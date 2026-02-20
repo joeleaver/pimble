@@ -1,10 +1,9 @@
 //! Pimble Desktop Application
 //!
-//! Entry point for the Slint-based desktop application.
+//! Entry point for the Rinch-based desktop application.
 
 mod app;
 mod backend;
-mod cosmic_editor;
 mod state;
 
 fn main() {
@@ -16,11 +15,8 @@ fn main() {
         )
         .init();
 
-    tracing::info!("Starting Pimble...");
+    tracing::info!("Starting Pimble with Rinch...");
 
     // Run the application
-    if let Err(e) = app::run() {
-        tracing::error!("Application error: {}", e);
-        std::process::exit(1);
-    }
+    app::run();
 }

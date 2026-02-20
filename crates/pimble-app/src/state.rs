@@ -7,7 +7,7 @@ use pimble_core::{Node, NodeId, Store, StoreId, Workspace};
 use crate::backend::BackendHandle;
 
 /// A flattened tree item for display
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TreeItem {
     /// Unique identifier for this item (as string for Slint)
     pub id: String,

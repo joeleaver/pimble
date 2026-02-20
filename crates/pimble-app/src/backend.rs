@@ -61,6 +61,7 @@ pub enum BackendEvent {
 }
 
 /// Handle to communicate with the backend
+#[derive(Clone)]
 pub struct BackendHandle {
     pub cmd_tx: Sender<BackendCommand>,
     pub event_rx: Receiver<BackendEvent>,
@@ -81,6 +82,11 @@ impl BackendHandle {
     }
 
     /// Send a command to the backend (non-blocking)
+    pub fn send_command(&self, cmd: BackendCommand) -> Result<(), crossbeam_channel::TrySendError<BackendCommand>> {
+        self.cmd_tx.try_send(cmd)
+    }
+
+    /// Send a command to the backend (non-blocking), ignoring result
     pub fn send(&self, cmd: BackendCommand) {
         let _ = self.cmd_tx.try_send(cmd);
     }

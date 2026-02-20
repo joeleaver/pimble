@@ -54,7 +54,7 @@ tantivy = "0.22"
 # tokenizers = "0.15"
 
 # UI framework
-slint = { version = "1.9", features = ["backend-winit", "renderer-skia"] }
+rinch = { git = "https://github.com/joeleaver/rinch.git", features = ["desktop", "components", "theme"] }
 
 # Error handling
 thiserror = "2.0"

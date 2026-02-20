@@ -4,21 +4,22 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Slint desktop application for Pimble"
+description = "Rinch desktop application for Pimble"
 
 [[bin]]
 name = "pimble"
 path = "src/main.rs"
 
 [features]
-default = ["backend-winit"]
+default = []
 backend-winit = []
 
 [dependencies]
 pimble-core = { workspace = true }
 pimble-client = { workspace = true }
 pimble-rpc = { workspace = true }
-slint = { workspace = true }
+rinch = { workspace = true }
+rinch-core = { git = "https://github.com/joeleaver/rinch.git" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -29,12 +30,5 @@ futures = { workspace = true }
 crossbeam-channel = { workspace = true }
 pimble-crdt = { workspace = true }
 chrono = { workspace = true }
-winit = "0.30"
-i-slint-backend-winit = "1.9"
-rfd = "0.15"
 pulldown-cmark = { workspace = true }
-cosmic-text = "0.12"
 arboard = "3"
-
-[build-dependencies]
-slint-build = "1.9"

@@ -1,1320 +1,403 @@
 //! Pimble Desktop Application
 //!
-//! Built with Slint UI framework
+//! Built with Rinch UI framework
 
-use std::rc::Rc;
-use std::cell::RefCell;
-use std::time::{Duration, Instant};
+use std::collections::{HashMap, HashSet};
 
-use slint::{ModelRc, SharedString, VecModel};
-use pimble_core::NodeId;
-use pimble_crdt::DocumentContent;
-
-// Import winit window accessor trait for window dragging
-#[cfg(feature = "backend-winit")]
-use i_slint_backend_winit::WinitWindowAccessor;
+use pimble_core::{Node, NodeId, Store, StoreId};
+use rinch::prelude::*;
 
 use crate::backend::{BackendCommand, BackendEvent, BackendHandle};
-use crate::state::{AppState, ConnectionState, TreeItem};
 
-// Include the generated Slint code
-slint::include_modules!();
-
-/// Convert our TreeItem to Slint's TreeItemData
-fn tree_item_to_slint(item: &TreeItem) -> TreeItemData {
-    TreeItemData {
-        id: SharedString::from(&item.id),
-        label: SharedString::from(&item.label),
-        icon: SharedString::from(&item.icon),
-        depth: item.depth,
-        expandable: item.expandable,
-        expanded: item.expanded,
-        is_store: item.is_store,
-    }
+/// A flattened tree item for display
+#[derive(Debug, Clone, PartialEq)]
+struct TreeItem {
+    id: String,
+    store_id: StoreId,
+    node_id: Option<NodeId>,
+    label: String,
+    icon: String,
+    depth: i32,
+    expandable: bool,
+    expanded: bool,
+    is_store: bool,
 }
 
-/// Update editor views with new content
-fn update_editor_content(window: &AppWindow, content: &str) {
-    window.set_node_content(SharedString::from(content));
-    window.set_cosmic_editor_text(SharedString::from(content));
-}
+pub fn run() {
+    #[component]
+    fn pimble_app() -> NodeHandle {
+        // Backend handle
+        let backend = use_signal(|| Option::<BackendHandle>::None);
 
-/// Create the default file menu items
-fn create_file_menu() -> Vec<MenuItemData> {
-    vec![
-        MenuItemData {
-            label: SharedString::from("New Store..."),
-            shortcut: SharedString::from("Ctrl+N"),
-            action_id: SharedString::from("file_new_store"),
-            enabled: true,
-            is_separator: false,
-        },
-        MenuItemData {
-            label: SharedString::from("Open Store..."),
-            shortcut: SharedString::from("Ctrl+O"),
-            action_id: SharedString::from("file_open_store"),
-            enabled: true,
-            is_separator: false,
-        },
-        MenuItemData {
-            label: SharedString::new(),
-            shortcut: SharedString::new(),
-            action_id: SharedString::new(),
-            enabled: false,
-            is_separator: true,
-        },
-        MenuItemData {
-            label: SharedString::from("Close Store"),
-            shortcut: SharedString::new(),
-            action_id: SharedString::from("file_close_store"),
-            enabled: true,
-            is_separator: false,
-        },
-        MenuItemData {
-            label: SharedString::new(),
-            shortcut: SharedString::new(),
-            action_id: SharedString::new(),
-            enabled: false,
-            is_separator: true,
-        },
-        MenuItemData {
-            label: SharedString::from("Exit"),
-            shortcut: SharedString::from("Alt+F4"),
-            action_id: SharedString::from("file_exit"),
-            enabled: true,
-            is_separator: false,
-        },
-    ]
-}
+        // Connection status
+        let connection_status = use_signal(|| "Connecting...".to_string());
 
-/// Create the default edit menu items
-fn create_edit_menu() -> Vec<MenuItemData> {
-    vec![
-        MenuItemData {
-            label: SharedString::from("Undo"),
-            shortcut: SharedString::from("Ctrl+Z"),
-            action_id: SharedString::from("edit_undo"),
-            enabled: false,
-            is_separator: false,
-        },
-        MenuItemData {
-            label: SharedString::from("Redo"),
-            shortcut: SharedString::from("Ctrl+Y"),
-            action_id: SharedString::from("edit_redo"),
-            enabled: false,
-            is_separator: false,
-        },
-        MenuItemData {
-            label: SharedString::new(),
-            shortcut: SharedString::new(),
-            action_id: SharedString::new(),
-            enabled: false,
-            is_separator: true,
-        },
-        MenuItemData {
-            label: SharedString::from("Cut"),
-            shortcut: SharedString::from("Ctrl+X"),
-            action_id: SharedString::from("edit_cut"),
-            enabled: false,
-            is_separator: false,
-        },
-        MenuItemData {
-            label: SharedString::from("Copy"),
-            shortcut: SharedString::from("Ctrl+C"),
-            action_id: SharedString::from("edit_copy"),
-            enabled: false,
-            is_separator: false,
-        },
-        MenuItemData {
-            label: SharedString::from("Paste"),
-            shortcut: SharedString::from("Ctrl+V"),
-            action_id: SharedString::from("edit_paste"),
-            enabled: false,
-            is_separator: false,
-        },
-    ]
-}
+        // Store state
+        let stores = use_signal(|| HashMap::<StoreId, Store>::new());
+        let nodes = use_signal(|| HashMap::<(StoreId, NodeId), Node>::new());
+        let children = use_signal(|| HashMap::<(StoreId, NodeId), Vec<NodeId>>::new());
 
-/// Create the default view menu items
-fn create_view_menu() -> Vec<MenuItemData> {
-    vec![
-        MenuItemData {
-            label: SharedString::from("Toggle Sidebar"),
-            shortcut: SharedString::from("Ctrl+B"),
-            action_id: SharedString::from("view_toggle_sidebar"),
-            enabled: true,
-            is_separator: false,
-        },
-        MenuItemData {
-            label: SharedString::new(),
-            shortcut: SharedString::new(),
-            action_id: SharedString::new(),
-            enabled: false,
-            is_separator: true,
-        },
-        MenuItemData {
-            label: SharedString::from("Zoom In"),
-            shortcut: SharedString::from("Ctrl+="),
-            action_id: SharedString::from("view_zoom_in"),
-            enabled: true,
-            is_separator: false,
-        },
-        MenuItemData {
-            label: SharedString::from("Zoom Out"),
-            shortcut: SharedString::from("Ctrl+-"),
-            action_id: SharedString::from("view_zoom_out"),
-            enabled: true,
-            is_separator: false,
-        },
-        MenuItemData {
-            label: SharedString::from("Reset Zoom"),
-            shortcut: SharedString::from("Ctrl+0"),
-            action_id: SharedString::from("view_zoom_reset"),
-            enabled: true,
-            is_separator: false,
-        },
-    ]
-}
+        // Tree state
+        let tree_items = use_signal(|| Vec::<TreeItem>::new());
+        let expanded = use_signal(|| HashSet::<(StoreId, NodeId)>::new());
 
-/// Create the default help menu items
-fn create_help_menu() -> Vec<MenuItemData> {
-    vec![
-        MenuItemData {
-            label: SharedString::from("Documentation"),
-            shortcut: SharedString::from("F1"),
-            action_id: SharedString::from("help_docs"),
-            enabled: true,
-            is_separator: false,
-        },
-        MenuItemData {
-            label: SharedString::new(),
-            shortcut: SharedString::new(),
-            action_id: SharedString::new(),
-            enabled: false,
-            is_separator: true,
-        },
-        MenuItemData {
-            label: SharedString::from("About Pimble"),
-            shortcut: SharedString::new(),
-            action_id: SharedString::from("help_about"),
-            enabled: true,
-            is_separator: false,
-        },
-    ]
-}
+        // Selection state
+        let selected_id = use_signal(|| Option::<String>::None);
+        let selected_node_content = use_signal(|| String::new());
 
-/// Main application runner
-pub fn run() -> Result<(), slint::PlatformError> {
-    // Create the main window
-    let window = AppWindow::new()?;
+        // Click counter for testing
+        let click_count = use_signal(|| 0i32);
 
-    // Create shared state
-    let state = Rc::new(RefCell::new(AppState::new()));
+        // Tick signal to trigger re-renders
+        let tick = use_signal(|| 0u32);
 
-    // Set up menu items
-    window.set_file_menu_items(ModelRc::new(VecModel::from(create_file_menu())));
-    window.set_edit_menu_items(ModelRc::new(VecModel::from(create_edit_menu())));
-    window.set_view_menu_items(ModelRc::new(VecModel::from(create_view_menu())));
-    window.set_help_menu_items(ModelRc::new(VecModel::from(create_help_menu())));
-
-    // Start backend connection
-    {
-        let mut state = state.borrow_mut();
-        // Spawn backend with a no-op signal function (Slint uses its own event loop)
-        state.backend = Some(BackendHandle::spawn(|| {}));
-        state.connection = ConnectionState::Connecting;
-
-        // Send connect command
-        if let Some(backend) = &state.backend {
-            let _ = backend.send(BackendCommand::Connect {
-                url: "http://127.0.0.1:9876".to_string(),
-            });
-        }
-    }
-
-    // Update connection status in UI
-    window.set_connection_status(SharedString::from("Connecting..."));
-
-    // Set up callbacks
-    let window_weak = window.as_weak();
-    let state_clone = state.clone();
-
-    // Cosmic text editor state
-    let cosmic_editor = Rc::new(RefCell::new(crate::cosmic_editor::SimpleCosmicEditor::new(
-        crate::cosmic_editor::EditorConfig::default(),
-    )));
-
-    // Menu item clicked callback
-    window.global::<AppCallbacks>().on_menu_item_clicked({
-        let window_weak = window_weak.clone();
-        let state = state_clone.clone();
-        move |action_id| {
-            let action = action_id.as_str();
-            tracing::info!("Menu action: {}", action);
-
-            match action {
-                "file_exit" => {
-                    if let Some(window) = window_weak.upgrade() {
-                        window.hide().ok();
+        // Helper to poll backend events and update UI
+        let poll_backend_events = |backend: &BackendHandle,
+                                   connection_status: &rinch::Signal<String>,
+                                   stores: &rinch::Signal<HashMap<StoreId, Store>>,
+                                   nodes: &rinch::Signal<HashMap<(StoreId, NodeId), Node>>,
+                                   children: &rinch::Signal<HashMap<(StoreId, NodeId), Vec<NodeId>>>,
+                                   expanded: &rinch::Signal<HashSet<(StoreId, NodeId)>>,
+                                   tree_items: &rinch::Signal<Vec<TreeItem>>| {
+            while let Some(event) = backend.try_recv() {
+                match event {
+                    BackendEvent::Connected => {
+                        connection_status.set("Connected".to_string());
                     }
-                }
-                "file_new_store" => {
-                    let state = state.borrow();
-                    if let Some(backend) = &state.backend {
-                        let _ = backend.send(BackendCommand::CreateStore {
-                            path: "./new-store.pimble".to_string(),
-                            name: "New Store".to_string(),
+                    BackendEvent::Disconnected => {
+                        connection_status.set("Disconnected".to_string());
+                    }
+                    BackendEvent::Error { message } => {
+                        connection_status.set(format!("Error: {}", message));
+                    }
+                    BackendEvent::StoreOpened { store } => {
+                        let store_id = store.id;
+                        let root_node_id = store.root_node_id;
+                        stores.update(|s| { s.insert(store_id, store); });
+                        let _ = backend.send_command(BackendCommand::GetChildren {
+                            store_id,
+                            node_id: root_node_id,
                         });
                     }
-                }
-                "file_open_store" => {
-                    let state = state.borrow();
-                    if let Some(backend) = &state.backend {
-                        let _ = backend.send(BackendCommand::OpenStore {
-                            path: "./test.pimble".to_string(),
-                        });
+                    BackendEvent::ChildrenLoaded { store_id, parent_id, children: child_nodes } => {
+                        let child_ids: Vec<NodeId> = child_nodes.iter().map(|n| n.id).collect();
+                        children.update(|c| { c.insert((store_id, parent_id), child_ids); });
+                        for node in child_nodes {
+                            nodes.update(|n| { n.insert((store_id, node.id), node); });
+                        }
+                        // Rebuild tree display
+                        let stores_val = stores.get();
+                        let nodes_val = nodes.get();
+                        let children_val = children.get();
+                        let expanded_val = expanded.get();
+                        let mut new_items = Vec::new();
+                        rebuild_tree_items(&stores_val, &nodes_val, &children_val, &expanded_val, &mut new_items);
+                        tree_items.set(new_items);
                     }
-                }
-                "file_close_store" => {
-                    tracing::info!("Close store");
-                    // TODO: Implement close store
-                }
-                "help_about" => {
-                    tracing::info!("About Pimble v0.1.0");
-                }
-                "help_docs" => {
-                    tracing::info!("Opening documentation...");
-                    // TODO: Open docs URL
-                }
-                _ => {
-                    tracing::debug!("Unhandled menu action: {}", action);
-                }
-            }
-        }
-    });
-
-    // Tree item clicked
-    window.global::<AppCallbacks>().on_tree_item_clicked({
-        let window_weak = window_weak.clone();
-        let state = state_clone.clone();
-        move |item_id| {
-            let id = item_id.as_str();
-            tracing::info!("Tree item clicked: {}", id);
-
-            let mut state = state.borrow_mut();
-            state.selected_id = Some(id.to_string());
-
-            // Find the tree item to get store_id and node_id
-            if let Some((store_id, node_id_opt)) = state.find_tree_item(id) {
-                if let Some(node_id) = node_id_opt {
-                    // Check if we have this node in cache
-                    if let Some(node) = state.nodes.get(&(store_id, node_id)) {
-                        tracing::info!("Node found in cache: {} (content size: {} bytes)",
-                            node.metadata.title, node.content.len());
-                        if let Some(window) = window_weak.upgrade() {
-                            window.set_node_title(SharedString::from(&node.metadata.title));
-                            let content = get_node_content_text(&node.content);
-                            tracing::info!("Extracted content: {} chars", content.len());
-                            update_editor_content(&window, &content);
-                        }
-                    } else {
-                        // Node not in cache, request it from backend
-                        tracing::info!("Node not in cache, requesting from backend");
-                        if let Some(backend) = &state.backend {
-                            let _ = backend.send(BackendCommand::GetNode { store_id, node_id });
-                        }
+                    BackendEvent::StoreCreated { store_id, root_node_id } => {
+                        // Open the newly created store
+                        let path = format!("./{}.pimble", store_id);
+                        let _ = backend.send_command(BackendCommand::OpenStore { path });
                     }
-                } else {
-                    // Clicked on a store header, show store info
-                    tracing::info!("Clicked on store header");
-                    if let Some(store) = state.stores.get(&store_id) {
-                        if let Some(window) = window_weak.upgrade() {
-                            window.set_node_title(SharedString::from(&store.name));
-                            let path_str = store.local_path()
-                                .map(|p| p.to_string_lossy().to_string())
-                                .unwrap_or_else(|| "remote".to_string());
-                            let content = format!(
-                                "Store: {}\nPath: {}\nRoot Node: {:?}",
-                                store.name,
-                                path_str,
-                                store.root_node_id
-                            );
-                            update_editor_content(&window, &content);
-                        }
-                    }
+                    _ => {}
                 }
             }
-        }
-    });
-
-    // Tree item toggle (expand/collapse)
-    window.global::<AppCallbacks>().on_tree_item_toggle({
-        let window_weak = window_weak.clone();
-        let state = state_clone.clone();
-        move |item_id| {
-            let id = item_id.as_str();
-            tracing::debug!("Tree item toggle: {}", id);
-
-            let mut state = state.borrow_mut();
-            state.toggle_expansion(id);
-
-            // Check if we need to load children
-            if let Some((store_id, node_id_opt)) = state.find_tree_item(id) {
-                // For store headers (node_id is None), use the store's root node
-                let node_id = node_id_opt.or_else(|| {
-                    state.stores.get(&store_id).map(|s| s.root_node_id)
-                });
-
-                if let Some(node_id) = node_id {
-                    if !state.children.contains_key(&(store_id, node_id)) {
-                        // Request children from backend
-                        if let Some(backend) = &state.backend {
-                            let _ = backend.send(BackendCommand::GetChildren {
-                                store_id,
-                                node_id,
-                            });
-                        }
-                    }
-                }
-            }
-
-            // Rebuild and update tree
-            state.rebuild_tree_items();
-            if let Some(window) = window_weak.upgrade() {
-                update_tree_view(&window, &state);
-            }
-        }
-    });
-
-    // Window controls
-    window.global::<AppCallbacks>().on_window_minimize({
-        let window_weak = window_weak.clone();
-        move || {
-            if let Some(window) = window_weak.upgrade() {
-                window.window().set_minimized(true);
-            }
-        }
-    });
-
-    window.global::<AppCallbacks>().on_window_maximize({
-        let window_weak = window_weak.clone();
-        move || {
-            if let Some(window) = window_weak.upgrade() {
-                let is_maximized = window.window().is_maximized();
-                window.window().set_maximized(!is_maximized);
-            }
-        }
-    });
-
-    window.global::<AppCallbacks>().on_window_close({
-        let window_weak = window_weak.clone();
-        move || {
-            if let Some(window) = window_weak.upgrade() {
-                window.hide().ok();
-            }
-        }
-    });
-
-    // Window drag - initiate drag move
-    #[cfg(feature = "backend-winit")]
-    window.global::<AppCallbacks>().on_start_window_drag({
-        let window_weak = window_weak.clone();
-        move || {
-            if let Some(window) = window_weak.upgrade() {
-                // Use the winit window drag functionality via Slint's window handle
-                // This initiates a native window drag operation
-                window.window().with_winit_window(|winit_window: &winit::window::Window| {
-                    let _ = winit_window.drag_window();
-                });
-            }
-        }
-    });
-
-    #[cfg(not(feature = "backend-winit"))]
-    window.global::<AppCallbacks>().on_start_window_drag({
-        move || {
-            tracing::warn!("Window dragging not supported without winit backend");
-        }
-    });
-
-    // Window resize - initiate resize operation
-    #[cfg(feature = "backend-winit")]
-    window.global::<AppCallbacks>().on_start_window_resize({
-        let window_weak = window_weak.clone();
-        move |direction: SharedString| {
-            if let Some(window) = window_weak.upgrade() {
-                use winit::window::ResizeDirection;
-                let resize_dir = match direction.as_str() {
-                    "n" => ResizeDirection::North,
-                    "s" => ResizeDirection::South,
-                    "e" => ResizeDirection::East,
-                    "w" => ResizeDirection::West,
-                    "ne" => ResizeDirection::NorthEast,
-                    "nw" => ResizeDirection::NorthWest,
-                    "se" => ResizeDirection::SouthEast,
-                    "sw" => ResizeDirection::SouthWest,
-                    _ => return,
-                };
-                window.window().with_winit_window(|winit_window: &winit::window::Window| {
-                    let _ = winit_window.drag_resize_window(resize_dir);
-                });
-            }
-        }
-    });
-
-    #[cfg(not(feature = "backend-winit"))]
-    window.global::<AppCallbacks>().on_start_window_resize({
-        move |_direction: SharedString| {
-            tracing::warn!("Window resizing not supported without winit backend");
-        }
-    });
-
-    // Toolbar actions
-    window.global::<AppCallbacks>().on_new_store({
-        let state = state_clone.clone();
-        move || {
-            tracing::info!("New store button clicked");
-
-            // Show save dialog to choose location for new store
-            let dialog = rfd::FileDialog::new()
-                .set_title("Create New Store")
-                .add_filter("Pimble Store", &["pimble"]);
-
-            if let Some(path) = dialog.save_file() {
-                let path_str = path.to_string_lossy().to_string();
-                // Ensure it ends with .pimble
-                let path_str = if path_str.ends_with(".pimble") {
-                    path_str
-                } else {
-                    format!("{}.pimble", path_str)
-                };
-
-                // Extract name from path
-                let name = std::path::Path::new(&path_str)
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "New Store".to_string());
-
-                tracing::info!("Creating new store at: {}", path_str);
-                let mut state = state.borrow_mut();
-                // Store the path so we can auto-open after creation
-                state.pending_create_path = Some(path_str.clone());
-                if let Some(backend) = &state.backend {
-                    let _ = backend.send(BackendCommand::CreateStore {
-                        path: path_str,
-                        name,
-                    });
-                }
-            }
-        }
-    });
-
-    window.global::<AppCallbacks>().on_open_store({
-        let state = state_clone.clone();
-        move || {
-            tracing::info!("Open store button clicked");
-
-            // Show folder picker to select existing store
-            let dialog = rfd::FileDialog::new()
-                .set_title("Open Store")
-                .add_filter("Pimble Store", &["pimble"]);
-
-            if let Some(path) = dialog.pick_folder() {
-                let path_str = path.to_string_lossy().to_string();
-                tracing::info!("Opening store at: {}", path_str);
-                let state = state.borrow();
-                if let Some(backend) = &state.backend {
-                    let _ = backend.send(BackendCommand::OpenStore {
-                        path: path_str,
-                    });
-                }
-            }
-        }
-    });
-
-    // New node callback
-    window.global::<AppCallbacks>().on_new_node({
-        let state = state_clone.clone();
-        move || {
-            let state = state.borrow();
-
-            // Find the first open store to create a node in
-            if let Some((&store_id, store)) = state.stores.iter().next() {
-                tracing::debug!("Creating new node in store: {}", store.name);
-                if let Some(backend) = &state.backend {
-                    let _ = backend.send(BackendCommand::CreateNode {
-                        store_id,
-                        parent_id: Some(store.root_node_id),
-                        title: "New Document".to_string(),
-                    });
-                }
-            } else {
-                tracing::warn!("No store open to create node in");
-            }
-        }
-    });
-
-    // Cosmic text editor callbacks
-    // Helper function to render the cosmic editor and update the Slint image
-    fn render_cosmic_editor(
-        window: &AppWindow,
-        editor: &Rc<RefCell<crate::cosmic_editor::SimpleCosmicEditor>>,
-        width: f32,
-        height: f32,
-    ) {
-        let mut editor = editor.borrow_mut();
-        let mut font_system = crate::cosmic_editor::get_font_system().lock().unwrap();
-        let mut swash_cache = crate::cosmic_editor::get_swash_cache().lock().unwrap();
-
-        // Set size from provided dimensions
-        editor.set_size(width, height);
-
-        let pixel_buffer = editor.render(&mut font_system, &mut swash_cache);
-
-        // Convert to Slint image
-        let image = slint::Image::from_rgba8(slint::SharedPixelBuffer::clone_from_slice(
-            &pixel_buffer.pixels,
-            pixel_buffer.width,
-            pixel_buffer.height,
-        ));
-
-        window.set_cosmic_editor_image(image);
-
-        // Update table toolbar state
-        let has_table_cell = editor.has_table_cell_selected();
-        window.set_table_cell_selected(has_table_cell);
-
-        if has_table_cell {
-            if let Some((x, y)) = editor.get_table_toolbar_position(&mut font_system) {
-                window.set_table_toolbar_x(x);
-                window.set_table_toolbar_y(y);
-            }
-        }
-    }
-
-    // Track editor size for rendering (current size + last rendered size for dedup)
-    let cosmic_editor_size = Rc::new(RefCell::new((400.0f32, 600.0f32)));
-    let _cosmic_last_rendered_size = Rc::new(RefCell::new((0.0f32, 0.0f32)));
-
-    // Debounce tracking for CRDT sync (500ms after last edit)
-    let cosmic_last_edit_time: Rc<RefCell<Option<Instant>>> = Rc::new(RefCell::new(None));
-    let cosmic_pending_sync_text: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-
-    // Content changed callback (for source text editing)
-    window.global::<AppCallbacks>().on_content_changed({
-        let window_weak = window_weak.clone();
-        let state = state_clone.clone();
-        let cosmic_editor = cosmic_editor.clone();
-        let cosmic_editor_size = cosmic_editor_size.clone();
-        move |new_text| {
-            // Update the cosmic editor with the new text
-            if let Some(window) = window_weak.upgrade() {
-                let current_cosmic_text = window.get_cosmic_editor_text().to_string();
-                if current_cosmic_text != new_text.as_str() {
-                    // Update cosmic editor
-                    cosmic_editor.borrow_mut().set_text(new_text.as_str());
-                    window.set_cosmic_editor_text(new_text.clone());
-                    // Re-render the cosmic editor
-                    let (w, h) = *cosmic_editor_size.borrow();
-                    render_cosmic_editor(&window, &cosmic_editor, w, h);
-                }
-            }
-
-            // Sync to backend
-            let state = state.borrow();
-            if let Some((store_id, node_id)) = state.selected_store_and_node() {
-                tracing::debug!("Content changed for node {:?}", node_id);
-                if let Some(backend) = &state.backend {
-                    let _ = backend.send(BackendCommand::SetNodeContent {
-                        store_id,
-                        node_id,
-                        text: new_text.to_string(),
-                    });
-                }
-            }
-        }
-    });
-
-    // Cosmic key pressed handler
-    window.global::<AppCallbacks>().on_cosmic_key_pressed({
-        let window_weak = window_weak.clone();
-        let cosmic_editor = cosmic_editor.clone();
-        let cosmic_editor_size = cosmic_editor_size.clone();
-        let cosmic_last_edit_time = cosmic_last_edit_time.clone();
-        let cosmic_pending_sync_text = cosmic_pending_sync_text.clone();
-        move |key, shift, ctrl, alt| {
-            let key_str = key.as_str();
-            tracing::debug!("Cosmic key: '{}', shift={}, ctrl={}, alt={}", key_str, shift, ctrl, alt);
-
-            {
-                let mut editor = cosmic_editor.borrow_mut();
-
-                // Arrow keys and Tab are special characters in Slint
-                const LEFT_ARROW: char = '\u{F702}';
-                const RIGHT_ARROW: char = '\u{F703}';
-                const UP_ARROW: char = '\u{F700}';
-                const DOWN_ARROW: char = '\u{F701}';
-                const HOME: char = '\u{F729}';
-                const END: char = '\u{F72B}';
-                const TAB: char = '\t';
-
-                let first_char = key_str.chars().next();
-
-                // Check if we're editing a table cell
-                if editor.has_table_cell_selected() {
-                    // Table cell editing mode
-                    if ctrl {
-                        // Handle Ctrl shortcuts in cell
-                        match first_char {
-                            Some('c') | Some('C') => {
-                                // Copy cell text
-                                if let Some(text) = editor.get_selected_cell_text() {
-                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                        let _ = clipboard.set_text(&text);
-                                        tracing::debug!("Copied cell text: {} chars", text.len());
-                                    }
-                                }
-                            }
-                            Some('v') | Some('V') => {
-                                // Paste into cell (replace entire cell content for now)
-                                if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                    if let Ok(text) = clipboard.get_text() {
-                                        // Insert char by char to handle multi-char paste
-                                        for c in text.chars() {
-                                            if c != '\n' && c != '\r' {
-                                                editor.insert_char_in_cell(c);
-                                            }
-                                        }
-                                        tracing::debug!("Pasted into cell: {} chars", text.len());
-                                    }
-                                }
-                            }
-                            // Table row/column operations
-                            Some('\r') | Some('\n') => {
-                                // Ctrl+Enter: Add row below, Ctrl+Shift+Enter: Add row above
-                                if shift {
-                                    editor.add_row_above();
-                                    tracing::debug!("Added row above");
-                                } else {
-                                    editor.add_row_below();
-                                    tracing::debug!("Added row below");
-                                }
-                            }
-                            Some('+') | Some('=') => {
-                                // Ctrl+=: Add column right, Ctrl+Shift+=: Add column left
-                                if shift {
-                                    editor.add_column_left();
-                                    tracing::debug!("Added column left");
-                                } else {
-                                    editor.add_column_right();
-                                    tracing::debug!("Added column right");
-                                }
-                            }
-                            Some('-') => {
-                                // Ctrl+-: Delete row, Ctrl+Shift+-: Delete column
-                                if shift {
-                                    editor.delete_column();
-                                    tracing::debug!("Deleted column");
-                                } else {
-                                    editor.delete_row();
-                                    tracing::debug!("Deleted row");
-                                }
-                            }
-                            _ => {}
-                        }
-                    } else if alt {
-                        // Alt shortcuts for table manipulation
-                        match first_char {
-                            Some(UP_ARROW) => {
-                                editor.add_row_above();
-                                tracing::debug!("Alt+Up: Added row above");
-                            }
-                            Some(DOWN_ARROW) => {
-                                editor.add_row_below();
-                                tracing::debug!("Alt+Down: Added row below");
-                            }
-                            Some(LEFT_ARROW) => {
-                                editor.add_column_left();
-                                tracing::debug!("Alt+Left: Added column left");
-                            }
-                            Some(RIGHT_ARROW) => {
-                                editor.add_column_right();
-                                tracing::debug!("Alt+Right: Added column right");
-                            }
-                            _ => {}
-                        }
-                    } else {
-                        match first_char {
-                            Some('\u{8}') => editor.backspace_in_cell(), // Backspace
-                            Some('\u{7f}') => editor.delete_in_cell(),   // Delete
-                            Some('\r') | Some('\n') => {
-                                // Enter moves to next row (or exits table if last row)
-                                editor.move_to_cell_below();
-                            }
-                            Some('\u{1b}') => {
-                                // Escape clears table selection
-                                editor.clear_table_selection();
-                            }
-                            Some(TAB) => {
-                                // Tab/Shift+Tab navigates cells
-                                if shift {
-                                    editor.move_to_prev_cell();
-                                } else {
-                                    editor.move_to_next_cell();
-                                }
-                            }
-                            Some(LEFT_ARROW) => {
-                                // Move cursor left in cell, or to previous cell at start
-                                if let Some(sel) = editor.selected_table_cell() {
-                                    if sel.cursor_in_cell == 0 {
-                                        editor.move_to_cell_left();
-                                    } else {
-                                        editor.move_cell_cursor_left();
-                                    }
-                                }
-                            }
-                            Some(RIGHT_ARROW) => {
-                                // Move cursor right in cell, or to next cell at end
-                                let at_end = editor.get_selected_cell_text()
-                                    .map(|t| {
-                                        editor.selected_table_cell()
-                                            .map(|s| s.cursor_in_cell >= t.len())
-                                            .unwrap_or(false)
-                                    })
-                                    .unwrap_or(false);
-                                if at_end {
-                                    editor.move_to_cell_right();
-                                } else {
-                                    editor.move_cell_cursor_right();
-                                }
-                            }
-                            Some(UP_ARROW) => editor.move_to_cell_above(),
-                            Some(DOWN_ARROW) => editor.move_to_cell_below(),
-                            // Regular character input in cell
-                            Some(c) if !c.is_control() => {
-                                editor.insert_char_in_cell(c);
-                            }
-                            _ => {}
-                        }
-                    }
-                } else {
-                    // Normal editing mode (not in table cell)
-                    // Handle Ctrl+key shortcuts
-                    if ctrl {
-                        match first_char {
-                            Some('c') | Some('C') => {
-                                // Copy
-                                if let Some(text) = editor.get_selected_text() {
-                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                        let _ = clipboard.set_text(&text);
-                                        tracing::debug!("Copied {} chars to clipboard", text.len());
-                                    }
-                                }
-                            }
-                            Some('x') | Some('X') => {
-                                // Cut
-                                if let Some(text) = editor.get_selected_text() {
-                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                        let _ = clipboard.set_text(&text);
-                                        editor.backspace(); // Delete selection
-                                        tracing::debug!("Cut {} chars to clipboard", text.len());
-                                    }
-                                }
-                            }
-                            Some('v') | Some('V') => {
-                                // Paste
-                                if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                    if let Ok(text) = clipboard.get_text() {
-                                        editor.paste(&text);
-                                        tracing::debug!("Pasted {} chars from clipboard", text.len());
-                                    }
-                                }
-                            }
-                            Some('a') | Some('A') => {
-                                // Select all
-                                editor.select_all();
-                                tracing::debug!("Selected all text");
-                            }
-                            _ => {}
-                        }
-                    } else {
-                        match first_char {
-                            Some('\u{8}') => editor.backspace(), // Backspace
-                            Some('\u{7f}') => editor.delete(),   // Delete
-                            Some('\r') | Some('\n') => editor.enter(), // Enter
-                            Some('\u{1b}') => {},                // Escape - could clear selection
-                            Some(LEFT_ARROW) => editor.move_left(shift),
-                            Some(RIGHT_ARROW) => editor.move_right(shift),
-                            Some(HOME) => editor.move_home(shift),
-                            Some(END) => editor.move_end(shift),
-                            Some(UP_ARROW) => editor.move_up(shift),
-                            Some(DOWN_ARROW) => editor.move_down(shift),
-                            // Regular character input
-                            Some(c) if !c.is_control() => {
-                                editor.insert_char(c);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
-            // Update the display and track changes for sync
-            if let Some(window) = window_weak.upgrade() {
-                let (w, h) = *cosmic_editor_size.borrow();
-                render_cosmic_editor(&window, &cosmic_editor, w, h);
-                // Sync text back to UI
-                let text = cosmic_editor.borrow().text().to_string();
-                let old_text = window.get_cosmic_editor_text().to_string();
-
-                // Track if text changed for debounced CRDT sync
-                if text != old_text {
-                    *cosmic_last_edit_time.borrow_mut() = Some(Instant::now());
-                    *cosmic_pending_sync_text.borrow_mut() = Some(text.clone());
-                    // Also update the source editor (node_content)
-                    window.set_node_content(SharedString::from(&text));
-                }
-
-                window.set_cosmic_editor_text(SharedString::from(text));
-            }
-        }
-    });
-
-    // Cosmic mouse clicked handler
-    window.global::<AppCallbacks>().on_cosmic_mouse_clicked({
-        let window_weak = window_weak.clone();
-        let cosmic_editor = cosmic_editor.clone();
-        let cosmic_editor_size = cosmic_editor_size.clone();
-        move |x, y| {
-            tracing::info!("Cosmic click at ({}, {})", x, y);
-
-            if let Some(window) = window_weak.upgrade() {
-                // Sync scroll position from UI before processing click
-                let scroll_y = window.get_cosmic_scroll_y();
-
-                {
-                    let mut editor = cosmic_editor.borrow_mut();
-                    editor.set_scroll(scroll_y);
-                    let mut font_system = crate::cosmic_editor::get_font_system().lock().unwrap();
-                    editor.click(x, y, &mut font_system);
-                    tracing::info!("Cursor now at position: {}", editor.cursor_position());
-                }
-
-                let (w, h) = *cosmic_editor_size.borrow();
-                render_cosmic_editor(&window, &cosmic_editor, w, h);
-            }
-        }
-    });
-
-    // Cosmic mouse dragged handler
-    window.global::<AppCallbacks>().on_cosmic_mouse_dragged({
-        let window_weak = window_weak.clone();
-        let cosmic_editor = cosmic_editor.clone();
-        let cosmic_editor_size = cosmic_editor_size.clone();
-        move |x, y| {
-            if let Some(window) = window_weak.upgrade() {
-                // Sync scroll position from UI before processing drag
-                let scroll_y = window.get_cosmic_scroll_y();
-
-                {
-                    let mut editor = cosmic_editor.borrow_mut();
-                    editor.set_scroll(scroll_y);
-                    let mut font_system = crate::cosmic_editor::get_font_system().lock().unwrap();
-                    editor.drag(x, y, &mut font_system);
-                }
-
-                let (w, h) = *cosmic_editor_size.borrow();
-                render_cosmic_editor(&window, &cosmic_editor, w, h);
-            }
-        }
-    });
-
-    // Cosmic request render handler (with scroll and zoom support)
-    window.global::<AppCallbacks>().on_cosmic_request_render({
-        let window_weak = window_weak.clone();
-        let cosmic_editor = cosmic_editor.clone();
-        let cosmic_editor_size = cosmic_editor_size.clone();
-        move |width, height, scroll_y, zoom| {
-            // Skip rendering if size is too small (prevents crashes during layout)
-            if width < 10.0 || height < 10.0 {
-                return;
-            }
-
-            tracing::debug!("Cosmic request render: {}x{} scroll={:.1} zoom={:.2}", width, height, scroll_y, zoom);
-            // Store the new size
-            *cosmic_editor_size.borrow_mut() = (width, height);
-
-            if let Some(window) = window_weak.upgrade() {
-                // Update editor text from UI if needed
-                let ui_text = window.get_cosmic_editor_text();
-                {
-                    let mut editor = cosmic_editor.borrow_mut();
-                    editor.set_text(ui_text.as_str());
-                    editor.set_scroll(scroll_y);
-                    editor.set_zoom(zoom);
-                }
-                render_cosmic_editor(&window, &cosmic_editor, width, height);
-
-                // Update content height and max scroll in UI
-                let editor = cosmic_editor.borrow();
-                let content_height = editor.content_height();
-                let max_scroll = (content_height - height).max(0.0);
-                window.set_cosmic_content_height(content_height);
-                window.set_cosmic_max_scroll_y(max_scroll);
-            }
-        }
-    });
-
-    // Cosmic focus changed handler
-    // Note: We don't render here because the Slint component calls request-render
-    // with the actual widget size when focus is gained
-    window.global::<AppCallbacks>().on_cosmic_focus_changed({
-        move |focused| {
-            tracing::debug!("Cosmic focus changed: {}", focused);
-            // Rendering is handled by the request-render callback which has the correct size
-        }
-    });
-
-    // Cosmic blink update handler
-    window.global::<AppCallbacks>().on_cosmic_blink_update({
-        let window_weak = window_weak.clone();
-        let cosmic_editor = cosmic_editor.clone();
-        let cosmic_editor_size = cosmic_editor_size.clone();
-        move || {
-            let changed = cosmic_editor.borrow_mut().update_blink();
-            if changed {
-                if let Some(window) = window_weak.upgrade() {
-                    let (w, h) = *cosmic_editor_size.borrow();
-                    render_cosmic_editor(&window, &cosmic_editor, w, h);
-                }
-            }
-        }
-    });
-
-    // Table toolbar callbacks
-    window.global::<AppCallbacks>().on_table_add_row_above({
-        let window_weak = window_weak.clone();
-        let cosmic_editor = cosmic_editor.clone();
-        let cosmic_editor_size = cosmic_editor_size.clone();
-        move || {
-            cosmic_editor.borrow_mut().add_row_above();
-            if let Some(window) = window_weak.upgrade() {
-                let (w, h) = *cosmic_editor_size.borrow();
-                render_cosmic_editor(&window, &cosmic_editor, w, h);
-                // Sync text
-                let text = cosmic_editor.borrow().text().to_string();
-                window.set_cosmic_editor_text(SharedString::from(&text));
-                window.set_node_content(SharedString::from(&text));
-            }
-        }
-    });
-
-    window.global::<AppCallbacks>().on_table_add_row_below({
-        let window_weak = window_weak.clone();
-        let cosmic_editor = cosmic_editor.clone();
-        let cosmic_editor_size = cosmic_editor_size.clone();
-        move || {
-            cosmic_editor.borrow_mut().add_row_below();
-            if let Some(window) = window_weak.upgrade() {
-                let (w, h) = *cosmic_editor_size.borrow();
-                render_cosmic_editor(&window, &cosmic_editor, w, h);
-                let text = cosmic_editor.borrow().text().to_string();
-                window.set_cosmic_editor_text(SharedString::from(&text));
-                window.set_node_content(SharedString::from(&text));
-            }
-        }
-    });
-
-    window.global::<AppCallbacks>().on_table_add_column_left({
-        let window_weak = window_weak.clone();
-        let cosmic_editor = cosmic_editor.clone();
-        let cosmic_editor_size = cosmic_editor_size.clone();
-        move || {
-            cosmic_editor.borrow_mut().add_column_left();
-            if let Some(window) = window_weak.upgrade() {
-                let (w, h) = *cosmic_editor_size.borrow();
-                render_cosmic_editor(&window, &cosmic_editor, w, h);
-                let text = cosmic_editor.borrow().text().to_string();
-                window.set_cosmic_editor_text(SharedString::from(&text));
-                window.set_node_content(SharedString::from(&text));
-            }
-        }
-    });
-
-    window.global::<AppCallbacks>().on_table_add_column_right({
-        let window_weak = window_weak.clone();
-        let cosmic_editor = cosmic_editor.clone();
-        let cosmic_editor_size = cosmic_editor_size.clone();
-        move || {
-            cosmic_editor.borrow_mut().add_column_right();
-            if let Some(window) = window_weak.upgrade() {
-                let (w, h) = *cosmic_editor_size.borrow();
-                render_cosmic_editor(&window, &cosmic_editor, w, h);
-                let text = cosmic_editor.borrow().text().to_string();
-                window.set_cosmic_editor_text(SharedString::from(&text));
-                window.set_node_content(SharedString::from(&text));
-            }
-        }
-    });
-
-    window.global::<AppCallbacks>().on_table_delete_row({
-        let window_weak = window_weak.clone();
-        let cosmic_editor = cosmic_editor.clone();
-        let cosmic_editor_size = cosmic_editor_size.clone();
-        move || {
-            cosmic_editor.borrow_mut().delete_row();
-            if let Some(window) = window_weak.upgrade() {
-                let (w, h) = *cosmic_editor_size.borrow();
-                render_cosmic_editor(&window, &cosmic_editor, w, h);
-                let text = cosmic_editor.borrow().text().to_string();
-                window.set_cosmic_editor_text(SharedString::from(&text));
-                window.set_node_content(SharedString::from(&text));
-            }
-        }
-    });
-
-    window.global::<AppCallbacks>().on_table_delete_column({
-        let window_weak = window_weak.clone();
-        let cosmic_editor = cosmic_editor.clone();
-        let cosmic_editor_size = cosmic_editor_size.clone();
-        move || {
-            cosmic_editor.borrow_mut().delete_column();
-            if let Some(window) = window_weak.upgrade() {
-                let (w, h) = *cosmic_editor_size.borrow();
-                render_cosmic_editor(&window, &cosmic_editor, w, h);
-                let text = cosmic_editor.borrow().text().to_string();
-                window.set_cosmic_editor_text(SharedString::from(&text));
-                window.set_node_content(SharedString::from(&text));
-            }
-        }
-    });
-
-    // Set up a timer to process backend events
-    let timer = slint::Timer::default();
-    let window_weak_timer = window.as_weak();
-    let state_timer = state.clone();
-    // Clone debounce tracking for timer closure
-    let cosmic_last_edit_time_timer = cosmic_last_edit_time.clone();
-    let cosmic_pending_sync_text_timer = cosmic_pending_sync_text.clone();
-
-    timer.start(
-        slint::TimerMode::Repeated,
-        Duration::from_millis(16), // ~60fps
-        move || {
-            process_backend_events(&window_weak_timer, &state_timer);
-
-            // Check for debounced cosmic editor sync (500ms after last edit)
-            let should_sync = {
-                let last_edit = cosmic_last_edit_time_timer.borrow();
-                if let Some(last_time) = *last_edit {
-                    last_time.elapsed() >= Duration::from_millis(500)
-                } else {
-                    false
-                }
-            };
-
-            if should_sync {
-                if let Some(text) = cosmic_pending_sync_text_timer.borrow_mut().take() {
-                    *cosmic_last_edit_time_timer.borrow_mut() = None;
-
-                    // Sync to backend
-                    let state = state_timer.borrow();
-                    if let Some((store_id, node_id)) = state.selected_store_and_node() {
-                        if let Some(backend) = &state.backend {
-                            tracing::debug!("Syncing cosmic editor content to backend ({} chars)", text.len());
-                            let _ = backend.send(BackendCommand::SetNodeContent {
-                                store_id,
-                                node_id,
-                                text,
-                            });
-                        }
-                    }
-                }
-            }
-        },
-    );
-
-    // Run the event loop
-    window.run()
-}
-
-/// Process backend events and update UI
-fn process_backend_events(
-    window_weak: &slint::Weak<AppWindow>,
-    state: &Rc<RefCell<AppState>>,
-) {
-    let Some(window) = window_weak.upgrade() else {
-        return;
-    };
-
-    // Collect events first to avoid borrow issues
-    let events: Vec<BackendEvent> = {
-        let state = state.borrow();
-        let Some(backend) = &state.backend else {
-            return;
         };
-        let mut events = Vec::new();
-        while let Some(event) = backend.try_recv() {
-            events.push(event);
-        }
-        events
-    };
 
-    if events.is_empty() {
-        return;
-    }
+        // Initialize backend on mount
+        use_effect(
+            move || {
+                let handle = BackendHandle::spawn(|| {});
+                backend.set(Some(handle));
 
-    let mut state = state.borrow_mut();
-
-    // Process all collected events
-    for event in events {
-        match event {
-            BackendEvent::Connected => {
-                tracing::info!("Connected to backend");
-                state.connection = ConnectionState::Connected;
-                window.set_connection_status(SharedString::from("Connected"));
-            }
-
-            BackendEvent::Disconnected => {
-                tracing::info!("Disconnected from backend");
-                state.connection = ConnectionState::Disconnected;
-                window.set_connection_status(SharedString::from("Disconnected"));
-            }
-
-            BackendEvent::Error { message } => {
-                tracing::error!("Backend error: {}", message);
-                state.connection = ConnectionState::Error(message.clone());
-                window.set_connection_status(SharedString::from(format!("Error: {}", message)));
-            }
-
-            BackendEvent::StoreOpened { store } => {
-                tracing::info!("Store opened: {}", store.name);
-                let store_id = store.id;
-                let root_id = store.root_node_id;
-                state.stores.insert(store_id, store);
-
-                // Auto-expand the store and request children
-                state.expanded.insert((store_id, root_id));
-                if let Some(backend) = &state.backend {
-                    let _ = backend.send(BackendCommand::GetChildren {
-                        store_id,
-                        node_id: root_id,
+                // Connect to backend
+                if let Some(ref h) = backend.get() {
+                    let _ = h.send_command(BackendCommand::Connect {
+                        url: "http://127.0.0.1:9876".to_string(),
                     });
+                    // Poll multiple times - backend is async so need to wait for it
+                    for _ in 0..50 {
+                        poll_backend_events(h, &connection_status, &stores, &nodes, &children, &expanded, &tree_items);
+                        if connection_status.get() != "Connecting...".to_string() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+
+                    // Auto-open existing store
+                    let path = "./new-store.pimble".to_string();
+                    let _ = h.send_command(BackendCommand::OpenStore { path: path.clone() });
+                    // Poll for store and children
+                    for _ in 0..100 {
+                        poll_backend_events(h, &connection_status, &stores, &nodes, &children, &expanded, &tree_items);
+                        if !stores.get().is_empty() && !children.get().is_empty() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
                 }
+            },
+            (),
+        );
 
-                // Rebuild tree
-                state.rebuild_tree_items();
-                update_tree_view(&window, &state);
-            }
-
-            BackendEvent::StoreCreated { store_id, root_node_id } => {
-                tracing::info!("Store created: {:?} with root {:?}", store_id, root_node_id);
-                // Auto-open the newly created store using the pending path
-                if let Some(path) = state.pending_create_path.take() {
-                    tracing::info!("Auto-opening created store at: {}", path);
-                    if let Some(backend) = &state.backend {
-                        let _ = backend.send(BackendCommand::OpenStore { path });
+        // New Store button handler
+        let on_new_store = {
+            let backend = backend.clone();
+            let connection_status = connection_status.clone();
+            let stores = stores.clone();
+            let nodes = nodes.clone();
+            let children = children.clone();
+            let expanded = expanded.clone();
+            let tree_items = tree_items.clone();
+            move || {
+                if let Some(ref h) = backend.get() {
+                    let name = "New Store".to_string();
+                    let path = format!("./{}.pimble", name.to_lowercase().replace(' ', "-"));
+                    let _ = h.send_command(BackendCommand::CreateStore { path, name });
+                    // Poll for response
+                    for _ in 0..50 {
+                        poll_backend_events(h, &connection_status, &stores, &nodes, &children, &expanded, &tree_items);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
                     }
                 }
             }
+        };
 
-            BackendEvent::ChildrenLoaded { store_id, parent_id, children } => {
-                tracing::debug!("Children loaded for {:?}: {} nodes", parent_id, children.len());
-
-                // Store children IDs and node data
-                let child_ids: Vec<NodeId> = children.iter().map(|n| n.id).collect();
-                state.children.insert((store_id, parent_id), child_ids);
-
-                for child in children {
-                    state.nodes.insert((store_id, child.id), child);
+        // Open Store button handler
+        let on_open_store = {
+            let backend = backend.clone();
+            let connection_status = connection_status.clone();
+            let stores = stores.clone();
+            let nodes = nodes.clone();
+            let children = children.clone();
+            let expanded = expanded.clone();
+            let tree_items = tree_items.clone();
+            move || {
+                if let Some(ref h) = backend.get() {
+                    let path = "./new-store.pimble".to_string();
+                    let _ = h.send_command(BackendCommand::OpenStore { path });
+                    // Poll for response - more iterations
+                    for _ in 0..50 {
+                        poll_backend_events(h, &connection_status, &stores, &nodes, &children, &expanded, &tree_items);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
                 }
-
-                // Rebuild tree
-                state.rebuild_tree_items();
-                update_tree_view(&window, &state);
             }
+        };
 
-            BackendEvent::NodeLoaded { store_id, node } => {
-                tracing::info!("Node loaded: {:?} - {} (content: {} bytes)",
-                    node.id, node.metadata.title, node.content.len());
-                let node_id = node.id;
-                let title = node.metadata.title.clone();
-                let content_bytes = node.content.clone();
-                state.nodes.insert((store_id, node_id), node);
+        // Tree item click handler
+        let stores_clone = stores.clone();
+        let nodes_clone = nodes.clone();
+        let children_clone = children.clone();
+        let expanded_clone = expanded.clone();
+        let tree_items_clone = tree_items.clone();
+        let backend_clone = backend.clone();
+        let selected_id_clone = selected_id.clone();
 
-                // Update viewer if this is the selected node
-                if let Some(selected_id) = &state.selected_id {
-                    if let Some((sel_store_id, Some(sel_node_id))) = state.find_tree_item(selected_id) {
-                        if sel_store_id == store_id && sel_node_id == node_id {
-                            tracing::info!("Updating viewer for loaded node");
-                            window.set_node_title(SharedString::from(&title));
-                            let content = get_node_content_text(&content_bytes);
-                            update_editor_content(&window, &content);
+        let on_tree_click = move |item_id: String| {
+            let items = tree_items_clone.get();
+            if let Some(item) = items.iter().find(|i| i.id == item_id) {
+                if item.expandable {
+                    let key = if let Some(node_id) = item.node_id {
+                        (item.store_id, node_id)
+                    } else if let Some(store) = stores_clone.get().get(&item.store_id) {
+                        (item.store_id, store.root_node_id)
+                    } else {
+                        return;
+                    };
+
+                    expanded_clone.update(|e| {
+                        if e.contains(&key) {
+                            e.remove(&key);
+                        } else {
+                            e.insert(key);
+                        }
+                    });
+
+                    if !expanded_clone.get().contains(&key) {
+                        if let Some(ref h) = backend_clone.get() {
+                            let (_, node_id) = key;
+                            let _ = h.send_command(BackendCommand::GetChildren {
+                                store_id: item.store_id,
+                                node_id,
+                            });
+                        }
+                    }
+
+                    // Rebuild tree
+                    let stores_val = stores_clone.get();
+                    let nodes_val = nodes_clone.get();
+                    let children_val = children_clone.get();
+                    let expanded_val = expanded_clone.get();
+                    let mut new_items = Vec::new();
+                    rebuild_tree_items(&stores_val, &nodes_val, &children_val, &expanded_val, &mut new_items);
+                    tree_items_clone.set(new_items);
+                } else {
+                    selected_id_clone.set(Some(item_id.clone()));
+
+                    if let Some(node_id) = item.node_id {
+                        if let Some(ref h) = backend_clone.get() {
+                            let _ = h.send_command(BackendCommand::GetNode {
+                                store_id: item.store_id,
+                                node_id,
+                            });
                         }
                     }
                 }
             }
+        };
 
-            BackendEvent::NodeCreated { store_id, parent_id, node_id } => {
-                tracing::info!("Node created: {:?}", node_id);
+        // Force reactive update by using tick
+        let _ = tick.get();
 
-                // Get the actual parent node ID (either specified parent or store's root)
-                let actual_parent_id = parent_id.or_else(|| {
-                    state.stores.get(&store_id).map(|s| s.root_node_id)
+        rsx! {
+            div {
+                style: "display: flex; flex-direction: column; height: 100vh; background: #1e1e1e; color: #cccccc; font-family: sans-serif;",
+
+                // Toolbar
+                div {
+                    style: "display: flex; gap: 8px; padding: 8px 16px; background: #252526; border-bottom: 1px solid #3c3c3c;",
+                    button {
+                        style: "padding: 6px 16px; background: #0e639c; color: white; border: none; border-radius: 2px; cursor: pointer;",
+                        onclick: move || {
+                            click_count.update(|c| *c += 1);
+                            on_new_store();
+                        },
+                        "New Store ("
+                        { click_count.get().to_string() }
+                        ")"
+                    }
+                    button {
+                        style: "padding: 6px 16px; background: #0e639c; color: white; border: none; border-radius: 2px; cursor: pointer;",
+                        onclick: move || on_open_store(),
+                        "Open Store"
+                    }
+                }
+
+                // Status
+                div {
+                    style: "padding: 4px 16px; background: #252526; border-bottom: 1px solid #3c3c3c; font-size: 12px;",
+                    { connection_status.get() }
+                }
+
+                // Main Content
+                div {
+                    style: "display: flex; flex: 1; overflow: hidden;",
+
+                    // Sidebar
+                    div {
+                        style: "width: 250px; background: #252526; border-right: 1px solid #3c3c3c; overflow-y: auto; padding: 8px;",
+
+                        // Use a separate variable for is_empty check
+                        if tree_items.get().is_empty() {
+                            div {
+                                style: "padding: 8px; color: #808080;",
+                                "No stores open"
+                            }
+                        } else {
+                            for item in tree_items.get() {
+                                div {
+                                    style: format!("padding: 4px 8px; cursor: pointer; padding-left: {}px;", item.depth * 16),
+                                    onclick: move || on_tree_click(item.id.clone()),
+                                    "{item.icon} {item.label}"
+                                }
+                            }
+                        }
+                    }
+
+                    // Editor
+                    div {
+                        style: "flex: 1; padding: 16px; overflow: auto;",
+                        div {
+                            style: "font-size: 18px; font-weight: 600; padding: 8px 0; margin-bottom: 8px; border-bottom: 1px solid #3c3c3c;",
+                            "Editor"
+                        }
+
+                        if selected_id.get().is_some() {
+                            div {
+                                style: "min-height: 200px; padding: 8px; border: 1px solid #3c3c3c; border-radius: 2px;",
+                                { selected_node_content.get() }
+                            }
+                        } else {
+                            div {
+                                style: "color: #808080;",
+                                "Select a node to edit"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Run the app
+    rinch::run("Pimble", 1200, 800, pimble_app);
+}
+
+/// Rebuild tree items from current state
+fn rebuild_tree_items(
+    stores: &HashMap<StoreId, Store>,
+    nodes: &HashMap<(StoreId, NodeId), Node>,
+    children: &HashMap<(StoreId, NodeId), Vec<NodeId>>,
+    expanded: &HashSet<(StoreId, NodeId)>,
+    items: &mut Vec<TreeItem>,
+) {
+    for (store_id, store) in stores {
+        let root_node_id = store.root_node_id;
+        let store_expanded = expanded.contains(&(*store_id, root_node_id));
+
+        items.push(TreeItem {
+            id: format!("store_{}", store_id),
+            store_id: *store_id,
+            node_id: None,
+            label: store.name.clone(),
+            icon: "📁".to_string(),
+            depth: 0,
+            expandable: true,
+            expanded: store_expanded,
+            is_store: true,
+        });
+
+        if store_expanded {
+            add_children_to_tree(store_id, &root_node_id, nodes, children, expanded, items, 1);
+        }
+    }
+}
+
+/// Recursively add children to tree
+fn add_children_to_tree(
+    store_id: &StoreId,
+    parent_id: &NodeId,
+    nodes: &HashMap<(StoreId, NodeId), Node>,
+    children: &HashMap<(StoreId, NodeId), Vec<NodeId>>,
+    expanded: &HashSet<(StoreId, NodeId)>,
+    items: &mut Vec<TreeItem>,
+    depth: i32,
+) {
+    if let Some(child_ids) = children.get(&(*store_id, *parent_id)) {
+        for child_id in child_ids {
+            if let Some(node) = nodes.get(&(*store_id, *child_id)) {
+                let is_folder = node.node_type == "folder";
+                let is_expanded = expanded.contains(&(*store_id, *child_id));
+
+                let icon = if is_folder { "📂" } else { "📄" };
+
+                items.push(TreeItem {
+                    id: format!("node_{}_{}", store_id, child_id),
+                    store_id: *store_id,
+                    node_id: Some(*child_id),
+                    label: node.metadata.title.clone(),
+                    icon: icon.to_string(),
+                    depth,
+                    expandable: is_folder,
+                    expanded: is_expanded,
+                    is_store: false,
                 });
 
-                if let Some(parent_id) = actual_parent_id {
-                    // Ensure parent is expanded so the new node will be visible
-                    if !state.expanded.contains(&(store_id, parent_id)) {
-                        state.expanded.insert((store_id, parent_id));
-                    }
-
-                    // Refresh children of the parent to show the new node
-                    if let Some(backend) = &state.backend {
-                        let _ = backend.send(BackendCommand::GetChildren { store_id, node_id: parent_id });
-                    }
-                }
-
-                // Also load the new node so we can select it
-                if let Some(backend) = &state.backend {
-                    let _ = backend.send(BackendCommand::GetNode { store_id, node_id });
+                if is_expanded && is_folder {
+                    add_children_to_tree(store_id, child_id, nodes, children, expanded, items, depth + 1);
                 }
             }
-
-            // Handle other events as they're added
-            _ => {}
-        }
-    }
-}
-
-/// Update the tree view in the UI
-fn update_tree_view(window: &AppWindow, state: &AppState) {
-    let items: Vec<TreeItemData> = state
-        .tree_items
-        .iter()
-        .map(tree_item_to_slint)
-        .collect();
-
-    window.set_tree_items(ModelRc::new(VecModel::from(items)));
-}
-
-/// Extract text content from CRDT node content bytes
-fn get_node_content_text(content: &[u8]) -> String {
-    if content.is_empty() {
-        return String::new();
-    }
-
-    // Try to load as CRDT document and get text
-    match DocumentContent::load(content) {
-        Ok(doc) => {
-            match doc.get_text() {
-                Ok(text) => text,
-                Err(_) => String::from_utf8_lossy(content).to_string(),
-            }
-        }
-        Err(_) => {
-            // Fallback: try to decode as plain UTF-8
-            String::from_utf8_lossy(content).to_string()
         }
     }
 }
