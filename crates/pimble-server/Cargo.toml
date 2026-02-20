@@ -1,0 +1,23 @@
+[package]
+name = "pimble-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Local and remote server implementation for Pimble"
+
+[dependencies]
+pimble-core = { workspace = true }
+pimble-crdt = { workspace = true }
+pimble-store = { workspace = true }
+pimble-search = { workspace = true }
+pimble-rpc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+jsonrpsee = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }

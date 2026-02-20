@@ -1,0 +1,15 @@
+[package]
+name = "pimble-rpc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "JSON-RPC protocol definitions for Pimble"
+
+[dependencies]
+pimble-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+jsonrpsee = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }

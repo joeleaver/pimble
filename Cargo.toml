@@ -1,0 +1,94 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pimble-core",
+    "crates/pimble-crdt",
+    "crates/pimble-store",
+    "crates/pimble-search",
+    "crates/pimble-rpc",
+    "crates/pimble-server",
+    "crates/pimble-client",
+    "crates/pimble-plugins",
+    "crates/pimble-app",
+    "crates/pimble-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Pimble Contributors"]
+license = "MIT"
+repository = "https://github.com/pimble/pimble"
+
+[workspace.dependencies]
+# CRDT
+automerge = "0.5"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.22"
+
+# Identifiers
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+
+# JSON-RPC
+jsonrpsee = { version = "0.24", features = ["server", "client", "macros"] }
+
+# WASM runtime
+wasmtime = "27"
+
+# Vector database
+# lance = "0.10"  # Will enable in Phase 4
+
+# Full-text search
+tantivy = "0.22"
+
+# ML inference (Phase 4)
+# candle-core = "0.4"
+# candle-transformers = "0.4"
+# hf-hub = "0.3"
+# tokenizers = "0.15"
+
+# UI framework
+slint = { version = "1.9", features = ["backend-winit", "renderer-skia"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# URL handling
+url = { version = "2.5", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Async utilities
+futures = "0.3"
+async-trait = "0.1"
+
+# Channels for thread communication
+crossbeam-channel = "0.5"
+
+# Markdown parsing
+pulldown-cmark = "0.12"
+
+# File watching
+notify = "7.0"
+
+# Internal crates
+pimble-core = { path = "crates/pimble-core" }
+pimble-crdt = { path = "crates/pimble-crdt" }
+pimble-store = { path = "crates/pimble-store" }
+pimble-search = { path = "crates/pimble-search" }
+pimble-rpc = { path = "crates/pimble-rpc" }
+pimble-server = { path = "crates/pimble-server" }
+pimble-client = { path = "crates/pimble-client" }
+pimble-plugins = { path = "crates/pimble-plugins" }

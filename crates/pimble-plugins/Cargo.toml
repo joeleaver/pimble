@@ -1,0 +1,17 @@
+[package]
+name = "pimble-plugins"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "WASM plugin host and built-in plugins for Pimble"
+
+[dependencies]
+pimble-core = { workspace = true }
+pimble-crdt = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+wasmtime = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

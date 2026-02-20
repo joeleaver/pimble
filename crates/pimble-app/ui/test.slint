@@ -1,0 +1,30 @@
+// Minimal test layout
+
+export component TestWindow inherits Window {
+    title: "Test Layout";
+    min-width: 800px;
+    min-height: 600px;
+    background: #1e1e1e;
+
+    VerticalLayout {
+        Rectangle {
+            height: 30px;
+            background: #ff0000;  // RED - title bar area
+        }
+
+        Rectangle {
+            height: 35px;
+            background: #00ff00;  // GREEN - toolbar
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+            background: #0000ff;  // BLUE - main content
+        }
+
+        Rectangle {
+            height: 22px;
+            background: #ffff00;  // YELLOW - status bar
+        }
+    }
+}
