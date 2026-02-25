@@ -193,6 +193,70 @@ impl LocalStore {
         Ok(())
     }
 
+    /// Move a node to a new parent, optionally at a specific position
+    pub async fn move_node(&mut self, node_id: NodeId, new_parent_id: NodeId, position: Option<usize>) -> Result<()> {
+        // Get old parent_id from the node
+        let old_parent_id = {
+            let node = self.get_node(node_id).await?;
+            node.parent_id.ok_or_else(|| StoreError::InvalidOperation("Cannot move root node".into()))?
+        };
+
+        // Prevent moving node into itself
+        if node_id.0 == new_parent_id.0 {
+            return Err(StoreError::InvalidOperation("Cannot move node into itself".into()));
+        }
+
+        // Prevent cycles: walk up from new_parent to root and ensure we
+        // never encounter node_id (which would mean we're moving a parent
+        // into one of its own descendants).
+        {
+            let mut cursor = new_parent_id;
+            loop {
+                let parent = self.get_node(cursor).await?;
+                match parent.parent_id {
+                    None => break, // reached root — no cycle
+                    Some(pid) => {
+                        if pid == node_id {
+                            return Err(StoreError::InvalidOperation(
+                                "Cannot move a node into one of its own descendants".into(),
+                            ));
+                        }
+                        cursor = pid;
+                    }
+                }
+            }
+        }
+
+        // Remove from old parent's children
+        {
+            let old_parent = self.get_node_mut(old_parent_id).await?;
+            old_parent.remove_child(&node_id);
+        }
+
+        // Add to new parent's children at position
+        {
+            let new_parent = self.get_node_mut(new_parent_id).await?;
+            match position {
+                Some(pos) => {
+                    let pos = pos.min(new_parent.children.len());
+                    if !new_parent.children.contains(&node_id) {
+                        new_parent.children.insert(pos, node_id);
+                        new_parent.touch();
+                    }
+                }
+                None => new_parent.add_child(node_id),
+            }
+        }
+
+        // Update node's parent_id
+        {
+            let node = self.get_node_mut(node_id).await?;
+            node.parent_id = Some(new_parent_id);
+        }
+
+        Ok(())
+    }
+
     /// Update a node's CRDT content
     pub async fn update_node_content(&mut self, node_id: NodeId, content: Vec<u8>) -> Result<()> {
         let node = self.get_node_mut(node_id).await?;

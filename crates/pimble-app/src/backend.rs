@@ -29,6 +29,8 @@ pub enum BackendCommand {
     GetNode { store_id: StoreId, node_id: NodeId },
     GetChildren { store_id: StoreId, node_id: NodeId },
     SetNodeContent { store_id: StoreId, node_id: NodeId, text: String },
+    RenameNode { store_id: StoreId, node_id: NodeId, title: String },
+    MoveNode { store_id: StoreId, node_id: NodeId, new_parent_id: NodeId, position: Option<usize> },
 
     // Workspace operations
     CreateWorkspace { name: String, path: String },
@@ -54,6 +56,8 @@ pub enum BackendEvent {
     NodeLoaded { store_id: StoreId, node: Node },
     ChildrenLoaded { store_id: StoreId, parent_id: NodeId, children: Vec<Node> },
     NodeContentUpdated { store_id: StoreId, node_id: NodeId },
+    NodeRenamed { store_id: StoreId, node_id: NodeId },
+    NodeMoved { store_id: StoreId, node_id: NodeId, old_parent_id: NodeId, new_parent_id: NodeId },
 
     // Workspace events
     WorkspaceLoaded { workspace: Workspace },
@@ -222,6 +226,41 @@ async fn process_command(
             };
             match c.set_node_text(store_id, node_id, text).await {
                 Ok(()) => Some(BackendEvent::NodeContentUpdated { store_id, node_id }),
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::RenameNode { store_id, node_id, title } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            match c.get_node(store_id, node_id).await {
+                Ok(mut node) => {
+                    node.metadata.title = title;
+                    node.metadata.custom.insert(
+                        "explicit_title".to_string(),
+                        serde_json::Value::Bool(true),
+                    );
+                    match c.update_node_metadata(store_id, node_id, node.metadata).await {
+                        Ok(()) => Some(BackendEvent::NodeRenamed { store_id, node_id }),
+                        Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+                    }
+                }
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::MoveNode { store_id, node_id, new_parent_id, position } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            // Get old parent before moving
+            let old_parent_id = match c.get_node(store_id, node_id).await {
+                Ok(node) => node.parent_id.unwrap_or(NodeId(uuid::Uuid::nil())),
+                Err(e) => return Some(BackendEvent::Error { message: e.to_string() }),
+            };
+            match c.move_node(store_id, node_id, new_parent_id, position).await {
+                Ok(()) => Some(BackendEvent::NodeMoved { store_id, node_id, old_parent_id, new_parent_id }),
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
         }
