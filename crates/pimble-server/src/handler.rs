@@ -174,15 +174,11 @@ impl PimbleApiServer for RpcHandler {
         );
 
         let mut manager = self.store_manager.write().await;
-        let mut node = manager
-            .get_node(request.store_id, request.node_id)
+        manager
+            .update_node_metadata(request.store_id, request.node_id, request.metadata)
             .await
             .map_err(to_rpc_error)?;
 
-        node.metadata = request.metadata;
-        node.touch();
-
-        // Re-save the node (the manager will mark it dirty)
         manager
             .flush(request.store_id)
             .await
@@ -249,9 +245,24 @@ impl PimbleApiServer for RpcHandler {
 
     async fn move_node(
         &self,
-        _request: MoveNodeRequest,
+        request: MoveNodeRequest,
     ) -> Result<EmptyResponse, ErrorObjectOwned> {
-        // TODO: Implement node moving
+        info!(
+            "Moving node {} to parent {} in store {}",
+            request.node_id, request.new_parent_id, request.store_id
+        );
+
+        let mut manager = self.store_manager.write().await;
+        manager
+            .move_node(request.store_id, request.node_id, request.new_parent_id, request.position)
+            .await
+            .map_err(to_rpc_error)?;
+
+        manager
+            .flush(request.store_id)
+            .await
+            .map_err(to_rpc_error)?;
+
         Ok(EmptyResponse {})
     }
 

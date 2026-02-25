@@ -3,30 +3,23 @@
 use std::collections::{HashMap, HashSet};
 
 use pimble_core::{Node, NodeId, Store, StoreId, Workspace};
+use pimble_crdt::DocumentContent;
+use rinch::components::TreeNodeData;
 
 use crate::backend::BackendHandle;
 
-/// A flattened tree item for display
-#[derive(Debug, Clone, PartialEq)]
-pub struct TreeItem {
-    /// Unique identifier for this item (as string for Slint)
-    pub id: String,
-    /// The store this item belongs to
-    pub store_id: StoreId,
-    /// Node ID (None if this is a store header)
-    pub node_id: Option<NodeId>,
-    /// Display text
-    pub label: String,
-    /// Icon character
-    pub icon: String,
-    /// Indentation level
-    pub depth: i32,
-    /// Whether this item can be expanded (has children)
-    pub expandable: bool,
-    /// Whether this item is currently expanded
-    pub expanded: bool,
-    /// Whether this is a store header
-    pub is_store: bool,
+/// Extract text content from CRDT node content bytes
+pub fn get_node_content_text(content: &[u8]) -> String {
+    if content.is_empty() {
+        return String::new();
+    }
+
+    match DocumentContent::load(content) {
+        Ok(doc) => doc.get_text().unwrap_or_else(|_| {
+            String::from_utf8_lossy(content).to_string()
+        }),
+        Err(_) => String::from_utf8_lossy(content).to_string(),
+    }
 }
 
 /// Global application state
@@ -63,12 +56,6 @@ pub struct AppState {
 
     /// Error message to display
     pub error: Option<String>,
-
-    /// Flattened tree items for display
-    pub tree_items: Vec<TreeItem>,
-
-    /// Counter for generating unique tree item IDs
-    tree_item_counter: u64,
 }
 
 impl AppState {
@@ -85,125 +72,133 @@ impl AppState {
             expanded: HashSet::new(),
             loading: LoadingState::default(),
             error: None,
-            tree_items: Vec::new(),
-            tree_item_counter: 0,
         }
     }
 
-    /// Rebuild the flattened tree items from current state
-    pub fn rebuild_tree_items(&mut self) {
-        self.tree_items.clear();
-        self.tree_item_counter = 0;
+    /// Build Rinch TreeNodeData hierarchy from current state.
+    /// Root children are returned as top-level items (stores appear as headings, not tree nodes).
+    pub fn build_tree_data(&self) -> Vec<TreeNodeData> {
+        let mut result = Vec::new();
+        for store in self.stores.values() {
+            result.extend(self.build_children_data(store.id, store.root_node_id));
+        }
+        result
+    }
 
-        // Collect store info first to avoid borrow issues
-        let stores_info: Vec<_> = self.stores.values()
-            .map(|s| (s.id, s.root_node_id, s.name.clone()))
-            .collect();
-
-        for (store_id, root_node_id, store_name) in stores_info {
-            // Add store header
-            let store_expanded = self.expanded.contains(&(store_id, root_node_id));
-
-            let item_id = self.next_tree_item_id();
-            self.tree_items.push(TreeItem {
-                id: format!("store_{}", item_id),
-                store_id,
-                node_id: None,
-                label: store_name,
-                icon: "📁".to_string(),
-                depth: 0,
-                expandable: true,
-                expanded: store_expanded,
-                is_store: true,
-            });
-
-            // Add children if expanded
-            if store_expanded {
-                self.add_children_to_tree(store_id, root_node_id, 1);
-            }
+    /// Heading text for the sidebar (store name or fallback)
+    pub fn sidebar_heading(&self) -> String {
+        match self.stores.len() {
+            0 => String::new(),
+            1 => self.stores.values().next().unwrap().name.clone(),
+            n => format!("{} Stores", n),
         }
     }
 
-    fn add_children_to_tree(&mut self, store_id: StoreId, parent_id: NodeId, depth: i32) {
-        if let Some(child_ids) = self.children.get(&(store_id, parent_id)).cloned() {
-            for child_id in child_ids {
-                if let Some(node) = self.nodes.get(&(store_id, child_id)).cloned() {
-                    let is_folder = node.node_type == "folder";
-                    let is_expanded = self.expanded.contains(&(store_id, child_id));
+    /// Compute the display label for a node in the tree.
+    ///
+    /// - If `explicit_title` custom flag is set and title is non-empty → use title
+    /// - Else if node content has text → first line, up to 25 chars (+ "…" if truncated)
+    /// - Else if title is non-empty → use title (legacy nodes)
+    /// - Else → "Untitled"
+    pub fn display_label(&self, store_id: StoreId, node_id: NodeId) -> String {
+        let Some(node) = self.nodes.get(&(store_id, node_id)) else {
+            return "Untitled".to_string();
+        };
 
-                    let icon = if is_folder { "📂" } else { "📄" };
+        let has_explicit_title = node.metadata.custom
+            .get("explicit_title")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
-                    let _item_id = self.next_tree_item_id();
-                    self.tree_items.push(TreeItem {
-                        id: format!("node_{}_{}", store_id, child_id),
-                        store_id,
-                        node_id: Some(child_id),
-                        label: node.metadata.title.clone(),
-                        icon: icon.to_string(),
-                        depth,
-                        expandable: is_folder,
-                        expanded: is_expanded,
-                        is_store: false,
-                    });
-
-                    // Recursively add children if expanded
-                    if is_expanded && is_folder {
-                        self.add_children_to_tree(store_id, child_id, depth + 1);
-                    }
-                }
-            }
+        if has_explicit_title && !node.metadata.title.is_empty() {
+            return node.metadata.title.clone();
         }
-    }
 
-    fn next_tree_item_id(&mut self) -> u64 {
-        self.tree_item_counter += 1;
-        self.tree_item_counter
-    }
-
-    /// Find a tree item by ID and return its store_id and node_id
-    pub fn find_tree_item(&self, id: &str) -> Option<(StoreId, Option<NodeId>)> {
-        self.tree_items
-            .iter()
-            .find(|item| item.id == id)
-            .map(|item| (item.store_id, item.node_id))
-    }
-
-    /// Toggle expansion of a tree item
-    pub fn toggle_expansion(&mut self, id: &str) {
-        if let Some(item) = self.tree_items.iter().find(|item| item.id == id) {
-            let key = if let Some(node_id) = item.node_id {
-                (item.store_id, node_id)
+        let content = get_node_content_text(&node.content);
+        // Use only the first non-empty line to avoid newlines in tree labels
+        let first_line = content
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+        if !first_line.is_empty() {
+            let char_count = first_line.chars().count();
+            if char_count > 25 {
+                let truncated: String = first_line.chars().take(25).collect();
+                return format!("{truncated}…");
             } else {
-                // Store header - use root node
-                if let Some(store) = self.stores.get(&item.store_id) {
-                    (item.store_id, store.root_node_id)
-                } else {
-                    return;
-                }
-            };
-
-            if self.expanded.contains(&key) {
-                self.expanded.remove(&key);
-            } else {
-                self.expanded.insert(key);
+                return first_line.to_string();
             }
         }
+
+        if !node.metadata.title.is_empty() {
+            return node.metadata.title.clone();
+        }
+
+        "Untitled".to_string()
+    }
+
+    /// Build TreeNodeData for children of the given parent node.
+    fn build_children_data(&self, store_id: StoreId, parent_id: NodeId) -> Vec<TreeNodeData> {
+        let Some(child_ids) = self.children.get(&(store_id, parent_id)) else {
+            return Vec::new();
+        };
+        let mut result = Vec::new();
+        for &child_id in child_ids {
+            let label = self.display_label(store_id, child_id);
+            let tree_node = TreeNodeData::new(
+                format!("node_{}_{}", store_id, child_id),
+                &label,
+            );
+
+            // Always check for children — any node can have children via drag-and-drop
+            let children_data = self.build_children_data(store_id, child_id);
+            let has_children = !children_data.is_empty();
+            if has_children {
+                result.push(tree_node.with_children(children_data));
+            } else {
+                result.push(tree_node);
+            }
+        }
+        result
     }
 
     /// Get the selected node (if any)
     pub fn selected_node(&self) -> Option<&Node> {
         let selected_id = self.selected_id.as_ref()?;
-        let item = self.tree_items.iter().find(|item| &item.id == selected_id)?;
-        let node_id = item.node_id?;
-        self.nodes.get(&(item.store_id, node_id))
+        let (store_id, node_id_opt) = self.parse_tree_value(selected_id)?;
+        let node_id = node_id_opt?;
+        self.nodes.get(&(store_id, node_id))
     }
 
     /// Get the store_id and node_id of the selected node (if any)
     pub fn selected_store_and_node(&self) -> Option<(StoreId, NodeId)> {
         let selected_id = self.selected_id.as_ref()?;
-        let item = self.tree_items.iter().find(|item| &item.id == selected_id)?;
-        let node_id = item.node_id?;
-        Some((item.store_id, node_id))
+        let (store_id, node_id) = self.parse_tree_value(selected_id)?;
+        let node_id = node_id?;
+        Some((store_id, node_id))
+    }
+
+    /// Parse a tree value ID like "store_{uuid}" or "node_{store_uuid}_{node_uuid}"
+    pub fn parse_tree_value(&self, value: &str) -> Option<(StoreId, Option<NodeId>)> {
+        if let Some(rest) = value.strip_prefix("store_") {
+            let uuid: uuid::Uuid = rest.parse().ok()?;
+            Some((StoreId(uuid), None))
+        } else if let Some(rest) = value.strip_prefix("node_") {
+            // Format: node_{store_uuid}_{node_uuid}
+            // UUIDs are 36 chars each
+            if rest.len() >= 73 {
+                let store_str = &rest[..36];
+                let node_str = &rest[37..];
+                let store_uuid: uuid::Uuid = store_str.parse().ok()?;
+                let node_uuid: uuid::Uuid = node_str.parse().ok()?;
+                Some((StoreId(store_uuid), Some(NodeId(node_uuid))))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     }
 }
 

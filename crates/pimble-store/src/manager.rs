@@ -90,11 +90,28 @@ impl StoreManager {
         store.get_node(node_id).await.map(|n| n.clone())
     }
 
+    /// Update a node's metadata in-place and mark it dirty
+    pub async fn update_node_metadata(&mut self, store_id: StoreId, node_id: NodeId, metadata: pimble_core::NodeMetadata) -> Result<()> {
+        let store = self.local_stores.get_mut(&store_id)
+            .ok_or(StoreError::NotOpen(store_id))?;
+        let node = store.get_node_mut(node_id).await?;
+        node.metadata = metadata;
+        node.touch();
+        Ok(())
+    }
+
     /// Create a node in a store
     pub async fn create_node(&mut self, store_id: StoreId, node: Node, parent_id: Option<NodeId>) -> Result<NodeId> {
         let store = self.local_stores.get_mut(&store_id)
             .ok_or(StoreError::NotOpen(store_id))?;
         store.create_node(node, parent_id).await
+    }
+
+    /// Move a node to a new parent in a store
+    pub async fn move_node(&mut self, store_id: StoreId, node_id: NodeId, new_parent_id: NodeId, position: Option<usize>) -> Result<()> {
+        let store = self.local_stores.get_mut(&store_id)
+            .ok_or(StoreError::NotOpen(store_id))?;
+        store.move_node(node_id, new_parent_id, position).await
     }
 
     /// Delete a node from a store

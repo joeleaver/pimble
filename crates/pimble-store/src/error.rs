@@ -20,6 +20,9 @@ pub enum StoreError {
     #[error("Store not open: {0}")]
     NotOpen(StoreId),
 
+    #[error("Invalid operation: {0}")]
+    InvalidOperation(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
