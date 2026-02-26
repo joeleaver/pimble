@@ -54,10 +54,10 @@ tantivy = "0.22"
 # tokenizers = "0.15"
 
 # UI framework
-rinch = { path = "../rinch/crates/rinch", features = ["desktop", "components", "theme", "file-dialogs", "clipboard", "debug"] }
-rinch-tabler-icons = { path = "../rinch/crates/rinch-tabler-icons" }
-rinch-editor = { path = "../rinch/crates/rinch-editor" }
-rinch-editor-components = { path = "../rinch/crates/rinch-editor-components" }
+rinch = { git = "https://github.com/joeleaver/rinch.git", features = ["desktop", "components", "theme", "file-dialogs", "clipboard", "debug"] }
+rinch-tabler-icons = { git = "https://github.com/joeleaver/rinch.git" }
+rinch-editor = { git = "https://github.com/joeleaver/rinch.git" }
+rinch-editor-components = { git = "https://github.com/joeleaver/rinch.git" }
 
 # Error handling
 thiserror = "2.0"
