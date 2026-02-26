@@ -109,8 +109,8 @@ pub struct UpdateNodeMetadataRequest {
 pub struct UpdateNodeContentRequest {
     pub store_id: StoreId,
     pub node_id: NodeId,
-    /// Base64-encoded CRDT changes
-    pub changes: Vec<String>,
+    /// Base64-encoded document bytes (full replacement)
+    pub content: String,
 }
 
 /// Request to set a node's text content (replaces all content)

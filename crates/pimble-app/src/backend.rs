@@ -10,6 +10,7 @@ use std::thread;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use pimble_client::PimbleClient;
 use pimble_core::{Node, NodeId, Store, StoreId, Workspace};
+use pimble_server::PimbleServer;
 use tokio::runtime::Runtime;
 
 /// Commands sent from UI to backend
@@ -28,7 +29,7 @@ pub enum BackendCommand {
     CreateNode { store_id: StoreId, parent_id: Option<NodeId>, title: String },
     GetNode { store_id: StoreId, node_id: NodeId },
     GetChildren { store_id: StoreId, node_id: NodeId },
-    SetNodeContent { store_id: StoreId, node_id: NodeId, text: String },
+    SetNodeContent { store_id: StoreId, node_id: NodeId, content: Vec<u8> },
     RenameNode { store_id: StoreId, node_id: NodeId, title: String },
     MoveNode { store_id: StoreId, node_id: NodeId, new_parent_id: NodeId, position: Option<usize> },
 
@@ -108,6 +109,36 @@ async fn backend_loop(
 ) {
     let mut client: Option<PimbleClient> = None;
 
+    // Start embedded server and auto-connect
+    let mut server = PimbleServer::new();
+    match server.start().await {
+        Ok(()) => {
+            let url = format!("http://{}", server.addr());
+            tracing::info!("Embedded server started on {}", server.addr());
+            match PimbleClient::connect(&url).await {
+                Ok(c) => {
+                    client = Some(c);
+                    let _ = event_tx.try_send(BackendEvent::Connected);
+                    signal_ui();
+                }
+                Err(e) => {
+                    tracing::error!("Failed to connect to embedded server: {}", e);
+                    let _ = event_tx.try_send(BackendEvent::Error {
+                        message: format!("Failed to connect: {}", e),
+                    });
+                    signal_ui();
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to start embedded server: {}", e);
+            let _ = event_tx.try_send(BackendEvent::Error {
+                message: format!("Server failed to start: {}", e),
+            });
+            signal_ui();
+        }
+    }
+
     loop {
         // Block waiting for commands
         let cmd = match cmd_rx.recv() {
@@ -119,9 +150,15 @@ async fn backend_loop(
 
         if let Some(event) = event {
             let _ = event_tx.try_send(event);
-            signal_ui(); // Tell Makepad to redraw
+            signal_ui();
         }
     }
+
+    // Cleanup: stop server and flush stores
+    let store_manager = server.store_manager();
+    let _ = server.stop().await;
+    let mut manager = store_manager.write().await;
+    let _ = manager.flush_all().await;
 }
 
 async fn process_command(
@@ -220,11 +257,11 @@ async fn process_command(
             }
         }
 
-        BackendCommand::SetNodeContent { store_id, node_id, text } => {
+        BackendCommand::SetNodeContent { store_id, node_id, content } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
-            match c.set_node_text(store_id, node_id, text).await {
+            match c.set_node_content_bytes(store_id, node_id, content).await {
                 Ok(()) => Some(BackendEvent::NodeContentUpdated { store_id, node_id }),
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }

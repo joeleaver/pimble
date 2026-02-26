@@ -31,5 +31,7 @@ uuid = { workspace = true }
 futures = { workspace = true }
 crossbeam-channel = { workspace = true }
 pimble-crdt = { workspace = true }
+pimble-server = { workspace = true }
+pimble-store = { workspace = true }
 chrono = { workspace = true }
 dirs = "6"

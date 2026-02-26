@@ -176,17 +176,20 @@ impl PimbleClient {
         Ok(())
     }
 
-    /// Update a node's content
-    pub async fn update_node_content(
+    /// Update a node's content with raw document bytes
+    pub async fn set_node_content_bytes(
         &self,
         store_id: StoreId,
         node_id: NodeId,
-        changes: Vec<String>,
+        content: Vec<u8>,
     ) -> Result<()> {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&content);
+
         let request = UpdateNodeContentRequest {
             store_id,
             node_id,
-            changes,
+            content: encoded,
         };
 
         self.client

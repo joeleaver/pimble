@@ -5,15 +5,24 @@ use std::collections::{HashMap, HashSet};
 use pimble_core::{Node, NodeId, Store, StoreId, Workspace};
 use pimble_crdt::DocumentContent;
 use rinch::components::TreeNodeData;
+use rinch_editor::EditorDocument;
 
 use crate::backend::BackendHandle;
 
-/// Extract text content from CRDT node content bytes
+/// Extract text content from node content bytes.
+///
+/// Tries new format (EditorDocument) first, falls back to old format (DocumentContent).
 pub fn get_node_content_text(content: &[u8]) -> String {
     if content.is_empty() {
         return String::new();
     }
 
+    // Try new format first (EditorDocument with rich blocks)
+    if let Ok(doc) = EditorDocument::from_bytes(content) {
+        return doc.to_markdown();
+    }
+
+    // Fall back to old format (DocumentContent with flat text)
     match DocumentContent::load(content) {
         Ok(doc) => doc.get_text().unwrap_or_else(|_| {
             String::from_utf8_lossy(content).to_string()

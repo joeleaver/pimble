@@ -4,18 +4,161 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
-use pimble_core::{Node, NodeId, Store, StoreId};
+use pimble_core::NodeId;
 use rinch::prelude::*;
+use rinch::core::ce::with_active_ce_api;
 use rinch::core::{request_focus, set_keyboard_interceptor, clear_keyboard_interceptor};
 use rinch::menu::{Menu, MenuItem};
-use rinch_editor::prelude::*;
+use rinch_editor::document::EditorDocument;
 use rinch_editor_components::{render_toolbar, ToolbarConfig};
 use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
 
 use crate::backend::{BackendCommand, BackendEvent, BackendHandle};
 use crate::state::{get_node_content_text, AppState, ConnectionState};
+
+/// Editor content styles for the contenteditable area.
+///
+/// Designed for dark mode. Scoped to `.editor-content` so they don't leak
+/// into the rest of the UI.
+const EDITOR_CSS: &str = "
+.editor-content {
+    font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    font-size: 15px;
+    line-height: 1.7;
+    color: var(--rinch-color-text);
+    cursor: text;
+}
+
+/* --- Block elements --- */
+
+.editor-content p { margin: 0 0 4px 0; }
+
+.editor-content h1 {
+    font-size: 1.75em;
+    font-weight: 700;
+    margin: 20px 0 8px 0;
+    color: var(--rinch-color-text);
+}
+
+.editor-content h2 {
+    font-size: 1.4em;
+    font-weight: 700;
+    margin: 16px 0 6px 0;
+    color: var(--rinch-color-text);
+}
+
+.editor-content h3 {
+    font-size: 1.15em;
+    font-weight: 600;
+    margin: 14px 0 4px 0;
+    color: var(--rinch-color-text);
+}
+
+.editor-content h4 {
+    font-size: 1em;
+    font-weight: 600;
+    margin: 12px 0 4px 0;
+    color: var(--rinch-color-text);
+}
+
+.editor-content h5 {
+    font-size: 0.95em;
+    font-weight: 600;
+    margin: 10px 0 2px 0;
+    color: var(--rinch-color-dimmed);
+}
+
+.editor-content h6 {
+    font-size: 0.85em;
+    font-weight: 600;
+    margin: 10px 0 2px 0;
+    color: var(--rinch-color-dimmed);
+}
+
+/* --- Blockquotes --- */
+
+.editor-content blockquote {
+    border-left: 3px solid var(--rinch-color-border);
+    padding-left: 14px;
+    margin: 10px 0;
+    color: var(--rinch-color-dimmed);
+}
+
+.editor-content blockquote p { margin: 0 0 4px 0; }
+
+/* --- Code --- */
+
+.editor-content code {
+    color: #e06c75;
+    font-size: 0.88em;
+}
+
+.editor-content pre {
+    background: var(--rinch-color-dark-5);
+    border-radius: 6px;
+    padding: 12px 14px;
+    margin: 10px 0;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.editor-content pre code {
+    color: #abb2bf;
+    font-size: inherit;
+}
+
+/* --- Lists --- */
+
+.editor-content ul,
+.editor-content ol {
+    margin: 6px 0;
+    padding-left: 8px;
+}
+
+.editor-content li {
+    margin: 2px 0;
+    padding-left: 4px;
+}
+
+.editor-content ul > li::before {
+    content: \"\\2022  \";
+    color: var(--rinch-color-dimmed);
+}
+
+.editor-content ol > li::before {
+    content: \"\\2013  \";
+    color: var(--rinch-color-dimmed);
+}
+
+.editor-content ul ul > li::before {
+    content: \"\\25E6  \";
+}
+
+.editor-content ul ul ul > li::before {
+    content: \"\\25AA  \";
+}
+
+/* --- Horizontal rule --- */
+
+.editor-content hr {
+    border: none;
+    border-top: 1px solid var(--rinch-color-border);
+    margin: 16px 0;
+}
+
+/* --- Inline formatting --- */
+
+.editor-content strong { font-weight: 700; color: var(--rinch-color-text); }
+.editor-content em { font-style: italic; }
+.editor-content u { text-decoration: underline; }
+.editor-content s { text-decoration: line-through; color: var(--rinch-color-dimmed); }
+.editor-content a { color: var(--rinch-primary-color); text-decoration: underline; }
+.editor-content sub { font-size: 0.8em; }
+.editor-content sup { font-size: 0.8em; }
+";
 
 fn state_file_path() -> std::path::PathBuf {
     let config_dir = dirs::config_dir()
@@ -54,7 +197,7 @@ struct DeferredUpdates {
     tree_data: Option<Vec<TreeNodeData>>,
     expand_nodes: Vec<String>,
     node_title: Option<String>,
-    editor_content: Option<String>,
+    editor_content: Option<Vec<u8>>,
 }
 
 /// Process backend events and update signals
@@ -69,8 +212,7 @@ fn process_backend_events(
     tree_data: Signal<Vec<TreeNodeData>>,
     tree_state: UseTreeReturn,
     node_title: Signal<String>,
-    editor_rc: Rc<RefCell<Editor>>,
-    bridge_cell: Rc<RefCell<Option<EditorBridge>>>,
+    ce_div_cell: &Rc<RefCell<Option<NodeHandle>>>,
 ) {
     let (_events, deferred) = {
         let events: Vec<BackendEvent> = {
@@ -188,7 +330,7 @@ fn process_backend_events(
                         if let Some((sel_store_id, Some(sel_node_id))) = state.parse_tree_value(selected_id) {
                             if sel_store_id == *store_id && sel_node_id == node_id {
                                 deferred.node_title = Some(state.display_label(*store_id, node_id));
-                                deferred.editor_content = Some(get_node_content_text(&content_bytes));
+                                deferred.editor_content = Some(content_bytes);
                             }
                         }
                     }
@@ -291,14 +433,61 @@ fn process_backend_events(
     if let Some(v) = deferred.node_title {
         node_title.set(v);
     }
-    if let Some(content) = deferred.editor_content {
-        if let Ok(mut ed) = editor_rc.try_borrow_mut() {
-            ed.set_markdown(&content).ok();
-        }
-        if let Some(bridge) = bridge_cell.borrow().as_ref() {
-            bridge.reconcile();
+    if let Some(content_bytes) = deferred.editor_content {
+        if let Some(ce_div) = ce_div_cell.borrow().as_ref() {
+            load_content_into_ce(&content_bytes, ce_div);
         }
     }
+}
+
+/// Save current CE content as Automerge bytes.
+fn save_content_via_ce_api() -> Vec<u8> {
+    let blocks = with_active_ce_api(|api| api.borrow().extract_content()).unwrap_or_default();
+    let mut doc = EditorDocument::from_block_data(&blocks);
+    doc.to_bytes()
+}
+
+/// Convert content bytes to HTML for rendering in the CE div.
+fn content_bytes_to_html(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "<p><br></p>".to_string();
+    }
+    if let Ok(doc) = EditorDocument::from_bytes(bytes) {
+        let html = doc.to_html();
+        if html.is_empty() { "<p><br></p>".to_string() } else { html }
+    } else {
+        // Fall back to old format
+        let text = get_node_content_text(bytes);
+        if text.is_empty() {
+            "<p><br></p>".to_string()
+        } else {
+            format!("<p>{}</p>", text)
+        }
+    }
+}
+
+/// Load content bytes into the CE div.
+///
+/// If the CE API is active (user has clicked into the editor), uses `load_content()`
+/// which properly resets cursor and undo state. Otherwise, sets innerHTML directly
+/// so content is visible — a fresh CeOps will be created on next click.
+fn load_content_into_ce(bytes: &[u8], ce_div: &NodeHandle) {
+    // Try CE API first (properly resets cursor/undo state)
+    if !bytes.is_empty() {
+        if let Ok(doc) = EditorDocument::from_bytes(bytes) {
+            let blocks = doc.to_block_data();
+            let used_api = with_active_ce_api(|api| {
+                api.borrow_mut().load_content(&blocks);
+            })
+            .is_some();
+            if used_api {
+                return;
+            }
+        }
+    }
+    // Fall back to innerHTML (for when CE isn't focused yet)
+    let html = content_bytes_to_html(bytes);
+    ce_div.set_inner_html(&html);
 }
 
 /// Main application entry point
@@ -318,10 +507,8 @@ pub fn run() {
     // Double-click detection for rename: (last_click_time, last_click_value)
     let last_click: Rc<Cell<(Instant, String)>> = Rc::new(Cell::new((Instant::now(), String::new())));
 
-    // Rich text editor (shared between component, event processing, and tree selection)
-    let editor = Editor::new(Schema::starter_kit(), EditorConfig::default()).unwrap();
-    let editor_rc: Rc<RefCell<Editor>> = Rc::new(RefCell::new(editor));
-    let bridge_cell: Rc<RefCell<Option<EditorBridge>>> = Rc::new(RefCell::new(None));
+    // Shared CE div handle for content loading from backend events
+    let ce_div_cell: Rc<RefCell<Option<NodeHandle>>> = Rc::new(RefCell::new(None));
 
     // Persistent tree state — created once, preserves expanded/selected across data changes
     let tree_state = UseTreeReturn::new(UseTreeOptions::default());
@@ -333,8 +520,7 @@ pub fn run() {
     // Set up event processing via thread-local so run_on_main_thread
     // can trigger it without capturing non-Send types.
     let state_for_events = state.clone();
-    let editor_for_events = editor_rc.clone();
-    let bridge_for_events = bridge_cell.clone();
+    let ce_div_for_events = ce_div_cell.clone();
     EVENT_PROCESSOR.with(|cell| {
         *cell.borrow_mut() = Some(Box::new(move || {
             process_backend_events(
@@ -344,8 +530,7 @@ pub fn run() {
                 tree_data,
                 tree_state,
                 node_title,
-                editor_for_events.clone(),
-                bridge_for_events.clone(),
+                &ce_div_for_events,
             );
         }));
     });
@@ -431,7 +616,7 @@ pub fn run() {
         .item(MenuItem::new("Paste").shortcut("Ctrl+V").enabled(false).on_click(|| {}));
 
     let view_menu = Menu::new()
-        .item(MenuItem::new("Toggle Sidebar").shortcut("Ctrl+B").on_click(|| {
+        .item(MenuItem::new("Toggle Sidebar").shortcut("Ctrl+\\").on_click(|| {
             tracing::info!("Toggle sidebar");
         }))
         .separator()
@@ -463,6 +648,39 @@ pub fn run() {
         ..Default::default()
     };
 
+    // Save-on-close: register a thread-local that the close callback invokes.
+    // WindowProps requires Send+Sync but our state is Rc-based (main thread only),
+    // so we use the same thread-local pattern as EVENT_PROCESSOR.
+    let close_state = state.clone();
+    thread_local! {
+        static CLOSE_HANDLER: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+    CLOSE_HANDLER.with(|cell| {
+        *cell.borrow_mut() = Some(Box::new(move || {
+            let bytes = save_content_via_ce_api();
+            let st = close_state.borrow();
+            if let Some(selected_id) = &st.selected_id {
+                if let Some((store_id, Some(node_id))) = st.parse_tree_value(selected_id) {
+                    if let Some(backend) = &st.backend {
+                        backend.send(BackendCommand::SetNodeContent {
+                            store_id,
+                            node_id,
+                            content: bytes,
+                        });
+                    }
+                }
+            }
+        }));
+    });
+    let on_close: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| {
+        CLOSE_HANDLER.with(|cell| {
+            if let Some(f) = cell.borrow().as_ref() {
+                f();
+            }
+        });
+        true // proceed with close
+    });
+
     let props = WindowProps {
         title: "Pimble".into(),
         width: 1200,
@@ -470,20 +688,19 @@ pub fn run() {
         borderless: true,
         resizable: true,
         menu_in_titlebar: true,
+        on_close_requested: Some(on_close),
         ..Default::default()
     };
 
     // Build app component - parameter must be named __scope for the rsx! macro
     let app_state = state.clone();
-    let editor_for_app = editor_rc.clone();
-    let bridge_for_app = bridge_cell.clone();
+    let ce_div_for_app = ce_div_cell.clone();
     let app_component = move |__scope: &mut RenderScope| -> NodeHandle {
         // Tree callbacks
         let select_state = app_state.clone();
-        let select_editor = editor_for_app.clone();
-        let select_bridge = bridge_for_app.clone();
         let select_title = node_title;
 
+        let select_ce_div = ce_div_for_app.clone();
         let select_last_click = last_click.clone();
         let on_tree_select = ValueCallback::new(move |value: String| {
             tracing::info!("Tree node selected: {}", value);
@@ -528,7 +745,7 @@ pub fn run() {
 
             // Save current editor content to previously selected node
             {
-                let md = select_editor.borrow().get_markdown();
+                let bytes = save_content_via_ce_api();
                 let st = select_state.borrow();
                 if let Some(prev_id) = &st.selected_id {
                     if let Some((store_id, Some(node_id))) = st.parse_tree_value(prev_id) {
@@ -536,15 +753,15 @@ pub fn run() {
                             backend.send(BackendCommand::SetNodeContent {
                                 store_id,
                                 node_id,
-                                text: md,
+                                content: bytes,
                             });
                         }
                     }
                 }
             }
 
-            // Update selection and collect title + content
-            let (title_opt, content_opt) = {
+            // Update selection and collect title + content bytes
+            let (title_opt, content_bytes_opt) = {
                 let mut st = select_state.borrow_mut();
                 st.selected_id = Some(value.clone());
 
@@ -552,7 +769,7 @@ pub fn run() {
                     if let Some(node_id) = node_id_opt {
                         if let Some(node) = st.nodes.get(&(store_id, node_id)) {
                             let label = st.display_label(store_id, node_id);
-                            (Some(label), Some(get_node_content_text(&node.content)))
+                            (Some(label), Some(node.content.clone()))
                         } else {
                             if let Some(backend) = &st.backend {
                                 backend.send(BackendCommand::GetNode { store_id, node_id });
@@ -561,14 +778,7 @@ pub fn run() {
                         }
                     } else if let Some(store) = st.stores.get(&store_id) {
                         let title = store.name.clone();
-                        let path_str = store.local_path()
-                            .map(|p| p.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "remote".to_string());
-                        let content = format!(
-                            "Store: {}\nPath: {}\nRoot Node: {:?}",
-                            store.name, path_str, store.root_node_id
-                        );
-                        (Some(title), Some(content))
+                        (Some(title), Some(Vec::new()))
                     } else {
                         (None, None)
                     }
@@ -582,12 +792,9 @@ pub fn run() {
             }
 
             // Load content into editor
-            let content = content_opt.unwrap_or_default();
-            if let Ok(mut ed) = select_editor.try_borrow_mut() {
-                ed.set_markdown(&content).ok();
-            }
-            if let Some(bridge) = select_bridge.borrow().as_ref() {
-                bridge.reconcile();
+            let content_bytes = content_bytes_opt.unwrap_or_default();
+            if let Some(ce_div) = select_ce_div.borrow().as_ref() {
+                load_content_into_ce(&content_bytes, ce_div);
             }
         });
 
@@ -871,19 +1078,15 @@ pub fn run() {
 
         let ce_div = __scope.create_element("div");
         ce_div.set_attribute("contenteditable", "true");
-        ce_div.set_attribute("style", "min-height: 200px; outline: none; flex: 1; font-family: inherit; line-height: 1.6;");
-
-        let bridge = EditorBridge::mount(
-            __scope,
-            editor_for_app.clone(),
-            ce_div.clone(),
-            on_editor_change.clone(),
-        );
-        *bridge_for_app.borrow_mut() = Some(bridge);
+        ce_div.set_attribute("class", "editor-content");
+        ce_div.set_attribute("style", "min-height: 200px; outline: none; flex: 1;");
+        // Start with an empty paragraph so the CE div is clickable
+        ce_div.set_inner_html("<p><br></p>");
+        // Share ce_div handle for content loading from backend events
+        *ce_div_for_app.borrow_mut() = Some(ce_div.clone());
 
         let toolbar_handle = render_toolbar(
             __scope,
-            editor_for_app.clone(),
             &ToolbarConfig::default_markdown(),
             on_editor_change,
         );
@@ -910,7 +1113,7 @@ pub fn run() {
                 show_close: true,
                 on_close: Callback::new(|| close_current_window()),
 
-                // Compact tree chevrons/spacers + dark-mode overrides for tree and editor toolbar
+                // Tree overrides + toolbar dark-mode + editor content styles
                 style { "\
                     .rinch-tree__chevron, .rinch-tree__spacer { width: 0.875rem; height: 0.875rem; margin-right: 2px; } \
                     .rinch-tree__chevron svg, .rinch-tree__icon svg { width: 0.8rem; height: 0.8rem; } \
@@ -922,6 +1125,7 @@ pub fn run() {
                     .rinch-tree__node-content--selected .rinch-tree__chevron { color: var(--rinch-primary-color-2); } \
                     .editor-toolbar { background: var(--rinch-color-surface) !important; border-bottom-color: var(--rinch-color-border) !important; } \
                 " }
+                style { {EDITOR_CSS} }
 
                 // Main Content
                 div {
@@ -1004,10 +1208,10 @@ pub fn run() {
         Some(menus),
     );
 
-    // Drop the EditorBridge while thread-local storage is still alive,
-    // to avoid panic in unmount() during TLS destruction.
-    bridge_cell.borrow_mut().take();
     EVENT_PROCESSOR.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+    CLOSE_HANDLER.with(|cell| {
         *cell.borrow_mut() = None;
     });
 }

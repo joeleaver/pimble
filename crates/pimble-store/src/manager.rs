@@ -121,6 +121,13 @@ impl StoreManager {
         store.delete_node(node_id).await
     }
 
+    /// Update a node's raw content bytes
+    pub async fn update_node_content(&mut self, store_id: StoreId, node_id: NodeId, content: Vec<u8>) -> Result<()> {
+        let store = self.local_stores.get_mut(&store_id)
+            .ok_or(StoreError::NotOpen(store_id))?;
+        store.update_node_content(node_id, content).await
+    }
+
     /// Get a node's CRDT document
     pub async fn get_node_document(&mut self, store_id: StoreId, node_id: NodeId) -> Result<CrdtDocument> {
         let store = self.local_stores.get_mut(&store_id)

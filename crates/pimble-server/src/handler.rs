@@ -189,9 +189,29 @@ impl PimbleApiServer for RpcHandler {
 
     async fn update_node_content(
         &self,
-        _request: UpdateNodeContentRequest,
+        request: UpdateNodeContentRequest,
     ) -> Result<EmptyResponse, ErrorObjectOwned> {
-        // TODO: Apply CRDT changes
+        info!(
+            "Updating content for node {} in store {}",
+            request.node_id, request.store_id
+        );
+
+        use base64::Engine;
+        let content = base64::engine::general_purpose::STANDARD
+            .decode(&request.content)
+            .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
+
+        let mut manager = self.store_manager.write().await;
+        manager
+            .update_node_content(request.store_id, request.node_id, content)
+            .await
+            .map_err(to_rpc_error)?;
+
+        manager
+            .flush(request.store_id)
+            .await
+            .map_err(to_rpc_error)?;
+
         Ok(EmptyResponse {})
     }
 
