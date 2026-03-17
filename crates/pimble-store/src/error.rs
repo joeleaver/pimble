@@ -23,6 +23,15 @@ pub enum StoreError {
     #[error("Invalid operation: {0}")]
     InvalidOperation(String),
 
+    #[error("Mount cycle detected: {chain:?}")]
+    MountCycle { chain: Vec<(StoreId, NodeId)> },
+
+    #[error("Mount depth exceeded: {depth} (max 16)")]
+    MountDepthExceeded { depth: usize },
+
+    #[error("Mount source store unavailable: {store_id}")]
+    MountSourceUnavailable { store_id: StoreId },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

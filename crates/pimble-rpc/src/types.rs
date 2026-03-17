@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use pimble_core::{Node, NodeId, NodeMetadata, Store, StoreId, Workspace};
+use pimble_core::{MountRef, MountState, Node, NodeId, NodeMetadata, Store, StoreId, Workspace};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -150,6 +150,40 @@ pub struct GetChildrenRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetChildrenResponse {
     pub children: Vec<Node>,
+}
+
+// ============================================================================
+// Mount Operations
+// ============================================================================
+
+/// Request to create a mount point
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateMountRequest {
+    pub store_id: StoreId,
+    pub parent_id: NodeId,
+    pub source_store_id: StoreId,
+    pub source_node_id: NodeId,
+    pub title: Option<String>,
+}
+
+/// Response after creating a mount point
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateMountResponse {
+    pub node_id: NodeId,
+}
+
+/// Request to get mount state
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetMountStateRequest {
+    pub store_id: StoreId,
+    pub node_id: NodeId,
+}
+
+/// Response with mount state
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetMountStateResponse {
+    pub state: MountState,
+    pub mount_ref: MountRef,
 }
 
 // ============================================================================

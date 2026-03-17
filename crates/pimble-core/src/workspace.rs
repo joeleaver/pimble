@@ -1,12 +1,26 @@
 //! Workspace types - user's view into stores
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 use uuid::Uuid;
 
-use crate::{NodeId, Store, StoreId};
+use crate::{AuthMethod, NodeId, Store, StoreId};
+
+/// Serializable reference to how to reach a store (for workspace persistence).
+///
+/// This mirrors `StoreEndpoint` from `pimble-store` but lives in `pimble-core`
+/// to avoid a circular dependency (pimble-store depends on pimble-core).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StoreEndpointRef {
+    /// Local filesystem path
+    Local { path: PathBuf },
+    /// Remote server
+    Remote { url: Url, auth: AuthMethod },
+}
 
 /// A Workspace defines which stores are visible to the user
 ///
@@ -30,6 +44,10 @@ pub struct Workspace {
 
     /// UI state
     pub ui_state: WorkspaceUiState,
+
+    /// Known store endpoints for resolving mount references
+    #[serde(default)]
+    pub known_stores: HashMap<StoreId, StoreEndpointRef>,
 }
 
 impl Workspace {
@@ -44,7 +62,23 @@ impl Workspace {
             name: name.into(),
             stores: Vec::new(),
             ui_state: WorkspaceUiState::default(),
+            known_stores: HashMap::new(),
         }
+    }
+
+    /// Register a store endpoint so mount references can be resolved across sessions
+    pub fn register_store(&mut self, store_id: StoreId, endpoint: StoreEndpointRef) {
+        self.known_stores.insert(store_id, endpoint);
+    }
+
+    /// Unregister a store endpoint
+    pub fn unregister_store(&mut self, store_id: &StoreId) {
+        self.known_stores.remove(store_id);
+    }
+
+    /// Look up the endpoint for a store
+    pub fn get_store_endpoint(&self, store_id: &StoreId) -> Option<&StoreEndpointRef> {
+        self.known_stores.get(store_id)
     }
 
     /// Add a store to the workspace

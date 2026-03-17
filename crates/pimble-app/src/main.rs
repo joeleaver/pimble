@@ -4,7 +4,11 @@
 
 mod app;
 mod backend;
+mod editor;
+mod events;
+mod persistence;
 mod state;
+mod styles;
 
 fn main() {
     // Initialize logging

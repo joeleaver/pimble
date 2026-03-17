@@ -71,6 +71,18 @@ pub trait PimbleApi {
     async fn get_children(&self, request: GetChildrenRequest) -> Result<GetChildrenResponse, ErrorObjectOwned>;
 
     // ========================================================================
+    // Mount Operations
+    // ========================================================================
+
+    /// Create a mount point node in a store
+    #[method(name = "createMount")]
+    async fn create_mount(&self, request: CreateMountRequest) -> Result<CreateMountResponse, ErrorObjectOwned>;
+
+    /// Get the state of a mount point
+    #[method(name = "getMountState")]
+    async fn get_mount_state(&self, request: GetMountStateRequest) -> Result<GetMountStateResponse, ErrorObjectOwned>;
+
+    // ========================================================================
     // Workspace Operations
     // ========================================================================
 

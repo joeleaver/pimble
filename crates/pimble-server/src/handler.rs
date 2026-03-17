@@ -4,15 +4,17 @@ use std::sync::Arc;
 
 use jsonrpsee::core::async_trait;
 use jsonrpsee::types::ErrorObjectOwned;
-use pimble_core::{Node, Workspace};
+use pimble_core::{Node, MountRef, Workspace};
 use pimble_crdt::DocumentContent;
 use pimble_rpc::{
-    to_rpc_error, CloseStoreRequest, CreateNodeRequest, CreateNodeResponse, CreateStoreRequest,
-    CreateStoreResponse, CreateWorkspaceRequest, DeleteNodeRequest, EmptyResponse,
-    GetChildrenRequest, GetChildrenResponse, GetNodeRequest, GetNodeResponse, GetNodesRequest,
+    to_rpc_error, CloseStoreRequest, CreateMountRequest, CreateMountResponse, CreateNodeRequest,
+    CreateNodeResponse, CreateStoreRequest, CreateStoreResponse, CreateWorkspaceRequest,
+    DeleteNodeRequest, EmptyResponse, GetChildrenRequest, GetChildrenResponse,
+    GetMountStateRequest, GetMountStateResponse, GetNodeRequest, GetNodeResponse, GetNodesRequest,
     GetNodesResponse, ListStoresResponse, LoadWorkspaceRequest, LoadWorkspaceResponse,
     MoveNodeRequest, OpenStoreRequest, OpenStoreResponse, PimbleApiServer, SaveWorkspaceRequest,
-    SearchRequest, SearchResponse, SetNodeTextRequest, UpdateNodeContentRequest, UpdateNodeMetadataRequest,
+    SearchRequest, SearchResponse, SetNodeTextRequest, UpdateNodeContentRequest,
+    UpdateNodeMetadataRequest,
 };
 use pimble_store::StoreManager;
 use tokio::sync::RwLock;
@@ -302,6 +304,71 @@ impl PimbleApiServer for RpcHandler {
             .map_err(to_rpc_error)?;
 
         Ok(GetChildrenResponse { children })
+    }
+
+    async fn create_mount(
+        &self,
+        request: CreateMountRequest,
+    ) -> Result<CreateMountResponse, ErrorObjectOwned> {
+        info!(
+            "Creating mount in store {} under parent {}, source: {}:{}",
+            request.store_id, request.parent_id, request.source_store_id, request.source_node_id
+        );
+
+        let mount_ref = MountRef {
+            source_store: request.source_store_id,
+            source_node: request.source_node_id,
+        };
+
+        let mut manager = self.store_manager.write().await;
+
+        // Validate that this mount won't create a cycle
+        manager
+            .validate_mount_creation(request.store_id, request.parent_id, &mount_ref)
+            .await
+            .map_err(to_rpc_error)?;
+
+        // Create the mount node
+        let mut node = Node::mount(request.source_store_id, request.source_node_id);
+        if let Some(title) = request.title {
+            node.metadata.title = title;
+        }
+
+        let node_id = manager
+            .create_node(request.store_id, node, Some(request.parent_id))
+            .await
+            .map_err(to_rpc_error)?;
+
+        manager
+            .flush(request.store_id)
+            .await
+            .map_err(to_rpc_error)?;
+
+        Ok(CreateMountResponse { node_id })
+    }
+
+    async fn get_mount_state(
+        &self,
+        request: GetMountStateRequest,
+    ) -> Result<GetMountStateResponse, ErrorObjectOwned> {
+        debug!(
+            "Getting mount state for node {} in store {}",
+            request.node_id, request.store_id
+        );
+
+        let mut manager = self.store_manager.write().await;
+        let node = manager
+            .get_node(request.store_id, request.node_id)
+            .await
+            .map_err(to_rpc_error)?;
+
+        let mount_ref = node.mount_ref().ok_or_else(|| {
+            to_rpc_error(format!("Node {} is not a mount point", request.node_id))
+        })?;
+
+        let state = manager.mount_state(&mount_ref);
+
+        Ok(GetMountStateResponse { state, mount_ref })
     }
 
     async fn load_workspace(

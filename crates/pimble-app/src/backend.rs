@@ -1,15 +1,15 @@
 //! Background thread for RPC communication
 //!
-//! Makepad has its own event loop and doesn't use tokio directly. We:
+//! Rinch has its own event loop and doesn't use tokio directly. We:
 //! 1. Spawn a background thread with a tokio runtime
-//! 2. Use channels to communicate between Makepad UI and async code
-//! 3. Signal Makepad to redraw when data arrives
+//! 2. Use channels to communicate between Rinch UI and async code
+//! 3. Signal Rinch to process events when data arrives
 
 use std::thread;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use pimble_client::PimbleClient;
-use pimble_core::{Node, NodeId, Store, StoreId, Workspace};
+use pimble_core::{MountRef, MountState, Node, NodeId, Store, StoreId, Workspace};
 use pimble_server::PimbleServer;
 use tokio::runtime::Runtime;
 
@@ -33,6 +33,19 @@ pub enum BackendCommand {
     RenameNode { store_id: StoreId, node_id: NodeId, title: String },
     MoveNode { store_id: StoreId, node_id: NodeId, new_parent_id: NodeId, position: Option<usize> },
 
+    // Mount operations
+    CreateMount {
+        store_id: StoreId,
+        parent_id: NodeId,
+        source_store_id: StoreId,
+        source_node_id: NodeId,
+        title: Option<String>,
+    },
+    GetMountState {
+        store_id: StoreId,
+        node_id: NodeId,
+    },
+
     // Workspace operations
     CreateWorkspace { name: String, path: String },
     LoadWorkspace { path: String },
@@ -42,7 +55,7 @@ pub enum BackendCommand {
 /// Events sent from backend to UI
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
-    Connected,
+    Connected { server_addr: String },
     Disconnected,
     Error { message: String },
 
@@ -59,6 +72,18 @@ pub enum BackendEvent {
     NodeContentUpdated { store_id: StoreId, node_id: NodeId },
     NodeRenamed { store_id: StoreId, node_id: NodeId },
     NodeMoved { store_id: StoreId, node_id: NodeId, old_parent_id: NodeId, new_parent_id: NodeId },
+
+    // Mount events
+    MountCreated {
+        store_id: StoreId,
+        node_id: NodeId,
+        mount_ref: MountRef,
+    },
+    MountStateChanged {
+        store_id: StoreId,
+        node_id: NodeId,
+        state: MountState,
+    },
 
     // Workspace events
     WorkspaceLoaded { workspace: Workspace },
@@ -118,7 +143,9 @@ async fn backend_loop(
             match PimbleClient::connect(&url).await {
                 Ok(c) => {
                     client = Some(c);
-                    let _ = event_tx.try_send(BackendEvent::Connected);
+                    let _ = event_tx.try_send(BackendEvent::Connected {
+                        server_addr: server.addr().to_string(),
+                    });
                     signal_ui();
                 }
                 Err(e) => {
@@ -170,7 +197,7 @@ async fn process_command(
             match PimbleClient::connect(&url).await {
                 Ok(c) => {
                     *client = Some(c);
-                    Some(BackendEvent::Connected)
+                    Some(BackendEvent::Connected { server_addr: url })
                 }
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
@@ -298,6 +325,26 @@ async fn process_command(
             };
             match c.move_node(store_id, node_id, new_parent_id, position).await {
                 Ok(()) => Some(BackendEvent::NodeMoved { store_id, node_id, old_parent_id, new_parent_id }),
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::CreateMount { store_id, parent_id, source_store_id, source_node_id, title } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            match c.create_mount(store_id, parent_id, source_store_id, source_node_id, title).await {
+                Ok((node_id, mount_ref)) => Some(BackendEvent::MountCreated { store_id, node_id, mount_ref }),
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::GetMountState { store_id, node_id } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            match c.get_mount_state(store_id, node_id).await {
+                Ok((state, _mount_ref)) => Some(BackendEvent::MountStateChanged { store_id, node_id, state }),
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
         }
