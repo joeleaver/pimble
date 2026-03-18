@@ -196,6 +196,14 @@ impl AppStore {
         self.mount_data.update(|map| { map.retain(|(sid, _), _| *sid != store_id); });
     }
 
+    /// Remove a node and its per-entity signals (node_data, mount_data, children_of).
+    pub fn remove_node(&self, store_id: StoreId, node_id: NodeId) {
+        let key = (store_id, node_id);
+        self.node_data.update(|map| { map.remove(&key); });
+        self.mount_data.update(|map| { map.remove(&key); });
+        self.children_of.update(|map| { map.remove(&key); });
+    }
+
     /// Insert or update a node's per-entity signal.
     ///
     /// Sets the inner signal outside the outer borrow to avoid re-entrancy.

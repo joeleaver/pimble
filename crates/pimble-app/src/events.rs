@@ -277,6 +277,34 @@ pub(crate) fn process_backend_events(
                 store.send(BackendCommand::GetNode { store_id: *store_id, node_id: *node_id });
             }
 
+            BackendEvent::NodeDeleted { store_id, node_id, parent_id } => {
+                tracing::info!("Node deleted: {:?}/{:?}", store_id, node_id);
+
+                // Remove from parent's children signal
+                if let Some(parent_sig) = store.get_children_signal(*store_id, *parent_id) {
+                    parent_sig.update(|children| {
+                        children.retain(|&id| id != *node_id);
+                    });
+                }
+
+                // Clean up per-entity signals
+                store.remove_node(*store_id, *node_id);
+
+                // Clear selection if the deleted node was selected
+                if let Some(selected_id) = store.selected_id.get() {
+                    if let Some((sel_store_id, Some(sel_node_id))) = parse_tree_value(&selected_id) {
+                        if sel_store_id == *store_id && sel_node_id == *node_id {
+                            store.selected_id.set(None);
+                            store.node_title.set(String::new());
+                            store.show_editor.set(false);
+                        }
+                    }
+                }
+
+                // Structural change
+                store.bump_tree_structure();
+            }
+
             BackendEvent::StoreClosed { store_id } => {
                 tracing::info!("Store closed: {:?}", store_id);
 

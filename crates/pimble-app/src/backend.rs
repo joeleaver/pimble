@@ -33,6 +33,7 @@ pub enum BackendCommand {
     GetChildren { store_id: StoreId, node_id: NodeId },
     SetNodeContent { store_id: StoreId, node_id: NodeId, content: Vec<u8> },
     RenameNode { store_id: StoreId, node_id: NodeId, title: String },
+    DeleteNode { store_id: StoreId, node_id: NodeId },
     MoveNode { store_id: StoreId, node_id: NodeId, new_parent_id: NodeId, position: Option<usize> },
 
     // Mount operations
@@ -73,6 +74,7 @@ pub enum BackendEvent {
     ChildrenLoaded { store_id: StoreId, parent_id: NodeId, children: Vec<Node> },
     NodeContentUpdated { store_id: StoreId, node_id: NodeId },
     NodeRenamed { store_id: StoreId, node_id: NodeId },
+    NodeDeleted { store_id: StoreId, node_id: NodeId, parent_id: NodeId },
     NodeMoved { store_id: StoreId, node_id: NodeId, old_parent_id: NodeId, new_parent_id: NodeId },
 
     // Mount events
@@ -420,6 +422,21 @@ async fn process_command(
                         Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
                     }
                 }
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::DeleteNode { store_id, node_id } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            // Get parent before deleting
+            let parent_id = match c.get_node(store_id, node_id).await {
+                Ok(node) => node.parent_id.unwrap_or(NodeId(uuid::Uuid::nil())),
+                Err(e) => return Some(BackendEvent::Error { message: e.to_string() }),
+            };
+            match c.delete_node(store_id, node_id).await {
+                Ok(()) => Some(BackendEvent::NodeDeleted { store_id, node_id, parent_id }),
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
         }

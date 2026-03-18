@@ -120,7 +120,13 @@ pub fn run() {
         .separator()
         .item(MenuItem::new("Cut").shortcut("Ctrl+X").enabled(false).on_click(|| {}))
         .item(MenuItem::new("Copy").shortcut("Ctrl+C").enabled(false).on_click(|| {}))
-        .item(MenuItem::new("Paste").shortcut("Ctrl+V").enabled(false).on_click(|| {}));
+        .item(MenuItem::new("Paste").shortcut("Ctrl+V").enabled(false).on_click(|| {}))
+        .separator()
+        .item(MenuItem::new("Delete").on_click(move || {
+            if let Some((store_id, node_id)) = store.selected_store_and_node() {
+                store.send(BackendCommand::DeleteNode { store_id, node_id });
+            }
+        }));
 
     let view_menu = Menu::new()
         .item(MenuItem::new("Toggle Sidebar").shortcut("Ctrl+\\").on_click(|| {
@@ -558,6 +564,17 @@ pub fn run() {
                 }
             };
 
+            let on_delete = {
+                let nv = nv_ctx.clone();
+                move || {
+                    if let Some((s_id, Some(n_id))) = parse_tree_value(&nv) {
+                        store.send(BackendCommand::DeleteNode {
+                            store_id: s_id, node_id: n_id,
+                        });
+                    }
+                }
+            };
+
             // Build the wrapper span with drag-and-drop via rsx
             let draggable = if is_store_root { "false" } else { "true" };
 
@@ -728,6 +745,11 @@ pub fn run() {
                                 onclick: on_new_child,
                                 "New Node"
                             }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::Trash,
+                                onclick: on_delete,
+                                "Delete"
+                            }
                         }
                     }
                 }
@@ -788,6 +810,11 @@ pub fn run() {
                                 left_section: TablerIcon::Edit,
                                 onclick: on_rename,
                                 "Rename"
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::Trash,
+                                onclick: on_delete,
+                                "Delete"
                             }
                         }
                     }
