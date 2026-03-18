@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
 
+use crate::StoreId;
+
 /// Unique identifier for a node
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub Uuid);
@@ -152,6 +154,33 @@ impl Node {
         self.links.push(link);
         self.touch();
     }
+
+    /// Create a new mount node referencing a subtree in another store
+    pub fn mount(source_store: StoreId, source_node: NodeId) -> Self {
+        let mount_ref = MountRef {
+            source_store,
+            source_node,
+        };
+        let mut node = Self::new(node_types::MOUNT);
+        node.metadata.custom.insert(
+            "mount_ref".to_string(),
+            serde_json::to_value(&mount_ref).expect("MountRef serialization should not fail"),
+        );
+        node
+    }
+
+    /// Get the mount reference if this is a mount node
+    pub fn mount_ref(&self) -> Option<MountRef> {
+        self.metadata
+            .custom
+            .get("mount_ref")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
+    /// Check if this node is a mount point
+    pub fn is_mount(&self) -> bool {
+        self.node_type == node_types::MOUNT
+    }
 }
 
 /// Metadata associated with a node
@@ -256,6 +285,29 @@ impl LinkTarget {
     }
 }
 
+/// Reference to a subtree in another store
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountRef {
+    /// The store containing the source subtree
+    pub source_store: StoreId,
+    /// The node to use as root of the mounted subtree
+    pub source_node: NodeId,
+}
+
+/// Current state of a mount point
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MountState {
+    /// Source is connected and live
+    Live,
+    /// Source is unavailable; showing cached data
+    Cached { last_sync: DateTime<Utc> },
+    /// Source is unavailable and no cache exists
+    Unavailable,
+    /// Currently connecting/syncing
+    Connecting,
+}
+
 /// Well-known node types
 pub mod node_types {
     /// Folder node - container with no content, just children
@@ -272,6 +324,9 @@ pub mod node_types {
 
     /// Canvas node - freeform visual content
     pub const CANVAS: &str = "canvas";
+
+    /// Mount node - reference to a subtree in another store
+    pub const MOUNT: &str = "mount";
 }
 
 /// Helper module for base64 encoding of bytes in serde
@@ -297,5 +352,53 @@ mod serde_bytes_base64 {
         base64::engine::general_purpose::STANDARD
             .decode(&s)
             .map_err(|e| Error::custom(format!("base64 decode error: {}", e)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mount_node_roundtrip() {
+        let store_id = StoreId::new();
+        let node_id = NodeId::new();
+
+        let mount = Node::mount(store_id, node_id);
+        assert!(mount.is_mount());
+        assert_eq!(mount.node_type, node_types::MOUNT);
+
+        let mount_ref = mount.mount_ref().expect("should have mount_ref");
+        assert_eq!(mount_ref.source_store, store_id);
+        assert_eq!(mount_ref.source_node, node_id);
+    }
+
+    #[test]
+    fn mount_ref_serialization_roundtrip() {
+        let mount_ref = MountRef {
+            source_store: StoreId::new(),
+            source_node: NodeId::new(),
+        };
+
+        let json = serde_json::to_string(&mount_ref).unwrap();
+        let deserialized: MountRef = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.source_store, mount_ref.source_store);
+        assert_eq!(deserialized.source_node, mount_ref.source_node);
+    }
+
+    #[test]
+    fn is_mount_returns_false_for_other_types() {
+        let folder = Node::folder("test");
+        assert!(!folder.is_mount());
+
+        let doc = Node::document("test");
+        assert!(!doc.is_mount());
+    }
+
+    #[test]
+    fn mount_ref_returns_none_for_non_mount() {
+        let folder = Node::folder("test");
+        assert!(folder.mount_ref().is_none());
     }
 }

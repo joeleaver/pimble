@@ -10,6 +10,15 @@ use tracing::{debug, info};
 
 use crate::error::{Result, StoreError};
 
+/// Write a file atomically: write to a `.tmp` sibling, then rename into place.
+/// This prevents empty/corrupt files if the process is killed mid-write.
+async fn atomic_write(path: &Path, data: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let tmp_path = path.with_extension("tmp");
+    fs::write(&tmp_path, data).await?;
+    fs::rename(&tmp_path, path).await?;
+    Ok(())
+}
+
 /// A local store backed by the filesystem
 ///
 /// Directory structure:
@@ -292,7 +301,7 @@ impl LocalStore {
         // Update manifest modified time
         self.manifest.modified_at = chrono::Utc::now();
         let manifest_json = serde_json::to_string_pretty(&self.manifest)?;
-        fs::write(self.path.join(Self::MANIFEST_FILE), manifest_json).await?;
+        atomic_write(&self.path.join(Self::MANIFEST_FILE), manifest_json).await?;
 
         debug!("Flushed store {} to disk", self.id);
         Ok(())
@@ -372,12 +381,12 @@ impl LocalStore {
         let content = std::mem::take(&mut node_for_json.content);
 
         let json = serde_json::to_string_pretty(&node_for_json)?;
-        fs::write(&node_path, json).await?;
+        atomic_write(&node_path, json).await?;
 
         // Save content separately if not empty
         if !content.is_empty() {
             let content_path = self.node_content_path(node.id);
-            fs::write(&content_path, &content).await?;
+            atomic_write(&content_path, &content).await?;
         }
 
         debug!("Saved node {} to disk", node.id);

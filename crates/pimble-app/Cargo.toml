@@ -35,3 +35,4 @@ pimble-server = { workspace = true }
 pimble-store = { workspace = true }
 chrono = { workspace = true }
 dirs = "6"
+rand = "0.9"

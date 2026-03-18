@@ -8,7 +8,9 @@
 pub mod error;
 pub mod local;
 pub mod manager;
+pub mod registry;
 
 pub use error::*;
 pub use local::*;
 pub use manager::*;
+pub use registry::*;

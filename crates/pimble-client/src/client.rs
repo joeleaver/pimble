@@ -4,11 +4,13 @@ use std::path::Path;
 
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use pimble_core::{Node, NodeId, Store, StoreId, Workspace};
+use pimble_core::MountRef;
 use pimble_rpc::{
-    CloseStoreRequest, CreateNodeRequest, CreateStoreRequest, CreateWorkspaceRequest,
-    DeleteNodeRequest, GetChildrenRequest, GetNodeRequest, GetNodesRequest,
-    LoadWorkspaceRequest, MoveNodeRequest, OpenStoreRequest, PimbleApiClient, SaveWorkspaceRequest,
-    SearchRequest, SearchResultItem, SetNodeTextRequest, UpdateNodeContentRequest, UpdateNodeMetadataRequest,
+    CloseStoreRequest, CreateMountRequest, CreateNodeRequest, CreateStoreRequest,
+    CreateWorkspaceRequest, DeleteNodeRequest, GetChildrenRequest, GetMountStateRequest,
+    GetNodeRequest, GetNodesRequest, LoadWorkspaceRequest, MoveNodeRequest, OpenStoreRequest,
+    PimbleApiClient, SaveWorkspaceRequest, SearchRequest, SearchResultItem, SetNodeTextRequest,
+    UpdateNodeContentRequest, UpdateNodeMetadataRequest,
 };
 use tracing::debug;
 use url::Url;
@@ -267,6 +269,58 @@ impl PimbleClient {
             .map_err(|e| ClientError::Rpc(e.to_string()))?;
 
         Ok(response.children)
+    }
+
+    // ========================================================================
+    // Mount Operations
+    // ========================================================================
+
+    /// Create a mount point node in a store
+    pub async fn create_mount(
+        &self,
+        store_id: StoreId,
+        parent_id: NodeId,
+        source_store_id: StoreId,
+        source_node_id: NodeId,
+        title: Option<String>,
+    ) -> Result<(NodeId, MountRef)> {
+        let request = CreateMountRequest {
+            store_id,
+            parent_id,
+            source_store_id,
+            source_node_id,
+            title,
+        };
+
+        let response = self
+            .client
+            .create_mount(request)
+            .await
+            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+
+        let mount_ref = MountRef {
+            source_store: source_store_id,
+            source_node: source_node_id,
+        };
+
+        Ok((response.node_id, mount_ref))
+    }
+
+    /// Get the state of a mount point
+    pub async fn get_mount_state(
+        &self,
+        store_id: StoreId,
+        node_id: NodeId,
+    ) -> Result<(pimble_core::MountState, MountRef)> {
+        let request = GetMountStateRequest { store_id, node_id };
+
+        let response = self
+            .client
+            .get_mount_state(request)
+            .await
+            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+
+        Ok((response.state, response.mount_ref))
     }
 
     // ========================================================================
