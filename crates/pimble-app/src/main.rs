@@ -9,6 +9,7 @@ mod events;
 mod persistence;
 mod state;
 mod styles;
+mod toolbar;
 
 fn main() {
     // Initialize logging

@@ -1,4 +1,9 @@
 //! Application state management
+//!
+//! Uses per-entity reactive signals so that data changes (rename, mount state)
+//! only trigger effects on the affected node, while structural changes (children
+//! loaded, node moved, store opened/closed) bump `tree_structure_version` to
+//! trigger a full tree rebuild.
 
 use std::collections::{HashMap, HashSet};
 
@@ -19,13 +24,9 @@ pub struct PendingMount {
 }
 
 /// Mount metadata for a tree node.
-///
-/// Stored in `AppStore::mount_info` for nodes where `node.is_mount()` is true.
 #[derive(Debug, Clone)]
 pub struct MountInfo {
-    /// Whether this node is a mount point
     pub is_mount: bool,
-    /// Current state of the mount (Live, Unavailable, etc.)
     pub mount_state: Option<MountState>,
 }
 
@@ -51,11 +52,45 @@ pub fn get_node_content_text(content: &[u8]) -> String {
     }
 }
 
-/// Global application state as a Rinch store.
+/// Compute display label from a Node reference (no signal dependency).
+pub fn display_label_from_node(node: &Node) -> String {
+    let has_explicit_title = node.metadata.custom
+        .get("explicit_title")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if has_explicit_title && !node.metadata.title.is_empty() {
+        return node.metadata.title.clone();
+    }
+
+    let content = get_node_content_text(&node.content);
+    let first_line = content
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if !first_line.is_empty() {
+        let char_count = first_line.chars().count();
+        if char_count > 25 {
+            let truncated: String = first_line.chars().take(25).collect();
+            return format!("{truncated}…");
+        } else {
+            return first_line.to_string();
+        }
+    }
+
+    if !node.metadata.title.is_empty() {
+        return node.metadata.title.clone();
+    }
+
+    "Untitled".to_string()
+}
+
+/// Global application state with per-entity reactive signals.
 ///
-/// All fields are independent `Signal<T>` values, so there are no borrow
-/// conflicts and no deferred updates needed. The struct is `Clone + Copy`
-/// (Signal is a lightweight reactive reference).
+/// Structural changes bump `tree_structure_version` to trigger tree rebuilds.
+/// Data changes (rename, mount state) only update per-entity signals, so only
+/// the affected node's render Effects fire.
 #[derive(Clone, Copy)]
 pub struct AppStore {
     // Backend
@@ -63,14 +98,18 @@ pub struct AppStore {
     pub connection: Signal<ConnectionState>,
     pub pending_create_path: Signal<Option<String>>,
 
-    // Caches
-    pub stores: Signal<HashMap<StoreId, Store>>,
-    pub nodes: Signal<HashMap<(StoreId, NodeId), Node>>,
-    pub children: Signal<HashMap<(StoreId, NodeId), Vec<NodeId>>>,
-    pub expanded: Signal<HashSet<(StoreId, NodeId)>>,
+    // Per-entity signal registries
+    pub store_ids: Signal<Vec<StoreId>>,
+    pub store_data: Signal<HashMap<StoreId, Signal<Store>>>,
+    pub node_data: Signal<HashMap<(StoreId, NodeId), Signal<Node>>>,
+    pub children_of: Signal<HashMap<(StoreId, NodeId), Signal<Vec<NodeId>>>>,
+    pub mount_data: Signal<HashMap<(StoreId, NodeId), Signal<MountInfo>>>,
 
-    // Mount metadata: tracks which nodes are mounts and their current state
-    pub mount_info: Signal<HashMap<(StoreId, NodeId), MountInfo>>,
+    /// Bumped only on structural changes (store open/close, children loaded, node moved).
+    /// The data_source closure subscribes to this to trigger tree rebuilds.
+    pub tree_structure_version: Signal<u64>,
+
+    pub expanded: Signal<HashSet<(StoreId, NodeId)>>,
 
     // UI state
     pub connection_status: Signal<String>,
@@ -99,11 +138,13 @@ impl AppStore {
             backend: Signal::new(None),
             connection: Signal::new(ConnectionState::Disconnected),
             pending_create_path: Signal::new(None),
-            stores: Signal::new(HashMap::new()),
-            nodes: Signal::new(HashMap::new()),
-            children: Signal::new(HashMap::new()),
+            store_ids: Signal::new(Vec::new()),
+            store_data: Signal::new(HashMap::new()),
+            node_data: Signal::new(HashMap::new()),
+            children_of: Signal::new(HashMap::new()),
+            mount_data: Signal::new(HashMap::new()),
+            tree_structure_version: Signal::new(0),
             expanded: Signal::new(HashSet::new()),
-            mount_info: Signal::new(HashMap::new()),
             connection_status: Signal::new("Connecting...".to_string()),
             server_addr: Signal::new(String::new()),
             selected_id: Signal::new(None),
@@ -117,69 +158,231 @@ impl AppStore {
         }
     }
 
+    /// Bump the tree structure version to trigger a tree rebuild.
+    pub fn bump_tree_structure(&self) {
+        self.tree_structure_version.update(|v| *v += 1);
+    }
+
+    /// Insert or update a store's signal and add to store_ids if new.
+    ///
+    /// Looks up the inner signal first, then sets it *outside* the outer
+    /// HashMap borrow to avoid RefCell re-entrancy if subscribers read back.
+    pub fn upsert_store(&self, store: Store) {
+        let sid = store.id;
+        let existing = self.store_data.with(|map| map.get(&sid).copied());
+        if let Some(sig) = existing {
+            sig.set(store);
+        } else {
+            // Pre-create signal outside .update() — Signal::new() and .update()
+            // both borrow SIGNAL_STORE mutably, so nesting them panics.
+            let new_sig = Signal::new(store);
+            self.store_data.update(|map| {
+                map.insert(sid, new_sig);
+            });
+        }
+        self.store_ids.update(|ids| {
+            if !ids.contains(&sid) {
+                ids.push(sid);
+            }
+        });
+    }
+
+    /// Remove a store and all its associated per-entity signals.
+    pub fn remove_store(&self, store_id: StoreId) {
+        self.store_ids.update(|ids| ids.retain(|&id| id != store_id));
+        self.store_data.update(|map| { map.remove(&store_id); });
+        self.node_data.update(|map| { map.retain(|(sid, _), _| *sid != store_id); });
+        self.children_of.update(|map| { map.retain(|(sid, _), _| *sid != store_id); });
+        self.mount_data.update(|map| { map.retain(|(sid, _), _| *sid != store_id); });
+    }
+
+    /// Insert or update a node's per-entity signal.
+    ///
+    /// Sets the inner signal outside the outer borrow to avoid re-entrancy.
+    pub fn upsert_node(&self, store_id: StoreId, node: Node) {
+        let key = (store_id, node.id);
+        let existing = self.node_data.with(|map| map.get(&key).copied());
+        if let Some(sig) = existing {
+            sig.set(node);
+        } else {
+            let new_sig = Signal::new(node);
+            self.node_data.update(|map| {
+                map.insert(key, new_sig);
+            });
+        }
+    }
+
+    /// Set children for a parent node's per-entity signal.
+    ///
+    /// Sets the inner signal outside the outer borrow to avoid re-entrancy.
+    pub fn set_children(&self, store_id: StoreId, parent_id: NodeId, child_ids: Vec<NodeId>) {
+        let key = (store_id, parent_id);
+        let existing = self.children_of.with(|map| map.get(&key).copied());
+        if let Some(sig) = existing {
+            sig.set(child_ids);
+        } else {
+            let new_sig = Signal::new(child_ids);
+            self.children_of.update(|map| {
+                map.insert(key, new_sig);
+            });
+        }
+    }
+
+    /// Get the per-node signal (untracked read of the registry).
+    pub fn get_node_signal(&self, store_id: StoreId, node_id: NodeId) -> Option<Signal<Node>> {
+        untracked(|| self.node_data.with(|map| map.get(&(store_id, node_id)).copied()))
+    }
+
+    /// Get the per-store signal (untracked read of the registry).
+    pub fn get_store_signal(&self, store_id: StoreId) -> Option<Signal<Store>> {
+        untracked(|| self.store_data.with(|map| map.get(&store_id).copied()))
+    }
+
+    /// Get the per-mount signal (untracked read of the registry).
+    pub fn get_mount_signal(&self, store_id: StoreId, node_id: NodeId) -> Option<Signal<MountInfo>> {
+        untracked(|| self.mount_data.with(|map| map.get(&(store_id, node_id)).copied()))
+    }
+
+    /// Get the children signal for a parent (untracked read of the registry).
+    pub fn get_children_signal(&self, store_id: StoreId, node_id: NodeId) -> Option<Signal<Vec<NodeId>>> {
+        untracked(|| self.children_of.with(|map| map.get(&(store_id, node_id)).copied()))
+    }
+
+    /// Check if children have been loaded for a parent.
+    pub fn has_children_loaded(&self, store_id: StoreId, node_id: NodeId) -> bool {
+        untracked(|| self.children_of.with(|map| map.contains_key(&(store_id, node_id))))
+    }
+
+    /// Get the root node id for a store (untracked).
+    pub fn root_node_id(&self, store_id: StoreId) -> Option<NodeId> {
+        self.get_store_signal(store_id).map(|sig| untracked(|| sig.with(|s| s.root_node_id)))
+    }
+
+    /// Get all local paths of open stores (untracked, for persistence).
+    pub fn all_store_local_paths(&self) -> Vec<String> {
+        untracked(|| {
+            let ids = self.store_ids.get();
+            ids.iter().filter_map(|&sid| {
+                self.store_data.with(|map| {
+                    map.get(&sid).and_then(|sig| {
+                        sig.with(|s| s.local_path().map(|p| p.to_string_lossy().to_string()))
+                    })
+                })
+            }).collect()
+        })
+    }
+
     /// Update mount info for a node. Call this whenever a node is inserted into the cache.
     pub fn track_mount_info(&self, store_id: StoreId, node: &pimble_core::Node) {
         if node.is_mount() {
-            self.mount_info.update(|info| {
-                info.insert((store_id, node.id), MountInfo {
+            let key = (store_id, node.id);
+            let existing = self.mount_data.with(|map| map.get(&key).copied());
+            if let Some(sig) = existing {
+                sig.update(|m| { m.is_mount = true; });
+            } else {
+                let new_sig = Signal::new(MountInfo {
                     is_mount: true,
-                    mount_state: None, // Will be populated by GetMountState
+                    mount_state: None,
                 });
-            });
+                self.mount_data.update(|map| {
+                    map.insert(key, new_sig);
+                });
+            }
         }
     }
 
     /// Update the mount state for a specific node.
     pub fn set_mount_state(&self, store_id: StoreId, node_id: NodeId, state: MountState) {
-        self.mount_info.update(|info| {
-            if let Some(mount) = info.get_mut(&(store_id, node_id)) {
-                mount.mount_state = Some(state);
-            }
-        });
+        let key = (store_id, node_id);
+        let existing = self.mount_data.with(|map| map.get(&key).copied());
+        if let Some(sig) = existing {
+            sig.update(|m| { m.mount_state = Some(state); });
+        }
     }
 
-    /// Check if a node is a mount point.
+    /// Check if a node is a mount point (untracked).
     pub fn is_mount(&self, store_id: StoreId, node_id: NodeId) -> bool {
-        self.mount_info.with(|info| {
-            info.get(&(store_id, node_id)).map_or(false, |m| m.is_mount)
+        untracked(|| {
+            self.mount_data.with(|map| {
+                map.get(&(store_id, node_id)).map_or(false, |sig| sig.with(|m| m.is_mount))
+            })
         })
     }
 
-    /// Build Rinch TreeNodeData hierarchy from current state.
-    /// Each store appears as a top-level tree node with its children underneath.
+    /// Build structural tree data for the Tree component's data_source.
     ///
-    /// Uses `.get()` (clone) instead of `.with()` (borrow) so this can safely
-    /// be called from reactive contexts without RefCell re-entrancy panics.
-    pub fn build_tree_data(&self) -> Vec<TreeNodeData> {
-        let stores = self.stores.get();
-        let children = self.children.get();
-        let nodes = self.nodes.get();
-        let mount_info = self.mount_info.get();
+    /// Must be called from within an `untracked()` context. Builds TreeNodeData
+    /// with empty labels for nodes (render_node Effects fill them reactively)
+    /// and store names for store roots.
+    pub fn build_tree_data_structural(&self) -> Vec<TreeNodeData> {
+        let store_ids = self.store_ids.get();
         let mut result = Vec::new();
-        for store in stores.values() {
-            let store_node = TreeNodeData::new(
-                format!("store_{}", store.id),
-                &store.name,
-            );
-            let children_data = build_children_data(&children, &nodes, &mount_info, store.id, store.root_node_id);
-            if children_data.is_empty() {
+        for &sid in &store_ids {
+            let store_info = self.store_data.with(|map| {
+                map.get(&sid).map(|sig| sig.with(|s| (s.name.clone(), s.root_node_id)))
+            });
+            let Some((store_name, root_id)) = store_info else { continue };
+
+            let store_node = TreeNodeData::new(format!("store_{}", sid), &store_name);
+            let children = self.build_children_structural(sid, root_id);
+            if children.is_empty() {
                 result.push(store_node);
             } else {
-                result.push(store_node.with_children(children_data));
+                result.push(store_node.with_children(children));
             }
         }
         result
     }
 
-    /// Compute the display label for a node in the tree.
-    ///
-    /// - If `explicit_title` custom flag is set and title is non-empty → use title
-    /// - Else if node content has text → first line, up to 25 chars (+ "…" if truncated)
-    /// - Else if title is non-empty → use title (legacy nodes)
-    /// - Else → "Untitled"
+    /// Build structural children recursively (called from untracked context).
+    fn build_children_structural(&self, store_id: StoreId, parent_id: NodeId) -> Vec<TreeNodeData> {
+        let child_ids = self.children_of.with(|map| {
+            map.get(&(store_id, parent_id)).map(|sig| sig.get())
+        });
+        let Some(child_ids) = child_ids else { return Vec::new() };
+
+        let mut result = Vec::new();
+        for &child_id in &child_ids {
+            let is_mount = self.mount_data.with(|map| {
+                map.get(&(store_id, child_id)).map_or(false, |sig| sig.with(|m| m.is_mount))
+            });
+
+            // Empty label — render_node Effects will populate reactively
+            let tree_node = TreeNodeData::new(
+                format!("node_{}_{}", store_id, child_id),
+                "",
+            );
+
+            let children_data = self.build_children_structural(store_id, child_id);
+            let has_children = !children_data.is_empty();
+            let has_loaded_children = self.children_of.with(|map| {
+                map.contains_key(&(store_id, child_id))
+            });
+
+            if has_children {
+                result.push(tree_node.with_children(children_data));
+            } else if is_mount && !has_loaded_children {
+                let placeholder = TreeNodeData::new(
+                    format!("mount_loading_{}_{}", store_id, child_id),
+                    "Loading...",
+                );
+                result.push(tree_node.with_children(vec![placeholder]));
+            } else {
+                result.push(tree_node);
+            }
+        }
+        result
+    }
+
+    /// Compute the display label for a node (untracked, for use in callbacks).
     pub fn display_label(&self, store_id: StoreId, node_id: NodeId) -> String {
-        let nodes = self.nodes.get();
-        display_label_inner(&nodes, store_id, node_id)
+        untracked(|| {
+            self.node_data.with(|map| {
+                map.get(&(store_id, node_id))
+                    .map(|sig| sig.with(|node| display_label_from_node(node)))
+                    .unwrap_or_else(|| "Untitled".to_string())
+            })
+        })
     }
 
     /// Get the store_id and node_id of the selected node (if any)
@@ -220,86 +423,6 @@ pub fn parse_tree_value(value: &str) -> Option<(StoreId, Option<NodeId>)> {
     } else {
         None
     }
-}
-
-/// Compute display label from a nodes map (no signal dependency).
-fn display_label_inner(nodes: &HashMap<(StoreId, NodeId), Node>, store_id: StoreId, node_id: NodeId) -> String {
-    let Some(node) = nodes.get(&(store_id, node_id)) else {
-        return "Untitled".to_string();
-    };
-
-    let has_explicit_title = node.metadata.custom
-        .get("explicit_title")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    if has_explicit_title && !node.metadata.title.is_empty() {
-        return node.metadata.title.clone();
-    }
-
-    let content = get_node_content_text(&node.content);
-    // Use only the first non-empty line to avoid newlines in tree labels
-    let first_line = content
-        .lines()
-        .map(|l| l.trim())
-        .find(|l| !l.is_empty())
-        .unwrap_or("");
-    if !first_line.is_empty() {
-        let char_count = first_line.chars().count();
-        if char_count > 25 {
-            let truncated: String = first_line.chars().take(25).collect();
-            return format!("{truncated}…");
-        } else {
-            return first_line.to_string();
-        }
-    }
-
-    if !node.metadata.title.is_empty() {
-        return node.metadata.title.clone();
-    }
-
-    "Untitled".to_string()
-}
-
-/// Build TreeNodeData for children of the given parent node (no signal dependency).
-fn build_children_data(
-    children: &HashMap<(StoreId, NodeId), Vec<NodeId>>,
-    nodes: &HashMap<(StoreId, NodeId), Node>,
-    mount_info: &HashMap<(StoreId, NodeId), MountInfo>,
-    store_id: StoreId,
-    parent_id: NodeId,
-) -> Vec<TreeNodeData> {
-    let Some(child_ids) = children.get(&(store_id, parent_id)) else {
-        return Vec::new();
-    };
-    let mut result = Vec::new();
-    for &child_id in child_ids {
-        let is_mount = mount_info.get(&(store_id, child_id)).map_or(false, |m| m.is_mount);
-        let label = display_label_inner(nodes, store_id, child_id);
-        let tree_node = TreeNodeData::new(
-            format!("node_{}_{}", store_id, child_id),
-            &label,
-        );
-
-        // Always check for children — any node can have children via drag-and-drop
-        let children_data = build_children_data(children, nodes, mount_info, store_id, child_id);
-        let has_children = !children_data.is_empty();
-        if has_children {
-            result.push(tree_node.with_children(children_data));
-        } else if is_mount && !children.contains_key(&(store_id, child_id)) {
-            // Mount nodes without loaded children get a placeholder so the
-            // expand chevron is visible. The placeholder is replaced when
-            // the user expands the node and children are fetched.
-            let placeholder = TreeNodeData::new(
-                format!("mount_loading_{}_{}", store_id, child_id),
-                "Loading...",
-            );
-            result.push(tree_node.with_children(vec![placeholder]));
-        } else {
-            result.push(tree_node);
-        }
-    }
-    result
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

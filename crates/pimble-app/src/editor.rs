@@ -13,29 +13,42 @@ pub(crate) fn save_content_via_ce_api(ce_div: &NodeHandle) -> Option<Vec<u8>> {
     Some(doc.to_bytes())
 }
 
-/// Convert content bytes to HTML for rendering in the CE div.
-fn content_bytes_to_html(bytes: &[u8]) -> String {
-    if bytes.is_empty() {
-        return "<p><br></p>".to_string();
-    }
-    if let Ok(doc) = EditorDocument::from_bytes(bytes) {
-        let html = doc.to_html();
-        if html.is_empty() { "<p><br></p>".to_string() } else { html }
-    } else {
-        // Fall back to old format
-        let text = get_node_content_text(bytes);
-        if text.is_empty() {
-            "<p><br></p>".to_string()
-        } else {
-            format!("<p>{}</p>", text)
-        }
-    }
-}
-
 /// Load content bytes into the CE div via the CE API.
 pub(crate) fn load_content_into_ce(bytes: &[u8], ce_div: &NodeHandle) {
-    let html = content_bytes_to_html(bytes);
-    ce_div.with_ce_api(|api| {
-        api.borrow_mut().load_html(&html);
-    });
+    if bytes.is_empty() {
+        // Empty content: use load_content with an empty block list.
+        // This creates a proper empty <p> with a text node and positions
+        // the cursor correctly. Using load_html("<p></p>") would create
+        // a <p> with no text node, leaving the cursor on the CE root.
+        ce_div.with_ce_api(|api| {
+            api.borrow_mut().load_content(&[]);
+        });
+        return;
+    }
+
+    if let Ok(doc) = EditorDocument::from_bytes(bytes) {
+        // Prefer the block data round-trip: it goes through
+        // load_content which sets up text nodes and cursor properly.
+        let blocks = doc.to_block_data();
+        if blocks.is_empty() {
+            ce_div.with_ce_api(|api| {
+                api.borrow_mut().load_content(&[]);
+            });
+        } else {
+            ce_div.with_ce_api(|api| {
+                api.borrow_mut().load_content(&blocks);
+            });
+        }
+    } else {
+        // Fall back to old format — parse as plain text
+        let text = get_node_content_text(bytes);
+        let html = if text.is_empty() {
+            "<p></p>".to_string()
+        } else {
+            format!("<p>{}</p>", text)
+        };
+        ce_div.with_ce_api(|api| {
+            api.borrow_mut().load_html(&html);
+        });
+    }
 }

@@ -10,14 +10,34 @@ use std::time::Instant;
 use rinch::prelude::*;
 use rinch::core::{request_focus, set_keyboard_interceptor, clear_keyboard_interceptor};
 use rinch::menu::{Menu, MenuItem};
-use rinch_editor_components::{render_toolbar, ToolbarConfig};
 use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
 
 use crate::backend::{BackendCommand, BackendHandle};
 use crate::editor::{save_content_via_ce_api, load_content_into_ce};
 use crate::events::{EVENT_PROCESSOR, process_backend_events};
-use crate::state::{parse_tree_value, AppStore, PendingMount};
+use crate::state::{parse_tree_value, display_label_from_node, AppStore, PendingMount};
 use crate::styles::{APP_CSS, EDITOR_CSS};
+
+/// Walk the DOM subtree to find a `data-oncontextmenu` handler and copy it
+/// to `target`. Used to hoist the context menu handler from the invisible
+/// ContextMenuTarget (display:contents) to a visible wrapper div.
+fn hoist_context_menu_handler(from: &NodeHandle, target: &NodeHandle) {
+    if let Some(handler_id) = find_context_menu_handler(from) {
+        target.set_attribute("data-oncontextmenu", &handler_id);
+    }
+}
+
+fn find_context_menu_handler(node: &NodeHandle) -> Option<String> {
+    if let Some(val) = node.get_attribute("data-oncontextmenu") {
+        return Some(val);
+    }
+    for child in node.children() {
+        if let Some(val) = find_context_menu_handler(&child) {
+            return Some(val);
+        }
+    }
+    None
+}
 
 /// Main application entry point
 pub fn run() {
@@ -183,9 +203,30 @@ pub fn run() {
     // Build app component - parameter must be named __scope for the rsx! macro
     let ce_div_for_app = ce_div_cell.clone();
     let app_component = move |__scope: &mut RenderScope| -> NodeHandle {
+        // Cancel any in-progress rename, optionally committing the change.
+        let cancel_last_click = last_click.clone();
+        let cancel_rename = move |commit: bool| {
+            if let Some(prev_value) = untracked(|| store.renaming_node.get()) {
+                if commit {
+                    let new_title = untracked(|| store.rename_text.get());
+                    if let Some((sid, Some(nid))) = parse_tree_value(&prev_value) {
+                        store.send(BackendCommand::RenameNode {
+                            store_id: sid, node_id: nid, title: new_title,
+                        });
+                    }
+                }
+                store.renaming_node.set(None);
+                clear_keyboard_interceptor();
+            }
+            // Reset double-click timer so stale timestamps can't cause
+            // a spurious rename on the next click.
+            cancel_last_click.set((Instant::now(), String::new()));
+        };
+
         // Tree callbacks
         let select_ce_div = ce_div_for_app.clone();
         let select_last_click = last_click.clone();
+        let cancel_rename_for_select = cancel_rename.clone();
         let on_tree_select = ValueCallback::new(move |value: String| {
             tracing::info!("Tree node selected: {}", value);
 
@@ -207,21 +248,34 @@ pub fn run() {
                     }
 
                     let edit_text = if let Some((store_id, Some(node_id))) = parse_tree_value(&value) {
-                        store.nodes.with(|nodes| {
-                            nodes.get(&(store_id, node_id))
-                                .map(|n| n.metadata.title.clone())
-                                .unwrap_or_default()
-                        })
+                        store.get_node_signal(store_id, node_id)
+                            .map(|sig| sig.with(|n| n.metadata.title.clone()))
+                            .unwrap_or_default()
                     } else {
                         String::new()
                     };
                     store.rename_text.set(edit_text);
                     store.renaming_node.set(Some(value.clone()));
+                    let nv_interceptor = value.clone();
                     set_keyboard_interceptor(move |data| {
                         if data.key == "Escape" {
                             rinch::run_on_main_thread(move || {
                                 store.renaming_node.set(None);
                                 clear_keyboard_interceptor();
+                            });
+                            return true;
+                        }
+                        if data.key == "Enter" {
+                            let nv = nv_interceptor.clone();
+                            rinch::run_on_main_thread(move || {
+                                let new_title = untracked(|| store.rename_text.get());
+                                store.renaming_node.set(None);
+                                clear_keyboard_interceptor();
+                                if let Some((s_id, Some(n_id))) = parse_tree_value(&nv) {
+                                    store.send(BackendCommand::RenameNode {
+                                        store_id: s_id, node_id: n_id, title: new_title,
+                                    });
+                                }
                             });
                             return true;
                         }
@@ -234,18 +288,7 @@ pub fn run() {
                 }
 
                 // If we were renaming a node, commit it before switching
-                let was_renaming = store.renaming_node.get();
-                if let Some(prev_value) = was_renaming {
-                    let new_title = store.rename_text.get();
-                    if let Some((sid, Some(nid))) = parse_tree_value(&prev_value) {
-                        store.send(BackendCommand::RenameNode {
-                            store_id: sid, node_id: nid, title: new_title,
-                        });
-                    }
-                }
-
-                store.renaming_node.set(None);
-                clear_keyboard_interceptor();
+                cancel_rename_for_select(true);
             }
 
             // Save current editor content to previously selected node
@@ -268,9 +311,9 @@ pub fn run() {
 
             let (title_opt, content_bytes_opt, is_document) = if let Some((s_id, node_id_opt)) = parse_tree_value(&value) {
                 if let Some(n_id) = node_id_opt {
-                    let result = store.nodes.with(|nodes| {
-                        nodes.get(&(s_id, n_id)).map(|node| {
-                            let label = store.display_label(s_id, n_id);
+                    let result = store.get_node_signal(s_id, n_id).map(|sig| {
+                        sig.with(|node| {
+                            let label = display_label_from_node(node);
                             let is_doc = node.node_type == pimble_core::node_types::DOCUMENT;
                             (label, node.content.clone(), is_doc)
                         })
@@ -283,9 +326,8 @@ pub fn run() {
                         }
                     }
                 } else {
-                    let title = store.stores.with(|stores| {
-                        stores.get(&s_id).map(|s| s.name.clone())
-                    });
+                    let title = store.get_store_signal(s_id)
+                        .map(|sig| sig.with(|s| s.name.clone()));
                     match title {
                         Some(t) => (Some(t), Some(Vec::new()), false),
                         None => (None, None, false),
@@ -313,12 +355,10 @@ pub fn run() {
         let on_tree_expand = ValueCallback::new(move |value: String| {
             tracing::info!("Tree node expanded: {}", value);
             if let Some((s_id, node_id_opt)) = parse_tree_value(&value) {
-                let resolved = node_id_opt.or_else(|| {
-                    store.stores.with(|s| s.get(&s_id).map(|s| s.root_node_id))
-                });
+                let resolved = node_id_opt.or_else(|| store.root_node_id(s_id));
                 if let Some(nid) = resolved {
                     store.expanded.update(|e| { e.insert((s_id, nid)); });
-                    let needs_fetch = store.children.with(|c| !c.contains_key(&(s_id, nid)));
+                    let needs_fetch = !store.has_children_loaded(s_id, nid);
                     if needs_fetch {
                         store.send(BackendCommand::GetChildren { store_id: s_id, node_id: nid });
                     }
@@ -330,32 +370,33 @@ pub fn run() {
         let on_tree_collapse = ValueCallback::new(move |value: String| {
             tracing::info!("Tree node collapsed: {}", value);
             if let Some((s_id, node_id_opt)) = parse_tree_value(&value) {
-                let resolved = node_id_opt.or_else(|| {
-                    store.stores.with(|s| s.get(&s_id).map(|s| s.root_node_id))
-                });
+                let resolved = node_id_opt.or_else(|| store.root_node_id(s_id));
                 if let Some(nid) = resolved {
                     store.expanded.update(|e| { e.remove(&(s_id, nid)); });
                 }
             }
         });
 
-        // Build the tree with reactive data_source — the Tree diffs root nodes by key,
-        // and the persistent UseTreeReturn preserves expanded/selected state across updates.
-        // tree_scroll and tree are built declaratively in the main rsx block below
-
+        // Build the tree with reactive data_source.
+        // ONLY subscribes to tree_structure_version; everything else is untracked.
         let data_source: Rc<dyn Fn() -> Vec<TreeNodeData>> =
-            Rc::new(move || store.build_tree_data());
+            Rc::new(move || {
+                let _ = store.tree_structure_version.get(); // structural subscription
+                untracked(|| store.build_tree_data_structural())
+            });
 
-        // Custom render_node with drag-and-drop, context menu, and mount support
+        // Custom render_node with per-node reactive Effects for label/icon/mount
         let render_node_fn: RenderTreeNode = Rc::new(move |payload: &RenderTreeNodePayload, __scope: &mut RenderScope| {
             let node_value = payload.node.value.clone();
-            let label_text = payload.node.label.clone();
             let is_store_root = node_value.starts_with("store_");
             let has_children = payload.has_children;
 
-            // Determine if this node is a mount point and its state
+            // Parse once for reuse
+            let parsed = parse_tree_value(&node_value);
+
+            // Determine if this node is a mount point (static — mount status is structural)
             let is_mount = if !is_store_root {
-                if let Some((s_id, Some(n_id))) = parse_tree_value(&node_value) {
+                if let Some((s_id, Some(n_id))) = parsed {
                     store.is_mount(s_id, n_id)
                 } else {
                     false
@@ -364,21 +405,35 @@ pub fn run() {
                 false
             };
 
-            let mount_unavailable = if is_mount {
-                if let Some((s_id, Some(n_id))) = parse_tree_value(&node_value) {
-                    store.mount_info.with(|info| {
-                        info.get(&(s_id, n_id)).and_then(|m| m.mount_state.as_ref()).map_or(false, |s| {
-                            matches!(s, pimble_core::MountState::Unavailable)
-                        })
-                    })
+            // Capture per-entity signals for reactive label/icon Effects.
+            // These are looked up once (untracked) and the inner Signal is captured.
+            let node_sig = if !is_store_root {
+                if let Some((s_id, Some(n_id))) = parsed {
+                    store.get_node_signal(s_id, n_id)
                 } else {
-                    false
+                    None
                 }
             } else {
-                false
+                None
             };
 
-            // Choose icon
+            let store_sig = if is_store_root {
+                parsed.and_then(|(s_id, _)| store.get_store_signal(s_id))
+            } else {
+                None
+            };
+
+            let mount_sig = if is_mount {
+                if let Some((s_id, Some(n_id))) = parsed {
+                    store.get_mount_signal(s_id, n_id)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Choose icon (static — changes only on structural rebuild)
             let icon = if is_store_root {
                 TablerIcon::Database
             } else if is_mount {
@@ -395,22 +450,8 @@ pub fn run() {
                 "rinch-tree__icon"
             };
 
-            let icon_style = if is_mount && mount_unavailable {
-                "width: 1rem; height: 1rem; margin-right: 4px; opacity: 0.4;"
-            } else {
-                ""
-            };
-
-            let display_text = if mount_unavailable {
-                format!("{} (unavailable)", label_text)
-            } else {
-                label_text.clone()
-            };
-
-            let label_style = if is_store_root {
+            let base_label_style = if is_store_root {
                 "cursor: default; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.03em;"
-            } else if mount_unavailable {
-                "cursor: default; opacity: 0.4;"
             } else {
                 "cursor: default;"
             };
@@ -421,34 +462,44 @@ pub fn run() {
             let nv_enter = node_value.clone();
             let nv_leave = node_value.clone();
 
-            let on_dragstart = move || { drag_ctx.set(nv_dragstart.clone()); };
-            let on_dragend = move || { drag_ctx.clear(); store.drop_target.set(None); };
+            let on_dragstart = move || {
+                tracing::info!("DragStart: {}", nv_dragstart);
+                drag_ctx.set(nv_dragstart.clone());
+            };
+            let on_dragend = move || {
+                tracing::info!("DragEnd");
+                drag_ctx.clear();
+                store.drop_target.set(None);
+            };
             let on_drop = {
                 let nv = nv_drop.clone();
                 move || {
+                    // Always clear drag state first, even if the drop is invalid
+                    let dragged_value = drag_ctx.take();
                     store.drop_target.set(None);
-                    if let Some(dragged_value) = drag_ctx.take() {
-                        if dragged_value == nv { return; }
-                        let Some((drag_store_id, Some(drag_node_id))) = parse_tree_value(&dragged_value) else { return; };
-                        let new_parent_id = if let Some((target_store_id, target_node_id_opt)) = parse_tree_value(&nv) {
-                            if drag_store_id != target_store_id { return; }
-                            match target_node_id_opt {
-                                Some(nid) => nid,
-                                None => {
-                                    match store.stores.with(|s| s.get(&target_store_id).map(|s| s.root_node_id)) {
-                                        Some(id) => id,
-                                        None => return,
-                                    }
+
+                    let Some(dragged_value) = dragged_value else { return; };
+                    if dragged_value == nv { return; }
+                    let Some((drag_store_id, Some(drag_node_id))) = parse_tree_value(&dragged_value) else { return; };
+                    let new_parent_id = if let Some((target_store_id, target_node_id_opt)) = parse_tree_value(&nv) {
+                        if drag_store_id != target_store_id { return; }
+                        match target_node_id_opt {
+                            Some(nid) => nid,
+                            None => {
+                                match store.root_node_id(target_store_id) {
+                                    Some(id) => id,
+                                    None => return,
                                 }
                             }
-                        } else {
-                            return;
-                        };
-                        store.send(BackendCommand::MoveNode {
-                            store_id: drag_store_id, node_id: drag_node_id,
-                            new_parent_id, position: None,
-                        });
-                    }
+                        }
+                    } else {
+                        return;
+                    };
+                    tracing::info!("Drop: moving {:?} into {:?}", drag_node_id, new_parent_id);
+                    store.send(BackendCommand::MoveNode {
+                        store_id: drag_store_id, node_id: drag_node_id,
+                        new_parent_id, position: None,
+                    });
                 }
             };
             let on_dragenter = move || { store.drop_target.set(Some(nv_enter.clone())); };
@@ -467,9 +518,7 @@ pub fn run() {
                 let nv = nv_ctx.clone();
                 move || {
                     if let Some((s_id, node_id_opt)) = parse_tree_value(&nv) {
-                        let parent_id = node_id_opt.or_else(|| {
-                            store.stores.with(|s| s.get(&s_id).map(|s| s.root_node_id))
-                        });
+                        let parent_id = node_id_opt.or_else(|| store.root_node_id(s_id));
                         if let Some(pid) = parent_id {
                             store.send(BackendCommand::CreateNode {
                                 store_id: s_id, parent_id: Some(pid), title: String::new(),
@@ -478,13 +527,19 @@ pub fn run() {
                     }
                 }
             };
+            let on_close_store = {
+                let nv = nv_ctx.clone();
+                move || {
+                    if let Some((s_id, _)) = parse_tree_value(&nv) {
+                        store.send(BackendCommand::CloseStore { store_id: s_id });
+                    }
+                }
+            };
             let on_mount_store = {
                 let nv = nv_ctx.clone();
                 move || {
                     if let Some((s_id, node_id_opt)) = parse_tree_value(&nv) {
-                        let parent_id = node_id_opt.or_else(|| {
-                            store.stores.with(|s| s.get(&s_id).map(|s| s.root_node_id))
-                        });
+                        let parent_id = node_id_opt.or_else(|| store.root_node_id(s_id));
                         if let Some(pid) = parent_id {
                             let dialog = rinch::dialogs::pick_folder()
                                 .set_title("Select Store to Mount");
@@ -509,18 +564,22 @@ pub fn run() {
             let icon_el = render_tabler_icon(__scope, icon, TablerIconStyle::Outline);
 
             let nv_submit = node_value.clone();
-            let nv_rename = node_value.clone();
             let nv_effect = node_value.clone();
             let nv_for_context_menu = node_value.clone();
+
+            // Memo: only propagates when THIS node's rename state actually changes.
+            let is_renaming = {
+                let nv = node_value.clone();
+                Memo::new(move || store.renaming_node.get().as_deref() == Some(&nv))
+            };
+
             let rename_input = rsx! {
                 input {
                     r#type: "text",
                     class: "rinch-text-input__input",
                     style: {
-                        let nv = nv_rename.clone();
                         move || {
-                            let is_renaming = store.renaming_node.get().as_deref() == Some(&nv);
-                            if is_renaming {
+                            if is_renaming.get() {
                                 "width: 100%; font-size: inherit; padding: 0 2px; height: 22px; line-height: 22px;"
                             } else {
                                 "display: none;"
@@ -555,44 +614,80 @@ pub fn run() {
             let wrapper = rsx! {
                 span {
                     class: "rinch-tree__label",
-                    style: {
-                        let nv = nv_effect.clone();
-                        let base_style = "flex: 1; display: inline-flex; align-items: center; border-radius: 2px; transition: background 0.1s, opacity 0.1s;";
-                        move || {
-                            let is_being_dragged = drag_ctx.get().as_deref() == Some(&nv);
-                            let is_target = store.drop_target.get().as_deref() == Some(&nv)
-                                && drag_ctx.is_active();
-                            if is_being_dragged {
-                                format!("{} opacity: 0.3;", base_style)
-                            } else if is_target {
-                                format!("{} background: var(--rinch-color-blue-1); outline: 1px solid var(--rinch-color-blue-4);", base_style)
-                            } else {
-                                base_style.to_string()
-                            }
-                        }
-                    },
-                    draggable: draggable,
-                    ondragstart: on_dragstart,
-                    ondragend: on_dragend,
-                    ondrop: on_drop,
-                    ondragenter: on_dragenter,
-                    ondragleave: on_dragleave,
-
-                    span { class: icon_class, style: icon_style, {icon_el} }
+                    style: "flex: 1; display: inline-flex; align-items: center;",
 
                     span {
+                        class: icon_class,
                         style: {
-                            let nv = node_value.clone();
+                            // Reactive icon opacity for mount state
                             move || {
-                                let is_renaming = store.renaming_node.get().as_deref() == Some(&nv);
-                                if is_renaming {
-                                    "display: none;"
+                                if let Some(ms) = mount_sig {
+                                    let unavailable = ms.with(|m| {
+                                        m.mount_state.as_ref().map_or(false, |s| {
+                                            matches!(s, pimble_core::MountState::Unavailable)
+                                        })
+                                    });
+                                    if unavailable {
+                                        "width: 1rem; height: 1rem; margin-right: 4px; opacity: 0.4;"
+                                    } else {
+                                        ""
+                                    }
                                 } else {
-                                    label_style
+                                    ""
                                 }
                             }
                         },
-                        {display_text}
+                        {icon_el}
+                    }
+
+                    span {
+                        style: {
+                            // Reactive label style — hides during rename, dims for unavailable mounts
+                            move || {
+                                if is_renaming.get() {
+                                    "display: none;"
+                                } else if let Some(ms) = mount_sig {
+                                    let unavailable = ms.with(|m| {
+                                        m.mount_state.as_ref().map_or(false, |s| {
+                                            matches!(s, pimble_core::MountState::Unavailable)
+                                        })
+                                    });
+                                    if unavailable {
+                                        "cursor: default; opacity: 0.4;"
+                                    } else {
+                                        base_label_style
+                                    }
+                                } else {
+                                    base_label_style
+                                }
+                            }
+                        },
+
+                        // Reactive label text — subscribes to per-node/per-store signal only
+                        {move || {
+                            let label = if is_store_root {
+                                store_sig.map(|s| s.with(|st| st.name.clone()))
+                                    .unwrap_or_default()
+                            } else {
+                                node_sig.map(|s| s.with(|n| display_label_from_node(n)))
+                                    .unwrap_or_else(|| "Untitled".to_string())
+                            };
+
+                            if let Some(ms) = mount_sig {
+                                let unavailable = ms.with(|m| {
+                                    m.mount_state.as_ref().map_or(false, |s| {
+                                        matches!(s, pimble_core::MountState::Unavailable)
+                                    })
+                                });
+                                if unavailable {
+                                    format!("{} (unavailable)", label)
+                                } else {
+                                    label
+                                }
+                            } else {
+                                label
+                            }
+                        }}
                     }
 
                     {rename_input}
@@ -600,7 +695,7 @@ pub fn run() {
             };
 
             // Wrap in ContextMenu — different items for store roots vs nodes
-            if is_store_root {
+            let context_menu = if is_store_root {
                 rsx! {
                     ContextMenu {
                         ContextMenuTarget { {wrapper} }
@@ -614,6 +709,11 @@ pub fn run() {
                                 left_section: TablerIcon::Link,
                                 onclick: on_mount_store,
                                 "Mount Store..."
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::X,
+                                onclick: on_close_store,
+                                "Close Store"
                             }
                         }
                     }
@@ -636,18 +736,31 @@ pub fn run() {
                 let nv_rename_ctx = nv_for_context_menu.clone();
                 let on_rename = move || {
                     if let Some((s_id, Some(n_id))) = parse_tree_value(&nv_rename_ctx) {
-                        let edit_text = store.nodes.with(|nodes| {
-                            nodes.get(&(s_id, n_id))
-                                .map(|n| n.metadata.title.clone())
-                                .unwrap_or_default()
-                        });
+                        let edit_text = store.get_node_signal(s_id, n_id)
+                            .map(|sig| sig.with(|n| n.metadata.title.clone()))
+                            .unwrap_or_default();
                         store.rename_text.set(edit_text);
                         store.renaming_node.set(Some(nv_rename_ctx.clone()));
+                        let nv_interceptor = nv_rename_ctx.clone();
                         set_keyboard_interceptor(move |data| {
                             if data.key == "Escape" {
                                 rinch::run_on_main_thread(move || {
                                     store.renaming_node.set(None);
                                     clear_keyboard_interceptor();
+                                });
+                                return true;
+                            }
+                            if data.key == "Enter" {
+                                let nv = nv_interceptor.clone();
+                                rinch::run_on_main_thread(move || {
+                                    let new_title = untracked(|| store.rename_text.get());
+                                    store.renaming_node.set(None);
+                                    clear_keyboard_interceptor();
+                                    if let Some((s_id, Some(n_id))) = parse_tree_value(&nv) {
+                                        store.send(BackendCommand::RenameNode {
+                                            store_id: s_id, node_id: n_id, title: new_title,
+                                        });
+                                    }
                                 });
                                 return true;
                             }
@@ -679,14 +792,52 @@ pub fn run() {
                         }
                     }
                 }
-            }
+            };
+
+            // The ContextMenu sets data-oncontextmenu on its ContextMenuTarget,
+            // but both rinch-context-menu and rinch-context-menu__target have
+            // display:contents — they're invisible to hit testing. Wrap in a
+            // visible div that carries:
+            //  - context menu handler (hoisted from ContextMenuTarget)
+            //  - drag-and-drop attributes (draggable, ondragstart, etc.)
+            //  - visual feedback for drag state (opacity, highlight)
+            // This ensures right-click, drag, and drop all work on the full row.
+            let hit_area = rsx! {
+                div {
+                    style: {
+                        let nv = nv_effect.clone();
+                        move || {
+                            let base = "flex: 1; display: flex; align-items: center; border-radius: 2px; transition: background 0.1s, opacity 0.1s;";
+                            let is_being_dragged = drag_ctx.get().as_deref() == Some(&nv);
+                            let is_target = store.drop_target.get().as_deref() == Some(&nv)
+                                && drag_ctx.is_active();
+                            if is_being_dragged {
+                                format!("{} opacity: 0.3;", base)
+                            } else if is_target {
+                                format!("{} background: var(--rinch-color-blue-1); outline: 1px solid var(--rinch-color-blue-4);", base)
+                            } else {
+                                base.to_string()
+                            }
+                        }
+                    },
+                    draggable: draggable,
+                    ondragstart: on_dragstart,
+                    ondragend: on_dragend,
+                    ondrop: on_drop,
+                    ondragenter: on_dragenter,
+                    ondragleave: on_dragleave,
+                    {context_menu}
+                }
+            };
+            hoist_context_menu_handler(&hit_area, &hit_area);
+            hit_area
         });
 
         let tree_scroll = rsx! {
             div {
                 class: "pimble-sidebar__tree",
                 Tree {
-                    data: store.build_tree_data(),
+                    data: untracked(|| store.build_tree_data_structural()),
                     tree: tree_state,
                     data_source: data_source,
                     level_offset: "xs",
@@ -706,14 +857,13 @@ pub fn run() {
             let result = store.selected_id.get()
                 .and_then(|sel| parse_tree_value(&sel))
                 .and_then(|(s_id, _)| {
-                    store.stores.with(|stores| {
-                        stores.get(&s_id).map(|s| (s_id, s.root_node_id))
-                    })
+                    store.root_node_id(s_id).map(|rid| (s_id, rid))
                 })
                 // Fall back to first store
                 .or_else(|| {
-                    store.stores.with(|stores| {
-                        stores.iter().next().map(|(&id, s)| (id, s.root_node_id))
+                    let first_sid = untracked(|| store.store_ids.with(|ids| ids.first().copied()));
+                    first_sid.and_then(|sid| {
+                        store.root_node_id(sid).map(|rid| (sid, rid))
                     })
                 });
             if let Some((s_id, root_id)) = result {
@@ -726,10 +876,6 @@ pub fn run() {
         };
 
         // Rich text editor setup
-        let on_editor_change: Rc<dyn Fn()> = Rc::new(|| {
-            // Content saved on node switch — no per-keystroke action needed
-        });
-
         let ce_div = rsx! {
             div {
                 contenteditable: "true",
@@ -740,11 +886,13 @@ pub fn run() {
         // Share ce_div handle for content loading from backend events
         *ce_div_for_app.borrow_mut() = Some(ce_div.clone());
 
-        let toolbar_handle = render_toolbar(
-            __scope,
-            &ToolbarConfig::default_markdown(),
-            on_editor_change,
-        );
+        // Subscribe to CE events so toolbar active state updates on every
+        // cursor move, formatting change, etc.
+        rinch::core::ce::subscribe_ce_events(Rc::new(|_event| {
+            crate::toolbar::bump_toolbar();
+        }));
+
+        let toolbar_handle = crate::toolbar::render_pimble_toolbar(__scope);
 
         // Editor empty state icon
         let empty_icon = render_tabler_icon(__scope, TablerIcon::FileText, TablerIconStyle::Outline);
@@ -824,6 +972,7 @@ pub fn run() {
                         // ── Editor panel ──────────────────────────
                         div {
                             class: "pimble-editor",
+                            onclick: move || cancel_rename(true),
 
                             div {
                                 class: "pimble-editor__toolbar-wrap",

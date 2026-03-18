@@ -6,11 +6,13 @@
 //! 3. Signal Rinch to process events when data arrives
 
 use std::thread;
+use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use pimble_client::PimbleClient;
 use pimble_core::{MountRef, MountState, Node, NodeId, Store, StoreId, Workspace};
 use pimble_server::PimbleServer;
+use rand::Rng;
 use tokio::runtime::Runtime;
 
 /// Commands sent from UI to backend
@@ -127,40 +129,115 @@ impl BackendHandle {
     }
 }
 
+const SERVER_URL: &str = "http://127.0.0.1:9876";
+const SERVER_ADDR: &str = "127.0.0.1:9876";
+const MAX_CONNECT_ATTEMPTS: u32 = 6;
+const BASE_RETRY_MS: u64 = 250;
+
+/// Try to connect to an existing server, or start one and connect.
+/// Returns the client and optionally the server we started (if we own it).
+async fn ensure_connected() -> Result<(PimbleClient, Option<PimbleServer>), String> {
+    let mut rng = rand::rng();
+
+    for attempt in 0..MAX_CONNECT_ATTEMPTS {
+        // First, try connecting to an existing server
+        if let Ok(client) = PimbleClient::connect(SERVER_URL).await {
+            // Verify it's actually alive by making a cheap call
+            if client.list_stores().await.is_ok() {
+                tracing::info!("Connected to existing server at {}", SERVER_ADDR);
+                return Ok((client, None));
+            }
+        }
+
+        // No server running — try to start one
+        let mut server = PimbleServer::new();
+        match server.start().await {
+            Ok(()) => {
+                tracing::info!("Started embedded server on {}", SERVER_ADDR);
+                // Connect to the server we just started
+                match PimbleClient::connect(SERVER_URL).await {
+                    Ok(client) => return Ok((client, Some(server))),
+                    Err(e) => {
+                        tracing::warn!("Started server but failed to connect: {}", e);
+                        let _ = server.stop().await;
+                        // Fall through to retry
+                    }
+                }
+            }
+            Err(e) => {
+                // Port might be claimed by another instance that's still starting up
+                tracing::debug!(
+                    "Failed to start server (attempt {}): {}",
+                    attempt + 1,
+                    e
+                );
+            }
+        }
+
+        // Exponential backoff with jitter before retrying
+        if attempt + 1 < MAX_CONNECT_ATTEMPTS {
+            let base = BASE_RETRY_MS * 2u64.pow(attempt);
+            let jitter = rng.random_range(0..=base / 2);
+            let delay = Duration::from_millis(base + jitter);
+            tracing::debug!("Retrying connection in {:?} (attempt {})", delay, attempt + 1);
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    Err(format!(
+        "Failed to connect or start server after {} attempts",
+        MAX_CONNECT_ATTEMPTS
+    ))
+}
+
+/// Try to reconnect after a connection loss, optionally starting a new server.
+async fn reconnect(owned_server: &mut Option<PimbleServer>) -> Result<PimbleClient, String> {
+    // If we owned the server previously, stop it first (it may be dead anyway)
+    if let Some(mut server) = owned_server.take() {
+        let _ = server.stop().await;
+    }
+
+    let (client, new_server) = ensure_connected().await?;
+    *owned_server = new_server;
+    Ok(client)
+}
+
+/// Returns true if an error looks like a connection/transport failure
+/// (as opposed to a logical RPC error like "store not found").
+fn is_connection_error(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("broken pipe")
+        || lower.contains("transport")
+        || lower.contains("hyper")
+        || lower.contains("tcp")
+        || lower.contains("eof")
+        || lower.contains("not connected")
+}
+
 async fn backend_loop(
     cmd_rx: Receiver<BackendCommand>,
     event_tx: Sender<BackendEvent>,
     signal_ui: impl Fn(),
 ) {
     let mut client: Option<PimbleClient> = None;
+    let mut owned_server: Option<PimbleServer> = None;
 
-    // Start embedded server and auto-connect
-    let mut server = PimbleServer::new();
-    match server.start().await {
-        Ok(()) => {
-            let url = format!("http://{}", server.addr());
-            tracing::info!("Embedded server started on {}", server.addr());
-            match PimbleClient::connect(&url).await {
-                Ok(c) => {
-                    client = Some(c);
-                    let _ = event_tx.try_send(BackendEvent::Connected {
-                        server_addr: server.addr().to_string(),
-                    });
-                    signal_ui();
-                }
-                Err(e) => {
-                    tracing::error!("Failed to connect to embedded server: {}", e);
-                    let _ = event_tx.try_send(BackendEvent::Error {
-                        message: format!("Failed to connect: {}", e),
-                    });
-                    signal_ui();
-                }
-            }
+    // Initial connection
+    match ensure_connected().await {
+        Ok((c, server)) => {
+            client = Some(c);
+            owned_server = server;
+            let _ = event_tx.try_send(BackendEvent::Connected {
+                server_addr: SERVER_ADDR.to_string(),
+            });
+            signal_ui();
         }
         Err(e) => {
-            tracing::error!("Failed to start embedded server: {}", e);
+            tracing::error!("Initial connection failed: {}", e);
             let _ = event_tx.try_send(BackendEvent::Error {
-                message: format!("Server failed to start: {}", e),
+                message: format!("Failed to connect: {}", e),
             });
             signal_ui();
         }
@@ -175,17 +252,50 @@ async fn backend_loop(
 
         let event = process_command(&mut client, cmd).await;
 
+        if let Some(ref event) = event {
+            // Check if this is a connection error — if so, try to reconnect
+            if let BackendEvent::Error { message } = event {
+                if is_connection_error(message) {
+                    tracing::warn!("Connection error detected, attempting reconnect: {}", message);
+                    let _ = event_tx.try_send(BackendEvent::Disconnected);
+                    signal_ui();
+
+                    match reconnect(&mut owned_server).await {
+                        Ok(c) => {
+                            client = Some(c);
+                            let _ = event_tx.try_send(BackendEvent::Connected {
+                                server_addr: SERVER_ADDR.to_string(),
+                            });
+                            signal_ui();
+                            // Don't send the original error — we recovered
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::error!("Reconnection failed: {}", e);
+                            let _ = event_tx.try_send(BackendEvent::Error {
+                                message: format!("Reconnection failed: {}", e),
+                            });
+                            signal_ui();
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(event) = event {
             let _ = event_tx.try_send(event);
             signal_ui();
         }
     }
 
-    // Cleanup: stop server and flush stores
-    let store_manager = server.store_manager();
-    let _ = server.stop().await;
-    let mut manager = store_manager.write().await;
-    let _ = manager.flush_all().await;
+    // Cleanup: only stop the server if we own it
+    if let Some(mut server) = owned_server.take() {
+        let store_manager = server.store_manager();
+        let _ = server.stop().await;
+        let mut manager = store_manager.write().await;
+        let _ = manager.flush_all().await;
+    }
 }
 
 async fn process_command(

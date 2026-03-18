@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "rinch": {
+      "type": "stdio",
+      "command": "/home/joe/dev/rinch/target/debug/rinch-mcp-server",
+      "args": []
+    }
+  }
+}

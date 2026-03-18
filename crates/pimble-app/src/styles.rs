@@ -135,6 +135,10 @@ pub(crate) const APP_CSS: &str = "
     background: var(--rinch-color-dark-6) !important;
     border-bottom-color: var(--rinch-color-dark-4) !important;
 }
+.editor-toolbar svg {
+    width: 18px;
+    height: 18px;
+}
 
 /* ── Empty state ────────────────────────────────────────────── */
 
