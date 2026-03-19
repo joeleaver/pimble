@@ -11,6 +11,7 @@ members = [
     "crates/pimble-plugins",
     "crates/pimble-app",
     "crates/pimble-cli",
+    "crates/pimble-import",
 ]
 
 [workspace.package]
@@ -95,3 +96,4 @@ pimble-rpc = { path = "crates/pimble-rpc" }
 pimble-server = { path = "crates/pimble-server" }
 pimble-client = { path = "crates/pimble-client" }
 pimble-plugins = { path = "crates/pimble-plugins" }
+pimble-import = { path = "crates/pimble-import" }

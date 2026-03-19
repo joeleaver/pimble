@@ -5,6 +5,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use rinch::prelude::*;
@@ -54,6 +55,49 @@ pub fn run() {
 
     // Drag-and-drop state for tree node rearrangement
     let drag_ctx: DragContext<String> = DragContext::new();
+
+    // Auto-save: debounce timer using a generation counter.
+    // Each content edit bumps the generation. A background thread wakes
+    // every second and triggers a save if the generation is stable (unchanged
+    // for at least 2 seconds).
+    let autosave_gen = Arc::new(AtomicU64::new(0));
+    let autosave_gen_for_ce = autosave_gen.clone();
+    {
+        let gen = autosave_gen.clone();
+        std::thread::spawn(move || {
+            let mut last_seen: u64 = 0;
+            let mut stable_since: Option<Instant> = None;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let current = gen.load(Ordering::Relaxed);
+                if current == 0 || current == last_seen {
+                    if let Some(since) = stable_since {
+                        if since.elapsed() >= std::time::Duration::from_secs(2) {
+                            // Generation hasn't changed for 2s — trigger save
+                            gen.store(0, Ordering::Relaxed);
+                            stable_since = None;
+                            rinch::run_on_main_thread(|| {
+                                AUTOSAVE_HANDLER.with(|cell| {
+                                    if let Some(handler) = cell.borrow().as_ref() {
+                                        handler();
+                                    }
+                                });
+                            });
+                        }
+                    }
+                    continue;
+                }
+                // Generation changed — reset stability timer
+                last_seen = current;
+                stable_since = Some(Instant::now());
+            }
+        });
+    }
+
+    // Thread-local auto-save handler (set up later once we have ce_div)
+    thread_local! {
+        static AUTOSAVE_HANDLER: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
 
     // Set up event processing via thread-local so run_on_main_thread
     // can trigger it without capturing non-Send types.
@@ -170,15 +214,17 @@ pub fn run() {
     let ce_div_for_close = ce_div_cell.clone();
     CLOSE_HANDLER.with(|cell| {
         *cell.borrow_mut() = Some(Box::new(move || {
-            if let Some(ce_div) = ce_div_for_close.borrow().as_ref() {
-                if let Some(bytes) = save_content_via_ce_api(ce_div) {
-                    if let Some(selected_id) = store.selected_id.get() {
-                        if let Some((store_id, Some(node_id))) = parse_tree_value(&selected_id) {
-                            store.send(BackendCommand::SetNodeContent {
-                                store_id,
-                                node_id,
-                                content: bytes,
-                            });
+            if store.editor_dirty.get() {
+                if let Some(ce_div) = ce_div_for_close.borrow().as_ref() {
+                    if let Some(bytes) = save_content_via_ce_api(ce_div) {
+                        if let Some(selected_id) = store.selected_id.get() {
+                            if let Some((store_id, Some(node_id))) = parse_tree_value(&selected_id) {
+                                store.send(BackendCommand::SetNodeContent {
+                                    store_id,
+                                    node_id,
+                                    content: bytes,
+                                });
+                            }
                         }
                     }
                 }
@@ -297,50 +343,58 @@ pub fn run() {
                 cancel_rename_for_select(true);
             }
 
-            // Save current editor content to previously selected node
-            if let Some(ce_div) = select_ce_div.borrow().as_ref() {
-                if let Some(bytes) = save_content_via_ce_api(ce_div) {
-                    if let Some(prev_id) = store.selected_id.get() {
-                        if let Some((s_id, Some(n_id))) = parse_tree_value(&prev_id) {
-                            store.send(BackendCommand::SetNodeContent {
-                                store_id: s_id,
-                                node_id: n_id,
-                                content: bytes,
-                            });
+            // Save current editor content to previously selected node (only if dirty)
+            if store.editor_dirty.get() {
+                if let Some(ce_div) = select_ce_div.borrow().as_ref() {
+                    if let Some(bytes) = save_content_via_ce_api(ce_div) {
+                        if let Some(prev_id) = store.selected_id.get() {
+                            if let Some((s_id, Some(n_id))) = parse_tree_value(&prev_id) {
+                                store.send(BackendCommand::SetNodeContent {
+                                    store_id: s_id,
+                                    node_id: n_id,
+                                    content: bytes,
+                                });
+                            }
                         }
                     }
                 }
+                store.editor_dirty.set(false);
             }
 
             // Update selection and load new node
             store.selected_id.set(Some(value.clone()));
 
-            let (title_opt, content_bytes_opt, is_document) = if let Some((s_id, node_id_opt)) = parse_tree_value(&value) {
+            let parsed = parse_tree_value(&value);
+            let (title_opt, content_bytes_opt, is_document, sel_ids) = if let Some((s_id, node_id_opt)) = parsed {
                 if let Some(n_id) = node_id_opt {
                     let result = store.get_node_signal(s_id, n_id).map(|sig| {
                         sig.with(|node| {
-                            let label = display_label_from_node(node);
+                            let label = if !node.metadata.title.is_empty() {
+                                node.metadata.title.clone()
+                            } else {
+                                "Untitled".to_string()
+                            };
                             let is_doc = node.node_type == pimble_core::node_types::DOCUMENT;
                             (label, node.content.clone(), is_doc)
                         })
                     });
                     match result {
-                        Some((label, content, is_doc)) => (Some(label), Some(content), is_doc),
+                        Some((label, content, is_doc)) => (Some(label), Some(content), is_doc, Some((s_id, n_id))),
                         None => {
                             store.send(BackendCommand::GetNode { store_id: s_id, node_id: n_id });
-                            (None, None, false)
+                            (None, None, false, None)
                         }
                     }
                 } else {
                     let title = store.get_store_signal(s_id)
                         .map(|sig| sig.with(|s| s.name.clone()));
                     match title {
-                        Some(t) => (Some(t), Some(Vec::new()), false),
-                        None => (None, None, false),
+                        Some(t) => (Some(t), Some(Vec::new()), false, None),
+                        None => (None, None, false, None),
                     }
                 }
             } else {
-                (None, None, false)
+                (None, None, false, None)
             };
 
             store.show_editor.set(is_document);
@@ -352,10 +406,11 @@ pub fn run() {
             // Load content into editor
             if is_document {
                 let content_bytes = content_bytes_opt.unwrap_or_default();
-                if let Some(ce_div) = select_ce_div.borrow().as_ref() {
-                    load_content_into_ce(&content_bytes, ce_div);
+                if let (Some(ce_div), Some((s_id, n_id))) = (select_ce_div.borrow().as_ref(), sel_ids) {
+                    load_content_into_ce(&content_bytes, ce_div, store, s_id, n_id);
                 }
             }
+            store.editor_dirty.set(false);
         });
 
         let on_tree_expand = ValueCallback::new(move |value: String| {
@@ -914,10 +969,43 @@ pub fn run() {
         *ce_div_for_app.borrow_mut() = Some(ce_div.clone());
 
         // Subscribe to CE events so toolbar active state updates on every
-        // cursor move, formatting change, etc.
-        rinch::core::ce::subscribe_ce_events(Rc::new(|_event| {
+        // cursor move, formatting change, etc. Also mark editor dirty on
+        // content-modifying events and bump the auto-save generation.
+        let autosave_gen_ce = autosave_gen_for_ce.clone();
+        rinch::core::ce::subscribe_ce_events(Rc::new(move |event| {
             crate::toolbar::bump_toolbar();
+            use rinch::core::ce::CeEvent;
+            match event {
+                CeEvent::SelectionChanged { .. } => {}
+                _ => {
+                    store.editor_dirty.set(true);
+                    autosave_gen_ce.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }));
+
+        // Set up the auto-save handler now that we have the ce_div
+        let autosave_ce_div = ce_div.clone();
+        AUTOSAVE_HANDLER.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move || {
+                if !store.editor_dirty.get() {
+                    return;
+                }
+                if let Some(bytes) = save_content_via_ce_api(&autosave_ce_div) {
+                    if let Some(selected_id) = store.selected_id.get() {
+                        if let Some((s_id, Some(n_id))) = parse_tree_value(&selected_id) {
+                            tracing::info!("Auto-saving content for node {}", n_id);
+                            store.send(BackendCommand::SetNodeContent {
+                                store_id: s_id,
+                                node_id: n_id,
+                                content: bytes,
+                            });
+                        }
+                    }
+                }
+                store.editor_dirty.set(false);
+            }));
+        });
 
         let toolbar_handle = crate::toolbar::render_pimble_toolbar(__scope);
 

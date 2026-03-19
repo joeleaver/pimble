@@ -33,6 +33,13 @@ async fn main() -> Result<()> {
             }
             create_store(&args[2], &args[3]).await?;
         }
+        "import-scrivener" => {
+            if args.len() < 4 {
+                eprintln!("Usage: pimble-cli import-scrivener <scrivener-project.scriv> <output.pimble>");
+                return Ok(());
+            }
+            import_scrivener(&args[2], &args[3]).await?;
+        }
         "list-stores" => list_stores().await?,
         "open-store" => {
             if args.len() < 3 {
@@ -58,17 +65,19 @@ USAGE:
     pimble-cli <COMMAND> [OPTIONS]
 
 COMMANDS:
-    help            Show this help message
-    server          Start the Pimble server
-    create-store    Create a new store
-    open-store      Open an existing store
-    list-stores     List all open stores
+    help                Show this help message
+    server              Start the Pimble server
+    create-store        Create a new store
+    open-store          Open an existing store
+    list-stores         List all open stores
+    import-scrivener    Import a Scrivener .scriv project into a Pimble store
 
 EXAMPLES:
     pimble-cli server
     pimble-cli create-store ./my-notes.pimble "My Notes"
     pimble-cli open-store ./my-notes.pimble
     pimble-cli list-stores
+    pimble-cli import-scrivener ./project.scriv ./project.pimble
 "#
     );
 }
@@ -110,6 +119,17 @@ async fn list_stores() -> Result<()> {
             println!("  {} - {}", store.id, store.name);
         }
     }
+    Ok(())
+}
+
+async fn import_scrivener(scriv_path: &str, output_path: &str) -> Result<()> {
+    use std::path::Path;
+    pimble_import::scrivener::import_scrivener(
+        Path::new(scriv_path),
+        Path::new(output_path),
+    )
+    .await?;
+    println!("Scrivener project imported successfully to {}", output_path);
     Ok(())
 }
 

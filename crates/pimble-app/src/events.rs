@@ -10,7 +10,7 @@ use pimble_core::NodeId;
 use rinch::prelude::*;
 
 use crate::backend::{BackendCommand, BackendEvent};
-use crate::editor::load_content_into_ce;
+use crate::editor::{load_content_into_ce, invalidate_html_cache};
 use crate::persistence::{load_app_state_file, save_app_state_file};
 use crate::state::{parse_tree_value, AppStore, ConnectionState, MountInfo};
 
@@ -189,13 +189,17 @@ pub(crate) fn process_backend_events(
                 // Data-only: updates per-node signal, NO tree rebuild
                 store.upsert_node(*store_id, node.clone());
 
+                if content_changed {
+                    invalidate_html_cache(store, *store_id, node_id);
+                }
+
                 if let Some(selected_id) = store.selected_id.get() {
                     if let Some((sel_store_id, Some(sel_node_id))) = parse_tree_value(&selected_id) {
                         if sel_store_id == *store_id && sel_node_id == node_id {
                             store.node_title.set(store.display_label(*store_id, node_id));
                             if content_changed {
                                 if let Some(ce_div) = ce_div_cell.borrow().as_ref() {
-                                    load_content_into_ce(&content_bytes, ce_div);
+                                    load_content_into_ce(&content_bytes, ce_div, store, *store_id, node_id);
                                 }
                             }
                         }
@@ -260,6 +264,7 @@ pub(crate) fn process_backend_events(
 
             BackendEvent::NodeContentUpdated { store_id, node_id } => {
                 tracing::info!("Node content updated: {:?}/{:?}", store_id, node_id);
+                invalidate_html_cache(store, *store_id, *node_id);
                 // Only re-fetch if this isn't the currently-selected node.
                 let is_selected = store.selected_id.get()
                     .and_then(|sel| parse_tree_value(&sel))

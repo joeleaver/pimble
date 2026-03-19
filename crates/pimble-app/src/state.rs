@@ -130,6 +130,14 @@ pub struct AppStore {
 
     // Mount picker
     pub pending_mount: Signal<Option<PendingMount>>,
+
+    // Editor dirty flag — set when user edits content, cleared on save/load
+    pub editor_dirty: Signal<bool>,
+
+    // Cached HTML for loaded nodes — avoids re-parsing automerge on every click.
+    // Key is (StoreId, NodeId), value is the HTML string.
+    // Invalidated when node content changes.
+    pub html_cache: Signal<HashMap<(StoreId, NodeId), String>>,
 }
 
 impl AppStore {
@@ -155,6 +163,8 @@ impl AppStore {
             drop_target: Signal::new(None),
             rename_input_ids: Signal::new(HashMap::new()),
             pending_mount: Signal::new(None),
+            editor_dirty: Signal::new(false),
+            html_cache: Signal::new(HashMap::new()),
         }
     }
 
@@ -367,12 +377,28 @@ impl AppStore {
                 map.contains_key(&(store_id, child_id))
             });
 
+            // Check if the node itself reports having children (from its
+            // children list) even if we haven't fetched them yet. This
+            // lets the tree show an expand chevron for unfetched subtrees.
+            let node_reports_children = !has_loaded_children && self.node_data.with(|map| {
+                map.get(&(store_id, child_id))
+                    .map_or(false, |sig| sig.with(|n| !n.children.is_empty()))
+            });
+
             if has_children {
                 result.push(tree_node.with_children(children_data));
             } else if is_mount && !has_loaded_children {
                 let placeholder = TreeNodeData::new(
                     format!("mount_loading_{}_{}", store_id, child_id),
                     "Loading...",
+                );
+                result.push(tree_node.with_children(vec![placeholder]));
+            } else if node_reports_children {
+                // Node has children we haven't fetched yet — show a
+                // placeholder so the tree renders an expand chevron.
+                let placeholder = TreeNodeData::new(
+                    format!("placeholder_{}_{}", store_id, child_id),
+                    "",
                 );
                 result.push(tree_node.with_children(vec![placeholder]));
             } else {
