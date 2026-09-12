@@ -1,11 +1,31 @@
 //! RTF-to-BlockData converter
 //!
 //! Handles the subset of RTF used by Scrivener: extracts text with
-//! bold, italic, and hyperlink formatting into EditorDocument blocks.
+//! bold, italic, and hyperlink formatting into paragraph/run data.
 
 use std::collections::HashMap;
 
-use rinch_core::ce::{BlockData, InlineMarkData, InlineRunData};
+/// One paragraph of RTF content: a block type plus its inline runs.
+#[derive(Debug, Clone, Default)]
+pub struct BlockData {
+    pub block_type: String,
+    pub attrs: HashMap<String, String>,
+    pub content: Vec<InlineRunData>,
+}
+
+/// A run of text sharing the same inline formatting.
+#[derive(Debug, Clone, Default)]
+pub struct InlineRunData {
+    pub text: String,
+    pub marks: Vec<InlineMarkData>,
+}
+
+/// A single inline formatting mark (bold, italic, underline, link).
+#[derive(Debug, Clone)]
+pub struct InlineMarkData {
+    pub mark_type: String,
+    pub attrs: HashMap<String, String>,
+}
 
 /// Active formatting state while parsing RTF.
 #[derive(Clone, Default)]

@@ -8,10 +8,8 @@
 use std::collections::{HashMap, HashSet};
 
 use pimble_core::{MountState, Node, NodeId, Store, StoreId};
-use pimble_crdt::DocumentContent;
 use rinch::components::TreeNodeData;
 use rinch::prelude::*;
-use rinch_editor::EditorDocument;
 
 use crate::backend::BackendHandle;
 
@@ -30,41 +28,30 @@ pub struct MountInfo {
     pub mount_state: Option<MountState>,
 }
 
-/// Extract text content from node content bytes.
+/// Extract plain-text content from node content bytes, for tree previews / labels.
 ///
-/// Tries new format (EditorDocument) first, falls back to old format (DocumentContent).
+/// `content` is a yrs snapshot (or empty). Blocks are joined by `\n`; `""` for
+/// empty or unreadable content, in which case the caller falls back to the
+/// node's title.
 pub fn get_node_content_text(content: &[u8]) -> String {
-    if content.is_empty() {
-        return String::new();
-    }
-
-    // Try new format first (EditorDocument with rich blocks)
-    if let Ok(doc) = EditorDocument::from_bytes(content) {
-        return doc.to_markdown();
-    }
-
-    // Fall back to old format (DocumentContent with flat text)
-    match DocumentContent::load(content) {
-        Ok(doc) => doc.get_text().unwrap_or_else(|_| {
-            String::from_utf8_lossy(content).to_string()
-        }),
-        Err(_) => String::from_utf8_lossy(content).to_string(),
-    }
+    pimble_crdt::ContentDoc::text_of(content)
 }
 
-/// Compute display label from a Node reference (no signal dependency).
-pub fn display_label_from_node(node: &Node) -> String {
-    let has_explicit_title = node.metadata.custom
-        .get("explicit_title")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    if has_explicit_title && !node.metadata.title.is_empty() {
-        return node.metadata.title.clone();
+/// Compute a display label from an explicit-title flag/title plus a plain-text
+/// content projection: an explicit title wins; otherwise the first non-empty
+/// line of `content_text` (truncated to 25 chars with an ellipsis); otherwise
+/// `title`; otherwise `"Untitled"`.
+///
+/// Shared by [`display_label_from_node`] (which projects `content_text` from
+/// stored node bytes) and the editor's debounced live-label refresh
+/// (`editor::schedule_label_refresh`), which supplies `content_text` straight
+/// from the in-memory document instead of decoding a CRDT snapshot.
+pub fn label_from_title_and_content(has_explicit_title: bool, title: &str, content_text: &str) -> String {
+    if has_explicit_title && !title.is_empty() {
+        return title.to_string();
     }
 
-    let content = get_node_content_text(&node.content);
-    let first_line = content
+    let first_line = content_text
         .lines()
         .map(|l| l.trim())
         .find(|l| !l.is_empty())
@@ -79,11 +66,21 @@ pub fn display_label_from_node(node: &Node) -> String {
         }
     }
 
-    if !node.metadata.title.is_empty() {
-        return node.metadata.title.clone();
+    if !title.is_empty() {
+        return title.to_string();
     }
 
     "Untitled".to_string()
+}
+
+/// Compute display label from a Node reference (no signal dependency).
+pub fn display_label_from_node(node: &Node) -> String {
+    let has_explicit_title = node.metadata.custom
+        .get("explicit_title")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let content = get_node_content_text(&node.content);
+    label_from_title_and_content(has_explicit_title, &node.metadata.title, &content)
 }
 
 /// Global application state with per-entity reactive signals.
@@ -126,7 +123,9 @@ pub struct AppStore {
     pub drop_target: Signal<Option<String>>,
 
     // Rename input DOM node IDs (tree_value → input element node ID for request_focus)
-    pub rename_input_ids: Signal<HashMap<String, usize>>,
+    /// Rename inputs by tree value as `(doc_key, node_id)`, so the double-click
+    /// handler can focus one via `request_focus`.
+    pub rename_input_ids: Signal<HashMap<String, (u64, usize)>>,
 
     // Mount picker
     pub pending_mount: Signal<Option<PendingMount>>,
@@ -134,10 +133,49 @@ pub struct AppStore {
     // Editor dirty flag — set when user edits content, cleared on save/load
     pub editor_dirty: Signal<bool>,
 
-    // Cached HTML for loaded nodes — avoids re-parsing automerge on every click.
+    // Cached HTML for loaded nodes — avoids re-parsing content on every click.
     // Key is (StoreId, NodeId), value is the HTML string.
     // Invalidated when node content changes.
     pub html_cache: Signal<HashMap<(StoreId, NodeId), String>>,
+
+    // Active editing state — tracks the node being edited and its local CrdtDocument.
+    // When set, saves go through the sync protocol instead of full replacement.
+    pub active_edit: Signal<Option<ActiveEdit>>,
+
+    // Locally-computed display label for the node currently being typed into,
+    // refreshed on a debounce by `editor::schedule_label_refresh` straight from
+    // the editor's in-memory document. Takes priority over the content-derived
+    // label in the tree render, since the per-node signal's cached `content`
+    // isn't updated while a node is under active local edit (see
+    // `upsert_node`, which clears an entry once authoritative content arrives).
+    pub live_label: Signal<HashMap<(StoreId, NodeId), String>>,
+
+    // Sync status — tracks the overall sync state of the application.
+    pub sync_status: Signal<SyncStatus>,
+
+    // This client's unique ID (for echo suppression in notifications)
+    pub client_id: Signal<String>,
+
+}
+
+/// Tracks the actively-edited node and its local CrdtDocument.
+#[derive(Clone)]
+pub struct ActiveEdit {
+    pub store_id: StoreId,
+    pub node_id: NodeId,
+}
+
+/// Overall sync status for the application.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SyncStatus {
+    /// All stores are synced
+    Synced,
+    /// Currently syncing
+    Syncing,
+    /// Local changes not yet synced
+    Unsynced(usize),
+    /// Sync error
+    Error(String),
 }
 
 impl AppStore {
@@ -165,6 +203,10 @@ impl AppStore {
             pending_mount: Signal::new(None),
             editor_dirty: Signal::new(false),
             html_cache: Signal::new(HashMap::new()),
+            active_edit: Signal::new(None),
+            live_label: Signal::new(HashMap::new()),
+            sync_status: Signal::new(SyncStatus::Synced),
+            client_id: Signal::new(String::new()),
         }
     }
 
@@ -204,6 +246,7 @@ impl AppStore {
         self.node_data.update(|map| { map.retain(|(sid, _), _| *sid != store_id); });
         self.children_of.update(|map| { map.retain(|(sid, _), _| *sid != store_id); });
         self.mount_data.update(|map| { map.retain(|(sid, _), _| *sid != store_id); });
+        self.live_label.update(|map| { map.retain(|(sid, _), _| *sid != store_id); });
     }
 
     /// Remove a node and its per-entity signals (node_data, mount_data, children_of).
@@ -212,6 +255,7 @@ impl AppStore {
         self.node_data.update(|map| { map.remove(&key); });
         self.mount_data.update(|map| { map.remove(&key); });
         self.children_of.update(|map| { map.remove(&key); });
+        self.live_label.update(|map| { map.remove(&key); });
     }
 
     /// Insert or update a node's per-entity signal.
@@ -228,6 +272,9 @@ impl AppStore {
                 map.insert(key, new_sig);
             });
         }
+        // Authoritative content just replaced the cached node — drop any stale
+        // locally-computed label override for it (see `live_label`).
+        self.live_label.update(|m| { m.remove(&key); });
     }
 
     /// Set children for a parent node's per-entity signal.

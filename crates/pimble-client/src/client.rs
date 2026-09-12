@@ -2,14 +2,17 @@
 
 use std::path::Path;
 
-use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
+use jsonrpsee::core::client::SubscriptionClientT;
+use jsonrpsee::ws_client::{WsClient, WsClientBuilder};
 use pimble_core::{Node, NodeId, Store, StoreId, Workspace};
 use pimble_core::MountRef;
 use pimble_rpc::{
-    CloseStoreRequest, CreateMountRequest, CreateNodeRequest, CreateStoreRequest,
-    CreateWorkspaceRequest, DeleteNodeRequest, GetChildrenRequest, GetMountStateRequest,
-    GetNodeRequest, GetNodesRequest, LoadWorkspaceRequest, MoveNodeRequest, OpenStoreRequest,
-    PimbleApiClient, SaveWorkspaceRequest, SearchRequest, SearchResultItem, SetNodeTextRequest,
+    ApplyEditRequest, CloseStoreRequest, CreateMountRequest, CreateNodeRequest,
+    CreateStoreRequest, CreateWorkspaceRequest, DeleteNodeRequest, EditOperation,
+    GetChildrenRequest, GetMountStateRequest, GetNodeRequest, GetNodesRequest,
+    LoadWorkspaceRequest, MoveNodeRequest, NodeContentChangedNotification, OpenStoreRequest,
+    PimbleApiClient, SaveWorkspaceRequest, SearchRequest, SearchResultItem,
+    StoreChangedNotification, SyncNodeContentRequest, SyncStoreDocumentRequest,
     UpdateNodeContentRequest, UpdateNodeMetadataRequest,
 };
 use tracing::debug;
@@ -17,25 +20,47 @@ use url::Url;
 
 use crate::error::{ClientError, Result};
 
-/// Client for connecting to a Pimble server
+/// Client for connecting to a Pimble server via WebSocket.
+///
+/// Uses WebSocket transport to support both RPC calls and subscriptions.
 pub struct PimbleClient {
-    client: HttpClient,
+    client: WsClient,
     base_url: Url,
 }
 
 impl PimbleClient {
-    /// Connect to a Pimble server
+    /// Connect to a Pimble server via WebSocket.
+    ///
+    /// Accepts HTTP URLs (http://, https://) and automatically converts them
+    /// to WebSocket URLs (ws://, wss://).
     pub async fn connect(url: impl AsRef<str>) -> Result<Self> {
         let base_url: Url = url
             .as_ref()
             .parse()
             .map_err(|e| ClientError::Connection(format!("Invalid URL: {}", e)))?;
 
-        let client = HttpClientBuilder::default()
-            .build(&base_url)
+        // Convert http:// to ws:// for WebSocket connection
+        let ws_url = match base_url.scheme() {
+            "http" => {
+                let mut ws = base_url.clone();
+                ws.set_scheme("ws").map_err(|_| ClientError::Connection("Failed to set ws scheme".into()))?;
+                ws
+            }
+            "https" => {
+                let mut ws = base_url.clone();
+                ws.set_scheme("wss").map_err(|_| ClientError::Connection("Failed to set wss scheme".into()))?;
+                ws
+            }
+            "ws" | "wss" => base_url.clone(),
+            other => return Err(ClientError::Connection(format!("Unsupported scheme: {}", other))),
+        };
+
+        let client = WsClientBuilder::default()
+            .build(&ws_url)
+            .await
             .map_err(|e| ClientError::Connection(e.to_string()))?;
 
-        debug!("Connected to Pimble server at {}", base_url);
+        debug!("Connected to Pimble server at {} (ws: {})", base_url, ws_url);
 
         Ok(Self { client, base_url })
     }
@@ -184,6 +209,7 @@ impl PimbleClient {
         store_id: StoreId,
         node_id: NodeId,
         content: Vec<u8>,
+        client_id: Option<String>,
     ) -> Result<()> {
         use base64::Engine;
         let encoded = base64::engine::general_purpose::STANDARD.encode(&content);
@@ -192,31 +218,11 @@ impl PimbleClient {
             store_id,
             node_id,
             content: encoded,
+            client_id,
         };
 
         self.client
             .update_node_content(request)
-            .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
-
-        Ok(())
-    }
-
-    /// Set a node's text content (replaces all content)
-    pub async fn set_node_text(
-        &self,
-        store_id: StoreId,
-        node_id: NodeId,
-        text: String,
-    ) -> Result<()> {
-        let request = SetNodeTextRequest {
-            store_id,
-            node_id,
-            text,
-        };
-
-        self.client
-            .set_node_text(request)
             .await
             .map_err(|e| ClientError::Rpc(e.to_string()))?;
 
@@ -375,6 +381,145 @@ impl PimbleClient {
             .map_err(|e| ClientError::Rpc(e.to_string()))?;
 
         Ok(response.workspace)
+    }
+
+    // ========================================================================
+    // Edit Operations (collaborative editing)
+    // ========================================================================
+
+    /// Apply an edit operation to a node and broadcast to other clients.
+    pub async fn apply_edit(
+        &self,
+        store_id: StoreId,
+        node_id: NodeId,
+        client_id: &str,
+        operation: EditOperation,
+    ) -> Result<()> {
+        let request = ApplyEditRequest {
+            store_id,
+            node_id,
+            client_id: client_id.to_string(),
+            operation,
+        };
+
+        self.client
+            .apply_edit(request)
+            .await
+            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Sync Operations
+    // ========================================================================
+
+    /// Sync a store document (tree + metadata) using Automerge sync protocol.
+    /// Returns the server's sync message (base64-encoded), or None if in sync.
+    pub async fn sync_store_document(
+        &self,
+        store_id: StoreId,
+        client_id: &str,
+        message: Option<String>,
+    ) -> Result<Option<String>> {
+        let request = SyncStoreDocumentRequest {
+            store_id,
+            client_id: client_id.to_string(),
+            message,
+        };
+
+        let response = self
+            .client
+            .sync_store_document(request)
+            .await
+            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+
+        Ok(response.message)
+    }
+
+    /// Sync a node's content document: send our yrs state vector, get back
+    /// everything the server has beyond it plus the server's own state
+    /// vector. Stateless on both ends.
+    pub async fn sync_node_content(
+        &self,
+        store_id: StoreId,
+        node_id: NodeId,
+        state_vector: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        use base64::Engine;
+
+        let request = SyncNodeContentRequest {
+            store_id,
+            node_id,
+            state_vector: base64::engine::general_purpose::STANDARD.encode(state_vector),
+        };
+
+        let response = self
+            .client
+            .sync_node_content(request)
+            .await
+            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+
+        let diff = base64::engine::general_purpose::STANDARD
+            .decode(&response.diff)
+            .map_err(|e| ClientError::Rpc(format!("Invalid base64 diff: {}", e)))?;
+        let server_sv = base64::engine::general_purpose::STANDARD
+            .decode(&response.state_vector)
+            .map_err(|e| ClientError::Rpc(format!("Invalid base64 state vector: {}", e)))?;
+
+        Ok((diff, server_sv))
+    }
+
+    // ========================================================================
+    // Subscription Operations
+    // ========================================================================
+
+    /// Subscribe to store changes (tree structure, metadata).
+    /// Returns a subscription stream that yields `StoreChangedNotification`.
+    pub async fn subscribe_store_changes(
+        &self,
+        store_id: StoreId,
+    ) -> Result<jsonrpsee::core::client::Subscription<StoreChangedNotification>> {
+        use jsonrpsee::core::params::ArrayParams;
+
+        let mut params = ArrayParams::new();
+        params.insert(store_id).map_err(|e| ClientError::Rpc(e.to_string()))?;
+
+        let sub = self.client
+            .subscribe::<StoreChangedNotification, _>(
+                "pimble_subscribeStoreChanges",
+                params,
+                "pimble_unsubscribeStoreChanges",
+            )
+            .await
+            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+
+        Ok(sub)
+    }
+
+    /// Subscribe to node content changes.
+    /// Returns a subscription stream that yields `NodeContentChangedNotification`.
+    pub async fn subscribe_node_changes(
+        &self,
+        store_id: StoreId,
+        node_id: NodeId,
+    ) -> Result<jsonrpsee::core::client::Subscription<NodeContentChangedNotification>> {
+        use jsonrpsee::core::params::ArrayParams;
+
+        let mut params = ArrayParams::new();
+        params.insert(store_id).map_err(|e| ClientError::Rpc(e.to_string()))?;
+        params.insert(node_id).map_err(|e| ClientError::Rpc(e.to_string()))?;
+
+        let sub = self.client
+            .subscribe::<NodeContentChangedNotification, _>(
+                "pimble_subscribeNodeChanges",
+                params,
+                "pimble_unsubscribeNodeChanges",
+            )
+            .await
+            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+
+        Ok(sub)
     }
 
     // ========================================================================

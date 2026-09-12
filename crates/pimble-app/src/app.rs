@@ -5,7 +5,6 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use rinch::prelude::*;
@@ -14,7 +13,7 @@ use rinch::menu::{Menu, MenuItem};
 use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
 
 use crate::backend::{BackendCommand, BackendHandle};
-use crate::editor::{save_content_via_ce_api, load_content_into_ce};
+use crate::editor::{start_editing, stop_editing};
 use crate::events::{EVENT_PROCESSOR, process_backend_events};
 use crate::state::{parse_tree_value, display_label_from_node, AppStore, PendingMount};
 use crate::styles::{APP_CSS, EDITOR_CSS};
@@ -47,68 +46,18 @@ pub fn run() {
     // Double-click detection for rename: (last_click_time, last_click_value)
     let last_click: Rc<Cell<(Instant, String)>> = Rc::new(Cell::new((Instant::now(), String::new())));
 
-    // Shared CE div handle for content loading from backend events
-    let ce_div_cell: Rc<RefCell<Option<NodeHandle>>> = Rc::new(RefCell::new(None));
-
     // Persistent tree state — created once, preserves expanded/selected across data changes
     let tree_state = UseTreeReturn::new(UseTreeOptions::default());
 
     // Drag-and-drop state for tree node rearrangement
     let drag_ctx: DragContext<String> = DragContext::new();
 
-    // Auto-save: debounce timer using a generation counter.
-    // Each content edit bumps the generation. A background thread wakes
-    // every second and triggers a save if the generation is stable (unchanged
-    // for at least 2 seconds).
-    let autosave_gen = Arc::new(AtomicU64::new(0));
-    let autosave_gen_for_ce = autosave_gen.clone();
-    {
-        let gen = autosave_gen.clone();
-        std::thread::spawn(move || {
-            let mut last_seen: u64 = 0;
-            let mut stable_since: Option<Instant> = None;
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                let current = gen.load(Ordering::Relaxed);
-                if current == 0 || current == last_seen {
-                    if let Some(since) = stable_since {
-                        if since.elapsed() >= std::time::Duration::from_secs(2) {
-                            // Generation hasn't changed for 2s — trigger save
-                            gen.store(0, Ordering::Relaxed);
-                            stable_since = None;
-                            rinch::run_on_main_thread(|| {
-                                AUTOSAVE_HANDLER.with(|cell| {
-                                    if let Some(handler) = cell.borrow().as_ref() {
-                                        handler();
-                                    }
-                                });
-                            });
-                        }
-                    }
-                    continue;
-                }
-                // Generation changed — reset stability timer
-                last_seen = current;
-                stable_since = Some(Instant::now());
-            }
-        });
-    }
-
-    // Thread-local auto-save handler (set up later once we have ce_div)
-    thread_local! {
-        static AUTOSAVE_HANDLER: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
-    }
-
     // Set up event processing via thread-local so run_on_main_thread
-    // can trigger it without capturing non-Send types.
-    let ce_div_for_events = ce_div_cell.clone();
+    // can trigger it without capturing non-Send types. (No autosave loop or CE div
+    // anymore — the collab session persists edits live.)
     EVENT_PROCESSOR.with(|cell| {
         *cell.borrow_mut() = Some(Box::new(move || {
-            process_backend_events(
-                store,
-                tree_state,
-                &ce_div_for_events,
-            );
+            process_backend_events(store, tree_state);
         }));
     });
 
@@ -211,24 +160,10 @@ pub fn run() {
     thread_local! {
         static CLOSE_HANDLER: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
     }
-    let ce_div_for_close = ce_div_cell.clone();
     CLOSE_HANDLER.with(|cell| {
         *cell.borrow_mut() = Some(Box::new(move || {
-            if store.editor_dirty.get() {
-                if let Some(ce_div) = ce_div_for_close.borrow().as_ref() {
-                    if let Some(bytes) = save_content_via_ce_api(ce_div) {
-                        if let Some(selected_id) = store.selected_id.get() {
-                            if let Some((store_id, Some(node_id))) = parse_tree_value(&selected_id) {
-                                store.send(BackendCommand::SetNodeContent {
-                                    store_id,
-                                    node_id,
-                                    content: bytes,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
+            // Edits persist live through the collab relay; nothing to flush on close.
+            let _ = store;
         }));
     });
     let on_close: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| {
@@ -253,7 +188,6 @@ pub fn run() {
     };
 
     // Build app component - parameter must be named __scope for the rsx! macro
-    let ce_div_for_app = ce_div_cell.clone();
     let app_component = move |__scope: &mut RenderScope| -> NodeHandle {
         // Cancel any in-progress rename, optionally committing the change.
         let cancel_last_click = last_click.clone();
@@ -276,7 +210,6 @@ pub fn run() {
         };
 
         // Tree callbacks
-        let select_ce_div = ce_div_for_app.clone();
         let select_last_click = last_click.clone();
         let cancel_rename_for_select = cancel_rename.clone();
         let on_tree_select = ValueCallback::new(move |value: String| {
@@ -333,8 +266,8 @@ pub fn run() {
                         }
                         false
                     });
-                    if let Some(input_node_id) = store.rename_input_ids.with(|ids| ids.get(&value).copied()) {
-                        request_focus(input_node_id);
+                    if let Some((doc_key, input_node_id)) = store.rename_input_ids.with(|ids| ids.get(&value).copied()) {
+                        request_focus(doc_key, input_node_id);
                     }
                     return;
                 }
@@ -343,23 +276,8 @@ pub fn run() {
                 cancel_rename_for_select(true);
             }
 
-            // Save current editor content to previously selected node (only if dirty)
-            if store.editor_dirty.get() {
-                if let Some(ce_div) = select_ce_div.borrow().as_ref() {
-                    if let Some(bytes) = save_content_via_ce_api(ce_div) {
-                        if let Some(prev_id) = store.selected_id.get() {
-                            if let Some((s_id, Some(n_id))) = parse_tree_value(&prev_id) {
-                                store.send(BackendCommand::SetNodeContent {
-                                    store_id: s_id,
-                                    node_id: n_id,
-                                    content: bytes,
-                                });
-                            }
-                        }
-                    }
-                }
-                store.editor_dirty.set(false);
-            }
+            // (The previously-edited node's changes already persisted live through
+            // the collab delta relay — no explicit save-on-switch is needed.)
 
             // Update selection and load new node
             store.selected_id.set(Some(value.clone()));
@@ -397,18 +315,27 @@ pub fn run() {
                 (None, None, false, None)
             };
 
+            tracing::debug!(
+                "Selection resolved: parsed={} is_document={} content_len={:?}",
+                parsed.is_some(),
+                is_document,
+                content_bytes_opt.as_ref().map(|c| c.len())
+            );
             store.show_editor.set(is_document);
 
             if let Some(title) = title_opt {
                 store.node_title.set(title);
             }
 
-            // Load content into editor
+            // Load content into the editor and start a collaboration session
+            // (start_editing loads the content via guest-join or a fresh host).
             if is_document {
                 let content_bytes = content_bytes_opt.unwrap_or_default();
-                if let (Some(ce_div), Some((s_id, n_id))) = (select_ce_div.borrow().as_ref(), sel_ids) {
-                    load_content_into_ce(&content_bytes, ce_div, store, s_id, n_id);
+                if let Some((s_id, n_id)) = sel_ids {
+                    start_editing(store, s_id, n_id, &content_bytes);
                 }
+            } else {
+                stop_editing(store);
             }
             store.editor_dirty.set(false);
         });
@@ -494,12 +421,17 @@ pub fn run() {
                 None
             };
 
-            // Choose icon (static — changes only on structural rebuild)
+            // Choose icon (static — changes only on structural rebuild). Folders
+            // are folders even when empty; documents are documents even with
+            // children, so the icon follows node_type, not has_children.
+            let is_folder = node_sig
+                .map(|sig| sig.with(|n| n.node_type == pimble_core::node_types::FOLDER))
+                .unwrap_or(has_children);
             let icon = if is_store_root {
                 TablerIcon::Database
             } else if is_mount {
                 TablerIcon::Link
-            } else if has_children {
+            } else if is_folder {
                 TablerIcon::Folder
             } else {
                 TablerIcon::File
@@ -677,7 +609,7 @@ pub fn run() {
 
             // Register this input's DOM node ID so the double-click handler can focus it
             store.rename_input_ids.update(|ids| {
-                ids.insert(node_value.clone(), rename_input.node_id().0);
+                ids.insert(node_value.clone(), (rename_input.doc_key(), rename_input.node_id().0));
             });
 
             // Clone before wrapper rsx moves rename_input
@@ -735,13 +667,18 @@ pub fn run() {
                             }
                         },
 
-                        // Reactive label text — subscribes to per-node/per-store signal only
+                        // Reactive label text — subscribes to per-node/per-store signal
+                        // (and, for a node under active local edit, `live_label`).
                         {move || {
                             let label = if is_store_root {
                                 store_sig.map(|s| s.with(|st| st.name.clone()))
                                     .unwrap_or_default()
                             } else {
-                                node_sig.map(|s| s.with(|n| display_label_from_node(n)))
+                                let live = parsed.and_then(|(s_id, n_id)| {
+                                    let n_id = n_id?;
+                                    store.live_label.with(|m| m.get(&(s_id, n_id)).cloned())
+                                });
+                                live.or_else(|| node_sig.map(|s| s.with(|n| display_label_from_node(n))))
                                     .unwrap_or_else(|| "Untitled".to_string())
                             };
 
@@ -843,7 +780,7 @@ pub fn run() {
                             }
                             false
                         });
-                        request_focus(rename_input_for_focus.node_id().0);
+                        rename_input_for_focus.focus();
                     }
                 };
 
@@ -957,55 +894,15 @@ pub fn run() {
             }
         };
 
-        // Rich text editor setup
-        let ce_div = rsx! {
-            div {
-                contenteditable: "true",
-                class: "editor-content",
-                style: "outline: none; flex: 1; padding: 24px 32px; cursor: text;",
-            }
+        // Rich text editor (the new rinch `Editor {}` component over the shared
+        // thread-local `EditorHandle`). Collaboration is wired in `start_editing`:
+        // local edits broadcast their deltas through the server relay, and remote
+        // deltas arrive via `BackendEvent::RemoteChanges`. There is no CE event
+        // subscription or manual autosave anymore — the collab session persists
+        // edits live (the server applies + relays each delta).
+        let editor_view = rsx! {
+            Editor { editor: crate::editor::editor() }
         };
-        // Share ce_div handle for content loading from backend events
-        *ce_div_for_app.borrow_mut() = Some(ce_div.clone());
-
-        // Subscribe to CE events so toolbar active state updates on every
-        // cursor move, formatting change, etc. Also mark editor dirty on
-        // content-modifying events and bump the auto-save generation.
-        let autosave_gen_ce = autosave_gen_for_ce.clone();
-        rinch::core::ce::subscribe_ce_events(Rc::new(move |event| {
-            crate::toolbar::bump_toolbar();
-            use rinch::core::ce::CeEvent;
-            match event {
-                CeEvent::SelectionChanged { .. } => {}
-                _ => {
-                    store.editor_dirty.set(true);
-                    autosave_gen_ce.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }));
-
-        // Set up the auto-save handler now that we have the ce_div
-        let autosave_ce_div = ce_div.clone();
-        AUTOSAVE_HANDLER.with(|cell| {
-            *cell.borrow_mut() = Some(Box::new(move || {
-                if !store.editor_dirty.get() {
-                    return;
-                }
-                if let Some(bytes) = save_content_via_ce_api(&autosave_ce_div) {
-                    if let Some(selected_id) = store.selected_id.get() {
-                        if let Some((s_id, Some(n_id))) = parse_tree_value(&selected_id) {
-                            tracing::info!("Auto-saving content for node {}", n_id);
-                            store.send(BackendCommand::SetNodeContent {
-                                store_id: s_id,
-                                node_id: n_id,
-                                content: bytes,
-                            });
-                        }
-                    }
-                }
-                store.editor_dirty.set(false);
-            }));
-        });
 
         let toolbar_handle = crate::toolbar::render_pimble_toolbar(__scope);
 
@@ -1097,7 +994,7 @@ pub fn run() {
                             div {
                                 class: "pimble-editor__content-wrap",
                                 style: {|| if store.show_editor.get() { "" } else { "display: none;" }},
-                                {ce_div}
+                                {editor_view}
                             }
                             div {
                                 class: "pimble-empty-state",

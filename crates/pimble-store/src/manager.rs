@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use pimble_core::{MountRef, MountState, Node, NodeId, Store, StoreId, StoreLocation, SyncState};
-use pimble_crdt::CrdtDocument;
+use pimble_core::{MountRef, MountState, Node, NodeId, NodeMetadata, Store, StoreId, StoreLocation, SyncState};
+use pimble_crdt::{ContentDoc, StoreDocument};
 use tracing::{info, warn};
 
 /// Maximum depth for transitive mount resolution
@@ -100,17 +100,14 @@ impl StoreManager {
     pub async fn get_node(&mut self, store_id: StoreId, node_id: NodeId) -> Result<Node> {
         let store = self.local_stores.get_mut(&store_id)
             .ok_or(StoreError::NotOpen(store_id))?;
-        store.get_node(node_id).await.map(|n| n.clone())
+        store.get_node(node_id).await
     }
 
     /// Update a node's metadata in-place and mark it dirty
-    pub async fn update_node_metadata(&mut self, store_id: StoreId, node_id: NodeId, metadata: pimble_core::NodeMetadata) -> Result<()> {
+    pub async fn update_node_metadata(&mut self, store_id: StoreId, node_id: NodeId, metadata: NodeMetadata) -> Result<()> {
         let store = self.local_stores.get_mut(&store_id)
             .ok_or(StoreError::NotOpen(store_id))?;
-        let node = store.get_node_mut(node_id).await?;
-        node.metadata = metadata;
-        node.touch();
-        Ok(())
+        store.update_node_metadata(node_id, &metadata).await
     }
 
     /// Create a node in a store
@@ -134,25 +131,55 @@ impl StoreManager {
         store.delete_node(node_id).await
     }
 
-    /// Update a node's raw content bytes
+    /// Replace a node's content with a full yrs snapshot.
     pub async fn update_node_content(&mut self, store_id: StoreId, node_id: NodeId, content: Vec<u8>) -> Result<()> {
         let store = self.local_stores.get_mut(&store_id)
             .ok_or(StoreError::NotOpen(store_id))?;
         store.update_node_content(node_id, content).await
     }
 
-    /// Get a node's CRDT document
-    pub async fn get_node_document(&mut self, store_id: StoreId, node_id: NodeId) -> Result<CrdtDocument> {
+    /// Merge a yrs update (delta, reconciliation diff, or whole snapshot)
+    /// into a node's content document.
+    pub async fn apply_content_update(&mut self, store_id: StoreId, node_id: NodeId, update: &[u8]) -> Result<()> {
+        let store = self.local_stores.get_mut(&store_id)
+            .ok_or(StoreError::NotOpen(store_id))?;
+        store.apply_content_update(node_id, update).await
+    }
+
+    /// Get a node's persistent CRDT content document (mutable reference)
+    pub async fn get_node_document(&mut self, store_id: StoreId, node_id: NodeId) -> Result<&mut ContentDoc> {
         let store = self.local_stores.get_mut(&store_id)
             .ok_or(StoreError::NotOpen(store_id))?;
         store.get_node_document(node_id).await
     }
 
     /// Save a node's CRDT document
-    pub async fn save_node_document(&mut self, store_id: StoreId, node_id: NodeId, doc: &mut CrdtDocument) -> Result<()> {
+    pub async fn save_node_document(&mut self, store_id: StoreId, node_id: NodeId, doc: &mut ContentDoc) -> Result<()> {
         let store = self.local_stores.get_mut(&store_id)
             .ok_or(StoreError::NotOpen(store_id))?;
         store.save_node_document(node_id, doc).await
+    }
+
+    /// Mark a node's content as dirty
+    pub fn mark_content_dirty(&mut self, store_id: StoreId, node_id: NodeId) -> Result<()> {
+        let store = self.local_stores.get_mut(&store_id)
+            .ok_or(StoreError::NotOpen(store_id))?;
+        store.mark_content_dirty(node_id);
+        Ok(())
+    }
+
+    /// Get a reference to a store's StoreDocument
+    pub fn store_document(&self, store_id: StoreId) -> Result<&StoreDocument> {
+        let store = self.local_stores.get(&store_id)
+            .ok_or(StoreError::NotOpen(store_id))?;
+        Ok(store.store_document())
+    }
+
+    /// Get a mutable reference to a store's StoreDocument
+    pub fn store_document_mut(&mut self, store_id: StoreId) -> Result<&mut StoreDocument> {
+        let store = self.local_stores.get_mut(&store_id)
+            .ok_or(StoreError::NotOpen(store_id))?;
+        Ok(store.store_document_mut())
     }
 
     /// Get children of a node.
@@ -215,10 +242,6 @@ impl StoreManager {
     }
 
     /// Internal mount resolver with cycle detection.
-    ///
-    /// `chain` tracks `(StoreId, NodeId)` pairs already visited in this
-    /// resolution path so we can detect cycles. `depth` is incremented on
-    /// each transitive mount hop.
     fn resolve_mount_with_chain<'a>(
         &'a mut self,
         mount_ref: &'a MountRef,
@@ -244,24 +267,14 @@ impl StoreManager {
         // Ensure the source store is open
         self.ensure_store_open(mount_ref.source_store).await?;
 
-        // Get children IDs and load all children upfront to release the borrow
+        // Get children
         let children = {
             let store = self.local_stores.get_mut(&mount_ref.source_store)
                 .ok_or(StoreError::NotOpen(mount_ref.source_store))?;
-
-            let children_ids = {
-                let source_node = store.get_node(mount_ref.source_node).await?;
-                source_node.children.clone()
-            };
-
-            let mut children = Vec::with_capacity(children_ids.len());
-            for child_id in children_ids {
-                children.push(store.get_node(child_id).await?.clone());
-            }
-            children
+            store.get_children(mount_ref.source_node).await?
         };
 
-        // Now validate any nested mounts (self borrow is free)
+        // Validate any nested mounts
         for child in &children {
             if child.is_mount() {
                 if let Some(nested_ref) = child.mount_ref() {
@@ -289,7 +302,6 @@ impl StoreManager {
                 Ok(())
             }
             Some(StoreEndpoint::Remote { .. }) => {
-                // Remote stores not yet supported
                 Err(StoreError::MountSourceUnavailable { store_id })
             }
             None => Err(StoreError::MountSourceUnavailable { store_id }),
@@ -301,7 +313,6 @@ impl StoreManager {
         if self.local_stores.contains_key(&mount_ref.source_store) {
             MountState::Live
         } else if self.registry.lookup(&mount_ref.source_store).is_some() {
-            // Registered but not open — we can open it, so it's reachable
             MountState::Live
         } else {
             MountState::Unavailable
@@ -309,19 +320,14 @@ impl StoreManager {
     }
 
     /// Check if creating a mount would create a cycle.
-    ///
-    /// Walks the source subtree's metadata looking for mount nodes that
-    /// point back to `mounting_store` at an ancestor of `mounting_node`.
     pub async fn validate_mount_creation(
         &mut self,
         mounting_store: StoreId,
         mounting_node: NodeId,
         mount_ref: &MountRef,
     ) -> Result<()> {
-        // Collect the ancestor chain of mounting_node in mounting_store
         let ancestors = self.collect_ancestors(mounting_store, mounting_node).await?;
 
-        // Walk the source subtree looking for mounts that point back
         self.ensure_store_open(mount_ref.source_store).await?;
 
         let mut stack: Vec<(StoreId, NodeId, usize)> = vec![
@@ -333,18 +339,16 @@ impl StoreManager {
                 return Err(StoreError::MountDepthExceeded { depth });
             }
 
-            // Make sure this store is open
             self.ensure_store_open(current_store).await?;
 
-            let store = self.local_stores.get_mut(&current_store)
-                .ok_or(StoreError::NotOpen(current_store))?;
-
-            let node = store.get_node(current_node).await?.clone();
+            let node = {
+                let store = self.local_stores.get_mut(&current_store)
+                    .ok_or(StoreError::NotOpen(current_store))?;
+                store.get_node(current_node).await?
+            };
 
             if node.is_mount() {
                 if let Some(nested_ref) = node.mount_ref() {
-                    // Does this mount point back to an ancestor of our
-                    // mounting point?
                     if nested_ref.source_store == mounting_store
                         && ancestors.contains(&nested_ref.source_node)
                     {
@@ -357,8 +361,6 @@ impl StoreManager {
                         });
                     }
 
-                    // Follow this mount transitively (best-effort — skip
-                    // unreachable stores)
                     if self.registry.lookup(&nested_ref.source_store).is_some()
                         || self.local_stores.contains_key(&nested_ref.source_store)
                     {
@@ -367,7 +369,6 @@ impl StoreManager {
                 }
             }
 
-            // Also walk children of the current node
             let children_ids = node.children.clone();
             for child_id in children_ids {
                 stack.push((current_store, child_id, depth + 1));
@@ -377,8 +378,7 @@ impl StoreManager {
         Ok(())
     }
 
-    /// Collect the set of ancestor node IDs for a given node in a store,
-    /// including the node itself. Used for cycle detection.
+    /// Collect the set of ancestor node IDs for a given node in a store.
     async fn collect_ancestors(
         &mut self,
         store_id: StoreId,
@@ -409,5 +409,3 @@ impl Default for StoreManager {
         Self::new()
     }
 }
-
-// LocalStore.path is now public, no helper needed

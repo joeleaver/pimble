@@ -4,13 +4,12 @@
 //! (store open/close, children loaded, node moved) bump `tree_structure_version`.
 
 use std::cell::RefCell;
-use std::rc::Rc;
 
 use pimble_core::NodeId;
 use rinch::prelude::*;
 
 use crate::backend::{BackendCommand, BackendEvent};
-use crate::editor::{load_content_into_ce, invalidate_html_cache};
+use crate::editor::{apply_remote, invalidate_html_cache, start_editing};
 use crate::persistence::{load_app_state_file, save_app_state_file};
 use crate::state::{parse_tree_value, AppStore, ConnectionState, MountInfo};
 
@@ -22,11 +21,7 @@ thread_local! {
 ///
 /// Per-entity signals are updated individually. `tree_structure_version` is
 /// bumped only for structural changes so the tree rebuilds minimally.
-pub(crate) fn process_backend_events(
-    store: AppStore,
-    tree_state: UseTreeReturn,
-    ce_div_cell: &Rc<RefCell<Option<NodeHandle>>>,
-) {
+pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn) {
     let events: Vec<BackendEvent> = store.backend.with(|b| {
         let Some(backend) = b else { return Vec::new() };
         let mut events = Vec::new();
@@ -42,11 +37,14 @@ pub(crate) fn process_backend_events(
 
     for event in &events {
         match event {
-            BackendEvent::Connected { server_addr } => {
-                tracing::info!("Connected to backend at {}", server_addr);
+            BackendEvent::Connected { server_addr, client_id } => {
+                tracing::info!("Connected to backend at {} (client_id: {})", server_addr, client_id);
                 store.connection.set(ConnectionState::Connected);
                 store.connection_status.set("Connected".to_string());
                 store.server_addr.set(server_addr.clone());
+                if !client_id.is_empty() {
+                    store.client_id.set(client_id.clone());
+                }
 
                 // Auto-open previously loaded stores
                 let saved_paths = load_app_state_file();
@@ -89,6 +87,9 @@ pub(crate) fn process_backend_events(
                         });
                     }
                 });
+
+                // Subscribe to store changes for real-time updates
+                store.send(BackendCommand::SubscribeStoreChanges { store_id });
 
                 // Auto-expand the store node in the tree
                 tree_state.controller.expand(&format!("store_{}", store_id));
@@ -188,19 +189,21 @@ pub(crate) fn process_backend_events(
 
                 // Data-only: updates per-node signal, NO tree rebuild
                 store.upsert_node(*store_id, node.clone());
-
-                if content_changed {
-                    invalidate_html_cache(store, *store_id, node_id);
-                }
+                let _ = content_changed;
 
                 if let Some(selected_id) = store.selected_id.get() {
                     if let Some((sel_store_id, Some(sel_node_id))) = parse_tree_value(&selected_id) {
                         if sel_store_id == *store_id && sel_node_id == node_id {
                             store.node_title.set(store.display_label(*store_id, node_id));
-                            if content_changed {
-                                if let Some(ce_div) = ce_div_cell.borrow().as_ref() {
-                                    load_content_into_ce(&content_bytes, ce_div, store, *store_id, node_id);
-                                }
+                            // First load of the selected document (its content just
+                            // arrived from GetNode) — start the editing/collab session.
+                            // Guard against restarting an already-active session.
+                            let already_editing = untracked(|| store.active_edit.get())
+                                .map_or(false, |e| e.store_id == *store_id && e.node_id == node_id);
+                            if node.node_type == pimble_core::node_types::DOCUMENT
+                                && !already_editing
+                            {
+                                start_editing(store, *store_id, node_id, &content_bytes);
                             }
                         }
                     }
@@ -349,6 +352,128 @@ pub(crate) fn process_backend_events(
                 // Data-only: updates per-mount signal, NO tree rebuild.
                 // The mount Effect on that node fires and updates icon opacity + label suffix.
                 store.set_mount_state(*store_id, *node_id, state.clone());
+            }
+
+            BackendEvent::StoreDocumentSynced { store_id } => {
+                tracing::info!("Store document synced: {:?}", store_id);
+                // Re-fetch the tree to reflect any changes from sync
+                if let Some(root_id) = store.root_node_id(*store_id) {
+                    store.send(BackendCommand::GetChildren {
+                        store_id: *store_id,
+                        node_id: root_id,
+                    });
+                }
+            }
+
+            BackendEvent::NodeContentSynced { store_id, node_id, diff } => {
+                tracing::info!("Node content synced: {:?}/{:?}", store_id, node_id);
+                // Merge whatever the server said we were missing into the editor's
+                // live collab session (a no-op if this node isn't the active edit).
+                if !diff.is_empty() {
+                    apply_remote(diff);
+                }
+            }
+
+            BackendEvent::RemoteStoreChange { store_id, change_kind, source_client_id } => {
+                // Skip our own echoes
+                let my_id = untracked(|| store.client_id.get());
+                if let Some(source) = source_client_id {
+                    if !my_id.is_empty() && source == &my_id {
+                        continue;
+                    }
+                }
+                tracing::info!("Remote store change: {:?} - {:?}", store_id, change_kind);
+                use pimble_rpc::StoreChangeKind;
+                match change_kind {
+                    StoreChangeKind::NodeCreated { node_id }
+                    | StoreChangeKind::NodeDeleted { node_id }
+                    | StoreChangeKind::NodeMoved { node_id } => {
+                        // Re-fetch the tree from root
+                        if let Some(root_id) = store.root_node_id(*store_id) {
+                            store.send(BackendCommand::GetChildren {
+                                store_id: *store_id,
+                                node_id: root_id,
+                            });
+                        }
+                        // If deleted node was selected, clear selection
+                        if matches!(change_kind, StoreChangeKind::NodeDeleted { .. }) {
+                            if let Some(selected_id) = store.selected_id.get() {
+                                if let Some((sel_sid, Some(sel_nid))) = parse_tree_value(&selected_id) {
+                                    if sel_sid == *store_id && sel_nid == *node_id {
+                                        store.selected_id.set(None);
+                                        store.node_title.set(String::new());
+                                        store.show_editor.set(false);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    StoreChangeKind::MetadataUpdated { node_id } => {
+                        store.send(BackendCommand::GetNode {
+                            store_id: *store_id,
+                            node_id: *node_id,
+                        });
+                    }
+                    StoreChangeKind::ContentUpdated { node_id } => {
+                        // CRDT-edited nodes are synced by the subscription task directly.
+                        let is_active_crdt = untracked(|| {
+                            store.active_edit.with(|ae| {
+                                ae.as_ref().map_or(false, |e| e.store_id == *store_id && e.node_id == *node_id)
+                            })
+                        });
+
+                        if !is_active_crdt {
+                            invalidate_html_cache(store, *store_id, *node_id);
+                            store.send(BackendCommand::GetNode {
+                                store_id: *store_id,
+                                node_id: *node_id,
+                            });
+                        }
+                    }
+                    StoreChangeKind::TreeStructure => {
+                        if let Some(root_id) = store.root_node_id(*store_id) {
+                            store.send(BackendCommand::GetChildren {
+                                store_id: *store_id,
+                                node_id: root_id,
+                            });
+                        }
+                    }
+                }
+            }
+
+            BackendEvent::RemoteContentChange { store_id, node_id, source_client_id } => {
+                // Skip our own echoes
+                let my_id = untracked(|| store.client_id.get());
+                if let Some(source) = source_client_id {
+                    if !my_id.is_empty() && source == &my_id {
+                        continue;
+                    }
+                }
+
+                // If CRDT-edited node, the subscription task handles sync directly.
+                // Only fetch for non-CRDT nodes.
+                let is_active_crdt = untracked(|| {
+                    store.active_edit.with(|ae| {
+                        ae.as_ref().map_or(false, |e| e.store_id == *store_id && e.node_id == *node_id)
+                    })
+                });
+
+                if !is_active_crdt {
+                    invalidate_html_cache(store, *store_id, *node_id);
+                    store.send(BackendCommand::GetNode {
+                        store_id: *store_id,
+                        node_id: *node_id,
+                    });
+                }
+            }
+
+            BackendEvent::RemoteChanges { changes, .. } => {
+                use base64::Engine;
+                // A peer's delta: integrate it into the editor's collab session (which
+                // re-projects the view and does NOT re-broadcast).
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(changes) {
+                    apply_remote(&bytes);
+                }
             }
 
             _ => {}

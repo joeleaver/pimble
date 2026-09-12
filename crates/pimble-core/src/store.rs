@@ -241,7 +241,7 @@ pub struct StoreManifest {
 
 impl StoreManifest {
     /// Current schema version
-    pub const CURRENT_VERSION: u32 = 1;
+    pub const CURRENT_VERSION: u32 = 2;
 
     /// Create a new manifest
     pub fn new(name: impl Into<String>, root_node_id: NodeId) -> Self {

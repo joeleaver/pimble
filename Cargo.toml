@@ -54,11 +54,18 @@ tantivy = "0.22"
 # hf-hub = "0.3"
 # tokenizers = "0.15"
 
-# UI framework
-rinch = { git = "https://github.com/joeleaver/rinch.git", branch = "main", features = ["desktop", "components", "theme", "file-dialogs", "clipboard", "debug", "gpu"] }
+# UI framework, tracked from GitHub main (never the local checkout). Software
+# rendering (no `gpu`) avoids rinch's wgpu-fork patch. `collaboration` enables the
+# editor's CRDT (yrs) collab API used by pimble-app.
+rinch = { git = "https://github.com/joeleaver/rinch.git", branch = "main", features = ["desktop", "components", "theme", "file-dialogs", "clipboard", "debug", "collaboration"] }
 rinch-tabler-icons = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
-rinch-editor = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
-rinch-editor-components = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
+rinch-editor-core = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
+# Headless collab session (yrs projection of the editor model); pure Rust, no
+# platform deps, so the server and store can link it for text projection.
+rinch-editor-collab = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
+
+# CRDT for node content: the same engine rinch's editor collaboration uses.
+yrs = "0.27"
 
 # Error handling
 thiserror = "2.0"

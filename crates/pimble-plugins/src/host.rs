@@ -105,11 +105,7 @@ impl NodePlugin for DocumentPlugin {
     }
 
     fn extract_text(&self, content: &[u8]) -> Result<String> {
-        // Load as CRDT document and extract text
-        match pimble_crdt::DocumentContent::load(content) {
-            Ok(doc) => doc.get_text().map_err(|e| PluginError::ExecutionError(e.to_string())),
-            Err(e) => Err(PluginError::ExecutionError(e.to_string())),
-        }
+        Ok(pimble_crdt::ContentDoc::text_of(content))
     }
 
     fn validate(&self, _content: &[u8]) -> Result<ValidationResult> {
@@ -117,8 +113,7 @@ impl NodePlugin for DocumentPlugin {
     }
 
     fn init_content(&self) -> Result<Vec<u8>> {
-        let mut doc = pimble_crdt::DocumentContent::new();
-        Ok(doc.save())
+        Ok(pimble_crdt::ContentDoc::new().save())
     }
 }
 

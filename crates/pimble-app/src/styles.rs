@@ -131,6 +131,16 @@ pub(crate) const APP_CSS: &str = "
     overflow-y: auto;
 }
 
+/* Size the rinch Editor to fill the content area. Done via a CSS rule (NOT an
+   inline `style:` prop on the Editor) so it doesn't clobber the inline
+   position/z-index the editor view sets for its caret + selection overlays. */
+.pimble-editor__content-wrap > [data-pm-editor] {
+    flex: 1 1 auto;
+    min-height: 0;
+    border: none;
+    border-radius: 0;
+}
+
 .editor-toolbar {
     background: var(--rinch-color-dark-6) !important;
     border-bottom-color: var(--rinch-color-dark-4) !important;

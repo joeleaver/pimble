@@ -6,6 +6,7 @@
 //! - Node persistence using Automerge documents
 
 pub mod error;
+mod legacy;
 pub mod local;
 pub mod manager;
 pub mod registry;

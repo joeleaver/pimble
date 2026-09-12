@@ -1,7 +1,9 @@
 //! RPC method definitions using jsonrpsee
 
+use jsonrpsee::core::SubscriptionResult;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObjectOwned;
+use pimble_core::{NodeId, StoreId};
 
 use crate::types::*;
 
@@ -54,10 +56,6 @@ pub trait PimbleApi {
     #[method(name = "updateNodeContent")]
     async fn update_node_content(&self, request: UpdateNodeContentRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
 
-    /// Set a node's text content (replaces all content)
-    #[method(name = "setNodeText")]
-    async fn set_node_text(&self, request: SetNodeTextRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
-
     /// Delete a node
     #[method(name = "deleteNode")]
     async fn delete_node(&self, request: DeleteNodeRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
@@ -97,6 +95,42 @@ pub trait PimbleApi {
     /// Create a new workspace
     #[method(name = "createWorkspace")]
     async fn create_workspace(&self, request: CreateWorkspaceRequest) -> Result<LoadWorkspaceResponse, ErrorObjectOwned>;
+
+    // ========================================================================
+    // Edit Operations (collaborative editing)
+    // ========================================================================
+
+    /// Apply an edit operation to a node and broadcast to other clients.
+    #[method(name = "applyEdit")]
+    async fn apply_edit(&self, request: ApplyEditRequest) -> Result<ApplyEditResponse, ErrorObjectOwned>;
+
+    // ========================================================================
+    // Sync Operations
+    // ========================================================================
+
+    /// Sync store document (tree structure + metadata) using Automerge sync protocol
+    #[method(name = "syncStoreDocument")]
+    async fn sync_store_document(&self, request: SyncStoreDocumentRequest) -> Result<SyncStoreDocumentResponse, ErrorObjectOwned>;
+
+    /// Sync a node's content document: send a yrs state vector, receive a
+    /// diff of everything the server has beyond it. Stateless — the server
+    /// keeps no per-client sync state for content documents.
+    #[method(name = "syncNodeContent")]
+    async fn sync_node_content(&self, request: SyncNodeContentRequest) -> Result<SyncNodeContentResponse, ErrorObjectOwned>;
+
+    // ========================================================================
+    // Subscription Operations
+    // ========================================================================
+
+    /// Subscribe to changes in a store's tree structure and metadata.
+    /// Notifications are sent whenever nodes are created, deleted, moved, or have metadata updated.
+    #[subscription(name = "subscribeStoreChanges" => "storeChanged", unsubscribe = "unsubscribeStoreChanges", item = StoreChangedNotification)]
+    async fn subscribe_store_changes(&self, store_id: StoreId) -> SubscriptionResult;
+
+    /// Subscribe to changes in a specific node's content.
+    /// Notifications are sent whenever the node's content document is modified.
+    #[subscription(name = "subscribeNodeChanges" => "nodeChanged", unsubscribe = "unsubscribeNodeChanges", item = NodeContentChangedNotification)]
+    async fn subscribe_node_changes(&self, store_id: StoreId, node_id: NodeId) -> SubscriptionResult;
 
     // ========================================================================
     // Search Operations

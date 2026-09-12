@@ -109,17 +109,11 @@ pub struct UpdateNodeMetadataRequest {
 pub struct UpdateNodeContentRequest {
     pub store_id: StoreId,
     pub node_id: NodeId,
-    /// Base64-encoded document bytes (full replacement)
+    /// Base64-encoded full yrs snapshot (full replacement)
     pub content: String,
-}
-
-/// Request to set a node's text content (replaces all content)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SetNodeTextRequest {
-    pub store_id: StoreId,
-    pub node_id: NodeId,
-    /// The new text content
-    pub text: String,
+    /// Client ID for echo suppression in notifications
+    #[serde(default)]
+    pub client_id: Option<String>,
 }
 
 /// Request to delete a node
@@ -279,6 +273,122 @@ pub enum ChangeType {
     Updated,
     Deleted,
     Moved,
+}
+
+// ============================================================================
+// Edit Operations (collaborative editing)
+// ============================================================================
+
+/// A document editing operation, carrying yrs-encoded content bytes.
+/// These originate from the editor's collaboration session and can be
+/// applied on any client or on the server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum EditOperation {
+    /// A yrs v1 update (base64-encoded): a delta, or a reconciliation diff.
+    /// The primary collaboration primitive — just broadcast and apply.
+    IncrementalChanges { changes: String },
+    /// A full yrs v1 snapshot (base64-encoded), for initial load or complex
+    /// structural changes.
+    ReplaceContent { content: String },
+}
+
+/// Request to apply an edit operation to a node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyEditRequest {
+    pub store_id: StoreId,
+    pub node_id: NodeId,
+    pub client_id: String,
+    pub operation: EditOperation,
+}
+
+/// Response after applying an edit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyEditResponse {}
+
+// ============================================================================
+// Sync Operations
+// ============================================================================
+
+/// Request to sync a store document (tree/metadata)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncStoreDocumentRequest {
+    pub store_id: StoreId,
+    pub client_id: String,
+    /// Base64-encoded Automerge sync message, or None to initiate
+    pub message: Option<String>,
+}
+
+/// Response from store document sync
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncStoreDocumentResponse {
+    /// Base64-encoded Automerge sync message, or None if in sync
+    pub message: Option<String>,
+}
+
+/// Request to sync a node's content document. Stateless: the client sends
+/// its yrs state vector and the server responds with everything it has
+/// beyond it. No per-client state is kept on the server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncNodeContentRequest {
+    pub store_id: StoreId,
+    pub node_id: NodeId,
+    /// Base64-encoded yrs v1 state vector
+    pub state_vector: String,
+}
+
+/// Response from node content sync
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncNodeContentResponse {
+    /// Base64-encoded yrs v1 update: everything the server has that the
+    /// client's state vector lacked. May be empty (base64 of zero bytes) if
+    /// the client was already up to date.
+    pub diff: String,
+    /// The server's own state vector (base64-encoded yrs v1), for the client
+    /// to compute what it should send next.
+    pub state_vector: String,
+}
+
+// ============================================================================
+// Subscription Notification Types
+// ============================================================================
+
+/// Notification that a store's tree/metadata has changed
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreChangedNotification {
+    pub store_id: StoreId,
+    /// What changed (for client-side routing)
+    pub change_kind: StoreChangeKind,
+    /// Which client caused this change (for echo suppression)
+    #[serde(default)]
+    pub source_client_id: Option<String>,
+}
+
+/// Kind of store change
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoreChangeKind {
+    NodeCreated { node_id: NodeId },
+    NodeDeleted { node_id: NodeId },
+    NodeMoved { node_id: NodeId },
+    MetadataUpdated { node_id: NodeId },
+    ContentUpdated { node_id: NodeId },
+    TreeStructure,
+}
+
+/// Notification that a node's content has changed.
+/// Carries the edit operation so the receiving client can apply it directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeContentChangedNotification {
+    pub store_id: StoreId,
+    pub node_id: NodeId,
+    /// Which client caused this change (for echo suppression)
+    #[serde(default)]
+    pub source_client_id: Option<String>,
+    /// The edit operation to apply. When present, the client can apply it
+    /// directly via the CE API without fetching the full document.
+    #[serde(default)]
+    pub operation: Option<EditOperation>,
 }
 
 // ============================================================================

@@ -10,10 +10,11 @@ description = "Import external formats (Scrivener, etc.) into Pimble stores"
 pimble-core = { workspace = true }
 pimble-crdt = { workspace = true }
 pimble-store = { workspace = true }
-rinch-editor = { workspace = true }
-rinch-core = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
 quick-xml = { version = "0.37", features = ["serialize"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -22,7 +22,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            addr: "127.0.0.1:9876".parse().unwrap(),
+            addr: "127.0.0.1:7462".parse().unwrap(),
         }
     }
 }
@@ -73,6 +73,14 @@ impl PimbleServer {
 
     /// Stop the server
     pub async fn stop(&mut self) -> Result<()> {
+        // Flush any pending tree/content changes before the handle stops, so
+        // an app shutdown never depends on the caller remembering to flush
+        // (debounced content flushes in particular may still be pending).
+        {
+            let mut manager = self.store_manager.write().await;
+            manager.flush_all().await?;
+        }
+
         if let Some(handle) = self.handle.take() {
             handle.stop().map_err(|e| crate::ServerError::Server(e.to_string()))?;
             info!("Pimble server stopped");

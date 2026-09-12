@@ -5,8 +5,9 @@
 //! `render_toolbar` which renders once and never updates.
 
 use rinch::prelude::*;
-use rinch::core::ce::with_active_ce_api;
 use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
+
+use crate::editor::editor;
 
 /// A Signal bumped on every CE change/selection event so toolbar closures re-evaluate.
 static TOOLBAR_VERSION: std::sync::OnceLock<Signal<u32>> = std::sync::OnceLock::new();
@@ -86,34 +87,76 @@ fn button_groups() -> Vec<Vec<BtnDef>> {
     ]
 }
 
+/// Map an inline HTML tag to the new editor's mark name.
+fn mark_name(tag: &str) -> Option<&'static str> {
+    Some(match tag {
+        "strong" => "bold",
+        "em" => "italic",
+        "u" => "underline",
+        "s" => "strike",
+        "code" => "code",
+        _ => return None,
+    })
+}
+
 fn check_active(check: &ActiveCheck) -> bool {
+    let h = editor();
     match check {
-        ActiveCheck::Mark(tag) => {
-            with_active_ce_api(|api| api.borrow().has_active_mark(tag)).unwrap_or(false)
-        }
-        ActiveCheck::Block(tag) => {
-            let cur = with_active_ce_api(|api| api.borrow().cursor_block_tag()).flatten();
-            cur.as_deref() == Some(*tag)
-        }
+        ActiveCheck::Mark(tag) => mark_name(tag).map(|m| h.is_mark_active(m)).unwrap_or(false),
+        ActiveCheck::Block(tag) => match *tag {
+            // The handle reports the block type but not the heading level, so all
+            // heading buttons share the "in a heading" active state.
+            "h1" | "h2" | "h3" => h.current_block_type().as_deref() == Some("heading"),
+            "ul" => h.in_node_type("bullet_list"),
+            "ol" => h.in_node_type("ordered_list"),
+            "blockquote" => h.in_node_type("blockquote"),
+            "pre" => h.current_block_type().as_deref() == Some("code_block"),
+            _ => false,
+        },
         ActiveCheck::None => false,
     }
 }
 
 fn execute_cmd(cmd: &Cmd) {
-    with_active_ce_api(|api| {
-        let mut api = api.borrow_mut();
-        match cmd {
-            Cmd::ToggleWrap(tag) => api.toggle_wrap(tag),
-            Cmd::SetBlock(tag) => api.set_block_type(tag),
-            Cmd::HorizontalRule => {
-                api.split_block();
-                api.set_block_type("hr");
-            }
-            Cmd::Undo => api.undo(),
-            Cmd::Redo => api.redo(),
-            Cmd::ClearFormatting => api.clear_formatting(),
+    let h = editor();
+    match cmd {
+        Cmd::ToggleWrap(tag) => {
+            let name = match *tag {
+                "strong" => "toggleBold",
+                "em" => "toggleItalic",
+                "u" => "toggleUnderline",
+                "s" => "toggleStrike",
+                "code" => "toggleCode",
+                _ => return,
+            };
+            h.command(name);
         }
-    });
+        Cmd::SetBlock(tag) => {
+            let name = match *tag {
+                "h1" => "setHeading1",
+                "h2" => "setHeading2",
+                "h3" => "setHeading3",
+                "ul" => "toggleBulletList",
+                "ol" => "toggleOrderedList",
+                "blockquote" => "wrapInBlockquote",
+                "pre" => "setCodeBlock",
+                _ => return,
+            };
+            h.command(name);
+        }
+        Cmd::HorizontalRule => {
+            h.command("insertHorizontalRule");
+        }
+        Cmd::Undo => {
+            h.command("undo");
+        }
+        Cmd::Redo => {
+            h.command("redo");
+        }
+        Cmd::ClearFormatting => {
+            h.command("setParagraph");
+        }
+    }
     bump_toolbar();
 }
 

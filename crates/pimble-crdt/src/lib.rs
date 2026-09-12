@@ -1,14 +1,15 @@
-//! Pimble CRDT - Automerge integration for conflict-free data synchronization
+//! Pimble CRDT - yrs for node content, Automerge for the store document
 //!
 //! This crate provides:
-//! - CRDT document management using Automerge
-//! - Change tracking and merging
-//! - Node content serialization
+//! - Per-node content documents backed by yrs (`ContentDoc`)
+//! - The store document (tree structure + node metadata) backed by Automerge
+//!   (`StoreDocument`)
+//! - Shared error types
 
-pub mod document;
+pub mod content_doc;
 pub mod error;
-pub mod node_content;
+pub mod store_document;
 
-pub use document::*;
+pub use content_doc::*;
 pub use error::*;
-pub use node_content::*;
+pub use store_document::*;

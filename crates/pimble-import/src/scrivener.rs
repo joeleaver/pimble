@@ -7,14 +7,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use pimble_core::Node;
+use pimble_crdt::ContentDoc;
 use pimble_store::LocalStore;
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use rinch_editor::EditorDocument;
 use tokio::fs;
 use tracing::info;
 
-use crate::rtf::rtf_to_blocks;
+use crate::rtf::rtf_to_text;
 
 /// A parsed binder item from the .scrivx file
 #[derive(Debug)]
@@ -96,15 +96,15 @@ async fn import_binder_item(
 
     let node_id = store.create_node(node, Some(parent_id)).await?;
 
-    // Try to load RTF content for this item
+    // Try to load RTF content for this item. `rtf_to_text` extracts the RTF's
+    // paragraphs (dropping bold/italic/link marks, which the CRDT content model
+    // doesn't carry yet) and joins them with '\n'.
     let rtf_path = data_dir.join(&item.uuid).join("content.rtf");
     if rtf_path.exists() {
         if let Ok(rtf_bytes) = fs::read(&rtf_path).await {
-            let blocks = rtf_to_blocks(&rtf_bytes);
-            let has_content = blocks.iter().any(|b| b.content.iter().any(|r| !r.text.is_empty()));
-            if has_content {
-                let mut doc = EditorDocument::from_block_data(&blocks);
-                let content_bytes = doc.to_bytes();
+            let text = rtf_to_text(&rtf_bytes);
+            if !text.trim().is_empty() {
+                let content_bytes = ContentDoc::from_plain_text(&text)?.save();
                 store.update_node_content(node_id, content_bytes).await?;
                 stats.with_content += 1;
             }
@@ -237,5 +237,60 @@ fn skip_element(reader: &mut Reader<&[u8]>, tag_name: &[u8]) -> Result<()> {
             Event::Eof => return Ok(()),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// Builds a minimal `.scriv` project (one text document with RTF content)
+    /// in a tempdir, imports it, and checks the resulting store's tree and
+    /// content survive the round trip through the yrs content model.
+    #[tokio::test]
+    async fn imports_a_minimal_scrivener_project() {
+        let root = tempdir().unwrap();
+        let uuid = "11111111-1111-1111-1111-111111111111";
+        let scriv_path = root.path().join("MyBook.scriv");
+        let data_dir = scriv_path.join("Files").join("Data").join(uuid);
+        fs::create_dir_all(&data_dir).await.unwrap();
+
+        let scrivx = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<ScrivenerProject>
+  <Binder>
+    <BinderItem UUID="{uuid}" Type="Text">
+      <Title>Chapter One</Title>
+    </BinderItem>
+  </Binder>
+</ScrivenerProject>"#
+        );
+        fs::write(scriv_path.join("MyBook.scrivx"), scrivx).await.unwrap();
+
+        let rtf = br"{\rtf1\ansi\deff0 Hello RTF World}";
+        fs::write(data_dir.join("content.rtf"), rtf).await.unwrap();
+
+        let output_path = root.path().join("MyBook.pimble");
+        import_scrivener(&scriv_path, &output_path).await.unwrap();
+
+        // Reopen from disk to prove the import persisted, not just left an
+        // in-memory store looking right.
+        let mut store = LocalStore::open(&output_path).await.unwrap();
+        let root_id = store.root_node_id();
+        let root_node = store.get_node(root_id).await.unwrap();
+        assert_eq!(root_node.children.len(), 1, "expected one imported document");
+
+        let child_id = root_node.children[0];
+        let child = store.get_node(child_id).await.unwrap();
+        assert_eq!(child.metadata.title, "Chapter One");
+        assert_eq!(child.node_type, pimble_core::node_types::DOCUMENT);
+
+        let text = ContentDoc::text_of(&child.content);
+        assert!(
+            text.contains("Hello RTF World"),
+            "expected imported content to contain the RTF text, got {:?}",
+            text
+        );
     }
 }

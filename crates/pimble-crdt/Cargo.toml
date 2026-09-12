@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "CRDT operations using Automerge for Pimble"
+description = "CRDT documents for Pimble: yrs node content, Automerge store document"
 
 [dependencies]
 pimble-core = { workspace = true }
@@ -12,3 +12,8 @@ automerge = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+yrs = { workspace = true }
+rinch-editor-core = { workspace = true }
+rinch-editor-collab = { workspace = true }

@@ -49,6 +49,25 @@ pub enum BackendCommand {
         node_id: NodeId,
     },
 
+    // Collaborative editing — broadcast incremental changes to server
+    BroadcastChanges {
+        store_id: StoreId,
+        node_id: NodeId,
+        /// Base64-encoded incremental Automerge change bytes
+        changes: String,
+    },
+
+    // Sync operations
+    SyncStoreDocument { store_id: StoreId },
+    /// Reconcile a node's content against the server: `state_vector` is this
+    /// client's current yrs state vector (from `EditorHandle::collab_state_vector`).
+    /// The server answers with a diff (possibly empty) plus its own state vector.
+    SyncNodeContent { store_id: StoreId, node_id: NodeId, state_vector: Vec<u8> },
+
+    // Subscription operations
+    SubscribeStoreChanges { store_id: StoreId },
+    SubscribeNodeChanges { store_id: StoreId, node_id: NodeId },
+
     // Workspace operations
     CreateWorkspace { name: String, path: String },
     LoadWorkspace { path: String },
@@ -58,7 +77,7 @@ pub enum BackendCommand {
 /// Events sent from backend to UI
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
-    Connected { server_addr: String },
+    Connected { server_addr: String, client_id: String },
     Disconnected,
     Error { message: String },
 
@@ -89,6 +108,20 @@ pub enum BackendEvent {
         state: MountState,
     },
 
+    // Sync events
+    StoreDocumentSynced { store_id: StoreId },
+    /// Response to `SyncNodeContent`: `diff` is the yrs update this client was
+    /// missing (empty if already caught up).
+    NodeContentSynced { store_id: StoreId, node_id: NodeId, diff: Vec<u8> },
+
+    // Remote change events (from subscriptions)
+    RemoteStoreChange { store_id: StoreId, change_kind: pimble_rpc::StoreChangeKind, source_client_id: Option<String> },
+    RemoteContentChange { store_id: StoreId, node_id: NodeId, source_client_id: Option<String> },
+
+    // Collaborative editing
+    /// Remote incremental changes arrived — apply to local EditorDocument
+    RemoteChanges { store_id: StoreId, node_id: NodeId, changes: String },
+
     // Workspace events
     WorkspaceLoaded { workspace: Workspace },
     WorkspaceSaved,
@@ -103,9 +136,9 @@ pub struct BackendHandle {
 
 impl BackendHandle {
     /// Spawn the backend thread and return a handle
-    pub fn spawn(signal_ui: impl Fn() + Send + 'static) -> Self {
+    pub fn spawn(signal_ui: impl Fn() + Send + Sync + 'static) -> Self {
         let (cmd_tx, cmd_rx) = bounded::<BackendCommand>(100);
-        let (event_tx, event_rx) = bounded::<BackendEvent>(100);
+        let (event_tx, event_rx) = bounded::<BackendEvent>(1000);
 
         thread::spawn(move || {
             let rt = Runtime::new().expect("Failed to create tokio runtime");
@@ -122,7 +155,9 @@ impl BackendHandle {
 
     /// Send a command to the backend (non-blocking), ignoring result
     pub fn send(&self, cmd: BackendCommand) {
-        let _ = self.cmd_tx.try_send(cmd);
+        if let Err(e) = self.cmd_tx.try_send(cmd) {
+            tracing::error!("Backend channel send failed: {}", e);
+        }
     }
 
     /// Try to receive an event (non-blocking)
@@ -131,10 +166,16 @@ impl BackendHandle {
     }
 }
 
-const SERVER_URL: &str = "http://127.0.0.1:9876";
-const SERVER_ADDR: &str = "127.0.0.1:9876";
+// 7462 spells PIMB on a phone keypad. (The previous 9876 collided with the
+// Blender MCP add-on's default port: its raw TCP socket accepted our WebSocket
+// handshake and never answered, so the app sat at "Connecting..." forever.)
+const SERVER_URL: &str = "http://127.0.0.1:7462";
+const SERVER_ADDR: &str = "127.0.0.1:7462";
 const MAX_CONNECT_ATTEMPTS: u32 = 6;
 const BASE_RETRY_MS: u64 = 250;
+/// Upper bound on probing an existing server. A foreign listener on our port
+/// (anything that accepts TCP but never speaks JSON-RPC) must fail fast.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Try to connect to an existing server, or start one and connect.
 /// Returns the client and optionally the server we started (if we own it).
@@ -142,13 +183,23 @@ async fn ensure_connected() -> Result<(PimbleClient, Option<PimbleServer>), Stri
     let mut rng = rand::rng();
 
     for attempt in 0..MAX_CONNECT_ATTEMPTS {
-        // First, try connecting to an existing server
-        if let Ok(client) = PimbleClient::connect(SERVER_URL).await {
-            // Verify it's actually alive by making a cheap call
-            if client.list_stores().await.is_ok() {
+        // First, try connecting to an existing server (another Pimble instance),
+        // verifying it is really ours with a cheap call. Bounded by PROBE_TIMEOUT.
+        let probe = async {
+            let client = PimbleClient::connect(SERVER_URL).await.ok()?;
+            client.list_stores().await.ok()?;
+            Some(client)
+        };
+        match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
+            Ok(Some(client)) => {
                 tracing::info!("Connected to existing server at {}", SERVER_ADDR);
                 return Ok((client, None));
             }
+            Ok(None) => {}
+            Err(_) => tracing::warn!(
+                "Something on {} accepted the connection but did not answer as a Pimble server",
+                SERVER_ADDR
+            ),
         }
 
         // No server running — try to start one
@@ -168,8 +219,9 @@ async fn ensure_connected() -> Result<(PimbleClient, Option<PimbleServer>), Stri
             }
             Err(e) => {
                 // Port might be claimed by another instance that's still starting up
-                tracing::debug!(
-                    "Failed to start server (attempt {}): {}",
+                tracing::warn!(
+                    "Failed to start server on {} (attempt {}): {}",
+                    SERVER_ADDR,
                     attempt + 1,
                     e
                 );
@@ -187,8 +239,8 @@ async fn ensure_connected() -> Result<(PimbleClient, Option<PimbleServer>), Stri
     }
 
     Err(format!(
-        "Failed to connect or start server after {} attempts",
-        MAX_CONNECT_ATTEMPTS
+        "Failed to connect or start a server on {} after {} attempts (is the port in use?)",
+        SERVER_ADDR, MAX_CONNECT_ATTEMPTS
     ))
 }
 
@@ -221,18 +273,25 @@ fn is_connection_error(msg: &str) -> bool {
 async fn backend_loop(
     cmd_rx: Receiver<BackendCommand>,
     event_tx: Sender<BackendEvent>,
-    signal_ui: impl Fn(),
+    signal_ui: impl Fn() + Send + Sync + 'static,
 ) {
-    let mut client: Option<PimbleClient> = None;
+    let signal_arc: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(signal_ui);
+    let signal_ui = signal_arc.clone();
+
+    let client_id = uuid::Uuid::new_v4().to_string();
+    tracing::info!("Backend client ID: {}", client_id);
+
+    let mut client: Option<std::sync::Arc<PimbleClient>> = None;
     let mut owned_server: Option<PimbleServer> = None;
 
     // Initial connection
     match ensure_connected().await {
         Ok((c, server)) => {
-            client = Some(c);
+            client = Some(std::sync::Arc::new(c));
             owned_server = server;
             let _ = event_tx.try_send(BackendEvent::Connected {
                 server_addr: SERVER_ADDR.to_string(),
+                client_id: client_id.clone(),
             });
             signal_ui();
         }
@@ -252,7 +311,7 @@ async fn backend_loop(
             Err(_) => break, // Channel closed, exit
         };
 
-        let event = process_command(&mut client, cmd).await;
+        let event = process_command(&mut client, cmd, &event_tx, &signal_arc, &client_id).await;
 
         if let Some(ref event) = event {
             // Check if this is a connection error — if so, try to reconnect
@@ -264,9 +323,10 @@ async fn backend_loop(
 
                     match reconnect(&mut owned_server).await {
                         Ok(c) => {
-                            client = Some(c);
+                            client = Some(std::sync::Arc::new(c));
                             let _ = event_tx.try_send(BackendEvent::Connected {
                                 server_addr: SERVER_ADDR.to_string(),
+                                client_id: client_id.clone(),
                             });
                             signal_ui();
                             // Don't send the original error — we recovered
@@ -301,15 +361,18 @@ async fn backend_loop(
 }
 
 async fn process_command(
-    client: &mut Option<PimbleClient>,
+    client: &mut Option<std::sync::Arc<PimbleClient>>,
     cmd: BackendCommand,
+    event_tx: &Sender<BackendEvent>,
+    signal_ui: &std::sync::Arc<dyn Fn() + Send + Sync>,
+    client_id: &str,
 ) -> Option<BackendEvent> {
     match cmd {
         BackendCommand::Connect { url } => {
             match PimbleClient::connect(&url).await {
                 Ok(c) => {
-                    *client = Some(c);
-                    Some(BackendEvent::Connected { server_addr: url })
+                    *client = Some(std::sync::Arc::new(c));
+                    Some(BackendEvent::Connected { server_addr: url, client_id: String::new() })
                 }
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
@@ -400,10 +463,21 @@ async fn process_command(
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
-            match c.set_node_content_bytes(store_id, node_id, content).await {
+            match c.set_node_content_bytes(store_id, node_id, content, Some(client_id.to_string())).await {
                 Ok(()) => Some(BackendEvent::NodeContentUpdated { store_id, node_id }),
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
+        }
+
+        BackendCommand::BroadcastChanges { store_id, node_id, changes } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            use pimble_rpc::EditOperation;
+            if let Err(e) = c.apply_edit(store_id, node_id, client_id, EditOperation::IncrementalChanges { changes }).await {
+                tracing::warn!("BroadcastChanges failed: {}", e);
+            }
+            None
         }
 
         BackendCommand::RenameNode { store_id, node_id, title } => {
@@ -503,6 +577,118 @@ async fn process_command(
             match c.save_workspace(workspace, &path).await {
                 Ok(()) => Some(BackendEvent::WorkspaceSaved),
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
+
+        BackendCommand::SyncStoreDocument { store_id } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            // Run the sync protocol to completion (multiple round-trips)
+            let mut message: Option<String> = None;
+            loop {
+                match c.sync_store_document(store_id, client_id, message).await {
+                    Ok(response_msg) => {
+                        if response_msg.is_none() {
+                            // Sync complete
+                            break;
+                        }
+                        message = response_msg;
+                    }
+                    Err(e) => return Some(BackendEvent::Error { message: e.to_string() }),
+                }
+            }
+            Some(BackendEvent::StoreDocumentSynced { store_id })
+        }
+
+        BackendCommand::SyncNodeContent { store_id, node_id, state_vector } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            match c.sync_node_content(store_id, node_id, &state_vector).await {
+                Ok((diff, _server_state_vector)) => {
+                    Some(BackendEvent::NodeContentSynced { store_id, node_id, diff })
+                }
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::SubscribeStoreChanges { store_id } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            match c.subscribe_store_changes(store_id).await {
+                Ok(mut sub) => {
+                    let tx = event_tx.clone();
+                    let signal = signal_ui.clone();
+                    tokio::spawn(async move {
+                        while let Some(Ok(notification)) = sub.next().await {
+                            let event = BackendEvent::RemoteStoreChange {
+                                store_id: notification.store_id,
+                                change_kind: notification.change_kind,
+                                source_client_id: notification.source_client_id,
+                            };
+                            if let Err(e) = tx.try_send(event) {
+                                tracing::warn!("RemoteStoreChange channel full, dropped: {}", e);
+                            }
+                            signal();
+                        }
+                    });
+                    None // No immediate event
+                }
+                Err(e) => Some(BackendEvent::Error { message: format!("Subscribe failed: {}", e) }),
+            }
+        }
+
+        BackendCommand::SubscribeNodeChanges { store_id, node_id } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            match c.subscribe_node_changes(store_id, node_id).await {
+                Ok(mut sub) => {
+                    let tx = event_tx.clone();
+                    let signal = signal_ui.clone();
+                    let my_client_id = client_id.to_string();
+                    tokio::spawn(async move {
+                        loop {
+                            let notification = match sub.next().await {
+                                Some(Ok(n)) => n,
+                                Some(Err(e)) => {
+                                    tracing::warn!("Node subscription error: {}", e);
+                                    continue;
+                                }
+                                None => break,
+                            };
+
+                            tracing::info!("Node sub: received notification, source={:?}, has_op={}", notification.source_client_id, notification.operation.is_some());
+
+                            // Skip our own echoes
+                            if let Some(ref source) = notification.source_client_id {
+                                if source == &my_client_id {
+                                    continue;
+                                }
+                            }
+
+                            // Forward incremental changes if present
+                            if let Some(ref op) = notification.operation {
+                                use pimble_rpc::EditOperation;
+                                if let EditOperation::IncrementalChanges { changes } = op {
+                                    if let Err(e) = tx.try_send(BackendEvent::RemoteChanges {
+                                        store_id: notification.store_id,
+                                        node_id: notification.node_id,
+                                        changes: changes.clone(),
+                                    }) {
+                                        tracing::warn!("RemoteChanges channel full, dropped: {}", e);
+                                    }
+                                }
+                            }
+                            signal();
+                        }
+                    });
+                    None
+                }
+                Err(e) => Some(BackendEvent::Error { message: format!("Subscribe failed: {}", e) }),
             }
         }
     }

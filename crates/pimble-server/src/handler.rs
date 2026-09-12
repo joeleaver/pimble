@@ -1,33 +1,220 @@
 //! RPC method handlers
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use jsonrpsee::core::async_trait;
+use automerge::sync::{self, SyncDoc};
+use jsonrpsee::core::{async_trait, SubscriptionResult};
 use jsonrpsee::types::ErrorObjectOwned;
-use pimble_core::{Node, MountRef, Workspace};
-use pimble_crdt::DocumentContent;
+use jsonrpsee::{PendingSubscriptionSink, SubscriptionMessage};
+use pimble_core::{Node, MountRef, NodeId, StoreId, Workspace};
 use pimble_rpc::{
-    to_rpc_error, CloseStoreRequest, CreateMountRequest, CreateMountResponse, CreateNodeRequest,
-    CreateNodeResponse, CreateStoreRequest, CreateStoreResponse, CreateWorkspaceRequest,
-    DeleteNodeRequest, EmptyResponse, GetChildrenRequest, GetChildrenResponse,
-    GetMountStateRequest, GetMountStateResponse, GetNodeRequest, GetNodeResponse, GetNodesRequest,
-    GetNodesResponse, ListStoresResponse, LoadWorkspaceRequest, LoadWorkspaceResponse,
-    MoveNodeRequest, OpenStoreRequest, OpenStoreResponse, PimbleApiServer, SaveWorkspaceRequest,
-    SearchRequest, SearchResponse, SetNodeTextRequest, UpdateNodeContentRequest,
-    UpdateNodeMetadataRequest,
+    to_rpc_error, ApplyEditRequest, ApplyEditResponse, CloseStoreRequest, CreateMountRequest,
+    CreateMountResponse, CreateNodeRequest, CreateNodeResponse, CreateStoreRequest,
+    CreateStoreResponse, CreateWorkspaceRequest, DeleteNodeRequest, EditOperation, EmptyResponse,
+    GetChildrenRequest, GetChildrenResponse, GetMountStateRequest, GetMountStateResponse,
+    GetNodeRequest, GetNodeResponse, GetNodesRequest, GetNodesResponse, ListStoresResponse,
+    LoadWorkspaceRequest, LoadWorkspaceResponse, MoveNodeRequest, NodeContentChangedNotification,
+    OpenStoreRequest, OpenStoreResponse, PimbleApiServer, SaveWorkspaceRequest, SearchRequest,
+    SearchResponse, StoreChangeKind, StoreChangedNotification,
+    SyncNodeContentRequest, SyncNodeContentResponse, SyncStoreDocumentRequest,
+    SyncStoreDocumentResponse, UpdateNodeContentRequest, UpdateNodeMetadataRequest,
 };
 use pimble_store::StoreManager;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+use crate::sync_state::ServerSyncManager;
+
+/// How long to wait after a content edit before flushing it to disk. A burst
+/// of keystrokes coalesces into at most one flush per window, instead of one
+/// per edit.
+const CONTENT_FLUSH_DEBOUNCE: Duration = Duration::from_millis(750);
+
+/// Coalesces content flushes: `apply_edit` marks its store dirty and ensures
+/// exactly one flush task is in flight. Edits that land after that task has
+/// already drained the pending set are covered by a fresh task on the next
+/// `apply_edit` call, since `scheduled` is reset to `false` only once the
+/// flush has actually happened.
+#[derive(Default)]
+struct FlushDebouncer {
+    /// Stores with content dirty since the last flush.
+    pending: Mutex<HashSet<StoreId>>,
+    /// Whether a flush task is currently sleeping/running.
+    scheduled: Mutex<bool>,
+}
+
+/// Manages active subscription sinks for pushing notifications.
+struct SubscriptionRegistry {
+    /// Store change subscribers: store_id -> list of sinks
+    store_subs: HashMap<StoreId, Vec<jsonrpsee::core::server::SubscriptionSink>>,
+    /// Node content change subscribers: (store_id, node_id) -> list of sinks
+    node_subs: HashMap<(StoreId, NodeId), Vec<jsonrpsee::core::server::SubscriptionSink>>,
+}
+
+impl SubscriptionRegistry {
+    fn new() -> Self {
+        Self {
+            store_subs: HashMap::new(),
+            node_subs: HashMap::new(),
+        }
+    }
+
+    fn add_store_sub(&mut self, store_id: StoreId, sink: jsonrpsee::core::server::SubscriptionSink) {
+        self.store_subs.entry(store_id).or_default().push(sink);
+    }
+
+    fn add_node_sub(&mut self, store_id: StoreId, node_id: NodeId, sink: jsonrpsee::core::server::SubscriptionSink) {
+        self.node_subs.entry((store_id, node_id)).or_default().push(sink);
+    }
+
+    /// Notify all store subscribers about a change, removing closed sinks.
+    async fn notify_store_change(&mut self, notification: &StoreChangedNotification) {
+        if let Some(sinks) = self.store_subs.get_mut(&notification.store_id) {
+            let msg = SubscriptionMessage::from_json(&notification).ok();
+            if let Some(msg) = msg {
+                let mut closed = Vec::new();
+                for (i, sink) in sinks.iter().enumerate() {
+                    if sink.is_closed() {
+                        closed.push(i);
+                    } else if let Err(_) = sink.send(msg.clone()).await {
+                        closed.push(i);
+                    }
+                }
+                for i in closed.into_iter().rev() {
+                    sinks.swap_remove(i);
+                }
+            }
+        }
+    }
+
+    /// Notify all node content subscribers about a change, removing closed sinks.
+    async fn notify_node_change(&mut self, notification: &NodeContentChangedNotification) {
+        let key = (notification.store_id, notification.node_id);
+        if let Some(sinks) = self.node_subs.get_mut(&key) {
+            tracing::info!("notify_node_change: {} sinks for {:?}/{:?}", sinks.len(), notification.store_id, notification.node_id);
+            let msg = SubscriptionMessage::from_json(&notification).ok();
+            if let Some(msg) = msg {
+                let mut closed = Vec::new();
+                for (i, sink) in sinks.iter().enumerate() {
+                    if sink.is_closed() {
+                        tracing::info!("  sink {} is closed", i);
+                        closed.push(i);
+                    } else if let Err(e) = sink.send(msg.clone()).await {
+                        tracing::info!("  sink {} send failed: {}", i, e);
+                        closed.push(i);
+                    } else {
+                        tracing::info!("  sink {} sent OK", i);
+                    }
+                }
+                for i in closed.into_iter().rev() {
+                    sinks.swap_remove(i);
+                }
+            } else {
+                tracing::warn!("notify_node_change: failed to serialize notification");
+            }
+        } else {
+            tracing::info!("notify_node_change: no sinks for {:?}/{:?}", notification.store_id, notification.node_id);
+        }
+    }
+
+    /// Remove all subscriptions for a store.
+    fn remove_store(&mut self, store_id: StoreId) {
+        self.store_subs.remove(&store_id);
+        self.node_subs.retain(|(sid, _), _| *sid != store_id);
+    }
+}
 
 /// RPC handler implementation
 pub struct RpcHandler {
     store_manager: Arc<RwLock<StoreManager>>,
+    sync_manager: Arc<RwLock<ServerSyncManager>>,
+    subscriptions: Arc<RwLock<SubscriptionRegistry>>,
+    flush_debouncer: Arc<FlushDebouncer>,
 }
 
 impl RpcHandler {
     pub fn new(store_manager: Arc<RwLock<StoreManager>>) -> Self {
-        Self { store_manager }
+        Self {
+            store_manager,
+            sync_manager: Arc::new(RwLock::new(ServerSyncManager::new())),
+            subscriptions: Arc::new(RwLock::new(SubscriptionRegistry::new())),
+            flush_debouncer: Arc::new(FlushDebouncer::default()),
+        }
+    }
+
+    /// Mark `store_id` as having dirty content and, if no flush task is
+    /// already scheduled, spawn one. The task sleeps for
+    /// [`CONTENT_FLUSH_DEBOUNCE`], drains whichever stores are pending at
+    /// that point, and flushes each in turn. At most one flush task runs at
+    /// a time; edits that arrive after the drain (a narrow race) simply
+    /// schedule a fresh task on their own next call.
+    fn schedule_content_flush(&self, store_id: StoreId) {
+        {
+            let mut pending = self.flush_debouncer.pending.lock().unwrap();
+            pending.insert(store_id);
+        }
+
+        {
+            let mut scheduled = self.flush_debouncer.scheduled.lock().unwrap();
+            if *scheduled {
+                return;
+            }
+            *scheduled = true;
+        }
+
+        let store_manager = Arc::clone(&self.store_manager);
+        let debouncer = Arc::clone(&self.flush_debouncer);
+        tokio::spawn(async move {
+            tokio::time::sleep(CONTENT_FLUSH_DEBOUNCE).await;
+
+            let to_flush: Vec<StoreId> = {
+                let mut pending = debouncer.pending.lock().unwrap();
+                pending.drain().collect()
+            };
+
+            {
+                let mut manager = store_manager.write().await;
+                for store_id in to_flush {
+                    if let Err(e) = manager.flush(store_id).await {
+                        warn!("Debounced content flush failed for store {}: {}", store_id, e);
+                    }
+                }
+            }
+
+            let mut scheduled = debouncer.scheduled.lock().unwrap();
+            *scheduled = false;
+        });
+    }
+
+    /// Notify store subscribers about a change.
+    async fn notify_store_change(&self, store_id: StoreId, kind: StoreChangeKind, source: Option<&str>) {
+        let notification = StoreChangedNotification {
+            store_id,
+            change_kind: kind,
+            source_client_id: source.map(String::from),
+        };
+        self.subscriptions.write().await.notify_store_change(&notification).await;
+    }
+
+    /// Notify node content subscribers AND store subscribers about a content change.
+    async fn notify_node_content_change(&self, store_id: StoreId, node_id: NodeId, source: Option<&str>, operation: Option<EditOperation>) {
+        let node_notif = NodeContentChangedNotification {
+            store_id,
+            node_id,
+            source_client_id: source.map(String::from),
+            operation,
+        };
+        let store_notif = StoreChangedNotification {
+            store_id,
+            change_kind: StoreChangeKind::ContentUpdated { node_id },
+            source_client_id: source.map(String::from),
+        };
+        // Acquire lock once for both notification types
+        let mut registry = self.subscriptions.write().await;
+        registry.notify_node_change(&node_notif).await;
+        registry.notify_store_change(&store_notif).await;
     }
 }
 
@@ -85,6 +272,12 @@ impl PimbleApiServer for RpcHandler {
             .close_store(request.store_id)
             .await
             .map_err(to_rpc_error)?;
+
+        // Clean up sync states and subscriptions for this store
+        let mut sync_mgr = self.sync_manager.write().await;
+        sync_mgr.remove_store(request.store_id);
+        drop(sync_mgr);
+        self.subscriptions.write().await.remove_store(request.store_id);
 
         Ok(EmptyResponse {})
     }
@@ -163,6 +356,9 @@ impl PimbleApiServer for RpcHandler {
             .await
             .map_err(to_rpc_error)?;
 
+        drop(manager);
+        self.notify_store_change(request.store_id, StoreChangeKind::NodeCreated { node_id }, None).await;
+
         Ok(CreateNodeResponse { node_id })
     }
 
@@ -185,6 +381,9 @@ impl PimbleApiServer for RpcHandler {
             .flush(request.store_id)
             .await
             .map_err(to_rpc_error)?;
+
+        drop(manager);
+        self.notify_store_change(request.store_id, StoreChangeKind::MetadataUpdated { node_id: request.node_id }, None).await;
 
         Ok(EmptyResponse {})
     }
@@ -214,35 +413,8 @@ impl PimbleApiServer for RpcHandler {
             .await
             .map_err(to_rpc_error)?;
 
-        Ok(EmptyResponse {})
-    }
-
-    async fn set_node_text(
-        &self,
-        request: SetNodeTextRequest,
-    ) -> Result<EmptyResponse, ErrorObjectOwned> {
-        info!(
-            "Setting text content for node {} in store {}",
-            request.node_id, request.store_id
-        );
-
-        let mut manager = self.store_manager.write().await;
-
-        // Create new document content with the text
-        let mut doc_content = DocumentContent::new();
-        doc_content.set_text(&request.text).map_err(to_rpc_error)?;
-
-        // Save the document to the node
-        manager
-            .save_node_document(request.store_id, request.node_id, doc_content.document_mut())
-            .await
-            .map_err(to_rpc_error)?;
-
-        // Flush changes to disk
-        manager
-            .flush(request.store_id)
-            .await
-            .map_err(to_rpc_error)?;
+        drop(manager);
+        self.notify_node_content_change(request.store_id, request.node_id, request.client_id.as_deref(), None).await;
 
         Ok(EmptyResponse {})
     }
@@ -261,6 +433,9 @@ impl PimbleApiServer for RpcHandler {
             .delete_node(request.store_id, request.node_id)
             .await
             .map_err(to_rpc_error)?;
+
+        drop(manager);
+        self.notify_store_change(request.store_id, StoreChangeKind::NodeDeleted { node_id: request.node_id }, None).await;
 
         Ok(EmptyResponse {})
     }
@@ -284,6 +459,9 @@ impl PimbleApiServer for RpcHandler {
             .flush(request.store_id)
             .await
             .map_err(to_rpc_error)?;
+
+        drop(manager);
+        self.notify_store_change(request.store_id, StoreChangeKind::NodeMoved { node_id: request.node_id }, None).await;
 
         Ok(EmptyResponse {})
     }
@@ -371,6 +549,118 @@ impl PimbleApiServer for RpcHandler {
         Ok(GetMountStateResponse { state, mount_ref })
     }
 
+    async fn sync_store_document(
+        &self,
+        request: SyncStoreDocumentRequest,
+    ) -> Result<SyncStoreDocumentResponse, ErrorObjectOwned> {
+        debug!(
+            "Sync store document for store {} from client {}",
+            request.store_id, request.client_id
+        );
+
+        use base64::Engine;
+
+        // Decode incoming message if present
+        let incoming_msg = if let Some(ref encoded) = request.message {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
+            Some(
+                sync::Message::decode(&bytes)
+                    .map_err(|e| to_rpc_error(format!("Invalid sync message: {}", e)))?,
+            )
+        } else {
+            None
+        };
+
+        let mut store_manager = self.store_manager.write().await;
+        let mut sync_mgr = self.sync_manager.write().await;
+
+        let store_doc = store_manager
+            .store_document_mut(request.store_id)
+            .map_err(to_rpc_error)?;
+
+        let sync_state = sync_mgr.store_doc_state(&request.client_id, request.store_id);
+
+        // Apply incoming message
+        if let Some(msg) = incoming_msg {
+            store_doc
+                .inner_mut()
+                .sync()
+                .receive_sync_message(sync_state, msg)
+                .map_err(|e| to_rpc_error(format!("Sync receive error: {}", e)))?;
+        }
+
+        // Generate outgoing message
+        let outgoing = store_doc
+            .inner_mut()
+            .sync()
+            .generate_sync_message(sync_state);
+
+        let response_msg = outgoing.map(|msg: sync::Message| {
+            base64::engine::general_purpose::STANDARD.encode(msg.encode())
+        });
+
+        // Flush and validate if we received changes
+        if request.message.is_some() {
+            // Validate tree after sync
+            if let Ok(issues) = store_doc.validate_tree() {
+                for issue in &issues {
+                    tracing::warn!("Tree issue after sync in store {}: {:?}", request.store_id, issue);
+                }
+            }
+
+            drop(sync_mgr);
+            store_manager
+                .flush(request.store_id)
+                .await
+                .map_err(to_rpc_error)?;
+
+            // Notify subscribers about tree changes
+            self.notify_store_change(request.store_id, StoreChangeKind::TreeStructure, None).await;
+        }
+
+        Ok(SyncStoreDocumentResponse {
+            message: response_msg,
+        })
+    }
+
+    async fn sync_node_content(
+        &self,
+        request: SyncNodeContentRequest,
+    ) -> Result<SyncNodeContentResponse, ErrorObjectOwned> {
+        debug!(
+            "Sync node content for node {} in store {}",
+            request.node_id, request.store_id
+        );
+
+        use base64::Engine;
+
+        let client_sv = base64::engine::general_purpose::STANDARD
+            .decode(&request.state_vector)
+            .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
+
+        let mut store_manager = self.store_manager.write().await;
+
+        // Stateless reconciliation: no per-client sync state is kept for
+        // node content. The client sends its state vector, we hand back
+        // everything we have beyond it plus our own state vector.
+        let doc = store_manager
+            .get_node_document(request.store_id, request.node_id)
+            .await
+            .map_err(to_rpc_error)?;
+
+        let diff = doc
+            .diff_since(&client_sv)
+            .map_err(to_rpc_error)?;
+        let server_sv = doc.state_vector();
+
+        Ok(SyncNodeContentResponse {
+            diff: base64::engine::general_purpose::STANDARD.encode(&diff),
+            state_vector: base64::engine::general_purpose::STANDARD.encode(&server_sv),
+        })
+    }
+
     async fn load_workspace(
         &self,
         request: LoadWorkspaceRequest,
@@ -421,13 +711,88 @@ impl PimbleApiServer for RpcHandler {
         Ok(LoadWorkspaceResponse { workspace })
     }
 
+    async fn apply_edit(
+        &self,
+        request: ApplyEditRequest,
+    ) -> Result<ApplyEditResponse, ErrorObjectOwned> {
+        use base64::Engine;
+
+        // Apply the edit to the server's persistent yrs document.
+        match &request.operation {
+            EditOperation::IncrementalChanges { changes } => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(changes)
+                    .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
+                let mut store_manager = self.store_manager.write().await;
+                store_manager
+                    .apply_content_update(request.store_id, request.node_id, &bytes)
+                    .await
+                    .map_err(to_rpc_error)?;
+            }
+            EditOperation::ReplaceContent { content } => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(content)
+                    .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
+                let mut store_manager = self.store_manager.write().await;
+                store_manager
+                    .update_node_content(request.store_id, request.node_id, bytes)
+                    .await
+                    .map_err(to_rpc_error)?;
+            }
+        }
+
+        // Debounced persistence: coalesce a burst of edits into at most one
+        // flush per CONTENT_FLUSH_DEBOUNCE window, rather than one per edit,
+        // while still guaranteeing a crash never loses more than that window
+        // of keystrokes.
+        self.schedule_content_flush(request.store_id);
+
+        // Broadcast to other clients (never re-encoded or reinterpreted —
+        // the same operation bytes are relayed verbatim).
+        self.notify_node_content_change(
+            request.store_id,
+            request.node_id,
+            Some(&request.client_id),
+            Some(request.operation),
+        ).await;
+
+        Ok(ApplyEditResponse {})
+    }
+
+    async fn subscribe_store_changes(
+        &self,
+        pending: PendingSubscriptionSink,
+        store_id: StoreId,
+    ) -> SubscriptionResult {
+        info!("Client subscribing to store changes for {}", store_id);
+
+        let sink = pending.accept().await?;
+        self.subscriptions.write().await.add_store_sub(store_id, sink);
+
+        Ok(())
+    }
+
+    async fn subscribe_node_changes(
+        &self,
+        pending: PendingSubscriptionSink,
+        store_id: StoreId,
+        node_id: NodeId,
+    ) -> SubscriptionResult {
+        info!("Client subscribing to node changes for {}:{}", store_id, node_id);
+
+        let sink = pending.accept().await?;
+        self.subscriptions.write().await.add_node_sub(store_id, node_id, sink);
+
+        Ok(())
+    }
+
     async fn search(
         &self,
         request: SearchRequest,
     ) -> Result<SearchResponse, ErrorObjectOwned> {
         debug!("Searching for '{}'", request.query);
 
-        // TODO: Implement search in Phase 4
+        // TODO: Implement search
         Ok(SearchResponse {
             results: Vec::new(),
             total: 0,

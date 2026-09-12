@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 pimble-core = { workspace = true }
+pimble-crdt = { workspace = true }
 pimble-client = { workspace = true }
 pimble-rpc = { workspace = true }
 pimble-server = { workspace = true }
