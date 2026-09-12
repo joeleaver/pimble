@@ -1,133 +1,95 @@
 # Pimble - Claude Context
 
 This file provides context for Claude Code sessions working on this project.
+Read `docs/RESTART_PLAN.md` first: it holds the vision, the diagnosis of what went wrong,
+and the ordered plan.
 
 ## Project Overview
 
-Pimble is an **offline-first personal information manager** with:
-- CRDT-based data model (Automerge) for eventual online collaboration
-- Rust backend and Slint UI framework (migrated from Makepad)
-- JSON-RPC communication between components
-- WASM plugin system for extensible node types
-- Embedded vector database for semantic search (future)
+Pimble is an **offline-first personal information manager**:
+- Nodes in a tree inside a store; stores are `.pimble` directories
+- CRDT node content so devices and people can edit concurrently and merge
+- Rust backend, **rinch** UI (the Slint and Makepad UIs are gone)
+- Embedded JSON-RPC server (jsonrpsee over WebSocket) between UI and store
+- Mounts: any subtree of any store can appear in any other store's tree
+- Search: keyword and semantic (rhypedb is the planned index engine)
+- WASM plugin system for node types (skeleton)
 
-## Current Status: Phase 2 Complete (Basic UI)
+## Rules
 
-### What's Built
+- **rinch comes from GitHub `main`** (`joeleaver/rinch`), never a `path` dependency on
+  `/home/joe/dev/rinch`. That directory is off limits. To read rinch source use the cargo
+  checkout under `~/.cargo/git/checkouts/` or a fresh clone in the scratchpad. Move the
+  pinned revision with `cargo update rinch rinch-tabler-icons rinch-editor-core`.
+- rinch fixes go upstream as pull requests; point `Cargo.toml` at the branch until merged.
+- Always build and run `pimble-app` with `--release`; debug builds are unusably slow.
+- One way to write node content. If a second path appears, one of them is a bug.
+
+## Current Status (2026-09-12)
 
 | Crate | Purpose | Status |
 | --- | --- | --- |
-| `pimble-core` | Core types (Node, Store, Workspace) | ✅ Complete |
-| `pimble-crdt` | Automerge CRDT integration | ✅ Complete |
-| `pimble-store` | Local file-based storage | ✅ Complete |
-| `pimble-search` | Search infrastructure | ⏳ Skeleton only |
-| `pimble-rpc` | JSON-RPC protocol definitions | ✅ Complete |
-| `pimble-server` | Local RPC server | ✅ Complete |
-| `pimble-client` | Client library | ✅ Complete |
-| `pimble-plugins` | WASM plugin host | ⏳ Skeleton + built-ins |
-| `pimble-app` | Slint desktop app | ✅ Basic UI + VS Code-style menubar |
-| `pimble-cli` | Command-line interface | ✅ Complete |
+| `pimble-core` | Node, Store, Workspace, MountRef types | Complete |
+| `pimble-crdt` | `ContentDoc` (yrs node content), `StoreDocument` (Automerge tree) | Complete for Phase A |
+| `pimble-store` | `LocalStore` (`store.automerge` + `nodes/*.yrs`), `StoreManager`, legacy migration | Complete |
+| `pimble-rpc` / `pimble-server` / `pimble-client` | RPC protocol, embedded server, WebSocket client | Complete |
+| `pimble-search` | Search types | Skeleton |
+| `pimble-plugins` | `NodePlugin` trait, built-ins | Skeleton |
+| `pimble-app` | rinch desktop app | Works: two-window live editing, persistence verified |
+| `pimble-cli` | server / create-store / list-stores | Excluded from workspace |
+| `pimble-import` | Scrivener + RTF import | Excluded from workspace |
 
-### Phase 2 Complete: Basic UI
+### Phase A landed (2026-09-12): node content is yrs
 
-- ✅ Backend connection with background thread + tokio runtime
-- ✅ `BackendCommand` / `BackendEvent` enums for UI↔Backend communication
-- ✅ `crossbeam-channel` for thread-safe message passing
-- ✅ App connects to server on startup, displays connection status
-- ✅ Store/node state management in `AppState` with `TreeItem` for display
-- ✅ "Open Store" and "New Store" buttons in toolbar
-- ✅ Interactive TreePanel with expand/collapse (click handling)
-- ✅ Node selection updates viewer
-- ✅ CRDT document content rendering in NodeViewer
+Node content is a yrs document (`pimble_crdt::ContentDoc`), stored as `nodes/{id}.yrs`.
+Legacy `nodes/{id}.automerge` content is migrated best-effort on first access (text only)
+and the legacy file is left in place. The server holds one `ContentDoc` per open node,
+merges every `applyEdit` update, relays the raw bytes to other subscribers, and flushes
+dirty content on a 750ms debounce and on stop. `syncNodeContent` is stateless
+(state vector in, diff + server state vector out). `setNodeText` no longer exists.
+The store document (tree + metadata) is still Automerge until Phase B.
 
-### What's Next: Phase 3 (Document Editing)
+### Collaboration shape (keep these invariants)
 
-1. Text editing in NodeViewer (cursor, selection, input)
-2. Real-time CRDT sync back to server
-3. Undo/redo support
-4. Keyboard navigation in tree
-
-### Future Phases
-
-- **Phase 3**: Document editing with real-time CRDT sync
-- **Phase 4**: Search & indexing with vector DB (`all-MiniLM-L6-v2`)
-- **Phase 5**: Linking & navigation (deep links, backlinks)
-- **Phase 6**: WASM plugin system
-- **Phase 7**: Remote sync
-
-## Architecture Quick Reference
-
-### Data Model
-- **Node**: Basic unit of content (has id, parent, type, metadata, CRDT content, children, links)
-- **Store**: Container for a tree of nodes (local directory or remote)
-- **Workspace**: User's view into multiple stores (`.pimble-workspace` file)
-
-### Store Directory Structure
-```
-my-notes.pimble/
-├── manifest.json           # Store metadata
-├── nodes/
-│   ├── {node-id}.json      # Node metadata
-│   ├── {node-id}.automerge # CRDT content
-├── assets/                 # Binary files
-└── index/                  # Search indexes
-```
-
-### Communication Flow
-```
-Slint UI ←→ JSON-RPC (WebSocket/HTTP) ←→ Local Server ←→ Store (files)
-```
+- The app has ONE editor pane and one thread-local `EditorHandle` (`pimble-app/src/editor.rs`).
+- Local edits: `EditorHandle` outbound closure -> `BackendCommand::BroadcastChanges` ->
+  server persists and relays -> peers receive `BackendEvent::RemoteChanges` ->
+  `EditorHandle::collab_receive`.
+- Never wrap the editor in a document-model layer in the sync path. Never call
+  `load_html`/`load_doc` on a collaborating editor.
+- Rinch's collab scope is flat blocks + marks (paragraph, heading, code block; bold, italic,
+  link). Lists and tables in a collaborating document fail loudly by design.
 
 ## Key Files
 
-- `crates/pimble-core/src/node.rs` - Node, NodeId, NodeLink types
-- `crates/pimble-core/src/store.rs` - Store, StoreId, StoreLocation types
-- `crates/pimble-core/src/workspace.rs` - Workspace type
-- `crates/pimble-crdt/src/document.rs` - CrdtDocument wrapper
-- `crates/pimble-store/src/local.rs` - LocalStore implementation
-- `crates/pimble-rpc/src/methods.rs` - RPC API trait definition
+- `docs/RESTART_PLAN.md` - vision, diagnosis, decisions, ordered plan
+- `docs/ARCHITECTURE.md` - the original architecture, including mounts
+- `crates/pimble-core/src/node.rs` - Node, NodeId, NodeLink, MountRef
+- `crates/pimble-crdt/src/store_document.rs` - StoreDocument (tree + metadata CRDT)
+- `crates/pimble-store/src/local.rs` - LocalStore
+- `crates/pimble-rpc/src/methods.rs` - RPC API trait
 - `crates/pimble-server/src/handler.rs` - RPC method implementations
-- `crates/pimble-app/src/app.rs` - Slint app main logic
-- `crates/pimble-app/ui/app.slint` - Slint UI definition
-- `crates/pimble-app/ui/fonts/codicon.ttf` - VS Code icon font
-
-## Next Session: "Continue with Phase 3"
-
-**Phase 2 is complete.** The basic UI can:
-- Connect to server and display connection status
-- Open/create stores via buttons (hardcoded paths for now)
-- Display tree of stores and nodes with expand/collapse
-- Select nodes and view CRDT document content
-
-**Next steps (Phase 3):**
-- Replace read-only Text with TextInput for document editing in NodeViewer
-- Handle text changes and sync back via CRDT
-- Add file picker dialogs for Open/New Store buttons
-- Keyboard navigation in tree panel
-- Undo/redo support
+- `crates/pimble-app/src/app.rs` - UI tree, menus, rename, drag-and-drop
+- `crates/pimble-app/src/editor.rs` - editor pane + collaboration wiring
+- `crates/pimble-app/src/backend.rs` - background thread, embedded server, `BackendCommand`/`BackendEvent`
+- `crates/pimble-app/src/events.rs` - `BackendEvent` -> UI state
 
 ## Build & Run
 
-```powershell
-# Check build
+```bash
 cargo check --workspace
-
-# Run server
-cargo run -p pimble-cli -- server
-
-# Run desktop app
-cargo run -p pimble-app
-
-# Create a store (with server running)
-cargo run -p pimble-cli -- create-store ./test.pimble "Test Store"
+cargo build -p pimble-app --release
+cargo run -p pimble-app --release          # starts the embedded server itself
 ```
+
+The app has the rinch `debug` feature on, so the rinch MCP tools (`list_apps`, `connect`,
+`screenshot`, `dom_tree`, `click`, `type_text`) can drive a running instance.
 
 ## Dependencies
 
-Key external crates:
-- `automerge` 0.5 - CRDT
-- `jsonrpsee` 0.24 - JSON-RPC
-- `slint` 1.9 - UI framework
-- `i-slint-backend-winit` 1.9 - Winit backend for window control
-- `tantivy` 0.22 - Full-text search (Phase 4)
-- `wasmtime` 27 - WASM runtime (Phase 6)
+- `rinch` (git main) with features `desktop, components, theme, file-dialogs, clipboard, debug, collaboration`; software rendering (no `gpu`, which would need rinch's wgpu fork patch)
+- `rinch-editor-core` (git main)
+- `yrs` 0.27 and `rinch-editor-collab` (git main) for node content
+- `automerge` 0.5 for the store document only (retired in Phase B)
+- `jsonrpsee` 0.24
+- `rhypedb` (git, `joeleaver/rhypedb`) planned for `pimble-search`

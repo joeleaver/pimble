@@ -1,7 +1,7 @@
 # Rust build artifacts
 /target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is committed: it pins the rinch git revision the app builds against.
 
 # IDE
 .idea/

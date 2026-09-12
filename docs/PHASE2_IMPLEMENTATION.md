@@ -411,7 +411,7 @@ use crate::backend::{BackendCommand, BackendEvent, BackendHandle};
 use crate::state::{AppState, ConnectionState};
 
 // Server URL (could be configurable later)
-const SERVER_URL: &str = "http://127.0.0.1:9876";
+const SERVER_URL: &str = "http://127.0.0.1:7462";
 
 live_design! {
     use link::theme::*;
