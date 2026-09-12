@@ -183,8 +183,8 @@ bundle. The rhypedb lockfile has 428 packages. Put all of it behind a `semantic`
 | --- | --- | --- |
 | 0 | rinch on GitHub main, app compiles, focus API updated, server port moved off Blender's, tree icons follow node type | Done today |
 | 1 | Content on yrs (Phase A): store, server, RPC, client, app | Done 2026-09-12. Two windows edit live in both directions; force-killed both, relaunched, text intact. 40 tests pass, including server-boundary sync and debounced-flush tests. Interface: `docs/PHASE_A_CONTRACT.md`. |
-| 2 | Commit the migration as coherent commits | `git log` reads as a story |
-| 3 | Restore `pimble-cli` (headless testing) and `pimble-import` (port to `rinch-editor-core` document building) | `pimble create-store`, `pimble import` work against the embedded server |
+| 2 | Commit the migration as coherent commits | Done 2026-09-12 on branch `restart/phase-a-yrs-content`. |
+| 3 | Restore `pimble-cli` (headless testing) and `pimble-import` (port to `ContentDoc`) | Done 2026-09-12. CLI round-trips content through the real server; importer has an end-to-end test. |
 | 4 | Store document on yrs (Phase B); Automerge removed | `cargo tree` has no automerge; sync is one primitive |
 | 5 | `pimble-search` on rhypedb: schema, indexer fed by change notifications, search RPC, search panel | Semantic search over an imported Scrivener project |
 | 6 | Roadmap resumes: mounts (local first), remote sync, links UI, plugins | Per phase |
