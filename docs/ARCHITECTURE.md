@@ -3,7 +3,8 @@
 ## Overview
 
 Pimble is an offline-first personal information manager with:
-- CRDT-based data model (Automerge) for eventual online collaboration
+- CRDT-based data model (**yrs**) for both node content and the store's tree structure,
+  so devices and people can edit concurrently and merge without conflicts
 - Rust backend with Rinch UI framework
 - JSON-RPC communication between components (embedded server)
 - WASM plugin system for extensible node types
@@ -19,7 +20,7 @@ pimble/
 ├── Cargo.toml                 # Workspace root
 ├── crates/
 │   ├── pimble-core/           # Core types, traits, node definitions
-│   ├── pimble-crdt/           # Automerge integration, CRDT operations
+│   ├── pimble-crdt/           # yrs-backed CRDT documents (node content, store document)
 │   ├── pimble-store/          # Store abstraction (local + remote)
 │   ├── pimble-search/         # Vector DB, indexing, semantic search
 │   ├── pimble-rpc/            # JSON-RPC protocol definitions
@@ -49,7 +50,7 @@ pub struct Node {
     pub parent_id: Option<NodeId>,
     pub node_type: String,           // e.g., "document", "folder", "mount"
     pub metadata: NodeMetadata,
-    pub content: Vec<u8>,            // CRDT document bytes (Automerge)
+    pub content: Vec<u8>,            // CRDT document bytes (a yrs snapshot)
     pub children: Vec<NodeId>,       // Ordered child references
     pub links: Vec<NodeLink>,        // Outgoing links to other nodes
 }
@@ -76,6 +77,10 @@ pub enum LinkTarget {
 ```
 
 Well-known node types: `"document"`, `"folder"`, `"store"`, `"image"`, `"canvas"`.
+
+`parent_id`, `children`, and the metadata fields live in the store's tree document (see
+§4); `content` is assembled on read from the node's own content document. A node with no
+content document (a folder, say) reports empty `content`.
 
 ### 2. Store System (`pimble-store`)
 
@@ -132,23 +137,85 @@ Workspace files: `.pimble-workspace` (JSON)
 
 ### 4. CRDT Layer (`pimble-crdt`)
 
-All content mutations go through Automerge for conflict-free merging.
+There is one CRDT technology in Pimble, **yrs**, used for two kinds of document. Both are
+a `yrs::Doc` built with `OffsetKind::Utf16` (matching Yjs/rinch semantics) and both expose
+the same small set of primitives: load a document from bytes, save a full snapshot, apply
+an incoming update, and compute a state vector / diff pair for stateless sync.
+
+**`ContentDoc`** — one per node, the node's rich-text content:
 
 ```rust
-pub struct CrdtDocument {
-    doc: AutoCommit,
-}
+pub struct ContentDoc { /* yrs::Doc */ }
 
-impl CrdtDocument {
+impl ContentDoc {
     pub fn new() -> Self;
     pub fn load(bytes: &[u8]) -> Result<Self>;
-    pub fn save(&mut self) -> Vec<u8>;
-    pub fn get_heads(&mut self) -> Vec<ChangeHash>;
-    pub fn merge(&mut self, other: &mut Self) -> Result<()>;
+    pub fn from_plain_text(text: &str) -> Result<Self>;
+    pub fn save(&self) -> Vec<u8>;
+    pub fn apply_update(&mut self, update: &[u8]) -> Result<()>;
+    pub fn state_vector(&self) -> Vec<u8>;
+    pub fn diff_since(&self, state_vector: &[u8]) -> Result<Vec<u8>>;
+    pub fn text(&self) -> String; // flat-text projection for tree labels/search
 }
 ```
 
-Each node has its own `.automerge` file — this is important for the mount architecture because it means nodes can be synced individually rather than requiring whole-store sync.
+Internally a `ContentDoc` is a `rinch-editor-collab` `CollabSession` wrapping a
+`rinch-editor-core` document (paragraphs, headings, code blocks; bold/italic/link marks).
+That internal shape is opaque outside `from_plain_text` and `text`; every other caller
+(the server included) treats a `ContentDoc` as opaque yrs bytes and updates.
+
+**`StoreDocument`** — one per store, the tree structure and node metadata, built directly
+on `yrs::Map`/`yrs::Array` (no editor schema involved):
+
+```rust
+pub struct StoreDocument { /* yrs::Doc */ }
+
+impl StoreDocument {
+    pub fn new(name: &str, root_node_id: NodeId) -> Result<Self>;
+    pub fn load(bytes: &[u8]) -> Result<Self>;
+    pub fn save(&self) -> Vec<u8>;
+    pub fn apply_update(&mut self, update: &[u8]) -> Result<()>;
+    pub fn state_vector(&self) -> Vec<u8>;
+    pub fn diff_since(&self, state_vector: &[u8]) -> Result<Vec<u8>>;
+
+    // Tree and metadata mutation/read
+    pub fn add_node(&mut self, id: NodeId, parent_id: Option<NodeId>, node_type: &str, title: &str) -> Result<()>;
+    pub fn remove_node(&mut self, id: NodeId) -> Result<()>;
+    pub fn move_node(&mut self, id: NodeId, new_parent: NodeId, position: Option<usize>) -> Result<()>;
+    pub fn set_title(&mut self, id: NodeId, title: &str) -> Result<()>;
+    pub fn set_tags(&mut self, id: NodeId, tags: &[String]) -> Result<()>;
+    pub fn set_custom(&mut self, id: NodeId, key: &str, value: &serde_json::Value) -> Result<()>;
+    pub fn get_node_info(&self, id: NodeId) -> Result<NodeInfo>;
+    pub fn get_children(&self, id: NodeId) -> Result<Vec<NodeId>>;
+    pub fn validate_tree(&self) -> Result<Vec<TreeIssue>>;
+}
+```
+
+Schema:
+
+```text
+root map "meta":  { name: String, root_node_id: String }
+root map "nodes": { <node-id>: Map {
+    parent_id: String | absent,
+    node_type: String, title: String,
+    created_at: String (rfc3339), modified_at: String (rfc3339),
+    tags: Array<String>,
+    custom: Map<String, String (json)>,
+    children: Array<String (node-id)>
+} }
+```
+
+**Persistence.** A store keeps one `StoreDocument` (`store.yrs`) and one `ContentDoc` per
+node that has content (`nodes/{node-id}.yrs`), loaded lazily and kept in memory while the
+node is open. Because each node's content is its own document, nodes can be synced or
+replicated individually — this is what makes mounting a subtree cheap (see the Mount
+Architecture section below).
+
+**Sync.** Both document kinds use the same stateless protocol: a client sends the state
+vector it already has, the server (or peer) replies with a diff of everything beyond it
+plus its own state vector, and neither side keeps per-client sync state between calls. See
+§6 for the RPC methods that carry this (`syncNodeContent`, `syncStoreDocument`) and the
+ones that carry live edits (`applyEdit`, `applyStoreUpdate`).
 
 ### 5. Search & Indexing (`pimble-search`)
 
@@ -173,35 +240,81 @@ pub struct SearchResult {
 }
 ```
 
-**Embedding model** (Phase 4): Local-only using `all-MiniLM-L6-v2` (384 dimensions, ~80MB model) via `candle` or `ort`.
+**Embedding model** (Phase 4): Local-only using `all-MiniLM-L6-v2` (384 dimensions, ~80MB model). See `docs/RESTART_PLAN.md` §5 for the current plan (rhypedb as the index and query engine) superseding the candle/lance sketch this section originally described.
 
 ### 6. RPC Protocol (`pimble-rpc`)
 
-JSON-RPC 2.0. The app currently uses an embedded server (in-process), but the protocol supports HTTP/WebSocket for remote servers.
+JSON-RPC 2.0 via `jsonrpsee`. The app currently uses an embedded server (in-process), but
+the protocol supports HTTP/WebSocket for remote servers. This mirrors
+`crates/pimble-rpc/src/methods.rs`:
 
 ```rust
 #[rpc(server, client, namespace = "pimble")]
 pub trait PimbleApi {
-    // Store operations
-    async fn create_store(&self, request: CreateStoreRequest) -> Result<CreateStoreResponse>;
-    async fn open_store(&self, request: OpenStoreRequest) -> Result<OpenStoreResponse>;
-    async fn close_store(&self, request: CloseStoreRequest) -> Result<EmptyResponse>;
-    async fn list_stores(&self) -> Result<ListStoresResponse>;
+    // Store Operations
+    async fn create_store(&self, request: CreateStoreRequest) -> Result<CreateStoreResponse, ErrorObjectOwned>;
+    async fn open_store(&self, request: OpenStoreRequest) -> Result<OpenStoreResponse, ErrorObjectOwned>;
+    async fn close_store(&self, request: CloseStoreRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+    async fn list_stores(&self) -> Result<ListStoresResponse, ErrorObjectOwned>;
 
-    // Node operations
-    async fn get_node(&self, request: GetNodeRequest) -> Result<GetNodeResponse>;
-    async fn create_node(&self, request: CreateNodeRequest) -> Result<CreateNodeResponse>;
-    async fn delete_node(&self, request: DeleteNodeRequest) -> Result<EmptyResponse>;
-    async fn get_children(&self, request: GetChildrenRequest) -> Result<GetChildrenResponse>;
+    // Node Operations
+    async fn get_node(&self, request: GetNodeRequest) -> Result<GetNodeResponse, ErrorObjectOwned>;
+    async fn get_nodes(&self, request: GetNodesRequest) -> Result<GetNodesResponse, ErrorObjectOwned>;
+    async fn create_node(&self, request: CreateNodeRequest) -> Result<CreateNodeResponse, ErrorObjectOwned>;
+    async fn update_node_metadata(&self, request: UpdateNodeMetadataRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+    async fn update_node_content(&self, request: UpdateNodeContentRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+    async fn delete_node(&self, request: DeleteNodeRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+    async fn move_node(&self, request: MoveNodeRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+    async fn get_children(&self, request: GetChildrenRequest) -> Result<GetChildrenResponse, ErrorObjectOwned>;
 
-    // Workspace operations
-    async fn load_workspace(&self, request: LoadWorkspaceRequest) -> Result<LoadWorkspaceResponse>;
-    async fn save_workspace(&self, request: SaveWorkspaceRequest) -> Result<EmptyResponse>;
+    // Mount Operations
+    async fn create_mount(&self, request: CreateMountRequest) -> Result<CreateMountResponse, ErrorObjectOwned>;
+    async fn get_mount_state(&self, request: GetMountStateRequest) -> Result<GetMountStateResponse, ErrorObjectOwned>;
 
-    // Search
-    async fn search(&self, request: SearchRequest) -> Result<SearchResponse>;
+    // Workspace Operations
+    async fn load_workspace(&self, request: LoadWorkspaceRequest) -> Result<LoadWorkspaceResponse, ErrorObjectOwned>;
+    async fn save_workspace(&self, request: SaveWorkspaceRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+    async fn create_workspace(&self, request: CreateWorkspaceRequest) -> Result<LoadWorkspaceResponse, ErrorObjectOwned>;
+
+    // Edit Operations (collaborative editing)
+    /// Apply an edit operation to a node's content and broadcast it to other clients.
+    async fn apply_edit(&self, request: ApplyEditRequest) -> Result<ApplyEditResponse, ErrorObjectOwned>;
+
+    // Sync Operations
+    /// Sync a store document (tree structure + metadata): send a yrs state
+    /// vector, receive a diff of everything the server has beyond it.
+    /// Stateless. If the client also has local changes the server lacks,
+    /// it sends those separately via `applyStoreUpdate`.
+    async fn sync_store_document(&self, request: SyncStoreDocumentRequest) -> Result<SyncStoreDocumentResponse, ErrorObjectOwned>;
+    /// Sync a node's content document the same way: state vector in, diff out.
+    async fn sync_node_content(&self, request: SyncNodeContentRequest) -> Result<SyncNodeContentResponse, ErrorObjectOwned>;
+    /// Apply a yrs update to the store document and broadcast it to the
+    /// store's other subscribers.
+    async fn apply_store_update(&self, request: ApplyStoreUpdateRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    // Subscription Operations
+    #[subscription(name = "subscribeStoreChanges" => "storeChanged", unsubscribe = "unsubscribeStoreChanges", item = StoreChangedNotification)]
+    async fn subscribe_store_changes(&self, store_id: StoreId) -> SubscriptionResult;
+    #[subscription(name = "subscribeNodeChanges" => "nodeChanged", unsubscribe = "unsubscribeNodeChanges", item = NodeContentChangedNotification)]
+    async fn subscribe_node_changes(&self, store_id: StoreId, node_id: NodeId) -> SubscriptionResult;
+
+    // Search Operations
+    async fn search(&self, request: SearchRequest) -> Result<SearchResponse, ErrorObjectOwned>;
 }
 ```
+
+`EditOperation` (carried by `apply_edit` and relayed in `NodeContentChangedNotification`)
+has one active variant, `IncrementalChanges { changes: String }` — a base64-encoded yrs v1
+update (a delta or a reconciliation diff). Whole-document replacement goes through
+`updateNodeContent`, which seeds or replaces a node's content with a full snapshot.
+
+**Server-side relay.** `apply_edit` merges the incoming update into the server's
+in-memory `ContentDoc` for that node, schedules a debounced flush to `nodes/{id}.yrs`
+(750ms, coalescing a burst of edits into one write), and relays the same bytes verbatim to
+the node's other subscribers — never re-encoded or reinterpreted. `apply_store_update`
+does the equivalent for the store document: merge into the in-memory `StoreDocument`,
+flush `store.yrs` immediately, and broadcast to the store's subscribers as a
+`StoreChangedNotification` carrying the raw update.
 
 ### 7. Plugin System (`pimble-plugins`)
 
@@ -313,12 +426,12 @@ pub enum MountState {
 }
 ```
 
-**Offline behavior**: When a remote mount's source is unreachable, Pimble shows cached data if available (the locally-replicated `.automerge` files). The UI indicates staleness but remains functional. When the source comes back online, Automerge sync brings the local replica up to date.
+**Offline behavior**: When a remote mount's source is unreachable, Pimble shows cached data if available (the locally-replicated `.yrs` files). The UI indicates staleness but remains functional. When the source comes back online, yrs sync brings the local replica up to date.
 
 ### Data Ownership & Sync
 
 - **Data lives in the source store.** The mount point's store does not copy or own the mounted data.
-- **Local caching via CRDT replication.** For remote mounts, Pimble maintains a local replica of the mounted subtree's Automerge documents. Since each node has its own `.automerge` file, only the mounted subtree's nodes need to be replicated — not the entire source store.
+- **Local caching via CRDT replication.** For remote mounts, Pimble maintains a local replica of the mounted subtree's yrs documents. Since each node has its own `.yrs` file, only the mounted subtree's nodes need to be replicated — not the entire source store.
 - **Writes go to the source.** Editing a mounted node writes to the source store (directly for local mounts, via RPC for remote mounts). The CRDT layer handles conflict resolution if multiple clients edit concurrently.
 - **Tree structure is owned by the source.** You cannot reparent or reorder children within a mounted subtree from the mounting store's context. You can edit node content, but structural changes (add/move/delete children) must be authorized by the source store.
 
@@ -367,7 +480,7 @@ App
 │   ├── TreePanel (left)
 │   │   └── Tree with expand/collapse, inline rename, drag-and-drop
 │   └── NodeViewer (right)
-│       └── ContentEditable rich text editor
+│       └── Rich text editor pane (rinch editor + collaboration)
 └── StatusBar
 ```
 
@@ -409,7 +522,7 @@ pub struct AppState {
 │         │                │                  │               │
 │         ▼                ▼                  ▼               │
 │  ┌─────────────────────────────────────────────────┐       │
-│  │              CRDT Layer (Automerge)              │       │
+│  │                CRDT Layer (yrs)                  │       │
 │  └──────────────────────┬──────────────────────────┘       │
 │                         │                                   │
 │         ┌───────────────┼───────────────┐                  │
@@ -436,14 +549,14 @@ pub struct AppState {
 ### Phase 1: Foundation ✅ COMPLETE
 1. Initialize Cargo workspace with basic crate structure
 2. `pimble-core`: Define Node, Store, Workspace types
-3. `pimble-crdt`: Integrate Automerge, implement basic document operations
+3. `pimble-crdt`: Integrate yrs, implement basic document operations
 4. `pimble-store`: Local file-based store
 5. `pimble-rpc`: JSON-RPC types and basic client/server
 
 ### Phase 2: Basic UI ✅ COMPLETE
 1. `pimble-app`: Embedded server, Rinch UI with BackendCommand/BackendEvent
 2. TreePanel: Display node tree with expand/collapse, inline rename, drag-and-drop
-3. NodeViewer: ContentEditable rich text editor with CRDT sync
+3. NodeViewer: rich text editor with CRDT sync
 4. Store open/create via toolbar buttons
 5. VS Code-style menubar, dark mode
 
@@ -462,14 +575,14 @@ pub struct AppState {
 
 ### Phase 5: Remote Sync
 1. WebSocket transport for RPC
-2. Automerge sync protocol for per-node CRDT replication
+2. yrs sync protocol for per-node and per-store CRDT replication
 3. Partial sync — replicate only mounted subtrees, not whole stores
 4. Conflict resolution UI
 5. Authentication (API key, Bearer token, OAuth2 — already modeled in `AuthMethod`)
 6. Offline cache with staleness indicators
 
 ### Phase 6: Search & Indexing
-1. `pimble-search`: Full-text search with Tantivy
+1. `pimble-search`: index and query engine (see `docs/RESTART_PLAN.md` §5)
 2. Embedding generation (local model: `all-MiniLM-L6-v2`)
 3. Cross-mount search traversal
 4. Search UI: SearchBar, results panel
@@ -491,11 +604,10 @@ pub struct AppState {
 ## Key Dependencies
 
 ```toml
-automerge = "0.5"           # CRDT
-jsonrpsee = "0.24"          # JSON-RPC
-rinch = { git = "..." }     # UI framework
-wasmtime = "27"             # WASM runtime (Phase 8)
-tantivy = "0.22"            # Full-text search (Phase 6)
+yrs = "0.27"                 # CRDT (node content and the store document)
+jsonrpsee = "0.24"           # JSON-RPC
+rinch = { git = "..." }      # UI framework
+wasmtime = "27"              # WASM runtime (Phase 8)
 ```
 
 ---
@@ -528,20 +640,16 @@ tantivy = "0.22"            # Full-text search (Phase 6)
 ### Store Directory (`.pimble/`)
 ```
 my-notes.pimble/
-├── manifest.json           # Store metadata, schema version
+├── manifest.json           # Store metadata (version: 3)
+├── store.yrs               # Tree structure + node metadata (CRDT, yrs)
 ├── nodes/
-│   ├── {node-id}.json      # Node metadata
-│   ├── {node-id}.automerge # CRDT content (separate for efficiency)
+│   ├── {node-id}.yrs       # Per-node content documents (CRDT, yrs)
 │   └── ...
 ├── assets/                 # Binary files (images, attachments)
 │   ├── {hash}.png
 │   └── {hash}.pdf
-├── cache/                  # Cached data from remote mounts
+├── cache/                  # Cached data from remote mounts (future)
 │   └── {store-id}/
-│       └── {node-id}.automerge
-├── index/                  # Search indexes
-│   ├── vectors.lance       # Vector embeddings (Phase 6)
-│   └── fts/                # Tantivy full-text index
-└── sync/                   # Sync state for remote collaboration
-    └── heads.json          # Last known sync heads per peer
+│       └── {node-id}.yrs
+└── index/                  # Search indexes (future)
 ```

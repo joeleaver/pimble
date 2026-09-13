@@ -708,29 +708,18 @@ impl PimbleApiServer for RpcHandler {
     ) -> Result<ApplyEditResponse, ErrorObjectOwned> {
         use base64::Engine;
 
-        // Apply the edit to the server's persistent yrs document.
-        match &request.operation {
-            EditOperation::IncrementalChanges { changes } => {
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(changes)
-                    .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
-                let mut store_manager = self.store_manager.write().await;
-                store_manager
-                    .apply_content_update(request.store_id, request.node_id, &bytes)
-                    .await
-                    .map_err(to_rpc_error)?;
-            }
-            EditOperation::ReplaceContent { content } => {
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(content)
-                    .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
-                let mut store_manager = self.store_manager.write().await;
-                store_manager
-                    .update_node_content(request.store_id, request.node_id, bytes)
-                    .await
-                    .map_err(to_rpc_error)?;
-            }
-        }
+        // Apply the edit to the server's persistent yrs document. The
+        // full-snapshot path is `updateNodeContent`, not an `EditOperation`.
+        let EditOperation::IncrementalChanges { ref changes } = request.operation;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(changes)
+            .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
+        let mut store_manager = self.store_manager.write().await;
+        store_manager
+            .apply_content_update(request.store_id, request.node_id, &bytes)
+            .await
+            .map_err(to_rpc_error)?;
+        drop(store_manager);
 
         // Debounced persistence: coalesce a burst of edits into at most one
         // flush per CONTENT_FLUSH_DEBOUNCE window, rather than one per edit,

@@ -218,9 +218,14 @@ pub struct ConflictInfo {
 }
 
 /// Store manifest - metadata stored in manifest.json
+///
+/// Version 3 is the only supported layout: `manifest.json` plus `store.yrs`
+/// (tree structure and node metadata) and `nodes/{id}.yrs` (per-node content),
+/// both yrs documents. There is no migration path from an earlier layout; a
+/// store must be re-imported.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreManifest {
-    /// Schema version for forward compatibility
+    /// Schema version. Always [`StoreManifest::CURRENT_VERSION`].
     pub version: u32,
 
     /// Store ID
@@ -240,8 +245,8 @@ pub struct StoreManifest {
 }
 
 impl StoreManifest {
-    /// Current schema version
-    pub const CURRENT_VERSION: u32 = 2;
+    /// Current (and only) schema version
+    pub const CURRENT_VERSION: u32 = 3;
 
     /// Create a new manifest
     pub fn new(name: impl Into<String>, root_node_id: NodeId) -> Self {

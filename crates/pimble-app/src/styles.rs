@@ -199,7 +199,7 @@ pub(crate) const APP_CSS: &str = "
 }
 ";
 
-/// Editor content styles for the contenteditable area.
+/// Editor content styles for the editor pane.
 ///
 /// Designed for dark mode. Scoped to `.editor-content` so they don't leak
 /// into the rest of the UI.

@@ -9,16 +9,16 @@ use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
 
 use crate::editor::editor;
 
-/// A Signal bumped on every CE change/selection event so toolbar closures re-evaluate.
+/// A Signal bumped after every editor command so toolbar closures re-evaluate.
 static TOOLBAR_VERSION: std::sync::OnceLock<Signal<u32>> = std::sync::OnceLock::new();
 
 pub(crate) fn toolbar_version() -> Signal<u32> {
     *TOOLBAR_VERSION.get_or_init(|| Signal::new(0))
 }
 
-/// Call this after any CE mutation or cursor change to refresh toolbar state.
-/// Deferred via run_on_main_thread so it doesn't fire while the CE API's
-/// RefCell is still mutably borrowed by the operation that triggered the event.
+/// Call this after an editor command to refresh toolbar state.
+/// Deferred via run_on_main_thread so it doesn't fire while the editor's
+/// RefCell is still mutably borrowed by the operation that triggered it.
 pub(crate) fn bump_toolbar() {
     rinch::run_on_main_thread(|| {
         toolbar_version().update(|v| *v = v.wrapping_add(1));

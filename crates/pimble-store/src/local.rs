@@ -5,12 +5,11 @@ use std::path::{Path, PathBuf};
 
 use chrono::DateTime;
 use pimble_core::{Node, NodeId, NodeMetadata, StoreId, StoreManifest};
-use pimble_crdt::{ContentDoc, LegacyStoreDocument, StoreDocument};
+use pimble_crdt::{ContentDoc, StoreDocument};
 use tokio::fs;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::error::{Result, StoreError};
-use crate::legacy;
 
 /// Write a file atomically: write to a `.tmp` sibling, then rename into place.
 /// This prevents empty/corrupt files if the process is killed mid-write.
@@ -23,21 +22,17 @@ async fn atomic_write(path: &Path, data: impl AsRef<[u8]>) -> std::io::Result<()
 
 /// A local store backed by the filesystem
 ///
-/// Directory structure (v3):
+/// Directory structure:
 /// ```text
 /// store.pimble/
-/// ├── manifest.json           # Store metadata (version: 3)
-/// ├── store.yrs               # Tree structure + node metadata (CRDT, yrs)
-/// ├── store.automerge         # Legacy tree/metadata (pre-Phase-B); read
-/// │                           # once to migrate, then left untouched
+/// ├── manifest.json     # Store metadata (version: 3)
+/// ├── store.yrs         # Tree structure + node metadata (CRDT, yrs)
 /// ├── nodes/
-/// │   ├── {node-id}.yrs       # Per-node content documents (yrs)
-/// │   ├── {node-id}.automerge # Legacy per-node content (pre-Phase-A); read
-/// │   │                       # once to migrate, then left untouched
+/// │   ├── {node-id}.yrs # Per-node content documents (yrs)
 /// │   └── ...
-/// ├── assets/                 # Binary files
+/// ├── assets/           # Binary files
 /// │   └── {hash}.{ext}
-/// └── index/                  # Search indexes (future)
+/// └── index/            # Search indexes (future)
 /// ```
 pub struct LocalStore {
     /// Store ID
@@ -69,11 +64,7 @@ impl LocalStore {
     const INDEX_DIR: &'static str = "index";
     const MANIFEST_FILE: &'static str = "manifest.json";
     const STORE_DOC_FILE: &'static str = "store.yrs";
-    /// Legacy (pre-Phase-B) Automerge store document; read once to migrate,
-    /// then left untouched.
-    const LEGACY_STORE_DOC_FILE: &'static str = "store.automerge";
-    /// Store format version as of Phase B (store document on yrs). Set on
-    /// every freshly created store and on migration of an older store.
+    /// The only supported store format version.
     const STORE_MANIFEST_VERSION: u32 = 3;
 
     /// Create a new local store at the given path
@@ -123,7 +114,9 @@ impl LocalStore {
         Ok(store)
     }
 
-    /// Open an existing local store
+    /// Open an existing local store. Only the current format (manifest
+    /// version 3, `store.yrs` present) is supported; anything older must be
+    /// re-imported.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
 
@@ -139,143 +132,29 @@ impl LocalStore {
         let manifest_json = fs::read_to_string(&manifest_path).await?;
         let manifest: StoreManifest = serde_json::from_str(&manifest_json)?;
 
-        // Load or migrate the store document: prefer the current yrs format,
-        // then the legacy Automerge format (Phase B migration), then the
-        // oldest v1 per-node-JSON layout.
         let store_doc_path = path.join(Self::STORE_DOC_FILE);
-        let legacy_store_doc_path = path.join(Self::LEGACY_STORE_DOC_FILE);
-        let (store_doc, needs_migration) = if store_doc_path.exists() {
-            let bytes = fs::read(&store_doc_path).await?;
-            let doc = StoreDocument::load(&bytes).map_err(StoreError::from)?;
-            (doc, false)
-        } else if legacy_store_doc_path.exists() {
-            info!("Legacy Automerge store document detected, migrating to yrs...");
-            let legacy_bytes = fs::read(&legacy_store_doc_path).await?;
-            let legacy_doc = LegacyStoreDocument::load(&legacy_bytes).map_err(StoreError::from)?;
-            let doc = StoreDocument::from_legacy(&legacy_doc).map_err(StoreError::from)?;
-            info!("Migrated store document from Automerge to yrs");
-            (doc, true)
-        } else {
-            // Legacy v1 store (per-node .json files) — migrate straight into
-            // the new (yrs) StoreDocument.
-            info!("Legacy v1 store detected, migrating to yrs...");
-            let doc = Self::migrate_v1(&path, &manifest).await?;
-            (doc, true)
-        };
+        if manifest.version != Self::STORE_MANIFEST_VERSION || !store_doc_path.exists() {
+            return Err(StoreError::UnsupportedFormat {
+                path,
+                version: manifest.version,
+            });
+        }
 
-        let mut store = Self {
+        let bytes = fs::read(&store_doc_path).await?;
+        let store_doc = StoreDocument::load(&bytes).map_err(StoreError::from)?;
+
+        let store = Self {
             id: manifest.id,
             path,
             manifest,
             store_doc,
-            store_doc_dirty: needs_migration,
+            store_doc_dirty: false,
             content_docs: HashMap::new(),
             dirty_content: std::collections::HashSet::new(),
         };
 
-        if needs_migration {
-            // Update manifest version and save
-            store.manifest.version = Self::STORE_MANIFEST_VERSION;
-            store.flush().await?;
-            info!("Migration to yrs store document complete");
-        }
-
         info!("Opened local store '{}' from {:?}", store.manifest.name, store.path);
         Ok(store)
-    }
-
-    /// Migrate a v1 store (per-node .json files) straight into a new
-    /// (yrs-backed) `StoreDocument`.
-    async fn migrate_v1(path: &Path, manifest: &StoreManifest) -> Result<StoreDocument> {
-        let nodes_dir = path.join(Self::NODES_DIR);
-        let mut entries = fs::read_dir(&nodes_dir).await?;
-        let mut nodes: Vec<Node> = Vec::new();
-
-        // Load all node JSON files
-        while let Some(entry) = entries.next_entry().await? {
-            let entry_path = entry.path();
-            if entry_path.extension().is_some_and(|e| e == "json") {
-                let json = fs::read_to_string(&entry_path).await?;
-                match serde_json::from_str::<Node>(&json) {
-                    Ok(node) => nodes.push(node),
-                    Err(e) => warn!("Skipping invalid node file {:?}: {}", entry_path, e),
-                }
-            }
-        }
-
-        // Create store document with root
-        let mut store_doc = StoreDocument::new(&manifest.name, manifest.root_node_id)
-            .map_err(|e| StoreError::Crdt(e))?;
-
-        // Update root node timestamps from the actual node data if available
-        if let Some(root_node) = nodes.iter().find(|n| n.id == manifest.root_node_id) {
-            store_doc.set_timestamps(
-                manifest.root_node_id,
-                &root_node.metadata.created_at.to_rfc3339(),
-                &root_node.metadata.modified_at.to_rfc3339(),
-            ).map_err(|e| StoreError::Crdt(e))?;
-
-            // Set tags and custom fields from root
-            if !root_node.metadata.tags.is_empty() {
-                store_doc.set_tags(manifest.root_node_id, &root_node.metadata.tags)
-                    .map_err(|e| StoreError::Crdt(e))?;
-            }
-            for (key, val) in &root_node.metadata.custom {
-                store_doc.set_custom(manifest.root_node_id, key, val)
-                    .map_err(|e| StoreError::Crdt(e))?;
-            }
-        }
-
-        // Add non-root nodes
-        for node in &nodes {
-            if node.id == manifest.root_node_id {
-                continue;
-            }
-            store_doc.add_node_bare(
-                node.id,
-                &node.node_type,
-                &node.metadata.title,
-                &node.metadata.created_at.to_rfc3339(),
-                &node.metadata.modified_at.to_rfc3339(),
-            ).map_err(|e| StoreError::Crdt(e))?;
-
-            // Set parent_id
-            if let Some(parent_id) = node.parent_id {
-                store_doc.set_parent_id(node.id, Some(parent_id))
-                    .map_err(|e| StoreError::Crdt(e))?;
-            }
-
-            // Set tags and custom fields
-            if !node.metadata.tags.is_empty() {
-                store_doc.set_tags(node.id, &node.metadata.tags)
-                    .map_err(|e| StoreError::Crdt(e))?;
-            }
-            for (key, val) in &node.metadata.custom {
-                store_doc.set_custom(node.id, key, val)
-                    .map_err(|e| StoreError::Crdt(e))?;
-            }
-        }
-
-        // Rebuild children lists from parent_id relationships
-        for node in &nodes {
-            if let Some(parent_id) = node.parent_id {
-                if store_doc.has_node(parent_id) {
-                    store_doc.append_child(parent_id, node.id)
-                        .map_err(|e| StoreError::Crdt(e))?;
-                }
-            }
-        }
-
-        // Remove old .json files after successful migration
-        let mut entries = fs::read_dir(&nodes_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let entry_path = entry.path();
-            if entry_path.extension().is_some_and(|e| e == "json") {
-                fs::remove_file(&entry_path).await?;
-            }
-        }
-
-        Ok(store_doc)
     }
 
     /// Get the store manifest
@@ -320,10 +199,10 @@ impl LocalStore {
         match self.store_doc.validate_tree() {
             Ok(issues) => {
                 for issue in &issues {
-                    warn!("Tree issue after applying store update in store {}: {:?}", self.id, issue);
+                    tracing::warn!("Tree issue after applying store update in store {}: {:?}", self.id, issue);
                 }
             }
-            Err(e) => warn!("Failed to validate tree after applying store update: {}", e),
+            Err(e) => tracing::warn!("Failed to validate tree after applying store update: {}", e),
         }
         Ok(())
     }
@@ -363,11 +242,9 @@ impl LocalStore {
         })
     }
 
-    /// Get a node by ID. Loads (and migrates, if needed) its content from
-    /// disk if not already cached.
+    /// Get a node by ID. Loads its content from disk if not already cached.
     pub async fn get_node(&mut self, node_id: NodeId) -> Result<Node> {
-        // Ensures the content doc is loaded (migrating legacy content if
-        // necessary) and that the node exists.
+        // Ensures the content doc is loaded and that the node exists.
         self.get_node_document(node_id).await?;
 
         self.assemble_node(node_id)
@@ -415,14 +292,10 @@ impl LocalStore {
             .map_err(|e| StoreError::Crdt(e))?;
         self.store_doc_dirty = true;
 
-        // Remove content file(s)
+        // Remove content file
         let content_path = self.node_content_path(node_id);
         if content_path.exists() {
             fs::remove_file(&content_path).await?;
-        }
-        let legacy_path = self.legacy_content_path(node_id);
-        if legacy_path.exists() {
-            fs::remove_file(&legacy_path).await?;
         }
 
         // Remove from caches
@@ -497,10 +370,7 @@ impl LocalStore {
     }
 
     /// Get a node's persistent CRDT content document (loaded on demand, kept
-    /// in memory). If no `.yrs` file exists yet but a legacy `.automerge`
-    /// content file does, its text is extracted best-effort and used to seed
-    /// a new yrs document, which is then written to `.yrs`. The legacy file
-    /// is left untouched.
+    /// in memory).
     pub async fn get_node_document(&mut self, node_id: NodeId) -> Result<&mut ContentDoc> {
         if !self.store_doc.has_node(node_id) {
             return Err(StoreError::NodeNotFound(node_id));
@@ -511,22 +381,7 @@ impl LocalStore {
                 let bytes = fs::read(&content_path).await?;
                 ContentDoc::load(&bytes).map_err(StoreError::from)?
             } else {
-                let legacy_path = self.legacy_content_path(node_id);
-                if legacy_path.exists() {
-                    let legacy_bytes = fs::read(&legacy_path).await?;
-                    let text = legacy::extract_text(&legacy_bytes);
-                    let doc = ContentDoc::from_plain_text(&text).map_err(StoreError::from)?;
-                    let yrs_bytes = doc.save();
-                    atomic_write(&content_path, &yrs_bytes).await?;
-                    info!(
-                        "Migrated legacy Automerge content for node {} to yrs ({} chars)",
-                        node_id,
-                        text.len()
-                    );
-                    doc
-                } else {
-                    ContentDoc::new()
-                }
+                ContentDoc::new()
             };
             self.content_docs.insert(node_id, doc);
         }
@@ -613,11 +468,6 @@ impl LocalStore {
     fn node_content_path(&self, node_id: NodeId) -> PathBuf {
         self.path.join(Self::NODES_DIR).join(format!("{}.yrs", node_id))
     }
-
-    /// Path to a node's legacy (pre-restart) Automerge content file, if any.
-    fn legacy_content_path(&self, node_id: NodeId) -> PathBuf {
-        self.path.join(Self::NODES_DIR).join(format!("{}.automerge", node_id))
-    }
 }
 
 #[cfg(test)]
@@ -630,7 +480,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store_path = dir.path().join("test.pimble");
 
-        let store = LocalStore::create(&store_path, "Test Store").await.unwrap();
+        let _store = LocalStore::create(&store_path, "Test Store").await.unwrap();
         assert!(store_path.exists());
         assert!(store_path.join("manifest.json").exists());
         assert!(store_path.join("store.yrs").exists());
@@ -648,6 +498,33 @@ mod tests {
 
         let store = LocalStore::open(&store_path).await.unwrap();
         assert_eq!(store.id, store_id);
+    }
+
+    #[tokio::test]
+    async fn test_open_rejects_unsupported_format() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("test.pimble");
+        fs::create_dir_all(&store_path).await.unwrap();
+
+        // A manifest declaring an old version, with no store.yrs present.
+        let manifest = StoreManifest {
+            version: 2,
+            id: StoreId::new(),
+            name: "Old Store".into(),
+            root_node_id: NodeId::new(),
+            created_at: chrono::Utc::now(),
+            modified_at: chrono::Utc::now(),
+        };
+        fs::write(
+            store_path.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        ).await.unwrap();
+
+        match LocalStore::open(&store_path).await {
+            Err(StoreError::UnsupportedFormat { version, .. }) => assert_eq!(version, 2),
+            Err(other) => panic!("expected UnsupportedFormat, got {:?}", other),
+            Ok(_) => panic!("expected an error opening an unsupported-format store"),
+        }
     }
 
     #[tokio::test]
@@ -734,88 +611,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_v1_migration() {
-        let dir = tempdir().unwrap();
-        let store_path = dir.path().join("test.pimble");
-
-        // Create a v1-style store manually
-        fs::create_dir_all(&store_path).await.unwrap();
-        fs::create_dir(store_path.join("nodes")).await.unwrap();
-        fs::create_dir(store_path.join("assets")).await.unwrap();
-        fs::create_dir(store_path.join("index")).await.unwrap();
-
-        let root_id = NodeId::new();
-        let child_id = NodeId::new();
-
-        // Write v1 manifest
-        let manifest = StoreManifest {
-            version: 1,
-            id: StoreId::new(),
-            name: "Legacy Store".into(),
-            root_node_id: root_id,
-            created_at: chrono::Utc::now(),
-            modified_at: chrono::Utc::now(),
-        };
-        let manifest_json = serde_json::to_string_pretty(&manifest).unwrap();
-        fs::write(store_path.join("manifest.json"), manifest_json).await.unwrap();
-
-        // Write v1 node JSON files
-        let root_node = Node {
-            id: root_id,
-            parent_id: None,
-            node_type: "folder".into(),
-            metadata: NodeMetadata {
-                title: "Legacy Store".into(),
-                created_at: chrono::Utc::now(),
-                modified_at: chrono::Utc::now(),
-                tags: Vec::new(),
-                custom: std::collections::HashMap::new(),
-            },
-            content: Vec::new(),
-            children: vec![child_id],
-            links: Vec::new(),
-        };
-        let child_node = Node {
-            id: child_id,
-            parent_id: Some(root_id),
-            node_type: "document".into(),
-            metadata: NodeMetadata {
-                title: "Legacy Doc".into(),
-                created_at: chrono::Utc::now(),
-                modified_at: chrono::Utc::now(),
-                tags: Vec::new(),
-                custom: std::collections::HashMap::new(),
-            },
-            content: Vec::new(),
-            children: Vec::new(),
-            links: Vec::new(),
-        };
-
-        let root_json = serde_json::to_string_pretty(&root_node).unwrap();
-        fs::write(store_path.join("nodes").join(format!("{}.json", root_id)), root_json).await.unwrap();
-        let child_json = serde_json::to_string_pretty(&child_node).unwrap();
-        fs::write(store_path.join("nodes").join(format!("{}.json", child_id)), child_json).await.unwrap();
-
-        // Open should trigger migration
-        let mut store = LocalStore::open(&store_path).await.unwrap();
-
-        // Verify migration to the current (yrs) format
-        assert!(store_path.join("store.yrs").exists());
-
-        // Verify tree is intact
-        let root = store.get_node(root_id).await.unwrap();
-        assert_eq!(root.metadata.title, "Legacy Store");
-        assert!(root.children.contains(&child_id));
-
-        let child = store.get_node(child_id).await.unwrap();
-        assert_eq!(child.metadata.title, "Legacy Doc");
-        assert_eq!(child.parent_id, Some(root_id));
-
-        // Verify .json files are removed
-        assert!(!store_path.join("nodes").join(format!("{}.json", root_id)).exists());
-    }
-
-    #[tokio::test]
     async fn test_list_node_ids() {
         let dir = tempdir().unwrap();
         let store_path = dir.path().join("test.pimble");
@@ -873,41 +668,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_legacy_automerge_content_migration() {
-        use automerge::transaction::Transactable;
-        use automerge::{AutoCommit, ObjType};
-
-        let dir = tempdir().unwrap();
-        let store_path = dir.path().join("test.pimble");
-
-        let mut store = LocalStore::create(&store_path, "Test Store").await.unwrap();
-        let root_id = store.root_node_id();
-
-        let node = Node::document("Legacy Doc");
-        let doc_id = store.create_node(node, Some(root_id)).await.unwrap();
-        store.flush().await.unwrap();
-
-        // Write a legacy Automerge content file directly, bypassing the yrs
-        // path entirely (simulating a pre-restart store).
-        let mut legacy_doc = AutoCommit::new();
-        let text_id = legacy_doc
-            .put_object(automerge::ROOT, "text", ObjType::Text)
-            .unwrap();
-        legacy_doc.splice_text(&text_id, 0, 0, "Legacy content here").unwrap();
-        let legacy_bytes = legacy_doc.save();
-
-        let legacy_path = store_path.join("nodes").join(format!("{}.automerge", doc_id));
-        fs::write(&legacy_path, &legacy_bytes).await.unwrap();
-
-        let content_doc = store.get_node_document(doc_id).await.unwrap();
-        assert_eq!(content_doc.text(), "Legacy content here");
-
-        let yrs_path = store_path.join("nodes").join(format!("{}.yrs", doc_id));
-        assert!(yrs_path.exists(), "migration should have written a .yrs file");
-        assert!(legacy_path.exists(), "legacy .automerge file should be left untouched");
-    }
-
-    #[tokio::test]
     async fn test_reopen_preserves_full_tree() {
         let dir = tempdir().unwrap();
         let store_path = dir.path().join("test.pimble");
@@ -948,78 +708,5 @@ mod tests {
         assert_eq!(doc.metadata.title, "Doc");
         assert_eq!(doc.metadata.tags, vec!["x".to_string(), "y".to_string()]);
         assert_eq!(doc.metadata.custom.get("explicit_title"), Some(&serde_json::json!(true)));
-    }
-
-    #[tokio::test]
-    async fn test_legacy_store_document_migration() {
-        use pimble_crdt::LegacyStoreDocument;
-
-        let dir = tempdir().unwrap();
-        let store_path = dir.path().join("test.pimble");
-        fs::create_dir_all(&store_path).await.unwrap();
-        fs::create_dir(store_path.join("nodes")).await.unwrap();
-        fs::create_dir(store_path.join("assets")).await.unwrap();
-        fs::create_dir(store_path.join("index")).await.unwrap();
-
-        let root_id = NodeId::new();
-        let folder_id = NodeId::new();
-        let doc_id = NodeId::new();
-
-        // Build a legacy Automerge store document fixture: root -> folder ->
-        // document, the document carrying tags, custom metadata, and
-        // explicit timestamps, exactly like a pre-Phase-B store on disk.
-        let mut legacy = LegacyStoreDocument::new("Legacy Store", root_id).unwrap();
-        legacy.add_node(folder_id, Some(root_id), "folder", "A Folder").unwrap();
-        legacy.add_node(doc_id, Some(folder_id), "document", "A Document").unwrap();
-        legacy.set_tags(doc_id, &["a".to_string(), "b".to_string()]).unwrap();
-        legacy.set_custom(doc_id, "explicit_title", &serde_json::json!(true)).unwrap();
-        legacy.set_timestamps(doc_id, "2020-01-01T00:00:00Z", "2020-06-01T00:00:00Z").unwrap();
-        let legacy_bytes = legacy.save();
-
-        fs::write(store_path.join("store.automerge"), &legacy_bytes).await.unwrap();
-
-        // A matching pre-Phase-B (v2) manifest.
-        let manifest = StoreManifest {
-            version: 2,
-            id: StoreId::new(),
-            name: "Legacy Store".into(),
-            root_node_id: root_id,
-            created_at: chrono::Utc::now(),
-            modified_at: chrono::Utc::now(),
-        };
-        fs::write(
-            store_path.join("manifest.json"),
-            serde_json::to_string_pretty(&manifest).unwrap(),
-        ).await.unwrap();
-
-        // Open should migrate store.automerge -> store.yrs transparently.
-        let mut store = LocalStore::open(&store_path).await.unwrap();
-
-        assert!(store_path.join("store.yrs").exists(), "migration should have written store.yrs");
-        assert!(store_path.join("store.automerge").exists(), "legacy store.automerge should be left untouched");
-
-        // Tree, metadata, and child order all survive the migration.
-        let root = store.get_node(root_id).await.unwrap();
-        assert_eq!(root.children, vec![folder_id]);
-
-        let folder = store.get_node(folder_id).await.unwrap();
-        assert_eq!(folder.metadata.title, "A Folder");
-        assert_eq!(folder.children, vec![doc_id]);
-        assert_eq!(folder.parent_id, Some(root_id));
-
-        let doc = store.get_node(doc_id).await.unwrap();
-        assert_eq!(doc.metadata.title, "A Document");
-        assert_eq!(doc.parent_id, Some(folder_id));
-        assert_eq!(doc.metadata.tags, vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(doc.metadata.custom.get("explicit_title"), Some(&serde_json::json!(true)));
-
-        let expected_created = DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let expected_modified = DateTime::parse_from_rfc3339("2020-06-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        assert_eq!(doc.metadata.created_at, expected_created);
-        assert_eq!(doc.metadata.modified_at, expected_modified);
     }
 }

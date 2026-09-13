@@ -53,8 +53,8 @@ pub fn run() {
     let drag_ctx: DragContext<String> = DragContext::new();
 
     // Set up event processing via thread-local so run_on_main_thread
-    // can trigger it without capturing non-Send types. (No autosave loop or CE div
-    // anymore — the collab session persists edits live.)
+    // can trigger it without capturing non-Send types. (No autosave loop
+    // needed — the collab session persists edits live.)
     EVENT_PROCESSOR.with(|cell| {
         *cell.borrow_mut() = Some(Box::new(move || {
             process_backend_events(store, tree_state);
@@ -894,12 +894,12 @@ pub fn run() {
             }
         };
 
-        // Rich text editor (the new rinch `Editor {}` component over the shared
+        // Rich text editor (the rinch `Editor {}` component over the shared
         // thread-local `EditorHandle`). Collaboration is wired in `start_editing`:
         // local edits broadcast their deltas through the server relay, and remote
-        // deltas arrive via `BackendEvent::RemoteChanges`. There is no CE event
-        // subscription or manual autosave anymore — the collab session persists
-        // edits live (the server applies + relays each delta).
+        // deltas arrive via `BackendEvent::RemoteChanges`. There is no manual
+        // autosave — the collab session persists edits live (the server applies
+        // and relays each delta).
         let editor_view = rsx! {
             Editor { editor: crate::editor::editor() }
         };
@@ -1041,12 +1041,11 @@ pub fn run() {
         }
     };
 
-    rinch::run_with_window_props_and_menu(
-        app_component,
-        props,
-        Some(theme),
-        Some(menus),
-    );
+    App::new(app_component)
+        .window_props(props)
+        .theme(theme)
+        .menu(menus)
+        .run();
 
     EVENT_PROCESSOR.with(|cell| {
         *cell.borrow_mut() = None;

@@ -2,8 +2,8 @@
 //! M9 collaboration wired onto pimble's existing per-node change relay.
 //!
 //! Pimble uses ONE editor pane and swaps the active node's content into it, so we
-//! keep a single thread-local [`EditorHandle`] (the successor to the old
-//! `with_active_ce_api` global). Collaboration maps cleanly onto pimble's transport:
+//! keep a single thread-local [`EditorHandle`]. Collaboration maps cleanly onto
+//! pimble's transport:
 //!
 //! * a local edit's delta → `outbound` → [`BackendCommand::BroadcastChanges`] → the
 //!   server applies it (`apply_edit` → `ContentDoc::apply_update`) and relays it to peers;
@@ -182,15 +182,6 @@ fn doc_text(handle: &EditorHandle) -> String {
         collect(doc.child(i), &mut s);
     }
     s
-}
-
-/// Clear the cached HTML for a node. The HTML cache is vestigial now (the editor
-/// owns its content via the collab session), but several event handlers still call
-/// this when a node's content changes; keep it as a harmless cache eviction.
-pub(crate) fn invalidate_html_cache(store: AppStore, store_id: StoreId, node_id: NodeId) {
-    store.html_cache.update(|cache| {
-        cache.remove(&(store_id, node_id));
-    });
 }
 
 /// Apply a peer's remote delta (base64-decoded `bytes`) to the editor — the

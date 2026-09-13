@@ -3,10 +3,9 @@
 //! This crate provides:
 //! - Local file-based store implementation
 //! - Store management (create, open, close)
-//! - Node persistence using Automerge documents
+//! - Node persistence using yrs CRDT documents
 
 pub mod error;
-mod legacy;
 pub mod local;
 pub mod manager;
 pub mod registry;

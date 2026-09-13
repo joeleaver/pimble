@@ -9,7 +9,6 @@ description = "Store abstraction for local and remote storage in Pimble"
 [dependencies]
 pimble-core = { workspace = true }
 pimble-crdt = { workspace = true }
-automerge = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

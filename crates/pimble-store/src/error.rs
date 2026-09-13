@@ -1,5 +1,7 @@
 //! Error types for pimble-store
 
+use std::path::PathBuf;
+
 use pimble_core::{NodeId, StoreId};
 use thiserror::Error;
 
@@ -7,6 +9,11 @@ use thiserror::Error;
 pub enum StoreError {
     #[error("Store not found: {0}")]
     StoreNotFound(StoreId),
+
+    #[error(
+        "Store at {path:?} predates the current format (found manifest version {version}, expected 3) and must be re-imported"
+    )]
+    UnsupportedFormat { path: PathBuf, version: u32 },
 
     #[error("Node not found: {0}")]
     NodeNotFound(NodeId),

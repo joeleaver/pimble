@@ -133,13 +133,9 @@ pub struct AppStore {
     // Editor dirty flag — set when user edits content, cleared on save/load
     pub editor_dirty: Signal<bool>,
 
-    // Cached HTML for loaded nodes — avoids re-parsing content on every click.
-    // Key is (StoreId, NodeId), value is the HTML string.
-    // Invalidated when node content changes.
-    pub html_cache: Signal<HashMap<(StoreId, NodeId), String>>,
-
-    // Active editing state — tracks the node being edited and its local CrdtDocument.
-    // When set, saves go through the sync protocol instead of full replacement.
+    // Active editing state — which node is currently open in the shared editor.
+    // Its content lives in the editor's collab session; edits broadcast to the
+    // server live rather than being saved by wholesale replacement.
     pub active_edit: Signal<Option<ActiveEdit>>,
 
     // Locally-computed display label for the node currently being typed into,
@@ -150,32 +146,16 @@ pub struct AppStore {
     // `upsert_node`, which clears an entry once authoritative content arrives).
     pub live_label: Signal<HashMap<(StoreId, NodeId), String>>,
 
-    // Sync status — tracks the overall sync state of the application.
-    pub sync_status: Signal<SyncStatus>,
-
     // This client's unique ID (for echo suppression in notifications)
     pub client_id: Signal<String>,
 
 }
 
-/// Tracks the actively-edited node and its local CrdtDocument.
+/// Identifies the node currently open in the shared editor.
 #[derive(Clone)]
 pub struct ActiveEdit {
     pub store_id: StoreId,
     pub node_id: NodeId,
-}
-
-/// Overall sync status for the application.
-#[derive(Debug, Clone, PartialEq)]
-pub enum SyncStatus {
-    /// All stores are synced
-    Synced,
-    /// Currently syncing
-    Syncing,
-    /// Local changes not yet synced
-    Unsynced(usize),
-    /// Sync error
-    Error(String),
 }
 
 impl AppStore {
@@ -202,10 +182,8 @@ impl AppStore {
             rename_input_ids: Signal::new(HashMap::new()),
             pending_mount: Signal::new(None),
             editor_dirty: Signal::new(false),
-            html_cache: Signal::new(HashMap::new()),
             active_edit: Signal::new(None),
             live_label: Signal::new(HashMap::new()),
-            sync_status: Signal::new(SyncStatus::Synced),
             client_id: Signal::new(String::new()),
         }
     }
@@ -510,18 +488,6 @@ pub fn parse_tree_value(value: &str) -> Option<(StoreId, Option<NodeId>)> {
 pub enum ConnectionState {
     #[default]
     Disconnected,
-    Connecting,
     Connected,
     Error(String),
-}
-
-impl ConnectionState {
-    pub fn as_str(&self) -> &str {
-        match self {
-            ConnectionState::Disconnected => "Disconnected",
-            ConnectionState::Connecting => "Connecting...",
-            ConnectionState::Connected => "Connected",
-            ConnectionState::Error(msg) => msg.as_str(),
-        }
-    }
 }

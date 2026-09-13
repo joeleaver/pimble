@@ -72,7 +72,7 @@ pub struct Node {
     /// Node metadata
     pub metadata: NodeMetadata,
 
-    /// Raw CRDT content bytes (Automerge document)
+    /// Raw CRDT content bytes (a yrs document)
     /// This is managed by pimble-crdt
     #[serde(with = "serde_bytes_base64")]
     pub content: Vec<u8>,

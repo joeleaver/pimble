@@ -4,11 +4,10 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "CRDT documents for Pimble: yrs node content, Automerge store document"
+description = "CRDT documents for Pimble: yrs for node content and the store document"
 
 [dependencies]
 pimble-core = { workspace = true }
-automerge = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

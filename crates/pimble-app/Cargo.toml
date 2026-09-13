@@ -10,10 +10,6 @@ description = "Rinch desktop application for Pimble"
 name = "pimble"
 path = "src/main.rs"
 
-[features]
-default = []
-backend-winit = []
-
 [dependencies]
 pimble-core = { workspace = true }
 pimble-client = { workspace = true }

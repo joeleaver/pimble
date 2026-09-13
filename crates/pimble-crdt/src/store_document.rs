@@ -4,10 +4,6 @@
 //! - Tree structure (parent-child relationships, children ordering)
 //! - Node metadata (title, type, tags, custom fields, timestamps)
 //! - Node existence (create/delete)
-//!
-//! Legacy `store.automerge` files are read (never written) by
-//! [`crate::legacy_store_document::LegacyStoreDocument`] and converted with
-//! [`StoreDocument::from_legacy`].
 
 use std::collections::HashMap;
 
@@ -20,7 +16,6 @@ use yrs::{
 };
 
 use crate::error::{CrdtError, Result};
-use crate::legacy_store_document::LegacyStoreDocument;
 
 /// Information about a node read from the store document
 #[derive(Debug, Clone)]
@@ -95,67 +90,6 @@ impl StoreDocument {
         drop(txn);
 
         Ok(this)
-    }
-
-    /// Build a document whose contents mirror `legacy` exactly: every node's metadata,
-    /// tags, custom fields and timestamps, and every parent's children in the same
-    /// order.
-    pub fn from_legacy(legacy: &LegacyStoreDocument) -> Result<Self> {
-        let root_id = legacy.root_node_id()?;
-        let node_ids = legacy.list_node_ids()?;
-
-        let mut infos = HashMap::with_capacity(node_ids.len());
-        let mut children = HashMap::with_capacity(node_ids.len());
-        for &id in &node_ids {
-            infos.insert(id, legacy.get_node_info(id)?);
-            children.insert(id, legacy.get_children(id)?);
-        }
-
-        let root_info = infos
-            .get(&root_id)
-            .cloned()
-            .ok_or_else(|| CrdtError::KeyNotFound(format!("root node {}", root_id)))?;
-
-        let mut doc = StoreDocument::new(&root_info.title, root_id)?;
-        doc.set_node_type(root_id, &root_info.node_type)?;
-
-        // Bare entries for every non-root node first, so parent/child references below
-        // always resolve regardless of iteration order.
-        for &id in &node_ids {
-            if id == root_id {
-                continue;
-            }
-            let info = &infos[&id];
-            doc.add_node_bare(id, &info.node_type, &info.title, &info.created_at, &info.modified_at)?;
-        }
-
-        for &id in &node_ids {
-            let info = &infos[&id];
-            if id != root_id {
-                doc.set_parent_id(id, info.parent_id)?;
-            }
-            if !info.tags.is_empty() {
-                doc.set_tags(id, &info.tags)?;
-            }
-            for (key, value) in &info.custom {
-                doc.set_custom(id, key, value)?;
-            }
-        }
-
-        for &id in &node_ids {
-            for &child_id in &children[&id] {
-                doc.append_child(id, child_id)?;
-            }
-        }
-
-        // set_tags/set_custom above touch modified_at; restore the legacy timestamps
-        // exactly, last, so the migrated document matches the source precisely.
-        for &id in &node_ids {
-            let info = &infos[&id];
-            doc.set_timestamps(id, &info.created_at, &info.modified_at)?;
-        }
-
-        Ok(doc)
     }
 
     /// Load a store document from bytes (a yrs v1 update: a full snapshot or any
@@ -828,43 +762,5 @@ mod tests {
 
         assert!(a.validate_tree().unwrap().is_empty());
         assert!(b.validate_tree().unwrap().is_empty());
-    }
-
-    #[test]
-    fn migrate_from_legacy_preserves_everything() {
-        let root_id = NodeId::new();
-        let mut legacy = LegacyStoreDocument::new("Legacy Store", root_id).unwrap();
-
-        let folder_id = NodeId::new();
-        legacy.add_node(folder_id, Some(root_id), "folder", "A Folder").unwrap();
-
-        let doc_id = NodeId::new();
-        legacy.add_node(doc_id, Some(root_id), "document", "A Document").unwrap();
-        legacy.set_tags(doc_id, &["tag1".to_string(), "tag2".to_string()]).unwrap();
-        legacy.set_custom(doc_id, "explicit_title", &serde_json::json!(true)).unwrap();
-        legacy.set_timestamps(doc_id, "2020-01-01T00:00:00+00:00", "2020-06-01T00:00:00+00:00").unwrap();
-
-        let nested_child_id = NodeId::new();
-        legacy.add_node(nested_child_id, Some(folder_id), "document", "Nested").unwrap();
-
-        let migrated = StoreDocument::from_legacy(&legacy).unwrap();
-
-        for id in [root_id, folder_id, doc_id, nested_child_id] {
-            let legacy_info = legacy.get_node_info(id).unwrap();
-            let migrated_info = migrated.get_node_info(id).unwrap();
-
-            assert_eq!(migrated_info.id, legacy_info.id);
-            assert_eq!(migrated_info.parent_id, legacy_info.parent_id);
-            assert_eq!(migrated_info.node_type, legacy_info.node_type);
-            assert_eq!(migrated_info.title, legacy_info.title);
-            assert_eq!(migrated_info.tags, legacy_info.tags);
-            assert_eq!(migrated_info.custom, legacy_info.custom);
-            assert_eq!(migrated_info.created_at, legacy_info.created_at);
-            assert_eq!(migrated_info.modified_at, legacy_info.modified_at);
-
-            assert_eq!(migrated.get_children(id).unwrap(), legacy.get_children(id).unwrap());
-        }
-
-        assert!(migrated.validate_tree().unwrap().is_empty());
     }
 }

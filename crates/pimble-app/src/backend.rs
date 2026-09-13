@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use pimble_client::PimbleClient;
-use pimble_core::{MountRef, MountState, Node, NodeId, Store, StoreId, Workspace};
+use pimble_core::{MountRef, MountState, Node, NodeId, Store, StoreId};
 use pimble_server::PimbleServer;
 use rand::Rng;
 use tokio::runtime::Runtime;
@@ -18,14 +18,10 @@ use tokio::runtime::Runtime;
 /// Commands sent from UI to backend
 #[derive(Debug)]
 pub enum BackendCommand {
-    Connect { url: String },
-    Disconnect,
-
     // Store operations
     CreateStore { path: String, name: String },
     OpenStore { path: String },
     CloseStore { store_id: StoreId },
-    ListStores,
 
     // Node operations
     CreateNode { store_id: StoreId, parent_id: Option<NodeId>, title: String },
@@ -53,28 +49,13 @@ pub enum BackendCommand {
     BroadcastChanges {
         store_id: StoreId,
         node_id: NodeId,
-        /// Base64-encoded incremental Automerge change bytes
+        /// Base64-encoded incremental yrs change bytes
         changes: String,
     },
-
-    // Sync operations
-    /// Reconcile the store document against the server: `state_vector` is this
-    /// client's current yrs state vector for the store's tree/metadata doc. The
-    /// app holds no local `StoreDocument` today, so nothing populates this yet.
-    SyncStoreDocument { store_id: StoreId, state_vector: Vec<u8> },
-    /// Reconcile a node's content against the server: `state_vector` is this
-    /// client's current yrs state vector (from `EditorHandle::collab_state_vector`).
-    /// The server answers with a diff (possibly empty) plus its own state vector.
-    SyncNodeContent { store_id: StoreId, node_id: NodeId, state_vector: Vec<u8> },
 
     // Subscription operations
     SubscribeStoreChanges { store_id: StoreId },
     SubscribeNodeChanges { store_id: StoreId, node_id: NodeId },
-
-    // Workspace operations
-    CreateWorkspace { name: String, path: String },
-    LoadWorkspace { path: String },
-    SaveWorkspace { workspace: Workspace, path: String },
 }
 
 /// Events sent from backend to UI
@@ -88,7 +69,6 @@ pub enum BackendEvent {
     StoreCreated { store_id: StoreId, root_node_id: NodeId },
     StoreOpened { store: Store },
     StoreClosed { store_id: StoreId },
-    StoreList { stores: Vec<Store> },
 
     // Node events
     NodeCreated { store_id: StoreId, parent_id: Option<NodeId>, node_id: NodeId },
@@ -111,26 +91,14 @@ pub enum BackendEvent {
         state: MountState,
     },
 
-    // Sync events
-    /// Response to `SyncStoreDocument`: `diff` is the yrs update this client was
-    /// missing (empty if already caught up). The app has nothing to apply it to
-    /// today, so it just triggers the usual tree refresh.
-    StoreDocumentSynced { store_id: StoreId, diff: Vec<u8> },
-    /// Response to `SyncNodeContent`: `diff` is the yrs update this client was
-    /// missing (empty if already caught up).
-    NodeContentSynced { store_id: StoreId, node_id: NodeId, diff: Vec<u8> },
-
     // Remote change events (from subscriptions)
     RemoteStoreChange { store_id: StoreId, change_kind: pimble_rpc::StoreChangeKind, source_client_id: Option<String> },
-    RemoteContentChange { store_id: StoreId, node_id: NodeId, source_client_id: Option<String> },
 
     // Collaborative editing
-    /// Remote incremental changes arrived — apply to local EditorDocument
-    RemoteChanges { store_id: StoreId, node_id: NodeId, changes: String },
-
-    // Workspace events
-    WorkspaceLoaded { workspace: Workspace },
-    WorkspaceSaved,
+    /// Remote incremental changes arrived — apply to the local editor's collab
+    /// session. No node identity carried: pimble has one shared editor pane and
+    /// the subscription that produces this is already scoped to that node.
+    RemoteChanges { changes: String },
 }
 
 /// Handle to communicate with the backend
@@ -152,11 +120,6 @@ impl BackendHandle {
         });
 
         Self { cmd_tx, event_rx }
-    }
-
-    /// Send a command to the backend (non-blocking)
-    pub fn send_command(&self, cmd: BackendCommand) -> Result<(), crossbeam_channel::TrySendError<BackendCommand>> {
-        self.cmd_tx.try_send(cmd)
     }
 
     /// Send a command to the backend (non-blocking), ignoring result
@@ -374,21 +337,6 @@ async fn process_command(
     client_id: &str,
 ) -> Option<BackendEvent> {
     match cmd {
-        BackendCommand::Connect { url } => {
-            match PimbleClient::connect(&url).await {
-                Ok(c) => {
-                    *client = Some(std::sync::Arc::new(c));
-                    Some(BackendEvent::Connected { server_addr: url, client_id: String::new() })
-                }
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
-        BackendCommand::Disconnect => {
-            *client = None;
-            Some(BackendEvent::Disconnected)
-        }
-
         BackendCommand::CreateStore { path, name } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
@@ -417,16 +365,6 @@ async fn process_command(
             };
             match c.close_store(store_id).await {
                 Ok(()) => Some(BackendEvent::StoreClosed { store_id }),
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
-        BackendCommand::ListStores => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            match c.list_stores().await {
-                Ok(stores) => Some(BackendEvent::StoreList { stores }),
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
         }
@@ -556,61 +494,6 @@ async fn process_command(
             }
         }
 
-        BackendCommand::CreateWorkspace { name, path } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            match c.create_workspace(&name, &path).await {
-                Ok(workspace) => Some(BackendEvent::WorkspaceLoaded { workspace }),
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
-        BackendCommand::LoadWorkspace { path } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            match c.load_workspace(&path).await {
-                Ok(workspace) => Some(BackendEvent::WorkspaceLoaded { workspace }),
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
-        BackendCommand::SaveWorkspace { workspace, path } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            match c.save_workspace(workspace, &path).await {
-                Ok(()) => Some(BackendEvent::WorkspaceSaved),
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
-
-        BackendCommand::SyncStoreDocument { store_id, state_vector } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            match c.sync_store_document(store_id, &state_vector).await {
-                Ok((diff, _server_state_vector)) => {
-                    Some(BackendEvent::StoreDocumentSynced { store_id, diff })
-                }
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
-        BackendCommand::SyncNodeContent { store_id, node_id, state_vector } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            match c.sync_node_content(store_id, node_id, &state_vector).await {
-                Ok((diff, _server_state_vector)) => {
-                    Some(BackendEvent::NodeContentSynced { store_id, node_id, diff })
-                }
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
         BackendCommand::SubscribeStoreChanges { store_id } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
@@ -670,14 +553,11 @@ async fn process_command(
                             // Forward incremental changes if present
                             if let Some(ref op) = notification.operation {
                                 use pimble_rpc::EditOperation;
-                                if let EditOperation::IncrementalChanges { changes } = op {
-                                    if let Err(e) = tx.try_send(BackendEvent::RemoteChanges {
-                                        store_id: notification.store_id,
-                                        node_id: notification.node_id,
-                                        changes: changes.clone(),
-                                    }) {
-                                        tracing::warn!("RemoteChanges channel full, dropped: {}", e);
-                                    }
+                                let EditOperation::IncrementalChanges { changes } = op;
+                                if let Err(e) = tx.try_send(BackendEvent::RemoteChanges {
+                                    changes: changes.clone(),
+                                }) {
+                                    tracing::warn!("RemoteChanges channel full, dropped: {}", e);
                                 }
                             }
                             signal();

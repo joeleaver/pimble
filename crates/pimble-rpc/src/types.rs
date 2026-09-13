@@ -241,56 +241,17 @@ pub struct SearchResponse {
 }
 
 // ============================================================================
-// Subscription Types (for WebSocket)
-// ============================================================================
-
-/// Subscribe to node changes
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubscribeNodeRequest {
-    pub store_id: StoreId,
-    pub node_id: NodeId,
-}
-
-/// Subscribe to store changes
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubscribeStoreRequest {
-    pub store_id: StoreId,
-}
-
-/// Notification of node change
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeChangedNotification {
-    pub store_id: StoreId,
-    pub node_id: NodeId,
-    pub change_type: ChangeType,
-}
-
-/// Type of change
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ChangeType {
-    Created,
-    Updated,
-    Deleted,
-    Moved,
-}
-
-// ============================================================================
 // Edit Operations (collaborative editing)
 // ============================================================================
 
-/// A document editing operation, carrying yrs-encoded content bytes.
-/// These originate from the editor's collaboration session and can be
-/// applied on any client or on the server.
+/// A document editing operation, carrying a yrs v1 update (base64-encoded):
+/// a delta or a reconciliation diff. Originates from the editor's
+/// collaboration session and can be applied on any client or on the server.
+/// The full-snapshot path is `updateNodeContent`, not an `EditOperation`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum EditOperation {
-    /// A yrs v1 update (base64-encoded): a delta, or a reconciliation diff.
-    /// The primary collaboration primitive — just broadcast and apply.
     IncrementalChanges { changes: String },
-    /// A full yrs v1 snapshot (base64-encoded), for initial load or complex
-    /// structural changes.
-    ReplaceContent { content: String },
 }
 
 /// Request to apply an edit operation to a node.

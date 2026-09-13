@@ -25,29 +25,31 @@ Pimble is an **offline-first personal information manager**:
 - Always build and run `pimble-app` with `--release`; debug builds are unusably slow.
 - One way to write node content. If a second path appears, one of them is a bug.
 
-## Current Status (2026-09-12)
+## Current design (2026-09-13)
+
+Both CRDT documents in Pimble are yrs. There is no Automerge anywhere in the stack and no
+legacy format to read: a store predating this design does not open, and the answer is to
+re-import from Scrivener.
 
 | Crate | Purpose | Status |
 | --- | --- | --- |
 | `pimble-core` | Node, Store, Workspace, MountRef types | Complete |
-| `pimble-crdt` | `ContentDoc` (yrs node content), `StoreDocument` (Automerge tree) | Complete for Phase A |
-| `pimble-store` | `LocalStore` (`store.automerge` + `nodes/*.yrs`), `StoreManager`, legacy migration | Complete |
+| `pimble-crdt` | `ContentDoc` (per-node content) and `StoreDocument` (tree + metadata), both yrs | Complete |
+| `pimble-store` | `LocalStore` (`store.yrs` + `nodes/{id}.yrs`), `StoreManager` | Complete |
 | `pimble-rpc` / `pimble-server` / `pimble-client` | RPC protocol, embedded server, WebSocket client | Complete |
 | `pimble-search` | Search types | Skeleton |
 | `pimble-plugins` | `NodePlugin` trait, built-ins | Skeleton |
 | `pimble-app` | rinch desktop app | Works: two-window live editing, persistence verified |
-| `pimble-cli` | server / create-store / list-stores | Excluded from workspace |
-| `pimble-import` | Scrivener + RTF import | Excluded from workspace |
-
-### Phase A landed (2026-09-12): node content is yrs
+| `pimble-cli` | server / create-store / list-stores | Complete |
+| `pimble-import` | Scrivener + RTF import | Complete |
 
 Node content is a yrs document (`pimble_crdt::ContentDoc`), stored as `nodes/{id}.yrs`.
-Legacy `nodes/{id}.automerge` content is migrated best-effort on first access (text only)
-and the legacy file is left in place. The server holds one `ContentDoc` per open node,
-merges every `applyEdit` update, relays the raw bytes to other subscribers, and flushes
-dirty content on a 750ms debounce and on stop. `syncNodeContent` is stateless
-(state vector in, diff + server state vector out). `setNodeText` no longer exists.
-The store document (tree + metadata) is still Automerge until Phase B.
+The server holds one `ContentDoc` per open node, merges every `applyEdit` update, relays
+the raw bytes to other subscribers, and flushes dirty content on a 750ms debounce and on
+stop. The store document (tree structure and node metadata) is a second yrs document per
+store, stored as `store.yrs`; `applyStoreUpdate` merges and relays it the same way.
+`syncNodeContent` and `syncStoreDocument` are both stateless: state vector in, diff plus
+server state vector out. `setNodeText` and `ServerSyncManager` do not exist.
 
 ### Collaboration shape (keep these invariants)
 
@@ -63,7 +65,7 @@ The store document (tree + metadata) is still Automerge until Phase B.
 ## Key Files
 
 - `docs/RESTART_PLAN.md` - vision, diagnosis, decisions, ordered plan
-- `docs/ARCHITECTURE.md` - the original architecture, including mounts
+- `docs/ARCHITECTURE.md` - the architecture, including mounts
 - `crates/pimble-core/src/node.rs` - Node, NodeId, NodeLink, MountRef
 - `crates/pimble-crdt/src/store_document.rs` - StoreDocument (tree + metadata CRDT)
 - `crates/pimble-store/src/local.rs` - LocalStore
@@ -89,7 +91,7 @@ The app has the rinch `debug` feature on, so the rinch MCP tools (`list_apps`, `
 
 - `rinch` (git main) with features `desktop, components, theme, file-dialogs, clipboard, debug, collaboration`; software rendering (no `gpu`, which would need rinch's wgpu fork patch)
 - `rinch-editor-core` (git main)
-- `yrs` 0.27 and `rinch-editor-collab` (git main) for node content
-- `automerge` 0.5 for the store document only (retired in Phase B)
+- `yrs` 0.27 for both CRDT documents; `rinch-editor-collab` (git main) wraps it for node
+  content's rich-text schema, the store document uses `yrs` directly (Maps and Arrays)
 - `jsonrpsee` 0.24
 - `rhypedb` (git, `joeleaver/rhypedb`) planned for `pimble-search`

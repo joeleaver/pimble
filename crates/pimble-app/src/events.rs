@@ -9,7 +9,7 @@ use pimble_core::NodeId;
 use rinch::prelude::*;
 
 use crate::backend::{BackendCommand, BackendEvent};
-use crate::editor::{apply_remote, invalidate_html_cache, start_editing};
+use crate::editor::{apply_remote, start_editing};
 use crate::persistence::{load_app_state_file, save_app_state_file};
 use crate::state::{parse_tree_value, AppStore, ConnectionState, MountInfo};
 
@@ -267,7 +267,6 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
 
             BackendEvent::NodeContentUpdated { store_id, node_id } => {
                 tracing::info!("Node content updated: {:?}/{:?}", store_id, node_id);
-                invalidate_html_cache(store, *store_id, *node_id);
                 // Only re-fetch if this isn't the currently-selected node.
                 let is_selected = store.selected_id.get()
                     .and_then(|sel| parse_tree_value(&sel))
@@ -354,27 +353,6 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 store.set_mount_state(*store_id, *node_id, state.clone());
             }
 
-            BackendEvent::StoreDocumentSynced { store_id, diff: _ } => {
-                tracing::info!("Store document synced: {:?}", store_id);
-                // The app holds no local StoreDocument to merge the diff into —
-                // just re-fetch the tree to reflect any changes from sync.
-                if let Some(root_id) = store.root_node_id(*store_id) {
-                    store.send(BackendCommand::GetChildren {
-                        store_id: *store_id,
-                        node_id: root_id,
-                    });
-                }
-            }
-
-            BackendEvent::NodeContentSynced { store_id, node_id, diff } => {
-                tracing::info!("Node content synced: {:?}/{:?}", store_id, node_id);
-                // Merge whatever the server said we were missing into the editor's
-                // live collab session (a no-op if this node isn't the active edit).
-                if !diff.is_empty() {
-                    apply_remote(diff);
-                }
-            }
-
             BackendEvent::RemoteStoreChange { store_id, change_kind, source_client_id } => {
                 // Skip our own echoes
                 let my_id = untracked(|| store.client_id.get());
@@ -424,7 +402,6 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         });
 
                         if !is_active_crdt {
-                            invalidate_html_cache(store, *store_id, *node_id);
                             store.send(BackendCommand::GetNode {
                                 store_id: *store_id,
                                 node_id: *node_id,
@@ -442,33 +419,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 }
             }
 
-            BackendEvent::RemoteContentChange { store_id, node_id, source_client_id } => {
-                // Skip our own echoes
-                let my_id = untracked(|| store.client_id.get());
-                if let Some(source) = source_client_id {
-                    if !my_id.is_empty() && source == &my_id {
-                        continue;
-                    }
-                }
-
-                // If CRDT-edited node, the subscription task handles sync directly.
-                // Only fetch for non-CRDT nodes.
-                let is_active_crdt = untracked(|| {
-                    store.active_edit.with(|ae| {
-                        ae.as_ref().map_or(false, |e| e.store_id == *store_id && e.node_id == *node_id)
-                    })
-                });
-
-                if !is_active_crdt {
-                    invalidate_html_cache(store, *store_id, *node_id);
-                    store.send(BackendCommand::GetNode {
-                        store_id: *store_id,
-                        node_id: *node_id,
-                    });
-                }
-            }
-
-            BackendEvent::RemoteChanges { changes, .. } => {
+            BackendEvent::RemoteChanges { changes } => {
                 use base64::Engine;
                 // A peer's delta: integrate it into the editor's collab session (which
                 // re-projects the view and does NOT re-broadcast).
@@ -476,8 +427,6 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     apply_remote(&bytes);
                 }
             }
-
-            _ => {}
         }
     }
 }
