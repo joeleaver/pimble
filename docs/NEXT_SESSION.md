@@ -12,8 +12,8 @@ Written 2026-09-13 at the end of the restart session. Read this, then `CLAUDE.md
 - Workspace compiles with zero warnings. 43 tests pass in release.
 - Verified live: two windows edit the same node in both directions, force-kill both,
   relaunch, text intact. Tree labels follow content in the editing window too.
-- Restart plan steps 0 to 4 are done. Step 5 (search on rhypedb) is next and has an
-  open decision (below).
+- Restart plan steps 0 to 4 are done. Step 5 (search on rhypedb) is next; it starts in
+  the rhypedb repo (below).
 
 ## Verify in five minutes
 
