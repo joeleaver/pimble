@@ -8,8 +8,8 @@
 type Node {
     node_id: String @unique
     kind: String
-    title: String @fulltext
-    text: String @fulltext
+    title: String @fulltext(analyzer: "english")
+    text: String @fulltext(analyzer: "english")
     modified_at: i64
     // A to-one relation with no @on_delete defaults to Deny (rhypedb only
     // defaults an *unspecified* policy to Remove for a to-many field); an

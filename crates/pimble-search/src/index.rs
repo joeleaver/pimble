@@ -429,22 +429,41 @@ impl SearchIndex {
 
     // -- search -------------------------------------------------------------
 
+    /// Run the same full-text query over `title` and `text`.
+    fn fulltext_both(
+        &self,
+        query: &str,
+        k: usize,
+    ) -> Result<(Vec<rhypedb_engine::fulltext::FulltextHit>, Vec<rhypedb_engine::fulltext::FulltextHit>)> {
+        let title = self
+            .db
+            .fulltext_search("Node", "title", query, k, None, None)
+            .map_err(map_fulltext_err)?
+            .hits;
+        let text = self
+            .db
+            .fulltext_search("Node", "text", query, k, None, None)
+            .map_err(map_fulltext_err)?
+            .hits;
+        Ok((title, text))
+    }
+
     fn keyword_search(&self, query_text: &str, limit: usize) -> Result<Vec<SearchHit>> {
         if query_text.trim().is_empty() {
             return Ok(Vec::new());
         }
         let k = (limit * 4).max(20);
 
-        let title_hits = self
-            .db
-            .fulltext_search("Node", "title", query_text, k, None, None)
-            .map_err(map_fulltext_err)?
-            .hits;
-        let text_hits = self
-            .db
-            .fulltext_search("Node", "text", query_text, k, None, None)
-            .map_err(map_fulltext_err)?
-            .hits;
+        // Search-as-you-type: the last word the user is still typing is a prefix
+        // term. If the engine refuses the expansion (too short after analysis, or
+        // more than its cap of distinct terms), fall back to the literal query.
+        let typed = with_trailing_prefix(query_text);
+        let (title_hits, text_hits) = match self.fulltext_both(&typed, k) {
+            Ok(hits) if typed != query_text => hits,
+            Ok(hits) => hits,
+            Err(_) if typed != query_text => self.fulltext_both(query_text, k)?,
+            Err(e) => return Err(e),
+        };
 
         let mut combined: HashMap<u64, f32> = HashMap::new();
         for h in &title_hits {
@@ -751,8 +770,45 @@ pub(crate) fn map_engine_err(e: EngineError) -> SearchError {
     }
 }
 
+
+/// Turn the last word of a query into a prefix term (`came` -> `came*`) so
+/// results update while the user is still typing. Leaves the query alone when
+/// the last token already ends a phrase or a prefix, is inside an open quote,
+/// or is shorter than two characters (the engine rejects those).
+pub(crate) fn with_trailing_prefix(query: &str) -> String {
+    let trimmed = query.trim_end();
+    if trimmed.is_empty() || trimmed.len() != query.len() {
+        // Trailing whitespace means the last word is finished.
+        return query.to_string();
+    }
+    if trimmed.matches('"').count() % 2 == 1 {
+        return query.to_string();
+    }
+    let last = trimmed.rsplit(char::is_whitespace).next().unwrap_or("");
+    let word = last.trim_start_matches('+');
+    if word.ends_with('*') || word.ends_with('"') {
+        return query.to_string();
+    }
+    if word.chars().filter(|c| c.is_alphanumeric()).count() < 2 {
+        return query.to_string();
+    }
+    format!("{trimmed}*")
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn trailing_prefix_rules() {
+        assert_eq!(with_trailing_prefix("came"), "came*");
+        assert_eq!(with_trailing_prefix("security came"), "security came*");
+        assert_eq!(with_trailing_prefix("came "), "came ");
+        assert_eq!(with_trailing_prefix("came*"), "came*");
+        assert_eq!(with_trailing_prefix("\"security cam"), "\"security cam");
+        assert_eq!(with_trailing_prefix("\"security cameras\""), "\"security cameras\"");
+        assert_eq!(with_trailing_prefix("c"), "c");
+        assert_eq!(with_trailing_prefix("+cam"), "+cam*");
+    }
+
     use super::*;
 
     /// `snippet`'s content (ellipses stripped) must be a substring of

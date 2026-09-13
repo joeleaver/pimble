@@ -82,8 +82,9 @@ Pimble keeps that behind a `semantic` feature.
 0. Turn `semantic` on for real: choose the ONNX link mode for release builds
    (`onnx-download` for a self-contained binary), install a runtime here for a first live
    test, add a first-run model fetch into Pimble's data directory with visible progress,
-   and ask rhypedb to fail soft (not panic) when the model cannot load. rhypedb #17 adds
-   stemming and prefix terms for keyword search.
+   and ask rhypedb to fail soft (not panic) when the model cannot load. (rhypedb #17,
+   stemming and prefix terms, landed and is wired: `english` analyzer on both fields,
+   trailing word searched as a prefix.)
 
 1. `ContentDoc::text()` re-projects the whole document on every call; tree labels call it
    per node. Cache the projected text per node in `LocalStore` and invalidate on update.

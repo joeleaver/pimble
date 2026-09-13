@@ -4365,7 +4365,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.45.0",
 ]
 
 [[package]]
@@ -5462,7 +5462,7 @@ checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 [[package]]
 name = "rhypedb-authz"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#4f1bbc462f89e2ebe3e78c181b7820d8c9716368"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#3d4f56fc50425167477843bc239d72c2216b71dd"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -5475,7 +5475,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-embed"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#4f1bbc462f89e2ebe3e78c181b7820d8c9716368"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#3d4f56fc50425167477843bc239d72c2216b71dd"
 dependencies = [
  "fastembed",
  "hf-hub 0.5.0",
@@ -5485,7 +5485,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-engine"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#4f1bbc462f89e2ebe3e78c181b7820d8c9716368"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#3d4f56fc50425167477843bc239d72c2216b71dd"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
@@ -5497,6 +5497,7 @@ dependencies = [
  "rhypedb-subscribe",
  "rhypedb-vector",
  "rhypedb-wire",
+ "rust-stemmers",
  "serde_json",
  "sha2",
  "thiserror 2.0.17",
@@ -5507,7 +5508,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-query"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#4f1bbc462f89e2ebe3e78c181b7820d8c9716368"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#3d4f56fc50425167477843bc239d72c2216b71dd"
 dependencies = [
  "bytes",
  "rhypedb-authz",
@@ -5520,7 +5521,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-schema"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#4f1bbc462f89e2ebe3e78c181b7820d8c9716368"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#3d4f56fc50425167477843bc239d72c2216b71dd"
 dependencies = [
  "thiserror 2.0.17",
 ]
@@ -5528,7 +5529,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-storage"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#4f1bbc462f89e2ebe3e78c181b7820d8c9716368"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#3d4f56fc50425167477843bc239d72c2216b71dd"
 dependencies = [
  "ahash",
  "bytes",
@@ -5546,7 +5547,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-subscribe"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#4f1bbc462f89e2ebe3e78c181b7820d8c9716368"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#3d4f56fc50425167477843bc239d72c2216b71dd"
 dependencies = [
  "parking_lot",
  "serde",
@@ -5556,7 +5557,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-vector"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#4f1bbc462f89e2ebe3e78c181b7820d8c9716368"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#3d4f56fc50425167477843bc239d72c2216b71dd"
 dependencies = [
  "boxcar",
  "parking_lot",
@@ -5567,7 +5568,7 @@ dependencies = [
 [[package]]
 name = "rhypedb-wire"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#4f1bbc462f89e2ebe3e78c181b7820d8c9716368"
+source = "git+https://github.com/joeleaver/rhypedb.git?branch=master#3d4f56fc50425167477843bc239d72c2216b71dd"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -5805,6 +5806,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "rust-stemmers"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e46a2036019fdb888131db7a4c847a1063a7493f971ed94ea82c67eada63ca54"
+dependencies = [
+ "serde",
+ "serde_derive",
 ]
 
 [[package]]

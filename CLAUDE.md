@@ -61,8 +61,9 @@ feature, content is chunked (about 200 words, block-aligned, heading context, pe
 hash so an edit re-embeds one chunk) into `Chunk` objects with `all-MiniLM-L6-v2`
 embeddings. Chunking works over `IndexUnit`s (prose, heading, code, table row, field,
 other) produced by `ContentDoc::units()` or a plugin's `index_units`, so tables and
-structured node types can index later without redesign. The simple analyzer has no
-stemming ("camera" does not find "cameras"); rhypedb #17 tracks that.
+structured node types can index later without redesign. Both fields use rhypedb's
+`english` analyzer (stemming), and the last typed word is searched as a prefix term so
+results update while typing (rhypedb #17).
 
 ### Collaboration shape (keep these invariants)
 
