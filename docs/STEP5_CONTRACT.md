@@ -1,8 +1,10 @@
 # Step 5 contract: search and graph index on rhypedb (draft, dispatch-ready)
 
-Status: drafted 2026-09-13, waiting on Joe's decision between Option 1 (add full-text to
-rhypedb first) and Option 2 (start now with a substring interim). Only §"Keyword search"
-differs. Everything else can be dispatched as is.
+Status: drafted 2026-09-13. Decision made the same day: Option 1, full-text search is
+built into rhypedb first (https://github.com/joeleaver/rhypedb/issues/16). Dispatch this
+contract once that lands, pointing the rhypedb git dependency at the branch or tag that
+has it. The Option 2 paragraph under "Keyword search" is kept only as the fallback if the
+rhypedb work slips.
 
 ## Ownership
 
@@ -83,8 +85,10 @@ queries where the query language is enough; fall back to `Database` calls (`get`
 offline; document `onnx-download` as the alternative.
 
 Keyword search:
-- Option 1: `Node.filter(.text.matches("<query>"))` (or whatever rhypedb's full-text
-  step is called once it exists) ranked by the engine.
+- Option 1 (chosen): `title: String @fulltext` and `text: String @fulltext` in the schema;
+  keyword search is `Node.matches(.text, "<query>", k: limit)` merged with a title query
+  (`Node.matches(.title, "<query>", k: limit)`, title hits weighted 2x), ranked by the
+  engine's BM25 score. See rhypedb issue #16 for the exact step syntax once merged.
 - Option 2: `scan_type("Node")` filtered case-insensitively on `title` then `text`,
   scored: title match 2.0, text match 1.0, ties by `modified_at` desc. Fine for
   thousands of nodes; a TODO points at Option 1.

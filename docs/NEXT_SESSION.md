@@ -37,33 +37,33 @@ The app has rinch's `debug` feature on; the rinch MCP tools (`list_apps`, `conne
 `screenshot`, `click`, `type_text`) drive a running instance. Blender's MCP add-on listens
 on 9876; Pimble deliberately uses 7462.
 
-## The open decision for step 5
+## Step 5 decision: full-text goes into rhypedb first (decided 2026-09-13)
 
 rhypedb (github.com/joeleaver/rhypedb, Joe's own engine) is the chosen index and query
 layer: nodes as objects, tree edges and links as relationships (backlinks via `@inverse`),
 tags, and `@vectorize` embeddings for semantic search. It is not the source of truth; the
 yrs documents are. The index lives under `store.pimble/index/rhypedb/` and is rebuildable.
 
-Two facts force a choice:
+rhypedb had no keyword search, and a PIM needs exact matching. Joe decided to add it to
+rhypedb itself rather than paper over it in Pimble. The design is filed as
+**https://github.com/joeleaver/rhypedb/issues/16**: a `@fulltext` directive on `String`
+fields, a `.matches(.field, "terms", k: N)` step ranked by BM25 (with `+required` terms
+and `"phrases"`), a cheap `.filter(.field.contains("x"))` predicate, an inverted index
+kept in the LSM keyspace inside the object's own transaction, and backfill on schema
+reload. rhypedb's default branch is `master`.
 
-1. rhypedb has **no keyword search** (operators are `==`, `!=`, `<`, `<=`, `>`, `>=` and
-   vector `similar`). A PIM needs exact matching.
-2. rhypedb's embedding stack (fastembed/ONNX) either downloads the ONNX runtime at build
-   time (`onnx-download`, network needed) or links a system library (`onnx-static` /
-   `onnx-dynamic`); the model itself downloads from Hugging Face on first use.
+Order of work for the next session:
 
-Options, Joe decides:
+1. Implement rhypedb issue #16 on a branch in a scratch clone of rhypedb and open a PR
+   (the same rule as rinch: the checkout under `/home/joe/dev` is Joe's working copy).
+   This is a rhypedb session, not a Pimble one; the Pimble contract waits on it.
+2. Point Pimble at the branch (git dep with `branch =`) and dispatch
+   `docs/STEP5_CONTRACT.md` with its Option 1 keyword section.
 
-- **Option 1 (recommended)**: add full-text indexing to rhypedb first, in the rhypedb repo
-  (`@index(fulltext)` on `String` fields, a `.matches("...")` step, BM25 ranking). Then
-  Pimble wires to it with keyword and semantic search in one engine. Pimble is the first
-  real consumer, so the feature gets a real test.
-- **Option 2**: start Pimble's indexer now on the graph and vector parts, with a substring
-  scan over `title`/`text` for keyword search in the interim, and swap to rhypedb
-  full-text when it exists.
-
-Either way, `docs/STEP5_CONTRACT.md` is drafted and dispatch-ready; only its keyword
-section differs between the options.
+The other consideration stands: rhypedb's embedding stack (fastembed/ONNX) either
+downloads the ONNX runtime at build time (`onnx-download`) or links a system library
+(`onnx-static` / `onnx-dynamic`), and the model downloads from Hugging Face on first use.
+Pimble keeps that behind a `semantic` feature.
 
 ## How the last session worked (keep doing this)
 
