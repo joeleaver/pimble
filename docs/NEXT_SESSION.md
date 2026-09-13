@@ -52,13 +52,11 @@ and `"phrases"`), a cheap `.filter(.field.contains("x"))` predicate, an inverted
 kept in the LSM keyspace inside the object's own transaction, and backfill on schema
 reload. rhypedb's default branch is `master`.
 
-Order of work for the next session:
-
-1. Implement rhypedb issue #16 on a branch in a scratch clone of rhypedb and open a PR
-   (the same rule as rinch: the checkout under `/home/joe/dev` is Joe's working copy).
-   This is a rhypedb session, not a Pimble one; the Pimble contract waits on it.
-2. Point Pimble at the branch (git dep with `branch =`) and dispatch
-   `docs/STEP5_CONTRACT.md` with its Option 1 keyword section.
+rhypedb #16 landed on `master` on 2026-09-13 (commit 4f1bbc4). Pimble's workspace now
+depends on `rhypedb-engine`, `rhypedb-schema` and `rhypedb-query` from that branch with
+default features off; `pimble-search`'s `semantic` feature turns on the ONNX stack.
+`docs/STEP5_CONTRACT.md` (search + graph index, chunked embeddings, extensible index
+units for tables and structured data) is the active contract.
 
 The other consideration stands: rhypedb's embedding stack (fastembed/ONNX) either
 downloads the ONNX runtime at build time (`onnx-download`) or links a system library

@@ -10,7 +10,7 @@ keyword search runs over whole nodes.
 
 | Agent | Scope |
 | --- | --- |
-| A | `pimble-search`: the index crate on rhypedb |
+| A | `pimble-search`: the index crate on rhypedb; `ContentDoc::units()` in `pimble-crdt`; `NodePlugin::index_units` in `pimble-plugins` |
 | B | `pimble-server` + `pimble-rpc` + `pimble-client`: indexer wiring, `search` and `rebuildIndex` RPCs, change feed |
 | C | `pimble-app`: search box, results panel, navigate to result |
 
@@ -44,6 +44,8 @@ type Chunk {
   chunk_id: String @unique          // "{node_id}:{ordinal}"
   node: Node @on_delete(cascade)
   ordinal: u32
+  kind: String                      // prose | heading | code | table | field | other
+  path: String                      // locator inside the node (block ordinal, cell, field path)
   hash: String                      // content hash of `text`; unchanged chunks are not re-embedded
   text: String
   embedding: Vector<384> @vectorize(source: "text", model: "all-MiniLM-L6-v2")
@@ -57,16 +59,42 @@ type Tag { name: String @unique }
   are written; A ships the schema as one file with a `// semantic:` marker the crate strips.
 
 - Chunking (pure function in `pimble-search`, unit-tested, no I/O):
-  - Input is the node's block list, not its flat text. A adds
-    `ContentDoc::blocks(&self) -> Vec<Block { kind: BlockKind, text: String }>` to
-    `pimble-crdt` (`BlockKind::{Paragraph, Heading(u8), CodeBlock}`), reusing the existing
-    projection walk; `text()` becomes `blocks().join("\n")`.
-  - Walk the blocks in order, accumulating consecutive blocks into a chunk until adding
-    the next block would exceed 200 words (about 256 word-pieces, the model's training
-    window). A single block longer than 200 words is split at sentence boundaries, then at
+  - Input is a list of **index units**, the index's own content model, decoupled from
+    rinch's editor schema so tables, richer layouts and structured node types can feed
+    the same chunker later:
+
+    ```rust
+    pub struct IndexUnit { pub kind: UnitKind, pub path: String, pub text: String }
+    pub enum UnitKind {
+        Prose,            // paragraph, quote, list item
+        Heading(u8),      // sets the section context for units that follow
+        Code,             // never sentence-split; chunked whole, oversize pieces split on lines
+        TableRow,         // text = "h1: v1 | h2: v2"; a table's header row is repeated as context
+        Field(String),    // structured data: field name; text = the value's text form
+        Other(String),    // unknown block kinds from the editor, indexed as prose
+    }
+    ```
+
+    `path` is a locator inside the node for deep links and highlighting: a block ordinal
+    (`"b:12"`), a table cell (`"b:12/r:3/c:1"`), or a field path (`"f:address.city"`).
+  - Producers: for `document` nodes, `ContentDoc::units(&self) -> Vec<IndexUnit>` in
+    `pimble-crdt`, built from the same projection walk as `text()`; it maps paragraph,
+    heading and code block today and passes any other block kind through as
+    `Other(kind)`, so a future table or callout block indexes without a crate change.
+    `text()` becomes the units' text joined by `\n`. For other node types the producer is
+    the node's plugin: `NodePlugin` gains `fn index_units(&self, content: &[u8]) ->
+    Vec<IndexUnit>` with a default that wraps `extract_text` in one `Prose` unit. B's
+    indexer asks the plugin host for units by `node_type`, never assumes a document.
+  - Walk the units in order, accumulating consecutive units into a chunk until adding
+    the next unit would exceed 200 words (about 256 word-pieces, the model's training
+    window). A single unit longer than 200 words is split at sentence boundaries, then at
     word boundaries, into pieces of at most 200 words with a 30-word overlap between
-    consecutive pieces.
-  - Each chunk's embedding source is `"{title}\n{nearest preceding heading, if any}\n{chunk text}"`,
+    consecutive pieces. `Code` units split on line boundaries instead. `TableRow` units
+    are grouped per table with the header row prepended to each chunk's source. `Field`
+    units are one chunk per field unless several short fields fit in one.
+  - Each chunk records `kind` (the dominant `UnitKind`) and `path` (its first unit's
+    locator) so the UI can render a hit as prose, a table row or a field, and can deep-link
+    to it. Each chunk's embedding source is `"{title}\n{nearest preceding heading, if any}\n{chunk text}"`,
     so a chunk carries its section context; `Chunk.text` stores the chunk text only and the
     context prefix is passed as the vectorize source by writing it into a separate
     `source: String` field if rhypedb requires the source to be a stored field (A checks;
@@ -88,17 +116,25 @@ type Tag { name: String @unique }
     the keyword node list and the semantic node list, so an exact term and a paraphrase
     both surface. `semantic: false` is keyword only.
 
+- Schema composition, for structured node types later: `pimble-search` builds the schema
+  from a base (`Node`, `Chunk`, `Tag`) plus zero or more `SchemaFragment`s (extra types
+  and extra `Node` relationships) contributed by node plugins through the plugin host. The
+  index directory stores a hash of the composed schema; a different hash triggers a
+  rebuild. Nothing contributes a fragment in this step; the seam exists so a future
+  `contact` or `task` node type can add `type Contact { ... }` with typed, filterable fields
+  and a `Node.contact: Contact` relationship instead of stuffing values into `text`.
+
 - Feed: the server already calls `notify_store_change` and `notify_node_content_change`
   for every mutation. B adds an in-process `IndexFeed` hook next to those calls (not over
   the WebSocket) that enqueues `(store_id, node_id, IndexEvent::{Upsert, Remove, Moved})`
   to a tokio task owning the store's `SearchIndex`. Content upserts are debounced per node
   (2s) because `applyEdit` fires per keystroke; the indexer reads `ContentDoc::blocks()` at
-  flush time, never per delta, and the chunk hashes keep unchanged chunks from re-embedding.
+  flush time (through the plugin host for non-document types), never per delta, and the chunk hashes keep unchanged chunks from re-embedding.
 - Query: `search(SearchRequest { query, stores, semantic, limit })` returns
   `SearchResultItem { node_id, store_id, score, title, snippet }`. `snippet` is the first
   match window in `text` (keyword) or the first 160 chars (semantic).
-- Node text and blocks come from `ContentDoc`; the only CRDT-crate change is the new
-  `blocks()` projection. (Follow-up 1 in `NEXT_SESSION.md`, the per-node projection cache in
+- Node text and units come from `ContentDoc`; the only CRDT-crate change is the new
+  `units()` projection. (Follow-up 1 in `NEXT_SESSION.md`, the per-node projection cache in
   `pimble-store`, is worth doing in the same step: the indexer and the tree labels both
   read it.)
 
@@ -132,11 +168,13 @@ Keyword and semantic search are as specified under "Ranking" in the Design secti
 can say so. When the `semantic` feature is off, a hybrid request degrades to keyword only
 and the response says `semantic: false`.
 
-`chunk_blocks(title, blocks) -> Vec<ChunkSpec { ordinal, text, source, hash }>` is public and
-tested on its own: a 5-paragraph note under 200 words yields one chunk; a 900-word
-paragraph yields five overlapping pieces; a heading followed by three paragraphs gives
-chunks whose `source` starts with the title and that heading; identical input yields
-identical hashes.
+`chunk_units(title, units) -> Vec<ChunkSpec { ordinal, kind, path, text, source, hash }>` is
+public and tested on its own: a 5-paragraph note under 200 words yields one chunk; a
+900-word paragraph yields five overlapping pieces; a heading followed by three paragraphs
+gives chunks whose `source` starts with the title and that heading; a 40-line code unit
+splits on lines, never mid-line; ten `TableRow` units under one header yield chunks whose
+`source` each begin with the header row; three `Field` units yield field-kind chunks with
+their field paths; identical input yields identical hashes.
 
 Tests: tempdir index; upsert three nodes with a parent chain and one link; keyword hit on
 title outranks hit on text; a phrase query matches only the node with the phrase; the

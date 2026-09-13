@@ -39,17 +39,11 @@ jsonrpsee = { version = "0.24", features = ["server", "client", "macros"] }
 # WASM runtime
 wasmtime = "27"
 
-# Vector database
-# lance = "0.10"  # Will enable in Phase 4
-
-# Full-text search
-tantivy = "0.22"
-
-# ML inference (Phase 4)
-# candle-core = "0.4"
-# candle-transformers = "0.4"
-# hf-hub = "0.3"
-# tokenizers = "0.15"
+# Search and graph index engine (Joe's rhypedb). default-features off keeps the
+# ONNX/fastembed stack out; pimble-search's `semantic` feature turns it on.
+rhypedb-engine = { git = "https://github.com/joeleaver/rhypedb.git", branch = "master", default-features = false }
+rhypedb-schema = { git = "https://github.com/joeleaver/rhypedb.git", branch = "master" }
+rhypedb-query = { git = "https://github.com/joeleaver/rhypedb.git", branch = "master", default-features = false }
 
 # UI framework, tracked from GitHub main (never the local checkout). Software
 # rendering (no `gpu`) avoids rinch's wgpu-fork patch. `collaboration` enables the
