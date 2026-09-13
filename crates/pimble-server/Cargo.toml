@@ -11,6 +11,7 @@ pimble-core = { workspace = true }
 pimble-crdt = { workspace = true }
 pimble-store = { workspace = true }
 pimble-search = { workspace = true }
+pimble-plugins = { workspace = true }
 pimble-rpc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -1,0 +1,43 @@
+// Pimble's rhypedb schema: one Node per pimble node, one Chunk per indexed
+// piece of a node's content (semantic search only), and shared Tags.
+//
+// See pimble_search::schema for how this file becomes two different schemas
+// (keyword-only vs. semantic) and how a future node-type plugin extends it.
+// Read that module's docs before editing the marker lines below.
+
+type Node {
+    node_id: String @unique
+    kind: String
+    title: String @fulltext
+    text: String @fulltext
+    modified_at: i64
+    // A to-one relation with no @on_delete defaults to Deny (rhypedb only
+    // defaults an *unspecified* policy to Remove for a to-many field); an
+    // index deletes leaf-to-root freely, so a parent must be deletable while
+    // it still has children — `remove` just drops the child's edge (`Remove`
+    // doesn't distinguish arity: it always just removes the edge, on one
+    // side or many).
+    parent: Node @on_delete(remove)
+    children: [Node] @inverse(Node.parent)
+    links: [Node]
+    backlinks: [Node] @inverse(Node.links)
+    tags: [Tag] @on_delete(remove)
+    // semantic: chunks: [Chunk] @inverse(Chunk.node)
+    // fragment-fields
+}
+
+// semantic: type Chunk {
+// semantic:     chunk_id: String @unique
+// semantic:     node: Node @on_delete(cascade)
+// semantic:     ordinal: u32
+// semantic:     kind: String
+// semantic:     path: String
+// semantic:     hash: String
+// semantic:     text: String
+// semantic:     source: String
+// semantic:     embedding: Vector<384> @vectorize(source: "source", model: "all-MiniLM-L6-v2") @index(hnsw, metric: cosine)
+// semantic: }
+
+type Tag {
+    name: String @unique
+}

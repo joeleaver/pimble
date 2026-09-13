@@ -15,8 +15,154 @@ use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
 use crate::backend::{BackendCommand, BackendHandle};
 use crate::editor::{start_editing, stop_editing};
 use crate::events::{EVENT_PROCESSOR, process_backend_events};
-use crate::state::{parse_tree_value, display_label_from_node, AppStore, PendingMount};
+use crate::state::{parse_tree_value, display_label_from_node, AppStore, PendingMount, SearchState};
 use crate::styles::{APP_CSS, EDITOR_CSS};
+
+thread_local! {
+    /// The search box's `NodeHandle`, captured once when the toolbar is built
+    /// so the View menu's "Focus Search" (Ctrl+K) action — constructed earlier,
+    /// before the box exists — can reach it later. Same reach-across-closures
+    /// need as `EVENT_PROCESSOR`/`CLOSE_HANDLER` below.
+    static SEARCH_INPUT: RefCell<Option<NodeHandle>> = const { RefCell::new(None) };
+    /// The debounced `Search` command pending from the last keystroke, if any.
+    static SEARCH_DEBOUNCE: RefCell<Option<TimeoutHandle>> = const { RefCell::new(None) };
+}
+
+/// Select and open a node or store root identified by a tree value
+/// (`"store_{uuid}"` / `"node_{store_uuid}_{node_uuid}"`) — the single
+/// implementation behind both a tree click and a search-result click, per
+/// CLAUDE.md's "one way to write node content": there is one way to open one.
+fn open_node(store: AppStore, tree_state: UseTreeReturn, value: String) {
+    store.selected_id.set(Some(value.clone()));
+    tree_state.controller.select(&value);
+
+    let parsed = parse_tree_value(&value);
+    let (title_opt, content_bytes_opt, is_document, sel_ids) = if let Some((s_id, node_id_opt)) = parsed {
+        if let Some(n_id) = node_id_opt {
+            let result = store.get_node_signal(s_id, n_id).map(|sig| {
+                sig.with(|node| {
+                    let label = if !node.metadata.title.is_empty() {
+                        node.metadata.title.clone()
+                    } else {
+                        "Untitled".to_string()
+                    };
+                    let is_doc = node.node_type == pimble_core::node_types::DOCUMENT;
+                    (label, node.content.clone(), is_doc)
+                })
+            });
+            match result {
+                Some((label, content, is_doc)) => (Some(label), Some(content), is_doc, Some((s_id, n_id))),
+                None => {
+                    store.send(BackendCommand::GetNode { store_id: s_id, node_id: n_id });
+                    (None, None, false, None)
+                }
+            }
+        } else {
+            let title = store.get_store_signal(s_id)
+                .map(|sig| sig.with(|s| s.name.clone()));
+            match title {
+                Some(t) => (Some(t), Some(Vec::new()), false, None),
+                None => (None, None, false, None),
+            }
+        }
+    } else {
+        (None, None, false, None)
+    };
+
+    store.show_editor.set(is_document);
+
+    if let Some(title) = title_opt {
+        store.node_title.set(title);
+    }
+
+    if is_document {
+        let content_bytes = content_bytes_opt.unwrap_or_default();
+        if let Some((s_id, n_id)) = sel_ids {
+            start_editing(store, s_id, n_id, &content_bytes);
+        }
+    } else {
+        stop_editing(store);
+    }
+    store.editor_dirty.set(false);
+}
+
+/// Cancel a pending debounce timer and reset the search box to empty/idle.
+/// Also drops the search box's Escape interceptor, installed by `oninput`
+/// only while the box is non-empty (see there) so it never fights the tree
+/// rename feature's own interceptor, which owns the same single global slot.
+fn clear_search(store: AppStore) {
+    if let Some(handle) = SEARCH_DEBOUNCE.with(|slot| slot.borrow_mut().take()) {
+        clear_timeout(handle);
+    }
+    store.search_query.set(String::new());
+    store.search_results.set(SearchState::Idle);
+    clear_keyboard_interceptor();
+}
+
+/// Debounce search-as-you-type by 250ms (per the step 5 contract) and dispatch
+/// a `BackendCommand::Search` over every open store when the timer fires.
+fn schedule_search(store: AppStore, query: String) {
+    if let Some(handle) = SEARCH_DEBOUNCE.with(|slot| slot.borrow_mut().take()) {
+        clear_timeout(handle);
+    }
+    if query.is_empty() {
+        store.search_results.set(SearchState::Idle);
+        return;
+    }
+    let timeout = set_timeout(250, move || {
+        SEARCH_DEBOUNCE.with(|slot| { slot.borrow_mut().take(); });
+        let stores = untracked(|| store.store_ids.get());
+        store.send(BackendCommand::Search { query, stores, limit: 50 });
+    });
+    SEARCH_DEBOUNCE.with(|slot| { *slot.borrow_mut() = Some(timeout); });
+}
+
+/// One search-result row, pre-resolved to plain fields the results panel
+/// renders directly — `SearchResultItem` itself isn't `PartialEq`, which the
+/// rsx `for` loop requires (see `rinch:rinch` Rule 9), and pimble-rpc isn't
+/// this crate's to change.
+#[derive(Clone, PartialEq)]
+struct SearchRow {
+    key: String,
+    value: String,
+    title: String,
+    store_name: String,
+    snippet: String,
+    kind: &'static str,
+}
+
+/// Resolve raw search hits into display-ready `SearchRow`s (looking up each
+/// store's name from already-cached signals — cheap, no new fetch). A plain
+/// function so the rsx `for`'s iterable expression is a bare call with no
+/// turbofish or closure braces for the macro's brace-stopping parser to trip
+/// on (see `parse_expr_before_brace` in rinch-macros).
+fn search_rows(store: AppStore, items: Vec<pimble_rpc::SearchResultItem>) -> Vec<SearchRow> {
+    items.into_iter().map(|item| SearchRow {
+        key: format!("{}_{}", item.store_id, item.node_id),
+        value: format!("node_{}_{}", item.store_id, item.node_id),
+        title: if item.title.is_empty() { "Untitled".to_string() } else { item.title },
+        store_name: store.get_store_signal(item.store_id)
+            .map(|sig| untracked(|| sig.with(|s| s.name.clone())))
+            .unwrap_or_default(),
+        snippet: item.snippet,
+        kind: kind_label(&item.kind),
+    }).collect()
+}
+
+/// A subtle, human-readable label for a search hit's `kind` (the index unit
+/// kind the hit's chunk carries: prose, a heading, code, a table row, or a
+/// structured field). Empty or unrecognized kinds render nothing.
+fn kind_label(kind: &str) -> &'static str {
+    match kind {
+        "prose" | "document" => "",
+        "heading" => "heading",
+        "code" => "code",
+        "table_row" | "table-row" | "tablerow" => "table row",
+        "field" => "field",
+        "folder" => "folder",
+        _ => "",
+    }
+}
 
 /// Walk the DOM subtree to find a `data-oncontextmenu` handler and copy it
 /// to `target`. Used to hoist the context menu handler from the invisible
@@ -124,6 +270,21 @@ pub fn run() {
     let view_menu = Menu::new()
         .item(MenuItem::new("Toggle Sidebar").shortcut("Ctrl+\\").on_click(|| {
             tracing::info!("Toggle sidebar");
+        }))
+        .separator()
+        .item(MenuItem::new("Focus Search").shortcut("Ctrl+K").on_click(|| {
+            SEARCH_INPUT.with(|cell| {
+                if let Some(handle) = cell.borrow().as_ref() {
+                    handle.focus();
+                }
+            });
+        }))
+        .item(MenuItem::new("Rebuild Search Index").on_click(move || {
+            let store_ids = untracked(|| store.store_ids.get());
+            tracing::info!("Rebuilding search index for {} store(s)", store_ids.len());
+            for store_id in store_ids {
+                store.send(BackendCommand::RebuildIndex { store_id });
+            }
         }))
         .separator()
         .item(MenuItem::new("Zoom In").shortcut("Ctrl+=").on_click(|| {}))
@@ -279,65 +440,9 @@ pub fn run() {
             // (The previously-edited node's changes already persisted live through
             // the collab delta relay — no explicit save-on-switch is needed.)
 
-            // Update selection and load new node
-            store.selected_id.set(Some(value.clone()));
-
-            let parsed = parse_tree_value(&value);
-            let (title_opt, content_bytes_opt, is_document, sel_ids) = if let Some((s_id, node_id_opt)) = parsed {
-                if let Some(n_id) = node_id_opt {
-                    let result = store.get_node_signal(s_id, n_id).map(|sig| {
-                        sig.with(|node| {
-                            let label = if !node.metadata.title.is_empty() {
-                                node.metadata.title.clone()
-                            } else {
-                                "Untitled".to_string()
-                            };
-                            let is_doc = node.node_type == pimble_core::node_types::DOCUMENT;
-                            (label, node.content.clone(), is_doc)
-                        })
-                    });
-                    match result {
-                        Some((label, content, is_doc)) => (Some(label), Some(content), is_doc, Some((s_id, n_id))),
-                        None => {
-                            store.send(BackendCommand::GetNode { store_id: s_id, node_id: n_id });
-                            (None, None, false, None)
-                        }
-                    }
-                } else {
-                    let title = store.get_store_signal(s_id)
-                        .map(|sig| sig.with(|s| s.name.clone()));
-                    match title {
-                        Some(t) => (Some(t), Some(Vec::new()), false, None),
-                        None => (None, None, false, None),
-                    }
-                }
-            } else {
-                (None, None, false, None)
-            };
-
-            tracing::debug!(
-                "Selection resolved: parsed={} is_document={} content_len={:?}",
-                parsed.is_some(),
-                is_document,
-                content_bytes_opt.as_ref().map(|c| c.len())
-            );
-            store.show_editor.set(is_document);
-
-            if let Some(title) = title_opt {
-                store.node_title.set(title);
-            }
-
-            // Load content into the editor and start a collaboration session
-            // (start_editing loads the content via guest-join or a fresh host).
-            if is_document {
-                let content_bytes = content_bytes_opt.unwrap_or_default();
-                if let Some((s_id, n_id)) = sel_ids {
-                    start_editing(store, s_id, n_id, &content_bytes);
-                }
-            } else {
-                stop_editing(store);
-            }
-            store.editor_dirty.set(false);
+            // Update selection and load new node — the same `open_node` a
+            // search-result click uses, so there is exactly one way to open one.
+            open_node(store, tree_state, value);
         });
 
         let on_tree_expand = ValueCallback::new(move |value: String| {
@@ -921,6 +1026,112 @@ pub fn run() {
             }
         });
 
+        // ── Search box + results panel ────────────────────────────────
+        // The results panel replaces the tree while `search_query` is
+        // non-empty; Esc (via `clear_search`'s interceptor) restores it.
+        let search_icon = render_tabler_icon(__scope, TablerIcon::Search, TablerIconStyle::Outline);
+        let search_input = rsx! {
+            input {
+                r#type: "text",
+                class: "pimble-search-bar__input",
+                placeholder: "Search... (Ctrl+K)",
+                // Raw elements have no special "value_fn" prop — that's a
+                // `TextInput`-component-only field. On a raw `<input>` any
+                // closure-valued prop just becomes a reactively-set attribute
+                // named literally after the prop, so `value_fn` was writing a
+                // phantom `value_fn` attribute the renderer never reads
+                // (`paint_input_value` only reads `"value"`). Bind `value`
+                // itself so clearing the signal actually clears the box.
+                value: move || store.search_query.get(),
+                oninput: move |val: String| {
+                    let was_empty = untracked(|| store.search_query.get()).is_empty();
+                    let now_empty = val.is_empty();
+                    store.search_query.set(val.clone());
+                    if was_empty && !now_empty {
+                        // Only while the box is non-empty — see `clear_search`.
+                        set_keyboard_interceptor(move |data| {
+                            if data.key == "Escape" {
+                                rinch::run_on_main_thread(move || clear_search(store));
+                                return true;
+                            }
+                            false
+                        });
+                    } else if !was_empty && now_empty {
+                        clear_keyboard_interceptor();
+                    }
+                    schedule_search(store, val);
+                },
+                onsubmit: move || {
+                    let first = untracked(|| match store.search_results.get() {
+                        SearchState::Results(items) => items.into_iter().next(),
+                        _ => None,
+                    });
+                    if let Some(item) = first {
+                        let value = format!("node_{}_{}", item.store_id, item.node_id);
+                        clear_search(store);
+                        open_node(store, tree_state, value);
+                    }
+                },
+            }
+        };
+        SEARCH_INPUT.with(|cell| { *cell.borrow_mut() = Some(search_input.clone()); });
+
+        let search_bar = rsx! {
+            div {
+                class: "pimble-search-bar",
+                span { class: "pimble-search-bar__icon", {search_icon} }
+                {search_input}
+                if !store.search_query.get().is_empty() {
+                    ActionIcon {
+                        icon: TablerIcon::X,
+                        variant: "subtle",
+                        size: "xs",
+                        class: "pimble-search-bar__clear",
+                        onclick: move || clear_search(store),
+                    }
+                }
+            }
+        };
+
+        let search_panel = rsx! {
+            div {
+                class: "pimble-search-results",
+                match store.search_results.get() {
+                    SearchState::Idle => "",
+                    SearchState::Error(_message) => div {
+                        class: "pimble-search-results__message", {_message}
+                    },
+                    SearchState::Results(items) if items.is_empty() => div {
+                        class: "pimble-search-results__message", "No results"
+                    },
+                    SearchState::Results(_items) => div {
+                        for row in search_rows(store, _items.clone()) {
+                            div {
+                                key: row.key.clone(),
+                                class: "pimble-search-result",
+                                onclick: {
+                                    let value = row.value.clone();
+                                    move || {
+                                        clear_search(store);
+                                        open_node(store, tree_state, value.clone());
+                                    }
+                                },
+                                div {
+                                    class: "pimble-search-result__title-row",
+                                    span { class: "pimble-search-result__title", {row.title.clone()} }
+                                    if !row.kind.is_empty() {
+                                        span { class: "pimble-search-result__kind", {row.kind} }
+                                    }
+                                }
+                                div { class: "pimble-search-result__store", {row.store_name.clone()} }
+                                div { class: "pimble-search-result__snippet", {row.snippet.clone()} }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
         // Spawn the backend now that the UI and event loop are fully set up.
         // The EVENT_PROCESSOR thread-local is already registered, so signal_ui
         // callbacks will be processed correctly via run_on_main_thread.
@@ -953,6 +1164,8 @@ pub fn run() {
                 div {
                     style: "display: flex; flex-direction: column; height: 100%;",
 
+                    {search_bar}
+
                     // ── Main content ──────────────────────────────
                     div {
                         style: "display: flex; flex: 1; overflow: hidden;",
@@ -978,7 +1191,14 @@ pub fn run() {
                                 }
                             }
 
-                            {tree_scroll}
+                            div {
+                                style: {|| if store.search_query.get().is_empty() { "" } else { "display: none;" }},
+                                {tree_scroll}
+                            }
+                            div {
+                                style: {|| if store.search_query.get().is_empty() { "display: none;" } else { "" }},
+                                {search_panel}
+                            }
                         }
 
                         // ── Editor panel ──────────────────────────

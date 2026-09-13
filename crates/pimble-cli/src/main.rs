@@ -74,6 +74,23 @@ async fn main() -> Result<()> {
             }
             show_node(&args[2], &args[3]).await?;
         }
+        "search" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pimble-cli search <query>");
+                return Ok(());
+            }
+            // Join remaining args so a multi-word query doesn't need quoting
+            // tricks beyond normal shell quoting of args[2].
+            let query = args[2..].join(" ");
+            search(&query).await?;
+        }
+        "rebuild-index" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pimble-cli rebuild-index <store-id>");
+                return Ok(());
+            }
+            rebuild_index(&args[2]).await?;
+        }
         _ => {
             eprintln!("Unknown command: {}", command);
             print_help();
@@ -100,6 +117,8 @@ COMMANDS:
     create-node         Create a node in a store
     set-node-text       Set a node's content from plain text
     show-node           Print a node's metadata and content text
+    search              Search across all open stores
+    rebuild-index       Rebuild a store's search index from scratch
 
 EXAMPLES:
     pimble-cli server
@@ -110,6 +129,8 @@ EXAMPLES:
     pimble-cli create-node <store-id> <parent-id> document "My Note"
     pimble-cli set-node-text <store-id> <node-id> "Hello, world"
     pimble-cli show-node <store-id> <node-id>
+    pimble-cli search "hello"
+    pimble-cli rebuild-index <store-id>
 "#
     );
 }
@@ -206,6 +227,32 @@ async fn show_node(store_id: &str, node_id: &str) -> Result<()> {
     println!("Children: {}", node.children.len());
     println!("--- content ---");
     println!("{}", ContentDoc::text_of(&node.content));
+    Ok(())
+}
+
+async fn search(query: &str) -> Result<()> {
+    let client = connect().await?;
+    // Empty store list = search all open stores.
+    let results = client.search(query, Vec::new(), true, 20).await?;
+
+    if results.is_empty() {
+        println!("No results for '{}'", query);
+    } else {
+        println!("{} result(s) for '{}':", results.len(), query);
+        for r in results {
+            println!("  [{}] {} ({})", r.kind, r.title, r.store_id);
+            println!("      {}", r.snippet);
+        }
+    }
+    Ok(())
+}
+
+async fn rebuild_index(store_id: &str) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+
+    let client = connect().await?;
+    let indexed = client.rebuild_index(store_id).await?;
+    println!("Rebuilt index for store {}: {} node(s) indexed", store_id, indexed);
     Ok(())
 }
 

@@ -21,6 +21,18 @@ pub struct PendingMount {
     pub source_path: String,
 }
 
+/// Current state of the search box: idle (query empty), the last successful
+/// results (possibly empty), or an error/status message from the server (a
+/// connection failure, or the index still building — `SearchError::IndexBuilding`
+/// arrives as a plain RPC error whose text already says so, so it displays as-is).
+#[derive(Debug, Clone, Default)]
+pub enum SearchState {
+    #[default]
+    Idle,
+    Results(Vec<pimble_rpc::SearchResultItem>),
+    Error(String),
+}
+
 /// Mount metadata for a tree node.
 #[derive(Debug, Clone)]
 pub struct MountInfo {
@@ -149,6 +161,10 @@ pub struct AppStore {
     // This client's unique ID (for echo suppression in notifications)
     pub client_id: Signal<String>,
 
+    // Search: the toolbar search box's text and the last response for it.
+    // The results panel replaces the tree whenever `search_query` is non-empty.
+    pub search_query: Signal<String>,
+    pub search_results: Signal<SearchState>,
 }
 
 /// Identifies the node currently open in the shared editor.
@@ -185,6 +201,8 @@ impl AppStore {
             active_edit: Signal::new(None),
             live_label: Signal::new(HashMap::new()),
             client_id: Signal::new(String::new()),
+            search_query: Signal::new(String::new()),
+            search_results: Signal::new(SearchState::Idle),
         }
     }
 

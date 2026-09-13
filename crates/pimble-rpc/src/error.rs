@@ -21,6 +21,12 @@ pub enum RpcError {
 
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    /// The store's search index is still building (e.g. a backfilling
+    /// fulltext or vector index); `done`/`total` report progress so the UI
+    /// can say so instead of treating this as a generic failure.
+    #[error("Search index is still building ({done}/{total})")]
+    IndexBuilding { done: usize, total: usize },
 }
 
 impl RpcError {
@@ -32,6 +38,7 @@ impl RpcError {
             RpcError::Store(_) => -32001,
             RpcError::Node(_) => -32002,
             RpcError::Serialization(_) => -32700,
+            RpcError::IndexBuilding { .. } => -32010,
         }
     }
 }

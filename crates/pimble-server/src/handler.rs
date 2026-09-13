@@ -1,28 +1,39 @@
 //! RPC method handlers
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use jsonrpsee::core::{async_trait, SubscriptionResult};
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{PendingSubscriptionSink, SubscriptionMessage};
-use pimble_core::{Node, MountRef, NodeId, StoreId, Workspace};
+use pimble_core::{Node, MountRef, NodeId, StoreId, StoreLocation, Workspace};
+use pimble_plugins::PluginHost;
 use pimble_rpc::{
-    to_rpc_error, ApplyEditRequest, ApplyEditResponse, ApplyStoreUpdateRequest, CloseStoreRequest,
-    CreateMountRequest, CreateMountResponse, CreateNodeRequest, CreateNodeResponse,
-    CreateStoreRequest, CreateStoreResponse, CreateWorkspaceRequest, DeleteNodeRequest,
-    EditOperation, EmptyResponse, GetChildrenRequest, GetChildrenResponse, GetMountStateRequest,
-    GetMountStateResponse, GetNodeRequest, GetNodeResponse, GetNodesRequest, GetNodesResponse,
-    ListStoresResponse, LoadWorkspaceRequest, LoadWorkspaceResponse, MoveNodeRequest,
-    NodeContentChangedNotification, OpenStoreRequest, OpenStoreResponse, PimbleApiServer,
-    SaveWorkspaceRequest, SearchRequest, SearchResponse, StoreChangeKind, StoreChangedNotification,
-    SyncNodeContentRequest, SyncNodeContentResponse, SyncStoreDocumentRequest,
-    SyncStoreDocumentResponse, UpdateNodeContentRequest, UpdateNodeMetadataRequest,
+    index_building_error, to_rpc_error, ApplyEditRequest, ApplyEditResponse,
+    ApplyStoreUpdateRequest, CloseStoreRequest, CreateMountRequest, CreateMountResponse,
+    CreateNodeRequest, CreateNodeResponse, CreateStoreRequest, CreateStoreResponse,
+    CreateWorkspaceRequest, DeleteNodeRequest, EditOperation, EmptyResponse, GetChildrenRequest,
+    GetChildrenResponse, GetMountStateRequest, GetMountStateResponse, GetNodeRequest,
+    GetNodeResponse, GetNodesRequest, GetNodesResponse, ListStoresResponse, LoadWorkspaceRequest,
+    LoadWorkspaceResponse, MoveNodeRequest, NodeContentChangedNotification, OpenStoreRequest,
+    OpenStoreResponse, PimbleApiServer, RebuildIndexRequest, RebuildIndexResponse,
+    SaveWorkspaceRequest, SearchRequest, SearchResponse, SearchResultItem, StoreChangeKind,
+    StoreChangedNotification, SyncNodeContentRequest, SyncNodeContentResponse,
+    SyncStoreDocumentRequest, SyncStoreDocumentResponse, UpdateNodeContentRequest,
+    UpdateNodeMetadataRequest,
 };
+use pimble_search::{IndexNode, SearchError, SearchIndex, SearchQuery};
 use pimble_store::StoreManager;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
+
+/// How long to wait, after a node's content last changed, before reading its
+/// units and upserting them into the search index. `applyEdit` fires on every
+/// keystroke; this coalesces a burst of edits into one re-index per node,
+/// independent of the (unrelated) content-flush debounce above.
+const CONTENT_INDEX_DEBOUNCE: Duration = Duration::from_millis(2_000);
 
 /// How long to wait after a content edit before flushing it to disk. A burst
 /// of keystrokes coalesces into at most one flush per window, instead of one
@@ -40,6 +51,193 @@ struct FlushDebouncer {
     pending: Mutex<HashSet<StoreId>>,
     /// Whether a flush task is currently sleeping/running.
     scheduled: Mutex<bool>,
+}
+
+// ── Search index feed ──────────────────────────────────────────────────
+
+/// In-process notification fed to a store's [`StoreIndexer`] task, enqueued
+/// next to the existing `notify_store_change`/`notify_node_content_change`
+/// calls (never over the WebSocket). `Upsert` and `Remove` are applied
+/// immediately; `ContentChanged` is debounced per node.
+enum IndexEvent {
+    /// A node's metadata, tree position, or existence changed (created,
+    /// title/tags edited, or moved — moving re-upserts the node with its new
+    /// `parent`). Applied immediately: cheap and infrequent relative to
+    /// keystrokes.
+    Upsert(NodeId),
+    /// A node's content changed (`applyEdit`/`updateNodeContent`). Debounced
+    /// [`CONTENT_INDEX_DEBOUNCE`] per node so a burst of keystrokes re-indexes
+    /// once, not per edit.
+    ContentChanged(NodeId),
+    /// A node was deleted.
+    Remove(NodeId),
+}
+
+/// A store's open search index plus the channel that feeds its indexing
+/// task.
+struct IndexHandle {
+    index: Arc<SearchIndex>,
+    events: mpsc::UnboundedSender<IndexEvent>,
+}
+
+/// Owns one store's [`SearchIndex`] and reduces the store's mutations
+/// (`IndexEvent`s) into `upsert`/`remove` calls on it. One instance is
+/// spawned as a tokio task per open store.
+struct StoreIndexer {
+    store_id: StoreId,
+    index: Arc<SearchIndex>,
+    store_manager: Arc<RwLock<StoreManager>>,
+    plugin_host: Arc<PluginHost>,
+    /// Per-node debounce generation: `schedule_content_upsert` increments a
+    /// node's counter and captures it; the sleeping task that follows only
+    /// does the work if its captured value is still current when it wakes,
+    /// so a newer edit silently supersedes an older, still-sleeping one.
+    content_gen: Mutex<HashMap<NodeId, u64>>,
+}
+
+impl StoreIndexer {
+    /// Drive `rx` until the sender side (the store's `IndexHandle`) is
+    /// dropped, e.g. on `closeStore`.
+    async fn run(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<IndexEvent>) {
+        while let Some(event) = rx.recv().await {
+            match event {
+                IndexEvent::Upsert(node_id) => {
+                    if let Err(e) = self.upsert_now(node_id).await {
+                        warn!("Indexing node {} in store {} failed: {}", node_id, self.store_id, e);
+                    }
+                }
+                IndexEvent::Remove(node_id) => {
+                    if let Err(e) = self.index.remove(node_id) {
+                        warn!("Removing node {} from index for store {} failed: {}", node_id, self.store_id, e);
+                    }
+                }
+                IndexEvent::ContentChanged(node_id) => {
+                    Arc::clone(&self).schedule_content_upsert(node_id);
+                }
+            }
+        }
+    }
+
+    /// Bump `node_id`'s debounce generation and spawn a task that, after
+    /// [`CONTENT_INDEX_DEBOUNCE`], re-indexes the node if no newer edit has
+    /// arrived in the meantime.
+    fn schedule_content_upsert(self: Arc<Self>, node_id: NodeId) {
+        let generation = {
+            let mut gens = self.content_gen.lock().unwrap();
+            let g = gens.entry(node_id).or_insert(0);
+            *g += 1;
+            *g
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(CONTENT_INDEX_DEBOUNCE).await;
+            let still_current = {
+                let gens = self.content_gen.lock().unwrap();
+                gens.get(&node_id).copied() == Some(generation)
+            };
+            if still_current {
+                if let Err(e) = self.upsert_now(node_id).await {
+                    warn!("Indexing node {} in store {} failed: {}", node_id, self.store_id, e);
+                }
+            }
+        });
+    }
+
+    /// Fetch `node_id` fresh from the store and upsert it into the index.
+    /// A node that no longer exists (deleted, or the store closed, before
+    /// this ran) is silently skipped rather than treated as an error.
+    async fn upsert_now(&self, node_id: NodeId) -> pimble_search::Result<()> {
+        let node = {
+            let mut manager = self.store_manager.write().await;
+            match manager.get_node(self.store_id, node_id).await {
+                Ok(node) => node,
+                Err(_) => return Ok(()),
+            }
+        };
+        let index_node = build_index_node(&node, &self.plugin_host);
+        self.index.upsert(&index_node)
+    }
+}
+
+/// The title a search result shows for `node`, given its already-projected
+/// `content_text` (the same joined-units text as `IndexNode::text`): an
+/// explicit title wins; otherwise the first non-empty line of the content
+/// (truncated to 25 chars with "…"); otherwise the raw title; otherwise
+/// `"Untitled"`. This is also what gets written to `IndexNode.title`, so
+/// title search matches the same fallback.
+///
+/// Exactly mirrors `pimble_app::state::label_from_title_and_content` (the
+/// tree's display label), so a search result's title agrees with what the
+/// tree shows for a node with no explicit title. Duplicated here rather than
+/// shared through a `pimble-core` helper: this step's scope excludes editing
+/// `pimble-core` or `pimble-app`, so the ~20 lines are copied verbatim
+/// instead of factored out.
+fn index_title(node: &Node, content_text: &str) -> String {
+    let has_explicit_title = node
+        .metadata
+        .custom
+        .get("explicit_title")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let title = &node.metadata.title;
+
+    if has_explicit_title && !title.is_empty() {
+        return title.clone();
+    }
+
+    let first_line = content_text
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if !first_line.is_empty() {
+        let char_count = first_line.chars().count();
+        return if char_count > 25 {
+            let truncated: String = first_line.chars().take(25).collect();
+            format!("{truncated}…")
+        } else {
+            first_line.to_string()
+        };
+    }
+
+    if !title.is_empty() {
+        return title.clone();
+    }
+
+    "Untitled".to_string()
+}
+
+/// Project a [`Node`] into the search index's [`IndexNode`]: metadata plus
+/// its content's [`pimble_core::IndexUnit`]s, from the node type's plugin
+/// (`ContentDoc::units()` for `document` nodes, via `DocumentPlugin`). A node
+/// type with no registered plugin (e.g. `mount`) indexes with no units/text.
+fn build_index_node(node: &Node, plugin_host: &PluginHost) -> IndexNode {
+    let units = plugin_host
+        .get(&node.node_type)
+        .and_then(|plugin| plugin.index_units(&node.content).ok())
+        .unwrap_or_default();
+    let text = units
+        .iter()
+        .map(|u| u.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let title = index_title(node, &text);
+    let links = node
+        .links
+        .iter()
+        .filter_map(|link| link.target.node_id())
+        .collect();
+
+    IndexNode {
+        node_id: node.id,
+        kind: node.node_type.clone(),
+        title,
+        text,
+        modified_at: node.metadata.modified_at.timestamp_millis(),
+        parent: node.parent_id,
+        tags: node.metadata.tags.clone(),
+        links,
+        units,
+    }
 }
 
 /// Manages active subscription sinks for pushing notifications.
@@ -128,6 +326,12 @@ pub struct RpcHandler {
     store_manager: Arc<RwLock<StoreManager>>,
     subscriptions: Arc<RwLock<SubscriptionRegistry>>,
     flush_debouncer: Arc<FlushDebouncer>,
+    /// Built-in node-type plugins (document, folder), shared across every
+    /// store, used to project a node's content into `IndexUnit`s for search.
+    plugin_host: Arc<PluginHost>,
+    /// One open `SearchIndex` per open store, under `<store dir>/index/rhypedb/`.
+    /// Opened when a store opens, closed (removed) when it closes.
+    indexes: Arc<RwLock<HashMap<StoreId, IndexHandle>>>,
 }
 
 impl RpcHandler {
@@ -136,6 +340,8 @@ impl RpcHandler {
             store_manager,
             subscriptions: Arc::new(RwLock::new(SubscriptionRegistry::new())),
             flush_debouncer: Arc::new(FlushDebouncer::default()),
+            plugin_host: Arc::new(pimble_plugins::create_default_host()),
+            indexes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -213,6 +419,156 @@ impl RpcHandler {
         registry.notify_node_change(&node_notif).await;
         registry.notify_store_change(&store_notif).await;
     }
+
+    // ── Search index feed ────────────────────────────────────────────
+
+    /// Send an [`IndexEvent`] to `store_id`'s indexing task, if one is open.
+    /// A store with indexing not (yet) available (index open/rebuild failed)
+    /// silently has no handle and this is a no-op — search over that store
+    /// just returns nothing until the next successful open.
+    async fn enqueue_index_event(&self, store_id: StoreId, event: IndexEvent) {
+        let indexes = self.indexes.read().await;
+        if let Some(handle) = indexes.get(&store_id) {
+            // An unbounded channel only fails to send if the receiving task
+            // has ended (e.g. a race with `closeStore`); harmless to drop.
+            let _ = handle.events.send(event);
+        }
+    }
+
+    /// The directory a store's search index lives in:
+    /// `<store dir>/index/rhypedb/`. Only local stores have one.
+    async fn index_dir_for(&self, store_id: StoreId) -> anyhow::Result<PathBuf> {
+        let store = self.store_manager.read().await.get_store_info(store_id)?;
+        match store.location {
+            StoreLocation::Local { path } => Ok(path.join("index").join("rhypedb")),
+            StoreLocation::Remote { .. } | StoreLocation::Mounted { .. } => {
+                anyhow::bail!("store {} has no local directory; it has no local search index", store_id)
+            }
+        }
+    }
+
+    /// Wrap an opened [`SearchIndex`] in a fresh [`StoreIndexer`] task and
+    /// install it as `store_id`'s current [`IndexHandle`], replacing (and
+    /// thereby stopping) any previous one for that store.
+    async fn install_index_handle(&self, store_id: StoreId, index: Arc<SearchIndex>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let indexer = Arc::new(StoreIndexer {
+            store_id,
+            index: Arc::clone(&index),
+            store_manager: Arc::clone(&self.store_manager),
+            plugin_host: Arc::clone(&self.plugin_host),
+            content_gen: Mutex::new(HashMap::new()),
+        });
+        tokio::spawn(indexer.run(rx));
+        self.indexes.write().await.insert(store_id, IndexHandle { index, events: tx });
+    }
+
+    /// Walk every node in `store_id` from its root (mount nodes are indexed
+    /// themselves but not descended into — their children belong to another
+    /// store) and upsert each into `index`. Returns the count indexed.
+    async fn reindex_all_nodes(&self, store_id: StoreId, index: &SearchIndex) -> anyhow::Result<usize> {
+        let root_id = self.store_manager.read().await.root_node_id(store_id)?;
+        let mut manager = self.store_manager.write().await;
+        let mut stack = vec![root_id];
+        let mut count = 0usize;
+        while let Some(node_id) = stack.pop() {
+            let node = manager.get_node(store_id, node_id).await?;
+            let index_node = build_index_node(&node, &self.plugin_host);
+            index.upsert(&index_node)?;
+            count += 1;
+            if !node.is_mount() {
+                stack.extend(node.children.iter().copied());
+            }
+        }
+        Ok(count)
+    }
+
+    /// Open (or rebuild, if missing or schema-stale) `store_id`'s search
+    /// index and install it. Called when a store opens; logs and leaves the
+    /// store without a search index on failure rather than failing the open.
+    ///
+    /// Schema drift is detected by diffing `SCHEMA_HASH_FILE`'s content
+    /// before vs. after a successful [`SearchIndex::open`] call, rather than
+    /// pre-computing an "expected" hash ourselves: `open` internally ANDs
+    /// the `semantic` bool we pass it with its own crate's `semantic`
+    /// feature (a cfg gate this crate cannot observe from outside), then
+    /// composes and persists the schema that's actually in effect. `true` is
+    /// always passed through unconditionally — never gated here — matching
+    /// what `open` alone can decide. Before/after diffing sidesteps needing
+    /// to replicate that gate: whatever `open` just wrote is definitionally
+    /// correct for this build, whether or not `semantic` ends up honored.
+    async fn open_index_for_store(&self, store_id: StoreId) -> anyhow::Result<()> {
+        let index_dir = self.index_dir_for(store_id).await?;
+        let hash_path = index_dir.join(pimble_search::SCHEMA_HASH_FILE);
+        let old_hash = std::fs::read_to_string(&hash_path).ok();
+
+        let index = match SearchIndex::open(&index_dir, true) {
+            Ok(index) => index,
+            Err(e) => {
+                // `Database::open` couldn't tolerate whatever is on disk
+                // (typically a schema mismatch from an older build): wipe
+                // the directory and start fresh rather than fail the store
+                // open over a derived, rebuildable index.
+                warn!(
+                    "Search index open failed for store {} ({}); rebuilding the index from scratch",
+                    store_id, e
+                );
+                if index_dir.exists() {
+                    std::fs::remove_dir_all(&index_dir)?;
+                }
+                SearchIndex::open(&index_dir, true)?
+            }
+        };
+
+        let new_hash = std::fs::read_to_string(&hash_path).ok();
+        let needs_rebuild = old_hash.is_none() || old_hash != new_hash;
+
+        let index = if needs_rebuild {
+            // `SearchIndex::clear()` deletes `Node`s in scan order without
+            // regard for `Node.parent` still referencing an as-yet-undeleted
+            // parent, and rhypedb's delete-restrict policy rejects that
+            // (`delete denied: Node:N is referenced by Node.parent`) —
+            // reported upstream (see report to Agent A/team lead). Route
+            // around it: drop this handle (releasing its file lock) and
+            // recreate the directory from scratch instead of calling
+            // `clear()` on a populated index.
+            drop(index);
+            std::fs::remove_dir_all(&index_dir)?;
+            let fresh = SearchIndex::open(&index_dir, true)?;
+            let count = self.reindex_all_nodes(store_id, &fresh).await?;
+            info!("Rebuilt search index for store {}: {} node(s) indexed", store_id, count);
+            fresh
+        } else {
+            index
+        };
+
+        self.install_index_handle(store_id, Arc::new(index)).await;
+        Ok(())
+    }
+
+    /// Delete and rebuild `store_id`'s search index from scratch. Returns the
+    /// number of nodes indexed.
+    ///
+    /// Deletes the directory and reopens fresh rather than calling
+    /// `SearchIndex::clear()`, which cannot yet delete a `Node` another
+    /// `Node.parent` still references (see `open_index_for_store`'s doc
+    /// comment). Drops any existing handle first so its `Arc<SearchIndex>`
+    /// starts releasing its file lock before the directory is removed; a
+    /// background upsert from the outgoing indexer task landing mid-delete
+    /// is a benign, logged no-op (same acceptable race `closeStore` already
+    /// has with in-flight debounced upserts).
+    async fn rebuild_store_index(&self, store_id: StoreId) -> anyhow::Result<usize> {
+        self.indexes.write().await.remove(&store_id);
+
+        let index_dir = self.index_dir_for(store_id).await?;
+        if index_dir.exists() {
+            std::fs::remove_dir_all(&index_dir)?;
+        }
+        let index = Arc::new(SearchIndex::open(&index_dir, true)?);
+        let count = self.reindex_all_nodes(store_id, &index).await?;
+        self.install_index_handle(store_id, index).await;
+        Ok(count)
+    }
 }
 
 #[async_trait]
@@ -232,6 +588,13 @@ impl PimbleApiServer for RpcHandler {
         let root_node_id = manager
             .root_node_id(store_id)
             .map_err(to_rpc_error)?;
+
+        drop(manager);
+        if !self.indexes.read().await.contains_key(&store_id) {
+            if let Err(e) = self.open_index_for_store(store_id).await {
+                warn!("Failed to open search index for store {}: {}", store_id, e);
+            }
+        }
 
         Ok(CreateStoreResponse {
             store_id,
@@ -255,6 +618,16 @@ impl PimbleApiServer for RpcHandler {
             .get_store_info(store_id)
             .map_err(to_rpc_error)?;
 
+        drop(manager);
+        // `open_local_store` returns the id of an already-open store as-is
+        // (no-op); skip re-opening its index so we never call
+        // `SearchIndex::open` twice concurrently on the same directory.
+        if !self.indexes.read().await.contains_key(&store_id) {
+            if let Err(e) = self.open_index_for_store(store_id).await {
+                warn!("Failed to open search index for store {}: {}", store_id, e);
+            }
+        }
+
         Ok(OpenStoreResponse { store })
     }
 
@@ -273,6 +646,10 @@ impl PimbleApiServer for RpcHandler {
 
         // Clean up subscriptions for this store
         self.subscriptions.write().await.remove_store(request.store_id);
+        // Dropping the handle drops its event sender, ending the store's
+        // indexing task; the `Arc<SearchIndex>` itself closes once every
+        // in-flight debounced-upsert task referencing it finishes.
+        self.indexes.write().await.remove(&request.store_id);
 
         Ok(EmptyResponse {})
     }
@@ -353,6 +730,7 @@ impl PimbleApiServer for RpcHandler {
 
         drop(manager);
         self.notify_store_change(request.store_id, StoreChangeKind::NodeCreated { node_id }, None).await;
+        self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
 
         Ok(CreateNodeResponse { node_id })
     }
@@ -379,6 +757,7 @@ impl PimbleApiServer for RpcHandler {
 
         drop(manager);
         self.notify_store_change(request.store_id, StoreChangeKind::MetadataUpdated { node_id: request.node_id }, None).await;
+        self.enqueue_index_event(request.store_id, IndexEvent::Upsert(request.node_id)).await;
 
         Ok(EmptyResponse {})
     }
@@ -410,6 +789,7 @@ impl PimbleApiServer for RpcHandler {
 
         drop(manager);
         self.notify_node_content_change(request.store_id, request.node_id, request.client_id.as_deref(), None).await;
+        self.enqueue_index_event(request.store_id, IndexEvent::ContentChanged(request.node_id)).await;
 
         Ok(EmptyResponse {})
     }
@@ -431,6 +811,7 @@ impl PimbleApiServer for RpcHandler {
 
         drop(manager);
         self.notify_store_change(request.store_id, StoreChangeKind::NodeDeleted { node_id: request.node_id }, None).await;
+        self.enqueue_index_event(request.store_id, IndexEvent::Remove(request.node_id)).await;
 
         Ok(EmptyResponse {})
     }
@@ -457,6 +838,8 @@ impl PimbleApiServer for RpcHandler {
 
         drop(manager);
         self.notify_store_change(request.store_id, StoreChangeKind::NodeMoved { node_id: request.node_id }, None).await;
+        // Re-upsert the moved node: its `parent` relationship is what changed.
+        self.enqueue_index_event(request.store_id, IndexEvent::Upsert(request.node_id)).await;
 
         Ok(EmptyResponse {})
     }
@@ -516,6 +899,12 @@ impl PimbleApiServer for RpcHandler {
             .flush(request.store_id)
             .await
             .map_err(to_rpc_error)?;
+
+        drop(manager);
+        // No existing `notify_store_change` call sits next to this one (a
+        // pre-existing gap, out of this step's scope) but the mount node
+        // should still be indexed.
+        self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
 
         Ok(CreateMountResponse { node_id })
     }
@@ -736,6 +1125,10 @@ impl PimbleApiServer for RpcHandler {
             Some(request.operation),
         ).await;
 
+        // Content upserts are debounced per node (2s) here, independent of
+        // the disk-flush debounce above: `applyEdit` fires per keystroke.
+        self.enqueue_index_event(request.store_id, IndexEvent::ContentChanged(request.node_id)).await;
+
         Ok(ApplyEditResponse {})
     }
 
@@ -772,10 +1165,79 @@ impl PimbleApiServer for RpcHandler {
     ) -> Result<SearchResponse, ErrorObjectOwned> {
         debug!("Searching for '{}'", request.query);
 
-        // TODO: Implement search
-        Ok(SearchResponse {
-            results: Vec::new(),
-            total: 0,
-        })
+        let limit = request.limit.max(1);
+        let query = SearchQuery {
+            text: request.query.clone(),
+            semantic: request.semantic,
+            limit,
+        };
+
+        // Empty request.stores means every open store.
+        let store_ids: Vec<StoreId> = if request.stores.is_empty() {
+            self.indexes.read().await.keys().copied().collect()
+        } else {
+            request.stores.clone()
+        };
+
+        let mut hits: Vec<(StoreId, pimble_search::SearchHit)> = Vec::new();
+        {
+            let indexes = self.indexes.read().await;
+            for store_id in &store_ids {
+                let Some(handle) = indexes.get(store_id) else {
+                    continue; // no index open for this store; nothing to search
+                };
+                match handle.index.search(&query) {
+                    Ok(store_hits) => hits.extend(store_hits.into_iter().map(|h| (*store_id, h))),
+                    Err(SearchError::IndexBuilding { done, total }) => {
+                        return Err(index_building_error(done as usize, total as usize));
+                    }
+                    Err(e) => return Err(to_rpc_error(e)),
+                }
+            }
+        }
+
+        // Merge by score across stores, then take the overall top `limit`.
+        hits.sort_by(|a, b| b.1.score.partial_cmp(&a.1.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.truncate(limit);
+
+        // Look up each hit's node type (the index's own `kind` field means
+        // the matched chunk's kind here, not the node type — see
+        // `SearchResultItem::node_type`).
+        let mut manager = self.store_manager.write().await;
+        let mut results = Vec::with_capacity(hits.len());
+        for (store_id, hit) in &hits {
+            let node_type = manager
+                .get_node(*store_id, hit.node_id)
+                .await
+                .map(|n| n.node_type)
+                .unwrap_or_default();
+            results.push(SearchResultItem {
+                node_id: hit.node_id,
+                store_id: *store_id,
+                score: hit.score,
+                title: hit.title.clone(),
+                snippet: hit.snippet.clone(),
+                kind: hit.kind.clone(),
+                node_type,
+                path: hit.path.clone().unwrap_or_default(),
+            });
+        }
+
+        let total = results.len();
+        Ok(SearchResponse { results, total })
+    }
+
+    async fn rebuild_index(
+        &self,
+        request: RebuildIndexRequest,
+    ) -> Result<RebuildIndexResponse, ErrorObjectOwned> {
+        info!("Rebuilding search index for store {}", request.store_id);
+
+        let indexed = self
+            .rebuild_store_index(request.store_id)
+            .await
+            .map_err(to_rpc_error)?;
+
+        Ok(RebuildIndexResponse { indexed })
     }
 }

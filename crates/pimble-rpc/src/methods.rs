@@ -148,9 +148,27 @@ pub trait PimbleApi {
     /// Search across stores
     #[method(name = "search")]
     async fn search(&self, request: SearchRequest) -> Result<SearchResponse, ErrorObjectOwned>;
+
+    /// Rebuild a store's search index from scratch: delete the on-disk
+    /// index and re-index every node from the store's documents. Returns
+    /// the number of nodes indexed.
+    #[method(name = "rebuildIndex")]
+    async fn rebuild_index(&self, request: RebuildIndexRequest) -> Result<RebuildIndexResponse, ErrorObjectOwned>;
 }
 
 /// Helper function to convert any error to ErrorObjectOwned
 pub fn to_rpc_error(e: impl std::fmt::Display) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(-32000, e.to_string(), None::<()>)
+}
+
+/// A store's search index is still building (backfilling a fulltext or
+/// vector index). Carries `done`/`total` progress so the client can show a
+/// "still indexing" state instead of a generic error.
+pub fn index_building_error(done: usize, total: usize) -> ErrorObjectOwned {
+    let err = crate::RpcError::IndexBuilding { done, total };
+    ErrorObjectOwned::owned(
+        err.code(),
+        err.to_string(),
+        Some(serde_json::json!({ "done": done, "total": total })),
+    )
 }

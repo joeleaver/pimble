@@ -1,5 +1,6 @@
 //! Plugin interface definitions
 
+use pimble_core::{IndexUnit, UnitKind};
 use serde::{Deserialize, Serialize};
 
 use crate::PluginError;
@@ -147,6 +148,21 @@ pub trait NodePlugin: Send + Sync {
 
     /// Extract searchable text from content
     fn extract_text(&self, content: &[u8]) -> Result<String, PluginError>;
+
+    /// Index units for this node's content: the search index's chunk-able pieces
+    /// (see [`pimble_core::IndexUnit`]). The default wraps [`NodePlugin::extract_text`]
+    /// in a single [`UnitKind::Prose`] unit (empty text yields no units), so every
+    /// plugin is indexable with no extra work; a plugin with real internal
+    /// structure overrides this (the built-in document plugin delegates to
+    /// `ContentDoc::units()`).
+    fn index_units(&self, content: &[u8]) -> Result<Vec<IndexUnit>, PluginError> {
+        let text = self.extract_text(content)?;
+        if text.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Ok(vec![IndexUnit::new(UnitKind::Prose, "b:0", text)])
+        }
+    }
 
     /// Validate content against schema
     fn validate(&self, content: &[u8]) -> Result<ValidationResult, PluginError>;

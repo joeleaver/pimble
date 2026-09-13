@@ -11,7 +11,7 @@ use pimble_rpc::{
     CreateNodeRequest, CreateStoreRequest, CreateWorkspaceRequest, DeleteNodeRequest,
     EditOperation, GetChildrenRequest, GetMountStateRequest, GetNodeRequest, GetNodesRequest,
     LoadWorkspaceRequest, MoveNodeRequest, NodeContentChangedNotification, OpenStoreRequest,
-    PimbleApiClient, SaveWorkspaceRequest, SearchRequest, SearchResultItem,
+    PimbleApiClient, RebuildIndexRequest, SaveWorkspaceRequest, SearchRequest, SearchResultItem,
     StoreChangedNotification, SyncNodeContentRequest, SyncStoreDocumentRequest,
     UpdateNodeContentRequest, UpdateNodeMetadataRequest,
 };
@@ -583,5 +583,20 @@ impl PimbleClient {
             .map_err(|e| ClientError::Rpc(e.to_string()))?;
 
         Ok(response.results)
+    }
+
+    /// Rebuild a store's search index from scratch: delete the on-disk
+    /// index and re-index every node from the store's documents. Returns
+    /// the number of nodes indexed.
+    pub async fn rebuild_index(&self, store_id: StoreId) -> Result<usize> {
+        let request = RebuildIndexRequest { store_id };
+
+        let response = self
+            .client
+            .rebuild_index(request)
+            .await
+            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+
+        Ok(response.indexed)
     }
 }

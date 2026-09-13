@@ -56,6 +56,10 @@ pub enum BackendCommand {
     // Subscription operations
     SubscribeStoreChanges { store_id: StoreId },
     SubscribeNodeChanges { store_id: StoreId, node_id: NodeId },
+
+    // Search
+    Search { query: String, stores: Vec<StoreId>, limit: usize },
+    RebuildIndex { store_id: StoreId },
 }
 
 /// Events sent from backend to UI
@@ -99,6 +103,14 @@ pub enum BackendEvent {
     /// session. No node identity carried: pimble has one shared editor pane and
     /// the subscription that produces this is already scoped to that node.
     RemoteChanges { changes: String },
+
+    // Search
+    /// The outcome of a `Search` command. Carries `Err` rather than folding
+    /// into the generic `Error` event so a failed search (including "the
+    /// index is still building") shows inline in the results panel without
+    /// touching the connection status bar or the reconnect-on-error path.
+    SearchResults { results: Result<Vec<pimble_rpc::SearchResultItem>, String> },
+    IndexRebuilt { store_id: StoreId, indexed: usize },
 }
 
 /// Handle to communicate with the backend
@@ -566,6 +578,26 @@ async fn process_command(
                     None
                 }
                 Err(e) => Some(BackendEvent::Error { message: format!("Subscribe failed: {}", e) }),
+            }
+        }
+
+        BackendCommand::Search { query, stores, limit } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::SearchResults { results: Err("Not connected".into()) });
+            };
+            match c.search(query, stores, false, limit).await {
+                Ok(results) => Some(BackendEvent::SearchResults { results: Ok(results) }),
+                Err(e) => Some(BackendEvent::SearchResults { results: Err(e.to_string()) }),
+            }
+        }
+
+        BackendCommand::RebuildIndex { store_id } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            match c.rebuild_index(store_id).await {
+                Ok(indexed) => Some(BackendEvent::IndexRebuilt { store_id, indexed }),
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
         }
     }

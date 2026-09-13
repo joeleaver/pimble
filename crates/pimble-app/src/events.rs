@@ -11,7 +11,7 @@ use rinch::prelude::*;
 use crate::backend::{BackendCommand, BackendEvent};
 use crate::editor::{apply_remote, start_editing};
 use crate::persistence::{load_app_state_file, save_app_state_file};
-use crate::state::{parse_tree_value, AppStore, ConnectionState, MountInfo};
+use crate::state::{parse_tree_value, AppStore, ConnectionState, MountInfo, SearchState};
 
 thread_local! {
     pub(crate) static EVENT_PROCESSOR: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
@@ -426,6 +426,17 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(changes) {
                     apply_remote(&bytes);
                 }
+            }
+
+            BackendEvent::SearchResults { results } => {
+                match results {
+                    Ok(items) => store.search_results.set(SearchState::Results(items.clone())),
+                    Err(message) => store.search_results.set(SearchState::Error(message.clone())),
+                }
+            }
+
+            BackendEvent::IndexRebuilt { store_id, indexed } => {
+                tracing::info!("Search index rebuilt for store {:?}: {} node(s) indexed", store_id, indexed);
             }
         }
     }

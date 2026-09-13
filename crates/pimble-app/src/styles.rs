@@ -179,6 +179,109 @@ pub(crate) const APP_CSS: &str = "
     opacity: 0.3;
 }
 
+/* ── Search bar + results panel ─────────────────────────────── */
+
+.pimble-search-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    background: var(--rinch-color-dark-7);
+    border-bottom: 1px solid var(--rinch-color-dark-4);
+    flex-shrink: 0;
+}
+
+.pimble-search-bar__icon {
+    display: inline-flex;
+    color: var(--rinch-color-dimmed);
+    width: 15px;
+    height: 15px;
+}
+.pimble-search-bar__icon svg { width: 15px; height: 15px; }
+
+.pimble-search-bar__input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--rinch-color-text);
+    font-size: 13px;
+    padding: 2px 0;
+}
+
+.pimble-search-results {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    overflow-y: auto;
+    padding: 4px 6px 8px 8px;
+}
+
+.pimble-search-results__message {
+    padding: 10px 4px;
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+    opacity: 0.6;
+}
+
+.pimble-search-result {
+    display: flex;
+    flex-direction: column;
+    padding: 6px 8px;
+    border-radius: var(--rinch-radius-sm);
+    cursor: pointer;
+}
+.pimble-search-result:hover {
+    background-color: var(--rinch-color-dark-5);
+}
+
+.pimble-search-result__title-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 6px;
+}
+
+.pimble-search-result__title {
+    flex: 1;
+    min-width: 0;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--rinch-color-text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.pimble-search-result__kind {
+    flex-shrink: 0;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--rinch-color-dimmed);
+    opacity: 0.6;
+}
+
+.pimble-search-result__store {
+    font-size: 11px;
+    color: var(--rinch-primary-color-6);
+    opacity: 0.8;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-top: 1px;
+}
+
+.pimble-search-result__snippet {
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-top: 2px;
+}
+
 /* ── Status bar ─────────────────────────────────────────────── */
 
 .pimble-status-bar {

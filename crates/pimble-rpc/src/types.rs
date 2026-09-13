@@ -231,6 +231,17 @@ pub struct SearchResultItem {
     pub score: f32,
     pub title: String,
     pub snippet: String,
+    /// The matched unit/chunk's kind, from the contract's vocabulary:
+    /// "prose", "heading", "code", "table", "field", or "other". Drives how
+    /// the UI renders the hit (e.g. as a table row vs. a paragraph).
+    pub kind: String,
+    /// The node's own type (e.g. "document", "folder"), for icon/rendering
+    /// choices independent of the matched chunk's kind.
+    pub node_type: String,
+    /// Locator of the matched chunk/unit within the node (e.g. a block
+    /// ordinal), for deep-linking and highlighting. Empty when the hit is a
+    /// whole-node keyword match with no specific location.
+    pub path: String,
 }
 
 /// Response with search results
@@ -238,6 +249,19 @@ pub struct SearchResultItem {
 pub struct SearchResponse {
     pub results: Vec<SearchResultItem>,
     pub total: usize,
+}
+
+/// Request to rebuild a store's search index from scratch: delete
+/// `index/rhypedb/` and re-index every node from the store's documents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebuildIndexRequest {
+    pub store_id: StoreId,
+}
+
+/// Response after rebuilding a store's search index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebuildIndexResponse {
+    pub indexed: usize,
 }
 
 // ============================================================================

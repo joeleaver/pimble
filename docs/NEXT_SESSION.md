@@ -12,8 +12,7 @@ Written 2026-09-13 at the end of the restart session. Read this, then `CLAUDE.md
 - Workspace compiles with zero warnings. 43 tests pass in release.
 - Verified live: two windows edit the same node in both directions, force-kill both,
   relaunch, text intact. Tree labels follow content in the editing window too.
-- Restart plan steps 0 to 4 are done. Step 5 (search on rhypedb) is next; it starts in
-  the rhypedb repo (below).
+- Restart plan steps 0 to 5 are done (step 5: search on rhypedb, 2026-09-13).
 
 ## Verify in five minutes
 
@@ -79,6 +78,12 @@ Pimble keeps that behind a `semantic` feature.
   `~/.cargo/git/checkouts/rinch-*/<rev>/` or a scratch clone.
 
 ## Smaller follow-ups, in rough priority
+
+0. Turn `semantic` on for real: choose the ONNX link mode for release builds
+   (`onnx-download` for a self-contained binary), install a runtime here for a first live
+   test, add a first-run model fetch into Pimble's data directory with visible progress,
+   and ask rhypedb to fail soft (not panic) when the model cannot load. rhypedb #17 adds
+   stemming and prefix terms for keyword search.
 
 1. `ContentDoc::text()` re-projects the whole document on every call; tree labels call it
    per node. Cache the projected text per node in `LocalStore` and invalidate on update.

@@ -108,6 +108,10 @@ impl NodePlugin for DocumentPlugin {
         Ok(pimble_crdt::ContentDoc::text_of(content))
     }
 
+    fn index_units(&self, content: &[u8]) -> Result<Vec<pimble_core::IndexUnit>> {
+        Ok(pimble_crdt::ContentDoc::units_of(content))
+    }
+
     fn validate(&self, _content: &[u8]) -> Result<ValidationResult> {
         Ok(ValidationResult::ok())
     }
@@ -170,4 +174,86 @@ pub fn create_default_host() -> PluginHost {
     host.register(DocumentPlugin);
     host.register(FolderPlugin);
     host
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pimble_core::UnitKind;
+
+    #[test]
+    fn document_plugin_index_units_delegates_to_content_doc() {
+        let content = pimble_crdt::ContentDoc::from_plain_text("hello\nworld").unwrap();
+        let units = DocumentPlugin.index_units(&content.save()).unwrap();
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].kind, UnitKind::Prose);
+        assert_eq!(units[0].text, "hello");
+        assert_eq!(units[1].text, "world");
+    }
+
+    #[test]
+    fn document_plugin_empty_content_yields_no_units() {
+        let empty = pimble_crdt::ContentDoc::new().save();
+        // An empty ContentDoc still projects to one empty paragraph.
+        let units = DocumentPlugin.index_units(&empty).unwrap();
+        assert!(units.iter().all(|u| u.text.is_empty()));
+    }
+
+    #[test]
+    fn folder_plugin_uses_default_index_units_impl() {
+        let units = FolderPlugin.index_units(b"anything").unwrap();
+        assert!(units.is_empty());
+    }
+
+    /// A plugin that only implements the required trait methods gets a working
+    /// `index_units` for free via the default implementation.
+    struct MinimalPlugin;
+
+    impl NodePlugin for MinimalPlugin {
+        fn info(&self) -> PluginInfo {
+            PluginInfo {
+                id: "test.minimal".into(),
+                name: "Minimal".into(),
+                version: "0.0.0".into(),
+                node_type: "minimal".into(),
+                description: String::new(),
+            }
+        }
+        fn node_type(&self) -> &str {
+            "minimal"
+        }
+        fn schema(&self) -> NodeSchema {
+            NodeSchema {
+                version: 1,
+                fields: vec![],
+            }
+        }
+        fn render(&self, _content: &[u8]) -> Result<RenderOutput> {
+            unimplemented!()
+        }
+        fn extract_text(&self, content: &[u8]) -> Result<String> {
+            Ok(String::from_utf8_lossy(content).into_owned())
+        }
+        fn validate(&self, _content: &[u8]) -> Result<ValidationResult> {
+            Ok(ValidationResult::ok())
+        }
+        fn init_content(&self) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn default_index_units_wraps_extract_text_as_one_prose_unit() {
+        let units = MinimalPlugin.index_units(b"plain text").unwrap();
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].kind, UnitKind::Prose);
+        assert_eq!(units[0].path, "b:0");
+        assert_eq!(units[0].text, "plain text");
+    }
+
+    #[test]
+    fn default_index_units_empty_text_yields_no_units() {
+        let units = MinimalPlugin.index_units(b"").unwrap();
+        assert!(units.is_empty());
+    }
 }

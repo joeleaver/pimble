@@ -13,6 +13,7 @@
 
 use std::rc::Rc;
 
+use pimble_core::{IndexUnit, UnitKind};
 use rinch_editor_collab::CollabSession;
 use rinch_editor_core::{default_plugins, EditorState, Fragment, Node, Schema};
 use yrs::updates::decoder::Decode;
@@ -111,24 +112,15 @@ impl ContentDoc {
         Ok(self.doc.transact().encode_diff_v1(&sv))
     }
 
-    /// Plain-text projection: blocks joined by `'\n'`. `""` if the document is empty or
-    /// cannot be projected — never panics, logs at debug on failure.
+    /// Plain-text projection: the units' text (see [`ContentDoc::units`]) joined by
+    /// `'\n'`. `""` if the document is empty or cannot be projected — never panics,
+    /// logs at debug on failure.
     pub fn text(&self) -> String {
-        let session = match CollabSession::from_bytes(&self.save()) {
-            Ok(session) => session,
-            Err(e) => {
-                tracing::debug!("ContentDoc::text: CollabSession::from_bytes failed: {e}");
-                return String::new();
-            }
-        };
-        let schema = Schema::starter_kit();
-        match session.projected_doc(&schema) {
-            Ok(node) => Self::project_text(&node),
-            Err(e) => {
-                tracing::debug!("ContentDoc::text: projected_doc failed: {e}");
-                String::new()
-            }
-        }
+        self.units()
+            .iter()
+            .map(|u| u.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Convenience for callers holding bytes: [`ContentDoc::load`] then
@@ -137,18 +129,63 @@ impl ContentDoc {
         Self::load(bytes).map(|d| d.text()).unwrap_or_default()
     }
 
-    /// Join the top-level children of `doc` (its blocks) with `'\n'`, concatenating each
-    /// block's own leaf text with no separator.
-    fn project_text(doc: &Node) -> String {
+    /// Index units: one per top-level block, in document order, for the search
+    /// index's chunker. Maps `paragraph` to [`UnitKind::Prose`], `heading` to
+    /// [`UnitKind::Heading`] (reading the `level` attribute, default 1), `code_block`
+    /// to [`UnitKind::Code`], and any other block kind through as
+    /// [`UnitKind::Other`] (so a future table or callout block indexes without a
+    /// crate change). Each unit's `path` is `"b:{ordinal}"`. `[]` if the document is
+    /// empty or cannot be projected — never panics, logs at debug on failure.
+    pub fn units(&self) -> Vec<IndexUnit> {
+        let session = match CollabSession::from_bytes(&self.save()) {
+            Ok(session) => session,
+            Err(e) => {
+                tracing::debug!("ContentDoc::units: CollabSession::from_bytes failed: {e}");
+                return Vec::new();
+            }
+        };
+        let schema = Schema::starter_kit();
+        match session.projected_doc(&schema) {
+            Ok(node) => Self::project_units(&node),
+            Err(e) => {
+                tracing::debug!("ContentDoc::units: projected_doc failed: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Convenience for callers holding bytes: [`ContentDoc::load`] then
+    /// [`ContentDoc::units`], `[]` on any error.
+    pub fn units_of(bytes: &[u8]) -> Vec<IndexUnit> {
+        Self::load(bytes).map(|d| d.units()).unwrap_or_default()
+    }
+
+    /// One [`IndexUnit`] per top-level child of `doc` (its blocks), each carrying
+    /// that block's own leaf text (concatenated with no separator) and a `path` of
+    /// `"b:{ordinal}"`.
+    fn project_units(doc: &Node) -> Vec<IndexUnit> {
         doc.content()
             .iter()
-            .map(|block| {
-                let mut s = String::new();
-                Self::collect_leaf_text(block, &mut s);
-                s
+            .enumerate()
+            .map(|(ordinal, block)| {
+                let mut text = String::new();
+                Self::collect_leaf_text(block, &mut text);
+                let kind = match block.type_name() {
+                    "paragraph" => UnitKind::Prose,
+                    "heading" => {
+                        let level = block
+                            .attrs()
+                            .get_int("level")
+                            .unwrap_or(1)
+                            .clamp(1, u8::MAX as i64) as u8;
+                        UnitKind::Heading(level)
+                    }
+                    "code_block" => UnitKind::Code,
+                    other => UnitKind::Other(other.to_string()),
+                };
+                IndexUnit::new(kind, format!("b:{ordinal}"), text)
             })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .collect()
     }
 
     /// Append every leaf text node under `node`, depth-first, in document order.
@@ -179,6 +216,77 @@ mod tests {
         let bytes = doc.save();
         let loaded = ContentDoc::load(&bytes).unwrap();
         assert_eq!(loaded.text(), "a\nb");
+    }
+
+    /// Build doc(heading[level=2]("Title"), code_block("fn f() {}"), custom_block("x"))
+    /// directly through the schema builders (bypassing `from_plain_text`, which only
+    /// produces paragraphs) to exercise every arm of `project_units`.
+    fn mixed_blocks_doc() -> ContentDoc {
+        use rinch_editor_core::Attrs;
+
+        let schema = Rc::new(Schema::starter_kit());
+        let heading = schema
+            .create_node(
+                "heading",
+                Attrs::new().with("level", 2i64),
+                Fragment::from_node(schema.text("Title").unwrap()),
+            )
+            .unwrap();
+        let code = schema
+            .create_node(
+                "code_block",
+                Attrs::new(),
+                Fragment::from_node(schema.text("fn f() {}").unwrap()),
+            )
+            .unwrap();
+        // A block kind `project_units` doesn't special-case. `bullet_list` is a
+        // collab-supported list container (unlike e.g. `blockquote`, which
+        // `CollabSession::new` below would reject outright), so it exercises the
+        // `Other` arm without failing document construction.
+        let list_item = schema
+            .branch(
+                "list_item",
+                Fragment::from_node(
+                    schema
+                        .branch("paragraph", Fragment::from_node(schema.text("quoted").unwrap()))
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        let other = schema
+            .branch("bullet_list", Fragment::from_node(list_item))
+            .unwrap();
+        let doc_node = schema
+            .branch("doc", Fragment::from_children(vec![heading, code, other]))
+            .unwrap();
+        let state = EditorState::create(schema.clone(), doc_node, default_plugins());
+        let session = CollabSession::new(&state).unwrap();
+        ContentDoc::load(&session.snapshot()).unwrap()
+    }
+
+    #[test]
+    fn units_map_heading_level_code_and_other() {
+        let doc = mixed_blocks_doc();
+        let units = doc.units();
+        assert_eq!(units.len(), 3);
+
+        assert_eq!(units[0].kind, UnitKind::Heading(2));
+        assert_eq!(units[0].path, "b:0");
+        assert_eq!(units[0].text, "Title");
+
+        assert_eq!(units[1].kind, UnitKind::Code);
+        assert_eq!(units[1].path, "b:1");
+        assert_eq!(units[1].text, "fn f() {}");
+
+        assert_eq!(units[2].kind, UnitKind::Other("bullet_list".to_string()));
+        assert_eq!(units[2].path, "b:2");
+        assert_eq!(units[2].text, "quoted");
+    }
+
+    #[test]
+    fn text_is_units_joined_by_newline() {
+        let doc = mixed_blocks_doc();
+        assert_eq!(doc.text(), "Title\nfn f() {}\nquoted");
     }
 
     #[test]

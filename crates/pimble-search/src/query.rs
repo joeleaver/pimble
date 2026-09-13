@@ -1,41 +1,26 @@
-//! Search query types and execution
+//! Search query and result types.
 
-use pimble_core::{NodeId, StoreId};
+use pimble_core::NodeId;
 use serde::{Deserialize, Serialize};
 
-/// Search query
+/// A search request against a [`crate::SearchIndex`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchQuery {
-    /// The search query string
-    pub query: String,
-
-    /// Which stores to search (empty = all)
-    pub stores: Vec<StoreId>,
-
-    /// Whether to use semantic (vector) search
+    pub text: String,
+    /// `true` asks for a hybrid (keyword + semantic) search; ignored (treated
+    /// as keyword-only) when the index has no vectorizer — see
+    /// [`crate::SearchIndex::semantic_enabled`].
     pub semantic: bool,
-
-    /// Filters to apply
-    pub filters: SearchFilters,
-
-    /// Maximum number of results
     pub limit: usize,
 }
 
 impl SearchQuery {
-    pub fn new(query: impl Into<String>) -> Self {
+    pub fn new(text: impl Into<String>) -> Self {
         Self {
-            query: query.into(),
-            stores: Vec::new(),
-            semantic: true,
-            filters: SearchFilters::default(),
+            text: text.into(),
+            semantic: false,
             limit: 20,
         }
-    }
-
-    pub fn with_stores(mut self, stores: Vec<StoreId>) -> Self {
-        self.stores = stores;
-        self
     }
 
     pub fn with_semantic(mut self, semantic: bool) -> Self {
@@ -49,61 +34,22 @@ impl SearchQuery {
     }
 }
 
-/// Search filters
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SearchFilters {
-    /// Filter by node types
-    pub node_types: Vec<String>,
-
-    /// Filter by tags (any match)
-    pub tags: Vec<String>,
-
-    /// Filter by date range
-    pub created_after: Option<chrono::DateTime<chrono::Utc>>,
-    pub created_before: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-/// A single search result
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchResult {
-    /// The node ID
+/// One search result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchHit {
     pub node_id: NodeId,
-
-    /// The store containing the node
-    pub store_id: StoreId,
-
-    /// Relevance score (0-1)
+    /// Higher is better, for both keyword (BM25) and semantic (distance,
+    /// converted) hits.
     pub score: f32,
-
-    /// Node title
     pub title: String,
-
-    /// Snippet of matching content
+    /// A window of text around the match (keyword) or the best-matching
+    /// chunk's text (semantic).
     pub snippet: String,
-
-    /// Deep link anchor within the node (if applicable)
-    pub deep_link: Option<String>,
-}
-
-/// Collection of search results
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchResults {
-    /// The query that was executed
-    pub query: String,
-
-    /// Total number of matches (may be more than returned)
-    pub total_matches: usize,
-
-    /// The result items
-    pub results: Vec<SearchResult>,
-}
-
-impl SearchResults {
-    pub fn empty(query: impl Into<String>) -> Self {
-        Self {
-            query: query.into(),
-            total_matches: 0,
-            results: Vec::new(),
-        }
-    }
+    /// What was matched: `"node"` for a whole-node keyword match (title/text
+    /// fields), or the matched chunk's kind — one of `"prose"`, `"heading"`,
+    /// `"code"`, `"table"`, `"field"`, `"other"` — for a semantic hit.
+    pub kind: String,
+    /// The matched chunk's locator (see `IndexUnit::path`), when the hit
+    /// resolved to a specific chunk. `None` for a whole-node keyword match.
+    pub path: Option<String>,
 }

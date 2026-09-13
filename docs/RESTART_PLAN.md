@@ -186,7 +186,7 @@ bundle. The rhypedb lockfile has 428 packages. Put all of it behind a `semantic`
 | 2 | Commit the migration as coherent commits | Done 2026-09-12 on branch `restart/phase-a-yrs-content`. |
 | 3 | Restore `pimble-cli` (headless testing) and `pimble-import` (port to `ContentDoc`) | Done 2026-09-12. CLI round-trips content through the real server; importer has an end-to-end test. |
 | 4 | Store document on yrs (Phase B); Automerge removed | Done 2026-09-13. Interface: `docs/history/PHASE_B_CONTRACT.md`. |
-| 5 | `pimble-search` on rhypedb: schema, indexer fed by change notifications, search RPC, search panel | Semantic search over an imported Scrivener project |
+| 5 | `pimble-search` on rhypedb: schema, indexer fed by change notifications, search RPC, search panel | Done 2026-09-13. Keyword search over `@fulltext` title and text (rhypedb #16), chunked embeddings behind the `semantic` feature, search box and results panel in the app, `search`/`rebuild-index` in the CLI. 82 tests pass. Follow-ups: rhypedb #17 (stemming, prefix terms), turning `semantic` on for release builds with a first-run model fetch. |
 | 6 | Roadmap resumes: mounts (local first), remote sync, links UI, plugins | Per phase |
 
 Legacy readers for the pre-Phase-A Automerge node content and the pre-Phase-B Automerge

@@ -12,7 +12,7 @@ Pimble is an **offline-first personal information manager**:
 - Rust backend, **rinch** UI (the Slint and Makepad UIs are gone)
 - Embedded JSON-RPC server (jsonrpsee over WebSocket) between UI and store
 - Mounts: any subtree of any store can appear in any other store's tree
-- Search: keyword and semantic (rhypedb is the planned index engine)
+- Search: keyword (rhypedb full-text) and semantic (chunked embeddings, `semantic` feature)
 - WASM plugin system for node types (skeleton)
 
 ## Rules
@@ -37,7 +37,7 @@ re-import from Scrivener.
 | `pimble-crdt` | `ContentDoc` (per-node content) and `StoreDocument` (tree + metadata), both yrs | Complete |
 | `pimble-store` | `LocalStore` (`store.yrs` + `nodes/{id}.yrs`), `StoreManager` | Complete |
 | `pimble-rpc` / `pimble-server` / `pimble-client` | RPC protocol, embedded server, WebSocket client | Complete |
-| `pimble-search` | Search types | Skeleton |
+| `pimble-search` | rhypedb index per store: keyword (`@fulltext`, BM25), chunked embeddings behind `semantic`, backlinks | Complete |
 | `pimble-plugins` | `NodePlugin` trait, built-ins | Skeleton |
 | `pimble-app` | rinch desktop app | Works: two-window live editing, persistence verified |
 | `pimble-cli` | server / create-store / list-stores | Complete |
@@ -50,6 +50,19 @@ stop. The store document (tree structure and node metadata) is a second yrs docu
 store, stored as `store.yrs`; `applyStoreUpdate` merges and relays it the same way.
 `syncNodeContent` and `syncStoreDocument` are both stateless: state vector in, diff plus
 server state vector out. `setNodeText` and `ServerSyncManager` do not exist.
+
+### Search index
+
+Each open store has a rhypedb database at `<store>/index/rhypedb/`, derived and
+disposable (`rebuildIndex` RPC, "Rebuild search index" in the View menu). The server feeds
+it in-process from the same places it broadcasts change notifications, with a 2s per-node
+debounce on content. Nodes index `title` and `text` with `@fulltext`; with the `semantic`
+feature, content is chunked (about 200 words, block-aligned, heading context, per-chunk
+hash so an edit re-embeds one chunk) into `Chunk` objects with `all-MiniLM-L6-v2`
+embeddings. Chunking works over `IndexUnit`s (prose, heading, code, table row, field,
+other) produced by `ContentDoc::units()` or a plugin's `index_units`, so tables and
+structured node types can index later without redesign. The simple analyzer has no
+stemming ("camera" does not find "cameras"); rhypedb #17 tracks that.
 
 ### Collaboration shape (keep these invariants)
 
@@ -94,4 +107,4 @@ The app has the rinch `debug` feature on, so the rinch MCP tools (`list_apps`, `
 - `yrs` 0.27 for both CRDT documents; `rinch-editor-collab` (git main) wraps it for node
   content's rich-text schema, the store document uses `yrs` directly (Maps and Arrays)
 - `jsonrpsee` 0.24
-- `rhypedb` (git, `joeleaver/rhypedb`) planned for `pimble-search`
+- `rhypedb-engine`/`-schema`/`-query` (git master, default features off) for `pimble-search`; the `semantic` feature enables fastembed/ONNX through `onnx-dynamic`

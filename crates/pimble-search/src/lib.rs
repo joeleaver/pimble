@@ -1,14 +1,21 @@
-//! Pimble Search - Search and indexing for semantic and full-text search
+//! Pimble Search — the search and graph index, on rhypedb.
 //!
-//! This crate will provide (Phase 4):
-//! - Vector database for semantic search
-//! - Full-text search using Tantivy
-//! - Embedding generation using local models
+//! One [`SearchIndex`] per open store, backed by a rhypedb database at
+//! `store.pimble/index/rhypedb/`. It is derived and disposable: the yrs
+//! documents (`pimble-crdt`) remain the source of truth, and deleting the
+//! index directory and re-running every node through [`SearchIndex::upsert`]
+//! rebuilds it exactly.
+//!
+//! See `docs/STEP5_CONTRACT.md` for the design this crate implements.
 
+pub mod chunk;
 pub mod error;
 pub mod index;
 pub mod query;
+pub mod schema;
 
+pub use chunk::*;
 pub use error::*;
 pub use index::*;
 pub use query::*;
+pub use schema::{compose_schema, schema_hash, SchemaFragment, SCHEMA_HASH_FILE};
