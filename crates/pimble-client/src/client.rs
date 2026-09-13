@@ -7,9 +7,9 @@ use jsonrpsee::ws_client::{WsClient, WsClientBuilder};
 use pimble_core::{Node, NodeId, Store, StoreId, Workspace};
 use pimble_core::MountRef;
 use pimble_rpc::{
-    ApplyEditRequest, CloseStoreRequest, CreateMountRequest, CreateNodeRequest,
-    CreateStoreRequest, CreateWorkspaceRequest, DeleteNodeRequest, EditOperation,
-    GetChildrenRequest, GetMountStateRequest, GetNodeRequest, GetNodesRequest,
+    ApplyEditRequest, ApplyStoreUpdateRequest, CloseStoreRequest, CreateMountRequest,
+    CreateNodeRequest, CreateStoreRequest, CreateWorkspaceRequest, DeleteNodeRequest,
+    EditOperation, GetChildrenRequest, GetMountStateRequest, GetNodeRequest, GetNodesRequest,
     LoadWorkspaceRequest, MoveNodeRequest, NodeContentChangedNotification, OpenStoreRequest,
     PimbleApiClient, SaveWorkspaceRequest, SearchRequest, SearchResultItem,
     StoreChangedNotification, SyncNodeContentRequest, SyncStoreDocumentRequest,
@@ -414,18 +414,19 @@ impl PimbleClient {
     // Sync Operations
     // ========================================================================
 
-    /// Sync a store document (tree + metadata) using Automerge sync protocol.
-    /// Returns the server's sync message (base64-encoded), or None if in sync.
+    /// Sync a store document (tree + metadata): send our yrs state vector,
+    /// get back everything the server has beyond it plus the server's own
+    /// state vector. Stateless on both ends.
     pub async fn sync_store_document(
         &self,
         store_id: StoreId,
-        client_id: &str,
-        message: Option<String>,
-    ) -> Result<Option<String>> {
+        state_vector: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        use base64::Engine;
+
         let request = SyncStoreDocumentRequest {
             store_id,
-            client_id: client_id.to_string(),
-            message,
+            state_vector: base64::engine::general_purpose::STANDARD.encode(state_vector),
         };
 
         let response = self
@@ -434,7 +435,41 @@ impl PimbleClient {
             .await
             .map_err(|e| ClientError::Rpc(e.to_string()))?;
 
-        Ok(response.message)
+        let diff = base64::engine::general_purpose::STANDARD
+            .decode(&response.diff)
+            .map_err(|e| ClientError::Rpc(format!("Invalid base64 diff: {}", e)))?;
+        let server_sv = base64::engine::general_purpose::STANDARD
+            .decode(&response.state_vector)
+            .map_err(|e| ClientError::Rpc(format!("Invalid base64 state vector: {}", e)))?;
+
+        Ok((diff, server_sv))
+    }
+
+    /// Apply a yrs update to the store document (a delta, reconciliation
+    /// diff, or whole snapshot) and broadcast it to the store's other
+    /// subscribers.
+    ///
+    /// Deviation from the Phase B contract's 2-arg signature
+    /// (`apply_store_update(store_id, update)`): `ApplyStoreUpdateRequest`
+    /// carries a `client_id` (for echo suppression via
+    /// `StoreChangedNotification::source_client_id`, same as `apply_edit`),
+    /// and `PimbleClient` has no stored client id field, so it is taken as
+    /// an explicit parameter here, matching `apply_edit`'s existing pattern.
+    pub async fn apply_store_update(&self, store_id: StoreId, client_id: &str, update: &[u8]) -> Result<()> {
+        use base64::Engine;
+
+        let request = ApplyStoreUpdateRequest {
+            store_id,
+            client_id: client_id.to_string(),
+            update: base64::engine::general_purpose::STANDARD.encode(update),
+        };
+
+        self.client
+            .apply_store_update(request)
+            .await
+            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+
+        Ok(())
     }
 
     /// Sync a node's content document: send our yrs state vector, get back

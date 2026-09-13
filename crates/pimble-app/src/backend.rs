@@ -58,7 +58,10 @@ pub enum BackendCommand {
     },
 
     // Sync operations
-    SyncStoreDocument { store_id: StoreId },
+    /// Reconcile the store document against the server: `state_vector` is this
+    /// client's current yrs state vector for the store's tree/metadata doc. The
+    /// app holds no local `StoreDocument` today, so nothing populates this yet.
+    SyncStoreDocument { store_id: StoreId, state_vector: Vec<u8> },
     /// Reconcile a node's content against the server: `state_vector` is this
     /// client's current yrs state vector (from `EditorHandle::collab_state_vector`).
     /// The server answers with a diff (possibly empty) plus its own state vector.
@@ -109,7 +112,10 @@ pub enum BackendEvent {
     },
 
     // Sync events
-    StoreDocumentSynced { store_id: StoreId },
+    /// Response to `SyncStoreDocument`: `diff` is the yrs update this client was
+    /// missing (empty if already caught up). The app has nothing to apply it to
+    /// today, so it just triggers the usual tree refresh.
+    StoreDocumentSynced { store_id: StoreId, diff: Vec<u8> },
     /// Response to `SyncNodeContent`: `diff` is the yrs update this client was
     /// missing (empty if already caught up).
     NodeContentSynced { store_id: StoreId, node_id: NodeId, diff: Vec<u8> },
@@ -581,25 +587,16 @@ async fn process_command(
         }
 
 
-        BackendCommand::SyncStoreDocument { store_id } => {
+        BackendCommand::SyncStoreDocument { store_id, state_vector } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
-            // Run the sync protocol to completion (multiple round-trips)
-            let mut message: Option<String> = None;
-            loop {
-                match c.sync_store_document(store_id, client_id, message).await {
-                    Ok(response_msg) => {
-                        if response_msg.is_none() {
-                            // Sync complete
-                            break;
-                        }
-                        message = response_msg;
-                    }
-                    Err(e) => return Some(BackendEvent::Error { message: e.to_string() }),
+            match c.sync_store_document(store_id, &state_vector).await {
+                Ok((diff, _server_state_vector)) => {
+                    Some(BackendEvent::StoreDocumentSynced { store_id, diff })
                 }
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
-            Some(BackendEvent::StoreDocumentSynced { store_id })
         }
 
         BackendCommand::SyncNodeContent { store_id, node_id, state_vector } => {

@@ -182,6 +182,28 @@ impl StoreManager {
         Ok(store.store_document_mut())
     }
 
+    /// v1-encoded state vector for a store's store document.
+    pub fn store_doc_state_vector(&self, store_id: StoreId) -> Result<Vec<u8>> {
+        let store = self.local_stores.get(&store_id)
+            .ok_or(StoreError::NotOpen(store_id))?;
+        Ok(store.store_doc_state_vector())
+    }
+
+    /// Everything a store's store document has that a peer at `state_vector`
+    /// (v1-encoded) lacks.
+    pub fn store_doc_diff_since(&self, store_id: StoreId, state_vector: &[u8]) -> Result<Vec<u8>> {
+        let store = self.local_stores.get(&store_id)
+            .ok_or(StoreError::NotOpen(store_id))?;
+        store.store_doc_diff_since(state_vector)
+    }
+
+    /// Merge a peer's yrs update into a store's store document.
+    pub fn apply_store_doc_update(&mut self, store_id: StoreId, update: &[u8]) -> Result<()> {
+        let store = self.local_stores.get_mut(&store_id)
+            .ok_or(StoreError::NotOpen(store_id))?;
+        store.apply_store_doc_update(update)
+    }
+
     /// Get children of a node.
     ///
     /// If the node is a mount point, its children are transparently resolved

@@ -1,16 +1,26 @@
 //! CRDT-backed store document for tree structure and node metadata
 //!
-//! A single Automerge document per store containing:
+//! A single yrs document per store containing:
 //! - Tree structure (parent-child relationships, children ordering)
 //! - Node metadata (title, type, tags, custom fields, timestamps)
 //! - Node existence (create/delete)
+//!
+//! Legacy `store.automerge` files are read (never written) by
+//! [`crate::legacy_store_document::LegacyStoreDocument`] and converted with
+//! [`StoreDocument::from_legacy`].
 
 use std::collections::HashMap;
 
-use automerge::{transaction::Transactable, AutoCommit, ObjType, ReadDoc};
 use pimble_core::NodeId;
+use yrs::updates::decoder::Decode;
+use yrs::updates::encoder::Encode;
+use yrs::{
+    Array, ArrayPrelim, ArrayRef, Doc, Map, MapPrelim, MapRef, OffsetKind, Options, Out, ReadTxn,
+    StateVector, Transact, TransactionMut, Update,
+};
 
 use crate::error::{CrdtError, Result};
+use crate::legacy_store_document::LegacyStoreDocument;
 
 /// Information about a node read from the store document
 #[derive(Debug, Clone)]
@@ -40,105 +50,200 @@ pub enum TreeIssue {
 
 /// A CRDT-backed store document managing tree structure and node metadata.
 ///
-/// Schema:
+/// Schema (a yrs `Doc` built with `OffsetKind::Utf16`, matching `ContentDoc`):
 /// ```text
-/// Root Map {
-///   "root_node_id": Str,
-///   "nodes": Map {
-///     "<uuid>": Map {
-///       "parent_id": Str | Null,
-///       "node_type": Str,
-///       "children": List [ Str, ... ],
-///       "title": Str,
-///       "tags": List [ Str, ... ],
-///       "custom": Map { key: ScalarValue },
-///       "created_at": Str (ISO 8601),
-///       "modified_at": Str (ISO 8601),
-///     }
-///   }
-/// }
+/// root map "meta":  { name: String, root_node_id: String }
+/// root map "nodes": { <node-id>: Map {
+///     parent_id: String | absent,
+///     node_type: String, title: String,
+///     created_at: String (rfc3339), modified_at: String (rfc3339),
+///     tags: Array<String>,
+///     custom: Map<String, String (json)>,
+///     children: Array<String (node-id)>
+/// } }
 /// ```
-#[derive(Debug)]
 pub struct StoreDocument {
-    doc: AutoCommit,
+    doc: Doc,
+    /// Root map "meta", resolved once at construction. `Doc::get_or_insert_map`
+    /// opens its own write transaction, so it must never run while a caller holds
+    /// one; caching the handles here makes every method single-transaction.
+    meta: MapRef,
+    /// Root map "nodes", resolved once at construction (see `meta`).
+    nodes: MapRef,
 }
 
 impl StoreDocument {
     /// Create a new store document with a root folder node.
     pub fn new(name: &str, root_node_id: NodeId) -> Result<Self> {
-        let mut doc = AutoCommit::new();
+        let this = Self::empty();
 
-        // Set root node ID
-        doc.put(automerge::ROOT, "root_node_id", root_node_id.to_string())?;
+        let mut txn = this.doc.transact_mut();
+        this.meta().insert(&mut txn, "name", name.to_string());
+        this.meta().insert(&mut txn, "root_node_id", root_node_id.to_string());
 
-        // Create nodes map
-        let nodes_id = doc.put_object(automerge::ROOT, "nodes", ObjType::Map)?;
-
-        // Create root node entry
         let now = chrono::Utc::now().to_rfc3339();
         let root_key = root_node_id.to_string();
-        let node_obj = doc.put_object(&nodes_id, &root_key, ObjType::Map)?;
-        // parent_id is null for root
-        doc.put(&node_obj, "node_type", "folder")?;
-        let _children = doc.put_object(&node_obj, "children", ObjType::List)?;
-        doc.put(&node_obj, "title", name)?;
-        let _tags = doc.put_object(&node_obj, "tags", ObjType::List)?;
-        let _custom = doc.put_object(&node_obj, "custom", ObjType::Map)?;
-        doc.put(&node_obj, "created_at", &now)?;
-        doc.put(&node_obj, "modified_at", &now)?;
+        let node_map = this.nodes().insert(&mut txn, root_key, MapPrelim::default());
+        // parent_id is absent for root
+        node_map.insert(&mut txn, "node_type", "folder".to_string());
+        node_map.insert(&mut txn, "title", name.to_string());
+        node_map.insert(&mut txn, "created_at", now.clone());
+        node_map.insert(&mut txn, "modified_at", now);
+        node_map.insert(&mut txn, "tags", ArrayPrelim::default());
+        node_map.insert(&mut txn, "custom", MapPrelim::default());
+        node_map.insert(&mut txn, "children", ArrayPrelim::default());
+        drop(txn);
 
-        Ok(Self { doc })
+        Ok(this)
     }
 
-    /// Load a store document from bytes.
+    /// Build a document whose contents mirror `legacy` exactly: every node's metadata,
+    /// tags, custom fields and timestamps, and every parent's children in the same
+    /// order.
+    pub fn from_legacy(legacy: &LegacyStoreDocument) -> Result<Self> {
+        let root_id = legacy.root_node_id()?;
+        let node_ids = legacy.list_node_ids()?;
+
+        let mut infos = HashMap::with_capacity(node_ids.len());
+        let mut children = HashMap::with_capacity(node_ids.len());
+        for &id in &node_ids {
+            infos.insert(id, legacy.get_node_info(id)?);
+            children.insert(id, legacy.get_children(id)?);
+        }
+
+        let root_info = infos
+            .get(&root_id)
+            .cloned()
+            .ok_or_else(|| CrdtError::KeyNotFound(format!("root node {}", root_id)))?;
+
+        let mut doc = StoreDocument::new(&root_info.title, root_id)?;
+        doc.set_node_type(root_id, &root_info.node_type)?;
+
+        // Bare entries for every non-root node first, so parent/child references below
+        // always resolve regardless of iteration order.
+        for &id in &node_ids {
+            if id == root_id {
+                continue;
+            }
+            let info = &infos[&id];
+            doc.add_node_bare(id, &info.node_type, &info.title, &info.created_at, &info.modified_at)?;
+        }
+
+        for &id in &node_ids {
+            let info = &infos[&id];
+            if id != root_id {
+                doc.set_parent_id(id, info.parent_id)?;
+            }
+            if !info.tags.is_empty() {
+                doc.set_tags(id, &info.tags)?;
+            }
+            for (key, value) in &info.custom {
+                doc.set_custom(id, key, value)?;
+            }
+        }
+
+        for &id in &node_ids {
+            for &child_id in &children[&id] {
+                doc.append_child(id, child_id)?;
+            }
+        }
+
+        // set_tags/set_custom above touch modified_at; restore the legacy timestamps
+        // exactly, last, so the migrated document matches the source precisely.
+        for &id in &node_ids {
+            let info = &infos[&id];
+            doc.set_timestamps(id, &info.created_at, &info.modified_at)?;
+        }
+
+        Ok(doc)
+    }
+
+    /// Load a store document from bytes (a yrs v1 update: a full snapshot or any
+    /// update). Empty bytes produce an empty document.
     pub fn load(bytes: &[u8]) -> Result<Self> {
-        let doc = AutoCommit::load(bytes)?;
-        Ok(Self { doc })
+        let this = Self::empty();
+        if bytes.is_empty() {
+            return Ok(this);
+        }
+        let update = Update::decode_v1(bytes).map_err(|e| CrdtError::Yrs(e.to_string()))?;
+        this.doc
+            .transact_mut()
+            .apply_update(update)
+            .map_err(|e| CrdtError::Yrs(e.to_string()))?;
+        Ok(this)
     }
 
-    /// Save the store document to bytes.
-    pub fn save(&mut self) -> Vec<u8> {
-        self.doc.save()
+    /// An empty yrs `Doc`, UTF-16 offsets, no root content populated yet.
+    fn empty() -> Self {
+        let options = Options {
+            offset_kind: OffsetKind::Utf16,
+            ..Default::default()
+        };
+        let doc = Doc::with_options(options);
+        let meta = doc.get_or_insert_map("meta");
+        let nodes = doc.get_or_insert_map("nodes");
+        Self { doc, meta, nodes }
+    }
+
+    fn meta(&self) -> MapRef {
+        self.meta.clone()
+    }
+
+    fn nodes(&self) -> MapRef {
+        self.nodes.clone()
+    }
+
+    /// Full snapshot: the v1 update encoding of the whole document from an empty state
+    /// vector. Round-trips through [`StoreDocument::load`].
+    pub fn save(&self) -> Vec<u8> {
+        self.doc
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default())
+    }
+
+    /// This document's state vector, v1-encoded.
+    pub fn state_vector(&self) -> Vec<u8> {
+        self.doc.transact().state_vector().encode_v1()
+    }
+
+    /// Everything this document has that a peer at `state_vector` (v1-encoded) lacks.
+    pub fn diff_since(&self, state_vector: &[u8]) -> Result<Vec<u8>> {
+        let sv =
+            StateVector::decode_v1(state_vector).map_err(|e| CrdtError::Yrs(e.to_string()))?;
+        Ok(self.doc.transact().encode_diff_v1(&sv))
+    }
+
+    /// Merge a peer's v1 update — a broadcast delta, a reconciliation diff, or a whole
+    /// snapshot — into this document.
+    pub fn apply_update(&mut self, update: &[u8]) -> Result<()> {
+        let update = Update::decode_v1(update).map_err(|e| CrdtError::Yrs(e.to_string()))?;
+        self.doc
+            .transact_mut()
+            .apply_update(update)
+            .map_err(|e| CrdtError::Yrs(e.to_string()))
     }
 
     /// Get the root node ID.
     pub fn root_node_id(&self) -> Result<NodeId> {
-        match self.doc.get(automerge::ROOT, "root_node_id")? {
-            Some((automerge::Value::Scalar(s), _)) => match s.as_ref() {
-                automerge::ScalarValue::Str(s) => {
-                    NodeId::parse(s).map_err(|e| CrdtError::Serialization(e.to_string()))
-                }
-                _ => Err(CrdtError::TypeMismatch {
-                    expected: "string".into(),
-                    actual: format!("{:?}", s),
-                }),
-            },
-            _ => Err(CrdtError::KeyNotFound("root_node_id".into())),
-        }
+        let txn = self.doc.transact();
+        let s = Self::string_value(self.meta().get(&txn, "root_node_id"))
+            .ok_or_else(|| CrdtError::KeyNotFound("root_node_id".into()))?;
+        NodeId::parse(&s).map_err(|e| CrdtError::Serialization(e.to_string()))
     }
 
-    /// Get the ObjId for the "nodes" map.
-    fn nodes_map(&self) -> Result<automerge::ObjId> {
-        match self.doc.get(automerge::ROOT, "nodes")? {
-            Some((automerge::Value::Object(ObjType::Map), id)) => Ok(id),
-            _ => Err(CrdtError::KeyNotFound("nodes".into())),
-        }
-    }
-
-    /// Get the ObjId for a specific node entry.
-    fn node_obj(&self, node_id: NodeId) -> Result<automerge::ObjId> {
-        let nodes = self.nodes_map()?;
-        let key = node_id.to_string();
-        match self.doc.get(&nodes, &key)? {
-            Some((automerge::Value::Object(ObjType::Map), id)) => Ok(id),
+    /// Get the MapRef for a specific node entry.
+    fn node_map<T: ReadTxn>(&self, txn: &T, node_id: NodeId) -> Result<MapRef> {
+        match self.nodes().get(txn, &node_id.to_string()) {
+            Some(Out::YMap(m)) => Ok(m),
             _ => Err(CrdtError::KeyNotFound(format!("node {}", node_id))),
         }
     }
 
-    /// Get the children list ObjId for a node.
-    fn children_list(&self, node_obj: &automerge::ObjId) -> Result<automerge::ObjId> {
-        match self.doc.get(node_obj, "children")? {
-            Some((automerge::Value::Object(ObjType::List), id)) => Ok(id),
+    /// Get the children ArrayRef for a node.
+    fn children_array<T: ReadTxn>(&self, txn: &T, node_id: NodeId) -> Result<ArrayRef> {
+        let node_map = self.node_map(txn, node_id)?;
+        match node_map.get(txn, "children") {
+            Some(Out::YArray(a)) => Ok(a),
             _ => Err(CrdtError::KeyNotFound("children".into())),
         }
     }
@@ -151,35 +256,35 @@ impl StoreDocument {
         node_type: &str,
         title: &str,
     ) -> Result<()> {
-        let nodes = self.nodes_map()?;
+        let mut txn = self.doc.transact_mut();
         let key = id.to_string();
 
-        // Check if node already exists
-        if self.doc.get(&nodes, &key)?.is_some() {
+        if self.nodes().get(&txn, &key).is_some() {
             return Err(CrdtError::Serialization(format!("Node {} already exists", id)));
         }
 
+        // Resolve the parent's children array before creating anything, so a missing
+        // parent fails loud without leaving a half-created node behind.
+        let parent_children = match parent_id {
+            Some(pid) => Some(self.children_array(&txn, pid)?),
+            None => None,
+        };
+
         let now = chrono::Utc::now().to_rfc3339();
-
-        // Create node map entry
-        let node_obj = self.doc.put_object(&nodes, &key, ObjType::Map)?;
+        let node_map = self.nodes().insert(&mut txn, key, MapPrelim::default());
         if let Some(pid) = parent_id {
-            self.doc.put(&node_obj, "parent_id", pid.to_string())?;
+            node_map.insert(&mut txn, "parent_id", pid.to_string());
         }
-        self.doc.put(&node_obj, "node_type", node_type)?;
-        let _children = self.doc.put_object(&node_obj, "children", ObjType::List)?;
-        self.doc.put(&node_obj, "title", title)?;
-        let _tags = self.doc.put_object(&node_obj, "tags", ObjType::List)?;
-        let _custom = self.doc.put_object(&node_obj, "custom", ObjType::Map)?;
-        self.doc.put(&node_obj, "created_at", &now)?;
-        self.doc.put(&node_obj, "modified_at", &now)?;
+        node_map.insert(&mut txn, "node_type", node_type.to_string());
+        node_map.insert(&mut txn, "title", title.to_string());
+        node_map.insert(&mut txn, "created_at", now.clone());
+        node_map.insert(&mut txn, "modified_at", now);
+        node_map.insert(&mut txn, "tags", ArrayPrelim::default());
+        node_map.insert(&mut txn, "custom", MapPrelim::default());
+        node_map.insert(&mut txn, "children", ArrayPrelim::default());
 
-        // Append to parent's children list
-        if let Some(pid) = parent_id {
-            let parent_obj = self.node_obj(pid)?;
-            let parent_children = self.children_list(&parent_obj)?;
-            let len = self.doc.length(&parent_children);
-            self.doc.insert(&parent_children, len, id.to_string())?;
+        if let Some(children) = parent_children {
+            children.push_back(&mut txn, id.to_string());
         }
 
         Ok(())
@@ -187,18 +292,14 @@ impl StoreDocument {
 
     /// Remove a node from the store document.
     pub fn remove_node(&mut self, id: NodeId) -> Result<()> {
-        // Get parent ID first
-        let parent_id = self.get_parent_id(id)?;
+        let mut txn = self.doc.transact_mut();
 
-        // Remove from parent's children list
+        let parent_id = self.parent_id_of(&txn, id)?;
         if let Some(pid) = parent_id {
-            self.remove_from_children_list(pid, id)?;
+            Self::remove_from_children_list(&self.children_array(&txn, pid)?, &mut txn, id);
         }
 
-        // Remove from nodes map
-        let nodes = self.nodes_map()?;
-        let key = id.to_string();
-        self.doc.delete(&nodes, &key)?;
+        self.nodes().remove(&mut txn, &id.to_string());
 
         Ok(())
     }
@@ -210,106 +311,94 @@ impl StoreDocument {
         new_parent_id: NodeId,
         position: Option<usize>,
     ) -> Result<()> {
-        // Get old parent
-        let old_parent_id = self.get_parent_id(id)?
+        let mut txn = self.doc.transact_mut();
+
+        let old_parent_id = self
+            .parent_id_of(&txn, id)?
             .ok_or_else(|| CrdtError::Serialization("Cannot move root node".into()))?;
 
-        // Remove from old parent's children
-        self.remove_from_children_list(old_parent_id, id)?;
+        Self::remove_from_children_list(&self.children_array(&txn, old_parent_id)?, &mut txn, id);
 
-        // Add to new parent's children at position
-        let new_parent_obj = self.node_obj(new_parent_id)?;
-        let children = self.children_list(&new_parent_obj)?;
-        let len = self.doc.length(&children);
-        let pos = position.map(|p| p.min(len)).unwrap_or(len);
-        self.doc.insert(&children, pos, id.to_string())?;
+        let children = self.children_array(&txn, new_parent_id)?;
+        let len = children.len(&txn);
+        let pos = position.map(|p| (p as u32).min(len)).unwrap_or(len);
+        children.insert(&mut txn, pos, id.to_string());
 
-        // Update parent_id on the node
-        let node_obj = self.node_obj(id)?;
-        self.doc.put(&node_obj, "parent_id", new_parent_id.to_string())?;
-
-        // Update modified_at
+        let node_map = self.node_map(&txn, id)?;
+        node_map.insert(&mut txn, "parent_id", new_parent_id.to_string());
         let now = chrono::Utc::now().to_rfc3339();
-        self.doc.put(&node_obj, "modified_at", &now)?;
+        node_map.insert(&mut txn, "modified_at", now);
 
         Ok(())
     }
 
     /// Set the title of a node.
     pub fn set_title(&mut self, id: NodeId, title: &str) -> Result<()> {
-        let node_obj = self.node_obj(id)?;
-        self.doc.put(&node_obj, "title", title)?;
+        let mut txn = self.doc.transact_mut();
+        let node_map = self.node_map(&txn, id)?;
+        node_map.insert(&mut txn, "title", title.to_string());
         let now = chrono::Utc::now().to_rfc3339();
-        self.doc.put(&node_obj, "modified_at", &now)?;
+        node_map.insert(&mut txn, "modified_at", now);
         Ok(())
     }
 
     /// Set the tags of a node.
     pub fn set_tags(&mut self, id: NodeId, tags: &[String]) -> Result<()> {
-        let node_obj = self.node_obj(id)?;
-        // Replace tags list
-        let tags_list = self.doc.put_object(&node_obj, "tags", ObjType::List)?;
-        for (i, tag) in tags.iter().enumerate() {
-            self.doc.insert(&tags_list, i, tag.as_str())?;
+        let mut txn = self.doc.transact_mut();
+        let node_map = self.node_map(&txn, id)?;
+        // Replace the tags array wholesale, same as before.
+        let tags_array = node_map.insert(&mut txn, "tags", ArrayPrelim::default());
+        for tag in tags {
+            tags_array.push_back(&mut txn, tag.clone());
         }
         let now = chrono::Utc::now().to_rfc3339();
-        self.doc.put(&node_obj, "modified_at", &now)?;
+        node_map.insert(&mut txn, "modified_at", now);
         Ok(())
     }
 
     /// Set a custom metadata field on a node.
     pub fn set_custom(&mut self, id: NodeId, key: &str, value: &serde_json::Value) -> Result<()> {
-        let node_obj = self.node_obj(id)?;
-        let custom = match self.doc.get(&node_obj, "custom")? {
-            Some((automerge::Value::Object(ObjType::Map), id)) => id,
+        let mut txn = self.doc.transact_mut();
+        let node_map = self.node_map(&txn, id)?;
+        let custom = match node_map.get(&txn, "custom") {
+            Some(Out::YMap(m)) => m,
             _ => return Err(CrdtError::KeyNotFound("custom".into())),
         };
         // Store as JSON string for simplicity with complex values
-        let json_str = serde_json::to_string(value)
-            .map_err(|e| CrdtError::Serialization(e.to_string()))?;
-        self.doc.put(&custom, key, json_str)?;
+        let json_str = serde_json::to_string(value).map_err(|e| CrdtError::Serialization(e.to_string()))?;
+        custom.insert(&mut txn, key.to_string(), json_str);
         let now = chrono::Utc::now().to_rfc3339();
-        self.doc.put(&node_obj, "modified_at", &now)?;
+        node_map.insert(&mut txn, "modified_at", now);
         Ok(())
     }
 
     /// Get node info from the store document.
     pub fn get_node_info(&self, id: NodeId) -> Result<NodeInfo> {
-        let node_obj = self.node_obj(id)?;
+        let txn = self.doc.transact();
+        let node_map = self.node_map(&txn, id)?;
 
-        let parent_id = self.get_parent_id(id)?;
-        let node_type = self.get_str_field(&node_obj, "node_type")?;
-        let title = self.get_str_field(&node_obj, "title")?;
-        let created_at = self.get_str_field(&node_obj, "created_at")?;
-        let modified_at = self.get_str_field(&node_obj, "modified_at")?;
+        let parent_id = self.parent_id_of(&txn, id)?;
+        let node_type = Self::string_value(node_map.get(&txn, "node_type")).unwrap_or_default();
+        let title = Self::string_value(node_map.get(&txn, "title")).unwrap_or_default();
+        let created_at = Self::string_value(node_map.get(&txn, "created_at")).unwrap_or_default();
+        let modified_at = Self::string_value(node_map.get(&txn, "modified_at")).unwrap_or_default();
 
-        // Read tags
-        let tags = match self.doc.get(&node_obj, "tags")? {
-            Some((automerge::Value::Object(ObjType::List), tags_id)) => {
-                let len = self.doc.length(&tags_id);
-                let mut tags = Vec::with_capacity(len);
-                for i in 0..len {
-                    if let Some((automerge::Value::Scalar(s), _)) = self.doc.get(&tags_id, i)? {
-                        if let automerge::ScalarValue::Str(tag) = s.as_ref() {
-                            tags.push(tag.to_string());
-                        }
-                    }
-                }
-                tags
-            }
+        let tags = match node_map.get(&txn, "tags") {
+            Some(Out::YArray(a)) => a
+                .iter(&txn)
+                .filter_map(|out| Self::string_value(Some(out)))
+                .collect(),
             _ => Vec::new(),
         };
 
-        // Read custom fields
-        let custom = match self.doc.get(&node_obj, "custom")? {
-            Some((automerge::Value::Object(ObjType::Map), custom_id)) => {
+        let custom = match node_map.get(&txn, "custom") {
+            Some(Out::YMap(m)) => {
                 let mut custom = HashMap::new();
-                let keys = self.doc.keys(&custom_id);
-                for key in keys {
-                    if let Some((automerge::Value::Scalar(s), _)) = self.doc.get(&custom_id, &key)? {
-                        if let automerge::ScalarValue::Str(val) = s.as_ref() {
-                            if let Ok(parsed) = serde_json::from_str(val) {
-                                custom.insert(key, parsed);
+                for (key, value) in m.iter(&txn) {
+                    if let Out::Any(any) = value {
+                        if let Ok(s) = String::try_from(any) {
+                            if let Ok(parsed) = serde_json::from_str(&s) {
+                                custom.insert(key.to_string(), parsed);
                             }
                         }
                     }
@@ -333,66 +422,29 @@ impl StoreDocument {
 
     /// Get the ordered children of a node.
     pub fn get_children(&self, id: NodeId) -> Result<Vec<NodeId>> {
-        let node_obj = self.node_obj(id)?;
-        let children = self.children_list(&node_obj)?;
-        let len = self.doc.length(&children);
-        let mut result = Vec::with_capacity(len);
-        for i in 0..len {
-            if let Some((automerge::Value::Scalar(s), _)) = self.doc.get(&children, i)? {
-                if let automerge::ScalarValue::Str(child_id_str) = s.as_ref() {
-                    if let Ok(child_id) = NodeId::parse(child_id_str) {
-                        result.push(child_id);
-                    }
-                }
-            }
-        }
-        Ok(result)
+        let txn = self.doc.transact();
+        let children = self.children_array(&txn, id)?;
+        Ok(children
+            .iter(&txn)
+            .filter_map(|out| Self::string_value(Some(out)))
+            .filter_map(|s| NodeId::parse(&s).ok())
+            .collect())
     }
 
     /// List all node IDs in the store document.
     pub fn list_node_ids(&self) -> Result<Vec<NodeId>> {
-        let nodes = self.nodes_map()?;
-        let keys = self.doc.keys(&nodes);
-        let mut ids = Vec::new();
-        for key in keys {
-            if let Ok(id) = NodeId::parse(&key) {
-                ids.push(id);
-            }
-        }
-        Ok(ids)
+        let txn = self.doc.transact();
+        Ok(self
+            .nodes()
+            .keys(&txn)
+            .filter_map(|k| NodeId::parse(k).ok())
+            .collect())
     }
 
     /// Check if a node exists in the store document.
     pub fn has_node(&self, id: NodeId) -> bool {
-        self.node_obj(id).is_ok()
-    }
-
-    /// Get the current heads (for sync protocol).
-    pub fn get_heads(&mut self) -> Vec<automerge::ChangeHash> {
-        self.doc.get_heads()
-    }
-
-    /// Get the underlying AutoCommit document for advanced operations.
-    pub fn inner(&self) -> &AutoCommit {
-        &self.doc
-    }
-
-    /// Get mutable access to the underlying AutoCommit document.
-    pub fn inner_mut(&mut self) -> &mut AutoCommit {
-        &mut self.doc
-    }
-
-    /// Fork this document (create an independent copy for merge testing).
-    pub fn fork(&mut self) -> Self {
-        Self {
-            doc: self.doc.fork(),
-        }
-    }
-
-    /// Merge another store document into this one.
-    pub fn merge(&mut self, other: &mut StoreDocument) -> Result<()> {
-        self.doc.merge(&mut other.doc)?;
-        Ok(())
+        let txn = self.doc.transact();
+        matches!(self.nodes().get(&txn, &id.to_string()), Some(Out::YMap(_)))
     }
 
     /// Validate the tree structure and return any issues found.
@@ -406,7 +458,7 @@ impl StoreDocument {
 
         for &node_id in &node_ids {
             // Check parent exists
-            if let Ok(Some(parent_id)) = self.get_parent_id_result(node_id) {
+            if let Ok(Some(parent_id)) = self.parent_id_of(&self.doc.transact(), node_id) {
                 if !node_set.contains(&parent_id) {
                     issues.push(TreeIssue::OrphanNode {
                         node_id,
@@ -424,10 +476,7 @@ impl StoreDocument {
                             child_id,
                         });
                     }
-                    child_to_parents
-                        .entry(child_id)
-                        .or_default()
-                        .push(node_id);
+                    child_to_parents.entry(child_id).or_default().push(node_id);
                 }
             }
         }
@@ -447,97 +496,79 @@ impl StoreDocument {
 
     // ── Private helpers ─────────────────────────────────────────────
 
-    fn get_parent_id(&self, id: NodeId) -> Result<Option<NodeId>> {
-        self.get_parent_id_result(id)
-    }
-
-    fn get_parent_id_result(&self, id: NodeId) -> Result<Option<NodeId>> {
-        let node_obj = self.node_obj(id)?;
-        match self.doc.get(&node_obj, "parent_id")? {
-            Some((automerge::Value::Scalar(s), _)) => match s.as_ref() {
-                automerge::ScalarValue::Str(pid_str) => {
-                    let pid = NodeId::parse(pid_str)
-                        .map_err(|e| CrdtError::Serialization(e.to_string()))?;
-                    Ok(Some(pid))
-                }
-                automerge::ScalarValue::Null => Ok(None),
-                _ => Ok(None),
-            },
-            _ => Ok(None),
+    fn parent_id_of<T: ReadTxn>(&self, txn: &T, id: NodeId) -> Result<Option<NodeId>> {
+        let node_map = self.node_map(txn, id)?;
+        match Self::string_value(node_map.get(txn, "parent_id")) {
+            Some(s) => NodeId::parse(&s)
+                .map(Some)
+                .map_err(|e| CrdtError::Serialization(e.to_string())),
+            None => Ok(None),
         }
     }
 
-    fn get_str_field(&self, obj: &automerge::ObjId, key: &str) -> Result<String> {
-        match self.doc.get(obj, key)? {
-            Some((automerge::Value::Scalar(s), _)) => match s.as_ref() {
-                automerge::ScalarValue::Str(s) => Ok(s.to_string()),
-                _ => Err(CrdtError::TypeMismatch {
-                    expected: "string".into(),
-                    actual: format!("{:?}", s),
-                }),
-            },
-            _ => Ok(String::new()),
+    fn string_value(out: Option<Out>) -> Option<String> {
+        match out {
+            Some(Out::Any(any)) => String::try_from(any).ok(),
+            _ => None,
         }
     }
 
-    fn remove_from_children_list(&mut self, parent_id: NodeId, child_id: NodeId) -> Result<()> {
-        let parent_obj = self.node_obj(parent_id)?;
-        let children = self.children_list(&parent_obj)?;
-        let len = self.doc.length(&children);
+    fn remove_from_children_list(children: &ArrayRef, txn: &mut TransactionMut, child_id: NodeId) {
         let child_str = child_id.to_string();
-
+        let len = children.len(txn);
         for i in (0..len).rev() {
-            if let Some((automerge::Value::Scalar(s), _)) = self.doc.get(&children, i)? {
-                if let automerge::ScalarValue::Str(val) = s.as_ref() {
-                    if val == &child_str {
-                        self.doc.delete(&children, i)?;
+            if let Some(Out::Any(any)) = children.get(txn, i) {
+                if let Ok(s) = String::try_from(any) {
+                    if s == child_str {
+                        children.remove(txn, i);
                         break;
                     }
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Update the modified_at timestamp of a node to now.
     pub fn touch_modified(&mut self, id: NodeId) -> Result<()> {
-        let node_obj = self.node_obj(id)?;
+        let mut txn = self.doc.transact_mut();
+        let node_map = self.node_map(&txn, id)?;
         let now = chrono::Utc::now().to_rfc3339();
-        self.doc.put(&node_obj, "modified_at", &now)?;
+        node_map.insert(&mut txn, "modified_at", now);
         Ok(())
     }
 
     /// Set the node type of a node.
     pub fn set_node_type(&mut self, id: NodeId, node_type: &str) -> Result<()> {
-        let node_obj = self.node_obj(id)?;
-        self.doc.put(&node_obj, "node_type", node_type)?;
+        let mut txn = self.doc.transact_mut();
+        let node_map = self.node_map(&txn, id)?;
+        node_map.insert(&mut txn, "node_type", node_type.to_string());
         Ok(())
     }
 
     /// Set the parent_id of a node (used during migration).
     pub fn set_parent_id(&mut self, id: NodeId, parent_id: Option<NodeId>) -> Result<()> {
-        let node_obj = self.node_obj(id)?;
+        let mut txn = self.doc.transact_mut();
+        let node_map = self.node_map(&txn, id)?;
         if let Some(pid) = parent_id {
-            self.doc.put(&node_obj, "parent_id", pid.to_string())?;
+            node_map.insert(&mut txn, "parent_id", pid.to_string());
         }
         Ok(())
     }
 
     /// Append a child to a node's children list (used during migration).
     pub fn append_child(&mut self, parent_id: NodeId, child_id: NodeId) -> Result<()> {
-        let parent_obj = self.node_obj(parent_id)?;
-        let children = self.children_list(&parent_obj)?;
-        let len = self.doc.length(&children);
-        self.doc.insert(&children, len, child_id.to_string())?;
+        let mut txn = self.doc.transact_mut();
+        let children = self.children_array(&txn, parent_id)?;
+        children.push_back(&mut txn, child_id.to_string());
         Ok(())
     }
 
     /// Set timestamps on a node (used during migration).
     pub fn set_timestamps(&mut self, id: NodeId, created_at: &str, modified_at: &str) -> Result<()> {
-        let node_obj = self.node_obj(id)?;
-        self.doc.put(&node_obj, "created_at", created_at)?;
-        self.doc.put(&node_obj, "modified_at", modified_at)?;
+        let mut txn = self.doc.transact_mut();
+        let node_map = self.node_map(&txn, id)?;
+        node_map.insert(&mut txn, "created_at", created_at.to_string());
+        node_map.insert(&mut txn, "modified_at", modified_at.to_string());
         Ok(())
     }
 
@@ -550,16 +581,16 @@ impl StoreDocument {
         created_at: &str,
         modified_at: &str,
     ) -> Result<()> {
-        let nodes = self.nodes_map()?;
+        let mut txn = self.doc.transact_mut();
         let key = id.to_string();
-        let node_obj = self.doc.put_object(&nodes, &key, ObjType::Map)?;
-        self.doc.put(&node_obj, "node_type", node_type)?;
-        let _children = self.doc.put_object(&node_obj, "children", ObjType::List)?;
-        self.doc.put(&node_obj, "title", title)?;
-        let _tags = self.doc.put_object(&node_obj, "tags", ObjType::List)?;
-        let _custom = self.doc.put_object(&node_obj, "custom", ObjType::Map)?;
-        self.doc.put(&node_obj, "created_at", created_at)?;
-        self.doc.put(&node_obj, "modified_at", modified_at)?;
+        let node_map = self.nodes().insert(&mut txn, key, MapPrelim::default());
+        node_map.insert(&mut txn, "node_type", node_type.to_string());
+        node_map.insert(&mut txn, "title", title.to_string());
+        node_map.insert(&mut txn, "created_at", created_at.to_string());
+        node_map.insert(&mut txn, "modified_at", modified_at.to_string());
+        node_map.insert(&mut txn, "tags", ArrayPrelim::default());
+        node_map.insert(&mut txn, "custom", MapPrelim::default());
+        node_map.insert(&mut txn, "children", ArrayPrelim::default());
         Ok(())
     }
 }
@@ -731,30 +762,6 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_merge() {
-        let root_id = NodeId::new();
-        let mut doc1 = StoreDocument::new("Store", root_id).unwrap();
-
-        // Fork
-        let mut doc2 = doc1.fork();
-
-        // Concurrent changes: each adds a child to root
-        let child_a = NodeId::new();
-        let child_b = NodeId::new();
-        doc1.add_node(child_a, Some(root_id), "document", "A").unwrap();
-        doc2.add_node(child_b, Some(root_id), "document", "B").unwrap();
-
-        // Merge
-        doc1.merge(&mut doc2).unwrap();
-
-        // Both children should appear
-        let children = doc1.get_children(root_id).unwrap();
-        assert_eq!(children.len(), 2);
-        assert!(children.contains(&child_a));
-        assert!(children.contains(&child_b));
-    }
-
-    #[test]
     fn test_validate_tree_clean() {
         let root_id = NodeId::new();
         let mut doc = StoreDocument::new("Store", root_id).unwrap();
@@ -764,5 +771,100 @@ mod tests {
 
         let issues = doc.validate_tree().unwrap();
         assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn round_trip_save_load() {
+        let root_id = NodeId::new();
+        let mut doc = StoreDocument::new("Store", root_id).unwrap();
+
+        let child = NodeId::new();
+        doc.add_node(child, Some(root_id), "document", "Doc").unwrap();
+        doc.set_tags(child, &["a".to_string(), "b".to_string()]).unwrap();
+
+        let bytes = doc.save();
+        let loaded = StoreDocument::load(&bytes).unwrap();
+
+        assert_eq!(loaded.root_node_id().unwrap(), root_id);
+        assert_eq!(loaded.get_children(root_id).unwrap(), vec![child]);
+        let info = loaded.get_node_info(child).unwrap();
+        assert_eq!(info.title, "Doc");
+        assert_eq!(info.tags, vec!["a", "b"]);
+        assert_eq!(loaded.state_vector(), doc.state_vector());
+    }
+
+    #[test]
+    fn two_replicas_add_children_converge() {
+        // `b` starts as an exact copy of `a` (same underlying object identities), then
+        // each replica independently adds a *different* child under the shared root
+        // before exchanging state-vector diffs — the scenario `diff_since`/
+        // `apply_update` exist for.
+        let root_id = NodeId::new();
+        let a = StoreDocument::new("Store", root_id).unwrap();
+        let mut b = StoreDocument::load(&a.save()).unwrap();
+        let mut a = a;
+
+        let child_a = NodeId::new();
+        let child_b = NodeId::new();
+        a.add_node(child_a, Some(root_id), "document", "A").unwrap();
+        b.add_node(child_b, Some(root_id), "document", "B").unwrap();
+
+        let a_sv = a.state_vector();
+        let b_sv = b.state_vector();
+
+        let diff_for_b = a.diff_since(&b_sv).unwrap();
+        let diff_for_a = b.diff_since(&a_sv).unwrap();
+
+        b.apply_update(&diff_for_b).unwrap();
+        a.apply_update(&diff_for_a).unwrap();
+
+        let a_children: std::collections::HashSet<_> = a.get_children(root_id).unwrap().into_iter().collect();
+        let b_children: std::collections::HashSet<_> = b.get_children(root_id).unwrap().into_iter().collect();
+
+        assert_eq!(a_children.len(), 2);
+        assert!(a_children.contains(&child_a));
+        assert!(a_children.contains(&child_b));
+        assert_eq!(a_children, b_children);
+
+        assert!(a.validate_tree().unwrap().is_empty());
+        assert!(b.validate_tree().unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrate_from_legacy_preserves_everything() {
+        let root_id = NodeId::new();
+        let mut legacy = LegacyStoreDocument::new("Legacy Store", root_id).unwrap();
+
+        let folder_id = NodeId::new();
+        legacy.add_node(folder_id, Some(root_id), "folder", "A Folder").unwrap();
+
+        let doc_id = NodeId::new();
+        legacy.add_node(doc_id, Some(root_id), "document", "A Document").unwrap();
+        legacy.set_tags(doc_id, &["tag1".to_string(), "tag2".to_string()]).unwrap();
+        legacy.set_custom(doc_id, "explicit_title", &serde_json::json!(true)).unwrap();
+        legacy.set_timestamps(doc_id, "2020-01-01T00:00:00+00:00", "2020-06-01T00:00:00+00:00").unwrap();
+
+        let nested_child_id = NodeId::new();
+        legacy.add_node(nested_child_id, Some(folder_id), "document", "Nested").unwrap();
+
+        let migrated = StoreDocument::from_legacy(&legacy).unwrap();
+
+        for id in [root_id, folder_id, doc_id, nested_child_id] {
+            let legacy_info = legacy.get_node_info(id).unwrap();
+            let migrated_info = migrated.get_node_info(id).unwrap();
+
+            assert_eq!(migrated_info.id, legacy_info.id);
+            assert_eq!(migrated_info.parent_id, legacy_info.parent_id);
+            assert_eq!(migrated_info.node_type, legacy_info.node_type);
+            assert_eq!(migrated_info.title, legacy_info.title);
+            assert_eq!(migrated_info.tags, legacy_info.tags);
+            assert_eq!(migrated_info.custom, legacy_info.custom);
+            assert_eq!(migrated_info.created_at, legacy_info.created_at);
+            assert_eq!(migrated_info.modified_at, legacy_info.modified_at);
+
+            assert_eq!(migrated.get_children(id).unwrap(), legacy.get_children(id).unwrap());
+        }
+
+        assert!(migrated.validate_tree().unwrap().is_empty());
     }
 }

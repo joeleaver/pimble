@@ -354,9 +354,10 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 store.set_mount_state(*store_id, *node_id, state.clone());
             }
 
-            BackendEvent::StoreDocumentSynced { store_id } => {
+            BackendEvent::StoreDocumentSynced { store_id, diff: _ } => {
                 tracing::info!("Store document synced: {:?}", store_id);
-                // Re-fetch the tree to reflect any changes from sync
+                // The app holds no local StoreDocument to merge the diff into —
+                // just re-fetch the tree to reflect any changes from sync.
                 if let Some(root_id) = store.root_node_id(*store_id) {
                     store.send(BackendCommand::GetChildren {
                         store_id: *store_id,

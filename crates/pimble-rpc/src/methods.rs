@@ -108,7 +108,11 @@ pub trait PimbleApi {
     // Sync Operations
     // ========================================================================
 
-    /// Sync store document (tree structure + metadata) using Automerge sync protocol
+    /// Sync a store document (tree structure + metadata): send a yrs state
+    /// vector, receive a diff of everything the server has beyond it.
+    /// Stateless — the server keeps no per-client sync state. If the client
+    /// also has local changes the server lacks, it sends those separately
+    /// via `applyStoreUpdate`.
     #[method(name = "syncStoreDocument")]
     async fn sync_store_document(&self, request: SyncStoreDocumentRequest) -> Result<SyncStoreDocumentResponse, ErrorObjectOwned>;
 
@@ -117,6 +121,11 @@ pub trait PimbleApi {
     /// keeps no per-client sync state for content documents.
     #[method(name = "syncNodeContent")]
     async fn sync_node_content(&self, request: SyncNodeContentRequest) -> Result<SyncNodeContentResponse, ErrorObjectOwned>;
+
+    /// Apply a yrs update to the store document (tree structure + metadata)
+    /// and broadcast it to the store's other subscribers.
+    #[method(name = "applyStoreUpdate")]
+    async fn apply_store_update(&self, request: ApplyStoreUpdateRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
 
     // ========================================================================
     // Subscription Operations

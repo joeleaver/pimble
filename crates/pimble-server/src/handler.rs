@@ -4,28 +4,25 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use automerge::sync::{self, SyncDoc};
 use jsonrpsee::core::{async_trait, SubscriptionResult};
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{PendingSubscriptionSink, SubscriptionMessage};
 use pimble_core::{Node, MountRef, NodeId, StoreId, Workspace};
 use pimble_rpc::{
-    to_rpc_error, ApplyEditRequest, ApplyEditResponse, CloseStoreRequest, CreateMountRequest,
-    CreateMountResponse, CreateNodeRequest, CreateNodeResponse, CreateStoreRequest,
-    CreateStoreResponse, CreateWorkspaceRequest, DeleteNodeRequest, EditOperation, EmptyResponse,
-    GetChildrenRequest, GetChildrenResponse, GetMountStateRequest, GetMountStateResponse,
-    GetNodeRequest, GetNodeResponse, GetNodesRequest, GetNodesResponse, ListStoresResponse,
-    LoadWorkspaceRequest, LoadWorkspaceResponse, MoveNodeRequest, NodeContentChangedNotification,
-    OpenStoreRequest, OpenStoreResponse, PimbleApiServer, SaveWorkspaceRequest, SearchRequest,
-    SearchResponse, StoreChangeKind, StoreChangedNotification,
+    to_rpc_error, ApplyEditRequest, ApplyEditResponse, ApplyStoreUpdateRequest, CloseStoreRequest,
+    CreateMountRequest, CreateMountResponse, CreateNodeRequest, CreateNodeResponse,
+    CreateStoreRequest, CreateStoreResponse, CreateWorkspaceRequest, DeleteNodeRequest,
+    EditOperation, EmptyResponse, GetChildrenRequest, GetChildrenResponse, GetMountStateRequest,
+    GetMountStateResponse, GetNodeRequest, GetNodeResponse, GetNodesRequest, GetNodesResponse,
+    ListStoresResponse, LoadWorkspaceRequest, LoadWorkspaceResponse, MoveNodeRequest,
+    NodeContentChangedNotification, OpenStoreRequest, OpenStoreResponse, PimbleApiServer,
+    SaveWorkspaceRequest, SearchRequest, SearchResponse, StoreChangeKind, StoreChangedNotification,
     SyncNodeContentRequest, SyncNodeContentResponse, SyncStoreDocumentRequest,
     SyncStoreDocumentResponse, UpdateNodeContentRequest, UpdateNodeMetadataRequest,
 };
 use pimble_store::StoreManager;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
-
-use crate::sync_state::ServerSyncManager;
 
 /// How long to wait after a content edit before flushing it to disk. A burst
 /// of keystrokes coalesces into at most one flush per window, instead of one
@@ -129,7 +126,6 @@ impl SubscriptionRegistry {
 /// RPC handler implementation
 pub struct RpcHandler {
     store_manager: Arc<RwLock<StoreManager>>,
-    sync_manager: Arc<RwLock<ServerSyncManager>>,
     subscriptions: Arc<RwLock<SubscriptionRegistry>>,
     flush_debouncer: Arc<FlushDebouncer>,
 }
@@ -138,7 +134,6 @@ impl RpcHandler {
     pub fn new(store_manager: Arc<RwLock<StoreManager>>) -> Self {
         Self {
             store_manager,
-            sync_manager: Arc::new(RwLock::new(ServerSyncManager::new())),
             subscriptions: Arc::new(RwLock::new(SubscriptionRegistry::new())),
             flush_debouncer: Arc::new(FlushDebouncer::default()),
         }
@@ -194,6 +189,7 @@ impl RpcHandler {
             store_id,
             change_kind: kind,
             source_client_id: source.map(String::from),
+            update: None,
         };
         self.subscriptions.write().await.notify_store_change(&notification).await;
     }
@@ -210,6 +206,7 @@ impl RpcHandler {
             store_id,
             change_kind: StoreChangeKind::ContentUpdated { node_id },
             source_client_id: source.map(String::from),
+            update: None,
         };
         // Acquire lock once for both notification types
         let mut registry = self.subscriptions.write().await;
@@ -272,11 +269,9 @@ impl PimbleApiServer for RpcHandler {
             .close_store(request.store_id)
             .await
             .map_err(to_rpc_error)?;
+        drop(manager);
 
-        // Clean up sync states and subscriptions for this store
-        let mut sync_mgr = self.sync_manager.write().await;
-        sync_mgr.remove_store(request.store_id);
-        drop(sync_mgr);
+        // Clean up subscriptions for this store
         self.subscriptions.write().await.remove_store(request.store_id);
 
         Ok(EmptyResponse {})
@@ -553,76 +548,72 @@ impl PimbleApiServer for RpcHandler {
         &self,
         request: SyncStoreDocumentRequest,
     ) -> Result<SyncStoreDocumentResponse, ErrorObjectOwned> {
-        debug!(
-            "Sync store document for store {} from client {}",
+        debug!("Sync store document for store {}", request.store_id);
+
+        use base64::Engine;
+
+        let client_sv = base64::engine::general_purpose::STANDARD
+            .decode(&request.state_vector)
+            .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
+
+        let store_manager = self.store_manager.read().await;
+
+        // Stateless reconciliation: no per-client sync state is kept for the
+        // store document. The client sends its state vector, we hand back
+        // everything we have beyond it plus our own state vector. If the
+        // client has local changes the server lacks, it sends those
+        // separately via `applyStoreUpdate`.
+        let diff = store_manager
+            .store_doc_diff_since(request.store_id, &client_sv)
+            .map_err(to_rpc_error)?;
+        let server_sv = store_manager
+            .store_doc_state_vector(request.store_id)
+            .map_err(to_rpc_error)?;
+
+        Ok(SyncStoreDocumentResponse {
+            diff: base64::engine::general_purpose::STANDARD.encode(&diff),
+            state_vector: base64::engine::general_purpose::STANDARD.encode(&server_sv),
+        })
+    }
+
+    async fn apply_store_update(
+        &self,
+        request: ApplyStoreUpdateRequest,
+    ) -> Result<EmptyResponse, ErrorObjectOwned> {
+        info!(
+            "Applying store update to store {} from client {}",
             request.store_id, request.client_id
         );
 
         use base64::Engine;
 
-        // Decode incoming message if present
-        let incoming_msg = if let Some(ref encoded) = request.message {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
-            Some(
-                sync::Message::decode(&bytes)
-                    .map_err(|e| to_rpc_error(format!("Invalid sync message: {}", e)))?,
-            )
-        } else {
-            None
-        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&request.update)
+            .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
 
-        let mut store_manager = self.store_manager.write().await;
-        let mut sync_mgr = self.sync_manager.write().await;
-
-        let store_doc = store_manager
-            .store_document_mut(request.store_id)
+        let mut manager = self.store_manager.write().await;
+        manager
+            .apply_store_doc_update(request.store_id, &bytes)
             .map_err(to_rpc_error)?;
 
-        let sync_state = sync_mgr.store_doc_state(&request.client_id, request.store_id);
+        manager
+            .flush(request.store_id)
+            .await
+            .map_err(to_rpc_error)?;
 
-        // Apply incoming message
-        if let Some(msg) = incoming_msg {
-            store_doc
-                .inner_mut()
-                .sync()
-                .receive_sync_message(sync_state, msg)
-                .map_err(|e| to_rpc_error(format!("Sync receive error: {}", e)))?;
-        }
+        drop(manager);
 
-        // Generate outgoing message
-        let outgoing = store_doc
-            .inner_mut()
-            .sync()
-            .generate_sync_message(sync_state);
+        // Broadcast to other subscribers, carrying the raw update bytes so
+        // they can apply it directly instead of refetching.
+        let notification = StoreChangedNotification {
+            store_id: request.store_id,
+            change_kind: StoreChangeKind::TreeStructure,
+            source_client_id: Some(request.client_id.clone()),
+            update: Some(request.update.clone()),
+        };
+        self.subscriptions.write().await.notify_store_change(&notification).await;
 
-        let response_msg = outgoing.map(|msg: sync::Message| {
-            base64::engine::general_purpose::STANDARD.encode(msg.encode())
-        });
-
-        // Flush and validate if we received changes
-        if request.message.is_some() {
-            // Validate tree after sync
-            if let Ok(issues) = store_doc.validate_tree() {
-                for issue in &issues {
-                    tracing::warn!("Tree issue after sync in store {}: {:?}", request.store_id, issue);
-                }
-            }
-
-            drop(sync_mgr);
-            store_manager
-                .flush(request.store_id)
-                .await
-                .map_err(to_rpc_error)?;
-
-            // Notify subscribers about tree changes
-            self.notify_store_change(request.store_id, StoreChangeKind::TreeStructure, None).await;
-        }
-
-        Ok(SyncStoreDocumentResponse {
-            message: response_msg,
-        })
+        Ok(EmptyResponse {})
     }
 
     async fn sync_node_content(

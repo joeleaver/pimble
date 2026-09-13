@@ -22,7 +22,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 base64 = { workspace = true }
-automerge = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

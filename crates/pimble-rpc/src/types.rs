@@ -310,20 +310,39 @@ pub struct ApplyEditResponse {}
 // Sync Operations
 // ============================================================================
 
-/// Request to sync a store document (tree/metadata)
+/// Request to sync a store document (tree/metadata). Stateless: the client
+/// sends its yrs state vector and the server responds with everything it has
+/// beyond it. No per-client state is kept on the server. If the client also
+/// has local changes the server lacks, it sends those separately via
+/// `applyStoreUpdate`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncStoreDocumentRequest {
     pub store_id: StoreId,
-    pub client_id: String,
-    /// Base64-encoded Automerge sync message, or None to initiate
-    pub message: Option<String>,
+    /// Base64-encoded yrs v1 state vector
+    pub state_vector: String,
 }
 
 /// Response from store document sync
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncStoreDocumentResponse {
-    /// Base64-encoded Automerge sync message, or None if in sync
-    pub message: Option<String>,
+    /// Base64-encoded yrs v1 update: everything the server has that the
+    /// client's state vector lacked. May be empty (base64 of zero bytes) if
+    /// the client was already up to date.
+    pub diff: String,
+    /// The server's own state vector (base64-encoded yrs v1), for the client
+    /// to compute what it should send next.
+    pub state_vector: String,
+}
+
+/// Request to apply a yrs update to the store document (a delta,
+/// reconciliation diff, or whole snapshot) and broadcast it to the store's
+/// other subscribers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyStoreUpdateRequest {
+    pub store_id: StoreId,
+    pub client_id: String,
+    /// Base64-encoded yrs v1 update
+    pub update: String,
 }
 
 /// Request to sync a node's content document. Stateless: the client sends
@@ -362,6 +381,11 @@ pub struct StoreChangedNotification {
     /// Which client caused this change (for echo suppression)
     #[serde(default)]
     pub source_client_id: Option<String>,
+    /// The raw yrs update (base64-encoded) that caused the change, when one
+    /// is available (currently: `applyStoreUpdate`), so subscribers can
+    /// apply it directly instead of refetching. `None` otherwise.
+    #[serde(default)]
+    pub update: Option<String>,
 }
 
 /// Kind of store change
