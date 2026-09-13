@@ -1,10 +1,10 @@
 # Step 5 contract: search and graph index on rhypedb (draft, dispatch-ready)
 
-Status: drafted 2026-09-13. Decision made the same day: Option 1, full-text search is
-built into rhypedb first (https://github.com/joeleaver/rhypedb/issues/16). Dispatch this
-contract once that lands, pointing the rhypedb git dependency at the branch or tag that
-has it. The Option 2 paragraph under "Keyword search" is kept only as the fallback if the
-rhypedb work slips.
+Status: rhypedb issue #16 (`@fulltext`, `.matches` with BM25 scores and phrases,
+`.contains`) landed on rhypedb `master` on 2026-09-13. This contract is dispatch-ready.
+Chunking (below) was added the same day: rhypedb embeds a `@vectorize` source field whole,
+and `all-MiniLM-L6-v2` truncates long inputs, so semantic search runs over chunks while
+keyword search runs over whole nodes.
 
 ## Ownership
 
@@ -29,14 +29,23 @@ workspace-level `semantic` feature story), remove `tantivy` from the workspace d
 type Node {
   node_id: String @unique
   kind: String
-  title: String
-  text: String
+  title: String @fulltext
+  text: String @fulltext
   modified_at: i64
   parent: Node
   children: [Node] @inverse(Node.parent)
   links: [Node]
   backlinks: [Node] @inverse(Node.links)
   tags: [Tag] @on_delete(remove)
+  chunks: [Chunk] @inverse(Chunk.node)
+}
+
+type Chunk {
+  chunk_id: String @unique          // "{node_id}:{ordinal}"
+  node: Node @on_delete(cascade)
+  ordinal: u32
+  hash: String                      // content hash of `text`; unchanged chunks are not re-embedded
+  text: String
   embedding: Vector<384> @vectorize(source: "text", model: "all-MiniLM-L6-v2")
                          @index(hnsw, metric: cosine)
 }
@@ -44,21 +53,54 @@ type Node {
 type Tag { name: String @unique }
 ```
 
-  The `embedding` line is present only when the `semantic` feature is on; A ships two
-  schema files or one with a marker the crate strips.
+  Without the `semantic` feature the `Chunk` type is omitted from the schema and no chunks
+  are written; A ships the schema as one file with a `// semantic:` marker the crate strips.
+
+- Chunking (pure function in `pimble-search`, unit-tested, no I/O):
+  - Input is the node's block list, not its flat text. A adds
+    `ContentDoc::blocks(&self) -> Vec<Block { kind: BlockKind, text: String }>` to
+    `pimble-crdt` (`BlockKind::{Paragraph, Heading(u8), CodeBlock}`), reusing the existing
+    projection walk; `text()` becomes `blocks().join("\n")`.
+  - Walk the blocks in order, accumulating consecutive blocks into a chunk until adding
+    the next block would exceed 200 words (about 256 word-pieces, the model's training
+    window). A single block longer than 200 words is split at sentence boundaries, then at
+    word boundaries, into pieces of at most 200 words with a 30-word overlap between
+    consecutive pieces.
+  - Each chunk's embedding source is `"{title}\n{nearest preceding heading, if any}\n{chunk text}"`,
+    so a chunk carries its section context; `Chunk.text` stores the chunk text only and the
+    context prefix is passed as the vectorize source by writing it into a separate
+    `source: String` field if rhypedb requires the source to be a stored field (A checks;
+    if so, `embedding` vectorizes `source` and `text` stays the display text).
+  - Ordinals are stable positions in the block order. On re-index, compute the new chunk
+    list, `hash` each chunk, and per ordinal: unchanged hash means no write; changed hash
+    means update `text` (rhypedb re-embeds on update); missing ordinals are deleted. This
+    keeps a keystroke-debounced flush from re-embedding an entire document.
+  - Empty nodes (folders, blank documents) produce zero chunks.
+
+- Ranking:
+  - Keyword: `Node.matches(.title, q, k)` and `Node.matches(.text, q, k)`, merged by node
+    with title hits weighted 2x. Snippet: Pimble finds the first query term in the node's
+    text and returns a window of about 160 characters around it, computed from
+    `ContentDoc::text()` at query time (rhypedb returns scores, not snippets).
+  - Semantic: `Chunk.similar(.embedding, q, k: 3 * limit)`, grouped by node keeping each
+    node's best chunk; the snippet is that chunk's text.
+  - `semantic: true` in `SearchRequest` means hybrid: reciprocal rank fusion (k = 60) of
+    the keyword node list and the semantic node list, so an exact term and a paraphrase
+    both surface. `semantic: false` is keyword only.
 
 - Feed: the server already calls `notify_store_change` and `notify_node_content_change`
   for every mutation. B adds an in-process `IndexFeed` hook next to those calls (not over
   the WebSocket) that enqueues `(store_id, node_id, IndexEvent::{Upsert, Remove, Moved})`
   to a tokio task owning the store's `SearchIndex`. Content upserts are debounced per node
-  (1s) because `applyEdit` fires per keystroke; the indexer reads `ContentDoc::text()` at
-  flush time, never per delta.
+  (2s) because `applyEdit` fires per keystroke; the indexer reads `ContentDoc::blocks()` at
+  flush time, never per delta, and the chunk hashes keep unchanged chunks from re-embedding.
 - Query: `search(SearchRequest { query, stores, semantic, limit })` returns
   `SearchResultItem { node_id, store_id, score, title, snippet }`. `snippet` is the first
   match window in `text` (keyword) or the first 160 chars (semantic).
-- Node text comes from `ContentDoc::text()`; A adds nothing to the CRDT crates. (Follow-up
-  1 in `NEXT_SESSION.md`, the per-node text cache, can land in `pimble-store` first if the
-  indexer is too slow on the 567-node store.)
+- Node text and blocks come from `ContentDoc`; the only CRDT-crate change is the new
+  `blocks()` projection. (Follow-up 1 in `NEXT_SESSION.md`, the per-node projection cache in
+  `pimble-store`, is worth doing in the same step: the indexer and the tree labels both
+  read it.)
 
 ## A. `pimble-search`
 
@@ -84,23 +126,24 @@ queries where the query language is enough; fall back to `Database` calls (`get`
 `rhypedb-engine/onnx-dynamic` (ORT_DYLIB_PATH at runtime) so day-to-day builds stay
 offline; document `onnx-download` as the alternative.
 
-Keyword search:
-- Option 1 (chosen): `title: String @fulltext` and `text: String @fulltext` in the schema;
-  keyword search is `Node.matches(.text, "<query>", k: limit)` merged with a title query
-  (`Node.matches(.title, "<query>", k: limit)`, title hits weighted 2x), ranked by the
-  engine's BM25 score. See rhypedb issue #16 for the exact step syntax once merged.
-- Option 2: `scan_type("Node")` filtered case-insensitively on `title` then `text`,
-  scored: title match 2.0, text match 1.0, ties by `modified_at` desc. Fine for
-  thousands of nodes; a TODO points at Option 1.
+Keyword and semantic search are as specified under "Ranking" in the Design section.
+`.matches` on a field whose index is still backfilling returns an error carrying progress;
+`SearchIndex::search` maps that to `SearchError::IndexBuilding { done, total }` so the UI
+can say so. When the `semantic` feature is off, a hybrid request degrades to keyword only
+and the response says `semantic: false`.
 
-Semantic: `Node.similar(.embedding, "<query>", k: limit)`; results carry the engine's
-score. When `semantic` is off, `SearchQuery.semantic = true` returns an error the UI can
-show ("semantic search is not built in").
+`chunk_blocks(title, blocks) -> Vec<ChunkSpec { ordinal, text, source, hash }>` is public and
+tested on its own: a 5-paragraph note under 200 words yields one chunk; a 900-word
+paragraph yields five overlapping pieces; a heading followed by three paragraphs gives
+chunks whose `source` starts with the title and that heading; identical input yields
+identical hashes.
 
 Tests: tempdir index; upsert three nodes with a parent chain and one link; keyword hit on
-title outranks hit on text; `backlinks` returns the linker; `remove` drops the node and
-its backlink; `clear` + re-upsert works. Semantic tests behind the feature and `#[ignore]`
-by default (they download a model).
+title outranks hit on text; a phrase query matches only the node with the phrase; the
+snippet contains the query term; `backlinks` returns the linker; `remove` drops the node,
+its chunks and its backlink; re-upsert with one changed paragraph rewrites exactly one
+chunk; `clear` + re-upsert works. Semantic tests behind the feature and `#[ignore]` by
+default (they download a model).
 
 ## B. Server, RPC, client
 
@@ -129,5 +172,6 @@ by default (they download a model).
 ## Done means
 
 Import the Scrivener project, type a word that appears in one document, see it in the
-results within a second, click it, land in that document. With `semantic` on, a
-paraphrase finds the same document.
+results within a second with a snippet around the word, click it, land in that document.
+With `semantic` on, a paraphrase of a paragraph deep inside a long document finds that
+document and shows that paragraph as the snippet; editing one paragraph re-embeds one chunk.
