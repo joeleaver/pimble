@@ -1,7 +1,7 @@
 # Pimble - Claude Context
 
 This file provides context for Claude Code sessions working on this project.
-Read `docs/RESTART_PLAN.md` first: it holds the vision, the diagnosis of what went wrong,
+Read `docs/NEXT_SESSION.md` first (where things stand, the open decision, how to verify), then `docs/RESTART_PLAN.md`: it holds the vision, the diagnosis of what went wrong,
 and the ordered plan.
 
 ## Project Overview
