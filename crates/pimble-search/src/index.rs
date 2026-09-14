@@ -868,8 +868,23 @@ pub(crate) fn with_trailing_prefix(query: &str) -> String {
     if word.chars().filter(|c| c.is_alphanumeric()).count() < 2 {
         return query.to_string();
     }
+    // rhypedb's english analyzer drops stop words, but a prefix term bypasses
+    // that: "of*" would match "office" and "the*" "theocratic". A stop word the
+    // user is still typing is far more often the word itself than a prefix.
+    if PREFIX_STOP_WORDS.contains(&word.to_lowercase().as_str()) {
+        return query.to_string();
+    }
     format!("{trimmed}*")
 }
+
+/// Short English function words that are never expanded into prefix terms.
+const PREFIX_STOP_WORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "do", "for", "from", "had",
+    "has", "have", "he", "her", "his", "how", "i", "if", "in", "is", "it", "its", "me",
+    "my", "no", "not", "of", "on", "or", "our", "she", "so", "that", "the", "their", "them",
+    "they", "this", "to", "up", "us", "was", "we", "were", "what", "when", "who", "will",
+    "with", "you", "your",
+];
 
 #[cfg(test)]
 mod tests {
@@ -883,6 +898,10 @@ mod tests {
         assert_eq!(with_trailing_prefix("\"security cameras\""), "\"security cameras\"");
         assert_eq!(with_trailing_prefix("c"), "c");
         assert_eq!(with_trailing_prefix("+cam"), "+cam*");
+        assert_eq!(with_trailing_prefix("of"), "of");
+        assert_eq!(with_trailing_prefix("video of"), "video of");
+        assert_eq!(with_trailing_prefix("The"), "The");
+        assert_eq!(with_trailing_prefix("theo"), "theo*");
     }
 
     use super::*;
