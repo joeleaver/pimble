@@ -143,6 +143,11 @@ pub struct GetChildrenRequest {
 /// Response with children nodes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetChildrenResponse {
+    /// The canonical store the returned children live in: the request's
+    /// `store_id` for an ordinary node, the mount's source store for a mount
+    /// point (its `store.yrs` is what actually holds them). Clients address
+    /// every child by `(store_id, child.id)`.
+    pub store_id: StoreId,
     pub children: Vec<Node>,
 }
 

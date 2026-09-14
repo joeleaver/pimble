@@ -879,7 +879,7 @@ impl PimbleApiServer for RpcHandler {
             .await
             .map_err(to_rpc_error)?;
 
-        Ok(GetChildrenResponse { children })
+        Ok(GetChildrenResponse { store_id: request.store_id, children })
     }
 
     async fn create_mount(

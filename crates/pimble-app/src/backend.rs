@@ -77,7 +77,9 @@ pub enum BackendEvent {
     // Node events
     NodeCreated { store_id: StoreId, parent_id: Option<NodeId>, node_id: NodeId },
     NodeLoaded { store_id: StoreId, node: Node },
-    ChildrenLoaded { store_id: StoreId, parent_id: NodeId, children: Vec<Node> },
+    /// `children` live in `children_store_id`: the same as `store_id` for an
+    /// ordinary parent, the mount's source store when `parent_id` is a mount point.
+    ChildrenLoaded { store_id: StoreId, parent_id: NodeId, children_store_id: StoreId, children: Vec<Node> },
     NodeContentUpdated { store_id: StoreId, node_id: NodeId },
     NodeRenamed { store_id: StoreId, node_id: NodeId },
     NodeDeleted { store_id: StoreId, node_id: NodeId, parent_id: NodeId },
@@ -406,9 +408,10 @@ async fn process_command(
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
             match c.get_children(store_id, node_id).await {
-                Ok(children) => Some(BackendEvent::ChildrenLoaded {
+                Ok((children_store_id, children)) => Some(BackendEvent::ChildrenLoaded {
                     store_id,
                     parent_id: node_id,
+                    children_store_id,
                     children
                 }),
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),

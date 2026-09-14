@@ -132,8 +132,8 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 }
             }
 
-            BackendEvent::ChildrenLoaded { store_id, parent_id, children } => {
-                tracing::info!("Children loaded for {:?}: {} nodes", parent_id, children.len());
+            BackendEvent::ChildrenLoaded { store_id, parent_id, children_store_id, children } => {
+                tracing::info!("Children loaded for {:?}: {} nodes (in store {:?})", parent_id, children.len(), children_store_id);
 
                 let child_ids: Vec<NodeId> = children.iter().map(|n| n.id).collect();
 

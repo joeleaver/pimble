@@ -264,8 +264,10 @@ impl PimbleClient {
         Ok(())
     }
 
-    /// Get children of a node
-    pub async fn get_children(&self, store_id: StoreId, node_id: NodeId) -> Result<Vec<Node>> {
+    /// Get children of a node. Returns the canonical store the children live
+    /// in (the mount's source store when `node_id` is a mount point) and the
+    /// children themselves; address each child by `(store, child.id)`.
+    pub async fn get_children(&self, store_id: StoreId, node_id: NodeId) -> Result<(StoreId, Vec<Node>)> {
         let request = GetChildrenRequest { store_id, node_id };
 
         let response = self
@@ -274,7 +276,7 @@ impl PimbleClient {
             .await
             .map_err(|e| ClientError::Rpc(e.to_string()))?;
 
-        Ok(response.children)
+        Ok((response.store_id, response.children))
     }
 
     // ========================================================================
