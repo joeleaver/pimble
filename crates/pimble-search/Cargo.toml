@@ -25,7 +25,7 @@ rhypedb-query = { workspace = true }
 # checkout, so this doesn't add a second copy) — currently rhypedb #18's
 # vectorizer-hardening branch (EmbedOptions, VectorizerConfig, SimilarHit);
 # move this in lockstep with Cargo.toml's rhypedb-engine/-schema/-query pins.
-rhypedb-embed = { git = "https://github.com/joeleaver/rhypedb.git", branch = "feat/18-vectorizer-hardening", default-features = false, optional = true }
+rhypedb-embed = { git = "https://github.com/joeleaver/rhypedb.git", branch = "master", default-features = false, optional = true }
 sha2 = "0.10"
 unicode-segmentation = "1"
 uuid = { workspace = true }

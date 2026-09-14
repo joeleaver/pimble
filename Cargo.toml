@@ -41,9 +41,9 @@ wasmtime = "27"
 
 # Search and graph index engine (Joe's rhypedb). default-features off keeps the
 # ONNX/fastembed stack out; pimble-search's `semantic` feature turns it on.
-rhypedb-engine = { git = "https://github.com/joeleaver/rhypedb.git", branch = "feat/18-vectorizer-hardening", default-features = false }
-rhypedb-schema = { git = "https://github.com/joeleaver/rhypedb.git", branch = "feat/18-vectorizer-hardening" }
-rhypedb-query = { git = "https://github.com/joeleaver/rhypedb.git", branch = "feat/18-vectorizer-hardening", default-features = false }
+rhypedb-engine = { git = "https://github.com/joeleaver/rhypedb.git", branch = "master", default-features = false }
+rhypedb-schema = { git = "https://github.com/joeleaver/rhypedb.git", branch = "master" }
+rhypedb-query = { git = "https://github.com/joeleaver/rhypedb.git", branch = "master", default-features = false }
 
 # UI framework, tracked from GitHub main (never the local checkout). Software
 # rendering (no `gpu`) avoids rinch's wgpu-fork patch. `collaboration` enables the
