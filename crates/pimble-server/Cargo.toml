@@ -23,6 +23,12 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 base64 = { workspace = true }
+dirs = "6"
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+# Semantic search. Choose one ONNX link mode; see crates/pimble-search/Cargo.toml.
+onnx-download = ["pimble-search/onnx-download"]
+onnx-dynamic = ["pimble-search/onnx-dynamic"]

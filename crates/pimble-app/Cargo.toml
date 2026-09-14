@@ -32,3 +32,13 @@ pimble-store = { workspace = true }
 chrono = { workspace = true }
 dirs = "6"
 rand = "0.9"
+
+[features]
+# Semantic search is on by default through the statically linked ONNX runtime
+# (cargo downloads it once at build time; the embedding model downloads to the
+# user's data dir on first run). Build with --no-default-features for a
+# keyword-only app that needs no network at build time. See
+# crates/pimble-search/Cargo.toml for the link modes.
+default = ["onnx-download"]
+onnx-download = ["pimble-server/onnx-download"]
+onnx-dynamic = ["pimble-server/onnx-dynamic"]

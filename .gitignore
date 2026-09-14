@@ -36,3 +36,5 @@ Thumbs.db
 *.png
 *.ps1
 nul
+# fastembed model cache (a run with the ONNX feature in this directory writes here)
+.fastembed_cache/

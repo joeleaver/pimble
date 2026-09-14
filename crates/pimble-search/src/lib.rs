@@ -13,9 +13,11 @@ pub mod error;
 pub mod index;
 pub mod query;
 pub mod schema;
+pub mod warmup;
 
 pub use chunk::*;
 pub use error::*;
 pub use index::*;
 pub use query::*;
 pub use schema::{compose_schema, schema_hash, SchemaFragment, SCHEMA_HASH_FILE};
+pub use warmup::{set_model_cache_dir, warm_embedding_model};

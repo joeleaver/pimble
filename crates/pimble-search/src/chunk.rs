@@ -16,6 +16,15 @@ const MAX_CHUNK_WORDS: usize = 200;
 /// Overlap, in words, between consecutive pieces of one oversize unit split
 /// by [`split_words_with_overlap`].
 const OVERLAP_WORDS: usize = 30;
+/// Below this many words, a chunk's `text` is too thin to carry a topic an
+/// embedding could meaningfully place — a stray "Untitled" note containing
+/// just "asdfasdf asdff", say. [`push_chunk`] silently drops any chunk under
+/// this, so such a node ends up with zero chunks (nothing to embed, nothing
+/// to match against) rather than one that a search can't tell from real
+/// content. The `title`/heading context `push_chunk` also prepends into
+/// `Chunk.source` doesn't count toward this — those two junk words would
+/// otherwise ride in on the title's coattails and still get embedded.
+const MIN_CHUNK_WORDS: usize = 5;
 
 /// One embeddable piece of a node's content, ready to become (or update) a
 /// `Chunk` object.
@@ -224,6 +233,15 @@ fn push_chunk(
     table_header: &Option<String>,
     title: &str,
 ) {
+    // See MIN_CHUNK_WORDS's doc comment: too little actual content to embed
+    // meaningfully, regardless of how the title/heading context would pad
+    // out `source`. Ordinal is only ever incremented on an actual push, so
+    // skipping here doesn't leave a gap a later re-index would need to
+    // account for.
+    if word_count(&text) < MIN_CHUNK_WORDS {
+        return;
+    }
+
     let mut source = String::new();
     source.push_str(title);
     source.push('\n');
@@ -509,7 +527,7 @@ mod tests {
 
     #[test]
     fn identical_input_yields_identical_hashes() {
-        let units = vec![unit(UnitKind::Prose, "b:0", "The quick brown fox.")];
+        let units = vec![unit(UnitKind::Prose, "b:0", "The quick brown fox jumps high.")];
         let a = chunk_units("Doc", &units);
         let b = chunk_units("Doc", &units);
         assert_eq!(a[0].hash, b[0].hash);
@@ -518,13 +536,36 @@ mod tests {
 
     #[test]
     fn different_text_yields_different_hash() {
-        let a = chunk_units("Doc", &[unit(UnitKind::Prose, "b:0", "alpha")]);
-        let b = chunk_units("Doc", &[unit(UnitKind::Prose, "b:0", "beta")]);
+        let a = chunk_units("Doc", &[unit(UnitKind::Prose, "b:0", "alpha alpha alpha alpha alpha")]);
+        let b = chunk_units("Doc", &[unit(UnitKind::Prose, "b:0", "beta beta beta beta beta")]);
         assert_ne!(a[0].hash, b[0].hash);
     }
 
     #[test]
     fn empty_units_yield_no_chunks() {
         assert!(chunk_units("Doc", &[]).is_empty());
+    }
+
+    #[test]
+    fn a_unit_under_five_words_yields_no_chunk() {
+        // 3 words: "asdfasdf", "asdff", "hi" — a stray "Untitled" note's
+        // entire content, too thin to embed meaningfully regardless of how
+        // the title would pad `source` out.
+        let units = vec![unit(UnitKind::Prose, "b:0", "asdfasdf asdff hi")];
+        assert!(chunk_units("Untitled", &units).is_empty());
+    }
+
+    #[test]
+    fn a_node_whose_only_content_is_under_five_words_produces_zero_chunks() {
+        // Not a special case: several short units that would otherwise
+        // merge into one buffered chunk (all Prose, well under the 200-word
+        // budget) still add up to under 5 words total, so that one merged
+        // chunk is the one that gets dropped — a whole trivial node
+        // naturally ends up with no chunks at all, not a special-cased path.
+        let units = vec![
+            unit(UnitKind::Prose, "b:0", "asdf"),
+            unit(UnitKind::Prose, "b:1", "asdf"),
+        ];
+        assert!(chunk_units("Untitled", &units).is_empty());
     }
 }

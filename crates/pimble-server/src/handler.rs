@@ -332,16 +332,35 @@ pub struct RpcHandler {
     /// One open `SearchIndex` per open store, under `<store dir>/index/rhypedb/`.
     /// Opened when a store opens, closed (removed) when it closes.
     indexes: Arc<RwLock<HashMap<StoreId, IndexHandle>>>,
+    /// Whether every `SearchIndex::open` call below should ask for semantic
+    /// search. `true` unless `PimbleServer::start`'s model warm-up (see
+    /// `warm_embedding_model` there) failed — a failure means the model
+    /// isn't cached and probably can't be downloaded, so passing `true`
+    /// anyway would just start a background worker that lazily retries (and
+    /// re-fails) the same download per store. `false` here makes every store
+    /// open keyword-only instead; it never disables an already-open index.
+    semantic_available: bool,
 }
 
 impl RpcHandler {
     pub fn new(store_manager: Arc<RwLock<StoreManager>>) -> Self {
+        Self::with_semantic_available(store_manager, true)
+    }
+
+    /// Like [`RpcHandler::new`], but with `semantic_available` set
+    /// explicitly (see that field's doc comment) instead of defaulting to
+    /// `true`. Used by `PimbleServer::start` after its own warm-up attempt;
+    /// `new` (unconditionally `true`, same as every `SearchIndex::open` call
+    /// used to pass before this field existed) covers every other caller,
+    /// including the test suite.
+    pub fn with_semantic_available(store_manager: Arc<RwLock<StoreManager>>, semantic_available: bool) -> Self {
         Self {
             store_manager,
             subscriptions: Arc::new(RwLock::new(SubscriptionRegistry::new())),
             flush_debouncer: Arc::new(FlushDebouncer::default()),
             plugin_host: Arc::new(pimble_plugins::create_default_host()),
             indexes: Arc::new(RwLock::new(HashMap::new())),
+            semantic_available,
         }
     }
 
@@ -492,17 +511,18 @@ impl RpcHandler {
     /// pre-computing an "expected" hash ourselves: `open` internally ANDs
     /// the `semantic` bool we pass it with its own crate's `semantic`
     /// feature (a cfg gate this crate cannot observe from outside), then
-    /// composes and persists the schema that's actually in effect. `true` is
-    /// always passed through unconditionally — never gated here — matching
-    /// what `open` alone can decide. Before/after diffing sidesteps needing
-    /// to replicate that gate: whatever `open` just wrote is definitionally
-    /// correct for this build, whether or not `semantic` ends up honored.
+    /// composes and persists the schema that's actually in effect.
+    /// `self.semantic_available` is passed through unconditionally — never
+    /// gated further here — matching what `open` alone can decide.
+    /// Before/after diffing sidesteps needing to replicate that gate:
+    /// whatever `open` just wrote is definitionally correct for this build,
+    /// whether or not `semantic` ends up honored.
     async fn open_index_for_store(&self, store_id: StoreId) -> anyhow::Result<()> {
         let index_dir = self.index_dir_for(store_id).await?;
         let hash_path = index_dir.join(pimble_search::SCHEMA_HASH_FILE);
         let old_hash = std::fs::read_to_string(&hash_path).ok();
 
-        let index = match SearchIndex::open(&index_dir, true) {
+        let index = match SearchIndex::open(&index_dir, self.semantic_available) {
             Ok(index) => index,
             Err(e) => {
                 // `Database::open` couldn't tolerate whatever is on disk
@@ -516,7 +536,7 @@ impl RpcHandler {
                 if index_dir.exists() {
                     std::fs::remove_dir_all(&index_dir)?;
                 }
-                SearchIndex::open(&index_dir, true)?
+                SearchIndex::open(&index_dir, self.semantic_available)?
             }
         };
 
@@ -534,7 +554,7 @@ impl RpcHandler {
             // `clear()` on a populated index.
             drop(index);
             std::fs::remove_dir_all(&index_dir)?;
-            let fresh = SearchIndex::open(&index_dir, true)?;
+            let fresh = SearchIndex::open(&index_dir, self.semantic_available)?;
             let count = self.reindex_all_nodes(store_id, &fresh).await?;
             info!("Rebuilt search index for store {}: {} node(s) indexed", store_id, count);
             fresh
@@ -564,7 +584,7 @@ impl RpcHandler {
         if index_dir.exists() {
             std::fs::remove_dir_all(&index_dir)?;
         }
-        let index = Arc::new(SearchIndex::open(&index_dir, true)?);
+        let index = Arc::new(SearchIndex::open(&index_dir, self.semantic_available)?);
         let count = self.reindex_all_nodes(store_id, &index).await?;
         self.install_index_handle(store_id, index).await;
         Ok(count)

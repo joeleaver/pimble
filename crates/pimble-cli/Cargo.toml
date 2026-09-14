@@ -25,3 +25,8 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
+
+[features]
+# Semantic search. Choose one ONNX link mode; see crates/pimble-search/Cargo.toml.
+onnx-download = ["pimble-server/onnx-download"]
+onnx-dynamic = ["pimble-server/onnx-dynamic"]

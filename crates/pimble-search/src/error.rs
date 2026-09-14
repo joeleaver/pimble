@@ -29,6 +29,18 @@ pub enum SearchError {
     #[error("embedding error: {0}")]
     Embedding(String),
 
+    /// The embedding model needed for a semantic query isn't available right
+    /// now — still downloading, in load-retry backoff after a prior
+    /// failure, or this binary has no `fastembed` feature. Mirrors
+    /// `rhypedb_engine::EngineError::ModelUnavailable`; distinct from
+    /// `Embedding`, which is a specific embed call's own failure rather than
+    /// the model itself being down. `SearchIndex::search`'s hybrid path
+    /// catches this from `semantic_search` and degrades to keyword-only
+    /// (logging a warning once) rather than ever returning it to a caller
+    /// of `search`.
+    #[error("embedding model unavailable: {0}")]
+    ModelUnavailable(String),
+
     /// A `.matches` field's full-text index is still backfilling. `done` of
     /// `total` objects have been indexed so far.
     #[error("full-text index is still building ({done} of {total} objects indexed)")]

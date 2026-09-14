@@ -56,8 +56,12 @@ server state vector out. `setNodeText` and `ServerSyncManager` do not exist.
 Each open store has a rhypedb database at `<store>/index/rhypedb/`, derived and
 disposable (`rebuildIndex` RPC, "Rebuild search index" in the View menu). The server feeds
 it in-process from the same places it broadcasts change notifications, with a 2s per-node
-debounce on content. Nodes index `title` and `text` with `@fulltext`; with the `semantic`
-feature, content is chunked (about 200 words, block-aligned, heading context, per-chunk
+debounce on content. Nodes index `title` and `text` with `@fulltext`. Semantic search is
+on by default in `pimble-app` (`onnx-download`: the ONNX runtime is linked statically,
+the int8 `all-MiniLM-L6-v2` model downloads once into the user's data dir under
+`pimble/models`, and the server warms it before any store opens; if that fails the app
+runs keyword-only). Measured on the 674-node family store after rhypedb #18: model ready
+in about 4 s, peak 767 MB resident, UI responsive during the backfill. Content is chunked (about 200 words, block-aligned, heading context, per-chunk
 hash so an edit re-embeds one chunk) into `Chunk` objects with `all-MiniLM-L6-v2`
 embeddings. Chunking works over `IndexUnit`s (prose, heading, code, table row, field,
 other) produced by `ContentDoc::units()` or a plugin's `index_units`, so tables and
@@ -108,4 +112,4 @@ The app has the rinch `debug` feature on, so the rinch MCP tools (`list_apps`, `
 - `yrs` 0.27 for both CRDT documents; `rinch-editor-collab` (git main) wraps it for node
   content's rich-text schema, the store document uses `yrs` directly (Maps and Arrays)
 - `jsonrpsee` 0.24
-- `rhypedb-engine`/`-schema`/`-query` (git master, default features off) for `pimble-search`; the `semantic` feature enables fastembed/ONNX through `onnx-dynamic`
+- `rhypedb-engine`/`-schema`/`-query`/`-embed` (git, currently the `feat/18-vectorizer-hardening` branch until PR #19 merges, then `master`) for `pimble-search`; `semantic` turns on the code paths, `onnx-download` or `onnx-dynamic` picks the ONNX link mode

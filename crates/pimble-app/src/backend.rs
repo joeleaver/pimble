@@ -585,7 +585,9 @@ async fn process_command(
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::SearchResults { results: Err("Not connected".into()) });
             };
-            match c.search(query, stores, false, limit).await {
+            // Ask for hybrid (keyword + semantic); a server built without an ONNX
+            // link mode answers keyword-only.
+            match c.search(query, stores, true, limit).await {
                 Ok(results) => Some(BackendEvent::SearchResults { results: Ok(results) }),
                 Err(e) => Some(BackendEvent::SearchResults { results: Err(e.to_string()) }),
             }

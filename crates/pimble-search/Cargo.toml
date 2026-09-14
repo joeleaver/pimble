@@ -17,6 +17,15 @@ pimble-plugins = { workspace = true }
 rhypedb-engine = { workspace = true }
 rhypedb-schema = { workspace = true }
 rhypedb-query = { workspace = true }
+# Not a workspace dependency: only rhypedb-engine depends on it today, and it
+# doesn't re-export it. Needed directly here so `warmup::warm_embedding_model`
+# can construct a `FastEmbedder` itself, up front, instead of only ever
+# getting one lazily (and racily, across multiple stores) via `Vectorizer`.
+# Same branch as the other rhypedb-* crates (a workspace dep pulls the same
+# checkout, so this doesn't add a second copy) — currently rhypedb #18's
+# vectorizer-hardening branch (EmbedOptions, VectorizerConfig, SimilarHit);
+# move this in lockstep with Cargo.toml's rhypedb-engine/-schema/-query pins.
+rhypedb-embed = { git = "https://github.com/joeleaver/rhypedb.git", branch = "feat/18-vectorizer-hardening", default-features = false, optional = true }
 sha2 = "0.10"
 unicode-segmentation = "1"
 uuid = { workspace = true }
@@ -28,6 +37,11 @@ tempfile = "3"
 
 [features]
 default = []
-# Server-side embeddings through rhypedb's fastembed/ONNX stack. onnx-dynamic loads
-# libonnxruntime at runtime (ORT_DYLIB_PATH) so day-to-day builds stay offline.
-semantic = ["rhypedb-engine/onnx-dynamic"]
+# Semantic (chunk embedding + similarity) code paths and rhypedb's fastembed embedder.
+# Pick exactly ONE ONNX link mode below with it; `semantic` alone does not link ONNX.
+semantic = ["rhypedb-engine/fastembed", "dep:rhypedb-embed", "rhypedb-embed/fastembed"]
+# cargo downloads the ONNX runtime at build time and links it statically: a
+# self-contained binary (needs network once at build). Use for release builds.
+onnx-download = ["semantic", "rhypedb-engine/onnx-download", "rhypedb-embed/onnx-download"]
+# dlopen libonnxruntime at run time from ORT_DYLIB_PATH. Offline builds.
+onnx-dynamic = ["semantic", "rhypedb-engine/onnx-dynamic", "rhypedb-embed/onnx-dynamic"]

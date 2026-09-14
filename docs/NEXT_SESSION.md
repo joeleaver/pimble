@@ -79,13 +79,15 @@ Pimble keeps that behind a `semantic` feature.
 
 ## Smaller follow-ups, in rough priority
 
-0. Turn `semantic` on for real: choose the ONNX link mode for release builds
-   (`onnx-download` for a self-contained binary), install a runtime here for a first live
-   test, add a first-run model fetch into Pimble's data directory with visible progress,
-   and ask rhypedb to fail soft (not panic) when the model cannot load. (rhypedb #17,
-   stemming and prefix terms, landed and is wired: `english` analyzer on both fields,
-   trailing word searched as a prefix.)
-
+0. Semantic search is on by default as of 2026-09-13 (`onnx-download`). rhypedb PR #19
+   (issue #18: batch 32, 256 tokens, int8 model, thread cap, fail-soft model load, one
+   download per process, cache dir option, cross-encoder off unless configured,
+   `SimilarHit` results) is what made it viable: peak memory went from 15.6 GB to 767 MB
+   on the family store and the UI stays responsive. Pimble pins that branch; when the PR
+   merges, point the four rhypedb git deps back at `master` and `cargo update` them.
+   Open upstream: rhypedb #20 (stop words in the english analyzer). Quality knobs live in
+   `pimble-search`: chunks under 5 words are not embedded, semantic hits beyond cosine
+   distance 0.65 are dropped, hybrid ranking is reciprocal rank fusion.
 1. `ContentDoc::text()` re-projects the whole document on every call; tree labels call it
    per node. Cache the projected text per node in `LocalStore` and invalidate on update.
    The rhypedb indexer will want the same cache.

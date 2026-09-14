@@ -54,14 +54,23 @@ impl PimbleServer {
         Arc::clone(&self.store_manager)
     }
 
-    /// Start the server
+    /// Start the server.
+    ///
+    /// Before accepting any RPC (in particular, before any `openStore` can
+    /// reach [`RpcHandler`]), warms up the semantic search embedding model
+    /// once — see [`warm_up_embedding_model`]. This is what turns "two
+    /// stores opening at once each lazily construct their own embedder and
+    /// race to download the same model" into "one download, serially, before
+    /// any store exists to race over."
     pub async fn start(&mut self) -> Result<()> {
         let server = Server::builder()
             .build(&self.config.addr)
             .await
             .map_err(|e| crate::ServerError::Server(e.to_string()))?;
 
-        let handler = RpcHandler::new(Arc::clone(&self.store_manager));
+        let semantic_available = warm_up_embedding_model().await;
+
+        let handler = RpcHandler::with_semantic_available(Arc::clone(&self.store_manager), semantic_available);
         let methods = handler.into_rpc();
 
         info!("Starting Pimble server on {}", self.config.addr);
@@ -104,6 +113,65 @@ impl PimbleServer {
 impl Default for PimbleServer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The model semantic search embeds chunks with — kept in one place so
+/// [`warm_up_embedding_model`] and every `SearchIndex`'s own lazy
+/// `Vectorizer` (via the schema's `@vectorize(model: "...")` directive)
+/// agree on it.
+const EMBEDDING_MODEL: &str = "all-MiniLM-L6-v2";
+
+/// Point the embedding model cache at a stable, per-user directory and force
+/// the model to load once, before any store's `SearchIndex` can start its
+/// own background worker and lazily (and, with more than one store opening
+/// at once, racily) load it instead. Returns whether semantic search is
+/// available for this run: `true` on success, `false` on any failure (no
+/// network on first run, disk full, model registry mismatch, ...) — a
+/// missing model is not fatal to the server, it just means every store opens
+/// keyword-only (see [`RpcHandler::with_semantic_available`]) until a build
+/// with the model cached, or with network access, runs again.
+///
+/// A no-op (always `true`) when pimble-search's `semantic` feature isn't
+/// compiled in — both `pimble_search` calls below already are.
+///
+/// Runs `warm_embedding_model` (a blocking, synchronous ONNX Runtime call)
+/// on a blocking thread so it can't stall the async runtime other RPCs will
+/// shortly run on; `start` still awaits it, so no store can open before it
+/// resolves.
+async fn warm_up_embedding_model() -> bool {
+    let cache_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("pimble")
+        .join("models");
+
+    if let Err(e) = pimble_search::set_model_cache_dir(&cache_dir) {
+        tracing::warn!(
+            "Could not create embedding model cache dir {:?} ({}); running search keyword-only",
+            cache_dir, e
+        );
+        return false;
+    }
+
+    match tokio::task::spawn_blocking(|| pimble_search::warm_embedding_model(EMBEDDING_MODEL)).await {
+        Ok(Ok(elapsed)) => {
+            info!("Embedding model '{}' ready in {:.1}s", EMBEDDING_MODEL, elapsed.as_secs_f64());
+            true
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                "Embedding model '{}' warm-up failed ({}); running search keyword-only",
+                EMBEDDING_MODEL, e
+            );
+            false
+        }
+        Err(join_err) => {
+            tracing::warn!(
+                "Embedding model warm-up task panicked ({}); running search keyword-only",
+                join_err
+            );
+            false
+        }
     }
 }
 
