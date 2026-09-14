@@ -81,6 +81,23 @@ pub trait PimbleApi {
     async fn get_mount_state(&self, request: GetMountStateRequest) -> Result<GetMountStateResponse, ErrorObjectOwned>;
 
     // ========================================================================
+    // Replica Sync Operations (docs/SYNC_CONTRACT.md)
+    // ========================================================================
+
+    /// Create a local replica of a store held by a remote Pimble server and
+    /// link it. Answers once the first reconcile has finished (or timed out).
+    #[method(name = "cloneStore")]
+    async fn clone_store(&self, request: CloneStoreRequest) -> Result<OpenStoreResponse, ErrorObjectOwned>;
+
+    /// Link a local store to its twin on a remote server, or unlink it.
+    #[method(name = "setStoreSync")]
+    async fn set_store_sync(&self, request: SetStoreSyncRequest) -> Result<GetStoreSyncResponse, ErrorObjectOwned>;
+
+    /// A store's sync link and the link's current state.
+    #[method(name = "getStoreSync")]
+    async fn get_store_sync(&self, request: GetStoreSyncRequest) -> Result<GetStoreSyncResponse, ErrorObjectOwned>;
+
+    // ========================================================================
     // Workspace Operations
     // ========================================================================
 

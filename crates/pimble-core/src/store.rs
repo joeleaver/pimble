@@ -141,6 +141,14 @@ pub enum StoreLocation {
     },
 }
 
+/// How to reach another Pimble server: the URL of its RPC endpoint and how
+/// to authenticate. Used by replica sync links (`docs/SYNC_CONTRACT.md`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteEndpoint {
+    pub url: Url,
+    pub auth: AuthMethod,
+}
+
 /// Authentication method for remote stores
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]

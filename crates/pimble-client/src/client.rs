@@ -4,12 +4,12 @@ use std::path::Path;
 
 use jsonrpsee::core::client::SubscriptionClientT;
 use jsonrpsee::ws_client::{WsClient, WsClientBuilder};
-use pimble_core::{Node, NodeId, Store, StoreId, Workspace};
+use pimble_core::{Node, NodeId, RemoteEndpoint, Store, StoreId, SyncState, Workspace};
 use pimble_core::MountRef;
 use pimble_rpc::{
-    ApplyEditRequest, ApplyStoreUpdateRequest, CloseStoreRequest, CreateMountRequest,
+    ApplyEditRequest, ApplyStoreUpdateRequest, CloneStoreRequest, CloseStoreRequest, CreateMountRequest,
     CreateNodeRequest, CreateStoreRequest, CreateWorkspaceRequest, DeleteNodeRequest,
-    EditOperation, GetChildrenRequest, GetMountStateRequest, GetNodeRequest, GetNodesRequest,
+    EditOperation, GetChildrenRequest, GetMountStateRequest, GetNodeRequest, GetNodesRequest, GetStoreSyncRequest, SetStoreSyncRequest,
     LoadWorkspaceRequest, MoveNodeRequest, NodeContentChangedNotification, OpenStoreRequest,
     PimbleApiClient, RebuildIndexRequest, SaveWorkspaceRequest, SearchRequest, SearchResultItem,
     StoreChangedNotification, SyncNodeContentRequest, SyncStoreDocumentRequest,
@@ -324,6 +324,58 @@ impl PimbleClient {
             .map_err(|e| ClientError::Rpc(e.to_string()))?;
 
         Ok((response.state, response.mount_ref))
+    }
+
+    // ========================================================================
+    // Replica Sync Operations (docs/SYNC_CONTRACT.md)
+    // ========================================================================
+
+    /// Create a local replica of `remote_store_id` as held by `remote`, at
+    /// `path`, linked to it. Returns the opened store.
+    pub async fn clone_store(
+        &self,
+        remote: RemoteEndpoint,
+        remote_store_id: StoreId,
+        path: impl AsRef<Path>,
+    ) -> Result<Store> {
+        let request = CloneStoreRequest {
+            remote,
+            remote_store_id,
+            path: path.as_ref().to_path_buf(),
+        };
+        let response = self
+            .client
+            .clone_store(request)
+            .await
+            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+        Ok(response.store)
+    }
+
+    /// Link a local store to its twin on `remote` (`Some`) or unlink it
+    /// (`None`). Returns the link and its state.
+    pub async fn set_store_sync(
+        &self,
+        store_id: StoreId,
+        remote: Option<RemoteEndpoint>,
+    ) -> Result<(Option<RemoteEndpoint>, SyncState)> {
+        let request = SetStoreSyncRequest { store_id, remote };
+        let response = self
+            .client
+            .set_store_sync(request)
+            .await
+            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+        Ok((response.remote, response.state))
+    }
+
+    /// A store's sync link (`None` when unlinked) and its current state.
+    pub async fn get_store_sync(&self, store_id: StoreId) -> Result<(Option<RemoteEndpoint>, SyncState)> {
+        let request = GetStoreSyncRequest { store_id };
+        let response = self
+            .client
+            .get_store_sync(request)
+            .await
+            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+        Ok((response.remote, response.state))
     }
 
     // ========================================================================

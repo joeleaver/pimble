@@ -12,10 +12,10 @@ use pimble_core::{Node, MountRef, NodeId, StoreId, StoreLocation, Workspace};
 use pimble_plugins::PluginHost;
 use pimble_rpc::{
     index_building_error, to_rpc_error, ApplyEditRequest, ApplyEditResponse,
-    ApplyStoreUpdateRequest, CloseStoreRequest, CreateMountRequest, CreateMountResponse,
+    ApplyStoreUpdateRequest, CloneStoreRequest, CloseStoreRequest, CreateMountRequest, CreateMountResponse,
     CreateNodeRequest, CreateNodeResponse, CreateStoreRequest, CreateStoreResponse,
     CreateWorkspaceRequest, DeleteNodeRequest, EditOperation, EmptyResponse, GetChildrenRequest,
-    GetChildrenResponse, GetMountStateRequest, GetMountStateResponse, GetNodeRequest,
+    GetChildrenResponse, GetMountStateRequest, GetMountStateResponse, GetNodeRequest, GetStoreSyncRequest, GetStoreSyncResponse, SetStoreSyncRequest,
     GetNodeResponse, GetNodesRequest, GetNodesResponse, ListStoresResponse, LoadWorkspaceRequest,
     LoadWorkspaceResponse, MoveNodeRequest, NodeContentChangedNotification, OpenStoreRequest,
     OpenStoreResponse, PimbleApiServer, RebuildIndexRequest, RebuildIndexResponse,
@@ -971,6 +971,33 @@ impl PimbleApiServer for RpcHandler {
         self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
 
         Ok(CreateMountResponse { node_id, mount_ref })
+    }
+
+    // ── Replica sync (docs/SYNC_CONTRACT.md) ─────────────────────────
+    // Stubs landed with the interface; the sync link makes them real.
+
+    async fn clone_store(
+        &self,
+        request: CloneStoreRequest,
+    ) -> Result<OpenStoreResponse, ErrorObjectOwned> {
+        Err(to_rpc_error(format!(
+            "cloneStore is not implemented yet (store {} from {})",
+            request.remote_store_id, request.remote.url
+        )))
+    }
+
+    async fn set_store_sync(
+        &self,
+        request: SetStoreSyncRequest,
+    ) -> Result<GetStoreSyncResponse, ErrorObjectOwned> {
+        Err(to_rpc_error(format!("setStoreSync is not implemented yet (store {})", request.store_id)))
+    }
+
+    async fn get_store_sync(
+        &self,
+        request: GetStoreSyncRequest,
+    ) -> Result<GetStoreSyncResponse, ErrorObjectOwned> {
+        Err(to_rpc_error(format!("getStoreSync is not implemented yet (store {})", request.store_id)))
     }
 
     async fn get_mount_state(

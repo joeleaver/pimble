@@ -470,6 +470,10 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     StoreChangeKind::TreeStructure => {
                         refetch_loaded_children(store, *store_id);
                     }
+                    StoreChangeKind::SyncStateChanged { state } => {
+                        // Placeholder: the sync UI (docs/SYNC_CONTRACT.md) tracks this.
+                        tracing::info!("Sync state of {:?}: {:?}", store_id, state);
+                    }
                 }
             }
 

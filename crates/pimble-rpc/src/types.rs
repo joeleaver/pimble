@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use pimble_core::{MountRef, MountState, Node, NodeId, NodeMetadata, Store, StoreId, Workspace};
+use pimble_core::{MountRef, MountState, Node, NodeId, NodeMetadata, RemoteEndpoint, Store, StoreId, SyncState, Workspace};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -187,6 +187,42 @@ pub struct GetMountStateRequest {
 pub struct GetMountStateResponse {
     pub state: MountState,
     pub mount_ref: MountRef,
+}
+
+// ============================================================================
+// Replica Sync Operations (docs/SYNC_CONTRACT.md)
+// ============================================================================
+
+/// Create a local replica of `remote_store_id` as it exists on `remote`,
+/// at `path`, linked to it. Answers with the opened store once the first
+/// reconcile has finished (or after a timeout, with the current state).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloneStoreRequest {
+    pub remote: RemoteEndpoint,
+    pub remote_store_id: StoreId,
+    pub path: PathBuf,
+}
+
+/// Link a local store to the same store on a remote server (`Some`) or
+/// unlink it (`None`). The link is persisted in the store directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetStoreSyncRequest {
+    pub store_id: StoreId,
+    pub remote: Option<RemoteEndpoint>,
+}
+
+/// Ask for a store's sync link and its current state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetStoreSyncRequest {
+    pub store_id: StoreId,
+}
+
+/// A store's sync link (`None` when unlinked) and the link's current state
+/// (`SyncState::Offline` for an unlinked store as well).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetStoreSyncResponse {
+    pub remote: Option<RemoteEndpoint>,
+    pub state: SyncState,
 }
 
 // ============================================================================
@@ -392,6 +428,8 @@ pub enum StoreChangeKind {
     MetadataUpdated { node_id: NodeId },
     ContentUpdated { node_id: NodeId },
     TreeStructure,
+    /// The store's replica sync link changed state (docs/SYNC_CONTRACT.md).
+    SyncStateChanged { state: SyncState },
 }
 
 /// Notification that a node's content has changed.
