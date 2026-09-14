@@ -83,9 +83,8 @@ Pimble keeps that behind a `semantic` feature.
    (issue #18: batch 32, 256 tokens, int8 model, thread cap, fail-soft model load, one
    download per process, cache dir option, cross-encoder off unless configured,
    `SimilarHit` results) is what made it viable: peak memory went from 15.6 GB to 767 MB
-   on the family store and the UI stays responsive. Pimble pins that branch; when the PR
-   merges, point the four rhypedb git deps back at `master` and `cargo update` them.
-   Open upstream: rhypedb #20 (stop words in the english analyzer). Quality knobs live in
+   on the family store and the UI stays responsive. rhypedb PR #19 and #20 (stop words) are merged and Pimble is back on
+   rhypedb `master`. Quality knobs live in
    `pimble-search`: chunks under 5 words are not embedded, semantic hits beyond cosine
    distance 0.65 are dropped, hybrid ranking is reciprocal rank fusion.
 1. `ContentDoc::text()` re-projects the whole document on every call; tree labels call it

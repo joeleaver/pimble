@@ -112,4 +112,4 @@ The app has the rinch `debug` feature on, so the rinch MCP tools (`list_apps`, `
 - `yrs` 0.27 for both CRDT documents; `rinch-editor-collab` (git main) wraps it for node
   content's rich-text schema, the store document uses `yrs` directly (Maps and Arrays)
 - `jsonrpsee` 0.24
-- `rhypedb-engine`/`-schema`/`-query`/`-embed` (git, currently the `feat/18-vectorizer-hardening` branch until PR #19 merges, then `master`) for `pimble-search`; `semantic` turns on the code paths, `onnx-download` or `onnx-dynamic` picks the ONNX link mode
+- `rhypedb-engine`/`-schema`/`-query`/`-embed` (git master) for `pimble-search`; `semantic` turns on the code paths, `onnx-download` or `onnx-dynamic` picks the ONNX link mode
