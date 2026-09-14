@@ -39,6 +39,9 @@ pub enum StoreError {
     #[error("Mount source store unavailable: {store_id}")]
     MountSourceUnavailable { store_id: StoreId },
 
+    #[error("Node {node_id} is a mount point and has no children of its own; create under the mount's source instead")]
+    MountHasNoChildren { node_id: NodeId },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

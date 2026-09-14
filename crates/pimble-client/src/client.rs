@@ -306,12 +306,7 @@ impl PimbleClient {
             .await
             .map_err(|e| ClientError::Rpc(e.to_string()))?;
 
-        let mount_ref = MountRef {
-            source_store: source_store_id,
-            source_node: source_node_id,
-        };
-
-        Ok((response.node_id, mount_ref))
+        Ok((response.node_id, response.mount_ref))
     }
 
     /// Get the state of a mount point

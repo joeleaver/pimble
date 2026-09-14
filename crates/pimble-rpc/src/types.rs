@@ -169,6 +169,10 @@ pub struct CreateMountRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateMountResponse {
     pub node_id: NodeId,
+    /// The server's own `MountRef` (including any `source_path` hint it
+    /// filled in from the registry). Callers use this directly rather than
+    /// reconstructing one locally, since only the server knows the hint.
+    pub mount_ref: MountRef,
 }
 
 /// Request to get mount state

@@ -25,7 +25,7 @@ use pimble_rpc::{
     UpdateNodeMetadataRequest,
 };
 use pimble_search::{IndexNode, SearchError, SearchIndex, SearchQuery};
-use pimble_store::StoreManager;
+use pimble_store::{StoreEndpoint, StoreManager};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
 
@@ -566,6 +566,22 @@ impl RpcHandler {
         Ok(())
     }
 
+    /// Open a search index for every store id in `store_ids` that doesn't
+    /// already have one open. Call after any `StoreManager` operation that
+    /// may have opened stores implicitly (resolving or validating a mount),
+    /// with the list drained via `StoreManager::opened_since`, so an
+    /// implicitly-opened source store gets the same treatment as one opened
+    /// via `openStore`.
+    async fn open_indexes_for_newly_opened(&self, store_ids: Vec<StoreId>) {
+        for store_id in store_ids {
+            if !self.indexes.read().await.contains_key(&store_id) {
+                if let Err(e) = self.open_index_for_store(store_id).await {
+                    warn!("Failed to open search index for newly opened store {}: {}", store_id, e);
+                }
+            }
+        }
+    }
+
     /// Delete and rebuild `store_id`'s search index from scratch. Returns the
     /// number of nodes indexed.
     ///
@@ -748,6 +764,13 @@ impl PimbleApiServer for RpcHandler {
             .await
             .map_err(to_rpc_error)?;
 
+        // A node that is created and never edited again has no other flush
+        // point; without this it exists only in memory until shutdown.
+        manager
+            .flush(request.store_id)
+            .await
+            .map_err(to_rpc_error)?;
+
         drop(manager);
         self.notify_store_change(request.store_id, StoreChangeKind::NodeCreated { node_id }, None).await;
         self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
@@ -874,12 +897,18 @@ impl PimbleApiServer for RpcHandler {
         );
 
         let mut manager = self.store_manager.write().await;
-        let children = manager
+        let (store_id, children) = manager
             .get_children(request.store_id, request.node_id)
             .await
             .map_err(to_rpc_error)?;
+        let newly_opened = manager.opened_since();
+        drop(manager);
 
-        Ok(GetChildrenResponse { store_id: request.store_id, children })
+        // A mount's source store may have just been opened implicitly to
+        // resolve it; give it a search index like any other open store.
+        self.open_indexes_for_newly_opened(newly_opened).await;
+
+        Ok(GetChildrenResponse { store_id, children })
     }
 
     async fn create_mount(
@@ -891,21 +920,35 @@ impl PimbleApiServer for RpcHandler {
             request.store_id, request.parent_id, request.source_store_id, request.source_node_id
         );
 
+        let mut manager = self.store_manager.write().await;
+
+        // Fill `source_path` from the registry's Local endpoint for the
+        // source store, if it has one: this is what lets the mount resolve
+        // after a restart even if the source isn't otherwise reopened (see
+        // `StoreManager::ensure_store_open`).
+        let source_path = match manager.registry().lookup(&request.source_store_id) {
+            Some(StoreEndpoint::Local { path }) => Some(path.clone()),
+            _ => None,
+        };
+
         let mount_ref = MountRef {
             source_store: request.source_store_id,
             source_node: request.source_node_id,
+            source_path,
         };
 
-        let mut manager = self.store_manager.write().await;
-
-        // Validate that this mount won't create a cycle
+        // Validate that this mount won't create a cycle. This also rejects
+        // a mount-node parent transitively: `create_node` below is the
+        // authoritative check, but validating first avoids opening/walking
+        // stores for a request that's going to fail anyway.
         manager
             .validate_mount_creation(request.store_id, request.parent_id, &mount_ref)
             .await
             .map_err(to_rpc_error)?;
 
-        // Create the mount node
-        let mut node = Node::mount(request.source_store_id, request.source_node_id);
+        // Create the mount node. `create_node` rejects a mount-node parent
+        // (`StoreError::MountHasNoChildren`), surfaced here as an RPC error.
+        let mut node = Node::mount_with_ref(mount_ref.clone());
         if let Some(title) = request.title {
             node.metadata.title = title;
         }
@@ -920,13 +963,14 @@ impl PimbleApiServer for RpcHandler {
             .await
             .map_err(to_rpc_error)?;
 
+        let newly_opened = manager.opened_since();
         drop(manager);
-        // No existing `notify_store_change` call sits next to this one (a
-        // pre-existing gap, out of this step's scope) but the mount node
-        // should still be indexed.
+
+        self.open_indexes_for_newly_opened(newly_opened).await;
+        self.notify_store_change(request.store_id, StoreChangeKind::NodeCreated { node_id }, None).await;
         self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
 
-        Ok(CreateMountResponse { node_id })
+        Ok(CreateMountResponse { node_id, mount_ref })
     }
 
     async fn get_mount_state(
@@ -948,7 +992,11 @@ impl PimbleApiServer for RpcHandler {
             to_rpc_error(format!("Node {} is not a mount point", request.node_id))
         })?;
 
-        let state = manager.mount_state(&mount_ref);
+        let state = manager.mount_state(&mount_ref).await;
+        let newly_opened = manager.opened_since();
+        drop(manager);
+
+        self.open_indexes_for_newly_opened(newly_opened).await;
 
         Ok(GetMountStateResponse { state, mount_ref })
     }

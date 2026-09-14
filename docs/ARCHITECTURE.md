@@ -349,17 +349,24 @@ This is analogous to filesystem mount points: you can mount any block device at 
 A mount point is a node with `node_type: "mount"` whose metadata contains a `MountRef`:
 
 ```rust
-/// Reference to a remote subtree
+/// Reference to a subtree in another store
 pub struct MountRef {
     /// Which store contains the source subtree
     pub source_store: StoreId,
     /// Which node to use as the root of the mounted subtree
     /// (and all its children come along)
     pub source_node: NodeId,
+    /// A filesystem-path hint for reopening the source store after a
+    /// restart, when it isn't otherwise in the store registry. `createMount`
+    /// fills it from the registry's `Local` endpoint for the source store at
+    /// creation time; `None` for a source that was never local or never
+    /// open. Optional on the wire so an older-shaped `MountRef` still
+    /// deserializes.
+    pub source_path: Option<PathBuf>,
 }
 ```
 
-The mount point node itself has no `children` or `content` of its own — its children are the children of the source node, resolved at runtime.
+The mount point node is a **placeholder**: `getNode` on it returns the mount node itself (empty `children`, empty `content`); it has no children or content of its own. `getChildren` on it returns the *source* node's children instead — see `GetChildrenResponse.store_id` below. Rename, delete, and move addressed at the mount node act on the mount node in the mounting store only, never on the source; `createNode` with a mount node as parent is an error (create under `mount_ref` instead).
 
 ### Mount Resolver
 
@@ -374,15 +381,19 @@ UI requests node expansion
         ├─ node_type == "mount" ?
         │       │
         │       ▼
-        │   MountResolver.resolve(mount_ref)
+        │   StoreManager.ensure_store_open(mount_ref)
         │       │
-        │       ├─ source store already open? → return handle
-        │       ├─ source is local? → open LocalStore
-        │       ├─ source is remote? → connect via RPC client
-        │       └─ source unavailable? → return MountState::Unavailable
+        │       ├─ source store already open? → use it
+        │       ├─ registry has a Local/Remote endpoint? → open it (Remote: unavailable)
+        │       ├─ mount_ref.source_path hint set? → open it, registering on success
+        │       └─ none of the above → MountSourceUnavailable
         │
         └─ regular node → return children from local store
 ```
+
+This is a single hop, not a recursive resolve: `getChildren` on a mount returns exactly the source node's children, addressed by the source store's id (`GetChildrenResponse.store_id`). A nested mount among those children is itself an ordinary node in the (now open) source store, resolved the same way when the caller expands it in turn — so cycles are caught once, at `createMount` time (`validate_mount_creation`), not on every expansion.
+
+**An implicitly opened source is an ordinary open store.** When resolving or validating a mount opens a store that wasn't already open, it gets the same treatment `openStore` gives one: a search index under its own `index/rhypedb/`, a place in `listStores`, and subscriptions work on it. `StoreManager::opened_since()` drains the list of stores opened since the last call, so the RPC handler can open a search index for each one after any call that might have opened stores implicitly (`getChildren`, `getMountState`, `createMount`).
 
 The resolver maintains a **store registry** — a mapping from `StoreId` to connection information:
 
@@ -391,10 +402,8 @@ The resolver maintains a **store registry** — a mapping from `StoreId` to conn
 pub enum StoreEndpoint {
     /// Local filesystem path
     Local { path: PathBuf },
-    /// Remote server
+    /// Remote server (defined; not yet used — remote mounts are out of scope)
     Remote { url: Url, auth: AuthMethod },
-    /// Already open in this process
-    InProcess { store_id: StoreId },
 }
 
 /// Registry of known stores and how to reach them
@@ -404,10 +413,7 @@ pub struct StoreRegistry {
 }
 ```
 
-The registry is populated from:
-1. Stores already open in the workspace
-2. The workspace file (which records store locations)
-3. Discovery (future: mDNS, manual URL entry, shared registry)
+An already-open store needs no registry lookup at all — `local_stores` is checked first. The registry is populated by every `create_local_store`/`open_local_store` call (including ones a mount triggers), so it has an entry for any store this process has opened this session. `MountRef.source_path` exists for the case the registry doesn't cover: a fresh process, before anything has reopened the source directly.
 
 ### Mount State & Degradation
 
@@ -459,7 +465,7 @@ The `selected_node` in `WorkspaceUiState` currently uses `(StoreId, NodeId)` whi
 | `StoreManager` | Add `MountResolver` and `StoreRegistry`. `get_node` / `get_children` must handle mount-point traversal. |
 | `StoreLocation::Mounted` | Already exists — becomes the backing type for resolved mounts. |
 | `Node` | New `node_type: "mount"`. Mount metadata stored in `metadata.custom` (or a dedicated field). |
-| `PimbleApi` | New RPC methods: `resolve_mount`, `get_mount_state`. Existing `get_children` transparently resolves mounts server-side. |
+| `PimbleApi` | `createMount`, `getMountState`. `getChildren` transparently resolves a mount server-side and reports the canonical store via `GetChildrenResponse.store_id`. |
 | `Workspace` | The store registry is workspace-level state — it knows how to reach each store. |
 | `pimble-app` UI | Mount point nodes get a distinct visual treatment (icon, connectivity indicator). Mounted subtrees render identically to local subtrees. |
 | `pimble-search` | Cross-mount search: search can optionally traverse into mounted subtrees. Results include the canonical `(store_id, node_id)`. |

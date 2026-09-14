@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -155,12 +156,20 @@ impl Node {
         self.touch();
     }
 
-    /// Create a new mount node referencing a subtree in another store
+    /// Create a new mount node referencing a subtree in another store, with
+    /// no `source_path` hint. Prefer [`Node::mount_with_ref`] when a hint is
+    /// available (e.g. from the store registry at mount-creation time).
     pub fn mount(source_store: StoreId, source_node: NodeId) -> Self {
-        let mount_ref = MountRef {
+        Self::mount_with_ref(MountRef {
             source_store,
             source_node,
-        };
+            source_path: None,
+        })
+    }
+
+    /// Create a new mount node from a fully-formed [`MountRef`] (including
+    /// any `source_path` hint).
+    pub fn mount_with_ref(mount_ref: MountRef) -> Self {
         let mut node = Self::new(node_types::MOUNT);
         node.metadata.custom.insert(
             "mount_ref".to_string(),
@@ -292,6 +301,14 @@ pub struct MountRef {
     pub source_store: StoreId,
     /// The node to use as root of the mounted subtree
     pub source_node: NodeId,
+    /// A filesystem-path hint for reopening the source store after a
+    /// restart, when it is not otherwise in the store registry. Filled by
+    /// `createMount` from the registry's `Local` endpoint at creation time;
+    /// `None` for a source that was never local or never open. Omitted from
+    /// JSON when absent, and optional on the way in so an older-shaped
+    /// `MountRef` (without this field) still deserializes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<PathBuf>,
 }
 
 /// Current state of a mount point
@@ -378,6 +395,7 @@ mod tests {
         let mount_ref = MountRef {
             source_store: StoreId::new(),
             source_node: NodeId::new(),
+            source_path: Some(PathBuf::from("/tmp/source.pimble")),
         };
 
         let json = serde_json::to_string(&mount_ref).unwrap();
@@ -385,6 +403,25 @@ mod tests {
 
         assert_eq!(deserialized.source_store, mount_ref.source_store);
         assert_eq!(deserialized.source_node, mount_ref.source_node);
+        assert_eq!(deserialized.source_path, mount_ref.source_path);
+    }
+
+    #[test]
+    fn mount_ref_deserializes_without_source_path() {
+        let source_store = StoreId::new();
+        let source_node = NodeId::new();
+        let json = format!(
+            r#"{{"source_store":"{}","source_node":"{}"}}"#,
+            source_store.as_uuid(),
+            source_node.as_uuid(),
+        );
+
+        let mount_ref: MountRef = serde_json::from_str(&json)
+            .expect("a MountRef with no source_path field should still deserialize");
+
+        assert_eq!(mount_ref.source_store, source_store);
+        assert_eq!(mount_ref.source_node, source_node);
+        assert!(mount_ref.source_path.is_none());
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use pimble_core::{MountRef, MountState, Node, NodeId, NodeMetadata, Store, StoreId, StoreLocation, SyncState};
 use pimble_crdt::{ContentDoc, StoreDocument};
-use tracing::{info, warn};
+use tracing::info;
 
 /// Maximum depth for transitive mount resolution
 const MAX_MOUNT_DEPTH: usize = 16;
@@ -20,6 +20,15 @@ pub struct StoreManager {
     local_stores: HashMap<StoreId, LocalStore>,
     /// Registry of known stores and how to reach them
     registry: StoreRegistry,
+    /// Stores opened since the last call to [`StoreManager::opened_since`],
+    /// which drains it. Populated by `create_local_store` and
+    /// `open_local_store` (including when called transitively while
+    /// resolving or validating a mount), so a caller that may have triggered
+    /// an implicit open — e.g. `get_children` or `mount_state` on a mount
+    /// node — can learn which stores it must now treat as ordinary open
+    /// stores (search index, `listStores`, subscriptions) without diffing
+    /// `list_stores()` before and after.
+    newly_opened: Vec<StoreId>,
 }
 
 impl StoreManager {
@@ -28,6 +37,7 @@ impl StoreManager {
         Self {
             local_stores: HashMap::new(),
             registry: StoreRegistry::new(),
+            newly_opened: Vec::new(),
         }
     }
 
@@ -38,6 +48,7 @@ impl StoreManager {
         let id = store.id;
         self.registry.register(id, StoreEndpoint::Local { path: path.to_path_buf() });
         self.local_stores.insert(id, store);
+        self.newly_opened.push(id);
         Ok(id)
     }
 
@@ -56,7 +67,15 @@ impl StoreManager {
         }
 
         self.local_stores.insert(id, store);
+        self.newly_opened.push(id);
         Ok(id)
+    }
+
+    /// Drain and return the list of stores opened since the last call to
+    /// this method. See the [`StoreManager::newly_opened`] field doc for why
+    /// this exists.
+    pub fn opened_since(&mut self) -> Vec<StoreId> {
+        std::mem::take(&mut self.newly_opened)
     }
 
     /// Close a store
@@ -65,6 +84,7 @@ impl StoreManager {
             store.flush().await?;
             info!("Closed store {}", store_id);
         }
+        self.newly_opened.retain(|id| *id != store_id);
         Ok(())
     }
 
@@ -110,10 +130,21 @@ impl StoreManager {
         store.update_node_metadata(node_id, &metadata).await
     }
 
-    /// Create a node in a store
+    /// Create a node in a store. A mount node has no children of its own
+    /// (its subtree lives entirely in the source store), so creating under
+    /// one is rejected; create under the mount's `mount_ref` instead.
     pub async fn create_node(&mut self, store_id: StoreId, node: Node, parent_id: Option<NodeId>) -> Result<NodeId> {
         let store = self.local_stores.get_mut(&store_id)
             .ok_or(StoreError::NotOpen(store_id))?;
+
+        if let Some(parent_id) = parent_id {
+            let parent = store.store_document().get_node_info(parent_id)
+                .map_err(StoreError::Crdt)?;
+            if parent.node_type == pimble_core::node_types::MOUNT {
+                return Err(StoreError::MountHasNoChildren { node_id: parent_id });
+            }
+        }
+
         store.create_node(node, parent_id).await
     }
 
@@ -204,22 +235,33 @@ impl StoreManager {
         store.apply_store_doc_update(update)
     }
 
-    /// Get children of a node.
+    /// Get children of a node, and the id of the store they canonically live
+    /// in.
     ///
-    /// If the node is a mount point, its children are transparently resolved
-    /// from the source store instead of the local store.
-    pub async fn get_children(&mut self, store_id: StoreId, node_id: NodeId) -> Result<Vec<Node>> {
-        // First, check if this node is a mount
+    /// For an ordinary node this is `(store_id, ...)`: the request's own
+    /// store. For a mount point, the mount's source store is opened if
+    /// necessary (see [`StoreManager::ensure_store_open`]) and the source
+    /// node's children are returned instead, addressed by the source store's
+    /// id — a mount resolves exactly one level; a nested mount inside the
+    /// returned children is itself a source-store node, resolved the same
+    /// way when the caller expands it in turn.
+    pub async fn get_children(&mut self, store_id: StoreId, node_id: NodeId) -> Result<(StoreId, Vec<Node>)> {
         let node = self.get_node(store_id, node_id).await?;
         if node.is_mount() {
-            if let Some(mount_ref) = node.mount_ref() {
-                return self.resolve_mount(&mount_ref).await;
-            }
+            let mount_ref = node.mount_ref().ok_or_else(|| {
+                StoreError::InvalidOperation(format!("mount node {} has no mount_ref", node_id))
+            })?;
+            let source_store = self.ensure_store_open(&mount_ref).await?;
+            let store = self.local_stores.get_mut(&source_store)
+                .ok_or(StoreError::NotOpen(source_store))?;
+            let children = store.get_children(mount_ref.source_node).await?;
+            return Ok((source_store, children));
         }
 
         let store = self.local_stores.get_mut(&store_id)
             .ok_or(StoreError::NotOpen(store_id))?;
-        store.get_children(node_id).await
+        let children = store.get_children(node_id).await?;
+        Ok((store_id, children))
     }
 
     /// Flush a store to disk
@@ -256,64 +298,43 @@ impl StoreManager {
 
     // ── Mount resolution ────────────────────────────────────────────
 
-    /// Resolve a mount point, opening the source store if needed.
-    /// Returns the source node's children (the mounted subtree's top level).
-    pub async fn resolve_mount(&mut self, mount_ref: &MountRef) -> Result<Vec<Node>> {
-        let mut chain = Vec::new();
-        self.resolve_mount_with_chain(mount_ref, &mut chain, 0).await
-    }
+    /// Ensure a mount's source store is open, returning its `StoreId`
+    /// (always `mount_ref.source_store` on success). Resolution order:
+    /// already open; a registry entry (works for a store opened earlier in
+    /// this process, local or previously-registered); `mount_ref`'s
+    /// `source_path` hint, opened directly and thereby registered (this is
+    /// what lets a mount resolve after a restart even when its source was
+    /// not itself in the app's open-store list). `Err` only when none of
+    /// those apply, or the registry's entry is `Remote` (out of scope).
+    pub async fn ensure_store_open(&mut self, mount_ref: &MountRef) -> Result<StoreId> {
+        let store_id = mount_ref.source_store;
 
-    /// Internal mount resolver with cycle detection.
-    fn resolve_mount_with_chain<'a>(
-        &'a mut self,
-        mount_ref: &'a MountRef,
-        chain: &'a mut Vec<(StoreId, NodeId)>,
-        depth: usize,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Node>>> + Send + 'a>> {
-        Box::pin(async move {
-        let pair = (mount_ref.source_store, mount_ref.source_node);
-
-        // Cycle check
-        if chain.contains(&pair) {
-            chain.push(pair);
-            return Err(StoreError::MountCycle { chain: chain.clone() });
-        }
-
-        // Depth check
-        if depth > MAX_MOUNT_DEPTH {
-            return Err(StoreError::MountDepthExceeded { depth });
-        }
-
-        chain.push(pair);
-
-        // Ensure the source store is open
-        self.ensure_store_open(mount_ref.source_store).await?;
-
-        // Get children
-        let children = {
-            let store = self.local_stores.get_mut(&mount_ref.source_store)
-                .ok_or(StoreError::NotOpen(mount_ref.source_store))?;
-            store.get_children(mount_ref.source_node).await?
-        };
-
-        // Validate any nested mounts
-        for child in &children {
-            if child.is_mount() {
-                if let Some(nested_ref) = child.mount_ref() {
-                    if let Err(e) = self.resolve_mount_with_chain(&nested_ref, chain, depth + 1).await {
-                        warn!("Nested mount {} not resolvable: {}", child.id, e);
-                    }
+        match self.open_registered_store(store_id).await {
+            Ok(()) => Ok(store_id),
+            Err(StoreError::MountSourceUnavailable { .. }) => {
+                let Some(path) = &mount_ref.source_path else {
+                    return Err(StoreError::MountSourceUnavailable { store_id });
+                };
+                // The hint is only a hint: the directory may now hold a
+                // different store. Open it, and if it is not the store the
+                // mount names, close it again and report the source missing.
+                let opened = self.open_local_store(path).await
+                    .map_err(|_| StoreError::MountSourceUnavailable { store_id })?;
+                if opened != store_id {
+                    self.close_store(opened).await?;
+                    return Err(StoreError::MountSourceUnavailable { store_id });
                 }
+                Ok(store_id)
             }
+            Err(e) => Err(e),
         }
-
-        chain.pop();
-        Ok(children)
-        }) // end Box::pin
     }
 
-    /// Ensure a store is open, opening it from the registry if necessary.
-    async fn ensure_store_open(&mut self, store_id: StoreId) -> Result<()> {
+    /// Open `store_id` if it is already open or known to the registry;
+    /// otherwise `MountSourceUnavailable`. Does not consult a `MountRef`'s
+    /// `source_path` hint — see [`StoreManager::ensure_store_open`] for the
+    /// full resolution order used when resolving a specific mount.
+    async fn open_registered_store(&mut self, store_id: StoreId) -> Result<()> {
         if self.local_stores.contains_key(&store_id) {
             return Ok(());
         }
@@ -330,14 +351,15 @@ impl StoreManager {
         }
     }
 
-    /// Get the current state of a mount point.
-    pub fn mount_state(&self, mount_ref: &MountRef) -> MountState {
-        if self.local_stores.contains_key(&mount_ref.source_store) {
-            MountState::Live
-        } else if self.registry.lookup(&mount_ref.source_store).is_some() {
-            MountState::Live
-        } else {
-            MountState::Unavailable
+    /// The current state of a mount point: `Live` if its source store is
+    /// open or could be opened (see [`StoreManager::ensure_store_open`]),
+    /// `Unavailable` otherwise. Actually attempts resolution rather than
+    /// checking the registry alone, so a `Live` result means the source can
+    /// really be reached right now.
+    pub async fn mount_state(&mut self, mount_ref: &MountRef) -> MountState {
+        match self.ensure_store_open(mount_ref).await {
+            Ok(_) => MountState::Live,
+            Err(_) => MountState::Unavailable,
         }
     }
 
@@ -350,7 +372,7 @@ impl StoreManager {
     ) -> Result<()> {
         let ancestors = self.collect_ancestors(mounting_store, mounting_node).await?;
 
-        self.ensure_store_open(mount_ref.source_store).await?;
+        self.ensure_store_open(mount_ref).await?;
 
         let mut stack: Vec<(StoreId, NodeId, usize)> = vec![
             (mount_ref.source_store, mount_ref.source_node, 0),
@@ -361,7 +383,7 @@ impl StoreManager {
                 return Err(StoreError::MountDepthExceeded { depth });
             }
 
-            self.ensure_store_open(current_store).await?;
+            self.open_registered_store(current_store).await?;
 
             let node = {
                 let store = self.local_stores.get_mut(&current_store)

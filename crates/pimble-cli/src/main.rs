@@ -91,6 +91,28 @@ async fn main() -> Result<()> {
             }
             rebuild_index(&args[2]).await?;
         }
+        "create-mount" => {
+            if args.len() < 6 {
+                eprintln!("Usage: pimble-cli create-mount <store-id> <parent-id> <source-store-id> <source-node-id> [title]");
+                return Ok(());
+            }
+            let title = if args.len() > 6 { Some(args[6..].join(" ")) } else { None };
+            create_mount(&args[2], &args[3], &args[4], &args[5], title).await?;
+        }
+        "mount-state" => {
+            if args.len() < 4 {
+                eprintln!("Usage: pimble-cli mount-state <store-id> <node-id>");
+                return Ok(());
+            }
+            mount_state(&args[2], &args[3]).await?;
+        }
+        "list-children" => {
+            if args.len() < 4 {
+                eprintln!("Usage: pimble-cli list-children <store-id> <node-id>");
+                return Ok(());
+            }
+            list_children(&args[2], &args[3]).await?;
+        }
         _ => {
             eprintln!("Unknown command: {}", command);
             print_help();
@@ -119,6 +141,9 @@ COMMANDS:
     show-node           Print a node's metadata and content text
     search              Search across all open stores
     rebuild-index       Rebuild a store's search index from scratch
+    create-mount        Mount a subtree from one store under a node in another
+    mount-state         Show a mount point's resolution state
+    list-children       List a node's children (resolves mounts)
 
 EXAMPLES:
     pimble-cli server
@@ -131,6 +156,9 @@ EXAMPLES:
     pimble-cli show-node <store-id> <node-id>
     pimble-cli search "hello"
     pimble-cli rebuild-index <store-id>
+    pimble-cli create-mount <store-id> <parent-id> <source-store-id> <source-node-id> "My Mount"
+    pimble-cli mount-state <store-id> <node-id>
+    pimble-cli list-children <store-id> <node-id>
 "#
     );
 }
@@ -253,6 +281,63 @@ async fn rebuild_index(store_id: &str) -> Result<()> {
     let client = connect().await?;
     let indexed = client.rebuild_index(store_id).await?;
     println!("Rebuilt index for store {}: {} node(s) indexed", store_id, indexed);
+    Ok(())
+}
+
+async fn create_mount(
+    store_id: &str,
+    parent_id: &str,
+    source_store_id: &str,
+    source_node_id: &str,
+    title: Option<String>,
+) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let parent_id = parse_node_id(parent_id)?;
+    let source_store_id = parse_store_id(source_store_id)?;
+    let source_node_id = parse_node_id(source_node_id)?;
+
+    let client = connect().await?;
+    let (node_id, mount_ref) = client
+        .create_mount(store_id, parent_id, source_store_id, source_node_id, title)
+        .await?;
+    println!("Created mount: {}", node_id);
+    println!("Source: {}:{}", mount_ref.source_store, mount_ref.source_node);
+    if let Some(path) = &mount_ref.source_path {
+        println!("Source path: {}", path.display());
+    }
+    Ok(())
+}
+
+async fn mount_state(store_id: &str, node_id: &str) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let node_id = parse_node_id(node_id)?;
+
+    let client = connect().await?;
+    let (state, mount_ref) = client.get_mount_state(store_id, node_id).await?;
+    println!("Mount state: {:?}", state);
+    println!("Source: {}:{}", mount_ref.source_store, mount_ref.source_node);
+    if let Some(path) = &mount_ref.source_path {
+        println!("Source path: {}", path.display());
+    }
+    Ok(())
+}
+
+async fn list_children(store_id: &str, node_id: &str) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let node_id = parse_node_id(node_id)?;
+
+    let client = connect().await?;
+    let (canonical_store, children) = client.get_children(store_id, node_id).await?;
+    if children.is_empty() {
+        println!("No children");
+    } else {
+        for child in children {
+            println!(
+                "{} {} {} {}",
+                canonical_store, child.id, child.node_type, child.metadata.title
+            );
+        }
+    }
     Ok(())
 }
 
