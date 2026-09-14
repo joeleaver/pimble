@@ -5,13 +5,35 @@
 //! loaded, node moved, store opened/closed) bump `tree_structure_version` to
 //! trigger a full tree rebuild.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
-use pimble_core::{MountState, Node, NodeId, Store, StoreId};
+use pimble_core::{MountRef, MountState, Node, NodeId, Store, StoreId};
 use rinch::components::TreeNodeData;
 use rinch::prelude::*;
 
 use crate::backend::BackendHandle;
+
+thread_local! {
+    /// The tree value (with any mount-path suffix, decision 7) of the last
+    /// drag-and-drop target, set by `app.rs`'s `on_drop` right before sending
+    /// `MoveNode` and consumed once by the `NodeMoved` handler in `events.rs`
+    /// to auto-expand exactly the place the user dropped into, rather than
+    /// reconstructing an unqualified value that would not match a target
+    /// reached only through a mount.
+    static LAST_DROP_TARGET_VALUE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Record the qualified tree value of a drag-and-drop target, just before the
+/// `MoveNode` command that will result in a `NodeMoved` event for it.
+pub fn set_last_drop_target_value(value: String) {
+    LAST_DROP_TARGET_VALUE.with(|cell| *cell.borrow_mut() = Some(value));
+}
+
+/// Take (and clear) the last recorded drop-target tree value, if any.
+pub fn take_last_drop_target_value() -> Option<String> {
+    LAST_DROP_TARGET_VALUE.with(|cell| cell.borrow_mut().take())
+}
 
 /// A pending mount operation waiting for a store to be opened.
 #[derive(Debug, Clone)]
@@ -38,6 +60,11 @@ pub enum SearchState {
 pub struct MountInfo {
     pub is_mount: bool,
     pub mount_state: Option<MountState>,
+    /// The mount's target: source store and node. Populated as soon as we see
+    /// the mount node's own data (`Node::mount_ref()`), and refreshed whenever
+    /// `getMountState` answers (which is authoritative, e.g. after Agent A's
+    /// `source_path` hint is filled in server-side).
+    pub mount_ref: Option<MountRef>,
 }
 
 /// Extract plain-text content from node content bytes, for tree previews / labels.
@@ -111,7 +138,10 @@ pub struct AppStore {
     pub store_ids: Signal<Vec<StoreId>>,
     pub store_data: Signal<HashMap<StoreId, Signal<Store>>>,
     pub node_data: Signal<HashMap<(StoreId, NodeId), Signal<Node>>>,
-    pub children_of: Signal<HashMap<(StoreId, NodeId), Signal<Vec<NodeId>>>>,
+    /// Each parent's children, as their OWN canonical `(StoreId, NodeId)`
+    /// pairs — the same as the parent's store for an ordinary parent, the
+    /// mount's source store when the parent is a mount node (decision 1).
+    pub children_of: Signal<HashMap<(StoreId, NodeId), Signal<Vec<(StoreId, NodeId)>>>>,
     pub mount_data: Signal<HashMap<(StoreId, NodeId), Signal<MountInfo>>>,
 
     /// Bumped only on structural changes (store open/close, children loaded, node moved).
@@ -141,6 +171,10 @@ pub struct AppStore {
 
     // Mount picker
     pub pending_mount: Signal<Option<PendingMount>>,
+
+    // "Copy as Mount Source" / "Paste Mount Here": the canonical pair and
+    // display title of the node last copied as a mount source, if any.
+    pub mount_source: Signal<Option<(StoreId, NodeId, String)>>,
 
     // Editor dirty flag — set when user edits content, cleared on save/load
     pub editor_dirty: Signal<bool>,
@@ -197,6 +231,7 @@ impl AppStore {
             drop_target: Signal::new(None),
             rename_input_ids: Signal::new(HashMap::new()),
             pending_mount: Signal::new(None),
+            mount_source: Signal::new(None),
             editor_dirty: Signal::new(false),
             active_edit: Signal::new(None),
             live_label: Signal::new(HashMap::new()),
@@ -273,16 +308,17 @@ impl AppStore {
         self.live_label.update(|m| { m.remove(&key); });
     }
 
-    /// Set children for a parent node's per-entity signal.
+    /// Set children for a parent node's per-entity signal. `children` are
+    /// each child's own canonical `(StoreId, NodeId)` pair (decision 1).
     ///
     /// Sets the inner signal outside the outer borrow to avoid re-entrancy.
-    pub fn set_children(&self, store_id: StoreId, parent_id: NodeId, child_ids: Vec<NodeId>) {
+    pub fn set_children(&self, store_id: StoreId, parent_id: NodeId, children: Vec<(StoreId, NodeId)>) {
         let key = (store_id, parent_id);
         let existing = self.children_of.with(|map| map.get(&key).copied());
         if let Some(sig) = existing {
-            sig.set(child_ids);
+            sig.set(children);
         } else {
-            let new_sig = Signal::new(child_ids);
+            let new_sig = Signal::new(children);
             self.children_of.update(|map| {
                 map.insert(key, new_sig);
             });
@@ -305,7 +341,7 @@ impl AppStore {
     }
 
     /// Get the children signal for a parent (untracked read of the registry).
-    pub fn get_children_signal(&self, store_id: StoreId, node_id: NodeId) -> Option<Signal<Vec<NodeId>>> {
+    pub fn get_children_signal(&self, store_id: StoreId, node_id: NodeId) -> Option<Signal<Vec<(StoreId, NodeId)>>> {
         untracked(|| self.children_of.with(|map| map.get(&(store_id, node_id)).copied()))
     }
 
@@ -334,16 +370,26 @@ impl AppStore {
     }
 
     /// Update mount info for a node. Call this whenever a node is inserted into the cache.
+    /// Picks up `mount_ref` straight from the node's own data
+    /// (`Node::mount_ref()`) when present, so a mount's target is known as
+    /// soon as its node is seen, without waiting on `getMountState`.
     pub fn track_mount_info(&self, store_id: StoreId, node: &pimble_core::Node) {
         if node.is_mount() {
             let key = (store_id, node.id);
+            let mount_ref = node.mount_ref();
             let existing = self.mount_data.with(|map| map.get(&key).copied());
             if let Some(sig) = existing {
-                sig.update(|m| { m.is_mount = true; });
+                sig.update(|m| {
+                    m.is_mount = true;
+                    if mount_ref.is_some() {
+                        m.mount_ref = mount_ref.clone();
+                    }
+                });
             } else {
                 let new_sig = Signal::new(MountInfo {
                     is_mount: true,
                     mount_state: None,
+                    mount_ref,
                 });
                 self.mount_data.update(|map| {
                     map.insert(key, new_sig);
@@ -352,13 +398,54 @@ impl AppStore {
         }
     }
 
-    /// Update the mount state for a specific node.
-    pub fn set_mount_state(&self, store_id: StoreId, node_id: NodeId, state: MountState) {
+    /// Update the mount state (and the authoritative `mount_ref` the
+    /// `getMountState` RPC returns alongside it) for a specific node.
+    pub fn set_mount_state(&self, store_id: StoreId, node_id: NodeId, state: MountState, mount_ref: MountRef) {
         let key = (store_id, node_id);
         let existing = self.mount_data.with(|map| map.get(&key).copied());
         if let Some(sig) = existing {
-            sig.update(|m| { m.mount_state = Some(state); });
+            sig.update(|m| { m.mount_state = Some(state); m.mount_ref = Some(mount_ref); });
+        } else {
+            let new_sig = Signal::new(MountInfo {
+                is_mount: true,
+                mount_state: Some(state),
+                mount_ref: Some(mount_ref),
+            });
+            self.mount_data.update(|map| {
+                map.insert(key, new_sig);
+            });
         }
+    }
+
+    /// Canonical pairs of every mount node whose `mount_ref.source_store` is
+    /// `source_store` (untracked). Used to refresh mounts in response to a
+    /// structural change reported on that store's own `storeChanged`
+    /// subscription (decision 6: no new server-side fan-out for mounts).
+    pub fn mounts_sourced_from(&self, source_store: StoreId) -> Vec<(StoreId, NodeId)> {
+        untracked(|| {
+            self.mount_data.with(|map| {
+                map.iter()
+                    .filter_map(|(&key, sig)| {
+                        let matches = sig.with(|m| {
+                            m.mount_ref.as_ref().map_or(false, |r| r.source_store == source_store)
+                        });
+                        if matches { Some(key) } else { None }
+                    })
+                    .collect()
+            })
+        })
+    }
+
+    /// Canonical pairs of every node in `store_id` whose children are loaded
+    /// (untracked): the parents a remote structural change in that store may
+    /// have touched. A `storeChanged` notification names only the node, not
+    /// its parent, so the client refetches every loaded list of that store.
+    pub fn loaded_parents_in(&self, store_id: StoreId) -> Vec<(StoreId, NodeId)> {
+        untracked(|| {
+            self.children_of.with(|map| {
+                map.keys().copied().filter(|(sid, _)| *sid == store_id).collect()
+            })
+        })
     }
 
     /// Check if a node is a mount point (untracked).
@@ -385,7 +472,7 @@ impl AppStore {
             let Some((store_name, root_id)) = store_info else { continue };
 
             let store_node = TreeNodeData::new(format!("store_{}", sid), &store_name);
-            let children = self.build_children_structural(sid, root_id);
+            let children = self.build_children_structural(sid, root_id, &[]);
             if children.is_empty() {
                 result.push(store_node);
             } else {
@@ -396,35 +483,55 @@ impl AppStore {
     }
 
     /// Build structural children recursively (called from untracked context).
-    fn build_children_structural(&self, store_id: StoreId, parent_id: NodeId) -> Vec<TreeNodeData> {
-        let child_ids = self.children_of.with(|map| {
+    ///
+    /// `mount_path` accumulates the canonical `(mount_store, mount_node)` pair
+    /// of every mount node crossed to reach this level, outermost first
+    /// (decision 7) — empty for a node reached directly from its own store's
+    /// root. It disambiguates the same canonical node appearing in several
+    /// places, since rinch's Tree keys expansion and selection by value string.
+    fn build_children_structural(
+        &self,
+        store_id: StoreId,
+        parent_id: NodeId,
+        mount_path: &[(StoreId, NodeId)],
+    ) -> Vec<TreeNodeData> {
+        let children = self.children_of.with(|map| {
             map.get(&(store_id, parent_id)).map(|sig| sig.get())
         });
-        let Some(child_ids) = child_ids else { return Vec::new() };
+        let Some(children) = children else { return Vec::new() };
+
+        let suffix = mount_path_suffix(mount_path);
 
         let mut result = Vec::new();
-        for &child_id in &child_ids {
+        for &(child_store, child_id) in &children {
             let is_mount = self.mount_data.with(|map| {
-                map.get(&(store_id, child_id)).map_or(false, |sig| sig.with(|m| m.is_mount))
+                map.get(&(child_store, child_id)).map_or(false, |sig| sig.with(|m| m.is_mount))
             });
 
             // Empty label — render_node Effects will populate reactively
             let tree_node = TreeNodeData::new(
-                format!("node_{}_{}", store_id, child_id),
+                format!("node_{}_{}{}", child_store, child_id, suffix),
                 "",
             );
 
-            let children_data = self.build_children_structural(store_id, child_id);
+            // Crossing a mount node adds it to the path for everything below it.
+            let children_data = if is_mount {
+                let mut next_path = mount_path.to_vec();
+                next_path.push((child_store, child_id));
+                self.build_children_structural(child_store, child_id, &next_path)
+            } else {
+                self.build_children_structural(child_store, child_id, mount_path)
+            };
             let has_children = !children_data.is_empty();
             let has_loaded_children = self.children_of.with(|map| {
-                map.contains_key(&(store_id, child_id))
+                map.contains_key(&(child_store, child_id))
             });
 
             // Check if the node itself reports having children (from its
             // children list) even if we haven't fetched them yet. This
             // lets the tree show an expand chevron for unfetched subtrees.
             let node_reports_children = !has_loaded_children && self.node_data.with(|map| {
-                map.get(&(store_id, child_id))
+                map.get(&(child_store, child_id))
                     .map_or(false, |sig| sig.with(|n| !n.children.is_empty()))
             });
 
@@ -432,7 +539,7 @@ impl AppStore {
                 result.push(tree_node.with_children(children_data));
             } else if is_mount && !has_loaded_children {
                 let placeholder = TreeNodeData::new(
-                    format!("mount_loading_{}_{}", store_id, child_id),
+                    format!("mount_loading_{}_{}{}", child_store, child_id, suffix),
                     "Loading...",
                 );
                 result.push(tree_node.with_children(vec![placeholder]));
@@ -440,7 +547,7 @@ impl AppStore {
                 // Node has children we haven't fetched yet — show a
                 // placeholder so the tree renders an expand chevron.
                 let placeholder = TreeNodeData::new(
-                    format!("placeholder_{}_{}", store_id, child_id),
+                    format!("placeholder_{}_{}{}", child_store, child_id, suffix),
                     "",
                 );
                 result.push(tree_node.with_children(vec![placeholder]));
@@ -480,17 +587,36 @@ impl AppStore {
     }
 }
 
-/// Parse a tree value ID like "store_{uuid}" or "node_{store_uuid}_{node_uuid}"
+/// Build the mount-path suffix for a tree value (decision 7): one
+/// `/{mount_store}_{mount_node}` segment per mount level crossed, innermost
+/// last. Empty for a node reached directly (no mounts crossed).
+fn mount_path_suffix(mount_path: &[(StoreId, NodeId)]) -> String {
+    let mut s = String::new();
+    for (mount_store, mount_node) in mount_path {
+        s.push('/');
+        s.push_str(&mount_store.to_string());
+        s.push('_');
+        s.push_str(&mount_node.to_string());
+    }
+    s
+}
+
+/// Parse a tree value ID like "store_{uuid}" or
+/// "node_{store_uuid}_{node_uuid}[/{mount_store}_{mount_node}...]" — always
+/// returning the CANONICAL pair (the first 73 characters after "node_"),
+/// ignoring any mount-path suffix (decision 7). Every existing consumer wants
+/// the canonical node identity regardless of which place in the tree it was
+/// reached through.
 pub fn parse_tree_value(value: &str) -> Option<(StoreId, Option<NodeId>)> {
     if let Some(rest) = value.strip_prefix("store_") {
         let uuid: uuid::Uuid = rest.parse().ok()?;
         Some((StoreId(uuid), None))
     } else if let Some(rest) = value.strip_prefix("node_") {
-        // Format: node_{store_uuid}_{node_uuid}
-        // UUIDs are 36 chars each
+        // Format: node_{store_uuid}_{node_uuid}[/...path suffix]
+        // UUIDs are 36 chars each; 36 + 1 ('_') + 36 = 73.
         if rest.len() >= 73 {
             let store_str = &rest[..36];
-            let node_str = &rest[37..];
+            let node_str = &rest[37..73];
             let store_uuid: uuid::Uuid = store_str.parse().ok()?;
             let node_uuid: uuid::Uuid = node_str.parse().ok()?;
             Some((StoreId(store_uuid), Some(NodeId(node_uuid))))

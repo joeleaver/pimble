@@ -22,6 +22,11 @@ pub enum BackendCommand {
     CreateStore { path: String, name: String },
     OpenStore { path: String },
     CloseStore { store_id: StoreId },
+    /// List every store the server currently has open. Used to discover a
+    /// store the server opened implicitly to resolve a mount (decision 4) —
+    /// the client sees its id in `ChildrenLoaded.children_store_id` before it
+    /// knows anything else about it.
+    ListStores,
 
     // Node operations
     CreateNode { store_id: StoreId, parent_id: Option<NodeId>, title: String },
@@ -73,6 +78,8 @@ pub enum BackendEvent {
     StoreCreated { store_id: StoreId, root_node_id: NodeId },
     StoreOpened { store: Store },
     StoreClosed { store_id: StoreId },
+    /// Answer to `ListStores`: every store the server currently has open.
+    StoresListed { stores: Vec<Store> },
 
     // Node events
     NodeCreated { store_id: StoreId, parent_id: Option<NodeId>, node_id: NodeId },
@@ -95,6 +102,7 @@ pub enum BackendEvent {
         store_id: StoreId,
         node_id: NodeId,
         state: MountState,
+        mount_ref: MountRef,
     },
 
     // Remote change events (from subscriptions)
@@ -383,6 +391,16 @@ async fn process_command(
             }
         }
 
+        BackendCommand::ListStores => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            match c.list_stores().await {
+                Ok(stores) => Some(BackendEvent::StoresListed { stores }),
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
         BackendCommand::CreateNode { store_id, parent_id, title } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
@@ -504,7 +522,7 @@ async fn process_command(
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
             match c.get_mount_state(store_id, node_id).await {
-                Ok((state, _mount_ref)) => Some(BackendEvent::MountStateChanged { store_id, node_id, state }),
+                Ok((state, mount_ref)) => Some(BackendEvent::MountStateChanged { store_id, node_id, state, mount_ref }),
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
         }

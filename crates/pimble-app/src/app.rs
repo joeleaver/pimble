@@ -86,6 +86,51 @@ fn open_node(store: AppStore, tree_state: UseTreeReturn, value: String) {
     store.editor_dirty.set(false);
 }
 
+/// "Copy as Mount Source": record the canonical pair and display title of the
+/// node or store root identified by `value` into `store.mount_source`, for a
+/// subsequent "Paste Mount Here" elsewhere in the tree.
+fn copy_as_mount_source(store: AppStore, value: &str) {
+    let Some((s_id, node_id_opt)) = parse_tree_value(value) else { return };
+    match node_id_opt {
+        Some(n_id) => {
+            let title = store.display_label(s_id, n_id);
+            store.mount_source.set(Some((s_id, n_id, title)));
+            store.bump_tree_structure();
+        }
+        None => {
+            if let Some(root_id) = store.root_node_id(s_id) {
+                let name = store.get_store_signal(s_id)
+                    .map(|sig| untracked(|| sig.with(|s| s.name.clone())))
+                    .unwrap_or_default();
+                store.mount_source.set(Some((s_id, root_id, name)));
+                store.bump_tree_structure();
+            }
+        }
+    }
+}
+
+/// "Paste Mount Here": create a mount at the tree location identified by
+/// `target_value`, sourced from whatever "Copy as Mount Source" last recorded
+/// in `store.mount_source`. No-op if nothing was copied. Clears the copied
+/// source on success so the menu item disappears again.
+fn paste_mount_here(store: AppStore, target_value: &str) {
+    let Some(source) = untracked(|| store.mount_source.get()) else { return };
+    let (source_store, source_node, title) = source;
+    let Some((target_store, target_node_opt)) = parse_tree_value(target_value) else { return };
+    let Some(parent_id) = target_node_opt.or_else(|| store.root_node_id(target_store)) else { return };
+    store.send(BackendCommand::CreateMount {
+        store_id: target_store,
+        parent_id,
+        source_store_id: source_store,
+        source_node_id: source_node,
+        title: Some(title),
+    });
+    store.mount_source.set(None);
+    // Re-render every row's context menu so "Paste Mount Here" reads as
+    // disabled again (see the `no_mount_source` note in `run`).
+    store.bump_tree_structure();
+}
+
 /// Cancel a pending debounce timer and reset the search box to empty/idle.
 /// Also drops the search box's Escape interceptor, installed by `oninput`
 /// only while the box is non-empty (see there) so it never fights the tree
@@ -580,9 +625,21 @@ pub fn run() {
                     if dragged_value == nv { return; }
                     let Some((drag_store_id, Some(drag_node_id))) = parse_tree_value(&dragged_value) else { return; };
                     let new_parent_id = if let Some((target_store_id, target_node_id_opt)) = parse_tree_value(&nv) {
-                        if drag_store_id != target_store_id { return; }
+                        if drag_store_id != target_store_id {
+                            tracing::warn!(
+                                "Ignoring drop: source store {:?} differs from target store {:?} (cross-store move not supported yet)",
+                                drag_store_id, target_store_id
+                            );
+                            return;
+                        }
                         match target_node_id_opt {
-                            Some(nid) => nid,
+                            Some(nid) => {
+                                if store.is_mount(target_store_id, nid) {
+                                    tracing::warn!("Ignoring drop onto mount node {:?}/{:?}", target_store_id, nid);
+                                    return;
+                                }
+                                nid
+                            }
                             None => {
                                 match store.root_node_id(target_store_id) {
                                     Some(id) => id,
@@ -594,6 +651,10 @@ pub fn run() {
                         return;
                     };
                     tracing::info!("Drop: moving {:?} into {:?}", drag_node_id, new_parent_id);
+                    // Record the exact (possibly mount-path-qualified) tree
+                    // value dropped onto, so the resulting `NodeMoved` event
+                    // can auto-expand precisely this place (decision 7).
+                    crate::state::set_last_drop_target_value(nv.clone());
                     store.send(BackendCommand::MoveNode {
                         store_id: drag_store_id, node_id: drag_node_id,
                         new_parent_id, position: None,
@@ -665,6 +726,49 @@ pub fn run() {
                         });
                     }
                 }
+            };
+
+            // Mount-node-only "New Node": creates under the mount's source
+            // (mount_ref), never under the mount node itself (decision 2 —
+            // the server rejects a mount node as a create parent).
+            let on_new_child_mount = {
+                let sig = mount_sig;
+                move || {
+                    let Some(sig) = sig else { return };
+                    let mount_ref = untracked(|| sig.with(|m| m.mount_ref.clone()));
+                    match mount_ref {
+                        Some(mount_ref) => {
+                            store.send(BackendCommand::CreateNode {
+                                store_id: mount_ref.source_store,
+                                parent_id: Some(mount_ref.source_node),
+                                title: String::new(),
+                            });
+                        }
+                        None => tracing::warn!("Mount node has no mount_ref yet; cannot create a child under it"),
+                    }
+                }
+            };
+
+            // "Copy as Mount Source" — store roots and ordinary nodes only
+            // (not mount nodes, which are placeholders). Not reactive, so a
+            // single `move` closure built once is fine (Rule 4/16).
+            let on_copy_as_mount_source = {
+                let nv = nv_ctx.clone();
+                move || copy_as_mount_source(store, &nv)
+            };
+            // "Paste Mount Here" is always rendered, disabled while nothing is
+            // copied. It must NOT sit inside a reactive `if` block: a rinch
+            // DropdownMenuItem captures the menu's close signal from a
+            // thread-local only during the ContextMenu's own render, so an
+            // item rendered later by a reactive block never closes the menu,
+            // and the tree rebuild that follows the paste then orphans the
+            // still-open portal. `copy_as_mount_source`/`paste_mount_here`
+            // bump the tree structure instead, so every row's menu re-renders
+            // with a fresh `disabled` value.
+            let no_mount_source = untracked(|| store.mount_source.get().is_none());
+            let on_paste_mount = {
+                let nv = nv_ctx.clone();
+                move || paste_mount_here(store, &nv)
             };
 
             // Build the wrapper span with drag-and-drop via rsx
@@ -825,6 +929,17 @@ pub fn run() {
                                 "Mount Store..."
                             }
                             DropdownMenuItem {
+                                left_section: TablerIcon::Copy,
+                                onclick: on_copy_as_mount_source,
+                                "Copy as Mount Source"
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::ClipboardCopy,
+                                disabled: no_mount_source,
+                                onclick: on_paste_mount,
+                                "Paste Mount Here"
+                            }
+                            DropdownMenuItem {
                                 left_section: TablerIcon::X,
                                 onclick: on_close_store,
                                 "Close Store"
@@ -839,7 +954,7 @@ pub fn run() {
                         ContextMenuDropdown {
                             DropdownMenuItem {
                                 left_section: TablerIcon::FilePlus,
-                                onclick: on_new_child,
+                                onclick: on_new_child_mount,
                                 "New Node"
                             }
                             DropdownMenuItem {
@@ -902,6 +1017,17 @@ pub fn run() {
                                 left_section: TablerIcon::Link,
                                 onclick: on_mount_store,
                                 "Mount Store..."
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::Copy,
+                                onclick: on_copy_as_mount_source,
+                                "Copy as Mount Source"
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::ClipboardCopy,
+                                disabled: no_mount_source,
+                                onclick: on_paste_mount,
+                                "Paste Mount Here"
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Edit,

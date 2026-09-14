@@ -5,16 +5,63 @@
 
 use std::cell::RefCell;
 
-use pimble_core::NodeId;
+use pimble_core::{NodeId, Store, StoreId};
 use rinch::prelude::*;
 
 use crate::backend::{BackendCommand, BackendEvent};
 use crate::editor::{apply_remote, start_editing};
 use crate::persistence::{load_app_state_file, save_app_state_file};
-use crate::state::{parse_tree_value, AppStore, ConnectionState, MountInfo, SearchState};
+use crate::state::{parse_tree_value, take_last_drop_target_value, AppStore, ConnectionState, MountInfo, SearchState};
 
 thread_local! {
     pub(crate) static EVENT_PROCESSOR: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+}
+
+/// Register a newly-known store in the tree: upsert its signal, fetch its
+/// root's children, subscribe to its changes, auto-expand its row, and
+/// persist the open-store list. Used both when the app explicitly opens a
+/// store (`StoreOpened`) and when it discovers one implicitly — a mount's
+/// source store the server opened to resolve a mount (`StoresListed`,
+/// decision 4) — minus the pending-mount finalization, which only applies to
+/// the explicit "Mount Store..." folder-picker flow.
+fn register_opened_store(store: AppStore, tree_state: UseTreeReturn, opened_store: &Store) {
+    let store_id = opened_store.id;
+    let root_id = opened_store.root_node_id;
+
+    // Structural: new store appears in tree
+    store.upsert_store(opened_store.clone());
+    store.expanded.update(|e| { e.insert((store_id, root_id)); });
+
+    store.send(BackendCommand::GetChildren { store_id, node_id: root_id });
+
+    // Subscribe to store changes for real-time updates
+    store.send(BackendCommand::SubscribeStoreChanges { store_id });
+
+    // Auto-expand the store node in the tree
+    tree_state.controller.expand(&format!("store_{}", store_id));
+
+    // Persist open store paths
+    save_app_state_file(&store.all_store_local_paths());
+
+    // Structural change
+    store.bump_tree_structure();
+}
+
+/// A structural change was reported on `changed_store`'s `storeChanged`
+/// subscription. The notification names the node, not its parent, so
+/// refetch every loaded children list of that store, plus every mount node
+/// (in any store) whose source is that store and whose children are loaded
+/// (decision 6: no new server-side fan-out for mounts — the client does this
+/// itself). Each answer arrives as `ChildrenLoaded`.
+fn refetch_loaded_children(store: AppStore, changed_store: StoreId) {
+    for (sid, nid) in store.loaded_parents_in(changed_store) {
+        store.send(BackendCommand::GetChildren { store_id: sid, node_id: nid });
+    }
+    for (mount_store, mount_node) in store.mounts_sourced_from(changed_store) {
+        if mount_store != changed_store && store.has_children_loaded(mount_store, mount_node) {
+            store.send(BackendCommand::GetChildren { store_id: mount_store, node_id: mount_node });
+        }
+    }
 }
 
 /// Process backend events and update store signals directly.
@@ -75,24 +122,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 let store_id = opened_store.id;
                 let root_id = opened_store.root_node_id;
 
-                // Structural: new store appears in tree
-                store.upsert_store(opened_store.clone());
-                store.expanded.update(|e| { e.insert((store_id, root_id)); });
-
-                store.backend.with(|b| {
-                    if let Some(backend) = b {
-                        backend.send(BackendCommand::GetChildren {
-                            store_id,
-                            node_id: root_id,
-                        });
-                    }
-                });
-
-                // Subscribe to store changes for real-time updates
-                store.send(BackendCommand::SubscribeStoreChanges { store_id });
-
-                // Auto-expand the store node in the tree
-                tree_state.controller.expand(&format!("store_{}", store_id));
+                register_opened_store(store, tree_state, opened_store);
 
                 // Check if this store was opened as part of a pending mount
                 if let Some(pending) = store.pending_mount.get() {
@@ -110,12 +140,6 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         }
                     }
                 }
-
-                // Persist open store paths
-                save_app_state_file(&store.all_store_local_paths());
-
-                // Structural change
-                store.bump_tree_structure();
             }
 
             BackendEvent::StoreCreated { store_id, root_node_id } => {
@@ -132,13 +156,40 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 }
             }
 
+            BackendEvent::StoresListed { stores } => {
+                // Discover any store not yet known — the server may have
+                // opened it implicitly to resolve a mount (decision 4). Run
+                // the same registration path a normal `StoreOpened` uses,
+                // minus the pending-mount finalization (that's specific to
+                // the explicit "Mount Store..." folder-picker flow).
+                let known = untracked(|| store.store_ids.with(|ids| ids.clone()));
+                for s in stores {
+                    if !known.contains(&s.id) {
+                        tracing::info!("Discovered implicitly-opened store: {} ({})", s.name, s.id);
+                        register_opened_store(store, tree_state, s);
+                    }
+                }
+            }
+
             BackendEvent::ChildrenLoaded { store_id, parent_id, children_store_id, children } => {
                 tracing::info!("Children loaded for {:?}: {} nodes (in store {:?})", parent_id, children.len(), children_store_id);
 
-                let child_ids: Vec<NodeId> = children.iter().map(|n| n.id).collect();
+                // Each child's own canonical store is `children_store_id`
+                // (the mount's source store when `parent_id` is a mount
+                // point, `store_id` otherwise — decision 1).
+                let child_pairs: Vec<(StoreId, NodeId)> = children.iter().map(|n| (*children_store_id, n.id)).collect();
 
                 // Structural: children list changed
-                store.set_children(*store_id, *parent_id, child_ids);
+                store.set_children(*store_id, *parent_id, child_pairs);
+
+                // The children's store might not be one we know about yet —
+                // the server may have opened it implicitly to resolve a mount
+                // (decision 4). Discover it via `listStores`.
+                let children_store_known = untracked(|| store.store_ids.with(|ids| ids.contains(children_store_id)));
+                if !children_store_known {
+                    tracing::info!("Unknown store {:?} in ChildrenLoaded; requesting store list", children_store_id);
+                    store.send(BackendCommand::ListStores);
+                }
 
                 // Collect mount node IDs so we can request their state
                 let mount_node_ids: Vec<NodeId> = children.iter()
@@ -146,9 +197,10 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     .map(|child| child.id)
                     .collect();
 
-                // Upsert each child node (per-entity signal)
+                // Upsert each child node (per-entity signal), keyed by its
+                // OWN canonical store.
                 for child in children {
-                    let key = (*store_id, child.id);
+                    let key = (*children_store_id, child.id);
                     let should_update = untracked(|| {
                         store.node_data.with(|map| {
                             map.get(&key)
@@ -156,15 +208,16 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         })
                     });
                     if should_update {
-                        store.track_mount_info(*store_id, child);
-                        store.upsert_node(*store_id, child.clone());
+                        store.track_mount_info(*children_store_id, child);
+                        store.upsert_node(*children_store_id, child.clone());
                     }
                 }
 
-                // Request mount state for any mount nodes
+                // Request mount state for any mount nodes (addressed in
+                // their own store).
                 for mount_node_id in mount_node_ids {
                     store.send(BackendCommand::GetMountState {
-                        store_id: *store_id,
+                        store_id: *children_store_id,
                         node_id: mount_node_id,
                     });
                 }
@@ -216,32 +269,42 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // Update children_of for old parent
                 if let Some(old_sig) = store.get_children_signal(*store_id, *old_parent_id) {
                     old_sig.update(|children| {
-                        children.retain(|&id| id != *node_id);
+                        children.retain(|&pair| pair != (*store_id, *node_id));
                     });
                 }
 
                 // Update children_of for new parent (avoid nested borrow)
                 let new_key = (*store_id, *new_parent_id);
                 let new_parent_sig = store.get_children_signal(*store_id, *new_parent_id);
+                let new_pair = (*store_id, *node_id);
                 if let Some(sig) = new_parent_sig {
                     sig.update(|children| {
-                        if !children.contains(node_id) {
-                            children.push(*node_id);
+                        if !children.contains(&new_pair) {
+                            children.push(new_pair);
                         }
                     });
                 } else {
-                    let new_sig = Signal::new(vec![*node_id]);
+                    let new_sig = Signal::new(vec![new_pair]);
                     store.children_of.update(|map| {
                         map.insert(new_key, new_sig);
                     });
                 }
 
-                // Auto-expand the new parent so the moved node is visible
+                // Auto-expand the new parent so the moved node is visible.
+                // `MoveNode` is only ever sent from a drag-and-drop, whose
+                // `on_drop` records the exact (possibly mount-path-qualified)
+                // tree value it dropped onto — use that instead of
+                // reconstructing an unqualified value that would not match a
+                // target reached only through a mount (decision 7).
                 store.expanded.update(|e| { e.insert((*store_id, *new_parent_id)); });
                 let is_root = store.root_node_id(*store_id)
                     .map_or(false, |rid| rid == *new_parent_id);
+                let dropped_value = take_last_drop_target_value();
                 if !is_root {
-                    tree_state.controller.expand(&format!("node_{}_{}", store_id, new_parent_id));
+                    let expand_value = dropped_value
+                        .filter(|v| parse_tree_value(v).map_or(false, |(sid, nid)| sid == *store_id && nid == Some(*new_parent_id)))
+                        .unwrap_or_else(|| format!("node_{}_{}", store_id, new_parent_id));
+                    tree_state.controller.expand(&expand_value);
                 }
 
                 // Re-fetch from server for authoritative data
@@ -290,7 +353,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // Remove from parent's children signal
                 if let Some(parent_sig) = store.get_children_signal(*store_id, *parent_id) {
                     parent_sig.update(|children| {
-                        children.retain(|&id| id != *node_id);
+                        children.retain(|&pair| pair != (*store_id, *node_id));
                     });
                 }
 
@@ -328,14 +391,16 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             BackendEvent::MountCreated { store_id, node_id, mount_ref } => {
                 tracing::info!("Mount created: {:?}/{:?} -> {:?}/{:?}",
                     store_id, node_id, mount_ref.source_store, mount_ref.source_node);
-                // Track mount info for the new node (avoid nested borrow)
+                // Track mount info for the new node, using the mount_ref the
+                // RPC returned (avoid nested borrow)
                 let existing_mount = store.get_mount_signal(*store_id, *node_id);
                 if let Some(sig) = existing_mount {
-                    sig.update(|m| { m.is_mount = true; m.mount_state = None; });
+                    sig.update(|m| { m.is_mount = true; m.mount_state = None; m.mount_ref = Some(mount_ref.clone()); });
                 } else {
                     let new_sig = Signal::new(MountInfo {
                         is_mount: true,
                         mount_state: None,
+                        mount_ref: Some(mount_ref.clone()),
                     });
                     store.mount_data.update(|map| {
                         map.insert((*store_id, *node_id), new_sig);
@@ -346,11 +411,11 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 store.send(BackendCommand::GetMountState { store_id: *store_id, node_id: *node_id });
             }
 
-            BackendEvent::MountStateChanged { store_id, node_id, state } => {
+            BackendEvent::MountStateChanged { store_id, node_id, state, mount_ref } => {
                 tracing::info!("Mount state changed: {:?}/{:?} -> {:?}", store_id, node_id, state);
                 // Data-only: updates per-mount signal, NO tree rebuild.
                 // The mount Effect on that node fires and updates icon opacity + label suffix.
-                store.set_mount_state(*store_id, *node_id, state.clone());
+                store.set_mount_state(*store_id, *node_id, state.clone(), mount_ref.clone());
             }
 
             BackendEvent::RemoteStoreChange { store_id, change_kind, source_client_id } => {
@@ -367,13 +432,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     StoreChangeKind::NodeCreated { node_id }
                     | StoreChangeKind::NodeDeleted { node_id }
                     | StoreChangeKind::NodeMoved { node_id } => {
-                        // Re-fetch the tree from root
-                        if let Some(root_id) = store.root_node_id(*store_id) {
-                            store.send(BackendCommand::GetChildren {
-                                store_id: *store_id,
-                                node_id: root_id,
-                            });
-                        }
+                        refetch_loaded_children(store, *store_id);
                         // If deleted node was selected, clear selection
                         if matches!(change_kind, StoreChangeKind::NodeDeleted { .. }) {
                             if let Some(selected_id) = store.selected_id.get() {
@@ -409,12 +468,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         }
                     }
                     StoreChangeKind::TreeStructure => {
-                        if let Some(root_id) = store.root_node_id(*store_id) {
-                            store.send(BackendCommand::GetChildren {
-                                store_id: *store_id,
-                                node_id: root_id,
-                            });
-                        }
+                        refetch_loaded_children(store, *store_id);
                     }
                 }
             }
