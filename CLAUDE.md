@@ -39,7 +39,7 @@ re-import from Scrivener.
 | `pimble-rpc` / `pimble-server` / `pimble-client` | RPC protocol, embedded server, WebSocket client | Complete |
 | `pimble-search` | rhypedb index per store: keyword (`@fulltext`, BM25), chunked embeddings behind `semantic`, backlinks | Complete |
 | `pimble-plugins` | `NodePlugin` trait, built-ins | Skeleton |
-| `pimble-app` | rinch desktop app | Works: two-window live editing, persistence verified |
+| `pimble-app` | rinch desktop app | Works: two-window live editing, persistence, local mounts |
 | `pimble-cli` | server / create-store / list-stores | Complete |
 | `pimble-import` | Scrivener + RTF import | Complete |
 
@@ -68,6 +68,23 @@ other) produced by `ContentDoc::units()` or a plugin's `index_units`, so tables 
 structured node types can index later without redesign. Both fields use rhypedb's
 `english` analyzer (stemming), and the last typed word is searched as a prefix term so
 results update while typing (rhypedb #17).
+
+### Mounts (local, done 2026-09-14)
+
+A mount node (`node_type = "mount"`, `MountRef { source_store, source_node, source_path }`
+in `metadata.custom`) is a placeholder in the mounting store: `getNode` returns it with no
+children or content, `getChildren` returns the source node's children, and
+`GetChildrenResponse.store_id` names the store they live in. Every node the app holds is
+addressed by that canonical `(StoreId, NodeId)`, so opening, editing, subscribing and
+renaming through a mount hit the source store. Tree values are path addresses
+(`node_{store}_{node}/{mount_store}_{mount_node}` per mount level) so the same node can
+appear in several places; `parse_tree_value` returns the canonical pair. The server opens
+a source store it needs (registry, then the `source_path` hint) and treats it as an
+ordinary open store; the app discovers it via `listStores` when it sees an unknown store
+id and adds it to the open-store list. Cycles are rejected at `createMount`. Creating a
+child of a mount node is an error; the app creates under the source instead. Remote
+sources, `MountState::Cached` and `Connecting` are not implemented. Contract:
+`docs/history/MOUNTS_CONTRACT.md`.
 
 ### Collaboration shape (keep these invariants)
 

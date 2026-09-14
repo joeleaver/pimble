@@ -1,4 +1,10 @@
-# Mounts contract: local mounts end to end (dispatch-ready, 2026-09-14)
+# Mounts contract: local mounts end to end
+
+Status: done 2026-09-14 (commits after 11438e1 on master). Everything below was
+implemented and verified as written, with two app-side changes found in review: "Paste
+Mount Here" is always rendered (disabled while nothing is copied) because a rinch
+DropdownMenuItem inside a reactive block never closes its menu (rinch #714), and a remote
+structural change refetches every loaded folder of the store, not only its root.
 
 Roadmap step 6, first item: "mounts (local first)". The scaffolding from before the
 restart is still in the tree (`MountRef`, `Node::mount`, `StoreManager::resolve_mount`,
