@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Log in — Pimble</title>
+  <meta name="description" content="Log in to Pimble.">
+  <link rel="icon" href="data:,">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="nav">
+    <a class="nav__brand" href="index.html">Pimble</a>
+    <nav class="nav__links">
+      <a href="download.html">Download</a>
+      <a href="signup.html" class="nav__cta">Sign up</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="shell hero">
+      <h1>Log in</h1>
+
+      <form id="login-form" class="stack" novalidate>
+        <div class="form-error" data-form-error hidden></div>
+
+        <div class="field">
+          <label for="email">Email</label>
+          <input id="email" name="email" type="email" autocomplete="email" required>
+        </div>
+
+        <div class="field">
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required>
+        </div>
+
+        <button class="btn" type="submit">Log in</button>
+      </form>
+
+      <p style="margin-top: 24px;">
+        No account yet? <a href="signup.html">Sign up</a>.
+      </p>
+    </section>
+  </main>
+
+  <footer class="site">
+    <div class="shell" style="padding: 0;">
+      Pimble. <a href="https://github.com/pimble/pimble">Source on GitHub</a>.
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+  <script>
+    document.getElementById("login-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const form = e.currentTarget;
+      setFormError(form, "");
+
+      const email = form.email.value.trim();
+      const password = form.password.value;
+
+      const button = form.querySelector('button[type="submit"]');
+      button.disabled = true;
+      try {
+        await apiFetch("/login", {
+          method: "POST",
+          body: JSON.stringify({ email, password }),
+        });
+        const params = new URLSearchParams(window.location.search);
+        window.location.href = params.get("next") || "/app/";
+      } catch (err) {
+        if (err.status === 401) {
+          setFormError(form, "Wrong email or password.");
+        } else {
+          setFormError(form, err.message);
+        }
+      } finally {
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

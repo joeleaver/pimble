@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pimble</title>
+  <meta name="description" content="Pimble is an offline-first personal information manager: nodes in a tree, content that merges across devices and people, and search that works without a network.">
+  <link rel="icon" href="data:,">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="nav">
+    <a class="nav__brand" href="index.html">Pimble</a>
+    <nav class="nav__links">
+      <a href="download.html">Download</a>
+      <a href="login.html">Log in</a>
+      <a href="signup.html" class="nav__cta">Sign up</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="shell hero">
+      <h1>One tree of notes, however many devices you open it from.</h1>
+      <p class="lead">
+        Pimble keeps everything you write as nodes in a tree, inside a folder
+        on your own disk. Open it offline on the desktop, open the same tree
+        in a browser, hand a copy to someone else — every edit merges back
+        together, because the document underneath is built to be edited from
+        more than one place at once.
+      </p>
+      <div class="hero__actions">
+        <a class="btn" href="download.html">Download for desktop</a>
+        <a class="btn secondary" href="signup.html">Sign up</a>
+      </div>
+    </section>
+
+    <section class="shell">
+      <figure class="tree-figure">
+        <ul>
+          <li>Household
+            <ul>
+              <li>Renovation
+                <ul>
+                  <li>Contractor quotes</li>
+                  <li>Reference library <span class="mount-tag">mounted</span></li>
+                </ul>
+              </li>
+              <li>Taxes</li>
+            </ul>
+          </li>
+          <li>Novel draft
+            <ul>
+              <li>Chapter outline</li>
+              <li>Reference library <span class="mount-tag">mounted</span></li>
+            </ul>
+          </li>
+        </ul>
+        <figcaption>
+          An illustration of a Pimble tree, not a screenshot. "Reference
+          library" is one store, mounted inside two others — it's edited in
+          place from either one, not copied between them.
+        </figcaption>
+      </figure>
+    </section>
+
+    <section class="shell">
+      <ul class="outline">
+        <li class="outline__item">
+          <h2>Nodes in a tree</h2>
+          <p>
+            A store is a folder of nodes, each one a page of formatted text,
+            arranged however you like: a manuscript's chapters, a project's
+            sources, a household's paperwork. There's no separate database to
+            keep in sync with the files — the folder is the store.
+          </p>
+        </li>
+        <li class="outline__item">
+          <h2>Merges, not conflicts</h2>
+          <p>
+            Both a node's content and the tree's structure are CRDTs. Two
+            people can edit the same node at the same time, on machines that
+            have never spoken to each other, and reconcile later without
+            either edit being thrown away.
+          </p>
+        </li>
+        <li class="outline__item">
+          <h2>Mounts</h2>
+          <p>
+            Any subtree of any store can appear inside any other store's
+            tree. A shared reference library can sit inside three different
+            projects at once, edited from any of them, without ever being
+            copied.
+          </p>
+        </li>
+        <li class="outline__item">
+          <h2>Search that understands what you meant</h2>
+          <p>
+            Every store keeps its own local index: keyword search over
+            titles and text, and semantic search that finds a passage by
+            what it says rather than the exact words it uses.
+          </p>
+        </li>
+        <li class="outline__item">
+          <h2>Brought in from Scrivener</h2>
+          <p>
+            The importer reads a Scrivener project's binder, its labels and
+            its formatting, and rebuilds it as a Pimble tree — colours and
+            tags included.
+          </p>
+        </li>
+      </ul>
+    </section>
+
+    <section class="shell hero" style="padding-top: 32px;">
+      <h2>Start with a store</h2>
+      <p class="lead">Download the desktop app, or sign up to open one in a browser.</p>
+      <div class="hero__actions">
+        <a class="btn" href="download.html">Download for desktop</a>
+        <a class="btn secondary" href="signup.html">Sign up</a>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site">
+    <div class="shell" style="padding: 0;">
+      Pimble. <a href="https://github.com/pimble/pimble">Source on GitHub</a>.
+    </div>
+  </footer>
+</body>
+</html>

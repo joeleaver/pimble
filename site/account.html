@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Account — Pimble</title>
+  <link rel="icon" href="data:,">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="nav">
+    <a class="nav__brand" href="index.html">Pimble</a>
+    <nav class="nav__links">
+      <a href="/app/">Open the web app</a>
+      <a href="download.html">Download</a>
+      <a href="#" id="logout-link">Log out</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="shell hero">
+      <h1>Account</h1>
+      <p class="dim" id="account-email">Loading…</p>
+
+      <div id="page-error" class="panel quiet" hidden>
+        <span data-message>Couldn't reach the Pimble server.</span>
+      </div>
+
+      <div id="account-body" hidden>
+        <h2>Your stores</h2>
+        <div id="stores"></div>
+
+        <div class="panel">
+          <h3 style="margin-top: 0;">New store</h3>
+          <form id="new-store-form" class="field-row" novalidate>
+            <div class="form-error" data-form-error hidden style="flex-basis: 100%;"></div>
+            <div class="field">
+              <label for="store-name">Name</label>
+              <input id="store-name" name="name" type="text" required>
+            </div>
+            <button class="btn" type="submit">Create store</button>
+          </form>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site">
+    <div class="shell" style="padding: 0;">
+      Pimble. <a href="https://github.com/pimble/pimble">Source on GitHub</a>.
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+  <script>
+    const state = {
+      stores: [],
+      members: {},   // store_id -> array of members, once loaded
+      open: new Set(), // store_ids whose members panel is expanded
+    };
+
+    const storesEl = document.getElementById("stores");
+
+    function roleLabel(role) {
+      return role.charAt(0).toUpperCase() + role.slice(1);
+    }
+
+    function renderMembers(store) {
+      const members = state.members[store.store_id];
+      if (!members) {
+        return `<div class="members"><p class="dim">Loading members…</p></div>`;
+      }
+      const isOwner = store.role === "owner";
+      const rows = members.map((m) => `
+        <tr>
+          <td>${escapeHtml(m.email)}</td>
+          <td>${escapeHtml(roleLabel(m.role))}</td>
+          <td>${isOwner ? `<button class="btn danger small" data-action="remove-member" data-store="${store.store_id}" data-user="${m.user_id}">Remove</button>` : ""}</td>
+        </tr>
+      `).join("");
+
+      return `
+        <div class="members">
+          <table class="members-table">
+            <thead><tr><th>Email</th><th>Role</th><th></th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+          ${isOwner ? `
+            <form class="field-row" data-action="add-member" data-store="${store.store_id}" novalidate>
+              <div class="form-error" data-form-error hidden style="flex-basis: 100%;"></div>
+              <div class="field">
+                <label>Email</label>
+                <input type="email" name="email" required>
+              </div>
+              <div class="field">
+                <label>Role</label>
+                <select name="role">
+                  <option value="reader">Reader</option>
+                  <option value="editor">Editor</option>
+                  <option value="owner">Owner</option>
+                </select>
+              </div>
+              <button class="btn secondary small" type="submit">Add</button>
+            </form>
+          ` : ""}
+        </div>
+      `;
+    }
+
+    function renderStores() {
+      if (state.stores.length === 0) {
+        storesEl.innerHTML = `<div class="panel quiet">No stores yet. Create one below.</div>`;
+        return;
+      }
+      storesEl.innerHTML = state.stores.map((store) => {
+        const isOpen = state.open.has(store.store_id);
+        return `
+          <div class="store">
+            <div class="store__head">
+              <div>
+                <div class="store__name">${escapeHtml(store.name)}</div>
+                <div class="store__meta">${roleLabel(store.role)} · created ${formatDate(store.created_at)}</div>
+              </div>
+              <div class="store__actions">
+                <button class="btn secondary small" data-action="toggle-members" data-store="${store.store_id}">
+                  ${isOpen ? "Hide members" : "Manage members"}
+                </button>
+                ${store.role === "owner" ? `<button class="btn danger small" data-action="delete-store" data-store="${store.store_id}">Delete</button>` : ""}
+              </div>
+            </div>
+            ${isOpen ? renderMembers(store) : ""}
+          </div>
+        `;
+      }).join("");
+    }
+
+    async function loadMembers(storeId) {
+      try {
+        const members = await apiFetch(`/stores/${storeId}/members`);
+        state.members[storeId] = members;
+      } catch (err) {
+        state.members[storeId] = [];
+      }
+      renderStores();
+    }
+
+    async function loadStores() {
+      state.stores = await apiFetch("/stores");
+      renderStores();
+    }
+
+    storesEl.addEventListener("click", async (e) => {
+      const btn = e.target.closest("[data-action]");
+      if (!btn) return;
+      const action = btn.dataset.action;
+      const storeId = btn.dataset.store;
+
+      if (action === "toggle-members") {
+        if (state.open.has(storeId)) {
+          state.open.delete(storeId);
+          renderStores();
+        } else {
+          state.open.add(storeId);
+          renderStores();
+          if (!state.members[storeId]) await loadMembers(storeId);
+        }
+      }
+
+      if (action === "delete-store") {
+        const store = state.stores.find((s) => s.store_id === storeId);
+        if (!store) return;
+        if (!window.confirm(`Delete "${store.name}"? This cannot be undone from here.`)) return;
+        try {
+          await apiFetch(`/stores/${storeId}`, { method: "DELETE" });
+          state.stores = state.stores.filter((s) => s.store_id !== storeId);
+          renderStores();
+        } catch (err) {
+          window.alert(err.message);
+        }
+      }
+
+      if (action === "remove-member") {
+        const userId = btn.dataset.user;
+        try {
+          await apiFetch(`/stores/${storeId}/members/${userId}`, { method: "DELETE" });
+          await loadMembers(storeId);
+        } catch (err) {
+          window.alert(err.message);
+        }
+      }
+    });
+
+    storesEl.addEventListener("submit", async (e) => {
+      const form = e.target.closest('[data-action="add-member"]');
+      if (!form) return;
+      e.preventDefault();
+      setFormError(form, "");
+      const storeId = form.dataset.store;
+      const email = form.email.value.trim();
+      const role = form.role.value;
+      try {
+        await apiFetch(`/stores/${storeId}/members`, {
+          method: "PUT",
+          body: JSON.stringify({ email, role }),
+        });
+        await loadMembers(storeId);
+      } catch (err) {
+        setFormError(form, err.code === "not_found" ? "No account exists for that email yet." : err.message);
+      }
+    });
+
+    document.getElementById("new-store-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const form = e.currentTarget;
+      setFormError(form, "");
+      const name = form.name.value.trim();
+      if (!name) return;
+      const button = form.querySelector('button[type="submit"]');
+      button.disabled = true;
+      try {
+        const store = await apiFetch("/stores", {
+          method: "POST",
+          body: JSON.stringify({ name }),
+        });
+        state.stores.push(store);
+        renderStores();
+        form.reset();
+      } catch (err) {
+        setFormError(form, err.message);
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    document.getElementById("logout-link").addEventListener("click", async (e) => {
+      e.preventDefault();
+      try {
+        await apiFetch("/logout", { method: "POST" });
+      } catch (err) {
+        // Fall through to the redirect regardless -- the cookie is either
+        // gone or was never valid.
+      }
+      window.location.href = "index.html";
+    });
+
+    (async function init() {
+      try {
+        const me = await apiFetch("/me");
+        document.getElementById("account-email").textContent = me.email;
+        document.getElementById("account-body").hidden = false;
+        await loadStores();
+      } catch (err) {
+        if (err.status === 401) {
+          window.location.href = "login.html?next=/account.html";
+          return;
+        }
+        const panel = document.getElementById("page-error");
+        panel.hidden = false;
+        panel.querySelector("[data-message]").textContent = err.message;
+        document.getElementById("account-email").textContent = "";
+      }
+    })();
+  </script>
+</body>
+</html>

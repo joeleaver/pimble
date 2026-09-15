@@ -1,0 +1,75 @@
+# jkbase deployment manifest for Pimble. See docs/CLOUD_CONTRACT.md for the
+# design this mirrors and docs/DEPLOY.md for how to deploy it.
+#
+# Layout (one project, one origin):
+#   /            site/                 static marketing site, downloads, login
+#   /app/*       web/                  trunk-built rinch web app (SPA)
+#   /api/*       crates/pimble-cloud   accounts service (axum, port 8080)
+#   /rpc         crates/pimble-cli     hosted Pimble server (port 7462)
+
+[project]
+name = "pimble"
+
+# The marketing/account site (site/index.html, download.html, signup.html,
+# login.html, account.html): a committed static site, no build step.
+[hosting]
+public = "site"
+
+# The rinch web app, built server-side from the trunk frontend crate.
+# `context = "."` mounts the whole workspace so `web`'s path-dependency on
+# `pimble-app` (default-features = false) resolves.
+[sites.app]
+source = "web"
+context = "."
+build = "trunk"
+prefix = "/app"
+spa = true
+
+# Accounts service (crates/pimble-cloud). A plain workspace member with its
+# own Cargo.toml and a `[[bin]] name = "pimble-cloud"`, so the rust
+# buildpack's binary selection (preferred_bin, then choose_default) lands on
+# `pimble-cloud` with no ambiguity; no `command` override is needed. `port`
+# is what the accounts service listens on ($PORT, defaulted to 8080 in its
+# own code); env (PIMBLE_SERVER_URL, PIMBLE_SERVER_TOKEN, JKBASE_AUTH_*,
+# PIMBLE_CLOUD_PUBLIC_URL, ...) comes from `jkbase secret set` per
+# docs/DEPLOY.md.
+[servers.cloud]
+source = "crates/pimble-cloud"
+context = "."
+port = 8080
+health_check = { path = "/api/v1/health", interval = "10s", timeout = "5s" }
+
+# The hosted Pimble server (crates/pimble-cli). Its Cargo.toml declares
+# `[[bin]] name = "pimble-cli"`, so the buildpack ships the launch binary at
+# `/app/pimble-cli`; the default launch command it would derive takes no
+# arguments, so `command` overrides it to run the `server` subcommand with
+# the two flags that must be exact (the loopback address every other
+# service on this VM expects, and the volume-backed stores directory).
+# Everything else (--jwks, --issuer, --allow-origin, the static service
+# token) comes from env: PIMBLE_JWKS_URL, PIMBLE_JWT_ISSUER,
+# PIMBLE_ALLOW_ORIGINS, PIMBLE_SERVER_TOKEN (see docs/DEPLOY.md).
+#
+# No `--features` override is needed to keep this off the ONNX download:
+# pimble-cli's Cargo.toml has no `default = [...]` enabling `onnx-download`
+# or `onnx-dynamic`, and the rust buildpack's `cargo build --release
+# --offline` passes no `--features` flag of its own, so the default build
+# already has semantic search compiled out (keyword-only rhypedb search).
+# That default also happens to be required, not just convenient: the
+# buildpack's `compile` phase runs post-seal with the VM's network fenced,
+# and `onnx-download` (`fastembed/ort-download-binaries-native-tls`) fetches
+# a prebuilt ONNX Runtime in a dependency's build.rs during that same
+# `cargo build` -- a build-time download the sealed compile phase cannot
+# serve even if a feature flag existed to request it.
+[servers.pimble]
+source = "crates/pimble-cli"
+context = "."
+port = 7462
+command = ["/app/pimble-cli", "server", "--addr", "127.0.0.1:7462", "--stores-dir", "/app/data/stores"]
+volumes = [{ name = "data", mount = "/app/data" }]
+
+[database]
+schema = "crates/pimble-cloud/schema.rhype"
+
+[routes]
+"/api/*" = { service = "server", name = "cloud" }
+"/rpc" = { service = "server", name = "pimble" }

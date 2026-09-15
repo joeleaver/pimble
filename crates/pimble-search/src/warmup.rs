@@ -124,12 +124,16 @@ mod tests {
     /// which test's call actually set it: once any call has run, some
     /// already-created directory is on record.
     #[test]
-    fn model_cache_dir_reflects_some_already_created_directory() {
+    fn model_cache_dir_is_on_record_after_any_call() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("models");
         set_model_cache_dir(&target).unwrap();
-        let cached = model_cache_dir().expect("some call in this binary must have set it by now");
-        assert!(cached.is_dir(), "{cached:?} should have been created by a set_model_cache_dir call");
+        // Our own target was created regardless of which call won the lock.
+        assert!(target.is_dir());
+        // The recorded directory may belong to a sibling test whose tempdir
+        // is already gone, so only its presence can be asserted, never that
+        // it still exists on disk.
+        assert!(model_cache_dir().is_some(), "some call in this binary must have set it by now");
     }
 
     #[test]

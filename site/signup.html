@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign up — Pimble</title>
+  <meta name="description" content="Create a Pimble account.">
+  <link rel="icon" href="data:,">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="nav">
+    <a class="nav__brand" href="index.html">Pimble</a>
+    <nav class="nav__links">
+      <a href="download.html">Download</a>
+      <a href="login.html">Log in</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="shell hero">
+      <h1>Sign up</h1>
+      <p class="lead">Creates a hosted store you can reach from a browser, in addition to anything you keep on the desktop app.</p>
+
+      <form id="signup-form" class="stack" novalidate>
+        <div class="form-error" data-form-error hidden></div>
+
+        <div class="field">
+          <label for="email">Email</label>
+          <input id="email" name="email" type="email" autocomplete="email" required>
+        </div>
+
+        <div class="field">
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" autocomplete="new-password" minlength="8" required>
+        </div>
+        <p class="form-note">At least 8 characters.</p>
+
+        <button class="btn" type="submit">Create account</button>
+      </form>
+
+      <p style="margin-top: 24px;">
+        Already have an account? <a href="login.html">Log in</a>.
+      </p>
+    </section>
+  </main>
+
+  <footer class="site">
+    <div class="shell" style="padding: 0;">
+      Pimble. <a href="https://github.com/pimble/pimble">Source on GitHub</a>.
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+  <script>
+    document.getElementById("signup-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const form = e.currentTarget;
+      setFormError(form, "");
+
+      const email = form.email.value.trim();
+      const password = form.password.value;
+      if (password.length < 8) {
+        setFormError(form, "Use a password of at least 8 characters.");
+        return;
+      }
+
+      const button = form.querySelector('button[type="submit"]');
+      button.disabled = true;
+      try {
+        await apiFetch("/signup", {
+          method: "POST",
+          body: JSON.stringify({ email, password }),
+        });
+        window.location.href = "/app/";
+      } catch (err) {
+        if (err.code === "network") {
+          setFormError(form, err.message);
+        } else if (err.status === 409 || err.code === "email_taken") {
+          setFormError(form, "An account already exists for that email. Try logging in instead.");
+        } else {
+          setFormError(form, err.message);
+        }
+      } finally {
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

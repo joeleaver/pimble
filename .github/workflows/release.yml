@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          # See ci.yml for why the google-chrome source is dropped first.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*.list \
+                     /etc/apt/sources.list.d/google-chrome*.sources
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev libglib2.0-dev libatk1.0-dev libcairo2-dev \
+            libpango1.0-dev libgdk-pixbuf2.0-dev libxdo-dev libmpv-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Default features (native + onnx-download, crates/pimble-app/Cargo.toml)
+      # ship semantic search statically linked, as intended for a real release.
+      - name: Build pimble-app (release)
+        run: cargo build -p pimble-app --release
+
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          tools/package.sh "$version" target/release/pimble dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-package
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No system packages beyond the standard MSVC toolchain the runner
+      # image already carries -- rinch's windows backend needs nothing
+      # analogous to the GTK/mpv dev headers the Linux build links.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build pimble-app (release)
+        run: cargo build -p pimble-app --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          $stage = "dist/pimble-$version-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/pimble.exe "$stage/pimble.exe"
+          if (Test-Path LICENSE) { Copy-Item LICENSE "$stage/" }
+          if (Test-Path README.md) { Copy-Item README.md "$stage/" }
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/pimble-$version-windows-x86_64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-package
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten artifact layout
+        run: |
+          mkdir -p release
+          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release/ \;
+          ls -la release
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

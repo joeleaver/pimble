@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Download — Pimble</title>
+  <meta name="description" content="Download Pimble for Linux or Windows.">
+  <link rel="icon" href="data:,">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="nav">
+    <a class="nav__brand" href="index.html">Pimble</a>
+    <nav class="nav__links">
+      <a href="download.html">Download</a>
+      <a href="login.html">Log in</a>
+      <a href="signup.html" class="nav__cta">Sign up</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="shell hero">
+      <h1>Download Pimble</h1>
+      <p class="lead">
+        The desktop app runs entirely on your own machine — no account, no
+        network, no server. Sign up separately if you also want a hosted
+        store you can reach from a browser.
+      </p>
+
+      <p id="release-meta" class="release-meta" hidden>
+        Version <span data-version></span>, published <span data-date></span>.
+      </p>
+
+      <div id="asset-linux" class="asset" hidden>
+        <div>
+          <div class="asset__os">Linux</div>
+          <div class="asset__note">
+            A plain binary in a tar.gz — no installer, no package repository.
+            Extract it and run it; nothing else is installed on your system.
+          </div>
+        </div>
+        <a class="btn" href="#" data-download>Download (<span data-size></span>)</a>
+      </div>
+
+      <div id="asset-windows" class="asset" hidden>
+        <div>
+          <div class="asset__os">Windows</div>
+          <div class="asset__note">A zip file containing pimble.exe.</div>
+        </div>
+        <a class="btn" href="#" data-download>Download (<span data-size></span>)</a>
+      </div>
+
+      <div id="release-empty" class="panel quiet" hidden>
+        No release has been published yet. In the meantime you can build
+        Pimble from source: <a href="https://github.com/pimble/pimble">clone
+        the repository</a> and run <code>cargo build -p pimble-app --release</code>.
+      </div>
+
+      <div id="release-error" class="panel quiet" hidden>
+        <span data-message>Couldn't load the current release.</span>
+        In the meantime, get the source directly from
+        <a href="https://github.com/pimble/pimble">GitHub</a>.
+      </div>
+    </section>
+  </main>
+
+  <footer class="site">
+    <div class="shell" style="padding: 0;">
+      Pimble. <a href="https://github.com/pimble/pimble">Source on GitHub</a>.
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+  <script>
+    (async function () {
+      const linuxEl = document.getElementById("asset-linux");
+      const windowsEl = document.getElementById("asset-windows");
+      const metaEl = document.getElementById("release-meta");
+      const emptyEl = document.getElementById("release-empty");
+      const errorEl = document.getElementById("release-error");
+
+      try {
+        const data = await apiFetch("/releases");
+        const assets = (data && data.assets) || [];
+        const linux = assets.find((a) => a.os === "linux");
+        const windows = assets.find((a) => a.os === "windows");
+
+        if (!linux && !windows) {
+          emptyEl.hidden = false;
+          return;
+        }
+
+        metaEl.hidden = false;
+        metaEl.querySelector("[data-version]").textContent = data.version;
+        metaEl.querySelector("[data-date]").textContent = formatDate(data.published_at);
+
+        if (linux) {
+          linuxEl.hidden = false;
+          linuxEl.querySelector("[data-download]").href = linux.url;
+          linuxEl.querySelector("[data-size]").textContent = formatBytes(linux.size);
+        }
+        if (windows) {
+          windowsEl.hidden = false;
+          windowsEl.querySelector("[data-download]").href = windows.url;
+          windowsEl.querySelector("[data-size]").textContent = formatBytes(windows.size);
+        }
+      } catch (err) {
+        errorEl.hidden = false;
+        errorEl.querySelector("[data-message]").textContent = err.message;
+      }
+    })();
+  </script>
+</body>
+</html>
