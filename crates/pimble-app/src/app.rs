@@ -18,6 +18,11 @@ use crate::events::{EVENT_PROCESSOR, process_backend_events};
 use crate::state::{parse_tree_value, display_label_from_node, AppStore, PendingMount, SearchState};
 use crate::styles::{APP_CSS, EDITOR_CSS};
 
+/// The app's color scheme. Feeds rinch's `ThemeProviderProps` and the editor's
+/// built-in dark stylesheet (`EditorHandle::set_dark_mode`, applied in
+/// `editor::start_editing`), so both follow one switch.
+pub(crate) const DARK_MODE: bool = true;
+
 thread_local! {
     /// The search box's `NodeHandle`, captured once when the toolbar is built
     /// so the View menu's "Focus Search" (Ctrl+K) action — constructed earlier,
@@ -378,7 +383,7 @@ pub fn run() {
     // Theme
     let theme = ThemeProviderProps {
         primary_color: Some("blue".into()),
-        dark_mode: true,
+        dark_mode: DARK_MODE,
         default_radius: Some("sm".into()),
         ..Default::default()
     };

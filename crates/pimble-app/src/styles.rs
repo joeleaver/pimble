@@ -304,147 +304,66 @@ pub(crate) const APP_CSS: &str = "
 
 /// Editor content styles for the editor pane.
 ///
-/// Designed for dark mode. Scoped to `.editor-content` so they don't leak
-/// into the rest of the UI.
+/// rinch's editor ships its own stylesheet, scoped to `[data-pm-editor]`, with a
+/// dark scheme keyed on `data-pm-theme="dark"` (set from `editor::start_editing`).
+/// These rules ride on top of that scheme with higher specificity and swap its
+/// GitHub-dark palette for the app's own theme tokens, so the pane matches the
+/// tree and toolbar around it.
 pub(crate) const EDITOR_CSS: &str = "
-.editor-content {
-    font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] {
+    background: var(--rinch-color-dark-7);
+    color: var(--rinch-color-text);
+    border-color: var(--rinch-color-dark-4);
     font-size: 15px;
     line-height: 1.7;
-    color: var(--rinch-color-text);
-    cursor: text;
 }
 
-/* --- Block elements --- */
-
-.editor-content p { margin: 0 0 4px 0; }
-
-.editor-content h1 {
-    font-size: 1.75em;
-    font-weight: 700;
-    margin: 24px 0 8px 0;
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] h1,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] h2,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] h3,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] h4 {
     color: var(--rinch-color-text);
 }
-
-.editor-content h2 {
-    font-size: 1.4em;
-    font-weight: 700;
-    margin: 20px 0 6px 0;
-    color: var(--rinch-color-text);
-}
-
-.editor-content h3 {
-    font-size: 1.15em;
-    font-weight: 600;
-    margin: 16px 0 4px 0;
-    color: var(--rinch-color-text);
-}
-
-.editor-content h4 {
-    font-size: 1em;
-    font-weight: 600;
-    margin: 14px 0 4px 0;
-    color: var(--rinch-color-text);
-}
-
-.editor-content h5 {
-    font-size: 0.95em;
-    font-weight: 600;
-    margin: 12px 0 2px 0;
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] h5,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] h6 {
     color: var(--rinch-color-dimmed);
 }
 
-.editor-content h6 {
-    font-size: 0.85em;
-    font-weight: 600;
-    margin: 12px 0 2px 0;
-    color: var(--rinch-color-dimmed);
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] a {
+    color: var(--rinch-primary-color-4);
 }
 
-/* --- Blockquotes --- */
-
-.editor-content blockquote {
-    border-left: 3px solid var(--rinch-primary-color-7);
-    padding-left: 14px;
-    margin: 12px 0;
-    color: var(--rinch-color-dimmed);
-}
-
-.editor-content blockquote p { margin: 0 0 4px 0; }
-
-/* --- Code --- */
-
-.editor-content code {
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] code {
     background: var(--rinch-color-dark-5);
-    padding: 1px 5px;
-    border-radius: 3px;
     color: #e06c75;
-    font-size: 0.88em;
 }
-
-.editor-content pre {
-    background: var(--rinch-color-dark-5);
-    border-radius: 6px;
-    padding: 12px 14px;
-    margin: 12px 0;
-    font-size: 13px;
-    line-height: 1.5;
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] pre {
+    background: var(--rinch-color-dark-6);
 }
-
-.editor-content pre code {
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] pre code {
     background: none;
-    padding: 0;
     color: #abb2bf;
-    font-size: inherit;
 }
 
-/* --- Lists --- */
-
-.editor-content ul,
-.editor-content ol {
-    margin: 6px 0;
-    padding-left: 8px;
-}
-
-.editor-content li {
-    margin: 2px 0;
-    padding-left: 4px;
-}
-
-.editor-content ul > li::before {
-    content: \"\\2022  \";
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] blockquote {
+    border-left-color: var(--rinch-primary-color-7);
     color: var(--rinch-color-dimmed);
 }
 
-.editor-content ol > li::before {
-    content: \"\\2013  \";
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] hr {
+    border-top-color: var(--rinch-color-dark-4);
+}
+
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] table,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] td,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] th {
+    border-color: var(--rinch-color-dark-4);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] th {
+    background: var(--rinch-color-dark-6);
+}
+
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] [data-pm-placeholder] {
     color: var(--rinch-color-dimmed);
 }
-
-.editor-content ul ul > li::before {
-    content: \"\\25E6  \";
-}
-
-.editor-content ul ul ul > li::before {
-    content: \"\\25AA  \";
-}
-
-/* --- Horizontal rule --- */
-
-.editor-content hr {
-    border: none;
-    border-top: 1px solid var(--rinch-color-dark-4);
-    margin: 20px 0;
-}
-
-/* --- Inline formatting --- */
-
-.editor-content strong { font-weight: 700; color: var(--rinch-color-text); }
-.editor-content em { font-style: italic; }
-.editor-content u { text-decoration: underline; }
-.editor-content s { text-decoration: line-through; color: var(--rinch-color-dimmed); }
-.editor-content a { color: var(--rinch-primary-color-4); text-decoration: none; }
-.editor-content a:hover { text-decoration: underline; }
-.editor-content sub { font-size: 0.8em; }
-.editor-content sup { font-size: 0.8em; }
 ";
