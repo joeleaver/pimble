@@ -7,13 +7,25 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use pimble_core::{StoreId, StoreKind};
-use pimble_crypto::KeyEnvelope;
+use pimble_crypto::{CryptoError, KeyEnvelope};
 
 use crate::db::HostedStoreRow;
-use crate::envelope::verify_envelope_signature;
 use crate::error::{CloudError, CloudResult};
 use crate::session::AuthedUser;
 use crate::state::AppState;
+
+/// `pimble_crypto::verify_envelope` needs no private key, so the accounts
+/// service (which only ever holds public keys) can authenticate an envelope
+/// it relays (docs/CRYPTO_CONTRACT.md, `PUT /stores/{id}/keys`). A bad
+/// signature or a signer that doesn't match `expected_signer` are both
+/// `CryptoError::BadSignature` — both are the caller presenting an envelope
+/// they can't prove they made, so both map to 401.
+fn verify_envelope_signature(envelope: &KeyEnvelope, expected_signer: &str) -> CloudResult<()> {
+    pimble_crypto::verify_envelope(envelope, expected_signer).map_err(|e| match e {
+        CryptoError::BadSignature => CloudError::Unauthorized("envelope signature does not verify".to_string()),
+        other => CloudError::BadRequest(format!("envelope is invalid: {other}")),
+    })
+}
 
 fn rfc3339(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms).unwrap_or_default().to_rfc3339()

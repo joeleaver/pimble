@@ -12,7 +12,6 @@ pub mod auth;
 pub mod claims;
 pub mod config;
 pub mod db;
-pub mod envelope;
 pub mod error;
 pub mod jwt;
 pub mod kdf_decoy;

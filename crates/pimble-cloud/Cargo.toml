@@ -12,16 +12,11 @@ path = "src/main.rs"
 
 [dependencies]
 pimble-core = { workspace = true }
+# `PimbleClient::create_store_with` (now committed) takes `kind`/`store_id`
+# directly, so `PimbleService::create_store` (src/pimble.rs) is back to
+# calling it instead of connecting over a raw jsonrpsee client — no direct
+# `pimble-rpc`/`jsonrpsee` dependency needed any more.
 pimble-client = { workspace = true }
-# `PimbleApiClient` (the generated RPC client trait) and `CreateStoreRequest`:
-# `PimbleService::create_store` (src/pimble.rs) calls `createStore` directly
-# over a raw jsonrpsee connection rather than through `pimble_client::
-# PimbleClient::create_store`, whose wrapper doesn't yet expose `kind`/
-# `store_id` — `pimble-client/src/client.rs` has a concurrent editor as of
-# this writing (see src/pimble.rs's doc comment), so this crate calls the RPC
-# itself instead of extending that wrapper.
-pimble-rpc = { workspace = true }
-jsonrpsee = { workspace = true }
 # Request/response shapes for the crypto endpoints (docs/CRYPTO_CONTRACT.md,
 # "Accounts service endpoints"): `KdfParams`, `AccountPublicKeys`,
 # `AccountKeyBlob`, `KeyEnvelope`. Not in `[workspace.dependencies]` (that

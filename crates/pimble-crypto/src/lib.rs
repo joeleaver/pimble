@@ -359,11 +359,16 @@ pub fn wrap_key(
     })
 }
 
-/// Verifies the envelope's signature against `expected_signer` (the sender's public
-/// signing key as the accounts service reported it) and unwraps with `me`.
-pub fn unwrap_key(envelope: &KeyEnvelope, me: &AccountKeys, expected_signer: &str) -> Result<SymmetricKey> {
+/// Verifies a [`KeyEnvelope`]'s signature against `expected_signer` with no private key
+/// needed: confirms the envelope names `expected_signer` as its signer and checks the
+/// Ed25519 signature over exactly the bytes `wrap_key` signs. Lets a party that only
+/// holds public keys (the accounts service) authenticate an envelope it relays.
+pub fn verify_envelope(envelope: &KeyEnvelope, expected_signer: &str) -> Result<()> {
     if envelope.v != VERSION {
         return Err(CryptoError::UnsupportedVersion(envelope.v));
+    }
+    if envelope.signer != expected_signer {
+        return Err(CryptoError::BadSignature);
     }
 
     let signer_bytes = b64_decode_fixed::<32>(expected_signer, "expected signer key")?;
@@ -391,7 +396,21 @@ pub fn unwrap_key(envelope: &KeyEnvelope, me: &AccountKeys, expected_signer: &st
     );
     verifying_key
         .verify(&sign_bytes, &signature)
-        .map_err(|_| CryptoError::BadSignature)?;
+        .map_err(|_| CryptoError::BadSignature)
+}
+
+/// Verifies the envelope's signature against `expected_signer` (the sender's public
+/// signing key as the accounts service reported it, via [`verify_envelope`]) and
+/// unwraps with `me`.
+pub fn unwrap_key(envelope: &KeyEnvelope, me: &AccountKeys, expected_signer: &str) -> Result<SymmetricKey> {
+    verify_envelope(envelope, expected_signer)?;
+
+    let ephemeral_bytes = b64_decode_fixed::<32>(&envelope.ephemeral, "ephemeral key")?;
+    let nonce_bytes = b64_decode(&envelope.nonce)?;
+    if nonce_bytes.len() != NONCE_LEN {
+        return Err(CryptoError::Malformed("envelope nonce"));
+    }
+    let ciphertext = b64_decode(&envelope.ciphertext)?;
 
     let ephemeral_public = X25519PublicKey::from(ephemeral_bytes);
     let my_secret = StaticSecret::from(me.encryption_secret);
@@ -890,6 +909,52 @@ mod tests {
 
         let result = unwrap_key(&envelope, &recipient, &sender_public.signing);
         assert!(matches!(result, Err(CryptoError::BadSignature)));
+    }
+
+    #[test]
+    fn verify_envelope_accepts_correct_and_rejects_tampered() {
+        let sender = AccountKeys::generate();
+        let recipient = AccountKeys::generate();
+        let recipient_public = recipient.public_keys();
+        let sender_public = sender.public_keys();
+
+        let key = SymmetricKey::generate();
+        let envelope = wrap_key(&key, KeyId::new_v4(), &recipient_public, &sender, "store:abc").unwrap();
+
+        // A correct envelope verifies with no private key at all.
+        assert!(verify_envelope(&envelope, &sender_public.signing).is_ok());
+
+        // Tampering with any signed field is caught.
+        let mut tampered_context = envelope.clone();
+        tampered_context.context = "store:other".to_string();
+        assert!(matches!(
+            verify_envelope(&tampered_context, &sender_public.signing),
+            Err(CryptoError::BadSignature)
+        ));
+
+        let mut tampered_key_id = envelope.clone();
+        tampered_key_id.key_id = KeyId::new_v4();
+        assert!(matches!(
+            verify_envelope(&tampered_key_id, &sender_public.signing),
+            Err(CryptoError::BadSignature)
+        ));
+
+        let mut tampered_ciphertext = envelope.clone();
+        let mut raw = b64_decode(&tampered_ciphertext.ciphertext).unwrap();
+        raw[0] ^= 0xff;
+        tampered_ciphertext.ciphertext = b64_encode(&raw);
+        assert!(matches!(
+            verify_envelope(&tampered_ciphertext, &sender_public.signing),
+            Err(CryptoError::BadSignature)
+        ));
+
+        // A claimed signer that doesn't match the envelope's own `signer` field is
+        // rejected before any signature math.
+        let impostor = AccountKeys::generate().public_keys();
+        assert!(matches!(
+            verify_envelope(&envelope, &impostor.signing),
+            Err(CryptoError::BadSignature)
+        ));
     }
 
     #[test]
