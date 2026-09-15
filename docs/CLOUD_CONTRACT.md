@@ -269,6 +269,50 @@ token. A `README.md` in the crate documents running it locally against a local R
    on push. D cannot run the Windows job locally; D makes the Linux packaging step run
    locally as a script (`tools/package.sh`) and reports what is unverified.
 
+## Phase 1b: email verification (added 2026-09-15 after the first deploy)
+
+Joe's requirement: an account is not complete until its email address is verified by
+clicking a link in a message. Sending goes through Resend from the domain `m.pimble.app`.
+
+**Accounts service (C):**
+
+- `User` gains `verified: Bool`, `verify_token_hash: String`, `verify_expires_at: DateTime`.
+  Signup creates the user unverified, generates a 32-byte random token (stored hashed, 24 h
+  expiry), sends the verification mail, and answers `202 { "status": "verification_sent",
+  "email": "<as given>" }`. It no longer starts a session or returns a token. Signing up
+  again with an unverified email re-sends the mail and answers 202 (no enumeration);
+  a verified duplicate is 409 as before.
+- `GET /api/v1/verify?token=<token>`: on success marks the user verified, clears the token,
+  and answers `303 Location: /login.html?verified=1`; an unknown or expired token answers
+  `303 Location: /login.html?verify_error=invalid` or `...=expired`. A browser follows it.
+- `POST /api/v1/resend-verification { "email" }`: 202 always. Re-sends for an unverified
+  account (new token), does nothing otherwise. Rate limit: one send per address per minute.
+- `POST /api/v1/login` for an unverified account: `403 { "error": "email_unverified",
+  "message": "Check your inbox for the verification link." }`, checked after the password.
+- Mail: a `Mailer` trait with two implementations. `ResendMailer` posts to
+  `https://api.resend.com/emails` with `Authorization: Bearer <RESEND_API_KEY>` and
+  `{ "from", "to", "subject", "html", "text" }`; `LogMailer` (no key configured) logs the
+  link at `info` and keeps the last message per address in memory so tests can read the
+  link back through a test-only accessor. Env: `RESEND_API_KEY` (unset means `LogMailer`),
+  `PIMBLE_MAIL_FROM` (default `Pimble <no-reply@m.pimble.app>`). The link is
+  `<PIMBLE_CLOUD_PUBLIC_URL>/api/v1/verify?token=...`. Subject "Verify your Pimble
+  account"; plain, short body, the link, and "if you did not sign up, ignore this".
+- Tests: signup answers 202 and no session; login before verification is 403
+  `email_unverified`; the link from `LogMailer` verifies and redirects; login then works;
+  an expired token redirects with `expired`; resend issues a new token and invalidates the
+  old; a second signup for an unverified address re-sends.
+
+**Site (D):**
+
+- `signup.html`: a "Confirm password" field; mismatch is a form error before any request;
+  on 202 replace the form with "Check your inbox: we sent a verification link to
+  <email>." plus a "Send it again" button calling `resend-verification`.
+- `login.html`: banners for `?verified=1` ("Your email is verified. Log in."),
+  `?verify_error=expired` ("That link has expired." with a resend form) and `invalid`;
+  on `403 email_unverified` show the message and the resend button.
+- The site's script is `site.js` (never a name starting with `app`: jkbase routes every
+  path with the `/app` prefix, including `/app.js`, to the web app).
+
 ## Phase 2 (not now, designed for)
 
 - Desktop sign-in: "Account..." stores the opaque session; `AuthMethod::CloudSession`
