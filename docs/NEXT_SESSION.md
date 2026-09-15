@@ -1,7 +1,8 @@
 # Next session: start here
 
-Written 2026-09-15 at the end of the remote mounts session. Read this, then `CLAUDE.md`,
-then `docs/RESTART_PLAN.md`.
+Written 2026-09-15 at the end of the remote mounts session and updated the same day after
+two shorter pieces of work (the Scrivener importer, tree appearance). Read this, then
+`CLAUDE.md`, then `docs/RESTART_PLAN.md`.
 
 ## Where master stands
 
@@ -20,8 +21,16 @@ then `docs/RESTART_PLAN.md`.
   Contracts and the decisions behind them are in `docs/history/`; summaries in
   `CLAUDE.md`; architecture in `docs/ARCHITECTURE.md` ("Mount Architecture", "Replica
   sync", "Auth").
-- Workspace compiles with zero warnings. `cargo test --workspace --release` passes: 180
-  tests (see the commit message for the exact run).
+- After that, same day, without a contract (PM-only work, no agents): **the Scrivener
+  importer keeps rich text** (`6c21dbd`: `pimble_crdt::Block` model and
+  `ContentDoc::from_blocks`, the RTF parser rewritten, list buttons back in the toolbar)
+  and **tree appearance** (`16984df`, `223eb8c`: per-node and per-store icon and colour
+  in metadata, a picker with search over every Tabler icon and a tags field, Scrivener
+  labels and icons imported, View > "Toggle Dark Mode" at runtime and persisted). Both
+  are summarised in `CLAUDE.md` ("Collaboration shape", "Tree appearance") and in
+  follow-ups 13 and 18 below.
+- Workspace compiles with zero warnings. `cargo test --workspace --release` passes: 195
+  tests (see the commit messages for the exact runs).
 
 ## Verify in five minutes
 
@@ -138,7 +147,9 @@ after "Copy as Mount Source" again.
     portals leak on unmount. Worked around (items always rendered, `disabled` at render
     time, row data changes for re-renders, bumps deferred past the menu close).
 12. rinch repaint artifacts seen earlier (a strip below a shrunk modal, a stray line across
-    the tree). Not isolated; reproduce and file.
+    the tree), and once, right after View > "Toggle Dark Mode", the status bar's
+    "Connected" badge drew without its text until the next restart. None isolated;
+    reproduce and file.
 13. The Scrivener importer (2026-09-15) keeps bold, italic, underline, strike, links,
     text colour, highlight, sub/superscript, monospace-as-code, nested bullet and ordered
     lists, alignment and indent, and stylesheet or bold-and-larger headings. It reduces
