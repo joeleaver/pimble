@@ -121,6 +121,12 @@ pub(crate) fn start_editing(
     store.editor_dirty.set(false);
     // See edits from other clients.
     store.send(BackendCommand::SubscribeNodeChanges { store_id, node_id });
+    // Offline-first open: the session started from the cached bytes above
+    // (instant, no flash); now reconcile with the server's copy, which may
+    // hold edits this cache never saw (this window's own earlier session,
+    // another window, a replica). The answer lands in `apply_reconcile`.
+    request_reconcile(store, store_id, node_id);
+
     // A different document is under the toolbar now.
     crate::toolbar::bump_toolbar();
 }
@@ -144,6 +150,45 @@ pub(crate) fn stop_editing(store: AppStore) {
     store.active_edit.set(None);
     cancel_pending_label_refresh();
     crate::toolbar::bump_toolbar();
+}
+
+/// Ask the server for what it has beyond the active session's state vector
+/// (`syncNodeContent`). Used when a document opens and when the connection
+/// comes back after a failover.
+pub(crate) fn request_reconcile(store: AppStore, store_id: StoreId, node_id: NodeId) {
+    if let Some(state_vector) = editor().collab_state_vector() {
+        store.send(BackendCommand::ReconcileNodeContent { store_id, node_id, state_vector });
+    }
+}
+
+/// Merge the server's answer to `request_reconcile` into the active session,
+/// then send the server whatever the session has that it lacks. Ignored if
+/// the session has moved to another node meanwhile.
+pub(crate) fn apply_reconcile(
+    store: AppStore,
+    store_id: StoreId,
+    node_id: NodeId,
+    diff: &[u8],
+    server_state_vector: &[u8],
+) {
+    let active = untracked(|| store.active_edit.get());
+    if !active.map_or(false, |e| e.store_id == store_id && e.node_id == node_id) {
+        return;
+    }
+    let handle = editor();
+    if !diff.is_empty() {
+        // `collab_receive` re-projects the view and does not re-broadcast.
+        handle.collab_receive(diff);
+        schedule_label_refresh(store, store_id, node_id);
+        crate::toolbar::bump_toolbar();
+    }
+    if let Some(ours) = handle.collab_sync_diff(server_state_vector) {
+        if !ours.is_empty() {
+            use base64::Engine;
+            let changes = base64::engine::general_purpose::STANDARD.encode(&ours);
+            store.send(BackendCommand::BroadcastChanges { store_id, node_id, changes });
+        }
+    }
 }
 
 /// Cancel any debounced label refresh left over from a prior editing session.

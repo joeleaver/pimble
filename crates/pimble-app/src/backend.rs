@@ -58,6 +58,12 @@ pub enum BackendCommand {
         changes: String,
     },
 
+    /// Reconcile the editor's collaboration session with the server's copy
+    /// of a node's content: state vector in, the server's diff and state
+    /// vector out (`NodeContentReconciled`). Stateless on both ends; the
+    /// same primitive the replica sync link uses between servers.
+    ReconcileNodeContent { store_id: StoreId, node_id: NodeId, state_vector: Vec<u8> },
+
     // Subscription operations
     SubscribeStoreChanges { store_id: StoreId },
     SubscribeNodeChanges { store_id: StoreId, node_id: NodeId },
@@ -122,6 +128,11 @@ pub enum BackendEvent {
         state: MountState,
         mount_ref: MountRef,
     },
+
+    /// Answer to `ReconcileNodeContent`: everything the server has beyond
+    /// the session's state vector (may be empty), and the server's own state
+    /// vector, so the session can send back what the server lacks.
+    NodeContentReconciled { store_id: StoreId, node_id: NodeId, diff: Vec<u8>, server_state_vector: Vec<u8> },
 
     // Remote change events (from subscriptions)
     RemoteStoreChange { store_id: StoreId, change_kind: pimble_rpc::StoreChangeKind, source_client_id: Option<String> },
@@ -603,6 +614,21 @@ async fn process_command(
             match c.get_mount_state(store_id, node_id).await {
                 Ok((state, mount_ref)) => Some(BackendEvent::MountStateChanged { store_id, node_id, state, mount_ref }),
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::ReconcileNodeContent { store_id, node_id, state_vector } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            match c.sync_node_content(store_id, node_id, &state_vector).await {
+                Ok((diff, server_state_vector)) => Some(BackendEvent::NodeContentReconciled {
+                    store_id,
+                    node_id,
+                    diff,
+                    server_state_vector,
+                }),
+                Err(e) => Some(BackendEvent::Error { message: format!("Reconcile failed: {}", e) }),
             }
         }
 

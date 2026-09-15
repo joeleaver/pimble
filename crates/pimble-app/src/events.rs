@@ -133,24 +133,16 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // A document was being edited across the reconnect: its
                 // subscription died with the old connection and any delta
                 // sent during the gap was lost. Commands run in order, so
-                // the store is open again by the time these execute: push the
-                // editor's whole current state (a yrs update; the server
-                // merges it, so nothing typed offline is lost) and subscribe
-                // again for the other direction.
+                // the store is open again by the time these execute:
+                // subscribe again and reconcile (state vector in, diff out,
+                // then our diff back), so nothing typed offline is lost and
+                // nothing the new server holds is missed.
                 if let Some(active) = untracked(|| store.active_edit.get()) {
-                    if let Some(snapshot) = crate::editor::editor().collab_snapshot() {
-                        use base64::Engine;
-                        let changes = base64::engine::general_purpose::STANDARD.encode(&snapshot);
-                        store.send(BackendCommand::BroadcastChanges {
-                            store_id: active.store_id,
-                            node_id: active.node_id,
-                            changes,
-                        });
-                    }
                     store.send(BackendCommand::SubscribeNodeChanges {
                         store_id: active.store_id,
                         node_id: active.node_id,
                     });
+                    crate::editor::request_reconcile(store, active.store_id, active.node_id);
                 }
             }
 
@@ -552,6 +544,10 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         }
                     }
                 }
+            }
+
+            BackendEvent::NodeContentReconciled { store_id, node_id, diff, server_state_vector } => {
+                crate::editor::apply_reconcile(store, *store_id, *node_id, diff, server_state_vector);
             }
 
             BackendEvent::RemoteChanges { changes } => {
