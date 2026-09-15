@@ -71,6 +71,18 @@ effect on the next `jkbase deploy`, or immediately with `jkbase restart` (no reb
 (`http://127.0.0.1:7462`) are the loopback defaults baked into the same VM and don't need a
 secret unless something is moved off those ports.
 
+## The two lock files must agree on wasm-bindgen
+
+jkbase's trunk buildpack provisions the `wasm-bindgen` CLI for the offline build from the
+`Cargo.lock` at the **build context root** (the repo root, because `web/` needs
+`context = "."` for its path dependencies), not from `web/Cargo.lock`. If the two locks
+pin different `wasm-bindgen` versions the web target fails after cargo finishes, with no
+useful error in the tail (first deploy, 2026-09-15: root 0.2.108, web 0.2.128). Keep them
+equal: after `cargo update` in either workspace, run
+`cargo update -p wasm-bindgen -p js-sys -p web-sys -p wasm-bindgen-futures` in both and
+check `grep -A1 'name = "wasm-bindgen"' Cargo.lock web/Cargo.lock`. The right fix is in
+jkbase (read the lock of the cargo workspace that contains `source`, walking up from it).
+
 ## Push to deploy
 
 The repo has a second git remote, `jkbase` (`jkbase repo connect`, added 2026-09-15; the
