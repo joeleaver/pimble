@@ -209,6 +209,18 @@ fn kind_label(kind: &str) -> &'static str {
     }
 }
 
+/// Text for a linked store's status badge (docs/SYNC_CONTRACT.md "B: app
+/// side"). `Conflict` is out of scope for this contract (there are no
+/// conflicts to show yet) but still needs a label rather than a match gap.
+fn sync_badge_text(state: &pimble_core::SyncState) -> &'static str {
+    match state {
+        pimble_core::SyncState::Offline => "offline",
+        pimble_core::SyncState::Syncing => "syncing",
+        pimble_core::SyncState::Synced { .. } => "synced",
+        pimble_core::SyncState::Conflict { .. } => "conflict",
+    }
+}
+
 /// Walk the DOM subtree to find a `data-oncontextmenu` handler and copy it
 /// to `target`. Used to hoist the context menu handler from the invisible
 /// ContextMenuTarget (display:contents) to a visible wrapper div.
@@ -285,6 +297,17 @@ pub fn run() {
                 tracing::info!("Opening store at: {}", path_str);
                 store.send(BackendCommand::OpenStore { path: path_str });
             }
+        }))
+        .item(MenuItem::new("Add Remote Store...").on_click(move || {
+            tracing::info!("Add remote store menu clicked");
+            store.connect_modal_stores.set(Vec::new());
+            store.connect_modal_selected.set(String::new());
+            store.connect_modal_error.set(String::new());
+            store.connect_modal_busy.set(false);
+            if untracked(|| store.connect_modal_url.get()).is_empty() {
+                store.connect_modal_url.set("http://".to_string());
+            }
+            store.connect_modal_open.set(true);
         }))
         .separator()
         .item(MenuItem::new("Close Store").on_click(move || {
@@ -571,6 +594,22 @@ pub fn run() {
                 None
             };
 
+            // Sync status (store roots only, docs/SYNC_CONTRACT.md "B: app
+            // side"): looked up once (an entry always exists by the time a
+            // registered store's row renders — see `ensure_sync_entry`) and
+            // read reactively below for the badge; `is_linked_now` is a
+            // static (untracked) snapshot for the context menu's `disabled`
+            // values, rebuilt only when the tree structurally re-renders this
+            // row (rinch #714 — see the `no_mount_source` note further down).
+            let sync_sig = if is_store_root {
+                parsed.and_then(|(s_id, _)| store.get_sync_signal(s_id))
+            } else {
+                None
+            };
+            let is_linked_now = sync_sig
+                .map(|sig| untracked(|| sig.with(|(remote, _)| remote.is_some())))
+                .unwrap_or(false);
+
             // Choose icon (static — changes only on structural rebuild). Folders
             // are folders even when empty; documents are documents even with
             // children, so the icon follows node_type, not has_children.
@@ -691,6 +730,24 @@ pub fn run() {
                 move || {
                     if let Some((s_id, _)) = parse_tree_value(&nv) {
                         store.send(BackendCommand::CloseStore { store_id: s_id });
+                    }
+                }
+            };
+            let on_link_to_remote = {
+                let nv = nv_ctx.clone();
+                move || {
+                    if let Some((s_id, _)) = parse_tree_value(&nv) {
+                        store.link_modal_store.set(Some(s_id));
+                        store.link_modal_url.set(String::new());
+                        store.link_modal_error.set(String::new());
+                    }
+                }
+            };
+            let on_unlink_from_remote = {
+                let nv = nv_ctx.clone();
+                move || {
+                    if let Some((s_id, _)) = parse_tree_value(&nv) {
+                        store.send(BackendCommand::SetStoreSync { store_id: s_id, remote: None });
                     }
                 }
             };
@@ -908,6 +965,30 @@ pub fn run() {
                         }}
                     }
 
+                    // Sync status badge (store roots only, linked stores
+                    // only) — reactive per store, no tree rebuild
+                    // (docs/SYNC_CONTRACT.md "B: app side").
+                    span {
+                        style: {
+                            move || {
+                                let linked = sync_sig
+                                    .map(|sig| sig.with(|(remote, _)| remote.is_some()))
+                                    .unwrap_or(false);
+                                if linked {
+                                    "margin-left: 6px; cursor: default; font-size: 10px; font-weight: 400; \
+                                     text-transform: none; letter-spacing: normal; opacity: 0.6;"
+                                } else {
+                                    "display: none;"
+                                }
+                            }
+                        },
+                        {move || {
+                            sync_sig
+                                .map(|sig| sig.with(|(_, state)| sync_badge_text(state).to_string()))
+                                .unwrap_or_default()
+                        }}
+                    }
+
                     {rename_input}
                 }
             };
@@ -938,6 +1019,18 @@ pub fn run() {
                                 disabled: no_mount_source,
                                 onclick: on_paste_mount,
                                 "Paste Mount Here"
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::Cloud,
+                                disabled: is_linked_now,
+                                onclick: on_link_to_remote,
+                                "Link to Remote..."
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::Unlink,
+                                disabled: !is_linked_now,
+                                onclick: on_unlink_from_remote,
+                                "Unlink from Remote"
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::X,
@@ -1258,6 +1351,139 @@ pub fn run() {
             }
         };
 
+        // ── "Add Remote Store..." modal (File menu) ─────────────────────
+        // docs/SYNC_CONTRACT.md "B: app side". No folder/path field: the
+        // server places the replica in its own data directory, so nothing
+        // in this flow opens a native OS dialog (the rinch debug tools can
+        // drive it end to end).
+        let connect_modal = rsx! {
+            Modal {
+                opened_fn: move || store.connect_modal_open.get(),
+                onclose: move || {
+                    store.connect_modal_open.set(false);
+                    store.connect_modal_error.set(String::new());
+                },
+                title: "Add Remote Store",
+                size: "sm",
+
+                div {
+                    style: "display: flex; flex-direction: column; gap: 10px;",
+
+                    TextInput {
+                        label: "Server URL",
+                        placeholder: "http://host:7462",
+                        value_fn: move || store.connect_modal_url.get(),
+                        oninput: move |val: String| store.connect_modal_url.set(val),
+                    }
+
+                    Button {
+                        variant: "light",
+                        size: "sm",
+                        disabled: {|| store.connect_modal_busy.get()},
+                        onclick: move || {
+                            let url = untracked(|| store.connect_modal_url.get());
+                            store.connect_modal_busy.set(true);
+                            store.connect_modal_error.set(String::new());
+                            store.send(BackendCommand::ListRemoteStores { url });
+                        },
+                        "List stores"
+                    }
+
+                    Select {
+                        label: "Store",
+                        placeholder: "Select a store",
+                        value_fn: move || store.connect_modal_selected.get(),
+                        onchange: move |val: String| store.connect_modal_selected.set(val),
+                        data: {|| {
+                            store.connect_modal_stores.get().iter()
+                                .map(|s| SelectOption::new(s.id.to_string(), s.name.clone()))
+                                .collect::<Vec<_>>()
+                        }},
+                    }
+
+                    Button {
+                        variant: "filled",
+                        size: "sm",
+                        disabled: {|| store.connect_modal_busy.get() || store.connect_modal_selected.get().is_empty()},
+                        onclick: move || {
+                            let selected = untracked(|| store.connect_modal_selected.get());
+                            let Ok(remote_uuid) = selected.parse::<uuid::Uuid>() else {
+                                store.connect_modal_error.set("Select a store first".to_string());
+                                return;
+                            };
+                            let remote_store_id = pimble_core::StoreId(remote_uuid);
+                            let url = untracked(|| store.connect_modal_url.get());
+                            store.connect_modal_pending_add.set(true);
+                            store.connect_modal_busy.set(true);
+                            store.connect_modal_error.set(String::new());
+                            store.send(BackendCommand::AddRemoteStore { url, remote_store_id });
+                        },
+                        "Add"
+                    }
+
+                    if !store.connect_modal_error.get().is_empty() {
+                        div {
+                            style: "color: var(--rinch-color-red-6); font-size: 12px;",
+                            {|| store.connect_modal_error.get()}
+                        }
+                    }
+                }
+            }
+        };
+
+        // ── "Link to Remote..." modal (store root context menu) ─────────
+        // docs/SYNC_CONTRACT.md "B: app side".
+        let link_modal = rsx! {
+            Modal {
+                opened_fn: move || store.link_modal_store.get().is_some(),
+                onclose: move || {
+                    store.link_modal_store.set(None);
+                    store.link_modal_error.set(String::new());
+                },
+                title: "Link to Remote",
+                size: "sm",
+
+                div {
+                    style: "display: flex; flex-direction: column; gap: 10px;",
+
+                    TextInput {
+                        label: "Server URL",
+                        placeholder: "http://host:7462",
+                        value_fn: move || store.link_modal_url.get(),
+                        oninput: move |val: String| store.link_modal_url.set(val),
+                    }
+
+                    Button {
+                        variant: "filled",
+                        size: "sm",
+                        disabled: {|| store.link_modal_pending.get()},
+                        onclick: move || {
+                            let Some(store_id) = untracked(|| store.link_modal_store.get()) else { return };
+                            let url_str = untracked(|| store.link_modal_url.get());
+                            let Ok(url) = url_str.parse::<url::Url>() else {
+                                store.link_modal_error.set("Invalid URL".to_string());
+                                return;
+                            };
+                            store.link_modal_pending.set(true);
+                            store.link_modal_error.set(String::new());
+                            store.send(BackendCommand::SetStoreSync {
+                                store_id,
+                                remote: Some(pimble_core::RemoteEndpoint { url, auth: pimble_core::AuthMethod::None }),
+                            });
+                        },
+                        "Link"
+                    }
+
+                    if !store.link_modal_error.get().is_empty() {
+                        div {
+                            style: "color: var(--rinch-color-red-6); font-size: 12px;",
+                            {|| store.link_modal_error.get()}
+                        }
+                    }
+                }
+            }
+        };
+
         // Spawn the backend now that the UI and event loop are fully set up.
         // The EVENT_PROCESSOR thread-local is already registered, so signal_ui
         // callbacks will be processed correctly via run_on_main_thread.
@@ -1284,6 +1510,9 @@ pub fn run() {
 
                 style { {APP_CSS} }
                 style { {EDITOR_CSS} }
+
+                {connect_modal}
+                {link_modal}
 
                 // Outer wrapper — flex column fills the content area, pushes
                 // status bar to the very bottom.

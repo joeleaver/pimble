@@ -8,11 +8,12 @@ use std::time::Duration;
 use jsonrpsee::core::{async_trait, SubscriptionResult};
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{PendingSubscriptionSink, SubscriptionMessage};
-use pimble_core::{Node, MountRef, NodeId, StoreId, StoreLocation, Workspace};
+use pimble_client::PimbleClient;
+use pimble_core::{Node, MountRef, NodeId, RemoteEndpoint, StoreId, StoreLocation, SyncState, Workspace};
 use pimble_plugins::PluginHost;
 use pimble_rpc::{
     index_building_error, to_rpc_error, ApplyEditRequest, ApplyEditResponse,
-    ApplyStoreUpdateRequest, CloneStoreRequest, CloseStoreRequest, CreateMountRequest, CreateMountResponse,
+    AddRemoteStoreRequest, ApplyStoreUpdateRequest, CloseStoreRequest, CreateMountRequest, CreateMountResponse,
     CreateNodeRequest, CreateNodeResponse, CreateStoreRequest, CreateStoreResponse,
     CreateWorkspaceRequest, DeleteNodeRequest, EditOperation, EmptyResponse, GetChildrenRequest,
     GetChildrenResponse, GetMountStateRequest, GetMountStateResponse, GetNodeRequest, GetStoreSyncRequest, GetStoreSyncResponse, SetStoreSyncRequest,
@@ -25,9 +26,11 @@ use pimble_rpc::{
     UpdateNodeMetadataRequest,
 };
 use pimble_search::{IndexNode, SearchError, SearchIndex, SearchQuery};
-use pimble_store::{StoreEndpoint, StoreManager};
-use tokio::sync::{mpsc, RwLock};
+use pimble_store::{StoreEndpoint, StoreManager, SyncConfig};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, info, warn};
+
+use crate::sync_link::{SyncLink, SyncLinkHandle};
 
 /// How long to wait, after a node's content last changed, before reading its
 /// units and upserting them into the search index. `applyEdit` fires on every
@@ -39,6 +42,20 @@ const CONTENT_INDEX_DEBOUNCE: Duration = Duration::from_millis(2_000);
 /// of keystrokes coalesces into at most one flush per window, instead of one
 /// per edit.
 const CONTENT_FLUSH_DEBOUNCE: Duration = Duration::from_millis(750);
+
+/// Where `addRemoteStore` places a replica when the caller passes `path:
+/// None` (docs/SYNC_CONTRACT.md decision 8): `<data dir>/pimble/replicas/
+/// <store id>.pimble`. The user never chooses this location; a caller like
+/// the CLI may still pass an explicit `path`. `LocalStore::create_replica`
+/// creates every ancestor directory, so nothing here needs to pre-create
+/// `pimble/replicas/`.
+fn default_replica_path(store_id: StoreId) -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("pimble")
+        .join("replicas")
+        .join(format!("{}.pimble", store_id))
+}
 
 /// Coalesces content flushes: `apply_edit` marks its store dirty and ensures
 /// exactly one flush task is in flight. Edits that land after that task has
@@ -240,20 +257,40 @@ fn build_index_node(node: &Node, plugin_host: &PluginHost) -> IndexNode {
     }
 }
 
+/// One local notification, broadcast in-process (docs/SYNC_CONTRACT.md
+/// decision 3) wherever [`SubscriptionRegistry`] notifies its WebSocket
+/// sinks. A store's [`crate::sync_link::SyncLink`] subscribes to this to
+/// learn about local changes to forward to its remote, without a loopback
+/// socket.
+#[derive(Debug, Clone)]
+pub enum LocalChange {
+    Store(StoreChangedNotification),
+    Node(NodeContentChangedNotification),
+}
+
 /// Manages active subscription sinks for pushing notifications.
 struct SubscriptionRegistry {
     /// Store change subscribers: store_id -> list of sinks
     store_subs: HashMap<StoreId, Vec<jsonrpsee::core::server::SubscriptionSink>>,
     /// Node content change subscribers: (store_id, node_id) -> list of sinks
     node_subs: HashMap<(StoreId, NodeId), Vec<jsonrpsee::core::server::SubscriptionSink>>,
+    /// In-process broadcast of every local notification (decision 3).
+    local_changes: broadcast::Sender<LocalChange>,
 }
 
 impl SubscriptionRegistry {
     fn new() -> Self {
+        let (local_changes, _) = broadcast::channel(1024);
         Self {
             store_subs: HashMap::new(),
             node_subs: HashMap::new(),
+            local_changes,
         }
+    }
+
+    /// Subscribe to the in-process local-change broadcast.
+    fn subscribe_local(&self) -> broadcast::Receiver<LocalChange> {
+        self.local_changes.subscribe()
     }
 
     fn add_store_sub(&mut self, store_id: StoreId, sink: jsonrpsee::core::server::SubscriptionSink) {
@@ -266,6 +303,10 @@ impl SubscriptionRegistry {
 
     /// Notify all store subscribers about a change, removing closed sinks.
     async fn notify_store_change(&mut self, notification: &StoreChangedNotification) {
+        // Local, in-process broadcast (decision 3); harmless if no one (no
+        // sync link) is currently subscribed.
+        let _ = self.local_changes.send(LocalChange::Store(notification.clone()));
+
         if let Some(sinks) = self.store_subs.get_mut(&notification.store_id) {
             let msg = SubscriptionMessage::from_json(&notification).ok();
             if let Some(msg) = msg {
@@ -286,6 +327,8 @@ impl SubscriptionRegistry {
 
     /// Notify all node content subscribers about a change, removing closed sinks.
     async fn notify_node_change(&mut self, notification: &NodeContentChangedNotification) {
+        let _ = self.local_changes.send(LocalChange::Node(notification.clone()));
+
         let key = (notification.store_id, notification.node_id);
         if let Some(sinks) = self.node_subs.get_mut(&key) {
             tracing::info!("notify_node_change: {} sinks for {:?}/{:?}", sinks.len(), notification.store_id, notification.node_id);
@@ -321,7 +364,12 @@ impl SubscriptionRegistry {
     }
 }
 
-/// RPC handler implementation
+/// RPC handler implementation.
+///
+/// A bag of `Arc`s, `Clone` for that reason: a store's `SyncLink` owns a
+/// clone so it can call `apply_edit`/`apply_store_update` on the same live
+/// state as every other client (docs/SYNC_CONTRACT.md decision 1).
+#[derive(Clone)]
 pub struct RpcHandler {
     store_manager: Arc<RwLock<StoreManager>>,
     subscriptions: Arc<RwLock<SubscriptionRegistry>>,
@@ -340,6 +388,11 @@ pub struct RpcHandler {
     /// re-fails) the same download per store. `false` here makes every store
     /// open keyword-only instead; it never disables an already-open index.
     semantic_available: bool,
+    /// One running [`SyncLinkHandle`] per replica-linked store
+    /// (docs/SYNC_CONTRACT.md). Populated by `openStore` (from `sync.json`)
+    /// and `setStoreSync`/`addRemoteStore`; removed (after `stop()`) by
+    /// `closeStore` and `setStoreSync(None)`.
+    links: Arc<RwLock<HashMap<StoreId, SyncLinkHandle>>>,
 }
 
 impl RpcHandler {
@@ -361,6 +414,57 @@ impl RpcHandler {
             plugin_host: Arc::new(pimble_plugins::create_default_host()),
             indexes: Arc::new(RwLock::new(HashMap::new())),
             semantic_available,
+            links: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    // ── Replica sync (docs/SYNC_CONTRACT.md) ─────────────────────────
+
+    /// Shared handle to the store manager, for [`crate::sync_link`] to read
+    /// and write CRDT documents directly (state vectors, diffs) alongside
+    /// the handler's own `apply_store_update`/`apply_edit` (used to actually
+    /// merge, persist, broadcast, and index a remote change).
+    pub(crate) fn store_manager_handle(&self) -> Arc<RwLock<StoreManager>> {
+        Arc::clone(&self.store_manager)
+    }
+
+    /// Subscribe to this server's in-process broadcast of local
+    /// notifications (decision 3), used by a sync link to learn about local
+    /// changes to forward to its remote.
+    pub(crate) async fn subscribe_local_changes(&self) -> broadcast::Receiver<LocalChange> {
+        self.subscriptions.read().await.subscribe_local()
+    }
+
+    /// Notify a store's local subscribers that its sync link's state
+    /// changed.
+    pub(crate) async fn notify_sync_state_changed(&self, store_id: StoreId, state: SyncState) {
+        self.notify_store_change(store_id, StoreChangeKind::SyncStateChanged { state }, None).await;
+    }
+
+    /// A store's sync link state, `Offline` if it has none.
+    async fn sync_state_of(&self, store_id: StoreId) -> SyncState {
+        match self.links.read().await.get(&store_id) {
+            Some(handle) => handle.state(),
+            None => SyncState::Offline,
+        }
+    }
+
+    /// Start a sync link for `store_id` if one isn't already running.
+    /// `openStore`, `addRemoteStore`, `set_store_sync(Some(remote))` and no-op if
+    /// a link is already present.
+    async fn ensure_link_started(&self, store_id: StoreId, remote: RemoteEndpoint) {
+        let mut links = self.links.write().await;
+        if links.contains_key(&store_id) {
+            return;
+        }
+        let handle = SyncLink::start(self.clone(), store_id, remote);
+        links.insert(store_id, handle);
+    }
+
+    /// Stop and remove `store_id`'s sync link, if any.
+    async fn stop_link(&self, store_id: StoreId) {
+        if let Some(handle) = self.links.write().await.remove(&store_id) {
+            handle.stop();
         }
     }
 
@@ -420,18 +524,28 @@ impl RpcHandler {
     }
 
     /// Notify node content subscribers AND store subscribers about a content change.
+    ///
+    /// Decision 4: when `operation` is an `applyEdit` delta, its bytes are
+    /// also put on the store-level notification's `update` field, so a
+    /// subscriber to the store alone (e.g. a sync link) gets content deltas
+    /// without subscribing per node. `updateNodeContent` (the full-snapshot
+    /// path) passes `None` here and still yields `update: None`.
     async fn notify_node_content_change(&self, store_id: StoreId, node_id: NodeId, source: Option<&str>, operation: Option<EditOperation>) {
         let node_notif = NodeContentChangedNotification {
             store_id,
             node_id,
             source_client_id: source.map(String::from),
-            operation,
+            operation: operation.clone(),
+        };
+        let update_bytes = match &operation {
+            Some(EditOperation::IncrementalChanges { changes }) => Some(changes.clone()),
+            None => None,
         };
         let store_notif = StoreChangedNotification {
             store_id,
             change_kind: StoreChangeKind::ContentUpdated { node_id },
             source_client_id: source.map(String::from),
-            update: None,
+            update: update_bytes,
         };
         // Acquire lock once for both notification types
         let mut registry = self.subscriptions.write().await;
@@ -488,6 +602,12 @@ impl RpcHandler {
     async fn reindex_all_nodes(&self, store_id: StoreId, index: &SearchIndex) -> anyhow::Result<usize> {
         let root_id = self.store_manager.read().await.root_node_id(store_id)?;
         let mut manager = self.store_manager.write().await;
+        // A freshly added remote store has a root id in its manifest but an
+        // empty store document until its first reconcile: nothing to index
+        // yet, and not an error. The reconcile's updates feed the index.
+        if !manager.store_document(store_id)?.has_node(root_id) {
+            return Ok(0);
+        }
         let mut stack = vec![root_id];
         let mut count = 0usize;
         while let Some(node_id) = stack.pop() {
@@ -650,9 +770,10 @@ impl PimbleApiServer for RpcHandler {
             .await
             .map_err(to_rpc_error)?;
 
-        let store = manager
+        let mut store = manager
             .get_store_info(store_id)
             .map_err(to_rpc_error)?;
+        let sync_config = manager.read_sync_config(store_id).await.map_err(to_rpc_error)?;
 
         drop(manager);
         // `open_local_store` returns the id of an already-open store as-is
@@ -664,6 +785,15 @@ impl PimbleApiServer for RpcHandler {
             }
         }
 
+        // Start the store's sync link from `sync.json`, if present
+        // (docs/SYNC_CONTRACT.md decision 7). `ensure_link_started` no-ops
+        // if one is already running (e.g. `open_local_store` above was a
+        // no-op for an already-open store).
+        if let Some(config) = sync_config {
+            self.ensure_link_started(store_id, config.remote).await;
+        }
+        store.sync_state = self.sync_state_of(store_id).await;
+
         Ok(OpenStoreResponse { store })
     }
 
@@ -672,6 +802,8 @@ impl PimbleApiServer for RpcHandler {
         request: CloseStoreRequest,
     ) -> Result<EmptyResponse, ErrorObjectOwned> {
         info!("Closing store {}", request.store_id);
+
+        self.stop_link(request.store_id).await;
 
         let mut manager = self.store_manager.write().await;
         manager
@@ -698,7 +830,8 @@ impl PimbleApiServer for RpcHandler {
 
         let mut stores = Vec::new();
         for id in store_ids {
-            if let Ok(store) = manager.get_store_info(id) {
+            if let Ok(mut store) = manager.get_store_info(id) {
+                store.sync_state = self.sync_state_of(id).await;
                 stores.push(store);
             }
         }
@@ -974,30 +1107,179 @@ impl PimbleApiServer for RpcHandler {
     }
 
     // ── Replica sync (docs/SYNC_CONTRACT.md) ─────────────────────────
-    // Stubs landed with the interface; the sync link makes them real.
 
-    async fn clone_store(
+    async fn add_remote_store(
         &self,
-        request: CloneStoreRequest,
+        request: AddRemoteStoreRequest,
     ) -> Result<OpenStoreResponse, ErrorObjectOwned> {
-        Err(to_rpc_error(format!(
-            "cloneStore is not implemented yet (store {} from {})",
-            request.remote_store_id, request.remote.url
-        )))
+        // `None` lets the server choose the replica's location; the user
+        // never picks one (decision 8).
+        let path = request.path.clone().unwrap_or_else(|| default_replica_path(request.remote_store_id));
+
+        info!(
+            "Adding remote store {} from {} at {:?}",
+            request.remote_store_id, request.remote.url, path
+        );
+
+        // A store this server already holds cannot also be added as a
+        // replica (the manager refuses too); this also covers pointing the
+        // request at this very server.
+        {
+            let manager = self.store_manager.read().await;
+            if manager.is_open(request.remote_store_id) {
+                let where_ = manager
+                    .get_store_info(request.remote_store_id)
+                    .ok()
+                    .and_then(|s| s.local_path().cloned())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                return Err(to_rpc_error(format!(
+                    "store {} is already open locally at {}; use setStoreSync to link it",
+                    request.remote_store_id, where_
+                )));
+            }
+        }
+
+        // Ask the remote for the store (decision 8): its name and root node
+        // id, matched by id via `listStores`.
+        let remote_client = PimbleClient::connect_with_auth(request.remote.url.as_str(), &request.remote.auth)
+            .await
+            .map_err(|e| to_rpc_error(format!("Failed to connect to remote {}: {}", request.remote.url, e)))?;
+        let remote_stores = remote_client.list_stores().await.map_err(to_rpc_error)?;
+        let remote_store = remote_stores
+            .into_iter()
+            .find(|s| s.id == request.remote_store_id)
+            .ok_or_else(|| {
+                to_rpc_error(format!(
+                    "Remote {} has no open store {}",
+                    request.remote.url, request.remote_store_id
+                ))
+            })?;
+        drop(remote_client);
+
+        // An empty replica, never `StoreDocument::new` (decision 8: two
+        // independently created roots for the same id would merge into
+        // duplicated children).
+        let mut manager = self.store_manager.write().await;
+        let store_id = manager
+            .create_replica(&path, remote_store.id, &remote_store.name, remote_store.root_node_id)
+            .await
+            .map_err(to_rpc_error)?;
+        manager
+            .write_sync_config(store_id, &SyncConfig { remote: request.remote.clone() })
+            .await
+            .map_err(to_rpc_error)?;
+        let mut store = manager.get_store_info(store_id).map_err(to_rpc_error)?;
+        let newly_opened = manager.opened_since();
+        drop(manager);
+
+        self.open_indexes_for_newly_opened(newly_opened).await;
+
+        self.ensure_link_started(store_id, request.remote.clone()).await;
+
+        // Wait up to 10s for the first full reconcile to reach `Synced`
+        // (decision 8), then answer anyway with the current state.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = self.sync_state_of(store_id).await;
+            let is_synced = matches!(state, SyncState::Synced { .. });
+            if is_synced || std::time::Instant::now() >= deadline {
+                store.sync_state = state;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        Ok(OpenStoreResponse { store })
     }
 
     async fn set_store_sync(
         &self,
         request: SetStoreSyncRequest,
     ) -> Result<GetStoreSyncResponse, ErrorObjectOwned> {
-        Err(to_rpc_error(format!("setStoreSync is not implemented yet (store {})", request.store_id)))
+        info!("Setting sync for store {}: {:?}", request.store_id, request.remote.as_ref().map(|r| &r.url));
+
+        match request.remote {
+            Some(remote) => {
+                // Refuse if the remote has no store with this id.
+                let remote_client = PimbleClient::connect_with_auth(remote.url.as_str(), &remote.auth)
+                    .await
+                    .map_err(|e| to_rpc_error(format!("Failed to connect to remote {}: {}", remote.url, e)))?;
+                let remote_stores = remote_client.list_stores().await.map_err(to_rpc_error)?;
+                let Some(twin) = remote_stores.iter().find(|s| s.id == request.store_id) else {
+                    return Err(to_rpc_error(format!(
+                        "Remote {} has no open store {}",
+                        remote.url, request.store_id
+                    )));
+                };
+                // The remote's copy must be a different directory. The same
+                // path means the remote is this server (or another server on
+                // this machine serving the very same directory): a link would
+                // reconcile a store with itself.
+                let local_path = self
+                    .store_manager
+                    .read()
+                    .await
+                    .get_store_info(request.store_id)
+                    .map_err(to_rpc_error)?
+                    .local_path()
+                    .cloned();
+                if twin.local_path().is_some() && twin.local_path() == local_path.as_ref() {
+                    return Err(to_rpc_error(format!(
+                        "remote {} is this server: store {} lives at {} on both ends",
+                        remote.url,
+                        request.store_id,
+                        local_path.map(|p| p.display().to_string()).unwrap_or_default()
+                    )));
+                }
+                drop(remote_client);
+
+                let manager = self.store_manager.read().await;
+                manager
+                    .write_sync_config(request.store_id, &SyncConfig { remote: remote.clone() })
+                    .await
+                    .map_err(to_rpc_error)?;
+                drop(manager);
+
+                // Replace any existing link so it points at the new remote.
+                self.stop_link(request.store_id).await;
+                self.ensure_link_started(request.store_id, remote).await;
+            }
+            None => {
+                self.stop_link(request.store_id).await;
+                let manager = self.store_manager.read().await;
+                manager.clear_sync_config(request.store_id).await.map_err(to_rpc_error)?;
+                drop(manager);
+                self.notify_sync_state_changed(request.store_id, SyncState::Offline).await;
+            }
+        }
+
+        let manager = self.store_manager.read().await;
+        let remote_now = manager
+            .read_sync_config(request.store_id)
+            .await
+            .map_err(to_rpc_error)?
+            .map(|c| c.remote);
+        drop(manager);
+        let state = self.sync_state_of(request.store_id).await;
+
+        Ok(GetStoreSyncResponse { remote: remote_now, state })
     }
 
     async fn get_store_sync(
         &self,
         request: GetStoreSyncRequest,
     ) -> Result<GetStoreSyncResponse, ErrorObjectOwned> {
-        Err(to_rpc_error(format!("getStoreSync is not implemented yet (store {})", request.store_id)))
+        let manager = self.store_manager.read().await;
+        let remote = manager
+            .read_sync_config(request.store_id)
+            .await
+            .map_err(to_rpc_error)?
+            .map(|c| c.remote);
+        drop(manager);
+        let state = self.sync_state_of(request.store_id).await;
+
+        Ok(GetStoreSyncResponse { remote, state })
     }
 
     async fn get_mount_state(
@@ -1076,7 +1358,7 @@ impl PimbleApiServer for RpcHandler {
             .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
 
         let mut manager = self.store_manager.write().await;
-        manager
+        let touched = manager
             .apply_store_doc_update(request.store_id, &bytes)
             .map_err(to_rpc_error)?;
 
@@ -1084,6 +1366,14 @@ impl PimbleApiServer for RpcHandler {
             .flush(request.store_id)
             .await
             .map_err(to_rpc_error)?;
+
+        // Decision 9: an id whose node entry still exists gets upserted
+        // (this is what makes a title change arriving as a store update get
+        // reindexed); an id no longer present was removed.
+        let (upserts, removals): (Vec<NodeId>, Vec<NodeId>) = {
+            let doc = manager.store_document(request.store_id).map_err(to_rpc_error)?;
+            touched.into_iter().partition(|id| doc.has_node(*id))
+        };
 
         drop(manager);
 
@@ -1096,6 +1386,13 @@ impl PimbleApiServer for RpcHandler {
             update: Some(request.update.clone()),
         };
         self.subscriptions.write().await.notify_store_change(&notification).await;
+
+        for node_id in upserts {
+            self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
+        }
+        for node_id in removals {
+            self.enqueue_index_event(request.store_id, IndexEvent::Remove(node_id)).await;
+        }
 
         Ok(EmptyResponse {})
     }

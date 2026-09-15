@@ -32,6 +32,10 @@ pub struct PimbleServer {
     config: ServerConfig,
     store_manager: Arc<RwLock<StoreManager>>,
     handle: Option<ServerHandle>,
+    /// The socket the server actually bound to, resolved once at `start()`
+    /// (`Server::local_addr()`), so a config with port 0 (as used in tests)
+    /// still has a meaningful `addr()`.
+    local_addr: Option<SocketAddr>,
 }
 
 impl PimbleServer {
@@ -46,6 +50,7 @@ impl PimbleServer {
             config,
             store_manager: Arc::new(RwLock::new(StoreManager::new())),
             handle: None,
+            local_addr: None,
         }
     }
 
@@ -68,12 +73,18 @@ impl PimbleServer {
             .await
             .map_err(|e| crate::ServerError::Server(e.to_string()))?;
 
+        // `local_addr()` must be read before `start()`, which consumes the
+        // `Server` by value; this is what makes port 0 (bind to any free
+        // port, used by tests) resolve to something `addr()` can report.
+        let local_addr = server.local_addr().map_err(|e| crate::ServerError::Server(e.to_string()))?;
+        self.local_addr = Some(local_addr);
+
         let semantic_available = warm_up_embedding_model().await;
 
         let handler = RpcHandler::with_semantic_available(Arc::clone(&self.store_manager), semantic_available);
         let methods = handler.into_rpc();
 
-        info!("Starting Pimble server on {}", self.config.addr);
+        info!("Starting Pimble server on {}", local_addr);
         let handle = server.start(methods);
         self.handle = Some(handle);
 
@@ -104,9 +115,12 @@ impl PimbleServer {
         }
     }
 
-    /// Get the server address
+    /// The address the server is bound to: the actual bound socket
+    /// (`Server::local_addr()`) once `start()` has run, so a `ServerConfig`
+    /// with port 0 resolves to the OS-assigned port; falls back to the
+    /// configured address before `start()`.
     pub fn addr(&self) -> SocketAddr {
-        self.config.addr
+        self.local_addr.unwrap_or(self.config.addr)
     }
 }
 

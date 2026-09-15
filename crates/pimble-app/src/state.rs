@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
-use pimble_core::{MountRef, MountState, Node, NodeId, Store, StoreId};
+use pimble_core::{MountRef, MountState, Node, NodeId, RemoteEndpoint, Store, StoreId, SyncState};
 use rinch::components::TreeNodeData;
 use rinch::prelude::*;
 
@@ -144,6 +144,13 @@ pub struct AppStore {
     pub children_of: Signal<HashMap<(StoreId, NodeId), Signal<Vec<(StoreId, NodeId)>>>>,
     pub mount_data: Signal<HashMap<(StoreId, NodeId), Signal<MountInfo>>>,
 
+    /// Each registered store's remote endpoint (`None` when unlinked) and
+    /// current sync state (docs/SYNC_CONTRACT.md "B: app side"). An entry
+    /// exists for every store as soon as it's registered (see
+    /// `ensure_sync_entry`), so the tree row's badge signal is always
+    /// available by the time the row renders, before `GetStoreSync` answers.
+    pub sync_data: Signal<HashMap<StoreId, Signal<(Option<RemoteEndpoint>, SyncState)>>>,
+
     /// Bumped only on structural changes (store open/close, children loaded, node moved).
     /// The data_source closure subscribes to this to trigger tree rebuilds.
     pub tree_structure_version: Signal<u64>,
@@ -199,6 +206,31 @@ pub struct AppStore {
     // The results panel replaces the tree whenever `search_query` is non-empty.
     pub search_query: Signal<String>,
     pub search_results: Signal<SearchState>,
+
+    // "Add Remote Store..." modal (File menu, docs/SYNC_CONTRACT.md "B: app
+    // side"): browse a remote's open stores and add one as a local replica.
+    // No folder/path field — the server places the replica in its own data
+    // directory, so nothing here opens a native OS dialog.
+    pub connect_modal_open: Signal<bool>,
+    pub connect_modal_url: Signal<String>,
+    pub connect_modal_stores: Signal<Vec<Store>>,
+    /// The selected store's id, as a string (the raw `Select` value).
+    pub connect_modal_selected: Signal<String>,
+    pub connect_modal_error: Signal<String>,
+    /// True while a `ListRemoteStores` or `AddRemoteStore` request is in flight.
+    pub connect_modal_busy: Signal<bool>,
+    /// True while specifically waiting for `AddRemoteStore`'s answer, so the
+    /// generic `BackendEvent::Error`/`StoreOpened` outcome routes into this
+    /// modal's own error line / auto-close instead of the global status bar.
+    pub connect_modal_pending_add: Signal<bool>,
+
+    // "Link to Remote..." modal (store root context menu). `Some(store_id)`
+    // is the store the modal is open for; `None` means closed.
+    pub link_modal_store: Signal<Option<StoreId>>,
+    pub link_modal_url: Signal<String>,
+    pub link_modal_error: Signal<String>,
+    /// True while a `SetStoreSync` request from this modal is in flight.
+    pub link_modal_pending: Signal<bool>,
 }
 
 /// Identifies the node currently open in the shared editor.
@@ -219,6 +251,7 @@ impl AppStore {
             node_data: Signal::new(HashMap::new()),
             children_of: Signal::new(HashMap::new()),
             mount_data: Signal::new(HashMap::new()),
+            sync_data: Signal::new(HashMap::new()),
             tree_structure_version: Signal::new(0),
             expanded: Signal::new(HashSet::new()),
             connection_status: Signal::new("Connecting...".to_string()),
@@ -238,6 +271,17 @@ impl AppStore {
             client_id: Signal::new(String::new()),
             search_query: Signal::new(String::new()),
             search_results: Signal::new(SearchState::Idle),
+            connect_modal_open: Signal::new(false),
+            connect_modal_url: Signal::new(String::new()),
+            connect_modal_stores: Signal::new(Vec::new()),
+            connect_modal_selected: Signal::new(String::new()),
+            connect_modal_error: Signal::new(String::new()),
+            connect_modal_busy: Signal::new(false),
+            connect_modal_pending_add: Signal::new(false),
+            link_modal_store: Signal::new(None),
+            link_modal_url: Signal::new(String::new()),
+            link_modal_error: Signal::new(String::new()),
+            link_modal_pending: Signal::new(false),
         }
     }
 
@@ -278,6 +322,7 @@ impl AppStore {
         self.children_of.update(|map| { map.retain(|(sid, _), _| *sid != store_id); });
         self.mount_data.update(|map| { map.retain(|(sid, _), _| *sid != store_id); });
         self.live_label.update(|map| { map.retain(|(sid, _), _| *sid != store_id); });
+        self.sync_data.update(|map| { map.remove(&store_id); });
     }
 
     /// Remove a node and its per-entity signals (node_data, mount_data, children_of).
@@ -415,6 +460,63 @@ impl AppStore {
                 map.insert(key, new_sig);
             });
         }
+    }
+
+    /// Ensure a store has a sync-status entry, defaulting to unlinked/offline.
+    /// Called as soon as a store is registered (`register_opened_store`) so
+    /// the tree row's badge signal always exists by the time the row
+    /// renders, ahead of `GetStoreSync`'s answer.
+    pub fn ensure_sync_entry(&self, store_id: StoreId) {
+        let exists = self.sync_data.with(|map| map.contains_key(&store_id));
+        if !exists {
+            let new_sig = Signal::new((None, SyncState::Offline));
+            self.sync_data.update(|map| {
+                map.insert(store_id, new_sig);
+            });
+        }
+    }
+
+    /// Get the per-store sync signal (untracked read of the registry).
+    pub fn get_sync_signal(&self, store_id: StoreId) -> Option<Signal<(Option<RemoteEndpoint>, SyncState)>> {
+        untracked(|| self.sync_data.with(|map| map.get(&store_id).copied()))
+    }
+
+    /// Set a store's remote endpoint and sync state (answer to
+    /// `SetStoreSync`/`GetStoreSync`, which always carry both).
+    pub fn set_sync(&self, store_id: StoreId, remote: Option<RemoteEndpoint>, state: SyncState) {
+        let existing = self.sync_data.with(|map| map.get(&store_id).copied());
+        if let Some(sig) = existing {
+            sig.set((remote, state));
+        } else {
+            let new_sig = Signal::new((remote, state));
+            self.sync_data.update(|map| {
+                map.insert(store_id, new_sig);
+            });
+        }
+    }
+
+    /// Update just a store's sync state, preserving whatever remote endpoint
+    /// is already known — for a bare `SyncStateChanged` notification, which
+    /// carries only the new state (decision 6, docs/SYNC_CONTRACT.md).
+    pub fn update_sync_state(&self, store_id: StoreId, state: SyncState) {
+        let existing = self.sync_data.with(|map| map.get(&store_id).copied());
+        if let Some(sig) = existing {
+            sig.update(|(_, s)| *s = state);
+        } else {
+            let new_sig = Signal::new((None, state));
+            self.sync_data.update(|map| {
+                map.insert(store_id, new_sig);
+            });
+        }
+    }
+
+    /// Whether a store currently has a remote endpoint linked (untracked).
+    pub fn is_linked(&self, store_id: StoreId) -> bool {
+        untracked(|| {
+            self.sync_data.with(|map| {
+                map.get(&store_id).map_or(false, |sig| sig.with(|(remote, _)| remote.is_some()))
+            })
+        })
     }
 
     /// Canonical pairs of every mount node whose `mount_ref.source_store` is

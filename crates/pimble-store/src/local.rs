@@ -4,12 +4,21 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::DateTime;
-use pimble_core::{Node, NodeId, NodeMetadata, StoreId, StoreManifest};
+use pimble_core::{Node, NodeId, NodeMetadata, RemoteEndpoint, StoreId, StoreManifest};
 use pimble_crdt::{ContentDoc, StoreDocument};
+use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tracing::{debug, info};
 
 use crate::error::{Result, StoreError};
+
+/// A store's replica sync link, persisted as `<store>/sync.json`
+/// (docs/SYNC_CONTRACT.md decision 7). Present exactly when the store is
+/// linked to a remote twin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncConfig {
+    pub remote: RemoteEndpoint,
+}
 
 /// Write a file atomically: write to a `.tmp` sibling, then rename into place.
 /// This prevents empty/corrupt files if the process is killed mid-write.
@@ -64,6 +73,7 @@ impl LocalStore {
     const INDEX_DIR: &'static str = "index";
     const MANIFEST_FILE: &'static str = "manifest.json";
     const STORE_DOC_FILE: &'static str = "store.yrs";
+    const SYNC_CONFIG_FILE: &'static str = "sync.json";
     /// The only supported store format version.
     const STORE_MANIFEST_VERSION: u32 = 3;
 
@@ -112,6 +122,92 @@ impl LocalStore {
 
         info!("Created local store '{}' at {:?}", name, store.path);
         Ok(store)
+    }
+
+    /// Create a local replica of a store held by a remote server
+    /// (docs/SYNC_CONTRACT.md decision 8): same directory layout as
+    /// [`LocalStore::create`], but with the given `id`/`root_node_id`
+    /// (matching the remote's) and an **empty** store document
+    /// (`StoreDocument::load(&[])`) rather than one with its own freshly
+    /// generated root. The first reconcile with the remote populates it.
+    ///
+    /// `StoreDocument::new` must never run for a replica: two independently
+    /// created roots for the same store id would merge into duplicated
+    /// children once the replica's tree and the remote's are reconciled.
+    pub async fn create_replica(
+        path: impl AsRef<Path>,
+        id: StoreId,
+        name: impl Into<String>,
+        root_node_id: NodeId,
+    ) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let name = name.into();
+
+        if path.exists() {
+            return Err(StoreError::StoreExists(path.display().to_string()));
+        }
+
+        fs::create_dir_all(&path).await?;
+        fs::create_dir(path.join(Self::NODES_DIR)).await?;
+        fs::create_dir(path.join(Self::ASSETS_DIR)).await?;
+        fs::create_dir(path.join(Self::INDEX_DIR)).await?;
+
+        let now = chrono::Utc::now();
+        let manifest = StoreManifest {
+            version: Self::STORE_MANIFEST_VERSION,
+            id,
+            name: name.clone(),
+            root_node_id,
+            created_at: now,
+            modified_at: now,
+        };
+
+        let manifest_json = serde_json::to_string_pretty(&manifest)?;
+        fs::write(path.join(Self::MANIFEST_FILE), manifest_json).await?;
+
+        let store_doc = StoreDocument::load(&[]).map_err(StoreError::from)?;
+
+        let mut store = Self {
+            id: manifest.id,
+            path,
+            manifest,
+            store_doc,
+            store_doc_dirty: true,
+            content_docs: HashMap::new(),
+            dirty_content: std::collections::HashSet::new(),
+        };
+
+        store.flush().await?;
+
+        info!("Created replica store '{}' ({}) at {:?}", name, id, store.path);
+        Ok(store)
+    }
+
+    /// Read `<store>/sync.json`, if present.
+    pub async fn read_sync_config(&self) -> Result<Option<SyncConfig>> {
+        let path = self.path.join(Self::SYNC_CONFIG_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let json = fs::read_to_string(&path).await?;
+        let config: SyncConfig = serde_json::from_str(&json)?;
+        Ok(Some(config))
+    }
+
+    /// Write `<store>/sync.json`, replacing any existing content.
+    pub async fn write_sync_config(&self, config: &SyncConfig) -> Result<()> {
+        let json = serde_json::to_string_pretty(config)?;
+        atomic_write(&self.path.join(Self::SYNC_CONFIG_FILE), json).await?;
+        Ok(())
+    }
+
+    /// Delete `<store>/sync.json` if present (unlinking the store).
+    pub async fn clear_sync_config(&self) -> Result<()> {
+        let path = self.path.join(Self::SYNC_CONFIG_FILE);
+        if path.exists() {
+            fs::remove_file(&path).await?;
+        }
+        Ok(())
     }
 
     /// Open an existing local store. Only the current format (manifest
@@ -192,9 +288,11 @@ impl LocalStore {
     /// Merge a peer's yrs update (delta, reconciliation diff, or whole
     /// snapshot) into the store document, mark it dirty, and re-validate the
     /// tree (concurrent moves can leave duplicates or stray entries; issues
-    /// are logged, not repaired here).
-    pub fn apply_store_doc_update(&mut self, update: &[u8]) -> Result<()> {
-        self.store_doc.apply_update(update).map_err(StoreError::from)?;
+    /// are logged, not repaired here). Returns the ids of the node entries
+    /// the update touched (created, deleted, or modified), for the caller to
+    /// feed a search index (docs/SYNC_CONTRACT.md decision 9).
+    pub fn apply_store_doc_update(&mut self, update: &[u8]) -> Result<Vec<NodeId>> {
+        let touched = self.store_doc.apply_update(update).map_err(StoreError::from)?;
         self.store_doc_dirty = true;
         match self.store_doc.validate_tree() {
             Ok(issues) => {
@@ -204,7 +302,7 @@ impl LocalStore {
             }
             Err(e) => tracing::warn!("Failed to validate tree after applying store update: {}", e),
         }
-        Ok(())
+        Ok(touched)
     }
 
     /// Assemble a Node from store document metadata + content bytes

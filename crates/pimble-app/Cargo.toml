@@ -30,6 +30,7 @@ base64 = { workspace = true }
 pimble-server = { workspace = true }
 pimble-store = { workspace = true }
 chrono = { workspace = true }
+url = { workspace = true }
 dirs = "6"
 rand = "0.9"
 

@@ -11,7 +11,7 @@ use tracing::info;
 const MAX_MOUNT_DEPTH: usize = 16;
 
 use crate::error::{Result, StoreError};
-use crate::local::LocalStore;
+use crate::local::{LocalStore, SyncConfig};
 use crate::registry::{StoreEndpoint, StoreRegistry};
 
 /// Manages multiple open stores
@@ -45,6 +45,35 @@ impl StoreManager {
     pub async fn create_local_store(&mut self, path: impl AsRef<Path>, name: impl Into<String>) -> Result<StoreId> {
         let path = path.as_ref();
         let store = LocalStore::create(path, name).await?;
+        let id = store.id;
+        self.registry.register(id, StoreEndpoint::Local { path: path.to_path_buf() });
+        self.local_stores.insert(id, store);
+        self.newly_opened.push(id);
+        Ok(id)
+    }
+
+    /// Create a local replica of a store held by a remote server, from
+    /// nothing (docs/SYNC_CONTRACT.md decision 8): same `id` and
+    /// `root_node_id` as the remote, an empty store document.
+    pub async fn create_replica(
+        &mut self,
+        path: impl AsRef<Path>,
+        id: StoreId,
+        name: impl Into<String>,
+        root_node_id: NodeId,
+    ) -> Result<StoreId> {
+        let path = path.as_ref();
+        // Inserting a second `LocalStore` under an open id would replace the
+        // open one in `local_stores` (dropping its unflushed state), so a
+        // replica of a store this server already holds is refused here, not
+        // only at the RPC boundary.
+        if let Some(open) = self.local_stores.get(&id) {
+            return Err(StoreError::InvalidOperation(format!(
+                "store {} is already open locally at {}; link it with setStoreSync instead of adding a replica",
+                id, open.path.display()
+            )));
+        }
+        let store = LocalStore::create_replica(path, id, name, root_node_id).await?;
         let id = store.id;
         self.registry.register(id, StoreEndpoint::Local { path: path.to_path_buf() });
         self.local_stores.insert(id, store);
@@ -228,11 +257,34 @@ impl StoreManager {
         store.store_doc_diff_since(state_vector)
     }
 
-    /// Merge a peer's yrs update into a store's store document.
-    pub fn apply_store_doc_update(&mut self, store_id: StoreId, update: &[u8]) -> Result<()> {
+    /// Merge a peer's yrs update into a store's store document. Returns the
+    /// ids of the node entries it touched (see
+    /// `LocalStore::apply_store_doc_update`).
+    pub fn apply_store_doc_update(&mut self, store_id: StoreId, update: &[u8]) -> Result<Vec<NodeId>> {
         let store = self.local_stores.get_mut(&store_id)
             .ok_or(StoreError::NotOpen(store_id))?;
         store.apply_store_doc_update(update)
+    }
+
+    /// Read a store's replica sync link (`<store>/sync.json`), if any.
+    pub async fn read_sync_config(&self, store_id: StoreId) -> Result<Option<SyncConfig>> {
+        let store = self.local_stores.get(&store_id)
+            .ok_or(StoreError::NotOpen(store_id))?;
+        store.read_sync_config().await
+    }
+
+    /// Write a store's replica sync link, replacing any existing one.
+    pub async fn write_sync_config(&self, store_id: StoreId, config: &SyncConfig) -> Result<()> {
+        let store = self.local_stores.get(&store_id)
+            .ok_or(StoreError::NotOpen(store_id))?;
+        store.write_sync_config(config).await
+    }
+
+    /// Delete a store's replica sync link, if any (unlinking it).
+    pub async fn clear_sync_config(&self, store_id: StoreId) -> Result<()> {
+        let store = self.local_stores.get(&store_id)
+            .ok_or(StoreError::NotOpen(store_id))?;
+        store.clear_sync_config().await
     }
 
     /// Get children of a node, and the id of the store they canonically live
@@ -451,5 +503,39 @@ impl StoreManager {
 impl Default for StoreManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reproduces the bug an app-level `addRemoteStore` self-reference
+    /// exposed: `create_replica` for an id that's already open would
+    /// `HashMap::insert` over the open `LocalStore`, silently dropping its
+    /// in-memory tree (any unflushed edits with it) and leaving the store id
+    /// pointing at a fresh, empty replica. Refused here, not only at the RPC
+    /// boundary, since this is `StoreManager`'s own invariant to keep.
+    #[tokio::test]
+    async fn create_replica_refuses_an_id_that_is_already_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = StoreManager::new();
+        let store_id = manager.create_local_store(dir.path().join("existing.pimble"), "Existing").await.unwrap();
+        let root_id = manager.root_node_id(store_id).unwrap();
+
+        let replica_dir = tempfile::tempdir().unwrap();
+        let err = manager
+            .create_replica(replica_dir.path().join("replica.pimble"), store_id, "Existing", root_id)
+            .await
+            .expect_err("create_replica should refuse an id that's already open");
+        assert!(
+            matches!(err, StoreError::InvalidOperation(_)),
+            "expected InvalidOperation, got {:?}", err
+        );
+
+        // The original store must be untouched: still open, same root.
+        assert!(manager.is_open(store_id));
+        assert_eq!(manager.root_node_id(store_id).unwrap(), root_id);
+        assert!(!replica_dir.path().join("replica.pimble").exists(), "no replica directory should have been created");
     }
 }

@@ -37,6 +37,13 @@ fn register_opened_store(store: AppStore, tree_state: UseTreeReturn, opened_stor
     // Subscribe to store changes for real-time updates
     store.send(BackendCommand::SubscribeStoreChanges { store_id });
 
+    // Sync status (docs/SYNC_CONTRACT.md "B: app side"): a placeholder
+    // unlinked/offline entry exists immediately so the store row's badge
+    // signal is always available by the time the tree renders it;
+    // `GetStoreSync`'s answer (`StoreSyncChanged`) fills in the real state.
+    store.ensure_sync_entry(store_id);
+    store.send(BackendCommand::GetStoreSync { store_id });
+
     // Auto-expand the store node in the tree
     tree_state.controller.expand(&format!("store_{}", store_id));
 
@@ -61,6 +68,22 @@ fn refetch_loaded_children(store: AppStore, changed_store: StoreId) {
         if mount_store != changed_store && store.has_children_loaded(mount_store, mount_node) {
             store.send(BackendCommand::GetChildren { store_id: mount_store, node_id: mount_node });
         }
+    }
+}
+
+/// After a transition to `Synced`, refetch the root's children if none are
+/// loaded yet — a freshly added remote store's document starts empty and only
+/// gains a root once the first reconcile lands (docs/SYNC_CONTRACT.md "B: app
+/// side").
+fn refetch_root_if_empty(store: AppStore, store_id: StoreId) {
+    let Some(root_id) = store.root_node_id(store_id) else { return };
+    let children_missing = untracked(|| {
+        store.get_children_signal(store_id, root_id)
+            .map(|sig| sig.with(|c| c.is_empty()))
+            .unwrap_or(true)
+    });
+    if children_missing {
+        store.send(BackendCommand::GetChildren { store_id, node_id: root_id });
     }
 }
 
@@ -113,8 +136,21 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
 
             BackendEvent::Error { message } => {
                 tracing::error!("Backend error: {}", message);
-                store.connection.set(ConnectionState::Error(message.clone()));
-                store.connection_status.set(format!("Error: {}", message));
+                // A pending sync-modal request claims this error for its own
+                // error line instead of the global status bar — the wire
+                // protocol has no per-request tag, but only one such request
+                // is ever in flight at a time from these modals.
+                if untracked(|| store.connect_modal_pending_add.get()) {
+                    store.connect_modal_pending_add.set(false);
+                    store.connect_modal_busy.set(false);
+                    store.connect_modal_error.set(message.clone());
+                } else if untracked(|| store.link_modal_pending.get()) {
+                    store.link_modal_pending.set(false);
+                    store.link_modal_error.set(message.clone());
+                } else {
+                    store.connection.set(ConnectionState::Error(message.clone()));
+                    store.connection_status.set(format!("Error: {}", message));
+                }
             }
 
             BackendEvent::StoreOpened { store: opened_store } => {
@@ -123,6 +159,16 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 let root_id = opened_store.root_node_id;
 
                 register_opened_store(store, tree_state, opened_store);
+
+                // An `AddRemoteStore` request just answered successfully —
+                // close the connect modal (contract: "the modal closes on
+                // success").
+                if untracked(|| store.connect_modal_pending_add.get()) {
+                    store.connect_modal_pending_add.set(false);
+                    store.connect_modal_busy.set(false);
+                    store.connect_modal_open.set(false);
+                    store.connect_modal_error.set(String::new());
+                }
 
                 // Check if this store was opened as part of a pending mount
                 if let Some(pending) = store.pending_mount.get() {
@@ -471,8 +517,13 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         refetch_loaded_children(store, *store_id);
                     }
                     StoreChangeKind::SyncStateChanged { state } => {
-                        // Placeholder: the sync UI (docs/SYNC_CONTRACT.md) tracks this.
                         tracing::info!("Sync state of {:?}: {:?}", store_id, state);
+                        // Carries only the state — keep whatever remote endpoint
+                        // is already known (decision 6, docs/SYNC_CONTRACT.md).
+                        store.update_sync_state(*store_id, state.clone());
+                        if matches!(state, pimble_core::SyncState::Synced { .. }) {
+                            refetch_root_if_empty(store, *store_id);
+                        }
                     }
                 }
             }
@@ -495,6 +546,56 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
 
             BackendEvent::IndexRebuilt { store_id, indexed } => {
                 tracing::info!("Search index rebuilt for store {:?}: {} node(s) indexed", store_id, indexed);
+            }
+
+            BackendEvent::RemoteStoresListed { url, result } => {
+                // Guard against a stale answer landing after the modal's URL
+                // changed and "List stores" was clicked again.
+                if untracked(|| store.connect_modal_url.get()) != *url {
+                    continue;
+                }
+                store.connect_modal_busy.set(false);
+                match result {
+                    Ok(stores) => {
+                        store.connect_modal_stores.set(stores.clone());
+                        store.connect_modal_selected.set(
+                            stores.first().map(|s| s.id.to_string()).unwrap_or_default()
+                        );
+                        store.connect_modal_error.set(String::new());
+                    }
+                    Err(message) => {
+                        store.connect_modal_stores.set(Vec::new());
+                        store.connect_modal_selected.set(String::new());
+                        store.connect_modal_error.set(message.clone());
+                    }
+                }
+            }
+
+            BackendEvent::StoreSyncChanged { store_id, remote, state } => {
+                tracing::info!("Sync state for store {:?}: {:?}", store_id, state);
+                let was_linked = store.is_linked(*store_id);
+                store.set_sync(*store_id, remote.clone(), state.clone());
+                let now_linked = remote.is_some();
+                if was_linked != now_linked {
+                    // The "Link to Remote..."/"Unlink from Remote" disabled
+                    // state flipped — rebuild the tree so the store row's
+                    // context menu re-renders with it (rinch #714: menu items
+                    // must not sit inside a reactive block).
+                    store.bump_tree_structure();
+                }
+
+                // A "Link to Remote..." modal request just answered.
+                if untracked(|| store.link_modal_pending.get())
+                    && untracked(|| store.link_modal_store.get()) == Some(*store_id)
+                {
+                    store.link_modal_pending.set(false);
+                    store.link_modal_store.set(None);
+                    store.link_modal_error.set(String::new());
+                }
+
+                if matches!(state, pimble_core::SyncState::Synced { .. }) {
+                    refetch_root_if_empty(store, *store_id);
+                }
             }
         }
     }

@@ -111,6 +111,9 @@ pub enum SyncState {
 }
 ```
 
+`SyncState` reflects a store's replica sync link (see "Replica sync" below): `Offline` for a
+store with no link. `Conflict` is modeled but unused — a yrs merge never produces one.
+
 The `StoreManager` currently handles only `LocalStore` instances. It will be extended to support remote and mounted stores via the Mount Resolver (see below).
 
 ### 3. Workspace System (`pimble-core`)
@@ -579,13 +582,39 @@ pub struct AppState {
 5. UI: mount point rendering, connectivity indicators, mount creation UX
 6. Local-to-local mounts first, then remote mounts
 
-### Phase 5: Remote Sync
-1. WebSocket transport for RPC
-2. yrs sync protocol for per-node and per-store CRDT replication
-3. Partial sync — replicate only mounted subtrees, not whole stores
-4. Conflict resolution UI
-5. Authentication (API key, Bearer token, OAuth2 — already modeled in `AuthMethod`)
-6. Offline cache with staleness indicators
+### Replica sync ✅ COMPLETE (`docs/history/SYNC_CONTRACT.md`)
+
+A local store can be a **replica** of the same store (same `StoreId`) held by another Pimble
+server. The server relays and persists; it never owns the data, and offline is normal —
+both sides keep working and converge on reconnect with no conflicts, because everything is
+a yrs merge.
+
+- **One `SyncLink` per linked store**, owned by the server's `RpcHandler` (a `Clone`-able bag
+  of `Arc`s). A remote change enters through the handler's own `apply_edit`/
+  `apply_store_update` — the same entry points any client uses — with
+  `client_id = "sync-link:<uuid>"`, so persistence, local subscribers, and the search index
+  all follow automatically.
+- **Local changes are broadcast in-process** (`SubscriptionRegistry`'s
+  `tokio::sync::broadcast::Sender<LocalChange>`, published wherever a WebSocket sink would be
+  notified). A link subscribes to this to learn what to forward, and to the remote's own
+  `subscribeStoreChanges` to learn what to pull. Every `sync-link:`-sourced change is skipped
+  when forwarding outward, which is what prevents echo storms in a chain of linked servers.
+  `ContentUpdated` notifications carry the edit's delta bytes, so a store-level subscriber
+  gets content changes without subscribing per node.
+- **Reconcile** is `(diff, remote_sv) = remote.syncStoreDocument(local_sv)`; apply `diff`
+  locally if non-empty; push `local.diff_since(remote_sv)` back if non-empty — the same shape
+  for a node's content via `syncNodeContent`/`applyEdit`. A full reconcile does the store
+  document first, then every node id, so both sides agree on the node set before per-node
+  reconciles start.
+- **Lifecycle**: connect, full reconcile (`Syncing`), subscribe, process (`Synced { last_sync
+  }`); any error drops the connection and retries with backoff (1s doubling to 30s,
+  `Offline` meanwhile). The link is persisted as `<store>/sync.json`; `openStore` starts it,
+  `closeStore`/unlinking stops it.
+- **`addRemoteStore`** creates an empty replica (never `StoreDocument::new` — two independent
+  roots for the same id would merge into duplicated children) plus a link, and waits briefly
+  for the first reconcile before answering.
+- Out of scope: partial (subtree-only) replication, remote mounts, server-side auth
+  enforcement (the client sends the header; nothing checks it), TLS.
 
 ### Phase 6: Search & Indexing
 1. `pimble-search`: index and query engine (see `docs/RESTART_PLAN.md` §5)

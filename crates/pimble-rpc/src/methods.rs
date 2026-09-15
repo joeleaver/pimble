@@ -86,8 +86,8 @@ pub trait PimbleApi {
 
     /// Create a local replica of a store held by a remote Pimble server and
     /// link it. Answers once the first reconcile has finished (or timed out).
-    #[method(name = "cloneStore")]
-    async fn clone_store(&self, request: CloneStoreRequest) -> Result<OpenStoreResponse, ErrorObjectOwned>;
+    #[method(name = "addRemoteStore")]
+    async fn add_remote_store(&self, request: AddRemoteStoreRequest) -> Result<OpenStoreResponse, ErrorObjectOwned>;
 
     /// Link a local store to its twin on a remote server, or unlink it.
     #[method(name = "setStoreSync")]

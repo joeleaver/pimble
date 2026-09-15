@@ -1,13 +1,13 @@
 //! RPC client implementation
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use jsonrpsee::core::client::SubscriptionClientT;
-use jsonrpsee::ws_client::{WsClient, WsClientBuilder};
-use pimble_core::{Node, NodeId, RemoteEndpoint, Store, StoreId, SyncState, Workspace};
+use jsonrpsee::ws_client::{HeaderMap, HeaderValue, WsClient, WsClientBuilder};
+use pimble_core::{AuthMethod, Node, NodeId, RemoteEndpoint, Store, StoreId, SyncState, Workspace};
 use pimble_core::MountRef;
 use pimble_rpc::{
-    ApplyEditRequest, ApplyStoreUpdateRequest, CloneStoreRequest, CloseStoreRequest, CreateMountRequest,
+    AddRemoteStoreRequest, ApplyEditRequest, ApplyStoreUpdateRequest, CloseStoreRequest, CreateMountRequest,
     CreateNodeRequest, CreateStoreRequest, CreateWorkspaceRequest, DeleteNodeRequest,
     EditOperation, GetChildrenRequest, GetMountStateRequest, GetNodeRequest, GetNodesRequest, GetStoreSyncRequest, SetStoreSyncRequest,
     LoadWorkspaceRequest, MoveNodeRequest, NodeContentChangedNotification, OpenStoreRequest,
@@ -29,11 +29,25 @@ pub struct PimbleClient {
 }
 
 impl PimbleClient {
-    /// Connect to a Pimble server via WebSocket.
+    /// Connect to a Pimble server via WebSocket, sending no authentication.
+    /// Equivalent to `connect_with_auth(url, &AuthMethod::None)`.
     ///
     /// Accepts HTTP URLs (http://, https://) and automatically converts them
     /// to WebSocket URLs (ws://, wss://).
     pub async fn connect(url: impl AsRef<str>) -> Result<Self> {
+        Self::connect_with_auth(url, &AuthMethod::None).await
+    }
+
+    /// Connect to a Pimble server via WebSocket, authenticating the
+    /// handshake per `auth` (docs/SYNC_CONTRACT.md decision 10):
+    /// `Bearer { token }` sends `Authorization: Bearer <token>`, `ApiKey
+    /// { key }` sends `X-Api-Key: <key>`, `None` sends nothing. `OAuth2` is
+    /// not supported here and is an error. The server checks nothing yet;
+    /// this only plumbs the header through.
+    ///
+    /// Accepts HTTP URLs (http://, https://) and automatically converts them
+    /// to WebSocket URLs (ws://, wss://).
+    pub async fn connect_with_auth(url: impl AsRef<str>, auth: &AuthMethod) -> Result<Self> {
         let base_url: Url = url
             .as_ref()
             .parse()
@@ -55,7 +69,31 @@ impl PimbleClient {
             other => return Err(ClientError::Connection(format!("Unsupported scheme: {}", other))),
         };
 
-        let client = WsClientBuilder::default()
+        let mut builder = WsClientBuilder::default();
+        match auth {
+            AuthMethod::None => {}
+            AuthMethod::Bearer { token } => {
+                let mut headers = HeaderMap::new();
+                let value = HeaderValue::from_str(&format!("Bearer {}", token))
+                    .map_err(|e| ClientError::Connection(format!("Invalid bearer token: {}", e)))?;
+                headers.insert("authorization", value);
+                builder = builder.set_headers(headers);
+            }
+            AuthMethod::ApiKey { key } => {
+                let mut headers = HeaderMap::new();
+                let value = HeaderValue::from_str(key)
+                    .map_err(|e| ClientError::Connection(format!("Invalid API key: {}", e)))?;
+                headers.insert("x-api-key", value);
+                builder = builder.set_headers(headers);
+            }
+            AuthMethod::OAuth2 { .. } => {
+                return Err(ClientError::Connection(
+                    "OAuth2 auth is not supported by connect_with_auth".into(),
+                ));
+            }
+        }
+
+        let client = builder
             .build(&ws_url)
             .await
             .map_err(|e| ClientError::Connection(e.to_string()))?;
@@ -330,22 +368,24 @@ impl PimbleClient {
     // Replica Sync Operations (docs/SYNC_CONTRACT.md)
     // ========================================================================
 
-    /// Create a local replica of `remote_store_id` as held by `remote`, at
-    /// `path`, linked to it. Returns the opened store.
-    pub async fn clone_store(
+    /// Create a local replica of `remote_store_id` as held by `remote`,
+    /// linked to it. Returns the opened store. `path: None` lets the server
+    /// choose the replica's location (`<data dir>/pimble/replicas/<store
+    /// id>.pimble`); `Some` places it there instead (refused if it exists).
+    pub async fn add_remote_store(
         &self,
         remote: RemoteEndpoint,
         remote_store_id: StoreId,
-        path: impl AsRef<Path>,
+        path: Option<PathBuf>,
     ) -> Result<Store> {
-        let request = CloneStoreRequest {
+        let request = AddRemoteStoreRequest {
             remote,
             remote_store_id,
-            path: path.as_ref().to_path_buf(),
+            path,
         };
         let response = self
             .client
-            .clone_store(request)
+            .add_remote_store(request)
             .await
             .map_err(|e| ClientError::Rpc(e.to_string()))?;
         Ok(response.store)

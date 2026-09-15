@@ -39,8 +39,8 @@ re-import from Scrivener.
 | `pimble-rpc` / `pimble-server` / `pimble-client` | RPC protocol, embedded server, WebSocket client | Complete |
 | `pimble-search` | rhypedb index per store: keyword (`@fulltext`, BM25), chunked embeddings behind `semantic`, backlinks | Complete |
 | `pimble-plugins` | `NodePlugin` trait, built-ins | Skeleton |
-| `pimble-app` | rinch desktop app | Works: two-window live editing, persistence, local mounts |
-| `pimble-cli` | server / create-store / list-stores | Complete |
+| `pimble-app` | rinch desktop app | Works: two-window live editing, persistence, local mounts, replica sync UI |
+| `pimble-cli` | server, stores, nodes, mounts, replica sync, search | Complete |
 | `pimble-import` | Scrivener + RTF import | Complete |
 
 Node content is a yrs document (`pimble_crdt::ContentDoc`), stored as `nodes/{id}.yrs`.
@@ -85,6 +85,27 @@ id and adds it to the open-store list. Cycles are rejected at `createMount`. Cre
 child of a mount node is an error; the app creates under the source instead. Remote
 sources, `MountState::Cached` and `Connecting` are not implemented. Contract:
 `docs/history/MOUNTS_CONTRACT.md`.
+
+### Replica sync (local ↔ remote server, done 2026-09-15)
+
+A local store can be a replica of the same store (same `StoreId`) on another Pimble
+server. One `SyncLink` per linked store lives in the local server
+(`pimble-server/src/sync_link.rs`), persisted as `<store>/sync.json` and restarted by
+`openStore`. It reconciles with the stateless primitives (`syncStoreDocument` /
+`syncNodeContent`: state vector in, diff out; then push the local diff back) and then
+shuttles live updates both ways: remote `storeChanged` notifications carry the yrs bytes
+(`TreeStructure` from `applyStoreUpdate`, `ContentUpdated` from `applyEdit`) and are
+applied through the handler's own `apply_edit`/`apply_store_update` with
+`client_id = "sync-link:<uuid>"`; local notifications reach the link through an in-process
+broadcast and are forwarded unless their source is any `sync-link:` id (that rule is what
+stops echo storms across chains of servers). `addRemoteStore` creates an empty replica
+(never `StoreDocument::new`: two roots for one id would merge into duplicated children) in
+`<data dir>/pimble/replicas/<store id>.pimble` and links it; `setStoreSync` links or
+unlinks an existing store. A store already open on this server is refused as a replica, and
+a store cannot be linked to the server it lives on. Auth headers are sent, never checked.
+Remote mounts, partial replication and TLS are not done. Contract:
+`docs/history/SYNC_CONTRACT.md`; CLI: `server --addr --open`, `add-remote-store`,
+`link-store`, `unlink-store`, `sync-state`, `remote-stores`, `PIMBLE_SERVER`.
 
 ### Collaboration shape (keep these invariants)
 

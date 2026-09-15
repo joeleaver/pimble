@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use pimble_client::PimbleClient;
-use pimble_core::{MountRef, MountState, Node, NodeId, Store, StoreId};
+use pimble_core::{AuthMethod, MountRef, MountState, Node, NodeId, RemoteEndpoint, Store, StoreId, SyncState};
 use pimble_server::PimbleServer;
 use rand::Rng;
 use tokio::runtime::Runtime;
@@ -65,6 +65,19 @@ pub enum BackendCommand {
     // Search
     Search { query: String, stores: Vec<StoreId>, limit: usize },
     RebuildIndex { store_id: StoreId },
+
+    // Replica sync (docs/SYNC_CONTRACT.md "B: app side") — a temporary
+    // connection to a remote for browsing its open stores, distinct from any
+    // link a store may already have.
+    ListRemoteStores { url: String },
+    /// Create a local replica of `remote_store_id` from `remote`, linked to
+    /// it. No path: the server puts it in its own data directory.
+    /// `AuthMethod::None` until the app has a way to collect credentials.
+    AddRemoteStore { url: String, remote_store_id: StoreId },
+    /// Link a local store to a remote (`Some`) or unlink it (`None`).
+    SetStoreSync { store_id: StoreId, remote: Option<RemoteEndpoint> },
+    /// Ask for a store's current sync link and state.
+    GetStoreSync { store_id: StoreId },
 }
 
 /// Events sent from backend to UI
@@ -121,6 +134,16 @@ pub enum BackendEvent {
     /// touching the connection status bar or the reconnect-on-error path.
     SearchResults { results: Result<Vec<pimble_rpc::SearchResultItem>, String> },
     IndexRebuilt { store_id: StoreId, indexed: usize },
+
+    // Replica sync (docs/SYNC_CONTRACT.md "B: app side")
+    /// Answer to `ListRemoteStores`: the remote's open stores, or the error
+    /// connecting to / querying it (shown inline in the connect modal, never
+    /// folded into the generic `Error` event).
+    RemoteStoresListed { url: String, result: Result<Vec<Store>, String> },
+    /// A store's sync link and state changed: the answer to `SetStoreSync` or
+    /// `GetStoreSync`, or a live `SyncStateChanged` notification (which
+    /// carries only the state — the event handler keeps the known `remote`).
+    StoreSyncChanged { store_id: StoreId, remote: Option<RemoteEndpoint>, state: SyncState },
 }
 
 /// Handle to communicate with the backend
@@ -620,6 +643,55 @@ async fn process_command(
             };
             match c.rebuild_index(store_id).await {
                 Ok(indexed) => Some(BackendEvent::IndexRebuilt { store_id, indexed }),
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::ListRemoteStores { url } => {
+            // A temporary connection to the remote, distinct from `client`
+            // (our connection to the local embedded/shared server) and from
+            // any sync link a store may already have.
+            match PimbleClient::connect(&url).await {
+                Ok(remote_client) => match remote_client.list_stores().await {
+                    Ok(stores) => Some(BackendEvent::RemoteStoresListed { url, result: Ok(stores) }),
+                    Err(e) => Some(BackendEvent::RemoteStoresListed { url, result: Err(e.to_string()) }),
+                },
+                Err(e) => Some(BackendEvent::RemoteStoresListed { url, result: Err(e.to_string()) }),
+            }
+        }
+
+        BackendCommand::AddRemoteStore { url, remote_store_id } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            let remote_url: url::Url = match url.parse() {
+                Ok(u) => u,
+                Err(e) => return Some(BackendEvent::Error { message: format!("Invalid remote URL: {}", e) }),
+            };
+            let remote = RemoteEndpoint { url: remote_url, auth: AuthMethod::None };
+            // No path: the server puts the replica in its own data directory.
+            match c.add_remote_store(remote, remote_store_id, None).await {
+                Ok(store) => Some(BackendEvent::StoreOpened { store }),
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::SetStoreSync { store_id, remote } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            match c.set_store_sync(store_id, remote).await {
+                Ok((remote, state)) => Some(BackendEvent::StoreSyncChanged { store_id, remote, state }),
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::GetStoreSync { store_id } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            match c.get_store_sync(store_id).await {
+                Ok((remote, state)) => Some(BackendEvent::StoreSyncChanged { store_id, remote, state }),
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
         }

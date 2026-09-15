@@ -197,10 +197,13 @@ pub struct GetMountStateResponse {
 /// at `path`, linked to it. Answers with the opened store once the first
 /// reconcile has finished (or after a timeout, with the current state).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CloneStoreRequest {
+pub struct AddRemoteStoreRequest {
     pub remote: RemoteEndpoint,
     pub remote_store_id: StoreId,
-    pub path: PathBuf,
+    /// Where to create the replica. `None` lets the server choose:
+    /// `<data dir>/pimble/replicas/<store id>.pimble`.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
 }
 
 /// Link a local store to the same store on a remote server (`Some`) or

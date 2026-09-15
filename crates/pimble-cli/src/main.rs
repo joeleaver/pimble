@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use pimble_client::PimbleClient;
-use pimble_core::{NodeId, StoreId};
+use pimble_core::{AuthMethod, NodeId, RemoteEndpoint, StoreId};
 use pimble_crdt::ContentDoc;
 use tracing_subscriber::EnvFilter;
 
@@ -27,7 +27,17 @@ async fn main() -> Result<()> {
 
     match command.as_str() {
         "help" | "--help" | "-h" => print_help(),
-        "server" => run_server().await?,
+        "server" => {
+            let (addr, open_paths) = match parse_server_args(&args[2..]) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    eprintln!("Usage: pimble-cli server [--addr HOST:PORT] [--open PATH]...");
+                    return Ok(());
+                }
+            };
+            run_server(&addr, open_paths).await?;
+        }
         "create-store" => {
             if args.len() < 4 {
                 eprintln!("Usage: pimble-cli create-store <path> <name>");
@@ -113,6 +123,42 @@ async fn main() -> Result<()> {
             }
             list_children(&args[2], &args[3]).await?;
         }
+        "add-remote-store" => {
+            if args.len() < 4 {
+                eprintln!("Usage: pimble-cli add-remote-store <url> <remote-store-id> [path]");
+                return Ok(());
+            }
+            let path = args.get(4).map(PathBuf::from);
+            add_remote_store(&args[2], &args[3], path).await?;
+        }
+        "link-store" => {
+            if args.len() < 4 {
+                eprintln!("Usage: pimble-cli link-store <store-id> <url>");
+                return Ok(());
+            }
+            link_store(&args[2], &args[3]).await?;
+        }
+        "unlink-store" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pimble-cli unlink-store <store-id>");
+                return Ok(());
+            }
+            unlink_store(&args[2]).await?;
+        }
+        "sync-state" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pimble-cli sync-state <store-id>");
+                return Ok(());
+            }
+            sync_state(&args[2]).await?;
+        }
+        "remote-stores" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pimble-cli remote-stores <url>");
+                return Ok(());
+            }
+            remote_stores(&args[2]).await?;
+        }
         _ => {
             eprintln!("Unknown command: {}", command);
             print_help();
@@ -144,9 +190,19 @@ COMMANDS:
     create-mount        Mount a subtree from one store under a node in another
     mount-state         Show a mount point's resolution state
     list-children       List a node's children (resolves mounts)
+    add-remote-store    Create a local replica of a remote's store and link it
+    link-store          Link an existing local store to its twin on a remote
+    unlink-store        Unlink a store from its remote (stops the sync link)
+    sync-state          Show a store's replica sync link and its state
+    remote-stores       List the stores a remote Pimble server has open
+
+ENVIRONMENT:
+    PIMBLE_SERVER       Server URL for every command but `server` itself
+                        (default: http://127.0.0.1:7462)
 
 EXAMPLES:
     pimble-cli server
+    pimble-cli server --addr 0.0.0.0:7462 --open /srv/family.pimble
     pimble-cli create-store ./my-notes.pimble "My Notes"
     pimble-cli open-store ./my-notes.pimble
     pimble-cli list-stores
@@ -159,15 +215,148 @@ EXAMPLES:
     pimble-cli create-mount <store-id> <parent-id> <source-store-id> <source-node-id> "My Mount"
     pimble-cli mount-state <store-id> <node-id>
     pimble-cli list-children <store-id> <node-id>
+    pimble-cli add-remote-store http://127.0.0.1:7463 <remote-store-id>
+    pimble-cli link-store <store-id> http://127.0.0.1:7463
+    pimble-cli unlink-store <store-id>
+    pimble-cli sync-state <store-id>
+    pimble-cli remote-stores http://127.0.0.1:7463
 "#
     );
 }
 
-async fn run_server() -> Result<()> {
-    use pimble_server::{run_server, ServerConfig};
+/// Parse `server`'s own flags (`--addr HOST:PORT`, repeatable `--open PATH`)
+/// out of the args following the `server` word.
+fn parse_server_args(rest: &[String]) -> std::result::Result<(String, Vec<PathBuf>), String> {
+    let mut addr = "127.0.0.1:7462".to_string();
+    let mut open_paths = Vec::new();
 
-    println!("Starting Pimble server on 127.0.0.1:7462...");
-    run_server(ServerConfig::default()).await?;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--addr" => {
+                i += 1;
+                addr = rest.get(i).ok_or("--addr requires a value")?.clone();
+            }
+            "--open" => {
+                i += 1;
+                let path = rest.get(i).ok_or("--open requires a value")?;
+                open_paths.push(PathBuf::from(path));
+            }
+            other => return Err(format!("Unknown server option: {}", other)),
+        }
+        i += 1;
+    }
+
+    Ok((addr, open_paths))
+}
+
+/// Start the embedded Pimble server, bound to `addr`, opening every store in
+/// `open_paths` at start (so a headless replica host can run as
+/// `pimble-cli server --addr 0.0.0.0:7462 --open /srv/family.pimble`) —
+/// opened the same way any other client would, over a loopback connection to
+/// the server it just started.
+async fn run_server(addr: &str, open_paths: Vec<PathBuf>) -> Result<()> {
+    use pimble_server::{PimbleServer, ServerConfig};
+
+    let socket_addr: std::net::SocketAddr = addr.parse().with_context(|| format!("Invalid --addr {}", addr))?;
+    let mut server = PimbleServer::with_config(ServerConfig { addr: socket_addr });
+    server.start().await?;
+    let bound = server.addr();
+    println!("Pimble server listening on {}", bound);
+
+    if !open_paths.is_empty() {
+        let client = PimbleClient::connect(format!("http://{}", bound)).await?;
+        for path in &open_paths {
+            match client.open_store(path).await {
+                Ok(store) => println!("Opened store {} ({}) from {:?}", store.id, store.name, path),
+                Err(e) => eprintln!("Failed to open store at {:?}: {}", path, e),
+            }
+        }
+    }
+
+    // Wait for Ctrl+C
+    tokio::signal::ctrl_c().await?;
+    println!("Shutting down...");
+    server.stop().await?;
+
+    let manager = server.store_manager();
+    let mut manager = manager.write().await;
+    manager.flush_all().await?;
+
+    Ok(())
+}
+
+async fn add_remote_store(url: &str, remote_store_id: &str, path: Option<PathBuf>) -> Result<()> {
+    let remote_store_id = parse_store_id(remote_store_id)?;
+    let remote = RemoteEndpoint {
+        url: url.parse().with_context(|| format!("Invalid URL: {}", url))?,
+        auth: AuthMethod::None,
+    };
+
+    let client = connect().await?;
+    let store = client.add_remote_store(remote, remote_store_id, path).await?;
+    println!("Added remote store: {}", store.id);
+    println!("Name: {}", store.name);
+    println!("Root node: {}", store.root_node_id);
+    println!("Sync state: {:?}", store.sync_state);
+    Ok(())
+}
+
+async fn link_store(store_id: &str, url: &str) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let remote = RemoteEndpoint {
+        url: url.parse().with_context(|| format!("Invalid URL: {}", url))?,
+        auth: AuthMethod::None,
+    };
+
+    let client = connect().await?;
+    let (remote, state) = client.set_store_sync(store_id, Some(remote)).await?;
+    match remote {
+        Some(r) => println!("Store {} linked to {}", store_id, r.url),
+        None => println!("Store {} has no remote (unexpected after linking)", store_id),
+    }
+    println!("Sync state: {:?}", state);
+    Ok(())
+}
+
+async fn unlink_store(store_id: &str) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+
+    let client = connect().await?;
+    let (was_remote, state) = client.set_store_sync(store_id, None).await?;
+    match was_remote {
+        Some(r) => println!("Store {} unlinked (was {})", store_id, r.url),
+        None => println!("Store {} was already unlinked", store_id),
+    }
+    println!("Sync state: {:?}", state);
+    Ok(())
+}
+
+async fn sync_state(store_id: &str) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+
+    let client = connect().await?;
+    let (remote, state) = client.get_store_sync(store_id).await?;
+    match remote {
+        Some(r) => println!("Remote: {}", r.url),
+        None => println!("Remote: (none)"),
+    }
+    println!("State: {:?}", state);
+    Ok(())
+}
+
+async fn remote_stores(url: &str) -> Result<()> {
+    let client = PimbleClient::connect(url).await?;
+    let stores = client.list_stores().await?;
+
+    if stores.is_empty() {
+        println!("No stores open on {}", url);
+    } else {
+        println!("Stores open on {}:", url);
+        for store in stores {
+            println!("  {} - {}", store.id, store.name);
+        }
+    }
     Ok(())
 }
 

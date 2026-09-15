@@ -1,4 +1,12 @@
-# Sync contract: replicas of a store on two Pimble servers (dispatch-ready, 2026-09-15)
+# Sync contract: replicas of a store on two Pimble servers
+
+Status: done 2026-09-15 (commits after c7dee64 on master). Implemented as written, with
+these changes decided during the work: "clone" became "add remote store" (`addRemoteStore`)
+and the user never chooses the replica's location (`path: None` puts it in
+`<data dir>/pimble/replicas/<store id>.pimble`); review added two guards (a store already
+open on this server is refused as a replica, and a store cannot be linked to the server it
+lives on), made a lagged local-change broadcast force a reconnect, and made the initial
+index walk treat an empty replica as zero nodes instead of failing.
 
 Roadmap step 6, second item: remote sync. Vision (`docs/RESTART_PLAN.md` §1): stores can
 sit "behind a remote Pimble server"; "offline is the normal state; sync is opportunistic";
@@ -21,7 +29,7 @@ server. While the remote is reachable, edits made on either side appear on the o
 within a second and the search index on each side follows. While it is unreachable, both
 sides keep working; on reconnect they converge with no conflicts, because everything is a
 yrs merge. A replica survives restarts: the link is stored in the store directory and comes
-back when the store opens. Cloning a store from a remote creates a replica from nothing.
+back when the store opens. Adding a remote store creates a replica from nothing.
 
 Out of scope: partial (subtree-only) replication, remote mounts, server-side auth
 enforcement (the client sends the header; nothing checks it yet), conflict UI (there are
@@ -81,16 +89,18 @@ change an RPC type it says so in its report and the PM decides.
    connection and retry with backoff 1 s doubling to 30 s (`Offline` meanwhile). A
    `SyncStateChanged { state }` `storeChanged` notification goes to the store's local
    subscribers on every transition; `Store.sync_state` in `listStores`, `openStore` and
-   `cloneStore` responses reflects the link (`Offline` for an unlinked store too;
+   `addRemoteStore` responses reflects the link (`Offline` for an unlinked store too;
    `getStoreSync` tells them apart).
 7. **The link is persisted in the store.** `<store>/sync.json`:
    `{ "remote": { "url": "http://host:7462", "auth": { "method": "none" } } }`. `openStore`
    starts the link when the file exists; `setStoreSync` writes or deletes it and starts or
    stops the link; `closeStore` stops it.
-8. **A clone is an empty replica plus a link.** `cloneStore` asks the remote for the
+8. **Adding a remote store creates an empty replica plus a link.** `addRemoteStore` asks the remote for the
    store (`listStores` there, matched by id) and creates the local directory with the
    remote's id, name and root node id and an **empty** store document
-   (`LocalStore::create_replica`), writes `sync.json`, opens the store, starts the link,
+   (`LocalStore::create_replica`) at `path`, or when `path` is `None` at
+   `<dirs::data_local_dir()>/pimble/replicas/<store id>.pimble` (the user never chooses a
+   location; the CLI may), writes `sync.json`, opens the store, starts the link,
    and waits up to 10 s for the first full reconcile before answering (so the store comes
    back populated); on timeout it answers anyway with the current state. It refuses an
    existing path. `StoreDocument::new` must never run for a replica: two roots for the same
@@ -117,7 +127,7 @@ pub struct RemoteEndpoint { pub url: Url, pub auth: AuthMethod }
 `pimble-rpc` (namespace `pimble`):
 
 ```rust
-CloneStoreRequest   { remote: RemoteEndpoint, remote_store_id: StoreId, path: PathBuf }
+AddRemoteStoreRequest   { remote: RemoteEndpoint, remote_store_id: StoreId, path: Option<PathBuf> }  // None: server picks <data dir>/pimble/replicas/<store id>.pimble
 // -> OpenStoreResponse { store }
 SetStoreSyncRequest { store_id: StoreId, remote: Option<RemoteEndpoint> }   // None unlinks
 // -> GetStoreSyncResponse
@@ -126,7 +136,7 @@ GetStoreSyncResponse { remote: Option<RemoteEndpoint>, state: SyncState }
 StoreChangeKind::SyncStateChanged { state: SyncState }
 ```
 
-`PimbleClient`: `clone_store(remote, remote_store_id, path) -> Store`,
+`PimbleClient`: `add_remote_store(remote, remote_store_id, path: Option<PathBuf>) -> Store`,
 `set_store_sync(store_id, Option<RemoteEndpoint>) -> (Option<RemoteEndpoint>, SyncState)`,
 `get_store_sync(store_id) -> (Option<RemoteEndpoint>, SyncState)`.
 
@@ -149,7 +159,7 @@ StoreChangeKind::SyncStateChanged { state: SyncState }
   `tokio::sync::watch::Receiver<SyncState>` and `stop()`. `RpcHandler` keeps
   `links: Arc<RwLock<HashMap<StoreId, SyncLinkHandle>>>`.
 - The three stub RPCs become real (decisions 6 to 8). `openStore` starts a link from
-  `sync.json`; `closeStore` stops it; `listStores`/`openStore`/`cloneStore` fill
+  `sync.json`; `closeStore` stops it; `listStores`/`openStore`/`addRemoteStore` fill
   `Store.sync_state` from the link.
 - `SubscriptionRegistry` broadcast (decision 3); `ContentUpdated` carries bytes
   (decision 4); index follow-up on `applyStoreUpdate` (decision 9).
@@ -169,7 +179,7 @@ StoreChangeKind::SyncStateChanged { state: SyncState }
   so a headless replica host can run as `pimble-cli server --addr 0.0.0.0:7462 --open
   /srv/family.pimble`.
 - `PIMBLE_SERVER` env var (default `http://127.0.0.1:7462`) for every client command.
-- `clone-store <url> <remote-store-id> <path>`, `link-store <store-id> <url>`,
+- `add-remote-store <url> <remote-store-id> [path]`, `link-store <store-id> <url>`,
   `unlink-store <store-id>`, `sync-state <store-id>`, `remote-stores <url>` (lists the
   stores a remote has open). Update `print_help`.
 
@@ -179,7 +189,7 @@ Two real `PimbleServer`s on `127.0.0.1:0` in one process, driven through `Pimble
 Helper: `wait_until(timeout, || async { cond })` polling every 50 ms; never `sleep` a fixed
 long time and hope.
 
-1. Clone: B has a store with one document ("hello"); A clones it; A's store has the same
+1. Add remote store: B has a store with one document ("hello"); A adds it; A's store has the same
    id, root id, and a node with text "hello"; A's `getStoreSync` is `Synced`.
 2. Remote to local, live: `applyEdit` on B (a `ContentDoc` delta) appears in A's node text
    within 2 s; `createNode` on B appears in A's `getChildren`.
@@ -204,22 +214,24 @@ the link design (decisions 1 to 9) in a "Replica sync" section. Keep it short.
 
 - Backend commands and events: `ListRemoteStores { url }` -> `RemoteStoresListed { url,
   result: Result<Vec<Store>, String> }` (a temporary `PimbleClient::connect(url)`;
-  errors are reported, not logged away); `CloneStore { url, remote_store_id, path }` ->
+  errors are reported, not logged away); `AddRemoteStore { url, remote_store_id, path }` ->
   `StoreOpened` (or `Error`); `SetStoreSync { store_id, remote: Option<RemoteEndpoint> }`
   and `GetStoreSync { store_id }` -> `StoreSyncChanged { store_id, remote, state }`;
   `RemoteStoreChange` with `SyncStateChanged { state }` -> the same `StoreSyncChanged`
   update (keep the known `remote`).
 - State: `sync_data: Signal<HashMap<StoreId, Signal<(Option<RemoteEndpoint>, SyncState)>>>`.
   `register_opened_store` sends `GetStoreSync`. On a transition to `Synced` for a store
-  whose root children failed to load or are empty, refetch the root's children (a fresh
-  clone has no root until the first reconcile).
+  whose root children failed to load or are empty, refetch the root's children (a freshly
+  added store has no root until the first reconcile).
 - Store row: a small status badge after the name, only for linked stores: "offline",
   "syncing", "synced" (text is fine; an icon with those three states is better if
   cheap). Reactive per store, no tree rebuild.
-- File menu: "Connect to Remote Store..." opens a `Modal` with a URL `TextInput`
-  (default `http://`), a "List stores" `Button`, a `Select` of the remote's stores (name),
-  a "Clone..." `Button` that opens `pick_folder` for the parent directory and clones into
-  `<parent>/<store name>.pimble`, and an error line. The modal closes on success.
+- File menu: "Add Remote Store..." opens a `Modal` with a URL `TextInput` (default
+  `http://`), a "List stores" `Button`, a `Select` of the remote's stores (name), an
+  "Add" `Button` and an error line. No folder or path: the server puts the replica in
+  its data directory (`AddRemoteStoreRequest.path = None`). The modal closes on success
+  and the store appears in the tree like any opened store. Nothing in the flow opens a
+  native OS dialog, so the rinch debug tools can drive it end to end.
 - Store root context menu: "Link to Remote..." (a `Modal` with a URL field; sends
   `SetStoreSync` with that endpoint; the server refuses if the remote has no store with
   this id and the error shows in the modal) and, when linked, "Unlink from Remote"
@@ -234,10 +246,10 @@ the link design (decisions 1 to 9) in a "Replica sync" section. Keep it short.
 1. `cargo check --workspace --all-targets`: zero warnings. `cargo test --workspace
    --release --no-fail-fast`: all pass except the known search flake.
 2. Headless: `pimble-cli server --addr 127.0.0.1:7463 --open /tmp/b.pimble` as the
-   remote; the app on 7462 clones from it; `set-node-text` against 7463 shows in the app;
+   remote; the app on 7462 adds it as a remote store; `set-node-text` against 7463 shows in the app;
    typing in the app shows in `show-node` against 7463; kill 7463, type, restart 7463,
    converge; restart the app, the badge comes back "synced".
-3. GUI: the connect modal lists the remote's stores and clones; the store badge shows the
+3. GUI: the connect modal lists the remote's stores and adds one; the store badge shows the
    three states; "Unlink from Remote" and "Link to Remote..." round-trip.
 
 ## Working agreements (unchanged)

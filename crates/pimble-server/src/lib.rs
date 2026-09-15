@@ -8,7 +8,9 @@
 pub mod error;
 pub mod handler;
 pub mod server;
+pub mod sync_link;
 
 pub use error::*;
 pub use handler::*;
 pub use server::*;
+pub use sync_link::*;

@@ -5,14 +5,16 @@
 //! - Node metadata (title, type, tags, custom fields, timestamps)
 //! - Node existence (create/delete)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use pimble_core::NodeId;
+use yrs::types::{Event, PathSegment};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{
-    Array, ArrayPrelim, ArrayRef, Doc, Map, MapPrelim, MapRef, OffsetKind, Options, Out, ReadTxn,
-    StateVector, Transact, TransactionMut, Update,
+    Array, ArrayPrelim, ArrayRef, DeepObservable, Doc, Map, MapPrelim, MapRef, OffsetKind,
+    Options, Out, ReadTxn, StateVector, Transact, TransactionMut, Update,
 };
 
 use crate::error::{CrdtError, Result};
@@ -148,13 +150,57 @@ impl StoreDocument {
     }
 
     /// Merge a peer's v1 update — a broadcast delta, a reconciliation diff, or a whole
-    /// snapshot — into this document.
-    pub fn apply_update(&mut self, update: &[u8]) -> Result<()> {
+    /// snapshot — into this document. Returns the ids of every node entry the update
+    /// touched (created, deleted, or modified — metadata, tags, custom fields, tree
+    /// position, or children order), so a caller can feed them to a search index
+    /// without having to diff the tree itself (docs/SYNC_CONTRACT.md decision 9).
+    ///
+    /// Implemented with a scoped `observe_deep` on the `nodes` map: since paths from
+    /// `observe_deep` are relative to the observed type, an event whose path is empty
+    /// fired directly on `nodes` (a node entry created or removed — that node's own
+    /// map key is read from the event's own key changes) and an event with a non-empty
+    /// path fired on something nested inside one node's own map (its first segment is
+    /// that node's id, e.g. a title/tag/custom edit or a children-array change from a
+    /// move). The subscription is dropped again before returning, so it only observes
+    /// this one update.
+    pub fn apply_update(&mut self, update: &[u8]) -> Result<Vec<NodeId>> {
         let update = Update::decode_v1(update).map_err(|e| CrdtError::Yrs(e.to_string()))?;
+
+        let touched: Arc<Mutex<HashSet<NodeId>>> = Arc::new(Mutex::new(HashSet::new()));
+        let touched_in_closure = Arc::clone(&touched);
+        let subscription = self.nodes().observe_deep(move |txn, events| {
+            for event in events.iter() {
+                let path = event.path();
+                match path.front() {
+                    Some(PathSegment::Key(key)) => {
+                        if let Ok(node_id) = NodeId::parse(key) {
+                            touched_in_closure.lock().unwrap().insert(node_id);
+                        }
+                    }
+                    Some(PathSegment::Index(_)) | None => {
+                        // An empty path means the event fired on the observed
+                        // `nodes` map itself: a whole node entry was added or
+                        // removed. Its own key changes are the touched ids.
+                        if let Event::Map(map_event) = event {
+                            for key in map_event.keys(txn).keys() {
+                                if let Ok(node_id) = NodeId::parse(key) {
+                                    touched_in_closure.lock().unwrap().insert(node_id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         self.doc
             .transact_mut()
             .apply_update(update)
-            .map_err(|e| CrdtError::Yrs(e.to_string()))
+            .map_err(|e| CrdtError::Yrs(e.to_string()))?;
+
+        drop(subscription);
+        let touched_ids: Vec<NodeId> = touched.lock().unwrap().iter().copied().collect();
+        Ok(touched_ids)
     }
 
     /// Get the root node ID.
@@ -762,5 +808,85 @@ mod tests {
 
         assert!(a.validate_tree().unwrap().is_empty());
         assert!(b.validate_tree().unwrap().is_empty());
+    }
+
+    #[test]
+    fn apply_update_returns_the_id_of_a_created_node() {
+        let root_id = NodeId::new();
+        let a = StoreDocument::new("Store", root_id).unwrap();
+        let mut b = StoreDocument::load(&a.save()).unwrap();
+        let mut a = a;
+
+        let b_sv = b.state_vector();
+        let new_id = NodeId::new();
+        a.add_node(new_id, Some(root_id), "document", "New").unwrap();
+        let diff = a.diff_since(&b_sv).unwrap();
+
+        // The new node itself, plus the root whose children array gained an entry.
+        let touched: HashSet<_> = b.apply_update(&diff).unwrap().into_iter().collect();
+        assert_eq!(touched, HashSet::from([new_id, root_id]));
+    }
+
+    #[test]
+    fn apply_update_returns_the_id_of_a_node_whose_title_changed() {
+        let root_id = NodeId::new();
+        let a = StoreDocument::new("Store", root_id).unwrap();
+        let mut b = StoreDocument::load(&a.save()).unwrap();
+        let mut a = a;
+
+        let child = NodeId::new();
+        a.add_node(child, Some(root_id), "document", "Doc").unwrap();
+        b.apply_update(&a.diff_since(&b.state_vector()).unwrap()).unwrap();
+
+        let b_sv = b.state_vector();
+        a.set_title(child, "Renamed").unwrap();
+        let diff = a.diff_since(&b_sv).unwrap();
+
+        let touched = b.apply_update(&diff).unwrap();
+        assert_eq!(touched, vec![child]);
+    }
+
+    #[test]
+    fn apply_update_returns_ids_of_a_moved_node_and_both_parents() {
+        let root_id = NodeId::new();
+        let a = StoreDocument::new("Store", root_id).unwrap();
+        let mut b = StoreDocument::load(&a.save()).unwrap();
+        let mut a = a;
+
+        let folder_a = NodeId::new();
+        let folder_b = NodeId::new();
+        let child = NodeId::new();
+        a.add_node(folder_a, Some(root_id), "folder", "A").unwrap();
+        a.add_node(folder_b, Some(root_id), "folder", "B").unwrap();
+        a.add_node(child, Some(folder_a), "document", "Doc").unwrap();
+        b.apply_update(&a.diff_since(&b.state_vector()).unwrap()).unwrap();
+
+        let b_sv = b.state_vector();
+        a.move_node(child, folder_b, None).unwrap();
+        let diff = a.diff_since(&b_sv).unwrap();
+
+        let touched: HashSet<_> = b.apply_update(&diff).unwrap().into_iter().collect();
+        // The moved node itself (new parent_id) plus both parents' children arrays.
+        assert_eq!(touched, HashSet::from([child, folder_a, folder_b]));
+    }
+
+    #[test]
+    fn apply_update_returns_the_id_of_a_removed_node() {
+        let root_id = NodeId::new();
+        let a = StoreDocument::new("Store", root_id).unwrap();
+        let mut b = StoreDocument::load(&a.save()).unwrap();
+        let mut a = a;
+
+        let child = NodeId::new();
+        a.add_node(child, Some(root_id), "document", "Doc").unwrap();
+        b.apply_update(&a.diff_since(&b.state_vector()).unwrap()).unwrap();
+
+        let b_sv = b.state_vector();
+        a.remove_node(child).unwrap();
+        let diff = a.diff_since(&b_sv).unwrap();
+
+        let touched: HashSet<_> = b.apply_update(&diff).unwrap().into_iter().collect();
+        assert!(touched.contains(&child), "expected the removed node's id in {:?}", touched);
+        assert!(!b.has_node(child));
     }
 }
