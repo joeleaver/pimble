@@ -1280,6 +1280,7 @@ impl PimbleApiServer for RpcHandler {
             source_store: request.source_store_id,
             source_node: request.source_node_id,
             source_path,
+            source_remote: None,
         };
 
         // Validate that this mount won't create a cycle. This also rejects
@@ -1376,7 +1377,7 @@ impl PimbleApiServer for RpcHandler {
             .await
             .map_err(to_rpc_error)?;
         manager
-            .write_sync_config(store_id, &SyncConfig { remote: Self::without_auth(&request.remote) })
+            .write_sync_config(store_id, &SyncConfig { remote: Self::without_auth(&request.remote), last_sync: None })
             .await
             .map_err(to_rpc_error)?;
         let mut store = manager.get_store_info(store_id).map_err(to_rpc_error)?;
@@ -1445,7 +1446,7 @@ impl PimbleApiServer for RpcHandler {
 
                 let manager = self.store_manager.read().await;
                 manager
-                    .write_sync_config(request.store_id, &SyncConfig { remote: Self::without_auth(&remote) })
+                    .write_sync_config(request.store_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None })
                     .await
                     .map_err(to_rpc_error)?;
                 drop(manager);

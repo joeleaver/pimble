@@ -927,7 +927,7 @@ pub fn run() {
                                 if let Some(ms) = mount_sig {
                                     let unavailable = ms.with(|m| {
                                         m.mount_state.as_ref().map_or(false, |s| {
-                                            matches!(s, pimble_core::MountState::Unavailable)
+                                            matches!(s, pimble_core::MountState::Unavailable { .. })
                                         })
                                     });
                                     if unavailable {
@@ -952,7 +952,7 @@ pub fn run() {
                                 } else if let Some(ms) = mount_sig {
                                     let unavailable = ms.with(|m| {
                                         m.mount_state.as_ref().map_or(false, |s| {
-                                            matches!(s, pimble_core::MountState::Unavailable)
+                                            matches!(s, pimble_core::MountState::Unavailable { .. })
                                         })
                                     });
                                     if unavailable {
@@ -984,7 +984,7 @@ pub fn run() {
                             if let Some(ms) = mount_sig {
                                 let unavailable = ms.with(|m| {
                                     m.mount_state.as_ref().map_or(false, |s| {
-                                        matches!(s, pimble_core::MountState::Unavailable)
+                                        matches!(s, pimble_core::MountState::Unavailable { .. })
                                     })
                                 });
                                 if unavailable {

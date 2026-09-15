@@ -480,6 +480,11 @@ pub enum StoreChangeKind {
     TreeStructure { node_ids: Vec<NodeId> },
     /// The store's replica sync link changed state (docs/SYNC_CONTRACT.md).
     SyncStateChanged { state: SyncState },
+    /// A mount node in this store changed state because its source store's
+    /// link did, or its source's replica finished (or failed) being created
+    /// (docs/REMOTE_MOUNTS_CONTRACT.md decision 5). Derived state: sync
+    /// links never forward it.
+    MountStateChanged { node_id: NodeId, state: MountState },
 }
 
 /// Notification that a node's content has changed.

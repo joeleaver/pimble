@@ -164,6 +164,7 @@ impl Node {
             source_store,
             source_node,
             source_path: None,
+            source_remote: None,
         })
     }
 
@@ -309,6 +310,13 @@ pub struct MountRef {
     /// `MountRef` (without this field) still deserializes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_path: Option<PathBuf>,
+    /// The Pimble server the source store can be replicated from when it is
+    /// not on this machine (docs/REMOTE_MOUNTS_CONTRACT.md decision 2). A
+    /// URL only, never a credential: a mount ref is replicated with its
+    /// store. Filled by `createMount` when the source store is a linked
+    /// replica on the creating server; `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_remote: Option<Url>,
 }
 
 /// Current state of a mount point
@@ -317,11 +325,17 @@ pub struct MountRef {
 pub enum MountState {
     /// Source is connected and live
     Live,
-    /// Source is unavailable; showing cached data
+    /// The source's replica exists but its link is down or reconciling;
+    /// the replica's content still shows.
     Cached { last_sync: DateTime<Utc> },
-    /// Source is unavailable and no cache exists
-    Unavailable,
-    /// Currently connecting/syncing
+    /// Nothing can reach the source. `reason` says why, in words a user can
+    /// act on ("remote http://host:7463 refused the credentials").
+    Unavailable {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// The source's replica is being created or reconciling for the first
+    /// time.
     Connecting,
 }
 
@@ -396,6 +410,7 @@ mod tests {
             source_store: StoreId::new(),
             source_node: NodeId::new(),
             source_path: Some(PathBuf::from("/tmp/source.pimble")),
+            source_remote: Some(Url::parse("http://host:7463").unwrap()),
         };
 
         let json = serde_json::to_string(&mount_ref).unwrap();
@@ -404,6 +419,7 @@ mod tests {
         assert_eq!(deserialized.source_store, mount_ref.source_store);
         assert_eq!(deserialized.source_node, mount_ref.source_node);
         assert_eq!(deserialized.source_path, mount_ref.source_path);
+        assert_eq!(deserialized.source_remote, mount_ref.source_remote);
     }
 
     #[test]
@@ -422,6 +438,14 @@ mod tests {
         assert_eq!(mount_ref.source_store, source_store);
         assert_eq!(mount_ref.source_node, source_node);
         assert!(mount_ref.source_path.is_none());
+        assert!(mount_ref.source_remote.is_none());
+    }
+
+    #[test]
+    fn mount_state_unavailable_deserializes_without_reason() {
+        let state: MountState = serde_json::from_str(r#"{"state":"unavailable"}"#)
+            .expect("an Unavailable state with no reason should still deserialize");
+        assert!(matches!(state, MountState::Unavailable { reason: None }));
     }
 
     #[test]

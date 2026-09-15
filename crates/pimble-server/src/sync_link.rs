@@ -272,9 +272,10 @@ async fn handle_remote_notification(
         | (StoreChangeKind::TreeStructure { .. }, None) => {
             schedule_store_reconcile(debouncer, reconcile_tx);
         }
-        (StoreChangeKind::SyncStateChanged { .. }, _) => {
-            // The remote's own link state, if it links elsewhere too; not
-            // ours to react to.
+        (StoreChangeKind::SyncStateChanged { .. }, _) | (StoreChangeKind::MountStateChanged { .. }, _) => {
+            // The remote's own link state, or the state of its mounts
+            // (derived from its links); not ours to react to, and never
+            // forwarded (docs/REMOTE_MOUNTS_CONTRACT.md decision 6).
         }
     }
     Ok(())
@@ -330,7 +331,7 @@ async fn forward_local_change(
         | (StoreChangeKind::TreeStructure { .. }, None) => {
             schedule_store_reconcile(debouncer, reconcile_tx);
         }
-        (StoreChangeKind::SyncStateChanged { .. }, _) => {}
+        (StoreChangeKind::SyncStateChanged { .. }, _) | (StoreChangeKind::MountStateChanged { .. }, _) => {}
     }
     Ok(())
 }

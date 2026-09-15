@@ -574,6 +574,11 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                             refetch_root_if_empty(store, *store_id);
                         }
                     }
+                    StoreChangeKind::MountStateChanged { node_id, state } => {
+                        // Placeholder (docs/REMOTE_MOUNTS_CONTRACT.md "B: app
+                        // side"): update the mount's state, keep its ref.
+                        tracing::info!("Mount state of {:?}/{:?}: {:?}", store_id, node_id, state);
+                    }
                 }
             }
 

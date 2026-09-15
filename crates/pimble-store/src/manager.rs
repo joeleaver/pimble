@@ -485,7 +485,7 @@ impl StoreManager {
     pub async fn mount_state(&mut self, mount_ref: &MountRef) -> MountState {
         match self.ensure_store_open(mount_ref).await {
             Ok(_) => MountState::Live,
-            Err(_) => MountState::Unavailable,
+            Err(e) => MountState::Unavailable { reason: Some(e.to_string()) },
         }
     }
 

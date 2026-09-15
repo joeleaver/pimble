@@ -238,7 +238,7 @@ async fn mount_source_directory_gone_is_unavailable() {
         })
         .await
         .unwrap();
-    assert!(matches!(state_resp.state, MountState::Unavailable));
+    assert!(matches!(state_resp.state, MountState::Unavailable { .. }));
 
     let children_result = handler
         .get_children(GetChildrenRequest {

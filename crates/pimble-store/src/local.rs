@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use pimble_core::{Node, NodeId, NodeMetadata, RemoteEndpoint, StoreId, StoreManifest};
 use pimble_crdt::{ContentDoc, StoreDocument};
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,12 @@ use crate::error::{Result, StoreError};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncConfig {
     pub remote: RemoteEndpoint,
+    /// When the link last reached `Synced` (docs/REMOTE_MOUNTS_CONTRACT.md
+    /// decision 4), so a mount sourced from this store can report
+    /// `Cached { last_sync }` after a restart with the remote down. Written
+    /// by the sync link on category transitions; `None` until it first syncs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sync: Option<DateTime<Utc>>,
 }
 
 /// Write a file atomically: write to a `.tmp` sibling, then rename into place.
