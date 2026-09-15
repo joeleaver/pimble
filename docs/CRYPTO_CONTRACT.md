@@ -158,6 +158,15 @@ shows "encrypted" for vault links.
   stores keep the existing RPC path.
 - Search in the web app: client-side over decrypted titles and any loaded content. No
   server search for vault stores.
+- **Endpoint-agnostic (Joe, 2026-09-15: the browser must also be a client for relayed
+  shares).** The vault client never assumes one server: every store it opens carries its
+  own RPC endpoint and token (`POST /api/v1/token` answers per-store `rpc_url`s in the
+  relay phase; today all are the hosted server), and it holds one `PimbleClient` per
+  endpoint. A relayed store is served by the owner's local server through the relay,
+  which presents the plain local store as a vault: it encrypts the update stream on the
+  way out with the share key and keeps a per-document sequence log so a late-joining
+  client can `vaultFetch` from a point. Keys reach the browser through the same
+  envelope path. Nothing in the web app's code may special-case "the" server.
 
 ## Ownership
 
