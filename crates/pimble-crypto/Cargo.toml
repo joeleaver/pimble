@@ -12,8 +12,18 @@ serde_json = { workspace = true }
 base64 = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
-# Agent K adds the RustCrypto crates here (argon2, chacha20poly1305, x25519-dalek,
-# ed25519-dalek, hkdf, sha2, hmac, rand, zeroize) and the wasm32 `getrandom` js feature.
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 uuid = { workspace = true, features = ["js"] }
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+hex = "0.4"
