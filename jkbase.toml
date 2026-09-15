@@ -7,6 +7,11 @@
 #   /api/*       crates/pimble-cloud   accounts service (axum, port 8080)
 #   /rpc         crates/pimble-cli     hosted Pimble server (port 7462)
 
+# Custom domains (Cloudflare DNS, proxy off: jkbase terminates TLS itself with a
+# per-host certificate once `jkbase domain verify` has passed). The platform
+# host is 54.39.17.150; pimble.jkbase.app keeps working alongside.
+domains = ["pimble.app", "www.pimble.app"]
+
 [project]
 name = "pimble"
 

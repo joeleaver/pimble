@@ -18,6 +18,24 @@ static `site/`, the trunk-built `web/` at `/app`, and the two source-built serve
 `crates/pimble-cloud` and `crates/pimble-cli` at `/api/*` and `/rpc`) plus the managed
 RhypeDB schema. Nothing there needs editing to deploy; it's committed.
 
+## Custom domain (pimble.app)
+
+The project already has `pimble.app` and `www.pimble.app` attached (`jkbase domain list
+--project pimble`). Custom hosts get a per-host certificate over HTTP-01 after the TXT
+verification passes, so the records point straight at the platform host with Cloudflare's
+proxy **off** (DNS only): jkbase terminates TLS itself. Records in the Cloudflare zone:
+
+| Type | Name | Content |
+| --- | --- | --- |
+| A | `pimble.app` | `54.39.17.150` |
+| CNAME | `www` | `pimble.app` |
+| TXT | `_jkbase-challenge` | the token `jkbase domain list --project pimble` shows for `pimble.app` |
+| TXT | `_jkbase-challenge.www` | the token it shows for `www.pimble.app` |
+
+Then `jkbase domain verify pimble.app` and `jkbase domain verify www.pimble.app`; the
+certificate follows within a minute or two (`domain list` shows `tls: provisioning` until
+then). `.app` is on the HSTS preload list, so the site is only ever reachable over HTTPS.
+
 ## jkbase-Auth issuer key
 
 The accounts service (`pimble-cloud`) mints per-user tokens by presenting a `jkbk_…` issuer
@@ -28,7 +46,7 @@ jkbase auth key create --label pimble-cloud   # prints a jkbk_... key -- shown o
 ```
 
 That key is the `JKBASE_AUTH_KEY` secret below. `JKBASE_AUTH_ISSUER_URL` is
-`https://auth.jkbase.app/v1/projects/<project-id>` using the project id from `project info`.
+`https://auth.jkbase.app/v1/projects/pimble` (the project id is `pimble`, from `project info`).
 
 ## Secrets
 
@@ -38,12 +56,12 @@ effect on the next `jkbase deploy`, or immediately with `jkbase restart` (no reb
 | Secret | Value |
 | --- | --- |
 | `PIMBLE_SERVER_TOKEN` | A long random string. This is the static service-principal token: generate one (e.g. `openssl rand -hex 32`) and set the *same* value for both servers -- `pimble-cloud` presents it to `pimble-cli server` as its `Authorization: Bearer`, and `pimble-cli server` accepts it as its own `--token-file`/`PIMBLE_TOKEN`-equivalent static token. |
-| `JKBASE_AUTH_ISSUER_URL` | `https://auth.jkbase.app/v1/projects/<project-id>` |
+| `JKBASE_AUTH_ISSUER_URL` | `https://auth.jkbase.app/v1/projects/pimble` |
 | `JKBASE_AUTH_KEY` | The `jkbk_…` key from `jkbase auth key create` above |
-| `PIMBLE_JWKS_URL` | `https://auth.jkbase.app/v1/projects/<project-id>/.well-known/jwks.json` -- what `pimble-cli server` fetches to verify user JWTs |
+| `PIMBLE_JWKS_URL` | `https://auth.jkbase.app/v1/projects/pimble/.well-known/jwks.json` -- what `pimble-cli server` fetches to verify user JWTs |
 | `PIMBLE_JWT_ISSUER` | Same as `JKBASE_AUTH_ISSUER_URL` -- the `iss` claim `pimble-cli server` checks |
-| `PIMBLE_ALLOW_ORIGINS` | `https://pimble.jkbase.app` (comma-separated if a custom domain is added later) |
-| `PIMBLE_CLOUD_PUBLIC_URL` | `https://pimble.jkbase.app` -- used for the session cookie's `Secure` flag and, in development-signing mode only, as the fallback token issuer |
+| `PIMBLE_ALLOW_ORIGINS` | `https://pimble.app,https://www.pimble.app,https://pimble.jkbase.app` |
+| `PIMBLE_CLOUD_PUBLIC_URL` | `https://pimble.app` -- used for the session cookie's `Secure` flag and, in development-signing mode only, as the fallback token issuer |
 | `PIMBLE_STORES_DIR` | `/app/data/stores` -- must match the path `pimble-cli server --stores-dir` is given in `jkbase.toml`; `pimble-cloud` uses this same value when it asks the server to create a store |
 
 `pimble-cloud`'s own `RHYPEDB_ADDR` (`127.0.0.1:4201`) and `PIMBLE_SERVER_URL`
