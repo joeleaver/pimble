@@ -7,7 +7,8 @@
 //! [`icon_by_name`], so an importer may set one the picker does not show. A name the
 //! table does not know falls back to the node type's icon.
 
-use rinch_tabler_icons::TablerIcon;
+use rinch::prelude::*;
+use rinch_tabler_icons::{render_tabler_icon, TablerIcon, TablerIconStyle, ALL_ICONS};
 
 /// The icons the appearance picker offers, in display order. Each entry's name is its
 /// `TablerIcon::name()`, which is what the metadata stores.
@@ -99,9 +100,57 @@ pub const COLOR_CHOICES: &[(&str, &str)] = &[
     ("Grey", "#8b8d98"),
 ];
 
-/// The icon stored under `name`, if the picker's table knows it.
+/// The icon stored under `name`: one of the picker's, or any icon in the Tabler set
+/// (the picker's search offers all of them, and an import may name one).
 pub fn icon_by_name(name: &str) -> Option<TablerIcon> {
-    ICON_CHOICES.iter().copied().find(|icon| icon.name() == name)
+    ICON_CHOICES
+        .iter()
+        .copied()
+        .find(|icon| icon.name() == name)
+        .or_else(|| ALL_ICONS.iter().copied().find(|icon| icon.name() == name))
+}
+
+/// How many icons the picker's search shows at most.
+pub const SEARCH_LIMIT: usize = 60;
+
+/// The icons the picker shows for `query`: the curated set when it is empty,
+/// otherwise every Tabler icon whose name contains it, exact and prefix matches
+/// first, capped at [`SEARCH_LIMIT`].
+pub fn icons_matching(query: &str) -> Vec<TablerIcon> {
+    let q = query.trim().to_ascii_lowercase().replace(' ', "-");
+    if q.is_empty() {
+        return ICON_CHOICES.to_vec();
+    }
+    let mut hits: Vec<(u8, TablerIcon)> = ALL_ICONS
+        .iter()
+        .copied()
+        .filter_map(|icon| {
+            let name = icon.name();
+            let rank = if name == q {
+                0
+            } else if name.starts_with(&q) {
+                1
+            } else if name.contains(&q) {
+                2
+            } else {
+                return None;
+            };
+            Some((rank, icon))
+        })
+        .collect();
+    hits.sort_by(|a, b| (a.0, a.1.name()).cmp(&(b.0, b.1.name())));
+    hits.into_iter().map(|(_, icon)| icon).take(SEARCH_LIMIT).collect()
+}
+
+/// One Tabler icon by name, as a component so a reactive `for` in the picker can
+/// render it (an icon needs a render scope, which a component has and a reactive
+/// block does not). An unknown name renders nothing.
+#[component]
+pub fn IconGlyph(name: String) -> NodeHandle {
+    match icon_by_name(&name) {
+        Some(icon) => render_tabler_icon(__scope, icon, TablerIconStyle::Outline),
+        None => rsx! { span {} },
+    }
 }
 
 /// The colour to draw `hex` with on the current theme. Stored colours are kept as
@@ -188,6 +237,17 @@ mod tests {
         assert_eq!(display_color("#f5e6b3", true), "#f5e6b3");
         // Non-hex passes through.
         assert_eq!(display_color("rebeccapurple", true), "rebeccapurple");
+    }
+
+    #[test]
+    fn any_tabler_icon_resolves_by_name_and_search_ranks_prefixes_first() {
+        assert!(icon_by_name("brand-github").is_some(), "outside the curated table");
+        assert!(icon_by_name("no-such-icon").is_none());
+        let hits = icons_matching("star");
+        assert_eq!(hits.first().map(|i| i.name()), Some("star"));
+        assert!(hits.iter().all(|i| i.name().contains("star")));
+        assert!(hits.len() <= SEARCH_LIMIT);
+        assert_eq!(icons_matching("").len(), ICON_CHOICES.len());
     }
 
     #[test]

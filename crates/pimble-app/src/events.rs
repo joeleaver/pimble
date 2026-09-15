@@ -34,6 +34,8 @@ fn register_opened_store(store: AppStore, tree_state: UseTreeReturn, opened_stor
     store.expanded.update(|e| { e.insert((store_id, root_id)); });
 
     store.send(BackendCommand::GetChildren { store_id, node_id: root_id });
+    // The root node itself, for the store row's icon and colour (its metadata).
+    store.send(BackendCommand::GetNode { store_id, node_id: root_id });
 
     // Subscribe to store changes for real-time updates
     store.send(BackendCommand::SubscribeStoreChanges { store_id });
@@ -346,10 +348,13 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
 
                 // Whether the node's icon or colour changed against the cache: the
                 // row snapshots both at render time, so that (unlike a title or
-                // content change) needs the tree rebuilt to show.
+                // content change) needs the tree rebuilt to show. A node never
+                // cached before counts as changed when it carries either — a
+                // store's root node arrives after its row was first built.
+                let has_appearance = node.metadata.icon().is_some() || node.metadata.color().is_some();
                 let appearance_changed = untracked(|| {
                     store.node_data.with(|map| {
-                        map.get(&(*store_id, node_id)).map_or(false, |sig| {
+                        map.get(&(*store_id, node_id)).map_or(has_appearance, |sig| {
                             sig.with(|cached| {
                                 cached.metadata.icon() != node.metadata.icon()
                                     || cached.metadata.color() != node.metadata.color()

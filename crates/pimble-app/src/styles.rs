@@ -9,8 +9,8 @@ pub(crate) const APP_CSS: &str = "
     min-width: 200px;
     display: flex;
     flex-direction: column;
-    background: var(--rinch-color-dark-7);
-    border-right: 1px solid var(--rinch-color-dark-4);
+    background: var(--rinch-color-body);
+    border-right: 1px solid var(--rinch-color-border);
 }
 
 .pimble-sidebar__header {
@@ -18,7 +18,7 @@ pub(crate) const APP_CSS: &str = "
     align-items: center;
     padding: 8px 12px 6px;
     gap: 8px;
-    border-top: 1px solid var(--rinch-color-dark-4);
+    border-top: 1px solid var(--rinch-color-border);
 }
 
 .pimble-sidebar__heading {
@@ -62,14 +62,14 @@ pub(crate) const APP_CSS: &str = "
     padding: 2px 4px;
 }
 .rinch-tree__node-content:hover {
-    background-color: var(--rinch-color-dark-5);
+    background-color: var(--rinch-color-option-hover);
 }
 .rinch-tree__node-content--selected {
-    background-color: var(--rinch-color-dark-5);
+    background-color: var(--rinch-color-option-hover);
     color: var(--rinch-color-text);
 }
 .rinch-tree__node-content--selected:hover {
-    background-color: var(--rinch-color-dark-4);
+    background-color: var(--rinch-color-option-selected);
 }
 .rinch-tree__node-content--selected .rinch-tree__icon {
     color: var(--rinch-primary-color-4);
@@ -78,13 +78,13 @@ pub(crate) const APP_CSS: &str = "
     color: var(--rinch-color-text);
 }
 
-/* ── Context menu (dark theme overrides) ────────────────────── */
+/* ── Context menu ───────────────────────────────────────────── */
 
 .rinch-context-menu__dropdown {
-    background-color: var(--rinch-color-dark-6);
-    border: 1px solid var(--rinch-color-dark-4);
+    background-color: var(--rinch-color-surface);
+    border: 1px solid var(--rinch-color-border);
     border-radius: var(--rinch-radius-default);
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
 }
 
 .rinch-dropdown-menu__item {
@@ -94,11 +94,11 @@ pub(crate) const APP_CSS: &str = "
 }
 
 .rinch-dropdown-menu__item:hover {
-    background-color: var(--rinch-color-dark-4);
+    background-color: var(--rinch-color-option-hover);
 }
 
 .rinch-dropdown-menu__divider {
-    border-color: var(--rinch-color-dark-4);
+    border-color: var(--rinch-color-border);
 }
 
 /* Mount point icon gets a distinct color */
@@ -128,12 +128,12 @@ pub(crate) const APP_CSS: &str = "
     cursor: pointer;
 }
 .pimble-swatch--active {
-    border-color: var(--rinch-color-dark-0);
+    border-color: var(--rinch-color-text);
 }
 .pimble-swatch--none {
     background: transparent;
-    border: 2px dashed var(--rinch-color-dark-3);
-    color: var(--rinch-color-dark-1);
+    border: 2px dashed var(--rinch-color-placeholder);
+    color: var(--rinch-color-dimmed);
     font-size: 11px;
     display: flex;
     align-items: center;
@@ -146,7 +146,7 @@ pub(crate) const APP_CSS: &str = "
     height: 32px;
     border-radius: 6px;
     border: 2px solid transparent;
-    background: var(--rinch-color-dark-6);
+    background: var(--rinch-color-surface);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -171,8 +171,8 @@ pub(crate) const APP_CSS: &str = "
 }
 
 .pimble-editor__toolbar-wrap {
-    border-top: 1px solid var(--rinch-color-dark-4);
-    border-bottom: 1px solid var(--rinch-color-dark-4);
+    border-top: 1px solid var(--rinch-color-border);
+    border-bottom: 1px solid var(--rinch-color-border);
 }
 
 .pimble-editor__content-wrap {
@@ -193,8 +193,8 @@ pub(crate) const APP_CSS: &str = "
 }
 
 .editor-toolbar {
-    background: var(--rinch-color-dark-6) !important;
-    border-bottom-color: var(--rinch-color-dark-4) !important;
+    background: var(--rinch-color-surface) !important;
+    border-bottom-color: var(--rinch-color-border) !important;
 }
 .editor-toolbar svg {
     width: 18px;
@@ -237,8 +237,8 @@ pub(crate) const APP_CSS: &str = "
     align-items: center;
     gap: 8px;
     padding: 6px 12px;
-    background: var(--rinch-color-dark-7);
-    border-bottom: 1px solid var(--rinch-color-dark-4);
+    background: var(--rinch-color-body);
+    border-bottom: 1px solid var(--rinch-color-border);
     flex-shrink: 0;
 }
 
@@ -284,7 +284,7 @@ pub(crate) const APP_CSS: &str = "
     cursor: pointer;
 }
 .pimble-search-result:hover {
-    background-color: var(--rinch-color-dark-5);
+    background-color: var(--rinch-color-option-hover);
 }
 
 .pimble-search-result__title-row {
@@ -340,8 +340,8 @@ pub(crate) const APP_CSS: &str = "
     align-items: center;
     gap: 10px;
     padding: 3px 12px;
-    border-top: 1px solid var(--rinch-color-dark-4);
-    background: var(--rinch-color-dark-7);
+    border-top: 1px solid var(--rinch-color-border);
+    background: var(--rinch-color-body);
     font-size: 11px;
     color: var(--rinch-color-dimmed);
     flex-shrink: 0;
@@ -362,9 +362,9 @@ pub(crate) const APP_CSS: &str = "
 /// tree and toolbar around it.
 pub(crate) const EDITOR_CSS: &str = "
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] {
-    background: var(--rinch-color-dark-7);
+    background: var(--rinch-color-body);
     color: var(--rinch-color-text);
-    border-color: var(--rinch-color-dark-4);
+    border-color: var(--rinch-color-border);
     font-size: 15px;
     line-height: 1.7;
 }
@@ -385,11 +385,11 @@ pub(crate) const EDITOR_CSS: &str = "
 }
 
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] code {
-    background: var(--rinch-color-dark-5);
+    background: var(--rinch-color-option-hover);
     color: #e06c75;
 }
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] pre {
-    background: var(--rinch-color-dark-6);
+    background: var(--rinch-color-surface);
 }
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] pre code {
     background: none;
@@ -402,16 +402,16 @@ pub(crate) const EDITOR_CSS: &str = "
 }
 
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] hr {
-    border-top-color: var(--rinch-color-dark-4);
+    border-top-color: var(--rinch-color-border);
 }
 
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] table,
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] td,
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] th {
-    border-color: var(--rinch-color-dark-4);
+    border-color: var(--rinch-color-border);
 }
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] th {
-    background: var(--rinch-color-dark-6);
+    background: var(--rinch-color-surface);
 }
 
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] [data-pm-placeholder] {

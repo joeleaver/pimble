@@ -15,14 +15,35 @@ use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
 use crate::backend::{BackendCommand, BackendHandle};
 use crate::editor::{start_editing, stop_editing};
 use crate::events::{EVENT_PROCESSOR, process_backend_events};
-use crate::appearance::{display_color, icon_by_name, COLOR_CHOICES, ICON_CHOICES};
+use crate::appearance::{display_color, icon_by_name, icons_matching, IconGlyph, COLOR_CHOICES};
+use crate::persistence::{load_dark_mode, save_dark_mode};
 use crate::state::{parse_tree_value, display_label_from_node, mount_is_dimmed, mount_label_suffix, AppStore, PendingMount, SearchState};
 use crate::styles::{APP_CSS, EDITOR_CSS};
 
-/// The app's color scheme. Feeds rinch's `ThemeProviderProps` and the editor's
-/// built-in dark stylesheet (`EditorHandle::set_dark_mode`, applied in
-/// `editor::start_editing`), so both follow one switch.
-pub(crate) const DARK_MODE: bool = true;
+/// rinch's theme for the app: one function so the startup theme and a runtime
+/// switch (View > "Toggle Dark Mode", `rinch::update_theme`) agree on everything
+/// but the scheme. The editor's own stylesheet follows the same flag through
+/// `EditorHandle::set_dark_mode`, and colours the app derives follow
+/// `AppStore::dark_mode` reactively.
+fn theme_props(dark_mode: bool) -> ThemeProviderProps {
+    ThemeProviderProps {
+        primary_color: Some("blue".into()),
+        dark_mode,
+        default_radius: Some("sm".into()),
+        ..Default::default()
+    }
+}
+
+/// Switch between the dark and light themes: the theme CSS, the editor's
+/// stylesheet, every colour the app derives (they read `dark_mode`), and the
+/// saved preference.
+fn toggle_dark_mode(store: AppStore) {
+    let dark = !untracked(|| store.dark_mode.get());
+    store.dark_mode.set(dark);
+    rinch::update_theme(&theme_props(dark));
+    crate::editor::editor().set_dark_mode(dark);
+    save_dark_mode(dark);
+}
 
 thread_local! {
     /// The search box's `NodeHandle`, captured once when the toolbar is built
@@ -173,6 +194,18 @@ fn open_connect_modal(store: AppStore, target: Option<(pimble_core::StoreId, pim
     store.connect_modal_open.set(true);
 }
 
+/// Open the "Appearance..." picker for `(store_id, node_id)`: seed the tags field
+/// from the node and clear the icon search.
+fn open_appearance_modal(store: AppStore, store_id: pimble_core::StoreId, node_id: pimble_core::NodeId) {
+    let tags = store
+        .get_node_signal(store_id, node_id)
+        .map(|sig| untracked(|| sig.with(|n| n.metadata.tags.join(", "))))
+        .unwrap_or_default();
+    store.appearance_tags_text.set(tags);
+    store.appearance_icon_query.set(String::new());
+    store.appearance_modal_node.set(Some((store_id, node_id)));
+}
+
 /// Cancel a pending debounce timer and reset the search box to empty/idle.
 /// Also drops the search box's Escape interceptor, installed by `oninput`
 /// only while the box is non-empty (see there) so it never fights the tree
@@ -287,6 +320,7 @@ fn find_context_menu_handler(node: &NodeHandle) -> Option<String> {
 /// Main application entry point
 pub fn run() {
     let store = AppStore::new();
+    store.dark_mode.set(load_dark_mode());
 
     // Double-click detection for rename: (last_click_time, last_click_value)
     let last_click: Rc<Cell<(Instant, String)>> = Rc::new(Cell::new((Instant::now(), String::new())));
@@ -374,6 +408,7 @@ pub fn run() {
         .item(MenuItem::new("Toggle Sidebar").shortcut("Ctrl+\\").on_click(|| {
             tracing::info!("Toggle sidebar");
         }))
+        .item(MenuItem::new("Toggle Dark Mode").on_click(move || toggle_dark_mode(store)))
         .separator()
         .item(MenuItem::new("Focus Search").shortcut("Ctrl+K").on_click(|| {
             SEARCH_INPUT.with(|cell| {
@@ -411,12 +446,7 @@ pub fn run() {
     ];
 
     // Theme
-    let theme = ThemeProviderProps {
-        primary_color: Some("blue".into()),
-        dark_mode: DARK_MODE,
-        default_radius: Some("sm".into()),
-        ..Default::default()
-    };
+    let theme = theme_props(untracked(|| store.dark_mode.get()));
 
     // Save-on-close: register a thread-local that the close callback invokes.
     // WindowProps requires Send+Sync but our state is Rc-based (main thread only),
@@ -660,15 +690,21 @@ pub fn run() {
                 .map(|sig| sig.with(|n| n.node_type == pimble_core::node_types::FOLDER))
                 .unwrap_or(has_children);
             // A custom icon or colour from the node's metadata (the "Appearance..."
-            // picker, or an import). Snapshotted here like the type icon: the
-            // row's `TreeNodeData` carries both, so a change re-renders the row.
-            let (custom_icon, node_color) = node_sig
+            // picker, or an import); a store row takes its root node's. Snapshotted
+            // here like the type icon: the row's `TreeNodeData` carries both, so a
+            // change re-renders the row.
+            let appearance_sig = if is_store_root {
+                parsed.and_then(|(s_id, _)| store.root_node_id(s_id).and_then(|root| store.get_node_signal(s_id, root)))
+            } else {
+                node_sig
+            };
+            let (custom_icon, node_color) = appearance_sig
                 .map(|sig| sig.with(|n| (n.metadata.icon().and_then(icon_by_name), n.metadata.color().map(String::from))))
                 .unwrap_or((None, None));
-            let icon = if is_store_root {
-                TablerIcon::Database
-            } else if let Some(custom) = custom_icon {
+            let icon = if let Some(custom) = custom_icon {
                 custom
+            } else if is_store_root {
+                TablerIcon::Database
             } else if is_mount {
                 TablerIcon::Link
             } else if is_folder {
@@ -676,12 +712,14 @@ pub fn run() {
             } else {
                 TablerIcon::File
             };
-            let color_css = node_color.as_ref().map(|c| format!(" color: {};", display_color(c, DARK_MODE))).unwrap_or_default();
-            // One clone per reactive closure below (rinch: a re-running closure
-            // must not consume a non-Copy capture, and two closures cannot share
-            // one moved String).
-            let icon_color_css = color_css.clone();
-            let label_color_css = color_css;
+            // The CSS for the node's colour on the current theme; reactive on the
+            // theme so a toggle recolours rows in place. One clone per closure
+            // (rinch: two closures cannot share one moved String).
+            let color_css = move |color: &Option<String>| -> String {
+                color.as_ref().map(|c| format!(" color: {};", display_color(c, store.dark_mode.get()))).unwrap_or_default()
+            };
+            let icon_color = node_color.clone();
+            let label_color = node_color;
 
             let icon_class = if is_mount {
                 "rinch-tree__icon rinch-tree__icon--mount"
@@ -869,12 +907,15 @@ pub fn run() {
                     }
                 }
             };
-            // "Appearance...": open the icon and colour picker for this node.
+            // "Appearance...": open the icon, colour and tags picker for this
+            // node (a store row edits its root node).
             let on_appearance = {
                 let nv = nv_ctx.clone();
                 move || {
-                    if let Some((s_id, Some(n_id))) = parse_tree_value(&nv) {
-                        store.appearance_modal_node.set(Some((s_id, n_id)));
+                    if let Some((s_id, node_id_opt)) = parse_tree_value(&nv) {
+                        if let Some(n_id) = node_id_opt.or_else(|| store.root_node_id(s_id)) {
+                            open_appearance_modal(store, s_id, n_id);
+                        }
                     }
                 }
             };
@@ -989,10 +1030,11 @@ pub fn run() {
                                 let dimmed = mount_sig.map_or(false, |ms| {
                                     ms.with(|m| m.mount_state.as_ref().map_or(false, mount_is_dimmed))
                                 });
+                                let color = color_css(&icon_color);
                                 if dimmed {
-                                    format!("width: 1rem; height: 1rem; margin-right: 4px; opacity: 0.4;{icon_color_css}")
+                                    format!("width: 1rem; height: 1rem; margin-right: 4px; opacity: 0.4;{color}")
                                 } else {
-                                    icon_color_css.clone()
+                                    color
                                 }
                             }
                         },
@@ -1011,10 +1053,11 @@ pub fn run() {
                                 let dimmed = mount_sig.map_or(false, |ms| {
                                     ms.with(|m| m.mount_state.as_ref().map_or(false, mount_is_dimmed))
                                 });
+                                let color = color_css(&label_color);
                                 if dimmed {
-                                    format!("cursor: default; opacity: 0.4;{label_color_css}")
+                                    format!("cursor: default; opacity: 0.4;{color}")
                                 } else {
-                                    format!("{base_label_style}{label_color_css}")
+                                    format!("{base_label_style}{color}")
                                 }
                             }
                         },
@@ -1122,6 +1165,11 @@ pub fn run() {
                                 disabled: !is_replica_now,
                                 onclick: on_remove_replica,
                                 "Remove Replica..."
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::Palette,
+                                onclick: on_appearance,
+                                "Appearance..."
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::X,
@@ -1661,7 +1709,17 @@ pub fn run() {
         };
         let send_appearance = move |icon: Option<Option<String>>, color: Option<Option<String>>| {
             if let Some((store_id, node_id)) = untracked(|| store.appearance_modal_node.get()) {
-                store.send(BackendCommand::SetNodeAppearance { store_id, node_id, icon, color });
+                store.send(BackendCommand::SetNodeAppearance { store_id, node_id, icon, color, tags: None });
+            }
+        };
+        let send_tags = move || {
+            if let Some((store_id, node_id)) = untracked(|| store.appearance_modal_node.get()) {
+                let tags: Vec<String> = untracked(|| store.appearance_tags_text.get())
+                    .split(',')
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                store.send(BackendCommand::SetNodeAppearance { store_id, node_id, icon: None, color: None, tags: Some(tags) });
             }
         };
         let swatches: Vec<NodeHandle> = COLOR_CHOICES
@@ -1675,23 +1733,6 @@ pub fn run() {
                         style: format!("background: {hex};"),
                         title: name,
                         onclick: move || send_appearance(None, Some(Some(hex.to_string()))),
-                    }
-                }
-            })
-            .collect();
-        let icon_choices: Vec<NodeHandle> = ICON_CHOICES
-            .iter()
-            .map(|&icon| {
-                let name = icon.name();
-                let el = render_tabler_icon(__scope, icon, TablerIconStyle::Outline);
-                rsx! {
-                    div {
-                        class: {move || {
-                            if appearance_node_icon().as_deref() == Some(name) { "pimble-icon-choice pimble-icon-choice--active" } else { "pimble-icon-choice" }
-                        }},
-                        title: name,
-                        onclick: move || send_appearance(Some(Some(name.to_string())), None),
-                        {el}
                     }
                 }
             })
@@ -1717,8 +1758,14 @@ pub fn run() {
                         {swatches}
                     }
                     div { class: "pimble-appearance__label", "Icon" }
+                    TextInput {
+                        placeholder: "Search all icons...",
+                        value_fn: move || store.appearance_icon_query.get(),
+                        oninput: move |val: String| store.appearance_icon_query.set(val),
+                    }
                     div {
                         class: "pimble-appearance__row",
+                        style: "margin-top: 6px;",
                         div {
                             class: {move || {
                                 if appearance_node_icon().is_none() { "pimble-swatch pimble-swatch--none pimble-swatch--active" } else { "pimble-swatch pimble-swatch--none" }
@@ -1726,13 +1773,35 @@ pub fn run() {
                             onclick: move || send_appearance(Some(None), None),
                             "Default"
                         }
-                        {icon_choices}
+                        // The curated set, or every Tabler icon matching the
+                        // search: reactive on the query, one component per icon.
+                        for icon in icons_matching(&store.appearance_icon_query.get()) {
+                            div {
+                                key: icon.name(),
+                                class: {move || {
+                                    if appearance_node_icon().as_deref() == Some(icon.name()) { "pimble-icon-choice pimble-icon-choice--active" } else { "pimble-icon-choice" }
+                                }},
+                                title: icon.name(),
+                                onclick: move || send_appearance(Some(Some(icon.name().to_string())), None),
+                                IconGlyph { name: icon.name() }
+                            }
+                        }
+                    }
+                    div { class: "pimble-appearance__label", "Tags (comma separated)" }
+                    TextInput {
+                        placeholder: "e.g. Important, Tax",
+                        value_fn: move || store.appearance_tags_text.get(),
+                        oninput: move |val: String| store.appearance_tags_text.set(val),
+                        onsubmit: move || send_tags(),
                     }
                     div {
                         style: "margin-top: 14px; display: flex; justify-content: flex-end;",
                         Button {
                             variant: "filled",
-                            onclick: move || store.appearance_modal_node.set(None),
+                            onclick: move || {
+                                send_tags();
+                                store.appearance_modal_node.set(None);
+                            },
                             "Done"
                         }
                     }

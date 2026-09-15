@@ -38,7 +38,14 @@ pub enum BackendCommand {
     /// (`#rrggbb`) in its metadata. `None` for a field leaves it as it is;
     /// `Some(None)` clears it. Answers with `NodeRenamed`, whose refetch
     /// carries the new metadata to the tree.
-    SetNodeAppearance { store_id: StoreId, node_id: NodeId, icon: Option<Option<String>>, color: Option<Option<String>> },
+    SetNodeAppearance {
+        store_id: StoreId,
+        node_id: NodeId,
+        icon: Option<Option<String>>,
+        color: Option<Option<String>>,
+        /// `Some(tags)` replaces the node's tags.
+        tags: Option<Vec<String>>,
+    },
     DeleteNode { store_id: StoreId, node_id: NodeId },
     MoveNode { store_id: StoreId, node_id: NodeId, new_parent_id: NodeId, position: Option<usize> },
 
@@ -579,7 +586,7 @@ async fn process_command(
             None
         }
 
-        BackendCommand::SetNodeAppearance { store_id, node_id, icon, color } => {
+        BackendCommand::SetNodeAppearance { store_id, node_id, icon, color, tags } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
@@ -590,6 +597,9 @@ async fn process_command(
                     }
                     if let Some(color) = color {
                         node.metadata.set_color(color);
+                    }
+                    if let Some(tags) = tags {
+                        node.metadata.tags = tags;
                     }
                     match c.update_node_metadata(store_id, node_id, node.metadata).await {
                         Ok(()) => Some(BackendEvent::NodeRenamed { store_id, node_id }),

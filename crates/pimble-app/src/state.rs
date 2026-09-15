@@ -289,8 +289,16 @@ pub struct AppStore {
     pub link_modal_pending: Signal<bool>,
 
     // "Appearance..." modal (node context menu): the node whose icon and
-    // colour are being picked; `None` means closed.
+    // colour are being picked; `None` means closed. `appearance_icon_query`
+    // filters the icon grid over the whole Tabler set; `appearance_tags_text`
+    // is the tags field's text (comma separated), seeded when the modal opens.
     pub appearance_modal_node: Signal<Option<(StoreId, NodeId)>>,
+    pub appearance_icon_query: Signal<String>,
+    pub appearance_tags_text: Signal<String>,
+
+    /// The theme in use (View > "Toggle Dark Mode"), persisted in `state.json`.
+    /// Read reactively wherever a colour depends on the scheme.
+    pub dark_mode: Signal<bool>,
 
     // "Remove Replica..." confirmation modal (store root context menu,
     // docs/history/HARDENING_CONTRACT.md "B: app"). `Some(store_id)` is the replica
@@ -356,6 +364,9 @@ impl AppStore {
             link_modal_error: Signal::new(String::new()),
             link_modal_pending: Signal::new(false),
             appearance_modal_node: Signal::new(None),
+            appearance_icon_query: Signal::new(String::new()),
+            appearance_tags_text: Signal::new(String::new()),
+            dark_mode: Signal::new(true),
             remove_replica_modal_store: Signal::new(None),
             remove_replica_modal_error: Signal::new(String::new()),
             remove_replica_modal_pending: Signal::new(false),
@@ -751,9 +762,15 @@ impl AppStore {
             let linked = self.sync_data.with(|map| {
                 map.get(&sid).map_or(false, |sig| sig.with(|(remote, _)| remote.is_some()))
             });
+            // A store row's icon and colour come from its root node's metadata.
+            let root_appearance = self.node_data.with(|map| {
+                map.get(&(sid, root_id)).map(|sig| {
+                    sig.with(|n| format!("{}|{}", n.metadata.icon().unwrap_or(""), n.metadata.color().unwrap_or("")))
+                })
+            });
             let store_node = TreeNodeData::new(
                 format!("store_{}", sid),
-                format!("{store_name} (linked: {linked}, paste: {paste})"),
+                format!("{store_name} (linked: {linked}, paste: {paste}, {})", root_appearance.unwrap_or_default()),
             );
             let children = self.build_children_structural(sid, root_id, paste, &[]);
             if children.is_empty() {

@@ -150,10 +150,10 @@ after "Copy as Mount Source" again.
 15. Cross-store drag-and-drop is ignored with a warning.
 16. `pimble-client::get_nodes` (and the `getNodes` RPC) are unused.
 17. A CLI `show-node | head` panics on a broken pipe; harmless, cosmetic.
-18. Tree appearance (2026-09-15): per-node icon and colour, picker in the node context
-    menu, Scrivener labels and icons imported. Not done: colouring a store row, a light
-    theme (the app is dark-only; `display_color` already handles both), custom icons
-    beyond the picker's table, and showing a label's name anywhere but the node's tags.
+18. Tree appearance (2026-09-15): per-node and per-store icon and colour, a picker with
+    search over every Tabler icon and a tags field, Scrivener labels and icons imported,
+    and a runtime dark/light toggle (View menu, persisted). Tags are editable in the
+    picker but not shown in the tree (Joe: the label chips were noise).
 19. A search hit for a node the tree has not loaded now opens the editor pane (it used
     to start the session with the pane hidden); worth a look at whether the tree should
     also expand to and select that node.

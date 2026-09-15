@@ -63,7 +63,7 @@ pub(crate) fn start_editing(
     // The editor's built-in stylesheet is light unless the container carries
     // `data-pm-theme="dark"`; `set_dark_mode` is a no-op before the view
     // mounts, so apply the app's scheme here, once a document is opened.
-    handle.set_dark_mode(crate::app::DARK_MODE);
+    handle.set_dark_mode(untracked(|| store.dark_mode.get()));
     handle.stop_collaboration(); // end any prior node's session
     cancel_pending_label_refresh();
 

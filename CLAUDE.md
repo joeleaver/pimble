@@ -191,15 +191,21 @@ A node's custom icon and colour live in `metadata.custom` under
 `pimble_core::custom_keys::{ICON, COLOR}` (`NodeMetadata::icon/color/set_icon/set_color`):
 a Tabler icon name and a `#rrggbb`, replicated with the store like any metadata and
 written through `updateNodeMetadata` (`BackendCommand::SetNodeAppearance`). The app's
-`appearance.rs` holds the picker's icon and colour tables and `icon_by_name`; a name the
-table does not know falls back to the type's icon. Rows snapshot icon and colour at
+`appearance.rs` holds the picker's curated icon table and palette; `icon_by_name` resolves
+any Tabler icon (`ALL_ICONS`), and the picker's search box (`icons_matching`) offers all
+of them, rendered through the `IconGlyph` component so a reactive `for` can draw icons.
+A store row takes its root node's icon and colour (`register_opened_store` fetches the
+root; the store row's menu has "Appearance..." too). Rows snapshot icon and colour at
 render time, so the row's `TreeNodeData` label carries them (with the paste flag) and
 `NodeLoaded` bumps the tree when they change. `display_color` lifts a dark stored colour
-to a readable lightness on the dark theme at render time (Scrivener's label colours are
-made for light backgrounds); the stored value is never altered. "Appearance..." in the
-node context menu opens the picker (every click applies at once). The Scrivener importer
-maps a binder item's label to colour plus a tag with the label's name, and its
-`IconFileName` to a picker icon where one matches.
+on the dark theme and caps a light one on the light theme, at render time and reactively
+on `AppStore::dark_mode`; the stored value is never altered. "Appearance..." opens the
+picker (every click applies at once; the tags field applies on Enter or Done). Tags are
+not shown in the tree. The Scrivener importer maps a binder item's label to colour plus a
+tag with the label's name, and its `IconFileName` to an icon where one matches. View >
+"Toggle Dark Mode" switches the theme at runtime (`rinch::update_theme`, the editor's
+`set_dark_mode`, `state.json` `dark_mode`); the app stylesheet uses only rinch's semantic
+colour variables, never the dark palette directly, so both schemes work.
 
 ## Key Files
 
