@@ -330,9 +330,20 @@ user's data). Roles for now: `reader` and `editor`; finer permissions later.
   Moving a node out of a shared subtree revokes access to it; moving one in shares it.
 - **Recipient side** is a remote mount of the owner's node (exists today) backed by a
   partial replica instead of a whole-store one. The web app needs no replica.
-- **Source**: the owner's hosted copy (whole-store replica upward, works while the owner
-  is offline) or, later, the relay (nothing stored on the server, cached copy when the
-  owner is offline). The same authorization code runs in whichever server serves it.
+- **Source, a per-store choice the owner makes (Joe, 2026-09-15: both are products):**
+  *Hosted*: an encrypted copy on Pimble Cloud (whole-store replica upward); works while
+  the owner is offline. *Relay*: Pimble Cloud stores **nothing**, not even ciphertext at
+  rest; the owner's local server serves the store live through a reverse tunnel and
+  recipients keep their cached partial replica; when the owner is offline recipients read
+  their cache and their edits wait. The promise of the relay tier is "we never store your
+  data", and the relay must stay stateless to keep it (no persistent queue). The same
+  code encrypts on the way out and enforces access in whichever server serves the store.
+- **Encryption (Joe, 2026-09-15: important, from day 1)**: node content and tree
+  documents are encrypted client-side with per-store and per-share keys; the hosted server
+  and the relay carry ciphertext only, as a blob log (append, fetch-since, snapshot) with
+  a per-member node-id list, and clients do all merging. Details and costs in the
+  discussion of 2026-09-15; a crypto contract (account keys at signup, wrapped keys,
+  recovery code, blob-mode server) comes before any sharing work.
 - **Identity**: both sides have accounts. The owner signs in on the desktop (needed to
   create hosted stores, mint the link's token, manage grants). An invitation is a pending
   grant keyed by email or an "anyone with the link" token at `https://pimble.app/s/<token>`;
@@ -341,15 +352,17 @@ user's data). Roles for now: `reader` and `editor`; finer permissions later.
 - **Revocation** deletes the grant; effective at the next token (an hour) or at once via a
   Service-only RPC that drops a subject's live connections. Already-synced content stays
   with the recipient, as in any sharing system.
-- **Encryption** is deferred: shares are labelled as going through Pimble Cloud. A later
-  opt-in "private share" (per-share keys distributed via account public keys, rotation on
-  revoke; no server-side search or web access without keys) fits the same grant model.
+- **Consequences of encryption**: no server-side search of hosted stores (the desktop
+  keeps its local index; the web app searches client-side over decrypted data); tree
+  repair moves to clients; clients compact blob logs into snapshots; the web app's
+  encryption protects against a breached or passive server, not a malicious one.
 - **UI**: node context menu "Share..." (sign in first if needed); dialog with people by
   email plus role and an optional "anyone with the link" switch; a shared badge on the node;
   the same dialog manages members, roles, the link and "Stop sharing".
 
-Build order: desktop sign-in (`AuthMethod::CloudSession` so the sync link mints a fresh JWT
-before each connect); hosting a local store from the app (whole-store replica upward);
-subtree grants in the accounts service and the server, invitation link and email; partial
-replicas and the Share dialog; the relay; then teams (organisations above grants, server as
+Build order: crypto foundation and account keys at signup; desktop sign-in
+(`AuthMethod::CloudSession` so the sync link mints a fresh JWT before each connect);
+hosted stores in blob mode with the encrypting sync link (one person, several devices, the
+web app); subtree grants, invitation link and email; partial replicas, the share mirror
+and the Share dialog; the relay tier; then teams (organisations above grants, server as
 source of truth, binary files in object storage, store deletion on disk).
