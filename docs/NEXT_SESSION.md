@@ -139,11 +139,20 @@ after "Copy as Mount Source" again.
     time, row data changes for re-renders, bumps deferred past the menu close).
 12. rinch repaint artifacts seen earlier (a strip below a shrunk modal, a stray line across
     the tree). Not isolated; reproduce and file.
-13. The importer flattens RTF formatting to plain paragraphs.
-14. The collaboration scope rejects lists, block quotes and tables.
+13. The Scrivener importer (2026-09-15) keeps bold, italic, underline, strike, links,
+    text colour, highlight, sub/superscript, monospace-as-code, nested bullet and ordered
+    lists, alignment and indent, and stylesheet or bold-and-larger headings. It reduces
+    what the content model cannot hold: tables become one tab-separated paragraph per
+    row, pictures are skipped, a line break is a paragraph break. Scrivener's comments
+    and footnotes (`\Scrv_` groups) are not in this project's RTF and are untested.
+14. The collaboration scope rejects block quotes, tables, images and hard breaks; lists
+    are in scope and their toolbar buttons are back.
 15. Cross-store drag-and-drop is ignored with a warning.
 16. `pimble-client::get_nodes` (and the `getNodes` RPC) are unused.
 17. A CLI `show-node | head` panics on a broken pipe; harmless, cosmetic.
+18. A search hit for a node the tree has not loaded now opens the editor pane (it used
+    to start the session with the pane hidden); worth a look at whether the tree should
+    also expand to and select that node.
 
 ## Then the roadmap: links UI and backlinks, then plugins
 

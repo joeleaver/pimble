@@ -368,6 +368,10 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                             if node.node_type == pimble_core::node_types::DOCUMENT
                                 && !already_editing
                             {
+                                // `open_node` could not tell this was a document
+                                // (a search hit the tree had not loaded), so the
+                                // pane is still hidden: show it with the session.
+                                store.show_editor.set(true);
                                 start_editing(store, *store_id, node_id, &content_bytes);
                             }
                         }

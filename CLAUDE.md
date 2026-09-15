@@ -179,8 +179,11 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
   `EditorHandle::collab_receive`.
 - Never wrap the editor in a document-model layer in the sync path. Never call
   `load_html`/`load_doc` on a collaborating editor.
-- Rinch's collab scope is flat blocks + marks (paragraph, heading, code block; bold, italic,
-  link). Lists and tables in a collaborating document fail loudly by design.
+- Rinch's collab scope is flat text blocks (paragraph, heading, code block), nested bullet
+  and ordered lists, and the starter-kit marks (bold, italic, underline, strike, code, link,
+  highlight, text colour, sub/superscript). Block quotes, tables, images and hard breaks in a
+  collaborating document fail loudly by design. `pimble_crdt::Block` is that scope as data;
+  `ContentDoc::from_blocks` builds a document from it (the importer's way in).
 
 ## Key Files
 

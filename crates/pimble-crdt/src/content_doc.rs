@@ -15,11 +15,12 @@ use std::rc::Rc;
 
 use pimble_core::{IndexUnit, UnitKind};
 use rinch_editor_collab::CollabSession;
-use rinch_editor_core::{default_plugins, EditorState, Fragment, Node, Schema};
+use rinch_editor_core::{default_plugins, EditorState, Node, Schema};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{Doc, OffsetKind, Options, ReadTxn, StateVector, Transact, Update};
 
+use crate::blocks::{blocks_from_plain_text, build_doc, Block};
 use crate::error::{CrdtError, Result};
 
 /// A node's rich-text content, backed by a yrs CRDT document.
@@ -56,11 +57,17 @@ impl ContentDoc {
     }
 
     /// Build a document whose content is one paragraph per line of `text` (a blank line
-    /// becomes an empty paragraph; empty `text` becomes a single empty paragraph). Used
-    /// to migrate legacy plain-text content.
+    /// becomes an empty paragraph; empty `text` becomes a single empty paragraph).
     pub fn from_plain_text(text: &str) -> Result<Self> {
+        Self::from_blocks(&blocks_from_plain_text(text))
+    }
+
+    /// Build a document from rich [`Block`]s (paragraphs, headings, code blocks, nested
+    /// lists, marked runs): the importer's and the CLI's way in. Every block kind here
+    /// is inside rinch's collaboration scope, so the result always projects.
+    pub fn from_blocks(blocks: &[Block]) -> Result<Self> {
         let schema = Rc::new(Schema::starter_kit());
-        let doc_node = plain_text_doc(&schema, text)?;
+        let doc_node = build_doc(&schema, blocks)?;
         let state = EditorState::create(schema.clone(), doc_node, default_plugins());
         let session = CollabSession::new(&state).map_err(|e| CrdtError::Collab(e.to_string()))?;
         Self::load(&session.snapshot())
@@ -76,7 +83,7 @@ impl ContentDoc {
     /// the delta is that whole snapshot.
     pub fn replace_plain_text(&mut self, text: &str) -> Result<Vec<u8>> {
         let schema = Rc::new(Schema::starter_kit());
-        let after = plain_text_doc(&schema, text)?;
+        let after = build_doc(&schema, &blocks_from_plain_text(text))?;
 
         let has_history = !self.doc.transact().state_vector().is_empty();
         let delta = if has_history {
@@ -222,9 +229,18 @@ impl ContentDoc {
     }
 
     /// Append every leaf text node under `node`, depth-first, in document order.
+    /// The text under `node`, with one newline between text blocks (so a list's
+    /// items read as lines, not as one run-on word) and none inside a block.
     fn collect_leaf_text(node: &Node, out: &mut String) {
         if let Some(t) = node.text() {
             out.push_str(t);
+        } else if node.is_textblock() {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            for child in node.content().iter() {
+                Self::collect_leaf_text(child, out);
+            }
         } else {
             for child in node.content().iter() {
                 Self::collect_leaf_text(child, out);
@@ -239,32 +255,10 @@ impl Default for ContentDoc {
     }
 }
 
-/// One `doc` node holding one `paragraph` per line of `text` (a blank line becomes an
-/// empty paragraph; empty `text` becomes a single empty paragraph).
-fn plain_text_doc(schema: &Rc<Schema>, text: &str) -> Result<Node> {
-    let mut paragraphs = Vec::new();
-    for line in text.split('\n') {
-        let content = if line.is_empty() {
-            Fragment::empty()
-        } else {
-            let text_node = schema
-                .text(line)
-                .map_err(|e| CrdtError::Collab(e.to_string()))?;
-            Fragment::from_node(text_node)
-        };
-        let paragraph = schema
-            .branch("paragraph", content)
-            .map_err(|e| CrdtError::Collab(e.to_string()))?;
-        paragraphs.push(paragraph);
-    }
-    schema
-        .branch("doc", Fragment::from_children(paragraphs))
-        .map_err(|e| CrdtError::Collab(e.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rinch_editor_core::Fragment;
 
     /// A replacement is an edit of the shared history: a peer holding the old
     /// snapshot that merges the delta ends up with exactly the new text, not the
@@ -298,6 +292,67 @@ mod tests {
         peer.apply_update(&delta).unwrap();
         assert_eq!(doc.text(), "hello");
         assert_eq!(peer.text(), "hello");
+    }
+
+    /// Rich blocks survive the trip into the CRDT and back out through the
+    /// projection: headings keep their level, lists nest, marks stay on their
+    /// runs, and a replica loading the bytes reads the same thing.
+    #[test]
+    fn rich_blocks_round_trip_through_the_projection() {
+        use crate::blocks::{Align, Block, ListItem, Mark, Run};
+        let blocks = vec![
+            Block::Heading { level: 2, runs: vec![Run::plain("Title")] },
+            Block::Paragraph {
+                runs: vec![
+                    Run::plain("plain "),
+                    Run::marked("bold", vec![Mark::Bold]),
+                    Run::marked(" link", vec![Mark::Link { href: "https://example.com".into() }]),
+                    Run::marked(" red", vec![Mark::TextColor { color: "#ff0000".into() }]),
+                ],
+                align: Align::Center,
+                indent: 1,
+            },
+            Block::BulletList {
+                items: vec![
+                    ListItem { blocks: vec![Block::plain("one")] },
+                    ListItem {
+                        blocks: vec![
+                            Block::plain("two"),
+                            Block::OrderedList { start: 3, items: vec![ListItem { blocks: vec![Block::plain("nested")] }] },
+                        ],
+                    },
+                ],
+            },
+            Block::CodeBlock { text: "let x = 1;".into() },
+        ];
+        let doc = ContentDoc::from_blocks(&blocks).unwrap();
+        let peer = ContentDoc::load(&doc.save()).unwrap();
+        let units = peer.units();
+        assert_eq!(units.len(), 4, "one unit per top-level block: {:?}", units);
+        assert!(matches!(units[0].kind, UnitKind::Heading(2)));
+        assert_eq!(units[0].text, "Title");
+        assert_eq!(units[1].text, "plain bold link red");
+        assert!(matches!(units[2].kind, UnitKind::Other(ref k) if k == "bullet_list"));
+        assert_eq!(units[2].text.replace('\n', "|"), "one|two|nested".to_string(), "{:?}", units[2].text);
+        assert!(matches!(units[3].kind, UnitKind::Code));
+
+        // Marks and attrs came back, not just text.
+        let session = CollabSession::from_bytes(&peer.save()).unwrap();
+        let node = session.projected_doc(&Schema::starter_kit()).unwrap();
+        let para = node.child(1);
+        assert_eq!(para.attrs().get_str("text_align"), Some("center"));
+        assert_eq!(para.attrs().get_int("indent"), Some(1));
+        let names: Vec<String> = (0..para.child_count())
+            .flat_map(|i| para.child(i).marks().iter().map(|m| m.type_name().to_string()).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(names, vec!["bold", "link", "text_color"]);
+    }
+
+    #[test]
+    fn empty_blocks_build_one_empty_paragraph() {
+        let doc = ContentDoc::from_blocks(&[]).unwrap();
+        assert_eq!(doc.units().len(), 1);
+        assert_eq!(doc.text(), "");
     }
 
     #[test]

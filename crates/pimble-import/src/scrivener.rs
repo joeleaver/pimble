@@ -14,7 +14,7 @@ use quick_xml::Reader;
 use tokio::fs;
 use tracing::info;
 
-use crate::rtf::rtf_to_text;
+use crate::rtf::rtf_to_blocks;
 
 /// A parsed binder item from the .scrivx file
 #[derive(Debug)]
@@ -62,8 +62,8 @@ pub async fn import_scrivener(scriv_path: &Path, output_path: &Path) -> Result<(
     store.flush().await?;
 
     info!(
-        "Import complete: {} folders, {} documents ({} with content)",
-        stats.folders, stats.documents, stats.with_content
+        "Import complete: {} folders, {} documents ({} with content); {} paragraphs, {} headings, {} lists, {} marked runs",
+        stats.folders, stats.documents, stats.with_content, stats.paragraphs, stats.headings, stats.lists, stats.marked_runs
     );
 
     Ok(())
@@ -74,6 +74,35 @@ struct ImportStats {
     folders: usize,
     documents: usize,
     with_content: usize,
+    paragraphs: usize,
+    headings: usize,
+    lists: usize,
+    marked_runs: usize,
+}
+
+impl ImportStats {
+    fn count_blocks(&mut self, blocks: &[pimble_crdt::Block]) {
+        use pimble_crdt::Block;
+        for block in blocks {
+            match block {
+                Block::Paragraph { runs, .. } => {
+                    self.paragraphs += 1;
+                    self.marked_runs += runs.iter().filter(|r| !r.marks.is_empty()).count();
+                }
+                Block::Heading { runs, .. } => {
+                    self.headings += 1;
+                    self.marked_runs += runs.iter().filter(|r| !r.marks.is_empty()).count();
+                }
+                Block::CodeBlock { .. } => self.paragraphs += 1,
+                Block::BulletList { items } | Block::OrderedList { items, .. } => {
+                    self.lists += 1;
+                    for item in items {
+                        self.count_blocks(&item.blocks);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Recursively import a BinderItem and its children into the store.
@@ -96,17 +125,23 @@ async fn import_binder_item(
 
     let node_id = store.create_node(node, Some(parent_id)).await?;
 
-    // Try to load RTF content for this item. `rtf_to_text` extracts the RTF's
-    // paragraphs (dropping bold/italic/link marks, which the CRDT content model
-    // doesn't carry yet) and joins them with '\n'.
+    // The item's RTF, as rich blocks: paragraphs with their marks (bold, italic,
+    // underline, strike, link, colour, highlight, code, sub/superscript),
+    // headings, nested bullet and ordered lists, alignment and indent. The
+    // node has no content yet, so seeding it with a whole document is right
+    // here (see CLAUDE.md on `updateNodeContent`).
     let rtf_path = data_dir.join(&item.uuid).join("content.rtf");
     if rtf_path.exists() {
         if let Ok(rtf_bytes) = fs::read(&rtf_path).await {
-            let text = rtf_to_text(&rtf_bytes);
-            if !text.trim().is_empty() {
-                let content_bytes = ContentDoc::from_plain_text(&text)?.save();
+            let blocks = rtf_to_blocks(&rtf_bytes);
+            let has_text = blocks.iter().any(|b| !b.plain_text().trim().is_empty());
+            if has_text {
+                let content_bytes = ContentDoc::from_blocks(&blocks)
+                    .with_context(|| format!("building content for {} ({})", item.title, item.uuid))?
+                    .save();
                 store.update_node_content(node_id, content_bytes).await?;
                 stats.with_content += 1;
+                stats.count_blocks(&blocks);
             }
         }
     }
@@ -268,7 +303,7 @@ mod tests {
         );
         fs::write(scriv_path.join("MyBook.scrivx"), scrivx).await.unwrap();
 
-        let rtf = br"{\rtf1\ansi\deff0 Hello RTF World}";
+        let rtf = br"{\rtf1\ansi\deff0 Hello {\b RTF} World\par\pard\ls1\ilvl0{\listtext	\u9679\'3F	}{\f0 an item}\par}";
         fs::write(data_dir.join("content.rtf"), rtf).await.unwrap();
 
         let output_path = root.path().join("MyBook.pimble");
@@ -292,5 +327,12 @@ mod tests {
             "expected imported content to contain the RTF text, got {:?}",
             text
         );
+        // The formatting made it into the CRDT, not only the text: a bold run
+        // and a bullet list (the `\listtext` bullet itself is not in the text).
+        let units = ContentDoc::load(&child.content).unwrap().units();
+        assert_eq!(units.len(), 2, "{units:?}");
+        assert!(matches!(units[1].kind, pimble_core::UnitKind::Other(ref k) if k == "bullet_list"), "{:?}", units[1]);
+        assert_eq!(units[1].text, "an item");
+        assert!(!text.contains('\u{25CF}'), "the bullet glyph must not be imported as text: {text:?}");
     }
 }
