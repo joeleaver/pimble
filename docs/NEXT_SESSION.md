@@ -1,44 +1,55 @@
 # Next session: start here
 
-Written 2026-09-15 at the end of the remote mounts session and updated the same day after
-two shorter pieces of work (the Scrivener importer, tree appearance). Read this, then
-`CLAUDE.md`, then `docs/RESTART_PLAN.md`.
+Written 2026-09-15 at the end of the remote mounts session, updated the same day after the
+Scrivener importer and tree appearance work, and again the same evening after **cloud
+phase 1** (branch `cloud/phase-1`). Read this, then `CLAUDE.md`, then
+`docs/CLOUD_CONTRACT.md` and `docs/DEPLOY.md`.
 
-## Where master stands
+## Where things stand
 
-- Branch `master`, working tree clean (see `git log`).
+- Branch `cloud/phase-1` off `master`, working tree clean. Not merged yet: merge once the
+  first deploy has been exercised.
+- **Cloud phase 1 is code-complete (2026-09-15), not deployed.** Joe decided to pause the
+  roadmap for a website with downloads and signup, a web app, and a hosted server, all on
+  jkbase (`~/dev/jkbase`, his own platform). Contract `docs/CLOUD_CONTRACT.md` (status
+  header lists the decisions made during the work); summary in `CLAUDE.md` "Cloud,
+  phase 1". Done, each in its own commit: JWT auth and per-store authorization in
+  `pimble-server` (94 tests across server and CLI); the `pimble-cloud` accounts service
+  (10 integration tests against a real `rhypedb-server`); `pimble-app` split into a UI
+  library and the desktop binary, `pimble-client` on wasm, and `web/` (trunk) verified end
+  to end with two browser tabs editing one document; `site/`, `jkbase.toml`,
+  `.github/workflows/{ci,release}.yml`, `docs/DEPLOY.md`.
+- **Live already:** the jkbase project `pimble` (id `pimble`) exists; `pimble.app` and
+  `www.pimble.app` point at it (Cloudflare, DNS only), are verified, and have Let's Encrypt
+  certificates. They answer 503 until the first deploy. `m.pimble.app` is a Resend sending
+  domain for phase 2 email.
+- **Not done:** the first `jkbase deploy` (needs `jkbase auth key create` and the secrets
+  in `docs/DEPLOY.md`; Joe confirms before deploying); the Windows release job has never
+  run; no `v*` tag exists, so the download page shows its empty state.
 - Both CRDT documents are yrs. No Automerge, no migrations, no backwards compatibility.
-- rinch is tracked from GitHub `main`, pinned in `Cargo.lock` at `743f8a0`.
-- Done since the restart: search on rhypedb (keyword + semantic), local mounts, replica sync
-  between Pimble servers, app polish, hardening (auth, credentials, replica removal, tree
-  repair, no-op sync), and **remote mounts (2026-09-15)**: a mount whose source store is
-  on another server makes the source a replica here and resolves locally; mount states
-  `Live` / `Connecting` / `Cached { last_sync }` / `Unavailable { reason }` derived from
-  the source's sync link and pushed to the app as `MountStateChanged`; "Mount Remote
-  Store Here..." in the app; `mount-remote-store` in the CLI. Three fixes found on the way:
-  a store opened implicitly now starts its sync link, a link forwards every change except
-  its own so edits travel a whole chain of servers, and `set-node-text` is a real CRDT edit.
-  Contracts and the decisions behind them are in `docs/history/`; summaries in
-  `CLAUDE.md`; architecture in `docs/ARCHITECTURE.md` ("Mount Architecture", "Replica
-  sync", "Auth").
-- After that, same day, without a contract (PM-only work, no agents): **the Scrivener
-  importer keeps rich text** (`6c21dbd`: `pimble_crdt::Block` model and
-  `ContentDoc::from_blocks`, the RTF parser rewritten, list buttons back in the toolbar)
-  and **tree appearance** (`16984df`, `223eb8c`: per-node and per-store icon and colour
-  in metadata, a picker with search over every Tabler icon and a tags field, Scrivener
-  labels and icons imported, View > "Toggle Dark Mode" at runtime and persisted). Both
-  are summarised in `CLAUDE.md` ("Collaboration shape", "Tree appearance") and in
-  follow-ups 13 and 18 below.
-- Workspace compiles with zero warnings. `cargo test --workspace --release` passes: 195
-  tests (see the commit messages for the exact runs).
+- rinch is tracked from GitHub `main`, pinned in both `Cargo.lock`s at `743f8a0`; the root
+  workspace no longer declares `rinch` itself (`crates/pimble-app/Cargo.toml` does).
+- Everything before the cloud work (search on rhypedb, local and remote mounts, replica
+  sync, hardening, the rich-text Scrivener importer, tree appearance) is summarised in
+  `CLAUDE.md`, with contracts in `docs/history/`.
+- Workspace compiles with zero warnings. `cargo test --workspace --release`: 235 passed,
+  5 ignored.
 
 ## Verify in five minutes
 
 ```bash
 cargo check --workspace --all-targets      # expect zero warnings
-cargo test --workspace --release --no-fail-fast
+cargo test --workspace --release --no-fail-fast   # pimble-cloud tests need ~/dev/rhypedb/target/debug/rhypedb-server
 cargo build -p pimble-app -p pimble-cli --release   # build together: see follow-up 8
+cd web && trunk build --release && cd ..   # the browser build
 ```
+
+Cloud, headless: `crates/pimble-cloud/README.md` and `web/README.md` have the four-process
+local stack (accounts service on 8080 in development-signing mode, `pimble-cli server`
+with `--jwks http://127.0.0.1:8080/api/v1/.well-known/jwks.json --issuer
+http://127.0.0.1:8080/api/v1 --allow-origin http://127.0.0.1:8081 --stores-dir ...`, the
+site from a static server, `trunk serve` for the web app). Sign up on the site, create a
+store on the account page, open `/app/`, edit in two tabs.
 
 Headless remote mount, three servers on one machine (the binary is `target/release/pimble`
 for the app, `pimble-cli` for the CLI). Give every server its own `XDG_CONFIG_HOME` and
@@ -119,7 +130,12 @@ after "Copy as Mount Source" again.
 
 ## Follow-ups, in rough priority
 
-1. TLS (`wss://`). Tokens go over plain `ws://`; fine on a trusted LAN, not beyond it.
+0. **Deploy cloud phase 1** (`docs/DEPLOY.md`): issuer key, secrets, `jkbase deploy`, then
+   sign up on pimble.app, create a store, open the web app, edit from two browsers. Then
+   tag `v0.1.0` to exercise the release workflow (the Windows job is unverified) and merge
+   `cloud/phase-1`. Then phase 2: desktop sign-in (`AuthMethod::CloudSession` so the sync
+   link mints a fresh JWT before each connect), the relay, email through Resend.
+1. TLS for a self-run `pimble-cli server` (`wss://`). Tokens go over plain `ws://`; fine on a trusted LAN, not beyond it. The hosted server on jkbase is behind the edge's TLS already.
 2. Two servers on one machine opening the same store directory (a mount resolved through
    `source_path` while another server holds the source) share `nodes/*.yrs` and fight over
    the rhypedb lock. A lock file per store directory, or refusing to open a directory

@@ -1,7 +1,15 @@
 # Cloud contract, phase 1: accounts, hosted server, web app, website
 
-Status: in progress (started 2026-09-15). Decided with Joe the same day: everything
-server-side runs on jkbase (`~/dev/jkbase`, Joe's own platform, live at jkbase.app).
+Status: code done 2026-09-15 (branch `cloud/phase-1`), not yet deployed. Implemented as
+written, with these decisions made during the work: `listRemoteStores` is `Service`-only
+like its siblings; `createMount` and `getMountState` authorize against the mount's source
+store as `getChildren` does; the accounts service refuses to demote the last owner as well
+as to remove them; `/.well-known/jwks.json`, `/releases` and `/health` live under `/api/v1`
+so the edge routes reach them; the accounts schema carries denormalized scalar ids because
+RhypeDB's query language has no relation-equality filter; the jkbase project id is
+`pimble` and the public origin is `https://pimble.app` (custom domain, verified, with
+certificates). Decided with Joe the same day: everything server-side runs on jkbase
+(`~/dev/jkbase`, Joe's own platform, live at jkbase.app).
 
 ## Goal
 

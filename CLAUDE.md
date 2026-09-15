@@ -39,9 +39,11 @@ re-import from Scrivener.
 | `pimble-rpc` / `pimble-server` / `pimble-client` | RPC protocol, embedded server, WebSocket client | Complete |
 | `pimble-search` | rhypedb index per store: keyword (`@fulltext`, BM25), chunked embeddings behind `semantic`, backlinks | Complete |
 | `pimble-plugins` | `NodePlugin` trait, built-ins | Skeleton |
-| `pimble-app` | rinch desktop app | Works: two-window live editing, persistence, local and remote mounts, replica sync UI |
+| `pimble-app` | UI library (desktop and web) plus the `pimble` desktop binary | Works: two-window live editing, persistence, local and remote mounts, replica sync UI |
 | `pimble-cli` | server, stores, nodes, mounts, replica sync, search | Complete |
 | `pimble-import` | Scrivener + RTF import | Complete |
+| `pimble-cloud` | Pimble Cloud accounts service: users, sessions, hosted stores, grants, JWTs | Complete (phase 1) |
+| `web/` (`pimble-web`) | the same UI built for the browser with trunk; its own cargo workspace | Complete (phase 1) |
 
 Node content is a yrs document (`pimble_crdt::ContentDoc`), stored as `nodes/{id}.yrs`.
 The server holds one `ContentDoc` per open node, merges every `applyEdit` update, relays
@@ -207,6 +209,64 @@ tag with the label's name, and its `IconFileName` to an icon where one matches. 
 `set_dark_mode`, `state.json` `dark_mode`); the app stylesheet uses only rinch's semantic
 colour variables, never the dark palette directly, so both schemes work.
 
+### Cloud, phase 1 (code done 2026-09-15, not yet deployed)
+
+Contract: `docs/CLOUD_CONTRACT.md`; operations: `docs/DEPLOY.md`. Everything server-side
+runs on jkbase (`~/dev/jkbase`, Joe's own platform; read it, never edit it) as one project
+`pimble` on one origin, `https://pimble.app` (DNS and certificates are live; the platform
+subdomain `pimble.jkbase.app` works too): `site/` at `/`, `web/` at `/app/`,
+`crates/pimble-cloud` at `/api/*`, and `pimble-cli server` at `/rpc`, all declared in
+`jkbase.toml`.
+
+- **Identity.** A user is a UUID `sub` with an argon2id password in the accounts service's
+  managed RhypeDB (`crates/pimble-cloud/schema.rhype`). A grant is `(user, store, role)`,
+  role `owner | editor | reader`; a store always keeps at least one owner. A token is an
+  EdDSA JWT minted by jkbase-Auth (`https://auth.jkbase.app/v1/projects/pimble`) or, in
+  development, by the service's own Ed25519 key; `aud` is `pimble` and the custom claims
+  carry `email` and `stores: { <store id>: <role> }`. Tokens live an hour, so Pimble servers
+  hold no account state: they verify against a JWKS and read grants from the token.
+- **pimble-server.** `AuthMiddleware` resolves a `Principal` per connection (`Service` for
+  the static token or a tokenless loopback server; `User { sub, email, grants }` for a JWT)
+  and attaches it to the request extensions; every store-scoped RPC declares
+  `with_extensions` in `pimble-rpc` and calls `authorize(principal, store_id, Read|Write)`
+  first. Readers read, editors and owners write, anything touching a mount authorizes
+  against the source store too, `listStores` and `search` filter to readable stores, and
+  store lifecycle RPCs (`createStore`, `openStore`, `closeStore`, `addRemoteStore`,
+  `listRemoteStores`, `setStoreSync`, `removeReplica`) are `Service`-only. Denied is
+  JSON-RPC `-32004`. Credentials arrive as `Authorization: Bearer`, `X-Api-Key`, or the
+  `access_token` query parameter (a browser WebSocket cannot set headers). An origin
+  allowlist (`--allow-origin` / `PIMBLE_ALLOW_ORIGINS`) admits browsers; the embedded app
+  server sets none and refuses every `Origin` as before. `pimble-cli server` takes
+  `--jwks`, `--issuer`, `--allow-origin`, `--stores-dir` (opens every `*.pimble` in it) and
+  env fallbacks for every flag (`PIMBLE_ADDR`, `PIMBLE_SERVER_TOKEN`, `PIMBLE_JWKS_URL`,
+  `PIMBLE_JWT_ISSUER`, `PIMBLE_ALLOW_ORIGINS`, `PIMBLE_STORES_DIR`).
+- **pimble-cloud.** axum under `/api/v1`: signup, login, logout, me, token, stores (create
+  goes through `createStore` on the hosted server with the static token), members,
+  releases (GitHub, cached), `.well-known/jwks.json`, health. Sessions are opaque 30-day
+  tokens hashed at rest, sent as the `pimble_session` cookie or a bearer header. Tests run
+  against a real `rhypedb-server` process (`~/dev/rhypedb/target/debug/rhypedb-server`) and
+  skip when it is absent.
+- **App split.** `pimble-app` is a library: UI, state, events, editor wiring,
+  `protocol.rs` (`BackendCommand`/`BackendEvent`), `commands.rs` (`process_command`, shared
+  by both backends), `rinch_editor.rs` (the editor types from whichever rinch backend is
+  in play). The embedded server, tokio thread and persistence are behind the default
+  `native` feature; the `web` feature takes `rinch-web`'s collaboration adapter. rinch is
+  declared in `crates/pimble-app/Cargo.toml` with default features off, not in the root
+  workspace. `--no-default-features` alone means "the UI library"; the keyword-only desktop
+  build is `--no-default-features --features native`.
+- **web/** is its own cargo workspace (`pimble-web`, trunk, `public_url = "/app/"`). On
+  start it `POST`s `/api/v1/token` with the session cookie (401 sends the visitor to
+  `/login.html`), connects `PimbleClient` to the returned `rpc_url` with the token in the
+  query string, fills the tree from `listStores`, refreshes the token five minutes before
+  expiry and reconnects with backoff. Both `Cargo.lock`s must pin the same rinch revision
+  (`cd web && cargo update -p rinch --precise <sha>` alongside the root update).
+- **Site and CI.** `site/` is static HTML/CSS/JS. `.github/workflows/ci.yml` checks and
+  tests; `release.yml` builds Linux and Windows packages on a `v*` tag and attaches them
+  to a GitHub release, which the download page reads through `/api/v1/releases`.
+- **Phase 2** (designed for, not built): desktop sign-in with `AuthMethod::CloudSession`,
+  the relay server, email via Resend (`m.pimble.app`) for verification and invitations.
+  Phase 3: teams.
+
 ## Key Files
 
 - `docs/RESTART_PLAN.md` - vision, diagnosis, decisions, ordered plan
@@ -218,7 +278,12 @@ colour variables, never the dark palette directly, so both schemes work.
 - `crates/pimble-server/src/handler.rs` - RPC method implementations
 - `crates/pimble-app/src/app.rs` - UI tree, menus, rename, drag-and-drop
 - `crates/pimble-app/src/editor.rs` - editor pane + collaboration wiring
-- `crates/pimble-app/src/backend.rs` - background thread, embedded server, `BackendCommand`/`BackendEvent`
+- `crates/pimble-app/src/protocol.rs` - `BackendCommand`/`BackendEvent`; `commands.rs` - `process_command`, shared by desktop and web
+- `crates/pimble-app/src/backend.rs` - desktop background thread and embedded server (`native` only)
+- `crates/pimble-server/src/auth.rs`, `jwt.rs`, `principal.rs` - HTTP-edge auth, JWT verification, `Principal` and `authorize`
+- `crates/pimble-cloud/src/routes/` - the accounts API; `schema.rhype` - its RhypeDB schema
+- `web/src/backend.rs` - the browser backend (token, connection, reconnect)
+- `jkbase.toml`, `docs/DEPLOY.md` - deployment
 - `crates/pimble-app/src/events.rs` - `BackendEvent` -> UI state
 - `crates/pimble-app/src/appearance.rs` - tree icon and colour choices, name lookup, dark-theme legibility
 
@@ -228,14 +293,18 @@ colour variables, never the dark palette directly, so both schemes work.
 cargo check --workspace
 cargo build -p pimble-app --release
 cargo run -p pimble-app --release          # starts the embedded server itself
+cd web && trunk build --release            # the browser build, dist/ (cargo install trunk once)
 ```
+
+The full local stack (accounts service, a `pimble-cli server` in JWT mode, the site and
+the web app) is described in `web/README.md` and `docs/DEPLOY.md`.
 
 The app has the rinch `debug` feature on, so the rinch MCP tools (`list_apps`, `connect`,
 `screenshot`, `dom_tree`, `click`, `type_text`) can drive a running instance.
 
 ## Dependencies
 
-- `rinch` (git main) with features `desktop, components, theme, file-dialogs, clipboard, debug, collaboration`; software rendering (no `gpu`, which would need rinch's wgpu fork patch)
+- `rinch` (git main), declared in `crates/pimble-app/Cargo.toml`: default features off, `native` adds `desktop, file-dialogs, clipboard, debug, collaboration`, `web` adds `rinch-web` with `collaboration`; software rendering (no `gpu`, which would need rinch's wgpu fork patch)
 - `rinch-editor-core` (git main)
 - `yrs` 0.27 for both CRDT documents; `rinch-editor-collab` (git main) wraps it for node
   content's rich-text schema, the store document uses `yrs` directly (Maps and Arrays)
