@@ -36,7 +36,18 @@ thread_local! {
 /// The app's editor handle (created on first use). Cheap to clone (an `Rc`); the
 /// toolbar, the `Editor {}` component, and the event loop all share this one handle.
 pub(crate) fn editor() -> EditorHandle {
-    EDITOR.with(|e| e.borrow_mut().get_or_insert_with(create_editor).clone())
+    EDITOR.with(|e| {
+        e.borrow_mut()
+            .get_or_insert_with(|| {
+                let handle = create_editor();
+                // Typing, commands and remote deltas all land here; the
+                // toolbar's active states follow immediately (cursor-only
+                // moves are covered by the toolbar's own watcher).
+                handle.on_change(crate::toolbar::bump_toolbar);
+                handle
+            })
+            .clone()
+    })
 }
 
 /// Begin editing `node_id`: load its content into the shared editor and start a
@@ -110,6 +121,8 @@ pub(crate) fn start_editing(
     store.editor_dirty.set(false);
     // See edits from other clients.
     store.send(BackendCommand::SubscribeNodeChanges { store_id, node_id });
+    // A different document is under the toolbar now.
+    crate::toolbar::bump_toolbar();
 }
 
 /// Stop editing the current node (detach the collab session).
@@ -117,6 +130,7 @@ pub(crate) fn stop_editing(store: AppStore) {
     editor().stop_collaboration();
     store.active_edit.set(None);
     cancel_pending_label_refresh();
+    crate::toolbar::bump_toolbar();
 }
 
 /// Cancel any debounced label refresh left over from a prior editing session.

@@ -4,25 +4,75 @@
 //! button active-state and dropdowns update correctly — unlike the upstream
 //! `render_toolbar` which renders once and never updates.
 
+use std::cell::Cell;
+
 use rinch::prelude::*;
 use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
 
 use crate::editor::editor;
 
-/// A Signal bumped after every editor command so toolbar closures re-evaluate.
+/// A Signal bumped whenever the toolbar's active states may have changed, so
+/// the per-button style closures re-evaluate.
 static TOOLBAR_VERSION: std::sync::OnceLock<Signal<u32>> = std::sync::OnceLock::new();
 
 pub(crate) fn toolbar_version() -> Signal<u32> {
     *TOOLBAR_VERSION.get_or_init(|| Signal::new(0))
 }
 
-/// Call this after an editor command to refresh toolbar state.
-/// Deferred via run_on_main_thread so it doesn't fire while the editor's
-/// RefCell is still mutably borrowed by the operation that triggered it.
+thread_local! {
+    /// The last active-state fingerprint the watcher saw (see `watch_toolbar`).
+    static LAST_FINGERPRINT: Cell<u64> = const { Cell::new(u64::MAX) };
+    /// Whether the self-rescheduling watcher is running.
+    static WATCHING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// How often the watcher re-reads the editor state. Cursor moves fire no
+/// editor callback, so this is what keeps the buttons honest while the
+/// caret travels; a handful of RefCell reads per tick, nothing more.
+const WATCH_INTERVAL_MS: u32 = 120;
+
+/// Refresh the toolbar now. Deferred via `run_on_main_thread` so it never
+/// runs while the editor's RefCell is still mutably borrowed by the
+/// operation that triggered it (a command, a change callback).
 pub(crate) fn bump_toolbar() {
     rinch::run_on_main_thread(|| {
+        LAST_FINGERPRINT.with(|f| f.set(u64::MAX));
         toolbar_version().update(|v| *v = v.wrapping_add(1));
     });
+}
+
+/// Every button's active state packed into bits, so a change anywhere is
+/// one integer compare.
+fn fingerprint() -> u64 {
+    let h = editor();
+    let mut bits = 0u64;
+    for (i, def) in button_groups().into_iter().flatten().enumerate() {
+        if check_active_with(&h, &def.active_check) {
+            bits |= 1 << i;
+        }
+    }
+    bits
+}
+
+/// Start (idempotently) a light poll that bumps the toolbar only when its
+/// active states actually changed. Called once from `render_pimble_toolbar`.
+fn watch_toolbar() {
+    if WATCHING.with(|w| w.replace(true)) {
+        return;
+    }
+    fn tick() {
+        let now = fingerprint();
+        let changed = LAST_FINGERPRINT.with(|f| {
+            let changed = f.get() != now;
+            f.set(now);
+            changed
+        });
+        if changed {
+            toolbar_version().update(|v| *v = v.wrapping_add(1));
+        }
+        set_timeout(WATCH_INTERVAL_MS, tick);
+    }
+    set_timeout(WATCH_INTERVAL_MS, tick);
 }
 
 // ── Toolbar button definitions ───────────────────────────────────────────
@@ -99,14 +149,29 @@ fn mark_name(tag: &str) -> Option<&'static str> {
     })
 }
 
+/// The `level` of the heading the cursor is in, or `None` when the block at
+/// the selection head is not a heading (or the selection spans blocks).
+fn heading_level(h: &EditorHandle) -> Option<i64> {
+    let state = h.state();
+    let resolved = state.doc.resolve(state.selection.head()).ok()?;
+    let block = resolved.parent();
+    if block.type_name() != "heading" {
+        return None;
+    }
+    block.attrs().get_int("level")
+}
+
 fn check_active(check: &ActiveCheck) -> bool {
-    let h = editor();
+    check_active_with(&editor(), check)
+}
+
+fn check_active_with(h: &EditorHandle, check: &ActiveCheck) -> bool {
     match check {
         ActiveCheck::Mark(tag) => mark_name(tag).map(|m| h.is_mark_active(m)).unwrap_or(false),
         ActiveCheck::Block(tag) => match *tag {
-            // The handle reports the block type but not the heading level, so all
-            // heading buttons share the "in a heading" active state.
-            "h1" | "h2" | "h3" => h.current_block_type().as_deref() == Some("heading"),
+            "h1" => heading_level(h) == Some(1),
+            "h2" => heading_level(h) == Some(2),
+            "h3" => heading_level(h) == Some(3),
             "ul" => h.in_node_type("bullet_list"),
             "ol" => h.in_node_type("ordered_list"),
             "blockquote" => h.in_node_type("blockquote"),
@@ -181,6 +246,7 @@ fn btn_style(active: bool) -> String {
 pub(crate) fn render_pimble_toolbar(__scope: &mut RenderScope) -> NodeHandle {
     let version = toolbar_version();
     let groups = button_groups();
+    watch_toolbar();
 
     let toolbar = rsx! {
         div {
