@@ -69,6 +69,7 @@ repo root for the full design; this file is how to run it.
 | `PIMBLE_CLOUD_RELEASES_BASE_URL` | overrides the GitHub API base URL for `/releases` | `https://api.github.com` (not part of the contract; exists so tests can point this at a local stub instead of the network) |
 | `RESEND_API_KEY` | Resend API key; unset means `LogMailer` (verification links are logged at `info`, not emailed) | unset |
 | `PIMBLE_MAIL_FROM` | the `from` address on every mail this service sends | `Pimble <no-reply@m.pimble.app>` |
+| `PIMBLE_CLOUD_KDF_DECOY_SECRET` | the HMAC key `GET /kdf` derives an unknown email's decoy salt from | random (logs a warning; still deterministic within one process's lifetime) |
 
 `PIMBLE_CLOUD_PUBLIC_URL`'s scheme decides two things: whether the session
 cookie is marked `Secure`, and whether `/token`'s `rpc_url` is `ws://` or
@@ -80,10 +81,65 @@ Locally there is no such proxy, so `rpc_url` from a local `pimble-cloud`
 won't resolve on its own — connect a `PimbleClient` straight to
 `PIMBLE_SERVER_URL` with the minted `token` for manual testing instead.
 
+## End-to-end encryption (Phase 2a)
+
+docs/CRYPTO_CONTRACT.md: the server never sees a password or a plaintext
+key. A real client (the web app, or the desktop app signing in) uses
+`pimble-crypto` to do all of this:
+
+1. **`GET /api/v1/kdf?email=`** returns `{ salt, m_cost, t_cost, p_cost }` —
+   a real user's stored Argon2id parameters, or (same shape, so a passive
+   observer can't tell) a deterministic decoy derived by HMAC-SHA256 of the
+   lowercased email under `PIMBLE_CLOUD_KDF_DECOY_SECRET` for an unknown one.
+2. The client derives `auth_key`/`kek` from the password and those params
+   (`pimble_crypto::derive_password_keys`), generates an account X25519/Ed25519
+   keypair, wraps it under `kek`, generates a recovery code and wraps the
+   same keypair under a KEK derived from it too.
+3. **`POST /api/v1/signup`** carries `auth_key` (base64url; hashed again with
+   Argon2id at rest, exactly like a password before this phase), `kdf`,
+   `public_keys: { encryption, signing }`, `account_key_blob`,
+   `recovery_salt`, `recovery_key_blob` (the last two blobs are
+   `pimble_crypto::AccountKeyBlob`, stored as opaque JSON strings). Everything
+   else about signup (202, no session, verification email, duplicate/resend
+   rules) is unchanged from Phase 1b, below.
+4. **`POST /api/v1/login { email, auth_key }`** — same otherwise.
+5. **`GET /api/v1/me/keys`** (session): `{ public_keys, kdf, account_key_blob }` —
+   never `recovery_salt`/`recovery_key_blob`. The client unwraps
+   `account_key_blob` locally with the password-derived `kek`.
+6. **`GET /api/v1/users/lookup?email=`** (session, rate limited — see the
+   design note below): `{ id, public_keys }` for a verified user, `404`
+   otherwise (unknown address or real-but-unverified, same shape either
+   way) — what a sharer uses to wrap a store key to someone.
+7. **`POST /api/v1/stores { name, kind?, store_id? }`**: `kind` is `"plain"`
+   (default) or `"vault"`; `store_id`, when given, asks the Pimble server to
+   create the hosted store under that exact id (refused if already open
+   there) — how a desktop app hosts an existing local store's twin. The
+   response (and every `GET /stores` row) now also carries `kind`.
+8. **`GET`/`PUT /api/v1/stores/{id}/keys`**: `GET` (any grant) returns the
+   caller's own `{ envelopes: [{ key_id, envelope }] }` for that store, never
+   another member's. `PUT { envelopes: [{ user_id, key_id, envelope }] }`
+   upserts one or more; an owner or editor may always set their own, only an
+   owner may set someone else's; every envelope's Ed25519 signature is
+   verified against the *caller's* `public_signing_key` (whoever is doing the
+   `PUT` must be the one who signed it) before it's stored.
+9. **`POST /api/v1/recover { email, recovery_code_auth }`** is `501` — Phase
+   2a only stores the recovery blob at signup; using it to actually recover
+   is a later phase.
+
+**Migration**: `User` gained nine required fields (`kdf_*`,
+`public_*_key`, `account_key_blob`, `recovery_salt`, `recovery_key_blob`) with
+no default — a pre-Phase-2a row (the two keyless smoke accounts from
+initial testing) cannot satisfy the new schema and is orphaned by this
+change. They were never real accounts; deleting them (or leaving them
+orphaned — nothing reads a `User` row that doesn't have this crate's full
+current field set) is the intended cleanup, not a bug.
+
 ## Email verification
 
 An account can't log in until its email address is verified (docs/
-CLOUD_CONTRACT.md, "Phase 1b: email verification"). The flow:
+CLOUD_CONTRACT.md, "Phase 1b: email verification"; the redirects below now
+target the web app per docs/CRYPTO_CONTRACT.md — "the web app owns the
+account pages now"). The flow:
 
 1. `POST /signup` creates the user **unverified**, sends a mail with a
    `<PIMBLE_CLOUD_PUBLIC_URL>/api/v1/verify?token=...` link (24h expiry), and
@@ -92,11 +148,13 @@ CLOUD_CONTRACT.md, "Phase 1b: email verification"). The flow:
    just re-sends the link (also 202); a verified duplicate is `409`.
 2. `GET /api/v1/verify?token=...` (what the mail links to; a browser follows
    it) marks the account verified and redirects (`303`) to
-   `/login.html?verified=1`, or to `/login.html?verify_error=invalid` /
+   `/app/login?verified=1`, or to `/app/login?verify_error=invalid` /
    `...=expired` for a bad token.
 3. `POST /api/v1/resend-verification { "email" }` always answers `202`; it
    re-sends only for a real, still-unverified address, and only once per
-   minute per address (silently ignored otherwise — still `202`).
+   minute per address (silently ignored otherwise — still `202`) — a send
+   from `POST /signup` counts too, so a resend moments after signing up is
+   also silent.
 4. `POST /login` for an unverified account is `403 { "error":
    "email_unverified", "message": "..." }`, checked after the password (so a
    wrong password is still a plain `401`, never a hint that the email
@@ -120,13 +178,33 @@ mailer is chosen once at startup from whether the key is set.
 
 ## Example requests
 
+Signup's real body needs real `pimble-crypto` output (a KDF salt, a wrapped
+key blob, …) that isn't something to type by hand — `tests/integration.rs`'s
+`build_signup_body` builds one exactly as a real client would and is the
+easiest way to see one on the wire (run a test with `--nocapture` and a
+`reqwest` tracing filter, or read the helper itself). The shape:
+
 ```bash
+# GET /kdf first (a real client always does, for both signup and login)
+curl -s 'http://127.0.0.1:8080/api/v1/kdf?email=alice@example.com'
+# -> {"salt":"<base64url>","m_cost":32768,"t_cost":3,"p_cost":1} (real or decoy)
+
 # Sign up: 202, no session — check the LogMailer log (or your inbox with a
 # real RESEND_API_KEY) for the verification link, then follow it in a
 # browser (or curl -i, to read the Location header) before logging in.
+# auth_key/kdf/public_keys/account_key_blob/recovery_salt/recovery_key_blob
+# all come from pimble_crypto — the values below are illustrative shapes.
 curl -si -X POST http://127.0.0.1:8080/api/v1/signup \
   -H 'Content-Type: application/json' \
-  -d '{"email": "alice@example.com", "password": "correct horse battery staple"}'
+  -d '{
+    "email": "alice@example.com",
+    "auth_key": "<base64url, pimble_crypto::encode_auth_key>",
+    "kdf": {"salt": "<base64url>", "m_cost": 32768, "t_cost": 3, "p_cost": 1},
+    "public_keys": {"encryption": "<base64url>", "signing": "<base64url>"},
+    "account_key_blob": {"v": 1, "nonce": "<base64url>", "ciphertext": "<base64url>"},
+    "recovery_salt": "<base64url>",
+    "recovery_key_blob": {"v": 1, "nonce": "<base64url>", "ciphertext": "<base64url>"}
+  }'
 
 # Resend the verification link (202 either way; a no-op for an unknown or
 # already-verified address, and rate-limited to once per minute)
@@ -136,14 +214,20 @@ curl -s -X POST http://127.0.0.1:8080/api/v1/resend-verification \
 # Log in (also 403 email_unverified until the link above has been followed)
 curl -sc cookies.txt -X POST http://127.0.0.1:8080/api/v1/login \
   -H 'Content-Type: application/json' \
-  -d '{"email": "alice@example.com", "password": "correct horse battery staple"}'
+  -d '{"email": "alice@example.com", "auth_key": "<base64url, from the real kdf params above>"}'
 
-# Who am I
+# Who am I / my keys (never the recovery blob)
 curl -sb cookies.txt http://127.0.0.1:8080/api/v1/me
+curl -sb cookies.txt http://127.0.0.1:8080/api/v1/me/keys
 
-# Create a hosted store (creates it on the Pimble server + an owner grant)
+# Look someone up by email (session required, rate limited) — what a
+# sharer uses to get a recipient's public keys before wrapping a key to them
+curl -sb cookies.txt 'http://127.0.0.1:8080/api/v1/users/lookup?email=bob@example.com'
+
+# Create a hosted store (creates it on the Pimble server + an owner grant);
+# kind defaults to "plain", store_id is optional
 curl -sb cookies.txt -X POST http://127.0.0.1:8080/api/v1/stores \
-  -H 'Content-Type: application/json' -d '{"name": "My Notes"}'
+  -H 'Content-Type: application/json' -d '{"name": "My Notes", "kind": "vault"}'
 
 # List my stores
 curl -sb cookies.txt http://127.0.0.1:8080/api/v1/stores
@@ -151,6 +235,13 @@ curl -sb cookies.txt http://127.0.0.1:8080/api/v1/stores
 # Add a member
 curl -sb cookies.txt -X PUT http://127.0.0.1:8080/api/v1/stores/<store-id>/members \
   -H 'Content-Type: application/json' -d '{"email": "bob@example.com", "role": "editor"}'
+
+# My own key envelopes for a store, and setting one (envelope from
+# pimble_crypto::wrap_key, signed by the caller's own signing key)
+curl -sb cookies.txt http://127.0.0.1:8080/api/v1/stores/<store-id>/keys
+curl -sb cookies.txt -X PUT http://127.0.0.1:8080/api/v1/stores/<store-id>/keys \
+  -H 'Content-Type: application/json' \
+  -d '{"envelopes": [{"user_id": "<my user id>", "key_id": "<uuid>", "envelope": { "...": "a pimble_crypto::KeyEnvelope" }}]}'
 
 # Mint a fresh JWT for the Pimble server (Authorization: Bearer <session> works in
 # place of the cookie, too — this is what a non-browser caller uses)
@@ -249,3 +340,44 @@ elsewhere) so the `/releases` tests never touch the network.
   `LogMailer::last_message` plus `mail::first_url` are the "test-only
   accessor" the contract asks for — `tests/integration.rs`'s
   `extract_verify_token` is the one place that calls them.
+- **`PimbleService` (`src/pimble.rs`) talks to the Pimble server over a raw
+  jsonrpsee connection** (`pimble_rpc::PimbleApiClient`, generated in
+  `pimble-rpc`), not through `pimble_client::PimbleClient::create_store`.
+  That wrapper still hardcodes `kind: Default::default(), store_id: None`
+  and `pimble-client/src/client.rs` had a concurrent editor (agent A/B's
+  vault-RPC wrappers) while this crate's Phase 2a work landed — extending it
+  risked clobbering in-flight, out-of-scope work. `pimble-client` is still a
+  dependency (used by `tests/integration.rs` and `src/error.rs`'s `From`
+  impl); only the one `createStore` call bypasses it. Once
+  `PimbleClient::create_store` grows `kind`/`store_id` parameters, `pimble.rs`
+  should switch back to it and this crate can drop its own `pimble-rpc`/
+  `jsonrpsee` dependencies.
+- **Envelope signature verification (`src/envelope.rs`) reimplements
+  `pimble-crypto`'s private `envelope_signing_bytes`** rather than calling
+  `pimble_crypto::unwrap_key`: that function needs the *recipient's* private
+  `AccountKeys` to unwrap the key afterwards, which the server never has,
+  and the signing-bytes helper itself isn't `pub`. The exact layout (`v ||
+  key_id || recipient || ephemeral || nonce || ciphertext || context`, with
+  `recipient`/`ephemeral`/`nonce`/`ciphertext` as their **decoded raw
+  bytes**, not the base64url string) was confirmed by reading
+  `wrap_key`/`unwrap_key` in `pimble-crypto/src/lib.rs` directly, not
+  guessed from the `KeyEnvelope` doc comment alone — the doc comment doesn't
+  say whether those fields are raw or encoded, and getting it wrong would
+  make every real envelope fail verification here. If `pimble-crypto` ever
+  exports that helper, `src/envelope.rs` should call it instead.
+- **`users_lookup_rate_limit`'s interval (200ms, in `src/state.rs`) is a
+  judgment call**, not a number the contract gives: it only says "rate
+  limited". Chosen to survive ordinary UI use (typing an email into a share
+  dialog) while still blocking a scripted enumeration loop.
+- **`KeyGrant` mirrors `Grant`'s denormalization** (`user_rid`/`store_rid`/
+  `store_uuid` scalar copies alongside the `user`/`store` relations) for the
+  same reason: no relation-equality filter in the query language.
+  `(user, store, key_id)` uniqueness is enforced in the service
+  (find-then-create/update in `routes/stores.rs::put_store_keys`), not the
+  schema — key rotation adds a new `key_id` and new envelopes per member
+  rather than mutating an old row, so old blobs keep decrypting.
+- **`NewUserKeyMaterial::placeholder_for_tests`** exists because every
+  `User` field is now schema-required; a test that needs a user row to
+  exist without exercising any crypto endpoint (mail/rate-limit tests that
+  call `db.create_user` directly) uses it rather than inventing its own
+  dummy strings inline.

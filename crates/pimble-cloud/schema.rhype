@@ -29,6 +29,9 @@ type User {
     user_uuid: String @unique
     email: String
     email_lower: String @unique
+    // Argon2id(auth_key) since phase 2a (docs/CRYPTO_CONTRACT.md): the field
+    // and the hashing are unchanged from phase 1b's password_hash, only what
+    // gets hashed changed (the server never sees a password any more).
     password_hash: String
     created_at: DateTime
     // Phase 1b (email verification): unverified at signup. `verify_token_hash`
@@ -39,6 +42,22 @@ type User {
     verified: Bool
     verify_token_hash: String
     verify_expires_at: DateTime
+    // Phase 2a (docs/CRYPTO_CONTRACT.md "Data model additions"): every field
+    // below is required from signup on — there is no keyless `User` row any
+    // more (the two pre-phase-2a smoke accounts are deleted on migration; see
+    // this crate's README). `kdf_*` and `public_*` are plain scalars;
+    // `account_key_blob` and `recovery_key_blob` are `pimble_crypto::
+    // AccountKeyBlob` serialized to a JSON string (opaque to this schema,
+    // exactly like `KeyGrant.envelope` below).
+    kdf_salt: String
+    kdf_m_cost: u32
+    kdf_t_cost: u32
+    kdf_p_cost: u32
+    public_encryption_key: String
+    public_signing_key: String
+    account_key_blob: String
+    recovery_salt: String
+    recovery_key_blob: String
 }
 
 type Session {
@@ -55,12 +74,38 @@ type HostedStore {
     dir_name: String
     created_at: DateTime
     deleted: Bool
+    // Phase 2a (docs/CRYPTO_CONTRACT.md): `"plain"` or `"vault"`, matching
+    // `pimble_core::StoreKind`'s serde spelling. Missing on no row created by
+    // this crate (every `create_hosted_store` call sets it), kept as a plain
+    // required String like every other field here rather than an enum, since
+    // this schema has no enum type and the Pimble server is the source of
+    // truth for what the string means.
+    kind: String
 }
 
 type Grant {
     user: User
     store: HostedStore
     role: String
+    user_rid: u64 @indexed
+    store_rid: u64 @indexed
+    store_uuid: String
+}
+
+// Phase 2a (docs/CRYPTO_CONTRACT.md "Data model additions"): one row per
+// (user, store, key_id) — a store's key rotates by adding a new key_id and
+// new envelopes per member, never by mutating an old row (old blobs still
+// need their old envelope to decrypt). `(user, store, key_id)` uniqueness is
+// enforced in the service, like `Grant`'s `(user, store)` — see schema.rhype's
+// header comment on why relation-pair uniqueness isn't a schema-level thing
+// here.
+type KeyGrant {
+    user: User
+    store: HostedStore
+    key_id: String
+    // A `pimble_crypto::KeyEnvelope` serialized to a JSON string — opaque to
+    // this schema and to RhypeDB, exactly like `User.account_key_blob`.
+    envelope: String
     user_rid: u64 @indexed
     store_rid: u64 @indexed
     store_uuid: String

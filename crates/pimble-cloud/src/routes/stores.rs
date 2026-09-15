@@ -1,11 +1,16 @@
-//! `GET/POST /stores`, `DELETE /stores/{id}`, and the members sub-resource.
+//! `GET/POST /stores`, `DELETE /stores/{id}`, the members sub-resource, and
+//! the key-grants sub-resource (docs/CRYPTO_CONTRACT.md, Phase 2a).
 
 use axum::extract::{Path, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use pimble_core::{StoreId, StoreKind};
+use pimble_crypto::KeyEnvelope;
+
 use crate::db::HostedStoreRow;
+use crate::envelope::verify_envelope_signature;
 use crate::error::{CloudError, CloudResult};
 use crate::session::AuthedUser;
 use crate::state::AppState;
@@ -16,12 +21,28 @@ fn rfc3339(ms: i64) -> String {
 
 const ROLES: [&str; 3] = ["owner", "editor", "reader"];
 
+fn store_kind_str(kind: StoreKind) -> &'static str {
+    match kind {
+        StoreKind::Plain => "plain",
+        StoreKind::Vault => "vault",
+    }
+}
+
+fn to_json(field: &'static str, value: &impl Serialize) -> CloudResult<String> {
+    serde_json::to_string(value).map_err(|e| CloudError::Internal(format!("serializing {field}: {e}")))
+}
+
 #[derive(Serialize)]
 pub struct StoreView {
     store_id: String,
     name: String,
     role: String,
+    kind: String,
     created_at: String,
+}
+
+fn store_view(store: &HostedStoreRow, role: &str) -> StoreView {
+    StoreView { store_id: store.store_id.clone(), name: store.name.clone(), role: role.to_string(), kind: store.kind.clone(), created_at: rfc3339(store.created_at_ms) }
 }
 
 /// Look a store up by its external id, refusing (as 404) one that doesn't
@@ -73,7 +94,7 @@ pub async fn list_stores(State(state): State<AppState>, authed: AuthedUser) -> C
     for grant in grants {
         if let Some(store) = state.db.get_hosted_store(grant.store_rid).await? {
             if !store.deleted {
-                out.push(StoreView { store_id: store.store_id, name: store.name, role: grant.role, created_at: rfc3339(store.created_at_ms) });
+                out.push(store_view(&store, &grant.role));
             }
         }
     }
@@ -83,17 +104,32 @@ pub async fn list_stores(State(state): State<AppState>, authed: AuthedUser) -> C
 #[derive(Deserialize)]
 pub struct CreateStoreRequest {
     pub name: String,
+    /// `"plain"` (default) or `"vault"` (docs/CRYPTO_CONTRACT.md).
+    #[serde(default)]
+    pub kind: StoreKind,
+    /// A chosen store id (a desktop app hosting an existing local store
+    /// under its own id); refused server-side if that id is already open.
+    #[serde(default)]
+    pub store_id: Option<String>,
 }
 
 pub async fn create_store(State(state): State<AppState>, authed: AuthedUser, Json(req): Json<CreateStoreRequest>) -> CloudResult<Json<StoreView>> {
     if req.name.trim().is_empty() {
         return Err(CloudError::BadRequest("name must not be empty".to_string()));
     }
-    let (store_id, dir_name) = state.pimble.create_store(req.name.trim()).await?;
-    let store_id_str = store_id.as_uuid().to_string();
-    let hosted = state.db.create_hosted_store(&store_id_str, req.name.trim(), &dir_name).await?;
+    let store_id = req
+        .store_id
+        .as_deref()
+        .map(StoreId::parse)
+        .transpose()
+        .map_err(|e| CloudError::BadRequest(format!("store_id is not a valid id: {e}")))?;
+
+    let (created_store_id, dir_name) = state.pimble.create_store(req.name.trim(), req.kind, store_id).await?;
+    let store_id_str = created_store_id.as_uuid().to_string();
+    let kind_str = store_kind_str(req.kind);
+    let hosted = state.db.create_hosted_store(&store_id_str, req.name.trim(), &dir_name, kind_str).await?;
     state.db.create_grant(authed.user.rid, hosted.rid, &store_id_str, "owner").await?;
-    Ok(Json(StoreView { store_id: store_id_str, name: hosted.name, role: "owner".to_string(), created_at: rfc3339(hosted.created_at_ms) }))
+    Ok(Json(store_view(&hosted, "owner")))
 }
 
 pub async fn delete_store(State(state): State<AppState>, authed: AuthedUser, Path(store_id): Path<String>) -> CloudResult<Json<Value>> {
@@ -189,5 +225,94 @@ pub async fn delete_member(
         return Err(CloudError::Conflict(LAST_OWNER_ERROR.to_string()));
     }
     state.db.delete_grant(grant.rid).await?;
+    Ok(Json(json!({})))
+}
+
+// ── Key grants (docs/CRYPTO_CONTRACT.md "Accounts service endpoints") ────
+
+#[derive(Serialize)]
+pub struct KeyGrantView {
+    key_id: String,
+    envelope: KeyEnvelope,
+}
+
+#[derive(Serialize)]
+pub struct KeyGrantsResponse {
+    envelopes: Vec<KeyGrantView>,
+}
+
+/// `GET /api/v1/stores/{id}/keys` — the caller's own envelopes for this
+/// store, never another member's (any grant may read their own).
+pub async fn get_store_keys(State(state): State<AppState>, authed: AuthedUser, Path(store_id): Path<String>) -> CloudResult<Json<KeyGrantsResponse>> {
+    let store = require_live_store(&state, &store_id).await?;
+    require_any_grant(&state, &store, authed.user.rid).await?;
+
+    let grants = state.db.key_grants_for_user_and_store(authed.user.rid, store.rid).await?;
+    let mut envelopes = Vec::with_capacity(grants.len());
+    for grant in grants {
+        let envelope: KeyEnvelope =
+            serde_json::from_str(&grant.envelope).map_err(|e| CloudError::Internal(format!("stored envelope is not valid JSON: {e}")))?;
+        envelopes.push(KeyGrantView { key_id: grant.key_id, envelope });
+    }
+    Ok(Json(KeyGrantsResponse { envelopes }))
+}
+
+#[derive(Deserialize)]
+pub struct EnvelopeUpsert {
+    pub user_id: String,
+    pub key_id: String,
+    pub envelope: KeyEnvelope,
+}
+
+#[derive(Deserialize)]
+pub struct PutStoreKeysRequest {
+    pub envelopes: Vec<EnvelopeUpsert>,
+}
+
+/// `PUT /api/v1/stores/{id}/keys` — upserts one or more (user, key id)
+/// envelopes. Ownership rule (docs/CRYPTO_CONTRACT.md): an owner or editor
+/// may always set their OWN envelopes; only an owner may set another
+/// member's. Every envelope must be signed by the CALLER (whoever is
+/// distributing the key), verified against the caller's own
+/// `public_signing_key` — see `crate::envelope` for the caveat that this
+/// verification is a stand-in for `pimble_crypto::unwrap_key`'s sibling,
+/// not yet implemented.
+pub async fn put_store_keys(
+    State(state): State<AppState>,
+    authed: AuthedUser,
+    Path(store_id): Path<String>,
+    Json(req): Json<PutStoreKeysRequest>,
+) -> CloudResult<Json<Value>> {
+    let store = require_live_store(&state, &store_id).await?;
+    let caller_role = require_any_grant(&state, &store, authed.user.rid).await?;
+    if caller_role != "owner" && caller_role != "editor" {
+        return Err(CloudError::Forbidden("only an owner or editor can set store keys".to_string()));
+    }
+
+    for item in &req.envelopes {
+        if item.user_id != authed.user.user_uuid && caller_role != "owner" {
+            return Err(CloudError::Forbidden("only an owner can set another member's keys".to_string()));
+        }
+        verify_envelope_signature(&item.envelope, &authed.user.public_signing_key)?;
+
+        let target = state
+            .db
+            .find_user_by_uuid(&item.user_id)
+            .await?
+            .ok_or_else(|| CloudError::NotFound(format!("no such user: {}", item.user_id)))?;
+        state
+            .db
+            .find_grant(target.rid, store.rid)
+            .await?
+            .ok_or_else(|| CloudError::BadRequest(format!("{} is not a member of this store", item.user_id)))?;
+
+        let envelope_json = to_json("envelope", &item.envelope)?;
+        match state.db.find_key_grant(target.rid, store.rid, &item.key_id).await? {
+            Some(existing) => state.db.update_key_grant_envelope(existing.rid, &envelope_json).await?,
+            None => {
+                state.db.create_key_grant(target.rid, store.rid, &store.store_id, &item.key_id, &envelope_json).await?;
+            }
+        }
+    }
     Ok(Json(json!({})))
 }

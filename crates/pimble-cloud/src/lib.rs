@@ -1,4 +1,6 @@
-//! Pimble Cloud: the accounts service (docs/CLOUD_CONTRACT.md, section C).
+//! Pimble Cloud: the accounts service (docs/CLOUD_CONTRACT.md, section C;
+//! docs/CRYPTO_CONTRACT.md's "Accounts service endpoints" and "Data model
+//! additions" for Phase 2a's end-to-end encryption).
 //!
 //! A library crate as well as the `pimble-cloud` binary so integration
 //! tests (`tests/`) can build the axum [`Router`] directly, bind it to an
@@ -10,8 +12,10 @@ pub mod auth;
 pub mod claims;
 pub mod config;
 pub mod db;
+pub mod envelope;
 pub mod error;
 pub mod jwt;
+pub mod kdf_decoy;
 pub mod mail;
 pub mod pimble;
 pub mod ratelimit;

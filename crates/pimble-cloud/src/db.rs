@@ -61,6 +61,16 @@ fn get_u64(o: &Object, field: &str) -> CloudResult<u64> {
     }
 }
 
+fn get_u32(o: &Object, field: &str) -> CloudResult<u32> {
+    match o.fields.get(field) {
+        Some(Value::U32(v)) => Ok(*v),
+        other => Err(CloudError::Internal(format!(
+            "{}.{field}: expected a u32, got {other:?}",
+            o.type_name
+        ))),
+    }
+}
+
 /// `DateTime` fields come back as raw epoch-millis (`Value::DateTime`) from
 /// the binary protocol — the RFC 3339 rendering is `value_to_query_json`'s
 /// job for the HTTP `/query`/typed-row paths, which this repository doesn't
@@ -104,6 +114,57 @@ pub struct UserRow {
     pub verified: bool,
     pub verify_token_hash: String,
     pub verify_expires_at_ms: i64,
+    /// Phase 2a (docs/CRYPTO_CONTRACT.md "Data model additions").
+    pub kdf_salt: String,
+    pub kdf_m_cost: u32,
+    pub kdf_t_cost: u32,
+    pub kdf_p_cost: u32,
+    pub public_encryption_key: String,
+    pub public_signing_key: String,
+    /// `pimble_crypto::AccountKeyBlob` as stored: a JSON string, opaque here.
+    pub account_key_blob: String,
+    pub recovery_salt: String,
+    /// `pimble_crypto::AccountKeyBlob` as stored: a JSON string, opaque here.
+    pub recovery_key_blob: String,
+}
+
+/// Everything [`RhypeDb::create_user`] needs beyond email and the auth-key
+/// hash (docs/CRYPTO_CONTRACT.md "Data model additions"). Bundled so the
+/// call site reads as one unit of "the account's key material" rather than
+/// nine positional strings.
+#[derive(Debug, Clone)]
+pub struct NewUserKeyMaterial {
+    pub kdf_salt: String,
+    pub kdf_m_cost: u32,
+    pub kdf_t_cost: u32,
+    pub kdf_p_cost: u32,
+    pub public_encryption_key: String,
+    pub public_signing_key: String,
+    pub account_key_blob: String,
+    pub recovery_salt: String,
+    pub recovery_key_blob: String,
+}
+
+impl NewUserKeyMaterial {
+    /// Placeholder key material for a test that needs a `User` row to exist
+    /// (e.g. to exercise mail or rate-limiting behaviour) without exercising
+    /// any crypto endpoint — every field is schema-required, but nothing
+    /// checks these values are real key material below the `/me/keys`,
+    /// `/users/lookup` and `/stores/{id}/keys` handlers a test actually
+    /// calls.
+    pub fn placeholder_for_tests() -> Self {
+        Self {
+            kdf_salt: "placeholder-salt".to_string(),
+            kdf_m_cost: pimble_crypto::KDF_M_COST_KIB,
+            kdf_t_cost: pimble_crypto::KDF_T_COST,
+            kdf_p_cost: pimble_crypto::KDF_P_COST,
+            public_encryption_key: "placeholder-encryption-key".to_string(),
+            public_signing_key: "placeholder-signing-key".to_string(),
+            account_key_blob: "{}".to_string(),
+            recovery_salt: "placeholder-recovery-salt".to_string(),
+            recovery_key_blob: "{}".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +181,9 @@ pub struct HostedStoreRow {
     pub name: String,
     pub created_at_ms: i64,
     pub deleted: bool,
+    /// `"plain"` or `"vault"` (docs/CRYPTO_CONTRACT.md), matching
+    /// `pimble_core::StoreKind`'s serde spelling.
+    pub kind: String,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +195,18 @@ pub struct GrantRow {
     pub role: String,
 }
 
+/// One member's envelope for one key id on one store (docs/CRYPTO_CONTRACT.md
+/// "Data model additions": `KeyGrant`).
+#[derive(Debug, Clone)]
+pub struct KeyGrantRow {
+    pub rid: u64,
+    pub user_rid: u64,
+    pub store_rid: u64,
+    pub key_id: String,
+    /// A `pimble_crypto::KeyEnvelope` as stored: a JSON string.
+    pub envelope: String,
+}
+
 fn user_from_object(o: &Object) -> CloudResult<UserRow> {
     Ok(UserRow {
         rid: o.id,
@@ -140,6 +216,15 @@ fn user_from_object(o: &Object) -> CloudResult<UserRow> {
         verified: get_bool(o, "verified")?,
         verify_token_hash: get_string(o, "verify_token_hash")?.to_string(),
         verify_expires_at_ms: get_datetime_ms(o, "verify_expires_at")?,
+        kdf_salt: get_string(o, "kdf_salt")?.to_string(),
+        kdf_m_cost: get_u32(o, "kdf_m_cost")?,
+        kdf_t_cost: get_u32(o, "kdf_t_cost")?,
+        kdf_p_cost: get_u32(o, "kdf_p_cost")?,
+        public_encryption_key: get_string(o, "public_encryption_key")?.to_string(),
+        public_signing_key: get_string(o, "public_signing_key")?.to_string(),
+        account_key_blob: get_string(o, "account_key_blob")?.to_string(),
+        recovery_salt: get_string(o, "recovery_salt")?.to_string(),
+        recovery_key_blob: get_string(o, "recovery_key_blob")?.to_string(),
     })
 }
 
@@ -154,6 +239,7 @@ fn hosted_store_from_object(o: &Object) -> CloudResult<HostedStoreRow> {
         name: get_string(o, "name")?.to_string(),
         created_at_ms: get_datetime_ms(o, "created_at")?,
         deleted: get_bool(o, "deleted")?,
+        kind: get_string(o, "kind")?.to_string(),
     })
 }
 
@@ -164,6 +250,16 @@ fn grant_from_object(o: &Object) -> CloudResult<GrantRow> {
         store_rid: get_u64(o, "store_rid")?,
         store_uuid: get_string(o, "store_uuid")?.to_string(),
         role: get_string(o, "role")?.to_string(),
+    })
+}
+
+fn key_grant_from_object(o: &Object) -> CloudResult<KeyGrantRow> {
+    Ok(KeyGrantRow {
+        rid: o.id,
+        user_rid: get_u64(o, "user_rid")?,
+        store_rid: get_u64(o, "store_rid")?,
+        key_id: get_string(o, "key_id")?.to_string(),
+        envelope: get_string(o, "envelope")?.to_string(),
     })
 }
 
@@ -219,20 +315,31 @@ impl RhypeDb {
 
     /// Creates the user unverified (Phase 1b: signup issues a verify token
     /// separately via [`Self::set_verify_token`], right after this succeeds —
-    /// see `routes/accounts.rs`'s `start_verification`). `None` on a
-    /// duplicate `email_lower` (the caller turns that into 409); any other
-    /// RhypeDB failure is `Err`.
-    pub async fn create_user(&self, email: &str, password_hash: &str) -> CloudResult<Option<UserRow>> {
+    /// see `routes/accounts.rs`'s `start_verification`) with the given key
+    /// material (Phase 2a: `password_hash` is `Argon2id(auth_key)`, not a
+    /// human password — see schema.rhype's `User.password_hash` comment).
+    /// `None` on a duplicate `email_lower` (the caller turns that into 409);
+    /// any other RhypeDB failure is `Err`.
+    pub async fn create_user(&self, email: &str, password_hash: &str, keys: &NewUserKeyMaterial) -> CloudResult<Option<UserRow>> {
         let user_uuid = uuid::Uuid::new_v4().to_string();
         let email_lower = email.to_lowercase();
         let q = format!(
-            "User.create({{ user_uuid: {uuid}, email: {email}, email_lower: {email_lower}, password_hash: {hash}, created_at: {now}, verified: false, verify_token_hash: {empty}, verify_expires_at: {now} }})",
+            "User.create({{ user_uuid: {uuid}, email: {email}, email_lower: {email_lower}, password_hash: {hash}, created_at: {now}, verified: false, verify_token_hash: {empty}, verify_expires_at: {now}, kdf_salt: {kdf_salt}, kdf_m_cost: {m_cost}, kdf_t_cost: {t_cost}, kdf_p_cost: {p_cost}, public_encryption_key: {pub_enc}, public_signing_key: {pub_sign}, account_key_blob: {acct_blob}, recovery_salt: {rec_salt}, recovery_key_blob: {rec_blob} }})",
             uuid = ql_str(&user_uuid),
             email = ql_str(email),
             email_lower = ql_str(&email_lower),
             hash = ql_str(password_hash),
             now = now_literal(),
             empty = ql_str(""),
+            kdf_salt = ql_str(&keys.kdf_salt),
+            m_cost = keys.kdf_m_cost,
+            t_cost = keys.kdf_t_cost,
+            p_cost = keys.kdf_p_cost,
+            pub_enc = ql_str(&keys.public_encryption_key),
+            pub_sign = ql_str(&keys.public_signing_key),
+            acct_blob = ql_str(&keys.account_key_blob),
+            rec_salt = ql_str(&keys.recovery_salt),
+            rec_blob = ql_str(&keys.recovery_key_blob),
         );
         match self.client.query(&q).await {
             Ok(result) => {
@@ -324,13 +431,14 @@ impl RhypeDb {
 
     // ── Hosted stores ──────────────────────────────────────────────────
 
-    pub async fn create_hosted_store(&self, store_id: &str, name: &str, dir_name: &str) -> CloudResult<HostedStoreRow> {
+    pub async fn create_hosted_store(&self, store_id: &str, name: &str, dir_name: &str, kind: &str) -> CloudResult<HostedStoreRow> {
         let q = format!(
-            "HostedStore.create({{ store_id: {sid}, name: {name}, dir_name: {dir}, created_at: {now}, deleted: false }})",
+            "HostedStore.create({{ store_id: {sid}, name: {name}, dir_name: {dir}, created_at: {now}, deleted: false, kind: {kind} }})",
             sid = ql_str(store_id),
             name = ql_str(name),
             dir = ql_str(dir_name),
             now = now_literal(),
+            kind = ql_str(kind),
         );
         let obj = self
             .objects(&q)
@@ -413,5 +521,45 @@ impl RhypeDb {
     pub async fn grants_for_store(&self, store_rid: u64) -> CloudResult<Vec<GrantRow>> {
         let q = format!("Grant.filter(.store_rid == {store_rid})");
         self.objects(&q).await?.iter().map(grant_from_object).collect()
+    }
+
+    // ── Key grants (docs/CRYPTO_CONTRACT.md "Data model additions") ─────
+
+    pub async fn create_key_grant(&self, user_rid: u64, store_rid: u64, store_uuid: &str, key_id: &str, envelope_json: &str) -> CloudResult<KeyGrantRow> {
+        let q = format!(
+            "KeyGrant.create({{ key_id: {kid}, envelope: {env}, user_rid: {uid}, store_rid: {sid}, store_uuid: {suuid} }})",
+            kid = ql_str(key_id),
+            env = ql_str(envelope_json),
+            uid = user_rid,
+            sid = store_rid,
+            suuid = ql_str(store_uuid),
+        );
+        let obj = self
+            .objects(&q)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| CloudError::Internal("KeyGrant.create returned nothing".into()))?;
+        let grant = key_grant_from_object(&obj)?;
+        self.link("KeyGrant", grant.rid, "User", user_rid).await?;
+        self.link("KeyGrant", grant.rid, "HostedStore", store_rid).await?;
+        Ok(grant)
+    }
+
+    pub async fn update_key_grant_envelope(&self, key_grant_rid: u64, envelope_json: &str) -> CloudResult<()> {
+        self.objects(&format!("KeyGrant.get({key_grant_rid}).update({{ envelope: {} }})", ql_str(envelope_json))).await?;
+        Ok(())
+    }
+
+    pub async fn find_key_grant(&self, user_rid: u64, store_rid: u64, key_id: &str) -> CloudResult<Option<KeyGrantRow>> {
+        let q = format!("KeyGrant.filter(.user_rid == {user_rid} && .store_rid == {store_rid} && .key_id == {})", ql_str(key_id));
+        self.one(&q).await?.map(|o| key_grant_from_object(&o)).transpose()
+    }
+
+    /// One user's own envelopes for one store — what `GET /stores/{id}/keys`
+    /// returns (the caller's, never another member's).
+    pub async fn key_grants_for_user_and_store(&self, user_rid: u64, store_rid: u64) -> CloudResult<Vec<KeyGrantRow>> {
+        let q = format!("KeyGrant.filter(.user_rid == {user_rid} && .store_rid == {store_rid})");
+        self.objects(&q).await?.iter().map(key_grant_from_object).collect()
     }
 }

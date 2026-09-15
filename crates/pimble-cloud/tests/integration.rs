@@ -22,6 +22,8 @@ use base64::Engine;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde_json::{json, Value};
 
+use pimble_crypto::{AccountKeys, KdfParams};
+
 const SCHEMA: &str = include_str!("../schema.rhype");
 
 /// A [`pimble_cloud::mail::Mailer`] that always fails, simulating Resend
@@ -259,6 +261,9 @@ async fn spawn_stack_inner(releases_base_url: Option<String>, mailer_override: O
         // exactly what `extract_verify_token` and friends rely on.
         resend_api_key: None,
         mail_from: "Pimble <no-reply@m.pimble.app>".to_string(),
+        // Fixed and non-secret, like `dev_seed` above: deterministic within
+        // a test run so a `/kdf` test can assert the decoy salt is stable.
+        kdf_decoy_secret: Some("test-kdf-decoy-secret".to_string()),
     };
 
     let app_state = match mailer_override {
@@ -303,26 +308,76 @@ macro_rules! skip_without_rhypedb {
     };
 }
 
-/// `POST /signup` (Phase 1b: 202, no session — see docs/CLOUD_CONTRACT.md
-/// "Phase 1b: email verification").
-async fn signup(stack: &Stack, email: &str, password: &str) -> Value {
-    let resp = stack
-        .http
-        .post(format!("{}/signup", stack.base_url))
-        .json(&json!({ "email": email, "password": password }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 202, "signup for {email} should be accepted (verification pending)");
+/// Builds a real, valid `POST /signup` body using `pimble_crypto` exactly as
+/// a real client would (docs/CRYPTO_CONTRACT.md "Primitives" and "Client-
+/// derived login"): derive `auth_key`/`kek` from `password`, generate a
+/// fresh account keypair, wrap it under the password KEK and under a fresh
+/// recovery code's KEK. Returns the JSON body (so a test can inspect what
+/// was sent, e.g. the public keys) and the plaintext `AccountKeys` (so a
+/// test can later unwrap a returned blob or sign an envelope as this user).
+fn build_signup_body(email: &str, password: &str) -> (Value, AccountKeys) {
+    let kdf = KdfParams::generate();
+    let password_keys = pimble_crypto::derive_password_keys(password, &kdf).expect("derive_password_keys");
+    let auth_key = pimble_crypto::encode_auth_key(&password_keys.auth_key);
+
+    let account_keys = AccountKeys::generate();
+    let public_keys = account_keys.public_keys();
+    let account_key_blob = pimble_crypto::wrap_account_keys(&account_keys, &password_keys.kek).expect("wrap_account_keys");
+
+    let recovery_salt = KdfParams::generate().salt;
+    let recovery_code = pimble_crypto::generate_recovery_code();
+    let recovery_params = KdfParams { salt: recovery_salt.clone(), m_cost: kdf.m_cost, t_cost: kdf.t_cost, p_cost: kdf.p_cost };
+    let recovery_kek = pimble_crypto::derive_recovery_kek(&recovery_code, &recovery_params).expect("derive_recovery_kek");
+    let recovery_key_blob = pimble_crypto::wrap_account_keys(&account_keys, &recovery_kek).expect("wrap recovery blob");
+
+    let body = json!({
+        "email": email,
+        "auth_key": auth_key,
+        "kdf": kdf,
+        "public_keys": public_keys,
+        "account_key_blob": account_key_blob,
+        "recovery_salt": recovery_salt,
+        "recovery_key_blob": recovery_key_blob,
+    });
+    (body, account_keys)
+}
+
+/// `GET /api/v1/kdf?email=` — real params for a known email, a
+/// (deterministic, same-shaped) decoy otherwise.
+async fn fetch_kdf(stack: &Stack, email: &str) -> KdfParams {
+    let resp = stack.http.get(format!("{}/kdf", stack.base_url)).query(&[("email", email)]).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "GET /kdf should always answer 200");
     resp.json().await.unwrap()
+}
+
+/// `POST /signup` (Phase 1b: 202, no session — see docs/CLOUD_CONTRACT.md
+/// "Phase 1b: email verification"), with real key material
+/// ([`build_signup_body`]). Returns the signup response body and the
+/// account keys generated for it — use [`signup`] when the keys aren't
+/// needed.
+async fn signup_with_material(stack: &Stack, email: &str, password: &str) -> (Value, AccountKeys) {
+    let (request_body, account_keys) = build_signup_body(email, password);
+    let resp = stack.http.post(format!("{}/signup", stack.base_url)).json(&request_body).send().await.unwrap();
+    assert_eq!(resp.status(), 202, "signup for {email} should be accepted (verification pending)");
+    (resp.json().await.unwrap(), account_keys)
+}
+
+async fn signup(stack: &Stack, email: &str, password: &str) -> Value {
+    signup_with_material(stack, email, password).await.0
 }
 
 fn first_cookie_pair(resp: &reqwest::Response) -> String {
     resp.headers().get("set-cookie").unwrap().to_str().unwrap().split(';').next().unwrap().to_string()
 }
 
+/// `POST /login`: fetches the account's real KDF params first (as a real
+/// client does) and derives `auth_key` from them, so this only succeeds
+/// against a `password` that actually matches what `signup`/`signup_with_material`
+/// used for `email`.
 async fn login(stack: &Stack, email: &str, password: &str) -> (Value, String) {
-    let resp = stack.http.post(format!("{}/login", stack.base_url)).json(&json!({ "email": email, "password": password })).send().await.unwrap();
+    let kdf = fetch_kdf(stack, email).await;
+    let auth_key = pimble_crypto::encode_auth_key(&pimble_crypto::derive_password_keys(password, &kdf).unwrap().auth_key);
+    let resp = stack.http.post(format!("{}/login", stack.base_url)).json(&json!({ "email": email, "auth_key": auth_key })).send().await.unwrap();
     assert_eq!(resp.status(), 200, "login for {email} should succeed");
     let cookie = first_cookie_pair(&resp);
     let body: Value = resp.json().await.unwrap();
@@ -416,8 +471,7 @@ async fn signup_login_logout_me_round_trip() {
     assert_eq!(resp.status(), 401);
 
     // login re-establishes a session.
-    let resp = stack.http.post(format!("{}/login", stack.base_url)).json(&json!({ "email": email, "password": password })).send().await.unwrap();
-    assert_eq!(resp.status(), 200);
+    login(&stack, email, password).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -425,10 +479,13 @@ async fn wrong_password_and_unknown_email_are_both_401() {
     let stack = skip_without_rhypedb!();
     signup(&stack, "carol@example.com", "the right password").await;
 
+    // The server only ever sees `auth_key`, an opaque string as far as it's
+    // concerned — any wrong value (not necessarily one really derived from
+    // "the wrong password") must fail the same way.
     let resp = stack
         .http
         .post(format!("{}/login", stack.base_url))
-        .json(&json!({ "email": "carol@example.com", "password": "the wrong password" }))
+        .json(&json!({ "email": "carol@example.com", "auth_key": "not-the-real-auth-key" }))
         .send()
         .await
         .unwrap();
@@ -437,7 +494,7 @@ async fn wrong_password_and_unknown_email_are_both_401() {
     let resp = stack
         .http
         .post(format!("{}/login", stack.base_url))
-        .json(&json!({ "email": "nobody-signed-up-with-this@example.com", "password": "anything" }))
+        .json(&json!({ "email": "nobody-signed-up-with-this@example.com", "auth_key": "anything" }))
         .send()
         .await
         .unwrap();
@@ -451,35 +508,20 @@ async fn duplicate_email_is_409_once_verified_but_202_while_unverified() {
 
     // Still unverified: a duplicate signup just re-sends the link — 202,
     // no enumeration (docs/CLOUD_CONTRACT.md "Phase 1b").
-    let resp = stack
-        .http
-        .post(format!("{}/signup", stack.base_url))
-        .json(&json!({ "email": "dupe@example.com", "password": "second password!" }))
-        .send()
-        .await
-        .unwrap();
+    let (second_body, _) = build_signup_body("dupe@example.com", "second password!");
+    let resp = stack.http.post(format!("{}/signup", stack.base_url)).json(&second_body).send().await.unwrap();
     assert_eq!(resp.status(), 202);
 
     // Verify (with the ORIGINAL password — a re-send never changes it), then
     // a duplicate signup is a real 409.
     verify_then_login(&stack, "dupe@example.com", "first password!").await;
-    let resp = stack
-        .http
-        .post(format!("{}/signup", stack.base_url))
-        .json(&json!({ "email": "dupe@example.com", "password": "third password!" }))
-        .send()
-        .await
-        .unwrap();
+    let (third_body, _) = build_signup_body("dupe@example.com", "third password!");
+    let resp = stack.http.post(format!("{}/signup", stack.base_url)).json(&third_body).send().await.unwrap();
     assert_eq!(resp.status(), 409);
 
     // Case-insensitivity: the same address differently-cased also conflicts.
-    let resp = stack
-        .http
-        .post(format!("{}/signup", stack.base_url))
-        .json(&json!({ "email": "DUPE@example.com", "password": "fourth password!" }))
-        .send()
-        .await
-        .unwrap();
+    let (fourth_body, _) = build_signup_body("DUPE@example.com", "fourth password!");
+    let resp = stack.http.post(format!("{}/signup", stack.base_url)).json(&fourth_body).send().await.unwrap();
     assert_eq!(resp.status(), 409);
 }
 
@@ -492,16 +534,25 @@ async fn login_before_verification_is_403_email_unverified() {
     let password = "oscar's unverified password";
     signup(&stack, email, password).await;
 
-    let resp = stack.http.post(format!("{}/login", stack.base_url)).json(&json!({ "email": email, "password": password })).send().await.unwrap();
+    // The correct auth_key (derived from the account's real kdf params, as
+    // a real client would) still gets 403 email_unverified, not a session.
+    let kdf = fetch_kdf(&stack, email).await;
+    let auth_key = pimble_crypto::encode_auth_key(&pimble_crypto::derive_password_keys(password, &kdf).unwrap().auth_key);
+    let resp = stack.http.post(format!("{}/login", stack.base_url)).json(&json!({ "email": email, "auth_key": auth_key })).send().await.unwrap();
     assert_eq!(resp.status(), 403);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"], "email_unverified");
 
-    // The password check still runs first: a wrong password is 401, not
+    // The password check still runs first: a wrong auth_key is 401, not
     // "email_unverified" (which would leak that the email exists yet the
     // password was never even checked).
-    let resp =
-        stack.http.post(format!("{}/login", stack.base_url)).json(&json!({ "email": email, "password": "not oscar's password" })).send().await.unwrap();
+    let resp = stack
+        .http
+        .post(format!("{}/login", stack.base_url))
+        .json(&json!({ "email": email, "auth_key": "not oscar's auth_key" }))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 401);
 }
 
@@ -536,13 +587,8 @@ async fn second_signup_for_unverified_address_resends_and_invalidates_the_old_to
     signup(&stack, email, "judy's real password!!").await;
     let old_token = extract_verify_token(&stack, email);
 
-    let resp = stack
-        .http
-        .post(format!("{}/signup", stack.base_url))
-        .json(&json!({ "email": email, "password": "ignored on a resend" }))
-        .send()
-        .await
-        .unwrap();
+    let (resend_body, _) = build_signup_body(email, "ignored on a resend");
+    let resp = stack.http.post(format!("{}/signup", stack.base_url)).json(&resend_body).send().await.unwrap();
     assert_eq!(resp.status(), 202);
     let new_token = extract_verify_token(&stack, email);
     assert_ne!(old_token, new_token, "a re-sent signup should issue a fresh token");
@@ -565,7 +611,7 @@ async fn resend_verification_issues_a_new_token_and_invalidates_the_old() {
     // record a send against the rate limiter and make the resend below
     // rate-limited — see `resend_immediately_after_signup_is_rate_limited_too`
     // for that case) so this test's resend is this address's first send.
-    let user = stack.app_state.db.create_user(email, "irrelevant-hash").await.unwrap().unwrap();
+    let user = stack.app_state.db.create_user(email, "irrelevant-hash", &pimble_cloud::db::NewUserKeyMaterial::placeholder_for_tests()).await.unwrap().unwrap();
     let (old_token, old_hash) = pimble_cloud::auth::new_verify_token();
     let future_ms = chrono::Utc::now().timestamp_millis() + 24 * 60 * 60 * 1000;
     stack.app_state.db.set_verify_token(user.rid, &old_hash, future_ms).await.unwrap();
@@ -611,7 +657,7 @@ async fn resend_verification_is_rate_limited_to_once_per_minute() {
     // Created directly (bypassing signup, which is itself a send — see
     // `resend_immediately_after_signup_is_rate_limited_too`) so this test's
     // first resend is a genuinely fresh send for this address.
-    stack.app_state.db.create_user(email, "irrelevant-hash").await.unwrap().unwrap();
+    stack.app_state.db.create_user(email, "irrelevant-hash", &pimble_cloud::db::NewUserKeyMaterial::placeholder_for_tests()).await.unwrap().unwrap();
 
     let resp = stack.http.post(format!("{}/resend-verification", stack.base_url)).json(&json!({ "email": email })).send().await.unwrap();
     assert_eq!(resp.status(), 202);
@@ -993,13 +1039,8 @@ async fn signup_maps_a_mail_failure_to_502_without_leaking_the_provider_response
             return;
         }
     };
-    let resp = stack
-        .http
-        .post(format!("{}/signup", stack.base_url))
-        .json(&json!({ "email": "bounces@example.com", "password": "whatever password" }))
-        .send()
-        .await
-        .unwrap();
+    let (signup_body, _) = build_signup_body("bounces@example.com", "whatever password");
+    let resp = stack.http.post(format!("{}/signup", stack.base_url)).json(&signup_body).send().await.unwrap();
     assert_eq!(resp.status(), 502);
     assert_mail_failed_response(&resp.json().await.unwrap());
 }
@@ -1016,7 +1057,7 @@ async fn resend_verification_maps_a_mail_failure_to_502_without_leaking_the_prov
     // The user must exist (and be unverified) for resend to attempt a send
     // at all; signup itself already fails to mail, so create the row
     // directly rather than through the API.
-    let user = stack.app_state.db.create_user("bounces2@example.com", "irrelevant-hash").await.unwrap().unwrap();
+    let user = stack.app_state.db.create_user("bounces2@example.com", "irrelevant-hash", &pimble_cloud::db::NewUserKeyMaterial::placeholder_for_tests()).await.unwrap().unwrap();
     let _ = user;
 
     let resp = stack
@@ -1028,4 +1069,372 @@ async fn resend_verification_maps_a_mail_failure_to_502_without_leaking_the_prov
         .unwrap();
     assert_eq!(resp.status(), 502);
     assert_mail_failed_response(&resp.json().await.unwrap());
+}
+
+// ── Phase 2a: end-to-end encryption (docs/CRYPTO_CONTRACT.md) ─────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kdf_returns_real_params_for_a_known_email_and_a_stable_decoy_otherwise() {
+    let stack = skip_without_rhypedb!();
+    let email = "kdf-test@example.com";
+    signup(&stack, email, "kdf test password!!").await;
+
+    let real = fetch_kdf(&stack, email).await;
+    assert!(!real.salt.is_empty());
+    assert_eq!(real.m_cost, pimble_crypto::KDF_M_COST_KIB);
+    assert_eq!(real.t_cost, pimble_crypto::KDF_T_COST);
+    assert_eq!(real.p_cost, pimble_crypto::KDF_P_COST);
+
+    // An unknown email gets the same shape, deterministically (not a fresh
+    // random salt on every call), and it must not collide with a real one.
+    let decoy1 = fetch_kdf(&stack, "nobody-has-signed-up@example.com").await;
+    let decoy2 = fetch_kdf(&stack, "nobody-has-signed-up@example.com").await;
+    assert_eq!(decoy1, decoy2, "the decoy salt must be stable for the same unknown email");
+    assert_ne!(decoy1.salt, real.salt);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn me_keys_round_trips_through_real_crypto_and_never_returns_recovery() {
+    let stack = skip_without_rhypedb!();
+    let email = "keyholder@example.com";
+    let password = "keyholder password!!";
+    // `build_signup_body` directly (not `signup_with_material`, which only
+    // hands back the 202 response — the `{status, email}` body, not the
+    // request) so this test can compare against the public keys actually
+    // sent at signup.
+    let (request_body, account_keys) = build_signup_body(email, password);
+    let resp = stack.http.post(format!("{}/signup", stack.base_url)).json(&request_body).send().await.unwrap();
+    assert_eq!(resp.status(), 202);
+    let (_login_body, cookie) = verify_then_login(&stack, email, password).await;
+
+    let resp = stack.http.get(format!("{}/me/keys", stack.base_url)).header("Cookie", &cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["public_keys"], request_body["public_keys"]);
+    assert!(body.get("recovery_key_blob").is_none(), "me/keys must never return the recovery blob");
+    assert!(body.get("recovery_salt").is_none(), "me/keys must never return the recovery salt");
+
+    // The returned `account_key_blob` really unwraps, with the
+    // password-derived KEK, back to the exact keys generated at signup —
+    // not just "some JSON came back that looks right".
+    let kdf = fetch_kdf(&stack, email).await;
+    let password_keys = pimble_crypto::derive_password_keys(password, &kdf).unwrap();
+    let blob: pimble_crypto::AccountKeyBlob = serde_json::from_value(body["account_key_blob"].clone()).unwrap();
+    let unwrapped = pimble_crypto::unwrap_account_keys(&blob, &password_keys.kek).unwrap();
+    assert_eq!(unwrapped.encryption_secret, account_keys.encryption_secret);
+    assert_eq!(unwrapped.signing_secret, account_keys.signing_secret);
+
+    // No session: 401.
+    let resp = stack.http.get(format!("{}/me/keys", stack.base_url)).send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn users_lookup_finds_verified_users_and_404s_otherwise() {
+    let stack = skip_without_rhypedb!();
+    // A fresh, freshly-signed-in caller per lookup: `/users/lookup` is
+    // rate-limited per caller (see `users_lookup_is_rate_limited_per_caller`),
+    // and these local round trips are faster than that interval, so reusing
+    // one caller across several lookups in the same test would spuriously
+    // 429 the later ones.
+
+    // An unverified target has no usable keys to share to yet: 404.
+    signup(&stack, "lookup-unverified@example.com", "target password!!").await;
+    let (_, looker1_cookie) = signup_verify_login(&stack, "lookup-caller1@example.com", "looker password!!").await;
+    let resp = stack
+        .http
+        .get(format!("{}/users/lookup", stack.base_url))
+        .header("Cookie", &looker1_cookie)
+        .query(&[("email", "lookup-unverified@example.com")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // A verified target: 200 with its id and public keys.
+    signup_verify_login(&stack, "lookup-target@example.com", "target password!!").await;
+    let (_, looker2_cookie) = signup_verify_login(&stack, "lookup-caller2@example.com", "looker password!!").await;
+    let resp = stack
+        .http
+        .get(format!("{}/users/lookup", stack.base_url))
+        .header("Cookie", &looker2_cookie)
+        .query(&[("email", "lookup-target@example.com")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["id"].as_str().is_some());
+    assert!(body["public_keys"]["encryption"].as_str().is_some());
+
+    // Unknown address: 404 too (same shape as unverified — no enumeration
+    // signal either way).
+    let (_, looker3_cookie) = signup_verify_login(&stack, "lookup-caller3@example.com", "looker password!!").await;
+    let resp = stack
+        .http
+        .get(format!("{}/users/lookup", stack.base_url))
+        .header("Cookie", &looker3_cookie)
+        .query(&[("email", "no-such-address@example.com")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // No session: 401 (fails in the session extractor, before the rate
+    // limiter is ever consulted — no fresh caller needed here).
+    let resp = stack.http.get(format!("{}/users/lookup", stack.base_url)).query(&[("email", "lookup-target@example.com")]).send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn users_lookup_is_rate_limited_per_caller() {
+    let stack = skip_without_rhypedb!();
+    let (_body, looker_cookie) = signup_verify_login(&stack, "rapid-looker@example.com", "looker password!!").await;
+    signup_verify_login(&stack, "rapid-target@example.com", "target password!!").await;
+
+    let resp = stack
+        .http
+        .get(format!("{}/users/lookup", stack.base_url))
+        .header("Cookie", &looker_cookie)
+        .query(&[("email", "rapid-target@example.com")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Immediately again: too fast, rate-limited.
+    let resp = stack
+        .http
+        .get(format!("{}/users/lookup", stack.base_url))
+        .header("Cookie", &looker_cookie)
+        .query(&[("email", "rapid-target@example.com")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recover_is_not_implemented() {
+    let stack = skip_without_rhypedb!();
+    let resp = stack
+        .http
+        .post(format!("{}/recover", stack.base_url))
+        .json(&json!({ "email": "someone@example.com", "recovery_code_auth": "whatever" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 501);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "not_implemented");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_store_with_chosen_kind_and_id() {
+    let stack = skip_without_rhypedb!();
+    let (_body, cookie) = signup_verify_login(&stack, "vault-owner@example.com", "vault owner password!!").await;
+
+    let chosen_id = uuid::Uuid::new_v4().to_string();
+    let resp = stack
+        .http
+        .post(format!("{}/stores", stack.base_url))
+        .header("Cookie", &cookie)
+        .json(&json!({ "name": "Encrypted Notes", "kind": "vault", "store_id": chosen_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let store: Value = resp.json().await.unwrap();
+    assert_eq!(store["kind"], "vault");
+    assert_eq!(store["store_id"], chosen_id);
+
+    // A plain store (the default `kind`) still works and is reported as such.
+    let resp = stack
+        .http
+        .post(format!("{}/stores", stack.base_url))
+        .header("Cookie", &cookie)
+        .json(&json!({ "name": "Plain Notes" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.json::<Value>().await.unwrap()["kind"], "plain");
+}
+
+/// Wraps `key` to `recipient_keys` from `sender`, signing as `sender`, for
+/// `store_id` — what a real client does before `PUT /stores/{id}/keys`.
+fn wrap_store_key(key: &pimble_crypto::SymmetricKey, key_id: pimble_crypto::KeyId, store_id: &str, sender: &AccountKeys, recipient: &pimble_crypto::AccountPublicKeys) -> pimble_crypto::KeyEnvelope {
+    pimble_crypto::wrap_key(key, key_id, recipient, sender, &format!("store:{store_id}")).expect("wrap_key")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn store_keys_put_and_get_round_trip_with_signature_verification() {
+    let stack = skip_without_rhypedb!();
+    let email = "vault-owner2@example.com";
+    let password = "owner password!!";
+    let (_signup_body, owner_keys) = signup_with_material(&stack, email, password).await;
+    let (login_body, cookie) = verify_then_login(&stack, email, password).await;
+    let owner_id = login_body["user"]["id"].as_str().unwrap().to_string();
+    let owner_public = owner_keys.public_keys();
+
+    let store: Value = stack
+        .http
+        .post(format!("{}/stores", stack.base_url))
+        .header("Cookie", &cookie)
+        .json(&json!({ "name": "Vault Store", "kind": "vault" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+
+    let store_key = pimble_crypto::SymmetricKey::generate();
+    let key_id = uuid::Uuid::new_v4();
+    let envelope = wrap_store_key(&store_key, key_id, &store_id, &owner_keys, &owner_public);
+
+    let resp = stack
+        .http
+        .put(format!("{}/stores/{store_id}/keys", stack.base_url))
+        .header("Cookie", &cookie)
+        .json(&json!({ "envelopes": [ { "user_id": owner_id, "key_id": key_id.to_string(), "envelope": envelope } ] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+
+    let resp = stack.http.get(format!("{}/stores/{store_id}/keys", stack.base_url)).header("Cookie", &cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let envelopes = body["envelopes"].as_array().unwrap();
+    assert_eq!(envelopes.len(), 1);
+    assert_eq!(envelopes[0]["key_id"], key_id.to_string());
+
+    // The returned envelope really does unwrap to the same store key.
+    let returned_envelope: pimble_crypto::KeyEnvelope = serde_json::from_value(envelopes[0]["envelope"].clone()).unwrap();
+    let unwrapped = pimble_crypto::unwrap_key(&returned_envelope, &owner_keys, &owner_public.signing).unwrap();
+    assert_eq!(unwrapped.0, store_key.0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn store_keys_put_rejects_a_tampered_signature() {
+    let stack = skip_without_rhypedb!();
+    let email = "vault-owner3@example.com";
+    let password = "owner password!!";
+    let (_signup_body, owner_keys) = signup_with_material(&stack, email, password).await;
+    let (login_body, cookie) = verify_then_login(&stack, email, password).await;
+    let owner_id = login_body["user"]["id"].as_str().unwrap().to_string();
+    let owner_public = owner_keys.public_keys();
+
+    let store: Value = stack
+        .http
+        .post(format!("{}/stores", stack.base_url))
+        .header("Cookie", &cookie)
+        .json(&json!({ "name": "Vault Store", "kind": "vault" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+
+    let store_key = pimble_crypto::SymmetricKey::generate();
+    let key_id = uuid::Uuid::new_v4();
+    let mut envelope = wrap_store_key(&store_key, key_id, &store_id, &owner_keys, &owner_public);
+    let mut sig_bytes = URL_SAFE_NO_PAD.decode(&envelope.signature).unwrap();
+    sig_bytes[0] ^= 0xff;
+    envelope.signature = URL_SAFE_NO_PAD.encode(&sig_bytes);
+
+    let resp = stack
+        .http
+        .put(format!("{}/stores/{store_id}/keys", stack.base_url))
+        .header("Cookie", &cookie)
+        .json(&json!({ "envelopes": [ { "user_id": owner_id, "key_id": key_id.to_string(), "envelope": envelope } ] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "a tampered envelope signature must not verify");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn store_keys_ownership_rules() {
+    let stack = skip_without_rhypedb!();
+    let (owner_login, owner_cookie) = signup_verify_login(&stack, "vault-owner4@example.com", "owner password!!").await;
+    let owner_id = owner_login["user"]["id"].as_str().unwrap().to_string();
+    let (_editor_signup, editor_keys) = signup_with_material(&stack, "vault-editor4@example.com", "editor password!!").await;
+    let (editor_login, editor_cookie) = verify_then_login(&stack, "vault-editor4@example.com", "editor password!!").await;
+    let editor_id = editor_login["user"]["id"].as_str().unwrap().to_string();
+    let editor_public = editor_keys.public_keys();
+    let (reader_login, reader_cookie) = signup_verify_login(&stack, "vault-reader4@example.com", "reader password!!").await;
+    let reader_id = reader_login["user"]["id"].as_str().unwrap().to_string();
+
+    let store: Value = stack
+        .http
+        .post(format!("{}/stores", stack.base_url))
+        .header("Cookie", &owner_cookie)
+        .json(&json!({ "name": "Vault Store", "kind": "vault" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+
+    stack
+        .http
+        .put(format!("{}/stores/{store_id}/members", stack.base_url))
+        .header("Cookie", &owner_cookie)
+        .json(&json!({ "email": "vault-editor4@example.com", "role": "editor" }))
+        .send()
+        .await
+        .unwrap();
+    stack
+        .http
+        .put(format!("{}/stores/{store_id}/members", stack.base_url))
+        .header("Cookie", &owner_cookie)
+        .json(&json!({ "email": "vault-reader4@example.com", "role": "reader" }))
+        .send()
+        .await
+        .unwrap();
+
+    // A reader cannot set keys, even their own.
+    let store_key = pimble_crypto::SymmetricKey::generate();
+    let envelope_for_editor = wrap_store_key(&store_key, uuid::Uuid::new_v4(), &store_id, &editor_keys, &editor_public);
+    let resp = stack
+        .http
+        .put(format!("{}/stores/{store_id}/keys", stack.base_url))
+        .header("Cookie", &reader_cookie)
+        .json(&json!({ "envelopes": [ { "user_id": reader_id, "key_id": uuid::Uuid::new_v4().to_string(), "envelope": envelope_for_editor } ] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // An editor CAN set their own key (signed by themselves)...
+    let editor_key_id = uuid::Uuid::new_v4();
+    let self_envelope = wrap_store_key(&store_key, editor_key_id, &store_id, &editor_keys, &editor_public);
+    let resp = stack
+        .http
+        .put(format!("{}/stores/{store_id}/keys", stack.base_url))
+        .header("Cookie", &editor_cookie)
+        .json(&json!({ "envelopes": [ { "user_id": editor_id, "key_id": editor_key_id.to_string(), "envelope": self_envelope } ] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // ...but not on behalf of another member.
+    let other_envelope = wrap_store_key(&store_key, uuid::Uuid::new_v4(), &store_id, &editor_keys, &editor_public);
+    let resp = stack
+        .http
+        .put(format!("{}/stores/{store_id}/keys", stack.base_url))
+        .header("Cookie", &editor_cookie)
+        .json(&json!({ "envelopes": [ { "user_id": owner_id, "key_id": uuid::Uuid::new_v4().to_string(), "envelope": other_envelope } ] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
 }

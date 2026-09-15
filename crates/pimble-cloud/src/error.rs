@@ -38,6 +38,12 @@ pub enum CloudError {
     /// email (Phase 1b). The provider's raw response never reaches the
     /// caller; the call site logs it at `warn` instead.
     MailFailed,
+    /// 429 — a caller (identified by session) is calling a rate-limited
+    /// endpoint too fast (Phase 2a: `GET /users/lookup`).
+    RateLimited(String),
+    /// 501 — a real endpoint that intentionally does nothing yet
+    /// (Phase 2a: `POST /recover`).
+    NotImplemented,
 }
 
 impl CloudError {
@@ -55,6 +61,8 @@ impl CloudError {
                 "mail_failed",
                 "We couldn't send the verification email. Try again in a minute with \"Send it again\".",
             ),
+            CloudError::RateLimited(m) => (StatusCode::TOO_MANY_REQUESTS, "rate_limited", m.as_str()),
+            CloudError::NotImplemented => (StatusCode::NOT_IMPLEMENTED, "not_implemented", "Account recovery is not available yet."),
         }
     }
 }

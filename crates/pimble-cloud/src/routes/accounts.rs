@@ -1,10 +1,18 @@
-//! `POST /signup`, `GET /verify`, `POST /resend-verification`, `POST /login`,
-//! `POST /logout`, `GET /me`, `POST /token`.
+//! `GET /kdf`, `POST /signup`, `GET /verify`, `POST /resend-verification`,
+//! `POST /login`, `POST /logout`, `GET /me`, `GET /me/keys`,
+//! `GET /users/lookup`, `POST /recover`, `POST /token`.
 //!
 //! Phase 1b (docs/CLOUD_CONTRACT.md, "Phase 1b: email verification"): an
 //! account is unusable until its email is verified by clicking a link.
 //! `signup` no longer starts a session; `login` refuses an unverified
 //! account with `email_unverified`.
+//!
+//! Phase 2a (docs/CRYPTO_CONTRACT.md): the server never sees a password —
+//! `signup`/`login` carry `auth_key` (what the client's KDF derived), plus
+//! the account's public keys and wrapped private keys. `password_hash` is
+//! now `Argon2id(auth_key)`; the hashing itself (`crate::auth`) is
+//! unchanged. The web app now owns the account pages, so verification
+//! redirects target `/app/login`, not the static site's `/login.html`.
 
 use axum::extract::{Query, State};
 use axum::http::header::{LOCATION, SET_COOKIE};
@@ -14,10 +22,13 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use pimble_crypto::{AccountKeyBlob, AccountPublicKeys, KdfParams};
+
 use crate::auth::{hash_password, hash_verify_token, new_session_token, new_verify_token, verify_password_constant_time};
 use crate::claims::claims_for_user;
-use crate::db::UserRow;
+use crate::db::{NewUserKeyMaterial, UserRow};
 use crate::error::{CloudError, CloudResult};
+use crate::kdf_decoy::decoy_kdf_params;
 use crate::mail::verification_email;
 use crate::session::{build_clear_cookie, build_set_cookie, AuthedUser};
 use crate::state::AppState;
@@ -26,16 +37,45 @@ const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// "24 h expiry" (docs/CLOUD_CONTRACT.md, "Phase 1b").
 const VERIFY_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
+// ── GET /kdf ────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct KdfQuery {
+    pub email: String,
+}
+
+/// `GET /api/v1/kdf?email=` — a real user's stored KDF parameters, or a
+/// deterministic decoy for an unknown email (docs/CRYPTO_CONTRACT.md
+/// "Client-derived login"). Same response shape either way, so a client
+/// (and a passive observer) cannot tell which one it got.
+pub async fn kdf(State(state): State<AppState>, Query(query): Query<KdfQuery>) -> CloudResult<Json<KdfParams>> {
+    let email_lower = query.email.trim().to_lowercase();
+    if let Some(user) = state.db.find_user_by_email(&email_lower).await? {
+        return Ok(Json(KdfParams { salt: user.kdf_salt, m_cost: user.kdf_m_cost, t_cost: user.kdf_t_cost, p_cost: user.kdf_p_cost }));
+    }
+    Ok(Json(decoy_kdf_params(&state.kdf_decoy_secret, &email_lower)))
+}
+
+// ── Signup / login / logout / me ─────────────────────────────────────────
+
 #[derive(Deserialize)]
 pub struct SignupRequest {
     pub email: String,
-    pub password: String,
+    /// Base64url; the server argon2id-hashes this at rest exactly as it
+    /// hashed a raw password before Phase 2a — see schema.rhype's
+    /// `User.password_hash` comment.
+    pub auth_key: String,
+    pub kdf: KdfParams,
+    pub public_keys: AccountPublicKeys,
+    pub account_key_blob: AccountKeyBlob,
+    pub recovery_salt: String,
+    pub recovery_key_blob: AccountKeyBlob,
 }
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
     pub email: String,
-    pub password: String,
+    pub auth_key: String,
 }
 
 #[derive(Serialize)]
@@ -105,10 +145,38 @@ struct VerificationSentResponse {
     email: String,
 }
 
-pub async fn signup(State(state): State<AppState>, Json(req): Json<SignupRequest>) -> CloudResult<Response> {
-    if req.password.len() < 8 {
-        return Err(CloudError::BadRequest("password must be at least 8 characters".to_string()));
+/// Non-empty and, for a blob, a matching version and non-empty nonce and
+/// ciphertext — a shallow sanity check on the client's own crypto, not a
+/// cryptographic validation (the server never has the keys to check more).
+fn validate_signup_request(req: &SignupRequest) -> CloudResult<()> {
+    if req.auth_key.trim().is_empty() {
+        return Err(CloudError::BadRequest("auth_key must not be empty".to_string()));
     }
+    if req.kdf.salt.trim().is_empty() || req.kdf.m_cost == 0 || req.kdf.t_cost == 0 || req.kdf.p_cost == 0 {
+        return Err(CloudError::BadRequest("kdf is invalid".to_string()));
+    }
+    if req.public_keys.encryption.trim().is_empty() || req.public_keys.signing.trim().is_empty() {
+        return Err(CloudError::BadRequest("public_keys must not be empty".to_string()));
+    }
+    let valid_blob = |b: &AccountKeyBlob| b.v == pimble_crypto::VERSION && !b.nonce.trim().is_empty() && !b.ciphertext.trim().is_empty();
+    if !valid_blob(&req.account_key_blob) {
+        return Err(CloudError::BadRequest("account_key_blob is invalid".to_string()));
+    }
+    if req.recovery_salt.trim().is_empty() {
+        return Err(CloudError::BadRequest("recovery_salt must not be empty".to_string()));
+    }
+    if !valid_blob(&req.recovery_key_blob) {
+        return Err(CloudError::BadRequest("recovery_key_blob is invalid".to_string()));
+    }
+    Ok(())
+}
+
+fn to_json(field: &'static str, value: &impl Serialize) -> CloudResult<String> {
+    serde_json::to_string(value).map_err(|e| CloudError::Internal(format!("serializing {field}: {e}")))
+}
+
+pub async fn signup(State(state): State<AppState>, Json(req): Json<SignupRequest>) -> CloudResult<Response> {
+    validate_signup_request(&req)?;
     let email = req.email.trim();
     if email.is_empty() || !email.contains('@') {
         return Err(CloudError::BadRequest("email is not valid".to_string()));
@@ -121,15 +189,27 @@ pub async fn signup(State(state): State<AppState>, Json(req): Json<SignupRequest
         Some(existing) => {
             // An unverified duplicate just gets the link re-sent — no
             // enumeration signal beyond "check your inbox" either way, and
-            // no new password is recorded (the caller hasn't proven they
-            // control the mailbox, let alone this is the same person).
+            // the key material already on file stands (the caller hasn't
+            // proven mailbox control, let alone that they hold the original
+            // keys, so a resend never overwrites it).
             start_verification(&state, existing.rid, &existing.email).await?;
         }
         None => {
-            let password_hash = hash_password(&req.password)?;
+            let password_hash = hash_password(&req.auth_key)?;
+            let keys = NewUserKeyMaterial {
+                kdf_salt: req.kdf.salt.clone(),
+                kdf_m_cost: req.kdf.m_cost,
+                kdf_t_cost: req.kdf.t_cost,
+                kdf_p_cost: req.kdf.p_cost,
+                public_encryption_key: req.public_keys.encryption.clone(),
+                public_signing_key: req.public_keys.signing.clone(),
+                account_key_blob: to_json("account_key_blob", &req.account_key_blob)?,
+                recovery_salt: req.recovery_salt.clone(),
+                recovery_key_blob: to_json("recovery_key_blob", &req.recovery_key_blob)?,
+            };
             let user = state
                 .db
-                .create_user(email, &password_hash)
+                .create_user(email, &password_hash, &keys)
                 .await?
                 .ok_or_else(|| CloudError::Conflict("an account with this email already exists".to_string()))?;
             start_verification(&state, user.rid, &user.email).await?;
@@ -150,21 +230,23 @@ fn redirect_to(path: &str) -> Response {
 
 /// `GET /api/v1/verify?token=...` — a browser follows the link from the
 /// mail. Never returns a JSON error for an invalid/expired token (those are
-/// redirects the login page renders as a banner); a real backend failure
-/// still surfaces as the usual JSON error.
+/// redirects the web app's `/app/login` renders as a banner); a real
+/// backend failure still surfaces as the usual JSON error. Redirects to the
+/// web app, not the static site (docs/CRYPTO_CONTRACT.md: "the web app owns
+/// the account pages now").
 pub async fn verify(State(state): State<AppState>, Query(query): Query<VerifyQuery>) -> CloudResult<Response> {
     let Some(token) = query.token.as_deref().filter(|t| !t.is_empty()) else {
-        return Ok(redirect_to("/login.html?verify_error=invalid"));
+        return Ok(redirect_to("/app/login?verify_error=invalid"));
     };
     let token_hash = hash_verify_token(token);
     let Some(user) = state.db.find_user_by_verify_token_hash(&token_hash).await? else {
-        return Ok(redirect_to("/login.html?verify_error=invalid"));
+        return Ok(redirect_to("/app/login?verify_error=invalid"));
     };
     if user.verify_expires_at_ms <= chrono::Utc::now().timestamp_millis() {
-        return Ok(redirect_to("/login.html?verify_error=expired"));
+        return Ok(redirect_to("/app/login?verify_error=expired"));
     }
     state.db.mark_user_verified(user.rid).await?;
-    Ok(redirect_to("/login.html?verified=1"))
+    Ok(redirect_to("/app/login?verified=1"))
 }
 
 #[derive(Deserialize)]
@@ -186,7 +268,7 @@ pub async fn resend_verification(State(state): State<AppState>, Json(req): Json<
 
 pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> CloudResult<Response> {
     let user = state.db.find_user_by_email(&req.email).await?;
-    let ok = verify_password_constant_time(&req.password, user.as_ref().map(|u| u.password_hash.as_str()));
+    let ok = verify_password_constant_time(&req.auth_key, user.as_ref().map(|u| u.password_hash.as_str()));
     let Some(user) = user.filter(|_| ok) else {
         return Err(CloudError::Unauthorized("invalid email or password".to_string()));
     };
@@ -205,6 +287,77 @@ pub async fn logout(State(state): State<AppState>, authed: AuthedUser) -> CloudR
 pub async fn me(authed: AuthedUser) -> Json<UserView> {
     Json(UserView { id: authed.user.user_uuid, email: authed.user.email })
 }
+
+// ── Keys ──────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct MeKeysResponse {
+    public_keys: AccountPublicKeys,
+    kdf: KdfParams,
+    account_key_blob: AccountKeyBlob,
+}
+
+/// `GET /api/v1/me/keys` — never the recovery blob (docs/CRYPTO_CONTRACT.md).
+pub async fn me_keys(authed: AuthedUser) -> CloudResult<Json<MeKeysResponse>> {
+    let user = &authed.user;
+    let account_key_blob: AccountKeyBlob =
+        serde_json::from_str(&user.account_key_blob).map_err(|e| CloudError::Internal(format!("stored account_key_blob is not valid JSON: {e}")))?;
+    Ok(Json(MeKeysResponse {
+        public_keys: AccountPublicKeys { encryption: user.public_encryption_key.clone(), signing: user.public_signing_key.clone() },
+        kdf: KdfParams { salt: user.kdf_salt.clone(), m_cost: user.kdf_m_cost, t_cost: user.kdf_t_cost, p_cost: user.kdf_p_cost },
+        account_key_blob,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct UsersLookupQuery {
+    pub email: String,
+}
+
+#[derive(Serialize)]
+pub struct UserLookupResponse {
+    id: String,
+    public_keys: AccountPublicKeys,
+}
+
+/// `GET /api/v1/users/lookup?email=` — a verified user's id and public keys
+/// (so a caller can wrap a store key to them), 404 for anyone else (unknown
+/// email, or a real but unverified account: it has no usable keys to share
+/// yet as far as a sharer is concerned). Rate limited per caller
+/// (docs/CRYPTO_CONTRACT.md doesn't pin a number; see
+/// `state::USERS_LOOKUP_INTERVAL`'s doc comment for the one chosen here).
+pub async fn users_lookup(State(state): State<AppState>, authed: AuthedUser, Query(query): Query<UsersLookupQuery>) -> CloudResult<Json<UserLookupResponse>> {
+    if !state.users_lookup_rate_limit.try_acquire(&authed.user.user_uuid) {
+        return Err(CloudError::RateLimited("too many lookups; slow down".to_string()));
+    }
+    let user = state
+        .db
+        .find_user_by_email(query.email.trim())
+        .await?
+        .filter(|u| u.verified)
+        .ok_or_else(|| CloudError::NotFound("no such user".to_string()))?;
+    Ok(Json(UserLookupResponse {
+        id: user.user_uuid,
+        public_keys: AccountPublicKeys { encryption: user.public_encryption_key, signing: user.public_signing_key },
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct RecoverRequest {
+    #[allow(dead_code)]
+    pub email: String,
+    #[allow(dead_code)]
+    pub recovery_code_auth: String,
+}
+
+/// `POST /api/v1/recover` — out of scope for this phase beyond storing the
+/// blob at signup (docs/CRYPTO_CONTRACT.md); always 501.
+pub async fn recover(Json(req): Json<RecoverRequest>) -> Response {
+    let _ = req;
+    CloudError::NotImplemented.into_response()
+}
+
+// ── Tokens ────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
 pub struct TokenResponse {

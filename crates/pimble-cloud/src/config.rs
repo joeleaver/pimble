@@ -49,6 +49,14 @@ pub struct Config {
     /// `PIMBLE_MAIL_FROM` — the `from` address on every mail this service
     /// sends. Default `Pimble <no-reply@m.pimble.app>`.
     pub mail_from: String,
+    /// `PIMBLE_CLOUD_KDF_DECOY_SECRET` — the HMAC key `GET /kdf` derives an
+    /// unknown email's decoy salt from (docs/CRYPTO_CONTRACT.md "Client-
+    /// derived login"). Unset means a random secret for this process only
+    /// (logs a warning, same pattern as `dev_signing_seed`): the decoy is
+    /// still deterministic within one process's lifetime, which is all the
+    /// endpoint promises, but restarting changes every unknown email's
+    /// decoy salt.
+    pub kdf_decoy_secret: Option<String>,
 }
 
 fn env_var(name: &str) -> Option<String> {
@@ -71,6 +79,7 @@ impl Config {
             releases_base_url: env_var("PIMBLE_CLOUD_RELEASES_BASE_URL"),
             resend_api_key: env_var("RESEND_API_KEY"),
             mail_from: env_var("PIMBLE_MAIL_FROM").unwrap_or_else(|| "Pimble <no-reply@m.pimble.app>".to_string()),
+            kdf_decoy_secret: env_var("PIMBLE_CLOUD_KDF_DECOY_SECRET"),
         }
     }
 

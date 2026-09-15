@@ -12,6 +12,12 @@ use crate::releases::ReleasesCache;
 /// One send per address per minute (docs/CLOUD_CONTRACT.md, "Phase 1b":
 /// `POST /resend-verification`'s rate limit).
 const RESEND_VERIFICATION_INTERVAL: Duration = Duration::from_secs(60);
+/// `GET /api/v1/users/lookup` isn't given a specific number by
+/// docs/CRYPTO_CONTRACT.md ("rate limited"), only that it must be — chosen
+/// to allow ordinary UI use (typing an email into a share dialog) while
+/// still blocking a scripted enumeration loop: at most once every 200ms per
+/// caller (5/s).
+const USERS_LOOKUP_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Clone)]
 pub struct AppState(pub Arc<Inner>);
@@ -24,6 +30,11 @@ pub struct Inner {
     pub releases: ReleasesCache,
     pub mailer: Arc<dyn Mailer>,
     pub resend_rate_limit: RateLimiter,
+    pub users_lookup_rate_limit: RateLimiter,
+    /// `GET /kdf`'s decoy-salt HMAC key (docs/CRYPTO_CONTRACT.md), resolved
+    /// once at startup from `config.kdf_decoy_secret` — see
+    /// [`resolve_kdf_decoy_secret`].
+    pub kdf_decoy_secret: Vec<u8>,
 }
 
 impl std::ops::Deref for AppState {
@@ -33,8 +44,42 @@ impl std::ops::Deref for AppState {
     }
 }
 
+/// `config.kdf_decoy_secret` as bytes (any hex or plain string works — it's
+/// only ever used as an HMAC key, never decoded back), or a fresh random
+/// secret logged at `warn` when unset (same pattern as `JwtSigner`'s local
+/// dev-signing seed): the process still starts and `/kdf` still answers
+/// deterministically within its lifetime, but a restart changes every
+/// unknown email's decoy salt.
+fn resolve_kdf_decoy_secret(config: &Config) -> Vec<u8> {
+    match &config.kdf_decoy_secret {
+        Some(secret) => secret.as_bytes().to_vec(),
+        None => {
+            tracing::warn!(
+                "PIMBLE_CLOUD_KDF_DECOY_SECRET is not set; generating a random secret for this \
+                 process only. GET /kdf's decoy salt for an unknown email will not be stable \
+                 across a restart or agree between replicas. Set the env var before running \
+                 more than one instance."
+            );
+            let mut secret = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::rng(), &mut secret);
+            secret.to_vec()
+        }
+    }
+}
+
 impl AppState {
     pub fn new(config: Config, db: RhypeDb, pimble: PimbleService, signer: JwtSigner, releases: ReleasesCache, mailer: Arc<dyn Mailer>) -> Self {
-        AppState(Arc::new(Inner { config, db, pimble, signer, releases, mailer, resend_rate_limit: RateLimiter::new(RESEND_VERIFICATION_INTERVAL) }))
+        let kdf_decoy_secret = resolve_kdf_decoy_secret(&config);
+        AppState(Arc::new(Inner {
+            config,
+            db,
+            pimble,
+            signer,
+            releases,
+            mailer,
+            resend_rate_limit: RateLimiter::new(RESEND_VERIFICATION_INTERVAL),
+            users_lookup_rate_limit: RateLimiter::new(USERS_LOOKUP_INTERVAL),
+            kdf_decoy_secret,
+        }))
     }
 }

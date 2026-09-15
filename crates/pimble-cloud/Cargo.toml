@@ -13,6 +13,20 @@ path = "src/main.rs"
 [dependencies]
 pimble-core = { workspace = true }
 pimble-client = { workspace = true }
+# `PimbleApiClient` (the generated RPC client trait) and `CreateStoreRequest`:
+# `PimbleService::create_store` (src/pimble.rs) calls `createStore` directly
+# over a raw jsonrpsee connection rather than through `pimble_client::
+# PimbleClient::create_store`, whose wrapper doesn't yet expose `kind`/
+# `store_id` — `pimble-client/src/client.rs` has a concurrent editor as of
+# this writing (see src/pimble.rs's doc comment), so this crate calls the RPC
+# itself instead of extending that wrapper.
+pimble-rpc = { workspace = true }
+jsonrpsee = { workspace = true }
+# Request/response shapes for the crypto endpoints (docs/CRYPTO_CONTRACT.md,
+# "Accounts service endpoints"): `KdfParams`, `AccountPublicKeys`,
+# `AccountKeyBlob`, `KeyEnvelope`. Not in `[workspace.dependencies]` (that
+# table is the PM's file) — a plain path dependency, same crate either way.
+pimble-crypto = { path = "../pimble-crypto" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -54,6 +68,10 @@ rand = "0.9"
 # day sessions "stored as a hash"); hex is just a readable encoding of it.
 sha2 = "0.10"
 hex = "0.4"
+# HMAC-SHA256 for `GET /kdf`'s decoy salt (docs/CRYPTO_CONTRACT.md:
+# "a deterministic decoy salt (HMAC-SHA256 of the lowercased email under a
+# server secret)").
+hmac = "0.12"
 
 # Outbound HTTP: jkbase-Auth token minting, jkbase's JWKS proxy-and-cache, and
 # the GitHub Releases API for /releases. rustls (no system OpenSSL) matches
