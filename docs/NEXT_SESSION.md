@@ -9,23 +9,33 @@ phase 1** (branch `cloud/phase-1`). Read this, then `CLAUDE.md`, then
 
 - Branch `cloud/phase-1` off `master`, working tree clean. Not merged yet: merge once the
   first deploy has been exercised.
-- **Cloud phase 1 is code-complete (2026-09-15), not deployed.** Joe decided to pause the
+- **Cloud phase 1 is done and deployed (2026-09-15).** Joe decided to pause the
   roadmap for a website with downloads and signup, a web app, and a hosted server, all on
   jkbase (`~/dev/jkbase`, his own platform). Contract `docs/CLOUD_CONTRACT.md` (status
   header lists the decisions made during the work); summary in `CLAUDE.md` "Cloud,
   phase 1". Done, each in its own commit: JWT auth and per-store authorization in
   `pimble-server` (94 tests across server and CLI); the `pimble-cloud` accounts service
-  (10 integration tests against a real `rhypedb-server`); `pimble-app` split into a UI
+  (10 integration tests against a real `rhypedb-server`; note they silently skipped until
+  the PM ran the stack: RhypeDB schema comments are `//`, the harness now fails loudly when
+  the database dies); `pimble-app` split into a UI
   library and the desktop binary, `pimble-client` on wasm, and `web/` (trunk) verified end
   to end with two browser tabs editing one document; `site/`, `jkbase.toml`,
   `.github/workflows/{ci,release}.yml`, `docs/DEPLOY.md`.
-- **Live already:** the jkbase project `pimble` (id `pimble`) exists; `pimble.app` and
-  `www.pimble.app` point at it (Cloudflare, DNS only), are verified, and have Let's Encrypt
-  certificates. They answer 503 until the first deploy. `m.pimble.app` is a Resend sending
+- **Deployed 2026-09-15 evening.** The jkbase project `pimble` (id `pimble`) serves
+  https://pimble.app (Cloudflare DNS only, verified, Let's Encrypt): the accounts service
+  at `/api/v1/*`, the hosted Pimble server at `/rpc`, the web app at `/app/`, the site at
+  `/` (that last one fixed in the third build: with any `[sites.*]` declared, jkbase
+  ignores `[hosting]`, so the site is `[sites.site]`). Verified live: signup, store
+  creation, a jkbase-Auth token (`kid pimble.0`), `pimble-cli list-stores` and `search`
+  over `wss://pimble.app/rpc` with that token, and the web app creating and editing a
+  document that the CLI then found by search. A throwaway account
+  `smoke-1789509101@example.com` with store "Live smoke" exists on production; delete it
+  when there is a way to. Deploy with `git push jkbase` (see `docs/DEPLOY.md`); the CLI's
+  `jkbase deploy` gives up client-side after 12 minutes while the hosted server target
+  takes about 12 minutes to compile from a cold cache. `m.pimble.app` is a Resend sending
   domain for phase 2 email.
-- **Not done:** the first `jkbase deploy` (needs `jkbase auth key create` and the secrets
-  in `docs/DEPLOY.md`; Joe confirms before deploying); the Windows release job has never
-  run; no `v*` tag exists, so the download page shows its empty state.
+- **Not done:** the Windows release job has never run; no `v*` tag exists, so the download
+  page shows its empty state; `cloud/phase-1` is not merged to `master`.
 - Both CRDT documents are yrs. No Automerge, no migrations, no backwards compatibility.
 - rinch is tracked from GitHub `main`, pinned in both `Cargo.lock`s at `743f8a0`; the root
   workspace no longer declares `rinch` itself (`crates/pimble-app/Cargo.toml` does).
@@ -130,11 +140,25 @@ after "Copy as Mount Source" again.
 
 ## Follow-ups, in rough priority
 
-0. **Deploy cloud phase 1** (`docs/DEPLOY.md`): issuer key, secrets, `jkbase deploy`, then
-   sign up on pimble.app, create a store, open the web app, edit from two browsers. Then
-   tag `v0.1.0` to exercise the release workflow (the Windows job is unverified) and merge
-   `cloud/phase-1`. Then phase 2: desktop sign-in (`AuthMethod::CloudSession` so the sync
-   link mints a fresh JWT before each connect), the relay, email through Resend.
+0. **After the deploy:** tag `v0.1.0` to exercise the release workflow (the Windows job is
+   unverified) and merge `cloud/phase-1`. Then phase 2: desktop sign-in
+   (`AuthMethod::CloudSession` so the sync link mints a fresh JWT before each connect),
+   the relay, email through Resend (verification, invitations).
+0a. **Hosted build time.** `pimble-cli` compiles about a thousand crates including
+   wasmtime (the plugin skeleton, `pimble-plugins`), and jkbase keeps no compile cache
+   between builds, so every push costs about 12 minutes. Make wasmtime optional in
+   `pimble-plugins` (the hosted server loads no plugins) and ask jkbase for a per-project
+   `target/` cache.
+0b. **jkbase issues found on the first deploys** (Joe's platform, fix there): the trunk
+   buildpack reads the wasm-bindgen version from the build-context root `Cargo.lock`, not
+   the workspace containing `source` (both locks must agree for now); `[hosting]` is
+   silently ignored once any `[sites.*]` exists (the README's kitchen-sink example shows
+   both); a failed trunk target's log tail ends at cargo's "Finished" line, hiding trunk's
+   own error; `jkbase deploy` stops polling after 12 minutes.
+0c. **Web app notes:** jsonrpsee's wasm client reports connected before the socket opens
+   (the backend now waits for `listStores` to answer); the desktop store-row menu after
+   the `CAN_ADMINISTER_STORES` gate was verified by build and inspection, not by
+   right-clicking a desktop row (agent A's embedded server port was taken at the time).
 1. TLS for a self-run `pimble-cli server` (`wss://`). Tokens go over plain `ws://`; fine on a trusted LAN, not beyond it. The hosted server on jkbase is behind the edge's TLS already.
 2. Two servers on one machine opening the same store directory (a mount resolved through
    `source_path` while another server holds the source) share `nodes/*.yrs` and fight over

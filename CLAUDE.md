@@ -209,14 +209,17 @@ tag with the label's name, and its `IconFileName` to an icon where one matches. 
 `set_dark_mode`, `state.json` `dark_mode`); the app stylesheet uses only rinch's semantic
 colour variables, never the dark palette directly, so both schemes work.
 
-### Cloud, phase 1 (code done 2026-09-15, not yet deployed)
+### Cloud, phase 1 (done and deployed 2026-09-15)
 
 Contract: `docs/CLOUD_CONTRACT.md`; operations: `docs/DEPLOY.md`. Everything server-side
 runs on jkbase (`~/dev/jkbase`, Joe's own platform; read it, never edit it) as one project
-`pimble` on one origin, `https://pimble.app` (DNS and certificates are live; the platform
-subdomain `pimble.jkbase.app` works too): `site/` at `/`, `web/` at `/app/`,
-`crates/pimble-cloud` at `/api/*`, and `pimble-cli server` at `/rpc`, all declared in
-`jkbase.toml`.
+`pimble` on one origin, `https://pimble.app` (the platform subdomain `pimble.jkbase.app`
+works too): `site/` at `/` (a named `[sites.site]`; jkbase ignores `[hosting]` once any
+`[sites.*]` exists), `web/` at `/app/`, `crates/pimble-cloud` at `/api/*`, and `pimble-cli
+server` at `/rpc`, all declared in `jkbase.toml`. Deploy with `git push jkbase` (the
+remote's refspec targets the platform's `main`); the root and `web/` lock files must pin
+the same `wasm-bindgen` (the trunk buildpack reads the root lock); the hosted server
+target takes about 12 minutes to build.
 
 - **Identity.** A user is a UUID `sub` with an argon2id password in the accounts service's
   managed RhypeDB (`crates/pimble-cloud/schema.rhype`). A grant is `(user, store, role)`,
