@@ -38,3 +38,6 @@ Thumbs.db
 nul
 # fastembed model cache (a run with the ONNX feature in this directory writes here)
 .fastembed_cache/
+
+# Playwright MCP screenshots from browser checks
+.playwright-mcp/
