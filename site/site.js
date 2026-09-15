@@ -1,6 +1,6 @@
 // Pimble site: shared helpers for the account/API pages. Classic script
 // (no bundler, no modules) so every page can load it with a plain
-// <script src="app.js"></script> and call these as globals.
+// <script src="site.js"></script> and call these as globals.
 
 const PIMBLE_API_BASE = "/api/v1";
 

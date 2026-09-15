@@ -24,6 +24,24 @@
     <section class="shell hero">
       <h1>Log in</h1>
 
+      <div id="verified-banner" class="form-success" hidden>Your email is verified. Log in.</div>
+      <div id="invalid-banner" class="form-error" hidden>That verification link is invalid.</div>
+
+      <div id="expired-banner" class="form-error" hidden>
+        <p style="margin: 0 0 12px;">That link has expired.</p>
+        <form id="expired-resend-form" class="stack" style="max-width: none;" novalidate>
+          <div class="form-error" data-form-error hidden style="margin: 0 0 10px;"></div>
+          <div class="field-row">
+            <div class="field">
+              <label for="expired-email">Email</label>
+              <input id="expired-email" name="email" type="email" autocomplete="email" required>
+            </div>
+            <button class="btn secondary small" type="submit">Send new link</button>
+          </div>
+          <p class="form-note" data-resend-note hidden style="margin-top: 8px;"></p>
+        </form>
+      </div>
+
       <form id="login-form" class="stack" novalidate>
         <div class="form-error" data-form-error hidden></div>
 
@@ -38,6 +56,11 @@
         </div>
 
         <button class="btn" type="submit">Log in</button>
+
+        <div id="login-resend-wrap" hidden style="margin-top: 14px;">
+          <button class="btn secondary small" id="login-resend-btn" type="button">Send it again</button>
+          <p class="form-note" data-login-resend-note hidden style="margin-top: 8px;"></p>
+        </div>
       </form>
 
       <p style="margin-top: 24px;">
@@ -54,33 +77,115 @@
 
   <script src="site.js"></script>
   <script>
-    document.getElementById("login-form").addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const form = e.currentTarget;
-      setFormError(form, "");
+    (function () {
+      const loginForm = document.getElementById("login-form");
+      const loginResendWrap = document.getElementById("login-resend-wrap");
+      const loginResendBtn = document.getElementById("login-resend-btn");
+      const loginResendNote = loginResendWrap.querySelector("[data-login-resend-note]");
 
-      const email = form.email.value.trim();
-      const password = form.password.value;
+      const verifiedBanner = document.getElementById("verified-banner");
+      const invalidBanner = document.getElementById("invalid-banner");
+      const expiredBanner = document.getElementById("expired-banner");
+      const expiredForm = document.getElementById("expired-resend-form");
+      const expiredNote = expiredForm.querySelector("[data-resend-note]");
 
-      const button = form.querySelector('button[type="submit"]');
-      button.disabled = true;
-      try {
-        await apiFetch("/login", {
-          method: "POST",
-          body: JSON.stringify({ email, password }),
-        });
-        const params = new URLSearchParams(window.location.search);
-        window.location.href = params.get("next") || "/app/";
-      } catch (err) {
-        if (err.status === 401) {
-          setFormError(form, "Wrong email or password.");
-        } else {
-          setFormError(form, err.message);
+      function showBannerFromQuery() {
+        try {
+          const params = new URLSearchParams(window.location.search);
+          if (params.get("verified") === "1") {
+            verifiedBanner.hidden = false;
+          }
+          const verifyError = params.get("verify_error");
+          if (verifyError === "expired") {
+            expiredBanner.hidden = false;
+          } else if (verifyError === "invalid") {
+            invalidBanner.hidden = false;
+          }
+        } catch (err) {
+          // Malformed query string -- nothing to show, not fatal.
         }
-      } finally {
-        button.disabled = false;
       }
-    });
+      showBannerFromQuery();
+
+      loginForm.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        try {
+          setFormError(loginForm, "");
+          loginResendWrap.hidden = true;
+
+          const email = loginForm.email.value.trim();
+          const password = loginForm.password.value;
+
+          const button = loginForm.querySelector('button[type="submit"]');
+          button.disabled = true;
+          try {
+            await apiFetch("/login", {
+              method: "POST",
+              body: JSON.stringify({ email, password }),
+            });
+            const params = new URLSearchParams(window.location.search);
+            window.location.href = params.get("next") || "/app/";
+          } catch (err) {
+            if (err.status === 401) {
+              setFormError(loginForm, "Wrong email or password.");
+            } else if (err.status === 403 && err.code === "email_unverified") {
+              setFormError(loginForm, (err && err.message) || "Check your inbox for the verification link.");
+              loginResendWrap.hidden = false;
+            } else {
+              setFormError(loginForm, (err && err.message) || "Something went wrong. Try again.");
+            }
+          } finally {
+            button.disabled = false;
+          }
+        } catch (err) {
+          setFormError(loginForm, (err && err.message) || "Something went wrong. Try again.");
+        }
+      });
+
+      loginResendBtn.addEventListener("click", async () => {
+        try {
+          loginResendNote.hidden = true;
+          loginResendBtn.disabled = true;
+          const email = loginForm.email.value.trim();
+          await apiFetch("/resend-verification", {
+            method: "POST",
+            body: JSON.stringify({ email }),
+          });
+          loginResendNote.textContent = "Sent. Check your inbox.";
+          loginResendNote.hidden = false;
+        } catch (err) {
+          loginResendNote.textContent = (err && err.message) || "Couldn't resend. Try again.";
+          loginResendNote.hidden = false;
+        } finally {
+          loginResendBtn.disabled = false;
+        }
+      });
+
+      expiredForm.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        try {
+          setFormError(expiredForm, "");
+          expiredNote.hidden = true;
+          const email = expiredForm.email.value.trim();
+          const button = expiredForm.querySelector('button[type="submit"]');
+          button.disabled = true;
+          try {
+            await apiFetch("/resend-verification", {
+              method: "POST",
+              body: JSON.stringify({ email }),
+            });
+            expiredNote.textContent = "Sent. Check your inbox.";
+            expiredNote.hidden = false;
+          } catch (err) {
+            setFormError(expiredForm, (err && err.message) || "Couldn't resend. Try again.");
+          } finally {
+            button.disabled = false;
+          }
+        } catch (err) {
+          setFormError(expiredForm, (err && err.message) || "Something went wrong. Try again.");
+        }
+      });
+    })();
   </script>
 </body>
 </html>
