@@ -313,16 +313,43 @@ clicking a link in a message. Sending goes through Resend from the domain `m.pim
 - The site's script is `site.js` (never a name starting with `app`: jkbase routes every
   path with the `/app` prefix, including `/app.js`, to the web app).
 
-## Phase 2 (not now, designed for)
+## Phase 2: sharing (decided with Joe 2026-09-15, not built)
 
-- Desktop sign-in: "Account..." stores the opaque session; `AuthMethod::CloudSession`
-  lets the sync link mint a fresh JWT before each connect, so hosted stores are one click.
-- Relay: a Pimble server on jkbase holding no stores; a local server registers a store over
-  an outbound WebSocket, the relay proxies RPC streams to it, grants come from the same
-  token. Offline sharer means `Cached` for the guest.
-- Email: Joe has `m.pimble.app` configured as a sending domain on Resend. Phase 2 adds
-  signup verification and invitations by email from the accounts service (`RESEND_API_KEY`
-  secret, sender `Pimble <no-reply@m.pimble.app>`); an invited email with no account becomes
-  a pending grant claimed at signup.
-- Teams: organisations above grants, server as source of truth, binary files in object
-  storage, store deletion on disk, invitations by email.
+Share a node **in place**: nothing in the owner's store moves or is restructured (Joe
+rejected extracting a shared subtree into its own store as taking liberties with the
+user's data). Roles for now: `reader` and `editor`; finer permissions later.
+
+- **Grant** becomes `(user, store, root node, role)`; a whole-store grant is the root.
+- **Content** replicates per node (each node is its own yrs document), so a recipient holds
+  copies of exactly the nodes under the shared root: a **partial replica** with a root, a
+  structure cache fed by the source's change notifications, content sync limited to nodes
+  under the root, and tree edits forwarded as node-level RPCs. Recipients never sync the
+  store document (a diff of it carries every title in the store).
+- **Authorization**: every node-scoped RPC checks that the node is under a granted root
+  (ancestor walk); `syncStoreDocument`/`applyStoreUpdate` are refused for subtree grants.
+  Moving a node out of a shared subtree revokes access to it; moving one in shares it.
+- **Recipient side** is a remote mount of the owner's node (exists today) backed by a
+  partial replica instead of a whole-store one. The web app needs no replica.
+- **Source**: the owner's hosted copy (whole-store replica upward, works while the owner
+  is offline) or, later, the relay (nothing stored on the server, cached copy when the
+  owner is offline). The same authorization code runs in whichever server serves it.
+- **Identity**: both sides have accounts. The owner signs in on the desktop (needed to
+  create hosted stores, mint the link's token, manage grants). An invitation is a pending
+  grant keyed by email or an "anyone with the link" token at `https://pimble.app/s/<token>`;
+  signup or login with that email claims it; a signed-in visitor lands in the web app on
+  the shared node or is offered "Open in Pimble desktop".
+- **Revocation** deletes the grant; effective at the next token (an hour) or at once via a
+  Service-only RPC that drops a subject's live connections. Already-synced content stays
+  with the recipient, as in any sharing system.
+- **Encryption** is deferred: shares are labelled as going through Pimble Cloud. A later
+  opt-in "private share" (per-share keys distributed via account public keys, rotation on
+  revoke; no server-side search or web access without keys) fits the same grant model.
+- **UI**: node context menu "Share..." (sign in first if needed); dialog with people by
+  email plus role and an optional "anyone with the link" switch; a shared badge on the node;
+  the same dialog manages members, roles, the link and "Stop sharing".
+
+Build order: desktop sign-in (`AuthMethod::CloudSession` so the sync link mints a fresh JWT
+before each connect); hosting a local store from the app (whole-store replica upward);
+subtree grants in the accounts service and the server, invitation link and email; partial
+replicas and the Share dialog; the relay; then teams (organisations above grants, server as
+source of truth, binary files in object storage, store deletion on disk).
