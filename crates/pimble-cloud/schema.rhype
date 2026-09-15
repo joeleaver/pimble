@@ -1,0 +1,59 @@
+# Pimble Cloud accounts service schema (docs/CLOUD_CONTRACT.md, section C:
+# "Identity and grants").
+#
+# Deviations from the contract's literal field list, both deliberate:
+#
+# 1. `User.user_uuid` is the JWT `sub` — a UUID minted by this service at
+#    signup (never RhypeDB's own internal `id`, which is an implementation
+#    detail of the database and not something we hand out or accept back
+#    from a client). Likewise `HostedStore.store_id` is the Pimble server's
+#    own `StoreId` (also a UUID), not RhypeDB's internal id.
+#
+# 2. `Session.user_rid`, `Grant.user_rid`/`Grant.store_rid`/`Grant.store_uuid`
+#    are redundant scalar copies of what the `user`/`store` relations already
+#    say. RhypeDB's query language has no relation-equality filter — reading
+#    rhypedb-query's parser and executor (`Predicate::Compare`'s right-hand
+#    side is always a scalar `Literal`; `evaluate_predicate` reads the
+#    comparison field straight out of the object's own FieldMap, which never
+#    contains a relation) confirms `.filter(.store == HostedStore.get(1))` is
+#    not a thing today, and neither is `@unique` across a pair of relations.
+#    Without these scalar copies, "does a grant already exist for (user,
+#    store)", "list a store's members", and "build this user's JWT `stores`
+#    claim" would each need a relation traversal per candidate row instead of
+#    one scalar-filtered query. The `user`/`store` relations stay for
+#    referential correctness (and are what a future phase's `@on_delete`
+#    policies would hang off); the scalars are a query-performance shortcut,
+#    not the source of truth.
+
+type User {
+    user_uuid: String @unique
+    email: String
+    email_lower: String @unique
+    password_hash: String
+    created_at: DateTime
+}
+
+type Session {
+    token_hash: String @unique
+    user: User
+    user_rid: u64 @indexed
+    expires_at: DateTime
+    created_at: DateTime
+}
+
+type HostedStore {
+    store_id: String @unique
+    name: String
+    dir_name: String
+    created_at: DateTime
+    deleted: Bool
+}
+
+type Grant {
+    user: User
+    store: HostedStore
+    role: String
+    user_rid: u64 @indexed
+    store_rid: u64 @indexed
+    store_uuid: String
+}

@@ -1,0 +1,651 @@
+//! End-to-end tests for the accounts service (docs/CLOUD_CONTRACT.md,
+//! section C). Every test drives the real axum app (`pimble_cloud::build_router`)
+//! over real HTTP, backed by a real `rhypedb-server` process and a real
+//! in-process `pimble_server::PimbleServer` — no RhypeDB or Pimble server
+//! double stands in for either.
+//!
+//! `rhypedb-server` isn't a workspace member here (rhypedb is a sibling repo,
+//! see CLAUDE.md), so there is no library entry point this crate can start
+//! in-process on an ephemeral port: `rhypedb_server::run()` parses this test
+//! binary's own argv via `clap` and calls `std::process::exit` on any
+//! problem, which is exactly wrong for a test. Every test therefore spawns
+//! the real `rhypedb-server` binary as a subprocess (found at
+//! `~/dev/rhypedb/target/{release,debug}/rhypedb-server` or on `PATH`) and
+//! skips cleanly, printing why, when it can't be found.
+
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use serde_json::{json, Value};
+
+const SCHEMA: &str = include_str!("../schema.rhype");
+
+// ── Harness ──────────────────────────────────────────────────────────────
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+fn find_rhypedb_server_binary() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("RHYPEDB_SERVER_BIN") {
+        let p = PathBuf::from(explicit);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        for rel in ["dev/rhypedb/target/release/rhypedb-server", "dev/rhypedb/target/debug/rhypedb-server"] {
+            let p = PathBuf::from(&home).join(rel);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            for name in ["rhypedb-server", "rhypedb"] {
+                let p = dir.join(name);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
+struct RhypeDbGuard {
+    child: Child,
+    addr: String,
+}
+
+impl Drop for RhypeDbGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+async fn spawn_rhypedb(data_dir: &Path, schema_path: &Path) -> Option<RhypeDbGuard> {
+    let binary = find_rhypedb_server_binary()?;
+    let http_port = free_port();
+    let tcp_port = free_port();
+    let child = Command::new(&binary)
+        .arg("--schema")
+        .arg(schema_path)
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--listen")
+        .arg(format!("127.0.0.1:{http_port}"))
+        .arg("--tcp-listen")
+        .arg(format!("127.0.0.1:{tcp_port}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let addr = format!("127.0.0.1:{tcp_port}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Some(RhypeDbGuard { child, addr })
+}
+
+/// Everything a test needs: the two real backing servers plus the cloud
+/// service's own axum app, all bound to ephemeral loopback ports. Dropping
+/// it tears the stack down (kills the rhypedb-server subprocess, aborts the
+/// cloud app's serve task; the in-process Pimble server and its temp dirs go
+/// with the struct).
+pub struct Stack {
+    _rhypedb: RhypeDbGuard,
+    _rhypedb_data_dir: tempfile::TempDir,
+    _rhypedb_schema_dir: tempfile::TempDir,
+    pub pimble_server: pimble_server::PimbleServer,
+    pub service_token: String,
+    _pimble_creds_dir: tempfile::TempDir,
+    _pimble_replicas_dir: tempfile::TempDir,
+    _stores_dir: tempfile::TempDir,
+    pub base_url: String,
+    pub http: reqwest::Client,
+    cloud_server: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Stack {
+    fn drop(&mut self) {
+        self.cloud_server.abort();
+    }
+}
+
+pub async fn spawn_stack() -> Option<Stack> {
+    spawn_stack_with_releases_base_url(None).await
+}
+
+pub async fn spawn_stack_with_releases_base_url(releases_base_url: Option<String>) -> Option<Stack> {
+    let rhypedb_schema_dir = tempfile::tempdir().unwrap();
+    let schema_path = rhypedb_schema_dir.path().join("schema.rhype");
+    std::fs::write(&schema_path, SCHEMA).unwrap();
+    let rhypedb_data_dir = tempfile::tempdir().unwrap();
+
+    let rhypedb = match spawn_rhypedb(rhypedb_data_dir.path(), &schema_path).await {
+        Some(r) => r,
+        None => return None,
+    };
+
+    let service_token = "pimble-cloud-test-service-token".to_string();
+    let pimble_creds_dir = tempfile::tempdir().unwrap();
+    let pimble_replicas_dir = tempfile::tempdir().unwrap();
+    let mut pimble_server = pimble_server::PimbleServer::with_config(pimble_server::ServerConfig {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        auth_token: Some(service_token.clone()),
+        credentials_path: Some(pimble_creds_dir.path().join("credentials.json")),
+        replicas_dir: Some(pimble_replicas_dir.path().to_path_buf()),
+        // Forward-compatible with fields agent B is concurrently adding to
+        // `ServerConfig` (JWT verification, origin allowlist): this service
+        // only exercises the pre-existing static-token mode.
+        ..Default::default()
+    });
+    pimble_server.start().await.expect("pimble server starts");
+    let pimble_addr = pimble_server.addr();
+
+    let stores_dir = tempfile::tempdir().unwrap();
+
+    // A fixed, non-secret development seed: deterministic within a test run
+    // so a test can verify a minted token's signature against the JWKS this
+    // same process serves.
+    let dev_seed = "aa".repeat(32);
+
+    let config = pimble_cloud::config::Config {
+        port: 0,
+        rhypedb_addr: rhypedb.addr.clone(),
+        pimble_server_url: format!("http://{pimble_addr}"),
+        pimble_server_token: Some(service_token.clone()),
+        pimble_stores_dir: stores_dir.path().to_path_buf(),
+        jkbase_auth_issuer_url: None,
+        jkbase_auth_key: None,
+        dev_signing_seed: Some(dev_seed),
+        public_url: "http://cloud.test".to_string(),
+        github_repo: "joeleaver/pimble".to_string(),
+        releases_base_url,
+    };
+
+    let router = pimble_cloud::build_router(config).await.expect("build_router");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cloud_server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    Some(Stack {
+        _rhypedb: rhypedb,
+        _rhypedb_data_dir: rhypedb_data_dir,
+        _rhypedb_schema_dir: rhypedb_schema_dir,
+        pimble_server,
+        service_token,
+        _pimble_creds_dir: pimble_creds_dir,
+        _pimble_replicas_dir: pimble_replicas_dir,
+        _stores_dir: stores_dir,
+        base_url: format!("http://{addr}/api/v1"),
+        http: reqwest::Client::new(),
+        cloud_server,
+    })
+}
+
+macro_rules! skip_without_rhypedb {
+    () => {
+        match spawn_stack().await {
+            Some(s) => s,
+            None => {
+                eprintln!(
+                    "SKIP: no rhypedb-server binary found (checked $RHYPEDB_SERVER_BIN, \
+                     ~/dev/rhypedb/target/{{release,debug}}/rhypedb-server, and $PATH)"
+                );
+                return;
+            }
+        }
+    };
+}
+
+async fn signup(stack: &Stack, email: &str, password: &str) -> (Value, String) {
+    let resp = stack
+        .http
+        .post(format!("{}/signup", stack.base_url))
+        .json(&json!({ "email": email, "password": password }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "signup for {email} should succeed");
+    let cookie = first_cookie_pair(&resp);
+    let body: Value = resp.json().await.unwrap();
+    (body, cookie)
+}
+
+fn first_cookie_pair(resp: &reqwest::Response) -> String {
+    resp.headers().get("set-cookie").unwrap().to_str().unwrap().split(';').next().unwrap().to_string()
+}
+
+// ── Accounts: signup / login / logout / me ────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn signup_login_logout_me_round_trip() {
+    let stack = skip_without_rhypedb!();
+    let email = "alice@example.com";
+    let password = "correct horse battery staple";
+
+    let (body, cookie) = signup(&stack, email, password).await;
+    assert_eq!(body["user"]["email"], email);
+    assert!(body["user"]["id"].as_str().is_some(), "user id (the sub UUID) should be present");
+    let session_token = body["session"].as_str().unwrap().to_string();
+    assert!(body["token"].as_str().is_some());
+    assert!(body["exp"].as_i64().is_some());
+
+    // /me via the cookie.
+    let resp = stack.http.get(format!("{}/me", stack.base_url)).header("Cookie", &cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let me: Value = resp.json().await.unwrap();
+    assert_eq!(me["email"], email);
+
+    // /me via `Authorization: Bearer <session>` instead of the cookie.
+    let resp = stack.http.get(format!("{}/me", stack.base_url)).bearer_auth(&session_token).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // No credential at all.
+    let resp = stack.http.get(format!("{}/me", stack.base_url)).send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // logout, then the same cookie is dead.
+    let resp = stack.http.post(format!("{}/logout", stack.base_url)).header("Cookie", &cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = stack.http.get(format!("{}/me", stack.base_url)).header("Cookie", &cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // login re-establishes a session.
+    let resp = stack.http.post(format!("{}/login", stack.base_url)).json(&json!({ "email": email, "password": password })).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wrong_password_and_unknown_email_are_both_401() {
+    let stack = skip_without_rhypedb!();
+    signup(&stack, "carol@example.com", "the right password").await;
+
+    let resp = stack
+        .http
+        .post(format!("{}/login", stack.base_url))
+        .json(&json!({ "email": "carol@example.com", "password": "the wrong password" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    let resp = stack
+        .http
+        .post(format!("{}/login", stack.base_url))
+        .json(&json!({ "email": "nobody-signed-up-with-this@example.com", "password": "anything" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_email_is_409() {
+    let stack = skip_without_rhypedb!();
+    signup(&stack, "dupe@example.com", "first password!").await;
+
+    let resp = stack
+        .http
+        .post(format!("{}/signup", stack.base_url))
+        .json(&json!({ "email": "dupe@example.com", "password": "second password!" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+
+    // Case-insensitivity: the same address differently-cased also conflicts.
+    let resp = stack
+        .http
+        .post(format!("{}/signup", stack.base_url))
+        .json(&json!({ "email": "DUPE@example.com", "password": "third password!" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+}
+
+// ── Tokens: claims + JWKS verification ────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn token_claims_and_jwks_verify() {
+    let stack = skip_without_rhypedb!();
+    let (signup_body, cookie) = signup(&stack, "erin@example.com", "a fine password").await;
+    let user_id = signup_body["user"]["id"].as_str().unwrap().to_string();
+
+    let store: Value = stack
+        .http
+        .post(format!("{}/stores", stack.base_url))
+        .header("Cookie", &cookie)
+        .json(&json!({ "name": "Erin's Notes" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+
+    let token_resp: Value =
+        stack.http.post(format!("{}/token", stack.base_url)).header("Cookie", &cookie).send().await.unwrap().json().await.unwrap();
+    let token = token_resp["token"].as_str().unwrap();
+    assert!(token_resp["rpc_url"].as_str().unwrap().ends_with("/rpc"));
+
+    let jwks: Value = stack.http.get(format!("{}/.well-known/jwks.json", stack.base_url)).send().await.unwrap().json().await.unwrap();
+    let payload = verify_and_decode(token, &jwks);
+
+    assert_eq!(payload["sub"], user_id);
+    assert_eq!(payload["aud"], "pimble");
+    assert_eq!(payload["claims"]["email"], "erin@example.com");
+    assert_eq!(payload["claims"]["stores"][&store_id], "owner");
+}
+
+/// Verify `token`'s Ed25519 signature against `jwks` (matching by `kid`) and
+/// return its decoded payload.
+fn verify_and_decode(token: &str, jwks: &Value) -> Value {
+    let parts: Vec<&str> = token.split('.').collect();
+    assert_eq!(parts.len(), 3, "a JWT has three segments");
+
+    let header: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
+    let payload: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+    let signature_bytes = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+
+    let kid = header["kid"].as_str().expect("header carries a kid");
+    let key = jwks["keys"].as_array().unwrap().iter().find(|k| k["kid"] == kid).expect("jwks has a matching kid");
+    let x = key["x"].as_str().unwrap();
+    let public_key_bytes: [u8; 32] = URL_SAFE_NO_PAD.decode(x).unwrap().try_into().unwrap();
+    let verifying_key = VerifyingKey::from_bytes(&public_key_bytes).unwrap();
+
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let signature = Signature::from_bytes(&signature_bytes.try_into().unwrap());
+    verifying_key.verify(signing_input.as_bytes(), &signature).expect("JWT signature verifies against the served JWKS");
+
+    payload
+}
+
+// ── Stores + members ───────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_store_creates_a_real_store_and_an_owner_grant() {
+    let stack = skip_without_rhypedb!();
+    let (_signup_body, cookie) = signup(&stack, "frank@example.com", "another fine password").await;
+
+    let resp = stack
+        .http
+        .post(format!("{}/stores", stack.base_url))
+        .header("Cookie", &cookie)
+        .json(&json!({ "name": "Frank's Store" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let store: Value = resp.json().await.unwrap();
+    assert_eq!(store["name"], "Frank's Store");
+    assert_eq!(store["role"], "owner");
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+
+    // It's a real store on the Pimble server, not just a RhypeDB row: connect
+    // as the service principal and check the server itself has it open.
+    let pimble_client = pimble_client::PimbleClient::connect_with_auth(
+        format!("http://{}", stack.pimble_server.addr()),
+        &pimble_core::AuthMethod::Bearer { token: stack.service_token.clone() },
+    )
+    .await
+    .unwrap();
+    let open_stores = pimble_client.list_stores().await.unwrap();
+    assert!(
+        open_stores.iter().any(|s| s.id.as_uuid().to_string() == store_id),
+        "the store POST /stores created should be open on the Pimble server"
+    );
+
+    // GET /stores lists it for the owner.
+    let stores: Value = stack.http.get(format!("{}/stores", stack.base_url)).header("Cookie", &cookie).send().await.unwrap().json().await.unwrap();
+    assert!(stores.as_array().unwrap().iter().any(|s| s["store_id"] == store_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn member_lifecycle_and_last_owner_refusal() {
+    let stack = skip_without_rhypedb!();
+    let (owner_body, owner_cookie) = signup(&stack, "grace@example.com", "owner password!!").await;
+    let (_member_body, member_cookie) = signup(&stack, "heidi@example.com", "member password!!").await;
+    let member_user_id = stack
+        .http
+        .get(format!("{}/me", stack.base_url))
+        .header("Cookie", &member_cookie)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let _ = owner_body;
+
+    let store: Value = stack
+        .http
+        .post(format!("{}/stores", stack.base_url))
+        .header("Cookie", &owner_cookie)
+        .json(&json!({ "name": "Shared Store" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+
+    // A non-member can't see the members list.
+    let resp = stack.http.get(format!("{}/stores/{store_id}/members", stack.base_url)).header("Cookie", &member_cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // The owner adds heidi as a reader.
+    let resp = stack
+        .http
+        .put(format!("{}/stores/{store_id}/members", stack.base_url))
+        .header("Cookie", &owner_cookie)
+        .json(&json!({ "email": "heidi@example.com", "role": "reader" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let members: Value =
+        stack.http.get(format!("{}/stores/{store_id}/members", stack.base_url)).header("Cookie", &owner_cookie).send().await.unwrap().json().await.unwrap();
+    let members = members.as_array().unwrap();
+    assert_eq!(members.len(), 2);
+    assert!(members.iter().any(|m| m["email"] == "heidi@example.com" && m["role"] == "reader"));
+
+    // A non-owner (reader) can't change roles.
+    let resp = stack
+        .http
+        .put(format!("{}/stores/{store_id}/members", stack.base_url))
+        .header("Cookie", &member_cookie)
+        .json(&json!({ "email": "heidi@example.com", "role": "editor" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // A non-owner (reader) can't delete the store either.
+    let resp = stack.http.delete(format!("{}/stores/{store_id}", stack.base_url)).header("Cookie", &member_cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // The owner changes heidi to editor.
+    let resp = stack
+        .http
+        .put(format!("{}/stores/{store_id}/members", stack.base_url))
+        .header("Cookie", &owner_cookie)
+        .json(&json!({ "email": "heidi@example.com", "role": "editor" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.json::<Value>().await.unwrap()["role"], "editor");
+
+    // Demoting the sole owner (via PUT) is refused exactly like removing
+    // them: either way the store would end up with zero owners.
+    let resp = stack
+        .http
+        .put(format!("{}/stores/{store_id}/members", stack.base_url))
+        .header("Cookie", &owner_cookie)
+        .json(&json!({ "email": "grace@example.com", "role": "editor" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+
+    // Removing the sole owner is refused.
+    let owner_user_id = stack.http.get(format!("{}/me", stack.base_url)).header("Cookie", &owner_cookie).send().await.unwrap().json::<Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = stack
+        .http
+        .delete(format!("{}/stores/{store_id}/members/{owner_user_id}", stack.base_url))
+        .header("Cookie", &owner_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+
+    // The owner removes heidi (an editor, not the last owner: allowed).
+    let resp = stack
+        .http
+        .delete(format!("{}/stores/{store_id}/members/{member_user_id}", stack.base_url))
+        .header("Cookie", &owner_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let members: Value =
+        stack.http.get(format!("{}/stores/{store_id}/members", stack.base_url)).header("Cookie", &owner_cookie).send().await.unwrap().json().await.unwrap();
+    assert_eq!(members.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_store_hides_it() {
+    let stack = skip_without_rhypedb!();
+    let (_body, cookie) = signup(&stack, "ivan@example.com", "yet another password").await;
+
+    let store: Value = stack
+        .http
+        .post(format!("{}/stores", stack.base_url))
+        .header("Cookie", &cookie)
+        .json(&json!({ "name": "Disposable" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+
+    let resp = stack.http.delete(format!("{}/stores/{store_id}", stack.base_url)).header("Cookie", &cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let stores: Value = stack.http.get(format!("{}/stores", stack.base_url)).header("Cookie", &cookie).send().await.unwrap().json().await.unwrap();
+    assert!(!stores.as_array().unwrap().iter().any(|s| s["store_id"] == store_id), "a deleted store must not be listed");
+
+    let resp = stack.http.get(format!("{}/stores/{store_id}/members", stack.base_url)).header("Cookie", &cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 404, "a deleted store's members endpoint should look like it never existed");
+}
+
+// ── Releases ────────────────────────────────────────────────────────────
+
+async fn spawn_github_stub(body: Value, status: axum::http::StatusCode) -> (String, tokio::task::JoinHandle<()>) {
+    let app = axum::Router::new().route(
+        "/repos/:owner/:repo/releases/latest",
+        axum::routing::get(move || {
+            let body = body.clone();
+            async move { (status, axum::Json(body)) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), task)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn releases_endpoint_uses_a_stub_and_infers_os() {
+    let (stub_url, _stub) = spawn_github_stub(
+        json!({
+            "tag_name": "v1.2.3",
+            "published_at": "2026-01-01T00:00:00Z",
+            "assets": [
+                { "name": "pimble-1.2.3-linux-x86_64.tar.gz", "browser_download_url": "https://example.com/linux.tar.gz", "size": 111 },
+                { "name": "pimble-1.2.3-windows-x86_64.zip", "browser_download_url": "https://example.com/windows.zip", "size": 222 },
+            ],
+        }),
+        axum::http::StatusCode::OK,
+    )
+    .await;
+
+    let stack = match spawn_stack_with_releases_base_url(Some(stub_url)).await {
+        Some(s) => s,
+        None => {
+            eprintln!("SKIP: no rhypedb-server binary found");
+            return;
+        }
+    };
+
+    let resp = stack.http.get(format!("{}/releases", stack.base_url)).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["version"], "v1.2.3");
+    let assets = body["assets"].as_array().unwrap();
+    assert_eq!(assets.len(), 2);
+    assert_eq!(assets[0]["os"], "linux");
+    assert_eq!(assets[1]["os"], "windows");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn releases_endpoint_tolerates_no_releases_yet() {
+    let (stub_url, _stub) = spawn_github_stub(json!({ "message": "Not Found" }), axum::http::StatusCode::NOT_FOUND).await;
+
+    let stack = match spawn_stack_with_releases_base_url(Some(stub_url)).await {
+        Some(s) => s,
+        None => {
+            eprintln!("SKIP: no rhypedb-server binary found");
+            return;
+        }
+    };
+
+    let resp = stack.http.get(format!("{}/releases", stack.base_url)).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["version"], "");
+    assert_eq!(body["assets"], json!([]));
+}
+
+// ── Health ──────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn health_is_ok() {
+    let stack = skip_without_rhypedb!();
+    let resp = stack.http.get(format!("{}/health", stack.base_url)).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "ok");
+}

@@ -11,3 +11,55 @@ name = "pimble-cloud"
 path = "src/main.rs"
 
 [dependencies]
+pimble-core = { workspace = true }
+pimble-client = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+url = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+base64 = { workspace = true }
+
+# HTTP server for /api/v1 (docs/CLOUD_CONTRACT.md, section C).
+axum = "0.7"
+# axum-core 0.4's `FromRequestParts`/`FromRequest` are still declared with
+# `#[async_trait]` (pre-AFIT), so `AuthedUser`'s impl (src/session.rs) needs
+# the same macro to match the trait's desugared signature.
+async-trait = "0.1.67"
+
+# RhypeDB client: the accounts database. `async` pulls in the native
+# `AsyncClient` (tokio-backed); the sync `Client` stays unused. Pinned to the
+# same git branch as every other rhypedb-* crate in this workspace.
+rhypedb-client = { git = "https://github.com/joeleaver/rhypedb.git", branch = "master", features = ["async"] }
+# Named directly (not just transitively through rhypedb-client) because this
+# crate names `rhypedb_wire::object::{Object, Value}` itself when reading rows
+# back off the wire — see src/db.rs.
+rhypedb-wire = { git = "https://github.com/joeleaver/rhypedb.git", branch = "master" }
+
+# Password hashing (argon2id).
+argon2 = "0.5"
+# Local (development) JWT signing when no jkbase issuer is configured; also
+# used to build the dev `/.well-known/jwks.json` entry (a hand-rolled RFC 8037
+# OKP JWK — jsonwebtoken has no JWK-serialization surface, so this is simpler
+# than pulling it in just to hand-roll the JWK anyway).
+ed25519-dalek = "2"
+rand = "0.9"
+# Opaque session tokens are stored only as a hash (docs/CLOUD_CONTRACT.md: 30
+# day sessions "stored as a hash"); hex is just a readable encoding of it.
+sha2 = "0.10"
+hex = "0.4"
+
+# Outbound HTTP: jkbase-Auth token minting, jkbase's JWKS proxy-and-cache, and
+# the GitHub Releases API for /releases. rustls (no system OpenSSL) matches
+# the rest of this workspace's TLS story.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+pimble-server = { workspace = true }
+tempfile = "3"
