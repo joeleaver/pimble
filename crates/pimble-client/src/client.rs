@@ -103,6 +103,20 @@ impl PimbleClient {
         Ok(Self { client, base_url })
     }
 
+    /// Whether the WebSocket connection is still up. False once the server
+    /// has gone away (the background task has closed), even before any call
+    /// has failed.
+    pub fn is_connected(&self) -> bool {
+        self.client.is_connected()
+    }
+
+    /// Resolves once the connection is lost (or immediately if it already
+    /// is). Lets a caller notice a dead server without waiting for a call to
+    /// fail.
+    pub async fn on_disconnect(&self) {
+        self.client.on_disconnect().await
+    }
+
     /// Get the server URL
     pub fn url(&self) -> &Url {
         &self.base_url

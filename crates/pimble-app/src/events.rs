@@ -116,7 +116,10 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     store.client_id.set(client_id.clone());
                 }
 
-                // Auto-open previously loaded stores
+                // Auto-open previously loaded stores. On a reconnect this is
+                // the same list (every open store is persisted there), so
+                // the new server ends up holding what the old one held; the
+                // tree keeps its store ids and refreshes from `StoreOpened`.
                 let saved_paths = load_app_state_file();
                 store.backend.with(|b| {
                     if let Some(backend) = b {
@@ -126,6 +129,29 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         }
                     }
                 });
+
+                // A document was being edited across the reconnect: its
+                // subscription died with the old connection and any delta
+                // sent during the gap was lost. Commands run in order, so
+                // the store is open again by the time these execute: push the
+                // editor's whole current state (a yrs update; the server
+                // merges it, so nothing typed offline is lost) and subscribe
+                // again for the other direction.
+                if let Some(active) = untracked(|| store.active_edit.get()) {
+                    if let Some(snapshot) = crate::editor::editor().collab_snapshot() {
+                        use base64::Engine;
+                        let changes = base64::engine::general_purpose::STANDARD.encode(&snapshot);
+                        store.send(BackendCommand::BroadcastChanges {
+                            store_id: active.store_id,
+                            node_id: active.node_id,
+                            changes,
+                        });
+                    }
+                    store.send(BackendCommand::SubscribeNodeChanges {
+                        store_id: active.store_id,
+                        node_id: active.node_id,
+                    });
+                }
             }
 
             BackendEvent::Disconnected => {

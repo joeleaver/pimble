@@ -62,6 +62,11 @@ pub enum BackendCommand {
     SubscribeStoreChanges { store_id: StoreId },
     SubscribeNodeChanges { store_id: StoreId, node_id: NodeId },
 
+    /// Internal: the connection watchdog saw the WebSocket close. Carries the
+    /// connection generation it watched so a stale watchdog (from before a
+    /// reconnect) is ignored.
+    ConnectionLost { generation: u64 },
+
     // Search
     Search { query: String, stores: Vec<StoreId>, limit: usize },
     RebuildIndex { store_id: StoreId },
@@ -159,9 +164,10 @@ impl BackendHandle {
         let (cmd_tx, cmd_rx) = bounded::<BackendCommand>(100);
         let (event_tx, event_rx) = bounded::<BackendEvent>(1000);
 
+        let watchdog_tx = cmd_tx.clone();
         thread::spawn(move || {
             let rt = Runtime::new().expect("Failed to create tokio runtime");
-            rt.block_on(backend_loop(cmd_rx, event_tx, signal_ui));
+            rt.block_on(backend_loop(cmd_rx, watchdog_tx, event_tx, signal_ui));
         });
 
         Self { cmd_tx, event_rx }
@@ -282,10 +288,24 @@ fn is_connection_error(msg: &str) -> bool {
         || lower.contains("tcp")
         || lower.contains("eof")
         || lower.contains("not connected")
+        || lower.contains("connection closed")
+}
+
+/// Watch `client` and post `ConnectionLost` to the command loop the moment
+/// its WebSocket closes. This is what lets an app that borrowed another
+/// instance's embedded server notice that instance quitting, instead of
+/// finding out from the next failed call.
+fn spawn_connection_watchdog(client: std::sync::Arc<PimbleClient>, generation: u64, cmd_tx: Sender<BackendCommand>) {
+    tokio::spawn(async move {
+        client.on_disconnect().await;
+        tracing::warn!("Connection to the server closed (generation {})", generation);
+        let _ = cmd_tx.try_send(BackendCommand::ConnectionLost { generation });
+    });
 }
 
 async fn backend_loop(
     cmd_rx: Receiver<BackendCommand>,
+    cmd_tx: Sender<BackendCommand>,
     event_tx: Sender<BackendEvent>,
     signal_ui: impl Fn() + Send + Sync + 'static,
 ) {
@@ -297,11 +317,17 @@ async fn backend_loop(
 
     let mut client: Option<std::sync::Arc<PimbleClient>> = None;
     let mut owned_server: Option<PimbleServer> = None;
+    // Bumped on every (re)connection; watchdogs report the generation they
+    // watched so one left over from a previous connection cannot trigger a
+    // second reconnect.
+    let mut generation: u64 = 0;
 
     // Initial connection
     match ensure_connected().await {
         Ok((c, server)) => {
-            client = Some(std::sync::Arc::new(c));
+            let c = std::sync::Arc::new(c);
+            spawn_connection_watchdog(std::sync::Arc::clone(&c), generation, cmd_tx.clone());
+            client = Some(c);
             owned_server = server;
             let _ = event_tx.try_send(BackendEvent::Connected {
                 server_addr: SERVER_ADDR.to_string(),
@@ -325,36 +351,66 @@ async fn backend_loop(
             Err(_) => break, // Channel closed, exit
         };
 
+        // A dead connection is handled before the command runs against it:
+        // the watchdog's `ConnectionLost` for the current generation, or a
+        // client that reports itself closed. Either way, reconnect (starting
+        // our own embedded server if the one we borrowed is gone), tell the
+        // UI, and then run the command against the new connection. A stale
+        // `ConnectionLost` is dropped.
+        let lost = match &cmd {
+            BackendCommand::ConnectionLost { generation: g } => {
+                if *g != generation {
+                    continue;
+                }
+                true
+            }
+            _ => client.as_ref().map_or(false, |c| !c.is_connected()),
+        };
+        if lost {
+            tracing::warn!("Connection lost, attempting reconnect");
+            let _ = event_tx.try_send(BackendEvent::Disconnected);
+            signal_ui();
+            match reconnect(&mut owned_server).await {
+                Ok(c) => {
+                    generation += 1;
+                    let c = std::sync::Arc::new(c);
+                    spawn_connection_watchdog(std::sync::Arc::clone(&c), generation, cmd_tx.clone());
+                    client = Some(c);
+                    let _ = event_tx.try_send(BackendEvent::Connected {
+                        server_addr: SERVER_ADDR.to_string(),
+                        client_id: client_id.clone(),
+                    });
+                    signal_ui();
+                }
+                Err(e) => {
+                    tracing::error!("Reconnection failed: {}", e);
+                    let _ = event_tx.try_send(BackendEvent::Error {
+                        message: format!("Reconnection failed: {}", e),
+                    });
+                    signal_ui();
+                    continue;
+                }
+            }
+            if matches!(cmd, BackendCommand::ConnectionLost { .. }) {
+                continue;
+            }
+        }
+
         let event = process_command(&mut client, cmd, &event_tx, &signal_arc, &client_id).await;
 
         if let Some(ref event) = event {
-            // Check if this is a connection error — if so, try to reconnect
+            // A call that failed because the connection died under it: the
+            // watchdog will post `ConnectionLost` and the next command
+            // reconnects; report it as a disconnect rather than a generic error.
             if let BackendEvent::Error { message } = event {
                 if is_connection_error(message) {
-                    tracing::warn!("Connection error detected, attempting reconnect: {}", message);
+                    tracing::warn!("Connection error on a call: {}", message);
                     let _ = event_tx.try_send(BackendEvent::Disconnected);
                     signal_ui();
-
-                    match reconnect(&mut owned_server).await {
-                        Ok(c) => {
-                            client = Some(std::sync::Arc::new(c));
-                            let _ = event_tx.try_send(BackendEvent::Connected {
-                                server_addr: SERVER_ADDR.to_string(),
-                                client_id: client_id.clone(),
-                            });
-                            signal_ui();
-                            // Don't send the original error — we recovered
-                            continue;
-                        }
-                        Err(e) => {
-                            tracing::error!("Reconnection failed: {}", e);
-                            let _ = event_tx.try_send(BackendEvent::Error {
-                                message: format!("Reconnection failed: {}", e),
-                            });
-                            signal_ui();
-                            continue;
-                        }
-                    }
+                    // Wake the loop so the reconnect happens even if the UI
+                    // sends nothing else for a while.
+                    let _ = cmd_tx.try_send(BackendCommand::ConnectionLost { generation });
+                    continue;
                 }
             }
         }
@@ -624,6 +680,9 @@ async fn process_command(
                 Err(e) => Some(BackendEvent::Error { message: format!("Subscribe failed: {}", e) }),
             }
         }
+
+        // Handled in `backend_loop` before dispatch; never reaches here.
+        BackendCommand::ConnectionLost { .. } => None,
 
         BackendCommand::Search { query, stores, limit } => {
             let Some(c) = client.as_ref() else {
