@@ -3,7 +3,14 @@
 use std::path::{Path, PathBuf};
 
 use jsonrpsee::core::client::SubscriptionClientT;
-use jsonrpsee::ws_client::{HeaderMap, HeaderValue, WsClient, WsClientBuilder};
+// The transport differs per target but the client type does not:
+// `jsonrpsee::ws_client::WsClient` and what `WasmClientBuilder` builds are both
+// `jsonrpsee_core::client::Client`, so every RPC method below is written once.
+use jsonrpsee::core::client::Client as RpcClient;
+#[cfg(target_arch = "wasm32")]
+use jsonrpsee::wasm_client::WasmClientBuilder;
+#[cfg(not(target_arch = "wasm32"))]
+use jsonrpsee::ws_client::{HeaderMap, HeaderValue, WsClientBuilder};
 use pimble_core::{AuthMethod, Node, NodeId, RemoteEndpoint, Store, StoreId, SyncState, Workspace};
 use pimble_core::MountRef;
 use pimble_rpc::{
@@ -23,9 +30,42 @@ use crate::error::{ClientError, Result};
 /// Client for connecting to a Pimble server via WebSocket.
 ///
 /// Uses WebSocket transport to support both RPC calls and subscriptions.
+///
+/// The same API on both targets. Natively the transport is jsonrpsee's
+/// `ws-client` (tokio and tungstenite) and a credential travels in a request
+/// header; on `wasm32` it is jsonrpsee's `wasm-client` (the browser's own
+/// `WebSocket` through web-sys), where no header can be set and the credential
+/// travels as an `access_token` query parameter instead.
 pub struct PimbleClient {
-    client: WsClient,
+    client: RpcClient,
     base_url: Url,
+}
+
+/// `url` with `access_token=<token>` added to its query, which is how a
+/// browser carries a credential the `WebSocket` API gives it no way to put in
+/// a header (the server accepts it beside `Authorization: Bearer` and
+/// `X-Api-Key`; see the cloud contract). Any existing `access_token` is
+/// replaced, every other query parameter is kept, and the token is
+/// percent-encoded by `Url`'s own serializer.
+///
+/// A URL carrying a credential belongs in a `WebSocket` constructor and
+/// nowhere else: it should not be logged, put in a link, or persisted.
+pub fn url_with_access_token(url: &Url, token: &str) -> Url {
+    let mut out = url.clone();
+    let kept: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(k, _)| k != "access_token")
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    {
+        let mut query = out.query_pairs_mut();
+        query.clear();
+        for (k, v) in &kept {
+            query.append_pair(k, v);
+        }
+        query.append_pair("access_token", token);
+    }
+    out
 }
 
 /// Turn a failed [`PimbleClient::connect_with_auth`] at `url` into the
@@ -39,6 +79,11 @@ pub struct PimbleClient {
 /// token) becomes "refused the credentials"; `403` (the edge's `Origin`
 /// check) becomes "refused the connection". Anything else keeps the
 /// original message.
+///
+/// On `wasm32` the browser's `WebSocket` never reports the rejecting
+/// response's status to script, so neither branch can match and a refused
+/// handshake keeps its generic message. That is a browser limitation, not a
+/// gap here.
 pub fn describe_connect_error(url: &Url, err: &ClientError) -> String {
     let msg = err.to_string();
     // `Url` always renders a bare host with a trailing `/`; people type and
@@ -106,6 +151,18 @@ impl PimbleClient {
             other => return Err(ClientError::Connection(format!("Unsupported scheme: {}", other))),
         };
 
+        let client = Self::build_transport(&ws_url, auth).await?;
+
+        // `ws_url` may carry the credential on wasm32, so only the base URL is
+        // ever logged.
+        debug!("Connected to Pimble server at {}", base_url);
+
+        Ok(Self { client, base_url })
+    }
+
+    /// Open the WebSocket to `ws_url`, carrying `auth` in a request header.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn build_transport(ws_url: &Url, auth: &AuthMethod) -> Result<RpcClient> {
         let mut builder = WsClientBuilder::default();
         match auth {
             AuthMethod::None => {}
@@ -130,14 +187,34 @@ impl PimbleClient {
             }
         }
 
-        let client = builder
-            .build(&ws_url)
+        builder
+            .build(ws_url)
             .await
-            .map_err(|e| ClientError::Connection(e.to_string()))?;
+            .map_err(|e| ClientError::Connection(e.to_string()))
+    }
 
-        debug!("Connected to Pimble server at {} (ws: {})", base_url, ws_url);
+    /// Open the browser's `WebSocket` to `ws_url`, carrying `auth` as an
+    /// `access_token` query parameter: the `WebSocket` constructor takes a URL
+    /// and a subprotocol list and nothing else, so a header is not available.
+    /// `Bearer` and `ApiKey` both put their secret there and the server tries
+    /// each of its verifiers against it.
+    #[cfg(target_arch = "wasm32")]
+    async fn build_transport(ws_url: &Url, auth: &AuthMethod) -> Result<RpcClient> {
+        let ws_url = match auth {
+            AuthMethod::None => ws_url.clone(),
+            AuthMethod::Bearer { token } => url_with_access_token(ws_url, token),
+            AuthMethod::ApiKey { key } => url_with_access_token(ws_url, key),
+            AuthMethod::OAuth2 { .. } => {
+                return Err(ClientError::Connection(
+                    "OAuth2 auth is not supported by connect_with_auth".into(),
+                ));
+            }
+        };
 
-        Ok(Self { client, base_url })
+        WasmClientBuilder::default()
+            .build(ws_url.as_str())
+            .await
+            .map_err(|e| ClientError::Connection(e.to_string()))
     }
 
     /// Whether the WebSocket connection is still up. False once the server
@@ -804,5 +881,47 @@ impl PimbleClient {
             .map_err(rpc_error)?;
 
         Ok(response.indexed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn access_token_goes_in_the_query() {
+        let url: Url = "wss://pimble.example/rpc".parse().unwrap();
+        let out = url_with_access_token(&url, "abc123");
+        assert_eq!(out.as_str(), "wss://pimble.example/rpc?access_token=abc123");
+    }
+
+    #[test]
+    fn access_token_keeps_other_parameters_and_replaces_its_own() {
+        let url: Url = "wss://pimble.example/rpc?store=one&access_token=stale".parse().unwrap();
+        let out = url_with_access_token(&url, "fresh");
+        let pairs: Vec<(String, String)> = out
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("store".to_string(), "one".to_string()),
+                ("access_token".to_string(), "fresh".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn access_token_is_percent_encoded() {
+        let url: Url = "wss://pimble.example/rpc".parse().unwrap();
+        // A JWT never contains these, but a static token set by hand might.
+        let out = url_with_access_token(&url, "a b&c=d");
+        assert_eq!(out.query().unwrap(), "access_token=a+b%26c%3Dd");
+        assert_eq!(
+            out.query_pairs().next().unwrap().1.into_owned(),
+            "a b&c=d",
+            "the server reads back exactly what was put in"
+        );
     }
 }

@@ -1,16 +1,10 @@
 //! Pimble Desktop Application
 //!
-//! Entry point for the Rinch-based desktop application.
-
-mod app;
-mod appearance;
-mod backend;
-mod editor;
-mod events;
-mod persistence;
-mod state;
-mod styles;
-mod toolbar;
+//! Entry point for the Rinch-based desktop application. Everything it draws and
+//! everything it talks to lives in the `pimble_app` library beside it; this file
+//! only starts the logger and opens the window. The library's `native` feature
+//! (which this binary requires) is what brings in the embedded server, the tokio
+//! backend thread and the desktop shell.
 
 fn main() {
     // Initialize logging
@@ -24,7 +18,7 @@ fn main() {
     tracing::info!("Starting Pimble with Rinch...");
 
     // Run the application
-    app::run();
+    pimble_app::app::run();
 }
 
 #[cfg(test)]

@@ -46,10 +46,11 @@ rhypedb-engine = { git = "https://github.com/joeleaver/rhypedb.git", branch = "m
 rhypedb-schema = { git = "https://github.com/joeleaver/rhypedb.git", branch = "master" }
 rhypedb-query = { git = "https://github.com/joeleaver/rhypedb.git", branch = "master", default-features = false }
 
-# UI framework, tracked from GitHub main (never the local checkout). Software
-# rendering (no `gpu`) avoids rinch's wgpu-fork patch. `collaboration` enables the
-# editor's CRDT (yrs) collab API used by pimble-app.
-rinch = { git = "https://github.com/joeleaver/rinch.git", branch = "main", features = ["desktop", "components", "theme", "file-dialogs", "clipboard", "debug", "collaboration"] }
+# UI framework, tracked from GitHub main (never the local checkout). `rinch` itself is
+# declared in crates/pimble-app/Cargo.toml (default features off there; the `native`
+# feature re-adds desktop, file-dialogs, clipboard, debug, collaboration; `web` uses
+# rinch-web), because the same UI library builds for the browser. Software rendering
+# (no `gpu`) avoids rinch's wgpu-fork patch.
 rinch-tabler-icons = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
 rinch-editor-core = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
 # Headless collab session (yrs projection of the editor model); pure Rust, no

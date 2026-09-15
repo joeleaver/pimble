@@ -9,13 +9,28 @@ use std::collections::HashSet;
 use pimble_core::{NodeId, Store, StoreId};
 use rinch::prelude::*;
 
-use crate::backend::{BackendCommand, BackendEvent};
+use crate::protocol::{BackendCommand, BackendEvent};
 use crate::editor::{apply_remote, start_editing};
 use crate::persistence::{load_app_state_file, save_app_state_file};
 use crate::state::{parse_tree_value, take_last_drop_target_value, AppStore, ConnectionState, MountInfo, SearchState};
 
 thread_local! {
     pub(crate) static EVENT_PROCESSOR: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+}
+
+/// Drain whatever the backend has posted into the UI, from a backend that has
+/// just put something there.
+///
+/// `app::build_view` registers the processor; a backend calls this (through
+/// `run_on_main_thread`, so it never runs while the backend's own borrow is
+/// live) every time it emits an event. Doing nothing is correct before the UI
+/// has been built and after it is gone.
+pub fn pump_backend_events() {
+    EVENT_PROCESSOR.with(|cell| {
+        if let Some(f) = cell.borrow().as_ref() {
+            f();
+        }
+    });
 }
 
 /// Register a newly-known store in the tree: upsert its signal, fetch its

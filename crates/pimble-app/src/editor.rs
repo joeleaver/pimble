@@ -20,7 +20,8 @@ use pimble_core::{NodeId, StoreId};
 use rinch::prelude::*;
 use rinch_editor_core::Node as EditorNode;
 
-use crate::backend::BackendCommand;
+use crate::protocol::BackendCommand;
+use crate::rinch_editor::{create_editor, EditorHandle};
 use crate::state::{label_from_title_and_content, ActiveEdit, AppStore};
 
 thread_local! {

@@ -12,7 +12,7 @@ use pimble_core::{MountRef, MountState, Node, NodeId, RemoteEndpoint, Store, Sto
 use rinch::components::TreeNodeData;
 use rinch::prelude::*;
 
-use crate::backend::BackendHandle;
+use crate::protocol::BackendHandle;
 
 thread_local! {
     /// The tree value (with any mount-path suffix, decision 7) of the last
@@ -888,7 +888,7 @@ impl AppStore {
     }
 
     /// Send a command to the backend if connected.
-    pub fn send(&self, cmd: crate::backend::BackendCommand) {
+    pub fn send(&self, cmd: crate::protocol::BackendCommand) {
         self.backend.with(|b| {
             if let Some(backend) = b {
                 backend.send(cmd);

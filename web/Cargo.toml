@@ -1,0 +1,80 @@
+# The browser app is its own cargo workspace, not a member of the one above.
+# A wasm build wants its own lock, its own profiles, and above all its own
+# dependency graph: the main workspace's `cargo check --workspace` would
+# otherwise try to build this for the host, where `rinch-web` has no document to
+# render into.
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "pimble-web"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Pimble in the browser: the pimble-app UI over a hosted Pimble server"
+
+[dependencies]
+# Rinch without `desktop`, plus the browser-native DOM backend. `collaboration`
+# on rinch-web (never on rinch, where it implies `desktop`) is the same
+# rinch-editor-collab yrs adapter the desktop editor uses.
+rinch = { git = "https://github.com/joeleaver/rinch.git", branch = "main", default-features = false, features = [
+    "components",
+    "theme",
+] }
+rinch-core = { git = "https://github.com/joeleaver/rinch.git", branch = "main", features = [
+    "theme",
+] }
+rinch-web = { git = "https://github.com/joeleaver/rinch.git", branch = "main", features = [
+    "collaboration",
+] }
+rinch-editor-core = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
+
+# The UI and the command seam, without the desktop shell or the embedded server.
+pimble-app = { path = "../crates/pimble-app", default-features = false, features = ["web"] }
+pimble-client = { path = "../crates/pimble-client" }
+pimble-core = { path = "../crates/pimble-core" }
+
+crossbeam-channel = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `v4` only: the randomness backend the browser needs comes from pimble-core,
+# which enables `uuid/js` for wasm32 itself.
+uuid = { version = "1", features = ["v4"] }
+
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Location",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "Request",
+    "RequestInit",
+    "RequestCredentials",
+    "Response",
+    "Headers",
+] }
+console_error_panic_hook = "0.1"
+console_log = "0.2"
+log = "0.4"
+# `tracing` calls inside pimble-app reach the browser console through this.
+tracing = "0.1"
+tracing-wasm = "0.2"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+# The wasm binary is shipped over the wire, so size is the thing to optimise;
+# trunk's `data-wasm-opt="z"` runs wasm-opt over the result as well.
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

@@ -1,0 +1,17 @@
+# The app is served under https://<host>/app/ (jkbase routes the prefix), so
+# every asset URL the generated index.html emits has to carry that prefix.
+[build]
+target = "index.html"
+public_url = "/app/"
+
+# `trunk serve` for local development. The account API and the Pimble server
+# live on the same origin in production; locally they are separate processes, so
+# proxy them here and the app still sees one origin. See README.md.
+[[proxy]]
+backend = "http://127.0.0.1:8080/api"
+rewrite = "/api/"
+
+[[proxy]]
+backend = "http://127.0.0.1:7462/"
+ws = true
+rewrite = "/rpc"

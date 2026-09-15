@@ -10,6 +10,7 @@ use rinch::prelude::*;
 use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
 
 use crate::editor::editor;
+use crate::rinch_editor::EditorHandle;
 
 /// A Signal bumped whenever the toolbar's active states may have changed, so
 /// the per-button style closures re-evaluate.
@@ -35,7 +36,7 @@ const WATCH_INTERVAL_MS: u32 = 120;
 /// runs while the editor's RefCell is still mutably borrowed by the
 /// operation that triggered it (a command, a change callback).
 pub(crate) fn bump_toolbar() {
-    rinch::run_on_main_thread(|| {
+    run_on_main_thread(|| {
         LAST_FINGERPRINT.with(|f| f.set(u64::MAX));
         toolbar_version().update(|v| *v = v.wrapping_add(1));
     });

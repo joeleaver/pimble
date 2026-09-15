@@ -1,0 +1,221 @@
+//! The seam between the UI and whatever is behind it.
+//!
+//! The UI sends a [`BackendCommand`] and consumes a [`BackendEvent`], and knows
+//! nothing else about how either travels. Two implementations fill that in:
+//! the desktop's `backend` module (a background thread with a tokio runtime and
+//! an embedded `PimbleServer`, behind the `native` feature) and the web app's
+//! command loop on `wasm_bindgen_futures::spawn_local` against a hosted server.
+//!
+//! [`BackendHandle`] is the pair of channels itself, so both implementations
+//! hand the UI the same thing. Only `BackendHandle::spawn` is native; `send`
+//! and `try_recv` never block and work on every target.
+
+use crossbeam_channel::{Receiver, Sender};
+use pimble_core::{MountRef, MountState, Node, NodeId, RemoteEndpoint, Store, StoreId, SyncState};
+
+/// Commands sent from UI to backend
+#[derive(Debug)]
+pub enum BackendCommand {
+    // Store operations
+    CreateStore { path: String, name: String },
+    OpenStore { path: String },
+    CloseStore { store_id: StoreId },
+    /// List every store the server currently has open. Used to discover a
+    /// store the server opened implicitly to resolve a mount (decision 4) —
+    /// the client sees its id in `ChildrenLoaded.children_store_id` before it
+    /// knows anything else about it.
+    ListStores,
+
+    // Node operations
+    CreateNode { store_id: StoreId, parent_id: Option<NodeId>, title: String },
+    GetNode { store_id: StoreId, node_id: NodeId },
+    GetChildren { store_id: StoreId, node_id: NodeId },
+    SetNodeContent { store_id: StoreId, node_id: NodeId, content: Vec<u8> },
+    RenameNode { store_id: StoreId, node_id: NodeId, title: String },
+    /// Set or clear a node's custom icon (a Tabler icon name) and/or colour
+    /// (`#rrggbb`) in its metadata. `None` for a field leaves it as it is;
+    /// `Some(None)` clears it. Answers with `NodeRenamed`, whose refetch
+    /// carries the new metadata to the tree.
+    SetNodeAppearance {
+        store_id: StoreId,
+        node_id: NodeId,
+        icon: Option<Option<String>>,
+        color: Option<Option<String>>,
+        /// `Some(tags)` replaces the node's tags.
+        tags: Option<Vec<String>>,
+    },
+    DeleteNode { store_id: StoreId, node_id: NodeId },
+    MoveNode { store_id: StoreId, node_id: NodeId, new_parent_id: NodeId, position: Option<usize> },
+
+    // Mount operations
+    CreateMount {
+        store_id: StoreId,
+        parent_id: NodeId,
+        source_store_id: StoreId,
+        source_node_id: NodeId,
+        title: Option<String>,
+    },
+    GetMountState {
+        store_id: StoreId,
+        node_id: NodeId,
+    },
+
+    // Collaborative editing — broadcast incremental changes to server
+    BroadcastChanges {
+        store_id: StoreId,
+        node_id: NodeId,
+        /// Base64-encoded incremental yrs change bytes
+        changes: String,
+    },
+
+    /// Reconcile the editor's collaboration session with the server's copy
+    /// of a node's content: state vector in, the server's diff and state
+    /// vector out (`NodeContentReconciled`). Stateless on both ends; the
+    /// same primitive the replica sync link uses between servers.
+    ReconcileNodeContent { store_id: StoreId, node_id: NodeId, state_vector: Vec<u8> },
+
+    // Subscription operations
+    SubscribeStoreChanges { store_id: StoreId },
+    SubscribeNodeChanges { store_id: StoreId, node_id: NodeId },
+
+    /// Internal: the connection watchdog saw the WebSocket close. Carries the
+    /// connection generation it watched so a stale watchdog (from before a
+    /// reconnect) is ignored.
+    ConnectionLost { generation: u64 },
+
+    // Search
+    Search { query: String, stores: Vec<StoreId>, limit: usize },
+    RebuildIndex { store_id: StoreId },
+
+    // Replica sync (docs/history/HARDENING_CONTRACT.md "B: app") — routed through
+    // this server's own `listRemoteStores`/`addRemoteStore` RPCs, never a
+    // direct connection to the remote from the app itself (decision 5).
+    /// Empty `token` means "use whatever this server already saved for that
+    /// remote's origin" (decision 4); non-empty is sent as `AuthMethod::Bearer`.
+    ListRemoteStores { url: String, token: String },
+    /// Create a local replica of `remote_store_id` from `remote`, linked to
+    /// it. No path: the server puts it in its own data directory. Same
+    /// `token` semantics as `ListRemoteStores`.
+    AddRemoteStore { url: String, remote_store_id: StoreId, token: String },
+    /// "Mount Remote Store Here...": one user action, two RPCs
+    /// (docs/history/REMOTE_MOUNTS_CONTRACT.md decision 9). Adds `remote_store_id`
+    /// from `url` as a replica unless this server already has it open, then
+    /// mounts that store's root under `(target_store_id, target_parent_id)`
+    /// with the store's name as the mount's title. Same `token` semantics as
+    /// `ListRemoteStores`. Emits `StoreOpened` (only when it added the
+    /// replica) and then `MountCreated`.
+    MountRemoteStore {
+        url: String,
+        remote_store_id: StoreId,
+        token: String,
+        target_store_id: StoreId,
+        target_parent_id: NodeId,
+    },
+    /// Link a local store to a remote (`Some`) or unlink it (`None`).
+    SetStoreSync { store_id: StoreId, remote: Option<RemoteEndpoint> },
+    /// Ask for a store's current sync link and state.
+    GetStoreSync { store_id: StoreId },
+    /// Stop a replica's sync link, close it, and delete its directory.
+    /// `force` removes one whose link is not `Synced` (decision 6).
+    RemoveReplica { store_id: StoreId, force: bool },
+}
+
+/// Events sent from backend to UI
+#[derive(Debug, Clone)]
+pub enum BackendEvent {
+    Connected { server_addr: String, client_id: String },
+    Disconnected,
+    Error { message: String },
+
+    // Store events
+    StoreCreated { store_id: StoreId, root_node_id: NodeId },
+    StoreOpened { store: Store },
+    StoreClosed { store_id: StoreId },
+    /// Answer to `ListStores`: every store the server currently has open.
+    StoresListed { stores: Vec<Store> },
+
+    // Node events
+    NodeCreated { store_id: StoreId, parent_id: Option<NodeId>, node_id: NodeId },
+    NodeLoaded { store_id: StoreId, node: Node },
+    /// `children` live in `children_store_id`: the same as `store_id` for an
+    /// ordinary parent, the mount's source store when `parent_id` is a mount point.
+    ChildrenLoaded { store_id: StoreId, parent_id: NodeId, children_store_id: StoreId, children: Vec<Node> },
+    NodeContentUpdated { store_id: StoreId, node_id: NodeId },
+    NodeRenamed { store_id: StoreId, node_id: NodeId },
+    NodeDeleted { store_id: StoreId, node_id: NodeId, parent_id: NodeId },
+    NodeMoved { store_id: StoreId, node_id: NodeId, old_parent_id: NodeId, new_parent_id: NodeId },
+
+    // Mount events
+    MountCreated {
+        store_id: StoreId,
+        /// The node the mount was created under, so the tree can load that
+        /// parent's children and show the new mount even when the parent had
+        /// never been expanded (`RemoteStoreChange`'s `NodeCreated` refetch
+        /// deliberately skips a parent whose children are not loaded).
+        parent_id: NodeId,
+        node_id: NodeId,
+        mount_ref: MountRef,
+    },
+    MountStateChanged {
+        store_id: StoreId,
+        node_id: NodeId,
+        state: MountState,
+        mount_ref: MountRef,
+    },
+
+    /// Answer to `ReconcileNodeContent`: everything the server has beyond
+    /// the session's state vector (may be empty), and the server's own state
+    /// vector, so the session can send back what the server lacks.
+    NodeContentReconciled { store_id: StoreId, node_id: NodeId, diff: Vec<u8>, server_state_vector: Vec<u8> },
+
+    // Remote change events (from subscriptions)
+    RemoteStoreChange { store_id: StoreId, change_kind: pimble_rpc::StoreChangeKind, source_client_id: Option<String> },
+
+    // Collaborative editing
+    /// Remote incremental changes arrived — apply to the local editor's collab
+    /// session. No node identity carried: pimble has one shared editor pane and
+    /// the subscription that produces this is already scoped to that node.
+    RemoteChanges { changes: String },
+
+    // Search
+    /// The outcome of a `Search` command. Carries `Err` rather than folding
+    /// into the generic `Error` event so a failed search (including "the
+    /// index is still building") shows inline in the results panel without
+    /// touching the connection status bar or the reconnect-on-error path.
+    SearchResults { results: Result<Vec<pimble_rpc::SearchResultItem>, String> },
+    IndexRebuilt { store_id: StoreId, indexed: usize },
+
+    // Replica sync (docs/SYNC_CONTRACT.md "B: app side")
+    /// Answer to `ListRemoteStores`: the remote's open stores, or the error
+    /// connecting to / querying it (shown inline in the connect modal, never
+    /// folded into the generic `Error` event).
+    RemoteStoresListed { url: String, result: Result<Vec<Store>, String> },
+    /// A store's sync link and state changed: the answer to `SetStoreSync` or
+    /// `GetStoreSync`, or a live `SyncStateChanged` notification (which
+    /// carries only the state — the event handler keeps the known `remote`).
+    StoreSyncChanged { store_id: StoreId, remote: Option<RemoteEndpoint>, state: SyncState },
+    /// Answer to `RemoveReplica`: the replica is gone. Handled exactly like
+    /// `StoreClosed` (tree + saved open-store list cleanup).
+    ReplicaRemoved { store_id: StoreId },
+}
+
+/// Handle to communicate with the backend
+#[derive(Clone)]
+pub struct BackendHandle {
+    pub cmd_tx: Sender<BackendCommand>,
+    pub event_rx: Receiver<BackendEvent>,
+}
+
+impl BackendHandle {
+    /// Send a command to the backend (non-blocking), ignoring result
+    pub fn send(&self, cmd: BackendCommand) {
+        if let Err(e) = self.cmd_tx.try_send(cmd) {
+            tracing::error!("Backend channel send failed: {}", e);
+        }
+    }
+
+    /// Try to receive an event (non-blocking)
+    pub fn try_recv(&self) -> Option<BackendEvent> {
+        self.event_rx.try_recv().ok()
+    }
+}

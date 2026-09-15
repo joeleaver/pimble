@@ -9,14 +9,26 @@ description = "Client library for connecting to Pimble servers"
 [dependencies]
 pimble-core = { workspace = true }
 pimble-rpc = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
-jsonrpsee = { workspace = true }
-tokio = { workspace = true }
 thiserror = { workspace = true }
-anyhow = { workspace = true }
-futures = { workspace = true }
 tracing = { workspace = true }
-uuid = { workspace = true }
 url = { workspace = true }
 base64 = { workspace = true }
+
+# Native: the tokio-backed WebSocket transport, with the credential in an
+# `Authorization` / `X-Api-Key` header.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+jsonrpsee = { workspace = true }
+
+# wasm32: the browser's own WebSocket through web-sys. A browser `WebSocket`
+# cannot set request headers, so the credential travels as an `access_token`
+# query parameter instead (see `PimbleClient::connect_with_auth`). No tokio,
+# and no `server` feature on jsonrpsee: both pull in `mio`, which has no
+# wasm32-unknown-unknown implementation.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+jsonrpsee = { version = "0.24", default-features = false, features = [
+    "client-core",
+    "wasm-client",
+    "async-wasm-client",
+    "macros",
+] }

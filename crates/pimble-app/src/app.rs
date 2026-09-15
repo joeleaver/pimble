@@ -1,31 +1,58 @@
-//! Pimble Desktop Application
+//! Pimble's application UI.
 //!
-//! Built with Rinch UI framework
+//! Built with the Rinch UI framework. Everything here is target-independent
+//! except [`run`], which opens the desktop window; the browser entry point in
+//! `web/` mounts the very same component through `rinch_web`.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::Arc;
-use std::time::Instant;
 
 use rinch::prelude::*;
 use rinch::core::{request_focus, set_keyboard_interceptor, clear_keyboard_interceptor};
-use rinch::menu::{Menu, MenuItem};
 use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
 
-use crate::backend::{BackendCommand, BackendHandle};
+use crate::rinch_editor::Editor;
+use crate::protocol::BackendCommand;
+#[cfg(feature = "native")]
+use crate::protocol::BackendHandle;
 use crate::editor::{start_editing, stop_editing};
 use crate::events::{EVENT_PROCESSOR, process_backend_events};
 use crate::appearance::{display_color, icon_by_name, icons_matching, IconGlyph, COLOR_CHOICES};
 use crate::persistence::{load_dark_mode, save_dark_mode};
-use crate::state::{parse_tree_value, display_label_from_node, mount_is_dimmed, mount_label_suffix, AppStore, PendingMount, SearchState};
+use crate::state::{parse_tree_value, display_label_from_node, mount_is_dimmed, mount_label_suffix, AppStore, SearchState};
+// Only "Mount Store Here...", which picks a directory on this machine, sets one.
+#[cfg(feature = "native")]
+use crate::state::PendingMount;
 use crate::styles::{APP_CSS, EDITOR_CSS};
+
+/// How long after a click a second one on the same row still counts as a
+/// double-click, and so starts an inline rename.
+const DOUBLE_CLICK_MS: f64 = 500.0;
+
+/// Milliseconds on a clock that only moves forward, for the double-click
+/// window above. `std::time::Instant` has no implementation on
+/// `wasm32-unknown-unknown` and panics the first time it is read, so the
+/// browser build reads the page's own clock instead. Only differences between
+/// two readings matter here, so the two origins need not agree.
+#[cfg(feature = "native")]
+fn now_ms() -> f64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
+}
+
+#[cfg(not(feature = "native"))]
+fn now_ms() -> f64 {
+    js_sys::Date::now()
+}
 
 /// rinch's theme for the app: one function so the startup theme and a runtime
 /// switch (View > "Toggle Dark Mode", `rinch::update_theme`) agree on everything
 /// but the scheme. The editor's own stylesheet follows the same flag through
 /// `EditorHandle::set_dark_mode`, and colours the app derives follow
 /// `AppStore::dark_mode` reactively.
-fn theme_props(dark_mode: bool) -> ThemeProviderProps {
+pub fn theme_props(dark_mode: bool) -> ThemeProviderProps {
     ThemeProviderProps {
         primary_color: Some("blue".into()),
         dark_mode,
@@ -37,7 +64,7 @@ fn theme_props(dark_mode: bool) -> ThemeProviderProps {
 /// Switch between the dark and light themes: the theme CSS, the editor's
 /// stylesheet, every colour the app derives (they read `dark_mode`), and the
 /// saved preference.
-fn toggle_dark_mode(store: AppStore) {
+pub fn toggle_dark_mode(store: AppStore) {
     let dark = !untracked(|| store.dark_mode.get());
     store.dark_mode.set(dark);
     rinch::update_theme(&theme_props(dark));
@@ -148,7 +175,7 @@ fn copy_as_mount_source(store: AppStore, value: &str) {
 /// then stays on screen for good (rinch #714); deferring lets the item close
 /// its menu first.
 fn bump_tree_after_menu_closes(store: AppStore) {
-    rinch::run_on_main_thread(move || store.bump_tree_structure());
+    run_on_main_thread(move || store.bump_tree_structure());
 }
 
 /// "Paste Mount Here": create a mount at the tree location identified by
@@ -317,13 +344,20 @@ fn find_context_menu_handler(node: &NodeHandle) -> Option<String> {
     None
 }
 
-/// Main application entry point
-pub fn run() {
+/// The application: its reactive state, its backend-event pump, and the component
+/// that renders the whole UI. Both entry points call this and then differ only
+/// in the platform chrome around it — [`run`] wraps it in a desktop window with
+/// a menu bar, the web app hands the component straight to `rinch_web::mount`.
+///
+/// The returned [`AppStore`] is the same one the component uses, so a caller can
+/// install a backend into it (the web app does, before mounting) or read the
+/// theme choice out of it (the desktop does, to build the theme props).
+pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
     let store = AppStore::new();
     store.dark_mode.set(load_dark_mode());
 
     // Double-click detection for rename: (last_click_time, last_click_value)
-    let last_click: Rc<Cell<(Instant, String)>> = Rc::new(Cell::new((Instant::now(), String::new())));
+    let last_click: Rc<Cell<(f64, String)>> = Rc::new(Cell::new((now_ms(), String::new())));
 
     // Persistent tree state — created once, preserves expanded/selected across data changes
     let tree_state = UseTreeReturn::new(UseTreeOptions::default());
@@ -339,148 +373,6 @@ pub fn run() {
             process_backend_events(store, tree_state);
         }));
     });
-
-    // Build menus
-    let file_menu = Menu::new()
-        .item(MenuItem::new("New Store...").shortcut("Ctrl+N").on_click(move || {
-            tracing::info!("New store menu clicked");
-            let dialog = rinch::dialogs::save_file()
-                .set_title("Create New Store")
-                .add_filter("Pimble Store", &["pimble"]);
-
-            if let Some(path) = dialog.save() {
-                let path_str = path.to_string_lossy().to_string();
-                let path_str = if path_str.ends_with(".pimble") {
-                    path_str
-                } else {
-                    format!("{}.pimble", path_str)
-                };
-                let name = path.file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "New Store".to_string());
-                tracing::info!("Creating new store at: {}", path_str);
-                store.pending_create_path.set(Some(path_str.clone()));
-                store.send(BackendCommand::CreateStore { path: path_str, name });
-            }
-        }))
-        .item(MenuItem::new("Open Store...").shortcut("Ctrl+O").on_click(move || {
-            tracing::info!("Open store menu clicked");
-            let dialog = rinch::dialogs::pick_folder()
-                .set_title("Open Store");
-
-            if let Some(path) = dialog.pick() {
-                let path_str = path.to_string_lossy().to_string();
-                tracing::info!("Opening store at: {}", path_str);
-                store.send(BackendCommand::OpenStore { path: path_str });
-            }
-        }))
-        .item(MenuItem::new("Add Remote Store...").on_click(move || {
-            tracing::info!("Add remote store menu clicked");
-            open_connect_modal(store, None);
-        }))
-        .separator()
-        .item(MenuItem::new("Close Store").on_click(move || {
-            tracing::info!("Close store");
-            if let Some((store_id, _)) = store.selected_store_and_node() {
-                store.send(BackendCommand::CloseStore { store_id });
-            }
-        }))
-        .separator()
-        .item(MenuItem::new("Exit").shortcut("Alt+F4").on_click(|| {
-            close_current_window();
-        }));
-
-    let edit_menu = Menu::new()
-        .item(MenuItem::new("Undo").shortcut("Ctrl+Z").enabled(false).on_click(|| {}))
-        .item(MenuItem::new("Redo").shortcut("Ctrl+Y").enabled(false).on_click(|| {}))
-        .separator()
-        .item(MenuItem::new("Cut").shortcut("Ctrl+X").enabled(false).on_click(|| {}))
-        .item(MenuItem::new("Copy").shortcut("Ctrl+C").enabled(false).on_click(|| {}))
-        .item(MenuItem::new("Paste").shortcut("Ctrl+V").enabled(false).on_click(|| {}))
-        .separator()
-        .item(MenuItem::new("Delete").on_click(move || {
-            if let Some((store_id, node_id)) = store.selected_store_and_node() {
-                store.send(BackendCommand::DeleteNode { store_id, node_id });
-            }
-        }));
-
-    let view_menu = Menu::new()
-        .item(MenuItem::new("Toggle Sidebar").shortcut("Ctrl+\\").on_click(|| {
-            tracing::info!("Toggle sidebar");
-        }))
-        .item(MenuItem::new("Toggle Dark Mode").on_click(move || toggle_dark_mode(store)))
-        .separator()
-        .item(MenuItem::new("Focus Search").shortcut("Ctrl+K").on_click(|| {
-            SEARCH_INPUT.with(|cell| {
-                if let Some(handle) = cell.borrow().as_ref() {
-                    handle.focus();
-                }
-            });
-        }))
-        .item(MenuItem::new("Rebuild Search Index").on_click(move || {
-            let store_ids = untracked(|| store.store_ids.get());
-            tracing::info!("Rebuilding search index for {} store(s)", store_ids.len());
-            for store_id in store_ids {
-                store.send(BackendCommand::RebuildIndex { store_id });
-            }
-        }))
-        .separator()
-        .item(MenuItem::new("Zoom In").shortcut("Ctrl+=").on_click(|| {}))
-        .item(MenuItem::new("Zoom Out").shortcut("Ctrl+-").on_click(|| {}))
-        .item(MenuItem::new("Reset Zoom").shortcut("Ctrl+0").on_click(|| {}));
-
-    let help_menu = Menu::new()
-        .item(MenuItem::new("Documentation").shortcut("F1").on_click(|| {
-            tracing::info!("Opening documentation...");
-        }))
-        .separator()
-        .item(MenuItem::new("About Pimble").on_click(|| {
-            tracing::info!("About Pimble v0.1.0");
-        }));
-
-    let menus = vec![
-        ("File", file_menu),
-        ("Edit", edit_menu),
-        ("View", view_menu),
-        ("Help", help_menu),
-    ];
-
-    // Theme
-    let theme = theme_props(untracked(|| store.dark_mode.get()));
-
-    // Save-on-close: register a thread-local that the close callback invokes.
-    // WindowProps requires Send+Sync but our state is Rc-based (main thread only),
-    // so we use the same thread-local pattern as EVENT_PROCESSOR.
-    thread_local! {
-        static CLOSE_HANDLER: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
-    }
-    CLOSE_HANDLER.with(|cell| {
-        *cell.borrow_mut() = Some(Box::new(move || {
-            // Edits persist live through the collab relay; nothing to flush on close.
-            let _ = store;
-        }));
-    });
-    let on_close: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| {
-        CLOSE_HANDLER.with(|cell| {
-            if let Some(f) = cell.borrow().as_ref() {
-                f();
-            }
-        });
-        true // proceed with close
-    });
-
-    let props = WindowProps {
-        title: "Pimble".into(),
-        width: 1200,
-        height: 800,
-        borderless: true,
-        transparent: true,
-        resizable: true,
-        menu_in_titlebar: true,
-        on_close_requested: Some(on_close),
-        ..Default::default()
-    };
-
     // Build app component - parameter must be named __scope for the rsx! macro
     let app_component = move |__scope: &mut RenderScope| -> NodeHandle {
         // Cancel any in-progress rename, optionally committing the change.
@@ -500,7 +392,7 @@ pub fn run() {
             }
             // Reset double-click timer so stale timestamps can't cause
             // a spurious rename on the next click.
-            cancel_last_click.set((Instant::now(), String::new()));
+            cancel_last_click.set((now_ms(), String::new()));
         };
 
         // Tree callbacks
@@ -511,9 +403,9 @@ pub fn run() {
 
             // Double-click on a node → enter rename mode
             {
-                let now = Instant::now();
+                let now = now_ms();
                 let (prev_time, prev_value) = select_last_click.replace((now, value.clone()));
-                let is_double_click = prev_value == value && now.duration_since(prev_time).as_millis() < 500;
+                let is_double_click = prev_value == value && now - prev_time < DOUBLE_CLICK_MS;
 
                 if is_double_click && value.starts_with("node_") {
                     // Don't allow rename on mount nodes
@@ -538,7 +430,7 @@ pub fn run() {
                     let nv_interceptor = value.clone();
                     set_keyboard_interceptor(move |data| {
                         if data.key == "Escape" {
-                            rinch::run_on_main_thread(move || {
+                            run_on_main_thread(move || {
                                 store.renaming_node.set(None);
                                 clear_keyboard_interceptor();
                             });
@@ -546,7 +438,7 @@ pub fn run() {
                         }
                         if data.key == "Enter" {
                             let nv = nv_interceptor.clone();
-                            rinch::run_on_main_thread(move || {
+                            run_on_main_thread(move || {
                                 let new_title = untracked(|| store.rename_text.get());
                                 store.renaming_node.set(None);
                                 clear_keyboard_interceptor();
@@ -864,17 +756,29 @@ pub fn run() {
                     if let Some((s_id, node_id_opt)) = parse_tree_value(&nv) {
                         let parent_id = node_id_opt.or_else(|| store.root_node_id(s_id));
                         if let Some(pid) = parent_id {
-                            let dialog = rinch::dialogs::pick_folder()
-                                .set_title("Select Store to Mount");
-                            if let Some(path) = dialog.pick() {
-                                let path_str = path.to_string_lossy().to_string();
-                                tracing::info!("Mounting store from: {} into {:?}", path_str, s_id);
-                                store.send(BackendCommand::OpenStore { path: path_str.clone() });
-                                store.pending_mount.set(Some(PendingMount {
-                                    target_store_id: s_id,
-                                    target_parent_id: pid,
-                                    source_path: path_str,
-                                }));
+                            #[cfg(feature = "native")]
+                            {
+                                let dialog = rinch::dialogs::pick_folder()
+                                    .set_title("Select Store to Mount");
+                                if let Some(path) = dialog.pick() {
+                                    let path_str = path.to_string_lossy().to_string();
+                                    tracing::info!("Mounting store from: {} into {:?}", path_str, s_id);
+                                    store.send(BackendCommand::OpenStore { path: path_str.clone() });
+                                    store.pending_mount.set(Some(PendingMount {
+                                        target_store_id: s_id,
+                                        target_parent_id: pid,
+                                        source_path: path_str,
+                                    }));
+                                }
+                            }
+                            // A store on this machine is a desktop idea: the web
+                            // app reaches hosted stores through the account it is
+                            // signed in to, and mounts them with "Mount Remote
+                            // Store Here...".
+                            #[cfg(not(feature = "native"))]
+                            {
+                                let _ = pid;
+                                tracing::info!("Mounting a local store is desktop-only");
                             }
                         }
                     }
@@ -1215,7 +1119,7 @@ pub fn run() {
                         let nv_interceptor = nv_rename_ctx.clone();
                         set_keyboard_interceptor(move |data| {
                             if data.key == "Escape" {
-                                rinch::run_on_main_thread(move || {
+                                run_on_main_thread(move || {
                                     store.renaming_node.set(None);
                                     clear_keyboard_interceptor();
                                 });
@@ -1223,7 +1127,7 @@ pub fn run() {
                             }
                             if data.key == "Enter" {
                                 let nv = nv_interceptor.clone();
-                                rinch::run_on_main_thread(move || {
+                                run_on_main_thread(move || {
                                     let new_title = untracked(|| store.rename_text.get());
                                     store.renaming_node.set(None);
                                     clear_keyboard_interceptor();
@@ -1424,7 +1328,7 @@ pub fn run() {
                         // Only while the box is non-empty — see `clear_search`.
                         set_keyboard_interceptor(move |data| {
                             if data.key == "Escape" {
-                                rinch::run_on_main_thread(move || clear_search(store));
+                                run_on_main_thread(move || clear_search(store));
                                 return true;
                             }
                             false
@@ -1891,39 +1795,24 @@ pub fn run() {
 
         // Spawn the backend now that the UI and event loop are fully set up.
         // The EVENT_PROCESSOR thread-local is already registered, so signal_ui
-        // callbacks will be processed correctly via run_on_main_thread.
+        // callbacks will be processed correctly via run_on_main_thread. The web
+        // build has no thread to spawn: its entry point puts a backend into the
+        // store before it mounts, and this leaves that one alone.
+        #[cfg(feature = "native")]
         if store.backend.with(|b| b.is_none()) {
             let backend = BackendHandle::spawn(move || {
-                rinch::run_on_main_thread(|| {
-                    EVENT_PROCESSOR.with(|cell| {
-                        if let Some(f) = cell.borrow().as_ref() {
-                            f();
-                        }
-                    });
-                });
+                run_on_main_thread(crate::events::pump_backend_events);
             });
             store.backend.set(Some(backend));
         }
 
-        rsx! {
-            BorderlessWindow {
-                title: "Pimble",
-                show_minimize: true,
-                show_maximize: true,
-                show_close: true,
-                on_close: || close_current_window(),
-
-                style { {APP_CSS} }
-                style { {EDITOR_CSS} }
-
-                {connect_modal}
-                {link_modal}
-                {remove_replica_modal}
-                {appearance_modal}
-
-                // Outer wrapper — flex column fills the content area, pushes
-                // status bar to the very bottom.
-                div {
+        // The page itself, with no window chrome around it: identical on both
+        // targets. Only the frame differs — a borderless native window that
+        // draws its own titlebar, or the browser's viewport.
+        let body = rsx! {
+            // Outer wrapper — flex column fills the content area, pushes
+            // status bar to the very bottom.
+            div {
                     style: "display: flex; flex-direction: column; height: 100%;",
 
                     {search_bar}
@@ -2019,8 +1908,199 @@ pub fn run() {
                         div { style: "flex: 1;", }
                     }
                 }
+        };
+
+        #[cfg(feature = "native")]
+        let root = rsx! {
+            BorderlessWindow {
+                title: "Pimble",
+                show_minimize: true,
+                show_maximize: true,
+                show_close: true,
+                on_close: || close_current_window(),
+
+                style { {APP_CSS} }
+                style { {EDITOR_CSS} }
+
+                {connect_modal}
+                {link_modal}
+                {remove_replica_modal}
+                {appearance_modal}
+                {body}
             }
-        }
+        };
+
+        // A browser tab has its own chrome; the app just fills it.
+        #[cfg(not(feature = "native"))]
+        let root = rsx! {
+            div {
+                style: "height: 100vh; display: flex; flex-direction: column;",
+
+                style { {APP_CSS} }
+                style { {EDITOR_CSS} }
+
+                {connect_modal}
+                {link_modal}
+                {remove_replica_modal}
+                {appearance_modal}
+                {body}
+            }
+        };
+
+        root
+    };
+
+    (store, app_component)
+}
+
+/// Open the desktop window: the same UI [`build_view`] builds, wrapped in a
+/// native menu bar, the borderless window and the saved theme.
+#[cfg(feature = "native")]
+pub fn run() {
+    use rinch::menu::{Menu, MenuItem};
+    use std::sync::Arc;
+
+    let (store, app_component) = build_view();
+
+    // Build menus
+    let file_menu = Menu::new()
+        .item(MenuItem::new("New Store...").shortcut("Ctrl+N").on_click(move || {
+            tracing::info!("New store menu clicked");
+            let dialog = rinch::dialogs::save_file()
+                .set_title("Create New Store")
+                .add_filter("Pimble Store", &["pimble"]);
+
+            if let Some(path) = dialog.save() {
+                let path_str = path.to_string_lossy().to_string();
+                let path_str = if path_str.ends_with(".pimble") {
+                    path_str
+                } else {
+                    format!("{}.pimble", path_str)
+                };
+                let name = path.file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "New Store".to_string());
+                tracing::info!("Creating new store at: {}", path_str);
+                store.pending_create_path.set(Some(path_str.clone()));
+                store.send(BackendCommand::CreateStore { path: path_str, name });
+            }
+        }))
+        .item(MenuItem::new("Open Store...").shortcut("Ctrl+O").on_click(move || {
+            tracing::info!("Open store menu clicked");
+            let dialog = rinch::dialogs::pick_folder()
+                .set_title("Open Store");
+
+            if let Some(path) = dialog.pick() {
+                let path_str = path.to_string_lossy().to_string();
+                tracing::info!("Opening store at: {}", path_str);
+                store.send(BackendCommand::OpenStore { path: path_str });
+            }
+        }))
+        .item(MenuItem::new("Add Remote Store...").on_click(move || {
+            tracing::info!("Add remote store menu clicked");
+            open_connect_modal(store, None);
+        }))
+        .separator()
+        .item(MenuItem::new("Close Store").on_click(move || {
+            tracing::info!("Close store");
+            if let Some((store_id, _)) = store.selected_store_and_node() {
+                store.send(BackendCommand::CloseStore { store_id });
+            }
+        }))
+        .separator()
+        .item(MenuItem::new("Exit").shortcut("Alt+F4").on_click(|| {
+            close_current_window();
+        }));
+
+    let edit_menu = Menu::new()
+        .item(MenuItem::new("Undo").shortcut("Ctrl+Z").enabled(false).on_click(|| {}))
+        .item(MenuItem::new("Redo").shortcut("Ctrl+Y").enabled(false).on_click(|| {}))
+        .separator()
+        .item(MenuItem::new("Cut").shortcut("Ctrl+X").enabled(false).on_click(|| {}))
+        .item(MenuItem::new("Copy").shortcut("Ctrl+C").enabled(false).on_click(|| {}))
+        .item(MenuItem::new("Paste").shortcut("Ctrl+V").enabled(false).on_click(|| {}))
+        .separator()
+        .item(MenuItem::new("Delete").on_click(move || {
+            if let Some((store_id, node_id)) = store.selected_store_and_node() {
+                store.send(BackendCommand::DeleteNode { store_id, node_id });
+            }
+        }));
+
+    let view_menu = Menu::new()
+        .item(MenuItem::new("Toggle Sidebar").shortcut("Ctrl+\\").on_click(|| {
+            tracing::info!("Toggle sidebar");
+        }))
+        .item(MenuItem::new("Toggle Dark Mode").on_click(move || toggle_dark_mode(store)))
+        .separator()
+        .item(MenuItem::new("Focus Search").shortcut("Ctrl+K").on_click(|| {
+            SEARCH_INPUT.with(|cell| {
+                if let Some(handle) = cell.borrow().as_ref() {
+                    handle.focus();
+                }
+            });
+        }))
+        .item(MenuItem::new("Rebuild Search Index").on_click(move || {
+            let store_ids = untracked(|| store.store_ids.get());
+            tracing::info!("Rebuilding search index for {} store(s)", store_ids.len());
+            for store_id in store_ids {
+                store.send(BackendCommand::RebuildIndex { store_id });
+            }
+        }))
+        .separator()
+        .item(MenuItem::new("Zoom In").shortcut("Ctrl+=").on_click(|| {}))
+        .item(MenuItem::new("Zoom Out").shortcut("Ctrl+-").on_click(|| {}))
+        .item(MenuItem::new("Reset Zoom").shortcut("Ctrl+0").on_click(|| {}));
+
+    let help_menu = Menu::new()
+        .item(MenuItem::new("Documentation").shortcut("F1").on_click(|| {
+            tracing::info!("Opening documentation...");
+        }))
+        .separator()
+        .item(MenuItem::new("About Pimble").on_click(|| {
+            tracing::info!("About Pimble v0.1.0");
+        }));
+
+    let menus = vec![
+        ("File", file_menu),
+        ("Edit", edit_menu),
+        ("View", view_menu),
+        ("Help", help_menu),
+    ];
+
+    // Theme
+    let theme = theme_props(untracked(|| store.dark_mode.get()));
+
+    // Save-on-close: register a thread-local that the close callback invokes.
+    // WindowProps requires Send+Sync but our state is Rc-based (main thread only),
+    // so we use the same thread-local pattern as EVENT_PROCESSOR.
+    thread_local! {
+        static CLOSE_HANDLER: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+    CLOSE_HANDLER.with(|cell| {
+        *cell.borrow_mut() = Some(Box::new(move || {
+            // Edits persist live through the collab relay; nothing to flush on close.
+            let _ = store;
+        }));
+    });
+    let on_close: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| {
+        CLOSE_HANDLER.with(|cell| {
+            if let Some(f) = cell.borrow().as_ref() {
+                f();
+            }
+        });
+        true // proceed with close
+    });
+
+    let props = WindowProps {
+        title: "Pimble".into(),
+        width: 1200,
+        height: 800,
+        borderless: true,
+        transparent: true,
+        resizable: true,
+        menu_in_titlebar: true,
+        on_close_requested: Some(on_close),
+        ..Default::default()
     };
 
     App::new(app_component)
