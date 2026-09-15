@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use pimble_client::PimbleClient;
 use pimble_core::{AuthMethod, NodeId, RemoteEndpoint, StoreId};
 use pimble_crdt::ContentDoc;
+use pimble_server::auth;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -28,15 +29,19 @@ async fn main() -> Result<()> {
     match command.as_str() {
         "help" | "--help" | "-h" => print_help(),
         "server" => {
-            let (addr, open_paths) = match parse_server_args(&args[2..]) {
+            let (addr, open_paths, token_file) = match parse_server_args(&args[2..]) {
                 Ok(parsed) => parsed,
                 Err(e) => {
                     eprintln!("{}", e);
-                    eprintln!("Usage: pimble-cli server [--addr HOST:PORT] [--open PATH]...");
+                    eprintln!("Usage: pimble-cli server [--addr HOST:PORT] [--open PATH]... [--token-file PATH]");
                     return Ok(());
                 }
             };
-            run_server(&addr, open_paths).await?;
+            run_server(&addr, open_paths, token_file).await?;
+        }
+        "token" => {
+            let new = args.get(2).map(|s| s == "--new").unwrap_or(false);
+            token_command(new)?;
         }
         "create-store" => {
             if args.len() < 4 {
@@ -66,6 +71,20 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             create_node(&args[2], &args[3], &args[4], &args[5]).await?;
+        }
+        "move-node" => {
+            if args.len() < 5 {
+                eprintln!("Usage: pimble-cli move-node <store-id> <node-id> <new-parent-id>");
+                return Ok(());
+            }
+            move_node(&args[2], &args[3], &args[4]).await?;
+        }
+        "delete-node" => {
+            if args.len() < 4 {
+                eprintln!("Usage: pimble-cli delete-node <store-id> <node-id>");
+                return Ok(());
+            }
+            delete_node(&args[2], &args[3]).await?;
         }
         "set-node-text" => {
             if args.len() < 5 {
@@ -124,19 +143,21 @@ async fn main() -> Result<()> {
             list_children(&args[2], &args[3]).await?;
         }
         "add-remote-store" => {
-            if args.len() < 4 {
-                eprintln!("Usage: pimble-cli add-remote-store <url> <remote-store-id> [path]");
+            let (rest, token) = extract_flag_value(&args[2..], "--token");
+            if rest.len() < 2 {
+                eprintln!("Usage: pimble-cli add-remote-store <url> <remote-store-id> [path] [--token T]");
                 return Ok(());
             }
-            let path = args.get(4).map(PathBuf::from);
-            add_remote_store(&args[2], &args[3], path).await?;
+            let path = rest.get(2).map(PathBuf::from);
+            add_remote_store(&rest[0], &rest[1], path, token).await?;
         }
         "link-store" => {
-            if args.len() < 4 {
-                eprintln!("Usage: pimble-cli link-store <store-id> <url>");
+            let (rest, token) = extract_flag_value(&args[2..], "--token");
+            if rest.len() < 2 {
+                eprintln!("Usage: pimble-cli link-store <store-id> <url> [--token T]");
                 return Ok(());
             }
-            link_store(&args[2], &args[3]).await?;
+            link_store(&rest[0], &rest[1], token).await?;
         }
         "unlink-store" => {
             if args.len() < 3 {
@@ -153,11 +174,20 @@ async fn main() -> Result<()> {
             sync_state(&args[2]).await?;
         }
         "remote-stores" => {
-            if args.len() < 3 {
-                eprintln!("Usage: pimble-cli remote-stores <url>");
+            let (rest, token) = extract_flag_value(&args[2..], "--token");
+            if rest.is_empty() {
+                eprintln!("Usage: pimble-cli remote-stores <url> [--token T]");
                 return Ok(());
             }
-            remote_stores(&args[2]).await?;
+            remote_stores(&rest[0], token).await?;
+        }
+        "remove-replica" => {
+            let (rest, force) = extract_switch(&args[2..], "--force");
+            if rest.is_empty() {
+                eprintln!("Usage: pimble-cli remove-replica <store-id> [--force]");
+                return Ok(());
+            }
+            remove_replica(&rest[0], force).await?;
         }
         _ => {
             eprintln!("Unknown command: {}", command);
@@ -178,11 +208,14 @@ USAGE:
 COMMANDS:
     help                Show this help message
     server              Start the Pimble server
+    token               Print this machine's default server token (creating it if needed)
     create-store        Create a new store
     open-store          Open an existing store
     list-stores         List all open stores
     import-scrivener    Import a Scrivener .scriv project into a Pimble store
     create-node         Create a node in a store
+    move-node           Move a node under a new parent (appended last)
+    delete-node         Delete a node and its whole subtree
     set-node-text       Set a node's content from plain text
     show-node           Print a node's metadata and content text
     search              Search across all open stores
@@ -195,19 +228,27 @@ COMMANDS:
     unlink-store        Unlink a store from its remote (stops the sync link)
     sync-state          Show a store's replica sync link and its state
     remote-stores       List the stores a remote Pimble server has open
+    remove-replica      Stop a replica's sync link, close it, and delete it
 
 ENVIRONMENT:
     PIMBLE_SERVER       Server URL for every command but `server` itself
                         (default: http://127.0.0.1:7462)
+    PIMBLE_TOKEN        Bearer token sent with every request to PIMBLE_SERVER.
+                        If unset and PIMBLE_SERVER is loopback, the default
+                        server token file's token is used if it exists.
 
 EXAMPLES:
     pimble-cli server
-    pimble-cli server --addr 0.0.0.0:7462 --open /srv/family.pimble
+    pimble-cli server --addr 0.0.0.0:7462 --open /srv/family.pimble --token-file /etc/pimble/token
+    pimble-cli token
+    pimble-cli token --new
     pimble-cli create-store ./my-notes.pimble "My Notes"
     pimble-cli open-store ./my-notes.pimble
     pimble-cli list-stores
     pimble-cli import-scrivener ./project.scriv ./project.pimble
     pimble-cli create-node <store-id> <parent-id> document "My Note"
+    pimble-cli move-node <store-id> <node-id> <new-parent-id>
+    pimble-cli delete-node <store-id> <node-id>
     pimble-cli set-node-text <store-id> <node-id> "Hello, world"
     pimble-cli show-node <store-id> <node-id>
     pimble-cli search "hello"
@@ -215,20 +256,22 @@ EXAMPLES:
     pimble-cli create-mount <store-id> <parent-id> <source-store-id> <source-node-id> "My Mount"
     pimble-cli mount-state <store-id> <node-id>
     pimble-cli list-children <store-id> <node-id>
-    pimble-cli add-remote-store http://127.0.0.1:7463 <remote-store-id>
-    pimble-cli link-store <store-id> http://127.0.0.1:7463
+    pimble-cli add-remote-store http://127.0.0.1:7463 <remote-store-id> --token secret
+    pimble-cli link-store <store-id> http://127.0.0.1:7463 --token secret
     pimble-cli unlink-store <store-id>
     pimble-cli sync-state <store-id>
-    pimble-cli remote-stores http://127.0.0.1:7463
+    pimble-cli remote-stores http://127.0.0.1:7463 --token secret
+    pimble-cli remove-replica <store-id> --force
 "#
     );
 }
 
-/// Parse `server`'s own flags (`--addr HOST:PORT`, repeatable `--open PATH`)
-/// out of the args following the `server` word.
-fn parse_server_args(rest: &[String]) -> std::result::Result<(String, Vec<PathBuf>), String> {
+/// Parse `server`'s own flags (`--addr HOST:PORT`, repeatable `--open PATH`,
+/// `--token-file PATH`) out of the args following the `server` word.
+fn parse_server_args(rest: &[String]) -> std::result::Result<(String, Vec<PathBuf>, Option<PathBuf>), String> {
     let mut addr = "127.0.0.1:7462".to_string();
     let mut open_paths = Vec::new();
+    let mut token_file = None;
 
     let mut i = 0;
     while i < rest.len() {
@@ -242,12 +285,52 @@ fn parse_server_args(rest: &[String]) -> std::result::Result<(String, Vec<PathBu
                 let path = rest.get(i).ok_or("--open requires a value")?;
                 open_paths.push(PathBuf::from(path));
             }
+            "--token-file" => {
+                i += 1;
+                let path = rest.get(i).ok_or("--token-file requires a value")?;
+                token_file = Some(PathBuf::from(path));
+            }
             other => return Err(format!("Unknown server option: {}", other)),
         }
         i += 1;
     }
 
-    Ok((addr, open_paths))
+    Ok((addr, open_paths, token_file))
+}
+
+/// Pull `flag`'s value out of `args` (its first occurrence; `flag value`),
+/// returning the remaining positional args in order and the value if the
+/// flag was present. Used for `--token T` on the replica-sync commands,
+/// which otherwise take only positional arguments.
+fn extract_flag_value(args: &[String], flag: &str) -> (Vec<String>, Option<String>) {
+    let mut rest = Vec::new();
+    let mut value = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == flag && value.is_none() {
+            i += 1;
+            value = args.get(i).cloned();
+        } else {
+            rest.push(args[i].clone());
+        }
+        i += 1;
+    }
+    (rest, value)
+}
+
+/// Like [`extract_flag_value`], but for a boolean switch (`--force`) that
+/// takes no value.
+fn extract_switch(args: &[String], flag: &str) -> (Vec<String>, bool) {
+    let mut rest = Vec::new();
+    let mut present = false;
+    for a in args {
+        if a == flag {
+            present = true;
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    (rest, present)
 }
 
 /// Start the embedded Pimble server, bound to `addr`, opening every store in
@@ -255,17 +338,38 @@ fn parse_server_args(rest: &[String]) -> std::result::Result<(String, Vec<PathBu
 /// `pimble-cli server --addr 0.0.0.0:7462 --open /srv/family.pimble`) —
 /// opened the same way any other client would, over a loopback connection to
 /// the server it just started.
-async fn run_server(addr: &str, open_paths: Vec<PathBuf>) -> Result<()> {
+///
+/// `token_file` always enables the auth check, even on loopback (docs/
+/// HARDENING_CONTRACT.md decision 3); without it, a non-loopback `addr`
+/// still needs a token, so it falls back to the default token file
+/// ([`auth::default_token_path`]) — `PimbleServer::start` would otherwise
+/// refuse to bind.
+async fn run_server(addr: &str, open_paths: Vec<PathBuf>, token_file: Option<PathBuf>) -> Result<()> {
     use pimble_server::{PimbleServer, ServerConfig};
 
     let socket_addr: std::net::SocketAddr = addr.parse().with_context(|| format!("Invalid --addr {}", addr))?;
-    let mut server = PimbleServer::with_config(ServerConfig { addr: socket_addr });
+
+    let auth_token = match token_file {
+        Some(path) => Some(
+            auth::load_or_create_token(&path).with_context(|| format!("Failed to load or create token file {:?}", path))?,
+        ),
+        None if !socket_addr.ip().is_loopback() => Some(
+            auth::load_or_create_token(&auth::default_token_path()).context("Failed to load or create the default server token")?,
+        ),
+        None => None,
+    };
+
+    let mut server = PimbleServer::with_config(ServerConfig { addr: socket_addr, auth_token: auth_token.clone(), ..Default::default() });
     server.start().await?;
     let bound = server.addr();
     println!("Pimble server listening on {}", bound);
 
     if !open_paths.is_empty() {
-        let client = PimbleClient::connect(format!("http://{}", bound)).await?;
+        let bound_url = format!("http://{}", bound);
+        let client = match &auth_token {
+            Some(token) => PimbleClient::connect_with_auth(&bound_url, &AuthMethod::Bearer { token: token.clone() }).await?,
+            None => PimbleClient::connect(&bound_url).await?,
+        };
         for path in &open_paths {
             match client.open_store(path).await {
                 Ok(store) => println!("Opened store {} ({}) from {:?}", store.id, store.name, path),
@@ -274,8 +378,7 @@ async fn run_server(addr: &str, open_paths: Vec<PathBuf>) -> Result<()> {
         }
     }
 
-    // Wait for Ctrl+C
-    tokio::signal::ctrl_c().await?;
+    pimble_server::wait_for_shutdown_signal().await;
     println!("Shutting down...");
     server.stop().await?;
 
@@ -286,11 +389,21 @@ async fn run_server(addr: &str, open_paths: Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-async fn add_remote_store(url: &str, remote_store_id: &str, path: Option<PathBuf>) -> Result<()> {
+/// Print this machine's default server token, creating it first if it
+/// doesn't exist yet (`new: false`), or replace it with a freshly generated
+/// one (`new: true`) — `pimble-cli token`/`token --new`.
+fn token_command(new: bool) -> Result<()> {
+    let path = auth::default_token_path();
+    let token = if new { auth::regenerate_token(&path)? } else { auth::load_or_create_token(&path)? };
+    println!("{}", token);
+    Ok(())
+}
+
+async fn add_remote_store(url: &str, remote_store_id: &str, path: Option<PathBuf>, token: Option<String>) -> Result<()> {
     let remote_store_id = parse_store_id(remote_store_id)?;
     let remote = RemoteEndpoint {
         url: url.parse().with_context(|| format!("Invalid URL: {}", url))?,
-        auth: AuthMethod::None,
+        auth: auth_method_of(token),
     };
 
     let client = connect().await?;
@@ -302,11 +415,11 @@ async fn add_remote_store(url: &str, remote_store_id: &str, path: Option<PathBuf
     Ok(())
 }
 
-async fn link_store(store_id: &str, url: &str) -> Result<()> {
+async fn link_store(store_id: &str, url: &str, token: Option<String>) -> Result<()> {
     let store_id = parse_store_id(store_id)?;
     let remote = RemoteEndpoint {
         url: url.parse().with_context(|| format!("Invalid URL: {}", url))?,
-        auth: AuthMethod::None,
+        auth: auth_method_of(token),
     };
 
     let client = connect().await?;
@@ -316,6 +429,15 @@ async fn link_store(store_id: &str, url: &str) -> Result<()> {
         None => println!("Store {} has no remote (unexpected after linking)", store_id),
     }
     println!("Sync state: {:?}", state);
+    Ok(())
+}
+
+async fn remove_replica(store_id: &str, force: bool) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+
+    let client = connect().await?;
+    client.remove_replica(store_id, force).await?;
+    println!("Removed replica {}", store_id);
     Ok(())
 }
 
@@ -345,9 +467,17 @@ async fn sync_state(store_id: &str) -> Result<()> {
     Ok(())
 }
 
-async fn remote_stores(url: &str) -> Result<()> {
-    let client = PimbleClient::connect(url).await?;
-    let stores = client.list_stores().await?;
+/// List the stores open on a remote server — through `PIMBLE_SERVER`'s own
+/// `listRemoteStores`, never a direct connection from this CLI to `url`
+/// (docs/history/HARDENING_CONTRACT.md decision 5).
+async fn remote_stores(url: &str, token: Option<String>) -> Result<()> {
+    let remote = RemoteEndpoint {
+        url: url.parse().with_context(|| format!("Invalid URL: {}", url))?,
+        auth: auth_method_of(token),
+    };
+
+    let client = connect().await?;
+    let stores = client.list_remote_stores(remote).await?;
 
     if stores.is_empty() {
         println!("No stores open on {}", url);
@@ -408,6 +538,27 @@ async fn create_node(store_id: &str, parent_id: &str, node_type: &str, title: &s
         .create_node(store_id, Some(parent_id), node_type, title)
         .await?;
     println!("Created node: {}", node_id);
+    Ok(())
+}
+
+async fn move_node(store_id: &str, node_id: &str, new_parent_id: &str) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let node_id = parse_node_id(node_id)?;
+    let new_parent_id = parse_node_id(new_parent_id)?;
+
+    let client = connect().await?;
+    client.move_node(store_id, node_id, new_parent_id, None).await?;
+    println!("Moved node {} under {}", node_id, new_parent_id);
+    Ok(())
+}
+
+async fn delete_node(store_id: &str, node_id: &str) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let node_id = parse_node_id(node_id)?;
+
+    let client = connect().await?;
+    client.delete_node(store_id, node_id).await?;
+    println!("Deleted node {} and its subtree", node_id);
     Ok(())
 }
 
@@ -538,8 +689,57 @@ fn parse_node_id(s: &str) -> Result<NodeId> {
     NodeId::parse(s).with_context(|| format!("Invalid node id: {}", s))
 }
 
+/// `token` as an `AuthMethod`: `Bearer` when given, `None` otherwise.
+fn auth_method_of(token: Option<String>) -> AuthMethod {
+    match token {
+        Some(token) => AuthMethod::Bearer { token },
+        None => AuthMethod::None,
+    }
+}
+
+/// Connect to `PIMBLE_SERVER`, authenticating per [`resolve_cli_auth`].
 async fn connect() -> Result<PimbleClient> {
     let url = std::env::var("PIMBLE_SERVER").unwrap_or_else(|_| "http://127.0.0.1:7462".to_string());
-    let client = PimbleClient::connect(&url).await?;
+    let client = match resolve_cli_auth(&url) {
+        Some(token) => PimbleClient::connect_with_auth(&url, &AuthMethod::Bearer { token }).await?,
+        None => PimbleClient::connect(&url).await?,
+    };
     Ok(client)
+}
+
+/// The bearer token for a connection to `url`: `PIMBLE_TOKEN` if set and
+/// non-empty, else the default server token file's token when `url`'s host
+/// is loopback and the file exists (docs/history/HARDENING_CONTRACT.md "A: edge"),
+/// else no token.
+fn resolve_cli_auth(url: &str) -> Option<String> {
+    if let Ok(token) = std::env::var("PIMBLE_TOKEN") {
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+
+    if is_loopback_url(url) {
+        if let Ok(contents) = std::fs::read_to_string(auth::default_token_path()) {
+            let token = contents.trim();
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Whether `url`'s host is a loopback address or `localhost`.
+fn is_loopback_url(url: &str) -> bool {
+    // `host()` (not `host_str()`, which brackets an IPv6 address as
+    // `[::1]` — not a valid `IpAddr` string) so `http://[::1]:7462` is
+    // recognized as loopback too.
+    let Ok(parsed) = url::Url::parse(url) else { return false };
+    match parsed.host() {
+        Some(url::Host::Domain("localhost")) => true,
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        _ => false,
+    }
 }

@@ -117,11 +117,12 @@ fn button_groups() -> Vec<Vec<BtnDef>> {
             BtnDef { icon: TablerIcon::H2, tooltip: "Heading 2", cmd: Cmd::SetBlock("h2"), active_check: ActiveCheck::Block("h2") },
             BtnDef { icon: TablerIcon::H3, tooltip: "Heading 3", cmd: Cmd::SetBlock("h3"), active_check: ActiveCheck::Block("h3") },
         ],
-        // Lists & blocks
+        // Lists & blocks — bullet list, ordered list and blockquote are
+        // hidden (docs/history/HARDENING_CONTRACT.md item 13): rinch's collaboration
+        // scope is flat blocks + marks only, and a list/blockquote in a
+        // collaborating document fails loudly by design (CLAUDE.md
+        // "Collaboration shape").
         vec![
-            BtnDef { icon: TablerIcon::List, tooltip: "Bullet List", cmd: Cmd::SetBlock("ul"), active_check: ActiveCheck::Block("ul") },
-            BtnDef { icon: TablerIcon::ListNumbers, tooltip: "Ordered List", cmd: Cmd::SetBlock("ol"), active_check: ActiveCheck::Block("ol") },
-            BtnDef { icon: TablerIcon::Blockquote, tooltip: "Blockquote", cmd: Cmd::SetBlock("blockquote"), active_check: ActiveCheck::Block("blockquote") },
             BtnDef { icon: TablerIcon::SourceCode, tooltip: "Code Block", cmd: Cmd::SetBlock("pre"), active_check: ActiveCheck::Block("pre") },
         ],
         // Insert & utility

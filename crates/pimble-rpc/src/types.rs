@@ -232,7 +232,7 @@ pub struct GetStoreSyncResponse {
 /// Ask this server for the stores a remote Pimble server has open. The
 /// server connects to the remote itself, with `remote.auth` when it is not
 /// `None` and otherwise with the credential it saved for that remote
-/// (docs/HARDENING_CONTRACT.md decisions 4 and 5). Answers with
+/// (docs/history/HARDENING_CONTRACT.md decisions 4 and 5). Answers with
 /// `ListStoresResponse`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListRemoteStoresRequest {
@@ -242,7 +242,7 @@ pub struct ListRemoteStoresRequest {
 /// Remove a replica: stop its sync link, close it, and delete its
 /// directory. Refused for a store outside the server's replicas directory,
 /// and for a replica whose link is not `Synced` unless `force`
-/// (docs/HARDENING_CONTRACT.md decision 6).
+/// (docs/history/HARDENING_CONTRACT.md decision 6).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoveReplicaRequest {
     pub store_id: StoreId,

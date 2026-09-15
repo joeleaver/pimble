@@ -8,8 +8,8 @@ use std::time::Duration;
 use jsonrpsee::core::{async_trait, SubscriptionResult};
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{PendingSubscriptionSink, SubscriptionMessage};
-use pimble_client::PimbleClient;
-use pimble_core::{Node, MountRef, NodeId, RemoteEndpoint, StoreId, StoreLocation, SyncState, Workspace};
+use pimble_client::{describe_connect_error, PimbleClient};
+use pimble_core::{AuthMethod, Node, MountRef, NodeId, RemoteEndpoint, StoreId, StoreLocation, SyncState, Workspace};
 use pimble_plugins::PluginHost;
 use pimble_rpc::{
     index_building_error, to_rpc_error, ApplyEditRequest, ApplyEditResponse,
@@ -102,11 +102,18 @@ enum IndexEvent {
     Remove(NodeId),
 }
 
-/// A store's open search index plus the channel that feeds its indexing
-/// task.
+/// A store's open search index, the channel that feeds its indexing task, and
+/// everything needed to shut that task (and every debounced upsert it has
+/// spawned) down completely — see [`RpcHandler::shutdown_index`]
+/// (docs/history/HARDENING_CONTRACT.md decision 12).
 struct IndexHandle {
     index: Arc<SearchIndex>,
     events: mpsc::UnboundedSender<IndexEvent>,
+    /// The `StoreIndexer::run` task.
+    main_task: tokio::task::JoinHandle<()>,
+    /// Every debounced content-upsert task currently sleeping or running,
+    /// shared with the `StoreIndexer` that spawns into it (`schedule_content_upsert`).
+    debounce_tasks: Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>,
 }
 
 /// Owns one store's [`SearchIndex`] and reduces the store's mutations
@@ -122,11 +129,17 @@ struct StoreIndexer {
     /// does the work if its captured value is still current when it wakes,
     /// so a newer edit silently supersedes an older, still-sleeping one.
     content_gen: Mutex<HashMap<NodeId, u64>>,
+    /// Shared with this store's [`IndexHandle`], so a shutdown can find and
+    /// cancel every debounce task this indexer has spawned, not just the ones
+    /// it happens to know about at the moment it starts shutting down.
+    debounce_tasks: Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>,
 }
 
 impl StoreIndexer {
     /// Drive `rx` until the sender side (the store's `IndexHandle`) is
-    /// dropped, e.g. on `closeStore`.
+    /// dropped, e.g. on `closeStore`. Ends only once `rx` is both closed and
+    /// drained, so every `IndexEvent` sent before the handle was dropped —
+    /// including one that spawns a fresh debounce task — is still seen.
     async fn run(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<IndexEvent>) {
         while let Some(event) = rx.recv().await {
             match event {
@@ -141,7 +154,7 @@ impl StoreIndexer {
                     }
                 }
                 IndexEvent::ContentChanged(node_id) => {
-                    Arc::clone(&self).schedule_content_upsert(node_id);
+                    Arc::clone(&self).schedule_content_upsert(node_id).await;
                 }
             }
         }
@@ -149,23 +162,34 @@ impl StoreIndexer {
 
     /// Bump `node_id`'s debounce generation and spawn a task that, after
     /// [`CONTENT_INDEX_DEBOUNCE`], re-indexes the node if no newer edit has
-    /// arrived in the meantime.
-    fn schedule_content_upsert(self: Arc<Self>, node_id: NodeId) {
+    /// arrived in the meantime. The task is spawned into `debounce_tasks`
+    /// (not bare `tokio::spawn`) so a shutdown can find and cancel it instead
+    /// of it quietly outliving the `SearchIndex` handle it holds.
+    async fn schedule_content_upsert(self: Arc<Self>, node_id: NodeId) {
         let generation = {
             let mut gens = self.content_gen.lock().unwrap();
             let g = gens.entry(node_id).or_insert(0);
             *g += 1;
             *g
         };
-        tokio::spawn(async move {
+        let indexer = Arc::clone(&self);
+        let mut tasks = self.debounce_tasks.lock().await;
+        // `JoinSet` keeps a finished task's slot until it's joined, and
+        // `applyEdit` calls this once per keystroke — without reaping here,
+        // a long editing session would grow the set by one dead entry per
+        // keystroke, all sitting unjoined until the store closes.
+        // `try_join_next` is non-blocking (only pops entries already
+        // notified as done), so this never waits on a still-sleeping task.
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(async move {
             tokio::time::sleep(CONTENT_INDEX_DEBOUNCE).await;
             let still_current = {
-                let gens = self.content_gen.lock().unwrap();
+                let gens = indexer.content_gen.lock().unwrap();
                 gens.get(&node_id).copied() == Some(generation)
             };
             if still_current {
-                if let Err(e) = self.upsert_now(node_id).await {
-                    warn!("Indexing node {} in store {} failed: {}", node_id, self.store_id, e);
+                if let Err(e) = indexer.upsert_now(node_id).await {
+                    warn!("Indexing node {} in store {} failed: {}", node_id, indexer.store_id, e);
                 }
             }
         });
@@ -405,6 +429,11 @@ pub struct RpcHandler {
     /// and `setStoreSync`/`addRemoteStore`; removed (after `stop()`) by
     /// `closeStore` and `setStoreSync(None)`.
     links: Arc<RwLock<HashMap<StoreId, SyncLinkHandle>>>,
+    /// Saved per-remote credentials (docs/history/HARDENING_CONTRACT.md decision 4),
+    /// resolved whenever this server connects to a remote and consulted (or
+    /// updated) only by `add_remote_store`, `set_store_sync`,
+    /// `list_remote_stores` and the sync link's own connect.
+    credentials: Arc<crate::credentials::CredentialStore>,
 }
 
 impl RpcHandler {
@@ -419,6 +448,15 @@ impl RpcHandler {
     /// used to pass before this field existed) covers every other caller,
     /// including the test suite.
     pub fn with_semantic_available(store_manager: Arc<RwLock<StoreManager>>, semantic_available: bool) -> Self {
+        Self::with_credentials_path(store_manager, semantic_available, crate::credentials::default_credentials_path())
+    }
+
+    /// Like [`RpcHandler::with_semantic_available`], but with the saved
+    /// credentials file loaded from `credentials_path` instead of
+    /// [`crate::credentials::default_credentials_path`]. `PimbleServer::start`
+    /// uses this so `ServerConfig::credentials_path` actually takes effect;
+    /// tests use it to keep credentials in a temp directory.
+    pub fn with_credentials_path(store_manager: Arc<RwLock<StoreManager>>, semantic_available: bool, credentials_path: PathBuf) -> Self {
         Self {
             store_manager,
             subscriptions: Arc::new(RwLock::new(SubscriptionRegistry::new())),
@@ -427,6 +465,7 @@ impl RpcHandler {
             indexes: Arc::new(RwLock::new(HashMap::new())),
             semantic_available,
             links: Arc::new(RwLock::new(HashMap::new())),
+            credentials: Arc::new(crate::credentials::CredentialStore::new(credentials_path)),
         }
     }
 
@@ -438,6 +477,13 @@ impl RpcHandler {
     /// merge, persist, broadcast, and index a remote change).
     pub(crate) fn store_manager_handle(&self) -> Arc<RwLock<StoreManager>> {
         Arc::clone(&self.store_manager)
+    }
+
+    /// Shared handle to the saved-credentials store, for [`crate::sync_link`]
+    /// to resolve auth the same way `add_remote_store`/`set_store_sync`/
+    /// `list_remote_stores` do (docs/history/HARDENING_CONTRACT.md decision 4).
+    pub(crate) fn credentials(&self) -> Arc<crate::credentials::CredentialStore> {
+        Arc::clone(&self.credentials)
     }
 
     /// Subscribe to this server's in-process broadcast of local
@@ -478,6 +524,39 @@ impl RpcHandler {
         if let Some(handle) = self.links.write().await.remove(&store_id) {
             handle.stop();
         }
+    }
+
+    /// Connect to `remote`: the credential used is `remote.auth` if it is
+    /// not `AuthMethod::None`, else whatever was last saved for its origin
+    /// (docs/history/HARDENING_CONTRACT.md decision 4). On a successful connection,
+    /// if `remote.auth` itself was not `None` (an explicit credential, not
+    /// one already reused from the saved store), it is saved for the
+    /// origin — a connection that actually worked is the only signal a
+    /// credential is any good. A failed connection is translated to
+    /// decision 5's wording ("refused the credentials" for `401`, "refused
+    /// the connection" for `403`) naming `remote.url`.
+    async fn connect_to_remote(&self, remote: &RemoteEndpoint) -> Result<PimbleClient, ErrorObjectOwned> {
+        let auth = self.credentials.resolve(&remote.url, &remote.auth).await;
+        let client = PimbleClient::connect_with_auth(remote.url.as_str(), &auth)
+            .await
+            .map_err(|e| to_rpc_error(describe_connect_error(&remote.url, &e)))?;
+
+        if !matches!(remote.auth, AuthMethod::None) {
+            if let Err(e) = self.credentials.save(&remote.url, remote.auth.clone()).await {
+                warn!("Failed to save credential for {}: {}", remote.url, e);
+            }
+        }
+
+        Ok(client)
+    }
+
+    /// `remote` as it belongs on disk (`sync.json`) or in an RPC response:
+    /// its credential stripped to `AuthMethod::None` (decision 4). The real
+    /// credential, if any, lives only in the credentials store, keyed by
+    /// origin, resolved fresh by [`Self::connect_to_remote`] every time it's
+    /// needed.
+    fn without_auth(remote: &RemoteEndpoint) -> RemoteEndpoint {
+        RemoteEndpoint { url: remote.url.clone(), auth: AuthMethod::None }
     }
 
     /// Mark `store_id` as having dirty content and, if no flush task is
@@ -565,6 +644,54 @@ impl RpcHandler {
         registry.notify_store_change(&store_notif).await;
     }
 
+    /// Repair `store_id`'s tree (see `StoreDocument::repair`) if it needs it,
+    /// then flush, broadcast, and re-index exactly like any other structural
+    /// change (docs/history/HARDENING_CONTRACT.md decision 9). Called at `openStore`
+    /// and after every `applyStoreUpdate` that changed the document. `None`
+    /// (nothing to repair) is by far the common case, and costs one cheap
+    /// read-only pass over the tree. Logs and returns on error rather than
+    /// failing its caller's RPC — like search indexing, this is best-effort
+    /// upkeep, not a precondition for the operation that triggered it.
+    async fn repair_store_tree(&self, store_id: StoreId) {
+        let repair = {
+            let mut manager = self.store_manager.write().await;
+            match manager.repair_tree(store_id) {
+                Ok(repair) => repair,
+                Err(e) => {
+                    warn!("Tree repair failed for store {}: {}", store_id, e);
+                    return;
+                }
+            }
+        };
+        let Some(repair) = repair else {
+            return;
+        };
+
+        if let Err(e) = self.store_manager.write().await.flush(store_id).await {
+            warn!("Failed to flush store {} after tree repair: {}", store_id, e);
+        }
+        info!("Repaired tree for store {}: {} node(s) touched", store_id, repair.touched.len());
+
+        // `source_client_id: None`, like any change with no single originating
+        // client, so a sync link forwards it rather than treating it as its
+        // own echo.
+        use base64::Engine;
+        let notification = StoreChangedNotification {
+            store_id,
+            change_kind: StoreChangeKind::TreeStructure { node_ids: repair.touched.clone() },
+            source_client_id: None,
+            update: Some(base64::engine::general_purpose::STANDARD.encode(&repair.update)),
+        };
+        self.subscriptions.write().await.notify_store_change(&notification).await;
+
+        // A repair only ever reassigns a node's parent or reorders/fixes a
+        // children list, never removes a node entry — every touched id is
+        // still there to upsert.
+        for node_id in repair.touched {
+            self.enqueue_index_event(store_id, IndexEvent::Upsert(node_id)).await;
+        }
+    }
+
     // ── Search index feed ────────────────────────────────────────────
 
     /// Send an [`IndexEvent`] to `store_id`'s indexing task, if one is open.
@@ -594,18 +721,53 @@ impl RpcHandler {
 
     /// Wrap an opened [`SearchIndex`] in a fresh [`StoreIndexer`] task and
     /// install it as `store_id`'s current [`IndexHandle`], replacing (and
-    /// thereby stopping) any previous one for that store.
+    /// thereby stopping) any previous one for that store. The previous
+    /// handle, if any, is dropped without being shut down first — every
+    /// caller of `install_index_handle` has already removed and shut down
+    /// whatever was there (`open_index_for_store`'s own callers never race
+    /// it, and `rebuild_store_index` calls `shutdown_index` explicitly).
     async fn install_index_handle(&self, store_id: StoreId, index: Arc<SearchIndex>) {
         let (tx, rx) = mpsc::unbounded_channel();
+        let debounce_tasks = Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
         let indexer = Arc::new(StoreIndexer {
             store_id,
             index: Arc::clone(&index),
             store_manager: Arc::clone(&self.store_manager),
             plugin_host: Arc::clone(&self.plugin_host),
             content_gen: Mutex::new(HashMap::new()),
+            debounce_tasks: Arc::clone(&debounce_tasks),
         });
-        tokio::spawn(indexer.run(rx));
-        self.indexes.write().await.insert(store_id, IndexHandle { index, events: tx });
+        let main_task = tokio::spawn(indexer.run(rx));
+        self.indexes.write().await.insert(store_id, IndexHandle { index, events: tx, main_task, debounce_tasks });
+    }
+
+    /// Shut an [`IndexHandle`] down completely: by the time this returns, no
+    /// task anywhere holds its `Arc<SearchIndex>` (docs/history/HARDENING_CONTRACT.md
+    /// decision 12) — the fix for the flaky
+    /// `reopening_a_store_preserves_its_search_index`, whose real cause was
+    /// this never having been guaranteed before: `closeStore` dropped the
+    /// `IndexHandle`, which only *starts* `StoreIndexer::run` winding down
+    /// (its channel closing) without waiting for that to finish, and never
+    /// touched debounced upsert tasks at all — both `run` and any number of
+    /// them could still be mid-flight, each holding its own clone of the
+    /// `Arc<SearchIndex>`, when an immediate reopen tried to open the same
+    /// rhypedb directory again.
+    ///
+    /// Order matters: dropping `events` first lets `run` drain whatever was
+    /// already buffered (which can itself spawn fresh debounce tasks) and
+    /// exit; only once `run` has actually finished can spawning of further
+    /// debounce tasks be ruled out, which is what makes clearing
+    /// `debounce_tasks` afterward exhaustive rather than racing new arrivals.
+    /// Debounce tasks are aborted rather than awaited to their natural
+    /// completion — there is no reason to sit out a content re-index's
+    /// debounce window just because the store is closing.
+    async fn shutdown_index(handle: IndexHandle) {
+        drop(handle.events);
+        let _ = handle.main_task.await;
+
+        let mut tasks = handle.debounce_tasks.lock().await;
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
     }
 
     /// Walk every node in `store_id` from its root (mount nodes are indexed
@@ -654,6 +816,14 @@ impl RpcHandler {
         let hash_path = index_dir.join(pimble_search::SCHEMA_HASH_FILE);
         let old_hash = std::fs::read_to_string(&hash_path).ok();
 
+        // Whether the open-failure fallback below ran: it always wipes the directory
+        // clean, so the reopened index is empty regardless of what `old_hash` says —
+        // comparing hashes afterward could otherwise conclude "no schema change" (the
+        // wiped-and-reopened index typically has the very same schema) and skip
+        // reindexing an index that is, in fact, now blank
+        // (docs/history/HARDENING_CONTRACT.md decision 12).
+        let mut forced_rebuild = false;
+
         let index = match SearchIndex::open(&index_dir, self.semantic_available) {
             Ok(index) => index,
             Err(e) => {
@@ -668,12 +838,13 @@ impl RpcHandler {
                 if index_dir.exists() {
                     std::fs::remove_dir_all(&index_dir)?;
                 }
+                forced_rebuild = true;
                 SearchIndex::open(&index_dir, self.semantic_available)?
             }
         };
 
         let new_hash = std::fs::read_to_string(&hash_path).ok();
-        let needs_rebuild = old_hash.is_none() || old_hash != new_hash;
+        let needs_rebuild = forced_rebuild || old_hash.is_none() || old_hash != new_hash;
 
         let index = if needs_rebuild {
             // `SearchIndex::clear()` deletes `Node`s in scan order without
@@ -720,13 +891,14 @@ impl RpcHandler {
     /// Deletes the directory and reopens fresh rather than calling
     /// `SearchIndex::clear()`, which cannot yet delete a `Node` another
     /// `Node.parent` still references (see `open_index_for_store`'s doc
-    /// comment). Drops any existing handle first so its `Arc<SearchIndex>`
-    /// starts releasing its file lock before the directory is removed; a
-    /// background upsert from the outgoing indexer task landing mid-delete
-    /// is a benign, logged no-op (same acceptable race `closeStore` already
-    /// has with in-flight debounced upserts).
+    /// comment). Shuts down any existing handle first (`shutdown_index`) so
+    /// no task anywhere still holds the old `Arc<SearchIndex>` — and so
+    /// nothing can land a background upsert mid-delete — before the
+    /// directory is removed (docs/history/HARDENING_CONTRACT.md decision 12).
     async fn rebuild_store_index(&self, store_id: StoreId) -> anyhow::Result<usize> {
-        self.indexes.write().await.remove(&store_id);
+        if let Some(handle) = self.indexes.write().await.remove(&store_id) {
+            Self::shutdown_index(handle).await;
+        }
 
         let index_dir = self.index_dir_for(store_id).await?;
         if index_dir.exists() {
@@ -804,6 +976,12 @@ impl PimbleApiServer for RpcHandler {
         if let Some(config) = sync_config {
             self.ensure_link_started(store_id, config.remote).await;
         }
+
+        // Decision 9: repair a store's tree when it opens (a store closed
+        // mid-repair, or reopened straight from disk after a crash, may
+        // still be carrying an issue nothing has fixed yet).
+        self.repair_store_tree(store_id).await;
+
         store.sync_state = self.sync_state_of(store_id).await;
         mark_replica(&mut store);
 
@@ -827,10 +1005,13 @@ impl PimbleApiServer for RpcHandler {
 
         // Clean up subscriptions for this store
         self.subscriptions.write().await.remove_store(request.store_id);
-        // Dropping the handle drops its event sender, ending the store's
-        // indexing task; the `Arc<SearchIndex>` itself closes once every
-        // in-flight debounced-upsert task referencing it finishes.
-        self.indexes.write().await.remove(&request.store_id);
+        // `shutdown_index` (decision 12) doesn't return until no task anywhere
+        // still holds this store's `Arc<SearchIndex>`, so a reopen right
+        // after this response never meets a second live handle on the same
+        // rhypedb directory.
+        if let Some(handle) = self.indexes.write().await.remove(&request.store_id) {
+            Self::shutdown_index(handle).await;
+        }
 
         Ok(EmptyResponse {})
     }
@@ -1173,9 +1354,7 @@ impl PimbleApiServer for RpcHandler {
 
         // Ask the remote for the store (decision 8): its name and root node
         // id, matched by id via `listStores`.
-        let remote_client = PimbleClient::connect_with_auth(request.remote.url.as_str(), &request.remote.auth)
-            .await
-            .map_err(|e| to_rpc_error(format!("Failed to connect to remote {}: {}", request.remote.url, e)))?;
+        let remote_client = self.connect_to_remote(&request.remote).await?;
         let remote_stores = remote_client.list_stores().await.map_err(to_rpc_error)?;
         let remote_store = remote_stores
             .into_iter()
@@ -1197,7 +1376,7 @@ impl PimbleApiServer for RpcHandler {
             .await
             .map_err(to_rpc_error)?;
         manager
-            .write_sync_config(store_id, &SyncConfig { remote: request.remote.clone() })
+            .write_sync_config(store_id, &SyncConfig { remote: Self::without_auth(&request.remote) })
             .await
             .map_err(to_rpc_error)?;
         let mut store = manager.get_store_info(store_id).map_err(to_rpc_error)?;
@@ -1234,9 +1413,7 @@ impl PimbleApiServer for RpcHandler {
         match request.remote {
             Some(remote) => {
                 // Refuse if the remote has no store with this id.
-                let remote_client = PimbleClient::connect_with_auth(remote.url.as_str(), &remote.auth)
-                    .await
-                    .map_err(|e| to_rpc_error(format!("Failed to connect to remote {}: {}", remote.url, e)))?;
+                let remote_client = self.connect_to_remote(&remote).await?;
                 let remote_stores = remote_client.list_stores().await.map_err(to_rpc_error)?;
                 let Some(twin) = remote_stores.iter().find(|s| s.id == request.store_id) else {
                     return Err(to_rpc_error(format!(
@@ -1268,7 +1445,7 @@ impl PimbleApiServer for RpcHandler {
 
                 let manager = self.store_manager.read().await;
                 manager
-                    .write_sync_config(request.store_id, &SyncConfig { remote: remote.clone() })
+                    .write_sync_config(request.store_id, &SyncConfig { remote: Self::without_auth(&remote) })
                     .await
                     .map_err(to_rpc_error)?;
                 drop(manager);
@@ -1287,11 +1464,14 @@ impl PimbleApiServer for RpcHandler {
         }
 
         let manager = self.store_manager.read().await;
+        // Never `remote.auth` as saved (decision 4): sync.json is already
+        // written with `auth: none`, but strip it here too so an older
+        // sync.json written before that fix can't leak a credential.
         let remote_now = manager
             .read_sync_config(request.store_id)
             .await
             .map_err(to_rpc_error)?
-            .map(|c| c.remote);
+            .map(|c| Self::without_auth(&c.remote));
         drop(manager);
         let state = self.sync_state_of(request.store_id).await;
 
@@ -1307,7 +1487,7 @@ impl PimbleApiServer for RpcHandler {
             .read_sync_config(request.store_id)
             .await
             .map_err(to_rpc_error)?
-            .map(|c| c.remote);
+            .map(|c| Self::without_auth(&c.remote));
         drop(manager);
         let state = self.sync_state_of(request.store_id).await;
 
@@ -1318,16 +1498,66 @@ impl PimbleApiServer for RpcHandler {
         &self,
         request: ListRemoteStoresRequest,
     ) -> Result<ListStoresResponse, ErrorObjectOwned> {
-        // Interface stub: agent A implements (docs/HARDENING_CONTRACT.md).
-        Err(to_rpc_error(format!("listRemoteStores for {} is not implemented yet", request.remote.url)))
+        debug!("Listing remote stores on {}", request.remote.url);
+
+        let client = self.connect_to_remote(&request.remote).await?;
+        let stores = client.list_stores().await.map_err(to_rpc_error)?;
+
+        Ok(ListStoresResponse { stores })
     }
 
     async fn remove_replica(
         &self,
         request: RemoveReplicaRequest,
     ) -> Result<EmptyResponse, ErrorObjectOwned> {
-        // Interface stub: agent A implements (docs/HARDENING_CONTRACT.md).
-        Err(to_rpc_error(format!("removeReplica for store {} is not implemented yet", request.store_id)))
+        info!("Removing replica {} (force: {})", request.store_id, request.force);
+
+        let mut store = {
+            let manager = self.store_manager.read().await;
+            manager.get_store_info(request.store_id).map_err(to_rpc_error)?
+        };
+        mark_replica(&mut store);
+        if !store.is_replica {
+            return Err(to_rpc_error(format!(
+                "store {} is not a replica (its directory is not under this server's replicas directory); \
+                 removeReplica only removes a replica this server created with addRemoteStore",
+                request.store_id
+            )));
+        }
+
+        let state = self.sync_state_of(request.store_id).await;
+        if !matches!(state, SyncState::Synced { .. }) && !request.force {
+            return Err(to_rpc_error(format!(
+                "replica {} is not fully synced (currently {:?}); it may have changes the remote does not have yet. \
+                 Pass force to remove it anyway.",
+                request.store_id, state
+            )));
+        }
+
+        let path = store.local_path().cloned();
+
+        // Closes exactly as `closeStore` does (it already stops the link
+        // too), so `removeReplica` inherits whatever `closeStore` does to
+        // shut its search index down cleanly before the directory under it
+        // is deleted (decision 6).
+        self.close_store(CloseStoreRequest { store_id: request.store_id }).await?;
+
+        if let Some(path) = path {
+            if let Err(e) = tokio::fs::remove_dir_all(&path).await {
+                // The store is already closed and unlinked at this point,
+                // so this can't be silently swallowed into a success: the
+                // caller (app or CLI) needs to know the directory is still
+                // there (permissions, a file still open on it, ...).
+                return Err(to_rpc_error(format!(
+                    "replica {} was closed but its directory {} could not be deleted: {}",
+                    request.store_id,
+                    path.display(),
+                    e
+                )));
+            }
+        }
+
+        Ok(EmptyResponse {})
     }
 
     async fn get_mount_state(
@@ -1406,21 +1636,30 @@ impl PimbleApiServer for RpcHandler {
             .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
 
         let mut manager = self.store_manager.write().await;
-        let touched = manager
+        let effect = manager
             .apply_store_doc_update(request.store_id, &bytes)
             .map_err(to_rpc_error)?;
+
+        if !effect.changed {
+            // Decision 8: every part of this update was already reflected
+            // here (a yrs diff is never actually empty, so this can't be
+            // told apart by the request's byte length) — no flush, no
+            // notification, no re-index, no repair.
+            return Ok(EmptyResponse {});
+        }
 
         manager
             .flush(request.store_id)
             .await
             .map_err(to_rpc_error)?;
 
-        // Decision 9: an id whose node entry still exists gets upserted
-        // (this is what makes a title change arriving as a store update get
-        // reindexed); an id no longer present was removed.
+        // Decision 9 (of docs/SYNC_CONTRACT.md): an id whose node entry
+        // still exists gets upserted (this is what makes a title change
+        // arriving as a store update get reindexed); an id no longer
+        // present was removed.
         let (upserts, removals): (Vec<NodeId>, Vec<NodeId>) = {
             let doc = manager.store_document(request.store_id).map_err(to_rpc_error)?;
-            touched.iter().copied().partition(|id| doc.has_node(*id))
+            effect.touched.iter().copied().partition(|id| doc.has_node(*id))
         };
 
         drop(manager);
@@ -1429,7 +1668,7 @@ impl PimbleApiServer for RpcHandler {
         // they can apply it directly instead of refetching.
         let notification = StoreChangedNotification {
             store_id: request.store_id,
-            change_kind: StoreChangeKind::TreeStructure { node_ids: touched },
+            change_kind: StoreChangeKind::TreeStructure { node_ids: effect.touched },
             source_client_id: Some(request.client_id.clone()),
             update: Some(request.update.clone()),
         };
@@ -1441,6 +1680,10 @@ impl PimbleApiServer for RpcHandler {
         for node_id in removals {
             self.enqueue_index_event(request.store_id, IndexEvent::Remove(node_id)).await;
         }
+
+        // Decision 9 (of docs/history/HARDENING_CONTRACT.md): repair after a
+        // changing applyStoreUpdate.
+        self.repair_store_tree(request.store_id).await;
 
         Ok(EmptyResponse {})
     }
@@ -1558,11 +1801,17 @@ impl PimbleApiServer for RpcHandler {
             .decode(changes)
             .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
         let mut store_manager = self.store_manager.write().await;
-        store_manager
+        let changed = store_manager
             .apply_content_update(request.store_id, request.node_id, &bytes)
             .await
             .map_err(to_rpc_error)?;
         drop(store_manager);
+
+        if !changed {
+            // Decision 8: every part of this edit was already reflected here
+            // — no flush, no broadcast, no re-index.
+            return Ok(ApplyEditResponse {});
+        }
 
         // Debounced persistence: coalesce a burst of edits into at most one
         // flush per CONTENT_FLUSH_DEBOUNCE window, rather than one per edit,

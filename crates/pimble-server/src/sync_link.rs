@@ -158,9 +158,15 @@ async fn connect_and_sync(
 ) -> anyhow::Result<()> {
     set_state(handler, store_id, state_tx, SyncState::Syncing).await;
 
-    let client = PimbleClient::connect_with_auth(remote.url.as_str(), &remote.auth)
+    // `remote.auth` is `AuthMethod::None` whenever this link was restarted
+    // from `sync.json` (which never stores a real credential — docs/
+    // HARDENING_CONTRACT.md decision 4); `resolve` finds the credential
+    // saved for this origin, if any, the same way `addRemoteStore`/
+    // `setStoreSync`/`listRemoteStores` do.
+    let auth = handler.credentials().resolve(&remote.url, &remote.auth).await;
+    let client = PimbleClient::connect_with_auth(remote.url.as_str(), &auth)
         .await
-        .map_err(|e| anyhow::anyhow!("connect to {} failed: {}", remote.url, e))?;
+        .map_err(|e| anyhow::anyhow!("{}", pimble_client::describe_connect_error(&remote.url, &e)))?;
 
     full_reconcile(handler, &client, store_id, link_id).await?;
 
@@ -422,13 +428,17 @@ async fn full_reconcile(handler: &RpcHandler, client: &PimbleClient, store_id: S
 
         // A node the remote left out is not in its store document yet (a
         // race with a structural change); the next reconcile covers it.
+        //
+        // The pull always runs (decision 7's finding: a yrs v1 diff is never
+        // actually empty — `[0, 0]` at minimum plus the sender's whole
+        // delete set — so an `is_empty()` gate here was always true anyway);
+        // `apply_edit` on the receiving end now does its own no-op check
+        // (decision 8), so applying a diff that turns out to carry nothing
+        // new is cheap.
         for (node_id, diff, remote_sv) in remote_answers {
-            if !diff.is_empty() {
-                let diff_b64 = base64::engine::general_purpose::STANDARD.encode(&diff);
-                apply_edit_locally_with_fallback(handler, client, store_id, node_id, link_id, diff_b64).await?;
-                debug!("Sync link for store {} pulled a content diff for node {} from the remote", store_id, node_id);
-            }
-            push_node_diff(handler, client, store_id, node_id, link_id, &remote_sv).await?;
+            let diff_b64 = base64::engine::general_purpose::STANDARD.encode(&diff);
+            apply_edit_locally_with_fallback(handler, client, store_id, node_id, link_id, diff_b64).await?;
+            push_node_diff(handler, client, store_id, node_id, link_id, &remote_sv, &diff).await?;
         }
     }
 
@@ -436,7 +446,11 @@ async fn full_reconcile(handler: &RpcHandler, client: &PimbleClient, store_id: S
 }
 
 /// Reconcile the store document with the remote: pull what it has that we
-/// lack, then push what we have that it lacks (decision 5).
+/// lack, then push what we have that it lacks (decision 5). The pull always
+/// applies (see `full_reconcile`'s comment on why `is_empty()` never gated
+/// anything); the push uses `diff_if_peer_lacks_it` (decision 7) instead of
+/// the same dead `is_empty()` check, so a reconcile between two already-
+/// synced servers makes no round trip at all here.
 async fn reconcile_store(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, link_id: &str) -> anyhow::Result<()> {
     let manager = handler.store_manager_handle();
 
@@ -450,18 +464,15 @@ async fn reconcile_store(handler: &RpcHandler, client: &PimbleClient, store_id: 
         .await
         .map_err(|e| anyhow::anyhow!("remote syncStoreDocument failed: {}", e))?;
 
-    if !diff.is_empty() {
-        let diff_b64 = base64::engine::general_purpose::STANDARD.encode(&diff);
-        apply_store_update_locally(handler, store_id, link_id, diff_b64).await?;
-        debug!("Sync link for store {} pulled a store document diff from the remote", store_id);
-    }
+    let diff_b64 = base64::engine::general_purpose::STANDARD.encode(&diff);
+    apply_store_update_locally(handler, store_id, link_id, diff_b64).await?;
 
-    let local_diff = {
+    let local_push = {
         let manager = manager.read().await;
-        manager.store_doc_diff_since(store_id, &remote_sv)?
+        manager.store_document(store_id)?.diff_if_peer_lacks_it(&remote_sv, &diff)?
     };
 
-    if !local_diff.is_empty() {
+    if let Some(local_diff) = local_push {
         client
             .apply_store_update(store_id, link_id, &local_diff)
             .await
@@ -491,17 +502,17 @@ async fn reconcile_node(handler: &RpcHandler, client: &PimbleClient, store_id: S
         .await
         .map_err(|e| anyhow::anyhow!("remote syncNodeContent failed: {}", e))?;
 
-    if !diff.is_empty() {
-        let diff_b64 = base64::engine::general_purpose::STANDARD.encode(&diff);
-        apply_edit_locally_with_fallback(handler, client, store_id, node_id, link_id, diff_b64).await?;
-        debug!("Sync link for store {} pulled a content diff for node {} from the remote", store_id, node_id);
-    }
+    let diff_b64 = base64::engine::general_purpose::STANDARD.encode(&diff);
+    apply_edit_locally_with_fallback(handler, client, store_id, node_id, link_id, diff_b64).await?;
 
-    push_node_diff(handler, client, store_id, node_id, link_id, &remote_sv).await
+    push_node_diff(handler, client, store_id, node_id, link_id, &remote_sv, &diff).await
 }
 
 /// Send the remote everything this node's local content document has beyond
-/// `remote_sv`, if anything.
+/// `remote_sv`, if anything — `remote_diff` (the diff the remote just sent
+/// us, en route to `remote_sv`) is what `diff_if_peer_lacks_it` needs to
+/// tell "nothing new" apart from "carries the remote's whole delete set, as
+/// every yrs diff does" (decision 7).
 async fn push_node_diff(
     handler: &RpcHandler,
     client: &PimbleClient,
@@ -509,15 +520,16 @@ async fn push_node_diff(
     node_id: NodeId,
     link_id: &str,
     remote_sv: &[u8],
+    remote_diff: &[u8],
 ) -> anyhow::Result<()> {
-    let local_diff = {
+    let local_push = {
         let manager = handler.store_manager_handle();
         let mut manager = manager.write().await;
         let doc = manager.get_node_document(store_id, node_id).await?;
-        doc.diff_since(remote_sv)?
+        doc.diff_if_peer_lacks_it(remote_sv, remote_diff)?
     };
 
-    if !local_diff.is_empty() {
+    if let Some(local_diff) = local_push {
         let diff_b64 = base64::engine::general_purpose::STANDARD.encode(&local_diff);
         apply_edit_remotely_with_fallback(handler, client, store_id, node_id, link_id, diff_b64).await?;
         debug!("Sync link for store {} pushed a content diff for node {} to the remote", store_id, node_id);

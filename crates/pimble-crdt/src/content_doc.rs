@@ -92,13 +92,16 @@ impl ContentDoc {
     }
 
     /// Merge a peer's v1 update — a broadcast delta, a reconciliation diff, or a whole
-    /// snapshot — into this document.
-    pub fn apply_update(&mut self, update: &[u8]) -> Result<()> {
+    /// snapshot — into this document. Returns whether it changed anything (decision 8 of
+    /// docs/history/HARDENING_CONTRACT.md): `false` when every part of `update` was already
+    /// reflected in this document. Computed from the merging transaction's own
+    /// before/after state and delete set — never from `update`'s byte length, since a
+    /// yrs v1 update is never actually empty (see [`crate::sync_util`]).
+    pub fn apply_update(&mut self, update: &[u8]) -> Result<bool> {
         let update = Update::decode_v1(update).map_err(|e| CrdtError::Yrs(e.to_string()))?;
-        self.doc
-            .transact_mut()
-            .apply_update(update)
-            .map_err(|e| CrdtError::Yrs(e.to_string()))
+        let mut txn = self.doc.transact_mut();
+        txn.apply_update(update).map_err(|e| CrdtError::Yrs(e.to_string()))?;
+        Ok(*txn.before_state() != *txn.after_state() || !txn.delete_set().is_empty())
     }
 
     /// This document's state vector, v1-encoded.
@@ -110,6 +113,23 @@ impl ContentDoc {
     pub fn diff_since(&self, state_vector: &[u8]) -> Result<Vec<u8>> {
         let sv = StateVector::decode_v1(state_vector).map_err(|e| CrdtError::Yrs(e.to_string()))?;
         Ok(self.doc.transact().encode_diff_v1(&sv))
+    }
+
+    /// Computes [`ContentDoc::diff_since`] against `remote_sv` and returns it only if it
+    /// tells the peer something it doesn't already know (docs/history/HARDENING_CONTRACT.md
+    /// decision 7): a struct beyond `remote_sv`, or one of our deletions missing from
+    /// `remote_diff`'s delete set. `remote_diff` is the diff the peer just sent us (from
+    /// its own `diff_since` against our last-known state) — decoded here only for its
+    /// delete set, never applied. `None` when the peer already has everything, which a
+    /// bare `diff_since(remote_sv).is_empty()` check can never detect (see
+    /// [`crate::sync_util`]).
+    pub fn diff_if_peer_lacks_it(&self, remote_sv: &[u8], remote_diff: &[u8]) -> Result<Option<Vec<u8>>> {
+        let local_diff = self.diff_since(remote_sv)?;
+        if crate::sync_util::peer_lacks_something(&local_diff, remote_diff)? {
+            Ok(Some(local_diff))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Plain-text projection: the units' text (see [`ContentDoc::units`]) joined by
@@ -353,5 +373,76 @@ mod tests {
     fn new_is_default_and_empty() {
         let doc = ContentDoc::default();
         assert_eq!(doc.text(), "");
+    }
+
+    #[test]
+    fn apply_update_reports_whether_it_changed_anything() {
+        let a = ContentDoc::from_plain_text("hello").unwrap();
+        let mut b = ContentDoc::new();
+
+        let b_sv = b.state_vector();
+        let diff = a.diff_since(&b_sv).unwrap();
+
+        assert!(b.apply_update(&diff).unwrap(), "merging new content must report changed");
+        assert!(
+            !b.apply_update(&diff).unwrap(),
+            "resending an already-merged update must report unchanged"
+        );
+    }
+
+    #[test]
+    fn diff_if_peer_lacks_it_is_none_once_both_sides_have_exchanged() {
+        let local = ContentDoc::from_plain_text("hello").unwrap();
+        let remote = ContentDoc::load(&local.save()).unwrap(); // remote already has everything
+
+        let remote_sv = remote.state_vector();
+        let local_sv = local.state_vector();
+        // What remote would send local, from local's own state vector: since remote has
+        // exactly what local has, this carries no new structs — just remote's (empty)
+        // delete set.
+        let remote_diff = remote.diff_since(&local_sv).unwrap();
+
+        let push = local.diff_if_peer_lacks_it(&remote_sv, &remote_diff).unwrap();
+        assert!(push.is_none(), "expected nothing to push, remote already has everything: {:?}", push);
+    }
+
+    #[test]
+    fn diff_if_peer_lacks_it_is_some_when_a_struct_is_missing() {
+        let a = ContentDoc::from_plain_text("hello").unwrap();
+        let b = ContentDoc::new();
+
+        let b_sv = b.state_vector();
+        // b's diff to a (an empty document to an empty state) carries nothing.
+        let diff_for_a = b.diff_since(&b_sv).unwrap();
+
+        let push = a.diff_if_peer_lacks_it(&b_sv, &diff_for_a).unwrap();
+        assert!(push.is_some(), "expected a's content to be pushed to empty b");
+    }
+
+    #[test]
+    fn diff_if_peer_lacks_it_is_some_when_a_deletion_is_missing() {
+        use yrs::{Text, Transact};
+
+        let a = ContentDoc::new();
+        {
+            let txt = a.doc.get_or_insert_text("scratch");
+            let mut txn = a.doc.transact_mut();
+            txt.insert(&mut txn, 0, "hello");
+        }
+        let b = ContentDoc::load(&a.save()).unwrap();
+
+        // b deletes content a still has.
+        {
+            let txt = b.doc.get_or_insert_text("scratch");
+            let mut txn = b.doc.transact_mut();
+            txt.remove_range(&mut txn, 0, 5);
+        }
+
+        // a's diff to b (from a's stale state vector) carries none of b's deletion.
+        let a_sv = a.state_vector();
+        let diff_for_b = a.diff_since(&a_sv).unwrap();
+
+        let push = b.diff_if_peer_lacks_it(&a_sv, &diff_for_b).unwrap();
+        assert!(push.is_some(), "expected b's deletion to be pushed back to a");
     }
 }

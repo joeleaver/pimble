@@ -1,6 +1,34 @@
 # Hardening contract: auth, replica lifecycle, exact notifications, tree repair
 
-Status: in progress (2026-09-14). The interface below is landed by the PM before dispatch.
+Status: done 2026-09-14. Interface landed at 2e3821e; implemented as written, with these
+changes decided during the work or in review:
+
+- `TreeIssue` was redesigned around repair's model (orphan, detached, missing child,
+  duplicate in a list, wrong list, missing from a list, root in a list, cycle);
+  `DuplicateChild` is gone because a child in two lists is one correct placement plus
+  `WrongList` entries.
+- Repair edits lists surgically (removes exactly the wrong indices, appends exactly the
+  missing children). A clear-and-rebuild of changed lists never converged across two
+  replicas: each fabricated its own copy of every kept entry.
+- The subtree delete walks with a visited set, skips the root and ids with no entry, and
+  `StoreDocument::remove_node` tolerates a parent that is already gone, so deleting inside
+  an unrepaired merge neither loops (the walk has no await point and would hang the
+  runtime) nor half-fails nor takes the root with it.
+- The flake's cause (not reproduced on demand, fixed by construction): `closeStore`
+  returned while `StoreIndexer::run` and untracked debounce tasks still held the
+  `Arc<SearchIndex>`, so a reopen could meet a second live rhypedb handle on the same
+  directory. Index handles now own their tasks (debounce tasks in a `JoinSet`, reaped on
+  every spawn) and `shutdown_index` drains them.
+- Review also added: an empty token (file or config) is refused; the token and
+  credentials temp files are created `0600`; an unreadable credentials file is logged;
+  `removeReplica` reports a directory it could not delete; `[::1]` counts as loopback in
+  the CLI; masked token fields; one refetch per parent for `TreeStructure`; RPC errors
+  carry the server's message instead of jsonrpsee's `ErrorObject { .. }` rendering.
+- Found in GUI verification: store rows never re-rendered when a store became linked
+  (rinch's Tree diffs rows on `TreeNodeData`, which did not change), so "Link to
+  Remote..." / "Unlink from Remote" stayed stale. The store row's (unrendered) label now
+  carries the link state.
+- `pimble-cli` gained `move-node` and `delete-node` for headless testing.
 
 This phase takes the top follow-ups from `docs/NEXT_SESSION.md` (items 1, 2, 4, 6, 7, 8,
 12, 13, 15) before the roadmap resumes with remote mounts. Remote mounts need two things

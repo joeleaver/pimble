@@ -286,13 +286,20 @@ impl LocalStore {
     }
 
     /// Merge a peer's yrs update (delta, reconciliation diff, or whole
-    /// snapshot) into the store document, mark it dirty, and re-validate the
-    /// tree (concurrent moves can leave duplicates or stray entries; issues
-    /// are logged, not repaired here). Returns the ids of the node entries
-    /// the update touched (created, deleted, or modified), for the caller to
-    /// feed a search index (docs/SYNC_CONTRACT.md decision 9).
-    pub fn apply_store_doc_update(&mut self, update: &[u8]) -> Result<Vec<NodeId>> {
-        let touched = self.store_doc.apply_update(update).map_err(StoreError::from)?;
+    /// snapshot) into the store document. A no-op merge (decision 8 of
+    /// docs/history/HARDENING_CONTRACT.md — every part of `update` already reflected
+    /// here) leaves the store untouched: not marked dirty, not
+    /// re-validated. A real change marks it dirty and re-validates the tree
+    /// (concurrent moves can leave duplicates or stray entries; issues are
+    /// logged, not repaired here — `StoreManager::repair_tree` does that).
+    /// Returns whether it changed anything and the ids of the node entries
+    /// it touched (created, deleted, or modified), for the caller to feed a
+    /// search index (docs/SYNC_CONTRACT.md decision 9).
+    pub fn apply_store_doc_update(&mut self, update: &[u8]) -> Result<pimble_crdt::StoreUpdateEffect> {
+        let effect = self.store_doc.apply_update(update).map_err(StoreError::from)?;
+        if !effect.changed {
+            return Ok(effect);
+        }
         self.store_doc_dirty = true;
         match self.store_doc.validate_tree() {
             Ok(issues) => {
@@ -302,7 +309,21 @@ impl LocalStore {
             }
             Err(e) => tracing::warn!("Failed to validate tree after applying store update: {}", e),
         }
-        Ok(touched)
+        Ok(effect)
+    }
+
+    /// Repair the store document's tree (see `StoreDocument::repair`),
+    /// marking the store dirty only when it actually changed something
+    /// (docs/history/HARDENING_CONTRACT.md decision 9). Unlike `store_document_mut`
+    /// — which every caller reaches for because it is *about* to mutate —
+    /// a repair often finds nothing to fix, and that must never force an
+    /// extra flush.
+    pub fn repair_tree(&mut self) -> Result<Option<pimble_crdt::TreeRepair>> {
+        let repair = self.store_doc.repair().map_err(StoreError::from)?;
+        if repair.is_some() {
+            self.store_doc_dirty = true;
+        }
+        Ok(repair)
     }
 
     /// Assemble a Node from store document metadata + content bytes
@@ -454,17 +475,22 @@ impl LocalStore {
     }
 
     /// Merge a yrs update (delta, reconciliation diff, or whole snapshot)
-    /// into a node's content document.
-    pub async fn apply_content_update(&mut self, node_id: NodeId, update: &[u8]) -> Result<()> {
-        {
+    /// into a node's content document. A no-op merge (decision 8 of
+    /// docs/history/HARDENING_CONTRACT.md) leaves `modified_at` and every dirty flag
+    /// untouched; returns whether it changed anything.
+    pub async fn apply_content_update(&mut self, node_id: NodeId, update: &[u8]) -> Result<bool> {
+        let changed = {
             let doc = self.get_node_document(node_id).await?;
-            doc.apply_update(update).map_err(StoreError::from)?;
+            doc.apply_update(update).map_err(StoreError::from)?
+        };
+        if !changed {
+            return Ok(false);
         }
         self.dirty_content.insert(node_id);
         self.store_doc.touch_modified(node_id)
             .map_err(|e| StoreError::Crdt(e))?;
         self.store_doc_dirty = true;
-        Ok(())
+        Ok(true)
     }
 
     /// Get a node's persistent CRDT content document (loaded on demand, kept

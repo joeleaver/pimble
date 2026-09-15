@@ -5,7 +5,10 @@
 //! - Store management
 //! - Search coordination
 
+pub mod auth;
+pub mod credentials;
 pub mod error;
+mod fs_util;
 pub mod handler;
 pub mod server;
 pub mod sync_link;

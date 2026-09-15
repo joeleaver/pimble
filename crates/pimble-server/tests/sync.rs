@@ -37,7 +37,7 @@ where
 /// Start a `PimbleServer` bound to an OS-assigned loopback port and return
 /// it plus a `PimbleClient` already connected to it.
 async fn start_server() -> (PimbleServer, PimbleClient) {
-    let mut server = PimbleServer::with_config(ServerConfig { addr: "127.0.0.1:0".parse().unwrap() });
+    let mut server = PimbleServer::with_config(ServerConfig { addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() });
     server.start().await.expect("server starts");
     let client = PimbleClient::connect(format!("http://{}", server.addr())).await.expect("client connects");
     (server, client)

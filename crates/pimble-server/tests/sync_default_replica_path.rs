@@ -27,13 +27,13 @@ async fn add_remote_store_with_no_path_uses_the_default_replica_directory() {
         std::env::set_var("XDG_DATA_HOME", fake_data_home.path());
     }
 
-    let mut server_b = PimbleServer::with_config(ServerConfig { addr: "127.0.0.1:0".parse().unwrap() });
+    let mut server_b = PimbleServer::with_config(ServerConfig { addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() });
     server_b.start().await.expect("server B starts");
     let client_b = PimbleClient::connect(format!("http://{}", server_b.addr())).await.unwrap();
     let b_dir = tempfile::tempdir().unwrap();
     let (store_id, _root_id) = client_b.create_store(b_dir.path().join("b.pimble"), "B").await.unwrap();
 
-    let mut server_a = PimbleServer::with_config(ServerConfig { addr: "127.0.0.1:0".parse().unwrap() });
+    let mut server_a = PimbleServer::with_config(ServerConfig { addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() });
     server_a.start().await.expect("server A starts");
     let client_a = PimbleClient::connect(format!("http://{}", server_a.addr())).await.unwrap();
 

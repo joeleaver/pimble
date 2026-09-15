@@ -1,6 +1,7 @@
 //! Server startup and management
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use jsonrpsee::server::{Server, ServerHandle};
@@ -17,12 +18,25 @@ use crate::Result;
 pub struct ServerConfig {
     /// Address to bind to
     pub addr: SocketAddr,
+    /// Required credential for every JSON-RPC request (docs/
+    /// HARDENING_CONTRACT.md decisions 1-2): `Authorization: Bearer
+    /// <token>` or `X-Api-Key: <token>`, checked at the HTTP edge before any
+    /// request reaches the store. `None` means no token is required, which
+    /// `start()` only allows on a loopback address — the app's embedded
+    /// server runs this way.
+    pub auth_token: Option<String>,
+    /// Where saved per-remote credentials live (decision 4). `None` uses
+    /// [`crate::credentials::default_credentials_path`]; tests set this to a
+    /// temp path so they never touch the real config directory.
+    pub credentials_path: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             addr: "127.0.0.1:7462".parse().unwrap(),
+            auth_token: None,
+            credentials_path: None,
         }
     }
 }
@@ -61,6 +75,11 @@ impl PimbleServer {
 
     /// Start the server.
     ///
+    /// Refuses to bind a non-loopback address without `config.auth_token`
+    /// (docs/history/HARDENING_CONTRACT.md decision 2): an open port reachable from
+    /// outside this machine with no credential check is never allowed, even
+    /// by a caller who forgot to configure one.
+    ///
     /// Before accepting any RPC (in particular, before any `openStore` can
     /// reach [`RpcHandler`]), warms up the semantic search embedding model
     /// once — see [`warm_up_embedding_model`]. This is what turns "two
@@ -68,7 +87,34 @@ impl PimbleServer {
     /// race to download the same model" into "one download, serially, before
     /// any store exists to race over."
     pub async fn start(&mut self) -> Result<()> {
+        // An empty or whitespace-only token is never valid: treating it as
+        // "no token configured" would silently disable the non-loopback
+        // refusal below, and treating it literally would make
+        // `AuthMiddleware` admit `Authorization: Bearer ` (nothing after
+        // it) and an empty `X-Api-Key`.
+        if let Some(token) = &self.config.auth_token {
+            if token.trim().is_empty() {
+                return Err(crate::ServerError::Server(
+                    "refusing to start with an empty auth_token; pass None for no token, or a real one".to_string(),
+                ));
+            }
+        }
+
+        if !self.config.addr.ip().is_loopback() && self.config.auth_token.is_none() {
+            return Err(crate::ServerError::Server(format!(
+                "refusing to bind {} (not a loopback address) without an auth token; \
+                 pass ServerConfig::auth_token or start with a token file (pimble-cli server --token-file)",
+                self.config.addr
+            )));
+        }
+
+        // The HTTP-edge auth layer (decisions 1-2), run on every request
+        // before it reaches the JSON-RPC dispatch — including the WebSocket
+        // upgrade handshake.
+        let http_middleware = tower::ServiceBuilder::new().layer(crate::auth::AuthLayer::new(self.config.auth_token.clone()));
+
         let server = Server::builder()
+            .set_http_middleware(http_middleware)
             .build(&self.config.addr)
             .await
             .map_err(|e| crate::ServerError::Server(e.to_string()))?;
@@ -81,7 +127,8 @@ impl PimbleServer {
 
         let semantic_available = warm_up_embedding_model().await;
 
-        let handler = RpcHandler::with_semantic_available(Arc::clone(&self.store_manager), semantic_available);
+        let credentials_path = self.config.credentials_path.clone().unwrap_or_else(crate::credentials::default_credentials_path);
+        let handler = RpcHandler::with_credentials_path(Arc::clone(&self.store_manager), semantic_available, credentials_path);
         let methods = handler.into_rpc();
 
         info!("Starting Pimble server on {}", local_addr);
@@ -189,15 +236,39 @@ async fn warm_up_embedding_model() -> bool {
     }
 }
 
+/// Resolve on the first `SIGINT` (Ctrl+C) or, on Unix, `SIGTERM` —
+/// whichever arrives first (docs/history/HARDENING_CONTRACT.md decision 13). A
+/// container or `systemd stop` sends `SIGTERM`, not `SIGINT`; without this a
+/// headless server killed that way skips its flush instead of stopping
+/// cleanly.
+pub async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(sigterm) => sigterm,
+            Err(e) => {
+                tracing::warn!("Could not install a SIGTERM handler ({}); only SIGINT will stop this server", e);
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 /// Start a server and run it until shutdown
 pub async fn run_server(config: ServerConfig) -> Result<()> {
     let mut server = PimbleServer::with_config(config);
     server.start().await?;
 
-    // Wait for Ctrl+C
-    tokio::signal::ctrl_c()
-        .await
-        .map_err(|e| crate::ServerError::Io(e))?;
+    wait_for_shutdown_signal().await;
 
     info!("Shutting down...");
     server.stop().await?;

@@ -4,6 +4,7 @@
 //! (store open/close, children loaded, node moved) bump `tree_structure_version`.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 
 use pimble_core::{NodeId, Store, StoreId};
 use rinch::prelude::*;
@@ -54,18 +55,19 @@ fn register_opened_store(store: AppStore, tree_state: UseTreeReturn, opened_stor
     store.bump_tree_structure();
 }
 
-/// A structural change was reported on `changed_store`'s `storeChanged`
-/// subscription. The notification names the node, not its parent, so
-/// refetch every loaded children list of that store, plus every mount node
-/// (in any store) whose source is that store and whose children are loaded
-/// (decision 6: no new server-side fan-out for mounts — the client does this
-/// itself). Each answer arrives as `ChildrenLoaded`.
-fn refetch_loaded_children(store: AppStore, changed_store: StoreId) {
-    for (sid, nid) in store.loaded_parents_in(changed_store) {
-        store.send(BackendCommand::GetChildren { store_id: sid, node_id: nid });
+/// Exact refetch (docs/history/HARDENING_CONTRACT.md "B: app"): refetch
+/// `(changed_store, parent_id)`'s children list if it is loaded, plus every
+/// mount (in any store) whose `mount_ref` source is exactly that pair and
+/// whose own children are loaded (decision 6 of SYNC_CONTRACT: no new
+/// server-side fan-out for mounts — the client does this itself). Each
+/// answer arrives as `ChildrenLoaded`. Used for every structural
+/// notification kind, since each one now names every parent it touched.
+fn refetch_parent_children(store: AppStore, changed_store: StoreId, parent_id: NodeId) {
+    if store.has_children_loaded(changed_store, parent_id) {
+        store.send(BackendCommand::GetChildren { store_id: changed_store, node_id: parent_id });
     }
-    for (mount_store, mount_node) in store.mounts_sourced_from(changed_store) {
-        if mount_store != changed_store && store.has_children_loaded(mount_store, mount_node) {
+    for (mount_store, mount_node) in store.mounts_sourced_from_node(changed_store, parent_id) {
+        if store.has_children_loaded(mount_store, mount_node) {
             store.send(BackendCommand::GetChildren { store_id: mount_store, node_id: mount_node });
         }
     }
@@ -165,6 +167,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 } else if untracked(|| store.link_modal_pending.get()) {
                     store.link_modal_pending.set(false);
                     store.link_modal_error.set(message.clone());
+                } else if untracked(|| store.remove_replica_modal_pending.get()) {
+                    store.remove_replica_modal_pending.set(false);
+                    store.remove_replica_modal_error.set(message.clone());
                 } else {
                     store.connection.set(ConnectionState::Error(message.clone()));
                     store.connection_status.set(format!("Error: {}", message));
@@ -421,19 +426,10 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     });
                 }
 
-                // Clean up per-entity signals
-                store.remove_node(*store_id, *node_id);
-
-                // Clear selection if the deleted node was selected
-                if let Some(selected_id) = store.selected_id.get() {
-                    if let Some((sel_store_id, Some(sel_node_id))) = parse_tree_value(&selected_id) {
-                        if sel_store_id == *store_id && sel_node_id == *node_id {
-                            store.selected_id.set(None);
-                            store.node_title.set(String::new());
-                            store.show_editor.set(false);
-                        }
-                    }
-                }
+                // The server deletes the whole subtree (item 10) — drop every
+                // cached descendant too, and clear the selection if it was
+                // anywhere inside.
+                store.remove_subtree(*store_id, *node_id);
 
                 // Structural change
                 store.bump_tree_structure();
@@ -480,6 +476,20 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // Data-only: updates per-mount signal, NO tree rebuild.
                 // The mount Effect on that node fires and updates icon opacity + label suffix.
                 store.set_mount_state(*store_id, *node_id, state.clone(), mount_ref.clone());
+
+                // The mount's source store may be one the app doesn't know
+                // about yet — e.g. `getMountState` filled in `source_path`
+                // server-side ahead of anything else discovering it (item 8).
+                // Only worth a `ListStores` when the server actually has it
+                // open (`Live`); `Unavailable`/`Cached`/`Connecting` mean
+                // there is nothing to discover yet.
+                if matches!(state, pimble_core::MountState::Live) {
+                    let source_known = untracked(|| store.store_ids.with(|ids| ids.contains(&mount_ref.source_store)));
+                    if !source_known {
+                        tracing::info!("Unknown mount source store {:?}; requesting store list", mount_ref.source_store);
+                        store.send(BackendCommand::ListStores);
+                    }
+                }
             }
 
             BackendEvent::RemoteStoreChange { store_id, change_kind, source_client_id } => {
@@ -493,22 +503,26 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 tracing::info!("Remote store change: {:?} - {:?}", store_id, change_kind);
                 use pimble_rpc::StoreChangeKind;
                 match change_kind {
-                    StoreChangeKind::NodeCreated { node_id, .. }
-                    | StoreChangeKind::NodeDeleted { node_id, .. }
-                    | StoreChangeKind::NodeMoved { node_id, .. } => {
-                        refetch_loaded_children(store, *store_id);
-                        // If deleted node was selected, clear selection
-                        if matches!(change_kind, StoreChangeKind::NodeDeleted { .. }) {
-                            if let Some(selected_id) = store.selected_id.get() {
-                                if let Some((sel_sid, Some(sel_nid))) = parse_tree_value(&selected_id) {
-                                    if sel_sid == *store_id && sel_nid == *node_id {
-                                        store.selected_id.set(None);
-                                        store.node_title.set(String::new());
-                                        store.show_editor.set(false);
-                                    }
-                                }
-                            }
+                    StoreChangeKind::NodeCreated { parent_id, .. } => {
+                        refetch_parent_children(store, *store_id, *parent_id);
+                    }
+                    StoreChangeKind::NodeDeleted { node_id, parent_id } => {
+                        // Instant feedback ahead of the refetch below: drop
+                        // the node from its parent's loaded list right away.
+                        if let Some(parent_sig) = store.get_children_signal(*store_id, *parent_id) {
+                            parent_sig.update(|children| {
+                                children.retain(|&pair| pair != (*store_id, *node_id));
+                            });
                         }
+                        // The server deletes the whole subtree (item 10); a
+                        // notification names only its root.
+                        store.remove_subtree(*store_id, *node_id);
+                        refetch_parent_children(store, *store_id, *parent_id);
+                        store.bump_tree_structure();
+                    }
+                    StoreChangeKind::NodeMoved { old_parent_id, new_parent_id, .. } => {
+                        refetch_parent_children(store, *store_id, *old_parent_id);
+                        refetch_parent_children(store, *store_id, *new_parent_id);
                     }
                     StoreChangeKind::MetadataUpdated { node_id } => {
                         store.send(BackendCommand::GetNode {
@@ -531,8 +545,25 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                             });
                         }
                     }
-                    StoreChangeKind::TreeStructure { .. } => {
-                        refetch_loaded_children(store, *store_id);
+                    StoreChangeKind::TreeStructure { node_ids } => {
+                        // Every listed id's own loaded children (it may be a
+                        // parent whose list changed) and its cached parent's
+                        // loaded children (it may have moved in or out of a
+                        // list) — `refetch_parent_children` covers mounts
+                        // sourced from each pair too. Collect the distinct
+                        // parent ids first: a full reconcile can list many
+                        // children of the same folder, and each parent must
+                        // be refetched once, not once per listed child.
+                        let mut parents: HashSet<NodeId> = HashSet::new();
+                        for &id in node_ids {
+                            parents.insert(id);
+                            if let Some(parent_id) = store.cached_parent_id(*store_id, id) {
+                                parents.insert(parent_id);
+                            }
+                        }
+                        for parent_id in parents {
+                            refetch_parent_children(store, *store_id, parent_id);
+                        }
                     }
                     StoreChangeKind::SyncStateChanged { state } => {
                         tracing::info!("Sync state of {:?}: {:?}", store_id, state);
@@ -617,6 +648,22 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
 
                 if matches!(state, pimble_core::SyncState::Synced { .. }) {
                     refetch_root_if_empty(store, *store_id);
+                }
+            }
+
+            BackendEvent::ReplicaRemoved { store_id } => {
+                tracing::info!("Replica removed: {:?}", store_id);
+
+                // Same tree/state-file cleanup as closing a store.
+                store.remove_store(*store_id);
+                save_app_state_file(&store.all_store_local_paths());
+                store.bump_tree_structure();
+
+                // The confirmation modal closes on success.
+                if untracked(|| store.remove_replica_modal_store.get()) == Some(*store_id) {
+                    store.remove_replica_modal_pending.set(false);
+                    store.remove_replica_modal_store.set(None);
+                    store.remove_replica_modal_error.set(String::new());
                 }
             }
         }

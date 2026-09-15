@@ -25,7 +25,22 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 base64 = { workspace = true }
+url = { workspace = true }
 dirs = "6"
+# HTTP-edge auth middleware (docs/history/HARDENING_CONTRACT.md decision 1), wired
+# onto jsonrpsee via `Server::builder().set_http_middleware(...)`. Pinned to
+# the same major version jsonrpsee-server 0.24 depends on internally: the
+# `tower::ServiceBuilder<T>` that function takes must be the same `tower`
+# crate, or the types don't unify.
+tower = { version = "0.4", features = ["util"] }
+http = "1"
+http-body = "1"
+bytes = "1"
+rand = "0.9"
+# Constant-time comparison for the bearer/API-key check (decision 1); already
+# in the dependency tree transitively (a crypto crate rhypedb-embed pulls in),
+# declared directly here so pimble-server can use it.
+subtle = "2.6"
 
 [dev-dependencies]
 tempfile = "3"

@@ -155,9 +155,10 @@ impl ContentDoc {
     pub fn load(bytes: &[u8]) -> Result<Self>;
     pub fn from_plain_text(text: &str) -> Result<Self>;
     pub fn save(&self) -> Vec<u8>;
-    pub fn apply_update(&mut self, update: &[u8]) -> Result<()>;
+    pub fn apply_update(&mut self, update: &[u8]) -> Result<bool>; // false: nothing new
     pub fn state_vector(&self) -> Vec<u8>;
     pub fn diff_since(&self, state_vector: &[u8]) -> Result<Vec<u8>>;
+    pub fn diff_if_peer_lacks_it(&self, peer_sv: &[u8], peer_diff: &[u8]) -> Result<Option<Vec<u8>>>;
     pub fn text(&self) -> String; // flat-text projection for tree labels/search
 }
 ```
@@ -177,9 +178,10 @@ impl StoreDocument {
     pub fn new(name: &str, root_node_id: NodeId) -> Result<Self>;
     pub fn load(bytes: &[u8]) -> Result<Self>;
     pub fn save(&self) -> Vec<u8>;
-    pub fn apply_update(&mut self, update: &[u8]) -> Result<()>;
+    pub fn apply_update(&mut self, update: &[u8]) -> Result<StoreUpdateEffect>; // changed + touched ids
     pub fn state_vector(&self) -> Vec<u8>;
     pub fn diff_since(&self, state_vector: &[u8]) -> Result<Vec<u8>>;
+    pub fn diff_if_peer_lacks_it(&self, peer_sv: &[u8], peer_diff: &[u8]) -> Result<Option<Vec<u8>>>;
 
     // Tree and metadata mutation/read
     pub fn add_node(&mut self, id: NodeId, parent_id: Option<NodeId>, node_type: &str, title: &str) -> Result<()>;
@@ -191,6 +193,7 @@ impl StoreDocument {
     pub fn get_node_info(&self, id: NodeId) -> Result<NodeInfo>;
     pub fn get_children(&self, id: NodeId) -> Result<Vec<NodeId>>;
     pub fn validate_tree(&self) -> Result<Vec<TreeIssue>>;
+    pub fn repair(&mut self) -> Result<Option<TreeRepair>>; // exactly what validate_tree reports
 }
 ```
 
@@ -602,10 +605,22 @@ a yrs merge.
   `ContentUpdated` notifications carry the edit's delta bytes, so a store-level subscriber
   gets content changes without subscribing per node.
 - **Reconcile** is `(diff, remote_sv) = remote.syncStoreDocument(local_sv)`; apply `diff`
-  locally if non-empty; push `local.diff_since(remote_sv)` back if non-empty — the same shape
-  for a node's content via `syncNodeContent`/`applyEdit`. A full reconcile does the store
-  document first, then every node id, so both sides agree on the node set before per-node
-  reconciles start.
+  locally; push `local.diff_if_peer_lacks_it(remote_sv, diff)` back when it is `Some` — the
+  same shape for node content via `syncNodeContents` (up to 100 nodes per request) and
+  `applyEdit`. A yrs diff is never empty (`[0, 0]` plus the sender's whole delete set), so
+  "does the peer lack anything" compares our structs beyond its state vector and our delete
+  set against the delete set its diff carried; and a merge that changes nothing is a no-op
+  on the server (no `modified_at`, flush, notification or re-index). A full reconcile does
+  the store document first, then node content in batches, so both sides agree on the node
+  set before content reconciles start.
+- **Tree repair.** Concurrent moves on two replicas can merge into a child listed under two
+  parents, a cycle, or an orphan. After every changing `applyStoreUpdate`, and when a store
+  opens, the server runs `StoreDocument::repair`, which is deterministic in the merged state
+  (so replicas repairing the same state make the same edits) and broadcasts the repair as
+  `TreeStructure { node_ids }` with `source_client_id: None`, so links forward it.
+  Structural notifications name every parent they change (`NodeCreated`/`NodeDeleted`
+  `parent_id`, `NodeMoved` both parents, `TreeStructure` the touched entries), and deleting
+  a node deletes its subtree.
 - **Lifecycle**: connect, full reconcile (`Syncing`), subscribe, process (`Synced { last_sync
   }`); any error drops the connection and retries with backoff (1s doubling to 30s,
   `Offline` meanwhile). The link is persisted as `<store>/sync.json`; `openStore` starts it,
@@ -613,8 +628,32 @@ a yrs merge.
 - **`addRemoteStore`** creates an empty replica (never `StoreDocument::new` — two independent
   roots for the same id would merge into duplicated children) plus a link, and waits briefly
   for the first reconcile before answering.
-- Out of scope: partial (subtree-only) replication, remote mounts, server-side auth
-  enforcement (the client sends the header; nothing checks it), TLS.
+- **`removeReplica`** (`docs/history/HARDENING_CONTRACT.md` decision 6) removes a replica this
+  server created with `addRemoteStore`: refused for a store whose directory isn't under
+  `<data dir>/pimble/replicas/` (`Store.is_replica`), and refused for a replica whose link
+  isn't `Synced` unless `force` (its unsynced local changes are lost). It stops the link,
+  closes the store the same way `closeStore` does, then deletes the directory. Saved
+  credentials for that remote are untouched — other replicas may still need them.
+- Out of scope: partial (subtree-only) replication, remote mounts, TLS.
+
+### Auth (`docs/history/HARDENING_CONTRACT.md` decisions 1-5)
+
+Two checks run at the HTTP edge, before any request reaches JSON-RPC dispatch (a tower
+layer on the jsonrpsee server, covering the WebSocket upgrade too): a request carrying an
+`Origin` header is always refused with `403` (browsers always send one on a WebSocket
+handshake; no legitimate Pimble client ever does), and, when the server has a token, a
+request must carry it as `Authorization: Bearer <token>` or `X-Api-Key: <token>`
+(constant-time compared) or is refused with `401`. A server refuses to bind a non-loopback
+address without a token. The app's embedded server stays on `127.0.0.1:7462` with no
+token — it trusts local processes the way any loopback-only service does, the same trust
+boundary as the OS's other local sockets.
+
+Credentials this server uses to reach a remote (a sync link, `addRemoteStore`,
+`setStoreSync`, `listRemoteStores`) live in one file per user, keyed by the remote's
+origin, never in a store directory and never echoed back in an RPC response — a store's
+`sync.json` always records `auth: none`, and `getStoreSync`/`setStoreSync` never return a
+credential. The app never connects to a remote itself; it always asks its own server to
+via `listRemoteStores`.
 
 ### Phase 6: Search & Indexing
 1. `pimble-search`: index and query engine (see `docs/RESTART_PLAN.md` §5)

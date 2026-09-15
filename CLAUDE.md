@@ -92,7 +92,7 @@ A local store can be a replica of the same store (same `StoreId`) on another Pim
 server. One `SyncLink` per linked store lives in the local server
 (`pimble-server/src/sync_link.rs`), persisted as `<store>/sync.json` and restarted by
 `openStore`. It reconciles with the stateless primitives (`syncStoreDocument` /
-`syncNodeContent`: state vector in, diff out; then push the local diff back) and then
+`syncNodeContents`: state vector in, diff out; then push back only what the remote lacks) and then
 shuttles live updates both ways: remote `storeChanged` notifications carry the yrs bytes
 (`TreeStructure` from `applyStoreUpdate`, `ContentUpdated` from `applyEdit`) and are
 applied through the handler's own `apply_edit`/`apply_store_update` with
@@ -102,10 +102,40 @@ stops echo storms across chains of servers). `addRemoteStore` creates an empty r
 (never `StoreDocument::new`: two roots for one id would merge into duplicated children) in
 `<data dir>/pimble/replicas/<store id>.pimble` and links it; `setStoreSync` links or
 unlinks an existing store. A store already open on this server is refused as a replica, and
-a store cannot be linked to the server it lives on. Auth headers are sent, never checked.
+a store cannot be linked to the server it lives on. `removeReplica` stops, closes and
+deletes a replica (only inside the replicas directory; not while unsynced unless `force`).
 Remote mounts, partial replication and TLS are not done. Contract:
-`docs/history/SYNC_CONTRACT.md`; CLI: `server --addr --open`, `add-remote-store`,
-`link-store`, `unlink-store`, `sync-state`, `remote-stores`, `PIMBLE_SERVER`.
+`docs/history/SYNC_CONTRACT.md`; CLI: `server --addr --open --token-file`, `token`,
+`add-remote-store`, `link-store`, `unlink-store`, `sync-state`, `remote-stores`,
+`remove-replica`, `move-node`, `delete-node`, `PIMBLE_SERVER`, `PIMBLE_TOKEN`.
+
+### Hardening (done 2026-09-14)
+
+Contract: `docs/history/HARDENING_CONTRACT.md`.
+
+- **Auth at the HTTP edge** (`pimble-server/src/auth.rs`): any request with an `Origin`
+  header is refused (403; browsers can open WebSockets to loopback), and a server with a
+  token requires `Authorization: Bearer` or `X-Api-Key` (401). A server without a token
+  refuses to bind beyond loopback; the app's embedded server is tokenless on
+  `127.0.0.1:7462`. Server token file: `<config dir>/pimble/server-token`.
+- **Credentials** a server uses for remotes live in `<config dir>/pimble/credentials.json`
+  (0600, keyed by origin), saved after a connection with them succeeds. Never in
+  `sync.json` (always `auth: none`), never in an RPC response. Clients never connect to a
+  remote: `listRemoteStores` goes through the local server.
+- **No-op updates change nothing.** A yrs diff is never empty (`[0, 0]` plus the whole delete
+  set), so `is_empty()` checks on diffs are always wrong. `ContentDoc`/`StoreDocument`
+  report whether a merge changed anything, and `diff_if_peer_lacks_it` decides whether a
+  reconcile pushes. A reconnect between synced servers sends no edits.
+- **Tree repair** (`StoreDocument::repair`, deterministic, surgical list edits) runs at open
+  and after every changing `applyStoreUpdate`; the result is broadcast as `TreeStructure`
+  with `source_client_id: None`. `validate_tree` reports exactly what repair fixes.
+- **Notifications name parents** (`NodeCreated`/`NodeDeleted { parent_id }`, `NodeMoved {
+  old_parent_id, new_parent_id }`, `TreeStructure { node_ids }`); the app refetches only
+  those lists. Deleting a node deletes its subtree; the root cannot be deleted.
+- **`closeStore` releases the search index** before answering (the old flaky reopen test).
+- rinch's Tree re-renders a row only when its `TreeNodeData` changes: anything a row
+  snapshots at render time (context-menu `disabled` states) must be reflected in that data
+  (the store row's unrendered label carries the link state).
 
 ### Collaboration shape (keep these invariants)
 

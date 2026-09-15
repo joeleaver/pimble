@@ -315,6 +315,8 @@ pub fn run() {
             store.connect_modal_selected.set(String::new());
             store.connect_modal_error.set(String::new());
             store.connect_modal_busy.set(false);
+            store.connect_modal_token.set(String::new());
+            store.connect_modal_token_visible.set(false);
             if untracked(|| store.connect_modal_url.get()).is_empty() {
                 store.connect_modal_url.set("http://".to_string());
             }
@@ -621,6 +623,14 @@ pub fn run() {
                 .map(|sig| untracked(|| sig.with(|(remote, _)| remote.is_some())))
                 .unwrap_or(false);
 
+            // Same static-snapshot-rebuilt-on-structural-rebuild pattern as
+            // `is_linked_now` (rinch #714 — see the `no_mount_source` note
+            // further down): whether this store row is a replica, for
+            // "Remove Replica..."'s `disabled` value.
+            let is_replica_now = store_sig
+                .map(|sig| untracked(|| sig.with(|s| s.is_replica)))
+                .unwrap_or(false);
+
             // Choose icon (static — changes only on structural rebuild). Folders
             // are folders even when empty; documents are documents even with
             // children, so the icon follows node_type, not has_children.
@@ -750,6 +760,8 @@ pub fn run() {
                     if let Some((s_id, _)) = parse_tree_value(&nv) {
                         store.link_modal_store.set(Some(s_id));
                         store.link_modal_url.set(String::new());
+                        store.link_modal_token.set(String::new());
+                        store.link_modal_token_visible.set(false);
                         store.link_modal_error.set(String::new());
                     }
                 }
@@ -759,6 +771,16 @@ pub fn run() {
                 move || {
                     if let Some((s_id, _)) = parse_tree_value(&nv) {
                         store.send(BackendCommand::SetStoreSync { store_id: s_id, remote: None });
+                    }
+                }
+            };
+            let on_remove_replica = {
+                let nv = nv_ctx.clone();
+                move || {
+                    if let Some((s_id, _)) = parse_tree_value(&nv) {
+                        store.remove_replica_modal_store.set(Some(s_id));
+                        store.remove_replica_modal_error.set(String::new());
+                        store.remove_replica_modal_pending.set(false);
                     }
                 }
             };
@@ -1042,6 +1064,12 @@ pub fn run() {
                                 disabled: !is_linked_now,
                                 onclick: on_unlink_from_remote,
                                 "Unlink from Remote"
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::Trash,
+                                disabled: !is_replica_now,
+                                onclick: on_remove_replica,
+                                "Remove Replica..."
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::X,
@@ -1387,15 +1415,25 @@ pub fn run() {
                         oninput: move |val: String| store.connect_modal_url.set(val),
                     }
 
+                    PasswordInput {
+                        label: "Token",
+                        placeholder: "Leave empty to use a saved token",
+                        value_fn: move || store.connect_modal_token.get(),
+                        oninput: move |val: String| store.connect_modal_token.set(val),
+                        visible_fn: move || store.connect_modal_token_visible.get(),
+                        ontoggle: move || store.connect_modal_token_visible.update(|v| *v = !*v),
+                    }
+
                     Button {
                         variant: "light",
                         size: "sm",
                         disabled: {|| store.connect_modal_busy.get()},
                         onclick: move || {
                             let url = untracked(|| store.connect_modal_url.get());
+                            let token = untracked(|| store.connect_modal_token.get());
                             store.connect_modal_busy.set(true);
                             store.connect_modal_error.set(String::new());
-                            store.send(BackendCommand::ListRemoteStores { url });
+                            store.send(BackendCommand::ListRemoteStores { url, token });
                         },
                         "List stores"
                     }
@@ -1424,10 +1462,11 @@ pub fn run() {
                             };
                             let remote_store_id = pimble_core::StoreId(remote_uuid);
                             let url = untracked(|| store.connect_modal_url.get());
+                            let token = untracked(|| store.connect_modal_token.get());
                             store.connect_modal_pending_add.set(true);
                             store.connect_modal_busy.set(true);
                             store.connect_modal_error.set(String::new());
-                            store.send(BackendCommand::AddRemoteStore { url, remote_store_id });
+                            store.send(BackendCommand::AddRemoteStore { url, remote_store_id, token });
                         },
                         "Add"
                     }
@@ -1464,6 +1503,15 @@ pub fn run() {
                         oninput: move |val: String| store.link_modal_url.set(val),
                     }
 
+                    PasswordInput {
+                        label: "Token",
+                        placeholder: "Leave empty to use a saved token",
+                        value_fn: move || store.link_modal_token.get(),
+                        oninput: move |val: String| store.link_modal_token.set(val),
+                        visible_fn: move || store.link_modal_token_visible.get(),
+                        ontoggle: move || store.link_modal_token_visible.update(|v| *v = !*v),
+                    }
+
                     Button {
                         variant: "filled",
                         size: "sm",
@@ -1475,11 +1523,17 @@ pub fn run() {
                                 store.link_modal_error.set("Invalid URL".to_string());
                                 return;
                             };
+                            let token = untracked(|| store.link_modal_token.get());
+                            let auth = if token.is_empty() {
+                                pimble_core::AuthMethod::None
+                            } else {
+                                pimble_core::AuthMethod::Bearer { token }
+                            };
                             store.link_modal_pending.set(true);
                             store.link_modal_error.set(String::new());
                             store.send(BackendCommand::SetStoreSync {
                                 store_id,
-                                remote: Some(pimble_core::RemoteEndpoint { url, auth: pimble_core::AuthMethod::None }),
+                                remote: Some(pimble_core::RemoteEndpoint { url, auth }),
                             });
                         },
                         "Link"
@@ -1489,6 +1543,91 @@ pub fn run() {
                         div {
                             style: "color: var(--rinch-color-red-6); font-size: 12px;",
                             {|| store.link_modal_error.get()}
+                        }
+                    }
+                }
+            }
+        };
+
+        // ── "Remove Replica..." confirmation modal (store root context
+        // menu) ──────────────────────────────────────────────────────────
+        // docs/history/HARDENING_CONTRACT.md "B: app". Names the store and its
+        // remote; when the link isn't `Synced`, warns before removing with
+        // `force`.
+        let remove_replica_modal = rsx! {
+            Modal {
+                opened_fn: move || store.remove_replica_modal_store.get().is_some(),
+                onclose: move || {
+                    store.remove_replica_modal_store.set(None);
+                    store.remove_replica_modal_error.set(String::new());
+                },
+                title: "Remove Replica",
+                size: "sm",
+
+                div {
+                    style: "display: flex; flex-direction: column; gap: 10px;",
+
+                    div {
+                        {|| {
+                            let Some(store_id) = store.remove_replica_modal_store.get() else {
+                                return String::new();
+                            };
+                            let name = store.get_store_signal(store_id)
+                                .map(|sig| sig.with(|s| s.name.clone()))
+                                .unwrap_or_default();
+                            let remote_url = store.get_sync_signal(store_id)
+                                .and_then(|sig| sig.with(|(remote, _)| {
+                                    remote.as_ref().map(|r| r.url.as_str().trim_end_matches('/').to_string())
+                                }));
+                            match remote_url {
+                                Some(url) => format!("Remove the local copy of \"{}\"? The store stays on {}.", name, url),
+                                None => format!("Remove the local copy of \"{}\"?", name),
+                            }
+                        }}
+                    }
+
+                    div {
+                        style: {
+                            move || {
+                                let unsynced = store.remove_replica_modal_store.get()
+                                    .and_then(|sid| store.get_sync_signal(sid))
+                                    .map(|sig| sig.with(|(_, state)| {
+                                        !matches!(state, pimble_core::SyncState::Synced { .. })
+                                    }))
+                                    .unwrap_or(false);
+                                if unsynced {
+                                    "color: var(--rinch-color-yellow-6); font-size: 12px;"
+                                } else {
+                                    "display: none;"
+                                }
+                            }
+                        },
+                        "This replica is not synced right now. Anything changed here since it last synced will be lost."
+                    }
+
+                    Button {
+                        variant: "filled",
+                        color: "red",
+                        size: "sm",
+                        disabled: {|| store.remove_replica_modal_pending.get()},
+                        onclick: move || {
+                            let Some(store_id) = untracked(|| store.remove_replica_modal_store.get()) else { return };
+                            let force = store.get_sync_signal(store_id)
+                                .map(|sig| untracked(|| sig.with(|(_, state)| {
+                                    !matches!(state, pimble_core::SyncState::Synced { .. })
+                                })))
+                                .unwrap_or(false);
+                            store.remove_replica_modal_pending.set(true);
+                            store.remove_replica_modal_error.set(String::new());
+                            store.send(BackendCommand::RemoveReplica { store_id, force });
+                        },
+                        "Remove"
+                    }
+
+                    if !store.remove_replica_modal_error.get().is_empty() {
+                        div {
+                            style: "color: var(--rinch-color-red-6); font-size: 12px;",
+                            {|| store.remove_replica_modal_error.get()}
                         }
                     }
                 }
@@ -1524,6 +1663,7 @@ pub fn run() {
 
                 {connect_modal}
                 {link_modal}
+                {remove_replica_modal}
 
                 // Outer wrapper — flex column fills the content area, pushes
                 // status bar to the very bottom.

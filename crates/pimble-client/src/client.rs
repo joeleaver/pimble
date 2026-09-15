@@ -28,6 +28,43 @@ pub struct PimbleClient {
     base_url: Url,
 }
 
+/// Turn a failed [`PimbleClient::connect_with_auth`] at `url` into the
+/// decision-5 wording (docs/history/HARDENING_CONTRACT.md): a rejected WebSocket
+/// handshake carries the HTTP status jsonrpsee's transport reported
+/// (`WsHandshakeError::Rejected { status_code }`, whose `Display` is
+/// "Connection rejected with status code: NNN" and survives unchanged
+/// through `Error::Transport`'s `#[error(transparent)]`), so this matches on
+/// that text rather than downcasting through several transport-crate error
+/// types this crate doesn't depend on directly. `401` (wrong or missing
+/// token) becomes "refused the credentials"; `403` (the edge's `Origin`
+/// check) becomes "refused the connection". Anything else keeps the
+/// original message.
+pub fn describe_connect_error(url: &Url, err: &ClientError) -> String {
+    let msg = err.to_string();
+    // `Url` always renders a bare host with a trailing `/`; people type and
+    // read server addresses without one.
+    let url = url.as_str().trim_end_matches('/');
+    if msg.contains("status code: 401") {
+        format!("{} refused the credentials", url)
+    } else if msg.contains("status code: 403") {
+        format!("{} refused the connection", url)
+    } else {
+        format!("Failed to connect to {}: {}", url, err)
+    }
+}
+
+/// A failed call as `ClientError::Rpc`. For an error the server returned,
+/// that is the server's own message: jsonrpsee renders the whole
+/// `ErrorObject { code, message, data }` otherwise, and that is what a user
+/// would read in the app. Transport and protocol failures keep their text
+/// (the app recognises a dead connection by it).
+fn rpc_error(e: jsonrpsee::core::client::Error) -> ClientError {
+    match e {
+        jsonrpsee::core::client::Error::Call(obj) => ClientError::Rpc(obj.message().to_string()),
+        other => ClientError::Rpc(other.to_string()),
+    }
+}
+
 impl PimbleClient {
     /// Connect to a Pimble server via WebSocket, sending no authentication.
     /// Equivalent to `connect_with_auth(url, &AuthMethod::None)`.
@@ -122,6 +159,21 @@ impl PimbleClient {
         &self.base_url
     }
 
+    /// Connect with `auth`, and on a `401`/`403` handshake rejection return
+    /// the decision-5 wording (docs/history/HARDENING_CONTRACT.md) naming `url`
+    /// instead of the raw transport error: "refused the credentials" for a
+    /// wrong or missing token, "refused the connection" for the edge's
+    /// `Origin` check. Any other failure keeps its own message. Used
+    /// wherever a server connects to a remote on a caller's behalf
+    /// (`addRemoteStore`, `setStoreSync`, `listRemoteStores`, a sync link) so
+    /// the error a client eventually sees always explains which of the two
+    /// happened.
+    pub async fn connect_with_auth_describing_errors(url: &Url, auth: &AuthMethod) -> Result<Self> {
+        Self::connect_with_auth(url.as_str(), auth)
+            .await
+            .map_err(|e| ClientError::Connection(describe_connect_error(url, &e)))
+    }
+
     // ========================================================================
     // Store Operations
     // ========================================================================
@@ -137,7 +189,7 @@ impl PimbleClient {
             .client
             .create_store(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok((response.store_id, response.root_node_id))
     }
@@ -152,7 +204,7 @@ impl PimbleClient {
             .client
             .open_store(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok(response.store)
     }
@@ -164,7 +216,7 @@ impl PimbleClient {
         self.client
             .close_store(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok(())
     }
@@ -175,7 +227,7 @@ impl PimbleClient {
             .client
             .list_stores()
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok(response.stores)
     }
@@ -192,7 +244,7 @@ impl PimbleClient {
             .client
             .get_node(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok(response.node)
     }
@@ -205,7 +257,7 @@ impl PimbleClient {
             .client
             .get_nodes(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok(response.nodes)
     }
@@ -229,7 +281,7 @@ impl PimbleClient {
             .client
             .create_node(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok(response.node_id)
     }
@@ -250,7 +302,7 @@ impl PimbleClient {
         self.client
             .update_node_metadata(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok(())
     }
@@ -276,7 +328,7 @@ impl PimbleClient {
         self.client
             .update_node_content(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok(())
     }
@@ -288,7 +340,7 @@ impl PimbleClient {
         self.client
             .delete_node(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok(())
     }
@@ -311,7 +363,7 @@ impl PimbleClient {
         self.client
             .move_node(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok(())
     }
@@ -326,7 +378,7 @@ impl PimbleClient {
             .client
             .get_children(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok((response.store_id, response.children))
     }
@@ -356,7 +408,7 @@ impl PimbleClient {
             .client
             .create_mount(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok((response.node_id, response.mount_ref))
     }
@@ -373,7 +425,7 @@ impl PimbleClient {
             .client
             .get_mount_state(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok((response.state, response.mount_ref))
     }
@@ -401,7 +453,7 @@ impl PimbleClient {
             .client
             .add_remote_store(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
         Ok(response.store)
     }
 
@@ -417,7 +469,7 @@ impl PimbleClient {
             .client
             .set_store_sync(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
         Ok((response.remote, response.state))
     }
 
@@ -428,7 +480,7 @@ impl PimbleClient {
             .client
             .get_store_sync(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
         Ok((response.remote, response.state))
     }
 
@@ -441,7 +493,7 @@ impl PimbleClient {
             .client
             .list_remote_stores(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
         Ok(response.stores)
     }
 
@@ -453,7 +505,7 @@ impl PimbleClient {
         self.client
             .remove_replica(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
         Ok(())
     }
 
@@ -471,7 +523,7 @@ impl PimbleClient {
             .client
             .load_workspace(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok(response.workspace)
     }
@@ -486,7 +538,7 @@ impl PimbleClient {
         self.client
             .save_workspace(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok(())
     }
@@ -506,7 +558,7 @@ impl PimbleClient {
             .client
             .create_workspace(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok(response.workspace)
     }
@@ -533,7 +585,7 @@ impl PimbleClient {
         self.client
             .apply_edit(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok(())
     }
@@ -561,7 +613,7 @@ impl PimbleClient {
             .client
             .sync_store_document(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         let diff = base64::engine::general_purpose::STANDARD
             .decode(&response.diff)
@@ -595,7 +647,7 @@ impl PimbleClient {
         self.client
             .apply_store_update(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok(())
     }
@@ -643,7 +695,7 @@ impl PimbleClient {
                 .client
                 .sync_node_contents(request)
                 .await
-                .map_err(|e| ClientError::Rpc(e.to_string()))?;
+                .map_err(rpc_error)?;
 
             for entry in response.nodes {
                 let diff = b64
@@ -672,7 +724,7 @@ impl PimbleClient {
         use jsonrpsee::core::params::ArrayParams;
 
         let mut params = ArrayParams::new();
-        params.insert(store_id).map_err(|e| ClientError::Rpc(e.to_string()))?;
+        params.insert(store_id)?;
 
         let sub = self.client
             .subscribe::<StoreChangedNotification, _>(
@@ -681,7 +733,7 @@ impl PimbleClient {
                 "pimble_unsubscribeStoreChanges",
             )
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok(sub)
     }
@@ -696,8 +748,8 @@ impl PimbleClient {
         use jsonrpsee::core::params::ArrayParams;
 
         let mut params = ArrayParams::new();
-        params.insert(store_id).map_err(|e| ClientError::Rpc(e.to_string()))?;
-        params.insert(node_id).map_err(|e| ClientError::Rpc(e.to_string()))?;
+        params.insert(store_id)?;
+        params.insert(node_id)?;
 
         let sub = self.client
             .subscribe::<NodeContentChangedNotification, _>(
@@ -706,7 +758,7 @@ impl PimbleClient {
                 "pimble_unsubscribeNodeChanges",
             )
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok(sub)
     }
@@ -734,7 +786,7 @@ impl PimbleClient {
             .client
             .search(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok(response.results)
     }
@@ -749,7 +801,7 @@ impl PimbleClient {
             .client
             .rebuild_index(request)
             .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            .map_err(rpc_error)?;
 
         Ok(response.indexed)
     }

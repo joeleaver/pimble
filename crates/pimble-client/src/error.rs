@@ -7,7 +7,9 @@ pub enum ClientError {
     #[error("Connection error: {0}")]
     Connection(String),
 
-    #[error("RPC error: {0}")]
+    /// A call the server answered with an error (its message as is), or a
+    /// transport failure during a call.
+    #[error("{0}")]
     Rpc(String),
 
     #[error("Not connected")]

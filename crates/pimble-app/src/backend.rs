@@ -77,18 +77,23 @@ pub enum BackendCommand {
     Search { query: String, stores: Vec<StoreId>, limit: usize },
     RebuildIndex { store_id: StoreId },
 
-    // Replica sync (docs/SYNC_CONTRACT.md "B: app side") — a temporary
-    // connection to a remote for browsing its open stores, distinct from any
-    // link a store may already have.
-    ListRemoteStores { url: String },
+    // Replica sync (docs/history/HARDENING_CONTRACT.md "B: app") — routed through
+    // this server's own `listRemoteStores`/`addRemoteStore` RPCs, never a
+    // direct connection to the remote from the app itself (decision 5).
+    /// Empty `token` means "use whatever this server already saved for that
+    /// remote's origin" (decision 4); non-empty is sent as `AuthMethod::Bearer`.
+    ListRemoteStores { url: String, token: String },
     /// Create a local replica of `remote_store_id` from `remote`, linked to
-    /// it. No path: the server puts it in its own data directory.
-    /// `AuthMethod::None` until the app has a way to collect credentials.
-    AddRemoteStore { url: String, remote_store_id: StoreId },
+    /// it. No path: the server puts it in its own data directory. Same
+    /// `token` semantics as `ListRemoteStores`.
+    AddRemoteStore { url: String, remote_store_id: StoreId, token: String },
     /// Link a local store to a remote (`Some`) or unlink it (`None`).
     SetStoreSync { store_id: StoreId, remote: Option<RemoteEndpoint> },
     /// Ask for a store's current sync link and state.
     GetStoreSync { store_id: StoreId },
+    /// Stop a replica's sync link, close it, and delete its directory.
+    /// `force` removes one whose link is not `Synced` (decision 6).
+    RemoveReplica { store_id: StoreId, force: bool },
 }
 
 /// Events sent from backend to UI
@@ -160,6 +165,9 @@ pub enum BackendEvent {
     /// `GetStoreSync`, or a live `SyncStateChanged` notification (which
     /// carries only the state — the event handler keeps the known `remote`).
     StoreSyncChanged { store_id: StoreId, remote: Option<RemoteEndpoint>, state: SyncState },
+    /// Answer to `RemoveReplica`: the replica is gone. Handled exactly like
+    /// `StoreClosed` (tree + saved open-store list cleanup).
+    ReplicaRemoved { store_id: StoreId },
 }
 
 /// Handle to communicate with the backend
@@ -732,28 +740,31 @@ async fn process_command(
             }
         }
 
-        BackendCommand::ListRemoteStores { url } => {
-            // A temporary connection to the remote, distinct from `client`
-            // (our connection to the local embedded/shared server) and from
-            // any sync link a store may already have.
-            match PimbleClient::connect(&url).await {
-                Ok(remote_client) => match remote_client.list_stores().await {
-                    Ok(stores) => Some(BackendEvent::RemoteStoresListed { url, result: Ok(stores) }),
-                    Err(e) => Some(BackendEvent::RemoteStoresListed { url, result: Err(e.to_string()) }),
-                },
+        BackendCommand::ListRemoteStores { url, token } => {
+            // Through this server's own `listRemoteStores` (decision 5): the
+            // app never connects to a remote itself. `c` here is our
+            // connection to the local embedded/shared server.
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::RemoteStoresListed { url, result: Err("Not connected".into()) });
+            };
+            let remote = match remote_endpoint(&url, &token) {
+                Ok(r) => r,
+                Err(message) => return Some(BackendEvent::RemoteStoresListed { url, result: Err(message) }),
+            };
+            match c.list_remote_stores(remote).await {
+                Ok(stores) => Some(BackendEvent::RemoteStoresListed { url, result: Ok(stores) }),
                 Err(e) => Some(BackendEvent::RemoteStoresListed { url, result: Err(e.to_string()) }),
             }
         }
 
-        BackendCommand::AddRemoteStore { url, remote_store_id } => {
+        BackendCommand::AddRemoteStore { url, remote_store_id, token } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
-            let remote_url: url::Url = match url.parse() {
-                Ok(u) => u,
-                Err(e) => return Some(BackendEvent::Error { message: format!("Invalid remote URL: {}", e) }),
+            let remote = match remote_endpoint(&url, &token) {
+                Ok(r) => r,
+                Err(message) => return Some(BackendEvent::Error { message }),
             };
-            let remote = RemoteEndpoint { url: remote_url, auth: AuthMethod::None };
             // No path: the server puts the replica in its own data directory.
             match c.add_remote_store(remote, remote_store_id, None).await {
                 Ok(store) => Some(BackendEvent::StoreOpened { store }),
@@ -780,5 +791,25 @@ async fn process_command(
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
         }
+
+        BackendCommand::RemoveReplica { store_id, force } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            match c.remove_replica(store_id, force).await {
+                Ok(()) => Some(BackendEvent::ReplicaRemoved { store_id }),
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
     }
+}
+
+/// Build a `RemoteEndpoint` for a URL typed into a modal: an empty token
+/// means "use whatever this server already saved for that origin"
+/// (`AuthMethod::None`, docs/history/HARDENING_CONTRACT.md decision 4); a non-empty
+/// one is sent as `AuthMethod::Bearer`.
+fn remote_endpoint(url: &str, token: &str) -> Result<RemoteEndpoint, String> {
+    let url: url::Url = url.parse().map_err(|e| format!("Invalid remote URL: {}", e))?;
+    let auth = if token.is_empty() { AuthMethod::None } else { AuthMethod::Bearer { token: token.to_string() } };
+    Ok(RemoteEndpoint { url, auth })
 }

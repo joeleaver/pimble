@@ -207,12 +207,18 @@ pub struct AppStore {
     pub search_query: Signal<String>,
     pub search_results: Signal<SearchState>,
 
-    // "Add Remote Store..." modal (File menu, docs/SYNC_CONTRACT.md "B: app
-    // side"): browse a remote's open stores and add one as a local replica.
+    // "Add Remote Store..." modal (File menu, docs/history/HARDENING_CONTRACT.md "B:
+    // app"): browse a remote's open stores and add one as a local replica.
     // No folder/path field — the server places the replica in its own data
     // directory, so nothing here opens a native OS dialog.
     pub connect_modal_open: Signal<bool>,
     pub connect_modal_url: Signal<String>,
+    /// Empty means "use what the server saved for this remote's origin"
+    /// (docs/history/HARDENING_CONTRACT.md decision 4); non-empty is sent as
+    /// `AuthMethod::Bearer`.
+    pub connect_modal_token: Signal<String>,
+    /// Whether the token field's `PasswordInput` shows the token in clear text.
+    pub connect_modal_token_visible: Signal<bool>,
     pub connect_modal_stores: Signal<Vec<Store>>,
     /// The selected store's id, as a string (the raw `Select` value).
     pub connect_modal_selected: Signal<String>,
@@ -228,9 +234,21 @@ pub struct AppStore {
     // is the store the modal is open for; `None` means closed.
     pub link_modal_store: Signal<Option<StoreId>>,
     pub link_modal_url: Signal<String>,
+    /// Same token semantics as `connect_modal_token`.
+    pub link_modal_token: Signal<String>,
+    /// Whether the token field's `PasswordInput` shows the token in clear text.
+    pub link_modal_token_visible: Signal<bool>,
     pub link_modal_error: Signal<String>,
     /// True while a `SetStoreSync` request from this modal is in flight.
     pub link_modal_pending: Signal<bool>,
+
+    // "Remove Replica..." confirmation modal (store root context menu,
+    // docs/history/HARDENING_CONTRACT.md "B: app"). `Some(store_id)` is the replica
+    // the modal is open for; `None` means closed.
+    pub remove_replica_modal_store: Signal<Option<StoreId>>,
+    pub remove_replica_modal_error: Signal<String>,
+    /// True while a `RemoveReplica` request from this modal is in flight.
+    pub remove_replica_modal_pending: Signal<bool>,
 }
 
 /// Identifies the node currently open in the shared editor.
@@ -273,6 +291,8 @@ impl AppStore {
             search_results: Signal::new(SearchState::Idle),
             connect_modal_open: Signal::new(false),
             connect_modal_url: Signal::new(String::new()),
+            connect_modal_token: Signal::new(String::new()),
+            connect_modal_token_visible: Signal::new(false),
             connect_modal_stores: Signal::new(Vec::new()),
             connect_modal_selected: Signal::new(String::new()),
             connect_modal_error: Signal::new(String::new()),
@@ -280,8 +300,13 @@ impl AppStore {
             connect_modal_pending_add: Signal::new(false),
             link_modal_store: Signal::new(None),
             link_modal_url: Signal::new(String::new()),
+            link_modal_token: Signal::new(String::new()),
+            link_modal_token_visible: Signal::new(false),
             link_modal_error: Signal::new(String::new()),
             link_modal_pending: Signal::new(false),
+            remove_replica_modal_store: Signal::new(None),
+            remove_replica_modal_error: Signal::new(String::new()),
+            remove_replica_modal_pending: Signal::new(false),
         }
     }
 
@@ -332,6 +357,42 @@ impl AppStore {
         self.mount_data.update(|map| { map.remove(&key); });
         self.children_of.update(|map| { map.remove(&key); });
         self.live_label.update(|map| { map.remove(&key); });
+    }
+
+    /// Remove `node_id` and every cached descendant from the app's caches,
+    /// and clear the selection if it was anywhere inside — the server
+    /// deletes a whole subtree in one go (docs/history/HARDENING_CONTRACT.md item
+    /// 10), so both the local echo of a delete and a remote `NodeDeleted`
+    /// notification (which names only the subtree's root) need to drop the
+    /// rest of it here too.
+    ///
+    /// Recurses through each cached node's own `children` field, which is
+    /// always addressed within `store_id` — never through the `children_of`
+    /// cache, whose entry for a MOUNT node holds pairs from the mount's
+    /// SOURCE store: those are a different store's real nodes, unaffected by
+    /// deleting the mount placeholder, and must not be swept up here.
+    pub fn remove_subtree(&self, store_id: StoreId, node_id: NodeId) {
+        let child_ids: Vec<NodeId> = untracked(|| {
+            self.node_data.with(|map| {
+                map.get(&(store_id, node_id))
+                    .map(|sig| sig.with(|n| n.children.clone()))
+                    .unwrap_or_default()
+            })
+        });
+        for child_id in child_ids {
+            self.remove_subtree(store_id, child_id);
+        }
+        self.remove_node(store_id, node_id);
+
+        if let Some(selected_id) = self.selected_id.get() {
+            if let Some((sel_sid, Some(sel_nid))) = parse_tree_value(&selected_id) {
+                if sel_sid == store_id && sel_nid == node_id {
+                    self.selected_id.set(None);
+                    self.node_title.set(String::new());
+                    self.show_editor.set(false);
+                }
+            }
+        }
     }
 
     /// Insert or update a node's per-entity signal.
@@ -519,17 +580,20 @@ impl AppStore {
         })
     }
 
-    /// Canonical pairs of every mount node whose `mount_ref.source_store` is
-    /// `source_store` (untracked). Used to refresh mounts in response to a
-    /// structural change reported on that store's own `storeChanged`
-    /// subscription (decision 6: no new server-side fan-out for mounts).
-    pub fn mounts_sourced_from(&self, source_store: StoreId) -> Vec<(StoreId, NodeId)> {
+    /// Canonical pairs of every mount node whose `mount_ref` names exactly
+    /// `(source_store, source_node)` (untracked). Used for the exact refetch
+    /// (docs/history/HARDENING_CONTRACT.md "B: app"): a structural notification names
+    /// every parent it touched, so only mounts sourced from those precise
+    /// `(store, parent)` pairs need refreshing — never a whole-store scan.
+    pub fn mounts_sourced_from_node(&self, source_store: StoreId, source_node: NodeId) -> Vec<(StoreId, NodeId)> {
         untracked(|| {
             self.mount_data.with(|map| {
                 map.iter()
                     .filter_map(|(&key, sig)| {
                         let matches = sig.with(|m| {
-                            m.mount_ref.as_ref().map_or(false, |r| r.source_store == source_store)
+                            m.mount_ref.as_ref().map_or(false, |r| {
+                                r.source_store == source_store && r.source_node == source_node
+                            })
                         });
                         if matches { Some(key) } else { None }
                     })
@@ -538,14 +602,14 @@ impl AppStore {
         })
     }
 
-    /// Canonical pairs of every node in `store_id` whose children are loaded
-    /// (untracked): the parents a remote structural change in that store may
-    /// have touched. A `storeChanged` notification names only the node, not
-    /// its parent, so the client refetches every loaded list of that store.
-    pub fn loaded_parents_in(&self, store_id: StoreId) -> Vec<(StoreId, NodeId)> {
+    /// A node's cached parent id (untracked) — `None` if the node isn't
+    /// cached or has no parent (a store root). Used by the `TreeStructure`
+    /// exact refetch to find "that listed id's cached parent"
+    /// (docs/history/HARDENING_CONTRACT.md "B: app").
+    pub fn cached_parent_id(&self, store_id: StoreId, node_id: NodeId) -> Option<NodeId> {
         untracked(|| {
-            self.children_of.with(|map| {
-                map.keys().copied().filter(|(sid, _)| *sid == store_id).collect()
+            self.node_data.with(|map| {
+                map.get(&(store_id, node_id)).and_then(|sig| sig.with(|n| n.parent_id))
             })
         })
     }
@@ -573,7 +637,17 @@ impl AppStore {
             });
             let Some((store_name, root_id)) = store_info else { continue };
 
-            let store_node = TreeNodeData::new(format!("store_{}", sid), &store_name);
+            // rinch's Tree re-renders a row only when its `TreeNodeData`
+            // changes, and the store row's context menu snapshots whether the
+            // store is linked at render time (rinch #714 keeps those items
+            // static). The row renderer draws its own label from the store
+            // signal and never reads this one, so the label carries the link
+            // state: linking or unlinking changes the data and re-renders the
+            // row with fresh menu items.
+            let linked = self.sync_data.with(|map| {
+                map.get(&sid).map_or(false, |sig| sig.with(|(remote, _)| remote.is_some()))
+            });
+            let store_node = TreeNodeData::new(format!("store_{}", sid), format!("{store_name} (linked: {linked})"));
             let children = self.build_children_structural(sid, root_id, &[]);
             if children.is_empty() {
                 result.push(store_node);
