@@ -17,13 +17,13 @@ use pimble_rpc::{
     CreateNodeRequest, CreateNodeResponse, CreateStoreRequest, CreateStoreResponse,
     CreateWorkspaceRequest, DeleteNodeRequest, EditOperation, EmptyResponse, GetChildrenRequest,
     GetChildrenResponse, GetMountStateRequest, GetMountStateResponse, GetNodeRequest, GetStoreSyncRequest, GetStoreSyncResponse, SetStoreSyncRequest,
-    GetNodeResponse, GetNodesRequest, GetNodesResponse, ListStoresResponse, LoadWorkspaceRequest,
-    LoadWorkspaceResponse, MoveNodeRequest, NodeContentChangedNotification, OpenStoreRequest,
-    OpenStoreResponse, PimbleApiServer, RebuildIndexRequest, RebuildIndexResponse,
+    GetNodeResponse, GetNodesRequest, GetNodesResponse, ListRemoteStoresRequest, ListStoresResponse, LoadWorkspaceRequest,
+    LoadWorkspaceResponse, MoveNodeRequest, NodeContentChangedNotification, NodeContentDiff, OpenStoreRequest,
+    OpenStoreResponse, PimbleApiServer, RebuildIndexRequest, RebuildIndexResponse, RemoveReplicaRequest,
     SaveWorkspaceRequest, SearchRequest, SearchResponse, SearchResultItem, StoreChangeKind,
-    StoreChangedNotification, SyncNodeContentRequest, SyncNodeContentResponse,
+    StoreChangedNotification, SyncNodeContentsRequest, SyncNodeContentsResponse,
     SyncStoreDocumentRequest, SyncStoreDocumentResponse, UpdateNodeContentRequest,
-    UpdateNodeMetadataRequest,
+    UpdateNodeMetadataRequest, MAX_SYNC_NODE_CONTENTS,
 };
 use pimble_search::{IndexNode, SearchError, SearchIndex, SearchQuery};
 use pimble_store::{StoreEndpoint, StoreManager, SyncConfig};
@@ -50,11 +50,23 @@ const CONTENT_FLUSH_DEBOUNCE: Duration = Duration::from_millis(750);
 /// creates every ancestor directory, so nothing here needs to pre-create
 /// `pimble/replicas/`.
 fn default_replica_path(store_id: StoreId) -> PathBuf {
+    replicas_dir().join(format!("{}.pimble", store_id))
+}
+
+/// The directory this server creates replicas in: `<data dir>/pimble/
+/// replicas/`. A store inside it is a replica (`Store::is_replica`), and
+/// only such a store can be removed with `removeReplica`.
+fn replicas_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("pimble")
         .join("replicas")
-        .join(format!("{}.pimble", store_id))
+}
+
+/// Fill in the fields of a `Store` only the server knows: whether it is a
+/// replica (its directory is inside [`replicas_dir`]).
+fn mark_replica(store: &mut pimble_core::Store) {
+    store.is_replica = store.local_path().map_or(false, |p| p.starts_with(replicas_dir()));
 }
 
 /// Coalesces content flushes: `apply_edit` marks its store dirty and ensures
@@ -793,6 +805,7 @@ impl PimbleApiServer for RpcHandler {
             self.ensure_link_started(store_id, config.remote).await;
         }
         store.sync_state = self.sync_state_of(store_id).await;
+        mark_replica(&mut store);
 
         Ok(OpenStoreResponse { store })
     }
@@ -832,6 +845,7 @@ impl PimbleApiServer for RpcHandler {
         for id in store_ids {
             if let Ok(mut store) = manager.get_store_info(id) {
                 store.sync_state = self.sync_state_of(id).await;
+                mark_replica(&mut store);
                 stores.push(store);
             }
         }
@@ -892,8 +906,13 @@ impl PimbleApiServer for RpcHandler {
         node.metadata.title = request.title;
 
         let mut manager = self.store_manager.write().await;
+        // `parent_id: None` creates under the root.
+        let parent_id = match request.parent_id {
+            Some(parent_id) => parent_id,
+            None => manager.root_node_id(request.store_id).map_err(to_rpc_error)?,
+        };
         let node_id = manager
-            .create_node(request.store_id, node, request.parent_id)
+            .create_node(request.store_id, node, Some(parent_id))
             .await
             .map_err(to_rpc_error)?;
 
@@ -905,7 +924,7 @@ impl PimbleApiServer for RpcHandler {
             .map_err(to_rpc_error)?;
 
         drop(manager);
-        self.notify_store_change(request.store_id, StoreChangeKind::NodeCreated { node_id }, None).await;
+        self.notify_store_change(request.store_id, StoreChangeKind::NodeCreated { node_id, parent_id }, None).await;
         self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
 
         Ok(CreateNodeResponse { node_id })
@@ -980,14 +999,21 @@ impl PimbleApiServer for RpcHandler {
         );
 
         let mut manager = self.store_manager.write().await;
-        manager
+        let removal = manager
             .delete_node(request.store_id, request.node_id)
             .await
             .map_err(to_rpc_error)?;
 
         drop(manager);
-        self.notify_store_change(request.store_id, StoreChangeKind::NodeDeleted { node_id: request.node_id }, None).await;
-        self.enqueue_index_event(request.store_id, IndexEvent::Remove(request.node_id)).await;
+        self.notify_store_change(
+            request.store_id,
+            StoreChangeKind::NodeDeleted { node_id: request.node_id, parent_id: removal.parent_id },
+            None,
+        )
+        .await;
+        for node_id in removal.removed {
+            self.enqueue_index_event(request.store_id, IndexEvent::Remove(node_id)).await;
+        }
 
         Ok(EmptyResponse {})
     }
@@ -1002,7 +1028,7 @@ impl PimbleApiServer for RpcHandler {
         );
 
         let mut manager = self.store_manager.write().await;
-        manager
+        let old_parent_id = manager
             .move_node(request.store_id, request.node_id, request.new_parent_id, request.position)
             .await
             .map_err(to_rpc_error)?;
@@ -1013,7 +1039,12 @@ impl PimbleApiServer for RpcHandler {
             .map_err(to_rpc_error)?;
 
         drop(manager);
-        self.notify_store_change(request.store_id, StoreChangeKind::NodeMoved { node_id: request.node_id }, None).await;
+        self.notify_store_change(
+            request.store_id,
+            StoreChangeKind::NodeMoved { node_id: request.node_id, old_parent_id, new_parent_id: request.new_parent_id },
+            None,
+        )
+        .await;
         // Re-upsert the moved node: its `parent` relationship is what changed.
         self.enqueue_index_event(request.store_id, IndexEvent::Upsert(request.node_id)).await;
 
@@ -1100,7 +1131,7 @@ impl PimbleApiServer for RpcHandler {
         drop(manager);
 
         self.open_indexes_for_newly_opened(newly_opened).await;
-        self.notify_store_change(request.store_id, StoreChangeKind::NodeCreated { node_id }, None).await;
+        self.notify_store_change(request.store_id, StoreChangeKind::NodeCreated { node_id, parent_id: request.parent_id }, None).await;
         self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
 
         Ok(CreateMountResponse { node_id, mount_ref })
@@ -1190,6 +1221,7 @@ impl PimbleApiServer for RpcHandler {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
+        mark_replica(&mut store);
         Ok(OpenStoreResponse { store })
     }
 
@@ -1282,6 +1314,22 @@ impl PimbleApiServer for RpcHandler {
         Ok(GetStoreSyncResponse { remote, state })
     }
 
+    async fn list_remote_stores(
+        &self,
+        request: ListRemoteStoresRequest,
+    ) -> Result<ListStoresResponse, ErrorObjectOwned> {
+        // Interface stub: agent A implements (docs/HARDENING_CONTRACT.md).
+        Err(to_rpc_error(format!("listRemoteStores for {} is not implemented yet", request.remote.url)))
+    }
+
+    async fn remove_replica(
+        &self,
+        request: RemoveReplicaRequest,
+    ) -> Result<EmptyResponse, ErrorObjectOwned> {
+        // Interface stub: agent A implements (docs/HARDENING_CONTRACT.md).
+        Err(to_rpc_error(format!("removeReplica for store {} is not implemented yet", request.store_id)))
+    }
+
     async fn get_mount_state(
         &self,
         request: GetMountStateRequest,
@@ -1372,7 +1420,7 @@ impl PimbleApiServer for RpcHandler {
         // reindexed); an id no longer present was removed.
         let (upserts, removals): (Vec<NodeId>, Vec<NodeId>) = {
             let doc = manager.store_document(request.store_id).map_err(to_rpc_error)?;
-            touched.into_iter().partition(|id| doc.has_node(*id))
+            touched.iter().copied().partition(|id| doc.has_node(*id))
         };
 
         drop(manager);
@@ -1381,7 +1429,7 @@ impl PimbleApiServer for RpcHandler {
         // they can apply it directly instead of refetching.
         let notification = StoreChangedNotification {
             store_id: request.store_id,
-            change_kind: StoreChangeKind::TreeStructure,
+            change_kind: StoreChangeKind::TreeStructure { node_ids: touched },
             source_client_id: Some(request.client_id.clone()),
             update: Some(request.update.clone()),
         };
@@ -1397,40 +1445,54 @@ impl PimbleApiServer for RpcHandler {
         Ok(EmptyResponse {})
     }
 
-    async fn sync_node_content(
+    async fn sync_node_contents(
         &self,
-        request: SyncNodeContentRequest,
-    ) -> Result<SyncNodeContentResponse, ErrorObjectOwned> {
+        request: SyncNodeContentsRequest,
+    ) -> Result<SyncNodeContentsResponse, ErrorObjectOwned> {
         debug!(
-            "Sync node content for node {} in store {}",
-            request.node_id, request.store_id
+            "Sync content of {} node(s) in store {}",
+            request.nodes.len(), request.store_id
         );
 
         use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
 
-        let client_sv = base64::engine::general_purpose::STANDARD
-            .decode(&request.state_vector)
-            .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
+        if request.nodes.len() > MAX_SYNC_NODE_CONTENTS {
+            return Err(to_rpc_error(format!(
+                "syncNodeContents takes at most {} nodes per request, got {}",
+                MAX_SYNC_NODE_CONTENTS,
+                request.nodes.len()
+            )));
+        }
 
         let mut store_manager = self.store_manager.write().await;
+        if !store_manager.is_open(request.store_id) {
+            return Err(to_rpc_error(pimble_store::StoreError::NotOpen(request.store_id)));
+        }
 
         // Stateless reconciliation: no per-client sync state is kept for
-        // node content. The client sends its state vector, we hand back
-        // everything we have beyond it plus our own state vector.
-        let doc = store_manager
-            .get_node_document(request.store_id, request.node_id)
-            .await
-            .map_err(to_rpc_error)?;
+        // node content. For each node the client sends its state vector, we
+        // hand back everything we have beyond it plus our own state vector.
+        // A node this store does not have is left out.
+        let mut nodes = Vec::with_capacity(request.nodes.len());
+        for entry in request.nodes {
+            let client_sv = b64
+                .decode(&entry.state_vector)
+                .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
+            let doc = match store_manager.get_node_document(request.store_id, entry.node_id).await {
+                Ok(doc) => doc,
+                Err(pimble_store::StoreError::NodeNotFound(_)) => continue,
+                Err(e) => return Err(to_rpc_error(e)),
+            };
+            let diff = doc.diff_since(&client_sv).map_err(to_rpc_error)?;
+            nodes.push(NodeContentDiff {
+                node_id: entry.node_id,
+                diff: b64.encode(&diff),
+                state_vector: b64.encode(doc.state_vector()),
+            });
+        }
 
-        let diff = doc
-            .diff_since(&client_sv)
-            .map_err(to_rpc_error)?;
-        let server_sv = doc.state_vector();
-
-        Ok(SyncNodeContentResponse {
-            diff: base64::engine::general_purpose::STANDARD.encode(&diff),
-            state_vector: base64::engine::general_purpose::STANDARD.encode(&server_sv),
-        })
+        Ok(SyncNodeContentsResponse { nodes })
     }
 
     async fn load_workspace(

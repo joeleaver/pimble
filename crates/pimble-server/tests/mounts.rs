@@ -417,7 +417,7 @@ async fn create_mount_notifies_a_store_changes_subscriber() {
     assert!(
         matches!(
             notification.change_kind,
-            StoreChangeKind::NodeCreated { node_id } if node_id == mount_resp.node_id
+            StoreChangeKind::NodeCreated { node_id, .. } if node_id == mount_resp.node_id
         ),
         "expected a NodeCreated notification for the mount node, got {:?}",
         notification.change_kind

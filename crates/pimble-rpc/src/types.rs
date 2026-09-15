@@ -221,11 +221,33 @@ pub struct GetStoreSyncRequest {
 }
 
 /// A store's sync link (`None` when unlinked) and the link's current state
-/// (`SyncState::Offline` for an unlinked store as well).
+/// (`SyncState::Offline` for an unlinked store as well). `remote.auth` is
+/// always `AuthMethod::None`: a server never returns a credential.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStoreSyncResponse {
     pub remote: Option<RemoteEndpoint>,
     pub state: SyncState,
+}
+
+/// Ask this server for the stores a remote Pimble server has open. The
+/// server connects to the remote itself, with `remote.auth` when it is not
+/// `None` and otherwise with the credential it saved for that remote
+/// (docs/HARDENING_CONTRACT.md decisions 4 and 5). Answers with
+/// `ListStoresResponse`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListRemoteStoresRequest {
+    pub remote: RemoteEndpoint,
+}
+
+/// Remove a replica: stop its sync link, close it, and delete its
+/// directory. Refused for a store outside the server's replicas directory,
+/// and for a replica whose link is not `Synced` unless `force`
+/// (docs/HARDENING_CONTRACT.md decision 6).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveReplicaRequest {
+    pub store_id: StoreId,
+    #[serde(default)]
+    pub force: bool,
 }
 
 // ============================================================================
@@ -378,20 +400,40 @@ pub struct ApplyStoreUpdateRequest {
     pub update: String,
 }
 
-/// Request to sync a node's content document. Stateless: the client sends
-/// its yrs state vector and the server responds with everything it has
-/// beyond it. No per-client state is kept on the server.
+/// The most nodes one `syncNodeContents` request may name. The server
+/// refuses more; `PimbleClient::sync_node_contents` splits a longer list.
+pub const MAX_SYNC_NODE_CONTENTS: usize = 100;
+
+/// Request to sync the content documents of several nodes in one round trip.
+/// Stateless: for each node the client sends its yrs state vector and the
+/// server responds with everything it has beyond it. No per-client state is
+/// kept on the server. At most [`MAX_SYNC_NODE_CONTENTS`] nodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncNodeContentRequest {
+pub struct SyncNodeContentsRequest {
     pub store_id: StoreId,
+    pub nodes: Vec<NodeStateVector>,
+}
+
+/// One node's state vector in a [`SyncNodeContentsRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeStateVector {
     pub node_id: NodeId,
     /// Base64-encoded yrs v1 state vector
     pub state_vector: String,
 }
 
-/// Response from node content sync
+/// Response from node content sync: one entry per requested node the
+/// server has, in request order. A node the server does not have is left
+/// out (not an error).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncNodeContentResponse {
+pub struct SyncNodeContentsResponse {
+    pub nodes: Vec<NodeContentDiff>,
+}
+
+/// One node's answer in a [`SyncNodeContentsResponse`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeContentDiff {
+    pub node_id: NodeId,
     /// Base64-encoded yrs v1 update: everything the server has that the
     /// client's state vector lacked. May be empty (base64 of zero bytes) if
     /// the client was already up to date.
@@ -421,16 +463,21 @@ pub struct StoreChangedNotification {
     pub update: Option<String>,
 }
 
-/// Kind of store change
+/// Kind of store change. Structural kinds name every parent whose children
+/// list changed, so a subscriber can refetch exactly those lists.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StoreChangeKind {
-    NodeCreated { node_id: NodeId },
-    NodeDeleted { node_id: NodeId },
-    NodeMoved { node_id: NodeId },
+    NodeCreated { node_id: NodeId, parent_id: NodeId },
+    /// `node_id` and its whole subtree were removed from `parent_id`.
+    NodeDeleted { node_id: NodeId, parent_id: NodeId },
+    NodeMoved { node_id: NodeId, old_parent_id: NodeId, new_parent_id: NodeId },
     MetadataUpdated { node_id: NodeId },
     ContentUpdated { node_id: NodeId },
-    TreeStructure,
+    /// A yrs update to the store document (`applyStoreUpdate`, or a tree
+    /// repair). `node_ids` are the node entries it created, removed or
+    /// changed, including every parent whose children list changed.
+    TreeStructure { node_ids: Vec<NodeId> },
     /// The store's replica sync link changed state (docs/SYNC_CONTRACT.md).
     SyncStateChanged { state: SyncState },
 }

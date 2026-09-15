@@ -70,6 +70,13 @@ pub struct Store {
 
     /// Current synchronization state
     pub sync_state: SyncState,
+
+    /// Whether this is a replica the server created for a remote store
+    /// (`addRemoteStore`), living in the server's replicas directory. Only
+    /// a replica can be removed with `removeReplica`. Filled in by the
+    /// server on every `Store` it returns.
+    #[serde(default)]
+    pub is_replica: bool,
 }
 
 impl Store {
@@ -81,6 +88,7 @@ impl Store {
             location: StoreLocation::Local { path },
             root_node_id: NodeId::new(),
             sync_state: SyncState::Offline,
+            is_replica: false,
         }
     }
 
@@ -92,6 +100,7 @@ impl Store {
             location: StoreLocation::Remote { url, auth },
             root_node_id: NodeId::new(),
             sync_state: SyncState::Offline,
+            is_replica: false,
         }
     }
 

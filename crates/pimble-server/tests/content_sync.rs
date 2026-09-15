@@ -12,7 +12,7 @@ use base64::Engine;
 use pimble_crdt::ContentDoc;
 use pimble_rpc::{
     ApplyEditRequest, CreateNodeRequest, CreateStoreRequest, EditOperation, GetNodeRequest,
-    PimbleApiServer, SyncNodeContentRequest, UpdateNodeContentRequest,
+    NodeStateVector, PimbleApiServer, SyncNodeContentsRequest, UpdateNodeContentRequest,
 };
 use pimble_server::RpcHandler;
 use pimble_store::StoreManager;
@@ -74,13 +74,15 @@ async fn sync_node_content_hands_new_client_the_full_document() {
     let empty_sv_b64 = base64::engine::general_purpose::STANDARD
         .encode(ContentDoc::new().state_vector());
     let sync_resp = handler
-        .sync_node_content(SyncNodeContentRequest {
+        .sync_node_contents(SyncNodeContentsRequest {
             store_id,
-            node_id,
-            state_vector: empty_sv_b64,
+            nodes: vec![NodeStateVector { node_id, state_vector: empty_sv_b64 }],
         })
         .await
         .unwrap();
+    assert_eq!(sync_resp.nodes.len(), 1);
+    let sync_resp = &sync_resp.nodes[0];
+    assert_eq!(sync_resp.node_id, node_id);
 
     let diff_bytes = base64::engine::general_purpose::STANDARD
         .decode(&sync_resp.diff)

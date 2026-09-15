@@ -97,6 +97,16 @@ pub trait PimbleApi {
     #[method(name = "getStoreSync")]
     async fn get_store_sync(&self, request: GetStoreSyncRequest) -> Result<GetStoreSyncResponse, ErrorObjectOwned>;
 
+    /// The stores a remote Pimble server has open, fetched by this server
+    /// (which holds the saved credentials), so a client never connects to a
+    /// remote itself.
+    #[method(name = "listRemoteStores")]
+    async fn list_remote_stores(&self, request: ListRemoteStoresRequest) -> Result<ListStoresResponse, ErrorObjectOwned>;
+
+    /// Stop a replica's sync link, close it and delete its directory.
+    #[method(name = "removeReplica")]
+    async fn remove_replica(&self, request: RemoveReplicaRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
     // ========================================================================
     // Workspace Operations
     // ========================================================================
@@ -133,11 +143,12 @@ pub trait PimbleApi {
     #[method(name = "syncStoreDocument")]
     async fn sync_store_document(&self, request: SyncStoreDocumentRequest) -> Result<SyncStoreDocumentResponse, ErrorObjectOwned>;
 
-    /// Sync a node's content document: send a yrs state vector, receive a
-    /// diff of everything the server has beyond it. Stateless — the server
-    /// keeps no per-client sync state for content documents.
-    #[method(name = "syncNodeContent")]
-    async fn sync_node_content(&self, request: SyncNodeContentRequest) -> Result<SyncNodeContentResponse, ErrorObjectOwned>;
+    /// Sync the content documents of up to `MAX_SYNC_NODE_CONTENTS` nodes:
+    /// send a yrs state vector per node, receive a diff of everything the
+    /// server has beyond each. Stateless — the server keeps no per-client
+    /// sync state for content documents.
+    #[method(name = "syncNodeContents")]
+    async fn sync_node_contents(&self, request: SyncNodeContentsRequest) -> Result<SyncNodeContentsResponse, ErrorObjectOwned>;
 
     /// Apply a yrs update to the store document (tree structure + metadata)
     /// and broadcast it to the store's other subscribers.

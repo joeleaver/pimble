@@ -25,7 +25,7 @@ use pimble_client::PimbleClient;
 use pimble_core::{NodeId, RemoteEndpoint, StoreId, SyncState};
 use pimble_rpc::{
     ApplyEditRequest, ApplyStoreUpdateRequest, EditOperation, PimbleApiServer, StoreChangeKind,
-    StoreChangedNotification,
+    StoreChangedNotification, MAX_SYNC_NODE_CONTENTS,
 };
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -246,7 +246,7 @@ async fn handle_remote_notification(
     }
 
     match (&notif.change_kind, &notif.update) {
-        (StoreChangeKind::TreeStructure, Some(update_b64)) => {
+        (StoreChangeKind::TreeStructure { .. }, Some(update_b64)) => {
             apply_store_update_locally(handler, store_id, link_id, update_b64.clone()).await?;
             debug!("Sync link for store {} applied a remote tree update", store_id);
         }
@@ -263,7 +263,7 @@ async fn handle_remote_notification(
         | (StoreChangeKind::NodeDeleted { .. }, _)
         | (StoreChangeKind::NodeMoved { .. }, _)
         | (StoreChangeKind::MetadataUpdated { .. }, _)
-        | (StoreChangeKind::TreeStructure, None) => {
+        | (StoreChangeKind::TreeStructure { .. }, None) => {
             schedule_store_reconcile(debouncer, reconcile_tx);
         }
         (StoreChangeKind::SyncStateChanged { .. }, _) => {
@@ -302,7 +302,7 @@ async fn forward_local_change(
     }
 
     match (&notif.change_kind, &notif.update) {
-        (StoreChangeKind::TreeStructure, Some(update_b64)) => {
+        (StoreChangeKind::TreeStructure { .. }, Some(update_b64)) => {
             let bytes = base64::engine::general_purpose::STANDARD.decode(update_b64)?;
             client
                 .apply_store_update(store_id, link_id, &bytes)
@@ -321,7 +321,7 @@ async fn forward_local_change(
         | (StoreChangeKind::NodeDeleted { .. }, _)
         | (StoreChangeKind::NodeMoved { .. }, _)
         | (StoreChangeKind::MetadataUpdated { .. }, _)
-        | (StoreChangeKind::TreeStructure, None) => {
+        | (StoreChangeKind::TreeStructure { .. }, None) => {
             schedule_store_reconcile(debouncer, reconcile_tx);
         }
         (StoreChangeKind::SyncStateChanged { .. }, _) => {}
@@ -392,19 +392,44 @@ async fn apply_edit_remotely_with_fallback(
 
 // ── Reconcile ────────────────────────────────────────────────────────
 
-/// A full reconcile: the store document first, then every node id in the
-/// (now up to date) local store document (decision 5).
+/// A full reconcile: the store document first, then the content of every
+/// node id in the (now up to date) local store document (decision 5), in
+/// `syncNodeContents` batches so a store of N nodes costs about N / 100
+/// round trips plus one per node that actually differs.
 async fn full_reconcile(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, link_id: &str) -> anyhow::Result<()> {
     reconcile_store(handler, client, store_id, link_id).await?;
 
+    let manager = handler.store_manager_handle();
     let node_ids = {
-        let manager = handler.store_manager_handle();
         let manager = manager.read().await;
         manager.store_document(store_id)?.list_node_ids()?
     };
 
-    for node_id in node_ids {
-        reconcile_node(handler, client, store_id, node_id, link_id).await?;
+    for chunk in node_ids.chunks(MAX_SYNC_NODE_CONTENTS) {
+        let local_svs = {
+            let mut manager = manager.write().await;
+            let mut svs = Vec::with_capacity(chunk.len());
+            for node_id in chunk {
+                svs.push((*node_id, manager.get_node_document(store_id, *node_id).await?.state_vector()));
+            }
+            svs
+        };
+
+        let remote_answers = client
+            .sync_node_contents(store_id, &local_svs)
+            .await
+            .map_err(|e| anyhow::anyhow!("remote syncNodeContents failed: {}", e))?;
+
+        // A node the remote left out is not in its store document yet (a
+        // race with a structural change); the next reconcile covers it.
+        for (node_id, diff, remote_sv) in remote_answers {
+            if !diff.is_empty() {
+                let diff_b64 = base64::engine::general_purpose::STANDARD.encode(&diff);
+                apply_edit_locally_with_fallback(handler, client, store_id, node_id, link_id, diff_b64).await?;
+                debug!("Sync link for store {} pulled a content diff for node {} from the remote", store_id, node_id);
+            }
+            push_node_diff(handler, client, store_id, node_id, link_id, &remote_sv).await?;
+        }
     }
 
     Ok(())
@@ -472,10 +497,24 @@ async fn reconcile_node(handler: &RpcHandler, client: &PimbleClient, store_id: S
         debug!("Sync link for store {} pulled a content diff for node {} from the remote", store_id, node_id);
     }
 
+    push_node_diff(handler, client, store_id, node_id, link_id, &remote_sv).await
+}
+
+/// Send the remote everything this node's local content document has beyond
+/// `remote_sv`, if anything.
+async fn push_node_diff(
+    handler: &RpcHandler,
+    client: &PimbleClient,
+    store_id: StoreId,
+    node_id: NodeId,
+    link_id: &str,
+    remote_sv: &[u8],
+) -> anyhow::Result<()> {
     let local_diff = {
+        let manager = handler.store_manager_handle();
         let mut manager = manager.write().await;
         let doc = manager.get_node_document(store_id, node_id).await?;
-        doc.diff_since(&remote_sv)?
+        doc.diff_since(remote_sv)?
     };
 
     if !local_diff.is_empty() {

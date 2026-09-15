@@ -45,6 +45,15 @@ pub enum TreeIssue {
     Cycle { node_ids: Vec<NodeId> },
 }
 
+/// What [`StoreDocument::repair`] changed: the yrs update its transaction
+/// produced (to broadcast and forward like any other store update) and the
+/// node entries it touched (docs/HARDENING_CONTRACT.md decision 9).
+#[derive(Debug, Clone)]
+pub struct TreeRepair {
+    pub update: Vec<u8>,
+    pub touched: Vec<NodeId>,
+}
+
 /// A CRDT-backed store document managing tree structure and node metadata.
 ///
 /// Schema (a yrs `Doc` built with `OffsetKind::Utf16`, matching `ContentDoc`):
@@ -472,6 +481,17 @@ impl StoreDocument {
         }
 
         Ok(issues)
+    }
+
+    /// Make the tree well formed again after concurrent edits merged into a
+    /// shape no single replica produced (a child in two parents' lists, a
+    /// cycle, an orphan). Deterministic in the merged state, so replicas
+    /// that repair the same state make the same changes. `None` when the
+    /// tree is already well formed (docs/HARDENING_CONTRACT.md decision 9).
+    ///
+    /// Stub landed with the interface; agent C implements it.
+    pub fn repair(&mut self) -> Result<Option<TreeRepair>> {
+        Ok(None)
     }
 
     // ── Private helpers ─────────────────────────────────────────────

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use pimble_core::{MountRef, MountState, Node, NodeId, NodeMetadata, Store, StoreId, StoreLocation, SyncState};
-use pimble_crdt::{ContentDoc, StoreDocument};
+use pimble_crdt::{ContentDoc, StoreDocument, TreeRepair};
 use tracing::info;
 
 /// Maximum depth for transitive mount resolution
@@ -13,6 +13,15 @@ const MAX_MOUNT_DEPTH: usize = 16;
 use crate::error::{Result, StoreError};
 use crate::local::{LocalStore, SyncConfig};
 use crate::registry::{StoreEndpoint, StoreRegistry};
+
+/// What [`StoreManager::delete_node`] removed.
+#[derive(Debug, Clone)]
+pub struct NodeRemoval {
+    /// The parent the deleted node was removed from.
+    pub parent_id: NodeId,
+    /// The deleted node and every descendant of it.
+    pub removed: Vec<NodeId>,
+}
 
 /// Manages multiple open stores
 pub struct StoreManager {
@@ -129,6 +138,7 @@ impl StoreManager {
                 },
                 root_node_id: manifest.root_node_id,
                 sync_state: SyncState::Offline,
+                is_replica: false,
             })
         } else {
             Err(StoreError::StoreNotFound(store_id))
@@ -177,18 +187,43 @@ impl StoreManager {
         store.create_node(node, parent_id).await
     }
 
-    /// Move a node to a new parent in a store
-    pub async fn move_node(&mut self, store_id: StoreId, node_id: NodeId, new_parent_id: NodeId, position: Option<usize>) -> Result<()> {
+    /// Move a node to a new parent in a store. Returns the parent it left.
+    pub async fn move_node(&mut self, store_id: StoreId, node_id: NodeId, new_parent_id: NodeId, position: Option<usize>) -> Result<NodeId> {
         let store = self.local_stores.get_mut(&store_id)
             .ok_or(StoreError::NotOpen(store_id))?;
-        store.move_node(node_id, new_parent_id, position).await
+        let old_parent_id = store.store_document().get_node_info(node_id)
+            .map_err(StoreError::Crdt)?
+            .parent_id
+            .ok_or_else(|| StoreError::InvalidOperation("Cannot move the root node".into()))?;
+        store.move_node(node_id, new_parent_id, position).await?;
+        Ok(old_parent_id)
     }
 
-    /// Delete a node from a store
-    pub async fn delete_node(&mut self, store_id: StoreId, node_id: NodeId) -> Result<()> {
+    /// Delete a node and its subtree from a store. Returns the parent it was
+    /// removed from and every node id removed (docs/HARDENING_CONTRACT.md
+    /// decision 10).
+    ///
+    /// Interim implementation landed with the interface (removes the node
+    /// only); agent C makes it remove the subtree and refuse the root.
+    pub async fn delete_node(&mut self, store_id: StoreId, node_id: NodeId) -> Result<NodeRemoval> {
         let store = self.local_stores.get_mut(&store_id)
             .ok_or(StoreError::NotOpen(store_id))?;
-        store.delete_node(node_id).await
+        let parent_id = store.store_document().get_node_info(node_id)
+            .map_err(StoreError::Crdt)?
+            .parent_id
+            .ok_or_else(|| StoreError::InvalidOperation("Cannot delete the root node".into()))?;
+        store.delete_node(node_id).await?;
+        Ok(NodeRemoval { parent_id, removed: vec![node_id] })
+    }
+
+    /// Repair a store's tree after a merge (see `StoreDocument::repair`),
+    /// marking the store document dirty when anything changed.
+    ///
+    /// Stub landed with the interface; agent C implements it.
+    pub fn repair_tree(&mut self, store_id: StoreId) -> Result<Option<TreeRepair>> {
+        let store = self.local_stores.get_mut(&store_id)
+            .ok_or(StoreError::NotOpen(store_id))?;
+        store.store_document_mut().repair().map_err(StoreError::Crdt)
     }
 
     /// Replace a node's content with a full yrs snapshot.

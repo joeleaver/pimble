@@ -10,10 +10,10 @@ use pimble_rpc::{
     AddRemoteStoreRequest, ApplyEditRequest, ApplyStoreUpdateRequest, CloseStoreRequest, CreateMountRequest,
     CreateNodeRequest, CreateStoreRequest, CreateWorkspaceRequest, DeleteNodeRequest,
     EditOperation, GetChildrenRequest, GetMountStateRequest, GetNodeRequest, GetNodesRequest, GetStoreSyncRequest, SetStoreSyncRequest,
-    LoadWorkspaceRequest, MoveNodeRequest, NodeContentChangedNotification, OpenStoreRequest,
-    PimbleApiClient, RebuildIndexRequest, SaveWorkspaceRequest, SearchRequest, SearchResultItem,
-    StoreChangedNotification, SyncNodeContentRequest, SyncStoreDocumentRequest,
-    UpdateNodeContentRequest, UpdateNodeMetadataRequest,
+    ListRemoteStoresRequest, LoadWorkspaceRequest, MoveNodeRequest, NodeContentChangedNotification, NodeStateVector,
+    OpenStoreRequest, PimbleApiClient, RebuildIndexRequest, RemoveReplicaRequest, SaveWorkspaceRequest,
+    SearchRequest, SearchResultItem, StoreChangedNotification, SyncNodeContentsRequest, SyncStoreDocumentRequest,
+    UpdateNodeContentRequest, UpdateNodeMetadataRequest, MAX_SYNC_NODE_CONTENTS,
 };
 use tracing::debug;
 use url::Url;
@@ -432,6 +432,31 @@ impl PimbleClient {
         Ok((response.remote, response.state))
     }
 
+    /// The stores `remote` has open, fetched by the server this client is
+    /// connected to (with `remote.auth`, or its saved credential for that
+    /// remote when `remote.auth` is `None`).
+    pub async fn list_remote_stores(&self, remote: RemoteEndpoint) -> Result<Vec<Store>> {
+        let request = ListRemoteStoresRequest { remote };
+        let response = self
+            .client
+            .list_remote_stores(request)
+            .await
+            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+        Ok(response.stores)
+    }
+
+    /// Stop a replica's sync link, close it, and delete its directory.
+    /// `force` removes a replica whose link is not `Synced` (its unsynced
+    /// changes are lost).
+    pub async fn remove_replica(&self, store_id: StoreId, force: bool) -> Result<()> {
+        let request = RemoveReplicaRequest { store_id, force };
+        self.client
+            .remove_replica(request)
+            .await
+            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+        Ok(())
+    }
+
     // ========================================================================
     // Workspace Operations
     // ========================================================================
@@ -575,37 +600,63 @@ impl PimbleClient {
         Ok(())
     }
 
-    /// Sync a node's content document: send our yrs state vector, get back
+    /// Sync one node's content document: send our yrs state vector, get back
     /// everything the server has beyond it plus the server's own state
-    /// vector. Stateless on both ends.
+    /// vector. Stateless on both ends. A one-node `syncNodeContents`; an
+    /// error if the server does not have the node.
     pub async fn sync_node_content(
         &self,
         store_id: StoreId,
         node_id: NodeId,
         state_vector: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let mut nodes = self.sync_node_contents(store_id, &[(node_id, state_vector.to_vec())]).await?;
+        match nodes.pop() {
+            Some((id, diff, server_sv)) if id == node_id => Ok((diff, server_sv)),
+            _ => Err(ClientError::Rpc(format!("Node not found: {}", node_id))),
+        }
+    }
+
+    /// Sync the content documents of many nodes: for each `(node, state
+    /// vector)`, get back `(node, diff, server state vector)`, in request
+    /// order, for every node the server has (others are left out). Splits
+    /// the list into requests of at most `MAX_SYNC_NODE_CONTENTS` nodes.
+    pub async fn sync_node_contents(
+        &self,
+        store_id: StoreId,
+        nodes: &[(NodeId, Vec<u8>)],
+    ) -> Result<Vec<(NodeId, Vec<u8>, Vec<u8>)>> {
         use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
 
-        let request = SyncNodeContentRequest {
-            store_id,
-            node_id,
-            state_vector: base64::engine::general_purpose::STANDARD.encode(state_vector),
-        };
+        let mut out = Vec::with_capacity(nodes.len());
+        for chunk in nodes.chunks(MAX_SYNC_NODE_CONTENTS) {
+            let request = SyncNodeContentsRequest {
+                store_id,
+                nodes: chunk
+                    .iter()
+                    .map(|(node_id, sv)| NodeStateVector { node_id: *node_id, state_vector: b64.encode(sv) })
+                    .collect(),
+            };
 
-        let response = self
-            .client
-            .sync_node_content(request)
-            .await
-            .map_err(|e| ClientError::Rpc(e.to_string()))?;
+            let response = self
+                .client
+                .sync_node_contents(request)
+                .await
+                .map_err(|e| ClientError::Rpc(e.to_string()))?;
 
-        let diff = base64::engine::general_purpose::STANDARD
-            .decode(&response.diff)
-            .map_err(|e| ClientError::Rpc(format!("Invalid base64 diff: {}", e)))?;
-        let server_sv = base64::engine::general_purpose::STANDARD
-            .decode(&response.state_vector)
-            .map_err(|e| ClientError::Rpc(format!("Invalid base64 state vector: {}", e)))?;
+            for entry in response.nodes {
+                let diff = b64
+                    .decode(&entry.diff)
+                    .map_err(|e| ClientError::Rpc(format!("Invalid base64 diff: {}", e)))?;
+                let server_sv = b64
+                    .decode(&entry.state_vector)
+                    .map_err(|e| ClientError::Rpc(format!("Invalid base64 state vector: {}", e)))?;
+                out.push((entry.node_id, diff, server_sv));
+            }
+        }
 
-        Ok((diff, server_sv))
+        Ok(out)
     }
 
     // ========================================================================

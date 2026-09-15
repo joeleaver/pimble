@@ -493,9 +493,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 tracing::info!("Remote store change: {:?} - {:?}", store_id, change_kind);
                 use pimble_rpc::StoreChangeKind;
                 match change_kind {
-                    StoreChangeKind::NodeCreated { node_id }
-                    | StoreChangeKind::NodeDeleted { node_id }
-                    | StoreChangeKind::NodeMoved { node_id } => {
+                    StoreChangeKind::NodeCreated { node_id, .. }
+                    | StoreChangeKind::NodeDeleted { node_id, .. }
+                    | StoreChangeKind::NodeMoved { node_id, .. } => {
                         refetch_loaded_children(store, *store_id);
                         // If deleted node was selected, clear selection
                         if matches!(change_kind, StoreChangeKind::NodeDeleted { .. }) {
@@ -531,7 +531,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                             });
                         }
                     }
-                    StoreChangeKind::TreeStructure => {
+                    StoreChangeKind::TreeStructure { .. } => {
                         refetch_loaded_children(store, *store_id);
                     }
                     StoreChangeKind::SyncStateChanged { state } => {
