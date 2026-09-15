@@ -27,7 +27,30 @@ token's grants allow. There is no "open a store by path" here: the accounts
 service creates stores, and the token says which ones this account may see.
 
 The token is refreshed five minutes before it expires. The loop reconnects
-whenever the socket drops, with backoff, using the freshest token it holds.
+whenever the socket drops, using the freshest token it holds.
+
+A word on what counts as connected. jsonrpsee's wasm client answers `connect`
+before the browser has opened the socket, so a refused endpoint looks like a
+success for an instant. The backend therefore proves every connection with one
+RPC (`listStores`, which the tree wants anyway) before telling the UI it is
+connected, and it only forgets the current backoff once a connection has also
+stayed up for two seconds. Failed attempts back off from one second to thirty
+and say so once per outage, not once per attempt.
+
+## What the browser build leaves out
+
+A browser connects as a signed-in user, whose token carries per-store grants and
+nothing else. The service principal's RPCs — open a store from a path, add a
+remote as a replica, link, unlink, remove a replica, close a store, create one —
+are refused for that principal, so the web build does not offer them: no "Mount
+Store...", "Mount Remote Store Here...", "Link to Remote...", "Unlink from
+Remote", "Remove Replica..." or "Close Store" in the tree's context menus, and
+no "press Ctrl+N to create a new store" in the empty editor. Stores are created
+and shared on the account pages. "New Node", "Copy as Mount Source", "Paste
+Mount Here", "Rename", "Appearance..." and "Delete" are ordinary writes and stay.
+
+One flag decides this, `CAN_ADMINISTER_STORES` in `crates/pimble-app/src/app.rs`,
+so the desktop app is unchanged.
 
 ## Build
 
@@ -96,6 +119,11 @@ the desktop app's embedded server.
 cd web && trunk serve --release --port 8081
 ```
 
+The `/rpc` proxy in `Trunk.toml` has a `ws://` backend, not `http://`: trunk's
+WebSocket proxy rejects an `http` scheme with `Url(UnsupportedUrlScheme)` and
+then every upgrade fails. A broken proxy shows up in the app as a connection
+that is refused immediately and retried, so check trunk's own log first.
+
 **4. Sign up** at the site's `signup.html` (or `curl -X POST
 http://127.0.0.1:8080/api/v1/signup -d '{"email":"...","password":"..."}'`),
 create a store, then open the app.
@@ -121,13 +149,21 @@ That is how the collaboration path below was first verified.
 
 ## What has been verified
 
-Against a real `pimble-cli server` with `--allow-origin`, a stub `/api/v1/token`
-and the release `dist/`, in Chromium:
+In Chromium, against a real `pimble-cli server` started with `--allow-origin`,
+with the release build served by a plain static server and a stub answering
+`POST /api/v1/token`. That arrangement gives the app one origin without trunk in
+the way, so it exercises the app and the server but **not** the `trunk serve`
+proxies:
 
 - the app boots, mints a token, connects, and `listStores` fills the tree;
 - clicking a document opens it in the browser editor with its content;
 - two tabs on the same document see each other's typing live, in both
-  directions, and the result is on disk afterwards (`pimble-cli show-node`).
+  directions, and the result is on disk afterwards (`pimble-cli show-node`);
+- pointed at a port with nothing listening, the backend makes 7 attempts in 65
+  seconds (1s, 2s, 4s, 8s, 16s, 30s, 30s), never claims to be connected, and
+  writes one error to the status bar rather than one per attempt;
+- pointed at the real server, it connects once and stays connected, with no
+  retries and no errors.
 
-Not yet verified end to end: the same flow against `pimble-cloud` with real
-signup, login and JWT verification, which is being built alongside this.
+Not yet verified here: the same flow against `pimble-cloud` with real signup,
+login and JWT verification, and the flow through `trunk serve`'s proxies.

@@ -29,6 +29,18 @@ use crate::styles::{APP_CSS, EDITOR_CSS};
 /// double-click, and so starts an inline rename.
 const DOUBLE_CLICK_MS: f64 = 500.0;
 
+/// Whether this build may administer the stores on its server: open one from a
+/// path, add a remote as a replica, link, unlink, remove a replica, close one,
+/// create one.
+///
+/// Those are the service principal's RPCs. The desktop app owns the server it
+/// talks to and connects as that principal, so it offers them all. A browser
+/// connects as a signed-in user, whose token carries per-store grants and
+/// nothing else, so the server refuses every one of them; the account pages
+/// create and share stores instead. Offering a menu item that can only fail is
+/// worse than not offering it, so the browser build hides them.
+const CAN_ADMINISTER_STORES: bool = cfg!(feature = "native");
+
 /// Milliseconds on a clock that only moves forward, for the double-click
 /// window above. `std::time::Instant` has no implementation on
 /// `wasm32-unknown-unknown` and panics the first time it is read, so the
@@ -1031,15 +1043,19 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 onclick: on_new_child,
                                 "New Node"
                             }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Link,
-                                onclick: on_mount_store,
-                                "Mount Store..."
+                            if CAN_ADMINISTER_STORES {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::Link,
+                                    onclick: on_mount_store.clone(),
+                                    "Mount Store..."
+                                }
                             }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::CloudDownload,
-                                onclick: on_mount_remote_store,
-                                "Mount Remote Store Here..."
+                            if CAN_ADMINISTER_STORES {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::CloudDownload,
+                                    onclick: on_mount_remote_store.clone(),
+                                    "Mount Remote Store Here..."
+                                }
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Copy,
@@ -1052,33 +1068,41 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 onclick: on_paste_mount,
                                 "Paste Mount Here"
                             }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Cloud,
-                                disabled: is_linked_now,
-                                onclick: on_link_to_remote,
-                                "Link to Remote..."
+                            if CAN_ADMINISTER_STORES {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::Cloud,
+                                    disabled: is_linked_now,
+                                    onclick: on_link_to_remote.clone(),
+                                    "Link to Remote..."
+                                }
                             }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Unlink,
-                                disabled: !is_linked_now,
-                                onclick: on_unlink_from_remote,
-                                "Unlink from Remote"
+                            if CAN_ADMINISTER_STORES {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::Unlink,
+                                    disabled: !is_linked_now,
+                                    onclick: on_unlink_from_remote.clone(),
+                                    "Unlink from Remote"
+                                }
                             }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Trash,
-                                disabled: !is_replica_now,
-                                onclick: on_remove_replica,
-                                "Remove Replica..."
+                            if CAN_ADMINISTER_STORES {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::Trash,
+                                    disabled: !is_replica_now,
+                                    onclick: on_remove_replica.clone(),
+                                    "Remove Replica..."
+                                }
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Palette,
                                 onclick: on_appearance,
                                 "Appearance..."
                             }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::X,
-                                onclick: on_close_store,
-                                "Close Store"
+                            if CAN_ADMINISTER_STORES {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::X,
+                                    onclick: on_close_store.clone(),
+                                    "Close Store"
+                                }
                             }
                         }
                     }
@@ -1154,15 +1178,19 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 onclick: on_new_child,
                                 "New Node"
                             }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Link,
-                                onclick: on_mount_store,
-                                "Mount Store..."
+                            if CAN_ADMINISTER_STORES {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::Link,
+                                    onclick: on_mount_store.clone(),
+                                    "Mount Store..."
+                                }
                             }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::CloudDownload,
-                                onclick: on_mount_remote_store,
-                                "Mount Remote Store Here..."
+                            if CAN_ADMINISTER_STORES {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::CloudDownload,
+                                    onclick: on_mount_remote_store.clone(),
+                                    "Mount Remote Store Here..."
+                                }
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Copy,
@@ -1878,9 +1906,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                     class: "pimble-empty-state__text",
                                     "Select a document to start editing"
                                 }
-                                div {
-                                    class: "pimble-empty-state__hint",
-                                    "Or press Ctrl+N to create a new store"
+                                if CAN_ADMINISTER_STORES {
+                                    div {
+                                        class: "pimble-empty-state__hint",
+                                        "Or press Ctrl+N to create a new store"
+                                    }
                                 }
                             }
                         }

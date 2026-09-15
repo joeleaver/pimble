@@ -71,6 +71,23 @@ effect on the next `jkbase deploy`, or immediately with `jkbase restart` (no reb
 (`http://127.0.0.1:7462`) are the loopback defaults baked into the same VM and don't need a
 secret unless something is moved off those ports.
 
+## Push to deploy
+
+The repo has a second git remote, `jkbase` (`jkbase repo connect`, added 2026-09-15; the
+push token lives only in `.git/config`, nothing tracked). The platform builds whatever
+lands on its `main` branch, and that name is fixed on the platform side, while this repo's
+default branch is `master`. The remote's push refspec is set to `HEAD:refs/heads/main`, so
+from any branch:
+
+```bash
+git push jkbase          # pushes the current HEAD to the platform's main: build + deploy
+```
+
+Watch it with `jkbase deployments` and `jkbase logs -f`. `jkbase repo token` re-mints the
+push token (revoking the old one); `jkbase repo disconnect` removes it. If another machine
+needs the remote, run `jkbase repo connect` there and set the same refspec:
+`git config remote.jkbase.push 'HEAD:refs/heads/main'`.
+
 ## Deploy
 
 ```bash

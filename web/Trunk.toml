@@ -12,6 +12,6 @@ backend = "http://127.0.0.1:8080/api"
 rewrite = "/api/"
 
 [[proxy]]
-backend = "http://127.0.0.1:7462/"
+backend = "ws://127.0.0.1:7462/"
 ws = true
 rewrite = "/rpc"

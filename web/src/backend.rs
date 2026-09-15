@@ -33,8 +33,17 @@ const IDLE_POLL_MS: i32 = 16;
 const REFRESH_LEAD_SECS: f64 = 300.0;
 
 /// Backoff bounds for a failed connection attempt.
-const RECONNECT_MIN_MS: i32 = 500;
-const RECONNECT_MAX_MS: i32 = 15_000;
+const RECONNECT_MIN_MS: i32 = 1_000;
+const RECONNECT_MAX_MS: i32 = 30_000;
+
+/// How long a connection has to survive before it counts as real.
+///
+/// jsonrpsee's wasm client answers `connect` before the browser has opened the
+/// socket, so a refused or immediately-closed connection looks like a success
+/// for an instant. Nothing resets the backoff until a connection has both
+/// answered an RPC and stayed up this long, which is what stops a broken
+/// endpoint being retried hundreds of times a minute.
+const SETTLE_MS: f64 = 2_000.0;
 
 /// Start the browser backend and hand back the channels the UI talks through.
 ///
@@ -67,6 +76,12 @@ async fn run(
 
     let mut client: Option<Arc<PimbleClient>> = None;
     let mut backoff_ms = RECONNECT_MIN_MS;
+    // When the current connection proved itself, so the backoff is only reset
+    // once it has lasted.
+    let mut connected_at: Option<f64> = None;
+    // A run of failed attempts says so once, not once per attempt: the status
+    // bar should read "Disconnected" while the server is unreachable, not flap.
+    let mut reported_failure = false;
 
     loop {
         // 1. Keep the credential ahead of its expiry, whether or not the
@@ -91,21 +106,64 @@ async fn run(
             }
         }
 
-        // 2. Connect, or notice that the socket has gone and connect again.
-        let connected = client.as_ref().is_some_and(|c| c.is_connected());
-        if !connected {
+        // 2. A connection that has held up for a while is a good one; only
+        //    then is it safe to forget how long the last outage lasted.
+        if let Some(since) = connected_at {
+            if client.as_ref().is_some_and(|c| c.is_connected()) && now_ms() - since >= SETTLE_MS {
+                backoff_ms = RECONNECT_MIN_MS;
+                connected_at = None;
+            }
+        }
+
+        // 3. Connect, or notice that the socket has gone and connect again.
+        if !client.as_ref().is_some_and(|c| c.is_connected()) {
             if client.take().is_some() {
                 tracing::warn!("The connection to the Pimble server closed");
+                connected_at = None;
                 emit(&event_tx, &signal_ui, BackendEvent::Disconnected);
+                reported_failure = true;
             }
 
             let auth = AuthMethod::Bearer {
                 token: session.token.clone(),
             };
-            match PimbleClient::connect_with_auth(&session.rpc_url, &auth).await {
+            let attempt = PimbleClient::connect_with_auth(&session.rpc_url, &auth).await;
+
+            // `connect` answering `Ok` is not yet evidence of anything. One RPC
+            // is: it proves the socket really opened, that whatever sits
+            // between here and the server passes WebSocket frames, and that
+            // the credential was accepted. `listStores` is that RPC *and* the
+            // list the tree wants — there is no "open a store by path" in the
+            // browser, the token's grants are the whole list.
+            let proven = match attempt {
                 Ok(c) => {
-                    backoff_ms = RECONNECT_MIN_MS;
-                    let mut c = Some(Arc::new(c));
+                    let mut candidate = Some(Arc::new(c));
+                    let answer = process_command(
+                        &mut candidate,
+                        BackendCommand::ListStores,
+                        &event_tx,
+                        &signal_ui,
+                        &client_id,
+                    )
+                    .await;
+                    match answer {
+                        Some(BackendEvent::StoresListed { stores }) => {
+                            Ok((candidate, BackendEvent::StoresListed { stores }))
+                        }
+                        other => Err(match other {
+                            Some(BackendEvent::Error { message }) => message,
+                            _ => "the server did not answer listStores".to_string(),
+                        }),
+                    }
+                }
+                Err(e) => Err(e.to_string()),
+            };
+
+            match proven {
+                Ok((candidate, listed)) => {
+                    client = candidate;
+                    connected_at = Some(now_ms());
+                    reported_failure = false;
                     emit(
                         &event_tx,
                         &signal_ui,
@@ -114,36 +172,34 @@ async fn run(
                             client_id: client_id.clone(),
                         },
                     );
-                    // The hosted stores this account may see. There is no
-                    // "open a store by path" in the browser: the token's
-                    // grants are the whole list.
-                    dispatch(
-                        &mut c,
-                        BackendCommand::ListStores,
-                        &event_tx,
-                        &signal_ui,
-                        &client_id,
-                    )
-                    .await;
-                    client = c;
+                    emit(&event_tx, &signal_ui, listed);
                 }
-                Err(e) => {
-                    tracing::warn!("Connecting to {} failed: {}", session.rpc_url, e);
-                    emit(
-                        &event_tx,
-                        &signal_ui,
-                        BackendEvent::Error {
-                            message: format!("Failed to connect: {}", e),
-                        },
+                Err(message) => {
+                    tracing::warn!(
+                        "Connecting to {} failed ({}); retrying in {} ms",
+                        session.rpc_url,
+                        message,
+                        backoff_ms
                     );
+                    // One message per outage, not one per attempt.
+                    if !reported_failure {
+                        reported_failure = true;
+                        emit(
+                            &event_tx,
+                            &signal_ui,
+                            BackendEvent::Error {
+                                message: format!("Failed to connect: {}", message),
+                            },
+                        );
+                    }
                     sleep_ms(backoff_ms).await;
-                    backoff_ms = (backoff_ms * 2).min(RECONNECT_MAX_MS);
+                    backoff_ms = (backoff_ms.saturating_mul(2)).min(RECONNECT_MAX_MS);
                     continue;
                 }
             }
         }
 
-        // 3. Run whatever the UI has posted. Drain the queue rather than
+        // 4. Run whatever the UI has posted. Drain the queue rather than
         //    taking one per pass, so a burst of edits does not spread over as
         //    many frames as it has commands.
         let mut ran_anything = false;
@@ -162,7 +218,7 @@ async fn run(
             }
         }
 
-        // 4. Give the browser the thread back.
+        // 5. Give the browser the thread back.
         if !ran_anything {
             sleep_ms(IDLE_POLL_MS).await;
         }
@@ -191,8 +247,12 @@ fn emit(event_tx: &Sender<BackendEvent>, signal_ui: &Arc<dyn Fn() + Send + Sync>
 
 /// Whether `session`'s token is inside the refresh window (or already past it).
 fn expiring_soon(session: &Session) -> bool {
-    let now = js_sys::Date::now() / 1000.0;
-    (session.exp as f64) - now <= REFRESH_LEAD_SECS
+    (session.exp as f64) - now_ms() / 1000.0 <= REFRESH_LEAD_SECS
+}
+
+/// The page's clock, in milliseconds.
+fn now_ms() -> f64 {
+    js_sys::Date::now()
 }
 
 /// `setTimeout` as a future, so the loop can yield to the browser.
