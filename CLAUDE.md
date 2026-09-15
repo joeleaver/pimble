@@ -185,6 +185,22 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
   collaborating document fail loudly by design. `pimble_crdt::Block` is that scope as data;
   `ContentDoc::from_blocks` builds a document from it (the importer's way in).
 
+### Tree appearance (done 2026-09-15)
+
+A node's custom icon and colour live in `metadata.custom` under
+`pimble_core::custom_keys::{ICON, COLOR}` (`NodeMetadata::icon/color/set_icon/set_color`):
+a Tabler icon name and a `#rrggbb`, replicated with the store like any metadata and
+written through `updateNodeMetadata` (`BackendCommand::SetNodeAppearance`). The app's
+`appearance.rs` holds the picker's icon and colour tables and `icon_by_name`; a name the
+table does not know falls back to the type's icon. Rows snapshot icon and colour at
+render time, so the row's `TreeNodeData` label carries them (with the paste flag) and
+`NodeLoaded` bumps the tree when they change. `display_color` lifts a dark stored colour
+to a readable lightness on the dark theme at render time (Scrivener's label colours are
+made for light backgrounds); the stored value is never altered. "Appearance..." in the
+node context menu opens the picker (every click applies at once). The Scrivener importer
+maps a binder item's label to colour plus a tag with the label's name, and its
+`IconFileName` to a picker icon where one matches.
+
 ## Key Files
 
 - `docs/RESTART_PLAN.md` - vision, diagnosis, decisions, ordered plan
@@ -198,6 +214,7 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
 - `crates/pimble-app/src/editor.rs` - editor pane + collaboration wiring
 - `crates/pimble-app/src/backend.rs` - background thread, embedded server, `BackendCommand`/`BackendEvent`
 - `crates/pimble-app/src/events.rs` - `BackendEvent` -> UI state
+- `crates/pimble-app/src/appearance.rs` - tree icon and colour choices, name lookup, dark-theme legibility
 
 ## Build & Run
 

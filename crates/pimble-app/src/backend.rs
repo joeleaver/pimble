@@ -34,6 +34,11 @@ pub enum BackendCommand {
     GetChildren { store_id: StoreId, node_id: NodeId },
     SetNodeContent { store_id: StoreId, node_id: NodeId, content: Vec<u8> },
     RenameNode { store_id: StoreId, node_id: NodeId, title: String },
+    /// Set or clear a node's custom icon (a Tabler icon name) and/or colour
+    /// (`#rrggbb`) in its metadata. `None` for a field leaves it as it is;
+    /// `Some(None)` clears it. Answers with `NodeRenamed`, whose refetch
+    /// carries the new metadata to the tree.
+    SetNodeAppearance { store_id: StoreId, node_id: NodeId, icon: Option<Option<String>>, color: Option<Option<String>> },
     DeleteNode { store_id: StoreId, node_id: NodeId },
     MoveNode { store_id: StoreId, node_id: NodeId, new_parent_id: NodeId, position: Option<usize> },
 
@@ -574,6 +579,27 @@ async fn process_command(
             None
         }
 
+        BackendCommand::SetNodeAppearance { store_id, node_id, icon, color } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            match c.get_node(store_id, node_id).await {
+                Ok(mut node) => {
+                    if let Some(icon) = icon {
+                        node.metadata.set_icon(icon);
+                    }
+                    if let Some(color) = color {
+                        node.metadata.set_color(color);
+                    }
+                    match c.update_node_metadata(store_id, node_id, node.metadata).await {
+                        Ok(()) => Some(BackendEvent::NodeRenamed { store_id, node_id }),
+                        Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+                    }
+                }
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
         BackendCommand::RenameNode { store_id, node_id, title } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
@@ -582,7 +608,7 @@ async fn process_command(
                 Ok(mut node) => {
                     node.metadata.title = title;
                     node.metadata.custom.insert(
-                        "explicit_title".to_string(),
+                        pimble_core::custom_keys::EXPLICIT_TITLE.to_string(),
                         serde_json::Value::Bool(true),
                     );
                     match c.update_node_metadata(store_id, node_id, node.metadata).await {

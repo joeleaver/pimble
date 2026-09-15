@@ -288,6 +288,10 @@ pub struct AppStore {
     /// True while a `SetStoreSync` request from this modal is in flight.
     pub link_modal_pending: Signal<bool>,
 
+    // "Appearance..." modal (node context menu): the node whose icon and
+    // colour are being picked; `None` means closed.
+    pub appearance_modal_node: Signal<Option<(StoreId, NodeId)>>,
+
     // "Remove Replica..." confirmation modal (store root context menu,
     // docs/history/HARDENING_CONTRACT.md "B: app"). `Some(store_id)` is the replica
     // the modal is open for; `None` means closed.
@@ -351,6 +355,7 @@ impl AppStore {
             link_modal_token_visible: Signal::new(false),
             link_modal_error: Signal::new(String::new()),
             link_modal_pending: Signal::new(false),
+            appearance_modal_node: Signal::new(None),
             remove_replica_modal_store: Signal::new(None),
             remove_replica_modal_error: Signal::new(String::new()),
             remove_replica_modal_pending: Signal::new(false),
@@ -788,12 +793,18 @@ impl AppStore {
             });
 
             // The renderer never reads this label (render_node Effects draw
-            // it reactively); it only carries the "Paste Mount Here" state so
-            // the row re-renders when that flips (see
-            // `build_tree_data_structural`).
+            // it reactively); it only carries what the row snapshots at render
+            // time — the "Paste Mount Here" state and the node's custom icon
+            // and colour — so the row re-renders when any of them changes
+            // (see `build_tree_data_structural`).
+            let appearance = self.node_data.with(|map| {
+                map.get(&(child_store, child_id)).map(|sig| {
+                    sig.with(|n| format!("{}|{}", n.metadata.icon().unwrap_or(""), n.metadata.color().unwrap_or("")))
+                })
+            });
             let tree_node = TreeNodeData::new(
                 format!("node_{}_{}{}", child_store, child_id, suffix),
-                if paste { "paste" } else { "" },
+                format!("{}|{}", if paste { "paste" } else { "" }, appearance.unwrap_or_default()),
             );
 
             // Crossing a mount node adds it to the path for everything below it.

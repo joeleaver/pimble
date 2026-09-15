@@ -3,6 +3,7 @@
 //! Entry point for the Rinch-based desktop application.
 
 mod app;
+mod appearance;
 mod backend;
 mod editor;
 mod events;

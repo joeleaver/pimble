@@ -193,6 +193,16 @@ impl Node {
     }
 }
 
+/// Keys in [`NodeMetadata::custom`] the app and importers agree on.
+pub mod custom_keys {
+    /// `true` once a user named the node; the tree stops deriving its label from content.
+    pub const EXPLICIT_TITLE: &str = "explicit_title";
+    /// A Tabler icon name (kebab-case, e.g. `"star"`) shown instead of the type's icon.
+    pub const ICON: &str = "icon";
+    /// A CSS colour (`#rrggbb`) for the node's icon and label in the tree.
+    pub const COLOR: &str = "color";
+}
+
 /// Metadata associated with a node
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeMetadata {
@@ -210,6 +220,42 @@ pub struct NodeMetadata {
 
     /// Custom metadata fields
     pub custom: HashMap<String, serde_json::Value>,
+}
+
+impl NodeMetadata {
+    /// The custom icon name, if one is set (see [`custom_keys::ICON`]).
+    pub fn icon(&self) -> Option<&str> {
+        self.custom.get(custom_keys::ICON).and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+    }
+
+    /// The custom colour, if one is set (see [`custom_keys::COLOR`]).
+    pub fn color(&self) -> Option<&str> {
+        self.custom.get(custom_keys::COLOR).and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+    }
+
+    /// Set or clear the custom icon.
+    pub fn set_icon(&mut self, icon: Option<String>) {
+        match icon.filter(|s| !s.is_empty()) {
+            Some(icon) => {
+                self.custom.insert(custom_keys::ICON.to_string(), serde_json::Value::String(icon));
+            }
+            None => {
+                self.custom.remove(custom_keys::ICON);
+            }
+        }
+    }
+
+    /// Set or clear the custom colour.
+    pub fn set_color(&mut self, color: Option<String>) {
+        match color.filter(|s| !s.is_empty()) {
+            Some(color) => {
+                self.custom.insert(custom_keys::COLOR.to_string(), serde_json::Value::String(color));
+            }
+            None => {
+                self.custom.remove(custom_keys::COLOR);
+            }
+        }
+    }
 }
 
 /// A link from one node to another

@@ -15,6 +15,7 @@ use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
 use crate::backend::{BackendCommand, BackendHandle};
 use crate::editor::{start_editing, stop_editing};
 use crate::events::{EVENT_PROCESSOR, process_backend_events};
+use crate::appearance::{display_color, icon_by_name, COLOR_CHOICES, ICON_CHOICES};
 use crate::state::{parse_tree_value, display_label_from_node, mount_is_dimmed, mount_label_suffix, AppStore, PendingMount, SearchState};
 use crate::styles::{APP_CSS, EDITOR_CSS};
 
@@ -658,8 +659,16 @@ pub fn run() {
             let is_folder = node_sig
                 .map(|sig| sig.with(|n| n.node_type == pimble_core::node_types::FOLDER))
                 .unwrap_or(has_children);
+            // A custom icon or colour from the node's metadata (the "Appearance..."
+            // picker, or an import). Snapshotted here like the type icon: the
+            // row's `TreeNodeData` carries both, so a change re-renders the row.
+            let (custom_icon, node_color) = node_sig
+                .map(|sig| sig.with(|n| (n.metadata.icon().and_then(icon_by_name), n.metadata.color().map(String::from))))
+                .unwrap_or((None, None));
             let icon = if is_store_root {
                 TablerIcon::Database
+            } else if let Some(custom) = custom_icon {
+                custom
             } else if is_mount {
                 TablerIcon::Link
             } else if is_folder {
@@ -667,6 +676,12 @@ pub fn run() {
             } else {
                 TablerIcon::File
             };
+            let color_css = node_color.as_ref().map(|c| format!(" color: {};", display_color(c, DARK_MODE))).unwrap_or_default();
+            // One clone per reactive closure below (rinch: a re-running closure
+            // must not consume a non-Copy capture, and two closures cannot share
+            // one moved String).
+            let icon_color_css = color_css.clone();
+            let label_color_css = color_css;
 
             let icon_class = if is_mount {
                 "rinch-tree__icon rinch-tree__icon--mount"
@@ -854,6 +869,15 @@ pub fn run() {
                     }
                 }
             };
+            // "Appearance...": open the icon and colour picker for this node.
+            let on_appearance = {
+                let nv = nv_ctx.clone();
+                move || {
+                    if let Some((s_id, Some(n_id))) = parse_tree_value(&nv) {
+                        store.appearance_modal_node.set(Some((s_id, n_id)));
+                    }
+                }
+            };
 
             // Mount-node-only "New Node": creates under the mount's source
             // (mount_ref), never under the mount node itself (decision 2 —
@@ -961,18 +985,14 @@ pub fn run() {
                         style: {
                             // Reactive icon opacity: a mount whose source is
                             // out of reach or not reachable yet renders dimmed.
-                            move || {
-                                if let Some(ms) = mount_sig {
-                                    let dimmed = ms.with(|m| {
-                                        m.mount_state.as_ref().map_or(false, mount_is_dimmed)
-                                    });
-                                    if dimmed {
-                                        "width: 1rem; height: 1rem; margin-right: 4px; opacity: 0.4;"
-                                    } else {
-                                        ""
-                                    }
+                            || {
+                                let dimmed = mount_sig.map_or(false, |ms| {
+                                    ms.with(|m| m.mount_state.as_ref().map_or(false, mount_is_dimmed))
+                                });
+                                if dimmed {
+                                    format!("width: 1rem; height: 1rem; margin-right: 4px; opacity: 0.4;{icon_color_css}")
                                 } else {
-                                    ""
+                                    icon_color_css.clone()
                                 }
                             }
                         },
@@ -984,20 +1004,17 @@ pub fn run() {
                             // Reactive label style — hides during rename, dims
                             // a mount whose source is out of reach or not
                             // reachable yet.
-                            move || {
+                            || {
                                 if is_renaming.get() {
-                                    "display: none;"
-                                } else if let Some(ms) = mount_sig {
-                                    let dimmed = ms.with(|m| {
-                                        m.mount_state.as_ref().map_or(false, mount_is_dimmed)
-                                    });
-                                    if dimmed {
-                                        "cursor: default; opacity: 0.4;"
-                                    } else {
-                                        base_label_style
-                                    }
+                                    return "display: none;".to_string();
+                                }
+                                let dimmed = mount_sig.map_or(false, |ms| {
+                                    ms.with(|m| m.mount_state.as_ref().map_or(false, mount_is_dimmed))
+                                });
+                                if dimmed {
+                                    format!("cursor: default; opacity: 0.4;{label_color_css}")
                                 } else {
-                                    base_label_style
+                                    format!("{base_label_style}{label_color_css}")
                                 }
                             }
                         },
@@ -1125,6 +1142,11 @@ pub fn run() {
                                 "New Node"
                             }
                             DropdownMenuItem {
+                                left_section: TablerIcon::Palette,
+                                onclick: on_appearance,
+                                "Appearance..."
+                            }
+                            DropdownMenuItem {
                                 left_section: TablerIcon::Trash,
                                 onclick: on_delete,
                                 "Delete"
@@ -1205,6 +1227,11 @@ pub fn run() {
                                 left_section: TablerIcon::Edit,
                                 onclick: on_rename,
                                 "Rename"
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::Palette,
+                                onclick: on_appearance,
+                                "Appearance..."
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Trash,
@@ -1620,6 +1647,99 @@ pub fn run() {
         // docs/history/HARDENING_CONTRACT.md "B: app". Names the store and its
         // remote; when the link isn't `Synced`, warns before removing with
         // `force`.
+        // ── "Appearance..." modal (node context menu) ───────────────────
+        // Picks a colour and an icon for one node; every click applies at
+        // once through `SetNodeAppearance`, and the selection shown follows
+        // the node's own signal, so a change from another window shows too.
+        let appearance_node_color = move || -> Option<String> {
+            let (s_id, n_id) = store.appearance_modal_node.get()?;
+            store.get_node_signal(s_id, n_id)?.with(|n| n.metadata.color().map(String::from))
+        };
+        let appearance_node_icon = move || -> Option<String> {
+            let (s_id, n_id) = store.appearance_modal_node.get()?;
+            store.get_node_signal(s_id, n_id)?.with(|n| n.metadata.icon().map(String::from))
+        };
+        let send_appearance = move |icon: Option<Option<String>>, color: Option<Option<String>>| {
+            if let Some((store_id, node_id)) = untracked(|| store.appearance_modal_node.get()) {
+                store.send(BackendCommand::SetNodeAppearance { store_id, node_id, icon, color });
+            }
+        };
+        let swatches: Vec<NodeHandle> = COLOR_CHOICES
+            .iter()
+            .map(|&(name, hex)| {
+                rsx! {
+                    div {
+                        class: {move || {
+                            if appearance_node_color().as_deref() == Some(hex) { "pimble-swatch pimble-swatch--active" } else { "pimble-swatch" }
+                        }},
+                        style: format!("background: {hex};"),
+                        title: name,
+                        onclick: move || send_appearance(None, Some(Some(hex.to_string()))),
+                    }
+                }
+            })
+            .collect();
+        let icon_choices: Vec<NodeHandle> = ICON_CHOICES
+            .iter()
+            .map(|&icon| {
+                let name = icon.name();
+                let el = render_tabler_icon(__scope, icon, TablerIconStyle::Outline);
+                rsx! {
+                    div {
+                        class: {move || {
+                            if appearance_node_icon().as_deref() == Some(name) { "pimble-icon-choice pimble-icon-choice--active" } else { "pimble-icon-choice" }
+                        }},
+                        title: name,
+                        onclick: move || send_appearance(Some(Some(name.to_string())), None),
+                        {el}
+                    }
+                }
+            })
+            .collect();
+        let appearance_modal = rsx! {
+            Modal {
+                opened_fn: move || store.appearance_modal_node.get().is_some(),
+                onclose: move || store.appearance_modal_node.set(None),
+                title: "Appearance",
+                size: "md",
+
+                div {
+                    div { class: "pimble-appearance__label", "Colour" }
+                    div {
+                        class: "pimble-appearance__row",
+                        div {
+                            class: {move || {
+                                if appearance_node_color().is_none() { "pimble-swatch pimble-swatch--none pimble-swatch--active" } else { "pimble-swatch pimble-swatch--none" }
+                            }},
+                            onclick: move || send_appearance(None, Some(None)),
+                            "None"
+                        }
+                        {swatches}
+                    }
+                    div { class: "pimble-appearance__label", "Icon" }
+                    div {
+                        class: "pimble-appearance__row",
+                        div {
+                            class: {move || {
+                                if appearance_node_icon().is_none() { "pimble-swatch pimble-swatch--none pimble-swatch--active" } else { "pimble-swatch pimble-swatch--none" }
+                            }},
+                            onclick: move || send_appearance(Some(None), None),
+                            "Default"
+                        }
+                        {icon_choices}
+                    }
+                    div {
+                        style: "margin-top: 14px; display: flex; justify-content: flex-end;",
+                        Button {
+                            variant: "filled",
+                            onclick: move || store.appearance_modal_node.set(None),
+                            "Done"
+                        }
+                    }
+                }
+            }
+        };
+
         let remove_replica_modal = rsx! {
             Modal {
                 opened_fn: move || store.remove_replica_modal_store.get().is_some(),
@@ -1730,6 +1850,7 @@ pub fn run() {
                 {connect_modal}
                 {link_modal}
                 {remove_replica_modal}
+                {appearance_modal}
 
                 // Outer wrapper — flex column fills the content area, pushes
                 // status bar to the very bottom.

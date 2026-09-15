@@ -109,6 +109,57 @@ pub(crate) const APP_CSS: &str = "
     color: var(--rinch-primary-color-4) !important;
 }
 
+/* ── Appearance picker ──────────────────────────────────────── */
+.pimble-appearance__label {
+    font-size: 12px;
+    opacity: 0.7;
+    margin: 10px 0 6px 0;
+}
+.pimble-appearance__row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+.pimble-swatch {
+    width: 26px;
+    height: 26px;
+    border-radius: 6px;
+    border: 2px solid transparent;
+    cursor: pointer;
+}
+.pimble-swatch--active {
+    border-color: var(--rinch-color-dark-0);
+}
+.pimble-swatch--none {
+    background: transparent;
+    border: 2px dashed var(--rinch-color-dark-3);
+    color: var(--rinch-color-dark-1);
+    font-size: 11px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: auto;
+    padding: 0 8px;
+}
+.pimble-icon-choice {
+    width: 32px;
+    height: 32px;
+    border-radius: 6px;
+    border: 2px solid transparent;
+    background: var(--rinch-color-dark-6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+}
+.pimble-icon-choice--active {
+    border-color: var(--rinch-primary-color-5);
+}
+.pimble-icon-choice svg {
+    width: 18px;
+    height: 18px;
+}
+
 /* ── Editor panel ───────────────────────────────────────────── */
 
 .pimble-editor {

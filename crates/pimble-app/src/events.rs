@@ -344,17 +344,26 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 let content_bytes = node.content.clone();
                 store.track_mount_info(*store_id, node);
 
-                // Check if the content actually changed compared to what we have cached.
-                let content_changed = untracked(|| {
+                // Whether the node's icon or colour changed against the cache: the
+                // row snapshots both at render time, so that (unlike a title or
+                // content change) needs the tree rebuilt to show.
+                let appearance_changed = untracked(|| {
                     store.node_data.with(|map| {
-                        map.get(&(*store_id, node_id))
-                            .map_or(true, |sig| sig.with(|cached| cached.content != node.content))
+                        map.get(&(*store_id, node_id)).map_or(false, |sig| {
+                            sig.with(|cached| {
+                                cached.metadata.icon() != node.metadata.icon()
+                                    || cached.metadata.color() != node.metadata.color()
+                            })
+                        })
                     })
                 });
 
-                // Data-only: updates per-node signal, NO tree rebuild
+                // Data-only: updates per-node signal, NO tree rebuild (except for
+                // an appearance change, below).
                 store.upsert_node(*store_id, node.clone());
-                let _ = content_changed;
+                if appearance_changed {
+                    store.bump_tree_structure();
+                }
 
                 if let Some(selected_id) = store.selected_id.get() {
                     if let Some((sel_store_id, Some(sel_node_id))) = parse_tree_value(&selected_id) {
