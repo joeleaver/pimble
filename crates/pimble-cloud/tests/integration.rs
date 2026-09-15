@@ -24,6 +24,20 @@ use serde_json::{json, Value};
 
 const SCHEMA: &str = include_str!("../schema.rhype");
 
+/// A [`pimble_cloud::mail::Mailer`] that always fails, simulating Resend
+/// rejecting a message (e.g. its real 422 on an `example.com` recipient) —
+/// used to test that the raw provider response never reaches a caller.
+struct FailingMailer;
+
+#[async_trait::async_trait]
+impl pimble_cloud::mail::Mailer for FailingMailer {
+    async fn send(&self, _to: &str, _subject: &str, _text: &str, _html: &str) -> pimble_cloud::error::CloudResult<()> {
+        Err(pimble_cloud::error::CloudError::Internal(
+            "Resend rejected the message (422 Unprocessable Entity): {\"message\":\"invalid recipient domain\"}".to_string(),
+        ))
+    }
+}
+
 // ── Harness ──────────────────────────────────────────────────────────────
 
 fn free_port() -> u16 {
@@ -173,10 +187,21 @@ impl Drop for Stack {
 }
 
 pub async fn spawn_stack() -> Option<Stack> {
-    spawn_stack_with_releases_base_url(None).await
+    spawn_stack_inner(None, None).await
 }
 
 pub async fn spawn_stack_with_releases_base_url(releases_base_url: Option<String>) -> Option<Stack> {
+    spawn_stack_inner(releases_base_url, None).await
+}
+
+/// Like [`spawn_stack`], but with `mailer` in place of the `LogMailer`
+/// every other test gets — for covering how a mail-provider failure is
+/// handled (`pimble_cloud::build_state_with_mailer`).
+pub async fn spawn_stack_with_mailer(mailer: std::sync::Arc<dyn pimble_cloud::mail::Mailer>) -> Option<Stack> {
+    spawn_stack_inner(None, Some(mailer)).await
+}
+
+async fn spawn_stack_inner(releases_base_url: Option<String>, mailer_override: Option<std::sync::Arc<dyn pimble_cloud::mail::Mailer>>) -> Option<Stack> {
     // The ONLY skip condition: no rhypedb-server binary exists anywhere we
     // know to look. A binary that exists but fails to start is a real test
     // failure (`spawn_rhypedb`'s `expect` below panics with its stderr/stdout).
@@ -236,7 +261,10 @@ pub async fn spawn_stack_with_releases_base_url(releases_base_url: Option<String
         mail_from: "Pimble <no-reply@m.pimble.app>".to_string(),
     };
 
-    let app_state = pimble_cloud::build_state(config).await.expect("build_state");
+    let app_state = match mailer_override {
+        Some(mailer) => pimble_cloud::build_state_with_mailer(config, mailer).await.expect("build_state_with_mailer"),
+        None => pimble_cloud::build_state(config).await.expect("build_state"),
+    };
     let router = pimble_cloud::router_from_state(app_state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -533,8 +561,14 @@ async fn second_signup_for_unverified_address_resends_and_invalidates_the_old_to
 async fn resend_verification_issues_a_new_token_and_invalidates_the_old() {
     let stack = skip_without_rhypedb!();
     let email = "kevin@example.com";
-    signup(&stack, email, "kevin's password!!").await;
-    let old_token = extract_verify_token(&stack, email);
+    // An "old" token planted directly (bypassing signup, which would also
+    // record a send against the rate limiter and make the resend below
+    // rate-limited — see `resend_immediately_after_signup_is_rate_limited_too`
+    // for that case) so this test's resend is this address's first send.
+    let user = stack.app_state.db.create_user(email, "irrelevant-hash").await.unwrap().unwrap();
+    let (old_token, old_hash) = pimble_cloud::auth::new_verify_token();
+    let future_ms = chrono::Utc::now().timestamp_millis() + 24 * 60 * 60 * 1000;
+    stack.app_state.db.set_verify_token(user.rid, &old_hash, future_ms).await.unwrap();
 
     let resp =
         stack.http.post(format!("{}/resend-verification", stack.base_url)).json(&json!({ "email": email })).send().await.unwrap();
@@ -574,7 +608,10 @@ async fn resend_verification_is_202_for_unknown_and_already_verified_addresses_t
 async fn resend_verification_is_rate_limited_to_once_per_minute() {
     let stack = skip_without_rhypedb!();
     let email = "mallory@example.com";
-    signup(&stack, email, "mallory's password!!").await;
+    // Created directly (bypassing signup, which is itself a send — see
+    // `resend_immediately_after_signup_is_rate_limited_too`) so this test's
+    // first resend is a genuinely fresh send for this address.
+    stack.app_state.db.create_user(email, "irrelevant-hash").await.unwrap().unwrap();
 
     let resp = stack.http.post(format!("{}/resend-verification", stack.base_url)).json(&json!({ "email": email })).send().await.unwrap();
     assert_eq!(resp.status(), 202);
@@ -589,6 +626,26 @@ async fn resend_verification_is_rate_limited_to_once_per_minute() {
 
     let resp = visit_verify_link(&stack, &token_after_second).await;
     assert!(redirect_location(&resp).contains("verified=1"), "the token that survived the rate limit should still verify");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resend_immediately_after_signup_is_rate_limited_too() {
+    let stack = skip_without_rhypedb!();
+    let email = "quentin@example.com";
+    signup(&stack, email, "quentin's password!!").await;
+    let token_from_signup = extract_verify_token(&stack, email);
+
+    // Signup's own send must count against the same limiter a plain resend
+    // uses — a resend moments later is silently rate-limited (202, no new
+    // mail), not treated as the address's first send.
+    let resp = stack.http.post(format!("{}/resend-verification", stack.base_url)).json(&json!({ "email": email })).send().await.unwrap();
+    assert_eq!(resp.status(), 202);
+    let token_after_resend = extract_verify_token(&stack, email);
+    assert_eq!(token_from_signup, token_after_resend, "signup's send should count, so an immediate resend must not issue a new token");
+
+    // The signup mail's original token is still the one that verifies.
+    let resp = visit_verify_link(&stack, &token_from_signup).await;
+    assert!(redirect_location(&resp).contains("verified=1"));
 }
 
 // ── Tokens: claims + JWKS verification ────────────────────────────────────
@@ -916,4 +973,59 @@ async fn health_is_ok() {
     let resp = stack.http.get(format!("{}/health", stack.base_url)).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.unwrap(), "ok");
+}
+
+// ── Phase 1b: mail-provider failure ────────────────────────────────────────
+
+fn assert_mail_failed_response(body: &Value) {
+    assert_eq!(body["error"], "mail_failed");
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("Send it again"), "unexpected message: {message}");
+    assert!(!message.contains("Resend") && !message.contains("422"), "provider detail leaked into the response: {message}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn signup_maps_a_mail_failure_to_502_without_leaking_the_provider_response() {
+    let stack = match spawn_stack_with_mailer(std::sync::Arc::new(FailingMailer)).await {
+        Some(s) => s,
+        None => {
+            eprintln!("SKIP: no rhypedb-server binary found");
+            return;
+        }
+    };
+    let resp = stack
+        .http
+        .post(format!("{}/signup", stack.base_url))
+        .json(&json!({ "email": "bounces@example.com", "password": "whatever password" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+    assert_mail_failed_response(&resp.json().await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resend_verification_maps_a_mail_failure_to_502_without_leaking_the_provider_response() {
+    let stack = match spawn_stack_with_mailer(std::sync::Arc::new(FailingMailer)).await {
+        Some(s) => s,
+        None => {
+            eprintln!("SKIP: no rhypedb-server binary found");
+            return;
+        }
+    };
+    // The user must exist (and be unverified) for resend to attempt a send
+    // at all; signup itself already fails to mail, so create the row
+    // directly rather than through the API.
+    let user = stack.app_state.db.create_user("bounces2@example.com", "irrelevant-hash").await.unwrap().unwrap();
+    let _ = user;
+
+    let resp = stack
+        .http
+        .post(format!("{}/resend-verification", stack.base_url))
+        .json(&json!({ "email": "bounces2@example.com" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+    assert_mail_failed_response(&resp.json().await.unwrap());
 }

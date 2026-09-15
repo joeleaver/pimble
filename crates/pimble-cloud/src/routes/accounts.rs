@@ -75,15 +75,27 @@ async fn issue_session(state: &AppState, user: &UserRow) -> CloudResult<Response
 
 /// (Re)issues a verify token for `user_rid`/`email` and sends the mail:
 /// a fresh signup, a signup retry against an existing unverified address,
-/// and `POST /resend-verification` all funnel through here.
+/// and `POST /resend-verification` all funnel through here. Every call
+/// records the send against `resend_rate_limit`, keyed on the lowercased
+/// address — signup and a signup retry aren't themselves rate-limited (they
+/// always send), but they count as a send, so a `resend-verification`
+/// moments later still sees one and stays silent instead of finding an
+/// empty map.
 async fn start_verification(state: &AppState, user_rid: u64, email: &str) -> CloudResult<()> {
     let (token, token_hash) = new_verify_token();
     let expires_at_ms = chrono::Utc::now().timestamp_millis() + VERIFY_TTL_MS;
     state.db.set_verify_token(user_rid, &token_hash, expires_at_ms).await?;
+    state.resend_rate_limit.record(&email.to_lowercase());
 
     let link = format!("{}/api/v1/verify?token={token}", state.config.public_url.trim_end_matches('/'));
     let (subject, text, html) = verification_email(&link);
-    state.mailer.send(email, subject, &text, &html).await?;
+    // The user already exists at this point (created or found above); the
+    // provider's raw response (which may echo back the rejected address or
+    // other detail) never reaches the caller — only this log line sees it.
+    state.mailer.send(email, subject, &text, &html).await.map_err(|e| {
+        tracing::warn!(%email, error = %e, "sending the verification email failed");
+        CloudError::MailFailed
+    })?;
     Ok(())
 }
 

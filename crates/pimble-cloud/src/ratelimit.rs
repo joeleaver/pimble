@@ -34,4 +34,15 @@ impl RateLimiter {
             }
         }
     }
+
+    /// Unconditionally marks `key` as used just now, regardless of whether
+    /// it was already within its cooldown. Used by every code path that
+    /// actually sends mail but isn't itself gated by this limiter (signup,
+    /// and a signup retry against an existing unverified address both
+    /// always send) — so a `resend-verification` moments later still sees a
+    /// recent send and stays silent, instead of finding an empty map because
+    /// only `try_acquire` ever wrote to it.
+    pub fn record(&self, key: &str) {
+        self.last.lock().expect("RateLimiter mutex poisoned").insert(key.to_string(), std::time::Instant::now());
+    }
 }

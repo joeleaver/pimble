@@ -34,6 +34,10 @@ pub enum CloudError {
     /// in a way the caller didn't cause and can't fix by retrying with
     /// different input.
     Internal(String),
+    /// 502 — the mail provider rejected or failed to send a verification
+    /// email (Phase 1b). The provider's raw response never reaches the
+    /// caller; the call site logs it at `warn` instead.
+    MailFailed,
 }
 
 impl CloudError {
@@ -46,6 +50,11 @@ impl CloudError {
             CloudError::NotFound(m) => (StatusCode::NOT_FOUND, "not_found", m.as_str()),
             CloudError::Conflict(m) => (StatusCode::CONFLICT, "conflict", m.as_str()),
             CloudError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, "internal", m.as_str()),
+            CloudError::MailFailed => (
+                StatusCode::BAD_GATEWAY,
+                "mail_failed",
+                "We couldn't send the verification email. Try again in a minute with \"Send it again\".",
+            ),
         }
     }
 }

@@ -36,11 +36,18 @@ use state::AppState;
 /// through `AppState::mailer` — see `tests/integration.rs`) alongside the
 /// router built from it.
 pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
+    let mailer = mail::build_mailer(&config);
+    build_state_with_mailer(config, mailer).await
+}
+
+/// Like [`build_state`], but with the mailer supplied rather than chosen
+/// from `config` — lets a test substitute one that always fails, to cover
+/// how a mail-provider failure is handled (`tests/integration.rs`).
+pub async fn build_state_with_mailer(config: Config, mailer: std::sync::Arc<dyn mail::Mailer>) -> anyhow::Result<AppState> {
     let db = RhypeDb::connect(&config.rhypedb_addr).await?;
     let pimble = PimbleService::connect(&config).await?;
     let signer = JwtSigner::from_config(&config);
     let releases = ReleasesCache::new(config.github_repo.clone(), config.releases_base_url.clone());
-    let mailer = mail::build_mailer(&config);
     Ok(AppState::new(config, db, pimble, signer, releases, mailer))
 }
 
