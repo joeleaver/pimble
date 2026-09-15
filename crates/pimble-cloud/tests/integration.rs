@@ -15,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -108,13 +109,42 @@ fn drain_into(reader: impl std::io::Read + Send + 'static, into: std::sync::Arc<
     });
 }
 
-/// Spawn the real `rhypedb-server` binary at `binary` and wait for its
-/// binary-protocol port to accept connections. `Err` (never `None`) on any
-/// failure — a binary that was found but wouldn't start, crashed during
-/// startup, or never opened its port is a real test failure, not something
-/// to skip past; only "no binary exists anywhere" (checked by the caller
-/// before this is called at all) is a skip.
+/// How many times a port-picking spawn (`spawn_rhypedb`, the in-process
+/// Pimble server, this crate's own axum app, the GitHub stub) retries with a
+/// fresh port before giving up for real. `free_port` (below) probes for a
+/// free port by binding it and immediately releasing it — a TOCTOU race
+/// against anything else (most likely another concurrently-starting test's
+/// same probe) that grabs that exact port before the real server binds it a
+/// moment later. One retry with a freshly-probed port almost always clears
+/// it; five is generous headroom.
+const MAX_PORT_ATTEMPTS: u32 = 5;
+const PORT_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Spawn the real `rhypedb-server` binary at `binary`, retrying with fresh
+/// ports (see `MAX_PORT_ATTEMPTS`) if it exits early or its port never
+/// opens. `Err` (never `None`) once attempts are exhausted — a binary that
+/// exists but never starts even after retries is a real test failure, not
+/// something to skip past; only "no binary exists anywhere" (checked by the
+/// caller before this is called at all) is a skip.
 async fn spawn_rhypedb(binary: &Path, data_dir: &Path, schema_path: &Path) -> Result<RhypeDbGuard, String> {
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_PORT_ATTEMPTS {
+        match try_spawn_rhypedb(binary, data_dir, schema_path).await {
+            Ok(guard) => return Ok(guard),
+            Err(e) => {
+                last_err = format!("attempt {attempt}/{MAX_PORT_ATTEMPTS}: {e}");
+                if attempt < MAX_PORT_ATTEMPTS {
+                    tokio::time::sleep(PORT_RETRY_BACKOFF).await;
+                }
+            }
+        }
+    }
+    Err(format!("giving up after {MAX_PORT_ATTEMPTS} attempts; {last_err}"))
+}
+
+/// One attempt: probe two fresh ports, spawn `rhypedb-server` on them, and
+/// wait for its binary-protocol port to accept connections.
+async fn try_spawn_rhypedb(binary: &Path, data_dir: &Path, schema_path: &Path) -> Result<RhypeDbGuard, String> {
     let http_port = free_port();
     let tcp_port = free_port();
     let mut child = Command::new(binary)
@@ -158,12 +188,82 @@ async fn spawn_rhypedb(binary: &Path, data_dir: &Path, schema_path: &Path) -> Re
     Ok(RhypeDbGuard { child, addr, _output: output })
 }
 
+/// Binds an ephemeral loopback port for this crate's own axum app or the
+/// GitHub stub, retrying (see `MAX_PORT_ATTEMPTS`) on the off chance the OS
+/// hands back a port another racing bind grabs first. `bind(..:0)` asks the
+/// OS to assign whatever's free, so unlike `free_port` there's no
+/// probe-then-release gap — this is defense in depth, not the fix for the
+/// observed flake (that was `free_port`, in `try_spawn_rhypedb`).
+async fn bind_ephemeral_loopback() -> tokio::net::TcpListener {
+    let mut last_err = None;
+    for attempt in 1..=MAX_PORT_ATTEMPTS {
+        match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => return listener,
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < MAX_PORT_ATTEMPTS {
+                    tokio::time::sleep(PORT_RETRY_BACKOFF).await;
+                }
+            }
+        }
+    }
+    panic!("binding an ephemeral loopback port failed after {MAX_PORT_ATTEMPTS} attempts: {last_err:?}");
+}
+
+/// Caps how many `Stack`s run at once. `cargo test`'s default parallelism
+/// (one thread per CPU) would otherwise try to start as many
+/// `rhypedb-server` subprocesses simultaneously as there are tests, each
+/// probing two "free" ports — the more of those racing at the same instant,
+/// the more often one loses the race in `try_spawn_rhypedb`. Limiting
+/// concurrency keeps that rare instead of routine; the retry loop above is
+/// the other half of the fix, for whenever it still happens.
+const MAX_CONCURRENT_STACKS: usize = 4;
+
+fn stack_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEMAPHORE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    SEMAPHORE.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_STACKS))
+}
+
+/// Starts the in-process Pimble server on an OS-assigned loopback port,
+/// retrying (see `MAX_PORT_ATTEMPTS`) if `start` fails for any reason —
+/// `addr: "127.0.0.1:0"` means the OS hands out whatever's free, so this is
+/// defense in depth (see `bind_ephemeral_loopback`), not the fix for the
+/// observed flake.
+async fn start_pimble_server(creds_dir: &Path, replicas_dir: &Path, service_token: &str) -> pimble_server::PimbleServer {
+    let mut last_err = None;
+    for attempt in 1..=MAX_PORT_ATTEMPTS {
+        let mut pimble_server = pimble_server::PimbleServer::with_config(pimble_server::ServerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            auth_token: Some(service_token.to_string()),
+            credentials_path: Some(creds_dir.join("credentials.json")),
+            replicas_dir: Some(replicas_dir.to_path_buf()),
+            // Forward-compatible with fields agent B is concurrently adding
+            // to `ServerConfig` (JWT verification, origin allowlist): this
+            // service only exercises the pre-existing static-token mode.
+            ..Default::default()
+        });
+        match pimble_server.start().await {
+            Ok(()) => return pimble_server,
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < MAX_PORT_ATTEMPTS {
+                    tokio::time::sleep(PORT_RETRY_BACKOFF).await;
+                }
+            }
+        }
+    }
+    panic!("in-process Pimble server failed to start after {MAX_PORT_ATTEMPTS} attempts: {last_err:?}");
+}
+
 /// Everything a test needs: the two real backing servers plus the cloud
 /// service's own axum app, all bound to ephemeral loopback ports. Dropping
 /// it tears the stack down (kills the rhypedb-server subprocess, aborts the
 /// cloud app's serve task; the in-process Pimble server and its temp dirs go
 /// with the struct).
 pub struct Stack {
+    /// Held for this `Stack`'s whole lifetime, released on drop — see
+    /// `MAX_CONCURRENT_STACKS`.
+    _stack_permit: tokio::sync::SemaphorePermit<'static>,
     _rhypedb: RhypeDbGuard,
     _rhypedb_data_dir: tempfile::TempDir,
     _rhypedb_schema_dir: tempfile::TempDir,
@@ -205,9 +305,13 @@ pub async fn spawn_stack_with_mailer(mailer: std::sync::Arc<dyn pimble_cloud::ma
 
 async fn spawn_stack_inner(releases_base_url: Option<String>, mailer_override: Option<std::sync::Arc<dyn pimble_cloud::mail::Mailer>>) -> Option<Stack> {
     // The ONLY skip condition: no rhypedb-server binary exists anywhere we
-    // know to look. A binary that exists but fails to start is a real test
-    // failure (`spawn_rhypedb`'s `expect` below panics with its stderr/stdout).
+    // know to look. A binary that exists but fails to start (even after
+    // `spawn_rhypedb`'s retries) is a real test failure, not a skip.
     let binary = find_rhypedb_server_binary()?;
+
+    // Acquired before starting anything below, held for the whole `Stack`'s
+    // lifetime: caps how many of these run at once (`MAX_CONCURRENT_STACKS`).
+    let stack_permit = stack_semaphore().acquire().await.expect("stack semaphore is never closed");
 
     let rhypedb_schema_dir = tempfile::tempdir().unwrap();
     let schema_path = rhypedb_schema_dir.path().join("schema.rhype");
@@ -221,17 +325,7 @@ async fn spawn_stack_inner(releases_base_url: Option<String>, mailer_override: O
     let service_token = "pimble-cloud-test-service-token".to_string();
     let pimble_creds_dir = tempfile::tempdir().unwrap();
     let pimble_replicas_dir = tempfile::tempdir().unwrap();
-    let mut pimble_server = pimble_server::PimbleServer::with_config(pimble_server::ServerConfig {
-        addr: "127.0.0.1:0".parse().unwrap(),
-        auth_token: Some(service_token.clone()),
-        credentials_path: Some(pimble_creds_dir.path().join("credentials.json")),
-        replicas_dir: Some(pimble_replicas_dir.path().to_path_buf()),
-        // Forward-compatible with fields agent B is concurrently adding to
-        // `ServerConfig` (JWT verification, origin allowlist): this service
-        // only exercises the pre-existing static-token mode.
-        ..Default::default()
-    });
-    pimble_server.start().await.expect("pimble server starts");
+    let pimble_server = start_pimble_server(pimble_creds_dir.path(), pimble_replicas_dir.path(), &service_token).await;
     let pimble_addr = pimble_server.addr();
 
     let stores_dir = tempfile::tempdir().unwrap();
@@ -271,13 +365,14 @@ async fn spawn_stack_inner(releases_base_url: Option<String>, mailer_override: O
         None => pimble_cloud::build_state(config).await.expect("build_state"),
     };
     let router = pimble_cloud::router_from_state(app_state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = bind_ephemeral_loopback().await;
     let addr = listener.local_addr().unwrap();
     let cloud_server = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
 
     Some(Stack {
+        _stack_permit: stack_permit,
         _rhypedb: rhypedb,
         _rhypedb_data_dir: rhypedb_data_dir,
         _rhypedb_schema_dir: rhypedb_schema_dir,
@@ -951,7 +1046,7 @@ async fn spawn_github_stub(body: Value, status: axum::http::StatusCode) -> (Stri
             async move { (status, axum::Json(body)) }
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = bind_ephemeral_loopback().await;
     let addr = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
