@@ -39,7 +39,7 @@ re-import from Scrivener.
 | `pimble-rpc` / `pimble-server` / `pimble-client` | RPC protocol, embedded server, WebSocket client | Complete |
 | `pimble-search` | rhypedb index per store: keyword (`@fulltext`, BM25), chunked embeddings behind `semantic`, backlinks | Complete |
 | `pimble-plugins` | `NodePlugin` trait, built-ins | Skeleton |
-| `pimble-app` | rinch desktop app | Works: two-window live editing, persistence, local mounts, replica sync UI |
+| `pimble-app` | rinch desktop app | Works: two-window live editing, persistence, local and remote mounts, replica sync UI |
 | `pimble-cli` | server, stores, nodes, mounts, replica sync, search | Complete |
 | `pimble-import` | Scrivener + RTF import | Complete |
 
@@ -71,7 +71,8 @@ results update while typing (rhypedb #17).
 
 ### Mounts (local, done 2026-09-14)
 
-A mount node (`node_type = "mount"`, `MountRef { source_store, source_node, source_path }`
+A mount node (`node_type = "mount"`, `MountRef { source_store, source_node, source_path,
+source_remote }`
 in `metadata.custom`) is a placeholder in the mounting store: `getNode` returns it with no
 children or content, `getChildren` returns the source node's children, and
 `GetChildrenResponse.store_id` names the store they live in. Every node the app holds is
@@ -82,9 +83,36 @@ appear in several places; `parse_tree_value` returns the canonical pair. The ser
 a source store it needs (registry, then the `source_path` hint) and treats it as an
 ordinary open store; the app discovers it via `listStores` when it sees an unknown store
 id and adds it to the open-store list. Cycles are rejected at `createMount`. Creating a
-child of a mount node is an error; the app creates under the source instead. Remote
-sources, `MountState::Cached` and `Connecting` are not implemented. Contract:
+child of a mount node is an error; the app creates under the source instead. Contract:
 `docs/history/MOUNTS_CONTRACT.md`.
+
+### Remote mounts (done 2026-09-15)
+
+A mount whose source store is not on this machine resolves by making the source a replica
+here and then resolving locally. `RpcHandler::resolve_mount` is the one resolution path
+(`getMountState`, `getChildren` on a mount, `createMount`): the local chain first (open,
+registry, `source_path`), then `MountRef.source_remote` (a URL only, filled by `createMount`
+when the source is a linked replica), then the mounting store's own `sync.json` remote
+(a store and the stores it mounts usually live on the same server). A remote candidate
+means creating a replica exactly as `addRemoteStore` does (`create_replica_from`), in a
+detached task; the RPC answers `Connecting` at once and a per-source in-flight set makes
+two resolutions start one task. Mount state is derived from the source's link, never
+stored: no link or `Synced` is `Live`; `Syncing`/`Offline` is `Cached { last_sync }` once
+the link has ever synced (`SyncConfig.last_sync`, written on transitions into and out of
+`Synced`) and `Connecting` until then; nothing to try or a failed attempt is
+`Unavailable { reason }`. The server remembers which mounts it resolved per source
+(`resolved_mounts`, pruned when the mounting store closes or the mount node is deleted)
+and sends `StoreChangeKind::MountStateChanged { node_id, state }` on the mounting store
+when the source's link changes category or a background creation ends; links never
+forward it. A store opened implicitly (mount resolution, replica creation) gets everything
+`openStore` gives one: index, sync link from `sync.json`, tree repair (`adopt_newly_opened`).
+`getChildren` on a mount whose source is not open is an error naming the state. App:
+"Mount Remote Store Here..." (the Add Remote Store modal with a target node; two RPCs,
+`addRemoteStore` skipped when the store is already open here), label suffixes
+"(connecting...)", "(offline copy)", "(unavailable)", and a same-kind dedup on
+`MountStateChanged` (a down link flaps `Syncing`/`Offline` on every backoff tick). CLI:
+`mount-remote-store`, `mount-state` prints all four states. Contract:
+`docs/history/REMOTE_MOUNTS_CONTRACT.md`.
 
 ### Replica sync (local ↔ remote server, done 2026-09-15)
 
@@ -97,17 +125,23 @@ shuttles live updates both ways: remote `storeChanged` notifications carry the y
 (`TreeStructure` from `applyStoreUpdate`, `ContentUpdated` from `applyEdit`) and are
 applied through the handler's own `apply_edit`/`apply_store_update` with
 `client_id = "sync-link:<uuid>"`; local notifications reach the link through an in-process
-broadcast and are forwarded unless their source is any `sync-link:` id (that rule is what
-stops echo storms across chains of servers). `addRemoteStore` creates an empty replica
+broadcast and are forwarded unless their source is this link's own id, so an edit travels
+a whole chain of servers; a bounce back to a server that already has the change is a no-op
+merge there and sends nothing, which is what stops echo storms. `addRemoteStore` creates an empty replica
 (never `StoreDocument::new`: two roots for one id would merge into duplicated children) in
 `<data dir>/pimble/replicas/<store id>.pimble` and links it; `setStoreSync` links or
 unlinks an existing store. A store already open on this server is refused as a replica, and
 a store cannot be linked to the server it lives on. `removeReplica` stops, closes and
 deletes a replica (only inside the replicas directory; not while unsynced unless `force`).
-Remote mounts, partial replication and TLS are not done. Contract:
+Partial replication and TLS are not done. Contract:
 `docs/history/SYNC_CONTRACT.md`; CLI: `server --addr --open --token-file`, `token`,
 `add-remote-store`, `link-store`, `unlink-store`, `sync-state`, `remote-stores`,
-`remove-replica`, `move-node`, `delete-node`, `PIMBLE_SERVER`, `PIMBLE_TOKEN`.
+`remove-replica`, `mount-remote-store`, `move-node`, `delete-node`, `PIMBLE_SERVER`,
+`PIMBLE_TOKEN`. `set-node-text` is an `applyEdit` of `ContentDoc::replace_plain_text`
+(an edit of the node's existing document); `updateNodeContent` replaces the document
+wholesale and is only right for a node whose content was never written (the importer),
+since a replacement shares no history with the copies replicas hold and merges in beside
+the old paragraphs instead of replacing them.
 
 ### Hardening (done 2026-09-14)
 
