@@ -32,7 +32,9 @@ proxy **off** (DNS only): jkbase terminates TLS itself. Records in the Cloudflar
 | TXT | `_jkbase-challenge` | the token `jkbase domain list --project pimble` shows for `pimble.app` |
 | TXT | `_jkbase-challenge.www` | the token it shows for `www.pimble.app` |
 
-Then `jkbase domain verify pimble.app` and `jkbase domain verify www.pimble.app`; the
+All four records were created and both hosts verified on 2026-09-15; Let's Encrypt
+certificates for `pimble.app` and `www.pimble.app` are issued. For a new host: `jkbase
+domain add`, add its records, then `jkbase domain verify <host>`; the
 certificate follows within a minute or two (`domain list` shows `tls: provisioning` until
 then). `.app` is on the HSTS preload list, so the site is only ever reachable over HTTPS.
 
