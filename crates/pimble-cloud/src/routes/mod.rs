@@ -14,6 +14,8 @@ use crate::state::AppState;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/signup", post(accounts::signup))
+        .route("/api/v1/verify", get(accounts::verify))
+        .route("/api/v1/resend-verification", post(accounts::resend_verification))
         .route("/api/v1/login", post(accounts::login))
         .route("/api/v1/logout", post(accounts::logout))
         .route("/api/v1/me", get(accounts::me))

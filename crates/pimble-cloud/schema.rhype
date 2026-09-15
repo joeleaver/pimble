@@ -31,6 +31,14 @@ type User {
     email_lower: String @unique
     password_hash: String
     created_at: DateTime
+    // Phase 1b (email verification): unverified at signup. `verify_token_hash`
+    // is sha256(opaque verify token), empty string once verified or replaced
+    // by a newer token (an empty query token is rejected before it would ever
+    // match this sentinel — see routes/accounts.rs::verify). `verify_expires_at`
+    // is 24h from when the token was (re)issued.
+    verified: Bool
+    verify_token_hash: String
+    verify_expires_at: DateTime
 }
 
 type Session {

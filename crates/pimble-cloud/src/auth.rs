@@ -49,6 +49,7 @@ pub fn verify_password_constant_time(password: &str, stored: Option<&str>) -> bo
 }
 
 const SESSION_TOKEN_BYTES: usize = 32;
+const VERIFY_TOKEN_BYTES: usize = 32;
 
 /// A fresh opaque session token (returned to the client) and its hash (what
 /// the `Session` row actually stores — docs/CLOUD_CONTRACT.md: "sessions of
@@ -62,7 +63,26 @@ pub fn new_session_token() -> (String, String) {
 }
 
 pub fn hash_session_token(token: &str) -> String {
+    sha256_hex(token)
+}
+
+/// A fresh opaque email-verification token (embedded in the `/verify?token=`
+/// link) and its hash (what `User::verify_token_hash` stores — Phase 1b:
+/// "generates a 32-byte random token (stored hashed, 24 h expiry)").
+pub fn new_verify_token() -> (String, String) {
+    let mut bytes = [0u8; VERIFY_TOKEN_BYTES];
+    rand::rng().fill_bytes(&mut bytes);
+    let token = hex::encode(bytes);
+    let hash = hash_verify_token(&token);
+    (token, hash)
+}
+
+pub fn hash_verify_token(token: &str) -> String {
+    sha256_hex(token)
+}
+
+fn sha256_hex(s: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
+    hasher.update(s.as_bytes());
     hex::encode(hasher.finalize())
 }

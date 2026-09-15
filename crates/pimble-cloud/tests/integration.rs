@@ -158,6 +158,11 @@ pub struct Stack {
     _stores_dir: tempfile::TempDir,
     pub base_url: String,
     pub http: reqwest::Client,
+    /// Kept so tests can reach the [`pimble_cloud::mail::LogMailer`] through
+    /// `app_state.mailer` (Phase 1b: every test runs with no `RESEND_API_KEY`,
+    /// so this is always a `LogMailer`) and the DB directly (e.g. to force a
+    /// verify token's expiry in the past).
+    pub app_state: pimble_cloud::state::AppState,
     cloud_server: tokio::task::JoinHandle<()>,
 }
 
@@ -218,12 +223,21 @@ pub async fn spawn_stack_with_releases_base_url(releases_base_url: Option<String
         jkbase_auth_issuer_url: None,
         jkbase_auth_key: None,
         dev_signing_seed: Some(dev_seed),
+        // A fake host: not actually resolvable. Tests never dereference a
+        // full verify link against this address — they pull the `token`
+        // query parameter out of it and hit `stack.base_url` (the real
+        // bound address) directly. See `extract_verify_token`.
         public_url: "http://cloud.test".to_string(),
         github_repo: "joeleaver/pimble".to_string(),
         releases_base_url,
+        // No RESEND_API_KEY: every test runs against `LogMailer`, which is
+        // exactly what `extract_verify_token` and friends rely on.
+        resend_api_key: None,
+        mail_from: "Pimble <no-reply@m.pimble.app>".to_string(),
     };
 
-    let router = pimble_cloud::build_router(config).await.expect("build_router");
+    let app_state = pimble_cloud::build_state(config).await.expect("build_state");
+    let router = pimble_cloud::router_from_state(app_state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let cloud_server = tokio::spawn(async move {
@@ -241,6 +255,7 @@ pub async fn spawn_stack_with_releases_base_url(releases_base_url: Option<String
         _stores_dir: stores_dir,
         base_url: format!("http://{addr}/api/v1"),
         http: reqwest::Client::new(),
+        app_state,
         cloud_server,
     })
 }
@@ -260,7 +275,9 @@ macro_rules! skip_without_rhypedb {
     };
 }
 
-async fn signup(stack: &Stack, email: &str, password: &str) -> (Value, String) {
+/// `POST /signup` (Phase 1b: 202, no session — see docs/CLOUD_CONTRACT.md
+/// "Phase 1b: email verification").
+async fn signup(stack: &Stack, email: &str, password: &str) -> Value {
     let resp = stack
         .http
         .post(format!("{}/signup", stack.base_url))
@@ -268,14 +285,65 @@ async fn signup(stack: &Stack, email: &str, password: &str) -> (Value, String) {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "signup for {email} should succeed");
+    assert_eq!(resp.status(), 202, "signup for {email} should be accepted (verification pending)");
+    resp.json().await.unwrap()
+}
+
+fn first_cookie_pair(resp: &reqwest::Response) -> String {
+    resp.headers().get("set-cookie").unwrap().to_str().unwrap().split(';').next().unwrap().to_string()
+}
+
+async fn login(stack: &Stack, email: &str, password: &str) -> (Value, String) {
+    let resp = stack.http.post(format!("{}/login", stack.base_url)).json(&json!({ "email": email, "password": password })).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "login for {email} should succeed");
     let cookie = first_cookie_pair(&resp);
     let body: Value = resp.json().await.unwrap();
     (body, cookie)
 }
 
-fn first_cookie_pair(resp: &reqwest::Response) -> String {
-    resp.headers().get("set-cookie").unwrap().to_str().unwrap().split(';').next().unwrap().to_string()
+/// A `reqwest::Client` that does not follow redirects — `GET /verify` always
+/// answers 303, and a normal client would try to follow it to a `/login.html`
+/// this test stack never serves.
+fn no_redirect_client() -> reqwest::Client {
+    reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap()
+}
+
+/// Pulls the verify token last sent (via `LogMailer`) to `email` out of
+/// `stack.app_state`. Panics with a clear message if no mail was sent —
+/// every test that calls this expects one to be waiting.
+fn extract_verify_token(stack: &Stack, email: &str) -> String {
+    let log_mailer = stack.app_state.mailer.as_log_mailer().expect("test stack must run with LogMailer (no RESEND_API_KEY)");
+    let body = log_mailer.last_message(email).unwrap_or_else(|| panic!("no verification email was sent to {email}"));
+    let link = pimble_cloud::mail::first_url(&body).unwrap_or_else(|| panic!("verification email body had no link:\n{body}"));
+    // `link` is `<fake public_url>/api/v1/verify?token=<hex>`; only the
+    // token is usable against this test stack's real bound address (see
+    // `spawn_stack_with_releases_base_url`'s comment on `public_url`).
+    link.rsplit("token=").next().unwrap().to_string()
+}
+
+async fn visit_verify_link(stack: &Stack, token: &str) -> reqwest::Response {
+    no_redirect_client().get(format!("{}/verify?token={token}", stack.base_url)).send().await.unwrap()
+}
+
+fn redirect_location(resp: &reqwest::Response) -> String {
+    resp.headers().get("location").unwrap().to_str().unwrap().to_string()
+}
+
+/// Consumes the verify token last sent to `email`, asserts it redirects to
+/// `verified=1`, and logs in. Does not sign up — call [`signup`] first (or
+/// use [`signup_verify_login`], which does both).
+async fn verify_then_login(stack: &Stack, email: &str, password: &str) -> (Value, String) {
+    let token = extract_verify_token(stack, email);
+    let resp = visit_verify_link(stack, &token).await;
+    assert_eq!(resp.status(), 303, "verify should redirect");
+    let location = redirect_location(&resp);
+    assert!(location.contains("verified=1"), "unexpected redirect: {location}");
+    login(stack, email, password).await
+}
+
+async fn signup_verify_login(stack: &Stack, email: &str, password: &str) -> (Value, String) {
+    signup(stack, email, password).await;
+    verify_then_login(stack, email, password).await
 }
 
 // ── Accounts: signup / login / logout / me ────────────────────────────────
@@ -286,7 +354,13 @@ async fn signup_login_logout_me_round_trip() {
     let email = "alice@example.com";
     let password = "correct horse battery staple";
 
-    let (body, cookie) = signup(&stack, email, password).await;
+    let signup_body = signup(&stack, email, password).await;
+    assert_eq!(signup_body["status"], "verification_sent");
+    assert_eq!(signup_body["email"], email);
+    assert!(signup_body.get("session").is_none(), "signup must not start a session");
+    assert!(signup_body.get("token").is_none(), "signup must not mint a token");
+
+    let (body, cookie) = verify_then_login(&stack, email, password).await;
     assert_eq!(body["user"]["email"], email);
     assert!(body["user"]["id"].as_str().is_some(), "user id (the sub UUID) should be present");
     let session_token = body["session"].as_str().unwrap().to_string();
@@ -343,14 +417,28 @@ async fn wrong_password_and_unknown_email_are_both_401() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn duplicate_email_is_409() {
+async fn duplicate_email_is_409_once_verified_but_202_while_unverified() {
     let stack = skip_without_rhypedb!();
     signup(&stack, "dupe@example.com", "first password!").await;
 
+    // Still unverified: a duplicate signup just re-sends the link — 202,
+    // no enumeration (docs/CLOUD_CONTRACT.md "Phase 1b").
     let resp = stack
         .http
         .post(format!("{}/signup", stack.base_url))
         .json(&json!({ "email": "dupe@example.com", "password": "second password!" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+
+    // Verify (with the ORIGINAL password — a re-send never changes it), then
+    // a duplicate signup is a real 409.
+    verify_then_login(&stack, "dupe@example.com", "first password!").await;
+    let resp = stack
+        .http
+        .post(format!("{}/signup", stack.base_url))
+        .json(&json!({ "email": "dupe@example.com", "password": "third password!" }))
         .send()
         .await
         .unwrap();
@@ -360,11 +448,147 @@ async fn duplicate_email_is_409() {
     let resp = stack
         .http
         .post(format!("{}/signup", stack.base_url))
-        .json(&json!({ "email": "DUPE@example.com", "password": "third password!" }))
+        .json(&json!({ "email": "DUPE@example.com", "password": "fourth password!" }))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 409);
+}
+
+// ── Phase 1b: email verification ──────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn login_before_verification_is_403_email_unverified() {
+    let stack = skip_without_rhypedb!();
+    let email = "oscar@example.com";
+    let password = "oscar's unverified password";
+    signup(&stack, email, password).await;
+
+    let resp = stack.http.post(format!("{}/login", stack.base_url)).json(&json!({ "email": email, "password": password })).send().await.unwrap();
+    assert_eq!(resp.status(), 403);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "email_unverified");
+
+    // The password check still runs first: a wrong password is 401, not
+    // "email_unverified" (which would leak that the email exists yet the
+    // password was never even checked).
+    let resp =
+        stack.http.post(format!("{}/login", stack.base_url)).json(&json!({ "email": email, "password": "not oscar's password" })).send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn expired_verify_token_redirects_with_expired() {
+    let stack = skip_without_rhypedb!();
+    let email = "nina@example.com";
+    signup(&stack, email, "nina's password!!").await;
+    let token = extract_verify_token(&stack, email);
+
+    // Force the already-issued token into the past (no way to wait out the
+    // real 24h TTL in a test) by re-setting the SAME hash with an expired
+    // timestamp, reaching the DB directly through `stack.app_state`.
+    let user = stack.app_state.db.find_user_by_email(email).await.unwrap().unwrap();
+    let past_ms = chrono::Utc::now().timestamp_millis() - 1_000;
+    stack.app_state.db.set_verify_token(user.rid, &user.verify_token_hash, past_ms).await.unwrap();
+
+    let resp = visit_verify_link(&stack, &token).await;
+    assert_eq!(resp.status(), 303);
+    assert!(redirect_location(&resp).contains("verify_error=expired"));
+
+    // An unknown token (never issued, or already consumed) redirects with
+    // "invalid" rather than "expired".
+    let resp = visit_verify_link(&stack, &"0".repeat(64)).await;
+    assert!(redirect_location(&resp).contains("verify_error=invalid"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn second_signup_for_unverified_address_resends_and_invalidates_the_old_token() {
+    let stack = skip_without_rhypedb!();
+    let email = "judy@example.com";
+    signup(&stack, email, "judy's real password!!").await;
+    let old_token = extract_verify_token(&stack, email);
+
+    let resp = stack
+        .http
+        .post(format!("{}/signup", stack.base_url))
+        .json(&json!({ "email": email, "password": "ignored on a resend" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    let new_token = extract_verify_token(&stack, email);
+    assert_ne!(old_token, new_token, "a re-sent signup should issue a fresh token");
+
+    let resp = visit_verify_link(&stack, &old_token).await;
+    assert!(redirect_location(&resp).contains("verify_error=invalid"), "the superseded token must no longer verify");
+
+    let resp = visit_verify_link(&stack, &new_token).await;
+    assert!(redirect_location(&resp).contains("verified=1"));
+
+    // The original password (not the ignored resend one) still works.
+    login(&stack, email, "judy's real password!!").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resend_verification_issues_a_new_token_and_invalidates_the_old() {
+    let stack = skip_without_rhypedb!();
+    let email = "kevin@example.com";
+    signup(&stack, email, "kevin's password!!").await;
+    let old_token = extract_verify_token(&stack, email);
+
+    let resp =
+        stack.http.post(format!("{}/resend-verification", stack.base_url)).json(&json!({ "email": email })).send().await.unwrap();
+    assert_eq!(resp.status(), 202);
+    let new_token = extract_verify_token(&stack, email);
+    assert_ne!(old_token, new_token);
+
+    let resp = visit_verify_link(&stack, &old_token).await;
+    assert!(redirect_location(&resp).contains("verify_error=invalid"));
+    let resp = visit_verify_link(&stack, &new_token).await;
+    assert!(redirect_location(&resp).contains("verified=1"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resend_verification_is_202_for_unknown_and_already_verified_addresses_too() {
+    let stack = skip_without_rhypedb!();
+
+    // Unknown address: 202, no enumeration.
+    let resp = stack
+        .http
+        .post(format!("{}/resend-verification", stack.base_url))
+        .json(&json!({ "email": "nobody-ever-signed-up@example.com" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+
+    // Already verified: also 202, and it's a no-op (login keeps working).
+    let email = "laura@example.com";
+    signup_verify_login(&stack, email, "laura's password!!").await;
+    let resp = stack.http.post(format!("{}/resend-verification", stack.base_url)).json(&json!({ "email": email })).send().await.unwrap();
+    assert_eq!(resp.status(), 202);
+    login(&stack, email, "laura's password!!").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resend_verification_is_rate_limited_to_once_per_minute() {
+    let stack = skip_without_rhypedb!();
+    let email = "mallory@example.com";
+    signup(&stack, email, "mallory's password!!").await;
+
+    let resp = stack.http.post(format!("{}/resend-verification", stack.base_url)).json(&json!({ "email": email })).send().await.unwrap();
+    assert_eq!(resp.status(), 202);
+    let token_after_first = extract_verify_token(&stack, email);
+
+    // A second resend within the same minute is accepted (still 202) but
+    // does nothing — the token in flight does not change.
+    let resp = stack.http.post(format!("{}/resend-verification", stack.base_url)).json(&json!({ "email": email })).send().await.unwrap();
+    assert_eq!(resp.status(), 202);
+    let token_after_second = extract_verify_token(&stack, email);
+    assert_eq!(token_after_first, token_after_second, "a resend within the same minute must be rate-limited");
+
+    let resp = visit_verify_link(&stack, &token_after_second).await;
+    assert!(redirect_location(&resp).contains("verified=1"), "the token that survived the rate limit should still verify");
 }
 
 // ── Tokens: claims + JWKS verification ────────────────────────────────────
@@ -372,8 +596,8 @@ async fn duplicate_email_is_409() {
 #[tokio::test(flavor = "multi_thread")]
 async fn token_claims_and_jwks_verify() {
     let stack = skip_without_rhypedb!();
-    let (signup_body, cookie) = signup(&stack, "erin@example.com", "a fine password").await;
-    let user_id = signup_body["user"]["id"].as_str().unwrap().to_string();
+    let (login_body, cookie) = signup_verify_login(&stack, "erin@example.com", "a fine password").await;
+    let user_id = login_body["user"]["id"].as_str().unwrap().to_string();
 
     let store: Value = stack
         .http
@@ -430,7 +654,7 @@ fn verify_and_decode(token: &str, jwks: &Value) -> Value {
 #[tokio::test(flavor = "multi_thread")]
 async fn create_store_creates_a_real_store_and_an_owner_grant() {
     let stack = skip_without_rhypedb!();
-    let (_signup_body, cookie) = signup(&stack, "frank@example.com", "another fine password").await;
+    let (_login_body, cookie) = signup_verify_login(&stack, "frank@example.com", "another fine password").await;
 
     let resp = stack
         .http
@@ -468,8 +692,8 @@ async fn create_store_creates_a_real_store_and_an_owner_grant() {
 #[tokio::test(flavor = "multi_thread")]
 async fn member_lifecycle_and_last_owner_refusal() {
     let stack = skip_without_rhypedb!();
-    let (owner_body, owner_cookie) = signup(&stack, "grace@example.com", "owner password!!").await;
-    let (_member_body, member_cookie) = signup(&stack, "heidi@example.com", "member password!!").await;
+    let (owner_body, owner_cookie) = signup_verify_login(&stack, "grace@example.com", "owner password!!").await;
+    let (_member_body, member_cookie) = signup_verify_login(&stack, "heidi@example.com", "member password!!").await;
     let member_user_id = stack
         .http
         .get(format!("{}/me", stack.base_url))
@@ -589,7 +813,7 @@ async fn member_lifecycle_and_last_owner_refusal() {
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_store_hides_it() {
     let stack = skip_without_rhypedb!();
-    let (_body, cookie) = signup(&stack, "ivan@example.com", "yet another password").await;
+    let (_body, cookie) = signup_verify_login(&stack, "ivan@example.com", "yet another password").await;
 
     let store: Value = stack
         .http

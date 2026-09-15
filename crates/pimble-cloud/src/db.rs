@@ -100,6 +100,10 @@ pub struct UserRow {
     pub user_uuid: String,
     pub email: String,
     pub password_hash: String,
+    /// Phase 1b (email verification).
+    pub verified: bool,
+    pub verify_token_hash: String,
+    pub verify_expires_at_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +137,9 @@ fn user_from_object(o: &Object) -> CloudResult<UserRow> {
         user_uuid: get_string(o, "user_uuid")?.to_string(),
         email: get_string(o, "email")?.to_string(),
         password_hash: get_string(o, "password_hash")?.to_string(),
+        verified: get_bool(o, "verified")?,
+        verify_token_hash: get_string(o, "verify_token_hash")?.to_string(),
+        verify_expires_at_ms: get_datetime_ms(o, "verify_expires_at")?,
     })
 }
 
@@ -210,18 +217,22 @@ impl RhypeDb {
 
     // ── Users ──────────────────────────────────────────────────────────
 
-    /// `None` on a duplicate `email_lower` (the caller turns that into 409);
-    /// any other RhypeDB failure is `Err`.
+    /// Creates the user unverified (Phase 1b: signup issues a verify token
+    /// separately via [`Self::set_verify_token`], right after this succeeds —
+    /// see `routes/accounts.rs`'s `start_verification`). `None` on a
+    /// duplicate `email_lower` (the caller turns that into 409); any other
+    /// RhypeDB failure is `Err`.
     pub async fn create_user(&self, email: &str, password_hash: &str) -> CloudResult<Option<UserRow>> {
         let user_uuid = uuid::Uuid::new_v4().to_string();
         let email_lower = email.to_lowercase();
         let q = format!(
-            "User.create({{ user_uuid: {uuid}, email: {email}, email_lower: {email_lower}, password_hash: {hash}, created_at: {now} }})",
+            "User.create({{ user_uuid: {uuid}, email: {email}, email_lower: {email_lower}, password_hash: {hash}, created_at: {now}, verified: false, verify_token_hash: {empty}, verify_expires_at: {now} }})",
             uuid = ql_str(&user_uuid),
             email = ql_str(email),
             email_lower = ql_str(&email_lower),
             hash = ql_str(password_hash),
             now = now_literal(),
+            empty = ql_str(""),
         );
         match self.client.query(&q).await {
             Ok(result) => {
@@ -231,6 +242,37 @@ impl RhypeDb {
             Err(e) if is_unique_violation(&e, "email_lower") => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// (Re)issues a verify token for `user_rid` (Phase 1b: fresh signup,
+    /// resend, or a signup retry against an existing unverified address).
+    pub async fn set_verify_token(&self, user_rid: u64, verify_token_hash: &str, expires_at_ms: i64) -> CloudResult<()> {
+        let q = format!(
+            "User.get({user_rid}).update({{ verify_token_hash: {hash}, verify_expires_at: {exp} }})",
+            hash = ql_str(verify_token_hash),
+            exp = datetime_literal(expires_at_ms),
+        );
+        self.objects(&q).await?;
+        Ok(())
+    }
+
+    /// Marks `user_rid` verified and clears its verify token (so the same
+    /// link can't be replayed to re-verify or extend anything).
+    pub async fn mark_user_verified(&self, user_rid: u64) -> CloudResult<()> {
+        let q = format!("User.get({user_rid}).update({{ verified: true, verify_token_hash: {empty} }})", empty = ql_str(""));
+        self.objects(&q).await?;
+        Ok(())
+    }
+
+    /// Looks up a user by the hash of a verify token from a `/verify?token=`
+    /// link. The caller must never pass an empty `verify_token_hash` — every
+    /// verified or superseded user's row carries `verify_token_hash: ""`, so
+    /// an empty hash would match an arbitrary (and ambiguous) set of rows;
+    /// callers reject an empty query-string token before hashing it.
+    pub async fn find_user_by_verify_token_hash(&self, verify_token_hash: &str) -> CloudResult<Option<UserRow>> {
+        debug_assert!(!verify_token_hash.is_empty(), "must not query the empty verify_token_hash sentinel");
+        let q = format!("User.filter(.verify_token_hash == {})", ql_str(verify_token_hash));
+        self.one(&q).await?.map(|o| user_from_object(&o)).transpose()
     }
 
     pub async fn find_user_by_email(&self, email: &str) -> CloudResult<Option<UserRow>> {

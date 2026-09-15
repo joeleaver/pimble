@@ -43,6 +43,12 @@ pub struct Config {
     /// of the real network (docs/CLOUD_CONTRACT.md: "handles an HTTP stub
     /// (or skip if it would need the network)").
     pub releases_base_url: Option<String>,
+    /// `RESEND_API_KEY` — Phase 1b. Unset means `LogMailer` (verification
+    /// links are logged, not emailed).
+    pub resend_api_key: Option<String>,
+    /// `PIMBLE_MAIL_FROM` — the `from` address on every mail this service
+    /// sends. Default `Pimble <no-reply@m.pimble.app>`.
+    pub mail_from: String,
 }
 
 fn env_var(name: &str) -> Option<String> {
@@ -63,6 +69,8 @@ impl Config {
             public_url: env_var("PIMBLE_CLOUD_PUBLIC_URL").unwrap_or_else(|| "http://127.0.0.1:8080".to_string()),
             github_repo: env_var("GITHUB_REPO").unwrap_or_else(|| "joeleaver/pimble".to_string()),
             releases_base_url: env_var("PIMBLE_CLOUD_RELEASES_BASE_URL"),
+            resend_api_key: env_var("RESEND_API_KEY"),
+            mail_from: env_var("PIMBLE_MAIL_FROM").unwrap_or_else(|| "Pimble <no-reply@m.pimble.app>".to_string()),
         }
     }
 

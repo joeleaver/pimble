@@ -17,6 +17,10 @@ pub enum CloudError {
     /// login attempt). Always a generic message on login so a wrong
     /// password and an unknown email are indistinguishable to the caller.
     Unauthorized(String),
+    /// 403 — a login attempt with the right password for an account whose
+    /// email hasn't been verified yet (Phase 1b, checked after the
+    /// password so it never substitutes for "wrong password").
+    EmailUnverified,
     /// 403 — a real session that isn't allowed to do this (e.g. a non-owner
     /// touching a store's members).
     Forbidden(String),
@@ -37,6 +41,7 @@ impl CloudError {
         match self {
             CloudError::BadRequest(m) => (StatusCode::BAD_REQUEST, "bad_request", m.as_str()),
             CloudError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, "unauthorized", m.as_str()),
+            CloudError::EmailUnverified => (StatusCode::FORBIDDEN, "email_unverified", "Check your inbox for the verification link."),
             CloudError::Forbidden(m) => (StatusCode::FORBIDDEN, "forbidden", m.as_str()),
             CloudError::NotFound(m) => (StatusCode::NOT_FOUND, "not_found", m.as_str()),
             CloudError::Conflict(m) => (StatusCode::CONFLICT, "conflict", m.as_str()),

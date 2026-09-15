@@ -67,6 +67,8 @@ repo root for the full design; this file is how to run it.
 | `PIMBLE_CLOUD_PUBLIC_URL` | this service's own public origin | `http://127.0.0.1:8080` |
 | `GITHUB_REPO` | `owner/repo` for `/releases` | `joeleaver/pimble` |
 | `PIMBLE_CLOUD_RELEASES_BASE_URL` | overrides the GitHub API base URL for `/releases` | `https://api.github.com` (not part of the contract; exists so tests can point this at a local stub instead of the network) |
+| `RESEND_API_KEY` | Resend API key; unset means `LogMailer` (verification links are logged at `info`, not emailed) | unset |
+| `PIMBLE_MAIL_FROM` | the `from` address on every mail this service sends | `Pimble <no-reply@m.pimble.app>` |
 
 `PIMBLE_CLOUD_PUBLIC_URL`'s scheme decides two things: whether the session
 cookie is marked `Secure`, and whether `/token`'s `rpc_url` is `ws://` or
@@ -78,11 +80,61 @@ Locally there is no such proxy, so `rpc_url` from a local `pimble-cloud`
 won't resolve on its own — connect a `PimbleClient` straight to
 `PIMBLE_SERVER_URL` with the minted `token` for manual testing instead.
 
+## Email verification
+
+An account can't log in until its email address is verified (docs/
+CLOUD_CONTRACT.md, "Phase 1b: email verification"). The flow:
+
+1. `POST /signup` creates the user **unverified**, sends a mail with a
+   `<PIMBLE_CLOUD_PUBLIC_URL>/api/v1/verify?token=...` link (24h expiry), and
+   answers `202 { "status": "verification_sent", "email": "..." }` — no
+   session, no token. Signing up again for the same still-unverified address
+   just re-sends the link (also 202); a verified duplicate is `409`.
+2. `GET /api/v1/verify?token=...` (what the mail links to; a browser follows
+   it) marks the account verified and redirects (`303`) to
+   `/login.html?verified=1`, or to `/login.html?verify_error=invalid` /
+   `...=expired` for a bad token.
+3. `POST /api/v1/resend-verification { "email" }` always answers `202`; it
+   re-sends only for a real, still-unverified address, and only once per
+   minute per address (silently ignored otherwise — still `202`).
+4. `POST /login` for an unverified account is `403 { "error":
+   "email_unverified", "message": "..." }`, checked after the password (so a
+   wrong password is still a plain `401`, never a hint that the email
+   exists).
+
+**Sending mail**: `RESEND_API_KEY` unset (the default, and every local run
+and test in this repo) means `LogMailer` — it logs the verification link at
+`info` instead of emailing it. Watch it with:
+
+```bash
+RUST_LOG=pimble_cloud=info cargo run --release -p pimble-cloud   # ... and copy the logged link out of the terminal
+```
+
+**Testing Resend for real**: set `RESEND_API_KEY` to a real key (Joe's
+`m.pimble.app` sending domain is already configured on Resend) and restart
+`pimble-cloud`; `POST /signup` then sends a real mail via
+`https://api.resend.com/emails` from `PIMBLE_MAIL_FROM` (default `Pimble
+<no-reply@m.pimble.app>`), and every call above behaves identically — the
+only difference is where the link goes. There's nothing else to flip: the
+mailer is chosen once at startup from whether the key is set.
+
 ## Example requests
 
 ```bash
-# Sign up (also logs in: sets the session cookie and returns a token)
-curl -sc cookies.txt -X POST http://127.0.0.1:8080/api/v1/signup \
+# Sign up: 202, no session — check the LogMailer log (or your inbox with a
+# real RESEND_API_KEY) for the verification link, then follow it in a
+# browser (or curl -i, to read the Location header) before logging in.
+curl -si -X POST http://127.0.0.1:8080/api/v1/signup \
+  -H 'Content-Type: application/json' \
+  -d '{"email": "alice@example.com", "password": "correct horse battery staple"}'
+
+# Resend the verification link (202 either way; a no-op for an unknown or
+# already-verified address, and rate-limited to once per minute)
+curl -s -X POST http://127.0.0.1:8080/api/v1/resend-verification \
+  -H 'Content-Type: application/json' -d '{"email": "alice@example.com"}'
+
+# Log in (also 403 email_unverified until the link above has been followed)
+curl -sc cookies.txt -X POST http://127.0.0.1:8080/api/v1/login \
   -H 'Content-Type: application/json' \
   -d '{"email": "alice@example.com", "password": "correct horse battery staple"}'
 
@@ -176,3 +228,24 @@ elsewhere) so the `/releases` tests never touch the network.
 - **`POST /stores`'s response shape** isn't specified by the contract; it
   returns the same shape as a `GET /stores` row: `{ store_id, name, role,
   created_at }` (`role` is always `"owner"`).
+- **`build_router` is now `build_state` + `router_from_state`** (`build_router`
+  still exists and just composes the two). Tests need the `AppState` itself,
+  not just the `Router` built from it, to reach the `LogMailer` through
+  `AppState::mailer` (`Mailer::as_log_mailer`) — e.g. to pull the verify link
+  a test's signup triggered back out of memory. `main.rs` is unchanged; it
+  still just calls `build_router`.
+- **`verify_token_hash` uses an empty string, not `Option`, as its "no
+  current token" sentinel** (set once at verification, matching the schema's
+  other required-`String` fields, none of which are nullable). Nothing ever
+  queries that sentinel: an empty `token` query parameter on `GET /verify` is
+  rejected before it would be hashed and looked up, so a stale or verified
+  user's `""` can never be matched by an incoming request.
+- **The resend rate limiter (`src/ratelimit.rs`) is in-memory, per-process**,
+  keyed by lowercased email, same tradeoff as the releases/JWKS caches
+  already in this crate — a restart only ever makes it more permissive.
+- **`ResendMailer`/`LogMailer` share one `Mailer` trait** rather than an `if
+  let Some(key) = ...` scattered through the handlers; `routes/accounts.rs`
+  calls `state.mailer.send(...)` without knowing which one is behind it.
+  `LogMailer::last_message` plus `mail::first_url` are the "test-only
+  accessor" the contract asks for — `tests/integration.rs`'s
+  `extract_verify_token` is the one place that calls them.
