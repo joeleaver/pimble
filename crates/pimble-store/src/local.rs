@@ -35,6 +35,20 @@ async fn atomic_write(path: &Path, data: impl AsRef<[u8]>) -> std::io::Result<()
     Ok(())
 }
 
+/// Peek a store directory's `manifest.json` to learn its
+/// [`pimble_core::StoreKind`] without committing to opening it as a
+/// [`LocalStore`] (only ever `Plain`) or a `Vault` store
+/// (docs/CRYPTO_CONTRACT.md) — `StoreManager::open_local_store` reads this
+/// first to decide which one to construct.
+pub async fn peek_manifest_kind(path: impl AsRef<Path>) -> Result<pimble_core::StoreKind> {
+    let manifest_path = path.as_ref().join(LocalStore::MANIFEST_FILE);
+    let manifest_json = fs::read_to_string(&manifest_path)
+        .await
+        .map_err(|_| StoreError::InvalidPath(format!("No manifest found at {}", manifest_path.display())))?;
+    let manifest: StoreManifest = serde_json::from_str(&manifest_json)?;
+    Ok(manifest.kind)
+}
+
 /// A local store backed by the filesystem
 ///
 /// Directory structure:
@@ -83,8 +97,21 @@ impl LocalStore {
     /// The only supported store format version.
     const STORE_MANIFEST_VERSION: u32 = 3;
 
-    /// Create a new local store at the given path
+    /// Create a new local store at the given path, with a freshly generated id.
     pub async fn create(path: impl AsRef<Path>, name: impl Into<String>) -> Result<Self> {
+        Self::create_impl(path, name, None).await
+    }
+
+    /// Like [`LocalStore::create`], but under a chosen `id` rather than a
+    /// freshly generated one (docs/CRYPTO_CONTRACT.md: `createStore`'s
+    /// `store_id`, letting the accounts service create the hosted twin of a
+    /// local store under the local store's own id). Refusing an id already
+    /// open is the caller's job (`StoreManager`), same as for a fresh id.
+    pub async fn create_with_id(path: impl AsRef<Path>, name: impl Into<String>, id: StoreId) -> Result<Self> {
+        Self::create_impl(path, name, Some(id)).await
+    }
+
+    async fn create_impl(path: impl AsRef<Path>, name: impl Into<String>, id: Option<StoreId>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let name = name.into();
 
@@ -105,6 +132,9 @@ impl LocalStore {
         // Create manifest
         let mut manifest = StoreManifest::new(&name, root_node_id);
         manifest.version = Self::STORE_MANIFEST_VERSION;
+        if let Some(id) = id {
+            manifest.id = id;
+        }
 
         // Write manifest
         let manifest_json = serde_json::to_string_pretty(&manifest)?;
@@ -166,6 +196,7 @@ impl LocalStore {
             root_node_id,
             created_at: now,
             modified_at: now,
+            kind: pimble_core::StoreKind::Plain,
         };
 
         let manifest_json = serde_json::to_string_pretty(&manifest)?;
@@ -644,6 +675,7 @@ mod tests {
             root_node_id: NodeId::new(),
             created_at: chrono::Utc::now(),
             modified_at: chrono::Utc::now(),
+            kind: pimble_core::StoreKind::Plain,
         };
         fs::write(
             store_path.join("manifest.json"),

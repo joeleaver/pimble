@@ -9,10 +9,10 @@ use jsonrpsee::core::{async_trait, SubscriptionResult};
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{Extensions, PendingSubscriptionSink, SubscriptionMessage};
 use pimble_client::{describe_connect_error, PimbleClient};
-use pimble_core::{AuthMethod, Node, MountRef, MountState, NodeId, RemoteEndpoint, StoreId, StoreLocation, SyncState, Workspace};
+use pimble_core::{AuthMethod, Node, MountRef, MountState, NodeId, RemoteEndpoint, StoreId, StoreKind, StoreLocation, SyncState, Workspace};
 use pimble_plugins::PluginHost;
 use pimble_rpc::{
-    index_building_error, to_rpc_error, ApplyEditRequest, ApplyEditResponse,
+    encrypted_store_error, index_building_error, snapshot_required_error, to_rpc_error, ApplyEditRequest, ApplyEditResponse,
     AddRemoteStoreRequest, ApplyStoreUpdateRequest, CloseStoreRequest, CreateMountRequest, CreateMountResponse,
     CreateNodeRequest, CreateNodeResponse, CreateStoreRequest, CreateStoreResponse,
     CreateWorkspaceRequest, DeleteNodeRequest, EditOperation, EmptyResponse, GetChildrenRequest,
@@ -23,7 +23,10 @@ use pimble_rpc::{
     SaveWorkspaceRequest, SearchRequest, SearchResponse, SearchResultItem, StoreChangeKind,
     StoreChangedNotification, SyncNodeContentsRequest, SyncNodeContentsResponse,
     SyncStoreDocumentRequest, SyncStoreDocumentResponse, UpdateNodeContentRequest,
-    UpdateNodeMetadataRequest, MAX_SYNC_NODE_CONTENTS,
+    UpdateNodeMetadataRequest,
+    VaultAppendRequest, VaultAppendResponse, VaultDocId, VaultDocInfo, VaultEntry, VaultFetchRequest,
+    VaultFetchResponse, VaultListDocsRequest, VaultListDocsResponse, VaultSnapshotRequest,
+    MAX_SYNC_NODE_CONTENTS,
 };
 use pimble_search::{IndexNode, SearchError, SearchIndex, SearchQuery};
 use pimble_store::{StoreEndpoint, StoreManager, SyncConfig};
@@ -522,6 +525,21 @@ impl RpcHandler {
     /// directory).
     fn mark_replica(&self, store: &mut pimble_core::Store) {
         store.is_replica = store.local_path().map_or(false, |p| p.starts_with(self.replicas_dir.as_path()));
+    }
+
+    /// The guard every store-scoped RPC but the four vault ones needs
+    /// (docs/CRYPTO_CONTRACT.md "Pimble server, a store of kind `vault`"): a
+    /// vault store has no `StoreDocument`, `ContentDoc` or search index, so
+    /// none of those RPCs may touch it. `Ok(())` when the store is `Plain`
+    /// or not open at all — a missing store still fails downstream with its
+    /// own, more specific `NotOpen`/`StoreNotFound` error.
+    async fn reject_if_vault(&self, store_id: StoreId) -> Result<(), ErrorObjectOwned> {
+        if self.store_manager.read().await.store_kind(store_id) == Some(StoreKind::Vault) {
+            return Err(encrypted_store_error(format!(
+                "store {} is encrypted; use the vault API", store_id
+            )));
+        }
+        Ok(())
     }
 
     // ── Replica sync (docs/SYNC_CONTRACT.md) ─────────────────────────
@@ -1307,22 +1325,103 @@ impl RpcHandler {
 
 #[async_trait]
 impl PimbleApiServer for RpcHandler {
-    // ── Vault API stubs (docs/CRYPTO_CONTRACT.md): agent B replaces these. ──
+    // ── Vault (encrypted store) API, docs/CRYPTO_CONTRACT.md ─────────────
 
-    async fn vault_append(&self, _ext: &Extensions, _request: pimble_rpc::types::VaultAppendRequest) -> Result<pimble_rpc::types::VaultAppendResponse, ErrorObjectOwned> {
-        Err(ErrorObjectOwned::owned(-32601, "vaultAppend is not implemented yet", None::<()>))
+    async fn vault_append(&self, ext: &Extensions, request: VaultAppendRequest) -> Result<VaultAppendResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        debug!("Vault append to store {} doc {:?}", request.store_id, request.doc_id);
+
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let blob = URL_SAFE_NO_PAD
+            .decode(&request.blob)
+            .map_err(|e| to_rpc_error(format!("invalid base64url blob: {}", e)))?;
+
+        let mut manager = self.store_manager.write().await;
+        let seq = manager
+            .vault_append(request.store_id, &request.doc_id.as_str(), blob)
+            .await
+            .map_err(|e| match e {
+                pimble_store::StoreError::VaultSnapshotRequired => snapshot_required_error(format!(
+                    "store {} document {:?}: log is at its size limit; upload a snapshot before appending more",
+                    request.store_id, request.doc_id
+                )),
+                other => to_rpc_error(other),
+            })?;
+        drop(manager);
+
+        // The blob rides the notification verbatim (still base64url) so a
+        // live subscriber never re-fetches; there is no per-caller client id
+        // in `VaultAppendRequest` to echo-suppress on, so `source_client_id`
+        // is always `None` here.
+        let notification = StoreChangedNotification {
+            store_id: request.store_id,
+            change_kind: StoreChangeKind::VaultAppended { doc_id: request.doc_id.clone(), seq },
+            source_client_id: None,
+            update: Some(request.blob.clone()),
+        };
+        self.subscriptions.write().await.notify_store_change(&notification).await;
+
+        Ok(VaultAppendResponse { seq })
     }
 
-    async fn vault_fetch(&self, _ext: &Extensions, _request: pimble_rpc::types::VaultFetchRequest) -> Result<pimble_rpc::types::VaultFetchResponse, ErrorObjectOwned> {
-        Err(ErrorObjectOwned::owned(-32601, "vaultFetch is not implemented yet", None::<()>))
+    async fn vault_fetch(&self, ext: &Extensions, request: VaultFetchRequest) -> Result<VaultFetchResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Read)?;
+        debug!("Vault fetch from store {} doc {:?} after {}", request.store_id, request.doc_id, request.after_seq);
+
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let manager = self.store_manager.read().await;
+        let (snapshot, updates, head) = manager
+            .vault_fetch(request.store_id, &request.doc_id.as_str(), request.after_seq)
+            .await
+            .map_err(to_rpc_error)?;
+
+        Ok(VaultFetchResponse {
+            snapshot: snapshot.map(|(seq, blob)| VaultEntry { seq, blob: URL_SAFE_NO_PAD.encode(blob) }),
+            updates: updates
+                .into_iter()
+                .map(|(seq, blob)| VaultEntry { seq, blob: URL_SAFE_NO_PAD.encode(blob) })
+                .collect(),
+            head,
+        })
     }
 
-    async fn vault_snapshot(&self, _ext: &Extensions, _request: pimble_rpc::types::VaultSnapshotRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
-        Err(ErrorObjectOwned::owned(-32601, "vaultSnapshot is not implemented yet", None::<()>))
+    async fn vault_snapshot(&self, ext: &Extensions, request: VaultSnapshotRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        info!("Vault snapshot for store {} doc {:?} upto {}", request.store_id, request.doc_id, request.upto_seq);
+
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let blob = URL_SAFE_NO_PAD
+            .decode(&request.blob)
+            .map_err(|e| to_rpc_error(format!("invalid base64url blob: {}", e)))?;
+
+        let mut manager = self.store_manager.write().await;
+        manager
+            .vault_snapshot(request.store_id, &request.doc_id.as_str(), request.upto_seq, blob)
+            .await
+            .map_err(to_rpc_error)?;
+
+        Ok(EmptyResponse {})
     }
 
-    async fn vault_list_docs(&self, _ext: &Extensions, _request: pimble_rpc::types::VaultListDocsRequest) -> Result<pimble_rpc::types::VaultListDocsResponse, ErrorObjectOwned> {
-        Err(ErrorObjectOwned::owned(-32601, "vaultListDocs is not implemented yet", None::<()>))
+    async fn vault_list_docs(&self, ext: &Extensions, request: VaultListDocsRequest) -> Result<VaultListDocsResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Read)?;
+        debug!("Vault list docs for store {}", request.store_id);
+
+        let manager = self.store_manager.read().await;
+        let docs = manager.vault_list_docs(request.store_id).map_err(to_rpc_error)?;
+
+        Ok(VaultListDocsResponse {
+            docs: docs
+                .into_iter()
+                .filter_map(|(doc_id, head, snapshot_seq)| {
+                    VaultDocId::parse(&doc_id).map(|doc_id| VaultDocInfo { doc_id, head, snapshot_seq })
+                })
+                .collect(),
+        })
     }
 
     async fn create_store(
@@ -1331,20 +1430,27 @@ impl PimbleApiServer for RpcHandler {
         request: CreateStoreRequest,
     ) -> Result<CreateStoreResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "createStore")?;
-        info!("Creating store '{}' at {:?}", request.name, request.path);
+        info!("Creating {:?} store '{}' at {:?}", request.kind, request.name, request.path);
 
         let mut manager = self.store_manager.write().await;
         let store_id = manager
-            .create_local_store(&request.path, &request.name)
+            .create_local_store_with(&request.path, &request.name, request.kind, request.store_id)
             .await
             .map_err(to_rpc_error)?;
 
+        // `root_node_id` is meaningless for a vault store (it has no tree of
+        // its own here), but `Store`/`CreateStoreResponse` always carry one;
+        // `get_store_info` works uniformly for either kind, unlike
+        // `root_node_id`, which only knows about `Plain` stores.
         let root_node_id = manager
-            .root_node_id(store_id)
-            .map_err(to_rpc_error)?;
+            .get_store_info(store_id)
+            .map_err(to_rpc_error)?
+            .root_node_id;
 
         drop(manager);
-        if !self.indexes.read().await.contains_key(&store_id) {
+
+        // A vault store has no search index at all (docs/CRYPTO_CONTRACT.md).
+        if request.kind == StoreKind::Plain && !self.indexes.read().await.contains_key(&store_id) {
             if let Err(e) = self.open_index_for_store(store_id).await {
                 warn!("Failed to open search index for store {}: {}", store_id, e);
             }
@@ -1373,6 +1479,17 @@ impl PimbleApiServer for RpcHandler {
         let mut store = manager
             .get_store_info(store_id)
             .map_err(to_rpc_error)?;
+
+        // A vault store (docs/CRYPTO_CONTRACT.md) has no `sync.json`, search
+        // index, or tree to repair — `read_sync_config` in particular only
+        // knows about `Plain` stores and would fail outright for one.
+        if store.kind != StoreKind::Plain {
+            drop(manager);
+            store.sync_state = self.sync_state_of(store_id).await;
+            self.mark_replica(&mut store);
+            return Ok(OpenStoreResponse { store });
+        }
+
         let sync_config = manager.read_sync_config(store_id).await.map_err(to_rpc_error)?;
 
         drop(manager);
@@ -1462,6 +1579,7 @@ impl PimbleApiServer for RpcHandler {
         request: GetNodeRequest,
     ) -> Result<GetNodeResponse, ErrorObjectOwned> {
         authorize(&principal_of(ext), request.store_id, Access::Read)?;
+        self.reject_if_vault(request.store_id).await?;
         debug!("Getting node {} from store {}", request.node_id, request.store_id);
 
         let mut manager = self.store_manager.write().await;
@@ -1479,6 +1597,7 @@ impl PimbleApiServer for RpcHandler {
         request: GetNodesRequest,
     ) -> Result<GetNodesResponse, ErrorObjectOwned> {
         authorize(&principal_of(ext), request.store_id, Access::Read)?;
+        self.reject_if_vault(request.store_id).await?;
         debug!(
             "Getting {} nodes from store {}",
             request.node_ids.len(),
@@ -1506,6 +1625,7 @@ impl PimbleApiServer for RpcHandler {
         request: CreateNodeRequest,
     ) -> Result<CreateNodeResponse, ErrorObjectOwned> {
         authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        self.reject_if_vault(request.store_id).await?;
         info!(
             "Creating {} node '{}' in store {}",
             request.node_type, request.title, request.store_id
@@ -1545,6 +1665,7 @@ impl PimbleApiServer for RpcHandler {
         request: UpdateNodeMetadataRequest,
     ) -> Result<EmptyResponse, ErrorObjectOwned> {
         authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        self.reject_if_vault(request.store_id).await?;
         debug!(
             "Updating metadata for node {} in store {}",
             request.node_id, request.store_id
@@ -1574,6 +1695,7 @@ impl PimbleApiServer for RpcHandler {
         request: UpdateNodeContentRequest,
     ) -> Result<EmptyResponse, ErrorObjectOwned> {
         authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        self.reject_if_vault(request.store_id).await?;
         info!(
             "Updating content for node {} in store {}",
             request.node_id, request.store_id
@@ -1608,6 +1730,7 @@ impl PimbleApiServer for RpcHandler {
         request: DeleteNodeRequest,
     ) -> Result<EmptyResponse, ErrorObjectOwned> {
         authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        self.reject_if_vault(request.store_id).await?;
         info!(
             "Deleting node {} from store {}",
             request.node_id, request.store_id
@@ -1642,6 +1765,7 @@ impl PimbleApiServer for RpcHandler {
         request: MoveNodeRequest,
     ) -> Result<EmptyResponse, ErrorObjectOwned> {
         authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        self.reject_if_vault(request.store_id).await?;
         info!(
             "Moving node {} to parent {} in store {}",
             request.node_id, request.new_parent_id, request.store_id
@@ -1678,6 +1802,7 @@ impl PimbleApiServer for RpcHandler {
     ) -> Result<GetChildrenResponse, ErrorObjectOwned> {
         let principal = principal_of(ext);
         authorize(&principal, request.store_id, Access::Read)?;
+        self.reject_if_vault(request.store_id).await?;
         debug!(
             "Getting children of node {} in store {}",
             request.node_id, request.store_id
@@ -1746,6 +1871,8 @@ impl PimbleApiServer for RpcHandler {
         // extended to `createMount`/`getMountState` uniformly with
         // `getChildren`).
         authorize(&principal, request.source_store_id, Access::Read)?;
+        self.reject_if_vault(request.store_id).await?;
+        self.reject_if_vault(request.source_store_id).await?;
         info!(
             "Creating mount in store {} under parent {}, source: {}:{}",
             request.store_id, request.parent_id, request.source_store_id, request.source_node_id
@@ -2020,6 +2147,7 @@ impl PimbleApiServer for RpcHandler {
     ) -> Result<GetMountStateResponse, ErrorObjectOwned> {
         let principal = principal_of(ext);
         authorize(&principal, request.store_id, Access::Read)?;
+        self.reject_if_vault(request.store_id).await?;
         debug!(
             "Getting mount state for node {} in store {}",
             request.node_id, request.store_id
@@ -2055,6 +2183,7 @@ impl PimbleApiServer for RpcHandler {
         request: SyncStoreDocumentRequest,
     ) -> Result<SyncStoreDocumentResponse, ErrorObjectOwned> {
         authorize(&principal_of(ext), request.store_id, Access::Read)?;
+        self.reject_if_vault(request.store_id).await?;
         debug!("Sync store document for store {}", request.store_id);
 
         use base64::Engine;
@@ -2089,6 +2218,7 @@ impl PimbleApiServer for RpcHandler {
         request: ApplyStoreUpdateRequest,
     ) -> Result<EmptyResponse, ErrorObjectOwned> {
         authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        self.reject_if_vault(request.store_id).await?;
         info!(
             "Applying store update to store {} from client {}",
             request.store_id, request.client_id
@@ -2159,6 +2289,7 @@ impl PimbleApiServer for RpcHandler {
         request: SyncNodeContentsRequest,
     ) -> Result<SyncNodeContentsResponse, ErrorObjectOwned> {
         authorize(&principal_of(ext), request.store_id, Access::Read)?;
+        self.reject_if_vault(request.store_id).await?;
         debug!(
             "Sync content of {} node(s) in store {}",
             request.nodes.len(), request.store_id
@@ -2261,6 +2392,7 @@ impl PimbleApiServer for RpcHandler {
         request: ApplyEditRequest,
     ) -> Result<ApplyEditResponse, ErrorObjectOwned> {
         authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        self.reject_if_vault(request.store_id).await?;
         use base64::Engine;
 
         // Apply the edit to the server's persistent yrs document. The
@@ -2314,6 +2446,9 @@ impl PimbleApiServer for RpcHandler {
             pending.reject(e).await;
             return Ok(());
         }
+        // Unlike every other store-scoped RPC, `subscribeStoreChanges` works
+        // on a vault store: it's how a live client hears `VaultAppended`
+        // without re-fetching (docs/CRYPTO_CONTRACT.md).
         info!("Client subscribing to store changes for {}", store_id);
 
         let sink = pending.accept().await?;
@@ -2330,6 +2465,10 @@ impl PimbleApiServer for RpcHandler {
         node_id: NodeId,
     ) -> SubscriptionResult {
         if let Err(e) = authorize(&principal_of(ext), store_id, Access::Read) {
+            pending.reject(e).await;
+            return Ok(());
+        }
+        if let Err(e) = self.reject_if_vault(store_id).await {
             pending.reject(e).await;
             return Ok(());
         }
@@ -2423,6 +2562,7 @@ impl PimbleApiServer for RpcHandler {
         request: RebuildIndexRequest,
     ) -> Result<RebuildIndexResponse, ErrorObjectOwned> {
         authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        self.reject_if_vault(request.store_id).await?;
         info!("Rebuilding search index for store {}", request.store_id);
 
         let indexed = self

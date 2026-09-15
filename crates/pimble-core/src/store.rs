@@ -269,7 +269,9 @@ pub struct StoreManifest {
     /// Store name
     pub name: String,
 
-    /// Root node ID
+    /// Root node ID. Meaningless for a `Vault` store (docs/CRYPTO_CONTRACT.md):
+    /// a vault has no tree of its own on this server, but the field stays
+    /// populated (a fresh id) so every manifest has the same shape.
     pub root_node_id: NodeId,
 
     /// When the store was created
@@ -277,14 +279,27 @@ pub struct StoreManifest {
 
     /// When the store was last modified
     pub modified_at: DateTime<Utc>,
+
+    /// `Plain` (readable, indexed, CRDT tree + content) or `Vault`
+    /// (encrypted blobs only, docs/CRYPTO_CONTRACT.md). Missing in older
+    /// serializations: plain.
+    #[serde(default)]
+    pub kind: StoreKind,
 }
 
 impl StoreManifest {
     /// Current (and only) schema version
     pub const CURRENT_VERSION: u32 = 3;
 
-    /// Create a new manifest
+    /// Create a new `Plain` manifest. See [`StoreManifest::new_with_kind`]
+    /// for a `Vault` one.
     pub fn new(name: impl Into<String>, root_node_id: NodeId) -> Self {
+        Self::new_with_kind(name, root_node_id, StoreKind::Plain)
+    }
+
+    /// Create a new manifest of a given [`StoreKind`] (docs/CRYPTO_CONTRACT.md
+    /// "Pimble server, a store of kind `vault`").
+    pub fn new_with_kind(name: impl Into<String>, root_node_id: NodeId, kind: StoreKind) -> Self {
         let now = Utc::now();
         Self {
             version: Self::CURRENT_VERSION,
@@ -293,6 +308,7 @@ impl StoreManifest {
             root_node_id,
             created_at: now,
             modified_at: now,
+            kind,
         }
     }
 }

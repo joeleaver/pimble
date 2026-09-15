@@ -4,10 +4,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use pimble_client::PimbleClient;
-use pimble_core::{AuthMethod, MountRef, MountState, NodeId, RemoteEndpoint, StoreId};
+use pimble_core::{AuthMethod, MountRef, MountState, NodeId, RemoteEndpoint, StoreId, StoreKind};
 use base64::Engine;
 use pimble_crdt::ContentDoc;
-use pimble_rpc::EditOperation;
+use pimble_rpc::{EditOperation, VaultDocId};
 use pimble_server::auth;
 use tracing_subscriber::EnvFilter;
 
@@ -49,11 +49,43 @@ async fn main() -> Result<()> {
             token_command(new)?;
         }
         "create-store" => {
-            if args.len() < 4 {
-                eprintln!("Usage: pimble-cli create-store <path> <name>");
+            let (rest, kind) = extract_flag_value(&args[2..], "--kind");
+            let (rest, id) = extract_flag_value(&rest, "--id");
+            if rest.len() < 2 {
+                eprintln!("Usage: pimble-cli create-store <path> <name> [--kind plain|vault] [--id <uuid>]");
                 return Ok(());
             }
-            create_store(&args[2], &args[3]).await?;
+            create_store(&rest[0], &rest[1], kind, id).await?;
+        }
+        "vault-list" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pimble-cli vault-list <store-id>");
+                return Ok(());
+            }
+            vault_list(&args[2]).await?;
+        }
+        "vault-fetch" => {
+            let (rest, after) = extract_flag_value(&args[2..], "--after");
+            if rest.len() < 2 {
+                eprintln!("Usage: pimble-cli vault-fetch <store-id> <doc> [--after N]");
+                return Ok(());
+            }
+            let after_seq = after.map(|s| s.parse::<u64>()).transpose().context("--after must be a number")?.unwrap_or(0);
+            vault_fetch(&rest[0], &rest[1], after_seq).await?;
+        }
+        "vault-append" => {
+            if args.len() < 5 {
+                eprintln!("Usage: pimble-cli vault-append <store-id> <doc> <file>");
+                return Ok(());
+            }
+            vault_append(&args[2], &args[3], &args[4]).await?;
+        }
+        "vault-snapshot" => {
+            if args.len() < 6 {
+                eprintln!("Usage: pimble-cli vault-snapshot <store-id> <doc> <upto-seq> <file>");
+                return Ok(());
+            }
+            vault_snapshot(&args[2], &args[3], &args[4], &args[5]).await?;
         }
         "import-scrivener" => {
             if args.len() < 4 {
@@ -223,7 +255,7 @@ COMMANDS:
     help                Show this help message
     server              Start the Pimble server
     token               Print this machine's default server token (creating it if needed)
-    create-store        Create a new store
+    create-store        Create a new store (--kind plain|vault, --id <uuid>)
     open-store          Open an existing store
     list-stores         List all open stores
     import-scrivener    Import a Scrivener .scriv project into a Pimble store
@@ -244,6 +276,10 @@ COMMANDS:
     sync-state          Show a store's replica sync link and its state
     remote-stores       List the stores a remote Pimble server has open
     remove-replica      Stop a replica's sync link, close it, and delete it
+    vault-list          List a vault store's documents with their heads
+    vault-fetch         Fetch a vault document's snapshot and updates
+    vault-append        Append a file's bytes as a vault document update
+    vault-snapshot      Store a file's bytes as a vault document snapshot
 
 ENVIRONMENT (client, for every command but `server` itself):
     PIMBLE_SERVER       Server URL (default: http://127.0.0.1:7462)
@@ -630,11 +666,88 @@ async fn remote_stores(url: &str, token: Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn create_store(path: &str, name: &str) -> Result<()> {
+async fn create_store(path: &str, name: &str, kind: Option<String>, id: Option<String>) -> Result<()> {
+    let kind = match kind.as_deref() {
+        None | Some("plain") => StoreKind::Plain,
+        Some("vault") => StoreKind::Vault,
+        Some(other) => anyhow::bail!("unknown store kind '{}': expected 'plain' or 'vault'", other),
+    };
+    let store_id = id.as_deref().map(parse_store_id).transpose()?;
+
     let client = connect().await?;
-    let (store_id, root_id) = client.create_store(PathBuf::from(path), name).await?;
+    let (store_id, root_id) = client.create_store_with(PathBuf::from(path), name, kind, store_id).await?;
     println!("Created store: {}", store_id);
-    println!("Root node: {}", root_id);
+    // A vault store's manifest root id is a meaningless placeholder (it has
+    // no tree of its own on this server; docs/CRYPTO_CONTRACT.md) — printing
+    // it would just invite confusion.
+    if kind == StoreKind::Plain {
+        println!("Root node: {}", root_id);
+    }
+    Ok(())
+}
+
+/// Parse a `VaultDocId` CLI argument: the literal `tree`, or a node id.
+fn parse_vault_doc_id(s: &str) -> Result<VaultDocId> {
+    VaultDocId::parse(s).with_context(|| format!("Invalid vault document id: {} (expected 'tree' or a node id)", s))
+}
+
+async fn vault_list(store_id: &str) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let client = connect().await?;
+    let docs = client.vault_list_docs(store_id).await?;
+    if docs.is_empty() {
+        println!("No documents");
+    } else {
+        for doc in docs {
+            println!("{} head={} snapshot_seq={}", doc.doc_id.as_str(), doc.head, doc.snapshot_seq);
+        }
+    }
+    Ok(())
+}
+
+async fn vault_fetch(store_id: &str, doc: &str, after_seq: u64) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let doc_id = parse_vault_doc_id(doc)?;
+    let client = connect().await?;
+    let response = client.vault_fetch(store_id, doc_id, after_seq).await?;
+
+    println!("Head: {}", response.head);
+    match &response.snapshot {
+        Some(snapshot) => println!("Snapshot: seq={} bytes={}", snapshot.seq, snapshot.blob.len()),
+        None => println!("Snapshot: (none)"),
+    }
+    if response.updates.is_empty() {
+        println!("No updates after {}", after_seq);
+    } else {
+        for update in &response.updates {
+            println!("  seq={} bytes={}", update.seq, update.blob.len());
+        }
+    }
+    Ok(())
+}
+
+async fn vault_append(store_id: &str, doc: &str, file: &str) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let doc_id = parse_vault_doc_id(doc)?;
+    let bytes = std::fs::read(file).with_context(|| format!("failed to read {}", file))?;
+    let blob = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes);
+
+    let client = connect().await?;
+    let seq = client.vault_append(store_id, doc_id, blob).await?;
+    println!("Appended seq {}", seq);
+    Ok(())
+}
+
+async fn vault_snapshot(store_id: &str, doc: &str, upto_seq: &str, file: &str) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let doc_id = parse_vault_doc_id(doc)?;
+    let upto_seq: u64 = upto_seq.parse().context("upto-seq must be a number")?;
+    let bytes = std::fs::read(file).with_context(|| format!("failed to read {}", file))?;
+    let blob = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes);
+
+    let client = connect().await?;
+    client.vault_snapshot(store_id, doc_id, upto_seq, blob).await?;
+    println!("Stored snapshot up to seq {}", upto_seq);
     Ok(())
 }
 

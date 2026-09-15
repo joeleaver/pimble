@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use pimble_core::{MountRef, Node, NodeId, NodeMetadata, Store, StoreId, StoreLocation, SyncState};
+use pimble_core::{MountRef, Node, NodeId, NodeMetadata, Store, StoreId, StoreKind, StoreLocation, SyncState};
 use pimble_crdt::{ContentDoc, StoreDocument, TreeRepair};
 use tracing::info;
 
@@ -11,8 +11,9 @@ use tracing::info;
 const MAX_MOUNT_DEPTH: usize = 16;
 
 use crate::error::{Result, StoreError};
-use crate::local::{LocalStore, SyncConfig};
+use crate::local::{peek_manifest_kind, LocalStore, SyncConfig};
 use crate::registry::{StoreEndpoint, StoreRegistry};
+use crate::vault::VaultStore;
 
 /// What [`StoreManager::delete_node`] removed.
 #[derive(Debug, Clone)]
@@ -25,8 +26,12 @@ pub struct NodeRemoval {
 
 /// Manages multiple open stores
 pub struct StoreManager {
-    /// Open local stores
+    /// Open local (`Plain`) stores.
     local_stores: HashMap<StoreId, LocalStore>,
+    /// Open vault stores (docs/CRYPTO_CONTRACT.md): disjoint from
+    /// `local_stores` — a store id is open in at most one of the two maps,
+    /// whichever matches its manifest's `kind`.
+    vault_stores: HashMap<StoreId, VaultStore>,
     /// Registry of known stores and how to reach them
     registry: StoreRegistry,
     /// Stores opened since the last call to [`StoreManager::opened_since`],
@@ -45,18 +50,57 @@ impl StoreManager {
     pub fn new() -> Self {
         Self {
             local_stores: HashMap::new(),
+            vault_stores: HashMap::new(),
             registry: StoreRegistry::new(),
             newly_opened: Vec::new(),
         }
     }
 
-    /// Create a new local store
+    /// Create a new `Plain` local store with a freshly generated id. See
+    /// [`StoreManager::create_local_store_with`] for a chosen `kind`/`id`
+    /// (docs/CRYPTO_CONTRACT.md).
     pub async fn create_local_store(&mut self, path: impl AsRef<Path>, name: impl Into<String>) -> Result<StoreId> {
+        self.create_local_store_with(path, name, StoreKind::Plain, None).await
+    }
+
+    /// Create a new local store of `kind`, under `store_id` when given
+    /// (refused if that id is already open here) or a freshly generated one
+    /// otherwise (docs/CRYPTO_CONTRACT.md: `createStore`'s `kind`/`store_id`,
+    /// the latter letting the accounts service create the hosted twin of a
+    /// local store under the local store's own id).
+    pub async fn create_local_store_with(
+        &mut self,
+        path: impl AsRef<Path>,
+        name: impl Into<String>,
+        kind: StoreKind,
+        store_id: Option<StoreId>,
+    ) -> Result<StoreId> {
         let path = path.as_ref();
-        let store = LocalStore::create(path, name).await?;
-        let id = store.id;
+        if let Some(id) = store_id {
+            if self.is_open(id) {
+                return Err(StoreError::InvalidOperation(format!("store {} is already open", id)));
+            }
+        }
+
+        let id = match kind {
+            StoreKind::Plain => {
+                let store = match store_id {
+                    Some(id) => LocalStore::create_with_id(path, name, id).await?,
+                    None => LocalStore::create(path, name).await?,
+                };
+                let id = store.id;
+                self.local_stores.insert(id, store);
+                id
+            }
+            StoreKind::Vault => {
+                let store = VaultStore::create(path, name, store_id).await?;
+                let id = store.id;
+                self.vault_stores.insert(id, store);
+                id
+            }
+        };
+
         self.registry.register(id, StoreEndpoint::Local { path: path.to_path_buf() });
-        self.local_stores.insert(id, store);
         self.newly_opened.push(id);
         Ok(id)
     }
@@ -90,21 +134,37 @@ impl StoreManager {
         Ok(id)
     }
 
-    /// Open an existing local store
+    /// Open an existing local store, `Plain` or `Vault` (its manifest's
+    /// `kind` decides which; docs/CRYPTO_CONTRACT.md).
     pub async fn open_local_store(&mut self, path: impl AsRef<Path>) -> Result<StoreId> {
         let path = path.as_ref();
-        let store = LocalStore::open(path).await?;
-        let id = store.id;
+        let kind = peek_manifest_kind(path).await?;
 
-        // Always register (updates path if it changed)
-        self.registry.register(id, StoreEndpoint::Local { path: path.to_path_buf() });
+        let id = match kind {
+            StoreKind::Plain => {
+                let store = LocalStore::open(path).await?;
+                let id = store.id;
+                self.registry.register(id, StoreEndpoint::Local { path: path.to_path_buf() });
+                if self.is_open(id) {
+                    info!("Store {} is already open", id);
+                    return Ok(id);
+                }
+                self.local_stores.insert(id, store);
+                id
+            }
+            StoreKind::Vault => {
+                let store = VaultStore::open(path).await?;
+                let id = store.id;
+                self.registry.register(id, StoreEndpoint::Local { path: path.to_path_buf() });
+                if self.is_open(id) {
+                    info!("Store {} is already open", id);
+                    return Ok(id);
+                }
+                self.vault_stores.insert(id, store);
+                id
+            }
+        };
 
-        if self.local_stores.contains_key(&id) {
-            info!("Store {} is already open", id);
-            return Ok(id);
-        }
-
-        self.local_stores.insert(id, store);
         self.newly_opened.push(id);
         Ok(id)
     }
@@ -116,11 +176,15 @@ impl StoreManager {
         std::mem::take(&mut self.newly_opened)
     }
 
-    /// Close a store
+    /// Close a store, `Plain` or `Vault`.
     pub async fn close_store(&mut self, store_id: StoreId) -> Result<()> {
         if let Some(mut store) = self.local_stores.remove(&store_id) {
             store.flush().await?;
             info!("Closed store {}", store_id);
+        } else if self.vault_stores.remove(&store_id).is_some() {
+            // A vault store has no in-memory dirty state to flush: every
+            // append/snapshot already wrote to disk synchronously.
+            info!("Closed vault store {}", store_id);
         }
         self.newly_opened.retain(|id| *id != store_id);
         Ok(())
@@ -130,7 +194,7 @@ impl StoreManager {
     pub fn get_store_info(&self, store_id: StoreId) -> Result<Store> {
         if let Some(store) = self.local_stores.get(&store_id) {
             let manifest = store.manifest();
-            Ok(Store {
+            return Ok(Store {
                 id: store_id,
                 name: manifest.name.clone(),
                 location: StoreLocation::Local {
@@ -139,23 +203,77 @@ impl StoreManager {
                 root_node_id: manifest.root_node_id,
                 sync_state: SyncState::Offline,
                 is_replica: false,
-                // Agent B: read this from the manifest once vault stores exist
-                // (docs/CRYPTO_CONTRACT.md).
-                kind: pimble_core::StoreKind::Plain,
-            })
-        } else {
-            Err(StoreError::StoreNotFound(store_id))
+                kind: manifest.kind,
+            });
         }
+        if let Some(store) = self.vault_stores.get(&store_id) {
+            let manifest = store.manifest();
+            return Ok(Store {
+                id: store_id,
+                name: manifest.name.clone(),
+                location: StoreLocation::Local {
+                    path: store.path.clone(),
+                },
+                root_node_id: manifest.root_node_id,
+                sync_state: SyncState::Offline,
+                is_replica: false,
+                kind: manifest.kind,
+            });
+        }
+        Err(StoreError::StoreNotFound(store_id))
     }
 
-    /// List all open stores
+    /// List all open stores (`Plain` and `Vault` alike).
     pub fn list_stores(&self) -> Vec<StoreId> {
-        self.local_stores.keys().copied().collect()
+        self.local_stores.keys().chain(self.vault_stores.keys()).copied().collect()
     }
 
-    /// Check if a store is open
+    /// Check if a store is open, `Plain` or `Vault`.
     pub fn is_open(&self, store_id: StoreId) -> bool {
-        self.local_stores.contains_key(&store_id)
+        self.local_stores.contains_key(&store_id) || self.vault_stores.contains_key(&store_id)
+    }
+
+    /// The kind of store open under `store_id`, or `None` if it isn't open
+    /// at all (docs/CRYPTO_CONTRACT.md). Every store-scoped RPC that isn't
+    /// one of the four vault RPCs checks this and refuses a `Vault` store
+    /// with `encrypted_store_error`.
+    pub fn store_kind(&self, store_id: StoreId) -> Option<StoreKind> {
+        if self.local_stores.contains_key(&store_id) {
+            return Some(StoreKind::Plain);
+        }
+        if self.vault_stores.contains_key(&store_id) {
+            return Some(StoreKind::Vault);
+        }
+        None
+    }
+
+    // ── Vault (encrypted store) storage, docs/CRYPTO_CONTRACT.md ────────
+
+    /// Append `blob` to `doc_id`'s log in vault store `store_id`, returning
+    /// its sequence number.
+    pub async fn vault_append(&mut self, store_id: StoreId, doc_id: &str, blob: Vec<u8>) -> Result<u64> {
+        let store = self.vault_stores.get_mut(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        store.append(doc_id, blob).await
+    }
+
+    /// The snapshot (if newer than `after_seq`), every update after
+    /// `max(after_seq, snapshot.seq)`, and the document's head.
+    pub async fn vault_fetch(&self, store_id: StoreId, doc_id: &str, after_seq: u64) -> Result<(Option<(u64, Vec<u8>)>, Vec<(u64, Vec<u8>)>, u64)> {
+        let store = self.vault_stores.get(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        store.fetch(doc_id, after_seq).await
+    }
+
+    /// Store a snapshot for `doc_id` covering every update up to and
+    /// including `upto_seq`, dropping log entries at or below it.
+    pub async fn vault_snapshot(&mut self, store_id: StoreId, doc_id: &str, upto_seq: u64, blob: Vec<u8>) -> Result<()> {
+        let store = self.vault_stores.get_mut(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        store.snapshot(doc_id, upto_seq, blob).await
+    }
+
+    /// Every document in vault store `store_id`, with its head and snapshot seq.
+    pub fn vault_list_docs(&self, store_id: StoreId) -> Result<Vec<(String, u64, u64)>> {
+        let store = self.vault_stores.get(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        Ok(store.list_docs())
     }
 
     /// Get a node from a store

@@ -42,6 +42,15 @@ pub enum StoreError {
     #[error("Node {node_id} is a mount point and has no children of its own; create under the mount's source instead")]
     MountHasNoChildren { node_id: NodeId },
 
+    /// A vault blob (docs/CRYPTO_CONTRACT.md) exceeds the 4 MiB per-blob limit.
+    #[error("Vault blob of {size} bytes exceeds the 4 MiB limit")]
+    VaultBlobTooLarge { size: usize },
+
+    /// A vault document's log would exceed 64 MiB; the caller must upload a
+    /// snapshot (`vaultSnapshot`) before appending more.
+    #[error("Vault document log is at its size limit; a snapshot is required before more updates can be appended")]
+    VaultSnapshotRequired,
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

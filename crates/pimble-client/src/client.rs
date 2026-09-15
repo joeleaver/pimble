@@ -11,7 +11,7 @@ use jsonrpsee::core::client::Client as RpcClient;
 use jsonrpsee::wasm_client::WasmClientBuilder;
 #[cfg(not(target_arch = "wasm32"))]
 use jsonrpsee::ws_client::{HeaderMap, HeaderValue, WsClientBuilder};
-use pimble_core::{AuthMethod, Node, NodeId, RemoteEndpoint, Store, StoreId, SyncState, Workspace};
+use pimble_core::{AuthMethod, Node, NodeId, RemoteEndpoint, Store, StoreId, StoreKind, SyncState, Workspace};
 use pimble_core::MountRef;
 use pimble_rpc::{
     AddRemoteStoreRequest, ApplyEditRequest, ApplyStoreUpdateRequest, CloseStoreRequest, CreateMountRequest,
@@ -20,7 +20,9 @@ use pimble_rpc::{
     ListRemoteStoresRequest, LoadWorkspaceRequest, MoveNodeRequest, NodeContentChangedNotification, NodeStateVector,
     OpenStoreRequest, PimbleApiClient, RebuildIndexRequest, RemoveReplicaRequest, SaveWorkspaceRequest,
     SearchRequest, SearchResultItem, StoreChangedNotification, SyncNodeContentsRequest, SyncStoreDocumentRequest,
-    UpdateNodeContentRequest, UpdateNodeMetadataRequest, MAX_SYNC_NODE_CONTENTS,
+    UpdateNodeContentRequest, UpdateNodeMetadataRequest, VaultAppendRequest, VaultDocId,
+    VaultDocInfo, VaultFetchRequest, VaultFetchResponse, VaultListDocsRequest,
+    VaultSnapshotRequest, MAX_SYNC_NODE_CONTENTS,
 };
 use tracing::debug;
 use url::Url;
@@ -255,11 +257,32 @@ impl PimbleClient {
     // Store Operations
     // ========================================================================
 
-    /// Create a new local store
+    /// Create a new local `Plain` store with a freshly generated id. See
+    /// [`PimbleClient::create_store_with`] for a chosen `kind`/`store_id`
+    /// (docs/CRYPTO_CONTRACT.md).
     pub async fn create_store(&self, path: impl AsRef<Path>, name: impl Into<String>) -> Result<(StoreId, NodeId)> {
-        let request = CreateStoreRequest { kind: Default::default(), store_id: None, 
+        self.create_store_with(path, name, StoreKind::Plain, None).await
+    }
+
+    /// Create a new store of `kind` (`Plain` or `Vault`), under `store_id`
+    /// when given (refused if that id is already open) or a freshly
+    /// generated one otherwise (docs/CRYPTO_CONTRACT.md: the accounts
+    /// service uses `store_id` to create a hosted twin of a local store
+    /// under the local store's own id). The returned `NodeId` is a `Vault`
+    /// store's manifest root id, which has no meaning there — a vault store
+    /// has no tree on this server.
+    pub async fn create_store_with(
+        &self,
+        path: impl AsRef<Path>,
+        name: impl Into<String>,
+        kind: StoreKind,
+        store_id: Option<StoreId>,
+    ) -> Result<(StoreId, NodeId)> {
+        let request = CreateStoreRequest {
             path: path.as_ref().to_path_buf(),
             name: name.into(),
+            kind,
+            store_id,
         };
 
         let response = self
@@ -881,6 +904,68 @@ impl PimbleClient {
             .map_err(rpc_error)?;
 
         Ok(response.indexed)
+    }
+
+    // ========================================================================
+    // Vault (encrypted store) Operations — docs/CRYPTO_CONTRACT.md
+    // ========================================================================
+    //
+    // Thin pass-throughs by design: the server stores and relays opaque blobs,
+    // and every byte of meaning is put there by `pimble-crypto` on the caller's
+    // side. Nothing here encrypts, decrypts, or inspects a blob.
+
+    /// Append an encrypted update to a vault document. Answers its sequence number.
+    pub async fn vault_append(
+        &self,
+        store_id: StoreId,
+        doc_id: VaultDocId,
+        blob: String,
+    ) -> Result<u64> {
+        let response = self
+            .client
+            .vault_append(VaultAppendRequest { store_id, doc_id, blob })
+            .await
+            .map_err(rpc_error)?;
+        Ok(response.seq)
+    }
+
+    /// Everything a vault document holds beyond `after_seq`: the snapshot (when
+    /// its seq is greater) and the updates after it.
+    pub async fn vault_fetch(
+        &self,
+        store_id: StoreId,
+        doc_id: VaultDocId,
+        after_seq: u64,
+    ) -> Result<VaultFetchResponse> {
+        self.client
+            .vault_fetch(VaultFetchRequest { store_id, doc_id, after_seq })
+            .await
+            .map_err(rpc_error)
+    }
+
+    /// Store a snapshot covering every update up to and including `upto_seq`.
+    pub async fn vault_snapshot(
+        &self,
+        store_id: StoreId,
+        doc_id: VaultDocId,
+        upto_seq: u64,
+        blob: String,
+    ) -> Result<()> {
+        self.client
+            .vault_snapshot(VaultSnapshotRequest { store_id, doc_id, upto_seq, blob })
+            .await
+            .map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// Every document in a vault store, with its head and snapshot sequence.
+    pub async fn vault_list_docs(&self, store_id: StoreId) -> Result<Vec<VaultDocInfo>> {
+        let response = self
+            .client
+            .vault_list_docs(VaultListDocsRequest { store_id })
+            .await
+            .map_err(rpc_error)?;
+        Ok(response.docs)
     }
 }
 

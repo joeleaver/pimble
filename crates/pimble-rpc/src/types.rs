@@ -41,6 +41,18 @@ impl VaultDocId {
             VaultDocId::Tree => "tree".to_string(),
         }
     }
+
+    /// The inverse of [`VaultDocId::as_str`]: `"tree"` parses to
+    /// [`VaultDocId::Tree`], anything else as a node id. Used to reconstruct
+    /// a `VaultDocId` from the on-disk directory name `pimble-store`'s vault
+    /// storage names each document by (`vaultListDocs`).
+    pub fn parse(s: &str) -> Option<VaultDocId> {
+        if s == "tree" {
+            Some(VaultDocId::Tree)
+        } else {
+            NodeId::parse(s).ok().map(VaultDocId::Node)
+        }
+    }
 }
 
 /// One stored blob with its sequence number. `blob` is base64url (no padding) of the
