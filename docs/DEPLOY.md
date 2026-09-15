@@ -72,6 +72,16 @@ effect on the next `jkbase deploy`, or immediately with `jkbase restart` (no reb
 (`http://127.0.0.1:7462`) are the loopback defaults baked into the same VM and don't need a
 secret unless something is moved off those ports.
 
+## Build cache
+
+jkbase keys each target's build on its inputs, and each `context = "."` target in
+`jkbase.toml` carries `exclude = ["site", "docs", "*.md", "jkbase.toml"]` so a change to
+the site or the docs does not rebuild the Rust or web targets. Verified 2026-09-15: a
+one-line site change rebuilt nothing but the site, with the hosted server and web targets
+hitting the cache in 12 s and 21 s. A target whose inputs changed still compiles from
+scratch (about 4 to 12 minutes). Keep the exclude lists in step if new top-level
+directories appear that no build target reads.
+
 ## The two lock files must agree on wasm-bindgen
 
 jkbase's trunk buildpack provisions the `wasm-bindgen` CLI for the offline build from the
