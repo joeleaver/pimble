@@ -16,9 +16,15 @@ domains = ["pimble.app", "www.pimble.app"]
 name = "pimble"
 
 # The marketing/account site (site/index.html, download.html, signup.html,
-# login.html, account.html): a committed static site, no build step.
-[hosting]
+# login.html, account.html): a committed static site, no build step. Declared
+# as a named site, not `[hosting]`: jkbase synthesizes the `[hosting]` site
+# only when no `[sites.*]` exist (`ProjectConfig::resolved_sites`), so with
+# `[sites.app]` below a `[hosting]` table is silently ignored and `/` 404s
+# (first deploy, 2026-09-15). Sites route longest-prefix first, so `/app/*`
+# still reaches the web app.
+[sites.site]
 public = "site"
+prefix = "/"
 
 # The rinch web app, built server-side from the trunk frontend crate.
 # `context = "."` mounts the whole workspace so `web`'s path-dependency on
