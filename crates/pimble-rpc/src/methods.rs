@@ -231,6 +231,39 @@ pub trait PimbleApi {
     /// the number of nodes indexed. Write.
     #[method(name = "rebuildIndex", with_extensions)]
     async fn rebuild_index(&self, request: RebuildIndexRequest) -> Result<RebuildIndexResponse, ErrorObjectOwned>;
+
+    // ========================================================================
+    // Cloud (Pimble Cloud account) Operations, docs/CRYPTO_CONTRACT.md
+    // ========================================================================
+    //
+    // `Service`-only: called by the desktop app on its own behalf, never by
+    // a user principal.
+
+    /// Sign in to a Pimble Cloud account and persist its unwrapped keys in
+    /// this server's keystore. `Service`-only.
+    #[method(name = "cloudSignIn", with_extensions)]
+    async fn cloud_sign_in(&self, request: CloudSignInRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// Forget the signed-in account (the session and every unwrapped key).
+    /// `Service`-only.
+    #[method(name = "cloudSignOut", with_extensions)]
+    async fn cloud_sign_out(&self) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// Whether an account is currently signed in, and as whom. `Service`-only.
+    #[method(name = "cloudStatus", with_extensions)]
+    async fn cloud_status(&self) -> Result<CloudStatusResponse, ErrorObjectOwned>;
+
+    /// Host a local store's encrypted twin on Pimble Cloud. `Service`-only.
+    #[method(name = "cloudHostStore", with_extensions)]
+    async fn cloud_host_store(&self, request: CloudHostStoreRequest) -> Result<CloudHostStoreResponse, ErrorObjectOwned>;
+
+    /// Every store the signed-in account has a grant on. `Service`-only.
+    #[method(name = "cloudListHostedStores", with_extensions)]
+    async fn cloud_list_hosted_stores(&self) -> Result<CloudListHostedStoresResponse, ErrorObjectOwned>;
+
+    /// Add an already-hosted store as a local replica. `Service`-only.
+    #[method(name = "cloudAddHostedStore", with_extensions)]
+    async fn cloud_add_hosted_store(&self, request: CloudAddHostedStoreRequest) -> Result<OpenStoreResponse, ErrorObjectOwned>;
 }
 
 /// Helper function to convert any error to ErrorObjectOwned

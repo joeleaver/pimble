@@ -12,6 +12,21 @@ use tracing::{debug, info};
 
 use crate::error::{Result, StoreError};
 
+/// Which kind of link `<store>/sync.json` describes (docs/CRYPTO_CONTRACT.md
+/// "Pimble server, the desktop side"): `Sync` is the plain replica link
+/// (`crate` re-exports nothing here — the running link is
+/// `pimble_server::sync_link::SyncLink`); `Vault` links a `Plain` local
+/// store to a hosted twin of kind `Vault` under the same id, kept in sync by
+/// `pimble_server::vault_link::VaultLink` instead. Missing in an older
+/// `sync.json`: `Sync`, so an existing replica link still parses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncMode {
+    #[default]
+    Sync,
+    Vault,
+}
+
 /// A store's replica sync link, persisted as `<store>/sync.json`
 /// (docs/SYNC_CONTRACT.md decision 7). Present exactly when the store is
 /// linked to a remote twin.
@@ -24,6 +39,22 @@ pub struct SyncConfig {
     /// by the sync link on category transitions; `None` until it first syncs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_sync: Option<DateTime<Utc>>,
+    /// `Sync` (default, so an older `sync.json` still parses) or `Vault`
+    /// (docs/CRYPTO_CONTRACT.md).
+    #[serde(default)]
+    pub mode: SyncMode,
+    /// Per-document last-applied vault sequence number
+    /// (`pimble_rpc::VaultDocId::as_str()` -> seq), meaningful only when
+    /// `mode` is `Vault`: lets a restarted `VaultLink` resume `vaultFetch`
+    /// from where it left off instead of re-fetching (and re-decrypting)
+    /// the whole log. Always empty for `Sync` mode.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub last_seq: HashMap<String, u64>,
+    /// The store key id a `Vault`-mode link encrypts outgoing blobs with
+    /// (looked up in the keystore fresh on every connect, never cached here
+    /// — only the id is persisted). `None` for `Sync` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_key_id: Option<uuid::Uuid>,
 }
 
 /// Write a file atomically: write to a `.tmp` sibling, then rename into place.

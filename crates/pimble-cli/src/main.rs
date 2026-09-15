@@ -235,6 +235,30 @@ async fn main() -> Result<()> {
             }
             remove_replica(&rest[0], force).await?;
         }
+        "cloud-sign-in" => {
+            if args.len() < 4 {
+                eprintln!("Usage: pimble-cli cloud-sign-in <url> <email>  (password via PIMBLE_CLOUD_PASSWORD or a prompt)");
+                return Ok(());
+            }
+            cloud_sign_in(&args[2], &args[3]).await?;
+        }
+        "cloud-status" => cloud_status().await?,
+        "cloud-sign-out" => cloud_sign_out().await?,
+        "cloud-host-store" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pimble-cli cloud-host-store <store-id>");
+                return Ok(());
+            }
+            cloud_host_store(&args[2]).await?;
+        }
+        "cloud-list-hosted" => cloud_list_hosted().await?,
+        "cloud-add-hosted" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pimble-cli cloud-add-hosted <store-id>");
+                return Ok(());
+            }
+            cloud_add_hosted(&args[2]).await?;
+        }
         _ => {
             eprintln!("Unknown command: {}", command);
             print_help();
@@ -280,12 +304,19 @@ COMMANDS:
     vault-fetch         Fetch a vault document's snapshot and updates
     vault-append        Append a file's bytes as a vault document update
     vault-snapshot      Store a file's bytes as a vault document snapshot
+    cloud-sign-in       Sign in to a Pimble Cloud account
+    cloud-status        Show whether a Pimble Cloud account is signed in
+    cloud-sign-out      Forget the signed-in Pimble Cloud account
+    cloud-host-store    Host a local store's encrypted twin on Pimble Cloud
+    cloud-list-hosted   List the stores the signed-in account has a grant on
+    cloud-add-hosted    Add an already-hosted store as a local replica
 
 ENVIRONMENT (client, for every command but `server` itself):
     PIMBLE_SERVER       Server URL (default: http://127.0.0.1:7462)
     PIMBLE_TOKEN        Bearer token sent with every request to PIMBLE_SERVER.
                         If unset and PIMBLE_SERVER is loopback, the default
                         server token file's token is used if it exists.
+    PIMBLE_CLOUD_PASSWORD  Password for `cloud-sign-in`; prompted for if unset.
 
 ENVIRONMENT (server, `pimble-cli server` only; every flag below wins over its
 env fallback):
@@ -339,6 +370,12 @@ EXAMPLES:
     pimble-cli sync-state <store-id>
     pimble-cli remote-stores http://127.0.0.1:7463 --token secret
     pimble-cli remove-replica <store-id> --force
+    pimble-cli cloud-sign-in https://pimble.app alice@example.com
+    pimble-cli cloud-status
+    pimble-cli cloud-host-store <store-id>
+    pimble-cli cloud-list-hosted
+    pimble-cli cloud-add-hosted <store-id>
+    pimble-cli cloud-sign-out
 "#
     );
 }
@@ -663,6 +700,81 @@ async fn remote_stores(url: &str, token: Option<String>) -> Result<()> {
             println!("  {} - {}", store.id, store.name);
         }
     }
+    Ok(())
+}
+
+// ── Cloud (Pimble Cloud account), docs/CRYPTO_CONTRACT.md ────────────────
+
+/// `PIMBLE_CLOUD_PASSWORD` if set and non-empty, else a stderr prompt read
+/// from stdin (visible, like the rest of this debugging CLI's input).
+fn read_cloud_password() -> Result<String> {
+    if let Ok(password) = std::env::var("PIMBLE_CLOUD_PASSWORD") {
+        if !password.is_empty() {
+            return Ok(password);
+        }
+    }
+    use std::io::Write;
+    eprint!("Password: ");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).context("reading password from stdin")?;
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
+async fn cloud_sign_in(url: &str, email: &str) -> Result<()> {
+    let password = read_cloud_password()?;
+    let client = connect().await?;
+    client.cloud_sign_in(url, email, password).await?;
+    println!("Signed in to {} as {}", url, email);
+    Ok(())
+}
+
+async fn cloud_status() -> Result<()> {
+    let client = connect().await?;
+    let status = client.cloud_status().await?;
+    if status.signed_in {
+        println!("Signed in as {} on {}", status.email.unwrap_or_default(), status.url.unwrap_or_default());
+    } else {
+        println!("Not signed in");
+    }
+    Ok(())
+}
+
+async fn cloud_sign_out() -> Result<()> {
+    let client = connect().await?;
+    client.cloud_sign_out().await?;
+    println!("Signed out");
+    Ok(())
+}
+
+async fn cloud_host_store(store_id: &str) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let client = connect().await?;
+    let hosted_id = client.cloud_host_store(store_id).await?;
+    println!("Hosting store {} on Pimble Cloud", hosted_id);
+    Ok(())
+}
+
+async fn cloud_list_hosted() -> Result<()> {
+    let client = connect().await?;
+    let stores = client.cloud_list_hosted_stores().await?;
+    if stores.is_empty() {
+        println!("No hosted stores");
+    } else {
+        for s in stores {
+            println!("{}  {}  role={}  kind={}  created={}", s.store_id, s.name, s.role, s.kind, s.created_at);
+        }
+    }
+    Ok(())
+}
+
+async fn cloud_add_hosted(store_id: &str) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let client = connect().await?;
+    let store = client.cloud_add_hosted_store(store_id).await?;
+    println!("Added hosted store {} locally", store.id);
+    println!("Name: {}", store.name);
+    println!("Sync state: {:?}", store.sync_state);
     Ok(())
 }
 

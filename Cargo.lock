@@ -5020,6 +5020,7 @@ dependencies = [
  "pimble-client",
  "pimble-core",
  "pimble-crdt",
+ "pimble-crypto",
  "pimble-plugins",
  "pimble-rpc",
  "pimble-search",

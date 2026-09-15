@@ -13,7 +13,9 @@ use pimble_core::{AuthMethod, Node, MountRef, MountState, NodeId, RemoteEndpoint
 use pimble_plugins::PluginHost;
 use pimble_rpc::{
     encrypted_store_error, index_building_error, snapshot_required_error, to_rpc_error, ApplyEditRequest, ApplyEditResponse,
-    AddRemoteStoreRequest, ApplyStoreUpdateRequest, CloseStoreRequest, CreateMountRequest, CreateMountResponse,
+    AddRemoteStoreRequest, ApplyStoreUpdateRequest, CloseStoreRequest, CloudAddHostedStoreRequest, CloudHostStoreRequest,
+    CloudHostStoreResponse, CloudHostedStoreInfo, CloudListHostedStoresResponse, CloudSignInRequest, CloudStatusResponse,
+    CreateMountRequest, CreateMountResponse,
     CreateNodeRequest, CreateNodeResponse, CreateStoreRequest, CreateStoreResponse,
     CreateWorkspaceRequest, DeleteNodeRequest, EditOperation, EmptyResponse, GetChildrenRequest,
     GetChildrenResponse, GetMountStateRequest, GetMountStateResponse, GetNodeRequest, GetStoreSyncRequest, GetStoreSyncResponse, SetStoreSyncRequest,
@@ -29,12 +31,15 @@ use pimble_rpc::{
     MAX_SYNC_NODE_CONTENTS,
 };
 use pimble_search::{IndexNode, SearchError, SearchIndex, SearchQuery};
-use pimble_store::{StoreEndpoint, StoreManager, SyncConfig};
+use pimble_store::{StoreEndpoint, StoreManager, SyncConfig, SyncMode};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
+use crate::keystore::Keystore;
 use crate::principal::{authorize, authorize_service_only, principal_of, readable, service_extensions, Access};
 use crate::sync_link::{SyncLink, SyncLinkHandle};
+use crate::vault_link::{VaultLink, VaultLinkHandle};
 
 /// How long to wait, after a node's content last changed, before reading its
 /// units and upserting them into the search index. `applyEdit` fires on every
@@ -459,6 +464,16 @@ pub struct RpcHandler {
     /// Mounts resolved so far and replica creations in flight
     /// (docs/history/REMOTE_MOUNTS_CONTRACT.md decisions 5 and 8).
     mounts: Arc<Mutex<MountTracking>>,
+    /// One running [`VaultLinkHandle`] per vault-linked store
+    /// (docs/CRYPTO_CONTRACT.md), the vault-mode counterpart of `links`.
+    /// Populated by `openStore` (from `sync.json`'s `mode: "vault"`),
+    /// `cloudHostStore` and `cloudAddHostedStore`; removed (after `stop()`)
+    /// by `closeStore`.
+    vault_links: Arc<RwLock<HashMap<StoreId, VaultLinkHandle>>>,
+    /// This server's signed-in Pimble Cloud account and unwrapped store
+    /// keys (docs/CRYPTO_CONTRACT.md), consulted by the `cloud*` RPCs and by
+    /// every `VaultLink`.
+    keystore: Arc<Keystore>,
 }
 
 impl RpcHandler {
@@ -489,12 +504,30 @@ impl RpcHandler {
     /// directory given explicitly instead of [`default_replicas_dir`].
     /// `PimbleServer::start` uses this so `ServerConfig::replicas_dir`
     /// takes effect; tests point it at a temp directory so a replica this
-    /// server creates never lands in the real data directory.
+    /// server creates never lands in the real data directory. The keystore
+    /// path defaults to [`crate::keystore::default_keystore_path`]; see
+    /// [`RpcHandler::with_all_paths`] for a caller (`PimbleServer::start`,
+    /// and tests) that wants that overridden too.
     pub fn with_paths(
         store_manager: Arc<RwLock<StoreManager>>,
         semantic_available: bool,
         credentials_path: PathBuf,
         replicas_dir: PathBuf,
+    ) -> Self {
+        Self::with_all_paths(store_manager, semantic_available, credentials_path, replicas_dir, crate::keystore::default_keystore_path())
+    }
+
+    /// Like [`RpcHandler::with_paths`], but with the keystore path given
+    /// explicitly instead of [`crate::keystore::default_keystore_path`].
+    /// `PimbleServer::start` uses this so `ServerConfig::keystore_path`
+    /// takes effect; tests point it at a temp path so a sign-in never
+    /// touches the real config directory.
+    pub fn with_all_paths(
+        store_manager: Arc<RwLock<StoreManager>>,
+        semantic_available: bool,
+        credentials_path: PathBuf,
+        replicas_dir: PathBuf,
+        keystore_path: PathBuf,
     ) -> Self {
         Self {
             store_manager,
@@ -507,6 +540,8 @@ impl RpcHandler {
             credentials: Arc::new(crate::credentials::CredentialStore::new(credentials_path)),
             replicas_dir: Arc::new(replicas_dir),
             mounts: Arc::new(Mutex::new(MountTracking::default())),
+            vault_links: Arc::new(RwLock::new(HashMap::new())),
+            keystore: Arc::new(Keystore::new(keystore_path)),
         }
     }
 
@@ -576,12 +611,16 @@ impl RpcHandler {
         self.notify_mount_states_for_source(store_id).await;
     }
 
-    /// A store's sync link state, `Offline` if it has none.
+    /// A store's sync link state, `Offline` if it has neither a sync link
+    /// nor a vault link (a store is linked as at most one of the two).
     async fn sync_state_of(&self, store_id: StoreId) -> SyncState {
-        match self.links.read().await.get(&store_id) {
-            Some(handle) => handle.state(),
-            None => SyncState::Offline,
+        if let Some(handle) = self.links.read().await.get(&store_id) {
+            return handle.state();
         }
+        if let Some(handle) = self.vault_links.read().await.get(&store_id) {
+            return handle.state();
+        }
+        SyncState::Offline
     }
 
     /// Start a sync link for `store_id` if one isn't already running.
@@ -609,6 +648,73 @@ impl RpcHandler {
         if let Some(handle) = self.links.write().await.remove(&store_id) {
             handle.stop();
         }
+    }
+
+    // ── Cloud / vault links (docs/CRYPTO_CONTRACT.md) ────────────────────
+
+    /// Shared handle to this server's keystore, for [`crate::vault_link`] to
+    /// look up the signed-in account's session (to mint a JWT) and store
+    /// keys (to encrypt/decrypt blobs).
+    pub(crate) fn keystore(&self) -> Arc<Keystore> {
+        Arc::clone(&self.keystore)
+    }
+
+    /// Start a vault link for `store_id` if one isn't already running
+    /// (`openStore` restarting one from `sync.json`, `cloudHostStore`,
+    /// `cloudAddHostedStore`). `rpc_url` is the hosted twin's Pimble RPC
+    /// endpoint (`mint_token`'s `rpc_url`); the link mints its own bearer
+    /// fresh from the keystore on every connect, so no credential is passed
+    /// in here.
+    async fn ensure_vault_link_started(&self, store_id: StoreId, rpc_url: url::Url, key_id: Uuid) {
+        let last_sync = {
+            let manager = self.store_manager.read().await;
+            manager.read_sync_config(store_id).await.ok().flatten().and_then(|c| c.last_sync)
+        };
+        let mut vault_links = self.vault_links.write().await;
+        if vault_links.contains_key(&store_id) {
+            return;
+        }
+        let handle = VaultLink::start(self.clone(), store_id, rpc_url, key_id, last_sync);
+        vault_links.insert(store_id, handle);
+    }
+
+    /// Stop and remove `store_id`'s vault link, if any.
+    async fn stop_vault_link(&self, store_id: StoreId) {
+        if let Some(handle) = self.vault_links.write().await.remove(&store_id) {
+            handle.stop();
+        }
+    }
+
+    /// Mint a fresh JWT (for its `rpc_url`) and write `store_id`'s
+    /// `sync.json` as a vault-mode link to it under `key_id`, stripped of
+    /// any credential (`auth: none`, matching `crate::sync_link`'s own
+    /// decision 4) — a vault link never trusts what's on disk for a
+    /// credential, only the keystore. Used by `cloudHostStore` and
+    /// `cloudAddHostedStore`, both of which then call
+    /// `ensure_vault_link_started` with the returned url.
+    async fn link_hosted_store(&self, store_id: StoreId, account: &crate::keystore::SignedInAccount, key_id: Uuid) -> Result<url::Url, ErrorObjectOwned> {
+        let minted = crate::cloud::mint_token(&account.url, &account.session).await.map_err(to_rpc_error)?;
+        let rpc_url: url::Url = minted
+            .rpc_url
+            .parse()
+            .map_err(|e| to_rpc_error(format!("cloud service returned an invalid rpc_url {:?}: {}", minted.rpc_url, e)))?;
+
+        let manager = self.store_manager.read().await;
+        manager
+            .write_sync_config(
+                store_id,
+                &SyncConfig {
+                    remote: RemoteEndpoint { url: rpc_url.clone(), auth: AuthMethod::None },
+                    last_sync: None,
+                    mode: SyncMode::Vault,
+                    last_seq: Default::default(),
+                    vault_key_id: Some(key_id),
+                },
+            )
+            .await
+            .map_err(to_rpc_error)?;
+
+        Ok(rpc_url)
     }
 
     /// Connect to `remote`: the credential used is `remote.auth` if it is
@@ -927,7 +1033,7 @@ impl RpcHandler {
             .await
             .map_err(to_rpc_error)?;
         manager
-            .write_sync_config(created_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None })
+            .write_sync_config(created_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None, mode: pimble_store::SyncMode::Sync, last_seq: Default::default(), vault_key_id: None })
             .await
             .map_err(to_rpc_error)?;
         let mut store = manager.get_store_info(created_id).map_err(to_rpc_error)?;
@@ -1424,6 +1530,183 @@ impl PimbleApiServer for RpcHandler {
         })
     }
 
+    // ── Cloud (Pimble Cloud account) API, docs/CRYPTO_CONTRACT.md ────────
+
+    async fn cloud_sign_in(&self, ext: &Extensions, request: CloudSignInRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudSignIn")?;
+        info!("Signing in to Pimble Cloud at {} as {}", request.url, request.email);
+
+        let kdf_params = crate::cloud::kdf(&request.url, &request.email).await.map_err(to_rpc_error)?;
+        let password_keys = pimble_crypto::derive_password_keys(&request.password, &kdf_params).map_err(to_rpc_error)?;
+        let auth_key = pimble_crypto::encode_auth_key(&password_keys.auth_key);
+
+        let login = crate::cloud::login(&request.url, &request.email, &auth_key).await.map_err(to_rpc_error)?;
+        let me_keys = crate::cloud::me_keys(&request.url, &login.session).await.map_err(to_rpc_error)?;
+        let account_keys = pimble_crypto::unwrap_account_keys(&me_keys.account_key_blob, &password_keys.kek).map_err(to_rpc_error)?;
+
+        self.keystore
+            .sign_in(request.url.clone(), login.user.email.clone(), login.user.id.clone(), login.session.clone(), &account_keys)
+            .await
+            .map_err(to_rpc_error)?;
+
+        Ok(EmptyResponse {})
+    }
+
+    async fn cloud_sign_out(&self, ext: &Extensions) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudSignOut")?;
+        info!("Signing out of Pimble Cloud");
+        self.keystore.sign_out().await.map_err(to_rpc_error)?;
+        Ok(EmptyResponse {})
+    }
+
+    async fn cloud_status(&self, ext: &Extensions) -> Result<CloudStatusResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudStatus")?;
+        match self.keystore.account().await {
+            Some(account) => Ok(CloudStatusResponse { signed_in: true, email: Some(account.email), url: Some(account.url) }),
+            None => Ok(CloudStatusResponse { signed_in: false, email: None, url: None }),
+        }
+    }
+
+    async fn cloud_host_store(&self, ext: &Extensions, request: CloudHostStoreRequest) -> Result<CloudHostStoreResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudHostStore")?;
+        let store_id = request.store_id;
+        info!("Hosting store {} on Pimble Cloud", store_id);
+
+        let account = self.keystore.account().await.ok_or_else(|| to_rpc_error("no Pimble Cloud account is signed in"))?;
+
+        let name = {
+            let manager = self.store_manager.read().await;
+            manager.get_store_info(store_id).map_err(to_rpc_error)?.name
+        };
+
+        let store_view = crate::cloud::create_store(&account.url, &account.session, &name, "vault", Some(&store_id.to_string()))
+            .await
+            .map_err(to_rpc_error)?;
+        if store_view.store_id != store_id.to_string() {
+            return Err(to_rpc_error(format!(
+                "cloud service created store {} instead of the requested {}",
+                store_view.store_id, store_id
+            )));
+        }
+
+        let key = pimble_crypto::SymmetricKey::generate();
+        let key_id = Uuid::new_v4();
+        let recipient = account.keys.public_keys();
+        let envelope = pimble_crypto::wrap_key(&key, key_id, &recipient, &account.keys, &format!("store:{}", store_id)).map_err(to_rpc_error)?;
+        crate::cloud::put_store_key(&account.url, &account.session, &store_id.to_string(), &account.user_id, key_id, &envelope)
+            .await
+            .map_err(to_rpc_error)?;
+        self.keystore.add_store_key(store_id, key_id, &key).await.map_err(to_rpc_error)?;
+
+        let rpc_url = self.link_hosted_store(store_id, &account, key_id).await?;
+        self.ensure_vault_link_started(store_id, rpc_url, key_id).await;
+
+        Ok(CloudHostStoreResponse { store_id })
+    }
+
+    async fn cloud_list_hosted_stores(&self, ext: &Extensions) -> Result<CloudListHostedStoresResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudListHostedStores")?;
+        let account = self.keystore.account().await.ok_or_else(|| to_rpc_error("no Pimble Cloud account is signed in"))?;
+        let stores = crate::cloud::list_stores(&account.url, &account.session).await.map_err(to_rpc_error)?;
+        Ok(CloudListHostedStoresResponse {
+            stores: stores
+                .into_iter()
+                .map(|s| CloudHostedStoreInfo { store_id: s.store_id, name: s.name, role: s.role, kind: s.kind, created_at: s.created_at })
+                .collect(),
+        })
+    }
+
+    async fn cloud_add_hosted_store(&self, ext: &Extensions, request: CloudAddHostedStoreRequest) -> Result<OpenStoreResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudAddHostedStore")?;
+        let store_id = request.store_id;
+        info!("Adding hosted store {} as a local replica", store_id);
+
+        let account = self.keystore.account().await.ok_or_else(|| to_rpc_error("no Pimble Cloud account is signed in"))?;
+
+        {
+            let manager = self.store_manager.read().await;
+            if manager.is_open(store_id) {
+                return Err(to_rpc_error(format!("store {} is already open here", store_id)));
+            }
+        }
+
+        let key_grants = crate::cloud::get_store_keys(&account.url, &account.session, &store_id.to_string()).await.map_err(to_rpc_error)?;
+        let signer = account.keys.public_keys().signing;
+        let mut key_id: Option<Uuid> = None;
+        for grant in key_grants.envelopes {
+            let id: Uuid = grant.key_id.parse().map_err(|e| to_rpc_error(format!("cloud service returned a bad key id: {}", e)))?;
+            let key = pimble_crypto::unwrap_key(&grant.envelope, &account.keys, &signer).map_err(to_rpc_error)?;
+            self.keystore.add_store_key(store_id, id, &key).await.map_err(to_rpc_error)?;
+            key_id = Some(id);
+        }
+        let key_id = key_id.ok_or_else(|| to_rpc_error(format!("no key envelopes for store {} on this account", store_id)))?;
+
+        let name = crate::cloud::list_stores(&account.url, &account.session)
+            .await
+            .map_err(to_rpc_error)?
+            .into_iter()
+            .find(|s| s.store_id == store_id.to_string())
+            .map(|s| s.name)
+            .unwrap_or_else(|| store_id.to_string());
+
+        // An *empty* store document (never `create_local_store_with`, which
+        // would give it its own freshly generated root): a vault store has
+        // no plaintext root id to ask for ahead of time the way a `Plain`
+        // remote's does for `addRemoteStore`, so this mirrors
+        // `StoreManager::create_replica`'s own reasoning exactly — two
+        // independently created roots for the same store id would merge
+        // into a duplicated, disconnected tree once the vault link pulls
+        // the real one. The placeholder root id here is manifest-only
+        // bookkeeping, corrected below once the pull lands the real one.
+        let path = self.default_replica_path(store_id);
+        let mut manager = self.store_manager.write().await;
+        let created_id = manager.create_replica(&path, store_id, &name, NodeId::new()).await.map_err(to_rpc_error)?;
+        let mut store = manager.get_store_info(created_id).map_err(to_rpc_error)?;
+        drop(manager);
+
+        if !self.indexes.read().await.contains_key(&created_id) {
+            if let Err(e) = self.open_index_for_store(created_id).await {
+                warn!("Failed to open search index for store {}: {}", created_id, e);
+            }
+        }
+
+        let rpc_url = self.link_hosted_store(created_id, &account, key_id).await?;
+        self.ensure_vault_link_started(created_id, rpc_url, key_id).await;
+
+        // Wait up to 10s for the first pull to land, same as
+        // `addRemoteStore` (`create_replica_from`) does for a plain replica,
+        // so the response's `root_node_id` reflects the real tree rather
+        // than the placeholder above whenever the pull is fast enough.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = self.sync_state_of(created_id).await;
+            let is_synced = matches!(state, SyncState::Synced { .. });
+            if is_synced || std::time::Instant::now() >= deadline {
+                store.sync_state = state;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // The manifest's `root_node_id` is never rewritten once the pull
+        // merges the real tree in; read the live store document's own idea
+        // of its root instead (docs/CRYPTO_CONTRACT.md: `StoreDocument`
+        // tracks this itself, in its "meta" map, distinct from the
+        // manifest).
+        {
+            let manager = self.store_manager.read().await;
+            if let Ok(doc) = manager.store_document(created_id) {
+                if let Ok(root) = doc.root_node_id() {
+                    store.root_node_id = root;
+                }
+            }
+        }
+
+        self.mark_replica(&mut store);
+
+        Ok(OpenStoreResponse { store })
+    }
+
     async fn create_store(
         &self,
         ext: &Extensions,
@@ -1502,12 +1785,22 @@ impl PimbleApiServer for RpcHandler {
             }
         }
 
-        // Start the store's sync link from `sync.json`, if present
-        // (docs/SYNC_CONTRACT.md decision 7). `ensure_link_started` no-ops
-        // if one is already running (e.g. `open_local_store` above was a
+        // Start the store's sync or vault link from `sync.json`, if present
+        // (docs/SYNC_CONTRACT.md decision 7; docs/CRYPTO_CONTRACT.md for
+        // `mode: "vault"`). Both `ensure_*_started` no-op if a link of that
+        // kind is already running (e.g. `open_local_store` above was a
         // no-op for an already-open store).
         if let Some(config) = sync_config {
-            self.ensure_link_started(store_id, config.remote).await;
+            match config.mode {
+                SyncMode::Sync => self.ensure_link_started(store_id, config.remote).await,
+                SyncMode::Vault => match config.vault_key_id {
+                    Some(key_id) => self.ensure_vault_link_started(store_id, config.remote.url, key_id).await,
+                    None => warn!(
+                        "store {} sync.json has mode: vault but no vault_key_id; not starting a vault link",
+                        store_id
+                    ),
+                },
+            }
         }
 
         // Decision 9: repair a store's tree when it opens (a store closed
@@ -1530,6 +1823,7 @@ impl PimbleApiServer for RpcHandler {
         info!("Closing store {}", request.store_id);
 
         self.stop_link(request.store_id).await;
+        self.stop_vault_link(request.store_id).await;
         // Decision 5: a closing store's mounts are no longer this server's
         // to report on. Its entries as a mount *source* stay — the next
         // resolution reopens it.
@@ -2016,7 +2310,7 @@ impl PimbleApiServer for RpcHandler {
 
                 let manager = self.store_manager.read().await;
                 manager
-                    .write_sync_config(request.store_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None })
+                    .write_sync_config(request.store_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None, mode: pimble_store::SyncMode::Sync, last_seq: Default::default(), vault_key_id: None })
                     .await
                     .map_err(to_rpc_error)?;
                 drop(manager);

@@ -53,6 +53,12 @@ pub struct ServerConfig {
     /// (`<data dir>/pimble/replicas`); tests set this to a temp directory
     /// so they never write into the real data directory.
     pub replicas_dir: Option<PathBuf>,
+    /// Where this server's signed-in Pimble Cloud account and unwrapped
+    /// store keys live (docs/CRYPTO_CONTRACT.md). `None` uses
+    /// [`crate::keystore::default_keystore_path`] (`<config dir>/pimble/keys.json`);
+    /// tests set this to a temp path so a sign-in never touches the real
+    /// config directory.
+    pub keystore_path: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -65,6 +71,7 @@ impl Default for ServerConfig {
             allowed_origins: Vec::new(),
             credentials_path: None,
             replicas_dir: None,
+            keystore_path: None,
         }
     }
 }
@@ -181,7 +188,8 @@ impl PimbleServer {
 
         let credentials_path = self.config.credentials_path.clone().unwrap_or_else(crate::credentials::default_credentials_path);
         let replicas_dir = self.config.replicas_dir.clone().unwrap_or_else(crate::handler::default_replicas_dir);
-        let handler = RpcHandler::with_paths(Arc::clone(&self.store_manager), semantic_available, credentials_path, replicas_dir);
+        let keystore_path = self.config.keystore_path.clone().unwrap_or_else(crate::keystore::default_keystore_path);
+        let handler = RpcHandler::with_all_paths(Arc::clone(&self.store_manager), semantic_available, credentials_path, replicas_dir, keystore_path);
         let methods = handler.into_rpc();
 
         info!("Starting Pimble server on {}", local_addr);

@@ -6,14 +6,17 @@
 //! - Search coordination
 
 pub mod auth;
+pub mod cloud;
 pub mod credentials;
 pub mod error;
 mod fs_util;
 pub mod handler;
 pub mod jwt;
+pub mod keystore;
 pub mod principal;
 pub mod server;
 pub mod sync_link;
+pub mod vault_link;
 
 pub use error::*;
 pub use handler::*;

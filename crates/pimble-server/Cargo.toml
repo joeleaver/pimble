@@ -14,6 +14,9 @@ pimble-search = { workspace = true }
 pimble-plugins = { workspace = true }
 pimble-rpc = { workspace = true }
 pimble-client = { workspace = true }
+# No workspace entry yet (docs/CRYPTO_CONTRACT.md phase 2a is still landing);
+# a direct path dependency, same as pimble-cloud's.
+pimble-crypto = { path = "../pimble-crypto" }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

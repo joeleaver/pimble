@@ -202,6 +202,18 @@ pub enum AuthMethod {
         /// Refresh token (access token is obtained dynamically)
         refresh_token: String,
     },
+
+    /// A Pimble Cloud account session (docs/CRYPTO_CONTRACT.md "Desktop (E,
+    /// after B)"): `url` is the accounts service's base URL (not the Pimble
+    /// server the link actually connects to — that is `RemoteEndpoint.url`),
+    /// `session` is the long-lived session token `POST /api/v1/login`
+    /// returned. Never connected with directly: a caller mints a short-lived
+    /// JWT via `POST {url}/api/v1/token` (`Authorization: Bearer <session>`)
+    /// first and connects with that as `Bearer`.
+    CloudSession {
+        url: String,
+        session: String,
+    },
 }
 
 /// Synchronization state of a store

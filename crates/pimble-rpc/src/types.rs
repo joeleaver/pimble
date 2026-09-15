@@ -626,3 +626,74 @@ pub struct ErrorResponse {
     pub code: i32,
     pub message: String,
 }
+
+// ============================================================================
+// Cloud (Pimble Cloud account) Operations, docs/CRYPTO_CONTRACT.md
+// "Desktop (E, after B): sign-in and the encrypting link"
+// ============================================================================
+//
+// Service-only: a desktop app's local server calls these on its own behalf
+// (there is one signed-in account per running server, held in
+// `pimble_server::keystore::Keystore`), never a user principal over a
+// hosted, JWT-verified connection.
+
+/// Sign in to a Pimble Cloud account: derive `auth_key`/`kek` from
+/// `password` against the account's KDF parameters, log in, fetch and
+/// unwrap the account's keys with `kek`, and persist all of it (email,
+/// cloud url, session token, unwrapped keys) in the local keystore.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudSignInRequest {
+    /// The accounts service's base URL, e.g. `https://pimble.app`.
+    pub url: String,
+    pub email: String,
+    pub password: String,
+}
+
+/// Whether this server currently holds a signed-in Pimble Cloud account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudStatusResponse {
+    pub signed_in: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// Host a local store's encrypted twin on Pimble Cloud: create a hosted
+/// store of kind `vault` under the local store's own id, generate a store
+/// key, wrap it to the signed-in account, upload the envelope, and link the
+/// local store to the hosted twin in vault mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudHostStoreRequest {
+    pub store_id: StoreId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudHostStoreResponse {
+    pub store_id: StoreId,
+}
+
+/// One store the signed-in account has a grant on, as the accounts service
+/// reports it (`GET /api/v1/stores`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudHostedStoreInfo {
+    pub store_id: String,
+    pub name: String,
+    pub role: String,
+    /// `"plain"` or `"vault"`.
+    pub kind: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudListHostedStoresResponse {
+    pub stores: Vec<CloudHostedStoreInfo>,
+}
+
+/// Add an already-hosted store as a local replica: fetch the caller's key
+/// envelopes for it, unwrap them, create an empty local `Plain` store under
+/// the same id, and link it to the hosted twin in vault mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudAddHostedStoreRequest {
+    pub store_id: StoreId,
+}
