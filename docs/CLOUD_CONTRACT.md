@@ -268,5 +268,9 @@ token. A `README.md` in the crate documents running it locally against a local R
 - Relay: a Pimble server on jkbase holding no stores; a local server registers a store over
   an outbound WebSocket, the relay proxies RPC streams to it, grants come from the same
   token. Offline sharer means `Cached` for the guest.
+- Email: Joe has `m.pimble.app` configured as a sending domain on Resend. Phase 2 adds
+  signup verification and invitations by email from the accounts service (`RESEND_API_KEY`
+  secret, sender `Pimble <no-reply@m.pimble.app>`); an invited email with no account becomes
+  a pending grant claimed at signup.
 - Teams: organisations above grants, server as source of truth, binary files in object
   storage, store deletion on disk, invitations by email.

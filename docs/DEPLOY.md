@@ -61,6 +61,7 @@ effect on the next `jkbase deploy`, or immediately with `jkbase restart` (no reb
 | `PIMBLE_JWKS_URL` | `https://auth.jkbase.app/v1/projects/pimble/.well-known/jwks.json` -- what `pimble-cli server` fetches to verify user JWTs |
 | `PIMBLE_JWT_ISSUER` | Same as `JKBASE_AUTH_ISSUER_URL` -- the `iss` claim `pimble-cli server` checks |
 | `PIMBLE_ALLOW_ORIGINS` | `https://pimble.app,https://www.pimble.app,https://pimble.jkbase.app` |
+| `RESEND_API_KEY` | (phase 2) Resend key for `m.pimble.app`, the sending domain for verification and invitation email |
 | `PIMBLE_CLOUD_PUBLIC_URL` | `https://pimble.app` -- used for the session cookie's `Secure` flag and, in development-signing mode only, as the fallback token issuer |
 | `PIMBLE_STORES_DIR` | `/app/data/stores` -- must match the path `pimble-cli server --stores-dir` is given in `jkbase.toml`; `pimble-cloud` uses this same value when it asks the server to create a store |
 
