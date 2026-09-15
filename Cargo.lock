@@ -4765,19 +4765,14 @@ dependencies = [
 name = "pimble-client"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "base64 0.22.1",
- "futures",
  "jsonrpsee",
  "pimble-core",
  "pimble-rpc",
- "serde",
  "serde_json",
  "thiserror 2.0.17",
- "tokio",
  "tracing",
  "url",
- "uuid",
 ]
 
 [[package]]

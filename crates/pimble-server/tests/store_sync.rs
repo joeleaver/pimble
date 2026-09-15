@@ -26,7 +26,7 @@ async fn new_handler_with_store() -> (RpcHandler, StoreId, NodeId, tempfile::Tem
     let store_path = dir.path().join("test.pimble");
 
     let create_resp = handler
-        .create_store(CreateStoreRequest {
+        .create_store(&pimble_server::service_extensions(), CreateStoreRequest {
             path: store_path,
             name: "Test Store".into(),
         })
@@ -53,7 +53,7 @@ async fn sync_store_document_hands_new_client_the_full_tree() {
     let (handler, store_id, root_id, _dir) = new_handler_with_store().await;
 
     let node_resp = handler
-        .create_node(CreateNodeRequest {
+        .create_node(&pimble_server::service_extensions(), CreateNodeRequest {
             store_id,
             parent_id: Some(root_id),
             node_type: "document".into(),
@@ -66,7 +66,7 @@ async fn sync_store_document_hands_new_client_the_full_tree() {
     let sv_b64 = base64::engine::general_purpose::STANDARD.encode(fresh_disjoint_state_vector());
 
     let sync_resp = handler
-        .sync_store_document(SyncStoreDocumentRequest {
+        .sync_store_document(&pimble_server::service_extensions(), SyncStoreDocumentRequest {
             store_id,
             state_vector: sv_b64,
         })
@@ -102,7 +102,7 @@ async fn apply_store_update_with_a_new_node_reaches_get_children() {
     // current store document via the same "disjoint state vector" sync path
     // exercised above — this is how a real peer would first obtain the tree.
     let bootstrap_resp = handler
-        .sync_store_document(SyncStoreDocumentRequest {
+        .sync_store_document(&pimble_server::service_extensions(), SyncStoreDocumentRequest {
             store_id,
             state_vector: base64::engine::general_purpose::STANDARD
                 .encode(fresh_disjoint_state_vector()),
@@ -124,7 +124,7 @@ async fn apply_store_update_with_a_new_node_reaches_get_children() {
     let update_b64 = base64::engine::general_purpose::STANDARD.encode(&update);
 
     handler
-        .apply_store_update(ApplyStoreUpdateRequest {
+        .apply_store_update(&pimble_server::service_extensions(), ApplyStoreUpdateRequest {
             store_id,
             client_id: "peer".into(),
             update: update_b64,
@@ -133,7 +133,7 @@ async fn apply_store_update_with_a_new_node_reaches_get_children() {
         .unwrap();
 
     let children_resp = handler
-        .get_children(GetChildrenRequest { store_id, node_id: root_id })
+        .get_children(&pimble_server::service_extensions(), GetChildrenRequest { store_id, node_id: root_id })
         .await
         .unwrap();
 

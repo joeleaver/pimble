@@ -27,6 +27,12 @@ pub enum RpcError {
     /// can say so instead of treating this as a generic failure.
     #[error("Search index is still building ({done}/{total})")]
     IndexBuilding { done: usize, total: usize },
+
+    /// The connection's principal is authenticated but not authorized for
+    /// the store (or the server-only operation) the request named
+    /// (docs/CLOUD_CONTRACT.md "B: pimble-server" item 5).
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
 }
 
 impl RpcError {
@@ -39,6 +45,7 @@ impl RpcError {
             RpcError::Node(_) => -32002,
             RpcError::Serialization(_) => -32700,
             RpcError::IndexBuilding { .. } => -32010,
+            RpcError::Forbidden(_) => -32004,
         }
     }
 }

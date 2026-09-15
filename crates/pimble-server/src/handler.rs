@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use jsonrpsee::core::{async_trait, SubscriptionResult};
 use jsonrpsee::types::ErrorObjectOwned;
-use jsonrpsee::{PendingSubscriptionSink, SubscriptionMessage};
+use jsonrpsee::{Extensions, PendingSubscriptionSink, SubscriptionMessage};
 use pimble_client::{describe_connect_error, PimbleClient};
 use pimble_core::{AuthMethod, Node, MountRef, MountState, NodeId, RemoteEndpoint, StoreId, StoreLocation, SyncState, Workspace};
 use pimble_plugins::PluginHost;
@@ -30,6 +30,7 @@ use pimble_store::{StoreEndpoint, StoreManager, SyncConfig};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, info, warn};
 
+use crate::principal::{authorize, authorize_service_only, principal_of, readable, service_extensions, Access};
 use crate::sync_link::{SyncLink, SyncLinkHandle};
 
 /// How long to wait, after a node's content last changed, before reading its
@@ -1308,8 +1309,10 @@ impl RpcHandler {
 impl PimbleApiServer for RpcHandler {
     async fn create_store(
         &self,
+        ext: &Extensions,
         request: CreateStoreRequest,
     ) -> Result<CreateStoreResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "createStore")?;
         info!("Creating store '{}' at {:?}", request.name, request.path);
 
         let mut manager = self.store_manager.write().await;
@@ -1337,8 +1340,10 @@ impl PimbleApiServer for RpcHandler {
 
     async fn open_store(
         &self,
+        ext: &Extensions,
         request: OpenStoreRequest,
     ) -> Result<OpenStoreResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "openStore")?;
         info!("Opening store at {:?}", request.path);
 
         let mut manager = self.store_manager.write().await;
@@ -1383,8 +1388,10 @@ impl PimbleApiServer for RpcHandler {
 
     async fn close_store(
         &self,
+        ext: &Extensions,
         request: CloseStoreRequest,
     ) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "closeStore")?;
         info!("Closing store {}", request.store_id);
 
         self.stop_link(request.store_id).await;
@@ -1413,11 +1420,11 @@ impl PimbleApiServer for RpcHandler {
         Ok(EmptyResponse {})
     }
 
-    async fn list_stores(&self) -> Result<ListStoresResponse, ErrorObjectOwned> {
+    async fn list_stores(&self, ext: &Extensions) -> Result<ListStoresResponse, ErrorObjectOwned> {
         debug!("Listing stores");
 
         let manager = self.store_manager.read().await;
-        let store_ids = manager.list_stores();
+        let store_ids = readable(&principal_of(ext), manager.list_stores().iter());
 
         let mut stores = Vec::new();
         for id in store_ids {
@@ -1433,8 +1440,10 @@ impl PimbleApiServer for RpcHandler {
 
     async fn get_node(
         &self,
+        ext: &Extensions,
         request: GetNodeRequest,
     ) -> Result<GetNodeResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Read)?;
         debug!("Getting node {} from store {}", request.node_id, request.store_id);
 
         let mut manager = self.store_manager.write().await;
@@ -1448,8 +1457,10 @@ impl PimbleApiServer for RpcHandler {
 
     async fn get_nodes(
         &self,
+        ext: &Extensions,
         request: GetNodesRequest,
     ) -> Result<GetNodesResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Read)?;
         debug!(
             "Getting {} nodes from store {}",
             request.node_ids.len(),
@@ -1473,8 +1484,10 @@ impl PimbleApiServer for RpcHandler {
 
     async fn create_node(
         &self,
+        ext: &Extensions,
         request: CreateNodeRequest,
     ) -> Result<CreateNodeResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Write)?;
         info!(
             "Creating {} node '{}' in store {}",
             request.node_type, request.title, request.store_id
@@ -1510,8 +1523,10 @@ impl PimbleApiServer for RpcHandler {
 
     async fn update_node_metadata(
         &self,
+        ext: &Extensions,
         request: UpdateNodeMetadataRequest,
     ) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Write)?;
         debug!(
             "Updating metadata for node {} in store {}",
             request.node_id, request.store_id
@@ -1537,8 +1552,10 @@ impl PimbleApiServer for RpcHandler {
 
     async fn update_node_content(
         &self,
+        ext: &Extensions,
         request: UpdateNodeContentRequest,
     ) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Write)?;
         info!(
             "Updating content for node {} in store {}",
             request.node_id, request.store_id
@@ -1569,8 +1586,10 @@ impl PimbleApiServer for RpcHandler {
 
     async fn delete_node(
         &self,
+        ext: &Extensions,
         request: DeleteNodeRequest,
     ) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Write)?;
         info!(
             "Deleting node {} from store {}",
             request.node_id, request.store_id
@@ -1601,8 +1620,10 @@ impl PimbleApiServer for RpcHandler {
 
     async fn move_node(
         &self,
+        ext: &Extensions,
         request: MoveNodeRequest,
     ) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Write)?;
         info!(
             "Moving node {} to parent {} in store {}",
             request.node_id, request.new_parent_id, request.store_id
@@ -1634,8 +1655,11 @@ impl PimbleApiServer for RpcHandler {
 
     async fn get_children(
         &self,
+        ext: &Extensions,
         request: GetChildrenRequest,
     ) -> Result<GetChildrenResponse, ErrorObjectOwned> {
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Read)?;
         debug!(
             "Getting children of node {} in store {}",
             request.node_id, request.store_id
@@ -1656,6 +1680,11 @@ impl PimbleApiServer for RpcHandler {
         };
 
         if let Some(mount_ref) = mount_ref {
+            // A mount's children are its source's; a principal that can't
+            // read the source has no business seeing them just because it
+            // can read the mounting store (docs/CLOUD_CONTRACT.md "B:
+            // pimble-server" item 5).
+            authorize(&principal, mount_ref.source_store, Access::Read)?;
             let state = self.resolve_mount(request.store_id, request.node_id, &mount_ref).await;
             if !self.store_manager.read().await.is_open(mount_ref.source_store) {
                 // Decision 7: the error carries the state, because that is
@@ -1688,8 +1717,17 @@ impl PimbleApiServer for RpcHandler {
 
     async fn create_mount(
         &self,
+        ext: &Extensions,
         request: CreateMountRequest,
     ) -> Result<CreateMountResponse, ErrorObjectOwned> {
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Write)?;
+        // A mount hands its contents to whoever can see the mounting store;
+        // a principal that can't even read the source has no business
+        // mounting it in (docs/CLOUD_CONTRACT.md "B: pimble-server" item 5,
+        // extended to `createMount`/`getMountState` uniformly with
+        // `getChildren`).
+        authorize(&principal, request.source_store_id, Access::Read)?;
         info!(
             "Creating mount in store {} under parent {}, source: {}:{}",
             request.store_id, request.parent_id, request.source_store_id, request.source_node_id
@@ -1778,8 +1816,10 @@ impl PimbleApiServer for RpcHandler {
 
     async fn add_remote_store(
         &self,
+        ext: &Extensions,
         request: AddRemoteStoreRequest,
     ) -> Result<OpenStoreResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "addRemoteStore")?;
         // `path: None` lets the server choose the replica's location; the
         // user never picks one (docs/SYNC_CONTRACT.md decision 8). `wait:
         // true`: this call answers only once the first full reconcile has
@@ -1790,8 +1830,10 @@ impl PimbleApiServer for RpcHandler {
 
     async fn set_store_sync(
         &self,
+        ext: &Extensions,
         request: SetStoreSyncRequest,
     ) -> Result<GetStoreSyncResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "setStoreSync")?;
         info!("Setting sync for store {}: {:?}", request.store_id, request.remote.as_ref().map(|r| &r.url));
 
         match request.remote {
@@ -1864,8 +1906,10 @@ impl PimbleApiServer for RpcHandler {
 
     async fn get_store_sync(
         &self,
+        ext: &Extensions,
         request: GetStoreSyncRequest,
     ) -> Result<GetStoreSyncResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Read)?;
         let manager = self.store_manager.read().await;
         let remote = manager
             .read_sync_config(request.store_id)
@@ -1880,8 +1924,10 @@ impl PimbleApiServer for RpcHandler {
 
     async fn list_remote_stores(
         &self,
+        ext: &Extensions,
         request: ListRemoteStoresRequest,
     ) -> Result<ListStoresResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "listRemoteStores")?;
         debug!("Listing remote stores on {}", request.remote.url);
 
         let client = self.connect_to_remote(&request.remote).await?;
@@ -1892,8 +1938,10 @@ impl PimbleApiServer for RpcHandler {
 
     async fn remove_replica(
         &self,
+        ext: &Extensions,
         request: RemoveReplicaRequest,
     ) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "removeReplica")?;
         info!("Removing replica {} (force: {})", request.store_id, request.force);
 
         let mut store = {
@@ -1923,8 +1971,11 @@ impl PimbleApiServer for RpcHandler {
         // Closes exactly as `closeStore` does (it already stops the link
         // too), so `removeReplica` inherits whatever `closeStore` does to
         // shut its search index down cleanly before the directory under it
-        // is deleted (decision 6).
-        self.close_store(CloseStoreRequest { store_id: request.store_id }).await?;
+        // is deleted (decision 6). `removeReplica` is already `Service`-only
+        // (checked above), so this internal call carries a `Service`
+        // extension rather than forwarding the caller's — there is no HTTP
+        // request behind it to have attached one in the first place.
+        self.close_store(&service_extensions(), CloseStoreRequest { store_id: request.store_id }).await?;
 
         if let Some(path) = path {
             if let Err(e) = tokio::fs::remove_dir_all(&path).await {
@@ -1946,8 +1997,11 @@ impl PimbleApiServer for RpcHandler {
 
     async fn get_mount_state(
         &self,
+        ext: &Extensions,
         request: GetMountStateRequest,
     ) -> Result<GetMountStateResponse, ErrorObjectOwned> {
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Read)?;
         debug!(
             "Getting mount state for node {} in store {}",
             request.node_id, request.store_id
@@ -1964,6 +2018,9 @@ impl PimbleApiServer for RpcHandler {
         let mount_ref = node.mount_ref().filter(|_| node.is_mount()).ok_or_else(|| {
             to_rpc_error(format!("Node {} is not a mount point", request.node_id))
         })?;
+        // Read on the source too, uniformly with `getChildren`/`createMount`
+        // (docs/CLOUD_CONTRACT.md "B: pimble-server" item 5, extended).
+        authorize(&principal, mount_ref.source_store, Access::Read)?;
 
         // Attempts resolution rather than reading a cached answer
         // (docs/history/MOUNTS_CONTRACT.md decision 5), which for a source that is
@@ -1976,8 +2033,10 @@ impl PimbleApiServer for RpcHandler {
 
     async fn sync_store_document(
         &self,
+        ext: &Extensions,
         request: SyncStoreDocumentRequest,
     ) -> Result<SyncStoreDocumentResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Read)?;
         debug!("Sync store document for store {}", request.store_id);
 
         use base64::Engine;
@@ -2008,8 +2067,10 @@ impl PimbleApiServer for RpcHandler {
 
     async fn apply_store_update(
         &self,
+        ext: &Extensions,
         request: ApplyStoreUpdateRequest,
     ) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Write)?;
         info!(
             "Applying store update to store {} from client {}",
             request.store_id, request.client_id
@@ -2076,8 +2137,10 @@ impl PimbleApiServer for RpcHandler {
 
     async fn sync_node_contents(
         &self,
+        ext: &Extensions,
         request: SyncNodeContentsRequest,
     ) -> Result<SyncNodeContentsResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Read)?;
         debug!(
             "Sync content of {} node(s) in store {}",
             request.nodes.len(), request.store_id
@@ -2176,8 +2239,10 @@ impl PimbleApiServer for RpcHandler {
 
     async fn apply_edit(
         &self,
+        ext: &Extensions,
         request: ApplyEditRequest,
     ) -> Result<ApplyEditResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Write)?;
         use base64::Engine;
 
         // Apply the edit to the server's persistent yrs document. The
@@ -2224,8 +2289,13 @@ impl PimbleApiServer for RpcHandler {
     async fn subscribe_store_changes(
         &self,
         pending: PendingSubscriptionSink,
+        ext: &Extensions,
         store_id: StoreId,
     ) -> SubscriptionResult {
+        if let Err(e) = authorize(&principal_of(ext), store_id, Access::Read) {
+            pending.reject(e).await;
+            return Ok(());
+        }
         info!("Client subscribing to store changes for {}", store_id);
 
         let sink = pending.accept().await?;
@@ -2237,9 +2307,14 @@ impl PimbleApiServer for RpcHandler {
     async fn subscribe_node_changes(
         &self,
         pending: PendingSubscriptionSink,
+        ext: &Extensions,
         store_id: StoreId,
         node_id: NodeId,
     ) -> SubscriptionResult {
+        if let Err(e) = authorize(&principal_of(ext), store_id, Access::Read) {
+            pending.reject(e).await;
+            return Ok(());
+        }
         info!("Client subscribing to node changes for {}:{}", store_id, node_id);
 
         let sink = pending.accept().await?;
@@ -2250,9 +2325,11 @@ impl PimbleApiServer for RpcHandler {
 
     async fn search(
         &self,
+        ext: &Extensions,
         request: SearchRequest,
     ) -> Result<SearchResponse, ErrorObjectOwned> {
         debug!("Searching for '{}'", request.query);
+        let principal = principal_of(ext);
 
         let limit = request.limit.max(1);
         let query = SearchQuery {
@@ -2261,11 +2338,17 @@ impl PimbleApiServer for RpcHandler {
             limit,
         };
 
-        // Empty request.stores means every open store.
+        // Empty request.stores means every open store the principal may
+        // read (not literally every open store: a user principal must never
+        // learn of a hit in a store it has no grant on). An explicit list is
+        // still filtered the same way, so naming an unauthorized store id
+        // silently searches nothing there instead of leaking whether it
+        // exists.
         let store_ids: Vec<StoreId> = if request.stores.is_empty() {
-            self.indexes.read().await.keys().copied().collect()
+            let open: Vec<StoreId> = self.indexes.read().await.keys().copied().collect();
+            readable(&principal, open.iter())
         } else {
-            request.stores.clone()
+            readable(&principal, request.stores.iter())
         };
 
         let mut hits: Vec<(StoreId, pimble_search::SearchHit)> = Vec::new();
@@ -2318,8 +2401,10 @@ impl PimbleApiServer for RpcHandler {
 
     async fn rebuild_index(
         &self,
+        ext: &Extensions,
         request: RebuildIndexRequest,
     ) -> Result<RebuildIndexResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Write)?;
         info!("Rebuilding search index for store {}", request.store_id);
 
         let indexed = self

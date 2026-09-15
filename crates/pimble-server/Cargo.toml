@@ -41,9 +41,20 @@ rand = "0.9"
 # in the dependency tree transitively (a crypto crate rhypedb-embed pulls in),
 # declared directly here so pimble-server can use it.
 subtle = "2.6"
+# EdDSA (Ed25519) JWT verification (docs/CLOUD_CONTRACT.md "B: pimble-server"
+# item 1): the JWT itself is parsed by hand (see src/jwt.rs) rather than
+# through a JWT crate, so this is only the signature primitive.
+ed25519-dalek = "2.2"
+# Fetching the JWKS. rustls (not the default-tls/openssl backend) per the
+# contract; no default features so openssl-sys never enters the dependency
+# tree.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [dev-dependencies]
 tempfile = "3"
+# A tiny local JWKS endpoint for jwt.rs's and tests/auth.rs's tests
+# (docs/CLOUD_CONTRACT.md "B: pimble-server" item 8).
+axum = "0.8"
 
 [features]
 # Semantic search. Choose one ONNX link mode; see crates/pimble-search/Cargo.toml.

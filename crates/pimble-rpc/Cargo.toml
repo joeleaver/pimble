@@ -10,6 +10,17 @@ description = "JSON-RPC protocol definitions for Pimble"
 pimble-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-jsonrpsee = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+
+# Native: the workspace features, which include `server` — this crate's
+# `#[rpc(server, client)]` generates both halves of the API.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+jsonrpsee = { workspace = true }
+
+# wasm32: the client half only (see `methods.rs`). The `server` feature pulls
+# in jsonrpsee-server -> tokio/net -> mio, which has no
+# wasm32-unknown-unknown implementation, and the generated server trait is
+# useless in a browser anyway.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+jsonrpsee = { version = "0.24", default-features = false, features = ["client-core", "macros"] }

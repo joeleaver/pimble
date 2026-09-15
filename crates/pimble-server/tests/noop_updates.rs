@@ -39,11 +39,11 @@ async fn new_handler_with_store() -> (RpcHandler, StoreId, NodeId, tempfile::Tem
     let store_path = dir.path().join("test.pimble");
 
     let create_resp = handler
-        .create_store(CreateStoreRequest { path: store_path, name: "Test Store".into() })
+        .create_store(&pimble_server::service_extensions(), CreateStoreRequest { path: store_path, name: "Test Store".into() })
         .await
         .unwrap();
     let node_resp = handler
-        .create_node(CreateNodeRequest {
+        .create_node(&pimble_server::service_extensions(), CreateNodeRequest {
             store_id: create_resp.store_id,
             parent_id: Some(create_resp.root_node_id),
             node_type: "document".into(),
@@ -65,7 +65,7 @@ async fn resending_an_applied_content_edit_produces_no_notification_or_modified_
     let base = ContentDoc::from_plain_text("Hello").unwrap();
     let content_b64 = base64::engine::general_purpose::STANDARD.encode(base.save());
     handler
-        .update_node_content(UpdateNodeContentRequest { store_id, node_id, content: content_b64, client_id: None })
+        .update_node_content(&pimble_server::service_extensions(), UpdateNodeContentRequest { store_id, node_id, content: content_b64, client_id: None })
         .await
         .unwrap();
 
@@ -73,7 +73,8 @@ async fn resending_an_applied_content_edit_produces_no_notification_or_modified_
     // notifies): the queue must be empty going into the real edit below, or
     // the seed's notification would be mistaken for the edit's and shift
     // everything that follows by one.
-    let module = handler.clone().into_rpc();
+    let mut module = handler.clone().into_rpc();
+    module.extensions_mut().insert(pimble_server::Principal::Service);
     let mut sub = module.subscribe_unbounded("pimble_subscribeStoreChanges", (store_id,)).await.unwrap();
 
     let richer = ContentDoc::from_plain_text("Hello\nWorld").unwrap();
@@ -87,7 +88,7 @@ async fn resending_an_applied_content_edit_produces_no_notification_or_modified_
     };
 
     // The real application: must notify.
-    handler.apply_edit(edit.clone()).await.unwrap();
+    handler.apply_edit(&pimble_server::service_extensions(), edit.clone()).await.unwrap();
     let (notif, _sub_id) = tokio::time::timeout(Duration::from_secs(1), sub.next::<StoreChangedNotification>())
         .await
         .expect("expected a notification for the real edit")
@@ -98,15 +99,15 @@ async fn resending_an_applied_content_edit_produces_no_notification_or_modified_
         "expected ContentUpdated for the real edit, got {:?}", notif.change_kind
     );
 
-    let modified_before = handler.get_node(GetNodeRequest { store_id, node_id }).await.unwrap().node.metadata.modified_at;
+    let modified_before = handler.get_node(&pimble_server::service_extensions(), GetNodeRequest { store_id, node_id }).await.unwrap().node.metadata.modified_at;
 
     // The resend: same bytes, already fully merged.
-    handler.apply_edit(edit).await.unwrap();
+    handler.apply_edit(&pimble_server::service_extensions(), edit).await.unwrap();
 
     let resend_notif = tokio::time::timeout(Duration::from_millis(500), sub.next::<StoreChangedNotification>()).await;
     assert!(resend_notif.is_err(), "expected no notification for the resend, got {:?}", resend_notif);
 
-    let modified_after = handler.get_node(GetNodeRequest { store_id, node_id }).await.unwrap().node.metadata.modified_at;
+    let modified_after = handler.get_node(&pimble_server::service_extensions(), GetNodeRequest { store_id, node_id }).await.unwrap().node.metadata.modified_at;
     assert_eq!(modified_before, modified_after, "resending an already-merged edit must not touch modified_at");
 }
 
@@ -117,14 +118,15 @@ async fn resending_an_applied_content_edit_produces_no_notification_or_modified_
 async fn resending_an_applied_store_update_produces_no_notification_or_modified_at_change() {
     let (handler, store_id, root_id, _dir) = new_handler_with_store().await;
 
-    let module = handler.clone().into_rpc();
+    let mut module = handler.clone().into_rpc();
+    module.extensions_mut().insert(pimble_server::Principal::Service);
     let mut sub = module.subscribe_unbounded("pimble_subscribeStoreChanges", (store_id,)).await.unwrap();
 
     // Bootstrap an independent, fully mergeable replica of the server's
     // current store document (same "disjoint state vector" technique
     // `store_sync.rs` uses), then have it add a node and diff just that.
     let bootstrap = handler
-        .sync_store_document(pimble_rpc::SyncStoreDocumentRequest {
+        .sync_store_document(&pimble_server::service_extensions(), pimble_rpc::SyncStoreDocumentRequest {
             store_id,
             state_vector: base64::engine::general_purpose::STANDARD.encode(
                 pimble_crdt::StoreDocument::new("bootstrap", NodeId::new()).unwrap().state_vector(),
@@ -142,7 +144,7 @@ async fn resending_an_applied_store_update_produces_no_notification_or_modified_
     let request = ApplyStoreUpdateRequest { store_id, client_id: "peer".into(), update: update_b64 };
 
     // The real application: must notify.
-    handler.apply_store_update(request.clone()).await.unwrap();
+    handler.apply_store_update(&pimble_server::service_extensions(), request.clone()).await.unwrap();
     let (notif, _sub_id) = tokio::time::timeout(Duration::from_secs(1), sub.next::<StoreChangedNotification>())
         .await
         .expect("expected a notification for the real update")
@@ -153,15 +155,15 @@ async fn resending_an_applied_store_update_produces_no_notification_or_modified_
         "expected TreeStructure naming the new node, got {:?}", notif.change_kind
     );
 
-    let modified_before = handler.get_node(GetNodeRequest { store_id, node_id: root_id }).await.unwrap().node.metadata.modified_at;
+    let modified_before = handler.get_node(&pimble_server::service_extensions(), GetNodeRequest { store_id, node_id: root_id }).await.unwrap().node.metadata.modified_at;
 
     // The resend: same bytes, already fully merged.
-    handler.apply_store_update(request).await.unwrap();
+    handler.apply_store_update(&pimble_server::service_extensions(), request).await.unwrap();
 
     let resend_notif = tokio::time::timeout(Duration::from_millis(500), sub.next::<StoreChangedNotification>()).await;
     assert!(resend_notif.is_err(), "expected no notification for the resend, got {:?}", resend_notif);
 
-    let modified_after = handler.get_node(GetNodeRequest { store_id, node_id: root_id }).await.unwrap().node.metadata.modified_at;
+    let modified_after = handler.get_node(&pimble_server::service_extensions(), GetNodeRequest { store_id, node_id: root_id }).await.unwrap().node.metadata.modified_at;
     assert_eq!(modified_before, modified_after, "resending an already-merged store update must not touch modified_at");
 }
 

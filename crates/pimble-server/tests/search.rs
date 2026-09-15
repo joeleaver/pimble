@@ -32,7 +32,7 @@ async fn new_handler_with_store() -> (RpcHandler, pimble_core::StoreId, pimble_c
     let store_path = dir.path().join("test.pimble");
 
     let create_resp = handler
-        .create_store(CreateStoreRequest {
+        .create_store(&pimble_server::service_extensions(), CreateStoreRequest {
             path: store_path,
             name: "Test Store".into(),
         })
@@ -53,7 +53,7 @@ async fn set_text(
     let doc = ContentDoc::from_plain_text(text).unwrap();
     let content_b64 = base64::engine::general_purpose::STANDARD.encode(doc.save());
     handler
-        .update_node_content(UpdateNodeContentRequest {
+        .update_node_content(&pimble_server::service_extensions(), UpdateNodeContentRequest {
             store_id,
             node_id,
             content: content_b64,
@@ -65,7 +65,7 @@ async fn set_text(
 
 async fn search(handler: &RpcHandler, query: &str, stores: Vec<pimble_core::StoreId>) -> pimble_rpc::SearchResponse {
     handler
-        .search(SearchRequest {
+        .search(&pimble_server::service_extensions(), SearchRequest {
             query: query.into(),
             stores,
             semantic: false,
@@ -83,7 +83,7 @@ async fn search_finds_the_document_containing_the_query_term() {
     let (handler, store_id, root_id, _dir) = new_handler_with_store().await;
 
     let doc_a = handler
-        .create_node(CreateNodeRequest {
+        .create_node(&pimble_server::service_extensions(), CreateNodeRequest {
             store_id,
             parent_id: Some(root_id),
             node_type: "document".into(),
@@ -93,7 +93,7 @@ async fn search_finds_the_document_containing_the_query_term() {
         .unwrap()
         .node_id;
     let doc_b = handler
-        .create_node(CreateNodeRequest {
+        .create_node(&pimble_server::service_extensions(), CreateNodeRequest {
             store_id,
             parent_id: Some(root_id),
             node_type: "document".into(),
@@ -137,7 +137,7 @@ async fn search_no_longer_finds_a_deleted_node() {
     let (handler, store_id, root_id, _dir) = new_handler_with_store().await;
 
     let doc_id = handler
-        .create_node(CreateNodeRequest {
+        .create_node(&pimble_server::service_extensions(), CreateNodeRequest {
             store_id,
             parent_id: Some(root_id),
             node_type: "document".into(),
@@ -154,7 +154,7 @@ async fn search_no_longer_finds_a_deleted_node() {
     assert_eq!(before.results.len(), 1, "expected the node to be indexed before delete");
 
     handler
-        .delete_node(DeleteNodeRequest { store_id, node_id: doc_id })
+        .delete_node(&pimble_server::service_extensions(), DeleteNodeRequest { store_id, node_id: doc_id })
         .await
         .unwrap();
 
@@ -178,7 +178,7 @@ async fn rebuild_index_reindexes_every_node_from_scratch() {
     let (handler, store_id, root_id, _dir) = new_handler_with_store().await;
 
     let doc_id = handler
-        .create_node(CreateNodeRequest {
+        .create_node(&pimble_server::service_extensions(), CreateNodeRequest {
             store_id,
             parent_id: Some(root_id),
             node_type: "document".into(),
@@ -191,7 +191,7 @@ async fn rebuild_index_reindexes_every_node_from_scratch() {
     tokio::time::sleep(PAST_INDEX_DEBOUNCE).await;
 
     let rebuild_resp = handler
-        .rebuild_index(RebuildIndexRequest { store_id })
+        .rebuild_index(&pimble_server::service_extensions(), RebuildIndexRequest { store_id })
         .await
         .unwrap();
     // At least the root and the one document.
@@ -220,7 +220,7 @@ async fn empty_stores_list_searches_all_open_stores() {
     let (handler_b, store_b, root_b, _dir_b) = new_handler_with_store().await;
 
     let doc_a = handler_a
-        .create_node(CreateNodeRequest {
+        .create_node(&pimble_server::service_extensions(), CreateNodeRequest {
             store_id: store_a,
             parent_id: Some(root_a),
             node_type: "document".into(),
@@ -232,7 +232,7 @@ async fn empty_stores_list_searches_all_open_stores() {
     set_text(&handler_a, store_a, doc_a, "unique marker zephyr").await;
 
     let doc_b = handler_b
-        .create_node(CreateNodeRequest {
+        .create_node(&pimble_server::service_extensions(), CreateNodeRequest {
             store_id: store_b,
             parent_id: Some(root_b),
             node_type: "document".into(),
@@ -269,7 +269,7 @@ async fn reopening_a_store_preserves_its_search_index() {
     let store_path = dir.path().join("test.pimble");
 
     let doc_id = handler
-        .create_node(CreateNodeRequest {
+        .create_node(&pimble_server::service_extensions(), CreateNodeRequest {
             store_id,
             parent_id: Some(root_id),
             node_type: "document".into(),
@@ -284,8 +284,8 @@ async fn reopening_a_store_preserves_its_search_index() {
     let before = search(&handler, "persistent", vec![store_id]).await;
     assert_eq!(before.results.len(), 1, "expected the node to be indexed before closing");
 
-    handler.close_store(CloseStoreRequest { store_id }).await.unwrap();
-    handler.open_store(OpenStoreRequest { path: store_path }).await.unwrap();
+    handler.close_store(&pimble_server::service_extensions(), CloseStoreRequest { store_id }).await.unwrap();
+    handler.open_store(&pimble_server::service_extensions(), OpenStoreRequest { path: store_path }).await.unwrap();
 
     let after = search(&handler, "persistent", vec![store_id]).await;
     assert_eq!(

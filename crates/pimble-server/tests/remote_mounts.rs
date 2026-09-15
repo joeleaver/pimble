@@ -83,6 +83,7 @@ async fn start_server(token: Option<&str>) -> Server {
         auth_token: token.map(String::from),
         credentials_path: Some(credentials.path().join("credentials.json")),
         replicas_dir: Some(replicas.path().to_path_buf()),
+        ..Default::default()
     });
     server.start().await.expect("server starts");
 

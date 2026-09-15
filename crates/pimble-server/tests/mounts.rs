@@ -27,7 +27,7 @@ fn new_handler() -> (RpcHandler, Arc<RwLock<StoreManager>>) {
 /// Create a local store at `path` and return its id and root node id.
 async fn create_store(handler: &RpcHandler, path: &std::path::Path, name: &str) -> (StoreId, NodeId) {
     let resp = handler
-        .create_store(CreateStoreRequest {
+        .create_store(&pimble_server::service_extensions(), CreateStoreRequest {
             path: path.to_path_buf(),
             name: name.into(),
         })
@@ -39,7 +39,7 @@ async fn create_store(handler: &RpcHandler, path: &std::path::Path, name: &str) 
 /// Create a document node under `parent_id` in `store_id` and return its id.
 async fn create_doc(handler: &RpcHandler, store_id: StoreId, parent_id: NodeId, title: &str) -> NodeId {
     handler
-        .create_node(CreateNodeRequest {
+        .create_node(&pimble_server::service_extensions(), CreateNodeRequest {
             store_id,
             parent_id: Some(parent_id),
             node_type: "document".into(),
@@ -63,7 +63,7 @@ async fn get_children_on_a_mount_resolves_to_the_source_store() {
     let b_doc = create_doc(&handler, b_store, b_root, "B Doc").await;
 
     let mount_resp = handler
-        .create_mount(CreateMountRequest {
+        .create_mount(&pimble_server::service_extensions(), CreateMountRequest {
             store_id: a_store,
             parent_id: a_root,
             source_store_id: b_store,
@@ -74,7 +74,7 @@ async fn get_children_on_a_mount_resolves_to_the_source_store() {
         .unwrap();
 
     let children_resp = handler
-        .get_children(GetChildrenRequest {
+        .get_children(&pimble_server::service_extensions(), GetChildrenRequest {
             store_id: a_store,
             node_id: mount_resp.node_id,
         })
@@ -100,7 +100,7 @@ async fn get_mount_state_is_live_with_source_path_set() {
     let (b_store, b_root) = create_store(&handler, &b_path, "B").await;
 
     let mount_resp = handler
-        .create_mount(CreateMountRequest {
+        .create_mount(&pimble_server::service_extensions(), CreateMountRequest {
             store_id: a_store,
             parent_id: a_root,
             source_store_id: b_store,
@@ -114,7 +114,7 @@ async fn get_mount_state_is_live_with_source_path_set() {
     assert_eq!(mount_resp.mount_ref.source_path.as_deref(), Some(b_path.as_path()));
 
     let state_resp = handler
-        .get_mount_state(GetMountStateRequest {
+        .get_mount_state(&pimble_server::service_extensions(), GetMountStateRequest {
             store_id: a_store,
             node_id: mount_resp.node_id,
         })
@@ -142,7 +142,7 @@ async fn restart_resolves_mount_via_source_path_hint() {
         let b_doc = create_doc(&handler, b_store, b_root, "B Doc").await;
 
         let mount_resp = handler
-            .create_mount(CreateMountRequest {
+            .create_mount(&pimble_server::service_extensions(), CreateMountRequest {
                 store_id: a_store,
                 parent_id: a_root,
                 source_store_id: b_store,
@@ -163,12 +163,12 @@ async fn restart_resolves_mount_via_source_path_hint() {
     // restarted. Only the mounting store is opened.
     let (handler, _store_manager) = new_handler();
     handler
-        .open_store(OpenStoreRequest { path: a_path.clone() })
+        .open_store(&pimble_server::service_extensions(), OpenStoreRequest { path: a_path.clone() })
         .await
         .unwrap();
 
     let children_resp = handler
-        .get_children(GetChildrenRequest {
+        .get_children(&pimble_server::service_extensions(), GetChildrenRequest {
             store_id: a_store,
             node_id: mount_node_id,
         })
@@ -179,7 +179,7 @@ async fn restart_resolves_mount_via_source_path_hint() {
     assert_eq!(children_resp.children.len(), 1);
     assert_eq!(children_resp.children[0].id, b_doc);
 
-    let stores_resp = handler.list_stores().await.unwrap();
+    let stores_resp = handler.list_stores(&pimble_server::service_extensions()).await.unwrap();
     let ids: Vec<StoreId> = stores_resp.stores.iter().map(|s| s.id).collect();
     assert!(ids.contains(&a_store), "expected list_stores to include the mounting store");
     assert!(
@@ -205,7 +205,7 @@ async fn mount_source_directory_gone_is_unavailable() {
         let (b_store, b_root) = create_store(&handler, &b_path, "B").await;
 
         let mount_resp = handler
-            .create_mount(CreateMountRequest {
+            .create_mount(&pimble_server::service_extensions(), CreateMountRequest {
                 store_id: a_store,
                 parent_id: a_root,
                 source_store_id: b_store,
@@ -227,12 +227,12 @@ async fn mount_source_directory_gone_is_unavailable() {
 
     let (handler, _store_manager) = new_handler();
     handler
-        .open_store(OpenStoreRequest { path: a_path.clone() })
+        .open_store(&pimble_server::service_extensions(), OpenStoreRequest { path: a_path.clone() })
         .await
         .unwrap();
 
     let state_resp = handler
-        .get_mount_state(GetMountStateRequest {
+        .get_mount_state(&pimble_server::service_extensions(), GetMountStateRequest {
             store_id: a_store,
             node_id: mount_node_id,
         })
@@ -241,7 +241,7 @@ async fn mount_source_directory_gone_is_unavailable() {
     assert!(matches!(state_resp.state, MountState::Unavailable { .. }));
 
     let children_result = handler
-        .get_children(GetChildrenRequest {
+        .get_children(&pimble_server::service_extensions(), GetChildrenRequest {
             store_id: a_store,
             node_id: mount_node_id,
         })
@@ -262,7 +262,7 @@ async fn mounting_back_into_the_mounting_store_is_rejected_as_a_cycle() {
 
     // Mount B's root under A's root.
     handler
-        .create_mount(CreateMountRequest {
+        .create_mount(&pimble_server::service_extensions(), CreateMountRequest {
             store_id: a_store,
             parent_id: a_root,
             source_store_id: b_store,
@@ -274,7 +274,7 @@ async fn mounting_back_into_the_mounting_store_is_rejected_as_a_cycle() {
 
     // Mounting A's root into B would close the loop (A -> B -> A).
     let result = handler
-        .create_mount(CreateMountRequest {
+        .create_mount(&pimble_server::service_extensions(), CreateMountRequest {
             store_id: b_store,
             parent_id: b_root,
             source_store_id: a_store,
@@ -304,7 +304,7 @@ async fn nested_mounts_resolve_one_level_at_a_time() {
     let c_doc = create_doc(&handler, c_store, c_root, "C Doc").await;
 
     let b_mount_resp = handler
-        .create_mount(CreateMountRequest {
+        .create_mount(&pimble_server::service_extensions(), CreateMountRequest {
             store_id: b_store,
             parent_id: b_root,
             source_store_id: c_store,
@@ -315,7 +315,7 @@ async fn nested_mounts_resolve_one_level_at_a_time() {
         .unwrap();
 
     let a_mount_resp = handler
-        .create_mount(CreateMountRequest {
+        .create_mount(&pimble_server::service_extensions(), CreateMountRequest {
             store_id: a_store,
             parent_id: a_root,
             source_store_id: b_store,
@@ -326,7 +326,7 @@ async fn nested_mounts_resolve_one_level_at_a_time() {
         .unwrap();
 
     let via_a = handler
-        .get_children(GetChildrenRequest {
+        .get_children(&pimble_server::service_extensions(), GetChildrenRequest {
             store_id: a_store,
             node_id: a_mount_resp.node_id,
         })
@@ -338,7 +338,7 @@ async fn nested_mounts_resolve_one_level_at_a_time() {
     assert!(via_a.children[0].is_mount());
 
     let via_b = handler
-        .get_children(GetChildrenRequest {
+        .get_children(&pimble_server::service_extensions(), GetChildrenRequest {
             store_id: b_store,
             node_id: b_mount_resp.node_id,
         })
@@ -367,7 +367,12 @@ async fn nested_mounts_resolve_one_level_at_a_time() {
 async fn create_mount_notifies_a_store_changes_subscriber() {
     let store_manager = Arc::new(RwLock::new(StoreManager::new()));
     let handler = RpcHandler::new(store_manager);
-    let module = handler.into_rpc();
+    let mut module = handler.into_rpc();
+    // Every call below goes through jsonrpsee's in-process dispatch (no HTTP
+    // edge, so no `AuthMiddleware` ever ran); give it the same
+    // `Principal::Service` extension a trusted internal caller gets, the
+    // way `Methods::extensions_mut` is meant to be used in-process.
+    module.extensions_mut().insert(pimble_server::Principal::Service);
 
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
@@ -435,7 +440,7 @@ async fn create_node_under_a_mount_is_an_error() {
     let (b_store, b_root) = create_store(&handler, &dir_b.path().join("b.pimble"), "B").await;
 
     let mount_resp = handler
-        .create_mount(CreateMountRequest {
+        .create_mount(&pimble_server::service_extensions(), CreateMountRequest {
             store_id: a_store,
             parent_id: a_root,
             source_store_id: b_store,
@@ -446,7 +451,7 @@ async fn create_node_under_a_mount_is_an_error() {
         .unwrap();
 
     let result = handler
-        .create_node(CreateNodeRequest {
+        .create_node(&pimble_server::service_extensions(), CreateNodeRequest {
             store_id: a_store,
             parent_id: Some(mount_resp.node_id),
             node_type: "document".into(),

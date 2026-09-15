@@ -422,8 +422,12 @@ async fn forward_local_change(
 /// the handler's own `applyStoreUpdate` (so persistence, local subscribers,
 /// and the search index all follow, per decision 1).
 async fn apply_store_update_locally(handler: &RpcHandler, store_id: StoreId, link_id: &str, update_b64: String) -> anyhow::Result<()> {
+    // A sync link's own merge of a remote change it already fetched with its
+    // own (out-of-band) credential — there is no per-request `Principal` to
+    // forward here, so this carries `Principal::Service`
+    // (docs/CLOUD_CONTRACT.md "B: pimble-server" item 4).
     handler
-        .apply_store_update(ApplyStoreUpdateRequest { store_id, client_id: link_id.to_string(), update: update_b64 })
+        .apply_store_update(&crate::principal::service_extensions(), ApplyStoreUpdateRequest { store_id, client_id: link_id.to_string(), update: update_b64 })
         .await
         .map_err(|e| anyhow::anyhow!("local applyStoreUpdate failed: {}", e))?;
     Ok(())
@@ -444,11 +448,13 @@ async fn apply_edit_locally_with_fallback(
 ) -> anyhow::Result<()> {
     let op = EditOperation::IncrementalChanges { changes: changes_b64 };
     let request = ApplyEditRequest { store_id, node_id, client_id: link_id.to_string(), operation: op.clone() };
-    if handler.apply_edit(request).await.is_err() {
+    // `Principal::Service`, for the same reason as `apply_store_update_locally` above.
+    let ext = crate::principal::service_extensions();
+    if handler.apply_edit(&ext, request).await.is_err() {
         reconcile_store(handler, client, store_id, link_id).await?;
         let retry = ApplyEditRequest { store_id, node_id, client_id: link_id.to_string(), operation: op };
         handler
-            .apply_edit(retry)
+            .apply_edit(&ext, retry)
             .await
             .map_err(|e| anyhow::anyhow!("local applyEdit failed even after reconciling the store document: {}", e))?;
     }

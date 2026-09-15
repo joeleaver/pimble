@@ -31,15 +31,18 @@ async fn main() -> Result<()> {
     match command.as_str() {
         "help" | "--help" | "-h" => print_help(),
         "server" => {
-            let (addr, open_paths, token_file) = match parse_server_args(&args[2..]) {
+            let parsed = match parse_server_args(&args[2..]) {
                 Ok(parsed) => parsed,
                 Err(e) => {
                     eprintln!("{}", e);
-                    eprintln!("Usage: pimble-cli server [--addr HOST:PORT] [--open PATH]... [--token-file PATH]");
+                    eprintln!(
+                        "Usage: pimble-cli server [--addr HOST:PORT] [--open PATH]... [--token-file PATH] \
+                         [--jwks URL --issuer ISS] [--allow-origin ORIGIN]... [--stores-dir DIR]"
+                    );
                     return Ok(());
                 }
             };
-            run_server(&addr, open_paths, token_file).await?;
+            run_server(parsed).await?;
         }
         "token" => {
             let new = args.get(2).map(|s| s == "--new").unwrap_or(false);
@@ -242,16 +245,41 @@ COMMANDS:
     remote-stores       List the stores a remote Pimble server has open
     remove-replica      Stop a replica's sync link, close it, and delete it
 
-ENVIRONMENT:
-    PIMBLE_SERVER       Server URL for every command but `server` itself
-                        (default: http://127.0.0.1:7462)
+ENVIRONMENT (client, for every command but `server` itself):
+    PIMBLE_SERVER       Server URL (default: http://127.0.0.1:7462)
     PIMBLE_TOKEN        Bearer token sent with every request to PIMBLE_SERVER.
                         If unset and PIMBLE_SERVER is loopback, the default
                         server token file's token is used if it exists.
 
+ENVIRONMENT (server, `pimble-cli server` only; every flag below wins over its
+env fallback):
+    PIMBLE_ADDR         Same as --addr.
+    PIMBLE_SERVER_TOKEN The static token's value directly (--token-file reads
+                        one from a file instead; either enables the check).
+    PIMBLE_JWKS_URL     Same as --jwks.
+    PIMBLE_JWT_ISSUER   Same as --issuer.
+    PIMBLE_ALLOW_ORIGINS  Same as --allow-origin, comma separated.
+    PIMBLE_STORES_DIR   Same as --stores-dir.
+
+SERVER OPTIONS (`pimble-cli server`):
+    --addr HOST:PORT    Address to bind (default: 127.0.0.1:7462).
+    --open PATH         Open this store at start (repeatable).
+    --token-file PATH   Static-token file; created with a fresh token if
+                        missing. Enables the bearer/API-key check even on
+                        loopback.
+    --jwks URL          JWKS endpoint for JWT verification (needs --issuer).
+    --issuer ISS        Required `iss` claim (needs --jwks). Audience is
+                        always `pimble`.
+    --allow-origin ORIGIN  A WebSocket `Origin` to accept (repeatable); any
+                        other Origin is refused, and an Origin at all is
+                        refused when this is never given.
+    --stores-dir DIR    Open every `*.pimble` directory directly inside DIR
+                        at start.
+
 EXAMPLES:
     pimble-cli server
     pimble-cli server --addr 0.0.0.0:7462 --open /srv/family.pimble --token-file /etc/pimble/token
+    pimble-cli server --addr 0.0.0.0:7462 --jwks https://auth.example/.well-known/jwks.json --issuer https://auth.example --allow-origin https://app.example --stores-dir /srv/stores
     pimble-cli token
     pimble-cli token --new
     pimble-cli create-store ./my-notes.pimble "My Notes"
@@ -279,19 +307,45 @@ EXAMPLES:
     );
 }
 
-/// Parse `server`'s own flags (`--addr HOST:PORT`, repeatable `--open PATH`,
-/// `--token-file PATH`) out of the args following the `server` word.
-fn parse_server_args(rest: &[String]) -> std::result::Result<(String, Vec<PathBuf>, Option<PathBuf>), String> {
-    let mut addr = "127.0.0.1:7462".to_string();
+/// Parsed `server` flags plus their env fallbacks resolved
+/// (docs/CLOUD_CONTRACT.md "B: pimble-server" item 7: flags win over env).
+struct ServerArgs {
+    addr: String,
+    open_paths: Vec<PathBuf>,
+    token_file: Option<PathBuf>,
+    /// The static token's literal value (`PIMBLE_SERVER_TOKEN`; there is no
+    /// flag for the value itself, only `--token-file` for a file). Only
+    /// consulted when `token_file` is `None`.
+    server_token_env: Option<String>,
+    jwks_url: Option<String>,
+    jwt_issuer: Option<String>,
+    allow_origins: Vec<String>,
+    stores_dir: Option<PathBuf>,
+}
+
+/// Parse `server`'s own flags out of the args following the `server` word,
+/// then fill in whatever wasn't given from its env fallback
+/// (docs/CLOUD_CONTRACT.md "B: pimble-server" item 7): `--addr` /
+/// `PIMBLE_ADDR`; `--token-file` / `PIMBLE_SERVER_TOKEN` (the token's own
+/// value, not a file: `--token-file` still works as before); `--jwks` /
+/// `PIMBLE_JWKS_URL`; `--issuer` / `PIMBLE_JWT_ISSUER`; repeatable
+/// `--allow-origin` / `PIMBLE_ALLOW_ORIGINS` (comma separated); `--stores-dir`
+/// / `PIMBLE_STORES_DIR`. `--open PATH` (repeatable) has no env form.
+fn parse_server_args(rest: &[String]) -> std::result::Result<ServerArgs, String> {
+    let mut addr = None;
     let mut open_paths = Vec::new();
     let mut token_file = None;
+    let mut jwks_url = None;
+    let mut jwt_issuer = None;
+    let mut allow_origins = Vec::new();
+    let mut stores_dir = None;
 
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
             "--addr" => {
                 i += 1;
-                addr = rest.get(i).ok_or("--addr requires a value")?.clone();
+                addr = Some(rest.get(i).ok_or("--addr requires a value")?.clone());
             }
             "--open" => {
                 i += 1;
@@ -303,12 +357,46 @@ fn parse_server_args(rest: &[String]) -> std::result::Result<(String, Vec<PathBu
                 let path = rest.get(i).ok_or("--token-file requires a value")?;
                 token_file = Some(PathBuf::from(path));
             }
+            "--jwks" => {
+                i += 1;
+                jwks_url = Some(rest.get(i).ok_or("--jwks requires a value")?.clone());
+            }
+            "--issuer" => {
+                i += 1;
+                jwt_issuer = Some(rest.get(i).ok_or("--issuer requires a value")?.clone());
+            }
+            "--allow-origin" => {
+                i += 1;
+                allow_origins.push(rest.get(i).ok_or("--allow-origin requires a value")?.clone());
+            }
+            "--stores-dir" => {
+                i += 1;
+                let path = rest.get(i).ok_or("--stores-dir requires a value")?;
+                stores_dir = Some(PathBuf::from(path));
+            }
             other => return Err(format!("Unknown server option: {}", other)),
         }
         i += 1;
     }
 
-    Ok((addr, open_paths, token_file))
+    let addr = addr.or_else(|| std::env::var("PIMBLE_ADDR").ok()).unwrap_or_else(|| "127.0.0.1:7462".to_string());
+    let jwks_url = jwks_url.or_else(|| std::env::var("PIMBLE_JWKS_URL").ok());
+    let jwt_issuer = jwt_issuer.or_else(|| std::env::var("PIMBLE_JWT_ISSUER").ok());
+    let server_token_env = std::env::var("PIMBLE_SERVER_TOKEN").ok().filter(|t| !t.is_empty());
+    // Flags accumulate rather than override one-for-one, so a repeatable
+    // flag either wins outright (any given) or falls back to the env list
+    // entirely — never a merge of the two.
+    let allow_origins = if !allow_origins.is_empty() {
+        allow_origins
+    } else {
+        std::env::var("PIMBLE_ALLOW_ORIGINS")
+            .ok()
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default()
+    };
+    let stores_dir = stores_dir.or_else(|| std::env::var("PIMBLE_STORES_DIR").ok().map(PathBuf::from));
+
+    Ok(ServerArgs { addr, open_paths, token_file, server_token_env, jwks_url, jwt_issuer, allow_origins, stores_dir })
 }
 
 /// Pull `flag`'s value out of `args` (its first occurrence; `flag value`),
@@ -346,33 +434,72 @@ fn extract_switch(args: &[String], flag: &str) -> (Vec<String>, bool) {
     (rest, present)
 }
 
-/// Start the embedded Pimble server, bound to `addr`, opening every store in
-/// `open_paths` at start (so a headless replica host can run as
-/// `pimble-cli server --addr 0.0.0.0:7462 --open /srv/family.pimble`) —
-/// opened the same way any other client would, over a loopback connection to
-/// the server it just started.
+/// Every `*.pimble` directory directly inside `dir` (docs/CLOUD_CONTRACT.md
+/// "B: pimble-server" item 6): what `pimble-cli server --stores-dir DIR`
+/// opens at start, in addition to any `--open PATH`. A `dir` that doesn't
+/// exist or can't be listed yields nothing rather than an error — the
+/// accounts service is expected to have created it before pointing a server
+/// at it, but an empty/missing directory on first run shouldn't stop the
+/// server from starting.
+fn pimble_stores_in(dir: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut stores: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && p.extension().is_some_and(|ext| ext == "pimble"))
+        .collect();
+    stores.sort();
+    stores
+}
+
+/// Start the embedded Pimble server and open every store `args` names, both
+/// explicit (`--open PATH`, so a headless replica host can run as
+/// `pimble-cli server --addr 0.0.0.0:7462 --open /srv/family.pimble`) and
+/// discovered (`--stores-dir DIR`, item 6) — opened the same way any other
+/// client would, over a loopback connection to the server it just started.
 ///
-/// `token_file` always enables the auth check, even on loopback (docs/
-/// HARDENING_CONTRACT.md decision 3); without it, a non-loopback `addr`
-/// still needs a token, so it falls back to the default token file
-/// ([`auth::default_token_path`]) — `PimbleServer::start` would otherwise
-/// refuse to bind.
-async fn run_server(addr: &str, open_paths: Vec<PathBuf>, token_file: Option<PathBuf>) -> Result<()> {
+/// The static-token precedence (item 7): `--token-file PATH` (flag) wins;
+/// else `PIMBLE_SERVER_TOKEN`'s literal value; else, if `addr` isn't
+/// loopback and no JWT verifier is configured either, the default token
+/// file ([`auth::default_token_path`]) — `PimbleServer::start` would
+/// otherwise refuse to bind. A JWT verifier alone (`--jwks`/`--issuer`) also
+/// satisfies that bind check, so this never force-creates a token file a
+/// JWT-only deployment has no use for.
+async fn run_server(args: ServerArgs) -> Result<()> {
     use pimble_server::{PimbleServer, ServerConfig};
 
-    let socket_addr: std::net::SocketAddr = addr.parse().with_context(|| format!("Invalid --addr {}", addr))?;
+    let socket_addr: std::net::SocketAddr = args.addr.parse().with_context(|| format!("Invalid --addr {}", args.addr))?;
 
-    let auth_token = match token_file {
-        Some(path) => Some(
-            auth::load_or_create_token(&path).with_context(|| format!("Failed to load or create token file {:?}", path))?,
+    let jwt_configured = args.jwks_url.is_some() && args.jwt_issuer.is_some();
+    if args.jwks_url.is_some() != args.jwt_issuer.is_some() {
+        anyhow::bail!("--jwks/PIMBLE_JWKS_URL and --issuer/PIMBLE_JWT_ISSUER must both be given, or neither");
+    }
+    let jwks_url = args.jwks_url.as_deref().map(|s| s.parse()).transpose().context("Invalid --jwks URL")?;
+
+    let auth_token = match args.token_file {
+        Some(ref path) => Some(
+            auth::load_or_create_token(path).with_context(|| format!("Failed to load or create token file {:?}", path))?,
         ),
-        None if !socket_addr.ip().is_loopback() => Some(
+        None if args.server_token_env.is_some() => args.server_token_env.clone(),
+        None if !socket_addr.ip().is_loopback() && !jwt_configured => Some(
             auth::load_or_create_token(&auth::default_token_path()).context("Failed to load or create the default server token")?,
         ),
         None => None,
     };
 
-    let mut server = PimbleServer::with_config(ServerConfig { addr: socket_addr, auth_token: auth_token.clone(), ..Default::default() });
+    let mut open_paths = args.open_paths.clone();
+    if let Some(stores_dir) = &args.stores_dir {
+        open_paths.extend(pimble_stores_in(stores_dir));
+    }
+
+    let mut server = PimbleServer::with_config(ServerConfig {
+        addr: socket_addr,
+        auth_token: auth_token.clone(),
+        jwks_url,
+        jwt_issuer: args.jwt_issuer.clone(),
+        allowed_origins: args.allow_origins.clone(),
+        ..Default::default()
+    });
     server.start().await?;
     let bound = server.addr();
     println!("Pimble server listening on {}", bound);
@@ -826,5 +953,56 @@ fn is_loopback_url(url: &str) -> bool {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh temp directory under the OS temp dir, cleaned up when the
+    /// returned guard drops. No `tempfile` dev-dependency needed for one
+    /// test: `uuid` is already a normal dependency.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("pimble-cli-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// docs/CLOUD_CONTRACT.md "B: pimble-server" item 6: `--stores-dir DIR`
+    /// opens every `*.pimble` directory directly inside `DIR`. Only
+    /// directories with that extension count — a same-named file, a
+    /// differently-named directory, and anything nested deeper are all
+    /// left out.
+    #[test]
+    fn pimble_stores_in_finds_only_pimble_directories_directly_inside() {
+        let dir = TempDir::new();
+
+        std::fs::create_dir_all(dir.0.join("alpha.pimble")).unwrap();
+        std::fs::create_dir_all(dir.0.join("beta.pimble")).unwrap();
+        std::fs::create_dir_all(dir.0.join("not-a-store")).unwrap();
+        std::fs::write(dir.0.join("gamma.pimble"), b"not a directory").unwrap();
+        std::fs::write(dir.0.join("readme.txt"), b"ignored").unwrap();
+        std::fs::create_dir_all(dir.0.join("alpha.pimble").join("nested.pimble")).unwrap();
+
+        let mut found = pimble_stores_in(&dir.0);
+        found.sort();
+        let mut expected = vec![dir.0.join("alpha.pimble"), dir.0.join("beta.pimble")];
+        expected.sort();
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn pimble_stores_in_a_missing_directory_is_empty_not_an_error() {
+        let dir = TempDir::new();
+        assert_eq!(pimble_stores_in(&dir.0.join("does-not-exist")), Vec::<PathBuf>::new());
     }
 }

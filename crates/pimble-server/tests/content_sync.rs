@@ -30,7 +30,7 @@ async fn new_handler_with_store() -> (RpcHandler, pimble_core::StoreId, pimble_c
     let store_path = dir.path().join("test.pimble");
 
     let create_resp = handler
-        .create_store(CreateStoreRequest {
+        .create_store(&pimble_server::service_extensions(), CreateStoreRequest {
             path: store_path,
             name: "Test Store".into(),
         })
@@ -38,7 +38,7 @@ async fn new_handler_with_store() -> (RpcHandler, pimble_core::StoreId, pimble_c
         .unwrap();
 
     let node_resp = handler
-        .create_node(CreateNodeRequest {
+        .create_node(&pimble_server::service_extensions(), CreateNodeRequest {
             store_id: create_resp.store_id,
             parent_id: Some(create_resp.root_node_id),
             node_type: "document".into(),
@@ -60,7 +60,7 @@ async fn sync_node_content_hands_new_client_the_full_document() {
     let content_b64 = base64::engine::general_purpose::STANDARD.encode(a_doc.save());
 
     handler
-        .update_node_content(UpdateNodeContentRequest {
+        .update_node_content(&pimble_server::service_extensions(), UpdateNodeContentRequest {
             store_id,
             node_id,
             content: content_b64,
@@ -74,7 +74,7 @@ async fn sync_node_content_hands_new_client_the_full_document() {
     let empty_sv_b64 = base64::engine::general_purpose::STANDARD
         .encode(ContentDoc::new().state_vector());
     let sync_resp = handler
-        .sync_node_contents(SyncNodeContentsRequest {
+        .sync_node_contents(&pimble_server::service_extensions(), SyncNodeContentsRequest {
             store_id,
             nodes: vec![NodeStateVector { node_id, state_vector: empty_sv_b64 }],
         })
@@ -106,7 +106,7 @@ async fn apply_edit_incremental_changes_merges_into_server_document() {
     let base = ContentDoc::from_plain_text("Hello").unwrap();
     let content_b64 = base64::engine::general_purpose::STANDARD.encode(base.save());
     handler
-        .update_node_content(UpdateNodeContentRequest {
+        .update_node_content(&pimble_server::service_extensions(), UpdateNodeContentRequest {
             store_id,
             node_id,
             content: content_b64,
@@ -123,7 +123,7 @@ async fn apply_edit_incremental_changes_merges_into_server_document() {
     let changes_b64 = base64::engine::general_purpose::STANDARD.encode(&diff);
 
     handler
-        .apply_edit(ApplyEditRequest {
+        .apply_edit(&pimble_server::service_extensions(), ApplyEditRequest {
             store_id,
             node_id,
             client_id: "client-a".into(),
@@ -133,7 +133,7 @@ async fn apply_edit_incremental_changes_merges_into_server_document() {
         .unwrap();
 
     let node = handler
-        .get_node(GetNodeRequest { store_id, node_id })
+        .get_node(&pimble_server::service_extensions(), GetNodeRequest { store_id, node_id })
         .await
         .unwrap()
         .node;
@@ -157,7 +157,7 @@ async fn apply_edit_incremental_changes_is_flushed_to_disk_after_debounce() {
     let base = ContentDoc::from_plain_text("Hello").unwrap();
     let content_b64 = base64::engine::general_purpose::STANDARD.encode(base.save());
     handler
-        .update_node_content(UpdateNodeContentRequest {
+        .update_node_content(&pimble_server::service_extensions(), UpdateNodeContentRequest {
             store_id,
             node_id,
             content: content_b64,
@@ -172,7 +172,7 @@ async fn apply_edit_incremental_changes_is_flushed_to_disk_after_debounce() {
     let changes_b64 = base64::engine::general_purpose::STANDARD.encode(&diff);
 
     handler
-        .apply_edit(ApplyEditRequest {
+        .apply_edit(&pimble_server::service_extensions(), ApplyEditRequest {
             store_id,
             node_id,
             client_id: "client-a".into(),

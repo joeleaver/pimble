@@ -9,6 +9,7 @@ use pimble_rpc::PimbleApiServer;
 use pimble_store::StoreManager;
 use tokio::sync::RwLock;
 use tracing::info;
+use url::Url;
 
 use crate::handler::RpcHandler;
 use crate::Result;
@@ -21,10 +22,26 @@ pub struct ServerConfig {
     /// Required credential for every JSON-RPC request (docs/
     /// HARDENING_CONTRACT.md decisions 1-2): `Authorization: Bearer
     /// <token>` or `X-Api-Key: <token>`, checked at the HTTP edge before any
-    /// request reaches the store. `None` means no token is required, which
-    /// `start()` only allows on a loopback address — the app's embedded
-    /// server runs this way.
+    /// request reaches the store. `None` means no static-token check;
+    /// `start()` only allows binding beyond loopback when this or `jwks_url`
+    /// (with `jwt_issuer`) is set — the app's embedded server runs with
+    /// neither.
     pub auth_token: Option<String>,
+    /// The JWKS endpoint for JWT verification (docs/CLOUD_CONTRACT.md "B:
+    /// pimble-server" item 1): `--jwks URL` / `PIMBLE_JWKS_URL`. Only takes
+    /// effect together with `jwt_issuer`; audience is always fixed to
+    /// `pimble`.
+    pub jwks_url: Option<Url>,
+    /// The `iss` claim every accepted JWT must carry: `--issuer ISS` /
+    /// `PIMBLE_JWT_ISSUER`. Only takes effect together with `jwks_url`.
+    pub jwt_issuer: Option<String>,
+    /// Origins a WebSocket handshake's `Origin` header may carry and still
+    /// be accepted (docs/CLOUD_CONTRACT.md "B: pimble-server" item 3):
+    /// `--allow-origin` (repeatable) / `PIMBLE_ALLOW_ORIGINS` (comma
+    /// separated). Empty (the default, and always for the embedded app
+    /// server) refuses every request that carries an `Origin` header at
+    /// all, as before this contract.
+    pub allowed_origins: Vec<String>,
     /// Where saved per-remote credentials live (decision 4). `None` uses
     /// [`crate::credentials::default_credentials_path`]; tests set this to a
     /// temp path so they never touch the real config directory.
@@ -43,6 +60,9 @@ impl Default for ServerConfig {
         Self {
             addr: "127.0.0.1:7462".parse().unwrap(),
             auth_token: None,
+            jwks_url: None,
+            jwt_issuer: None,
+            allowed_origins: Vec::new(),
             credentials_path: None,
             replicas_dir: None,
         }
@@ -108,18 +128,42 @@ impl PimbleServer {
             }
         }
 
-        if !self.config.addr.ip().is_loopback() && self.config.auth_token.is_none() {
+        // A JWT verifier configured (jwks_url + jwt_issuer, both required
+        // together) counts as a verifier just as much as the static token
+        // does (docs/CLOUD_CONTRACT.md "B: pimble-server" item 1: "A server
+        // with neither verifier still refuses to bind beyond loopback").
+        let jwt_configured = self.config.jwks_url.is_some() && self.config.jwt_issuer.is_some();
+        if self.config.jwks_url.is_some() != self.config.jwt_issuer.is_some() {
+            return Err(crate::ServerError::Server(
+                "jwks_url and jwt_issuer must both be set, or both left unset".to_string(),
+            ));
+        }
+
+        if !self.config.addr.ip().is_loopback() && self.config.auth_token.is_none() && !jwt_configured {
             return Err(crate::ServerError::Server(format!(
-                "refusing to bind {} (not a loopback address) without an auth token; \
-                 pass ServerConfig::auth_token or start with a token file (pimble-cli server --token-file)",
+                "refusing to bind {} (not a loopback address) without an auth token or a JWT verifier; \
+                 pass ServerConfig::auth_token (or start with a token file, pimble-cli server --token-file) \
+                 and/or ServerConfig::jwks_url/jwt_issuer (pimble-cli server --jwks/--issuer)",
                 self.config.addr
             )));
         }
 
-        // The HTTP-edge auth layer (decisions 1-2), run on every request
-        // before it reaches the JSON-RPC dispatch — including the WebSocket
-        // upgrade handshake.
-        let http_middleware = tower::ServiceBuilder::new().layer(crate::auth::AuthLayer::new(self.config.auth_token.clone()));
+        let jwt = if let (Some(jwks_url), Some(issuer)) = (&self.config.jwks_url, &self.config.jwt_issuer) {
+            Some(crate::jwt::JwtVerifier::new(jwks_url.clone(), issuer.clone()).await.map_err(|e| {
+                crate::ServerError::Server(format!("failed to start the JWT verifier for {}: {}", jwks_url, e))
+            })?)
+        } else {
+            None
+        };
+
+        // The HTTP-edge auth layer (docs/CLOUD_CONTRACT.md "B: pimble-server"
+        // items 1-3), run on every request before it reaches the JSON-RPC
+        // dispatch — including the WebSocket upgrade handshake.
+        let http_middleware = tower::ServiceBuilder::new().layer(crate::auth::AuthLayer::new(
+            self.config.auth_token.clone(),
+            jwt,
+            self.config.allowed_origins.clone(),
+        ));
 
         let server = Server::builder()
             .set_http_middleware(http_middleware)
