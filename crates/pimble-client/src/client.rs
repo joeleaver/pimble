@@ -14,8 +14,9 @@ use jsonrpsee::ws_client::{HeaderMap, HeaderValue, WsClientBuilder};
 use pimble_core::{AuthMethod, Node, NodeId, RemoteEndpoint, Store, StoreId, StoreKind, SyncState, Workspace};
 use pimble_core::MountRef;
 use pimble_rpc::{
-    AddRemoteStoreRequest, ApplyEditRequest, ApplyStoreUpdateRequest, CloseStoreRequest, CreateMountRequest,
-    CreateNodeRequest, CreateStoreRequest, CreateWorkspaceRequest, DeleteNodeRequest,
+    AddRemoteStoreRequest, ApplyEditRequest, ApplyStoreUpdateRequest, CloseStoreRequest, CloudAddHostedStoreRequest,
+    CloudHostStoreRequest, CloudHostedStoreInfo, CloudSignInRequest, CloudStatusResponse,
+    CreateMountRequest, CreateNodeRequest, CreateStoreRequest, CreateWorkspaceRequest, DeleteNodeRequest,
     EditOperation, GetChildrenRequest, GetMountStateRequest, GetNodeRequest, GetNodesRequest, GetStoreSyncRequest, SetStoreSyncRequest,
     ListRemoteStoresRequest, LoadWorkspaceRequest, MoveNodeRequest, NodeContentChangedNotification, NodeStateVector,
     OpenStoreRequest, PimbleApiClient, RebuildIndexRequest, RemoveReplicaRequest, SaveWorkspaceRequest,
@@ -187,6 +188,17 @@ impl PimbleClient {
                     "OAuth2 auth is not supported by connect_with_auth".into(),
                 ));
             }
+            AuthMethod::CloudSession { .. } => {
+                // docs/CRYPTO_CONTRACT.md: a `CloudSession` is a long-lived
+                // accounts-service session, not something a WebSocket
+                // handshake carries directly. A caller (a sync/vault link)
+                // must mint a short-lived JWT via `POST {url}/api/v1/token`
+                // first and connect with `AuthMethod::Bearer { token: jwt }`
+                // instead.
+                return Err(ClientError::Connection(
+                    "CloudSession auth must be resolved to a Bearer token (via POST /api/v1/token) before connecting".into(),
+                ));
+            }
         }
 
         builder
@@ -209,6 +221,11 @@ impl PimbleClient {
             AuthMethod::OAuth2 { .. } => {
                 return Err(ClientError::Connection(
                     "OAuth2 auth is not supported by connect_with_auth".into(),
+                ));
+            }
+            AuthMethod::CloudSession { .. } => {
+                return Err(ClientError::Connection(
+                    "CloudSession auth must be resolved to a Bearer token (via POST /api/v1/token) before connecting".into(),
                 ));
             }
         };
@@ -966,6 +983,48 @@ impl PimbleClient {
             .await
             .map_err(rpc_error)?;
         Ok(response.docs)
+    }
+
+    // ========================================================================
+    // Cloud (Pimble Cloud account) Operations, docs/CRYPTO_CONTRACT.md
+    // ========================================================================
+
+    /// Sign in to a Pimble Cloud account.
+    pub async fn cloud_sign_in(&self, url: impl Into<String>, email: impl Into<String>, password: impl Into<String>) -> Result<()> {
+        self.client
+            .cloud_sign_in(CloudSignInRequest { url: url.into(), email: email.into(), password: password.into() })
+            .await
+            .map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// Forget the signed-in account.
+    pub async fn cloud_sign_out(&self) -> Result<()> {
+        self.client.cloud_sign_out().await.map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// Whether an account is signed in, and as whom.
+    pub async fn cloud_status(&self) -> Result<CloudStatusResponse> {
+        self.client.cloud_status().await.map_err(rpc_error)
+    }
+
+    /// Host a local store's encrypted twin on Pimble Cloud.
+    pub async fn cloud_host_store(&self, store_id: StoreId) -> Result<StoreId> {
+        let response = self.client.cloud_host_store(CloudHostStoreRequest { store_id }).await.map_err(rpc_error)?;
+        Ok(response.store_id)
+    }
+
+    /// Every store the signed-in account has a grant on.
+    pub async fn cloud_list_hosted_stores(&self) -> Result<Vec<CloudHostedStoreInfo>> {
+        let response = self.client.cloud_list_hosted_stores().await.map_err(rpc_error)?;
+        Ok(response.stores)
+    }
+
+    /// Add an already-hosted store as a local replica.
+    pub async fn cloud_add_hosted_store(&self, store_id: StoreId) -> Result<Store> {
+        let response = self.client.cloud_add_hosted_store(CloudAddHostedStoreRequest { store_id }).await.map_err(rpc_error)?;
+        Ok(response.store)
     }
 }
 

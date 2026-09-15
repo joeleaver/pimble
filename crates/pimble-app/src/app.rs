@@ -85,6 +85,16 @@ pub fn toggle_dark_mode(store: AppStore) {
 }
 
 thread_local! {
+    /// What the sidebar's account button does, when there is one.
+    ///
+    /// The browser build has account pages of its own (`/app/account`) and has
+    /// to be able to reach them without a page load, because a reload throws
+    /// away the keys that make an encrypted store readable. It registers the
+    /// move here; the desktop registers nothing, and the button is not drawn.
+    /// A hook rather than a `cfg` so the shared UI stays free of target
+    /// spelling, and rather than a `BackendCommand` because nothing about it
+    /// involves the backend.
+    static ACCOUNT_ACTION: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
     /// The search box's `NodeHandle`, captured once when the toolbar is built
     /// so the View menu's "Focus Search" (Ctrl+K) action — constructed earlier,
     /// before the box exists — can reach it later. Same reach-across-closures
@@ -92,6 +102,29 @@ thread_local! {
     static SEARCH_INPUT: RefCell<Option<NodeHandle>> = const { RefCell::new(None) };
     /// The debounced `Search` command pending from the last keystroke, if any.
     static SEARCH_DEBOUNCE: RefCell<Option<TimeoutHandle>> = const { RefCell::new(None) };
+}
+
+/// Give the sidebar an account button and say what it does. Called before
+/// [`build_view`]; calling it again replaces the action.
+pub fn set_account_action(action: impl Fn() + 'static) {
+    ACCOUNT_ACTION.with(|slot| *slot.borrow_mut() = Some(Rc::new(action)));
+}
+
+/// Whether a build registered one. Read once, at render time: the browser
+/// registers before the view is built and the desktop never does, so this never
+/// changes while a view is on screen.
+fn has_account_action() -> bool {
+    ACCOUNT_ACTION.with(|slot| slot.borrow().is_some())
+}
+
+fn run_account_action() {
+    // Cloned out of the slot before it runs: the action navigates, which
+    // unmounts this view, and a borrow held across that would be live while
+    // the thing that owns it goes away.
+    let action = ACCOUNT_ACTION.with(|slot| slot.borrow().clone());
+    if let Some(action) = action {
+        action();
+    }
 }
 
 /// Select and open a node or store root identified by a tree value
@@ -1860,6 +1893,18 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 span {
                                     class: "pimble-sidebar__heading",
                                     "EXPLORER"
+                                }
+
+                                // Only the browser build registers this: it is
+                                // the way back to the account pages, which the
+                                // desktop reaches through its menu bar instead.
+                                if has_account_action() {
+                                    ActionIcon {
+                                        icon: TablerIcon::User,
+                                        variant: "subtle",
+                                        size: "xs",
+                                        onclick: move || run_account_action(),
+                                    }
                                 }
 
                                 ActionIcon {

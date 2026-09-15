@@ -6,11 +6,17 @@
 //! here: getting a credential from the accounts service, keeping it fresh, and
 //! noticing when the socket dies.
 //!
+//! One thing sits in front of `process_command`: the vault client
+//! (`crate::vault`). A command for an encrypted store is answered from the
+//! documents this page holds and never reaches the plain RPCs — which the
+//! server refuses for such a store anyway. Everything else is unchanged.
+//!
 //! The command channel is crossbeam's, as on the desktop, because
 //! [`pimble_app::BackendHandle`] is the one thing both backends hand the UI.
 //! Nothing blocks on it: the loop drains with `try_recv` and yields to the
 //! browser between passes.
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -18,9 +24,11 @@ use pimble_app::commands::process_command;
 use pimble_app::protocol::{BackendCommand, BackendEvent, BackendHandle};
 use pimble_client::PimbleClient;
 use pimble_core::AuthMethod;
-use wasm_bindgen_futures::{spawn_local, JsFuture};
+use wasm_bindgen_futures::spawn_local;
 
 use crate::api::{self, Session, TokenError};
+use crate::util::sleep_ms;
+use crate::vault::{Handled, VaultClient};
 
 /// How long the loop sleeps when there is nothing to do. One frame: a command
 /// posted by a keystroke is on the wire within about that long, and an idle tab
@@ -44,6 +52,23 @@ const RECONNECT_MAX_MS: i32 = 30_000;
 /// answered an RPC and stayed up this long, which is what stops a broken
 /// endpoint being retried hundreds of times a minute.
 const SETTLE_MS: f64 = 2_000.0;
+
+thread_local! {
+    /// Set by [`request_refresh`], read once per turn of the loop.
+    static REFRESH_WANTED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Ask the backend to mint a fresh token and connect again.
+///
+/// A token carries the grants the account had when it was minted, and
+/// `listStores` shows exactly what the token allows. So a store created on the
+/// account page is invisible to the app until both are redone — which is what
+/// coming back from the account pages asks for here. The reconnect path already
+/// re-lists the stores and re-opens every encrypted one, so this needs nothing
+/// of its own beyond dropping the current connection.
+pub fn request_refresh() {
+    REFRESH_WANTED.set(true);
+}
 
 /// Start the browser backend and hand back the channels the UI talks through.
 ///
@@ -74,6 +99,8 @@ async fn run(
     let client_id = uuid::Uuid::new_v4().to_string();
     tracing::info!("Backend client ID: {}", client_id);
 
+    let mut vault = VaultClient::new();
+
     let mut client: Option<Arc<PimbleClient>> = None;
     let mut backoff_ms = RECONNECT_MIN_MS;
     // When the current connection proved itself, so the backoff is only reset
@@ -88,7 +115,16 @@ async fn run(
         //    connection needs it yet: a reconnect must not have to wait for a
         //    round trip to the accounts service, and a grant removed upstream
         //    should stop applying at the next token rather than the next hour.
-        if expiring_soon(&session) {
+        let refresh_wanted = REFRESH_WANTED.replace(false);
+        if refresh_wanted {
+            // Drop the connection: reconnecting is what re-lists the stores
+            // and re-opens the encrypted ones, and it must do so with a token
+            // that carries any grant added since.
+            client = None;
+            connected_at = None;
+        }
+
+        if refresh_wanted || expiring_soon(&session) {
             match api::fetch_token().await {
                 Ok(fresh) => {
                     tracing::debug!("Refreshed the access token");
@@ -161,6 +197,28 @@ async fn run(
 
             match proven {
                 Ok((candidate, listed)) => {
+                    // Every encrypted store is opened — keys fetched, tree
+                    // fetched and decrypted — *before* the UI sees the list,
+                    // so the tree's first `getChildren` has a store document
+                    // to read rather than a store that does not answer yet.
+                    if let (Some(c), BackendEvent::StoresListed { stores }) =
+                        (candidate.as_ref(), &listed)
+                    {
+                        // Which stores the account calls encrypted, asked again
+                        // on every connect: one created since the last one has
+                        // to be recognised before its first `getChildren`.
+                        vault.learn_kinds().await;
+                        for problem in vault.open_listed(c, stores).await {
+                            emit(
+                                &event_tx,
+                                &signal_ui,
+                                BackendEvent::Error {
+                                    message: format!("Could not open an encrypted store ({problem})"),
+                                },
+                            );
+                        }
+                    }
+
                     client = candidate;
                     connected_at = Some(now_ms());
                     reported_failure = false;
@@ -199,10 +257,19 @@ async fn run(
             }
         }
 
-        // 4. Run whatever the UI has posted. Drain the queue rather than
+        // 4. Apply whatever the vault subscriptions delivered since the last
+        //    pass. The subscription task only forwards raw notifications;
+        //    decrypting and merging them needs the vault client itself, which
+        //    lives here.
+        let mut ran_anything = false;
+        for event in vault.pump() {
+            ran_anything = true;
+            emit(&event_tx, &signal_ui, event);
+        }
+
+        // 5. Run whatever the UI has posted. Drain the queue rather than
         //    taking one per pass, so a burst of edits does not spread over as
         //    many frames as it has commands.
-        let mut ran_anything = false;
         while let Ok(cmd) = cmd_rx.try_recv() {
             ran_anything = true;
             // The desktop watchdog posts this; nothing does here, because the
@@ -210,7 +277,7 @@ async fn run(
             if matches!(cmd, BackendCommand::ConnectionLost { .. }) {
                 continue;
             }
-            dispatch(&mut client, cmd, &event_tx, &signal_ui, &client_id).await;
+            dispatch(&mut client, &mut vault, cmd, &event_tx, &signal_ui, &client_id).await;
             if client.as_ref().is_some_and(|c| !c.is_connected()) {
                 // Reconnect at the top of the next pass rather than running
                 // the rest of the queue into a dead socket.
@@ -218,21 +285,35 @@ async fn run(
             }
         }
 
-        // 5. Give the browser the thread back.
+        // 6. Give the browser the thread back.
         if !ran_anything {
             sleep_ms(IDLE_POLL_MS).await;
         }
     }
 }
 
-/// One command, through the shared implementation, with its answer posted.
+/// One command: the vault client first, then the shared implementation.
 async fn dispatch(
     client: &mut Option<Arc<PimbleClient>>,
+    vault: &mut VaultClient,
     cmd: BackendCommand,
     event_tx: &Sender<BackendEvent>,
     signal_ui: &Arc<dyn Fn() + Send + Sync>,
     client_id: &str,
 ) {
+    let cmd = match client.as_ref() {
+        Some(connected) => match vault.handle(connected, cmd, signal_ui).await {
+            Handled::Yes(event) => {
+                if let Some(event) = event {
+                    emit(event_tx, signal_ui, event);
+                }
+                return;
+            }
+            Handled::No(cmd) => cmd,
+        },
+        None => cmd,
+    };
+
     if let Some(event) = process_command(client, cmd, event_tx, signal_ui, client_id).await {
         emit(event_tx, signal_ui, event);
     }
@@ -253,14 +334,4 @@ fn expiring_soon(session: &Session) -> bool {
 /// The page's clock, in milliseconds.
 fn now_ms() -> f64 {
     js_sys::Date::now()
-}
-
-/// `setTimeout` as a future, so the loop can yield to the browser.
-async fn sleep_ms(ms: i32) {
-    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-        if let Some(window) = web_sys::window() {
-            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
-        }
-    });
-    let _ = JsFuture::from(promise).await;
 }

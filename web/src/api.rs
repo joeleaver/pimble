@@ -15,8 +15,10 @@ use web_sys::{Request, RequestCredentials, RequestInit, Response};
 /// what makes the session cookie work with no CORS anywhere.
 const TOKEN_PATH: &str = "/api/v1/token";
 
-/// Where an unauthenticated visitor is sent.
-const LOGIN_PATH: &str = "/login.html";
+/// Where an unauthenticated visitor is sent. The app owns its own login page
+/// now (`crate::pages::login`), reached without a reload so a sign-in's keys
+/// survive into the app.
+const LOGIN_ROUTE: crate::route::Route = crate::route::Route::Login;
 
 /// A minted credential and the server it opens.
 #[derive(Debug, Clone, Deserialize)]
@@ -92,11 +94,9 @@ pub async fn fetch_token() -> Result<Session, TokenError> {
         .map_err(|e| TokenError::Failed(format!("token response did not parse: {}", e)))
 }
 
-/// Leave for the login page. Does not return in practice.
+/// Send the visitor to the login page, in place.
 pub fn go_to_login() {
-    if let Some(window) = web_sys::window() {
-        let _ = window.location().set_href(LOGIN_PATH);
-    }
+    crate::route::replace_with(LOGIN_ROUTE);
 }
 
 /// A `JsValue` error as something worth putting in a log line.

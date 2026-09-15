@@ -35,7 +35,17 @@ rinch-editor-core = { git = "https://github.com/joeleaver/rinch.git", branch = "
 pimble-app = { path = "../crates/pimble-app", default-features = false, features = ["web"] }
 pimble-client = { path = "../crates/pimble-client" }
 pimble-core = { path = "../crates/pimble-core" }
+pimble-rpc = { path = "../crates/pimble-rpc" }
+# The vault client holds the store document and every open node's content
+# document in the browser (docs/CRYPTO_CONTRACT.md, "Web app"); the same two
+# yrs documents the desktop's server holds, built from decrypted blobs.
+pimble-crdt = { path = "../crates/pimble-crdt" }
+# Every byte that leaves this page is encrypted here. Pure Rust, no I/O, so
+# the browser runs exactly what the desktop runs.
+pimble-crypto = { path = "../crates/pimble-crypto" }
 
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "wasmbind"] }
 crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -49,9 +59,11 @@ js-sys = "0.3"
 web-sys = { version = "0.3", features = [
     "Window",
     "Location",
+    "History",
     "Document",
     "Element",
     "HtmlElement",
+    "Performance",
     "Request",
     "RequestInit",
     "RequestCredentials",
