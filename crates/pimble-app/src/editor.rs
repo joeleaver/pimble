@@ -127,7 +127,20 @@ pub(crate) fn start_editing(
 
 /// Stop editing the current node (detach the collab session).
 pub(crate) fn stop_editing(store: AppStore) {
-    editor().stop_collaboration();
+    let handle = editor();
+    // The node cache holds the content bytes from the last fetch; the
+    // session's edits never touched them. Write the session's final state
+    // back so labels and anything else reading the cache see what was
+    // typed. (Opening a document still fetches from the server, which may
+    // hold remote edits this session never saw.)
+    if let Some(active) = untracked(|| store.active_edit.get()) {
+        if let Some(snapshot) = handle.collab_snapshot() {
+            if let Some(sig) = store.get_node_signal(active.store_id, active.node_id) {
+                sig.update(|node| node.content = snapshot);
+            }
+        }
+    }
+    handle.stop_collaboration();
     store.active_edit.set(None);
     cancel_pending_label_refresh();
     crate::toolbar::bump_toolbar();

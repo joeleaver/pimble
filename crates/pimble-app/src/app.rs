@@ -13,7 +13,7 @@ use rinch::menu::{Menu, MenuItem};
 use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
 
 use crate::backend::{BackendCommand, BackendHandle};
-use crate::editor::{start_editing, stop_editing};
+use crate::editor::stop_editing;
 use crate::events::{EVENT_PROCESSOR, process_backend_events};
 use crate::state::{parse_tree_value, display_label_from_node, AppStore, PendingMount, SearchState};
 use crate::styles::{APP_CSS, EDITOR_CSS};
@@ -41,52 +41,52 @@ fn open_node(store: AppStore, tree_state: UseTreeReturn, value: String) {
     store.selected_id.set(Some(value.clone()));
     tree_state.controller.select(&value);
 
+    // What we know about the target from the cache decides the title and
+    // whether the editor pane shows. The cached content bytes are NOT used to
+    // start editing: they are a snapshot from the last fetch, and edits made
+    // through the live session never update them, so a document reopened
+    // from the cache would show its pre-session text. `GetNode` fetches the
+    // server's current content and the `NodeLoaded` handler starts the
+    // session with it (the previous session is stopped here first, so that
+    // handler's "already editing" guard lets it through).
     let parsed = parse_tree_value(&value);
-    let (title_opt, content_bytes_opt, is_document, sel_ids) = if let Some((s_id, node_id_opt)) = parsed {
+    let (title_opt, is_document, target) = if let Some((s_id, node_id_opt)) = parsed {
         if let Some(n_id) = node_id_opt {
-            let result = store.get_node_signal(s_id, n_id).map(|sig| {
+            let cached = store.get_node_signal(s_id, n_id).map(|sig| {
                 sig.with(|node| {
                     let label = if !node.metadata.title.is_empty() {
                         node.metadata.title.clone()
                     } else {
                         "Untitled".to_string()
                     };
-                    let is_doc = node.node_type == pimble_core::node_types::DOCUMENT;
-                    (label, node.content.clone(), is_doc)
+                    (label, node.node_type == pimble_core::node_types::DOCUMENT)
                 })
             });
-            match result {
-                Some((label, content, is_doc)) => (Some(label), Some(content), is_doc, Some((s_id, n_id))),
-                None => {
-                    store.send(BackendCommand::GetNode { store_id: s_id, node_id: n_id });
-                    (None, None, false, None)
-                }
+            match cached {
+                Some((label, is_doc)) => (Some(label), is_doc, Some((s_id, n_id))),
+                None => (None, false, Some((s_id, n_id))),
             }
         } else {
             let title = store.get_store_signal(s_id)
                 .map(|sig| sig.with(|s| s.name.clone()));
-            match title {
-                Some(t) => (Some(t), Some(Vec::new()), false, None),
-                None => (None, None, false, None),
-            }
+            (title, false, None)
         }
     } else {
-        (None, None, false, None)
+        (None, false, None)
     };
 
+    stop_editing(store);
     store.show_editor.set(is_document);
 
     if let Some(title) = title_opt {
         store.node_title.set(title);
     }
 
-    if is_document {
-        let content_bytes = content_bytes_opt.unwrap_or_default();
-        if let Some((s_id, n_id)) = sel_ids {
-            start_editing(store, s_id, n_id, &content_bytes);
-        }
-    } else {
-        stop_editing(store);
+    // Always refresh from the server: for a document this is what starts
+    // the editing session (see above); for an unknown node it also tells us
+    // whether it is a document at all.
+    if let Some((s_id, n_id)) = target {
+        store.send(BackendCommand::GetNode { store_id: s_id, node_id: n_id });
     }
     store.editor_dirty.set(false);
 }
