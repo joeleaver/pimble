@@ -1,0 +1,13 @@
+[package]
+name = "pimble-cloud"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Pimble Cloud accounts service: users, sessions, hosted stores, grants, tokens"
+
+[[bin]]
+name = "pimble-cloud"
+path = "src/main.rs"
+
+[dependencies]

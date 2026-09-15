@@ -12,6 +12,7 @@ members = [
     "crates/pimble-app",
     "crates/pimble-cli",
     "crates/pimble-import",
+    "crates/pimble-cloud",
 ]
 
 [workspace.package]

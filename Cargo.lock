@@ -4587,6 +4587,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pimble-cloud"
+version = "0.1.0"
+
+[[package]]
 name = "pimble-core"
 version = "0.1.0"
 dependencies = [
