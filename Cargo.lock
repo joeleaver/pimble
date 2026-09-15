@@ -4837,6 +4837,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pimble-crypto"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "uuid",
+]
+
+[[package]]
 name = "pimble-import"
 version = "0.1.0"
 dependencies = [

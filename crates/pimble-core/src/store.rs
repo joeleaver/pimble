@@ -77,6 +77,13 @@ pub struct Store {
     /// server on every `Store` it returns.
     #[serde(default)]
     pub is_replica: bool,
+
+    /// `Plain` stores hold readable documents the server merges and indexes;
+    /// `Vault` stores hold only encrypted blobs (docs/CRYPTO_CONTRACT.md) and
+    /// answer nothing but the vault RPCs. Missing in older serializations:
+    /// plain.
+    #[serde(default)]
+    pub kind: StoreKind,
 }
 
 impl Store {
@@ -89,6 +96,7 @@ impl Store {
             root_node_id: NodeId::new(),
             sync_state: SyncState::Offline,
             is_replica: false,
+            kind: StoreKind::Plain,
         }
     }
 
@@ -101,6 +109,7 @@ impl Store {
             root_node_id: NodeId::new(),
             sync_state: SyncState::Offline,
             is_replica: false,
+            kind: StoreKind::Plain,
         }
     }
 
@@ -156,6 +165,15 @@ pub enum StoreLocation {
 pub struct RemoteEndpoint {
     pub url: Url,
     pub auth: AuthMethod,
+}
+
+/// What a store holds on the server (docs/CRYPTO_CONTRACT.md "Data model").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StoreKind {
+    #[default]
+    Plain,
+    Vault,
 }
 
 /// Authentication method for remote stores

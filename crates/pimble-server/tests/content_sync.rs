@@ -30,7 +30,7 @@ async fn new_handler_with_store() -> (RpcHandler, pimble_core::StoreId, pimble_c
     let store_path = dir.path().join("test.pimble");
 
     let create_resp = handler
-        .create_store(&pimble_server::service_extensions(), CreateStoreRequest {
+        .create_store(&pimble_server::service_extensions(), CreateStoreRequest { kind: Default::default(), store_id: None, 
             path: store_path,
             name: "Test Store".into(),
         })

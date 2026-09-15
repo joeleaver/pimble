@@ -666,6 +666,10 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                             refetch_root_if_empty(store, *store_id);
                         }
                     }
+                    StoreChangeKind::VaultAppended { .. } => {
+                        // Encrypted-store blobs are handled by the vault client
+                        // (docs/CRYPTO_CONTRACT.md); the tree does not change here.
+                    }
                     StoreChangeKind::MountStateChanged { node_id, state } => {
                         tracing::info!("Mount state of {:?}/{:?}: {:?}", store_id, node_id, state);
                         // Derived state, recomputed by this server whenever

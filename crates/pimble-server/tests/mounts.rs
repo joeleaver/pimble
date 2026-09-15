@@ -27,7 +27,7 @@ fn new_handler() -> (RpcHandler, Arc<RwLock<StoreManager>>) {
 /// Create a local store at `path` and return its id and root node id.
 async fn create_store(handler: &RpcHandler, path: &std::path::Path, name: &str) -> (StoreId, NodeId) {
     let resp = handler
-        .create_store(&pimble_server::service_extensions(), CreateStoreRequest {
+        .create_store(&pimble_server::service_extensions(), CreateStoreRequest { kind: Default::default(), store_id: None, 
             path: path.to_path_buf(),
             name: name.into(),
         })
@@ -380,14 +380,14 @@ async fn create_mount_notifies_a_store_changes_subscriber() {
     let a: CreateStoreResponse = module
         .call(
             "pimble_createStore",
-            (CreateStoreRequest { path: dir_a.path().join("a.pimble"), name: "A".into() },),
+            (CreateStoreRequest { kind: Default::default(), store_id: None, path: dir_a.path().join("a.pimble"), name: "A".into() },),
         )
         .await
         .unwrap();
     let b: CreateStoreResponse = module
         .call(
             "pimble_createStore",
-            (CreateStoreRequest { path: dir_b.path().join("b.pimble"), name: "B".into() },),
+            (CreateStoreRequest { kind: Default::default(), store_id: None, path: dir_b.path().join("b.pimble"), name: "B".into() },),
         )
         .await
         .unwrap();

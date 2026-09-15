@@ -139,6 +139,9 @@ impl StoreManager {
                 root_node_id: manifest.root_node_id,
                 sync_state: SyncState::Offline,
                 is_replica: false,
+                // Agent B: read this from the manifest once vault stores exist
+                // (docs/CRYPTO_CONTRACT.md).
+                kind: pimble_core::StoreKind::Plain,
             })
         } else {
             Err(StoreError::StoreNotFound(store_id))

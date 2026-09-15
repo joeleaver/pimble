@@ -1307,6 +1307,24 @@ impl RpcHandler {
 
 #[async_trait]
 impl PimbleApiServer for RpcHandler {
+    // ── Vault API stubs (docs/CRYPTO_CONTRACT.md): agent B replaces these. ──
+
+    async fn vault_append(&self, _ext: &Extensions, _request: pimble_rpc::types::VaultAppendRequest) -> Result<pimble_rpc::types::VaultAppendResponse, ErrorObjectOwned> {
+        Err(ErrorObjectOwned::owned(-32601, "vaultAppend is not implemented yet", None::<()>))
+    }
+
+    async fn vault_fetch(&self, _ext: &Extensions, _request: pimble_rpc::types::VaultFetchRequest) -> Result<pimble_rpc::types::VaultFetchResponse, ErrorObjectOwned> {
+        Err(ErrorObjectOwned::owned(-32601, "vaultFetch is not implemented yet", None::<()>))
+    }
+
+    async fn vault_snapshot(&self, _ext: &Extensions, _request: pimble_rpc::types::VaultSnapshotRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        Err(ErrorObjectOwned::owned(-32601, "vaultSnapshot is not implemented yet", None::<()>))
+    }
+
+    async fn vault_list_docs(&self, _ext: &Extensions, _request: pimble_rpc::types::VaultListDocsRequest) -> Result<pimble_rpc::types::VaultListDocsResponse, ErrorObjectOwned> {
+        Err(ErrorObjectOwned::owned(-32601, "vaultListDocs is not implemented yet", None::<()>))
+    }
+
     async fn create_store(
         &self,
         ext: &Extensions,

@@ -130,6 +130,24 @@ pub trait PimbleApi {
     #[method(name = "removeReplica", with_extensions)]
     async fn remove_replica(&self, request: RemoveReplicaRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
 
+    // ── Vault (encrypted store) API, docs/CRYPTO_CONTRACT.md ────────────
+
+    /// Append an encrypted update to a vault document (editor).
+    #[method(name = "vaultAppend", with_extensions)]
+    async fn vault_append(&self, request: VaultAppendRequest) -> Result<VaultAppendResponse, ErrorObjectOwned>;
+
+    /// Fetch a vault document's snapshot and updates after a sequence number (reader).
+    #[method(name = "vaultFetch", with_extensions)]
+    async fn vault_fetch(&self, request: VaultFetchRequest) -> Result<VaultFetchResponse, ErrorObjectOwned>;
+
+    /// Store a snapshot covering updates up to a sequence number (editor).
+    #[method(name = "vaultSnapshot", with_extensions)]
+    async fn vault_snapshot(&self, request: VaultSnapshotRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// List a vault store's documents with their heads (reader).
+    #[method(name = "vaultListDocs", with_extensions)]
+    async fn vault_list_docs(&self, request: VaultListDocsRequest) -> Result<VaultListDocsResponse, ErrorObjectOwned>;
+
     // ========================================================================
     // Workspace Operations
     // ========================================================================
@@ -236,6 +254,16 @@ pub fn index_building_error(done: usize, total: usize) -> ErrorObjectOwned {
 /// requested operation (docs/CLOUD_CONTRACT.md "B: pimble-server" item 5):
 /// a user principal reaching a `Service`-only method, or one without the
 /// role a store operation needs. JSON-RPC code `-32004`.
+pub fn encrypted_store_error(message: impl Into<String>) -> ErrorObjectOwned {
+    let err = crate::RpcError::EncryptedStore(message.into());
+    ErrorObjectOwned::owned(err.code(), err.to_string(), None::<()>)
+}
+
+pub fn snapshot_required_error(message: impl Into<String>) -> ErrorObjectOwned {
+    let err = crate::RpcError::SnapshotRequired(message.into());
+    ErrorObjectOwned::owned(err.code(), err.to_string(), None::<()>)
+}
+
 pub fn forbidden_error(message: impl Into<String>) -> ErrorObjectOwned {
     let err = crate::RpcError::Forbidden(message.into());
     ErrorObjectOwned::owned(err.code(), err.to_string(), None::<()>)

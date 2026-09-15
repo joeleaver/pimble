@@ -346,6 +346,10 @@ async fn handle_remote_notification(
         | (StoreChangeKind::TreeStructure { .. }, None) => {
             schedule_store_reconcile(debouncer, reconcile_tx);
         }
+        (StoreChangeKind::VaultAppended { .. }, _) => {
+            // A plain link never links a vault store; VaultLink handles these
+            // (docs/CRYPTO_CONTRACT.md).
+        }
         (StoreChangeKind::SyncStateChanged { .. }, _) | (StoreChangeKind::MountStateChanged { .. }, _) => {
             // The remote's own link state, or the state of its mounts
             // (derived from its links); not ours to react to, and never
@@ -411,7 +415,9 @@ async fn forward_local_change(
         | (StoreChangeKind::TreeStructure { .. }, None) => {
             schedule_store_reconcile(debouncer, reconcile_tx);
         }
-        (StoreChangeKind::SyncStateChanged { .. }, _) | (StoreChangeKind::MountStateChanged { .. }, _) => {}
+        (StoreChangeKind::SyncStateChanged { .. }, _)
+        | (StoreChangeKind::MountStateChanged { .. }, _)
+        | (StoreChangeKind::VaultAppended { .. }, _) => {}
     }
     Ok(())
 }

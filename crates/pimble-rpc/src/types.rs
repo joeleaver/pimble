@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use pimble_core::{MountRef, MountState, Node, NodeId, NodeMetadata, RemoteEndpoint, Store, StoreId, SyncState, Workspace};
+use pimble_core::{MountRef, MountState, Node, NodeId, NodeMetadata, RemoteEndpoint, Store, StoreId, StoreKind, SyncState, Workspace};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -14,6 +14,100 @@ use serde::{Deserialize, Serialize};
 pub struct CreateStoreRequest {
     pub path: PathBuf,
     pub name: String,
+    /// `plain` (default) or `vault` (docs/CRYPTO_CONTRACT.md).
+    #[serde(default)]
+    pub kind: StoreKind,
+    /// A chosen id, so the accounts service can create the hosted twin of a
+    /// local store under the local store's id. Refused if already open here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_id: Option<StoreId>,
+}
+
+// ── Vault (encrypted store) RPCs, docs/CRYPTO_CONTRACT.md ────────────────
+
+/// A document inside a vault store: one node's content, or the tree.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase", tag = "kind", content = "id")]
+pub enum VaultDocId {
+    Node(NodeId),
+    Tree,
+}
+
+impl VaultDocId {
+    /// The on-disk and associated-data name: the node id, or `tree`.
+    pub fn as_str(&self) -> String {
+        match self {
+            VaultDocId::Node(id) => id.to_string(),
+            VaultDocId::Tree => "tree".to_string(),
+        }
+    }
+}
+
+/// One stored blob with its sequence number. `blob` is base64url (no padding) of the
+/// `pimble_crypto::Blob` bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultEntry {
+    pub seq: u64,
+    pub blob: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultAppendRequest {
+    pub store_id: StoreId,
+    pub doc_id: VaultDocId,
+    pub blob: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultAppendResponse {
+    pub seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultFetchRequest {
+    pub store_id: StoreId,
+    pub doc_id: VaultDocId,
+    /// Everything after this sequence number (0 = from the beginning).
+    #[serde(default)]
+    pub after_seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultFetchResponse {
+    /// The snapshot, when its seq is greater than `after_seq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<VaultEntry>,
+    /// Every update after `max(after_seq, snapshot.seq)`, ascending.
+    pub updates: Vec<VaultEntry>,
+    /// The document's latest sequence number (0 when empty).
+    pub head: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultSnapshotRequest {
+    pub store_id: StoreId,
+    pub doc_id: VaultDocId,
+    /// The snapshot covers every update up to and including this seq.
+    pub upto_seq: u64,
+    pub blob: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultListDocsRequest {
+    pub store_id: StoreId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultDocInfo {
+    pub doc_id: VaultDocId,
+    pub head: u64,
+    /// 0 when the document has no snapshot.
+    pub snapshot_seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultListDocsResponse {
+    pub docs: Vec<VaultDocInfo>,
 }
 
 /// Response after creating a store
@@ -485,6 +579,10 @@ pub enum StoreChangeKind {
     /// (docs/history/REMOTE_MOUNTS_CONTRACT.md decision 5). Derived state: sync
     /// links never forward it.
     MountStateChanged { node_id: NodeId, state: MountState },
+    /// A blob was appended to a vault store's document (`vaultAppend`,
+    /// docs/CRYPTO_CONTRACT.md); the notification's `update` carries the blob
+    /// (base64url) so a live subscriber never re-fetches.
+    VaultAppended { doc_id: VaultDocId, seq: u64 },
 }
 
 /// Notification that a node's content has changed.

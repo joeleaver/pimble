@@ -257,7 +257,7 @@ impl PimbleClient {
 
     /// Create a new local store
     pub async fn create_store(&self, path: impl AsRef<Path>, name: impl Into<String>) -> Result<(StoreId, NodeId)> {
-        let request = CreateStoreRequest {
+        let request = CreateStoreRequest { kind: Default::default(), store_id: None, 
             path: path.as_ref().to_path_buf(),
             name: name.into(),
         };

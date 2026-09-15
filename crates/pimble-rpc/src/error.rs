@@ -33,6 +33,15 @@ pub enum RpcError {
     /// (docs/CLOUD_CONTRACT.md "B: pimble-server" item 5).
     #[error("Forbidden: {0}")]
     Forbidden(String),
+
+    /// The store is a vault (docs/CRYPTO_CONTRACT.md): only the vault RPCs apply.
+    #[error("Encrypted store: {0}")]
+    EncryptedStore(String),
+
+    /// A vault document's log is at its limit; a snapshot must be uploaded
+    /// before more updates are appended.
+    #[error("Snapshot required: {0}")]
+    SnapshotRequired(String),
 }
 
 impl RpcError {
@@ -46,6 +55,8 @@ impl RpcError {
             RpcError::Serialization(_) => -32700,
             RpcError::IndexBuilding { .. } => -32010,
             RpcError::Forbidden(_) => -32004,
+            RpcError::EncryptedStore(_) => -32005,
+            RpcError::SnapshotRequired(_) => -32006,
         }
     }
 }
