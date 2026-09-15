@@ -61,6 +61,13 @@ fn find_rhypedb_server_binary() -> Option<PathBuf> {
 struct RhypeDbGuard {
     child: Child,
     addr: String,
+    /// stdout+stderr, drained continuously by a background thread so a
+    /// long-running server can't block on a full pipe. Only read back out
+    /// on the startup-failure paths in `spawn_rhypedb` (a live `Stack`'s
+    /// guard just needs to keep the drainer threads' `Arc` alive); kept here
+    /// rather than dropped so a future test that wants a mid-run crash's
+    /// output has it available.
+    _output: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 impl Drop for RhypeDbGuard {
@@ -70,11 +77,31 @@ impl Drop for RhypeDbGuard {
     }
 }
 
-async fn spawn_rhypedb(data_dir: &Path, schema_path: &Path) -> Option<RhypeDbGuard> {
-    let binary = find_rhypedb_server_binary()?;
+/// Continuously copy `reader`'s bytes, line by line, into `into` — run on a
+/// plain OS thread (not tokio) since it blocks on synchronous I/O for the
+/// subprocess's whole lifetime.
+fn drain_into(reader: impl std::io::Read + Send + 'static, into: std::sync::Arc<std::sync::Mutex<String>>) {
+    use std::io::BufRead;
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(reader).lines().map_while(Result::ok) {
+            if let Ok(mut buf) = into.lock() {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+        }
+    });
+}
+
+/// Spawn the real `rhypedb-server` binary at `binary` and wait for its
+/// binary-protocol port to accept connections. `Err` (never `None`) on any
+/// failure — a binary that was found but wouldn't start, crashed during
+/// startup, or never opened its port is a real test failure, not something
+/// to skip past; only "no binary exists anywhere" (checked by the caller
+/// before this is called at all) is a skip.
+async fn spawn_rhypedb(binary: &Path, data_dir: &Path, schema_path: &Path) -> Result<RhypeDbGuard, String> {
     let http_port = free_port();
     let tcp_port = free_port();
-    let child = Command::new(&binary)
+    let mut child = Command::new(binary)
         .arg("--schema")
         .arg(schema_path)
         .arg("--data-dir")
@@ -83,10 +110,14 @@ async fn spawn_rhypedb(data_dir: &Path, schema_path: &Path) -> Option<RhypeDbGua
         .arg(format!("127.0.0.1:{http_port}"))
         .arg("--tcp-listen")
         .arg(format!("127.0.0.1:{tcp_port}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
-        .ok()?;
+        .map_err(|e| format!("failed to spawn {}: {e}", binary.display()))?;
+
+    let output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    drain_into(child.stdout.take().unwrap(), output.clone());
+    drain_into(child.stderr.take().unwrap(), output.clone());
 
     let addr = format!("127.0.0.1:{tcp_port}");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
@@ -94,12 +125,21 @@ async fn spawn_rhypedb(data_dir: &Path, schema_path: &Path) -> Option<RhypeDbGua
         if tokio::net::TcpStream::connect(&addr).await.is_ok() {
             break;
         }
+        if let Ok(Some(status)) = child.try_wait() {
+            let log = output.lock().unwrap().clone();
+            return Err(format!("{} exited early with {status}; output:\n{log}", binary.display()));
+        }
         if tokio::time::Instant::now() >= deadline {
-            return None;
+            let _ = child.kill();
+            let log = output.lock().unwrap().clone();
+            return Err(format!(
+                "{} never opened its TCP port ({addr}) within 15s; output so far:\n{log}",
+                binary.display()
+            ));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    Some(RhypeDbGuard { child, addr })
+    Ok(RhypeDbGuard { child, addr, _output: output })
 }
 
 /// Everything a test needs: the two real backing servers plus the cloud
@@ -132,15 +172,19 @@ pub async fn spawn_stack() -> Option<Stack> {
 }
 
 pub async fn spawn_stack_with_releases_base_url(releases_base_url: Option<String>) -> Option<Stack> {
+    // The ONLY skip condition: no rhypedb-server binary exists anywhere we
+    // know to look. A binary that exists but fails to start is a real test
+    // failure (`spawn_rhypedb`'s `expect` below panics with its stderr/stdout).
+    let binary = find_rhypedb_server_binary()?;
+
     let rhypedb_schema_dir = tempfile::tempdir().unwrap();
     let schema_path = rhypedb_schema_dir.path().join("schema.rhype");
     std::fs::write(&schema_path, SCHEMA).unwrap();
     let rhypedb_data_dir = tempfile::tempdir().unwrap();
 
-    let rhypedb = match spawn_rhypedb(rhypedb_data_dir.path(), &schema_path).await {
-        Some(r) => r,
-        None => return None,
-    };
+    let rhypedb = spawn_rhypedb(&binary, rhypedb_data_dir.path(), &schema_path)
+        .await
+        .expect("rhypedb-server binary was found but did not become ready");
 
     let service_token = "pimble-cloud-test-service-token".to_string();
     let pimble_creds_dir = tempfile::tempdir().unwrap();

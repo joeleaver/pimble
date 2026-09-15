@@ -180,6 +180,34 @@ impl RhypeDb {
         Ok(self.objects(query).await?.into_iter().next())
     }
 
+    /// Link `source_rid` (of `source_type`) to `target_rid` (of
+    /// `target_type`) on whichever relation field connects the two types.
+    ///
+    /// A `.create({...})` object literal only accepts scalar `Literal`
+    /// values (`rhypedb-query::parser::Parser::parse_object` builds a
+    /// `HashMap<String, Literal>`, full stop) — `docs/src/queries.md`'s
+    /// `Post.create({ title: "Hello", author: User.get(1) })` example does
+    /// not parse against this build. Every relation this service sets is
+    /// therefore a separate `.link()` call after the object exists, in the
+    /// query language's actual supported form: `Type.get(id).link(Other.get(id))`
+    /// with NO preceding `.fieldName` traversal step. (`docs/src/queries.md`'s
+    /// `.favorite_movies.link(...)` form, with the field name spelled out,
+    /// also doesn't do what it looks like: `Step::Link` resolves the field
+    /// to link purely from `(current_type, target_type)` via
+    /// `resolve_relation_field`, using the ORIGINAL query source's type when
+    /// the preceding traversal's result is empty — which it always is right
+    /// after create — and using the traversed-to type otherwise, which
+    /// isn't the source type `resolve_relation_field` needs at all. The bare
+    /// form matches `rhypedb-query`'s own `execute_link_via_query` test
+    /// exactly: `User.get(id).link(User.get(other_id))`, no field name.)
+    /// Every relation in this schema is the only one between its two types,
+    /// so the auto-resolution is always unambiguous.
+    async fn link(&self, source_type: &str, source_rid: u64, target_type: &str, target_rid: u64) -> CloudResult<()> {
+        let q = format!("{source_type}.get({source_rid}).link({target_type}.get({target_rid}))");
+        self.objects(&q).await?;
+        Ok(())
+    }
+
     // ── Users ──────────────────────────────────────────────────────────
 
     /// `None` on a duplicate `email_lower` (the caller turns that into 409);
@@ -225,7 +253,7 @@ impl RhypeDb {
 
     pub async fn create_session(&self, user_rid: u64, token_hash: &str, expires_at_ms: i64) -> CloudResult<SessionRow> {
         let q = format!(
-            "Session.create({{ token_hash: {hash}, user: User.get({uid}), user_rid: {uid}, expires_at: {exp}, created_at: {now} }})",
+            "Session.create({{ token_hash: {hash}, user_rid: {uid}, expires_at: {exp}, created_at: {now} }})",
             hash = ql_str(token_hash),
             uid = user_rid,
             exp = datetime_literal(expires_at_ms),
@@ -237,7 +265,9 @@ impl RhypeDb {
             .into_iter()
             .next()
             .ok_or_else(|| CloudError::Internal("Session.create returned nothing".into()))?;
-        session_from_object(&obj)
+        let session = session_from_object(&obj)?;
+        self.link("Session", session.rid, "User", user_rid).await?;
+        Ok(session)
     }
 
     pub async fn find_session_by_token_hash(&self, token_hash: &str) -> CloudResult<Option<SessionRow>> {
@@ -291,7 +321,7 @@ impl RhypeDb {
 
     pub async fn create_grant(&self, user_rid: u64, store_rid: u64, store_uuid: &str, role: &str) -> CloudResult<GrantRow> {
         let q = format!(
-            "Grant.create({{ user: User.get({uid}), store: HostedStore.get({sid}), role: {role}, user_rid: {uid}, store_rid: {sid}, store_uuid: {suuid} }})",
+            "Grant.create({{ role: {role}, user_rid: {uid}, store_rid: {sid}, store_uuid: {suuid} }})",
             uid = user_rid,
             sid = store_rid,
             role = ql_str(role),
@@ -303,7 +333,10 @@ impl RhypeDb {
             .into_iter()
             .next()
             .ok_or_else(|| CloudError::Internal("Grant.create returned nothing".into()))?;
-        grant_from_object(&obj)
+        let grant = grant_from_object(&obj)?;
+        self.link("Grant", grant.rid, "User", user_rid).await?;
+        self.link("Grant", grant.rid, "HostedStore", store_rid).await?;
+        Ok(grant)
     }
 
     pub async fn find_grant(&self, user_rid: u64, store_rid: u64) -> CloudResult<Option<GrantRow>> {
