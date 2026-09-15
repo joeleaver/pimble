@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Pimble</title>
-  <meta name="description" content="Pimble is an offline-first personal information manager: nodes in a tree, content that merges across devices and people, and search that works without a network.">
+  <meta name="description" content="Pimble keeps your notes, plans, and references in a folder on your own disk — offline by default, and built to merge edits from everyone you share with.">
   <link rel="icon" href="data:,">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -23,103 +23,182 @@
 
   <main>
     <section class="shell hero">
-      <h1>One tree of notes, however many devices you open it from.</h1>
+      <h1>One place for everything you write down, and it's actually yours.</h1>
       <p class="lead">
-        Pimble keeps everything you write as nodes in a tree, inside a folder
-        on your own disk. Open it offline on the desktop, open the same tree
-        in a browser, hand a copy to someone else — every edit merges back
-        together, because the document underneath is built to be edited from
-        more than one place at once.
+        Pimble is a personal information manager: notes, plans, references,
+        whatever else you'd otherwise scatter across a dozen apps, organized
+        into one tree you shape yourself. It lives in a folder on your own
+        disk, so it's there whether or not you have a network, and whether or
+        not Pimble's servers are running. Share a piece of it, and edits from
+        two people — or two of your own devices — merge back together on
+        their own.
       </p>
       <div class="hero__actions">
         <a class="btn" href="download.html">Download for desktop</a>
-        <a class="btn secondary" href="signup.html">Sign up</a>
+        <a class="btn secondary" href="signup.html">Create a free account</a>
       </div>
     </section>
 
     <section class="shell">
+      <h2>Organized your way</h2>
+      <p class="prose">
+        A store is a folder on disk, and everything in it is a node in a
+        tree: a page of formatted text, a project, a room in the house, a
+        person you keep notes about — whatever shape your life actually
+        takes. There's no separate database quietly keeping itself in sync
+        with your files. The folder is the store. And because it's a folder
+        you own, it's still there even if Pimble the company someday isn't.
+      </p>
+
       <figure class="tree-figure">
         <ul>
-          <li>Household
+          <li>Home
             <ul>
-              <li>Renovation
+              <li>House
                 <ul>
                   <li>Contractor quotes</li>
-                  <li>Reference library <span class="mount-tag">mounted</span></li>
+                  <li>Reading list <span class="mount-tag">mounted</span></li>
                 </ul>
               </li>
               <li>Taxes</li>
             </ul>
           </li>
-          <li>Novel draft
+          <li>Work
             <ul>
-              <li>Chapter outline</li>
-              <li>Reference library <span class="mount-tag">mounted</span></li>
+              <li>Q3 planning</li>
+              <li>Reading list <span class="mount-tag">mounted</span></li>
             </ul>
           </li>
         </ul>
         <figcaption>
-          An illustration of a Pimble tree, not a screenshot. "Reference
-          library" is one store, mounted inside two others — it's edited in
-          place from either one, not copied between them.
+          An illustration of a Pimble tree, not a screenshot. "Reading list"
+          is one store, mounted inside both Home and Work — a single thing,
+          edited from either, never copied.
         </figcaption>
       </figure>
     </section>
 
     <section class="shell">
+      <h2>Three ways to run it</h2>
+      <p class="prose">Pick the one that fits, and change your mind later.</p>
+
+      <div class="plans">
+        <div class="plan">
+          <div class="plan__head">
+            <h3>On your own</h3>
+          </div>
+          <p>
+            Download the app, point it at a folder, and start writing.
+            There's no account to create and nothing leaves your machine.
+            This isn't a limited trial of the real product — it is the real
+            product.
+          </p>
+        </div>
+
+        <div class="plan">
+          <div class="plan__head">
+            <h3>Shared through a relay</h3>
+            <span class="tag">coming soon</span>
+          </div>
+          <p>
+            Share a store with someone else, and Pimble's servers pass the
+            changes between you as they happen, without ever storing what's
+            in them. For when you want to collaborate but keep your data off
+            anyone else's disk.
+          </p>
+        </div>
+
+        <div class="plan">
+          <div class="plan__head">
+            <h3>Hosted on Pimble Cloud</h3>
+            <span class="tag">coming soon</span>
+          </div>
+          <p>
+            For a team that wants the store itself hosted, not just relayed:
+            it lives on Pimble Cloud, encrypted so that even Pimble can't
+            read it. Everything that goes through the cloud is designed to
+            be unreadable to us, end to end.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section class="shell">
+      <h2>Search that understands what you meant</h2>
+      <p class="prose">
+        Every store keeps its own index, right there next to your files:
+        ordinary keyword search across every title and every word you've
+        written, narrowing results as you type. Alongside it, semantic
+        search finds a passage by what it's about, even when you don't
+        remember the words you used for it — and because the model behind
+        it runs locally on your machine, that search never touches a network
+        either.
+      </p>
+    </section>
+
+    <section class="shell">
+      <h2>No more "someone else has this open"</h2>
+      <p class="prose">
+        Two people can open the same page at the same time — on two laptops
+        anywhere in the world, or two windows on your own machine — and both
+        keep working. Nothing locks, nothing gets thrown away, and neither
+        person waits for the other to close their editor. It's the same
+        trick that lets Pimble work offline in the first place: every
+        document is built to reconcile changes from more than one place,
+        whether that place has been disconnected for five minutes or five
+        months.
+      </p>
+    </section>
+
+    <section class="shell">
+      <p class="dim" style="margin-bottom: 4px;">Under the hood, for the curious:</p>
       <ul class="outline">
         <li class="outline__item">
           <h2>Nodes in a tree</h2>
           <p>
-            A store is a folder of nodes, each one a page of formatted text,
-            arranged however you like: a manuscript's chapters, a project's
-            sources, a household's paperwork. There's no separate database to
-            keep in sync with the files — the folder is the store.
+            A store is a folder of nodes, arranged however you like. There's
+            no separate database to keep in sync with the files — the
+            folder is the store.
           </p>
         </li>
         <li class="outline__item">
-          <h2>Merges, not conflicts</h2>
+          <h2>CRDTs, not locks</h2>
           <p>
-            Both a node's content and the tree's structure are CRDTs. Two
-            people can edit the same node at the same time, on machines that
-            have never spoken to each other, and reconcile later without
-            either edit being thrown away.
+            A node's content and the tree's structure are both CRDTs: data
+            structures built to merge. Two edits from two places reconcile
+            automatically, and neither one is thrown away.
           </p>
         </li>
         <li class="outline__item">
           <h2>Mounts</h2>
           <p>
             Any subtree of any store can appear inside any other store's
-            tree. A shared reference library can sit inside three different
-            projects at once, edited from any of them, without ever being
-            copied.
+            tree, resolved to the same underlying node wherever it shows up
+            — whether that store is on this machine or another server
+            entirely.
           </p>
         </li>
         <li class="outline__item">
-          <h2>Search that understands what you meant</h2>
+          <h2>A local search index</h2>
           <p>
-            Every store keeps its own local index: keyword search over
-            titles and text, and semantic search that finds a passage by
-            what it says rather than the exact words it uses.
-          </p>
-        </li>
-        <li class="outline__item">
-          <h2>Brought in from Scrivener</h2>
-          <p>
-            The importer reads a Scrivener project's binder, its labels and
-            its formatting, and rebuilds it as a Pimble tree — colours and
-            tags included.
+            Each store keeps its own index on disk: keyword search over
+            titles and text, plus a small embedding model for semantic
+            search, both running without a network call.
           </p>
         </li>
       </ul>
     </section>
 
-    <section class="shell hero" style="padding-top: 32px;">
-      <h2>Start with a store</h2>
-      <p class="lead">Download the desktop app, or sign up to open one in a browser.</p>
+    <section class="shell hero">
+      <h2>Start now. No account needed.</h2>
+      <p class="lead">
+        Download the desktop app and open a store today — nothing to sign
+        up for. Create a free account only when you're ready to share, or
+        want the store in a browser.
+      </p>
       <div class="hero__actions">
         <a class="btn" href="download.html">Download for desktop</a>
-        <a class="btn secondary" href="signup.html">Sign up</a>
+        <a class="btn secondary" href="signup.html">Create a free account</a>
       </div>
     </section>
   </main>

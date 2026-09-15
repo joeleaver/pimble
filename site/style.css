@@ -70,6 +70,7 @@ h3 { font-size: 1.1rem; font-family: var(--font-sans); font-weight: 600; }
 
 p { margin: 0 0 1em; color: var(--text); }
 p.lead { font-size: 1.15rem; color: var(--text-dim); max-width: 46ch; }
+p.prose { max-width: 58ch; }
 
 a { color: var(--accent-strong); text-decoration-color: var(--border-strong); text-underline-offset: 3px; }
 a:hover { text-decoration-color: currentColor; }
@@ -122,6 +123,8 @@ small, .dim { color: var(--text-dim); }
 .nav__links a.nav__cta { color: var(--accent-strong); font-weight: 600; }
 
 main { padding-bottom: 96px; }
+
+main > .shell + .shell { margin-top: 48px; }
 
 .hero {
   padding: 24px 0 56px;
@@ -234,6 +237,45 @@ footer.site {
   border-top: 1px dashed var(--border);
   font-size: 0.85rem;
   color: var(--text-dim);
+}
+
+/* ---------- plans (three ways to use it) ---------- */
+
+.plans {
+  margin: 20px 0 0;
+}
+
+.plan {
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  padding: 20px 22px;
+  margin-bottom: 14px;
+}
+
+.plan:last-child { margin-bottom: 0; }
+
+.plan__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.plan__head h3 { margin: 0; }
+
+.plan p {
+  margin: 10px 0 0;
+  max-width: 56ch;
+}
+
+.tag {
+  display: inline-block;
+  padding: 1px 6px;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  white-space: nowrap;
 }
 
 /* ---------- buttons ---------- */
