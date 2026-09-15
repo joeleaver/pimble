@@ -18,7 +18,7 @@ use crate::error::{Result, StoreError};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncConfig {
     pub remote: RemoteEndpoint,
-    /// When the link last reached `Synced` (docs/REMOTE_MOUNTS_CONTRACT.md
+    /// When the link last reached `Synced` (docs/history/REMOTE_MOUNTS_CONTRACT.md
     /// decision 4), so a mount sourced from this store can report
     /// `Cached { last_sync }` after a restart with the remote down. Written
     /// by the sync link on category transitions; `None` until it first syncs.

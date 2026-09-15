@@ -369,6 +369,12 @@ pub struct MountRef {
     /// open. Optional on the wire so an older-shaped `MountRef` still
     /// deserializes.
     pub source_path: Option<PathBuf>,
+    /// The Pimble server the source store can be replicated from when it
+    /// isn't on this machine. A URL only, never a credential: a mount ref
+    /// replicates with its store and lands on machines that must not hold
+    /// the token. `createMount` fills it when the source store is itself a
+    /// linked replica on the creating server; `None` otherwise.
+    pub source_remote: Option<Url>,
 }
 ```
 
@@ -387,17 +393,25 @@ UI requests node expansion
         ├─ node_type == "mount" ?
         │       │
         │       ▼
-        │   StoreManager.ensure_store_open(mount_ref)
+        │   RpcHandler.resolve_mount(mounting store, mount node, mount_ref)
         │       │
-        │       ├─ source store already open? → use it
-        │       ├─ registry has a Local/Remote endpoint? → open it (Remote: unavailable)
-        │       ├─ mount_ref.source_path hint set? → open it, registering on success
-        │       └─ none of the above → MountSourceUnavailable
+        │       ├─ StoreManager.ensure_store_open(mount_ref)
+        │       │       ├─ source store already open? → use it
+        │       │       ├─ registry has a Local endpoint? → open it (Remote: unavailable)
+        │       │       └─ mount_ref.source_path hint set? → open it, registering on success
+        │       │
+        │       ├─ mount_ref.source_remote set? ──┐  replicate the source from the
+        │       ├─ the mounting store's remote? ──┤  first of these that has it, in a
+        │       │   (its own sync.json)           │  background task; answer Connecting
+        │       │                                 │  now
+        │       └─ nothing to try → Unavailable { reason }
         │
         └─ regular node → return children from local store
 ```
 
 This is a single hop, not a recursive resolve: `getChildren` on a mount returns exactly the source node's children, addressed by the source store's id (`GetChildrenResponse.store_id`). A nested mount among those children is itself an ordinary node in the (now open) source store, resolved the same way when the caller expands it in turn — so cycles are caught once, at `createMount` time (`validate_mount_creation`), not on every expansion.
+
+**A source that isn't on this machine becomes a replica, and then resolves locally.** The two remote steps are the handler's, not `StoreManager`'s: each candidate is asked for the store (`create_replica_from`, the same function `addRemoteStore` uses, so the "already open locally" guard and the `StoreDocument::new` prohibition both apply), and the first that has it wins. Creation runs in a detached task and the triggering RPC answers `Connecting` at once; a per-source in-flight set, checked under the same lock that records the mount, means two resolutions of one source start one task. The replica lands in the server's replicas directory (`ServerConfig::replicas_dir`, default `<data dir>/pimble/replicas/<store id>.pimble`), so it is `is_replica` and removable with `removeReplica` like any other. Nothing retries on a timer: the next resolution of the mount tries again.
 
 **An implicitly opened source is an ordinary open store.** When resolving or validating a mount opens a store that wasn't already open, it gets the same treatment `openStore` gives one: a search index under its own `index/rhypedb/`, a place in `listStores`, and subscriptions work on it. `StoreManager::opened_since()` drains the list of stores opened since the last call, so the RPC handler can open a search index for each one after any call that might have opened stores implicitly (`getChildren`, `getMountState`, `createMount`).
 
@@ -408,7 +422,9 @@ The resolver maintains a **store registry** — a mapping from `StoreId` to conn
 pub enum StoreEndpoint {
     /// Local filesystem path
     Local { path: PathBuf },
-    /// Remote server (defined; not yet used — remote mounts are out of scope)
+    /// Remote server (defined; a mount never resolves through this — a
+    /// source that isn't local becomes a replica and then resolves as a
+    /// `Local` one)
     Remote { url: Url, auth: AuthMethod },
 }
 
@@ -421,29 +437,51 @@ pub struct StoreRegistry {
 
 An already-open store needs no registry lookup at all — `local_stores` is checked first. The registry is populated by every `create_local_store`/`open_local_store` call (including ones a mount triggers), so it has an entry for any store this process has opened this session. `MountRef.source_path` exists for the case the registry doesn't cover: a fresh process, before anything has reopened the source directly.
 
-### Mount State & Degradation
-
-Mounts can be in various states, especially when the source is remote:
+### Mount State & Degradation (`docs/history/REMOTE_MOUNTS_CONTRACT.md`)
 
 ```rust
 pub enum MountState {
-    /// Source is connected and live
+    /// The source is open here and its data is current.
     Live,
-    /// Source is unavailable; showing cached data
+    /// The source's replica is here and readable, but its link is down or
+    /// still reconciling.
     Cached { last_sync: DateTime<Utc> },
-    /// Source is unavailable and no cache exists
-    Unavailable,
-    /// Currently connecting/syncing
+    /// Nothing can reach the source. `reason` says why, in words a user
+    /// can act on ("http://host:7463 refused the credentials").
+    Unavailable { reason: Option<String> },
+    /// The source's replica is being created, or reconciling for the first
+    /// time.
     Connecting,
 }
 ```
 
-**Offline behavior**: When a remote mount's source is unreachable, Pimble shows cached data if available (the locally-replicated `.yrs` files). The UI indicates staleness but remains functional. When the source comes back online, yrs sync brings the local replica up to date.
+- **Mount state is derived from the source's link**, never stored. For a source open on
+  this server: no link, or a link that is `Synced`, is `Live`; a link that is `Offline` or
+  `Syncing` is `Cached { last_sync }` once it has ever synced, and `Connecting` until then.
+  For a source that isn't open: a replica creation in flight is `Connecting`; nothing to
+  try, or a failed last attempt, is `Unavailable { reason }`.
+- **`last_sync` is persisted.** `<store>/sync.json` gains `last_sync`, which the link seeds
+  itself from at start and rewrites only on a transition into `Synced` (with now) or out of
+  it (with the last value), always keeping `auth: none`. That is what makes a mount
+  `Cached` rather than `Connecting` after a restart with the remote down.
+- **The server tells clients when a mount's state changes; nobody polls.** It remembers
+  which mounts it resolved per source store (added to by `getMountState`, `getChildren` on
+  a mount, and `createMount`; a mounting store's entries go when it closes). When that
+  source's link changes category, or a background replica creation ends either way, every
+  mounting store gets a `StoreChangeKind::MountStateChanged { node_id, state }` with
+  `source_client_id: None`. Sync links ignore `MountStateChanged` in both directions, like
+  `SyncStateChanged`: it is derived state and every server computes its own.
+- **`getChildren` on a mount whose source isn't open is an error** carrying the state
+  ("mount source is connecting", "mount source unavailable: <reason>"). The client shows
+  it and refetches when a `MountStateChanged` says the source is back. A `Cached` mount's
+  source *is* open, so its children and documents keep answering from the replica.
+- **Out of scope**: replicating only the mounted subtree (the whole source store is
+  replicated), TLS, and any retry loop for a failed creation.
 
 ### Data Ownership & Sync
 
 - **Data lives in the source store.** The mount point's store does not copy or own the mounted data.
-- **Local caching via CRDT replication.** For remote mounts, Pimble maintains a local replica of the mounted subtree's yrs documents. Since each node has its own `.yrs` file, only the mounted subtree's nodes need to be replicated — not the entire source store.
+- **Local caching via CRDT replication.** A remote mount's source becomes an ordinary replica of the whole source store on the mounting server (first cut: replicating only the mounted subtree is out of scope), kept current by the same `SyncLink` any replica has.
 - **Writes go to the source.** Editing a mounted node writes to the source store (directly for local mounts, via RPC for remote mounts). The CRDT layer handles conflict resolution if multiple clients edit concurrently.
 - **Tree structure is owned by the source.** You cannot reparent or reorder children within a mounted subtree from the mounting store's context. You can edit node content, but structural changes (add/move/delete children) must be authorized by the source store.
 
@@ -583,7 +621,7 @@ pub struct AppState {
 3. `MountResolver` — resolve mount refs to live store handles
 4. `StoreManager` extension to transparently traverse mounts
 5. UI: mount point rendering, connectivity indicators, mount creation UX
-6. Local-to-local mounts first, then remote mounts
+6. Local-to-local mounts first, then remote mounts (both done; see "Mount Architecture")
 
 ### Replica sync ✅ COMPLETE (`docs/history/SYNC_CONTRACT.md`)
 
@@ -600,8 +638,11 @@ a yrs merge.
 - **Local changes are broadcast in-process** (`SubscriptionRegistry`'s
   `tokio::sync::broadcast::Sender<LocalChange>`, published wherever a WebSocket sink would be
   notified). A link subscribes to this to learn what to forward, and to the remote's own
-  `subscribeStoreChanges` to learn what to pull. Every `sync-link:`-sourced change is skipped
-  when forwarding outward, which is what prevents echo storms in a chain of linked servers.
+  `subscribeStoreChanges` to learn what to pull. When forwarding outward a link skips only
+  the changes it applied itself (they came from the remote it would send them back to); a
+  change another link applied here is forwarded on, so an edit travels a whole chain of
+  servers (`M -> L -> R`). Echo storms cannot start because a change that bounces back to a
+  server that already has it merges as a no-op, and a no-op merge sends no notification.
   `ContentUpdated` notifications carry the edit's delta bytes, so a store-level subscriber
   gets content changes without subscribing per node.
 - **Reconcile** is `(diff, remote_sv) = remote.syncStoreDocument(local_sv)`; apply `diff`
@@ -634,7 +675,9 @@ a yrs merge.
   isn't `Synced` unless `force` (its unsynced local changes are lost). It stops the link,
   closes the store the same way `closeStore` does, then deletes the directory. Saved
   credentials for that remote are untouched — other replicas may still need them.
-- Out of scope: partial (subtree-only) replication, remote mounts, TLS.
+- Out of scope: partial (subtree-only) replication and TLS. Remote mounts are built on
+  this (see "Mount State & Degradation"): a mount whose source isn't on this machine
+  replicates that source with the same machinery and then resolves it locally.
 
 ### Auth (`docs/history/HARDENING_CONTRACT.md` decisions 1-5)
 

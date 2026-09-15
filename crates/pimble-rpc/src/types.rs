@@ -482,7 +482,7 @@ pub enum StoreChangeKind {
     SyncStateChanged { state: SyncState },
     /// A mount node in this store changed state because its source store's
     /// link did, or its source's replica finished (or failed) being created
-    /// (docs/REMOTE_MOUNTS_CONTRACT.md decision 5). Derived state: sync
+    /// (docs/history/REMOTE_MOUNTS_CONTRACT.md decision 5). Derived state: sync
     /// links never forward it.
     MountStateChanged { node_id: NodeId, state: MountState },
 }

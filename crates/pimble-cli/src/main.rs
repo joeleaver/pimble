@@ -4,8 +4,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use pimble_client::PimbleClient;
-use pimble_core::{AuthMethod, NodeId, RemoteEndpoint, StoreId};
+use pimble_core::{AuthMethod, MountRef, MountState, NodeId, RemoteEndpoint, StoreId};
+use base64::Engine;
 use pimble_crdt::ContentDoc;
+use pimble_rpc::EditOperation;
 use pimble_server::auth;
 use tracing_subscriber::EnvFilter;
 
@@ -135,6 +137,15 @@ async fn main() -> Result<()> {
             }
             mount_state(&args[2], &args[3]).await?;
         }
+        "mount-remote-store" => {
+            let (rest, token) = extract_flag_value(&args[2..], "--token");
+            if rest.len() < 4 {
+                eprintln!("Usage: pimble-cli mount-remote-store <store-id> <parent-id> <url> <remote-store-id> [title] [--token T]");
+                return Ok(());
+            }
+            let title = if rest.len() > 4 { Some(rest[4..].join(" ")) } else { None };
+            mount_remote_store(&rest[0], &rest[1], &rest[2], &rest[3], title, token).await?;
+        }
         "list-children" => {
             if args.len() < 4 {
                 eprintln!("Usage: pimble-cli list-children <store-id> <node-id>");
@@ -222,6 +233,7 @@ COMMANDS:
     rebuild-index       Rebuild a store's search index from scratch
     create-mount        Mount a subtree from one store under a node in another
     mount-state         Show a mount point's resolution state
+    mount-remote-store  Add a remote's store as a replica and mount it here
     list-children       List a node's children (resolves mounts)
     add-remote-store    Create a local replica of a remote's store and link it
     link-store          Link an existing local store to its twin on a remote
@@ -255,6 +267,7 @@ EXAMPLES:
     pimble-cli rebuild-index <store-id>
     pimble-cli create-mount <store-id> <parent-id> <source-store-id> <source-node-id> "My Mount"
     pimble-cli mount-state <store-id> <node-id>
+    pimble-cli mount-remote-store <store-id> <parent-id> http://127.0.0.1:7463 <remote-store-id> "Family" --token secret
     pimble-cli list-children <store-id> <node-id>
     pimble-cli add-remote-store http://127.0.0.1:7463 <remote-store-id> --token secret
     pimble-cli link-store <store-id> http://127.0.0.1:7463 --token secret
@@ -566,13 +579,22 @@ async fn set_node_text(store_id: &str, node_id: &str, text: &str) -> Result<()> 
     let store_id = parse_store_id(store_id)?;
     let node_id = parse_node_id(node_id)?;
 
-    let content = ContentDoc::from_plain_text(text)
-        .map_err(|e| anyhow::anyhow!("failed to build content document: {e}"))?
-        .save();
-
     let client = connect().await?;
+
+    // An edit of the node's existing content document, sent as an `applyEdit`
+    // delta — the one way content is written. A fresh document built from
+    // `text` (`updateNodeContent`) shares no history with the node's, so on
+    // any replica it would merge in next to the old paragraphs instead of
+    // replacing them.
+    let node = client.get_node(store_id, node_id).await?;
+    let mut doc = ContentDoc::load(&node.content)
+        .map_err(|e| anyhow::anyhow!("failed to load the node's content document: {e}"))?;
+    let delta = doc
+        .replace_plain_text(text)
+        .map_err(|e| anyhow::anyhow!("failed to build the replacement edit: {e}"))?;
+    let changes = base64::engine::general_purpose::STANDARD.encode(delta);
     client
-        .set_node_content_bytes(store_id, node_id, content, None)
+        .apply_edit(store_id, node_id, "pimble-cli", EditOperation::IncrementalChanges { changes })
         .await?;
     println!("Updated content for node {}", node_id);
     Ok(())
@@ -641,11 +663,77 @@ async fn create_mount(
         .create_mount(store_id, parent_id, source_store_id, source_node_id, title)
         .await?;
     println!("Created mount: {}", node_id);
+    print_mount_ref(&mount_ref);
+    Ok(())
+}
+
+/// Add `remote_store_id` from `url` as a replica of this server (unless it
+/// is already open here) and mount its root under `parent_id`
+/// (docs/history/REMOTE_MOUNTS_CONTRACT.md decision 9's two steps, headless).
+async fn mount_remote_store(
+    store_id: &str,
+    parent_id: &str,
+    url: &str,
+    remote_store_id: &str,
+    title: Option<String>,
+    token: Option<String>,
+) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let parent_id = parse_node_id(parent_id)?;
+    let remote_store_id = parse_store_id(remote_store_id)?;
+    let remote = RemoteEndpoint {
+        url: url.parse().with_context(|| format!("Invalid URL: {}", url))?,
+        auth: auth_method_of(token),
+    };
+
+    let client = connect().await?;
+
+    let existing = client.list_stores().await?.into_iter().find(|s| s.id == remote_store_id);
+    let source = match existing {
+        Some(store) => {
+            println!("Store {} is already open here; mounting it directly", store.id);
+            store
+        }
+        None => {
+            let store = client.add_remote_store(remote, remote_store_id, None).await?;
+            println!("Added remote store: {} ({})", store.id, store.name);
+            println!("Sync state: {:?}", store.sync_state);
+            store
+        }
+    };
+
+    let title = title.unwrap_or_else(|| source.name.clone());
+    let (node_id, mount_ref) = client
+        .create_mount(store_id, parent_id, source.id, source.root_node_id, Some(title))
+        .await?;
+    println!("Created mount: {}", node_id);
+    print_mount_ref(&mount_ref);
+    Ok(())
+}
+
+/// Where a mount's source is, as far as its `MountRef` knows: the canonical
+/// pair always, plus the on-disk path and the remote Pimble server it can
+/// be replicated from when those are set.
+fn print_mount_ref(mount_ref: &MountRef) {
     println!("Source: {}:{}", mount_ref.source_store, mount_ref.source_node);
     if let Some(path) = &mount_ref.source_path {
         println!("Source path: {}", path.display());
     }
-    Ok(())
+    if let Some(url) = &mount_ref.source_remote {
+        println!("Source remote: {}", url);
+    }
+}
+
+/// A [`MountState`] in one line, with what each state carries: when a
+/// cached mount last synced, and why an unavailable one is unavailable.
+fn describe_mount_state(state: &MountState) -> String {
+    match state {
+        MountState::Live => "Live".to_string(),
+        MountState::Connecting => "Connecting".to_string(),
+        MountState::Cached { last_sync } => format!("Cached (last synced {})", last_sync.to_rfc3339()),
+        MountState::Unavailable { reason: Some(reason) } => format!("Unavailable: {}", reason),
+        MountState::Unavailable { reason: None } => "Unavailable".to_string(),
+    }
 }
 
 async fn mount_state(store_id: &str, node_id: &str) -> Result<()> {
@@ -654,11 +742,8 @@ async fn mount_state(store_id: &str, node_id: &str) -> Result<()> {
 
     let client = connect().await?;
     let (state, mount_ref) = client.get_mount_state(store_id, node_id).await?;
-    println!("Mount state: {:?}", state);
-    println!("Source: {}:{}", mount_ref.source_store, mount_ref.source_node);
-    if let Some(path) = &mount_ref.source_path {
-        println!("Source path: {}", path.display());
-    }
+    println!("Mount state: {}", describe_mount_state(&state));
+    print_mount_ref(&mount_ref);
     Ok(())
 }
 

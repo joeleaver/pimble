@@ -20,13 +20,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use pimble_client::PimbleClient;
-use pimble_core::{NodeId, RemoteEndpoint, StoreId, SyncState};
+use pimble_core::{AuthMethod, NodeId, RemoteEndpoint, StoreId, SyncState};
 use pimble_rpc::{
     ApplyEditRequest, ApplyStoreUpdateRequest, EditOperation, PimbleApiServer, StoreChangeKind,
     StoreChangedNotification, MAX_SYNC_NODE_CONTENTS,
 };
+use pimble_store::SyncConfig;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -49,6 +50,11 @@ const RECONCILE_DEBOUNCE: Duration = Duration::from_millis(200);
 /// alone does not stop the background task.
 pub struct SyncLinkHandle {
     state_rx: watch::Receiver<SyncState>,
+    /// When this link last reached `Synced`, shared with the running task
+    /// (docs/history/REMOTE_MOUNTS_CONTRACT.md decision 4). Seeded from `sync.json`
+    /// at [`SyncLink::start`], so a link that has never yet connected since
+    /// the store reopened still knows when it last did.
+    last_sync: Arc<Mutex<Option<DateTime<Utc>>>>,
     join: JoinHandle<()>,
 }
 
@@ -56,6 +62,14 @@ impl SyncLinkHandle {
     /// The link's current state.
     pub fn state(&self) -> SyncState {
         self.state_rx.borrow().clone()
+    }
+
+    /// When this link last reached `Synced`, whether in this process or a
+    /// previous one (decision 4). `None` means it has never synced. This is
+    /// what turns a mount whose source's link is down into
+    /// `MountState::Cached { last_sync }` rather than `Connecting`.
+    pub fn last_sync(&self) -> Option<DateTime<Utc>> {
+        *self.last_sync.lock().unwrap()
     }
 
     /// A receiver for state changes; cheap to clone, shares the same channel
@@ -78,23 +92,35 @@ impl SyncLink {
     /// Start a sync link for `store_id` to `remote`, returning a handle.
     /// `handler` is an `Arc`-backed clone of the server's `RpcHandler`
     /// (cheap); the link drives its own background task from it until
-    /// [`SyncLinkHandle::stop`].
-    pub fn start(handler: RpcHandler, store_id: StoreId, remote: RemoteEndpoint) -> SyncLinkHandle {
+    /// [`SyncLinkHandle::stop`]. `last_sync` is the value this store's
+    /// `sync.json` carries (decision 4), so the handle can answer
+    /// [`SyncLinkHandle::last_sync`] before the link has connected even
+    /// once.
+    pub fn start(
+        handler: RpcHandler,
+        store_id: StoreId,
+        remote: RemoteEndpoint,
+        last_sync: Option<DateTime<Utc>>,
+    ) -> SyncLinkHandle {
         let link_id = format!("sync-link:{}", Uuid::new_v4());
         let (state_tx, state_rx) = watch::channel(SyncState::Syncing);
+        let last_sync = Arc::new(Mutex::new(last_sync));
 
-        let join = tokio::spawn(run_loop(handler, store_id, remote, link_id, state_tx));
+        let link = LinkState { store_id, state_tx, last_sync: Arc::clone(&last_sync) };
+        let join = tokio::spawn(run_loop(handler, remote, link_id, link));
 
-        SyncLinkHandle { state_rx, join }
+        SyncLinkHandle { state_rx, last_sync, join }
     }
 }
 
-/// Whether `source_client_id` names any sync link (not necessarily this
-/// one). Used to filter the local-to-remote forwarding direction: skipping
-/// every `sync-link:`-sourced change here is what prevents echo storms when
-/// two servers link to each other, or a chain of three exists (decision 2).
-fn is_any_sync_link(source_client_id: &Option<String>) -> bool {
-    source_client_id.as_deref().map(|s| s.starts_with("sync-link:")).unwrap_or(false)
+/// Everything publishing a state change needs: which store the link serves,
+/// the watch channel its [`SyncLinkHandle`] reads, and the shared
+/// `last_sync` that handle answers from and that `sync.json` mirrors
+/// (decision 4).
+struct LinkState {
+    store_id: StoreId,
+    state_tx: watch::Sender<SyncState>,
+    last_sync: Arc<Mutex<Option<DateTime<Utc>>>>,
 }
 
 /// Coarse state category, ignoring `Synced`'s embedded timestamp, so
@@ -115,19 +141,67 @@ fn state_kind(state: &SyncState) -> u8 {
 /// (decision 6). Called after every applied change too (to keep `last_sync`
 /// current for `listStores`/`getStoreSync`), but that alone never logs or
 /// notifies.
-async fn set_state(handler: &RpcHandler, store_id: StoreId, state_tx: &watch::Sender<SyncState>, state: SyncState) {
-    let transitioned = state_kind(&state_tx.borrow()) != state_kind(&state);
-    let _ = state_tx.send(state.clone());
-    if transitioned {
-        info!("Sync link for store {} -> {:?}", store_id, state);
-        handler.notify_sync_state_changed(store_id, state).await;
+///
+/// `last_sync` is kept current in memory on every `Synced` (decision 4 of
+/// docs/history/REMOTE_MOUNTS_CONTRACT.md) and mirrored to `sync.json` only on a
+/// transition into `Synced` (with the new time) or out of it (with the last
+/// time), so an ordinary editing session doesn't rewrite that file once per
+/// keystroke.
+async fn set_state(handler: &RpcHandler, link: &LinkState, state: SyncState) {
+    let previous = link.state_tx.borrow().clone();
+    let transitioned = state_kind(&previous) != state_kind(&state);
+    let crossed_synced =
+        matches!(previous, SyncState::Synced { .. }) || matches!(state, SyncState::Synced { .. });
+
+    if let SyncState::Synced { last_sync } = &state {
+        *link.last_sync.lock().unwrap() = Some(*last_sync);
+    }
+    let _ = link.state_tx.send(state.clone());
+
+    if !transitioned {
+        return;
+    }
+
+    if crossed_synced {
+        let remembered = *link.last_sync.lock().unwrap();
+        persist_last_sync(handler, link.store_id, remembered).await;
+    }
+
+    info!("Sync link for store {} -> {:?}", link.store_id, state);
+    handler.notify_sync_state_changed(link.store_id, state).await;
+}
+
+/// Mirror the link's `last_sync` into `<store>/sync.json`, keeping its
+/// `remote` and forcing `auth: none` (decision 4: a credential never lands
+/// on disk here). Best effort: a store closed or unlinked under us — in
+/// which case there is no `sync.json` and recreating one would resurrect a
+/// link the user just removed — and a failed write are both logged, never
+/// propagated; this is bookkeeping, not part of the sync protocol.
+async fn persist_last_sync(handler: &RpcHandler, store_id: StoreId, last_sync: Option<DateTime<Utc>>) {
+    let manager = handler.store_manager_handle();
+    let manager = manager.read().await;
+    let existing = match manager.read_sync_config(store_id).await {
+        Ok(Some(config)) => config,
+        Ok(None) => return,
+        Err(e) => {
+            debug!("Could not read sync.json for store {} to record last_sync: {}", store_id, e);
+            return;
+        }
+    };
+    let updated = SyncConfig {
+        remote: RemoteEndpoint { url: existing.remote.url, auth: AuthMethod::None },
+        last_sync,
+    };
+    if let Err(e) = manager.write_sync_config(store_id, &updated).await {
+        warn!("Could not record last_sync for store {}: {}", store_id, e);
     }
 }
 
-async fn run_loop(handler: RpcHandler, store_id: StoreId, remote: RemoteEndpoint, link_id: String, state_tx: watch::Sender<SyncState>) {
+async fn run_loop(handler: RpcHandler, remote: RemoteEndpoint, link_id: String, link: LinkState) {
+    let store_id = link.store_id;
     let mut backoff = INITIAL_BACKOFF;
     loop {
-        match connect_and_sync(&handler, store_id, &remote, &link_id, &state_tx).await {
+        match connect_and_sync(&handler, &remote, &link_id, &link).await {
             Ok(()) => {
                 // `connect_and_sync` only returns once its select loop hits
                 // an error; a clean `Ok` should not happen, but treat it the
@@ -136,7 +210,7 @@ async fn run_loop(handler: RpcHandler, store_id: StoreId, remote: RemoteEndpoint
             }
             Err(e) => {
                 warn!("Sync link for store {} to {} dropped: {}", store_id, remote.url, e);
-                set_state(&handler, store_id, &state_tx, SyncState::Offline).await;
+                set_state(&handler, &link, SyncState::Offline).await;
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
@@ -151,12 +225,12 @@ async fn run_loop(handler: RpcHandler, store_id: StoreId, remote: RemoteEndpoint
 /// backoff (decision 6).
 async fn connect_and_sync(
     handler: &RpcHandler,
-    store_id: StoreId,
     remote: &RemoteEndpoint,
     link_id: &str,
-    state_tx: &watch::Sender<SyncState>,
+    link: &LinkState,
 ) -> anyhow::Result<()> {
-    set_state(handler, store_id, state_tx, SyncState::Syncing).await;
+    let store_id = link.store_id;
+    set_state(handler, link, SyncState::Syncing).await;
 
     // `remote.auth` is `AuthMethod::None` whenever this link was restarted
     // from `sync.json` (which never stores a real credential — docs/
@@ -179,7 +253,7 @@ async fn connect_and_sync(
     let debouncer = Arc::new(ReconcileDebouncer::new());
     let (reconcile_tx, mut reconcile_rx) = mpsc::unbounded_channel::<ReconcileTrigger>();
 
-    set_state(handler, store_id, state_tx, SyncState::Synced { last_sync: Utc::now() }).await;
+    set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
     info!("Sync link for store {} connected to {}", store_id, remote.url);
 
     loop {
@@ -188,7 +262,7 @@ async fn connect_and_sync(
                 match item {
                     Some(Ok(notif)) => {
                         handle_remote_notification(handler, &client, store_id, link_id, notif, &debouncer, &reconcile_tx).await?;
-                        set_state(handler, store_id, state_tx, SyncState::Synced { last_sync: Utc::now() }).await;
+                        set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
                     }
                     Some(Err(e)) => return Err(anyhow::anyhow!("remote notification decode error: {}", e)),
                     None => return Err(anyhow::anyhow!("remote subscription closed")),
@@ -198,7 +272,7 @@ async fn connect_and_sync(
                 match change {
                     Ok(local_change) => {
                         forward_local_change(handler, &client, store_id, link_id, local_change, &debouncer, &reconcile_tx).await?;
-                        set_state(handler, store_id, state_tx, SyncState::Synced { last_sync: Utc::now() }).await;
+                        set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         // Missed notifications may never be followed by
@@ -219,11 +293,11 @@ async fn connect_and_sync(
                 match trigger {
                     Some(ReconcileTrigger::Store) => {
                         reconcile_store(handler, &client, store_id, link_id).await?;
-                        set_state(handler, store_id, state_tx, SyncState::Synced { last_sync: Utc::now() }).await;
+                        set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
                     }
                     Some(ReconcileTrigger::Node(node_id)) => {
                         reconcile_node(handler, &client, store_id, node_id, link_id).await?;
-                        set_state(handler, store_id, state_tx, SyncState::Synced { last_sync: Utc::now() }).await;
+                        set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
                     }
                     None => return Err(anyhow::anyhow!("internal reconcile channel closed")),
                 }
@@ -275,7 +349,7 @@ async fn handle_remote_notification(
         (StoreChangeKind::SyncStateChanged { .. }, _) | (StoreChangeKind::MountStateChanged { .. }, _) => {
             // The remote's own link state, or the state of its mounts
             // (derived from its links); not ours to react to, and never
-            // forwarded (docs/REMOTE_MOUNTS_CONTRACT.md decision 6).
+            // forwarded (docs/history/REMOTE_MOUNTS_CONTRACT.md decision 6).
         }
     }
     Ok(())
@@ -284,7 +358,7 @@ async fn handle_remote_notification(
 // ── Local -> remote ─────────────────────────────────────────────────
 
 /// Forward one local notification to the remote (decision 2, second
-/// bullet). Node-content notifications carry nothing a store subscriber
+/// bullet, as amended for chains: see the source check below). Node-content notifications carry nothing a store subscriber
 /// doesn't already get (decision 4 puts content deltas on the store
 /// notification too), so only `LocalChange::Store` is acted on here.
 async fn forward_local_change(
@@ -302,9 +376,15 @@ async fn forward_local_change(
     if notif.store_id != store_id {
         return Ok(());
     }
-    // Skip every sync-link source, not just our own: this is what prevents
-    // echo storms in a chain of linked servers (decision 2).
-    if is_any_sync_link(&notif.source_client_id) {
+    // Skip only what this link itself applied: that change came from the
+    // very remote it would be sent back to. A change another link applied
+    // here is forwarded on, so an edit travels the whole length of a chain
+    // (M -> L -> R, the shape a remote mount resolved through the mounting
+    // store's own remote produces; docs/history/REMOTE_MOUNTS_CONTRACT.md). No echo
+    // storm follows: a change bouncing back to a server that already has it
+    // merges as a no-op there, and a no-op merge sends no notification
+    // (docs/history/HARDENING_CONTRACT.md decision 8), so every path ends.
+    if notif.source_client_id.as_deref() == Some(link_id) {
         return Ok(());
     }
 

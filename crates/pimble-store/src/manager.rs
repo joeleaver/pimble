@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use pimble_core::{MountRef, MountState, Node, NodeId, NodeMetadata, Store, StoreId, StoreLocation, SyncState};
+use pimble_core::{MountRef, Node, NodeId, NodeMetadata, Store, StoreId, StoreLocation, SyncState};
 use pimble_crdt::{ContentDoc, StoreDocument, TreeRepair};
 use tracing::info;
 
@@ -474,18 +474,6 @@ impl StoreManager {
                 Err(StoreError::MountSourceUnavailable { store_id })
             }
             None => Err(StoreError::MountSourceUnavailable { store_id }),
-        }
-    }
-
-    /// The current state of a mount point: `Live` if its source store is
-    /// open or could be opened (see [`StoreManager::ensure_store_open`]),
-    /// `Unavailable` otherwise. Actually attempts resolution rather than
-    /// checking the registry alone, so a `Live` result means the source can
-    /// really be reached right now.
-    pub async fn mount_state(&mut self, mount_ref: &MountRef) -> MountState {
-        match self.ensure_store_open(mount_ref).await {
-            Ok(_) => MountState::Live,
-            Err(e) => MountState::Unavailable { reason: Some(e.to_string()) },
         }
     }
 

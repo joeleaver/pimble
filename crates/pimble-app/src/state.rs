@@ -112,6 +112,46 @@ pub fn label_from_title_and_content(has_explicit_title: bool, title: &str, conte
     "Untitled".to_string()
 }
 
+/// The suffix a mount node's tree label carries for its current state
+/// (docs/history/REMOTE_MOUNTS_CONTRACT.md "B: app side"). One function, used
+/// everywhere a mount row is labelled.
+pub fn mount_label_suffix(state: &MountState) -> &'static str {
+    match state {
+        MountState::Live => "",
+        MountState::Connecting => " (connecting...)",
+        MountState::Cached { .. } => " (offline copy)",
+        MountState::Unavailable { .. } => " (unavailable)",
+    }
+}
+
+/// Whether a mount row's icon and label render dimmed: its source is out of
+/// reach (`Unavailable`) or not reachable yet (`Connecting`). A `Cached`
+/// mount still shows its replica's content, so it reads normally and only
+/// carries the "(offline copy)" suffix.
+pub fn mount_is_dimmed(state: &MountState) -> bool {
+    matches!(state, MountState::Unavailable { .. } | MountState::Connecting)
+}
+
+/// Which of the four mount states a `MountState` is, without its payload.
+/// `MountState` is not `PartialEq`, and neither `last_sync` nor `reason`
+/// changes anything the tree does, so this is what the app compares by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountStateKind {
+    Live,
+    Cached,
+    Unavailable,
+    Connecting,
+}
+
+pub fn mount_state_kind(state: &MountState) -> MountStateKind {
+    match state {
+        MountState::Live => MountStateKind::Live,
+        MountState::Cached { .. } => MountStateKind::Cached,
+        MountState::Unavailable { .. } => MountStateKind::Unavailable,
+        MountState::Connecting => MountStateKind::Connecting,
+    }
+}
+
 /// Compute display label from a Node reference (no signal dependency).
 pub fn display_label_from_node(node: &Node) -> String {
     let has_explicit_title = node.metadata.custom
@@ -229,6 +269,12 @@ pub struct AppStore {
     /// generic `BackendEvent::Error`/`StoreOpened` outcome routes into this
     /// modal's own error line / auto-close instead of the global status bar.
     pub connect_modal_pending_add: Signal<bool>,
+    /// Set by "Mount Remote Store Here..." to the canonical target the mount
+    /// is created under (a store root's target is its own root node,
+    /// docs/history/REMOTE_MOUNTS_CONTRACT.md "B: app side"). `None` is the plain
+    /// "Add Remote Store..." mode: the same modal, but the action only adds
+    /// the replica. Cleared whenever the modal closes.
+    pub connect_modal_target: Signal<Option<(StoreId, NodeId)>>,
 
     // "Link to Remote..." modal (store root context menu). `Some(store_id)`
     // is the store the modal is open for; `None` means closed.
@@ -298,6 +344,7 @@ impl AppStore {
             connect_modal_error: Signal::new(String::new()),
             connect_modal_busy: Signal::new(false),
             connect_modal_pending_add: Signal::new(false),
+            connect_modal_target: Signal::new(None),
             link_modal_store: Signal::new(None),
             link_modal_url: Signal::new(String::new()),
             link_modal_token: Signal::new(String::new()),
@@ -523,6 +570,53 @@ impl AppStore {
         }
     }
 
+    /// Update just a mount's state, keeping whatever `mount_ref` is already
+    /// known — for a `MountStateChanged` notification, which carries only the
+    /// node and the new state (docs/history/REMOTE_MOUNTS_CONTRACT.md decision 5).
+    /// [`set_mount_state`] stays for the `getMountState` answer, which is
+    /// authoritative about the ref as well.
+    ///
+    /// Returns whether this is news, which is what decides if the caller
+    /// refetches. It is `false` in two cases:
+    ///
+    /// - the state's kind is the one the row already shows. The server
+    ///   re-derives a mount's state on every category transition of the
+    ///   source's sync link, and a link whose remote is down flaps `Syncing`
+    ///   ↔ `Offline` on a backoff forever — every one of those maps to the
+    ///   same `Cached`, and refetching the mount's children on each would be
+    ///   an endless poll.
+    /// - the app holds no entry for that node. Stale `resolved_mounts`
+    ///   entries for a deleted mount are tolerated server-side (decision 5),
+    ///   so a notification can name a mount this app has already dropped;
+    ///   caching state for a node that no longer exists would only produce
+    ///   `GetChildren` calls the server answers with "node not found".
+    pub fn update_mount_state(&self, store_id: StoreId, node_id: NodeId, state: MountState) -> bool {
+        let key = (store_id, node_id);
+        let Some(sig) = untracked(|| self.mount_data.with(|map| map.get(&key).copied())) else {
+            return false;
+        };
+        let kind = mount_state_kind(&state);
+        let was = untracked(|| sig.with(|m| m.mount_state.as_ref().map(mount_state_kind)));
+        sig.update(|m| { m.is_mount = true; m.mount_state = Some(state); });
+        was != Some(kind)
+    }
+
+    /// The source store a mount node points at, if its `mount_ref` is known
+    /// (untracked).
+    pub fn mount_source_store(&self, store_id: StoreId, node_id: NodeId) -> Option<StoreId> {
+        untracked(|| {
+            self.mount_data.with(|map| {
+                map.get(&(store_id, node_id))
+                    .and_then(|sig| sig.with(|m| m.mount_ref.as_ref().map(|r| r.source_store)))
+            })
+        })
+    }
+
+    /// Whether a node's row is currently expanded in the tree (untracked).
+    pub fn is_expanded(&self, store_id: StoreId, node_id: NodeId) -> bool {
+        untracked(|| self.expanded.with(|e| e.contains(&(store_id, node_id))))
+    }
+
     /// Ensure a store has a sync-status entry, defaulting to unlinked/offline.
     /// Called as soon as a store is registered (`register_opened_store`) so
     /// the tree row's badge signal always exists by the time the row
@@ -630,6 +724,11 @@ impl AppStore {
     /// and store names for store roots.
     pub fn build_tree_data_structural(&self) -> Vec<TreeNodeData> {
         let store_ids = self.store_ids.get();
+        // Same rinch #714 reason as the link state below: "Paste Mount Here"
+        // snapshots whether a mount source is copied at render time, so
+        // every row's data must change when that flips, or no row re-renders
+        // and the item never enables.
+        let paste = self.mount_source.with(|s| s.is_some());
         let mut result = Vec::new();
         for &sid in &store_ids {
             let store_info = self.store_data.with(|map| {
@@ -647,8 +746,11 @@ impl AppStore {
             let linked = self.sync_data.with(|map| {
                 map.get(&sid).map_or(false, |sig| sig.with(|(remote, _)| remote.is_some()))
             });
-            let store_node = TreeNodeData::new(format!("store_{}", sid), format!("{store_name} (linked: {linked})"));
-            let children = self.build_children_structural(sid, root_id, &[]);
+            let store_node = TreeNodeData::new(
+                format!("store_{}", sid),
+                format!("{store_name} (linked: {linked}, paste: {paste})"),
+            );
+            let children = self.build_children_structural(sid, root_id, paste, &[]);
             if children.is_empty() {
                 result.push(store_node);
             } else {
@@ -669,6 +771,7 @@ impl AppStore {
         &self,
         store_id: StoreId,
         parent_id: NodeId,
+        paste: bool,
         mount_path: &[(StoreId, NodeId)],
     ) -> Vec<TreeNodeData> {
         let children = self.children_of.with(|map| {
@@ -684,19 +787,22 @@ impl AppStore {
                 map.get(&(child_store, child_id)).map_or(false, |sig| sig.with(|m| m.is_mount))
             });
 
-            // Empty label — render_node Effects will populate reactively
+            // The renderer never reads this label (render_node Effects draw
+            // it reactively); it only carries the "Paste Mount Here" state so
+            // the row re-renders when that flips (see
+            // `build_tree_data_structural`).
             let tree_node = TreeNodeData::new(
                 format!("node_{}_{}{}", child_store, child_id, suffix),
-                "",
+                if paste { "paste" } else { "" },
             );
 
             // Crossing a mount node adds it to the path for everything below it.
             let children_data = if is_mount {
                 let mut next_path = mount_path.to_vec();
                 next_path.push((child_store, child_id));
-                self.build_children_structural(child_store, child_id, &next_path)
+                self.build_children_structural(child_store, child_id, paste, &next_path)
             } else {
-                self.build_children_structural(child_store, child_id, mount_path)
+                self.build_children_structural(child_store, child_id, paste, mount_path)
             };
             let has_children = !children_data.is_empty();
             let has_loaded_children = self.children_of.with(|map| {

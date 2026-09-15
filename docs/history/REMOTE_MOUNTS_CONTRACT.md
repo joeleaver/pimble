@@ -1,7 +1,20 @@
 # Remote mounts contract: a mount whose source store lives on another server
 
-Status: in progress (2026-09-15). Written by the PM before dispatch; the interface below
-is landed and committed before any agent starts.
+Status: done 2026-09-15 (commit after ecef630 on master). Implemented as written, with
+these changes decided during the work: replicas dir is `ServerConfig::replicas_dir`
+(tests never touch the real data dir); `getMountState` never answers `Unavailable` for a
+source that has remote candidates, since every resolution retries (the verdict arrives as
+a `MountStateChanged`); candidates are tried with `create_replica_from` directly rather
+than a separate `listStores` probe; `StoreManager::mount_state` was removed as a second
+way to compute mount state; `delete_node` prunes the deleted subtree's mounts from
+`resolved_mounts`; the app dedups same-kind `MountStateChanged` (a down link flaps) and
+ignores one for a node it no longer holds; `MountCreated` carries `parent_id`. Review and
+the GUI pass added: a store opened implicitly now starts its sync link and repairs its tree
+(`adopt_newly_opened`, test 10); a link forwards every change except the ones it applied
+itself, so an edit travels a whole chain of servers (`tests/sync.rs` 6b); `set-node-text`
+became a real edit (`ContentDoc::replace_plain_text`); "Paste Mount Here" enables again
+(every row's `TreeNodeData` carries the flag, and the tree bump is deferred past the menu
+close so rinch #714 does not orphan the menu).
 
 Roadmap step 6, third item. Local mounts (`docs/history/MOUNTS_CONTRACT.md`) resolve a
 `MountRef` to a store this server can open from disk. Replica sync

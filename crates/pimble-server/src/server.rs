@@ -29,6 +29,13 @@ pub struct ServerConfig {
     /// [`crate::credentials::default_credentials_path`]; tests set this to a
     /// temp path so they never touch the real config directory.
     pub credentials_path: Option<PathBuf>,
+    /// The directory this server creates replicas in and recognises them
+    /// by (`addRemoteStore` with `path: None`, every replica a remote
+    /// mount's resolution creates, `Store::is_replica`, `removeReplica`).
+    /// `None` uses [`crate::handler::default_replicas_dir`]
+    /// (`<data dir>/pimble/replicas`); tests set this to a temp directory
+    /// so they never write into the real data directory.
+    pub replicas_dir: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -37,6 +44,7 @@ impl Default for ServerConfig {
             addr: "127.0.0.1:7462".parse().unwrap(),
             auth_token: None,
             credentials_path: None,
+            replicas_dir: None,
         }
     }
 }
@@ -128,7 +136,8 @@ impl PimbleServer {
         let semantic_available = warm_up_embedding_model().await;
 
         let credentials_path = self.config.credentials_path.clone().unwrap_or_else(crate::credentials::default_credentials_path);
-        let handler = RpcHandler::with_credentials_path(Arc::clone(&self.store_manager), semantic_available, credentials_path);
+        let replicas_dir = self.config.replicas_dir.clone().unwrap_or_else(crate::handler::default_replicas_dir);
+        let handler = RpcHandler::with_paths(Arc::clone(&self.store_manager), semantic_available, credentials_path, replicas_dir);
         let methods = handler.into_rpc();
 
         info!("Starting Pimble server on {}", local_addr);

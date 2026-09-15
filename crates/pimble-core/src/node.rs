@@ -311,7 +311,7 @@ pub struct MountRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_path: Option<PathBuf>,
     /// The Pimble server the source store can be replicated from when it is
-    /// not on this machine (docs/REMOTE_MOUNTS_CONTRACT.md decision 2). A
+    /// not on this machine (docs/history/REMOTE_MOUNTS_CONTRACT.md decision 2). A
     /// URL only, never a credential: a mount ref is replicated with its
     /// store. Filled by `createMount` when the source store is a linked
     /// replica on the creating server; `None` otherwise.

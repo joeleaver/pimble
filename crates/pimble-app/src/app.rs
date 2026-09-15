@@ -15,7 +15,7 @@ use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
 use crate::backend::{BackendCommand, BackendHandle};
 use crate::editor::{start_editing, stop_editing};
 use crate::events::{EVENT_PROCESSOR, process_backend_events};
-use crate::state::{parse_tree_value, display_label_from_node, AppStore, PendingMount, SearchState};
+use crate::state::{parse_tree_value, display_label_from_node, mount_is_dimmed, mount_label_suffix, AppStore, PendingMount, SearchState};
 use crate::styles::{APP_CSS, EDITOR_CSS};
 
 /// The app's color scheme. Feeds rinch's `ThemeProviderProps` and the editor's
@@ -106,7 +106,6 @@ fn copy_as_mount_source(store: AppStore, value: &str) {
         Some(n_id) => {
             let title = store.display_label(s_id, n_id);
             store.mount_source.set(Some((s_id, n_id, title)));
-            store.bump_tree_structure();
         }
         None => {
             if let Some(root_id) = store.root_node_id(s_id) {
@@ -114,10 +113,20 @@ fn copy_as_mount_source(store: AppStore, value: &str) {
                     .map(|sig| untracked(|| sig.with(|s| s.name.clone())))
                     .unwrap_or_default();
                 store.mount_source.set(Some((s_id, root_id, name)));
-                store.bump_tree_structure();
             }
         }
     }
+    bump_tree_after_menu_closes(store);
+}
+
+/// Re-render every row's context menu (so "Paste Mount Here" reads its fresh
+/// `disabled` value: every row's `TreeNodeData` carries that flag) on the
+/// next main-thread turn, not inside the menu item's own click. A row that
+/// re-renders while its menu is still open orphans the menu's portal, which
+/// then stays on screen for good (rinch #714); deferring lets the item close
+/// its menu first.
+fn bump_tree_after_menu_closes(store: AppStore) {
+    rinch::run_on_main_thread(move || store.bump_tree_structure());
 }
 
 /// "Paste Mount Here": create a mount at the tree location identified by
@@ -139,7 +148,28 @@ fn paste_mount_here(store: AppStore, target_value: &str) {
     store.mount_source.set(None);
     // Re-render every row's context menu so "Paste Mount Here" reads as
     // disabled again (see the `no_mount_source` note in `run`).
-    store.bump_tree_structure();
+    bump_tree_after_menu_closes(store);
+}
+
+/// Open the "Add Remote Store..." modal, resetting everything a previous run
+/// left behind. `target` picks the mode (docs/history/REMOTE_MOUNTS_CONTRACT.md
+/// decision 9): `None` is the plain File-menu flow that only adds a replica,
+/// `Some(canonical pair)` is "Mount Remote Store Here...", whose action adds
+/// the replica when this server does not already have the store and then
+/// mounts its root under that pair.
+fn open_connect_modal(store: AppStore, target: Option<(pimble_core::StoreId, pimble_core::NodeId)>) {
+    store.connect_modal_target.set(target);
+    store.connect_modal_stores.set(Vec::new());
+    store.connect_modal_selected.set(String::new());
+    store.connect_modal_error.set(String::new());
+    store.connect_modal_busy.set(false);
+    store.connect_modal_pending_add.set(false);
+    store.connect_modal_token.set(String::new());
+    store.connect_modal_token_visible.set(false);
+    if untracked(|| store.connect_modal_url.get()).is_empty() {
+        store.connect_modal_url.set("http://".to_string());
+    }
+    store.connect_modal_open.set(true);
 }
 
 /// Cancel a pending debounce timer and reset the search box to empty/idle.
@@ -311,16 +341,7 @@ pub fn run() {
         }))
         .item(MenuItem::new("Add Remote Store...").on_click(move || {
             tracing::info!("Add remote store menu clicked");
-            store.connect_modal_stores.set(Vec::new());
-            store.connect_modal_selected.set(String::new());
-            store.connect_modal_error.set(String::new());
-            store.connect_modal_busy.set(false);
-            store.connect_modal_token.set(String::new());
-            store.connect_modal_token_visible.set(false);
-            if untracked(|| store.connect_modal_url.get()).is_empty() {
-                store.connect_modal_url.set("http://".to_string());
-            }
-            store.connect_modal_open.set(true);
+            open_connect_modal(store, None);
         }))
         .separator()
         .item(MenuItem::new("Close Store").on_click(move || {
@@ -807,6 +828,22 @@ pub fn run() {
                 }
             };
 
+            // "Mount Remote Store Here..." — store roots and ordinary nodes
+            // only. Opens the connect modal in mount mode with this row's
+            // canonical target (a store root's target is its own root node).
+            let on_mount_remote_store = {
+                let nv = nv_ctx.clone();
+                move || {
+                    if let Some((s_id, node_id_opt)) = parse_tree_value(&nv) {
+                        let parent_id = node_id_opt.or_else(|| store.root_node_id(s_id));
+                        match parent_id {
+                            Some(pid) => open_connect_modal(store, Some((s_id, pid))),
+                            None => tracing::warn!("No target node for a remote mount under {:?}", s_id),
+                        }
+                    }
+                }
+            };
+
             let on_delete = {
                 let nv = nv_ctx.clone();
                 move || {
@@ -922,15 +959,14 @@ pub fn run() {
                     span {
                         class: icon_class,
                         style: {
-                            // Reactive icon opacity for mount state
+                            // Reactive icon opacity: a mount whose source is
+                            // out of reach or not reachable yet renders dimmed.
                             move || {
                                 if let Some(ms) = mount_sig {
-                                    let unavailable = ms.with(|m| {
-                                        m.mount_state.as_ref().map_or(false, |s| {
-                                            matches!(s, pimble_core::MountState::Unavailable { .. })
-                                        })
+                                    let dimmed = ms.with(|m| {
+                                        m.mount_state.as_ref().map_or(false, mount_is_dimmed)
                                     });
-                                    if unavailable {
+                                    if dimmed {
                                         "width: 1rem; height: 1rem; margin-right: 4px; opacity: 0.4;"
                                     } else {
                                         ""
@@ -945,17 +981,17 @@ pub fn run() {
 
                     span {
                         style: {
-                            // Reactive label style — hides during rename, dims for unavailable mounts
+                            // Reactive label style — hides during rename, dims
+                            // a mount whose source is out of reach or not
+                            // reachable yet.
                             move || {
                                 if is_renaming.get() {
                                     "display: none;"
                                 } else if let Some(ms) = mount_sig {
-                                    let unavailable = ms.with(|m| {
-                                        m.mount_state.as_ref().map_or(false, |s| {
-                                            matches!(s, pimble_core::MountState::Unavailable { .. })
-                                        })
+                                    let dimmed = ms.with(|m| {
+                                        m.mount_state.as_ref().map_or(false, mount_is_dimmed)
                                     });
-                                    if unavailable {
+                                    if dimmed {
                                         "cursor: default; opacity: 0.4;"
                                     } else {
                                         base_label_style
@@ -982,16 +1018,10 @@ pub fn run() {
                             };
 
                             if let Some(ms) = mount_sig {
-                                let unavailable = ms.with(|m| {
-                                    m.mount_state.as_ref().map_or(false, |s| {
-                                        matches!(s, pimble_core::MountState::Unavailable { .. })
-                                    })
+                                let suffix = ms.with(|m| {
+                                    m.mount_state.as_ref().map_or("", mount_label_suffix)
                                 });
-                                if unavailable {
-                                    format!("{} (unavailable)", label)
-                                } else {
-                                    label
-                                }
+                                if suffix.is_empty() { label } else { format!("{label}{suffix}") }
                             } else {
                                 label
                             }
@@ -1041,6 +1071,11 @@ pub fn run() {
                                 left_section: TablerIcon::Link,
                                 onclick: on_mount_store,
                                 "Mount Store..."
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::CloudDownload,
+                                onclick: on_mount_remote_store,
+                                "Mount Remote Store Here..."
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Copy,
@@ -1149,6 +1184,11 @@ pub fn run() {
                                 left_section: TablerIcon::Link,
                                 onclick: on_mount_store,
                                 "Mount Store..."
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::CloudDownload,
+                                onclick: on_mount_remote_store,
+                                "Mount Remote Store Here..."
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Copy,
@@ -1395,14 +1435,24 @@ pub fn run() {
         // server places the replica in its own data directory, so nothing
         // in this flow opens a native OS dialog (the rinch debug tools can
         // drive it end to end).
+        //
+        // The same modal serves "Mount Remote Store Here..." when
+        // `connect_modal_target` names a target node: its action adds the
+        // replica (unless the store is already open here) and then mounts it
+        // there, in one command (docs/history/REMOTE_MOUNTS_CONTRACT.md decision 9).
         let connect_modal = rsx! {
             Modal {
                 opened_fn: move || store.connect_modal_open.get(),
                 onclose: move || {
                     store.connect_modal_open.set(false);
                     store.connect_modal_error.set(String::new());
+                    store.connect_modal_target.set(None);
                 },
-                title: "Add Remote Store",
+                title: {|| if store.connect_modal_target.get().is_some() {
+                    "Mount Remote Store"
+                } else {
+                    "Add Remote Store"
+                }},
                 size: "sm",
 
                 div {
@@ -1463,12 +1513,28 @@ pub fn run() {
                             let remote_store_id = pimble_core::StoreId(remote_uuid);
                             let url = untracked(|| store.connect_modal_url.get());
                             let token = untracked(|| store.connect_modal_token.get());
+                            // Both modes report their outcome through the same
+                            // route: `connect_modal_pending_add` claims the
+                            // generic `Error` event for this modal's error line.
                             store.connect_modal_pending_add.set(true);
                             store.connect_modal_busy.set(true);
                             store.connect_modal_error.set(String::new());
-                            store.send(BackendCommand::AddRemoteStore { url, remote_store_id, token });
+                            match untracked(|| store.connect_modal_target.get()) {
+                                Some((target_store_id, target_parent_id)) => {
+                                    store.send(BackendCommand::MountRemoteStore {
+                                        url,
+                                        remote_store_id,
+                                        token,
+                                        target_store_id,
+                                        target_parent_id,
+                                    });
+                                }
+                                None => {
+                                    store.send(BackendCommand::AddRemoteStore { url, remote_store_id, token });
+                                }
+                            }
                         },
-                        "Add"
+                        {|| if store.connect_modal_target.get().is_some() { "Mount" } else { "Add" }}
                     }
 
                     if !store.connect_modal_error.get().is_empty() {

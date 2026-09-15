@@ -87,6 +87,20 @@ pub enum BackendCommand {
     /// it. No path: the server puts it in its own data directory. Same
     /// `token` semantics as `ListRemoteStores`.
     AddRemoteStore { url: String, remote_store_id: StoreId, token: String },
+    /// "Mount Remote Store Here...": one user action, two RPCs
+    /// (docs/history/REMOTE_MOUNTS_CONTRACT.md decision 9). Adds `remote_store_id`
+    /// from `url` as a replica unless this server already has it open, then
+    /// mounts that store's root under `(target_store_id, target_parent_id)`
+    /// with the store's name as the mount's title. Same `token` semantics as
+    /// `ListRemoteStores`. Emits `StoreOpened` (only when it added the
+    /// replica) and then `MountCreated`.
+    MountRemoteStore {
+        url: String,
+        remote_store_id: StoreId,
+        token: String,
+        target_store_id: StoreId,
+        target_parent_id: NodeId,
+    },
     /// Link a local store to a remote (`Some`) or unlink it (`None`).
     SetStoreSync { store_id: StoreId, remote: Option<RemoteEndpoint> },
     /// Ask for a store's current sync link and state.
@@ -124,6 +138,11 @@ pub enum BackendEvent {
     // Mount events
     MountCreated {
         store_id: StoreId,
+        /// The node the mount was created under, so the tree can load that
+        /// parent's children and show the new mount even when the parent had
+        /// never been expanded (`RemoteStoreChange`'s `NodeCreated` refetch
+        /// deliberately skips a parent whose children are not loaded).
+        parent_id: NodeId,
         node_id: NodeId,
         mount_ref: MountRef,
     },
@@ -610,7 +629,7 @@ async fn process_command(
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
             match c.create_mount(store_id, parent_id, source_store_id, source_node_id, title).await {
-                Ok((node_id, mount_ref)) => Some(BackendEvent::MountCreated { store_id, node_id, mount_ref }),
+                Ok((node_id, mount_ref)) => Some(BackendEvent::MountCreated { store_id, parent_id, node_id, mount_ref }),
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
         }
@@ -768,6 +787,67 @@ async fn process_command(
             // No path: the server puts the replica in its own data directory.
             match c.add_remote_store(remote, remote_store_id, None).await {
                 Ok(store) => Some(BackendEvent::StoreOpened { store }),
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::MountRemoteStore {
+            url,
+            remote_store_id,
+            token,
+            target_store_id,
+            target_parent_id,
+        } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+
+            // Step 1: the source store may already be open here (an earlier
+            // replica, or a store that lives on this server), in which case
+            // adding it again is both wrong and refused. Ask the local server
+            // what it holds before deciding.
+            let already_open = match c.list_stores().await {
+                Ok(stores) => stores.into_iter().find(|s| s.id == remote_store_id),
+                Err(e) => return Some(BackendEvent::Error { message: e.to_string() }),
+            };
+
+            let source = match already_open {
+                Some(existing) => existing,
+                None => {
+                    let remote = match remote_endpoint(&url, &token) {
+                        Ok(r) => r,
+                        Err(message) => return Some(BackendEvent::Error { message }),
+                    };
+                    // No path: the server puts the replica in its own data directory.
+                    let added = match c.add_remote_store(remote, remote_store_id, None).await {
+                        Ok(store) => store,
+                        Err(e) => return Some(BackendEvent::Error { message: e.to_string() }),
+                    };
+                    // Report the new store before the mount, so the tree has
+                    // it registered by the time `MountCreated` lands.
+                    let _ = event_tx.try_send(BackendEvent::StoreOpened { store: added.clone() });
+                    signal_ui();
+                    added
+                }
+            };
+
+            // Step 2: mount the source store's root under the target.
+            match c
+                .create_mount(
+                    target_store_id,
+                    target_parent_id,
+                    source.id,
+                    source.root_node_id,
+                    Some(source.name.clone()),
+                )
+                .await
+            {
+                Ok((node_id, mount_ref)) => Some(BackendEvent::MountCreated {
+                    store_id: target_store_id,
+                    parent_id: target_parent_id,
+                    node_id,
+                    mount_ref,
+                }),
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
         }

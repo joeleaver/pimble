@@ -9,7 +9,7 @@ use jsonrpsee::core::{async_trait, SubscriptionResult};
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{PendingSubscriptionSink, SubscriptionMessage};
 use pimble_client::{describe_connect_error, PimbleClient};
-use pimble_core::{AuthMethod, Node, MountRef, NodeId, RemoteEndpoint, StoreId, StoreLocation, SyncState, Workspace};
+use pimble_core::{AuthMethod, Node, MountRef, MountState, NodeId, RemoteEndpoint, StoreId, StoreLocation, SyncState, Workspace};
 use pimble_plugins::PluginHost;
 use pimble_rpc::{
     index_building_error, to_rpc_error, ApplyEditRequest, ApplyEditResponse,
@@ -43,30 +43,16 @@ const CONTENT_INDEX_DEBOUNCE: Duration = Duration::from_millis(2_000);
 /// per edit.
 const CONTENT_FLUSH_DEBOUNCE: Duration = Duration::from_millis(750);
 
-/// Where `addRemoteStore` places a replica when the caller passes `path:
-/// None` (docs/SYNC_CONTRACT.md decision 8): `<data dir>/pimble/replicas/
-/// <store id>.pimble`. The user never chooses this location; a caller like
-/// the CLI may still pass an explicit `path`. `LocalStore::create_replica`
-/// creates every ancestor directory, so nothing here needs to pre-create
-/// `pimble/replicas/`.
-fn default_replica_path(store_id: StoreId) -> PathBuf {
-    replicas_dir().join(format!("{}.pimble", store_id))
-}
-
-/// The directory this server creates replicas in: `<data dir>/pimble/
-/// replicas/`. A store inside it is a replica (`Store::is_replica`), and
-/// only such a store can be removed with `removeReplica`.
-fn replicas_dir() -> PathBuf {
+/// The directory a server creates replicas in unless
+/// [`crate::ServerConfig::replicas_dir`] says otherwise: `<data dir>/
+/// pimble/replicas/`. A store inside it is a replica
+/// (`Store::is_replica`), and only such a store can be removed with
+/// `removeReplica`.
+pub(crate) fn default_replicas_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("pimble")
         .join("replicas")
-}
-
-/// Fill in the fields of a `Store` only the server knows: whether it is a
-/// replica (its directory is inside [`replicas_dir`]).
-fn mark_replica(store: &mut pimble_core::Store) {
-    store.is_replica = store.local_path().map_or(false, |p| p.starts_with(replicas_dir()));
 }
 
 /// Coalesces content flushes: `apply_edit` marks its store dirty and ensures
@@ -293,6 +279,32 @@ fn build_index_node(node: &Node, plugin_host: &PluginHost) -> IndexNode {
     }
 }
 
+/// What this server knows about the mounts it has resolved
+/// (docs/history/REMOTE_MOUNTS_CONTRACT.md decisions 5 and 8), all keyed by the
+/// mount's *source* store: that is the store whose link state, or whose
+/// replica creation, decides every one of those mounts' states.
+///
+/// Guarded by one `std::sync::Mutex` so the "is a creation already in
+/// flight?" check and the "mark one in flight" write cannot interleave with
+/// another resolution of the same source. Nothing in here is ever held
+/// across an `.await`.
+#[derive(Default)]
+struct MountTracking {
+    /// Source store -> every `(mounting store, mount node)` this server has
+    /// resolved from it. Added to by every resolution; a mounting store's
+    /// entries go when that store closes. An entry for a mount node that
+    /// has since been deleted is harmless: the notification it produces
+    /// names a node no client has.
+    resolved: HashMap<StoreId, HashSet<(StoreId, NodeId)>>,
+    /// Source stores whose replica a background task is creating right now
+    /// (decision 8). Two resolutions of the same source start one task.
+    in_flight: HashSet<StoreId>,
+    /// Why the last background replica creation for a source failed, in
+    /// words a user can act on (decision 3). Cleared when a fresh attempt
+    /// starts, so a retry never reports a stale reason.
+    failed: HashMap<StoreId, String>,
+}
+
 /// One local notification, broadcast in-process (docs/SYNC_CONTRACT.md
 /// decision 3) wherever [`SubscriptionRegistry`] notifies its WebSocket
 /// sinks. A store's [`crate::sync_link::SyncLink`] subscribes to this to
@@ -434,6 +446,15 @@ pub struct RpcHandler {
     /// updated) only by `add_remote_store`, `set_store_sync`,
     /// `list_remote_stores` and the sync link's own connect.
     credentials: Arc<crate::credentials::CredentialStore>,
+    /// Where this server creates replicas (`addRemoteStore` with
+    /// `path: None`, and every replica a remote mount's resolution creates)
+    /// and, equivalently, which directory makes a store a replica for
+    /// `Store::is_replica` and `removeReplica`. [`default_replicas_dir`]
+    /// unless `ServerConfig::replicas_dir` overrides it.
+    replicas_dir: Arc<PathBuf>,
+    /// Mounts resolved so far and replica creations in flight
+    /// (docs/history/REMOTE_MOUNTS_CONTRACT.md decisions 5 and 8).
+    mounts: Arc<Mutex<MountTracking>>,
 }
 
 impl RpcHandler {
@@ -457,6 +478,20 @@ impl RpcHandler {
     /// uses this so `ServerConfig::credentials_path` actually takes effect;
     /// tests use it to keep credentials in a temp directory.
     pub fn with_credentials_path(store_manager: Arc<RwLock<StoreManager>>, semantic_available: bool, credentials_path: PathBuf) -> Self {
+        Self::with_paths(store_manager, semantic_available, credentials_path, default_replicas_dir())
+    }
+
+    /// Like [`RpcHandler::with_credentials_path`], but with the replicas
+    /// directory given explicitly instead of [`default_replicas_dir`].
+    /// `PimbleServer::start` uses this so `ServerConfig::replicas_dir`
+    /// takes effect; tests point it at a temp directory so a replica this
+    /// server creates never lands in the real data directory.
+    pub fn with_paths(
+        store_manager: Arc<RwLock<StoreManager>>,
+        semantic_available: bool,
+        credentials_path: PathBuf,
+        replicas_dir: PathBuf,
+    ) -> Self {
         Self {
             store_manager,
             subscriptions: Arc::new(RwLock::new(SubscriptionRegistry::new())),
@@ -466,7 +501,26 @@ impl RpcHandler {
             semantic_available,
             links: Arc::new(RwLock::new(HashMap::new())),
             credentials: Arc::new(crate::credentials::CredentialStore::new(credentials_path)),
+            replicas_dir: Arc::new(replicas_dir),
+            mounts: Arc::new(Mutex::new(MountTracking::default())),
         }
+    }
+
+    /// Where `addRemoteStore` places a replica when the caller passes
+    /// `path: None` (docs/SYNC_CONTRACT.md decision 8):
+    /// `<replicas dir>/<store id>.pimble`. The user never chooses this
+    /// location; a caller like the CLI may still pass an explicit `path`.
+    /// `LocalStore::create_replica` creates every ancestor directory, so
+    /// nothing here needs to pre-create the replicas directory.
+    fn default_replica_path(&self, store_id: StoreId) -> PathBuf {
+        self.replicas_dir.join(format!("{}.pimble", store_id))
+    }
+
+    /// Fill in the field of a `Store` only the server knows: whether it is
+    /// a replica (its directory is inside this server's replicas
+    /// directory).
+    fn mark_replica(&self, store: &mut pimble_core::Store) {
+        store.is_replica = store.local_path().map_or(false, |p| p.starts_with(self.replicas_dir.as_path()));
     }
 
     // ── Replica sync (docs/SYNC_CONTRACT.md) ─────────────────────────
@@ -494,9 +548,13 @@ impl RpcHandler {
     }
 
     /// Notify a store's local subscribers that its sync link's state
-    /// changed.
+    /// changed, and every mount sourced from that store that its own state
+    /// changed with it (docs/history/REMOTE_MOUNTS_CONTRACT.md decisions 3 and 5:
+    /// a mount's state is derived from its source's link, so this is the
+    /// one place both are published from).
     pub(crate) async fn notify_sync_state_changed(&self, store_id: StoreId, state: SyncState) {
         self.notify_store_change(store_id, StoreChangeKind::SyncStateChanged { state }, None).await;
+        self.notify_mount_states_for_source(store_id).await;
     }
 
     /// A store's sync link state, `Offline` if it has none.
@@ -511,11 +569,19 @@ impl RpcHandler {
     /// `openStore`, `addRemoteStore`, `set_store_sync(Some(remote))` and no-op if
     /// a link is already present.
     async fn ensure_link_started(&self, store_id: StoreId, remote: RemoteEndpoint) {
+        // Decision 4 of docs/history/REMOTE_MOUNTS_CONTRACT.md: the link answers
+        // `last_sync` from `sync.json` until it next reaches `Synced`, so a
+        // mount sourced from this store reports `Cached { last_sync }`
+        // rather than `Connecting` after a restart with the remote down.
+        let last_sync = {
+            let manager = self.store_manager.read().await;
+            manager.read_sync_config(store_id).await.ok().flatten().and_then(|c| c.last_sync)
+        };
         let mut links = self.links.write().await;
         if links.contains_key(&store_id) {
             return;
         }
-        let handle = SyncLink::start(self.clone(), store_id, remote);
+        let handle = SyncLink::start(self.clone(), store_id, remote, last_sync);
         links.insert(store_id, handle);
     }
 
@@ -557,6 +623,321 @@ impl RpcHandler {
     /// needed.
     fn without_auth(remote: &RemoteEndpoint) -> RemoteEndpoint {
         RemoteEndpoint { url: remote.url.clone(), auth: AuthMethod::None }
+    }
+
+    // ── Remote mounts (docs/history/REMOTE_MOUNTS_CONTRACT.md) ───────────────
+
+    /// Resolve `mount_node`'s source and report the mount's state
+    /// (decisions 1 and 3). The single resolution path: `get_mount_state`,
+    /// `get_children` on a mount and `create_mount` all come through here,
+    /// so every one of them records the mount for later fan-out and every
+    /// one of them can trigger a replica creation.
+    ///
+    /// Order: the three local steps (`StoreManager::ensure_store_open`:
+    /// already open, a registry entry, the `source_path` hint), then the
+    /// two remote ones — the mount ref's own `source_remote`, then the
+    /// mounting store's remote, because a store and the stores it mounts
+    /// usually live on the same server. A remote candidate means creating a
+    /// replica, which happens in a detached task: this returns `Connecting`
+    /// at once rather than making the caller's RPC wait on a round trip.
+    ///
+    /// Never holds the store-manager lock across a remote call: the only
+    /// thing it does under that lock is the local resolution.
+    async fn resolve_mount(&self, mounting_store: StoreId, mount_node: NodeId, mount_ref: &MountRef) -> MountState {
+        let source = mount_ref.source_store;
+        self.record_mount(source, mounting_store, mount_node);
+
+        let (resolved_locally, newly_opened) = {
+            let mut manager = self.store_manager.write().await;
+            let resolved = manager.ensure_store_open(mount_ref).await.is_ok();
+            (resolved, manager.opened_since())
+        };
+        // A source store just opened implicitly is an ordinary open store
+        // (docs/history/MOUNTS_CONTRACT.md decision 4), search index included.
+        self.adopt_newly_opened(newly_opened).await;
+
+        if resolved_locally {
+            return self.mount_state_of_open_source(source).await;
+        }
+
+        let candidates = self.remote_candidates_for(mounting_store, mount_ref).await;
+        if candidates.is_empty() {
+            return MountState::Unavailable {
+                reason: Some(format!(
+                    "source store {} is not on this server and no remote is known for it",
+                    source
+                )),
+            };
+        }
+
+        // Decision 8: one creation per source however many mounts ask for
+        // it at once, decided under the same lock that records it.
+        {
+            let mut mounts = self.mounts.lock().unwrap();
+            if mounts.in_flight.contains(&source) {
+                return MountState::Connecting;
+            }
+            mounts.in_flight.insert(source);
+            mounts.failed.remove(&source);
+        }
+
+        let handler = self.clone();
+        tokio::spawn(async move {
+            handler.create_mount_source_replica(source, candidates).await;
+        });
+
+        MountState::Connecting
+    }
+
+    /// The remotes that might hold `mount_ref`'s source, in the order
+    /// decision 1 tries them: the mount ref's `source_remote` (a URL only,
+    /// never a credential), then the mounting store's own remote from its
+    /// `sync.json`. Both are returned with `AuthMethod::None`, so
+    /// [`Self::connect_to_remote`] resolves whatever credential this server
+    /// has saved for that origin.
+    async fn remote_candidates_for(&self, mounting_store: StoreId, mount_ref: &MountRef) -> Vec<RemoteEndpoint> {
+        let mut candidates: Vec<RemoteEndpoint> = Vec::new();
+        if let Some(url) = &mount_ref.source_remote {
+            candidates.push(RemoteEndpoint { url: url.clone(), auth: AuthMethod::None });
+        }
+
+        let mounting_remote = {
+            let manager = self.store_manager.read().await;
+            manager.read_sync_config(mounting_store).await.ok().flatten()
+        };
+        if let Some(config) = mounting_remote {
+            if !candidates.iter().any(|c| c.url == config.remote.url) {
+                candidates.push(Self::without_auth(&config.remote));
+            }
+        }
+
+        candidates
+    }
+
+    /// Create a replica of mount source `source` from the first of
+    /// `candidates` that has it, then tell every mount of that source what
+    /// happened (decision 5). Runs detached: whichever RPC triggered it has
+    /// already answered `Connecting`.
+    ///
+    /// A candidate that cannot be reached, or that has no such store, is
+    /// just the next one's turn; when none works the reason is kept so the
+    /// notification says why, in the remote's own words ("... refused the
+    /// credentials"). Nothing retries on a timer — the next resolution of
+    /// the same mount tries again (decision 3's "the last creation attempt
+    /// failed" is what a fan-out reports in the meantime).
+    async fn create_mount_source_replica(&self, source: StoreId, candidates: Vec<RemoteEndpoint>) {
+        let mut errors: Vec<String> = Vec::new();
+        let mut created = false;
+
+        for remote in &candidates {
+            match self.create_replica_from(remote.clone(), source, None, false).await {
+                Ok(_) => {
+                    info!("Created a replica of mount source {} from {}", source, remote.url);
+                    created = true;
+                    break;
+                }
+                Err(e) => {
+                    let message = e.message().to_string();
+                    debug!("Mount source {} not available from {}: {}", source, remote.url, message);
+                    errors.push(message);
+                }
+            }
+        }
+
+        {
+            let mut mounts = self.mounts.lock().unwrap();
+            mounts.in_flight.remove(&source);
+            if !created {
+                let reason = if errors.iter().all(|e| e.contains("has no open store")) {
+                    format!("no remote has store {}", source)
+                } else {
+                    errors.join("; ")
+                };
+                warn!("Could not replicate mount source {}: {}", source, reason);
+                mounts.failed.insert(source, reason);
+            }
+        }
+
+        self.notify_mount_states_for_source(source).await;
+    }
+
+    /// The state of a mount whose source store is open here (decision 3):
+    /// no link at all, or a link that is `Synced`, is `Live`; a link that
+    /// is down or still reconciling is `Cached { last_sync }` once it has
+    /// ever synced, and `Connecting` until then.
+    async fn mount_state_of_open_source(&self, source: StoreId) -> MountState {
+        let link = self.links.read().await.get(&source).map(|h| (h.state(), h.last_sync()));
+        match link {
+            None => MountState::Live,
+            Some((SyncState::Synced { .. }, _)) => MountState::Live,
+            Some((_, Some(last_sync))) => MountState::Cached { last_sync },
+            Some((_, None)) => MountState::Connecting,
+        }
+    }
+
+    /// The state every mount of `source` currently has, including the case
+    /// the source is not open here: a creation in flight is `Connecting`,
+    /// and anything else is `Unavailable` with the last failure's reason
+    /// (decision 3). Used by the fan-out; a resolution uses
+    /// [`Self::resolve_mount`], which also retries.
+    async fn mount_state_for_source(&self, source: StoreId) -> MountState {
+        if self.store_manager.read().await.is_open(source) {
+            return self.mount_state_of_open_source(source).await;
+        }
+        let mounts = self.mounts.lock().unwrap();
+        if mounts.in_flight.contains(&source) {
+            return MountState::Connecting;
+        }
+        MountState::Unavailable { reason: mounts.failed.get(&source).cloned() }
+    }
+
+    /// Tell every mount sourced from `source` what its state is now
+    /// (decision 5), on each mounting store's own `storeChanged`
+    /// subscription with `source_client_id: None`. Called when the source's
+    /// link changes category and when a background replica creation ends,
+    /// successfully or not — a failure is a state a client can show, never
+    /// something only the log knows.
+    async fn notify_mount_states_for_source(&self, source: StoreId) {
+        let mounts: Vec<(StoreId, NodeId)> = {
+            let tracking = self.mounts.lock().unwrap();
+            tracking.resolved.get(&source).map(|set| set.iter().copied().collect()).unwrap_or_default()
+        };
+        if mounts.is_empty() {
+            return;
+        }
+
+        let state = self.mount_state_for_source(source).await;
+        for (mounting_store, node_id) in mounts {
+            self.notify_store_change(
+                mounting_store,
+                StoreChangeKind::MountStateChanged { node_id, state: state.clone() },
+                None,
+            )
+            .await;
+        }
+    }
+
+    /// Remember that `(mounting_store, mount_node)` is a mount of `source`,
+    /// so a later change to that source's state reaches it (decision 5).
+    fn record_mount(&self, source: StoreId, mounting_store: StoreId, mount_node: NodeId) {
+        self.mounts.lock().unwrap().resolved.entry(source).or_default().insert((mounting_store, mount_node));
+    }
+
+    /// Drop the record of specific mount nodes in `store_id`, because they
+    /// have been deleted. A stale entry is harmless to the server — it
+    /// names a node no client has — but it keeps producing
+    /// `MountStateChanged` notifications for a node the client has to
+    /// recognise and discard, so the cheap thing is not to send them.
+    fn forget_mounts(&self, store_id: StoreId, node_ids: &[NodeId]) {
+        if node_ids.is_empty() {
+            return;
+        }
+        let mut tracking = self.mounts.lock().unwrap();
+        tracking.resolved.retain(|_, mounts| {
+            mounts.retain(|(mounting_store, node_id)| *mounting_store != store_id || !node_ids.contains(node_id));
+            !mounts.is_empty()
+        });
+    }
+
+    /// Drop every mount `store_id` holds, because it is closing. Its
+    /// entries as a *source* stay: the next resolution reopens or recreates
+    /// it, which is what a local mount has always done.
+    fn forget_mounting_store(&self, store_id: StoreId) {
+        let mut tracking = self.mounts.lock().unwrap();
+        tracking.resolved.retain(|_, mounts| {
+            mounts.retain(|(mounting_store, _)| *mounting_store != store_id);
+            !mounts.is_empty()
+        });
+    }
+
+    /// Create a local replica of `store_id` as `remote` holds it, link it,
+    /// and return the opened store (docs/SYNC_CONTRACT.md decision 8). The
+    /// `addRemoteStore` RPC is this with `wait: true`; a mount resolving
+    /// its source in the background is this with `wait: false`, because the
+    /// link's own `Connecting` -> `Live` transitions are what tell that
+    /// caller it finished.
+    ///
+    /// `path: None` puts the replica in this server's replicas directory,
+    /// which is also what makes it removable with `removeReplica`.
+    async fn create_replica_from(
+        &self,
+        remote: RemoteEndpoint,
+        store_id: StoreId,
+        path: Option<PathBuf>,
+        wait: bool,
+    ) -> Result<pimble_core::Store, ErrorObjectOwned> {
+        let path = path.unwrap_or_else(|| self.default_replica_path(store_id));
+
+        info!("Adding remote store {} from {} at {:?}", store_id, remote.url, path);
+
+        // A store this server already holds cannot also be added as a
+        // replica (the manager refuses too); this also covers pointing the
+        // request at this very server.
+        {
+            let manager = self.store_manager.read().await;
+            if manager.is_open(store_id) {
+                let where_ = manager
+                    .get_store_info(store_id)
+                    .ok()
+                    .and_then(|s| s.local_path().cloned())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                return Err(to_rpc_error(format!(
+                    "store {} is already open locally at {}; use setStoreSync to link it",
+                    store_id, where_
+                )));
+            }
+        }
+
+        // Ask the remote for the store (decision 8): its name and root node
+        // id, matched by id via `listStores`.
+        let remote_client = self.connect_to_remote(&remote).await?;
+        let remote_stores = remote_client.list_stores().await.map_err(to_rpc_error)?;
+        let remote_store = remote_stores
+            .into_iter()
+            .find(|s| s.id == store_id)
+            .ok_or_else(|| to_rpc_error(format!("Remote {} has no open store {}", remote.url, store_id)))?;
+        drop(remote_client);
+
+        // An empty replica, never `StoreDocument::new` (decision 8: two
+        // independently created roots for the same id would merge into
+        // duplicated children).
+        let mut manager = self.store_manager.write().await;
+        let created_id = manager
+            .create_replica(&path, remote_store.id, &remote_store.name, remote_store.root_node_id)
+            .await
+            .map_err(to_rpc_error)?;
+        manager
+            .write_sync_config(created_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None })
+            .await
+            .map_err(to_rpc_error)?;
+        let mut store = manager.get_store_info(created_id).map_err(to_rpc_error)?;
+        let newly_opened = manager.opened_since();
+        drop(manager);
+
+        self.adopt_newly_opened(newly_opened).await;
+
+        self.ensure_link_started(created_id, remote).await;
+
+        // Wait up to 10s for the first full reconcile to reach `Synced`
+        // (decision 8), then answer anyway with the current state.
+        if wait {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let state = self.sync_state_of(created_id).await;
+                let is_synced = matches!(state, SyncState::Synced { .. });
+                if is_synced || std::time::Instant::now() >= deadline {
+                    store.sync_state = state;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        } else {
+            store.sync_state = self.sync_state_of(created_id).await;
+        }
+
+        self.mark_replica(&mut store);
+        Ok(store)
     }
 
     /// Mark `store_id` as having dirty content and, if no flush task is
@@ -869,19 +1250,31 @@ impl RpcHandler {
         Ok(())
     }
 
-    /// Open a search index for every store id in `store_ids` that doesn't
-    /// already have one open. Call after any `StoreManager` operation that
-    /// may have opened stores implicitly (resolving or validating a mount),
-    /// with the list drained via `StoreManager::opened_since`, so an
-    /// implicitly-opened source store gets the same treatment as one opened
-    /// via `openStore`.
-    async fn open_indexes_for_newly_opened(&self, store_ids: Vec<StoreId>) {
+    /// Give every store in `store_ids` what `openStore` gives one: a search
+    /// index, its sync link if `sync.json` names a remote, and a tree repair.
+    /// Call after any `StoreManager` operation that may have opened stores
+    /// implicitly (resolving or validating a mount, creating a replica), with
+    /// the list drained via `StoreManager::opened_since`, so an implicitly
+    /// opened source store is an ordinary open store
+    /// (docs/history/MOUNTS_CONTRACT.md decision 4). A replica resolved as a
+    /// mount's source through its `source_path` after a restart depends on
+    /// the link part: without it the replica sits `Offline` for good and the
+    /// mount reads `Live` while nothing flows.
+    async fn adopt_newly_opened(&self, store_ids: Vec<StoreId>) {
         for store_id in store_ids {
             if !self.indexes.read().await.contains_key(&store_id) {
                 if let Err(e) = self.open_index_for_store(store_id).await {
                     warn!("Failed to open search index for newly opened store {}: {}", store_id, e);
                 }
             }
+            let sync_config = {
+                let manager = self.store_manager.read().await;
+                manager.read_sync_config(store_id).await.ok().flatten()
+            };
+            if let Some(config) = sync_config {
+                self.ensure_link_started(store_id, config.remote).await;
+            }
+            self.repair_store_tree(store_id).await;
         }
     }
 
@@ -983,7 +1376,7 @@ impl PimbleApiServer for RpcHandler {
         self.repair_store_tree(store_id).await;
 
         store.sync_state = self.sync_state_of(store_id).await;
-        mark_replica(&mut store);
+        self.mark_replica(&mut store);
 
         Ok(OpenStoreResponse { store })
     }
@@ -995,6 +1388,10 @@ impl PimbleApiServer for RpcHandler {
         info!("Closing store {}", request.store_id);
 
         self.stop_link(request.store_id).await;
+        // Decision 5: a closing store's mounts are no longer this server's
+        // to report on. Its entries as a mount *source* stay — the next
+        // resolution reopens it.
+        self.forget_mounting_store(request.store_id);
 
         let mut manager = self.store_manager.write().await;
         manager
@@ -1026,7 +1423,7 @@ impl PimbleApiServer for RpcHandler {
         for id in store_ids {
             if let Ok(mut store) = manager.get_store_info(id) {
                 store.sync_state = self.sync_state_of(id).await;
-                mark_replica(&mut store);
+                self.mark_replica(&mut store);
                 stores.push(store);
             }
         }
@@ -1186,6 +1583,9 @@ impl PimbleApiServer for RpcHandler {
             .map_err(to_rpc_error)?;
 
         drop(manager);
+        // A deleted subtree may contain mount nodes; stop reporting their
+        // source's state to a client that no longer has them.
+        self.forget_mounts(request.store_id, &removal.removed);
         self.notify_store_change(
             request.store_id,
             StoreChangeKind::NodeDeleted { node_id: request.node_id, parent_id: removal.parent_id },
@@ -1241,6 +1641,36 @@ impl PimbleApiServer for RpcHandler {
             request.node_id, request.store_id
         );
 
+        // A mount node's children live in its source store, which may need
+        // resolving first — opening it from disk, or replicating it from a
+        // remote (docs/history/REMOTE_MOUNTS_CONTRACT.md decision 1). Resolution
+        // also records the mount, so a later change to the source's link
+        // state reaches this client as `MountStateChanged`.
+        let mount_ref = {
+            let mut manager = self.store_manager.write().await;
+            let node = manager
+                .get_node(request.store_id, request.node_id)
+                .await
+                .map_err(to_rpc_error)?;
+            node.mount_ref().filter(|_| node.is_mount())
+        };
+
+        if let Some(mount_ref) = mount_ref {
+            let state = self.resolve_mount(request.store_id, request.node_id, &mount_ref).await;
+            if !self.store_manager.read().await.is_open(mount_ref.source_store) {
+                // Decision 7: the error carries the state, because that is
+                // what a client can act on — it refetches when a
+                // `MountStateChanged` says the source is back.
+                return Err(to_rpc_error(match state {
+                    MountState::Unavailable { reason: Some(reason) } => {
+                        format!("mount source unavailable: {}", reason)
+                    }
+                    MountState::Unavailable { reason: None } => "mount source unavailable".to_string(),
+                    _ => "mount source is connecting".to_string(),
+                }));
+            }
+        }
+
         let mut manager = self.store_manager.write().await;
         let (store_id, children) = manager
             .get_children(request.store_id, request.node_id)
@@ -1251,7 +1681,7 @@ impl PimbleApiServer for RpcHandler {
 
         // A mount's source store may have just been opened implicitly to
         // resolve it; give it a search index like any other open store.
-        self.open_indexes_for_newly_opened(newly_opened).await;
+        self.adopt_newly_opened(newly_opened).await;
 
         Ok(GetChildrenResponse { store_id, children })
     }
@@ -1267,6 +1697,23 @@ impl PimbleApiServer for RpcHandler {
 
         let mut manager = self.store_manager.write().await;
 
+        // Validate that this mount won't create a cycle. This also rejects
+        // a mount-node parent transitively: `create_node` below is the
+        // authoritative check, but validating first avoids opening/walking
+        // stores for a request that's going to fail anyway. It opens the
+        // source store, which is what makes reading the source's path and
+        // remote below possible.
+        let probe = MountRef {
+            source_store: request.source_store_id,
+            source_node: request.source_node_id,
+            source_path: None,
+            source_remote: None,
+        };
+        manager
+            .validate_mount_creation(request.store_id, request.parent_id, &probe)
+            .await
+            .map_err(to_rpc_error)?;
+
         // Fill `source_path` from the registry's Local endpoint for the
         // source store, if it has one: this is what lets the mount resolve
         // after a restart even if the source isn't otherwise reopened (see
@@ -1276,21 +1723,23 @@ impl PimbleApiServer for RpcHandler {
             _ => None,
         };
 
+        // Fill `source_remote` when the source store is itself a linked
+        // replica here (docs/history/REMOTE_MOUNTS_CONTRACT.md decision 2): the URL
+        // only, never the credential, because this mount ref replicates
+        // with its store to machines that must not hold the token.
+        let source_remote = manager
+            .read_sync_config(request.source_store_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|config| config.remote.url);
+
         let mount_ref = MountRef {
             source_store: request.source_store_id,
             source_node: request.source_node_id,
             source_path,
-            source_remote: None,
+            source_remote,
         };
-
-        // Validate that this mount won't create a cycle. This also rejects
-        // a mount-node parent transitively: `create_node` below is the
-        // authoritative check, but validating first avoids opening/walking
-        // stores for a request that's going to fail anyway.
-        manager
-            .validate_mount_creation(request.store_id, request.parent_id, &mount_ref)
-            .await
-            .map_err(to_rpc_error)?;
 
         // Create the mount node. `create_node` rejects a mount-node parent
         // (`StoreError::MountHasNoChildren`), surfaced here as an RPC error.
@@ -1312,9 +1761,15 @@ impl PimbleApiServer for RpcHandler {
         let newly_opened = manager.opened_since();
         drop(manager);
 
-        self.open_indexes_for_newly_opened(newly_opened).await;
+        self.adopt_newly_opened(newly_opened).await;
         self.notify_store_change(request.store_id, StoreChangeKind::NodeCreated { node_id, parent_id: request.parent_id }, None).await;
         self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
+
+        // Record the new mount so a later change to its source's link
+        // state reaches this store's subscribers (decision 5). The source
+        // is open by now (`validate_mount_creation` opened it), so this
+        // resolves locally and starts nothing.
+        let _ = self.resolve_mount(request.store_id, node_id, &mount_ref).await;
 
         Ok(CreateMountResponse { node_id, mount_ref })
     }
@@ -1325,83 +1780,11 @@ impl PimbleApiServer for RpcHandler {
         &self,
         request: AddRemoteStoreRequest,
     ) -> Result<OpenStoreResponse, ErrorObjectOwned> {
-        // `None` lets the server choose the replica's location; the user
-        // never picks one (decision 8).
-        let path = request.path.clone().unwrap_or_else(|| default_replica_path(request.remote_store_id));
-
-        info!(
-            "Adding remote store {} from {} at {:?}",
-            request.remote_store_id, request.remote.url, path
-        );
-
-        // A store this server already holds cannot also be added as a
-        // replica (the manager refuses too); this also covers pointing the
-        // request at this very server.
-        {
-            let manager = self.store_manager.read().await;
-            if manager.is_open(request.remote_store_id) {
-                let where_ = manager
-                    .get_store_info(request.remote_store_id)
-                    .ok()
-                    .and_then(|s| s.local_path().cloned())
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                return Err(to_rpc_error(format!(
-                    "store {} is already open locally at {}; use setStoreSync to link it",
-                    request.remote_store_id, where_
-                )));
-            }
-        }
-
-        // Ask the remote for the store (decision 8): its name and root node
-        // id, matched by id via `listStores`.
-        let remote_client = self.connect_to_remote(&request.remote).await?;
-        let remote_stores = remote_client.list_stores().await.map_err(to_rpc_error)?;
-        let remote_store = remote_stores
-            .into_iter()
-            .find(|s| s.id == request.remote_store_id)
-            .ok_or_else(|| {
-                to_rpc_error(format!(
-                    "Remote {} has no open store {}",
-                    request.remote.url, request.remote_store_id
-                ))
-            })?;
-        drop(remote_client);
-
-        // An empty replica, never `StoreDocument::new` (decision 8: two
-        // independently created roots for the same id would merge into
-        // duplicated children).
-        let mut manager = self.store_manager.write().await;
-        let store_id = manager
-            .create_replica(&path, remote_store.id, &remote_store.name, remote_store.root_node_id)
-            .await
-            .map_err(to_rpc_error)?;
-        manager
-            .write_sync_config(store_id, &SyncConfig { remote: Self::without_auth(&request.remote), last_sync: None })
-            .await
-            .map_err(to_rpc_error)?;
-        let mut store = manager.get_store_info(store_id).map_err(to_rpc_error)?;
-        let newly_opened = manager.opened_since();
-        drop(manager);
-
-        self.open_indexes_for_newly_opened(newly_opened).await;
-
-        self.ensure_link_started(store_id, request.remote.clone()).await;
-
-        // Wait up to 10s for the first full reconcile to reach `Synced`
-        // (decision 8), then answer anyway with the current state.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let state = self.sync_state_of(store_id).await;
-            let is_synced = matches!(state, SyncState::Synced { .. });
-            if is_synced || std::time::Instant::now() >= deadline {
-                store.sync_state = state;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-
-        mark_replica(&mut store);
+        // `path: None` lets the server choose the replica's location; the
+        // user never picks one (docs/SYNC_CONTRACT.md decision 8). `wait:
+        // true`: this call answers only once the first full reconcile has
+        // landed (or 10s have passed), so the store comes back populated.
+        let store = self.create_replica_from(request.remote, request.remote_store_id, request.path, true).await?;
         Ok(OpenStoreResponse { store })
     }
 
@@ -1517,7 +1900,7 @@ impl PimbleApiServer for RpcHandler {
             let manager = self.store_manager.read().await;
             manager.get_store_info(request.store_id).map_err(to_rpc_error)?
         };
-        mark_replica(&mut store);
+        self.mark_replica(&mut store);
         if !store.is_replica {
             return Err(to_rpc_error(format!(
                 "store {} is not a replica (its directory is not under this server's replicas directory); \
@@ -1570,21 +1953,23 @@ impl PimbleApiServer for RpcHandler {
             request.node_id, request.store_id
         );
 
-        let mut manager = self.store_manager.write().await;
-        let node = manager
-            .get_node(request.store_id, request.node_id)
-            .await
-            .map_err(to_rpc_error)?;
+        let node = {
+            let mut manager = self.store_manager.write().await;
+            manager
+                .get_node(request.store_id, request.node_id)
+                .await
+                .map_err(to_rpc_error)?
+        };
 
-        let mount_ref = node.mount_ref().ok_or_else(|| {
+        let mount_ref = node.mount_ref().filter(|_| node.is_mount()).ok_or_else(|| {
             to_rpc_error(format!("Node {} is not a mount point", request.node_id))
         })?;
 
-        let state = manager.mount_state(&mount_ref).await;
-        let newly_opened = manager.opened_since();
-        drop(manager);
-
-        self.open_indexes_for_newly_opened(newly_opened).await;
+        // Attempts resolution rather than reading a cached answer
+        // (docs/history/MOUNTS_CONTRACT.md decision 5), which for a source that is
+        // not on this machine means starting its replica and answering
+        // `Connecting` (docs/history/REMOTE_MOUNTS_CONTRACT.md decision 1).
+        let state = self.resolve_mount(request.store_id, request.node_id, &mount_ref).await;
 
         Ok(GetMountStateResponse { state, mount_ref })
     }

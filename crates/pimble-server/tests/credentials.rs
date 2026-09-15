@@ -36,6 +36,7 @@ async fn start_server(auth_token: Option<&str>, credentials_path: Option<PathBuf
         addr: "127.0.0.1:0".parse().unwrap(),
         auth_token: auth_token.map(String::from),
         credentials_path,
+        ..Default::default()
     });
     server.start().await.expect("server starts");
     server

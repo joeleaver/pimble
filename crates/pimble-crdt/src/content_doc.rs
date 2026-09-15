@@ -60,27 +60,40 @@ impl ContentDoc {
     /// to migrate legacy plain-text content.
     pub fn from_plain_text(text: &str) -> Result<Self> {
         let schema = Rc::new(Schema::starter_kit());
-        let mut paragraphs = Vec::new();
-        for line in text.split('\n') {
-            let content = if line.is_empty() {
-                Fragment::empty()
-            } else {
-                let text_node = schema
-                    .text(line)
-                    .map_err(|e| CrdtError::Collab(e.to_string()))?;
-                Fragment::from_node(text_node)
-            };
-            let paragraph = schema
-                .branch("paragraph", content)
-                .map_err(|e| CrdtError::Collab(e.to_string()))?;
-            paragraphs.push(paragraph);
-        }
-        let doc_node = schema
-            .branch("doc", Fragment::from_children(paragraphs))
-            .map_err(|e| CrdtError::Collab(e.to_string()))?;
+        let doc_node = plain_text_doc(&schema, text)?;
         let state = EditorState::create(schema.clone(), doc_node, default_plugins());
         let session = CollabSession::new(&state).map_err(|e| CrdtError::Collab(e.to_string()))?;
         Self::load(&session.snapshot())
+    }
+
+    /// Replace this document's whole content with one paragraph per line of `text`, as
+    /// an *edit* of the existing CRDT rather than a new document, and return the yrs v1
+    /// delta that edit produced — the payload for an `applyEdit`. Peers that merge the
+    /// delta converge on exactly `text`; a fresh document built from `text` would
+    /// instead merge alongside the old content as extra paragraphs, since it shares no
+    /// history with it. A document with no operations yet (a node whose content was
+    /// never written) is seeded the way [`ContentDoc::from_plain_text`] builds one, and
+    /// the delta is that whole snapshot.
+    pub fn replace_plain_text(&mut self, text: &str) -> Result<Vec<u8>> {
+        let schema = Rc::new(Schema::starter_kit());
+        let after = plain_text_doc(&schema, text)?;
+
+        let has_history = !self.doc.transact().state_vector().is_empty();
+        let delta = if has_history {
+            let mut session = CollabSession::from_bytes(&self.save()).map_err(|e| CrdtError::Collab(e.to_string()))?;
+            let before = session.projected_doc(&schema).map_err(|e| CrdtError::Collab(e.to_string()))?;
+            session
+                .record_local(&schema, &before, &after)
+                .map_err(|e| CrdtError::Collab(e.to_string()))?;
+            session.save_incremental().map_err(|e| CrdtError::Collab(e.to_string()))?
+        } else {
+            let state = EditorState::create(schema.clone(), after, default_plugins());
+            let session = CollabSession::new(&state).map_err(|e| CrdtError::Collab(e.to_string()))?;
+            session.snapshot()
+        };
+
+        self.apply_update(&delta)?;
+        Ok(delta)
     }
 
     /// Full snapshot: the v1 update encoding of the whole document from an empty state
@@ -226,9 +239,66 @@ impl Default for ContentDoc {
     }
 }
 
+/// One `doc` node holding one `paragraph` per line of `text` (a blank line becomes an
+/// empty paragraph; empty `text` becomes a single empty paragraph).
+fn plain_text_doc(schema: &Rc<Schema>, text: &str) -> Result<Node> {
+    let mut paragraphs = Vec::new();
+    for line in text.split('\n') {
+        let content = if line.is_empty() {
+            Fragment::empty()
+        } else {
+            let text_node = schema
+                .text(line)
+                .map_err(|e| CrdtError::Collab(e.to_string()))?;
+            Fragment::from_node(text_node)
+        };
+        let paragraph = schema
+            .branch("paragraph", content)
+            .map_err(|e| CrdtError::Collab(e.to_string()))?;
+        paragraphs.push(paragraph);
+    }
+    schema
+        .branch("doc", Fragment::from_children(paragraphs))
+        .map_err(|e| CrdtError::Collab(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A replacement is an edit of the shared history: a peer holding the old
+    /// snapshot that merges the delta ends up with exactly the new text, not the
+    /// old and new paragraphs side by side (which is what merging a document built
+    /// from scratch produces).
+    #[test]
+    fn replace_plain_text_converges_on_the_new_text() {
+        let mut doc = ContentDoc::from_plain_text("v1").unwrap();
+        let mut peer = ContentDoc::load(&doc.save()).unwrap();
+
+        let delta = doc.replace_plain_text("v2\nsecond line").unwrap();
+        assert_eq!(doc.text(), "v2\nsecond line");
+
+        assert!(peer.apply_update(&delta).unwrap());
+        assert_eq!(peer.text(), "v2\nsecond line");
+
+        // And again, with a different block count in the other direction.
+        let delta = doc.replace_plain_text("v3").unwrap();
+        peer.apply_update(&delta).unwrap();
+        assert_eq!(doc.text(), "v3");
+        assert_eq!(peer.text(), "v3");
+    }
+
+    /// A never-written document has no history to edit; the delta is the whole
+    /// seeded snapshot and still leaves both sides on the text.
+    #[test]
+    fn replace_plain_text_seeds_an_empty_document() {
+        let mut doc = ContentDoc::new();
+        let mut peer = ContentDoc::new();
+        let delta = doc.replace_plain_text("hello").unwrap();
+        peer.apply_update(&delta).unwrap();
+        assert_eq!(doc.text(), "hello");
+        assert_eq!(peer.text(), "hello");
+    }
 
     #[test]
     fn round_trip_plain_text() {

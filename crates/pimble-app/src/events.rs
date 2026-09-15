@@ -89,6 +89,44 @@ fn refetch_root_if_empty(store: AppStore, store_id: StoreId) {
     }
 }
 
+/// What a `Live`/`Cached` mount state means for the tree, shared by the
+/// `getMountState` answer and the `MountStateChanged` notification
+/// (docs/history/REMOTE_MOUNTS_CONTRACT.md "B: app side"):
+///
+/// - the source store may be one the app has never heard of — the server
+///   opens or replicates it to resolve the mount — so ask for the store list
+///   and let `StoresListed` register it;
+/// - the mount's children either failed to load while the source was out of
+///   reach, or are stale, so refetch them whenever the row is expanded or has
+///   no children loaded yet.
+///
+/// `Connecting` and `Unavailable` mean there is nothing to fetch yet.
+fn apply_mount_state_followups(
+    store: AppStore,
+    store_id: StoreId,
+    node_id: NodeId,
+    state: &pimble_core::MountState,
+    source_store: Option<StoreId>,
+) {
+    use pimble_core::MountState;
+    if !matches!(state, MountState::Live | MountState::Cached { .. }) {
+        return;
+    }
+
+    if let Some(source_store) = source_store {
+        let known = untracked(|| store.store_ids.with(|ids| ids.contains(&source_store)));
+        if !known {
+            tracing::info!("Unknown mount source store {:?}; requesting store list", source_store);
+            store.send(BackendCommand::ListStores);
+        }
+    }
+
+    let children_loaded = store.has_children_loaded(store_id, node_id);
+    if !children_loaded || store.is_expanded(store_id, node_id) {
+        store.send(BackendCommand::GetChildren { store_id, node_id });
+    }
+}
+
 /// Process backend events and update store signals directly.
 ///
 /// Per-entity signals are updated individually. `tree_structure_version` is
@@ -185,8 +223,13 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
 
                 // An `AddRemoteStore` request just answered successfully —
                 // close the connect modal (contract: "the modal closes on
-                // success").
-                if untracked(|| store.connect_modal_pending_add.get()) {
+                // success"). In the "Mount Remote Store Here..." flow the
+                // same event only reports the replica half of the two-step
+                // command: the modal stays open and busy until `MountCreated`
+                // (docs/history/REMOTE_MOUNTS_CONTRACT.md decision 9).
+                if untracked(|| store.connect_modal_pending_add.get())
+                    && untracked(|| store.connect_modal_target.get()).is_none()
+                {
                     store.connect_modal_pending_add.set(false);
                     store.connect_modal_busy.set(false);
                     store.connect_modal_open.set(false);
@@ -448,7 +491,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 store.bump_tree_structure();
             }
 
-            BackendEvent::MountCreated { store_id, node_id, mount_ref } => {
+            BackendEvent::MountCreated { store_id, parent_id, node_id, mount_ref } => {
                 tracing::info!("Mount created: {:?}/{:?} -> {:?}/{:?}",
                     store_id, node_id, mount_ref.source_store, mount_ref.source_node);
                 // Track mount info for the new node, using the mount_ref the
@@ -469,6 +512,24 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // Re-fetch node and mount state
                 store.send(BackendCommand::GetNode { store_id: *store_id, node_id: *node_id });
                 store.send(BackendCommand::GetMountState { store_id: *store_id, node_id: *node_id });
+
+                // Load the parent's children so the new mount shows up under
+                // it. Unconditional, like the `NodeCreated` answer: the
+                // `NodeCreated` notification's own refetch skips a parent
+                // whose children were never loaded, which is exactly the case
+                // when a mount is created under a collapsed folder.
+                store.send(BackendCommand::GetChildren { store_id: *store_id, node_id: *parent_id });
+
+                // The second and last step of "Mount Remote Store Here..."
+                // just succeeded — close the connect modal and leave it in
+                // its plain "Add Remote Store..." mode.
+                if untracked(|| store.connect_modal_target.get()).is_some() {
+                    store.connect_modal_pending_add.set(false);
+                    store.connect_modal_busy.set(false);
+                    store.connect_modal_open.set(false);
+                    store.connect_modal_error.set(String::new());
+                    store.connect_modal_target.set(None);
+                }
             }
 
             BackendEvent::MountStateChanged { store_id, node_id, state, mount_ref } => {
@@ -477,19 +538,17 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // The mount Effect on that node fires and updates icon opacity + label suffix.
                 store.set_mount_state(*store_id, *node_id, state.clone(), mount_ref.clone());
 
-                // The mount's source store may be one the app doesn't know
-                // about yet — e.g. `getMountState` filled in `source_path`
-                // server-side ahead of anything else discovering it (item 8).
-                // Only worth a `ListStores` when the server actually has it
-                // open (`Live`); `Unavailable`/`Cached`/`Connecting` mean
-                // there is nothing to discover yet.
-                if matches!(state, pimble_core::MountState::Live) {
-                    let source_known = untracked(|| store.store_ids.with(|ids| ids.contains(&mount_ref.source_store)));
-                    if !source_known {
-                        tracing::info!("Unknown mount source store {:?}; requesting store list", mount_ref.source_store);
-                        store.send(BackendCommand::ListStores);
-                    }
-                }
+                // Same follow-ups the live notification gets: the source
+                // store may be one only the server knows about (it opens or
+                // replicates it to resolve the mount), and the mount's
+                // children may never have loaded while it was out of reach.
+                apply_mount_state_followups(
+                    store,
+                    *store_id,
+                    *node_id,
+                    state,
+                    Some(mount_ref.source_store),
+                );
             }
 
             BackendEvent::RemoteStoreChange { store_id, change_kind, source_client_id } => {
@@ -575,9 +634,16 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         }
                     }
                     StoreChangeKind::MountStateChanged { node_id, state } => {
-                        // Placeholder (docs/REMOTE_MOUNTS_CONTRACT.md "B: app
-                        // side"): update the mount's state, keep its ref.
                         tracing::info!("Mount state of {:?}/{:?}: {:?}", store_id, node_id, state);
+                        // Derived state, recomputed by this server whenever
+                        // the source's link moves (decision 5). It carries no
+                        // `MountRef`, so keep the one already known. The
+                        // follow-ups only run when this is news — see
+                        // `update_mount_state` for the two cases that aren't.
+                        if store.update_mount_state(*store_id, *node_id, state.clone()) {
+                            let source_store = store.mount_source_store(*store_id, *node_id);
+                            apply_mount_state_followups(store, *store_id, *node_id, state, source_store);
+                        }
                     }
                 }
             }

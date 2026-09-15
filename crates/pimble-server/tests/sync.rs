@@ -283,6 +283,65 @@ async fn one_local_edit_reaches_remote_exactly_once() {
     assert_eq!(matching, 1, "expected exactly one ContentUpdated notification for B's doc, got {}", matching);
 }
 
+// ── 6b. A chain of three: the far end's edit reaches the origin once ──
+
+/// B holds the store, A is a replica of B, and C is a replica of A (the
+/// shape a remote mount resolved through the mounting store's own remote
+/// produces, docs/history/REMOTE_MOUNTS_CONTRACT.md decision 1). An edit on C must
+/// reach B — A's link forwards a change A's *other* link applied — and it
+/// must reach B exactly once, since the only bounce (B's copy coming back
+/// through A) merges as a no-op that sends nothing.
+#[tokio::test]
+async fn an_edit_at_the_far_end_of_a_chain_reaches_the_origin_exactly_once() {
+    let a_dir = tempfile::tempdir().unwrap();
+    let (server_a, client_a, _server_b, client_b, store_id, _root_id, doc_id, _b_path, _b_dir) =
+        setup_synced_pair(&a_dir.path().join("a.pimble")).await;
+
+    let (_server_c, client_c) = start_server().await;
+    let c_dir = tempfile::tempdir().unwrap();
+    client_c
+        .add_remote_store(remote_endpoint(server_a.addr()), store_id, Some(c_dir.path().join("c.pimble")))
+        .await
+        .expect("C adds the store from A");
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            matches!(client_c.get_store_sync(store_id).await, Ok((_, SyncState::Synced { .. })))
+                && node_text(&client_c, store_id, doc_id).await == "hello"
+        })
+        .await,
+        "C should hold the document through A before the chain check"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut sub = client_b.subscribe_store_changes(store_id).await.unwrap();
+
+    diverge_content(&client_c, store_id, doc_id, "client-c", "hello\nchain").await;
+
+    assert!(
+        wait_until(Duration::from_secs(5), || async { node_text(&client_b, store_id, doc_id).await.contains("chain") }).await,
+        "C's edit should reach B through A"
+    );
+    assert!(node_text(&client_a, store_id, doc_id).await.contains("chain"), "and A, in the middle, has it too");
+
+    let mut matching = 0u32;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, sub.next()).await {
+            Ok(Some(Ok(notif))) => {
+                if matches!(notif.change_kind, StoreChangeKind::ContentUpdated { node_id } if node_id == doc_id) {
+                    matching += 1;
+                }
+            }
+            Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+        }
+    }
+    assert_eq!(matching, 1, "expected exactly one ContentUpdated for the doc at the origin, got {}", matching);
+}
+
 // ── 7. Index ──────────────────────────────────────────────────────────
 
 #[tokio::test]
