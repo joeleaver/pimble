@@ -1,49 +1,31 @@
 # Next session: start here
 
-Written 2026-09-15 at the end of the remote mounts session, updated the same day after the
-Scrivener importer and tree appearance work, and again the same evening after **cloud
-phase 1** (branch `cloud/phase-1`). Read this, then `CLAUDE.md`, then
-`docs/CLOUD_CONTRACT.md` and `docs/DEPLOY.md`.
+Updated 2026-09-16 early morning after **cloud phase 2a** (end-to-end encryption). Read
+this, then `CLAUDE.md` ("Cloud, phase 1" and "Cloud, phase 2a"), then
+`docs/CRYPTO_CONTRACT.md` and `docs/DEPLOY.md`.
 
 ## Where things stand
 
-- Branch `cloud/phase-1` off `master`, working tree clean. Not merged yet: merge once the
-  first deploy has been exercised.
-- **Cloud phase 1 is done and deployed (2026-09-15).** Joe decided to pause the
-  roadmap for a website with downloads and signup, a web app, and a hosted server, all on
-  jkbase (`~/dev/jkbase`, his own platform). Contract `docs/CLOUD_CONTRACT.md` (status
-  header lists the decisions made during the work); summary in `CLAUDE.md` "Cloud,
-  phase 1". Done, each in its own commit: JWT auth and per-store authorization in
-  `pimble-server` (94 tests across server and CLI); the `pimble-cloud` accounts service
-  (10 integration tests against a real `rhypedb-server`; note they silently skipped until
-  the PM ran the stack: RhypeDB schema comments are `//`, the harness now fails loudly when
-  the database dies); `pimble-app` split into a UI
-  library and the desktop binary, `pimble-client` on wasm, and `web/` (trunk) verified end
-  to end with two browser tabs editing one document; `site/`, `jkbase.toml`,
-  `.github/workflows/{ci,release}.yml`, `docs/DEPLOY.md`.
-- **Deployed 2026-09-15 evening.** The jkbase project `pimble` (id `pimble`) serves
-  https://pimble.app (Cloudflare DNS only, verified, Let's Encrypt): the accounts service
-  at `/api/v1/*`, the hosted Pimble server at `/rpc`, the web app at `/app/`, the site at
-  `/` (that last one fixed in the third build: with any `[sites.*]` declared, jkbase
-  ignores `[hosting]`, so the site is `[sites.site]`). Verified live: signup, store
-  creation, a jkbase-Auth token (`kid pimble.0`), `pimble-cli list-stores` and `search`
-  over `wss://pimble.app/rpc` with that token, and the web app creating and editing a
-  document that the CLI then found by search. A throwaway account
-  `smoke-1789509101@example.com` with store "Live smoke" exists on production; delete it
-  when there is a way to. Deploy with `git push jkbase` (see `docs/DEPLOY.md`); the CLI's
-  `jkbase deploy` gives up client-side after 12 minutes while the hosted server target
-  takes about 12 minutes to compile from a cold cache. `m.pimble.app` is a Resend sending
-  domain for phase 2 email.
-- **Not done:** the Windows release job has never run; no `v*` tag exists, so the download
-  page shows its empty state; `cloud/phase-1` is not merged to `master`.
-- Both CRDT documents are yrs. No Automerge, no migrations, no backwards compatibility.
-- rinch is tracked from GitHub `main`, pinned in both `Cargo.lock`s at `743f8a0`; the root
-  workspace no longer declares `rinch` itself (`crates/pimble-app/Cargo.toml` does).
-- Everything before the cloud work (search on rhypedb, local and remote mounts, replica
-  sync, hardening, the rich-text Scrivener importer, tree appearance) is summarised in
-  `CLAUDE.md`, with contracts in `docs/history/`.
-- Workspace compiles with zero warnings. `cargo test --workspace --release`: 235 passed,
-  5 ignored.
+- Branch `cloud/phase-1`, not merged to `master`. Every phase 1 and 2a commit is on it.
+- **Live on pimble.app (deployment v6, phase 1 plus fixes):** the site, the web app, the
+  accounts service with email verification through Resend, the hosted Pimble server with
+  JWT auth. Push-to-deploy with `git push jkbase`; the build cache works with the exclude
+  lists (a site-only change rebuilds nothing else; a changed Rust target still takes 4 to
+  12 minutes).
+- **Phase 2a is code-complete and verified, not deployed.** The next push carries the
+  client-derived login, so it must go out together with the web app's account pages (it
+  does: they are committed). Pending before that push: the web menu bar wiring (agent A,
+  rinch PR #791) and a last full check. Then sign up on pimble.app, create an encrypted
+  store, and edit it from two browsers.
+- **Open decision (Joe):** the store display name is plaintext in the hosted manifest and
+  the accounts service; encrypt it or list it as visible metadata.
+- **rinch is on branch `feat/web-menu-bar` (PR #791)** in both workspaces; move back to
+  `main` when it merges. The PR also fixes the browser's native context menu suppression
+  and a stale-handler gap; a further rinch-web defect (a context menu orphaned by a tree
+  rebuild) is with the rinch agent.
+- Workspace compiles with zero warnings. `cargo test --workspace --release`: 312 passed
+  (the accounts tests need `~/dev/rhypedb/target/debug/rhypedb-server`; the harness now
+  retries port races and caps concurrent stacks).
 
 ## Verify in five minutes
 
@@ -140,10 +122,14 @@ after "Copy as Mount Source" again.
 
 ## Follow-ups, in rough priority
 
-0. **After the deploy:** tag `v0.1.0` to exercise the release workflow (the Windows job is
-   unverified) and merge `cloud/phase-1`. Then phase 2: desktop sign-in
-   (`AuthMethod::CloudSession` so the sync link mints a fresh JWT before each connect),
-   the relay, email through Resend (verification, invitations).
+0. **Deploy phase 2a**, then tag `v0.1.0` (the Windows job is unverified) and merge
+   `cloud/phase-1`. Then: the desktop sign-in UI (the RPCs and CLI exist: `cloudSignIn`,
+   `cloudHostStore`, `cloudAddHostedStore`; the app needs an Account menu, "Host on Pimble
+   Cloud...", "Add hosted store...", an "encrypted" badge from `sync_mode`); encrypt the
+   store display name if Joe says so; move the unwrapped keys from `keys.json` to the OS
+   keychain; account recovery with the recovery code (`POST /recover` is 501); password
+   change (re-wrap); then phase 2b sharing (`docs/CRYPTO_CONTRACT.md`, `docs/CLOUD_CONTRACT.md`
+   "Phase 2: sharing").
 0a. **Hosted build time.** `pimble-cli` compiles about a thousand crates including
    wasmtime (the plugin skeleton, `pimble-plugins`), and jkbase keeps no compile cache
    between builds, so every push costs about 12 minutes. Make wasmtime optional in

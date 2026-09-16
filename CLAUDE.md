@@ -42,8 +42,9 @@ re-import from Scrivener.
 | `pimble-app` | UI library (desktop and web) plus the `pimble` desktop binary | Works: two-window live editing, persistence, local and remote mounts, replica sync UI |
 | `pimble-cli` | server, stores, nodes, mounts, replica sync, search | Complete |
 | `pimble-import` | Scrivener + RTF import | Complete |
-| `pimble-cloud` | Pimble Cloud accounts service: users, sessions, hosted stores, grants, JWTs | Complete (phase 1) |
-| `web/` (`pimble-web`) | the same UI built for the browser with trunk; its own cargo workspace | Complete (phase 1) |
+| `pimble-cloud` | Pimble Cloud accounts service: users, sessions, verification mail, hosted stores, grants, keys, JWTs | Complete (phases 1 and 2a) |
+| `pimble-crypto` | client-side cryptography: password-derived keys, account keys, envelopes, blobs | Complete |
+| `web/` (`pimble-web`) | the same UI built for the browser with trunk; its own cargo workspace; account pages and the vault client | Complete (phases 1 and 2a) |
 
 Node content is a yrs document (`pimble_crdt::ContentDoc`), stored as `nodes/{id}.yrs`.
 The server holds one `ContentDoc` per open node, merges every `applyEdit` update, relays
@@ -266,9 +267,54 @@ target takes about 12 minutes to build.
 - **Site and CI.** `site/` is static HTML/CSS/JS. `.github/workflows/ci.yml` checks and
   tests; `release.yml` builds Linux and Windows packages on a `v*` tag and attaches them
   to a GitHub release, which the download page reads through `/api/v1/releases`.
-- **Phase 2** (designed for, not built): desktop sign-in with `AuthMethod::CloudSession`,
-  the relay server, email via Resend (`m.pimble.app`) for verification and invitations.
-  Phase 3: teams.
+- **Email verification (done 2026-09-15):** signup creates an unverified user and mails a
+  24-hour link through Resend (`m.pimble.app`; `LogMailer` logs the link when no key is
+  set); login refuses unverified accounts with `email_unverified`; resend is limited to one
+  per address per minute, counting signup's own send.
+
+### Cloud, phase 2a: end-to-end encryption (code done 2026-09-16, deploy pending)
+
+Contract: `docs/CRYPTO_CONTRACT.md` (status header lists the decisions and the open
+store-name question). Pimble Cloud holds ciphertext only.
+
+- **`pimble-crypto`** (native and wasm): Argon2id (32 MiB, 3 passes) split by HKDF into
+  `auth_key` (sent as the password; the server hashes it again) and `kek`; X25519 and
+  Ed25519 account keys wrapped under the password KEK and a recovery-code KEK; signed
+  sealed-box `KeyEnvelope`s; the `PB` blob layout over XChaCha20-Poly1305 with
+  `"{store_id}/{doc_id}"` as associated data; `verify_envelope` for servers.
+- **Vault stores** (`Store.kind = vault`): no StoreDocument, ContentDoc or index on the
+  server; per document an append-only log plus a snapshot under `<store>/vault/{doc}/`;
+  RPCs `vaultAppend/Fetch/Snapshot/ListDocs` (reader/editor), `VaultAppended`
+  notifications carry the blob; every other store-scoped RPC answers `-32005`; `createStore`
+  takes `kind` and a chosen `store_id`. Limits: 4 MiB per blob, 64 MiB per log before
+  `-32006 snapshot_required`.
+- **Accounts service**: users carry kdf parameters, public keys and the wrapped key blobs;
+  `GET /kdf` (HMAC decoy for unknown emails), signup and login with `auth_key`,
+  `GET /me/keys`, `GET /users/lookup`, `POST /stores { name, kind, store_id? }`,
+  `GET`/`PUT /stores/{id}/keys` with ownership rules and signature checks. The account
+  pages live in the web app (`/app/signup`, `/app/login`, `/app/account`); the site's
+  pages redirect there.
+- **Desktop**: `AuthMethod::CloudSession` mints a JWT before every connect; `keys.json`
+  (0600) holds the unwrapped account and store keys; Service-only RPCs `cloudSignIn/
+  SignOut/Status/HostStore/ListHostedStores/AddHostedStore`; `VaultLink` (mode `vault` in
+  `sync.json`, per-document `last_seq`) pulls, decrypts and applies blobs, encrypts and
+  appends local updates, drops echoes by seq, snapshots every 200 appends;
+  `Store.sync_mode`/`GetStoreSyncResponse.sync_mode` tell the app it is encrypted. CLI
+  `cloud-*` commands. The desktop sign-in UI is not built yet.
+- **Web app**: keys in memory only (a reload asks for the password to unlock); one
+  `PimbleClient` per endpoint with per-store `rpc_url` and token ready for relayed shares;
+  the vault client holds a decrypted `StoreDocument` and per-node `ContentDoc`s in the
+  browser, answers tree and editor commands from them, encrypts outbound edits and
+  searches client-side; the explorer's `+` creates an encrypted store through the accounts
+  service and re-mints the token; menus are data in `crates/pimble-app/src/menus.rs` and the
+  browser mounts them through `rinch_web::mount_with_menu_bar` (rinch PR #791, tracked as
+  branch `feat/web-menu-bar` in both workspaces until it merges).
+- **Verified by the PM** in a browser through trunk's proxies against the real stack:
+  signup with the recovery code, verification, unlock, an encrypted store, a node typed in
+  one tab, only `PB` ciphertext on the hosted disk (no typed words, title or store name in
+  the vault), a second tab decrypting and receiving edits live.
+- **Phase 2b** (designed for, not built): sharing in place with subtree grants and per-share
+  keys, invitations, the relay tier (store nothing), then teams.
 
 ## Key Files
 
