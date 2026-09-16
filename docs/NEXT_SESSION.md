@@ -1,10 +1,60 @@
 # Next session: start here
 
-Updated 2026-09-16 early morning after **cloud phase 2a** (end-to-end encryption). Read
-this, then `CLAUDE.md` ("Cloud, phase 1" and "Cloud, phase 2a"), then
-`docs/CRYPTO_CONTRACT.md` and `docs/DEPLOY.md`.
+Updated 2026-09-16 evening after **v0.1.0, the desktop account UI and two server
+fixes**. Read this, then `CLAUDE.md` ("Cloud, phase 1", "Cloud, phase 2a", "Desktop
+account UI"), then `docs/CRYPTO_CONTRACT.md`, `docs/DESKTOP_ACCOUNT_CONTRACT.md` and
+`docs/DEPLOY.md`.
 
-## Where things stand
+## Where things stand (2026-09-16 evening)
+
+- **`cloud/phase-1` is merged into `master`** (fast-forward; `master` is at the workflow
+  and release commits, the later commits below are on `cloud/phase-1` and fast-forward
+  cleanly). CI on GitHub runs on `master` pushes and is green.
+- **Tag `v0.1.0`** is pushed (at `master`'s head). Two CI facts learned the hard way: the
+  static ONNX Runtime that `onnx-download` links (ort-sys 2.0.0-rc.12) references glibc
+  2.38 symbols, so every Linux job runs on `ubuntu-24.04` and **the shipped Linux binary
+  needs glibc 2.38 or newer** (Ubuntu 24.04, Debian 13, Fedora 39; the keyword-only build
+  has no such floor). The **Windows build fails in `rhypedb-storage`** (memmap2's
+  `Mmap::advise` is Unix-only): fixed upstream as joeleaver/rhypedb#23, not merged; until
+  the pin moves past it the Windows job is `continue-on-error` and the release publishes
+  with the Linux package alone (the download page hides a missing platform). Check the
+  release run: `gh run list --workflow Release`; the GitHub release should exist with
+  `pimble-0.1.0-linux-x86_64.tar.gz`.
+- **Desktop account UI is done** (`docs/DESKTOP_ACCOUNT_CONTRACT.md`, one agent, PM
+  verification in the GUI against the local stack with rinch's TCP debug protocol driven
+  by a script, since the rinch MCP server binary is missing on this machine). The contract's
+  verification list passed: sign-in, restart, "Add Hosted Store...", "Host on Pimble
+  Cloud...", live edits landing on the hosted disk as `PB` ciphertext, sign-out and
+  sign-in again.
+- **Two server bugs found by that verification, fixed with a regression test**
+  (`adopting_a_hosted_replica_starts_no_plain_link_beside_its_vault_link`): an adopted
+  vault replica also got a plain sync link (flapping "refused the credentials"), and a
+  vault replica's manifest kept its placeholder root so a reopened replica showed "Node
+  not found" and no children. See the CLAUDE.md section.
+- **Production (v15, 2026-09-16 21:25 UTC):** Joe reported the password-recovery mail
+  never reaching Resend. The service never called the mailer (no warning in the log); the
+  route has four silent no-send outcomes (unknown address, unverified, no key material,
+  a repeat within a minute), most likely the first: the 03:09 UTC cleanup deleted seven
+  legacy accounts, so an account from before phase 2a is gone. v15 logs which outcome a
+  recovery request hits and trims the address in the lookup. **Open:** ask Joe which
+  address and when the account was created; read `jkbase logs --service cloud` after the
+  next attempt.
+- **Local verification stack for the desktop** (all in the session scratchpad, gone now):
+  rhypedb-server, `pimble-cli server` on 7463 in JWT mode with a token file, `pimble-cloud`
+  on 8080 with `PIMBLE_CLOUD_PUBLIC_URL=http://127.0.0.1:8090`, a 60-line node reverse
+  proxy on 8090 (`/api/*` to 8080, `/rpc` to 7463 with WebSocket upgrade; the vault link
+  connects to the `rpc_url` the token endpoint reports, so a one-origin proxy is
+  required), the desktop app with `XDG_CONFIG_HOME`/`XDG_DATA_HOME` in temp dirs (embedded
+  server on 7462, so the hosted server must not be on 7462). A signup body is built with a
+  tiny scratch crate over `pimble-crypto` (copy `build_signup_body` from
+  `crates/pimble-cloud/tests/integration.rs`) and POSTed with curl; the verification link
+  is in the service log. rinch's debug protocol: `~/.rinch/debug/*.json` names the port;
+  4-byte big-endian length-prefixed JSON frames; handshake `{"protocol":"rinch-debug",
+  "version":1}`; then `{"id":n,"method":"screenshot"|"click"|"type_text"|"key_press"|
+  "dom_tree"|"query_selector",...,"params":{...}}` (see
+  `crates/rinch-mcp-server/src/client.rs` in the cargo checkout).
+
+## Where things stood before (2026-09-16 morning)
 
 - Branch `cloud/phase-1`, not merged to `master`. Every phase 1 and 2a commit is on it.
 - **Live on pimble.app (deployment v9, 2026-09-16 02:31 UTC): phases 1 and 2a.** The PM
@@ -154,13 +204,13 @@ after "Copy as Mount Source" again.
 
 ## Follow-ups, in rough priority
 
-0. Tag `v0.1.0` (the Windows job is unverified) and merge
-   `cloud/phase-1`. Then: the desktop sign-in UI (the RPCs and CLI exist: `cloudSignIn`,
-   `cloudHostStore`, `cloudAddHostedStore`; the app needs an Account menu, "Host on Pimble
-   Cloud...", "Add hosted store...", an "encrypted" badge from `sync_mode`); move the unwrapped keys from `keys.json` to the OS
-   keychain; account recovery with the recovery code (`POST /recover` is 501); password
-   change (re-wrap); then phase 2b sharing (`docs/CRYPTO_CONTRACT.md`, `docs/CLOUD_CONTRACT.md`
-   "Phase 2: sharing").
+0. Done today: `v0.1.0` tagged, `cloud/phase-1` merged, the desktop account UI, account
+   recovery and password change. Next: merge joeleaver/rhypedb#23, move the rhypedb pin
+   (`cargo update -p rhypedb-storage` and the other rhypedb crates), drop
+   `continue-on-error` from the Windows job and re-tag or tag `v0.1.1`; the desktop
+   "Account..." modal could offer signup (today it only signs in; signup is on the web);
+   move the unwrapped keys from `keys.json` to the OS keychain; then phase 2b sharing
+   (`docs/CRYPTO_CONTRACT.md`, `docs/CLOUD_CONTRACT.md` "Phase 2: sharing").
 0a. **Hosted build time.** `pimble-cli` compiles about a thousand crates including
    wasmtime (the plugin skeleton, `pimble-plugins`), and jkbase keeps no compile cache
    between builds, so every push costs about 12 minutes. Make wasmtime optional in
