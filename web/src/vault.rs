@@ -147,6 +147,7 @@ impl VaultClient {
     /// Fetch this store's keys and its whole tree document, decrypt, and hold it.
     async fn open_store(&mut self, client: &PimbleClient, store: &Store) -> Result<(), String> {
         let store_id = store.id;
+        let me = self.client_id.clone();
         let keyring = keys::fetch_keyring(&store_id.to_string()).await?;
 
         let fetched = client
@@ -175,7 +176,7 @@ impl VaultClient {
                 .map_err(|e| format!("building the store document failed: {e}"))?;
             let blob = encrypt_blob(&keyring, store_id, &VaultDocId::Tree, &tree.save())?;
             tree_seq = client
-                .vault_append(store_id, VaultDocId::Tree, blob)
+                .vault_append_from(store_id, VaultDocId::Tree, blob, Some(me))
                 .await
                 .map_err(|e| format!("seeding the tree failed: {e}"))?;
         }
@@ -649,7 +650,7 @@ impl VaultClient {
         let blob = encrypt_blob(&store.keyring, store_id, &VaultDocId::Tree, &update)?;
 
         let seq = client
-            .vault_append(store_id, VaultDocId::Tree, blob)
+            .vault_append_from(store_id, VaultDocId::Tree, blob, Some(self.client_id.clone()))
             .await
             .map_err(|e| e.to_string())?;
 
@@ -721,7 +722,7 @@ impl VaultClient {
 
         let blob = encrypt_blob(&store.keyring, store_id, &doc_id, update)?;
         let seq = client
-            .vault_append(store_id, doc_id.clone(), blob)
+            .vault_append_from(store_id, doc_id.clone(), blob, Some(self.client_id.clone()))
             .await
             .map_err(|e| e.to_string())?;
 
@@ -1160,9 +1161,10 @@ fn decrypt_entries(
 pub fn should_apply(source_client_id: Option<&str>, my_client_id: &str) -> bool {
     match source_client_id {
         Some(source) => source != my_client_id,
-        // The server does not yet name the client behind a `vaultAppend`:
-        // `VaultAppendRequest` has no field for one, so `source_client_id` is
-        // always `None` on a `VaultAppended`. Applying is the safe reading.
+        // Unattributed: an append made by something that did not name itself,
+        // or by a server that does not stamp one. Applying is the safe
+        // reading — a merge repeated is nothing, a merge missed is a lost
+        // edit.
         None => true,
     }
 }
