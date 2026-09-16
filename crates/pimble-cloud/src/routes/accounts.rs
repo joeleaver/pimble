@@ -408,19 +408,32 @@ pub struct RecoverStartRequest {
 /// rate-limited here for a minute purely because signup itself just sent a
 /// verification email.
 pub async fn recover_start(State(state): State<AppState>, Json(req): Json<RecoverStartRequest>) -> CloudResult<Response> {
-    if let Some(user) = state.db.find_user_by_email(&req.email).await? {
-        if user.verified && user.has_key_material() && state.recovery_rate_limit.try_acquire(&user.email.to_lowercase()) {
-            let (token, token_hash) = new_recovery_token();
-            let expires_at_ms = chrono::Utc::now().timestamp_millis() + RECOVERY_TTL_MS;
-            state.db.set_recovery_token(user.rid, &token_hash, expires_at_ms).await?;
+    // Every outcome answers 202 so the response never says whether an
+    // account exists; the log does, because a request that sends nothing is
+    // otherwise invisible (production, 2026-09-16: "the recovery mail never
+    // reached Resend").
+    let Some(user) = state.db.find_user_by_email(&req.email).await? else {
+        tracing::info!(email = %req.email.trim(), "recovery requested for an unknown address; nothing sent");
+        return Ok((StatusCode::ACCEPTED, Json(json!({ "status": "recovery_sent" }))).into_response());
+    };
+    if !user.verified {
+        tracing::info!(email = %user.email, "recovery requested for an unverified account; nothing sent");
+    } else if !user.has_key_material() {
+        tracing::info!(email = %user.email, "recovery requested for a legacy account with no key material; nothing sent");
+    } else if !state.recovery_rate_limit.try_acquire(&user.email.to_lowercase()) {
+        tracing::info!(email = %user.email, "recovery requested again within a minute; nothing sent");
+    } else {
+        let (token, token_hash) = new_recovery_token();
+        let expires_at_ms = chrono::Utc::now().timestamp_millis() + RECOVERY_TTL_MS;
+        state.db.set_recovery_token(user.rid, &token_hash, expires_at_ms).await?;
 
-            let link = format!("{}/app/recover?token={token}", state.config.public_url.trim_end_matches('/'));
-            let (subject, text, html) = recovery_email(&link);
-            state.mailer.send(&user.email, subject, &text, &html).await.map_err(|e| {
-                tracing::warn!(email = %user.email, error = %e, "sending the recovery email failed");
-                CloudError::MailFailed
-            })?;
-        }
+        let link = format!("{}/app/recover?token={token}", state.config.public_url.trim_end_matches('/'));
+        let (subject, text, html) = recovery_email(&link);
+        state.mailer.send(&user.email, subject, &text, &html).await.map_err(|e| {
+            tracing::warn!(email = %user.email, error = %e, "sending the recovery email failed");
+            CloudError::MailFailed
+        })?;
+        tracing::info!(email = %user.email, "recovery email sent");
     }
     Ok((StatusCode::ACCEPTED, Json(json!({ "status": "recovery_sent" }))).into_response())
 }

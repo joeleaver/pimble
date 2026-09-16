@@ -487,7 +487,9 @@ impl RhypeDb {
     }
 
     pub async fn find_user_by_email(&self, email: &str) -> CloudResult<Option<UserRow>> {
-        let email_lower = email.to_lowercase();
+        // Trimmed like `GET /kdf` trims: a pasted address with a stray space
+        // must find the same row.
+        let email_lower = email.trim().to_lowercase();
         let q = format!("User.filter(.email_lower == {})", ql_str(&email_lower));
         self.one(&q).await?.map(|o| user_from_object(&o)).transpose()
     }
