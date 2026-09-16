@@ -218,14 +218,16 @@ pub fn rebuild_search_indexes(store: AppStore) {
 /// from, so it picks one of the stores the account already grants. Either way
 /// the RPC is the same `createMount`, which an editor is allowed to call.
 pub fn open_mount_picker(store: AppStore, target: (pimble_core::StoreId, pimble_core::NodeId)) {
-    // Never the store being mounted into: a store cannot contain itself.
+    // The target goes in first: the picker's own option list reads it to leave
+    // out the store being mounted into, and a list built before it was set
+    // would offer that store as a place to put itself.
+    store.mount_picker_target.set(Some(target));
     let first = untracked(|| {
         store.store_ids.with(|ids| ids.iter().find(|&&id| id != target.0).copied())
     });
     store.mount_picker_selected.set(first.map(|id| id.to_string()).unwrap_or_default());
     store.mount_picker_error.set(String::new());
     store.mount_picker_pending.set(false);
-    store.mount_picker_target.set(Some(target));
 }
 
 /// Open the "New Store..." modal, empty.
@@ -323,13 +325,26 @@ fn copy_as_mount_source(store: AppStore, value: &str) {
 }
 
 /// Re-render every row's context menu (so "Paste Mount Here" reads its fresh
-/// `disabled` value: every row's `TreeNodeData` carries that flag) on the
-/// next main-thread turn, not inside the menu item's own click. A row that
-/// re-renders while its menu is still open orphans the menu's portal, which
-/// then stays on screen for good (rinch #714); deferring lets the item close
-/// its menu first.
+/// `disabled` value: every row's `TreeNodeData` carries that flag) **after**
+/// the menu item's click has finished, never inside it.
+///
+/// A rinch `DropdownMenuItem` closes its menu by writing the `ContextMenu`'s
+/// `opened` signal *after* the item's own callback returns. That signal is
+/// owned by the row's render scope, and bumping the tree disposes every row —
+/// so a bump inside the callback frees the signal the close is about to write,
+/// the write is dropped ("Signal::set() on a freed signal"), and the menu's
+/// portal is left on screen with nothing alive to hide it. It is parented to
+/// the body rather than to the row, so disposing the row does not take it
+/// away either: the menu stays up for good.
+///
+/// `run_on_main_thread` does not help here — called from the main thread it
+/// runs the closure straight through, which is exactly the case this has to
+/// avoid. A zero-length timeout is a real turn of the loop on both targets:
+/// the click handler returns, the item writes `opened = false`, the portal
+/// hides, and only then does the tree rebuild.
 fn bump_tree_after_menu_closes(store: AppStore) {
-    run_on_main_thread(move || store.bump_tree_structure());
+    // Nothing cancels this; the tree must be rebuilt whatever happens next.
+    let _ = set_timeout(0, move || store.bump_tree_structure());
 }
 
 /// "Paste Mount Here": create a mount at the tree location identified by
@@ -1004,22 +1019,16 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 move || copy_as_mount_source(store, &nv)
             };
             // "Paste Mount Here" is always rendered, disabled while nothing is
-            // copied.
+            // copied, because a `DropdownMenuItem`'s `disabled` is a value
+            // snapshotted at render time rather than a reactive one.
+            // `copy_as_mount_source`/`paste_mount_here` bump the tree structure
+            // afterwards (see `bump_tree_after_menu_closes` for why that has to
+            // wait a turn), so every row's menu re-renders with a fresh value.
             //
-            // No menu item may sit inside a reactive `if` block (rinch #714).
-            // `ContextMenu` publishes its close signal through a thread-local
-            // that is set while its children render and cleared in its own
-            // `render`, and a `DropdownMenuItem` reads it once, there. An item
-            // inside a reactive `if` renders later, from an Effect, by which
-            // time the thread-local is empty: it captures no close signal, so
-            // clicking it runs the action and leaves the menu open for good.
-            // Every conditional item is therefore an embedded
-            // `Option<NodeHandle>` (`{ if cond { Some(rsx!{…}) } else { None } }`),
-            // which rsx evaluates inline with the other children rather than
-            // deferring, and every `disabled` value is a render-time snapshot.
-            // `copy_as_mount_source`/`paste_mount_here`
-            // bump the tree structure instead, so every row's menu re-renders
-            // with a fresh `disabled` value.
+            // An item may sit inside an `if` in rsx: `show_dom` renders the
+            // branch synchronously the first time, while `ContextMenu`'s close
+            // signal is still published, so the item closes the menu like any
+            // other. Verified on the desktop with the rinch debug tools.
             let no_mount_source = untracked(|| store.mount_source.get().is_none());
 
             // Mounts do not exist in an encrypted store: the server holds only
@@ -1976,6 +1985,97 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             }
         };
 
+        // ── "Mount Store..." picker ─────────────────────────────────────
+        // The desktop picks a directory on this machine. A browser has none to
+        // pick from: its stores live on the account, so it picks one of those.
+        // Either way the RPC is `createMount`, which an editor may call — the
+        // picker is a different way to name the same thing, not a lesser one.
+        let do_mount_store = move || {
+            let Some((target_store, target_parent)) = untracked(|| store.mount_picker_target.get())
+            else {
+                return;
+            };
+            let selected = untracked(|| store.mount_picker_selected.get());
+            let Ok(uuid) = selected.parse::<uuid::Uuid>() else {
+                store.mount_picker_error.set("Choose a store to mount.".to_string());
+                return;
+            };
+            let source_store_id = pimble_core::StoreId(uuid);
+            // A store's root is what gets mounted; the source keeps its own name.
+            let Some(source_root) = store.root_node_id(source_store_id) else {
+                store.mount_picker_error.set("That store has not finished opening.".to_string());
+                return;
+            };
+            let title = store
+                .get_store_signal(source_store_id)
+                .map(|sig| untracked(|| sig.with(|s| s.name.clone())));
+
+            store.mount_picker_error.set(String::new());
+            store.mount_picker_pending.set(true);
+            store.send(BackendCommand::CreateMount {
+                store_id: target_store,
+                parent_id: target_parent,
+                source_store_id,
+                source_node_id: source_root,
+                title,
+            });
+        };
+
+        let mount_picker_modal = rsx! {
+            Modal {
+                opened_fn: move || store.mount_picker_target.get().is_some(),
+                onclose: move || {
+                    store.mount_picker_target.set(None);
+                    store.mount_picker_error.set(String::new());
+                },
+                title: "Mount Store",
+                size: "sm",
+
+                div {
+                    style: "display: flex; flex-direction: column; gap: 10px;",
+
+                    Select {
+                        label: "Store",
+                        placeholder: "Choose a store",
+                        value_fn: move || store.mount_picker_selected.get(),
+                        onchange: move |val: String| store.mount_picker_selected.set(val),
+                        data: {|| {
+                            // Everything open except the one being mounted into:
+                            // a store cannot contain itself.
+                            let target = store.mount_picker_target.get().map(|(sid, _)| sid);
+                            store.store_ids.get().iter()
+                                .filter(|sid| Some(**sid) != target)
+                                .filter_map(|sid| {
+                                    store.get_store_signal(*sid)
+                                        .map(|sig| sig.with(|s| SelectOption::new(sid.to_string(), s.name.clone())))
+                                })
+                                .collect::<Vec<_>>()
+                        }},
+                    }
+
+                    div {
+                        style: {
+                            move || if store.mount_picker_error.get().is_empty() {
+                                "display: none;"
+                            } else {
+                                "color: var(--rinch-color-red-6); font-size: 12px;"
+                            }
+                        },
+                        {|| store.mount_picker_error.get()}
+                    }
+
+                    Button {
+                        variant: "filled",
+                        size: "sm",
+                        loading: {|| store.mount_picker_pending.get()},
+                        disabled: {|| store.mount_picker_pending.get() || store.mount_picker_selected.get().is_empty()},
+                        onclick: do_mount_store,
+                        "Mount"
+                    }
+                }
+            }
+        };
+
         let remove_replica_modal = rsx! {
             Modal {
                 opened_fn: move || store.remove_replica_modal_store.get().is_some(),
@@ -2209,6 +2309,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {link_modal}
                 {remove_replica_modal}
                 {new_store_modal}
+                {mount_picker_modal}
                 {appearance_modal}
                 {body}
             }
@@ -2227,6 +2328,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {link_modal}
                 {remove_replica_modal}
                 {new_store_modal}
+                {mount_picker_modal}
                 {appearance_modal}
                 {body}
             }

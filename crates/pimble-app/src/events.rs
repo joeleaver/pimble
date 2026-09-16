@@ -228,6 +228,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 } else if untracked(|| store.new_store_modal_pending.get()) {
                     store.new_store_modal_pending.set(false);
                     store.new_store_modal_error.set(message.clone());
+                } else if untracked(|| store.mount_picker_pending.get()) {
+                    store.mount_picker_pending.set(false);
+                    store.mount_picker_error.set(message.clone());
                 } else {
                     store.connection.set(ConnectionState::Error(message.clone()));
                     store.connection_status.set(format!("Error: {}", message));
@@ -555,6 +558,13 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // whose children were never loaded, which is exactly the case
                 // when a mount is created under a collapsed folder.
                 store.send(BackendCommand::GetChildren { store_id: *store_id, node_id: *parent_id });
+
+                // The "Mount Store..." picker's request just succeeded.
+                if untracked(|| store.mount_picker_target.get()).is_some() {
+                    store.mount_picker_pending.set(false);
+                    store.mount_picker_target.set(None);
+                    store.mount_picker_error.set(String::new());
+                }
 
                 // The second and last step of "Mount Remote Store Here..."
                 // just succeeded — close the connect modal and leave it in
