@@ -23,12 +23,12 @@ this, then `CLAUDE.md` ("Cloud, phase 1" and "Cloud, phase 2a"), then
   able to stop the service from serving (log and continue), and production holds rows of
   three generations (phase 1, phase 1b verification, phase 2a keys), so every row read must
   treat later fields as optional.
-- **Known live bug, fix in progress (agent C):** `GET /api/v1/kdf` (and login) answer 500
-  for a pre-encryption account, because its row has no key fields; every such account is a
-  PM test account. The fix reads the fields as optional, deletes keyless users at startup,
-  and answers the decoy/401 for any survivor. Deploy it next.
-- **Production test accounts** (all the PM's, delete when there is a way): the legacy
-  ones above plus `pm-live-2a@resend.dev` with the encrypted store "Live vault".
+- **Fixed and deployed 2026-09-16 03:09 UTC:** the accounts service reads rows of every
+  generation with later fields optional, its startup cleanup removed the seven keyless
+  accounts (logged), a cleanup error can no longer stop the service, and `kdf` answers the
+  decoy for an unknown or legacy address.
+- **Production test account** (the PM's, delete when there is a way): `pm-live-2a@resend.dev`
+  with the encrypted store "Live vault".
 - **Open decision (Joe):** the store display name is plaintext in the hosted manifest and
   the accounts service; encrypt it or list it as visible metadata.
 - **rinch is on branch `feat/web-menu-bar` (PR #791)** in both workspaces; move back to
@@ -134,7 +134,7 @@ after "Copy as Mount Source" again.
 
 ## Follow-ups, in rough priority
 
-0. **Deploy C's legacy-user fix**, then tag `v0.1.0` (the Windows job is unverified) and merge
+0. Tag `v0.1.0` (the Windows job is unverified) and merge
    `cloud/phase-1`. Then: the desktop sign-in UI (the RPCs and CLI exist: `cloudSignIn`,
    `cloudHostStore`, `cloudAddHostedStore`; the app needs an Account menu, "Host on Pimble
    Cloud...", "Add hosted store...", an "encrypted" badge from `sync_mode`); encrypt the
