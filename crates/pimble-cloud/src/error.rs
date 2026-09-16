@@ -41,9 +41,11 @@ pub enum CloudError {
     /// 429 — a caller (identified by session) is calling a rate-limited
     /// endpoint too fast (Phase 2a: `GET /users/lookup`).
     RateLimited(String),
-    /// 501 — a real endpoint that intentionally does nothing yet
-    /// (Phase 2a: `POST /recover`).
-    NotImplemented,
+    /// 404 — an account-recovery token (`GET`/`POST /recover/{token}...`)
+    /// that's unknown, expired, or already consumed (Phase 2a-2). One code
+    /// for all three, matching docs/CRYPTO_CONTRACT.md's "Unknown or
+    /// expired: 404 `{ error: "recovery_invalid" }`" literally.
+    RecoveryInvalid,
 }
 
 impl CloudError {
@@ -62,7 +64,7 @@ impl CloudError {
                 "We couldn't send the verification email. Try again in a minute with \"Send it again\".",
             ),
             CloudError::RateLimited(m) => (StatusCode::TOO_MANY_REQUESTS, "rate_limited", m.as_str()),
-            CloudError::NotImplemented => (StatusCode::NOT_IMPLEMENTED, "not_implemented", "Account recovery is not available yet."),
+            CloudError::RecoveryInvalid => (StatusCode::NOT_FOUND, "recovery_invalid", "This recovery link is invalid or has expired."),
         }
     }
 }

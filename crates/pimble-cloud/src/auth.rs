@@ -50,6 +50,7 @@ pub fn verify_password_constant_time(password: &str, stored: Option<&str>) -> bo
 
 const SESSION_TOKEN_BYTES: usize = 32;
 const VERIFY_TOKEN_BYTES: usize = 32;
+const RECOVERY_TOKEN_BYTES: usize = 32;
 
 /// A fresh opaque session token (returned to the client) and its hash (what
 /// the `Session` row actually stores — docs/CLOUD_CONTRACT.md: "sessions of
@@ -78,6 +79,22 @@ pub fn new_verify_token() -> (String, String) {
 }
 
 pub fn hash_verify_token(token: &str) -> String {
+    sha256_hex(token)
+}
+
+/// A fresh opaque account-recovery token (embedded in the
+/// `/app/recover?token=` link) and its hash (what `User::recovery_token_hash`
+/// stores — docs/CRYPTO_CONTRACT.md "Phase 2a-2": "32 random bytes, stored
+/// hashed, 1 hour, one use").
+pub fn new_recovery_token() -> (String, String) {
+    let mut bytes = [0u8; RECOVERY_TOKEN_BYTES];
+    rand::rng().fill_bytes(&mut bytes);
+    let token = hex::encode(bytes);
+    let hash = hash_recovery_token(&token);
+    (token, hash)
+}
+
+pub fn hash_recovery_token(token: &str) -> String {
     sha256_hex(token)
 }
 

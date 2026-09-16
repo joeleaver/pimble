@@ -23,7 +23,7 @@ use base64::Engine;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde_json::{json, Value};
 
-use pimble_crypto::{AccountKeys, KdfParams};
+use pimble_crypto::{AccountKeyBlob, AccountKeys, KdfParams};
 
 const SCHEMA: &str = include_str!("../schema.rhype");
 
@@ -408,9 +408,12 @@ macro_rules! skip_without_rhypedb {
 /// derived login"): derive `auth_key`/`kek` from `password`, generate a
 /// fresh account keypair, wrap it under the password KEK and under a fresh
 /// recovery code's KEK. Returns the JSON body (so a test can inspect what
-/// was sent, e.g. the public keys) and the plaintext `AccountKeys` (so a
-/// test can later unwrap a returned blob or sign an envelope as this user).
-fn build_signup_body(email: &str, password: &str) -> (Value, AccountKeys) {
+/// was sent, e.g. the public keys), the plaintext `AccountKeys` (so a test
+/// can later unwrap a returned blob or sign an envelope as this user), and
+/// the plaintext recovery code (so a recovery-flow test can derive the same
+/// recovery KEK a real client would from the salt `GET /recover/{token}`
+/// serves).
+fn build_signup_body(email: &str, password: &str) -> (Value, AccountKeys, String) {
     let kdf = KdfParams::generate();
     let password_keys = pimble_crypto::derive_password_keys(password, &kdf).expect("derive_password_keys");
     let auth_key = pimble_crypto::encode_auth_key(&password_keys.auth_key);
@@ -434,7 +437,7 @@ fn build_signup_body(email: &str, password: &str) -> (Value, AccountKeys) {
         "recovery_salt": recovery_salt,
         "recovery_key_blob": recovery_key_blob,
     });
-    (body, account_keys)
+    (body, account_keys, recovery_code)
 }
 
 /// `GET /api/v1/kdf?email=` — real params for a known email, a
@@ -451,7 +454,7 @@ async fn fetch_kdf(stack: &Stack, email: &str) -> KdfParams {
 /// account keys generated for it — use [`signup`] when the keys aren't
 /// needed.
 async fn signup_with_material(stack: &Stack, email: &str, password: &str) -> (Value, AccountKeys) {
-    let (request_body, account_keys) = build_signup_body(email, password);
+    let (request_body, account_keys, _recovery_code) = build_signup_body(email, password);
     let resp = stack.http.post(format!("{}/signup", stack.base_url)).json(&request_body).send().await.unwrap();
     assert_eq!(resp.status(), 202, "signup for {email} should be accepted (verification pending)");
     (resp.json().await.unwrap(), account_keys)
@@ -522,6 +525,82 @@ async fn verify_then_login(stack: &Stack, email: &str, password: &str) -> (Value
 async fn signup_verify_login(stack: &Stack, email: &str, password: &str) -> (Value, String) {
     signup(stack, email, password).await;
     verify_then_login(stack, email, password).await
+}
+
+// ── Recovery test helpers (docs/CRYPTO_CONTRACT.md "Phase 2a-2") ─────────
+
+/// Like [`signup_with_material`], but also returns the plaintext recovery
+/// code — needed to derive the recovery KEK in a recovery-flow test the
+/// same way a real client does from the salt `GET /recover/{token}` serves.
+async fn signup_with_material_and_recovery_code(stack: &Stack, email: &str, password: &str) -> (Value, AccountKeys, String) {
+    let (request_body, account_keys, recovery_code) = build_signup_body(email, password);
+    let resp = stack.http.post(format!("{}/signup", stack.base_url)).json(&request_body).send().await.unwrap();
+    assert_eq!(resp.status(), 202, "signup for {email} should be accepted (verification pending)");
+    (resp.json().await.unwrap(), account_keys, recovery_code)
+}
+
+/// Pulls the recovery token last sent (via `LogMailer`) to `email` — same
+/// mechanism as `extract_verify_token`, but the link is
+/// `/app/recover?token=...`.
+fn extract_recovery_token(stack: &Stack, email: &str) -> String {
+    let log_mailer = stack.app_state.mailer.as_log_mailer().expect("test stack must run with LogMailer (no RESEND_API_KEY)");
+    let body = log_mailer.last_message(email).unwrap_or_else(|| panic!("no recovery email was sent to {email}"));
+    let link = pimble_cloud::mail::first_url(&body).unwrap_or_else(|| panic!("recovery email body had no link:\n{body}"));
+    link.rsplit("token=").next().unwrap().to_string()
+}
+
+/// `GET /api/v1/recover/{token}`, then derives the recovery KEK from
+/// `recovery_code` and the served salt/costs and unwraps the account keys —
+/// exactly what `/app/recover` does client-side. Returns the raw response
+/// body too, for a test that wants to inspect it further.
+async fn fetch_and_unwrap_recovery_material(stack: &Stack, token: &str, recovery_code: &str) -> (Value, AccountKeys) {
+    let resp = stack.http.get(format!("{}/recover/{token}", stack.base_url)).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "GET /recover/{{token}} should succeed for a fresh, unconsumed token");
+    let body: Value = resp.json().await.unwrap();
+    let recovery_key_blob: AccountKeyBlob = serde_json::from_value(body["recovery_key_blob"].clone()).unwrap();
+    let recovery_params = KdfParams {
+        salt: body["recovery_salt"].as_str().unwrap().to_string(),
+        m_cost: body["recovery_kdf"]["m_cost"].as_u64().unwrap() as u32,
+        t_cost: body["recovery_kdf"]["t_cost"].as_u64().unwrap() as u32,
+        p_cost: body["recovery_kdf"]["p_cost"].as_u64().unwrap() as u32,
+    };
+    let recovery_kek = pimble_crypto::derive_recovery_kek(recovery_code, &recovery_params).expect("derive_recovery_kek");
+    let unwrapped = pimble_crypto::unwrap_account_keys(&recovery_key_blob, &recovery_kek).expect("unwrap_account_keys");
+    (body, unwrapped)
+}
+
+/// Derives brand new password material and a brand new recovery code for
+/// `account_keys` (what `unwrap_account_keys` just produced) — a client
+/// always rotates the code on recovery — then `POST`s
+/// `/recover/{token}/complete`. Returns the response body.
+async fn complete_recovery_with_new_material(stack: &Stack, token: &str, account_keys: &AccountKeys, new_password: &str) -> Value {
+    let new_kdf = KdfParams::generate();
+    let new_password_keys = pimble_crypto::derive_password_keys(new_password, &new_kdf).expect("derive_password_keys");
+    let new_auth_key = pimble_crypto::encode_auth_key(&new_password_keys.auth_key);
+    let new_account_key_blob = pimble_crypto::wrap_account_keys(account_keys, &new_password_keys.kek).expect("wrap_account_keys");
+
+    let new_recovery_salt = KdfParams::generate().salt;
+    let new_recovery_code = pimble_crypto::generate_recovery_code();
+    let new_recovery_params =
+        KdfParams { salt: new_recovery_salt.clone(), m_cost: new_kdf.m_cost, t_cost: new_kdf.t_cost, p_cost: new_kdf.p_cost };
+    let new_recovery_kek = pimble_crypto::derive_recovery_kek(&new_recovery_code, &new_recovery_params).expect("derive_recovery_kek");
+    let new_recovery_key_blob = pimble_crypto::wrap_account_keys(account_keys, &new_recovery_kek).expect("wrap recovery blob");
+
+    let resp = stack
+        .http
+        .post(format!("{}/recover/{token}/complete", stack.base_url))
+        .json(&json!({
+            "auth_key": new_auth_key,
+            "kdf": new_kdf,
+            "account_key_blob": new_account_key_blob,
+            "recovery_salt": new_recovery_salt,
+            "recovery_key_blob": new_recovery_key_blob,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "recover complete should succeed");
+    resp.json().await.unwrap()
 }
 
 // ── Accounts: signup / login / logout / me ────────────────────────────────
@@ -603,19 +682,19 @@ async fn duplicate_email_is_409_once_verified_but_202_while_unverified() {
 
     // Still unverified: a duplicate signup just re-sends the link — 202,
     // no enumeration (docs/CLOUD_CONTRACT.md "Phase 1b").
-    let (second_body, _) = build_signup_body("dupe@example.com", "second password!");
+    let (second_body, _, _) = build_signup_body("dupe@example.com", "second password!");
     let resp = stack.http.post(format!("{}/signup", stack.base_url)).json(&second_body).send().await.unwrap();
     assert_eq!(resp.status(), 202);
 
     // Verify (with the ORIGINAL password — a re-send never changes it), then
     // a duplicate signup is a real 409.
     verify_then_login(&stack, "dupe@example.com", "first password!").await;
-    let (third_body, _) = build_signup_body("dupe@example.com", "third password!");
+    let (third_body, _, _) = build_signup_body("dupe@example.com", "third password!");
     let resp = stack.http.post(format!("{}/signup", stack.base_url)).json(&third_body).send().await.unwrap();
     assert_eq!(resp.status(), 409);
 
     // Case-insensitivity: the same address differently-cased also conflicts.
-    let (fourth_body, _) = build_signup_body("DUPE@example.com", "fourth password!");
+    let (fourth_body, _, _) = build_signup_body("DUPE@example.com", "fourth password!");
     let resp = stack.http.post(format!("{}/signup", stack.base_url)).json(&fourth_body).send().await.unwrap();
     assert_eq!(resp.status(), 409);
 }
@@ -682,7 +761,7 @@ async fn second_signup_for_unverified_address_resends_and_invalidates_the_old_to
     signup(&stack, email, "judy's real password!!").await;
     let old_token = extract_verify_token(&stack, email);
 
-    let (resend_body, _) = build_signup_body(email, "ignored on a resend");
+    let (resend_body, _, _) = build_signup_body(email, "ignored on a resend");
     let resp = stack.http.post(format!("{}/signup", stack.base_url)).json(&resend_body).send().await.unwrap();
     assert_eq!(resp.status(), 202);
     let new_token = extract_verify_token(&stack, email);
@@ -1134,7 +1213,7 @@ async fn signup_maps_a_mail_failure_to_502_without_leaking_the_provider_response
             return;
         }
     };
-    let (signup_body, _) = build_signup_body("bounces@example.com", "whatever password");
+    let (signup_body, _, _) = build_signup_body("bounces@example.com", "whatever password");
     let resp = stack.http.post(format!("{}/signup", stack.base_url)).json(&signup_body).send().await.unwrap();
     assert_eq!(resp.status(), 502);
     assert_mail_failed_response(&resp.json().await.unwrap());
@@ -1271,7 +1350,7 @@ async fn me_keys_round_trips_through_real_crypto_and_never_returns_recovery() {
     // hands back the 202 response — the `{status, email}` body, not the
     // request) so this test can compare against the public keys actually
     // sent at signup.
-    let (request_body, account_keys) = build_signup_body(email, password);
+    let (request_body, account_keys, _recovery_code) = build_signup_body(email, password);
     let resp = stack.http.post(format!("{}/signup", stack.base_url)).json(&request_body).send().await.unwrap();
     assert_eq!(resp.status(), 202);
     let (_login_body, cookie) = verify_then_login(&stack, email, password).await;
@@ -1381,21 +1460,6 @@ async fn users_lookup_is_rate_limited_per_caller() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 429);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn recover_is_not_implemented() {
-    let stack = skip_without_rhypedb!();
-    let resp = stack
-        .http
-        .post(format!("{}/recover", stack.base_url))
-        .json(&json!({ "email": "someone@example.com", "recovery_code_auth": "whatever" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 501);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["error"], "not_implemented");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1606,4 +1670,278 @@ async fn store_keys_ownership_rules() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 403);
+}
+
+// ── Phase 2a-2: account recovery, password change, new recovery code ─────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recover_full_flow_rotates_keys_with_real_crypto_and_invalidates_old_password() {
+    let stack = skip_without_rhypedb!();
+    let email = "recoverable@example.com";
+    let old_password = "old password for recovery!!";
+    let (_signup_body, old_account_keys, recovery_code) = signup_with_material_and_recovery_code(&stack, email, old_password).await;
+    let (_login_body, cookie) = verify_then_login(&stack, email, old_password).await;
+
+    // A real hosted store + key envelope, so "store keys still unwrap"
+    // (docs/CRYPTO_CONTRACT.md) is checked against real crypto, not assumed.
+    let store: Value = stack
+        .http
+        .post(format!("{}/stores", stack.base_url))
+        .header("Cookie", &cookie)
+        .json(&json!({ "name": "Recoverable Store", "kind": "vault" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+    let me: Value = stack.http.get(format!("{}/me", stack.base_url)).header("Cookie", &cookie).send().await.unwrap().json().await.unwrap();
+    let user_id = me["id"].as_str().unwrap().to_string();
+    let old_public_keys = old_account_keys.public_keys();
+    let store_key = pimble_crypto::SymmetricKey::generate();
+    let key_id = uuid::Uuid::new_v4();
+    let envelope = wrap_store_key(&store_key, key_id, &store_id, &old_account_keys, &old_public_keys);
+    let resp = stack
+        .http
+        .put(format!("{}/stores/{store_id}/keys", stack.base_url))
+        .header("Cookie", &cookie)
+        .json(&json!({ "envelopes": [ { "user_id": user_id, "key_id": key_id.to_string(), "envelope": envelope } ] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = stack.http.post(format!("{}/recover/start", stack.base_url)).json(&json!({ "email": email })).send().await.unwrap();
+    assert_eq!(resp.status(), 202);
+    let token = extract_recovery_token(&stack, email);
+
+    let (recover_body, unwrapped_keys) = fetch_and_unwrap_recovery_material(&stack, &token, &recovery_code).await;
+    assert_eq!(recover_body["email"], email);
+    assert_eq!(unwrapped_keys.encryption_secret, old_account_keys.encryption_secret);
+    assert_eq!(unwrapped_keys.signing_secret, old_account_keys.signing_secret);
+
+    let new_password = "new password after recovery!!";
+    let complete_body = complete_recovery_with_new_material(&stack, &token, &unwrapped_keys, new_password).await;
+    assert_eq!(complete_body["user"]["email"], email);
+
+    // The old password no longer works...
+    let old_kdf = fetch_kdf(&stack, email).await;
+    let old_style_auth_key = pimble_crypto::encode_auth_key(&pimble_crypto::derive_password_keys(old_password, &old_kdf).unwrap().auth_key);
+    let resp =
+        stack.http.post(format!("{}/login", stack.base_url)).json(&json!({ "email": email, "auth_key": old_style_auth_key })).send().await.unwrap();
+    assert_eq!(resp.status(), 401, "the old password must no longer work after recovery");
+
+    // ...the new one does.
+    let (_new_login_body, new_cookie) = login(&stack, email, new_password).await;
+
+    // The session active before recovery is gone.
+    let resp = stack.http.get(format!("{}/me", stack.base_url)).header("Cookie", &cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 401, "the session active before recovery must be gone");
+
+    // Store keys still unwrap (public keys never changed).
+    let resp = stack.http.get(format!("{}/stores/{store_id}/keys", stack.base_url)).header("Cookie", &new_cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let keys_body: Value = resp.json().await.unwrap();
+    let returned_envelope: pimble_crypto::KeyEnvelope = serde_json::from_value(keys_body["envelopes"][0]["envelope"].clone()).unwrap();
+    let unwrapped_store_key = pimble_crypto::unwrap_key(&returned_envelope, &unwrapped_keys, &old_public_keys.signing).unwrap();
+    assert_eq!(unwrapped_store_key.0, store_key.0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recover_expired_token_is_invalid() {
+    let stack = skip_without_rhypedb!();
+    let email = "recover-expired@example.com";
+    let password = "expiring password!!";
+    signup_verify_login(&stack, email, password).await;
+
+    let resp = stack.http.post(format!("{}/recover/start", stack.base_url)).json(&json!({ "email": email })).send().await.unwrap();
+    assert_eq!(resp.status(), 202);
+    let token = extract_recovery_token(&stack, email);
+
+    // Force the already-issued token into the past (no way to wait out the
+    // real 1h TTL in a test) by re-setting the SAME hash with an expired
+    // timestamp, reaching the DB directly through `stack.app_state`.
+    let user = stack.app_state.db.find_user_by_email(email).await.unwrap().unwrap();
+    let past_ms = chrono::Utc::now().timestamp_millis() - 1_000;
+    stack.app_state.db.set_recovery_token(user.rid, &pimble_cloud::auth::hash_recovery_token(&token), past_ms).await.unwrap();
+
+    let resp = stack.http.get(format!("{}/recover/{token}", stack.base_url)).send().await.unwrap();
+    assert_eq!(resp.status(), 404);
+    assert_eq!(resp.json::<Value>().await.unwrap()["error"], "recovery_invalid");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recover_token_cannot_be_reused_after_complete() {
+    let stack = skip_without_rhypedb!();
+    let email = "recover-reuse@example.com";
+    let password = "reuse password!!";
+    let (_body, _account_keys, recovery_code) = signup_with_material_and_recovery_code(&stack, email, password).await;
+    verify_then_login(&stack, email, password).await;
+
+    let resp = stack.http.post(format!("{}/recover/start", stack.base_url)).json(&json!({ "email": email })).send().await.unwrap();
+    assert_eq!(resp.status(), 202);
+    let token = extract_recovery_token(&stack, email);
+    let (_recover_body, unwrapped_keys) = fetch_and_unwrap_recovery_material(&stack, &token, &recovery_code).await;
+    complete_recovery_with_new_material(&stack, &token, &unwrapped_keys, "post-recovery password!!").await;
+
+    // The same token must not verify, or complete, a second time.
+    let resp = stack.http.get(format!("{}/recover/{token}", stack.base_url)).send().await.unwrap();
+    assert_eq!(resp.status(), 404, "a consumed token must not verify again");
+
+    let junk_blob = pimble_crypto::AccountKeyBlob { v: 1, nonce: "x".to_string(), ciphertext: "y".to_string() };
+    let resp = stack
+        .http
+        .post(format!("{}/recover/{token}/complete", stack.base_url))
+        .json(&json!({
+            "auth_key": "irrelevant",
+            "kdf": pimble_crypto::KdfParams::generate(),
+            "account_key_blob": junk_blob.clone(),
+            "recovery_salt": "z",
+            "recovery_key_blob": junk_blob,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "a consumed token must not be completable again");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_password_refuses_wrong_current_key_and_accepts_right_one() {
+    let stack = skip_without_rhypedb!();
+    let email = "change-pw@example.com";
+    let old_password = "original password!!";
+    let (_body, account_keys) = signup_with_material(&stack, email, old_password).await;
+    let (_login_body, cookie) = verify_then_login(&stack, email, old_password).await;
+
+    let new_kdf = KdfParams::generate();
+    let new_password = "changed password!!";
+    let new_password_keys = pimble_crypto::derive_password_keys(new_password, &new_kdf).unwrap();
+    let new_auth_key = pimble_crypto::encode_auth_key(&new_password_keys.auth_key);
+    let new_account_key_blob = pimble_crypto::wrap_account_keys(&account_keys, &new_password_keys.kek).unwrap();
+
+    // A wrong current_auth_key is refused.
+    let resp = stack
+        .http
+        .post(format!("{}/me/password", stack.base_url))
+        .header("Cookie", &cookie)
+        .json(&json!({
+            "current_auth_key": "not the real current key",
+            "auth_key": new_auth_key,
+            "kdf": new_kdf,
+            "account_key_blob": new_account_key_blob,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // The right one succeeds.
+    let old_kdf = fetch_kdf(&stack, email).await;
+    let current_auth_key = pimble_crypto::encode_auth_key(&pimble_crypto::derive_password_keys(old_password, &old_kdf).unwrap().auth_key);
+    let resp = stack
+        .http
+        .post(format!("{}/me/password", stack.base_url))
+        .header("Cookie", &cookie)
+        .json(&json!({
+            "current_auth_key": current_auth_key,
+            "auth_key": new_auth_key,
+            "kdf": new_kdf,
+            "account_key_blob": new_account_key_blob,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The session used to change it is kept (docs/CRYPTO_CONTRACT.md:
+    // "keeps other sessions").
+    let resp = stack.http.get(format!("{}/me", stack.base_url)).header("Cookie", &cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The old password no longer works; the new one does.
+    let resp =
+        stack.http.post(format!("{}/login", stack.base_url)).json(&json!({ "email": email, "auth_key": current_auth_key })).send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+    login(&stack, email, new_password).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_recovery_code_replaces_material_for_future_recovery() {
+    let stack = skip_without_rhypedb!();
+    let email = "change-recovery@example.com";
+    let password = "recovery code owner password!!";
+    let (_body, account_keys) = signup_with_material(&stack, email, password).await;
+    let (_login_body, cookie) = verify_then_login(&stack, email, password).await;
+
+    let new_recovery_salt = KdfParams::generate().salt;
+    let new_recovery_code = pimble_crypto::generate_recovery_code();
+    let new_recovery_params = KdfParams {
+        salt: new_recovery_salt.clone(),
+        m_cost: pimble_crypto::KDF_M_COST_KIB,
+        t_cost: pimble_crypto::KDF_T_COST,
+        p_cost: pimble_crypto::KDF_P_COST,
+    };
+    let new_recovery_kek = pimble_crypto::derive_recovery_kek(&new_recovery_code, &new_recovery_params).unwrap();
+    let new_recovery_key_blob = pimble_crypto::wrap_account_keys(&account_keys, &new_recovery_kek).unwrap();
+
+    let resp = stack
+        .http
+        .post(format!("{}/me/recovery-code", stack.base_url))
+        .header("Cookie", &cookie)
+        .json(&json!({ "recovery_salt": new_recovery_salt, "recovery_key_blob": new_recovery_key_blob }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The new code really recovers the account now.
+    let resp = stack.http.post(format!("{}/recover/start", stack.base_url)).json(&json!({ "email": email })).send().await.unwrap();
+    assert_eq!(resp.status(), 202);
+    let token = extract_recovery_token(&stack, email);
+    let (_recover_body, unwrapped_keys) = fetch_and_unwrap_recovery_material(&stack, &token, &new_recovery_code).await;
+    assert_eq!(unwrapped_keys.encryption_secret, account_keys.encryption_secret);
+    assert_eq!(unwrapped_keys.signing_secret, account_keys.signing_secret);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recover_delete_account_removes_everything_and_deletes_solely_owned_stores() {
+    let stack = skip_without_rhypedb!();
+    let email = "delete-me@example.com";
+    let password = "delete me password!!";
+    signup_verify_login(&stack, email, password).await;
+    let (_login_body, cookie) = login(&stack, email, password).await;
+
+    let store: Value = stack
+        .http
+        .post(format!("{}/stores", stack.base_url))
+        .header("Cookie", &cookie)
+        .json(&json!({ "name": "Solely Owned" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+
+    let resp = stack.http.post(format!("{}/recover/start", stack.base_url)).json(&json!({ "email": email })).send().await.unwrap();
+    assert_eq!(resp.status(), 202);
+    let token = extract_recovery_token(&stack, email);
+
+    let resp = stack.http.post(format!("{}/recover/{token}/delete-account", stack.base_url)).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The account is gone: login fails like any unknown address, and the
+    // store it solely owned is marked deleted (checked directly since no
+    // session can reach it once the account is gone).
+    let resp = stack.http.post(format!("{}/login", stack.base_url)).json(&json!({ "email": email, "auth_key": "anything" })).send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+    assert!(stack.app_state.db.find_user_by_email(email).await.unwrap().is_none());
+    let hosted = stack.app_state.db.find_hosted_store(&store_id).await.unwrap().unwrap();
+    assert!(hosted.deleted, "a solely-owned store must be marked deleted when its owner's account is deleted");
+
+    // The token itself is dead too (its user row is gone).
+    let resp = stack.http.get(format!("{}/recover/{token}", stack.base_url)).send().await.unwrap();
+    assert_eq!(resp.status(), 404);
 }

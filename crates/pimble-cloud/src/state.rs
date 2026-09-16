@@ -12,6 +12,14 @@ use crate::releases::ReleasesCache;
 /// One send per address per minute (docs/CLOUD_CONTRACT.md, "Phase 1b":
 /// `POST /resend-verification`'s rate limit).
 const RESEND_VERIFICATION_INTERVAL: Duration = Duration::from_secs(60);
+/// `POST /recover/start`'s rate limit (docs/CRYPTO_CONTRACT.md "Phase
+/// 2a-2": "the same one-per-minute limit as verification") — read as "the
+/// same shape of limit" (a separate limiter with the same interval), not
+/// literally `resend_rate_limit`: a fresh signup's own verification send
+/// already records against that bucket, which would otherwise leave
+/// `/recover/start` for the same brand-new address rate-limited for the
+/// next minute before anyone ever asked it to send anything.
+const RECOVERY_START_INTERVAL: Duration = Duration::from_secs(60);
 /// `GET /api/v1/users/lookup` isn't given a specific number by
 /// docs/CRYPTO_CONTRACT.md ("rate limited"), only that it must be — chosen
 /// to allow ordinary UI use (typing an email into a share dialog) while
@@ -30,6 +38,7 @@ pub struct Inner {
     pub releases: ReleasesCache,
     pub mailer: Arc<dyn Mailer>,
     pub resend_rate_limit: RateLimiter,
+    pub recovery_rate_limit: RateLimiter,
     pub users_lookup_rate_limit: RateLimiter,
     /// `GET /kdf`'s decoy-salt HMAC key (docs/CRYPTO_CONTRACT.md), resolved
     /// once at startup from `config.kdf_decoy_secret` — see
@@ -78,6 +87,7 @@ impl AppState {
             releases,
             mailer,
             resend_rate_limit: RateLimiter::new(RESEND_VERIFICATION_INTERVAL),
+            recovery_rate_limit: RateLimiter::new(RECOVERY_START_INTERVAL),
             users_lookup_rate_limit: RateLimiter::new(USERS_LOOKUP_INTERVAL),
             kdf_decoy_secret,
         }))

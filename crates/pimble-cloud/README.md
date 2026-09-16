@@ -122,17 +122,73 @@ key. A real client (the web app, or the desktop app signing in) uses
    owner may set someone else's; every envelope's Ed25519 signature is
    verified against the *caller's* `public_signing_key` (whoever is doing the
    `PUT` must be the one who signed it) before it's stored.
-9. **`POST /api/v1/recover { email, recovery_code_auth }`** is `501` — Phase
-   2a only stores the recovery blob at signup; using it to actually recover
-   is a later phase.
+Account recovery (`POST /recover`, `501` in the first cut of this phase) is
+now real — see "Account recovery, password change, new recovery code"
+below.
 
-**Migration**: `User` gained nine required fields (`kdf_*`,
-`public_*_key`, `account_key_blob`, `recovery_salt`, `recovery_key_blob`) with
-no default — a pre-Phase-2a row (the two keyless smoke accounts from
-initial testing) cannot satisfy the new schema and is orphaned by this
-change. They were never real accounts; deleting them (or leaving them
-orphaned — nothing reads a `User` row that doesn't have this crate's full
-current field set) is the intended cleanup, not a bug.
+**Migration and legacy rows — read every new field as optional.** This
+service has now shipped three schema generations (Phase 1's four fields;
+Phase 1b's `verified`/`verify_token_hash`/`verify_expires_at`; Phase 2a's
+nine key-material fields; Phase 2a-2's `recovery_token_hash`/
+`recovery_token_expires_at`), and RhypeDB never backfills a field onto a row
+that predates it — the field is simply absent from that row, forever, until
+something writes it. A production database accumulates rows from every
+generation. `db.rs`'s `user_from_object` reads **every** field added after
+the original four (`get_string_opt`/`get_bool_opt`/`get_u32_opt`/
+`get_datetime_ms_opt`) with a safe default on absence — `false`/`""`/`0`,
+never an error — precisely because a live crash-loop
+(`Error: 500 ... User.verified: expected a Bool, got None`, hit in
+production after the Phase 2a-2 deploy) came from treating one of these as
+required. The rule going forward: **a new `User` field is always read
+optional**, and the startup cleanup (below) never deserializes a row through
+`user_from_object` at all, so a future field doesn't risk a repeat.
+`kdf_salt`'s absence is what marks a row keyless (`has_key_material`); the
+two pre-Phase-2a smoke accounts and any phase-1-shape row are deleted by
+this at every startup.
+
+## Account recovery, password change, new recovery code (Phase 2a-2)
+
+The server holds neither the password KEK nor the recovery KEK, so recovery
+can only ever replace what the recovery code unwraps client-side — the
+account keys themselves never change, only what they're wrapped under.
+Every one of these is 202-or-404-always, never a different code for a real
+versus an unfamiliar account:
+
+1. **`POST /api/v1/recover/start { email }`** — 202 always. For a real,
+   verified account with key material, mails
+   `<PIMBLE_CLOUD_PUBLIC_URL>/app/recover?token=...` (32 random bytes,
+   stored hashed, 1 hour, one use) through the same `Mailer` `start_verification`
+   uses, rate-limited to once a minute per address by its own limiter
+   (`recovery_rate_limit` — a separate instance from `resend_rate_limit`,
+   not shared: sharing it would leave a brand-new signup's address
+   rate-limited here for a minute purely because signup itself just sent a
+   verification email).
+2. **`GET /api/v1/recover/{token}`** — auth is holding the token, nothing
+   else. `{ email, recovery_salt, recovery_kdf: { m_cost, t_cost, p_cost },
+   recovery_key_blob, public_keys }`; unknown, expired, or already-consumed
+   is `404 { "error": "recovery_invalid" }` (one code for all three).
+   `recovery_kdf` is always the fixed `pimble_crypto` constants — there's no
+   per-user stored cost for recovery, only a salt.
+3. **`POST /api/v1/recover/{token}/complete { auth_key, kdf, account_key_blob,
+   recovery_salt, recovery_key_blob }`** — auth is the token. The client
+   rotates *both* the password material and the recovery code in the same
+   call (a fresh recovery code every time one gets used, so an old emailed
+   link is never a standing risk); replaces both, consumes the token,
+   deletes every session, answers `{ user }`, starts no new session. Public
+   keys never change, so every store key envelope already wrapped to this
+   account stays valid without re-sharing anything.
+4. **`POST /api/v1/me/password { current_auth_key, auth_key, kdf,
+   account_key_blob }`** (session) — verifies `current_auth_key` like login,
+   replaces the password material, keeps every other session.
+5. **`POST /api/v1/me/recovery-code { recovery_salt, recovery_key_blob }`**
+   (session) — replaces the recovery material with a new code the client
+   generated while already holding the keys.
+6. **`POST /api/v1/recover/{token}/delete-account`** — auth is the token,
+   for someone who no longer has the code. Deletes the user, its sessions,
+   grants and key grants; a store it solely owned is marked `deleted` (the
+   same soft-delete `DELETE /stores/{id}` uses) since nobody else could ever
+   manage it once the account is gone — wiping the underlying vault data is
+   a later phase.
 
 ## Email verification
 
@@ -248,6 +304,22 @@ curl -sb cookies.txt -X PUT http://127.0.0.1:8080/api/v1/stores/<store-id>/keys 
   -H 'Content-Type: application/json' \
   -d '{"envelopes": [{"user_id": "<my user id>", "key_id": "<uuid>", "envelope": { "...": "a pimble_crypto::KeyEnvelope" }}]}'
 
+# Recovery: start (202 always), fetch what the token names, then complete
+# with rotated material (both blobs come from pimble_crypto, same as signup)
+curl -s -X POST http://127.0.0.1:8080/api/v1/recover/start -H 'Content-Type: application/json' -d '{"email": "alice@example.com"}'
+curl -s http://127.0.0.1:8080/api/v1/recover/<token>
+curl -si -X POST http://127.0.0.1:8080/api/v1/recover/<token>/complete \
+  -H 'Content-Type: application/json' \
+  -d '{"auth_key": "<new>", "kdf": {"...": "new KdfParams"}, "account_key_blob": {"...": "rewrapped"}, "recovery_salt": "<new>", "recovery_key_blob": {"...": "rewrapped under a new code"}}'
+# ...or, without the code at all:
+curl -s -X POST http://127.0.0.1:8080/api/v1/recover/<token>/delete-account
+
+# Change password (session) / generate a new recovery code (session)
+curl -sb cookies.txt -X POST http://127.0.0.1:8080/api/v1/me/password \
+  -H 'Content-Type: application/json' -d '{"current_auth_key": "<old>", "auth_key": "<new>", "kdf": {"...": "new KdfParams"}, "account_key_blob": {"...": "rewrapped"}}'
+curl -sb cookies.txt -X POST http://127.0.0.1:8080/api/v1/me/recovery-code \
+  -H 'Content-Type: application/json' -d '{"recovery_salt": "<new>", "recovery_key_blob": {"...": "rewrapped under the new code"}}'
+
 # Mint a fresh JWT for the Pimble server (Authorization: Bearer <session> works in
 # place of the cookie, too — this is what a non-browser caller uses)
 curl -sb cookies.txt -X POST http://127.0.0.1:8080/api/v1/token
@@ -357,19 +429,26 @@ elsewhere) so the `/releases` tests never touch the network.
   `PimbleClient::create_store` grows `kind`/`store_id` parameters, `pimble.rs`
   should switch back to it and this crate can drop its own `pimble-rpc`/
   `jsonrpsee` dependencies.
-- **Envelope signature verification (`src/envelope.rs`) reimplements
-  `pimble-crypto`'s private `envelope_signing_bytes`** rather than calling
-  `pimble_crypto::unwrap_key`: that function needs the *recipient's* private
-  `AccountKeys` to unwrap the key afterwards, which the server never has,
-  and the signing-bytes helper itself isn't `pub`. The exact layout (`v ||
-  key_id || recipient || ephemeral || nonce || ciphertext || context`, with
-  `recipient`/`ephemeral`/`nonce`/`ciphertext` as their **decoded raw
-  bytes**, not the base64url string) was confirmed by reading
-  `wrap_key`/`unwrap_key` in `pimble-crypto/src/lib.rs` directly, not
-  guessed from the `KeyEnvelope` doc comment alone — the doc comment doesn't
-  say whether those fields are raw or encoded, and getting it wrong would
-  make every real envelope fail verification here. If `pimble-crypto` ever
-  exports that helper, `src/envelope.rs` should call it instead.
+- **Envelope signature verification calls `pimble_crypto::verify_envelope`**
+  (a tiny wrapper in `routes/stores.rs`, mapping `CryptoError::BadSignature`
+  to 401 and anything else to 400) — it needs no private key, unlike
+  `unwrap_key`, so the server (which only ever holds public keys) can
+  authenticate an envelope it relays without unwrapping it. An earlier,
+  short-lived version of this crate reimplemented the signing-bytes layout
+  itself in a since-deleted `src/envelope.rs`, before `pimble-crypto`
+  exported this helper; nothing calls that layout by hand any more.
+- **`recovery_rate_limit` is a separate `RateLimiter` instance from
+  `resend_rate_limit`**, not the same bucket, even though both are "one per
+  minute per address": a fresh signup already records a use of
+  `resend_rate_limit` for its verification email, so sharing it would leave
+  `POST /recover/start` rate-limited for that same address for a minute
+  before anyone ever called it — caught by every recovery-flow test
+  failing with a stale (verification, not recovery) link in `LogMailer`.
+- **`RhypeDb::complete_recovery` is one `.update()` call**, not three,
+  covering the password material, the recovery material, and clearing
+  `recovery_token_hash` together — so there's no window where a crash
+  between separate updates leaves a token half-consumed or a row with new
+  recovery material still holding the old password (or vice versa).
 - **`users_lookup_rate_limit`'s interval (200ms, in `src/state.rs`) is a
   judgment call**, not a number the contract gives: it only says "rate
   limited". Chosen to survive ordinary UI use (typing an email into a share

@@ -58,6 +58,16 @@ type User {
     account_key_blob: String
     recovery_salt: String
     recovery_key_blob: String
+    // Phase 2a-2 (docs/CRYPTO_CONTRACT.md "account recovery, password
+    // change, new recovery code"): `POST /recover/start`'s emailed token,
+    // sha256'd, one hour, one use — same sentinel-on-absent-or-consumed
+    // pattern as `verify_token_hash` above. Absent on every row from before
+    // this addition (read as optional; see db.rs's `get_string_opt`/
+    // `get_datetime_ms_opt` callers in `user_from_object`), which is
+    // correct: no in-flight recovery to speak of for a row that predates
+    // the field.
+    recovery_token_hash: String
+    recovery_token_expires_at: DateTime
 }
 
 type Session {

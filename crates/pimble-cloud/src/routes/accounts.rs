@@ -1,6 +1,8 @@
 //! `GET /kdf`, `POST /signup`, `GET /verify`, `POST /resend-verification`,
 //! `POST /login`, `POST /logout`, `GET /me`, `GET /me/keys`,
-//! `GET /users/lookup`, `POST /recover`, `POST /token`.
+//! `GET /users/lookup`, `POST /recover/start`, `GET /recover/{token}`,
+//! `POST /recover/{token}/complete`, `POST /recover/{token}/delete-account`,
+//! `POST /me/password`, `POST /me/recovery-code`, `POST /token`.
 //!
 //! Phase 1b (docs/CLOUD_CONTRACT.md, "Phase 1b: email verification"): an
 //! account is unusable until its email is verified by clicking a link.
@@ -13,29 +15,56 @@
 //! now `Argon2id(auth_key)`; the hashing itself (`crate::auth`) is
 //! unchanged. The web app now owns the account pages, so verification
 //! redirects target `/app/login`, not the static site's `/login.html`.
+//!
+//! Phase 2a-2 (docs/CRYPTO_CONTRACT.md "account recovery, password change,
+//! new recovery code"): the server holds neither password nor recovery
+//! KEK, so recovery can only replace what the recovery code unwrapped
+//! client-side; a request naming an unfamiliar account is never
+//! distinguishable from one naming a real, unverified, or keyless account
+//! (all "202 always" or "404 recovery_invalid", never a different code).
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::header::{LOCATION, SET_COOKIE};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use pimble_crypto::{AccountKeyBlob, AccountPublicKeys, KdfParams};
 
-use crate::auth::{hash_password, hash_verify_token, new_session_token, new_verify_token, verify_password_constant_time};
+use crate::auth::{hash_password, hash_recovery_token, hash_verify_token, new_recovery_token, new_session_token, new_verify_token, verify_password_constant_time};
 use crate::claims::claims_for_user;
 use crate::db::{NewUserKeyMaterial, UserRow};
 use crate::error::{CloudError, CloudResult};
 use crate::kdf_decoy::decoy_kdf_params;
-use crate::mail::verification_email;
+use crate::mail::{recovery_email, verification_email};
 use crate::session::{build_clear_cookie, build_set_cookie, AuthedUser};
 use crate::state::AppState;
 
 const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// "24 h expiry" (docs/CLOUD_CONTRACT.md, "Phase 1b").
 const VERIFY_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+/// "1 hour" (docs/CRYPTO_CONTRACT.md, "Phase 2a-2").
+const RECOVERY_TTL_MS: i64 = 60 * 60 * 1000;
+
+/// Non-empty and, for a blob, a matching version and non-empty nonce and
+/// ciphertext — a shallow sanity check on the client's own crypto, not a
+/// cryptographic validation (the server never has the keys to check more).
+/// Shared by every endpoint that accepts a `KdfParams`/`AccountKeyBlob`.
+fn validate_kdf(kdf: &KdfParams) -> CloudResult<()> {
+    if kdf.salt.trim().is_empty() || kdf.m_cost == 0 || kdf.t_cost == 0 || kdf.p_cost == 0 {
+        return Err(CloudError::BadRequest("kdf is invalid".to_string()));
+    }
+    Ok(())
+}
+
+fn validate_blob(field: &'static str, blob: &AccountKeyBlob) -> CloudResult<()> {
+    if blob.v != pimble_crypto::VERSION || blob.nonce.trim().is_empty() || blob.ciphertext.trim().is_empty() {
+        return Err(CloudError::BadRequest(format!("{field} is invalid")));
+    }
+    Ok(())
+}
 
 // ── GET /kdf ────────────────────────────────────────────────────────────
 
@@ -362,19 +391,237 @@ pub async fn users_lookup(State(state): State<AppState>, authed: AuthedUser, Que
     Ok(Json(UserLookupResponse { id: user.user_uuid, public_keys }))
 }
 
+// ── Recovery (docs/CRYPTO_CONTRACT.md "Phase 2a-2") ─────────────────────
+
 #[derive(Deserialize)]
-pub struct RecoverRequest {
-    #[allow(dead_code)]
+pub struct RecoverStartRequest {
     pub email: String,
-    #[allow(dead_code)]
-    pub recovery_code_auth: String,
 }
 
-/// `POST /api/v1/recover` — out of scope for this phase beyond storing the
-/// blob at signup (docs/CRYPTO_CONTRACT.md); always 501.
-pub async fn recover(Json(req): Json<RecoverRequest>) -> Response {
-    let _ = req;
-    CloudError::NotImplemented.into_response()
+/// `POST /api/v1/recover/start` — 202 always (no enumeration); mails a
+/// recovery link only for a real, verified account that has key material,
+/// through the same mailer `start_verification` uses and a limiter of the
+/// same one-per-minute-per-address shape (docs/CRYPTO_CONTRACT.md: "the
+/// same mailer and the same one-per-minute limit as verification") — its
+/// own instance (`recovery_rate_limit`), not literally `resend_rate_limit`:
+/// sharing that bucket would leave a brand-new signup's address
+/// rate-limited here for a minute purely because signup itself just sent a
+/// verification email.
+pub async fn recover_start(State(state): State<AppState>, Json(req): Json<RecoverStartRequest>) -> CloudResult<Response> {
+    if let Some(user) = state.db.find_user_by_email(&req.email).await? {
+        if user.verified && user.has_key_material() && state.recovery_rate_limit.try_acquire(&user.email.to_lowercase()) {
+            let (token, token_hash) = new_recovery_token();
+            let expires_at_ms = chrono::Utc::now().timestamp_millis() + RECOVERY_TTL_MS;
+            state.db.set_recovery_token(user.rid, &token_hash, expires_at_ms).await?;
+
+            let link = format!("{}/app/recover?token={token}", state.config.public_url.trim_end_matches('/'));
+            let (subject, text, html) = recovery_email(&link);
+            state.mailer.send(&user.email, subject, &text, &html).await.map_err(|e| {
+                tracing::warn!(email = %user.email, error = %e, "sending the recovery email failed");
+                CloudError::MailFailed
+            })?;
+        }
+    }
+    Ok((StatusCode::ACCEPTED, Json(json!({ "status": "recovery_sent" }))).into_response())
+}
+
+#[derive(Serialize)]
+pub struct RecoveryKdfCosts {
+    m_cost: u32,
+    t_cost: u32,
+    p_cost: u32,
+}
+
+#[derive(Serialize)]
+pub struct RecoverTokenResponse {
+    email: String,
+    recovery_salt: String,
+    recovery_kdf: RecoveryKdfCosts,
+    recovery_key_blob: AccountKeyBlob,
+    public_keys: AccountPublicKeys,
+}
+
+/// Looks up the (unexpired) user a recovery token names, or `Err(RecoveryInvalid)`
+/// — shared by every `/recover/{token}...` endpoint below. An empty path
+/// segment is never valid (axum still routes `/recover/` to this handler
+/// with `token == ""`, and an empty token would otherwise match the
+/// `recovery_token_hash` sentinel every consumed/legacy row carries).
+async fn user_for_recovery_token(state: &AppState, token: &str) -> CloudResult<UserRow> {
+    if token.is_empty() {
+        return Err(CloudError::RecoveryInvalid);
+    }
+    let token_hash = hash_recovery_token(token);
+    let user = state.db.find_user_by_recovery_token_hash(&token_hash).await?.ok_or(CloudError::RecoveryInvalid)?;
+    if user.recovery_token_expires_at_ms <= chrono::Utc::now().timestamp_millis() {
+        return Err(CloudError::RecoveryInvalid);
+    }
+    Ok(user)
+}
+
+/// `GET /api/v1/recover/{token}` — the only place the recovery blob is ever
+/// served, and only to the holder of the emailed token.
+pub async fn recover_get(State(state): State<AppState>, Path(token): Path<String>) -> CloudResult<Json<RecoverTokenResponse>> {
+    let user = user_for_recovery_token(&state, &token).await?;
+    let recovery_salt = user.recovery_salt.clone().ok_or(CloudError::RecoveryInvalid)?;
+    let recovery_key_blob_json = user.recovery_key_blob.as_deref().ok_or(CloudError::RecoveryInvalid)?;
+    let recovery_key_blob: AccountKeyBlob =
+        serde_json::from_str(recovery_key_blob_json).map_err(|e| CloudError::Internal(format!("stored recovery_key_blob is not valid JSON: {e}")))?;
+    let public_keys = user.public_keys().ok_or(CloudError::RecoveryInvalid)?;
+    Ok(Json(RecoverTokenResponse {
+        email: user.email,
+        recovery_salt,
+        // The recovery KEK always uses the same fixed costs the password
+        // KDF does (there are no separate stored recovery costs — only a
+        // salt); see `tests/integration.rs`'s `build_signup_body`.
+        recovery_kdf: RecoveryKdfCosts { m_cost: pimble_crypto::KDF_M_COST_KIB, t_cost: pimble_crypto::KDF_T_COST, p_cost: pimble_crypto::KDF_P_COST },
+        recovery_key_blob,
+        public_keys,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct RecoverCompleteRequest {
+    pub auth_key: String,
+    pub kdf: KdfParams,
+    pub account_key_blob: AccountKeyBlob,
+    pub recovery_salt: String,
+    pub recovery_key_blob: AccountKeyBlob,
+}
+
+#[derive(Serialize)]
+pub struct RecoverCompleteResponse {
+    user: UserView,
+}
+
+/// `POST /api/v1/recover/{token}/complete` — replaces password material and
+/// recovery material (the client rotates the code), consumes the token,
+/// deletes every session, and starts no new one. Public keys are unchanged,
+/// so every store envelope already wrapped to this account stays valid.
+pub async fn recover_complete(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+    Json(req): Json<RecoverCompleteRequest>,
+) -> CloudResult<Json<RecoverCompleteResponse>> {
+    if req.auth_key.trim().is_empty() {
+        return Err(CloudError::BadRequest("auth_key must not be empty".to_string()));
+    }
+    validate_kdf(&req.kdf)?;
+    validate_blob("account_key_blob", &req.account_key_blob)?;
+    if req.recovery_salt.trim().is_empty() {
+        return Err(CloudError::BadRequest("recovery_salt must not be empty".to_string()));
+    }
+    validate_blob("recovery_key_blob", &req.recovery_key_blob)?;
+
+    let user = user_for_recovery_token(&state, &token).await?;
+    let password_hash = hash_password(&req.auth_key)?;
+    state
+        .db
+        .complete_recovery(
+            user.rid,
+            &password_hash,
+            &req.kdf.salt,
+            req.kdf.m_cost,
+            req.kdf.t_cost,
+            req.kdf.p_cost,
+            &to_json("account_key_blob", &req.account_key_blob)?,
+            &req.recovery_salt,
+            &to_json("recovery_key_blob", &req.recovery_key_blob)?,
+        )
+        .await?;
+
+    for session in state.db.sessions_for_user(user.rid).await? {
+        state.db.delete_session(session.rid).await?;
+    }
+
+    Ok(Json(RecoverCompleteResponse { user: UserView { id: user.user_uuid, email: user.email } }))
+}
+
+/// `POST /api/v1/recover/{token}/delete-account` — for people without the
+/// recovery code: deletes the user, its sessions, grants and key grants;
+/// any hosted store it solely owned is marked `deleted` (the same
+/// soft-delete `DELETE /stores/{id}` uses — nobody else could ever manage
+/// it once this account is gone; wiping the underlying vault data is a
+/// later phase).
+pub async fn recover_delete_account(State(state): State<AppState>, Path(token): Path<String>) -> CloudResult<Json<Value>> {
+    let user = user_for_recovery_token(&state, &token).await?;
+
+    for grant in state.db.grants_for_user(user.rid).await? {
+        if grant.role == "owner" {
+            let owner_count = state.db.grants_for_store(grant.store_rid).await?.into_iter().filter(|g| g.role == "owner").count();
+            if owner_count <= 1 {
+                state.db.mark_store_deleted(grant.store_rid).await?;
+            }
+        }
+        state.db.delete_grant(grant.rid).await?;
+    }
+    for key_grant in state.db.key_grants_for_user(user.rid).await? {
+        state.db.delete_key_grant(key_grant.rid).await?;
+    }
+    for session in state.db.sessions_for_user(user.rid).await? {
+        state.db.delete_session(session.rid).await?;
+    }
+    state.db.delete_user(user.rid).await?;
+
+    Ok(Json(json!({})))
+}
+
+// ── Password / recovery-code changes (session) ──────────────────────────
+
+#[derive(Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_auth_key: String,
+    pub auth_key: String,
+    pub kdf: KdfParams,
+    pub account_key_blob: AccountKeyBlob,
+}
+
+/// `POST /api/v1/me/password` — verifies `current_auth_key` like login,
+/// then replaces the password material. Other sessions are kept (Joe may
+/// change that later — docs/CRYPTO_CONTRACT.md).
+pub async fn change_password(State(state): State<AppState>, authed: AuthedUser, Json(req): Json<ChangePasswordRequest>) -> CloudResult<Json<Value>> {
+    if !verify_password_constant_time(&req.current_auth_key, Some(authed.user.password_hash.as_str())) {
+        return Err(CloudError::Unauthorized("current password is incorrect".to_string()));
+    }
+    if req.auth_key.trim().is_empty() {
+        return Err(CloudError::BadRequest("auth_key must not be empty".to_string()));
+    }
+    validate_kdf(&req.kdf)?;
+    validate_blob("account_key_blob", &req.account_key_blob)?;
+
+    let password_hash = hash_password(&req.auth_key)?;
+    state
+        .db
+        .update_password_material(
+            authed.user.rid,
+            &password_hash,
+            &req.kdf.salt,
+            req.kdf.m_cost,
+            req.kdf.t_cost,
+            req.kdf.p_cost,
+            &to_json("account_key_blob", &req.account_key_blob)?,
+        )
+        .await?;
+    Ok(Json(json!({})))
+}
+
+#[derive(Deserialize)]
+pub struct ChangeRecoveryCodeRequest {
+    pub recovery_salt: String,
+    pub recovery_key_blob: AccountKeyBlob,
+}
+
+/// `POST /api/v1/me/recovery-code` — replaces the recovery material with a
+/// new code the client generated while already holding the account keys.
+pub async fn change_recovery_code(State(state): State<AppState>, authed: AuthedUser, Json(req): Json<ChangeRecoveryCodeRequest>) -> CloudResult<Json<Value>> {
+    if req.recovery_salt.trim().is_empty() {
+        return Err(CloudError::BadRequest("recovery_salt must not be empty".to_string()));
+    }
+    validate_blob("recovery_key_blob", &req.recovery_key_blob)?;
+    state
+        .db
+        .update_recovery_material(authed.user.rid, &req.recovery_salt, &to_json("recovery_key_blob", &req.recovery_key_blob)?)
+        .await?;
+    Ok(Json(json!({})))
 }
 
 // ── Tokens ────────────────────────────────────────────────────────────

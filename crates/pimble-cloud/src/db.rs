@@ -179,6 +179,12 @@ pub struct UserRow {
     pub recovery_salt: Option<String>,
     /// `pimble_crypto::AccountKeyBlob` as stored: a JSON string, opaque here.
     pub recovery_key_blob: Option<String>,
+    /// Phase 2a-2 (account recovery). Same empty-string/epoch-zero sentinel
+    /// as `verify_token_hash`/`verify_expires_at_ms`: absent on every row
+    /// from before this field existed, and cleared the same way once a
+    /// recovery token is consumed or superseded.
+    pub recovery_token_hash: String,
+    pub recovery_token_expires_at_ms: i64,
 }
 
 impl UserRow {
@@ -321,6 +327,8 @@ fn user_from_object(o: &Object) -> CloudResult<UserRow> {
         account_key_blob: get_string_opt(o, "account_key_blob")?.map(str::to_string),
         recovery_salt: get_string_opt(o, "recovery_salt")?.map(str::to_string),
         recovery_key_blob: get_string_opt(o, "recovery_key_blob")?.map(str::to_string),
+        recovery_token_hash: get_string_opt(o, "recovery_token_hash")?.map(str::to_string).unwrap_or_default(),
+        recovery_token_expires_at_ms: get_datetime_ms_opt(o, "recovery_token_expires_at")?.unwrap_or(0),
     })
 }
 
@@ -482,6 +490,111 @@ impl RhypeDb {
         let email_lower = email.to_lowercase();
         let q = format!("User.filter(.email_lower == {})", ql_str(&email_lower));
         self.one(&q).await?.map(|o| user_from_object(&o)).transpose()
+    }
+
+    // ── Recovery (docs/CRYPTO_CONTRACT.md "Phase 2a-2") ──────────────────
+
+    /// (Re)issues a recovery token for `user_rid` (`POST /recover/start`).
+    pub async fn set_recovery_token(&self, user_rid: u64, recovery_token_hash: &str, expires_at_ms: i64) -> CloudResult<()> {
+        let q = format!(
+            "User.get({user_rid}).update({{ recovery_token_hash: {hash}, recovery_token_expires_at: {exp} }})",
+            hash = ql_str(recovery_token_hash),
+            exp = datetime_literal(expires_at_ms),
+        );
+        self.objects(&q).await?;
+        Ok(())
+    }
+
+    /// Clears `user_rid`'s recovery token so it can't be replayed — used
+    /// whenever it's consumed (`.../complete`, `.../delete-account`).
+    pub async fn clear_recovery_token(&self, user_rid: u64) -> CloudResult<()> {
+        self.objects(&format!("User.get({user_rid}).update({{ recovery_token_hash: {empty} }})", empty = ql_str(""))).await?;
+        Ok(())
+    }
+
+    /// Looks up a user by the hash of a recovery token from a
+    /// `/recover/{token}` link. The caller must never pass an empty
+    /// `recovery_token_hash` — same reasoning as
+    /// [`Self::find_user_by_verify_token_hash`].
+    pub async fn find_user_by_recovery_token_hash(&self, recovery_token_hash: &str) -> CloudResult<Option<UserRow>> {
+        debug_assert!(!recovery_token_hash.is_empty(), "must not query the empty recovery_token_hash sentinel");
+        let q = format!("User.filter(.recovery_token_hash == {})", ql_str(recovery_token_hash));
+        self.one(&q).await?.map(|o| user_from_object(&o)).transpose()
+    }
+
+    /// Replaces `user_rid`'s password material — `POST /me/password`
+    /// (current session kept) and the password half of
+    /// `POST /recover/{token}/complete` both go through this. Public keys
+    /// and recovery material are untouched.
+    pub async fn update_password_material(
+        &self,
+        user_rid: u64,
+        password_hash: &str,
+        kdf_salt: &str,
+        kdf_m_cost: u32,
+        kdf_t_cost: u32,
+        kdf_p_cost: u32,
+        account_key_blob: &str,
+    ) -> CloudResult<()> {
+        let q = format!(
+            "User.get({user_rid}).update({{ password_hash: {hash}, kdf_salt: {salt}, kdf_m_cost: {m}, kdf_t_cost: {t}, kdf_p_cost: {p}, account_key_blob: {blob} }})",
+            hash = ql_str(password_hash),
+            salt = ql_str(kdf_salt),
+            m = kdf_m_cost,
+            t = kdf_t_cost,
+            p = kdf_p_cost,
+            blob = ql_str(account_key_blob),
+        );
+        self.objects(&q).await?;
+        Ok(())
+    }
+
+    /// Replaces `user_rid`'s recovery material only — `POST
+    /// /me/recovery-code` (a new code generated while already holding the
+    /// keys).
+    pub async fn update_recovery_material(&self, user_rid: u64, recovery_salt: &str, recovery_key_blob: &str) -> CloudResult<()> {
+        let q = format!(
+            "User.get({user_rid}).update({{ recovery_salt: {salt}, recovery_key_blob: {blob} }})",
+            salt = ql_str(recovery_salt),
+            blob = ql_str(recovery_key_blob),
+        );
+        self.objects(&q).await?;
+        Ok(())
+    }
+
+    /// `POST /recover/{token}/complete`: password material and recovery
+    /// material both rotate (the client generates a new recovery code too),
+    /// and the token that got the caller here is consumed — all in the one
+    /// `.update()` call so there's no window where only some of it landed.
+    /// Public keys are unchanged (docs/CRYPTO_CONTRACT.md: "so every store
+    /// envelope stays valid").
+    #[allow(clippy::too_many_arguments)]
+    pub async fn complete_recovery(
+        &self,
+        user_rid: u64,
+        password_hash: &str,
+        kdf_salt: &str,
+        kdf_m_cost: u32,
+        kdf_t_cost: u32,
+        kdf_p_cost: u32,
+        account_key_blob: &str,
+        recovery_salt: &str,
+        recovery_key_blob: &str,
+    ) -> CloudResult<()> {
+        let q = format!(
+            "User.get({user_rid}).update({{ password_hash: {hash}, kdf_salt: {salt}, kdf_m_cost: {m}, kdf_t_cost: {t}, kdf_p_cost: {p}, account_key_blob: {blob}, recovery_salt: {rsalt}, recovery_key_blob: {rblob}, recovery_token_hash: {empty} }})",
+            hash = ql_str(password_hash),
+            salt = ql_str(kdf_salt),
+            m = kdf_m_cost,
+            t = kdf_t_cost,
+            p = kdf_p_cost,
+            blob = ql_str(account_key_blob),
+            rsalt = ql_str(recovery_salt),
+            rblob = ql_str(recovery_key_blob),
+            empty = ql_str(""),
+        );
+        self.objects(&q).await?;
+        Ok(())
     }
 
     pub async fn find_user_by_uuid(&self, user_uuid: &str) -> CloudResult<Option<UserRow>> {
@@ -759,5 +872,17 @@ impl RhypeDb {
     pub async fn key_grants_for_user_and_store(&self, user_rid: u64, store_rid: u64) -> CloudResult<Vec<KeyGrantRow>> {
         let q = format!("KeyGrant.filter(.user_rid == {user_rid} && .store_rid == {store_rid})");
         self.objects(&q).await?.iter().map(key_grant_from_object).collect()
+    }
+
+    /// Every key grant `user_rid` holds, across every store — used only by
+    /// account deletion (`POST /recover/{token}/delete-account`).
+    pub async fn key_grants_for_user(&self, user_rid: u64) -> CloudResult<Vec<KeyGrantRow>> {
+        let q = format!("KeyGrant.filter(.user_rid == {user_rid})");
+        self.objects(&q).await?.iter().map(key_grant_from_object).collect()
+    }
+
+    pub async fn delete_key_grant(&self, key_grant_rid: u64) -> CloudResult<()> {
+        self.objects(&format!("KeyGrant.get({key_grant_rid}).delete()")).await?;
+        Ok(())
     }
 }
