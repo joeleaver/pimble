@@ -31,10 +31,9 @@ this, then `CLAUDE.md` ("Cloud, phase 1" and "Cloud, phase 2a"), then
   with the encrypted store "Live vault".
 - **Decided (Joe, 2026-09-16):** the store display name stays plaintext; it is listed as
   visible metadata in the crypto contract.
-- **rinch is on branch `feat/web-menu-bar` (PR #791)** in both workspaces; move back to
-  `main` when it merges. The PR also fixes the browser's native context menu suppression
-  and a stale-handler gap; a further rinch-web defect (a context menu orphaned by a tree
-  rebuild) is with the rinch agent.
+- **rinch PR #791 merged 2026-09-16**; both workspaces track `main` again (`bb3bcbd`). It
+  carried the web menu bar, native context-menu suppression, a stale-handler fix and the
+  context-menu portal closing with its scope.
 - Workspace compiles with zero warnings. `cargo test --workspace --release`: 312 passed
   (the accounts tests need `~/dev/rhypedb/target/debug/rhypedb-server`; the harness now
   retries port races and caps concurrent stacks).

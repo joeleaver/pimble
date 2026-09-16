@@ -307,8 +307,7 @@ store-name question). Pimble Cloud holds ciphertext only.
   browser, answers tree and editor commands from them, encrypts outbound edits and
   searches client-side; the explorer's `+` creates an encrypted store through the accounts
   service and re-mints the token; menus are data in `crates/pimble-app/src/menus.rs` and the
-  browser mounts them through `rinch_web::mount_with_menu_bar` (rinch PR #791, tracked as
-  branch `feat/web-menu-bar` in both workspaces until it merges).
+  browser mounts them through `rinch_web::mount_with_menu_bar` (rinch PR #791, merged to `main` 2026-09-16).
 - **Verified by the PM** in a browser through trunk's proxies against the real stack:
   signup with the recovery code, verification, unlock, an encrypted store, a node typed in
   one tab, only `PB` ciphertext on the hosted disk (no typed words, title or store name in

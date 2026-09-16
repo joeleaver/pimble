@@ -1,8 +1,8 @@
 # Crypto contract, phase 2a: end-to-end encryption for hosted stores
 
 Status: code done 2026-09-16 (branch `cloud/phase-1`), verified end to end by the PM in a
-browser through trunk's proxies against the real four-process stack; deploy pending the
-web menu bar (rinch PR #791, tracked as branch `feat/web-menu-bar` in both workspaces).
+browser through trunk's proxies against the real four-process stack; deployed to
+pimble.app 2026-09-16 (rinch PR #791 merged the same day).
 Decided with Joe 2026-09-15: encryption is important and comes first, before sharing.
 Assumptions Joe has not overruled: local store files stay unencrypted on disk; signup
 issues a recovery code. Decided 2026-09-16: the store display name stays plaintext (listed under visible
