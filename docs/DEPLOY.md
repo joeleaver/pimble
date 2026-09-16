@@ -106,7 +106,9 @@ from any branch:
 git push jkbase          # pushes the current HEAD to the platform's main: build + deploy
 ```
 
-Watch it with `jkbase deployments` and `jkbase logs -f`. `jkbase repo token` re-mints the
+Watch it with `jkbase deployments` and `jkbase logs -f`. A push that arrives while a build
+is already running is dropped, not queued (seen 2026-09-16): check that a new build appears
+after every push, and push again once the running build has finished if it did not. `jkbase repo token` re-mints the
 push token (revoking the old one); `jkbase repo disconnect` removes it. If another machine
 needs the remote, run `jkbase repo connect` there and set the same refspec:
 `git config remote.jkbase.push 'HEAD:refs/heads/main'`.
