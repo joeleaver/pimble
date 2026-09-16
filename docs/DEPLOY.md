@@ -106,9 +106,12 @@ from any branch:
 git push jkbase          # pushes the current HEAD to the platform's main: build + deploy
 ```
 
-Watch it with `jkbase deployments` and `jkbase logs -f`. A push that arrives while a build
-is already running is dropped, not queued (seen 2026-09-16): check that a new build appears
-after every push, and push again once the running build has finished if it did not. `jkbase repo token` re-mints the
+Watch it with `jkbase deployments` and `jkbase logs -f`. A push that the platform refuses
+(the monthly build-minute quota was exhausted on 2026-09-16 after a day of 12-minute
+Rust builds) is silently dropped: no error on the git side, no build record. `jkbase deploy`
+from a clean export does report it (`402 build-minute quota exceeded`). Check that a new
+build appears after every push; `jkbase usage` shows the month's build minutes and
+`jkbase quota` raises them (admin token). `jkbase repo token` re-mints the
 push token (revoking the old one); `jkbase repo disconnect` removes it. If another machine
 needs the remote, run `jkbase repo connect` there and set the same refspec:
 `git config remote.jkbase.push 'HEAD:refs/heads/main'`.
