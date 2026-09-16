@@ -39,7 +39,7 @@ account UI"), then `docs/CRYPTO_CONTRACT.md`, `docs/DESKTOP_ACCOUNT_CONTRACT.md`
   recovery request hits and trims the address in the lookup. **Open:** ask Joe which
   address and when the account was created; read `jkbase logs --service cloud` after the
   next attempt.
-- **Local verification stack for the desktop** (all in the session scratchpad, gone now):
+- **Local verification stack for the desktop** (`tools/dev-proxy.js` is the proxy, `tools/rinch-debug.py` drives the GUI):
   rhypedb-server, `pimble-cli server` on 7463 in JWT mode with a token file, `pimble-cloud`
   on 8080 with `PIMBLE_CLOUD_PUBLIC_URL=http://127.0.0.1:8090`, a 60-line node reverse
   proxy on 8090 (`/api/*` to 8080, `/rpc` to 7463 with WebSocket upgrade; the vault link
