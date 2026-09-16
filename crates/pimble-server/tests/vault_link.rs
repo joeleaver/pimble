@@ -492,6 +492,91 @@ async fn a_second_server_receives_content_and_a_reply_edit_reaches_the_first() {
     b.stop().await.unwrap();
 }
 
+/// Regression test for the bug found in the web vault client: echo
+/// suppression there dropped any incoming `VaultAppended` whose seq wasn't
+/// above the client's own last-appended seq, which is wrong whenever a peer
+/// races ahead while this side keeps appending too (its own seq is not
+/// reliably the highest). `crate::vault_link::EchoTracker` suppresses by
+/// identity instead (the exact `(doc_id, seq)` pairs this link itself
+/// appended, an `EchoTracker`/`HashSet`, not a `>=` comparison against
+/// `last_seq`) — this fires many interleaved appends from two servers with
+/// no waiting in between, so their vault appends race each other, and
+/// checks both sides still converge to every edit.
+#[tokio::test]
+async fn interleaved_edits_from_two_servers_on_one_hosted_document_converge() {
+    let env = spawn_env().await;
+
+    let (mut a, client_a, a_dir) = start_local_server().await;
+    client_a.cloud_sign_in(&env.stub_url, &env.email, &env.password).await.unwrap();
+    let (store_id, root_id) = client_a.create_store(a_dir.path().join("a.pimble"), "Interleave").await.unwrap();
+    let doc_id = client_a.create_node(store_id, Some(root_id), "document", "Doc").await.unwrap();
+    seed_content(&client_a, store_id, doc_id, "seed", "start").await;
+    client_a.cloud_host_store(store_id).await.unwrap();
+
+    let doc_key = VaultDocId::Node(doc_id);
+    let seeded = wait_until(Duration::from_secs(10), || async {
+        env.h_admin.vault_fetch(store_id, doc_key.clone(), 0).await.map(|f| f.head > 0).unwrap_or(false)
+    })
+    .await;
+    assert!(seeded, "A's content must reach the vault before B can pull it");
+
+    let (mut b, client_b, _b_dir) = start_local_server().await;
+    client_b.cloud_sign_in(&env.stub_url, &env.email, &env.password).await.unwrap();
+    let store_on_b = client_b.cloud_add_hosted_store(store_id).await.expect("B adds the hosted store");
+    let (_, b_children) = wait_children_nonempty(&client_b, store_id, store_on_b.root_node_id).await;
+    assert_eq!(b_children.len(), 1);
+    let b_doc_id = b_children[0].id;
+    let pulled = wait_until(Duration::from_secs(10), || async { node_text(&client_b, store_id, b_doc_id).await.contains("start") }).await;
+    assert!(pulled, "B must receive A's seed content before the interleaving starts");
+
+    // Fire edits from both sides in strict alternation with no waiting for
+    // propagation in between, so each side's `vaultAppend`s race the
+    // other's live `VaultAppended` notifications arriving through its own
+    // subscription — exactly the scenario a seq-threshold echo check gets
+    // wrong (this side's own seq is not reliably the highest once the other
+    // side is also appending concurrently).
+    let markers: [(&str, bool); 8] = [
+        ("alpha-from-a", true),
+        ("bravo-from-b", false),
+        ("charlie-from-a", true),
+        ("delta-from-b", false),
+        ("echo-from-a", true),
+        ("foxtrot-from-b", false),
+        ("golf-from-a", true),
+        ("hotel-from-b", false),
+    ];
+    for (marker, from_a) in &markers {
+        if *from_a {
+            seed_content(&client_a, store_id, doc_id, "a-editor", marker).await;
+        } else {
+            seed_content(&client_b, store_id, b_doc_id, "b-editor", marker).await;
+        }
+    }
+
+    let converged_a = wait_until(Duration::from_secs(15), || async {
+        let text = node_text(&client_a, store_id, doc_id).await;
+        markers.iter().all(|(m, _)| text.contains(m))
+    })
+    .await;
+    assert!(converged_a, "A must end up with every edit from both sides, not just its own");
+
+    let converged_b = wait_until(Duration::from_secs(15), || async {
+        let text = node_text(&client_b, store_id, b_doc_id).await;
+        markers.iter().all(|(m, _)| text.contains(m))
+    })
+    .await;
+    assert!(converged_b, "B must end up with every edit from both sides, not just its own");
+
+    assert_eq!(
+        node_text(&client_a, store_id, doc_id).await,
+        node_text(&client_b, store_id, b_doc_id).await,
+        "both sides must converge to byte-identical text"
+    );
+
+    a.stop().await.unwrap();
+    b.stop().await.unwrap();
+}
+
 /// Poll `getChildren` until it's non-empty (the tree pull may lag a beat
 /// behind the vault link reaching `Synced`).
 async fn wait_children_nonempty(client: &PimbleClient, store_id: StoreId, node_id: NodeId) -> (StoreId, Vec<pimble_core::Node>) {
