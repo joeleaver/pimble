@@ -16,6 +16,13 @@ this, then `CLAUDE.md` ("Cloud, phase 1" and "Cloud, phase 2a"), then
   `git push jkbase` (force when the platform's `main` diverged); the build cache works
   with the exclude lists (a site-only change rebuilds nothing else; a changed Rust target
   still takes 4 to 12 minutes).
+- **Incident 2026-09-16 02:40 UTC:** deployment v10 (the legacy-user fix) crash-looped the
+  accounts service at startup because its cleanup read every user row and a phase 1 row has
+  no `verified` field either; rolled back to v9 within two minutes (`jkbase rollback
+  --version 9 --force`). Lesson, now a rule: a startup migration or cleanup must never be
+  able to stop the service from serving (log and continue), and production holds rows of
+  three generations (phase 1, phase 1b verification, phase 2a keys), so every row read must
+  treat later fields as optional.
 - **Known live bug, fix in progress (agent C):** `GET /api/v1/kdf` (and login) answer 500
   for a pre-encryption account, because its row has no key fields; every such account is a
   PM test account. The fix reads the fields as optional, deletes keyless users at startup,
