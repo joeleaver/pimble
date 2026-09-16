@@ -1749,6 +1749,30 @@ async fn recover_full_flow_rotates_keys_with_real_crypto_and_invalidates_old_pas
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn recover_start_moments_after_signup_is_not_blocked_by_verifications_rate_limit() {
+    let stack = skip_without_rhypedb!();
+    let email = "recover-soon-after-signup@example.com";
+    let password = "recover soon after signup!!";
+    // Signup's own send records against `resend_rate_limit`; verifying and
+    // logging in are both local and fast, so `recover/start` below lands
+    // well within the same minute — recovery must not be blocked by it.
+    signup(&stack, email, password).await;
+    verify_then_login(&stack, email, password).await;
+
+    let resp = stack.http.post(format!("{}/recover/start", stack.base_url)).json(&json!({ "email": email })).send().await.unwrap();
+    assert_eq!(resp.status(), 202);
+
+    // A real recovery mail actually went out — proven by the token it
+    // issued actually working, not just the always-202 response (which
+    // looks identical whether or not `recover/start` silently skipped
+    // sending because it thought the address was already rate-limited by
+    // the unrelated verification send).
+    let token = extract_recovery_token(&stack, email);
+    let resp = stack.http.get(format!("{}/recover/{token}", stack.base_url)).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "recover/start must send even moments after signup's own verification email");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn recover_expired_token_is_invalid() {
     let stack = skip_without_rhypedb!();
     let email = "recover-expired@example.com";
