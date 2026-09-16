@@ -7,16 +7,21 @@ this, then `CLAUDE.md` ("Cloud, phase 1" and "Cloud, phase 2a"), then
 ## Where things stand
 
 - Branch `cloud/phase-1`, not merged to `master`. Every phase 1 and 2a commit is on it.
-- **Live on pimble.app (deployment v6, phase 1 plus fixes):** the site, the web app, the
-  accounts service with email verification through Resend, the hosted Pimble server with
-  JWT auth. Push-to-deploy with `git push jkbase`; the build cache works with the exclude
-  lists (a site-only change rebuilds nothing else; a changed Rust target still takes 4 to
-  12 minutes).
-- **Phase 2a is code-complete and verified, not deployed.** The next push carries the
-  client-derived login, so it must go out together with the web app's account pages (it
-  does: they are committed). Pending before that push: the web menu bar wiring (agent A,
-  rinch PR #791) and a last full check. Then sign up on pimble.app, create an encrypted
-  store, and edit it from two browsers.
+- **Live on pimble.app (deployment v9, 2026-09-16 02:31 UTC): phases 1 and 2a.** The PM
+  verified on production: signup at `/app/signup` with the recovery code, the real
+  verification mail (readable through Resend's API: `GET /emails/{id}` returns the body),
+  login, an encrypted store from the explorer's `+`, a note typed in the browser, and the
+  hosted server holding only vault documents while refusing plain RPCs on that store with
+  `-32005`. The web menu bar (File, Edit, View) renders. Push-to-deploy with
+  `git push jkbase` (force when the platform's `main` diverged); the build cache works
+  with the exclude lists (a site-only change rebuilds nothing else; a changed Rust target
+  still takes 4 to 12 minutes).
+- **Known live bug, fix in progress (agent C):** `GET /api/v1/kdf` (and login) answer 500
+  for a pre-encryption account, because its row has no key fields; every such account is a
+  PM test account. The fix reads the fields as optional, deletes keyless users at startup,
+  and answers the decoy/401 for any survivor. Deploy it next.
+- **Production test accounts** (all the PM's, delete when there is a way): the legacy
+  ones above plus `pm-live-2a@resend.dev` with the encrypted store "Live vault".
 - **Open decision (Joe):** the store display name is plaintext in the hosted manifest and
   the accounts service; encrypt it or list it as visible metadata.
 - **rinch is on branch `feat/web-menu-bar` (PR #791)** in both workspaces; move back to
@@ -122,7 +127,7 @@ after "Copy as Mount Source" again.
 
 ## Follow-ups, in rough priority
 
-0. **Deploy phase 2a**, then tag `v0.1.0` (the Windows job is unverified) and merge
+0. **Deploy C's legacy-user fix**, then tag `v0.1.0` (the Windows job is unverified) and merge
    `cloud/phase-1`. Then: the desktop sign-in UI (the RPCs and CLI exist: `cloudSignIn`,
    `cloudHostStore`, `cloudAddHostedStore`; the app needs an Account menu, "Host on Pimble
    Cloud...", "Add hosted store...", an "encrypted" badge from `sync_mode`); encrypt the
