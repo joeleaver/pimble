@@ -573,6 +573,19 @@ async fn interleaved_edits_from_two_servers_on_one_hosted_document_converge() {
         "both sides must converge to byte-identical text"
     );
 
+    // Ground truth for "nothing applied twice": a mis-identified echo would
+    // show up here, not in the merged text (a yrs merge is idempotent, so
+    // even a redundant local re-apply of a blob a side already has leaves
+    // the text unchanged — it's silent there). If either link ever forwarded
+    // its own echoed append back out as if it were a new local edit, the
+    // node document's log would hold more than exactly one append per edit.
+    let final_head = env.h_admin.vault_fetch(store_id, doc_key.clone(), 0).await.unwrap().head;
+    assert_eq!(
+        final_head, 9,
+        "exactly one append per edit (1 seed + 8 interleaved) must reach the hosted log; \
+         more would mean a link re-forwarded an echo of its own (or the other side's) append"
+    );
+
     a.stop().await.unwrap();
     b.stop().await.unwrap();
 }

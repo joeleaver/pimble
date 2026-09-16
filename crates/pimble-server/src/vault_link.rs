@@ -244,7 +244,7 @@ async fn connect_and_sync(handler: &RpcHandler, rpc_url: &Url, key_id: Uuid, lin
             trigger = push_rx.recv() => {
                 match trigger {
                     Some(()) => {
-                        push_full(handler, &client, store_id, VaultDocId::Tree, key_id, &echoes).await?;
+                        push_full(handler, &client, store_id, VaultDocId::Tree, key_id, link_id, &echoes).await?;
                         set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
                     }
                     None => return Err(anyhow::anyhow!("internal tree-push channel closed")),
@@ -322,14 +322,16 @@ async fn full_reconcile(handler: &RpcHandler, client: &PimbleClient, store_id: S
         }
     }
 
-    // Seed anything the remote has never seen.
+    // Seed anything the remote has never seen. No live subscription is
+    // active yet during a full reconcile, so a disposable echo tracker is
+    // fine here (nothing to echo against until `connect_and_sync` subscribes).
     if remote_heads.get(&VaultDocId::Tree).copied().unwrap_or(0) == 0 {
-        push_full(handler, client, store_id, VaultDocId::Tree, key_id, &Arc::new(EchoTracker::new())).await?;
+        push_full(handler, client, store_id, VaultDocId::Tree, key_id, link_id, &Arc::new(EchoTracker::new())).await?;
     }
     for node_id in &node_ids {
         let doc_id = VaultDocId::Node(*node_id);
         if remote_heads.get(&doc_id).copied().unwrap_or(0) == 0 {
-            push_full(handler, client, store_id, doc_id, key_id, &Arc::new(EchoTracker::new())).await?;
+            push_full(handler, client, store_id, doc_id, key_id, link_id, &Arc::new(EchoTracker::new())).await?;
         }
     }
 
@@ -423,8 +425,21 @@ async fn handle_remote_notification(
         return Ok(());
     };
 
+    // Identity first: every `vaultAppend` this link makes carries its own
+    // `link_id` (see `push_update`), so an echo of it back through this same
+    // subscription is recognized directly, the same way `apply_edit`'s
+    // `client_id` already works. The seen-seq set is a second guard for
+    // anything that reaches the server without a `client_id` (an older
+    // caller, or the CLI/web client), not the primary mechanism — dropping
+    // by `seq >= last_seq` instead would be wrong the moment a peer is also
+    // appending concurrently, since this link's own seq is then not
+    // reliably the highest.
+    if notif.source_client_id.as_deref() == Some(link_id) {
+        debug!("Vault link for store {} doc {:?}: dropping our own echoed append by id (seq {})", store_id, doc_id, seq);
+        return Ok(());
+    }
     if echoes.take_if_present(doc_id, *seq) {
-        debug!("Vault link for store {} doc {:?}: dropping our own echoed append (seq {})", store_id, doc_id, seq);
+        debug!("Vault link for store {} doc {:?}: dropping our own echoed append by seq (seq {})", store_id, doc_id, seq);
         return Ok(());
     }
 
@@ -466,16 +481,16 @@ async fn forward_local_change(
     match (&notif.change_kind, &notif.update) {
         (StoreChangeKind::ContentUpdated { node_id }, Some(changes_b64)) => {
             let plaintext = STANDARD.decode(changes_b64)?;
-            push_update(handler, client, store_id, VaultDocId::Node(*node_id), key_id, &plaintext, echoes).await?;
+            push_update(handler, client, store_id, VaultDocId::Node(*node_id), key_id, link_id, &plaintext, echoes).await?;
         }
         (StoreChangeKind::ContentUpdated { node_id }, None) => {
             // A full-snapshot content replacement (`updateNodeContent`): no
             // delta to reuse, push the node's current full state instead.
-            push_full(handler, client, store_id, VaultDocId::Node(*node_id), key_id, echoes).await?;
+            push_full(handler, client, store_id, VaultDocId::Node(*node_id), key_id, link_id, echoes).await?;
         }
         (StoreChangeKind::TreeStructure { .. }, Some(update_b64)) => {
             let plaintext = STANDARD.decode(update_b64)?;
-            push_update(handler, client, store_id, VaultDocId::Tree, key_id, &plaintext, echoes).await?;
+            push_update(handler, client, store_id, VaultDocId::Tree, key_id, link_id, &plaintext, echoes).await?;
         }
         (StoreChangeKind::NodeCreated { .. }, _)
         | (StoreChangeKind::NodeDeleted { .. }, _)
@@ -500,6 +515,7 @@ async fn push_update(
     store_id: StoreId,
     doc_id: VaultDocId,
     key_id: Uuid,
+    link_id: &str,
     plaintext: &[u8],
     echoes: &Arc<EchoTracker>,
 ) -> anyhow::Result<()> {
@@ -510,8 +526,13 @@ async fn push_update(
     let blob = Blob::encrypt(&key, key_id, &aad, plaintext);
     let blob_b64 = URL_SAFE_NO_PAD.encode(&blob);
 
+    // Attributed to this link's own id (`PimbleClient::vault_append_from`)
+    // so the notification it produces is dropped by identity if it echoes
+    // back through this link's own subscription; the seen-seq set below is
+    // kept as a second guard for anything that reaches the server without a
+    // `client_id`.
     let seq = client
-        .vault_append(store_id, doc_id.clone(), blob_b64)
+        .vault_append_from(store_id, doc_id.clone(), blob_b64, Some(link_id.to_string()))
         .await
         .map_err(|e| anyhow::anyhow!("remote vaultAppend for {:?} failed: {}", doc_id, e))?;
     echoes.remember(&doc_id, seq);
@@ -533,10 +554,11 @@ async fn push_full(
     store_id: StoreId,
     doc_id: VaultDocId,
     key_id: Uuid,
+    link_id: &str,
     echoes: &Arc<EchoTracker>,
 ) -> anyhow::Result<()> {
     let plaintext = full_doc_state(handler, store_id, &doc_id).await?;
-    push_update(handler, client, store_id, doc_id, key_id, &plaintext, echoes).await
+    push_update(handler, client, store_id, doc_id, key_id, link_id, &plaintext, echoes).await
 }
 
 /// The current full state of `doc_id` (`ContentDoc`/`StoreDocument::save()`:
