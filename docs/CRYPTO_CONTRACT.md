@@ -175,6 +175,48 @@ shows "encrypted" for vault links.
   client can `vaultFetch` from a point. Keys reach the browser through the same
   envelope path. Nothing in the web app's code may special-case "the" server.
 
+## Phase 2a-2: account recovery, password change, new recovery code (added 2026-09-16)
+
+Joe: "we're going to need account recovery / forgot password flows". Constraint: the
+account keys are wrapped under the password KEK and under the recovery KEK only; the
+server holds neither. So recovery needs the recovery code, and someone without it cannot
+get their data back. The flows must say that plainly.
+
+**Accounts service (C):**
+
+| Method and path | Auth | Behaviour |
+| --- | --- | --- |
+| `POST /api/v1/recover/start { email }` | none | 202 always. For a verified account with key material, mail a recovery link `<PIMBLE_CLOUD_PUBLIC_URL>/app/recover?token=<t>` (32 random bytes, stored hashed, 1 hour, one use), through the same mailer and the same one-per-minute limit as verification. Subject "Recover your Pimble account". |
+| `GET /api/v1/recover/{token}` | the token | `{ email, recovery_salt, recovery_kdf: { m_cost, t_cost, p_cost }, recovery_key_blob, public_keys }`. This is the only place the recovery blob is ever served, and only to the holder of an emailed token. Unknown or expired: 404 `{ error: "recovery_invalid" }`. |
+| `POST /api/v1/recover/{token}/complete { auth_key, kdf, account_key_blob, recovery_salt, recovery_key_blob }` | the token | Replaces the password hash (of `auth_key`), kdf, account key blob and the recovery material (the client rotated the code); consumes the token; deletes every session; answers `{ user }` and starts no session. The public keys are unchanged, so every store envelope stays valid. |
+| `POST /api/v1/me/password { current_auth_key, auth_key, kdf, account_key_blob }` | session | Verifies `current_auth_key` like login; replaces the password material; keeps other sessions (Joe may change that later). |
+| `POST /api/v1/me/recovery-code { recovery_salt, recovery_key_blob }` | session | Replaces the recovery material (a new code the client generated while holding the keys). |
+| `POST /api/v1/recover/{token}/delete-account` | the token | For people without the code: deletes the user, sessions, grants, key grants; hosted stores the user solely owned are marked `deleted` (the vault data is wiped in a later phase, noted). 200 `{}`. |
+
+`POST /recover` (501) is removed. Rate limits and no-enumeration as elsewhere. Tests: the
+full flow with `LogMailer` (start, GET, complete with keys rotated by real `pimble-crypto`,
+old password refused, new password accepted, store keys still unwrap, sessions gone), an
+expired token, a reused token, password change with a wrong current key refused,
+recovery-code replacement, delete-account.
+
+**Web app (A):**
+
+- `/app/login`: "Forgot your password?" link to `/app/forgot`: email field, always
+  "If that address has an account, we sent a link", plus the plain sentence "Recovery needs
+  the recovery code you saved at signup. Without it, the notes in your account cannot be
+  decrypted by anyone, including us."
+- `/app/recover?token=`: fetches the recovery material; asks for the recovery code and a
+  new password twice; on submit derives the recovery KEK (`derive_recovery_kek` with the
+  served salt), unwraps the account keys (a wrong code fails locally, no request), derives
+  new password keys with a fresh `KdfParams`, re-wraps, generates a new recovery code and
+  wraps under it, calls complete, then shows the new recovery code once with the same
+  "I have saved it" confirmation, then goes to `/app/login?recovered=1` ("Your password
+  is set. Sign in."). A link "I don't have my recovery code" explains the consequence and
+  offers "Delete this account and everything in it" with a typed confirmation.
+- `/app/account`: "Change password" (current, new twice; re-wrap; on success the session
+  stays) and "Generate a new recovery code" (shows it once, confirmation, then replaces).
+- Verify end to end in headless Chrome with `LogMailer` links against the real stack.
+
 ## Ownership
 
 | Who | Scope (no one edits another's files) |
