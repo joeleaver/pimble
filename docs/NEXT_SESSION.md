@@ -32,7 +32,10 @@ this, then `CLAUDE.md` ("Cloud, phase 1" and "Cloud, phase 2a"), then
   traced to the server never attributing vault appends: `vaultAppend` now carries a client
   id stamped on `VaultAppended`, the web client applies everything not attributed to
   itself, the desktop link drops echoes by identity first (convergence test with two
-  servers racing). Account recovery is built in the accounts service (`/recover/start`,
+  servers racing). Verified on production (v12) by the PM with two tabs typing alternately.
+  Open: four `TypeError ... reading 'length'` in the browser console from a document
+  keydown listener in rinch-web reading `event.key` on an event without one (rinch
+  follow-up PR in progress). Account recovery is built in the accounts service (`/recover/start`,
   `/recover/{token}`, `/recover/{token}/complete`, `/me/password`, `/me/recovery-code`,
   `/recover/{token}/delete-account`, 36 tests) and the web pages are in progress (agent A).
   The server targets' cache inputs now exclude `web/` as well.
