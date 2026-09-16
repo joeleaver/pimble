@@ -55,8 +55,13 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
+  # Non-blocking until joeleaver/rhypedb#23 (rhypedb-storage's Unix-only
+  # `Mmap::advise`) is merged and pimble's pin moves past it: the release
+  # publishes with whatever packages built, and the download page hides the
+  # platform whose package is missing.
   build-windows:
     runs-on: windows-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -91,6 +96,8 @@ jobs:
 
   release:
     needs: [build-linux, build-windows]
+    # The Linux package is what the release needs; Windows may be missing (above).
+    if: always() && needs.build-linux.result == 'success'
     runs-on: ubuntu-24.04
     steps:
       - name: Download packaged artifacts
