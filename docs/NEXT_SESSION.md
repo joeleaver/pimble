@@ -37,7 +37,9 @@ this, then `CLAUDE.md` ("Cloud, phase 1" and "Cloud, phase 2a"), then
   keydown listener in rinch-web reading `event.key` on an event without one (rinch
   follow-up PR in progress). Account recovery is built in the accounts service (`/recover/start`,
   `/recover/{token}`, `/recover/{token}/complete`, `/me/password`, `/me/recovery-code`,
-  `/recover/{token}/delete-account`, 36 tests) and the web pages are in progress (agent A).
+  `/recover/{token}/delete-account`, 36 tests) and the web pages are built (`/app/forgot`, `/app/recover?token=`, change password and a
+  new recovery code on `/app/account`), verified against the real service with logged
+  links; not yet deployed.
   The server targets' cache inputs now exclude `web/` as well.
 - **Production test account** (the PM's, delete when there is a way): `pm-live-2a@resend.dev`
   with the encrypted store "Live vault".
