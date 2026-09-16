@@ -5,10 +5,8 @@ browser through trunk's proxies against the real four-process stack; deploy pend
 web menu bar (rinch PR #791, tracked as branch `feat/web-menu-bar` in both workspaces).
 Decided with Joe 2026-09-15: encryption is important and comes first, before sharing.
 Assumptions Joe has not overruled: local store files stay unencrypted on disk; signup
-issues a recovery code. Open decision: the store's display name is still plaintext in the
-hosted manifest and the accounts service (not listed in the threat model); proposal: keep
-the name inside the encrypted tree document and store an encrypted name blob for the
-account page, sending the server only the id. Decisions made during the work: the mode
+issues a recovery code. Decided 2026-09-16: the store display name stays plaintext (listed under visible
+metadata). Decisions made during the work: the mode
 field is `sync_mode` (`Store.kind` already means the store's own kind); `cloudAddHostedStore`
 starts from an empty replica; the accounts service's `rpc_url` only resolves behind an
 edge that routes `/rpc`, so the interop test runs a tiny proxy; `run_on_main_thread` from
@@ -33,8 +31,9 @@ envelopes with per-share keys.
   on first contact (member public keys are trusted on first use through the accounts
   service in this phase; envelopes are signed so later substitution is detectable), or a
   compromised device.
-- Metadata visible to the server: account emails, store ids, node ids, document ids,
-  blob sizes and timing, membership. Titles are inside the encrypted tree document.
+- Metadata visible to the server: account emails, store ids, **store display names**
+  (Joe, 2026-09-16: not worth encrypting), node ids, document ids, blob sizes and timing,
+  membership. Node titles are inside the encrypted tree document.
 
 ## Primitives (crate `pimble-crypto`, pure Rust, native and wasm32, no I/O, no async)
 

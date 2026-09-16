@@ -29,8 +29,8 @@ this, then `CLAUDE.md` ("Cloud, phase 1" and "Cloud, phase 2a"), then
   decoy for an unknown or legacy address.
 - **Production test account** (the PM's, delete when there is a way): `pm-live-2a@resend.dev`
   with the encrypted store "Live vault".
-- **Open decision (Joe):** the store display name is plaintext in the hosted manifest and
-  the accounts service; encrypt it or list it as visible metadata.
+- **Decided (Joe, 2026-09-16):** the store display name stays plaintext; it is listed as
+  visible metadata in the crypto contract.
 - **rinch is on branch `feat/web-menu-bar` (PR #791)** in both workspaces; move back to
   `main` when it merges. The PR also fixes the browser's native context menu suppression
   and a stale-handler gap; a further rinch-web defect (a context menu orphaned by a tree
@@ -137,8 +137,7 @@ after "Copy as Mount Source" again.
 0. Tag `v0.1.0` (the Windows job is unverified) and merge
    `cloud/phase-1`. Then: the desktop sign-in UI (the RPCs and CLI exist: `cloudSignIn`,
    `cloudHostStore`, `cloudAddHostedStore`; the app needs an Account menu, "Host on Pimble
-   Cloud...", "Add hosted store...", an "encrypted" badge from `sync_mode`); encrypt the
-   store display name if Joe says so; move the unwrapped keys from `keys.json` to the OS
+   Cloud...", "Add hosted store...", an "encrypted" badge from `sync_mode`); move the unwrapped keys from `keys.json` to the OS
    keychain; account recovery with the recovery code (`POST /recover` is 501); password
    change (re-wrap); then phase 2b sharing (`docs/CRYPTO_CONTRACT.md`, `docs/CLOUD_CONTRACT.md`
    "Phase 2: sharing").
