@@ -1984,24 +1984,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "fontique"
-version = "0.7.0"
-source = "git+https://github.com/linebender/parley?rev=f6a8485c35367b581b03bd6da55c8465f24e16ef#f6a8485c35367b581b03bd6da55c8465f24e16ef"
+name = "font-types"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8eb065f3251655b3c90e22e5e363f310fc5332fb3402e37bbc94752283248f6"
 dependencies = [
  "bytemuck",
- "hashbrown 0.16.1",
- "icu_locale_core",
+]
+
+[[package]]
+name = "fontique"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6688bc1294fe7117d788937b6c53480169b29c566954af490830d4c09da9516a"
+dependencies = [
+ "hashbrown 0.17.1",
  "linebender_resource_handle",
  "memmap2",
  "objc2 0.6.4",
  "objc2-core-foundation",
  "objc2-core-text",
  "objc2-foundation 0.3.2",
- "read-fonts 0.35.0",
+ "parlance",
+ "read-fonts 0.41.0",
  "roxmltree",
  "smallvec",
- "windows",
- "windows-core 0.58.0",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
  "yeslogic-fontconfig-sys",
 ]
 
@@ -2544,7 +2553,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 1.0.69",
- "windows",
+ "windows 0.58.0",
 ]
 
 [[package]]
@@ -2668,14 +2677,13 @@ dependencies = [
 
 [[package]]
 name = "harfrust"
-version = "0.3.2"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92c020db12c71d8a12a3fe7607873cade3a01a6287e29d540c8723276221b9d8"
+checksum = "c03d949a14aa089bbb282f7dd76a498a7f684428e4257202efc119ec010376f9"
 dependencies = [
  "bitflags 2.10.0",
  "bytemuck",
- "core_maths",
- "read-fonts 0.35.0",
+ "read-fonts 0.41.0",
  "smallvec",
 ]
 
@@ -2709,6 +2717,15 @@ dependencies = [
  "foldhash 0.2.0",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "hashbrown"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash 0.2.0",
 ]
 
 [[package]]
@@ -4660,16 +4677,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "parlance"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b6937eda350acc1a5d05872c3cbf99fe78619c269096e2be3d4a350058639d5"
+
+[[package]]
 name = "parley"
-version = "0.7.0"
-source = "git+https://github.com/linebender/parley?rev=f6a8485c35367b581b03bd6da55c8465f24e16ef#f6a8485c35367b581b03bd6da55c8465f24e16ef"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22d2ff88bd3f7d68d1d9b09c7e6209f9a8e8c05088295140a2bcf2e9b17038c5"
 dependencies = [
  "fontique",
  "harfrust",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
+ "icu_normalizer",
+ "icu_properties",
+ "icu_segmenter",
  "linebender_resource_handle",
- "skrifa 0.37.0",
- "swash",
+ "parlance",
+ "parley_data",
+ "skrifa 0.44.0",
+]
+
+[[package]]
+name = "parley_data"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1567535334d6ba2d3cde19221ba9a7bd0fabb3cbd99046ddfb10ae061cfcc889"
+dependencies = [
+ "icu_properties",
 ]
 
 [[package]]
@@ -5685,7 +5722,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6717cf23b488adf64b9d711329542ba34de147df262370221940dfabc2c91358"
 dependencies = [
  "bytemuck",
- "core_maths",
  "font-types 0.10.1",
 ]
 
@@ -5697,6 +5733,17 @@ checksum = "7b634fabf032fab15307ffd272149b622260f55974d9fad689292a5d33df02e5"
 dependencies = [
  "bytemuck",
  "font-types 0.11.0",
+]
+
+[[package]]
+name = "read-fonts"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "046a7d674daf459825b32f5062056d6882db0d2f5a479fbd76ccfc870ac18709"
+dependencies = [
+ "bytemuck",
+ "font-types 0.12.5",
+ "once_cell",
 ]
 
 [[package]]
@@ -6007,7 +6054,7 @@ dependencies = [
 [[package]]
 name = "rinch"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#743f8a0431c113e47386ed0bb387d694162673b5"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Fweb-menu-bar#5a36dd2fe8a8d4bb7d3472e2f03e187fe4f4e10f"
 dependencies = [
  "base64 0.22.1",
  "bytemuck",
@@ -6042,7 +6089,7 @@ dependencies = [
 [[package]]
 name = "rinch-android"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#743f8a0431c113e47386ed0bb387d694162673b5"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Fweb-menu-bar#5a36dd2fe8a8d4bb7d3472e2f03e187fe4f4e10f"
 dependencies = [
  "android-activity",
  "base64 0.22.1",
@@ -6055,7 +6102,7 @@ dependencies = [
 [[package]]
 name = "rinch-clipboard"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#743f8a0431c113e47386ed0bb387d694162673b5"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Fweb-menu-bar#5a36dd2fe8a8d4bb7d3472e2f03e187fe4f4e10f"
 dependencies = [
  "arboard",
  "js-sys",
@@ -6068,7 +6115,7 @@ dependencies = [
 [[package]]
 name = "rinch-components"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#743f8a0431c113e47386ed0bb387d694162673b5"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Fweb-menu-bar#5a36dd2fe8a8d4bb7d3472e2f03e187fe4f4e10f"
 dependencies = [
  "rinch-core",
  "rinch-macros",
@@ -6079,7 +6126,7 @@ dependencies = [
 [[package]]
 name = "rinch-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#743f8a0431c113e47386ed0bb387d694162673b5"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Fweb-menu-bar#5a36dd2fe8a8d4bb7d3472e2f03e187fe4f4e10f"
 dependencies = [
  "thiserror 1.0.69",
  "tracing",
@@ -6089,7 +6136,7 @@ dependencies = [
 [[package]]
 name = "rinch-debug"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#743f8a0431c113e47386ed0bb387d694162673b5"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Fweb-menu-bar#5a36dd2fe8a8d4bb7d3472e2f03e187fe4f4e10f"
 dependencies = [
  "serde",
  "serde_json",
@@ -6099,7 +6146,7 @@ dependencies = [
 [[package]]
 name = "rinch-dom"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#743f8a0431c113e47386ed0bb387d694162673b5"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Fweb-menu-bar#5a36dd2fe8a8d4bb7d3472e2f03e187fe4f4e10f"
 dependencies = [
  "app_units",
  "atomic_refcell",
@@ -6111,7 +6158,6 @@ dependencies = [
  "parley",
  "peniko",
  "precomputed-hash",
- "read-fonts 0.37.0",
  "rinch-core",
  "selectors",
  "serde",
@@ -6137,12 +6183,12 @@ dependencies = [
 [[package]]
 name = "rinch-editable"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#743f8a0431c113e47386ed0bb387d694162673b5"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Fweb-menu-bar#5a36dd2fe8a8d4bb7d3472e2f03e187fe4f4e10f"
 
 [[package]]
 name = "rinch-editor-collab"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#743f8a0431c113e47386ed0bb387d694162673b5"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Fweb-menu-bar#5a36dd2fe8a8d4bb7d3472e2f03e187fe4f4e10f"
 dependencies = [
  "rinch-editor-core",
  "thiserror 1.0.69",
@@ -6152,7 +6198,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#743f8a0431c113e47386ed0bb387d694162673b5"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Fweb-menu-bar#5a36dd2fe8a8d4bb7d3472e2f03e187fe4f4e10f"
 dependencies = [
  "regex",
  "thiserror 1.0.69",
@@ -6161,7 +6207,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-view"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#743f8a0431c113e47386ed0bb387d694162673b5"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Fweb-menu-bar#5a36dd2fe8a8d4bb7d3472e2f03e187fe4f4e10f"
 dependencies = [
  "rinch-core",
  "rinch-editor-collab",
@@ -6171,7 +6217,7 @@ dependencies = [
 [[package]]
 name = "rinch-macros"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#743f8a0431c113e47386ed0bb387d694162673b5"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Fweb-menu-bar#5a36dd2fe8a8d4bb7d3472e2f03e187fe4f4e10f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6181,7 +6227,7 @@ dependencies = [
 [[package]]
 name = "rinch-platform"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#743f8a0431c113e47386ed0bb387d694162673b5"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Fweb-menu-bar#5a36dd2fe8a8d4bb7d3472e2f03e187fe4f4e10f"
 dependencies = [
  "peniko",
  "vello",
@@ -6191,7 +6237,7 @@ dependencies = [
 [[package]]
 name = "rinch-tabler-icons"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#743f8a0431c113e47386ed0bb387d694162673b5"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Fweb-menu-bar#5a36dd2fe8a8d4bb7d3472e2f03e187fe4f4e10f"
 dependencies = [
  "heck 0.5.0",
  "rinch-core",
@@ -6203,12 +6249,12 @@ dependencies = [
 [[package]]
 name = "rinch-theme"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#743f8a0431c113e47386ed0bb387d694162673b5"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Fweb-menu-bar#5a36dd2fe8a8d4bb7d3472e2f03e187fe4f4e10f"
 
 [[package]]
 name = "rinch-web"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#743f8a0431c113e47386ed0bb387d694162673b5"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Fweb-menu-bar#5a36dd2fe8a8d4bb7d3472e2f03e187fe4f4e10f"
 dependencies = [
  "js-sys",
  "rinch",
@@ -6723,6 +6769,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "skrifa"
+version = "0.44.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "819ab7d62b1d3e72d9d9dea5650bac30424f9111364bb94928dbf5ecad1baa68"
+dependencies = [
+ "bytemuck",
+ "read-fonts 0.41.0",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7078,7 +7134,7 @@ checksum = "fd15301b4756455af51fda9835655e48812dd4175e80947fd5d6a4b57ee30e89"
 [[package]]
 name = "stylo_taffy"
 version = "0.2.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#743f8a0431c113e47386ed0bb387d694162673b5"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Fweb-menu-bar#5a36dd2fe8a8d4bb7d3472e2f03e187fe4f4e10f"
 dependencies = [
  "stylo",
  "stylo_atoms",
@@ -8811,7 +8867,7 @@ dependencies = [
  "wasm-bindgen",
  "web-sys",
  "wgpu-types",
- "windows",
+ "windows 0.58.0",
  "windows-core 0.58.0",
 ]
 
@@ -8888,6 +8944,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "windows"
+version = "0.62.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "527fadee13e0c05939a6a05d5bd6eec6cd2e3dbd648b9f8e447c6518133d8580"
+dependencies = [
+ "windows-collections",
+ "windows-core 0.62.2",
+ "windows-future",
+ "windows-numerics",
+]
+
+[[package]]
+name = "windows-collections"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b2d95af1a8a14a3c7367e1ed4fc9c20e0a26e79551b1454d72583c97cc6610"
+dependencies = [
+ "windows-core 0.62.2",
+]
+
+[[package]]
 name = "windows-core"
 version = "0.58.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8911,6 +8988,17 @@ dependencies = [
  "windows-link",
  "windows-result 0.4.1",
  "windows-strings 0.5.1",
+]
+
+[[package]]
+name = "windows-future"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1d6f90251fe18a279739e78025bd6ddc52a7e22f921070ccdc67dde84c605cb"
+dependencies = [
+ "windows-core 0.62.2",
+ "windows-link",
+ "windows-threading",
 ]
 
 [[package]]
@@ -8962,6 +9050,16 @@ name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-numerics"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e2e40844ac143cdb44aead537bbf727de9b044e107a0f1220392177d15b0f26"
+dependencies = [
+ "windows-core 0.62.2",
+ "windows-link",
+]
 
 [[package]]
 name = "windows-registry"
@@ -9102,6 +9200,15 @@ dependencies = [
  "windows_x86_64_gnu 0.53.1",
  "windows_x86_64_gnullvm 0.53.1",
  "windows_x86_64_msvc 0.53.1",
+]
+
+[[package]]
+name = "windows-threading"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3949bd5b99cafdf1c7ca86b43ca564028dfe27d66958f2470940f73d86d75b37"
+dependencies = [
+ "windows-link",
 ]
 
 [[package]]
