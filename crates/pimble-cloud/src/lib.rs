@@ -52,10 +52,15 @@ pub async fn build_state_with_mailer(config: Config, mailer: std::sync::Arc<dyn 
     // CRYPTO_CONTRACT.md's migration note) and can never really log in
     // again; deleting it here means every request this process answers sees
     // a clean database, not just the ones that happen to hit the handlers'
-    // own defensive checks for one.
-    let deleted_legacy_users = db.delete_legacy_users_without_keys().await?;
-    if deleted_legacy_users > 0 {
-        tracing::warn!(count = deleted_legacy_users, "deleted legacy pre-Phase-2a user(s) with no key material at startup");
+    // own defensive checks for one. Never lets a startup failure follow
+    // from this: a database this process can otherwise serve requests
+    // against just fine must not crash-loop the whole service over a
+    // best-effort cleanup, so any error here is logged at `error` and
+    // startup continues regardless.
+    match db.delete_legacy_users_without_keys().await {
+        Ok(0) => {}
+        Ok(deleted) => tracing::warn!(count = deleted, "deleted legacy pre-Phase-2a user(s) with no key material at startup"),
+        Err(e) => tracing::error!(error = %e, "startup cleanup of legacy pre-Phase-2a users failed; continuing to start anyway"),
     }
     let pimble = PimbleService::connect(&config).await?;
     let signer = JwtSigner::from_config(&config);

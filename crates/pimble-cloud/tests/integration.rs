@@ -1235,6 +1235,33 @@ async fn legacy_keyless_users_and_their_sessions_and_grants_are_deleted_at_start
     assert!(second_state.db.find_grant(legacy.rid, hosted.rid).await.unwrap().is_none(), "its grant should be deleted too");
 }
 
+/// A live crash: `delete_legacy_users_without_keys` used to deserialize
+/// every row into a typed `UserRow` to decide what to delete, so a row from
+/// before email verification existed — missing `verified`,
+/// `verify_token_hash`, `verify_expires_at`, and every Phase 2a field, not
+/// just the ones Phase 2a added — failed that parse and took the whole
+/// startup down with it (`Error: 500 Internal Server Error internal:
+/// User.verified: expected a Bool, got None`, crash-looping in production).
+/// The cleanup must delete a row this bare by id, never deserializing it,
+/// and normal lookups (`find_user_by_email`) must tolerate it too rather
+/// than 500ing before the cleanup gets a chance to run.
+#[tokio::test(flavor = "multi_thread")]
+async fn phase1_shape_user_does_not_crash_startup_or_lookups() {
+    let stack = skip_without_rhypedb!();
+    let email = "phase1-shape@example.com";
+    let user_rid = stack.app_state.db.create_phase1_shape_user_for_tests(email, "irrelevant-hash").await.unwrap();
+    assert!(stack.app_state.db.user_exists_for_tests(user_rid).await.unwrap());
+
+    // A normal lookup (e.g. what `GET /kdf`, `POST /login` do) must not 500
+    // on it, even before any cleanup runs.
+    assert!(stack.app_state.db.find_user_by_email(email).await.unwrap().is_some(), "a bare phase-1-shape row must still be readable");
+
+    // The startup cleanup, run again as a fresh `build_state` would on a
+    // restart, must delete it by id without ever deserializing it.
+    let second_state = pimble_cloud::build_state(stack.app_state.config.clone()).await.expect("build_state must not fail on a phase-1-shape row");
+    assert!(!second_state.db.user_exists_for_tests(user_rid).await.unwrap(), "a phase-1-shape row must be deleted at startup like any other keyless row");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn me_keys_round_trips_through_real_crypto_and_never_returns_recovery() {
     let stack = skip_without_rhypedb!();

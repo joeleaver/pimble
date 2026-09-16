@@ -51,6 +51,18 @@ fn get_bool(o: &Object, field: &str) -> CloudResult<bool> {
     }
 }
 
+/// Like [`get_string_opt`], for a `Bool` field.
+fn get_bool_opt(o: &Object, field: &str) -> CloudResult<Option<bool>> {
+    match o.fields.get(field) {
+        None => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        other => Err(CloudError::Internal(format!(
+            "{}.{field}: expected a Bool or to be absent, got {other:?}",
+            o.type_name
+        ))),
+    }
+}
+
 fn get_u64(o: &Object, field: &str) -> CloudResult<u64> {
     match o.fields.get(field) {
         Some(Value::U64(v)) => Ok(*v),
@@ -104,6 +116,18 @@ fn get_datetime_ms(o: &Object, field: &str) -> CloudResult<i64> {
     }
 }
 
+/// Like [`get_string_opt`], for a `DateTime` field.
+fn get_datetime_ms_opt(o: &Object, field: &str) -> CloudResult<Option<i64>> {
+    match o.fields.get(field) {
+        None => Ok(None),
+        Some(Value::DateTime(ms)) => Ok(Some(*ms)),
+        other => Err(CloudError::Internal(format!(
+            "{}.{field}: expected a DateTime or to be absent, got {other:?}",
+            o.type_name
+        ))),
+    }
+}
+
 fn datetime_literal(ms: i64) -> String {
     // RFC 3339 is easier to read in a query than an epoch-millis integer
     // (both parse identically per docs/src/queries.md's Literals table).
@@ -121,6 +145,13 @@ fn now_literal() -> String {
 /// instead of a generic 500.
 fn is_unique_violation(err: &rhypedb_client::Error, field: &str) -> bool {
     matches!(err, rhypedb_client::Error::Server(msg) if msg.contains("unique constraint violated") && msg.contains(field))
+}
+
+/// True when `err` is `Type.get(id)` on an id that doesn't exist — the
+/// engine raises an error for this rather than an empty result, unlike
+/// `.filter(...)` matching nothing.
+fn is_not_found(err: &rhypedb_client::Error) -> bool {
+    matches!(err, rhypedb_client::Error::Server(msg) if msg.contains("object not found"))
 }
 
 #[derive(Debug, Clone)]
@@ -261,12 +292,26 @@ pub struct KeyGrantRow {
 fn user_from_object(o: &Object) -> CloudResult<UserRow> {
     Ok(UserRow {
         rid: o.id,
-        user_uuid: get_string(o, "user_uuid")?.to_string(),
+        // Absent on the very bare "only email/email_lower/password_hash/
+        // created_at" phase-1 shape too (confirmed by
+        // `create_phase1_shape_user_for_tests` in the integration tests,
+        // which omits it and still creates successfully) — defaults to ""
+        // rather than erroring, the same sentinel `verify_token_hash` uses.
+        // A row this bare has no key material either, so it's gone by the
+        // next startup cleanup regardless; nothing meaningful ever reads
+        // this fallback value in the meantime (a keyless account can never
+        // reach `issue_session`, the one place `user_uuid` becomes a JWT
+        // `sub` or an API-visible id).
+        user_uuid: get_string_opt(o, "user_uuid")?.map(str::to_string).unwrap_or_default(),
         email: get_string(o, "email")?.to_string(),
         password_hash: get_string(o, "password_hash")?.to_string(),
-        verified: get_bool(o, "verified")?,
-        verify_token_hash: get_string(o, "verify_token_hash")?.to_string(),
-        verify_expires_at_ms: get_datetime_ms(o, "verify_expires_at")?,
+        // A phase-1 row (created before email verification existed) has
+        // none of these three either — absent defaults to "unverified, no
+        // live token", the same safe state a real never-verified account
+        // has, not an error (the live crash this replaced).
+        verified: get_bool_opt(o, "verified")?.unwrap_or(false),
+        verify_token_hash: get_string_opt(o, "verify_token_hash")?.map(str::to_string).unwrap_or_default(),
+        verify_expires_at_ms: get_datetime_ms_opt(o, "verify_expires_at")?.unwrap_or(0),
         kdf_salt: get_string_opt(o, "kdf_salt")?.map(str::to_string),
         kdf_m_cost: get_u32_opt(o, "kdf_m_cost")?,
         kdf_t_cost: get_u32_opt(o, "kdf_t_cost")?,
@@ -449,15 +494,6 @@ impl RhypeDb {
         self.one(&q).await?.map(|o| user_from_object(&o)).transpose()
     }
 
-    /// Every `User` row — `User` alone (no `.filter`) is "all objects of
-    /// `User`" per docs/src/queries.md's `Sources` table. Used only by
-    /// [`Self::delete_legacy_users_without_keys`]: the query language has no
-    /// "field is absent" predicate to filter on server-side, so that scan
-    /// happens in Rust over every row instead.
-    async fn all_users(&self) -> CloudResult<Vec<UserRow>> {
-        self.objects("User").await?.iter().map(user_from_object).collect()
-    }
-
     pub async fn delete_user(&self, user_rid: u64) -> CloudResult<()> {
         self.objects(&format!("User.get({user_rid}).delete()")).await?;
         Ok(())
@@ -485,6 +521,39 @@ impl RhypeDb {
         user_from_object(&obj)
     }
 
+    /// Test-only: creates a `User` row shaped like the very first accounts
+    /// this crate ever had — only the four fields present before email
+    /// verification (`verified`/`verify_token_hash`/`verify_expires_at`),
+    /// let alone Phase 2a's key material, existed. Returns the raw object
+    /// id, not a `UserRow`: `user_from_object` itself fails on a row this
+    /// bare (missing even `user_uuid`), which is exactly the shape
+    /// [`Self::delete_legacy_users_without_keys`] must tolerate without
+    /// ever deserializing it.
+    pub async fn create_phase1_shape_user_for_tests(&self, email: &str, password_hash: &str) -> CloudResult<u64> {
+        let email_lower = email.to_lowercase();
+        let q = format!(
+            "User.create({{ email: {email}, email_lower: {email_lower}, password_hash: {hash}, created_at: {now} }})",
+            email = ql_str(email),
+            email_lower = ql_str(&email_lower),
+            hash = ql_str(password_hash),
+            now = now_literal(),
+        );
+        let obj = self.objects(&q).await?.into_iter().next().ok_or_else(|| CloudError::Internal("User.create returned nothing".into()))?;
+        Ok(obj.id)
+    }
+
+    /// Test-only: whether `User.get(user_rid)` still returns a row, without
+    /// trying to deserialize it into a `UserRow` — a phase-1-shape row
+    /// (see [`Self::create_phase1_shape_user_for_tests`]) would fail that
+    /// parse even while it still exists.
+    pub async fn user_exists_for_tests(&self, user_rid: u64) -> CloudResult<bool> {
+        match self.client.query(&format!("User.get({user_rid})")).await {
+            Ok(result) => Ok(!result.into_objects().is_empty()),
+            Err(e) if is_not_found(&e) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Deletes every `User` row with no key material (`kdf_salt` absent —
     /// see [`UserRow::has_key_material`]), along with its sessions and
     /// grants, and returns how many were deleted. Run once at startup
@@ -495,17 +564,28 @@ impl RhypeDb {
     /// `warn`.
     pub async fn delete_legacy_users_without_keys(&self) -> CloudResult<usize> {
         let mut deleted = 0usize;
-        for user in self.all_users().await? {
-            if user.has_key_material() {
+        // Raw objects, not `UserRow`/`user_from_object`: a phase-1 row
+        // (created before email verification, let alone Phase 2a's key
+        // material, existed) can be missing almost any field this crate has
+        // added since, and typed parsing would fail on it before this
+        // cleanup ever got to decide whether to delete it — the startup
+        // crash this replaced. The only thing that matters here is whether
+        // `kdf_salt` is present as a String; everything else about the row
+        // is irrelevant to that decision, and only its id is needed to
+        // delete it.
+        for user_object in self.objects("User").await? {
+            let has_key_material = matches!(user_object.fields.get("kdf_salt"), Some(Value::String(_)));
+            if has_key_material {
                 continue;
             }
-            for session in self.sessions_for_user(user.rid).await? {
+            let user_rid = user_object.id;
+            for session in self.sessions_for_user(user_rid).await? {
                 self.delete_session(session.rid).await?;
             }
-            for grant in self.grants_for_user(user.rid).await? {
+            for grant in self.grants_for_user(user_rid).await? {
                 self.delete_grant(grant.rid).await?;
             }
-            self.delete_user(user.rid).await?;
+            self.delete_user(user_rid).await?;
             deleted += 1;
         }
         Ok(deleted)
