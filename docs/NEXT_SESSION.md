@@ -27,6 +27,15 @@ this, then `CLAUDE.md` ("Cloud, phase 1" and "Cloud, phase 2a"), then
   generation with later fields optional, its startup cleanup removed the seven keyless
   accounts (logged), a cleanup error can no longer stop the service, and `kdf` answers the
   decoy for an unknown or legacy address.
+- **2026-09-16 afternoon:** rinch PR #791 merged and both workspaces are back on `main`
+  (deployed as v11). A live two-tab bug (a concurrent typist's edits lost in one direction)
+  traced to the server never attributing vault appends: `vaultAppend` now carries a client
+  id stamped on `VaultAppended`, the web client applies everything not attributed to
+  itself, the desktop link drops echoes by identity first (convergence test with two
+  servers racing). Account recovery is built in the accounts service (`/recover/start`,
+  `/recover/{token}`, `/recover/{token}/complete`, `/me/password`, `/me/recovery-code`,
+  `/recover/{token}/delete-account`, 36 tests) and the web pages are in progress (agent A).
+  The server targets' cache inputs now exclude `web/` as well.
 - **Production test account** (the PM's, delete when there is a way): `pm-live-2a@resend.dev`
   with the encrypted store "Live vault".
 - **Decided (Joe, 2026-09-16):** the store display name stays plaintext; it is listed as
