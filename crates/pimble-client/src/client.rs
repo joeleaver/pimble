@@ -953,9 +953,27 @@ impl PimbleClient {
         doc_id: VaultDocId,
         blob: String,
     ) -> Result<u64> {
+        self.vault_append_from(store_id, doc_id, blob, None).await
+    }
+
+    /// Like [`PimbleClient::vault_append`], but attributes the append to
+    /// `client_id`: it rides the `VaultAppended` notification's
+    /// `source_client_id`, the same way `applyEdit`'s `client_id` does, so a
+    /// caller (e.g. the desktop `VaultLink`, with `vault-link:<uuid>`) can
+    /// drop its own echo by identity, keeping a seen-seq set as a second
+    /// guard. A separate method rather than a new required parameter on
+    /// `vault_append`, so every existing caller (the web vault client, the
+    /// CLI, `VaultLink`) keeps compiling unchanged.
+    pub async fn vault_append_from(
+        &self,
+        store_id: StoreId,
+        doc_id: VaultDocId,
+        blob: String,
+        client_id: Option<String>,
+    ) -> Result<u64> {
         let response = self
             .client
-            .vault_append(VaultAppendRequest { store_id, doc_id, blob })
+            .vault_append(VaultAppendRequest { store_id, doc_id, blob, client_id })
             .await
             .map_err(rpc_error)?;
         Ok(response.seq)

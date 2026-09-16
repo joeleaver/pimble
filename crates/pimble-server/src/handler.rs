@@ -1474,13 +1474,13 @@ impl PimbleApiServer for RpcHandler {
         drop(manager);
 
         // The blob rides the notification verbatim (still base64url) so a
-        // live subscriber never re-fetches; there is no per-caller client id
-        // in `VaultAppendRequest` to echo-suppress on, so `source_client_id`
-        // is always `None` here.
+        // live subscriber never re-fetches; `source_client_id` carries the
+        // caller's id (the same way `applyEdit`'s `client_id` propagates),
+        // so a client can drop its own echo by identity, not only by seq.
         let notification = StoreChangedNotification {
             store_id: request.store_id,
             change_kind: StoreChangeKind::VaultAppended { doc_id: request.doc_id.clone(), seq },
-            source_client_id: None,
+            source_client_id: request.client_id.clone(),
             update: Some(request.blob.clone()),
         };
         self.subscriptions.write().await.notify_store_change(&notification).await;

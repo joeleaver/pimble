@@ -68,6 +68,12 @@ pub struct VaultAppendRequest {
     pub store_id: StoreId,
     pub doc_id: VaultDocId,
     pub blob: String,
+    /// The caller's id, echoed as `source_client_id` on the `VaultAppended`
+    /// notification (the same way `applyEdit`'s `client_id` propagates), so
+    /// a client can drop its own echo by identity rather than only by
+    /// tracking sequence numbers it has already seen.
+    #[serde(default)]
+    pub client_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -318,6 +318,51 @@ async fn subscription_delivers_vault_appended_with_the_blob() {
     assert_eq!(notif.update.as_deref(), Some(blob.as_str()), "the blob should ride the notification so a live subscriber never re-fetches");
 }
 
+// ── 8b. vaultAppend's client_id names the source on the notification ────
+
+#[tokio::test]
+async fn vault_append_with_a_client_id_names_it_in_the_notification() {
+    let (_server, client) = start_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (store_id, _root) = client.create_store_with(dir.path().join("v.pimble"), "V", StoreKind::Vault, None).await.unwrap();
+
+    // Two independent subscribers, both watching before the append happens.
+    let mut sub_a = client.subscribe_store_changes(store_id).await.unwrap();
+    let mut sub_b = client.subscribe_store_changes(store_id).await.unwrap();
+
+    let seq = client
+        .vault_append_from(store_id, VaultDocId::Tree, b64(b"hi"), Some("client-a".to_string()))
+        .await
+        .unwrap();
+
+    for sub in [&mut sub_a, &mut sub_b] {
+        let notif = tokio::time::timeout(Duration::from_secs(2), sub.next())
+            .await
+            .expect("a notification should arrive within 2s")
+            .expect("the subscription stream should not end")
+            .expect("the notification should deserialize");
+
+        assert_eq!(notif.source_client_id.as_deref(), Some("client-a"), "source_client_id should name the appending client");
+        match notif.change_kind {
+            StoreChangeKind::VaultAppended { doc_id, seq: notified_seq } => {
+                assert_eq!(doc_id, VaultDocId::Tree);
+                assert_eq!(notified_seq, seq);
+            }
+            other => panic!("expected VaultAppended, got {:?}", other),
+        }
+    }
+
+    // Omitting a client_id (the plain `vault_append` wrapper) still works
+    // and names no source, as before.
+    client.vault_append(store_id, VaultDocId::Tree, b64(b"anonymous")).await.unwrap();
+    let notif = tokio::time::timeout(Duration::from_secs(2), sub_a.next())
+        .await
+        .expect("a notification should arrive within 2s")
+        .expect("the subscription stream should not end")
+        .expect("the notification should deserialize");
+    assert_eq!(notif.source_client_id, None);
+}
+
 // ── 9. A truncated trailing log record is dropped when the store reopens ──
 
 #[tokio::test]
