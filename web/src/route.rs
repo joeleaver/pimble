@@ -30,6 +30,10 @@ const BASE: &str = "/app";
 pub enum Route {
     Signup,
     Login,
+    /// "I forgot my password": ask for the address to mail a link to.
+    Forgot,
+    /// The link's destination, carrying the token in its query.
+    Recover,
     Account,
     /// The app itself: the tree, the editor, the stores.
     App,
@@ -40,6 +44,8 @@ impl Route {
         match self {
             Route::Signup => "/app/signup",
             Route::Login => "/app/login",
+            Route::Forgot => "/app/forgot",
+            Route::Recover => "/app/recover",
             Route::Account => "/app/account",
             Route::App => "/app/",
         }
@@ -71,6 +77,8 @@ fn from_path(path: &str) -> Route {
     match rest.trim_end_matches('/') {
         "/signup" => Route::Signup,
         "/login" => Route::Login,
+        "/forgot" => Route::Forgot,
+        "/recover" => Route::Recover,
         "/account" => Route::Account,
         _ => Route::App,
     }
@@ -129,6 +137,8 @@ pub fn render(route: Route) {
         }
         Route::Signup => mount_page(crate::pages::signup::signup_page),
         Route::Login => mount_page(crate::pages::login::login_page),
+        Route::Forgot => mount_page(crate::pages::forgot::forgot_page),
+        Route::Recover => mount_page(crate::pages::recover::recover_page),
         Route::Account => mount_page(crate::pages::account::account_page),
     }
 }
@@ -239,6 +249,8 @@ mod tests {
         assert_eq!(from_path("/app/login"), Route::Login);
         assert_eq!(from_path("/app/login/"), Route::Login);
         assert_eq!(from_path("/app/signup"), Route::Signup);
+        assert_eq!(from_path("/app/forgot"), Route::Forgot);
+        assert_eq!(from_path("/app/recover"), Route::Recover);
         assert_eq!(from_path("/app/account"), Route::Account);
         assert_eq!(from_path("/app/"), Route::App);
         assert_eq!(from_path("/app"), Route::App);

@@ -149,6 +149,121 @@ pub async fn lookup_user(email: &str) -> ApiResult<UserLookup> {
     http::get(&format!("/api/v1/users/lookup?email={}", query_escape(email))).await
 }
 
+// ── Recovery, and changing what the password is ─────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct EmailRequest<'a> {
+    email: &'a str,
+}
+
+/// `POST /api/v1/recover/start`. Always 202, whatever the address is: an
+/// answer that varied would say who has an account here.
+pub async fn recover_start(email: &str) -> ApiResult<()> {
+    http::post::<_, Value>("/api/v1/recover/start", &EmailRequest { email })
+        .await
+        .map(|_| ())
+}
+
+/// What a recovery token buys: the wrapped keys, and the parameters for the
+/// one KEK that opens them.
+///
+/// This is the only place the recovery blob is ever served, and only to
+/// whoever holds the emailed token. It is still useless without the code.
+#[derive(Debug, Clone)]
+pub struct RecoveryMaterial {
+    pub email: String,
+    /// The recovery code's Argon2id parameters, salt included.
+    pub kdf: KdfParams,
+    pub recovery_key_blob: AccountKeyBlob,
+    pub public_keys: AccountPublicKeys,
+}
+
+/// `GET /api/v1/recover/{token}`. A 404 means the link is unknown, expired or
+/// already used.
+pub async fn recover_material(token: &str) -> ApiResult<RecoveryMaterial> {
+    let raw: Value = http::get(&format!("/api/v1/recover/{}", query_escape(token))).await?;
+
+    // The salt travels beside the costs rather than inside them, because the
+    // server stores it on the user.
+    let costs = &raw["recovery_kdf"];
+    let salt = raw["recovery_salt"]
+        .as_str()
+        .ok_or_else(|| ApiError::local("the recovery salt was missing"))?
+        .to_string();
+    let kdf = KdfParams {
+        salt,
+        m_cost: costs["m_cost"].as_u64().unwrap_or(pimble_crypto::KDF_M_COST_KIB as u64) as u32,
+        t_cost: costs["t_cost"].as_u64().unwrap_or(pimble_crypto::KDF_T_COST as u64) as u32,
+        p_cost: costs["p_cost"].as_u64().unwrap_or(pimble_crypto::KDF_P_COST as u64) as u32,
+    };
+
+    Ok(RecoveryMaterial {
+        email: raw["email"].as_str().unwrap_or_default().to_string(),
+        kdf,
+        recovery_key_blob: lenient(&raw["recovery_key_blob"], "recovery key blob")?,
+        public_keys: lenient(&raw["public_keys"], "public keys")?,
+    })
+}
+
+/// Everything the client rotated while it held the account keys: the password
+/// material and a fresh recovery code's.
+#[derive(Debug, Serialize)]
+pub struct RecoverCompleteRequest {
+    pub auth_key: String,
+    pub kdf: KdfParams,
+    pub account_key_blob: AccountKeyBlob,
+    pub recovery_salt: String,
+    pub recovery_key_blob: AccountKeyBlob,
+}
+
+/// `POST /api/v1/recover/{token}/complete`. Consumes the token and drops every
+/// session, so the answer starts none: the next step is signing in.
+pub async fn recover_complete(token: &str, request: &RecoverCompleteRequest) -> ApiResult<()> {
+    http::post::<_, Value>(
+        &format!("/api/v1/recover/{}/complete", query_escape(token)),
+        request,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// `POST /api/v1/recover/{token}/delete-account`, for someone who cannot
+/// recover. There is nothing else this token can do for them.
+pub async fn recover_delete_account(token: &str) -> ApiResult<()> {
+    http::post_empty::<Value>(&format!(
+        "/api/v1/recover/{}/delete-account",
+        query_escape(token)
+    ))
+    .await
+    .map(|_| ())
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChangePasswordRequest {
+    /// The current password's `auth_key`, checked the way login checks one.
+    pub current_auth_key: String,
+    pub auth_key: String,
+    pub kdf: KdfParams,
+    pub account_key_blob: AccountKeyBlob,
+}
+
+/// `POST /api/v1/me/password`.
+pub async fn change_password(request: &ChangePasswordRequest) -> ApiResult<()> {
+    http::post::<_, Value>("/api/v1/me/password", request).await.map(|_| ())
+}
+
+#[derive(Debug, Serialize)]
+pub struct NewRecoveryCodeRequest {
+    pub recovery_salt: String,
+    pub recovery_key_blob: AccountKeyBlob,
+}
+
+/// `POST /api/v1/me/recovery-code`, replacing the old code's material with a
+/// new one the client wrapped while holding the keys.
+pub async fn replace_recovery_code(request: &NewRecoveryCodeRequest) -> ApiResult<()> {
+    http::post::<_, Value>("/api/v1/me/recovery-code", request).await.map(|_| ())
+}
+
 // ── Stores and members ──────────────────────────────────────────────────────
 
 /// One store this account has a grant on.

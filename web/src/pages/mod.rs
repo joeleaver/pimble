@@ -7,7 +7,9 @@
 //! app is `crate::route::go`, never a link that reloads.
 
 pub mod account;
+pub mod forgot;
 pub mod login;
+pub mod recover;
 pub mod signup;
 
 /// Layout for the three account pages. Everything else comes from rinch's

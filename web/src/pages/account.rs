@@ -11,14 +11,23 @@
 //! blobs readable). The store key has to be opened here to seal a copy of it,
 //! so this only works while the account is unlocked.
 
+use pimble_crypto::{
+    derive_recovery_kek, encode_auth_key, generate_recovery_code, wrap_account_keys, KdfParams,
+};
 use rinch::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::accounts::{self, MemberView, StoreView};
+use crate::accounts::{
+    self, ChangePasswordRequest, MemberView, NewRecoveryCodeRequest, StoreView,
+};
 use crate::keys;
 use crate::pages::PAGE_CSS;
 use crate::route::{self, Route};
-use crate::session;
+use crate::session::{self, derive_timed};
+use crate::util::yield_to_browser;
+
+/// The shortest password the accounts service accepts.
+const MIN_PASSWORD: usize = 8;
 
 const ROLES: [&str; 3] = ["owner", "editor", "reader"];
 
@@ -53,6 +62,77 @@ pub fn account_page() -> NodeHandle {
     let member_busy = Signal::new(false);
 
     let who = Signal::new(session::email().unwrap_or_default());
+
+    // "Change password" and "Generate a new recovery code". Both need the
+    // account keys in hand: the point of either is to wrap the same keys under
+    // something new, and this page is the only place that holds them unwrapped.
+    let current_password = Signal::new(String::new());
+    let new_password = Signal::new(String::new());
+    let new_password_again = Signal::new(String::new());
+    let password_busy = Signal::new(false);
+    let password_note = Signal::new(String::new());
+    let password_error = Signal::new(String::new());
+
+    let fresh_code = Signal::new(String::new());
+    let code_saved = Signal::new(false);
+    let code_busy = Signal::new(false);
+    let code_error = Signal::new(String::new());
+
+    let do_change_password = move || {
+        if untracked(|| password_busy.get()) {
+            return;
+        }
+        let current = untracked(|| current_password.get());
+        let next = untracked(|| new_password.get());
+        let again = untracked(|| new_password_again.get());
+        if current.is_empty() {
+            password_error.set("Enter your current password.".to_string());
+            return;
+        }
+        if next.chars().count() < MIN_PASSWORD {
+            password_error.set(format!("Use at least {MIN_PASSWORD} characters."));
+            return;
+        }
+        if next != again {
+            password_error.set("The two new passwords do not match.".to_string());
+            return;
+        }
+        password_error.set(String::new());
+        password_note.set(String::new());
+        password_busy.set(true);
+        spawn_local(async move {
+            yield_to_browser().await;
+            match change_password(&current, &next).await {
+                Ok(()) => {
+                    current_password.set(String::new());
+                    new_password.set(String::new());
+                    new_password_again.set(String::new());
+                    password_note.set("Your password is changed.".to_string());
+                }
+                Err(message) => password_error.set(message),
+            }
+            password_busy.set(false);
+        });
+    };
+
+    let do_new_recovery_code = move || {
+        if untracked(|| code_busy.get()) {
+            return;
+        }
+        code_error.set(String::new());
+        code_busy.set(true);
+        spawn_local(async move {
+            yield_to_browser().await;
+            match new_recovery_code().await {
+                Ok(code) => {
+                    code_saved.set(false);
+                    fresh_code.set(code);
+                }
+                Err(message) => code_error.set(message),
+            }
+            code_busy.set(false);
+        });
+    };
 
     let refresh = move || {
         loading.set(true);
@@ -334,6 +414,99 @@ pub fn account_page() -> NodeHandle {
                     "An encrypted store's key is made here and sealed to your account. \
                      Pimble Cloud stores the blobs and never sees the key."
                 }
+
+                Divider { size: "sm" }
+
+                h2 { style: "margin: 0; font-size: 16px;", "Change password" }
+
+                div {
+                    class: "pimble-row",
+                    PasswordInput {
+                        label: "Current password",
+                        size: "sm",
+                        toggle_visibility: false,
+                        value_fn: move || current_password.get(),
+                        oninput: move |value: String| current_password.set(value),
+                    }
+                    PasswordInput {
+                        label: "New password",
+                        size: "sm",
+                        toggle_visibility: false,
+                        value_fn: move || new_password.get(),
+                        oninput: move |value: String| new_password.set(value),
+                    }
+                    PasswordInput {
+                        label: "New password again",
+                        size: "sm",
+                        toggle_visibility: false,
+                        value_fn: move || new_password_again.get(),
+                        oninput: move |value: String| new_password_again.set(value),
+                    }
+                    div {
+                        class: "pimble-row__fixed",
+                        Button {
+                            variant: "filled",
+                            size: "sm",
+                            loading: {|| password_busy.get()},
+                            disabled: {|| password_busy.get()},
+                            onclick: do_change_password,
+                            "Change password"
+                        }
+                    }
+                }
+
+                if !password_error.get().is_empty() {
+                    div { class: "pimble-page__error", {|| password_error.get()} }
+                }
+                if !password_note.get().is_empty() {
+                    div { class: "pimble-page__lede", {|| password_note.get()} }
+                }
+
+                Divider { size: "sm" }
+
+                h2 { style: "margin: 0; font-size: 16px;", "Recovery code" }
+
+                if fresh_code.get().is_empty() {
+                    div {
+                        style: "display: flex; flex-direction: column; gap: 10px;",
+                        p { class: "pimble-page__lede",
+                            "A new code replaces the old one, which stops working. Your \
+                             password is unchanged."
+                        }
+                        Button {
+                            variant: "light",
+                            size: "sm",
+                            loading: {|| code_busy.get()},
+                            disabled: {|| code_busy.get()},
+                            onclick: do_new_recovery_code,
+                            "Generate a new recovery code"
+                        }
+                    }
+                } else {
+                    div {
+                        style: "display: flex; flex-direction: column; gap: 10px;",
+                        p { class: "pimble-page__lede",
+                            "Shown once. The old code no longer works."
+                        }
+                        div { class: "pimble-recovery", {|| fresh_code.get()} }
+                        Checkbox {
+                            label: "I have written this down somewhere safe",
+                            checked_fn: move || code_saved.get(),
+                            onchange: move || code_saved.update(|v| *v = !*v),
+                        }
+                        Button {
+                            variant: "filled",
+                            size: "sm",
+                            disabled: {|| !code_saved.get()},
+                            onclick: move || fresh_code.set(String::new()),
+                            "Done"
+                        }
+                    }
+                }
+
+                if !code_error.get().is_empty() {
+                    div { class: "pimble-page__error", {|| code_error.get()} }
+                }
             }
         }
     }
@@ -375,4 +548,58 @@ async fn add_member(store_id: &str, email: &str, role: &str, is_vault: bool) -> 
 
     accounts::put_member(store_id, email, role).await.map_err(|e| e.message)?;
     Ok(())
+}
+
+/// Wrap the account keys under a new password and tell the service.
+///
+/// The keys themselves do not change, so nothing that was shared stops being
+/// readable; only what opens them does. The current password is proved the way
+/// login proves one, with its `auth_key`, and the service checks that before
+/// accepting the new material.
+async fn change_password(current: &str, next: &str) -> Result<(), String> {
+    let keys = session::keys().ok_or("Unlock your account first.")?;
+
+    // The current password's `auth_key` is derived under the *current*
+    // parameters, which are the ones the service still has.
+    let my_keys = accounts::my_keys().await.map_err(|e| e.message)?;
+    let current_derived = derive_timed(current, &my_keys.kdf).map_err(|e| e.to_string())?;
+
+    let kdf = KdfParams::generate();
+    let derived = derive_timed(next, &kdf).map_err(|e| e.to_string())?;
+    let account_key_blob =
+        wrap_account_keys(&keys, &derived.kek).map_err(|e| format!("Wrapping failed: {e}"))?;
+
+    accounts::change_password(&ChangePasswordRequest {
+        current_auth_key: encode_auth_key(&current_derived.auth_key),
+        auth_key: encode_auth_key(&derived.auth_key),
+        kdf,
+        account_key_blob,
+    })
+    .await
+    .map_err(|e| match e.status {
+        401 => "That is not your current password.".to_string(),
+        _ => e.message,
+    })
+}
+
+/// Mint a recovery code, wrap the account keys under it, and replace the old
+/// one. Returns the code, to show once.
+async fn new_recovery_code() -> Result<String, String> {
+    let keys = session::keys().ok_or("Unlock your account first.")?;
+
+    let code = generate_recovery_code();
+    let params = KdfParams::generate();
+    let kek = derive_recovery_kek(&code, &params)
+        .map_err(|e| format!("Deriving from the new code failed: {e}"))?;
+    let recovery_key_blob =
+        wrap_account_keys(&keys, &kek).map_err(|e| format!("Wrapping failed: {e}"))?;
+
+    accounts::replace_recovery_code(&NewRecoveryCodeRequest {
+        recovery_salt: params.salt.clone(),
+        recovery_key_blob,
+    })
+    .await
+    .map_err(|e| e.message)?;
+
+    Ok(code)
 }

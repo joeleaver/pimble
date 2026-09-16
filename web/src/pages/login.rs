@@ -27,6 +27,9 @@ fn banner() -> String {
     if query_param("verified").as_deref() == Some("1") {
         return "Your email is verified. Sign in to get started.".to_string();
     }
+    if query_param("recovered").as_deref() == Some("1") {
+        return "Your password is set. Sign in.".to_string();
+    }
     match query_param("verify_error").as_deref() {
         Some("expired") => {
             "That verification link has expired. Sign in and we will send a new one.".to_string()
@@ -209,6 +212,11 @@ pub fn login_page() -> NodeHandle {
                             class: "pimble-link",
                             onclick: move || route::go(Route::Signup),
                             "Create one"
+                        }
+                        span {
+                            class: "pimble-link",
+                            onclick: move || route::go(Route::Forgot),
+                            "Forgot your password?"
                         }
                     }
                 }
