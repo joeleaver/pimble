@@ -24,6 +24,7 @@ pub mod appearance;
 pub mod commands;
 pub mod editor;
 pub mod events;
+pub mod menus;
 pub mod persistence;
 pub mod protocol;
 pub mod rinch_editor;

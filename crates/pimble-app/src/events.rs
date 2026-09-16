@@ -225,6 +225,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 } else if untracked(|| store.remove_replica_modal_pending.get()) {
                     store.remove_replica_modal_pending.set(false);
                     store.remove_replica_modal_error.set(message.clone());
+                } else if untracked(|| store.new_store_modal_pending.get()) {
+                    store.new_store_modal_pending.set(false);
+                    store.new_store_modal_error.set(message.clone());
                 } else {
                     store.connection.set(ConnectionState::Error(message.clone()));
                     store.connection_status.set(format!("Error: {}", message));
@@ -757,6 +760,17 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 if matches!(state, pimble_core::SyncState::Synced { .. }) {
                     refetch_root_if_empty(store, *store_id);
                 }
+            }
+
+            BackendEvent::HostedStoreCreated { name } => {
+                tracing::info!("Hosted store created: {}", name);
+                // The store itself arrives through `StoresListed`, once the
+                // backend has a token carrying the new grant. Nothing to do
+                // here but close the modal.
+                store.new_store_modal_pending.set(false);
+                store.new_store_modal_open.set(false);
+                store.new_store_modal_name.set(String::new());
+                store.new_store_modal_error.set(String::new());
             }
 
             BackendEvent::ReplicaRemoved { store_id } => {

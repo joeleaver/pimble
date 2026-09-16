@@ -118,6 +118,16 @@ pub enum BackendCommand {
     /// Stop a replica's sync link, close it, and delete its directory.
     /// `force` removes one whose link is not `Synced` (decision 6).
     RemoveReplica { store_id: StoreId, force: bool },
+
+    /// Make a store on the account this client is signed in as
+    /// (docs/CRYPTO_CONTRACT.md). `kind` is `"vault"` or `"plain"`.
+    ///
+    /// Not a Pimble server's business: the accounts service owns hosted
+    /// stores, and for an encrypted one the client also has to mint the key
+    /// and seal it to itself, which no server can do for it. The browser
+    /// backend answers this itself; the desktop, whose stores are files it
+    /// creates directly, refuses it.
+    CreateHostedStore { name: String, kind: String },
 }
 
 /// Events sent from backend to UI
@@ -197,6 +207,11 @@ pub enum BackendEvent {
     /// Answer to `RemoveReplica`: the replica is gone. Handled exactly like
     /// `StoreClosed` (tree + saved open-store list cleanup).
     ReplicaRemoved { store_id: StoreId },
+
+    /// A `CreateHostedStore` succeeded. Carries only the name, because the
+    /// store itself arrives the ordinary way: the backend mints a token that
+    /// carries the new grant and reconnects, and `StoresListed` brings it in.
+    HostedStoreCreated { name: String },
 }
 
 /// Handle to communicate with the backend

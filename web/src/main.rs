@@ -21,11 +21,14 @@ mod accounts;
 mod api;
 mod app_page;
 mod backend;
+mod endpoints;
 mod http;
 mod keys;
+mod menu;
 mod pages;
 mod route;
 mod session;
+mod shortcuts;
 mod util;
 mod vault;
 
@@ -39,6 +42,7 @@ pub fn start() {
     tracing_wasm::set_as_global_default();
     let _ = console_log::init_with_level(log::Level::Info);
 
+    shortcuts::install();
     route::start();
 }
 

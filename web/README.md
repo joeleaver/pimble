@@ -43,6 +43,22 @@ connected, and it only forgets the current backoff once a connection has also
 stayed up for two seconds. Failed attempts back off from one second to thirty
 and say so once per outage, not once per attempt.
 
+## One binary, several servers
+
+Nothing here talks to "the" Pimble server. `POST /api/v1/token` names the server
+the store list comes from, and may name a different one per store; `src/endpoints.rs`
+holds one credential and one `PimbleClient` per URL, and every command is
+answered through the endpoint that serves the store it names
+(docs/CRYPTO_CONTRACT.md, "Endpoint-agnostic"). Today the token response names
+one URL and every store resolves to it, so there is exactly one connection. When
+a relayed share arrives — served by its owner's machine rather than the hosted
+server — it becomes a second entry with its own token, and nothing else in the
+app changes.
+
+The backend loop supervises the endpoint the store list comes from, because that
+is the one whose absence means there is nothing to show. Any other endpoint
+connects the first time a store on it is touched.
+
 ## The account pages
 
 `/app/signup`, `/app/login` and `/app/account` are rinch views in this same wasm
@@ -157,6 +173,72 @@ decrypted titles and whatever content is loaded. There is no server index for
 such a store and there cannot be one. Plain stores named in the same query still
 go to the server, and the two sets of hits are merged.
 
+## Controls, and the ones that would do nothing
+
+A browser build has no menu bar, so anything the desktop reaches only through a
+menu has to be reachable another way or not be offered. What that came to:
+
+- **The explorer's "+"** makes a node under the selected store, as on the
+  desktop. With no store open the desktop offers "New Store..." from the File
+  menu; here "+" opens that modal instead of doing nothing. It asks for a name,
+  creates the store through `POST /api/v1/stores` as a vault, mints its key and
+  seals it to the account, then asks for a fresh token and reconnects — a store
+  is invisible to a token minted before the grant existed. The store then
+  arrives through `listStores` like any other.
+- **Ctrl+K** focuses the search box, whose placeholder has always advertised it.
+  The desktop carries that accelerator on its View menu; `src/shortcuts.rs`
+  binds it here.
+- **Mounts** are hidden from an encrypted store's context menu. The server holds
+  only blobs there and has nothing to point a mount at, so "Copy as Mount
+  Source" and "Paste Mount Here" would fail wherever they were pressed.
+  Hiding beats disabling: there is nothing the reader could do to enable them.
+- **The empty state** says to use "+" rather than naming a shortcut that only
+  the desktop has.
+- **Right-click** shows Pimble's menu and not the browser's (see below).
+- **Rebuild Search Index** and **Sign Out** have no route yet. They are in the
+  shared menu spec and arrive with the menu bar; nothing in the UI offers them
+  in the meantime, so nothing is offered that fails.
+
+The desktop's items that do nothing (Undo/Redo/Cut/Copy/Paste, disabled; Toggle
+Sidebar, the zoom items, Documentation, About, which log and return) were left
+alone: they are the desktop menu's, not this build's, and changing them is not
+this crate's business.
+
+### Menus
+
+`crates/pimble-app/src/menus.rs` is the menus as data — a title, and per item a
+label, an accelerator and an action — so the desktop's native bar and the
+browser's DOM one cannot drift. Items that need a file dialog or a service
+principal are `native`; the ones that need an account are not. `build_menus`
+turns the spec into `rinch::menu::Menu`s and is `native` only because
+`rinch::menu` is behind rinch's `desktop` feature. When rinch-web gains a menu
+bar, that `cfg` comes off and mounting the app becomes one call with the spec
+passed in. `src/menu.rs` registers the two actions no shared crate could
+perform on its own (reaching the accounts service, dropping this page's keys)
+and holds the test that every item the web configuration offers has an action
+behind it.
+
+### The browser's own context menu
+
+A right-click used to show Pimble's menu with the browser's on top of it.
+rinch-web already calls `prevent_default()` on `contextmenu`, but only when
+`closest("[data-oncontextmenu]")` finds a handler
+(`crates/rinch-web/src/event_delegation.rs`, the listener installed at the end
+of `setup_event_delegation`), so every right-click outside a menu target — the
+tree's padding, the editor, and `ContextMenu`'s own portalled overlay while a
+menu is open — left the native one to appear. `src/shortcuts.rs` cancels it for
+the whole page: a bubble-phase listener on `document` that never stops
+propagation, so rinch's own listener still runs and its menu still opens.
+
+The upstream fix is a flag rather than a widening, because unconditional
+suppression would take right-click-copy away from a host page hydrating rinch
+islands: a `SUPPRESS_NATIVE_CONTEXT_MENU` thread-local in
+`crates/rinch-web/src/event_delegation.rs` with a
+`set_suppress_native_context_menu(bool)` exported beside `setup_event_delegation`,
+and the `prevent_default()` in that listener moved out of the handler-lookup
+`if let` so it also runs when the flag is on. `event_delegation.rs` is compiled
+only in rinch-web, so the desktop is untouched.
+
 ## What the browser build leaves out
 
 A browser connects as a signed-in user, whose token carries per-store grants and
@@ -245,12 +327,16 @@ JWKS is what makes a user's JWT acceptable. Both verifiers may be on at once.
 carrying an `Origin` header is refused with 403, which is the right default for
 the desktop app's embedded server.
 
-Two things must agree or every WebSocket is closed the moment it opens, with
-nothing in either log to say why. `--issuer` has to match the accounts service's
-`PIMBLE_CLOUD_PUBLIC_URL` plus `/api/v1` (the JWKS URL is a server-to-server
-fetch and can stay on the service's own port), and the Pimble server has to be
-started **after** the accounts service, because it fetches the JWKS once at
-startup and keeps an empty key set if that fetch fails.
+`--issuer` has to match the accounts service's `PIMBLE_CLOUD_PUBLIC_URL` plus
+`/api/v1`, or every WebSocket is closed the moment it opens with nothing in
+either log to say why. The JWKS URL is a server-to-server fetch and can stay on
+the service's own port.
+
+**Start this one before the accounts service.** The two depend on each other and
+only one of them tolerates it: the accounts service exits if the Pimble server
+is not there when it starts, while the Pimble server only warns that its first
+JWKS fetch failed and retries on the first token it cannot verify (a minute at
+worst). So: Pimble server, then accounts service.
 
 **3. The app**:
 
@@ -329,6 +415,25 @@ standing in for `trunk serve`):
   text — in the tree label and in the editor.
 
 Argon2id at the contract's cost took 56–254 ms across runs in that browser.
+
+### The controls, against the same stack
+
+From a fresh account each run, so the tree starts empty:
+
+- the explorer's "+" opens the New Store modal, refuses an empty name in the
+  page, and otherwise creates an encrypted store that appears in the tree once
+  the backend has a token carrying the new grant;
+- a right-click on a tree row opens Pimble's menu with the event's
+  `defaultPrevented` true, and a right-click anywhere else is cancelled too;
+- that menu, on an encrypted store, offers "New Node" and "Appearance..." and
+  no mount items;
+- Ctrl+K puts the caret in the search box;
+- the theme choice written to `localStorage` survives a reload.
+
+The encrypted round trip was then re-run against a store made by "+" rather than
+by the account page, after the endpoint registry replaced the single connection:
+a node created, typed into, the server holding only ciphertext, and a second tab
+decrypting the same text.
 
 ### The plain path
 

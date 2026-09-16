@@ -1,11 +1,12 @@
 //! State file persistence: the open stores and the theme choice, in
 //! `<config dir>/pimble/state.json`.
 //!
-//! Native only. A web build has no config directory and no store paths to
-//! remember (its stores come from the account service's `listStores`), so the
-//! same four calls answer with defaults and drop what they are given. Keeping
-//! the module's surface identical on both targets is what lets `app.rs` and
-//! `events.rs` stay free of `cfg`.
+//! A web build has no config directory and no store paths to remember (its
+//! stores come from the account service's `listStores`), so those two calls
+//! answer with defaults and drop what they are given. The theme choice it does
+//! remember, in `localStorage` — per browser, which is the right scope for it.
+//! Keeping the module's surface identical on both targets is what lets `app.rs`
+//! and `events.rs` stay free of `cfg`.
 
 #[cfg(feature = "native")]
 mod imp {
@@ -61,20 +62,37 @@ mod imp {
 
 #[cfg(not(feature = "native"))]
 mod imp {
-    /// Nothing is remembered between page loads yet, so the web app starts with
-    /// no stores of its own and asks the server which ones the account may see.
+    /// Where the theme choice lives in the browser.
+    const DARK_MODE_KEY: &str = "pimble.dark_mode";
+
+    /// The app's stores come from the account, not from a remembered list of
+    /// paths, so there is nothing here to load or save.
     pub(crate) fn load_app_state_file() -> Vec<String> {
         Vec::new()
     }
 
     pub(crate) fn save_app_state_file(_paths: &[String]) {}
 
-    /// The same default the desktop app uses when it has never been told.
-    pub(crate) fn load_dark_mode() -> bool {
-        true
+    /// `localStorage`, when the browser has one. It can be missing or throw
+    /// outright in a private window or with site data blocked, so every read
+    /// falls back to the same default the desktop uses when it has never been
+    /// told, and every write is allowed to fail silently.
+    fn storage() -> Option<web_sys::Storage> {
+        web_sys::window()?.local_storage().ok().flatten()
     }
 
-    pub(crate) fn save_dark_mode(_dark: bool) {}
+    pub(crate) fn load_dark_mode() -> bool {
+        storage()
+            .and_then(|s| s.get_item(DARK_MODE_KEY).ok().flatten())
+            .map(|value| value != "false")
+            .unwrap_or(true)
+    }
+
+    pub(crate) fn save_dark_mode(dark: bool) {
+        if let Some(storage) = storage() {
+            let _ = storage.set_item(DARK_MODE_KEY, if dark { "true" } else { "false" });
+        }
+    }
 }
 
 pub(crate) use imp::{load_app_state_file, load_dark_mode, save_app_state_file, save_dark_mode};

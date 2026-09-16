@@ -41,6 +41,14 @@ const DOUBLE_CLICK_MS: f64 = 500.0;
 /// worse than not offering it, so the browser build hides them.
 const CAN_ADMINISTER_STORES: bool = cfg!(feature = "native");
 
+/// Whether this build can make a store on the signed-in account.
+///
+/// The exact complement of [`CAN_ADMINISTER_STORES`] for creating one: a
+/// desktop build makes a store as a directory through a native dialog, a
+/// browser build asks the accounts service for a hosted one and mints its key.
+/// Both are "New Store...", and no build offers neither.
+const CAN_CREATE_HOSTED_STORES: bool = !CAN_ADMINISTER_STORES;
+
 /// Milliseconds on a clock that only moves forward, for the double-click
 /// window above. `std::time::Instant` has no implementation on
 /// `wasm32-unknown-unknown` and panics the first time it is read, so the
@@ -95,6 +103,9 @@ thread_local! {
     /// spelling, and rather than a `BackendCommand` because nothing about it
     /// involves the backend.
     static ACCOUNT_ACTION: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+    /// What "Sign Out" does, for a build that has an account to sign out of.
+    /// Registered by the browser entry point, like [`ACCOUNT_ACTION`].
+    static SIGN_OUT_ACTION: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
     /// The search box's `NodeHandle`, captured once when the toolbar is built
     /// so the View menu's "Focus Search" (Ctrl+K) action — constructed earlier,
     /// before the box exists — can reach it later. Same reach-across-closures
@@ -117,7 +128,7 @@ fn has_account_action() -> bool {
     ACCOUNT_ACTION.with(|slot| slot.borrow().is_some())
 }
 
-fn run_account_action() {
+pub fn run_account_action() {
     // Cloned out of the slot before it runs: the action navigates, which
     // unmounts this view, and a borrow held across that would be live while
     // the thing that owns it goes away.
@@ -125,6 +136,104 @@ fn run_account_action() {
     if let Some(action) = action {
         action();
     }
+}
+
+/// Give "Sign Out" something to do. Called before [`build_view`].
+pub fn set_sign_out_action(action: impl Fn() + 'static) {
+    SIGN_OUT_ACTION.with(|slot| *slot.borrow_mut() = Some(Rc::new(action)));
+}
+
+pub fn run_sign_out_action() {
+    let action = SIGN_OUT_ACTION.with(|slot| slot.borrow().clone());
+    if let Some(action) = action {
+        action();
+    }
+}
+
+/// "New Store...", the desktop's way: pick a path, create, open.
+#[cfg(feature = "native")]
+pub fn pick_and_create_store(store: AppStore) {
+    let dialog = rinch::dialogs::save_file()
+        .set_title("Create New Store")
+        .add_filter("Pimble Store", &["pimble"]);
+
+    let Some(path) = dialog.save() else { return };
+    let path_str = path.to_string_lossy().to_string();
+    let path_str = if path_str.ends_with(".pimble") {
+        path_str
+    } else {
+        format!("{}.pimble", path_str)
+    };
+    let name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "New Store".to_string());
+    tracing::info!("Creating new store at: {}", path_str);
+    store.pending_create_path.set(Some(path_str.clone()));
+    store.send(BackendCommand::CreateStore { path: path_str, name });
+}
+
+/// "Open Store...", the desktop's way: pick a directory and open it.
+#[cfg(feature = "native")]
+pub fn pick_and_open_store(store: AppStore) {
+    let Some(path) = rinch::dialogs::pick_folder().set_title("Open Store").pick() else {
+        return;
+    };
+    let path_str = path.to_string_lossy().to_string();
+    tracing::info!("Opening store at: {}", path_str);
+    store.send(BackendCommand::OpenStore { path: path_str });
+}
+
+/// Put the caret in the search box.
+///
+/// The desktop reaches this through the View menu's "Focus Search"; a browser
+/// build, which has no menu bar to carry an accelerator, binds Ctrl+K to it
+/// itself. The search box advertises the shortcut in its placeholder, so
+/// exactly one of the two must always be in place.
+pub fn focus_search() {
+    SEARCH_INPUT.with(|cell| {
+        if let Some(handle) = cell.borrow().as_ref() {
+            handle.focus();
+        }
+    });
+}
+
+/// Rebuild the search index of every open store that has one.
+///
+/// An encrypted store has no server-side index and cannot have one — the
+/// server has never seen a word of it — so it is skipped rather than asked.
+pub fn rebuild_search_indexes(store: AppStore) {
+    let store_ids = untracked(|| store.store_ids.get());
+    for store_id in store_ids {
+        if store.is_vault(store_id) {
+            continue;
+        }
+        store.send(BackendCommand::RebuildIndex { store_id });
+    }
+}
+
+/// Open the "Mount Store..." picker for a target node.
+///
+/// The desktop's "Mount Store..." picks a directory; a browser has none to pick
+/// from, so it picks one of the stores the account already grants. Either way
+/// the RPC is the same `createMount`, which an editor is allowed to call.
+pub fn open_mount_picker(store: AppStore, target: (pimble_core::StoreId, pimble_core::NodeId)) {
+    // Never the store being mounted into: a store cannot contain itself.
+    let first = untracked(|| {
+        store.store_ids.with(|ids| ids.iter().find(|&&id| id != target.0).copied())
+    });
+    store.mount_picker_selected.set(first.map(|id| id.to_string()).unwrap_or_default());
+    store.mount_picker_error.set(String::new());
+    store.mount_picker_pending.set(false);
+    store.mount_picker_target.set(Some(target));
+}
+
+/// Open the "New Store..." modal, empty.
+pub fn open_new_store_modal(store: AppStore) {
+    store.new_store_modal_name.set(String::new());
+    store.new_store_modal_error.set(String::new());
+    store.new_store_modal_pending.set(false);
+    store.new_store_modal_open.set(true);
 }
 
 /// Select and open a node or store root identified by a tree value
@@ -251,7 +360,7 @@ fn paste_mount_here(store: AppStore, target_value: &str) {
 /// `Some(canonical pair)` is "Mount Remote Store Here...", whose action adds
 /// the replica when this server does not already have the store and then
 /// mounts its root under that pair.
-fn open_connect_modal(store: AppStore, target: Option<(pimble_core::StoreId, pimble_core::NodeId)>) {
+pub fn open_connect_modal(store: AppStore, target: Option<(pimble_core::StoreId, pimble_core::NodeId)>) {
     store.connect_modal_target.set(target);
     store.connect_modal_stores.set(Vec::new());
     store.connect_modal_selected.set(String::new());
@@ -816,15 +925,12 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                     }));
                                 }
                             }
-                            // A store on this machine is a desktop idea: the web
-                            // app reaches hosted stores through the account it is
-                            // signed in to, and mounts them with "Mount Remote
-                            // Store Here...".
+                            // A browser has no directories to offer, so it
+                            // picks from the stores the account already grants.
+                            // The RPC either way is `createMount`, which an
+                            // editor may call.
                             #[cfg(not(feature = "native"))]
-                            {
-                                let _ = pid;
-                                tracing::info!("Mounting a local store is desktop-only");
-                            }
+                            open_mount_picker(store, (s_id, pid));
                         }
                     }
                 }
@@ -898,15 +1004,31 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 move || copy_as_mount_source(store, &nv)
             };
             // "Paste Mount Here" is always rendered, disabled while nothing is
-            // copied. It must NOT sit inside a reactive `if` block: a rinch
-            // DropdownMenuItem captures the menu's close signal from a
-            // thread-local only during the ContextMenu's own render, so an
-            // item rendered later by a reactive block never closes the menu,
-            // and the tree rebuild that follows the paste then orphans the
-            // still-open portal. `copy_as_mount_source`/`paste_mount_here`
+            // copied.
+            //
+            // No menu item may sit inside a reactive `if` block (rinch #714).
+            // `ContextMenu` publishes its close signal through a thread-local
+            // that is set while its children render and cleared in its own
+            // `render`, and a `DropdownMenuItem` reads it once, there. An item
+            // inside a reactive `if` renders later, from an Effect, by which
+            // time the thread-local is empty: it captures no close signal, so
+            // clicking it runs the action and leaves the menu open for good.
+            // Every conditional item is therefore an embedded
+            // `Option<NodeHandle>` (`{ if cond { Some(rsx!{…}) } else { None } }`),
+            // which rsx evaluates inline with the other children rather than
+            // deferring, and every `disabled` value is a render-time snapshot.
+            // `copy_as_mount_source`/`paste_mount_here`
             // bump the tree structure instead, so every row's menu re-renders
             // with a fresh `disabled` value.
             let no_mount_source = untracked(|| store.mount_source.get().is_none());
+
+            // Mounts do not exist in an encrypted store: the server holds only
+            // blobs there and has no tree to point a mount at. Hiding the two
+            // items rather than disabling them keeps the menu honest — there is
+            // nothing the reader could do to enable them.
+            let mounts_apply = parsed
+                .map(|(s_id, _)| !store.is_vault(s_id))
+                .unwrap_or(true);
             let on_paste_mount = {
                 let nv = nv_ctx.clone();
                 move || paste_mount_here(store, &nv)
@@ -1076,7 +1198,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 onclick: on_new_child,
                                 "New Node"
                             }
-                            if CAN_ADMINISTER_STORES {
+                            if mounts_apply {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::Link,
                                     onclick: on_mount_store.clone(),
@@ -1090,16 +1212,20 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                     "Mount Remote Store Here..."
                                 }
                             }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Copy,
-                                onclick: on_copy_as_mount_source,
-                                "Copy as Mount Source"
+                            if mounts_apply {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::Copy,
+                                    onclick: on_copy_as_mount_source.clone(),
+                                    "Copy as Mount Source"
+                                }
                             }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::ClipboardCopy,
-                                disabled: no_mount_source,
-                                onclick: on_paste_mount,
-                                "Paste Mount Here"
+                            if mounts_apply {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::ClipboardCopy,
+                                    disabled: no_mount_source,
+                                    onclick: on_paste_mount.clone(),
+                                    "Paste Mount Here"
+                                }
                             }
                             if CAN_ADMINISTER_STORES {
                                 DropdownMenuItem {
@@ -1211,7 +1337,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 onclick: on_new_child,
                                 "New Node"
                             }
-                            if CAN_ADMINISTER_STORES {
+                            if mounts_apply {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::Link,
                                     onclick: on_mount_store.clone(),
@@ -1225,16 +1351,20 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                     "Mount Remote Store Here..."
                                 }
                             }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::Copy,
-                                onclick: on_copy_as_mount_source,
-                                "Copy as Mount Source"
+                            if mounts_apply {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::Copy,
+                                    onclick: on_copy_as_mount_source.clone(),
+                                    "Copy as Mount Source"
+                                }
                             }
-                            DropdownMenuItem {
-                                left_section: TablerIcon::ClipboardCopy,
-                                disabled: no_mount_source,
-                                onclick: on_paste_mount,
-                                "Paste Mount Here"
+                            if mounts_apply {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::ClipboardCopy,
+                                    disabled: no_mount_source,
+                                    onclick: on_paste_mount.clone(),
+                                    "Paste Mount Here"
+                                }
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Edit,
@@ -1328,12 +1458,17 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         store.root_node_id(sid).map(|rid| (sid, rid))
                     })
                 });
-            if let Some((s_id, root_id)) = result {
-                store.send(BackendCommand::CreateNode {
+            match result {
+                Some((s_id, root_id)) => store.send(BackendCommand::CreateNode {
                     store_id: s_id,
                     parent_id: Some(root_id),
                     title: String::new(),
-                });
+                }),
+                // Nothing to create a node under. On the desktop "New
+                // Store..." is a menu item away; a browser has no menu bar, so
+                // "+" offers the store instead of doing nothing at all.
+                None if CAN_CREATE_HOSTED_STORES => open_new_store_modal(store),
+                None => {}
             }
         };
 
@@ -1774,6 +1909,73 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             }
         };
 
+        let create_hosted_store = move || {
+            let name = untracked(|| store.new_store_modal_name.get()).trim().to_string();
+            if name.is_empty() {
+                store.new_store_modal_error.set("Give the store a name.".to_string());
+                return;
+            }
+            store.new_store_modal_error.set(String::new());
+            store.new_store_modal_pending.set(true);
+            store.send(BackendCommand::CreateHostedStore { name, kind: "vault".to_string() });
+        };
+
+        // ── "New Store..." modal ────────────────────────────────────────
+        // A browser build's stores live on the account, not on disk, so there
+        // is no path to pick: a name and a kind is the whole of it. The
+        // backend makes the store, mints its key if it is encrypted, and asks
+        // for a token that carries the new grant; the store then arrives
+        // through `StoresListed` like any other.
+        let new_store_modal = rsx! {
+            Modal {
+                opened_fn: move || store.new_store_modal_open.get(),
+                onclose: move || {
+                    store.new_store_modal_open.set(false);
+                    store.new_store_modal_error.set(String::new());
+                },
+                title: "New Store",
+                size: "sm",
+
+                div {
+                    style: "display: flex; flex-direction: column; gap: 10px;",
+
+                    TextInput {
+                        label: "Name",
+                        placeholder: "Notes",
+                        value_fn: move || store.new_store_modal_name.get(),
+                        oninput: move |val: String| store.new_store_modal_name.set(val),
+                        onsubmit: create_hosted_store,
+                    }
+
+                    div {
+                        style: "font-size: 12px; color: var(--rinch-color-dimmed);",
+                        "Encrypted. Its key is made here and sealed to your account; \
+                         the server stores what it cannot read."
+                    }
+
+                    div {
+                        style: {
+                            move || if store.new_store_modal_error.get().is_empty() {
+                                "display: none;"
+                            } else {
+                                "color: var(--rinch-color-red-6); font-size: 12px;"
+                            }
+                        },
+                        {|| store.new_store_modal_error.get()}
+                    }
+
+                    Button {
+                        variant: "filled",
+                        size: "sm",
+                        loading: {|| store.new_store_modal_pending.get()},
+                        disabled: {|| store.new_store_modal_pending.get()},
+                        onclick: create_hosted_store,
+                        "Create"
+                    }
+                }
+            }
+        };
+
         let remove_replica_modal = rsx! {
             Modal {
                 opened_fn: move || store.remove_replica_modal_store.get().is_some(),
@@ -1957,6 +2159,12 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                         "Or press Ctrl+N to create a new store"
                                     }
                                 }
+                                if CAN_CREATE_HOSTED_STORES {
+                                    div {
+                                        class: "pimble-empty-state__hint",
+                                        "Or use + above the tree to make a store"
+                                    }
+                                }
                             }
                         }
                     }
@@ -2000,6 +2208,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {connect_modal}
                 {link_modal}
                 {remove_replica_modal}
+                {new_store_modal}
                 {appearance_modal}
                 {body}
             }
@@ -2017,6 +2226,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {connect_modal}
                 {link_modal}
                 {remove_replica_modal}
+                {new_store_modal}
                 {appearance_modal}
                 {body}
             }
@@ -2032,115 +2242,14 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
 /// native menu bar, the borderless window and the saved theme.
 #[cfg(feature = "native")]
 pub fn run() {
-    use rinch::menu::{Menu, MenuItem};
     use std::sync::Arc;
 
     let (store, app_component) = build_view();
 
-    // Build menus
-    let file_menu = Menu::new()
-        .item(MenuItem::new("New Store...").shortcut("Ctrl+N").on_click(move || {
-            tracing::info!("New store menu clicked");
-            let dialog = rinch::dialogs::save_file()
-                .set_title("Create New Store")
-                .add_filter("Pimble Store", &["pimble"]);
-
-            if let Some(path) = dialog.save() {
-                let path_str = path.to_string_lossy().to_string();
-                let path_str = if path_str.ends_with(".pimble") {
-                    path_str
-                } else {
-                    format!("{}.pimble", path_str)
-                };
-                let name = path.file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "New Store".to_string());
-                tracing::info!("Creating new store at: {}", path_str);
-                store.pending_create_path.set(Some(path_str.clone()));
-                store.send(BackendCommand::CreateStore { path: path_str, name });
-            }
-        }))
-        .item(MenuItem::new("Open Store...").shortcut("Ctrl+O").on_click(move || {
-            tracing::info!("Open store menu clicked");
-            let dialog = rinch::dialogs::pick_folder()
-                .set_title("Open Store");
-
-            if let Some(path) = dialog.pick() {
-                let path_str = path.to_string_lossy().to_string();
-                tracing::info!("Opening store at: {}", path_str);
-                store.send(BackendCommand::OpenStore { path: path_str });
-            }
-        }))
-        .item(MenuItem::new("Add Remote Store...").on_click(move || {
-            tracing::info!("Add remote store menu clicked");
-            open_connect_modal(store, None);
-        }))
-        .separator()
-        .item(MenuItem::new("Close Store").on_click(move || {
-            tracing::info!("Close store");
-            if let Some((store_id, _)) = store.selected_store_and_node() {
-                store.send(BackendCommand::CloseStore { store_id });
-            }
-        }))
-        .separator()
-        .item(MenuItem::new("Exit").shortcut("Alt+F4").on_click(|| {
-            close_current_window();
-        }));
-
-    let edit_menu = Menu::new()
-        .item(MenuItem::new("Undo").shortcut("Ctrl+Z").enabled(false).on_click(|| {}))
-        .item(MenuItem::new("Redo").shortcut("Ctrl+Y").enabled(false).on_click(|| {}))
-        .separator()
-        .item(MenuItem::new("Cut").shortcut("Ctrl+X").enabled(false).on_click(|| {}))
-        .item(MenuItem::new("Copy").shortcut("Ctrl+C").enabled(false).on_click(|| {}))
-        .item(MenuItem::new("Paste").shortcut("Ctrl+V").enabled(false).on_click(|| {}))
-        .separator()
-        .item(MenuItem::new("Delete").on_click(move || {
-            if let Some((store_id, node_id)) = store.selected_store_and_node() {
-                store.send(BackendCommand::DeleteNode { store_id, node_id });
-            }
-        }));
-
-    let view_menu = Menu::new()
-        .item(MenuItem::new("Toggle Sidebar").shortcut("Ctrl+\\").on_click(|| {
-            tracing::info!("Toggle sidebar");
-        }))
-        .item(MenuItem::new("Toggle Dark Mode").on_click(move || toggle_dark_mode(store)))
-        .separator()
-        .item(MenuItem::new("Focus Search").shortcut("Ctrl+K").on_click(|| {
-            SEARCH_INPUT.with(|cell| {
-                if let Some(handle) = cell.borrow().as_ref() {
-                    handle.focus();
-                }
-            });
-        }))
-        .item(MenuItem::new("Rebuild Search Index").on_click(move || {
-            let store_ids = untracked(|| store.store_ids.get());
-            tracing::info!("Rebuilding search index for {} store(s)", store_ids.len());
-            for store_id in store_ids {
-                store.send(BackendCommand::RebuildIndex { store_id });
-            }
-        }))
-        .separator()
-        .item(MenuItem::new("Zoom In").shortcut("Ctrl+=").on_click(|| {}))
-        .item(MenuItem::new("Zoom Out").shortcut("Ctrl+-").on_click(|| {}))
-        .item(MenuItem::new("Reset Zoom").shortcut("Ctrl+0").on_click(|| {}));
-
-    let help_menu = Menu::new()
-        .item(MenuItem::new("Documentation").shortcut("F1").on_click(|| {
-            tracing::info!("Opening documentation...");
-        }))
-        .separator()
-        .item(MenuItem::new("About Pimble").on_click(|| {
-            tracing::info!("About Pimble v0.1.0");
-        }));
-
-    let menus = vec![
-        ("File", file_menu),
-        ("Edit", edit_menu),
-        ("View", view_menu),
-        ("Help", help_menu),
-    ];
+    // One spec, two shells: `crates/pimble-app/src/menus.rs` says what the
+    // menus hold and which target each item belongs on, so the browser's menu
+    // bar cannot drift from this one.
+    let menus = crate::menus::build_menus(store);
 
     // Theme
     let theme = theme_props(untracked(|| store.dark_mode.get()));

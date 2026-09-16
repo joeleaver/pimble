@@ -20,7 +20,15 @@ const TOKEN_PATH: &str = "/api/v1/token";
 /// survive into the app.
 const LOGIN_ROUTE: crate::route::Route = crate::route::Route::Login;
 
-/// A minted credential and the server it opens.
+/// A minted credential and the servers it opens.
+///
+/// `rpc_url` and `token` are the session's own: the server the store list comes
+/// from, and the credential for it. `stores` names any store served somewhere
+/// else. Today it is always absent and every store is on `rpc_url`; in the
+/// relay phase a shared store is served by its owner's machine through a relay
+/// and arrives here with its own URL and, if it needs one, its own token
+/// (docs/CRYPTO_CONTRACT.md, "Endpoint-agnostic"). Nothing downstream asks
+/// which of the two a store came from.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Session {
     /// The JWT, `aud` of `pimble`, carrying this user's grants.
@@ -29,6 +37,19 @@ pub struct Session {
     pub exp: i64,
     /// The WebSocket URL of the Pimble server that honours it.
     pub rpc_url: String,
+    /// Stores served somewhere other than `rpc_url`.
+    #[serde(default)]
+    pub stores: Vec<StoreEndpoint>,
+}
+
+/// Where one store is served, when it is not the session's own server.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StoreEndpoint {
+    pub store_id: pimble_core::StoreId,
+    pub rpc_url: String,
+    /// The credential for `rpc_url`, when it differs from the session's.
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 #[derive(Debug)]

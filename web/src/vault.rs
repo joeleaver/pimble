@@ -971,7 +971,11 @@ impl VaultClient {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Which store a command is about, when it is about one.
-fn store_id_of(cmd: &BackendCommand) -> Option<StoreId> {
+///
+/// Public because the backend loop needs it before the vault client does: a
+/// command is answered through the endpoint that serves its store, whichever
+/// kind of store that is.
+pub fn store_id_of(cmd: &BackendCommand) -> Option<StoreId> {
     use BackendCommand::*;
     Some(match cmd {
         CloseStore { store_id }

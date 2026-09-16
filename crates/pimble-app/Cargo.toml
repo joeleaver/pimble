@@ -57,6 +57,9 @@ rinch-web = { git = "https://github.com/joeleaver/rinch.git", branch = "main", f
 ], optional = true }
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
+# `persistence.rs` remembers the theme choice in `localStorage`, which is the
+# browser's equivalent of the desktop's `state.json`.
+web-sys = { version = "0.3", optional = true, features = ["Window", "Storage"] }
 
 [features]
 # `native` is the desktop app: the embedded server, the tokio backend thread,
@@ -85,6 +88,6 @@ native = [
     # `rinch-web/collaboration` instead.
     "rinch/collaboration",
 ]
-web = ["dep:rinch-web", "dep:js-sys", "dep:wasm-bindgen-futures"]
+web = ["dep:rinch-web", "dep:js-sys", "dep:wasm-bindgen-futures", "dep:web-sys"]
 onnx-download = ["native", "pimble-server/onnx-download"]
 onnx-dynamic = ["native", "pimble-server/onnx-dynamic"]

@@ -300,6 +300,28 @@ pub struct AppStore {
     /// Read reactively wherever a colour depends on the scheme.
     pub dark_mode: Signal<bool>,
 
+    // "Mount Store..." picker (browser builds). The desktop picks a directory
+    // on this machine; a browser has no directories to pick from, so it picks
+    // one of the stores the account already grants. `Some(target)` is the
+    // canonical node the mount is created under; `None` means closed.
+    pub mount_picker_target: Signal<Option<(StoreId, NodeId)>>,
+    /// The chosen source store's id, as the raw `Select` value.
+    pub mount_picker_selected: Signal<String>,
+    pub mount_picker_error: Signal<String>,
+    /// True while this modal's `CreateMount` is in flight.
+    pub mount_picker_pending: Signal<bool>,
+
+    // "New Store..." modal (the explorer's "+" with nothing open yet, and the
+    // menu item). Only builds that can create a hosted store show it: the
+    // accounts service owns those, and a desktop build makes its stores as
+    // files through a native dialog instead.
+    pub new_store_modal_open: Signal<bool>,
+    pub new_store_modal_name: Signal<String>,
+    pub new_store_modal_error: Signal<String>,
+    /// True while a `CreateHostedStore` request from this modal is in flight,
+    /// so its outcome lands in the modal rather than the status bar.
+    pub new_store_modal_pending: Signal<bool>,
+
     // "Remove Replica..." confirmation modal (store root context menu,
     // docs/history/HARDENING_CONTRACT.md "B: app"). `Some(store_id)` is the replica
     // the modal is open for; `None` means closed.
@@ -367,6 +389,14 @@ impl AppStore {
             appearance_icon_query: Signal::new(String::new()),
             appearance_tags_text: Signal::new(String::new()),
             dark_mode: Signal::new(true),
+            mount_picker_target: Signal::new(None),
+            mount_picker_selected: Signal::new(String::new()),
+            mount_picker_error: Signal::new(String::new()),
+            mount_picker_pending: Signal::new(false),
+            new_store_modal_open: Signal::new(false),
+            new_store_modal_name: Signal::new(String::new()),
+            new_store_modal_error: Signal::new(String::new()),
+            new_store_modal_pending: Signal::new(false),
             remove_replica_modal_store: Signal::new(None),
             remove_replica_modal_error: Signal::new(String::new()),
             remove_replica_modal_pending: Signal::new(false),
@@ -679,6 +709,19 @@ impl AppStore {
                 map.insert(store_id, new_sig);
             });
         }
+    }
+
+    /// Whether a store holds only encrypted blobs (untracked).
+    ///
+    /// Nothing about mounts, replication or a server-side index applies to one,
+    /// so the tree hides those where they would only fail.
+    pub fn is_vault(&self, store_id: StoreId) -> bool {
+        untracked(|| {
+            self.store_data.with(|map| {
+                map.get(&store_id)
+                    .map_or(false, |sig| sig.with(|s| s.kind == pimble_core::StoreKind::Vault))
+            })
+        })
     }
 
     /// Whether a store currently has a remote endpoint linked (untracked).

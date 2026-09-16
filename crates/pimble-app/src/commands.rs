@@ -458,6 +458,14 @@ pub async fn process_command(
             }
         }
 
+        // The accounts service owns hosted stores, and only a signed-in client
+        // can mint an encrypted store's key and seal it to itself. The browser
+        // backend answers this before a command ever reaches here; a build that
+        // makes its stores as files on disk has nothing to do with it.
+        BackendCommand::CreateHostedStore { .. } => Some(BackendEvent::Error {
+            message: "This build cannot create a hosted store".into(),
+        }),
+
         BackendCommand::RemoveReplica { store_id, force } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });

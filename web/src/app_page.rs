@@ -43,10 +43,10 @@ pub fn start() {
 
         tracing::info!("Signed in; the Pimble server is at {}", session_token.rpc_url);
 
-        // The sidebar's way back to the account pages. Registered before the
-        // view is built, and in place rather than as a link: a reload would
-        // throw away the keys this page holds.
-        pimble_app::app::set_account_action(|| route::go(Route::Account));
+        // What the account button and the menu's account items do. Registered
+        // before the view is built, and navigating in place rather than
+        // linking: a reload would throw away the keys this page holds.
+        crate::menu::install_hooks();
 
         // The UI and its state. The desktop spawns its backend from inside the
         // component; here the backend exists first and is handed in, which is
