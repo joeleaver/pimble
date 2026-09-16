@@ -351,6 +351,17 @@ pub(crate) const APP_CSS: &str = "
     opacity: 0.5;
     font-size: 11px;
 }
+
+/* The signed-in account; a click opens the Account modal. */
+.pimble-status-bar__account {
+    font-size: 11px;
+    opacity: 0.7;
+}
+
+.pimble-status-bar__account:hover {
+    opacity: 1;
+    text-decoration: underline;
+}
 ";
 
 /// Editor content styles for the editor pane.

@@ -390,6 +390,50 @@ pub fn open_connect_modal(store: AppStore, target: Option<(pimble_core::StoreId,
     store.connect_modal_open.set(true);
 }
 
+/// Open the "Account..." modal (docs/DESKTOP_ACCOUNT_CONTRACT.md decision 1):
+/// the sign-in form while nothing is signed in, the signed-in view otherwise.
+/// `hint` is why it opened when it did not open from the menu ("Sign in to
+/// host a store"), or empty. The URL field starts at `https://pimble.app` and
+/// then keeps whatever was last typed in this run.
+pub fn open_account_modal(store: AppStore, hint: &str) {
+    store.account_modal_error.set(String::new());
+    store.account_modal_busy.set(false);
+    store.account_modal_password.set(String::new());
+    store.account_modal_password_visible.set(false);
+    store.account_modal_hint.set(hint.to_string());
+    if untracked(|| store.account_modal_url.get()).is_empty() {
+        store.account_modal_url.set("https://pimble.app".to_string());
+    }
+    store.account_modal_open.set(true);
+}
+
+/// "Host on Pimble Cloud..." for `store_id`: the confirmation when an account
+/// is signed in, the Account modal with a hint otherwise (decision 5).
+pub fn open_host_modal(store: AppStore, store_id: pimble_core::StoreId) {
+    if !untracked(|| store.cloud_signed_in.get()) {
+        open_account_modal(store, "Sign in to host a store");
+        return;
+    }
+    store.host_modal_error.set(String::new());
+    store.host_modal_busy.set(false);
+    store.host_modal_store.set(Some(store_id));
+}
+
+/// Open the "Add Hosted Store..." modal and ask for the account's stores at
+/// once (decision 6). Not signed in, the modal says so and offers the
+/// Account modal instead of a list.
+pub fn open_hosted_modal(store: AppStore) {
+    store.hosted_modal_stores.set(Vec::new());
+    store.hosted_modal_selected.set(String::new());
+    store.hosted_modal_error.set(String::new());
+    let signed_in = untracked(|| store.cloud_signed_in.get());
+    store.hosted_modal_busy.set(signed_in);
+    store.hosted_modal_open.set(true);
+    if signed_in {
+        store.send(BackendCommand::CloudListHostedStores);
+    }
+}
+
 /// Open the "Appearance..." picker for `(store_id, node_id)`: seed the tags field
 /// from the node and clear the icon search.
 fn open_appearance_modal(store: AppStore, store_id: pimble_core::StoreId, node_id: pimble_core::NodeId) {
@@ -483,12 +527,18 @@ fn kind_label(kind: &str) -> &'static str {
 /// Text for a linked store's status badge (docs/SYNC_CONTRACT.md "B: app
 /// side"). `Conflict` is out of scope for this contract (there are no
 /// conflicts to show yet) but still needs a label rather than a match gap.
-fn sync_badge_text(state: &pimble_core::SyncState) -> &'static str {
-    match state {
-        pimble_core::SyncState::Offline => "offline",
-        pimble_core::SyncState::Syncing => "syncing",
-        pimble_core::SyncState::Synced { .. } => "synced",
-        pimble_core::SyncState::Conflict { .. } => "conflict",
+/// An encrypting vault link says so first (docs/DESKTOP_ACCOUNT_CONTRACT.md
+/// decision 4): `encrypted · synced`.
+fn sync_badge_text(state: &pimble_core::SyncState, mode: pimble_core::StoreKind) -> &'static str {
+    match (mode, state) {
+        (pimble_core::StoreKind::Plain, pimble_core::SyncState::Offline) => "offline",
+        (pimble_core::StoreKind::Plain, pimble_core::SyncState::Syncing) => "syncing",
+        (pimble_core::StoreKind::Plain, pimble_core::SyncState::Synced { .. }) => "synced",
+        (pimble_core::StoreKind::Plain, pimble_core::SyncState::Conflict { .. }) => "conflict",
+        (pimble_core::StoreKind::Vault, pimble_core::SyncState::Offline) => "encrypted · offline",
+        (pimble_core::StoreKind::Vault, pimble_core::SyncState::Syncing) => "encrypted · syncing",
+        (pimble_core::StoreKind::Vault, pimble_core::SyncState::Synced { .. }) => "encrypted · synced",
+        (pimble_core::StoreKind::Vault, pimble_core::SyncState::Conflict { .. }) => "encrypted · conflict",
     }
 }
 
@@ -743,6 +793,12 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             let is_replica_now = store_sig
                 .map(|sig| untracked(|| sig.with(|s| s.is_replica)))
                 .unwrap_or(false);
+            // And whether it is itself an encrypted store, for "Host on
+            // Pimble Cloud..."'s `disabled` value (decision 5): the server
+            // holds only blobs for one, so there is nothing here to host.
+            let is_vault_now = parsed
+                .map(|(s_id, _)| store.is_vault(s_id))
+                .unwrap_or(false);
 
             // Choose icon (static — changes only on structural rebuild). Folders
             // are folders even when empty; documents are documents even with
@@ -906,6 +962,14 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 move || {
                     if let Some((s_id, _)) = parse_tree_value(&nv) {
                         store.send(BackendCommand::SetStoreSync { store_id: s_id, remote: None });
+                    }
+                }
+            };
+            let on_host_on_cloud = {
+                let nv = nv_ctx.clone();
+                move || {
+                    if let Some((s_id, _)) = parse_tree_value(&nv) {
+                        open_host_modal(store, s_id);
                     }
                 }
             };
@@ -1186,8 +1250,13 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             }
                         },
                         {move || {
+                            // The mode is the store's own signal (decision 4),
+                            // read here so the badge follows a new vault link.
+                            let mode = store_sig
+                                .map(|sig| sig.with(|s| s.sync_mode))
+                                .unwrap_or_default();
                             sync_sig
-                                .map(|sig| sig.with(|(_, state)| sync_badge_text(state).to_string()))
+                                .map(|sig| sig.with(|(_, state)| sync_badge_text(state, mode).to_string()))
                                 .unwrap_or_default()
                         }}
                     }
@@ -1242,6 +1311,14 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                     disabled: is_linked_now,
                                     onclick: on_link_to_remote.clone(),
                                     "Link to Remote..."
+                                }
+                            }
+                            if CAN_ADMINISTER_STORES {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::CloudUpload,
+                                    disabled: is_linked_now || is_replica_now || is_vault_now,
+                                    onclick: on_host_on_cloud.clone(),
+                                    "Host on Pimble Cloud..."
                                 }
                             }
                             if CAN_ADMINISTER_STORES {
@@ -2156,6 +2233,294 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             }
         };
 
+        // ── "Account..." modal ──────────────────────────────────────────
+        // docs/DESKTOP_ACCOUNT_CONTRACT.md decision 1: one modal, two faces.
+        // The sign-in form while nothing is signed in; the account and a
+        // "Sign Out" button once something is. Both outcomes arrive as
+        // `CloudStatusChanged`, which flips the face and leaves the modal
+        // open so the person sees it worked.
+        let sign_in = move || {
+            let url = untracked(|| store.account_modal_url.get()).trim().to_string();
+            let email = untracked(|| store.account_modal_email.get()).trim().to_string();
+            let password = untracked(|| store.account_modal_password.get());
+            if url.is_empty() || email.is_empty() || password.is_empty() {
+                store.account_modal_error.set("Fill in the service URL, email and password.".to_string());
+                return;
+            }
+            store.account_modal_error.set(String::new());
+            store.account_modal_busy.set(true);
+            store.send(BackendCommand::CloudSignIn { url, email, password });
+        };
+        let account_modal = rsx! {
+            Modal {
+                opened_fn: move || store.account_modal_open.get(),
+                onclose: move || {
+                    store.account_modal_open.set(false);
+                    store.account_modal_error.set(String::new());
+                    store.account_modal_password.set(String::new());
+                    store.account_modal_hint.set(String::new());
+                },
+                title: "Account",
+                size: "sm",
+
+                div {
+                    style: "display: flex; flex-direction: column; gap: 10px;",
+
+                    if !store.account_modal_hint.get().is_empty() {
+                        div {
+                            style: "font-size: 12px; color: var(--rinch-color-dimmed);",
+                            {|| store.account_modal_hint.get()}
+                        }
+                    }
+
+                    // The sign-in face.
+                    if !store.cloud_signed_in.get() {
+                        div {
+                            style: "display: flex; flex-direction: column; gap: 10px;",
+
+                            TextInput {
+                                label: "Service URL",
+                                placeholder: "https://pimble.app",
+                                value_fn: move || store.account_modal_url.get(),
+                                oninput: move |val: String| store.account_modal_url.set(val),
+                            }
+
+                            TextInput {
+                                label: "Email",
+                                placeholder: "you@example.com",
+                                value_fn: move || store.account_modal_email.get(),
+                                oninput: move |val: String| store.account_modal_email.set(val),
+                            }
+
+                            PasswordInput {
+                                label: "Password",
+                                value_fn: move || store.account_modal_password.get(),
+                                oninput: move |val: String| store.account_modal_password.set(val),
+                                visible_fn: move || store.account_modal_password_visible.get(),
+                                ontoggle: move || store.account_modal_password_visible.update(|v| *v = !*v),
+                            }
+
+                            Button {
+                                variant: "filled",
+                                size: "sm",
+                                loading: {|| store.account_modal_busy.get()},
+                                disabled: {|| store.account_modal_busy.get()},
+                                onclick: sign_in,
+                                "Sign In"
+                            }
+                        }
+                    }
+
+                    // The signed-in face.
+                    if store.cloud_signed_in.get() {
+                        div {
+                            style: "display: flex; flex-direction: column; gap: 10px;",
+
+                            div {
+                                {|| format!("Signed in as {}", store.cloud_email.get())}
+                            }
+                            div {
+                                style: "font-size: 12px; color: var(--rinch-color-dimmed);",
+                                {|| store.cloud_url.get()}
+                            }
+
+                            Button {
+                                variant: "light",
+                                size: "sm",
+                                loading: {|| store.account_modal_busy.get()},
+                                disabled: {|| store.account_modal_busy.get()},
+                                onclick: move || {
+                                    store.account_modal_error.set(String::new());
+                                    store.account_modal_busy.set(true);
+                                    store.send(BackendCommand::CloudSignOut);
+                                },
+                                "Sign Out"
+                            }
+                        }
+                    }
+
+                    if !store.account_modal_error.get().is_empty() {
+                        div {
+                            style: "color: var(--rinch-color-red-6); font-size: 12px;",
+                            {|| store.account_modal_error.get()}
+                        }
+                    }
+                }
+            }
+        };
+
+        // ── "Host on Pimble Cloud..." confirmation (store root context
+        // menu) ─────────────────────────────────────────────────────────
+        // decision 5: names the store and the account, then `CloudHostStore`.
+        // `CloudStoreHosted` closes it; a `CloudError { HostStore }` lands
+        // on its error line.
+        let host_modal = rsx! {
+            Modal {
+                opened_fn: move || store.host_modal_store.get().is_some(),
+                onclose: move || {
+                    store.host_modal_store.set(None);
+                    store.host_modal_error.set(String::new());
+                },
+                title: "Host on Pimble Cloud",
+                size: "sm",
+
+                div {
+                    style: "display: flex; flex-direction: column; gap: 10px;",
+
+                    div {
+                        {|| {
+                            let Some(store_id) = store.host_modal_store.get() else {
+                                return String::new();
+                            };
+                            let name = store.get_store_signal(store_id)
+                                .map(|sig| sig.with(|s| s.name.clone()))
+                                .unwrap_or_default();
+                            format!("Host \"{}\" on Pimble Cloud as {}?", name, store.cloud_email.get())
+                        }}
+                    }
+
+                    div {
+                        style: "font-size: 12px; color: var(--rinch-color-dimmed);",
+                        "Encrypted before it leaves this machine. Its key is made here and \
+                         sealed to your account; the server stores what it cannot read."
+                    }
+
+                    if !store.host_modal_error.get().is_empty() {
+                        div {
+                            style: "color: var(--rinch-color-red-6); font-size: 12px;",
+                            {|| store.host_modal_error.get()}
+                        }
+                    }
+
+                    div {
+                        style: "display: flex; justify-content: flex-end; gap: 8px;",
+                        Button {
+                            variant: "light",
+                            size: "sm",
+                            disabled: {|| store.host_modal_busy.get()},
+                            onclick: move || {
+                                store.host_modal_store.set(None);
+                                store.host_modal_error.set(String::new());
+                            },
+                            "Cancel"
+                        }
+                        Button {
+                            variant: "filled",
+                            size: "sm",
+                            loading: {|| store.host_modal_busy.get()},
+                            disabled: {|| store.host_modal_busy.get()},
+                            onclick: move || {
+                                let Some(store_id) = untracked(|| store.host_modal_store.get()) else { return };
+                                store.host_modal_error.set(String::new());
+                                store.host_modal_busy.set(true);
+                                store.send(BackendCommand::CloudHostStore { store_id });
+                            },
+                            "Host"
+                        }
+                    }
+                }
+            }
+        };
+
+        // ── "Add Hosted Store..." modal (Account menu) ──────────────────
+        // decision 6: the account's encrypted stores not already open here
+        // (the event handler filters `CloudHostedStoresListed`), one of
+        // which becomes a local replica. The store arrives as `StoreOpened`,
+        // which closes the modal.
+        let add_hosted_store = move || {
+            let selected = untracked(|| store.hosted_modal_selected.get());
+            let Ok(uuid) = selected.parse::<uuid::Uuid>() else {
+                store.hosted_modal_error.set("Select a store first".to_string());
+                return;
+            };
+            store.hosted_modal_error.set(String::new());
+            store.hosted_modal_busy.set(true);
+            store.send(BackendCommand::CloudAddHostedStore { store_id: pimble_core::StoreId(uuid) });
+        };
+        let hosted_modal = rsx! {
+            Modal {
+                opened_fn: move || store.hosted_modal_open.get(),
+                onclose: move || {
+                    store.hosted_modal_open.set(false);
+                    store.hosted_modal_error.set(String::new());
+                },
+                title: "Add Hosted Store",
+                size: "sm",
+
+                div {
+                    style: "display: flex; flex-direction: column; gap: 10px;",
+
+                    // Nothing to list without an account.
+                    if !store.cloud_signed_in.get() {
+                        div {
+                            style: "display: flex; flex-direction: column; gap: 10px;",
+                            div { "Sign in first." }
+                            Button {
+                                variant: "filled",
+                                size: "sm",
+                                onclick: move || {
+                                    store.hosted_modal_open.set(false);
+                                    store.hosted_modal_error.set(String::new());
+                                    open_account_modal(store, "");
+                                },
+                                "Account..."
+                            }
+                        }
+                    }
+
+                    if store.cloud_signed_in.get() {
+                        div {
+                            style: "display: flex; flex-direction: column; gap: 10px;",
+
+                            Select {
+                                label: "Store",
+                                placeholder: "Select a store",
+                                value_fn: move || store.hosted_modal_selected.get(),
+                                onchange: move |val: String| store.hosted_modal_selected.set(val),
+                                data: {|| {
+                                    store.hosted_modal_stores.get().iter()
+                                        .map(|s| SelectOption::new(s.store_id.clone(), s.name.clone()))
+                                        .collect::<Vec<_>>()
+                                }},
+                            }
+
+                            div {
+                                style: {
+                                    move || {
+                                        let nothing = !store.hosted_modal_busy.get()
+                                            && store.hosted_modal_error.get().is_empty()
+                                            && store.hosted_modal_stores.with(|s| s.is_empty());
+                                        if nothing {
+                                            "font-size: 12px; color: var(--rinch-color-dimmed);"
+                                        } else {
+                                            "display: none;"
+                                        }
+                                    }
+                                },
+                                "Every encrypted store on this account is already open here."
+                            }
+
+                            Button {
+                                variant: "filled",
+                                size: "sm",
+                                loading: {|| store.hosted_modal_busy.get()},
+                                disabled: {|| store.hosted_modal_busy.get() || store.hosted_modal_selected.get().is_empty()},
+                                onclick: add_hosted_store,
+                                "Add"
+                            }
+                        }
+                    }
+
+                    if !store.hosted_modal_error.get().is_empty() {
+                        div {
+                            style: "color: var(--rinch-color-red-6); font-size: 12px;",
+                            {|| store.hosted_modal_error.get()}
+                        }
+                    }
+                }
+            }
+        };
+
         // Spawn the backend now that the UI and event loop are fully set up.
         // The EVENT_PROCESSOR thread-local is already registered, so signal_ui
         // callbacks will be processed correctly via run_on_main_thread. The web
@@ -2288,6 +2653,19 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             }}
                         }
 
+                        // The signed-in account, when there is one; a click
+                        // opens the Account modal (docs/DESKTOP_ACCOUNT_CONTRACT.md
+                        // decision 7). Only a build whose server keeps an
+                        // account: the browser signs in through its own pages.
+                        if CAN_ADMINISTER_STORES {
+                            span {
+                                class: "pimble-status-bar__account",
+                                style: {|| if store.cloud_signed_in.get() { "cursor: pointer;" } else { "display: none;" }},
+                                onclick: move || open_account_modal(store, ""),
+                                {|| format!("Signed in as {}", store.cloud_email.get())}
+                            }
+                        }
+
                         div { style: "flex: 1;", }
                     }
                 }
@@ -2311,6 +2689,9 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {new_store_modal}
                 {mount_picker_modal}
                 {appearance_modal}
+                {account_modal}
+                {host_modal}
+                {hosted_modal}
                 {body}
             }
         };
@@ -2330,6 +2711,9 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {new_store_modal}
                 {mount_picker_modal}
                 {appearance_modal}
+                {account_modal}
+                {host_modal}
+                {hosted_modal}
                 {body}
             }
         };
@@ -2401,4 +2785,25 @@ pub fn run() {
     CLOSE_HANDLER.with(|cell| {
         *cell.borrow_mut() = None;
     });
+}
+#[cfg(test)]
+mod tests {
+    use super::sync_badge_text;
+    use pimble_core::{StoreKind, SyncState};
+
+    /// The badge is the server's `sync_mode` (docs/DESKTOP_ACCOUNT_CONTRACT.md
+    /// decision 4): a vault link says "encrypted" first, a plain link reads
+    /// as it always has.
+    #[test]
+    fn badge_text_follows_state_and_mode() {
+        // Built through serde: this crate has no chrono of its own.
+        let synced: SyncState =
+            serde_json::from_str(r#"{"state":"synced","last_sync":"2026-09-16T00:00:00Z"}"#).unwrap();
+        assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Plain), "offline");
+        assert_eq!(sync_badge_text(&SyncState::Syncing, StoreKind::Plain), "syncing");
+        assert_eq!(sync_badge_text(&synced, StoreKind::Plain), "synced");
+        assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Vault), "encrypted · offline");
+        assert_eq!(sync_badge_text(&SyncState::Syncing, StoreKind::Vault), "encrypted · syncing");
+        assert_eq!(sync_badge_text(&synced, StoreKind::Vault), "encrypted · synced");
+    }
 }

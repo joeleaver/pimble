@@ -315,6 +315,30 @@ store-name question). Pimble Cloud holds ciphertext only.
 - **Phase 2b** (designed for, not built): sharing in place with subtree grants and per-share
   keys, invitations, the relay tier (store nothing), then teams.
 
+### Desktop account UI (done 2026-09-16)
+
+Contract: `docs/DESKTOP_ACCOUNT_CONTRACT.md`. `native` only; the browser keeps its own
+pages. An "Account" menu (between File and Edit) holds "Account..." and "Add Hosted
+Store...". The Account modal has two faces: the sign-in form (service URL defaulting to
+`https://pimble.app`, email, password) and, once signed in, the email, the URL and
+"Sign Out"; a sign-in survives an app restart because the embedded server's keystore
+(`<config dir>/pimble/keys.json`) holds the session, and the app sends `CloudStatus` on
+every `Connected`. The status bar shows "Signed in as <email>" (click opens the modal).
+A store row's menu has "Host on Pimble Cloud..." (disabled for a linked store, a replica
+or a vault-kind store; opens the Account modal with a hint when nothing is signed in) with
+a confirmation that names the store and the account. "Add Hosted Store..." lists the
+account's vault stores not open here and adds one as a replica (`StoreOpened`, like
+`addRemoteStore`). Every cloud command answers with an event naming its operation
+(`CloudStatusChanged`, `CloudError { op }`, `CloudHostedStoresListed`, `CloudStoreHosted`),
+never the generic `Error`. `StoreSyncChanged` carries the server's `sync_mode`, written
+into the store's `Store` signal; the badge reads it: `encrypted · synced` for a vault
+link, `synced` for a plain one. Two server fixes came out of verifying it: adopting an
+implicitly opened store (`adopt_newly_opened`, drained by the next `getChildren`) now
+starts the link `sync.json` describes instead of always a plain one, `ensure_link_started`
+refuses a store that has a vault link, and a vault replica's manifest root is rewritten
+from the store document once the tree is pulled (`adopt_document_root`, also at
+vault-link start), so a reopened replica no longer reports a placeholder root.
+
 ## Key Files
 
 - `docs/RESTART_PLAN.md` - vision, diagnosis, decisions, ordered plan

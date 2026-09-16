@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use pimble_core::{NodeId, Store, StoreId};
 use rinch::prelude::*;
 
-use crate::protocol::{BackendCommand, BackendEvent};
+use crate::protocol::{BackendCommand, BackendEvent, CloudOp};
 use crate::editor::{apply_remote, start_editing};
 use crate::persistence::{load_app_state_file, save_app_state_file};
 use crate::state::{parse_tree_value, take_last_drop_target_value, AppStore, ConnectionState, MountInfo, SearchState};
@@ -201,6 +201,12 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     });
                     crate::editor::request_reconcile(store, active.store_id, active.node_id);
                 }
+
+                // Whether the server's keystore holds a signed-in account
+                // (a sign-in survives an app restart), for the status bar
+                // and the Account modal's face (docs/DESKTOP_ACCOUNT_CONTRACT.md
+                // decision 7).
+                store.send(BackendCommand::CloudStatus);
             }
 
             BackendEvent::Disconnected => {
@@ -257,6 +263,19 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     store.connect_modal_busy.set(false);
                     store.connect_modal_open.set(false);
                     store.connect_modal_error.set(String::new());
+                }
+
+                // A `CloudAddHostedStore` request just answered: the replica
+                // is open, so the "Add Hosted Store..." modal closes
+                // (docs/DESKTOP_ACCOUNT_CONTRACT.md decision 6). The id
+                // check keeps a store opening for another reason while the
+                // list request is in flight (busy too) from closing it.
+                let hosted_add_answered = untracked(|| store.hosted_modal_busy.get())
+                    && untracked(|| store.hosted_modal_selected.get()) == store_id.to_string();
+                if hosted_add_answered {
+                    store.hosted_modal_busy.set(false);
+                    store.hosted_modal_open.set(false);
+                    store.hosted_modal_error.set(String::new());
                 }
 
                 // Check if this store was opened as part of a pending mount
@@ -745,10 +764,13 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 }
             }
 
-            BackendEvent::StoreSyncChanged { store_id, remote, state } => {
-                tracing::info!("Sync state for store {:?}: {:?}", store_id, state);
+            BackendEvent::StoreSyncChanged { store_id, remote, state, sync_mode } => {
+                tracing::info!("Sync state for store {:?}: {:?} ({:?})", store_id, state, sync_mode);
                 let was_linked = store.is_linked(*store_id);
                 store.set_sync(*store_id, remote.clone(), state.clone());
+                // What the link is, for the badge's "encrypted" prefix
+                // (docs/DESKTOP_ACCOUNT_CONTRACT.md decision 4).
+                store.set_store_sync_mode(*store_id, *sync_mode);
                 let now_linked = remote.is_some();
                 if was_linked != now_linked {
                     // The "Link to Remote..."/"Unlink from Remote" disabled
@@ -797,6 +819,93 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     store.remove_replica_modal_store.set(None);
                     store.remove_replica_modal_error.set(String::new());
                 }
+            }
+
+            // Pimble Cloud account (docs/DESKTOP_ACCOUNT_CONTRACT.md "Events").
+            BackendEvent::CloudStatusChanged { signed_in, email, url } => {
+                tracing::info!("Cloud account: signed_in={} email={:?}", signed_in, email);
+                store.cloud_signed_in.set(*signed_in);
+                store.cloud_email.set(email.clone().unwrap_or_default());
+                store.cloud_url.set(url.clone().unwrap_or_default());
+                // Seed the sign-in form with the account this server knows,
+                // so a sign-out (or a restart) leaves the URL and email to be
+                // typed once, not every time.
+                if let Some(email) = email {
+                    store.account_modal_email.set(email.clone());
+                }
+                if let Some(url) = url {
+                    store.account_modal_url.set(url.clone());
+                }
+                // A sign-in or sign-out from the Account modal just answered:
+                // the modal stays open and shows its other face, so the
+                // person sees it worked.
+                if untracked(|| store.account_modal_busy.get()) {
+                    store.account_modal_busy.set(false);
+                    store.account_modal_error.set(String::new());
+                    store.account_modal_password.set(String::new());
+                    store.account_modal_hint.set(String::new());
+                }
+            }
+
+            BackendEvent::CloudError { op, message } => {
+                tracing::warn!("Cloud {:?} failed: {}", op, message);
+                match op {
+                    CloudOp::SignIn | CloudOp::SignOut => {
+                        store.account_modal_busy.set(false);
+                        store.account_modal_error.set(message.clone());
+                    }
+                    CloudOp::Status => {
+                        // Asked on every connect; only worth a line in the
+                        // modal when the modal is there to show it.
+                        if untracked(|| store.account_modal_open.get()) {
+                            store.account_modal_busy.set(false);
+                            store.account_modal_error.set(message.clone());
+                        }
+                    }
+                    CloudOp::HostStore => {
+                        store.host_modal_busy.set(false);
+                        store.host_modal_error.set(message.clone());
+                    }
+                    CloudOp::ListHostedStores | CloudOp::AddHostedStore => {
+                        store.hosted_modal_busy.set(false);
+                        store.hosted_modal_error.set(message.clone());
+                    }
+                }
+            }
+
+            BackendEvent::CloudHostedStoresListed { stores } => {
+                // Only an encrypted store not already open here can be added
+                // as a replica (the server refuses an open one anyway), so
+                // the modal lists just those (decision 6).
+                let open: Vec<StoreId> = untracked(|| store.store_ids.get());
+                let candidates: Vec<pimble_rpc::CloudHostedStoreInfo> = stores
+                    .iter()
+                    .filter(|s| s.kind == "vault")
+                    .filter(|s| {
+                        s.store_id
+                            .parse::<uuid::Uuid>()
+                            .map_or(false, |id| !open.contains(&StoreId(id)))
+                    })
+                    .cloned()
+                    .collect();
+                store.hosted_modal_selected.set(
+                    candidates.first().map(|s| s.store_id.clone()).unwrap_or_default(),
+                );
+                store.hosted_modal_stores.set(candidates);
+                store.hosted_modal_busy.set(false);
+                store.hosted_modal_error.set(String::new());
+            }
+
+            BackendEvent::CloudStoreHosted { store_id } => {
+                tracing::info!("Store {:?} is hosted on Pimble Cloud", store_id);
+                store.host_modal_busy.set(false);
+                store.host_modal_store.set(None);
+                store.host_modal_error.set(String::new());
+                // The badge and mode come from the server's view of the new
+                // link, and the row's menu re-renders with "Host on Pimble
+                // Cloud..." disabled (decision 5).
+                store.send(BackendCommand::GetStoreSync { store_id: *store_id });
+                store.bump_tree_structure();
             }
         }
     }

@@ -396,6 +396,7 @@ impl VaultClient {
                 store_id,
                 remote: None,
                 state: pimble_core::SyncState::Offline,
+                sync_mode: pimble_core::StoreKind::Plain,
             }),
             BackendCommand::RebuildIndex { store_id } => {
                 Some(BackendEvent::IndexRebuilt { store_id, indexed: 0 })

@@ -590,6 +590,23 @@ impl PimbleClient {
         Ok((response.remote, response.state))
     }
 
+    /// Like [`PimbleClient::set_store_sync`], but also reports the link's
+    /// mode (`Plain` or `Vault`), the way [`PimbleClient::get_store_sync_with_mode`]
+    /// does for a read. The two-element wrapper stays for its callers.
+    pub async fn set_store_sync_with_mode(
+        &self,
+        store_id: StoreId,
+        remote: Option<RemoteEndpoint>,
+    ) -> Result<(Option<RemoteEndpoint>, SyncState, StoreKind)> {
+        let request = SetStoreSyncRequest { store_id, remote };
+        let response = self
+            .client
+            .set_store_sync(request)
+            .await
+            .map_err(rpc_error)?;
+        Ok((response.remote, response.state, response.sync_mode))
+    }
+
     /// A store's sync link (`None` when unlinked) and its current state.
     pub async fn get_store_sync(&self, store_id: StoreId) -> Result<(Option<RemoteEndpoint>, SyncState)> {
         let request = GetStoreSyncRequest { store_id };

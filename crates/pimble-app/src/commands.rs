@@ -13,7 +13,7 @@ use crossbeam_channel::Sender;
 use pimble_client::PimbleClient;
 use pimble_core::{AuthMethod, NodeId, RemoteEndpoint};
 
-use crate::protocol::{BackendCommand, BackendEvent};
+use crate::protocol::{BackendCommand, BackendEvent, CloudOp};
 
 /// Run `fut` alongside the command loop, for a subscription that then feeds
 /// events in for as long as it lives.
@@ -442,8 +442,10 @@ pub async fn process_command(
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
-            match c.set_store_sync(store_id, remote).await {
-                Ok((remote, state)) => Some(BackendEvent::StoreSyncChanged { store_id, remote, state }),
+            match c.set_store_sync_with_mode(store_id, remote).await {
+                Ok((remote, state, sync_mode)) => {
+                    Some(BackendEvent::StoreSyncChanged { store_id, remote, state, sync_mode })
+                }
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
         }
@@ -452,9 +454,84 @@ pub async fn process_command(
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
-            match c.get_store_sync(store_id).await {
-                Ok((remote, state)) => Some(BackendEvent::StoreSyncChanged { store_id, remote, state }),
+            match c.get_store_sync_with_mode(store_id).await {
+                Ok((remote, state, sync_mode)) => {
+                    Some(BackendEvent::StoreSyncChanged { store_id, remote, state, sync_mode })
+                }
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
+        // Pimble Cloud account (docs/DESKTOP_ACCOUNT_CONTRACT.md). Every
+        // failure is a `CloudError` naming its operation, never the generic
+        // `Error`, so the modal that asked gets it (decision 3).
+        BackendCommand::CloudStatus => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::Status, message: "Not connected".into() });
+            };
+            match c.cloud_status().await {
+                Ok(status) => Some(cloud_status_event(status)),
+                Err(e) => Some(BackendEvent::CloudError { op: CloudOp::Status, message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::CloudSignIn { url, email, password } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::SignIn, message: "Not connected".into() });
+            };
+            if let Err(e) = c.cloud_sign_in(url.clone(), email.clone(), password).await {
+                return Some(BackendEvent::CloudError { op: CloudOp::SignIn, message: e.to_string() });
+            }
+            // The keystore's own record of the account is the answer; the
+            // typed values stand in only if reading it back fails.
+            match c.cloud_status().await {
+                Ok(status) => Some(cloud_status_event(status)),
+                Err(_) => Some(BackendEvent::CloudStatusChanged {
+                    signed_in: true,
+                    email: Some(email),
+                    url: Some(url),
+                }),
+            }
+        }
+
+        BackendCommand::CloudSignOut => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::SignOut, message: "Not connected".into() });
+            };
+            match c.cloud_sign_out().await {
+                Ok(()) => Some(BackendEvent::CloudStatusChanged { signed_in: false, email: None, url: None }),
+                Err(e) => Some(BackendEvent::CloudError { op: CloudOp::SignOut, message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::CloudHostStore { store_id } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::HostStore, message: "Not connected".into() });
+            };
+            match c.cloud_host_store(store_id).await {
+                Ok(store_id) => Some(BackendEvent::CloudStoreHosted { store_id }),
+                Err(e) => Some(BackendEvent::CloudError { op: CloudOp::HostStore, message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::CloudListHostedStores => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::ListHostedStores, message: "Not connected".into() });
+            };
+            match c.cloud_list_hosted_stores().await {
+                Ok(stores) => Some(BackendEvent::CloudHostedStoresListed { stores }),
+                Err(e) => Some(BackendEvent::CloudError { op: CloudOp::ListHostedStores, message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::CloudAddHostedStore { store_id } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::AddHostedStore, message: "Not connected".into() });
+            };
+            // The replica arrives the way `AddRemoteStore`'s does.
+            match c.cloud_add_hosted_store(store_id).await {
+                Ok(store) => Some(BackendEvent::StoreOpened { store }),
+                Err(e) => Some(BackendEvent::CloudError { op: CloudOp::AddHostedStore, message: e.to_string() }),
             }
         }
 
@@ -476,6 +553,11 @@ pub async fn process_command(
             }
         }
     }
+}
+
+/// The `CloudStatusChanged` event for a `cloudStatus` answer.
+fn cloud_status_event(status: pimble_rpc::CloudStatusResponse) -> BackendEvent {
+    BackendEvent::CloudStatusChanged { signed_in: status.signed_in, email: status.email, url: status.url }
 }
 
 /// Build a `RemoteEndpoint` for a URL typed into a modal: an empty token

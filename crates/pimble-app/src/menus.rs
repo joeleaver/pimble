@@ -43,10 +43,25 @@ pub struct MenuSection {
 
 /// Every menu this build offers.
 pub fn menu_spec(store: AppStore) -> Vec<MenuSection> {
+    let mut sections = vec![MenuSection { title: "File", entries: file_entries(store) }];
+    // The desktop signs in through its own server's keystore
+    // (docs/DESKTOP_ACCOUNT_CONTRACT.md); the browser has account pages of
+    // its own, reached from the File menu above.
+    #[cfg(feature = "native")]
+    sections.push(MenuSection { title: "Account", entries: account_entries(store) });
+    sections.push(MenuSection { title: "Edit", entries: edit_entries(store) });
+    sections.push(MenuSection { title: "View", entries: view_entries(store) });
+    sections
+}
+
+/// A native menu cannot re-label its items reactively and no label here may
+/// be dead, so the one item is "Account..." whichever face the modal shows
+/// (docs/DESKTOP_ACCOUNT_CONTRACT.md decision 1).
+#[cfg(feature = "native")]
+fn account_entries(store: AppStore) -> Vec<MenuEntry> {
     vec![
-        MenuSection { title: "File", entries: file_entries(store) },
-        MenuSection { title: "Edit", entries: edit_entries(store) },
-        MenuSection { title: "View", entries: view_entries(store) },
+        MenuEntry::item("Account...", "", move || crate::app::open_account_modal(store, "")),
+        MenuEntry::item("Add Hosted Store...", "", move || crate::app::open_hosted_modal(store)),
     ]
 }
 

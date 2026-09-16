@@ -128,6 +128,38 @@ pub enum BackendCommand {
     /// backend answers this itself; the desktop, whose stores are files it
     /// creates directly, refuses it.
     CreateHostedStore { name: String, kind: String },
+
+    // Pimble Cloud account (docs/DESKTOP_ACCOUNT_CONTRACT.md). All six are
+    // `Service`-only RPCs on the server this client talks to; the desktop's
+    // embedded server is that principal. Each answers with a `Cloud*` event
+    // that names the operation, so an outcome never has to be guessed at.
+    /// Whether an account is signed in, and as whom (`CloudStatusChanged`).
+    CloudStatus,
+    /// Sign in to the accounts service at `url` (`CloudStatusChanged` with
+    /// `signed_in: true`, or `CloudError { op: SignIn }`).
+    CloudSignIn { url: String, email: String, password: String },
+    /// Forget the signed-in account (`CloudStatusChanged` with `signed_in: false`).
+    CloudSignOut,
+    /// Host a local store's encrypted twin on Pimble Cloud (`CloudStoreHosted`).
+    CloudHostStore { store_id: StoreId },
+    /// Every store the signed-in account has a grant on (`CloudHostedStoresListed`).
+    CloudListHostedStores,
+    /// Add an already-hosted store as a local replica; the store arrives as
+    /// `StoreOpened`, exactly as `AddRemoteStore`'s does.
+    CloudAddHostedStore { store_id: StoreId },
+}
+
+/// Which cloud request an outcome belongs to (docs/DESKTOP_ACCOUNT_CONTRACT.md
+/// decision 3): every cloud event names its operation, so the event handler
+/// routes an error to the modal that asked without a pending flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudOp {
+    Status,
+    SignIn,
+    SignOut,
+    HostStore,
+    ListHostedStores,
+    AddHostedStore,
 }
 
 /// Events sent from backend to UI
@@ -203,7 +235,11 @@ pub enum BackendEvent {
     /// A store's sync link and state changed: the answer to `SetStoreSync` or
     /// `GetStoreSync`, or a live `SyncStateChanged` notification (which
     /// carries only the state — the event handler keeps the known `remote`).
-    StoreSyncChanged { store_id: StoreId, remote: Option<RemoteEndpoint>, state: SyncState },
+    /// `sync_mode` is what the link is: `Plain` for an ordinary replica link
+    /// (or unlinked), `Vault` for an encrypting vault link, which the store
+    /// row's badge shows as "encrypted" (docs/DESKTOP_ACCOUNT_CONTRACT.md
+    /// decision 4).
+    StoreSyncChanged { store_id: StoreId, remote: Option<RemoteEndpoint>, state: SyncState, sync_mode: pimble_core::StoreKind },
     /// Answer to `RemoveReplica`: the replica is gone. Handled exactly like
     /// `StoreClosed` (tree + saved open-store list cleanup).
     ReplicaRemoved { store_id: StoreId },
@@ -212,6 +248,20 @@ pub enum BackendEvent {
     /// store itself arrives the ordinary way: the backend mints a token that
     /// carries the new grant and reconnects, and `StoresListed` brings it in.
     HostedStoreCreated { name: String },
+
+    // Pimble Cloud account (docs/DESKTOP_ACCOUNT_CONTRACT.md).
+    /// The answer to `CloudStatus`, `CloudSignIn` (`signed_in: true`) and
+    /// `CloudSignOut` (`signed_in: false`).
+    CloudStatusChanged { signed_in: bool, email: Option<String>, url: Option<String> },
+    /// A cloud request failed; `op` says which, so the error lands in the
+    /// modal that sent it.
+    CloudError { op: CloudOp, message: String },
+    /// The answer to `CloudListHostedStores`: every store the account has a
+    /// grant on, unfiltered (the event handler keeps the ones worth adding).
+    CloudHostedStoresListed { stores: Vec<pimble_rpc::CloudHostedStoreInfo> },
+    /// The answer to `CloudHostStore`: the store is hosted and linked in
+    /// vault mode.
+    CloudStoreHosted { store_id: StoreId },
 }
 
 /// Handle to communicate with the backend

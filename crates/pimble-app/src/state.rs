@@ -329,6 +329,49 @@ pub struct AppStore {
     pub remove_replica_modal_error: Signal<String>,
     /// True while a `RemoveReplica` request from this modal is in flight.
     pub remove_replica_modal_pending: Signal<bool>,
+
+    // Pimble Cloud account (docs/DESKTOP_ACCOUNT_CONTRACT.md): what the
+    // server's keystore reports, refreshed by `CloudStatus` on every connect
+    // and by every sign-in or sign-out.
+    pub cloud_signed_in: Signal<bool>,
+    pub cloud_email: Signal<String>,
+    pub cloud_url: Signal<String>,
+
+    // "Account..." modal (Account menu, the status bar, and "Host on Pimble
+    // Cloud..." with nothing signed in). One modal, two faces: the sign-in
+    // form while nothing is signed in, the signed-in view otherwise
+    // (decision 1).
+    pub account_modal_open: Signal<bool>,
+    /// The service URL field; `"https://pimble.app"` when first opened, then
+    /// whatever was last typed in this run (not persisted).
+    pub account_modal_url: Signal<String>,
+    pub account_modal_email: Signal<String>,
+    /// Cleared whenever the modal closes and on a successful sign-in.
+    pub account_modal_password: Signal<String>,
+    pub account_modal_password_visible: Signal<bool>,
+    /// True while a `CloudSignIn` or `CloudSignOut` is in flight.
+    pub account_modal_busy: Signal<bool>,
+    pub account_modal_error: Signal<String>,
+    /// Why the modal opened, when it did not open from the menu: "Sign in to
+    /// host a store", or empty.
+    pub account_modal_hint: Signal<String>,
+
+    // "Host on Pimble Cloud..." confirmation (store root context menu).
+    // `Some(store_id)` is the store it is open for; `None` means closed.
+    pub host_modal_store: Signal<Option<StoreId>>,
+    /// True while a `CloudHostStore` is in flight.
+    pub host_modal_busy: Signal<bool>,
+    pub host_modal_error: Signal<String>,
+
+    // "Add Hosted Store..." modal (Account menu): the account's encrypted
+    // stores not already open here, one of which becomes a local replica.
+    pub hosted_modal_open: Signal<bool>,
+    pub hosted_modal_stores: Signal<Vec<pimble_rpc::CloudHostedStoreInfo>>,
+    /// The selected store's id, as a string (the raw `Select` value).
+    pub hosted_modal_selected: Signal<String>,
+    /// True while a `CloudListHostedStores` or `CloudAddHostedStore` is in flight.
+    pub hosted_modal_busy: Signal<bool>,
+    pub hosted_modal_error: Signal<String>,
 }
 
 /// Identifies the node currently open in the shared editor.
@@ -400,6 +443,37 @@ impl AppStore {
             remove_replica_modal_store: Signal::new(None),
             remove_replica_modal_error: Signal::new(String::new()),
             remove_replica_modal_pending: Signal::new(false),
+            cloud_signed_in: Signal::new(false),
+            cloud_email: Signal::new(String::new()),
+            cloud_url: Signal::new(String::new()),
+            account_modal_open: Signal::new(false),
+            account_modal_url: Signal::new(String::new()),
+            account_modal_email: Signal::new(String::new()),
+            account_modal_password: Signal::new(String::new()),
+            account_modal_password_visible: Signal::new(false),
+            account_modal_busy: Signal::new(false),
+            account_modal_error: Signal::new(String::new()),
+            account_modal_hint: Signal::new(String::new()),
+            host_modal_store: Signal::new(None),
+            host_modal_busy: Signal::new(false),
+            host_modal_error: Signal::new(String::new()),
+            hosted_modal_open: Signal::new(false),
+            hosted_modal_stores: Signal::new(Vec::new()),
+            hosted_modal_selected: Signal::new(String::new()),
+            hosted_modal_busy: Signal::new(false),
+            hosted_modal_error: Signal::new(String::new()),
+        }
+    }
+
+    /// Record what a store's sync link is (`Plain` or `Vault`) on the store's
+    /// own signal, where the row's badge reads it reactively
+    /// (docs/DESKTOP_ACCOUNT_CONTRACT.md decision 4). A no-op when nothing
+    /// changed, so the badge's effect does not re-run on every `GetStoreSync`.
+    pub fn set_store_sync_mode(&self, store_id: StoreId, sync_mode: pimble_core::StoreKind) {
+        let Some(sig) = self.get_store_signal(store_id) else { return };
+        let differs = untracked(|| sig.with(|s| s.sync_mode != sync_mode));
+        if differs {
+            sig.update(|s| s.sync_mode = sync_mode);
         }
     }
 
