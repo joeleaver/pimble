@@ -33,9 +33,14 @@ this, then `CLAUDE.md` ("Cloud, phase 1" and "Cloud, phase 2a"), then
   id stamped on `VaultAppended`, the web client applies everything not attributed to
   itself, the desktop link drops echoes by identity first (convergence test with two
   servers racing). Verified on production (v12) by the PM with two tabs typing alternately.
-  Open: four `TypeError ... reading 'length'` in the browser console from a document
-  keydown listener in rinch-web reading `event.key` on an event without one (rinch
-  follow-up PR in progress). Account recovery is built in the accounts service (`/recover/start`,
+  The `TypeError ... reading 'length'` console errors (rinch-web's keydown/keyup
+  listeners casting non-keyboard events, triggered by autofill) are fixed by rinch PR #810,
+  merged and deployed as v14 2026-09-16 20:49 UTC: the same unlock-and-mount sequence now
+  logs zero errors. Two lessons from that deploy: a target's `exclude` list must never name
+  a workspace member crate (cargo cannot load the workspace without every member
+  manifest; the excludes are `site`, `docs`, `*.md`, `jkbase.toml`, `web` for the servers),
+  and the platform's monthly build-minute quota (200 minutes by default) silently drops
+  pushes once exhausted; Joe raised it. Account recovery is built in the accounts service (`/recover/start`,
   `/recover/{token}`, `/recover/{token}/complete`, `/me/password`, `/me/recovery-code`,
   `/recover/{token}/delete-account`, 36 tests) and the web pages are built (`/app/forgot`, `/app/recover?token=`, change password and a
   new recovery code on `/app/account`), verified against the real service with logged
