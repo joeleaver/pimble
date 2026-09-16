@@ -39,7 +39,9 @@ this, then `CLAUDE.md` ("Cloud, phase 1" and "Cloud, phase 2a"), then
   `/recover/{token}`, `/recover/{token}/complete`, `/me/password`, `/me/recovery-code`,
   `/recover/{token}/delete-account`, 36 tests) and the web pages are built (`/app/forgot`, `/app/recover?token=`, change password and a
   new recovery code on `/app/account`), verified against the real service with logged
-  links; not yet deployed.
+  links; deployed as v13 and verified on production by the PM (recovery link through
+  Resend, old code accepted, new code issued, old password refused, new password signs in,
+  the encrypted note still decrypts).
   The server targets' cache inputs now exclude `web/` as well.
 - **Production test account** (the PM's, delete when there is a way): `pm-live-2a@resend.dev`
   with the encrypted store "Live vault".
