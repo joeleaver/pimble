@@ -52,7 +52,7 @@ source = "crates/pimble-cloud"
 context = "."
 # Cache keying: only these inputs matter to the build; a change elsewhere must not
 # invalidate this target (jkbase, 2026-09-15).
-exclude = ["site", "docs", "*.md", "jkbase.toml"]
+exclude = ["site", "docs", "*.md", "jkbase.toml", "web"]
 port = 8080
 health_check = { path = "/api/v1/health", interval = "10s", timeout = "5s" }
 
@@ -82,7 +82,7 @@ source = "crates/pimble-cli"
 context = "."
 # Cache keying: only these inputs matter to the build; a change elsewhere must not
 # invalidate this target (jkbase, 2026-09-15).
-exclude = ["site", "docs", "*.md", "jkbase.toml"]
+exclude = ["site", "docs", "*.md", "jkbase.toml", "web"]
 port = 7462
 command = ["/app/pimble-cli", "server", "--addr", "127.0.0.1:7462", "--stores-dir", "/app/data/stores"]
 volumes = [{ name = "data", mount = "/app/data" }]
