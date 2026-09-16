@@ -230,14 +230,15 @@ menu is open — left the native one to appear. `src/shortcuts.rs` cancels it fo
 the whole page: a bubble-phase listener on `document` that never stops
 propagation, so rinch's own listener still runs and its menu still opens.
 
-The upstream fix is a flag rather than a widening, because unconditional
-suppression would take right-click-copy away from a host page hydrating rinch
-islands: a `SUPPRESS_NATIVE_CONTEXT_MENU` thread-local in
-`crates/rinch-web/src/event_delegation.rs` with a
-`set_suppress_native_context_menu(bool)` exported beside `setup_event_delegation`,
-and the `prevent_default()` in that listener moved out of the handler-lookup
-`if let` so it also runs when the flag is on. `event_delegation.rs` is compiled
-only in rinch-web, so the desktop is untouched.
+That fix has landed upstream, on rinch PR #791's branch rather than on `main`:
+`rinch_web::set_suppress_native_context_menu(bool)`, a flag rather than a
+widening, because unconditional suppression would take right-click-copy away
+from a host page hydrating rinch islands. The same commit closes a gap this
+crate's listener cannot reach, where a stale `data-oncontextmenu` suppressed the
+default and dispatched nothing. When this workspace is on a rinch that has it,
+call it with `true` where the app mounts and delete the `contextmenu` half of
+`src/shortcuts.rs`; the Ctrl+K half stays until the menu bar carries that
+accelerator.
 
 ## What the browser build leaves out
 
@@ -456,3 +457,14 @@ proxies:
 Not yet verified here: the flow through `trunk serve`'s own proxies (the runs
 above used an equivalent reverse proxy), a store shared with a second account,
 key rotation, and the snapshot path (200 appends to one document).
+
+## Two dev-only traps seen on 2026-09-16
+
+- `trunk serve`'s `/api` proxy follows redirects against the backend, so opening the
+  verification link through port 8081 verifies the account but shows a 404; open the link
+  against the accounts service's own port, or accept the 404 and sign in. jkbase's edge does
+  not follow redirects.
+- The desktop app's embedded server binds `127.0.0.1:7462`; a hosted server for the local
+  stack must use another port (`--addr 127.0.0.1:17463`, `PIMBLE_SERVER_URL` to match, and
+  a copy of `Trunk.toml` with an absolute `target` and the `/rpc` backend on that port,
+  passed with `trunk serve --config`).

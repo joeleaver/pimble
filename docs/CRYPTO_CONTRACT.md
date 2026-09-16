@@ -1,10 +1,18 @@
 # Crypto contract, phase 2a: end-to-end encryption for hosted stores
 
-Status: in progress (started 2026-09-15 evening). Decided with Joe the same day: encryption
-is important and comes first, before sharing. Nothing here deploys until jkbase's build
-cache change is live (Joe's instruction: no `git push jkbase` until then). Assumptions Joe
-has not overruled: local store files stay unencrypted on disk; signup issues a recovery
-code.
+Status: code done 2026-09-16 (branch `cloud/phase-1`), verified end to end by the PM in a
+browser through trunk's proxies against the real four-process stack; deploy pending the
+web menu bar (rinch PR #791, tracked as branch `feat/web-menu-bar` in both workspaces).
+Decided with Joe 2026-09-15: encryption is important and comes first, before sharing.
+Assumptions Joe has not overruled: local store files stay unencrypted on disk; signup
+issues a recovery code. Open decision: the store's display name is still plaintext in the
+hosted manifest and the accounts service (not listed in the threat model); proposal: keep
+the name inside the encrypted tree document and store an encrypted name blob for the
+account page, sending the server only the id. Decisions made during the work: the mode
+field is `sync_mode` (`Store.kind` already means the store's own kind); `cloudAddHostedStore`
+starts from an empty replica; the accounts service's `rpc_url` only resolves behind an
+edge that routes `/rpc`, so the interop test runs a tiny proxy; `run_on_main_thread` from
+the main thread runs synchronously, so "defer past the menu close" uses a zero timer.
 
 ## Goal
 

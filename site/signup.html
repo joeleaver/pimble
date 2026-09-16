@@ -3,144 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Sign up — Pimble</title>
-  <meta name="description" content="Create a Pimble account.">
-  <link rel="icon" href="data:,">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap" rel="stylesheet">
+  <title>Pimble: create an account</title>
+  <meta http-equiv="refresh" content="0; url=/app/signup">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <header class="nav">
-    <a class="nav__brand" href="index.html">Pimble</a>
-    <nav class="nav__links">
-      <a href="download.html">Download</a>
-      <a href="login.html">Log in</a>
-    </nav>
-  </header>
-
-  <main>
-    <section class="shell hero">
-      <h1>Sign up</h1>
-      <p class="lead">Creates a hosted store you can reach from a browser, in addition to anything you keep on the desktop app.</p>
-
-      <form id="signup-form" class="stack" novalidate>
-        <div class="form-error" data-form-error hidden></div>
-
-        <div class="field">
-          <label for="email">Email</label>
-          <input id="email" name="email" type="email" autocomplete="email" required>
-        </div>
-
-        <div class="field">
-          <label for="password">Password</label>
-          <input id="password" name="password" type="password" autocomplete="new-password" minlength="8" required>
-        </div>
-        <p class="form-note">At least 8 characters.</p>
-
-        <div class="field">
-          <label for="confirm-password">Confirm password</label>
-          <input id="confirm-password" name="confirm_password" type="password" autocomplete="new-password" minlength="8" required>
-        </div>
-
-        <button class="btn" type="submit">Create account</button>
-      </form>
-
-      <div id="signup-sent" class="panel" hidden>
-        <p style="margin-bottom: 14px;">Check your inbox: we sent a verification link to <strong data-sent-email></strong>.</p>
-        <div class="form-error" data-resend-error hidden></div>
-        <p class="form-note" data-resend-note hidden></p>
-        <button class="btn secondary" id="resend-btn" type="button">Send it again</button>
-      </div>
-
-      <p id="signup-login-hint" style="margin-top: 24px;">
-        Already have an account? <a href="login.html">Log in</a>.
-      </p>
-    </section>
+  <main class="shell">
+    <p>Account creation happens inside the app, where your keys are made on this device. <a href="/app/signup">Continue to /app/signup</a>.</p>
   </main>
-
-  <footer class="site">
-    <div class="shell" style="padding: 0;">
-      Pimble. <a href="https://github.com/pimble/pimble">Source on GitHub</a>.
-    </div>
-  </footer>
-
-  <script src="site.js"></script>
-  <script>
-    (function () {
-      const form = document.getElementById("signup-form");
-      const sentPanel = document.getElementById("signup-sent");
-      const sentEmailEl = sentPanel.querySelector("[data-sent-email]");
-      const resendBtn = document.getElementById("resend-btn");
-      const resendError = sentPanel.querySelector("[data-resend-error]");
-      const resendNote = sentPanel.querySelector("[data-resend-note]");
-      let sentEmail = "";
-
-      form.addEventListener("submit", async (e) => {
-        e.preventDefault();
-        try {
-          const currentForm = e.currentTarget;
-          setFormError(currentForm, "");
-
-          const email = currentForm.email.value.trim();
-          const password = currentForm.password.value;
-          const confirmPassword = currentForm.confirm_password.value;
-
-          if (password.length < 8) {
-            setFormError(currentForm, "Use a password of at least 8 characters.");
-            return;
-          }
-          if (password !== confirmPassword) {
-            setFormError(currentForm, "Passwords don't match.");
-            return;
-          }
-
-          const button = currentForm.querySelector('button[type="submit"]');
-          button.disabled = true;
-          try {
-            await apiFetch("/signup", {
-              method: "POST",
-              body: JSON.stringify({ email, password }),
-            });
-            sentEmail = email;
-            sentEmailEl.textContent = email;
-            currentForm.hidden = true;
-            document.getElementById("signup-login-hint").hidden = true;
-            sentPanel.hidden = false;
-          } catch (err) {
-            if (err.status === 409 || err.code === "email_taken") {
-              setFormError(currentForm, "An account already exists for that email. Try logging in instead.");
-            } else {
-              setFormError(currentForm, (err && err.message) || "Something went wrong. Try again.");
-            }
-          } finally {
-            button.disabled = false;
-          }
-        } catch (err) {
-          setFormError(e.currentTarget, (err && err.message) || "Something went wrong. Try again.");
-        }
-      });
-
-      resendBtn.addEventListener("click", async () => {
-        try {
-          resendError.hidden = true;
-          resendNote.hidden = true;
-          resendBtn.disabled = true;
-          await apiFetch("/resend-verification", {
-            method: "POST",
-            body: JSON.stringify({ email: sentEmail }),
-          });
-          resendNote.textContent = "Sent. Check your inbox.";
-          resendNote.hidden = false;
-        } catch (err) {
-          resendError.textContent = (err && err.message) || "Couldn't resend. Try again.";
-          resendError.hidden = false;
-        } finally {
-          resendBtn.disabled = false;
-        }
-      });
-    })();
-  </script>
+  <script>window.location.replace("/app/signup");</script>
 </body>
 </html>
