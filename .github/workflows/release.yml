@@ -12,8 +12,14 @@ permissions:
   contents: write
 
 jobs:
+  # ubuntu-24.04, not 22.04: the prebuilt static ONNX Runtime that
+  # `onnx-download` links (ort-sys 2.0.0-rc.12) was built against glibc 2.38
+  # (`__isoc23_strtol` and friends), so linking on 22.04's glibc 2.35 fails and
+  # the shipped Linux binary needs glibc 2.38 or newer (Ubuntu 24.04, Debian 13,
+  # Fedora 39). The keyword-only build (`--no-default-features --features
+  # native`) has no such floor.
   build-linux:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -85,7 +91,7 @@ jobs:
 
   release:
     needs: [build-linux, build-windows]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Download packaged artifacts
         uses: actions/download-artifact@v4
