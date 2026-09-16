@@ -61,11 +61,30 @@ fn get_u64(o: &Object, field: &str) -> CloudResult<u64> {
     }
 }
 
-fn get_u32(o: &Object, field: &str) -> CloudResult<u32> {
+/// Like [`get_string`], but a field simply absent from the row — every
+/// `User` created before Phase 2a's nine key-material fields existed has
+/// exactly this shape, since RhypeDB does not backfill a schema addition
+/// onto old rows — is `Ok(None)` rather than the `Internal` error `get_string`
+/// would raise. A field present but the wrong type is still `Internal`: that
+/// is real corruption, not "an older row".
+fn get_string_opt<'a>(o: &'a Object, field: &str) -> CloudResult<Option<&'a str>> {
     match o.fields.get(field) {
-        Some(Value::U32(v)) => Ok(*v),
+        None => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
         other => Err(CloudError::Internal(format!(
-            "{}.{field}: expected a u32, got {other:?}",
+            "{}.{field}: expected a String or to be absent, got {other:?}",
+            o.type_name
+        ))),
+    }
+}
+
+/// Like [`get_string_opt`], for a `u32` field.
+fn get_u32_opt(o: &Object, field: &str) -> CloudResult<Option<u32>> {
+    match o.fields.get(field) {
+        None => Ok(None),
+        Some(Value::U32(v)) => Ok(Some(*v)),
+        other => Err(CloudError::Internal(format!(
+            "{}.{field}: expected a u32 or to be absent, got {other:?}",
             o.type_name
         ))),
     }
@@ -114,18 +133,50 @@ pub struct UserRow {
     pub verified: bool,
     pub verify_token_hash: String,
     pub verify_expires_at_ms: i64,
-    /// Phase 2a (docs/CRYPTO_CONTRACT.md "Data model additions").
-    pub kdf_salt: String,
-    pub kdf_m_cost: u32,
-    pub kdf_t_cost: u32,
-    pub kdf_p_cost: u32,
-    pub public_encryption_key: String,
-    pub public_signing_key: String,
+    /// Phase 2a (docs/CRYPTO_CONTRACT.md "Data model additions"). `None` on
+    /// every field together, never some but not others, for a row created
+    /// before this phase (this crate's own `create_user` always writes all
+    /// nine at once) — see [`Self::has_key_material`].
+    pub kdf_salt: Option<String>,
+    pub kdf_m_cost: Option<u32>,
+    pub kdf_t_cost: Option<u32>,
+    pub kdf_p_cost: Option<u32>,
+    pub public_encryption_key: Option<String>,
+    pub public_signing_key: Option<String>,
     /// `pimble_crypto::AccountKeyBlob` as stored: a JSON string, opaque here.
-    pub account_key_blob: String,
-    pub recovery_salt: String,
+    pub account_key_blob: Option<String>,
+    pub recovery_salt: Option<String>,
     /// `pimble_crypto::AccountKeyBlob` as stored: a JSON string, opaque here.
-    pub recovery_key_blob: String,
+    pub recovery_key_blob: Option<String>,
+}
+
+impl UserRow {
+    /// Whether this row has real Phase 2a key material — `false` for a
+    /// pre-Phase-2a row (checked via `kdf_salt`, the field the startup
+    /// migration keys its cleanup on too; every field here is written
+    /// together by `create_user`, so this one field stands for all nine).
+    /// A legacy user is treated as if unknown throughout: `GET /kdf` answers
+    /// the decoy, `POST /login` answers a plain 401.
+    pub fn has_key_material(&self) -> bool {
+        self.kdf_salt.is_some()
+    }
+
+    /// This user's `KdfParams`, or `None` for a legacy row with no key
+    /// material.
+    pub fn kdf_params(&self) -> Option<pimble_crypto::KdfParams> {
+        Some(pimble_crypto::KdfParams {
+            salt: self.kdf_salt.clone()?,
+            m_cost: self.kdf_m_cost?,
+            t_cost: self.kdf_t_cost?,
+            p_cost: self.kdf_p_cost?,
+        })
+    }
+
+    /// This user's `AccountPublicKeys`, or `None` for a legacy row with no
+    /// key material.
+    pub fn public_keys(&self) -> Option<pimble_crypto::AccountPublicKeys> {
+        Some(pimble_crypto::AccountPublicKeys { encryption: self.public_encryption_key.clone()?, signing: self.public_signing_key.clone()? })
+    }
 }
 
 /// Everything [`RhypeDb::create_user`] needs beyond email and the auth-key
@@ -216,15 +267,15 @@ fn user_from_object(o: &Object) -> CloudResult<UserRow> {
         verified: get_bool(o, "verified")?,
         verify_token_hash: get_string(o, "verify_token_hash")?.to_string(),
         verify_expires_at_ms: get_datetime_ms(o, "verify_expires_at")?,
-        kdf_salt: get_string(o, "kdf_salt")?.to_string(),
-        kdf_m_cost: get_u32(o, "kdf_m_cost")?,
-        kdf_t_cost: get_u32(o, "kdf_t_cost")?,
-        kdf_p_cost: get_u32(o, "kdf_p_cost")?,
-        public_encryption_key: get_string(o, "public_encryption_key")?.to_string(),
-        public_signing_key: get_string(o, "public_signing_key")?.to_string(),
-        account_key_blob: get_string(o, "account_key_blob")?.to_string(),
-        recovery_salt: get_string(o, "recovery_salt")?.to_string(),
-        recovery_key_blob: get_string(o, "recovery_key_blob")?.to_string(),
+        kdf_salt: get_string_opt(o, "kdf_salt")?.map(str::to_string),
+        kdf_m_cost: get_u32_opt(o, "kdf_m_cost")?,
+        kdf_t_cost: get_u32_opt(o, "kdf_t_cost")?,
+        kdf_p_cost: get_u32_opt(o, "kdf_p_cost")?,
+        public_encryption_key: get_string_opt(o, "public_encryption_key")?.map(str::to_string),
+        public_signing_key: get_string_opt(o, "public_signing_key")?.map(str::to_string),
+        account_key_blob: get_string_opt(o, "account_key_blob")?.map(str::to_string),
+        recovery_salt: get_string_opt(o, "recovery_salt")?.map(str::to_string),
+        recovery_key_blob: get_string_opt(o, "recovery_key_blob")?.map(str::to_string),
     })
 }
 
@@ -398,7 +449,74 @@ impl RhypeDb {
         self.one(&q).await?.map(|o| user_from_object(&o)).transpose()
     }
 
+    /// Every `User` row — `User` alone (no `.filter`) is "all objects of
+    /// `User`" per docs/src/queries.md's `Sources` table. Used only by
+    /// [`Self::delete_legacy_users_without_keys`]: the query language has no
+    /// "field is absent" predicate to filter on server-side, so that scan
+    /// happens in Rust over every row instead.
+    async fn all_users(&self) -> CloudResult<Vec<UserRow>> {
+        self.objects("User").await?.iter().map(user_from_object).collect()
+    }
+
+    pub async fn delete_user(&self, user_rid: u64) -> CloudResult<()> {
+        self.objects(&format!("User.get({user_rid}).delete()")).await?;
+        Ok(())
+    }
+
+    /// Test-only: creates a `User` row shaped exactly like a real
+    /// pre-Phase-2a account — every key-material field simply never set,
+    /// not present as an empty string — so a test can reproduce "a legacy
+    /// row exists" without needing a pre-migration database snapshot. Real
+    /// signups always go through [`Self::create_user`], which sets every
+    /// field; this is the one path that deliberately doesn't.
+    pub async fn create_legacy_user_without_keys_for_tests(&self, email: &str, password_hash: &str) -> CloudResult<UserRow> {
+        let user_uuid = uuid::Uuid::new_v4().to_string();
+        let email_lower = email.to_lowercase();
+        let q = format!(
+            "User.create({{ user_uuid: {uuid}, email: {email}, email_lower: {email_lower}, password_hash: {hash}, created_at: {now}, verified: true, verify_token_hash: {empty}, verify_expires_at: {now} }})",
+            uuid = ql_str(&user_uuid),
+            email = ql_str(email),
+            email_lower = ql_str(&email_lower),
+            hash = ql_str(password_hash),
+            now = now_literal(),
+            empty = ql_str(""),
+        );
+        let obj = self.objects(&q).await?.into_iter().next().ok_or_else(|| CloudError::Internal("User.create returned nothing".into()))?;
+        user_from_object(&obj)
+    }
+
+    /// Deletes every `User` row with no key material (`kdf_salt` absent —
+    /// see [`UserRow::has_key_material`]), along with its sessions and
+    /// grants, and returns how many were deleted. Run once at startup
+    /// (`build_state`/`build_state_with_mailer`), so a legacy pre-Phase-2a
+    /// account (docs/CRYPTO_CONTRACT.md's migration note; in production,
+    /// Joe's own pre-encryption test accounts) is gone by the time this
+    /// process answers its first request. The caller logs the count at
+    /// `warn`.
+    pub async fn delete_legacy_users_without_keys(&self) -> CloudResult<usize> {
+        let mut deleted = 0usize;
+        for user in self.all_users().await? {
+            if user.has_key_material() {
+                continue;
+            }
+            for session in self.sessions_for_user(user.rid).await? {
+                self.delete_session(session.rid).await?;
+            }
+            for grant in self.grants_for_user(user.rid).await? {
+                self.delete_grant(grant.rid).await?;
+            }
+            self.delete_user(user.rid).await?;
+            deleted += 1;
+        }
+        Ok(deleted)
+    }
+
     // ── Sessions ───────────────────────────────────────────────────────
+
+    pub async fn sessions_for_user(&self, user_rid: u64) -> CloudResult<Vec<SessionRow>> {
+        let q = format!("Session.filter(.user_rid == {user_rid})");
+        self.objects(&q).await?.iter().map(session_from_object).collect()
+    }
 
     pub async fn create_session(&self, user_rid: u64, token_hash: &str, expires_at_ms: i64) -> CloudResult<SessionRow> {
         let q = format!(

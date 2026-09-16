@@ -48,6 +48,15 @@ pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
 /// how a mail-provider failure is handled (`tests/integration.rs`).
 pub async fn build_state_with_mailer(config: Config, mailer: std::sync::Arc<dyn mail::Mailer>) -> anyhow::Result<AppState> {
     let db = RhypeDb::connect(&config.rhypedb_addr).await?;
+    // A pre-Phase-2a `User` row has no key material at all (docs/
+    // CRYPTO_CONTRACT.md's migration note) and can never really log in
+    // again; deleting it here means every request this process answers sees
+    // a clean database, not just the ones that happen to hit the handlers'
+    // own defensive checks for one.
+    let deleted_legacy_users = db.delete_legacy_users_without_keys().await?;
+    if deleted_legacy_users > 0 {
+        tracing::warn!(count = deleted_legacy_users, "deleted legacy pre-Phase-2a user(s) with no key material at startup");
+    }
     let pimble = PimbleService::connect(&config).await?;
     let signer = JwtSigner::from_config(&config);
     let releases = ReleasesCache::new(config.github_repo.clone(), config.releases_base_url.clone());

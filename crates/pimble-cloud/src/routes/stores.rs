@@ -300,12 +300,21 @@ pub async fn put_store_keys(
     if caller_role != "owner" && caller_role != "editor" {
         return Err(CloudError::Forbidden("only an owner or editor can set store keys".to_string()));
     }
+    // A session only ever exists for a real Phase 2a account now (`login`
+    // refuses a legacy no-key-material one outright), so this is always
+    // `Some` in practice; treated as `Internal`, not a panic, if it somehow
+    // isn't.
+    let caller_signing_key = authed
+        .user
+        .public_signing_key
+        .as_deref()
+        .ok_or_else(|| CloudError::Internal("session exists for a user with no key material".to_string()))?;
 
     for item in &req.envelopes {
         if item.user_id != authed.user.user_uuid && caller_role != "owner" {
             return Err(CloudError::Forbidden("only an owner can set another member's keys".to_string()));
         }
-        verify_envelope_signature(&item.envelope, &authed.user.public_signing_key)?;
+        verify_envelope_signature(&item.envelope, caller_signing_key)?;
 
         let target = state
             .db

@@ -1188,6 +1188,53 @@ async fn kdf_returns_real_params_for_a_known_email_and_a_stable_decoy_otherwise(
     assert_ne!(decoy1.salt, real.salt);
 }
 
+/// A legacy pre-Phase-2a account (docs/CRYPTO_CONTRACT.md's migration note:
+/// Joe's own pre-encryption test accounts in production) has no key
+/// material at all — every field simply absent, not an empty string. `GET
+/// /kdf` must not 500 on it (the live bug reported), and both `/kdf` and
+/// `/login` must treat it exactly as if the email were unknown.
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_keyless_user_gets_the_decoy_kdf_and_a_401_on_login() {
+    let stack = skip_without_rhypedb!();
+    let email = "legacy@example.com";
+    stack.app_state.db.create_legacy_user_without_keys_for_tests(email, "irrelevant-hash").await.unwrap();
+
+    // Must not 500, and must be byte-for-byte the same decoy an unknown
+    // email gets — not merely "some params came back".
+    let legacy_kdf = fetch_kdf(&stack, email).await;
+    let expected_decoy = pimble_cloud::kdf_decoy::decoy_kdf_params(b"test-kdf-decoy-secret", &email.to_lowercase());
+    assert_eq!(legacy_kdf, expected_decoy);
+
+    let resp = stack.http.post(format!("{}/login", stack.base_url)).json(&json!({ "email": email, "auth_key": "anything" })).send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+/// The startup migration (`build_state`/`build_state_with_mailer`) must
+/// delete a legacy row, its sessions, and its grants, so a redeploy cleans
+/// production. Builds a second `AppState` against the same backing servers
+/// — what a restart does — after seeding one directly.
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_keyless_users_and_their_sessions_and_grants_are_deleted_at_startup() {
+    let stack = skip_without_rhypedb!();
+    let email = "legacy2@example.com";
+    let legacy = stack.app_state.db.create_legacy_user_without_keys_for_tests(email, "irrelevant-hash").await.unwrap();
+
+    let (_token, token_hash) = pimble_cloud::auth::new_session_token();
+    let expires_at_ms = chrono::Utc::now().timestamp_millis() + 60 * 60 * 1000;
+    stack.app_state.db.create_session(legacy.rid, &token_hash, expires_at_ms).await.unwrap();
+
+    let hosted = stack.app_state.db.create_hosted_store(&uuid::Uuid::new_v4().to_string(), "Legacy's Store", "legacy.pimble", "plain").await.unwrap();
+    stack.app_state.db.create_grant(legacy.rid, hosted.rid, &hosted.store_id, "owner").await.unwrap();
+
+    // A fresh `build_state` against the exact same rhypedb-server and
+    // Pimble server — simulating the next deploy's restart.
+    let second_state = pimble_cloud::build_state(stack.app_state.config.clone()).await.expect("build_state (second run, simulating a restart)");
+
+    assert!(second_state.db.find_user_by_email(email).await.unwrap().is_none(), "the legacy user should be deleted at startup");
+    assert!(second_state.db.find_session_by_token_hash(&token_hash).await.unwrap().is_none(), "its session should be deleted too");
+    assert!(second_state.db.find_grant(legacy.rid, hosted.rid).await.unwrap().is_none(), "its grant should be deleted too");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn me_keys_round_trips_through_real_crypto_and_never_returns_recovery() {
     let stack = skip_without_rhypedb!();

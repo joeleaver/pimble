@@ -50,9 +50,14 @@ pub struct KdfQuery {
 /// (and a passive observer) cannot tell which one it got.
 pub async fn kdf(State(state): State<AppState>, Query(query): Query<KdfQuery>) -> CloudResult<Json<KdfParams>> {
     let email_lower = query.email.trim().to_lowercase();
-    if let Some(user) = state.db.find_user_by_email(&email_lower).await? {
-        return Ok(Json(KdfParams { salt: user.kdf_salt, m_cost: user.kdf_m_cost, t_cost: user.kdf_t_cost, p_cost: user.kdf_p_cost }));
+    if let Some(params) = state.db.find_user_by_email(&email_lower).await?.and_then(|u| u.kdf_params()) {
+        return Ok(Json(params));
     }
+    // No user, or a legacy pre-Phase-2a account with no key material at
+    // all: both get the same decoy (docs/CRYPTO_CONTRACT.md's migration
+    // note — this only matters for the moment before a restart's startup
+    // migration clears the row out; `kdf_params()` returning `None` is what
+    // makes it fall through to here).
     Ok(Json(decoy_kdf_params(&state.kdf_decoy_secret, &email_lower)))
 }
 
@@ -272,6 +277,14 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>)
     let Some(user) = user.filter(|_| ok) else {
         return Err(CloudError::Unauthorized("invalid email or password".to_string()));
     };
+    if !user.has_key_material() {
+        // A legacy pre-Phase-2a account: no keys to unwrap, so no way in.
+        // Same generic message as any other failed login — no hint that
+        // the account exists (docs/CRYPTO_CONTRACT.md's migration note; the
+        // startup migration deletes these, so this only matters for the
+        // moment before the next restart clears the row out).
+        return Err(CloudError::Unauthorized("invalid email or password".to_string()));
+    }
     if !user.verified {
         return Err(CloudError::EmailUnverified);
     }
@@ -300,13 +313,19 @@ pub struct MeKeysResponse {
 /// `GET /api/v1/me/keys` — never the recovery blob (docs/CRYPTO_CONTRACT.md).
 pub async fn me_keys(authed: AuthedUser) -> CloudResult<Json<MeKeysResponse>> {
     let user = &authed.user;
+    // A session can only exist for a user `create_session` was called for,
+    // which only ever happens after a real login, which now refuses a
+    // legacy no-key-material account outright — so this is reachable only
+    // for a real Phase 2a account. Treated as `Internal`, not a panic: a
+    // stale session surviving the startup migration would be a genuine bug
+    // worth a loud 500, not a silent wrong answer.
+    let no_keys = || CloudError::Internal("session exists for a user with no key material".to_string());
+    let public_keys = user.public_keys().ok_or_else(no_keys)?;
+    let kdf = user.kdf_params().ok_or_else(no_keys)?;
+    let account_key_blob_json = user.account_key_blob.as_deref().ok_or_else(no_keys)?;
     let account_key_blob: AccountKeyBlob =
-        serde_json::from_str(&user.account_key_blob).map_err(|e| CloudError::Internal(format!("stored account_key_blob is not valid JSON: {e}")))?;
-    Ok(Json(MeKeysResponse {
-        public_keys: AccountPublicKeys { encryption: user.public_encryption_key.clone(), signing: user.public_signing_key.clone() },
-        kdf: KdfParams { salt: user.kdf_salt.clone(), m_cost: user.kdf_m_cost, t_cost: user.kdf_t_cost, p_cost: user.kdf_p_cost },
-        account_key_blob,
-    }))
+        serde_json::from_str(account_key_blob_json).map_err(|e| CloudError::Internal(format!("stored account_key_blob is not valid JSON: {e}")))?;
+    Ok(Json(MeKeysResponse { public_keys, kdf, account_key_blob }))
 }
 
 #[derive(Deserialize)]
@@ -334,12 +353,13 @@ pub async fn users_lookup(State(state): State<AppState>, authed: AuthedUser, Que
         .db
         .find_user_by_email(query.email.trim())
         .await?
-        .filter(|u| u.verified)
+        // A verified legacy account (no key material) has nothing a sharer
+        // could wrap a key to; treated the same as "no such user" (404),
+        // not surfaced differently — no enumeration signal either way.
+        .filter(|u| u.verified && u.has_key_material())
         .ok_or_else(|| CloudError::NotFound("no such user".to_string()))?;
-    Ok(Json(UserLookupResponse {
-        id: user.user_uuid,
-        public_keys: AccountPublicKeys { encryption: user.public_encryption_key, signing: user.public_signing_key },
-    }))
+    let public_keys = user.public_keys().ok_or_else(|| CloudError::Internal("user has key material but public_keys() failed".to_string()))?;
+    Ok(Json(UserLookupResponse { id: user.user_uuid, public_keys }))
 }
 
 #[derive(Deserialize)]
