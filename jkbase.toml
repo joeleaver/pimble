@@ -51,9 +51,9 @@ spa = true
 source = "crates/pimble-cloud"
 context = "."
 # Cache keying: only these inputs matter to the build; a change elsewhere must not
-# invalidate this target (jkbase, 2026-09-15). The accounts service does not depend on
-# the desktop app, the CLI or the server crates it never links.
-exclude = ["site", "docs", "*.md", "jkbase.toml", "web", "crates/pimble-app", "crates/pimble-cli", "crates/pimble-import", "crates/pimble-search", "crates/pimble-plugins"]
+# invalidate this target (jkbase, 2026-09-15). Workspace member crates cannot be
+# excluded: cargo needs every member manifest to load the workspace.
+exclude = ["site", "docs", "*.md", "jkbase.toml", "web"]
 port = 8080
 health_check = { path = "/api/v1/health", interval = "10s", timeout = "5s" }
 
@@ -82,9 +82,9 @@ health_check = { path = "/api/v1/health", interval = "10s", timeout = "5s" }
 source = "crates/pimble-cli"
 context = "."
 # Cache keying: only these inputs matter to the build; a change elsewhere must not
-# invalidate this target (jkbase, 2026-09-15). The hosted server never links the
-# accounts service or the desktop app.
-exclude = ["site", "docs", "*.md", "jkbase.toml", "web", "crates/pimble-cloud", "crates/pimble-app"]
+# invalidate this target (jkbase, 2026-09-15). Workspace member crates cannot be
+# excluded: cargo needs every member manifest to load the workspace.
+exclude = ["site", "docs", "*.md", "jkbase.toml", "web"]
 port = 7462
 command = ["/app/pimble-cli", "server", "--addr", "127.0.0.1:7462", "--stores-dir", "/app/data/stores"]
 volumes = [{ name = "data", mount = "/app/data" }]
