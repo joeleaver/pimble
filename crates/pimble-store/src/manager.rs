@@ -538,6 +538,12 @@ impl StoreManager {
         Ok(store.root_node_id())
     }
 
+    /// Rewrite a local store's manifest root (see `LocalStore::set_root_node_id`).
+    pub async fn set_root_node_id(&mut self, store_id: StoreId, root_node_id: NodeId) -> Result<()> {
+        let store = self.local_stores.get_mut(&store_id).ok_or(StoreError::StoreNotFound(store_id))?;
+        store.set_root_node_id(root_node_id).await
+    }
+
     /// Get a reference to the store registry
     pub fn registry(&self) -> &StoreRegistry {
         &self.registry

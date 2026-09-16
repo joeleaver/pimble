@@ -331,6 +331,22 @@ impl LocalStore {
         self.manifest.root_node_id
     }
 
+    /// Rewrite the manifest's root node id. A replica created empty for a
+    /// vault twin (`cloudAddHostedStore`) starts with a placeholder root
+    /// because the real one is only known once the encrypted tree has been
+    /// pulled and merged; the vault link calls this when the store document's
+    /// own root (its "meta" map) disagrees with the manifest.
+    pub async fn set_root_node_id(&mut self, root_node_id: NodeId) -> Result<()> {
+        if self.manifest.root_node_id == root_node_id {
+            return Ok(());
+        }
+        self.manifest.root_node_id = root_node_id;
+        self.manifest.modified_at = chrono::Utc::now();
+        let manifest_json = serde_json::to_string_pretty(&self.manifest)?;
+        atomic_write(&self.path.join(Self::MANIFEST_FILE), manifest_json).await?;
+        Ok(())
+    }
+
     /// Get a reference to the store document
     pub fn store_document(&self) -> &StoreDocument {
         &self.store_doc

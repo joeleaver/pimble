@@ -396,6 +396,9 @@ async fn apply_blob_locally(handler: &RpcHandler, store_id: StoreId, doc_id: &Va
                 .apply_store_update(&ext, ApplyStoreUpdateRequest { store_id, client_id: link_id.to_string(), update })
                 .await
                 .map_err(|e| anyhow::anyhow!("local applyStoreUpdate failed: {}", e))?;
+            // A replica created empty for this twin still carries its
+            // placeholder manifest root until this point.
+            handler.adopt_document_root(store_id).await;
         }
         VaultDocId::Node(node_id) => {
             let changes = STANDARD.encode(&plaintext);

@@ -651,6 +651,13 @@ impl RpcHandler {
             let manager = self.store_manager.read().await;
             manager.read_sync_config(store_id).await.ok().flatten().and_then(|c| c.last_sync)
         };
+        // A store has one link. A vault link (docs/CRYPTO_CONTRACT.md) talks
+        // to the hosted twin with a minted JWT; a plain link started beside
+        // it would connect with no credential, be refused, and flap.
+        if self.vault_links.read().await.contains_key(&store_id) {
+            warn!("store {} has a vault link; not starting a plain sync link beside it", store_id);
+            return;
+        }
         let mut links = self.links.write().await;
         if links.contains_key(&store_id) {
             return;
@@ -682,6 +689,10 @@ impl RpcHandler {
     /// fresh from the keystore on every connect, so no credential is passed
     /// in here.
     async fn ensure_vault_link_started(&self, store_id: StoreId, rpc_url: url::Url, key_id: Uuid) {
+        // A replica whose tree was pulled before the manifest root was kept
+        // in step (see `adopt_document_root`) heals on its next open: the
+        // store document on disk already holds the real root.
+        self.adopt_document_root(store_id).await;
         let last_sync = {
             let manager = self.store_manager.read().await;
             manager.read_sync_config(store_id).await.ok().flatten().and_then(|c| c.last_sync)
@@ -1414,9 +1425,51 @@ impl RpcHandler {
                 manager.read_sync_config(store_id).await.ok().flatten()
             };
             if let Some(config) = sync_config {
-                self.ensure_link_started(store_id, config.remote).await;
+                self.start_link_from_config(store_id, config).await;
             }
             self.repair_store_tree(store_id).await;
+        }
+    }
+
+    /// Bring a store's manifest root in line with its store document's own
+    /// root (the "meta" map, docs/CRYPTO_CONTRACT.md). A replica created
+    /// empty for a vault twin carries a placeholder root until the first
+    /// pull merges the real tree; until 2026-09-16 the manifest kept the
+    /// placeholder, so every later `openStore`/`listStores` handed the app a
+    /// root id that no node had ("Node not found" in the status bar, an
+    /// empty store row). The vault link calls this after each tree update.
+    pub(crate) async fn adopt_document_root(&self, store_id: StoreId) {
+        let mut manager = self.store_manager.write().await;
+        let Ok(doc_root) = manager.store_document(store_id).and_then(|doc| doc.root_node_id().map_err(Into::into)) else {
+            return;
+        };
+        let Ok(manifest_root) = manager.root_node_id(store_id) else { return };
+        if doc_root != manifest_root {
+            info!("Store {}: manifest root {} replaced by the document's root {}", store_id, manifest_root, doc_root);
+            if let Err(e) = manager.set_root_node_id(store_id, doc_root).await {
+                warn!("Store {}: rewriting the manifest root failed: {}", store_id, e);
+            }
+        }
+    }
+
+    /// Start whichever link `sync.json` describes: a plain sync link for
+    /// `mode: "sync"`, a vault link for `mode: "vault"`
+    /// (docs/CRYPTO_CONTRACT.md). Both `ensure_*_started` no-op when a link
+    /// of that kind is already running. `openStore` and `adopt_newly_opened`
+    /// share this so an implicitly adopted vault replica never gets a plain
+    /// link beside its vault link (2026-09-16: `cloudAddHostedStore`'s
+    /// replica, adopted by the next `listStores`, flapped Syncing/Offline
+    /// with "refused the credentials" while its vault link sat Synced).
+    async fn start_link_from_config(&self, store_id: StoreId, config: SyncConfig) {
+        match config.mode {
+            SyncMode::Sync => self.ensure_link_started(store_id, config.remote).await,
+            SyncMode::Vault => match config.vault_key_id {
+                Some(key_id) => self.ensure_vault_link_started(store_id, config.remote.url, key_id).await,
+                None => warn!(
+                    "store {} sync.json has mode: vault but no vault_key_id; not starting a vault link",
+                    store_id
+                ),
+            },
         }
     }
 
@@ -1708,18 +1761,12 @@ impl PimbleApiServer for RpcHandler {
         // with `mode: "vault"`.
         store.sync_mode = StoreKind::Vault;
 
-        // The manifest's `root_node_id` is never rewritten once the pull
-        // merges the real tree in; read the live store document's own idea
-        // of its root instead (docs/CRYPTO_CONTRACT.md: `StoreDocument`
-        // tracks this itself, in its "meta" map, distinct from the
-        // manifest).
-        {
-            let manager = self.store_manager.read().await;
-            if let Ok(doc) = manager.store_document(created_id) {
-                if let Ok(root) = doc.root_node_id() {
-                    store.root_node_id = root;
-                }
-            }
+        // The vault link rewrites the manifest root once the pull merges the
+        // real tree in (`adopt_document_root`); do the same here so the
+        // answer carries it even when the pull was fast.
+        self.adopt_document_root(created_id).await;
+        if let Ok(root) = self.store_manager.read().await.root_node_id(created_id) {
+            store.root_node_id = root;
         }
 
         self.mark_replica(&mut store);
@@ -1811,22 +1858,20 @@ impl PimbleApiServer for RpcHandler {
         // kind is already running (e.g. `open_local_store` above was a
         // no-op for an already-open store).
         if let Some(config) = sync_config {
-            match config.mode {
-                SyncMode::Sync => self.ensure_link_started(store_id, config.remote).await,
-                SyncMode::Vault => match config.vault_key_id {
-                    Some(key_id) => self.ensure_vault_link_started(store_id, config.remote.url, key_id).await,
-                    None => warn!(
-                        "store {} sync.json has mode: vault but no vault_key_id; not starting a vault link",
-                        store_id
-                    ),
-                },
-            }
+            self.start_link_from_config(store_id, config).await;
         }
 
         // Decision 9: repair a store's tree when it opens (a store closed
         // mid-repair, or reopened straight from disk after a crash, may
         // still be carrying an issue nothing has fixed yet).
         self.repair_store_tree(store_id).await;
+
+        // `store` was read before the link started; starting a vault link
+        // may have just corrected the manifest root (`adopt_document_root`),
+        // and the answer must carry the root the app will ask for.
+        if let Ok(root) = self.store_manager.read().await.root_node_id(store_id) {
+            store.root_node_id = root;
+        }
 
         store.sync_state = self.sync_state_of(store_id).await;
         store.sync_mode = self.sync_mode_of(store_id).await;

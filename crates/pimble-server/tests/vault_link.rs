@@ -492,6 +492,96 @@ async fn a_second_server_receives_content_and_a_reply_edit_reaches_the_first() {
     b.stop().await.unwrap();
 }
 
+/// Regression test (2026-09-16, the desktop "Add Hosted Store..." flow): the
+/// replica `cloudAddHostedStore` creates is adopted by the next `listStores`
+/// (`adopt_newly_opened`), which used to start a *plain* sync link from
+/// `sync.json` beside the vault link. The plain link connected with no
+/// credential, was refused, and flapped Syncing/Offline, and `getStoreSync`
+/// reported that link's state over the vault link's `Synced`. Adoption now
+/// dispatches on `sync.json`'s mode like `openStore` does, and the plain
+/// starter refuses a store that has a vault link.
+#[tokio::test]
+async fn adopting_a_hosted_replica_starts_no_plain_link_beside_its_vault_link() {
+    let env = spawn_env().await;
+
+    let (mut a, client_a, a_dir) = start_local_server().await;
+    client_a.cloud_sign_in(&env.stub_url, &env.email, &env.password).await.unwrap();
+    let (store_id, root_id) = client_a.create_store(a_dir.path().join("a.pimble"), "Shared").await.unwrap();
+    let doc_id = client_a.create_node(store_id, Some(root_id), "document", "Doc").await.unwrap();
+    seed_content(&client_a, store_id, doc_id, "seed", "from A").await;
+    client_a.cloud_host_store(store_id).await.unwrap();
+
+    let (mut b, client_b, b_dir) = start_local_server().await;
+    client_b.cloud_sign_in(&env.stub_url, &env.email, &env.password).await.unwrap();
+    let store_on_b = client_b.cloud_add_hosted_store(store_id).await.expect("B adds the hosted store");
+    assert_eq!(store_on_b.sync_mode, StoreKind::Vault);
+
+    // What the desktop app does next: `getChildren` on the root, which is
+    // what drains `StoreManager::opened_since` and adopts the new replica.
+    let (_, children) = wait_children_nonempty(&client_b, store_id, store_on_b.root_node_id).await;
+    assert_eq!(children.len(), 1);
+
+    let synced = wait_until(Duration::from_secs(10), || async {
+        matches!(client_b.get_store_sync(store_id).await, Ok((_, pimble_core::SyncState::Synced { .. })))
+    })
+    .await;
+    assert!(synced, "B's vault link must reach Synced");
+
+    // A plain link beside the vault link flapped every second or so; three
+    // seconds of sampling is long enough to see it and short enough to keep.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        let (_, state, mode) = client_b.get_store_sync_with_mode(store_id).await.unwrap();
+        assert_eq!(mode, StoreKind::Vault);
+        assert!(
+            matches!(state, pimble_core::SyncState::Synced { .. }),
+            "the hosted replica must stay Synced after adoption, got {:?}",
+            state
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The replica was created with a placeholder root; once the pull merged
+    // the real tree the manifest must say the real root too, or every later
+    // open hands the app a root no node has (the desktop app's "Node not
+    // found" after a restart, 2026-09-16).
+    let b_path = b_dir.path().join("replicas").join(format!("{store_id}.pimble"));
+    let listed = client_b.list_stores().await.unwrap();
+    let b_store = listed.iter().find(|s| s.id == store_id).expect("the replica is listed");
+    assert_eq!(b_store.root_node_id, root_id, "the replica's root must be A's root once the tree is pulled");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    b.stop().await.unwrap();
+
+    // A replica made before the manifest was kept in step still carries its
+    // placeholder on disk; put one back and the reopen must still answer
+    // the real root (the vault link heals the manifest as it starts, and
+    // `openStore` reads the root after that).
+    {
+        let manifest_path = b_path.join("manifest.json");
+        let mut manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        manifest["root_node_id"] = json!(NodeId::new().to_string());
+        std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+    }
+
+    let dir = b_dir.path();
+    let mut b2 = PimbleServer::with_config(ServerConfig {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        keystore_path: Some(dir.join("keys.json")),
+        credentials_path: Some(dir.join("credentials.json")),
+        replicas_dir: Some(dir.join("replicas")),
+        ..Default::default()
+    });
+    b2.start().await.expect("restarted server starts");
+    let client_b2 = PimbleClient::connect(format!("http://{}", b2.addr())).await.expect("client connects to restarted server");
+    let reopened = client_b2.open_store(&b_path).await.expect("reopening the replica succeeds");
+    assert_eq!(reopened.root_node_id, root_id, "a reopened replica must report the real root");
+    let (_, children) = wait_children_nonempty(&client_b2, store_id, reopened.root_node_id).await;
+    assert_eq!(children.len(), 1, "the reopened replica's root must have its child");
+
+    a.stop().await.unwrap();
+    b2.stop().await.unwrap();
+}
+
 /// Regression test for the bug found in the web vault client: echo
 /// suppression there dropped any incoming `VaultAppended` whose seq wasn't
 /// above the client's own last-appended seq, which is wrong whenever a peer
