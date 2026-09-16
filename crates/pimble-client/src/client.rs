@@ -601,6 +601,21 @@ impl PimbleClient {
         Ok((response.remote, response.state))
     }
 
+    /// Like [`PimbleClient::get_store_sync`], but also reports whether the
+    /// link is an ordinary `Plain` sync link or a `Vault` link
+    /// (docs/CRYPTO_CONTRACT.md) — a separate method so the existing
+    /// two-element tuple callers (and `BackendCommand::GetStoreSync`'s event
+    /// shape) don't have to change.
+    pub async fn get_store_sync_with_mode(&self, store_id: StoreId) -> Result<(Option<RemoteEndpoint>, SyncState, StoreKind)> {
+        let request = GetStoreSyncRequest { store_id };
+        let response = self
+            .client
+            .get_store_sync(request)
+            .await
+            .map_err(rpc_error)?;
+        Ok((response.remote, response.state, response.sync_mode))
+    }
+
     /// The stores `remote` has open, fetched by the server this client is
     /// connected to (with `remote.auth`, or its saved credential for that
     /// remote when `remote.auth` is `None`).

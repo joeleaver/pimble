@@ -204,6 +204,10 @@ impl StoreManager {
                 sync_state: SyncState::Offline,
                 is_replica: false,
                 kind: manifest.kind,
+                // Placeholder, like `sync_state` above: callers that care
+                // about the vault-link state overwrite this (see
+                // `RpcHandler::sync_mode_of`).
+                sync_mode: StoreKind::Plain,
             });
         }
         if let Some(store) = self.vault_stores.get(&store_id) {
@@ -218,6 +222,7 @@ impl StoreManager {
                 sync_state: SyncState::Offline,
                 is_replica: false,
                 kind: manifest.kind,
+                sync_mode: StoreKind::Plain,
             });
         }
         Err(StoreError::StoreNotFound(store_id))
@@ -907,5 +912,37 @@ mod tests {
 
         let repair = manager.repair_tree(store_id).unwrap();
         assert!(repair.is_none());
+    }
+
+    /// A plain node's deletion, once flushed, stays deleted across a
+    /// reopen: the store-layer half of the contract the RPC handler's
+    /// `deleteNode` depends on (docs from Joe's bug report: a node deleted
+    /// in the app reappeared after restarting; the root cause was
+    /// `deleteNode` never flushing, fixed in `pimble-server`, not here —
+    /// this confirms the persistence layer itself has always honored a
+    /// flushed delete correctly).
+    #[tokio::test]
+    async fn deleted_node_stays_deleted_after_flush_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.pimble");
+
+        let (store_id, root_id, doc_id) = {
+            let mut manager = StoreManager::new();
+            let store_id = manager.create_local_store(&path, "Store").await.unwrap();
+            let root_id = manager.root_node_id(store_id).unwrap();
+            let doc_id = manager.create_node(store_id, Node::document("Doc"), Some(root_id)).await.unwrap();
+            manager.flush(store_id).await.unwrap();
+
+            manager.delete_node(store_id, doc_id).await.unwrap();
+            manager.flush(store_id).await.unwrap();
+
+            (store_id, root_id, doc_id)
+        };
+
+        let mut manager = StoreManager::new();
+        let reopened_id = manager.open_local_store(&path).await.unwrap();
+        assert_eq!(reopened_id, store_id);
+        assert!(!manager.store_document(store_id).unwrap().has_node(doc_id));
+        assert!(!manager.store_document(store_id).unwrap().get_children(root_id).unwrap().contains(&doc_id));
     }
 }

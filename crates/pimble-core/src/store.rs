@@ -84,6 +84,18 @@ pub struct Store {
     /// plain.
     #[serde(default)]
     pub kind: StoreKind,
+
+    /// What this store is currently *linked* to, distinct from `kind` (this
+    /// store's own kind, always `Plain` for a desktop store even when it is
+    /// vault-linked — docs/CRYPTO_CONTRACT.md: "the local store itself stays
+    /// plain on disk"). `Plain` means unlinked or linked by an ordinary
+    /// replica sync link to a `Plain` twin; `Vault` means linked by an
+    /// encrypting vault link to a `Vault` twin (`cloudHostStore`/
+    /// `cloudAddHostedStore`). This is what a UI checks to show "encrypted"
+    /// on the sync badge instead of the ordinary sync icon. Missing in
+    /// older serializations: plain (unlinked).
+    #[serde(default)]
+    pub sync_mode: StoreKind,
 }
 
 impl Store {
@@ -97,6 +109,7 @@ impl Store {
             sync_state: SyncState::Offline,
             is_replica: false,
             kind: StoreKind::Plain,
+            sync_mode: StoreKind::Plain,
         }
     }
 
@@ -110,6 +123,7 @@ impl Store {
             sync_state: SyncState::Offline,
             is_replica: false,
             kind: StoreKind::Plain,
+            sync_mode: StoreKind::Plain,
         }
     }
 

@@ -600,3 +600,325 @@ async fn restarting_a_server_resumes_the_vault_link_without_losing_or_duplicatin
 
     a2.stop().await.unwrap();
 }
+
+// ── Interop with the REAL accounts service (crates/pimble-cloud) ─────────
+//
+// Everything above drives an axum stub. This test instead spawns the real
+// `rhypedb-server` and `pimble-cloud` binaries and walks the whole flow
+// against them: a real signup (built with real `pimble-crypto` output),
+// following the real verification link `pimble-cloud`'s `LogMailer` logs,
+// `cloudSignIn`, `cloudHostStore`, a second device's `cloudAddHostedStore`,
+// edits each way, and a check that the hosted server's disk never holds the
+// plaintext. Skips itself cleanly (prints why on stderr) if either real
+// binary isn't available, the same way `pimble-cloud`'s own
+// `tests/integration.rs` skips without `rhypedb-server`.
+
+use std::process::{Child, Command, Stdio};
+
+/// Kills the wrapped child on drop, so a panicking assertion never leaves
+/// `rhypedb-server`/`pimble-cloud` running after the test ends.
+struct ChildGuard(Child);
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+/// The minimal stand-in for jkbase's edge proxy (see the caller's comment):
+/// every connection to `listen_port` is routed, by peeking its HTTP request
+/// line, to `h_port` when the path starts with `/rpc` (a WebSocket upgrade,
+/// for the vault RPCs) or to `cloud_port` otherwise (every plain HTTP call
+/// this test or `pimble_server::cloud` makes). Once routed, the connection
+/// is spliced byte-for-byte in both directions — this never parses HTTP
+/// beyond that first line, so it works for both a WebSocket upgrade and an
+/// ordinary request/response.
+async fn run_edge_proxy(listen_port: u16, cloud_port: u16, h_port: u16) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", listen_port)).await.expect("proxy binds");
+    loop {
+        let Ok((mut inbound, _)) = listener.accept().await else { continue };
+        tokio::spawn(async move {
+            let mut peek_buf = [0u8; 4096];
+            let n = match inbound.peek(&mut peek_buf).await {
+                Ok(n) if n > 0 => n,
+                _ => return,
+            };
+            let head = String::from_utf8_lossy(&peek_buf[..n]);
+            let is_rpc = head.starts_with("GET /rpc") || head.starts_with("POST /rpc");
+            let target_port = if is_rpc { h_port } else { cloud_port };
+            let Ok(mut outbound) = tokio::net::TcpStream::connect(("127.0.0.1", target_port)).await else { return };
+            let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+        });
+    }
+}
+
+fn find_rhypedb_server() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("RHYPEDB_SERVER_BIN") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let home = dirs::home_dir()?;
+    for rel in ["dev/rhypedb/target/release/rhypedb-server", "dev/rhypedb/target/debug/rhypedb-server"] {
+        let p = home.join(rel);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// `pimble-cloud` is a workspace member, not an external checkout: look for
+/// an already-built binary next to this crate's own target directory
+/// (`cargo build -p pimble-cloud --release` builds it there) rather than
+/// building it from inside this test.
+fn find_pimble_cloud_binary() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("PIMBLE_CLOUD_BIN") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent()?.parent()?.to_path_buf();
+    for rel in ["target/release/pimble-cloud", "target/debug/pimble-cloud"] {
+        let p = workspace_root.join(rel);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// The verification link `pimble-cloud`'s `LogMailer` writes at `info`
+/// (`RUST_LOG=pimble_cloud=info`, set on the child below) — polls the
+/// captured log file until the link appears.
+async fn wait_for_verify_url(log_path: &Path, timeout: Duration) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(log_path) {
+            if let Some(start) = contents.find("/api/v1/verify?token=") {
+                let rest = &contents[start..];
+                let end = rest.find(|c: char| c.is_whitespace() || c == '"' || c == '\\').unwrap_or(rest.len());
+                return Some(rest[..end].to_string());
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn interop_with_the_real_accounts_service() {
+    let Some(rhypedb_bin) = find_rhypedb_server() else {
+        eprintln!(
+            "SKIPPING interop_with_the_real_accounts_service: no rhypedb-server binary found \
+             (set RHYPEDB_SERVER_BIN, or build ~/dev/rhypedb in release or debug mode)"
+        );
+        return;
+    };
+    let Some(cloud_bin) = find_pimble_cloud_binary() else {
+        eprintln!(
+            "SKIPPING interop_with_the_real_accounts_service: no pimble-cloud binary found \
+             (set PIMBLE_CLOUD_BIN, or `cargo build -p pimble-cloud --release`)"
+        );
+        return;
+    };
+
+    let rhypedb_data_dir = tempfile::tempdir().unwrap();
+    let rhypedb_http_port = free_port();
+    let rhypedb_tcp_port = free_port();
+    let schema_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("pimble-cloud").join("schema.rhype");
+
+    let _rhypedb = ChildGuard(
+        Command::new(&rhypedb_bin)
+            .args([
+                "--schema",
+                schema_path.to_str().unwrap(),
+                "--data-dir",
+                rhypedb_data_dir.path().to_str().unwrap(),
+                "--listen",
+                &format!("127.0.0.1:{rhypedb_http_port}"),
+                "--tcp-listen",
+                &format!("127.0.0.1:{rhypedb_tcp_port}"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("rhypedb-server spawns"),
+    );
+
+    let rhypedb_ready = wait_until(Duration::from_secs(15), || async {
+        reqwest::get(format!("http://127.0.0.1:{rhypedb_http_port}/health")).await.map(|r| r.status().is_success()).unwrap_or(false)
+    })
+    .await;
+    assert!(rhypedb_ready, "rhypedb-server must come up within 15s");
+
+    // H, the hosted Pimble server: real, in-process, JWT-verified against
+    // pimble-cloud's own dev-mode JWKS (its issuer is fixed by pimble-cloud
+    // to `{public_url}/api/v1`).
+    let h_dir = tempfile::tempdir().unwrap();
+    let h_token = "h-service-token".to_string();
+
+    // pimble-cloud computes `rpc_url` (`mint_token`) and its verification
+    // link from `PIMBLE_CLOUD_PUBLIC_URL` alone, on the assumption that in
+    // production jkbase's edge proxies that one public origin's `/rpc` to
+    // the hosted Pimble server and everything else to this service (see the
+    // crate's README, "Layout on jkbase"). Locally there is no such edge, so
+    // this test stands up the minimal version of it: a raw TCP proxy in
+    // front of one public port, routing `/rpc*` to `H` and everything else
+    // to the real `pimble-cloud` process on its own internal port. Without
+    // this, `rpc_url` would point at pimble-cloud's own HTTP port, which
+    // serves no such route at all — exactly the gap the README calls out.
+    let cloud_internal_port = free_port();
+    let cloud_internal_url = format!("http://127.0.0.1:{cloud_internal_port}");
+    let proxy_port = free_port();
+    let public_url = format!("http://127.0.0.1:{proxy_port}");
+    let issuer = format!("{public_url}/api/v1");
+    let jwks_url = format!("{issuer}/.well-known/jwks.json");
+
+    let mut h = PimbleServer::with_config(ServerConfig {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        auth_token: Some(h_token.clone()),
+        jwks_url: Some(jwks_url.parse().unwrap()),
+        jwt_issuer: Some(issuer),
+        keystore_path: Some(h_dir.path().join("keys.json")),
+        credentials_path: Some(h_dir.path().join("credentials.json")),
+        replicas_dir: Some(h_dir.path().join("replicas")),
+        ..Default::default()
+    });
+    h.start().await.expect("H starts");
+    let h_addr = h.addr();
+    let h_url = format!("http://{h_addr}");
+    let h_admin = PimbleClient::connect_with_auth(&h_url, &AuthMethod::Bearer { token: h_token.clone() }).await.expect("admin client connects to H");
+
+    let cloud_stores_dir = tempfile::tempdir().unwrap();
+    let cloud_log_path = h_dir.path().join("cloud.log");
+    let cloud_log_file = std::fs::File::create(&cloud_log_path).unwrap();
+    let cloud_log_file_err = cloud_log_file.try_clone().unwrap();
+    let _cloud = ChildGuard(
+        Command::new(&cloud_bin)
+            .env("RHYPEDB_ADDR", format!("127.0.0.1:{rhypedb_tcp_port}"))
+            .env("PIMBLE_SERVER_URL", &h_url)
+            .env("PIMBLE_SERVER_TOKEN", &h_token)
+            .env("PIMBLE_STORES_DIR", cloud_stores_dir.path())
+            // 32 bytes hex (README): two v4 UUIDs' 16-byte simple forms concatenated.
+            .env("PIMBLE_CLOUD_DEV_SIGNING_SEED", format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()))
+            .env("PIMBLE_CLOUD_PUBLIC_URL", &public_url)
+            .env("PORT", cloud_internal_port.to_string())
+            .env("RUST_LOG", "pimble_cloud=info")
+            .stdout(Stdio::from(cloud_log_file))
+            .stderr(Stdio::from(cloud_log_file_err))
+            .spawn()
+            .expect("pimble-cloud spawns"),
+    );
+
+    let cloud_ready = wait_until(Duration::from_secs(15), || async {
+        reqwest::get(format!("{cloud_internal_url}/api/v1/health")).await.map(|r| r.status().is_success()).unwrap_or(false)
+    })
+    .await;
+    assert!(cloud_ready, "pimble-cloud must come up within 15s (see {:?})", cloud_log_path);
+
+    tokio::spawn(run_edge_proxy(proxy_port, cloud_internal_port, h_addr.port()));
+    let cloud_url = public_url;
+    let proxy_ready = wait_until(Duration::from_secs(5), || async {
+        reqwest::get(format!("{cloud_url}/api/v1/health")).await.map(|r| r.status().is_success()).unwrap_or(false)
+    })
+    .await;
+    assert!(proxy_ready, "the local edge proxy must come up within 5s");
+
+    // A real signup, with real pimble-crypto output.
+    let email = format!("interop-{}@example.com", Uuid::new_v4());
+    let password = "correct horse battery staple";
+    let kdf = cheap_kdf_params();
+    let password_keys = derive_password_keys(password, &kdf).unwrap();
+    let auth_key = pimble_crypto::encode_auth_key(&password_keys.auth_key);
+    let account_keys = AccountKeys::generate();
+    let public_keys = account_keys.public_keys();
+    let account_key_blob = wrap_account_keys(&account_keys, &password_keys.kek).unwrap();
+    let recovery_kdf = cheap_kdf_params();
+    let recovery_code = pimble_crypto::generate_recovery_code();
+    let recovery_kek = pimble_crypto::derive_recovery_kek(&recovery_code, &recovery_kdf).unwrap();
+    let recovery_key_blob = wrap_account_keys(&account_keys, &recovery_kek).unwrap();
+
+    let http = reqwest::Client::new();
+    let signup_resp = http
+        .post(format!("{cloud_url}/api/v1/signup"))
+        .json(&json!({
+            "email": email,
+            "auth_key": auth_key,
+            "kdf": kdf,
+            "public_keys": public_keys,
+            "account_key_blob": account_key_blob,
+            "recovery_salt": recovery_kdf.salt,
+            "recovery_key_blob": recovery_key_blob,
+        }))
+        .send()
+        .await
+        .expect("signup request sends");
+    assert_eq!(signup_resp.status(), 202, "signup must accept a well-formed real body");
+
+    let verify_url = wait_for_verify_url(&cloud_log_path, Duration::from_secs(5))
+        .await
+        .expect("the verification link must appear in pimble-cloud's log (LogMailer, RUST_LOG=pimble_cloud=info)");
+    let no_redirect = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let verify_resp = no_redirect.get(format!("{cloud_url}{verify_url}")).send().await.expect("verify link is reachable");
+    assert_eq!(verify_resp.status(), 303);
+    let location = verify_resp.headers().get("location").unwrap().to_str().unwrap().to_string();
+    assert!(location.contains("verified=1"), "verification must succeed, got redirect to {location}");
+
+    // The desktop side: real `cloudSignIn`/`cloudHostStore` against the real service.
+    let (mut a, client_a, a_dir) = start_local_server().await;
+    client_a.cloud_sign_in(&cloud_url, &email, password).await.expect("cloudSignIn against the real service succeeds");
+    let status = client_a.cloud_status().await.unwrap();
+    assert!(status.signed_in);
+    assert_eq!(status.email.as_deref(), Some(email.as_str()));
+
+    let (store_id, root_id) = client_a.create_store(a_dir.path().join("a.pimble"), "Interop Notes").await.unwrap();
+    let doc_id = client_a.create_node(store_id, Some(root_id), "document", "Doc").await.unwrap();
+    let marker = "REAL-SERVICE-PLAINTEXT-MARKER-4471";
+    seed_content(&client_a, store_id, doc_id, "seed", marker).await;
+
+    let hosted_id = client_a.cloud_host_store(store_id).await.expect("cloudHostStore against the real service succeeds");
+    assert_eq!(hosted_id, store_id);
+
+    let doc_key = VaultDocId::Node(doc_id);
+    let seeded = wait_until(Duration::from_secs(10), || async {
+        h_admin.vault_fetch(store_id, doc_key.clone(), 0).await.map(|f| f.head > 0).unwrap_or(false)
+    })
+    .await;
+    assert!(seeded, "hosting must upload the store's existing content (see {:?} for pimble-cloud's log)", cloud_log_path);
+    assert!(
+        !contains_bytes_recursive(cloud_stores_dir.path(), marker.as_bytes()),
+        "the plaintext must never reach the real hosted server's disk"
+    );
+
+    // A second device (same account) receives the content and can edit back.
+    let (mut b, client_b, _b_dir) = start_local_server().await;
+    client_b.cloud_sign_in(&cloud_url, &email, password).await.expect("a second device signs in to the same account");
+    let store_on_b = client_b.cloud_add_hosted_store(store_id).await.expect("cloudAddHostedStore against the real service succeeds");
+    assert_eq!(store_on_b.id, store_id);
+
+    let (_, b_children) = wait_children_nonempty(&client_b, store_id, store_on_b.root_node_id).await;
+    assert_eq!(b_children.len(), 1);
+    let b_doc_id = b_children[0].id;
+    let pulled = wait_until(Duration::from_secs(10), || async { node_text(&client_b, store_id, b_doc_id).await.contains(marker) }).await;
+    assert!(pulled, "the second device must receive the first device's content");
+
+    seed_content(&client_b, store_id, b_doc_id, "b-editor", "edited from the second device").await;
+    let reached_a = wait_until(Duration::from_secs(10), || async {
+        node_text(&client_a, store_id, doc_id).await.contains("edited from the second device")
+    })
+    .await;
+    assert!(reached_a, "an edit on the second device must reach the first through the real hosted vault");
+
+    a.stop().await.unwrap();
+    b.stop().await.unwrap();
+    h.stop().await.unwrap();
+}

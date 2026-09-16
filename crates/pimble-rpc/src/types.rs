@@ -333,6 +333,11 @@ pub struct GetStoreSyncRequest {
 pub struct GetStoreSyncResponse {
     pub remote: Option<RemoteEndpoint>,
     pub state: SyncState,
+    /// `Plain` (an ordinary sync link, or unlinked) or `Vault` (an
+    /// encrypting vault link, docs/CRYPTO_CONTRACT.md) — mirrors
+    /// `Store::sync_mode`. Missing in an older client's expectations: plain.
+    #[serde(default)]
+    pub sync_mode: StoreKind,
 }
 
 /// Ask this server for the stores a remote Pimble server has open. The

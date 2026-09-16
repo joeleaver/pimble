@@ -8,7 +8,7 @@ use std::sync::Arc;
 use pimble_core::{MountState, NodeId, StoreId};
 use pimble_rpc::{
     CreateMountRequest, CreateMountResponse, CreateNodeRequest, CreateStoreRequest,
-    CreateStoreResponse, GetChildrenRequest, GetMountStateRequest, OpenStoreRequest,
+    CreateStoreResponse, DeleteNodeRequest, GetChildrenRequest, GetMountStateRequest, OpenStoreRequest,
     PimbleApiServer, StoreChangeKind, StoreChangedNotification,
 };
 use pimble_server::RpcHandler;
@@ -464,5 +464,72 @@ async fn create_node_under_a_mount_is_an_error() {
         err.message().contains("source"),
         "expected the error message to point at the mount's source, got {:?}",
         err.message()
+    );
+}
+
+/// 9. Deleting a mount node persists across a restart (the bug Joe reported:
+/// a mount node deleted in the explorer was back after restarting the app).
+/// `deleteNode` shares its whole implementation with an ordinary node —
+/// there's no mount-specific deletion path — so the fix (and this
+/// regression test) is really about node deletion in general; a mount node
+/// exercises it because that's what surfaced the bug.
+///
+/// Deliberately does *not* flush after `deleteNode`, or close the store
+/// before "restarting": nothing besides `deleteNode` itself is ever
+/// guaranteed to flush between one RPC and the next in a real session, and
+/// the store manager here is simply dropped, standing in for the process
+/// being killed. If `deleteNode` doesn't flush its own change to disk, nothing else will.
+#[tokio::test]
+async fn deleting_a_mount_node_persists_after_restart() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let a_path = dir_a.path().join("a.pimble");
+    let b_path = dir_b.path().join("b.pimble");
+
+    let (a_store, a_root, mount_node_id) = {
+        let (handler, _store_manager) = new_handler();
+        let (a_store, a_root) = create_store(&handler, &a_path, "A").await;
+        let (b_store, b_root) = create_store(&handler, &b_path, "B").await;
+
+        let mount_resp = handler
+            .create_mount(&pimble_server::service_extensions(), CreateMountRequest {
+                store_id: a_store,
+                parent_id: a_root,
+                source_store_id: b_store,
+                source_node_id: b_root,
+                title: None,
+            })
+            .await
+            .unwrap();
+
+        handler
+            .delete_node(&pimble_server::service_extensions(), DeleteNodeRequest {
+                store_id: a_store,
+                node_id: mount_resp.node_id,
+            })
+            .await
+            .unwrap();
+
+        (a_store, a_root, mount_resp.node_id)
+        // `_store_manager` (and the `handler` holding the only other
+        // reference to it) is dropped here with no explicit flush —
+        // simulating a hard kill right after the delete.
+    };
+
+    // Fresh manager/handler over the same directory, as if the process
+    // restarted with no clean shutdown.
+    let (handler, _store_manager) = new_handler();
+    handler
+        .open_store(&pimble_server::service_extensions(), OpenStoreRequest { path: a_path.clone() })
+        .await
+        .unwrap();
+
+    let children_resp = handler
+        .get_children(&pimble_server::service_extensions(), GetChildrenRequest { store_id: a_store, node_id: a_root })
+        .await
+        .unwrap();
+    assert!(
+        !children_resp.children.iter().any(|c| c.id == mount_node_id),
+        "the deleted mount node must not reappear after a restart"
     );
 }

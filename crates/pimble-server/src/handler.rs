@@ -623,6 +623,22 @@ impl RpcHandler {
         SyncState::Offline
     }
 
+    /// What `store_id` is currently linked to: `Plain` (unlinked, or an
+    /// ordinary sync link to a `Plain` twin) or `Vault` (a vault link,
+    /// docs/CRYPTO_CONTRACT.md), read from `sync.json`'s `mode`. `Plain` for
+    /// a store with no `sync.json` at all (unlinked, or itself a `Vault`
+    /// store, which never has one) or one that fails to read.
+    async fn sync_mode_of(&self, store_id: StoreId) -> StoreKind {
+        let manager = self.store_manager.read().await;
+        match manager.read_sync_config(store_id).await {
+            Ok(Some(config)) => match config.mode {
+                SyncMode::Sync => StoreKind::Plain,
+                SyncMode::Vault => StoreKind::Vault,
+            },
+            _ => StoreKind::Plain,
+        }
+    }
+
     /// Start a sync link for `store_id` if one isn't already running.
     /// `openStore`, `addRemoteStore`, `set_store_sync(Some(remote))` and no-op if
     /// a link is already present.
@@ -1060,6 +1076,7 @@ impl RpcHandler {
         } else {
             store.sync_state = self.sync_state_of(created_id).await;
         }
+        store.sync_mode = self.sync_mode_of(created_id).await;
 
         self.mark_replica(&mut store);
         Ok(store)
@@ -1687,6 +1704,9 @@ impl PimbleApiServer for RpcHandler {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        // Always `Vault`: `link_hosted_store` above just wrote `sync.json`
+        // with `mode: "vault"`.
+        store.sync_mode = StoreKind::Vault;
 
         // The manifest's `root_node_id` is never rewritten once the pull
         // merges the real tree in; read the live store document's own idea
@@ -1809,6 +1829,7 @@ impl PimbleApiServer for RpcHandler {
         self.repair_store_tree(store_id).await;
 
         store.sync_state = self.sync_state_of(store_id).await;
+        store.sync_mode = self.sync_mode_of(store_id).await;
         self.mark_replica(&mut store);
 
         Ok(OpenStoreResponse { store })
@@ -1859,6 +1880,7 @@ impl PimbleApiServer for RpcHandler {
         for id in store_ids {
             if let Ok(mut store) = manager.get_store_info(id) {
                 store.sync_state = self.sync_state_of(id).await;
+                store.sync_mode = self.sync_mode_of(id).await;
                 self.mark_replica(&mut store);
                 stores.push(store);
             }
@@ -2033,6 +2055,20 @@ impl PimbleApiServer for RpcHandler {
         let mut manager = self.store_manager.write().await;
         let removal = manager
             .delete_node(request.store_id, request.node_id)
+            .await
+            .map_err(to_rpc_error)?;
+
+        // Unlike every other structural mutation here (createNode, moveNode,
+        // updateNodeMetadata/Content all flush immediately below), this call
+        // was missing its flush: the deletion only ever existed in the
+        // in-memory `StoreDocument` until something else happened to flush
+        // the store later (another edit, or a clean `closeStore`/shutdown).
+        // A hard kill, or simply never touching the store again before the
+        // app exits, lost the delete and the store.yrs on disk still had
+        // the node (a mount node included) — which is exactly the bug where
+        // a deleted mount reappears after restarting.
+        manager
+            .flush(request.store_id)
             .await
             .map_err(to_rpc_error)?;
 
@@ -2339,8 +2375,9 @@ impl PimbleApiServer for RpcHandler {
             .map(|c| Self::without_auth(&c.remote));
         drop(manager);
         let state = self.sync_state_of(request.store_id).await;
+        let sync_mode = self.sync_mode_of(request.store_id).await;
 
-        Ok(GetStoreSyncResponse { remote: remote_now, state })
+        Ok(GetStoreSyncResponse { remote: remote_now, state, sync_mode })
     }
 
     async fn get_store_sync(
@@ -2357,8 +2394,9 @@ impl PimbleApiServer for RpcHandler {
             .map(|c| Self::without_auth(&c.remote));
         drop(manager);
         let state = self.sync_state_of(request.store_id).await;
+        let sync_mode = self.sync_mode_of(request.store_id).await;
 
-        Ok(GetStoreSyncResponse { remote, state })
+        Ok(GetStoreSyncResponse { remote, state, sync_mode })
     }
 
     async fn list_remote_stores(

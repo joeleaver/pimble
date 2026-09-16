@@ -671,12 +671,13 @@ async fn sync_state(store_id: &str) -> Result<()> {
     let store_id = parse_store_id(store_id)?;
 
     let client = connect().await?;
-    let (remote, state) = client.get_store_sync(store_id).await?;
+    let (remote, state, mode) = client.get_store_sync_with_mode(store_id).await?;
     match remote {
         Some(r) => println!("Remote: {}", r.url),
         None => println!("Remote: (none)"),
     }
     println!("State: {:?}", state);
+    println!("Mode: {:?}", mode);
     Ok(())
 }
 
