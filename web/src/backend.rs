@@ -102,7 +102,7 @@ async fn run(
     let client_id = uuid::Uuid::new_v4().to_string();
     tracing::info!("Backend client ID: {}", client_id);
 
-    let mut vault = VaultClient::new();
+    let mut vault = VaultClient::new(client_id.clone());
     let mut endpoints = Endpoints::from_session(&session);
 
     loop {

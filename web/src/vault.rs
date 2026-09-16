@@ -68,12 +68,12 @@ struct VaultStore {
     heads: HashMap<NodeId, u64>,
     /// Whether `vaultListDocs` has been asked yet.
     heads_known: bool,
-    /// Sequence numbers this client produced, per document name, so its own
-    /// `VaultAppended` notifications are dropped instead of applied twice.
-    own_seqs: HashMap<String, HashSet<u64>>,
 }
 
 pub struct VaultClient {
+    /// This client's id, as the server sees it, for recognising the
+    /// notifications caused by this client's own appends.
+    client_id: String,
     stores: HashMap<StoreId, VaultStore>,
     /// Store ids the accounts service calls vault stores, which is the
     /// authority when the RPC `Store` does not carry a kind yet.
@@ -89,9 +89,10 @@ pub struct VaultClient {
 }
 
 impl VaultClient {
-    pub fn new() -> Self {
+    pub fn new(client_id: String) -> Self {
         let (notices_tx, notices_rx) = unbounded();
         Self {
+            client_id,
             stores: HashMap::new(),
             vault_ids: HashSet::new(),
             active: None,
@@ -192,15 +193,8 @@ impl VaultClient {
                 docs: HashMap::new(),
                 heads: HashMap::new(),
                 heads_known: false,
-                own_seqs: HashMap::new(),
             },
         );
-
-        // The seeding append above is this client's own; it must not come back
-        // as news.
-        if let Some(store) = self.stores.get_mut(&store_id) {
-            remember_own(store, &VaultDocId::Tree, tree_seq);
-        }
         Ok(())
     }
 
@@ -231,7 +225,10 @@ impl VaultClient {
                 tracing::warn!("A VaultAppended notification carried no blob; ignoring it");
                 continue;
             };
-            if let Some(event) = self.apply_notification(store_id, doc_id, seq, &blob) {
+            let source = notification.source_client_id.clone();
+            if let Some(event) =
+                self.apply_notification(store_id, doc_id, seq, &blob, source.as_deref())
+            {
                 events.push(event);
             }
         }
@@ -244,13 +241,15 @@ impl VaultClient {
         doc_id: VaultDocId,
         seq: u64,
         blob: &str,
+        source_client_id: Option<&str>,
     ) -> Option<BackendEvent> {
         let active = self.active;
+        let apply = should_apply(source_client_id, &self.client_id);
         let store = self.stores.get_mut(&store_id)?;
 
-        // This client's own append, echoed back. Dropping it by sequence number
-        // is what stops a local edit being applied twice.
-        if forget_own(store, &doc_id, seq) {
+        // Sequence numbers say how far this client has read, never who wrote
+        // what; `should_apply` is the whole of that decision.
+        if !apply {
             return None;
         }
 
@@ -290,7 +289,8 @@ impl VaultClient {
                     return None;
                 }
                 doc.seq = doc.seq.max(seq);
-                store.heads.insert(node_id, seq);
+                let head = store.heads.entry(node_id).or_insert(0);
+                *head = (*head).max(seq);
 
                 if active == Some((store_id, node_id)) {
                     // The editor has this node open, so hand it the delta the
@@ -656,7 +656,6 @@ impl VaultClient {
         let Some(store) = self.stores.get_mut(&store_id) else { return Ok(()) };
         store.tree_seq = store.tree_seq.max(seq);
         store.tree_appends += 1;
-        remember_own(store, &VaultDocId::Tree, seq);
 
         if store.tree_appends >= SNAPSHOT_EVERY {
             let full = store.tree.save();
@@ -727,8 +726,8 @@ impl VaultClient {
             .map_err(|e| e.to_string())?;
 
         let Some(store) = self.stores.get_mut(&store_id) else { return Ok(()) };
-        remember_own(store, &doc_id, seq);
-        store.heads.insert(node_id, seq);
+        let head = store.heads.entry(node_id).or_insert(0);
+        *head = (*head).max(seq);
         let needs_snapshot = match store.docs.get_mut(&node_id) {
             Some(doc) => {
                 doc.seq = doc.seq.max(seq);
@@ -1146,17 +1145,81 @@ fn decrypt_entries(
     out
 }
 
-/// Note that this client produced `seq` for `doc_id`, so the notification it
-/// causes is recognised as an echo.
-fn remember_own(store: &mut VaultStore, doc_id: &VaultDocId, seq: u64) {
-    store.own_seqs.entry(doc_id.as_str()).or_default().insert(seq);
+/// Whether an incoming `VaultAppended` should be applied.
+///
+/// Authorship is the only thing that can decide this, and the notification
+/// carries it: a blob this client sent comes back with its own id on it, and
+/// everything else is somebody else's work. A sequence number cannot stand in
+/// for authorship. Several clients append to one document and the server hands
+/// out its numbers in arrival order, so one client's appends are interleaved
+/// with another's, and "not newer than the last number I was given" throws away
+/// exactly the updates that arrived while this client was typing.
+///
+/// When in doubt this applies. A yrs merge is idempotent, so a genuine echo
+/// applied twice changes nothing, while a dropped update is gone for good.
+pub fn should_apply(source_client_id: Option<&str>, my_client_id: &str) -> bool {
+    match source_client_id {
+        Some(source) => source != my_client_id,
+        // The server does not yet name the client behind a `vaultAppend`:
+        // `VaultAppendRequest` has no field for one, so `source_client_id` is
+        // always `None` on a `VaultAppended`. Applying is the safe reading.
+        None => true,
+    }
 }
 
-/// Whether `seq` was this client's own append, consuming the record.
-fn forget_own(store: &mut VaultStore, doc_id: &VaultDocId, seq: u64) -> bool {
-    store
-        .own_seqs
-        .get_mut(&doc_id.as_str())
-        .map(|seqs| seqs.remove(&seq))
-        .unwrap_or(false)
+#[cfg(test)]
+mod tests {
+    use super::should_apply;
+
+    #[test]
+    fn a_client_skips_only_its_own_work() {
+        assert!(!should_apply(Some("me"), "me"));
+        assert!(should_apply(Some("someone-else"), "me"));
+    }
+
+    #[test]
+    fn an_unattributed_notification_is_applied() {
+        // What the server sends today: `VaultAppendRequest` carries no client
+        // id, so nothing is suppressed and every blob is merged.
+        assert!(should_apply(None, "me"));
+    }
+
+    #[test]
+    fn interleaved_appends_from_two_clients_all_arrive() {
+        // Two tabs typing in turn. The server numbers appends in arrival
+        // order, so each client's own ids are scattered through the other's —
+        // which is why a sequence number cannot stand in for authorship. Every
+        // update written by the other client must be applied, whether its
+        // number is above or below anything this client was last given.
+        let log: [(u64, &str); 6] = [
+            (1, "a"),
+            (2, "b"),
+            (3, "a"),
+            (4, "b"),
+            (5, "b"),
+            (6, "a"),
+        ];
+
+        let seen_by_a: Vec<u64> = log
+            .iter()
+            .filter(|(_, who)| should_apply(Some(who), "a"))
+            .map(|(seq, _)| *seq)
+            .collect();
+        let seen_by_b: Vec<u64> = log
+            .iter()
+            .filter(|(_, who)| should_apply(Some(who), "b"))
+            .map(|(seq, _)| *seq)
+            .collect();
+
+        assert_eq!(seen_by_a, vec![2, 4, 5], "a must see every append b made");
+        assert_eq!(seen_by_b, vec![1, 3, 6], "b must see every append a made");
+    }
+
+    #[test]
+    fn a_late_number_is_not_a_reason_to_drop() {
+        // The shape of the bug this replaced: b's append lands between two of
+        // a's, so its number is below the last one a was given. It is still b's
+        // work and still has to be applied.
+        assert!(should_apply(Some("b"), "a"));
+    }
 }
