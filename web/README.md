@@ -186,8 +186,11 @@ menu has to be reachable another way or not be offered. What that came to:
   is invisible to a token minted before the grant existed. The store then
   arrives through `listStores` like any other.
 - **Ctrl+K** focuses the search box, whose placeholder has always advertised it.
-  The desktop carries that accelerator on its View menu; `src/shortcuts.rs`
-  binds it here.
+  Both shells carry that accelerator on their View menu, and rinch-web's menu
+  bar arms it against the document, so neither binds it by hand.
+- **"Mount Store..."** is offered here too: `createMount` is a write an editor
+  may make, and where the desktop picks a directory the browser picks one of the
+  stores the account already grants, leaving out the one being mounted into.
 - **Mounts** are hidden from an encrypted store's context menu. The server holds
   only blobs there and has nothing to point a mount at, so "Copy as Mount
   Source" and "Paste Mount Here" would fail wherever they were pressed.
@@ -195,9 +198,9 @@ menu has to be reachable another way or not be offered. What that came to:
 - **The empty state** says to use "+" rather than naming a shortcut that only
   the desktop has.
 - **Right-click** shows Pimble's menu and not the browser's (see below).
-- **Rebuild Search Index** and **Sign Out** have no route yet. They are in the
-  shared menu spec and arrive with the menu bar; nothing in the UI offers them
-  in the meantime, so nothing is offered that fails.
+- **Rebuild Search Index** and **Sign Out** are in the menu bar, which the
+  browser now has. Rebuilding skips encrypted stores, which have no server-side
+  index and cannot have one.
 
 The desktop's items that do nothing (Undo/Redo/Cut/Copy/Paste, disabled; Toggle
 Sidebar, the zoom items, Documentation, About, which log and return) were left
@@ -210,13 +213,19 @@ this crate's business.
 label, an accelerator and an action — so the desktop's native bar and the
 browser's DOM one cannot drift. Items that need a file dialog or a service
 principal are `native`; the ones that need an account are not. `build_menus`
-turns the spec into `rinch::menu::Menu`s and is `native` only because
-`rinch::menu` is behind rinch's `desktop` feature. When rinch-web gains a menu
-bar, that `cfg` comes off and mounting the app becomes one call with the spec
-passed in. `src/menu.rs` registers the two actions no shared crate could
-perform on its own (reaching the accounts service, dropping this page's keys)
-and holds the test that every item the web configuration offers has an action
-behind it.
+turns the spec into `rinch::menu::Menu`s, and both shells call it: the desktop
+hands the result to `App::menu`, and `src/route.rs` hands the very same values
+to `rinch_web::mount_into_with_menu_bar`. So the browser shows File (New
+Store..., Account, Sign Out), Edit (Delete) and View (Toggle Dark Mode, Focus
+Search, Rebuild Search Index), and the desktop shows its own File with the
+dialogs and the remote-store items.
+
+That call also arms every item's accelerator against the document, which is why
+nothing in this crate binds Ctrl+K any more.
+
+`src/menu.rs` registers the two actions no shared crate could perform on its own
+(reaching the accounts service, dropping this page's keys) and holds the test
+that every item the web configuration offers has an action behind it.
 
 ### The browser's own context menu
 
@@ -230,15 +239,11 @@ menu is open — left the native one to appear. `src/shortcuts.rs` cancels it fo
 the whole page: a bubble-phase listener on `document` that never stops
 propagation, so rinch's own listener still runs and its menu still opens.
 
-That fix has landed upstream, on rinch PR #791's branch rather than on `main`:
-`rinch_web::set_suppress_native_context_menu(bool)`, a flag rather than a
-widening, because unconditional suppression would take right-click-copy away
-from a host page hydrating rinch islands. The same commit closes a gap this
-crate's listener cannot reach, where a stale `data-oncontextmenu` suppressed the
-default and dispatched nothing. When this workspace is on a rinch that has it,
-call it with `true` where the app mounts and delete the `contextmenu` half of
-`src/shortcuts.rs`; the Ctrl+K half stays until the menu bar carries that
-accelerator.
+`src/shortcuts.rs` now asks rinch to do it: `set_suppress_native_context_menu(true)`.
+It is a flag rather than a widening because unconditional suppression would take
+right-click-copy away from a host page hydrating rinch islands, and it also
+closes a gap a page-level listener cannot reach, where a stale
+`data-oncontextmenu` suppressed the default and dispatched nothing.
 
 ## What the browser build leaves out
 
@@ -266,6 +271,13 @@ trunk build --release        # writes dist/
 `Trunk.toml` sets `public_url = "/app/"`, because jkbase serves this under
 `https://pimble.jkbase.app/app/`. The release build is about 4.3 MB of wasm
 (the account pages and `pimble-crypto` added roughly 400 KB).
+
+**This workspace and the root are on rinch's `feat/web-menu-bar` (PR #791)**,
+which is what makes `rinch::menu` build without the `desktop` feature and adds
+rinch-web's menu-bar entry points. Both must name the same branch: a workspace
+that ends up with two rinch sources gets two of every rinch type, and cargo
+will not patch a git source with another branch of the same repository. Move
+them together, back to `main` once the PR merges.
 
 To move the pinned rinch revision, do it here as well as in the root workspace:
 

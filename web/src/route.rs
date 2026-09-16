@@ -133,14 +133,23 @@ pub fn render(route: Route) {
     }
 }
 
-/// Build the app into its own host. Called once, by `app_page`.
-pub fn mount_app<F>(build: F)
+/// Build the app into its own host, under its menu bar. Called once, by
+/// `app_page`.
+///
+/// The menus are `pimble_app::menus`, the same values the desktop hands its
+/// native bar, rendered here by rinch-web's DOM bar. Every item's accelerator
+/// is armed against the document by that call, so Ctrl+K reaches "Focus
+/// Search" without this crate binding anything.
+pub fn mount_app<F>(store: pimble_app::state::AppStore, build: F)
 where
     F: FnOnce(&mut RenderScope) -> NodeHandle,
 {
     let host = app_host();
     let theme = pimble_app::app::theme_props(true);
-    rinch_web::mount_into(&host, theme, build);
+    let menus = pimble_app::menus::build_menus(store);
+    let borrowed: Vec<(&str, rinch::menu::Menu)> =
+        menus.into_iter().map(|(title, menu)| (title, menu)).collect();
+    rinch_web::mount_into_with_menu_bar(&host, theme, borrowed, build);
 }
 
 /// The app could not start. Undo the "started" flag so a later attempt (a fresh

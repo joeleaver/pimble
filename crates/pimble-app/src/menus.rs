@@ -117,10 +117,9 @@ fn view_entries(store: AppStore) -> Vec<MenuEntry> {
 
 /// The spec as rinch menus, for a shell that has a menu bar.
 ///
-/// `native` only for now because `rinch::menu` is behind the `desktop` feature;
-/// when rinch-web gains a menu bar this loses its `cfg` and the browser entry
-/// point calls it too.
-#[cfg(feature = "native")]
+/// Both shells call this. `rinch::menu` — the types and the renderer, not the
+/// `muda` builders — is platform-independent, so the desktop's native bar and
+/// rinch-web's DOM bar are handed the very same values.
 pub fn build_menus(store: AppStore) -> Vec<(&'static str, rinch::menu::Menu)> {
     use rinch::menu::{Menu, MenuItem};
 

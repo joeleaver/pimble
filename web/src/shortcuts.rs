@@ -1,48 +1,21 @@
-//! Two things a browser needs that a window does not.
+//! The browser's own context menu, turned off.
 //!
-//! **The native context menu.** rinch-web already suppresses it, but only when
-//! the right-click lands inside an element carrying `data-oncontextmenu`
-//! (`crates/rinch-web/src/event_delegation.rs`, the `contextmenu` listener:
-//! `prevent_default()` sits inside the `if let` that looks the handler up). A
-//! right-click anywhere else — including on `ContextMenu`'s own portalled
-//! overlay while a menu is open — leaves the browser's menu to appear over
-//! ours. Pimble wants its own menu everywhere, so this cancels the default for
-//! the whole page.
+//! A right-click used to show Pimble's menu with the browser's on top of it.
+//! rinch-web suppresses the native menu only where a right-click lands inside
+//! an element carrying `data-oncontextmenu`, which leaves the tree's padding,
+//! the editor, and `ContextMenu`'s own portalled overlay to the browser.
+//! `set_suppress_native_context_menu(true)` moves that decision into the
+//! delegation itself, for the whole page, and is a flag rather than a widening
+//! because a rinch island hydrated into somebody else's page must not take
+//! right-click-copy away from the rest of it.
 //!
-//! The listener is deliberately bubble-phase and never stops propagation:
-//! rinch's own listener is also on `document` and also bubble-phase, and
-//! starving it would mean no rinch menu at all. Either listener calling
-//! `preventDefault` is enough, and the order between them does not matter.
-//!
-//! **Accelerators.** The search box's placeholder promises Ctrl+K. On the
-//! desktop the View menu carries that accelerator; a browser has no menu bar,
-//! so the shortcut is bound here. A control that advertises a shortcut and does
-//! nothing is worse than one that advertises none.
+//! Accelerators need nothing here. `rinch_web::mount_into_with_menu_bar` arms
+//! every menu item's `shortcut` against the document, so Ctrl+K reaches "Focus
+//! Search" through the same declaration the desktop's menu bar uses
+//! (`pimble_app::menus`) rather than through a binding this crate keeps in step
+//! by hand.
 
-use wasm_bindgen::prelude::Closure;
-use wasm_bindgen::JsCast;
-
-/// Install both, once, for the lifetime of the page.
+/// Turn the browser's context menu off for this page, once.
 pub fn install() {
-    let Some(document) = web_sys::window().and_then(|w| w.document()) else { return };
-
-    let contextmenu = Closure::wrap(Box::new(|event: web_sys::Event| {
-        event.prevent_default();
-    }) as Box<dyn FnMut(_)>);
-    let _ = document
-        .add_event_listener_with_callback("contextmenu", contextmenu.as_ref().unchecked_ref());
-    contextmenu.forget();
-
-    let keydown = Closure::wrap(Box::new(|event: web_sys::KeyboardEvent| {
-        // Ctrl+K, and Cmd+K where that is what people reach for.
-        if (event.ctrl_key() || event.meta_key())
-            && !event.alt_key()
-            && event.key().eq_ignore_ascii_case("k")
-        {
-            event.prevent_default();
-            pimble_app::app::focus_search();
-        }
-    }) as Box<dyn FnMut(_)>);
-    let _ = document.add_event_listener_with_callback("keydown", keydown.as_ref().unchecked_ref());
-    keydown.forget();
+    rinch_web::set_suppress_native_context_menu(true);
 }

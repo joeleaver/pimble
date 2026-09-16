@@ -53,6 +53,6 @@ pub fn start() {
         // the same seam either way.
         let (store, view) = pimble_app::app::build_view();
         store.backend.set(Some(backend::spawn(session_token)));
-        route::mount_app(view);
+        route::mount_app(store, view);
     });
 }
