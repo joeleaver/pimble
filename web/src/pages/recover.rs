@@ -257,7 +257,9 @@ pub fn recover_page() -> NodeHandle {
                             disabled: {|| !saved.get()},
                             onclick: move || {
                                 new_code.set(String::new());
-                                route::replace_with(Route::Login);
+                                // With the query: the login page's banner reads
+                                // it to say the password is set.
+                                route::replace_with_query(Route::Login, "recovered=1");
                             },
                             "Continue to sign in"
                         }

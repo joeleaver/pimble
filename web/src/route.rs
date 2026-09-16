@@ -98,6 +98,17 @@ pub fn replace_with(route: Route) {
     render(route);
 }
 
+/// Go to `route` carrying a query, replacing the current history entry.
+///
+/// The query is how a page tells the next one what just happened — the login
+/// page reads `recovered=1` to say "Your password is set". It has to be in the
+/// URL rather than in memory so that a reload, or the link someone keeps open,
+/// still says it.
+pub fn replace_with_query(route: Route, query: &str) {
+    push_url(&format!("{}?{}", route.path(), query), true);
+    render(route);
+}
+
 fn push_url(path: &str, replace: bool) {
     let Some(history) = web_sys::window().and_then(|w| w.history().ok()) else { return };
     let _ = if replace {
