@@ -162,10 +162,15 @@ account pages now"). The flow:
 
 **Sending mail**: `RESEND_API_KEY` unset (the default, and every local run
 and test in this repo) means `LogMailer` — it logs the verification link at
-`info` instead of emailing it. Watch it with:
+`info` instead of emailing it. The service defaults its own log level to
+`info` when `RUST_LOG` isn't set (so the link is visible out of the box, not
+just when you remember to ask for it), and `RUST_LOG` still overrides that
+default as usual:
 
 ```bash
-RUST_LOG=pimble_cloud=info cargo run --release -p pimble-cloud   # ... and copy the logged link out of the terminal
+cargo run --release -p pimble-cloud   # ... and copy the logged link out of the terminal
+# or, to be explicit (or to change the level):
+RUST_LOG=pimble_cloud=info cargo run --release -p pimble-cloud
 ```
 
 **Testing Resend for real**: set `RESEND_API_KEY` to a real key (Joe's
