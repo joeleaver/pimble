@@ -57,7 +57,19 @@ pub struct Config {
     /// endpoint promises, but restarting changes every unknown email's
     /// decoy salt.
     pub kdf_decoy_secret: Option<String>,
+    /// Members plus pending invitations one store may have
+    /// (docs/SHARING_CONTRACT.md: "fifty members plus invitations per store");
+    /// `PUT members` answers 409 beyond it. Deliberately **not** an
+    /// environment variable — the contract fixes the number, and an operator
+    /// raising it would quietly change what the service promises. It is a
+    /// field rather than a constant only so a test can lower it to something
+    /// it can reach in a second.
+    pub max_members_per_store: usize,
 }
+
+/// The value [`Config::from_env`] always uses for
+/// [`Config::max_members_per_store`].
+pub const DEFAULT_MAX_MEMBERS_PER_STORE: usize = 50;
 
 fn env_var(name: &str) -> Option<String> {
     env::var(name).ok().filter(|v| !v.is_empty())
@@ -80,6 +92,7 @@ impl Config {
             resend_api_key: env_var("RESEND_API_KEY"),
             mail_from: env_var("PIMBLE_MAIL_FROM").unwrap_or_else(|| "Pimble <no-reply@m.pimble.app>".to_string()),
             kdf_decoy_secret: env_var("PIMBLE_CLOUD_KDF_DECOY_SECRET"),
+            max_members_per_store: DEFAULT_MAX_MEMBERS_PER_STORE,
         }
     }
 

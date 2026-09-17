@@ -272,6 +272,27 @@ pub struct HostedStoreRow {
     /// `"plain"` or `"vault"` (docs/CRYPTO_CONTRACT.md), matching
     /// `pimble_core::StoreKind`'s serde spelling.
     pub kind: String,
+    /// Phase 2b (docs/SHARING_CONTRACT.md): this vault store is a share
+    /// mirror. `false` for every row created before the field existed.
+    pub share: bool,
+}
+
+/// One address invited to a store that has no verified account yet
+/// (docs/SHARING_CONTRACT.md, "Accounts service"). Becomes a [`GrantRow`] and
+/// is deleted the moment the address is claimed.
+#[derive(Debug, Clone)]
+pub struct InvitationRow {
+    pub rid: u64,
+    pub store_rid: u64,
+    pub store_uuid: String,
+    /// As typed by the inviter (what the mail was addressed to); the lookup
+    /// key is the lowercased copy the schema indexes.
+    pub email: String,
+    pub role: String,
+    /// The `User.rid` of whoever sent it — may name a row that no longer
+    /// exists (see schema.rhype's comment on the field).
+    pub invited_by_rid: u64,
+    pub created_at_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +357,10 @@ fn session_from_object(o: &Object) -> CloudResult<SessionRow> {
     Ok(SessionRow { rid: o.id, user_rid: get_u64(o, "user_rid")?, expires_at_ms: get_datetime_ms(o, "expires_at")? })
 }
 
+/// The store kind a row with no `kind` field is treated as — the only kind
+/// that existed before Phase 2a added the field.
+const DEFAULT_STORE_KIND: &str = "plain";
+
 fn hosted_store_from_object(o: &Object) -> CloudResult<HostedStoreRow> {
     Ok(HostedStoreRow {
         rid: o.id,
@@ -343,7 +368,25 @@ fn hosted_store_from_object(o: &Object) -> CloudResult<HostedStoreRow> {
         name: get_string(o, "name")?.to_string(),
         created_at_ms: get_datetime_ms(o, "created_at")?,
         deleted: get_bool(o, "deleted")?,
-        kind: get_string(o, "kind")?.to_string(),
+        // Both of these were added after rows already existed, so both are
+        // read optional with the value the older row really has — the rule
+        // from the `User.verified` crash-loop (this crate's README, "Migration
+        // and legacy rows"). A store hosted before Phase 2a is plain; a store
+        // hosted before Phase 2b is not a share.
+        kind: get_string_opt(o, "kind")?.unwrap_or(DEFAULT_STORE_KIND).to_string(),
+        share: get_bool_opt(o, "share")?.unwrap_or(false),
+    })
+}
+
+fn invitation_from_object(o: &Object) -> CloudResult<InvitationRow> {
+    Ok(InvitationRow {
+        rid: o.id,
+        store_rid: get_u64(o, "store_rid")?,
+        store_uuid: get_string(o, "store_uuid")?.to_string(),
+        email: get_string(o, "email")?.to_string(),
+        role: get_string(o, "role")?.to_string(),
+        invited_by_rid: get_u64(o, "invited_by_rid")?,
+        created_at_ms: get_datetime_ms(o, "created_at")?,
     })
 }
 
@@ -744,7 +787,32 @@ impl RhypeDb {
 
     // ── Hosted stores ──────────────────────────────────────────────────
 
-    pub async fn create_hosted_store(&self, store_id: &str, name: &str, dir_name: &str, kind: &str) -> CloudResult<HostedStoreRow> {
+    pub async fn create_hosted_store(&self, store_id: &str, name: &str, dir_name: &str, kind: &str, share: bool) -> CloudResult<HostedStoreRow> {
+        let q = format!(
+            "HostedStore.create({{ store_id: {sid}, name: {name}, dir_name: {dir}, created_at: {now}, deleted: false, kind: {kind}, share: {share} }})",
+            sid = ql_str(store_id),
+            name = ql_str(name),
+            dir = ql_str(dir_name),
+            now = now_literal(),
+            kind = ql_str(kind),
+        );
+        let obj = self
+            .objects(&q)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| CloudError::Internal("HostedStore.create returned nothing".into()))?;
+        hosted_store_from_object(&obj)
+    }
+
+    /// Test-only: creates a `HostedStore` row shaped like one from before
+    /// Phase 2b — `share` simply never set, not written as `false` — so a
+    /// test can reproduce "a production row predates the field" without a
+    /// pre-migration database snapshot. Real stores always go through
+    /// [`Self::create_hosted_store`], which sets it; this is the one path
+    /// that deliberately doesn't (compare
+    /// [`Self::create_legacy_user_without_keys_for_tests`]).
+    pub async fn create_hosted_store_without_share_for_tests(&self, store_id: &str, name: &str, dir_name: &str, kind: &str) -> CloudResult<HostedStoreRow> {
         let q = format!(
             "HostedStore.create({{ store_id: {sid}, name: {name}, dir_name: {dir}, created_at: {now}, deleted: false, kind: {kind} }})",
             sid = ql_str(store_id),
@@ -885,6 +953,95 @@ impl RhypeDb {
 
     pub async fn delete_key_grant(&self, key_grant_rid: u64) -> CloudResult<()> {
         self.objects(&format!("KeyGrant.get({key_grant_rid}).delete()")).await?;
+        Ok(())
+    }
+
+    /// Every key grant on `store_rid`, whoever holds it — what deleting a
+    /// store removes along with its grants.
+    pub async fn key_grants_for_store(&self, store_rid: u64) -> CloudResult<Vec<KeyGrantRow>> {
+        let q = format!("KeyGrant.filter(.store_rid == {store_rid})");
+        self.objects(&q).await?.iter().map(key_grant_from_object).collect()
+    }
+
+    /// Deletes one member's envelopes for one store — what removing them from
+    /// it does (docs/SHARING_CONTRACT.md: "also deletes that user's
+    /// `KeyGrant`s for the store"). They keep whatever they already
+    /// decrypted; this only stops the service handing them the key again.
+    pub async fn delete_key_grants_for_user_and_store(&self, user_rid: u64, store_rid: u64) -> CloudResult<()> {
+        for grant in self.key_grants_for_user_and_store(user_rid, store_rid).await? {
+            self.delete_key_grant(grant.rid).await?;
+        }
+        Ok(())
+    }
+
+    /// Every key grant on `store_rid`, deleted one at a time (the query
+    /// language has no bulk `.filter(...).delete()`), like
+    /// [`Self::delete_grants_for_store`].
+    pub async fn delete_key_grants_for_store(&self, store_rid: u64) -> CloudResult<()> {
+        for grant in self.key_grants_for_store(store_rid).await? {
+            self.delete_key_grant(grant.rid).await?;
+        }
+        Ok(())
+    }
+
+    // ── Invitations (docs/SHARING_CONTRACT.md "Accounts service") ────────
+
+    pub async fn create_invitation(&self, store_rid: u64, store_uuid: &str, email: &str, role: &str, invited_by_rid: u64) -> CloudResult<InvitationRow> {
+        let q = format!(
+            "Invitation.create({{ store_rid: {sid}, store_uuid: {suuid}, email: {email}, email_lower: {email_lower}, role: {role}, invited_by_rid: {by}, created_at: {now} }})",
+            sid = store_rid,
+            suuid = ql_str(store_uuid),
+            email = ql_str(email),
+            email_lower = ql_str(&email.trim().to_lowercase()),
+            role = ql_str(role),
+            by = invited_by_rid,
+            now = now_literal(),
+        );
+        let obj = self
+            .objects(&q)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| CloudError::Internal("Invitation.create returned nothing".into()))?;
+        let invitation = invitation_from_object(&obj)?;
+        self.link("Invitation", invitation.rid, "HostedStore", store_rid).await?;
+        Ok(invitation)
+    }
+
+    /// The invitation for one address on one store, if any — the
+    /// find-then-create/update half of the `(store, email_lower)` uniqueness
+    /// this service enforces itself.
+    pub async fn find_invitation(&self, store_rid: u64, email: &str) -> CloudResult<Option<InvitationRow>> {
+        let q = format!("Invitation.filter(.store_rid == {store_rid} && .email_lower == {})", ql_str(&email.trim().to_lowercase()));
+        self.one(&q).await?.map(|o| invitation_from_object(&o)).transpose()
+    }
+
+    pub async fn invitations_for_store(&self, store_rid: u64) -> CloudResult<Vec<InvitationRow>> {
+        let q = format!("Invitation.filter(.store_rid == {store_rid})");
+        self.objects(&q).await?.iter().map(invitation_from_object).collect()
+    }
+
+    /// Every invitation standing for one address, across every store — what
+    /// the claim path (verification, and every login) turns into grants.
+    pub async fn invitations_for_email(&self, email: &str) -> CloudResult<Vec<InvitationRow>> {
+        let q = format!("Invitation.filter(.email_lower == {})", ql_str(&email.trim().to_lowercase()));
+        self.objects(&q).await?.iter().map(invitation_from_object).collect()
+    }
+
+    pub async fn update_invitation_role(&self, invitation_rid: u64, role: &str) -> CloudResult<()> {
+        self.objects(&format!("Invitation.get({invitation_rid}).update({{ role: {} }})", ql_str(role))).await?;
+        Ok(())
+    }
+
+    pub async fn delete_invitation(&self, invitation_rid: u64) -> CloudResult<()> {
+        self.objects(&format!("Invitation.get({invitation_rid}).delete()")).await?;
+        Ok(())
+    }
+
+    pub async fn delete_invitations_for_store(&self, store_rid: u64) -> CloudResult<()> {
+        for invitation in self.invitations_for_store(store_rid).await? {
+            self.delete_invitation(invitation.rid).await?;
+        }
         Ok(())
     }
 }

@@ -33,6 +33,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/stores/:id", delete(stores::delete_store))
         .route("/api/v1/stores/:id/members", get(stores::list_members).put(stores::put_member))
         .route("/api/v1/stores/:id/members/:user_id", delete(stores::delete_member))
+        .route("/api/v1/stores/:id/invitations/:email", delete(stores::delete_invitation))
         .route("/api/v1/stores/:id/keys", get(stores::get_store_keys).put(stores::put_store_keys))
         .route("/api/v1/releases", get(misc::releases))
         .route("/api/v1/.well-known/jwks.json", get(misc::jwks))

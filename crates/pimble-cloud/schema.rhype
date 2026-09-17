@@ -85,12 +85,44 @@ type HostedStore {
     created_at: DateTime
     deleted: Bool
     // Phase 2a (docs/CRYPTO_CONTRACT.md): `"plain"` or `"vault"`, matching
-    // `pimble_core::StoreKind`'s serde spelling. Missing on no row created by
-    // this crate (every `create_hosted_store` call sets it), kept as a plain
-    // required String like every other field here rather than an enum, since
-    // this schema has no enum type and the Pimble server is the source of
-    // truth for what the string means.
+    // `pimble_core::StoreKind`'s serde spelling. Kept as a plain String like
+    // every other field here rather than an enum, since this schema has no
+    // enum type and the Pimble server is the source of truth for what the
+    // string means. Absent on every row created before Phase 2a — read
+    // optional (`hosted_store_from_object`, defaulting to `"plain"`), like
+    // every field added after a generation shipped.
     kind: String
+    // Phase 2b (docs/SHARING_CONTRACT.md): true when this vault store is a
+    // share mirror rather than a store of the account's own. Absent on every
+    // row from before this field existed, which reads as `false` — the state
+    // every pre-2b store really is in.
+    share: Bool
+}
+
+// Phase 2b (docs/SHARING_CONTRACT.md, "Accounts service"): an address invited
+// to a store that has no verified account yet. One row per (store,
+// email_lower), enforced in the service (find-then-create/update) like
+// `Grant`'s (user, store) — see this file's header comment on why relation-pair
+// uniqueness isn't a schema-level thing here. An invitation becomes a `Grant`
+// and is deleted the moment the address is claimed (at verification and at
+// every login), so nothing here is ever read for an account that exists.
+//
+// `store_rid`/`store_uuid` are the same denormalized scalar copies `Grant`
+// carries, for the same reason. `email_lower` is what the claim path queries.
+// `invited_by_rid` is a scalar with no matching relation on purpose: the
+// inviter is only ever read back to name them in the invitation mail, and a
+// row whose inviter has since deleted their account is still a perfectly good
+// invitation (the lookup simply finds nothing and the mail says the store's
+// name instead).
+type Invitation {
+    store: HostedStore
+    store_rid: u64 @indexed
+    store_uuid: String
+    email: String
+    email_lower: String @indexed
+    role: String
+    invited_by_rid: u64
+    created_at: DateTime
 }
 
 type Grant {

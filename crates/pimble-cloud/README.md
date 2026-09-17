@@ -1,8 +1,10 @@
 # pimble-cloud
 
 The Pimble Cloud accounts service: users, sessions, hosted stores, grants,
-and the JWTs a Pimble server verifies. See `docs/CLOUD_CONTRACT.md` at the
-repo root for the full design; this file is how to run it.
+invitations, and the JWTs a Pimble server verifies. See
+`docs/CLOUD_CONTRACT.md` at the repo root for the full design (and
+`docs/CRYPTO_CONTRACT.md` / `docs/SHARING_CONTRACT.md` for the encryption
+and sharing phases); this file is how to run it.
 
 ## What it needs
 
@@ -146,6 +148,103 @@ optional**, and the startup cleanup (below) never deserializes a row through
 two pre-Phase-2a smoke accounts and any phase-1-shape row are deleted by
 this at every startup.
 
+The rule is not about `User` alone. `HostedStore` has now gained two fields
+after rows already existed — Phase 2a's `kind` and Phase 2b's `share` — and
+`hosted_store_from_object` reads **both** optional, as the kind a row from
+before `kind` really is (`"plain"`) and the share a row from before `share`
+really is (`false`). `kind` was required until Phase 2b, which would have
+failed `GET /stores` outright for anyone holding a store created in Phase 1;
+that is the same shape of bug as the `User.verified` crash, found while
+adding `share` beside it.
+
+## Sharing (Phase 2b)
+
+docs/SHARING_CONTRACT.md: a share is an ordinary vault store with
+`share: true` and ordinary `(user, store, role)` grants — this service
+learns nothing new about what is in one. What it does gain is a way to
+name somebody who has no Pimble account yet:
+
+1. **`POST /stores { name, kind, store_id?, share? }`** — `share: true`
+   needs `kind: "vault"` (400 otherwise). Every `GET /stores` row now
+   carries `share` and `shared_by` (an owner's email, filled in only when
+   the caller is not an owner — `null` for one's own store).
+2. **`GET /stores/{id}/members`** (any grant) returns
+   `[{ user_id, email, role, status, has_key, public_keys }]`:
+   - `status` is `"active"` (a `Grant`) or `"invited"` (an `Invitation`);
+   - `has_key` is whether a `KeyGrant` exists for that member on that store
+     — what the owner's key sweep looks for (docs/SHARING_CONTRACT.md,
+     "Key sweep"). The desktop's third state, "waiting for the key", is an
+     active member with `has_key: false`, not a status here;
+   - `user_id` is `null` for an invitation, and `public_keys` is `null`
+     unless the caller is an **owner** (a reader of a shared folder learns
+     nothing about the other members' keys). Invitation rows are only
+     listed for an owner at all.
+3. **`PUT /stores/{id}/members { email, role }`** (owner) now does one of
+   two things, and says which in `status`:
+   - the address has a **verified account with key material** → a grant, as
+     before, plus a "shared with you" mail; the answer is `status:
+     "active"` with that account's `public_keys`, so the caller can wrap the
+     store key to them without a second round trip;
+   - otherwise (no account, unverified, or a legacy keyless row) → an
+     `Invitation` is upserted, an invitation mail goes out, and the answer
+     is `status: "invited"`. Role `owner` this way is refused (400): an
+     owner can delete the store, which is not something to hand to an
+     unproven address.
+4. **`DELETE /stores/{id}/members/{user_id}`** — an **owner, or the member
+   themself** (leaving a share needs nobody's permission). Deletes that
+   user's `KeyGrant`s for the store along with the grant; the last-owner
+   rule stands.
+5. **`DELETE /stores/{id}/invitations/{email}`** (owner) withdraws an
+   invitation — the address is URL-encoded in the path, and it is `200`
+   whether or not there was one to withdraw.
+6. **`GET /stores/{id}/keys`** additionally returns `signers: [{ user_id,
+   email, public_signing_key }]`, the store's owners: a recipient is handed
+   the key by the sharer, so "signed by me" is no longer the only signature
+   worth accepting.
+7. **`DELETE /stores/{id}`** also deletes the store's key grants and
+   invitations, and for a `vault` store calls `deleteVaultStore` on the
+   hosted Pimble server so the ciphertext goes too. That call failing is
+   logged, never returned: the row is marked deleted either way and nothing
+   can reach the store afterwards.
+
+**Claiming.** An invitation becomes a grant the moment the address really
+has an account: at `GET /verify` (the address becoming verified) and at
+every `POST /login`. An existing grant wins — an owner who invited an
+address and then added or re-roled the account directly is not overruled by
+the older invitation — and the invitation is deleted either way, as it is
+for a store that has since been deleted. Both call sites treat it as best
+effort: a claim that fails is logged and retried at the next login rather
+than failing the verification or the login itself.
+
+**Mail and limits** (all in-memory and per-process, like the other
+limiters here):
+
+| Limit | Key | Beyond it |
+| --- | --- | --- |
+| one sharing mail per minute | `<store id>:<lowercased address>` | the grant or invitation still happens; no mail is sent |
+| thirty new invitations per hour | the inviter's account | `429 rate_limited` |
+| fifty members plus invitations | the store | `409 conflict` |
+
+**Names and addresses in a mail are attacker-controlled.** A share's name is
+typed by its owner and the inviter's address by whoever signed up, and both
+go out in a message Pimble's own sending domain puts its name to. So
+`mail::one_line` runs over each first — every `char::is_control` dropped (CR
+and LF among them, which is what makes a subject header injectable),
+whitespace runs collapsed, trimmed — the name is capped at 80 characters
+with an ellipsis, and every interpolated value in an HTML body goes through
+`escape_html` (`& < > " '`), the link's `href` and its visible text
+included. `POST /stores` applies the same one-line rule to a name before
+storing it and refuses one over **200 characters** with a 400 (there was no
+limit at all before Phase 2b). `mail.rs`'s unit tests cover a name like
+`<a href="…">click</a>\r\nBcc: x@y`.
+
+Both mails (`mail::invitation_email`, `mail::shared_with_you_email`) say
+plainly that the notes are end-to-end encrypted and that they open once the
+sender's Pimble has been online to hand over the key. The invitation links
+to `<PIMBLE_CLOUD_PUBLIC_URL>/app/signup?email=<urlencoded address>`; the
+"shared with you" mail links to `<PIMBLE_CLOUD_PUBLIC_URL>/app/`. Without
+`RESEND_API_KEY` both go to `LogMailer` like every other mail here.
+
 ## Account recovery, password change, new recovery code (Phase 2a-2)
 
 The server holds neither the password KEK nor the recovery KEK, so recovery
@@ -286,19 +385,38 @@ curl -sb cookies.txt http://127.0.0.1:8080/api/v1/me/keys
 curl -sb cookies.txt 'http://127.0.0.1:8080/api/v1/users/lookup?email=bob@example.com'
 
 # Create a hosted store (creates it on the Pimble server + an owner grant);
-# kind defaults to "plain", store_id is optional
+# kind defaults to "plain", store_id is optional, share needs kind "vault"
 curl -sb cookies.txt -X POST http://127.0.0.1:8080/api/v1/stores \
   -H 'Content-Type: application/json' -d '{"name": "My Notes", "kind": "vault"}'
+curl -sb cookies.txt -X POST http://127.0.0.1:8080/api/v1/stores \
+  -H 'Content-Type: application/json' -d '{"name": "Recipes", "kind": "vault", "share": true}'
 
 # List my stores
+# -> [{"store_id":"...","name":"Recipes","role":"editor","kind":"vault",
+#      "created_at":"...","share":true,"shared_by":"ann@example.com"}]
 curl -sb cookies.txt http://127.0.0.1:8080/api/v1/stores
 
-# Add a member
+# Add a member, or invite an address with no account yet — same call
+# -> {"user_id":"...","email":"bob@example.com","role":"editor",
+#     "status":"active","has_key":false,"public_keys":{"encryption":"...","signing":"..."}}
+# -> {"user_id":null,"email":"new@example.com","role":"editor",
+#     "status":"invited","has_key":false,"public_keys":null}
 curl -sb cookies.txt -X PUT http://127.0.0.1:8080/api/v1/stores/<store-id>/members \
   -H 'Content-Type: application/json' -d '{"email": "bob@example.com", "role": "editor"}'
 
-# My own key envelopes for a store, and setting one (envelope from
-# pimble_crypto::wrap_key, signed by the caller's own signing key)
+# The members list (invitations and public_keys only for an owner)
+curl -sb cookies.txt http://127.0.0.1:8080/api/v1/stores/<store-id>/members
+
+# Remove a member (an owner, or the member themself), or withdraw an
+# invitation (an owner; the address is url-encoded, 200 even if there is none)
+curl -sb cookies.txt -X DELETE http://127.0.0.1:8080/api/v1/stores/<store-id>/members/<user-id>
+curl -sb cookies.txt -X DELETE http://127.0.0.1:8080/api/v1/stores/<store-id>/invitations/new%40example.com
+
+# My own key envelopes for a store, plus the owners whose signatures on them
+# are legitimate, and setting one (envelope from pimble_crypto::wrap_key,
+# signed by the caller's own signing key)
+# -> {"envelopes":[{"key_id":"...","envelope":{...}}],
+#     "signers":[{"user_id":"...","email":"ann@example.com","public_signing_key":"..."}]}
 curl -sb cookies.txt http://127.0.0.1:8080/api/v1/stores/<store-id>/keys
 curl -sb cookies.txt -X PUT http://127.0.0.1:8080/api/v1/stores/<store-id>/keys \
   -H 'Content-Type: application/json' \
@@ -460,6 +578,39 @@ elsewhere) so the `/releases` tests never touch the network.
   (find-then-create/update in `routes/stores.rs::put_store_keys`), not the
   schema — key rotation adds a new `key_id` and new envelopes per member
   rather than mutating an old row, so old blobs keep decrypting.
+- **`Invitation` carries `store`/`store_rid`/`store_uuid` like `Grant`**, for
+  the same reason (no relation-equality filter), and `(store, email_lower)`
+  uniqueness is likewise enforced in the service (find-then-create/update in
+  `routes/stores.rs::invite_member`). `invited_by_rid` is a scalar with *no*
+  matching relation on purpose: the inviter is only ever read back to name
+  them in the mail, and an invitation whose inviter has since deleted their
+  account is still a perfectly good invitation.
+- **`QuotaLimiter` (`src/ratelimit.rs`) is a second limiter**, not a
+  parameterisation of `RateLimiter`: the existing one allows exactly one use
+  per interval, and thirty invitations in a row is the ordinary way somebody
+  shares a folder with their family. It keeps the instants still inside the
+  window per key, which is bounded by the limit (a key at its limit records
+  nothing further).
+- **`Config::max_members_per_store` is not an environment variable.** The
+  contract fixes the number at fifty and an operator raising it would quietly
+  change what the service promises; it is a field rather than a constant only
+  so a test can lower it (`spawn_stack_with_members_cap`) instead of making
+  fifty accounts.
+- **A sharing mail that fails to send is logged, not returned**, unlike
+  signup's (which is a 502 — an account nobody can verify is unusable). By
+  the time the mail goes out the grant or invitation is already committed, so
+  a 502 would show the owner an error for a share that really was created,
+  and the recipient finds it in their own store list regardless. The mail is
+  a courtesy, not the mechanism.
+- **`PUT members` treats "verified with key material" as "has an account"**.
+  An unverified or legacy row is invited instead of granted — the same test
+  `users_lookup` applies — so the claim path picks it up when that address
+  really becomes usable, rather than leaving a grant nobody can ever hold the
+  key for.
+- **`LogMailer::message_count`** joins `last_message` as a test-only
+  accessor: two sharing mails a minute apart have identical bodies, so
+  "was a second one sent?" — what the per-(store, address) rate-limit test
+  asks — cannot be read off the last body alone.
 - **`NewUserKeyMaterial::placeholder_for_tests`** exists because every
   `User` field is now schema-required; a test that needs a user row to
   exist without exercising any crypto endpoint (mail/rate-limit tests that

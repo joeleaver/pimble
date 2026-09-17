@@ -280,6 +280,11 @@ pub async fn verify(State(state): State<AppState>, Query(query): Query<VerifyQue
         return Ok(redirect_to("/app/login?verify_error=expired"));
     }
     state.db.mark_user_verified(user.rid).await?;
+    // Phase 2b (docs/SHARING_CONTRACT.md, "Claiming"): this address may have
+    // been invited to shares before it had an account. Best effort — a share
+    // that cannot be handed over right now must not make verification itself
+    // fail; the next login claims it.
+    super::stores::claim_invitations_best_effort(&state, &user).await;
     Ok(redirect_to("/app/login?verified=1"))
 }
 
@@ -317,6 +322,12 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>)
     if !user.verified {
         return Err(CloudError::EmailUnverified);
     }
+    // Claim any invitations for this address before the token is minted, so
+    // the `stores` claim in it already carries a share invited moments ago
+    // (docs/SHARING_CONTRACT.md, "Claiming": "at every `login`"). Verification
+    // usually does this first; login covers an invitation sent afterwards,
+    // and any claim that failed then.
+    super::stores::claim_invitations_best_effort(&state, &user).await;
     issue_session(&state, &user).await
 }
 

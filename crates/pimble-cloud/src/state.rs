@@ -6,7 +6,7 @@ use crate::db::RhypeDb;
 use crate::jwt::JwtSigner;
 use crate::mail::Mailer;
 use crate::pimble::PimbleService;
-use crate::ratelimit::RateLimiter;
+use crate::ratelimit::{QuotaLimiter, RateLimiter};
 use crate::releases::ReleasesCache;
 
 /// One send per address per minute (docs/CLOUD_CONTRACT.md, "Phase 1b":
@@ -26,6 +26,20 @@ const RECOVERY_START_INTERVAL: Duration = Duration::from_secs(60);
 /// still blocking a scripted enumeration loop: at most once every 200ms per
 /// caller (5/s).
 const USERS_LOOKUP_INTERVAL: Duration = Duration::from_millis(200);
+/// "one mail per (store, address) per minute" (docs/SHARING_CONTRACT.md,
+/// "Accounts service"). Its own instance again, for the same reason
+/// `recovery_rate_limit` is: sharing a bucket with verification would make an
+/// invitation's mail depend on whether that address happened to sign up a
+/// moment ago. Keyed by `<store id>:<lowercased address>`, so inviting the
+/// same person to a second store is never silenced by the first.
+const SHARE_MAIL_INTERVAL: Duration = Duration::from_secs(60);
+/// "thirty invitations per inviter per hour" (docs/SHARING_CONTRACT.md) —
+/// what stops an account using `PUT members` as a mail cannon at addresses
+/// that never asked for anything. Only the invitation path counts: granting
+/// to an address that already has an account mails somebody who is already a
+/// Pimble user.
+const INVITES_PER_INVITER_WINDOW: Duration = Duration::from_secs(60 * 60);
+const INVITES_PER_INVITER_LIMIT: usize = 30;
 
 #[derive(Clone)]
 pub struct AppState(pub Arc<Inner>);
@@ -40,6 +54,13 @@ pub struct Inner {
     pub resend_rate_limit: RateLimiter,
     pub recovery_rate_limit: RateLimiter,
     pub users_lookup_rate_limit: RateLimiter,
+    /// One sharing mail per `<store id>:<address>` per minute
+    /// (docs/SHARING_CONTRACT.md). A repeat inside the minute still grants or
+    /// upserts the invitation — only the mail is skipped.
+    pub share_mail_rate_limit: RateLimiter,
+    /// Thirty new invitations per inviter per hour (docs/SHARING_CONTRACT.md);
+    /// beyond it `PUT members` answers 429.
+    pub invite_quota: QuotaLimiter,
     /// `GET /kdf`'s decoy-salt HMAC key (docs/CRYPTO_CONTRACT.md), resolved
     /// once at startup from `config.kdf_decoy_secret` — see
     /// [`resolve_kdf_decoy_secret`].
@@ -89,6 +110,8 @@ impl AppState {
             resend_rate_limit: RateLimiter::new(RESEND_VERIFICATION_INTERVAL),
             recovery_rate_limit: RateLimiter::new(RECOVERY_START_INTERVAL),
             users_lookup_rate_limit: RateLimiter::new(USERS_LOOKUP_INTERVAL),
+            share_mail_rate_limit: RateLimiter::new(SHARE_MAIL_INTERVAL),
+            invite_quota: QuotaLimiter::new(INVITES_PER_INVITER_WINDOW, INVITES_PER_INVITER_LIMIT),
             kdf_decoy_secret,
         }))
     }

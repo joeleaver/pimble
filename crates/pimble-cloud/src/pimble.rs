@@ -41,4 +41,16 @@ impl PimbleService {
         let (store_id, _root_node_id) = self.client.create_store_with(&path, name, kind, store_id).await?;
         Ok((store_id, dir_name))
     }
+
+    /// Close a hosted **vault** store and delete its directory
+    /// (docs/SHARING_CONTRACT.md: `deleteVaultStore`, Service-only) — what
+    /// `DELETE /stores/{id}` does for a vault store, so the ciphertext of a
+    /// share goes with the share. The caller must treat a failure as
+    /// non-fatal: the accounts row is marked deleted either way, and a store
+    /// left behind on the hosted disk is unreachable (no grant names it any
+    /// more) rather than dangerous.
+    pub async fn delete_vault_store(&self, store_id: StoreId) -> CloudResult<()> {
+        self.client.delete_vault_store(store_id).await?;
+        Ok(())
+    }
 }
