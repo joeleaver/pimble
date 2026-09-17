@@ -63,17 +63,18 @@ account UI"), then `docs/CRYPTO_CONTRACT.md`, `docs/DESKTOP_ACCOUNT_CONTRACT.md`
   every client built before this change. Tests: `a_snapshot_never_covers_an_entry_this_
   device_did_not_apply` (fails on the old rule: "snapshot at 200, entry 2"), the store and
   RPC-level guards, the cursor's unit tests.
-- **2026-09-17: rinch is pinned to the branch `fix/collab-remote-caret`** (joeleaver/rinch#831),
-  not `main`, in the root `Cargo.toml`, `crates/pimble-app/Cargo.toml` and `web/Cargo.toml`
-  (both locks at the same revision). Joe: one client backspaced the line the other's caret
-  was on and the caret ended up out in space. Two rinch defects: a remote change is a
-  block-level replace, and a caret inside the replaced paragraph was mapped to the start
-  of the *next* paragraph on every keystroke of the peer's (two people could not write in
-  one paragraph); and rinch-web refreshed the caret only from its input handlers, so after
-  a remote delta it stayed painted where the line used to end. **When #831 merges:** put
-  `branch = "main"` back in those three files, `cargo update rinch rinch-tabler-icons
-  rinch-editor-core rinch-editor-collab`, the same in `web/` (`rinch rinch-core rinch-web
-  rinch-editor-core`), check both locks name one revision and one `wasm-bindgen`.
+- **2026-09-17: rinch is back on `main`** (`c4845d3`, which carries joeleaver/rinch#831, the
+  collaboration caret fix) in the root `Cargo.toml`, `crates/pimble-app/Cargo.toml` and
+  `web/Cargo.toml`, both locks at that revision with one `wasm-bindgen` (0.2.128). Joe had
+  reported that one client backspacing the line the other's caret was on left that caret
+  out in space: a remote change is a block-level replace and a caret inside the replaced
+  paragraph was mapped to the start of the *next* one, and rinch-web refreshed the caret
+  only from its input handlers. The pull request's branch was deleted at merge, which would
+  have failed any fresh-checkout build (CI, the release, jkbase) of the commit that pinned it.
+- **2026-09-17: v0.1.1 and a standing rule.** The public download was still v0.1.0, ten
+  commits behind production and without the account UI. Joe: update the desktop builds
+  every time we push a version (`docs/DEPLOY.md`, "A desktop release with every version";
+  also a rule in `CLAUDE.md`). v0.1.1 is `master` with the pins on `main`.
 - **Local verification stack for the desktop** (`tools/dev-proxy.js` is the proxy, `tools/rinch-debug.py` drives the GUI):
   rhypedb-server, `pimble-cli server` on 7463 in JWT mode with a token file, `pimble-cloud`
   on 8080 with `PIMBLE_CLOUD_PUBLIC_URL=http://127.0.0.1:8090`, a 60-line node reverse

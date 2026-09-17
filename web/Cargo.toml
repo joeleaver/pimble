@@ -9,7 +9,7 @@ resolver = "2"
 
 [package]
 name = "pimble-web"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -19,17 +19,17 @@ description = "Pimble in the browser: the pimble-app UI over a hosted Pimble ser
 # Rinch without `desktop`, plus the browser-native DOM backend. `collaboration`
 # on rinch-web (never on rinch, where it implies `desktop`) is the same
 # rinch-editor-collab yrs adapter the desktop editor uses.
-rinch = { git = "https://github.com/joeleaver/rinch.git", branch = "fix/collab-remote-caret", default-features = false, features = [
+rinch = { git = "https://github.com/joeleaver/rinch.git", branch = "main", default-features = false, features = [
     "components",
     "theme",
 ] }
-rinch-core = { git = "https://github.com/joeleaver/rinch.git", branch = "fix/collab-remote-caret", features = [
+rinch-core = { git = "https://github.com/joeleaver/rinch.git", branch = "main", features = [
     "theme",
 ] }
-rinch-web = { git = "https://github.com/joeleaver/rinch.git", branch = "fix/collab-remote-caret", features = [
+rinch-web = { git = "https://github.com/joeleaver/rinch.git", branch = "main", features = [
     "collaboration",
 ] }
-rinch-editor-core = { git = "https://github.com/joeleaver/rinch.git", branch = "fix/collab-remote-caret" }
+rinch-editor-core = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
 
 # The UI and the command seam, without the desktop shell or the embedded server.
 pimble-app = { path = "../crates/pimble-app", default-features = false, features = ["web"] }

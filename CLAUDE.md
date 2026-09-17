@@ -24,6 +24,10 @@ Pimble is an **offline-first personal information manager**:
 - rinch fixes go upstream as pull requests; point `Cargo.toml` at the branch until merged.
 - Always build and run `pimble-app` with `--release`; debug builds are unusably slow.
 - One way to write node content. If a second path appears, one of them is a bug.
+- Every time a version is pushed (a deploy, or a push of `master` that changes what ships),
+  cut a desktop release too: bump the workspace version, tag `v<version>` on `master`, push
+  the tag, check the Release run and the download page (`docs/DEPLOY.md`, "A desktop
+  release with every version").
 
 ## Current design (2026-09-13)
 

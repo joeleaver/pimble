@@ -27,7 +27,7 @@ pimble-crdt = { workspace = true }
 # (and `collaboration`, which implies it) must stay out of a web build, and a
 # member cannot switch a workspace dependency's defaults off. Still GitHub
 # `main`, never a path; `cargo update rinch` moves the pin as before.
-rinch = { git = "https://github.com/joeleaver/rinch.git", branch = "fix/collab-remote-caret", default-features = false, features = [
+rinch = { git = "https://github.com/joeleaver/rinch.git", branch = "main", default-features = false, features = [
     "components",
     "theme",
 ] }
@@ -52,7 +52,7 @@ rand = { version = "0.9", optional = true }
 # --- web only (the browser DOM backend) ------------------------------------
 # The same `EditorHandle` / `Editor` as desktop, reached through the browser
 # backend instead of the desktop one, with the same yrs collaboration adapter.
-rinch-web = { git = "https://github.com/joeleaver/rinch.git", branch = "fix/collab-remote-caret", features = [
+rinch-web = { git = "https://github.com/joeleaver/rinch.git", branch = "main", features = [
     "collaboration",
 ], optional = true }
 js-sys = { version = "0.3", optional = true }

@@ -116,6 +116,30 @@ push token (revoking the old one); `jkbase repo disconnect` removes it. If anoth
 needs the remote, run `jkbase repo connect` there and set the same refspec:
 `git config remote.jkbase.push 'HEAD:refs/heads/main'`.
 
+## A desktop release with every version
+
+Every time a version is pushed (a production deploy, or any push of `master` that changes
+what ships), the desktop builds are updated too (Joe, 2026-09-17): the download page must
+never offer a client older than the service it talks to. On 2026-09-17 it was offering
+v0.1.0, ten commits behind production and without the account UI.
+
+```bash
+# on master, with the change that ships already committed
+sed -i '0,/^version = "/s/^version = ".*"/version = "X.Y.Z"/' Cargo.toml web/Cargo.toml
+cargo check --workspace && (cd web && cargo check --target wasm32-unknown-unknown)   # refreshes both locks
+git commit -am "Release X.Y.Z" && git push origin master
+git tag vX.Y.Z && git push origin vX.Y.Z
+gh run list --workflow Release --limit 1          # about 13 minutes
+```
+
+`.github/workflows/release.yml` builds the packages and creates the GitHub release; the
+download page reads it through `/api/v1/releases` (cached for ten minutes) and needs no
+deploy of its own. The release build is a fresh checkout, so every git dependency must
+resolve there: **a rinch branch that was deleted after its pull request merged fails the
+build** even though it still builds locally from cargo's cache (`fix/collab-remote-caret`,
+2026-09-17). Move the pins to `main` before tagging. The Windows job is
+`continue-on-error` until joeleaver/rhypedb#23 merges; the Linux binary needs glibc 2.38.
+
 ## Deploy
 
 ```bash
