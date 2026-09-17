@@ -29,7 +29,7 @@ use pimble_core::{custom_keys, node_types, Node, NodeId, NodeMetadata, Store, St
 use pimble_crdt::{ContentDoc, StoreDocument};
 use pimble_crypto::{blob_aad, Blob};
 use pimble_rpc::{
-    SearchResultItem, StoreChangeKind, StoreChangedNotification, VaultDocId, VaultEntry,
+    SearchResultItem, StoreChangeKind, StoreChangedNotification, VaultCursor, VaultDocId,
 };
 
 use crate::keys::{self, Keyring};
@@ -49,8 +49,10 @@ pub enum Handled {
 /// One node's content, as this page holds it.
 struct VaultDoc {
     content: ContentDoc,
-    /// The highest sequence number merged into `content`.
-    seq: u64,
+    /// How far into the log `content` has been read without a gap: where the
+    /// next fetch starts, and the only number a snapshot may be stamped with
+    /// (see `pimble_rpc::VaultCursor`).
+    cursor: VaultCursor,
     /// Appends since the last snapshot upload.
     appends: u32,
     /// A state vector everything up to which the server is known to hold
@@ -67,7 +69,7 @@ struct VaultStore {
     root_node_id: NodeId,
     keyring: Keyring,
     tree: StoreDocument,
-    tree_seq: u64,
+    tree_cursor: VaultCursor,
     tree_appends: u32,
     /// As `VaultDoc::known_sv` and `VaultDoc::unsent`, for the tree.
     tree_known_sv: Vec<u8>,
@@ -167,19 +169,20 @@ impl VaultClient {
 
         let mut tree = StoreDocument::load(&[]).map_err(|e| e.to_string())?;
         let mut tree_known_sv = pimble_crdt::empty_state_vector();
-        for update in decrypt_entries(&keyring, store_id, &VaultDocId::Tree, &fetched) {
+        let mut tree_cursor = VaultCursor::default();
+        for (mark, update) in decrypt_entries(&keyring, store_id, &VaultDocId::Tree, &fetched) {
             match update {
                 Ok(bytes) => {
                     if let Err(e) = tree.apply_update(&bytes) {
                         tracing::warn!("Skipping an unreadable tree update: {}", e);
                     } else {
                         advance(&mut tree_known_sv, &bytes);
+                        mark.apply(&mut tree_cursor);
                     }
                 }
                 Err(message) => tracing::warn!("Skipping a tree blob: {}", message),
             }
         }
-        let mut tree_seq = fetched.head;
 
         // An empty log is a store the accounts service has just created. Seed
         // it here, under the id and root the server already minted, so both
@@ -188,10 +191,11 @@ impl VaultClient {
             tree = StoreDocument::new(&store.name, store.root_node_id)
                 .map_err(|e| format!("building the store document failed: {e}"))?;
             let blob = encrypt_blob(&keyring, store_id, &VaultDocId::Tree, &tree.save())?;
-            tree_seq = client
+            let seq = client
                 .vault_append_from(store_id, VaultDocId::Tree, blob, Some(me))
                 .await
                 .map_err(|e| format!("seeding the tree failed: {e}"))?;
+            tree_cursor.mark(seq);
             tree_known_sv = tree.state_vector();
         }
 
@@ -203,7 +207,7 @@ impl VaultClient {
                 root_node_id,
                 keyring,
                 tree,
-                tree_seq,
+                tree_cursor,
                 tree_appends: 0,
                 tree_known_sv,
                 tree_unsent: false,
@@ -231,20 +235,20 @@ impl VaultClient {
         let store_ids: Vec<StoreId> = self.stores.keys().copied().collect();
         for store_id in store_ids {
             // Down: the tree, then every document held.
-            let tree_seq = self.stores.get(&store_id).map(|s| s.tree_seq).unwrap_or(0);
+            let tree_seq = self.stores.get(&store_id).map(|s| s.tree_cursor.applied_through()).unwrap_or(0);
             if let Ok(fetched) = client.vault_fetch(store_id, VaultDocId::Tree, tree_seq).await {
                 if let Some(store) = self.stores.get_mut(&store_id) {
                     let mut touched = Vec::new();
-                    for update in decrypt_entries(&store.keyring, store_id, &VaultDocId::Tree, &fetched) {
+                    for (mark, update) in decrypt_entries(&store.keyring, store_id, &VaultDocId::Tree, &fetched) {
                         let Ok(bytes) = update else { continue };
                         if let Ok(effect) = store.tree.apply_update(&bytes) {
                             advance(&mut store.tree_known_sv, &bytes);
+                            mark.apply(&mut store.tree_cursor);
                             if effect.changed {
                                 touched.extend(effect.touched);
                             }
                         }
                     }
-                    store.tree_seq = store.tree_seq.max(fetched.head);
                     if !touched.is_empty() {
                         events.push(BackendEvent::RemoteStoreChange {
                             store_id,
@@ -258,7 +262,7 @@ impl VaultClient {
             let held: Vec<(NodeId, u64)> = self
                 .stores
                 .get(&store_id)
-                .map(|s| s.docs.iter().map(|(id, doc)| (*id, doc.seq)).collect())
+                .map(|s| s.docs.iter().map(|(id, doc)| (*id, doc.cursor.applied_through())).collect())
                 .unwrap_or_default();
             for (node_id, seq) in held {
                 let doc_id = VaultDocId::Node(node_id);
@@ -268,17 +272,17 @@ impl VaultClient {
                 let updates = decrypt_entries(&store.keyring, store_id, &doc_id, &fetched);
                 let Some(doc) = store.docs.get_mut(&node_id) else { continue };
                 let mut changed = false;
-                for update in updates {
+                for (mark, update) in updates {
                     let Ok(bytes) = update else { continue };
                     if doc.content.apply_update(&bytes).is_ok() {
                         advance(&mut doc.known_sv, &bytes);
+                        mark.apply(&mut doc.cursor);
                         changed = true;
                         if active {
                             events.push(BackendEvent::RemoteChanges { changes: STANDARD.encode(&bytes) });
                         }
                     }
                 }
-                doc.seq = doc.seq.max(fetched.head);
                 store.heads.insert(node_id, fetched.head);
                 if changed && !active {
                     events.push(BackendEvent::NodeContentUpdated { store_id, node_id });
@@ -355,8 +359,17 @@ impl VaultClient {
         let store = self.stores.get_mut(&store_id)?;
 
         // Sequence numbers say how far this client has read, never who wrote
-        // what; `should_apply` is the whole of that decision.
+        // what; `should_apply` is the whole of that decision. This client's own
+        // append is already in its document, so its number counts as read.
         if !apply {
+            match &doc_id {
+                VaultDocId::Tree => store.tree_cursor.mark(seq),
+                VaultDocId::Node(node_id) => {
+                    if let Some(doc) = store.docs.get_mut(node_id) {
+                        doc.cursor.mark(seq);
+                    }
+                }
+            }
             return None;
         }
 
@@ -379,7 +392,7 @@ impl VaultClient {
                         return None;
                     }
                 };
-                store.tree_seq = store.tree_seq.max(seq);
+                store.tree_cursor.mark(seq);
                 advance(&mut store.tree_known_sv, &update);
                 if !effect.changed {
                     return None;
@@ -396,7 +409,7 @@ impl VaultClient {
                     tracing::warn!("A content update would not apply: {}", e);
                     return None;
                 }
-                doc.seq = doc.seq.max(seq);
+                doc.cursor.mark(seq);
                 advance(&mut doc.known_sv, &update);
                 let head = store.heads.entry(node_id).or_insert(0);
                 *head = (*head).max(seq);
@@ -781,10 +794,14 @@ impl VaultClient {
         } else {
             advance(&mut store.tree_known_sv, &update);
         }
-        store.tree_seq = store.tree_seq.max(seq);
+        store.tree_cursor.mark(seq);
         store.tree_appends += 1;
 
-        if store.tree_appends >= SNAPSHOT_EVERY {
+        // The server deletes every log entry at or below a snapshot's number,
+        // so it may only be stamped with a number read *through*. Another
+        // client's append just below ours may still be on its way; until it
+        // lands the snapshot waits for a later append.
+        if store.tree_appends >= SNAPSHOT_EVERY && store.tree_cursor.applied_through() == seq {
             let full = store.tree.save();
             let blob = encrypt_blob(&store.keyring, store_id, &VaultDocId::Tree, &full)?;
             match client.vault_snapshot(store_id, VaultDocId::Tree, seq, blob).await {
@@ -846,7 +863,7 @@ impl VaultClient {
         let head = store.heads.entry(node_id).or_insert(0);
         *head = (*head).max(seq);
         if let Some(doc) = store.docs.get_mut(&node_id) {
-            doc.seq = doc.seq.max(seq);
+            doc.cursor.mark(seq);
             doc.known_sv = sent_sv;
             doc.unsent = false;
         }
@@ -907,9 +924,11 @@ impl VaultClient {
         *head = (*head).max(seq);
         let needs_snapshot = match store.docs.get_mut(&node_id) {
             Some(doc) => {
-                doc.seq = doc.seq.max(seq);
+                doc.cursor.mark(seq);
                 doc.appends += 1;
-                doc.appends >= SNAPSHOT_EVERY
+                // As for the tree: only a number read through may be stamped
+                // on a snapshot.
+                doc.appends >= SNAPSHOT_EVERY && doc.cursor.applied_through() == seq
             }
             None => false,
         };
@@ -982,7 +1001,7 @@ impl VaultClient {
             let doc = store.docs.get(&node_id);
             (
                 doc.is_some(),
-                doc.map(|d| d.seq).unwrap_or(0),
+                doc.map(|d| d.cursor.applied_through()).unwrap_or(0),
                 store.heads.get(&node_id).copied().unwrap_or(0),
             )
         };
@@ -1002,25 +1021,25 @@ impl VaultClient {
         };
         let entry = store.docs.entry(node_id).or_insert_with(|| VaultDoc {
             content: ContentDoc::new(),
-            seq: 0,
+            cursor: VaultCursor::default(),
             appends: 0,
             known_sv: pimble_crdt::empty_state_vector(),
             unsent: false,
         });
 
-        for update in decrypt_entries(&store.keyring, store_id, &doc_id, &fetched) {
+        for (mark, update) in decrypt_entries(&store.keyring, store_id, &doc_id, &fetched) {
             match update {
                 Ok(bytes) => {
                     if let Err(e) = entry.content.apply_update(&bytes) {
                         tracing::warn!("Skipping an unreadable content update: {}", e);
                     } else {
                         advance(&mut entry.known_sv, &bytes);
+                        mark.apply(&mut entry.cursor);
                     }
                 }
                 Err(message) => tracing::warn!("Skipping a content blob: {}", message),
             }
         }
-        entry.seq = entry.seq.max(fetched.head);
         store.heads.insert(node_id, fetched.head);
         Ok(())
     }
@@ -1308,20 +1327,37 @@ fn decode_blob(encoded: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Every blob in a fetch, snapshot first, decrypted in order.
+/// What applying a fetched entry says about the log: a snapshot stands for
+/// everything up to its number, an update for its own number only.
+#[derive(Clone, Copy)]
+enum Mark {
+    Through(u64),
+    One(u64),
+}
+
+impl Mark {
+    /// Called only once the entry has been applied; an entry that would not
+    /// decrypt or merge is never marked, so the cursor stops in front of it.
+    fn apply(self, cursor: &mut VaultCursor) {
+        match self {
+            Mark::Through(seq) => cursor.mark_through(seq),
+            Mark::One(seq) => cursor.mark(seq),
+        }
+    }
+}
+
 fn decrypt_entries(
     keyring: &Keyring,
     store_id: StoreId,
     doc_id: &VaultDocId,
     fetched: &pimble_rpc::VaultFetchResponse,
-) -> Vec<Result<Vec<u8>, String>> {
+) -> Vec<(Mark, Result<Vec<u8>, String>)> {
     let mut out = Vec::with_capacity(fetched.updates.len() + 1);
-    let entries = fetched
-        .snapshot
-        .iter()
-        .chain(fetched.updates.iter())
-        .collect::<Vec<&VaultEntry>>();
-    for entry in entries {
-        out.push(decrypt_blob(keyring, store_id, doc_id, &entry.blob));
+    if let Some(entry) = &fetched.snapshot {
+        out.push((Mark::Through(entry.seq), decrypt_blob(keyring, store_id, doc_id, &entry.blob)));
+    }
+    for entry in &fetched.updates {
+        out.push((Mark::One(entry.seq), decrypt_blob(keyring, store_id, doc_id, &entry.blob)));
     }
     out
 }

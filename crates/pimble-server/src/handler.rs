@@ -1567,6 +1567,18 @@ impl PimbleApiServer for RpcHandler {
     async fn vault_snapshot(&self, ext: &Extensions, request: VaultSnapshotRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
         authorize(&principal_of(ext), request.store_id, Access::Write)?;
         info!("Vault snapshot for store {} doc {:?} upto {}", request.store_id, request.doc_id, request.upto_seq);
+        if !request.covers_prefix {
+            // A client from before 2026-09-17 stamps a snapshot with its own
+            // latest append's number, whatever it had applied below it, and
+            // storing one deletes the log entries it may lack. Acknowledged
+            // (that client treats a refusal as an error worth surfacing) and
+            // not stored; the log keeps everything.
+            warn!(
+                "Ignoring a vault snapshot for store {} doc {:?}: the sender does not vouch that it covers every entry up to {}",
+                request.store_id, request.doc_id, request.upto_seq
+            );
+            return Ok(EmptyResponse {});
+        }
 
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;

@@ -48,9 +48,21 @@ account UI"), then `docs/CRYPTO_CONTRACT.md`, `docs/DESKTOP_ACCOUNT_CONTRACT.md`
   in the web vault client (`catch_up` on every connect, resend after a failed append).
   "Unlink from Remote" now also stops a vault link. Tests: a cuttable TCP relay in
   `tests/vault_link.rs` (`env.relay.cut()`/`restore()`), two new regression tests.
-  **Not fixed, worth a look:** a snapshot claims to cover the log up to seq N but is this
-  device's state, which may not yet include another device's append below N that is still
-  in flight to it; a reader that starts from that snapshot would miss that append.
+- **2026-09-17: a snapshot could destroy what it did not contain.** The hosted server
+  deletes every log entry at or below a snapshot's number, and both clients stamped a
+  snapshot with the number of their own latest append, whatever they had applied below it
+  (another device's append still in flight, or a blob that would not decrypt). The same
+  "highest number seen" was the fetch cursor, so an entry below an own append was never
+  fetched after a drop. Fixed with `pimble_rpc::VaultCursor` (`applied_through`: the
+  largest n with every entry 1..=n reflected locally; an unapplied entry holds it): the
+  desktop link and the web client fetch from it and snapshot only when it equals their
+  own append's number; `sync.json`'s `last_seq` now holds exactly that value, and a
+  replica from before (`vault-link.json` `cursor_version` below 1) reads every log once
+  from the start. The server keeps a held snapshot over one that is not newer, and
+  **ignores (but acknowledges) a snapshot whose request lacks `covers_prefix`**, which is
+  every client built before this change. Tests: `a_snapshot_never_covers_an_entry_this_
+  device_did_not_apply` (fails on the old rule: "snapshot at 200, entry 2"), the store and
+  RPC-level guards, the cursor's unit tests.
 - **Local verification stack for the desktop** (`tools/dev-proxy.js` is the proxy, `tools/rinch-debug.py` drives the GUI):
   rhypedb-server, `pimble-cli server` on 7463 in JWT mode with a token file, `pimble-cloud`
   on 8080 with `PIMBLE_CLOUD_PUBLIC_URL=http://127.0.0.1:8090`, a 60-line node reverse

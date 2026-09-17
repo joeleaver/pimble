@@ -8,7 +8,9 @@
 pub mod error;
 pub mod methods;
 pub mod types;
+pub mod vault_cursor;
 
 pub use error::*;
 pub use methods::*;
 pub use types::*;
+pub use vault_cursor::VaultCursor;

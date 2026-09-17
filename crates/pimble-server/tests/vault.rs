@@ -162,6 +162,40 @@ async fn fetch_semantics_around_a_snapshot() {
 
 // ── 3. Snapshot drops old entries and survives close/reopen ─────────
 
+/// A client from before 2026-09-17 stamps a snapshot with the number of its own
+/// latest append, whatever it had applied below it, and storing one deletes the
+/// log entries it may lack. Its request carries no `covers_prefix`; the server
+/// acknowledges it and keeps the log whole.
+#[tokio::test]
+async fn a_snapshot_that_does_not_vouch_for_its_prefix_is_acknowledged_and_ignored() {
+    use pimble_rpc::{PimbleApiClient, VaultSnapshotRequest};
+
+    let (server, client) = start_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (store_id, _root) = client.create_store_with(dir.path().join("v.pimble"), "V", StoreKind::Vault, None).await.unwrap();
+    client.vault_append(store_id, VaultDocId::Tree, b64(b"a")).await.unwrap();
+    client.vault_append(store_id, VaultDocId::Tree, b64(b"b")).await.unwrap();
+
+    // The request as an old client sends it: no `covers_prefix` field at all.
+    let raw = jsonrpsee::ws_client::WsClientBuilder::default()
+        .build(format!("ws://{}", server.addr()))
+        .await
+        .expect("raw client connects");
+    let old_style: VaultSnapshotRequest = serde_json::from_value(serde_json::json!({
+        "store_id": store_id,
+        "doc_id": VaultDocId::Tree,
+        "upto_seq": 2,
+        "blob": b64(b"an old client's state"),
+    }))
+    .expect("the flag defaults to false");
+    assert!(!old_style.covers_prefix);
+    raw.vault_snapshot(old_style).await.expect("acknowledged, not refused");
+
+    let fetched = client.vault_fetch(store_id, VaultDocId::Tree, 0).await.unwrap();
+    assert!(fetched.snapshot.is_none(), "nothing was stored");
+    assert_eq!(fetched.updates.iter().map(|u| u.seq).collect::<Vec<_>>(), vec![1, 2], "the log is whole");
+}
+
 #[tokio::test]
 async fn snapshot_drops_old_entries_and_survives_close_and_reopen() {
     let dir = tempfile::tempdir().unwrap();

@@ -63,7 +63,8 @@ use pimble_client::PimbleClient;
 use pimble_core::{AuthMethod, NodeId, StoreId, SyncState};
 use pimble_crypto::Blob;
 use pimble_rpc::{
-    ApplyEditRequest, ApplyStoreUpdateRequest, EditOperation, PimbleApiServer, StoreChangeKind, StoreChangedNotification, VaultDocId,
+    ApplyEditRequest, ApplyStoreUpdateRequest, EditOperation, PimbleApiServer, StoreChangeKind, StoreChangedNotification, VaultCursor,
+    VaultDocId,
 };
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -79,9 +80,15 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// reuse, so a burst of them (several renames/moves in a row) yields one
 /// full-tree push.
 const TREE_PUSH_DEBOUNCE: Duration = Duration::from_millis(200);
-/// Upload a snapshot of a document whenever its head reaches a multiple of
-/// this many appended updates (docs/CRYPTO_CONTRACT.md).
+/// Upload a snapshot of a document once this many entries have been appended
+/// since the last one (docs/CRYPTO_CONTRACT.md), and only when this device has
+/// applied every one of them (see `pimble_rpc::VaultCursor`).
 const SNAPSHOT_EVERY: u64 = 200;
+/// `ProgressFile::cursor_version` once a replica's cursors are gap-aware. A
+/// file below it (or none) was written when `sync.json`'s `last_seq` meant "the
+/// highest number seen", which may sit beyond an entry that never arrived; one
+/// full refetch of every document settles it.
+const CURSOR_VERSION: u32 = 1;
 /// A reconnect's catch-up push is one blob per document; the hosted server
 /// refuses a blob over 4 MiB, and one refused blob must not take the link down.
 const MAX_CATCH_UP_BLOB: usize = 3 * 1024 * 1024;
@@ -365,12 +372,23 @@ struct ProgressFile {
     dirty: BTreeSet<String>,
     #[serde(default)]
     dirty_all: bool,
+    #[serde(default)]
+    cursor_version: u32,
 }
 
 struct Progress {
     path: Option<PathBuf>,
     file: ProgressFile,
     unsaved: bool,
+    /// How far into each document's log this device has read without a gap.
+    /// Rebuilt at every reconcile from `sync.json`'s `last_seq`, which holds
+    /// exactly `VaultCursor::applied_through` (a restart loses only the
+    /// entries noted beyond a gap, which are fetched again and merge to
+    /// nothing).
+    cursors: HashMap<String, VaultCursor>,
+    /// Each document's snapshot number as last known, for deciding when the
+    /// next one is due.
+    snapshot_seqs: HashMap<String, u64>,
 }
 
 impl Progress {
@@ -395,7 +413,20 @@ impl Progress {
             },
             None => ProgressFile::default(),
         };
-        Self { path, file, unsaved: false }
+        Self { path, file, unsaved: false, cursors: HashMap::new(), snapshot_seqs: HashMap::new() }
+    }
+
+    fn cursor(&mut self, doc_id: &VaultDocId) -> &mut VaultCursor {
+        self.cursors.entry(doc_id.as_str()).or_default()
+    }
+
+    fn snapshot_seq(&self, doc_id: &VaultDocId) -> u64 {
+        self.snapshot_seqs.get(&doc_id.as_str()).copied().unwrap_or(0)
+    }
+
+    fn note_snapshot(&mut self, doc_id: &VaultDocId, seq: u64) {
+        let held = self.snapshot_seqs.entry(doc_id.as_str()).or_insert(0);
+        *held = (*held).max(seq);
     }
 
     /// The state vector the remote is known to hold for `doc_id` (empty when
@@ -534,12 +565,12 @@ async fn read_last_seq(handler: &RpcHandler, store_id: StoreId, doc_id: &VaultDo
     }
 }
 
-/// Record `seq` as the last-applied sequence for `doc_id`, if it advances
-/// what's already there (never regresses it, so an out-of-order live
-/// notification racing a reconcile can't undo progress). Best effort: a
-/// store closed or unlinked under us, or a write failure, is logged, never
-/// propagated (bookkeeping, not part of the protocol).
-async fn record_last_seq(handler: &RpcHandler, store_id: StoreId, doc_id: &VaultDocId, seq: u64) {
+/// Record how far `doc_id`'s log has been read without a gap
+/// (`VaultCursor::applied_through`), which is where the next connect fetches
+/// from. Best effort: a store closed or unlinked under us, or a write
+/// failure, is logged, never propagated (bookkeeping, not part of the
+/// protocol).
+async fn record_last_seq(handler: &RpcHandler, store_id: StoreId, doc_id: &VaultDocId, applied_through: u64) {
     let manager = handler.store_manager_handle();
     let manager = manager.read().await;
     let mut config = match manager.read_sync_config(store_id).await {
@@ -551,10 +582,10 @@ async fn record_last_seq(handler: &RpcHandler, store_id: StoreId, doc_id: &Vault
         }
     };
     let key = doc_id.as_str();
-    if config.last_seq.get(&key).copied().unwrap_or(0) >= seq {
+    if config.last_seq.get(&key).copied().unwrap_or(0) == applied_through {
         return;
     }
-    config.last_seq.insert(key, seq);
+    config.last_seq.insert(key, applied_through);
     if let Err(e) = manager.write_sync_config(store_id, &config).await {
         warn!("Could not record last_seq for store {} doc {:?}: {}", store_id, doc_id, e);
     }
@@ -579,6 +610,20 @@ async fn full_reconcile(
     echoes: &Arc<EchoTracker>,
 ) -> anyhow::Result<()> {
     let remote_docs = client.vault_list_docs(store_id).await.map_err(|e| anyhow::anyhow!("remote vaultListDocs failed: {}", e))?;
+
+    // Where each document's log has been read to. A replica whose `last_seq`
+    // predates gap-aware cursors reads everything once more from the start
+    // (a merge repeated is nothing; an entry skipped is lost).
+    let refetch_all = progress.file.cursor_version < CURSOR_VERSION;
+    if refetch_all {
+        info!("Vault link for store {}: reading every document's log once from the start", store_id);
+    }
+    progress.cursors.clear();
+    for doc in &remote_docs {
+        let applied_through = if refetch_all { 0 } else { read_last_seq(handler, store_id, &doc.doc_id).await };
+        progress.cursors.insert(doc.doc_id.as_str(), VaultCursor::starting_at(applied_through));
+        progress.note_snapshot(&doc.doc_id, doc.snapshot_seq);
+    }
     let remote_heads: HashMap<VaultDocId, u64> = remote_docs.into_iter().map(|d| (d.doc_id, d.head)).collect();
 
     if remote_heads.contains_key(&VaultDocId::Tree) {
@@ -616,36 +661,45 @@ async fn full_reconcile(
             );
             continue;
         }
-        append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, &diff, echoes).await?;
+        append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, &diff, echoes, progress).await?;
         progress.set_known(&doc_id, &local_sv);
         progress.clear_dirty(&doc_id);
     }
     progress.clear_all_dirty();
+    if progress.file.cursor_version != CURSOR_VERSION {
+        progress.file.cursor_version = CURSOR_VERSION;
+        progress.unsaved = true;
+    }
     progress.save_if_unsaved().await;
 
     Ok(())
 }
 
-/// Fetch and apply everything `doc_id` has beyond its remembered `last_seq`.
+/// Fetch and apply everything `doc_id` has beyond what this device has read
+/// without a gap. Only what was applied moves the cursor: a blob that would not
+/// decrypt stays in front of it, to be asked for again.
 async fn pull_doc(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, doc_id: &VaultDocId, link_id: &str, progress: &mut Progress) -> anyhow::Result<()> {
-    let after_seq = read_last_seq(handler, store_id, doc_id).await;
+    let after_seq = progress.cursor(doc_id).applied_through();
     let fetch = client
         .vault_fetch(store_id, doc_id.clone(), after_seq)
         .await
         .map_err(|e| anyhow::anyhow!("remote vaultFetch for {:?} failed: {}", doc_id, e))?;
 
     if let Some(entry) = &fetch.snapshot {
+        progress.note_snapshot(doc_id, entry.seq);
         if let Some(update) = apply_blob_locally(handler, store_id, doc_id, &entry.blob, link_id).await? {
             progress.advance(doc_id, &update);
+            progress.cursor(doc_id).mark_through(entry.seq);
         }
-        record_last_seq(handler, store_id, doc_id, entry.seq).await;
     }
     for entry in &fetch.updates {
         if let Some(update) = apply_blob_locally(handler, store_id, doc_id, &entry.blob, link_id).await? {
             progress.advance(doc_id, &update);
+            progress.cursor(doc_id).mark(entry.seq);
         }
-        record_last_seq(handler, store_id, doc_id, entry.seq).await;
     }
+    let applied_through = progress.cursor(doc_id).applied_through();
+    record_last_seq(handler, store_id, doc_id, applied_through).await;
     Ok(())
 }
 
@@ -735,10 +789,12 @@ async fn handle_remote_notification(
     // reliably the highest.
     if notif.source_client_id.as_deref() == Some(link_id) {
         debug!("Vault link for store {} doc {:?}: dropping our own echoed append by id (seq {})", store_id, doc_id, seq);
+        progress.cursor(doc_id).mark(*seq);
         return Ok(());
     }
     if echoes.take_if_present(doc_id, *seq) {
         debug!("Vault link for store {} doc {:?}: dropping our own echoed append by seq (seq {})", store_id, doc_id, seq);
+        progress.cursor(doc_id).mark(*seq);
         return Ok(());
     }
 
@@ -748,8 +804,10 @@ async fn handle_remote_notification(
     };
     if let Some(update) = apply_blob_locally(handler, store_id, doc_id, blob, link_id).await? {
         progress.advance(doc_id, &update);
+        progress.cursor(doc_id).mark(*seq);
     }
-    record_last_seq(handler, store_id, doc_id, *seq).await;
+    let applied_through = progress.cursor(doc_id).applied_through();
+    record_last_seq(handler, store_id, doc_id, applied_through).await;
     Ok(())
 }
 
@@ -825,6 +883,7 @@ async fn append_blob(
     link_id: &str,
     plaintext: &[u8],
     echoes: &Arc<EchoTracker>,
+    progress: &mut Progress,
 ) -> anyhow::Result<()> {
     let Some(key) = handler.keystore().store_key(store_id, key_id).await else {
         return Err(anyhow::anyhow!("no local key held for store {} key id {}; cannot encrypt an outgoing update", store_id, key_id));
@@ -843,11 +902,20 @@ async fn append_blob(
         .await
         .map_err(|e| anyhow::anyhow!("remote vaultAppend for {:?} failed: {}", doc_id, e))?;
     echoes.remember(&doc_id, seq);
-    record_last_seq(handler, store_id, &doc_id, seq).await;
+    progress.cursor(&doc_id).mark(seq);
+    let applied_through = progress.cursor(&doc_id).applied_through();
+    record_last_seq(handler, store_id, &doc_id, applied_through).await;
     debug!("Vault link for store {} pushed doc {:?} update (seq {})", store_id, doc_id, seq);
 
-    if seq % SNAPSHOT_EVERY == 0 {
-        upload_snapshot(handler, client, store_id, doc_id, key_id, seq).await?;
+    // A snapshot deletes every log entry at or below its number, so it may
+    // only be stamped with a number this device has read *through*. Our own
+    // append being `seq` says nothing about another device's `seq - 1`, which
+    // may still be on its way here; until it lands `applied_through` stays
+    // below `seq` and the snapshot waits for a later append.
+    let due = seq.saturating_sub(progress.snapshot_seq(&doc_id)) >= SNAPSHOT_EVERY;
+    if due && applied_through == seq {
+        upload_snapshot(handler, client, store_id, doc_id.clone(), key_id, seq).await?;
+        progress.note_snapshot(&doc_id, seq);
     }
     Ok(())
 }
@@ -865,7 +933,7 @@ async fn push_update(
     echoes: &Arc<EchoTracker>,
     progress: &mut Progress,
 ) -> anyhow::Result<()> {
-    append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, plaintext, echoes).await?;
+    append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, plaintext, echoes, progress).await?;
     progress.advance(&doc_id, plaintext);
     Ok(())
 }
@@ -885,7 +953,7 @@ async fn push_full(
     progress: &mut Progress,
 ) -> anyhow::Result<()> {
     let (local_sv, state) = doc_diff(handler, store_id, &doc_id, &pimble_crdt::empty_state_vector()).await?;
-    append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, &state, echoes).await?;
+    append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, &state, echoes, progress).await?;
     progress.set_known(&doc_id, &local_sv);
     progress.clear_dirty(&doc_id);
     Ok(())

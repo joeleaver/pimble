@@ -285,7 +285,11 @@ store-name question). Pimble Cloud holds ciphertext only.
 - **Vault stores** (`Store.kind = vault`): no StoreDocument, ContentDoc or index on the
   server; per document an append-only log plus a snapshot under `<store>/vault/{doc}/`;
   RPCs `vaultAppend/Fetch/Snapshot/ListDocs` (reader/editor), `VaultAppended`
-  notifications carry the blob; every other store-scoped RPC answers `-32005`; `createStore`
+  notifications carry the blob; a snapshot deletes every log entry at or below its
+  number, so it may only be stamped with `VaultCursor::applied_through` (every entry up
+  to it applied locally, never "my latest append"), its request says so
+  (`covers_prefix`; one without it is acknowledged and ignored), and a snapshot not newer
+  than the held one changes nothing; every other store-scoped RPC answers `-32005`; `createStore`
   takes `kind` and a chosen `store_id`. Limits: 4 MiB per blob, 64 MiB per log before
   `-32006 snapshot_required`.
 - **Accounts service**: users carry kdf parameters, public keys and the wrapped key blobs;

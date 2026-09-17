@@ -1011,6 +1011,9 @@ impl PimbleClient {
     }
 
     /// Store a snapshot covering every update up to and including `upto_seq`.
+    /// `upto_seq` must be a [`pimble_rpc::VaultCursor::applied_through`] value:
+    /// the server deletes every log entry at or below it, so the blob has to
+    /// reflect all of them. The request says so (`covers_prefix`).
     pub async fn vault_snapshot(
         &self,
         store_id: StoreId,
@@ -1019,7 +1022,7 @@ impl PimbleClient {
         blob: String,
     ) -> Result<()> {
         self.client
-            .vault_snapshot(VaultSnapshotRequest { store_id, doc_id, upto_seq, blob })
+            .vault_snapshot(VaultSnapshotRequest { store_id, doc_id, upto_seq, blob, covers_prefix: true })
             .await
             .map_err(rpc_error)?;
         Ok(())

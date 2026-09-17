@@ -108,6 +108,15 @@ pub struct VaultSnapshotRequest {
     /// The snapshot covers every update up to and including this seq.
     pub upto_seq: u64,
     pub blob: String,
+    /// The sender vouches that its document reflected **every** entry
+    /// `1..=upto_seq` when it made this blob (`VaultCursor::applied_through`),
+    /// not merely that `upto_seq` is the number of its own latest append. The
+    /// server deletes every log entry at or below `upto_seq`, so a snapshot
+    /// without this guarantee destroys whatever it lacks; one that does not
+    /// carry the flag (a client from before 2026-09-17) is acknowledged and
+    /// ignored.
+    #[serde(default)]
+    pub covers_prefix: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

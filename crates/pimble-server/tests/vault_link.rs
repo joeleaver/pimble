@@ -908,6 +908,62 @@ async fn a_snapshot_is_uploaded_after_200_updates_and_a_fresh_server_reads_it() 
     c.stop().await.unwrap();
 }
 
+/// A snapshot deletes every log entry at or below its number, so a device may
+/// only stamp one with a number it has read *through*. Until 2026-09-17 it used
+/// the number of its own latest append, whatever it had applied below that: an
+/// entry from another device that was still in flight, or that this device
+/// could not decrypt, was deleted from the server with no copy in the snapshot.
+/// Here the entry A cannot apply is one sealed with a key A does not hold; A
+/// then types well past the snapshot interval.
+#[tokio::test]
+async fn a_snapshot_never_covers_an_entry_this_device_did_not_apply() {
+    let env = spawn_env().await;
+    let (mut a, client_a, a_dir) = start_local_server().await;
+    client_a.cloud_sign_in(&env.stub_url, &env.email, &env.password).await.unwrap();
+    let (store_id, root_id) = client_a.create_store(a_dir.path().join("a.pimble"), "Shared").await.unwrap();
+    let doc_id = client_a.create_node(store_id, Some(root_id), "document", "Doc").await.unwrap();
+    seed_content(&client_a, store_id, doc_id, "seed", "seeded").await;
+    client_a.cloud_host_store(store_id).await.unwrap();
+
+    let doc_key = VaultDocId::Node(doc_id);
+    let seeded = wait_until(Duration::from_secs(10), || async {
+        env.h_admin.vault_fetch(store_id, doc_key.clone(), 0).await.map(|f| f.head > 0).unwrap_or(false)
+    })
+    .await;
+    assert!(seeded);
+
+    let foreign_key = pimble_crypto::SymmetricKey::generate();
+    let aad = pimble_crypto::blob_aad(&store_id.to_string(), &doc_key.as_str());
+    let foreign = pimble_crypto::Blob::encrypt(&foreign_key, Uuid::new_v4(), &aad, b"another device's edit");
+    let foreign_seq = env
+        .h_admin
+        .vault_append_from(store_id, doc_key.clone(), URL_SAFE_NO_PAD.encode(&foreign), Some("another-device".to_string()))
+        .await
+        .expect("the other device's append is taken");
+
+    for i in 0..210 {
+        seed_content(&client_a, store_id, doc_id, "editor", &format!("edit {i}")).await;
+    }
+    let pushed = wait_until(Duration::from_secs(30), || async {
+        env.h_admin.vault_fetch(store_id, doc_key.clone(), 0).await.map(|f| f.head >= foreign_seq + 210).unwrap_or(false)
+    })
+    .await;
+    assert!(pushed, "A's edits reach the hosted log");
+    // Long enough for a snapshot upload to have happened if one were coming.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let docs = env.h_admin.vault_list_docs(store_id).await.unwrap();
+    let snapshot_seq = docs.iter().find(|d| d.doc_id == doc_key).map(|d| d.snapshot_seq).unwrap_or(0);
+    assert!(snapshot_seq < foreign_seq, "A must not snapshot past an entry it never applied (snapshot at {snapshot_seq}, entry {foreign_seq})");
+    let fetched = env.h_admin.vault_fetch(store_id, doc_key.clone(), 0).await.unwrap();
+    assert!(
+        fetched.updates.iter().any(|entry| entry.seq == foreign_seq),
+        "the other device's entry must still be in the hosted log"
+    );
+
+    a.stop().await.unwrap();
+}
+
 #[tokio::test]
 async fn restarting_a_server_resumes_the_vault_link_without_losing_or_duplicating_content() {
     let env = spawn_env().await;

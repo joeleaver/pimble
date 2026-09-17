@@ -136,6 +136,14 @@ Local-server RPCs, Service-only, called by the app: `cloudSignIn { url, email, p
 link). `AuthMethod::CloudSession { url, session }` is a new variant: the link mints a JWT
 through `POST /api/v1/token` before every connect.
 
+**Snapshot rule (added 2026-09-17).** `vaultSnapshot` deletes every log entry at or below
+`upto_seq`, so `upto_seq` must be a number the sender has read *through*: every entry
+`1..=upto_seq` applied to the document the blob was made from (`pimble_rpc::VaultCursor`).
+A sender's own latest append is not such a number: another device's append just below it
+may still be in flight. The request carries `covers_prefix: true` to say so; the server
+acknowledges and ignores one without it, and keeps the snapshot it holds over one that is
+not newer. The same cursor is where a client fetches from after a reconnect.
+
 `VaultLink` (`pimble-server/src/vault_link.rs`) replaces `SyncLink` for `mode: "vault"`:
 at start `vaultListDocs`, then `vaultFetch` per document from its `last_seq`, decrypt, and
 apply through `apply_edit`/`apply_store_update` with `client_id = "vault-link:<uuid>"`;

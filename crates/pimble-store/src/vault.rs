@@ -303,6 +303,16 @@ impl VaultStore {
                 "upto_seq {} is beyond document {}'s head {}", upto_seq, doc_id, doc.head
             )));
         }
+        // Not newer than the snapshot already held: keep that one. The log at
+        // or below it is gone, so replacing it with an older device's state
+        // would put a snapshot covering less in front of a log that no longer
+        // has the difference. Not an error: two devices racing to snapshot is
+        // ordinary, and the slower one has nothing to do.
+        if let Some((held, _)) = &doc.snapshot {
+            if *held >= upto_seq {
+                return Ok(());
+            }
+        }
 
         fs::create_dir_all(&doc.dir).await?;
         let mut snapshot_bytes = Vec::with_capacity(8 + blob.len());
@@ -390,6 +400,24 @@ mod tests {
         assert_eq!(snapshot, Some((2, b"snap-of-one-two".to_vec())));
         assert_eq!(updates, vec![(3, b"three".to_vec())]);
         assert_eq!(head, 3);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_not_newer_than_the_held_one_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = VaultStore::create(dir.path().join("v.pimble"), "V", None).await.unwrap();
+        for i in 0..6u8 {
+            store.append("doc", vec![i]).await.unwrap();
+        }
+        store.snapshot("doc", 4, b"newer".to_vec()).await.unwrap();
+        // A slower device, whose state is older, arrives second.
+        store.snapshot("doc", 2, b"older".to_vec()).await.unwrap();
+        store.snapshot("doc", 4, b"same seq, other device".to_vec()).await.unwrap();
+
+        let (snapshot, updates, head) = store.fetch("doc", 0).await.unwrap();
+        assert_eq!(snapshot, Some((4, b"newer".to_vec())));
+        assert_eq!(updates.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(), vec![5, 6]);
+        assert_eq!(head, 6);
     }
 
     #[tokio::test]
