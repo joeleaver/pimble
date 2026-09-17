@@ -52,11 +52,11 @@ rhypedb-query = { git = "https://github.com/joeleaver/rhypedb.git", branch = "ma
 # feature re-adds desktop, file-dialogs, clipboard, debug, collaboration; `web` uses
 # rinch-web), because the same UI library builds for the browser. Software rendering
 # (no `gpu`) avoids rinch's wgpu-fork patch.
-rinch-tabler-icons = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
-rinch-editor-core = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
+rinch-tabler-icons = { git = "https://github.com/joeleaver/rinch.git", branch = "fix/collab-remote-caret" }
+rinch-editor-core = { git = "https://github.com/joeleaver/rinch.git", branch = "fix/collab-remote-caret" }
 # Headless collab session (yrs projection of the editor model); pure Rust, no
 # platform deps, so the server and store can link it for text projection.
-rinch-editor-collab = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
+rinch-editor-collab = { git = "https://github.com/joeleaver/rinch.git", branch = "fix/collab-remote-caret" }
 
 # CRDT for node content: the same engine rinch's editor collaboration uses.
 yrs = "0.27"
