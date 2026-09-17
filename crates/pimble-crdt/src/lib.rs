@@ -16,3 +16,4 @@ pub use blocks::{blocks_from_plain_text, Align, Block, ListItem, Mark, Run};
 pub use content_doc::*;
 pub use error::*;
 pub use store_document::*;
+pub use sync_util::{advance_state_vector, empty_state_vector, state_vector_exceeds};

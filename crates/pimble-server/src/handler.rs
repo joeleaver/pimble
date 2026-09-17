@@ -2398,10 +2398,18 @@ impl PimbleApiServer for RpcHandler {
 
                 // Replace any existing link so it points at the new remote.
                 self.stop_link(request.store_id).await;
+                self.stop_vault_link(request.store_id).await;
+                crate::vault_link::forget_progress(self, request.store_id).await;
                 self.ensure_link_started(request.store_id, remote).await;
             }
             None => {
+                // Whichever kind of link the store has: until 2026-09-17 only
+                // the plain one was stopped, so "Unlink from Remote" on a
+                // hosted store left its vault link running against a
+                // `sync.json` that no longer existed.
                 self.stop_link(request.store_id).await;
+                self.stop_vault_link(request.store_id).await;
+                crate::vault_link::forget_progress(self, request.store_id).await;
                 let manager = self.store_manager.read().await;
                 manager.clear_sync_config(request.store_id).await.map_err(to_rpc_error)?;
                 drop(manager);

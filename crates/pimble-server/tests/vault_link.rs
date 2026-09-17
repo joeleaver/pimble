@@ -282,6 +282,57 @@ struct Env {
     h_admin: PimbleClient,
     h_stores_dir: PathBuf,
     _h_dir: tempfile::TempDir,
+    /// Every device's vault link reaches `H` through this, so a test can take
+    /// the network away and give it back.
+    relay: Relay,
+}
+
+/// A TCP relay in front of `H` that a test can cut: `cut()` drops every open
+/// connection and refuses new ones until `restore()`. Transparent otherwise.
+#[derive(Clone)]
+struct Relay {
+    addr: std::net::SocketAddr,
+    blocked: Arc<std::sync::atomic::AtomicBool>,
+    conns: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+}
+
+impl Relay {
+    async fn start(target: std::net::SocketAddr) -> Relay {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay = Relay {
+            addr: listener.local_addr().unwrap(),
+            blocked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            conns: Arc::new(Mutex::new(Vec::new())),
+        };
+        let this = relay.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut inbound, _)) = listener.accept().await else { break };
+                if this.blocked.load(std::sync::atomic::Ordering::SeqCst) {
+                    drop(inbound);
+                    continue;
+                }
+                let task = tokio::spawn(async move {
+                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+                this.conns.lock().unwrap().push(task.abort_handle());
+            }
+        });
+        relay
+    }
+
+    fn cut(&self) {
+        self.blocked.store(true, std::sync::atomic::Ordering::SeqCst);
+        for conn in self.conns.lock().unwrap().drain(..) {
+            conn.abort();
+        }
+    }
+
+    fn restore(&self) {
+        self.blocked.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl Env {
@@ -378,13 +429,14 @@ async fn spawn_env() -> Env {
         .await
         .expect("admin client connects to H");
 
+    let relay = Relay::start(h.addr()).await;
     {
         let mut s = state.lock().unwrap();
         s.h_client = Some(Arc::new(h_client));
-        s.h_rpc_url = format!("ws://{}", h.addr());
+        s.h_rpc_url = format!("ws://{}", relay.addr);
     }
 
-    Env { stub_url, email, password, _h: h, h_admin, h_stores_dir, _h_dir: h_dir }
+    Env { stub_url, email, password, _h: h, h_admin, h_stores_dir, _h_dir: h_dir, relay }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -489,6 +541,120 @@ async fn a_second_server_receives_content_and_a_reply_edit_reaches_the_first() {
     assert!(reached_a, "an edit on B must reach A through the hosted vault");
 
     a.stop().await.unwrap();
+    b.stop().await.unwrap();
+}
+
+/// Regression test (2026-09-17, Joe's desktop and the web app on one hosted
+/// store: the web's edits reached the desktop, the desktop's never reached the
+/// web). An edit made while the link is down was never pushed: a reconnect
+/// pulled what it had missed and pushed only documents the remote had never
+/// seen. Every later edit from that device depends on the missing one, so every
+/// other device holds them as pending and shows none of them, for good.
+#[tokio::test]
+async fn an_edit_made_while_the_link_is_down_reaches_the_other_device_after_reconnect() {
+    let env = spawn_env().await;
+
+    let (mut a, client_a, a_dir) = start_local_server().await;
+    client_a.cloud_sign_in(&env.stub_url, &env.email, &env.password).await.unwrap();
+    let (store_id, root_id) = client_a.create_store(a_dir.path().join("a.pimble"), "Shared").await.unwrap();
+    let doc_id = client_a.create_node(store_id, Some(root_id), "document", "Doc").await.unwrap();
+    seed_content(&client_a, store_id, doc_id, "seed", "seeded").await;
+    client_a.cloud_host_store(store_id).await.unwrap();
+
+    let (mut b, client_b, _b_dir) = start_local_server().await;
+    client_b.cloud_sign_in(&env.stub_url, &env.email, &env.password).await.unwrap();
+    let store_on_b = client_b.cloud_add_hosted_store(store_id).await.expect("B adds the hosted store");
+    let (_, b_children) = wait_children_nonempty(&client_b, store_id, store_on_b.root_node_id).await;
+    let b_doc_id = b_children[0].id;
+    let pulled = wait_until(Duration::from_secs(10), || async { node_text(&client_b, store_id, b_doc_id).await.contains("seeded") }).await;
+    assert!(pulled, "B starts with A's content");
+
+    // The network goes away; A keeps typing.
+    env.relay.cut();
+    let a_offline = wait_until(Duration::from_secs(10), || async {
+        !matches!(client_a.get_store_sync(store_id).await, Ok((_, pimble_core::SyncState::Synced { .. })))
+    })
+    .await;
+    assert!(a_offline, "A's link must notice the cut");
+    seed_content(&client_a, store_id, doc_id, "editor", "typed while offline").await;
+
+    // The network comes back; A types some more.
+    env.relay.restore();
+    let a_back = wait_until(Duration::from_secs(30), || async {
+        matches!(client_a.get_store_sync(store_id).await, Ok((_, pimble_core::SyncState::Synced { .. })))
+    })
+    .await;
+    assert!(a_back, "A's link must reconnect");
+    seed_content(&client_a, store_id, doc_id, "editor", "typed after reconnect").await;
+
+    let caught_up = wait_until(Duration::from_secs(30), || async {
+        let text = node_text(&client_b, store_id, b_doc_id).await;
+        text.contains("typed while offline") && text.contains("typed after reconnect")
+    })
+    .await;
+    assert!(
+        caught_up,
+        "B must end up with both of A's edits, got {:?}",
+        node_text(&client_b, store_id, b_doc_id).await
+    );
+
+    a.stop().await.unwrap();
+    b.stop().await.unwrap();
+}
+
+/// A replica that already lost edits under the old link (no `vault-link.json`,
+/// a local document ahead of the hosted log) heals on its next connect: with
+/// nothing recorded about the remote, the link pushes what the document holds.
+/// This is the state Joe's desktop was in on 2026-09-17.
+#[tokio::test]
+async fn a_replica_from_before_the_progress_file_pushes_what_the_remote_lacks() {
+    let env = spawn_env().await;
+
+    let (mut a, client_a, a_dir) = start_local_server().await;
+    client_a.cloud_sign_in(&env.stub_url, &env.email, &env.password).await.unwrap();
+    let a_path = a_dir.path().join("a.pimble");
+    let (store_id, root_id) = client_a.create_store(&a_path, "Shared").await.unwrap();
+    let doc_id = client_a.create_node(store_id, Some(root_id), "document", "Doc").await.unwrap();
+    seed_content(&client_a, store_id, doc_id, "seed", "seeded").await;
+    client_a.cloud_host_store(store_id).await.unwrap();
+
+    let (mut b, client_b, _b_dir) = start_local_server().await;
+    client_b.cloud_sign_in(&env.stub_url, &env.email, &env.password).await.unwrap();
+    let store_on_b = client_b.cloud_add_hosted_store(store_id).await.expect("B adds the hosted store");
+    let (_, b_children) = wait_children_nonempty(&client_b, store_id, store_on_b.root_node_id).await;
+    let b_doc_id = b_children[0].id;
+
+    // A edits with the network gone and is shut down before it comes back;
+    // then the record an old build never kept is taken away.
+    env.relay.cut();
+    let a_offline = wait_until(Duration::from_secs(10), || async {
+        !matches!(client_a.get_store_sync(store_id).await, Ok((_, pimble_core::SyncState::Synced { .. })))
+    })
+    .await;
+    assert!(a_offline);
+    seed_content(&client_a, store_id, doc_id, "editor", "lost by the old link").await;
+    tokio::time::sleep(Duration::from_millis(1000)).await; // the content flush debounce
+    a.stop().await.unwrap();
+    let _ = std::fs::remove_file(a_path.join("vault-link.json"));
+    env.relay.restore();
+
+    let dir = a_dir.path();
+    let mut a2 = PimbleServer::with_config(ServerConfig {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        keystore_path: Some(dir.join("keys.json")),
+        credentials_path: Some(dir.join("credentials.json")),
+        replicas_dir: Some(dir.join("replicas")),
+        ..Default::default()
+    });
+    a2.start().await.expect("restarted server starts");
+    let client_a2 = PimbleClient::connect(format!("http://{}", a2.addr())).await.unwrap();
+    client_a2.open_store(&a_path).await.expect("reopening the store succeeds");
+    assert!(node_text(&client_a2, store_id, doc_id).await.contains("lost by the old link"), "A kept its own edit");
+
+    let healed = wait_until(Duration::from_secs(30), || async { node_text(&client_b, store_id, b_doc_id).await.contains("lost by the old link") }).await;
+    assert!(healed, "B must receive the edit the old link never pushed, got {:?}", node_text(&client_b, store_id, b_doc_id).await);
+
+    a2.stop().await.unwrap();
     b.stop().await.unwrap();
 }
 

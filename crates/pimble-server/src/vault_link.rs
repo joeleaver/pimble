@@ -51,7 +51,8 @@
 //! signed-in account (or a mint failure) is treated like any other
 //! connection failure: `Offline`, retried with backoff.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -81,6 +82,11 @@ const TREE_PUSH_DEBOUNCE: Duration = Duration::from_millis(200);
 /// Upload a snapshot of a document whenever its head reaches a multiple of
 /// this many appended updates (docs/CRYPTO_CONTRACT.md).
 const SNAPSHOT_EVERY: u64 = 200;
+/// A reconnect's catch-up push is one blob per document; the hosted server
+/// refuses a blob over 4 MiB, and one refused blob must not take the link down.
+const MAX_CATCH_UP_BLOB: usize = 3 * 1024 * 1024;
+/// How often the live loop writes `vault-link.json` when it has changed.
+const PROGRESS_SAVE_EVERY: Duration = Duration::from_secs(5);
 
 /// A running vault link for one store, mirroring [`crate::sync_link::SyncLinkHandle`]'s API.
 pub struct VaultLinkHandle {
@@ -160,18 +166,51 @@ async fn set_state(handler: &RpcHandler, link: &LinkState, state: SyncState) {
 
 async fn run_loop(handler: RpcHandler, rpc_url: Url, key_id: Uuid, link_id: String, link: LinkState) {
     let store_id = link.store_id;
+    // Subscribed once, for the life of the task: a change made while the link
+    // is down still arrives here, which is how the link knows what to push
+    // once it is back (see `Progress`).
+    let mut local_rx = handler.subscribe_local_changes().await;
+    let mut progress = Progress::load(&handler, store_id).await;
     let mut backoff = INITIAL_BACKOFF;
     loop {
-        match connect_and_sync(&handler, &rpc_url, key_id, &link_id, &link).await {
-            Ok(()) => backoff = INITIAL_BACKOFF,
-            Err(e) => {
-                warn!("Vault link for store {} to {} dropped: {}", store_id, rpc_url, e);
-                set_state(&handler, &link, SyncState::Offline).await;
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
-            }
+        let mut reached_synced = false;
+        let result = connect_and_sync(&handler, &rpc_url, key_id, &link_id, &link, &mut local_rx, &mut progress, &mut reached_synced).await;
+        if reached_synced {
+            backoff = INITIAL_BACKOFF;
+        }
+        if let Err(e) = result {
+            warn!("Vault link for store {} to {} dropped: {}", store_id, rpc_url, e);
+            set_state(&handler, &link, SyncState::Offline).await;
+            note_local_changes_for(&mut local_rx, &mut progress, store_id, &link_id, backoff).await;
+            backoff = (backoff * 2).min(MAX_BACKOFF);
         }
     }
+}
+
+/// Wait out a backoff, recording which documents change locally meanwhile.
+async fn note_local_changes_for(
+    local_rx: &mut broadcast::Receiver<LocalChange>,
+    progress: &mut Progress,
+    store_id: StoreId,
+    link_id: &str,
+    wait: Duration,
+) {
+    let deadline = tokio::time::sleep(wait);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            change = local_rx.recv() => match change {
+                Ok(change) => progress.note(store_id, link_id, &change),
+                Err(broadcast::error::RecvError::Lagged(_)) => progress.mark_all_dirty(),
+                Err(broadcast::error::RecvError::Closed) => {
+                    (&mut deadline).await;
+                    break;
+                }
+            },
+        }
+    }
+    progress.save_if_unsaved().await;
 }
 
 /// Mint a fresh JWT from the currently signed-in account and connect to
@@ -194,25 +233,52 @@ async fn connect(handler: &RpcHandler, rpc_url: &Url) -> anyhow::Result<PimbleCl
         .map_err(|e| anyhow::anyhow!("{}", pimble_client::describe_connect_error(rpc_url, &e)))
 }
 
-async fn connect_and_sync(handler: &RpcHandler, rpc_url: &Url, key_id: Uuid, link_id: &str, link: &LinkState) -> anyhow::Result<()> {
+#[allow(clippy::too_many_arguments)]
+async fn connect_and_sync(
+    handler: &RpcHandler,
+    rpc_url: &Url,
+    key_id: Uuid,
+    link_id: &str,
+    link: &LinkState,
+    local_rx: &mut broadcast::Receiver<LocalChange>,
+    progress: &mut Progress,
+    reached_synced: &mut bool,
+) -> anyhow::Result<()> {
     let store_id = link.store_id;
     set_state(handler, link, SyncState::Syncing).await;
 
     let client = connect(handler, rpc_url).await?;
 
-    full_reconcile(handler, &client, store_id, key_id, link_id).await?;
-
+    // Subscribed before the reconcile, not after it: an append that lands
+    // between the pull and the subscription would otherwise be seen by
+    // neither. Anything the pull already applied arrives again here and
+    // merges to nothing.
     let mut remote_sub = client
         .subscribe_store_changes(store_id)
         .await
         .map_err(|e| anyhow::anyhow!("subscribe to {} storeChanged failed: {}", rpc_url, e))?;
-    let mut local_rx = handler.subscribe_local_changes().await;
+
+    // Whatever changed locally while no connection was up is not pushed as
+    // the deltas it arrived as (the link was not there to push them in
+    // order); the documents are marked and the reconcile pushes what the
+    // remote lacks of each.
+    loop {
+        match local_rx.try_recv() {
+            Ok(change) => progress.note(store_id, link_id, &change),
+            Err(broadcast::error::TryRecvError::Lagged(_)) => progress.mark_all_dirty(),
+            Err(_) => break,
+        }
+    }
 
     let echoes = Arc::new(EchoTracker::new());
+    full_reconcile(handler, &client, store_id, key_id, link_id, progress, &echoes).await?;
+
     let tree_debouncer = Arc::new(TreePushDebouncer::new());
     let (push_tx, mut push_rx) = mpsc::unbounded_channel::<()>();
+    let mut save_tick = tokio::time::interval(PROGRESS_SAVE_EVERY);
 
     set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
+    *reached_synced = true;
     info!("Vault link for store {} connected to {}", store_id, rpc_url);
 
     loop {
@@ -220,7 +286,7 @@ async fn connect_and_sync(handler: &RpcHandler, rpc_url: &Url, key_id: Uuid, lin
             item = remote_sub.next() => {
                 match item {
                     Some(Ok(notif)) => {
-                        handle_remote_notification(handler, store_id, link_id, notif, &echoes).await?;
+                        handle_remote_notification(handler, store_id, link_id, notif, &echoes, progress).await?;
                         set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
                     }
                     Some(Err(e)) => return Err(anyhow::anyhow!("remote notification decode error: {}", e)),
@@ -230,10 +296,21 @@ async fn connect_and_sync(handler: &RpcHandler, rpc_url: &Url, key_id: Uuid, lin
             change = local_rx.recv() => {
                 match change {
                     Ok(local_change) => {
-                        forward_local_change(handler, &client, store_id, key_id, link_id, local_change, &tree_debouncer, &push_tx, &echoes).await?;
+                        let doc = changed_doc(store_id, link_id, &local_change);
+                        if let Err(e) = forward_local_change(handler, &client, store_id, key_id, link_id, local_change, &tree_debouncer, &push_tx, &echoes, progress).await {
+                            // Taken off the channel and not delivered: the
+                            // next reconcile has to carry it.
+                            if let Some(doc) = doc {
+                                progress.mark_dirty(&doc);
+                            }
+                            progress.save_if_unsaved().await;
+                            return Err(e);
+                        }
                         set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
+                        progress.mark_all_dirty();
+                        progress.save_if_unsaved().await;
                         return Err(anyhow::anyhow!("missed {} local notifications (broadcast lag); reconnecting to reconcile", n));
                     }
                     Err(broadcast::error::RecvError::Closed) => {
@@ -244,13 +321,202 @@ async fn connect_and_sync(handler: &RpcHandler, rpc_url: &Url, key_id: Uuid, lin
             trigger = push_rx.recv() => {
                 match trigger {
                     Some(()) => {
-                        push_full(handler, &client, store_id, VaultDocId::Tree, key_id, link_id, &echoes).await?;
+                        push_full(handler, &client, store_id, VaultDocId::Tree, key_id, link_id, &echoes, progress).await?;
                         set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
                     }
                     None => return Err(anyhow::anyhow!("internal tree-push channel closed")),
                 }
             }
+            _ = save_tick.tick() => {
+                progress.save_if_unsaved().await;
+            }
         }
+    }
+}
+
+// ── What the remote is known to hold ────────────────────────────────────
+//
+// The hosted twin stores ciphertext: it has no state vector to answer with,
+// so "what does the remote lack?" cannot be asked of it the way a plain sync
+// link asks. The link keeps the answer itself, per document, in
+// `<store>/vault-link.json`:
+//
+// - `pushed_sv`: a state vector everything up to which is known to be on the
+//   remote. It advances with every update this link appends or pulls, and only
+//   when the update continues from what is already known
+//   (`pimble_crdt::advance_state_vector`), so it can lag but never overstate.
+//   A lagging vector costs a slightly larger catch-up push; an overstated one
+//   would skip structs for good.
+// - `dirty`: documents that changed locally while no connection was up, or
+//   whose push failed. Needed beside the state vector because a deletion moves
+//   no clock: a document edited only by deleting looks identical by vector.
+//
+// Until 2026-09-17 a reconnect pulled what it had missed and pushed only
+// documents the remote had never seen, so an edit made while the link was down
+// (a hosted-server restart is enough) never left the machine. Every later edit
+// from that device depends on it, and every other device held those as pending
+// and showed none of them: the desktop's typing never reached the web app.
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct ProgressFile {
+    #[serde(default)]
+    pushed_sv: HashMap<String, String>,
+    #[serde(default)]
+    dirty: BTreeSet<String>,
+    #[serde(default)]
+    dirty_all: bool,
+}
+
+struct Progress {
+    path: Option<PathBuf>,
+    file: ProgressFile,
+    unsaved: bool,
+}
+
+impl Progress {
+    const FILE_NAME: &'static str = "vault-link.json";
+
+    async fn load(handler: &RpcHandler, store_id: StoreId) -> Self {
+        let path = {
+            let manager = handler.store_manager_handle();
+            let manager = manager.read().await;
+            manager
+                .get_store_info(store_id)
+                .ok()
+                .and_then(|store| store.local_path().map(|p| p.join(Self::FILE_NAME)))
+        };
+        let file = match &path {
+            Some(path) => match tokio::fs::read_to_string(path).await {
+                Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
+                    warn!("Vault link for store {}: unreadable {} ({}); starting over", store_id, Self::FILE_NAME, e);
+                    ProgressFile::default()
+                }),
+                Err(_) => ProgressFile::default(),
+            },
+            None => ProgressFile::default(),
+        };
+        Self { path, file, unsaved: false }
+    }
+
+    /// The state vector the remote is known to hold for `doc_id` (empty when
+    /// nothing is recorded: a replica from before this file existed pushes
+    /// each document's whole state once, which is also what heals one whose
+    /// earlier edits never left).
+    fn known(&self, doc_id: &VaultDocId) -> Vec<u8> {
+        self.file
+            .pushed_sv
+            .get(&doc_id.as_str())
+            .and_then(|b64| STANDARD.decode(b64).ok())
+            .unwrap_or_else(pimble_crdt::empty_state_vector)
+    }
+
+    fn set_known(&mut self, doc_id: &VaultDocId, state_vector: &[u8]) {
+        let encoded = STANDARD.encode(state_vector);
+        if self.file.pushed_sv.get(&doc_id.as_str()) != Some(&encoded) {
+            self.file.pushed_sv.insert(doc_id.as_str(), encoded);
+            self.unsaved = true;
+        }
+    }
+
+    /// `update` is on the remote (this link appended it, or pulled it).
+    fn advance(&mut self, doc_id: &VaultDocId, update: &[u8]) {
+        match pimble_crdt::advance_state_vector(&self.known(doc_id), update) {
+            Ok(state_vector) => self.set_known(doc_id, &state_vector),
+            Err(e) => debug!("Vault link: could not advance the known state of {:?}: {}", doc_id, e),
+        }
+    }
+
+    fn is_dirty(&self, doc_id: &VaultDocId) -> bool {
+        self.file.dirty_all || self.file.dirty.contains(&doc_id.as_str())
+    }
+
+    fn mark_dirty(&mut self, doc_id: &VaultDocId) {
+        if self.file.dirty.insert(doc_id.as_str()) {
+            self.unsaved = true;
+        }
+    }
+
+    fn mark_all_dirty(&mut self) {
+        if !self.file.dirty_all {
+            self.file.dirty_all = true;
+            self.unsaved = true;
+        }
+    }
+
+    fn clear_dirty(&mut self, doc_id: &VaultDocId) {
+        if self.file.dirty.remove(&doc_id.as_str()) {
+            self.unsaved = true;
+        }
+    }
+
+    fn clear_all_dirty(&mut self) {
+        if self.file.dirty_all || !self.file.dirty.is_empty() {
+            self.file.dirty_all = false;
+            self.file.dirty.clear();
+            self.unsaved = true;
+        }
+    }
+
+    /// Record a local change seen while no connection could carry it.
+    fn note(&mut self, store_id: StoreId, link_id: &str, change: &LocalChange) {
+        if let Some(doc_id) = changed_doc(store_id, link_id, change) {
+            self.mark_dirty(&doc_id);
+        }
+    }
+
+    /// Best effort, like `record_last_seq`: bookkeeping, never fatal.
+    async fn save_if_unsaved(&mut self) {
+        if !self.unsaved {
+            return;
+        }
+        let Some(path) = &self.path else { return };
+        let json = match serde_json::to_string(&self.file) {
+            Ok(json) => json,
+            Err(e) => {
+                warn!("Vault link: could not encode {}: {}", Self::FILE_NAME, e);
+                return;
+            }
+        };
+        let tmp = path.with_extension("json.tmp");
+        let written = async {
+            tokio::fs::write(&tmp, json).await?;
+            tokio::fs::rename(&tmp, path).await
+        }
+        .await;
+        match written {
+            Ok(()) => self.unsaved = false,
+            Err(e) => debug!("Vault link: could not write {}: {}", path.display(), e),
+        }
+    }
+}
+
+/// Forget what the remote was known to hold: the store is no longer linked to
+/// that twin, and a record kept for one remote would overstate what another
+/// holds. Called when a store is unlinked or linked elsewhere.
+pub(crate) async fn forget_progress(handler: &RpcHandler, store_id: StoreId) {
+    let progress = Progress::load(handler, store_id).await;
+    if let Some(path) = progress.path {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+}
+
+/// Which vault document a local change touches, if it is one this link would
+/// push: this store's, and not this link's own apply coming back around.
+fn changed_doc(store_id: StoreId, link_id: &str, change: &LocalChange) -> Option<VaultDocId> {
+    let LocalChange::Store(notif) = change else { return None };
+    if notif.store_id != store_id || notif.source_client_id.as_deref() == Some(link_id) {
+        return None;
+    }
+    match &notif.change_kind {
+        StoreChangeKind::ContentUpdated { node_id } => Some(VaultDocId::Node(*node_id)),
+        StoreChangeKind::TreeStructure { .. }
+        | StoreChangeKind::NodeCreated { .. }
+        | StoreChangeKind::NodeDeleted { .. }
+        | StoreChangeKind::NodeMoved { .. }
+        | StoreChangeKind::MetadataUpdated { .. } => Some(VaultDocId::Tree),
+        StoreChangeKind::VaultAppended { .. }
+        | StoreChangeKind::SyncStateChanged { .. }
+        | StoreChangeKind::MountStateChanged { .. } => None,
     }
 }
 
@@ -297,17 +563,26 @@ async fn record_last_seq(handler: &RpcHandler, store_id: StoreId, doc_id: &Vault
 // ── Full reconcile (link start) ──────────────────────────────────────────
 
 /// Pull every document the remote already lists (tree first, so node ids it
-/// names are known locally before their content is applied), then push the
-/// current full state of every local document (the tree, and every node id
-/// the now-current local tree names) the remote doesn't have yet — the
-/// seeding step `cloudHostStore` depends on to upload a store's pre-existing
-/// content.
-async fn full_reconcile(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, key_id: Uuid, link_id: &str) -> anyhow::Result<()> {
+/// names are known locally before their content is applied), then push, for
+/// the tree and every node the now-current local tree names, whatever the
+/// remote lacks: the whole document when the remote has never seen it (the
+/// seeding step `cloudHostStore` depends on), otherwise the diff since the
+/// state the remote is known to hold, for a document that is ahead of it or
+/// that changed while the link was down (see `Progress`).
+async fn full_reconcile(
+    handler: &RpcHandler,
+    client: &PimbleClient,
+    store_id: StoreId,
+    key_id: Uuid,
+    link_id: &str,
+    progress: &mut Progress,
+    echoes: &Arc<EchoTracker>,
+) -> anyhow::Result<()> {
     let remote_docs = client.vault_list_docs(store_id).await.map_err(|e| anyhow::anyhow!("remote vaultListDocs failed: {}", e))?;
     let remote_heads: HashMap<VaultDocId, u64> = remote_docs.into_iter().map(|d| (d.doc_id, d.head)).collect();
 
     if remote_heads.contains_key(&VaultDocId::Tree) {
-        pull_doc(handler, client, store_id, &VaultDocId::Tree, link_id).await?;
+        pull_doc(handler, client, store_id, &VaultDocId::Tree, link_id, progress).await?;
     }
 
     let node_ids: Vec<NodeId> = {
@@ -318,28 +593,41 @@ async fn full_reconcile(handler: &RpcHandler, client: &PimbleClient, store_id: S
     for node_id in &node_ids {
         let doc_id = VaultDocId::Node(*node_id);
         if remote_heads.contains_key(&doc_id) {
-            pull_doc(handler, client, store_id, &doc_id, link_id).await?;
+            pull_doc(handler, client, store_id, &doc_id, link_id, progress).await?;
         }
     }
 
-    // Seed anything the remote has never seen. No live subscription is
-    // active yet during a full reconcile, so a disposable echo tracker is
-    // fine here (nothing to echo against until `connect_and_sync` subscribes).
-    if remote_heads.get(&VaultDocId::Tree).copied().unwrap_or(0) == 0 {
-        push_full(handler, client, store_id, VaultDocId::Tree, key_id, link_id, &Arc::new(EchoTracker::new())).await?;
-    }
-    for node_id in &node_ids {
-        let doc_id = VaultDocId::Node(*node_id);
-        if remote_heads.get(&doc_id).copied().unwrap_or(0) == 0 {
-            push_full(handler, client, store_id, doc_id, key_id, link_id, &Arc::new(EchoTracker::new())).await?;
+    let mut doc_ids = vec![VaultDocId::Tree];
+    doc_ids.extend(node_ids.iter().map(|id| VaultDocId::Node(*id)));
+    for doc_id in doc_ids {
+        let unseen = remote_heads.get(&doc_id).copied().unwrap_or(0) == 0;
+        let known = if unseen { pimble_crdt::empty_state_vector() } else { progress.known(&doc_id) };
+        let (local_sv, diff) = doc_diff(handler, store_id, &doc_id, &known).await?;
+        // An undecodable vector reads as "ahead": pushing too much is a
+        // merge to nothing, pushing too little is a lost edit.
+        let ahead = pimble_crdt::state_vector_exceeds(&local_sv, &known).unwrap_or(true);
+        if !(unseen || ahead || progress.is_dirty(&doc_id)) {
+            continue;
         }
+        if diff.len() > MAX_CATCH_UP_BLOB {
+            warn!(
+                "Vault link for store {} doc {:?}: a catch-up push of {} bytes is over the blob limit; leaving it for live updates",
+                store_id, doc_id, diff.len()
+            );
+            continue;
+        }
+        append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, &diff, echoes).await?;
+        progress.set_known(&doc_id, &local_sv);
+        progress.clear_dirty(&doc_id);
     }
+    progress.clear_all_dirty();
+    progress.save_if_unsaved().await;
 
     Ok(())
 }
 
 /// Fetch and apply everything `doc_id` has beyond its remembered `last_seq`.
-async fn pull_doc(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, doc_id: &VaultDocId, link_id: &str) -> anyhow::Result<()> {
+async fn pull_doc(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, doc_id: &VaultDocId, link_id: &str, progress: &mut Progress) -> anyhow::Result<()> {
     let after_seq = read_last_seq(handler, store_id, doc_id).await;
     let fetch = client
         .vault_fetch(store_id, doc_id.clone(), after_seq)
@@ -347,11 +635,15 @@ async fn pull_doc(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId
         .map_err(|e| anyhow::anyhow!("remote vaultFetch for {:?} failed: {}", doc_id, e))?;
 
     if let Some(entry) = &fetch.snapshot {
-        apply_blob_locally(handler, store_id, doc_id, &entry.blob, link_id).await?;
+        if let Some(update) = apply_blob_locally(handler, store_id, doc_id, &entry.blob, link_id).await? {
+            progress.advance(doc_id, &update);
+        }
         record_last_seq(handler, store_id, doc_id, entry.seq).await;
     }
     for entry in &fetch.updates {
-        apply_blob_locally(handler, store_id, doc_id, &entry.blob, link_id).await?;
+        if let Some(update) = apply_blob_locally(handler, store_id, doc_id, &entry.blob, link_id).await? {
+            progress.advance(doc_id, &update);
+        }
         record_last_seq(handler, store_id, doc_id, entry.seq).await;
     }
     Ok(())
@@ -362,7 +654,10 @@ async fn pull_doc(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId
 /// failure is logged and skipped, never fatal to the link
 /// (docs/CRYPTO_CONTRACT.md: "a blob with an unknown key id is logged and
 /// skipped").
-async fn apply_blob_locally(handler: &RpcHandler, store_id: StoreId, doc_id: &VaultDocId, blob_b64url: &str, link_id: &str) -> anyhow::Result<()> {
+///
+/// Returns the decrypted update when it was applied, `None` when the blob was
+/// skipped, so the caller can record that the remote holds it.
+async fn apply_blob_locally(handler: &RpcHandler, store_id: StoreId, doc_id: &VaultDocId, blob_b64url: &str, link_id: &str) -> anyhow::Result<Option<Vec<u8>>> {
     let blob = URL_SAFE_NO_PAD
         .decode(blob_b64url)
         .map_err(|e| anyhow::anyhow!("blob for {:?} is not valid base64url: {}", doc_id, e))?;
@@ -371,12 +666,12 @@ async fn apply_blob_locally(handler: &RpcHandler, store_id: StoreId, doc_id: &Va
         Ok(id) => id,
         Err(e) => {
             warn!("Vault link for store {} doc {:?}: malformed blob header ({}); skipping it", store_id, doc_id, e);
-            return Ok(());
+            return Ok(None);
         }
     };
     let Some(key) = handler.keystore().store_key(store_id, key_id).await else {
         warn!("Vault link for store {} doc {:?}: no key held for key id {}; skipping this blob", store_id, doc_id, key_id);
-        return Ok(());
+        return Ok(None);
     };
 
     let aad = pimble_crypto::blob_aad(&store_id.to_string(), &doc_id.as_str());
@@ -384,7 +679,7 @@ async fn apply_blob_locally(handler: &RpcHandler, store_id: StoreId, doc_id: &Va
         Ok(bytes) => bytes,
         Err(e) => {
             warn!("Vault link for store {} doc {:?}: decryption failed ({}); skipping this blob", store_id, doc_id, e);
-            return Ok(());
+            return Ok(None);
         }
     };
 
@@ -409,7 +704,7 @@ async fn apply_blob_locally(handler: &RpcHandler, store_id: StoreId, doc_id: &Va
                 .map_err(|e| anyhow::anyhow!("local applyEdit failed: {}", e))?;
         }
     }
-    Ok(())
+    Ok(Some(plaintext))
 }
 
 // ── Remote -> local (live) ───────────────────────────────────────────────
@@ -420,6 +715,7 @@ async fn handle_remote_notification(
     link_id: &str,
     notif: StoreChangedNotification,
     echoes: &Arc<EchoTracker>,
+    progress: &mut Progress,
 ) -> anyhow::Result<()> {
     let StoreChangeKind::VaultAppended { doc_id, seq } = &notif.change_kind else {
         // A vault store only ever produces `VaultAppended`; anything else
@@ -450,13 +746,16 @@ async fn handle_remote_notification(
         warn!("Vault link for store {} doc {:?}: VaultAppended with no blob; skipping", store_id, doc_id);
         return Ok(());
     };
-    apply_blob_locally(handler, store_id, doc_id, blob, link_id).await?;
+    if let Some(update) = apply_blob_locally(handler, store_id, doc_id, blob, link_id).await? {
+        progress.advance(doc_id, &update);
+    }
     record_last_seq(handler, store_id, doc_id, *seq).await;
     Ok(())
 }
 
 // ── Local -> remote (live) ────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_local_change(
     handler: &RpcHandler,
     client: &PimbleClient,
@@ -467,6 +766,7 @@ async fn forward_local_change(
     tree_debouncer: &Arc<TreePushDebouncer>,
     push_tx: &mpsc::UnboundedSender<()>,
     echoes: &Arc<EchoTracker>,
+    progress: &mut Progress,
 ) -> anyhow::Result<()> {
     let LocalChange::Store(notif) = change else {
         return Ok(());
@@ -484,22 +784,25 @@ async fn forward_local_change(
     match (&notif.change_kind, &notif.update) {
         (StoreChangeKind::ContentUpdated { node_id }, Some(changes_b64)) => {
             let plaintext = STANDARD.decode(changes_b64)?;
-            push_update(handler, client, store_id, VaultDocId::Node(*node_id), key_id, link_id, &plaintext, echoes).await?;
+            push_update(handler, client, store_id, VaultDocId::Node(*node_id), key_id, link_id, &plaintext, echoes, progress).await?;
         }
         (StoreChangeKind::ContentUpdated { node_id }, None) => {
             // A full-snapshot content replacement (`updateNodeContent`): no
             // delta to reuse, push the node's current full state instead.
-            push_full(handler, client, store_id, VaultDocId::Node(*node_id), key_id, link_id, echoes).await?;
+            push_full(handler, client, store_id, VaultDocId::Node(*node_id), key_id, link_id, echoes, progress).await?;
         }
         (StoreChangeKind::TreeStructure { .. }, Some(update_b64)) => {
             let plaintext = STANDARD.decode(update_b64)?;
-            push_update(handler, client, store_id, VaultDocId::Tree, key_id, link_id, &plaintext, echoes).await?;
+            push_update(handler, client, store_id, VaultDocId::Tree, key_id, link_id, &plaintext, echoes, progress).await?;
         }
         (StoreChangeKind::NodeCreated { .. }, _)
         | (StoreChangeKind::NodeDeleted { .. }, _)
         | (StoreChangeKind::NodeMoved { .. }, _)
         | (StoreChangeKind::MetadataUpdated { .. }, _)
         | (StoreChangeKind::TreeStructure { .. }, None) => {
+            // Pushed after a debounce: should the link drop first, the
+            // reconcile carries it.
+            progress.mark_dirty(&VaultDocId::Tree);
             schedule_tree_push(tree_debouncer, push_tx);
         }
         (StoreChangeKind::VaultAppended { .. }, _)
@@ -512,7 +815,8 @@ async fn forward_local_change(
 /// Encrypt `plaintext` and append it to `doc_id`'s vault log, recording the
 /// echo and snapshotting if the returned sequence lands on a multiple of
 /// [`SNAPSHOT_EVERY`].
-async fn push_update(
+#[allow(clippy::too_many_arguments)]
+async fn append_blob(
     handler: &RpcHandler,
     client: &PimbleClient,
     store_id: StoreId,
@@ -548,9 +852,28 @@ async fn push_update(
     Ok(())
 }
 
-/// Push a document's current full state as a fresh append (used to seed a
-/// document the remote has never seen, and as the fallback for a structural
-/// change with no delta bytes to reuse).
+/// Append one local update as it arrived, and record that the remote holds it.
+#[allow(clippy::too_many_arguments)]
+async fn push_update(
+    handler: &RpcHandler,
+    client: &PimbleClient,
+    store_id: StoreId,
+    doc_id: VaultDocId,
+    key_id: Uuid,
+    link_id: &str,
+    plaintext: &[u8],
+    echoes: &Arc<EchoTracker>,
+    progress: &mut Progress,
+) -> anyhow::Result<()> {
+    append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, plaintext, echoes).await?;
+    progress.advance(&doc_id, plaintext);
+    Ok(())
+}
+
+/// Push a document's current full state as a fresh append (the fallback for a
+/// change with no delta bytes to reuse: a wholesale content replacement, or a
+/// debounced burst of structural tree changes).
+#[allow(clippy::too_many_arguments)]
 async fn push_full(
     handler: &RpcHandler,
     client: &PimbleClient,
@@ -559,9 +882,36 @@ async fn push_full(
     key_id: Uuid,
     link_id: &str,
     echoes: &Arc<EchoTracker>,
+    progress: &mut Progress,
 ) -> anyhow::Result<()> {
-    let plaintext = full_doc_state(handler, store_id, &doc_id).await?;
-    push_update(handler, client, store_id, doc_id, key_id, link_id, &plaintext, echoes).await
+    let (local_sv, state) = doc_diff(handler, store_id, &doc_id, &pimble_crdt::empty_state_vector()).await?;
+    append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, &state, echoes).await?;
+    progress.set_known(&doc_id, &local_sv);
+    progress.clear_dirty(&doc_id);
+    Ok(())
+}
+
+/// `doc_id`'s state vector and everything it has beyond `known`, read under
+/// one lock so the vector describes exactly what the diff carries.
+async fn doc_diff(handler: &RpcHandler, store_id: StoreId, doc_id: &VaultDocId, known: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let manager = handler.store_manager_handle();
+    match doc_id {
+        VaultDocId::Tree => {
+            let manager = manager.read().await;
+            let doc = manager.store_document(store_id).map_err(|e| anyhow::anyhow!("store document unavailable: {}", e))?;
+            let diff = doc.diff_since(known).map_err(|e| anyhow::anyhow!("store document diff failed: {}", e))?;
+            Ok((doc.state_vector(), diff))
+        }
+        VaultDocId::Node(node_id) => {
+            let mut manager = manager.write().await;
+            let doc = manager
+                .get_node_document(store_id, *node_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("node document unavailable: {}", e))?;
+            let diff = doc.diff_since(known).map_err(|e| anyhow::anyhow!("node document diff failed: {}", e))?;
+            Ok((doc.state_vector(), diff))
+        }
+    }
 }
 
 /// The current full state of `doc_id` (`ContentDoc`/`StoreDocument::save()`:

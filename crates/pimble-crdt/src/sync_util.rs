@@ -64,3 +64,73 @@ fn covered_by(subset: &IdSet, superset: &IdSet) -> bool {
     }
     true
 }
+
+// ── State vectors for a peer that cannot answer with one ────────────────
+//
+// A vault twin (docs/CRYPTO_CONTRACT.md) stores ciphertext and has no state
+// vector to offer, so the vault link keeps its own record of what the remote
+// is known to hold: a state vector it advances as updates go out and come in,
+// and diffs against when it reconnects.
+
+/// The v1 encoding of an empty state vector: "the peer has nothing".
+pub fn empty_state_vector() -> Vec<u8> {
+    use yrs::updates::encoder::Encode;
+    yrs::StateVector::default().encode_v1()
+}
+
+/// `known` advanced by `update`, both v1-encoded.
+///
+/// A client's clock moves only when the update continues from what is already
+/// known for that client (its lowest clock is not beyond the known one). An
+/// update that starts past a gap proves nothing about the clocks in between,
+/// and claiming them would make a later diff skip structs the peer never got;
+/// leaving the vector behind only makes a later diff carry a little extra.
+pub fn advance_state_vector(known: &[u8], update: &[u8]) -> Result<Vec<u8>> {
+    use yrs::updates::encoder::Encode;
+    let mut known = yrs::StateVector::decode_v1(known).map_err(|e| CrdtError::Yrs(e.to_string()))?;
+    let update = Update::decode_v1(update).map_err(|e| CrdtError::Yrs(e.to_string()))?;
+    let lower = update.state_vector_lower();
+    let upper = update.state_vector();
+    for (client, end) in upper.iter() {
+        if lower.get(client) <= known.get(client) {
+            known.set_max(*client, *end);
+        }
+    }
+    Ok(known.encode_v1())
+}
+
+/// Whether `local` holds a struct that `known` does not, both v1-encoded.
+/// Deletions do not move a state vector, so `false` is not proof that the peer
+/// lacks nothing; callers that may have deleted while disconnected track that
+/// separately.
+pub fn state_vector_exceeds(local: &[u8], known: &[u8]) -> Result<bool> {
+    let local = yrs::StateVector::decode_v1(local).map_err(|e| CrdtError::Yrs(e.to_string()))?;
+    let known = yrs::StateVector::decode_v1(known).map_err(|e| CrdtError::Yrs(e.to_string()))?;
+    Ok(local.iter().any(|(client, clock)| *clock > known.get(client)))
+}
+
+#[cfg(test)]
+mod state_vector_tests {
+    use super::*;
+    use crate::ContentDoc;
+
+    #[test]
+    fn a_pushed_update_advances_the_known_vector_until_nothing_exceeds_it() {
+        let doc = ContentDoc::from_plain_text("hello").unwrap();
+        let known = empty_state_vector();
+        assert!(state_vector_exceeds(&doc.state_vector(), &known).unwrap());
+        let known = advance_state_vector(&known, &doc.save()).unwrap();
+        assert!(!state_vector_exceeds(&doc.state_vector(), &known).unwrap());
+    }
+
+    #[test]
+    fn an_update_past_a_gap_does_not_claim_the_gap() {
+        let mut doc = ContentDoc::from_plain_text("one").unwrap();
+        let first_sv = doc.state_vector();
+        doc.replace_plain_text("one two").unwrap();
+        let second_only = doc.diff_since(&first_sv).unwrap();
+        // The peer never got the first update; the second alone proves nothing.
+        let known = advance_state_vector(&empty_state_vector(), &second_only).unwrap();
+        assert!(state_vector_exceeds(&doc.state_vector(), &known).unwrap());
+    }
+}
