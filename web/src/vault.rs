@@ -53,6 +53,13 @@ struct VaultDoc {
     seq: u64,
     /// Appends since the last snapshot upload.
     appends: u32,
+    /// A state vector everything up to which the server is known to hold
+    /// (see `advance`). What a resend after a failed append is a diff against.
+    known_sv: Vec<u8>,
+    /// An append failed: `content` holds work the server does not. Every later
+    /// edit depends on it, so until it is resent no other device can show
+    /// anything this one types.
+    unsent: bool,
 }
 
 /// One encrypted store.
@@ -62,6 +69,9 @@ struct VaultStore {
     tree: StoreDocument,
     tree_seq: u64,
     tree_appends: u32,
+    /// As `VaultDoc::known_sv` and `VaultDoc::unsent`, for the tree.
+    tree_known_sv: Vec<u8>,
+    tree_unsent: bool,
     docs: HashMap<NodeId, VaultDoc>,
     /// Each document's head as the server last reported it, so a node with an
     /// empty log is never fetched.
@@ -156,11 +166,14 @@ impl VaultClient {
             .map_err(|e| format!("fetching the tree failed: {e}"))?;
 
         let mut tree = StoreDocument::load(&[]).map_err(|e| e.to_string())?;
+        let mut tree_known_sv = pimble_crdt::empty_state_vector();
         for update in decrypt_entries(&keyring, store_id, &VaultDocId::Tree, &fetched) {
             match update {
                 Ok(bytes) => {
                     if let Err(e) = tree.apply_update(&bytes) {
                         tracing::warn!("Skipping an unreadable tree update: {}", e);
+                    } else {
+                        advance(&mut tree_known_sv, &bytes);
                     }
                 }
                 Err(message) => tracing::warn!("Skipping a tree blob: {}", message),
@@ -179,6 +192,7 @@ impl VaultClient {
                 .vault_append_from(store_id, VaultDocId::Tree, blob, Some(me))
                 .await
                 .map_err(|e| format!("seeding the tree failed: {e}"))?;
+            tree_known_sv = tree.state_vector();
         }
 
         let root_node_id = tree.root_node_id().unwrap_or(store.root_node_id);
@@ -191,12 +205,104 @@ impl VaultClient {
                 tree,
                 tree_seq,
                 tree_appends: 0,
+                tree_known_sv,
+                tree_unsent: false,
                 docs: HashMap::new(),
                 heads: HashMap::new(),
                 heads_known: false,
             },
         );
         Ok(())
+    }
+
+    // ── After a reconnect ───────────────────────────────────────────────────
+
+    /// Bring every open store level with the server again, both ways.
+    ///
+    /// This client outlives its connection: the socket is replaced on every
+    /// token refresh and after every drop, while the decrypted documents stay.
+    /// Nothing else closes the gap in between. Appends the server took while
+    /// the socket was down were never notified here, and an append of this
+    /// client's that failed was, until 2026-09-17, simply lost, along with
+    /// every later edit's chance of being shown anywhere else (each depends on
+    /// the one before). Called on every connect, after `open_listed`.
+    pub async fn catch_up(&mut self, client: &PimbleClient) -> Vec<BackendEvent> {
+        let mut events = Vec::new();
+        let store_ids: Vec<StoreId> = self.stores.keys().copied().collect();
+        for store_id in store_ids {
+            // Down: the tree, then every document held.
+            let tree_seq = self.stores.get(&store_id).map(|s| s.tree_seq).unwrap_or(0);
+            if let Ok(fetched) = client.vault_fetch(store_id, VaultDocId::Tree, tree_seq).await {
+                if let Some(store) = self.stores.get_mut(&store_id) {
+                    let mut touched = Vec::new();
+                    for update in decrypt_entries(&store.keyring, store_id, &VaultDocId::Tree, &fetched) {
+                        let Ok(bytes) = update else { continue };
+                        if let Ok(effect) = store.tree.apply_update(&bytes) {
+                            advance(&mut store.tree_known_sv, &bytes);
+                            if effect.changed {
+                                touched.extend(effect.touched);
+                            }
+                        }
+                    }
+                    store.tree_seq = store.tree_seq.max(fetched.head);
+                    if !touched.is_empty() {
+                        events.push(BackendEvent::RemoteStoreChange {
+                            store_id,
+                            change_kind: StoreChangeKind::TreeStructure { node_ids: touched },
+                            source_client_id: None,
+                        });
+                    }
+                }
+            }
+
+            let held: Vec<(NodeId, u64)> = self
+                .stores
+                .get(&store_id)
+                .map(|s| s.docs.iter().map(|(id, doc)| (*id, doc.seq)).collect())
+                .unwrap_or_default();
+            for (node_id, seq) in held {
+                let doc_id = VaultDocId::Node(node_id);
+                let Ok(fetched) = client.vault_fetch(store_id, doc_id.clone(), seq).await else { continue };
+                let active = self.active == Some((store_id, node_id));
+                let Some(store) = self.stores.get_mut(&store_id) else { continue };
+                let updates = decrypt_entries(&store.keyring, store_id, &doc_id, &fetched);
+                let Some(doc) = store.docs.get_mut(&node_id) else { continue };
+                let mut changed = false;
+                for update in updates {
+                    let Ok(bytes) = update else { continue };
+                    if doc.content.apply_update(&bytes).is_ok() {
+                        advance(&mut doc.known_sv, &bytes);
+                        changed = true;
+                        if active {
+                            events.push(BackendEvent::RemoteChanges { changes: STANDARD.encode(&bytes) });
+                        }
+                    }
+                }
+                doc.seq = doc.seq.max(fetched.head);
+                store.heads.insert(node_id, fetched.head);
+                if changed && !active {
+                    events.push(BackendEvent::NodeContentUpdated { store_id, node_id });
+                }
+            }
+
+            // Up: whatever an append failed to deliver.
+            if self.stores.get(&store_id).map_or(false, |s| s.tree_unsent) {
+                if let Err(e) = self.commit_tree(client, store_id, |_| Ok(())).await {
+                    tracing::warn!("Resending the tree of {} failed: {}", store_id, e);
+                }
+            }
+            let unsent: Vec<NodeId> = self
+                .stores
+                .get(&store_id)
+                .map(|s| s.docs.iter().filter(|(_, doc)| doc.unsent).map(|(id, _)| *id).collect())
+                .unwrap_or_default();
+            for node_id in unsent {
+                if let Err(e) = self.resend_content(client, store_id, node_id).await {
+                    tracing::warn!("Resending the content of {} failed: {}", node_id, e);
+                }
+            }
+        }
+        events
     }
 
     // ── Live updates ────────────────────────────────────────────────────────
@@ -274,6 +380,7 @@ impl VaultClient {
                     }
                 };
                 store.tree_seq = store.tree_seq.max(seq);
+                advance(&mut store.tree_known_sv, &update);
                 if !effect.changed {
                     return None;
                 }
@@ -290,6 +397,7 @@ impl VaultClient {
                     return None;
                 }
                 doc.seq = doc.seq.max(seq);
+                advance(&mut doc.known_sv, &update);
                 let head = store.heads.entry(node_id).or_insert(0);
                 *head = (*head).max(seq);
 
@@ -647,15 +755,32 @@ impl VaultClient {
 
         let before = store.tree.state_vector();
         mutate(&mut store.tree)?;
-        let update = store.tree.diff_since(&before).map_err(|e| e.to_string())?;
+        // After a failed append the server is behind by more than this one
+        // change, so what goes out is everything it lacks.
+        let resend = store.tree_unsent;
+        let since = if resend { store.tree_known_sv.clone() } else { before };
+        let update = store.tree.diff_since(&since).map_err(|e| e.to_string())?;
+        let sent_sv = store.tree.state_vector();
         let blob = encrypt_blob(&store.keyring, store_id, &VaultDocId::Tree, &update)?;
 
-        let seq = client
+        let appended = client
             .vault_append_from(store_id, VaultDocId::Tree, blob, Some(self.client_id.clone()))
-            .await
-            .map_err(|e| e.to_string())?;
+            .await;
 
         let Some(store) = self.stores.get_mut(&store_id) else { return Ok(()) };
+        let seq = match appended {
+            Ok(seq) => seq,
+            Err(e) => {
+                store.tree_unsent = true;
+                return Err(e.to_string());
+            }
+        };
+        if resend {
+            store.tree_known_sv = sent_sv;
+            store.tree_unsent = false;
+        } else {
+            advance(&mut store.tree_known_sv, &update);
+        }
         store.tree_seq = store.tree_seq.max(seq);
         store.tree_appends += 1;
 
@@ -703,6 +828,31 @@ impl VaultClient {
         self.append_content(client, store_id, node_id, content).await
     }
 
+    /// Send everything `node_id`'s document holds that the server does not,
+    /// for a document an earlier append failed to deliver.
+    async fn resend_content(&mut self, client: &PimbleClient, store_id: StoreId, node_id: NodeId) -> Result<(), String> {
+        let doc_id = VaultDocId::Node(node_id);
+        let (blob, sent_sv) = {
+            let Some(store) = self.stores.get(&store_id) else { return Ok(()) };
+            let Some(doc) = store.docs.get(&node_id) else { return Ok(()) };
+            let payload = doc.content.diff_since(&doc.known_sv).map_err(|e| e.to_string())?;
+            (encrypt_blob(&store.keyring, store_id, &doc_id, &payload)?, doc.content.state_vector())
+        };
+        let seq = client
+            .vault_append_from(store_id, doc_id, blob, Some(self.client_id.clone()))
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(store) = self.stores.get_mut(&store_id) else { return Ok(()) };
+        let head = store.heads.entry(node_id).or_insert(0);
+        *head = (*head).max(seq);
+        if let Some(doc) = store.docs.get_mut(&node_id) {
+            doc.seq = doc.seq.max(seq);
+            doc.known_sv = sent_sv;
+            doc.unsent = false;
+        }
+        Ok(())
+    }
+
     async fn append_content(
         &mut self,
         client: &PimbleClient,
@@ -721,13 +871,38 @@ impl VaultClient {
         };
         doc.content.apply_update(update).map_err(|e| e.to_string())?;
 
-        let blob = encrypt_blob(&store.keyring, store_id, &doc_id, update)?;
-        let seq = client
+        // After a failed append the server is behind by more than this one
+        // edit, so what goes out is everything it lacks.
+        let resend = doc.unsent;
+        let payload = if resend {
+            doc.content.diff_since(&doc.known_sv).map_err(|e| e.to_string())?
+        } else {
+            update.to_vec()
+        };
+        let sent_sv = doc.content.state_vector();
+        let blob = encrypt_blob(&store.keyring, store_id, &doc_id, &payload)?;
+        let appended = client
             .vault_append_from(store_id, doc_id.clone(), blob, Some(self.client_id.clone()))
-            .await
-            .map_err(|e| e.to_string())?;
+            .await;
 
         let Some(store) = self.stores.get_mut(&store_id) else { return Ok(()) };
+        let seq = match appended {
+            Ok(seq) => seq,
+            Err(e) => {
+                if let Some(doc) = store.docs.get_mut(&node_id) {
+                    doc.unsent = true;
+                }
+                return Err(e.to_string());
+            }
+        };
+        if let Some(doc) = store.docs.get_mut(&node_id) {
+            if resend {
+                doc.known_sv = sent_sv;
+                doc.unsent = false;
+            } else {
+                advance(&mut doc.known_sv, &payload);
+            }
+        }
         let head = store.heads.entry(node_id).or_insert(0);
         *head = (*head).max(seq);
         let needs_snapshot = match store.docs.get_mut(&node_id) {
@@ -829,6 +1004,8 @@ impl VaultClient {
             content: ContentDoc::new(),
             seq: 0,
             appends: 0,
+            known_sv: pimble_crdt::empty_state_vector(),
+            unsent: false,
         });
 
         for update in decrypt_entries(&store.keyring, store_id, &doc_id, &fetched) {
@@ -836,6 +1013,8 @@ impl VaultClient {
                 Ok(bytes) => {
                     if let Err(e) = entry.content.apply_update(&bytes) {
                         tracing::warn!("Skipping an unreadable content update: {}", e);
+                    } else {
+                        advance(&mut entry.known_sv, &bytes);
                     }
                 }
                 Err(message) => tracing::warn!("Skipping a content blob: {}", message),
@@ -1145,6 +1324,15 @@ fn decrypt_entries(
         out.push(decrypt_blob(keyring, store_id, doc_id, &entry.blob));
     }
     out
+}
+
+/// `update` is on the server (this client appended it, or fetched it): move
+/// the record of what the server holds. It only moves when the update continues
+/// from what is already known, so it can lag, never overstate.
+fn advance(known_sv: &mut Vec<u8>, update: &[u8]) {
+    if let Ok(next) = pimble_crdt::advance_state_vector(known_sv, update) {
+        *known_sv = next;
+    }
 }
 
 /// Whether an incoming `VaultAppended` should be applied.

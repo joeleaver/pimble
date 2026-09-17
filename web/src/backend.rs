@@ -258,6 +258,12 @@ async fn supervise(
                 // every connect: one created since the last one has to be
                 // recognised before its first `getChildren`.
                 vault.learn_kinds().await;
+                // A store already open from before this connection: pull what
+                // the server took while the socket was down, and resend what
+                // this client could not deliver.
+                for event in vault.catch_up(c).await {
+                    emit(event_tx, signal_ui, event);
+                }
                 for problem in vault.open_listed(c, stores).await {
                     emit(
                         event_tx,
