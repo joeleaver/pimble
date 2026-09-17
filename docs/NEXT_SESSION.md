@@ -39,6 +39,18 @@ account UI"), then `docs/CRYPTO_CONTRACT.md`, `docs/DESKTOP_ACCOUNT_CONTRACT.md`
   recovery request hits and trims the address in the lookup. **Open:** ask Joe which
   address and when the account was created; read `jkbase logs --service cloud` after the
   next attempt.
+- **2026-09-17: edits made while a vault link is down were never pushed** (Joe: the web's
+  typing reached the desktop, the desktop's never reached the web). A reconnect pulled and
+  pushed only never-seen documents; the lost edit made every later one from that device
+  pending everywhere else. Fixed in `vault_link.rs` (`Progress`, `vault-link.json`, push
+  of the diff since the known state on every reconnect; a replica from before the file
+  pushes each document's whole state once, which is what heals an already-broken one) and
+  in the web vault client (`catch_up` on every connect, resend after a failed append).
+  "Unlink from Remote" now also stops a vault link. Tests: a cuttable TCP relay in
+  `tests/vault_link.rs` (`env.relay.cut()`/`restore()`), two new regression tests.
+  **Not fixed, worth a look:** a snapshot claims to cover the log up to seq N but is this
+  device's state, which may not yet include another device's append below N that is still
+  in flight to it; a reader that starts from that snapshot would miss that append.
 - **Local verification stack for the desktop** (`tools/dev-proxy.js` is the proxy, `tools/rinch-debug.py` drives the GUI):
   rhypedb-server, `pimble-cli server` on 7463 in JWT mode with a token file, `pimble-cloud`
   on 8080 with `PIMBLE_CLOUD_PUBLIC_URL=http://127.0.0.1:8090`, a 60-line node reverse

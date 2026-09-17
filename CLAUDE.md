@@ -298,14 +298,22 @@ store-name question). Pimble Cloud holds ciphertext only.
   (0600) holds the unwrapped account and store keys; Service-only RPCs `cloudSignIn/
   SignOut/Status/HostStore/ListHostedStores/AddHostedStore`; `VaultLink` (mode `vault` in
   `sync.json`, per-document `last_seq`) pulls, decrypts and applies blobs, encrypts and
-  appends local updates, drops echoes by seq, snapshots every 200 appends;
+  appends local updates, drops echoes by seq, snapshots every 200 appends; it keeps its
+  local-change subscription across disconnects and records in `<store>/vault-link.json`
+  what the remote is known to hold (a state vector per document, advanced only by
+  updates that continue from it) plus the documents that changed while it was down, and
+  every reconnect pushes what the remote lacks (the hosted twin is ciphertext and cannot
+  answer with a state vector; before 2026-09-17 an edit made while the link was down was
+  never sent, and every later edit from that device sat pending on every other one);
   `Store.sync_mode`/`GetStoreSyncResponse.sync_mode` tell the app it is encrypted. CLI
   `cloud-*` commands. The desktop sign-in UI is not built yet.
 - **Web app**: keys in memory only (a reload asks for the password to unlock); one
   `PimbleClient` per endpoint with per-store `rpc_url` and token ready for relayed shares;
   the vault client holds a decrypted `StoreDocument` and per-node `ContentDoc`s in the
   browser, answers tree and editor commands from them, encrypts outbound edits and
-  searches client-side; the explorer's `+` creates an encrypted store through the accounts
+  searches client-side; it outlives its socket (replaced on every token refresh), so on
+  every connect `catch_up` fetches what each held document missed and resends what a
+  failed append left unsent (`known_sv`/`unsent` per document); the explorer's `+` creates an encrypted store through the accounts
   service and re-mints the token; menus are data in `crates/pimble-app/src/menus.rs` and the
   browser mounts them through `rinch_web::mount_with_menu_bar` (rinch PR #791, merged to `main` 2026-09-16).
 - **Verified by the PM** in a browser through trunk's proxies against the real stack:
