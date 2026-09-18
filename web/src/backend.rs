@@ -24,12 +24,14 @@
 //! browser between passes.
 
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use pimble_app::commands::process_command;
 use pimble_app::protocol::{BackendCommand, BackendEvent, BackendHandle};
 use pimble_client::PimbleClient;
+use pimble_core::StoreId;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::api::{self, Session, TokenError};
@@ -59,6 +61,36 @@ const SETTLE_MS: f64 = 2_000.0;
 thread_local! {
     /// Set by [`request_refresh`], read once per turn of the loop.
     static REFRESH_WANTED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The store subscriptions this page has asked for.
+///
+/// A subscription belongs to the socket it was made on, and this backend
+/// replaces its socket on every token refresh — about once an hour — as well as
+/// after every drop. The UI subscribes to a store when it first registers it
+/// and never again (`register_opened_store`, and `StoresListed` registers only
+/// stores it does not know), so without this a tab stops hearing anything new
+/// after its first hour: for an encrypted store that is every `VaultAppended`,
+/// which is every edit anyone else makes. The connection is this module's, so
+/// restoring what it carried is too.
+#[derive(Default)]
+struct Subscriptions {
+    wanted: HashSet<StoreId>,
+}
+
+impl Subscriptions {
+    /// The UI asked for this store's changes.
+    fn remember(&mut self, store_id: StoreId) {
+        self.wanted.insert(store_id);
+    }
+
+    /// Which stores to subscribe to again on a new connection: the ones asked
+    /// for that the server still lists. A store that is gone — a grant
+    /// withdrawn, a store deleted — is forgotten rather than retried forever.
+    fn restore(&mut self, listed: &[StoreId]) -> Vec<StoreId> {
+        self.wanted.retain(|id| listed.contains(id));
+        listed.iter().copied().filter(|id| self.wanted.contains(id)).collect()
+    }
 }
 
 /// Ask the backend to mint a fresh token and connect again.
@@ -104,6 +136,7 @@ async fn run(
 
     let mut vault = VaultClient::new(client_id.clone());
     let mut endpoints = Endpoints::from_session(&session);
+    let mut subscriptions = Subscriptions::default();
 
     loop {
         // 1. Keep the credentials ahead of their expiry, whether or not a
@@ -141,8 +174,16 @@ async fn run(
         //    from, so it is the one worth supervising; any other endpoint is
         //    connected on demand by whatever first asks for a store on it.
         let session_url = endpoints.session_url();
-        if !supervise(&mut endpoints, &session_url, &mut vault, &event_tx, &signal_ui, &client_id)
-            .await
+        if !supervise(
+            &mut endpoints,
+            &session_url,
+            &mut vault,
+            &mut subscriptions,
+            &event_tx,
+            &signal_ui,
+            &client_id,
+        )
+        .await
         {
             continue;
         }
@@ -157,6 +198,20 @@ async fn run(
             emit(&event_tx, &signal_ui, event);
         }
 
+        // 3b. Settle any tree whose merged updates have stopped arriving: the
+        //     repair is debounced behind them (`REPAIR_DEBOUNCE_MS` in
+        //     `crate::vault`), and what it writes is appended like an edit,
+        //     through the endpoint that serves the store.
+        for store_id in vault.repairs_due() {
+            let Some(client) = endpoints.client_for(store_id).filter(|c| c.is_connected()) else {
+                continue;
+            };
+            for event in vault.repair(&client, store_id).await {
+                ran_anything = true;
+                emit(&event_tx, &signal_ui, event);
+            }
+        }
+
         // 4. Run whatever the UI has posted. Drain the queue rather than
         //    taking one per pass, so a burst of edits does not spread over as
         //    many frames as it has commands.
@@ -167,7 +222,16 @@ async fn run(
             if matches!(cmd, BackendCommand::ConnectionLost { .. }) {
                 continue;
             }
-            dispatch(&mut endpoints, &mut vault, cmd, &event_tx, &signal_ui, &client_id).await;
+            dispatch(
+                &mut endpoints,
+                &mut vault,
+                &mut subscriptions,
+                cmd,
+                &event_tx,
+                &signal_ui,
+                &client_id,
+            )
+            .await;
             if !endpoints.get(&session_url).is_some_and(|e| e.is_connected()) {
                 // Reconnect at the top of the next pass rather than running
                 // the rest of the queue into a dead socket.
@@ -194,6 +258,7 @@ async fn supervise(
     endpoints: &mut Endpoints,
     url: &str,
     vault: &mut VaultClient,
+    subscriptions: &mut Subscriptions,
     event_tx: &Sender<BackendEvent>,
     signal_ui: &Arc<dyn Fn() + Send + Sync>,
     client_id: &str,
@@ -235,9 +300,7 @@ async fn supervise(
             )
             .await;
             match answer {
-                Some(BackendEvent::StoresListed { stores }) => {
-                    Ok((candidate, BackendEvent::StoresListed { stores }))
-                }
+                Some(BackendEvent::StoresListed { stores }) => Ok((candidate, stores)),
                 other => Err(match other {
                     Some(BackendEvent::Error { message }) => message,
                     _ => "the server did not answer listStores".to_string(),
@@ -248,23 +311,55 @@ async fn supervise(
     };
 
     match proven {
-        Ok((candidate, listed)) => {
-            // Every encrypted store is opened — keys fetched, tree fetched and
-            // decrypted — *before* the UI sees the list, so the tree's first
-            // `getChildren` has a store document to read rather than a store
-            // that does not answer yet.
-            if let (Some(c), BackendEvent::StoresListed { stores }) = (candidate.as_ref(), &listed) {
+        Ok((candidate, mut stores)) => {
+            // Every encrypted store is opened — keys fetched, every document
+            // fetched and decrypted — *before* the UI sees the list, so the
+            // tree's first `getChildren` has documents to read rather than a
+            // store that does not answer yet.
+            if let Some(c) = candidate.as_ref() {
                 // Which stores the account calls encrypted, asked again on
                 // every connect: one created since the last one has to be
                 // recognised before its first `getChildren`.
                 vault.learn_kinds().await;
+
+                // Every subscription this page had belonged to the socket that
+                // has just been replaced, so they are all gone and are made
+                // again here — the UI subscribes to a store once, when it first
+                // registers it, and never learns that a connection was lost.
+                //
+                // Before the catch-up, not after it: an append that lands
+                // between the pull and the subscription would be seen by
+                // neither (the desktop's vault link says the same thing in
+                // `connect_and_sync`). Anything the pull has already applied
+                // arrives again and merges to nothing.
+                vault.forget_subscriptions();
+                let listed_ids: Vec<StoreId> = stores.iter().map(|store| store.id).collect();
+                for store_id in subscriptions.restore(&listed_ids) {
+                    let event = if vault.is_encrypted(store_id) {
+                        vault.subscribe(c, store_id, signal_ui).await
+                    } else {
+                        let mut client = Some(c.clone());
+                        process_command(
+                            &mut client,
+                            BackendCommand::SubscribeStoreChanges { store_id },
+                            event_tx,
+                            signal_ui,
+                            client_id,
+                        )
+                        .await
+                    };
+                    if let Some(BackendEvent::Error { message }) = event {
+                        tracing::warn!("Subscribing to {} again failed: {}", store_id, message);
+                    }
+                }
+
                 // A store already open from before this connection: pull what
                 // the server took while the socket was down, and resend what
                 // this client could not deliver.
                 for event in vault.catch_up(c).await {
                     emit(event_tx, signal_ui, event);
                 }
-                for problem in vault.open_listed(c, stores).await {
+                for problem in vault.open_listed(c, &stores, signal_ui).await {
                     emit(
                         event_tx,
                         signal_ui,
@@ -273,6 +368,10 @@ async fn supervise(
                         },
                     );
                 }
+                // The root the documents name rather than the placeholder the
+                // hosted manifest may carry. After `open_listed`, so a store
+                // opened just now is described by the tree it has.
+                vault.describe_all(&mut stores);
             }
 
             if let Some(endpoint) = endpoints.get_mut(url) {
@@ -288,7 +387,7 @@ async fn supervise(
                     client_id: client_id.to_string(),
                 },
             );
-            emit(event_tx, signal_ui, listed);
+            emit(event_tx, signal_ui, BackendEvent::StoresListed { stores });
             true
         }
         Err(message) => {
@@ -321,11 +420,19 @@ async fn supervise(
 async fn dispatch(
     endpoints: &mut Endpoints,
     vault: &mut VaultClient,
+    subscriptions: &mut Subscriptions,
     cmd: BackendCommand,
     event_tx: &Sender<BackendEvent>,
     signal_ui: &Arc<dyn Fn() + Send + Sync>,
     client_id: &str,
 ) {
+    // What the UI asks to watch, it asks once. The socket it was asked on is
+    // replaced on every token refresh, so the ask is remembered and made again
+    // on each new connection.
+    if let BackendCommand::SubscribeStoreChanges { store_id } = &cmd {
+        subscriptions.remember(*store_id);
+    }
+
     // Creating a hosted store is the accounts service's business, not any
     // Pimble server's, so it never reaches one.
     if let BackendCommand::CreateHostedStore { name, kind } = &cmd {
@@ -374,7 +481,25 @@ async fn dispatch(
 
     let mut client = client;
     if let Some(event) = process_command(&mut client, cmd, event_tx, signal_ui, client_id).await {
-        emit(event_tx, signal_ui, event);
+        emit(event_tx, signal_ui, described(vault, event));
+    }
+}
+
+/// Every `Store` the UI is handed names, for an encrypted store this page
+/// has decrypted, the root its own documents name (`VaultClient::describe`).
+/// The store list is described where it is built, in `supervise`; this is the
+/// same for any other answer that carries a store.
+fn described(vault: &VaultClient, event: BackendEvent) -> BackendEvent {
+    match event {
+        BackendEvent::StoreOpened { mut store } => {
+            vault.describe(&mut store);
+            BackendEvent::StoreOpened { store }
+        }
+        BackendEvent::StoresListed { mut stores } => {
+            vault.describe_all(&mut stores);
+            BackendEvent::StoresListed { stores }
+        }
+        other => other,
     }
 }
 
@@ -426,4 +551,48 @@ fn expiring_soon(session: &Session) -> bool {
 /// The page's clock, in milliseconds.
 fn now_ms() -> f64 {
     js_sys::Date::now()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StoreId, Subscriptions};
+
+    #[test]
+    fn a_new_connection_subscribes_again_to_what_was_asked_for() {
+        let a = StoreId::new();
+        let b = StoreId::new();
+        let mut subscriptions = Subscriptions::default();
+        subscriptions.remember(a);
+        subscriptions.remember(b);
+        // Asking twice is one subscription, not two.
+        subscriptions.remember(a);
+
+        let again = subscriptions.restore(&[a, b]);
+        assert_eq!(again, vec![a, b]);
+        // And again on the connection after that: a restore does not consume.
+        assert_eq!(subscriptions.restore(&[a, b]), vec![a, b]);
+    }
+
+    #[test]
+    fn a_store_that_is_no_longer_listed_is_forgotten() {
+        let kept = StoreId::new();
+        let gone = StoreId::new();
+        let mut subscriptions = Subscriptions::default();
+        subscriptions.remember(kept);
+        subscriptions.remember(gone);
+
+        assert_eq!(subscriptions.restore(&[kept]), vec![kept]);
+        // A grant withdrawn while the socket was down: not retried forever,
+        // and not restored if the store comes back without the UI asking.
+        assert_eq!(subscriptions.restore(&[kept, gone]), vec![kept]);
+    }
+
+    #[test]
+    fn a_store_listed_but_never_subscribed_to_is_left_alone() {
+        // The UI subscribes when it registers a store; one it has not
+        // registered yet is not this loop's business.
+        let listed = StoreId::new();
+        let mut subscriptions = Subscriptions::default();
+        assert!(subscriptions.restore(&[listed]).is_empty());
+    }
 }

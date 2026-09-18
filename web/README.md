@@ -136,42 +136,70 @@ blobs a tree of notes.
 
 It sits in front of `pimble_app::commands::process_command`. A command naming a
 vault store is answered from documents this page holds; anything else is handed
-straight back, so the plain path is untouched. On connect it fetches each vault
-store's keys and its `tree` document, decrypts every blob, and builds a
-`pimble_crdt::StoreDocument` in the browser — the same store document the
-desktop's server holds, just built here. The tree UI then reads that instead of
-calling `getChildren`. A store whose log is empty (one the accounts service has
-just created) is seeded from here, under the id and root the server already
-minted.
+straight back, so the plain path is untouched. Every node is one document
+(`pimble_crdt::NodeDoc`: its text, its place in the tree and its metadata in
+one, docs/NODE_DOCUMENT_CONTRACT.md), and the tree is `pimble_crdt::Tree` over
+those documents, starting from the root the store's manifest names — the same
+documents the desktop's server holds, just decrypted here. There is no tree
+document any more; a hosted twin from before may still list one, which is
+skipped. On connect the client fetches each vault store's keys, lists its
+documents, fetches every log (titles and children lists live in the documents,
+so nothing of the tree can be drawn until they are here; the fetches go out in
+windows of 32), decrypts and merges every blob, and repairs the tree once, after
+the whole pull — never between the updates of one edit, since a half-applied
+move looks like an orphan and repair's answer to an orphan is a new parent
+written into the node's document. The tree UI then reads that instead of
+calling `getChildren`.
 
-Node content works the same way: `vaultFetch`, decrypt, merge into a
-`ContentDoc`, and hand the editor its bytes through the ordinary `NodeLoaded`
-path. Outbound edits arrive as `BroadcastChanges` exactly as they do for a plain
-store; they are merged, encrypted with `Blob::encrypt` (associated data
-`blob_aad(store_id, doc_id)`, so a blob cannot be replayed into another
-document) and appended with `vaultAppend`. Tree edits — create, rename, move,
-delete, appearance — mutate the store document and append the difference that
-mutation made, never the whole document.
+The manifest's root is a placeholder for a store hosted from a desktop, whose
+documents name their own root; the client takes the one node with no parent as
+the root and lists the store under it (`describe`). A store the accounts service
+has just created has an empty log: its root document is written at the first
+edit under it, not at open, so a page that merely looked at a store whose
+documents are still on their way from a desktop's link never gives it a second
+root.
+
+Tree edits — create, rename, move, delete, appearance — are `Tree` operations,
+and every `TreeEdit` they return is appended per touched document, in the order
+it names them (a new document before its parent's list), each blob carrying that
+transaction's update and nothing else. Node content goes through the same
+document: outbound edits arrive as `BroadcastChanges` exactly as they do for a
+plain store, are merged with `NodeDoc::apply_update`, encrypted with
+`Blob::encrypt` (associated data `blob_aad(store_id, doc_id)`, so a blob cannot
+be replayed into another document) and appended with `vaultAppend`. The editor
+is handed the whole node document through the ordinary `NodeLoaded` path, as it
+is on the desktop; Pimble's roots ride along.
 
 `VaultAppended` notifications come back through the store subscription with the
 blob attached. The subscription task only forwards them; decrypting and merging
 needs the vault client itself, which lives in the backend loop, so they travel
-down a channel it drains once per turn. This client's own appends are dropped by
-sequence number. A blob whose key id this device does not hold is logged and
-skipped, never fatal. A snapshot goes up every 200 appends per document.
+down a channel it drains once per turn. This client's own appends are recognised
+by the client id they carry. What a merged update changed decides what the UI
+hears — the same kinds the server derives (`NodeCreated`, `NodeDeleted`,
+`NodeMoved`, `MetadataUpdated`, `TreeStructure`), and a content change as
+`RemoteChanges` for the node the editor has open or `NodeContentUpdated` for
+any other — and a structural merge schedules a repair 250 ms after the last one,
+whose edit is appended like any other. A blob whose key id this device does not
+hold is logged and skipped, never fatal. A snapshot (`NodeDoc::save`) goes up
+every 200 appends per document, stamped only with a number the client has read
+through.
 
 Two things are worth knowing. `RemoteChanges` carries no node identity and the
 app has one editor pane, so a decrypted content update only becomes one for the
 node the editor has open — learned from `SubscribeNodeChanges`, which the vault
-client answers itself rather than subscribing again. And `getChildren` loads the
-content of the children it returns, because the app derives a document's tree
-label from its first line and opens it from the bytes it was handed, with no
-second fetch in between.
+client answers itself rather than subscribing again. And every child
+`getChildren` returns carries its document's bytes, because the app derives a
+document's tree label from its first line and opens it from the bytes it was
+handed, with no second fetch in between.
+
+The backend remembers which stores the UI subscribed to and subscribes again on
+every new connection, before the catch-up: a subscription belongs to the socket
+it was made on, and the socket is replaced on every token refresh.
 
 Search over an encrypted store is client-side: a case-insensitive substring over
-decrypted titles and whatever content is loaded. There is no server index for
-such a store and there cannot be one. Plain stores named in the same query still
-go to the server, and the two sets of hits are merged.
+decrypted titles and every document's text. There is no server index for such a
+store and there cannot be one. Plain stores named in the same query still go to
+the server, and the two sets of hits are merged.
 
 ## Controls, and the ones that would do nothing
 
@@ -423,7 +451,9 @@ standing in for `trunk serve`):
   a new node is created through it, and typing into that node works;
 - the server's copy is `vault/tree/log` and `vault/<node id>/log`, each blob
   `PB` + version + key id + nonce + ciphertext, with neither the store's name
-  nor a word of the note anywhere on its disk;
+  nor a word of the note anywhere on its disk (this was the layout before
+  docs/NODE_DOCUMENT_CONTRACT.md; a store made now has only the per-node logs,
+  and the client on that branch has not been run against the stack yet);
 - a second tab, signed in separately, decrypts the same store and shows the
   text — in the tree label and in the editor.
 
