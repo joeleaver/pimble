@@ -517,6 +517,64 @@ pub fn blob_aad(store_id: &str, doc_id: &str) -> Vec<u8> {
     format!("{store_id}/{doc_id}").into_bytes()
 }
 
+/// A document's data key (DEK) wrapped under one scope key: the store key, or
+/// the key of a share the document is under (docs/NODE_DOCUMENT_CONTRACT.md
+/// section 5, "Keys"). A document carries one wrap per scope key that may read
+/// it; a node entering a share gets one more wrap, never a re-encryption. JSON,
+/// versioned, base64url fields. XChaCha20-Poly1305 under the scope key with
+/// [`dek_aad`] as associated data, so a wrap cannot be replayed onto another
+/// document.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WrappedDek {
+    pub v: u8,
+    /// The key that wraps: which store key or share key to unwrap with.
+    pub scope_key_id: KeyId,
+    pub nonce: String,
+    pub ciphertext: String,
+}
+
+/// Wrap `dek` under `scope_key` (identified by `scope_key_id`) for the document
+/// `aad` names ([`dek_aad`]).
+pub fn wrap_dek(dek: &SymmetricKey, scope_key: &SymmetricKey, scope_key_id: KeyId, aad: &[u8]) -> WrappedDek {
+    let nonce_bytes = random_nonce();
+    let cipher = XChaCha20Poly1305::new(XChaChaKey::from_slice(&scope_key.0));
+    let ciphertext = cipher
+        .encrypt(XNonce::from_slice(&nonce_bytes), Payload { msg: &dek.0, aad })
+        .expect("XChaCha20-Poly1305 encryption cannot fail for valid inputs");
+    WrappedDek { v: VERSION, scope_key_id, nonce: b64_encode(&nonce_bytes), ciphertext: b64_encode(&ciphertext) }
+}
+
+/// Unwrap with the scope key `wrapped.scope_key_id` names, for the document
+/// `aad` names. A wrong key, a wrong document or a tampered wrap is
+/// [`CryptoError::Decrypt`].
+pub fn unwrap_dek(wrapped: &WrappedDek, scope_key: &SymmetricKey, aad: &[u8]) -> Result<SymmetricKey> {
+    if wrapped.v != VERSION {
+        return Err(CryptoError::UnsupportedVersion(wrapped.v));
+    }
+    let nonce_bytes = b64_decode(&wrapped.nonce)?;
+    if nonce_bytes.len() != NONCE_LEN {
+        return Err(CryptoError::Malformed("wrap nonce"));
+    }
+    let ciphertext = b64_decode(&wrapped.ciphertext)?;
+    let cipher = XChaCha20Poly1305::new(XChaChaKey::from_slice(&scope_key.0));
+    let mut plaintext = cipher
+        .decrypt(XNonce::from_slice(&nonce_bytes), Payload { msg: &ciphertext, aad })
+        .map_err(|_| CryptoError::Decrypt)?;
+    if plaintext.len() != 32 {
+        plaintext.zeroize();
+        return Err(CryptoError::Malformed("unwrapped data key length"));
+    }
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(&plaintext);
+    plaintext.zeroize();
+    Ok(SymmetricKey(key_bytes))
+}
+
+/// The associated data for a document's data-key wraps.
+pub fn dek_aad(store_id: &str, doc_id: &str) -> Vec<u8> {
+    format!("{store_id}/{doc_id}/dek").into_bytes()
+}
+
 // --- Internal helpers -------------------------------------------------------------
 
 fn b64_encode(bytes: &[u8]) -> String {
@@ -626,6 +684,31 @@ fn normalize_recovery_code(code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_data_key_wraps_under_a_scope_key_and_only_unwraps_for_its_document() {
+        let dek = SymmetricKey::generate();
+        let store_key = SymmetricKey::generate();
+        let share_key = SymmetricKey::generate();
+        let aad = dek_aad("store", "doc");
+
+        let under_store = wrap_dek(&dek, &store_key, KeyId::new_v4(), &aad);
+        let under_share = wrap_dek(&dek, &share_key, KeyId::new_v4(), &aad);
+        assert_eq!(unwrap_dek(&under_store, &store_key, &aad).unwrap().0, dek.0);
+        assert_eq!(unwrap_dek(&under_share, &share_key, &aad).unwrap().0, dek.0);
+
+        // The wrong scope key, another document, and a tampered wrap all fail.
+        assert!(matches!(unwrap_dek(&under_store, &share_key, &aad), Err(CryptoError::Decrypt)));
+        assert!(matches!(unwrap_dek(&under_store, &store_key, &dek_aad("store", "other")), Err(CryptoError::Decrypt)));
+        let mut tampered = under_store.clone();
+        tampered.ciphertext = b64_encode(&[0u8; 48]);
+        assert!(matches!(unwrap_dek(&tampered, &store_key, &aad), Err(CryptoError::Decrypt)));
+
+        // JSON round trip, as the server stores and relays it.
+        let json = serde_json::to_string(&under_share).unwrap();
+        let back: WrappedDek = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, under_share);
+    }
 
     // ---- Known-answer tests -------------------------------------------------------
 
