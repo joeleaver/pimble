@@ -23,6 +23,16 @@ Pimble is an **offline-first personal information manager**:
   pinned revision with `cargo update rinch rinch-tabler-icons rinch-editor-core`.
 - rinch fixes go upstream as pull requests; point `Cargo.toml` at the branch until merged.
 - Always build and run `pimble-app` with `--release`; debug builds are unusably slow.
+- **Nothing is hosted unless the person asked for it.** Only "Host on Pimble Cloud..."
+  (`cloudHostStore`) uploads a store, and it uploads that store. No feature may put data on
+  Pimble Cloud as a side effect: sharing an unhosted store goes through the relay (Pimble
+  Cloud stores nothing) or is refused with a sentence that says so (Joe, 2026-09-18).
+- **Everything is co-editable.** Every piece of a person's data (a node's text, its place in
+  the tree, its title and metadata, a plugin's JSON) lives in a CRDT document that everyone
+  with edit rights edits directly, and edits merge on their own. No projections, mirrors,
+  op logs, "let's just make a copy that someone keeps in step", or paths where one party's
+  device interprets another's edits. A feature that seems to need one has the wrong design;
+  say so and stop (Joe, 2026-09-17, after the phase 2b share mirror was built and rejected).
 - One way to write node content. If a second path appears, one of them is a bug.
 - Every time a version is pushed (a deploy, or a push of `master` that changes what ships),
   cut a desktop release too: bump the workspace version, tag `v<version>` on `master`, push
@@ -328,8 +338,12 @@ store-name question). Pimble Cloud holds ciphertext only.
   signup with the recovery code, verification, unlock, an encrypted store, a node typed in
   one tab, only `PB` ciphertext on the hosted disk (no typed words, title or store name in
   the vault), a second tab decrypting and receiving edits live.
-- **Phase 2b** (designed for, not built): sharing in place with subtree grants and per-share
-  keys, invitations, the relay tier (store nothing), then teams.
+- **Phase 2b, sharing**: a first cut (a share as a mirror store the owner's devices
+  projected) was built on `cloud/phase-2b` and rejected on 2026-09-17 because recipients
+  could not co-author the tree. The design that replaces it is
+  `docs/NODE_DOCUMENT_CONTRACT.md` (branch `node-document`): one yrs document per node,
+  the tree as the graph of node documents, sharing as a scoped grant on the same documents,
+  the relay for unhosted stores.
 
 ### Desktop account UI (done 2026-09-16)
 
