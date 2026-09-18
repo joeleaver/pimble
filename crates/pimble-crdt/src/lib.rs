@@ -1,9 +1,13 @@
-//! Pimble CRDT - yrs for node content and the store document
+//! Pimble CRDT - yrs documents for nodes and the tree over them
 //!
 //! This crate provides:
-//! - Per-node content documents backed by yrs (`ContentDoc`)
-//! - The store document (tree structure + node metadata) backed by yrs
-//!   (`StoreDocument`)
+//! - The node document (`NodeDoc`): one yrs document per node holding its
+//!   rich text, its place in the tree, its metadata and a plugin's JSON
+//!   (docs/NODE_DOCUMENT_CONTRACT.md)
+//! - The tree over node documents (`Tree`): the operations, validation and
+//!   repair, each edit reported per document (`TreeEdit`)
+//! - The previous layout, until wave 2 switches the workspace over: per-node
+//!   content documents (`ContentDoc`) and the store document (`StoreDocument`)
 //! - Shared error types
 
 pub mod blocks;

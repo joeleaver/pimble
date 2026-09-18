@@ -10,6 +10,11 @@
 //! [`ContentDoc::from_plain_text`] and [`ContentDoc::text`], the only two operations
 //! that need to know what is inside. Everything else operates on raw yrs bytes and
 //! updates, agnostic to what they encode.
+//!
+//! The pieces that know the projection (building a snapshot from blocks, the
+//! replacement delta, the index units) are `pub(crate)` functions at the bottom of
+//! this module, shared with [`crate::NodeDoc`], which keeps the same content in the
+//! same roots of a document that also holds the node's place in the tree.
 
 use std::rc::Rc;
 
@@ -18,7 +23,7 @@ use rinch_editor_collab::CollabSession;
 use rinch_editor_core::{default_plugins, EditorState, Node, Schema};
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
-use yrs::{Doc, OffsetKind, Options, ReadTxn, StateVector, Transact, Update};
+use yrs::{Doc, OffsetKind, Options, ReadTxn, StateVector, Transact, TransactionMut, Update};
 
 use crate::blocks::{blocks_from_plain_text, build_doc, Block};
 use crate::error::{CrdtError, Result};
@@ -47,7 +52,7 @@ impl ContentDoc {
         if bytes.is_empty() {
             return Ok(content);
         }
-        let update = Update::decode_v1(bytes).map_err(|e| CrdtError::Yrs(e.to_string()))?;
+        let update = decode_update(bytes)?;
         content
             .doc
             .transact_mut()
@@ -66,11 +71,7 @@ impl ContentDoc {
     /// lists, marked runs): the importer's and the CLI's way in. Every block kind here
     /// is inside rinch's collaboration scope, so the result always projects.
     pub fn from_blocks(blocks: &[Block]) -> Result<Self> {
-        let schema = Rc::new(Schema::starter_kit());
-        let doc_node = build_doc(&schema, blocks)?;
-        let state = EditorState::create(schema.clone(), doc_node, default_plugins());
-        let session = CollabSession::new(&state).map_err(|e| CrdtError::Collab(e.to_string()))?;
-        Self::load(&session.snapshot())
+        Self::load(&snapshot_from_blocks(blocks)?)
     }
 
     /// Replace this document's whole content with one paragraph per line of `text`, as
@@ -82,23 +83,8 @@ impl ContentDoc {
     /// never written) is seeded the way [`ContentDoc::from_plain_text`] builds one, and
     /// the delta is that whole snapshot.
     pub fn replace_plain_text(&mut self, text: &str) -> Result<Vec<u8>> {
-        let schema = Rc::new(Schema::starter_kit());
-        let after = build_doc(&schema, &blocks_from_plain_text(text))?;
-
         let has_history = !self.doc.transact().state_vector().is_empty();
-        let delta = if has_history {
-            let mut session = CollabSession::from_bytes(&self.save()).map_err(|e| CrdtError::Collab(e.to_string()))?;
-            let before = session.projected_doc(&schema).map_err(|e| CrdtError::Collab(e.to_string()))?;
-            session
-                .record_local(&schema, &before, &after)
-                .map_err(|e| CrdtError::Collab(e.to_string()))?;
-            session.save_incremental().map_err(|e| CrdtError::Collab(e.to_string()))?
-        } else {
-            let state = EditorState::create(schema.clone(), after, default_plugins());
-            let session = CollabSession::new(&state).map_err(|e| CrdtError::Collab(e.to_string()))?;
-            session.snapshot()
-        };
-
+        let delta = replacement_delta(&self.save(), !has_history, text)?;
         self.apply_update(&delta)?;
         Ok(delta)
     }
@@ -118,10 +104,10 @@ impl ContentDoc {
     /// before/after state and delete set — never from `update`'s byte length, since a
     /// yrs v1 update is never actually empty (see [`crate::sync_util`]).
     pub fn apply_update(&mut self, update: &[u8]) -> Result<bool> {
-        let update = Update::decode_v1(update).map_err(|e| CrdtError::Yrs(e.to_string()))?;
+        let update = decode_update(update)?;
         let mut txn = self.doc.transact_mut();
         txn.apply_update(update).map_err(|e| CrdtError::Yrs(e.to_string()))?;
-        Ok(*txn.before_state() != *txn.after_state() || !txn.delete_set().is_empty())
+        Ok(transaction_changed(&txn))
     }
 
     /// This document's state vector, v1-encoded.
@@ -131,8 +117,7 @@ impl ContentDoc {
 
     /// Everything this document has that a peer at `state_vector` (v1-encoded) lacks.
     pub fn diff_since(&self, state_vector: &[u8]) -> Result<Vec<u8>> {
-        let sv = StateVector::decode_v1(state_vector).map_err(|e| CrdtError::Yrs(e.to_string()))?;
-        Ok(self.doc.transact().encode_diff_v1(&sv))
+        diff_since(&self.doc, state_vector)
     }
 
     /// Computes [`ContentDoc::diff_since`] against `remote_sv` and returns it only if it
@@ -156,11 +141,7 @@ impl ContentDoc {
     /// `'\n'`. `""` if the document is empty or cannot be projected — never panics,
     /// logs at debug on failure.
     pub fn text(&self) -> String {
-        self.units()
-            .iter()
-            .map(|u| u.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
+        join_units(&self.units())
     }
 
     /// Convenience for callers holding bytes: [`ContentDoc::load`] then
@@ -177,21 +158,7 @@ impl ContentDoc {
     /// crate change). Each unit's `path` is `"b:{ordinal}"`. `[]` if the document is
     /// empty or cannot be projected — never panics, logs at debug on failure.
     pub fn units(&self) -> Vec<IndexUnit> {
-        let session = match CollabSession::from_bytes(&self.save()) {
-            Ok(session) => session,
-            Err(e) => {
-                tracing::debug!("ContentDoc::units: CollabSession::from_bytes failed: {e}");
-                return Vec::new();
-            }
-        };
-        let schema = Schema::starter_kit();
-        match session.projected_doc(&schema) {
-            Ok(node) => Self::project_units(&node),
-            Err(e) => {
-                tracing::debug!("ContentDoc::units: projected_doc failed: {e}");
-                Vec::new()
-            }
-        }
+        units_of_projection(&self.save(), "ContentDoc::units")
     }
 
     /// Convenience for callers holding bytes: [`ContentDoc::load`] then
@@ -199,59 +166,143 @@ impl ContentDoc {
     pub fn units_of(bytes: &[u8]) -> Vec<IndexUnit> {
         Self::load(bytes).map(|d| d.units()).unwrap_or_default()
     }
-
-    /// One [`IndexUnit`] per top-level child of `doc` (its blocks), each carrying
-    /// that block's own leaf text (concatenated with no separator) and a `path` of
-    /// `"b:{ordinal}"`.
-    fn project_units(doc: &Node) -> Vec<IndexUnit> {
-        doc.content()
-            .iter()
-            .enumerate()
-            .map(|(ordinal, block)| {
-                let mut text = String::new();
-                Self::collect_leaf_text(block, &mut text);
-                let kind = match block.type_name() {
-                    "paragraph" => UnitKind::Prose,
-                    "heading" => {
-                        let level = block
-                            .attrs()
-                            .get_int("level")
-                            .unwrap_or(1)
-                            .clamp(1, u8::MAX as i64) as u8;
-                        UnitKind::Heading(level)
-                    }
-                    "code_block" => UnitKind::Code,
-                    other => UnitKind::Other(other.to_string()),
-                };
-                IndexUnit::new(kind, format!("b:{ordinal}"), text)
-            })
-            .collect()
-    }
-
-    /// Append every leaf text node under `node`, depth-first, in document order.
-    /// The text under `node`, with one newline between text blocks (so a list's
-    /// items read as lines, not as one run-on word) and none inside a block.
-    fn collect_leaf_text(node: &Node, out: &mut String) {
-        if let Some(t) = node.text() {
-            out.push_str(t);
-        } else if node.is_textblock() {
-            if !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
-            }
-            for child in node.content().iter() {
-                Self::collect_leaf_text(child, out);
-            }
-        } else {
-            for child in node.content().iter() {
-                Self::collect_leaf_text(child, out);
-            }
-        }
-    }
 }
 
 impl Default for ContentDoc {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── The projection, shared with `NodeDoc` ────────────────────────────────
+//
+// Everything below is what a content document and a node document have in
+// common: both keep rinch-editor-collab's projection in the `content` and
+// `meta` roots of a UTF-16 yrs document, and neither knows more about it than
+// these functions do.
+
+/// `bytes` decoded as a yrs v1 update.
+pub(crate) fn decode_update(bytes: &[u8]) -> Result<Update> {
+    Update::decode_v1(bytes).map_err(|e| CrdtError::Yrs(e.to_string()))
+}
+
+/// Whether a transaction changed its document: it inserted a struct or deleted
+/// one (decision 8 of docs/history/HARDENING_CONTRACT.md). Never judged from an
+/// update's byte length, since a yrs v1 update is never actually empty (see
+/// [`crate::sync_util`]).
+pub(crate) fn transaction_changed(txn: &TransactionMut) -> bool {
+    *txn.before_state() != *txn.after_state() || !txn.delete_set().is_empty()
+}
+
+/// Everything `doc` has that a peer at `state_vector` (v1-encoded) lacks.
+pub(crate) fn diff_since(doc: &Doc, state_vector: &[u8]) -> Result<Vec<u8>> {
+    let sv = StateVector::decode_v1(state_vector).map_err(|e| CrdtError::Yrs(e.to_string()))?;
+    Ok(doc.transact().encode_diff_v1(&sv))
+}
+
+/// The snapshot of a fresh projection of `blocks` (one empty paragraph when
+/// there are none): the `content` blocks plus the format tag in `meta`, from a
+/// new client id.
+pub(crate) fn snapshot_from_blocks(blocks: &[Block]) -> Result<Vec<u8>> {
+    let schema = Rc::new(Schema::starter_kit());
+    let doc_node = build_doc(&schema, blocks)?;
+    let state = EditorState::create(schema.clone(), doc_node, default_plugins());
+    let session = CollabSession::new(&state).map_err(|e| CrdtError::Collab(e.to_string()))?;
+    Ok(session.snapshot())
+}
+
+/// The delta that replaces the content in `current` (a document's whole state)
+/// with one paragraph per line of `text`, as an edit of that content's history.
+/// With `seed`, the document holds no projection yet and the delta is a fresh
+/// snapshot instead (see [`ContentDoc::replace_plain_text`]). The caller applies
+/// the delta itself.
+pub(crate) fn replacement_delta(current: &[u8], seed: bool, text: &str) -> Result<Vec<u8>> {
+    let schema = Rc::new(Schema::starter_kit());
+    let after = build_doc(&schema, &blocks_from_plain_text(text))?;
+    if seed {
+        let state = EditorState::create(schema.clone(), after, default_plugins());
+        let session = CollabSession::new(&state).map_err(|e| CrdtError::Collab(e.to_string()))?;
+        return Ok(session.snapshot());
+    }
+    let mut session = CollabSession::from_bytes(current).map_err(|e| CrdtError::Collab(e.to_string()))?;
+    let before = session.projected_doc(&schema).map_err(|e| CrdtError::Collab(e.to_string()))?;
+    session
+        .record_local(&schema, &before, &after)
+        .map_err(|e| CrdtError::Collab(e.to_string()))?;
+    session.save_incremental().map_err(|e| CrdtError::Collab(e.to_string()))
+}
+
+/// The index units of the projection in `bytes` (a document's whole state):
+/// `[]` when there is none or it cannot be projected, logged at debug under
+/// `who`. See [`ContentDoc::units`] for the mapping.
+pub(crate) fn units_of_projection(bytes: &[u8], who: &str) -> Vec<IndexUnit> {
+    let session = match CollabSession::from_bytes(bytes) {
+        Ok(session) => session,
+        Err(e) => {
+            tracing::debug!("{who}: CollabSession::from_bytes failed: {e}");
+            return Vec::new();
+        }
+    };
+    let schema = Schema::starter_kit();
+    match session.projected_doc(&schema) {
+        Ok(node) => project_units(&node),
+        Err(e) => {
+            tracing::debug!("{who}: projected_doc failed: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// The units' text joined by `'\n'`: the plain-text projection.
+pub(crate) fn join_units(units: &[IndexUnit]) -> String {
+    units.iter().map(|u| u.text.as_str()).collect::<Vec<_>>().join("\n")
+}
+
+/// One [`IndexUnit`] per top-level child of `doc` (its blocks), each carrying
+/// that block's own leaf text (concatenated with no separator) and a `path` of
+/// `"b:{ordinal}"`.
+fn project_units(doc: &Node) -> Vec<IndexUnit> {
+    doc.content()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, block)| {
+            let mut text = String::new();
+            collect_leaf_text(block, &mut text);
+            let kind = match block.type_name() {
+                "paragraph" => UnitKind::Prose,
+                "heading" => {
+                    let level = block
+                        .attrs()
+                        .get_int("level")
+                        .unwrap_or(1)
+                        .clamp(1, u8::MAX as i64) as u8;
+                    UnitKind::Heading(level)
+                }
+                "code_block" => UnitKind::Code,
+                other => UnitKind::Other(other.to_string()),
+            };
+            IndexUnit::new(kind, format!("b:{ordinal}"), text)
+        })
+        .collect()
+}
+
+/// Append every leaf text node under `node`, depth-first, in document order.
+/// The text under `node`, with one newline between text blocks (so a list's
+/// items read as lines, not as one run-on word) and none inside a block.
+fn collect_leaf_text(node: &Node, out: &mut String) {
+    if let Some(t) = node.text() {
+        out.push_str(t);
+    } else if node.is_textblock() {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        for child in node.content().iter() {
+            collect_leaf_text(child, out);
+        }
+    } else {
+        for child in node.content().iter() {
+            collect_leaf_text(child, out);
+        }
     }
 }
 
