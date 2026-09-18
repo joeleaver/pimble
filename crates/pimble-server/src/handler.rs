@@ -1,19 +1,47 @@
-//! RPC method handlers
+//! RPC method handlers.
+//!
+//! A store is its node documents (docs/NODE_DOCUMENT_CONTRACT.md): one yrs
+//! document per node holding its text, its place in the tree and its
+//! metadata, read through `pimble_store::StoreManager`'s `Tree`. Every write
+//! reaches a document by one of two paths, and both end the same way:
+//!
+//! - A tree RPC (`createNode`, `moveNode`, `deleteNode`, `undeleteNode`,
+//!   `updateNodeMetadata`, `createMount`) asks the store for the operation
+//!   and gets a `TreeEdit` back: per document it touched, the update its
+//!   transaction produced. The handler flushes, then broadcasts one
+//!   notification per touched document carrying that document's bytes: the
+//!   RPC's own kind for the node it acted on, `TreeStructure { [id] }` for
+//!   every other document (a parent's list, a descendant's tombstone).
+//! - `applyEdit` (a client's keystroke, a sync or vault link relaying a
+//!   peer's update) merges any update into a document through
+//!   [`RpcHandler::apply_node_update_from`], which derives the kinds from
+//!   what the merge changed (see [`derive_kinds`]) and broadcasts them with
+//!   the same bytes. A merge that changed nothing does nothing at all
+//!   (docs/history/HARDENING_CONTRACT.md decision 8).
+//!
+//! So a subscriber never needs to refetch to stay in step: a sync link
+//! forwards the bytes of every document notification as an `applyEdit`, and
+//! an editor merges them. The tree is settled by `Tree::repair` after a
+//! merged update touched structure, debounced so one peer's edit, which is
+//! several documents' updates, is applied whole before repair judges it
+//! (see [`Repair`]).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine;
 use jsonrpsee::core::{async_trait, SubscriptionResult};
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{Extensions, PendingSubscriptionSink, SubscriptionMessage};
 use pimble_client::{describe_connect_error, PimbleClient};
 use pimble_core::{AuthMethod, Node, MountRef, MountState, NodeId, RemoteEndpoint, StoreId, StoreKind, StoreLocation, SyncState, Workspace};
+use pimble_crdt::{NodeDoc, NodeFields, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_plugins::PluginHost;
 use pimble_rpc::{
     encrypted_store_error, index_building_error, snapshot_required_error, to_rpc_error, ApplyEditRequest, ApplyEditResponse,
-    AddRemoteStoreRequest, ApplyStoreUpdateRequest, CloseStoreRequest, CloudAddHostedStoreRequest, CloudHostStoreRequest,
+    AddRemoteStoreRequest, CloseStoreRequest, CloudAddHostedStoreRequest, CloudHostStoreRequest,
     CloudHostStoreResponse, CloudHostedStoreInfo, CloudListHostedStoresResponse, CloudSignInRequest, CloudStatusResponse,
     CreateMountRequest, CreateMountResponse,
     CreateNodeRequest, CreateNodeResponse, CreateStoreRequest, CreateStoreResponse,
@@ -23,15 +51,14 @@ use pimble_rpc::{
     LoadWorkspaceResponse, MoveNodeRequest, NodeContentChangedNotification, NodeContentDiff, OpenStoreRequest,
     OpenStoreResponse, PimbleApiServer, RebuildIndexRequest, RebuildIndexResponse, RemoveReplicaRequest,
     SaveWorkspaceRequest, SearchRequest, SearchResponse, SearchResultItem, StoreChangeKind,
-    StoreChangedNotification, SyncNodeContentsRequest, SyncNodeContentsResponse, SyncNodesRequest, SyncNodesResponse,
-    SyncStoreDocumentRequest, SyncStoreDocumentResponse, UpdateNodeContentRequest,
+    StoreChangedNotification, SyncNodesRequest, SyncNodesResponse, UndeleteNodeRequest, UpdateNodeContentRequest,
     UpdateNodeMetadataRequest,
     VaultAppendRequest, VaultAppendResponse, VaultDocId, VaultDocInfo, VaultEntry, VaultFetchRequest,
     VaultFetchResponse, VaultListDocsRequest, VaultListDocsResponse, VaultSnapshotRequest,
     MAX_SYNC_NODE_CONTENTS,
 };
 use pimble_search::{IndexNode, SearchError, SearchIndex, SearchQuery};
-use pimble_store::{StoreEndpoint, StoreManager, SyncConfig, SyncMode};
+use pimble_store::{StoreEndpoint, StoreError, StoreManager, SyncConfig, SyncMode};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -49,8 +76,27 @@ const CONTENT_INDEX_DEBOUNCE: Duration = Duration::from_millis(2_000);
 
 /// How long to wait after a content edit before flushing it to disk. A burst
 /// of keystrokes coalesces into at most one flush per window, instead of one
-/// per edit.
+/// per edit. The `modified_at` stamp a person's content edit earns rides the
+/// same window (see [`FlushDebouncer`]).
 const CONTENT_FLUSH_DEBOUNCE: Duration = Duration::from_millis(750);
+
+/// How long a merged structural update waits for the next one before the
+/// tree is repaired (see [`Repair::Debounced`]).
+const REPAIR_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// The timestamp the server's own edits carry (a `modified_at` stamp),
+/// rfc3339 like the store's.
+fn now() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+/// Whether an `applyEdit`'s `client_id` is a link of another server
+/// relaying a peer's edit (`crate::sync_link`, `crate::vault_link`) rather
+/// than a person editing here. The id is the one thing a relayed edit
+/// carries that says so.
+fn is_link_client(client_id: &str) -> bool {
+    client_id.starts_with("sync-link:") || client_id.starts_with("vault-link:")
+}
 
 /// The directory a server creates replicas in unless
 /// [`crate::ServerConfig::replicas_dir`] says otherwise: `<data dir>/
@@ -69,12 +115,55 @@ pub(crate) fn default_replicas_dir() -> PathBuf {
 /// already drained the pending set are covered by a fresh task on the next
 /// `apply_edit` call, since `scheduled` is reset to `false` only once the
 /// flush has actually happened.
+///
+/// The same task stamps `modified_at` on every node a person edited in the
+/// window, once each, just before it flushes: a content merge never stamps
+/// anything in the store (a link relaying a peer's edit must not), so the
+/// stamp is a tree edit of the server's own, and doing it here rather than
+/// in `apply_edit` makes it one stamp and one broadcast per node per window
+/// instead of one per keystroke.
 #[derive(Default)]
 struct FlushDebouncer {
-    /// Stores with content dirty since the last flush.
-    pending: Mutex<HashSet<StoreId>>,
+    pending: Mutex<FlushPending>,
     /// Whether a flush task is currently sleeping/running.
     scheduled: Mutex<bool>,
+}
+
+#[derive(Default)]
+struct FlushPending {
+    /// Stores with content dirty since the last flush.
+    stores: HashSet<StoreId>,
+    /// Nodes a person edited since the last flush, to stamp `modified_at`.
+    stamps: HashSet<(StoreId, NodeId)>,
+}
+
+/// Per-store generations for [`RpcHandler::schedule_repair`], the same
+/// pattern as `StoreIndexer::content_gen`: a repair task fires only if no
+/// newer structural update has arrived while it slept.
+#[derive(Default)]
+struct RepairDebouncer {
+    generation: Mutex<HashMap<StoreId, u64>>,
+}
+
+/// When the tree is repaired after a merged update touched `node` or
+/// `children` (docs/NODE_DOCUMENT_CONTRACT.md section 2). One peer's tree
+/// edit is several documents' updates, and they arrive one at a time: a
+/// repair run between two of them judges a half-applied edit. The bad case
+/// is a deletion, where a descendant whose ancestor's tombstone has arrived
+/// but whose own has not is an orphan, and decision 9's answer to an orphan
+/// is a new parent written into its document, an edit that then propagates.
+/// So no repair runs per update; it runs once the updates have stopped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Repair {
+    /// Repair once no structural update has landed for [`REPAIR_DEBOUNCE`]:
+    /// the live path, where the few updates of one edit arrive within
+    /// microseconds of each other.
+    Debounced,
+    /// Repair nothing now; the caller runs `repair_store_tree` itself once
+    /// its whole batch is applied (a reconcile: possibly thousands of
+    /// documents, with round trips between batches that no debounce window
+    /// should be trusted to cover).
+    Later,
 }
 
 // ── Search index feed ──────────────────────────────────────────────────
@@ -195,8 +284,8 @@ impl StoreIndexer {
     /// this ran) is silently skipped rather than treated as an error.
     async fn upsert_now(&self, node_id: NodeId) -> pimble_search::Result<()> {
         let node = {
-            let mut manager = self.store_manager.write().await;
-            match manager.get_node(self.store_id, node_id).await {
+            let manager = self.store_manager.read().await;
+            match manager.get_node(self.store_id, node_id) {
                 Ok(node) => node,
                 Err(_) => return Ok(()),
             }
@@ -254,10 +343,12 @@ fn index_title(node: &Node, content_text: &str) -> String {
     "Untitled".to_string()
 }
 
-/// Project a [`Node`] into the search index's [`IndexNode`]: metadata plus
-/// its content's [`pimble_core::IndexUnit`]s, from the node type's plugin
-/// (`ContentDoc::units()` for `document` nodes, via `DocumentPlugin`). A node
-/// type with no registered plugin (e.g. `mount`) indexes with no units/text.
+/// Project a [`Node`] into the search index's [`IndexNode`]: its title and
+/// metadata, and its content's [`pimble_core::IndexUnit`]s from the node
+/// type's plugin (`NodeDoc::units()` for `document` nodes, via
+/// `DocumentPlugin`; `node.content` is the node document's bytes, title and
+/// text alike). A node type with no registered plugin (e.g. `mount`) indexes
+/// with no units/text.
 fn build_index_node(node: &Node, plugin_host: &PluginHost) -> IndexNode {
     let units = plugin_host
         .get(&node.node_type)
@@ -286,6 +377,142 @@ fn build_index_node(node: &Node, plugin_host: &PluginHost) -> IndexNode {
         links,
         units,
     }
+}
+
+// ── Deriving notifications from a merged update ────────────────────────
+
+/// What a node document says about the node before or after a merge: the
+/// `node` root as fields (`None` while the document is not initialised) and
+/// the children list as stored.
+struct DocShape {
+    fields: Option<NodeFields>,
+    children: Vec<NodeId>,
+}
+
+/// The shape of `id`'s document, `None` when the store holds none.
+fn shape_of(tree: &Tree, id: NodeId) -> Option<DocShape> {
+    tree.doc(id).map(|doc| DocShape { fields: doc.fields().ok(), children: doc.children() })
+}
+
+/// The notifications a merged update earns, from what it changed in the
+/// document (docs/NODE_DOCUMENT_CONTRACT.md section 2): the `node` root
+/// newly written is `NodeCreated` (or `NodeDeleted` when it arrived as a
+/// tombstone, or `TreeStructure` for a root, which has no parent to name);
+/// a tombstone set is `NodeDeleted`, cleared is `NodeCreated` again (the
+/// node is back under its parent); a changed `parent_id` is `NodeMoved`;
+/// any other change to the `node` root is `MetadataUpdated`; a changed
+/// children list is `TreeStructure { [node] }`; a changed `content` root,
+/// or the plugin's `data` root, is `ContentUpdated`. One update can earn
+/// several; a structural change nothing above names (a rewrite of the same
+/// values) still earns `TreeStructure`, so that its bytes travel down a
+/// chain of links. `root` stands in for a parent no document names.
+fn derive_kinds(node_id: NodeId, root: NodeId, before: Option<&DocShape>, after: Option<&DocShape>, effect: NodeUpdateEffect) -> Vec<StoreChangeKind> {
+    let mut kinds = Vec::new();
+    if effect.structure {
+        let before_fields = before.and_then(|s| s.fields.as_ref());
+        let after_fields = after.and_then(|s| s.fields.as_ref());
+        let node_kind = match (before_fields, after_fields) {
+            (None, Some(a)) => Some(match (a.deleted_at.is_some(), a.parent_id) {
+                (true, parent) => StoreChangeKind::NodeDeleted { node_id, parent_id: parent.unwrap_or(root) },
+                (false, Some(parent_id)) => StoreChangeKind::NodeCreated { node_id, parent_id },
+                (false, None) => StoreChangeKind::TreeStructure { node_ids: vec![node_id] },
+            }),
+            (Some(b), Some(a)) => {
+                if b.deleted_at.is_none() && a.deleted_at.is_some() {
+                    Some(StoreChangeKind::NodeDeleted { node_id, parent_id: b.parent_id.or(a.parent_id).unwrap_or(root) })
+                } else if b.deleted_at.is_some() && a.deleted_at.is_none() {
+                    Some(StoreChangeKind::NodeCreated { node_id, parent_id: a.parent_id.unwrap_or(root) })
+                } else if b.parent_id != a.parent_id {
+                    Some(StoreChangeKind::NodeMoved {
+                        node_id,
+                        old_parent_id: b.parent_id.unwrap_or(root),
+                        new_parent_id: a.parent_id.unwrap_or(root),
+                    })
+                } else if b != a {
+                    Some(StoreChangeKind::MetadataUpdated { node_id })
+                } else {
+                    None
+                }
+            }
+            // An initialised `node` root cannot become uninitialised, and
+            // a change that touched neither side of it is a list change.
+            (Some(_), None) | (None, None) => None,
+        };
+        let named_the_list = matches!(node_kind, Some(StoreChangeKind::TreeStructure { .. }));
+        kinds.extend(node_kind);
+        let before_children = before.map(|s| s.children.as_slice()).unwrap_or(&[]);
+        let after_children = after.map(|s| s.children.as_slice()).unwrap_or(&[]);
+        if (before_children != after_children || kinds.is_empty()) && !named_the_list {
+            kinds.push(StoreChangeKind::TreeStructure { node_ids: vec![node_id] });
+        }
+    }
+    if effect.content || effect.data {
+        kinds.push(StoreChangeKind::ContentUpdated { node_id });
+    }
+    if kinds.is_empty() {
+        kinds.push(StoreChangeKind::TreeStructure { node_ids: vec![node_id] });
+    }
+    kinds
+}
+
+/// What the index does about a derived kind. A tombstone is removed; a
+/// content change goes through the per-node debounce; everything else is an
+/// upsert, which skips a node that is not there to index.
+fn index_events_for(kind: &StoreChangeKind) -> Vec<IndexEvent> {
+    match kind {
+        StoreChangeKind::NodeCreated { node_id, .. }
+        | StoreChangeKind::NodeMoved { node_id, .. }
+        | StoreChangeKind::MetadataUpdated { node_id } => vec![IndexEvent::Upsert(*node_id)],
+        StoreChangeKind::NodeDeleted { node_id, .. } => vec![IndexEvent::Remove(*node_id)],
+        StoreChangeKind::ContentUpdated { node_id } => vec![IndexEvent::ContentChanged(*node_id)],
+        StoreChangeKind::TreeStructure { node_ids } => node_ids.iter().map(|id| IndexEvent::Upsert(*id)).collect(),
+        StoreChangeKind::SyncStateChanged { .. } | StoreChangeKind::MountStateChanged { .. } | StoreChangeKind::VaultAppended { .. } => Vec::new(),
+    }
+}
+
+/// A [`TreeEdit`] as one update per document, in the order the documents
+/// were first touched: a document the edit wrote in several transactions
+/// gets them merged (see [`merge_updates`]); when that fails, which no
+/// update this server made can cause, each is sent on its own.
+fn coalesce_edit(edit: &TreeEdit) -> Vec<(NodeId, Vec<u8>)> {
+    let mut order: Vec<NodeId> = Vec::new();
+    let mut per_doc: HashMap<NodeId, Vec<&[u8]>> = HashMap::new();
+    for (id, update) in &edit.touched {
+        per_doc.entry(*id).or_insert_with(|| {
+            order.push(*id);
+            Vec::new()
+        }).push(update.as_slice());
+    }
+    let mut out = Vec::with_capacity(order.len());
+    for id in order {
+        let updates = per_doc.remove(&id).unwrap_or_default();
+        if updates.len() == 1 {
+            out.push((id, updates[0].to_vec()));
+            continue;
+        }
+        match merge_updates(&updates) {
+            Ok(merged) => out.push((id, merged)),
+            Err(e) => {
+                warn!("Could not merge {} updates to node {}: {}; sending them one by one", updates.len(), id, e);
+                out.extend(updates.into_iter().map(|u| (id, u.to_vec())));
+            }
+        }
+    }
+    out
+}
+
+/// Several updates to one document as one: applied to a scratch document
+/// and read back as its whole state. An update that depends on structs the
+/// scratch does not hold (the previous value of a map key, a list item to
+/// delete) is kept pending there, and a yrs snapshot includes what is
+/// pending, so nothing is lost; a peer merging the result ends up where it
+/// would have applying each update in turn.
+fn merge_updates(updates: &[&[u8]]) -> pimble_crdt::Result<Vec<u8>> {
+    let mut scratch = NodeDoc::new();
+    for update in updates {
+        scratch.apply_update(update)?;
+    }
+    Ok(scratch.save())
 }
 
 /// What this server knows about the mounts it has resolved
@@ -424,13 +651,15 @@ impl SubscriptionRegistry {
 /// RPC handler implementation.
 ///
 /// A bag of `Arc`s, `Clone` for that reason: a store's `SyncLink` owns a
-/// clone so it can call `apply_edit`/`apply_store_update` on the same live
-/// state as every other client (docs/SYNC_CONTRACT.md decision 1).
+/// clone so it can apply a peer's updates on the same live state as every
+/// other client (docs/SYNC_CONTRACT.md decision 1).
 #[derive(Clone)]
 pub struct RpcHandler {
     store_manager: Arc<RwLock<StoreManager>>,
     subscriptions: Arc<RwLock<SubscriptionRegistry>>,
     flush_debouncer: Arc<FlushDebouncer>,
+    /// Debounced tree repairs after merged structural updates (see [`Repair`]).
+    repairs: Arc<RepairDebouncer>,
     /// Built-in node-type plugins (document, folder), shared across every
     /// store, used to project a node's content into `IndexUnit`s for search.
     plugin_host: Arc<PluginHost>,
@@ -533,6 +762,7 @@ impl RpcHandler {
             store_manager,
             subscriptions: Arc::new(RwLock::new(SubscriptionRegistry::new())),
             flush_debouncer: Arc::new(FlushDebouncer::default()),
+            repairs: Arc::new(RepairDebouncer::default()),
             plugin_host: Arc::new(pimble_plugins::create_default_host()),
             indexes: Arc::new(RwLock::new(HashMap::new())),
             semantic_available,
@@ -564,10 +794,10 @@ impl RpcHandler {
 
     /// The guard every store-scoped RPC but the four vault ones needs
     /// (docs/CRYPTO_CONTRACT.md "Pimble server, a store of kind `vault`"): a
-    /// vault store has no `StoreDocument`, `ContentDoc` or search index, so
-    /// none of those RPCs may touch it. `Ok(())` when the store is `Plain`
-    /// or not open at all — a missing store still fails downstream with its
-    /// own, more specific `NotOpen`/`StoreNotFound` error.
+    /// vault store has no node documents or search index here, so none of
+    /// those RPCs may touch it. `Ok(())` when the store is `Plain` or not
+    /// open at all — a missing store still fails downstream with its own,
+    /// more specific `NotOpen`/`StoreNotFound` error.
     async fn reject_if_vault(&self, store_id: StoreId) -> Result<(), ErrorObjectOwned> {
         if self.store_manager.read().await.store_kind(store_id) == Some(StoreKind::Vault) {
             return Err(encrypted_store_error(format!(
@@ -579,10 +809,11 @@ impl RpcHandler {
 
     // ── Replica sync (docs/SYNC_CONTRACT.md) ─────────────────────────
 
-    /// Shared handle to the store manager, for [`crate::sync_link`] to read
-    /// and write CRDT documents directly (state vectors, diffs) alongside
-    /// the handler's own `apply_store_update`/`apply_edit` (used to actually
-    /// merge, persist, broadcast, and index a remote change).
+    /// Shared handle to the store manager, for [`crate::sync_link`] and
+    /// [`crate::vault_link`] to read the node documents directly (ids,
+    /// state vectors, diffs) alongside the handler's own
+    /// [`RpcHandler::apply_node_update_from`] (used to actually merge,
+    /// persist, broadcast, and index a remote change).
     pub(crate) fn store_manager_handle(&self) -> Arc<RwLock<StoreManager>> {
         Arc::clone(&self.store_manager)
     }
@@ -691,7 +922,7 @@ impl RpcHandler {
     async fn ensure_vault_link_started(&self, store_id: StoreId, rpc_url: url::Url, key_id: Uuid) {
         // A replica whose tree was pulled before the manifest root was kept
         // in step (see `adopt_document_root`) heals on its next open: the
-        // store document on disk already holds the real root.
+        // documents on disk already hold the real root.
         self.adopt_document_root(store_id).await;
         let last_sync = {
             let manager = self.store_manager.read().await;
@@ -1051,9 +1282,9 @@ impl RpcHandler {
             .ok_or_else(|| to_rpc_error(format!("Remote {} has no open store {}", remote.url, store_id)))?;
         drop(remote_client);
 
-        // An empty replica, never `StoreDocument::new` (decision 8: two
-        // independently created roots for the same id would merge into
-        // duplicated children).
+        // An empty replica, without a root document of its own (decision 8:
+        // two independently initialised roots for the same id would merge
+        // field by field, and their lists into duplicated children).
         let mut manager = self.store_manager.write().await;
         let created_id = manager
             .create_replica(&path, remote_store.id, &remote_store.name, remote_store.root_node_id)
@@ -1093,18 +1324,30 @@ impl RpcHandler {
         Ok(store)
     }
 
-    /// Mark `store_id` as having dirty content and, if no flush task is
+    /// Mark `store_id` as having dirty documents and, if no flush task is
     /// already scheduled, spawn one. The task sleeps for
-    /// [`CONTENT_FLUSH_DEBOUNCE`], drains whichever stores are pending at
-    /// that point, and flushes each in turn. At most one flush task runs at
-    /// a time; edits that arrive after the drain (a narrow race) simply
-    /// schedule a fresh task on their own next call.
+    /// [`CONTENT_FLUSH_DEBOUNCE`], drains whichever stores (and
+    /// `modified_at` stamps) are pending at that point, stamps, and flushes
+    /// each store in turn. At most one flush task runs at a time; edits that
+    /// arrive after the drain (a narrow race) simply schedule a fresh task
+    /// on their own next call.
     fn schedule_content_flush(&self, store_id: StoreId) {
+        self.flush_debouncer.pending.lock().unwrap().stores.insert(store_id);
+        self.ensure_flush_scheduled();
+    }
+
+    /// A person edited `node_id`'s content: stamp its `modified_at` with the
+    /// next debounced flush (see [`FlushDebouncer`]).
+    fn note_content_edit(&self, store_id: StoreId, node_id: NodeId) {
         {
             let mut pending = self.flush_debouncer.pending.lock().unwrap();
-            pending.insert(store_id);
+            pending.stores.insert(store_id);
+            pending.stamps.insert((store_id, node_id));
         }
+        self.ensure_flush_scheduled();
+    }
 
+    fn ensure_flush_scheduled(&self) {
         {
             let mut scheduled = self.flush_debouncer.scheduled.lock().unwrap();
             if *scheduled {
@@ -1112,32 +1355,53 @@ impl RpcHandler {
             }
             *scheduled = true;
         }
-
-        let store_manager = Arc::clone(&self.store_manager);
-        let debouncer = Arc::clone(&self.flush_debouncer);
-        tokio::spawn(async move {
-            tokio::time::sleep(CONTENT_FLUSH_DEBOUNCE).await;
-
-            let to_flush: Vec<StoreId> = {
-                let mut pending = debouncer.pending.lock().unwrap();
-                pending.drain().collect()
-            };
-
-            {
-                let mut manager = store_manager.write().await;
-                for store_id in to_flush {
-                    if let Err(e) = manager.flush(store_id).await {
-                        warn!("Debounced content flush failed for store {}: {}", store_id, e);
-                    }
-                }
-            }
-
-            let mut scheduled = debouncer.scheduled.lock().unwrap();
-            *scheduled = false;
-        });
+        let handler = self.clone();
+        tokio::spawn(async move { handler.run_debounced_flush().await });
     }
 
-    /// Notify store subscribers about a change.
+    /// The flush task: stamp every pending node once, flush every pending
+    /// store, then broadcast the stamps as the server's own metadata edits
+    /// (`source_client_id: None`, so a link forwards them: the peer's copy
+    /// of the document gets the stamp from here, never one of its own).
+    async fn run_debounced_flush(self) {
+        tokio::time::sleep(CONTENT_FLUSH_DEBOUNCE).await;
+
+        let FlushPending { stores, stamps } = {
+            let mut pending = self.flush_debouncer.pending.lock().unwrap();
+            std::mem::take(&mut *pending)
+        };
+
+        let mut stamped: Vec<(StoreId, NodeId, TreeEdit)> = Vec::new();
+        {
+            let mut manager = self.store_manager.write().await;
+            let now = now();
+            for (store_id, node_id) in stamps {
+                // A node deleted, or a store closed, since the edit: nothing
+                // to stamp, and nothing to say about it.
+                let Some(edit) = manager.tree_mut(store_id).ok().and_then(|tree| tree.touch_modified(node_id, &now).ok()) else {
+                    continue;
+                };
+                for id in edit.node_ids() {
+                    let _ = manager.mark_dirty(store_id, id);
+                }
+                stamped.push((store_id, node_id, edit));
+            }
+            for store_id in stores {
+                if let Err(e) = manager.flush(store_id).await {
+                    warn!("Debounced content flush failed for store {}: {}", store_id, e);
+                }
+            }
+        }
+
+        *self.flush_debouncer.scheduled.lock().unwrap() = false;
+
+        for (store_id, node_id, edit) in stamped {
+            self.broadcast_tree_edit(store_id, &edit, Some((node_id, StoreChangeKind::MetadataUpdated { node_id })), None).await;
+        }
+    }
+
+    /// Notify store subscribers about a change that is not about a document
+    /// (a link's or a mount's state); it carries no bytes.
     async fn notify_store_change(&self, store_id: StoreId, kind: StoreChangeKind, source: Option<&str>) {
         let notification = StoreChangedNotification {
             store_id,
@@ -1148,45 +1412,132 @@ impl RpcHandler {
         self.subscriptions.write().await.notify_store_change(&notification).await;
     }
 
-    /// Notify node content subscribers AND store subscribers about a content change.
-    ///
-    /// Decision 4: when `operation` is an `applyEdit` delta, its bytes are
-    /// also put on the store-level notification's `update` field, so a
-    /// subscriber to the store alone (e.g. a sync link) gets content deltas
-    /// without subscribing per node. `updateNodeContent` (the full-snapshot
-    /// path) passes `None` here and still yields `update: None`.
-    async fn notify_node_content_change(&self, store_id: StoreId, node_id: NodeId, source: Option<&str>, operation: Option<EditOperation>) {
-        let node_notif = NodeContentChangedNotification {
-            store_id,
-            node_id,
-            source_client_id: source.map(String::from),
-            operation: operation.clone(),
-        };
-        let update_bytes = match &operation {
-            Some(EditOperation::IncrementalChanges { changes }) => Some(changes.clone()),
-            None => None,
-        };
+    /// Broadcast one document's change: `kind` names the document, and
+    /// `update_b64` is the update that changed it, so a subscriber applies
+    /// the bytes instead of refetching. `ContentUpdated` also reaches the
+    /// node's own subscribers (the editor), carrying the same bytes as its
+    /// operation.
+    async fn broadcast_document_change(&self, store_id: StoreId, kind: StoreChangeKind, source: Option<&str>, update_b64: Option<String>) {
         let store_notif = StoreChangedNotification {
             store_id,
-            change_kind: StoreChangeKind::ContentUpdated { node_id },
+            change_kind: kind.clone(),
             source_client_id: source.map(String::from),
-            update: update_bytes,
+            update: update_b64.clone(),
         };
         // Acquire lock once for both notification types
         let mut registry = self.subscriptions.write().await;
-        registry.notify_node_change(&node_notif).await;
+        if let StoreChangeKind::ContentUpdated { node_id } = kind {
+            let node_notif = NodeContentChangedNotification {
+                store_id,
+                node_id,
+                source_client_id: source.map(String::from),
+                operation: update_b64.map(|changes| EditOperation::IncrementalChanges { changes }),
+            };
+            registry.notify_node_change(&node_notif).await;
+        }
         registry.notify_store_change(&store_notif).await;
     }
 
-    /// Repair `store_id`'s tree (see `StoreDocument::repair`) if it needs it,
-    /// then flush, broadcast, and re-index exactly like any other structural
-    /// change (docs/history/HARDENING_CONTRACT.md decision 9). Called at `openStore`
-    /// and after every `applyStoreUpdate` that changed the document. `None`
-    /// (nothing to repair) is by far the common case, and costs one cheap
-    /// read-only pass over the tree. Logs and returns on error rather than
-    /// failing its caller's RPC — like search indexing, this is best-effort
-    /// upkeep, not a precondition for the operation that triggered it.
-    async fn repair_store_tree(&self, store_id: StoreId) {
+    /// Broadcast a [`TreeEdit`]: one notification per document it touched,
+    /// carrying that document's update, so a link forwards bytes and never
+    /// reconciles for a live edit. The document named by `primary` gets that
+    /// kind (the RPC's own: `NodeCreated` for the node it created), every
+    /// other one `TreeStructure { [id] }` (a parent's list, a descendant's
+    /// tombstone). An edit that wrote one document in several transactions
+    /// (a create with tags, a metadata update of several fields) names it
+    /// once, with the transactions merged into one update.
+    async fn broadcast_tree_edit(&self, store_id: StoreId, edit: &TreeEdit, primary: Option<(NodeId, StoreChangeKind)>, source: Option<&str>) {
+        for (node_id, update) in coalesce_edit(edit) {
+            let kind = match &primary {
+                Some((primary_id, kind)) if *primary_id == node_id => kind.clone(),
+                _ => StoreChangeKind::TreeStructure { node_ids: vec![node_id] },
+            };
+            let update_b64 = base64::engine::general_purpose::STANDARD.encode(&update);
+            self.broadcast_document_change(store_id, kind, source, Some(update_b64)).await;
+        }
+    }
+
+    /// Merge `update` into `node_id`'s document (creating it when unknown),
+    /// persist on the flush debounce, derive the notifications from what it
+    /// changed (see [`derive_kinds`]) and broadcast them with `update` as
+    /// their bytes, feed the index, and settle the tree per `repair`. The
+    /// one path a peer's update takes into a store: `applyEdit` from a
+    /// client, and a sync or vault link applying what its remote sent.
+    /// Nothing at all happens for an update the document already reflected
+    /// (docs/history/HARDENING_CONTRACT.md decision 8: no flush, no
+    /// broadcast, no re-index, no repair). Authorisation is the caller's.
+    pub(crate) async fn apply_node_update_from(
+        &self,
+        store_id: StoreId,
+        node_id: NodeId,
+        update: &[u8],
+        source: Option<&str>,
+        repair: Repair,
+    ) -> Result<NodeUpdateEffect, ErrorObjectOwned> {
+        let (effect, kinds) = {
+            let mut manager = self.store_manager.write().await;
+            let before = shape_of(manager.tree(store_id).map_err(to_rpc_error)?, node_id);
+            let effect = manager.apply_node_update(store_id, node_id, update).map_err(to_rpc_error)?;
+            if !effect.changed {
+                return Ok(effect);
+            }
+            let tree = manager.tree(store_id).map_err(to_rpc_error)?;
+            let after = shape_of(tree, node_id);
+            (effect, derive_kinds(node_id, tree.root(), before.as_ref(), after.as_ref(), effect))
+        };
+
+        self.schedule_content_flush(store_id);
+
+        let update_b64 = base64::engine::general_purpose::STANDARD.encode(update);
+        for kind in kinds {
+            for event in index_events_for(&kind) {
+                self.enqueue_index_event(store_id, event).await;
+            }
+            self.broadcast_document_change(store_id, kind, source, Some(update_b64.clone())).await;
+        }
+
+        if effect.structure {
+            // A replica created around a placeholder root (a vault twin's)
+            // learns its real root from the documents as they arrive.
+            self.adopt_document_root(store_id).await;
+            match repair {
+                Repair::Debounced => self.schedule_repair(store_id),
+                Repair::Later => {}
+            }
+        }
+
+        Ok(effect)
+    }
+
+    /// Repair `store_id`'s tree once no structural update has landed for
+    /// [`REPAIR_DEBOUNCE`] (see [`Repair`]).
+    fn schedule_repair(&self, store_id: StoreId) {
+        let generation = {
+            let mut gens = self.repairs.generation.lock().unwrap();
+            let g = gens.entry(store_id).or_insert(0);
+            *g += 1;
+            *g
+        };
+        let handler = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(REPAIR_DEBOUNCE).await;
+            let still_current = handler.repairs.generation.lock().unwrap().get(&store_id).copied() == Some(generation);
+            if still_current {
+                handler.repair_store_tree(store_id).await;
+            }
+        });
+    }
+
+    /// Repair `store_id`'s tree (see `Tree::repair`) if it needs it, then
+    /// flush, broadcast, and re-index exactly like any other structural
+    /// change (docs/history/HARDENING_CONTRACT.md decision 9). Called at
+    /// `openStore`, after a reconcile, and (debounced) after merged
+    /// structural updates. `None` (nothing to repair) is by far the common
+    /// case, and costs one cheap read-only pass over the tree. Logs and
+    /// returns on error rather than failing its caller's RPC — like search
+    /// indexing, this is best-effort upkeep, not a precondition for the
+    /// operation that triggered it.
+    pub(crate) async fn repair_store_tree(&self, store_id: StoreId) {
         let repair = {
             let mut manager = self.store_manager.write().await;
             match manager.repair_tree(store_id) {
@@ -1204,24 +1555,17 @@ impl RpcHandler {
         if let Err(e) = self.store_manager.write().await.flush(store_id).await {
             warn!("Failed to flush store {} after tree repair: {}", store_id, e);
         }
-        info!("Repaired tree for store {}: {} node(s) touched", store_id, repair.touched.len());
+        info!("Repaired tree for store {}: {} document(s) touched", store_id, repair.touched.len());
 
         // `source_client_id: None`, like any change with no single originating
         // client, so a sync link forwards it rather than treating it as its
         // own echo.
-        use base64::Engine;
-        let notification = StoreChangedNotification {
-            store_id,
-            change_kind: StoreChangeKind::TreeStructure { node_ids: repair.touched.clone() },
-            source_client_id: None,
-            update: Some(base64::engine::general_purpose::STANDARD.encode(&repair.update)),
-        };
-        self.subscriptions.write().await.notify_store_change(&notification).await;
+        self.broadcast_tree_edit(store_id, &repair, None, None).await;
 
         // A repair only ever reassigns a node's parent or reorders/fixes a
         // children list, never removes a node entry — every touched id is
         // still there to upsert.
-        for node_id in repair.touched {
+        for node_id in repair.node_ids() {
             self.enqueue_index_event(store_id, IndexEvent::Upsert(node_id)).await;
         }
     }
@@ -1308,18 +1652,18 @@ impl RpcHandler {
     /// themselves but not descended into — their children belong to another
     /// store) and upsert each into `index`. Returns the count indexed.
     async fn reindex_all_nodes(&self, store_id: StoreId, index: &SearchIndex) -> anyhow::Result<usize> {
-        let root_id = self.store_manager.read().await.root_node_id(store_id)?;
-        let mut manager = self.store_manager.write().await;
-        // A freshly added remote store has a root id in its manifest but an
-        // empty store document until its first reconcile: nothing to index
-        // yet, and not an error. The reconcile's updates feed the index.
-        if !manager.store_document(store_id)?.has_node(root_id) {
+        let manager = self.store_manager.read().await;
+        let root_id = manager.root_node_id(store_id)?;
+        // A freshly added remote store has a root id in its manifest but no
+        // documents until its first reconcile: nothing to index yet, and not
+        // an error. The reconcile's updates feed the index.
+        if !manager.tree(store_id)?.has_node(root_id) {
             return Ok(0);
         }
         let mut stack = vec![root_id];
         let mut count = 0usize;
         while let Some(node_id) = stack.pop() {
-            let node = manager.get_node(store_id, node_id).await?;
+            let node = manager.get_node(store_id, node_id)?;
             let index_node = build_index_node(&node, &self.plugin_host);
             index.upsert(&index_node)?;
             count += 1;
@@ -1431,21 +1775,24 @@ impl RpcHandler {
         }
     }
 
-    /// Bring a store's manifest root in line with its store document's own
-    /// root (the "meta" map, docs/CRYPTO_CONTRACT.md). A replica created
-    /// empty for a vault twin carries a placeholder root until the first
-    /// pull merges the real tree; until 2026-09-16 the manifest kept the
-    /// placeholder, so every later `openStore`/`listStores` handed the app a
-    /// root id that no node had ("Node not found" in the status bar, an
-    /// empty store row). The vault link calls this after each tree update.
+    /// Bring a store's manifest root in line with the root its documents
+    /// say it has (`StoreManager::document_root`: the manifest's root when
+    /// that is a node with no parent, else the one parentless node). A
+    /// replica created empty for a vault twin carries a placeholder root
+    /// until the pull brings the real root's document; until 2026-09-16 the
+    /// manifest kept the placeholder, so every later `openStore`/`listStores`
+    /// handed the app a root id that no node had ("Node not found" in the
+    /// status bar, an empty store row). Called after every merged
+    /// structural update and when a vault link starts. Nothing to adopt
+    /// (no root yet, or several candidates) changes nothing.
     pub(crate) async fn adopt_document_root(&self, store_id: StoreId) {
         let mut manager = self.store_manager.write().await;
-        let Ok(doc_root) = manager.store_document(store_id).and_then(|doc| doc.root_node_id().map_err(Into::into)) else {
+        let Ok(Some(doc_root)) = manager.document_root(store_id) else {
             return;
         };
         let Ok(manifest_root) = manager.root_node_id(store_id) else { return };
         if doc_root != manifest_root {
-            info!("Store {}: manifest root {} replaced by the document's root {}", store_id, manifest_root, doc_root);
+            info!("Store {}: manifest root {} replaced by the documents' root {}", store_id, manifest_root, doc_root);
             if let Err(e) = manager.set_root_node_id(store_id, doc_root).await {
                 warn!("Store {}: rewriting the manifest root failed: {}", store_id, e);
             }
@@ -1731,8 +2078,8 @@ impl PimbleApiServer for RpcHandler {
             .map(|s| s.name)
             .unwrap_or_else(|| store_id.to_string());
 
-        // An *empty* store document (never `create_local_store_with`, which
-        // would give it its own freshly generated root): a vault store has
+        // An *empty* replica (never `create_local_store_with`, which would
+        // give it its own freshly generated root): a vault store has
         // no plaintext root id to ask for ahead of time the way a `Plain`
         // remote's does for `addRemoteStore`, so this mirrors
         // `StoreManager::create_replica`'s own reasoning exactly — two
@@ -1955,10 +2302,9 @@ impl PimbleApiServer for RpcHandler {
         self.reject_if_vault(request.store_id).await?;
         debug!("Getting node {} from store {}", request.node_id, request.store_id);
 
-        let mut manager = self.store_manager.write().await;
+        let manager = self.store_manager.read().await;
         let node = manager
             .get_node(request.store_id, request.node_id)
-            .await
             .map_err(to_rpc_error)?;
 
         Ok(GetNodeResponse { node })
@@ -1977,11 +2323,11 @@ impl PimbleApiServer for RpcHandler {
             request.store_id
         );
 
-        let mut manager = self.store_manager.write().await;
+        let manager = self.store_manager.read().await;
         let mut nodes = Vec::new();
 
         for node_id in request.node_ids {
-            match manager.get_node(request.store_id, node_id).await {
+            match manager.get_node(request.store_id, node_id) {
                 Ok(node) => nodes.push(node),
                 Err(e) => {
                     debug!("Failed to get node {}: {}", node_id, e);
@@ -2013,9 +2359,8 @@ impl PimbleApiServer for RpcHandler {
             Some(parent_id) => parent_id,
             None => manager.root_node_id(request.store_id).map_err(to_rpc_error)?,
         };
-        let node_id = manager
+        let (node_id, edit) = manager
             .create_node(request.store_id, node, Some(parent_id))
-            .await
             .map_err(to_rpc_error)?;
 
         // A node that is created and never edited again has no other flush
@@ -2026,7 +2371,7 @@ impl PimbleApiServer for RpcHandler {
             .map_err(to_rpc_error)?;
 
         drop(manager);
-        self.notify_store_change(request.store_id, StoreChangeKind::NodeCreated { node_id, parent_id }, None).await;
+        self.broadcast_tree_edit(request.store_id, &edit, Some((node_id, StoreChangeKind::NodeCreated { node_id, parent_id })), None).await;
         self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
 
         Ok(CreateNodeResponse { node_id })
@@ -2045,10 +2390,15 @@ impl PimbleApiServer for RpcHandler {
         );
 
         let mut manager = self.store_manager.write().await;
-        manager
+        let edit = manager
             .update_node_metadata(request.store_id, request.node_id, request.metadata)
-            .await
             .map_err(to_rpc_error)?;
+        if edit.is_empty() {
+            // The store writes only what differs, and nothing did: no
+            // flush, no broadcast (decision 8 applies to a client's resend
+            // of the same metadata as much as to a peer's).
+            return Ok(EmptyResponse {});
+        }
 
         manager
             .flush(request.store_id)
@@ -2056,8 +2406,9 @@ impl PimbleApiServer for RpcHandler {
             .map_err(to_rpc_error)?;
 
         drop(manager);
-        self.notify_store_change(request.store_id, StoreChangeKind::MetadataUpdated { node_id: request.node_id }, None).await;
-        self.enqueue_index_event(request.store_id, IndexEvent::Upsert(request.node_id)).await;
+        let node_id = request.node_id;
+        self.broadcast_tree_edit(request.store_id, &edit, Some((node_id, StoreChangeKind::MetadataUpdated { node_id })), None).await;
+        self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
 
         Ok(EmptyResponse {})
     }
@@ -2074,25 +2425,37 @@ impl PimbleApiServer for RpcHandler {
             request.node_id, request.store_id
         );
 
-        use base64::Engine;
         let content = base64::engine::general_purpose::STANDARD
             .decode(&request.content)
             .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
+        let (store_id, node_id) = (request.store_id, request.node_id);
 
-        let mut manager = self.store_manager.write().await;
-        manager
-            .update_node_content(request.store_id, request.node_id, content)
-            .await
-            .map_err(to_rpc_error)?;
+        // A merge like any other, so the snapshot's bytes ride the
+        // notification as an update a subscriber applies; and a person's
+        // write, so the node is stamped, here and now rather than on the
+        // flush debounce, since this is one call and not a keystroke.
+        let stamp = {
+            let mut manager = self.store_manager.write().await;
+            let effect = manager.update_node_content(store_id, node_id, content).map_err(to_rpc_error)?;
+            if !effect.changed {
+                return Ok(EmptyResponse {});
+            }
+            let stamp = manager
+                .tree_mut(store_id)
+                .map_err(to_rpc_error)?
+                .touch_modified(node_id, &now())
+                .map_err(to_rpc_error)?;
+            for id in stamp.node_ids() {
+                manager.mark_dirty(store_id, id).map_err(to_rpc_error)?;
+            }
+            manager.flush(store_id).await.map_err(to_rpc_error)?;
+            stamp
+        };
 
-        manager
-            .flush(request.store_id)
-            .await
-            .map_err(to_rpc_error)?;
-
-        drop(manager);
-        self.notify_node_content_change(request.store_id, request.node_id, request.client_id.as_deref(), None).await;
-        self.enqueue_index_event(request.store_id, IndexEvent::ContentChanged(request.node_id)).await;
+        self.broadcast_document_change(store_id, StoreChangeKind::ContentUpdated { node_id }, request.client_id.as_deref(), Some(request.content))
+            .await;
+        self.broadcast_tree_edit(store_id, &stamp, Some((node_id, StoreChangeKind::MetadataUpdated { node_id })), None).await;
+        self.enqueue_index_event(store_id, IndexEvent::ContentChanged(node_id)).await;
 
         Ok(EmptyResponse {})
     }
@@ -2110,20 +2473,14 @@ impl PimbleApiServer for RpcHandler {
         );
 
         let mut manager = self.store_manager.write().await;
-        let removal = manager
+        let (removal, edit) = manager
             .delete_node(request.store_id, request.node_id)
-            .await
             .map_err(to_rpc_error)?;
 
-        // Unlike every other structural mutation here (createNode, moveNode,
-        // updateNodeMetadata/Content all flush immediately below), this call
-        // was missing its flush: the deletion only ever existed in the
-        // in-memory `StoreDocument` until something else happened to flush
-        // the store later (another edit, or a clean `closeStore`/shutdown).
-        // A hard kill, or simply never touching the store again before the
-        // app exits, lost the delete and the store.yrs on disk still had
-        // the node (a mount node included) — which is exactly the bug where
-        // a deleted mount reappears after restarting.
+        // Flushed at once like every other tree RPC: until 2026-09-14 this
+        // one was not, and a deletion lived only in memory until something
+        // else happened to flush the store, so a hard kill brought a deleted
+        // node (a mount, in the bug report) back on restart.
         manager
             .flush(request.store_id)
             .await
@@ -2133,14 +2490,48 @@ impl PimbleApiServer for RpcHandler {
         // A deleted subtree may contain mount nodes; stop reporting their
         // source's state to a client that no longer has them.
         self.forget_mounts(request.store_id, &removal.removed);
-        self.notify_store_change(
+        // The node's own tombstone is the `NodeDeleted`; every descendant's
+        // tombstone and the parent's list go as `TreeStructure`.
+        let node_id = request.node_id;
+        self.broadcast_tree_edit(
             request.store_id,
-            StoreChangeKind::NodeDeleted { node_id: request.node_id, parent_id: removal.parent_id },
+            &edit,
+            Some((node_id, StoreChangeKind::NodeDeleted { node_id, parent_id: removal.parent_id })),
             None,
         )
         .await;
         for node_id in removal.removed {
             self.enqueue_index_event(request.store_id, IndexEvent::Remove(node_id)).await;
+        }
+
+        Ok(EmptyResponse {})
+    }
+
+    async fn undelete_node(
+        &self,
+        ext: &Extensions,
+        request: UndeleteNodeRequest,
+    ) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        self.reject_if_vault(request.store_id).await?;
+        info!("Undeleting node {} in store {}", request.node_id, request.store_id);
+        let (store_id, node_id) = (request.store_id, request.node_id);
+
+        let (edit, parent_id, restored) = {
+            let mut manager = self.store_manager.write().await;
+            let edit = manager.undelete_node(store_id, node_id).map_err(to_rpc_error)?;
+            let node = manager.get_node(store_id, node_id).map_err(to_rpc_error)?;
+            let parent_id = node.parent_id.unwrap_or_else(|| manager.root_node_id(store_id).unwrap_or(node_id));
+            let restored = manager.tree(store_id).map_err(to_rpc_error)?.subtree_ids(node_id).unwrap_or_else(|_| vec![node_id]);
+            manager.flush(store_id).await.map_err(to_rpc_error)?;
+            (edit, parent_id, restored)
+        };
+
+        // Back under its parent: `NodeCreated` is what a subscriber does
+        // about a node it does not have appearing in a list.
+        self.broadcast_tree_edit(store_id, &edit, Some((node_id, StoreChangeKind::NodeCreated { node_id, parent_id })), None).await;
+        for id in restored {
+            self.enqueue_index_event(store_id, IndexEvent::Upsert(id)).await;
         }
 
         Ok(EmptyResponse {})
@@ -2159,9 +2550,14 @@ impl PimbleApiServer for RpcHandler {
         );
 
         let mut manager = self.store_manager.write().await;
+        // The old parent is read off the tree before the move rewrites it.
         let old_parent_id = manager
+            .get_node(request.store_id, request.node_id)
+            .map_err(to_rpc_error)?
+            .parent_id
+            .ok_or_else(|| to_rpc_error("Cannot move the root node"))?;
+        let edit = manager
             .move_node(request.store_id, request.node_id, request.new_parent_id, request.position)
-            .await
             .map_err(to_rpc_error)?;
 
         manager
@@ -2170,14 +2566,16 @@ impl PimbleApiServer for RpcHandler {
             .map_err(to_rpc_error)?;
 
         drop(manager);
-        self.notify_store_change(
+        let node_id = request.node_id;
+        self.broadcast_tree_edit(
             request.store_id,
-            StoreChangeKind::NodeMoved { node_id: request.node_id, old_parent_id, new_parent_id: request.new_parent_id },
+            &edit,
+            Some((node_id, StoreChangeKind::NodeMoved { node_id, old_parent_id, new_parent_id: request.new_parent_id })),
             None,
         )
         .await;
         // Re-upsert the moved node: its `parent` relationship is what changed.
-        self.enqueue_index_event(request.store_id, IndexEvent::Upsert(request.node_id)).await;
+        self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
 
         Ok(EmptyResponse {})
     }
@@ -2201,10 +2599,9 @@ impl PimbleApiServer for RpcHandler {
         // also records the mount, so a later change to the source's link
         // state reaches this client as `MountStateChanged`.
         let mount_ref = {
-            let mut manager = self.store_manager.write().await;
+            let manager = self.store_manager.read().await;
             let node = manager
                 .get_node(request.store_id, request.node_id)
-                .await
                 .map_err(to_rpc_error)?;
             node.mount_ref().filter(|_| node.is_mount())
         };
@@ -2318,9 +2715,8 @@ impl PimbleApiServer for RpcHandler {
             node.metadata.title = title;
         }
 
-        let node_id = manager
+        let (node_id, edit) = manager
             .create_node(request.store_id, node, Some(request.parent_id))
-            .await
             .map_err(to_rpc_error)?;
 
         manager
@@ -2332,7 +2728,7 @@ impl PimbleApiServer for RpcHandler {
         drop(manager);
 
         self.adopt_newly_opened(newly_opened).await;
-        self.notify_store_change(request.store_id, StoreChangeKind::NodeCreated { node_id, parent_id: request.parent_id }, None).await;
+        self.broadcast_tree_edit(request.store_id, &edit, Some((node_id, StoreChangeKind::NodeCreated { node_id, parent_id: request.parent_id })), None).await;
         self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
 
         // Record the new mount so a later change to its source's link
@@ -2551,10 +2947,9 @@ impl PimbleApiServer for RpcHandler {
         );
 
         let node = {
-            let mut manager = self.store_manager.write().await;
+            let manager = self.store_manager.read().await;
             manager
                 .get_node(request.store_id, request.node_id)
-                .await
                 .map_err(to_rpc_error)?
         };
 
@@ -2574,169 +2969,65 @@ impl PimbleApiServer for RpcHandler {
         Ok(GetMountStateResponse { state, mount_ref })
     }
 
-    async fn sync_store_document(
-        &self,
-        ext: &Extensions,
-        request: SyncStoreDocumentRequest,
-    ) -> Result<SyncStoreDocumentResponse, ErrorObjectOwned> {
-        authorize(&principal_of(ext), request.store_id, Access::Read)?;
-        self.reject_if_vault(request.store_id).await?;
-        debug!("Sync store document for store {}", request.store_id);
-
-        use base64::Engine;
-
-        let client_sv = base64::engine::general_purpose::STANDARD
-            .decode(&request.state_vector)
-            .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
-
-        let store_manager = self.store_manager.read().await;
-
-        // Stateless reconciliation: no per-client sync state is kept for the
-        // store document. The client sends its state vector, we hand back
-        // everything we have beyond it plus our own state vector. If the
-        // client has local changes the server lacks, it sends those
-        // separately via `applyStoreUpdate`.
-        let diff = store_manager
-            .store_doc_diff_since(request.store_id, &client_sv)
-            .map_err(to_rpc_error)?;
-        let server_sv = store_manager
-            .store_doc_state_vector(request.store_id)
-            .map_err(to_rpc_error)?;
-
-        Ok(SyncStoreDocumentResponse {
-            diff: base64::engine::general_purpose::STANDARD.encode(&diff),
-            state_vector: base64::engine::general_purpose::STANDARD.encode(&server_sv),
-        })
-    }
-
-    async fn apply_store_update(
-        &self,
-        ext: &Extensions,
-        request: ApplyStoreUpdateRequest,
-    ) -> Result<EmptyResponse, ErrorObjectOwned> {
-        authorize(&principal_of(ext), request.store_id, Access::Write)?;
-        self.reject_if_vault(request.store_id).await?;
-        info!(
-            "Applying store update to store {} from client {}",
-            request.store_id, request.client_id
-        );
-
-        use base64::Engine;
-
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&request.update)
-            .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
-
-        let mut manager = self.store_manager.write().await;
-        let effect = manager
-            .apply_store_doc_update(request.store_id, &bytes)
-            .map_err(to_rpc_error)?;
-
-        if !effect.changed {
-            // Decision 8: every part of this update was already reflected
-            // here (a yrs diff is never actually empty, so this can't be
-            // told apart by the request's byte length) — no flush, no
-            // notification, no re-index, no repair.
-            return Ok(EmptyResponse {});
-        }
-
-        manager
-            .flush(request.store_id)
-            .await
-            .map_err(to_rpc_error)?;
-
-        // Decision 9 (of docs/SYNC_CONTRACT.md): an id whose node entry
-        // still exists gets upserted (this is what makes a title change
-        // arriving as a store update get reindexed); an id no longer
-        // present was removed.
-        let (upserts, removals): (Vec<NodeId>, Vec<NodeId>) = {
-            let doc = manager.store_document(request.store_id).map_err(to_rpc_error)?;
-            effect.touched.iter().copied().partition(|id| doc.has_node(*id))
-        };
-
-        drop(manager);
-
-        // Broadcast to other subscribers, carrying the raw update bytes so
-        // they can apply it directly instead of refetching.
-        let notification = StoreChangedNotification {
-            store_id: request.store_id,
-            change_kind: StoreChangeKind::TreeStructure { node_ids: effect.touched },
-            source_client_id: Some(request.client_id.clone()),
-            update: Some(request.update.clone()),
-        };
-        self.subscriptions.write().await.notify_store_change(&notification).await;
-
-        for node_id in upserts {
-            self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
-        }
-        for node_id in removals {
-            self.enqueue_index_event(request.store_id, IndexEvent::Remove(node_id)).await;
-        }
-
-        // Decision 9 (of docs/history/HARDENING_CONTRACT.md): repair after a
-        // changing applyStoreUpdate.
-        self.repair_store_tree(request.store_id).await;
-
-        Ok(EmptyResponse {})
-    }
-
-    /// Whole node documents (docs/NODE_DOCUMENT_CONTRACT.md wave 2 builds it).
     async fn sync_nodes(&self, ext: &Extensions, request: SyncNodesRequest) -> Result<SyncNodesResponse, ErrorObjectOwned> {
-        authorize(&principal_of(ext), request.store_id, Access::Read)?;
-        Err(to_rpc_error("syncNodes is not built yet (docs/NODE_DOCUMENT_CONTRACT.md wave 2)"))
-    }
-
-    async fn sync_node_contents(
-        &self,
-        ext: &Extensions,
-        request: SyncNodeContentsRequest,
-    ) -> Result<SyncNodeContentsResponse, ErrorObjectOwned> {
         authorize(&principal_of(ext), request.store_id, Access::Read)?;
         self.reject_if_vault(request.store_id).await?;
         debug!(
-            "Sync content of {} node(s) in store {}",
-            request.nodes.len(), request.store_id
+            "Sync {} node document(s) in store {} (list unknown: {})",
+            request.nodes.len(), request.store_id, request.list_unknown
         );
 
-        use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
 
         if request.nodes.len() > MAX_SYNC_NODE_CONTENTS {
             return Err(to_rpc_error(format!(
-                "syncNodeContents takes at most {} nodes per request, got {}",
+                "syncNodes takes at most {} nodes per request, got {}",
                 MAX_SYNC_NODE_CONTENTS,
                 request.nodes.len()
             )));
         }
 
-        let mut store_manager = self.store_manager.write().await;
-        if !store_manager.is_open(request.store_id) {
-            return Err(to_rpc_error(pimble_store::StoreError::NotOpen(request.store_id)));
+        let manager = self.store_manager.read().await;
+        if !manager.is_open(request.store_id) {
+            return Err(to_rpc_error(StoreError::NotOpen(request.store_id)));
         }
 
-        // Stateless reconciliation: no per-client sync state is kept for
-        // node content. For each node the client sends its state vector, we
-        // hand back everything we have beyond it plus our own state vector.
-        // A node this store does not have is left out.
+        // Stateless reconciliation: no per-client sync state is kept. For
+        // each document the client names it sends its state vector, and
+        // gets back everything this store has beyond it plus this store's
+        // own state vector; a document this store does not hold is left
+        // out. Tombstones are documents like any other: a deletion is in
+        // the document, and a peer that never hears of it brings the node
+        // back.
+        let mut named: HashSet<NodeId> = HashSet::with_capacity(request.nodes.len());
         let mut nodes = Vec::with_capacity(request.nodes.len());
         for entry in request.nodes {
+            named.insert(entry.node_id);
             let client_sv = b64
                 .decode(&entry.state_vector)
                 .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
-            let doc = match store_manager.get_node_document(request.store_id, entry.node_id).await {
-                Ok(doc) => doc,
-                Err(pimble_store::StoreError::NodeNotFound(_)) => continue,
+            let diff = match manager.node_diff_since(request.store_id, entry.node_id, &client_sv) {
+                Ok(diff) => diff,
+                Err(StoreError::NodeNotFound(_)) => continue,
                 Err(e) => return Err(to_rpc_error(e)),
             };
-            let diff = doc.diff_since(&client_sv).map_err(to_rpc_error)?;
+            let state_vector = manager.node_state_vector(request.store_id, entry.node_id).map_err(to_rpc_error)?;
             nodes.push(NodeContentDiff {
                 node_id: entry.node_id,
                 diff: b64.encode(&diff),
-                state_vector: b64.encode(doc.state_vector()),
+                state_vector: b64.encode(&state_vector),
             });
         }
 
-        Ok(SyncNodeContentsResponse { nodes })
+        // What the caller did not name is what it does not hold at all (a
+        // fresh replica: everything), for it to ask for next.
+        let unknown_ids = if request.list_unknown {
+            manager.doc_ids(request.store_id).map_err(to_rpc_error)?.into_iter().filter(|id| !named.contains(id)).collect()
+        } else {
+            Vec::new()
+        };
+
+        Ok(SyncNodesResponse { nodes, unknown_ids })
     }
 
     async fn load_workspace(
@@ -2796,45 +3087,27 @@ impl PimbleApiServer for RpcHandler {
     ) -> Result<ApplyEditResponse, ErrorObjectOwned> {
         authorize(&principal_of(ext), request.store_id, Access::Write)?;
         self.reject_if_vault(request.store_id).await?;
-        use base64::Engine;
 
-        // Apply the edit to the server's persistent yrs document. The
-        // full-snapshot path is `updateNodeContent`, not an `EditOperation`.
         let EditOperation::IncrementalChanges { ref changes } = request.operation;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(changes)
             .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
-        let mut store_manager = self.store_manager.write().await;
-        let changed = store_manager
-            .apply_content_update(request.store_id, request.node_id, &bytes)
-            .await
-            .map_err(to_rpc_error)?;
-        drop(store_manager);
 
-        if !changed {
-            // Decision 8: every part of this edit was already reflected here
-            // — no flush, no broadcast, no re-index.
-            return Ok(ApplyEditResponse {});
+        // Merged, persisted on the flush debounce, broadcast with the same
+        // bytes (never re-encoded or reinterpreted), indexed, repaired: all
+        // in one place, shared with the links.
+        let effect = self
+            .apply_node_update_from(request.store_id, request.node_id, &bytes, Some(&request.client_id), Repair::Debounced)
+            .await?;
+
+        // A person's content edit stamps the node's `modified_at`: as a tree
+        // edit of the server's own, coalesced with the flush so a burst of
+        // keystrokes is one stamp, not one each. A link relaying a peer's
+        // edit is not a person: the stamp was made where the edit was, and
+        // travels as its own update.
+        if (effect.content || effect.data) && !is_link_client(&request.client_id) {
+            self.note_content_edit(request.store_id, request.node_id);
         }
-
-        // Debounced persistence: coalesce a burst of edits into at most one
-        // flush per CONTENT_FLUSH_DEBOUNCE window, rather than one per edit,
-        // while still guaranteeing a crash never loses more than that window
-        // of keystrokes.
-        self.schedule_content_flush(request.store_id);
-
-        // Broadcast to other clients (never re-encoded or reinterpreted —
-        // the same operation bytes are relayed verbatim).
-        self.notify_node_content_change(
-            request.store_id,
-            request.node_id,
-            Some(&request.client_id),
-            Some(request.operation),
-        ).await;
-
-        // Content upserts are debounced per node (2s) here, independent of
-        // the disk-flush debounce above: `applyEdit` fires per keystroke.
-        self.enqueue_index_event(request.store_id, IndexEvent::ContentChanged(request.node_id)).await;
 
         Ok(ApplyEditResponse {})
     }
@@ -2935,12 +3208,11 @@ impl PimbleApiServer for RpcHandler {
         // Look up each hit's node type (the index's own `kind` field means
         // the matched chunk's kind here, not the node type — see
         // `SearchResultItem::node_type`).
-        let mut manager = self.store_manager.write().await;
+        let manager = self.store_manager.read().await;
         let mut results = Vec::with_capacity(hits.len());
         for (store_id, hit) in &hits {
             let node_type = manager
                 .get_node(*store_id, hit.node_id)
-                .await
                 .map(|n| n.node_type)
                 .unwrap_or_default();
             results.push(SearchResultItem {
@@ -2974,5 +3246,140 @@ impl PimbleApiServer for RpcHandler {
             .map_err(to_rpc_error)?;
 
         Ok(RebuildIndexResponse { indexed })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pimble_crdt::Tree;
+
+    const T0: &str = "2026-09-18T10:00:00Z";
+    const T1: &str = "2026-09-18T10:00:01Z";
+
+    fn replica_of(tree: &Tree) -> Tree {
+        let docs = tree.ids().into_iter().map(|id| (id, NodeDoc::load(&tree.doc(id).unwrap().save()).unwrap())).collect();
+        Tree::from_docs(tree.root(), docs)
+    }
+
+    /// A tree edit that wrote one document in several transactions (a
+    /// create, then its tags and a custom key) is broadcast as one update
+    /// per document, and a peer merging the merged update ends up exactly
+    /// where it would applying each transaction in turn.
+    #[test]
+    fn coalesce_edit_merges_a_documents_transactions_into_one_update() {
+        let root = NodeId::new();
+        let mut tree = Tree::new(root, "Store", T0).unwrap();
+        let mut by_turns = replica_of(&tree);
+        let mut merged = replica_of(&tree);
+
+        let x = NodeId::new();
+        let mut edit = tree.add_node(x, Some(root), None, "document", "X", T0).unwrap();
+        edit.touched.extend(tree.set_tags(x, &["a".into(), "b".into()], T1).unwrap().touched);
+        edit.touched.extend(tree.set_custom(x, "icon", &serde_json::json!("star"), T1).unwrap().touched);
+        edit.touched.extend(tree.set_title(x, "Renamed", T1).unwrap().touched);
+        assert_eq!(edit.touched.iter().filter(|(id, _)| *id == x).count(), 4);
+
+        for (id, update) in &edit.touched {
+            by_turns.apply_update(*id, update).unwrap();
+        }
+        let coalesced = coalesce_edit(&edit);
+        assert_eq!(coalesced.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![x, root], "each once, first touched first");
+        for (id, update) in &coalesced {
+            assert!(merged.apply_update(*id, update).unwrap().changed);
+        }
+
+        for id in [x, root] {
+            let a = by_turns.doc(id).unwrap();
+            let b = merged.doc(id).unwrap();
+            assert_eq!(a.fields().ok(), b.fields().ok(), "document {id}");
+            assert_eq!(a.children(), b.children(), "document {id}");
+            assert_eq!(a.state_vector(), b.state_vector(), "document {id}");
+        }
+        let fields = merged.doc(x).unwrap().fields().unwrap();
+        assert_eq!(fields.title, "Renamed");
+        assert_eq!(fields.tags, vec!["a", "b"]);
+        assert_eq!(fields.custom.get("icon"), Some(&serde_json::json!("star")));
+        assert_eq!(merged.get_children(root).unwrap(), vec![x]);
+    }
+
+    fn shapes(before: &Tree, after: &Tree, id: NodeId) -> (Option<DocShape>, Option<DocShape>) {
+        (shape_of(before, id), shape_of(after, id))
+    }
+
+    fn structural() -> NodeUpdateEffect {
+        NodeUpdateEffect { changed: true, structure: true, content: false, data: false }
+    }
+
+    #[test]
+    fn derive_kinds_names_what_a_merge_changed() {
+        let root = NodeId::new();
+        let mut tree = Tree::new(root, "Store", T0).unwrap();
+        let (p, q) = (NodeId::new(), NodeId::new());
+        tree.add_node(p, Some(root), None, "folder", "P", T0).unwrap();
+        tree.add_node(q, Some(root), None, "folder", "Q", T0).unwrap();
+        let x = NodeId::new();
+
+        // Created: the node is new, the parent's list changed.
+        let before = replica_of(&tree);
+        tree.add_node(x, Some(p), None, "document", "X", T0).unwrap();
+        let (b, a) = shapes(&before, &tree, x);
+        assert!(matches!(derive_kinds(x, root, b.as_ref(), a.as_ref(), structural())[..], [StoreChangeKind::NodeCreated { node_id, parent_id }] if node_id == x && parent_id == p));
+        let (b, a) = shapes(&before, &tree, p);
+        assert!(matches!(derive_kinds(p, root, b.as_ref(), a.as_ref(), structural())[..], [StoreChangeKind::TreeStructure { ref node_ids }] if node_ids == &vec![p]));
+
+        // Moved.
+        let before = replica_of(&tree);
+        tree.move_node(x, q, None, T1).unwrap();
+        let (b, a) = shapes(&before, &tree, x);
+        assert!(matches!(
+            derive_kinds(x, root, b.as_ref(), a.as_ref(), structural())[..],
+            [StoreChangeKind::NodeMoved { node_id, old_parent_id, new_parent_id }] if node_id == x && old_parent_id == p && new_parent_id == q
+        ));
+
+        // Renamed.
+        let before = replica_of(&tree);
+        tree.set_title(x, "Y", T1).unwrap();
+        let (b, a) = shapes(&before, &tree, x);
+        assert!(matches!(derive_kinds(x, root, b.as_ref(), a.as_ref(), structural())[..], [StoreChangeKind::MetadataUpdated { node_id }] if node_id == x));
+
+        // Content, on top of nothing structural.
+        let content = NodeUpdateEffect { changed: true, structure: false, content: true, data: false };
+        let (b, a) = shapes(&tree, &tree, x);
+        assert!(matches!(derive_kinds(x, root, b.as_ref(), a.as_ref(), content)[..], [StoreChangeKind::ContentUpdated { node_id }] if node_id == x));
+
+        // Deleted, and back.
+        let before = replica_of(&tree);
+        tree.remove_node(x, T1).unwrap();
+        let (b, a) = shapes(&before, &tree, x);
+        assert!(matches!(derive_kinds(x, root, b.as_ref(), a.as_ref(), structural())[..], [StoreChangeKind::NodeDeleted { node_id, parent_id }] if node_id == x && parent_id == q));
+        let before = replica_of(&tree);
+        tree.undelete_node(x, T1).unwrap();
+        let (b, a) = shapes(&before, &tree, x);
+        assert!(matches!(derive_kinds(x, root, b.as_ref(), a.as_ref(), structural())[..], [StoreChangeKind::NodeCreated { node_id, parent_id }] if node_id == x && parent_id == q));
+
+        // A tombstone arriving whole on a replica that never had the node.
+        let mut fresh = Tree::from_docs(root, HashMap::new());
+        tree.remove_node(x, T1).unwrap();
+        fresh.apply_update(x, &tree.doc(x).unwrap().save()).unwrap();
+        let (b, a) = (None, shape_of(&fresh, x));
+        assert!(matches!(derive_kinds(x, root, b, a.as_ref(), structural())[..], [StoreChangeKind::NodeDeleted { node_id, parent_id }] if node_id == x && parent_id == q));
+
+        // The root arriving on an empty replica: no parent to name.
+        fresh.apply_update(root, &tree.doc(root).unwrap().save()).unwrap();
+        let a = shape_of(&fresh, root);
+        assert!(matches!(derive_kinds(root, root, None, a.as_ref(), structural())[..], [StoreChangeKind::TreeStructure { ref node_ids }] if node_ids == &vec![root]));
+
+        // A structural change that reads the same still earns bytes to forward.
+        let (b, a) = shapes(&tree, &tree, root);
+        assert!(matches!(derive_kinds(root, root, b.as_ref(), a.as_ref(), structural())[..], [StoreChangeKind::TreeStructure { .. }]));
+    }
+
+    #[test]
+    fn link_clients_are_told_apart_by_their_id() {
+        assert!(is_link_client("sync-link:1234"));
+        assert!(is_link_client("vault-link:1234"));
+        assert!(!is_link_client("pimble-cli"));
+        assert!(!is_link_client("app-7f3a"));
     }
 }

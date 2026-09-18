@@ -14,13 +14,13 @@ use jsonrpsee::ws_client::{HeaderMap, HeaderValue, WsClientBuilder};
 use pimble_core::{AuthMethod, Node, NodeId, RemoteEndpoint, Store, StoreId, StoreKind, SyncState, Workspace};
 use pimble_core::MountRef;
 use pimble_rpc::{
-    AddRemoteStoreRequest, ApplyEditRequest, ApplyStoreUpdateRequest, CloseStoreRequest, CloudAddHostedStoreRequest,
+    AddRemoteStoreRequest, ApplyEditRequest, CloseStoreRequest, CloudAddHostedStoreRequest,
     CloudHostStoreRequest, CloudHostedStoreInfo, CloudSignInRequest, CloudStatusResponse,
     CreateMountRequest, CreateNodeRequest, CreateStoreRequest, CreateWorkspaceRequest, DeleteNodeRequest,
     EditOperation, GetChildrenRequest, GetMountStateRequest, GetNodeRequest, GetNodesRequest, GetStoreSyncRequest, SetStoreSyncRequest,
     ListRemoteStoresRequest, LoadWorkspaceRequest, MoveNodeRequest, NodeContentChangedNotification, NodeStateVector,
     OpenStoreRequest, PimbleApiClient, RebuildIndexRequest, RemoveReplicaRequest, SaveWorkspaceRequest,
-    SearchRequest, SearchResultItem, StoreChangedNotification, SyncNodeContentsRequest, SyncStoreDocumentRequest,
+    SearchRequest, SearchResultItem, StoreChangedNotification, SyncNodesRequest, UndeleteNodeRequest,
     UpdateNodeContentRequest, UpdateNodeMetadataRequest, VaultAppendRequest, VaultDocId,
     VaultDocInfo, VaultFetchRequest, VaultFetchResponse, VaultListDocsRequest,
     VaultSnapshotRequest, MAX_SYNC_NODE_CONTENTS,
@@ -424,7 +424,9 @@ impl PimbleClient {
         Ok(())
     }
 
-    /// Update a node's content with raw document bytes
+    /// Seed a node's content with a whole document snapshot (`updateNodeContent`).
+    /// A merge, not a replacement: only right for a node whose content was
+    /// never written (see `UpdateNodeContentRequest`).
     pub async fn set_node_content_bytes(
         &self,
         store_id: StoreId,
@@ -450,12 +452,24 @@ impl PimbleClient {
         Ok(())
     }
 
-    /// Delete a node
+    /// Delete a node and its subtree (a tombstone; see `undelete_node`).
     pub async fn delete_node(&self, store_id: StoreId, node_id: NodeId) -> Result<()> {
         let request = DeleteNodeRequest { store_id, node_id };
 
         self.client
             .delete_node(request)
+            .await
+            .map_err(rpc_error)?;
+
+        Ok(())
+    }
+
+    /// Bring a deleted node and what the same deletion took with it back.
+    pub async fn undelete_node(&self, store_id: StoreId, node_id: NodeId) -> Result<()> {
+        let request = UndeleteNodeRequest { store_id, node_id };
+
+        self.client
+            .undelete_node(request)
             .await
             .map_err(rpc_error)?;
 
@@ -743,68 +757,10 @@ impl PimbleClient {
     // Sync Operations
     // ========================================================================
 
-    /// Sync a store document (tree + metadata): send our yrs state vector,
-    /// get back everything the server has beyond it plus the server's own
-    /// state vector. Stateless on both ends.
-    pub async fn sync_store_document(
-        &self,
-        store_id: StoreId,
-        state_vector: &[u8],
-    ) -> Result<(Vec<u8>, Vec<u8>)> {
-        use base64::Engine;
-
-        let request = SyncStoreDocumentRequest {
-            store_id,
-            state_vector: base64::engine::general_purpose::STANDARD.encode(state_vector),
-        };
-
-        let response = self
-            .client
-            .sync_store_document(request)
-            .await
-            .map_err(rpc_error)?;
-
-        let diff = base64::engine::general_purpose::STANDARD
-            .decode(&response.diff)
-            .map_err(|e| ClientError::Rpc(format!("Invalid base64 diff: {}", e)))?;
-        let server_sv = base64::engine::general_purpose::STANDARD
-            .decode(&response.state_vector)
-            .map_err(|e| ClientError::Rpc(format!("Invalid base64 state vector: {}", e)))?;
-
-        Ok((diff, server_sv))
-    }
-
-    /// Apply a yrs update to the store document (a delta, reconciliation
-    /// diff, or whole snapshot) and broadcast it to the store's other
-    /// subscribers.
-    ///
-    /// Deviation from the Phase B contract's 2-arg signature
-    /// (`apply_store_update(store_id, update)`): `ApplyStoreUpdateRequest`
-    /// carries a `client_id` (for echo suppression via
-    /// `StoreChangedNotification::source_client_id`, same as `apply_edit`),
-    /// and `PimbleClient` has no stored client id field, so it is taken as
-    /// an explicit parameter here, matching `apply_edit`'s existing pattern.
-    pub async fn apply_store_update(&self, store_id: StoreId, client_id: &str, update: &[u8]) -> Result<()> {
-        use base64::Engine;
-
-        let request = ApplyStoreUpdateRequest {
-            store_id,
-            client_id: client_id.to_string(),
-            update: base64::engine::general_purpose::STANDARD.encode(update),
-        };
-
-        self.client
-            .apply_store_update(request)
-            .await
-            .map_err(rpc_error)?;
-
-        Ok(())
-    }
-
-    /// Sync one node's content document: send our yrs state vector, get back
+    /// Sync one node's document: send our yrs state vector, get back
     /// everything the server has beyond it plus the server's own state
-    /// vector. Stateless on both ends. A one-node `syncNodeContents`; an
-    /// error if the server does not have the node.
+    /// vector. Stateless on both ends. A one-node `syncNodes`; an error if
+    /// the server does not have the node.
     pub async fn sync_node_content(
         &self,
         store_id: StoreId,
@@ -818,31 +774,60 @@ impl PimbleClient {
         }
     }
 
-    /// Sync the content documents of many nodes: for each `(node, state
-    /// vector)`, get back `(node, diff, server state vector)`, in request
-    /// order, for every node the server has (others are left out). Splits
-    /// the list into requests of at most `MAX_SYNC_NODE_CONTENTS` nodes.
+    /// Sync the documents of many nodes: for each `(node, state vector)`,
+    /// get back `(node, diff, server state vector)`, in request order, for
+    /// every node the server has (others are left out). The name is from
+    /// the days documents held content only; it is `sync_nodes` without the
+    /// unknown-id listing, kept for its callers.
     pub async fn sync_node_contents(
         &self,
         store_id: StoreId,
         nodes: &[(NodeId, Vec<u8>)],
     ) -> Result<Vec<(NodeId, Vec<u8>, Vec<u8>)>> {
+        let (answers, _) = self.sync_nodes(store_id, nodes, false).await?;
+        Ok(answers)
+    }
+
+    /// Sync node documents (docs/NODE_DOCUMENT_CONTRACT.md section 4): for
+    /// each `(node, state vector)` named, `(node, diff, server state
+    /// vector)` back, in request order, for every node the server has; and,
+    /// with `list_unknown`, the ids of every document the server holds that
+    /// `nodes` did not name (tombstones included). Splits the list into
+    /// requests of at most `MAX_SYNC_NODE_CONTENTS` nodes; the unknown ids
+    /// are asked for once and every named id is taken out of the answer, so
+    /// the split is invisible to the caller. `nodes` may be empty: with
+    /// `list_unknown` that asks for every id the store holds.
+    pub async fn sync_nodes(
+        &self,
+        store_id: StoreId,
+        nodes: &[(NodeId, Vec<u8>)],
+        list_unknown: bool,
+    ) -> Result<(Vec<(NodeId, Vec<u8>, Vec<u8>)>, Vec<NodeId>)> {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
 
-        let mut out = Vec::with_capacity(nodes.len());
-        for chunk in nodes.chunks(MAX_SYNC_NODE_CONTENTS) {
-            let request = SyncNodeContentsRequest {
+        let mut answers = Vec::with_capacity(nodes.len());
+        let mut unknown = Vec::new();
+        // One request even for an empty list, so `list_unknown` on nothing
+        // still answers with everything.
+        let chunks: Vec<&[(NodeId, Vec<u8>)]> = if nodes.is_empty() {
+            vec![&[]]
+        } else {
+            nodes.chunks(MAX_SYNC_NODE_CONTENTS).collect()
+        };
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let request = SyncNodesRequest {
                 store_id,
                 nodes: chunk
                     .iter()
                     .map(|(node_id, sv)| NodeStateVector { node_id: *node_id, state_vector: b64.encode(sv) })
                     .collect(),
+                list_unknown: list_unknown && i == 0,
             };
 
             let response = self
                 .client
-                .sync_node_contents(request)
+                .sync_nodes(request)
                 .await
                 .map_err(rpc_error)?;
 
@@ -853,11 +838,19 @@ impl PimbleClient {
                 let server_sv = b64
                     .decode(&entry.state_vector)
                     .map_err(|e| ClientError::Rpc(format!("Invalid base64 state vector: {}", e)))?;
-                out.push((entry.node_id, diff, server_sv));
+                answers.push((entry.node_id, diff, server_sv));
             }
+            unknown.extend(response.unknown_ids);
         }
 
-        Ok(out)
+        if list_unknown {
+            // The server answered relative to the first chunk alone; every
+            // id a later chunk named is known to the caller.
+            let named: std::collections::HashSet<NodeId> = nodes.iter().map(|(id, _)| *id).collect();
+            unknown.retain(|id| !named.contains(id));
+        }
+
+        Ok((answers, unknown))
     }
 
     // ========================================================================

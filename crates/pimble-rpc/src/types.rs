@@ -25,7 +25,11 @@ pub struct CreateStoreRequest {
 
 // ── Vault (encrypted store) RPCs, docs/CRYPTO_CONTRACT.md ────────────────
 
-/// A document inside a vault store: one node's content, or the tree.
+/// A document inside a vault store: one node's document
+/// (docs/NODE_DOCUMENT_CONTRACT.md section 4). `Tree` names the tree
+/// document of the layout before it, which nothing writes any more; it stays
+/// so a hosted twin migrated from that layout still lists, and a reader
+/// skips it (its content is superseded by the node documents).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase", tag = "kind", content = "id")]
 pub enum VaultDocId {
@@ -225,12 +229,17 @@ pub struct UpdateNodeMetadataRequest {
     pub metadata: NodeMetadata,
 }
 
-/// Request to update a node's content
+/// Request to seed a node's content with a whole document snapshot. The
+/// snapshot is merged into the node's document like any update, so this is
+/// only right for a node whose content was never written (the importer): a
+/// snapshot that shares no history with the copies replicas hold merges in
+/// beside their paragraphs instead of replacing them. An edit of existing
+/// content is an `applyEdit`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateNodeContentRequest {
     pub store_id: StoreId,
     pub node_id: NodeId,
-    /// Base64-encoded full yrs snapshot (full replacement)
+    /// Base64-encoded yrs v1 update: a whole document snapshot
     pub content: String,
     /// Client ID for echo suppression in notifications
     #[serde(default)]
@@ -240,6 +249,14 @@ pub struct UpdateNodeContentRequest {
 /// Request to delete a node
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteNodeRequest {
+    pub store_id: StoreId,
+    pub node_id: NodeId,
+}
+
+/// Request to undelete a node (docs/NODE_DOCUMENT_CONTRACT.md section 2:
+/// a deletion is a tombstone, and this clears it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UndeleteNodeRequest {
     pub store_id: StoreId,
     pub node_id: NodeId,
 }
@@ -266,8 +283,8 @@ pub struct GetChildrenRequest {
 pub struct GetChildrenResponse {
     /// The canonical store the returned children live in: the request's
     /// `store_id` for an ordinary node, the mount's source store for a mount
-    /// point (its `store.yrs` is what actually holds them). Clients address
-    /// every child by `(store_id, child.id)`.
+    /// point (its node documents are what actually hold them). Clients
+    /// address every child by `(store_id, child.id)`.
     pub store_id: StoreId,
     pub children: Vec<Node>,
 }
@@ -464,10 +481,11 @@ pub struct RebuildIndexResponse {
 // Edit Operations (collaborative editing)
 // ============================================================================
 
-/// A document editing operation, carrying a yrs v1 update (base64-encoded):
-/// a delta or a reconciliation diff. Originates from the editor's
-/// collaboration session and can be applied on any client or on the server.
-/// The full-snapshot path is `updateNodeContent`, not an `EditOperation`.
+/// A document editing operation, carrying a yrs v1 update (base64-encoded)
+/// to a node's document: an editor's delta, a reconciliation diff, a tree
+/// operation's transaction, or a whole snapshot (docs/NODE_DOCUMENT_CONTRACT.md
+/// section 4: one shape for content and structure alike). Applied on any
+/// client or on the server by merging.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum EditOperation {
@@ -491,56 +509,11 @@ pub struct ApplyEditResponse {}
 // Sync Operations
 // ============================================================================
 
-/// Request to sync a store document (tree/metadata). Stateless: the client
-/// sends its yrs state vector and the server responds with everything it has
-/// beyond it. No per-client state is kept on the server. If the client also
-/// has local changes the server lacks, it sends those separately via
-/// `applyStoreUpdate`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncStoreDocumentRequest {
-    pub store_id: StoreId,
-    /// Base64-encoded yrs v1 state vector
-    pub state_vector: String,
-}
-
-/// Response from store document sync
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncStoreDocumentResponse {
-    /// Base64-encoded yrs v1 update: everything the server has that the
-    /// client's state vector lacked. May be empty (base64 of zero bytes) if
-    /// the client was already up to date.
-    pub diff: String,
-    /// The server's own state vector (base64-encoded yrs v1), for the client
-    /// to compute what it should send next.
-    pub state_vector: String,
-}
-
-/// Request to apply a yrs update to the store document (a delta,
-/// reconciliation diff, or whole snapshot) and broadcast it to the store's
-/// other subscribers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApplyStoreUpdateRequest {
-    pub store_id: StoreId,
-    pub client_id: String,
-    /// Base64-encoded yrs v1 update
-    pub update: String,
-}
-
-/// The most nodes one `syncNodeContents` request may name. The server
-/// refuses more; `PimbleClient::sync_node_contents` splits a longer list.
+/// The most documents one `syncNodes` request may name. The server refuses
+/// more; `PimbleClient::sync_nodes` splits a longer list.
 pub const MAX_SYNC_NODE_CONTENTS: usize = 100;
 
-/// Request to sync the content documents of several nodes in one round trip.
-/// Stateless: for each node the client sends its yrs state vector and the
-/// server responds with everything it has beyond it. No per-client state is
-/// kept on the server. At most [`MAX_SYNC_NODE_CONTENTS`] nodes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncNodeContentsRequest {
-    pub store_id: StoreId,
-    pub nodes: Vec<NodeStateVector>,
-}
-
-/// One node's state vector in a [`SyncNodeContentsRequest`].
+/// One node's state vector in a [`SyncNodesRequest`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeStateVector {
     pub node_id: NodeId,
@@ -548,21 +521,14 @@ pub struct NodeStateVector {
     pub state_vector: String,
 }
 
-/// Response from node content sync: one entry per requested node the
-/// server has, in request order. A node the server does not have is left
-/// out (not an error).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncNodeContentsResponse {
-    pub nodes: Vec<NodeContentDiff>,
-}
-
-/// One node's answer in a [`SyncNodeContentsResponse`].
+/// One node's answer in a [`SyncNodesResponse`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeContentDiff {
     pub node_id: NodeId,
     /// Base64-encoded yrs v1 update: everything the server has that the
-    /// client's state vector lacked. May be empty (base64 of zero bytes) if
-    /// the client was already up to date.
+    /// client's state vector lacked. Never literally empty: a yrs diff
+    /// carries the whole delete set even when the client is up to date, so
+    /// only a merge can tell (docs/history/HARDENING_CONTRACT.md decision 7).
     pub diff: String,
     /// The server's own state vector (base64-encoded yrs v1), for the client
     /// to compute what it should send next.
@@ -570,13 +536,13 @@ pub struct NodeContentDiff {
 }
 
 /// Sync whole node documents (structure and content together,
-/// docs/NODE_DOCUMENT_CONTRACT.md section 4), the successor of
-/// `syncNodeContents`. Stateless: for each named node the caller sends its
-/// yrs state vector and the server answers with everything it has beyond it;
-/// with `list_unknown` the server also names every document of the store the
-/// caller did not name, so a fresh replica learns what to ask for next (it
-/// then names those with empty state vectors, at most
-/// [`MAX_SYNC_NODE_CONTENTS`] per call). No per-client state on the server.
+/// docs/NODE_DOCUMENT_CONTRACT.md section 4). Stateless: for each named node
+/// the caller sends its yrs state vector and the server answers with
+/// everything it has beyond it; with `list_unknown` the server also names
+/// every document of the store the caller did not name, so a fresh replica
+/// learns what to ask for next (it then names those with empty state
+/// vectors, at most [`MAX_SYNC_NODE_CONTENTS`] per call). No per-client
+/// state on the server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncNodesRequest {
     pub store_id: StoreId,
@@ -600,24 +566,37 @@ pub struct SyncNodesResponse {
 // Subscription Notification Types
 // ============================================================================
 
-/// Notification that a store's tree/metadata has changed
+/// Notification that one of a store's documents changed
+/// (docs/NODE_DOCUMENT_CONTRACT.md section 4). Every document kind
+/// (`NodeCreated`, `NodeDeleted`, `NodeMoved`, `MetadataUpdated`,
+/// `ContentUpdated`, `TreeStructure`) is about exactly one node document and
+/// carries that document's update bytes in `update`, so a subscriber (a sync
+/// link, an editor) applies them and never refetches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreChangedNotification {
     pub store_id: StoreId,
     /// What changed (for client-side routing)
     pub change_kind: StoreChangeKind,
-    /// Which client caused this change (for echo suppression)
+    /// Which client caused this change (for echo suppression). `None` for
+    /// an edit the server made itself (a repair, a `modified_at` stamp).
     #[serde(default)]
     pub source_client_id: Option<String>,
-    /// The raw yrs update (base64-encoded) that caused the change, when one
-    /// is available (currently: `applyStoreUpdate`), so subscribers can
-    /// apply it directly instead of refetching. `None` otherwise.
+    /// The yrs v1 update (base64-encoded) to the one node document the kind
+    /// names, so subscribers can apply it directly instead of refetching.
+    /// `None` only for the kinds that are not about a document
+    /// (`SyncStateChanged`, `MountStateChanged`).
     #[serde(default)]
     pub update: Option<String>,
 }
 
-/// Kind of store change. Structural kinds name every parent whose children
-/// list changed, so a subscriber can refetch exactly those lists.
+/// Kind of store change. The server derives it from what an update changed
+/// in a node document: newly initialised is `NodeCreated`, a set tombstone
+/// is `NodeDeleted`, a changed `parent_id` is `NodeMoved`, any other change
+/// to the `node` root is `MetadataUpdated`, a changed `content` (or plugin
+/// `data`) root is `ContentUpdated`, and a changed children list is
+/// `TreeStructure`. The tree RPCs emit the same kinds for the node they act
+/// on. Structural kinds name every parent whose children list changed, so a
+/// subscriber can refetch exactly those lists.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StoreChangeKind {
@@ -627,9 +606,10 @@ pub enum StoreChangeKind {
     NodeMoved { node_id: NodeId, old_parent_id: NodeId, new_parent_id: NodeId },
     MetadataUpdated { node_id: NodeId },
     ContentUpdated { node_id: NodeId },
-    /// A yrs update to the store document (`applyStoreUpdate`, or a tree
-    /// repair). `node_ids` are the node entries it created, removed or
-    /// changed, including every parent whose children list changed.
+    /// A node document changed in a way no other kind names: its children
+    /// list (a parent of a created, moved or deleted node; a repair), or a
+    /// root node arriving on a replica. `node_ids` names that document; a
+    /// subscriber refetches its list and its parent's.
     TreeStructure { node_ids: Vec<NodeId> },
     /// The store's replica sync link changed state (docs/SYNC_CONTRACT.md).
     SyncStateChanged { state: SyncState },

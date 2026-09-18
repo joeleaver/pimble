@@ -18,15 +18,18 @@ use std::time::Duration;
 
 use base64::Engine;
 use pimble_core::{AuthMethod, NodeId, RemoteEndpoint, StoreId, SyncState};
-use pimble_crdt::ContentDoc;
+use pimble_crdt::{NodeDoc, Tree};
 use pimble_rpc::{
-    ApplyEditRequest, ApplyStoreUpdateRequest, CreateNodeRequest, CreateStoreRequest,
-    EditOperation, GetNodeRequest, PimbleApiServer, StoreChangeKind, StoreChangedNotification,
-    UpdateNodeContentRequest,
+    ApplyEditRequest, CreateNodeRequest, CreateStoreRequest, EditOperation, GetNodeRequest, NodeStateVector,
+    PimbleApiServer, StoreChangeKind, StoreChangedNotification, SyncNodesRequest, UpdateNodeContentRequest,
 };
 use pimble_server::{PimbleServer, RpcHandler, ServerConfig};
 use pimble_store::StoreManager;
 use tokio::sync::RwLock;
+
+/// Real time past the server's content-flush debounce (750ms), which is
+/// also when a person's content edit earns its `modified_at` stamp.
+const PAST_FLUSH_DEBOUNCE: Duration = Duration::from_millis(1_200);
 
 /// Set up an `RpcHandler` backed by a fresh temporary store, with one
 /// document node created under the root. Returns the handler plus the
@@ -57,12 +60,13 @@ async fn new_handler_with_store() -> (RpcHandler, StoreId, NodeId, tempfile::Tem
 
 /// Re-sending an `applyEdit` the server already fully merged produces no
 /// `storeChanged`/`nodeChanged` notification and leaves `modified_at`
-/// unchanged — unlike the first (real) application of the same bytes.
+/// unchanged — unlike the first (real) application of the same bytes, which
+/// notifies and, once the flush debounce has passed, stamps the node.
 #[tokio::test]
 async fn resending_an_applied_content_edit_produces_no_notification_or_modified_at_change() {
     let (handler, store_id, node_id, _dir) = new_handler_with_store().await;
 
-    let base = ContentDoc::from_plain_text("Hello").unwrap();
+    let base = NodeDoc::from_plain_text("Hello").unwrap();
     let content_b64 = base64::engine::general_purpose::STANDARD.encode(base.save());
     handler
         .update_node_content(&pimble_server::service_extensions(), UpdateNodeContentRequest { store_id, node_id, content: content_b64, client_id: None })
@@ -77,7 +81,7 @@ async fn resending_an_applied_content_edit_produces_no_notification_or_modified_
     module.extensions_mut().insert(pimble_server::Principal::Service);
     let mut sub = module.subscribe_unbounded("pimble_subscribeStoreChanges", (store_id,)).await.unwrap();
 
-    let richer = ContentDoc::from_plain_text("Hello\nWorld").unwrap();
+    let richer = NodeDoc::from_plain_text("Hello\nWorld").unwrap();
     let diff = richer.diff_since(&base.state_vector()).unwrap();
     let changes_b64 = base64::engine::general_purpose::STANDARD.encode(&diff);
     let edit = ApplyEditRequest {
@@ -88,6 +92,7 @@ async fn resending_an_applied_content_edit_produces_no_notification_or_modified_
     };
 
     // The real application: must notify.
+    let seeded_modified = handler.get_node(&pimble_server::service_extensions(), GetNodeRequest { store_id, node_id }).await.unwrap().node.metadata.modified_at;
     handler.apply_edit(&pimble_server::service_extensions(), edit.clone()).await.unwrap();
     let (notif, _sub_id) = tokio::time::timeout(Duration::from_secs(1), sub.next::<StoreChangedNotification>())
         .await
@@ -98,73 +103,106 @@ async fn resending_an_applied_content_edit_produces_no_notification_or_modified_
         matches!(notif.change_kind, StoreChangeKind::ContentUpdated { node_id: n } if n == node_id),
         "expected ContentUpdated for the real edit, got {:?}", notif.change_kind
     );
+    assert!(notif.update.is_some(), "the edit's bytes ride the notification");
 
+    // A person's edit stamps `modified_at` with the flush: one stamp, its
+    // own `MetadataUpdated` carrying the stamp's bytes.
+    let (stamp, _sub_id) = tokio::time::timeout(PAST_FLUSH_DEBOUNCE, sub.next::<StoreChangedNotification>())
+        .await
+        .expect("expected the modified_at stamp after the flush debounce")
+        .expect("subscription still open")
+        .expect("notification decodes");
+    assert!(
+        matches!(stamp.change_kind, StoreChangeKind::MetadataUpdated { node_id: n } if n == node_id),
+        "expected MetadataUpdated for the stamp, got {:?}", stamp.change_kind
+    );
+    assert!(stamp.update.is_some() && stamp.source_client_id.is_none(), "the server's own edit, with bytes");
     let modified_before = handler.get_node(&pimble_server::service_extensions(), GetNodeRequest { store_id, node_id }).await.unwrap().node.metadata.modified_at;
+    assert!(modified_before > seeded_modified, "the edit moved modified_at");
 
     // The resend: same bytes, already fully merged.
     handler.apply_edit(&pimble_server::service_extensions(), edit).await.unwrap();
 
-    let resend_notif = tokio::time::timeout(Duration::from_millis(500), sub.next::<StoreChangedNotification>()).await;
+    let resend_notif = tokio::time::timeout(PAST_FLUSH_DEBOUNCE, sub.next::<StoreChangedNotification>()).await;
     assert!(resend_notif.is_err(), "expected no notification for the resend, got {:?}", resend_notif);
 
     let modified_after = handler.get_node(&pimble_server::service_extensions(), GetNodeRequest { store_id, node_id }).await.unwrap().node.metadata.modified_at;
     assert_eq!(modified_before, modified_after, "resending an already-merged edit must not touch modified_at");
 }
 
-/// The same, for `applyStoreUpdate`/`TreeStructure`: a peer's diff already
-/// fully reflected in the server's store document produces no notification
-/// and touches no node's `modified_at`.
+/// The same, for a structural update: a peer's tree edit (a node created,
+/// sent as the two documents' updates) already fully reflected in the
+/// server's documents produces no notification and touches no node's
+/// `modified_at`.
 #[tokio::test]
-async fn resending_an_applied_store_update_produces_no_notification_or_modified_at_change() {
+async fn resending_an_applied_structure_update_produces_no_notification_or_modified_at_change() {
     let (handler, store_id, root_id, _dir) = new_handler_with_store().await;
 
     let mut module = handler.clone().into_rpc();
     module.extensions_mut().insert(pimble_server::Principal::Service);
     let mut sub = module.subscribe_unbounded("pimble_subscribeStoreChanges", (store_id,)).await.unwrap();
 
-    // Bootstrap an independent, fully mergeable replica of the server's
-    // current store document (same "disjoint state vector" technique
-    // `store_sync.rs` uses), then have it add a node and diff just that.
-    let bootstrap = handler
-        .sync_store_document(&pimble_server::service_extensions(), pimble_rpc::SyncStoreDocumentRequest {
-            store_id,
-            state_vector: base64::engine::general_purpose::STANDARD.encode(
-                pimble_crdt::StoreDocument::new("bootstrap", NodeId::new()).unwrap().state_vector(),
-            ),
-        })
-        .await
-        .unwrap();
-    let snapshot = base64::engine::general_purpose::STANDARD.decode(&bootstrap.diff).unwrap();
-    let mut peer = pimble_crdt::StoreDocument::load(&snapshot).unwrap();
-    let peer_sv_before = peer.state_vector();
+    // A peer holding the server's one document (the root), as `syncNodes`
+    // hands it out, adds a node in its own tree.
+    let root_bytes = {
+        let resp = handler
+            .sync_nodes(&pimble_server::service_extensions(), SyncNodesRequest {
+                store_id,
+                nodes: vec![NodeStateVector { node_id: root_id, state_vector: base64::engine::general_purpose::STANDARD.encode(pimble_crdt::empty_state_vector()) }],
+                list_unknown: false,
+            })
+            .await
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.decode(&resp.nodes[0].diff).unwrap()
+    };
+    let mut peer = Tree::from_docs(root_id, [(root_id, NodeDoc::load(&root_bytes).unwrap())].into_iter().collect());
     let new_node_id = NodeId::new();
-    peer.add_node(new_node_id, Some(root_id), "document", "From Peer").unwrap();
-    let update = peer.diff_since(&peer_sv_before).unwrap();
-    let update_b64 = base64::engine::general_purpose::STANDARD.encode(&update);
-    let request = ApplyStoreUpdateRequest { store_id, client_id: "peer".into(), update: update_b64 };
+    let edit = peer.add_node(new_node_id, Some(root_id), None, "document", "From Peer", "2026-09-18T10:00:00Z").unwrap();
+    let requests: Vec<ApplyEditRequest> = edit
+        .touched
+        .iter()
+        .map(|(node_id, update)| ApplyEditRequest {
+            store_id,
+            node_id: *node_id,
+            client_id: "peer".into(),
+            operation: EditOperation::IncrementalChanges { changes: base64::engine::general_purpose::STANDARD.encode(update) },
+        })
+        .collect();
 
-    // The real application: must notify.
-    handler.apply_store_update(&pimble_server::service_extensions(), request.clone()).await.unwrap();
-    let (notif, _sub_id) = tokio::time::timeout(Duration::from_secs(1), sub.next::<StoreChangedNotification>())
-        .await
-        .expect("expected a notification for the real update")
-        .expect("subscription still open")
-        .expect("notification decodes");
+    // The real application: must notify, once per document.
+    for request in &requests {
+        handler.apply_edit(&pimble_server::service_extensions(), request.clone()).await.unwrap();
+    }
+    let mut kinds = Vec::new();
+    for _ in 0..2 {
+        let (notif, _sub_id) = tokio::time::timeout(Duration::from_secs(1), sub.next::<StoreChangedNotification>())
+            .await
+            .expect("expected a notification for the real update")
+            .expect("subscription still open")
+            .expect("notification decodes");
+        kinds.push(notif.change_kind);
+    }
     assert!(
-        matches!(&notif.change_kind, StoreChangeKind::TreeStructure { node_ids } if node_ids.contains(&new_node_id)),
-        "expected TreeStructure naming the new node, got {:?}", notif.change_kind
+        kinds.iter().any(|k| matches!(k, StoreChangeKind::NodeCreated { node_id, parent_id } if *node_id == new_node_id && *parent_id == root_id)),
+        "expected NodeCreated for the peer's node, got {:?}", kinds
+    );
+    assert!(
+        kinds.iter().any(|k| matches!(k, StoreChangeKind::TreeStructure { node_ids } if node_ids == &vec![root_id])),
+        "expected TreeStructure for the root's list, got {:?}", kinds
     );
 
     let modified_before = handler.get_node(&pimble_server::service_extensions(), GetNodeRequest { store_id, node_id: root_id }).await.unwrap().node.metadata.modified_at;
 
     // The resend: same bytes, already fully merged.
-    handler.apply_store_update(&pimble_server::service_extensions(), request).await.unwrap();
+    for request in requests {
+        handler.apply_edit(&pimble_server::service_extensions(), request).await.unwrap();
+    }
 
-    let resend_notif = tokio::time::timeout(Duration::from_millis(500), sub.next::<StoreChangedNotification>()).await;
+    let resend_notif = tokio::time::timeout(PAST_FLUSH_DEBOUNCE, sub.next::<StoreChangedNotification>()).await;
     assert!(resend_notif.is_err(), "expected no notification for the resend, got {:?}", resend_notif);
 
     let modified_after = handler.get_node(&pimble_server::service_extensions(), GetNodeRequest { store_id, node_id: root_id }).await.unwrap().node.metadata.modified_at;
-    assert_eq!(modified_before, modified_after, "resending an already-merged store update must not touch modified_at");
+    assert_eq!(modified_before, modified_after, "resending an already-merged structure update must not touch modified_at");
 }
 
 // ── Two real servers, relinking with no edits ───────────────────────────
@@ -224,10 +262,10 @@ async fn wait_for_an_offending_notification(
 }
 
 /// Two servers, synced once (with a node already created and deleted, so
-/// both sides' store documents carry a real delete set — not just
+/// both sides' documents carry real delete sets and a tombstone — not just
 /// insertions), unlinked and relinked with no further edits: decision 7
-/// means neither side pushes a no-op `applyStoreUpdate`, so decision 8 never
-/// even has a resend to swallow — no `ContentUpdated`/`TreeStructure`
+/// means neither side pushes a no-op `applyEdit`, so decision 8 never even
+/// has a resend to swallow — no `ContentUpdated`/`TreeStructure`
 /// notification appears on either side, and no node's `modified_at` moves.
 #[tokio::test]
 async fn relinking_two_already_synced_servers_produces_no_notifications() {

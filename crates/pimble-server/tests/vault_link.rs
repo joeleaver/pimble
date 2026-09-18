@@ -32,7 +32,7 @@ use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use pimble_client::PimbleClient;
 use pimble_core::{AuthMethod, NodeId, StoreId, StoreKind};
-use pimble_crdt::ContentDoc;
+use pimble_crdt::NodeDoc;
 use pimble_crypto::{derive_password_keys, wrap_account_keys, AccountKeyBlob, AccountKeys, KdfParams, KeyEnvelope};
 use pimble_rpc::{EditOperation, VaultDocId};
 use pimble_server::{PimbleServer, ServerConfig};
@@ -60,13 +60,13 @@ where
 
 async fn node_text(client: &PimbleClient, store_id: StoreId, node_id: NodeId) -> String {
     match client.get_node(store_id, node_id).await {
-        Ok(node) => ContentDoc::text_of(&node.content),
+        Ok(node) => NodeDoc::text_of(&node.content),
         Err(_) => String::new(),
     }
 }
 
 async fn seed_content(client: &PimbleClient, store_id: StoreId, node_id: NodeId, client_id: &str, text: &str) {
-    let doc = ContentDoc::from_plain_text(text).unwrap();
+    let doc = NodeDoc::from_plain_text(text).unwrap();
     let changes = base64::engine::general_purpose::STANDARD.encode(doc.save());
     client
         .apply_edit(store_id, node_id, client_id, EditOperation::IncrementalChanges { changes })
@@ -544,6 +544,63 @@ async fn a_second_server_receives_content_and_a_reply_edit_reaches_the_first() {
     b.stop().await.unwrap();
 }
 
+/// A twin hosted before docs/NODE_DOCUMENT_CONTRACT.md still lists the
+/// `tree` document of that layout. Nothing reads it any more: a device
+/// adding the store skips it, builds the tree from the node documents, and
+/// edits flow both ways as if it were not there.
+#[tokio::test]
+async fn a_hosted_twin_with_a_retired_tree_document_is_read_without_harm() {
+    let env = spawn_env().await;
+
+    let (mut a, client_a, a_dir) = start_local_server().await;
+    client_a.cloud_sign_in(&env.stub_url, &env.email, &env.password).await.unwrap();
+    let (store_id, root_id) = client_a.create_store(a_dir.path().join("a.pimble"), "Old").await.unwrap();
+    let doc_id = client_a.create_node(store_id, Some(root_id), "document", "Doc").await.unwrap();
+    seed_content(&client_a, store_id, doc_id, "seed", "from A").await;
+    client_a.cloud_host_store(store_id).await.unwrap();
+
+    let doc_key = VaultDocId::Node(doc_id);
+    let seeded = wait_until(Duration::from_secs(10), || async {
+        env.h_admin.vault_fetch(store_id, doc_key.clone(), 0).await.map(|f| f.head > 0).unwrap_or(false)
+    })
+    .await;
+    assert!(seeded, "A's content must reach the vault before B can pull it");
+
+    // What the old layout's link left behind: a tree document. Its bytes
+    // are never looked at, so they need not even be a blob.
+    env.h_admin
+        .vault_append(store_id, VaultDocId::Tree, URL_SAFE_NO_PAD.encode(b"a tree document from the layout before"))
+        .await
+        .expect("the hosted server takes any document id");
+    assert!(
+        env.h_admin.vault_list_docs(store_id).await.unwrap().iter().any(|d| d.doc_id == VaultDocId::Tree),
+        "the twin lists the retired document"
+    );
+
+    let (mut b, client_b, _b_dir) = start_local_server().await;
+    client_b.cloud_sign_in(&env.stub_url, &env.email, &env.password).await.unwrap();
+    let store_on_b = client_b.cloud_add_hosted_store(store_id).await.expect("B adds the hosted store");
+    assert_eq!(store_on_b.root_node_id, root_id, "the root comes from the node documents, not the retired one");
+    let (_, b_children) = wait_children_nonempty(&client_b, store_id, store_on_b.root_node_id).await;
+    assert_eq!(b_children.len(), 1);
+    let b_doc_id = b_children[0].id;
+    let pulled = wait_until(Duration::from_secs(10), || async { node_text(&client_b, store_id, b_doc_id).await.contains("from A") }).await;
+    assert!(pulled, "B must receive A's content beside the retired document");
+
+    seed_content(&client_b, store_id, b_doc_id, "b-editor", "from B").await;
+    let reached_a = wait_until(Duration::from_secs(10), || async { node_text(&client_a, store_id, doc_id).await.contains("from B") }).await;
+    assert!(reached_a, "an edit on B must reach A");
+
+    let synced = wait_until(Duration::from_secs(10), || async {
+        matches!(client_b.get_store_sync(store_id).await, Ok((_, pimble_core::SyncState::Synced { .. })))
+    })
+    .await;
+    assert!(synced, "the retired document must not trouble the link");
+
+    a.stop().await.unwrap();
+    b.stop().await.unwrap();
+}
+
 /// Regression test (2026-09-17, Joe's desktop and the web app on one hosted
 /// store: the web's edits reached the desktop, the desktop's never reached the
 /// web). An edit made while the link is down was never pushed: a reconnect
@@ -767,6 +824,10 @@ async fn interleaved_edits_from_two_servers_on_one_hosted_document_converge() {
     let (store_id, root_id) = client_a.create_store(a_dir.path().join("a.pimble"), "Interleave").await.unwrap();
     let doc_id = client_a.create_node(store_id, Some(root_id), "document", "Doc").await.unwrap();
     seed_content(&client_a, store_id, doc_id, "seed", "start").await;
+    // Past the flush debounce, so the seed's `modified_at` stamp is inside
+    // the whole document the link uploads first, not an append of its own
+    // (the count at the end depends on it).
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
     client_a.cloud_host_store(store_id).await.unwrap();
 
     let doc_key = VaultDocId::Node(doc_id);
@@ -834,12 +895,18 @@ async fn interleaved_edits_from_two_servers_on_one_hosted_document_converge() {
     // even a redundant local re-apply of a blob a side already has leaves
     // the text unchanged — it's silent there). If either link ever forwarded
     // its own echoed append back out as if it were a new local edit, the
-    // node document's log would hold more than exactly one append per edit.
+    // node document's log would hold more than one append per edit. What
+    // is in the log: the seeded document, the 8 edits, and each side's
+    // `modified_at` stamp (a person's edits earn one per flush window per
+    // node; a side's four edits land within one window, unless the machine
+    // stalls between two of them, which makes one more). Counted once the
+    // stamps have had their window and their append.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
     let final_head = env.h_admin.vault_fetch(store_id, doc_key.clone(), 0).await.unwrap().head;
-    assert_eq!(
-        final_head, 9,
-        "exactly one append per edit (1 seed + 8 interleaved) must reach the hosted log; \
-         more would mean a link re-forwarded an echo of its own (or the other side's) append"
+    assert!(
+        (11..=12).contains(&final_head),
+        "1 seed + 8 interleaved edits + one modified_at stamp per side must reach the hosted log, got {final_head}; \
+         many more would mean a link re-forwarded an echo of its own (or the other side's) append"
     );
 
     a.stop().await.unwrap();

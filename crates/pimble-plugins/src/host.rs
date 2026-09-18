@@ -105,11 +105,11 @@ impl NodePlugin for DocumentPlugin {
     }
 
     fn extract_text(&self, content: &[u8]) -> Result<String> {
-        Ok(pimble_crdt::ContentDoc::text_of(content))
+        Ok(pimble_crdt::NodeDoc::text_of(content))
     }
 
     fn index_units(&self, content: &[u8]) -> Result<Vec<pimble_core::IndexUnit>> {
-        Ok(pimble_crdt::ContentDoc::units_of(content))
+        Ok(pimble_crdt::NodeDoc::units_of(content))
     }
 
     fn validate(&self, _content: &[u8]) -> Result<ValidationResult> {
@@ -117,7 +117,7 @@ impl NodePlugin for DocumentPlugin {
     }
 
     fn init_content(&self) -> Result<Vec<u8>> {
-        Ok(pimble_crdt::ContentDoc::new().save())
+        Ok(pimble_crdt::NodeDoc::new().save())
     }
 }
 
@@ -182,8 +182,8 @@ mod tests {
     use pimble_core::UnitKind;
 
     #[test]
-    fn document_plugin_index_units_delegates_to_content_doc() {
-        let content = pimble_crdt::ContentDoc::from_plain_text("hello\nworld").unwrap();
+    fn document_plugin_index_units_delegates_to_node_doc() {
+        let content = pimble_crdt::NodeDoc::from_plain_text("hello\nworld").unwrap();
         let units = DocumentPlugin.index_units(&content.save()).unwrap();
         assert_eq!(units.len(), 2);
         assert_eq!(units[0].kind, UnitKind::Prose);
@@ -193,8 +193,8 @@ mod tests {
 
     #[test]
     fn document_plugin_empty_content_yields_no_units() {
-        let empty = pimble_crdt::ContentDoc::new().save();
-        // An empty ContentDoc still projects to one empty paragraph.
+        let empty = pimble_crdt::NodeDoc::new().save();
+        // An empty NodeDoc has no projection yet and so no units.
         let units = DocumentPlugin.index_units(&empty).unwrap();
         assert!(units.iter().all(|u| u.text.is_empty()));
     }

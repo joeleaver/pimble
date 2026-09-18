@@ -73,7 +73,7 @@ pub struct MountInfo {
 /// empty or unreadable content, in which case the caller falls back to the
 /// node's title.
 pub fn get_node_content_text(content: &[u8]) -> String {
-    pimble_crdt::ContentDoc::text_of(content)
+    pimble_crdt::NodeDoc::text_of(content)
 }
 
 /// Compute a display label from an explicit-title flag/title plus a plain-text

@@ -26,7 +26,7 @@ mod collab_sync_test {
     //! Proves the new rinch M9 collaboration (`EditorHandle` + `CollabSession`)
     //! converges through the exact relay shape pimble uses — base64 yrs
     //! deltas over `BroadcastChanges`/`RemoteChanges` — and that pimble's server
-    //! `apply_edit` (a `pimble_crdt::ContentDoc::apply_update`) accepts those deltas,
+    //! `apply_edit` (a `pimble_crdt::NodeDoc::apply_update`) accepts those deltas,
     //! which is the integration assumption the whole migration rests on.
 
     use rinch::prelude::*;
@@ -71,10 +71,10 @@ mod collab_sync_test {
             .start_collaboration_host(move |d| tb.borrow_mut().push(d))
             .expect("host projects the flat document");
 
-        // The pimble server loads that snapshot into its per-node `ContentDoc`
+        // The pimble server loads that snapshot into its per-node `NodeDoc`
         // (exactly what `update_node_content` does) and will apply deltas to it
         // (exactly what `apply_edit` does).
-        let mut server_doc = pimble_crdt::ContentDoc::load(&snapshot).unwrap();
+        let mut server_doc = pimble_crdt::NodeDoc::load(&snapshot).unwrap();
 
         // Client B joins from the snapshot and adopts the document.
         let b = create_editor();

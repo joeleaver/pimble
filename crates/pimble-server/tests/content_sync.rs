@@ -1,18 +1,18 @@
-//! Server-boundary tests for node content sync (Phase A: content on yrs).
+//! Server-boundary tests for node content sync (Phase A: content on yrs,
+//! now one document per node with its structure beside it).
 //!
 //! These call `RpcHandler` directly, bypassing the network transport, to
 //! exercise exactly the code paths a real client hits over JSON-RPC: the
-//! server is the authoritative peer holding one `ContentDoc` per open node,
-//! and relays/persists updates without ever re-encoding or interpreting
-//! them.
+//! server is the authoritative peer holding one `NodeDoc` per node, and
+//! relays/persists updates without ever re-encoding or interpreting them.
 
 use std::sync::Arc;
 
 use base64::Engine;
-use pimble_crdt::ContentDoc;
+use pimble_crdt::NodeDoc;
 use pimble_rpc::{
     ApplyEditRequest, CreateNodeRequest, CreateStoreRequest, EditOperation, GetNodeRequest,
-    NodeStateVector, PimbleApiServer, SyncNodeContentsRequest, UpdateNodeContentRequest,
+    NodeStateVector, PimbleApiServer, SyncNodesRequest, UpdateNodeContentRequest,
 };
 use pimble_server::RpcHandler;
 use pimble_store::StoreManager;
@@ -56,7 +56,7 @@ async fn new_handler_with_store() -> (RpcHandler, pimble_core::StoreId, pimble_c
 async fn sync_node_content_hands_new_client_the_full_document() {
     let (handler, store_id, node_id, _dir) = new_handler_with_store().await;
 
-    let a_doc = ContentDoc::from_plain_text("Hello").unwrap();
+    let a_doc = NodeDoc::from_plain_text("Hello").unwrap();
     let content_b64 = base64::engine::general_purpose::STANDARD.encode(a_doc.save());
 
     handler
@@ -72,11 +72,12 @@ async fn sync_node_content_hands_new_client_the_full_document() {
     // An "empty" state vector is the properly-encoded state vector of an
     // empty document, not literally zero bytes.
     let empty_sv_b64 = base64::engine::general_purpose::STANDARD
-        .encode(ContentDoc::new().state_vector());
+        .encode(NodeDoc::new().state_vector());
     let sync_resp = handler
-        .sync_node_contents(&pimble_server::service_extensions(), SyncNodeContentsRequest {
+        .sync_nodes(&pimble_server::service_extensions(), SyncNodesRequest {
             store_id,
             nodes: vec![NodeStateVector { node_id, state_vector: empty_sv_b64 }],
+            list_unknown: false,
         })
         .await
         .unwrap();
@@ -84,10 +85,13 @@ async fn sync_node_content_hands_new_client_the_full_document() {
     let sync_resp = &sync_resp.nodes[0];
     assert_eq!(sync_resp.node_id, node_id);
 
+    // The diff is the whole node document: its text, and its place.
     let diff_bytes = base64::engine::general_purpose::STANDARD
         .decode(&sync_resp.diff)
         .unwrap();
-    assert_eq!(ContentDoc::text_of(&diff_bytes), "Hello");
+    let doc = NodeDoc::load(&diff_bytes).unwrap();
+    assert_eq!(doc.text(), "Hello");
+    assert_eq!(doc.fields().unwrap().title, "Doc");
 
     // The server's returned state vector should not be empty now that it
     // holds content.
@@ -103,7 +107,7 @@ async fn sync_node_content_hands_new_client_the_full_document() {
 async fn apply_edit_incremental_changes_merges_into_server_document() {
     let (handler, store_id, node_id, _dir) = new_handler_with_store().await;
 
-    let base = ContentDoc::from_plain_text("Hello").unwrap();
+    let base = NodeDoc::from_plain_text("Hello").unwrap();
     let content_b64 = base64::engine::general_purpose::STANDARD.encode(base.save());
     handler
         .update_node_content(&pimble_server::service_extensions(), UpdateNodeContentRequest {
@@ -117,7 +121,7 @@ async fn apply_edit_incremental_changes_merges_into_server_document() {
 
     // A peer document that has diverged with more text than the server
     // currently holds state for.
-    let richer = ContentDoc::from_plain_text("Hello\nWorld").unwrap();
+    let richer = NodeDoc::from_plain_text("Hello\nWorld").unwrap();
     let base_sv = base.state_vector();
     let diff = richer.diff_since(&base_sv).unwrap();
     let changes_b64 = base64::engine::general_purpose::STANDARD.encode(&diff);
@@ -138,7 +142,7 @@ async fn apply_edit_incremental_changes_merges_into_server_document() {
         .unwrap()
         .node;
 
-    let server_text = ContentDoc::text_of(&node.content);
+    let server_text = NodeDoc::text_of(&node.content);
     assert!(
         server_text.contains("Hello") && server_text.contains("World"),
         "expected server text to contain both \"Hello\" and \"World\", got {:?}",
@@ -154,7 +158,7 @@ async fn apply_edit_incremental_changes_merges_into_server_document() {
 async fn apply_edit_incremental_changes_is_flushed_to_disk_after_debounce() {
     let (handler, store_id, node_id, dir) = new_handler_with_store().await;
 
-    let base = ContentDoc::from_plain_text("Hello").unwrap();
+    let base = NodeDoc::from_plain_text("Hello").unwrap();
     let content_b64 = base64::engine::general_purpose::STANDARD.encode(base.save());
     handler
         .update_node_content(&pimble_server::service_extensions(), UpdateNodeContentRequest {
@@ -166,7 +170,7 @@ async fn apply_edit_incremental_changes_is_flushed_to_disk_after_debounce() {
         .await
         .unwrap();
 
-    let richer = ContentDoc::from_plain_text("Hello\nWorld").unwrap();
+    let richer = NodeDoc::from_plain_text("Hello\nWorld").unwrap();
     let base_sv = base.state_vector();
     let diff = richer.diff_since(&base_sv).unwrap();
     let changes_b64 = base64::engine::general_purpose::STANDARD.encode(&diff);
@@ -190,9 +194,9 @@ async fn apply_edit_incremental_changes_is_flushed_to_disk_after_debounce() {
     let store_path = dir.path().join("test.pimble");
     let mut fresh_manager = StoreManager::new();
     fresh_manager.open_local_store(&store_path).await.unwrap();
-    let node = fresh_manager.get_node(store_id, node_id).await.unwrap();
+    let node = fresh_manager.get_node(store_id, node_id).unwrap();
 
-    let text = ContentDoc::text_of(&node.content);
+    let text = NodeDoc::text_of(&node.content);
     assert!(
         text.contains("World"),
         "expected the debounced flush to have persisted the edit, got {:?}",

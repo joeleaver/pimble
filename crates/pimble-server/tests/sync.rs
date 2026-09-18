@@ -11,7 +11,7 @@ use std::time::Duration;
 use base64::Engine;
 use pimble_client::PimbleClient;
 use pimble_core::{AuthMethod, NodeId, RemoteEndpoint, StoreId, SyncState};
-use pimble_crdt::ContentDoc;
+use pimble_crdt::NodeDoc;
 use pimble_rpc::{EditOperation, StoreChangeKind};
 use pimble_server::{PimbleServer, ServerConfig};
 
@@ -52,17 +52,17 @@ fn remote_endpoint(addr: std::net::SocketAddr) -> RemoteEndpoint {
 /// string if the node can't be fetched (e.g. it hasn't replicated yet).
 async fn node_text(client: &PimbleClient, store_id: StoreId, node_id: NodeId) -> String {
     match client.get_node(store_id, node_id).await {
-        Ok(node) => ContentDoc::text_of(&node.content),
+        Ok(node) => NodeDoc::text_of(&node.content),
         Err(_) => String::new(),
     }
 }
 
 /// Send `text` as a full-document `applyEdit` delta from empty (a fresh
-/// node's content is empty, so `ContentDoc::from_plain_text(text).save()`
+/// node's content is empty, so `NodeDoc::from_plain_text(text).save()`
 /// — the whole document encoded as an update from an empty state vector —
 /// is exactly the right "incremental" payload).
 async fn seed_content(client: &PimbleClient, store_id: StoreId, node_id: NodeId, client_id: &str, text: &str) {
-    let doc = ContentDoc::from_plain_text(text).unwrap();
+    let doc = NodeDoc::from_plain_text(text).unwrap();
     let changes = base64::engine::general_purpose::STANDARD.encode(doc.save());
     client
         .apply_edit(store_id, node_id, client_id, EditOperation::IncrementalChanges { changes })
@@ -77,8 +77,8 @@ async fn seed_content(client: &PimbleClient, store_id: StoreId, node_id: NodeId,
 /// old and new text once merged, though not as a single clean edit).
 async fn diverge_content(client: &PimbleClient, store_id: StoreId, node_id: NodeId, client_id: &str, new_text: &str) {
     let current = client.get_node(store_id, node_id).await.unwrap();
-    let base = ContentDoc::load(&current.content).unwrap();
-    let richer = ContentDoc::from_plain_text(new_text).unwrap();
+    let base = NodeDoc::load(&current.content).unwrap();
+    let richer = NodeDoc::from_plain_text(new_text).unwrap();
     let diff = richer.diff_since(&base.state_vector()).unwrap();
     let changes = base64::engine::general_purpose::STANDARD.encode(&diff);
     client

@@ -1,19 +1,26 @@
-//! Replica sync link: keeps one local store's tree and node content merged
-//! with the same store held by a remote Pimble server (`docs/SYNC_CONTRACT.md`).
+//! Replica sync link: keeps one local store's node documents merged with the
+//! same store held by a remote Pimble server (`docs/SYNC_CONTRACT.md`, over
+//! the documents of docs/NODE_DOCUMENT_CONTRACT.md section 4).
 //!
 //! One [`SyncLink`] per linked store, owned by `RpcHandler::links`. It never
 //! touches `LocalStore` directly for writes: a remote change is merged in
-//! through the handler's own `apply_edit`/`apply_store_update` (the same
-//! entry points any client uses), so local subscribers, the search index,
-//! and persistence all behave exactly as if an ordinary client had sent the
-//! change, with `client_id = "sync-link:<uuid>"`.
+//! through the handler's own `apply_node_update_from` (the same path
+//! `applyEdit` takes), so local subscribers, the search index, persistence
+//! and the tree repair all behave exactly as if an ordinary client had sent
+//! the change, with `client_id = "sync-link:<uuid>"`.
 //!
-//! Reconcile procedure (decision 5): for the store document,
-//! `(d_r, sv_r) = remote.syncStoreDocument(sv_local)`; apply `d_r` locally
-//! if not empty; `d_l = local diff since sv_r`; `remote.applyStoreUpdate(d_l)`
-//! if not empty. A node's content document reconciles the same way via
-//! `syncNodeContent`/`applyEdit`. A full reconcile does the store document
-//! first, then every node id in the (now up to date) local store document.
+//! There is one shape for everything: a node's text, its place in the tree
+//! and its metadata are one document, so the link knows nothing about
+//! content or structure. Reconcile (decision 5, per document): `syncNodes`
+//! with every held document's state vector and `list_unknown`, apply what
+//! the remote answers, fetch the documents it named that this store does not
+//! hold, push back per document what the remote lacks
+//! (`diff_if_peer_lacks_it`, decision 7) and every document the remote does
+//! not hold at all, then repair the tree once. Live: every notification that
+//! carries a document's bytes is forwarded as an `applyEdit` for that
+//! document, in both directions, and a change bouncing back merges as a
+//! no-op that sends nothing (decision 8), which is what lets an edit travel a
+//! whole chain of servers without an echo storm.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -23,25 +30,22 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use pimble_client::PimbleClient;
 use pimble_core::{AuthMethod, NodeId, RemoteEndpoint, StoreId, SyncState};
-use pimble_rpc::{
-    ApplyEditRequest, ApplyStoreUpdateRequest, EditOperation, PimbleApiServer, StoreChangeKind,
-    StoreChangedNotification, MAX_SYNC_NODE_CONTENTS,
-};
+use pimble_rpc::{EditOperation, StoreChangeKind, StoreChangedNotification, MAX_SYNC_NODE_CONTENTS};
 use pimble_store::SyncConfig;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::handler::{LocalChange, RpcHandler};
+use crate::handler::{LocalChange, Repair, RpcHandler};
 
 /// Initial retry backoff on a dropped or failed connection; doubles up to
 /// [`MAX_BACKOFF`] (decision 6).
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
-/// Debounce window for a reconcile triggered by a structural notification
-/// with no update bytes (decision 5), so a burst of them yields one round
-/// trip.
+/// Debounce window for a reconcile of one document triggered by a
+/// notification about it that carried no bytes (an older peer's), so a burst
+/// of them yields one round trip.
 const RECONCILE_DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// A running sync link for one store. Always call [`SyncLinkHandle::stop`]
@@ -245,36 +249,41 @@ async fn connect_and_sync(
         .await
         .map_err(|e| anyhow::anyhow!("{}", pimble_client::describe_connect_error(&remote.url, &e)))?;
 
-    full_reconcile(handler, &client, store_id, link_id).await?;
-
-    let mut remote_sub = client
+    // Both channels are open before the reconcile, not after it: what
+    // happens during it (the remote repairing its tree after this side's
+    // pushes; this side's own repair at the end) would otherwise be seen by
+    // neither, and two replicas each holding a repair the other never got
+    // do not converge (each would delete the other's duplicate and put its
+    // own back, for ever).
+    let remote_sub = client
         .subscribe_store_changes(store_id)
         .await
         .map_err(|e| anyhow::anyhow!("subscribe to {} storeChanged failed: {}", remote.url, e))?;
-    let mut local_rx = handler.subscribe_local_changes().await;
+    let local_rx = handler.subscribe_local_changes().await;
+    let (reconcile_tx, mut reconcile_rx) = mpsc::unbounded_channel::<NodeId>();
+    let mut channels = Channels { remote_sub, local_rx, debouncer: Arc::new(ReconcileDebouncer::new()), reconcile_tx };
 
-    let debouncer = Arc::new(ReconcileDebouncer::new());
-    let (reconcile_tx, mut reconcile_rx) = mpsc::unbounded_channel::<ReconcileTrigger>();
+    full_reconcile(handler, &client, store_id, link_id, &mut channels).await?;
 
     set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
     info!("Sync link for store {} connected to {}", store_id, remote.url);
 
     loop {
         tokio::select! {
-            item = remote_sub.next() => {
+            item = channels.remote_sub.next() => {
                 match item {
                     Some(Ok(notif)) => {
-                        handle_remote_notification(handler, &client, store_id, link_id, notif, &debouncer, &reconcile_tx).await?;
+                        handle_remote_notification(handler, store_id, link_id, notif, &channels.debouncer, &channels.reconcile_tx, Repair::Debounced).await?;
                         set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
                     }
                     Some(Err(e)) => return Err(anyhow::anyhow!("remote notification decode error: {}", e)),
                     None => return Err(anyhow::anyhow!("remote subscription closed")),
                 }
             }
-            change = local_rx.recv() => {
+            change = channels.local_rx.recv() => {
                 match change {
                     Ok(local_change) => {
-                        forward_local_change(handler, &client, store_id, link_id, local_change, &debouncer, &reconcile_tx).await?;
+                        forward_local_change(&client, store_id, link_id, local_change, &channels.debouncer, &channels.reconcile_tx).await?;
                         set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -294,11 +303,7 @@ async fn connect_and_sync(
             }
             trigger = reconcile_rx.recv() => {
                 match trigger {
-                    Some(ReconcileTrigger::Store) => {
-                        reconcile_store(handler, &client, store_id, link_id).await?;
-                        set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
-                    }
-                    Some(ReconcileTrigger::Node(node_id)) => {
+                    Some(node_id) => {
                         reconcile_node(handler, &client, store_id, node_id, link_id).await?;
                         set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
                     }
@@ -309,55 +314,102 @@ async fn connect_and_sync(
     }
 }
 
+/// What the live loop reads: the remote's `storeChanged` subscription, this
+/// server's local-change broadcast, and the debounced per-node reconcile
+/// triggers. Opened before the reconcile (see `connect_and_sync`) and
+/// drained between its batches, since the reconcile itself fills both: every
+/// document it applies here is a local notification (this link's own, and
+/// dropped as such), and every document it pushes comes back as the remote's
+/// echo. Left alone, a store of a few thousand documents would lag the
+/// broadcast (1024 slots) or overflow the subscription (which jsonrpsee then
+/// closes), and cost a second connection cycle to finish.
+struct Channels {
+    remote_sub: jsonrpsee::core::client::Subscription<StoreChangedNotification>,
+    local_rx: broadcast::Receiver<LocalChange>,
+    debouncer: Arc<ReconcileDebouncer>,
+    reconcile_tx: mpsc::UnboundedSender<NodeId>,
+}
+
+impl Channels {
+    /// Handle whatever both channels hold right now, without waiting for
+    /// more: a local change is forwarded, a remote one merged (with no
+    /// repair, the reconcile's own at the end covers it). The same errors
+    /// as the live loop's, for the same reasons.
+    async fn drain(&mut self, handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, link_id: &str) -> anyhow::Result<()> {
+        loop {
+            match self.local_rx.try_recv() {
+                Ok(change) => forward_local_change(client, store_id, link_id, change, &self.debouncer, &self.reconcile_tx).await?,
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    return Err(anyhow::anyhow!("missed {} local notifications (broadcast lag); reconnecting to reconcile", n));
+                }
+                Err(broadcast::error::TryRecvError::Closed) => return Err(anyhow::anyhow!("local change broadcast closed")),
+            }
+        }
+        loop {
+            // A zero timeout polls the subscription once and gives up if it
+            // is pending, which is the non-blocking read it has no method for.
+            match tokio::time::timeout(Duration::ZERO, self.remote_sub.next()).await {
+                Ok(Some(Ok(notif))) => {
+                    handle_remote_notification(handler, store_id, link_id, notif, &self.debouncer, &self.reconcile_tx, Repair::Later).await?;
+                }
+                Ok(Some(Err(e))) => return Err(anyhow::anyhow!("remote notification decode error: {}", e)),
+                Ok(None) => return Err(anyhow::anyhow!("remote subscription closed")),
+                Err(_) => break,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The document a notification is about, when it is about one: every kind
+/// but the link and mount states, which are derived and never forwarded
+/// (docs/history/REMOTE_MOUNTS_CONTRACT.md decision 6), and `VaultAppended`,
+/// which a plain link never sees (its remote is a plain twin).
+fn document_of(kind: &StoreChangeKind) -> Option<NodeId> {
+    match kind {
+        StoreChangeKind::NodeCreated { node_id, .. }
+        | StoreChangeKind::NodeDeleted { node_id, .. }
+        | StoreChangeKind::NodeMoved { node_id, .. }
+        | StoreChangeKind::MetadataUpdated { node_id }
+        | StoreChangeKind::ContentUpdated { node_id } => Some(*node_id),
+        StoreChangeKind::TreeStructure { node_ids } => node_ids.first().copied(),
+        StoreChangeKind::SyncStateChanged { .. }
+        | StoreChangeKind::MountStateChanged { .. }
+        | StoreChangeKind::VaultAppended { .. } => None,
+    }
+}
+
 // ── Remote -> local ─────────────────────────────────────────────────
 
 /// Apply one notification received from the remote's `storeChanged`
-/// subscription (decision 2, first bullet).
+/// subscription (decision 2, first bullet): its bytes are merged into the
+/// document it names. A document notification with no bytes (an older peer)
+/// reconciles that one document instead, after a debounce.
 async fn handle_remote_notification(
     handler: &RpcHandler,
-    client: &PimbleClient,
     store_id: StoreId,
     link_id: &str,
     notif: StoreChangedNotification,
     debouncer: &Arc<ReconcileDebouncer>,
-    reconcile_tx: &mpsc::UnboundedSender<ReconcileTrigger>,
+    reconcile_tx: &mpsc::UnboundedSender<NodeId>,
+    repair: Repair,
 ) -> anyhow::Result<()> {
     // Skip our own echo: a change we forwarded to the remote comes back to
     // us via our own subscription to its broadcast.
     if notif.source_client_id.as_deref() == Some(link_id) {
         return Ok(());
     }
-
-    match (&notif.change_kind, &notif.update) {
-        (StoreChangeKind::TreeStructure { .. }, Some(update_b64)) => {
-            apply_store_update_locally(handler, store_id, link_id, update_b64.clone()).await?;
-            debug!("Sync link for store {} applied a remote tree update", store_id);
+    let Some(node_id) = document_of(&notif.change_kind) else {
+        return Ok(());
+    };
+    match &notif.update {
+        Some(update_b64) => {
+            let bytes = base64::engine::general_purpose::STANDARD.decode(update_b64)?;
+            apply_update_locally(handler, store_id, node_id, link_id, &bytes, repair).await?;
+            debug!("Sync link for store {} applied a remote update to node {}", store_id, node_id);
         }
-        (StoreChangeKind::ContentUpdated { node_id }, Some(changes_b64)) => {
-            apply_edit_locally_with_fallback(handler, client, store_id, *node_id, link_id, changes_b64.clone()).await?;
-            debug!("Sync link for store {} applied a remote content edit to node {}", store_id, node_id);
-        }
-        (StoreChangeKind::ContentUpdated { node_id }, None) => {
-            // From `updateNodeContent` (a full snapshot, no delta bytes):
-            // reconcile that node's content document directly.
-            schedule_node_reconcile(debouncer, reconcile_tx, *node_id);
-        }
-        (StoreChangeKind::NodeCreated { .. }, _)
-        | (StoreChangeKind::NodeDeleted { .. }, _)
-        | (StoreChangeKind::NodeMoved { .. }, _)
-        | (StoreChangeKind::MetadataUpdated { .. }, _)
-        | (StoreChangeKind::TreeStructure { .. }, None) => {
-            schedule_store_reconcile(debouncer, reconcile_tx);
-        }
-        (StoreChangeKind::VaultAppended { .. }, _) => {
-            // A plain link never links a vault store; VaultLink handles these
-            // (docs/CRYPTO_CONTRACT.md).
-        }
-        (StoreChangeKind::SyncStateChanged { .. }, _) | (StoreChangeKind::MountStateChanged { .. }, _) => {
-            // The remote's own link state, or the state of its mounts
-            // (derived from its links); not ours to react to, and never
-            // forwarded (docs/history/REMOTE_MOUNTS_CONTRACT.md decision 6).
-        }
+        None => schedule_node_reconcile(debouncer, reconcile_tx, node_id),
     }
     Ok(())
 }
@@ -365,17 +417,17 @@ async fn handle_remote_notification(
 // ── Local -> remote ─────────────────────────────────────────────────
 
 /// Forward one local notification to the remote (decision 2, second
-/// bullet, as amended for chains: see the source check below). Node-content notifications carry nothing a store subscriber
-/// doesn't already get (decision 4 puts content deltas on the store
-/// notification too), so only `LocalChange::Store` is acted on here.
+/// bullet, as amended for chains: see the source check below). Node-content
+/// notifications carry nothing a store subscriber doesn't already get (the
+/// same bytes ride the store notification), so only `LocalChange::Store` is
+/// acted on here.
 async fn forward_local_change(
-    handler: &RpcHandler,
     client: &PimbleClient,
     store_id: StoreId,
     link_id: &str,
     change: LocalChange,
     debouncer: &Arc<ReconcileDebouncer>,
-    reconcile_tx: &mpsc::UnboundedSender<ReconcileTrigger>,
+    reconcile_tx: &mpsc::UnboundedSender<NodeId>,
 ) -> anyhow::Result<()> {
     let LocalChange::Store(notif) = change else {
         return Ok(());
@@ -394,217 +446,142 @@ async fn forward_local_change(
     if notif.source_client_id.as_deref() == Some(link_id) {
         return Ok(());
     }
-
-    match (&notif.change_kind, &notif.update) {
-        (StoreChangeKind::TreeStructure { .. }, Some(update_b64)) => {
-            let bytes = base64::engine::general_purpose::STANDARD.decode(update_b64)?;
+    let Some(node_id) = document_of(&notif.change_kind) else {
+        return Ok(());
+    };
+    match notif.update {
+        Some(changes) => {
             client
-                .apply_store_update(store_id, link_id, &bytes)
+                .apply_edit(store_id, node_id, link_id, EditOperation::IncrementalChanges { changes })
                 .await
-                .map_err(|e| anyhow::anyhow!("remote applyStoreUpdate failed: {}", e))?;
-            debug!("Sync link for store {} forwarded a local tree update", store_id);
+                .map_err(|e| anyhow::anyhow!("remote applyEdit for node {} failed: {}", node_id, e))?;
+            debug!("Sync link for store {} forwarded a local update to node {}", store_id, node_id);
         }
-        (StoreChangeKind::ContentUpdated { node_id }, Some(changes_b64)) => {
-            apply_edit_remotely_with_fallback(handler, client, store_id, *node_id, link_id, changes_b64.clone()).await?;
-            debug!("Sync link for store {} forwarded a local content edit for node {}", store_id, node_id);
-        }
-        (StoreChangeKind::ContentUpdated { node_id }, None) => {
-            schedule_node_reconcile(debouncer, reconcile_tx, *node_id);
-        }
-        (StoreChangeKind::NodeCreated { .. }, _)
-        | (StoreChangeKind::NodeDeleted { .. }, _)
-        | (StoreChangeKind::NodeMoved { .. }, _)
-        | (StoreChangeKind::MetadataUpdated { .. }, _)
-        | (StoreChangeKind::TreeStructure { .. }, None) => {
-            schedule_store_reconcile(debouncer, reconcile_tx);
-        }
-        (StoreChangeKind::SyncStateChanged { .. }, _)
-        | (StoreChangeKind::MountStateChanged { .. }, _)
-        | (StoreChangeKind::VaultAppended { .. }, _) => {}
+        None => schedule_node_reconcile(debouncer, reconcile_tx, node_id),
     }
     Ok(())
 }
 
-// ── Applying a change, with a structural fallback ───────────────────
-
-/// Merge a remote tree/metadata update into the local store document via
-/// the handler's own `applyStoreUpdate` (so persistence, local subscribers,
-/// and the search index all follow, per decision 1).
-async fn apply_store_update_locally(handler: &RpcHandler, store_id: StoreId, link_id: &str, update_b64: String) -> anyhow::Result<()> {
-    // A sync link's own merge of a remote change it already fetched with its
-    // own (out-of-band) credential — there is no per-request `Principal` to
-    // forward here, so this carries `Principal::Service`
-    // (docs/CLOUD_CONTRACT.md "B: pimble-server" item 4).
+/// Merge a remote update into the local document via the handler's own
+/// path (so persistence, local subscribers, the search index and the tree
+/// repair all follow, per decision 1). A sync link's own merge of a change
+/// it fetched with its own credential has no per-request `Principal` to
+/// forward; the handler's internal entry point authorises nothing
+/// (docs/CLOUD_CONTRACT.md "B: pimble-server" item 4).
+async fn apply_update_locally(handler: &RpcHandler, store_id: StoreId, node_id: NodeId, link_id: &str, update: &[u8], repair: Repair) -> anyhow::Result<()> {
     handler
-        .apply_store_update(&crate::principal::service_extensions(), ApplyStoreUpdateRequest { store_id, client_id: link_id.to_string(), update: update_b64 })
+        .apply_node_update_from(store_id, node_id, update, Some(link_id), repair)
         .await
-        .map_err(|e| anyhow::anyhow!("local applyStoreUpdate failed: {}", e))?;
-    Ok(())
-}
-
-/// Apply a remote content delta locally via the handler's own `applyEdit`.
-/// If that fails — most likely because the node's tree entry has not
-/// reached this replica yet, a race between the two notifications a single
-/// remote `applyEdit` and its node's earlier `NodeCreated` produce — pull
-/// the store document from the remote once and retry.
-async fn apply_edit_locally_with_fallback(
-    handler: &RpcHandler,
-    client: &PimbleClient,
-    store_id: StoreId,
-    node_id: NodeId,
-    link_id: &str,
-    changes_b64: String,
-) -> anyhow::Result<()> {
-    let op = EditOperation::IncrementalChanges { changes: changes_b64 };
-    let request = ApplyEditRequest { store_id, node_id, client_id: link_id.to_string(), operation: op.clone() };
-    // `Principal::Service`, for the same reason as `apply_store_update_locally` above.
-    let ext = crate::principal::service_extensions();
-    if handler.apply_edit(&ext, request).await.is_err() {
-        reconcile_store(handler, client, store_id, link_id).await?;
-        let retry = ApplyEditRequest { store_id, node_id, client_id: link_id.to_string(), operation: op };
-        handler
-            .apply_edit(&ext, retry)
-            .await
-            .map_err(|e| anyhow::anyhow!("local applyEdit failed even after reconciling the store document: {}", e))?;
-    }
-    Ok(())
-}
-
-/// The remote-side counterpart of [`apply_edit_locally_with_fallback`]: send
-/// a content delta to the remote via `applyEdit`, falling back to a store
-/// reconcile and one retry if the remote doesn't yet know the node.
-async fn apply_edit_remotely_with_fallback(
-    handler: &RpcHandler,
-    client: &PimbleClient,
-    store_id: StoreId,
-    node_id: NodeId,
-    link_id: &str,
-    changes_b64: String,
-) -> anyhow::Result<()> {
-    let op = EditOperation::IncrementalChanges { changes: changes_b64 };
-    if client.apply_edit(store_id, node_id, link_id, op.clone()).await.is_err() {
-        reconcile_store(handler, client, store_id, link_id).await?;
-        client
-            .apply_edit(store_id, node_id, link_id, op)
-            .await
-            .map_err(|e| anyhow::anyhow!("remote applyEdit failed even after reconciling the store document: {}", e))?;
-    }
+        .map_err(|e| anyhow::anyhow!("local applyEdit for node {} failed: {}", node_id, e.message()))?;
     Ok(())
 }
 
 // ── Reconcile ────────────────────────────────────────────────────────
 
-/// A full reconcile: the store document first, then the content of every
-/// node id in the (now up to date) local store document (decision 5), in
-/// `syncNodeContents` batches so a store of N nodes costs about N / 100
-/// round trips plus one per node that actually differs.
-async fn full_reconcile(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, link_id: &str) -> anyhow::Result<()> {
-    reconcile_store(handler, client, store_id, link_id).await?;
-
+/// A full reconcile over documents (decision 5): every held document's
+/// state vector goes to the remote in one `syncNodes` (batched by the
+/// client) that also asks what it did not name; what comes back is merged,
+/// the named unknowns are fetched in batches of [`MAX_SYNC_NODE_CONTENTS`]
+/// and merged, every held document is pushed back to the extent the remote
+/// lacks it (whole when the remote never heard of it), and the tree is
+/// repaired once at the end (see `Repair::Later`: a repair between two
+/// batches would judge a half-arrived tree). The live channels are drained
+/// every batch (see [`Channels`]).
+async fn full_reconcile(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, link_id: &str, channels: &mut Channels) -> anyhow::Result<()> {
     let manager = handler.store_manager_handle();
-    let node_ids = {
+
+    let local_svs: Vec<(NodeId, Vec<u8>)> = {
         let manager = manager.read().await;
-        manager.store_document(store_id)?.list_node_ids()?
-    };
-
-    for chunk in node_ids.chunks(MAX_SYNC_NODE_CONTENTS) {
-        let local_svs = {
-            let mut manager = manager.write().await;
-            let mut svs = Vec::with_capacity(chunk.len());
-            for node_id in chunk {
-                svs.push((*node_id, manager.get_node_document(store_id, *node_id).await?.state_vector()));
-            }
-            svs
-        };
-
-        let remote_answers = client
-            .sync_node_contents(store_id, &local_svs)
-            .await
-            .map_err(|e| anyhow::anyhow!("remote syncNodeContents failed: {}", e))?;
-
-        // A node the remote left out is not in its store document yet (a
-        // race with a structural change); the next reconcile covers it.
-        //
-        // The pull always runs (decision 7's finding: a yrs v1 diff is never
-        // actually empty — `[0, 0]` at minimum plus the sender's whole
-        // delete set — so an `is_empty()` gate here was always true anyway);
-        // `apply_edit` on the receiving end now does its own no-op check
-        // (decision 8), so applying a diff that turns out to carry nothing
-        // new is cheap.
-        for (node_id, diff, remote_sv) in remote_answers {
-            let diff_b64 = base64::engine::general_purpose::STANDARD.encode(&diff);
-            apply_edit_locally_with_fallback(handler, client, store_id, node_id, link_id, diff_b64).await?;
-            push_node_diff(handler, client, store_id, node_id, link_id, &remote_sv, &diff).await?;
+        let ids = manager.doc_ids(store_id)?;
+        let mut svs = Vec::with_capacity(ids.len());
+        for node_id in ids {
+            svs.push((node_id, manager.node_state_vector(store_id, node_id)?));
         }
-    }
-
-    Ok(())
-}
-
-/// Reconcile the store document with the remote: pull what it has that we
-/// lack, then push what we have that it lacks (decision 5). The pull always
-/// applies (see `full_reconcile`'s comment on why `is_empty()` never gated
-/// anything); the push uses `diff_if_peer_lacks_it` (decision 7) instead of
-/// the same dead `is_empty()` check, so a reconcile between two already-
-/// synced servers makes no round trip at all here.
-async fn reconcile_store(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, link_id: &str) -> anyhow::Result<()> {
-    let manager = handler.store_manager_handle();
-
-    let local_sv = {
-        let manager = manager.read().await;
-        manager.store_doc_state_vector(store_id)?
+        svs
     };
 
-    let (diff, remote_sv) = client
-        .sync_store_document(store_id, &local_sv)
+    let (answers, unknown) = client
+        .sync_nodes(store_id, &local_svs, true)
         .await
-        .map_err(|e| anyhow::anyhow!("remote syncStoreDocument failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("remote syncNodes failed: {}", e))?;
 
-    let diff_b64 = base64::engine::general_purpose::STANDARD.encode(&diff);
-    apply_store_update_locally(handler, store_id, link_id, diff_b64).await?;
-
-    let local_push = {
-        let manager = manager.read().await;
-        manager.store_document(store_id)?.diff_if_peer_lacks_it(&remote_sv, &diff)?
-    };
-
-    if let Some(local_diff) = local_push {
-        client
-            .apply_store_update(store_id, link_id, &local_diff)
-            .await
-            .map_err(|e| anyhow::anyhow!("remote applyStoreUpdate failed during reconcile: {}", e))?;
-        debug!("Sync link for store {} pushed a store document diff to the remote", store_id);
+    // The pull always applies (decision 7's finding: a yrs v1 diff is never
+    // actually empty — `[0, 0]` at minimum plus the sender's whole delete
+    // set — so an `is_empty()` gate here would always be true); the handler
+    // does its own no-op check (decision 8), so applying a diff that turns
+    // out to carry nothing new is cheap. Then the push back, only where the
+    // remote lacks something.
+    let mut answered = std::collections::HashSet::with_capacity(answers.len());
+    for chunk in answers.chunks(MAX_SYNC_NODE_CONTENTS) {
+        for (node_id, diff, remote_sv) in chunk {
+            answered.insert(*node_id);
+            apply_update_locally(handler, store_id, *node_id, link_id, diff, Repair::Later).await?;
+            push_node_diff(handler, client, store_id, *node_id, link_id, remote_sv, diff).await?;
+        }
+        channels.drain(handler, client, store_id, link_id).await?;
     }
 
+    // Documents the remote holds and this store does not: asked for whole
+    // (an empty state vector), and nothing to push back for them.
+    let empty_sv = pimble_crdt::empty_state_vector();
+    for chunk in unknown.chunks(MAX_SYNC_NODE_CONTENTS) {
+        let wanted: Vec<(NodeId, Vec<u8>)> = chunk.iter().map(|id| (*id, empty_sv.clone())).collect();
+        let (fetched, _) = client
+            .sync_nodes(store_id, &wanted, false)
+            .await
+            .map_err(|e| anyhow::anyhow!("remote syncNodes for unknown documents failed: {}", e))?;
+        for (node_id, diff, _) in fetched {
+            apply_update_locally(handler, store_id, node_id, link_id, &diff, Repair::Later).await?;
+        }
+        channels.drain(handler, client, store_id, link_id).await?;
+    }
+
+    // Documents this store holds and the remote does not: its `applyEdit`
+    // makes a document for an id it has never seen, so the whole state goes
+    // (`save`, which unlike a diff from an empty vector carries what is
+    // still pending here too).
+    let unanswered: Vec<NodeId> = local_svs.iter().map(|(id, _)| *id).filter(|id| !answered.contains(id)).collect();
+    for chunk in unanswered.chunks(MAX_SYNC_NODE_CONTENTS) {
+        for node_id in chunk {
+            let whole = {
+                let manager = manager.read().await;
+                match manager.tree(store_id)?.doc(*node_id) {
+                    Some(doc) => doc.save(),
+                    None => continue,
+                }
+            };
+            push_update_remotely(client, store_id, *node_id, link_id, &whole).await?;
+            debug!("Sync link for store {} pushed the whole document of node {} to the remote", store_id, node_id);
+        }
+        channels.drain(handler, client, store_id, link_id).await?;
+    }
+
+    handler.repair_store_tree(store_id).await;
     Ok(())
 }
 
-/// Reconcile one node's content document with the remote, the same way
-/// (decision 5). Only meaningful once both sides agree the node exists;
-/// callers that reach this from a debounced trigger rather than
-/// `full_reconcile` may still race a not-yet-arrived tree entry, in which
-/// case this surfaces as an error and the outer retry loop's next full
-/// reconcile catches it.
+/// Reconcile one document with the remote (decision 5), the fallback for a
+/// notification about it that carried no bytes.
 async fn reconcile_node(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, node_id: NodeId, link_id: &str) -> anyhow::Result<()> {
     let manager = handler.store_manager_handle();
 
     let local_sv = {
-        let mut manager = manager.write().await;
-        manager.get_node_document(store_id, node_id).await?.state_vector()
+        let manager = manager.read().await;
+        // Not held here yet: everything the remote has of it is wanted.
+        manager.node_state_vector(store_id, node_id).unwrap_or_else(|_| pimble_crdt::empty_state_vector())
     };
 
     let (diff, remote_sv) = client
         .sync_node_content(store_id, node_id, &local_sv)
         .await
-        .map_err(|e| anyhow::anyhow!("remote syncNodeContent failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("remote syncNodes for node {} failed: {}", node_id, e))?;
 
-    let diff_b64 = base64::engine::general_purpose::STANDARD.encode(&diff);
-    apply_edit_locally_with_fallback(handler, client, store_id, node_id, link_id, diff_b64).await?;
+    apply_update_locally(handler, store_id, node_id, link_id, &diff, Repair::Debounced).await?;
 
     push_node_diff(handler, client, store_id, node_id, link_id, &remote_sv, &diff).await
 }
 
-/// Send the remote everything this node's local content document has beyond
+/// Send the remote everything this node's local document has beyond
 /// `remote_sv`, if anything — `remote_diff` (the diff the remote just sent
 /// us, en route to `remote_sv`) is what `diff_if_peer_lacks_it` needs to
 /// tell "nothing new" apart from "carries the remote's whole delete set, as
@@ -620,60 +597,48 @@ async fn push_node_diff(
 ) -> anyhow::Result<()> {
     let local_push = {
         let manager = handler.store_manager_handle();
-        let mut manager = manager.write().await;
-        let doc = manager.get_node_document(store_id, node_id).await?;
-        doc.diff_if_peer_lacks_it(remote_sv, remote_diff)?
+        let manager = manager.read().await;
+        let tree = manager.tree(store_id)?;
+        match tree.doc(node_id) {
+            Some(doc) => doc.diff_if_peer_lacks_it(remote_sv, remote_diff)?,
+            None => None,
+        }
     };
 
     if let Some(local_diff) = local_push {
-        let diff_b64 = base64::engine::general_purpose::STANDARD.encode(&local_diff);
-        apply_edit_remotely_with_fallback(handler, client, store_id, node_id, link_id, diff_b64).await?;
-        debug!("Sync link for store {} pushed a content diff for node {} to the remote", store_id, node_id);
+        push_update_remotely(client, store_id, node_id, link_id, &local_diff).await?;
+        debug!("Sync link for store {} pushed a diff for node {} to the remote", store_id, node_id);
     }
 
     Ok(())
 }
 
-// ── Debounced reconcile triggers ────────────────────────────────────
-
-enum ReconcileTrigger {
-    Store,
-    Node(NodeId),
+async fn push_update_remotely(client: &PimbleClient, store_id: StoreId, node_id: NodeId, link_id: &str, update: &[u8]) -> anyhow::Result<()> {
+    let changes = base64::engine::general_purpose::STANDARD.encode(update);
+    client
+        .apply_edit(store_id, node_id, link_id, EditOperation::IncrementalChanges { changes })
+        .await
+        .map_err(|e| anyhow::anyhow!("remote applyEdit for node {} failed during reconcile: {}", node_id, e))?;
+    Ok(())
 }
 
-/// Per-store and per-node debounce generations for [`schedule_store_reconcile`]
-/// and [`schedule_node_reconcile`], same pattern as
-/// `StoreIndexer::schedule_content_upsert` in `handler.rs`: bump a counter,
-/// spawn a task that sleeps then fires only if no newer trigger has arrived.
+// ── Debounced reconcile triggers ────────────────────────────────────
+
+/// Per-node debounce generations for [`schedule_node_reconcile`], same
+/// pattern as `StoreIndexer::schedule_content_upsert` in `handler.rs`: bump
+/// a counter, spawn a task that sleeps then fires only if no newer trigger
+/// has arrived.
 struct ReconcileDebouncer {
-    store_generation: Mutex<u64>,
     node_generation: Mutex<HashMap<NodeId, u64>>,
 }
 
 impl ReconcileDebouncer {
     fn new() -> Self {
-        Self { store_generation: Mutex::new(0), node_generation: Mutex::new(HashMap::new()) }
+        Self { node_generation: Mutex::new(HashMap::new()) }
     }
 }
 
-fn schedule_store_reconcile(debouncer: &Arc<ReconcileDebouncer>, reconcile_tx: &mpsc::UnboundedSender<ReconcileTrigger>) {
-    let generation = {
-        let mut g = debouncer.store_generation.lock().unwrap();
-        *g += 1;
-        *g
-    };
-    let debouncer = Arc::clone(debouncer);
-    let reconcile_tx = reconcile_tx.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(RECONCILE_DEBOUNCE).await;
-        let still_current = *debouncer.store_generation.lock().unwrap() == generation;
-        if still_current {
-            let _ = reconcile_tx.send(ReconcileTrigger::Store);
-        }
-    });
-}
-
-fn schedule_node_reconcile(debouncer: &Arc<ReconcileDebouncer>, reconcile_tx: &mpsc::UnboundedSender<ReconcileTrigger>, node_id: NodeId) {
+fn schedule_node_reconcile(debouncer: &Arc<ReconcileDebouncer>, reconcile_tx: &mpsc::UnboundedSender<NodeId>, node_id: NodeId) {
     let generation = {
         let mut gens = debouncer.node_generation.lock().unwrap();
         let g = gens.entry(node_id).or_insert(0);
@@ -686,7 +651,7 @@ fn schedule_node_reconcile(debouncer: &Arc<ReconcileDebouncer>, reconcile_tx: &m
         tokio::time::sleep(RECONCILE_DEBOUNCE).await;
         let still_current = debouncer.node_generation.lock().unwrap().get(&node_id).copied() == Some(generation);
         if still_current {
-            let _ = reconcile_tx.send(ReconcileTrigger::Node(node_id));
+            let _ = reconcile_tx.send(node_id);
         }
     });
 }

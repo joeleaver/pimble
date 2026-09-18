@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use pimble_client::PimbleClient;
 use pimble_core::{AuthMethod, MountRef, MountState, NodeId, RemoteEndpoint, StoreId, StoreKind};
 use base64::Engine;
-use pimble_crdt::ContentDoc;
+use pimble_crdt::NodeDoc;
 use pimble_rpc::{EditOperation, VaultDocId};
 use pimble_server::auth;
 use tracing_subscriber::EnvFilter;
@@ -122,6 +122,13 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             delete_node(&args[2], &args[3]).await?;
+        }
+        "undelete-node" => {
+            if args.len() < 4 {
+                eprintln!("Usage: pimble-cli undelete-node <store-id> <node-id>");
+                return Ok(());
+            }
+            undelete_node(&args[2], &args[3]).await?;
         }
         "set-node-text" => {
             if args.len() < 5 {
@@ -285,7 +292,8 @@ COMMANDS:
     import-scrivener    Import a Scrivener .scriv project into a Pimble store
     create-node         Create a node in a store
     move-node           Move a node under a new parent (appended last)
-    delete-node         Delete a node and its whole subtree
+    delete-node         Delete a node and its whole subtree (a tombstone)
+    undelete-node       Bring a deleted node and its subtree back
     set-node-text       Set a node's content from plain text
     show-node           Print a node's metadata and content text
     search              Search across all open stores
@@ -356,6 +364,7 @@ EXAMPLES:
     pimble-cli create-node <store-id> <parent-id> document "My Note"
     pimble-cli move-node <store-id> <node-id> <new-parent-id>
     pimble-cli delete-node <store-id> <node-id>
+    pimble-cli undelete-node <store-id> <node-id>
     pimble-cli set-node-text <store-id> <node-id> "Hello, world"
     pimble-cli show-node <store-id> <node-id>
     pimble-cli search "hello"
@@ -799,9 +808,11 @@ async fn create_store(path: &str, name: &str, kind: Option<String>, id: Option<S
     Ok(())
 }
 
-/// Parse a `VaultDocId` CLI argument: the literal `tree`, or a node id.
+/// Parse a `VaultDocId` CLI argument: a node id, or the literal `tree` for
+/// the retired tree document a twin hosted before docs/NODE_DOCUMENT_CONTRACT.md
+/// may still list.
 fn parse_vault_doc_id(s: &str) -> Result<VaultDocId> {
-    VaultDocId::parse(s).with_context(|| format!("Invalid vault document id: {} (expected 'tree' or a node id)", s))
+    VaultDocId::parse(s).with_context(|| format!("Invalid vault document id: {} (expected a node id, or 'tree')", s))
 }
 
 async fn vault_list(store_id: &str) -> Result<()> {
@@ -928,20 +939,30 @@ async fn delete_node(store_id: &str, node_id: &str) -> Result<()> {
     Ok(())
 }
 
+async fn undelete_node(store_id: &str, node_id: &str) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let node_id = parse_node_id(node_id)?;
+
+    let client = connect().await?;
+    client.undelete_node(store_id, node_id).await?;
+    println!("Undeleted node {} and what its deletion took with it", node_id);
+    Ok(())
+}
+
 async fn set_node_text(store_id: &str, node_id: &str, text: &str) -> Result<()> {
     let store_id = parse_store_id(store_id)?;
     let node_id = parse_node_id(node_id)?;
 
     let client = connect().await?;
 
-    // An edit of the node's existing content document, sent as an `applyEdit`
+    // An edit of the node's existing document, sent as an `applyEdit`
     // delta — the one way content is written. A fresh document built from
     // `text` (`updateNodeContent`) shares no history with the node's, so on
     // any replica it would merge in next to the old paragraphs instead of
     // replacing them.
     let node = client.get_node(store_id, node_id).await?;
-    let mut doc = ContentDoc::load(&node.content)
-        .map_err(|e| anyhow::anyhow!("failed to load the node's content document: {e}"))?;
+    let mut doc = NodeDoc::load(&node.content)
+        .map_err(|e| anyhow::anyhow!("failed to load the node's document: {e}"))?;
     let delta = doc
         .replace_plain_text(text)
         .map_err(|e| anyhow::anyhow!("failed to build the replacement edit: {e}"))?;
@@ -969,7 +990,7 @@ async fn show_node(store_id: &str, node_id: &str) -> Result<()> {
     println!("Tags: {}", node.metadata.tags.join(", "));
     println!("Children: {}", node.children.len());
     println!("--- content ---");
-    println!("{}", ContentDoc::text_of(&node.content));
+    println!("{}", NodeDoc::text_of(&node.content));
     Ok(())
 }
 

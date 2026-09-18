@@ -154,7 +154,7 @@ pub trait NodePlugin: Send + Sync {
     /// in a single [`UnitKind::Prose`] unit (empty text yields no units), so every
     /// plugin is indexable with no extra work; a plugin with real internal
     /// structure overrides this (the built-in document plugin delegates to
-    /// `ContentDoc::units()`).
+    /// `NodeDoc::units()`).
     fn index_units(&self, content: &[u8]) -> Result<Vec<IndexUnit>, PluginError> {
         let text = self.extract_text(content)?;
         if text.is_empty() {

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
-use pimble_crdt::ContentDoc;
+use pimble_crdt::NodeDoc;
 use pimble_rpc::{
     CloseStoreRequest, CreateNodeRequest, CreateStoreRequest, DeleteNodeRequest,
     OpenStoreRequest, PimbleApiServer, RebuildIndexRequest, SearchRequest,
@@ -50,7 +50,7 @@ async fn set_text(
     node_id: pimble_core::NodeId,
     text: &str,
 ) {
-    let doc = ContentDoc::from_plain_text(text).unwrap();
+    let doc = NodeDoc::from_plain_text(text).unwrap();
     let content_b64 = base64::engine::general_purpose::STANDARD.encode(doc.save());
     handler
         .update_node_content(&pimble_server::service_extensions(), UpdateNodeContentRequest {

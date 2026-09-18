@@ -7,7 +7,7 @@
 //! `\par` with its runs and paragraph properties. [`paras_to_blocks`] then groups list
 //! paragraphs into nested [`Block::BulletList`]/[`Block::OrderedList`]s, turns styled
 //! or bold-and-larger paragraphs into headings, and produces the [`Block`]s a
-//! [`pimble_crdt::ContentDoc`] is built from.
+//! [`pimble_crdt::NodeDoc`] is built from.
 //!
 //! Everything the content model cannot hold is reduced rather than dropped silently:
 //! a table becomes one paragraph per row with cells separated by tabs, a line break

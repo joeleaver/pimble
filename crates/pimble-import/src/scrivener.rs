@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use pimble_core::Node;
-use pimble_crdt::ContentDoc;
+use pimble_crdt::NodeDoc;
 use pimble_store::LocalStore;
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -155,28 +155,29 @@ async fn import_binder_item(
         stats.with_icon += 1;
     }
 
-    let node_id = store.create_node(node, Some(parent_id)).await?;
-
     // The item's RTF, as rich blocks: paragraphs with their marks (bold, italic,
     // underline, strike, link, colour, highlight, code, sub/superscript),
     // headings, nested bullet and ordered lists, alignment and indent. The
-    // node has no content yet, so seeding it with a whole document is right
-    // here (see CLAUDE.md on `updateNodeContent`).
+    // content goes into the node before it is placed: `create_node` merges
+    // `node.content` into the new document as its first update, which is
+    // the one way content reaches a document, and right here because
+    // nothing else holds any of it yet.
     let rtf_path = data_dir.join(&item.uuid).join("content.rtf");
     if rtf_path.exists() {
         if let Ok(rtf_bytes) = fs::read(&rtf_path).await {
             let blocks = rtf_to_blocks(&rtf_bytes);
             let has_text = blocks.iter().any(|b| !b.plain_text().trim().is_empty());
             if has_text {
-                let content_bytes = ContentDoc::from_blocks(&blocks)
+                node.content = NodeDoc::from_blocks(&blocks)
                     .with_context(|| format!("building content for {} ({})", item.title, item.uuid))?
                     .save();
-                store.update_node_content(node_id, content_bytes).await?;
                 stats.with_content += 1;
                 stats.count_blocks(&blocks);
             }
         }
     }
+
+    let (node_id, _edit) = store.create_node(node, Some(parent_id))?;
 
     // Recurse into children
     for child in &item.children {
@@ -507,20 +508,20 @@ mod tests {
 
         // Reopen from disk to prove the import persisted, not just left an
         // in-memory store looking right.
-        let mut store = LocalStore::open(&output_path).await.unwrap();
+        let store = LocalStore::open(&output_path).await.unwrap();
         let root_id = store.root_node_id();
-        let root_node = store.get_node(root_id).await.unwrap();
+        let root_node = store.get_node(root_id).unwrap();
         assert_eq!(root_node.children.len(), 1, "expected one imported document");
 
         let child_id = root_node.children[0];
-        let child = store.get_node(child_id).await.unwrap();
+        let child = store.get_node(child_id).unwrap();
         assert_eq!(child.metadata.title, "Chapter One");
         assert_eq!(child.node_type, pimble_core::node_types::DOCUMENT);
         assert_eq!(child.metadata.color(), Some("#ff0080"), "the label colour becomes the node colour");
         assert_eq!(child.metadata.tags, vec!["Important".to_string()], "the label name becomes a tag");
         assert_eq!(child.metadata.icon(), Some("checkbox"), "Scrivener's ticked to-do icon maps to a checkbox");
 
-        let text = ContentDoc::text_of(&child.content);
+        let text = NodeDoc::text_of(&child.content);
         assert!(
             text.contains("Hello RTF World"),
             "expected imported content to contain the RTF text, got {:?}",
@@ -528,7 +529,7 @@ mod tests {
         );
         // The formatting made it into the CRDT, not only the text: a bold run
         // and a bullet list (the `\listtext` bullet itself is not in the text).
-        let units = ContentDoc::load(&child.content).unwrap().units();
+        let units = NodeDoc::load(&child.content).unwrap().units();
         assert_eq!(units.len(), 2, "{units:?}");
         assert!(matches!(units[1].kind, pimble_core::UnitKind::Other(ref k) if k == "bullet_list"), "{:?}", units[1]);
         assert_eq!(units[1].text, "an item");

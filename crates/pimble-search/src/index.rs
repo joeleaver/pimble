@@ -44,7 +44,7 @@ pub struct IndexNode {
     pub tags: Vec<String>,
     pub links: Vec<NodeId>,
     /// This node's content already broken into [`IndexUnit`]s (from
-    /// `ContentDoc::units()` or a plugin's `index_units`) — the chunker's
+    /// `NodeDoc::units()` or a plugin's `index_units`) — the chunker's
     /// input. Deviates from the contract's literal `IndexNode` (which has no
     /// `units` field): chunking needs the unit structure, not the flattened
     /// `text`, so one `upsert` call keeps a node's whole-text and chunk

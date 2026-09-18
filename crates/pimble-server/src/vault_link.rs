@@ -1,4 +1,4 @@
-//! Vault link: keeps a local `Plain` store's tree and node content mirrored,
+//! Vault link: keeps a local `Plain` store's node documents mirrored,
 //! encrypted, to its hosted `Vault` twin under the same store id
 //! (docs/CRYPTO_CONTRACT.md "Desktop (E, after B): sign-in and the
 //! encrypting link"). Started by `RpcHandler::ensure_vault_link_started`
@@ -8,36 +8,40 @@
 //!
 //! Unlike a plain sync link — two independent CRDT peers reconciling by yrs
 //! state vector — a vault link has only one real peer: the local `Plain`
-//! store. The hosted twin is an opaque, append-only, encrypted log this
-//! link is the sole author of (until a second device links the same store):
+//! store. The hosted twin is an opaque, append-only, encrypted log per
+//! document that this link authors together with every other device on the
+//! account. A vault document is a node document (`VaultDocId::Node`,
+//! docs/NODE_DOCUMENT_CONTRACT.md section 4): text, place in the tree and
+//! metadata in one, so the link knows nothing about content or structure.
+//! The `tree` document of the layout before is never written; one a hosted
+//! twin still lists is skipped on pull, its content superseded by the
+//! migrated node documents.
 //!
 //! - **At start** (and after every reconnect): `vaultListDocs`, then for
-//!   every document the remote already has, `vaultFetch` from
+//!   every node document the remote already has, `vaultFetch` from
 //!   `sync.json`'s remembered `last_seq` for that document, decrypt every
 //!   snapshot/update with [`pimble_crypto::Blob::decrypt`] (the key looked
 //!   up in the keystore by the blob's own key id — logged and skipped, not
 //!   fatal, on an unknown one) and apply it locally through the handler's
-//!   own `applyStoreUpdate`/`applyEdit` with `client_id =
-//!   "vault-link:<uuid>"`. The store document is always reconciled first, so
-//!   node ids it names are known locally before their own content is
-//!   applied. Then, for every local document (the tree, and every node id
-//!   the now-current local tree names) the remote does not have yet (head
-//!   `0`), the link seeds the vault with that document's current full state
-//!   (`ContentDoc`/`StoreDocument::save()`) — this is what makes
-//!   `cloudHostStore` upload a store's pre-existing content, since nothing
-//!   about creating the hosted twin itself produces local-change
-//!   notifications for content that already existed before the link started.
+//!   own `apply_node_update_from` with `client_id = "vault-link:<uuid>"`,
+//!   repairing the tree once every document is pulled (a repair between two
+//!   documents would judge a half-arrived tree). Then, for every document
+//!   this store holds, the link pushes whatever the remote lacks: the whole
+//!   document when the remote has never seen it (head `0`) — this is what
+//!   makes `cloudHostStore` upload a store's pre-existing content, since
+//!   nothing about creating the hosted twin itself produces local-change
+//!   notifications for what already existed before the link started — and
+//!   otherwise the diff since the state the remote is known to hold (see
+//!   `Progress`).
 //! - **Live**: subscribes to the hosted store's `storeChanged` and applies
 //!   every `VaultAppended` blob the same way, recognizing (and dropping) its
 //!   own appends echoed back through that same subscription by the
 //!   `(doc_id, seq)` pairs it remembers handing back from `vaultAppend`.
-//! - **Outbound**: subscribes to this server's local-change broadcast; a
-//!   content edit (`ContentUpdated` with delta bytes) or a store-document
-//!   delta (`TreeStructure` with bytes) is encrypted and appended directly;
-//!   a structural change with no delta bytes to reuse (`NodeCreated`/
-//!   `NodeDeleted`/`NodeMoved`/`MetadataUpdated`, or a full-snapshot
-//!   `updateNodeContent`) instead pushes that document's current full state,
-//!   debounced for the tree (a burst of moves/renames becomes one push).
+//! - **Outbound**: subscribes to this server's local-change broadcast; every
+//!   notification about a document carries that document's update bytes,
+//!   which are encrypted and appended as they are, structure and content
+//!   alike; one with no bytes (an older server's) pushes that document's
+//!   current whole state instead.
 //! - **Snapshots**: whenever an append's returned sequence number is a
 //!   multiple of 200, the link uploads that document's current full state as
 //!   a `vaultSnapshot` covering everything up to that sequence, so a fresh
@@ -62,24 +66,17 @@ use chrono::{DateTime, Utc};
 use pimble_client::PimbleClient;
 use pimble_core::{AuthMethod, NodeId, StoreId, SyncState};
 use pimble_crypto::Blob;
-use pimble_rpc::{
-    ApplyEditRequest, ApplyStoreUpdateRequest, EditOperation, PimbleApiServer, StoreChangeKind, StoreChangedNotification, VaultCursor,
-    VaultDocId,
-};
-use tokio::sync::{broadcast, mpsc, watch};
+use pimble_rpc::{StoreChangeKind, StoreChangedNotification, VaultCursor, VaultDocId};
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use url::Url;
 use uuid::Uuid;
 
-use crate::handler::{LocalChange, RpcHandler};
+use crate::handler::{LocalChange, Repair, RpcHandler};
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
-/// Debounce window for a structural tree change with no delta bytes to
-/// reuse, so a burst of them (several renames/moves in a row) yields one
-/// full-tree push.
-const TREE_PUSH_DEBOUNCE: Duration = Duration::from_millis(200);
 /// Upload a snapshot of a document once this many entries have been appended
 /// since the last one (docs/CRYPTO_CONTRACT.md), and only when this device has
 /// applied every one of them (see `pimble_rpc::VaultCursor`).
@@ -280,8 +277,6 @@ async fn connect_and_sync(
     let echoes = Arc::new(EchoTracker::new());
     full_reconcile(handler, &client, store_id, key_id, link_id, progress, &echoes).await?;
 
-    let tree_debouncer = Arc::new(TreePushDebouncer::new());
-    let (push_tx, mut push_rx) = mpsc::unbounded_channel::<()>();
     let mut save_tick = tokio::time::interval(PROGRESS_SAVE_EVERY);
 
     set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
@@ -304,7 +299,7 @@ async fn connect_and_sync(
                 match change {
                     Ok(local_change) => {
                         let doc = changed_doc(store_id, link_id, &local_change);
-                        if let Err(e) = forward_local_change(handler, &client, store_id, key_id, link_id, local_change, &tree_debouncer, &push_tx, &echoes, progress).await {
+                        if let Err(e) = forward_local_change(handler, &client, store_id, key_id, link_id, local_change, &echoes, progress).await {
                             // Taken off the channel and not delivered: the
                             // next reconcile has to carry it.
                             if let Some(doc) = doc {
@@ -323,15 +318,6 @@ async fn connect_and_sync(
                     Err(broadcast::error::RecvError::Closed) => {
                         return Err(anyhow::anyhow!("local change broadcast closed"));
                     }
-                }
-            }
-            trigger = push_rx.recv() => {
-                match trigger {
-                    Some(()) => {
-                        push_full(handler, &client, store_id, VaultDocId::Tree, key_id, link_id, &echoes, progress).await?;
-                        set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
-                    }
-                    None => return Err(anyhow::anyhow!("internal tree-push channel closed")),
                 }
             }
             _ = save_tick.tick() => {
@@ -532,19 +518,27 @@ pub(crate) async fn forget_progress(handler: &RpcHandler, store_id: StoreId) {
 }
 
 /// Which vault document a local change touches, if it is one this link would
-/// push: this store's, and not this link's own apply coming back around.
+/// push: this store's, about a document, and not this link's own apply coming
+/// back around.
 fn changed_doc(store_id: StoreId, link_id: &str, change: &LocalChange) -> Option<VaultDocId> {
     let LocalChange::Store(notif) = change else { return None };
     if notif.store_id != store_id || notif.source_client_id.as_deref() == Some(link_id) {
         return None;
     }
-    match &notif.change_kind {
-        StoreChangeKind::ContentUpdated { node_id } => Some(VaultDocId::Node(*node_id)),
-        StoreChangeKind::TreeStructure { .. }
-        | StoreChangeKind::NodeCreated { .. }
-        | StoreChangeKind::NodeDeleted { .. }
-        | StoreChangeKind::NodeMoved { .. }
-        | StoreChangeKind::MetadataUpdated { .. } => Some(VaultDocId::Tree),
+    document_of(&notif.change_kind).map(VaultDocId::Node)
+}
+
+/// The node document a notification is about, when it is about one (the
+/// link's and the mounts' states are derived and never pushed; a
+/// `VaultAppended` is the remote's, never a local change).
+fn document_of(kind: &StoreChangeKind) -> Option<NodeId> {
+    match kind {
+        StoreChangeKind::NodeCreated { node_id, .. }
+        | StoreChangeKind::NodeDeleted { node_id, .. }
+        | StoreChangeKind::NodeMoved { node_id, .. }
+        | StoreChangeKind::MetadataUpdated { node_id }
+        | StoreChangeKind::ContentUpdated { node_id } => Some(*node_id),
+        StoreChangeKind::TreeStructure { node_ids } => node_ids.first().copied(),
         StoreChangeKind::VaultAppended { .. }
         | StoreChangeKind::SyncStateChanged { .. }
         | StoreChangeKind::MountStateChanged { .. } => None,
@@ -593,9 +587,8 @@ async fn record_last_seq(handler: &RpcHandler, store_id: StoreId, doc_id: &Vault
 
 // ── Full reconcile (link start) ──────────────────────────────────────────
 
-/// Pull every document the remote already lists (tree first, so node ids it
-/// names are known locally before their content is applied), then push, for
-/// the tree and every node the now-current local tree names, whatever the
+/// Pull every node document the remote lists, repair the tree once they are
+/// all in, then push, for every document this store holds, whatever the
 /// remote lacks: the whole document when the remote has never seen it (the
 /// seeding step `cloudHostStore` depends on), otherwise the diff since the
 /// state the remote is known to hold, for a document that is ahead of it or
@@ -619,31 +612,32 @@ async fn full_reconcile(
         info!("Vault link for store {}: reading every document's log once from the start", store_id);
     }
     progress.cursors.clear();
-    for doc in &remote_docs {
+    let mut remote_heads: HashMap<VaultDocId, u64> = HashMap::new();
+    for doc in remote_docs {
+        if doc.doc_id == VaultDocId::Tree {
+            // The layout before this one kept the tree in a document of its
+            // own; a twin hosted then still lists it. Nothing reads it: the
+            // migrated node documents carry the tree now.
+            debug!("Vault link for store {}: skipping the retired tree document (head {})", store_id, doc.head);
+            continue;
+        }
         let applied_through = if refetch_all { 0 } else { read_last_seq(handler, store_id, &doc.doc_id).await };
         progress.cursors.insert(doc.doc_id.as_str(), VaultCursor::starting_at(applied_through));
         progress.note_snapshot(&doc.doc_id, doc.snapshot_seq);
-    }
-    let remote_heads: HashMap<VaultDocId, u64> = remote_docs.into_iter().map(|d| (d.doc_id, d.head)).collect();
-
-    if remote_heads.contains_key(&VaultDocId::Tree) {
-        pull_doc(handler, client, store_id, &VaultDocId::Tree, link_id, progress).await?;
+        remote_heads.insert(doc.doc_id, doc.head);
     }
 
-    let node_ids: Vec<NodeId> = {
+    for doc_id in remote_heads.keys() {
+        pull_doc(handler, client, store_id, doc_id, link_id, progress).await?;
+    }
+    // Every document is in before the tree is judged (see `Repair::Later`).
+    handler.repair_store_tree(store_id).await;
+
+    let doc_ids: Vec<VaultDocId> = {
         let manager = handler.store_manager_handle();
         let manager = manager.read().await;
-        manager.store_document(store_id).map(|doc| doc.list_node_ids().unwrap_or_default()).unwrap_or_default()
+        manager.doc_ids(store_id).map(|ids| ids.into_iter().map(VaultDocId::Node).collect()).unwrap_or_default()
     };
-    for node_id in &node_ids {
-        let doc_id = VaultDocId::Node(*node_id);
-        if remote_heads.contains_key(&doc_id) {
-            pull_doc(handler, client, store_id, &doc_id, link_id, progress).await?;
-        }
-    }
-
-    let mut doc_ids = vec![VaultDocId::Tree];
-    doc_ids.extend(node_ids.iter().map(|id| VaultDocId::Node(*id)));
     for doc_id in doc_ids {
         let unseen = remote_heads.get(&doc_id).copied().unwrap_or(0) == 0;
         let known = if unseen { pimble_crdt::empty_state_vector() } else { progress.known(&doc_id) };
@@ -677,7 +671,8 @@ async fn full_reconcile(
 
 /// Fetch and apply everything `doc_id` has beyond what this device has read
 /// without a gap. Only what was applied moves the cursor: a blob that would not
-/// decrypt stays in front of it, to be asked for again.
+/// decrypt stays in front of it, to be asked for again. No repair here: the
+/// caller repairs once every document is pulled.
 async fn pull_doc(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, doc_id: &VaultDocId, link_id: &str, progress: &mut Progress) -> anyhow::Result<()> {
     let after_seq = progress.cursor(doc_id).applied_through();
     let fetch = client
@@ -687,13 +682,13 @@ async fn pull_doc(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId
 
     if let Some(entry) = &fetch.snapshot {
         progress.note_snapshot(doc_id, entry.seq);
-        if let Some(update) = apply_blob_locally(handler, store_id, doc_id, &entry.blob, link_id).await? {
+        if let Some(update) = apply_blob_locally(handler, store_id, doc_id, &entry.blob, link_id, Repair::Later).await? {
             progress.advance(doc_id, &update);
             progress.cursor(doc_id).mark_through(entry.seq);
         }
     }
     for entry in &fetch.updates {
-        if let Some(update) = apply_blob_locally(handler, store_id, doc_id, &entry.blob, link_id).await? {
+        if let Some(update) = apply_blob_locally(handler, store_id, doc_id, &entry.blob, link_id, Repair::Later).await? {
             progress.advance(doc_id, &update);
             progress.cursor(doc_id).mark(entry.seq);
         }
@@ -704,14 +699,19 @@ async fn pull_doc(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId
 }
 
 /// Decrypt one base64url blob and apply it locally through the handler's
-/// own `applyStoreUpdate`/`applyEdit`. An unknown key id or a decryption
-/// failure is logged and skipped, never fatal to the link
-/// (docs/CRYPTO_CONTRACT.md: "a blob with an unknown key id is logged and
-/// skipped").
+/// own `apply_node_update_from`. An unknown key id or a decryption failure
+/// is logged and skipped, never fatal to the link (docs/CRYPTO_CONTRACT.md:
+/// "a blob with an unknown key id is logged and skipped"); so is a blob of
+/// the retired tree document.
 ///
 /// Returns the decrypted update when it was applied, `None` when the blob was
 /// skipped, so the caller can record that the remote holds it.
-async fn apply_blob_locally(handler: &RpcHandler, store_id: StoreId, doc_id: &VaultDocId, blob_b64url: &str, link_id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+async fn apply_blob_locally(handler: &RpcHandler, store_id: StoreId, doc_id: &VaultDocId, blob_b64url: &str, link_id: &str, repair: Repair) -> anyhow::Result<Option<Vec<u8>>> {
+    let VaultDocId::Node(node_id) = doc_id else {
+        debug!("Vault link for store {}: skipping a blob of the retired tree document", store_id);
+        return Ok(None);
+    };
+
     let blob = URL_SAFE_NO_PAD
         .decode(blob_b64url)
         .map_err(|e| anyhow::anyhow!("blob for {:?} is not valid base64url: {}", doc_id, e))?;
@@ -737,27 +737,10 @@ async fn apply_blob_locally(handler: &RpcHandler, store_id: StoreId, doc_id: &Va
         }
     };
 
-    let ext = crate::principal::service_extensions();
-    match doc_id {
-        VaultDocId::Tree => {
-            let update = STANDARD.encode(&plaintext);
-            handler
-                .apply_store_update(&ext, ApplyStoreUpdateRequest { store_id, client_id: link_id.to_string(), update })
-                .await
-                .map_err(|e| anyhow::anyhow!("local applyStoreUpdate failed: {}", e))?;
-            // A replica created empty for this twin still carries its
-            // placeholder manifest root until this point.
-            handler.adopt_document_root(store_id).await;
-        }
-        VaultDocId::Node(node_id) => {
-            let changes = STANDARD.encode(&plaintext);
-            let op = EditOperation::IncrementalChanges { changes };
-            handler
-                .apply_edit(&ext, ApplyEditRequest { store_id, node_id: *node_id, client_id: link_id.to_string(), operation: op })
-                .await
-                .map_err(|e| anyhow::anyhow!("local applyEdit failed: {}", e))?;
-        }
-    }
+    handler
+        .apply_node_update_from(store_id, *node_id, &plaintext, Some(link_id), repair)
+        .await
+        .map_err(|e| anyhow::anyhow!("local applyEdit for node {} failed: {}", node_id, e.message()))?;
     Ok(Some(plaintext))
 }
 
@@ -802,7 +785,7 @@ async fn handle_remote_notification(
         warn!("Vault link for store {} doc {:?}: VaultAppended with no blob; skipping", store_id, doc_id);
         return Ok(());
     };
-    if let Some(update) = apply_blob_locally(handler, store_id, doc_id, blob, link_id).await? {
+    if let Some(update) = apply_blob_locally(handler, store_id, doc_id, blob, link_id, Repair::Debounced).await? {
         progress.advance(doc_id, &update);
         progress.cursor(doc_id).mark(*seq);
     }
@@ -821,51 +804,28 @@ async fn forward_local_change(
     key_id: Uuid,
     link_id: &str,
     change: LocalChange,
-    tree_debouncer: &Arc<TreePushDebouncer>,
-    push_tx: &mpsc::UnboundedSender<()>,
     echoes: &Arc<EchoTracker>,
     progress: &mut Progress,
 ) -> anyhow::Result<()> {
     let LocalChange::Store(notif) = change else {
         return Ok(());
     };
-    if notif.store_id != store_id {
-        return Ok(());
-    }
     // Our own applies (from `apply_blob_locally` above) carry this link's
     // own id; forwarding those back would just re-encrypt what we just
     // decrypted from the very same remote.
-    if notif.source_client_id.as_deref() == Some(link_id) {
+    let Some(doc_id) = changed_doc(store_id, link_id, &LocalChange::Store(notif.clone())) else {
         return Ok(());
-    }
-
-    match (&notif.change_kind, &notif.update) {
-        (StoreChangeKind::ContentUpdated { node_id }, Some(changes_b64)) => {
-            let plaintext = STANDARD.decode(changes_b64)?;
-            push_update(handler, client, store_id, VaultDocId::Node(*node_id), key_id, link_id, &plaintext, echoes, progress).await?;
-        }
-        (StoreChangeKind::ContentUpdated { node_id }, None) => {
-            // A full-snapshot content replacement (`updateNodeContent`): no
-            // delta to reuse, push the node's current full state instead.
-            push_full(handler, client, store_id, VaultDocId::Node(*node_id), key_id, link_id, echoes, progress).await?;
-        }
-        (StoreChangeKind::TreeStructure { .. }, Some(update_b64)) => {
+    };
+    match notif.update {
+        Some(update_b64) => {
             let plaintext = STANDARD.decode(update_b64)?;
-            push_update(handler, client, store_id, VaultDocId::Tree, key_id, link_id, &plaintext, echoes, progress).await?;
+            push_update(handler, client, store_id, doc_id, key_id, link_id, &plaintext, echoes, progress).await?;
         }
-        (StoreChangeKind::NodeCreated { .. }, _)
-        | (StoreChangeKind::NodeDeleted { .. }, _)
-        | (StoreChangeKind::NodeMoved { .. }, _)
-        | (StoreChangeKind::MetadataUpdated { .. }, _)
-        | (StoreChangeKind::TreeStructure { .. }, None) => {
-            // Pushed after a debounce: should the link drop first, the
-            // reconcile carries it.
-            progress.mark_dirty(&VaultDocId::Tree);
-            schedule_tree_push(tree_debouncer, push_tx);
+        None => {
+            // No bytes to reuse (an older server's notification): push the
+            // document's current whole state instead.
+            push_full(handler, client, store_id, doc_id, key_id, link_id, echoes, progress).await?;
         }
-        (StoreChangeKind::VaultAppended { .. }, _)
-        | (StoreChangeKind::SyncStateChanged { .. }, _)
-        | (StoreChangeKind::MountStateChanged { .. }, _) => {}
     }
     Ok(())
 }
@@ -939,8 +899,7 @@ async fn push_update(
 }
 
 /// Push a document's current full state as a fresh append (the fallback for a
-/// change with no delta bytes to reuse: a wholesale content replacement, or a
-/// debounced burst of structural tree changes).
+/// change with no update bytes to reuse).
 #[allow(clippy::too_many_arguments)]
 async fn push_full(
     handler: &RpcHandler,
@@ -952,7 +911,7 @@ async fn push_full(
     echoes: &Arc<EchoTracker>,
     progress: &mut Progress,
 ) -> anyhow::Result<()> {
-    let (local_sv, state) = doc_diff(handler, store_id, &doc_id, &pimble_crdt::empty_state_vector()).await?;
+    let (local_sv, state) = full_doc_state(handler, store_id, &doc_id).await?;
     append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, &state, echoes, progress).await?;
     progress.set_known(&doc_id, &local_sv);
     progress.clear_dirty(&doc_id);
@@ -962,52 +921,39 @@ async fn push_full(
 /// `doc_id`'s state vector and everything it has beyond `known`, read under
 /// one lock so the vector describes exactly what the diff carries.
 async fn doc_diff(handler: &RpcHandler, store_id: StoreId, doc_id: &VaultDocId, known: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let VaultDocId::Node(node_id) = doc_id else {
+        return Err(anyhow::anyhow!("the tree document is retired; nothing to read of it"));
+    };
     let manager = handler.store_manager_handle();
-    match doc_id {
-        VaultDocId::Tree => {
-            let manager = manager.read().await;
-            let doc = manager.store_document(store_id).map_err(|e| anyhow::anyhow!("store document unavailable: {}", e))?;
-            let diff = doc.diff_since(known).map_err(|e| anyhow::anyhow!("store document diff failed: {}", e))?;
-            Ok((doc.state_vector(), diff))
-        }
-        VaultDocId::Node(node_id) => {
-            let mut manager = manager.write().await;
-            let doc = manager
-                .get_node_document(store_id, *node_id)
-                .await
-                .map_err(|e| anyhow::anyhow!("node document unavailable: {}", e))?;
-            let diff = doc.diff_since(known).map_err(|e| anyhow::anyhow!("node document diff failed: {}", e))?;
-            Ok((doc.state_vector(), diff))
-        }
-    }
+    let manager = manager.read().await;
+    let state_vector = manager
+        .node_state_vector(store_id, *node_id)
+        .map_err(|e| anyhow::anyhow!("node document unavailable: {}", e))?;
+    let diff = manager
+        .node_diff_since(store_id, *node_id, known)
+        .map_err(|e| anyhow::anyhow!("node document diff failed: {}", e))?;
+    Ok((state_vector, diff))
 }
 
-/// The current full state of `doc_id` (`ContentDoc`/`StoreDocument::save()`:
-/// a yrs update encoding the whole document from an empty state vector).
-async fn full_doc_state(handler: &RpcHandler, store_id: StoreId, doc_id: &VaultDocId) -> anyhow::Result<Vec<u8>> {
+/// `doc_id`'s state vector and its whole state (`NodeDoc::save`: a yrs
+/// update encoding the document from an empty state vector, pending updates
+/// included, which a diff from an empty vector leaves out), under one lock.
+async fn full_doc_state(handler: &RpcHandler, store_id: StoreId, doc_id: &VaultDocId) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let VaultDocId::Node(node_id) = doc_id else {
+        return Err(anyhow::anyhow!("the tree document is retired; nothing to read of it"));
+    };
     let manager = handler.store_manager_handle();
-    match doc_id {
-        VaultDocId::Tree => {
-            let manager = manager.read().await;
-            let doc = manager.store_document(store_id).map_err(|e| anyhow::anyhow!("store document unavailable: {}", e))?;
-            Ok(doc.save())
-        }
-        VaultDocId::Node(node_id) => {
-            let mut manager = manager.write().await;
-            let doc = manager
-                .get_node_document(store_id, *node_id)
-                .await
-                .map_err(|e| anyhow::anyhow!("node document unavailable: {}", e))?;
-            Ok(doc.save())
-        }
-    }
+    let manager = manager.read().await;
+    let tree = manager.tree(store_id).map_err(|e| anyhow::anyhow!("store unavailable: {}", e))?;
+    let doc = tree.doc(*node_id).ok_or_else(|| anyhow::anyhow!("node document {} unavailable", node_id))?;
+    Ok((doc.state_vector(), doc.save()))
 }
 
 async fn upload_snapshot(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, doc_id: VaultDocId, key_id: Uuid, upto_seq: u64) -> anyhow::Result<()> {
     let Some(key) = handler.keystore().store_key(store_id, key_id).await else {
         return Ok(()); // Can't snapshot without the key; the log still has everything.
     };
-    let plaintext = full_doc_state(handler, store_id, &doc_id).await?;
+    let (_, plaintext) = full_doc_state(handler, store_id, &doc_id).await?;
     let aad = pimble_crypto::blob_aad(&store_id.to_string(), &doc_id.as_str());
     let blob = Blob::encrypt(&key, key_id, &aad, &plaintext);
     let blob_b64 = URL_SAFE_NO_PAD.encode(&blob);
@@ -1047,33 +993,4 @@ impl EchoTracker {
             None => false,
         }
     }
-}
-
-// ── Debounced tree push ──────────────────────────────────────────────────
-
-struct TreePushDebouncer {
-    generation: Mutex<u64>,
-}
-
-impl TreePushDebouncer {
-    fn new() -> Self {
-        Self { generation: Mutex::new(0) }
-    }
-}
-
-fn schedule_tree_push(debouncer: &Arc<TreePushDebouncer>, push_tx: &mpsc::UnboundedSender<()>) {
-    let generation = {
-        let mut g = debouncer.generation.lock().unwrap();
-        *g += 1;
-        *g
-    };
-    let debouncer = Arc::clone(debouncer);
-    let push_tx = push_tx.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(TREE_PUSH_DEBOUNCE).await;
-        let still_current = *debouncer.generation.lock().unwrap() == generation;
-        if still_current {
-            let _ = push_tx.send(());
-        }
-    });
 }

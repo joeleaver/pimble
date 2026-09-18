@@ -2,7 +2,7 @@
 //! two real `PimbleServer`s, linked as replicas, diverge while unlinked and
 //! reconverge on a well-formed tree once relinked. Like `sync.rs`, driven
 //! entirely through `PimbleClient` over real WebSocket connections, with
-//! `PimbleServer::store_manager()` used only to read `StoreDocument::validate_tree`
+//! `PimbleServer::store_manager()` used only to read `Tree::validate_tree`
 //! directly (there is no RPC for it — it is a repair-time diagnostic, not part
 //! of the client-facing protocol).
 
@@ -44,13 +44,13 @@ fn remote_endpoint(addr: std::net::SocketAddr) -> RemoteEndpoint {
     RemoteEndpoint { url: format!("http://{}", addr).parse().unwrap(), auth: AuthMethod::None }
 }
 
-/// `StoreDocument::validate_tree()` issues for `store_id` on `server`, read
-/// directly off its `StoreManager` (there is no RPC for this — see the
-/// module doc comment).
+/// `Tree::validate_tree()` issues for `store_id` on `server`, read directly
+/// off its `StoreManager` (there is no RPC for this — see the module doc
+/// comment).
 async fn validate_tree(server: &PimbleServer, store_id: StoreId) -> Vec<pimble_crdt::TreeIssue> {
     let manager = server.store_manager();
     let manager = manager.read().await;
-    manager.store_document(store_id).expect("store is open").validate_tree().expect("validate_tree succeeds")
+    manager.tree(store_id).expect("store is open").validate_tree()
 }
 
 /// Set up B with a store containing two folders under its root, and A with a
@@ -190,10 +190,11 @@ async fn concurrent_a_under_b_and_b_under_a_repairs_the_cycle() {
     );
 }
 
-/// Deleting a node's subtree removes it from `store.yrs` (via `get_node`
-/// failing afterward) and its content file from disk.
+/// Deleting a node tombstones its whole subtree (docs/NODE_DOCUMENT_CONTRACT.md
+/// section 2): every member is gone from `getNode` and from its parent's
+/// list, and every document stays on disk, a deletion being part of it.
 #[tokio::test]
-async fn deleting_a_folder_deletes_its_subtree_and_content_files() {
+async fn deleting_a_folder_tombstones_its_subtree_and_keeps_the_documents() {
     let (server, client) = start_server().await;
     let dir = tempfile::tempdir().unwrap();
     let (store_id, root_id) = client.create_store(&dir.path().join("x.pimble"), "X").await.unwrap();
@@ -212,7 +213,7 @@ async fn deleting_a_folder_deletes_its_subtree_and_content_files() {
 
     assert!(client.get_node(store_id, folder_id).await.is_err(), "folder should be gone");
     assert!(client.get_node(store_id, doc_id).await.is_err(), "descendant should be gone too");
-    assert!(!content_path.exists(), "descendant's content file should be gone from disk");
+    assert!(content_path.exists(), "the descendant's document stays on disk as a tombstone");
 
     let (_, root_children) = client.get_children(store_id, root_id).await.unwrap();
     assert!(root_children.iter().all(|n| n.id != folder_id));

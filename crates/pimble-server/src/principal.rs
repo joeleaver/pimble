@@ -117,8 +117,9 @@ pub fn principal_of(ext: &Extensions) -> Principal {
 
 /// An `Extensions` carrying `Principal::Service`, for a handler method to
 /// pass to another handler method it calls internally (`removeReplica`
-/// calling `closeStore`; a sync link applying a remote's already-authorized
-/// change through `apply_edit`/`apply_store_update`). These are server-
+/// calling `closeStore`). A sync link applying a remote's already-authorized
+/// change goes through `RpcHandler::apply_node_update_from`, which
+/// authorises nothing, for the same reason. These are server-
 /// internal calls that never went through the HTTP-edge auth layer at all,
 /// so there is no real `Principal` to forward — the operation triggering
 /// them was already authorized (or is itself `Service`-only) at its own

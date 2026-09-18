@@ -72,9 +72,15 @@ pub trait PimbleApi {
     #[method(name = "updateNodeContent", with_extensions)]
     async fn update_node_content(&self, request: UpdateNodeContentRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
 
-    /// Delete a node. Write.
+    /// Delete a node and its subtree (tombstones,
+    /// docs/NODE_DOCUMENT_CONTRACT.md section 2). Write.
     #[method(name = "deleteNode", with_extensions)]
     async fn delete_node(&self, request: DeleteNodeRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// Bring a deleted node and what the same deletion took with it back,
+    /// at the end of its parent's list. Write.
+    #[method(name = "undeleteNode", with_extensions)]
+    async fn undelete_node(&self, request: UndeleteNodeRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
 
     /// Move a node to a new parent. Write.
     #[method(name = "moveNode", with_extensions)]
@@ -168,8 +174,11 @@ pub trait PimbleApi {
     // Edit Operations (collaborative editing)
     // ========================================================================
 
-    /// Apply an edit operation to a node and broadcast to other clients.
-    /// Write.
+    /// Merge a yrs update into a node's document, content or structure
+    /// alike (docs/NODE_DOCUMENT_CONTRACT.md section 4), persist it, relay
+    /// it to the store's other subscribers and derive the notifications
+    /// from what it changed. An id the store does not hold yet gets a
+    /// document. Write.
     #[method(name = "applyEdit", with_extensions)]
     async fn apply_edit(&self, request: ApplyEditRequest) -> Result<ApplyEditResponse, ErrorObjectOwned>;
 
@@ -177,32 +186,14 @@ pub trait PimbleApi {
     // Sync Operations
     // ========================================================================
 
-    /// Sync a store document (tree structure + metadata): send a yrs state
-    /// vector, receive a diff of everything the server has beyond it.
-    /// Stateless — the server keeps no per-client sync state. If the client
-    /// also has local changes the server lacks, it sends those separately
-    /// via `applyStoreUpdate`.
-    /// Read (a user principal pulling is a reader operation; the push
-    /// direction, `applyStoreUpdate`, is write).
-    #[method(name = "syncStoreDocument", with_extensions)]
-    async fn sync_store_document(&self, request: SyncStoreDocumentRequest) -> Result<SyncStoreDocumentResponse, ErrorObjectOwned>;
-
-    /// Sync the content documents of up to `MAX_SYNC_NODE_CONTENTS` nodes:
-    /// send a yrs state vector per node, receive a diff of everything the
-    /// server has beyond each. Stateless — the server keeps no per-client
-    /// sync state for content documents. Read (see `syncStoreDocument`).
-    #[method(name = "syncNodeContents", with_extensions)]
-    async fn sync_node_contents(&self, request: SyncNodeContentsRequest) -> Result<SyncNodeContentsResponse, ErrorObjectOwned>;
-
     /// Sync whole node documents, structure and content together
-    /// (docs/NODE_DOCUMENT_CONTRACT.md section 4). Read.
+    /// (docs/NODE_DOCUMENT_CONTRACT.md section 4): a state vector per named
+    /// document in, everything the server has beyond each out, plus (with
+    /// `list_unknown`) the ids of every document the caller did not name.
+    /// Stateless: the server keeps no per-client sync state. Read; the push
+    /// direction is `applyEdit`, which is write.
     #[method(name = "syncNodes", with_extensions)]
     async fn sync_nodes(&self, request: SyncNodesRequest) -> Result<SyncNodesResponse, ErrorObjectOwned>;
-
-    /// Apply a yrs update to the store document (tree structure + metadata)
-    /// and broadcast it to the store's other subscribers. Write.
-    #[method(name = "applyStoreUpdate", with_extensions)]
-    async fn apply_store_update(&self, request: ApplyStoreUpdateRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
 
     // ========================================================================
     // Subscription Operations
