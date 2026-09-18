@@ -268,6 +268,7 @@ impl LocalStore {
             created_at: now,
             modified_at: now,
             kind: pimble_core::StoreKind::Plain,
+            scope_roots: Vec::new(),
         };
 
         let manifest_json = serde_json::to_string_pretty(&manifest)?;
@@ -897,6 +898,7 @@ mod tests {
             created_at: Utc::now(),
             modified_at: Utc::now(),
             kind: pimble_core::StoreKind::Plain,
+            scope_roots: Vec::new(),
         };
         fs::write(
             store_path.join("manifest.json"),
@@ -1397,6 +1399,7 @@ mod tests {
             created_at: Utc::now(),
             modified_at: Utc::now(),
             kind: pimble_core::StoreKind::Plain,
+            scope_roots: Vec::new(),
         };
         fs::write(store_path.join("manifest.json"), serde_json::to_string_pretty(&manifest).unwrap()).await.unwrap();
 

@@ -51,7 +51,9 @@ use pimble_rpc::{
     LoadWorkspaceResponse, MoveNodeRequest, NodeContentChangedNotification, NodeContentDiff, OpenStoreRequest,
     OpenStoreResponse, PimbleApiServer, RebuildIndexRequest, RebuildIndexResponse, RemoveReplicaRequest,
     SaveWorkspaceRequest, SearchRequest, SearchResponse, SearchResultItem, StoreChangeKind,
-    DeleteVaultStoreRequest, StoreChangedNotification, SyncNodesRequest, SyncNodesResponse, UndeleteNodeRequest, UpdateNodeContentRequest,
+    CloudShareInfoResponse, CloudShareInviteRequest, CloudShareNodeRequest, CloudShareRef, CloudShareRemoveMemberRequest, DeleteVaultStoreRequest,
+    GetScopesRequest, GetScopesResponse, SetScopeRequest, StoreChangedNotification, SyncNodesRequest, SyncNodesResponse, UndeleteNodeRequest,
+    UpdateNodeContentRequest, VaultSetDocKeysRequest,
     UpdateNodeMetadataRequest,
     VaultAppendRequest, VaultAppendResponse, VaultDocId, VaultDocInfo, VaultEntry, VaultFetchRequest,
     VaultFetchResponse, VaultListDocsRequest, VaultListDocsResponse, VaultSnapshotRequest,
@@ -466,7 +468,10 @@ fn index_events_for(kind: &StoreChangeKind) -> Vec<IndexEvent> {
         StoreChangeKind::NodeDeleted { node_id, .. } => vec![IndexEvent::Remove(*node_id)],
         StoreChangeKind::ContentUpdated { node_id } => vec![IndexEvent::ContentChanged(*node_id)],
         StoreChangeKind::TreeStructure { node_ids } => node_ids.iter().map(|id| IndexEvent::Upsert(*id)).collect(),
-        StoreChangeKind::SyncStateChanged { .. } | StoreChangeKind::MountStateChanged { .. } | StoreChangeKind::VaultAppended { .. } => Vec::new(),
+        StoreChangeKind::SyncStateChanged { .. }
+        | StoreChangeKind::MountStateChanged { .. }
+        | StoreChangeKind::ShareStateChanged { .. }
+        | StoreChangeKind::VaultAppended { .. } => Vec::new(),
     }
 }
 
@@ -1908,6 +1913,7 @@ impl PimbleApiServer for RpcHandler {
                 .map(|(seq, blob)| VaultEntry { seq, blob: URL_SAFE_NO_PAD.encode(blob) })
                 .collect(),
             head,
+            keys: None,
         })
     }
 
@@ -1953,7 +1959,7 @@ impl PimbleApiServer for RpcHandler {
             docs: docs
                 .into_iter()
                 .filter_map(|(doc_id, head, snapshot_seq)| {
-                    VaultDocId::parse(&doc_id).map(|doc_id| VaultDocInfo { doc_id, head, snapshot_seq })
+                    VaultDocId::parse(&doc_id).map(|doc_id| VaultDocInfo { doc_id, head, snapshot_seq, dek_id: None })
                 })
                 .collect(),
         })
@@ -2040,7 +2046,7 @@ impl PimbleApiServer for RpcHandler {
         Ok(CloudListHostedStoresResponse {
             stores: stores
                 .into_iter()
-                .map(|s| CloudHostedStoreInfo { store_id: s.store_id, name: s.name, role: s.role, kind: s.kind, created_at: s.created_at })
+                .map(|s| CloudHostedStoreInfo { store_id: s.store_id, name: s.name, role: s.role, kind: s.kind, created_at: s.created_at, root: None, shared_by: None })
                 .collect(),
         })
     }
@@ -2137,6 +2143,49 @@ impl PimbleApiServer for RpcHandler {
     async fn delete_vault_store(&self, ext: &Extensions, request: DeleteVaultStoreRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "deleteVaultStore")?;
         Err(to_rpc_error(format!("deleteVaultStore is not built yet (store {})", request.store_id)))
+    }
+
+    // ── Sharing on node documents, docs/NODE_DOCUMENT_CONTRACT.md section 5
+    // (the sharing wave builds these; every stub authorizes first) ─────────
+
+    async fn vault_set_doc_keys(&self, ext: &Extensions, request: VaultSetDocKeysRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        Err(to_rpc_error("vaultSetDocKeys is not built yet (docs/NODE_DOCUMENT_CONTRACT.md section 5)"))
+    }
+
+    async fn set_scope(&self, ext: &Extensions, request: SetScopeRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        Err(to_rpc_error("setScope is not built yet (docs/NODE_DOCUMENT_CONTRACT.md section 5)"))
+    }
+
+    async fn get_scopes(&self, ext: &Extensions, request: GetScopesRequest) -> Result<GetScopesResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Read)?;
+        Err(to_rpc_error("getScopes is not built yet (docs/NODE_DOCUMENT_CONTRACT.md section 5)"))
+    }
+
+    async fn cloud_share_node(&self, ext: &Extensions, request: CloudShareNodeRequest) -> Result<CloudShareInfoResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudShareNode")?;
+        Err(to_rpc_error(format!("cloudShareNode is not built yet (node {} of store {})", request.node_id, request.store_id)))
+    }
+
+    async fn cloud_share_info(&self, ext: &Extensions, request: CloudShareRef) -> Result<CloudShareInfoResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudShareInfo")?;
+        Err(to_rpc_error(format!("cloudShareInfo is not built yet (node {} of store {})", request.node_id, request.store_id)))
+    }
+
+    async fn cloud_share_invite(&self, ext: &Extensions, request: CloudShareInviteRequest) -> Result<CloudShareInfoResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudShareInvite")?;
+        Err(to_rpc_error(format!("cloudShareInvite is not built yet (node {} of store {})", request.node_id, request.store_id)))
+    }
+
+    async fn cloud_share_remove_member(&self, ext: &Extensions, request: CloudShareRemoveMemberRequest) -> Result<CloudShareInfoResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudShareRemoveMember")?;
+        Err(to_rpc_error(format!("cloudShareRemoveMember is not built yet (node {} of store {})", request.node_id, request.store_id)))
+    }
+
+    async fn cloud_stop_sharing(&self, ext: &Extensions, request: CloudShareRef) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudStopSharing")?;
+        Err(to_rpc_error(format!("cloudStopSharing is not built yet (node {} of store {})", request.node_id, request.store_id)))
     }
 
     async fn create_store(
@@ -2844,7 +2893,7 @@ impl PimbleApiServer for RpcHandler {
         let state = self.sync_state_of(request.store_id).await;
         let sync_mode = self.sync_mode_of(request.store_id).await;
 
-        Ok(GetStoreSyncResponse { remote: remote_now, state, sync_mode })
+        Ok(GetStoreSyncResponse { remote: remote_now, state, sync_mode, access: pimble_core::StoreAccess::Full })
     }
 
     async fn get_store_sync(
@@ -2863,7 +2912,7 @@ impl PimbleApiServer for RpcHandler {
         let state = self.sync_state_of(request.store_id).await;
         let sync_mode = self.sync_mode_of(request.store_id).await;
 
-        Ok(GetStoreSyncResponse { remote, state, sync_mode })
+        Ok(GetStoreSyncResponse { remote, state, sync_mode, access: pimble_core::StoreAccess::Full })
     }
 
     async fn list_remote_stores(

@@ -268,6 +268,40 @@ pub trait PimbleApi {
     /// Hosted side: close a vault store and delete its directory. `Service`-only.
     #[method(name = "deleteVaultStore", with_extensions)]
     async fn delete_vault_store(&self, request: DeleteVaultStoreRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// Set a document's wrapped data keys (an editor whose scope holds the
+    /// document, or an owner).
+    #[method(name = "vaultSetDocKeys", with_extensions)]
+    async fn vault_set_doc_keys(&self, request: VaultSetDocKeysRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// Publish a share's scope: the documents under its root (owner).
+    #[method(name = "setScope", with_extensions)]
+    async fn set_scope(&self, request: SetScopeRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// The store's published scopes (owner).
+    #[method(name = "getScopes", with_extensions)]
+    async fn get_scopes(&self, request: GetScopesRequest) -> Result<GetScopesResponse, ErrorObjectOwned>;
+
+    /// Share a node of a local store with the signed-in account as owner. `Service`-only.
+    #[method(name = "cloudShareNode", with_extensions)]
+    async fn cloud_share_node(&self, request: CloudShareNodeRequest) -> Result<CloudShareInfoResponse, ErrorObjectOwned>;
+
+    /// A shared node's share and its members. `Service`-only.
+    #[method(name = "cloudShareInfo", with_extensions)]
+    async fn cloud_share_info(&self, request: CloudShareRef) -> Result<CloudShareInfoResponse, ErrorObjectOwned>;
+
+    /// Invite an address to a share, or change the role it already has. `Service`-only.
+    #[method(name = "cloudShareInvite", with_extensions)]
+    async fn cloud_share_invite(&self, request: CloudShareInviteRequest) -> Result<CloudShareInfoResponse, ErrorObjectOwned>;
+
+    /// Remove a member or a pending invitation from a share. `Service`-only.
+    #[method(name = "cloudShareRemoveMember", with_extensions)]
+    async fn cloud_share_remove_member(&self, request: CloudShareRemoveMemberRequest) -> Result<CloudShareInfoResponse, ErrorObjectOwned>;
+
+    /// Stop sharing a node: the grants go, the scope goes, the documents stay
+    /// where they were. `Service`-only.
+    #[method(name = "cloudStopSharing", with_extensions)]
+    async fn cloud_stop_sharing(&self, request: CloudShareRef) -> Result<EmptyResponse, ErrorObjectOwned>;
 }
 
 /// Helper function to convert any error to ErrorObjectOwned

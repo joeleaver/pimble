@@ -147,6 +147,20 @@ pub enum BackendCommand {
     /// Add an already-hosted store as a local replica; the store arrives as
     /// `StoreOpened`, exactly as `AddRemoteStore`'s does.
     CloudAddHostedStore { store_id: StoreId },
+
+    // Sharing (docs/NODE_DOCUMENT_CONTRACT.md section 5). `Service`-only like
+    // the six above. The first four answer `CloudShareUpdated`, the last
+    // `CloudSharingStopped`, and any of them `CloudError` with its own `CloudOp`.
+    /// Share a node under a display name Pimble Cloud and invitees will see.
+    CloudShareNode { store_id: StoreId, node_id: NodeId, name: String },
+    /// A shared node's share and members, as the accounts service has them now.
+    CloudShareInfo { store_id: StoreId, node_id: NodeId },
+    /// Invite an address (`Editor` or `Reader`), or change the role it has.
+    CloudShareInvite { store_id: StoreId, node_id: NodeId, email: String, role: pimble_rpc::MemberRole },
+    /// Remove a member or a pending invitation, by address.
+    CloudShareRemoveMember { store_id: StoreId, node_id: NodeId, email: String },
+    /// Stop sharing: the grants and the scope go; the documents stay where they are.
+    CloudStopSharing { store_id: StoreId, node_id: NodeId },
 }
 
 /// Which cloud request an outcome belongs to (docs/DESKTOP_ACCOUNT_CONTRACT.md
@@ -160,6 +174,11 @@ pub enum CloudOp {
     HostStore,
     ListHostedStores,
     AddHostedStore,
+    Share,
+    ShareInfo,
+    ShareInvite,
+    ShareRemoveMember,
+    StopSharing,
 }
 
 /// Events sent from backend to UI
@@ -262,6 +281,11 @@ pub enum BackendEvent {
     /// The answer to `CloudHostStore`: the store is hosted and linked in
     /// vault mode.
     CloudStoreHosted { store_id: StoreId },
+    /// The answer to `CloudShareNode`, `CloudShareInfo`, `CloudShareInvite` and
+    /// `CloudShareRemoveMember`: the share and everyone on it.
+    CloudShareUpdated { store_id: StoreId, node_id: NodeId, share: pimble_rpc::ShareInfo, members: Vec<pimble_rpc::ShareMember> },
+    /// The answer to `CloudStopSharing`.
+    CloudSharingStopped { store_id: StoreId, node_id: NodeId },
 }
 
 /// Handle to communicate with the backend

@@ -698,6 +698,11 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                             refetch_root_if_empty(store, *store_id);
                         }
                     }
+                    StoreChangeKind::ShareStateChanged { node_id, state } => {
+                        // The Share dialog and the node's badge read this (the
+                        // sharing wave, docs/NODE_DOCUMENT_CONTRACT.md section 5).
+                        tracing::info!("Share state of {:?}/{:?}: {:?}", store_id, node_id, state);
+                    }
                     StoreChangeKind::VaultAppended { .. } => {
                         // Encrypted-store blobs are handled by the vault client
                         // (docs/CRYPTO_CONTRACT.md); the tree does not change here.
@@ -870,6 +875,13 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         store.hosted_modal_busy.set(false);
                         store.hosted_modal_error.set(message.clone());
                     }
+                    CloudOp::Share
+                    | CloudOp::ShareInfo
+                    | CloudOp::ShareInvite
+                    | CloudOp::ShareRemoveMember
+                    | CloudOp::StopSharing => {
+                        // The Share modal shows these (the sharing wave); logged above until it exists.
+                    }
                 }
             }
 
@@ -906,6 +918,14 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // Cloud..." disabled (decision 5).
                 store.send(BackendCommand::GetStoreSync { store_id: *store_id });
                 store.bump_tree_structure();
+            }
+
+            // The Share modal's state (the sharing wave, docs/NODE_DOCUMENT_CONTRACT.md section 5).
+            BackendEvent::CloudShareUpdated { store_id, node_id, share, members } => {
+                tracing::info!("Share of {:?}/{:?}: {:?}, {} members", store_id, node_id, share.state, members.len());
+            }
+            BackendEvent::CloudSharingStopped { store_id, node_id } => {
+                tracing::info!("Stopped sharing {:?}/{:?}", store_id, node_id);
             }
         }
     }

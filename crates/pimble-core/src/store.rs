@@ -96,9 +96,35 @@ pub struct Store {
     /// older serializations: plain (unlinked).
     #[serde(default)]
     pub sync_mode: StoreKind,
+
+    /// What this device may change in the store (docs/NODE_DOCUMENT_CONTRACT.md
+    /// section 5): `Full` for one's own stores and for an editor's scope, `Read`
+    /// for a reader. Missing in older serializations: full.
+    #[serde(default)]
+    pub access: StoreAccess,
+
+    /// An owner's email when this store reached this device as someone else's
+    /// share. `None` for one's own stores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_by: Option<String>,
+
+    /// The roots this device holds of the store: `[root_node_id]` for a whole
+    /// store, the scope roots for a partial replica (a share's recipient). Empty
+    /// in older serializations: read it as `[root_node_id]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roots: Vec<NodeId>,
 }
 
 impl Store {
+    /// The roots to show: [`Store::roots`], or the store's root when none is listed.
+    pub fn shown_roots(&self) -> Vec<NodeId> {
+        if self.roots.is_empty() {
+            vec![self.root_node_id]
+        } else {
+            self.roots.clone()
+        }
+    }
+
     /// Create a new local store
     pub fn new_local(name: impl Into<String>, path: PathBuf) -> Self {
         Self {
@@ -110,6 +136,9 @@ impl Store {
             is_replica: false,
             kind: StoreKind::Plain,
             sync_mode: StoreKind::Plain,
+            access: StoreAccess::Full,
+            shared_by: None,
+            roots: Vec::new(),
         }
     }
 
@@ -124,6 +153,9 @@ impl Store {
             is_replica: false,
             kind: StoreKind::Plain,
             sync_mode: StoreKind::Plain,
+            access: StoreAccess::Full,
+            shared_by: None,
+            roots: Vec::new(),
         }
     }
 
@@ -188,6 +220,33 @@ pub enum StoreKind {
     #[default]
     Plain,
     Vault,
+}
+
+/// What this device may change in a store (docs/NODE_DOCUMENT_CONTRACT.md
+/// section 5): an editor edits everything in scope, a reader reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StoreAccess {
+    #[default]
+    Full,
+    Read,
+}
+
+impl StoreAccess {
+    /// What a refused write answers with, everywhere (the server's `-32004`,
+    /// the browser backend's own refusal, the app's notice): the sentence
+    /// alone, written for the person, shown as it is.
+    pub const READ_ONLY_REFUSAL: &'static str = "You can read this, not change it.";
+
+    /// Whether `message` is the refusal (with or without a `Forbidden: ` in front).
+    pub fn refusal_in(message: &str) -> Option<&'static str> {
+        let sentence = message.strip_prefix("Forbidden: ").unwrap_or(message);
+        (sentence == Self::READ_ONLY_REFUSAL).then_some(Self::READ_ONLY_REFUSAL)
+    }
+
+    pub fn allows_write(self) -> bool {
+        matches!(self, StoreAccess::Full)
+    }
 }
 
 /// Authentication method for remote stores
@@ -313,6 +372,12 @@ pub struct StoreManifest {
     /// serializations: plain.
     #[serde(default)]
     pub kind: StoreKind,
+
+    /// A partial replica's scope roots (docs/NODE_DOCUMENT_CONTRACT.md section
+    /// 5): the shared nodes this replica holds, when it is a share's recipient
+    /// and not a whole copy. Empty for a whole store.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope_roots: Vec<NodeId>,
 }
 
 impl StoreManifest {
@@ -337,6 +402,7 @@ impl StoreManifest {
             created_at: now,
             modified_at: now,
             kind,
+            scope_roots: Vec::new(),
         }
     }
 }

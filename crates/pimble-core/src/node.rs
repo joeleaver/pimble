@@ -201,6 +201,30 @@ pub mod custom_keys {
     pub const ICON: &str = "icon";
     /// A CSS colour (`#rrggbb`) for the node's icon and label in the tree.
     pub const COLOR: &str = "color";
+    /// A [`super::ShareMarker`]: this node is a share's root (docs/NODE_DOCUMENT_CONTRACT.md).
+    pub const SHARE: &str = "share";
+}
+
+/// What a shared node carries in `metadata.custom["share"]`
+/// (docs/NODE_DOCUMENT_CONTRACT.md section 5). The share is the scope
+/// `(store, this node)`; the marker names the key its documents' data keys are
+/// wrapped under for the share's members, the accounts service that holds the
+/// grants, and the name the owner gave it. It is in the node's own document, so
+/// it replicates to every copy including a recipient's, which is fine: a
+/// recipient may know they are inside a share.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareMarker {
+    pub v: u8,
+    /// The share key's id (a scope key, docs/NODE_DOCUMENT_CONTRACT.md "Keys").
+    pub key_id: Uuid,
+    /// The accounts service, e.g. `https://pimble.app`.
+    pub url: String,
+    /// The share's display name, as the owner typed it.
+    pub name: String,
+}
+
+impl ShareMarker {
+    pub const VERSION: u8 = 1;
 }
 
 /// Metadata associated with a node
@@ -241,6 +265,23 @@ impl NodeMetadata {
             }
             None => {
                 self.custom.remove(custom_keys::ICON);
+            }
+        }
+    }
+
+    /// The share marker, if this node is a share's root (see [`custom_keys::SHARE`]).
+    pub fn share(&self) -> Option<ShareMarker> {
+        self.custom.get(custom_keys::SHARE).and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
+    /// Set or clear the share marker.
+    pub fn set_share(&mut self, marker: Option<&ShareMarker>) {
+        match marker.and_then(|m| serde_json::to_value(m).ok()) {
+            Some(value) => {
+                self.custom.insert(custom_keys::SHARE.to_string(), value);
+            }
+            None => {
+                self.custom.remove(custom_keys::SHARE);
             }
         }
     }

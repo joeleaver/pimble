@@ -376,6 +376,7 @@ fn document_of(kind: &StoreChangeKind) -> Option<NodeId> {
         StoreChangeKind::TreeStructure { node_ids } => node_ids.first().copied(),
         StoreChangeKind::SyncStateChanged { .. }
         | StoreChangeKind::MountStateChanged { .. }
+        | StoreChangeKind::ShareStateChanged { .. }
         | StoreChangeKind::VaultAppended { .. } => None,
     }
 }

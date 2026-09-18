@@ -201,6 +201,12 @@ impl StoreManager {
                 // about the vault-link state overwrite this (see
                 // `RpcHandler::sync_mode_of`).
                 sync_mode: StoreKind::Plain,
+                // Placeholders too: the server fills them from `sync.json`
+                // (docs/NODE_DOCUMENT_CONTRACT.md section 5); the roots are the
+                // manifest's scope roots, or the store's root.
+                access: pimble_core::StoreAccess::Full,
+                shared_by: None,
+                roots: manifest.scope_roots.clone(),
             });
         }
         if let Some(store) = self.vault_stores.get(&store_id) {
@@ -216,6 +222,9 @@ impl StoreManager {
                 is_replica: false,
                 kind: manifest.kind,
                 sync_mode: StoreKind::Plain,
+                access: pimble_core::StoreAccess::Full,
+                shared_by: None,
+                roots: Vec::new(),
             });
         }
         Err(StoreError::StoreNotFound(store_id))

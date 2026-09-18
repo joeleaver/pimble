@@ -535,6 +535,44 @@ pub async fn process_command(
             }
         }
 
+        BackendCommand::CloudShareNode { store_id, node_id, name } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::Share, message: "Not connected".into() });
+            };
+            Some(share_answer(CloudOp::Share, store_id, node_id, c.cloud_share_node(store_id, node_id, &name).await))
+        }
+
+        BackendCommand::CloudShareInfo { store_id, node_id } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::ShareInfo, message: "Not connected".into() });
+            };
+            Some(share_answer(CloudOp::ShareInfo, store_id, node_id, c.cloud_share_info(store_id, node_id).await))
+        }
+
+        BackendCommand::CloudShareInvite { store_id, node_id, email, role } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::ShareInvite, message: "Not connected".into() });
+            };
+            Some(share_answer(CloudOp::ShareInvite, store_id, node_id, c.cloud_share_invite(store_id, node_id, &email, role).await))
+        }
+
+        BackendCommand::CloudShareRemoveMember { store_id, node_id, email } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::ShareRemoveMember, message: "Not connected".into() });
+            };
+            Some(share_answer(CloudOp::ShareRemoveMember, store_id, node_id, c.cloud_share_remove_member(store_id, node_id, &email).await))
+        }
+
+        BackendCommand::CloudStopSharing { store_id, node_id } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::StopSharing, message: "Not connected".into() });
+            };
+            match c.cloud_stop_sharing(store_id, node_id).await {
+                Ok(()) => Some(BackendEvent::CloudSharingStopped { store_id, node_id }),
+                Err(e) => Some(BackendEvent::CloudError { op: CloudOp::StopSharing, message: e.to_string() }),
+            }
+        }
+
         // The accounts service owns hosted stores, and only a signed-in client
         // can mint an encrypted store's key and seal it to itself. The browser
         // backend answers this before a command ever reaches here; a build that
@@ -568,4 +606,19 @@ fn remote_endpoint(url: &str, token: &str) -> Result<RemoteEndpoint, String> {
     let url: url::Url = url.parse().map_err(|e| format!("Invalid remote URL: {}", e))?;
     let auth = if token.is_empty() { AuthMethod::None } else { AuthMethod::Bearer { token: token.to_string() } };
     Ok(RemoteEndpoint { url, auth })
+}
+
+/// The event for a sharing RPC's answer (docs/NODE_DOCUMENT_CONTRACT.md
+/// section 5): the share and its members, or the error under the operation
+/// that asked.
+fn share_answer(
+    op: CloudOp,
+    store_id: pimble_core::StoreId,
+    node_id: pimble_core::NodeId,
+    answer: pimble_client::Result<pimble_rpc::CloudShareInfoResponse>,
+) -> BackendEvent {
+    match answer {
+        Ok(response) => BackendEvent::CloudShareUpdated { store_id, node_id, share: response.share, members: response.members },
+        Err(e) => BackendEvent::CloudError { op, message: e.to_string() },
+    }
 }

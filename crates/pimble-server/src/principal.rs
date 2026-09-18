@@ -51,8 +51,34 @@ pub enum Principal {
     User {
         sub: String,
         email: String,
-        grants: HashMap<StoreId, Role>,
+        grants: HashMap<StoreId, Grant>,
     },
+}
+
+/// One grant in a token: a role on a whole store, or on the subtrees under
+/// `roots` (a share's recipient, docs/NODE_DOCUMENT_CONTRACT.md section 5).
+/// A scoped grant reaches exactly the documents in the store's published
+/// scope sets for those roots (`RpcHandler`'s scope check); the role says what
+/// it may do with them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grant {
+    pub role: Role,
+    /// `None` for the whole store.
+    pub roots: Option<Vec<pimble_core::NodeId>>,
+}
+
+impl Grant {
+    pub fn whole(role: Role) -> Self {
+        Self { role, roots: None }
+    }
+
+    pub fn scoped(role: Role, roots: Vec<pimble_core::NodeId>) -> Self {
+        Self { role, roots: Some(roots) }
+    }
+
+    pub fn is_scoped(&self) -> bool {
+        self.roots.is_some()
+    }
 }
 
 /// A user's access to one store, from lowest to highest: `Reader` <
@@ -137,7 +163,7 @@ pub fn authorize(principal: &Principal, store_id: StoreId, needed: Access) -> Re
     match principal {
         Principal::Service => Ok(()),
         Principal::User { grants, .. } => match grants.get(&store_id) {
-            Some(role) if role.allows(needed) => Ok(()),
+            Some(grant) if grant.role.allows(needed) => Ok(()),
             Some(_) => Err(forbidden_error(format!(
                 "store {} does not grant the role this operation needs",
                 store_id
@@ -191,7 +217,7 @@ mod tests {
     fn a_reader_may_read_but_not_write() {
         let s = store();
         let mut grants = HashMap::new();
-        grants.insert(s, Role::Reader);
+        grants.insert(s, Grant::whole(Role::Reader));
         let user = Principal::User { sub: "u".into(), email: "u@example.com".into(), grants };
 
         assert!(authorize(&user, s, Access::Read).is_ok());
@@ -202,7 +228,7 @@ mod tests {
     fn an_editor_may_read_and_write() {
         let s = store();
         let mut grants = HashMap::new();
-        grants.insert(s, Role::Editor);
+        grants.insert(s, Grant::whole(Role::Editor));
         let user = Principal::User { sub: "u".into(), email: "u@example.com".into(), grants };
 
         assert!(authorize(&user, s, Access::Read).is_ok());
@@ -226,7 +252,7 @@ mod tests {
         let a = store();
         let b = store();
         let mut grants = HashMap::new();
-        grants.insert(a, Role::Reader);
+        grants.insert(a, Grant::whole(Role::Reader));
         let user = Principal::User { sub: "u".into(), email: "u@example.com".into(), grants };
 
         assert_eq!(readable(&user, [&a, &b]), vec![a]);

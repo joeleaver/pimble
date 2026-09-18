@@ -90,6 +90,7 @@ notify = "7.0"
 
 # Internal crates
 pimble-core = { path = "crates/pimble-core" }
+pimble-crypto = { path = "crates/pimble-crypto" }
 pimble-crdt = { path = "crates/pimble-crdt" }
 pimble-store = { path = "crates/pimble-store" }
 pimble-search = { path = "crates/pimble-search" }

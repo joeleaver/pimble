@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use pimble_core::{MountRef, MountState, Node, NodeId, NodeMetadata, RemoteEndpoint, Store, StoreId, StoreKind, SyncState, Workspace};
+use pimble_core::{MountRef, MountState, Node, NodeId, NodeMetadata, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState, Workspace};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -78,6 +78,13 @@ pub struct VaultAppendRequest {
     /// tracking sequence numbers it has already seen.
     #[serde(default)]
     pub client_id: Option<String>,
+    /// For a document the store does not have yet, appended by a member whose
+    /// grant is scoped to a subtree: the node's parent, which must be in the
+    /// member's scope; the new document then joins that scope
+    /// (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Scope sets"). Ignored for a
+    /// document the store already has and for an unscoped principal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<NodeId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +110,11 @@ pub struct VaultFetchResponse {
     pub updates: Vec<VaultEntry>,
     /// The document's latest sequence number (0 when empty).
     pub head: u64,
+    /// The document's data key, wrapped under every scope key that may read it
+    /// (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Keys"). `None` for a
+    /// document from before data keys, whose blobs name a scope key directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<VaultDocKeys>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +146,9 @@ pub struct VaultDocInfo {
     pub head: u64,
     /// 0 when the document has no snapshot.
     pub snapshot_seq: u64,
+    /// The id of the document's data key, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dek_id: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,6 +385,9 @@ pub struct GetStoreSyncResponse {
     /// `Store::sync_mode`. Missing in an older client's expectations: plain.
     #[serde(default)]
     pub sync_mode: StoreKind,
+    /// What this device may change in the store, mirroring `Store::access`.
+    #[serde(default)]
+    pub access: StoreAccess,
 }
 
 /// Ask this server for the stores a remote Pimble server has open. The
@@ -622,6 +640,10 @@ pub enum StoreChangeKind {
     /// docs/CRYPTO_CONTRACT.md); the notification's `update` carries the blob
     /// (base64url) so a live subscriber never re-fetches.
     VaultAppended { doc_id: VaultDocId, seq: u64 },
+    /// The share rooted at `node_id` in this store changed state on this
+    /// device (its key handover, its scope publishing, docs/NODE_DOCUMENT_CONTRACT.md
+    /// section 5). Derived state: links never forward it.
+    ShareStateChanged { node_id: NodeId, state: SyncState },
 }
 
 /// Notification that a node's content has changed.
@@ -710,6 +732,13 @@ pub struct CloudHostedStoreInfo {
     /// `"plain"` or `"vault"`.
     pub kind: String,
     pub created_at: String,
+    /// The shared node, when the grant is a share of one subtree of the store
+    /// rather than the whole store (docs/NODE_DOCUMENT_CONTRACT.md section 5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<NodeId>,
+    /// An owner's email, when the signed-in account is not an owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -735,4 +764,155 @@ pub struct CloudAddHostedStoreRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteVaultStoreRequest {
     pub store_id: StoreId,
+}
+
+/// A document's data key wrapped under every scope key that may read it
+/// (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Keys"): the store key, and the
+/// share key of each share the node is under. Clients look a blob's key id up
+/// here first, then among the scope keys they hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultDocKeys {
+    pub dek_id: uuid::Uuid,
+    pub wraps: Vec<pimble_crypto::WrappedDek>,
+}
+
+/// Set (or add to) a document's wrapped data keys. An editor whose scope
+/// holds the document, or an owner. Wraps are merged by `scope_key_id`; a
+/// different `dek_id` replaces the set (a rotation).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultSetDocKeysRequest {
+    pub store_id: StoreId,
+    pub doc_id: VaultDocId,
+    pub keys: VaultDocKeys,
+}
+
+/// One share's scope on the hosted server: the documents under its root, as
+/// its owner's devices publish them (docs/NODE_DOCUMENT_CONTRACT.md section 5,
+/// "Scope sets"). A plain store needs none: the server reads its own tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scope {
+    pub root: NodeId,
+    pub doc_ids: Vec<NodeId>,
+}
+
+/// Replace a scope's document set (owner). An empty `doc_ids` with `remove`
+/// deletes the scope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetScopeRequest {
+    pub store_id: StoreId,
+    pub scope: Scope,
+    #[serde(default)]
+    pub remove: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetScopesRequest {
+    pub store_id: StoreId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetScopesResponse {
+    pub scopes: Vec<Scope>,
+}
+
+/// A member's role on a store or a share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemberRole {
+    Owner,
+    Editor,
+    Reader,
+}
+
+impl MemberRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemberRole::Owner => "owner",
+            MemberRole::Editor => "editor",
+            MemberRole::Reader => "reader",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "owner" => Some(MemberRole::Owner),
+            "editor" => Some(MemberRole::Editor),
+            "reader" => Some(MemberRole::Reader),
+            _ => None,
+        }
+    }
+}
+
+/// How far a member is from opening the share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareMemberStatus {
+    /// Invited by email; no verified account with that address yet.
+    Invited,
+    /// Has the grant, but no device of the owner's has been online since to
+    /// hand them the share key.
+    WaitingForKey,
+    Active,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareMember {
+    pub email: String,
+    pub role: MemberRole,
+    pub status: ShareMemberStatus,
+}
+
+/// One share: the scope `(store, node)` and what this device knows of it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareInfo {
+    pub store_id: StoreId,
+    pub node_id: NodeId,
+    pub name: String,
+    /// The share's state on this device: whether the scope is published and
+    /// every member has the key.
+    pub state: SyncState,
+}
+
+/// Share a node: a scoped grant for the owner on the accounts service, the
+/// share key, its wrap of every document under the node, the marker, and the
+/// scope published to the hosted server. Nothing is uploaded that was not
+/// hosted already: a store that is not hosted is refused with a sentence that
+/// says so, until the relay serves it (docs/NODE_DOCUMENT_CONTRACT.md 5b).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudShareNodeRequest {
+    pub store_id: StoreId,
+    pub node_id: NodeId,
+    /// The share's display name, visible to Pimble Cloud and in invitations.
+    pub name: String,
+}
+
+/// Names a shared node (`cloudShareInfo`, `cloudStopSharing`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudShareRef {
+    pub store_id: StoreId,
+    pub node_id: NodeId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudShareInviteRequest {
+    pub store_id: StoreId,
+    pub node_id: NodeId,
+    pub email: String,
+    /// `Editor` or `Reader`; `Owner` is refused.
+    pub role: MemberRole,
+}
+
+/// Removes a member or a pending invitation, by address.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudShareRemoveMemberRequest {
+    pub store_id: StoreId,
+    pub node_id: NodeId,
+    pub email: String,
+}
+
+/// The share and everyone on it, as the accounts service reports them now.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudShareInfoResponse {
+    pub share: ShareInfo,
+    pub members: Vec<ShareMember>,
 }

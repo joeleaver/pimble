@@ -15,7 +15,9 @@ use pimble_core::{AuthMethod, Node, NodeId, RemoteEndpoint, Store, StoreId, Stor
 use pimble_core::MountRef;
 use pimble_rpc::{
     AddRemoteStoreRequest, ApplyEditRequest, CloseStoreRequest, CloudAddHostedStoreRequest,
-    CloudHostStoreRequest, CloudHostedStoreInfo, CloudSignInRequest, CloudStatusResponse, DeleteVaultStoreRequest,
+    CloudHostStoreRequest, CloudHostedStoreInfo, CloudShareInfoResponse, CloudShareInviteRequest, CloudShareNodeRequest, CloudShareRef,
+    CloudShareRemoveMemberRequest, CloudSignInRequest, CloudStatusResponse, DeleteVaultStoreRequest, GetScopesRequest, MemberRole, Scope,
+    SetScopeRequest, VaultDocKeys, VaultSetDocKeysRequest,
     CreateMountRequest, CreateNodeRequest, CreateStoreRequest, CreateWorkspaceRequest, DeleteNodeRequest,
     EditOperation, GetChildrenRequest, GetMountStateRequest, GetNodeRequest, GetNodesRequest, GetStoreSyncRequest, SetStoreSyncRequest,
     ListRemoteStoresRequest, LoadWorkspaceRequest, MoveNodeRequest, NodeContentChangedNotification, NodeStateVector,
@@ -981,12 +983,82 @@ impl PimbleClient {
         blob: String,
         client_id: Option<String>,
     ) -> Result<u64> {
+        self.vault_append_new(store_id, doc_id, blob, client_id, None).await
+    }
+
+    /// [`PimbleClient::vault_append_from`] naming the new document's parent,
+    /// which a member whose grant is scoped to a subtree must do for a
+    /// document the store does not have yet (docs/NODE_DOCUMENT_CONTRACT.md
+    /// section 5, "Scope sets").
+    pub async fn vault_append_new(
+        &self,
+        store_id: StoreId,
+        doc_id: VaultDocId,
+        blob: String,
+        client_id: Option<String>,
+        parent_id: Option<NodeId>,
+    ) -> Result<u64> {
         let response = self
             .client
-            .vault_append(VaultAppendRequest { store_id, doc_id, blob, client_id })
+            .vault_append(VaultAppendRequest { store_id, doc_id, blob, client_id, parent_id })
             .await
             .map_err(rpc_error)?;
         Ok(response.seq)
+    }
+
+    // ── Sharing on node documents, docs/NODE_DOCUMENT_CONTRACT.md section 5 ──
+
+    /// Set a document's wrapped data keys.
+    pub async fn vault_set_doc_keys(&self, store_id: StoreId, doc_id: VaultDocId, keys: VaultDocKeys) -> Result<()> {
+        self.client.vault_set_doc_keys(VaultSetDocKeysRequest { store_id, doc_id, keys }).await.map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// Publish (or remove) a share's scope on the hosted server.
+    pub async fn set_scope(&self, store_id: StoreId, scope: Scope, remove: bool) -> Result<()> {
+        self.client.set_scope(SetScopeRequest { store_id, scope, remove }).await.map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// The store's published scopes.
+    pub async fn get_scopes(&self, store_id: StoreId) -> Result<Vec<Scope>> {
+        let response = self.client.get_scopes(GetScopesRequest { store_id }).await.map_err(rpc_error)?;
+        Ok(response.scopes)
+    }
+
+    /// Share a node of a local store, named `name`. `Service`-only.
+    pub async fn cloud_share_node(&self, store_id: StoreId, node_id: NodeId, name: &str) -> Result<CloudShareInfoResponse> {
+        self.client
+            .cloud_share_node(CloudShareNodeRequest { store_id, node_id, name: name.to_string() })
+            .await
+            .map_err(rpc_error)
+    }
+
+    /// A shared node's share and its members.
+    pub async fn cloud_share_info(&self, store_id: StoreId, node_id: NodeId) -> Result<CloudShareInfoResponse> {
+        self.client.cloud_share_info(CloudShareRef { store_id, node_id }).await.map_err(rpc_error)
+    }
+
+    /// Invite an address to a share, or change the role it has.
+    pub async fn cloud_share_invite(&self, store_id: StoreId, node_id: NodeId, email: &str, role: MemberRole) -> Result<CloudShareInfoResponse> {
+        self.client
+            .cloud_share_invite(CloudShareInviteRequest { store_id, node_id, email: email.to_string(), role })
+            .await
+            .map_err(rpc_error)
+    }
+
+    /// Remove a member or a pending invitation from a share.
+    pub async fn cloud_share_remove_member(&self, store_id: StoreId, node_id: NodeId, email: &str) -> Result<CloudShareInfoResponse> {
+        self.client
+            .cloud_share_remove_member(CloudShareRemoveMemberRequest { store_id, node_id, email: email.to_string() })
+            .await
+            .map_err(rpc_error)
+    }
+
+    /// Stop sharing a node.
+    pub async fn cloud_stop_sharing(&self, store_id: StoreId, node_id: NodeId) -> Result<()> {
+        self.client.cloud_stop_sharing(CloudShareRef { store_id, node_id }).await.map_err(rpc_error)?;
+        Ok(())
     }
 
     /// Everything a vault document holds beyond `after_seq`: the snapshot (when

@@ -8,6 +8,7 @@ description = "JSON-RPC protocol definitions for Pimble"
 
 [dependencies]
 pimble-core = { workspace = true }
+pimble-crypto = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

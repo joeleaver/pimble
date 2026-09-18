@@ -21,7 +21,7 @@ use tokio::sync::RwLock;
 use tracing::warn;
 use url::Url;
 
-use crate::principal::{Principal, Role};
+use crate::principal::{Grant, Principal, Role};
 
 /// How often the background task refetches the JWKS regardless of demand.
 const SCHEDULED_REFRESH: Duration = Duration::from_secs(10 * 60);
@@ -101,8 +101,18 @@ struct JwtHeader {
 struct CustomClaims {
     #[serde(default)]
     email: String,
+    /// `"editor"` for a whole store, `{ "role": "editor", "roots": [...] }` for
+    /// a share (docs/NODE_DOCUMENT_CONTRACT.md section 5). A server from before
+    /// scopes cannot parse the object form and drops the grant: it fails closed.
     #[serde(default)]
-    stores: HashMap<String, String>,
+    stores: HashMap<String, StoreClaim>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum StoreClaim {
+    Whole(String),
+    Scoped { role: String, roots: Vec<String> },
 }
 
 #[derive(Debug, Deserialize)]
@@ -277,10 +287,20 @@ impl JwtVerifier {
             .claims
             .stores
             .iter()
-            .filter_map(|(store_id, role)| {
+            .filter_map(|(store_id, claim)| {
                 let store_id = StoreId::parse(store_id).ok()?;
-                let role = Role::parse(role)?;
-                Some((store_id, role))
+                let grant = match claim {
+                    StoreClaim::Whole(role) => Grant::whole(Role::parse(role)?),
+                    StoreClaim::Scoped { role, roots } => {
+                        let roots: Vec<pimble_core::NodeId> = roots.iter().filter_map(|r| pimble_core::NodeId::parse(r).ok()).collect();
+                        // A scope that names no node it can parse grants nothing.
+                        if roots.is_empty() {
+                            return None;
+                        }
+                        Grant::scoped(Role::parse(role)?, roots)
+                    }
+                };
+                Some((store_id, grant))
             })
             .collect();
 
@@ -354,7 +374,7 @@ mod tests {
             Principal::User { sub, email, grants } => {
                 assert_eq!(sub, "user-1");
                 assert_eq!(email, "user@example.com");
-                assert_eq!(grants.get(&store_id), Some(&Role::Editor));
+                assert_eq!(grants.get(&store_id), Some(&Grant::whole(Role::Editor)));
             }
             Principal::Service => panic!("expected a User principal"),
         }
