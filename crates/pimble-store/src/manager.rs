@@ -1,28 +1,19 @@
 //! Store manager - handles multiple open stores
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
 use pimble_core::{MountRef, Node, NodeId, NodeMetadata, Store, StoreId, StoreKind, StoreLocation, SyncState};
-use pimble_crdt::{ContentDoc, StoreDocument, TreeRepair};
+use pimble_crdt::{NodeDoc, NodeUpdateEffect, Tree, TreeEdit};
 use tracing::info;
 
 /// Maximum depth for transitive mount resolution
 const MAX_MOUNT_DEPTH: usize = 16;
 
 use crate::error::{Result, StoreError};
-use crate::local::{peek_manifest_kind, LocalStore, SyncConfig};
+use crate::local::{peek_manifest_kind, LocalStore, NodeRemoval, SyncConfig};
 use crate::registry::{StoreEndpoint, StoreRegistry};
 use crate::vault::VaultStore;
-
-/// What [`StoreManager::delete_node`] removed.
-#[derive(Debug, Clone)]
-pub struct NodeRemoval {
-    /// The parent the deleted node was removed from.
-    pub parent_id: NodeId,
-    /// The deleted node and every descendant of it.
-    pub removed: Vec<NodeId>,
-}
 
 /// Manages multiple open stores
 pub struct StoreManager {
@@ -107,7 +98,9 @@ impl StoreManager {
 
     /// Create a local replica of a store held by a remote server, from
     /// nothing (docs/SYNC_CONTRACT.md decision 8): same `id` and
-    /// `root_node_id` as the remote, an empty store document.
+    /// `root_node_id` as the remote, and no documents until the first
+    /// reconcile brings them (see [`LocalStore::create_replica`] for why
+    /// not even the root's).
     pub async fn create_replica(
         &mut self,
         path: impl AsRef<Path>,
@@ -252,6 +245,15 @@ impl StoreManager {
         None
     }
 
+    /// The open `Plain` store under `store_id`, or `NotOpen`.
+    fn local(&self, store_id: StoreId) -> Result<&LocalStore> {
+        self.local_stores.get(&store_id).ok_or(StoreError::NotOpen(store_id))
+    }
+
+    fn local_mut(&mut self, store_id: StoreId) -> Result<&mut LocalStore> {
+        self.local_stores.get_mut(&store_id).ok_or(StoreError::NotOpen(store_id))
+    }
+
     // ── Vault (encrypted store) storage, docs/CRYPTO_CONTRACT.md ────────
 
     /// Append `blob` to `doc_id`'s log in vault store `store_id`, returning
@@ -281,210 +283,70 @@ impl StoreManager {
         Ok(store.list_docs())
     }
 
-    /// Get a node from a store
-    pub async fn get_node(&mut self, store_id: StoreId, node_id: NodeId) -> Result<Node> {
-        let store = self.local_stores.get_mut(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
-        store.get_node(node_id).await
+    // ── Nodes ────────────────────────────────────────────────────────────
+
+    /// Get a node from a store. `NodeNotFound` for a tombstone or a
+    /// document whose `node` root has not arrived.
+    pub fn get_node(&self, store_id: StoreId, node_id: NodeId) -> Result<Node> {
+        self.local(store_id)?.get_node(node_id)
     }
 
-    /// Update a node's metadata in-place and mark it dirty
-    pub async fn update_node_metadata(&mut self, store_id: StoreId, node_id: NodeId, metadata: NodeMetadata) -> Result<()> {
-        let store = self.local_stores.get_mut(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
-        store.update_node_metadata(node_id, &metadata).await
+    /// Bring a node's title, tags and custom fields to `metadata` (the
+    /// whole metadata; a custom key absent from it is removed). See
+    /// [`LocalStore::update_node_metadata`].
+    pub fn update_node_metadata(&mut self, store_id: StoreId, node_id: NodeId, metadata: NodeMetadata) -> Result<TreeEdit> {
+        self.local_mut(store_id)?.update_node_metadata(node_id, &metadata)
     }
 
-    /// Create a node in a store. A mount node has no children of its own
+    /// Create a node in a store, returning its id and the edit to persist
+    /// and broadcast per document. A mount node has no children of its own
     /// (its subtree lives entirely in the source store), so creating under
     /// one is rejected; create under the mount's `mount_ref` instead.
-    pub async fn create_node(&mut self, store_id: StoreId, node: Node, parent_id: Option<NodeId>) -> Result<NodeId> {
-        let store = self.local_stores.get_mut(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
+    pub fn create_node(&mut self, store_id: StoreId, node: Node, parent_id: Option<NodeId>) -> Result<(NodeId, TreeEdit)> {
+        let store = self.local_mut(store_id)?;
 
         if let Some(parent_id) = parent_id {
-            let parent = store.store_document().get_node_info(parent_id)
-                .map_err(StoreError::Crdt)?;
+            let parent = store.tree().get_node_info(parent_id).map_err(|_| StoreError::NodeNotFound(parent_id))?;
             if parent.node_type == pimble_core::node_types::MOUNT {
                 return Err(StoreError::MountHasNoChildren { node_id: parent_id });
             }
         }
 
-        store.create_node(node, parent_id).await
+        store.create_node(node, parent_id)
     }
 
-    /// Move a node to a new parent in a store. Returns the parent it left.
-    pub async fn move_node(&mut self, store_id: StoreId, node_id: NodeId, new_parent_id: NodeId, position: Option<usize>) -> Result<NodeId> {
-        let store = self.local_stores.get_mut(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
-        let old_parent_id = store.store_document().get_node_info(node_id)
-            .map_err(StoreError::Crdt)?
-            .parent_id
-            .ok_or_else(|| StoreError::InvalidOperation("Cannot move the root node".into()))?;
-        store.move_node(node_id, new_parent_id, position).await?;
-        Ok(old_parent_id)
+    /// Move a node to a new parent in a store. The edit names the old
+    /// parent's list, the new parent's and the node itself; a caller that
+    /// wants the old parent for a notification reads it off the tree first.
+    pub fn move_node(&mut self, store_id: StoreId, node_id: NodeId, new_parent_id: NodeId, position: Option<usize>) -> Result<TreeEdit> {
+        self.local_mut(store_id)?.move_node(node_id, new_parent_id, position)
     }
 
-    /// Delete a node and its subtree from a store. Returns the parent it was
-    /// removed from and every node id removed — the node itself and every
-    /// descendant, entries and content files alike
-    /// (docs/history/HARDENING_CONTRACT.md decision 10). Refuses to delete the root.
-    ///
-    /// The subtree is walked *before* anything is removed: `LocalStore::delete_node`
-    /// deletes one node's own entry (and drops it from its parent's children
-    /// list), so a child's parent must still be reachable when its turn comes.
-    pub async fn delete_node(&mut self, store_id: StoreId, node_id: NodeId) -> Result<NodeRemoval> {
-        let store = self.local_stores.get_mut(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
-        let parent_id = store.store_document().get_node_info(node_id)
-            .map_err(StoreError::Crdt)?
-            .parent_id
-            .ok_or_else(|| StoreError::InvalidOperation("Cannot delete the root node".into()))?;
-
-        // A merge that hasn't been repaired yet (repair runs *after* a changing
-        // `applyStoreUpdate` — one can always be caught mid-flight, e.g. right
-        // between two servers reconciling) may leave a cycle or a child listed
-        // under two parents below `node_id`. `visited` makes both harmless: a
-        // cycle stops the walk from looping forever, and a node reachable two
-        // ways is still only queued for deletion once (queuing it twice would
-        // make the second `LocalStore::delete_node` fail outright — its entry
-        // would already be gone).
-        // The same unrepaired state can also list the root, or an id with no
-        // entry, below `node_id`: the root is never deleted along with a subtree
-        // (that would take the whole store), and an entry that doesn't exist has
-        // nothing to delete.
-        let root_id = store.root_node_id();
-        let mut visited = HashSet::new();
-        let mut removed = Vec::new();
-        let mut stack = vec![node_id];
-        while let Some(id) = stack.pop() {
-            if id == root_id || !store.store_document().has_node(id) || !visited.insert(id) {
-                continue;
-            }
-            let children = store.store_document().get_children(id).map_err(StoreError::Crdt)?;
-            stack.extend(children);
-            removed.push(id);
-        }
-
-        // `removed` is top-down (a node's parent-by-list always appears before it —
-        // see the walk above), so deleting bottom-up (reverse order) usually lets
-        // `LocalStore::delete_node` clean the parent's children list too, not just
-        // drop the node's own entry. It is not depended on for correctness: the
-        // same malformed-merge case above can leave a node's stored `parent_id`
-        // pointing somewhere other than the list edge this walk followed to reach
-        // it, so `StoreDocument::remove_node` tolerates a parent that's already
-        // gone (from earlier in this same loop, or otherwise) rather than erroring.
-        for &id in removed.iter().rev() {
-            store.delete_node(id).await?;
-        }
-
-        Ok(NodeRemoval { parent_id, removed })
+    /// Delete a node and its subtree from a store: every member becomes a
+    /// tombstone (docs/NODE_DOCUMENT_CONTRACT.md section 2; no file is
+    /// deleted). Returns the parent it was removed from with every id
+    /// tombstoned, and the edit. Refuses to delete the root.
+    pub fn delete_node(&mut self, store_id: StoreId, node_id: NodeId) -> Result<(NodeRemoval, TreeEdit)> {
+        self.local_mut(store_id)?.delete_node(node_id)
     }
 
-    /// Repair a store's tree after a merge (see `StoreDocument::repair`),
-    /// marking the store document dirty only when it actually changed
-    /// something (docs/history/HARDENING_CONTRACT.md decision 9).
-    pub fn repair_tree(&mut self, store_id: StoreId) -> Result<Option<TreeRepair>> {
-        let store = self.local_stores.get_mut(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
-        store.repair_tree()
+    /// Bring a deleted node and its subtree back (see
+    /// [`LocalStore::undelete_node`]).
+    pub fn undelete_node(&mut self, store_id: StoreId, node_id: NodeId) -> Result<TreeEdit> {
+        self.local_mut(store_id)?.undelete_node(node_id)
     }
 
-    /// Replace a node's content with a full yrs snapshot.
-    pub async fn update_node_content(&mut self, store_id: StoreId, node_id: NodeId, content: Vec<u8>) -> Result<()> {
-        let store = self.local_stores.get_mut(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
-        store.update_node_content(node_id, content).await
+    /// Repair a store's tree after a merge (see `Tree::repair`), marking
+    /// only the documents it changed dirty (docs/history/HARDENING_CONTRACT.md
+    /// decision 9). `None` when nothing needed fixing.
+    pub fn repair_tree(&mut self, store_id: StoreId) -> Result<Option<TreeEdit>> {
+        self.local_mut(store_id)?.repair_tree()
     }
 
-    /// Merge a yrs update (delta, reconciliation diff, or whole snapshot)
-    /// into a node's content document. Returns whether it changed anything
-    /// (docs/history/HARDENING_CONTRACT.md decision 8).
-    pub async fn apply_content_update(&mut self, store_id: StoreId, node_id: NodeId, update: &[u8]) -> Result<bool> {
-        let store = self.local_stores.get_mut(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
-        store.apply_content_update(node_id, update).await
-    }
-
-    /// Get a node's persistent CRDT content document (mutable reference)
-    pub async fn get_node_document(&mut self, store_id: StoreId, node_id: NodeId) -> Result<&mut ContentDoc> {
-        let store = self.local_stores.get_mut(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
-        store.get_node_document(node_id).await
-    }
-
-    /// Save a node's CRDT document
-    pub async fn save_node_document(&mut self, store_id: StoreId, node_id: NodeId, doc: &mut ContentDoc) -> Result<()> {
-        let store = self.local_stores.get_mut(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
-        store.save_node_document(node_id, doc).await
-    }
-
-    /// Mark a node's content as dirty
-    pub fn mark_content_dirty(&mut self, store_id: StoreId, node_id: NodeId) -> Result<()> {
-        let store = self.local_stores.get_mut(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
-        store.mark_content_dirty(node_id);
-        Ok(())
-    }
-
-    /// Get a reference to a store's StoreDocument
-    pub fn store_document(&self, store_id: StoreId) -> Result<&StoreDocument> {
-        let store = self.local_stores.get(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
-        Ok(store.store_document())
-    }
-
-    /// Get a mutable reference to a store's StoreDocument
-    pub fn store_document_mut(&mut self, store_id: StoreId) -> Result<&mut StoreDocument> {
-        let store = self.local_stores.get_mut(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
-        Ok(store.store_document_mut())
-    }
-
-    /// v1-encoded state vector for a store's store document.
-    pub fn store_doc_state_vector(&self, store_id: StoreId) -> Result<Vec<u8>> {
-        let store = self.local_stores.get(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
-        Ok(store.store_doc_state_vector())
-    }
-
-    /// Everything a store's store document has that a peer at `state_vector`
-    /// (v1-encoded) lacks.
-    pub fn store_doc_diff_since(&self, store_id: StoreId, state_vector: &[u8]) -> Result<Vec<u8>> {
-        let store = self.local_stores.get(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
-        store.store_doc_diff_since(state_vector)
-    }
-
-    /// Merge a peer's yrs update into a store's store document. Returns
-    /// whether it changed anything and the ids of the node entries it
-    /// touched (see `LocalStore::apply_store_doc_update`).
-    pub fn apply_store_doc_update(&mut self, store_id: StoreId, update: &[u8]) -> Result<pimble_crdt::StoreUpdateEffect> {
-        let store = self.local_stores.get_mut(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
-        store.apply_store_doc_update(update)
-    }
-
-    /// Read a store's replica sync link (`<store>/sync.json`), if any.
-    pub async fn read_sync_config(&self, store_id: StoreId) -> Result<Option<SyncConfig>> {
-        let store = self.local_stores.get(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
-        store.read_sync_config().await
-    }
-
-    /// Write a store's replica sync link, replacing any existing one.
-    pub async fn write_sync_config(&self, store_id: StoreId, config: &SyncConfig) -> Result<()> {
-        let store = self.local_stores.get(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
-        store.write_sync_config(config).await
-    }
-
-    /// Delete a store's replica sync link, if any (unlinking it).
-    pub async fn clear_sync_config(&self, store_id: StoreId) -> Result<()> {
-        let store = self.local_stores.get(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
-        store.clear_sync_config().await
+    /// Merge a node document snapshot into a node's document (never a
+    /// replacement; see [`LocalStore::update_node_content`]).
+    pub fn update_node_content(&mut self, store_id: StoreId, node_id: NodeId, content: Vec<u8>) -> Result<NodeUpdateEffect> {
+        self.local_mut(store_id)?.update_node_content(node_id, content)
     }
 
     /// Get children of a node, and the id of the store they canonically live
@@ -498,29 +360,104 @@ impl StoreManager {
     /// returned children is itself a source-store node, resolved the same
     /// way when the caller expands it in turn.
     pub async fn get_children(&mut self, store_id: StoreId, node_id: NodeId) -> Result<(StoreId, Vec<Node>)> {
-        let node = self.get_node(store_id, node_id).await?;
+        let node = self.get_node(store_id, node_id)?;
         if node.is_mount() {
             let mount_ref = node.mount_ref().ok_or_else(|| {
                 StoreError::InvalidOperation(format!("mount node {} has no mount_ref", node_id))
             })?;
             let source_store = self.ensure_store_open(&mount_ref).await?;
-            let store = self.local_stores.get_mut(&source_store)
-                .ok_or(StoreError::NotOpen(source_store))?;
-            let children = store.get_children(mount_ref.source_node).await?;
+            let children = self.local(source_store)?.get_children(mount_ref.source_node)?;
             return Ok((source_store, children));
         }
 
-        let store = self.local_stores.get_mut(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
-        let children = store.get_children(node_id).await?;
+        let children = self.local(store_id)?.get_children(node_id)?;
         Ok((store_id, children))
+    }
+
+    // ── Documents ────────────────────────────────────────────────────────
+
+    /// The tree over a store's documents.
+    pub fn tree(&self, store_id: StoreId) -> Result<&Tree> {
+        Ok(self.local(store_id)?.tree())
+    }
+
+    /// The tree, to edit. Nothing edited through it is marked dirty: call
+    /// [`StoreManager::mark_dirty`] for every id the resulting `TreeEdit`
+    /// names.
+    pub fn tree_mut(&mut self, store_id: StoreId) -> Result<&mut Tree> {
+        Ok(self.local_mut(store_id)?.tree_mut())
+    }
+
+    /// A held document, to edit; marked dirty at once. `NodeNotFound` when
+    /// no document is held under `node_id`.
+    pub fn node_doc(&mut self, store_id: StoreId, node_id: NodeId) -> Result<&mut NodeDoc> {
+        self.local_mut(store_id)?.node_doc(node_id)
+    }
+
+    /// Merge a peer's update into a node's document, creating the document
+    /// when unknown (authorise first). Marks it dirty only when the merge
+    /// changed something (docs/history/HARDENING_CONTRACT.md decision 8);
+    /// repairs nothing, so a caller applies a batch and then runs
+    /// `repair_tree` once when any effect reports `structure`.
+    pub fn apply_node_update(&mut self, store_id: StoreId, node_id: NodeId, update: &[u8]) -> Result<NodeUpdateEffect> {
+        self.local_mut(store_id)?.apply_node_update(node_id, update)
+    }
+
+    /// v1-encoded state vector of a node's document (`NodeNotFound` when no
+    /// document is held under the id).
+    pub fn node_state_vector(&self, store_id: StoreId, node_id: NodeId) -> Result<Vec<u8>> {
+        self.local(store_id)?.node_state_vector(node_id)
+    }
+
+    /// Everything a node's document has that a peer at `state_vector`
+    /// (v1-encoded) lacks.
+    pub fn node_diff_since(&self, store_id: StoreId, node_id: NodeId, state_vector: &[u8]) -> Result<Vec<u8>> {
+        self.local(store_id)?.node_diff_since(node_id, state_vector)
+    }
+
+    /// Every held document's id, tombstones included: what sync names.
+    pub fn doc_ids(&self, store_id: StoreId) -> Result<Vec<NodeId>> {
+        Ok(self.local(store_id)?.doc_ids())
+    }
+
+    /// Every undeleted node's id.
+    pub fn list_node_ids(&self, store_id: StoreId) -> Result<Vec<NodeId>> {
+        Ok(self.local(store_id)?.list_node_ids())
+    }
+
+    /// Mark a node's document as needing a flush (an edit made through
+    /// `tree_mut`).
+    pub fn mark_dirty(&mut self, store_id: StoreId, node_id: NodeId) -> Result<()> {
+        self.local_mut(store_id)?.mark_dirty(node_id);
+        Ok(())
+    }
+
+    /// The root a store's documents say it has (see
+    /// [`LocalStore::document_root`]), for `adopt_document_root`.
+    pub fn document_root(&self, store_id: StoreId) -> Result<Option<NodeId>> {
+        Ok(self.local(store_id)?.document_root())
+    }
+
+    // ── Sync configuration ───────────────────────────────────────────────
+
+    /// Read a store's replica sync link (`<store>/sync.json`), if any.
+    pub async fn read_sync_config(&self, store_id: StoreId) -> Result<Option<SyncConfig>> {
+        self.local(store_id)?.read_sync_config().await
+    }
+
+    /// Write a store's replica sync link, replacing any existing one.
+    pub async fn write_sync_config(&self, store_id: StoreId, config: &SyncConfig) -> Result<()> {
+        self.local(store_id)?.write_sync_config(config).await
+    }
+
+    /// Delete a store's replica sync link, if any (unlinking it).
+    pub async fn clear_sync_config(&self, store_id: StoreId) -> Result<()> {
+        self.local(store_id)?.clear_sync_config().await
     }
 
     /// Flush a store to disk
     pub async fn flush(&mut self, store_id: StoreId) -> Result<()> {
-        let store = self.local_stores.get_mut(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
-        store.flush().await
+        self.local_mut(store_id)?.flush().await
     }
 
     /// Flush all stores to disk
@@ -533,9 +470,7 @@ impl StoreManager {
 
     /// Get the root node ID for a store
     pub fn root_node_id(&self, store_id: StoreId) -> Result<NodeId> {
-        let store = self.local_stores.get(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
-        Ok(store.root_node_id())
+        Ok(self.local(store_id)?.root_node_id())
     }
 
     /// Rewrite a local store's manifest root (see `LocalStore::set_root_node_id`).
@@ -616,7 +551,7 @@ impl StoreManager {
         mounting_node: NodeId,
         mount_ref: &MountRef,
     ) -> Result<()> {
-        let ancestors = self.collect_ancestors(mounting_store, mounting_node).await?;
+        let ancestors = self.collect_ancestors(mounting_store, mounting_node)?;
 
         self.ensure_store_open(mount_ref).await?;
 
@@ -631,11 +566,7 @@ impl StoreManager {
 
             self.open_registered_store(current_store).await?;
 
-            let node = {
-                let store = self.local_stores.get_mut(&current_store)
-                    .ok_or(StoreError::NotOpen(current_store))?;
-                store.get_node(current_node).await?
-            };
+            let node = self.local(current_store)?.get_node(current_node)?;
 
             if node.is_mount() {
                 if let Some(nested_ref) = node.mount_ref() {
@@ -669,18 +600,13 @@ impl StoreManager {
     }
 
     /// Collect the set of ancestor node IDs for a given node in a store.
-    async fn collect_ancestors(
-        &mut self,
-        store_id: StoreId,
-        node_id: NodeId,
-    ) -> Result<Vec<NodeId>> {
+    fn collect_ancestors(&self, store_id: StoreId, node_id: NodeId) -> Result<Vec<NodeId>> {
         let mut ancestors = vec![node_id];
-        let store = self.local_stores.get_mut(&store_id)
-            .ok_or(StoreError::NotOpen(store_id))?;
+        let store = self.local(store_id)?;
 
         let mut current = node_id;
         loop {
-            let node = store.get_node(current).await?;
+            let node = store.get_node(current)?;
             match node.parent_id {
                 Some(parent_id) => {
                     ancestors.push(parent_id);
@@ -703,6 +629,9 @@ impl Default for StoreManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    const T: &str = "2026-09-18T10:00:00+00:00";
 
     /// Reproduces the bug an app-level `addRemoteStore` self-reference
     /// exposed: `create_replica` for an id that's already open would
@@ -733,38 +662,60 @@ mod tests {
         assert!(!replica_dir.path().join("replica.pimble").exists(), "no replica directory should have been created");
     }
 
-    /// Deleting a folder deletes every descendant's entry from the store document and
-    /// every descendant's content file from disk (docs/history/HARDENING_CONTRACT.md
-    /// decision 10) — not just the folder itself.
+    /// A replica starts with no documents, not even the root's: the peer's
+    /// root document is the root (see `LocalStore::create_replica`).
     #[tokio::test]
-    async fn delete_node_removes_the_whole_subtree() {
+    async fn create_replica_makes_no_root_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = StoreManager::new();
+        let (id, root_id) = (StoreId::new(), NodeId::new());
+        let store_id = manager.create_replica(dir.path().join("replica.pimble"), id, "Replica", root_id).await.unwrap();
+        assert_eq!(store_id, id);
+        assert!(manager.doc_ids(store_id).unwrap().is_empty());
+        assert!(manager.list_node_ids(store_id).unwrap().is_empty());
+        assert!(matches!(manager.get_node(store_id, root_id), Err(StoreError::NodeNotFound(_))));
+        assert_eq!(manager.document_root(store_id).unwrap(), None);
+        assert_eq!(manager.opened_since(), vec![store_id]);
+    }
+
+    /// Deleting a folder tombstones every descendant (docs/NODE_DOCUMENT_CONTRACT.md
+    /// section 2) — not just the folder itself — and deletes no file: the
+    /// documents stay, named for sync but no longer nodes.
+    #[tokio::test]
+    async fn delete_node_tombstones_the_whole_subtree() {
         let dir = tempfile::tempdir().unwrap();
         let mut manager = StoreManager::new();
         let store_id = manager.create_local_store(dir.path().join("store.pimble"), "Store").await.unwrap();
         let root_id = manager.root_node_id(store_id).unwrap();
 
-        let folder_id = manager.create_node(store_id, Node::folder("Folder"), Some(root_id)).await.unwrap();
-        let subfolder_id = manager.create_node(store_id, Node::folder("Subfolder"), Some(folder_id)).await.unwrap();
-        let doc_id = manager.create_node(store_id, Node::document("Doc"), Some(subfolder_id)).await.unwrap();
+        let folder_id = manager.create_node(store_id, Node::folder("Folder"), Some(root_id)).unwrap().0;
+        let subfolder_id = manager.create_node(store_id, Node::folder("Subfolder"), Some(folder_id)).unwrap().0;
+        let doc_id = manager.create_node(store_id, Node::document("Doc"), Some(subfolder_id)).unwrap().0;
 
-        manager.update_node_content(store_id, doc_id, ContentDoc::from_plain_text("hi").unwrap().save()).await.unwrap();
+        manager.update_node_content(store_id, doc_id, NodeDoc::from_plain_text("hi").unwrap().save()).unwrap();
         manager.flush(store_id).await.unwrap();
 
         let store_path = manager.get_store_info(store_id).unwrap().local_path().unwrap().clone();
         let content_path = store_path.join("nodes").join(format!("{}.yrs", doc_id));
-        assert!(content_path.exists(), "content file should exist before delete");
+        assert!(content_path.exists(), "the document's file should exist before delete");
 
-        let removal = manager.delete_node(store_id, folder_id).await.unwrap();
+        let (removal, edit) = manager.delete_node(store_id, folder_id).unwrap();
 
         assert_eq!(removal.parent_id, root_id);
-        let removed: std::collections::HashSet<_> = removal.removed.into_iter().collect();
+        let removed: HashSet<_> = removal.removed.iter().copied().collect();
         assert_eq!(removed, [folder_id, subfolder_id, doc_id].into_iter().collect());
+        let touched: HashSet<_> = edit.node_ids().into_iter().collect();
+        assert_eq!(touched, [folder_id, subfolder_id, doc_id, root_id].into_iter().collect());
 
-        assert!(!manager.store_document(store_id).unwrap().has_node(folder_id));
-        assert!(!manager.store_document(store_id).unwrap().has_node(subfolder_id));
-        assert!(!manager.store_document(store_id).unwrap().has_node(doc_id));
-        assert!(!manager.store_document(store_id).unwrap().get_children(root_id).unwrap().contains(&folder_id));
-        assert!(!content_path.exists(), "content file should be gone after delete");
+        let tree = manager.tree(store_id).unwrap();
+        assert!(!tree.has_node(folder_id));
+        assert!(!tree.has_node(subfolder_id));
+        assert!(!tree.has_node(doc_id));
+        assert!(!tree.get_children(root_id).unwrap().contains(&folder_id));
+        assert!(manager.doc_ids(store_id).unwrap().contains(&doc_id), "a tombstone is still a document");
+        assert!(!manager.list_node_ids(store_id).unwrap().contains(&doc_id));
+        manager.flush(store_id).await.unwrap();
+        assert!(content_path.exists(), "no file is deleted");
     }
 
     /// A subtree that hasn't been repaired yet can itself be malformed: a
@@ -772,15 +723,13 @@ mod tests {
     /// cycle among nodes below the one being deleted (e.g. two folders that
     /// concurrently moved under each other), and a child listed twice in the
     /// same parent's children list (e.g. two replicas concurrently moving
-    /// the same node to the same destination). Reproduced directly here with
-    /// `append_child` — the same primitive `add_node`/`move_node` use
-    /// internally, so the resulting shape is exactly what such a merge
+    /// the same node to the same destination). Reproduced directly here
+    /// with `insert_child` on the documents — the same primitive the tree's
+    /// edits use, so the resulting shape is exactly what such a merge
     /// leaves behind — rather than via an actual two-replica merge, to
     /// control precisely which lists end up malformed. `delete_node`'s walk
     /// must terminate (not loop forever on the cycle) and the delete must
-    /// still succeed (not fail partway through when the duplicate's second
-    /// occurrence points at an entry the first one already removed) —
-    /// without ever calling `repair_tree` first.
+    /// still succeed — without ever calling `repair_tree` first.
     #[tokio::test]
     async fn delete_node_survives_an_unrepaired_subtree_with_a_cycle_and_a_duplicate() {
         let dir = tempfile::tempdir().unwrap();
@@ -788,26 +737,26 @@ mod tests {
         let store_id = manager.create_local_store(dir.path().join("store.pimble"), "Store").await.unwrap();
         let root_id = manager.root_node_id(store_id).unwrap();
 
-        let top = manager.create_node(store_id, Node::folder("Top"), Some(root_id)).await.unwrap();
-        let folder_a = manager.create_node(store_id, Node::folder("A"), Some(top)).await.unwrap();
-        let folder_b = manager.create_node(store_id, Node::folder("B"), Some(top)).await.unwrap();
-        let child = manager.create_node(store_id, Node::document("Child"), Some(folder_a)).await.unwrap();
+        let top = manager.create_node(store_id, Node::folder("Top"), Some(root_id)).unwrap().0;
+        let folder_a = manager.create_node(store_id, Node::folder("A"), Some(top)).unwrap().0;
+        let folder_b = manager.create_node(store_id, Node::folder("B"), Some(top)).unwrap().0;
+        let child = manager.create_node(store_id, Node::document("Child"), Some(folder_a)).unwrap().0;
 
         {
-            let doc = manager.store_document_mut(store_id).unwrap();
+            let tree = manager.tree_mut(store_id).unwrap();
             // A cycle in the children-list graph below `top` (both A and B stay
             // listed under `top` too, so the subtree is still reachable from it):
             // A's list also names B, and B's list also names A.
-            doc.append_child(folder_b, folder_a).unwrap();
-            doc.append_child(folder_a, folder_b).unwrap();
+            tree.doc_mut(folder_b).unwrap().insert_child(99, folder_a).unwrap();
+            tree.doc_mut(folder_a).unwrap().insert_child(99, folder_b).unwrap();
             // A duplicate: `child` appears a second time in A's own list.
-            doc.append_child(folder_a, child).unwrap();
+            tree.doc_mut(folder_a).unwrap().insert_child(99, child).unwrap();
         }
 
-        let issues_before = manager.store_document(store_id).unwrap().validate_tree().unwrap();
+        let issues_before = manager.tree(store_id).unwrap().validate_tree();
         assert!(!issues_before.is_empty(), "expected the fabricated state to be malformed before any repair");
 
-        let removal = tokio::time::timeout(std::time::Duration::from_secs(5), manager.delete_node(store_id, top))
+        let (removal, _) = tokio::time::timeout(std::time::Duration::from_secs(5), async { manager.delete_node(store_id, top) })
             .await
             .expect("delete_node must terminate even with a cycle below the deleted node")
             .expect("delete_node must succeed even with a duplicated child below the deleted node");
@@ -815,16 +764,16 @@ mod tests {
         let removed: HashSet<_> = removal.removed.into_iter().collect();
         assert_eq!(removed, [top, folder_a, folder_b, child].into_iter().collect());
 
-        let doc = manager.store_document(store_id).unwrap();
-        assert!(!doc.has_node(top));
-        assert!(!doc.has_node(folder_a));
-        assert!(!doc.has_node(folder_b));
-        assert!(!doc.has_node(child));
+        let tree = manager.tree(store_id).unwrap();
+        assert!(!tree.has_node(top));
+        assert!(!tree.has_node(folder_a));
+        assert!(!tree.has_node(folder_b));
+        assert!(!tree.has_node(child));
     }
 
     /// An unrepaired list below the deleted node that names the root, or an id
-    /// with no entry, must neither take the root (and with it the whole store)
-    /// down with the subtree nor fail the delete halfway.
+    /// with no document, must neither take the root (and with it the whole
+    /// store) down with the subtree nor fail the delete halfway.
     #[tokio::test]
     async fn delete_node_skips_the_root_and_dangling_entries_listed_below_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -832,65 +781,62 @@ mod tests {
         let store_id = manager.create_local_store(dir.path().join("store.pimble"), "Store").await.unwrap();
         let root_id = manager.root_node_id(store_id).unwrap();
 
-        let keep = manager.create_node(store_id, Node::document("Keep"), Some(root_id)).await.unwrap();
-        let folder = manager.create_node(store_id, Node::folder("Folder"), Some(root_id)).await.unwrap();
+        let keep = manager.create_node(store_id, Node::document("Keep"), Some(root_id)).unwrap().0;
+        let folder = manager.create_node(store_id, Node::folder("Folder"), Some(root_id)).unwrap().0;
         {
-            let doc = manager.store_document_mut(store_id).unwrap();
-            doc.append_child(folder, root_id).unwrap();
-            doc.append_child(folder, NodeId::new()).unwrap();
+            let tree = manager.tree_mut(store_id).unwrap();
+            tree.doc_mut(folder).unwrap().insert_child(99, root_id).unwrap();
+            tree.doc_mut(folder).unwrap().insert_child(99, NodeId::new()).unwrap();
         }
 
-        let removal = manager.delete_node(store_id, folder).await.expect("delete_node succeeds");
+        let (removal, _) = manager.delete_node(store_id, folder).expect("delete_node succeeds");
         assert_eq!(removal.removed, vec![folder]);
 
-        let doc = manager.store_document(store_id).unwrap();
-        assert!(doc.has_node(root_id), "the root must survive");
-        assert!(doc.has_node(keep), "the root's other children must survive");
-        assert!(!doc.has_node(folder));
+        let tree = manager.tree(store_id).unwrap();
+        assert!(tree.has_node(root_id), "the root must survive");
+        assert!(tree.has_node(keep), "the root's other children must survive");
+        assert!(!tree.has_node(folder));
     }
 
-    /// A node's stored `parent_id` field can name a different node than the
-    /// children-list edge the subtree walk actually followed to reach it —
-    /// the same not-yet-repaired-merge shape as the test above, just in the
-    /// parent_id field rather than the list. If that other node is also
-    /// inside the subtree and ends up deleted earlier in the batch (as
-    /// `top`'s children here are ordered to force), `LocalStore::delete_node`
-    /// looking the node up in *that* parent's children list must not fail
-    /// just because the parent's entry is already gone.
+    /// A node's stored `parent_id` can name a different node than the
+    /// children-list edge it is reachable by — the same not-yet-repaired
+    /// merge shape as the test above, in the `parent_id` field rather than
+    /// the list. The tree counts a node as a child only where list and
+    /// `parent_id` agree, so such a node is not in the deleted subtree: the
+    /// delete succeeds around it, and the next repair places it under the
+    /// root (its stored parent is a tombstone) rather than losing it.
     #[tokio::test]
-    async fn delete_node_survives_a_node_whose_parent_id_points_at_an_already_deleted_sibling() {
+    async fn delete_node_leaves_a_node_whose_parent_id_disagrees_with_the_list_to_repair() {
         let dir = tempfile::tempdir().unwrap();
         let mut manager = StoreManager::new();
         let store_id = manager.create_local_store(dir.path().join("store.pimble"), "Store").await.unwrap();
         let root_id = manager.root_node_id(store_id).unwrap();
 
-        let top = manager.create_node(store_id, Node::folder("Top"), Some(root_id)).await.unwrap();
-        // Created in this order so `top`'s children list is [sibling,
-        // mismatched]: the walk is a LIFO stack, so of these two leaves,
-        // whichever is pushed *last* (the second one created) is popped —
-        // and therefore deleted — first.
-        let sibling = manager.create_node(store_id, Node::folder("Sibling"), Some(top)).await.unwrap();
-        let mismatched = manager.create_node(store_id, Node::document("Mismatched"), Some(top)).await.unwrap();
+        let top = manager.create_node(store_id, Node::folder("Top"), Some(root_id)).unwrap().0;
+        let sibling = manager.create_node(store_id, Node::folder("Sibling"), Some(top)).unwrap().0;
+        let mismatched = manager.create_node(store_id, Node::document("Mismatched"), Some(top)).unwrap().0;
 
         // `mismatched` stays listed under `top` (untouched), but its own
         // `parent_id` field is corrupted to name `sibling` instead.
-        manager.store_document_mut(store_id).unwrap().set_parent_id(mismatched, Some(sibling)).unwrap();
+        manager.node_doc(store_id, mismatched).unwrap().set_parent_id(Some(sibling), T).unwrap();
 
-        // `sibling` is deleted first, per the ordering above; `mismatched`
-        // — whose stray `parent_id` names `sibling` — is deleted next, by
-        // which point `sibling`'s own entry is already gone.
-        let removal = tokio::time::timeout(std::time::Duration::from_secs(5), manager.delete_node(store_id, top))
+        let (removal, _) = tokio::time::timeout(std::time::Duration::from_secs(5), async { manager.delete_node(store_id, top) })
             .await
             .unwrap()
-            .expect("delete_node must succeed even when a node's parent_id points at an already-deleted sibling");
+            .expect("delete_node must succeed around a node whose parent_id disagrees with the list");
 
         let removed: HashSet<_> = removal.removed.into_iter().collect();
-        assert_eq!(removed, [top, sibling, mismatched].into_iter().collect());
+        assert_eq!(removed, [top, sibling].into_iter().collect());
 
-        let doc = manager.store_document(store_id).unwrap();
-        assert!(!doc.has_node(top));
-        assert!(!doc.has_node(sibling));
-        assert!(!doc.has_node(mismatched));
+        let tree = manager.tree(store_id).unwrap();
+        assert!(!tree.has_node(top));
+        assert!(!tree.has_node(sibling));
+        assert!(tree.has_node(mismatched), "not reached by the deletion: still a node");
+
+        let repair = manager.repair_tree(store_id).unwrap().expect("the orphan needs a repair");
+        assert!(repair.node_ids().contains(&mismatched));
+        assert_eq!(manager.get_node(store_id, mismatched).unwrap().parent_id, Some(root_id));
+        assert!(manager.tree(store_id).unwrap().validate_tree().is_empty());
     }
 
     /// The root node can never be deleted, subtree or not.
@@ -901,14 +847,14 @@ mod tests {
         let store_id = manager.create_local_store(dir.path().join("store.pimble"), "Store").await.unwrap();
         let root_id = manager.root_node_id(store_id).unwrap();
 
-        let err = manager.delete_node(store_id, root_id).await.expect_err("deleting the root must fail");
+        let err = manager.delete_node(store_id, root_id).expect_err("deleting the root must fail");
         assert!(matches!(err, StoreError::InvalidOperation(_)), "expected InvalidOperation, got {:?}", err);
-        assert!(manager.store_document(store_id).unwrap().has_node(root_id));
+        assert!(manager.tree(store_id).unwrap().has_node(root_id));
     }
 
     /// `repair_tree` on an already well-formed tree changes nothing
-    /// (docs/history/HARDENING_CONTRACT.md decision 9): in particular it must not mark the
-    /// store dirty, which would force a needless flush on every reconcile.
+    /// (docs/history/HARDENING_CONTRACT.md decision 9): in particular it must not mark
+    /// anything dirty, which would force a needless flush on every reconcile.
     #[tokio::test]
     async fn repair_tree_is_a_no_op_on_a_well_formed_tree() {
         let dir = tempfile::tempdir().unwrap();
@@ -922,11 +868,10 @@ mod tests {
 
     /// A plain node's deletion, once flushed, stays deleted across a
     /// reopen: the store-layer half of the contract the RPC handler's
-    /// `deleteNode` depends on (docs from Joe's bug report: a node deleted
-    /// in the app reappeared after restarting; the root cause was
-    /// `deleteNode` never flushing, fixed in `pimble-server`, not here —
-    /// this confirms the persistence layer itself has always honored a
-    /// flushed delete correctly).
+    /// `deleteNode` depends on (from Joe's bug report: a node deleted in
+    /// the app reappeared after restarting; the root cause was `deleteNode`
+    /// never flushing, fixed in `pimble-server`, not here). With
+    /// tombstones the document comes back from disk, and comes back deleted.
     #[tokio::test]
     async fn deleted_node_stays_deleted_after_flush_and_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -936,10 +881,10 @@ mod tests {
             let mut manager = StoreManager::new();
             let store_id = manager.create_local_store(&path, "Store").await.unwrap();
             let root_id = manager.root_node_id(store_id).unwrap();
-            let doc_id = manager.create_node(store_id, Node::document("Doc"), Some(root_id)).await.unwrap();
+            let doc_id = manager.create_node(store_id, Node::document("Doc"), Some(root_id)).unwrap().0;
             manager.flush(store_id).await.unwrap();
 
-            manager.delete_node(store_id, doc_id).await.unwrap();
+            manager.delete_node(store_id, doc_id).unwrap();
             manager.flush(store_id).await.unwrap();
 
             (store_id, root_id, doc_id)
@@ -948,7 +893,78 @@ mod tests {
         let mut manager = StoreManager::new();
         let reopened_id = manager.open_local_store(&path).await.unwrap();
         assert_eq!(reopened_id, store_id);
-        assert!(!manager.store_document(store_id).unwrap().has_node(doc_id));
-        assert!(!manager.store_document(store_id).unwrap().get_children(root_id).unwrap().contains(&doc_id));
+        let tree = manager.tree(store_id).unwrap();
+        assert!(!tree.has_node(doc_id));
+        assert!(!tree.get_children(root_id).unwrap().contains(&doc_id));
+        assert!(manager.doc_ids(store_id).unwrap().contains(&doc_id), "the tombstone is held");
+        assert!(manager.repair_tree(store_id).unwrap().is_none());
+    }
+
+    /// The manager's edits report what they wrote, per document, and a peer
+    /// applying exactly those updates ends up with the same tree.
+    #[tokio::test]
+    async fn edits_report_updates_a_peer_can_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = StoreManager::new();
+        let store_id = manager.create_local_store(dir.path().join("store.pimble"), "Store").await.unwrap();
+        let root_id = manager.root_node_id(store_id).unwrap();
+        let peer_id = manager.create_replica(dir.path().join("peer.pimble"), StoreId::new(), "Peer", root_id).await.unwrap();
+        let relay = |manager: &mut StoreManager, edit: &TreeEdit| {
+            for (id, update) in &edit.touched {
+                manager.apply_node_update(peer_id, *id, update).unwrap();
+            }
+        };
+        let root_bytes = manager.node_doc(store_id, root_id).unwrap().save();
+        manager.apply_node_update(peer_id, root_id, &root_bytes).unwrap();
+
+        let mut node = Node::document("Doc");
+        node.metadata.tags = vec!["t".into()];
+        node.metadata.custom.insert("icon".into(), serde_json::json!("star"));
+        let (doc_id, edit) = manager.create_node(store_id, node, Some(root_id)).unwrap();
+        relay(&mut manager, &edit);
+        let (folder_id, edit) = manager.create_node(store_id, Node::folder("Folder"), None).unwrap();
+        relay(&mut manager, &edit);
+        let edit = manager.move_node(store_id, doc_id, folder_id, Some(0)).unwrap();
+        relay(&mut manager, &edit);
+        let mut metadata = manager.get_node(store_id, doc_id).unwrap().metadata;
+        metadata.title = "Renamed".into();
+        metadata.custom.remove("icon");
+        let edit = manager.update_node_metadata(store_id, doc_id, metadata).unwrap();
+        relay(&mut manager, &edit);
+        let (_, edit) = manager.delete_node(store_id, folder_id).unwrap();
+        relay(&mut manager, &edit);
+        let edit = manager.undelete_node(store_id, folder_id).unwrap();
+        relay(&mut manager, &edit);
+        assert!(manager.repair_tree(peer_id).unwrap().is_none(), "the relayed edits leave nothing to repair");
+
+        for id in [root_id, folder_id, doc_id] {
+            let (a, b) = (manager.get_node(store_id, id).unwrap(), manager.get_node(peer_id, id).unwrap());
+            assert_eq!(a.parent_id, b.parent_id);
+            assert_eq!(a.children, b.children);
+            assert_eq!(a.metadata.title, b.metadata.title);
+            assert_eq!(a.metadata.tags, b.metadata.tags);
+            assert_eq!(a.metadata.custom, b.metadata.custom);
+        }
+        let doc = manager.get_node(peer_id, doc_id).unwrap();
+        assert_eq!(doc.metadata.title, "Renamed");
+        assert!(!doc.metadata.custom.contains_key("icon"));
+        assert_eq!(manager.get_node(peer_id, root_id).unwrap().children, vec![folder_id]);
+        assert_eq!(manager.get_node(peer_id, folder_id).unwrap().children, vec![doc_id]);
+    }
+
+    /// Creating under a mount node is refused: its children live in the
+    /// source store.
+    #[tokio::test]
+    async fn create_node_refuses_a_mount_as_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = StoreManager::new();
+        let store_id = manager.create_local_store(dir.path().join("store.pimble"), "Store").await.unwrap();
+        let root_id = manager.root_node_id(store_id).unwrap();
+        let mount = Node::new(pimble_core::node_types::MOUNT);
+        let (mount_id, _) = manager.create_node(store_id, mount, Some(root_id)).unwrap();
+        let err = manager.create_node(store_id, Node::document("Under a mount"), Some(mount_id)).unwrap_err();
+        assert!(matches!(err, StoreError::MountHasNoChildren { node_id } if node_id == mount_id), "{err:?}");
+        let err = manager.create_node(store_id, Node::document("Nowhere"), Some(NodeId::new())).unwrap_err();
+        assert!(matches!(err, StoreError::NodeNotFound(_)), "{err:?}");
     }
 }

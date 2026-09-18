@@ -10,8 +10,11 @@ pub enum StoreError {
     #[error("Store not found: {0}")]
     StoreNotFound(StoreId),
 
+    /// A manifest version this crate neither reads nor migrates
+    /// (docs/NODE_DOCUMENT_CONTRACT.md section 3: version 3 is migrated at
+    /// open, version 4 is current).
     #[error(
-        "Store at {path:?} predates the current format (found manifest version {version}, expected 3) and must be re-imported"
+        "Store at {path:?} predates the formats this version reads (found manifest version {version}, expected 3 or 4) and must be re-imported"
     )]
     UnsupportedFormat { path: PathBuf, version: u32 },
 

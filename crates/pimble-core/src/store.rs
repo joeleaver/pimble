@@ -280,13 +280,15 @@ pub struct ConflictInfo {
 
 /// Store manifest - metadata stored in manifest.json
 ///
-/// Version 3 is the only supported layout: `manifest.json` plus `store.yrs`
-/// (tree structure and node metadata) and `nodes/{id}.yrs` (per-node content),
-/// both yrs documents. There is no migration path from an earlier layout; a
-/// store must be re-imported.
+/// Version 4 is the current layout (docs/NODE_DOCUMENT_CONTRACT.md section 3):
+/// `manifest.json` plus `nodes/{id}.yrs`, one yrs document per node holding
+/// its content, its place in the tree and its metadata. Version 3 (the same
+/// plus `store.yrs`, the tree as a document of its own) is migrated at open;
+/// there is no migration path from anything earlier, so such a store must
+/// be re-imported.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreManifest {
-    /// Schema version. Always [`StoreManifest::CURRENT_VERSION`].
+    /// Schema version. [`StoreManifest::CURRENT_VERSION`] once opened.
     pub version: u32,
 
     /// Store ID
@@ -314,8 +316,8 @@ pub struct StoreManifest {
 }
 
 impl StoreManifest {
-    /// Current (and only) schema version
-    pub const CURRENT_VERSION: u32 = 3;
+    /// Current schema version: the node-document layout.
+    pub const CURRENT_VERSION: u32 = 4;
 
     /// Create a new `Plain` manifest. See [`StoreManifest::new_with_kind`]
     /// for a `Vault` one.
