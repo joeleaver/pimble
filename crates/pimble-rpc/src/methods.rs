@@ -194,6 +194,11 @@ pub trait PimbleApi {
     #[method(name = "syncNodeContents", with_extensions)]
     async fn sync_node_contents(&self, request: SyncNodeContentsRequest) -> Result<SyncNodeContentsResponse, ErrorObjectOwned>;
 
+    /// Sync whole node documents, structure and content together
+    /// (docs/NODE_DOCUMENT_CONTRACT.md section 4). Read.
+    #[method(name = "syncNodes", with_extensions)]
+    async fn sync_nodes(&self, request: SyncNodesRequest) -> Result<SyncNodesResponse, ErrorObjectOwned>;
+
     /// Apply a yrs update to the store document (tree structure + metadata)
     /// and broadcast it to the store's other subscribers. Write.
     #[method(name = "applyStoreUpdate", with_extensions)]

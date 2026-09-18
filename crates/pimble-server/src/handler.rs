@@ -23,7 +23,7 @@ use pimble_rpc::{
     LoadWorkspaceResponse, MoveNodeRequest, NodeContentChangedNotification, NodeContentDiff, OpenStoreRequest,
     OpenStoreResponse, PimbleApiServer, RebuildIndexRequest, RebuildIndexResponse, RemoveReplicaRequest,
     SaveWorkspaceRequest, SearchRequest, SearchResponse, SearchResultItem, StoreChangeKind,
-    StoreChangedNotification, SyncNodeContentsRequest, SyncNodeContentsResponse,
+    StoreChangedNotification, SyncNodeContentsRequest, SyncNodeContentsResponse, SyncNodesRequest, SyncNodesResponse,
     SyncStoreDocumentRequest, SyncStoreDocumentResponse, UpdateNodeContentRequest,
     UpdateNodeMetadataRequest,
     VaultAppendRequest, VaultAppendResponse, VaultDocId, VaultDocInfo, VaultEntry, VaultFetchRequest,
@@ -2678,6 +2678,12 @@ impl PimbleApiServer for RpcHandler {
         self.repair_store_tree(request.store_id).await;
 
         Ok(EmptyResponse {})
+    }
+
+    /// Whole node documents (docs/NODE_DOCUMENT_CONTRACT.md wave 2 builds it).
+    async fn sync_nodes(&self, ext: &Extensions, request: SyncNodesRequest) -> Result<SyncNodesResponse, ErrorObjectOwned> {
+        authorize(&principal_of(ext), request.store_id, Access::Read)?;
+        Err(to_rpc_error("syncNodes is not built yet (docs/NODE_DOCUMENT_CONTRACT.md wave 2)"))
     }
 
     async fn sync_node_contents(

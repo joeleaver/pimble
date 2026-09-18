@@ -569,6 +569,33 @@ pub struct NodeContentDiff {
     pub state_vector: String,
 }
 
+/// Sync whole node documents (structure and content together,
+/// docs/NODE_DOCUMENT_CONTRACT.md section 4), the successor of
+/// `syncNodeContents`. Stateless: for each named node the caller sends its
+/// yrs state vector and the server answers with everything it has beyond it;
+/// with `list_unknown` the server also names every document of the store the
+/// caller did not name, so a fresh replica learns what to ask for next (it
+/// then names those with empty state vectors, at most
+/// [`MAX_SYNC_NODE_CONTENTS`] per call). No per-client state on the server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncNodesRequest {
+    pub store_id: StoreId,
+    pub nodes: Vec<NodeStateVector>,
+    #[serde(default)]
+    pub list_unknown: bool,
+}
+
+/// One entry per requested node the server has, in request order (a node the
+/// server does not have is left out), plus the ids it has that were not asked
+/// about when `list_unknown` was set. Tombstoned documents are included: a
+/// deletion is part of the document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncNodesResponse {
+    pub nodes: Vec<NodeContentDiff>,
+    #[serde(default)]
+    pub unknown_ids: Vec<NodeId>,
+}
+
 // ============================================================================
 // Subscription Notification Types
 // ============================================================================
