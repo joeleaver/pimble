@@ -724,3 +724,15 @@ pub struct CloudListHostedStoresResponse {
 pub struct CloudAddHostedStoreRequest {
     pub store_id: StoreId,
 }
+
+// ============================================================================
+// Sharing, docs/NODE_DOCUMENT_CONTRACT.md section 5
+// ============================================================================
+
+/// Hosted side, `Service`-only: close a `vault` store and delete its directory
+/// (what "Stop sharing" and deleting a hosted store reach through the accounts
+/// service). Refused for a plain store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteVaultStoreRequest {
+    pub store_id: StoreId,
+}

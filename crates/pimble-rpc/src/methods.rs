@@ -260,6 +260,14 @@ pub trait PimbleApi {
     /// Add an already-hosted store as a local replica. `Service`-only.
     #[method(name = "cloudAddHostedStore", with_extensions)]
     async fn cloud_add_hosted_store(&self, request: CloudAddHostedStoreRequest) -> Result<OpenStoreResponse, ErrorObjectOwned>;
+
+    // ========================================================================
+    // Sharing, docs/NODE_DOCUMENT_CONTRACT.md section 5
+    // ========================================================================
+
+    /// Hosted side: close a vault store and delete its directory. `Service`-only.
+    #[method(name = "deleteVaultStore", with_extensions)]
+    async fn delete_vault_store(&self, request: DeleteVaultStoreRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
 }
 
 /// Helper function to convert any error to ErrorObjectOwned

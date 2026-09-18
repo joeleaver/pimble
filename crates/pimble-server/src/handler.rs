@@ -51,7 +51,7 @@ use pimble_rpc::{
     LoadWorkspaceResponse, MoveNodeRequest, NodeContentChangedNotification, NodeContentDiff, OpenStoreRequest,
     OpenStoreResponse, PimbleApiServer, RebuildIndexRequest, RebuildIndexResponse, RemoveReplicaRequest,
     SaveWorkspaceRequest, SearchRequest, SearchResponse, SearchResultItem, StoreChangeKind,
-    StoreChangedNotification, SyncNodesRequest, SyncNodesResponse, UndeleteNodeRequest, UpdateNodeContentRequest,
+    DeleteVaultStoreRequest, StoreChangedNotification, SyncNodesRequest, SyncNodesResponse, UndeleteNodeRequest, UpdateNodeContentRequest,
     UpdateNodeMetadataRequest,
     VaultAppendRequest, VaultAppendResponse, VaultDocId, VaultDocInfo, VaultEntry, VaultFetchRequest,
     VaultFetchResponse, VaultListDocsRequest, VaultListDocsResponse, VaultSnapshotRequest,
@@ -2131,6 +2131,12 @@ impl PimbleApiServer for RpcHandler {
         self.mark_replica(&mut store);
 
         Ok(OpenStoreResponse { store })
+    }
+
+    /// Hosted side (docs/NODE_DOCUMENT_CONTRACT.md section 5; the sharing wave builds it).
+    async fn delete_vault_store(&self, ext: &Extensions, request: DeleteVaultStoreRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "deleteVaultStore")?;
+        Err(to_rpc_error(format!("deleteVaultStore is not built yet (store {})", request.store_id)))
     }
 
     async fn create_store(

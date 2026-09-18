@@ -15,7 +15,7 @@ use pimble_core::{AuthMethod, Node, NodeId, RemoteEndpoint, Store, StoreId, Stor
 use pimble_core::MountRef;
 use pimble_rpc::{
     AddRemoteStoreRequest, ApplyEditRequest, CloseStoreRequest, CloudAddHostedStoreRequest,
-    CloudHostStoreRequest, CloudHostedStoreInfo, CloudSignInRequest, CloudStatusResponse,
+    CloudHostStoreRequest, CloudHostedStoreInfo, CloudSignInRequest, CloudStatusResponse, DeleteVaultStoreRequest,
     CreateMountRequest, CreateNodeRequest, CreateStoreRequest, CreateWorkspaceRequest, DeleteNodeRequest,
     EditOperation, GetChildrenRequest, GetMountStateRequest, GetNodeRequest, GetNodesRequest, GetStoreSyncRequest, SetStoreSyncRequest,
     ListRemoteStoresRequest, LoadWorkspaceRequest, MoveNodeRequest, NodeContentChangedNotification, NodeStateVector,
@@ -1071,6 +1071,13 @@ impl PimbleClient {
     pub async fn cloud_add_hosted_store(&self, store_id: StoreId) -> Result<Store> {
         let response = self.client.cloud_add_hosted_store(CloudAddHostedStoreRequest { store_id }).await.map_err(rpc_error)?;
         Ok(response.store)
+    }
+
+    /// Hosted side: close a vault store and delete its directory
+    /// (docs/NODE_DOCUMENT_CONTRACT.md section 5). `Service`-only.
+    pub async fn delete_vault_store(&self, store_id: StoreId) -> Result<()> {
+        self.client.delete_vault_store(DeleteVaultStoreRequest { store_id }).await.map_err(rpc_error)?;
+        Ok(())
     }
 }
 
