@@ -43,6 +43,17 @@ fn kind_label(kind: &str) -> &'static str {
     }
 }
 
+/// What a member's row says beside their address: their role, and for an
+/// address that has been asked but has no account yet, that it is still an
+/// invitation. A plain function for the same reason as [`kind_label`].
+fn member_role_words(member: &MemberView) -> String {
+    if member.status == "invited" {
+        format!("{} · invited", member.role)
+    } else {
+        member.role.clone()
+    }
+}
+
 #[component]
 pub fn account_page() -> NodeHandle {
     let stores: Signal<Vec<StoreView>> = Signal::new(Vec::new());
@@ -160,12 +171,16 @@ pub fn account_page() -> NodeHandle {
         });
     }
 
+    // This page lists whole-store memberships, so it asks for no scope: a
+    // share's members are the Share dialog's business, on the desktop that
+    // owns the store. The answer is now `{ members, share_name }`; the name is
+    // `null` for a whole-store listing, which is what this always asks for.
     let load_members = move |store_id: String| {
         members.set(Vec::new());
         members_error.set(String::new());
         spawn_local(async move {
-            match accounts::list_members(&store_id).await {
-                Ok(list) => members.set(list),
+            match accounts::list_members(&store_id, None).await {
+                Ok(listing) => members.set(listing.members),
                 Err(e) => members_error.set(e.message),
             }
         });
@@ -269,22 +284,38 @@ pub fn account_page() -> NodeHandle {
 
                                 for member in members.get() {
                                     div {
-                                        key: member.user_id.clone(),
+                                        // The address, not the user id: an
+                                        // invited address has no account yet
+                                        // and so no id, and one address is one
+                                        // membership of one scope.
+                                        key: member.email.clone(),
                                         class: "pimble-member",
                                         span { {member.email.clone()} }
                                         span {
                                             style: "display: flex; gap: 8px; align-items: center;",
-                                            span { class: "pimble-member__role", {member.role.clone()} }
+                                            span { class: "pimble-member__role", {member_role_words(&member)} }
                                             Button {
                                                 variant: "subtle",
                                                 size: "xs",
                                                 color: "red",
+                                                // An invitation has no account
+                                                // to remove; withdrawing one
+                                                // is its own endpoint, and the
+                                                // owner's Share dialog's to
+                                                // offer.
+                                                disabled: {
+                                                    let invited = member.user_id.is_none();
+                                                    move || invited
+                                                },
                                                 onclick: {
                                                     let store_id = store.store_id.clone();
-                                                    let user_id = member.user_id.clone();
+                                                    let user_id = member.user_id.clone().unwrap_or_default();
                                                     move || {
                                                         let store_id = store_id.clone();
                                                         let user_id = user_id.clone();
+                                                        if user_id.is_empty() {
+                                                            return;
+                                                        }
                                                         spawn_local(async move {
                                                             match accounts::delete_member(&store_id, &user_id).await {
                                                                 Ok(()) => load_members(store_id),
@@ -539,11 +570,12 @@ async fn add_member(store_id: &str, email: &str, role: &str, is_vault: bool) -> 
             404 => "No verified account with that address.".to_string(),
             _ => e.message,
         })?;
-        let keyring = keys::fetch_keyring(store_id).await?;
-        let key = keyring
-            .current_key()
+        let keyring = keys::fetch_keyring(store_id, None).await.map_err(|e| e.message())?;
+        let (key_id, key) = keyring
+            .current
+            .zip(keyring.current_key())
             .ok_or("This store's key is not available on this device.")?;
-        keys::grant_store_key(store_id, keyring.current, key, &them.id, &them.public_keys).await?;
+        keys::grant_store_key(store_id, key_id, key, &them.id, &them.public_keys).await?;
     }
 
     accounts::put_member(store_id, email, role).await.map_err(|e| e.message)?;

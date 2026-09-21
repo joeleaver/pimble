@@ -212,6 +212,19 @@ async fn run(
             }
         }
 
+        // 3c. Ask again for the key of a share whose owner had not handed it
+        //     over yet. Every connection asks too (`open_listed` runs on each
+        //     one); this is what makes a tab left open notice on its own.
+        for store_id in vault.key_retries_due() {
+            let Some(client) = endpoints.client_for(store_id).filter(|c| c.is_connected()) else {
+                continue;
+            };
+            for event in vault.retry_key(&client, store_id, &signal_ui).await {
+                ran_anything = true;
+                emit(&event_tx, &signal_ui, event);
+            }
+        }
+
         // 4. Run whatever the UI has posted. Drain the queue rather than
         //    taking one per pass, so a burst of edits does not spread over as
         //    many frames as it has commands.
@@ -317,10 +330,12 @@ async fn supervise(
             // tree's first `getChildren` has documents to read rather than a
             // store that does not answer yet.
             if let Some(c) = candidate.as_ref() {
-                // Which stores the account calls encrypted, asked again on
-                // every connect: one created since the last one has to be
-                // recognised before its first `getChildren`.
-                vault.learn_kinds().await;
+                // What the account's grants say about each store, asked again
+                // on every connect: a store created since the last one has to
+                // be recognised as encrypted before its first `getChildren`,
+                // and a share that has arrived since has to be recognised as
+                // one before its store is described to the UI.
+                vault.learn_rows().await;
 
                 // Every subscription this page had belonged to the socket that
                 // has just been replaced, so they are all gone and are made
@@ -359,18 +374,14 @@ async fn supervise(
                 for event in vault.catch_up(c).await {
                     emit(event_tx, signal_ui, event);
                 }
-                for problem in vault.open_listed(c, &stores, signal_ui).await {
-                    emit(
-                        event_tx,
-                        signal_ui,
-                        BackendEvent::Error {
-                            message: format!("Could not open an encrypted store ({problem})"),
-                        },
-                    );
+                for event in vault.open_listed(c, &stores, signal_ui).await {
+                    emit(event_tx, signal_ui, event);
                 }
                 // The root the documents name rather than the placeholder the
-                // hosted manifest may carry. After `open_listed`, so a store
-                // opened just now is described by the tree it has.
+                // hosted manifest may carry, and what the account's grants say
+                // about a share: its own name, who shared it, its roots and
+                // whether they may be written to. After `open_listed`, so a
+                // store opened just now is described by the tree it has.
                 vault.describe_all(&mut stores);
             }
 
@@ -444,6 +455,16 @@ async fn dispatch(
     // Which server answers this command is decided by the store it names, not
     // by which connection happens to be open.
     let store_id = crate::vault::store_id_of(&cmd);
+
+    // A reader's write is refused here, before anything is asked of any
+    // server: the answer would be this same sentence, and it is the same one
+    // whether the store is encrypted or plain
+    // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles").
+    if let Some(event) = store_id.and_then(|id| vault.refuse_write(id, &cmd)) {
+        emit(event_tx, signal_ui, event);
+        return;
+    }
+
     let url = match store_id {
         Some(store_id) => endpoints.url_for(store_id),
         None => endpoints.session_url(),

@@ -27,6 +27,21 @@
 //! document changes only through `NodeDoc::apply_update` (a peer's update, or
 //! the editor's own delta) and through the `Tree` operations, whose
 //! `TreeEdit` says exactly what to append.
+//!
+//! **A share is a scope of somebody else's store** (docs/NODE_DOCUMENT_CONTRACT.md
+//! section 5). The account's store list is one row per grant, so one store can
+//! reach this page as several shares; what it holds of such a store is only the
+//! documents the server lists, each shared root being a root of the `Tree` whose
+//! `parent_id` names a document this page will never hold. That is not an
+//! orphan, so repair is done one scope at a time (see
+//! [`VaultStore::repair_now`], the browser's half of
+//! `pimble_store::LocalStore::repair_scopes`).
+//!
+//! **Keys** are a scope key per scope and a data key per document
+//! ([`StoreKeys`]): a blob's header names its document's data key, which the
+//! server hands over wrapped under each scope key that may read it. A document
+//! this page creates gets a fresh data key wrapped under every scope key it
+//! holds that covers the node.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -38,15 +53,17 @@ use base64::Engine as _;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use pimble_app::protocol::{BackendCommand, BackendEvent};
 use pimble_client::PimbleClient;
-use pimble_core::{custom_keys, node_types, Node, NodeId, NodeMetadata, Store, StoreId, StoreKind};
+use pimble_core::{
+    custom_keys, node_types, Node, NodeId, NodeMetadata, Store, StoreAccess, StoreId, StoreKind,
+};
 use pimble_crdt::{NodeDoc, NodeFields, NodeUpdateEffect, Tree, TreeEdit};
-use pimble_crypto::{blob_aad, Blob};
+use pimble_crypto::{blob_aad, dek_aad, unwrap_dek, wrap_dek, Blob, KeyId, SymmetricKey, WrappedDek};
 use pimble_rpc::{
     SearchResultItem, StoreChangeKind, StoreChangedNotification, VaultCursor, VaultDocId,
-    VaultFetchResponse,
+    VaultDocKeys, VaultFetchResponse,
 };
 
-use crate::keys::{self, Keyring};
+use crate::keys::{self, KeyError, Keyring};
 
 /// How many appends to a document before its snapshot is refreshed. The
 /// contract's number: a reader then replays at most this many updates.
@@ -65,6 +82,16 @@ const REPAIR_DEBOUNCE_MS: f64 = 250.0;
 /// and jsonrpsee caps the requests in flight on it, so a store of hundreds of
 /// nodes is pulled in windows rather than one request per round trip.
 const FETCH_WINDOW: usize = 32;
+
+/// How long before a share whose key has not arrived is asked for again. A
+/// fresh share waits on one of its owner's devices coming online, which is
+/// minutes rather than seconds; often enough to feel live, seldom enough to be
+/// nothing on a tab left open.
+const KEY_RETRY_MS: f64 = 30_000.0;
+
+/// What a store's name gains while its key has not reached this account: the
+/// row is listed, because the grant is real, and says why it will not open.
+const WAITING_SUFFIX: &str = " (waiting for the key)";
 
 /// What [`VaultClient::handle`] decided about a command.
 pub enum Handled {
@@ -103,18 +130,105 @@ impl Default for VaultDoc {
     }
 }
 
+/// One grant this account holds on a store, as the accounts service lists it
+/// (`GET /api/v1/stores`, one row per grant).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountGrant {
+    /// The shared node for a share, `None` for the whole store.
+    pub root: Option<NodeId>,
+    pub role: String,
+    /// The share's own name — never the owner's store name — for a scoped
+    /// grant; the store's for a whole-store one.
+    pub name: String,
+}
+
+/// What the account's store list says about one store: every grant it holds on
+/// it, so a store shared twice is one entry with two roots.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountStore {
+    /// `"vault"` or `"plain"`.
+    pub kind: String,
+    pub grants: Vec<AccountGrant>,
+    /// An owner's email when the store reached this account as a share.
+    pub shared_by: Option<String>,
+}
+
+impl AccountStore {
+    /// What this account may do in the store: `Read` only when every grant it
+    /// holds is a reader's. A reader of one folder and an editor of another
+    /// gets `Full`, and the server refuses the writes under the read-only root
+    /// one at a time — a store-wide `Read` would take away the editing they do
+    /// have (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Token").
+    pub fn access(&self) -> StoreAccess {
+        if !self.grants.is_empty() && self.grants.iter().all(|g| g.role == "reader") {
+            StoreAccess::Read
+        } else {
+            StoreAccess::Full
+        }
+    }
+
+    /// The shared roots, in the order the service listed them; empty when any
+    /// grant is of the whole store, which covers every node in it.
+    pub fn roots(&self) -> Vec<NodeId> {
+        if self.grants.iter().any(|g| g.root.is_none()) {
+            return Vec::new();
+        }
+        self.grants.iter().filter_map(|g| g.root).collect()
+    }
+
+    /// The name to show: the share's for a store reached only through shares,
+    /// and `None` for a whole-store grant, whose name the server already
+    /// carries. Several shares of one store share a name per share, so the
+    /// first is as good an answer as the list has.
+    pub fn name(&self) -> Option<String> {
+        if self.grants.iter().any(|g| g.root.is_none()) {
+            return None;
+        }
+        self.grants.iter().find(|g| !g.name.is_empty()).map(|g| g.name.clone())
+    }
+}
+
+/// The keys of one encrypted store: the scope keys this account holds, and
+/// every document's data key as blobs have asked for them.
+///
+/// Resolution order for a blob whose header names `key_id`
+/// (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Keys"):
+///
+/// 1. the document's data key, already unwrapped here;
+/// 2. the document's wraps as `vaultFetch` handed them over, unwrapped with
+///    whichever scope key this page holds;
+/// 3. a scope key of that id held directly — a blob from before data keys,
+///    whose header names the store key itself.
+struct StoreKeys {
+    /// The scope keys: the store key, or each share's, or both.
+    scope: Keyring,
+    /// Each document's wrapped data keys, as the server last served them.
+    wraps: HashMap<NodeId, VaultDocKeys>,
+    /// Data keys already unwrapped, with the id the blobs name.
+    deks: HashMap<NodeId, (KeyId, SymmetricKey)>,
+    /// Each document's data-key id as `vaultListDocs` reported it, for a
+    /// document whose wraps have not been fetched yet.
+    listed_dek: HashMap<NodeId, KeyId>,
+}
+
 /// One encrypted store.
 struct VaultStore {
     /// The store as the server listed it: what the UI is told again when the
     /// documents turn out to name another root than the manifest does.
     listed: Store,
-    keyring: Keyring,
+    keys: StoreKeys,
+    /// The roots this page holds of the store: empty for a whole store, the
+    /// shared roots for a scoped member (`Store::roots`). A scope root's
+    /// `parent_id` names a document this page never holds.
+    scope_roots: Vec<NodeId>,
     /// Every document this page holds, and the tree over them.
     tree: Tree,
     /// The log bookkeeping for each held document.
     docs: HashMap<NodeId, VaultDoc>,
     /// Each document's head as the server last reported it, so a document
-    /// nothing was appended to is never fetched again.
+    /// nothing was appended to is never fetched again. A document the server
+    /// is known to have at all, which is what decides whether an append
+    /// creates one.
     heads: HashMap<NodeId, u64>,
     /// When the debounced repair is due (the page's clock, ms), once a
     /// merged update has touched structure.
@@ -139,6 +253,20 @@ struct Outgoing {
     sent_sv: Vec<u8>,
     /// Whether this carried everything since `known_sv` rather than one edit.
     resend: bool,
+    /// The server has never seen this document: the data key this page made
+    /// for it, to set once the append has landed (the server admits keys only
+    /// for a document it has), and the parent the append must name so a scoped
+    /// member's new document joins their scope.
+    created: Option<(VaultDocKeys, Option<NodeId>)>,
+}
+
+/// A store this account holds a grant on whose key has not arrived yet.
+struct Waiting {
+    /// The store as the server listed it, so the retry needs no second
+    /// `listStores` and the UI can be told the moment it opens.
+    listed: Store,
+    /// The page's clock, ms.
+    due: f64,
 }
 
 /// What merging a peer's updates into one document came to.
@@ -153,9 +281,18 @@ pub struct VaultClient {
     /// notifications caused by this client's own appends.
     client_id: String,
     stores: HashMap<StoreId, VaultStore>,
-    /// Store ids the accounts service calls vault stores, which is the
-    /// authority when the RPC `Store` does not carry a kind yet.
-    vault_ids: HashSet<StoreId>,
+    /// What the accounts service says about each store this account has a
+    /// grant on: its kind (the authority when the RPC `Store` does not carry
+    /// one yet), its grants, and who shared it. One entry per store, however
+    /// many grants it holds on it.
+    rows: HashMap<StoreId, AccountStore>,
+    /// Stores whose key has not reached this account yet: the store as the
+    /// server listed it, and when to ask again. A fresh share sits here until
+    /// one of its owner's devices comes online to hand the key over.
+    waiting: HashMap<StoreId, Waiting>,
+    /// Which of those this session has already said out loud: once per store,
+    /// not once per retry.
+    announced: HashSet<StoreId>,
     /// The node the editor currently has open, learned from
     /// `SubscribeNodeChanges`. A decrypted content update is only turned into
     /// `RemoteChanges` for this node: the app has one editor pane and that
@@ -164,6 +301,9 @@ pub struct VaultClient {
     active: Option<(StoreId, NodeId)>,
     /// The stores subscribed to on the current socket (see `subscribe`).
     subscribed: HashSet<StoreId>,
+    /// Events raised somewhere with no reply of its own to carry them — a
+    /// document pulled again after a refused append — drained by [`pump`].
+    pending: Vec<BackendEvent>,
     notices_tx: Sender<StoreChangedNotification>,
     notices_rx: Receiver<StoreChangedNotification>,
 }
@@ -174,9 +314,12 @@ impl VaultClient {
         Self {
             client_id,
             stores: HashMap::new(),
-            vault_ids: HashSet::new(),
+            rows: HashMap::new(),
+            waiting: HashMap::new(),
+            announced: HashSet::new(),
             active: None,
             subscribed: HashSet::new(),
+            pending: Vec::new(),
             notices_tx,
             notices_rx,
         }
@@ -191,30 +334,62 @@ impl VaultClient {
     /// encrypted store, whether it is open here or only known to be encrypted
     /// from the account's store list.
     pub fn is_encrypted(&self, store_id: StoreId) -> bool {
-        self.owns(store_id) || self.vault_ids.contains(&store_id)
+        self.owns(store_id) || self.rows.get(&store_id).is_some_and(|row| row.kind == "vault")
     }
 
-    /// Remember which stores the accounts service says are encrypted.
+    /// What this account may change in a store, from the grants it holds.
+    pub fn access(&self, store_id: StoreId) -> StoreAccess {
+        self.rows.get(&store_id).map(AccountStore::access).unwrap_or(StoreAccess::Full)
+    }
+
+    /// Read the account's store list: which stores are encrypted, and every
+    /// grant this account holds on each.
     ///
-    /// Asked separately from the RPC store list because the two services are
-    /// landing together: either source saying "vault" is enough.
-    pub async fn learn_kinds(&mut self) {
-        match crate::accounts::list_stores().await {
-            Ok(list) => {
-                for view in list {
-                    if view.kind == "vault" {
-                        if let Ok(id) = StoreId::parse(&view.store_id) {
-                            self.vault_ids.insert(id);
-                        }
-                    }
-                }
+    /// Asked separately from the RPC store list because only the accounts
+    /// service knows a share's own name, who shared it and which roots the
+    /// account holds — the hosted server answers with the *owner's* store
+    /// name, which a recipient has no business learning. One row per grant, so
+    /// the rows of one store are collected here.
+    pub async fn learn_rows(&mut self) {
+        let list = match crate::accounts::list_stores().await {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!("Could not read the account's store list: {}", e);
+                return;
             }
-            Err(e) => tracing::warn!("Could not read the account's store list: {}", e),
+        };
+
+        let mut rows: HashMap<StoreId, AccountStore> = HashMap::new();
+        for view in list {
+            let Ok(store_id) = StoreId::parse(&view.store_id) else {
+                tracing::warn!("The account's store list named {}, which is not a store id", view.store_id);
+                continue;
+            };
+            // A row whose `root` will not parse is a scoped grant this page
+            // cannot address; dropping the row is safer than reading it as a
+            // whole-store grant, which is what `None` would mean.
+            let root = match view.root.as_deref() {
+                Some(raw) => match NodeId::parse(raw) {
+                    Ok(root) => Some(root),
+                    Err(_) => {
+                        tracing::warn!("A grant on {} named the root {}, which is not a node id", store_id, raw);
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            let row = rows.entry(store_id).or_default();
+            row.kind = view.kind;
+            if row.shared_by.is_none() {
+                row.shared_by = view.shared_by;
+            }
+            row.grants.push(AccountGrant { root, role: view.role, name: view.name });
         }
+        self.rows = rows;
     }
 
     /// Fill in what this page knows about a store before the UI sees it: the
-    /// root its documents name.
+    /// root its documents name, and what the account's grants say about it.
     ///
     /// The root matters. A hosted store's manifest carries the root the
     /// server minted when the store was created, which is the real one only
@@ -224,9 +399,31 @@ impl VaultClient {
     /// documents are the authority and this is where they replace the
     /// placeholder. A store whose documents are not open here keeps the
     /// server's root: there is nothing better to say until they are.
+    ///
+    /// For a share the row decides the rest: the name (the share's own, since
+    /// the server's is the owner's store's), who shared it, the roots this
+    /// account holds and whether any of them may be written to.
     pub fn describe(&self, store: &mut Store) {
+        if let Some(row) = self.rows.get(&store.id) {
+            store.access = row.access();
+            store.shared_by = row.shared_by.clone();
+            let roots = row.roots();
+            if !roots.is_empty() {
+                store.root_node_id = roots[0];
+                store.roots = roots;
+            }
+            if let Some(name) = row.name() {
+                store.name = name;
+            }
+        }
         if let Some(open) = self.stores.get(&store.id) {
-            store.root_node_id = open.tree.root();
+            if open.scope_roots.is_empty() {
+                store.root_node_id = open.tree.root();
+            }
+        } else if self.waiting.contains_key(&store.id) && !store.name.ends_with(WAITING_SUFFIX) {
+            // The grant is real; only the key is late. Listing the row says so
+            // rather than leaving a store that silently never opens.
+            store.name.push_str(WAITING_SUFFIX);
         }
     }
 
@@ -240,25 +437,107 @@ impl VaultClient {
     /// Open every vault store in `stores` that is not open yet.
     ///
     /// Called before `StoresListed` reaches the UI, so the tree's first
-    /// `GetChildren` already has documents to read.
+    /// `GetChildren` already has documents to read. Answers what the UI should
+    /// hear about the ones that did not open: an error for a real failure, and
+    /// for a share still waiting on its key a sentence saying so, once per
+    /// store per session.
     pub async fn open_listed(
         &mut self,
         client: &Arc<PimbleClient>,
         stores: &[Store],
         signal_ui: &Arc<dyn Fn() + Send + Sync>,
-    ) -> Vec<String> {
-        let mut problems = Vec::new();
+    ) -> Vec<BackendEvent> {
+        let mut events = Vec::new();
         for store in stores {
-            let is_vault = store.kind == StoreKind::Vault || self.vault_ids.contains(&store.id);
-            if !is_vault || self.stores.contains_key(&store.id) {
+            // Either source saying "vault" is enough: the accounts service
+            // knows a store's kind before any grant of it reaches a token, and
+            // the RPC `Store` knows it for one the account list has not been
+            // re-read for yet.
+            if store.kind == StoreKind::Vault {
+                self.rows.entry(store.id).or_default().kind = "vault".to_string();
+            }
+            if !self.is_encrypted(store.id) || self.stores.contains_key(&store.id) {
                 continue;
             }
-            if let Err(message) = self.open_store(client, store, signal_ui).await {
-                tracing::error!("Opening the encrypted store {}: {}", store.name, message);
-                problems.push(format!("{}: {}", store.name, message));
+            match self.open_store(client, store, signal_ui).await {
+                Ok(()) => {}
+                Err(KeyError::NoneYet) => events.extend(self.now_waiting(store)),
+                Err(KeyError::Failed(message)) => {
+                    tracing::error!("Opening the encrypted store {}: {}", store.name, message);
+                    events.push(BackendEvent::Error {
+                        message: format!("Could not open an encrypted store ({}: {})", store.name, message),
+                    });
+                }
             }
         }
-        problems
+        events
+    }
+
+    /// Record that a store is waiting for its key, and say so the first time.
+    ///
+    /// A grant with no envelope yet is the ordinary state of a fresh share:
+    /// the owner's Pimble has not been online since to hand the key over. It
+    /// is a sentence for the person, not an error, so it goes through the
+    /// notice channel (see [`notice`]).
+    fn now_waiting(&mut self, listed: &Store) -> Option<BackendEvent> {
+        let store_id = listed.id;
+        self.waiting.insert(store_id, Waiting { listed: listed.clone(), due: now_ms() + KEY_RETRY_MS });
+        if !self.announced.insert(store_id) {
+            return None;
+        }
+        let who = self
+            .rows
+            .get(&store_id)
+            .and_then(|row| row.shared_by.clone())
+            .unwrap_or_else(|| "the owner".to_string());
+        Some(notice(format!(
+            "Waiting for {who}'s Pimble to come online to finish sharing"
+        )))
+    }
+
+    /// The stores whose key is worth asking for again (see [`KEY_RETRY_MS`]).
+    pub fn key_retries_due(&self) -> Vec<StoreId> {
+        let now = now_ms();
+        self.waiting
+            .iter()
+            .filter(|(_, waiting)| waiting.due <= now)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Ask again for a waiting store's key and open it if it has arrived.
+    ///
+    /// The store is announced to the UI when it opens, since `StoresListed`
+    /// has long since been and gone — and it is announced without the
+    /// "waiting" suffix its name carried, which is what makes the row settle.
+    pub async fn retry_key(
+        &mut self,
+        client: &Arc<PimbleClient>,
+        store_id: StoreId,
+        signal_ui: &Arc<dyn Fn() + Send + Sync>,
+    ) -> Vec<BackendEvent> {
+        let Some(listed) = self.waiting.get(&store_id).map(|w| w.listed.clone()) else {
+            return Vec::new();
+        };
+        match self.open_store(client, &listed, signal_ui).await {
+            Ok(()) => {
+                let mut store = listed;
+                self.describe(&mut store);
+                tracing::info!("Store {}: the key arrived; it is open", store_id);
+                vec![BackendEvent::StoreOpened { store }]
+            }
+            Err(e) => {
+                // Still worth retrying either way: a request that failed may
+                // not fail next time, and a key that has not arrived may.
+                if let Some(waiting) = self.waiting.get_mut(&store_id) {
+                    waiting.due = now_ms() + KEY_RETRY_MS;
+                }
+                if let KeyError::Failed(message) = e {
+                    tracing::warn!("Asking again for the key of {} failed: {}", store_id, message);
+                }
+                Vec::new()
+            }
+        }
     }
 
     /// Fetch this store's keys and every document's log, decrypt, build the
@@ -279,49 +558,61 @@ impl VaultClient {
         client: &Arc<PimbleClient>,
         store: &Store,
         signal_ui: &Arc<dyn Fn() + Send + Sync>,
-    ) -> Result<(), String> {
+    ) -> Result<(), KeyError> {
         let store_id = store.id;
-        let keyring = keys::fetch_keyring(&store_id.to_string()).await?;
+        // The roots to fetch keys for are the account's grants: a share's key
+        // lives under its own root, the store key under none.
+        let scope_roots = self.rows.get(&store_id).map(AccountStore::roots).unwrap_or_default();
+        let keyring = keys::fetch_scope_keyring(&store_id.to_string(), &scope_roots).await?;
 
         if let Some(BackendEvent::Error { message }) = self.subscribe(client, store_id, signal_ui).await {
-            return Err(message);
+            return Err(KeyError::Failed(message));
         }
 
         let listed = client
             .vault_list_docs(store_id)
             .await
-            .map_err(|e| format!("listing the vault's documents failed: {e}"))?;
-        let wanted: Vec<(NodeId, u64)> = listed
-            .into_iter()
-            .filter_map(|info| match info.doc_id {
-                VaultDocId::Node(id) => (info.head > 0).then_some((id, 0)),
-                VaultDocId::Tree => {
-                    // A hosted twin from before this layout keeps its tree
-                    // document, superseded by the node documents.
-                    tracing::debug!("Store {} lists a tree document; skipping it", store_id);
-                    None
+            .map_err(|e| KeyError::Failed(format!("listing the vault's documents failed: {e}")))?;
+        let mut keys = StoreKeys::new(keyring);
+        let mut wanted: Vec<(NodeId, u64)> = Vec::new();
+        for info in listed {
+            match info.doc_id {
+                VaultDocId::Node(id) => {
+                    if let Some(dek_id) = info.dek_id {
+                        keys.listed_dek.insert(id, dek_id);
+                    }
+                    if info.head > 0 {
+                        wanted.push((id, 0));
+                    }
                 }
-            })
-            .collect();
+                // A hosted twin from before this layout keeps its tree
+                // document, superseded by the node documents.
+                VaultDocId::Tree => tracing::debug!("Store {} lists a tree document; skipping it", store_id),
+            }
+        }
 
         let mut pulled = Vec::with_capacity(wanted.len());
         for (node_id, fetched) in fetch_many(client, store_id, wanted).await {
             match fetched {
-                Ok(fetched) => pulled.push(Pulled {
-                    node_id,
-                    entries: decrypt_entries(&keyring, store_id, &VaultDocId::Node(node_id), &fetched),
-                    head: fetched.head,
-                }),
+                Ok(fetched) => {
+                    keys.note_wraps(node_id, fetched.keys.clone());
+                    pulled.push(Pulled {
+                        node_id,
+                        entries: keys.decrypt_entries(store_id, node_id, &fetched),
+                        head: fetched.head,
+                    });
+                }
                 // Left unheld: the next catch-up sees it listed and fetches
                 // it from the start.
                 Err(message) => tracing::warn!("Fetching the document {} failed: {}", node_id, message),
             }
         }
 
-        let mut vault_store = VaultStore::assemble(store.clone(), keyring, pulled);
+        let mut vault_store = VaultStore::assemble(store.clone(), keys, scope_roots, pulled);
         // Once, after the whole pull, never between the updates of one edit.
         let repair = vault_store.repair_now(&now_rfc3339());
         self.stores.insert(store_id, vault_store);
+        self.waiting.remove(&store_id);
         if let Some(edit) = repair {
             if let Err(message) = self.append_edit(client, store_id, &edit).await {
                 tracing::warn!("Appending the repair of {} failed: {}", store_id, message);
@@ -357,17 +648,24 @@ impl VaultClient {
                 }
             };
             let wanted: Vec<(NodeId, u64)> = {
-                let Some(store) = self.stores.get(&store_id) else { continue };
-                listed
-                    .into_iter()
-                    .filter_map(|info| match info.doc_id {
-                        VaultDocId::Node(id) => {
-                            let from = store.docs.get(&id).map(|d| d.cursor.applied_through()).unwrap_or(0);
-                            (info.head > from).then_some((id, from))
-                        }
-                        VaultDocId::Tree => None,
-                    })
-                    .collect()
+                let Some(store) = self.stores.get_mut(&store_id) else { continue };
+                let mut wanted = Vec::new();
+                for info in listed {
+                    let VaultDocId::Node(id) = info.doc_id else { continue };
+                    if let Some(dek_id) = info.dek_id {
+                        store.keys.listed_dek.insert(id, dek_id);
+                    }
+                    let from = store.docs.get(&id).map(|d| d.cursor.applied_through()).unwrap_or(0);
+                    // A document whose head has not moved is still fetched
+                    // when its wraps are missing: a fetch answers with them
+                    // whether or not it carries an entry, and without them
+                    // nothing can be encrypted for that document.
+                    let wants_keys = info.dek_id.is_some() && !store.keys.wraps.contains_key(&id);
+                    if info.head > from || wants_keys {
+                        wanted.push((id, from));
+                    }
+                }
+                wanted
             };
             let fetched = fetch_many(client, store_id, wanted).await;
 
@@ -376,7 +674,8 @@ impl VaultClient {
                 let Ok(fetched) = fetched else { continue };
                 let active = self.active == Some((store_id, node_id));
                 let Some(store) = self.stores.get_mut(&store_id) else { continue };
-                let entries = decrypt_entries(&store.keyring, store_id, &VaultDocId::Node(node_id), &fetched);
+                store.keys.note_wraps(node_id, fetched.keys.clone());
+                let entries = store.keys.decrypt_entries(store_id, node_id, &fetched);
                 let merged = store.merge(store_id, node_id, entries, active, None);
                 store.heads.insert(node_id, fetched.head);
                 structure |= merged.structure;
@@ -416,7 +715,7 @@ impl VaultClient {
     /// backend loop, which is what keeps `&mut self` out of the subscription
     /// task (it only forwards raw notifications down a channel).
     pub fn pump(&mut self) -> Vec<BackendEvent> {
-        let mut events = Vec::new();
+        let mut events = std::mem::take(&mut self.pending);
         while let Ok(notification) = self.notices_rx.try_recv() {
             let StoreChangeKind::VaultAppended { doc_id, seq } = &notification.change_kind else {
                 // A vault store emits nothing else, but forward anything that
@@ -469,11 +768,11 @@ impl VaultClient {
             return Vec::new();
         }
 
-        let doc_id = VaultDocId::Node(node_id);
-        let update = decrypt_blob(&store.keyring, store_id, &doc_id, blob);
+        let update = store.keys.decrypt_blob(store_id, node_id, blob);
         // An unknown key id is not fatal: a rotation this device has not been
-        // granted yet looks exactly like this. The cursor stops in front of
-        // the entry, so a later snapshot cannot vouch for it.
+        // granted yet, or a document whose wraps have not been fetched, looks
+        // exactly like this. The cursor stops in front of the entry, so a
+        // later snapshot cannot vouch for it.
         let merged = store.merge(store_id, node_id, vec![(Mark::One(seq), update)], active, source_client_id);
         let head = store.heads.entry(node_id).or_insert(0);
         *head = (*head).max(seq);
@@ -540,6 +839,9 @@ impl VaultClient {
             return Handled::No(cmd);
         }
 
+        // A reader's write never reaches here: the backend loop asks
+        // [`VaultClient::refuse_write`] before it hands a command anywhere, so
+        // that one gate covers an encrypted store and a plain one alike.
         Handled::Yes(match cmd {
             BackendCommand::GetChildren { store_id, node_id } => Some(self.get_children(store_id, node_id)),
 
@@ -566,10 +868,18 @@ impl VaultClient {
             }
 
             BackendCommand::BroadcastChanges { store_id, node_id, changes } => {
-                if let Err(message) = self.broadcast(client, store_id, node_id, &changes).await {
-                    tracing::warn!("Appending an encrypted edit failed: {}", message);
+                match self.broadcast(client, store_id, node_id, &changes).await {
+                    Ok(()) => None,
+                    // A refusal is the server saying no, and no later attempt
+                    // will change its mind, so the person is told. Any other
+                    // failure is recorded against the document and resent on
+                    // the next connection, which needs no announcement.
+                    Err(message) if is_refusal(&message) => Some(BackendEvent::Error { message }),
+                    Err(message) => {
+                        tracing::warn!("Appending an encrypted edit failed: {}", message);
+                        None
+                    }
                 }
-                None
             }
 
             BackendCommand::SetNodeContent { store_id, node_id, content } => {
@@ -613,6 +923,20 @@ impl VaultClient {
                 message: format!("{} is not available on an encrypted store", name_of(&other)),
             }),
         })
+    }
+
+    /// The refusal a writing command earns on a store this account may only
+    /// read, or `None` when there is nothing to refuse.
+    ///
+    /// The backend loop's one gate, asked before a command is handed anywhere,
+    /// so an encrypted store and a plain one are refused the same way and for
+    /// the same reason. It answers from the account's grants, so it does not
+    /// depend on the store being one this client holds.
+    pub fn refuse_write(&self, store_id: StoreId, cmd: &BackendCommand) -> Option<BackendEvent> {
+        if !writes(cmd) || self.access(store_id).allows_write() {
+            return None;
+        }
+        Some(BackendEvent::Error { message: StoreAccess::READ_ONLY_REFUSAL.to_string() })
     }
 
     // ── Reads ───────────────────────────────────────────────────────────────
@@ -841,6 +1165,11 @@ impl VaultClient {
 
     /// Append one document's update, already merged into the document here:
     /// encrypt, `vaultAppend`, record the outcome, snapshot when due.
+    ///
+    /// A document the server has never seen is created: its append names the
+    /// parent (which is how a scoped member's new document joins their scope)
+    /// and its data key is set right after, since the server admits keys only
+    /// for a document it has.
     async fn append_prepared(
         &mut self,
         client: &Arc<PimbleClient>,
@@ -854,15 +1183,47 @@ impl VaultClient {
             };
             store.prepare(store_id, node_id, update)?
         };
+        let parent_id = outgoing.created.as_ref().and_then(|(_, parent)| *parent);
         let appended = client
-            .vault_append_from(store_id, outgoing.doc_id.clone(), outgoing.blob.clone(), Some(self.client_id.clone()))
+            .vault_append_new(
+                store_id,
+                outgoing.doc_id.clone(),
+                outgoing.blob.clone(),
+                Some(self.client_id.clone()),
+                parent_id,
+            )
             .await
             .map_err(|e| e.to_string());
+
+        // A refusal is the server saying no — a reader's root inside a store
+        // this account edits elsewhere, or a document in nobody's scope. There
+        // is nothing to resend, so the document is not left `unsent` (which
+        // would push the same refused bytes on every reconnect); instead it is
+        // pulled again, so what is on screen is what the server holds.
+        if let Err(message) = &appended {
+            if is_refusal(message) {
+                tracing::warn!("Store {} refused an append to {}: {}", store_id, node_id, message);
+                let events = self.repull(client, store_id, node_id).await;
+                self.pending.extend(events);
+                return Err(message.clone());
+            }
+        }
 
         let Some(store) = self.stores.get_mut(&store_id) else { return Ok(()) };
         let snapshot = store.record(node_id, &outgoing, appended)?;
 
+        // The document is on the server now, so its wraps may be set. One that
+        // fails is not fatal: the document is readable to whoever made it, and
+        // the next append of it finds no keys and tries again.
+        if let Some((keys, _)) = outgoing.created {
+            store.keys.note_created(node_id, &keys);
+            if let Err(e) = client.vault_set_doc_keys(store_id, outgoing.doc_id.clone(), keys).await {
+                tracing::warn!("Setting the data key of {} failed: {}", node_id, e);
+            }
+        }
+
         if let Some(upto_seq) = snapshot {
+            let Some(store) = self.stores.get_mut(&store_id) else { return Ok(()) };
             let blob = store.snapshot_blob(store_id, node_id)?;
             match client.vault_snapshot(store_id, outgoing.doc_id, upto_seq, blob).await {
                 Ok(()) => {
@@ -874,6 +1235,62 @@ impl VaultClient {
             }
         }
         Ok(())
+    }
+
+    /// Throw one document away and fetch it again from the start, so what this
+    /// page holds is what the server holds.
+    ///
+    /// The only caller is a refused append. A yrs document cannot un-merge the
+    /// edit the server would not take, and leaving it would show work that
+    /// exists nowhere else and never will; the honest answer is the server's
+    /// copy. A document the server refuses to serve either is simply dropped:
+    /// it is not this account's to see.
+    async fn repull(&mut self, client: &Arc<PimbleClient>, store_id: StoreId, node_id: NodeId) -> Vec<BackendEvent> {
+        // The parent before the document goes: what the UI has drawn of that
+        // list is what changes, whether the document comes back or not.
+        let touched = {
+            let Some(store) = self.stores.get_mut(&store_id) else { return Vec::new() };
+            let mut touched = vec![node_id];
+            touched.extend(
+                store
+                    .tree
+                    .doc(node_id)
+                    .and_then(|doc| doc.fields().ok())
+                    .and_then(|fields| fields.parent_id),
+            );
+            store.refused(node_id);
+            touched
+        };
+        let fetched = client.vault_fetch(store_id, VaultDocId::Node(node_id), 0).await;
+        let active = self.active == Some((store_id, node_id));
+        let Some(store) = self.stores.get_mut(&store_id) else { return Vec::new() };
+        let fetched = match fetched {
+            Ok(fetched) => fetched,
+            Err(e) => {
+                tracing::warn!("Pulling {} again after a refusal failed: {}", node_id, e);
+                return vec![BackendEvent::RemoteStoreChange {
+                    store_id,
+                    change_kind: StoreChangeKind::TreeStructure { node_ids: touched },
+                    source_client_id: None,
+                }];
+            }
+        };
+        store.keys.note_wraps(node_id, fetched.keys.clone());
+        let entries = store.keys.decrypt_entries(store_id, node_id, &fetched);
+        let merged = store.merge(store_id, node_id, entries, active, None);
+        store.heads.insert(node_id, fetched.head);
+        if merged.structure {
+            store.repair_due = Some(now_ms() + REPAIR_DEBOUNCE_MS);
+        }
+        let mut events = merged.events;
+        // The tree holds one document fewer or one different: what the UI has
+        // drawn of it, and of the list it was in, is stale either way.
+        events.push(BackendEvent::RemoteStoreChange {
+            store_id,
+            change_kind: StoreChangeKind::TreeStructure { node_ids: touched },
+            source_client_id: None,
+        });
+        events
     }
 
     /// The same stateless reconcile the plain path does, answered from the
@@ -1021,7 +1438,7 @@ impl VaultStore {
     /// in log order. Picks the root, builds the tree, records each
     /// document's cursor. Nothing is repaired here; the caller runs
     /// [`VaultStore::repair_now`] once the whole pull is in.
-    fn assemble(listed: Store, keyring: Keyring, pulled: Vec<Pulled>) -> Self {
+    fn assemble(listed: Store, keys: StoreKeys, scope_roots: Vec<NodeId>, pulled: Vec<Pulled>) -> Self {
         let mut node_docs: HashMap<NodeId, NodeDoc> = HashMap::new();
         let mut docs: HashMap<NodeId, VaultDoc> = HashMap::new();
         let mut heads = HashMap::new();
@@ -1042,13 +1459,26 @@ impl VaultStore {
             }
             heads.insert(node_id, head);
         }
-        let mut tree = Tree::from_docs(listed.root_node_id, node_docs);
-        let root = document_root(&tree, listed.root_node_id);
-        if root != tree.root() {
-            tracing::info!("Store {}: manifest root {} replaced by the documents' root {}", listed.id, listed.root_node_id, root);
-            tree = rerooted(tree, root);
+        // A scope's tree starts at its first shared root, whose own
+        // `parent_id` names a document this page will never hold. Nothing may
+        // look for another root: there is none to find, and the documents'
+        // rule below would answer with whichever node happens to be missing
+        // its parent.
+        let start = scope_roots.first().copied().unwrap_or(listed.root_node_id);
+        let mut tree = Tree::from_docs(start, node_docs);
+        if scope_roots.is_empty() {
+            let root = document_root(&tree, listed.root_node_id);
+            if root != tree.root() {
+                tracing::info!("Store {}: manifest root {} replaced by the documents' root {}", listed.id, listed.root_node_id, root);
+                tree = rerooted(tree, root);
+            }
         }
-        Self { listed, keyring, tree, docs, heads, repair_due: None }
+        Self { listed, keys, scope_roots, tree, docs, heads, repair_due: None }
+    }
+
+    /// Whether this page holds only a scope of the store: a share's recipient.
+    fn is_partial(&self) -> bool {
+        !self.scope_roots.is_empty()
     }
 
     fn doc_entry(&mut self, node_id: NodeId) -> &mut VaultDoc {
@@ -1130,13 +1560,79 @@ impl VaultStore {
     /// Repair the tree if it needs it (`Tree::repair`): what it wrote, to be
     /// appended like any edit.
     fn repair_now(&mut self, now: &str) -> Option<TreeEdit> {
-        match self.tree.repair(now) {
+        let repaired = if self.is_partial() { self.repair_scopes(now) } else { self.tree.repair(now) };
+        match repaired {
             Ok(edit) => edit,
             Err(e) => {
                 tracing::warn!("Repairing the tree of {} failed: {}", self.listed.id, e);
                 None
             }
         }
+    }
+
+    /// Repair a scoped store one scope at a time, the browser's half of
+    /// `pimble_store::LocalStore::repair_scopes` (docs/NODE_DOCUMENT_CONTRACT.md
+    /// section 5).
+    ///
+    /// Every repair is an edit that travels to the owner and to every other
+    /// member, so it must be one a device holding the whole store would make
+    /// too; two devices that disagree about a fix undo each other's for ever.
+    /// `Tree::repair` reads "not held" as "missing", which is true of a whole
+    /// store and false here by design, so each scope is handed to it as the
+    /// honest tree it is — rooted at its scope root, holding exactly the
+    /// documents that lead to it. Three things follow:
+    ///
+    /// - **A scope root is a root.** Its `parent_id` names a document this
+    ///   page never holds, which is no orphan, and as the root of its own tree
+    ///   it is never re-parented nor listed. A scope root held under another
+    ///   (overlapping shares) is an ordinary node of that one's tree.
+    /// - **A document that leads to no scope root is left alone**: moved out
+    ///   of the share by its owner, or not under it yet.
+    /// - **A scope whose lists name a document not held yet is not judged
+    ///   yet**: that entry is a document on its way, and removing it would
+    ///   delete a child from the owner's folder.
+    fn repair_scopes(&mut self, now: &str) -> pimble_crdt::Result<Option<TreeEdit>> {
+        let groups = scope_groups(&self.tree, &self.scope_roots);
+
+        let mut edit = TreeEdit::default();
+        let mut tops: Vec<NodeId> = groups.keys().copied().collect();
+        tops.sort_by_key(|id| id.to_string());
+        for top in tops {
+            let group = &groups[&top];
+            // Only a node's list is repaired (a tombstone keeps its own for an
+            // undelete), so only a node's list can ask for a removal.
+            let awaited = group
+                .iter()
+                .filter(|id| self.tree.has_node(**id))
+                .filter_map(|id| self.tree.doc(*id))
+                .any(|doc| {
+                    doc.children()
+                        .into_iter()
+                        .any(|child| !self.tree.doc(child).is_some_and(|held| held.fields().is_ok()))
+                });
+            if awaited {
+                tracing::debug!("Store {}: scope {} lists a document not held yet; not repairing it now", self.listed.id, top);
+                continue;
+            }
+
+            let mut docs = HashMap::with_capacity(group.len());
+            for id in group {
+                if let Some(doc) = self.tree.take_doc(*id) {
+                    docs.insert(*id, doc);
+                }
+            }
+            let mut scope_tree = Tree::from_docs(top, docs);
+            let repaired = scope_tree.repair(now);
+            for id in group {
+                if let Some(doc) = scope_tree.take_doc(*id) {
+                    self.tree.insert_doc(*id, doc);
+                }
+            }
+            if let Some(scope_edit) = repaired? {
+                edit.touched.extend(scope_edit.touched);
+            }
+        }
+        Ok((!edit.is_empty()).then_some(edit))
     }
 
     /// Re-root the tree when the documents say the root is another node
@@ -1149,6 +1645,12 @@ impl VaultStore {
     /// whose link had not pushed yet — starts from the placeholder; as the
     /// desktop's root document lands this is what moves the tree under it.
     fn adopt_root(&mut self) -> Option<Store> {
+        if self.is_partial() {
+            // A scope's root is the grant's, not the documents'. Nothing this
+            // page holds has no parent, and the first node whose parent is
+            // simply not here is not a root.
+            return None;
+        }
         let current = self.tree.root();
         let root = document_root(&self.tree, current);
         if root == current {
@@ -1181,7 +1683,10 @@ impl VaultStore {
     fn seed_root(&mut self, now: &str) -> TreeEdit {
         let root = self.tree.root();
         let mut edit = TreeEdit::default();
-        if self.tree.has_node(root) || self.tree.doc(root).is_some_and(NodeDoc::is_initialised) {
+        // Never for a share: the shared node's document exists in the owner's
+        // store, and writing one here would make a second node of the same id
+        // that no repair could reconcile.
+        if self.is_partial() || self.tree.has_node(root) || self.tree.doc(root).is_some_and(NodeDoc::is_initialised) {
             return edit;
         }
         let mut doc = self.tree.take_doc(root).unwrap_or_default();
@@ -1197,7 +1702,7 @@ impl VaultStore {
     /// yet (see [`VaultStore::seed_root`]) has none rather than being an
     /// error: the row is there, the store is simply empty.
     fn children_of(&self, node_id: NodeId) -> Result<Vec<NodeId>, String> {
-        if node_id == self.tree.root() && !self.tree.has_node(node_id) {
+        if node_id == self.tree.root() && !self.tree.has_node(node_id) && !self.is_partial() {
             return Ok(Vec::new());
         }
         self.tree.get_children(node_id).map_err(|e| e.to_string())
@@ -1210,7 +1715,7 @@ impl VaultStore {
     /// is a folder named after the store.
     fn node_of(&self, node_id: NodeId) -> Result<Node, String> {
         let root = self.tree.root();
-        if node_id == root && !self.tree.has_node(root) {
+        if node_id == root && !self.tree.has_node(root) && !self.is_partial() {
             let now = chrono::Utc::now();
             return Ok(Node {
                 id: root,
@@ -1251,20 +1756,85 @@ impl VaultStore {
     /// Encrypt what goes to the server for one document: `update`, already
     /// merged into the document here, or — after a failed append, when the
     /// server is behind by more than this one change — everything it lacks.
+    ///
+    /// The key is the document's data key: the one this page has already
+    /// resolved, the one its wraps yield, or a fresh one made here for a
+    /// document the server has never seen, wrapped under every scope key this
+    /// page holds that covers the node. A document from before data keys,
+    /// whose blobs name a scope key directly, keeps being written under that
+    /// key: giving it one is its owner's business, not a member's.
     fn prepare(&mut self, store_id: StoreId, node_id: NodeId, update: &[u8]) -> Result<Outgoing, String> {
         let Some(node_doc) = self.tree.doc(node_id) else {
             return Err("that node's document is not held here".to_string());
         };
-        let doc = self.docs.entry(node_id).or_default();
-        let resend = doc.unsent;
+        let sent_sv = node_doc.state_vector();
+        let resend = self.docs.entry(node_id).or_default().unsent;
         let payload = if resend {
-            node_doc.diff_since(&doc.known_sv).map_err(|e| e.to_string())?
+            let known = self.docs[&node_id].known_sv.clone();
+            self.tree.doc(node_id).expect("held above").diff_since(&known).map_err(|e| e.to_string())?
         } else {
             update.to_vec()
         };
+
+        let creating = !self.heads.contains_key(&node_id);
+        let sealed = if creating {
+            let parent_id = self
+                .tree
+                .doc(node_id)
+                .and_then(|doc| doc.fields().ok())
+                .and_then(|fields| fields.parent_id);
+            let scope_key_ids = self.scope_key_ids_for(node_id);
+            self.keys
+                .create_document_key(store_id, node_id, &scope_key_ids)
+                .map(|(key_id, key, keys)| (key_id, key, Some((keys, parent_id))))
+        } else {
+            self.keys.encrypt_key(store_id, node_id).map(|(key_id, key)| (key_id, key, None))
+        };
+        let Some((key_id, key, created)) = sealed else {
+            // No key for this document yet: its wraps have not been fetched,
+            // or none of them is under a scope key this page holds. The work
+            // is already in the document, so it is marked unsent and the next
+            // connection — which fetches the wraps — resends it.
+            self.docs.entry(node_id).or_default().unsent = true;
+            return Err(format!("no key for the document {node_id} on this device yet"));
+        };
+
         let doc_id = VaultDocId::Node(node_id);
-        let blob = encrypt_blob(&self.keyring, store_id, &doc_id, &payload)?;
-        Ok(Outgoing { doc_id, blob, payload, sent_sv: node_doc.state_vector(), resend })
+        let aad = blob_aad(&store_id.to_string(), &doc_id.as_str());
+        let blob = URL_SAFE_NO_PAD.encode(Blob::encrypt(&key, key_id, &aad, &payload));
+        Ok(Outgoing { doc_id, blob, payload, sent_sv, resend, created })
+    }
+
+    /// The scope keys that cover a node: the store key, when this page holds
+    /// the whole store, and the key of every share the node sits under, which
+    /// each share's root names in its own marker (`NodeMetadata::share()`).
+    ///
+    /// A scoped member with no marker on the way up — a share from before
+    /// markers, or a root whose document has not arrived — falls back to the
+    /// keys it was given, which are its shares'.
+    fn scope_key_ids_for(&self, node_id: NodeId) -> Vec<KeyId> {
+        let mut ids: Vec<KeyId> = Vec::new();
+        if !self.is_partial() {
+            ids.extend(self.keys.scope.key_id_for(None));
+        }
+        let mut cur = Some(node_id);
+        for _ in 0..=self.tree.ids().len() {
+            let Some(fields) = cur.and_then(|id| self.tree.doc(id)).and_then(|doc| doc.fields().ok()) else { break };
+            if let Some(marker) = fields
+                .custom
+                .get(custom_keys::SHARE)
+                .and_then(|v| serde_json::from_value::<pimble_core::ShareMarker>(v.clone()).ok())
+            {
+                ids.push(marker.key_id);
+            }
+            cur = fields.parent_id;
+        }
+        if ids.is_empty() {
+            ids.extend(self.keys.scope.scopes.iter().map(|(_, id)| *id));
+        }
+        ids.retain(|id| self.keys.scope.get(id).is_some());
+        ids.dedup();
+        ids
     }
 
     /// Record how an append went. `Ok(Some(seq))` says a snapshot stamped
@@ -1298,10 +1868,202 @@ impl VaultStore {
         Ok(due.then_some(seq))
     }
 
-    /// The document's whole state, encrypted, for a snapshot.
-    fn snapshot_blob(&self, store_id: StoreId, node_id: NodeId) -> Result<String, String> {
+    /// Forget everything this page holds of one document, because the server
+    /// refused an append to it.
+    ///
+    /// There is nothing to resend — the same bytes would be refused for ever,
+    /// and a document left `unsent` would offer them again on every reconnect
+    /// — and nothing in the local document is worth keeping either: a yrs
+    /// document cannot un-merge the edit that was refused, so showing it would
+    /// show work that exists nowhere and never will. Dropping it is what makes
+    /// the next fetch start from the beginning and end at what the server
+    /// holds.
+    fn refused(&mut self, node_id: NodeId) {
+        self.tree.take_doc(node_id);
+        self.docs.remove(&node_id);
+        self.heads.remove(&node_id);
+        self.keys.forget(node_id);
+    }
+
+    /// The document's whole state, encrypted, for a snapshot. Under the same
+    /// key its updates go out under: a snapshot replaces them.
+    fn snapshot_blob(&mut self, store_id: StoreId, node_id: NodeId) -> Result<String, String> {
         let full = self.tree.doc(node_id).map(NodeDoc::save).unwrap_or_default();
-        encrypt_blob(&self.keyring, store_id, &VaultDocId::Node(node_id), &full)
+        let (key_id, key) = self
+            .keys
+            .encrypt_key(store_id, node_id)
+            .ok_or_else(|| format!("no key for the document {node_id} on this device"))?;
+        let aad = blob_aad(&store_id.to_string(), &VaultDocId::Node(node_id).as_str());
+        Ok(URL_SAFE_NO_PAD.encode(Blob::encrypt(&key, key_id, &aad, &full)))
+    }
+}
+
+/// Which scope each document belongs to: the last scope root on its stored
+/// parent chain through held documents (tombstones included — a deleted
+/// document stays with its scope), and nothing when it reaches none. Bounded,
+/// so an unrepaired cycle cannot loop. The grouping
+/// [`VaultStore::repair_scopes`] repairs one tree at a time.
+fn scope_groups(tree: &Tree, scope_roots: &[NodeId]) -> HashMap<NodeId, Vec<NodeId>> {
+    let roots: HashSet<NodeId> = scope_roots.iter().copied().collect();
+    let ids = tree.ids();
+    let bound = ids.len();
+    let mut groups: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for &id in &ids {
+        let mut cur = id;
+        let mut top = None;
+        for _ in 0..=bound {
+            if roots.contains(&cur) {
+                top = Some(cur);
+            }
+            match tree.doc(cur).and_then(|d| d.fields().ok()).and_then(|f| f.parent_id) {
+                Some(parent) if tree.doc(parent).is_some() => cur = parent,
+                _ => break,
+            }
+        }
+        if let Some(top) = top {
+            groups.entry(top).or_default().push(id);
+        }
+    }
+    groups
+}
+
+// ── Keys ────────────────────────────────────────────────────────────────────
+
+impl StoreKeys {
+    fn new(scope: Keyring) -> Self {
+        Self { scope, wraps: HashMap::new(), deks: HashMap::new(), listed_dek: HashMap::new() }
+    }
+
+    /// Take a `vaultFetch`'s answer about a document's data key. `None` is a
+    /// document from before data keys, whose blobs name a scope key; anything
+    /// held under a different `dek_id` is a rotation and is forgotten.
+    fn note_wraps(&mut self, node_id: NodeId, keys: Option<VaultDocKeys>) {
+        match keys {
+            Some(keys) => {
+                if self.deks.get(&node_id).is_some_and(|(id, _)| *id != keys.dek_id) {
+                    self.deks.remove(&node_id);
+                }
+                self.listed_dek.insert(node_id, keys.dek_id);
+                self.wraps.insert(node_id, keys);
+            }
+            None => {
+                self.wraps.remove(&node_id);
+                self.listed_dek.remove(&node_id);
+            }
+        }
+    }
+
+    /// Remember the key this page made for a document it created, so its own
+    /// next blob resolves without a round trip.
+    fn note_created(&mut self, node_id: NodeId, keys: &VaultDocKeys) {
+        self.listed_dek.insert(node_id, keys.dek_id);
+        self.wraps.insert(node_id, keys.clone());
+    }
+
+    /// Forget one document's keys, for a document being pulled again from the
+    /// beginning: whatever the server says about it then is the truth,
+    /// including a data key this page made for a create it refused.
+    fn forget(&mut self, node_id: NodeId) {
+        self.wraps.remove(&node_id);
+        self.deks.remove(&node_id);
+        self.listed_dek.remove(&node_id);
+    }
+
+    /// The key a blob whose header names `key_id` was written under, in the
+    /// order the contract gives (see the struct's own documentation).
+    fn blob_key(&mut self, store_id: StoreId, node_id: NodeId, key_id: KeyId) -> Option<SymmetricKey> {
+        if let Some((id, key)) = self.deks.get(&node_id) {
+            if *id == key_id {
+                return Some(key.clone());
+            }
+        }
+        if let Some(keys) = self.wraps.get(&node_id).filter(|keys| keys.dek_id == key_id) {
+            let aad = dek_aad(&store_id.to_string(), &VaultDocId::Node(node_id).as_str());
+            for wrap in &keys.wraps {
+                let Some(scope_key) = self.scope.get(&wrap.scope_key_id) else { continue };
+                match unwrap_dek(wrap, scope_key, &aad) {
+                    Ok(dek) => {
+                        self.deks.insert(node_id, (key_id, dek.clone()));
+                        return Some(dek);
+                    }
+                    Err(e) => tracing::warn!(
+                        "The wrap of {} under the scope key {} did not open ({})",
+                        node_id,
+                        wrap.scope_key_id,
+                        e
+                    ),
+                }
+            }
+        }
+        // A blob from before data keys names a scope key itself.
+        self.scope.get(&key_id).cloned()
+    }
+
+    /// The key an outgoing blob for `node_id` is written under: its data key
+    /// when it has one this page can open, and otherwise the scope key a
+    /// document from before data keys is still written under. `None` when the
+    /// document has a data key nothing here opens — its wraps have not been
+    /// fetched, or none is under a key this account holds.
+    fn encrypt_key(&mut self, store_id: StoreId, node_id: NodeId) -> Option<(KeyId, SymmetricKey)> {
+        match self.listed_dek.get(&node_id).copied() {
+            Some(dek_id) => self.blob_key(store_id, node_id, dek_id).map(|key| (dek_id, key)),
+            None => self.scope.current.and_then(|id| self.scope.get(&id).cloned().map(|key| (id, key))),
+        }
+    }
+
+    /// A fresh data key for a document nothing has seen, wrapped under every
+    /// scope key in `scope_key_ids` this page holds.
+    fn create_document_key(
+        &mut self,
+        store_id: StoreId,
+        node_id: NodeId,
+        scope_key_ids: &[KeyId],
+    ) -> Option<(KeyId, SymmetricKey, VaultDocKeys)> {
+        let dek = SymmetricKey::generate();
+        let dek_id = KeyId::new_v4();
+        let aad = dek_aad(&store_id.to_string(), &VaultDocId::Node(node_id).as_str());
+        let mut wraps: Vec<WrappedDek> = Vec::new();
+        for scope_key_id in scope_key_ids {
+            if wraps.iter().any(|w| w.scope_key_id == *scope_key_id) {
+                continue;
+            }
+            if let Some(scope_key) = self.scope.get(scope_key_id) {
+                wraps.push(wrap_dek(&dek, scope_key, *scope_key_id, &aad));
+            }
+        }
+        if wraps.is_empty() {
+            return None;
+        }
+        self.deks.insert(node_id, (dek_id, dek.clone()));
+        Some((dek_id, dek, VaultDocKeys { dek_id, wraps }))
+    }
+
+    /// Open one blob of one document.
+    fn decrypt_blob(&mut self, store_id: StoreId, node_id: NodeId, encoded: &str) -> Result<Vec<u8>, String> {
+        let blob = decode_blob(encoded)?;
+        let key_id = Blob::key_id(&blob).map_err(|e| e.to_string())?;
+        let key = self
+            .blob_key(store_id, node_id, key_id)
+            .ok_or_else(|| format!("no key {key_id} for the document {node_id} on this device"))?;
+        let aad = blob_aad(&store_id.to_string(), &VaultDocId::Node(node_id).as_str());
+        Blob::decrypt(&key, &aad, &blob).map_err(|e| e.to_string())
+    }
+
+    /// Every blob in a fetch, snapshot first, decrypted in order.
+    fn decrypt_entries(
+        &mut self,
+        store_id: StoreId,
+        node_id: NodeId,
+        fetched: &VaultFetchResponse,
+    ) -> Vec<(Mark, Result<Vec<u8>, String>)> {
+        let mut out = Vec::with_capacity(fetched.updates.len() + 1);
+        if let Some(entry) = &fetched.snapshot {
+            out.push((Mark::Through(entry.seq), self.decrypt_blob(store_id, node_id, &entry.blob)));
+        }
+        for entry in &fetched.updates {
+            out.push((Mark::One(entry.seq), self.decrypt_blob(store_id, node_id, &entry.blob)));
+        }
+        out
     }
 }
 
@@ -1493,6 +2255,47 @@ pub fn store_id_of(cmd: &BackendCommand) -> Option<StoreId> {
     })
 }
 
+/// Whether a command changes anything. A reader's is refused before it is
+/// sent; everything else a `Read` store answers as it always did.
+///
+/// Listed by hand rather than by exclusion: a command added later should have
+/// to be thought about once rather than quietly become a write a reader may
+/// make.
+pub fn writes(cmd: &BackendCommand) -> bool {
+    use BackendCommand::*;
+    matches!(
+        cmd,
+        CreateNode { .. }
+            | RenameNode { .. }
+            | SetNodeAppearance { .. }
+            | DeleteNode { .. }
+            | MoveNode { .. }
+            | SetNodeContent { .. }
+            | BroadcastChanges { .. }
+            | CreateMount { .. }
+            | MountRemoteStore { .. }
+            | SetStoreSync { .. }
+            | RemoveReplica { .. }
+    )
+}
+
+/// Whether a failed request was the server refusing rather than failing: a
+/// reader's write, or a document in none of this account's scopes. Nothing
+/// later changes such an answer, so it is never retried and never left
+/// pending — it is shown.
+pub fn is_refusal(message: &str) -> bool {
+    StoreAccess::refusal_in(message).is_some() || message.starts_with("Forbidden: ")
+}
+
+/// A sentence written for the person rather than an error: the app shows it in
+/// the status bar and clears it again on a timer
+/// (`pimble_app::events::show_notice`, reached by a message it recognises as
+/// meant to be read as it is). There is no `BackendEvent` of its own for this
+/// yet; when one lands, this is the single place that changes.
+fn notice(sentence: String) -> BackendEvent {
+    BackendEvent::Error { message: format!("Forbidden: {sentence}") }
+}
+
 /// A command's name, for the one error a vault store answers with.
 fn name_of(cmd: &BackendCommand) -> &'static str {
     use BackendCommand::*;
@@ -1550,38 +2353,6 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
-/// Encrypt one update for one document. The associated data ties the blob to
-/// this store and this document, so it cannot be replayed into another.
-fn encrypt_blob(
-    keyring: &Keyring,
-    store_id: StoreId,
-    doc_id: &VaultDocId,
-    plaintext: &[u8],
-) -> Result<String, String> {
-    let key = keyring
-        .current_key()
-        .ok_or("this store's key is not available on this device")?;
-    let aad = blob_aad(&store_id.to_string(), &doc_id.as_str());
-    Ok(URL_SAFE_NO_PAD.encode(Blob::encrypt(key, keyring.current, &aad, plaintext)))
-}
-
-/// Open one blob. The key id inside it picks the key, so a store that has been
-/// rotated still reads its own history.
-fn decrypt_blob(
-    keyring: &Keyring,
-    store_id: StoreId,
-    doc_id: &VaultDocId,
-    encoded: &str,
-) -> Result<Vec<u8>, String> {
-    let blob = decode_blob(encoded)?;
-    let key_id = Blob::key_id(&blob).map_err(|e| e.to_string())?;
-    let key = keyring
-        .get(&key_id)
-        .ok_or_else(|| format!("no key {key_id} on this device"))?;
-    let aad = blob_aad(&store_id.to_string(), &doc_id.as_str());
-    Blob::decrypt(key, &aad, &blob).map_err(|e| e.to_string())
-}
-
 /// base64url without padding is what the contract specifies; the padded and
 /// standard alphabets are accepted too, so a server that encodes either way
 /// still reads.
@@ -1610,23 +2381,6 @@ impl Mark {
             Mark::One(seq) => cursor.mark(seq),
         }
     }
-}
-
-/// Every blob in a fetch, snapshot first, decrypted in order.
-fn decrypt_entries(
-    keyring: &Keyring,
-    store_id: StoreId,
-    doc_id: &VaultDocId,
-    fetched: &VaultFetchResponse,
-) -> Vec<(Mark, Result<Vec<u8>, String>)> {
-    let mut out = Vec::with_capacity(fetched.updates.len() + 1);
-    if let Some(entry) = &fetched.snapshot {
-        out.push((Mark::Through(entry.seq), decrypt_blob(keyring, store_id, doc_id, &entry.blob)));
-    }
-    for entry in &fetched.updates {
-        out.push((Mark::One(entry.seq), decrypt_blob(keyring, store_id, doc_id, &entry.blob)));
-    }
-    out
 }
 
 /// One document's `vaultFetch` answer, or why there is none.
@@ -1705,9 +2459,23 @@ mod tests {
 
     // ── Fixtures ────────────────────────────────────────────────────────────
 
+    /// A keyring holding one scope key, as an owner's page has for a whole
+    /// store (`root` `None`) or a member's for one share.
+    fn keyring_for(root: Option<NodeId>) -> Keyring {
+        let key_id = KeyId::new_v4();
+        Keyring {
+            keys: HashMap::from([(key_id, SymmetricKey::generate())]),
+            current: Some(key_id),
+            scopes: vec![(root, key_id)],
+        }
+    }
+
     fn keyring() -> Keyring {
-        let key_id = uuid::Uuid::new_v4();
-        Keyring { keys: HashMap::from([(key_id, SymmetricKey::generate())]), current: key_id }
+        keyring_for(None)
+    }
+
+    fn store_keys() -> StoreKeys {
+        StoreKeys::new(keyring())
     }
 
     fn listed(root: NodeId) -> Store {
@@ -1739,7 +2507,7 @@ mod tests {
 
     /// A store page holding a copy of `tree`, as it is after an open.
     fn opened(tree: &Tree) -> VaultStore {
-        VaultStore::assemble(listed(tree.root()), keyring(), pull_of(tree))
+        VaultStore::assemble(listed(tree.root()), store_keys(), Vec::new(), pull_of(tree))
     }
 
     /// Feed the updates of `edit` to `store` one at a time, as the
@@ -1822,14 +2590,14 @@ mod tests {
         // A store hosted from a desktop: the manifest carries a placeholder
         // the desktop's documents never mention.
         let placeholder = NodeId::new();
-        let store = VaultStore::assemble(listed(placeholder), keyring(), pull_of(&peer));
+        let store = VaultStore::assemble(listed(placeholder), store_keys(), Vec::new(), pull_of(&peer));
         assert_eq!(store.tree.root(), real_root);
         assert_eq!(store.view().root_node_id, real_root);
         assert_eq!(store.children_of(real_root).unwrap(), vec![x]);
 
         // An empty log keeps the manifest's root, answers an empty tree for
         // it, and describes it as a folder named after the store.
-        let mut empty = VaultStore::assemble(listed(placeholder), keyring(), Vec::new());
+        let mut empty = VaultStore::assemble(listed(placeholder), store_keys(), Vec::new(), Vec::new());
         assert_eq!(empty.tree.root(), placeholder);
         assert_eq!(empty.children_of(placeholder).unwrap(), Vec::<NodeId>::new());
         assert_eq!(empty.node_of(placeholder).unwrap().metadata.title, "Vault");
@@ -1851,7 +2619,7 @@ mod tests {
         // person only looked, so nothing was seeded here.
         let placeholder = NodeId::new();
         let store_id = StoreId::new();
-        let mut store = VaultStore::assemble(listed(placeholder), keyring(), Vec::new());
+        let mut store = VaultStore::assemble(listed(placeholder), store_keys(), Vec::new(), Vec::new());
 
         let (mut peer, real_root) = origin();
         let x = NodeId::new();
@@ -1889,10 +2657,12 @@ mod tests {
             assert!(!outgoing.resend);
             // The blob is that document's update and nothing else, under
             // this store's and this document's associated data.
-            let opened = decrypt_blob(&store.keyring, store_id, &outgoing.doc_id, &outgoing.blob).unwrap();
+            let opened = store.keys.decrypt_blob(store_id, *node_id, &outgoing.blob).unwrap();
             assert_eq!(&opened, update);
-            let other = VaultDocId::Node(NodeId::new());
-            assert!(decrypt_blob(&store.keyring, store_id, &other, &outgoing.blob).is_err(), "bound to its document");
+            assert!(
+                store.keys.decrypt_blob(store_id, NodeId::new(), &outgoing.blob).is_err(),
+                "bound to its document"
+            );
             seq += 1;
             assert_eq!(store.record(*node_id, &outgoing, Ok(seq)).unwrap(), None);
             let doc = &store.docs[node_id];
@@ -2056,7 +2826,7 @@ mod tests {
             doc.entries.push((Mark::One(2), Ok(update.clone())));
             doc.head = 2;
         }
-        let mut store = VaultStore::assemble(listed(root), keyring(), pulled);
+        let mut store = VaultStore::assemble(listed(root), store_keys(), Vec::new(), pulled);
         assert!(store.tree.validate_tree().is_empty(), "{:?}", store.tree.validate_tree());
         assert!(store.repair_now(T2).is_none());
         assert_eq!(store.children_of(q).unwrap(), vec![x]);
@@ -2149,5 +2919,420 @@ mod tests {
         // a's, so its number is below the last one a was given. It is still b's
         // work and still has to be applied.
         assert!(should_apply(Some("b"), "a"));
+    }
+
+    // ── A share is a scope of somebody else's store ─────────────────────────
+
+    fn grant(root: Option<NodeId>, role: &str, name: &str) -> AccountGrant {
+        AccountGrant { root, role: role.to_string(), name: name.to_string() }
+    }
+
+    fn row(grants: Vec<AccountGrant>, shared_by: Option<&str>) -> AccountStore {
+        AccountStore { kind: "vault".to_string(), grants, shared_by: shared_by.map(str::to_string) }
+    }
+
+    #[test]
+    fn the_account_s_grants_decide_a_store_s_access_and_roots() {
+        let (a, b) = (NodeId::new(), NodeId::new());
+
+        // One's own store: one whole-store grant, nothing scoped.
+        let mine = row(vec![grant(None, "owner", "Family")], None);
+        assert_eq!(mine.access(), StoreAccess::Full);
+        assert!(mine.roots().is_empty(), "a whole store has no scope roots");
+        assert_eq!(mine.name(), None, "the server's name stands for a whole store");
+
+        // A reader of one folder: read-only, one root, the share's own name.
+        let reading = row(vec![grant(Some(a), "reader", "Recipes")], Some("ann@example.com"));
+        assert_eq!(reading.access(), StoreAccess::Read);
+        assert_eq!(reading.roots(), vec![a]);
+        assert_eq!(reading.name().as_deref(), Some("Recipes"));
+        assert_eq!(reading.shared_by.as_deref(), Some("ann@example.com"));
+
+        // A reader of one folder and an editor of another: `Full`, because a
+        // store-wide `Read` would take away the editing they do have. The
+        // server refuses the writes under the reader's root one at a time.
+        let mixed = row(vec![grant(Some(a), "reader", "Recipes"), grant(Some(b), "editor", "Plans")], Some("ann@example.com"));
+        assert_eq!(mixed.access(), StoreAccess::Full);
+        assert_eq!(mixed.roots(), vec![a, b], "both shares are roots of the same store");
+        assert_eq!(mixed.name().as_deref(), Some("Recipes"));
+
+        // A whole-store grant beside a share covers everything, so the shares
+        // stop being scopes at all.
+        let both = row(vec![grant(Some(a), "reader", "Recipes"), grant(None, "editor", "Family")], None);
+        assert_eq!(both.access(), StoreAccess::Full);
+        assert!(both.roots().is_empty());
+        assert_eq!(both.name(), None);
+
+        // Nothing known about a store is not a reason to refuse writes: the
+        // server is the authority and answers with the sentence itself.
+        assert_eq!(AccountStore::default().access(), StoreAccess::Full);
+    }
+
+    #[test]
+    fn a_listed_store_reaches_the_ui_as_the_share_it_is() {
+        let root = NodeId::new();
+        let store_id = StoreId::new();
+        let mut client = VaultClient::new("me".to_string());
+        client.rows.insert(
+            store_id,
+            row(vec![grant(Some(root), "reader", "Recipes")], Some("ann@example.com")),
+        );
+
+        // What the hosted server lists: the owner's store name, which a
+        // recipient must never see.
+        let mut listed = Store::new_local("Ann's whole life", PathBuf::new());
+        listed.id = store_id;
+        listed.kind = StoreKind::Vault;
+        client.describe(&mut listed);
+
+        assert_eq!(listed.name, "Recipes", "the share's own name, never the owner's store's");
+        assert_eq!(listed.shared_by.as_deref(), Some("ann@example.com"));
+        assert_eq!(listed.access, StoreAccess::Read);
+        assert_eq!(listed.roots, vec![root]);
+        assert_eq!(listed.root_node_id, root, "older callers read the first root");
+
+        // Waiting for the key says so on the row, and only once it is waiting.
+        assert!(!listed.name.ends_with(WAITING_SUFFIX));
+        client.waiting.insert(store_id, Waiting { listed: listed.clone(), due: 0.0 });
+        let mut again = listed.clone();
+        again.name = "Ann's whole life".to_string();
+        client.describe(&mut again);
+        assert_eq!(again.name, format!("Recipes{WAITING_SUFFIX}"));
+    }
+
+    // ── Which key opens a blob ──────────────────────────────────────────────
+
+    #[test]
+    fn a_blob_s_key_is_the_document_s_data_key_then_a_scope_key() {
+        let store_id = StoreId::new();
+        let node_id = NodeId::new();
+        let doc = VaultDocId::Node(node_id);
+        let aad = blob_aad(&store_id.to_string(), &doc.as_str());
+
+        // This page holds one share's key and not the store's.
+        let share_root = NodeId::new();
+        let share = keyring_for(Some(share_root));
+        let share_key_id = share.current.unwrap();
+        let share_key = share.current_key().unwrap().clone();
+        let mut keys = StoreKeys::new(share);
+
+        // A document whose data key is wrapped under the share key, and under
+        // a store key this page does not hold.
+        let dek = SymmetricKey::generate();
+        let dek_id = KeyId::new_v4();
+        let dek_aad = dek_aad(&store_id.to_string(), &doc.as_str());
+        let stranger = SymmetricKey::generate();
+        let wraps = VaultDocKeys {
+            dek_id,
+            wraps: vec![
+                wrap_dek(&dek, &stranger, KeyId::new_v4(), &dek_aad),
+                wrap_dek(&dek, &share_key, share_key_id, &dek_aad),
+            ],
+        };
+        keys.note_wraps(node_id, Some(wraps));
+
+        let blob = URL_SAFE_NO_PAD.encode(Blob::encrypt(&dek, dek_id, &aad, b"under the data key"));
+        assert_eq!(keys.decrypt_blob(store_id, node_id, &blob).unwrap(), b"under the data key");
+        assert!(keys.deks.contains_key(&node_id), "an unwrapped data key is kept");
+        // And an outgoing blob goes under the same data key.
+        assert_eq!(keys.encrypt_key(store_id, node_id).unwrap().0, dek_id);
+
+        // A blob from before data keys names a scope key in its header; the
+        // third step of the order finds it.
+        let other = NodeId::new();
+        let old_aad = blob_aad(&store_id.to_string(), &VaultDocId::Node(other).as_str());
+        let old = URL_SAFE_NO_PAD.encode(Blob::encrypt(&share_key, share_key_id, &old_aad, b"before data keys"));
+        assert_eq!(keys.decrypt_blob(store_id, other, &old).unwrap(), b"before data keys");
+        assert_eq!(
+            keys.encrypt_key(store_id, other).unwrap().0,
+            share_key_id,
+            "a document with no data key keeps being written under the scope key"
+        );
+
+        // A data key wrapped under nothing this page holds is not a failure to
+        // report, only a document that stays shut until the wrap arrives.
+        let shut = NodeId::new();
+        let shut_dek = SymmetricKey::generate();
+        let shut_dek_id = KeyId::new_v4();
+        let shut_doc = VaultDocId::Node(shut);
+        let shut_dek_aad = dek_aad_of(store_id, shut);
+        keys.note_wraps(
+            shut,
+            Some(VaultDocKeys { dek_id: shut_dek_id, wraps: vec![wrap_dek(&shut_dek, &stranger, KeyId::new_v4(), &shut_dek_aad)] }),
+        );
+        let shut_blob = URL_SAFE_NO_PAD.encode(Blob::encrypt(
+            &shut_dek,
+            shut_dek_id,
+            &blob_aad(&store_id.to_string(), &shut_doc.as_str()),
+            b"not for us",
+        ));
+        assert!(keys.decrypt_blob(store_id, shut, &shut_blob).is_err());
+        assert!(keys.encrypt_key(store_id, shut).is_none(), "and nothing is written to it either");
+    }
+
+    fn dek_aad_of(store_id: StoreId, node_id: NodeId) -> Vec<u8> {
+        dek_aad(&store_id.to_string(), &VaultDocId::Node(node_id).as_str())
+    }
+
+    // ── What a document this page creates is wrapped under ──────────────────
+
+    /// The documents of `ids` only, as a share's recipient pulls a scope.
+    fn pull_subset(tree: &Tree, ids: &[NodeId]) -> Vec<Pulled> {
+        ids.iter()
+            .map(|id| Pulled {
+                node_id: *id,
+                entries: vec![(Mark::Through(1), Ok(tree.doc(*id).unwrap().save()))],
+                head: 1,
+            })
+            .collect()
+    }
+
+    /// A share's marker on `node`, naming `key_id` as the share key.
+    fn mark_shared(tree: &mut Tree, node: NodeId, key_id: KeyId, name: &str) {
+        let marker = pimble_core::ShareMarker {
+            v: pimble_core::ShareMarker::VERSION,
+            key_id,
+            url: "https://pimble.app".to_string(),
+            name: name.to_string(),
+        };
+        tree.set_custom(node, custom_keys::SHARE, &serde_json::to_value(&marker).unwrap(), T1).unwrap();
+    }
+
+    #[test]
+    fn a_document_a_scoped_member_creates_is_wrapped_under_the_share_key() {
+        let (mut peer, root) = origin();
+        let folder = NodeId::new();
+        peer.add_node(folder, Some(root), None, "folder", "Recipes", T0).unwrap();
+        let child = NodeId::new();
+        peer.add_node(child, Some(folder), None, "document", "Bread", T0).unwrap();
+
+        // The recipient's page: the share's key, the share's documents, and
+        // the shared node as its root.
+        let scope = keyring_for(Some(folder));
+        let share_key_id = scope.current.unwrap();
+        let mut scoped = listed(folder);
+        scoped.roots = vec![folder];
+        let store_id = StoreId::new();
+        let mut store =
+            VaultStore::assemble(scoped, StoreKeys::new(scope), vec![folder], pull_subset(&peer, &[folder, child]));
+        assert!(store.is_partial());
+        assert_eq!(store.tree.root(), folder);
+
+        // A node they make in the shared folder.
+        let mine = NodeId::new();
+        let edit = store.tree.add_node(mine, Some(folder), None, "document", "Soup", T1).unwrap();
+        let outgoing = store.prepare(store_id, mine, &edit.touched[0].1).unwrap();
+        let (keys, parent_id) = outgoing.created.as_ref().expect("the server has never seen this document");
+        assert_eq!(*parent_id, Some(folder), "the append names the parent, so the new document joins the scope");
+        assert_eq!(
+            keys.wraps.iter().map(|w| w.scope_key_id).collect::<Vec<_>>(),
+            vec![share_key_id],
+            "one wrap, under the only scope key this page holds"
+        );
+        // The wrap opens with the share key, for this document and no other.
+        let share_key = store.keys.scope.get(&share_key_id).unwrap().clone();
+        let dek = unwrap_dek(&keys.wraps[0], &share_key, &dek_aad_of(store_id, mine)).unwrap();
+        assert!(unwrap_dek(&keys.wraps[0], &share_key, &dek_aad_of(store_id, NodeId::new())).is_err());
+        // And the blob is under that data key.
+        let blob = decode_blob(&outgoing.blob).unwrap();
+        assert_eq!(Blob::key_id(&blob).unwrap(), keys.dek_id);
+        assert_eq!(
+            Blob::decrypt(&dek, &blob_aad(&store_id.to_string(), &VaultDocId::Node(mine).as_str()), &blob).unwrap(),
+            edit.touched[0].1
+        );
+
+        // A document the store already has is not created again: its key is
+        // its own, not a fresh one.
+        let rename = store.tree.set_title(child, "Sourdough", T2).unwrap();
+        assert!(store.prepare(store_id, child, &rename.touched[0].1).unwrap().created.is_none());
+    }
+
+    #[test]
+    fn an_owner_s_new_document_is_wrapped_under_the_store_key_and_every_share_above_it() {
+        let (mut peer, root) = origin();
+        let folder = NodeId::new();
+        peer.add_node(folder, Some(root), None, "folder", "Recipes", T0).unwrap();
+
+        // The owner's page: the store key, and the key of the share sitting on
+        // that folder, which its marker names.
+        let mut scope = keyring_for(None);
+        let store_key_id = scope.current.unwrap();
+        let share_key_id = KeyId::new_v4();
+        scope.keys.insert(share_key_id, SymmetricKey::generate());
+        scope.scopes.push((Some(folder), share_key_id));
+
+        let store_id = StoreId::new();
+        let mut store = VaultStore::assemble(listed(root), StoreKeys::new(scope), Vec::new(), pull_of(&peer));
+        mark_shared(&mut store.tree, folder, share_key_id, "Recipes");
+
+        // Inside the share: both keys.
+        let inside = NodeId::new();
+        let edit = store.tree.add_node(inside, Some(folder), None, "document", "Bread", T1).unwrap();
+        let outgoing = store.prepare(store_id, inside, &edit.touched[0].1).unwrap();
+        let (keys, parent_id) = outgoing.created.as_ref().expect("new to the server");
+        assert_eq!(*parent_id, Some(folder));
+        let mut under: Vec<KeyId> = keys.wraps.iter().map(|w| w.scope_key_id).collect();
+        under.sort_by_key(|id| id.to_string());
+        let mut want = vec![store_key_id, share_key_id];
+        want.sort_by_key(|id| id.to_string());
+        assert_eq!(under, want, "the store key, and the key of the share it sits under");
+
+        // Outside it: the store key alone.
+        let outside = NodeId::new();
+        let edit = store.tree.add_node(outside, Some(root), None, "document", "Notes", T1).unwrap();
+        let outgoing = store.prepare(store_id, outside, &edit.touched[0].1).unwrap();
+        let (keys, _) = outgoing.created.as_ref().expect("new to the server");
+        assert_eq!(keys.wraps.iter().map(|w| w.scope_key_id).collect::<Vec<_>>(), vec![store_key_id]);
+    }
+
+    // ── A scope root is a root, not an orphan ───────────────────────────────
+
+    #[test]
+    fn repair_leaves_a_scope_root_whose_parent_is_not_held_where_it_is() {
+        let (mut peer, root) = origin();
+        let (recipes, plans, elsewhere) = (NodeId::new(), NodeId::new(), NodeId::new());
+        peer.add_node(recipes, Some(root), None, "folder", "Recipes", T0).unwrap();
+        peer.add_node(plans, Some(root), None, "folder", "Plans", T0).unwrap();
+        peer.add_node(elsewhere, Some(root), None, "folder", "Elsewhere", T0).unwrap();
+        let (bread, monday, stray) = (NodeId::new(), NodeId::new(), NodeId::new());
+        peer.add_node(bread, Some(recipes), None, "document", "Bread", T0).unwrap();
+        peer.add_node(monday, Some(plans), None, "document", "Monday", T0).unwrap();
+        peer.add_node(stray, Some(elsewhere), None, "document", "Stray", T0).unwrap();
+
+        // Two shares of one store, and — as can happen while an owner's move
+        // and their scope publish are in flight — one document that leads to
+        // neither.
+        let mut scoped = listed(recipes);
+        scoped.roots = vec![recipes, plans];
+        let mut store = VaultStore::assemble(
+            scoped,
+            StoreKeys::new(keyring_for(Some(recipes))),
+            vec![recipes, plans],
+            pull_subset(&peer, &[recipes, bread, plans, monday, stray]),
+        );
+
+        assert!(store.repair_now(T1).is_none(), "a consistent scope needs no repair");
+        for (scope_root, parent) in [(recipes, root), (plans, root)] {
+            assert_eq!(
+                store.tree.get_node_info(scope_root).unwrap().parent_id,
+                Some(parent),
+                "a scope root's parent is the owner's folder and is never rewritten"
+            );
+        }
+        assert_eq!(store.children_of(recipes).unwrap(), vec![bread]);
+        assert_eq!(store.children_of(plans).unwrap(), vec![monday]);
+        assert_eq!(
+            store.tree.get_node_info(stray).unwrap().parent_id,
+            Some(elsewhere),
+            "a document that leads to no scope root is not adopted into one"
+        );
+        assert!(store.tree.get_children(recipes).unwrap().iter().all(|id| *id != stray));
+
+        // A whole store would have judged all three: the scope roots become
+        // orphans of a tree that is not theirs, and `stray` is adopted.
+        let mut whole = VaultStore::assemble(
+            listed(recipes),
+            StoreKeys::new(keyring()),
+            Vec::new(),
+            pull_subset(&peer, &[recipes, bread, plans, monday, stray]),
+        );
+        assert!(whole.repair_now(T1).is_some(), "which is exactly why a scope is repaired on its own");
+    }
+
+    #[test]
+    fn a_scope_that_lists_a_document_not_held_yet_is_not_judged_yet() {
+        let (mut peer, root) = origin();
+        let recipes = NodeId::new();
+        peer.add_node(recipes, Some(root), None, "folder", "Recipes", T0).unwrap();
+        let (bread, coming) = (NodeId::new(), NodeId::new());
+        peer.add_node(bread, Some(recipes), None, "document", "Bread", T0).unwrap();
+        // A document somebody else created a moment ago: the folder's list
+        // names it and its own document has not arrived.
+        peer.add_node(coming, Some(recipes), None, "document", "Soup", T1).unwrap();
+
+        let mut scoped = listed(recipes);
+        scoped.roots = vec![recipes];
+        let mut store = VaultStore::assemble(
+            scoped,
+            StoreKeys::new(keyring_for(Some(recipes))),
+            vec![recipes],
+            pull_subset(&peer, &[recipes, bread]),
+        );
+        assert!(
+            store.repair_now(T1).is_none(),
+            "removing that entry would delete a child from the owner's folder"
+        );
+        assert!(store.tree.doc(recipes).unwrap().children().contains(&coming));
+
+        // Once it is here, the scope is judged again and has nothing to fix.
+        store.tree.apply_update(coming, &peer.doc(coming).unwrap().save()).unwrap();
+        assert!(store.repair_now(T2).is_none());
+        assert_eq!(store.children_of(recipes).unwrap(), vec![bread, coming]);
+    }
+
+    // ── Refusals ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_reader_s_write_is_refused_here_with_no_request_made() {
+        let store_id = StoreId::new();
+        let node_id = NodeId::new();
+        let mut client = VaultClient::new("me".to_string());
+        client.rows.insert(store_id, row(vec![grant(Some(NodeId::new()), "reader", "Recipes")], Some("ann@example.com")));
+
+        let refused = client
+            .refuse_write(store_id, &BackendCommand::RenameNode { store_id, node_id, title: "No".into() })
+            .expect("a reader may not rename");
+        assert!(
+            matches!(&refused, BackendEvent::Error { message } if message == StoreAccess::READ_ONLY_REFUSAL),
+            "the sentence alone, as the person sees it: {refused:?}"
+        );
+        // Reads are not refused, and neither is anything on a store this
+        // account edits.
+        assert!(client.refuse_write(store_id, &BackendCommand::GetNode { store_id, node_id }).is_none());
+        assert!(client.refuse_write(StoreId::new(), &BackendCommand::DeleteNode { store_id, node_id }).is_none());
+    }
+
+    #[test]
+    fn a_refusal_is_told_apart_from_a_failure() {
+        assert!(is_refusal(StoreAccess::READ_ONLY_REFUSAL));
+        assert!(is_refusal("Forbidden: no grant for this document"));
+        assert!(!is_refusal("Connection error: the socket closed"));
+        assert!(!is_refusal("listing the vault's documents failed"));
+    }
+
+    #[test]
+    fn a_refused_append_leaves_nothing_pending_and_nothing_local() {
+        let (mut peer, root) = origin();
+        let x = NodeId::new();
+        peer.add_node(x, Some(root), None, "document", "x", T0).unwrap();
+        let store_id = StoreId::new();
+        let mut store = opened(&peer);
+
+        // An edit whose append the server refuses — a reader's root inside a
+        // store this account edits elsewhere, say.
+        let edit = store.tree.set_title(x, "Mine now", T1).unwrap();
+        let outgoing = store.prepare(store_id, x, &edit.touched[0].1).unwrap();
+        assert!(store.record(x, &outgoing, Err("Forbidden: no grant for this document".into())).is_err());
+        assert!(store.docs[&x].unsent, "an ordinary failure is resent");
+
+        // The refusal path drops the document instead, so the pull that
+        // follows starts from the beginning and ends at what the server holds.
+        store.refused(x);
+        assert!(store.tree.doc(x).is_none(), "the local document goes");
+        assert!(!store.docs.contains_key(&x), "with its cursor and its unsent flag");
+        assert!(!store.heads.contains_key(&x), "so the next fetch asks from 0");
+        assert!(store.keys.wraps.get(&x).is_none());
+    }
+
+    #[test]
+    fn only_the_commands_that_change_something_are_writes() {
+        let store_id = StoreId::new();
+        let node_id = NodeId::new();
+        assert!(writes(&BackendCommand::CreateNode { store_id, parent_id: None, title: String::new() }));
+        assert!(writes(&BackendCommand::MoveNode { store_id, node_id, new_parent_id: node_id, position: None }));
+        assert!(writes(&BackendCommand::BroadcastChanges { store_id, node_id, changes: String::new() }));
+        assert!(!writes(&BackendCommand::GetChildren { store_id, node_id }));
+        assert!(!writes(&BackendCommand::SubscribeStoreChanges { store_id }));
+        assert!(!writes(&BackendCommand::ListStores));
     }
 }

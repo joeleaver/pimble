@@ -94,6 +94,14 @@ members with roles, and logs out. Adding a member to an encrypted store also
 seals that store's key to them; without that they would have a grant and
 unreadable blobs.
 
+It lists **whole-store** memberships only, so it asks `GET .../members` for no
+scope: a share's members belong to the Share dialog, on the desktop that owns
+the store. That answer is now `{ members, share_name }` rather than a bare array
+(both are read), and a row's `user_id` is `null` for an address that has been
+invited and has no account yet — such a row is listed as "invited" and has no
+Remove, since withdrawing an invitation is its own endpoint and its owner's to
+offer.
+
 Moving between any of these and the app is `crate::route`, which pushes a
 history entry and swaps what is mounted — never a link that reloads. The app is
 mounted once and afterwards only hidden and shown, because behind it sit a
@@ -114,13 +122,25 @@ long as the page does. They are never written to `localStorage`,
 cookie survives a reload; the keys deliberately do not, so a reload asks for the
 password again and `/app/` with no keys sends the visitor to `/app/login`.
 
-A store key reaches an account as a `KeyEnvelope`: sealed to their X25519 public
-key, signed by whoever sent it, held by the accounts service, which cannot open
-it. `src/keys.rs` fetches the envelopes for a store and opens the ones this
-account can, keeping every key id so a rotated store still reads its own
-history. An envelope is verified against the signing key it carries rather than
-one fetched independently — trust on first use, which the contract's threat
-model states out loud and phase 2a accepts.
+A **scope key** reaches an account as a `KeyEnvelope`: sealed to their X25519
+public key, signed by whoever sent it, held by the accounts service, which
+cannot open it. `src/keys.rs` fetches the envelopes for one scope — the store
+key with no `root`, a share's key with one — and opens the ones this account
+can, keeping every key id so a rotated store still reads its own history.
+
+Who may have signed one changed with sharing. An envelope used to be believed
+only when this account had signed it, which is true of one's own store and
+false of a share: the key is handed over by its owner. `GET .../keys` now also
+lists the store's owners as `signers`, and `expected_signer` verifies an
+envelope against its own signer only when that signer is this account or one of
+them; a stranger's signature opens nothing. Trust is still on first use — the
+signers come from the same service as the envelopes, which the contract's
+threat model states out loud and phase 2a accepts — but a *later* substitution
+stays detectable.
+
+A scope key encrypts no blob directly any more. It wraps the **data key** of
+each document in its scope (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Keys"),
+which is what `src/vault.rs`'s `StoreKeys` resolves; see below.
 
 Argon2id at the contract's cost (32 MiB, 3 passes) takes between about 60 and
 260 ms in Chrome on a desktop machine, measured through the line
@@ -169,6 +189,83 @@ plain store, are merged with `NodeDoc::apply_update`, encrypted with
 be replayed into another document) and appended with `vaultAppend`. The editor
 is handed the whole node document through the ordinary `NodeLoaded` path, as it
 is on the desktop; Pimble's roots ride along.
+
+### One key per document
+
+A blob's header names the **data key** of the document it belongs to, not a
+store key. The server holds that key wrapped under every scope key that may
+read it — the store key, and the key of each share the node is under — and
+serves the wraps beside the log (`VaultFetchResponse.keys`, and `dek_id` on
+every `vaultListDocs` row). `StoreKeys` resolves a blob's key in the order the
+contract gives: the data key it has already unwrapped, then the document's
+wraps opened with whichever scope key this page holds, then a scope key of that
+id held directly — which is what a blob from before data keys names.
+
+A document **this page creates** gets a fresh data key, wrapped under every
+scope key it holds that covers the node: the store key when it holds the whole
+store, and the key of every share on the way up the tree, which each share's
+root names in its own `ShareMarker`. A scoped member holds only their share's
+key, so that is the one wrap. The append that creates the document names its
+`parent_id` (`vault_append_new`) — which is how a scoped member's new document
+joins their scope — and the keys are set immediately afterwards
+(`vault_set_doc_keys`), because the server admits keys only for a document it
+already has. A document whose data key this page cannot open is left alone: it
+is not read, and nothing is written to it.
+
+### A share is a scope of somebody else's store
+
+`GET /api/v1/stores` is one row per grant, so one store can reach this page as
+several shares. `learn_rows` collects the rows of each store into an
+`AccountStore`, which decides what the UI is told (`describe`):
+
+- the **name** is the share's own, never the owner's store name — the hosted
+  server's `listStores` still answers with the store's, and a recipient has no
+  business learning it;
+- `shared_by` is an owner's address;
+- `access` is `Read` only when *every* grant on the store is a reader's. A
+  reader of one folder and an editor of another gets `Full`, because a
+  store-wide `Read` would take away the editing they do have; the server
+  refuses the writes under the reader's root one at a time, and those are
+  handled below;
+- `roots` are the shared roots, and `root_node_id` the first of them for
+  callers that know only one.
+
+What the page holds of such a store is only the documents the server lists. Each
+shared root is a root of the `Tree` whose own `parent_id` names a document that
+will never arrive — which is **not** an orphan, so `Tree::repair` cannot be let
+near it: its answer to an orphan is a new parent written into the node's
+document, which would then travel to the owner and to every other member.
+`repair_scopes` is the browser's half of `pimble_store::LocalStore::repair_scopes`
+and repairs one scope at a time, each handed to `Tree::repair` as the honest
+tree it is (rooted at its scope root, holding exactly the documents that lead to
+it). A document that leads to no scope root is left alone — moved out of the
+share by its owner, or not under it yet — and a scope whose lists name a
+document not held yet is not judged at all, because removing that entry would
+delete a child from the owner's folder.
+
+### Refusals, and waiting for a key
+
+A **reader's write** is refused in the browser, with no request made: the
+backend loop asks `VaultClient::refuse_write` before it hands a command
+anywhere, so an encrypted store and a plain one answer the same way, with
+`StoreAccess::READ_ONLY_REFUSAL` and nothing else. That sentence is written for
+the person and the app shows it as it is.
+
+A **refusal from the server** on an append — a reader's root inside a store this
+account edits elsewhere, or "no grant for this document" — must not wedge the
+client. There is nothing to resend, because the same bytes would be refused for
+ever, so the document is not left `unsent`; and a yrs document cannot un-merge
+the edit that was refused, so keeping it would show work that exists nowhere and
+never will. The document is dropped and pulled again from the beginning, the UI
+is told, and what is on screen becomes what the server holds.
+
+A grant with **no usable envelope yet** is the ordinary state of a fresh share:
+the owner's Pimble has not been online since to hand the key over. The store is
+listed with " (waiting for the key)" on its name, the page says once per store
+per session that it is waiting for that owner's Pimble to come online, and it
+asks again every thirty seconds and on every reconnect. When the key arrives the
+store opens and is announced again, since `StoresListed` has long since been and
+gone.
 
 `VaultAppended` notifications come back through the store subscription with the
 blob attached. The subscription task only forwards them; decrypting and merging
@@ -497,8 +594,21 @@ proxies:
   retries and no errors.
 
 Not yet verified here: the flow through `trunk serve`'s own proxies (the runs
-above used an equivalent reverse proxy), a store shared with a second account,
-key rotation, and the snapshot path (200 appends to one document).
+above used an equivalent reverse proxy), key rotation, and the snapshot path
+(200 appends to one document).
+
+**Sharing has not been run against the stack at all yet.** The browser half is
+in and unit-tested (rows to access and roots, the key resolution order, a
+created document's wraps, a scope root left where it is by repair, the refusal
+path), but no owner has yet shared a node from a desktop, so nothing here has
+seen a real scoped token, a real share key or a real `scopes.json`. What the PM
+has to see, once the owner side exists: a share listed under its own name with
+"shared by" and never the owner's store name; the shared folder's own root as
+the row's root; a recipient editing text, titles and structure inside it and the
+owner's web app seeing all three; a reader refused with the one sentence and
+nothing sent; a reader-root write inside a mixed store refused by the server
+without wedging the page; and a share whose key has not been handed over yet
+listed as waiting and opening on its own once it has.
 
 ## Two dev-only traps seen on 2026-09-16
 
