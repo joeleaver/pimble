@@ -3,8 +3,8 @@
 The Pimble Cloud accounts service: users, sessions, hosted stores, grants,
 invitations, and the JWTs a Pimble server verifies. See
 `docs/CLOUD_CONTRACT.md` at the repo root for the full design (and
-`docs/CRYPTO_CONTRACT.md` / `docs/SHARING_CONTRACT.md` for the encryption
-and sharing phases); this file is how to run it.
+`docs/CRYPTO_CONTRACT.md` for the encryption phase, `docs/NODE_DOCUMENT_CONTRACT.md`
+section 5 for what a share is); this file is how to run it.
 
 ## What it needs
 
@@ -120,10 +120,11 @@ key. A real client (the web app, or the desktop app signing in) uses
 8. **`GET`/`PUT /api/v1/stores/{id}/keys`**: `GET` (any grant) returns the
    caller's own `{ envelopes: [{ key_id, envelope }] }` for that store, never
    another member's. `PUT { envelopes: [{ user_id, key_id, envelope }] }`
-   upserts one or more; an owner or editor may always set their own, only an
-   owner may set someone else's; every envelope's Ed25519 signature is
-   verified against the *caller's* `public_signing_key` (whoever is doing the
-   `PUT` must be the one who signed it) before it's stored.
+   upserts one or more; any member may set their own, only an owner may set
+   someone else's; every envelope's Ed25519 signature is verified against the
+   *caller's* `public_signing_key` (whoever is doing the `PUT` must be the one
+   who signed it) before it's stored. Both take a scope — see "Sharing: a
+   share is a scoped grant" below.
 Account recovery (`POST /recover`, `501` in the first cut of this phase) is
 now real — see "Account recovery, password change, new recovery code"
 below.
@@ -148,82 +149,156 @@ optional**, and the startup cleanup (below) never deserializes a row through
 two pre-Phase-2a smoke accounts and any phase-1-shape row are deleted by
 this at every startup.
 
-The rule is not about `User` alone. `HostedStore` has now gained two fields
-after rows already existed — Phase 2a's `kind` and Phase 2b's `share` — and
-`hosted_store_from_object` reads **both** optional, as the kind a row from
-before `kind` really is (`"plain"`) and the share a row from before `share`
-really is (`false`). `kind` was required until Phase 2b, which would have
-failed `GET /stores` outright for anyone holding a store created in Phase 1;
-that is the same shape of bug as the `User.verified` crash, found while
-adding `share` beside it.
+The rule is not about `User` alone. `HostedStore.kind` was added after rows
+already existed, and `hosted_store_from_object` reads it optional, as the kind
+a row from before it really is (`"plain"`); it was required until the sharing
+work, which would have failed `GET /stores` outright for anyone holding a
+store created in Phase 1 — the same shape of bug as the `User.verified` crash.
+The scope fields that came with shares-as-scopes (`Grant.root`,
+`Invitation.root`, `KeyGrant.scope_root`) are read the same way, defaulting to
+the empty string: a row from before them is a whole-store grant, a whole-store
+invitation, and an envelope for the store key, which is exactly what each one
+really is. So are `Grant.share_name` and `Invitation.share_name`, which came
+one generation later still: absent is "no name", which a whole-store row
+really has — and a **scoped** row with no name is listed as `"Shared folder"`,
+never as the store it lives in.
 
-## Sharing (Phase 2b)
+The reverse also happens: `HostedStore.share` is **dead**, from the cut where
+a share was a vault store of its own. Nothing writes it and nothing reads it,
+but production rows still carry it, so the field stays declared in
+`schema.rhype` — a stored row with a field the schema has dropped is not a
+shape this database has been asked to load, and finding out in production is
+not the way to learn. `POST /stores` refuses a request that still sends
+`share` (400) rather than ignoring it: quietly creating an unshareable store
+would host data nobody asked to host (`CLAUDE.md`).
 
-docs/SHARING_CONTRACT.md: a share is an ordinary vault store with
-`share: true` and ordinary `(user, store, role)` grants — this service
-learns nothing new about what is in one. What it does gain is a way to
-name somebody who has no Pimble account yet:
+## Sharing: a share is a scoped grant
 
-1. **`POST /stores { name, kind, store_id?, share? }`** — `share: true`
-   needs `kind: "vault"` (400 otherwise). Every `GET /stores` row now
-   carries `share` and `shared_by` (an owner's email, filled in only when
-   the caller is not an owner — `null` for one's own store).
-2. **`GET /stores/{id}/members`** (any grant) returns
-   `[{ user_id, email, role, status, has_key, public_keys }]`:
+docs/NODE_DOCUMENT_CONTRACT.md section 5. A share is **not** a store: it is a
+grant with a scope, `(user, store, root node, role)`, on the owner's own
+hosted store. The shared documents live in exactly one place and nowhere else,
+so there is nothing to mirror and nothing extra to host. (The earlier cut,
+where a share was a vault store of its own with `share: true`, is gone; see
+"Migration and legacy rows" above for what that leaves in the database.)
+
+Every endpoint here therefore takes a **root**: the node the share is rooted
+at, or absent for the whole store — a `root=<node id>` query parameter where
+there is no body, a `root` field where there is. Absent means exactly what
+every one of these calls meant before shares had scopes, so a client that
+knows nothing about roots still works. A root is an id: it is parsed and
+re-rendered before it is stored or compared (a malformed one is a 400), so the
+same node in two spellings can never become two shares.
+
+1. **`POST /stores { name, kind, store_id? }`** — `share` is gone; a request
+   that still sends it is a 400. Every `GET /stores` row carries `root` (the
+   shared node, `null` for a whole-store grant) and `shared_by` (an owner's
+   email, filled in unless this row is the caller's own whole-store
+   ownership). It is **one row per grant**, so a store somebody holds two
+   shares of is two rows with the same `store_id` and different `root`s. A
+   scoped row's `name` is **the share's own name**, never the store's (a
+   recipient must not learn what the owner's whole store is called), and
+   `"Shared folder"` when a scoped row somehow carries none; a whole-store
+   row's `name` is the store's.
+2. **`GET /stores/{id}/members[?root=<node id>]`** returns
+   `{ members: [{ user_id, email, role, root, status, has_key, public_keys }],
+   share_name }` for that one scope — `share_name` is the share's name
+   (`"Shared folder"` when a row carries none) and `null` for a whole-store
+   listing, which is named by `GET /stores`:
+   - an **owner** may ask about any scope of their store; a **scoped member**
+     may ask about their own scope and nothing else — not the whole store's
+     listing, not another share's (both 403), since neither is theirs;
    - `status` is `"active"` (a `Grant`) or `"invited"` (an `Invitation`);
-   - `has_key` is whether a `KeyGrant` exists for that member on that store
-     — what the owner's key sweep looks for (docs/SHARING_CONTRACT.md,
-     "Key sweep"). The desktop's third state, "waiting for the key", is an
-     active member with `has_key: false`, not a status here;
+   - `has_key` is whether a `KeyGrant` exists for that user, store **and
+     root** — what the owner's key sweep looks for. The desktop's third
+     state, "waiting for the key", is an active member with `has_key: false`,
+     not a status here;
    - `user_id` is `null` for an invitation, and `public_keys` is `null`
-     unless the caller is an **owner** (a reader of a shared folder learns
-     nothing about the other members' keys). Invitation rows are only
-     listed for an owner at all.
-3. **`PUT /stores/{id}/members { email, role }`** (owner) now does one of
-   two things, and says which in `status`:
-   - the address has a **verified account with key material** → a grant, as
-     before, plus a "shared with you" mail; the answer is `status:
+     unless the caller is an **owner** (a member of a shared folder learns
+     nothing about the other members' keys). Invitation rows are only listed
+     for an owner at all.
+3. **`PUT /stores/{id}/members { email, role, root?, name? }`** (owner of the
+   store) does one of two things, and says which in `status`:
+   - the address has a **verified account with key material** → a grant on
+     that scope, plus a "shared with you" mail; the answer is `status:
      "active"` with that account's `public_keys`, so the caller can wrap the
-     store key to them without a second round trip;
+     scope's key to them without a second round trip;
    - otherwise (no account, unverified, or a legacy keyless row) → an
-     `Invitation` is upserted, an invitation mail goes out, and the answer
-     is `status: "invited"`. Role `owner` this way is refused (400): an
-     owner can delete the store, which is not something to hand to an
-     unproven address.
-4. **`DELETE /stores/{id}/members/{user_id}`** — an **owner, or the member
-   themself** (leaving a share needs nobody's permission). Deletes that
-   user's `KeyGrant`s for the store along with the grant; the last-owner
-   rule stands.
-5. **`DELETE /stores/{id}/invitations/{email}`** (owner) withdraws an
-   invitation — the address is URL-encoded in the path, and it is `200`
-   whether or not there was one to withdraw.
-6. **`GET /stores/{id}/keys`** additionally returns `signers: [{ user_id,
-   email, public_signing_key }]`, the store's owners: a recipient is handed
-   the key by the sharer, so "signed by me" is no longer the only signature
-   worth accepting.
+     `Invitation` for that scope is upserted, an invitation mail goes out,
+     and the answer is `status: "invited"`.
+   - `role: "owner"` is refused (400) for a scope — owner is a role on a
+     store, and there is nothing in a subtree of somebody else's store to own
+     — and refused for an invitation at any scope: an owner can delete the
+     store, which is not something to hand to an unproven address.
+   - `name` is what the owner calls the share and is **required with a
+     `root`** (Joe, 2026-09-21: "a share has a name of its own") — 400
+     without one. It is reduced with `mail::one_line` and capped at 200
+     characters, exactly like a store's name, and stored on the grant or
+     invitation. PUTting again with a different name renames the share for
+     **every** grant and invitation of that `(store, root)`, so a share has
+     one name however many people hold it, and an address invited under the
+     old name claims the new one. Without a `root` it is ignored: a
+     whole-store membership is of the store, which has a name already.
+4. **`DELETE /stores/{id}/members/{user_id}[?root=]`** — an **owner, or the
+   member themself** (leaving a share needs nobody's permission). Removes
+   that one membership: the grant for that scope and that user's `KeyGrant`s
+   for that scope, leaving their other shares of the same store, and their
+   whole-store grant if they have one, where they were. The last-owner rule
+   is about the store's owners only.
+5. **`DELETE /stores/{id}/invitations/{email}[?root=]`** (owner) withdraws an
+   invitation to that scope — the address is URL-encoded in the path, and it
+   is `200` whether or not there was one to withdraw.
+6. **`GET /stores/{id}/keys[?root=<node id>]`** returns the caller's own
+   envelopes for that scope (the store key without a `root`, that share's key
+   with one) plus `signers: [{ user_id, email, public_signing_key }]`, the
+   store's owners: a recipient is handed the key by the sharer, so "signed by
+   me" is not the only signature worth accepting.
+   **`PUT /stores/{id}/keys { envelopes: [{ user_id, key_id, envelope, root? }] }`**
+   upserts per `(user, store, key_id, root)`: an owner may set anyone's, a
+   member may set their own, and the target must already hold a grant that
+   covers that scope (400 otherwise).
 7. **`DELETE /stores/{id}`** also deletes the store's key grants and
    invitations, and for a `vault` store calls `deleteVaultStore` on the
    hosted Pimble server so the ciphertext goes too. That call failing is
    logged, never returned: the row is marked deleted either way and nothing
    can reach the store afterwards.
 
-**Claiming.** An invitation becomes a grant the moment the address really
-has an account: at `GET /verify` (the address becoming verified) and at
-every `POST /login`. An existing grant wins — an owner who invited an
-address and then added or re-roled the account directly is not overruled by
-the older invitation — and the invitation is deleted either way, as it is
-for a store that has since been deleted. Both call sites treat it as best
-effort: a claim that fails is logged and retried at the next login rather
-than failing the verification or the login itself.
+**The token.** `POST /token`'s `claims.stores` says `{ "<store>": "editor" }`
+for a whole-store grant and `{ "<store>": { "roots": { "<node id>": "reader",
+"<node id>": "editor" } } }` when all the user holds on that store is shares —
+one entry per store, carrying every scoped root they hold with **its own
+role** (Joe, 2026-09-21). There is no store-level `role` key in that form:
+there is no role they hold on the store as a whole. So an editor of one folder
+and a reader of another keeps both, instead of being reduced to the lesser of
+the two on everything. A user who holds a whole-store grant as well gets the
+string: it already covers every node in the store. An older Pimble server
+cannot parse the object and drops the grant, which fails closed.
+
+A role string this service does not know is not minted at all — the grant is
+left out of the claim entirely, so a row this service never wrote cannot
+invent a permission.
+
+**Claiming.** An invitation becomes a grant on the scope it named the moment
+the address really has an account: at `GET /verify` (the address becoming
+verified) and at every `POST /login`. An existing grant on that same scope
+wins — an owner who invited an address and then added or re-roled the account
+directly is not overruled by the older invitation — and the invitation is
+deleted either way, as it is for a store that has since been deleted. Both
+call sites treat it as best effort: a claim that fails is logged and retried
+at the next login rather than failing the verification or the login itself.
+
+(`docs/SHARING_CONTRACT.md` is the superseded cut — a share as a store of its
+own — and the references left to it in this crate are to the parts
+docs/NODE_DOCUMENT_CONTRACT.md section 7 keeps: the mail wording, the three
+limits below, claiming, `signers`, `deleteVaultStore`.)
 
 **Mail and limits** (all in-memory and per-process, like the other
 limiters here):
 
 | Limit | Key | Beyond it |
 | --- | --- | --- |
-| one sharing mail per minute | `<store id>:<lowercased address>` | the grant or invitation still happens; no mail is sent |
+| one sharing mail per minute | `<store id>:<lowercased address>` | the grant or invitation still happens; no mail is sent (the key is the store, not the scope: several shares of one store in a minute are one mail) |
 | thirty new invitations per hour | the inviter's account | `429 rate_limited` |
-| fifty members plus invitations | the store | `409 conflict` |
+| fifty members plus invitations | the store, every scope together — one person holding three shares of it is three | `409 conflict` |
 
 **Names and addresses in a mail are attacker-controlled.** A share's name is
 typed by its owner and the inviter's address by whoever signed up, and both
@@ -233,12 +308,15 @@ and LF among them, which is what makes a subject header injectable),
 whitespace runs collapsed, trimmed — the name is capped at 80 characters
 with an ellipsis, and every interpolated value in an HTML body goes through
 `escape_html` (`& < > " '`), the link's `href` and its visible text
-included. `POST /stores` applies the same one-line rule to a name before
-storing it and refuses one over **200 characters** with a 400 (there was no
-limit at all before Phase 2b). `mail.rs`'s unit tests cover a name like
+included. That covers `PUT members`'s `name` (a share's name) as much as the
+store's own. Both are stored through the same rule: one-lined, refused when
+empty, and refused over **200 characters** with a 400. `mail.rs`'s unit tests cover a name like
 `<a href="…">click</a>\r\nBcc: x@y`.
 
-Both mails (`mail::invitation_email`, `mail::shared_with_you_email`) say
+Both mails name **the share** — the name the owner typed — and never the
+store it lives in; a whole-store membership is the one case where the store's
+own name is what is being given, and so what the mail says. Both
+(`mail::invitation_email`, `mail::shared_with_you_email`) say
 plainly that the notes are end-to-end encrypted and that they open once the
 sender's Pimble has been online to hand over the key. The invitation links
 to `<PIMBLE_CLOUD_PUBLIC_URL>/app/signup?email=<urlencoded address>`; the
@@ -385,42 +463,61 @@ curl -sb cookies.txt http://127.0.0.1:8080/api/v1/me/keys
 curl -sb cookies.txt 'http://127.0.0.1:8080/api/v1/users/lookup?email=bob@example.com'
 
 # Create a hosted store (creates it on the Pimble server + an owner grant);
-# kind defaults to "plain", store_id is optional, share needs kind "vault"
+# kind defaults to "plain", store_id is optional. There is no `share`: a
+# share is a scoped grant on a store you already host (400 if you send one).
 curl -sb cookies.txt -X POST http://127.0.0.1:8080/api/v1/stores \
   -H 'Content-Type: application/json' -d '{"name": "My Notes", "kind": "vault"}'
-curl -sb cookies.txt -X POST http://127.0.0.1:8080/api/v1/stores \
-  -H 'Content-Type: application/json' -d '{"name": "Recipes", "kind": "vault", "share": true}'
 
-# List my stores
-# -> [{"store_id":"...","name":"Recipes","role":"editor","kind":"vault",
-#      "created_at":"...","share":true,"shared_by":"ann@example.com"}]
+# List my stores: one row per grant. A share's row is named by the SHARE
+# (never the store it lives in) and names the node and who shared it; a
+# whole-store row is named by the store and has root: null.
+# -> [{"store_id":"...","name":"My Notes","role":"owner","kind":"vault",
+#      "created_at":"...","root":null,"shared_by":null},
+#     {"store_id":"...","name":"Holiday Plans","role":"editor","kind":"vault",
+#      "created_at":"...","root":"<node id>","shared_by":"ann@example.com"}]
 curl -sb cookies.txt http://127.0.0.1:8080/api/v1/stores
 
-# Add a member, or invite an address with no account yet — same call
-# -> {"user_id":"...","email":"bob@example.com","role":"editor",
+# Add a member, or invite an address with no account yet — same call.
+# Without `root`: the whole store. With one: a share of that node, and
+# `name` is REQUIRED — what the share is called, in the mail and in the
+# recipient's store list. PUTting a different `name` for the same `root`
+# renames the share for everyone who holds it.
+# -> {"user_id":"...","email":"bob@example.com","role":"editor","root":null,
 #     "status":"active","has_key":false,"public_keys":{"encryption":"...","signing":"..."}}
-# -> {"user_id":null,"email":"new@example.com","role":"editor",
+# -> {"user_id":null,"email":"new@example.com","role":"editor","root":"<node id>",
 #     "status":"invited","has_key":false,"public_keys":null}
 curl -sb cookies.txt -X PUT http://127.0.0.1:8080/api/v1/stores/<store-id>/members \
   -H 'Content-Type: application/json' -d '{"email": "bob@example.com", "role": "editor"}'
+curl -sb cookies.txt -X PUT http://127.0.0.1:8080/api/v1/stores/<store-id>/members \
+  -H 'Content-Type: application/json' \
+  -d '{"email": "new@example.com", "role": "editor", "root": "<node id>", "name": "Holiday Plans"}'
 
-# The members list (invitations and public_keys only for an owner)
+# The members of one scope, and the share's own name beside them
+# (invitations and public_keys only for an owner; a scoped member may only
+# ask about their own root)
+# -> {"members":[{"user_id":"...","email":"bob@example.com","role":"editor",
+#                 "root":"<node id>","status":"active","has_key":true,"public_keys":null}],
+#     "share_name":"Holiday Plans"}   # share_name is null for the whole store
 curl -sb cookies.txt http://127.0.0.1:8080/api/v1/stores/<store-id>/members
+curl -sb cookies.txt 'http://127.0.0.1:8080/api/v1/stores/<store-id>/members?root=<node id>'
 
-# Remove a member (an owner, or the member themself), or withdraw an
-# invitation (an owner; the address is url-encoded, 200 even if there is none)
-curl -sb cookies.txt -X DELETE http://127.0.0.1:8080/api/v1/stores/<store-id>/members/<user-id>
-curl -sb cookies.txt -X DELETE http://127.0.0.1:8080/api/v1/stores/<store-id>/invitations/new%40example.com
+# Stop sharing one node with someone (an owner, or the member themself), or
+# withdraw an invitation to it (an owner; the address is url-encoded, 200
+# even if there is none). Without `root`, the whole-store membership.
+curl -sb cookies.txt -X DELETE 'http://127.0.0.1:8080/api/v1/stores/<store-id>/members/<user-id>?root=<node id>'
+curl -sb cookies.txt -X DELETE 'http://127.0.0.1:8080/api/v1/stores/<store-id>/invitations/new%40example.com?root=<node id>'
 
-# My own key envelopes for a store, plus the owners whose signatures on them
-# are legitimate, and setting one (envelope from pimble_crypto::wrap_key,
-# signed by the caller's own signing key)
+# My own key envelopes for a scope (the store key without `root`, a share's
+# key with one), plus the owners whose signatures on them are legitimate,
+# and setting one (envelope from pimble_crypto::wrap_key, signed by the
+# caller's own signing key)
 # -> {"envelopes":[{"key_id":"...","envelope":{...}}],
 #     "signers":[{"user_id":"...","email":"ann@example.com","public_signing_key":"..."}]}
 curl -sb cookies.txt http://127.0.0.1:8080/api/v1/stores/<store-id>/keys
+curl -sb cookies.txt 'http://127.0.0.1:8080/api/v1/stores/<store-id>/keys?root=<node id>'
 curl -sb cookies.txt -X PUT http://127.0.0.1:8080/api/v1/stores/<store-id>/keys \
   -H 'Content-Type: application/json' \
-  -d '{"envelopes": [{"user_id": "<my user id>", "key_id": "<uuid>", "envelope": { "...": "a pimble_crypto::KeyEnvelope" }}]}'
+  -d '{"envelopes": [{"user_id": "<their user id>", "key_id": "<uuid>", "root": "<node id>", "envelope": { "...": "a pimble_crypto::KeyEnvelope" }}]}'
 
 # Recovery: start (202 always), fetch what the token names, then complete
 # with rotated material (both blobs come from pimble_crypto, same as signup)
@@ -439,7 +536,10 @@ curl -sb cookies.txt -X POST http://127.0.0.1:8080/api/v1/me/recovery-code \
   -H 'Content-Type: application/json' -d '{"recovery_salt": "<new>", "recovery_key_blob": {"...": "rewrapped under the new code"}}'
 
 # Mint a fresh JWT for the Pimble server (Authorization: Bearer <session> works in
-# place of the cookie, too — this is what a non-browser caller uses)
+# place of the cookie, too — this is what a non-browser caller uses).
+# claims.stores is "<role>" for a whole-store grant and
+# {"roots": {"<node id>": "<role>", ...}} for a store held by shares — a role
+# per shared root, and no store-level role.
 curl -sb cookies.txt -X POST http://127.0.0.1:8080/api/v1/token
 
 # JWKS, the latest release, and the health check need no auth
@@ -574,17 +674,32 @@ elsewhere) so the `/releases` tests never touch the network.
 - **`KeyGrant` mirrors `Grant`'s denormalization** (`user_rid`/`store_rid`/
   `store_uuid` scalar copies alongside the `user`/`store` relations) for the
   same reason: no relation-equality filter in the query language.
-  `(user, store, key_id)` uniqueness is enforced in the service
+  `(user, store, key_id, scope_root)` uniqueness is enforced in the service
   (find-then-create/update in `routes/stores.rs::put_store_keys`), not the
   schema — key rotation adds a new `key_id` and new envelopes per member
   rather than mutating an old row, so old blobs keep decrypting.
 - **`Invitation` carries `store`/`store_rid`/`store_uuid` like `Grant`**, for
-  the same reason (no relation-equality filter), and `(store, email_lower)`
-  uniqueness is likewise enforced in the service (find-then-create/update in
-  `routes/stores.rs::invite_member`). `invited_by_rid` is a scalar with *no*
-  matching relation on purpose: the inviter is only ever read back to name
-  them in the mail, and an invitation whose inviter has since deleted their
-  account is still a perfectly good invitation.
+  the same reason (no relation-equality filter), and
+  `(store, email_lower, root)` uniqueness is likewise enforced in the service
+  (find-then-create/update in `routes/stores.rs::invite_member`).
+  `invited_by_rid` is a scalar with *no* matching relation on purpose: the
+  inviter is only ever read back to name them in the mail, and an invitation
+  whose inviter has since deleted their account is still a perfectly good
+  invitation.
+- **The scope fields are matched in this process, never by the query.**
+  `find_grant`, `find_invitation` and `find_key_grant` fetch the rows for
+  `(user, store)` (or `(store, address)`) and pick the scope out in Rust,
+  because a row written before `root`/`scope_root` existed has no such field
+  at all, and `.filter(.root == "")` cannot match a field that is absent — it
+  would hide every production grant from the very lookups that decide who may
+  read a store. The same reasoning as reading them optional, one step later.
+- **A user may hold several grants on one store**: the whole store, or one per
+  share, so "the caller's role here" is `require_role_for_scope` (a
+  whole-store grant covers every scope; a scoped grant covers only its own
+  node, and never answers for the store as a whole) rather than one
+  `find_grant`. "Owner" always means a whole-store owner — `PUT members`
+  refuses `owner` for a scope — which is what the last-owner rule, `signers`,
+  and every "only an owner can do this" check count.
 - **`QuotaLimiter` (`src/ratelimit.rs`) is a second limiter**, not a
   parameterisation of `RateLimiter`: the existing one allows exactly one use
   per interval, and thirty invitations in a row is the ordinary way somebody

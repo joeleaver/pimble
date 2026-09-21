@@ -92,20 +92,23 @@ type HostedStore {
     // optional (`hosted_store_from_object`, defaulting to `"plain"`), like
     // every field added after a generation shipped.
     kind: String
-    // Phase 2b (docs/SHARING_CONTRACT.md): true when this vault store is a
-    // share mirror rather than a store of the account's own. Absent on every
-    // row from before this field existed, which reads as `false` — the state
-    // every pre-2b store really is in.
+    // Dead since docs/NODE_DOCUMENT_CONTRACT.md section 5: a share was
+    // briefly a vault store of its own (`share: true`), and is now a scoped
+    // grant on the owner's own store — `Grant.root` below. Nothing writes
+    // this field any more and nothing reads it (`hosted_store_from_object`
+    // ignores it), but production rows from that cut still carry it, so the
+    // declaration stays: a field a stored row has and the schema does not is
+    // not a shape this database has ever been asked to load.
     share: Bool
 }
 
-// Phase 2b (docs/SHARING_CONTRACT.md, "Accounts service"): an address invited
-// to a store that has no verified account yet. One row per (store,
-// email_lower), enforced in the service (find-then-create/update) like
-// `Grant`'s (user, store) — see this file's header comment on why relation-pair
-// uniqueness isn't a schema-level thing here. An invitation becomes a `Grant`
-// and is deleted the moment the address is claimed (at verification and at
-// every login), so nothing here is ever read for an account that exists.
+// An address invited to a store that has no verified account yet. One row per
+// (store, email_lower, root), enforced in the service (find-then-create/update)
+// like `Grant`'s (user, store, root) — see this file's header comment on why
+// relation-pair uniqueness isn't a schema-level thing here. An invitation
+// becomes a `Grant` and is deleted the moment the address is claimed (at
+// verification and at every login), so nothing here is ever read for an
+// account that exists.
 //
 // `store_rid`/`store_uuid` are the same denormalized scalar copies `Grant`
 // carries, for the same reason. `email_lower` is what the claim path queries.
@@ -121,6 +124,17 @@ type Invitation {
     email: String
     email_lower: String @indexed
     role: String
+    // The scope this invitation is for, exactly like `Grant.root` below: the
+    // empty string for the whole store, a node id for a share. Carried into
+    // the grant when the address is claimed. Absent on every row written
+    // before shares became scopes — read optional, defaulting to the whole
+    // store, which is what those rows really are.
+    root: String
+    // What the owner called this share, exactly like `Grant.share_name`
+    // below, and carried into the grant with `root` when the address is
+    // claimed. Empty for a whole-store invitation (the store has a name of
+    // its own). Read optional, like every field added after rows existed.
+    share_name: String
     invited_by_rid: u64
     created_at: DateTime
 }
@@ -129,22 +143,42 @@ type Grant {
     user: User
     store: HostedStore
     role: String
+    // docs/NODE_DOCUMENT_CONTRACT.md section 5: a grant has a scope. The
+    // empty string is the whole store (every grant before shares became
+    // scopes); a node id is a share — this user holds `role` on that node and
+    // the documents under it, and on nothing else in the store. One row per
+    // (user, store, root), enforced in the service. Absent on every row
+    // written before this field existed, read optional as the whole store.
+    root: String
+    // What the owner called this share (Joe, 2026-09-21: "a share has a name
+    // of its own"): the name a recipient's store list shows, so the owner's
+    // store name never reaches them. Empty for a whole-store grant, which is
+    // named by its store. Every grant and invitation of one (store, root)
+    // carries the same name — `PUT members` rewrites them all — so a share
+    // has one name however many people hold it. Absent on every row written
+    // before this field existed; read optional, like every later field.
+    share_name: String
     user_rid: u64 @indexed
     store_rid: u64 @indexed
     store_uuid: String
 }
 
 // Phase 2a (docs/CRYPTO_CONTRACT.md "Data model additions"): one row per
-// (user, store, key_id) — a store's key rotates by adding a new key_id and
-// new envelopes per member, never by mutating an old row (old blobs still
-// need their old envelope to decrypt). `(user, store, key_id)` uniqueness is
-// enforced in the service, like `Grant`'s `(user, store)` — see schema.rhype's
+// (user, store, key_id, scope_root) — a store's key rotates by adding a new
+// key_id and new envelopes per member, never by mutating an old row (old blobs
+// still need their old envelope to decrypt). That uniqueness is enforced in
+// the service, like `Grant`'s `(user, store, root)` — see schema.rhype's
 // header comment on why relation-pair uniqueness isn't a schema-level thing
 // here.
 type KeyGrant {
     user: User
     store: HostedStore
     key_id: String
+    // Which scope key this envelope carries (docs/NODE_DOCUMENT_CONTRACT.md
+    // section 5): the empty string for the store key, a node id for that
+    // share's key. Absent on every row from before shares became scopes —
+    // read optional as the store key, which every such envelope holds.
+    scope_root: String
     // A `pimble_crypto::KeyEnvelope` serialized to a JSON string — opaque to
     // this schema and to RhypeDB, exactly like `User.account_key_blob`.
     envelope: String

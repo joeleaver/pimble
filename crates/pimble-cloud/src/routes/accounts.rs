@@ -280,7 +280,7 @@ pub async fn verify(State(state): State<AppState>, Query(query): Query<VerifyQue
         return Ok(redirect_to("/app/login?verify_error=expired"));
     }
     state.db.mark_user_verified(user.rid).await?;
-    // Phase 2b (docs/SHARING_CONTRACT.md, "Claiming"): this address may have
+    // Claiming: this address may have
     // been invited to shares before it had an account. Best effort — a share
     // that cannot be handed over right now must not make verification itself
     // fail; the next login claims it.
@@ -324,7 +324,7 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>)
     }
     // Claim any invitations for this address before the token is minted, so
     // the `stores` claim in it already carries a share invited moments ago
-    // (docs/SHARING_CONTRACT.md, "Claiming": "at every `login`"). Verification
+    // (claiming runs at every login). Verification
     // usually does this first; login covers an invitation sent afterwards,
     // and any claim that failed then.
     super::stores::claim_invitations_best_effort(&state, &user).await;
@@ -570,8 +570,11 @@ pub async fn recover_delete_account(State(state): State<AppState>, Path(token): 
     let user = user_for_recovery_token(&state, &token).await?;
 
     for grant in state.db.grants_for_user(user.rid).await? {
-        if grant.role == "owner" {
-            let owner_count = state.db.grants_for_store(grant.store_rid).await?.into_iter().filter(|g| g.role == "owner").count();
+        // Only a whole-store owner is an owner: a scoped grant is a share of
+        // somebody else's store, and losing it leaves that store alone.
+        if grant.role == "owner" && grant.is_whole_store() {
+            let owner_count =
+                state.db.grants_for_store(grant.store_rid).await?.into_iter().filter(|g| g.role == "owner" && g.is_whole_store()).count();
             if owner_count <= 1 {
                 state.db.mark_store_deleted(grant.store_rid).await?;
             }

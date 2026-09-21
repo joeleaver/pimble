@@ -1032,7 +1032,7 @@ async fn member_lifecycle_and_last_owner_refusal() {
 
     let members: Value =
         stack.http.get(format!("{}/stores/{store_id}/members", stack.base_url)).header("Cookie", &owner_cookie).send().await.unwrap().json().await.unwrap();
-    let members = members.as_array().unwrap();
+    let members = members["members"].as_array().unwrap();
     assert_eq!(members.len(), 2);
     assert!(members.iter().any(|m| m["email"] == "heidi@example.com" && m["role"] == "reader"));
 
@@ -1100,7 +1100,7 @@ async fn member_lifecycle_and_last_owner_refusal() {
     assert_eq!(resp.status(), 200);
     let members: Value =
         stack.http.get(format!("{}/stores/{store_id}/members", stack.base_url)).header("Cookie", &owner_cookie).send().await.unwrap().json().await.unwrap();
-    assert_eq!(members.as_array().unwrap().len(), 1);
+    assert_eq!(members["members"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1319,8 +1319,8 @@ async fn legacy_keyless_users_and_their_sessions_and_grants_are_deleted_at_start
     stack.app_state.db.create_session(legacy.rid, &token_hash, expires_at_ms).await.unwrap();
 
     let hosted =
-        stack.app_state.db.create_hosted_store(&uuid::Uuid::new_v4().to_string(), "Legacy's Store", "legacy.pimble", "plain", false).await.unwrap();
-    stack.app_state.db.create_grant(legacy.rid, hosted.rid, &hosted.store_id, "owner").await.unwrap();
+        stack.app_state.db.create_hosted_store(&uuid::Uuid::new_v4().to_string(), "Legacy's Store", "legacy.pimble", "plain").await.unwrap();
+    stack.app_state.db.create_grant(legacy.rid, hosted.rid, &hosted.store_id, "owner", "", "").await.unwrap();
 
     // A fresh `build_state` against the exact same rhypedb-server and
     // Pimble server — simulating the next deploy's restart.
@@ -1328,7 +1328,7 @@ async fn legacy_keyless_users_and_their_sessions_and_grants_are_deleted_at_start
 
     assert!(second_state.db.find_user_by_email(email).await.unwrap().is_none(), "the legacy user should be deleted at startup");
     assert!(second_state.db.find_session_by_token_hash(&token_hash).await.unwrap().is_none(), "its session should be deleted too");
-    assert!(second_state.db.find_grant(legacy.rid, hosted.rid).await.unwrap().is_none(), "its grant should be deleted too");
+    assert!(second_state.db.find_grant(legacy.rid, hosted.rid, "").await.unwrap().is_none(), "its grant should be deleted too");
 }
 
 /// A live crash: `delete_legacy_users_without_keys` used to deserialize
@@ -1617,7 +1617,8 @@ async fn store_keys_ownership_rules() {
     let (editor_login, editor_cookie) = verify_then_login(&stack, "vault-editor4@example.com", "editor password!!").await;
     let editor_id = editor_login["user"]["id"].as_str().unwrap().to_string();
     let editor_public = editor_keys.public_keys();
-    let (reader_login, reader_cookie) = signup_verify_login(&stack, "vault-reader4@example.com", "reader password!!").await;
+    let (_reader_signup, reader_keys) = signup_with_material(&stack, "vault-reader4@example.com", "reader password!!").await;
+    let (reader_login, reader_cookie) = verify_then_login(&stack, "vault-reader4@example.com", "reader password!!").await;
     let reader_id = reader_login["user"]["id"].as_str().unwrap().to_string();
 
     let store: Value = stack
@@ -1650,7 +1651,8 @@ async fn store_keys_ownership_rules() {
         .await
         .unwrap();
 
-    // A reader cannot set keys, even their own.
+    // An envelope somebody else signed is refused whoever posts it: every
+    // envelope must be signed by the caller distributing it.
     let store_key = pimble_crypto::SymmetricKey::generate();
     let envelope_for_editor = wrap_store_key(&store_key, uuid::Uuid::new_v4(), &store_id, &editor_keys, &editor_public);
     let resp = stack
@@ -1661,7 +1663,24 @@ async fn store_keys_ownership_rules() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 403);
+    assert_eq!(resp.status(), 401, "the reader did not sign this one");
+
+    // A reader CAN set their own, properly signed: any member may, an owner
+    // may set anyone's (docs/NODE_DOCUMENT_CONTRACT.md section 5 — before
+    // scopes this was "an owner or editor, their own"). Nobody else has
+    // reason to trust an envelope a reader signed for themselves; what it
+    // costs them is their own row.
+    let reader_key_id = uuid::Uuid::new_v4();
+    let reader_envelope = wrap_store_key(&store_key, reader_key_id, &store_id, &reader_keys, &reader_keys.public_keys());
+    let resp = stack
+        .http
+        .put(format!("{}/stores/{store_id}/keys", stack.base_url))
+        .header("Cookie", &reader_cookie)
+        .json(&json!({ "envelopes": [ { "user_id": reader_id, "key_id": reader_key_id.to_string(), "envelope": reader_envelope } ] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
 
     // An editor CAN set their own key (signed by themselves)...
     let editor_key_id = uuid::Uuid::new_v4();
@@ -2022,7 +2041,7 @@ async fn put_member(stack: &Stack, cookie: &str, store_id: &str, email: &str, ro
 async fn list_members(stack: &Stack, cookie: &str, store_id: &str) -> Vec<Value> {
     let resp = stack.http.get(format!("{}/stores/{store_id}/members", stack.base_url)).header("Cookie", cookie).send().await.unwrap();
     assert_eq!(resp.status(), 200);
-    resp.json::<Value>().await.unwrap().as_array().unwrap().clone()
+    resp.json::<Value>().await.unwrap()["members"].as_array().unwrap().clone()
 }
 
 async fn list_stores(stack: &Stack, cookie: &str) -> Vec<Value> {
@@ -2050,7 +2069,7 @@ fn assert_says_encrypted_and_waits_for_the_sender(body: &str, inviter_email: &st
 async fn inviting_an_unknown_address_and_claiming_it_at_verification() {
     let stack = skip_without_rhypedb!();
     let (_owner_body, owner_cookie) = signup_verify_login(&stack, "share-owner@example.com", "share owner password!!").await;
-    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Recipes", "kind": "vault", "share": true })).await;
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Recipes", "kind": "vault" })).await;
     let store_id = store["store_id"].as_str().unwrap().to_string();
 
     let invitee = "not-a-user-yet@example.com";
@@ -2080,12 +2099,12 @@ async fn inviting_an_unknown_address_and_claiming_it_at_verification() {
     let stores = list_stores(&stack, &invitee_cookie).await;
     let row = stores.iter().find(|s| s["store_id"] == store_id.as_str()).expect("the claimed share should be listed");
     assert_eq!(row["role"], "editor");
-    assert_eq!(row["share"], true);
+    assert!(row["root"].is_null(), "a whole-store grant's row names no node: {row}");
     assert_eq!(row["shared_by"], "share-owner@example.com");
 
     // ...and the invitation is gone, replaced by a real grant.
     let hosted = stack.app_state.db.find_hosted_store(&store_id).await.unwrap().unwrap();
-    assert!(stack.app_state.db.find_invitation(hosted.rid, invitee).await.unwrap().is_none(), "a claimed invitation must be deleted");
+    assert!(stack.app_state.db.find_invitation(hosted.rid, invitee, "").await.unwrap().is_none(), "a claimed invitation must be deleted");
     let members = list_members(&stack, &owner_cookie, &store_id).await;
     assert_eq!(find_member(&members, invitee)["status"], "active");
 }
@@ -2097,7 +2116,7 @@ async fn inviting_an_unknown_address_and_claiming_it_at_verification() {
 async fn login_claims_an_invitation_for_an_already_verified_address() {
     let stack = skip_without_rhypedb!();
     let (_owner_body, owner_cookie) = signup_verify_login(&stack, "claim-owner@example.com", "claim owner password!!").await;
-    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Claimed At Login", "kind": "vault", "share": true })).await;
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Claimed At Login", "kind": "vault" })).await;
     let store_id = store["store_id"].as_str().unwrap().to_string();
     let hosted = stack.app_state.db.find_hosted_store(&store_id).await.unwrap().unwrap();
 
@@ -2109,13 +2128,13 @@ async fn login_claims_an_invitation_for_an_already_verified_address() {
 
     // Written straight to the database: the shape a claim race leaves behind,
     // which no endpoint would produce for a verified address.
-    stack.app_state.db.create_invitation(hosted.rid, &store_id, email, "reader", owner.rid).await.unwrap();
-    assert!(stack.app_state.db.find_grant(user.rid, hosted.rid).await.unwrap().is_none());
+    stack.app_state.db.create_invitation(hosted.rid, &store_id, email, "reader", "", "", owner.rid).await.unwrap();
+    assert!(stack.app_state.db.find_grant(user.rid, hosted.rid, "").await.unwrap().is_none());
 
     let (_body, cookie) = login(&stack, email, password).await;
-    let grant = stack.app_state.db.find_grant(user.rid, hosted.rid).await.unwrap().expect("login should have claimed the invitation");
+    let grant = stack.app_state.db.find_grant(user.rid, hosted.rid, "").await.unwrap().expect("login should have claimed the invitation");
     assert_eq!(grant.role, "reader");
-    assert!(stack.app_state.db.find_invitation(hosted.rid, email).await.unwrap().is_none(), "the claimed invitation must be deleted");
+    assert!(stack.app_state.db.find_invitation(hosted.rid, email, "").await.unwrap().is_none(), "the claimed invitation must be deleted");
     assert!(list_stores(&stack, &cookie).await.iter().any(|s| s["store_id"] == store_id.as_str()));
 }
 
@@ -2131,7 +2150,7 @@ async fn inviting_a_known_verified_address_grants_at_once() {
     let (member_login, _member_cookie) = verify_then_login(&stack, member_email, "known member password!!").await;
     let member_id = member_login["user"]["id"].as_str().unwrap().to_string();
 
-    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Known Share", "kind": "vault", "share": true })).await;
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Known Share", "kind": "vault" })).await;
     let store_id = store["store_id"].as_str().unwrap().to_string();
 
     let resp = put_member(&stack, &owner_cookie, &store_id, member_email, "editor").await;
@@ -2163,7 +2182,7 @@ async fn member_has_key_flips_once_an_envelope_is_uploaded() {
     let (member_login, _member_cookie) = verify_then_login(&stack, member_email, "haskey member password!!").await;
     let member_id = member_login["user"]["id"].as_str().unwrap().to_string();
 
-    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Key Sweep", "kind": "vault", "share": true })).await;
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Key Sweep", "kind": "vault" })).await;
     let store_id = store["store_id"].as_str().unwrap().to_string();
     assert_eq!(put_member(&stack, &owner_cookie, &store_id, member_email, "editor").await.status(), 200);
 
@@ -2203,7 +2222,7 @@ async fn store_keys_lists_the_owners_as_signers() {
     let member_email = "signer-member@example.com";
     let (_member_login, member_cookie) = signup_verify_login(&stack, member_email, "signer member password!!").await;
 
-    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Signed Share", "kind": "vault", "share": true })).await;
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Signed Share", "kind": "vault" })).await;
     let store_id = store["store_id"].as_str().unwrap().to_string();
     assert_eq!(put_member(&stack, &owner_cookie, &store_id, member_email, "reader").await.status(), 200);
 
@@ -2235,7 +2254,7 @@ async fn a_member_removes_themself_but_not_each_other() {
     let (bystander_login, bystander_cookie) = signup_verify_login(&stack, "bystander@example.com", "bystander password!!").await;
     let bystander_id = bystander_login["user"]["id"].as_str().unwrap().to_string();
 
-    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Leavable", "kind": "vault", "share": true })).await;
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Leavable", "kind": "vault" })).await;
     let store_id = store["store_id"].as_str().unwrap().to_string();
     assert_eq!(put_member(&stack, &owner_cookie, &store_id, leaver_email, "editor").await.status(), 200);
     assert_eq!(put_member(&stack, &owner_cookie, &store_id, "bystander@example.com", "reader").await.status(), 200);
@@ -2286,7 +2305,7 @@ async fn a_member_removes_themself_but_not_each_other() {
 
     let hosted = stack.app_state.db.find_hosted_store(&store_id).await.unwrap().unwrap();
     let leaver = stack.app_state.db.find_user_by_email(leaver_email).await.unwrap().unwrap();
-    assert!(stack.app_state.db.find_grant(leaver.rid, hosted.rid).await.unwrap().is_none());
+    assert!(stack.app_state.db.find_grant(leaver.rid, hosted.rid, "").await.unwrap().is_none());
     assert!(
         stack.app_state.db.key_grants_for_user_and_store(leaver.rid, hosted.rid).await.unwrap().is_empty(),
         "removing a member must delete their envelopes for the store"
@@ -2302,7 +2321,7 @@ async fn an_invitation_can_be_withdrawn() {
     let stack = skip_without_rhypedb!();
     let (_owner_body, owner_cookie) = signup_verify_login(&stack, "withdraw-owner@example.com", "withdraw owner password!!").await;
     let (_other_body, other_cookie) = signup_verify_login(&stack, "withdraw-other@example.com", "withdraw other password!!").await;
-    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Withdrawable", "kind": "vault", "share": true })).await;
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Withdrawable", "kind": "vault" })).await;
     let store_id = store["store_id"].as_str().unwrap().to_string();
 
     let invitee = "withdrawn@example.com";
@@ -2349,7 +2368,7 @@ async fn an_invitation_can_be_withdrawn() {
 async fn inviting_an_owner_without_an_account_is_refused() {
     let stack = skip_without_rhypedb!();
     let (_owner_body, owner_cookie) = signup_verify_login(&stack, "no-owner-invite@example.com", "no owner invite password!!").await;
-    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Owners Only", "kind": "vault", "share": true })).await;
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Owners Only", "kind": "vault" })).await;
     let store_id = store["store_id"].as_str().unwrap().to_string();
 
     let resp = put_member(&stack, &owner_cookie, &store_id, "stranger@example.com", "owner").await;
@@ -2360,27 +2379,25 @@ async fn inviting_an_owner_without_an_account_is_refused() {
     assert_eq!(put_member(&stack, &owner_cookie, &store_id, "stranger@example.com", "editor").await.status(), 200);
 }
 
-/// `share: true` is only meaningful for an encrypted store.
+/// `share` is gone: a share is a scoped grant on the owner's own store now,
+/// never a store of its own. A client still sending it is told so rather than
+/// quietly getting a store nobody asked to host.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_share_must_be_a_vault_store() {
+async fn create_store_refuses_the_removed_share_field() {
     let stack = skip_without_rhypedb!();
     let (_body, cookie) = signup_verify_login(&stack, "plain-share@example.com", "plain share password!!").await;
 
-    let resp = stack
-        .http
-        .post(format!("{}/stores", stack.base_url))
-        .header("Cookie", &cookie)
-        .json(&json!({ "name": "Plain Share", "share": true }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 400);
-    assert_eq!(resp.json::<Value>().await.unwrap()["error"], "bad_request");
+    for body in [json!({ "name": "Old Share", "kind": "vault", "share": true }), json!({ "name": "Old Share", "share": false })] {
+        let resp = stack.http.post(format!("{}/stores", stack.base_url)).header("Cookie", &cookie).json(&body).send().await.unwrap();
+        assert_eq!(resp.status(), 400, "`share` must be refused, not ignored: {body}");
+        assert_eq!(resp.json::<Value>().await.unwrap()["error"], "bad_request");
+    }
 
-    // A plain store without `share` is still fine, and lists as share: false.
+    // The same store without it is fine, and its row names no share root.
     let store = create_store_with_body(&stack, &cookie, json!({ "name": "Plain Notes" })).await;
-    assert_eq!(store["share"], false);
+    assert!(store["root"].is_null());
     assert!(store["shared_by"].is_null());
+    assert!(store.get("share").is_none(), "the field is gone from the response too: {store}");
 }
 
 /// A store's name goes out in sharing mails and into every member's app, so
@@ -2420,25 +2437,26 @@ async fn a_store_name_is_bounded_and_kept_to_one_line() {
     assert_eq!(resp.status(), 400);
 }
 
-/// `GET /stores` says which rows are shares and, for a row the caller does
-/// not own, who shared it.
+/// `GET /stores`, for a whole-store membership: no `root`, and for a row the
+/// caller does not own, who shared it. (The scoped shape is
+/// `list_stores_rows_carry_root_and_shared_by_for_a_share`.)
 #[tokio::test(flavor = "multi_thread")]
-async fn list_stores_reports_share_and_shared_by() {
+async fn list_stores_reports_shared_by() {
     let stack = skip_without_rhypedb!();
     let owner_email = "listing-owner@example.com";
     let (_owner_body, owner_cookie) = signup_verify_login(&stack, owner_email, "listing owner password!!").await;
     let (_member_body, member_cookie) = signup_verify_login(&stack, "listing-member@example.com", "listing member password!!").await;
 
-    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Listed Share", "kind": "vault", "share": true })).await;
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Listed Share", "kind": "vault" })).await;
     let store_id = store["store_id"].as_str().unwrap().to_string();
     assert_eq!(put_member(&stack, &owner_cookie, &store_id, "listing-member@example.com", "editor").await.status(), 200);
 
     let owner_row = list_stores(&stack, &owner_cookie).await.into_iter().find(|s| s["store_id"] == store_id.as_str()).unwrap();
-    assert_eq!(owner_row["share"], true);
+    assert!(owner_row["root"].is_null(), "a whole-store grant names no node: {owner_row}");
     assert!(owner_row["shared_by"].is_null(), "an owner's own store is shared by nobody: {owner_row}");
 
     let member_row = list_stores(&stack, &member_cookie).await.into_iter().find(|s| s["store_id"] == store_id.as_str()).unwrap();
-    assert_eq!(member_row["share"], true);
+    assert!(member_row["root"].is_null());
     assert_eq!(member_row["role"], "editor");
     assert_eq!(member_row["shared_by"], owner_email);
 }
@@ -2449,7 +2467,7 @@ async fn list_stores_reports_share_and_shared_by() {
 async fn a_second_invitation_within_the_minute_sends_no_second_mail() {
     let stack = skip_without_rhypedb!();
     let (_owner_body, owner_cookie) = signup_verify_login(&stack, "quiet-owner@example.com", "quiet owner password!!").await;
-    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Quiet Share", "kind": "vault", "share": true })).await;
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Quiet Share", "kind": "vault" })).await;
     let store_id = store["store_id"].as_str().unwrap().to_string();
 
     let invitee = "invited-twice@example.com";
@@ -2479,7 +2497,7 @@ async fn store_member_cap_refuses_one_too_many() {
         }
     };
     let (_owner_body, owner_cookie) = signup_verify_login(&stack, "capped-owner@example.com", "capped owner password!!").await;
-    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Capped", "kind": "vault", "share": true })).await;
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Capped", "kind": "vault" })).await;
     let store_id = store["store_id"].as_str().unwrap().to_string();
 
     // The owner is one of the two; one invitation fills the store.
@@ -2505,7 +2523,7 @@ async fn deleting_a_store_removes_invitations_and_key_grants() {
     let (owner_login, owner_cookie) = verify_then_login(&stack, owner_email, "deleting owner password!!").await;
     let owner_id = owner_login["user"]["id"].as_str().unwrap().to_string();
 
-    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Doomed", "kind": "vault", "share": true })).await;
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Doomed", "kind": "vault" })).await;
     let store_id = store["store_id"].as_str().unwrap().to_string();
     let hosted = stack.app_state.db.find_hosted_store(&store_id).await.unwrap().unwrap();
 
@@ -2535,11 +2553,13 @@ async fn deleting_a_store_removes_invitations_and_key_grants() {
     assert!(stack.app_state.db.grants_for_store(hosted.rid).await.unwrap().is_empty());
 }
 
-/// A `HostedStore` row written before Phase 2b has no `share` field at all
-/// (RhypeDB never backfills one). Reading it must not fail — it is simply not
-/// a share, which is what every store from before this phase really is.
+/// A `HostedStore` row from the cut where a share was a store of its own
+/// still carries `share: true`, and a `Grant` from before shares had scopes
+/// has no `root` at all (RhypeDB never backfills or removes a field on an
+/// existing row). Reading either must not fail: the dead `share` is ignored,
+/// and the grant is what it has always been — the whole store.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_store_row_without_share_reads_as_not_shared() {
+async fn old_rows_read_without_error_and_as_whole_store_grants() {
     let stack = skip_without_rhypedb!();
     let (_body, cookie) = signup_verify_login(&stack, "old-row@example.com", "old row password!!").await;
     let user = stack.app_state.db.find_user_by_email("old-row@example.com").await.unwrap().unwrap();
@@ -2548,13 +2568,605 @@ async fn a_store_row_without_share_reads_as_not_shared() {
     let hosted = stack
         .app_state
         .db
-        .create_hosted_store_without_share_for_tests(&store_id, "From Before Sharing", "old.pimble", "vault")
+        .create_hosted_store_with_legacy_share_for_tests(&store_id, "From Before Sharing", "old.pimble", "vault")
         .await
         .unwrap();
-    assert!(!hosted.share, "an absent `share` reads as false, not an error");
-    stack.app_state.db.create_grant(user.rid, hosted.rid, &store_id, "owner").await.unwrap();
+    let grant = stack.app_state.db.create_grant_without_root_for_tests(user.rid, hosted.rid, &store_id, "owner").await.unwrap();
+    assert!(grant.is_whole_store(), "an absent `root` reads as the whole store, not an error");
 
     let row = list_stores(&stack, &cookie).await.into_iter().find(|s| s["store_id"] == store_id.as_str()).expect("the old row should list");
-    assert_eq!(row["share"], false);
+    assert!(row["root"].is_null());
     assert_eq!(row["kind"], "vault");
+    assert!(row.get("share").is_none(), "the dead field is never echoed back: {row}");
+
+    // ...and the token it mints is the plain string form.
+    assert_eq!(token_stores_claim(&stack, &cookie).await[&store_id], "owner");
+}
+
+// ── Sharing as a scoped grant (docs/NODE_DOCUMENT_CONTRACT.md section 5) ──
+
+/// The `claims.stores` object of a freshly minted token, verified against the
+/// JWKS this stack serves — the same check `token_claims_and_jwks_verify`
+/// does, reused wherever a test is about the claim's shape rather than the
+/// signature.
+async fn token_stores_claim(stack: &Stack, cookie: &str) -> Value {
+    let token_resp: Value =
+        stack.http.post(format!("{}/token", stack.base_url)).header("Cookie", cookie).send().await.unwrap().json().await.unwrap();
+    let token = token_resp["token"].as_str().expect("a minted token");
+    let jwks: Value = stack.http.get(format!("{}/.well-known/jwks.json", stack.base_url)).send().await.unwrap().json().await.unwrap();
+    verify_and_decode(token, &jwks)["claims"]["stores"].clone()
+}
+
+/// `PUT members` with whatever body the test wants — a `root`, a `name`, or
+/// neither ([`put_member`] is the no-scope shorthand).
+async fn put_member_with(stack: &Stack, cookie: &str, store_id: &str, body: Value) -> reqwest::Response {
+    stack.http.put(format!("{}/stores/{store_id}/members", stack.base_url)).header("Cookie", cookie).json(&body).send().await.unwrap()
+}
+
+fn scoped_url(base: &str, root: Option<&str>) -> String {
+    match root {
+        Some(root) => format!("{base}?root={root}"),
+        None => base.to_string(),
+    }
+}
+
+async fn members_response(stack: &Stack, cookie: &str, store_id: &str, root: Option<&str>) -> reqwest::Response {
+    let url = scoped_url(&format!("{}/stores/{store_id}/members", stack.base_url), root);
+    stack.http.get(url).header("Cookie", cookie).send().await.unwrap()
+}
+
+async fn list_members_at(stack: &Stack, cookie: &str, store_id: &str, root: Option<&str>) -> Vec<Value> {
+    members_body(stack, cookie, store_id, root).await["members"].as_array().unwrap().clone()
+}
+
+/// The whole `{ members, share_name }` body, for a test that is about the
+/// share's name rather than who holds it.
+async fn members_body(stack: &Stack, cookie: &str, store_id: &str, root: Option<&str>) -> Value {
+    let resp = members_response(stack, cookie, store_id, root).await;
+    assert_eq!(resp.status(), 200, "listing members of {root:?} should succeed: {:?}", resp.text().await);
+    resp.json().await.unwrap()
+}
+
+async fn keys_response(stack: &Stack, cookie: &str, store_id: &str, root: Option<&str>) -> reqwest::Response {
+    let url = scoped_url(&format!("{}/stores/{store_id}/keys", stack.base_url), root);
+    stack.http.get(url).header("Cookie", cookie).send().await.unwrap()
+}
+
+async fn put_keys(stack: &Stack, cookie: &str, store_id: &str, envelopes: Value) -> reqwest::Response {
+    stack
+        .http
+        .put(format!("{}/stores/{store_id}/keys", stack.base_url))
+        .header("Cookie", cookie)
+        .json(&json!({ "envelopes": envelopes }))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// A node id, as an owner's device would name the node it is sharing.
+fn node_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// The token's two shapes: a plain role string for a whole-store grant, and
+/// `{ roots: { "<node id>": "<role>" } }` for a store where all the user
+/// holds is shares — every scoped root in the one entry, each with its own
+/// role, and the whole-store string winning when they hold both on the same
+/// store.
+#[tokio::test(flavor = "multi_thread")]
+async fn token_says_a_role_for_a_store_and_role_plus_roots_for_shares() {
+    let stack = skip_without_rhypedb!();
+    let (_owner_body, owner_cookie) = signup_verify_login(&stack, "scope-owner@example.com", "scope owner password!!").await;
+    let recipient_email = "scope-recipient@example.com";
+    let (_recipient_body, recipient_cookie) = signup_verify_login(&stack, recipient_email, "scope recipient password!!").await;
+
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Family", "kind": "vault" })).await;
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+    let (first, second) = (node_id(), node_id());
+
+    // An owner holds the store itself: a plain string.
+    assert_eq!(token_stores_claim(&stack, &owner_cookie).await[&store_id], "owner");
+
+    // One share: the object form, with the node it is rooted at and its role.
+    let resp =
+        put_member_with(&stack, &owner_cookie, &store_id, json!({ "email": recipient_email, "role": "editor", "root": first, "name": "First Folder" }))
+            .await;
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+    let claim = token_stores_claim(&stack, &recipient_cookie).await;
+    assert_eq!(claim[&store_id], json!({ "roots": { first.as_str(): "editor" } }), "no store-level role in the scoped form: {claim}");
+
+    // A second share of the same store joins the same entry.
+    assert_eq!(
+        put_member_with(
+            &stack,
+            &owner_cookie,
+            &store_id,
+            json!({ "email": recipient_email, "role": "editor", "root": second, "name": "Second Folder" })
+        )
+        .await
+        .status(),
+        200
+    );
+    let claim = token_stores_claim(&stack, &recipient_cookie).await;
+    assert_eq!(
+        claim[&store_id],
+        json!({ "roots": { first.as_str(): "editor", second.as_str(): "editor" } }),
+        "one entry per store, carrying every scoped root"
+    );
+
+    // A whole-store grant on top of the shares: the string wins, since it
+    // already covers every node in the store.
+    assert_eq!(put_member(&stack, &owner_cookie, &store_id, recipient_email, "editor").await.status(), 200);
+    assert_eq!(token_stores_claim(&stack, &recipient_cookie).await[&store_id], "editor");
+}
+
+/// A role per shared root (Joe, 2026-09-21): a reader of one folder and an
+/// editor of another keeps both, rather than being reduced to the lesser of
+/// the two on everything they hold in that store.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_scoped_roles_on_one_store_each_keep_their_own() {
+    let stack = skip_without_rhypedb!();
+    let (_owner_body, owner_cookie) = signup_verify_login(&stack, "narrow-owner@example.com", "narrow owner password!!").await;
+    let recipient_email = "narrow-recipient@example.com";
+    let (_recipient_body, recipient_cookie) = signup_verify_login(&stack, recipient_email, "narrow recipient password!!").await;
+
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Mixed", "kind": "vault" })).await;
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+    let (writable, readable) = (node_id(), node_id());
+
+    assert_eq!(
+        put_member_with(&stack, &owner_cookie, &store_id, json!({ "email": recipient_email, "role": "editor", "root": writable, "name": "Drafts" })).await.status(),
+        200
+    );
+    assert_eq!(
+        put_member_with(&stack, &owner_cookie, &store_id, json!({ "email": recipient_email, "role": "reader", "root": readable, "name": "Reading" })).await.status(),
+        200
+    );
+
+    let claim = token_stores_claim(&stack, &recipient_cookie).await;
+    assert_eq!(
+        claim[&store_id],
+        json!({ "roots": { writable.as_str(): "editor", readable.as_str(): "reader" } }),
+        "each share keeps its own role: {claim}"
+    );
+}
+
+/// Owner is a role on a store, not on a subtree of one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_share_cannot_be_owned() {
+    let stack = skip_without_rhypedb!();
+    let (_owner_body, owner_cookie) = signup_verify_login(&stack, "scoped-owner@example.com", "scoped owner password!!").await;
+    let member_email = "scoped-owner-target@example.com";
+    signup_verify_login(&stack, member_email, "scoped owner target password!!").await;
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Unownable", "kind": "vault" })).await;
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+
+    let resp = put_member_with(&stack, &owner_cookie, &store_id, json!({ "email": member_email, "role": "owner", "root": node_id(), "name": "Unownable Folder" })).await;
+    assert_eq!(resp.status(), 400);
+    assert_eq!(resp.json::<Value>().await.unwrap()["error"], "bad_request");
+
+    // A root that is not a node id at all is refused the same way.
+    let resp = put_member_with(&stack, &owner_cookie, &store_id, json!({ "email": member_email, "role": "editor", "root": "not-a-node", "name": "Nowhere" })).await;
+    assert_eq!(resp.status(), 400);
+}
+
+/// An address with no account invited to one node: the mail names the share
+/// the owner typed (not the store), and signing up turns the invitation into
+/// a grant that carries the root.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scoped_invitation_is_claimed_with_its_root() {
+    let stack = skip_without_rhypedb!();
+    let owner_email = "scoped-invite-owner@example.com";
+    let (_owner_body, owner_cookie) = signup_verify_login(&stack, owner_email, "scoped invite owner password!!").await;
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Whole Store Name", "kind": "vault" })).await;
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+    let root = node_id();
+
+    let invitee = "scoped-invitee@example.com";
+    let resp =
+        put_member_with(&stack, &owner_cookie, &store_id, json!({ "email": invitee, "role": "editor", "root": root, "name": "Holiday Plans" }))
+            .await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "invited");
+    assert_eq!(body["root"], root);
+
+    // The mail names what the owner shared, not the store it lives in.
+    let mail = last_mail(&stack, invitee);
+    assert!(mail.contains("Holiday Plans"), "the mail names the share: {mail}");
+    assert!(!mail.contains("Whole Store Name"), "...and not the store around it: {mail}");
+    assert_says_encrypted_and_waits_for_the_sender(&mail, owner_email);
+
+    // The owner sees it under that root, and nowhere else.
+    assert_eq!(find_member(&list_members_at(&stack, &owner_cookie, &store_id, Some(&root)).await, invitee)["status"], "invited");
+    assert_eq!(list_members_at(&stack, &owner_cookie, &store_id, None).await.len(), 1, "the whole store still has only its owner");
+
+    // Signing up claims it, root and all.
+    let (_body, invitee_cookie) = signup_verify_login(&stack, invitee, "scoped invitee password!!").await;
+    let hosted = stack.app_state.db.find_hosted_store(&store_id).await.unwrap().unwrap();
+    let user = stack.app_state.db.find_user_by_email(invitee).await.unwrap().unwrap();
+    let grant = stack.app_state.db.find_grant(user.rid, hosted.rid, &root).await.unwrap().expect("the claimed grant carries the root");
+    assert_eq!(grant.role, "editor");
+    assert!(stack.app_state.db.find_grant(user.rid, hosted.rid, "").await.unwrap().is_none(), "claiming a share grants nothing else");
+
+    assert_eq!(grant.share_name, "Holiday Plans", "the invitation's name travels into the grant");
+
+    let row = list_stores(&stack, &invitee_cookie).await.into_iter().find(|s| s["store_id"] == store_id.as_str()).expect("the share lists");
+    assert_eq!(row["root"], root);
+    assert_eq!(row["role"], "editor");
+    assert_eq!(row["shared_by"], owner_email);
+    assert_eq!(row["name"], "Holiday Plans", "a recipient's row is named by the share, never the store: {row}");
+}
+
+/// `GET /stores` is one row per grant: two shares of one store are two rows,
+/// each naming its node, and a whole-store grant is a row with none.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_stores_rows_carry_root_and_shared_by_for_a_share() {
+    let stack = skip_without_rhypedb!();
+    let owner_email = "rows-owner@example.com";
+    let (_owner_body, owner_cookie) = signup_verify_login(&stack, owner_email, "rows owner password!!").await;
+    let member_email = "rows-member@example.com";
+    let (_member_body, member_cookie) = signup_verify_login(&stack, member_email, "rows member password!!").await;
+
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Two Shares", "kind": "vault" })).await;
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+    let (first, second) = (node_id(), node_id());
+    for (root, role, name) in [(&first, "editor", "Recipes"), (&second, "reader", "Photos")] {
+        assert_eq!(
+            put_member_with(&stack, &owner_cookie, &store_id, json!({ "email": member_email, "role": role, "root": root, "name": name }))
+                .await
+                .status(),
+            200
+        );
+    }
+
+    let rows: Vec<Value> = list_stores(&stack, &member_cookie).await.into_iter().filter(|s| s["store_id"] == store_id.as_str()).collect();
+    assert_eq!(rows.len(), 2, "one row per grant: {rows:?}");
+    for row in &rows {
+        assert_eq!(row["shared_by"], owner_email);
+        assert_ne!(row["name"], "Two Shares", "a recipient is never told what the store around their share is called: {row}");
+    }
+    let by_root: std::collections::HashMap<String, (String, String)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r["root"].as_str().unwrap().to_string(),
+                (r["role"].as_str().unwrap().to_string(), r["name"].as_str().unwrap().to_string()),
+            )
+        })
+        .collect();
+    assert_eq!(by_root.get(&first), Some(&("editor".to_string(), "Recipes".to_string())));
+    assert_eq!(by_root.get(&second), Some(&("reader".to_string(), "Photos".to_string())));
+
+    // The owner's own row is the store, with no root, and the store's name.
+    let owner_rows: Vec<Value> = list_stores(&stack, &owner_cookie).await.into_iter().filter(|s| s["store_id"] == store_id.as_str()).collect();
+    assert_eq!(owner_rows.len(), 1);
+    assert!(owner_rows[0]["root"].is_null());
+    assert!(owner_rows[0]["shared_by"].is_null());
+    assert_eq!(owner_rows[0]["name"], "Two Shares");
+}
+
+/// Members are listed per scope: an owner sees any of them, a scoped member
+/// sees their own and nothing else — not the whole store's, not another
+/// share's, and never anybody's public keys.
+#[tokio::test(flavor = "multi_thread")]
+async fn members_are_listed_per_scope_and_a_share_sees_only_its_own() {
+    let stack = skip_without_rhypedb!();
+    let (_owner_body, owner_cookie) = signup_verify_login(&stack, "per-scope-owner@example.com", "per scope owner password!!").await;
+    let member_email = "per-scope-member@example.com";
+    let (_member_body, member_cookie) = signup_verify_login(&stack, member_email, "per scope member password!!").await;
+    let other_email = "per-scope-other@example.com";
+    signup_verify_login(&stack, other_email, "per scope other password!!").await;
+
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Scoped Members", "kind": "vault" })).await;
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+    let (shared, elsewhere) = (node_id(), node_id());
+
+    for email in [member_email, other_email] {
+        assert_eq!(
+            put_member_with(&stack, &owner_cookie, &store_id, json!({ "email": email, "role": "editor", "root": shared, "name": "The Shared Folder" })).await.status(),
+            200
+        );
+    }
+    assert_eq!(
+        put_member_with(&stack, &owner_cookie, &store_id, json!({ "email": "invited-to-the-share@example.com", "role": "reader", "root": shared, "name": "The Shared Folder" }))
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(
+        put_member_with(&stack, &owner_cookie, &store_id, json!({ "email": other_email, "role": "reader", "root": elsewhere, "name": "Somewhere Else" })).await.status(),
+        200
+    );
+
+    // The owner: the share's two members plus its one invitation, with keys.
+    let owners_view = list_members_at(&stack, &owner_cookie, &store_id, Some(&shared)).await;
+    assert_eq!(owners_view.len(), 3, "{owners_view:?}");
+    assert_eq!(find_member(&owners_view, "invited-to-the-share@example.com")["status"], "invited");
+    assert_eq!(find_member(&owners_view, member_email)["root"], shared);
+    assert!(find_member(&owners_view, member_email)["public_keys"]["signing"].is_string());
+
+    // The share's own member: the same members, no invitations, no keys.
+    let members_view = list_members_at(&stack, &member_cookie, &store_id, Some(&shared)).await;
+    assert_eq!(members_view.len(), 2, "an invitation is the owner's business: {members_view:?}");
+    assert!(find_member(&members_view, other_email)["public_keys"].is_null());
+
+    // ...and nothing else about the store.
+    assert_eq!(members_response(&stack, &member_cookie, &store_id, None).await.status(), 403, "a share is not a way into the whole store");
+    assert_eq!(members_response(&stack, &member_cookie, &store_id, Some(&elsewhere)).await.status(), 403, "nor into another share");
+
+    // The whole store's own listing is unchanged: just its owner.
+    assert_eq!(list_members_at(&stack, &owner_cookie, &store_id, None).await.len(), 1);
+}
+
+/// Envelopes and `has_key` are per scope: the share key a member is handed
+/// for one node is not the store key, and is not another share's.
+#[tokio::test(flavor = "multi_thread")]
+async fn key_envelopes_and_has_key_are_per_scope() {
+    let stack = skip_without_rhypedb!();
+    let owner_email = "scoped-keys-owner@example.com";
+    let (_signup, owner_keys) = signup_with_material(&stack, owner_email, "scoped keys owner password!!").await;
+    let (_owner_login, owner_cookie) = verify_then_login(&stack, owner_email, "scoped keys owner password!!").await;
+    let member_email = "scoped-keys-member@example.com";
+    let (_member_signup, member_keys) = signup_with_material(&stack, member_email, "scoped keys member password!!").await;
+    let (member_login, member_cookie) = verify_then_login(&stack, member_email, "scoped keys member password!!").await;
+    let member_id = member_login["user"]["id"].as_str().unwrap().to_string();
+
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Scoped Keys", "kind": "vault" })).await;
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+    let (shared, elsewhere) = (node_id(), node_id());
+    assert_eq!(
+        put_member_with(&stack, &owner_cookie, &store_id, json!({ "email": member_email, "role": "editor", "root": shared, "name": "Keyed Folder" })).await.status(),
+        200
+    );
+    assert_eq!(find_member(&list_members_at(&stack, &owner_cookie, &store_id, Some(&shared)).await, member_email)["has_key"], false);
+
+    // The owner wraps the share's key to the member, naming the scope.
+    let share_key = pimble_crypto::SymmetricKey::generate();
+    let key_id = uuid::Uuid::new_v4();
+    let envelope = wrap_store_key(&share_key, key_id, &store_id, &owner_keys, &member_keys.public_keys());
+    let resp = put_keys(
+        &stack,
+        &owner_cookie,
+        &store_id,
+        json!([{ "user_id": member_id, "key_id": key_id.to_string(), "envelope": envelope, "root": shared }]),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+
+    // It comes back for that scope only...
+    let resp = keys_response(&stack, &member_cookie, &store_id, Some(&shared)).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["envelopes"].as_array().unwrap().len(), 1);
+    assert_eq!(body["envelopes"][0]["key_id"], key_id.to_string());
+    assert_eq!(body["signers"].as_array().unwrap().len(), 1, "the store's owners still sign: {body}");
+    assert_eq!(body["signers"][0]["email"], owner_email);
+
+    // ...and asking for the store key, or another share's, is not the
+    // member's to do at all.
+    assert_eq!(keys_response(&stack, &member_cookie, &store_id, None).await.status(), 403);
+    assert_eq!(keys_response(&stack, &member_cookie, &store_id, Some(&elsewhere)).await.status(), 403);
+
+    // `has_key` reads the same scope: true for the share, false for the store.
+    assert_eq!(find_member(&list_members_at(&stack, &owner_cookie, &store_id, Some(&shared)).await, member_email)["has_key"], true);
+    assert_eq!(find_member(&list_members_at(&stack, &owner_cookie, &store_id, None).await, owner_email)["has_key"], false);
+
+    // A scope the member holds no grant on takes no envelope either.
+    let stray = wrap_store_key(&share_key, key_id, &store_id, &owner_keys, &member_keys.public_keys());
+    let resp = put_keys(
+        &stack,
+        &owner_cookie,
+        &store_id,
+        json!([{ "user_id": member_id, "key_id": key_id.to_string(), "envelope": stray, "root": elsewhere }]),
+    )
+    .await;
+    assert_eq!(resp.status(), 400, "an envelope for a scope they were never shared: {:?}", resp.text().await);
+}
+
+/// Removing somebody from one share leaves their other shares, and their
+/// envelopes for them, exactly where they were; and the last-owner rule is
+/// about the store's owners, never a share's members.
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_scoped_member_touches_only_that_scope() {
+    let stack = skip_without_rhypedb!();
+    let owner_email = "unshare-owner@example.com";
+    let (_signup, owner_keys) = signup_with_material(&stack, owner_email, "unshare owner password!!").await;
+    let (_owner_login, owner_cookie) = verify_then_login(&stack, owner_email, "unshare owner password!!").await;
+    let member_email = "unshare-member@example.com";
+    let (_member_signup, member_keys) = signup_with_material(&stack, member_email, "unshare member password!!").await;
+    let (member_login, member_cookie) = verify_then_login(&stack, member_email, "unshare member password!!").await;
+    let member_id = member_login["user"]["id"].as_str().unwrap().to_string();
+
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Unshared", "kind": "vault" })).await;
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+    let (withdrawn, kept) = (node_id(), node_id());
+    for root in [&withdrawn, &kept] {
+        assert_eq!(
+            put_member_with(&stack, &owner_cookie, &store_id, json!({ "email": member_email, "role": "editor", "root": root, "name": "A Shared Folder" })).await.status(),
+            200
+        );
+        let key_id = uuid::Uuid::new_v4();
+        let envelope = wrap_store_key(&pimble_crypto::SymmetricKey::generate(), key_id, &store_id, &owner_keys, &member_keys.public_keys());
+        let resp = put_keys(
+            &stack,
+            &owner_cookie,
+            &store_id,
+            json!([{ "user_id": member_id, "key_id": key_id.to_string(), "envelope": envelope, "root": root }]),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+    }
+
+    // The owner stops sharing one node. (The store has exactly one owner, so
+    // this also shows the last-owner rule does not stand in a share's way.)
+    let resp = stack
+        .http
+        .delete(format!("{}/stores/{store_id}/members/{member_id}?root={withdrawn}", stack.base_url))
+        .header("Cookie", &owner_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+
+    assert_eq!(keys_response(&stack, &member_cookie, &store_id, Some(&withdrawn)).await.status(), 403, "the share is gone");
+    let kept_keys: Value = keys_response(&stack, &member_cookie, &store_id, Some(&kept)).await.json().await.unwrap();
+    assert_eq!(kept_keys["envelopes"].as_array().unwrap().len(), 1, "the other share is untouched: {kept_keys}");
+
+    let hosted = stack.app_state.db.find_hosted_store(&store_id).await.unwrap().unwrap();
+    let member = stack.app_state.db.find_user_by_email(member_email).await.unwrap().unwrap();
+    assert!(stack.app_state.db.key_grants_for_user_store_and_root(member.rid, hosted.rid, &withdrawn).await.unwrap().is_empty());
+    assert_eq!(stack.app_state.db.key_grants_for_user_store_and_root(member.rid, hosted.rid, &kept).await.unwrap().len(), 1);
+
+    // ...and the token now names only the share they still hold.
+    let claim = token_stores_claim(&stack, &member_cookie).await;
+    assert_eq!(claim[&store_id], json!({ "roots": { kept.as_str(): "editor" } }));
+
+    // A withdrawn invitation is scoped the same way.
+    let invitee = "unshare-invitee@example.com";
+    assert_eq!(
+        put_member_with(&stack, &owner_cookie, &store_id, json!({ "email": invitee, "role": "reader", "root": kept, "name": "A Shared Folder" })).await.status(),
+        200
+    );
+    let encoded: String = url::form_urlencoded::byte_serialize(invitee.as_bytes()).collect();
+    let resp = stack
+        .http
+        .delete(format!("{}/stores/{store_id}/invitations/{encoded}?root={kept}", stack.base_url))
+        .header("Cookie", &owner_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        !list_members_at(&stack, &owner_cookie, &store_id, Some(&kept)).await.iter().any(|m| m["email"] == invitee),
+        "the invitation to that scope is withdrawn"
+    );
+}
+
+/// A share is named by its owner: `PUT members` with a `root` and no usable
+/// name is a 400, and the name it does take is reduced and bounded exactly
+/// like a store's. A whole-store membership needs none — the store has a name
+/// already.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_share_must_be_named_and_the_name_is_bounded() {
+    let stack = skip_without_rhypedb!();
+    let (_owner_body, owner_cookie) = signup_verify_login(&stack, "naming-owner@example.com", "naming owner password!!").await;
+    let member_email = "naming-member@example.com";
+    let (_member_body, member_cookie) = signup_verify_login(&stack, member_email, "naming member password!!").await;
+
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "The Whole Store", "kind": "vault" })).await;
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+    let root = node_id();
+
+    // No name at all, and a name that is only whitespace, are the same thing.
+    for body in [
+        json!({ "email": member_email, "role": "editor", "root": root }),
+        json!({ "email": member_email, "role": "editor", "root": root, "name": "   " }),
+        json!({ "email": member_email, "role": "editor", "root": root, "name": "x".repeat(201) }),
+    ] {
+        let resp = put_member_with(&stack, &owner_cookie, &store_id, body.clone()).await;
+        assert_eq!(resp.status(), 400, "a share needs a name of its own: {body}");
+        assert_eq!(resp.json::<Value>().await.unwrap()["error"], "bad_request");
+    }
+    assert!(list_stores(&stack, &member_cookie).await.is_empty(), "a refused share grants nothing");
+
+    // The stored name is one line: control characters gone, whitespace runs
+    // collapsed, trimmed — the same rule a store's name goes through.
+    assert_eq!(
+        put_member_with(
+            &stack,
+            &owner_cookie,
+            &store_id,
+            json!({ "email": member_email, "role": "editor", "root": root, "name": "  Holiday\r\n  Plans  " })
+        )
+        .await
+        .status(),
+        200
+    );
+    let row = list_stores(&stack, &member_cookie).await.into_iter().find(|s| s["store_id"] == store_id.as_str()).expect("the share lists");
+    assert_eq!(row["name"], "Holiday Plans");
+    assert_eq!(members_body(&stack, &owner_cookie, &store_id, Some(&root)).await["share_name"], "Holiday Plans");
+
+    // A name at the cap is fine, and a whole-store membership needs none.
+    let long = "y".repeat(200);
+    assert_eq!(
+        put_member_with(&stack, &owner_cookie, &store_id, json!({ "email": member_email, "role": "editor", "root": node_id(), "name": long }))
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(put_member(&stack, &owner_cookie, &store_id, member_email, "editor").await.status(), 200);
+    let whole = members_body(&stack, &owner_cookie, &store_id, None).await;
+    assert!(whole["share_name"].is_null(), "the whole store is named by `GET /stores`, not here: {whole}");
+}
+
+/// A share has one name: renaming it renames it for everyone who holds it,
+/// and for anyone still invited to it — who claims the new name, not the one
+/// they were invited under.
+#[tokio::test(flavor = "multi_thread")]
+async fn renaming_a_share_renames_it_for_every_member_and_invitation() {
+    let stack = skip_without_rhypedb!();
+    let (_owner_body, owner_cookie) = signup_verify_login(&stack, "rename-owner@example.com", "rename owner password!!").await;
+    let first_email = "rename-first@example.com";
+    let (_first_body, first_cookie) = signup_verify_login(&stack, first_email, "rename first password!!").await;
+    let second_email = "rename-second@example.com";
+    let (_second_body, second_cookie) = signup_verify_login(&stack, second_email, "rename second password!!").await;
+    let invitee = "rename-invitee@example.com";
+
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Rename Me Not", "kind": "vault" })).await;
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+    let root = node_id();
+    for email in [first_email, second_email, invitee] {
+        assert_eq!(
+            put_member_with(&stack, &owner_cookie, &store_id, json!({ "email": email, "role": "editor", "root": root, "name": "Old Name" }))
+                .await
+                .status(),
+            200
+        );
+    }
+
+    // The owner types a new name while adding nobody new.
+    assert_eq!(
+        put_member_with(&stack, &owner_cookie, &store_id, json!({ "email": first_email, "role": "editor", "root": root, "name": "New Name" }))
+            .await
+            .status(),
+        200
+    );
+
+    for cookie in [&first_cookie, &second_cookie] {
+        let row = list_stores(&stack, cookie).await.into_iter().find(|s| s["store_id"] == store_id.as_str()).expect("the share lists");
+        assert_eq!(row["name"], "New Name", "one name for the share, whoever holds it: {row}");
+    }
+    assert_eq!(members_body(&stack, &owner_cookie, &store_id, Some(&root)).await["share_name"], "New Name");
+
+    // The address invited under the old name claims the new one.
+    let (_body, invitee_cookie) = signup_verify_login(&stack, invitee, "rename invitee password!!").await;
+    let row = list_stores(&stack, &invitee_cookie).await.into_iter().find(|s| s["store_id"] == store_id.as_str()).expect("the share lists");
+    assert_eq!(row["name"], "New Name");
+}
+
+/// A scoped grant with no `share_name` at all — the shape a share written
+/// before shares had names would have — reads without error and is shown as
+/// "Shared folder". Never as the store's own name: that is not the
+/// recipient's to see.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scoped_row_without_a_name_is_shown_as_shared_folder() {
+    let stack = skip_without_rhypedb!();
+    let member_email = "unnamed-share@example.com";
+    let (_body, member_cookie) = signup_verify_login(&stack, member_email, "unnamed share password!!").await;
+    let (_owner_body, owner_cookie) = signup_verify_login(&stack, "unnamed-owner@example.com", "unnamed owner password!!").await;
+    let member = stack.app_state.db.find_user_by_email(member_email).await.unwrap().unwrap();
+
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Secret Store Name", "kind": "vault" })).await;
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+    let hosted = stack.app_state.db.find_hosted_store(&store_id).await.unwrap().unwrap();
+    let root = node_id();
+    let grant =
+        stack.app_state.db.create_scoped_grant_without_share_name_for_tests(member.rid, hosted.rid, &store_id, "reader", &root).await.unwrap();
+    assert_eq!(grant.share_name, "", "an absent `share_name` reads as none, not an error");
+
+    let row = list_stores(&stack, &member_cookie).await.into_iter().find(|s| s["store_id"] == store_id.as_str()).expect("the share lists");
+    assert_eq!(row["name"], "Shared folder");
+    assert_eq!(row["root"], root);
+    assert_eq!(members_body(&stack, &member_cookie, &store_id, Some(&root)).await["share_name"], "Shared folder");
 }

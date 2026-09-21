@@ -272,14 +272,11 @@ pub struct HostedStoreRow {
     /// `"plain"` or `"vault"` (docs/CRYPTO_CONTRACT.md), matching
     /// `pimble_core::StoreKind`'s serde spelling.
     pub kind: String,
-    /// Phase 2b (docs/SHARING_CONTRACT.md): this vault store is a share
-    /// mirror. `false` for every row created before the field existed.
-    pub share: bool,
 }
 
-/// One address invited to a store that has no verified account yet
-/// (docs/SHARING_CONTRACT.md, "Accounts service"). Becomes a [`GrantRow`] and
-/// is deleted the moment the address is claimed.
+/// One address invited to a store that has no verified account yet. Becomes a
+/// [`GrantRow`] — with the same [`root`](Self::root) — the moment the address
+/// is claimed.
 #[derive(Debug, Clone)]
 pub struct InvitationRow {
     pub rid: u64,
@@ -289,6 +286,15 @@ pub struct InvitationRow {
     /// key is the lowercased copy the schema indexes.
     pub email: String,
     pub role: String,
+    /// The scope invited to: `""` for the whole store, a node id for a share
+    /// (docs/NODE_DOCUMENT_CONTRACT.md section 5). `""` for a row written
+    /// before the field existed.
+    pub root: String,
+    /// What the owner called the share this invites to, carried into the
+    /// grant when the address is claimed. `""` for a whole-store invitation
+    /// (the store has a name of its own), and for a row written before the
+    /// field existed.
+    pub share_name: String,
     /// The `User.rid` of whoever sent it — may name a row that no longer
     /// exists (see schema.rhype's comment on the field).
     pub invited_by_rid: u64,
@@ -302,6 +308,25 @@ pub struct GrantRow {
     pub store_rid: u64,
     pub store_uuid: String,
     pub role: String,
+    /// The scope granted: `""` for the whole store, a node id for a share
+    /// (docs/NODE_DOCUMENT_CONTRACT.md section 5). `""` for a row written
+    /// before the field existed, which is what every such grant really is.
+    pub root: String,
+    /// What the owner called this share (Joe, 2026-09-21): what a recipient's
+    /// store list shows instead of the store's own name. `""` for a
+    /// whole-store grant, and for a row written before the field existed —
+    /// a scoped row with no name is shown as "Shared folder" rather than
+    /// falling back to the store's name, which is not the recipient's to see.
+    pub share_name: String,
+}
+
+impl GrantRow {
+    /// Whether this grant covers the whole store rather than one shared
+    /// subtree — the only kind an owner ever is, and the only kind the
+    /// last-owner rule counts.
+    pub fn is_whole_store(&self) -> bool {
+        self.root.is_empty()
+    }
 }
 
 /// One member's envelope for one key id on one store (docs/CRYPTO_CONTRACT.md
@@ -312,6 +337,10 @@ pub struct KeyGrantRow {
     pub user_rid: u64,
     pub store_rid: u64,
     pub key_id: String,
+    /// Which scope key this envelope carries: `""` for the store key, a node
+    /// id for that share's key (docs/NODE_DOCUMENT_CONTRACT.md section 5).
+    /// `""` for a row written before the field existed.
+    pub scope_root: String,
     /// A `pimble_crypto::KeyEnvelope` as stored: a JSON string.
     pub envelope: String,
 }
@@ -368,15 +397,25 @@ fn hosted_store_from_object(o: &Object) -> CloudResult<HostedStoreRow> {
         name: get_string(o, "name")?.to_string(),
         created_at_ms: get_datetime_ms(o, "created_at")?,
         deleted: get_bool(o, "deleted")?,
-        // Both of these were added after rows already existed, so both are
-        // read optional with the value the older row really has — the rule
-        // from the `User.verified` crash-loop (this crate's README, "Migration
-        // and legacy rows"). A store hosted before Phase 2a is plain; a store
-        // hosted before Phase 2b is not a share.
+        // Added after rows already existed, so read optional with the value
+        // the older row really has — the rule from the `User.verified`
+        // crash-loop (this crate's README, "Migration and legacy rows"). A
+        // store hosted before Phase 2a is plain. (`share`, from the cut where
+        // a share was a store of its own, is not read at all any more; a
+        // production row may still carry it and that is simply ignored.)
         kind: get_string_opt(o, "kind")?.unwrap_or(DEFAULT_STORE_KIND).to_string(),
-        share: get_bool_opt(o, "share")?.unwrap_or(false),
     })
 }
+
+/// The scope a row with no scope field is treated as: the whole store, which
+/// is what every grant, invitation and envelope written before shares became
+/// scopes really is.
+const WHOLE_STORE: &str = "";
+
+/// The share name a row with no `share_name` field is treated as: none. A
+/// whole-store row really has none, and a scoped row from before the field
+/// existed is one whose name was never typed.
+const NO_SHARE_NAME: &str = "";
 
 fn invitation_from_object(o: &Object) -> CloudResult<InvitationRow> {
     Ok(InvitationRow {
@@ -385,6 +424,8 @@ fn invitation_from_object(o: &Object) -> CloudResult<InvitationRow> {
         store_uuid: get_string(o, "store_uuid")?.to_string(),
         email: get_string(o, "email")?.to_string(),
         role: get_string(o, "role")?.to_string(),
+        root: get_string_opt(o, "root")?.unwrap_or(WHOLE_STORE).to_string(),
+        share_name: get_string_opt(o, "share_name")?.unwrap_or(NO_SHARE_NAME).to_string(),
         invited_by_rid: get_u64(o, "invited_by_rid")?,
         created_at_ms: get_datetime_ms(o, "created_at")?,
     })
@@ -397,6 +438,8 @@ fn grant_from_object(o: &Object) -> CloudResult<GrantRow> {
         store_rid: get_u64(o, "store_rid")?,
         store_uuid: get_string(o, "store_uuid")?.to_string(),
         role: get_string(o, "role")?.to_string(),
+        root: get_string_opt(o, "root")?.unwrap_or(WHOLE_STORE).to_string(),
+        share_name: get_string_opt(o, "share_name")?.unwrap_or(NO_SHARE_NAME).to_string(),
     })
 }
 
@@ -406,6 +449,7 @@ fn key_grant_from_object(o: &Object) -> CloudResult<KeyGrantRow> {
         user_rid: get_u64(o, "user_rid")?,
         store_rid: get_u64(o, "store_rid")?,
         key_id: get_string(o, "key_id")?.to_string(),
+        scope_root: get_string_opt(o, "scope_root")?.unwrap_or(WHOLE_STORE).to_string(),
         envelope: get_string(o, "envelope")?.to_string(),
     })
 }
@@ -787,9 +831,9 @@ impl RhypeDb {
 
     // ── Hosted stores ──────────────────────────────────────────────────
 
-    pub async fn create_hosted_store(&self, store_id: &str, name: &str, dir_name: &str, kind: &str, share: bool) -> CloudResult<HostedStoreRow> {
+    pub async fn create_hosted_store(&self, store_id: &str, name: &str, dir_name: &str, kind: &str) -> CloudResult<HostedStoreRow> {
         let q = format!(
-            "HostedStore.create({{ store_id: {sid}, name: {name}, dir_name: {dir}, created_at: {now}, deleted: false, kind: {kind}, share: {share} }})",
+            "HostedStore.create({{ store_id: {sid}, name: {name}, dir_name: {dir}, created_at: {now}, deleted: false, kind: {kind} }})",
             sid = ql_str(store_id),
             name = ql_str(name),
             dir = ql_str(dir_name),
@@ -805,16 +849,15 @@ impl RhypeDb {
         hosted_store_from_object(&obj)
     }
 
-    /// Test-only: creates a `HostedStore` row shaped like one from before
-    /// Phase 2b — `share` simply never set, not written as `false` — so a
-    /// test can reproduce "a production row predates the field" without a
-    /// pre-migration database snapshot. Real stores always go through
-    /// [`Self::create_hosted_store`], which sets it; this is the one path
-    /// that deliberately doesn't (compare
-    /// [`Self::create_legacy_user_without_keys_for_tests`]).
-    pub async fn create_hosted_store_without_share_for_tests(&self, store_id: &str, name: &str, dir_name: &str, kind: &str) -> CloudResult<HostedStoreRow> {
+    /// Test-only: creates a `HostedStore` row shaped like one from the cut
+    /// where a share was a vault store of its own — `share: true`, a field
+    /// nothing writes or reads any more — so a test can reproduce "a
+    /// production row carries it" without a pre-migration database snapshot.
+    /// Real stores go through [`Self::create_hosted_store`], which never
+    /// writes it (compare [`Self::create_legacy_user_without_keys_for_tests`]).
+    pub async fn create_hosted_store_with_legacy_share_for_tests(&self, store_id: &str, name: &str, dir_name: &str, kind: &str) -> CloudResult<HostedStoreRow> {
         let q = format!(
-            "HostedStore.create({{ store_id: {sid}, name: {name}, dir_name: {dir}, created_at: {now}, deleted: false, kind: {kind} }})",
+            "HostedStore.create({{ store_id: {sid}, name: {name}, dir_name: {dir}, created_at: {now}, deleted: false, kind: {kind}, share: true }})",
             sid = ql_str(store_id),
             name = ql_str(name),
             dir = ql_str(dir_name),
@@ -850,7 +893,45 @@ impl RhypeDb {
 
     // ── Grants ─────────────────────────────────────────────────────────
 
-    pub async fn create_grant(&self, user_rid: u64, store_rid: u64, store_uuid: &str, role: &str) -> CloudResult<GrantRow> {
+    /// `root` is the scope: `""` for the whole store, a node id for a share
+    /// (docs/NODE_DOCUMENT_CONTRACT.md section 5). `share_name` is what the
+    /// owner called that share, and `""` for a whole-store grant.
+    pub async fn create_grant(
+        &self,
+        user_rid: u64,
+        store_rid: u64,
+        store_uuid: &str,
+        role: &str,
+        root: &str,
+        share_name: &str,
+    ) -> CloudResult<GrantRow> {
+        let q = format!(
+            "Grant.create({{ role: {role}, root: {root}, share_name: {share_name}, user_rid: {uid}, store_rid: {sid}, store_uuid: {suuid} }})",
+            uid = user_rid,
+            sid = store_rid,
+            role = ql_str(role),
+            root = ql_str(root),
+            share_name = ql_str(share_name),
+            suuid = ql_str(store_uuid),
+        );
+        let obj = self
+            .objects(&q)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| CloudError::Internal("Grant.create returned nothing".into()))?;
+        let grant = grant_from_object(&obj)?;
+        self.link("Grant", grant.rid, "User", user_rid).await?;
+        self.link("Grant", grant.rid, "HostedStore", store_rid).await?;
+        Ok(grant)
+    }
+
+    /// Test-only: creates a `Grant` row shaped like every one in production
+    /// before shares became scopes — neither `root` nor `share_name` present
+    /// at all, not written as `""` — so a test can reproduce the shape
+    /// [`grant_from_object`] must read as an unnamed whole-store grant.
+    /// Compare [`Self::create_hosted_store_with_legacy_share_for_tests`].
+    pub async fn create_grant_without_root_for_tests(&self, user_rid: u64, store_rid: u64, store_uuid: &str, role: &str) -> CloudResult<GrantRow> {
         let q = format!(
             "Grant.create({{ role: {role}, user_rid: {uid}, store_rid: {sid}, store_uuid: {suuid} }})",
             uid = user_rid,
@@ -870,13 +951,70 @@ impl RhypeDb {
         Ok(grant)
     }
 
-    pub async fn find_grant(&self, user_rid: u64, store_rid: u64) -> CloudResult<Option<GrantRow>> {
+    /// Test-only: a scoped `Grant` with no `share_name` field at all — the
+    /// shape a share written before a share had a name of its own would
+    /// have, which [`grant_from_object`] must read as "no name" and
+    /// `GET /stores` must show as "Shared folder" rather than as the store.
+    pub async fn create_scoped_grant_without_share_name_for_tests(
+        &self,
+        user_rid: u64,
+        store_rid: u64,
+        store_uuid: &str,
+        role: &str,
+        root: &str,
+    ) -> CloudResult<GrantRow> {
+        let q = format!(
+            "Grant.create({{ role: {role}, root: {root}, user_rid: {uid}, store_rid: {sid}, store_uuid: {suuid} }})",
+            uid = user_rid,
+            sid = store_rid,
+            role = ql_str(role),
+            root = ql_str(root),
+            suuid = ql_str(store_uuid),
+        );
+        let obj = self
+            .objects(&q)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| CloudError::Internal("Grant.create returned nothing".into()))?;
+        let grant = grant_from_object(&obj)?;
+        self.link("Grant", grant.rid, "User", user_rid).await?;
+        self.link("Grant", grant.rid, "HostedStore", store_rid).await?;
+        Ok(grant)
+    }
+
+    /// The grant for exactly this scope — `(user, store, root)`, the
+    /// uniqueness this service enforces itself. A user may hold several
+    /// grants on one store (the whole store, or one per share), so a caller
+    /// asking "may they touch this?" wants
+    /// [`Self::grants_for_user_and_store`] instead.
+    pub async fn find_grant(&self, user_rid: u64, store_rid: u64, root: &str) -> CloudResult<Option<GrantRow>> {
+        Ok(self
+            .grants_for_user_and_store(user_rid, store_rid)
+            .await?
+            .into_iter()
+            .find(|g| g.root == root))
+    }
+
+    /// Every grant `user_rid` holds on `store_rid`: at most one whole-store
+    /// grant plus one per share. Filtered in this process rather than by the
+    /// query, since a `root` absent from an older row cannot be matched by a
+    /// scalar comparison at all (`.filter(.root == "")` skips it).
+    pub async fn grants_for_user_and_store(&self, user_rid: u64, store_rid: u64) -> CloudResult<Vec<GrantRow>> {
         let q = format!("Grant.filter(.user_rid == {user_rid} && .store_rid == {store_rid})");
-        self.one(&q).await?.map(|o| grant_from_object(&o)).transpose()
+        self.objects(&q).await?.iter().map(grant_from_object).collect()
     }
 
     pub async fn update_grant_role(&self, grant_rid: u64, role: &str) -> CloudResult<()> {
         self.objects(&format!("Grant.get({grant_rid}).update({{ role: {} }})", ql_str(role))).await?;
+        Ok(())
+    }
+
+    /// Renames the share this grant is of. A share has one name, so the
+    /// caller rewrites every grant and invitation of the same `(store, root)`
+    /// when the owner types a new one.
+    pub async fn update_grant_share_name(&self, grant_rid: u64, share_name: &str) -> CloudResult<()> {
+        self.objects(&format!("Grant.get({grant_rid}).update({{ share_name: {} }})", ql_str(share_name))).await?;
         Ok(())
     }
 
@@ -906,10 +1044,21 @@ impl RhypeDb {
 
     // ── Key grants (docs/CRYPTO_CONTRACT.md "Data model additions") ─────
 
-    pub async fn create_key_grant(&self, user_rid: u64, store_rid: u64, store_uuid: &str, key_id: &str, envelope_json: &str) -> CloudResult<KeyGrantRow> {
+    /// `scope_root` names which key this envelope carries: `""` for the store
+    /// key, a node id for that share's key.
+    pub async fn create_key_grant(
+        &self,
+        user_rid: u64,
+        store_rid: u64,
+        store_uuid: &str,
+        key_id: &str,
+        scope_root: &str,
+        envelope_json: &str,
+    ) -> CloudResult<KeyGrantRow> {
         let q = format!(
-            "KeyGrant.create({{ key_id: {kid}, envelope: {env}, user_rid: {uid}, store_rid: {sid}, store_uuid: {suuid} }})",
+            "KeyGrant.create({{ key_id: {kid}, scope_root: {scope}, envelope: {env}, user_rid: {uid}, store_rid: {sid}, store_uuid: {suuid} }})",
             kid = ql_str(key_id),
+            scope = ql_str(scope_root),
             env = ql_str(envelope_json),
             uid = user_rid,
             sid = store_rid,
@@ -932,16 +1081,36 @@ impl RhypeDb {
         Ok(())
     }
 
-    pub async fn find_key_grant(&self, user_rid: u64, store_rid: u64, key_id: &str) -> CloudResult<Option<KeyGrantRow>> {
-        let q = format!("KeyGrant.filter(.user_rid == {user_rid} && .store_rid == {store_rid} && .key_id == {})", ql_str(key_id));
-        self.one(&q).await?.map(|o| key_grant_from_object(&o)).transpose()
+    /// The envelope for exactly `(user, store, key_id, scope_root)` — the
+    /// uniqueness this service enforces itself.
+    pub async fn find_key_grant(&self, user_rid: u64, store_rid: u64, key_id: &str, scope_root: &str) -> CloudResult<Option<KeyGrantRow>> {
+        Ok(self
+            .key_grants_for_user_and_store(user_rid, store_rid)
+            .await?
+            .into_iter()
+            .find(|g| g.key_id == key_id && g.scope_root == scope_root))
     }
 
-    /// One user's own envelopes for one store — what `GET /stores/{id}/keys`
-    /// returns (the caller's, never another member's).
+    /// One user's own envelopes for one store, every scope — the caller's,
+    /// never another member's. [`Self::key_grants_for_user_store_and_root`]
+    /// is what an endpoint scoped to one share wants.
     pub async fn key_grants_for_user_and_store(&self, user_rid: u64, store_rid: u64) -> CloudResult<Vec<KeyGrantRow>> {
         let q = format!("KeyGrant.filter(.user_rid == {user_rid} && .store_rid == {store_rid})");
         self.objects(&q).await?.iter().map(key_grant_from_object).collect()
+    }
+
+    /// One user's envelopes for one scope of one store — what
+    /// `GET /stores/{id}/keys?root=` returns and what `has_key` reads.
+    /// Filtered in this process for the same reason
+    /// [`Self::grants_for_user_and_store`] is: an absent field matches no
+    /// scalar comparison.
+    pub async fn key_grants_for_user_store_and_root(&self, user_rid: u64, store_rid: u64, scope_root: &str) -> CloudResult<Vec<KeyGrantRow>> {
+        Ok(self
+            .key_grants_for_user_and_store(user_rid, store_rid)
+            .await?
+            .into_iter()
+            .filter(|g| g.scope_root == scope_root)
+            .collect())
     }
 
     /// Every key grant `user_rid` holds, across every store — used only by
@@ -963,12 +1132,13 @@ impl RhypeDb {
         self.objects(&q).await?.iter().map(key_grant_from_object).collect()
     }
 
-    /// Deletes one member's envelopes for one store — what removing them from
-    /// it does (docs/SHARING_CONTRACT.md: "also deletes that user's
-    /// `KeyGrant`s for the store"). They keep whatever they already
+    /// Deletes one member's envelopes for one scope of one store — what
+    /// removing them from that scope does. They keep whatever they already
     /// decrypted; this only stops the service handing them the key again.
-    pub async fn delete_key_grants_for_user_and_store(&self, user_rid: u64, store_rid: u64) -> CloudResult<()> {
-        for grant in self.key_grants_for_user_and_store(user_rid, store_rid).await? {
+    /// Scoped, not store-wide: losing a share must not take away the store
+    /// key of somebody who also holds a whole-store grant.
+    pub async fn delete_key_grants_for_user_store_and_root(&self, user_rid: u64, store_rid: u64, scope_root: &str) -> CloudResult<()> {
+        for grant in self.key_grants_for_user_store_and_root(user_rid, store_rid, scope_root).await? {
             self.delete_key_grant(grant.rid).await?;
         }
         Ok(())
@@ -984,16 +1154,31 @@ impl RhypeDb {
         Ok(())
     }
 
-    // ── Invitations (docs/SHARING_CONTRACT.md "Accounts service") ────────
+    // ── Invitations ────────────────────────────────────────────────────
 
-    pub async fn create_invitation(&self, store_rid: u64, store_uuid: &str, email: &str, role: &str, invited_by_rid: u64) -> CloudResult<InvitationRow> {
+    /// `root` is the scope invited to and `share_name` what the owner called
+    /// it; both are carried into the grant when the address is claimed. `""`
+    /// and `""` for the whole store.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_invitation(
+        &self,
+        store_rid: u64,
+        store_uuid: &str,
+        email: &str,
+        role: &str,
+        root: &str,
+        share_name: &str,
+        invited_by_rid: u64,
+    ) -> CloudResult<InvitationRow> {
         let q = format!(
-            "Invitation.create({{ store_rid: {sid}, store_uuid: {suuid}, email: {email}, email_lower: {email_lower}, role: {role}, invited_by_rid: {by}, created_at: {now} }})",
+            "Invitation.create({{ store_rid: {sid}, store_uuid: {suuid}, email: {email}, email_lower: {email_lower}, role: {role}, root: {root}, share_name: {share_name}, invited_by_rid: {by}, created_at: {now} }})",
             sid = store_rid,
             suuid = ql_str(store_uuid),
             email = ql_str(email),
             email_lower = ql_str(&email.trim().to_lowercase()),
             role = ql_str(role),
+            root = ql_str(root),
+            share_name = ql_str(share_name),
             by = invited_by_rid,
             now = now_literal(),
         );
@@ -1008,12 +1193,13 @@ impl RhypeDb {
         Ok(invitation)
     }
 
-    /// The invitation for one address on one store, if any — the
-    /// find-then-create/update half of the `(store, email_lower)` uniqueness
-    /// this service enforces itself.
-    pub async fn find_invitation(&self, store_rid: u64, email: &str) -> CloudResult<Option<InvitationRow>> {
+    /// The invitation for one address on one scope of one store, if any — the
+    /// find-then-create/update half of the `(store, email_lower, root)`
+    /// uniqueness this service enforces itself. Filtered in this process for
+    /// the same reason [`Self::grants_for_user_and_store`] is.
+    pub async fn find_invitation(&self, store_rid: u64, email: &str, root: &str) -> CloudResult<Option<InvitationRow>> {
         let q = format!("Invitation.filter(.store_rid == {store_rid} && .email_lower == {})", ql_str(&email.trim().to_lowercase()));
-        self.one(&q).await?.map(|o| invitation_from_object(&o)).transpose()
+        Ok(self.objects(&q).await?.iter().map(invitation_from_object).collect::<CloudResult<Vec<_>>>()?.into_iter().find(|i| i.root == root))
     }
 
     pub async fn invitations_for_store(&self, store_rid: u64) -> CloudResult<Vec<InvitationRow>> {
@@ -1030,6 +1216,14 @@ impl RhypeDb {
 
     pub async fn update_invitation_role(&self, invitation_rid: u64, role: &str) -> CloudResult<()> {
         self.objects(&format!("Invitation.get({invitation_rid}).update({{ role: {} }})", ql_str(role))).await?;
+        Ok(())
+    }
+
+    /// Renames the share this invitation is to — the counterpart of
+    /// [`Self::update_grant_share_name`], so that an address invited before
+    /// the owner renamed the share is told the new name when it claims.
+    pub async fn update_invitation_share_name(&self, invitation_rid: u64, share_name: &str) -> CloudResult<()> {
+        self.objects(&format!("Invitation.get({invitation_rid}).update({{ share_name: {} }})", ql_str(share_name))).await?;
         Ok(())
     }
 
