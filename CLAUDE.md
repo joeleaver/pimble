@@ -39,17 +39,20 @@ Pimble is an **offline-first personal information manager**:
   the tag, check the Release run and the download page (`docs/DEPLOY.md`, "A desktop
   release with every version").
 
-## Current design (2026-09-13)
+## Current design (2026-09-21, branch `node-document`)
 
-Both CRDT documents in Pimble are yrs. There is no Automerge anywhere in the stack and no
-legacy format to read: a store predating this design does not open, and the answer is to
-re-import from Scrivener.
+**Every node is one yrs document, and that is the only CRDT in a store.** There is no store
+document: the tree is the graph of node documents. Contract:
+`docs/NODE_DOCUMENT_CONTRACT.md`. There is no Automerge anywhere in the stack. A store from
+before node documents (`store.yrs` beside `nodes/`) is migrated when it opens, once and one
+way (`store.yrs` becomes `store.yrs.migrated`): back it up first, and move every device and
+the hosted server to this version together.
 
 | Crate | Purpose | Status |
 | --- | --- | --- |
 | `pimble-core` | Node, Store, Workspace, MountRef types | Complete |
-| `pimble-crdt` | `ContentDoc` (per-node content) and `StoreDocument` (tree + metadata), both yrs | Complete |
-| `pimble-store` | `LocalStore` (`store.yrs` + `nodes/{id}.yrs`), `StoreManager` | Complete |
+| `pimble-crdt` | `NodeDoc` (one node: content, fields, children, plugin data) and `Tree` (the documents of a store as a tree); `StoreDocument` survives only for the migration to read | Complete |
+| `pimble-store` | `LocalStore` (`nodes/{id}.yrs`, migration at open, partial replicas), vault stores (logs, snapshots, per-document keys, scope sets), `StoreManager` | Complete |
 | `pimble-rpc` / `pimble-server` / `pimble-client` | RPC protocol, embedded server, WebSocket client | Complete |
 | `pimble-search` | rhypedb index per store: keyword (`@fulltext`, BM25), chunked embeddings behind `semantic`, backlinks | Complete |
 | `pimble-plugins` | `NodePlugin` trait, built-ins | Skeleton |
@@ -60,13 +63,23 @@ re-import from Scrivener.
 | `pimble-crypto` | client-side cryptography: password-derived keys, account keys, envelopes, blobs | Complete |
 | `web/` (`pimble-web`) | the same UI built for the browser with trunk; its own cargo workspace; account pages and the vault client | Complete (phases 1 and 2a) |
 
-Node content is a yrs document (`pimble_crdt::ContentDoc`), stored as `nodes/{id}.yrs`.
-The server holds one `ContentDoc` per open node, merges every `applyEdit` update, relays
-the raw bytes to other subscribers, and flushes dirty content on a 750ms debounce and on
-stop. The store document (tree structure and node metadata) is a second yrs document per
-store, stored as `store.yrs`; `applyStoreUpdate` merges and relays it the same way.
-`syncNodeContent` and `syncStoreDocument` are both stateless: state vector in, diff plus
-server state vector out. `setNodeText` and `ServerSyncManager` do not exist.
+A node's document (`pimble_crdt::NodeDoc`, stored as `nodes/{id}.yrs`) has five roots:
+`content` and `meta` (rinch's rich text, untouched), `node` (type, title, `parent_id`,
+timestamps, `deleted_at`, tags, custom), `children` (the ordered child ids) and `data` (a
+plugin's JSON as nested yrs types). `pimble_crdt::Tree` holds a store's documents and makes
+every structural edit as per-document updates (`TreeEdit`): a move is three documents'
+updates, concurrent moves converge, and `Tree::repair` (deterministic, the same rules as
+the old store document's) fixes what concurrency can leave behind. Deleting is a tombstone
+(`deleted_at`) on the node and its subtree; `undeleteNode` takes it back.
+
+`applyEdit` carries an update of any part of a node's document and is the one way anything
+is written; the server merges it (`apply_node_update_from`), derives the notifications from
+what changed (`derive_kinds`: `ContentUpdated`, `NodeRenamed`, `NodeMoved`, ...), relays the
+raw bytes, runs repair 250 ms after a structural merge, and flushes dirty documents on a
+750 ms debounce and on stop. `syncNodes` is the one stateless reconcile (state vectors in,
+diffs and the server's vectors out, plus the ids the caller did not name).
+`syncStoreDocument`, `applyStoreUpdate`, `syncNodeContents`, `setNodeText` and
+`ServerSyncManager` do not exist.
 
 ### Search index
 
@@ -81,7 +94,7 @@ runs keyword-only). Measured on the 674-node family store after rhypedb #18: mod
 in about 4 s, peak 767 MB resident, UI responsive during the backfill. Content is chunked (about 200 words, block-aligned, heading context, per-chunk
 hash so an edit re-embeds one chunk) into `Chunk` objects with `all-MiniLM-L6-v2`
 embeddings. Chunking works over `IndexUnit`s (prose, heading, code, table row, field,
-other) produced by `ContentDoc::units()` or a plugin's `index_units`, so tables and
+other) produced by `NodeDoc::units()` or a plugin's `index_units`, so tables and
 structured node types can index later without redesign. Both fields use rhypedb's
 `english` analyzer (stemming), and the last typed word is searched as a prefix term so
 results update while typing (rhypedb #17).
@@ -136,16 +149,16 @@ forward it. A store opened implicitly (mount resolution, replica creation) gets 
 A local store can be a replica of the same store (same `StoreId`) on another Pimble
 server. One `SyncLink` per linked store lives in the local server
 (`pimble-server/src/sync_link.rs`), persisted as `<store>/sync.json` and restarted by
-`openStore`. It reconciles with the stateless primitives (`syncStoreDocument` /
-`syncNodeContents`: state vector in, diff out; then push back only what the remote lacks) and then
-shuttles live updates both ways: remote `storeChanged` notifications carry the yrs bytes
-(`TreeStructure` from `applyStoreUpdate`, `ContentUpdated` from `applyEdit`) and are
-applied through the handler's own `apply_edit`/`apply_store_update` with
+`openStore`. It reconciles with the stateless primitive (`syncNodes`: state vectors in,
+diffs out; then push back only what the remote lacks; both notification channels are open
+before the reconcile starts) and then shuttles live updates both ways: remote
+`storeChanged` notifications carry the yrs bytes of the node document that changed and are
+applied through the handler's own `apply_node_update_from` with
 `client_id = "sync-link:<uuid>"`; local notifications reach the link through an in-process
 broadcast and are forwarded unless their source is this link's own id, so an edit travels
 a whole chain of servers; a bounce back to a server that already has the change is a no-op
 merge there and sends nothing, which is what stops echo storms. `addRemoteStore` creates an empty replica
-(never `StoreDocument::new`: two roots for one id would merge into duplicated children) in
+(never a fresh root: two roots for one store would merge into a duplicated tree) in
 `<data dir>/pimble/replicas/<store id>.pimble` and links it; `setStoreSync` links or
 unlinks an existing store. A store already open on this server is refused as a replica, and
 a store cannot be linked to the server it lives on. `removeReplica` stops, closes and
@@ -154,7 +167,7 @@ Partial replication and TLS are not done. Contract:
 `docs/history/SYNC_CONTRACT.md`; CLI: `server --addr --open --token-file`, `token`,
 `add-remote-store`, `link-store`, `unlink-store`, `sync-state`, `remote-stores`,
 `remove-replica`, `mount-remote-store`, `move-node`, `delete-node`, `PIMBLE_SERVER`,
-`PIMBLE_TOKEN`. `set-node-text` is an `applyEdit` of `ContentDoc::replace_plain_text`
+`PIMBLE_TOKEN`. `set-node-text` is an `applyEdit` of `NodeDoc::replace_plain_text`
 (an edit of the node's existing document); `updateNodeContent` replaces the document
 wholesale and is only right for a node whose content was never written (the importer),
 since a replacement shares no history with the copies replicas hold and merges in beside
@@ -174,12 +187,14 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
   `sync.json` (always `auth: none`), never in an RPC response. Clients never connect to a
   remote: `listRemoteStores` goes through the local server.
 - **No-op updates change nothing.** A yrs diff is never empty (`[0, 0]` plus the whole delete
-  set), so `is_empty()` checks on diffs are always wrong. `ContentDoc`/`StoreDocument`
-  report whether a merge changed anything, and `diff_if_peer_lacks_it` decides whether a
-  reconcile pushes. A reconnect between synced servers sends no edits.
-- **Tree repair** (`StoreDocument::repair`, deterministic, surgical list edits) runs at open
-  and after every changing `applyStoreUpdate`; the result is broadcast as `TreeStructure`
-  with `source_client_id: None`. `validate_tree` reports exactly what repair fixes.
+  set), so `is_empty()` checks on diffs are always wrong. `NodeDoc::apply_update` reports
+  whether a merge changed anything (and what: structure, content, data), and
+  `diff_if_peer_lacks_it` decides whether a reconcile pushes. A reconnect between synced
+  servers sends no edits.
+- **Tree repair** (`Tree::repair`, deterministic, surgical list edits, per scope root on a
+  partial replica) runs at open and 250 ms after a structural merge; what it changed is
+  broadcast per document with `source_client_id: None`. `validate_tree` reports exactly
+  what repair fixes.
 - **Notifications name parents** (`NodeCreated`/`NodeDeleted { parent_id }`, `NodeMoved {
   old_parent_id, new_parent_id }`, `TreeStructure { node_ids }`); the app refetches only
   those lists. Deleting a node deletes its subtree; the root cannot be deleted.
@@ -200,7 +215,7 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
   and ordered lists, and the starter-kit marks (bold, italic, underline, strike, code, link,
   highlight, text colour, sub/superscript). Block quotes, tables, images and hard breaks in a
   collaborating document fail loudly by design. `pimble_crdt::Block` is that scope as data;
-  `ContentDoc::from_blocks` builds a document from it (the importer's way in).
+  `NodeDoc::from_blocks` builds a document from it (the importer's way in).
 
 ### Tree appearance (done 2026-09-15)
 
@@ -296,7 +311,7 @@ store-name question). Pimble Cloud holds ciphertext only.
   Ed25519 account keys wrapped under the password KEK and a recovery-code KEK; signed
   sealed-box `KeyEnvelope`s; the `PB` blob layout over XChaCha20-Poly1305 with
   `"{store_id}/{doc_id}"` as associated data; `verify_envelope` for servers.
-- **Vault stores** (`Store.kind = vault`): no StoreDocument, ContentDoc or index on the
+- **Vault stores** (`Store.kind = vault`): no node documents, tree or index on the
   server; per document an append-only log plus a snapshot under `<store>/vault/{doc}/`;
   RPCs `vaultAppend/Fetch/Snapshot/ListDocs` (reader/editor), `VaultAppended`
   notifications carry the blob; a snapshot deletes every log entry at or below its
@@ -327,7 +342,7 @@ store-name question). Pimble Cloud holds ciphertext only.
   `cloud-*` commands. The desktop sign-in UI is not built yet.
 - **Web app**: keys in memory only (a reload asks for the password to unlock); one
   `PimbleClient` per endpoint with per-store `rpc_url` and token ready for relayed shares;
-  the vault client holds a decrypted `StoreDocument` and per-node `ContentDoc`s in the
+  the vault client holds a decrypted `Tree` of `NodeDoc`s in the
   browser, answers tree and editor commands from them, encrypts outbound edits and
   searches client-side; it outlives its socket (replaced on every token refresh), so on
   every connect `catch_up` fetches what each held document missed and resends what a
@@ -340,10 +355,50 @@ store-name question). Pimble Cloud holds ciphertext only.
   the vault), a second tab decrypting and receiving edits live.
 - **Phase 2b, sharing**: a first cut (a share as a mirror store the owner's devices
   projected) was built on `cloud/phase-2b` and rejected on 2026-09-17 because recipients
-  could not co-author the tree. The design that replaces it is
-  `docs/NODE_DOCUMENT_CONTRACT.md` (branch `node-document`): one yrs document per node,
-  the tree as the graph of node documents, sharing as a scoped grant on the same documents,
-  the relay for unhosted stores.
+  could not co-author the tree. That branch is a record and is never merged. What replaced
+  it is the next section.
+
+### Sharing on node documents (built and verified locally 2026-09-21, not merged or deployed)
+
+Contract: `docs/NODE_DOCUMENT_CONTRACT.md` section 5. How to run it all on one machine:
+`scripts/local-stack/README.md`.
+
+- **A share is a scoped grant** `(user, store, root node, role)` on the owner's hosted
+  store; there is no second store and no copy. The token carries a role per shared root
+  (`stores: { S: { roots: { "<node>": "editor" } } }`; a whole-store grant stays
+  `"editor"`), which `pimble-server` reads as `Grant::{Whole, Scoped}`. A share has a name
+  of its own (the accounts service stores it); a member never learns the owner's name for
+  the store: the hosted server's `listStores` answers a scoped principal "Shared with you",
+  and a member's replica is named after the share ("Shared by <owner>" for several).
+- **Scope sets**: which documents a root reaches. A plain store computes them from its
+  tree; a vault store (ciphertext) keeps `<store>/scopes.json`, published by the owner's
+  devices (`setScope`) and extended by the server when a scoped member creates a document
+  naming a parent it may write. `Reach` in `handler.rs` is the one place scoped reads,
+  writes and notification delivery are judged.
+- **Keys**: every document has a data key, stored beside it wrapped under each scope key
+  that may read it (`WrappedDek`, `vaultSetDocKeys`, `VaultFetchResponse.keys`). A new
+  document's wraps ride its first `vaultAppend` and are stored with it under one lock.
+  Resolution order: the cached data key, the document's wraps opened with a held scope
+  key, then a scope key directly (blobs from before data keys). `ShareMarker` in
+  `custom["share"]` names a share's key on its root node.
+- **The owner's side** (`crates/pimble-server/src/share.rs`, riding the vault link's
+  task): wrap data keys as nodes enter a share, publish scope sets, hand each member the
+  share's key (a sweep at connect, every 60 s and after an invite). None of it is in the
+  path of anyone's edit: two members co-author the tree with every owner device off.
+- **A member's desktop** holds a partial replica (`manifest.scope_roots`, `Store.roots`,
+  `Store.shared_by`, `Store.access`, `sync.json`'s `read_only_roots`), repaired per scope
+  root. The link reads the grant at every connect (`refresh_grant`) and asks again every
+  two minutes (`grant_shape`); a changed role, another share or a removal makes it connect
+  again with a fresh token. A root the account no longer holds stays as it last was and
+  takes no edits. Refusals are whole sentences: "You can read this, not change it."
+  (`StoreAccess::READ_ONLY_REFUSAL`), "no grant for this document".
+- **Nothing is hosted as a side effect**: `cloudShareNode` on an unhosted store answers
+  "Sharing needs this store hosted on Pimble Cloud, or the relay, which is not built yet.
+  Nothing was uploaded." The relay (contract section 5b) is the next wave.
+- **Known limits**, all in the contract or `docs/NEXT_SESSION.md`: a scoped editor can move
+  a node out of the share by setting its `parent_id`; no data-key rotation when a node or
+  a member leaves; a removed member's connection lives until its token expires if their
+  client does not ask; the hosted manifest still holds the store's name in the clear.
 
 ### Desktop account UI (done 2026-09-16)
 
@@ -374,7 +429,10 @@ vault-link start), so a reopened replica no longer reports a placeholder root.
 - `docs/RESTART_PLAN.md` - vision, diagnosis, decisions, ordered plan
 - `docs/ARCHITECTURE.md` - the architecture, including mounts
 - `crates/pimble-core/src/node.rs` - Node, NodeId, NodeLink, MountRef
-- `crates/pimble-crdt/src/store_document.rs` - StoreDocument (tree + metadata CRDT)
+- `docs/NODE_DOCUMENT_CONTRACT.md` - node documents and sharing on them
+- `crates/pimble-crdt/src/node_doc.rs`, `tree.rs` - NodeDoc (one node's document) and Tree
+- `crates/pimble-server/src/share.rs`, `vault_link.rs` - the owner's side of a share; the encrypted link, keys, grants
+- `scripts/local-stack/` - the whole stack on one machine, and the sharing walk-through
 - `crates/pimble-store/src/local.rs` - LocalStore
 - `crates/pimble-rpc/src/methods.rs` - RPC API trait
 - `crates/pimble-server/src/handler.rs` - RPC method implementations
