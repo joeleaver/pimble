@@ -143,11 +143,15 @@ pub fn login_page() -> NodeHandle {
                     }
                 }
 
-                PasswordInput {
+                // A `TextInput` of type password, not rinch's `PasswordInput`:
+                // that one has no `onsubmit`, and Enter in the password field
+                // has to do what the button does (it did nothing, 2026-09-21).
+                TextInput {
                     label: "Password",
-                    toggle_visibility: false,
+                    input_type: "password",
                     value_fn: move || password.get(),
                     oninput: move |value: String| password.set(value),
+                    onsubmit: submit,
                 }
 
                 if !error.get().is_empty() {
