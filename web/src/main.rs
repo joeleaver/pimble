@@ -38,8 +38,14 @@ use wasm_bindgen::prelude::*;
 pub fn start() {
     console_error_panic_hook::set_once();
     // `pimble-app`, `pimble-client` and this crate log through `tracing`; this
-    // puts those lines in the browser console alongside everything else.
-    tracing_wasm::set_as_global_default();
+    // puts those lines in the browser console alongside everything else. At
+    // INFO: the default (everything) lets rinch's per-effect DEBUG lines
+    // through by the thousand, and the console keeps only the most recent
+    // few hundred messages, so the app's own warnings were gone before anyone
+    // could read them (found looking for one, 2026-09-21).
+    tracing_wasm::set_as_global_default_with_config(
+        tracing_wasm::WASMLayerConfigBuilder::new().set_max_level(tracing::Level::INFO).build(),
+    );
     let _ = console_log::init_with_level(log::Level::Info);
 
     shortcuts::install();
