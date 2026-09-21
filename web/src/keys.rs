@@ -49,7 +49,10 @@ impl KeyError {
 }
 
 /// Every scope key this account can open for one store: its own store key, or
-/// the key of each share of it this account holds, or both.
+/// the key of each share of it this account holds, or both. An account that
+/// holds the whole store holds both: the store key, and the key of every share
+/// in it, which the device that made a share sealed to its owner's own account
+/// too (`crate::vault`, "The shares in a whole store").
 #[derive(Default)]
 pub struct Keyring {
     /// Each key id this account holds, so a blob naming an old one still opens
@@ -82,15 +85,23 @@ impl Keyring {
         self.scopes.iter().rev().find(|(scope, _)| *scope == root).map(|(_, id)| *id)
     }
 
-    /// Take another scope's keys in. The first scope's `current` stands:
-    /// a whole-store keyring is fetched with no roots at all, and a scoped
-    /// one's first root is the store's first.
-    fn absorb(&mut self, other: Keyring) {
+    /// Take another scope's keys in, and say whether any of them is new here.
+    /// The first scope's `current` stands: a whole-store keyring is fetched
+    /// with no roots at all, and a scoped one's first root is the store's
+    /// first. So a share's key that an owner's page learns of later never
+    /// becomes the key a document with no data key is written under.
+    pub fn absorb(&mut self, other: Keyring) -> bool {
+        let new = other.keys.keys().any(|id| !self.keys.contains_key(id));
         self.keys.extend(other.keys);
-        self.scopes.extend(other.scopes);
+        for scope in other.scopes {
+            if !self.scopes.contains(&scope) {
+                self.scopes.push(scope);
+            }
+        }
         if self.current.is_none() {
             self.current = other.current;
         }
+        new
     }
 }
 
@@ -117,7 +128,9 @@ pub async fn fetch_scope_keyring(store_id: &str, roots: &[NodeId]) -> Result<Key
     let mut failure = None;
     for scope in scopes {
         match fetch_keyring(store_id, scope).await {
-            Ok(one) => keyring.absorb(one),
+            Ok(one) => {
+                keyring.absorb(one);
+            }
             Err(KeyError::NoneYet) => {}
             Err(KeyError::Failed(message)) => {
                 tracing::warn!("Fetching the keys of store {} scope {:?} failed: {}", store_id, scope, message);
@@ -316,12 +329,18 @@ mod tests {
         // store key for a whole store, the first share's for a member.
         let other_root = NodeId::new();
         let other = KeyId::new_v4();
-        keyring.absorb(Keyring {
-            keys: HashMap::from([(other, SymmetricKey::generate())]),
+        let other_key = SymmetricKey::generate();
+        let fetched = || Keyring {
+            keys: HashMap::from([(other, other_key.clone())]),
             current: Some(other),
             scopes: vec![(Some(other_root), other)],
-        });
+        };
+        assert!(keyring.absorb(fetched()), "a key this keyring did not hold");
         assert_eq!(keyring.current, Some(store_key));
         assert_eq!(keyring.key_id_for(Some(other_root)), Some(other));
+
+        // The same answer again brings nothing new and lists nothing twice.
+        assert!(!keyring.absorb(fetched()));
+        assert_eq!(keyring.scopes.len(), 3);
     }
 }

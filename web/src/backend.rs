@@ -214,7 +214,10 @@ async fn run(
 
         // 3c. Ask again for the key of a share whose owner had not handed it
         //     over yet. Every connection asks too (`open_listed` runs on each
-        //     one); this is what makes a tab left open notice on its own.
+        //     one); this is what makes a tab left open notice on its own. The
+        //     same retry serves an open store that is owed something: the key
+        //     of a share in a whole store, or the wraps of a document whose
+        //     blob would not open (`KeyLook` in `crate::vault`).
         for store_id in vault.key_retries_due() {
             let Some(client) = endpoints.client_for(store_id).filter(|c| c.is_connected()) else {
                 continue;

@@ -42,6 +42,20 @@
 //! server hands over wrapped under each scope key that may read it. A document
 //! this page creates gets a fresh data key wrapped under every scope key it
 //! holds that covers the node.
+//!
+//! **The shares in a whole store.** An account that holds the whole store holds
+//! the key of every share in it too, as its desktops do (`refresh_grant` in
+//! `crates/pimble-server/src/vault_link.rs`). A share's member wraps a new
+//! document's data key under the share's key and nothing else, and the store
+//! key's wrap is added later by one of the owner's desktops; a page holding
+//! only the store key could not read what members made while those were off
+//! (found 2026-09-21). The shares are the documents whose `node` root carries a
+//! share's marker, and the device that made a share sealed its key to the
+//! owner's own account, so `GET /stores/{id}/keys?root=<node>` answers it.
+//! Their keys are asked for at open, at every connect, and on the live path
+//! when a marker arrives or a blob will not open (see [`KeyLook`]). A member's
+//! page asks for its grants' keys and nothing else, as before, and no page
+//! wraps anybody else's data key: that upkeep stays the desktops'.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -86,8 +100,18 @@ const FETCH_WINDOW: usize = 32;
 /// How long before a share whose key has not arrived is asked for again. A
 /// fresh share waits on one of its owner's devices coming online, which is
 /// minutes rather than seconds; often enough to feel live, seldom enough to be
-/// nothing on a tab left open.
+/// nothing on a tab left open. An ask for the keys of the shares in a whole
+/// store that failed waits as long.
 const KEY_RETRY_MS: f64 = 30_000.0;
+
+/// How long a look for keys (see [`KeyLook`]) waits for whatever else is
+/// arriving: one peer's edit is several documents' updates, and one look
+/// answers for all of them.
+const KEY_LOOK_DEBOUNCE_MS: f64 = 250.0;
+
+/// The least time between two asks of the accounts service for the keys of one
+/// store's shares, however many markers and unopened blobs want them.
+const SHARE_KEY_FLOOR_MS: f64 = 10_000.0;
 
 /// What a store's name gains while its key has not reached this account: the
 /// row is listed, because the grant is real, and says why it will not open.
@@ -210,13 +234,21 @@ impl AccountStore {
         }
     }
 
-    /// The name to show: the share's for a store reached only through shares,
-    /// and `None` for a whole-store grant, whose name the server already
-    /// carries. Several shares of one store share a name per share, so the
-    /// first is as good an answer as the list has.
+    /// The name to show: the share's for a store reached through one share,
+    /// "Shared by <owner>" for one reached through several (each root under
+    /// it carries its own title), and `None` for a whole-store grant, whose
+    /// name the server already carries. The same words the desktop gives a
+    /// share's replica (`pimble_server::cloud::HeldAs::from_rows`), so one
+    /// person's two devices do not call one thing by two names.
     pub fn name(&self) -> Option<String> {
         if self.grants.iter().any(|g| g.root.is_none()) {
             return None;
+        }
+        if self.grants.len() > 1 {
+            return Some(match &self.shared_by {
+                Some(owner) => format!("Shared by {owner}"),
+                None => "Shared with you".to_string(),
+            });
         }
         self.grants.iter().find(|g| !g.name.is_empty()).map(|g| g.name.clone())
     }
@@ -271,6 +303,54 @@ struct VaultStore {
     /// When the debounced repair is due (the page's clock, ms), once a
     /// merged update has touched structure.
     repair_due: Option<f64>,
+    /// What this page is still owed to open what it holds of the store.
+    look: KeyLook,
+}
+
+/// What an open store is still owed from outside, and when to go and look.
+///
+/// Two things leave a document shut on the live path. A share's key this page
+/// does not hold: its marker arrived in an update, or a member's blob will not
+/// open under anything held. And a document's wraps: a `VaultAppended` carries
+/// the blob and not the keys, so the first blob of a document made elsewhere a
+/// moment ago names a data key whose wraps this page was never handed. One
+/// look answers both: ask the accounts service for the share keys that are
+/// missing, never more often than [`SHARE_KEY_FLOOR_MS`], then read again the
+/// documents that are owed (`VaultClient::look_for_keys`).
+///
+/// The backend loop drives it through the retry a waiting store already has
+/// ([`VaultClient::key_retries_due`], [`VaultClient::retry_key`]), and awaits
+/// each look, so a store never has two in flight.
+#[derive(Default)]
+struct KeyLook {
+    /// When the next look is due (the page's clock, ms); `None` when nothing
+    /// is wanted. Wanting one while one is due never makes it later, so a
+    /// burst of reasons is one look.
+    due: Option<f64>,
+    /// When the accounts service was last asked for this store's share keys.
+    asked_keys_at: Option<f64>,
+    /// Documents with a blob nothing here opened, and the key it named, to be
+    /// read again for their wraps.
+    unread: HashMap<NodeId, KeyId>,
+    /// What has been read again for that reason already: a document this page
+    /// cannot open is asked about once a connection and once per new scope
+    /// key, not once an append (the desktop link's `unresolved`).
+    asked: HashSet<(NodeId, KeyId)>,
+}
+
+impl KeyLook {
+    /// Want a look a debounce from `now`, or sooner when one is due sooner.
+    fn want(&mut self, now: f64) {
+        self.want_at(now + KEY_LOOK_DEBOUNCE_MS);
+    }
+
+    fn want_at(&mut self, at: f64) {
+        self.due = Some(self.due.map_or(at, |due| due.min(at)));
+    }
+
+    fn is_due(&self, now: f64) -> bool {
+        self.due.is_some_and(|due| due <= now)
+    }
 }
 
 /// One document's log as fetched and decrypted, in log order.
@@ -312,6 +392,9 @@ struct Merged {
     events: Vec<BackendEvent>,
     /// The `node` or `children` root changed: the tree may need a repair.
     structure: bool,
+    /// The merge put a share's marker on the node, or changed the key it
+    /// names, and this page holds the whole store and not that key.
+    wants_key: bool,
 }
 
 pub struct VaultClient {
@@ -534,17 +617,19 @@ impl VaultClient {
         )))
     }
 
-    /// The stores whose key is worth asking for again (see [`KEY_RETRY_MS`]).
+    /// The stores with keys worth asking for again: one still waiting for its
+    /// own (see [`KEY_RETRY_MS`]), and an open one whose look for a share's
+    /// key or a document's wraps has come due (see [`KeyLook`]).
     pub fn key_retries_due(&self) -> Vec<StoreId> {
         let now = now_ms();
-        self.waiting
-            .iter()
-            .filter(|(_, waiting)| waiting.due <= now)
-            .map(|(id, _)| *id)
-            .collect()
+        let waiting = self.waiting.iter().filter(|(_, waiting)| waiting.due <= now).map(|(id, _)| *id);
+        let looking = self.stores.iter().filter(|(_, store)| store.look.is_due(now)).map(|(id, _)| *id);
+        waiting.chain(looking).collect()
     }
 
-    /// Ask again for a waiting store's key and open it if it has arrived.
+    /// Ask again for a waiting store's key and open it if it has arrived; for
+    /// a store that is open, look for what it is still owed
+    /// ([`VaultClient::look_for_keys`]).
     ///
     /// The store is announced to the UI when it opens, since `StoresListed`
     /// has long since been and gone — and it is announced without the
@@ -555,6 +640,9 @@ impl VaultClient {
         store_id: StoreId,
         signal_ui: &Arc<dyn Fn() + Send + Sync>,
     ) -> Vec<BackendEvent> {
+        if self.stores.contains_key(&store_id) {
+            return self.look_for_keys(client, store_id).await;
+        }
         let Some(listed) = self.waiting.get(&store_id).map(|w| w.listed.clone()) else {
             return Vec::new();
         };
@@ -630,24 +718,27 @@ impl VaultClient {
             }
         }
 
-        let mut pulled = Vec::with_capacity(wanted.len());
+        let mut fetched_docs = Vec::with_capacity(wanted.len());
         for (node_id, fetched) in fetch_many(client, store_id, wanted).await {
             match fetched {
-                Ok(fetched) => {
-                    keys.note_wraps(node_id, fetched.keys.clone());
-                    pulled.push(Pulled {
-                        node_id,
-                        entries: keys.decrypt_entries(store_id, node_id, &fetched),
-                        head: fetched.head,
-                    });
-                }
+                Ok(fetched) => fetched_docs.push((node_id, fetched)),
                 // Left unheld: the next catch-up sees it listed and fetches
                 // it from the start.
                 Err(message) => tracing::warn!("Fetching the document {} failed: {}", node_id, message),
             }
         }
 
-        let mut vault_store = VaultStore::assemble(store.clone(), keys, scope_roots, pulled);
+        let (mut vault_store, shut) = VaultStore::from_fetched(store.clone(), keys, scope_roots, fetched_docs);
+        // The shares in a whole store: what the first pass opened says which
+        // nodes are shared, and their keys open what members made that no
+        // desktop of the owner's has wrapped under the store key yet. Before
+        // the repair, so it judges the tree with those documents in it.
+        if fetch_share_keys(store_id, &mut vault_store).await {
+            let now = now_ms();
+            for (node_id, fetched) in &shut {
+                vault_store.take_fetched(store_id, *node_id, fetched, false, now);
+            }
+        }
         // Once, after the whole pull, never between the updates of one edit.
         let repair = vault_store.repair_now(&now_rfc3339());
         self.stores.insert(store_id, vault_store);
@@ -676,9 +767,19 @@ impl VaultClient {
         let mut events = Vec::new();
         let store_ids: Vec<StoreId> = self.stores.keys().copied().collect();
         for store_id in store_ids {
+            // The shares in a whole store first, so what is read below opens.
+            // A new connection may also ask again about every document it
+            // could not open, and the pull below reads each of them anyway.
+            if let Some(store) = self.stores.get_mut(&store_id) {
+                store.look.unread.clear();
+                store.look.asked.clear();
+                fetch_share_keys(store_id, store).await;
+            }
+
             // Down: every document the server lists, from where this page
             // stopped reading it, or from the start for one it never held (a
-            // node created elsewhere while the socket was down).
+            // node created elsewhere while the socket was down) or could not
+            // open.
             let listed = match client.vault_list_docs(store_id).await {
                 Ok(listed) => listed,
                 Err(e) => {
@@ -706,20 +807,8 @@ impl VaultClient {
                 }
                 wanted
             };
-            let fetched = fetch_many(client, store_id, wanted).await;
-
-            let mut structure = false;
-            for (node_id, fetched) in fetched {
-                let Ok(fetched) = fetched else { continue };
-                let active = self.active == Some((store_id, node_id));
-                let Some(store) = self.stores.get_mut(&store_id) else { continue };
-                store.keys.note_wraps(node_id, fetched.keys.clone());
-                let entries = store.keys.decrypt_entries(store_id, node_id, &fetched);
-                let merged = store.merge(store_id, node_id, entries, active, None);
-                store.heads.insert(node_id, fetched.head);
-                structure |= merged.structure;
-                events.extend(merged.events);
-            }
+            let (pulled, structure) = self.pull(client, store_id, wanted).await;
+            events.extend(pulled);
 
             // A pull is applied whole, then judged once: as at open, and as
             // the desktop's vault link does after its reconnect pull.
@@ -741,6 +830,60 @@ impl VaultClient {
                 if let Err(e) = self.resend(client, store_id, node_id).await {
                     tracing::warn!("Resending the document {} failed: {}", node_id, e);
                 }
+            }
+        }
+        events
+    }
+
+    /// Fetch documents from where this page stopped reading each, and merge
+    /// what comes: the events the UI should see, and whether any of it
+    /// touched structure.
+    async fn pull(
+        &mut self,
+        client: &Arc<PimbleClient>,
+        store_id: StoreId,
+        wanted: Vec<(NodeId, u64)>,
+    ) -> (Vec<BackendEvent>, bool) {
+        let mut events = Vec::new();
+        let mut structure = false;
+        let fetched = fetch_many(client, store_id, wanted).await;
+        let now = now_ms();
+        for (node_id, fetched) in fetched {
+            let Ok(fetched) = fetched else { continue };
+            let active = self.active == Some((store_id, node_id));
+            let Some(store) = self.stores.get_mut(&store_id) else { continue };
+            let merged = store.take_fetched(store_id, node_id, &fetched, active, now);
+            structure |= merged.structure;
+            events.extend(merged.events);
+        }
+        (events, structure)
+    }
+
+    // ── What an open store is still owed ────────────────────────────────────
+
+    /// One look for an open store (see [`KeyLook`]): the keys of the shares in
+    /// it this page has seen a marker of and holds no key for, then the
+    /// documents worth reading again: every one not read through when a key
+    /// came, and otherwise the ones whose wraps this page never had.
+    ///
+    /// What opens reaches the UI as it would from a notification: the kinds a
+    /// merge derives, and a repair once the updates have stopped.
+    async fn look_for_keys(&mut self, client: &Arc<PimbleClient>, store_id: StoreId) -> Vec<BackendEvent> {
+        let wanted = {
+            let Some(store) = self.stores.get_mut(&store_id) else { return Vec::new() };
+            store.look.due = None;
+            let new_key = fetch_share_keys(store_id, store).await;
+            store.reread_list(new_key)
+        };
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        tracing::debug!("Store {}: reading {} documents again", store_id, wanted.len());
+        let (mut events, structure) = self.pull(client, store_id, wanted).await;
+        if structure {
+            if let Some(store) = self.stores.get_mut(&store_id) {
+                store.repair_due = Some(now_ms() + REPAIR_DEBOUNCE_MS);
+                events.extend(store.adopt_root().map(|store| BackendEvent::StoreOpened { store }));
             }
         }
         events
@@ -807,14 +950,7 @@ impl VaultClient {
             return Vec::new();
         }
 
-        let update = store.keys.decrypt_blob(store_id, node_id, blob);
-        // An unknown key id is not fatal: a rotation this device has not been
-        // granted yet, or a document whose wraps have not been fetched, looks
-        // exactly like this. The cursor stops in front of the entry, so a
-        // later snapshot cannot vouch for it.
-        let merged = store.merge(store_id, node_id, vec![(Mark::One(seq), update)], active, source_client_id);
-        let head = store.heads.entry(node_id).or_insert(0);
-        *head = (*head).max(seq);
+        let merged = store.take_blob(store_id, node_id, seq, blob, active, source_client_id, now_ms());
 
         let mut events = merged.events;
         if merged.structure {
@@ -1316,10 +1452,7 @@ impl VaultClient {
                 }];
             }
         };
-        store.keys.note_wraps(node_id, fetched.keys.clone());
-        let entries = store.keys.decrypt_entries(store_id, node_id, &fetched);
-        let merged = store.merge(store_id, node_id, entries, active, None);
-        store.heads.insert(node_id, fetched.head);
+        let merged = store.take_fetched(store_id, node_id, &fetched, active, now_ms());
         if merged.structure {
             store.repair_due = Some(now_ms() + REPAIR_DEBOUNCE_MS);
         }
@@ -1475,6 +1608,34 @@ impl VaultClient {
 // on their own.
 
 impl VaultStore {
+    /// A store from what `vaultFetch` answered for each of its documents: take
+    /// each document's wraps, decrypt its log, [`assemble`](Self::assemble).
+    ///
+    /// Also answers the documents with a blob nothing held opened, as they
+    /// were fetched: a key that arrives a moment later (the key of a share in
+    /// a whole store, see [`fetch_share_keys`]) opens them through
+    /// [`VaultStore::take_fetched`] with no second round trip.
+    fn from_fetched(
+        listed: Store,
+        mut keys: StoreKeys,
+        scope_roots: Vec<NodeId>,
+        fetched: Vec<(NodeId, VaultFetchResponse)>,
+    ) -> (Self, Vec<(NodeId, VaultFetchResponse)>) {
+        let store_id = listed.id;
+        let mut pulled = Vec::with_capacity(fetched.len());
+        let mut shut = Vec::new();
+        for (node_id, fetched) in fetched {
+            keys.note_wraps(node_id, fetched.keys.clone());
+            let entries = keys.decrypt_entries(store_id, node_id, &fetched);
+            let head = fetched.head;
+            if entries.iter().any(|(_, opened)| opened.is_err()) {
+                shut.push((node_id, fetched));
+            }
+            pulled.push(Pulled { node_id, entries, head });
+        }
+        (Self::assemble(listed, keys, scope_roots, pulled), shut)
+    }
+
     /// A store from what its logs held: every decrypted entry, per document
     /// in log order. Picks the root, builds the tree, records each
     /// document's cursor. Nothing is repaired here; the caller runs
@@ -1514,7 +1675,7 @@ impl VaultStore {
                 tree = rerooted(tree, root);
             }
         }
-        Self { listed, keys, scope_roots, tree, docs, heads, repair_due: None }
+        Self { listed, keys, scope_roots, tree, docs, heads, repair_due: None, look: KeyLook::default() }
     }
 
     /// Whether this page holds only a scope of the store: a share's recipient.
@@ -1544,6 +1705,7 @@ impl VaultStore {
         source: Option<String>,
     ) -> Merged {
         let before = shape_of(&self.tree, node_id);
+        let marker_before = before.as_ref().and_then(DocShape::share_key_id);
         let mut effect = NodeUpdateEffect::default();
         let mut content_updates = Vec::new();
         for (mark, update) in entries {
@@ -1571,10 +1733,16 @@ impl VaultStore {
             }
         }
         if !effect.changed {
-            return Merged { events: Vec::new(), structure: false };
+            return Merged { events: Vec::new(), structure: false, wants_key: false };
         }
 
         let after = shape_of(&self.tree, node_id);
+        // A share made, or made again under another key, while this page was
+        // looking: a whole store's page is owed its key (see [`KeyLook`]).
+        let marker_after = after.as_ref().and_then(DocShape::share_key_id);
+        let wants_key = !self.is_partial()
+            && marker_after != marker_before
+            && marker_after.is_some_and(|key_id| self.keys.scope.get(&key_id).is_none());
         let mut events = Vec::new();
         for kind in derive_kinds(node_id, self.tree.root(), before.as_ref(), after.as_ref(), effect) {
             match kind {
@@ -1595,7 +1763,171 @@ impl VaultStore {
                 }),
             }
         }
-        Merged { events, structure: effect.structure }
+        Merged { events, structure: effect.structure, wants_key }
+    }
+
+    /// Take one document's `vaultFetch` answer: its wraps, then its log
+    /// decrypted and merged, then its head. A marker it brought whose key
+    /// this page lacks wants a look.
+    fn take_fetched(
+        &mut self,
+        store_id: StoreId,
+        node_id: NodeId,
+        fetched: &VaultFetchResponse,
+        active: bool,
+        now: f64,
+    ) -> Merged {
+        self.keys.note_wraps(node_id, fetched.keys.clone());
+        let entries = self.keys.decrypt_entries(store_id, node_id, fetched);
+        let merged = self.merge(store_id, node_id, entries, active, None);
+        self.heads.insert(node_id, fetched.head);
+        if merged.wants_key {
+            self.look.want(now);
+        }
+        merged
+    }
+
+    /// Take one blob from the live path: decrypt, merge, note the head.
+    ///
+    /// An unknown key id is not fatal: a rotation this device has not been
+    /// granted yet, a document whose wraps have not been fetched, or a
+    /// member's document under a share whose key is not here yet looks
+    /// exactly like this. The cursor stops in front of the entry, so a later
+    /// snapshot cannot vouch for it, and a look is wanted for what would open
+    /// it (see [`KeyLook`]).
+    #[allow(clippy::too_many_arguments)]
+    fn take_blob(
+        &mut self,
+        store_id: StoreId,
+        node_id: NodeId,
+        seq: u64,
+        blob: &str,
+        active: bool,
+        source: Option<String>,
+        now: f64,
+    ) -> Merged {
+        let update = self.keys.decrypt_blob(store_id, node_id, blob);
+        let unopened = match &update {
+            Ok(_) => None,
+            Err(_) => self.keys.key_wanted(store_id, node_id, blob),
+        };
+        let merged = self.merge(store_id, node_id, vec![(Mark::One(seq), update)], active, source);
+        let head = self.heads.entry(node_id).or_insert(0);
+        *head = (*head).max(seq);
+        if merged.wants_key {
+            self.look.want(now);
+        }
+        if let Some(key_id) = unopened {
+            self.note_unopened(node_id, key_id, now);
+        }
+        merged
+    }
+
+    /// A blob of `node_id` named `key_id` and nothing here opened it.
+    ///
+    /// The first time, the document is worth reading again: a fetch answers
+    /// with its wraps, which a notification never carries. After that only a
+    /// scope key can help, which is worth a look while a share in this store
+    /// still has none here; the floor on those asks is the look's.
+    fn note_unopened(&mut self, node_id: NodeId, key_id: KeyId, now: f64) {
+        if !self.look.asked.contains(&(node_id, key_id)) {
+            self.look.unread.insert(node_id, key_id);
+            self.look.want(now);
+        } else if self.look.due.is_none() && !self.missing_share_roots().is_empty() {
+            self.look.want(now);
+        }
+    }
+
+    // ── The shares in a whole store ─────────────────────────────────────────
+
+    /// The shared nodes whose key this page does not hold: every document it
+    /// holds of a whole store whose `node` root carries a share's marker
+    /// naming a key that is not in the keyring. Tombstones too: a deleted
+    /// folder's share may still be the only thing a member's document is
+    /// wrapped under. Nothing for a member's page, which holds its grants'
+    /// keys and is owed no others.
+    fn missing_share_roots(&self) -> Vec<NodeId> {
+        if self.is_partial() {
+            return Vec::new();
+        }
+        let mut roots: Vec<NodeId> = self
+            .tree
+            .ids()
+            .into_iter()
+            .filter(|id| {
+                self.tree
+                    .doc(*id)
+                    .and_then(|doc| doc.fields().ok())
+                    .and_then(|fields| share_marker_of(&fields))
+                    .is_some_and(|marker| self.keys.scope.get(&marker.key_id).is_none())
+            })
+            .collect();
+        roots.sort_by_key(|id| id.to_string());
+        roots
+    }
+
+    /// The shared roots to ask the accounts service about now, or `None`:
+    /// nothing is missing, or the last ask was under [`SHARE_KEY_FLOOR_MS`]
+    /// ago, in which case the look is put off until the floor has passed.
+    /// Answering `Some` records the ask.
+    fn share_keys_to_ask_for(&mut self, now: f64) -> Option<Vec<NodeId>> {
+        let missing = self.missing_share_roots();
+        if missing.is_empty() {
+            return None;
+        }
+        if let Some(asked_at) = self.look.asked_keys_at {
+            if now - asked_at < SHARE_KEY_FLOOR_MS {
+                self.look.want_at(asked_at + SHARE_KEY_FLOOR_MS);
+                return None;
+            }
+        }
+        self.look.asked_keys_at = Some(now);
+        Some(missing)
+    }
+
+    /// Take more scope keys into the keyring; whether any of them is new. A
+    /// new key may open what has been asked about before, so that is
+    /// forgotten.
+    fn take_keys(&mut self, more: Keyring) -> bool {
+        let new = self.keys.scope.absorb(more);
+        if new {
+            self.look.asked.clear();
+        }
+        new
+    }
+
+    /// How far `node_id`'s log has been read without a gap.
+    fn read_through(&self, node_id: NodeId) -> u64 {
+        self.docs.get(&node_id).map(|doc| doc.cursor.applied_through()).unwrap_or(0)
+    }
+
+    /// The documents the server is known to hold more of than this page has
+    /// read, with where to read each from: listed and never opened, or held
+    /// with a blob nothing here opened.
+    fn behind(&self) -> Vec<(NodeId, u64)> {
+        let mut behind: Vec<(NodeId, u64)> = self
+            .heads
+            .iter()
+            .map(|(id, head)| (*id, *head, self.read_through(*id)))
+            .filter(|(_, head, from)| head > from)
+            .map(|(id, _, from)| (id, from))
+            .collect();
+        behind.sort_by_key(|(id, _)| id.to_string());
+        behind
+    }
+
+    /// What a look reads again: everything [`behind`](Self::behind) when a
+    /// scope key has just arrived, and otherwise the documents whose wraps
+    /// this page never had. Either way those are now asked about.
+    fn reread_list(&mut self, new_key: bool) -> Vec<(NodeId, u64)> {
+        let unread = std::mem::take(&mut self.look.unread);
+        self.look.asked.extend(unread.iter().map(|(id, key_id)| (*id, *key_id)));
+        if new_key {
+            return self.behind();
+        }
+        let mut wanted: Vec<(NodeId, u64)> = unread.into_keys().map(|id| (id, self.read_through(id))).collect();
+        wanted.sort_by_key(|(id, _)| id.to_string());
+        wanted
     }
 
     /// Repair the tree if it needs it (`Tree::repair`): what it wrote, to be
@@ -1881,11 +2213,7 @@ impl VaultStore {
         let mut cur = Some(node_id);
         for _ in 0..=self.tree.ids().len() {
             let Some(fields) = cur.and_then(|id| self.tree.doc(id)).and_then(|doc| doc.fields().ok()) else { break };
-            if let Some(marker) = fields
-                .custom
-                .get(custom_keys::SHARE)
-                .and_then(|v| serde_json::from_value::<pimble_core::ShareMarker>(v.clone()).ok())
-            {
+            if let Some(marker) = share_marker_of(&fields) {
                 ids.push(marker.key_id);
             }
             cur = fields.parent_id;
@@ -1944,6 +2272,8 @@ impl VaultStore {
         self.docs.remove(&node_id);
         self.heads.remove(&node_id);
         self.keys.forget(node_id);
+        self.look.unread.remove(&node_id);
+        self.look.asked.retain(|(id, _)| *id != node_id);
     }
 
     /// The document's whole state, encrypted, for a snapshot. Under the same
@@ -1956,6 +2286,48 @@ impl VaultStore {
             .ok_or_else(|| format!("no key for the document {node_id} on this device"))?;
         let aad = blob_aad(&store_id.to_string(), &VaultDocId::Node(node_id).as_str());
         Ok(URL_SAFE_NO_PAD.encode(Blob::encrypt(&key, key_id, &aad, &full)))
+    }
+}
+
+/// The share's marker a node carries, when it is a share's root
+/// (`pimble_core::NodeMetadata::share`, read from a document's fields).
+fn share_marker_of(fields: &NodeFields) -> Option<pimble_core::ShareMarker> {
+    fields
+        .custom
+        .get(custom_keys::SHARE)
+        .and_then(|value| serde_json::from_value::<pimble_core::ShareMarker>(value.clone()).ok())
+}
+
+/// Ask the accounts service for the keys of the shares in a whole store that
+/// this page has seen a marker of and holds no key for, and take what comes
+/// into the keyring. Whether a key came that was not held.
+///
+/// `GET /stores/{id}/keys?root=<node>` answers the caller's own envelopes for
+/// that root, and a whole-store grant may ask about any root. An owner has
+/// one for every share: the device that made the share sealed its key to the
+/// owner's own account before it wrote the marker. Nothing there
+/// ([`KeyError::NoneYet`]) is normal for anyone else who holds the whole store
+/// and is quiet; a request that failed is asked again like a waiting store's.
+///
+/// Never for a member's page, and never more often than
+/// [`SHARE_KEY_FLOOR_MS`] per store: [`VaultStore::share_keys_to_ask_for`].
+async fn fetch_share_keys(store_id: StoreId, store: &mut VaultStore) -> bool {
+    let now = now_ms();
+    let Some(roots) = store.share_keys_to_ask_for(now) else { return false };
+    match keys::fetch_scope_keyring(&store_id.to_string(), &roots).await {
+        Ok(more) => {
+            let new = store.take_keys(more);
+            if new {
+                tracing::info!("Store {}: holding the key of a share in it that was not held", store_id);
+            }
+            new
+        }
+        Err(KeyError::NoneYet) => false,
+        Err(KeyError::Failed(message)) => {
+            tracing::warn!("Asking for the keys of the shares in {} failed: {}", store_id, message);
+            store.look.want_at(now + KEY_RETRY_MS);
+            false
+        }
     }
 }
 
@@ -2131,6 +2503,14 @@ impl StoreKeys {
         Some((dek_id, dek, keys))
     }
 
+    /// The key a blob names, when nothing here yields it: what told a blob
+    /// that will not open for want of a key from one that is simply bad.
+    fn key_wanted(&mut self, store_id: StoreId, node_id: NodeId, encoded: &str) -> Option<KeyId> {
+        let blob = decode_blob(encoded).ok()?;
+        let key_id = Blob::key_id(&blob).ok()?;
+        self.blob_key(store_id, node_id, key_id).is_none().then_some(key_id)
+    }
+
     /// Open one blob of one document.
     fn decrypt_blob(&mut self, store_id: StoreId, node_id: NodeId, encoded: &str) -> Result<Vec<u8>, String> {
         let blob = decode_blob(encoded)?;
@@ -2240,6 +2620,13 @@ fn rerooted(mut tree: Tree, root: NodeId) -> Tree {
 struct DocShape {
     fields: Option<NodeFields>,
     children: Vec<NodeId>,
+}
+
+impl DocShape {
+    /// The key the node's share marker names, when it carries one.
+    fn share_key_id(&self) -> Option<KeyId> {
+        self.fields.as_ref().and_then(share_marker_of).map(|marker| marker.key_id)
+    }
 }
 
 /// The shape of `id`'s document, `None` when the tree holds none.
@@ -3047,7 +3434,7 @@ mod tests {
         let mixed = row(vec![grant(Some(a), "reader", "Recipes"), grant(Some(b), "editor", "Plans")], Some("ann@example.com"));
         assert_eq!(mixed.access(), StoreAccess::Full);
         assert_eq!(mixed.roots(), vec![a, b], "both shares are roots of the same store");
-        assert_eq!(mixed.name().as_deref(), Some("Recipes"));
+        assert_eq!(mixed.name().as_deref(), Some("Shared by ann@example.com"), "several shares: the desktop's words, not the first share's name");
 
         // A whole-store grant beside a share covers everything, so the shares
         // stop being scopes at all.
@@ -3180,15 +3567,16 @@ mod tests {
             .collect()
     }
 
-    /// A share's marker on `node`, naming `key_id` as the share key.
-    fn mark_shared(tree: &mut Tree, node: NodeId, key_id: KeyId, name: &str) {
+    /// A share's marker on `node`, naming `key_id` as the share key: the edit
+    /// that wrote it, for a test that plays it to another page.
+    fn mark_shared(tree: &mut Tree, node: NodeId, key_id: KeyId, name: &str) -> TreeEdit {
         let marker = pimble_core::ShareMarker {
             v: pimble_core::ShareMarker::VERSION,
             key_id,
             url: "https://pimble.app".to_string(),
             name: name.to_string(),
         };
-        tree.set_custom(node, custom_keys::SHARE, &serde_json::to_value(&marker).unwrap(), T1).unwrap();
+        tree.set_custom(node, custom_keys::SHARE, &serde_json::to_value(&marker).unwrap(), T1).unwrap()
     }
 
     #[test]
@@ -3283,6 +3671,303 @@ mod tests {
         let edit = store.tree.add_node(outside, Some(root), None, "document", "Notes", T1).unwrap();
         let outgoing = store.prepare(store_id, outside, &edit.touched[0].1).unwrap();
         let (keys, _) = outgoing.created.as_ref().expect("new to the server");
+        assert_eq!(keys.wraps.iter().map(|w| w.scope_key_id).collect::<Vec<_>>(), vec![store_key_id]);
+    }
+
+    // ── The shares in a whole store ─────────────────────────────────────────
+
+    /// A scope key with its id, as the accounts service hands one over.
+    fn scope_key() -> (KeyId, SymmetricKey) {
+        (KeyId::new_v4(), SymmetricKey::generate())
+    }
+
+    /// The keyring a fetch of one share's key answers with.
+    fn share_keyring(root: NodeId, key_id: KeyId, key: &SymmetricKey) -> Keyring {
+        Keyring { keys: HashMap::from([(key_id, key.clone())]), current: Some(key_id), scopes: vec![(Some(root), key_id)] }
+    }
+
+    fn blob_under(store_id: StoreId, node_id: NodeId, dek_id: KeyId, dek: &SymmetricKey, payload: &[u8]) -> String {
+        let aad = blob_aad(&store_id.to_string(), &VaultDocId::Node(node_id).as_str());
+        URL_SAFE_NO_PAD.encode(Blob::encrypt(dek, dek_id, &aad, payload))
+    }
+
+    /// What `vaultFetch` answers for a document whose log is `payloads`, one
+    /// entry each from seq 1, under a fresh data key wrapped under each of
+    /// `under`; and that data key, for the blobs a test appends later.
+    fn fetched_under(
+        store_id: StoreId,
+        node_id: NodeId,
+        payloads: &[Vec<u8>],
+        under: &[(KeyId, &SymmetricKey)],
+    ) -> (VaultFetchResponse, (KeyId, SymmetricKey)) {
+        let (dek_id, dek) = scope_key();
+        let aad = dek_aad_of(store_id, node_id);
+        let wraps = under.iter().map(|(id, key)| wrap_dek(&dek, key, *id, &aad)).collect();
+        let updates: Vec<pimble_rpc::VaultEntry> = payloads
+            .iter()
+            .enumerate()
+            .map(|(i, payload)| pimble_rpc::VaultEntry {
+                seq: i as u64 + 1,
+                blob: blob_under(store_id, node_id, dek_id, &dek, payload),
+            })
+            .collect();
+        let head = updates.len() as u64;
+        (VaultFetchResponse { snapshot: None, updates, head, keys: Some(VaultDocKeys { dek_id, wraps }) }, (dek_id, dek))
+    }
+
+    /// An owner's page as `open_store` builds it, holding the store key only:
+    /// every document of `tree` but `members_docs` is wrapped under the store
+    /// key, and those under `share` alone, as a share's member makes them
+    /// while no desktop of the owner's is on to add the store key's wrap.
+    /// Answers the store, what the open could not open, and each document's
+    /// data key.
+    #[allow(clippy::type_complexity)]
+    fn owners_page(
+        store_id: StoreId,
+        tree: &Tree,
+        members_docs: &[NodeId],
+        share: (KeyId, &SymmetricKey),
+    ) -> (VaultStore, Vec<(NodeId, VaultFetchResponse)>, HashMap<NodeId, (KeyId, SymmetricKey)>, KeyId) {
+        let scope = keyring_for(None);
+        let store_key_id = scope.current.unwrap();
+        let store_key = scope.current_key().unwrap().clone();
+        let mut deks = HashMap::new();
+        let mut ids = tree.ids();
+        ids.sort_by_key(|id| id.to_string());
+        let fetched = ids
+            .into_iter()
+            .map(|id| {
+                let under = if members_docs.contains(&id) { share } else { (store_key_id, &store_key) };
+                let (fetched, dek) = fetched_under(store_id, id, &[tree.doc(id).unwrap().save()], &[under]);
+                deks.insert(id, dek);
+                (id, fetched)
+            })
+            .collect();
+        let mut listed = listed(tree.root());
+        listed.id = store_id;
+        let (store, shut) = VaultStore::from_fetched(listed, StoreKeys::new(scope), Vec::new(), fetched);
+        (store, shut, deks, store_key_id)
+    }
+
+    #[test]
+    fn an_owner_s_page_reads_what_a_member_made_once_it_holds_the_share_s_key() {
+        let (mut peer, root) = origin();
+        let (folder, bread, soup) = (NodeId::new(), NodeId::new(), NodeId::new());
+        peer.add_node(folder, Some(root), None, "folder", "Recipes", T0).unwrap();
+        peer.add_node(bread, Some(folder), None, "document", "Bread", T0).unwrap();
+        let (share_key_id, share_key) = scope_key();
+        mark_shared(&mut peer, folder, share_key_id, "Recipes");
+        // A member's note, made while every desktop of the owner's was off:
+        // its data key is wrapped under the share's key and nothing else.
+        peer.add_node(soup, Some(folder), None, "document", "Soup", T1).unwrap();
+
+        let store_id = StoreId::new();
+        let (mut store, shut, _, store_key_id) = owners_page(store_id, &peer, &[soup], (share_key_id, &share_key));
+
+        // With the store key alone the note stays shut: not a node here, not
+        // shown, and nothing about it is "repaired". The folder goes on
+        // listing it, as every device that can read it needs it to.
+        assert_eq!(shut.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![soup]);
+        assert!(!store.tree.has_node(soup));
+        assert!(store.node_of(soup).is_err());
+        assert_eq!(store.children_of(folder).unwrap(), vec![bread]);
+        assert!(store.repair_now(T2).is_none(), "a document not held is unknown, not missing");
+        assert_eq!(store.tree.doc(folder).unwrap().children(), vec![bread, soup], "the list is untouched");
+        assert_eq!(store.behind(), vec![(soup, 0)], "listed, and nothing of it read");
+
+        // What the open does next: the folder carries a share's marker whose
+        // key is not held, so that root is asked about.
+        assert_eq!(store.missing_share_roots(), vec![folder]);
+        assert_eq!(store.share_keys_to_ask_for(0.0), Some(vec![folder]));
+
+        // The key arrives, the note opens from what was already fetched, and
+        // it shows under its parent.
+        assert!(store.take_keys(share_keyring(folder, share_key_id, &share_key)));
+        assert!(!store.take_keys(share_keyring(folder, share_key_id, &share_key)), "the same key again is not news");
+        let (_, fetched) = &shut[0];
+        let merged = store.take_fetched(store_id, soup, fetched, false, 0.0);
+        assert!(
+            matches!(kinds_of(&merged.events)[..], [StoreChangeKind::NodeCreated { node_id, parent_id }] if node_id == soup && parent_id == folder),
+            "{:?}",
+            merged.events
+        );
+        assert_eq!(store.children_of(folder).unwrap(), vec![bread, soup]);
+        assert_eq!(store.node_of(soup).unwrap().metadata.title, "Soup");
+        assert!(store.behind().is_empty());
+        assert!(store.missing_share_roots().is_empty());
+        assert!(store.share_keys_to_ask_for(60_000.0).is_none(), "nothing left to ask for");
+        assert!(store.repair_now(T2).is_none());
+        assert_eq!(store.keys.scope.current, Some(store_key_id), "the store key stays the store's own");
+
+        // A member's page is owed no key but its grants': the same marker in
+        // its scope root asks for nothing.
+        let mut scoped = listed(folder);
+        scoped.roots = vec![folder];
+        let member = VaultStore::assemble(scoped, StoreKeys::new(keyring_for(Some(folder))), vec![folder], pull_subset(&peer, &[folder, bread]));
+        assert!(member.missing_share_roots().is_empty());
+    }
+
+    #[test]
+    fn a_marker_arriving_in_an_update_schedules_one_look_for_its_key() {
+        let (mut peer, root) = origin();
+        let folder = NodeId::new();
+        peer.add_node(folder, Some(root), None, "folder", "Recipes", T0).unwrap();
+        let (share_key_id, share_key) = scope_key();
+        let store_id = StoreId::new();
+        let (mut store, shut, deks, _) = owners_page(store_id, &peer, &[], (share_key_id, &share_key));
+        assert!(shut.is_empty());
+        assert!(store.share_keys_to_ask_for(0.0).is_none(), "no share, nothing to ask");
+        assert!(store.look.due.is_none());
+
+        // One of the owner's desktops shares the folder while the page is
+        // open: the marker reaches it as an update of the folder's document.
+        let (dek_id, dek) = &deks[&folder];
+        let edit = mark_shared(&mut peer, folder, share_key_id, "Recipes");
+        let blob = blob_under(store_id, folder, *dek_id, dek, &edit.touched[0].1);
+        let merged = store.take_blob(store_id, folder, 2, &blob, false, None, 1_000.0);
+        assert!(merged.wants_key);
+        assert_eq!(store.look.due, Some(1_000.0 + KEY_LOOK_DEBOUNCE_MS));
+
+        // The share renamed a moment later names the same key: no second
+        // reason, and the look is not put off.
+        let edit = mark_shared(&mut peer, folder, share_key_id, "Family recipes");
+        let blob = blob_under(store_id, folder, *dek_id, dek, &edit.touched[0].1);
+        assert!(!store.take_blob(store_id, folder, 3, &blob, false, None, 1_100.0).wants_key);
+        assert_eq!(store.look.due, Some(1_000.0 + KEY_LOOK_DEBOUNCE_MS));
+
+        // The look asks once, and not again inside the floor however many
+        // reasons arrive: it is put off until the floor has passed.
+        store.look.due = None;
+        assert_eq!(store.share_keys_to_ask_for(1_250.0), Some(vec![folder]));
+        assert_eq!(store.share_keys_to_ask_for(5_000.0), None);
+        assert_eq!(store.look.due, Some(1_250.0 + SHARE_KEY_FLOOR_MS));
+        assert_eq!(store.share_keys_to_ask_for(1_250.0 + SHARE_KEY_FLOOR_MS), Some(vec![folder]));
+
+        // Held, it is never asked for again; and a marker whose key is held
+        // already wants nothing.
+        assert!(store.take_keys(share_keyring(folder, share_key_id, &share_key)));
+        assert!(store.share_keys_to_ask_for(60_000.0).is_none());
+        store.look.due = None;
+        let edit = mark_shared(&mut peer, folder, share_key_id, "Recipes");
+        let blob = blob_under(store_id, folder, *dek_id, dek, &edit.touched[0].1);
+        assert!(!store.take_blob(store_id, folder, 4, &blob, false, None, 61_000.0).wants_key);
+        assert!(store.look.due.is_none());
+
+        // A member's page holds its grants' keys and asks for no others,
+        // whatever marker arrives.
+        let other = KeyId::new_v4();
+        let mut scoped = listed(folder);
+        scoped.roots = vec![folder];
+        let mut member = VaultStore::assemble(scoped, StoreKeys::new(keyring_for(Some(folder))), vec![folder], pull_subset(&peer, &[folder]));
+        let edit = mark_shared(&mut peer, folder, other, "Recipes");
+        let merged = member.merge(store_id, folder, vec![(Mark::One(5), Ok(edit.touched[0].1.clone()))], false, None);
+        assert!(!merged.wants_key);
+        assert!(member.share_keys_to_ask_for(0.0).is_none());
+    }
+
+    #[test]
+    fn a_blob_that_will_not_open_is_read_again_for_its_wraps_once() {
+        let (mut peer, root) = origin();
+        let folder = NodeId::new();
+        peer.add_node(folder, Some(root), None, "folder", "Recipes", T0).unwrap();
+        let (share_key_id, share_key) = scope_key();
+        mark_shared(&mut peer, folder, share_key_id, "Recipes");
+        let store_id = StoreId::new();
+        let (mut store, _, deks, _) = owners_page(store_id, &peer, &[], (share_key_id, &share_key));
+        assert!(store.take_keys(share_keyring(folder, share_key_id, &share_key)), "held since the open");
+
+        // A member makes a note while the page is open. The notification
+        // carries the blob and never the wraps, so the key it names is one
+        // this page has not heard of.
+        let soup = NodeId::new();
+        let edit = peer.add_node(soup, Some(folder), None, "document", "Soup", T1).unwrap();
+        assert_eq!(edit.node_ids(), vec![soup, folder]);
+        let (fetched, (soup_dek_id, soup_dek)) = fetched_under(store_id, soup, &[edit.touched[0].1.clone()], &[(share_key_id, &share_key)]);
+        let first = &fetched.updates[0].blob;
+        let merged = store.take_blob(store_id, soup, 1, first, false, None, 2_000.0);
+        assert!(merged.events.is_empty() && !store.tree.has_node(soup));
+        assert_eq!(store.look.due, Some(2_000.0 + KEY_LOOK_DEBOUNCE_MS));
+        // The folder's list arrives and opens as ever; it names a document
+        // not held yet, which no repair judges.
+        let (folder_dek_id, folder_dek) = &deks[&folder];
+        let list = blob_under(store_id, folder, *folder_dek_id, folder_dek, &edit.touched[1].1);
+        assert!(store.take_blob(store_id, folder, 2, &list, false, None, 2_010.0).structure);
+        assert!(store.repair_now(T2).is_none());
+
+        // The look: no key to ask for, one document to read again, from the
+        // start. The fetch brings the wraps, and the note opens.
+        assert!(store.share_keys_to_ask_for(2_250.0).is_none());
+        assert_eq!(store.reread_list(false), vec![(soup, 0)]);
+        let merged = store.take_fetched(store_id, soup, &fetched, false, 2_300.0);
+        assert!(
+            matches!(kinds_of(&merged.events)[..], [StoreChangeKind::NodeCreated { node_id, parent_id }] if node_id == soup && parent_id == folder),
+            "{:?}",
+            merged.events
+        );
+        assert_eq!(store.children_of(folder).unwrap(), vec![soup]);
+        assert!(store.behind().is_empty());
+        // And the member's next edit opens as it arrives.
+        let rename = peer.set_title(soup, "Leek soup", T2).unwrap();
+        let blob = blob_under(store_id, soup, soup_dek_id, &soup_dek, &rename.touched[0].1);
+        store.look.due = None;
+        store.take_blob(store_id, soup, 2, &blob, false, None, 3_000.0);
+        assert_eq!(store.node_of(soup).unwrap().metadata.title, "Leek soup");
+        assert!(store.look.due.is_none(), "nothing is owed");
+
+        // A document wrapped under nothing this page will ever hold is asked
+        // about once, not once an append.
+        let theirs = NodeId::new();
+        let (stranger_id, stranger) = scope_key();
+        let (shut, (shut_dek_id, shut_dek)) = fetched_under(store_id, theirs, &[b"one".to_vec()], &[(stranger_id, &stranger)]);
+        store.take_blob(store_id, theirs, 1, &shut.updates[0].blob, false, None, 4_000.0);
+        assert_eq!(store.reread_list(false), vec![(theirs, 0)]);
+        store.look.due = None;
+        store.take_fetched(store_id, theirs, &shut, false, 4_300.0);
+        assert_eq!(store.behind(), vec![(theirs, 0)], "still shut");
+        let more = blob_under(store_id, theirs, shut_dek_id, &shut_dek, b"two");
+        store.take_blob(store_id, theirs, 2, &more, false, None, 5_000.0);
+        assert!(store.look.due.is_none() && store.look.unread.is_empty(), "no share's key is missing and its wraps are known");
+        // Until a scope key arrives, which may open anything: then everything
+        // not read through is read again.
+        assert!(store.take_keys(share_keyring(NodeId::new(), stranger_id, &stranger)));
+        assert_eq!(store.reread_list(true), vec![(theirs, 0)]);
+    }
+
+    #[test]
+    fn an_owner_creating_under_a_shared_root_wraps_under_the_share_s_key_once_it_holds_it() {
+        let (mut peer, root) = origin();
+        let folder = NodeId::new();
+        peer.add_node(folder, Some(root), None, "folder", "Recipes", T0).unwrap();
+        let (share_key_id, share_key) = scope_key();
+        mark_shared(&mut peer, folder, share_key_id, "Recipes");
+        let store_id = StoreId::new();
+        let (mut store, _, _, store_key_id) = owners_page(store_id, &peer, &[], (share_key_id, &share_key));
+        let wraps_of = |store: &mut VaultStore, title: &str| {
+            let id = NodeId::new();
+            let edit = store.tree.add_node(id, Some(folder), None, "document", title, T1).unwrap();
+            let outgoing = store.prepare(store_id, id, &edit.touched[0].1).unwrap();
+            let (keys, _) = outgoing.created.expect("new to the server");
+            let mut under: Vec<KeyId> = keys.wraps.iter().map(|w| w.scope_key_id).collect();
+            under.sort_by_key(|id| id.to_string());
+            under
+        };
+
+        // Before the share's key has reached the page there is only the store
+        // key to wrap under; the owner's desktops add the share's.
+        assert_eq!(wraps_of(&mut store, "Bread"), vec![store_key_id]);
+
+        // Once it is in the keyring, the marker above the new node finds it:
+        // the members read what the owner makes with no desktop in between.
+        assert!(store.take_keys(share_keyring(folder, share_key_id, &share_key)));
+        let mut both = vec![store_key_id, share_key_id];
+        both.sort_by_key(|id| id.to_string());
+        assert_eq!(wraps_of(&mut store, "Soup"), both);
+
+        // Outside the share: the store key alone, as before.
+        let outside = NodeId::new();
+        let edit = store.tree.add_node(outside, Some(root), None, "document", "Notes", T1).unwrap();
+        let outgoing = store.prepare(store_id, outside, &edit.touched[0].1).unwrap();
+        let (keys, _) = outgoing.created.expect("new to the server");
         assert_eq!(keys.wraps.iter().map(|w| w.scope_key_id).collect::<Vec<_>>(), vec![store_key_id]);
     }
 
