@@ -133,6 +133,15 @@ of it run, `scripts/local-stack/README.md`.
    the root and in `web/`, and replace the interim read-only handling in
    `crates/pimble-app/src/editor.rs` with `set_read_only`.
 
+## A flake to watch
+
+One full `cargo test --workspace` run on 2026-09-21 (made while two local stacks, two app
+windows and a browser were running) ended with the `pimble-server` `auth` test target
+failing without naming a test or printing a result line. The target passed alone (20 of
+20), the whole server suite passed twice, and a second full workspace run was clean. The
+relay agent saw one like it in `remote_mounts::a_mount_whose_source_link_is_down...`.
+Both look like load; neither has been explained.
+
 ## Process notes that cost time before
 
 - Agents from an earlier session cannot be resumed after a restart: continue from
