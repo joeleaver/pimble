@@ -62,7 +62,10 @@ of it run, `scripts/local-stack/README.md`.
   - **The bar was run in the browser** with the owner's desktop off: the owner's page, a
     member's page and a member's desktop renamed, created, moved and deleted in one shared
     folder close together; both desktops ended with identical lists, both pages showed
-    them, and no document kept gaining appends afterwards.
+    them, and no document kept gaining appends afterwards. The owner's desktop, switched
+    on again (a binary built from committed code only), converged to the same lists with
+    no repair of its own to make, and added the store key's wrap to every document the
+    members had made. No title or typed word of any of it is readable on the hosted disk.
 - **Found and fixed by that verification** (all committed): a member never learns the
   owner's store name; a new document's wrapped key rides its first `vaultAppend` and is
   stored with it under one lock (a lost answer used to leave a blob nobody could open,
