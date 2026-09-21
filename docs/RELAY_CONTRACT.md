@@ -1,6 +1,10 @@
 # Relay contract: sharing from an unhosted store, with nothing uploaded
 
-Status: written 2026-09-21 by the PM from `docs/NODE_DOCUMENT_CONTRACT.md` section 5b,
+Status: the accounts-service half (d9f0d40, 6d95e38) and the owner's-server half (02c6564)
+are built and were verified headless by the PM on the local stack on 2026-09-21 (see
+"Verification" below); the apps' half is in progress. Nothing is merged or deployed.
+
+Written 2026-09-21 by the PM from `docs/NODE_DOCUMENT_CONTRACT.md` section 5b,
 which Joe approved on 2026-09-18 (decision 3: "Not supposed to be hosted, that's what the
 relay is for"; and "we really shouldn't host anything unless it's specifically been asked
 to be hosted"). This document fills in how. Where it departs from 5b it says so.
@@ -160,3 +164,15 @@ they disconnect; with the owner's server off, members read and edit locally, rec
 attempts get `owner offline`, and everything converges when it returns; a reader cannot
 write; a node outside the share is unreachable; killing the accounts service drops the
 tunnel and nothing is lost. The hosted tier's walk-through passes unchanged.
+
+**Run headless on 2026-09-21** (`scripts/local-stack/`, binaries built from committed code):
+every line above passed through the CLI. The store's name never reached the accounts
+service (its row lists with an empty name and `tier=relay`); the hosted stores directory
+stayed empty throughout; the twin on the owner's disk holds no readable word. With the
+owner's server off, members went `Offline` with no warning logged, kept working, and did
+not see each other; the twin was deleted while it was off; on its return the twin was
+rebuilt and all three converged, both members' offline notes and an offline text edit
+included. `cloudStopRelaying` was refused while shares existed. The accounts service was
+killed and restarted with a new signing key: members were `Synced` again within 45 s and
+what each side wrote meanwhile converged. Still to run: the two apps (the dialog's two
+ways, the badges) and a member in the browser, once the apps' half lands; `wss://`.

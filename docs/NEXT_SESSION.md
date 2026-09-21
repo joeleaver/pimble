@@ -123,9 +123,12 @@ of it run, `scripts/local-stack/README.md`.
 
 ## Next
 
-1. The relay tier (contract section 5b): an unhosted store shares through a reverse tunnel
-   to the owner's own server, and Pimble Cloud stores nothing.
-2. The browser pass above, then Joe's decisions, then merge, deploy and release.
+1. The relay tier's apps' half (`docs/RELAY_CONTRACT.md`, "The apps"): in progress when
+   this was written. The accounts-service and owner's-server halves are committed and
+   passed the contract's bar headless (the contract's "Verification" says what was run).
+   Then the PM's pass of it in the desktop app and with a member in the browser.
+2. Joe's decisions, then merge, deploy (the accounts database needs `HostedStore.tier`
+   applied, and the hosted server and accounts service go together) and release.
 3. When rinch #832 (read-only editor switch) merges: `cargo update` the rinch crates in
    the root and in `web/`, and replace the interim read-only handling in
    `crates/pimble-app/src/editor.rs` with `set_read_only`.

@@ -53,6 +53,21 @@ PIMBLE_CLOUD_PASSWORD=pw-alice-0123456789 own cloud-sign-in $EDGE alice@example.
    share: each reaches a member's machine within two minutes (the link asks the accounts
    service every two minutes and connects again with a fresh token).
 
+## The relay walk-through (what the PM ran on 2026-09-21)
+
+1. `own create-store $STACK/owner/garden.pimble Garden`, folders and notes. `own cloud-share`
+   answers "Sharing needs this store hosted on Pimble Cloud or shared from this computer."
+2. `own cloud-relay-store <store>`: "Nothing was uploaded". `ls $STACK/stores` is empty and
+   stays empty; `own cloud-list-hosted` shows the store with no name and `tier=relay`; the
+   encrypted twin is under `$STACK/owner/data/pimble/relay/`.
+3. Share and invite as in the hosted walk-through. Members' `cloud-add-hosted` links go to
+   `ws://127.0.0.1:18091/api/v1/relay/<store>`; they co-edit the tree through the relay.
+4. `kill $(cat $STACK/owner.pid)`: members are `Offline`, quietly, and keep working; they
+   do not see each other. `rm -rf` the twin; `desk.sh owner 17491 <store path>`: the twin is
+   rebuilt and everyone converges.
+5. Kill `pimble-cloud` and start it again (the command is in `up.sh`): members are `Synced`
+   again within a minute and nothing written meanwhile is lost.
+
 ## The apps on the same identities
 
 Stop the headless desktop for that name, write

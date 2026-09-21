@@ -392,9 +392,20 @@ Contract: `docs/NODE_DOCUMENT_CONTRACT.md` section 5. How to run it all on one m
   again with a fresh token. A root the account no longer holds stays as it last was and
   takes no edits. Refusals are whole sentences: "You can read this, not change it."
   (`StoreAccess::READ_ONLY_REFUSAL`), "no grant for this document".
-- **Nothing is hosted as a side effect**: `cloudShareNode` on an unhosted store answers
-  "Sharing needs this store hosted on Pimble Cloud, or the relay, which is not built yet.
-  Nothing was uploaded." The relay (contract section 5b) is the next wave.
+- **Nothing is hosted as a side effect**: `cloudShareNode` on a store that is neither
+  hosted nor relayed answers "Sharing needs this store hosted on Pimble Cloud or shared
+  from this computer."
+- **The relay tier** (`docs/RELAY_CONTRACT.md`; server halves built and verified headless
+  2026-09-21, apps' half in progress): `cloudRelayStore` shares an unhosted store from the
+  computer it lives on. The owner's server runs a second Pimble server in its own process,
+  the relay face (`relay_face.rs`: JWT mode, loopback, the store's encrypted twin under
+  `<data dir>/pimble/relay/`), kept in step by an ordinary vault link (`sync.json` mode
+  `relay`) with share upkeep riding it, and a tunnel (`relay_tunnel.rs`) to the accounts
+  service's `/api/v1/relay`, which pipes members' connections and stores nothing. The
+  accounts service records the store as `tier: "relay"` with an empty name; `/token` names
+  each relayed store's endpoint in `stores`, each with a token that names that store alone,
+  the only kind the relay takes (Joe, 2026-09-21: it is handed to the owner's machine).
+  `Store.relay` says which end a device is; a member whose owner is off is plain `Offline`.
 - **Known limits**, all in the contract or `docs/NEXT_SESSION.md`: a scoped editor can move
   a node out of the share by setting its `parent_id`; no data-key rotation when a node or
   a member leaves; a removed member's connection lives until its token expires if their
@@ -432,6 +443,7 @@ vault-link start), so a reopened replica no longer reports a placeholder root.
 - `docs/NODE_DOCUMENT_CONTRACT.md` - node documents and sharing on them
 - `crates/pimble-crdt/src/node_doc.rs`, `tree.rs` - NodeDoc (one node's document) and Tree
 - `crates/pimble-server/src/share.rs`, `vault_link.rs` - the owner's side of a share; the encrypted link, keys, grants
+- `docs/RELAY_CONTRACT.md`, `crates/pimble-server/src/relay_face.rs`, `relay_tunnel.rs`, `crates/pimble-cloud/src/relay.rs` - sharing from an unhosted store
 - `scripts/local-stack/` - the whole stack on one machine, and the sharing walk-through
 - `crates/pimble-store/src/local.rs` - LocalStore
 - `crates/pimble-rpc/src/methods.rs` - RPC API trait
