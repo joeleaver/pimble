@@ -997,11 +997,12 @@ impl LocalStore {
     /// repair usually finds nothing to fix, and that must never force a
     /// flush. `None` when nothing needed fixing.
     ///
-    /// A partial replica is repaired one scope at a time and only where it
-    /// can judge (see [`LocalStore::repair_scopes`]): `Tree::repair` reads
-    /// "not held" as "missing", which is true of a whole store and false of
-    /// a share's recipient, who by design holds less than the lists and
-    /// parents it is given may name.
+    /// A partial replica is repaired one scope at a time (see
+    /// [`LocalStore::repair_scopes`]): each scope is a tree of its own, whose
+    /// root's parent is by design never held. `Tree::repair` itself never
+    /// reads "not held" as "missing" (since 2026-09-21: that was false of a
+    /// whole store too, whenever a document was still on its way or its key
+    /// was), so what the scope pass adds is the rooting, not the caution.
     pub fn repair_tree(&mut self) -> Result<Option<TreeEdit>> {
         if self.is_partial() {
             return self.repair_scopes();

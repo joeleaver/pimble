@@ -370,17 +370,22 @@ impl Tree {
     // ── Shape ────────────────────────────────────────────────────────────
 
     /// Exactly the conditions [`Tree::repair`] fixes; empty after a repair.
-    /// `OrphanNode` and `MissingChild` name any id that is not a node: not
-    /// held, not initialised, or tombstoned.
+    /// `OrphanNode` and `MissingChild` name a document this device KNOWS is
+    /// deleted (a tombstone it holds). One it does not hold, or holds without
+    /// its `node` root, is unknown here and is never reported or "fixed":
+    /// see `analyze`.
     pub fn validate_tree(&self) -> Vec<TreeIssue> {
         self.analyze().issues
     }
 
     /// Decision 9 over documents: effective parents, cycles broken at the
-    /// smallest id, every list made to hold exactly the undeleted nodes whose
+    /// smallest id, every list made to hold the undeleted nodes whose
     /// effective parent is its owner (first occurrence kept, missing ones
-    /// appended in id order). Deterministic in the held state. `None` when
-    /// nothing needed fixing.
+    /// appended in id order), tombstones and duplicates taken out, and every
+    /// entry naming a document not held here left exactly where it is.
+    /// Deterministic in the held state, and acting on knowledge only, so two
+    /// devices that hold different subsets never undo each other. `None`
+    /// when nothing needed fixing.
     ///
     /// Touches only `parent_id` and children lists, never a timestamp: the
     /// clock rule of the share mirror served a causal guard that no longer
@@ -442,6 +447,18 @@ impl Tree {
         nodes.sort_by_key(|(id, _)| id.to_string());
         let node_ids: Vec<NodeId> = nodes.iter().map(|(id, _)| *id).collect();
         let node_set: HashSet<NodeId> = node_ids.iter().copied().collect();
+        // What this device KNOWS is deleted. Everything else that is not a
+        // node (a document not held, or held and not initialised) is unknown
+        // here, which is not the same as missing: node documents travel one
+        // by one, a list can name a child before the child's document is
+        // here, and a device may hold a document it has no key for yet (a
+        // member's new document on an owner's page, until the share's key or
+        // the store key's wrap reaches it). Repair acts on knowledge only. A
+        // device that "fixed" what it merely lacks would be undone by every
+        // device that holds it, for ever, and would move or unlist other
+        // people's documents meanwhile (found 2026-09-21: an owner's page
+        // unlisting a member's new note six times a second).
+        let gone: HashSet<NodeId> = self.docs.iter().filter(|(_, doc)| doc.is_tombstone()).map(|(&id, _)| id).collect();
 
         // Step 1: effective parent for every node but the root.
         let mut raw_parent: HashMap<NodeId, Option<NodeId>> = HashMap::new();
@@ -456,11 +473,16 @@ impl Tree {
                     analysis.issues.push(TreeIssue::DetachedNode { node_id: id });
                     root
                 }
-                Some(p) if p == id || !node_set.contains(&p) => {
+                Some(p) if node_set.contains(&p) && p != id => p,
+                // Its own parent, or under a document known to be deleted.
+                Some(p) if p == id || gone.contains(&p) => {
                     analysis.issues.push(TreeIssue::OrphanNode { node_id: id, missing_parent: p });
                     root
                 }
-                Some(p) => p,
+                // Under a document this device does not hold: where it
+                // belongs is not known here, so it is left exactly where it
+                // says it is (no effective parent, no rewrite, no listing).
+                Some(_) => continue,
             };
             effective_parent.insert(id, e);
         }
@@ -480,7 +502,15 @@ impl Tree {
                     reaches_root = true;
                     break;
                 }
-                cur = effective_parent[&cur];
+                // A chain that ends at a node whose parent is not held ends:
+                // it is no cycle.
+                match effective_parent.get(&cur) {
+                    Some(&next) => cur = next,
+                    None => {
+                        reaches_root = true;
+                        break;
+                    }
+                }
             }
             if reaches_root {
                 continue;
@@ -507,7 +537,10 @@ impl Tree {
                 index_of.insert(cur, path.len());
                 path.push(cur);
                 visited.insert(cur);
-                cur = effective_parent[&cur];
+                // Every member of a chain that did not end has one (the walk
+                // above would have ended at the first that does not).
+                let Some(&next) = effective_parent.get(&cur) else { break };
+                cur = next;
             }
         }
 
@@ -517,7 +550,7 @@ impl Tree {
             if id == root {
                 continue;
             }
-            let e = effective_parent[&id];
+            let Some(&e) = effective_parent.get(&id) else { continue };
             if raw_parent[&id] != Some(e) {
                 analysis.parent_rewrites.push((id, e));
             }
@@ -540,7 +573,7 @@ impl Tree {
                     remove_indices.entry(owner).or_default().push(index);
                     continue;
                 }
-                if !node_set.contains(&child) {
+                if gone.contains(&child) {
                     analysis.issues.push(TreeIssue::MissingChild { parent_id: owner, child_id: child });
                     remove_indices.entry(owner).or_default().push(index);
                     continue;
@@ -550,7 +583,9 @@ impl Tree {
                     remove_indices.entry(owner).or_default().push(index);
                     continue;
                 }
-                let e = effective_parent[&child];
+                // Not held here, or a node whose own parent is not held:
+                // unknown, so the entry stays where it is.
+                let Some(&e) = effective_parent.get(&child) else { continue };
                 if e != owner {
                     analysis.issues.push(TreeIssue::WrongList { parent_id: owner, child_id: child, effective_parent: e });
                     remove_indices.entry(owner).or_default().push(index);
@@ -562,7 +597,7 @@ impl Tree {
 
         let mut appends: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
         for &child in node_ids.iter().filter(|&&id| id != root && !placed.contains(&id)) {
-            let owner = effective_parent[&child];
+            let Some(&owner) = effective_parent.get(&child) else { continue };
             analysis.issues.push(TreeIssue::MissingFromList { parent_id: owner, child_id: child });
             appends.entry(owner).or_default().push(child);
         }
@@ -1149,17 +1184,62 @@ mod tests {
         assert_eq!(a.get_node_info(child).unwrap().modified_at, T1);
     }
 
+    /// A parent this device does not hold is unknown, not missing: documents
+    /// travel one by one, and a device may lack the key of one it was sent.
+    /// Re-parenting the node here would move it out of a folder every other
+    /// device can see it in.
     #[test]
-    fn repair_fixes_a_dangling_parent_reference() {
+    fn a_node_under_a_document_not_held_is_left_where_it_says_it_is() {
         let (mut a, root) = tree();
-        let child = id();
+        let (child, folder) = (id(), id());
         a.add_node(child, Some(root), None, "document", "Doc", T1).unwrap();
-        a.doc_mut(child).unwrap().set_parent_id(Some(id()), T1).unwrap();
-        assert!(a.validate_tree().iter().any(|i| matches!(i, TreeIssue::OrphanNode { .. })));
-        a.repair(T2).unwrap().expect("a dangling parent needs a repair");
+        // Someone moved it into a folder whose document is not here (yet).
+        a.doc_mut(child).unwrap().set_parent_id(Some(folder), T1).unwrap();
+        assert!(a.validate_tree().is_empty(), "{:?}", a.validate_tree());
+        assert!(a.repair(T2).unwrap().is_none(), "nothing known is wrong");
+        assert_eq!(a.get_node_info(child).unwrap().parent_id, Some(folder));
+
+        // The folder arrives, listing nothing (the move's other half is
+        // still on its way): now everything is known and repair finishes it.
+        let mut doc = NodeDoc::new();
+        doc.init("folder", "Folder", Some(root), T1).unwrap();
+        a.apply_update(folder, &doc.save()).unwrap();
+        a.repair(T2).unwrap().expect("the folder is here: the node belongs in its list");
         assert!(a.validate_tree().is_empty());
-        assert_eq!(a.get_node_info(child).unwrap().parent_id, Some(root));
-        assert_eq!(a.get_children(root).unwrap(), vec![child]);
+        assert_eq!(a.get_children(folder).unwrap(), vec![child]);
+        assert_eq!(a.get_children(root).unwrap(), vec![folder]);
+    }
+
+    /// The livelock found on 2026-09-21: a member made a note in a shared
+    /// folder; the owner's page held the folder and not the note (no key for
+    /// it yet), unlisted it as "missing", every device that did hold it
+    /// listed it again, six times a second, for as long as the page was open.
+    #[test]
+    fn a_listed_child_whose_document_is_not_held_stays_listed() {
+        let (mut holds_all, root) = tree();
+        let (folder, note) = (id(), id());
+        holds_all.add_node(folder, Some(root), None, "folder", "Shared", T1).unwrap();
+        let mut lacks_note = replica_of(&holds_all);
+        let made = holds_all.add_node(note, Some(folder), None, "document", "A member's note", T2).unwrap();
+
+        // The other device is sent the folder's new list, and not the note.
+        for (doc_id, update) in &made.touched {
+            if *doc_id != note {
+                lacks_note.apply_update(*doc_id, update).unwrap();
+            }
+        }
+        assert_eq!(lacks_note.doc(folder).unwrap().children(), vec![note]);
+        assert!(lacks_note.validate_tree().is_empty(), "{:?}", lacks_note.validate_tree());
+        assert!(lacks_note.repair(T3).unwrap().is_none(), "what is not held is not judged");
+        assert!(lacks_note.get_children(folder).unwrap().is_empty(), "and is not shown either");
+        assert!(holds_all.repair(T3).unwrap().is_none(), "so the device that holds it has nothing to put back");
+
+        // The note arrives (its key did): both agree, and nothing was written.
+        for (doc_id, update) in &made.touched {
+            lacks_note.apply_update(*doc_id, update).unwrap();
+        }
+        assert!(lacks_note.repair(T3).unwrap().is_none());
+        assert_eq!(lacks_note.get_children(folder).unwrap(), vec![note]);
     }
 
     #[test]
@@ -1243,9 +1323,11 @@ mod tests {
         assert!(a.get_children(bottom).unwrap().is_empty());
     }
 
-    /// The document-specific cases: what is not a node is not in the tree.
+    /// The document-specific cases: a tombstone is known to be deleted and
+    /// leaves the lists; a document that is not a node YET (content only:
+    /// its `node` root has not arrived) is unknown and stays listed, unshown.
     #[test]
-    fn repair_removes_entries_naming_tombstones_and_content_only_documents_and_never_appends_them() {
+    fn repair_removes_entries_naming_tombstones_and_leaves_documents_that_are_not_nodes_yet() {
         let (mut a, root) = tree();
         let (folder, dead, content_only) = (id(), id(), id());
         a.add_node(folder, Some(root), None, "folder", "F", T1).unwrap();
@@ -1262,14 +1344,15 @@ mod tests {
 
         let issues = a.validate_tree();
         assert!(issues.iter().any(|i| matches!(i, TreeIssue::MissingChild { child_id, .. } if *child_id == dead)), "{issues:?}");
-        assert!(issues.iter().any(|i| matches!(i, TreeIssue::MissingChild { child_id, .. } if *child_id == content_only)), "{issues:?}");
+        assert!(!issues.iter().any(|i| matches!(i, TreeIssue::MissingChild { child_id, .. } if *child_id == content_only)), "{issues:?}");
         assert!(issues.iter().any(|i| matches!(i, TreeIssue::OrphanNode { node_id, missing_parent } if *node_id == orphan && *missing_parent == dead)), "{issues:?}");
 
         let repair = a.repair(T3).unwrap().expect("needs a repair");
         assert_eq!(ids_of(&repair), HashSet::from([folder, orphan, root]));
         assert!(a.validate_tree().is_empty());
         assert!(a.repair(T3).unwrap().is_none());
-        assert!(a.doc(folder).unwrap().children().is_empty());
+        assert_eq!(a.doc(folder).unwrap().children(), vec![content_only], "the tombstone left the list; the document that is no node yet stayed");
+        assert!(a.get_children(folder).unwrap().is_empty(), "and is not shown");
         assert_eq!(a.get_node_info(orphan).unwrap().parent_id, Some(root));
         assert_eq!(a.get_children(root).unwrap(), vec![folder, orphan]);
         assert_eq!(a.doc(dead).unwrap().children(), vec![orphan], "a tombstone's list is not touched");

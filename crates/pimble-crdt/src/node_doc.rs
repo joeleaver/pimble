@@ -427,6 +427,13 @@ impl NodeDoc {
         self.placement().is_some()
     }
 
+    /// Initialised and tombstoned: a document this device *knows* is deleted,
+    /// which is a different thing from one it does not hold.
+    pub(crate) fn is_tombstone(&self) -> bool {
+        let txn = self.doc.transact();
+        self.node.len(&txn) > 0 && self.node.get(&txn, DELETED_AT).is_some()
+    }
+
     /// A node's stored `parent_id`, or `None` when this is not a node
     /// (uninitialised or tombstoned): all repair needs of the `node` root,
     /// read without the rest of the fields.

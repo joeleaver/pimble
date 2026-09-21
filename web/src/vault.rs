@@ -3329,15 +3329,17 @@ mod tests {
         );
         assert!(store.tree.get_children(recipes).unwrap().iter().all(|id| *id != stray));
 
-        // A whole store would have judged all three: the scope roots become
-        // orphans of a tree that is not theirs, and `stray` is adopted.
+        // Until 2026-09-21 a repair that took these for a whole store judged
+        // all three (the scope roots as orphans, `stray` adopted). No repair
+        // judges what it does not hold any more, rooted or not: a parent that
+        // is not here is unknown, not missing.
         let mut whole = VaultStore::assemble(
             listed(recipes),
             StoreKeys::new(keyring()),
             Vec::new(),
             pull_subset(&peer, &[recipes, bread, plans, monday, stray]),
         );
-        assert!(whole.repair_now(T1).is_some(), "which is exactly why a scope is repaired on its own");
+        assert!(whole.repair_now(T1).is_none(), "nothing known is wrong");
     }
 
     /// The page assembles its own nodes, so it is the one to say what the
