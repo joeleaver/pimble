@@ -63,6 +63,11 @@ pub struct ServerConfig {
     /// share's member who has the grant and not yet the key is handed it).
     /// `None` is the default minute; tests shorten it.
     pub share_sweep_interval: Option<std::time::Duration>,
+    /// How often a connected vault link asks the accounts service whether
+    /// the account's grant on its store has changed (`crate::vault_link`'s
+    /// `grant_shape`: a role the owner changed, another share, a removal).
+    /// `None` is the default two minutes; tests shorten it.
+    pub grant_check_interval: Option<std::time::Duration>,
     /// Where the encrypted twins of the stores shared from this computer
     /// live (docs/RELAY_CONTRACT.md; `crate::relay_face`). `None` puts it
     /// beside the replicas directory, as `relay`: `<data dir>/pimble/relay`
@@ -83,6 +88,7 @@ impl Default for ServerConfig {
             replicas_dir: None,
             keystore_path: None,
             share_sweep_interval: None,
+            grant_check_interval: None,
             relay_dir: None,
         }
     }
@@ -228,6 +234,9 @@ impl PimbleServer {
         }
         if let Some(every) = self.config.share_sweep_interval {
             handler = handler.with_share_sweep_interval(every);
+        }
+        if let Some(every) = self.config.grant_check_interval {
+            handler = handler.with_grant_check_interval(every);
         }
         self.handler = Some(handler.clone());
         let methods = handler.into_rpc();

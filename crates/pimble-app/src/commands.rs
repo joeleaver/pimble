@@ -624,6 +624,7 @@ fn store_sync_changed(store_id: pimble_core::StoreId, answer: pimble_rpc::GetSto
         sync_mode: answer.sync_mode,
         access: answer.access,
         read_only_roots: answer.read_only_roots,
+        ended_roots: answer.ended_roots,
         relay: answer.relay,
         // Only when the server knows: the relay said the owner's computer
         // is not there. This device having no network reads as plain

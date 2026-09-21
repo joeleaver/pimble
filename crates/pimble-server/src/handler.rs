@@ -637,6 +637,7 @@ fn index_events_for(kind: &StoreChangeKind) -> Vec<IndexEvent> {
         StoreChangeKind::SyncStateChanged { .. }
         | StoreChangeKind::MountStateChanged { .. }
         | StoreChangeKind::ShareStateChanged { .. }
+        | StoreChangeKind::SharesEnded { .. }
         | StoreChangeKind::VaultAppended { .. } => Vec::new(),
     }
 }
@@ -933,9 +934,13 @@ fn named_by(kind: &StoreChangeKind) -> Named {
         },
         StoreChangeKind::VaultAppended { doc_id: VaultDocId::Node(node_id), .. } => Named::Document { id: *node_id, others: Vec::new() },
         StoreChangeKind::VaultAppended { doc_id: VaultDocId::Tree, .. } => Named::Nobodys,
+        // `SharesEnded` names roots, and says of them only that they are
+        // not this device's to show any more; it is sent on a share's
+        // replica, to the app whose replica it is.
         StoreChangeKind::SyncStateChanged { .. }
         | StoreChangeKind::MountStateChanged { .. }
-        | StoreChangeKind::ShareStateChanged { .. } => Named::Nothing,
+        | StoreChangeKind::ShareStateChanged { .. }
+        | StoreChangeKind::SharesEnded { .. } => Named::Nothing,
     }
 }
 
@@ -1001,6 +1006,10 @@ pub struct RpcHandler {
     /// face, the twins it holds and the tunnel to Pimble Cloud's relay
     /// (`crate::relay_face`). Nothing of it runs until a store is relayed.
     relay: Arc<crate::relay_face::RelayHost>,
+    /// How often a connected vault link asks whether the account's grant on
+    /// its store has changed (`crate::vault_link::GRANT_CHECK_EVERY` unless
+    /// `ServerConfig::grant_check_interval` says otherwise).
+    grant_check_every: Duration,
 }
 
 /// What a share's member is told a store is called by this server, which
@@ -1079,6 +1088,7 @@ impl RpcHandler {
             vault_links: Arc::new(RwLock::new(HashMap::new())),
             keystore: Arc::new(Keystore::new(keystore_path)),
             shares: Arc::new(crate::share::Shares::new(crate::share::DEFAULT_SWEEP_EVERY)),
+            grant_check_every: crate::vault_link::GRANT_CHECK_EVERY,
             relay: Arc::new(crate::relay_face::RelayHost::new(relay_dir_beside(&replicas_dir))),
             replicas_dir: Arc::new(replicas_dir),
         }
@@ -1099,6 +1109,19 @@ impl RpcHandler {
     pub fn with_share_sweep_interval(mut self, every: Duration) -> Self {
         self.shares = Arc::new(crate::share::Shares::new(every));
         self
+    }
+
+    /// How often a connected vault link asks the accounts service whether
+    /// the account's grant has changed, in place of the default two
+    /// minutes. `PimbleServer::start` passes
+    /// `ServerConfig::grant_check_interval` through here; tests shorten it.
+    pub fn with_grant_check_interval(mut self, every: Duration) -> Self {
+        self.grant_check_every = every;
+        self
+    }
+
+    pub(crate) fn grant_check_every(&self) -> Duration {
+        self.grant_check_every
     }
 
     /// Where `addRemoteStore` places a replica when the caller passes
@@ -1444,6 +1467,16 @@ impl RpcHandler {
     /// no link forwards it.
     pub(crate) async fn notify_share_state_changed(&self, store_id: StoreId, node_id: NodeId, state: SyncState) {
         self.notify_store_change(store_id, StoreChangeKind::ShareStateChanged { node_id, state }, None).await;
+    }
+
+    /// Tell a share's replica's subscribers that the set of roots the
+    /// account no longer holds has changed (`crate::vault_link`'s
+    /// `refresh_grant`, which has recorded it in the manifest already):
+    /// `node_ids` are the roots that ended just now, none when the change
+    /// was a root granted again. Derived state, like a link's: no bytes,
+    /// and no link forwards it.
+    pub(crate) async fn notify_shares_ended(&self, store_id: StoreId, node_ids: Vec<NodeId>) {
+        self.notify_store_change(store_id, StoreChangeKind::SharesEnded { node_ids }, None).await;
     }
 
     /// Change `node_id`'s metadata under one lock and send the change out
@@ -2793,13 +2826,15 @@ impl PimbleApiServer for RpcHandler {
 
         // Open here already: an error for a whole store, and for a share's
         // replica unless the account has been given another share of the
-        // same store since, whose root joins the replica.
+        // same store since, whose root joins the replica, or has been given
+        // again one that had ended (it is still a scope root here, and not
+        // shown until it is un-ended).
         let open_roots = {
             let manager = self.store_manager.read().await;
-            manager.is_open(store_id).then(|| manager.scope_roots(store_id))
+            manager.is_open(store_id).then(|| (manager.scope_roots(store_id), manager.ended_roots(store_id)))
         };
-        if let Some(open_roots) = &open_roots {
-            let adds_a_root = !open_roots.is_empty() && held_as.roots.iter().any(|root| !open_roots.contains(root));
+        if let Some((open_roots, ended_roots)) = &open_roots {
+            let adds_a_root = !open_roots.is_empty() && held_as.roots.iter().any(|root| !open_roots.contains(root) || ended_roots.contains(root));
             if !adds_a_root {
                 return Err(to_rpc_error(format!("store {} is already open here", store_id)));
             }
@@ -2830,6 +2865,11 @@ impl PimbleApiServer for RpcHandler {
                 for root in &held_as.roots {
                     manager.add_scope_root(store_id, *root).await.map_err(to_rpc_error)?;
                 }
+                // A share granted again is no longer ended. One that has
+                // ended since is the link's to find, and to announce
+                // (`crate::vault_link`'s `refresh_grant`, at the connect below).
+                let still_ended: Vec<NodeId> = manager.ended_roots(store_id).into_iter().filter(|root| !held_as.roots.contains(root)).collect();
+                manager.set_ended_roots(store_id, still_ended).await.map_err(to_rpc_error)?;
                 // One share's replica carries that share's name; with
                 // another it is "Shared by ...", as one added with both is.
                 manager.set_partial_replica_name(store_id, &name).await.map_err(to_rpc_error)?;
@@ -3829,7 +3869,7 @@ impl PimbleApiServer for RpcHandler {
 
         // `Service` only, and a store just linked or unlinked this way is
         // held whole: `sync.json` says `full` or is gone.
-        Ok(GetStoreSyncResponse { remote: remote_now, state, sync_mode, access: pimble_core::StoreAccess::Full, read_only_roots: Vec::new(), relay, owner_offline: false })
+        Ok(GetStoreSyncResponse { remote: remote_now, state, sync_mode, access: pimble_core::StoreAccess::Full, read_only_roots: Vec::new(), ended_roots: Vec::new(), relay, owner_offline: false })
     }
 
     async fn get_store_sync(
@@ -3854,7 +3894,7 @@ impl PimbleApiServer for RpcHandler {
         let (sync_mode, relay) = self.link_kind_of(request.store_id).await;
 
         let owner_offline = self.vault_links.read().await.get(&request.store_id).is_some_and(|link| link.owner_offline());
-        Ok(GetStoreSyncResponse { remote, state, sync_mode, access: store.access, read_only_roots: store.read_only_roots, relay, owner_offline })
+        Ok(GetStoreSyncResponse { remote, state, sync_mode, access: store.access, read_only_roots: store.read_only_roots, ended_roots: store.ended_roots, relay, owner_offline })
     }
 
     async fn list_remote_stores(
@@ -4236,9 +4276,15 @@ impl PimbleApiServer for RpcHandler {
         // outside it is dropped, and since the index ranks the whole store,
         // such a store is asked for more than `limit` so that a small share
         // of a large store still fills its page.
-        let reaches: HashMap<StoreId, Reach> = {
+        // A share's replica with a share that ended is judged the same way:
+        // what is under an ended root is still on this device, is not shown
+        // any more, and is no hit either.
+        let (reaches, with_ended): (HashMap<StoreId, Reach>, HashSet<StoreId>) = {
             let manager = self.store_manager.read().await;
-            store_ids.iter().filter_map(|id| Some((*id, Reach::of(&manager, &principal, *id)?))).collect()
+            (
+                store_ids.iter().filter_map(|id| Some((*id, Reach::of(&manager, &principal, *id)?))).collect(),
+                store_ids.iter().filter(|id| !manager.ended_roots(**id).is_empty()).copied().collect(),
+            )
         };
 
         let mut hits: Vec<(StoreId, pimble_search::SearchHit)> = Vec::new();
@@ -4250,12 +4296,11 @@ impl PimbleApiServer for RpcHandler {
                 };
                 let reach = reaches.get(store_id);
                 let scoped_query;
-                let query = match reach {
-                    Some(_) => {
-                        scoped_query = SearchQuery { limit: limit.saturating_mul(SCOPED_SEARCH_OVERFETCH), ..query.clone() };
-                        &scoped_query
-                    }
-                    None => &query,
+                let query = if reach.is_some() || with_ended.contains(store_id) {
+                    scoped_query = SearchQuery { limit: limit.saturating_mul(SCOPED_SEARCH_OVERFETCH), ..query.clone() };
+                    &scoped_query
+                } else {
+                    &query
                 };
                 match handle.index.search(query) {
                     Ok(store_hits) => hits.extend(
@@ -4272,6 +4317,11 @@ impl PimbleApiServer for RpcHandler {
             }
         }
 
+        let manager = self.store_manager.read().await;
+        if !with_ended.is_empty() {
+            hits.retain(|(store_id, hit)| !manager.under_ended_root(*store_id, hit.node_id));
+        }
+
         // Merge by score across stores, then take the overall top `limit`.
         hits.sort_by(|a, b| b.1.score.partial_cmp(&a.1.score).unwrap_or(std::cmp::Ordering::Equal));
         hits.truncate(limit);
@@ -4279,7 +4329,6 @@ impl PimbleApiServer for RpcHandler {
         // Look up each hit's node type (the index's own `kind` field means
         // the matched chunk's kind here, not the node type — see
         // `SearchResultItem::node_type`).
-        let manager = self.store_manager.read().await;
         let mut results = Vec::with_capacity(hits.len());
         for (store_id, hit) in &hits {
             let node_type = manager

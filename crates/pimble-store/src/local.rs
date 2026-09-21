@@ -353,6 +353,7 @@ impl LocalStore {
             modified_at: now,
             kind: pimble_core::StoreKind::Plain,
             scope_roots,
+            ended_roots: Vec::new(),
         };
 
         let manifest_json = serde_json::to_string_pretty(&manifest)?;
@@ -424,21 +425,25 @@ impl LocalStore {
 
     /// Whether a write touching `ids` is refused here: everything on a
     /// replica held as a reader, and on one held with a role per shared
-    /// root, a document whose every scope is a reader's. A document under
-    /// a read-only root nested in an editable one takes the wider role, as
-    /// on the hosted server; one that reaches no scope root at all is not
-    /// this check's to judge.
+    /// root, a document whose every scope is a reader's or has ended
+    /// (`manifest.ended_roots`: the hosted server takes nothing under it
+    /// from this account any more, so an edit accepted here would sit on
+    /// this device for good, looking saved). A document under a read-only
+    /// root nested in an editable one takes the wider role, as on the
+    /// hosted server; one that reaches no scope root at all is not this
+    /// check's to judge.
     pub fn write_refused(&self, ids: &[NodeId]) -> bool {
         let link = self.link_access.read().unwrap();
         if !link.access.allows_write() {
             return true;
         }
-        if link.read_only_roots.is_empty() {
+        let ended = &self.manifest.ended_roots;
+        if link.read_only_roots.is_empty() && ended.is_empty() {
             return false;
         }
         ids.iter().any(|id| {
             let reached = self.scope_roots_above(*id);
-            !reached.is_empty() && reached.iter().all(|root| link.read_only_roots.contains(root))
+            !reached.is_empty() && reached.iter().all(|root| link.read_only_roots.contains(root) || ended.contains(root))
         })
     }
 
@@ -466,9 +471,51 @@ impl LocalStore {
     }
 
     /// Whether this is a partial replica: a share's recipient, holding only
-    /// the documents in its scopes.
+    /// the documents in its scopes. Still one when every share has ended
+    /// (`scope_roots` is never shrunk): it never starts behaving like a
+    /// whole store.
     pub fn is_partial(&self) -> bool {
         !self.manifest.scope_roots.is_empty()
+    }
+
+    /// The scope roots this account no longer holds (removed from that
+    /// share, or the share was stopped). A subset of
+    /// [`LocalStore::scope_roots`]; their documents stay on disk, read only
+    /// and unshown, until the replica is removed.
+    pub fn ended_roots(&self) -> &[NodeId] {
+        &self.manifest.ended_roots
+    }
+
+    /// Whether `id` is under a scope root that has ended and under none that
+    /// has not (a document in two overlapping shares is shown while either
+    /// is held): what the app no longer shows, and a search no longer finds.
+    pub fn under_ended_root(&self, id: NodeId) -> bool {
+        let ended = &self.manifest.ended_roots;
+        if ended.is_empty() {
+            return false;
+        }
+        let reached = self.scope_roots_above(id);
+        !reached.is_empty() && reached.iter().all(|root| ended.contains(root))
+    }
+
+    /// Record which scope roots have ended, replacing what was recorded: a
+    /// root granted again is un-ended by leaving it out. Only scope roots
+    /// count (anything else in `ended` is dropped), `scope_roots` itself is
+    /// untouched, and nothing on disk but the manifest is. Answers whether
+    /// anything changed; an unchanged set writes nothing.
+    pub async fn set_ended_roots(&mut self, ended: Vec<NodeId>) -> Result<bool> {
+        // In scope-root order, so the same set is always the same list.
+        let ended: Vec<NodeId> = self.manifest.scope_roots.iter().filter(|root| ended.contains(root)).copied().collect();
+        if ended == self.manifest.ended_roots {
+            return Ok(false);
+        }
+        let mut manifest = self.manifest.clone();
+        manifest.ended_roots = ended;
+        manifest.modified_at = Utc::now();
+        let manifest_json = serde_json::to_string_pretty(&manifest)?;
+        atomic_write(&self.path.join(Self::MANIFEST_FILE), manifest_json).await?;
+        self.manifest = manifest;
+        Ok(true)
     }
 
     /// The documents a partial replica's lists name and it does not hold
@@ -1220,6 +1267,7 @@ mod tests {
             modified_at: Utc::now(),
             kind: pimble_core::StoreKind::Plain,
             scope_roots: Vec::new(),
+            ended_roots: Vec::new(),
         };
         fs::write(
             store_path.join("manifest.json"),
@@ -1721,6 +1769,7 @@ mod tests {
             modified_at: Utc::now(),
             kind: pimble_core::StoreKind::Plain,
             scope_roots: Vec::new(),
+            ended_roots: Vec::new(),
         };
         fs::write(store_path.join("manifest.json"), serde_json::to_string_pretty(&manifest).unwrap()).await.unwrap();
 
@@ -2118,6 +2167,70 @@ mod tests {
         assert!(reopened.write_refused(&[under_edited]));
         reopened.clear_sync_config().await.unwrap();
         assert!(!reopened.write_refused(&[under_edited]));
+    }
+
+    /// A share that ended (the member was removed, or the owner stopped
+    /// sharing) is recorded beside the scope roots, never by dropping one:
+    /// the replica stays partial, the ended root takes no edits, nothing is
+    /// deleted, and a root granted again is simply left out of the next set.
+    #[tokio::test]
+    async fn an_ended_root_is_recorded_and_the_replica_stays_partial_and_read_only() {
+        let dir = tempdir().unwrap();
+        let mut owner = LocalStore::create(dir.path().join("owner.pimble"), "Owner").await.unwrap();
+        let root = owner.root_node_id();
+        let (trips, _) = owner.create_node(Node::folder("Trips"), Some(root)).unwrap();
+        let (recipes, _) = owner.create_node(Node::folder("Recipes"), Some(root)).unwrap();
+        let (under_trips, _) = owner.create_node(Node::document("Lisbon"), Some(trips)).unwrap();
+        let (under_recipes, _) = owner.create_node(Node::document("Soup"), Some(recipes)).unwrap();
+
+        let path = dir.path().join("partial.pimble");
+        let mut partial = LocalStore::create_replica_with_scope(&path, owner.id, "Shares", root, vec![trips, recipes]).await.unwrap();
+        for id in [trips, recipes, under_trips, under_recipes] {
+            partial.apply_node_update(id, &owner.tree().doc(id).unwrap().save()).unwrap();
+        }
+        partial.flush().await.unwrap();
+        assert!(partial.ended_roots().is_empty());
+        assert!(!partial.set_ended_roots(Vec::new()).await.unwrap(), "unchanged: nothing written");
+
+        // One of two ends. Something that is no scope root is not recorded.
+        assert!(partial.set_ended_roots(vec![trips, under_recipes]).await.unwrap());
+        assert_eq!(partial.ended_roots(), &[trips]);
+        assert_eq!(partial.scope_roots(), &[trips, recipes], "the scope roots are never shrunk");
+        assert!(partial.write_refused(&[under_trips]), "an ended root takes no edits");
+        assert!(!partial.write_refused(&[under_recipes]), "the share still held does");
+        assert!(partial.under_ended_root(under_trips) && partial.under_ended_root(trips));
+        assert!(!partial.under_ended_root(under_recipes));
+        assert!(!partial.set_ended_roots(vec![trips]).await.unwrap(), "the same set again changes nothing");
+
+        // Every share ended: still partial, read only throughout, and every
+        // document still here.
+        assert!(partial.set_ended_roots(vec![recipes, trips]).await.unwrap());
+        assert_eq!(partial.ended_roots(), &[trips, recipes], "in scope-root order");
+        assert!(partial.is_partial(), "never a whole store");
+        assert!(partial.write_refused(&[under_trips]) && partial.write_refused(&[under_recipes]));
+        assert_eq!(partial.get_node(under_trips).unwrap().metadata.title, "Lisbon", "nothing was deleted");
+        assert!(path.join("nodes").join(format!("{}.yrs", under_trips)).exists());
+
+        // The manifest round trip: a reopen reads what was recorded.
+        drop(partial);
+        let mut reopened = LocalStore::open(&path).await.unwrap();
+        assert_eq!(reopened.ended_roots(), &[trips, recipes]);
+        assert_eq!(reopened.scope_roots(), &[trips, recipes]);
+        assert!(reopened.is_partial());
+        assert!(reopened.write_refused(&[under_recipes]));
+        assert_eq!(reopened.get_node(under_recipes).unwrap().metadata.title, "Soup");
+
+        // Invited again to one of them: left out of the next set.
+        assert!(reopened.set_ended_roots(vec![trips]).await.unwrap());
+        assert_eq!(reopened.ended_roots(), &[trips]);
+        assert!(!reopened.write_refused(&[under_recipes]));
+
+        // A manifest written before ended roots existed has none.
+        assert!(reopened.set_ended_roots(Vec::new()).await.unwrap());
+        let written = fs::read_to_string(path.join("manifest.json")).await.unwrap();
+        assert!(!written.contains("ended_roots"), "skipped when empty, so an old manifest is what an unended one looks like: {written}");
+        drop(reopened);
+        assert!(LocalStore::open(&path).await.unwrap().ended_roots().is_empty());
     }
 
     /// `sync.json` across the relay tier (docs/RELAY_CONTRACT.md): a file

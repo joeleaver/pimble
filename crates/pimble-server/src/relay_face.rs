@@ -186,6 +186,7 @@ impl RelayHost {
             replicas_dir: Some(self.dir.join(".face").join("replicas")),
             relay_dir: Some(self.dir.join(".face").join("relay")),
             share_sweep_interval: None,
+            grant_check_interval: None,
         };
         let mut server = PimbleServer::relay_face(config);
         server.start().await.map_err(|e| anyhow::anyhow!("the relay face did not start: {}", e))?;

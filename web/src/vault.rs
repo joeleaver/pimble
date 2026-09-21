@@ -277,6 +277,45 @@ impl AccountStore {
     }
 }
 
+/// Shares of one store this page was showing that the account's store list
+/// no longer names: the account was removed from them, or their owner
+/// stopped sharing them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndedShares {
+    pub store_id: StoreId,
+    /// The shared roots that ended, in the order they were listed.
+    pub roots: Vec<NodeId>,
+    /// Nothing of the store is left to this account.
+    pub every: bool,
+}
+
+/// What ended between two readings of the account's store list: for every
+/// store held as shares, the roots the new list no longer names. A store the
+/// account holds whole now (a whole-store grant covers every node) has lost
+/// nothing, and a store held whole before was never a share.
+pub fn shares_ended(was: &HashMap<StoreId, AccountStore>, now: &HashMap<StoreId, AccountStore>) -> Vec<EndedShares> {
+    let mut ended = Vec::new();
+    for (store_id, held) in was {
+        let held_roots = held.roots();
+        if held_roots.is_empty() {
+            continue;
+        }
+        let Some(row) = now.get(store_id) else {
+            ended.push(EndedShares { store_id: *store_id, roots: held_roots, every: true });
+            continue;
+        };
+        if row.grants.iter().any(|g| g.root.is_none()) {
+            continue;
+        }
+        let left = row.roots();
+        let roots: Vec<NodeId> = held_roots.into_iter().filter(|root| !left.contains(root)).collect();
+        if !roots.is_empty() {
+            ended.push(EndedShares { store_id: *store_id, roots, every: left.is_empty() });
+        }
+    }
+    ended
+}
+
 /// The keys of one encrypted store: the scope keys this account holds, and
 /// every document's data key as blobs have asked for them.
 ///
@@ -456,6 +495,12 @@ pub struct VaultClient {
     /// own endpoint (`POST /token`'s `stores`): known to be relayed even when
     /// the account's store list could not be read.
     relayed: HashSet<StoreId>,
+    /// The stores every share of which ended while this page was open
+    /// ([`VaultClient::take_rows`]), until the account's list names them
+    /// again. The session may go on naming a relayed one's endpoint until its
+    /// next token; that endpoint failing is not the store's owner being
+    /// offline, and must not bring its row back.
+    ended: HashSet<StoreId>,
     /// The stores subscribed to on the current socket (see `subscribe`).
     subscribed: HashSet<StoreId>,
     /// Events raised somewhere with no reply of its own to carry them — a
@@ -477,6 +522,7 @@ impl VaultClient {
             active: None,
             owner_offline: HashSet::new(),
             relayed: HashSet::new(),
+            ended: HashSet::new(),
             subscribed: HashSet::new(),
             pending: Vec::new(),
             notices_tx,
@@ -539,12 +585,16 @@ impl VaultClient {
     /// account holds — the hosted server answers with the *owner's* store
     /// name, which a recipient has no business learning. One row per grant, so
     /// the rows of one store are collected here.
-    pub async fn learn_rows(&mut self) {
+    ///
+    /// Answers what the UI should hear about shares that ended since the
+    /// list was last read ([`VaultClient::take_rows`]). A list that cannot be
+    /// read changes nothing and ends nothing.
+    pub async fn learn_rows(&mut self) -> Vec<BackendEvent> {
         let list = match crate::accounts::list_stores().await {
             Ok(list) => list,
             Err(e) => {
                 tracing::warn!("Could not read the account's store list: {}", e);
-                return;
+                return Vec::new();
             }
         };
 
@@ -575,7 +625,48 @@ impl VaultClient {
             }
             row.grants.push(AccountGrant { root, role: view.role, name: view.name });
         }
+        self.take_rows(rows)
+    }
+
+    /// Take the account's store list as just read, and let go of every share
+    /// it no longer names (Joe, 2026-09-21: the folder leaves the explorer
+    /// with a notice). This page holds no replica, so there is nothing to
+    /// keep: the documents under an ended root are dropped from memory, and
+    /// a store none of whose shares is left is closed. The UI is told which
+    /// roots ended (`StoreChangeKind::SharesEnded`, which it answers with the
+    /// notice and by dropping them) and, for a store with nothing left, that
+    /// it is closed, before the list that no longer names them reaches it.
+    fn take_rows(&mut self, rows: HashMap<StoreId, AccountStore>) -> Vec<BackendEvent> {
+        let ended = shares_ended(&self.rows, &rows);
+        self.ended.retain(|store_id| !rows.contains_key(store_id));
         self.rows = rows;
+        let mut events = Vec::new();
+        for share in ended {
+            tracing::info!("Store {}: {} share(s) of it ended{}", share.store_id, share.roots.len(), if share.every { ", the last of them" } else { "" });
+            events.push(BackendEvent::RemoteStoreChange {
+                store_id: share.store_id,
+                change_kind: StoreChangeKind::SharesEnded { node_ids: share.roots.clone() },
+                source_client_id: None,
+            });
+            // A store left with no scope root would read as a whole store,
+            // so one that would be is closed here and opened again from
+            // the list as it is now.
+            let still_open = !share.every && self.stores.get_mut(&share.store_id).is_none_or(|open| open.drop_roots(&share.roots));
+            if !still_open {
+                self.stores.remove(&share.store_id);
+            }
+            if self.active.is_some_and(|(store_id, node_id)| store_id == share.store_id && !self.stores.get(&store_id).is_some_and(|open| open.tree.doc(node_id).is_some())) {
+                self.active = None;
+            }
+            if share.every {
+                self.waiting.remove(&share.store_id);
+                self.subscribed.remove(&share.store_id);
+                self.owner_offline.remove(&share.store_id);
+                self.ended.insert(share.store_id);
+                events.push(BackendEvent::StoreClosed { store_id: share.store_id });
+            }
+        }
+        events
     }
 
     /// Fill in what this page knows about a store before the UI sees it: the
@@ -1261,6 +1352,11 @@ impl VaultClient {
     pub fn endpoint_down(&mut self, store_ids: &[StoreId]) -> Vec<BackendEvent> {
         let mut events = Vec::new();
         for &store_id in store_ids {
+            // Nothing of it is this account's any more: its endpoint not
+            // answering says nothing about its owner's computer.
+            if self.ended.contains(&store_id) {
+                continue;
+            }
             if !self.owner_offline.insert(store_id) {
                 continue;
             }
@@ -1331,6 +1427,9 @@ impl VaultClient {
             sync_mode: pimble_core::StoreKind::Plain,
             access: self.access(store_id),
             read_only_roots: self.read_only_roots(store_id),
+            // This page holds no replica: a share that ended is dropped and
+            // is no longer one of the store's roots at all (`take_rows`).
+            ended_roots: Vec::new(),
             relay: if self.is_relayed(store_id) { RelaySide::Member } else { RelaySide::None },
             owner_offline: self.owner_offline.contains(&store_id),
         }
@@ -2627,12 +2726,51 @@ impl VaultStore {
     /// the next fetch start from the beginning and end at what the server
     /// holds.
     fn refused(&mut self, node_id: NodeId) {
+        self.drop_doc(node_id);
+    }
+
+    /// Let go of one document and everything kept about it.
+    fn drop_doc(&mut self, node_id: NodeId) {
         self.tree.take_doc(node_id);
         self.docs.remove(&node_id);
         self.heads.remove(&node_id);
         self.keys.forget(node_id);
         self.look.unread.remove(&node_id);
         self.look.asked.retain(|(id, _)| *id != node_id);
+    }
+
+    /// Let go of the shares rooted at `ended`: they are no longer scope roots
+    /// of this page, and every document under one of them and under no root
+    /// still held is dropped (overlapping shares: what is also under a share
+    /// that is left stays). Answers `false`, having changed nothing, when no
+    /// scope root would be left: such a store is not this function's to
+    /// keep open (with no scope root it would read as a whole store).
+    fn drop_roots(&mut self, ended: &[NodeId]) -> bool {
+        let left: Vec<NodeId> = self.scope_roots.iter().copied().filter(|root| !ended.contains(root)).collect();
+        if left.is_empty() {
+            return false;
+        }
+        let kept: HashSet<NodeId> = left.iter().flat_map(|root| self.tree.subtree_ids(*root).unwrap_or_default()).collect();
+        let dropped: Vec<NodeId> = ended
+            .iter()
+            .filter(|root| self.scope_roots.contains(root))
+            .flat_map(|root| self.tree.subtree_ids(*root).unwrap_or_else(|_| vec![*root]))
+            .filter(|id| !kept.contains(id))
+            .collect();
+        for id in dropped {
+            self.drop_doc(id);
+        }
+        self.scope_roots = left;
+        self.listed.roots.retain(|root| !ended.contains(root));
+        // The tree starts from the first scope root for its life; when that
+        // one went, it starts from the first that is left.
+        if ended.contains(&self.tree.root()) {
+            let root = self.scope_roots[0];
+            self.listed.root_node_id = root;
+            let tree = std::mem::replace(&mut self.tree, Tree::from_docs(root, HashMap::new()));
+            self.tree = rerooted(tree, root);
+        }
+        true
     }
 
     /// The document's whole state, encrypted, for a snapshot. Under the same
@@ -4835,6 +4973,114 @@ mod tests {
         let mut described = scoped;
         client.describe(&mut described);
         assert_eq!((described.access, described.read_only_roots), (Full, vec![recipes]));
+    }
+
+    // ── A share that ended (Joe, 2026-09-21) ────────────────────────────────
+
+    /// What ended between two readings of the account's store list.
+    #[test]
+    fn the_shares_the_rows_no_longer_name_have_ended() {
+        let (store_id, other) = (StoreId::new(), StoreId::new());
+        let (recipes, plans) = (NodeId::new(), NodeId::new());
+        let both = row(vec![grant(Some(recipes), "editor", "Recipes"), grant(Some(plans), "reader", "Plans")], Some("ann@example.com"));
+        let one = row(vec![grant(Some(plans), "reader", "Plans")], Some("ann@example.com"));
+        let whole = row(vec![grant(None, "editor", "Family")], None);
+        let rows = |entries: Vec<(StoreId, &AccountStore)>| entries.into_iter().map(|(id, row)| (id, row.clone())).collect::<HashMap<_, _>>();
+
+        assert!(shares_ended(&rows(vec![(store_id, &both)]), &rows(vec![(store_id, &both)])).is_empty());
+        assert_eq!(
+            shares_ended(&rows(vec![(store_id, &both)]), &rows(vec![(store_id, &one)])),
+            vec![EndedShares { store_id, roots: vec![recipes], every: false }]
+        );
+        assert_eq!(
+            shares_ended(&rows(vec![(store_id, &both), (other, &whole)]), &rows(vec![(other, &whole)])),
+            vec![EndedShares { store_id, roots: vec![recipes, plans], every: true }],
+            "no row names the store at all: every share of it ended"
+        );
+        assert!(shares_ended(&rows(vec![(store_id, &one)]), &rows(vec![(store_id, &both)])).is_empty(), "another share arrived: nothing ended");
+        assert!(shares_ended(&rows(vec![(store_id, &both)]), &rows(vec![(store_id, &whole)])).is_empty(), "held whole now: nothing of it was lost");
+        assert!(shares_ended(&rows(vec![(other, &whole)]), &HashMap::new()).is_empty(), "a store held whole was never a share");
+    }
+
+    /// The page holds no replica: a share the rows stop naming is said to
+    /// the UI, its documents are dropped from memory, and what is left of
+    /// the store goes on; when it was the last, the store is closed.
+    #[test]
+    fn a_share_that_ended_is_said_and_dropped_and_the_last_one_closes_the_store() {
+        let (mut peer, root) = origin();
+        let (recipes, plans) = (NodeId::new(), NodeId::new());
+        peer.add_node(recipes, Some(root), None, "folder", "Recipes", T0).unwrap();
+        peer.add_node(plans, Some(root), None, "folder", "Plans", T0).unwrap();
+        let (bread, monday) = (NodeId::new(), NodeId::new());
+        peer.add_node(bread, Some(recipes), None, "document", "Bread", T0).unwrap();
+        peer.add_node(monday, Some(plans), None, "document", "Monday", T0).unwrap();
+
+        let store_id = StoreId::new();
+        let mut scoped = listed(recipes);
+        scoped.id = store_id;
+        scoped.roots = vec![recipes, plans];
+        let store = VaultStore::assemble(scoped.clone(), StoreKeys::new(keyring_for(Some(recipes))), vec![recipes, plans], pull_subset(&peer, &[recipes, bread, plans, monday]));
+        let both = row(vec![grant(Some(recipes), "editor", "Recipes"), grant(Some(plans), "editor", "Plans")], Some("ann@example.com"));
+        let mut client = VaultClient::new("me".to_string());
+        client.stores.insert(store_id, store);
+        client.rows.insert(store_id, both.clone());
+        client.active = Some((store_id, bread));
+
+        // The same list again: nothing to say.
+        assert!(client.take_rows(HashMap::from([(store_id, both)])).is_empty());
+
+        // Removed from Recipes, the tree's first root.
+        let plans_only = row(vec![grant(Some(plans), "editor", "Plans")], Some("ann@example.com"));
+        let events = client.take_rows(HashMap::from([(store_id, plans_only.clone())]));
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(&events[0], BackendEvent::RemoteStoreChange { store_id: said, change_kind: StoreChangeKind::SharesEnded { node_ids }, source_client_id: None } if *said == store_id && node_ids == &vec![recipes]));
+        let open = client.stores.get(&store_id).expect("the share that is left keeps the store open");
+        assert_eq!(open.scope_roots, vec![plans]);
+        assert!(open.is_partial());
+        assert_eq!(open.tree.root(), plans, "the tree starts from a root that is held");
+        for gone in [recipes, bread] {
+            assert!(open.tree.doc(gone).is_none() && !open.docs.contains_key(&gone) && !open.heads.contains_key(&gone), "{gone} is still in memory");
+        }
+        assert!(open.tree.doc(monday).is_some() && open.tree.doc(plans).is_some());
+        assert_eq!(client.active, None, "the open document was under it");
+        let mut described = scoped.clone();
+        client.describe(&mut described);
+        assert_eq!((described.roots.clone(), described.root_node_id), (vec![plans], plans));
+        assert!(matches!(client.get_node(store_id, bread), BackendEvent::Error { .. }), "nothing of it is answered for");
+        assert!(matches!(client.get_node(store_id, monday), BackendEvent::NodeLoaded { .. }));
+
+        // Removed from the last one: said, and the store closed.
+        let events = client.take_rows(HashMap::new());
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(matches!(&events[0], BackendEvent::RemoteStoreChange { change_kind: StoreChangeKind::SharesEnded { node_ids }, .. } if node_ids == &vec![plans]));
+        assert!(matches!(&events[1], BackendEvent::StoreClosed { store_id: closed } if *closed == store_id));
+        assert!(!client.owns(store_id), "nothing of it is kept");
+        // Its endpoint, if the session still names one, failing afterwards
+        // is not its owner being offline: the row does not come back.
+        assert!(client.endpoint_down(&[store_id]).is_empty());
+        // Invited again: the list names it, and it is a store like any other.
+        assert!(client.take_rows(HashMap::from([(store_id, plans_only)])).is_empty());
+        assert!(!client.endpoint_down(&[store_id]).is_empty());
+    }
+
+    /// Overlapping shares: a document also under a share that is left stays.
+    #[test]
+    fn what_is_also_under_a_share_that_is_left_is_kept() {
+        let (mut peer, root) = origin();
+        let (outer, inner, leaf) = (NodeId::new(), NodeId::new(), NodeId::new());
+        peer.add_node(outer, Some(root), None, "folder", "Outer", T0).unwrap();
+        peer.add_node(inner, Some(outer), None, "folder", "Inner", T0).unwrap();
+        peer.add_node(leaf, Some(inner), None, "document", "Leaf", T0).unwrap();
+        let mut scoped = listed(inner);
+        scoped.roots = vec![inner, outer];
+        let mut store = VaultStore::assemble(scoped, StoreKeys::new(keyring_for(Some(outer))), vec![inner, outer], pull_subset(&peer, &[outer, inner, leaf]));
+
+        assert!(store.drop_roots(&[inner]));
+        assert_eq!(store.scope_roots, vec![outer]);
+        assert!(store.tree.doc(inner).is_some() && store.tree.doc(leaf).is_some(), "still in the outer share");
+        assert_eq!(store.tree.root(), outer);
+        assert!(!store.drop_roots(&[outer]), "the last root is not this function's to drop");
+        assert_eq!(store.scope_roots, vec![outer]);
     }
 
     #[test]

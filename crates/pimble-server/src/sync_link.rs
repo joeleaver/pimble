@@ -381,6 +381,7 @@ fn document_of(kind: &StoreChangeKind) -> Option<NodeId> {
         StoreChangeKind::SyncStateChanged { .. }
         | StoreChangeKind::MountStateChanged { .. }
         | StoreChangeKind::ShareStateChanged { .. }
+        | StoreChangeKind::SharesEnded { .. }
         | StoreChangeKind::VaultAppended { .. } => None,
     }
 }

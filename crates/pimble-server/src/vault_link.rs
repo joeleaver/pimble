@@ -76,7 +76,12 @@
 //! service at every connect (`refresh_grant`), and asked about every two
 //! minutes while connected (`grant_shape`): a role the owner changed,
 //! another share of the store or a removal ends the connection, and the
-//! next one is made with a token minted from the grant as it is now.
+//! next one is made with a token minted from the grant as it is now. A
+//! scope root the account's rows no longer name (a removal, a share its
+//! owner stopped) is recorded as ended in the manifest and announced once
+//! (`record_ended_roots`, `StoreChangeKind::SharesEnded`): it stays on this
+//! device, read only, until the replica is removed, and the app stops
+//! showing it. The scope roots themselves are never shrunk.
 //!
 //! **Share upkeep** (docs/NODE_DOCUMENT_CONTRACT.md section 5, the owner's
 //! half; `crate::share`): on an owner's device the link's task also runs
@@ -161,13 +166,14 @@ const CURSOR_VERSION: u32 = 1;
 const MAX_CATCH_UP_BLOB: usize = 3 * 1024 * 1024;
 /// How often the live loop writes `vault-link.json` when it has changed.
 const PROGRESS_SAVE_EVERY: Duration = Duration::from_secs(5);
+/// How often a connected link asks the accounts service whether the
+/// account's grant on the store is still what this connection was made
+/// with (see [`grant_shape`]), unless `ServerConfig::grant_check_interval`
+/// says otherwise.
+pub(crate) const GRANT_CHECK_EVERY: Duration = Duration::from_secs(120);
 /// How long a share's recipient waits before asking the remote again for a
 /// document a held list names and the scope did not hold yet, doubling up
 /// to [`MAX_AWAITED_POLL`] while nothing new arrives.
-/// How often a connected link asks the accounts service whether the
-/// account's grant on the store is still what this connection was made
-/// with (see [`grant_shape`]).
-const GRANT_CHECK_EVERY: Duration = Duration::from_secs(120);
 const AWAITED_POLL: Duration = Duration::from_secs(5);
 const MAX_AWAITED_POLL: Duration = Duration::from_secs(60);
 
@@ -569,7 +575,8 @@ async fn connect_and_sync(
     full_reconcile(handler, &client, store_id, key_id, link_id, progress, &echoes).await?;
 
     let mut save_tick = tokio::time::interval(PROGRESS_SAVE_EVERY);
-    let mut grant_tick = tokio::time::interval_at(tokio::time::Instant::now() + GRANT_CHECK_EVERY, GRANT_CHECK_EVERY);
+    let grant_check_every = handler.grant_check_every();
+    let mut grant_tick = tokio::time::interval_at(tokio::time::Instant::now() + grant_check_every, grant_check_every);
     let mut awaited_wait = AWAITED_POLL;
     let awaited_poll = tokio::time::sleep(awaited_wait);
     tokio::pin!(awaited_poll);
@@ -706,9 +713,10 @@ async fn grant_shape(handler: &RpcHandler, store_id: StoreId) -> Option<GrantSha
 
 /// Read again, from the accounts service, how the signed-in account holds
 /// this store, and bring `sync.json` (`access`, `shared_by`, the roots only
-/// read), a partial replica's scope roots and the keystore in line with it:
-/// a role changed by the owner, another share of the same store, a share's
-/// key handed over since the replica was added. Best effort: the token the
+/// read), a partial replica's scope roots, the roots among them that have
+/// ended, and the keystore in line with it: a role changed by the owner,
+/// another share of the same store, a removal from one, a share's key
+/// handed over since the replica was added. Best effort: the token the
 /// connect mints next is what the hosted server judges, and a link with no
 /// account or no network fails there, with its backoff.
 ///
@@ -743,6 +751,10 @@ async fn refresh_grant(handler: &RpcHandler, store_id: StoreId) -> Option<bool> 
                     }
                 }
             }
+            drop(manager);
+            // Every share of it has ended. The documents stay where they
+            // are until the replica is removed; the app stops showing them.
+            record_ended_roots(handler, store_id, local_roots.clone()).await;
         }
         return Some(owner);
     };
@@ -787,6 +799,16 @@ async fn refresh_grant(handler: &RpcHandler, store_id: StoreId) -> Option<bool> 
             }
         }
     }
+    // The shares that ended: exactly the roots held here that the account's
+    // rows no longer name, so one granted again is un-ended by the same
+    // comparison. After `sync.json`, so that whoever hears of it and asks
+    // how the store is held reads the ended root as read only already. A
+    // whole-store grant names no root and leaves none out: nothing of the
+    // store has stopped being this account's.
+    if !local_roots.is_empty() {
+        let ended = if held_as.roots.is_empty() { Vec::new() } else { local_roots.iter().filter(|root| !held_as.roots.contains(root)).copied().collect() };
+        record_ended_roots(handler, store_id, ended).await;
+    }
 
     // The scope keys: a share's recipient's shares', or the store key and,
     // on a device that holds the whole store, the key of every share in it
@@ -817,6 +839,31 @@ async fn refresh_grant(handler: &RpcHandler, store_id: StoreId) -> Option<bool> 
         }
     }
     Some(owner)
+}
+
+/// Record in a partial replica's manifest which of its scope roots the
+/// account no longer holds (`StoreManifest::ended_roots`; the scope roots
+/// themselves are never shrunk, and nothing else on disk is touched), and
+/// when that changed anything, tell the store's subscribers which roots
+/// ended just now (`StoreChangeKind::SharesEnded`): the app stops showing
+/// them and says so. A set that did not change, which is every connect
+/// after the one that learned of it, says nothing.
+async fn record_ended_roots(handler: &RpcHandler, store_id: StoreId, ended: Vec<NodeId>) {
+    let manager = handler.store_manager_handle();
+    let (before, changed) = {
+        let mut manager = manager.write().await;
+        let before = manager.ended_roots(store_id);
+        (before, manager.set_ended_roots(store_id, ended.clone()).await)
+    };
+    match changed {
+        Ok(false) => {}
+        Ok(true) => {
+            let just_now: Vec<NodeId> = ended.iter().filter(|root| !before.contains(root)).copied().collect();
+            info!("Vault link for store {}: {} share(s) of it ended just now; {} of the shares held here have ended in all", store_id, just_now.len(), ended.len());
+            handler.notify_shares_ended(store_id, just_now).await;
+        }
+        Err(e) => warn!("Vault link for store {}: could not record which shares have ended: {}", store_id, e),
+    }
 }
 
 /// Fetch and unwrap the scope keys the signed-in account has been handed
@@ -1218,7 +1265,8 @@ fn document_of(kind: &StoreChangeKind) -> Option<NodeId> {
         StoreChangeKind::VaultAppended { .. }
         | StoreChangeKind::SyncStateChanged { .. }
         | StoreChangeKind::MountStateChanged { .. }
-        | StoreChangeKind::ShareStateChanged { .. } => None,
+        | StoreChangeKind::ShareStateChanged { .. }
+        | StoreChangeKind::SharesEnded { .. } => None,
     }
 }
 

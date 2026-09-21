@@ -354,8 +354,13 @@ async fn supervise(
                 // on every connect: a store created since the last one has to
                 // be recognised as encrypted before its first `getChildren`,
                 // and a share that has arrived since has to be recognised as
-                // one before its store is described to the UI.
-                vault.learn_rows().await;
+                // one before its store is described to the UI. A share that
+                // has ended since is said here, before the list that no
+                // longer names it: the page drops the folder with a notice,
+                // and the store's row with it when it was the last.
+                for event in vault.learn_rows().await {
+                    emit(event_tx, signal_ui, event);
+                }
 
                 // Every subscription this page had belonged to the socket that
                 // has just been replaced, so they are all gone and are made
@@ -532,8 +537,11 @@ async fn supervise_relayed(
                 stores.retain(|store| served.contains(&store.id));
                 if let Some(c) = candidate.as_ref() {
                     // A share accepted since the session's endpoint last
-                    // connected is in the account's list and not yet here.
-                    vault.learn_rows().await;
+                    // connected is in the account's list and not yet here
+                    // (and one that ended since is said, as above).
+                    for event in vault.learn_rows().await {
+                        emit(event_tx, signal_ui, event);
+                    }
                     let served_here = |store_id: StoreId| served.contains(&store_id);
                     vault.forget_subscriptions(served_here);
                     let listed_ids: Vec<StoreId> = stores.iter().map(|store| store.id).collect();

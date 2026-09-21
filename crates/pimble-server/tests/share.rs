@@ -1538,6 +1538,176 @@ async fn a_big_folder_is_wrapped_in_slices_and_its_scope_published_once_all_of_i
     a.stop().await.unwrap();
 }
 
+/// The roots a member's replica is told have ended, from now until `want`
+/// have all been named (in one notification or several).
+async fn shares_ended_naming(changes: &mut jsonrpsee::core::client::Subscription<pimble_rpc::StoreChangedNotification>, want: &[NodeId]) -> Vec<Vec<NodeId>> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut told: Vec<Vec<NodeId>> = Vec::new();
+        while let Some(Ok(notif)) = changes.next().await {
+            let StoreChangeKind::SharesEnded { node_ids } = notif.change_kind else { continue };
+            assert_eq!(notif.source_client_id, None, "derived by this server, nobody's edit");
+            told.push(node_ids);
+            if want.iter().all(|root| told.iter().flatten().any(|named| named == root)) {
+                break;
+            }
+        }
+        told
+    })
+    .await
+    .expect("the member's replica is told which shares ended")
+}
+
+/// Joe, 2026-09-21, what a removed member's machine shows: the folder
+/// leaves the explorer with a notice, and the files go when the replica is
+/// removed. The server's half: a root the account's rows no longer name is
+/// recorded as ended (never dropped from the scope roots), announced once,
+/// read only and unfound by a search; the share still held goes on as
+/// before; a root granted again is un-ended; with every share ended the
+/// replica is read only, whole on disk, and `removeReplica` is what deletes it.
+#[tokio::test]
+async fn a_share_that_ended_is_announced_and_kept_on_disk_until_the_replica_is_removed() {
+    let env = spawn_env().await;
+    let (mut a, alice, a_dir) = start_local_server().await;
+    let fx = hosted_fixture(&env, &alice, a_dir.path()).await;
+    let (store_id, holiday) = (fx.store_id, fx.shared);
+    let recipes = alice.create_node(store_id, Some(fx.root_id), "folder", "Recipes").await.unwrap();
+    let soup = alice.create_node(store_id, Some(recipes), "document", "Soup").await.unwrap();
+    seed_content(&alice, store_id, soup, "seed", "leeks and potatoes").await;
+    alice.cloud_share_node(store_id, holiday, "Holiday Plans").await.unwrap();
+    alice.cloud_share_node(store_id, recipes, "Recipes").await.unwrap();
+    alice.cloud_share_invite(store_id, holiday, BOB.0, MemberRole::Editor).await.unwrap();
+    alice.cloud_share_invite(store_id, recipes, BOB.0, MemberRole::Editor).await.unwrap();
+
+    // Bob's device asks about its grant every second, in place of two minutes.
+    let b_dir = tempfile::tempdir().unwrap();
+    let mut b = PimbleServer::with_config(ServerConfig { grant_check_interval: Some(Duration::from_secs(1)), ..device_config(b_dir.path()) });
+    b.start().await.unwrap();
+    let bob = PimbleClient::connect(format!("http://{}", b.addr())).await.unwrap();
+    env.sign_in(&bob, BOB).await;
+    let added = bob.cloud_add_hosted_store(store_id).await.unwrap();
+    assert_eq!(sorted(added.roots.clone()), sorted(vec![holiday, recipes]));
+    assert!(added.ended_roots.is_empty());
+    let replica_path = added.local_path().cloned().expect("a replica is a local store");
+    let pulled = wait_until(Duration::from_secs(20), || async {
+        node_text(&bob, store_id, fx.inside).await.contains("socks and a map") && node_text(&bob, store_id, soup).await.contains("leeks and potatoes")
+    })
+    .await;
+    assert!(pulled, "both shares are pulled");
+    let found = |hits: Vec<pimble_rpc::SearchResultItem>| hits.into_iter().map(|hit| hit.node_id).collect::<Vec<_>>();
+    let indexed = wait_until(Duration::from_secs(20), || async { bob.search("socks", vec![store_id], false, 10).await.map(found).unwrap_or_default().contains(&fx.inside) }).await;
+    assert!(indexed, "a document of the share is found by a search while the share is held");
+    let mut bob_changes = bob.subscribe_store_changes(store_id).await.unwrap();
+
+    // Removed from one of the two.
+    alice.cloud_share_remove_member(store_id, holiday, BOB.0).await.unwrap();
+    assert_eq!(shares_ended_naming(&mut bob_changes, &[holiday]).await, vec![vec![holiday]]);
+    let listed = bob.list_stores().await.unwrap().into_iter().find(|s| s.id == store_id).unwrap();
+    assert_eq!(sorted(listed.roots.clone()), sorted(vec![holiday, recipes]), "the scope roots are never shrunk");
+    assert_eq!((listed.ended_roots.clone(), listed.shown_roots()), (vec![holiday], vec![recipes]));
+    let held = bob.get_store_sync_response(store_id).await.unwrap();
+    assert_eq!((held.ended_roots.clone(), held.access), (vec![holiday], StoreAccess::Full));
+    assert!(held.read_only_roots.contains(&holiday), "an ended root is held read only, as before: {:?}", held.read_only_roots);
+
+    // Nothing was deleted, nothing under it takes an edit, and a search
+    // does not find what the explorer no longer shows.
+    assert!(node_text(&bob, store_id, fx.inside).await.contains("socks and a map"));
+    assert_eq!(child_ids(&bob, store_id, holiday).await, vec![fx.inside, fx.deeper]);
+    let refused = bob.create_node(store_id, Some(holiday), "document", "Too late").await.expect_err("an ended share takes no edits").to_string();
+    assert!(refused.contains(StoreAccess::READ_ONLY_REFUSAL), "{refused}");
+    assert!(!bob.search("socks", vec![store_id], false, 10).await.map(found).unwrap().contains(&fx.inside));
+
+    // The share still held syncs and takes edits, both ways.
+    let synced = wait_until(Duration::from_secs(20), || async { matches!(bob.get_store_sync(store_id).await, Ok((_, SyncState::Synced { .. }))) }).await;
+    assert!(synced, "the link is up again with a token for the share that is left");
+    rename(&bob, store_id, soup, "Leek soup").await;
+    let reached = wait_until(Duration::from_secs(20), || async { node_title(&alice, store_id, soup).await == "Leek soup" }).await;
+    assert!(reached, "the member's edit in the share still held reaches the owner");
+    let bread = alice.create_node(store_id, Some(recipes), "document", "Bread").await.unwrap();
+    let arrived = wait_until(Duration::from_secs(30), || async { child_ids(&bob, store_id, recipes).await == vec![soup, bread] }).await;
+    assert!(arrived, "and the owner's reaches the member: {:?}", child_ids(&bob, store_id, recipes).await);
+    // What the owner does in the ended share no longer arrives.
+    rename(&alice, store_id, fx.inside, "Packing, revised").await;
+
+    // Invited again: un-ended by the same comparison, and editable again.
+    alice.cloud_share_invite(store_id, holiday, BOB.0, MemberRole::Editor).await.unwrap();
+    let unended = wait_until(Duration::from_secs(30), || async {
+        bob.get_store_sync_response(store_id).await.is_ok_and(|held| held.ended_roots.is_empty() && held.read_only_roots.is_empty())
+    })
+    .await;
+    assert!(unended, "a root granted again is no longer ended");
+    assert!(bob.list_stores().await.unwrap().into_iter().find(|s| s.id == store_id).unwrap().ended_roots.is_empty());
+    let caught_up = wait_until(Duration::from_secs(30), || async { node_title(&bob, store_id, fx.inside).await == "Packing, revised" }).await;
+    assert!(caught_up, "and what was missed meanwhile arrives");
+    let ferry = bob.create_node(store_id, Some(holiday), "document", "Ferry").await.expect("the share takes edits again");
+    assert!(wait_until(Duration::from_secs(20), || async { alice.get_node(store_id, ferry).await.is_ok() }).await);
+
+    // Removed from every share: every root ended, read only, all of it
+    // still on disk.
+    alice.cloud_share_remove_member(store_id, holiday, BOB.0).await.unwrap();
+    alice.cloud_share_remove_member(store_id, recipes, BOB.0).await.unwrap();
+    let told = shares_ended_naming(&mut bob_changes, &[holiday, recipes]).await;
+    assert_eq!(sorted(told.into_iter().flatten().collect()), sorted(vec![holiday, recipes]), "each root is announced once");
+    let all_ended = wait_until(Duration::from_secs(30), || async {
+        bob.get_store_sync_response(store_id).await.is_ok_and(|held| held.ended_roots.len() == 2 && held.access == StoreAccess::Read)
+    })
+    .await;
+    assert!(all_ended, "{:?}", bob.get_store_sync_response(store_id).await);
+    let listed = bob.list_stores().await.unwrap().into_iter().find(|s| s.id == store_id).unwrap();
+    assert!(listed.every_share_ended() && listed.shown_roots().is_empty(), "nothing of it is shown: {listed:?}");
+    assert_eq!(sorted(listed.roots.clone()), sorted(vec![holiday, recipes]), "and it is a partial replica still");
+    for (doc, text) in [(fx.inside, "socks and a map"), (soup, "leeks and potatoes")] {
+        assert!(node_text(&bob, store_id, doc).await.contains(text), "nothing was deleted");
+        assert!(replica_path.join("nodes").join(format!("{doc}.yrs")).exists());
+    }
+    let refused = bob.create_node(store_id, Some(recipes), "document", "Too late").await.expect_err("read only throughout").to_string();
+    assert!(refused.contains(StoreAccess::READ_ONLY_REFUSAL), "{refused}");
+    assert!(bob.search("leeks", vec![store_id], false, 10).await.map(found).unwrap().is_empty());
+
+    // Removing the replica is where the files go.
+    bob.remove_replica(store_id, true).await.expect("an ended replica can be removed");
+    assert!(!replica_path.exists(), "the directory is deleted with the replica");
+    assert!(bob.list_stores().await.unwrap().iter().all(|s| s.id != store_id));
+
+    a.stop().await.unwrap();
+    b.stop().await.unwrap();
+}
+
+/// A share that ended and is granted again is one the app offers under "Add
+/// Hosted Store..." (its root is not shown any more): adding it un-ends it
+/// at once, with no wait for the link's next look at the grant, and the
+/// same replica, with everything it held, carries on.
+#[tokio::test]
+async fn a_share_granted_again_is_added_again_to_the_replica_that_kept_it() {
+    let env = spawn_env().await;
+    let (mut a, alice, a_dir) = start_local_server().await;
+    let fx = hosted_fixture(&env, &alice, a_dir.path()).await;
+    let (store_id, holiday) = (fx.store_id, fx.shared);
+    alice.cloud_share_node(store_id, holiday, "Holiday Plans").await.unwrap();
+    alice.cloud_share_invite(store_id, holiday, BOB.0, MemberRole::Editor).await.unwrap();
+    let (mut b, bob, _b_dir) = member_device(&env, BOB, &fx).await;
+    let mut bob_changes = bob.subscribe_store_changes(store_id).await.unwrap();
+
+    // Removed; the link reads the grant again at its next connect.
+    alice.cloud_share_remove_member(store_id, holiday, BOB.0).await.unwrap();
+    env.relay.cut();
+    env.relay.restore();
+    assert_eq!(shares_ended_naming(&mut bob_changes, &[holiday]).await, vec![vec![holiday]]);
+    let ended = bob.list_stores().await.unwrap().into_iter().find(|s| s.id == store_id).unwrap();
+    assert!(ended.every_share_ended() && ended.access == StoreAccess::Read, "{ended:?}");
+    let refused = bob.cloud_add_hosted_store(store_id).await.expect_err("nothing of it is granted").to_string();
+    assert!(!refused.is_empty());
+
+    alice.cloud_share_invite(store_id, holiday, BOB.0, MemberRole::Editor).await.unwrap();
+    let again = bob.cloud_add_hosted_store(store_id).await.expect("a share granted again is added again");
+    assert_eq!((again.roots.clone(), again.ended_roots.clone(), again.access), (vec![holiday], Vec::new(), StoreAccess::Full));
+    assert!(node_text(&bob, store_id, fx.inside).await.contains("socks and a map"), "the replica that kept it");
+    let ferry = bob.create_node(store_id, Some(holiday), "document", "Ferry").await.expect("and it takes edits again");
+    assert!(wait_until(Duration::from_secs(20), || async { alice.get_node(store_id, ferry).await.is_ok() }).await, "which reach the owner");
+
+    a.stop().await.unwrap();
+    b.stop().await.unwrap();
+}
+
 // ── Against the REAL accounts service (crates/pimble-cloud) ──────────────
 //
 // Everything above drives a stub. This walks the owner's half of sharing

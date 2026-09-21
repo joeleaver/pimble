@@ -149,6 +149,49 @@ pub fn access_words(access: pimble_core::StoreAccess) -> &'static str {
     }
 }
 
+/// What a removed member is told, once per folder, when a share ends (they
+/// were removed from it, or its owner stopped sharing it) and the folder
+/// leaves the explorer (Joe, 2026-09-21). `title` is the shared folder's, from
+/// the app's own node cache; without one the sentence does not name it.
+pub fn share_ended_sentence(title: Option<&str>) -> String {
+    match title.map(str::trim).filter(|title| !title.is_empty()) {
+        Some(title) => format!("\"{title}\" is no longer shared with you."),
+        None => "A shared folder is no longer shared with you.".to_string(),
+    }
+}
+
+/// What the row of a share's replica says once every share it held has
+/// ended, in place of who shared it, what may be done with it and how its
+/// link is doing: none of that is true of it any more. The row stays because
+/// the files do, until "Remove Replica..." deletes them.
+pub const NO_LONGER_SHARED_WORDS: &str = "no longer shared";
+
+/// The one line at the top of that row's menu: why everything that changes
+/// anything is off, and what the one item left is for.
+pub const ENDED_REPLICA_NOTE: &str =
+    "This is no longer shared with you. \"Remove Replica...\" deletes its files from this computer.";
+
+/// The words after a store row's name that say whose store it is and what
+/// this device may do in it: "shared by <owner>", with "read only" for a
+/// reader, and [`NO_LONGER_SHARED_WORDS`] alone once every share has ended.
+/// Empty for one's own store.
+pub fn shared_by_words(store: &Store) -> String {
+    if store.every_share_ended() {
+        return NO_LONGER_SHARED_WORDS.to_string();
+    }
+    match &store.shared_by {
+        Some(email) => {
+            let words = access_words(store.access);
+            if words.is_empty() {
+                format!("shared by {email}")
+            } else {
+                format!("shared by {email} · {words}")
+            }
+        }
+        None => String::new(),
+    }
+}
+
 /// Why a row's menu items are disabled, or empty when they are not. Reading
 /// is the only access that disables anything, and it disables everything that
 /// writes, so one sentence at the top of the menu says it once: the same
@@ -355,6 +398,84 @@ pub fn stop_relaying_item_disabled(relay: pimble_core::RelaySide) -> bool {
 /// an unlink of one).
 pub fn unlink_item_disabled(linked: bool, relay: pimble_core::RelaySide) -> bool {
     !linked || relay == pimble_core::RelaySide::Owner
+}
+
+/// What a store row's menu snapshots when the row renders: everything its
+/// items' `disabled` values are decided from (rinch #714: a menu item is
+/// static, so each of these is also in the row's `TreeNodeData`).
+#[derive(Debug, Clone, Copy)]
+pub struct StoreRowFacts {
+    /// What this device may change in the store.
+    pub access: pimble_core::StoreAccess,
+    pub linked: bool,
+    pub replica: bool,
+    pub vault: bool,
+    pub relay: pimble_core::RelaySide,
+    /// The store reached this device as someone else's share.
+    pub held_as_share: bool,
+    /// The row's node (a whole store's root) carries a share marker.
+    pub shared_root: bool,
+    /// Something is copied for "Paste Mount Here".
+    pub mount_source_copied: bool,
+    /// A share's replica whose every share has ended.
+    pub every_share_ended: bool,
+}
+
+/// Which items of a store row's menu are off (`true` is disabled). "Close
+/// Store" is never off and is not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreRowMenu {
+    pub new_node: bool,
+    pub mount_store: bool,
+    pub mount_remote_store: bool,
+    pub copy_as_mount_source: bool,
+    pub paste_mount: bool,
+    pub link_to_remote: bool,
+    pub host: bool,
+    pub share: bool,
+    pub stop_relaying: bool,
+    pub unlink: bool,
+    pub remove_replica: bool,
+    pub appearance: bool,
+}
+
+/// The `disabled` value of every item of a store row's menu. A replica whose
+/// every share has ended (Joe, 2026-09-21) keeps its row because it keeps its
+/// files: everything that would change it, its link or another store from it
+/// is off, and "Remove Replica..." is where the files go.
+pub fn store_row_menu(facts: StoreRowFacts) -> StoreRowMenu {
+    let remove_replica = !facts.replica;
+    if facts.every_share_ended {
+        return StoreRowMenu {
+            new_node: true,
+            mount_store: true,
+            mount_remote_store: true,
+            copy_as_mount_source: true,
+            paste_mount: true,
+            link_to_remote: true,
+            host: true,
+            share: true,
+            stop_relaying: true,
+            unlink: true,
+            remove_replica,
+            appearance: true,
+        };
+    }
+    let read_only = !facts.access.allows_write();
+    StoreRowMenu {
+        new_node: read_only,
+        mount_store: read_only,
+        mount_remote_store: read_only,
+        copy_as_mount_source: false,
+        paste_mount: !facts.mount_source_copied || read_only,
+        link_to_remote: facts.linked,
+        host: host_item_disabled(facts.linked, facts.replica, facts.vault),
+        share: share_item_disabled(facts.access, facts.held_as_share, facts.shared_root),
+        stop_relaying: stop_relaying_item_disabled(facts.relay),
+        unlink: unlink_item_disabled(facts.linked, facts.relay),
+        remove_replica,
+        appearance: read_only,
+    }
 }
 
 /// What a store not yet named here is called in a list: the accounts service
@@ -673,6 +794,25 @@ pub struct AppStore {
     pub notice: Signal<String>,
 }
 
+/// What changed in the roots a store's row shows (`AppStore::set_store_roots`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RootsChange {
+    /// Shown until now, and ended: the share is no longer this account's.
+    /// These are the ones a notice is owed for.
+    pub ended: Vec<NodeId>,
+    /// Shown until now and no longer among the store's roots at all, with
+    /// nothing said about why.
+    pub gone: Vec<NodeId>,
+    /// Not shown until now: another share of the store, or one granted again.
+    pub arrived: Vec<NodeId>,
+}
+
+impl RootsChange {
+    pub fn is_empty(&self) -> bool {
+        self.ended.is_empty() && self.gone.is_empty() && self.arrived.is_empty()
+    }
+}
+
 /// Identifies the node currently open in the shared editor.
 #[derive(Clone)]
 pub struct ActiveEdit {
@@ -955,6 +1095,83 @@ impl AppStore {
                 map.get(&store_id).map(|sig| sig.with(|s| s.shown_roots())).unwrap_or_default()
             })
         })
+    }
+
+    /// Whether a store is a share's replica whose every share has ended
+    /// (`Store::every_share_ended`): its row shows no folder, says
+    /// [`NO_LONGER_SHARED_WORDS`], and offers "Remove Replica..." and nothing
+    /// that changes anything. Untracked.
+    pub fn every_share_ended(&self, store_id: StoreId) -> bool {
+        untracked(|| {
+            self.store_data
+                .with(|map| map.get(&store_id).map_or(false, |sig| sig.with(|s| s.every_share_ended())))
+        })
+    }
+
+    /// Bring the roots a store's row shows in line with what the backend says
+    /// now: `roots` when it sent the whole list (a `Store` it listed; `None`
+    /// keeps the list held), and the roots among them that have ended.
+    /// Answers what changed on the screen, so the caller can say so, drop
+    /// what left and fetch what arrived; the store's signal is written only
+    /// when something did.
+    pub fn set_store_roots(&self, store_id: StoreId, roots: Option<&[NodeId]>, ended_roots: &[NodeId]) -> RootsChange {
+        let Some(sig) = self.get_store_signal(store_id) else { return RootsChange::default() };
+        let (was_roots, was_ended, was_shown) = untracked(|| sig.with(|s| (s.roots.clone(), s.ended_roots.clone(), s.shown_roots())));
+        let same = |a: &[NodeId], b: &[NodeId]| a.len() == b.len() && a.iter().all(|id| b.contains(id));
+        let roots = roots.unwrap_or(&was_roots);
+        // Only a root of the store can have ended.
+        let ended_roots: Vec<NodeId> = ended_roots.iter().copied().filter(|root| roots.contains(root)).collect();
+        if roots == was_roots.as_slice() && same(&ended_roots, &was_ended) {
+            return RootsChange::default();
+        }
+        sig.update(|s| {
+            s.roots = roots.to_vec();
+            s.ended_roots = ended_roots.clone();
+        });
+        let now_shown = self.shown_roots(store_id);
+        let left: Vec<NodeId> = was_shown.iter().copied().filter(|root| !now_shown.contains(root)).collect();
+        RootsChange {
+            ended: left.iter().copied().filter(|root| ended_roots.contains(root)).collect(),
+            gone: left.iter().copied().filter(|root| !ended_roots.contains(root)).collect(),
+            arrived: now_shown.into_iter().filter(|root| !was_shown.contains(root)).collect(),
+        }
+    }
+
+    /// Record that the shares rooted at `roots` have ended, beside whatever
+    /// had already: the live notification names only the ones that ended
+    /// just now. Answers the ones this store was showing until this moment.
+    pub fn end_shares(&self, store_id: StoreId, roots: &[NodeId]) -> RootsChange {
+        let Some(sig) = self.get_store_signal(store_id) else { return RootsChange::default() };
+        let mut ended = untracked(|| sig.with(|s| s.ended_roots.clone()));
+        for root in roots {
+            if !ended.contains(root) {
+                ended.push(*root);
+            }
+        }
+        self.set_store_roots(store_id, None, &ended)
+    }
+
+    /// A cached node's title (untracked); `None` when the node is not cached.
+    pub fn cached_title(&self, store_id: StoreId, node_id: NodeId) -> Option<String> {
+        self.get_node_signal(store_id, node_id).map(|sig| untracked(|| sig.with(|n| n.metadata.title.clone())))
+    }
+
+    /// Whether `node_id` is `root` or under it, as far as the cached parent
+    /// chain says (untracked). A chain that breaks before it reaches `root`
+    /// (an ancestor the app never loaded) answers no.
+    pub fn is_at_or_under(&self, store_id: StoreId, node_id: NodeId, root: NodeId) -> bool {
+        let mut seen = HashSet::new();
+        let mut current = node_id;
+        while seen.insert(current) {
+            if current == root {
+                return true;
+            }
+            match self.cached_parent_id(store_id, current) {
+                Some(parent) => current = parent,
+                None => return false,
+            }
+        }
+        false
     }
 
     /// Whether a store is a partial replica — this device holds some shared
@@ -1454,9 +1671,9 @@ impl AppStore {
         let mut result = Vec::new();
         for &sid in &store_ids {
             let store_info = self.store_data.with(|map| {
-                map.get(&sid).map(|sig| sig.with(|s| (s.name.clone(), s.root_node_id, s.roots.clone())))
+                map.get(&sid).map(|sig| sig.with(|s| (s.name.clone(), s.root_node_id, s.roots.clone(), s.ended_roots.clone())))
             });
-            let Some((store_name, root_id, roots)) = store_info else { continue };
+            let Some((store_name, root_id, roots, ended_roots)) = store_info else { continue };
 
             // rinch's Tree re-renders a row only when its `TreeNodeData`
             // changes, and the store row's context menu snapshots whether the
@@ -1489,12 +1706,18 @@ impl AppStore {
             let relay = self
                 .store_data
                 .with(|map| map.get(&sid).map_or(pimble_core::RelaySide::None, |sig| sig.with(|s| s.relay)));
+            // The shares that have ended are in there as well: the last one
+            // to end leaves the row with no child to change, and its menu
+            // snapshots that every share has ended (everything that changes
+            // anything goes off, "Remove Replica..." stays).
             let roots_key: Vec<String> = roots.iter().map(|r| r.to_string()).collect();
+            let ended_key: Vec<String> = ended_roots.iter().map(|r| r.to_string()).collect();
             let store_node = TreeNodeData::new(
                 format!("store_{}", sid),
                 format!(
-                    "{store_name} (linked: {linked}, relay: {relay:?}, paste: {paste}, {access}, {root_appearance}, roots: {})",
-                    roots_key.join(",")
+                    "{store_name} (linked: {linked}, relay: {relay:?}, paste: {paste}, {access}, {root_appearance}, roots: {}, ended: {})",
+                    roots_key.join(","),
+                    ended_key.join(",")
                 ),
             );
             // A whole store's row stands for its root: the root's children hang
@@ -1504,10 +1727,17 @@ impl AppStore {
             // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "The recipient's
             // replica"). Its tree value is the ordinary `node_{store}_{node}`,
             // so opening, renaming and the context menu need no special case.
+            // A share that has ended is not shown: its root is still one of
+            // the replica's, and is no row (`Store::shown_roots`). When every
+            // share has ended the row has nothing under it.
             let children = if roots.is_empty() {
                 self.build_children_structural(sid, root_id, paste, &[])
             } else {
-                roots.iter().map(|&root| self.structural_node(sid, root, paste, &[])).collect()
+                roots
+                    .iter()
+                    .filter(|root| !ended_roots.contains(root))
+                    .map(|&root| self.structural_node(sid, root, paste, &[]))
+                    .collect()
             };
             if children.is_empty() {
                 result.push(store_node);
@@ -2236,6 +2466,154 @@ mod tests {
         let after = untracked(|| app.build_tree_data_structural());
         assert_ne!(before, after[0].label, "the store row never re-renders with the new root");
         assert_eq!(after[0].children.len(), 3);
+    }
+
+    /// A replica of two shares, with a document under each, parents and
+    /// lists as the server sends them.
+    fn a_replica_of_two_shares() -> (AppStore, StoreId, [NodeId; 2], [NodeId; 2]) {
+        let app = AppStore::new();
+        let mut store = Store::new_local("Shared by ann@example.com", "/tmp/anns.pimble".into());
+        let (mut recipes, mut trips) = (Node::folder("Recipes"), Node::folder("Trips"));
+        let (mut pasta, mut rome) = (Node::document("Pasta"), Node::document("Rome"));
+        pasta.parent_id = Some(recipes.id);
+        rome.parent_id = Some(trips.id);
+        recipes.children = vec![pasta.id];
+        trips.children = vec![rome.id];
+        store.root_node_id = recipes.id;
+        store.roots = vec![recipes.id, trips.id];
+        store.shared_by = Some("ann@example.com".to_string());
+        store.is_replica = true;
+        let store_id = store.id;
+        app.upsert_store(store);
+        app.set_children(store_id, recipes.id, vec![(store_id, pasta.id)]);
+        app.set_children(store_id, trips.id, vec![(store_id, rome.id)]);
+        let ids = ([recipes.id, trips.id], [pasta.id, rome.id]);
+        for node in [recipes, trips, pasta, rome] {
+            app.upsert_node(store_id, node);
+        }
+        (app, store_id, ids.0, ids.1)
+    }
+
+    /// The sentence a removed member reads, word for word (Joe, 2026-09-21).
+    #[test]
+    fn the_sentence_for_a_share_that_ended() {
+        assert_eq!(share_ended_sentence(Some("Trips")), "\"Trips\" is no longer shared with you.");
+        assert_eq!(share_ended_sentence(None), "A shared folder is no longer shared with you.");
+        assert_eq!(share_ended_sentence(Some("  ")), "A shared folder is no longer shared with you.", "an untitled folder is not named");
+    }
+
+    /// An ended share's root is no row, and the store row's data says which
+    /// have ended: the last one to end leaves the row with no child to
+    /// change, and its menu and words snapshot that every share has ended.
+    #[test]
+    fn an_ended_root_is_not_a_row_and_the_store_rows_data_says_so() {
+        let (app, store_id, [recipes, trips], _) = a_replica_of_two_shares();
+        let before = untracked(|| app.build_tree_data_structural());
+        assert_eq!(before[0].children.len(), 2);
+
+        let change = app.end_shares(store_id, &[trips]);
+        assert_eq!(change, RootsChange { ended: vec![trips], ..Default::default() });
+        assert_eq!(app.shown_roots(store_id), vec![recipes]);
+        assert!(!app.every_share_ended(store_id));
+        assert!(app.is_partial_replica(store_id), "still a share's replica");
+        let one_left = untracked(|| app.build_tree_data_structural());
+        assert_eq!(one_left[0].children.iter().map(|row| row.value.clone()).collect::<Vec<_>>(), vec![format!("node_{store_id}_{recipes}")]);
+        assert_ne!(before[0].label, one_left[0].label);
+        assert!(app.end_shares(store_id, &[trips]).is_empty(), "told twice, nothing changes");
+
+        let change = app.end_shares(store_id, &[recipes]);
+        assert_eq!(change.ended, vec![recipes]);
+        assert!(app.every_share_ended(store_id));
+        assert!(app.shown_roots(store_id).is_empty(), "never the fallback to the store's root: that is the folder that ended");
+        let none_left = untracked(|| app.build_tree_data_structural());
+        assert_eq!(none_left.len(), 1, "the store row stays: the files do");
+        assert!(none_left[0].children.is_empty());
+        assert_ne!(one_left[0].label, none_left[0].label, "the row never re-renders with its ended menu");
+
+        // Granted again: the whole set as the server has it now.
+        let change = app.set_store_roots(store_id, None, &[trips]);
+        assert_eq!(change, RootsChange { arrived: vec![recipes], ..Default::default() });
+        assert_eq!(app.shown_roots(store_id), vec![recipes]);
+        assert!(app.set_store_roots(store_id, None, &[trips]).is_empty());
+
+        // A listing whose roots no longer name one at all (the browser,
+        // which holds no replica): it left, and nothing says it ended.
+        let change = app.set_store_roots(store_id, Some(&[trips]), &[]);
+        assert_eq!(change, RootsChange { gone: vec![recipes], arrived: vec![trips], ..Default::default() });
+    }
+
+    /// The words on the row of a replica whose every share has ended, in
+    /// place of whose it was and what it allowed.
+    #[test]
+    fn the_row_of_an_ended_replica_says_no_longer_shared() {
+        let mut store = Store::new_local("Holiday Plans", "/tmp/replica.pimble".into());
+        assert_eq!(shared_by_words(&store), "", "one's own store says nothing");
+        let (trips, recipes) = (NodeId::new(), NodeId::new());
+        store.shared_by = Some("ann@example.com".to_string());
+        store.roots = vec![trips, recipes];
+        assert_eq!(shared_by_words(&store), "shared by ann@example.com");
+        store.access = StoreAccess::Read;
+        assert_eq!(shared_by_words(&store), "shared by ann@example.com · read only");
+        store.ended_roots = vec![trips];
+        assert_eq!(shared_by_words(&store), "shared by ann@example.com · read only", "one share of it is still held");
+        store.ended_roots = vec![trips, recipes];
+        assert_eq!(shared_by_words(&store), "no longer shared");
+        assert_eq!(shared_by_words(&store), NO_LONGER_SHARED_WORDS);
+    }
+
+    /// The menu of that row: everything that changes anything is off, and
+    /// "Remove Replica..." is still there, because that is where the files go.
+    #[test]
+    fn the_menu_of_an_ended_replica_offers_removal_and_nothing_that_changes_anything() {
+        let facts = StoreRowFacts {
+            access: StoreAccess::Read,
+            linked: true,
+            replica: true,
+            vault: false,
+            relay: pimble_core::RelaySide::None,
+            held_as_share: true,
+            shared_root: false,
+            mount_source_copied: true,
+            every_share_ended: true,
+        };
+        let menu = store_row_menu(facts);
+        assert!(!menu.remove_replica, "\"Remove Replica...\" is available");
+        let off = [
+            menu.new_node,
+            menu.mount_store,
+            menu.mount_remote_store,
+            menu.copy_as_mount_source,
+            menu.paste_mount,
+            menu.link_to_remote,
+            menu.host,
+            menu.share,
+            menu.stop_relaying,
+            menu.unlink,
+            menu.appearance,
+        ];
+        assert!(off.iter().all(|disabled| *disabled), "{menu:?}");
+
+        // The same replica while a share of it is held, as an editor: what
+        // it always offered ("Unlink from Remote" included).
+        let held = store_row_menu(StoreRowFacts { access: StoreAccess::Full, every_share_ended: false, ..facts });
+        assert!(!held.new_node && !held.paste_mount && !held.unlink && !held.remove_replica && !held.appearance && !held.copy_as_mount_source);
+        assert!(held.link_to_remote && held.host && held.share && held.stop_relaying);
+        // And one's own unlinked store.
+        let own = store_row_menu(StoreRowFacts { access: StoreAccess::Full, linked: false, replica: false, held_as_share: false, mount_source_copied: false, every_share_ended: false, ..facts });
+        assert!(!own.new_node && !own.link_to_remote && !own.host && !own.share && !own.appearance);
+        assert!(own.paste_mount && own.unlink && own.remove_replica && own.stop_relaying);
+    }
+
+    /// Whether a node is under a root is read off the cached parent chain.
+    #[test]
+    fn a_node_is_under_a_root_by_its_cached_parents() {
+        let (app, store_id, [recipes, trips], [pasta, rome]) = a_replica_of_two_shares();
+        assert!(app.is_at_or_under(store_id, rome, trips) && app.is_at_or_under(store_id, trips, trips));
+        assert!(!app.is_at_or_under(store_id, pasta, trips));
+        assert!(app.is_at_or_under(store_id, pasta, recipes));
+        assert!(!app.is_at_or_under(store_id, NodeId::new(), trips), "a node the app never loaded");
+        assert_eq!(app.cached_title(store_id, trips).as_deref(), Some("Trips"));
+        assert_eq!(app.cached_title(store_id, NodeId::new()), None);
     }
 
     /// A whole store keeps the behaviour it always had: the store row stands

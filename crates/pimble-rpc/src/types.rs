@@ -412,6 +412,11 @@ pub struct GetStoreSyncResponse {
     /// connects again).
     #[serde(default)]
     pub read_only_roots: Vec<NodeId>,
+    /// The roots the account no longer holds (removed from that share, or
+    /// the share was stopped), mirroring `Store::ended_roots`: still on this
+    /// device, read only, and not shown. Missing from an older server: none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ended_roots: Vec<NodeId>,
     /// Whether the store is reached through Pimble Cloud's relay and from
     /// which end, mirroring `Store::relay` (docs/RELAY_CONTRACT.md).
     /// `sync_mode` is `Vault` for a relayed store either way.
@@ -680,6 +685,16 @@ pub enum StoreChangeKind {
     /// device (its key handover, its scope publishing, docs/NODE_DOCUMENT_CONTRACT.md
     /// section 5). Derived state: links never forward it.
     ShareStateChanged { node_id: NodeId, state: SyncState },
+    /// On a share's replica: the account no longer holds the shares rooted
+    /// at `node_ids` (it was removed from them, or their owner stopped
+    /// sharing), as the replica's link learned just now from the accounts
+    /// service (docs/NODE_DOCUMENT_CONTRACT.md section 5). Sent whenever the
+    /// set of ended roots changes, naming the roots that ended with this
+    /// notification, not every root that ever has (`Store::ended_roots` and
+    /// `getStoreSync` are that): empty when the change was a share granted
+    /// again. A client stops showing the ones named; nothing is deleted
+    /// before the replica is removed. Derived state: links never forward it.
+    SharesEnded { node_ids: Vec<NodeId> },
 }
 
 /// Notification that a node's content has changed.
@@ -989,4 +1004,28 @@ pub struct CloudShareRemoveMemberRequest {
 pub struct CloudShareInfoResponse {
     pub share: ShareInfo,
     pub members: Vec<ShareMember>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `SharesEnded` on the wire, and `getStoreSync`'s answer from a server
+    /// from before ended roots: none.
+    #[test]
+    fn ended_shares_on_the_wire() {
+        let root = NodeId::new();
+        let kind = StoreChangeKind::SharesEnded { node_ids: vec![root] };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json, serde_json::json!({ "shares_ended": { "node_ids": [root] } }));
+        assert!(matches!(serde_json::from_value(json).unwrap(), StoreChangeKind::SharesEnded { node_ids } if node_ids == vec![root]));
+
+        let older: GetStoreSyncResponse = serde_json::from_str(r#"{ "remote": null, "state": { "state": "offline" } }"#).unwrap();
+        assert!(older.ended_roots.is_empty());
+        let mut answer = older;
+        assert!(serde_json::to_value(&answer).unwrap().get("ended_roots").is_none(), "skipped when empty");
+        answer.ended_roots = vec![root];
+        let back: GetStoreSyncResponse = serde_json::from_value(serde_json::to_value(&answer).unwrap()).unwrap();
+        assert_eq!(back.ended_roots, vec![root]);
+    }
 }

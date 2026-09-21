@@ -785,6 +785,11 @@ async fn sync_state(store_id: &str) -> Result<()> {
     println!("State: {:?}", answer.state);
     println!("Mode: {:?}", answer.sync_mode);
     println!("Access: {:?}", answer.access);
+    // A share's replica: the shares of it this account no longer holds.
+    // Their files stay here until the replica is removed.
+    for root in &answer.ended_roots {
+        println!("No longer shared: {}", root);
+    }
     match answer.relay {
         pimble_core::RelaySide::None => {}
         pimble_core::RelaySide::Owner => println!("Relay: shared from this computer (the remote is where members reach it)"),

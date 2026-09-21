@@ -123,6 +123,14 @@ pub struct Store {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_only_roots: Vec<NodeId>,
 
+    /// The roots among [`Store::roots`] the account no longer holds: it was
+    /// removed from that share, or the share was stopped
+    /// (`StoreManifest::ended_roots`). They are still on this device, read
+    /// only, until the replica is removed; they are not shown
+    /// ([`Store::shown_roots`]). Missing in older serializations: none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ended_roots: Vec<NodeId>,
+
     /// Whether the store is reached through Pimble Cloud's relay, and from
     /// which end (docs/RELAY_CONTRACT.md). Beside `sync_mode`, which stays
     /// `Vault` for a relayed store (its link is a vault link, and a client
@@ -133,13 +141,24 @@ pub struct Store {
 }
 
 impl Store {
-    /// The roots to show: [`Store::roots`], or the store's root when none is listed.
+    /// The roots to show. A whole store (no root listed) shows its own root.
+    /// A partial replica shows the roots it lists, less the ones that have
+    /// ended ([`Store::ended_roots`]); when every one has ended that is no
+    /// root at all, never the fallback to `root_node_id`, which is a whole
+    /// store's alone (a partial replica's `root_node_id` is its first scope
+    /// root: the very folder that is no longer shared).
     pub fn shown_roots(&self) -> Vec<NodeId> {
         if self.roots.is_empty() {
             vec![self.root_node_id]
         } else {
-            self.roots.clone()
+            self.roots.iter().filter(|root| !self.ended_roots.contains(root)).copied().collect()
         }
+    }
+
+    /// Whether this is a share's replica whose every share has ended: it
+    /// lists roots and shows none of them.
+    pub fn every_share_ended(&self) -> bool {
+        !self.roots.is_empty() && self.roots.iter().all(|root| self.ended_roots.contains(root))
     }
 
     /// Create a new local store
@@ -157,6 +176,7 @@ impl Store {
             shared_by: None,
             roots: Vec::new(),
             read_only_roots: Vec::new(),
+            ended_roots: Vec::new(),
             relay: RelaySide::None,
         }
     }
@@ -176,6 +196,7 @@ impl Store {
             shared_by: None,
             roots: Vec::new(),
             read_only_roots: Vec::new(),
+            ended_roots: Vec::new(),
             relay: RelaySide::None,
         }
     }
@@ -432,6 +453,15 @@ pub struct StoreManifest {
     /// and not a whole copy. Empty for a whole store.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope_roots: Vec<NodeId>,
+
+    /// The scope roots this account no longer holds: it was removed from
+    /// that share, or the share was stopped. A subset of `scope_roots`,
+    /// which is never shrunk: it is what makes the replica partial, and a
+    /// replica whose every share ended stays partial and read only. The
+    /// documents stay on disk until the replica is removed. Missing in older
+    /// serializations: none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ended_roots: Vec<NodeId>,
 }
 
 impl StoreManifest {
@@ -457,6 +487,70 @@ impl StoreManifest {
             modified_at: now,
             kind,
             scope_roots: Vec::new(),
+            ended_roots: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn partial(roots: Vec<NodeId>, ended: Vec<NodeId>) -> Store {
+        let mut store = Store::new_local("Shared by ana@example.com", PathBuf::from("/tmp/replica.pimble"));
+        store.root_node_id = roots[0];
+        store.roots = roots;
+        store.ended_roots = ended;
+        store
+    }
+
+    #[test]
+    fn a_whole_store_shows_its_own_root() {
+        let store = Store::new_local("Notes", PathBuf::from("/tmp/notes.pimble"));
+        assert_eq!(store.shown_roots(), vec![store.root_node_id]);
+        assert!(!store.every_share_ended());
+    }
+
+    #[test]
+    fn an_ended_root_is_not_shown() {
+        let (trips, recipes) = (NodeId::new(), NodeId::new());
+        let store = partial(vec![trips, recipes], vec![trips]);
+        assert_eq!(store.shown_roots(), vec![recipes]);
+        assert!(!store.every_share_ended());
+    }
+
+    /// The fallback to `root_node_id` is a whole store's: a partial replica's
+    /// `root_node_id` is its first scope root, the folder that ended.
+    #[test]
+    fn a_replica_whose_every_root_ended_shows_nothing() {
+        let (trips, recipes) = (NodeId::new(), NodeId::new());
+        let store = partial(vec![trips, recipes], vec![recipes, trips]);
+        assert_eq!(store.shown_roots(), Vec::<NodeId>::new());
+        assert!(store.every_share_ended());
+    }
+
+    #[test]
+    fn ended_roots_are_absent_from_older_serializations_and_skipped_when_empty() {
+        let trips = NodeId::new();
+        let store = partial(vec![trips], Vec::new());
+        let json = serde_json::to_value(&store).unwrap();
+        assert!(json.get("ended_roots").is_none(), "skipped when empty: {json}");
+        let back: Store = serde_json::from_value(json).unwrap();
+        assert!(back.ended_roots.is_empty());
+
+        let ended = partial(vec![trips], vec![trips]);
+        let back: Store = serde_json::from_value(serde_json::to_value(&ended).unwrap()).unwrap();
+        assert_eq!(back.ended_roots, vec![trips]);
+    }
+
+    #[test]
+    fn a_manifest_from_before_ended_roots_reads_as_none() {
+        let manifest = StoreManifest::new("Trips", NodeId::new());
+        let mut json = serde_json::to_value(&manifest).unwrap();
+        assert!(json.get("ended_roots").is_none(), "skipped when empty: {json}");
+        json.as_object_mut().unwrap().insert("scope_roots".into(), serde_json::json!([manifest.root_node_id]));
+        let old: StoreManifest = serde_json::from_value(json).unwrap();
+        assert_eq!(old.scope_roots, vec![manifest.root_node_id]);
+        assert!(old.ended_roots.is_empty());
     }
 }

@@ -500,6 +500,7 @@ impl Upkeep {
             | StoreChangeKind::SyncStateChanged { .. }
             | StoreChangeKind::MountStateChanged { .. }
             | StoreChangeKind::ShareStateChanged { .. }
+            | StoreChangeKind::SharesEnded { .. }
             | StoreChangeKind::VaultAppended { .. } => return,
         }
         self.retry_wait = UPKEEP_RETRY;

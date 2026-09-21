@@ -273,7 +273,10 @@ pub enum BackendEvent {
     /// `Store::read_only_roots`): a role the owner changed while the app runs
     /// arrives here, and the handler refetches what it holds of the store
     /// when either differs, because every node carries the server's
-    /// judgement of itself (`Node::access`). `relay` is which end of Pimble
+    /// judgement of itself (`Node::access`). `ended_roots` are the shares of
+    /// the store this account no longer holds (`Store::ended_roots`): a
+    /// share's replica keeps their files until it is removed, and the
+    /// explorer does not show them. `relay` is which end of Pimble
     /// Cloud's relay this device is for the store, if either
     /// (`Store::relay`, docs/RELAY_CONTRACT.md): the owner's row says
     /// `shared from here`. `owner_offline` is a backend that KNOWS the store
@@ -289,6 +292,7 @@ pub enum BackendEvent {
         sync_mode: pimble_core::StoreKind,
         access: pimble_core::StoreAccess,
         read_only_roots: Vec<NodeId>,
+        ended_roots: Vec<NodeId>,
         relay: pimble_core::RelaySide,
         owner_offline: bool,
     },

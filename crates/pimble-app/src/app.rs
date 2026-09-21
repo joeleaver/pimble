@@ -997,9 +997,12 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             let relay_now = parsed
                 .map(|(s_id, _)| store.store_relay(s_id))
                 .unwrap_or_default();
-            let host_disabled = crate::state::host_item_disabled(is_linked_now, is_replica_now, is_vault_now);
-            let unlink_disabled = crate::state::unlink_item_disabled(is_linked_now, relay_now);
-            let stop_relaying_disabled = crate::state::stop_relaying_item_disabled(relay_now);
+            // And whether this is a share's replica whose every share has
+            // ended (Joe, 2026-09-21): the row stays because the files do,
+            // everything that changes anything is off, and "Remove
+            // Replica..." is where the files go. Snapshotted like the
+            // others; the store row's data carries the ended roots.
+            let ended_now = is_store_root && parsed.map_or(false, |(s_id, _)| store.every_share_ended(s_id));
             // A browser build has none of those items to explain.
             let relayed_note_text = if CAN_ADMINISTER_STORES && is_store_root {
                 crate::state::relayed_store_note(relay_now)
@@ -1453,30 +1456,17 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             let shared_by_note: Option<NodeHandle> = if is_store_root {
                 // The sidebar is narrow enough to clip this, so the same
                 // sentence is the row's tooltip.
+                // Once every share of it has ended the words are "no longer
+                // shared", in place of whose it was and what it allowed.
                 let shared_by_text = move || -> String {
-                    store_sig
-                        .map(|sig| {
-                            sig.with(|s| match &s.shared_by {
-                                Some(email) => {
-                                    let words = crate::state::access_words(s.access);
-                                    if words.is_empty() {
-                                        format!("shared by {email}")
-                                    } else {
-                                        format!("shared by {email} · {words}")
-                                    }
-                                }
-                                None => String::new(),
-                            })
-                        })
-                        .unwrap_or_default()
+                    store_sig.map(|sig| sig.with(crate::state::shared_by_words)).unwrap_or_default()
                 };
                 Some(rsx! {
                     span {
                         class: "pimble-tree__shared-by",
                         style: {
                             move || {
-                                let shared = store_sig.map_or(false, |sig| sig.with(|s| s.shared_by.is_some()));
-                                if shared { "" } else { "display: none;" }
+                                if shared_by_text().is_empty() { "display: none;" } else { "" }
                             }
                         },
                         title: {move || shared_by_text()},
@@ -1624,7 +1614,12 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                     .unwrap_or(false);
                                 let owner_offline = parsed
                                     .map_or(false, |(s_id, _)| store.owner_offline.with(|set| set.contains(&s_id)));
-                                if linked || owner_offline {
+                                // A replica whose every share has ended has a
+                                // link that can reach nothing: "no longer
+                                // shared" is said once, beside the name, and
+                                // how that link is doing is not.
+                                let ended = store_sig.map_or(false, |sig| sig.with(|s| s.every_share_ended()));
+                                if (linked || owner_offline) && !ended {
                                     "margin-left: 6px; cursor: default; font-size: 10px; font-weight: 400; \
                                      text-transform: none; letter-spacing: normal; opacity: 0.6;"
                                 } else {
@@ -1659,7 +1654,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             // menu is otherwise a full menu (docs/NODE_DOCUMENT_CONTRACT.md
             // section 5).
             let access_note_text = crate::state::access_note(access_now);
-            let menu_note_text = crate::state::menu_note_text(&[access_note_text, share_note_text, relayed_note_text]);
+            let menu_note_text = if ended_now {
+                crate::state::ENDED_REPLICA_NOTE.to_string()
+            } else {
+                crate::state::menu_note_text(&[access_note_text, share_note_text, relayed_note_text])
+            };
             let menu_note: Option<NodeHandle> = if menu_note_text.is_empty() {
                 None
             } else {
@@ -1672,6 +1671,20 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 None
             };
 
+            // Which of a store row's items are off: one rule, in one place
+            // (`state::store_row_menu`), from what the row snapshots.
+            let store_menu = crate::state::store_row_menu(crate::state::StoreRowFacts {
+                access: access_now,
+                linked: is_linked_now,
+                replica: is_replica_now,
+                vault: is_vault_now,
+                relay: relay_now,
+                held_as_share: held_as_share_now,
+                shared_root: is_shared_now,
+                mount_source_copied: !no_mount_source,
+                every_share_ended: ended_now,
+            });
+
             // Wrap in ContextMenu — different items for store roots vs nodes
             let context_menu = if is_store_root {
                 rsx! {
@@ -1681,14 +1694,14 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             {menu_note}
                             DropdownMenuItem {
                                 left_section: TablerIcon::FilePlus,
-                                disabled: !can_write_tree,
+                                disabled: store_menu.new_node,
                                 onclick: on_new_child,
                                 "New Node"
                             }
                             if mounts_apply {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::Link,
-                                    disabled: !can_write_tree,
+                                    disabled: store_menu.mount_store,
                                     onclick: on_mount_store.clone(),
                                     "Mount Store..."
                                 }
@@ -1696,7 +1709,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             if CAN_ADMINISTER_STORES {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::CloudDownload,
-                                    disabled: !can_write_tree,
+                                    disabled: store_menu.mount_remote_store,
                                     onclick: on_mount_remote_store.clone(),
                                     "Mount Remote Store Here..."
                                 }
@@ -1704,6 +1717,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             if mounts_apply {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::Copy,
+                                    disabled: store_menu.copy_as_mount_source,
                                     onclick: on_copy_as_mount_source.clone(),
                                     "Copy as Mount Source"
                                 }
@@ -1711,7 +1725,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             if mounts_apply {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::ClipboardCopy,
-                                    disabled: no_mount_source || !can_write_tree,
+                                    disabled: store_menu.paste_mount,
                                     onclick: on_paste_mount.clone(),
                                     "Paste Mount Here"
                                 }
@@ -1719,7 +1733,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             if CAN_ADMINISTER_STORES {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::Cloud,
-                                    disabled: is_linked_now,
+                                    disabled: store_menu.link_to_remote,
                                     onclick: on_link_to_remote.clone(),
                                     "Link to Remote..."
                                 }
@@ -1727,7 +1741,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             if CAN_ADMINISTER_STORES {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::CloudUpload,
-                                    disabled: host_disabled,
+                                    disabled: store_menu.host,
                                     onclick: on_host_on_cloud.clone(),
                                     "Host on Pimble Cloud..."
                                 }
@@ -1735,7 +1749,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             if CAN_ADMINISTER_STORES {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::Share,
-                                    disabled: share_disabled,
+                                    disabled: store_menu.share,
                                     onclick: on_share.clone(),
                                     "Share..."
                                 }
@@ -1743,7 +1757,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             if CAN_ADMINISTER_STORES {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::ShareOff,
-                                    disabled: stop_relaying_disabled,
+                                    disabled: store_menu.stop_relaying,
                                     onclick: on_stop_relaying.clone(),
                                     "Stop Sharing from This Computer..."
                                 }
@@ -1751,7 +1765,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             if CAN_ADMINISTER_STORES {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::Unlink,
-                                    disabled: unlink_disabled,
+                                    disabled: store_menu.unlink,
                                     onclick: on_unlink_from_remote.clone(),
                                     "Unlink from Remote"
                                 }
@@ -1759,14 +1773,14 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             if CAN_ADMINISTER_STORES {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::Trash,
-                                    disabled: !is_replica_now,
+                                    disabled: store_menu.remove_replica,
                                     onclick: on_remove_replica.clone(),
                                     "Remove Replica..."
                                 }
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Palette,
-                                disabled: !can_write_tree,
+                                disabled: store_menu.appearance,
                                 onclick: on_appearance,
                                 "Appearance..."
                             }

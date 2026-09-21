@@ -208,6 +208,7 @@ impl StoreManager {
                 shared_by: store.shared_by(),
                 roots: manifest.scope_roots.clone(),
                 read_only_roots: store.read_only_roots(),
+                ended_roots: manifest.ended_roots.clone(),
                 // A placeholder like `sync_mode`: `RpcHandler::link_kind_of`.
                 relay: pimble_core::RelaySide::None,
             });
@@ -229,6 +230,7 @@ impl StoreManager {
                 shared_by: None,
                 roots: Vec::new(),
                 read_only_roots: Vec::new(),
+                ended_roots: Vec::new(),
                 relay: pimble_core::RelaySide::None,
             });
         }
@@ -406,6 +408,24 @@ impl StoreManager {
     /// [`LocalStore::awaited_docs`]); empty for anything else.
     pub fn awaited_docs(&self, store_id: StoreId) -> Vec<NodeId> {
         self.local_stores.get(&store_id).map(|s| s.awaited_docs()).unwrap_or_default()
+    }
+
+    /// The scope roots of a partial replica the account no longer holds
+    /// (see [`LocalStore::ended_roots`]); empty for anything else.
+    pub fn ended_roots(&self, store_id: StoreId) -> Vec<NodeId> {
+        self.local_stores.get(&store_id).map(|s| s.ended_roots().to_vec()).unwrap_or_default()
+    }
+
+    /// Whether a node is under ended roots only (see
+    /// [`LocalStore::under_ended_root`]).
+    pub fn under_ended_root(&self, store_id: StoreId, node_id: NodeId) -> bool {
+        self.local_stores.get(&store_id).is_some_and(|s| s.under_ended_root(node_id))
+    }
+
+    /// Record which of a partial replica's scope roots have ended, answering
+    /// whether that changed anything (see [`LocalStore::set_ended_roots`]).
+    pub async fn set_ended_roots(&mut self, store_id: StoreId, ended: Vec<NodeId>) -> Result<bool> {
+        self.local_mut(store_id)?.set_ended_roots(ended).await
     }
 
     /// Add a scope root to a partial replica (see [`LocalStore::add_scope_root`]).

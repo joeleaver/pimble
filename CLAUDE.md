@@ -389,8 +389,11 @@ Contract: `docs/NODE_DOCUMENT_CONTRACT.md` section 5. How to run it all on one m
   `Store.shared_by`, `Store.access`, `sync.json`'s `read_only_roots`), repaired per scope
   root. The link reads the grant at every connect (`refresh_grant`) and asks again every
   two minutes (`grant_shape`); a changed role, another share or a removal makes it connect
-  again with a fresh token. A root the account no longer holds stays as it last was and
-  takes no edits. Refusals are whole sentences: "You can read this, not change it."
+  again with a fresh token. A root the account no longer holds leaves the explorer with a
+  one-line notice (`manifest.ended_roots`, `Store.ended_roots`, `SharesEnded`; Joe,
+  2026-09-21): nothing is deleted from disk until the replica is removed, it takes no
+  edits and search skips it, and a replica whose every share ended stays as a row that
+  says `no longer shared` and offers "Remove Replica...". Refusals are whole sentences: "You can read this, not change it."
   (`StoreAccess::READ_ONLY_REFUSAL`), "no grant for this document".
 - **Nothing is hosted as a side effect**: `cloudShareNode` on a store that is neither
   hosted nor relayed answers "Sharing needs this store hosted on Pimble Cloud or shared

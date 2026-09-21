@@ -92,8 +92,10 @@ of it run, `scripts/local-stack/README.md`.
 - **A removed member's machine**: the PM's recommendation. The folder leaves the explorer
   with a one-line notice ("<title>" is no longer shared with you.), nothing is deleted from
   disk until the replica is removed, and a replica whose every share has ended stays as a
-  row that says so and offers "Remove Replica". (Being built when this was written:
-  `manifest.ended_roots`, `Store.ended_roots`, `StoreChangeKind::SharesEnded`.)
+  row that says so and offers "Remove Replica...". Built and tested
+  (`manifest.ended_roots`, `Store.ended_roots`, `StoreChangeKind::SharesEnded`); not yet
+  looked at in the running app or the browser. A desktop learns of a removal within the
+  two-minute grant check, a browser page at its next token refresh or reconnect.
 - **Members see each other's addresses**: yes, as today. Who people are to each other in a
   share (nicknames, presence and the rest) is a session of its own, later.
 - **The store's name in the clear on the hosted manifest**: fine (it was decided on

@@ -94,9 +94,17 @@ fn register_opened_store(store: AppStore, tree_state: UseTreeReturn, opened_stor
     // is not what was held, every node held of it carries a stale judgement
     // (`Node::access`), and only the roots are fetched below.
     let access_changed = store.set_store_access(store_id, opened_store.access, &opened_store.read_only_roots);
+    // And if a root it was showing is not one it shows now (a share that
+    // ended), that root leaves as it does on any other day: said, and
+    // dropped. The roots that arrived are fetched below with the rest. A
+    // store opened for the first time shows nothing yet, so an ended share
+    // is simply not shown and nothing is said.
+    let mut roots_change = store.set_store_roots(store_id, Some(&opened_store.roots), &opened_store.ended_roots);
+    roots_change.arrived.clear();
 
     // Structural: new store appears in tree
     store.upsert_store(opened_store.clone());
+    apply_roots_change(store, tree_state, store_id, roots_change);
     if access_changed {
         refetch_held_nodes(store, store_id);
     }
@@ -210,6 +218,78 @@ fn refetch_below_changed_access(store: AppStore, store_id: StoreId, changed: &[N
             store.send(BackendCommand::GetNode { store_id, node_id: active.node_id });
         }
     }
+}
+
+/// What the explorer does about a change in the roots a share's replica
+/// shows (`AppStore::set_store_roots`, `AppStore::end_shares`).
+///
+/// A share that ended (the person was removed from it, or its owner stopped
+/// sharing it; Joe, 2026-09-21) leaves the explorer with one sentence in the
+/// status bar per folder, naming it when the app holds its title. Everything
+/// held of it is dropped from the app's caches, and the open document closes
+/// if it was under it, exactly as a deleted node's does (the selection and
+/// the title are cleared and the pane is hidden: `AppStore::remove_subtree`;
+/// the editor itself is left alone, and the next document opened ends its
+/// session as it ends any other). What is also under a share still shown (a
+/// folder shared inside a shared folder) stays. Nothing is asked of the
+/// backend: the files stay where they are until the replica is removed. A
+/// root that is no longer among the store's at all goes the same way with
+/// nothing said (the browser holds no replica: its backend says what ended
+/// before it lists the store again). A root that arrived (another share of
+/// the store, or one granted again) is fetched like a newly opened store's.
+fn apply_roots_change(store: AppStore, tree_state: UseTreeReturn, store_id: StoreId, change: crate::state::RootsChange) {
+    if change.is_empty() {
+        return;
+    }
+    // Before anything is dropped: the titles are in the cache being emptied.
+    let sentences: Vec<String> = change
+        .ended
+        .iter()
+        .map(|root| crate::state::share_ended_sentence(store.cached_title(store_id, *root).as_deref()))
+        .collect();
+
+    let left: Vec<NodeId> = change.ended.iter().chain(change.gone.iter()).copied().collect();
+    if !left.is_empty() {
+        tracing::info!("Store {:?}: {} root(s) left the explorer ({} ended)", store_id, left.len(), change.ended.len());
+        // What has left with them: a node under a root that left as far as
+        // the cached parent chain says, or, when the store shows nothing at
+        // all any more, anything of it (a document opened from a search hit
+        // has no cached chain to follow). Never a node that is also under a
+        // root still shown (overlapping shares: a folder shared inside a
+        // shared folder is still there, under the outer one).
+        let shown = store.shown_roots(store_id);
+        let has_left = |node_id: NodeId| {
+            !shown.iter().any(|root| store.is_at_or_under(store_id, node_id, *root))
+                && (shown.is_empty() || left.iter().any(|root| store.is_at_or_under(store_id, node_id, *root)))
+        };
+        let selected = untracked(|| store.selected_id.get()).and_then(|value| parse_tree_value(&value));
+        if let Some((selected_store, Some(selected_node))) = selected {
+            if selected_store == store_id && has_left(selected_node) {
+                store.selected_id.set(None);
+                store.node_title.set(String::new());
+                store.show_editor.set(false);
+            }
+        }
+        for root in left.iter().filter(|root| has_left(**root)) {
+            store.remove_subtree(store_id, *root);
+        }
+    }
+
+    for &root_id in &change.arrived {
+        store.expanded.update(|e| { e.insert((store_id, root_id)); });
+        store.send(BackendCommand::GetChildren { store_id, node_id: root_id });
+        store.send(BackendCommand::GetNode { store_id, node_id: root_id });
+        if store.is_partial_replica(store_id) {
+            tree_state.controller.expand(&format!("node_{}_{}", store_id, root_id));
+        }
+    }
+
+    if !sentences.is_empty() {
+        show_notice(store, sentences.join(" "));
+    }
+    // The rows under the store row changed, and its own menu and badge
+    // snapshot whether every share has ended.
+    store.bump_tree_structure();
 }
 
 /// After a transition to `Synced`, refetch the children of every root the
@@ -448,13 +528,21 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     if !known.contains(&s.id) {
                         tracing::info!("Discovered implicitly-opened store: {} ({})", s.name, s.id);
                         register_opened_store(store, tree_state, s);
-                    } else if store.set_store_access(s.id, s.access, &s.read_only_roots) {
-                        // A store the tree already has, listed with another
-                        // access than the one held (the browser lists again
-                        // at every token refresh, which is when a role the
-                        // owner changed arrives there): as `StoreSyncChanged`
-                        // does, fetch what is held of it again, for each
-                        // node's own `access`.
+                        continue;
+                    }
+                    // A store the tree already has. The roots it shows are
+                    // the ones listed now: a share that ended since is gone
+                    // from them (the browser lists again at every token
+                    // refresh, and its backend has said which ended by then)
+                    // or named as ended (a desktop replica, which keeps it).
+                    let roots_change = store.set_store_roots(s.id, Some(&s.roots), &s.ended_roots);
+                    apply_roots_change(store, tree_state, s.id, roots_change);
+                    if store.set_store_access(s.id, s.access, &s.read_only_roots) {
+                        // Listed with another access than the one held (the
+                        // browser lists again at every token refresh, which
+                        // is when a role the owner changed arrives there): as
+                        // `StoreSyncChanged` does, fetch what is held of it
+                        // again, for each node's own `access`.
                         tracing::info!("Access to store {:?} changed: {:?}", s.id, s.access);
                         refetch_held_nodes(store, s.id);
                         store.bump_tree_structure();
@@ -888,6 +976,28 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                             store.share_modal_state.set(share_state_text(state).to_string());
                         }
                     }
+                    StoreChangeKind::SharesEnded { node_ids } => {
+                        // The replica's link has just learned that the
+                        // account no longer holds these shares (a removal, a
+                        // share its owner stopped). Derived by the server,
+                        // never forwarded by a link. The folders leave the
+                        // explorer with a sentence saying so; the files stay
+                        // until the replica is removed.
+                        tracing::info!("Shares of {:?} ended: {:?}", store_id, node_ids);
+                        let roots_change = store.end_shares(*store_id, node_ids);
+                        apply_roots_change(store, tree_state, *store_id, roots_change);
+                        // The notification names what ended just now, and a
+                        // server sends it whenever the set of ended shares
+                        // changes: with nothing in it, the change was a share
+                        // granted again, and which one is in how the store is
+                        // held. (With something in it there is nothing to
+                        // ask: the link's next state brings the rest, and a
+                        // browser's store whose last share ended is closed
+                        // by the time a question about it could be answered.)
+                        if node_ids.is_empty() {
+                            store.send(BackendCommand::GetStoreSync { store_id: *store_id });
+                        }
+                    }
                     StoreChangeKind::VaultAppended { .. } => {
                         // Encrypted-store blobs are handled by the vault client
                         // (docs/CRYPTO_CONTRACT.md); the tree does not change here.
@@ -954,7 +1064,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 }
             }
 
-            BackendEvent::StoreSyncChanged { store_id, remote, state, sync_mode, access, read_only_roots, relay, owner_offline } => {
+            BackendEvent::StoreSyncChanged { store_id, remote, state, sync_mode, access, read_only_roots, ended_roots, relay, owner_offline } => {
                 tracing::info!("Sync state for store {:?}: {:?} ({:?}, {:?}, relay {:?})", store_id, state, sync_mode, access, relay);
                 let was_linked = store.is_linked(*store_id);
                 store.set_sync(*store_id, remote.clone(), state.clone());
@@ -973,6 +1083,13 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // differs from what was held, so may the server's judgement
                 // of any node of the store (`Node::access`), and nothing names
                 // which: everything held of the store is fetched again.
+                // The shares of it that have ended, as the server has them
+                // now: one that ended while this app was not listening leaves
+                // the explorer here, and one granted again comes back. Before
+                // the access below, so that what is fetched again is what is
+                // still shown.
+                let roots_change = store.set_store_roots(*store_id, None, ended_roots);
+                apply_roots_change(store, tree_state, *store_id, roots_change);
                 if store.set_store_access(*store_id, *access, read_only_roots) {
                     tracing::info!("Access to store {:?} changed: {:?}, read-only roots {:?}", store_id, access, read_only_roots);
                     refetch_held_nodes(store, *store_id);
@@ -1855,6 +1972,7 @@ mod tests {
             sync_mode: pimble_core::StoreKind::Vault,
             access,
             read_only_roots,
+            ended_roots: Vec::new(),
             relay: pimble_core::RelaySide::None,
             owner_offline: false,
         }
@@ -2057,5 +2175,270 @@ mod tests {
         events.send(BackendEvent::NodeLoaded { store_id, node }).unwrap();
         pump(store);
         assert_eq!(store.tree_structure_version.get(), after);
+    }
+
+    // ── A share that ended (Joe, 2026-09-21) ────────────────────────────
+
+    /// A replica of two shares with a document under each, parents and lists
+    /// as the server sends them, and the document under Trips open.
+    fn a_replica_with_rome_open(store: AppStore) -> (StoreId, [NodeId; 2], [NodeId; 2]) {
+        let mut shared = pimble_core::Store::new_local("Shared by ann@example.com", "/tmp/anns.pimble".into());
+        let (mut recipes, mut trips) = (pimble_core::Node::folder("Recipes"), pimble_core::Node::folder("Trips"));
+        let (mut pasta, mut rome) = (pimble_core::Node::document("Pasta"), pimble_core::Node::document("Rome"));
+        pasta.parent_id = Some(recipes.id);
+        rome.parent_id = Some(trips.id);
+        recipes.children = vec![pasta.id];
+        trips.children = vec![rome.id];
+        shared.root_node_id = recipes.id;
+        shared.roots = vec![recipes.id, trips.id];
+        shared.shared_by = Some("ann@example.com".to_string());
+        shared.is_replica = true;
+        let store_id = shared.id;
+        store.upsert_store(shared);
+        store.set_children(store_id, recipes.id, vec![(store_id, pasta.id)]);
+        store.set_children(store_id, trips.id, vec![(store_id, rome.id)]);
+        let ids = ([recipes.id, trips.id], [pasta.id, rome.id]);
+        for node in [recipes, trips, pasta, rome] {
+            store.upsert_node(store_id, node);
+        }
+        store.selected_id.set(Some(format!("node_{store_id}_{}", ids.1[1])));
+        store.node_title.set("Rome".to_string());
+        store.show_editor.set(true);
+        store.active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id: ids.1[1] }));
+        (store_id, ids.0, ids.1)
+    }
+
+    fn shares_ended(store_id: StoreId, node_ids: Vec<NodeId>) -> BackendEvent {
+        BackendEvent::RemoteStoreChange { store_id, change_kind: pimble_rpc::StoreChangeKind::SharesEnded { node_ids }, source_client_id: None }
+    }
+
+    fn row_values(store: AppStore) -> Vec<String> {
+        untracked(|| store.build_tree_data_structural())[0].children.iter().map(|row| row.value.clone()).collect()
+    }
+
+    /// The owner removed this account from Trips while the app was running:
+    /// the folder leaves the explorer with one sentence that names it,
+    /// everything held of it is dropped, the document open under it closes,
+    /// and the share still held is untouched. Nothing is asked of the
+    /// server but how the store is held now.
+    #[test]
+    fn a_share_that_ended_leaves_the_explorer_with_a_notice() {
+        let (store, events, commands) = store_with_events();
+        let (store_id, [recipes, trips], [pasta, rome]) = a_replica_with_rome_open(store);
+        let before = store.tree_structure_version.get();
+
+        events.send(shares_ended(store_id, vec![trips])).unwrap();
+        pump(store);
+
+        assert_eq!(store.notice.get(), "\"Trips\" is no longer shared with you.");
+        assert_eq!(store.shown_roots(store_id), vec![recipes]);
+        assert_eq!(row_values(store), vec![format!("node_{store_id}_{recipes}")]);
+        assert!(store.tree_structure_version.get() > before, "the tree is rebuilt");
+        for dropped in [trips, rome] {
+            assert!(store.get_node_signal(store_id, dropped).is_none(), "{dropped} is still held");
+            assert!(!store.has_children_loaded(store_id, dropped));
+        }
+        for kept in [recipes, pasta] {
+            assert!(store.get_node_signal(store_id, kept).is_some());
+        }
+        // The open document was under it: closed as a deleted node's is.
+        assert_eq!(store.selected_id.get(), None);
+        assert!(!store.show_editor.get());
+        assert_eq!(store.node_title.get(), "");
+
+        let asked: Vec<BackendCommand> = commands.try_iter().collect();
+        assert!(asked.is_empty(), "nothing is asked of the server, and nothing deleted: the files stay until the person removes the replica ({} command(s))", asked.len());
+
+        // Told again (the answer to `GetStoreSync` names it too): nothing more.
+        let settled = store.tree_structure_version.get();
+        store.notice.set(String::new());
+        let mut answer = sync_changed(store_id, pimble_core::StoreAccess::Full, vec![trips]);
+        if let BackendEvent::StoreSyncChanged { ended_roots, .. } = &mut answer {
+            *ended_roots = vec![trips];
+        }
+        events.send(shares_ended(store_id, vec![trips])).unwrap();
+        pump(store);
+        assert_eq!(store.notice.get(), "", "one notice per folder");
+        assert_eq!(store.tree_structure_version.get(), settled, "and the tree is left alone");
+        events.send(answer).unwrap();
+        pump(store);
+        assert_eq!(store.notice.get(), "");
+        assert_eq!(store.shown_roots(store_id), vec![recipes]);
+    }
+
+    /// A document open under the share that is still held stays open, and a
+    /// folder whose title the app never loaded is not named.
+    #[test]
+    fn a_share_that_ended_closes_nothing_else_and_names_only_what_it_knows() {
+        let (store, events, _commands) = store_with_events();
+        let (store_id, [recipes, trips], [pasta, _]) = a_replica_with_rome_open(store);
+        store.selected_id.set(Some(format!("node_{store_id}_{pasta}")));
+        store.active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id: pasta }));
+        store.remove_node(store_id, trips);
+
+        events.send(shares_ended(store_id, vec![trips])).unwrap();
+        pump(store);
+        assert_eq!(store.notice.get(), "A shared folder is no longer shared with you.");
+        assert_eq!(store.shown_roots(store_id), vec![recipes]);
+        assert_eq!(store.selected_id.get(), Some(format!("node_{store_id}_{pasta}")));
+        assert!(store.show_editor.get());
+        assert!(store.active_edit.get().is_some_and(|active| active.node_id == pasta));
+    }
+
+    /// Removed from every share at once: a sentence for each, no folder
+    /// left, and the store row stays with "no longer shared" and a menu that
+    /// offers "Remove Replica..." and nothing that changes anything.
+    #[test]
+    fn the_last_share_to_end_leaves_the_row_and_its_removal() {
+        let (store, events, _commands) = store_with_events();
+        let (store_id, [recipes, trips], _) = a_replica_with_rome_open(store);
+
+        events.send(shares_ended(store_id, vec![recipes, trips])).unwrap();
+        pump(store);
+        assert_eq!(store.notice.get(), "\"Recipes\" is no longer shared with you. \"Trips\" is no longer shared with you.");
+        assert!(store.every_share_ended(store_id));
+        let data = untracked(|| store.build_tree_data_structural());
+        assert_eq!(data.len(), 1, "the store row stays");
+        assert!(data[0].children.is_empty());
+        assert!(store.selected_id.get().is_none() && !store.show_editor.get());
+
+        let held = store.get_store_signal(store_id).unwrap();
+        assert_eq!(held.with(crate::state::shared_by_words), "no longer shared");
+        let menu = crate::state::store_row_menu(crate::state::StoreRowFacts {
+            access: store.store_access(store_id),
+            linked: true,
+            replica: held.with(|s| s.is_replica),
+            vault: false,
+            relay: pimble_core::RelaySide::None,
+            held_as_share: true,
+            shared_root: false,
+            mount_source_copied: false,
+            every_share_ended: store.every_share_ended(store_id),
+        });
+        assert!(!menu.remove_replica);
+        assert!(menu.new_node && menu.unlink && menu.link_to_remote && menu.share && menu.appearance && menu.copy_as_mount_source);
+    }
+
+    /// Overlapping shares: a folder shared inside a shared folder. When the
+    /// inner share ends its row under the store row goes and the notice is
+    /// shown, and everything in it is still there under the outer share,
+    /// the open document included.
+    #[test]
+    fn a_share_inside_another_that_ended_is_still_shown_under_the_outer_one() {
+        let (store, events, _commands) = store_with_events();
+        let (store_id, [recipes, trips], [_, rome]) = a_replica_with_rome_open(store);
+        // Trips is inside Recipes, and shared on its own as well.
+        store.get_node_signal(store_id, trips).unwrap().update(|n| n.parent_id = Some(recipes));
+
+        events.send(shares_ended(store_id, vec![trips])).unwrap();
+        pump(store);
+        assert_eq!(store.notice.get(), "\"Trips\" is no longer shared with you.");
+        assert_eq!(store.shown_roots(store_id), vec![recipes]);
+        assert!(store.get_node_signal(store_id, trips).is_some() && store.get_node_signal(store_id, rome).is_some(), "still held: they are under Recipes");
+        assert_eq!(store.selected_id.get(), Some(format!("node_{store_id}_{rome}")), "and the open document stays open");
+        assert!(store.show_editor.get());
+    }
+
+    /// At start-up an ended share is simply not shown: no notice (the person
+    /// was told when it happened, or was not there), and nothing of it is
+    /// fetched.
+    #[test]
+    fn an_ended_share_is_not_shown_at_start_up() {
+        let (store, events, commands) = store_with_events();
+        let mut opened = pimble_core::Store::new_local("Shared by ann@example.com", "/tmp/anns.pimble".into());
+        let (recipes, trips) = (NodeId::new(), NodeId::new());
+        opened.root_node_id = recipes;
+        opened.roots = vec![recipes, trips];
+        opened.ended_roots = vec![trips];
+        let store_id = opened.id;
+
+        events.send(BackendEvent::StoreOpened { store: opened.clone() }).unwrap();
+        pump(store);
+        assert_eq!(store.notice.get(), "");
+        assert_eq!(store.shown_roots(store_id), vec![recipes]);
+        let asked: Vec<BackendCommand> = commands.try_iter().collect();
+        assert!(asked.iter().any(|c| matches!(c, BackendCommand::GetChildren { node_id, .. } if *node_id == recipes)));
+        assert!(!asked.iter().any(|c| matches!(c, BackendCommand::GetChildren { node_id, .. } | BackendCommand::GetNode { node_id, .. } if *node_id == trips)));
+
+        // The same store told again with the root it was showing ended: that
+        // one was on the screen, so it is said.
+        let mut recipes_node = pimble_core::Node::folder("Recipes");
+        recipes_node.id = recipes;
+        store.upsert_node(store_id, recipes_node);
+        opened.ended_roots = vec![trips, recipes];
+        events.send(BackendEvent::StoreOpened { store: opened }).unwrap();
+        pump(store);
+        assert_eq!(store.notice.get(), "\"Recipes\" is no longer shared with you.");
+        assert!(store.every_share_ended(store_id));
+        assert!(store.get_node_signal(store_id, recipes).is_none());
+    }
+
+    /// How the store is held, asked of the server, names the ended shares
+    /// too: one that ended while nothing was listening leaves the explorer
+    /// on that answer, and one granted again comes back and is fetched.
+    #[test]
+    fn the_answer_to_how_a_store_is_held_ends_and_un_ends_shares() {
+        let (store, events, commands) = store_with_events();
+        let (store_id, [recipes, trips], _) = a_replica_with_rome_open(store);
+        let answer = |ended: Vec<NodeId>| {
+            let mut answer = sync_changed(store_id, pimble_core::StoreAccess::Full, ended.clone());
+            if let BackendEvent::StoreSyncChanged { ended_roots, .. } = &mut answer {
+                *ended_roots = ended;
+            }
+            answer
+        };
+
+        events.send(answer(vec![trips])).unwrap();
+        pump(store);
+        assert_eq!(store.notice.get(), "\"Trips\" is no longer shared with you.");
+        assert_eq!(store.shown_roots(store_id), vec![recipes]);
+        assert!(store.selected_id.get().is_none() && !store.show_editor.get(), "the document open under it closed");
+        let _ = commands.try_iter().count();
+
+        // A share granted again: the server says the set changed and names
+        // nothing that ended, and the app asks how the store is held.
+        events.send(shares_ended(store_id, Vec::new())).unwrap();
+        pump(store);
+        assert!(commands.try_iter().any(|c| matches!(c, BackendCommand::GetStoreSync { store_id: asked_for } if asked_for == store_id)));
+        assert_eq!(store.shown_roots(store_id), vec![recipes], "nothing changes until the answer");
+
+        events.send(answer(Vec::new())).unwrap();
+        pump(store);
+        assert_eq!(store.shown_roots(store_id), vec![recipes, trips]);
+        let asked: Vec<BackendCommand> = commands.try_iter().collect();
+        assert!(asked.iter().any(|c| matches!(c, BackendCommand::GetNode { node_id, .. } if *node_id == trips)), "the root that came back is fetched");
+        assert!(asked.iter().any(|c| matches!(c, BackendCommand::GetChildren { node_id, .. } if *node_id == trips)));
+    }
+
+    /// The browser holds no replica: its backend says which shares ended and
+    /// then lists the store with the roots that are left. The listing drops
+    /// nothing twice and says nothing twice; a root that is simply gone from
+    /// a listing leaves without a word.
+    #[test]
+    fn a_listing_without_a_root_drops_it_and_says_nothing_more() {
+        let (store, events, _commands) = store_with_events();
+        let (store_id, [recipes, trips], _) = a_replica_with_rome_open(store);
+        let listed = |roots: Vec<NodeId>| {
+            let mut listed = store.get_store_signal(store_id).unwrap().with(|s| s.clone());
+            listed.roots = roots;
+            listed.ended_roots = Vec::new();
+            BackendEvent::StoresListed { stores: vec![listed] }
+        };
+
+        events.send(shares_ended(store_id, vec![trips])).unwrap();
+        pump(store);
+        assert_eq!(store.notice.get(), "\"Trips\" is no longer shared with you.");
+        store.notice.set(String::new());
+        events.send(listed(vec![recipes])).unwrap();
+        pump(store);
+        assert_eq!(store.notice.get(), "");
+        assert_eq!(store.shown_roots(store_id), vec![recipes]);
+        assert_eq!(row_values(store), vec![format!("node_{store_id}_{recipes}")]);
+
+        // The same listing again changes nothing.
+        let settled = store.tree_structure_version.get();
+        events.send(listed(vec![recipes])).unwrap();
+        pump(store);
+        assert_eq!(store.tree_structure_version.get(), settled);
     }
 }
