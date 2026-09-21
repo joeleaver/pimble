@@ -20,6 +20,9 @@ pub mod vault_link;
 
 pub use error::*;
 pub use handler::*;
-pub use principal::{authorize, authorize_service_only, readable, service_extensions, Access, Grant, Principal, Role};
+pub use principal::{
+    authorize, authorize_owner, authorize_service_only, no_grant_for_document_error, read_only_error, readable, scope_roots_of, service_extensions, Access, Grant,
+    Principal, Role, NO_GRANT_FOR_DOCUMENT,
+};
 pub use server::*;
 pub use sync_link::*;

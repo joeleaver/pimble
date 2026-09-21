@@ -1,6 +1,6 @@
 //! Store manager - handles multiple open stores
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use pimble_core::{MountRef, Node, NodeId, NodeMetadata, Store, StoreId, StoreKind, StoreLocation, SyncState};
@@ -13,7 +13,7 @@ const MAX_MOUNT_DEPTH: usize = 16;
 use crate::error::{Result, StoreError};
 use crate::local::{peek_manifest_kind, LocalStore, NodeRemoval, SyncConfig};
 use crate::registry::{StoreEndpoint, StoreRegistry};
-use crate::vault::VaultStore;
+use crate::vault::{DocKeys, VaultDocSummary, VaultStore};
 
 /// Manages multiple open stores
 pub struct StoreManager {
@@ -201,11 +201,11 @@ impl StoreManager {
                 // about the vault-link state overwrite this (see
                 // `RpcHandler::sync_mode_of`).
                 sync_mode: StoreKind::Plain,
-                // Placeholders too: the server fills them from `sync.json`
+                // From `sync.json`, as the store read it at open
                 // (docs/NODE_DOCUMENT_CONTRACT.md section 5); the roots are the
-                // manifest's scope roots, or the store's root.
-                access: pimble_core::StoreAccess::Full,
-                shared_by: None,
+                // manifest's scope roots, or empty for the store's own root.
+                access: store.access(),
+                shared_by: store.shared_by(),
                 roots: manifest.scope_roots.clone(),
             });
         }
@@ -286,10 +286,134 @@ impl StoreManager {
         store.snapshot(doc_id, upto_seq, blob).await
     }
 
-    /// Every document in vault store `store_id`, with its head and snapshot seq.
-    pub fn vault_list_docs(&self, store_id: StoreId) -> Result<Vec<(String, u64, u64)>> {
+    /// Every document in vault store `store_id`, with its head, snapshot seq
+    /// and data key id.
+    pub fn vault_list_docs(&self, store_id: StoreId) -> Result<Vec<VaultDocSummary>> {
         let store = self.vault_stores.get(&store_id).ok_or(StoreError::NotOpen(store_id))?;
         Ok(store.list_docs())
+    }
+
+    /// Whether vault store `store_id` holds `doc_id` at all.
+    pub fn vault_has_doc(&self, store_id: StoreId, doc_id: &str) -> Result<bool> {
+        let store = self.vault_stores.get(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        Ok(store.has_doc(doc_id))
+    }
+
+    /// `doc_id`'s wrapped data keys in vault store `store_id`, as stored.
+    pub fn vault_doc_keys(&self, store_id: StoreId, doc_id: &str) -> Result<Option<DocKeys>> {
+        let store = self.vault_stores.get(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        Ok(store.doc_keys(doc_id).cloned())
+    }
+
+    /// Store `json` as `doc_id`'s keys record (see [`VaultStore::set_doc_keys`]).
+    pub async fn vault_set_doc_keys(&mut self, store_id: StoreId, doc_id: &str, json: String) -> Result<()> {
+        let store = self.vault_stores.get_mut(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        store.set_doc_keys(doc_id, json).await
+    }
+
+    // ── Scope sets (docs/NODE_DOCUMENT_CONTRACT.md section 5) ────────────
+
+    /// A vault store's published scopes.
+    pub fn vault_scopes(&self, store_id: StoreId) -> Result<Vec<(NodeId, Vec<NodeId>)>> {
+        let store = self.vault_stores.get(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        Ok(store.scopes())
+    }
+
+    /// The documents a principal scoped to `roots` reaches in vault store
+    /// `store_id` (see [`VaultStore::scope_union`]).
+    pub fn vault_scope_union(&self, store_id: StoreId, roots: &[NodeId]) -> Result<HashSet<NodeId>> {
+        let store = self.vault_stores.get(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        Ok(store.scope_union(roots))
+    }
+
+    /// Replace a scope's set, or remove the scope.
+    pub async fn vault_set_scope(&mut self, store_id: StoreId, root: NodeId, docs: Option<Vec<NodeId>>) -> Result<()> {
+        let store = self.vault_stores.get_mut(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        match docs {
+            Some(docs) => store.set_scope(root, docs).await,
+            None => store.remove_scope(root).await,
+        }
+    }
+
+    /// A scoped member created `doc_id` under `parent_id` (see
+    /// [`VaultStore::extend_scopes`]).
+    pub async fn vault_extend_scopes(&mut self, store_id: StoreId, roots: &[NodeId], parent_id: NodeId, doc_id: NodeId) -> Result<bool> {
+        let store = self.vault_stores.get_mut(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        store.extend_scopes(roots, parent_id, doc_id).await
+    }
+
+    /// Close vault store `store_id` and delete its directory
+    /// (docs/NODE_DOCUMENT_CONTRACT.md section 5: `deleteVaultStore`, the
+    /// accounts service deleting a hosted store). Only a store of kind
+    /// `vault` that is open here: a plain store is refused, whatever its
+    /// path, because this is the one RPC that removes data from disk and
+    /// the hosted server holds nothing but vaults.
+    pub async fn delete_vault_store(&mut self, store_id: StoreId) -> Result<()> {
+        if self.local_stores.contains_key(&store_id) {
+            return Err(StoreError::InvalidOperation(format!("store {} is not a vault store", store_id)));
+        }
+        let store = self.vault_stores.remove(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        self.registry.unregister(&store_id);
+        self.newly_opened.retain(|id| *id != store_id);
+        tokio::fs::remove_dir_all(&store.path).await?;
+        info!("Deleted vault store {} at {:?}", store_id, store.path);
+        Ok(())
+    }
+
+    // ── Partial replicas (docs/NODE_DOCUMENT_CONTRACT.md section 5) ──────
+
+    /// What this device may change in plain store `store_id` (`sync.json`'s
+    /// `access`; `Full` when unlinked or not a plain store).
+    pub fn store_access(&self, store_id: StoreId) -> pimble_core::StoreAccess {
+        self.local_stores.get(&store_id).map(|s| s.access()).unwrap_or_default()
+    }
+
+    /// Whether a write touching `ids` is refused in plain store `store_id`
+    /// because of how this device holds it (see [`LocalStore::write_refused`]).
+    pub fn write_refused(&self, store_id: StoreId, ids: &[NodeId]) -> bool {
+        self.local_stores.get(&store_id).is_some_and(|s| s.write_refused(ids))
+    }
+
+    /// A partial replica's scope roots (empty for a whole store, or a store
+    /// that is not open as a plain one).
+    pub fn scope_roots(&self, store_id: StoreId) -> Vec<NodeId> {
+        self.local_stores.get(&store_id).map(|s| s.scope_roots().to_vec()).unwrap_or_default()
+    }
+
+    /// What a partial replica's lists name and it does not hold yet (see
+    /// [`LocalStore::awaited_docs`]); empty for anything else.
+    pub fn awaited_docs(&self, store_id: StoreId) -> Vec<NodeId> {
+        self.local_stores.get(&store_id).map(|s| s.awaited_docs()).unwrap_or_default()
+    }
+
+    /// Add a scope root to a partial replica (see [`LocalStore::add_scope_root`]).
+    pub async fn add_scope_root(&mut self, store_id: StoreId, root: NodeId) -> Result<()> {
+        self.local_mut(store_id)?.add_scope_root(root).await
+    }
+
+    /// Create a partial replica: [`StoreManager::create_replica`] with the
+    /// scope roots the share grants (see [`LocalStore::create_replica_with_scope`]).
+    pub async fn create_partial_replica(
+        &mut self,
+        path: impl AsRef<Path>,
+        id: StoreId,
+        name: impl Into<String>,
+        scope_roots: Vec<NodeId>,
+    ) -> Result<StoreId> {
+        let path = path.as_ref();
+        if let Some(open) = self.local_stores.get(&id) {
+            return Err(StoreError::InvalidOperation(format!(
+                "store {} is already open locally at {}; add the root to it instead of creating another replica",
+                id, open.path.display()
+            )));
+        }
+        let root = scope_roots.first().copied().unwrap_or_else(NodeId::new);
+        let store = LocalStore::create_replica_with_scope(path, id, name, root, scope_roots).await?;
+        let id = store.id;
+        self.registry.register(id, StoreEndpoint::Local { path: path.to_path_buf() });
+        self.local_stores.insert(id, store);
+        self.newly_opened.push(id);
+        Ok(id)
     }
 
     // ── Nodes ────────────────────────────────────────────────────────────

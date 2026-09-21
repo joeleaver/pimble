@@ -70,9 +70,29 @@ fn make_jwt(
     stores: &HashMap<StoreId, &str>,
     exp_offset_secs: i64,
 ) -> String {
+    let stores_claim = stores.iter().map(|(id, role)| (id.to_string(), json!(role))).collect();
+    make_jwt_with_claims(signing_key, kid, issuer, sub, email, stores_claim, exp_offset_secs)
+}
+
+/// A JWT for a member of one store's shares: a role per shared root
+/// (docs/NODE_DOCUMENT_CONTRACT.md section 5).
+fn make_scoped_jwt(signing_key: &SigningKey, kid: &str, issuer: &str, sub: &str, store_id: StoreId, roots: &[(NodeId, &str)]) -> String {
+    let roots: serde_json::Map<String, serde_json::Value> = roots.iter().map(|(root, role)| (root.to_string(), json!(role))).collect();
+    let mut stores_claim = serde_json::Map::new();
+    stores_claim.insert(store_id.to_string(), json!({ "roots": roots }));
+    make_jwt_with_claims(signing_key, kid, issuer, sub, &format!("{sub}@example.com"), stores_claim, 3600)
+}
+
+fn make_jwt_with_claims(
+    signing_key: &SigningKey,
+    kid: &str,
+    issuer: &str,
+    sub: &str,
+    email: &str,
+    stores_claim: serde_json::Map<String, serde_json::Value>,
+    exp_offset_secs: i64,
+) -> String {
     let header = json!({ "alg": "EdDSA", "kid": kid });
-    let stores_claim: serde_json::Map<String, serde_json::Value> =
-        stores.iter().map(|(id, role)| (id.to_string(), json!(role))).collect();
     let payload = json!({
         "iss": issuer,
         "sub": sub,
@@ -463,17 +483,316 @@ async fn a_reader_may_fetch_but_not_append_and_an_editor_may() {
         .vault_append(store_id, VaultDocId::Tree, b64(b"nope"))
         .await
         .expect_err("a reader may not append");
-    assert!(write_err.to_string().contains("Forbidden"), "expected a Forbidden error, got: {}", write_err);
+    assert_eq!(write_err.to_string(), pimble_core::StoreAccess::READ_ONLY_REFUSAL, "a reader's refusal is the sentence, whole");
 
     let snapshot_err = reader
         .vault_snapshot(store_id, VaultDocId::Tree, seeded_seq, b64(b"nope"))
         .await
         .expect_err("a reader may not snapshot");
-    assert!(snapshot_err.to_string().contains("Forbidden"), "expected a Forbidden error, got: {}", snapshot_err);
+    assert_eq!(snapshot_err.to_string(), pimble_core::StoreAccess::READ_ONLY_REFUSAL);
+
+    let keys = pimble_rpc::VaultDocKeys { dek_id: uuid::Uuid::new_v4(), wraps: Vec::new() };
+    let keys_err = reader.vault_set_doc_keys(store_id, VaultDocId::Tree, keys).await.expect_err("a reader may not set keys");
+    assert_eq!(keys_err.to_string(), pimble_core::StoreAccess::READ_ONLY_REFUSAL);
 
     let mut editor_grant = HashMap::new();
     editor_grant.insert(store_id, "editor");
     let editor_jwt = make_jwt(&sk, "kid-1", issuer, "editor-user", "editor@example.com", &editor_grant, 3600);
     let editor = PimbleClient::connect_with_auth(&url, &AuthMethod::Bearer { token: editor_jwt }).await.unwrap();
     editor.vault_append(store_id, VaultDocId::Tree, b64(b"ok")).await.expect("an editor may append");
+}
+
+// ── Sharing: scope sets, data keys, deletion (docs/NODE_DOCUMENT_CONTRACT.md
+// section 5) ──────────────────────────────────────────────────────────────
+
+const NO_GRANT: &str = "no grant for this document";
+
+fn refused_as_no_grant<T: std::fmt::Debug>(result: Result<T, pimble_client::ClientError>, what: &str) {
+    let err = result.expect_err(what).to_string();
+    assert!(err.contains(NO_GRANT), "{what}: expected the document refusal, got: {err}");
+}
+
+async fn listed_nodes(client: &PimbleClient, store_id: StoreId) -> std::collections::HashSet<NodeId> {
+    client
+        .vault_list_docs(store_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|doc| match doc.doc_id {
+            VaultDocId::Node(id) => Some(id),
+            VaultDocId::Tree => None,
+        })
+        .collect()
+}
+
+/// A vault store with a published share and a document outside it, behind
+/// a server in JWT mode.
+struct SharedVault {
+    server: PimbleServer,
+    dir: tempfile::TempDir,
+    url: String,
+    sk: SigningKey,
+    jwks_url: String,
+    issuer: &'static str,
+    admin: PimbleClient,
+    store_id: StoreId,
+    share_root: NodeId,
+    inside: NodeId,
+    outside: NodeId,
+}
+
+impl SharedVault {
+    async fn start() -> Self {
+        let sk = signing_key();
+        let jwks_url = spawn_jwks(&sk, "kid-1").await;
+        let issuer = "https://issuer.example/v1";
+        let server = start_jwt_server("admin-secret", &jwks_url, issuer).await;
+        let url = format!("http://{}", server.addr());
+        let admin = PimbleClient::connect_with_auth(&url, &AuthMethod::Bearer { token: "admin-secret".into() }).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (store_id, _) = admin.create_store_with(dir.path().join("v.pimble"), "V", StoreKind::Vault, None).await.unwrap();
+
+        let (share_root, inside, outside) = (NodeId::new(), NodeId::new(), NodeId::new());
+        for id in [share_root, inside, outside] {
+            admin.vault_append(store_id, VaultDocId::Node(id), b64(b"seed")).await.unwrap();
+        }
+        admin.vault_append(store_id, VaultDocId::Tree, b64(b"the retired tree document")).await.unwrap();
+        admin.set_scope(store_id, pimble_rpc::Scope { root: share_root, doc_ids: vec![inside] }, false).await.unwrap();
+        Self { server, dir, url, sk, jwks_url, issuer, admin, store_id, share_root, inside, outside }
+    }
+
+    async fn member(&self, sub: &str, roots: &[(NodeId, &str)]) -> PimbleClient {
+        let jwt = make_scoped_jwt(&self.sk, "kid-1", self.issuer, sub, self.store_id, roots);
+        PimbleClient::connect_with_auth(&self.url, &AuthMethod::Bearer { token: jwt }).await.expect("a scoped JWT connects")
+    }
+
+    async fn whole(&self, sub: &str, role: &'static str) -> PimbleClient {
+        let mut grant = HashMap::new();
+        grant.insert(self.store_id, role);
+        let jwt = make_jwt(&self.sk, "kid-1", self.issuer, sub, &format!("{sub}@example.com"), &grant, 3600);
+        PimbleClient::connect_with_auth(&self.url, &AuthMethod::Bearer { token: jwt }).await.unwrap()
+    }
+}
+
+#[tokio::test]
+async fn a_scoped_editor_reaches_exactly_its_scope_of_a_vault_store() {
+    let v = SharedVault::start().await;
+    let (store_id, share_root, inside, outside) = (v.store_id, v.share_root, v.inside, v.outside);
+    let member = v.member("bob", &[(share_root, "editor")]).await;
+    let keys = || pimble_rpc::VaultDocKeys { dek_id: uuid::Uuid::new_v4(), wraps: Vec::new() };
+
+    assert_eq!(listed_nodes(&member, store_id).await, [share_root, inside].into_iter().collect(), "the list is the scope: the root is in its own");
+    assert!(member.vault_list_docs(store_id).await.unwrap().iter().all(|d| d.doc_id != VaultDocId::Tree), "the retired tree document is nobody's");
+
+    member.vault_fetch(store_id, VaultDocId::Node(inside), 0).await.expect("a fetch in scope");
+    let seq = member.vault_append(store_id, VaultDocId::Node(inside), b64(b"bob-1")).await.expect("an append in scope");
+    member.vault_snapshot(store_id, VaultDocId::Node(inside), seq, b64(b"snap")).await.expect("a snapshot in scope");
+    member.vault_set_doc_keys(store_id, VaultDocId::Node(inside), keys()).await.expect("keys in scope");
+
+    for (what, doc) in [("a document outside", VaultDocId::Node(outside)), ("a document that does not exist", VaultDocId::Node(NodeId::new())), ("the tree document", VaultDocId::Tree)] {
+        refused_as_no_grant(member.vault_fetch(store_id, doc.clone(), 0).await, what);
+        refused_as_no_grant(member.vault_append(store_id, doc.clone(), b64(b"no")).await, what);
+        refused_as_no_grant(member.vault_snapshot(store_id, doc.clone(), 1, b64(b"no")).await, what);
+        refused_as_no_grant(member.vault_set_doc_keys(store_id, doc, keys()).await, what);
+    }
+    assert_eq!(v.admin.vault_fetch(store_id, VaultDocId::Node(outside), 0).await.unwrap().head, 1, "nothing refused was written");
+}
+
+#[tokio::test]
+async fn a_scoped_members_create_joins_the_scope_and_notifications_stay_inside_it() {
+    let v = SharedVault::start().await;
+    let (store_id, share_root, inside, outside) = (v.store_id, v.share_root, v.inside, v.outside);
+    let member = v.member("bob", &[(share_root, "editor")]).await;
+    let other_member = v.member("carol", &[(share_root, "reader")]).await;
+    let mut other_sub = other_member.subscribe_store_changes(store_id).await.unwrap();
+
+    // A create names its parent, which has to be the member's to write.
+    let created = NodeId::new();
+    refused_as_no_grant(member.vault_append(store_id, VaultDocId::Node(created), b64(b"x")).await, "a new document naming no parent");
+    refused_as_no_grant(
+        member.vault_append_new(store_id, VaultDocId::Node(created), b64(b"x"), None, Some(outside)).await,
+        "a new document under a parent outside the scope",
+    );
+    refused_as_no_grant(
+        member.vault_append_new(store_id, VaultDocId::Node(outside), b64(b"x"), None, Some(inside)).await,
+        "a document the store has is not made the member's by naming a parent",
+    );
+    let reader_create = other_member.vault_append_new(store_id, VaultDocId::Node(NodeId::new()), b64(b"x"), None, Some(inside)).await;
+    assert_eq!(reader_create.expect_err("a reader creates nothing").to_string(), pimble_core::StoreAccess::READ_ONLY_REFUSAL);
+
+    // Something outside first: what the other member hears first is then
+    // proof that it did not hear that.
+    v.admin.vault_append(store_id, VaultDocId::Node(outside), b64(b"not theirs")).await.unwrap();
+    member.vault_append_new(store_id, VaultDocId::Node(created), b64(b"made by bob"), Some("bob-device".into()), Some(inside)).await.expect("a create under a parent in scope");
+
+    let notif = tokio::time::timeout(Duration::from_secs(5), other_sub.next()).await.expect("the create reaches the share's other member").unwrap().unwrap();
+    match notif.change_kind {
+        StoreChangeKind::VaultAppended { doc_id, .. } => assert_eq!(doc_id, VaultDocId::Node(created), "in scope before it was announced, and the append outside never was"),
+        other => panic!("expected VaultAppended, got {:?}", other),
+    }
+    assert!(listed_nodes(&other_member, store_id).await.contains(&created));
+    member.vault_append(store_id, VaultDocId::Node(created), b64(b"and again")).await.expect("its maker keeps writing it");
+    // One level down: under the document just made.
+    let grandchild = NodeId::new();
+    member.vault_append_new(store_id, VaultDocId::Node(grandchild), b64(b"deeper"), None, Some(created)).await.expect("a create under a create");
+
+    // The owner sees the scope the members reach; a publish from a device
+    // that has not pulled the new documents yet does not take them away.
+    let scope_docs = |scopes: Vec<pimble_rpc::Scope>| -> std::collections::HashSet<NodeId> { scopes.into_iter().find(|s| s.root == share_root).unwrap().doc_ids.into_iter().collect() };
+    assert_eq!(scope_docs(v.admin.get_scopes(store_id).await.unwrap()), [inside, created, grandchild].into_iter().collect());
+    v.admin.set_scope(store_id, pimble_rpc::Scope { root: share_root, doc_ids: vec![inside] }, false).await.unwrap();
+    member.vault_fetch(store_id, VaultDocId::Node(created), 0).await.expect("still the member's after a stale publish");
+    // Named by a publish, then left out of the next: the owner moved it out.
+    v.admin.set_scope(store_id, pimble_rpc::Scope { root: share_root, doc_ids: vec![inside, created, grandchild] }, false).await.unwrap();
+    v.admin.set_scope(store_id, pimble_rpc::Scope { root: share_root, doc_ids: vec![inside, created] }, false).await.unwrap();
+    refused_as_no_grant(member.vault_fetch(store_id, VaultDocId::Node(grandchild), 0).await, "a document its owner moved out of the share");
+}
+
+#[tokio::test]
+async fn scope_sets_are_an_owners_to_publish_and_survive_a_restart() {
+    let mut v = SharedVault::start().await;
+    let (store_id, share_root, inside) = (v.store_id, v.share_root, v.inside);
+    let member = v.member("bob", &[(share_root, "editor")]).await;
+    let created = NodeId::new();
+    member.vault_append_new(store_id, VaultDocId::Node(created), b64(b"x"), None, Some(share_root)).await.unwrap();
+
+    let scope = pimble_rpc::Scope { root: NodeId::new(), doc_ids: vec![inside] };
+    for (who, client) in [("a share's member", &member), ("a whole-store editor", &v.whole("ed", "editor").await), ("a whole-store reader", &v.whole("rd", "reader").await)] {
+        let err = client.set_scope(store_id, scope.clone(), false).await.expect_err(who).to_string();
+        assert!(err.contains("only available to an owner"), "{who}: {err}");
+        let err = client.get_scopes(store_id).await.expect_err(who).to_string();
+        assert!(err.contains("only available to an owner"), "{who}: {err}");
+    }
+    let owner = v.whole("ann", "owner").await;
+    owner.set_scope(store_id, scope.clone(), false).await.expect("an owner publishes");
+    assert_eq!(owner.get_scopes(store_id).await.unwrap().len(), 2);
+    owner.set_scope(store_id, scope.clone(), true).await.expect("and removes");
+    assert_eq!(owner.get_scopes(store_id).await.unwrap().len(), 1);
+
+    // A restart: a new server over the same directory.
+    let path = v.dir.path().join("v.pimble");
+    assert!(path.join("scopes.json").exists());
+    v.server.stop().await.unwrap();
+    let server = start_jwt_server("admin-secret", &v.jwks_url, v.issuer).await;
+    let url = format!("http://{}", server.addr());
+    let admin = PimbleClient::connect_with_auth(&url, &AuthMethod::Bearer { token: "admin-secret".into() }).await.unwrap();
+    admin.open_store(&path).await.unwrap();
+    let jwt = make_scoped_jwt(&v.sk, "kid-1", v.issuer, "bob", store_id, &[(share_root, "editor")]);
+    let member = PimbleClient::connect_with_auth(&url, &AuthMethod::Bearer { token: jwt }).await.unwrap();
+    assert_eq!(listed_nodes(&member, store_id).await, [share_root, inside, created].into_iter().collect(), "the published set and the member's create, both");
+}
+
+/// A role per shared root on a vault store: what a member only reads
+/// refuses their write with the reader's sentence; what they edit takes it.
+#[tokio::test]
+async fn a_reader_of_one_vault_scope_and_editor_of_another() {
+    let v = SharedVault::start().await;
+    let (store_id, read_root, read_doc) = (v.store_id, v.share_root, v.inside);
+    let (edit_root, edit_doc) = (NodeId::new(), NodeId::new());
+    for id in [edit_root, edit_doc] {
+        v.admin.vault_append(store_id, VaultDocId::Node(id), b64(b"seed")).await.unwrap();
+    }
+    v.admin.set_scope(store_id, pimble_rpc::Scope { root: edit_root, doc_ids: vec![edit_doc] }, false).await.unwrap();
+    let member = v.member("dana", &[(read_root, "reader"), (edit_root, "editor")]).await;
+
+    assert_eq!(listed_nodes(&member, store_id).await, [read_root, read_doc, edit_root, edit_doc].into_iter().collect());
+    member.vault_fetch(store_id, VaultDocId::Node(read_doc), 0).await.expect("reads what it reads");
+    let err = member.vault_append(store_id, VaultDocId::Node(read_doc), b64(b"no")).await.expect_err("no write under the read root");
+    assert_eq!(err.to_string(), pimble_core::StoreAccess::READ_ONLY_REFUSAL);
+    let err = member.vault_append_new(store_id, VaultDocId::Node(NodeId::new()), b64(b"no"), None, Some(read_doc)).await.expect_err("no create under it either");
+    assert_eq!(err.to_string(), pimble_core::StoreAccess::READ_ONLY_REFUSAL);
+    member.vault_append(store_id, VaultDocId::Node(edit_doc), b64(b"yes")).await.expect("writes what it edits");
+    refused_as_no_grant(member.vault_fetch(store_id, VaultDocId::Node(v.outside), 0).await, "and the rest is nobody's");
+}
+
+#[tokio::test]
+async fn data_keys_round_trip_and_merge_by_scope_key() {
+    let (_server, client) = start_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (store_id, _root) = client.create_store_with(dir.path().join("v.pimble"), "V", StoreKind::Vault, None).await.unwrap();
+    let node = NodeId::new();
+    let doc = VaultDocId::Node(node);
+    let aad = pimble_crypto::dek_aad(&store_id.to_string(), &doc.as_str());
+
+    client.vault_append(store_id, doc.clone(), b64(b"from before data keys")).await.unwrap();
+    assert_eq!(client.vault_fetch(store_id, doc.clone(), 0).await.unwrap().keys, None, "a document from before data keys has none");
+    assert_eq!(client.vault_list_docs(store_id).await.unwrap()[0].dek_id, None);
+
+    let (dek, dek_id) = (pimble_crypto::SymmetricKey::generate(), uuid::Uuid::new_v4());
+    let (store_key, store_key_id) = (pimble_crypto::SymmetricKey::generate(), uuid::Uuid::new_v4());
+    let (share_key, share_key_id) = (pimble_crypto::SymmetricKey::generate(), uuid::Uuid::new_v4());
+    let under_store = pimble_crypto::wrap_dek(&dek, &store_key, store_key_id, &aad);
+    let under_share = pimble_crypto::wrap_dek(&dek, &share_key, share_key_id, &aad);
+
+    client.vault_set_doc_keys(store_id, doc.clone(), pimble_rpc::VaultDocKeys { dek_id, wraps: vec![under_store.clone()] }).await.unwrap();
+    let fetched = client.vault_fetch(store_id, doc.clone(), 0).await.unwrap().keys.expect("keys come back with the document");
+    assert_eq!(fetched, pimble_rpc::VaultDocKeys { dek_id, wraps: vec![under_store.clone()] });
+    assert_eq!(client.vault_list_docs(store_id).await.unwrap()[0].dek_id, Some(dek_id));
+    let unwrapped = pimble_crypto::unwrap_dek(&fetched.wraps[0], &store_key, &aad).unwrap();
+    assert_eq!(unwrapped.0, dek.0, "and open to the data key they were made from");
+
+    // The same data key under another scope key: added. Under the same
+    // scope key again: that wrap replaced. Another data key: a rotation.
+    client.vault_set_doc_keys(store_id, doc.clone(), pimble_rpc::VaultDocKeys { dek_id, wraps: vec![under_share.clone()] }).await.unwrap();
+    let merged = client.vault_fetch(store_id, doc.clone(), 0).await.unwrap().keys.unwrap();
+    assert_eq!(merged.wraps.len(), 2);
+    assert!(merged.wraps.contains(&under_store) && merged.wraps.contains(&under_share));
+    let under_store_again = pimble_crypto::wrap_dek(&dek, &store_key, store_key_id, &aad);
+    client.vault_set_doc_keys(store_id, doc.clone(), pimble_rpc::VaultDocKeys { dek_id, wraps: vec![under_store_again.clone()] }).await.unwrap();
+    let rewrapped = client.vault_fetch(store_id, doc.clone(), 0).await.unwrap().keys.unwrap();
+    assert_eq!(rewrapped.wraps.len(), 2);
+    assert!(rewrapped.wraps.contains(&under_store_again) && !rewrapped.wraps.contains(&under_store));
+
+    let (rotated, rotated_id) = (pimble_crypto::SymmetricKey::generate(), uuid::Uuid::new_v4());
+    let rotated_wrap = pimble_crypto::wrap_dek(&rotated, &store_key, store_key_id, &aad);
+    client.vault_set_doc_keys(store_id, doc.clone(), pimble_rpc::VaultDocKeys { dek_id: rotated_id, wraps: vec![rotated_wrap.clone()] }).await.unwrap();
+    assert_eq!(client.vault_fetch(store_id, doc.clone(), 0).await.unwrap().keys.unwrap(), pimble_rpc::VaultDocKeys { dek_id: rotated_id, wraps: vec![rotated_wrap] });
+
+    // On disk beside the document, and back after a reopen; keys can come
+    // before a document's first blob.
+    let path = dir.path().join("v.pimble");
+    assert!(path.join("vault").join(doc.as_str()).join("keys.json").exists());
+    let early = VaultDocId::Node(NodeId::new());
+    client.vault_set_doc_keys(store_id, early.clone(), pimble_rpc::VaultDocKeys { dek_id, wraps: vec![under_share] }).await.unwrap();
+    client.close_store(store_id).await.unwrap();
+    client.open_store(&path).await.unwrap();
+    assert_eq!(client.vault_fetch(store_id, doc, 0).await.unwrap().keys.unwrap().dek_id, rotated_id);
+    let early_fetch = client.vault_fetch(store_id, early, 0).await.unwrap();
+    assert_eq!((early_fetch.head, early_fetch.keys.map(|k| k.dek_id)), (0, Some(dek_id)));
+}
+
+#[tokio::test]
+async fn delete_vault_store_removes_an_open_vault_and_nothing_else() {
+    let sk = signing_key();
+    let jwks_url = spawn_jwks(&sk, "kid-1").await;
+    let issuer = "https://issuer.example/v1";
+    let server = start_jwt_server("admin-secret", &jwks_url, issuer).await;
+    let url = format!("http://{}", server.addr());
+    let admin = PimbleClient::connect_with_auth(&url, &AuthMethod::Bearer { token: "admin-secret".into() }).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let vault_path = dir.path().join("v.pimble");
+    let plain_path = dir.path().join("p.pimble");
+    let (vault_id, _) = admin.create_store_with(&vault_path, "V", StoreKind::Vault, None).await.unwrap();
+    let (plain_id, _) = admin.create_store(&plain_path, "P").await.unwrap();
+    admin.vault_append(vault_id, VaultDocId::Node(NodeId::new()), b64(b"ciphertext")).await.unwrap();
+
+    // The accounts service's call, and nobody else's: not even an owner's.
+    let mut grant = HashMap::new();
+    grant.insert(vault_id, "owner");
+    let owner_jwt = make_jwt(&sk, "kid-1", issuer, "ann", "ann@example.com", &grant, 3600);
+    let owner = PimbleClient::connect_with_auth(&url, &AuthMethod::Bearer { token: owner_jwt }).await.unwrap();
+    let err = owner.delete_vault_store(vault_id).await.expect_err("Service-only").to_string();
+    assert!(err.contains("only available to this server's own operator"), "{err}");
+
+    let err = admin.delete_vault_store(plain_id).await.expect_err("a plain store is refused").to_string();
+    assert!(err.contains("is not a vault store"), "{err}");
+    assert!(plain_path.join("manifest.json").exists(), "and left exactly where it was");
+    admin.delete_vault_store(StoreId::new()).await.expect_err("a store that is not open here");
+
+    admin.delete_vault_store(vault_id).await.expect("the open vault goes");
+    assert!(!vault_path.exists(), "its directory with it");
+    assert!(admin.list_stores().await.unwrap().iter().all(|s| s.id != vault_id));
+    admin.vault_list_docs(vault_id).await.expect_err("nothing answers for it any more");
+    admin.delete_vault_store(vault_id).await.expect_err("twice is an error, not a second removal");
+    assert!(plain_path.join("manifest.json").exists());
 }

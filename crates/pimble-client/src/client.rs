@@ -11,7 +11,7 @@ use jsonrpsee::core::client::Client as RpcClient;
 use jsonrpsee::wasm_client::WasmClientBuilder;
 #[cfg(not(target_arch = "wasm32"))]
 use jsonrpsee::ws_client::{HeaderMap, HeaderValue, WsClientBuilder};
-use pimble_core::{AuthMethod, Node, NodeId, RemoteEndpoint, Store, StoreId, StoreKind, SyncState, Workspace};
+use pimble_core::{AuthMethod, Node, NodeId, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState, Workspace};
 use pimble_core::MountRef;
 use pimble_rpc::{
     AddRemoteStoreRequest, ApplyEditRequest, CloseStoreRequest, CloudAddHostedStoreRequest,
@@ -647,6 +647,15 @@ impl PimbleClient {
             .await
             .map_err(rpc_error)?;
         Ok((response.remote, response.state, response.sync_mode))
+    }
+
+    /// Like [`PimbleClient::get_store_sync_with_mode`], with what this
+    /// device may change in the store (`Store::access`: a share's reader
+    /// reads, docs/NODE_DOCUMENT_CONTRACT.md section 5). A separate method
+    /// for the same reason.
+    pub async fn get_store_sync_with_access(&self, store_id: StoreId) -> Result<(Option<RemoteEndpoint>, SyncState, StoreKind, StoreAccess)> {
+        let response = self.client.get_store_sync(GetStoreSyncRequest { store_id }).await.map_err(rpc_error)?;
+        Ok((response.remote, response.state, response.sync_mode, response.access))
     }
 
     /// The stores `remote` has open, fetched by the server this client is

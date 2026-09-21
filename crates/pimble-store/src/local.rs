@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use pimble_core::{Node, NodeId, NodeMetadata, RemoteEndpoint, StoreId, StoreManifest};
+use pimble_core::{Node, NodeId, NodeMetadata, RemoteEndpoint, StoreAccess, StoreId, StoreManifest};
 use pimble_crdt::{NodeDoc, NodeUpdateEffect, StoreDocument, Tree, TreeEdit};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -60,6 +60,23 @@ pub struct SyncConfig {
     /// — only the id is persisted). `None` for `Sync` mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault_key_id: Option<uuid::Uuid>,
+    /// What this device may change in the store
+    /// (docs/NODE_DOCUMENT_CONTRACT.md section 5): `Read` for a share's
+    /// reader, whose local server refuses every write and whose vault link
+    /// pushes nothing; `Full` otherwise. Missing in an older `sync.json`:
+    /// full.
+    #[serde(default)]
+    pub access: StoreAccess,
+    /// The owner's email when this store reached this device as someone
+    /// else's share (`Store::shared_by`). `None` for one's own stores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_by: Option<String>,
+    /// The scope roots of a partial replica this device holds as a reader,
+    /// when it edits others (a role per shared root): the local server
+    /// refuses a write under one of these exactly as the hosted server
+    /// would. Empty when one answer covers the store (`access`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_only_roots: Vec<NodeId>,
 }
 
 /// What a deletion tombstoned (docs/NODE_DOCUMENT_CONTRACT.md section 2).
@@ -151,6 +168,29 @@ pub struct LocalStore {
 
     /// Documents with changes not yet written to `nodes/{id}.yrs`.
     dirty: HashSet<NodeId>,
+
+    /// What `sync.json` says this device may change, read once at open and
+    /// kept in step with every write of that file, so the server's per-RPC
+    /// "may this device write here?" check (docs/NODE_DOCUMENT_CONTRACT.md
+    /// section 5) costs no file read. The default for an unlinked store.
+    /// Behind a lock of its own because `sync.json` is written through
+    /// `&self` (a link records its cursor on every append, under the
+    /// manager's read guard, and must not hold every other RPC up to do it).
+    link_access: std::sync::RwLock<LinkAccess>,
+}
+
+/// The part of [`SyncConfig`] the store keeps in memory.
+#[derive(Debug, Clone, Default)]
+struct LinkAccess {
+    access: StoreAccess,
+    shared_by: Option<String>,
+    read_only_roots: Vec<NodeId>,
+}
+
+impl LinkAccess {
+    fn of(config: &SyncConfig) -> Self {
+        Self { access: config.access, shared_by: config.shared_by.clone(), read_only_roots: config.read_only_roots.clone() }
+    }
 }
 
 impl LocalStore {
@@ -219,6 +259,7 @@ impl LocalStore {
             manifest,
             tree,
             dirty: HashSet::from([root_node_id]),
+            link_access: Default::default(),
         };
 
         store.flush().await?;
@@ -241,14 +282,33 @@ impl LocalStore {
     /// peer's root arrives the tree is empty (`get_node` on the root is
     /// `NodeNotFound`), and a replica reopened before its first reconcile
     /// stays that way: `open` creates nothing either.
+    ///
+    /// A partial replica (docs/NODE_DOCUMENT_CONTRACT.md section 5, a share's
+    /// recipient) names its scope roots in `scope_roots` and takes the first
+    /// of them as `root_node_id`: the tree starts at the shared node, whose
+    /// own `parent_id` names a document this replica never holds and is
+    /// never rewritten (the tree's root is exempt from repair).
     pub async fn create_replica(
         path: impl AsRef<Path>,
         id: StoreId,
         name: impl Into<String>,
         root_node_id: NodeId,
     ) -> Result<Self> {
+        Self::create_replica_with_scope(path, id, name, root_node_id, Vec::new()).await
+    }
+
+    /// [`LocalStore::create_replica`] with `scope_roots` (empty for a whole
+    /// replica). With roots, `root_node_id` is ignored in favour of the first.
+    pub async fn create_replica_with_scope(
+        path: impl AsRef<Path>,
+        id: StoreId,
+        name: impl Into<String>,
+        root_node_id: NodeId,
+        scope_roots: Vec<NodeId>,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let name = name.into();
+        let root_node_id = scope_roots.first().copied().unwrap_or(root_node_id);
 
         if path.exists() {
             return Err(StoreError::StoreExists(path.display().to_string()));
@@ -268,7 +328,7 @@ impl LocalStore {
             created_at: now,
             modified_at: now,
             kind: pimble_core::StoreKind::Plain,
-            scope_roots: Vec::new(),
+            scope_roots,
         };
 
         let manifest_json = serde_json::to_string_pretty(&manifest)?;
@@ -280,6 +340,7 @@ impl LocalStore {
             manifest,
             tree: Tree::from_docs(root_node_id, HashMap::new()),
             dirty: HashSet::new(),
+            link_access: Default::default(),
         };
 
         info!("Created replica store '{}' ({}) at {:?}", name, id, store.path);
@@ -288,7 +349,11 @@ impl LocalStore {
 
     /// Read `<store>/sync.json`, if present.
     pub async fn read_sync_config(&self) -> Result<Option<SyncConfig>> {
-        let path = self.path.join(Self::SYNC_CONFIG_FILE);
+        Self::read_sync_config_at(&self.path).await
+    }
+
+    async fn read_sync_config_at(store_path: &Path) -> Result<Option<SyncConfig>> {
+        let path = store_path.join(Self::SYNC_CONFIG_FILE);
         if !path.exists() {
             return Ok(None);
         }
@@ -301,6 +366,7 @@ impl LocalStore {
     pub async fn write_sync_config(&self, config: &SyncConfig) -> Result<()> {
         let json = serde_json::to_string_pretty(config)?;
         atomic_write(&self.path.join(Self::SYNC_CONFIG_FILE), json).await?;
+        *self.link_access.write().unwrap() = LinkAccess::of(config);
         Ok(())
     }
 
@@ -310,6 +376,98 @@ impl LocalStore {
         if path.exists() {
             fs::remove_file(&path).await?;
         }
+        *self.link_access.write().unwrap() = Default::default();
+        Ok(())
+    }
+
+    /// What this device may change here (`sync.json`'s `access`; `Full`
+    /// when unlinked).
+    pub fn access(&self) -> StoreAccess {
+        self.link_access.read().unwrap().access
+    }
+
+    /// The owner's email when this store is someone else's share.
+    pub fn shared_by(&self) -> Option<String> {
+        self.link_access.read().unwrap().shared_by.clone()
+    }
+
+    /// Whether a write touching `ids` is refused here: everything on a
+    /// replica held as a reader, and on one held with a role per shared
+    /// root, a document whose every scope is a reader's. A document under
+    /// a read-only root nested in an editable one takes the wider role, as
+    /// on the hosted server; one that reaches no scope root at all is not
+    /// this check's to judge.
+    pub fn write_refused(&self, ids: &[NodeId]) -> bool {
+        let link = self.link_access.read().unwrap();
+        if !link.access.allows_write() {
+            return true;
+        }
+        if link.read_only_roots.is_empty() {
+            return false;
+        }
+        ids.iter().any(|id| {
+            let reached = self.scope_roots_above(*id);
+            !reached.is_empty() && reached.iter().all(|root| link.read_only_roots.contains(root))
+        })
+    }
+
+    /// The scope roots on `id`'s stored parent chain, itself included,
+    /// through held documents (tombstones too: a deleted document stays
+    /// with its scope). Bounded, so an unrepaired cycle cannot loop.
+    fn scope_roots_above(&self, id: NodeId) -> Vec<NodeId> {
+        let mut reached = Vec::new();
+        let mut cur = id;
+        for _ in 0..=self.tree.ids().len() {
+            if self.manifest.scope_roots.contains(&cur) {
+                reached.push(cur);
+            }
+            match self.tree.doc(cur).and_then(|d| d.fields().ok()).and_then(|f| f.parent_id) {
+                Some(parent) if self.tree.doc(parent).is_some() => cur = parent,
+                _ => break,
+            }
+        }
+        reached
+    }
+
+    /// A partial replica's scope roots (empty for a whole store).
+    pub fn scope_roots(&self) -> &[NodeId] {
+        &self.manifest.scope_roots
+    }
+
+    /// Whether this is a partial replica: a share's recipient, holding only
+    /// the documents in its scopes.
+    pub fn is_partial(&self) -> bool {
+        !self.manifest.scope_roots.is_empty()
+    }
+
+    /// The documents a partial replica's lists name and it does not hold
+    /// (yet): on their way, or not in the published scope yet. What its
+    /// link asks the remote for again, and what keeps a scope from being
+    /// repaired meanwhile (see [`LocalStore::repair_scopes`]). Empty for a
+    /// whole store, where a list entry with no document is simply missing.
+    pub fn awaited_docs(&self) -> Vec<NodeId> {
+        if !self.is_partial() {
+            return Vec::new();
+        }
+        let mut awaited: HashSet<NodeId> = HashSet::new();
+        for id in self.tree.list_node_ids() {
+            let Some(doc) = self.tree.doc(id) else { continue };
+            awaited.extend(doc.children().into_iter().filter(|child| !self.tree.doc(*child).is_some_and(|held| held.fields().is_ok())));
+        }
+        awaited.into_iter().collect()
+    }
+
+    /// Add a scope root to a partial replica (a second share of the same
+    /// store reaching this device). The first root stays the tree's root;
+    /// adding one already present changes nothing.
+    pub async fn add_scope_root(&mut self, root: NodeId) -> Result<()> {
+        if self.manifest.scope_roots.contains(&root) {
+            return Ok(());
+        }
+        self.manifest.scope_roots.push(root);
+        self.manifest.modified_at = Utc::now();
+        let manifest_json = serde_json::to_string_pretty(&self.manifest)?;
+        atomic_write(&self.path.join(Self::MANIFEST_FILE), manifest_json).await?;
         Ok(())
     }
 
@@ -365,12 +523,21 @@ impl LocalStore {
             manifest.version = StoreManifest::CURRENT_VERSION;
         }
 
+        // A `sync.json` that does not parse is the link's problem to report
+        // (`read_sync_config` fails the same way later); the store still
+        // opens, with the access an unlinked store has.
+        let link_access = match Self::read_sync_config_at(&path).await {
+            Ok(Some(config)) => LinkAccess::of(&config),
+            _ => LinkAccess::default(),
+        };
+
         let mut store = Self {
             id: manifest.id,
             path,
             tree: Tree::from_docs(manifest.root_node_id, docs),
             manifest,
             dirty,
+            link_access: std::sync::RwLock::new(link_access),
         };
 
         if store_doc_path.exists() {
@@ -394,9 +561,8 @@ impl LocalStore {
             }
         }
 
-        if let Some(edit) = store.tree.repair(&now()).map_err(StoreError::from)? {
+        if let Some(edit) = store.repair_tree()? {
             warn!("Store {}: tree repaired at open, {} document(s) touched", store.id, edit.touched.len());
-            store.mark_edit_dirty(&edit);
         }
         if !store.dirty.is_empty() || previous_layout {
             store.flush().await?;
@@ -525,8 +691,13 @@ impl LocalStore {
     /// `parent_id`, when there is exactly one; otherwise `None` (no root
     /// has arrived yet, or several nodes claim to be it, which only a
     /// repair from a known root settles). What `set_root_node_id`'s callers
-    /// compare the manifest against.
+    /// compare the manifest against. A partial replica's root is its first
+    /// scope root, a node with a parent this replica never holds: nothing
+    /// to adopt, ever.
     pub fn document_root(&self) -> Option<NodeId> {
+        if self.is_partial() {
+            return None;
+        }
         let is_root_like = |id: NodeId| self.tree.get_node_info(id).is_ok_and(|info| info.parent_id.is_none());
         let manifest_root = self.manifest.root_node_id;
         if is_root_like(manifest_root) {
@@ -799,12 +970,111 @@ impl LocalStore {
     /// changed dirty (docs/history/HARDENING_CONTRACT.md decision 9): a
     /// repair usually finds nothing to fix, and that must never force a
     /// flush. `None` when nothing needed fixing.
+    ///
+    /// A partial replica is repaired one scope at a time and only where it
+    /// can judge (see [`LocalStore::repair_scopes`]): `Tree::repair` reads
+    /// "not held" as "missing", which is true of a whole store and false of
+    /// a share's recipient, who by design holds less than the lists and
+    /// parents it is given may name.
     pub fn repair_tree(&mut self) -> Result<Option<TreeEdit>> {
+        if self.is_partial() {
+            return self.repair_scopes();
+        }
         let edit = self.tree.repair(&now()).map_err(StoreError::from)?;
         if let Some(edit) = &edit {
             self.mark_edit_dirty(edit);
         }
         Ok(edit)
+    }
+
+    /// Repair a partial replica (docs/NODE_DOCUMENT_CONTRACT.md section 5).
+    /// Every repair is an edit that travels to the owner and to every other
+    /// member, so it must be one a device holding the whole store would
+    /// make too; two devices that disagree about a fix undo each other's
+    /// for ever. Three things keep it so, all in this layer, each scope
+    /// being handed to `Tree::repair` as the honest tree it is (rooted at
+    /// its scope root, holding exactly the documents that lead to it):
+    ///
+    /// - **A scope root is a root.** Its `parent_id` names a document this
+    ///   replica never holds, which is no orphan here, and as the root of
+    ///   its own tree it is never re-parented nor listed. A scope root held
+    ///   under another (overlapping shares) is an ordinary node of that
+    ///   one's tree.
+    /// - **A document that leads to no scope root is left alone**: moved
+    ///   out of the share by its owner, or not yet under it. A whole store
+    ///   knows where it belongs; adopting it here would move it back.
+    /// - **A scope whose lists name a document not held yet is not judged
+    ///   yet.** The entry is a document on its way (created by someone
+    ///   else a moment ago, or not in the published scope yet), and
+    ///   removing it would delete a child from the owner's folder. The
+    ///   scope is repaired once the document is here, or by any device
+    ///   that holds the whole store.
+    fn repair_scopes(&mut self) -> Result<Option<TreeEdit>> {
+        let scope_roots: HashSet<NodeId> = self.manifest.scope_roots.iter().copied().collect();
+        let stored_parent = |tree: &Tree, id: NodeId| tree.doc(id).and_then(|d| d.fields().ok()).and_then(|f| f.parent_id);
+
+        // Which scope's tree a document belongs to: the last scope root on
+        // its stored parent chain through held documents (tombstones
+        // included: a deleted document stays with its scope). Bounded, so
+        // an unrepaired cycle cannot loop.
+        let ids = self.tree.ids();
+        let bound = ids.len();
+        let mut groups: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for &id in &ids {
+            let mut cur = id;
+            let mut top = None;
+            for _ in 0..=bound {
+                if scope_roots.contains(&cur) {
+                    top = Some(cur);
+                }
+                match stored_parent(&self.tree, cur) {
+                    Some(parent) if self.tree.doc(parent).is_some() => cur = parent,
+                    _ => break,
+                }
+            }
+            if let Some(top) = top {
+                groups.entry(top).or_default().push(id);
+            }
+        }
+
+        let now = now();
+        let mut edit = TreeEdit::default();
+        let mut tops: Vec<NodeId> = groups.keys().copied().collect();
+        tops.sort_by_key(|id| id.to_string());
+        for top in tops {
+            let group = &groups[&top];
+            // Only a node's list is repaired (a tombstone keeps its own for
+            // an undelete), so only a node's list can ask for a removal.
+            let awaited = group.iter().filter(|id| self.tree.has_node(**id)).filter_map(|id| self.tree.doc(*id)).any(|doc| {
+                doc.children().into_iter().any(|child| !self.tree.doc(child).is_some_and(|held| held.fields().is_ok()))
+            });
+            if awaited {
+                debug!("Store {}: scope {} lists a document not held yet; not repairing it now", self.id, top);
+                continue;
+            }
+
+            let mut docs = HashMap::with_capacity(group.len());
+            for id in group {
+                if let Some(doc) = self.tree.take_doc(*id) {
+                    docs.insert(*id, doc);
+                }
+            }
+            let mut scope_tree = Tree::from_docs(top, docs);
+            let repaired = scope_tree.repair(&now).map_err(StoreError::from);
+            for id in group {
+                if let Some(doc) = scope_tree.take_doc(*id) {
+                    self.tree.insert_doc(*id, doc);
+                }
+            }
+            if let Some(scope_edit) = repaired? {
+                extend(&mut edit, scope_edit);
+            }
+        }
+        if edit.is_empty() {
+            return Ok(None);
+        }
+        self.mark_edit_dirty(&edit);
+        Ok(Some(edit))
     }
 
     /// Flush all changes to disk: each dirty document's snapshot, written
@@ -1633,5 +1903,168 @@ mod tests {
         }
         a.flush().await.unwrap();
         b.flush().await.unwrap();
+    }
+
+    /// A partial replica (docs/NODE_DOCUMENT_CONTRACT.md section 5) repairs
+    /// each scope as its own tree: a scope root's `parent_id` (a node the
+    /// replica never holds) is left alone and it is listed under nobody; a
+    /// document whose chain reaches the second root stays in that scope; one
+    /// whose chain reaches no root (moved out of the share by its owner) is
+    /// left exactly as it is, where a single tree would adopt it under the
+    /// root and so move it back into the share for everyone.
+    #[tokio::test]
+    async fn a_partial_replica_repairs_each_scope_as_its_own_tree() {
+        let dir = tempdir().unwrap();
+        let owner_path = dir.path().join("owner.pimble");
+        let mut owner = LocalStore::create(&owner_path, "Owner").await.unwrap();
+        let root = owner.root_node_id();
+        let (r1, _) = owner.create_node(Node::folder("Share 1"), Some(root)).unwrap();
+        let (r2, _) = owner.create_node(Node::folder("Share 2"), Some(root)).unwrap();
+        let (a, _) = owner.create_node(Node::document("A"), Some(r1)).unwrap();
+        let (b, _) = owner.create_node(Node::document("B"), Some(r2)).unwrap();
+        let (b2, _) = owner.create_node(Node::document("B2"), Some(b)).unwrap();
+        let (elsewhere, _) = owner.create_node(Node::folder("Elsewhere"), Some(root)).unwrap();
+        let (stray, _) = owner.create_node(Node::document("Stray"), Some(elsewhere)).unwrap();
+
+        let mut partial = LocalStore::create_replica_with_scope(dir.path().join("partial.pimble"), owner.id, "Owner", root, vec![r1, r2]).await.unwrap();
+        assert!(partial.is_partial());
+        assert_eq!(partial.root_node_id(), r1);
+        assert_eq!(partial.document_root(), None);
+        // Both scopes whole, `b2` before its parent's list names it (the
+        // shape a half-arrived edit has), and a stray whose parent is held
+        // by nobody here.
+        for id in [r1, r2, a, b, b2, stray] {
+            partial.apply_node_update(id, &owner.tree().doc(id).unwrap().save()).unwrap();
+        }
+        partial.node_doc(b).unwrap().remove_child(b2).unwrap();
+
+        let edit = partial.repair_tree().unwrap().expect("the half-arrived child needs listing");
+        let touched: HashSet<_> = edit.node_ids().into_iter().collect();
+        assert_eq!(touched, [b].into_iter().collect::<HashSet<_>>(), "{touched:?}");
+
+        assert_eq!(partial.get_node(r1).unwrap().parent_id, Some(root), "a scope root's parent is never rewritten");
+        assert_eq!(partial.get_node(r2).unwrap().parent_id, Some(root));
+        assert_eq!(partial.get_node(b2).unwrap().parent_id, Some(b), "in its own scope's tree, listed by its parent again");
+        assert_eq!(partial.get_children(b).unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![b2]);
+        assert_eq!(partial.get_node(stray).unwrap().parent_id, Some(elsewhere), "a document that leads to no scope root is not adopted");
+        assert_eq!(partial.get_children(r1).unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![a]);
+        assert_eq!(partial.get_children(r2).unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![b]);
+        assert!(partial.repair_tree().unwrap().is_none(), "settled");
+
+        // A reopen keeps the roots and repairs nothing more.
+        partial.flush().await.unwrap();
+        let path = partial.path.clone();
+        drop(partial);
+        let reopened = LocalStore::open(&path).await.unwrap();
+        assert_eq!(reopened.scope_roots(), &[r1, r2]);
+        assert_eq!(reopened.get_node(r2).unwrap().parent_id, Some(root));
+        assert_eq!(reopened.get_children(r2).unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![b]);
+        assert_eq!(reopened.get_node(stray).unwrap().parent_id, Some(elsewhere));
+    }
+
+    /// A single scope root is a root too (one root was repaired as a whole
+    /// store's tree until it was noticed that this adopts strays), and a
+    /// list entry naming a document that has not arrived is not a missing
+    /// child to a recipient: the scope waits, nothing is removed, and the
+    /// repair it was owed happens once the document is here.
+    #[tokio::test]
+    async fn a_partial_replica_does_not_judge_a_scope_that_awaits_a_document() {
+        let dir = tempdir().unwrap();
+        let mut owner = LocalStore::create(dir.path().join("owner.pimble"), "Owner").await.unwrap();
+        let root = owner.root_node_id();
+        let (share, _) = owner.create_node(Node::folder("Share"), Some(root)).unwrap();
+        let (a, _) = owner.create_node(Node::document("A"), Some(share)).unwrap();
+        let (late, _) = owner.create_node(Node::document("Late"), Some(share)).unwrap();
+        let (moved_out, _) = owner.create_node(Node::document("Moved out"), Some(root)).unwrap();
+
+        let mut partial = LocalStore::create_replica_with_scope(dir.path().join("partial.pimble"), owner.id, "Share", root, vec![share]).await.unwrap();
+        for id in [share, a, moved_out] {
+            partial.apply_node_update(id, &owner.tree().doc(id).unwrap().save()).unwrap();
+        }
+        // Something for repair to want: `a` dropped from the share's list.
+        partial.node_doc(share).unwrap().remove_child(a).unwrap();
+
+        assert!(partial.repair_tree().unwrap().is_none(), "the share lists `late`, which is not here yet: not judged");
+        assert!(partial.node_doc(share).unwrap().children().contains(&late), "and the entry is still there for the owner's folder");
+        assert_eq!(partial.get_node(moved_out).unwrap().parent_id, Some(root), "a stray is not adopted under a single root either");
+
+        partial.apply_node_update(late, &owner.tree().doc(late).unwrap().save()).unwrap();
+        let edit = partial.repair_tree().unwrap().expect("judged now");
+        assert_eq!(edit.node_ids(), vec![share]);
+        assert_eq!(partial.get_children(share).unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![late, a]);
+        assert_eq!(partial.get_node(share).unwrap().parent_id, Some(root));
+    }
+
+    /// Overlapping shares: a scope root held under another scope root is an
+    /// ordinary node of that one's tree. Treated as a tree of its own, its
+    /// parent's list would name a document "missing" from the parent's tree
+    /// and repair would delete the inner share from the owner's folder.
+    #[tokio::test]
+    async fn a_scope_root_under_another_stays_in_its_parents_list() {
+        let dir = tempdir().unwrap();
+        let mut owner = LocalStore::create(dir.path().join("owner.pimble"), "Owner").await.unwrap();
+        let root = owner.root_node_id();
+        let (outer, _) = owner.create_node(Node::folder("Outer"), Some(root)).unwrap();
+        let (inner, _) = owner.create_node(Node::folder("Inner"), Some(outer)).unwrap();
+        let (leaf, _) = owner.create_node(Node::document("Leaf"), Some(inner)).unwrap();
+
+        let mut partial = LocalStore::create_replica_with_scope(dir.path().join("partial.pimble"), owner.id, "Outer", root, vec![inner, outer]).await.unwrap();
+        for id in [outer, inner, leaf] {
+            partial.apply_node_update(id, &owner.tree().doc(id).unwrap().save()).unwrap();
+        }
+        assert!(partial.repair_tree().unwrap().is_none(), "nothing to fix, and nothing removed");
+        assert_eq!(partial.get_children(outer).unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![inner]);
+        assert_eq!(partial.get_children(inner).unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![leaf]);
+    }
+
+    /// `sync.json` says what this device may change: everything, nothing,
+    /// or (a role per shared root) everything but what is only under a
+    /// root it reads. A document under a read root nested in an edited one
+    /// takes the wider role.
+    #[tokio::test]
+    async fn a_replicas_write_guard_follows_sync_json() {
+        let dir = tempdir().unwrap();
+        let mut owner = LocalStore::create(dir.path().join("owner.pimble"), "Owner").await.unwrap();
+        let root = owner.root_node_id();
+        let (edited, _) = owner.create_node(Node::folder("Edited"), Some(root)).unwrap();
+        let (read, _) = owner.create_node(Node::folder("Read"), Some(root)).unwrap();
+        let (under_edited, _) = owner.create_node(Node::document("E"), Some(edited)).unwrap();
+        let (under_read, _) = owner.create_node(Node::document("R"), Some(read)).unwrap();
+        let (read_inside_edited, _) = owner.create_node(Node::folder("Read inside"), Some(edited)).unwrap();
+        let (deep, _) = owner.create_node(Node::document("Deep"), Some(read_inside_edited)).unwrap();
+
+        let path = dir.path().join("partial.pimble");
+        let mut partial = LocalStore::create_replica_with_scope(&path, owner.id, "Shares", root, vec![edited, read, read_inside_edited]).await.unwrap();
+        for id in [edited, read, under_edited, under_read, read_inside_edited, deep] {
+            partial.apply_node_update(id, &owner.tree().doc(id).unwrap().save()).unwrap();
+        }
+        assert!(!partial.write_refused(&[under_read]), "unlinked: full");
+
+        let config = |access, read_only_roots| SyncConfig {
+            remote: RemoteEndpoint { url: "ws://127.0.0.1:1/rpc".parse().unwrap(), auth: pimble_core::AuthMethod::None },
+            last_sync: None,
+            mode: SyncMode::Vault,
+            last_seq: Default::default(),
+            vault_key_id: None,
+            access,
+            shared_by: Some("ann@example.com".into()),
+            read_only_roots,
+        };
+        partial.write_sync_config(&config(StoreAccess::Full, vec![read, read_inside_edited])).await.unwrap();
+        assert!(partial.write_refused(&[under_read]));
+        assert!(partial.write_refused(&[under_edited, read]), "one refused document refuses the write");
+        assert!(!partial.write_refused(&[under_edited, edited]));
+        assert!(!partial.write_refused(&[deep, read_inside_edited]), "also under a root this device edits: the wider role");
+        assert_eq!(partial.shared_by().as_deref(), Some("ann@example.com"));
+
+        partial.write_sync_config(&config(StoreAccess::Read, Vec::new())).await.unwrap();
+        assert!(partial.write_refused(&[under_edited]));
+        partial.flush().await.unwrap();
+        drop(partial);
+        let reopened = LocalStore::open(&path).await.unwrap();
+        assert_eq!(reopened.access(), StoreAccess::Read, "read at open");
+        assert!(reopened.write_refused(&[under_edited]));
+        reopened.clear_sync_config().await.unwrap();
+        assert!(!reopened.write_refused(&[under_edited]));
     }
 }

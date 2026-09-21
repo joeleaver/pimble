@@ -101,18 +101,25 @@ struct JwtHeader {
 struct CustomClaims {
     #[serde(default)]
     email: String,
-    /// `"editor"` for a whole store, `{ "role": "editor", "roots": [...] }` for
-    /// a share (docs/NODE_DOCUMENT_CONTRACT.md section 5). A server from before
-    /// scopes cannot parse the object form and drops the grant: it fails closed.
+    /// `"editor"` for a whole store, `{ "roots": { "<node id>": "reader", ... } }`
+    /// for shares: a role per shared root (docs/NODE_DOCUMENT_CONTRACT.md
+    /// section 5). A server from before scopes cannot parse the object form
+    /// and drops the grant: it fails closed.
     #[serde(default)]
     stores: HashMap<String, StoreClaim>,
 }
 
+/// One store's claim. Untagged, tried in order. A value that is neither
+/// form (the one role for every root the contract had for three days
+/// included, which no issuer ever shipped) is kept as
+/// [`StoreClaim::Unrecognized`] and grants nothing, rather than failing the
+/// whole token over one store's entry.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum StoreClaim {
     Whole(String),
-    Scoped { role: String, roots: Vec<String> },
+    Scoped { roots: HashMap<String, String> },
+    Unrecognized(serde::de::IgnoredAny),
 }
 
 #[derive(Debug, Deserialize)]
@@ -289,18 +296,20 @@ impl JwtVerifier {
             .iter()
             .filter_map(|(store_id, claim)| {
                 let store_id = StoreId::parse(store_id).ok()?;
-                let grant = match claim {
-                    StoreClaim::Whole(role) => Grant::whole(Role::parse(role)?),
-                    StoreClaim::Scoped { role, roots } => {
-                        let roots: Vec<pimble_core::NodeId> = roots.iter().filter_map(|r| pimble_core::NodeId::parse(r).ok()).collect();
-                        // A scope that names no node it can parse grants nothing.
-                        if roots.is_empty() {
-                            return None;
-                        }
-                        Grant::scoped(Role::parse(role)?, roots)
-                    }
+                // A root whose id or role does not parse is dropped, like a
+                // store's; roots that leave nothing grant nothing.
+                let roots: HashMap<pimble_core::NodeId, Role> = match claim {
+                    StoreClaim::Whole(role) => return Some((store_id, Grant::whole(Role::parse(role)?))),
+                    StoreClaim::Scoped { roots } => roots
+                        .iter()
+                        .filter_map(|(root, role)| Some((pimble_core::NodeId::parse(root).ok()?, Role::parse(role)?)))
+                        .collect(),
+                    StoreClaim::Unrecognized(_) => return None,
                 };
-                Some((store_id, grant))
+                if roots.is_empty() {
+                    return None;
+                }
+                Some((store_id, Grant::scoped(roots)))
             })
             .collect();
 
@@ -452,6 +461,38 @@ mod tests {
         let token = make_token(&sk, "kid-does-not-exist", |_h, _p| {});
 
         assert!(matches!(verifier.verify(&token).await, Err(JwtError::UnknownKid(_))));
+    }
+
+    /// Shares carry a role per root (docs/NODE_DOCUMENT_CONTRACT.md section
+    /// 5). What cannot be parsed is dropped, a root like a store, and a
+    /// claim left with no root grants nothing; one store's malformed entry
+    /// does not take the token's other grants with it.
+    #[tokio::test]
+    async fn a_scoped_claim_carries_a_role_per_root() {
+        let sk = signing_key();
+        let verifier = verifier_with_key("kid-1", sk.verifying_key(), "https://issuer.example/v1");
+        let (shared, emptied, earlier_form, malformed, whole) = (StoreId::new(), StoreId::new(), StoreId::new(), StoreId::new(), StoreId::new());
+        let (read_root, edit_root) = (pimble_core::NodeId::new(), pimble_core::NodeId::new());
+        let token = make_token(&sk, "kid-1", |_h, payload| {
+            let stores = &mut payload["claims"]["stores"];
+            stores[shared.to_string()] = json!({ "roots": {
+                read_root.to_string(): "reader",
+                edit_root.to_string(): "editor",
+                "not-a-node-id": "editor",
+                pimble_core::NodeId::new().to_string(): "superadmin",
+            } });
+            stores[emptied.to_string()] = json!({ "roots": { "not-a-node-id": "editor" } });
+            stores[earlier_form.to_string()] = json!({ "role": "editor", "roots": [read_root.to_string()] });
+            stores[malformed.to_string()] = json!({ "roots": 7 });
+            stores[whole.to_string()] = json!("reader");
+        });
+
+        let Principal::User { grants, .. } = verifier.verify(&token).await.unwrap() else { panic!("expected a User") };
+        assert_eq!(grants.get(&shared), Some(&Grant::scoped([(read_root, Role::Reader), (edit_root, Role::Editor)])));
+        assert_eq!(grants.get(&emptied), None, "no root left: nothing granted");
+        assert_eq!(grants.get(&earlier_form), None, "one role for a list of roots is not a form this server reads: it fails closed");
+        assert_eq!(grants.get(&malformed), None);
+        assert_eq!(grants.get(&whole), Some(&Grant::whole(Role::Reader)));
     }
 
     #[tokio::test]

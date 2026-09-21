@@ -30,8 +30,29 @@ use std::collections::HashMap;
 
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::Extensions;
-use pimble_core::StoreId;
+use pimble_core::{NodeId, StoreAccess, StoreId};
 use pimble_rpc::forbidden_error;
+
+/// What a reader's write, or a write to a `Read` replica, answers with:
+/// `-32004` and [`StoreAccess::READ_ONLY_REFUSAL`] as the whole message,
+/// with no `Forbidden: ` in front, because the sentence is shown to the
+/// person as it is (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles").
+pub fn read_only_error() -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(pimble_rpc::RpcError::Forbidden(String::new()).code(), StoreAccess::READ_ONLY_REFUSAL, None::<()>)
+}
+
+/// What a scoped principal gets for a document outside its scope, whether
+/// or not the document exists: a member of one share must not learn what
+/// else the store holds, so the answer is the same for a document that is
+/// not theirs and for one that is not there.
+pub fn no_grant_for_document_error() -> ErrorObjectOwned {
+    forbidden_error(NO_GRANT_FOR_DOCUMENT)
+}
+
+/// The document refusal's sentence, for a caller that has to tell it from a
+/// failure (a vault link leaves a refused document for later, and keeps
+/// the link up).
+pub const NO_GRANT_FOR_DOCUMENT: &str = "no grant for this document";
 
 /// Who is making this call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,29 +76,56 @@ pub enum Principal {
     },
 }
 
-/// One grant in a token: a role on a whole store, or on the subtrees under
-/// `roots` (a share's recipient, docs/NODE_DOCUMENT_CONTRACT.md section 5).
-/// A scoped grant reaches exactly the documents in the store's published
-/// scope sets for those roots (`RpcHandler`'s scope check); the role says what
-/// it may do with them.
+/// One grant in a token: a role on a whole store, or a role on each of the
+/// subtrees a share's recipient was given (docs/NODE_DOCUMENT_CONTRACT.md
+/// section 5: a role per shared root, so a reader of one folder who edits
+/// another is neither the lesser nor the greater of the two on both). A
+/// scoped grant reaches exactly the documents in the store's scope sets for
+/// its roots (`RpcHandler`'s scope check); the role of the root whose set
+/// holds a document says what the member may do with it, and a document in
+/// two of the member's scopes takes the wider role.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Grant {
-    pub role: Role,
-    /// `None` for the whole store.
-    pub roots: Option<Vec<pimble_core::NodeId>>,
+pub enum Grant {
+    Whole(Role),
+    Scoped(HashMap<NodeId, Role>),
 }
 
 impl Grant {
     pub fn whole(role: Role) -> Self {
-        Self { role, roots: None }
+        Grant::Whole(role)
     }
 
-    pub fn scoped(role: Role, roots: Vec<pimble_core::NodeId>) -> Self {
-        Self { role, roots: Some(roots) }
+    /// A share's recipient: a role per shared root.
+    pub fn scoped(roots: impl IntoIterator<Item = (NodeId, Role)>) -> Self {
+        Grant::Scoped(roots.into_iter().collect())
     }
 
     pub fn is_scoped(&self) -> bool {
-        self.roots.is_some()
+        matches!(self, Grant::Scoped(_))
+    }
+
+    /// Whether anything this grant reaches may be used for `needed`: the
+    /// store-level question. For a scoped grant the per-document check
+    /// still decides (an editor of one folder is not one of another).
+    pub fn allows(&self, needed: Access) -> bool {
+        match self {
+            Grant::Whole(role) => role.allows(needed),
+            Grant::Scoped(roots) => roots.values().any(|role| role.allows(needed)),
+        }
+    }
+
+    /// The scope roots whose role covers `needed`, in id order (so two
+    /// connections with the same grant name them alike); `None` for the
+    /// whole store.
+    pub fn roots_allowing(&self, needed: Access) -> Option<Vec<NodeId>> {
+        match self {
+            Grant::Whole(_) => None,
+            Grant::Scoped(roots) => {
+                let mut ids: Vec<NodeId> = roots.iter().filter(|(_, role)| role.allows(needed)).map(|(id, _)| *id).collect();
+                ids.sort_by_key(|id| id.to_string());
+                Some(ids)
+            }
+        }
     }
 }
 
@@ -163,13 +211,42 @@ pub fn authorize(principal: &Principal, store_id: StoreId, needed: Access) -> Re
     match principal {
         Principal::Service => Ok(()),
         Principal::User { grants, .. } => match grants.get(&store_id) {
-            Some(grant) if grant.role.allows(needed) => Ok(()),
-            Some(_) => Err(forbidden_error(format!(
-                "store {} does not grant the role this operation needs",
-                store_id
-            ))),
+            Some(grant) if grant.allows(needed) => Ok(()),
+            // Only a reader fails `allows`, and a reader's write is refused
+            // with the one sentence every reader refusal carries.
+            Some(_) => Err(read_only_error()),
             None => Err(forbidden_error(format!("no grant for store {}", store_id))),
         },
+    }
+}
+
+/// The check for an RPC that is an owner's to call (`setScope`, `getScopes`:
+/// the scope sets are authorization metadata the owner's devices publish,
+/// docs/NODE_DOCUMENT_CONTRACT.md section 5): `Service`, or a whole-store
+/// grant whose role is `Owner`. A reader is refused as a reader is
+/// everywhere; anyone else is told whose call it is.
+pub fn authorize_owner(principal: &Principal, store_id: StoreId, operation: &str) -> Result<(), ErrorObjectOwned> {
+    match principal {
+        Principal::Service => Ok(()),
+        Principal::User { grants, .. } => match grants.get(&store_id) {
+            Some(Grant::Whole(Role::Owner)) => Ok(()),
+            Some(_) => Err(forbidden_error(format!("{} is only available to an owner of store {}", operation, store_id))),
+            None => Err(forbidden_error(format!("no grant for store {}", store_id))),
+        },
+    }
+}
+
+/// The scope roots of `principal`'s grant on `store_id` whose role covers
+/// `needed`: `None` for a principal that reaches the whole store (`Service`,
+/// or a whole-store grant), `Some(roots)` for a share's member, who reaches
+/// exactly the documents in those roots' scope sets
+/// (docs/NODE_DOCUMENT_CONTRACT.md section 5). With `Access::Read` that is
+/// every root of the grant. Call after [`authorize`]: a principal with no
+/// grant at all reads as unscoped here, and `authorize` is what refuses it.
+pub fn scope_roots_of(principal: &Principal, store_id: StoreId, needed: Access) -> Option<Vec<NodeId>> {
+    match principal {
+        Principal::Service => None,
+        Principal::User { grants, .. } => grants.get(&store_id).and_then(|grant| grant.roots_allowing(needed)),
     }
 }
 
@@ -221,7 +298,61 @@ mod tests {
         let user = Principal::User { sub: "u".into(), email: "u@example.com".into(), grants };
 
         assert!(authorize(&user, s, Access::Read).is_ok());
-        assert!(authorize(&user, s, Access::Write).is_err());
+        let refusal = authorize(&user, s, Access::Write).unwrap_err();
+        assert_eq!(refusal.code(), -32004);
+        assert_eq!(refusal.message(), StoreAccess::READ_ONLY_REFUSAL, "the sentence alone, as the person sees it");
+        assert_eq!(StoreAccess::refusal_in(refusal.message()), Some(StoreAccess::READ_ONLY_REFUSAL));
+    }
+
+    #[test]
+    fn only_a_whole_store_owner_or_the_service_is_an_owner() {
+        let s = store();
+        let user = |grant: Grant| Principal::User { sub: "u".into(), email: "u@example.com".into(), grants: HashMap::from([(s, grant)]) };
+        assert!(authorize_owner(&Principal::Service, s, "setScope").is_ok());
+        assert!(authorize_owner(&user(Grant::whole(Role::Owner)), s, "setScope").is_ok());
+        for grant in [Grant::whole(Role::Editor), Grant::whole(Role::Reader), Grant::scoped([(NodeId::new(), Role::Editor)]), Grant::scoped([(NodeId::new(), Role::Owner)])] {
+            let refusal = authorize_owner(&user(grant), s, "setScope").unwrap_err();
+            assert_eq!(refusal.code(), -32004);
+        }
+        assert_eq!(authorize_owner(&user(Grant::whole(Role::Owner)), store(), "setScope").unwrap_err().code(), -32004);
+    }
+
+    #[test]
+    fn a_scoped_grant_names_its_roots_by_role_and_a_whole_one_none() {
+        let s = store();
+        let (read_root, edit_root) = (NodeId::new(), NodeId::new());
+        let mut grants = HashMap::new();
+        grants.insert(s, Grant::scoped([(read_root, Role::Reader), (edit_root, Role::Editor)]));
+        let member = Principal::User { sub: "u".into(), email: "u@example.com".into(), grants };
+        // At the store level an editor of one root may write; which
+        // documents is the per-document check's business.
+        assert!(authorize(&member, s, Access::Read).is_ok());
+        assert!(authorize(&member, s, Access::Write).is_ok());
+        let mut every_root = vec![read_root, edit_root];
+        every_root.sort_by_key(|id| id.to_string());
+        assert_eq!(scope_roots_of(&member, s, Access::Read), Some(every_root));
+        assert_eq!(scope_roots_of(&member, s, Access::Write), Some(vec![edit_root]));
+        assert_eq!(scope_roots_of(&member, store(), Access::Read), None, "no grant reads as unscoped; authorize refuses it first");
+
+        // A reader of every root is a reader: the sentence, at the door.
+        let readers = Principal::User {
+            sub: "u".into(),
+            email: "u@example.com".into(),
+            grants: HashMap::from([(s, Grant::scoped([(read_root, Role::Reader)]))]),
+        };
+        assert_eq!(authorize(&readers, s, Access::Write).unwrap_err().message(), StoreAccess::READ_ONLY_REFUSAL);
+        assert_eq!(scope_roots_of(&readers, s, Access::Write), Some(Vec::new()));
+
+        let mut grants = HashMap::new();
+        grants.insert(s, Grant::whole(Role::Editor));
+        let whole = Principal::User { sub: "u".into(), email: "u@example.com".into(), grants };
+        assert_eq!(scope_roots_of(&whole, s, Access::Read), None);
+        assert_eq!(scope_roots_of(&Principal::Service, s, Access::Write), None);
+
+        let document_refusal = no_grant_for_document_error();
+        assert_eq!(document_refusal.code(), -32004);
+        assert_eq!(document_refusal.message(), "Forbidden: no grant for this document");
+        assert!(document_refusal.message().contains(NO_GRANT_FOR_DOCUMENT));
     }
 
     #[test]

@@ -81,6 +81,9 @@ pub struct PimbleServer {
     config: ServerConfig,
     store_manager: Arc<RwLock<StoreManager>>,
     handle: Option<ServerHandle>,
+    /// The handler the running server dispatches to, kept so `stop()` can
+    /// stop the links it started.
+    handler: Option<RpcHandler>,
     /// The socket the server actually bound to, resolved once at `start()`
     /// (`Server::local_addr()`), so a config with port 0 (as used in tests)
     /// still has a meaningful `addr()`.
@@ -99,6 +102,7 @@ impl PimbleServer {
             config,
             store_manager: Arc::new(RwLock::new(StoreManager::new())),
             handle: None,
+            handler: None,
             local_addr: None,
         }
     }
@@ -190,6 +194,7 @@ impl PimbleServer {
         let replicas_dir = self.config.replicas_dir.clone().unwrap_or_else(crate::handler::default_replicas_dir);
         let keystore_path = self.config.keystore_path.clone().unwrap_or_else(crate::keystore::default_keystore_path);
         let handler = RpcHandler::with_all_paths(Arc::clone(&self.store_manager), semantic_available, credentials_path, replicas_dir, keystore_path);
+        self.handler = Some(handler.clone());
         let methods = handler.into_rpc();
 
         info!("Starting Pimble server on {}", local_addr);
@@ -201,6 +206,13 @@ impl PimbleServer {
 
     /// Stop the server
     pub async fn stop(&mut self) -> Result<()> {
+        // The links first: a link is a task of its own, and one left running
+        // after its server stopped keeps applying to (and writing the files
+        // of) stores a restarted server in the same process has open again.
+        if let Some(handler) = self.handler.take() {
+            handler.stop_links().await;
+        }
+
         // Flush any pending tree/content changes before the handle stops, so
         // an app shutdown never depends on the caller remembering to flush
         // (debounced content flushes in particular may still be pending).

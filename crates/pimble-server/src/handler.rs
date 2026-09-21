@@ -19,6 +19,20 @@
 //!   the same bytes. A merge that changed nothing does nothing at all
 //!   (docs/history/HARDENING_CONTRACT.md decision 8).
 //!
+//! Who may reach what (docs/NODE_DOCUMENT_CONTRACT.md section 5): `authorize`
+//! judges the store, and for a share's member (a grant with a role per
+//! shared root) every RPC that names a document or a node judges that too,
+//! against the scopes of the member's roots ([`Reach`]): a vault store's
+//! published scope sets, a plain store's own tree. Outside every scope is
+//! "no grant for this document", whether or not the document exists; in a
+//! scope the member only reads, a write is the reader's one sentence. Lists
+//! (`getChildren`, `getNodes`, `syncNodes`, `vaultListDocs`, `search`) leave
+//! out what is not the member's, and a notification reaches a scoped
+//! subscriber only when its document is in scope as it is sent
+//! ([`Delivery`]), so a member never learns another document's id. The same
+//! sentence refuses a write on a replica this device holds as a reader
+//! (`reject_if_read_only`).
+//!
 //! So a subscriber never needs to refetch to stay in step: a sync link
 //! forwards the bytes of every document notification as an `applyEdit`, and
 //! an editor merges them. The tree is settled by `Tree::repair` after a
@@ -36,7 +50,7 @@ use jsonrpsee::core::{async_trait, SubscriptionResult};
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{Extensions, PendingSubscriptionSink, SubscriptionMessage};
 use pimble_client::{describe_connect_error, PimbleClient};
-use pimble_core::{AuthMethod, Node, MountRef, MountState, NodeId, RemoteEndpoint, StoreId, StoreKind, StoreLocation, SyncState, Workspace};
+use pimble_core::{AuthMethod, Node, MountRef, MountState, NodeId, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState, Workspace};
 use pimble_crdt::{NodeDoc, NodeFields, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_plugins::PluginHost;
 use pimble_rpc::{
@@ -52,8 +66,8 @@ use pimble_rpc::{
     OpenStoreResponse, PimbleApiServer, RebuildIndexRequest, RebuildIndexResponse, RemoveReplicaRequest,
     SaveWorkspaceRequest, SearchRequest, SearchResponse, SearchResultItem, StoreChangeKind,
     CloudShareInfoResponse, CloudShareInviteRequest, CloudShareNodeRequest, CloudShareRef, CloudShareRemoveMemberRequest, DeleteVaultStoreRequest,
-    GetScopesRequest, GetScopesResponse, SetScopeRequest, StoreChangedNotification, SyncNodesRequest, SyncNodesResponse, UndeleteNodeRequest,
-    UpdateNodeContentRequest, VaultSetDocKeysRequest,
+    GetScopesRequest, GetScopesResponse, Scope, SetScopeRequest, StoreChangedNotification, SyncNodesRequest, SyncNodesResponse, UndeleteNodeRequest,
+    UpdateNodeContentRequest, VaultDocKeys, VaultSetDocKeysRequest,
     UpdateNodeMetadataRequest,
     VaultAppendRequest, VaultAppendResponse, VaultDocId, VaultDocInfo, VaultEntry, VaultFetchRequest,
     VaultFetchResponse, VaultListDocsRequest, VaultListDocsResponse, VaultSnapshotRequest,
@@ -66,7 +80,10 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::keystore::Keystore;
-use crate::principal::{authorize, authorize_service_only, principal_of, readable, service_extensions, Access};
+use crate::principal::{
+    authorize, authorize_owner, authorize_service_only, no_grant_for_document_error, principal_of, read_only_error, readable, scope_roots_of, service_extensions, Access,
+    Principal,
+};
 use crate::sync_link::{SyncLink, SyncLinkHandle};
 use crate::vault_link::{VaultLink, VaultLinkHandle};
 
@@ -81,6 +98,10 @@ const CONTENT_INDEX_DEBOUNCE: Duration = Duration::from_millis(2_000);
 /// per edit. The `modified_at` stamp a person's content edit earns rides the
 /// same window (see [`FlushDebouncer`]).
 const CONTENT_FLUSH_DEBOUNCE: Duration = Duration::from_millis(750);
+
+/// How many times `limit` a store's index is asked for when the caller is
+/// scoped in it (`search` drops the hits outside the scope afterwards).
+const SCOPED_SEARCH_OVERFETCH: usize = 10;
 
 /// How long a merged structural update waits for the next one before the
 /// tree is repaired (see [`Repair::Debounced`]).
@@ -98,6 +119,121 @@ fn now() -> String {
 /// carries that says so.
 fn is_link_client(client_id: &str) -> bool {
     client_id.starts_with("sync-link:") || client_id.starts_with("vault-link:")
+}
+
+/// The documents a principal scoped to `roots` reaches in `store_id`
+/// (docs/NODE_DOCUMENT_CONTRACT.md section 5): a vault store's published
+/// scope sets (the server holds no tree of it, so the owner's devices say
+/// what is under each root, and each root is in its own scope); a plain
+/// store's own tree under each root, computed and stored nowhere. A store
+/// that is not open reaches nothing, and the RPC fails on that afterwards.
+fn scope_set(manager: &StoreManager, store_id: StoreId, roots: &[NodeId]) -> HashSet<NodeId> {
+    match manager.store_kind(store_id) {
+        Some(StoreKind::Vault) => manager.vault_scope_union(store_id, roots).unwrap_or_default(),
+        Some(StoreKind::Plain) => manager.tree(store_id).map(|tree| plain_scope(tree, roots)).unwrap_or_default(),
+        None => HashSet::new(),
+    }
+}
+
+/// A plain store's scope for `roots`: every root's subtree, plus every held
+/// document whose stored parent chain leads into it. The second half is
+/// what the subtree walk leaves out and a member must still reach: a
+/// tombstone (a scoped member's delete is one, and the document stays theirs
+/// to undelete, the same as a vault store's set keeps a deleted document's
+/// id), and a document just created whose parent's list does not name it
+/// yet (a create is two documents' updates, and `parent_id` is the
+/// authoritative half).
+fn plain_scope(tree: &Tree, roots: &[NodeId]) -> HashSet<NodeId> {
+    let mut scope: HashSet<NodeId> = HashSet::new();
+    for root in roots {
+        if let Ok(ids) = tree.subtree_ids(*root) {
+            scope.extend(ids);
+        } else if tree.doc(*root).is_some() {
+            // A tombstoned root is still the member's document.
+            scope.insert(*root);
+        }
+    }
+    let mut outside: Vec<(NodeId, NodeId)> = tree
+        .ids()
+        .into_iter()
+        .filter(|id| !scope.contains(id))
+        .filter_map(|id| Some((id, tree.doc(id)?.fields().ok()?.parent_id?)))
+        .collect();
+    // A deleted folder's deleted children point at the folder, so admit
+    // until a pass admits none.
+    loop {
+        let before = scope.len();
+        outside.retain(|(id, parent)| {
+            if scope.contains(parent) {
+                scope.insert(*id);
+                false
+            } else {
+                true
+            }
+        });
+        if scope.len() == before {
+            break;
+        }
+    }
+    scope
+}
+
+/// What a scoped principal reaches in one store: the documents it may read
+/// (every root's scope) and, among them, the ones it may write (the scopes
+/// of the roots it edits; a document in a read scope and a write scope
+/// takes the wider role, docs/NODE_DOCUMENT_CONTRACT.md section 5).
+struct Reach {
+    readable: HashSet<NodeId>,
+    writable: HashSet<NodeId>,
+}
+
+impl Reach {
+    fn of(manager: &StoreManager, principal: &Principal, store_id: StoreId) -> Option<Self> {
+        let read_roots = scope_roots_of(principal, store_id, Access::Read)?;
+        let write_roots = scope_roots_of(principal, store_id, Access::Write).unwrap_or_default();
+        let readable = scope_set(manager, store_id, &read_roots);
+        // The common case, one role for every root, computes one set.
+        let writable = if write_roots.len() == read_roots.len() {
+            readable.clone()
+        } else if write_roots.is_empty() {
+            HashSet::new()
+        } else {
+            scope_set(manager, store_id, &write_roots)
+        };
+        Some(Self { readable, writable })
+    }
+
+    /// A document outside every scope is refused without saying whether it
+    /// exists; one the member may read and not write, as a reader is.
+    fn require(&self, id: NodeId, needed: Access) -> Result<(), ErrorObjectOwned> {
+        if !self.readable.contains(&id) {
+            return Err(no_grant_for_document_error());
+        }
+        match needed {
+            Access::Write if !self.writable.contains(&id) => Err(read_only_error()),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// `Ok` when `reach` is `None` (the principal reaches the whole store, and
+/// `authorize` has judged its role) or covers `id` for `needed`.
+fn require_in_scope(reach: &Option<Reach>, id: NodeId, needed: Access) -> Result<(), ErrorObjectOwned> {
+    match reach {
+        Some(reach) => reach.require(id, needed),
+        None => Ok(()),
+    }
+}
+
+/// The parent a node document's update names, for admitting a scoped
+/// member's `applyEdit` of a document the store does not have yet: the
+/// update is read into a scratch document and its `node.parent_id` is the
+/// parent the request names (the `createNode` path names it in the request
+/// itself). `None` when the update does not initialise the node.
+fn parent_named_by(update: &[u8]) -> Option<NodeId> {
+    let mut scratch = NodeDoc::new();
+    scratch.apply_update(update).ok()?;
+    scratch.fields().ok()?.parent_id
 }
 
 /// The directory a server creates replicas in unless
@@ -557,12 +693,63 @@ pub enum LocalChange {
     Node(NodeContentChangedNotification),
 }
 
+/// One subscriber's sink and the scope roots of the grant it subscribed
+/// with (`None`: it reaches the whole store). A scoped subscriber is sent a
+/// notification about a document only when that document is in its scope
+/// as of delivery, so it never learns another document's id, and a document
+/// moved out of its share stops reaching it at once
+/// (docs/NODE_DOCUMENT_CONTRACT.md section 5).
+struct ScopedSink {
+    sink: jsonrpsee::core::server::SubscriptionSink,
+    roots: Option<Vec<NodeId>>,
+}
+
+/// How a notification reaches one scoped subscriber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Form {
+    /// As it is: every document it names is in the subscriber's scope.
+    Whole,
+    /// Its document is in scope and another id it names is not (a share's
+    /// root moved by its owner names parents the member has no grant on):
+    /// sent as `TreeStructure { [document] }` with the same bytes, which
+    /// says "this document changed, here is how" and names nothing else.
+    DocumentOnly,
+}
+
+/// Which scoped subscribers a notification may reach and in which form,
+/// resolved by the handler before the registry is locked (the scope sets
+/// live in the store manager). A notification naming no document (a link's
+/// or a mount's state) reaches everyone; an unscoped subscriber always gets
+/// the notification as it is.
+struct Delivery {
+    admitted: Vec<(Vec<NodeId>, Form)>,
+    to_everyone: bool,
+}
+
+impl Delivery {
+    fn everyone() -> Self {
+        Self { admitted: Vec::new(), to_everyone: true }
+    }
+
+    fn unscoped_only() -> Self {
+        Self { admitted: Vec::new(), to_everyone: false }
+    }
+
+    fn form_for(&self, roots: &Option<Vec<NodeId>>) -> Option<Form> {
+        match roots {
+            None => Some(Form::Whole),
+            Some(_) if self.to_everyone => Some(Form::Whole),
+            Some(roots) => self.admitted.iter().find(|(r, _)| r == roots).map(|(_, form)| *form),
+        }
+    }
+}
+
 /// Manages active subscription sinks for pushing notifications.
 struct SubscriptionRegistry {
     /// Store change subscribers: store_id -> list of sinks
-    store_subs: HashMap<StoreId, Vec<jsonrpsee::core::server::SubscriptionSink>>,
+    store_subs: HashMap<StoreId, Vec<ScopedSink>>,
     /// Node content change subscribers: (store_id, node_id) -> list of sinks
-    node_subs: HashMap<(StoreId, NodeId), Vec<jsonrpsee::core::server::SubscriptionSink>>,
+    node_subs: HashMap<(StoreId, NodeId), Vec<ScopedSink>>,
     /// In-process broadcast of every local notification (decision 3).
     local_changes: broadcast::Sender<LocalChange>,
 }
@@ -582,67 +769,98 @@ impl SubscriptionRegistry {
         self.local_changes.subscribe()
     }
 
-    fn add_store_sub(&mut self, store_id: StoreId, sink: jsonrpsee::core::server::SubscriptionSink) {
-        self.store_subs.entry(store_id).or_default().push(sink);
+    fn add_store_sub(&mut self, store_id: StoreId, sink: jsonrpsee::core::server::SubscriptionSink, roots: Option<Vec<NodeId>>) {
+        self.store_subs.entry(store_id).or_default().push(ScopedSink { sink, roots });
     }
 
-    fn add_node_sub(&mut self, store_id: StoreId, node_id: NodeId, sink: jsonrpsee::core::server::SubscriptionSink) {
-        self.node_subs.entry((store_id, node_id)).or_default().push(sink);
+    fn add_node_sub(&mut self, store_id: StoreId, node_id: NodeId, sink: jsonrpsee::core::server::SubscriptionSink, roots: Option<Vec<NodeId>>) {
+        self.node_subs.entry((store_id, node_id)).or_default().push(ScopedSink { sink, roots });
+    }
+
+    /// The distinct root sets of `store_id`'s scoped subscribers (store and
+    /// node subscriptions alike), for the handler to resolve a delivery
+    /// against. Empty in the common case of no scoped subscriber at all.
+    fn scoped_roots(&self, store_id: StoreId) -> Vec<Vec<NodeId>> {
+        let mut out: Vec<Vec<NodeId>> = Vec::new();
+        let store_sinks = self.store_subs.get(&store_id).into_iter().flatten();
+        let node_sinks = self.node_subs.iter().filter(|((sid, _), _)| *sid == store_id).flat_map(|(_, sinks)| sinks.iter());
+        for sink in store_sinks.chain(node_sinks) {
+            if let Some(roots) = &sink.roots {
+                if !out.contains(roots) {
+                    out.push(roots.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Send `msg` to every sink `delivery` admits, dropping closed ones. A
+    /// sink admitted as [`Form::DocumentOnly`] gets `document_only` instead
+    /// (and nothing when there is none to send).
+    async fn send_to(sinks: &mut Vec<ScopedSink>, msg: &SubscriptionMessage, document_only: Option<&SubscriptionMessage>, delivery: &Delivery) {
+        let mut closed = Vec::new();
+        for (i, scoped) in sinks.iter().enumerate() {
+            if scoped.sink.is_closed() {
+                closed.push(i);
+                continue;
+            }
+            let msg = match delivery.form_for(&scoped.roots) {
+                Some(Form::Whole) => msg,
+                Some(Form::DocumentOnly) => match document_only {
+                    Some(msg) => msg,
+                    None => continue,
+                },
+                None => continue,
+            };
+            if scoped.sink.send(msg.clone()).await.is_err() {
+                closed.push(i);
+            }
+        }
+        for i in closed.into_iter().rev() {
+            sinks.swap_remove(i);
+        }
     }
 
     /// Notify all store subscribers about a change, removing closed sinks.
-    async fn notify_store_change(&mut self, notification: &StoreChangedNotification) {
+    async fn notify_store_change(&mut self, notification: &StoreChangedNotification, delivery: &Delivery) {
         // Local, in-process broadcast (decision 3); harmless if no one (no
-        // sync link) is currently subscribed.
+        // sync link) is currently subscribed. A link is this server's own
+        // and sees everything: scope is a subscriber's concern.
         let _ = self.local_changes.send(LocalChange::Store(notification.clone()));
 
         if let Some(sinks) = self.store_subs.get_mut(&notification.store_id) {
-            let msg = SubscriptionMessage::from_json(&notification).ok();
-            if let Some(msg) = msg {
-                let mut closed = Vec::new();
-                for (i, sink) in sinks.iter().enumerate() {
-                    if sink.is_closed() {
-                        closed.push(i);
-                    } else if let Err(_) = sink.send(msg.clone()).await {
-                        closed.push(i);
-                    }
-                }
-                for i in closed.into_iter().rev() {
-                    sinks.swap_remove(i);
-                }
+            if let Ok(msg) = SubscriptionMessage::from_json(&notification) {
+                // Built only when a subscriber needs it, which is rare.
+                let document_only = delivery
+                    .admitted
+                    .iter()
+                    .any(|(_, form)| *form == Form::DocumentOnly)
+                    .then(|| named_by(&notification.change_kind))
+                    .and_then(|named| match named {
+                        Named::Document { id, .. } => SubscriptionMessage::from_json(&StoreChangedNotification {
+                            change_kind: StoreChangeKind::TreeStructure { node_ids: vec![id] },
+                            ..notification.clone()
+                        })
+                        .ok(),
+                        _ => None,
+                    });
+                Self::send_to(sinks, &msg, document_only.as_ref(), delivery).await;
             }
         }
     }
 
-    /// Notify all node content subscribers about a change, removing closed sinks.
-    async fn notify_node_change(&mut self, notification: &NodeContentChangedNotification) {
+    /// Notify all node content subscribers about a change, removing closed
+    /// sinks. It names its node and nothing else, so it has one form.
+    async fn notify_node_change(&mut self, notification: &NodeContentChangedNotification, delivery: &Delivery) {
         let _ = self.local_changes.send(LocalChange::Node(notification.clone()));
 
         let key = (notification.store_id, notification.node_id);
         if let Some(sinks) = self.node_subs.get_mut(&key) {
-            tracing::info!("notify_node_change: {} sinks for {:?}/{:?}", sinks.len(), notification.store_id, notification.node_id);
-            let msg = SubscriptionMessage::from_json(&notification).ok();
-            if let Some(msg) = msg {
-                let mut closed = Vec::new();
-                for (i, sink) in sinks.iter().enumerate() {
-                    if sink.is_closed() {
-                        tracing::info!("  sink {} is closed", i);
-                        closed.push(i);
-                    } else if let Err(e) = sink.send(msg.clone()).await {
-                        tracing::info!("  sink {} send failed: {}", i, e);
-                        closed.push(i);
-                    } else {
-                        tracing::info!("  sink {} sent OK", i);
-                    }
-                }
-                for i in closed.into_iter().rev() {
-                    sinks.swap_remove(i);
-                }
-            } else {
-                tracing::warn!("notify_node_change: failed to serialize notification");
+            debug!("notify_node_change: {} sinks for {:?}/{:?}", sinks.len(), notification.store_id, notification.node_id);
+            match SubscriptionMessage::from_json(&notification) {
+                Ok(msg) => Self::send_to(sinks, &msg, Some(&msg), delivery).await,
+                Err(e) => warn!("notify_node_change: failed to serialize notification: {}", e),
             }
-        } else {
-            tracing::info!("notify_node_change: no sinks for {:?}/{:?}", notification.store_id, notification.node_id);
         }
     }
 
@@ -650,6 +868,44 @@ impl SubscriptionRegistry {
     fn remove_store(&mut self, store_id: StoreId) {
         self.store_subs.remove(&store_id);
         self.node_subs.retain(|(sid, _), _| *sid != store_id);
+    }
+}
+
+/// What a notification names, for scoped delivery.
+enum Named {
+    /// No document (a link's or a mount's state, which name nothing a
+    /// scope could hide): it reaches every subscriber.
+    Nothing,
+    /// A document no scope can hold (the retired `tree` vault document,
+    /// which is no node): it reaches unscoped subscribers only.
+    Nobodys,
+    /// The document it is about, and the other ids it names (the parents
+    /// of a create, a delete or a move).
+    Document { id: NodeId, others: Vec<NodeId> },
+}
+
+fn named_by(kind: &StoreChangeKind) -> Named {
+    match kind {
+        StoreChangeKind::NodeCreated { node_id, parent_id } | StoreChangeKind::NodeDeleted { node_id, parent_id } => {
+            Named::Document { id: *node_id, others: vec![*parent_id] }
+        }
+        StoreChangeKind::NodeMoved { node_id, old_parent_id, new_parent_id } => {
+            Named::Document { id: *node_id, others: vec![*old_parent_id, *new_parent_id] }
+        }
+        StoreChangeKind::MetadataUpdated { node_id } | StoreChangeKind::ContentUpdated { node_id } => {
+            Named::Document { id: *node_id, others: Vec::new() }
+        }
+        // One document per notification wherever this server builds one; a
+        // longer list is about its first, like the bytes it carries.
+        StoreChangeKind::TreeStructure { node_ids } => match node_ids.split_first() {
+            Some((id, others)) => Named::Document { id: *id, others: others.to_vec() },
+            None => Named::Nobodys,
+        },
+        StoreChangeKind::VaultAppended { doc_id: VaultDocId::Node(node_id), .. } => Named::Document { id: *node_id, others: Vec::new() },
+        StoreChangeKind::VaultAppended { doc_id: VaultDocId::Tree, .. } => Named::Nobodys,
+        StoreChangeKind::SyncStateChanged { .. }
+        | StoreChangeKind::MountStateChanged { .. }
+        | StoreChangeKind::ShareStateChanged { .. } => Named::Nothing,
     }
 }
 
@@ -812,6 +1068,100 @@ impl RpcHandler {
         Ok(())
     }
 
+    // ── Scoped grants and read-only replicas (docs/NODE_DOCUMENT_CONTRACT.md
+    // section 5) ─────────────────────────────────────────────────────────
+
+    /// The guard every write RPC on a plain store runs after `authorize`:
+    /// a replica this device holds as a share's reader (`sync.json`'s
+    /// `access: read`, or a reader's root among several) refuses a write
+    /// touching `ids` with the reader's own sentence, as the hosted server
+    /// would refuse the push. A link's applies never come this way
+    /// (`apply_node_update_from`), so a reader's replica still receives
+    /// everything.
+    async fn reject_if_read_only(&self, store_id: StoreId, ids: &[NodeId]) -> Result<(), ErrorObjectOwned> {
+        if self.store_manager.read().await.write_refused(store_id, ids) {
+            return Err(read_only_error());
+        }
+        Ok(())
+    }
+
+    /// A `Store` as `principal` is to see it (docs/NODE_DOCUMENT_CONTRACT.md
+    /// section 5): a share's member is shown the roots of their grant, never
+    /// the store's own root (a document they have no grant on), and what
+    /// they may change is the narrower of what this device may and what
+    /// their role may.
+    fn present_store_to(principal: &Principal, store: &mut pimble_core::Store) {
+        let Principal::User { grants, .. } = principal else { return };
+        let Some(grant) = grants.get(&store.id) else { return };
+        if !grant.allows(Access::Write) {
+            store.access = StoreAccess::Read;
+        }
+        if let Some(roots) = grant.roots_allowing(Access::Read) {
+            if let Some(first) = roots.first() {
+                store.root_node_id = *first;
+            }
+            store.roots = roots;
+        }
+    }
+
+    /// A scoped principal's read or write of vault document `doc_id`: it must
+    /// be a node document in the principal's scope. The retired tree
+    /// document is in no scope, and a document that does not exist answers
+    /// exactly as one that is someone else's.
+    fn require_vault_doc_in_scope(
+        &self,
+        manager: &StoreManager,
+        principal: &Principal,
+        store_id: StoreId,
+        doc_id: &VaultDocId,
+        needed: Access,
+    ) -> Result<(), ErrorObjectOwned> {
+        let Some(reach) = Reach::of(manager, principal, store_id) else {
+            return Ok(());
+        };
+        match doc_id {
+            VaultDocId::Node(id) => reach.require(*id, needed),
+            VaultDocId::Tree => Err(no_grant_for_document_error()),
+        }
+    }
+
+    /// What `principal` reaches in `store_id`: `None` when it reaches the
+    /// whole store (see [`Reach`]). Call after `authorize`.
+    async fn reach_of(&self, principal: &Principal, store_id: StoreId) -> Option<Reach> {
+        let manager = self.store_manager.read().await;
+        Reach::of(&manager, principal, store_id)
+    }
+
+    /// Which scoped subscribers of `store_id` a notification of `kind` may
+    /// reach, and in which form (see [`Delivery`]). Resolved before the
+    /// registry is locked, with a read of the store manager, which no
+    /// caller holds at that point. Cheap when nobody scoped is subscribed,
+    /// the common case.
+    async fn delivery_for(&self, store_id: StoreId, kind: &StoreChangeKind) -> Delivery {
+        let (id, others) = match named_by(kind) {
+            Named::Nothing => return Delivery::everyone(),
+            Named::Nobodys => return Delivery::unscoped_only(),
+            Named::Document { id, others } => (id, others),
+        };
+        let scoped = self.subscriptions.read().await.scoped_roots(store_id);
+        if scoped.is_empty() {
+            return Delivery::unscoped_only();
+        }
+        let manager = self.store_manager.read().await;
+        let admitted = scoped
+            .into_iter()
+            .filter_map(|roots| {
+                let scope = scope_set(&manager, store_id, &roots);
+                if !scope.contains(&id) {
+                    return None;
+                }
+                let form = if others.iter().all(|other| scope.contains(other)) { Form::Whole } else { Form::DocumentOnly };
+                Some((roots, form))
+            })
+            .collect();
+        Delivery { admitted, to_everyone: false }
+    }
+
     // ── Replica sync (docs/SYNC_CONTRACT.md) ─────────────────────────
 
     /// Shared handle to the store manager, for [`crate::sync_link`] and
@@ -903,6 +1253,16 @@ impl RpcHandler {
     }
 
     /// Stop and remove `store_id`'s sync link, if any.
+    /// Stop every link, plain and vault (`PimbleServer::stop`).
+    pub(crate) async fn stop_links(&self) {
+        for (_, handle) in self.links.write().await.drain() {
+            handle.stop();
+        }
+        for (_, handle) in self.vault_links.write().await.drain() {
+            handle.stop();
+        }
+    }
+
     async fn stop_link(&self, store_id: StoreId) {
         if let Some(handle) = self.links.write().await.remove(&store_id) {
             handle.stop();
@@ -955,7 +1315,13 @@ impl RpcHandler {
     /// credential, only the keystore. Used by `cloudHostStore` and
     /// `cloudAddHostedStore`, both of which then call
     /// `ensure_vault_link_started` with the returned url.
-    async fn link_hosted_store(&self, store_id: StoreId, account: &crate::keystore::SignedInAccount, key_id: Uuid) -> Result<url::Url, ErrorObjectOwned> {
+    async fn link_hosted_store(
+        &self,
+        store_id: StoreId,
+        account: &crate::keystore::SignedInAccount,
+        key_id: Uuid,
+        held_as: &crate::cloud::HeldAs,
+    ) -> Result<url::Url, ErrorObjectOwned> {
         let minted = crate::cloud::mint_token(&account.url, &account.session).await.map_err(to_rpc_error)?;
         let rpc_url: url::Url = minted
             .rpc_url
@@ -972,6 +1338,9 @@ impl RpcHandler {
                     mode: SyncMode::Vault,
                     last_seq: Default::default(),
                     vault_key_id: Some(key_id),
+                    access: held_as.access,
+                    shared_by: held_as.shared_by.clone(),
+                    read_only_roots: held_as.read_only_roots.clone(),
                 },
             )
             .await
@@ -1296,7 +1665,7 @@ impl RpcHandler {
             .await
             .map_err(to_rpc_error)?;
         manager
-            .write_sync_config(created_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None, mode: pimble_store::SyncMode::Sync, last_seq: Default::default(), vault_key_id: None })
+            .write_sync_config(created_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None, mode: pimble_store::SyncMode::Sync, last_seq: Default::default(), vault_key_id: None, access: StoreAccess::Full, shared_by: None, read_only_roots: Vec::new() })
             .await
             .map_err(to_rpc_error)?;
         let mut store = manager.get_store_info(created_id).map_err(to_rpc_error)?;
@@ -1408,13 +1777,14 @@ impl RpcHandler {
     /// Notify store subscribers about a change that is not about a document
     /// (a link's or a mount's state); it carries no bytes.
     async fn notify_store_change(&self, store_id: StoreId, kind: StoreChangeKind, source: Option<&str>) {
+        let delivery = self.delivery_for(store_id, &kind).await;
         let notification = StoreChangedNotification {
             store_id,
             change_kind: kind,
             source_client_id: source.map(String::from),
             update: None,
         };
-        self.subscriptions.write().await.notify_store_change(&notification).await;
+        self.subscriptions.write().await.notify_store_change(&notification, &delivery).await;
     }
 
     /// Broadcast one document's change: `kind` names the document, and
@@ -1423,6 +1793,7 @@ impl RpcHandler {
     /// node's own subscribers (the editor), carrying the same bytes as its
     /// operation.
     async fn broadcast_document_change(&self, store_id: StoreId, kind: StoreChangeKind, source: Option<&str>, update_b64: Option<String>) {
+        let delivery = self.delivery_for(store_id, &kind).await;
         let store_notif = StoreChangedNotification {
             store_id,
             change_kind: kind.clone(),
@@ -1438,9 +1809,9 @@ impl RpcHandler {
                 source_client_id: source.map(String::from),
                 operation: update_b64.map(|changes| EditOperation::IncrementalChanges { changes }),
             };
-            registry.notify_node_change(&node_notif).await;
+            registry.notify_node_change(&node_notif, &delivery).await;
         }
-        registry.notify_store_change(&store_notif).await;
+        registry.notify_store_change(&store_notif, &delivery).await;
     }
 
     /// Broadcast a [`TreeEdit`]: one notification per document it touched,
@@ -1516,7 +1887,7 @@ impl RpcHandler {
 
     /// Repair `store_id`'s tree once no structural update has landed for
     /// [`REPAIR_DEBOUNCE`] (see [`Repair`]).
-    fn schedule_repair(&self, store_id: StoreId) {
+    pub(crate) fn schedule_repair(&self, store_id: StoreId) {
         let generation = {
             let mut gens = self.repairs.generation.lock().unwrap();
             let g = gens.entry(store_id).or_insert(0);
@@ -1856,7 +2227,8 @@ impl PimbleApiServer for RpcHandler {
     // ── Vault (encrypted store) API, docs/CRYPTO_CONTRACT.md ─────────────
 
     async fn vault_append(&self, ext: &Extensions, request: VaultAppendRequest) -> Result<VaultAppendResponse, ErrorObjectOwned> {
-        authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Write)?;
         debug!("Vault append to store {} doc {:?}", request.store_id, request.doc_id);
 
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -1866,6 +2238,35 @@ impl PimbleApiServer for RpcHandler {
             .map_err(|e| to_rpc_error(format!("invalid base64url blob: {}", e)))?;
 
         let mut manager = self.store_manager.write().await;
+
+        // A scoped member reaches its scope's documents, and may add one
+        // under a parent it may write: the new id then joins every scope of
+        // the member's that holds the parent, before the owner's devices
+        // see it, so every other member's reads of it are in scope too
+        // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Scope sets"). The
+        // retired tree document is in no scope, and a document not in the
+        // store whose request names no parent, or a parent outside the
+        // scope, is refused like any other.
+        let mut joins_scopes: Option<(Vec<NodeId>, NodeId, NodeId)> = None;
+        if let Some(reach) = Reach::of(&manager, &principal, request.store_id) {
+            let VaultDocId::Node(node_id) = &request.doc_id else {
+                return Err(no_grant_for_document_error());
+            };
+            if reach.readable.contains(node_id) {
+                reach.require(*node_id, Access::Write)?;
+            } else {
+                let held = manager.vault_has_doc(request.store_id, &request.doc_id.as_str()).map_err(to_rpc_error)?;
+                match request.parent_id {
+                    Some(parent_id) if !held => {
+                        reach.require(parent_id, Access::Write)?;
+                        let roots = scope_roots_of(&principal, request.store_id, Access::Read).unwrap_or_default();
+                        joins_scopes = Some((roots, parent_id, *node_id));
+                    }
+                    _ => return Err(no_grant_for_document_error()),
+                }
+            }
+        }
+
         let seq = manager
             .vault_append(request.store_id, &request.doc_id.as_str(), blob)
             .await
@@ -1876,35 +2277,46 @@ impl PimbleApiServer for RpcHandler {
                 )),
                 other => to_rpc_error(other),
             })?;
+        if let Some((roots, parent_id, node_id)) = joins_scopes {
+            manager.vault_extend_scopes(request.store_id, &roots, parent_id, node_id).await.map_err(to_rpc_error)?;
+        }
         drop(manager);
 
         // The blob rides the notification verbatim (still base64url) so a
         // live subscriber never re-fetches; `source_client_id` carries the
         // caller's id (the same way `applyEdit`'s `client_id` propagates),
         // so a client can drop its own echo by identity, not only by seq.
+        let kind = StoreChangeKind::VaultAppended { doc_id: request.doc_id.clone(), seq };
+        let delivery = self.delivery_for(request.store_id, &kind).await;
         let notification = StoreChangedNotification {
             store_id: request.store_id,
-            change_kind: StoreChangeKind::VaultAppended { doc_id: request.doc_id.clone(), seq },
+            change_kind: kind,
             source_client_id: request.client_id.clone(),
             update: Some(request.blob.clone()),
         };
-        self.subscriptions.write().await.notify_store_change(&notification).await;
+        self.subscriptions.write().await.notify_store_change(&notification, &delivery).await;
 
         Ok(VaultAppendResponse { seq })
     }
 
     async fn vault_fetch(&self, ext: &Extensions, request: VaultFetchRequest) -> Result<VaultFetchResponse, ErrorObjectOwned> {
-        authorize(&principal_of(ext), request.store_id, Access::Read)?;
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Read)?;
         debug!("Vault fetch from store {} doc {:?} after {}", request.store_id, request.doc_id, request.after_seq);
 
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
 
         let manager = self.store_manager.read().await;
+        self.require_vault_doc_in_scope(&manager, &principal, request.store_id, &request.doc_id, Access::Read)?;
         let (snapshot, updates, head) = manager
             .vault_fetch(request.store_id, &request.doc_id.as_str(), request.after_seq)
             .await
             .map_err(to_rpc_error)?;
+        let keys = manager
+            .vault_doc_keys(request.store_id, &request.doc_id.as_str())
+            .map_err(to_rpc_error)?
+            .and_then(|record| serde_json::from_str::<VaultDocKeys>(&record.json).ok());
 
         Ok(VaultFetchResponse {
             snapshot: snapshot.map(|(seq, blob)| VaultEntry { seq, blob: URL_SAFE_NO_PAD.encode(blob) }),
@@ -1913,12 +2325,13 @@ impl PimbleApiServer for RpcHandler {
                 .map(|(seq, blob)| VaultEntry { seq, blob: URL_SAFE_NO_PAD.encode(blob) })
                 .collect(),
             head,
-            keys: None,
+            keys,
         })
     }
 
     async fn vault_snapshot(&self, ext: &Extensions, request: VaultSnapshotRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
-        authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Write)?;
         info!("Vault snapshot for store {} doc {:?} upto {}", request.store_id, request.doc_id, request.upto_seq);
         if !request.covers_prefix {
             // A client from before 2026-09-17 stamps a snapshot with its own
@@ -1940,6 +2353,7 @@ impl PimbleApiServer for RpcHandler {
             .map_err(|e| to_rpc_error(format!("invalid base64url blob: {}", e)))?;
 
         let mut manager = self.store_manager.write().await;
+        self.require_vault_doc_in_scope(&manager, &principal, request.store_id, &request.doc_id, Access::Write)?;
         manager
             .vault_snapshot(request.store_id, &request.doc_id.as_str(), request.upto_seq, blob)
             .await
@@ -1949,17 +2363,28 @@ impl PimbleApiServer for RpcHandler {
     }
 
     async fn vault_list_docs(&self, ext: &Extensions, request: VaultListDocsRequest) -> Result<VaultListDocsResponse, ErrorObjectOwned> {
-        authorize(&principal_of(ext), request.store_id, Access::Read)?;
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Read)?;
         debug!("Vault list docs for store {}", request.store_id);
 
         let manager = self.store_manager.read().await;
         let docs = manager.vault_list_docs(request.store_id).map_err(to_rpc_error)?;
+        // A scoped member is listed its scope and nothing else: the list is
+        // how a recipient's replica learns which documents exist at all.
+        let scope = scope_roots_of(&principal, request.store_id, Access::Read).map(|roots| scope_set(&manager, request.store_id, &roots));
 
         Ok(VaultListDocsResponse {
             docs: docs
                 .into_iter()
-                .filter_map(|(doc_id, head, snapshot_seq)| {
-                    VaultDocId::parse(&doc_id).map(|doc_id| VaultDocInfo { doc_id, head, snapshot_seq, dek_id: None })
+                .filter_map(|doc| {
+                    let doc_id = VaultDocId::parse(&doc.doc_id)?;
+                    if let Some(scope) = &scope {
+                        match &doc_id {
+                            VaultDocId::Node(id) if scope.contains(id) => {}
+                            _ => return None,
+                        }
+                    }
+                    Some(VaultDocInfo { doc_id, head: doc.head, snapshot_seq: doc.snapshot_seq, dek_id: doc.dek_id })
                 })
                 .collect(),
         })
@@ -2028,12 +2453,12 @@ impl PimbleApiServer for RpcHandler {
         let key_id = Uuid::new_v4();
         let recipient = account.keys.public_keys();
         let envelope = pimble_crypto::wrap_key(&key, key_id, &recipient, &account.keys, &format!("store:{}", store_id)).map_err(to_rpc_error)?;
-        crate::cloud::put_store_key(&account.url, &account.session, &store_id.to_string(), &account.user_id, key_id, &envelope)
+        crate::cloud::put_store_key(&account.url, &account.session, &store_id.to_string(), &account.user_id, key_id, &envelope, None)
             .await
             .map_err(to_rpc_error)?;
         self.keystore.add_store_key(store_id, key_id, &key).await.map_err(to_rpc_error)?;
 
-        let rpc_url = self.link_hosted_store(store_id, &account, key_id).await?;
+        let rpc_url = self.link_hosted_store(store_id, &account, key_id, &crate::cloud::HeldAs::owner()).await?;
         self.ensure_vault_link_started(store_id, rpc_url, key_id).await;
 
         Ok(CloudHostStoreResponse { store_id })
@@ -2046,7 +2471,15 @@ impl PimbleApiServer for RpcHandler {
         Ok(CloudListHostedStoresResponse {
             stores: stores
                 .into_iter()
-                .map(|s| CloudHostedStoreInfo { store_id: s.store_id, name: s.name, role: s.role, kind: s.kind, created_at: s.created_at, root: None, shared_by: None })
+                .map(|s| CloudHostedStoreInfo {
+                    root: s.scope_root(),
+                    store_id: s.store_id,
+                    name: s.name,
+                    role: s.role,
+                    kind: s.kind,
+                    created_at: s.created_at,
+                    shared_by: s.shared_by,
+                })
                 .collect(),
         })
     }
@@ -2058,31 +2491,63 @@ impl PimbleApiServer for RpcHandler {
 
         let account = self.keystore.account().await.ok_or_else(|| to_rpc_error("no Pimble Cloud account is signed in"))?;
 
-        {
+        // How the account holds the store: the whole of it, or shares of it
+        // (a row per grant, docs/NODE_DOCUMENT_CONTRACT.md section 5).
+        let rows = crate::cloud::list_stores(&account.url, &account.session).await.map_err(to_rpc_error)?;
+        // No row for it (an accounts service that lists nothing): held as
+        // it always was, whole and writable.
+        let held_as = crate::cloud::HeldAs::from_rows(&rows, store_id).unwrap_or_else(crate::cloud::HeldAs::owner);
+        let name = held_as.name.clone().unwrap_or_else(|| store_id.to_string());
+
+        // Open here already: an error for a whole store, and for a share's
+        // replica unless the account has been given another share of the
+        // same store since, whose root joins the replica.
+        let open_roots = {
             let manager = self.store_manager.read().await;
-            if manager.is_open(store_id) {
+            manager.is_open(store_id).then(|| manager.scope_roots(store_id))
+        };
+        if let Some(open_roots) = &open_roots {
+            let adds_a_root = !open_roots.is_empty() && held_as.roots.iter().any(|root| !open_roots.contains(root));
+            if !adds_a_root {
                 return Err(to_rpc_error(format!("store {} is already open here", store_id)));
             }
         }
 
-        let key_grants = crate::cloud::get_store_keys(&account.url, &account.session, &store_id.to_string()).await.map_err(to_rpc_error)?;
-        let signer = account.keys.public_keys().signing;
-        let mut key_id: Option<Uuid> = None;
-        for grant in key_grants.envelopes {
-            let id: Uuid = grant.key_id.parse().map_err(|e| to_rpc_error(format!("cloud service returned a bad key id: {}", e)))?;
-            let key = pimble_crypto::unwrap_key(&grant.envelope, &account.keys, &signer).map_err(to_rpc_error)?;
-            self.keystore.add_store_key(store_id, id, &key).await.map_err(to_rpc_error)?;
-            key_id = Some(id);
-        }
-        let key_id = key_id.ok_or_else(|| to_rpc_error(format!("no key envelopes for store {} on this account", store_id)))?;
-
-        let name = crate::cloud::list_stores(&account.url, &account.session)
+        // The scope keys this account has been handed: the store key, or
+        // each share's. An envelope is believed when the account itself or
+        // one of the store's owners signed it.
+        let key_id = crate::vault_link::fetch_scope_keys(self, &account, store_id, &held_as.roots)
             .await
             .map_err(to_rpc_error)?
-            .into_iter()
-            .find(|s| s.store_id == store_id.to_string())
-            .map(|s| s.name)
-            .unwrap_or_else(|| store_id.to_string());
+            .ok_or_else(|| {
+                to_rpc_error(if held_as.roots.is_empty() {
+                    format!("no key envelopes for store {} on this account", store_id)
+                } else {
+                    format!(
+                        "no key for this share has reached this account yet (store {}): it is handed over by one of the owner's devices the next time one is online",
+                        store_id
+                    )
+                })
+            })?;
+
+        if open_roots.is_some() {
+            // Another root for the replica that is here: the link is
+            // restarted so that it lists again and pulls the new scope.
+            {
+                let mut manager = self.store_manager.write().await;
+                for root in &held_as.roots {
+                    manager.add_scope_root(store_id, *root).await.map_err(to_rpc_error)?;
+                }
+            }
+            self.stop_vault_link(store_id).await;
+            let rpc_url = self.link_hosted_store(store_id, &account, key_id, &held_as).await?;
+            self.ensure_vault_link_started(store_id, rpc_url, key_id).await;
+            let mut store = self.store_manager.read().await.get_store_info(store_id).map_err(to_rpc_error)?;
+            store.sync_state = self.sync_state_of(store_id).await;
+            store.sync_mode = StoreKind::Vault;
+            self.mark_replica(&mut store);
+            return Ok(OpenStoreResponse { store });
+        }
 
         // An *empty* replica (never `create_local_store_with`, which would
         // give it its own freshly generated root): a vault store has
@@ -2092,12 +2557,18 @@ impl PimbleApiServer for RpcHandler {
         // independently created roots for the same store id would merge
         // into a duplicated, disconnected tree once the vault link pulls
         // the real one. The placeholder root id here is manifest-only
-        // bookkeeping, corrected below once the pull lands the real one.
+        // bookkeeping, corrected below once the pull lands the real one. A
+        // share's replica is partial: its roots are the shared nodes, known
+        // now, and the first of them is the root older callers are shown.
         let path = self.default_replica_path(store_id);
-        let mut manager = self.store_manager.write().await;
-        let created_id = manager.create_replica(&path, store_id, &name, NodeId::new()).await.map_err(to_rpc_error)?;
-        let mut store = manager.get_store_info(created_id).map_err(to_rpc_error)?;
-        drop(manager);
+        let created_id = {
+            let mut manager = self.store_manager.write().await;
+            if held_as.roots.is_empty() {
+                manager.create_replica(&path, store_id, &name, NodeId::new()).await.map_err(to_rpc_error)?
+            } else {
+                manager.create_partial_replica(&path, store_id, &name, held_as.roots.clone()).await.map_err(to_rpc_error)?
+            }
+        };
 
         if !self.indexes.read().await.contains_key(&created_id) {
             if let Err(e) = self.open_index_for_store(created_id).await {
@@ -2105,7 +2576,7 @@ impl PimbleApiServer for RpcHandler {
             }
         }
 
-        let rpc_url = self.link_hosted_store(created_id, &account, key_id).await?;
+        let rpc_url = self.link_hosted_store(created_id, &account, key_id, &held_as).await?;
         self.ensure_vault_link_started(created_id, rpc_url, key_id).await;
 
         // Wait up to 10s for the first pull to land, same as
@@ -2113,54 +2584,131 @@ impl PimbleApiServer for RpcHandler {
         // so the response's `root_node_id` reflects the real tree rather
         // than the placeholder above whenever the pull is fast enough.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
+        let sync_state = loop {
             let state = self.sync_state_of(created_id).await;
             let is_synced = matches!(state, SyncState::Synced { .. });
             if is_synced || std::time::Instant::now() >= deadline {
-                store.sync_state = state;
-                break;
+                break state;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        // Always `Vault`: `link_hosted_store` above just wrote `sync.json`
-        // with `mode: "vault"`.
-        store.sync_mode = StoreKind::Vault;
+        };
 
         // The vault link rewrites the manifest root once the pull merges the
         // real tree in (`adopt_document_root`); do the same here so the
-        // answer carries it even when the pull was fast.
+        // answer carries it even when the pull was fast. Read after
+        // `sync.json` is written, so the answer says how the store is held
+        // (`access`, `shared_by`, `roots`).
         self.adopt_document_root(created_id).await;
-        if let Ok(root) = self.store_manager.read().await.root_node_id(created_id) {
-            store.root_node_id = root;
-        }
-
+        let mut store = self.store_manager.read().await.get_store_info(created_id).map_err(to_rpc_error)?;
+        store.sync_state = sync_state;
+        // Always `Vault`: `link_hosted_store` above just wrote `sync.json`
+        // with `mode: "vault"`.
+        store.sync_mode = StoreKind::Vault;
         self.mark_replica(&mut store);
 
         Ok(OpenStoreResponse { store })
     }
 
-    /// Hosted side (docs/NODE_DOCUMENT_CONTRACT.md section 5; the sharing wave builds it).
+    /// Hosted side (docs/NODE_DOCUMENT_CONTRACT.md section 5): the accounts
+    /// service deleting a hosted store reaches the ciphertext through this.
+    /// The store is named by id and must be a vault open here; the
+    /// directory removed is that open store's own, never a path a caller
+    /// gives.
     async fn delete_vault_store(&self, ext: &Extensions, request: DeleteVaultStoreRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "deleteVaultStore")?;
-        Err(to_rpc_error(format!("deleteVaultStore is not built yet (store {})", request.store_id)))
+        let store_id = request.store_id;
+        info!("Deleting vault store {}", store_id);
+
+        self.store_manager.write().await.delete_vault_store(store_id).await.map_err(to_rpc_error)?;
+        // Its subscribers hold sinks to a store that is gone.
+        self.subscriptions.write().await.remove_store(store_id);
+
+        Ok(EmptyResponse {})
     }
 
-    // ── Sharing on node documents, docs/NODE_DOCUMENT_CONTRACT.md section 5
-    // (the sharing wave builds these; every stub authorizes first) ─────────
+    // ── Sharing on node documents, docs/NODE_DOCUMENT_CONTRACT.md section 5 ──
 
     async fn vault_set_doc_keys(&self, ext: &Extensions, request: VaultSetDocKeysRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
-        authorize(&principal_of(ext), request.store_id, Access::Write)?;
-        Err(to_rpc_error("vaultSetDocKeys is not built yet (docs/NODE_DOCUMENT_CONTRACT.md section 5)"))
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Write)?;
+        debug!("Vault set keys for store {} doc {:?} (dek {})", request.store_id, request.doc_id, request.keys.dek_id);
+
+        let mut manager = self.store_manager.write().await;
+        self.require_vault_doc_in_scope(&manager, &principal, request.store_id, &request.doc_id, Access::Write)?;
+
+        // Wraps of the same data key are merged by the scope key that wraps
+        // (the owner's devices add the store key's wrap to a document a
+        // recipient created, and a share's wrap to every document entering
+        // it); a different data key is a rotation and replaces the record.
+        let doc_id = request.doc_id.as_str();
+        let held = manager
+            .vault_doc_keys(request.store_id, &doc_id)
+            .map_err(to_rpc_error)?
+            .and_then(|record| serde_json::from_str::<VaultDocKeys>(&record.json).ok());
+        let mut keys = request.keys;
+        if let Some(held) = held.filter(|held| held.dek_id == keys.dek_id) {
+            for wrap in held.wraps {
+                if !keys.wraps.iter().any(|w| w.scope_key_id == wrap.scope_key_id) {
+                    keys.wraps.push(wrap);
+                }
+            }
+        }
+        let json = serde_json::to_string(&keys).map_err(to_rpc_error)?;
+        manager.vault_set_doc_keys(request.store_id, &doc_id, json).await.map_err(to_rpc_error)?;
+
+        Ok(EmptyResponse {})
     }
 
     async fn set_scope(&self, ext: &Extensions, request: SetScopeRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
-        authorize(&principal_of(ext), request.store_id, Access::Write)?;
-        Err(to_rpc_error("setScope is not built yet (docs/NODE_DOCUMENT_CONTRACT.md section 5)"))
+        authorize_owner(&principal_of(ext), request.store_id, "setScope")?;
+        debug!("Set scope {} of store {}: {} document(s), remove: {}", request.scope.root, request.store_id, request.scope.doc_ids.len(), request.remove);
+
+        let mut manager = self.store_manager.write().await;
+        match manager.store_kind(request.store_id) {
+            Some(StoreKind::Vault) => {}
+            // A plain store's scopes are read off its own tree; there is
+            // nothing to publish, and accepting a set would be keeping a
+            // copy of the tree beside the tree.
+            Some(StoreKind::Plain) => return Ok(EmptyResponse {}),
+            None => return Err(to_rpc_error(StoreError::NotOpen(request.store_id))),
+        }
+        let docs = (!request.remove).then_some(request.scope.doc_ids);
+        manager.vault_set_scope(request.store_id, request.scope.root, docs).await.map_err(to_rpc_error)?;
+
+        Ok(EmptyResponse {})
     }
 
     async fn get_scopes(&self, ext: &Extensions, request: GetScopesRequest) -> Result<GetScopesResponse, ErrorObjectOwned> {
-        authorize(&principal_of(ext), request.store_id, Access::Read)?;
-        Err(to_rpc_error("getScopes is not built yet (docs/NODE_DOCUMENT_CONTRACT.md section 5)"))
+        authorize_owner(&principal_of(ext), request.store_id, "getScopes")?;
+
+        let manager = self.store_manager.read().await;
+        let mut scopes: Vec<Scope> = match manager.store_kind(request.store_id) {
+            Some(StoreKind::Vault) => manager
+                .vault_scopes(request.store_id)
+                .map_err(to_rpc_error)?
+                .into_iter()
+                .map(|(root, doc_ids)| Scope { root, doc_ids })
+                .collect(),
+            // A plain store's shares are the nodes that carry a share
+            // marker, and each one's scope is what a member scoped to it
+            // reaches: computed here, stored nowhere.
+            Some(StoreKind::Plain) => {
+                let tree = manager.tree(request.store_id).map_err(to_rpc_error)?;
+                tree.list_node_ids()
+                    .into_iter()
+                    .filter(|id| tree.get_node_info(*id).is_ok_and(|info| info.custom.contains_key(pimble_core::custom_keys::SHARE)))
+                    .map(|root| Scope { root, doc_ids: plain_scope(tree, &[root]).into_iter().collect() })
+                    .collect()
+            }
+            None => return Err(to_rpc_error(StoreError::NotOpen(request.store_id))),
+        };
+        // Deterministic, so two reads of an unchanged store compare equal.
+        scopes.sort_by_key(|scope| scope.root.to_string());
+        for scope in &mut scopes {
+            scope.doc_ids.sort_by_key(|id| id.to_string());
+        }
+
+        Ok(GetScopesResponse { scopes })
     }
 
     async fn cloud_share_node(&self, ext: &Extensions, request: CloudShareNodeRequest) -> Result<CloudShareInfoResponse, ErrorObjectOwned> {
@@ -2332,8 +2880,9 @@ impl PimbleApiServer for RpcHandler {
     async fn list_stores(&self, ext: &Extensions) -> Result<ListStoresResponse, ErrorObjectOwned> {
         debug!("Listing stores");
 
+        let principal = principal_of(ext);
         let manager = self.store_manager.read().await;
-        let store_ids = readable(&principal_of(ext), manager.list_stores().iter());
+        let store_ids = readable(&principal, manager.list_stores().iter());
 
         let mut stores = Vec::new();
         for id in store_ids {
@@ -2341,6 +2890,7 @@ impl PimbleApiServer for RpcHandler {
                 store.sync_state = self.sync_state_of(id).await;
                 store.sync_mode = self.sync_mode_of(id).await;
                 self.mark_replica(&mut store);
+                Self::present_store_to(&principal, &mut store);
                 stores.push(store);
             }
         }
@@ -2353,11 +2903,13 @@ impl PimbleApiServer for RpcHandler {
         ext: &Extensions,
         request: GetNodeRequest,
     ) -> Result<GetNodeResponse, ErrorObjectOwned> {
-        authorize(&principal_of(ext), request.store_id, Access::Read)?;
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Read)?;
         self.reject_if_vault(request.store_id).await?;
         debug!("Getting node {} from store {}", request.node_id, request.store_id);
 
         let manager = self.store_manager.read().await;
+        require_in_scope(&Reach::of(&manager, &principal, request.store_id), request.node_id, Access::Read)?;
         let node = manager
             .get_node(request.store_id, request.node_id)
             .map_err(to_rpc_error)?;
@@ -2370,7 +2922,8 @@ impl PimbleApiServer for RpcHandler {
         ext: &Extensions,
         request: GetNodesRequest,
     ) -> Result<GetNodesResponse, ErrorObjectOwned> {
-        authorize(&principal_of(ext), request.store_id, Access::Read)?;
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Read)?;
         self.reject_if_vault(request.store_id).await?;
         debug!(
             "Getting {} nodes from store {}",
@@ -2379,9 +2932,15 @@ impl PimbleApiServer for RpcHandler {
         );
 
         let manager = self.store_manager.read().await;
+        let reach = Reach::of(&manager, &principal, request.store_id);
         let mut nodes = Vec::new();
 
         for node_id in request.node_ids {
+            // Left out like a node that is not there, which is all this
+            // call ever says about one it cannot return.
+            if require_in_scope(&reach, node_id, Access::Read).is_err() {
+                continue;
+            }
             match manager.get_node(request.store_id, node_id) {
                 Ok(node) => nodes.push(node),
                 Err(e) => {
@@ -2398,7 +2957,8 @@ impl PimbleApiServer for RpcHandler {
         ext: &Extensions,
         request: CreateNodeRequest,
     ) -> Result<CreateNodeResponse, ErrorObjectOwned> {
-        authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Write)?;
         self.reject_if_vault(request.store_id).await?;
         info!(
             "Creating {} node '{}' in store {}",
@@ -2414,6 +2974,12 @@ impl PimbleApiServer for RpcHandler {
             Some(parent_id) => parent_id,
             None => manager.root_node_id(request.store_id).map_err(to_rpc_error)?,
         };
+        // The parent is the document a create edits; the new node is under
+        // it, so in every scope the parent is in.
+        require_in_scope(&Reach::of(&manager, &principal, request.store_id), parent_id, Access::Write)?;
+        if manager.write_refused(request.store_id, &[parent_id]) {
+            return Err(read_only_error());
+        }
         let (node_id, edit) = manager
             .create_node(request.store_id, node, Some(parent_id))
             .map_err(to_rpc_error)?;
@@ -2437,7 +3003,8 @@ impl PimbleApiServer for RpcHandler {
         ext: &Extensions,
         request: UpdateNodeMetadataRequest,
     ) -> Result<EmptyResponse, ErrorObjectOwned> {
-        authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Write)?;
         self.reject_if_vault(request.store_id).await?;
         debug!(
             "Updating metadata for node {} in store {}",
@@ -2445,6 +3012,10 @@ impl PimbleApiServer for RpcHandler {
         );
 
         let mut manager = self.store_manager.write().await;
+        require_in_scope(&Reach::of(&manager, &principal, request.store_id), request.node_id, Access::Write)?;
+        if manager.write_refused(request.store_id, &[request.node_id]) {
+            return Err(read_only_error());
+        }
         let edit = manager
             .update_node_metadata(request.store_id, request.node_id, request.metadata)
             .map_err(to_rpc_error)?;
@@ -2473,12 +3044,15 @@ impl PimbleApiServer for RpcHandler {
         ext: &Extensions,
         request: UpdateNodeContentRequest,
     ) -> Result<EmptyResponse, ErrorObjectOwned> {
-        authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Write)?;
         self.reject_if_vault(request.store_id).await?;
         info!(
             "Updating content for node {} in store {}",
             request.node_id, request.store_id
         );
+        require_in_scope(&self.reach_of(&principal, request.store_id).await, request.node_id, Access::Write)?;
+        self.reject_if_read_only(request.store_id, &[request.node_id]).await?;
 
         let content = base64::engine::general_purpose::STANDARD
             .decode(&request.content)
@@ -2520,7 +3094,8 @@ impl PimbleApiServer for RpcHandler {
         ext: &Extensions,
         request: DeleteNodeRequest,
     ) -> Result<EmptyResponse, ErrorObjectOwned> {
-        authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Write)?;
         self.reject_if_vault(request.store_id).await?;
         info!(
             "Deleting node {} from store {}",
@@ -2528,6 +3103,18 @@ impl PimbleApiServer for RpcHandler {
         );
 
         let mut manager = self.store_manager.write().await;
+        // A delete edits the node (and everything under it, which is in
+        // every scope the node is in) and its parent's list: a member
+        // cannot delete their share's own root, whose parent is not theirs.
+        if let Some(reach) = Reach::of(&manager, &principal, request.store_id) {
+            reach.require(request.node_id, Access::Write)?;
+            if let Some(parent_id) = manager.get_node(request.store_id, request.node_id).map_err(to_rpc_error)?.parent_id {
+                reach.require(parent_id, Access::Write)?;
+            }
+        }
+        if manager.write_refused(request.store_id, &[request.node_id]) {
+            return Err(read_only_error());
+        }
         let (removal, edit) = manager
             .delete_node(request.store_id, request.node_id)
             .map_err(to_rpc_error)?;
@@ -2567,13 +3154,25 @@ impl PimbleApiServer for RpcHandler {
         ext: &Extensions,
         request: UndeleteNodeRequest,
     ) -> Result<EmptyResponse, ErrorObjectOwned> {
-        authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Write)?;
         self.reject_if_vault(request.store_id).await?;
         info!("Undeleting node {} in store {}", request.node_id, request.store_id);
         let (store_id, node_id) = (request.store_id, request.node_id);
 
         let (edit, parent_id, restored) = {
             let mut manager = self.store_manager.write().await;
+            // The tombstone and the list it goes back into, like a delete.
+            if let Some(reach) = Reach::of(&manager, &principal, store_id) {
+                reach.require(node_id, Access::Write)?;
+                let stored_parent = manager.tree(store_id).ok().and_then(|tree| tree.doc(node_id)?.fields().ok()?.parent_id);
+                if let Some(parent_id) = stored_parent {
+                    reach.require(parent_id, Access::Write)?;
+                }
+            }
+            if manager.write_refused(store_id, &[node_id]) {
+                return Err(read_only_error());
+            }
             let edit = manager.undelete_node(store_id, node_id).map_err(to_rpc_error)?;
             let node = manager.get_node(store_id, node_id).map_err(to_rpc_error)?;
             let parent_id = node.parent_id.unwrap_or_else(|| manager.root_node_id(store_id).unwrap_or(node_id));
@@ -2597,7 +3196,8 @@ impl PimbleApiServer for RpcHandler {
         ext: &Extensions,
         request: MoveNodeRequest,
     ) -> Result<EmptyResponse, ErrorObjectOwned> {
-        authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Write)?;
         self.reject_if_vault(request.store_id).await?;
         info!(
             "Moving node {} to parent {} in store {}",
@@ -2605,12 +3205,22 @@ impl PimbleApiServer for RpcHandler {
         );
 
         let mut manager = self.store_manager.write().await;
+        let reach = Reach::of(&manager, &principal, request.store_id);
+        require_in_scope(&reach, request.node_id, Access::Write)?;
         // The old parent is read off the tree before the move rewrites it.
         let old_parent_id = manager
             .get_node(request.store_id, request.node_id)
             .map_err(to_rpc_error)?
             .parent_id
             .ok_or_else(|| to_rpc_error("Cannot move the root node"))?;
+        // A move edits three documents, and both parents are among them: a
+        // member moves within what they may write, never into or out of it
+        // (a parent outside the scope is not theirs to edit).
+        require_in_scope(&reach, old_parent_id, Access::Write)?;
+        require_in_scope(&reach, request.new_parent_id, Access::Write)?;
+        if manager.write_refused(request.store_id, &[request.node_id, old_parent_id, request.new_parent_id]) {
+            return Err(read_only_error());
+        }
         let edit = manager
             .move_node(request.store_id, request.node_id, request.new_parent_id, request.position)
             .map_err(to_rpc_error)?;
@@ -2655,6 +3265,7 @@ impl PimbleApiServer for RpcHandler {
         // state reaches this client as `MountStateChanged`.
         let mount_ref = {
             let manager = self.store_manager.read().await;
+            require_in_scope(&Reach::of(&manager, &principal, request.store_id), request.node_id, Access::Read)?;
             let node = manager
                 .get_node(request.store_id, request.node_id)
                 .map_err(to_rpc_error)?;
@@ -2665,8 +3276,10 @@ impl PimbleApiServer for RpcHandler {
             // A mount's children are its source's; a principal that can't
             // read the source has no business seeing them just because it
             // can read the mounting store (docs/CLOUD_CONTRACT.md "B:
-            // pimble-server" item 5).
+            // pimble-server" item 5), and one scoped in the source store
+            // reaches the mounted node only when it is in that scope.
             authorize(&principal, mount_ref.source_store, Access::Read)?;
+            require_in_scope(&self.reach_of(&principal, mount_ref.source_store).await, mount_ref.source_node, Access::Read)?;
             let state = self.resolve_mount(request.store_id, request.node_id, &mount_ref).await;
             if !self.store_manager.read().await.is_open(mount_ref.source_store) {
                 // Decision 7: the error carries the state, because that is
@@ -2683,10 +3296,16 @@ impl PimbleApiServer for RpcHandler {
         }
 
         let mut manager = self.store_manager.write().await;
-        let (store_id, children) = manager
+        let (store_id, mut children) = manager
             .get_children(request.store_id, request.node_id)
             .await
             .map_err(to_rpc_error)?;
+        // Children outside the caller's scope (in the store they live in,
+        // a mount's source for a mount) are left out: a member never learns
+        // another document's id.
+        if let Some(reach) = Reach::of(&manager, &principal, store_id) {
+            children.retain(|child| reach.readable.contains(&child.id));
+        }
         let newly_opened = manager.opened_since();
         drop(manager);
 
@@ -2718,6 +3337,13 @@ impl PimbleApiServer for RpcHandler {
         );
 
         let mut manager = self.store_manager.write().await;
+        // A create under `parent_id` like any other, of a node that shows
+        // `source_node`: each in the caller's scope in its own store.
+        require_in_scope(&Reach::of(&manager, &principal, request.store_id), request.parent_id, Access::Write)?;
+        require_in_scope(&Reach::of(&manager, &principal, request.source_store_id), request.source_node_id, Access::Read)?;
+        if manager.write_refused(request.store_id, &[request.parent_id]) {
+            return Err(read_only_error());
+        }
 
         // Validate that this mount won't create a cycle. This also rejects
         // a mount-node parent transitively: `create_node` below is the
@@ -2854,7 +3480,7 @@ impl PimbleApiServer for RpcHandler {
 
                 let manager = self.store_manager.read().await;
                 manager
-                    .write_sync_config(request.store_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None, mode: pimble_store::SyncMode::Sync, last_seq: Default::default(), vault_key_id: None })
+                    .write_sync_config(request.store_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None, mode: pimble_store::SyncMode::Sync, last_seq: Default::default(), vault_key_id: None, access: StoreAccess::Full, shared_by: None, read_only_roots: Vec::new() })
                     .await
                     .map_err(to_rpc_error)?;
                 drop(manager);
@@ -2901,18 +3527,23 @@ impl PimbleApiServer for RpcHandler {
         ext: &Extensions,
         request: GetStoreSyncRequest,
     ) -> Result<GetStoreSyncResponse, ErrorObjectOwned> {
-        authorize(&principal_of(ext), request.store_id, Access::Read)?;
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Read)?;
         let manager = self.store_manager.read().await;
         let remote = manager
             .read_sync_config(request.store_id)
             .await
             .map_err(to_rpc_error)?
             .map(|c| Self::without_auth(&c.remote));
+        // What this device may change (`sync.json`), narrowed to what the
+        // caller's role may, as `Store::access` is everywhere.
+        let mut store = manager.get_store_info(request.store_id).map_err(to_rpc_error)?;
         drop(manager);
+        Self::present_store_to(&principal, &mut store);
         let state = self.sync_state_of(request.store_id).await;
         let sync_mode = self.sync_mode_of(request.store_id).await;
 
-        Ok(GetStoreSyncResponse { remote, state, sync_mode, access: pimble_core::StoreAccess::Full })
+        Ok(GetStoreSyncResponse { remote, state, sync_mode, access: store.access })
     }
 
     async fn list_remote_stores(
@@ -3003,6 +3634,7 @@ impl PimbleApiServer for RpcHandler {
 
         let node = {
             let manager = self.store_manager.read().await;
+            require_in_scope(&Reach::of(&manager, &principal, request.store_id), request.node_id, Access::Read)?;
             manager
                 .get_node(request.store_id, request.node_id)
                 .map_err(to_rpc_error)?
@@ -3025,7 +3657,8 @@ impl PimbleApiServer for RpcHandler {
     }
 
     async fn sync_nodes(&self, ext: &Extensions, request: SyncNodesRequest) -> Result<SyncNodesResponse, ErrorObjectOwned> {
-        authorize(&principal_of(ext), request.store_id, Access::Read)?;
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Read)?;
         self.reject_if_vault(request.store_id).await?;
         debug!(
             "Sync {} node document(s) in store {} (list unknown: {})",
@@ -3054,10 +3687,18 @@ impl PimbleApiServer for RpcHandler {
         // out. Tombstones are documents like any other: a deletion is in
         // the document, and a peer that never hears of it brings the node
         // back.
+        //
+        // A scoped member reconciles its scope: a document outside it is
+        // left out exactly as one this store does not hold, and is never
+        // listed as unknown.
+        let reach = Reach::of(&manager, &principal, request.store_id);
         let mut named: HashSet<NodeId> = HashSet::with_capacity(request.nodes.len());
         let mut nodes = Vec::with_capacity(request.nodes.len());
         for entry in request.nodes {
             named.insert(entry.node_id);
+            if require_in_scope(&reach, entry.node_id, Access::Read).is_err() {
+                continue;
+            }
             let client_sv = b64
                 .decode(&entry.state_vector)
                 .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
@@ -3077,7 +3718,13 @@ impl PimbleApiServer for RpcHandler {
         // What the caller did not name is what it does not hold at all (a
         // fresh replica: everything), for it to ask for next.
         let unknown_ids = if request.list_unknown {
-            manager.doc_ids(request.store_id).map_err(to_rpc_error)?.into_iter().filter(|id| !named.contains(id)).collect()
+            manager
+                .doc_ids(request.store_id)
+                .map_err(to_rpc_error)?
+                .into_iter()
+                .filter(|id| !named.contains(id))
+                .filter(|id| reach.as_ref().is_none_or(|reach| reach.readable.contains(id)))
+                .collect()
         } else {
             Vec::new()
         };
@@ -3140,13 +3787,35 @@ impl PimbleApiServer for RpcHandler {
         ext: &Extensions,
         request: ApplyEditRequest,
     ) -> Result<ApplyEditResponse, ErrorObjectOwned> {
-        authorize(&principal_of(ext), request.store_id, Access::Write)?;
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Write)?;
         self.reject_if_vault(request.store_id).await?;
 
         let EditOperation::IncrementalChanges { ref changes } = request.operation;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(changes)
             .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
+
+        {
+            let manager = self.store_manager.read().await;
+            let held = manager.tree(request.store_id).is_ok_and(|tree| tree.doc(request.node_id).is_some());
+            // A document the store holds is judged by where it is; one it
+            // does not hold yet, by the parent its first update names (a
+            // create is the node's document and the parent's list, and a
+            // member may make one under a parent they may write).
+            let judged_by = if held { Some(request.node_id) } else { parent_named_by(&bytes) };
+            if let Some(reach) = Reach::of(&manager, &principal, request.store_id) {
+                match judged_by {
+                    Some(id) => reach.require(id, Access::Write)?,
+                    None => return Err(no_grant_for_document_error()),
+                }
+            }
+            // A relayed edit is not this device's write: a reader's replica
+            // receives everything (`is_link_client`).
+            if !is_link_client(&request.client_id) && judged_by.is_some_and(|id| manager.write_refused(request.store_id, &[id])) {
+                return Err(read_only_error());
+            }
+        }
 
         // Merged, persisted on the flush debounce, broadcast with the same
         // bytes (never re-encoded or reinterpreted), indexed, repaired: all
@@ -3173,7 +3842,8 @@ impl PimbleApiServer for RpcHandler {
         ext: &Extensions,
         store_id: StoreId,
     ) -> SubscriptionResult {
-        if let Err(e) = authorize(&principal_of(ext), store_id, Access::Read) {
+        let principal = principal_of(ext);
+        if let Err(e) = authorize(&principal, store_id, Access::Read) {
             pending.reject(e).await;
             return Ok(());
         }
@@ -3182,8 +3852,12 @@ impl PimbleApiServer for RpcHandler {
         // without re-fetching (docs/CRYPTO_CONTRACT.md).
         info!("Client subscribing to store changes for {}", store_id);
 
+        // A share's member subscribes with the roots of their grant, and
+        // each notification is judged against those roots' scopes as they
+        // are when it is sent (`delivery_for`).
+        let roots = scope_roots_of(&principal, store_id, Access::Read);
         let sink = pending.accept().await?;
-        self.subscriptions.write().await.add_store_sub(store_id, sink);
+        self.subscriptions.write().await.add_store_sub(store_id, sink, roots);
 
         Ok(())
     }
@@ -3195,7 +3869,8 @@ impl PimbleApiServer for RpcHandler {
         store_id: StoreId,
         node_id: NodeId,
     ) -> SubscriptionResult {
-        if let Err(e) = authorize(&principal_of(ext), store_id, Access::Read) {
+        let principal = principal_of(ext);
+        if let Err(e) = authorize(&principal, store_id, Access::Read) {
             pending.reject(e).await;
             return Ok(());
         }
@@ -3203,10 +3878,17 @@ impl PimbleApiServer for RpcHandler {
             pending.reject(e).await;
             return Ok(());
         }
+        if let Err(e) = require_in_scope(&self.reach_of(&principal, store_id).await, node_id, Access::Read) {
+            pending.reject(e).await;
+            return Ok(());
+        }
         info!("Client subscribing to node changes for {}:{}", store_id, node_id);
 
+        // In scope now; every delivery checks again, so a node moved out of
+        // the share stops reaching this subscriber.
+        let roots = scope_roots_of(&principal, store_id, Access::Read);
         let sink = pending.accept().await?;
-        self.subscriptions.write().await.add_node_sub(store_id, node_id, sink);
+        self.subscriptions.write().await.add_node_sub(store_id, node_id, sink, roots);
 
         Ok(())
     }
@@ -3239,6 +3921,15 @@ impl PimbleApiServer for RpcHandler {
             readable(&principal, request.stores.iter())
         };
 
+        // What the principal reaches of each store it is scoped in: a hit
+        // outside it is dropped, and since the index ranks the whole store,
+        // such a store is asked for more than `limit` so that a small share
+        // of a large store still fills its page.
+        let reaches: HashMap<StoreId, Reach> = {
+            let manager = self.store_manager.read().await;
+            store_ids.iter().filter_map(|id| Some((*id, Reach::of(&manager, &principal, *id)?))).collect()
+        };
+
         let mut hits: Vec<(StoreId, pimble_search::SearchHit)> = Vec::new();
         {
             let indexes = self.indexes.read().await;
@@ -3246,8 +3937,22 @@ impl PimbleApiServer for RpcHandler {
                 let Some(handle) = indexes.get(store_id) else {
                     continue; // no index open for this store; nothing to search
                 };
-                match handle.index.search(&query) {
-                    Ok(store_hits) => hits.extend(store_hits.into_iter().map(|h| (*store_id, h))),
+                let reach = reaches.get(store_id);
+                let scoped_query;
+                let query = match reach {
+                    Some(_) => {
+                        scoped_query = SearchQuery { limit: limit.saturating_mul(SCOPED_SEARCH_OVERFETCH), ..query.clone() };
+                        &scoped_query
+                    }
+                    None => &query,
+                };
+                match handle.index.search(query) {
+                    Ok(store_hits) => hits.extend(
+                        store_hits
+                            .into_iter()
+                            .filter(|hit| reach.is_none_or(|reach| reach.readable.contains(&hit.node_id)))
+                            .map(|h| (*store_id, h)),
+                    ),
                     Err(SearchError::IndexBuilding { done, total }) => {
                         return Err(index_building_error(done as usize, total as usize));
                     }

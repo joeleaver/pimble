@@ -8,9 +8,10 @@
 //!   (`crates/pimble-cloud`), serving exactly the endpoints
 //!   `crate::cloud`/`crate::handler`'s `cloud*` RPCs call: `GET /kdf`,
 //!   `POST /login`, `GET /me/keys`, `POST /token`, `GET`/`POST /stores`,
-//!   `GET`/`PUT /stores/{id}/keys`, plus its own JWKS endpoint (the same
-//!   Ed25519 key `POST /token` signs with) so `H`'s `JwtVerifier` can check
-//!   the minted tokens. One fixed test account throughout: real
+//!   `GET`/`PUT /stores/{id}/keys` (with `root` for a share's), plus its own
+//!   JWKS endpoint (the same Ed25519 key `POST /token` signs with) so `H`'s
+//!   `JwtVerifier` can check the minted tokens. Two fixed test accounts, the
+//!   owner every test signs in as and a second one to share with: real
 //!   `pimble-crypto` output (KDF params shrunk for test speed, a real
 //!   account keypair, a real `AccountKeyBlob` wrapped under the password's
 //!   real KEK), so every `cloudSignIn` on every local server in a test
@@ -24,7 +25,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::extract::{Path as AxPath, State};
+use axum::extract::{Path as AxPath, Query, State};
+use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -100,9 +102,10 @@ fn fresh_signing_key() -> SigningKey {
     SigningKey::from_bytes(&seed)
 }
 
-fn make_jwt(signing_key: &SigningKey, kid: &str, issuer: &str, sub: &str, email: &str, stores: &HashMap<String, String>) -> String {
+/// `stores` is `claims.stores` as the accounts service mints it: a role for
+/// a whole store, `{ "roots": { "<node id>": "<role>" } }` for shares.
+fn make_jwt(signing_key: &SigningKey, kid: &str, issuer: &str, sub: &str, email: &str, stores_claim: &serde_json::Map<String, serde_json::Value>) -> String {
     let header = json!({ "alg": "EdDSA", "kid": kid });
-    let stores_claim: serde_json::Map<String, serde_json::Value> = stores.iter().map(|(id, role)| (id.clone(), json!(role))).collect();
     let payload = json!({
         "iss": issuer,
         "sub": sub,
@@ -121,29 +124,42 @@ fn make_jwt(signing_key: &SigningKey, kid: &str, issuer: &str, sub: &str, email:
 // ── The accounts-service stub ──────────────────────────────────────────────
 //
 // Covers exactly the surface `crate::cloud` calls. No auth enforcement on
-// the stub's own endpoints (the code under test is the pimble-server side,
-// not this stand-in); a single fixed account throughout.
+// the stub's own endpoints beyond telling its accounts apart by session
+// (the code under test is the pimble-server side, not this stand-in).
 
+/// One grant: `GET /stores` answers one row per grant of the caller's.
 struct StubStoreRow {
+    user_id: String,
     store_id: String,
     name: String,
     kind: String,
     created_at: String,
+    role: String,
+    /// The shared node, for a share.
+    root: Option<String>,
+    shared_by: Option<String>,
 }
 
 struct KeyGrantRow {
     user_id: String,
     key_id: String,
     envelope: KeyEnvelope,
+    /// The share the key is for; `None` for the store key.
+    root: Option<String>,
 }
 
-struct StubInner {
+struct StubAccount {
     kdf: KdfParams,
     user_id: String,
     email: String,
     session: String,
     account_key_blob: AccountKeyBlob,
     account_public_keys: pimble_crypto::AccountPublicKeys,
+}
+
+struct StubInner {
+    /// The owner first; a request with no session the stub knows is theirs.
+    accounts: Vec<StubAccount>,
     stores: Vec<StubStoreRow>,
     key_grants: HashMap<String, Vec<KeyGrantRow>>,
     signing_key: SigningKey,
@@ -170,41 +186,77 @@ fn stub_router(state: StubState) -> Router {
         .with_state(state)
 }
 
-async fn stub_kdf(State(state): State<StubState>) -> Json<KdfParams> {
-    Json(state.lock().unwrap().kdf.clone())
+impl StubInner {
+    /// The account a request's `Authorization: Bearer <session>` names.
+    fn account_of(&self, headers: &HeaderMap) -> &StubAccount {
+        let session = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
+        self.accounts.iter().find(|a| Some(a.session.as_str()) == session).unwrap_or(&self.accounts[0])
+    }
+
+    fn account_by_email(&self, email: Option<&str>) -> &StubAccount {
+        self.accounts.iter().find(|a| Some(a.email.as_str()) == email).unwrap_or(&self.accounts[0])
+    }
 }
 
-async fn stub_login(State(state): State<StubState>) -> Json<serde_json::Value> {
+async fn stub_kdf(State(state): State<StubState>, Query(query): Query<HashMap<String, String>>) -> Json<KdfParams> {
     let s = state.lock().unwrap();
-    Json(json!({ "user": { "id": s.user_id, "email": s.email }, "session": s.session, "token": "", "exp": 0 }))
+    Json(s.account_by_email(query.get("email").map(String::as_str)).kdf.clone())
 }
 
-async fn stub_me_keys(State(state): State<StubState>) -> Json<serde_json::Value> {
+async fn stub_login(State(state): State<StubState>, Json(req): Json<serde_json::Value>) -> Json<serde_json::Value> {
     let s = state.lock().unwrap();
-    Json(json!({ "public_keys": s.account_public_keys, "kdf": s.kdf, "account_key_blob": s.account_key_blob }))
+    let account = s.account_by_email(req["email"].as_str());
+    Json(json!({ "user": { "id": account.user_id, "email": account.email }, "session": account.session, "token": "", "exp": 0 }))
 }
 
-async fn stub_mint_token(State(state): State<StubState>) -> Json<serde_json::Value> {
+async fn stub_me_keys(State(state): State<StubState>, headers: HeaderMap) -> Json<serde_json::Value> {
+    let s = state.lock().unwrap();
+    let account = s.account_of(&headers);
+    Json(json!({ "public_keys": account.account_public_keys, "kdf": account.kdf, "account_key_blob": account.account_key_blob }))
+}
+
+/// The token as the accounts service mints it: a role for a store held
+/// whole, a role per shared root for one held by shares, and the whole
+/// store winning where an account holds both.
+async fn stub_mint_token(State(state): State<StubState>, headers: HeaderMap) -> Json<serde_json::Value> {
     let (token, rpc_url) = {
         let s = state.lock().unwrap();
-        let stores_claim: HashMap<String, String> = s.stores.iter().map(|st| (st.store_id.clone(), "owner".to_string())).collect();
-        let token = make_jwt(&s.signing_key, &s.kid, &s.issuer, &s.user_id, &s.email, &stores_claim);
+        let account = s.account_of(&headers);
+        let mut stores_claim = serde_json::Map::new();
+        for row in s.stores.iter().filter(|row| row.user_id == account.user_id) {
+            match &row.root {
+                None => {
+                    stores_claim.insert(row.store_id.clone(), json!(row.role));
+                }
+                Some(root) => {
+                    let claim = stores_claim.entry(row.store_id.clone()).or_insert_with(|| json!({ "roots": {} }));
+                    if let Some(roots) = claim.get_mut("roots") {
+                        roots[root] = json!(row.role);
+                    }
+                }
+            }
+        }
+        let token = make_jwt(&s.signing_key, &s.kid, &s.issuer, &account.user_id, &account.email, &stores_claim);
         (token, s.h_rpc_url.clone())
     };
     Json(json!({ "token": token, "exp": chrono::Utc::now().timestamp() + 300, "rpc_url": rpc_url }))
 }
 
-async fn stub_list_stores(State(state): State<StubState>) -> Json<serde_json::Value> {
+async fn stub_list_stores(State(state): State<StubState>, headers: HeaderMap) -> Json<serde_json::Value> {
     let s = state.lock().unwrap();
+    let account = s.account_of(&headers);
     let arr: Vec<_> = s
         .stores
         .iter()
-        .map(|st| json!({ "store_id": st.store_id, "name": st.name, "role": "owner", "kind": st.kind, "created_at": st.created_at }))
+        .filter(|st| st.user_id == account.user_id)
+        .map(|st| {
+            json!({ "store_id": st.store_id, "name": st.name, "role": st.role, "kind": st.kind, "created_at": st.created_at, "root": st.root, "shared_by": st.shared_by })
+        })
         .collect();
     Json(json!(arr))
 }
 
-async fn stub_create_store(State(state): State<StubState>, Json(req): Json<serde_json::Value>) -> Json<serde_json::Value> {
+async fn stub_create_store(State(state): State<StubState>, headers: HeaderMap, Json(req): Json<serde_json::Value>) -> Json<serde_json::Value> {
     let name = req["name"].as_str().unwrap_or("store").to_string();
     let kind_str = req["kind"].as_str().unwrap_or("plain").to_string();
     let kind = if kind_str == "vault" { StoreKind::Vault } else { StoreKind::Plain };
@@ -221,20 +273,52 @@ async fn stub_create_store(State(state): State<StubState>, Json(req): Json<serde
     let created_at = chrono::Utc::now().to_rfc3339();
     {
         let mut s = state.lock().unwrap();
-        s.stores.push(StubStoreRow { store_id: created_id.to_string(), name: name.clone(), kind: kind_str.clone(), created_at: created_at.clone() });
+        let user_id = s.account_of(&headers).user_id.clone();
+        s.stores.push(StubStoreRow {
+            user_id,
+            store_id: created_id.to_string(),
+            name: name.clone(),
+            kind: kind_str.clone(),
+            created_at: created_at.clone(),
+            role: "owner".into(),
+            root: None,
+            shared_by: None,
+        });
     }
 
     Json(json!({ "store_id": created_id.to_string(), "name": name, "role": "owner", "kind": kind_str, "created_at": created_at }))
 }
 
-async fn stub_get_keys(State(state): State<StubState>, AxPath(store_id): AxPath<String>) -> Json<serde_json::Value> {
+/// The caller's own envelopes for one scope (`?root=` for a share's key,
+/// nothing for the store key), and the store's owners as the signers to
+/// believe.
+async fn stub_get_keys(
+    State(state): State<StubState>,
+    AxPath(store_id): AxPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Json<serde_json::Value> {
     let s = state.lock().unwrap();
+    let account = s.account_of(&headers);
+    let root = query.get("root");
     let envelopes: Vec<_> = s
         .key_grants
         .get(&store_id)
-        .map(|rows| rows.iter().map(|g| json!({ "key_id": g.key_id, "envelope": g.envelope })).collect())
+        .map(|rows| {
+            rows.iter()
+                .filter(|g| g.user_id == account.user_id && g.root.as_ref() == root)
+                .map(|g| json!({ "key_id": g.key_id, "envelope": g.envelope }))
+                .collect()
+        })
         .unwrap_or_default();
-    Json(json!({ "envelopes": envelopes }))
+    let signers: Vec<_> = s
+        .stores
+        .iter()
+        .filter(|row| row.store_id == store_id && row.root.is_none() && row.role == "owner")
+        .filter_map(|row| s.accounts.iter().find(|a| a.user_id == row.user_id))
+        .map(|owner| json!({ "user_id": owner.user_id, "email": owner.email, "public_signing_key": owner.account_public_keys.signing }))
+        .collect();
+    Json(json!({ "envelopes": envelopes, "signers": signers }))
 }
 
 async fn stub_put_keys(State(state): State<StubState>, AxPath(store_id): AxPath<String>, Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
@@ -243,9 +327,10 @@ async fn stub_put_keys(State(state): State<StubState>, AxPath(store_id): AxPath<
     for env in body["envelopes"].as_array().cloned().unwrap_or_default() {
         let user_id = env["user_id"].as_str().unwrap().to_string();
         let key_id = env["key_id"].as_str().unwrap().to_string();
+        let root = env["root"].as_str().map(String::from);
         let envelope: KeyEnvelope = serde_json::from_value(env["envelope"].clone()).unwrap();
-        entries.retain(|g| !(g.user_id == user_id && g.key_id == key_id));
-        entries.push(KeyGrantRow { user_id, key_id, envelope });
+        entries.retain(|g| !(g.user_id == user_id && g.key_id == key_id && g.root == root));
+        entries.push(KeyGrantRow { user_id, key_id, envelope, root });
     }
     Json(json!({}))
 }
@@ -274,6 +359,14 @@ struct Env {
     stub_url: String,
     email: String,
     password: String,
+    /// A second account, to share with.
+    friend_email: String,
+    friend_password: String,
+    /// The owner's account keys (what their devices sign a share's key
+    /// envelopes with) and the stub's state, for a test to do by hand what
+    /// the owner's side of sharing will do.
+    owner_keys: AccountKeys,
+    stub: StubState,
     // Kept alive for the test's duration (dropping it would stop H);
     // never otherwise read.
     _h: PimbleServer,
@@ -365,16 +458,30 @@ fn contains_bytes_recursive(dir: &Path, needle: &[u8]) -> bool {
     false
 }
 
+/// A stub account with real key material, and its unwrapped keys.
+fn stub_account(email: &str, password: &str) -> (StubAccount, AccountKeys) {
+    let kdf = cheap_kdf_params();
+    let account_keys = AccountKeys::generate();
+    let password_keys = derive_password_keys(password, &kdf).expect("derive password keys");
+    let account_key_blob = wrap_account_keys(&account_keys, &password_keys.kek).expect("wrap account keys");
+    let account = StubAccount {
+        kdf,
+        user_id: Uuid::new_v4().to_string(),
+        email: email.to_string(),
+        session: format!("sess-{}", Uuid::new_v4()),
+        account_key_blob,
+        account_public_keys: account_keys.public_keys(),
+    };
+    (account, account_keys)
+}
+
 async fn spawn_env() -> Env {
     let email = "alice@example.com".to_string();
     let password = "correct horse battery staple".to_string();
-    let user_id = Uuid::new_v4().to_string();
-    let session = format!("sess-{}", Uuid::new_v4());
-    let kdf = cheap_kdf_params();
-    let account_keys = AccountKeys::generate();
-    let password_keys = derive_password_keys(&password, &kdf).expect("derive password keys");
-    let account_key_blob = wrap_account_keys(&account_keys, &password_keys.kek).expect("wrap account keys");
-    let account_public_keys = account_keys.public_keys();
+    let friend_email = "bob@example.com".to_string();
+    let friend_password = "a different horse entirely".to_string();
+    let (owner, owner_keys) = stub_account(&email, &password);
+    let (friend, _) = stub_account(&friend_email, &friend_password);
 
     let signing_key = fresh_signing_key();
     let kid = "test-kid".to_string();
@@ -385,12 +492,7 @@ async fn spawn_env() -> Env {
     std::fs::create_dir_all(&h_stores_dir).unwrap();
 
     let state: StubState = Arc::new(Mutex::new(StubInner {
-        kdf,
-        user_id,
-        email: email.clone(),
-        session,
-        account_key_blob,
-        account_public_keys,
+        accounts: vec![owner, friend],
         stores: Vec::new(),
         key_grants: HashMap::new(),
         signing_key,
@@ -436,7 +538,7 @@ async fn spawn_env() -> Env {
         s.h_rpc_url = format!("ws://{}", relay.addr);
     }
 
-    Env { stub_url, email, password, _h: h, h_admin, h_stores_dir, _h_dir: h_dir, relay }
+    Env { stub_url, email, password, friend_email, friend_password, owner_keys, stub: state, _h: h, h_admin, h_stores_dir, _h_dir: h_dir, relay }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -1076,6 +1178,361 @@ async fn restarting_a_server_resumes_the_vault_link_without_losing_or_duplicatin
     assert!(propagated);
 
     a2.stop().await.unwrap();
+}
+
+
+// ── Sharing: data keys, a share's recipient (docs/NODE_DOCUMENT_CONTRACT.md
+// section 5) ──────────────────────────────────────────────────────────────
+
+/// The one store key a device's keystore holds for `store_id`, read off its
+/// `keys.json`: what a test needs to stand in for the owner's side of
+/// sharing (wrapping data keys under a share's key), which a later wave
+/// builds into the server.
+fn scope_keys_in(server_dir: &Path, store_id: StoreId) -> Vec<(Uuid, pimble_crypto::SymmetricKey)> {
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(server_dir.join("keys.json")).expect("the keystore file")).unwrap();
+    json["store_keys"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| entry["store_id"].as_str() == Some(store_id.to_string().as_str()))
+        .map(|entry| {
+            let bytes: [u8; 32] = URL_SAFE_NO_PAD.decode(entry["key"].as_str().unwrap()).unwrap().try_into().unwrap();
+            (entry["key_id"].as_str().unwrap().parse().unwrap(), pimble_crypto::SymmetricKey(bytes))
+        })
+        .collect()
+}
+
+/// The key id in a blob's header.
+fn blob_key_id(blob_b64url: &str) -> Uuid {
+    pimble_crypto::Blob::key_id(&URL_SAFE_NO_PAD.decode(blob_b64url).unwrap()).unwrap()
+}
+
+async fn wait_all_seeded(env: &Env, store_id: StoreId, docs: &[NodeId]) {
+    let seeded = wait_until(Duration::from_secs(15), || async {
+        let listed = env.h_admin.vault_list_docs(store_id).await.unwrap_or_default();
+        docs.iter().all(|id| listed.iter().any(|d| d.doc_id == VaultDocId::Node(*id) && d.head > 0))
+    })
+    .await;
+    assert!(seeded, "every document must reach the hosted twin");
+}
+
+#[tokio::test]
+async fn a_link_reads_blobs_under_a_data_key_and_blobs_from_before_under_the_store_key() {
+    let env = spawn_env().await;
+    let (mut a, client_a, a_dir) = start_local_server().await;
+    client_a.cloud_sign_in(&env.stub_url, &env.email, &env.password).await.unwrap();
+    let (store_id, root_id) = client_a.create_store(a_dir.path().join("a.pimble"), "Keys").await.unwrap();
+    let doc_id = client_a.create_node(store_id, Some(root_id), "document", "Doc").await.unwrap();
+    seed_content(&client_a, store_id, doc_id, "seed", "written under a data key").await;
+    client_a.cloud_host_store(store_id).await.unwrap();
+    wait_all_seeded(&env, store_id, &[root_id, doc_id]).await;
+
+    // Seeding gave every document a data key of its own, wrapped under the
+    // store key (this device holds it: it is the owner's), and the blobs
+    // name the data key, not the store key.
+    let (store_key_id, store_key) = scope_keys_in(a_dir.path(), store_id).pop().expect("hosting made a store key");
+    let doc_key = VaultDocId::Node(doc_id);
+    let fetched = env.h_admin.vault_fetch(store_id, doc_key.clone(), 0).await.unwrap();
+    let keys = fetched.keys.clone().expect("a seeded document has keys");
+    assert_eq!(keys.wraps.iter().map(|w| w.scope_key_id).collect::<Vec<_>>(), vec![store_key_id]);
+    assert!(fetched.updates.iter().all(|entry| blob_key_id(&entry.blob) == keys.dek_id), "blobs go out under the document's data key");
+    let listed = env.h_admin.vault_list_docs(store_id).await.unwrap();
+    assert!(listed.iter().all(|d| d.dek_id.is_some()), "{listed:?}");
+    let root_dek = listed.iter().find(|d| d.doc_id == VaultDocId::Node(root_id)).unwrap().dek_id;
+    assert_ne!(root_dek, Some(keys.dek_id), "a key per document");
+
+    // A blob from before data keys: under the store key itself, on a
+    // document that has a data key now, and a whole document from then,
+    // which has none. Made by hand, as a phase 2a client would have.
+    let aad = pimble_crypto::blob_aad(&store_id.to_string(), &doc_key.as_str());
+    let old_style = NodeDoc::from_plain_text("from before data keys").unwrap().save();
+    let blob = pimble_crypto::Blob::encrypt(&store_key, store_key_id, &aad, &old_style);
+    env.h_admin.vault_append(store_id, doc_key.clone(), URL_SAFE_NO_PAD.encode(blob)).await.unwrap();
+
+    let old_doc_id = NodeId::new();
+    let old_doc_key = VaultDocId::Node(old_doc_id);
+    let mut old_doc = NodeDoc::from_plain_text("a whole document from before data keys").unwrap();
+    old_doc.init("document", "Old", Some(root_id), &chrono::Utc::now().to_rfc3339()).unwrap();
+    let aad_old = pimble_crypto::blob_aad(&store_id.to_string(), &old_doc_key.as_str());
+    let blob = pimble_crypto::Blob::encrypt(&store_key, store_key_id, &aad_old, &old_doc.save());
+    env.h_admin.vault_append(store_id, old_doc_key.clone(), URL_SAFE_NO_PAD.encode(blob)).await.unwrap();
+
+    let read_both = wait_until(Duration::from_secs(10), || async {
+        node_text(&client_a, store_id, doc_id).await.contains("from before data keys")
+            && node_text(&client_a, store_id, old_doc_id).await.contains("a whole document from before data keys")
+    })
+    .await;
+    assert!(read_both, "the key id is looked up among the wraps, then among the scope keys held: got {:?}", node_text(&client_a, store_id, doc_id).await);
+    assert!(node_text(&client_a, store_id, doc_id).await.contains("written under a data key"));
+
+    // An edit to the document without a data key goes out as it always did,
+    // under the store key; this device makes no keys for a document that exists.
+    seed_content(&client_a, store_id, old_doc_id, "editor", "edited here").await;
+    let pushed = wait_until(Duration::from_secs(10), || async {
+        env.h_admin.vault_fetch(store_id, old_doc_key.clone(), 0).await.map(|f| f.head >= 2).unwrap_or(false)
+    })
+    .await;
+    assert!(pushed);
+    let old_fetch = env.h_admin.vault_fetch(store_id, old_doc_key.clone(), 0).await.unwrap();
+    assert_eq!(old_fetch.keys, None);
+    assert!(old_fetch.updates.iter().all(|entry| blob_key_id(&entry.blob) == store_key_id));
+
+    // A second device of the same account reads all of it from scratch.
+    let (mut b, client_b, _b_dir) = start_local_server().await;
+    client_b.cloud_sign_in(&env.stub_url, &env.email, &env.password).await.unwrap();
+    client_b.cloud_add_hosted_store(store_id).await.unwrap();
+    let b_read = wait_until(Duration::from_secs(10), || async {
+        let text = node_text(&client_b, store_id, doc_id).await;
+        text.contains("written under a data key")
+            && text.contains("from before data keys")
+            && node_text(&client_b, store_id, old_doc_id).await.contains("edited here")
+    })
+    .await;
+    assert!(b_read, "a fresh replica unwraps each document's data key with the store key");
+    // A data key is never written down: not in the keystore, not in the link's files.
+    let dek_bytes = pimble_crypto::unwrap_dek(&keys.wraps[0], &store_key, &pimble_crypto::dek_aad(&store_id.to_string(), &doc_key.as_str())).unwrap();
+    assert!(!contains_bytes_recursive(a_dir.path(), URL_SAFE_NO_PAD.encode(dek_bytes.0).as_bytes()));
+    assert!(!contains_bytes_recursive(a_dir.path(), &dek_bytes.0));
+
+    a.stop().await.unwrap();
+    b.stop().await.unwrap();
+}
+
+/// What the owner's side of sharing does, by hand (a later wave builds it
+/// into the server): a share key; each document under the node given a wrap
+/// of its data key under it; the marker on the shared node; the scope
+/// published; a scoped grant and the key's envelope for the friend, and the
+/// owner's own envelope so their other devices hold the share key too.
+async fn share_by_hand(env: &Env, owner: &PimbleClient, owner_dir: &Path, store_id: StoreId, shared: NodeId, under_it: &[NodeId], role: &str, share_name: &str) -> (Uuid, pimble_crypto::SymmetricKey) {
+    let (_, store_key) = scope_keys_in(owner_dir, store_id).pop().expect("the owner holds the store key");
+    let (share_key, share_key_id) = (pimble_crypto::SymmetricKey::generate(), Uuid::new_v4());
+
+    for id in std::iter::once(&shared).chain(under_it) {
+        let doc = VaultDocId::Node(*id);
+        let keys = env.h_admin.vault_fetch(store_id, doc.clone(), u64::MAX).await.unwrap().keys.expect("a hosted document has a data key");
+        let aad = pimble_crypto::dek_aad(&store_id.to_string(), &doc.as_str());
+        let dek = pimble_crypto::unwrap_dek(&keys.wraps[0], &store_key, &aad).unwrap();
+        let wrap = pimble_crypto::wrap_dek(&dek, &share_key, share_key_id, &aad);
+        env.h_admin.vault_set_doc_keys(store_id, doc, pimble_rpc::VaultDocKeys { dek_id: keys.dek_id, wraps: vec![wrap] }).await.unwrap();
+    }
+
+    let mut metadata = owner.get_node(store_id, shared).await.unwrap().metadata;
+    metadata.set_share(Some(&pimble_core::ShareMarker { v: pimble_core::ShareMarker::VERSION, key_id: share_key_id, url: env.stub_url.clone(), name: share_name.into() }));
+    owner.update_node_metadata(store_id, shared, metadata).await.unwrap();
+
+    env.h_admin.set_scope(store_id, pimble_rpc::Scope { root: shared, doc_ids: under_it.to_vec() }, false).await.unwrap();
+
+    let mut stub = env.stub.lock().unwrap();
+    let (owner_account, friend) = (&stub.accounts[0], &stub.accounts[1]);
+    let context = format!("store:{store_id}/{shared}");
+    let for_friend = pimble_crypto::wrap_key(&share_key, share_key_id, &friend.account_public_keys, &env.owner_keys, &context).unwrap();
+    let for_owner = pimble_crypto::wrap_key(&share_key, share_key_id, &owner_account.account_public_keys, &env.owner_keys, &context).unwrap();
+    let (owner_id, owner_email, friend_id) = (owner_account.user_id.clone(), owner_account.email.clone(), friend.user_id.clone());
+    let kind = stub.stores.iter().find(|row| row.store_id == store_id.to_string()).unwrap().kind.clone();
+    stub.stores.push(StubStoreRow {
+        user_id: friend_id.clone(),
+        store_id: store_id.to_string(),
+        name: share_name.into(),
+        kind,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        role: role.into(),
+        root: Some(shared.to_string()),
+        shared_by: Some(owner_email),
+    });
+    let grants = stub.key_grants.entry(store_id.to_string()).or_default();
+    grants.push(KeyGrantRow { user_id: friend_id, key_id: share_key_id.to_string(), envelope: for_friend, root: Some(shared.to_string()) });
+    grants.push(KeyGrantRow { user_id: owner_id, key_id: share_key_id.to_string(), envelope: for_owner, root: Some(shared.to_string()) });
+    (share_key_id, share_key)
+}
+
+#[tokio::test]
+async fn a_share_recipients_replica_holds_its_scope_and_edits_it_with_the_owner() {
+    let env = spawn_env().await;
+    let (mut a, alice, a_dir) = start_local_server().await;
+    alice.cloud_sign_in(&env.stub_url, &env.email, &env.password).await.unwrap();
+    let (store_id, root_id) = alice.create_store(a_dir.path().join("a.pimble"), "Alice's Notes").await.unwrap();
+    let shared = alice.create_node(store_id, Some(root_id), "folder", "Holiday").await.unwrap();
+    let inside = alice.create_node(store_id, Some(shared), "document", "Packing").await.unwrap();
+    let deeper = alice.create_node(store_id, Some(shared), "folder", "Tickets").await.unwrap();
+    let leaf = alice.create_node(store_id, Some(deeper), "document", "Train").await.unwrap();
+    let private = alice.create_node(store_id, Some(root_id), "document", "Diary").await.unwrap();
+    seed_content(&alice, store_id, inside, "seed", "socks and a map").await;
+    seed_content(&alice, store_id, private, "seed", "PRIVATE-DIARY-TEXT").await;
+    alice.cloud_host_store(store_id).await.unwrap();
+    wait_all_seeded(&env, store_id, &[root_id, shared, inside, deeper, leaf, private]).await;
+
+    let (share_key_id, _) = share_by_hand(&env, &alice, a_dir.path(), store_id, shared, &[inside, deeper, leaf], "editor", "Holiday Plans").await;
+    // The owner's device picks the share key up at its next connect.
+    env.relay.cut();
+    env.relay.restore();
+    let alice_has_key = wait_until(Duration::from_secs(15), || async { scope_keys_in(a_dir.path(), store_id).iter().any(|(id, _)| *id == share_key_id) }).await;
+    assert!(alice_has_key, "an owner's device fetches its own envelope for a share's key");
+
+    // Bob: the account's rows say what the grant is, and adding the store
+    // makes a partial replica of it.
+    let (mut b, bob, b_dir) = start_local_server().await;
+    bob.cloud_sign_in(&env.stub_url, &env.friend_email, &env.friend_password).await.unwrap();
+    let rows = bob.cloud_list_hosted_stores().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].root, rows[0].shared_by.as_deref(), rows[0].name.as_str(), rows[0].role.as_str()), (Some(shared), Some(env.email.as_str()), "Holiday Plans", "editor"));
+
+    let store = bob.cloud_add_hosted_store(store_id).await.expect("a share is added like any hosted store");
+    assert_eq!(store.roots, vec![shared]);
+    assert_eq!(store.root_node_id, shared, "the first root, for callers that know of one");
+    assert_eq!(store.access, pimble_core::StoreAccess::Full);
+    assert_eq!(store.shared_by.as_deref(), Some(env.email.as_str()));
+    assert_eq!(store.name, "Holiday Plans", "the share's name; the owner's store name never reaches a recipient");
+    let (_, _, _, access) = bob.get_store_sync_with_access(store_id).await.unwrap();
+    assert_eq!(access, pimble_core::StoreAccess::Full);
+
+    // The scope and nothing else: the subtree shows, the rest is not held.
+    let pulled = wait_until(Duration::from_secs(10), || async { node_text(&bob, store_id, inside).await.contains("socks and a map") }).await;
+    assert!(pulled, "the scope's documents are pulled and read with the share's key");
+    let (_, children) = bob.get_children(store_id, shared).await.unwrap();
+    assert_eq!(children.iter().map(|n| n.id).collect::<Vec<_>>(), vec![inside, deeper]);
+    assert_eq!(bob.get_children(store_id, deeper).await.unwrap().1.iter().map(|n| n.id).collect::<Vec<_>>(), vec![leaf]);
+    for outside in [private, root_id] {
+        let err = bob.get_node(store_id, outside).await.expect_err("a node outside the scope is not held").to_string();
+        assert!(err.to_lowercase().contains("not found"), "{err}");
+    }
+    let replica_dir = b_dir.path().join("replicas").join(format!("{store_id}.pimble"));
+    assert!(!replica_dir.join("nodes").join(format!("{private}.yrs")).exists());
+    assert!(!contains_bytes_recursive(b_dir.path(), b"PRIVATE-DIARY-TEXT"));
+    let listed = bob.list_stores().await.unwrap();
+    assert_eq!(listed.iter().find(|s| s.id == store_id).unwrap().roots, vec![shared]);
+
+    // Repair leaves the scope root where it is: its parent is a document
+    // this replica never holds, and that is no orphan here.
+    assert_eq!(bob.get_node(store_id, shared).await.unwrap().parent_id, Some(root_id));
+    assert_eq!(alice.get_children(store_id, root_id).await.unwrap().1.iter().map(|n| n.id).collect::<Vec<_>>(), vec![shared, private]);
+
+    // Co-editing, both ways, text and tree.
+    seed_content(&bob, store_id, inside, "bob", "and sunscreen").await;
+    let reached_alice = wait_until(Duration::from_secs(10), || async { node_text(&alice, store_id, inside).await.contains("and sunscreen") }).await;
+    assert!(reached_alice, "a recipient's edit reaches the owner");
+
+    let from_bob = bob.create_node(store_id, Some(deeper), "document", "Ferry").await.unwrap();
+    seed_content(&bob, store_id, from_bob, "bob", "ferry at nine").await;
+    let created_at_alice = wait_until(Duration::from_secs(15), || async {
+        alice.get_children(store_id, deeper).await.map(|(_, c)| c.iter().any(|n| n.id == from_bob)).unwrap_or(false)
+            && node_text(&alice, store_id, from_bob).await.contains("ferry at nine")
+    })
+    .await;
+    assert!(created_at_alice, "a recipient's create reaches the owner, readable: its data key is wrapped under the share's key, which the owner holds");
+    let from_bob_keys = env.h_admin.vault_fetch(store_id, VaultDocId::Node(from_bob), u64::MAX).await.unwrap().keys.expect("its maker set its keys");
+    assert_eq!(from_bob_keys.wraps.iter().map(|w| w.scope_key_id).collect::<Vec<_>>(), vec![share_key_id], "wrapped under the scope key its maker holds");
+    let scope: Vec<NodeId> = env.h_admin.get_scopes(store_id).await.unwrap().into_iter().find(|s| s.root == shared).unwrap().doc_ids;
+    assert!(scope.contains(&from_bob), "and the server put it in the scope itself");
+    assert!(!env.hosted_store_contains_plaintext(store_id, "ferry at nine"));
+
+    // A create with nothing said after it: the owner's device may fetch the
+    // new document between its first append and its keys (a recipient can
+    // only set them second), and asks again.
+    let bare = bob.create_node(store_id, Some(deeper), "folder", "Bare").await.unwrap();
+    let bare_at_alice = wait_until(Duration::from_secs(20), || async { alice.get_node(store_id, bare).await.is_ok() }).await;
+    assert!(bare_at_alice, "a recipient's create reaches the owner with no later edit to carry it");
+
+    // The owner's side: an edit outside the share never reaches Bob; a
+    // create inside it does once the scope is published, wrapped under
+    // both keys by the device that made it.
+    seed_content(&alice, store_id, private, "alice", "MORE-PRIVATE-TEXT").await;
+    let from_alice = alice.create_node(store_id, Some(shared), "document", "Hotel").await.unwrap();
+    seed_content(&alice, store_id, from_alice, "alice", "two nights").await;
+    wait_all_seeded(&env, store_id, &[from_alice]).await;
+    let alice_keys = env.h_admin.vault_fetch(store_id, VaultDocId::Node(from_alice), u64::MAX).await.unwrap().keys.unwrap();
+    assert!(alice_keys.wraps.iter().any(|w| w.scope_key_id == share_key_id), "the owner's device wraps a document made under a share for the share too: {alice_keys:?}");
+    assert_eq!(alice_keys.wraps.len(), 2);
+    env.h_admin.set_scope(store_id, pimble_rpc::Scope { root: shared, doc_ids: vec![inside, deeper, leaf, from_bob, bare, from_alice] }, false).await.unwrap();
+    let created_at_bob = wait_until(Duration::from_secs(30), || async { node_text(&bob, store_id, from_alice).await.contains("two nights") }).await;
+    assert!(created_at_bob, "a document the share's list names and the scope held a moment later is asked for again");
+    assert_eq!(bob.get_children(store_id, shared).await.unwrap().1.iter().map(|n| n.id).collect::<Vec<_>>(), vec![inside, deeper, from_alice]);
+    assert!(!contains_bytes_recursive(b_dir.path(), b"MORE-PRIVATE-TEXT"));
+    assert!(bob.get_node(store_id, private).await.is_err());
+
+    // The same with nothing said about the document after the publish (the
+    // one above was stamped `modified_at` a moment later, and hearing of a
+    // document is reason enough to fetch it): Bob's replica holds a list
+    // that names a child it does not have, and asks.
+    let quiet = alice.create_node(store_id, Some(deeper), "folder", "Quiet").await.unwrap();
+    wait_all_seeded(&env, store_id, &[quiet]).await;
+    let named = wait_until(Duration::from_secs(10), || async {
+        env.h_admin.vault_fetch(store_id, VaultDocId::Node(deeper), 0).await.map(|f| f.head >= 3).unwrap_or(false)
+    })
+    .await;
+    assert!(named, "the parent's list reached the hosted twin");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(bob.get_node(store_id, quiet).await.is_err(), "not in the scope yet, so not sent");
+    env.h_admin.set_scope(store_id, pimble_rpc::Scope { root: shared, doc_ids: vec![inside, deeper, leaf, from_bob, bare, from_alice, quiet] }, false).await.unwrap();
+    let asked_for = wait_until(Duration::from_secs(30), || async { bob.get_node(store_id, quiet).await.is_ok() }).await;
+    assert!(asked_for, "an awaited document is asked for again until the scope holds it");
+    assert_eq!(alice.get_children(store_id, deeper).await.unwrap().1.iter().map(|n| n.id).collect::<Vec<_>>(), vec![leaf, from_bob, bare, quiet], "and meanwhile Bob's repair removed nothing from the owner's list");
+
+    // Through a restart: the roots, the access and the link come back, and
+    // nothing moved the share's root.
+    b.stop().await.unwrap();
+    let mut b = PimbleServer::with_config(ServerConfig {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        keystore_path: Some(b_dir.path().join("keys.json")),
+        credentials_path: Some(b_dir.path().join("credentials.json")),
+        replicas_dir: Some(b_dir.path().join("replicas")),
+        ..Default::default()
+    });
+    b.start().await.unwrap();
+    let bob = PimbleClient::connect(format!("http://{}", b.addr())).await.unwrap();
+    let reopened = bob.open_store(&replica_dir).await.unwrap();
+    assert_eq!((reopened.roots.clone(), reopened.access, reopened.shared_by.as_deref()), (vec![shared], pimble_core::StoreAccess::Full, Some(env.email.as_str())));
+    seed_content(&alice, store_id, inside, "alice", "after the restart").await;
+    let resumed = wait_until(Duration::from_secs(15), || async { node_text(&bob, store_id, inside).await.contains("after the restart") }).await;
+    assert!(resumed, "the partial replica's link resumes");
+    assert_eq!(bob.get_node(store_id, shared).await.unwrap().parent_id, Some(root_id));
+    assert_eq!(alice.get_node(store_id, shared).await.unwrap().parent_id, Some(root_id));
+    assert_eq!(alice.get_children(store_id, shared).await.unwrap().1.iter().map(|n| n.id).collect::<Vec<_>>(), vec![inside, deeper, from_alice], "and no repair of the recipient's touched the owner's folder");
+
+    a.stop().await.unwrap();
+    b.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_readers_replica_reads_everything_and_writes_nothing() {
+    let env = spawn_env().await;
+    let (mut a, alice, a_dir) = start_local_server().await;
+    alice.cloud_sign_in(&env.stub_url, &env.email, &env.password).await.unwrap();
+    let (store_id, root_id) = alice.create_store(a_dir.path().join("a.pimble"), "Alice's Notes").await.unwrap();
+    let shared = alice.create_node(store_id, Some(root_id), "folder", "Recipes").await.unwrap();
+    let inside = alice.create_node(store_id, Some(shared), "document", "Soup").await.unwrap();
+    seed_content(&alice, store_id, inside, "seed", "leeks").await;
+    alice.cloud_host_store(store_id).await.unwrap();
+    wait_all_seeded(&env, store_id, &[root_id, shared, inside]).await;
+    share_by_hand(&env, &alice, a_dir.path(), store_id, shared, &[inside], "reader", "Recipes").await;
+
+    let (mut b, bob, _b_dir) = start_local_server().await;
+    bob.cloud_sign_in(&env.stub_url, &env.friend_email, &env.friend_password).await.unwrap();
+    let store = bob.cloud_add_hosted_store(store_id).await.unwrap();
+    assert_eq!(store.access, pimble_core::StoreAccess::Read);
+    assert_eq!(bob.get_store_sync_with_access(store_id).await.unwrap().3, pimble_core::StoreAccess::Read);
+    let pulled = wait_until(Duration::from_secs(10), || async { node_text(&bob, store_id, inside).await.contains("leeks") }).await;
+    assert!(pulled);
+
+    // The local server refuses a reader's writes with the reader's sentence.
+    let heads_before: HashMap<VaultDocId, u64> = env.h_admin.vault_list_docs(store_id).await.unwrap().into_iter().map(|d| (d.doc_id, d.head)).collect();
+    let refused = |result: Result<(), pimble_client::ClientError>| assert_eq!(result.expect_err("a reader's replica refuses writes").to_string(), pimble_core::StoreAccess::READ_ONLY_REFUSAL);
+    refused(bob.create_node(store_id, Some(shared), "document", "no").await.map(|_| ()));
+    refused(bob.delete_node(store_id, inside).await);
+    let changes = base64::engine::general_purpose::STANDARD.encode(NodeDoc::from_plain_text("no").unwrap().save());
+    refused(bob.apply_edit(store_id, inside, "bob", EditOperation::IncrementalChanges { changes }).await);
+    let metadata = bob.get_node(store_id, inside).await.unwrap().metadata;
+    refused(bob.update_node_metadata(store_id, inside, metadata).await);
+
+    // And still receives everything, a link's applies being no write of its own.
+    seed_content(&alice, store_id, inside, "alice", "and potatoes").await;
+    let received = wait_until(Duration::from_secs(10), || async { node_text(&bob, store_id, inside).await.contains("and potatoes") }).await;
+    assert!(received);
+    let heads_after: HashMap<VaultDocId, u64> = env.h_admin.vault_list_docs(store_id).await.unwrap().into_iter().map(|d| (d.doc_id, d.head)).collect();
+    assert_eq!(heads_after.get(&VaultDocId::Node(shared)), heads_before.get(&VaultDocId::Node(shared)), "a reader's link pushes nothing");
+
+    a.stop().await.unwrap();
+    b.stop().await.unwrap();
 }
 
 // ── Interop with the REAL accounts service (crates/pimble-cloud) ─────────

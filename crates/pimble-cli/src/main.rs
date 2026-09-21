@@ -87,6 +87,34 @@ async fn main() -> Result<()> {
             }
             vault_snapshot(&args[2], &args[3], &args[4], &args[5]).await?;
         }
+        "delete-vault-store" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pimble-cli delete-vault-store <store-id>");
+                return Ok(());
+            }
+            delete_vault_store(&args[2]).await?;
+        }
+        "scopes" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pimble-cli scopes <store-id>");
+                return Ok(());
+            }
+            scopes(&args[2]).await?;
+        }
+        "set-scope" => {
+            if args.len() < 4 {
+                eprintln!("Usage: pimble-cli set-scope <store-id> <root-node-id> [<doc-node-id>...]");
+                return Ok(());
+            }
+            set_scope(&args[2], &args[3], &args[4..], false).await?;
+        }
+        "remove-scope" => {
+            if args.len() < 4 {
+                eprintln!("Usage: pimble-cli remove-scope <store-id> <root-node-id>");
+                return Ok(());
+            }
+            set_scope(&args[2], &args[3], &[], true).await?;
+        }
         "import-scrivener" => {
             if args.len() < 4 {
                 eprintln!("Usage: pimble-cli import-scrivener <scrivener-project.scriv> <output.pimble>");
@@ -312,6 +340,10 @@ COMMANDS:
     vault-fetch         Fetch a vault document's snapshot and updates
     vault-append        Append a file's bytes as a vault document update
     vault-snapshot      Store a file's bytes as a vault document snapshot
+    delete-vault-store  Close a vault store and delete its directory (hosted side)
+    scopes              List a store's shares: each root and the documents under it
+    set-scope           Publish a share's scope: the documents under its root
+    remove-scope        Remove a share's scope
     cloud-sign-in       Sign in to a Pimble Cloud account
     cloud-status        Show whether a Pimble Cloud account is signed in
     cloud-sign-out      Forget the signed-in Pimble Cloud account
@@ -680,13 +712,14 @@ async fn sync_state(store_id: &str) -> Result<()> {
     let store_id = parse_store_id(store_id)?;
 
     let client = connect().await?;
-    let (remote, state, mode) = client.get_store_sync_with_mode(store_id).await?;
+    let (remote, state, mode, access) = client.get_store_sync_with_access(store_id).await?;
     match remote {
         Some(r) => println!("Remote: {}", r.url),
         None => println!("Remote: (none)"),
     }
     println!("State: {:?}", state);
     println!("Mode: {:?}", mode);
+    println!("Access: {:?}", access);
     Ok(())
 }
 
@@ -771,8 +804,16 @@ async fn cloud_list_hosted() -> Result<()> {
     if stores.is_empty() {
         println!("No hosted stores");
     } else {
+        // One row per grant: a share of a store names its root and whose it is.
         for s in stores {
-            println!("{}  {}  role={}  kind={}  created={}", s.store_id, s.name, s.role, s.kind, s.created_at);
+            let mut line = format!("{}  {}  role={}  kind={}  created={}", s.store_id, s.name, s.role, s.kind, s.created_at);
+            if let Some(root) = s.root {
+                line.push_str(&format!("  root={root}"));
+            }
+            if let Some(shared_by) = s.shared_by {
+                line.push_str(&format!("  shared-by={shared_by}"));
+            }
+            println!("{line}");
         }
     }
     Ok(())
@@ -785,6 +826,13 @@ async fn cloud_add_hosted(store_id: &str) -> Result<()> {
     println!("Added hosted store {} locally", store.id);
     println!("Name: {}", store.name);
     println!("Sync state: {:?}", store.sync_state);
+    println!("Access: {:?}", store.access);
+    if let Some(shared_by) = &store.shared_by {
+        println!("Shared by: {}", shared_by);
+    }
+    for root in store.shown_roots() {
+        println!("Root: {}", root);
+    }
     Ok(())
 }
 
@@ -823,7 +871,8 @@ async fn vault_list(store_id: &str) -> Result<()> {
         println!("No documents");
     } else {
         for doc in docs {
-            println!("{} head={} snapshot_seq={}", doc.doc_id.as_str(), doc.head, doc.snapshot_seq);
+            let dek = doc.dek_id.map(|id| format!(" dek={id}")).unwrap_or_default();
+            println!("{} head={} snapshot_seq={}{}", doc.doc_id.as_str(), doc.head, doc.snapshot_seq, dek);
         }
     }
     Ok(())
@@ -836,6 +885,13 @@ async fn vault_fetch(store_id: &str, doc: &str, after_seq: u64) -> Result<()> {
     let response = client.vault_fetch(store_id, doc_id, after_seq).await?;
 
     println!("Head: {}", response.head);
+    match &response.keys {
+        Some(keys) => {
+            let wrapped_under: Vec<String> = keys.wraps.iter().map(|w| w.scope_key_id.to_string()).collect();
+            println!("Data key: {} (wrapped under {})", keys.dek_id, wrapped_under.join(", "));
+        }
+        None => println!("Data key: (none)"),
+    }
     match &response.snapshot {
         Some(snapshot) => println!("Snapshot: seq={} bytes={}", snapshot.seq, snapshot.blob.len()),
         None => println!("Snapshot: (none)"),
@@ -872,6 +928,47 @@ async fn vault_snapshot(store_id: &str, doc: &str, upto_seq: &str, file: &str) -
     let client = connect().await?;
     client.vault_snapshot(store_id, doc_id, upto_seq, blob).await?;
     println!("Stored snapshot up to seq {}", upto_seq);
+    Ok(())
+}
+
+/// Hosted side: what the accounts service calls when a hosted store is
+/// deleted. Refused for anything but a vault store open on the server.
+async fn delete_vault_store(store_id: &str) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let client = connect().await?;
+    client.delete_vault_store(store_id).await?;
+    println!("Deleted vault store {}", store_id);
+    Ok(())
+}
+
+async fn scopes(store_id: &str) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let client = connect().await?;
+    let scopes = client.get_scopes(store_id).await?;
+    if scopes.is_empty() {
+        println!("No scopes");
+    }
+    for scope in scopes {
+        println!("{}  {} document(s)", scope.root, scope.doc_ids.len());
+        for doc in scope.doc_ids {
+            println!("  {}", doc);
+        }
+    }
+    Ok(())
+}
+
+async fn set_scope(store_id: &str, root: &str, docs: &[String], remove: bool) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let root = parse_node_id(root)?;
+    let doc_ids = docs.iter().map(|d| parse_node_id(d)).collect::<Result<Vec<_>>>()?;
+    let client = connect().await?;
+    let count = doc_ids.len();
+    client.set_scope(store_id, pimble_rpc::Scope { root, doc_ids }, remove).await?;
+    if remove {
+        println!("Removed scope {}", root);
+    } else {
+        println!("Published scope {}: {} document(s)", root, count);
+    }
     Ok(())
 }
 

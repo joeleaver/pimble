@@ -5,6 +5,7 @@
 //! JWKS fetching, against a local axum stub but not a `PimbleServer`).
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -70,9 +71,37 @@ fn make_jwt(
     stores: &HashMap<pimble_core::StoreId, &str>,
     exp_offset_secs: i64,
 ) -> String {
+    let stores_claim = stores.iter().map(|(id, role)| (id.to_string(), json!(role))).collect();
+    make_jwt_with_claims(signing_key, kid, issuer, sub, email, stores_claim, exp_offset_secs)
+}
+
+/// One store's claim for a share's recipient: a role per shared root
+/// (docs/NODE_DOCUMENT_CONTRACT.md section 5), where a whole-store grant is
+/// the role's string alone.
+fn shares_claim(roots: &[(pimble_core::NodeId, &str)]) -> serde_json::Value {
+    let roots: serde_json::Map<String, serde_json::Value> = roots.iter().map(|(root, role)| (root.to_string(), json!(role))).collect();
+    json!({ "roots": roots })
+}
+
+/// A JWT for a member of one store's shares.
+fn make_scoped_jwt(signing_key: &SigningKey, kid: &str, issuer: &str, sub: &str, store_id: pimble_core::StoreId, roots: &[(pimble_core::NodeId, &str)]) -> String {
+    let mut stores_claim = serde_json::Map::new();
+    stores_claim.insert(store_id.to_string(), shares_claim(roots));
+    make_jwt_with_claims(signing_key, kid, issuer, sub, &format!("{sub}@example.com"), stores_claim, 3600)
+}
+
+/// [`make_jwt`] with `claims.stores` as given: each store's value is a role
+/// (the whole store) or [`shares_claim`]'s object.
+fn make_jwt_with_claims(
+    signing_key: &SigningKey,
+    kid: &str,
+    issuer: &str,
+    sub: &str,
+    email: &str,
+    stores_claim: serde_json::Map<String, serde_json::Value>,
+    exp_offset_secs: i64,
+) -> String {
     let header = json!({ "alg": "EdDSA", "kid": kid });
-    let stores_claim: serde_json::Map<String, serde_json::Value> =
-        stores.iter().map(|(id, role)| (id.to_string(), json!(role))).collect();
     let payload = json!({
         "iss": issuer,
         "sub": sub,
@@ -248,7 +277,7 @@ async fn a_reader_can_read_and_not_write_and_an_editor_can_write() {
         .create_node(store_id, Some(root_id), "document", "should be refused")
         .await
         .expect_err("a reader may not write");
-    assert!(write_err.to_string().contains("Forbidden"), "expected a Forbidden error, got: {}", write_err);
+    assert_eq!(write_err.to_string(), pimble_core::StoreAccess::READ_ONLY_REFUSAL, "a reader's refusal is the sentence, whole");
 
     let mut editor_grant = HashMap::new();
     editor_grant.insert(store_id, "editor");
@@ -424,4 +453,289 @@ async fn get_mount_state_is_forbidden_without_read_on_the_source_store() {
         .await
         .expect_err("getMountState must be forbidden without Read on the source store");
     assert!(err.to_string().contains("Forbidden"), "expected a Forbidden error, got: {}", err);
+}
+
+// ── Scoped grants: a share's member (docs/NODE_DOCUMENT_CONTRACT.md section 5) ──
+
+const NO_GRANT: &str = "no grant for this document";
+
+fn refused_as_no_grant<T: std::fmt::Debug>(result: Result<T, pimble_client::ClientError>, what: &str) {
+    let err = result.expect_err(what).to_string();
+    assert!(err.contains(NO_GRANT), "{what}: expected the document refusal, got: {err}");
+}
+
+fn refused_as_read_only<T: std::fmt::Debug>(result: Result<T, pimble_client::ClientError>, what: &str) {
+    let err = result.expect_err(what).to_string();
+    assert_eq!(err, pimble_core::StoreAccess::READ_ONLY_REFUSAL, "{what}: the sentence is the whole message");
+}
+
+fn edit_of(text: &str) -> pimble_rpc::EditOperation {
+    use base64::engine::general_purpose::STANDARD;
+    let doc = pimble_crdt::NodeDoc::from_plain_text(text).unwrap();
+    pimble_rpc::EditOperation::IncrementalChanges { changes: STANDARD.encode(doc.save()) }
+}
+
+/// A new node's document as a client that makes its own tree edits would
+/// send it: initialised, under `parent`.
+fn create_edit(title: &str, parent: pimble_core::NodeId) -> pimble_rpc::EditOperation {
+    use base64::engine::general_purpose::STANDARD;
+    let mut doc = pimble_crdt::NodeDoc::new();
+    doc.init("document", title, Some(parent), &chrono::Utc::now().to_rfc3339()).unwrap();
+    pimble_rpc::EditOperation::IncrementalChanges { changes: STANDARD.encode(doc.save()) }
+}
+
+/// A plain store with a shared folder and something outside it, a server in
+/// JWT mode in front of it, and the service client that set it up.
+struct SharedStore {
+    _server: PimbleServer,
+    _dir: tempfile::TempDir,
+    url: String,
+    sk: SigningKey,
+    issuer: &'static str,
+    admin: PimbleClient,
+    store_id: pimble_core::StoreId,
+    root: pimble_core::NodeId,
+    shared: pimble_core::NodeId,
+    inside: pimble_core::NodeId,
+    outside: pimble_core::NodeId,
+}
+
+impl SharedStore {
+    async fn start() -> Self {
+        let sk = signing_key();
+        let jwks_url = spawn_jwks(&sk, "kid-1").await;
+        let issuer = "https://issuer.example/v1";
+        let server = start_jwt_server("admin-secret", &jwks_url, issuer, Vec::new()).await;
+        let url = format!("http://{}", server.addr());
+        let admin = PimbleClient::connect_with_auth(&url, &AuthMethod::Bearer { token: "admin-secret".into() }).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (store_id, root) = admin.create_store(dir.path().join("s.pimble"), "S").await.unwrap();
+        let shared = admin.create_node(store_id, Some(root), "folder", "Shared").await.unwrap();
+        let inside = admin.create_node(store_id, Some(shared), "document", "Inside").await.unwrap();
+        let outside = admin.create_node(store_id, Some(root), "document", "Outside").await.unwrap();
+        Self { _server: server, _dir: dir, url, sk, issuer, admin, store_id, root, shared, inside, outside }
+    }
+
+    async fn member(&self, sub: &str, roots: &[(pimble_core::NodeId, &str)]) -> PimbleClient {
+        let jwt = make_scoped_jwt(&self.sk, "kid-1", self.issuer, sub, self.store_id, roots);
+        PimbleClient::connect_with_auth(&self.url, &AuthMethod::Bearer { token: jwt }).await.expect("a scoped JWT connects")
+    }
+}
+
+#[tokio::test]
+async fn a_scoped_editor_reads_and_writes_exactly_its_scope() {
+    let s = SharedStore::start().await;
+    let (store_id, root, shared, inside, outside) = (s.store_id, s.root, s.shared, s.inside, s.outside);
+    let member = s.member("bob", &[(shared, "editor")]).await;
+
+    // Reading: the share's root and what is under it; anything else,
+    // whether it exists or not, is the same refusal.
+    assert_eq!(member.get_node(store_id, shared).await.unwrap().metadata.title, "Shared");
+    member.get_node(store_id, inside).await.expect("a document in scope");
+    refused_as_no_grant(member.get_node(store_id, outside).await, "a document outside the scope");
+    refused_as_no_grant(member.get_node(store_id, root).await, "the store's root");
+    refused_as_no_grant(member.get_node(store_id, pimble_core::NodeId::new()).await, "a document that does not exist");
+    let (_, children) = member.get_children(store_id, shared).await.unwrap();
+    assert_eq!(children.iter().map(|n| n.id).collect::<Vec<_>>(), vec![inside]);
+    refused_as_no_grant(member.get_children(store_id, root).await, "the root's children");
+    let some = member.get_nodes(store_id, vec![inside, outside]).await.unwrap();
+    assert_eq!(some.iter().map(|n| n.id).collect::<Vec<_>>(), vec![inside], "getNodes leaves out what is not the member's");
+
+    // The store row a member is shown starts at their share.
+    let listed = member.list_stores().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].roots, vec![shared]);
+    assert_eq!(listed[0].root_node_id, shared, "never the store's own root, a document the member has no grant on");
+    assert_eq!(listed[0].access, pimble_core::StoreAccess::Full);
+
+    // Writing: everything in scope, structure included; a create joins it.
+    let created = member.create_node(store_id, Some(shared), "folder", "Made by Bob").await.expect("a create under the share");
+    member.get_node(store_id, created).await.expect("the new node is in the scope at once");
+    let mut renamed = member.get_node(store_id, inside).await.unwrap().metadata;
+    renamed.title = "Renamed by Bob".into();
+    member.update_node_metadata(store_id, inside, renamed).await.expect("metadata in scope");
+    member.move_node(store_id, inside, created, None).await.expect("a move inside the scope");
+    member.apply_edit(store_id, inside, "bob-editor", edit_of("typed by bob")).await.expect("an edit in scope");
+    let by_edit = pimble_core::NodeId::new();
+    member.apply_edit(store_id, by_edit, "bob-editor", create_edit("By edit", shared)).await.expect("a document created by applyEdit under a parent in scope");
+    member.get_node(store_id, by_edit).await.expect("in scope by its parent, before any list names it");
+    member.delete_node(store_id, by_edit).await.expect("a delete in scope");
+    member.undelete_node(store_id, by_edit).await.expect("a tombstone stays in scope, so it can come back");
+
+    refused_as_no_grant(member.create_node(store_id, Some(root), "document", "x").await, "a create under the root");
+    refused_as_no_grant(member.create_node(store_id, None, "document", "x").await, "a create with no parent is one under the root");
+    refused_as_no_grant(member.create_node(store_id, Some(outside), "document", "x").await, "a create under a node outside");
+    let outside_meta = s.admin.get_node(store_id, outside).await.unwrap().metadata;
+    refused_as_no_grant(member.update_node_metadata(store_id, outside, outside_meta).await, "metadata outside");
+    refused_as_no_grant(member.move_node(store_id, inside, root, None).await, "a move out of the scope");
+    refused_as_no_grant(member.move_node(store_id, outside, shared, None).await, "a move into the scope");
+    refused_as_no_grant(member.delete_node(store_id, outside).await, "a delete outside");
+    refused_as_no_grant(member.delete_node(store_id, shared).await, "deleting the share's own root edits its parent's list");
+    refused_as_no_grant(member.undelete_node(store_id, outside).await, "an undelete outside");
+    refused_as_no_grant(member.apply_edit(store_id, outside, "bob-editor", edit_of("no")).await, "an edit outside");
+    refused_as_no_grant(
+        member.apply_edit(store_id, pimble_core::NodeId::new(), "bob-editor", create_edit("x", outside)).await,
+        "a document created under a parent outside",
+    );
+    refused_as_no_grant(member.apply_edit(store_id, pimble_core::NodeId::new(), "bob-editor", edit_of("no parent named")).await, "a new document naming no parent");
+    refused_as_no_grant(member.create_mount(store_id, root, store_id, inside, None).await, "a mount under the root");
+    assert_eq!(s.admin.get_node(store_id, outside).await.unwrap().metadata.title, "Outside", "nothing refused changed anything");
+
+    // syncNodes: the scope, and nothing of the rest, named or not.
+    let (answered, unknown_ids) = member
+        .sync_nodes(store_id, &[(outside, pimble_crdt::empty_state_vector()), (inside, pimble_crdt::empty_state_vector())], true)
+        .await
+        .unwrap();
+    assert_eq!(answered.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(), vec![inside], "a named document outside the scope is left out like one not held");
+    let unknown: std::collections::HashSet<_> = unknown_ids.into_iter().collect();
+    assert_eq!(unknown, [shared, created, by_edit].into_iter().collect(), "unknown ids are the scope's and no one else's");
+}
+
+#[tokio::test]
+async fn a_scoped_subscriber_hears_of_its_scope_and_of_nothing_else() {
+    let s = SharedStore::start().await;
+    let (store_id, root, shared, inside, outside) = (s.store_id, s.root, s.shared, s.inside, s.outside);
+    let member = s.member("bob", &[(shared, "editor")]).await;
+    let mut member_sub = member.subscribe_store_changes(store_id).await.unwrap();
+    let mut whole_sub = s.admin.subscribe_store_changes(store_id).await.unwrap();
+    refused_as_no_grant(member.subscribe_node_changes(store_id, outside).await.map(|_| ()), "a node subscription outside the scope");
+    let mut inside_sub = member.subscribe_node_changes(store_id, inside).await.expect("a node subscription in scope");
+
+    // Outside first: whatever reaches the member first is then, by order,
+    // proof that the change outside did not.
+    s.admin.apply_edit(store_id, outside, "admin", edit_of("outside text")).await.unwrap();
+    s.admin.create_node(store_id, Some(root), "document", "Another outside").await.unwrap();
+    s.admin.apply_edit(store_id, inside, "admin", edit_of("inside text")).await.unwrap();
+    // The owner moves the share itself: the member's own root changed, and
+    // the parents it moved between are not the member's to hear of.
+    let elsewhere = s.admin.create_node(store_id, Some(root), "folder", "Elsewhere").await.unwrap();
+    s.admin.move_node(store_id, shared, elsewhere, None).await.unwrap();
+    let sentinel = s.admin.create_node(store_id, Some(shared), "document", "Sentinel").await.unwrap();
+
+    let mut heard = Vec::new();
+    loop {
+        let notif = tokio::time::timeout(Duration::from_secs(5), member_sub.next()).await.expect("the sentinel arrives").unwrap().unwrap();
+        let done = matches!(&notif.change_kind, pimble_rpc::StoreChangeKind::NodeCreated { node_id, .. } if *node_id == sentinel);
+        heard.push(notif);
+        if done {
+            break;
+        }
+    }
+    let foreign = [root, outside, elsewhere];
+    for notif in &heard {
+        let text = serde_json::to_string(&notif.change_kind).unwrap();
+        for id in foreign {
+            assert!(!text.contains(&id.to_string()), "a scoped subscriber must never be told another document's id: {text}");
+        }
+    }
+    assert!(
+        heard.iter().any(|n| matches!(&n.change_kind, pimble_rpc::StoreChangeKind::ContentUpdated { node_id } if *node_id == inside)),
+        "the edit in scope arrives as it is: {heard:?}"
+    );
+    let moved = heard
+        .iter()
+        .find(|n| matches!(&n.change_kind, pimble_rpc::StoreChangeKind::TreeStructure { node_ids } if node_ids == &vec![shared]))
+        .expect("the share's own move arrives as a change to its document, naming no parent");
+    assert!(moved.update.is_some(), "with the bytes, so the member's copy of the root keeps up");
+
+    // An unscoped subscriber heard all of it, the move as a move.
+    let mut whole_heard = Vec::new();
+    loop {
+        let notif = tokio::time::timeout(Duration::from_secs(5), whole_sub.next()).await.expect("the sentinel arrives").unwrap().unwrap();
+        let done = matches!(&notif.change_kind, pimble_rpc::StoreChangeKind::NodeCreated { node_id, .. } if *node_id == sentinel);
+        whole_heard.push(notif);
+        if done {
+            break;
+        }
+    }
+    assert!(whole_heard.iter().any(|n| matches!(&n.change_kind, pimble_rpc::StoreChangeKind::NodeMoved { node_id, .. } if *node_id == shared)));
+    assert!(whole_heard.iter().any(|n| matches!(&n.change_kind, pimble_rpc::StoreChangeKind::ContentUpdated { node_id } if *node_id == outside)));
+
+    let node_notif = tokio::time::timeout(Duration::from_secs(5), inside_sub.next()).await.expect("the node's own subscriber hears the edit").unwrap().unwrap();
+    assert_eq!(node_notif.node_id, inside);
+}
+
+#[tokio::test]
+async fn a_scoped_members_search_finds_its_scope_only() {
+    let s = SharedStore::start().await;
+    let (store_id, shared, inside, outside) = (s.store_id, s.shared, s.inside, s.outside);
+    s.admin.apply_edit(store_id, inside, "admin", edit_of("quokka notes kept inside the share")).await.unwrap();
+    s.admin.apply_edit(store_id, outside, "admin", edit_of("quokka notes kept outside the share")).await.unwrap();
+    let member = s.member("bob", &[(shared, "reader")]).await;
+
+    // Content is indexed on a debounce; wait until the unscoped search sees both.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let all = s.admin.search("quokka", vec![store_id], false, 10).await.unwrap_or_default();
+        if all.len() >= 2 {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "both documents should be indexed, got {all:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let found = member.search("quokka", vec![store_id], false, 10).await.unwrap();
+    assert_eq!(found.iter().map(|r| r.node_id).collect::<Vec<_>>(), vec![inside], "hits outside the scope are dropped");
+    let found = member.search("quokka", Vec::new(), false, 1).await.unwrap();
+    assert_eq!(found.iter().map(|r| r.node_id).collect::<Vec<_>>(), vec![inside], "and a page of one still finds the one in scope");
+}
+
+/// `Role::Reader` refuses every write, and the refusal is the one sentence,
+/// whole: a whole-store reader and a share's reader alike.
+#[tokio::test]
+async fn a_reader_is_refused_every_write_with_the_sentence_as_the_whole_message() {
+    let s = SharedStore::start().await;
+    let (store_id, root, shared, inside) = (s.store_id, s.root, s.shared, s.inside);
+    let mut whole = HashMap::new();
+    whole.insert(store_id, "reader");
+    let whole_reader_jwt = make_jwt(&s.sk, "kid-1", s.issuer, "reader", "reader@example.com", &whole, 3600);
+    let whole_reader = PimbleClient::connect_with_auth(&s.url, &AuthMethod::Bearer { token: whole_reader_jwt }).await.unwrap();
+    let share_reader = s.member("carol", &[(shared, "reader")]).await;
+
+    for (who, reader) in [("a whole-store reader", &whole_reader), ("a share's reader", &share_reader)] {
+        reader.get_node(store_id, inside).await.unwrap_or_else(|e| panic!("{who} reads: {e}"));
+        let metadata = reader.get_node(store_id, inside).await.unwrap().metadata;
+        refused_as_read_only(reader.create_node(store_id, Some(shared), "document", "x").await, who);
+        refused_as_read_only(reader.update_node_metadata(store_id, inside, metadata).await, who);
+        refused_as_read_only(reader.set_node_content_bytes(store_id, inside, pimble_crdt::NodeDoc::from_plain_text("x").unwrap().save(), None).await, who);
+        refused_as_read_only(reader.delete_node(store_id, inside).await, who);
+        refused_as_read_only(reader.undelete_node(store_id, inside).await, who);
+        refused_as_read_only(reader.move_node(store_id, inside, shared, None).await, who);
+        refused_as_read_only(reader.apply_edit(store_id, inside, "reader-editor", edit_of("x")).await, who);
+        refused_as_read_only(reader.create_mount(store_id, shared, store_id, inside, None).await, who);
+        refused_as_read_only(reader.rebuild_index(store_id).await, who);
+        let listed = reader.list_stores().await.unwrap();
+        assert_eq!(listed[0].access, pimble_core::StoreAccess::Read, "{who} is shown a store it may read");
+    }
+    assert_eq!(s.admin.get_children(store_id, root).await.unwrap().1.len(), 2, "nothing was written");
+}
+
+/// A role per shared root (docs/NODE_DOCUMENT_CONTRACT.md section 5): a
+/// reader of one folder who edits another is refused writes under the first
+/// with the reader's sentence and allowed them under the second, and a
+/// document in both scopes takes the wider role.
+#[tokio::test]
+async fn a_reader_of_one_root_and_editor_of_another_writes_only_under_the_second() {
+    let s = SharedStore::start().await;
+    let (store_id, read_root, read_doc) = (s.store_id, s.shared, s.inside);
+    let edit_root = s.admin.create_node(store_id, Some(s.root), "folder", "Edited").await.unwrap();
+    let edit_doc = s.admin.create_node(store_id, Some(edit_root), "document", "E").await.unwrap();
+    // Overlapping shares: a folder the member edits inside the one they read.
+    let nested_edit_root = s.admin.create_node(store_id, Some(read_root), "folder", "Edited inside").await.unwrap();
+    let member = s.member("dana", &[(read_root, "reader"), (edit_root, "editor"), (nested_edit_root, "editor")]).await;
+
+    member.get_node(store_id, read_doc).await.expect("reads under the root it reads");
+    refused_as_read_only(member.apply_edit(store_id, read_doc, "dana", edit_of("no")).await, "an edit under the read root");
+    refused_as_read_only(member.create_node(store_id, Some(read_root), "document", "no").await, "a create under the read root");
+    refused_as_read_only(member.delete_node(store_id, read_doc).await, "a delete under the read root");
+    refused_as_read_only(member.move_node(store_id, edit_doc, read_root, None).await, "a move into the read root edits its list");
+    refused_as_read_only(member.move_node(store_id, read_doc, edit_root, None).await, "a move out of the read root edits the node");
+
+    member.apply_edit(store_id, edit_doc, "dana", edit_of("yes")).await.expect("an edit under the edited root");
+    member.create_node(store_id, Some(edit_root), "document", "yes").await.expect("a create under the edited root");
+    member.create_node(store_id, Some(nested_edit_root), "document", "wider").await.expect("in both scopes: the wider role");
+    refused_as_no_grant(member.get_node(store_id, s.outside).await, "and what is in neither is still nobody's");
+
+    let listed = member.list_stores().await.unwrap();
+    assert_eq!(listed[0].access, pimble_core::StoreAccess::Full, "something here may be written");
+    assert_eq!(listed[0].roots.len(), 3);
 }

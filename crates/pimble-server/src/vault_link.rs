@@ -47,6 +47,32 @@
 //!   a `vaultSnapshot` covering everything up to that sequence, so a fresh
 //!   peer's first `vaultFetch` never replays the whole history.
 //!
+//! **Keys** (docs/NODE_DOCUMENT_CONTRACT.md section 5): a document has its
+//! own data key, stored on the hosted server wrapped under every scope key
+//! that may read it (the store key, and each share's). A blob's key is
+//! resolved by its header's key id: among the document's wraps first
+//! (unwrapped with a scope key the keystore holds, kept in memory for the
+//! life of the link and never written down), then among the scope keys the
+//! keystore holds directly, which is how a blob from before data keys, under
+//! the store key itself, still reads. A blob goes out under the document's
+//! data key when it has one and under the link's scope key when it does not
+//! (a document from before data keys, until its owner gives it one). A
+//! document the remote has never seen gets a data key from the device that
+//! creates it, wrapped under every scope key this device holds that covers
+//! the node: the store key on a whole replica, the share's key on a share's
+//! recipient (see [`Keyring`] and `seal_plan`).
+//!
+//! **A share's recipient** links a partial replica: the hosted server lists
+//! and sends it exactly its scope, so the pull needs to know nothing about
+//! scopes; a document entering the scope later is fetched whole the first
+//! time anything is heard of it, and asked for again while a held list
+//! names a child that is not here (`pull_pending`). Held as a reader
+//! (`sync.json`'s `access: read`), the link pulls and never pushes. A push
+//! the server refuses for one document (it left the scope, or it is under
+//! a root this account only reads) leaves that document marked and the link
+//! up. How the account holds the store is read again from the accounts
+//! service at every connect (`refresh_grant`).
+//!
 //! **Connecting**: `sync.json` never holds a credential (matching
 //! `crate::sync_link`'s decision 4) — a vault link instead asks
 //! `RpcHandler::keystore` for the currently signed-in account fresh on
@@ -64,9 +90,9 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use pimble_client::PimbleClient;
-use pimble_core::{AuthMethod, NodeId, StoreId, SyncState};
-use pimble_crypto::Blob;
-use pimble_rpc::{StoreChangeKind, StoreChangedNotification, VaultCursor, VaultDocId};
+use pimble_core::{AuthMethod, NodeId, StoreAccess, StoreId, SyncState};
+use pimble_crypto::{Blob, SymmetricKey};
+use pimble_rpc::{StoreChangeKind, StoreChangedNotification, VaultCursor, VaultDocId, VaultDocKeys};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -91,6 +117,11 @@ const CURSOR_VERSION: u32 = 1;
 const MAX_CATCH_UP_BLOB: usize = 3 * 1024 * 1024;
 /// How often the live loop writes `vault-link.json` when it has changed.
 const PROGRESS_SAVE_EVERY: Duration = Duration::from_secs(5);
+/// How long a share's recipient waits before asking the remote again for a
+/// document a held list names and the scope did not hold yet, doubling up
+/// to [`MAX_AWAITED_POLL`] while nothing new arrives.
+const AWAITED_POLL: Duration = Duration::from_secs(5);
+const MAX_AWAITED_POLL: Duration = Duration::from_secs(60);
 
 /// A running vault link for one store, mirroring [`crate::sync_link::SyncLinkHandle`]'s API.
 pub struct VaultLinkHandle {
@@ -251,7 +282,11 @@ async fn connect_and_sync(
     let store_id = link.store_id;
     set_state(handler, link, SyncState::Syncing).await;
 
+    refresh_grant(handler, store_id).await;
     let client = connect(handler, rpc_url).await?;
+    // What the last connection learned of the remote's documents and their
+    // wraps is asked again; data keys already unwrapped stay.
+    progress.keyring.forget_remote();
 
     // Subscribed before the reconcile, not after it: an append that lands
     // between the pull and the subscription would otherwise be seen by
@@ -278,6 +313,9 @@ async fn connect_and_sync(
     full_reconcile(handler, &client, store_id, key_id, link_id, progress, &echoes).await?;
 
     let mut save_tick = tokio::time::interval(PROGRESS_SAVE_EVERY);
+    let mut awaited_wait = AWAITED_POLL;
+    let awaited_poll = tokio::time::sleep(awaited_wait);
+    tokio::pin!(awaited_poll);
 
     set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
     *reached_synced = true;
@@ -288,7 +326,7 @@ async fn connect_and_sync(
             item = remote_sub.next() => {
                 match item {
                     Some(Ok(notif)) => {
-                        handle_remote_notification(handler, store_id, link_id, notif, &echoes, progress).await?;
+                        handle_remote_notification(handler, &client, store_id, link_id, notif, &echoes, progress).await?;
                         set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
                     }
                     Some(Err(e)) => return Err(anyhow::anyhow!("remote notification decode error: {}", e)),
@@ -323,8 +361,134 @@ async fn connect_and_sync(
             _ = save_tick.tick() => {
                 progress.save_if_unsaved().await;
             }
+            _ = &mut awaited_poll => {
+                // Quiet again the moment nothing is awaited; slower while
+                // what is awaited stays away.
+                let pulled = pull_pending(handler, &client, store_id, link_id, progress).await?;
+                awaited_wait = if pulled { AWAITED_POLL } else { (awaited_wait * 2).min(MAX_AWAITED_POLL) };
+                awaited_poll.as_mut().reset(tokio::time::Instant::now() + awaited_wait);
+            }
         }
     }
+}
+
+/// Read again, from the accounts service, how the signed-in account holds
+/// this store, and bring `sync.json` (`access`, `shared_by`, the roots only
+/// read), a partial replica's scope roots and the keystore in line with it:
+/// a role changed by the owner, another share of the same store, a share's
+/// key handed over since the replica was added. Best effort: the token the
+/// connect mints next is what the hosted server judges, and a link with no
+/// account or no network fails there, with its backoff.
+async fn refresh_grant(handler: &RpcHandler, store_id: StoreId) {
+    let Some(account) = handler.keystore().account().await else { return };
+    let rows = match crate::cloud::list_stores(&account.url, &account.session).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            debug!("Vault link for store {}: could not list the account's stores: {}", store_id, e);
+            return;
+        }
+    };
+    let Some(held_as) = crate::cloud::HeldAs::from_rows(&rows, store_id) else {
+        return;
+    };
+
+    let manager = handler.store_manager_handle();
+    let local_roots = manager.read().await.scope_roots(store_id);
+    // Only a partial replica takes roots: a whole replica holds every
+    // document already, whatever the account's grant has become since.
+    if !local_roots.is_empty() {
+        for root in held_as.roots.iter().filter(|root| !local_roots.contains(root)) {
+            if let Err(e) = manager.write().await.add_scope_root(store_id, *root).await {
+                warn!("Vault link for store {}: could not add scope root {}: {}", store_id, root, e);
+            }
+        }
+    }
+    {
+        let manager = manager.read().await;
+        if let Ok(Some(mut config)) = manager.read_sync_config(store_id).await {
+            let read_only_roots = if local_roots.is_empty() { Vec::new() } else { held_as.read_only_roots.clone() };
+            if config.access != held_as.access || config.shared_by != held_as.shared_by || config.read_only_roots != read_only_roots {
+                info!("Vault link for store {}: held as {:?} now (shared by {:?})", store_id, held_as.access, held_as.shared_by);
+                config.access = held_as.access;
+                config.shared_by = held_as.shared_by.clone();
+                config.read_only_roots = read_only_roots;
+                if let Err(e) = manager.write_sync_config(store_id, &config).await {
+                    warn!("Vault link for store {}: could not record how the store is held: {}", store_id, e);
+                }
+            }
+        }
+    }
+
+    // The scope keys: a share's recipient's shares', or the store key and,
+    // on a device that holds the whole store, the key of every share in it
+    // (the nodes that carry a share's marker): the device that made a share
+    // uploads an envelope of its key for the owner's own account too, which
+    // is how their other devices come to read what a recipient creates.
+    let (roots, shared_nodes) = {
+        let manager = manager.read().await;
+        let roots = manager.scope_roots(store_id);
+        let shared_nodes: Vec<NodeId> = match manager.tree(store_id) {
+            Ok(tree) if roots.is_empty() => tree
+                .list_node_ids()
+                .into_iter()
+                .filter(|id| tree.get_node_info(*id).is_ok_and(|info| info.custom.contains_key(pimble_core::custom_keys::SHARE)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        (roots, shared_nodes)
+    };
+    // `roots` empty is the store key's scope (`fetch_scope_keys`).
+    let mut scopes = vec![roots];
+    if !shared_nodes.is_empty() {
+        scopes.push(shared_nodes);
+    }
+    for scope in scopes {
+        if let Err(e) = fetch_scope_keys(handler, &account, store_id, &scope).await {
+            debug!("Vault link for store {}: could not fetch scope keys: {}", store_id, e);
+        }
+    }
+}
+
+/// Fetch and unwrap the scope keys the signed-in account has been handed
+/// for `store_id` (the store key when `roots` is empty, else each share's)
+/// into the keystore. An envelope is believed when the account itself or
+/// one of the store's owners, as the accounts service lists them, signed
+/// it; one that does not verify is skipped. Answers the key a link of this
+/// replica encrypts under when a document has no data key: the store key
+/// last listed, or the first share's first key; `None` when no key has
+/// reached the account (a share whose owner's devices have not been online
+/// since the grant).
+pub(crate) async fn fetch_scope_keys(
+    handler: &RpcHandler,
+    account: &crate::keystore::SignedInAccount,
+    store_id: StoreId,
+    roots: &[NodeId],
+) -> anyhow::Result<Option<Uuid>> {
+    let own_signer = account.keys.public_keys().signing;
+    let scopes: Vec<Option<&NodeId>> = if roots.is_empty() { vec![None] } else { roots.iter().map(Some).collect() };
+    let mut link_key: Option<Uuid> = None;
+    for scope in scopes {
+        let grants = crate::cloud::get_store_keys(&account.url, &account.session, &store_id.to_string(), scope).await?;
+        for grant in &grants.envelopes {
+            let Ok(key_id) = grant.key_id.parse::<Uuid>() else {
+                warn!("Store {}: the cloud service returned a bad key id {:?}; skipping it", store_id, grant.key_id);
+                continue;
+            };
+            let signer = grants.expected_signer(&grant.envelope, &own_signer);
+            match pimble_crypto::unwrap_key(&grant.envelope, &account.keys, signer) {
+                Ok(key) => {
+                    handler.keystore().add_store_key(store_id, key_id, &key).await?;
+                    // The store key: the last listed, as always. A share's:
+                    // the first root's, which is the replica's first root.
+                    if roots.is_empty() || link_key.is_none() {
+                        link_key = Some(key_id);
+                    }
+                }
+                Err(e) => warn!("Store {}: a key envelope for key {} did not verify ({}); skipping it", store_id, key_id, e),
+            }
+        }
+    }
+    Ok(link_key)
 }
 
 // ── What the remote is known to hold ────────────────────────────────────
@@ -360,6 +524,15 @@ struct ProgressFile {
     dirty_all: bool,
     #[serde(default)]
     cursor_version: u32,
+    /// The wraps of a data key this device made for a document it created
+    /// as a share's recipient, until the remote has them. Such a create has
+    /// to append first (the document is in nobody's scope until it exists)
+    /// and set the keys second; a crash between the two would leave a blob
+    /// under a key nobody can ever unwrap. The wraps are what goes to the
+    /// remote anyway, readable only with the share's key: the data key
+    /// itself is never written down.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pending_keys: HashMap<String, VaultDocKeys>,
 }
 
 struct Progress {
@@ -375,6 +548,107 @@ struct Progress {
     /// Each document's snapshot number as last known, for deciding when the
     /// next one is due.
     snapshot_seqs: HashMap<String, u64>,
+    /// The documents' data keys, in memory only.
+    keyring: Keyring,
+}
+
+/// What the link knows of the remote's documents and their data keys
+/// (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Keys"). In memory only: a
+/// data key is unwrapped on demand from the document's wraps with a scope
+/// key the keystore holds, and is gone with the process.
+#[derive(Default)]
+struct Keyring {
+    /// Each document's wraps, as `vaultFetch` last gave them.
+    wraps: HashMap<String, VaultDocKeys>,
+    /// The data key id `vaultListDocs` names for a document whose wraps
+    /// have not been fetched yet.
+    listed_dek: HashMap<String, Uuid>,
+    /// Data keys unwrapped (or made) so far: document -> (key id, key).
+    deks: HashMap<String, (Uuid, SymmetricKey)>,
+    /// The documents the remote is known to hold: listed, pulled, or
+    /// appended to by anyone. One that is not here is this device's to
+    /// create, data key and all.
+    remote_docs: HashSet<String>,
+    /// The documents read from their cursor in this connection. Anything
+    /// heard of another (it entered the scope since) is fetched whole.
+    pulled: HashSet<String>,
+    /// Blob key ids a refetch of the document's wraps did not resolve, so a
+    /// document this device cannot read is asked about once a connection,
+    /// not once an append.
+    unresolved: HashSet<(String, Uuid)>,
+    /// Documents whose last pull left a blob unread for want of its key,
+    /// with the retries they have left in this connection. A share's
+    /// recipient that creates a document can only set its keys after its
+    /// first append, so a peer that fetches in between finds a blob and no
+    /// wraps; asking again a moment later finds both. A document whose key
+    /// this device will never hold runs out of retries and waits for the
+    /// next connect.
+    unread: HashMap<String, u32>,
+}
+
+/// How often a document left unread for want of a key is asked for again
+/// within one connection.
+const UNREAD_RETRIES: u32 = 5;
+
+impl Keyring {
+    fn forget_remote(&mut self) {
+        self.wraps.clear();
+        self.listed_dek.clear();
+        self.remote_docs.clear();
+        self.pulled.clear();
+        self.unresolved.clear();
+        self.unread.clear();
+    }
+
+    fn note_wraps(&mut self, doc_id: &VaultDocId, keys: Option<VaultDocKeys>) {
+        let doc = doc_id.as_str();
+        match keys {
+            Some(keys) => {
+                // A rotation: the cached key is the old one's.
+                if self.deks.get(&doc).is_some_and(|(id, _)| *id != keys.dek_id) {
+                    self.deks.remove(&doc);
+                }
+                self.listed_dek.insert(doc.clone(), keys.dek_id);
+                self.wraps.insert(doc, keys);
+            }
+            None => {
+                self.wraps.remove(&doc);
+                self.listed_dek.remove(&doc);
+            }
+        }
+    }
+
+    /// The id of the document's data key, as far as the remote has said.
+    fn dek_id(&self, doc: &str) -> Option<Uuid> {
+        self.wraps.get(doc).map(|keys| keys.dek_id).or_else(|| self.listed_dek.get(doc).copied())
+    }
+}
+
+/// The key a blob of `doc_id` with `key_id` in its header reads with: the
+/// document's data key when the id names it (cached, or unwrapped now with
+/// whichever scope key the keystore holds among the wraps), else a scope
+/// key held directly (a blob from before data keys).
+async fn blob_key(handler: &RpcHandler, keyring: &mut Keyring, store_id: StoreId, doc_id: &VaultDocId, key_id: Uuid) -> Option<SymmetricKey> {
+    let doc = doc_id.as_str();
+    if let Some((id, key)) = keyring.deks.get(&doc) {
+        if *id == key_id {
+            return Some(key.clone());
+        }
+    }
+    if let Some(keys) = keyring.wraps.get(&doc).filter(|keys| keys.dek_id == key_id) {
+        let aad = pimble_crypto::dek_aad(&store_id.to_string(), &doc);
+        for wrap in &keys.wraps {
+            let Some(scope_key) = handler.keystore().store_key(store_id, wrap.scope_key_id).await else { continue };
+            match pimble_crypto::unwrap_dek(wrap, &scope_key, &aad) {
+                Ok(dek) => {
+                    keyring.deks.insert(doc, (key_id, dek.clone()));
+                    return Some(dek);
+                }
+                Err(e) => warn!("Vault link for store {} doc {:?}: the wrap under scope key {} did not open ({})", store_id, doc_id, wrap.scope_key_id, e),
+            }
+        }
+    }
+    handler.keystore().store_key(store_id, key_id).await
 }
 
 impl Progress {
@@ -399,7 +673,7 @@ impl Progress {
             },
             None => ProgressFile::default(),
         };
-        Self { path, file, unsaved: false, cursors: HashMap::new(), snapshot_seqs: HashMap::new() }
+        Self { path, file, unsaved: false, cursors: HashMap::new(), snapshot_seqs: HashMap::new(), keyring: Keyring::default() }
     }
 
     fn cursor(&mut self, doc_id: &VaultDocId) -> &mut VaultCursor {
@@ -613,6 +887,7 @@ async fn full_reconcile(
         info!("Vault link for store {}: reading every document's log once from the start", store_id);
     }
     progress.cursors.clear();
+    settle_pending_keys(client, store_id, progress).await;
     let mut remote_heads: HashMap<VaultDocId, u64> = HashMap::new();
     for doc in remote_docs {
         if doc.doc_id == VaultDocId::Tree {
@@ -625,6 +900,10 @@ async fn full_reconcile(
         let applied_through = if refetch_all { 0 } else { read_last_seq(handler, store_id, &doc.doc_id).await };
         progress.cursors.insert(doc.doc_id.as_str(), VaultCursor::starting_at(applied_through));
         progress.note_snapshot(&doc.doc_id, doc.snapshot_seq);
+        progress.keyring.remote_docs.insert(doc.doc_id.as_str());
+        if let Some(dek_id) = doc.dek_id {
+            progress.keyring.listed_dek.insert(doc.doc_id.as_str(), dek_id);
+        }
         remote_heads.insert(doc.doc_id, doc.head);
     }
 
@@ -634,13 +913,36 @@ async fn full_reconcile(
     // Every document is in before the tree is judged (see `Repair::Later`).
     handler.repair_store_tree(store_id).await;
 
-    let doc_ids: Vec<VaultDocId> = {
+    // Held as a reader: nothing is pushed, and nothing marked is forgotten
+    // (a repair this replica made for itself goes out if the role changes).
+    let (doc_ids, access, partial): (Vec<VaultDocId>, StoreAccess, bool) = {
         let manager = handler.store_manager_handle();
         let manager = manager.read().await;
-        manager.doc_ids(store_id).map(|ids| ids.into_iter().map(VaultDocId::Node).collect()).unwrap_or_default()
+        (
+            manager.doc_ids(store_id).map(|ids| ids.into_iter().map(VaultDocId::Node).collect()).unwrap_or_default(),
+            manager.store_access(store_id),
+            !manager.scope_roots(store_id).is_empty(),
+        )
     };
+    if !access.allows_write() {
+        if progress.file.cursor_version != CURSOR_VERSION {
+            progress.file.cursor_version = CURSOR_VERSION;
+            progress.unsaved = true;
+        }
+        progress.save_if_unsaved().await;
+        return Ok(());
+    }
+    let mut refused = false;
     for doc_id in doc_ids {
         let unseen = remote_heads.get(&doc_id).copied().unwrap_or(0) == 0;
+        // To a share's recipient "not listed" is also what a document its
+        // owner moved out of the share looks like: held here, no longer
+        // this account's. Only one that changed here is offered (a create
+        // made while the link was down); the remote refuses the other kind,
+        // and it stays marked.
+        if partial && unseen && !progress.is_dirty(&doc_id) {
+            continue;
+        }
         let known = if unseen { pimble_crdt::empty_state_vector() } else { progress.known(&doc_id) };
         let (local_sv, diff) = doc_diff(handler, store_id, &doc_id, &known).await?;
         // An undecodable vector reads as "ahead": pushing too much is a
@@ -656,11 +958,29 @@ async fn full_reconcile(
             );
             continue;
         }
-        append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, &diff, echoes, progress).await?;
-        progress.set_known(&doc_id, &local_sv);
-        progress.clear_dirty(&doc_id);
+        // A document's first blob is its whole state (`save`: what a diff
+        // from an empty vector leaves out, pending updates, rides along).
+        match append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, &diff, echoes, progress).await? {
+            Appended::Yes => {
+                progress.set_known(&doc_id, &local_sv);
+                progress.clear_dirty(&doc_id);
+            }
+            Appended::Refused => {
+                progress.mark_dirty(&doc_id);
+                refused = true;
+            }
+        }
     }
-    progress.clear_all_dirty();
+    if refused {
+        // `dirty_all` stood for every document; the refused ones are
+        // marked one by one now, so it can go and they stay.
+        if progress.file.dirty_all {
+            progress.file.dirty_all = false;
+            progress.unsaved = true;
+        }
+    } else {
+        progress.clear_all_dirty();
+    }
     if progress.file.cursor_version != CURSOR_VERSION {
         progress.file.cursor_version = CURSOR_VERSION;
         progress.unsaved = true;
@@ -676,27 +996,70 @@ async fn full_reconcile(
 /// caller repairs once every document is pulled.
 async fn pull_doc(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, doc_id: &VaultDocId, link_id: &str, progress: &mut Progress) -> anyhow::Result<()> {
     let after_seq = progress.cursor(doc_id).applied_through();
-    let fetch = client
-        .vault_fetch(store_id, doc_id.clone(), after_seq)
-        .await
-        .map_err(|e| anyhow::anyhow!("remote vaultFetch for {:?} failed: {}", doc_id, e))?;
+    let fetch = match client.vault_fetch(store_id, doc_id.clone(), after_seq).await {
+        Ok(fetch) => fetch,
+        // Listed a moment ago and out of the scope now (its owner moved it
+        // out of the share): not this replica's to read any more.
+        Err(e) if is_refusal(&e) => {
+            debug!("Vault link for store {} doc {:?}: fetch refused ({}); leaving it", store_id, doc_id, e);
+            return Ok(());
+        }
+        Err(e) => return Err(anyhow::anyhow!("remote vaultFetch for {:?} failed: {}", doc_id, e)),
+    };
+    progress.keyring.remote_docs.insert(doc_id.as_str());
+    progress.keyring.pulled.insert(doc_id.as_str());
+    progress.keyring.note_wraps(doc_id, fetch.keys.clone());
 
+    let mut wants_a_key = false;
     if let Some(entry) = &fetch.snapshot {
         progress.note_snapshot(doc_id, entry.seq);
-        if let Some(update) = apply_blob_locally(handler, store_id, doc_id, &entry.blob, link_id, Repair::Later).await? {
-            progress.advance(doc_id, &update);
-            progress.cursor(doc_id).mark_through(entry.seq);
+        match apply_blob_locally(handler, &mut progress.keyring, store_id, doc_id, &entry.blob, link_id, Repair::Later).await? {
+            Applying::Applied(update) => {
+                progress.advance(doc_id, &update);
+                progress.cursor(doc_id).mark_through(entry.seq);
+            }
+            Applying::UnknownKey(_) => wants_a_key = true,
+            Applying::Skipped => {}
         }
     }
     for entry in &fetch.updates {
-        if let Some(update) = apply_blob_locally(handler, store_id, doc_id, &entry.blob, link_id, Repair::Later).await? {
-            progress.advance(doc_id, &update);
-            progress.cursor(doc_id).mark(entry.seq);
+        match apply_blob_locally(handler, &mut progress.keyring, store_id, doc_id, &entry.blob, link_id, Repair::Later).await? {
+            Applying::Applied(update) => {
+                progress.advance(doc_id, &update);
+                progress.cursor(doc_id).mark(entry.seq);
+            }
+            Applying::UnknownKey(_) => wants_a_key = true,
+            Applying::Skipped => {}
         }
+    }
+    if wants_a_key {
+        progress.keyring.unread.entry(doc_id.as_str()).or_insert(UNREAD_RETRIES);
+    } else {
+        progress.keyring.unread.remove(&doc_id.as_str());
     }
     let applied_through = progress.cursor(doc_id).applied_through();
     record_last_seq(handler, store_id, doc_id, applied_through).await;
     Ok(())
+}
+
+/// What became of one blob.
+enum Applying {
+    /// Decrypted and merged: the update, for the caller to record that the
+    /// remote holds it.
+    Applied(Vec<u8>),
+    /// No key this device can find opens it (its header's key id).
+    UnknownKey(Uuid),
+    /// Malformed, undecryptable under the key its header names, or the
+    /// retired tree document's: logged, never fatal to the link.
+    Skipped,
+}
+
+/// Whether the remote refused a call for this one document (it is out of
+/// the account's scope now, or under a root the account only reads) as
+/// opposed to failing: the document is left for later and the link stays up.
+fn is_refusal(error: &pimble_client::ClientError) -> bool {
+    let message = error.to_string();
+    message.contains(crate::principal::NO_GRANT_FOR_DOCUMENT) || StoreAccess::refusal_in(&message).is_some()
 }
 
 /// Decrypt one base64url blob and apply it locally through the handler's
@@ -704,13 +1067,18 @@ async fn pull_doc(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId
 /// is logged and skipped, never fatal to the link (docs/CRYPTO_CONTRACT.md:
 /// "a blob with an unknown key id is logged and skipped"); so is a blob of
 /// the retired tree document.
-///
-/// Returns the decrypted update when it was applied, `None` when the blob was
-/// skipped, so the caller can record that the remote holds it.
-async fn apply_blob_locally(handler: &RpcHandler, store_id: StoreId, doc_id: &VaultDocId, blob_b64url: &str, link_id: &str, repair: Repair) -> anyhow::Result<Option<Vec<u8>>> {
+async fn apply_blob_locally(
+    handler: &RpcHandler,
+    keyring: &mut Keyring,
+    store_id: StoreId,
+    doc_id: &VaultDocId,
+    blob_b64url: &str,
+    link_id: &str,
+    repair: Repair,
+) -> anyhow::Result<Applying> {
     let VaultDocId::Node(node_id) = doc_id else {
         debug!("Vault link for store {}: skipping a blob of the retired tree document", store_id);
-        return Ok(None);
+        return Ok(Applying::Skipped);
     };
 
     let blob = URL_SAFE_NO_PAD
@@ -721,12 +1089,12 @@ async fn apply_blob_locally(handler: &RpcHandler, store_id: StoreId, doc_id: &Va
         Ok(id) => id,
         Err(e) => {
             warn!("Vault link for store {} doc {:?}: malformed blob header ({}); skipping it", store_id, doc_id, e);
-            return Ok(None);
+            return Ok(Applying::Skipped);
         }
     };
-    let Some(key) = handler.keystore().store_key(store_id, key_id).await else {
+    let Some(key) = blob_key(handler, keyring, store_id, doc_id, key_id).await else {
         warn!("Vault link for store {} doc {:?}: no key held for key id {}; skipping this blob", store_id, doc_id, key_id);
-        return Ok(None);
+        return Ok(Applying::UnknownKey(key_id));
     };
 
     let aad = pimble_crypto::blob_aad(&store_id.to_string(), &doc_id.as_str());
@@ -734,7 +1102,7 @@ async fn apply_blob_locally(handler: &RpcHandler, store_id: StoreId, doc_id: &Va
         Ok(bytes) => bytes,
         Err(e) => {
             warn!("Vault link for store {} doc {:?}: decryption failed ({}); skipping this blob", store_id, doc_id, e);
-            return Ok(None);
+            return Ok(Applying::Skipped);
         }
     };
 
@@ -742,13 +1110,14 @@ async fn apply_blob_locally(handler: &RpcHandler, store_id: StoreId, doc_id: &Va
         .apply_node_update_from(store_id, *node_id, &plaintext, Some(link_id), repair)
         .await
         .map_err(|e| anyhow::anyhow!("local applyEdit for node {} failed: {}", node_id, e.message()))?;
-    Ok(Some(plaintext))
+    Ok(Applying::Applied(plaintext))
 }
 
 // ── Remote -> local (live) ───────────────────────────────────────────────
 
 async fn handle_remote_notification(
     handler: &RpcHandler,
+    client: &PimbleClient,
     store_id: StoreId,
     link_id: &str,
     notif: StoreChangedNotification,
@@ -786,9 +1155,31 @@ async fn handle_remote_notification(
         warn!("Vault link for store {} doc {:?}: VaultAppended with no blob; skipping", store_id, doc_id);
         return Ok(());
     };
-    if let Some(update) = apply_blob_locally(handler, store_id, doc_id, blob, link_id, Repair::Debounced).await? {
-        progress.advance(doc_id, &update);
-        progress.cursor(doc_id).mark(*seq);
+    progress.keyring.remote_docs.insert(doc_id.as_str());
+
+    // A document not read in this connection is one that entered this
+    // account's scope since (created by another member, or moved into the
+    // share): what came before this append never reached this replica, so
+    // it is read from its cursor, which brings its wraps too.
+    if !progress.keyring.pulled.contains(&doc_id.as_str()) {
+        pull_doc(handler, client, store_id, doc_id, link_id, progress).await?;
+        // Debounced like any live structural update: a create is two
+        // documents' appends, and the parent's list is the next one.
+        handler.schedule_repair(store_id);
+        return Ok(());
+    }
+
+    match apply_blob_locally(handler, &mut progress.keyring, store_id, doc_id, blob, link_id, Repair::Debounced).await? {
+        Applying::Applied(update) => {
+            progress.advance(doc_id, &update);
+            progress.cursor(doc_id).mark(*seq);
+        }
+        // A data key this link has not seen: the document was given one (or
+        // a new one) since its wraps were fetched. Once per key.
+        Applying::UnknownKey(key_id) if progress.keyring.unresolved.insert((doc_id.as_str(), key_id)) => {
+            return pull_doc(handler, client, store_id, doc_id, link_id, progress).await;
+        }
+        Applying::UnknownKey(_) | Applying::Skipped => {}
     }
     let applied_through = progress.cursor(doc_id).applied_through();
     record_last_seq(handler, store_id, doc_id, applied_through).await;
@@ -817,6 +1208,13 @@ async fn forward_local_change(
     let Some(doc_id) = changed_doc(store_id, link_id, &LocalChange::Store(notif.clone())) else {
         return Ok(());
     };
+    // Held as a reader: the local server refuses a person's write, so what
+    // arrives here is this replica's own upkeep (a repair). It stays here,
+    // marked, and goes out if the role ever changes.
+    if !handler.store_manager_handle().read().await.store_access(store_id).allows_write() {
+        progress.mark_dirty(&doc_id);
+        return Ok(());
+    }
     match notif.update {
         Some(update_b64) => {
             let plaintext = STANDARD.decode(update_b64)?;
@@ -829,6 +1227,133 @@ async fn forward_local_change(
         }
     }
     Ok(())
+}
+
+/// Whether an append went out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Appended {
+    Yes,
+    /// The remote refused this document (see [`is_refusal`]), or this
+    /// device holds no key it may write it under: left for a later connect.
+    Refused,
+}
+
+/// How a blob of one document goes out.
+enum Seal {
+    /// Under this key: the document's data key, or, for a document without
+    /// one, the link's scope key as before data keys.
+    With { key_id: Uuid, key: SymmetricKey },
+    /// The remote has never seen the document: this device creates it, with
+    /// a data key of its own making wrapped under every scope key it holds
+    /// that covers the node.
+    Create { dek_id: Uuid, dek: SymmetricKey, keys: VaultDocKeys, parent_id: Option<NodeId>, partial: bool },
+    /// The document has a data key and no wrap this device can open.
+    Unreadable,
+}
+
+/// Decide how `doc_id`'s next blob is sealed (module doc, "Keys").
+async fn seal_plan(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, doc_id: &VaultDocId, link_key_id: Uuid, progress: &mut Progress) -> anyhow::Result<Seal> {
+    let doc = doc_id.as_str();
+    let VaultDocId::Node(node_id) = doc_id else {
+        return Err(anyhow::anyhow!("the tree document is retired; nothing is written to it"));
+    };
+
+    if progress.keyring.remote_docs.contains(&doc) {
+        // Wraps are fetched with the document; one only listed so far, or
+        // heard of through another device's append, is asked for now.
+        if progress.keyring.dek_id(&doc).is_some() && !progress.keyring.wraps.contains_key(&doc) {
+            match client.vault_fetch(store_id, doc_id.clone(), u64::MAX).await {
+                Ok(fetch) => progress.keyring.note_wraps(doc_id, fetch.keys),
+                Err(e) if is_refusal(&e) => return Ok(Seal::Unreadable),
+                Err(e) => return Err(anyhow::anyhow!("remote vaultFetch for {:?} failed: {}", doc_id, e)),
+            }
+        }
+        return Ok(match progress.keyring.dek_id(&doc) {
+            Some(dek_id) => match blob_key(handler, &mut progress.keyring, store_id, doc_id, dek_id).await {
+                Some(key) => Seal::With { key_id: dek_id, key },
+                None => Seal::Unreadable,
+            },
+            // From before data keys: under the scope key, as it always was,
+            // until its owner gives it a data key. A recipient never makes
+            // keys for a document that exists.
+            None => match handler.keystore().store_key(store_id, link_key_id).await {
+                Some(key) => Seal::With { key_id: link_key_id, key },
+                None => return Err(anyhow::anyhow!("no local key held for store {} key id {}; cannot encrypt an outgoing update", store_id, link_key_id)),
+            },
+        });
+    }
+
+    // A new document. The scope keys that cover it: the store key on a
+    // whole replica (this device holds it: it is the owner's, or a member's
+    // of the whole store), and the key of every share the node is under
+    // that this device holds, which the share's root names in its marker.
+    let (partial, parent_id, marker_keys) = {
+        let manager = handler.store_manager_handle();
+        let manager = manager.read().await;
+        let partial = !manager.scope_roots(store_id).is_empty();
+        let tree = manager.tree(store_id).map_err(|e| anyhow::anyhow!("store unavailable: {}", e))?;
+        let parent_id = tree.doc(*node_id).and_then(|doc| doc.fields().ok()).and_then(|fields| fields.parent_id);
+        let mut marker_keys = Vec::new();
+        let mut cur = Some(*node_id);
+        for _ in 0..=tree.ids().len() {
+            let Some(fields) = cur.and_then(|id| tree.doc(id)).and_then(|doc| doc.fields().ok()) else { break };
+            if let Some(marker) = fields.custom.get(pimble_core::custom_keys::SHARE).and_then(|v| serde_json::from_value::<pimble_core::ShareMarker>(v.clone()).ok()) {
+                marker_keys.push(marker.key_id);
+            }
+            cur = fields.parent_id;
+        }
+        (partial, parent_id, marker_keys)
+    };
+    let mut scope_key_ids: Vec<Uuid> = if partial { Vec::new() } else { vec![link_key_id] };
+    scope_key_ids.extend(marker_keys);
+    if partial && scope_key_ids.is_empty() {
+        // No marker on the way up (a share from before markers, or a root
+        // whose document has not arrived): the key this replica was added
+        // with is its share's.
+        scope_key_ids.push(link_key_id);
+    }
+
+    let dek = SymmetricKey::generate();
+    let dek_id = Uuid::new_v4();
+    let aad = pimble_crypto::dek_aad(&store_id.to_string(), &doc);
+    let mut wraps = Vec::new();
+    for scope_key_id in scope_key_ids {
+        if wraps.iter().any(|w: &pimble_crypto::WrappedDek| w.scope_key_id == scope_key_id) {
+            continue;
+        }
+        if let Some(scope_key) = handler.keystore().store_key(store_id, scope_key_id).await {
+            wraps.push(pimble_crypto::wrap_dek(&dek, &scope_key, scope_key_id, &aad));
+        }
+    }
+    if wraps.is_empty() {
+        return Err(anyhow::anyhow!("no scope key held for store {}; cannot encrypt a new document", store_id));
+    }
+    Ok(Seal::Create { dek_id, dek, keys: VaultDocKeys { dek_id, wraps }, parent_id, partial })
+}
+
+/// Hand the remote the wraps a crash (or a dropped connection) kept from it
+/// (see `ProgressFile::pending_keys`). One the remote refuses belongs to a
+/// create that never landed, and the next push of that document makes keys
+/// anew.
+async fn settle_pending_keys(client: &PimbleClient, store_id: StoreId, progress: &mut Progress) {
+    let pending: Vec<(String, VaultDocKeys)> = progress.file.pending_keys.iter().map(|(doc, keys)| (doc.clone(), keys.clone())).collect();
+    for (doc, keys) in pending {
+        let Some(doc_id) = VaultDocId::parse(&doc) else {
+            progress.file.pending_keys.remove(&doc);
+            progress.unsaved = true;
+            continue;
+        };
+        match client.vault_set_doc_keys(store_id, doc_id.clone(), keys).await {
+            Ok(()) => {}
+            Err(e) if is_refusal(&e) => debug!("Vault link for store {} doc {:?}: pending keys refused ({}); dropping them", store_id, doc_id, e),
+            Err(e) => {
+                debug!("Vault link for store {} doc {:?}: pending keys not set yet: {}", store_id, doc_id, e);
+                continue;
+            }
+        }
+        progress.file.pending_keys.remove(&doc);
+        progress.unsaved = true;
+    }
 }
 
 /// Encrypt `plaintext` and append it to `doc_id`'s vault log, recording the
@@ -845,24 +1370,77 @@ async fn append_blob(
     plaintext: &[u8],
     echoes: &Arc<EchoTracker>,
     progress: &mut Progress,
-) -> anyhow::Result<()> {
-    let Some(key) = handler.keystore().store_key(store_id, key_id).await else {
-        return Err(anyhow::anyhow!("no local key held for store {} key id {}; cannot encrypt an outgoing update", store_id, key_id));
+) -> anyhow::Result<Appended> {
+    let doc = doc_id.as_str();
+    let aad = pimble_crypto::blob_aad(&store_id.to_string(), &doc);
+    let plan = seal_plan(handler, client, store_id, &doc_id, key_id, progress).await?;
+    let (blob, created) = match &plan {
+        Seal::With { key_id, key } => (Blob::encrypt(key, *key_id, &aad, plaintext), None),
+        Seal::Create { dek_id, dek, keys, parent_id, partial } => (Blob::encrypt(dek, *dek_id, &aad, plaintext), Some((keys, *parent_id, *partial))),
+        Seal::Unreadable => {
+            warn!("Vault link for store {} doc {:?}: no wrap of its data key opens here; leaving the update for later", store_id, doc_id);
+            return Ok(Appended::Refused);
+        }
     };
-    let aad = pimble_crypto::blob_aad(&store_id.to_string(), &doc_id.as_str());
-    let blob = Blob::encrypt(&key, key_id, &aad, plaintext);
     let blob_b64 = URL_SAFE_NO_PAD.encode(&blob);
+
+    // A whole replica sets a new document's keys before its first blob, so
+    // no blob is ever on the remote under a key the remote has no wrap of.
+    // A share's recipient cannot: the document is in nobody's scope until
+    // its first append, naming its parent, puts it there. Its wraps wait in
+    // `vault-link.json` from before the append until the remote has them.
+    if let Some((keys, _, partial)) = &created {
+        if *partial {
+            progress.file.pending_keys.insert(doc.clone(), (*keys).clone());
+            progress.unsaved = true;
+            progress.save_if_unsaved().await;
+        } else {
+            match client.vault_set_doc_keys(store_id, doc_id.clone(), (*keys).clone()).await {
+                Ok(()) => {}
+                Err(e) if is_refusal(&e) => {
+                    debug!("Vault link for store {} doc {:?}: keys refused ({}); leaving the document for later", store_id, doc_id, e);
+                    return Ok(Appended::Refused);
+                }
+                Err(e) => return Err(anyhow::anyhow!("remote vaultSetDocKeys for {:?} failed: {}", doc_id, e)),
+            }
+        }
+    }
 
     // Attributed to this link's own id (`PimbleClient::vault_append_from`)
     // so the notification it produces is dropped by identity if it echoes
     // back through this link's own subscription; the seen-seq set below is
     // kept as a second guard for anything that reaches the server without a
-    // `client_id`.
-    let seq = client
-        .vault_append_from(store_id, doc_id.clone(), blob_b64, Some(link_id.to_string()))
-        .await
-        .map_err(|e| anyhow::anyhow!("remote vaultAppend for {:?} failed: {}", doc_id, e))?;
+    // `client_id`. A new document names its parent, which is what admits a
+    // scoped member's create (and is ignored for anyone else's).
+    let parent_id = created.as_ref().and_then(|(_, parent_id, _)| *parent_id);
+    let seq = match client.vault_append_new(store_id, doc_id.clone(), blob_b64, Some(link_id.to_string()), parent_id).await {
+        Ok(seq) => seq,
+        Err(e) if is_refusal(&e) => {
+            debug!("Vault link for store {} doc {:?}: append refused ({}); leaving the document for later", store_id, doc_id, e);
+            if progress.file.pending_keys.remove(&doc).is_some() {
+                progress.unsaved = true;
+            }
+            return Ok(Appended::Refused);
+        }
+        Err(e) => return Err(anyhow::anyhow!("remote vaultAppend for {:?} failed: {}", doc_id, e)),
+    };
     echoes.remember(&doc_id, seq);
+    progress.keyring.remote_docs.insert(doc.clone());
+    progress.keyring.pulled.insert(doc.clone());
+    if let Seal::Create { dek_id, dek, keys, partial, .. } = plan {
+        progress.keyring.deks.insert(doc.clone(), (dek_id, dek));
+        if partial {
+            // Failing here fails the link; the wraps are on disk and the
+            // next connect hands them over (`settle_pending_keys`).
+            client
+                .vault_set_doc_keys(store_id, doc_id.clone(), keys.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("remote vaultSetDocKeys for {:?} failed: {}", doc_id, e))?;
+            progress.file.pending_keys.remove(&doc);
+            progress.unsaved = true;
+        }
+        progress.keyring.note_wraps(&doc_id, Some(keys));
+    }
     progress.cursor(&doc_id).mark(seq);
     let applied_through = progress.cursor(&doc_id).applied_through();
     record_last_seq(handler, store_id, &doc_id, applied_through).await;
@@ -875,10 +1453,10 @@ async fn append_blob(
     // below `seq` and the snapshot waits for a later append.
     let due = seq.saturating_sub(progress.snapshot_seq(&doc_id)) >= SNAPSHOT_EVERY;
     if due && applied_through == seq {
-        upload_snapshot(handler, client, store_id, doc_id.clone(), key_id, seq).await?;
+        upload_snapshot(handler, client, store_id, doc_id.clone(), key_id, seq, progress).await?;
         progress.note_snapshot(&doc_id, seq);
     }
-    Ok(())
+    Ok(Appended::Yes)
 }
 
 /// Append one local update as it arrived, and record that the remote holds it.
@@ -894,8 +1472,17 @@ async fn push_update(
     echoes: &Arc<EchoTracker>,
     progress: &mut Progress,
 ) -> anyhow::Result<()> {
-    append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, plaintext, echoes, progress).await?;
-    progress.advance(&doc_id, plaintext);
+    // The first blob of a document the remote has never seen has to be the
+    // whole document: the update in hand is the last of however many made
+    // it (a create is several transactions), and the ones before it were
+    // never anyone's to push.
+    if !progress.keyring.remote_docs.contains(&doc_id.as_str()) {
+        return push_full(handler, client, store_id, doc_id, key_id, link_id, echoes, progress).await;
+    }
+    match append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, plaintext, echoes, progress).await? {
+        Appended::Yes => progress.advance(&doc_id, plaintext),
+        Appended::Refused => progress.mark_dirty(&doc_id),
+    }
     Ok(())
 }
 
@@ -913,9 +1500,13 @@ async fn push_full(
     progress: &mut Progress,
 ) -> anyhow::Result<()> {
     let (local_sv, state) = full_doc_state(handler, store_id, &doc_id).await?;
-    append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, &state, echoes, progress).await?;
-    progress.set_known(&doc_id, &local_sv);
-    progress.clear_dirty(&doc_id);
+    match append_blob(handler, client, store_id, doc_id.clone(), key_id, link_id, &state, echoes, progress).await? {
+        Appended::Yes => {
+            progress.set_known(&doc_id, &local_sv);
+            progress.clear_dirty(&doc_id);
+        }
+        Appended::Refused => progress.mark_dirty(&doc_id),
+    }
     Ok(())
 }
 
@@ -950,20 +1541,79 @@ async fn full_doc_state(handler: &RpcHandler, store_id: StoreId, doc_id: &VaultD
     Ok((doc.state_vector(), doc.save()))
 }
 
-async fn upload_snapshot(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, doc_id: VaultDocId, key_id: Uuid, upto_seq: u64) -> anyhow::Result<()> {
-    let Some(key) = handler.keystore().store_key(store_id, key_id).await else {
-        return Ok(()); // Can't snapshot without the key; the log still has everything.
+async fn upload_snapshot(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, doc_id: VaultDocId, key_id: Uuid, upto_seq: u64, progress: &mut Progress) -> anyhow::Result<()> {
+    // Under the key the document's blobs go out under (it exists by now, so
+    // never a create). Can't snapshot without it; the log still has
+    // everything.
+    let Seal::With { key_id, key } = seal_plan(handler, client, store_id, &doc_id, key_id, progress).await? else {
+        return Ok(());
     };
     let (_, plaintext) = full_doc_state(handler, store_id, &doc_id).await?;
     let aad = pimble_crypto::blob_aad(&store_id.to_string(), &doc_id.as_str());
     let blob = Blob::encrypt(&key, key_id, &aad, &plaintext);
     let blob_b64 = URL_SAFE_NO_PAD.encode(&blob);
-    client
-        .vault_snapshot(store_id, doc_id.clone(), upto_seq, blob_b64)
-        .await
-        .map_err(|e| anyhow::anyhow!("remote vaultSnapshot for {:?} failed: {}", doc_id, e))?;
+    match client.vault_snapshot(store_id, doc_id.clone(), upto_seq, blob_b64).await {
+        Ok(()) => {}
+        Err(e) if is_refusal(&e) => {
+            debug!("Vault link for store {} doc {:?}: snapshot refused ({}); the log keeps everything", store_id, doc_id, e);
+            return Ok(());
+        }
+        Err(e) => return Err(anyhow::anyhow!("remote vaultSnapshot for {:?} failed: {}", doc_id, e)),
+    }
     debug!("Vault link for store {} uploaded a snapshot for doc {:?} up to seq {}", store_id, doc_id, upto_seq);
     Ok(())
+}
+
+/// What a connection's first pass could not finish, asked for again on a
+/// timer. Answers whether anything new was read.
+///
+/// - A document left unread for want of its key (see `Keyring::unread`).
+/// - A share's recipient holds a list that names a child it does not hold:
+///   a document another member created whose append was sent before it was
+///   in the scope, or one its owner moved into the share (the scope is
+///   published a moment after the tree edit, docs/NODE_DOCUMENT_CONTRACT.md
+///   section 5: "a fetch that fails and is retried on the next set
+///   publish"). Nothing announces a publish, so the remote is asked what it
+///   lists now, and whatever is new is read. A whole replica awaits
+///   nothing: what its lists name and it does not hold is missing, and
+///   repair's to settle.
+async fn pull_pending(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, link_id: &str, progress: &mut Progress) -> anyhow::Result<bool> {
+    let mut pulled = false;
+
+    let unread: Vec<String> = progress.keyring.unread.iter().filter(|(_, left)| **left > 0).map(|(doc, _)| doc.clone()).collect();
+    for doc in unread {
+        if let Some(left) = progress.keyring.unread.get_mut(&doc) {
+            *left -= 1;
+        }
+        let Some(doc_id) = VaultDocId::parse(&doc) else { continue };
+        pull_doc(handler, client, store_id, &doc_id, link_id, progress).await?;
+        pulled |= !progress.keyring.unread.contains_key(&doc);
+    }
+
+    let awaited = {
+        let manager = handler.store_manager_handle();
+        let manager = manager.read().await;
+        manager.awaited_docs(store_id)
+    };
+    if !awaited.is_empty() {
+        let listed = client.vault_list_docs(store_id).await.map_err(|e| anyhow::anyhow!("remote vaultListDocs failed: {}", e))?;
+        for doc in listed {
+            if doc.doc_id == VaultDocId::Tree || progress.keyring.pulled.contains(&doc.doc_id.as_str()) {
+                continue;
+            }
+            progress.keyring.remote_docs.insert(doc.doc_id.as_str());
+            if let Some(dek_id) = doc.dek_id {
+                progress.keyring.listed_dek.insert(doc.doc_id.as_str(), dek_id);
+            }
+            progress.note_snapshot(&doc.doc_id, doc.snapshot_seq);
+            pull_doc(handler, client, store_id, &doc.doc_id, link_id, progress).await?;
+            pulled = true;
+        }
+    }
+    if pulled {
+        handler.repair_store_tree(store_id).await;
+    }
+    Ok(pulled)
 }
 
 // ── Echo tracking (decision: docs/CRYPTO_CONTRACT.md "remembering its own

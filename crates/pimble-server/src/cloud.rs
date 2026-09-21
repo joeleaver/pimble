@@ -156,6 +156,85 @@ pub struct StoreView {
     pub role: String,
     pub kind: String,
     pub created_at: String,
+    /// The shared node when the grant is a share of one subtree
+    /// (docs/NODE_DOCUMENT_CONTRACT.md section 5), absent for a whole-store
+    /// grant. Defaulted so a service from before scopes still parses.
+    #[serde(default)]
+    pub root: Option<String>,
+    /// An owner's email when the account is not an owner of the store.
+    #[serde(default)]
+    pub shared_by: Option<String>,
+}
+
+impl StoreView {
+    /// The shared node as a `NodeId`, if the row names one it can parse.
+    pub fn scope_root(&self) -> Option<pimble_core::NodeId> {
+        self.root.as_deref().and_then(|r| pimble_core::NodeId::parse(r).ok())
+    }
+
+    /// What a device with this grant may change (`Store::access`): a reader
+    /// reads, everyone else edits what they reach.
+    pub fn access(&self) -> pimble_core::StoreAccess {
+        if self.role == "reader" {
+            pimble_core::StoreAccess::Read
+        } else {
+            pimble_core::StoreAccess::Full
+        }
+    }
+}
+
+/// How the signed-in account holds one store, read off its `GET /stores`
+/// rows (one per grant): the whole of it, or the shares of it it was given
+/// (docs/NODE_DOCUMENT_CONTRACT.md section 5). What `sync.json` and the
+/// manifest of the replica here are written from, at `cloudAddHostedStore`
+/// and again at every connect of its vault link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldAs {
+    /// A share's name for a share (the owner's store name never reaches a
+    /// recipient), the store's otherwise. `None` when no row names the store.
+    pub name: Option<String>,
+    /// The shared nodes; empty for the whole store. A whole-store grant
+    /// wins over any share of the same store, as it does in the token.
+    pub roots: Vec<pimble_core::NodeId>,
+    /// The roots among them held as a reader, when others are edited.
+    pub read_only_roots: Vec<pimble_core::NodeId>,
+    /// `Read` when nothing the account holds of the store may be written.
+    pub access: pimble_core::StoreAccess,
+    pub shared_by: Option<String>,
+}
+
+impl HeldAs {
+    /// One's own store, just hosted.
+    pub fn owner() -> Self {
+        Self { name: None, roots: Vec::new(), read_only_roots: Vec::new(), access: pimble_core::StoreAccess::Full, shared_by: None }
+    }
+
+    /// `None` when no row names the store (nothing is known of how it is
+    /// held; the hosted server's answer to the token decides what really is).
+    pub fn from_rows(rows: &[StoreView], store_id: pimble_core::StoreId) -> Option<Self> {
+        let id = store_id.to_string();
+        let rows: Vec<&StoreView> = rows.iter().filter(|row| row.store_id == id).collect();
+        if let Some(whole) = rows.iter().find(|row| row.root.is_none()) {
+            return Some(Self {
+                name: Some(whole.name.clone()),
+                roots: Vec::new(),
+                read_only_roots: Vec::new(),
+                access: whole.access(),
+                shared_by: whole.shared_by.clone(),
+            });
+        }
+        let shares: Vec<(pimble_core::NodeId, &StoreView)> = rows.iter().filter_map(|row| Some((row.scope_root()?, *row))).collect();
+        let (_, first) = shares.first()?;
+        let reads = |row: &StoreView| row.access() == pimble_core::StoreAccess::Read;
+        let all_read = shares.iter().all(|(_, row)| reads(row));
+        Some(Self {
+            name: Some(first.name.clone()),
+            roots: shares.iter().map(|(root, _)| *root).collect(),
+            read_only_roots: if all_read { Vec::new() } else { shares.iter().filter(|(_, row)| reads(row)).map(|(root, _)| *root).collect() },
+            access: if all_read { pimble_core::StoreAccess::Read } else { pimble_core::StoreAccess::Full },
+            shared_by: first.shared_by.clone(),
+        })
+    }
 }
 
 pub async fn create_store(base_url: &str, session: &str, name: &str, kind: &str, store_id: Option<&str>) -> Result<StoreView> {
@@ -174,13 +253,53 @@ pub struct KeyGrantView {
     pub envelope: KeyEnvelope,
 }
 
+/// An account whose signature on an envelope for this store is to be
+/// believed: an owner. A share's recipient is handed the key by whichever
+/// of the owner's devices gets to it, so "signed by me" is not the only
+/// legitimate signer any more.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignerView {
+    pub user_id: String,
+    pub email: String,
+    pub public_signing_key: String,
+}
+
 #[derive(Deserialize)]
 pub struct KeyGrantsResponse {
     pub envelopes: Vec<KeyGrantView>,
+    /// Defaulted so a service from before sharing still parses; then only
+    /// the account's own signature is believed.
+    #[serde(default)]
+    pub signers: Vec<SignerView>,
 }
 
-pub async fn get_store_keys(base_url: &str, session: &str, store_id: &str) -> Result<KeyGrantsResponse> {
-    get(&endpoint(base_url, &format!("/api/v1/stores/{store_id}/keys")), Some(session)).await
+impl KeyGrantsResponse {
+    /// The signer an envelope may be verified against: the account's own
+    /// signing key, or a listed signer's, whichever the envelope names; an
+    /// envelope naming neither is checked against the account's own and so
+    /// refused by `unwrap_key`'s signature check.
+    pub fn expected_signer<'a>(&'a self, envelope: &'a KeyEnvelope, own_signer: &'a str) -> &'a str {
+        if envelope.signer == own_signer {
+            return own_signer;
+        }
+        self.signers
+            .iter()
+            .find(|s| s.public_signing_key == envelope.signer)
+            .map(|s| s.public_signing_key.as_str())
+            .unwrap_or(own_signer)
+    }
+}
+
+/// `?root=<node id>` where a scope is meant (a share), nothing for the whole
+/// store: how every scoped endpoint of the accounts service takes it.
+fn root_query(root: Option<&pimble_core::NodeId>) -> String {
+    root.map(|root| format!("?root={root}")).unwrap_or_default()
+}
+
+/// The caller's own key envelopes for a scope: the store key without a
+/// `root`, that share's key with one; and the signers to believe.
+pub async fn get_store_keys(base_url: &str, session: &str, store_id: &str, root: Option<&pimble_core::NodeId>) -> Result<KeyGrantsResponse> {
+    get(&endpoint(base_url, &format!("/api/v1/stores/{store_id}/keys{}", root_query(root))), Some(session)).await
 }
 
 #[derive(Serialize)]
@@ -188,6 +307,9 @@ struct EnvelopeUpsert<'a> {
     user_id: &'a str,
     key_id: String,
     envelope: &'a KeyEnvelope,
+    /// The share the key is for; absent for the store key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -196,9 +318,18 @@ struct PutStoreKeysRequest<'a> {
 }
 
 /// Upload one (user, key id) envelope for `store_id`, signed by the caller
-/// (verified by the accounts service against the caller's own signing key).
-pub async fn put_store_key(base_url: &str, session: &str, store_id: &str, user_id: &str, key_id: Uuid, envelope: &KeyEnvelope) -> Result<()> {
-    let body = PutStoreKeysRequest { envelopes: vec![EnvelopeUpsert { user_id, key_id: key_id.to_string(), envelope }] };
+/// (verified by the accounts service against the caller's own signing key):
+/// the store key's, or with `root` that share's key.
+pub async fn put_store_key(
+    base_url: &str,
+    session: &str,
+    store_id: &str,
+    user_id: &str,
+    key_id: Uuid,
+    envelope: &KeyEnvelope,
+    root: Option<&pimble_core::NodeId>,
+) -> Result<()> {
+    let body = PutStoreKeysRequest { envelopes: vec![EnvelopeUpsert { user_id, key_id: key_id.to_string(), envelope, root: root.map(|r| r.to_string()) }] };
     let _: serde_json::Value = put(&endpoint(base_url, &format!("/api/v1/stores/{store_id}/keys")), session, &body).await?;
     Ok(())
 }
