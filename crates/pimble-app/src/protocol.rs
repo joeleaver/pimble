@@ -257,8 +257,20 @@ pub enum BackendEvent {
     /// `sync_mode` is what the link is: `Plain` for an ordinary replica link
     /// (or unlinked), `Vault` for an encrypting vault link, which the store
     /// row's badge shows as "encrypted" (docs/DESKTOP_ACCOUNT_CONTRACT.md
-    /// decision 4).
-    StoreSyncChanged { store_id: StoreId, remote: Option<RemoteEndpoint>, state: SyncState, sync_mode: pimble_core::StoreKind },
+    /// decision 4). `access` and `read_only_roots` are what this device may
+    /// change in the store as the server has it now (`Store::access`,
+    /// `Store::read_only_roots`): a role the owner changed while the app runs
+    /// arrives here, and the handler refetches what it holds of the store
+    /// when either differs, because every node carries the server's
+    /// judgement of itself (`Node::access`).
+    StoreSyncChanged {
+        store_id: StoreId,
+        remote: Option<RemoteEndpoint>,
+        state: SyncState,
+        sync_mode: pimble_core::StoreKind,
+        access: pimble_core::StoreAccess,
+        read_only_roots: Vec<NodeId>,
+    },
     /// Answer to `RemoveReplica`: the replica is gone. Handled exactly like
     /// `StoreClosed` (tree + saved open-store list cleanup).
     ReplicaRemoved { store_id: StoreId },

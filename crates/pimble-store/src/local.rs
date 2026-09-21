@@ -391,6 +391,13 @@ impl LocalStore {
         self.link_access.read().unwrap().shared_by.clone()
     }
 
+    /// The scope roots this device may only read while it edits others
+    /// (`sync.json`'s `read_only_roots`; empty when [`LocalStore::access`]
+    /// answers for the whole store).
+    pub fn read_only_roots(&self) -> Vec<NodeId> {
+        self.link_access.read().unwrap().read_only_roots.clone()
+    }
+
     /// Whether a write touching `ids` is refused here: everything on a
     /// replica held as a reader, and on one held with a role per shared
     /// root, a document whose every scope is a reader's. A document under
@@ -832,6 +839,10 @@ impl LocalStore {
             content,
             children,
             links: Vec::new(),
+            // A judgement the server that answers makes per caller, from
+            // `write_refused` and the caller's role; never a property of
+            // the stored node.
+            access: StoreAccess::Full,
         })
     }
 

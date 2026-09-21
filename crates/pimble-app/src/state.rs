@@ -562,6 +562,82 @@ impl AppStore {
         })
     }
 
+    /// What this device may change of ONE node (untracked): the judgement
+    /// the server that answered for the node put on it (`Node::access`),
+    /// which is what a write of it would be answered with. A store held to
+    /// read answers for everything in it; otherwise the loaded node says (a
+    /// reader's root beside an editor's in the same store, a role a token
+    /// carries); a node the app has not loaded reads as `Full`, because
+    /// nothing is disabled on a guess and the server still judges the write.
+    ///
+    /// Everything that decides something about one node asks this, with the
+    /// node's CANONICAL pair: the editor, a row's menu, rename, delete, drag
+    /// and drop. A store row's own items ask [`AppStore::store_access`].
+    pub fn node_access(&self, store_id: StoreId, node_id: NodeId) -> pimble_core::StoreAccess {
+        untracked(|| self.node_access_in(store_id, node_id))
+    }
+
+    /// The access the held copy of a node carries (untracked), whatever its
+    /// store says: what an answer's `Node::access` is compared with to tell
+    /// that the server's judgement of the node changed. `Full` for a node
+    /// not held.
+    pub fn node_held_access(&self, store_id: StoreId, node_id: NodeId) -> pimble_core::StoreAccess {
+        untracked(|| {
+            self.node_data
+                .with(|map| map.get(&(store_id, node_id)).map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|n| n.access)))
+        })
+    }
+
+    /// [`AppStore::node_access`] for a caller already inside `untracked`
+    /// (`build_tree_data_structural`).
+    fn node_access_in(&self, store_id: StoreId, node_id: NodeId) -> pimble_core::StoreAccess {
+        let store_access = self
+            .store_data
+            .with(|map| map.get(&store_id).map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|s| s.access)));
+        if !store_access.allows_write() {
+            return store_access;
+        }
+        self.node_data
+            .with(|map| map.get(&(store_id, node_id)).map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|n| n.access)))
+    }
+
+    /// Record what this device may change in a store as the server has it
+    /// now (`GetStoreSync`'s answer). Answers whether either value differs
+    /// from what was held, which is when every `Node::access` held of the
+    /// store may be stale; the store's signal is written only then, so its
+    /// subscribers do not re-run on every answer.
+    pub fn set_store_access(&self, store_id: StoreId, access: pimble_core::StoreAccess, read_only_roots: &[NodeId]) -> bool {
+        let Some(sig) = self.get_store_signal(store_id) else { return false };
+        // The roots are a set: two answers may name them in different orders.
+        let same_roots = |held: &[NodeId]| held.len() == read_only_roots.len() && held.iter().all(|root| read_only_roots.contains(root));
+        let differs = untracked(|| sig.with(|s| s.access != access || !same_roots(&s.read_only_roots)));
+        if differs {
+            sig.update(|s| {
+                s.access = access;
+                s.read_only_roots = read_only_roots.to_vec();
+            });
+        }
+        differs
+    }
+
+    /// Every loaded children list that holds nodes of `store_id` (untracked):
+    /// the lists of its own parents, and the list of any mount, in whatever
+    /// store, whose children are this store's. What is refetched when the
+    /// store's access changes, since each node carries the server's
+    /// judgement of itself and no notification names the nodes it changed for.
+    pub fn loaded_lists_holding(&self, store_id: StoreId) -> Vec<(StoreId, NodeId)> {
+        untracked(|| {
+            self.children_of.with(|map| {
+                map.iter()
+                    .filter(|((list_store, _), sig)| {
+                        *list_store == store_id || sig.with(|children| children.iter().any(|(child_store, _)| *child_store == store_id))
+                    })
+                    .map(|(&key, _)| key)
+                    .collect()
+            })
+        })
+    }
+
     /// The email of whoever shared a store with this account, when it is
     /// someone else's share (untracked).
     pub fn shared_by(&self, store_id: StoreId) -> Option<String> {
@@ -1140,16 +1216,23 @@ impl AppStore {
         // The renderer never reads this label (render_node Effects draw
         // it reactively); it only carries what the row snapshots at render
         // time — the "Paste Mount Here" state, the node's custom icon and
-        // colour, its share marker, and what this device may change in
-        // the node's own store — so the row re-renders when any of them
-        // changes (see `build_tree_data_structural`).
+        // colour, its share marker, and what this device may change of the
+        // node (`node_access`: its own store's access, then the server's
+        // judgement of this node, so a reader's root beside an editor's
+        // disables its own rows and no others) — so the row re-renders when
+        // any of them changes (see `build_tree_data_structural`). A mount
+        // row's "New Node" goes to the mount's source, so that node's access
+        // rides along too.
         let appearance = self.row_snapshot(child_store, child_id);
-        let access = self.store_data.with(|map| {
-            map.get(&child_store).map(|sig| sig.with(|s| format!("{:?}", s.access))).unwrap_or_default()
-        });
+        let access = format!("{:?}", self.node_access_in(child_store, child_id));
+        let source_access = self
+            .mount_data
+            .with(|map| map.get(&(child_store, child_id)).and_then(|sig| sig.with(|m| m.mount_ref.as_ref().map(|r| (r.source_store, r.source_node)))))
+            .map(|(source_store, source_node)| format!("{:?}", self.node_access_in(source_store, source_node)))
+            .unwrap_or_default();
         let tree_node = TreeNodeData::new(
             format!("node_{}_{}{}", child_store, child_id, suffix),
-            format!("{}|{}|{}", if paste { "paste" } else { "" }, access, appearance),
+            format!("{}|{}{}|{}", if paste { "paste" } else { "" }, access, source_access, appearance),
         );
 
         // Crossing a mount node adds it to the path for everything below it.
@@ -1333,6 +1416,80 @@ mod tests {
             "a shared node's row never re-renders"
         );
         assert!(app.is_shared(store_id, child_id));
+    }
+
+    /// One store can hold a root this account reads beside one it edits
+    /// (`Store::access` is `Full`, the read root is in `read_only_roots`), and
+    /// what may be done with ONE node is the server's judgement of that node
+    /// (`Node::access`). Judging per store is how the editor took typing into
+    /// a document the server then refused: the text was on screen and nowhere
+    /// else.
+    #[test]
+    fn a_node_is_judged_by_its_own_access() {
+        let (app, store_id, child_id) = store_with_a_child();
+        let mut read_only = Node::document("Under the root that is read");
+        read_only.access = StoreAccess::Read;
+        let read_only_id = read_only.id;
+        app.upsert_node(store_id, read_only);
+
+        assert_eq!(app.store_access(store_id), StoreAccess::Full);
+        assert_eq!(app.node_access(store_id, read_only_id), StoreAccess::Read, "the store's `Full` spoke for it");
+        assert_eq!(app.node_access(store_id, child_id), StoreAccess::Full, "and its neighbour is still edited");
+        // Nothing is disabled on a guess: a node, or a store, the app does not hold.
+        assert_eq!(app.node_access(store_id, NodeId::new()), StoreAccess::Full);
+        assert_eq!(app.node_access(StoreId::new(), child_id), StoreAccess::Full);
+
+        // A store held to read answers for every node in it, whatever an
+        // older answer said of one.
+        if let Some(sig) = app.get_store_signal(store_id) {
+            sig.update(|s| s.access = StoreAccess::Read);
+        }
+        assert_eq!(app.node_access(store_id, child_id), StoreAccess::Read);
+        assert_eq!(app.node_access(store_id, NodeId::new()), StoreAccess::Read);
+    }
+
+    /// A row's menu snapshots what may be done with its node at render time,
+    /// so the node's own access has to be in the row's data: when the server
+    /// answers `read` for one node, that row re-renders with its items
+    /// disabled and its neighbour's does not change at all.
+    #[test]
+    fn row_data_carries_the_nodes_own_access() {
+        let (app, store_id, child_id) = store_with_a_child();
+        let sibling = Node::document("Sibling");
+        let sibling_id = sibling.id;
+        let root = app.root_node_id(store_id).unwrap();
+        app.upsert_node(store_id, sibling);
+        app.set_children(store_id, root, vec![(store_id, child_id), (store_id, sibling_id)]);
+        let before = untracked(|| app.build_tree_data_structural());
+
+        if let Some(sig) = app.get_node_signal(store_id, child_id) {
+            sig.update(|n| n.access = StoreAccess::Read);
+        }
+        let after = untracked(|| app.build_tree_data_structural());
+        assert_ne!(before[0].children[0].label, after[0].children[0].label, "the read-only node's row never re-renders");
+        assert_eq!(before[0].children[1].label, after[0].children[1].label, "its sibling has nothing to re-render for");
+        assert_eq!(before[0].label, after[0].label, "nor has the store row: the store's access did not change");
+
+        // And back, when the owner makes the account an editor again.
+        if let Some(sig) = app.get_node_signal(store_id, child_id) {
+            sig.update(|n| n.access = StoreAccess::Full);
+        }
+        let again = untracked(|| app.build_tree_data_structural());
+        assert_eq!(before[0].children[0].label, again[0].children[0].label);
+    }
+
+    /// `set_store_access` says whether anything changed, which is when the
+    /// app fetches what it holds again, and the roots are a set.
+    #[test]
+    fn store_access_reports_a_change_once() {
+        let (app, store_id, _) = store_with_a_child();
+        let (a, b) = (NodeId::new(), NodeId::new());
+        assert!(!app.set_store_access(store_id, StoreAccess::Full, &[]), "nothing changed");
+        assert!(app.set_store_access(store_id, StoreAccess::Full, &[a, b]));
+        assert!(!app.set_store_access(store_id, StoreAccess::Full, &[b, a]), "the same roots in another order");
+        assert!(app.set_store_access(store_id, StoreAccess::Read, &[]));
+        assert_eq!(app.store_access(store_id), StoreAccess::Read);
+        assert!(!app.set_store_access(StoreId::new(), StoreAccess::Read, &[]), "a store the app does not hold");
     }
 
     /// A store nobody shared reads as `Full`, and so does one the app has not

@@ -207,6 +207,7 @@ impl StoreManager {
                 access: store.access(),
                 shared_by: store.shared_by(),
                 roots: manifest.scope_roots.clone(),
+                read_only_roots: store.read_only_roots(),
             });
         }
         if let Some(store) = self.vault_stores.get(&store_id) {
@@ -225,6 +226,7 @@ impl StoreManager {
                 access: pimble_core::StoreAccess::Full,
                 shared_by: None,
                 roots: Vec::new(),
+                read_only_roots: Vec::new(),
             });
         }
         Err(StoreError::StoreNotFound(store_id))

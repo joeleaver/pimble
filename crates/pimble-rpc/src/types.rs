@@ -396,6 +396,13 @@ pub struct GetStoreSyncResponse {
     /// What this device may change in the store, mirroring `Store::access`.
     #[serde(default)]
     pub access: StoreAccess,
+    /// The roots only read while others are edited, mirroring
+    /// `Store::read_only_roots`. With `access`, what a client watches to
+    /// know that the `Node::access` of what it holds may have changed (a
+    /// role the owner changed reaches a replica's `sync.json` when its link
+    /// connects again).
+    #[serde(default)]
+    pub read_only_roots: Vec<NodeId>,
 }
 
 /// Ask this server for the stores a remote Pimble server has open. The

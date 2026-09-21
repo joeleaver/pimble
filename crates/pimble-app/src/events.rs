@@ -89,8 +89,17 @@ fn register_opened_store(store: AppStore, tree_state: UseTreeReturn, opened_stor
     // replaces the whole `Store`, so the new root is in the tree at once.
     let roots = opened_store.shown_roots();
 
+    // A store already in the tree is told again when it is opened again (a
+    // reconnect, a second share of it). If what this device may change in it
+    // is not what was held, every node held of it carries a stale judgement
+    // (`Node::access`), and only the roots are fetched below.
+    let access_changed = store.set_store_access(store_id, opened_store.access, &opened_store.read_only_roots);
+
     // Structural: new store appears in tree
     store.upsert_store(opened_store.clone());
+    if access_changed {
+        refetch_held_nodes(store, store_id);
+    }
 
     for &root_id in &roots {
         store.expanded.update(|e| { e.insert((store_id, root_id)); });
@@ -141,6 +150,56 @@ fn refetch_parent_children(store: AppStore, changed_store: StoreId, parent_id: N
     for (mount_store, mount_node) in store.mounts_sourced_from_node(changed_store, parent_id) {
         if store.has_children_loaded(mount_store, mount_node) {
             store.send(BackendCommand::GetChildren { store_id: mount_store, node_id: mount_node });
+        }
+    }
+}
+
+/// Fetch again everything the app holds of `store_id`, because what this
+/// device may change there has changed and each node carries the server's
+/// judgement of itself (`Node::access`): every loaded children list with
+/// nodes of the store in it (its own, and a mount's that shows them from
+/// another store), each root the store row shows (a share's root is in no
+/// list this device holds), and the document in the editor, which may have
+/// been opened from a search hit and be in no loaded list at all. The
+/// answers arrive as `ChildrenLoaded` and `NodeLoaded` like any other; a
+/// `NodeLoaded` for the document being edited updates the node and leaves
+/// the session alone.
+fn refetch_held_nodes(store: AppStore, store_id: StoreId) {
+    for (list_store, parent_id) in store.loaded_lists_holding(store_id) {
+        store.send(BackendCommand::GetChildren { store_id: list_store, node_id: parent_id });
+    }
+    let mut singles = store.shown_roots(store_id);
+    if let Some(active) = untracked(|| store.active_edit.get()).filter(|active| active.store_id == store_id) {
+        if !singles.contains(&active.node_id) {
+            singles.push(active.node_id);
+        }
+    }
+    for node_id in singles {
+        store.send(BackendCommand::GetNode { store_id, node_id });
+    }
+}
+
+/// Nodes of `store_id` the app already held came back with another access
+/// than the one held (`changed`). What made it so reaches what is under them
+/// too: a folder the owner moved from a root this account edits into one it
+/// reads changes what may be done with every document in it, and the
+/// notification for the move names only the two lists the folder moved
+/// between. So each changed node's loaded children list is fetched again
+/// (and those answers cascade the same way, stopping where nothing changed),
+/// and so is the open document when it is of this store, since it may be in
+/// no loaded list at all.
+fn refetch_below_changed_access(store: AppStore, store_id: StoreId, changed: &[NodeId]) {
+    if changed.is_empty() {
+        return;
+    }
+    for &node_id in changed {
+        if store.has_children_loaded(store_id, node_id) {
+            store.send(BackendCommand::GetChildren { store_id, node_id });
+        }
+    }
+    if let Some(active) = untracked(|| store.active_edit.get()) {
+        if active.store_id == store_id && !changed.contains(&active.node_id) {
+            store.send(BackendCommand::GetNode { store_id, node_id: active.node_id });
         }
     }
 }
@@ -381,6 +440,16 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     if !known.contains(&s.id) {
                         tracing::info!("Discovered implicitly-opened store: {} ({})", s.name, s.id);
                         register_opened_store(store, tree_state, s);
+                    } else if store.set_store_access(s.id, s.access, &s.read_only_roots) {
+                        // A store the tree already has, listed with another
+                        // access than the one held (the browser lists again
+                        // at every token refresh, which is when a role the
+                        // owner changed arrives there): as `StoreSyncChanged`
+                        // does, fetch what is held of it again, for each
+                        // node's own `access`.
+                        tracing::info!("Access to store {:?} changed: {:?}", s.id, s.access);
+                        refetch_held_nodes(store, s.id);
+                        store.bump_tree_structure();
                     }
                 }
             }
@@ -413,8 +482,12 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
 
                 // Upsert each child node (per-entity signal), keyed by its
                 // OWN canonical store.
+                let mut access_changed: Vec<NodeId> = Vec::new();
                 for child in children {
                     let key = (*children_store_id, child.id);
+                    if store.get_node_signal(key.0, key.1).is_some() && store.node_held_access(key.0, key.1) != child.access {
+                        access_changed.push(child.id);
+                    }
                     let should_update = untracked(|| {
                         store.node_data.with(|map| {
                             map.get(&key)
@@ -424,8 +497,17 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     if should_update {
                         store.track_mount_info(*children_store_id, child);
                         store.upsert_node(*children_store_id, child.clone());
+                    } else if let Some(sig) = store.get_node_signal(*children_store_id, child.id) {
+                        // The cached copy is the newer node, but what this
+                        // device may change of it is the server's judgement
+                        // at the moment it answered, and this answer is the
+                        // latest one (`Node::access`).
+                        if untracked(|| sig.with(|cached| cached.access != child.access)) {
+                            sig.update(|cached| cached.access = child.access);
+                        }
                     }
                 }
+                refetch_below_changed_access(store, *children_store_id, &access_changed);
 
                 // Request mount state for any mount nodes (addressed in
                 // their own store).
@@ -446,14 +528,18 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 let content_bytes = node.content.clone();
                 store.track_mount_info(*store_id, node);
 
-                // Whether the node's icon, colour or share marker changed against
-                // the cache: the row snapshots all three at render time, so that
-                // (unlike a title or content change) needs the tree rebuilt to
-                // show. A node never cached before counts as changed when it
-                // carries any of them — a store's root node arrives after its row
-                // was first built.
+                // Whether the node's icon, colour, share marker or access
+                // changed against the cache: the row snapshots all four at
+                // render time (the access as its menu's disabled items), so
+                // that (unlike a title or content change) needs the tree
+                // rebuilt to show. A node never cached before counts as changed
+                // when it carries any of them — a store's root node arrives
+                // after its row was first built.
                 let shared = node.metadata.share().is_some();
-                let has_row_data = node.metadata.icon().is_some() || node.metadata.color().is_some() || shared;
+                let has_row_data = node.metadata.icon().is_some()
+                    || node.metadata.color().is_some()
+                    || shared
+                    || !node.access.allows_write();
                 let row_data_changed = untracked(|| {
                     store.node_data.with(|map| {
                         map.get(&(*store_id, node_id)).map_or(has_row_data, |sig| {
@@ -461,14 +547,21 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                                 cached.metadata.icon() != node.metadata.icon()
                                     || cached.metadata.color() != node.metadata.color()
                                     || cached.metadata.share().is_some() != shared
+                                    || cached.access != node.access
                             })
                         })
                     })
                 });
 
+                let access_changed = store.get_node_signal(*store_id, node_id).is_some()
+                    && store.node_held_access(*store_id, node_id) != node.access;
+
                 // Data-only: updates per-node signal, NO tree rebuild (except for
                 // a change to what the row snapshots, below).
                 store.upsert_node(*store_id, node.clone());
+                if access_changed {
+                    refetch_below_changed_access(store, *store_id, &[node_id]);
+                }
                 if row_data_changed {
                     store.bump_tree_structure();
                 }
@@ -760,6 +853,19 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         if matches!(state, pimble_core::SyncState::Synced { .. }) {
                             refetch_root_if_empty(store, *store_id);
                         }
+                        // A link reads how the account holds the store each
+                        // time it connects, and connects again when the grant
+                        // changes (a role the owner changed, a share stopped):
+                        // what this device may change here can differ on the
+                        // far side of any transition, and this notification
+                        // carries only the state. Ask for the rest; the answer
+                        // (`StoreSyncChanged`) refetches what it has to. Not
+                        // on `Syncing`, which a link announces before it has
+                        // read anything: the `Synced` or `Offline` that
+                        // follows is the one that knows.
+                        if !matches!(state, pimble_core::SyncState::Syncing) {
+                            store.send(BackendCommand::GetStoreSync { store_id: *store_id });
+                        }
                     }
                     StoreChangeKind::ShareStateChanged { node_id, state } => {
                         // What the share's link is doing, derived by the
@@ -837,13 +943,24 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 }
             }
 
-            BackendEvent::StoreSyncChanged { store_id, remote, state, sync_mode } => {
-                tracing::info!("Sync state for store {:?}: {:?} ({:?})", store_id, state, sync_mode);
+            BackendEvent::StoreSyncChanged { store_id, remote, state, sync_mode, access, read_only_roots } => {
+                tracing::info!("Sync state for store {:?}: {:?} ({:?}, {:?})", store_id, state, sync_mode, access);
                 let was_linked = store.is_linked(*store_id);
                 store.set_sync(*store_id, remote.clone(), state.clone());
                 // What the link is, for the badge's "encrypted" prefix
                 // (docs/DESKTOP_ACCOUNT_CONTRACT.md decision 4).
                 store.set_store_sync_mode(*store_id, *sync_mode);
+                // What this device may change here, as the server has it now
+                // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"). When it
+                // differs from what was held, so may the server's judgement
+                // of any node of the store (`Node::access`), and nothing names
+                // which: everything held of the store is fetched again.
+                if store.set_store_access(*store_id, *access, read_only_roots) {
+                    tracing::info!("Access to store {:?} changed: {:?}, read-only roots {:?}", store_id, access, read_only_roots);
+                    refetch_held_nodes(store, *store_id);
+                    // The store row's menu and every node row's snapshot it.
+                    store.bump_tree_structure();
+                }
                 let now_linked = remote.is_some();
                 if was_linked != now_linked {
                     // The "Link to Remote..."/"Unlink from Remote" disabled
@@ -1328,6 +1445,176 @@ mod tests {
         assert!(commands
             .try_iter()
             .any(|c| matches!(c, BackendCommand::GetChildren { node_id, .. } if node_id == walks)));
+    }
+
+    /// A store with two shared roots and a document under each, all loaded,
+    /// as the tree holds a partial replica.
+    fn a_replica_with_two_roots(store: AppStore) -> (StoreId, [NodeId; 2], [NodeId; 2]) {
+        let mut shared = pimble_core::Store::new_local("Ann's notes", "/tmp/anns.pimble".into());
+        let (recipes, trips) = (pimble_core::Node::folder("Recipes"), pimble_core::Node::folder("Trips"));
+        let (pasta, rome) = (pimble_core::Node::document("Pasta"), pimble_core::Node::document("Rome"));
+        shared.root_node_id = recipes.id;
+        shared.roots = vec![recipes.id, trips.id];
+        shared.shared_by = Some("ann@example.com".to_string());
+        let store_id = shared.id;
+        store.upsert_store(shared);
+        let ids = ([recipes.id, trips.id], [pasta.id, rome.id]);
+        store.set_children(store_id, recipes.id, vec![(store_id, pasta.id)]);
+        store.set_children(store_id, trips.id, vec![(store_id, rome.id)]);
+        for node in [recipes, trips, pasta, rome] {
+            store.upsert_node(store_id, node);
+        }
+        (store_id, ids.0, ids.1)
+    }
+
+    /// Built through serde: this crate has no chrono of its own.
+    fn synced() -> SyncState {
+        serde_json::from_str(r#"{"state":"synced","last_sync":"2026-09-21T00:00:00Z"}"#).unwrap()
+    }
+
+    fn sync_changed(store_id: StoreId, access: pimble_core::StoreAccess, read_only_roots: Vec<NodeId>) -> BackendEvent {
+        BackendEvent::StoreSyncChanged {
+            store_id,
+            remote: None,
+            state: synced(),
+            sync_mode: pimble_core::StoreKind::Vault,
+            access,
+            read_only_roots,
+        }
+    }
+
+    /// A role the owner changes while the app runs reaches it with the next
+    /// `GetStoreSync` answer: the store's `access` and `read_only_roots` are
+    /// written, and because each node carries the server's judgement of
+    /// itself, everything held of the store is asked for again: the loaded
+    /// lists, the roots, the open document. An answer that changes nothing
+    /// asks for nothing.
+    #[test]
+    fn a_changed_access_is_kept_and_refetches_what_is_held() {
+        use pimble_core::StoreAccess::{Full, Read};
+        let (store, events, commands) = store_with_events();
+        let (store_id, [recipes, trips], [pasta, rome]) = a_replica_with_two_roots(store);
+        store.active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id: rome }));
+
+        events.send(sync_changed(store_id, Full, Vec::new())).unwrap();
+        pump(store);
+        assert!(
+            !commands.try_iter().any(|c| matches!(c, BackendCommand::GetChildren { .. } | BackendCommand::GetNode { .. })),
+            "nothing changed, so nothing is fetched"
+        );
+
+        // The owner made this account a reader of Trips.
+        let before = store.tree_structure_version.get();
+        events.send(sync_changed(store_id, Full, vec![trips])).unwrap();
+        pump(store);
+        let held = store.get_store_signal(store_id).unwrap();
+        assert_eq!(held.with(|s| (s.access, s.read_only_roots.clone())), (Full, vec![trips]));
+        let asked: Vec<BackendCommand> = commands.try_iter().collect();
+        for parent in [recipes, trips] {
+            assert!(asked.iter().any(|c| matches!(c, BackendCommand::GetChildren { node_id, .. } if *node_id == parent)), "the list under {parent} was not fetched again");
+            assert!(asked.iter().any(|c| matches!(c, BackendCommand::GetNode { node_id, .. } if *node_id == parent)), "the root {parent} was not fetched again");
+        }
+        assert!(asked.iter().any(|c| matches!(c, BackendCommand::GetNode { node_id, .. } if *node_id == rome)), "nor the open document");
+        assert!(store.tree_structure_version.get() > before);
+
+        // The answers carry the judgement, and the app believes it: the
+        // document under Trips takes no edits now, its neighbour still does.
+        let mut rome_now = store.get_node_signal(store_id, rome).unwrap().with(|n| n.clone());
+        rome_now.access = Read;
+        let before = store.tree_structure_version.get();
+        events.send(BackendEvent::NodeLoaded { store_id, node: rome_now }).unwrap();
+        pump(store);
+        assert_eq!(store.node_access(store_id, rome), Read);
+        assert_eq!(store.node_access(store_id, pasta), Full);
+        assert!(store.tree_structure_version.get() > before, "the row's menu never re-renders");
+
+        // The whole replica to read: the store's own word covers every node.
+        events.send(sync_changed(store_id, Read, Vec::new())).unwrap();
+        pump(store);
+        assert_eq!(held.with(|s| (s.access, s.read_only_roots.clone())), (Read, Vec::new()));
+        assert_eq!(store.node_access(store_id, pasta), Read);
+        assert!(commands.try_iter().any(|c| matches!(c, BackendCommand::GetChildren { .. })));
+    }
+
+    /// A children list brings each child's access even when the cached copy
+    /// of the child is the newer node and is kept.
+    #[test]
+    fn a_children_list_brings_access_to_a_newer_cached_node() {
+        use pimble_core::StoreAccess::{Full, Read};
+        let (store, events, _commands) = store_with_events();
+        let (store_id, [_, trips], [_, rome]) = a_replica_with_two_roots(store);
+
+        // The list's copy of the node is a minute older than the held one.
+        let held_now = store.get_node_signal(store_id, rome).unwrap().with(|n| n.clone());
+        let mut listed = held_now.clone();
+        let mut newer = held_now;
+        newer.metadata.modified_at += std::time::Duration::from_secs(60);
+        store.upsert_node(store_id, newer);
+        listed.metadata.title = "An older title".to_string();
+        listed.access = Read;
+        events
+            .send(BackendEvent::ChildrenLoaded { store_id, parent_id: trips, children_store_id: store_id, children: vec![listed] })
+            .unwrap();
+        pump(store);
+
+        let held = store.get_node_signal(store_id, rome).unwrap();
+        assert_eq!(held.with(|n| n.metadata.title.clone()), "Rome", "the newer node is kept");
+        assert_eq!(store.node_access(store_id, rome), Read, "with the latest judgement of it");
+        assert_eq!(store.node_access(store_id, trips), Full);
+    }
+
+    /// The owner moves a folder from a root this account edits into one it
+    /// reads: the move's notifications name the two lists it moved between,
+    /// and the folder comes back in one of them with another access. What is
+    /// under it changed with it, so its own loaded list is fetched again, and
+    /// the open document; the same answer a second time asks for nothing.
+    #[test]
+    fn a_node_whose_access_changed_refetches_what_is_under_it() {
+        use pimble_core::StoreAccess::Read;
+        let (store, events, commands) = store_with_events();
+        let (store_id, [recipes, trips], [pasta, _]) = a_replica_with_two_roots(store);
+        store.active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id: pasta }));
+
+        let mut moved = store.get_node_signal(store_id, trips).unwrap().with(|n| n.clone());
+        moved.access = Read;
+        let listing = BackendEvent::ChildrenLoaded { store_id, parent_id: recipes, children_store_id: store_id, children: vec![moved] };
+        events.send(listing.clone()).unwrap();
+        pump(store);
+        let asked: Vec<BackendCommand> = commands.try_iter().collect();
+        assert!(asked.iter().any(|c| matches!(c, BackendCommand::GetChildren { node_id, .. } if *node_id == trips)), "what is under the folder keeps its old access");
+        assert!(asked.iter().any(|c| matches!(c, BackendCommand::GetNode { node_id, .. } if *node_id == pasta)), "and so may the open document");
+
+        events.send(listing).unwrap();
+        pump(store);
+        assert!(!commands.try_iter().any(|c| matches!(c, BackendCommand::GetChildren { .. } | BackendCommand::GetNode { .. })), "nothing changed the second time");
+    }
+
+    /// A link reads how the account holds the store each time it connects,
+    /// and says only `SyncStateChanged` when it has: the app asks for the
+    /// rest. Not on `Syncing`, which a link announces before it has read
+    /// anything.
+    #[test]
+    fn a_links_transition_asks_how_the_store_is_held_now() {
+        let (store, events, commands) = store_with_events();
+        let (store_id, _, _) = a_replica_with_two_roots(store);
+        let notify = |state: SyncState| BackendEvent::RemoteStoreChange {
+            store_id,
+            change_kind: pimble_rpc::StoreChangeKind::SyncStateChanged { state },
+            source_client_id: None,
+        };
+        let asked = |commands: &crossbeam_channel::Receiver<BackendCommand>| {
+            commands.try_iter().any(|c| matches!(c, BackendCommand::GetStoreSync { store_id: s } if s == store_id))
+        };
+
+        events.send(notify(SyncState::Syncing)).unwrap();
+        pump(store);
+        assert!(!asked(&commands));
+        events.send(notify(synced())).unwrap();
+        pump(store);
+        assert!(asked(&commands), "connected again: the grant was read");
+        events.send(notify(SyncState::Offline)).unwrap();
+        pump(store);
+        assert!(asked(&commands), "refused or unreachable: a removal from every share is recorded before the connect fails");
     }
 
     /// A node that has just been shared must re-render its row, and rinch

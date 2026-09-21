@@ -19,7 +19,7 @@ use pimble_rpc::{
     CloudShareRemoveMemberRequest, CloudSignInRequest, CloudStatusResponse, DeleteVaultStoreRequest, GetScopesRequest, MemberRole, Scope,
     SetScopeRequest, VaultDocKeys, VaultSetDocKeysRequest,
     CreateMountRequest, CreateNodeRequest, CreateStoreRequest, CreateWorkspaceRequest, DeleteNodeRequest,
-    EditOperation, GetChildrenRequest, GetMountStateRequest, GetNodeRequest, GetNodesRequest, GetStoreSyncRequest, SetStoreSyncRequest,
+    EditOperation, GetChildrenRequest, GetMountStateRequest, GetNodeRequest, GetNodesRequest, GetStoreSyncRequest, GetStoreSyncResponse, SetStoreSyncRequest,
     ListRemoteStoresRequest, LoadWorkspaceRequest, MoveNodeRequest, NodeContentChangedNotification, NodeStateVector,
     OpenStoreRequest, PimbleApiClient, RebuildIndexRequest, RemoveReplicaRequest, SaveWorkspaceRequest,
     SearchRequest, SearchResultItem, StoreChangedNotification, SyncNodesRequest, UndeleteNodeRequest,
@@ -656,6 +656,19 @@ impl PimbleClient {
     pub async fn get_store_sync_with_access(&self, store_id: StoreId) -> Result<(Option<RemoteEndpoint>, SyncState, StoreKind, StoreAccess)> {
         let response = self.client.get_store_sync(GetStoreSyncRequest { store_id }).await.map_err(rpc_error)?;
         Ok((response.remote, response.state, response.sync_mode, response.access))
+    }
+
+    /// A store's sync answer whole: the link, its state and mode, and what
+    /// this device may change in the store (`access`, `read_only_roots`).
+    /// What the app asks with, since it keeps all of it.
+    pub async fn get_store_sync_response(&self, store_id: StoreId) -> Result<GetStoreSyncResponse> {
+        self.client.get_store_sync(GetStoreSyncRequest { store_id }).await.map_err(rpc_error)
+    }
+
+    /// [`PimbleClient::set_store_sync`], answering whole like
+    /// [`PimbleClient::get_store_sync_response`].
+    pub async fn set_store_sync_response(&self, store_id: StoreId, remote: Option<RemoteEndpoint>) -> Result<GetStoreSyncResponse> {
+        self.client.set_store_sync(SetStoreSyncRequest { store_id, remote }).await.map_err(rpc_error)
     }
 
     /// The stores `remote` has open, fetched by the server this client is

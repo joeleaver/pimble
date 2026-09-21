@@ -113,6 +113,15 @@ pub struct Store {
     /// in older serializations: read it as `[root_node_id]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roots: Vec<NodeId>,
+
+    /// The roots among [`Store::roots`] this device may only read while it
+    /// edits others (a role per shared root), plus roots the account no
+    /// longer holds at all: `sync.json`'s `read_only_roots`. Empty when
+    /// `access` answers for the whole store. What a node under one of them
+    /// may be used for is on the node itself ([`crate::Node::access`]); this
+    /// is here so a client can tell when that judgement has changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_only_roots: Vec<NodeId>,
 }
 
 impl Store {
@@ -139,6 +148,7 @@ impl Store {
             access: StoreAccess::Full,
             shared_by: None,
             roots: Vec::new(),
+            read_only_roots: Vec::new(),
         }
     }
 
@@ -156,6 +166,7 @@ impl Store {
             access: StoreAccess::Full,
             shared_by: None,
             roots: Vec::new(),
+            read_only_roots: Vec::new(),
         }
     }
 
@@ -245,6 +256,12 @@ impl StoreAccess {
     }
 
     pub fn allows_write(self) -> bool {
+        matches!(self, StoreAccess::Full)
+    }
+
+    /// Whether this is `Full`, the value an answer leaves out
+    /// (`Node::access`'s `skip_serializing_if`).
+    pub fn is_full(&self) -> bool {
         matches!(self, StoreAccess::Full)
     }
 }

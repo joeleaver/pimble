@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
 
-use crate::StoreId;
+use crate::{StoreAccess, StoreId};
 
 /// Unique identifier for a node
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -83,6 +83,17 @@ pub struct Node {
 
     /// Links from this node to other nodes
     pub links: Vec<NodeLink>,
+
+    /// What the device that asked may change of this node, as the server
+    /// that answered judges it (docs/NODE_DOCUMENT_CONTRACT.md section 5,
+    /// "Roles"): `Read` under a root the account holds as a reader, or for a
+    /// caller whose role does not cover a write of this node; `Full`
+    /// otherwise. A judgement reported with the answer, never stored in a
+    /// node document, and never read from a request: the server that takes a
+    /// write judges it again. `Full` is not serialized, and a payload
+    /// without the field (an older server) reads as `Full`.
+    #[serde(default, skip_serializing_if = "StoreAccess::is_full")]
+    pub access: StoreAccess,
 }
 
 impl Node {
@@ -103,6 +114,7 @@ impl Node {
             content: Vec::new(),
             children: Vec::new(),
             links: Vec::new(),
+            access: StoreAccess::Full,
         }
     }
 
@@ -548,5 +560,23 @@ mod tests {
     fn mount_ref_returns_none_for_non_mount() {
         let folder = Node::folder("test");
         assert!(folder.mount_ref().is_none());
+    }
+
+    /// `access` is a judgement that rides an answer: `Full` is not written at
+    /// all, so a payload is what it always was, and a payload from before the
+    /// field reads as `Full`.
+    #[test]
+    fn node_access_is_absent_when_full_and_defaults_to_full() {
+        let mut node = Node::document("test");
+        let json = serde_json::to_value(&node).unwrap();
+        assert!(json.get("access").is_none(), "{json}");
+        let back: Node = serde_json::from_value(json).unwrap();
+        assert_eq!(back.access, StoreAccess::Full);
+
+        node.access = StoreAccess::Read;
+        let json = serde_json::to_value(&node).unwrap();
+        assert_eq!(json["access"], "read");
+        let back: Node = serde_json::from_value(json).unwrap();
+        assert_eq!(back.access, StoreAccess::Read);
     }
 }

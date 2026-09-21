@@ -176,6 +176,40 @@ impl AccountStore {
         self.grants.iter().filter_map(|g| g.root).collect()
     }
 
+    /// The shared roots this account only reads while it edits others, as a
+    /// desktop replica's `sync.json` names its own (`Store::read_only_roots`);
+    /// empty when [`AccountStore::access`] answers for the whole store.
+    pub fn read_only_roots(&self) -> Vec<NodeId> {
+        if !self.access().allows_write() || self.grants.iter().any(|g| g.root.is_none()) {
+            return Vec::new();
+        }
+        self.grants.iter().filter(|g| g.role == "reader").filter_map(|g| g.root).collect()
+    }
+
+    /// What this account may change of one node, by the rule the hosted
+    /// server judges a write with (docs/NODE_DOCUMENT_CONTRACT.md section 5,
+    /// "Token"): a whole-store grant wins over any share and its role
+    /// answers for every node; otherwise the roles of the shared roots the
+    /// node is under (`reached`: the grant roots on its parent chain, itself
+    /// included) decide, and a node under a reader's root nested in an
+    /// editor's takes the wider role. A node that reaches no root this
+    /// account holds is not this rule's to judge and reads as the store does.
+    pub fn node_access(&self, reached: &[NodeId]) -> StoreAccess {
+        let reads = |role: &str| role == "reader";
+        if let Some(whole) = self.grants.iter().find(|g| g.root.is_none()) {
+            return if reads(&whole.role) { StoreAccess::Read } else { StoreAccess::Full };
+        }
+        let mut roles = self.grants.iter().filter(|g| g.root.is_some_and(|root| reached.contains(&root))).map(|g| g.role.as_str()).peekable();
+        if roles.peek().is_none() {
+            return self.access();
+        }
+        if roles.all(reads) {
+            StoreAccess::Read
+        } else {
+            StoreAccess::Full
+        }
+    }
+
     /// The name to show: the share's for a store reached only through shares,
     /// and `None` for a whole-store grant, whose name the server already
     /// carries. Several shares of one store share a name per share, so the
@@ -410,6 +444,7 @@ impl VaultClient {
     pub fn describe(&self, store: &mut Store) {
         if let Some(row) = self.rows.get(&store.id) {
             store.access = row.access();
+            store.read_only_roots = row.read_only_roots();
             store.shared_by = row.shared_by.clone();
             let roots = row.roots();
             if !roots.is_empty() {
@@ -913,11 +948,15 @@ impl VaultClient {
             // A vault store has no sync link and no server-side index. Both are
             // answered here rather than refused, so the app's ordinary
             // registration path does not light up the status bar with errors.
+            // What the account may change is what the store was described
+            // with (`describe`), from the same rows.
             BackendCommand::GetStoreSync { store_id } => Some(BackendEvent::StoreSyncChanged {
                 store_id,
                 remote: None,
                 state: pimble_core::SyncState::Offline,
                 sync_mode: pimble_core::StoreKind::Plain,
+                access: self.access(store_id),
+                read_only_roots: self.rows.get(&store_id).map(AccountStore::read_only_roots).unwrap_or_default(),
             }),
             BackendCommand::RebuildIndex { store_id } => {
                 Some(BackendEvent::IndexRebuilt { store_id, indexed: 0 })
@@ -953,8 +992,9 @@ impl VaultClient {
         let Some(store) = self.stores.get(&store_id) else {
             return BackendEvent::Error { message: "no such encrypted store".into() };
         };
+        let row = self.rows.get(&store_id);
         let children = match store.children_of(node_id) {
-            Ok(ids) => ids.iter().filter_map(|id| store.node_of(*id).ok()).collect(),
+            Ok(ids) => ids.iter().filter_map(|id| store.node_for(*id, row).ok()).collect(),
             Err(message) => return BackendEvent::Error { message },
         };
         BackendEvent::ChildrenLoaded { store_id, parent_id: node_id, children_store_id: store_id, children }
@@ -964,7 +1004,7 @@ impl VaultClient {
         let Some(store) = self.stores.get(&store_id) else {
             return BackendEvent::Error { message: "no such encrypted store".into() };
         };
-        match store.node_of(node_id) {
+        match store.node_for(node_id, self.rows.get(&store_id)) {
             Ok(node) => BackendEvent::NodeLoaded { store_id, node },
             Err(message) => BackendEvent::Error { message },
         }
@@ -1709,6 +1749,23 @@ impl VaultStore {
         self.tree.get_children(node_id).map_err(|e| e.to_string())
     }
 
+    /// [`VaultStore::node_of`] as the UI is handed it: with what this account
+    /// may change of the node (`Node::access`), which a server puts on every
+    /// node it returns and this page, holding the documents itself, judges
+    /// from the account's grants (`row`) by the hosted server's own rule. It
+    /// is the app's one source for what to offer: a store can hold a root the
+    /// account reads beside one it edits, and the hosted server refuses the
+    /// writes under the first one at a time. No row is a store nothing is
+    /// known about, which is no reason to disable anything.
+    fn node_for(&self, node_id: NodeId, row: Option<&AccountStore>) -> Result<Node, String> {
+        let mut node = self.node_of(node_id)?;
+        if let Some(row) = row {
+            let grant_roots: Vec<NodeId> = row.grants.iter().filter_map(|g| g.root).collect();
+            node.access = row.node_access(&roots_above(&self.tree, &grant_roots, node_id));
+        }
+        Ok(node)
+    }
+
     /// Assemble the `Node` the app expects from the tree's view of a node and
     /// its document's bytes, as the server assembles one: the content is the
     /// whole node document, which the editor joins as it joined a content
@@ -1732,6 +1789,7 @@ impl VaultStore {
                 content: Vec::new(),
                 children: Vec::new(),
                 links: Vec::new(),
+                access: StoreAccess::Full,
             });
         }
         let info = self.tree.get_node_info(node_id).map_err(|e| e.to_string())?;
@@ -1751,6 +1809,8 @@ impl VaultStore {
             content,
             children,
             links: Vec::new(),
+            // Judged per account in `node_for`, never part of the node.
+            access: StoreAccess::Full,
         })
     }
 
@@ -1926,6 +1986,28 @@ fn scope_groups(tree: &Tree, scope_roots: &[NodeId]) -> HashMap<NodeId, Vec<Node
         }
     }
     groups
+}
+
+/// The `roots` on `id`'s stored parent chain, itself included, through held
+/// documents (tombstones too), nearest first: the scopes a document is in, as
+/// the desktop's `LocalStore` reads them for the same judgement. Bounded, so
+/// an unrepaired cycle cannot loop.
+fn roots_above(tree: &Tree, roots: &[NodeId], id: NodeId) -> Vec<NodeId> {
+    let mut reached = Vec::new();
+    if roots.is_empty() {
+        return reached;
+    }
+    let mut cur = id;
+    for _ in 0..=tree.ids().len() {
+        if roots.contains(&cur) && !reached.contains(&cur) {
+            reached.push(cur);
+        }
+        match tree.doc(cur).and_then(|d| d.fields().ok()).and_then(|f| f.parent_id) {
+            Some(parent) if tree.doc(parent).is_some() => cur = parent,
+            _ => break,
+        }
+    }
+    reached
 }
 
 // ── Keys ────────────────────────────────────────────────────────────────────
@@ -3256,6 +3338,79 @@ mod tests {
             pull_subset(&peer, &[recipes, bread, plans, monday, stray]),
         );
         assert!(whole.repair_now(T1).is_some(), "which is exactly why a scope is repaired on its own");
+    }
+
+    /// The page assembles its own nodes, so it is the one to say what the
+    /// account may change of each (`Node::access`), by the hosted server's
+    /// rule: the role of the shared root a node is under, the wider role
+    /// where two roots cover it, a whole-store grant over any share. The app
+    /// believes it: a document under a reader's root takes no typing, in a
+    /// store whose other root is edited.
+    #[test]
+    fn an_assembled_node_says_what_the_account_may_change_of_it() {
+        use StoreAccess::{Full, Read};
+        let (mut peer, root) = origin();
+        let (recipes, plans, inner) = (NodeId::new(), NodeId::new(), NodeId::new());
+        peer.add_node(recipes, Some(root), None, "folder", "Recipes", T0).unwrap();
+        peer.add_node(plans, Some(root), None, "folder", "Plans", T0).unwrap();
+        // A folder the account edits inside the one it reads.
+        peer.add_node(inner, Some(recipes), None, "folder", "Ours", T0).unwrap();
+        let (bread, monday, shared_list) = (NodeId::new(), NodeId::new(), NodeId::new());
+        peer.add_node(bread, Some(recipes), None, "document", "Bread", T0).unwrap();
+        peer.add_node(monday, Some(plans), None, "document", "Monday", T0).unwrap();
+        peer.add_node(shared_list, Some(inner), None, "document", "Shopping", T0).unwrap();
+
+        let store_id = StoreId::new();
+        let mut scoped = listed(recipes);
+        scoped.id = store_id;
+        scoped.roots = vec![recipes, plans, inner];
+        let held = [recipes, bread, plans, monday, inner, shared_list];
+        let store = VaultStore::assemble(scoped.clone(), StoreKeys::new(keyring_for(Some(recipes))), vec![recipes, plans, inner], pull_subset(&peer, &held));
+        let mixed = row(
+            vec![grant(Some(recipes), "reader", "Recipes"), grant(Some(plans), "editor", "Plans"), grant(Some(inner), "editor", "Ours")],
+            Some("ann@example.com"),
+        );
+        assert_eq!(mixed.access(), Full, "something here may be written");
+        assert_eq!(mixed.read_only_roots(), vec![recipes]);
+
+        let access = |id: NodeId, row: &AccountStore| store.node_for(id, Some(row)).unwrap().access;
+        for (id, expected, what) in [
+            (recipes, Read, "the root it reads"),
+            (bread, Read, "a document under it"),
+            (plans, Full, "the root it edits"),
+            (monday, Full, "a document under it"),
+            (inner, Full, "an edited root inside the read one"),
+            (shared_list, Full, "in both scopes: the wider role"),
+        ] {
+            assert_eq!(access(id, &mixed), expected, "{what}");
+        }
+
+        // Every grant a reader's: the store's own word. A whole-store grant
+        // beside the shares answers for every node, either way.
+        let reading = row(vec![grant(Some(recipes), "reader", "Recipes"), grant(Some(plans), "reader", "Plans")], None);
+        assert!(held.iter().all(|id| access(*id, &reading) == Read));
+        assert!(reading.read_only_roots().is_empty(), "one answer covers the store");
+        let whole_editor = row(vec![grant(Some(recipes), "reader", "Recipes"), grant(None, "editor", "Family")], None);
+        assert!(held.iter().all(|id| access(*id, &whole_editor) == Full));
+        let whole_reader = row(vec![grant(Some(plans), "editor", "Plans"), grant(None, "reader", "Family")], None);
+        assert!(held.iter().all(|id| access(*id, &whole_reader) == Read));
+        // Nothing known about the store disables nothing.
+        assert_eq!(store.node_for(bread, None).unwrap().access, Full);
+
+        // What the app is handed: both answers, and the store described with
+        // the roots only read.
+        let mut client = VaultClient::new("me".to_string());
+        client.stores.insert(store_id, store);
+        client.rows.insert(store_id, mixed);
+        let BackendEvent::ChildrenLoaded { children, .. } = client.get_children(store_id, recipes) else { panic!("children of a held root") };
+        let mut listed_access: Vec<(NodeId, StoreAccess)> = children.iter().map(|n| (n.id, n.access)).collect();
+        listed_access.sort_by_key(|(id, _)| *id != bread);
+        assert_eq!(listed_access, vec![(bread, Read), (inner, Full)]);
+        let BackendEvent::NodeLoaded { node, .. } = client.get_node(store_id, bread) else { panic!("a held node") };
+        assert_eq!(node.access, Read);
+        let mut described = scoped;
+        client.describe(&mut described);
+        assert_eq!((described.access, described.read_only_roots), (Full, vec![recipes]));
     }
 
     #[test]

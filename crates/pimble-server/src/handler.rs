@@ -225,6 +225,27 @@ fn require_in_scope(reach: &Option<Reach>, id: NodeId, needed: Access) -> Result
     }
 }
 
+/// What `principal` may change of node `id` in plain store `store_id`: the
+/// judgement every `Node` an RPC returns carries as [`Node::access`]
+/// (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"), so a client knows
+/// before it offers an edit what a write of this node would be answered
+/// with. It reports, and decides nothing: a write is judged again where it
+/// lands. Both of the things that refuse one are asked, in the order a write
+/// RPC asks them: the caller's role (`authorize` for a whole-store grant,
+/// `reach` for a share's member, whose document under a reader's root nested
+/// in an editor's takes the wider role) and how this device holds the store
+/// (`write_refused`: a reader's replica, or a root held to read among roots
+/// that are edited). `Read` if either refuses, else `Full`. `reach` is the
+/// caller's in `store_id`, computed once for a list.
+fn judge_access(manager: &StoreManager, principal: &Principal, reach: &Option<Reach>, store_id: StoreId, id: NodeId) -> StoreAccess {
+    let role_allows = authorize(principal, store_id, Access::Write).is_ok() && require_in_scope(reach, id, Access::Write).is_ok();
+    if role_allows && !manager.write_refused(store_id, &[id]) {
+        StoreAccess::Full
+    } else {
+        StoreAccess::Read
+    }
+}
+
 /// The parent a node document's update names, for admitting a scoped
 /// member's `applyEdit` of a document the store does not have yet: the
 /// update is read into a scratch document and its `node.parent_id` is the
@@ -1133,6 +1154,17 @@ impl RpcHandler {
         if let Some(roots) = grant.roots_allowing(Access::Read) {
             if let Some(first) = roots.first() {
                 store.root_node_id = *first;
+            }
+            // A reader of one root who edits another: the roots only read,
+            // named as a replica's `sync.json` names its own. Nothing to
+            // name when one answer (`access`) covers every root.
+            let edited = grant.roots_allowing(Access::Write).unwrap_or_default();
+            if !edited.is_empty() {
+                for root in roots.iter().filter(|root| !edited.contains(root)) {
+                    if !store.read_only_roots.contains(root) {
+                        store.read_only_roots.push(*root);
+                    }
+                }
             }
             store.roots = roots;
             // The owner's store name is not a share's member's to learn
@@ -3050,10 +3082,12 @@ impl PimbleApiServer for RpcHandler {
         debug!("Getting node {} from store {}", request.node_id, request.store_id);
 
         let manager = self.store_manager.read().await;
-        require_in_scope(&Reach::of(&manager, &principal, request.store_id), request.node_id, Access::Read)?;
-        let node = manager
+        let reach = Reach::of(&manager, &principal, request.store_id);
+        require_in_scope(&reach, request.node_id, Access::Read)?;
+        let mut node = manager
             .get_node(request.store_id, request.node_id)
             .map_err(to_rpc_error)?;
+        node.access = judge_access(&manager, &principal, &reach, request.store_id, node.id);
 
         Ok(GetNodeResponse { node })
     }
@@ -3083,7 +3117,10 @@ impl PimbleApiServer for RpcHandler {
                 continue;
             }
             match manager.get_node(request.store_id, node_id) {
-                Ok(node) => nodes.push(node),
+                Ok(mut node) => {
+                    node.access = judge_access(&manager, &principal, &reach, request.store_id, node.id);
+                    nodes.push(node);
+                }
                 Err(e) => {
                     debug!("Failed to get node {}: {}", node_id, e);
                 }
@@ -3432,8 +3469,14 @@ impl PimbleApiServer for RpcHandler {
         // Children outside the caller's scope (in the store they live in,
         // a mount's source for a mount) are left out: a member never learns
         // another document's id.
-        if let Some(reach) = Reach::of(&manager, &principal, store_id) {
+        let reach = Reach::of(&manager, &principal, store_id);
+        if let Some(reach) = &reach {
             children.retain(|child| reach.readable.contains(&child.id));
+        }
+        // Each child is judged in the store it lives in: through a mount
+        // that is the source store, which is where a write of it would go.
+        for child in &mut children {
+            child.access = judge_access(&manager, &principal, &reach, store_id, child.id);
         }
         let newly_opened = manager.opened_since();
         drop(manager);
@@ -3648,7 +3691,9 @@ impl PimbleApiServer for RpcHandler {
         let state = self.sync_state_of(request.store_id).await;
         let sync_mode = self.sync_mode_of(request.store_id).await;
 
-        Ok(GetStoreSyncResponse { remote: remote_now, state, sync_mode, access: pimble_core::StoreAccess::Full })
+        // `Service` only, and a store just linked or unlinked this way is
+        // held whole: `sync.json` says `full` or is gone.
+        Ok(GetStoreSyncResponse { remote: remote_now, state, sync_mode, access: pimble_core::StoreAccess::Full, read_only_roots: Vec::new() })
     }
 
     async fn get_store_sync(
@@ -3672,7 +3717,7 @@ impl PimbleApiServer for RpcHandler {
         let state = self.sync_state_of(request.store_id).await;
         let sync_mode = self.sync_mode_of(request.store_id).await;
 
-        Ok(GetStoreSyncResponse { remote, state, sync_mode, access: store.access })
+        Ok(GetStoreSyncResponse { remote, state, sync_mode, access: store.access, read_only_roots: store.read_only_roots })
     }
 
     async fn list_remote_stores(

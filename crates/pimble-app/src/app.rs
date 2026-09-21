@@ -714,13 +714,17 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         return;
                     }
 
-                    // A store shared with this device to read changes in no
-                    // way (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"):
+                    // A node this device may only read changes in no way
+                    // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"):
                     // the context menu's "Rename" is disabled there, so the
                     // double-click shortcut is not a way around it. An editor
-                    // renames like anyone else.
-                    let renameable = parse_tree_value(&value)
-                        .map_or(true, |(s_id, _)| store.store_access(s_id).allows_write());
+                    // renames like anyone else. Judged per node: a reader's
+                    // root may sit beside an editor's in the same store.
+                    let renameable = match parse_tree_value(&value) {
+                        Some((s_id, Some(n_id))) => store.node_access(s_id, n_id).allows_write(),
+                        Some((s_id, None)) => store.store_access(s_id).allows_write(),
+                        None => true,
+                    };
                     if !renameable {
                         return;
                     }
@@ -888,24 +892,30 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 .map(|(s_id, _)| store.is_vault(s_id))
                 .unwrap_or(false);
 
-            // What this device may change in the store this row's node
-            // belongs to (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles").
-            // `Full` is one's own store and an editor's scope alike, so an
-            // editor of a share has nothing greyed out; only a reader does.
+            // What this device may change of this row's node
+            // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"): the
+            // server's own judgement of the node (`AppStore::node_access`),
+            // because one store can hold a root this account reads beside a
+            // root it edits, and only the rows under the first have anything
+            // greyed out. A store row asks about the store. `Full` is one's
+            // own store and an editor's scope alike, so an editor of a share
+            // has nothing greyed out; only a reader does.
             // `parse_tree_value` returns the CANONICAL pair, so a node
-            // reached through a mount is judged by its source store, which is
-            // the store the RPC would go to. Snapshotted like `is_linked_now`
-            // (rinch #714); the row's data carries it, so a store whose access
-            // changes re-renders its rows with fresh items.
-            let access_now = parsed
-                .map(|(s_id, _)| store.store_access(s_id))
-                .unwrap_or_default();
+            // reached through a mount is judged as the node it is in its
+            // source store, which is where the RPC would go. Snapshotted like
+            // `is_linked_now` (rinch #714); the row's data carries it, so a
+            // node whose access changes re-renders its row with fresh items.
+            let access_now = match parsed {
+                Some((s_id, Some(n_id))) => store.node_access(s_id, n_id),
+                Some((s_id, None)) => store.store_access(s_id),
+                None => Default::default(),
+            };
             let can_write_tree = access_now.allows_write();
-            // A mount's "New Node" creates under the mount's SOURCE, so the
-            // source store's access is what governs that one item.
+            // A mount's "New Node" creates under the mount's SOURCE node, so
+            // that node's access is what governs that one item.
             let can_write_mount_source = mount_sig
-                .and_then(|sig| untracked(|| sig.with(|m| m.mount_ref.as_ref().map(|r| r.source_store))))
-                .map_or(can_write_tree, |source| store.store_access(source).allows_write());
+                .and_then(|sig| untracked(|| sig.with(|m| m.mount_ref.as_ref().map(|r| (r.source_store, r.source_node)))))
+                .map_or(can_write_tree, |(source_store, source_node)| store.node_access(source_store, source_node).allows_write());
             // Whether this row's node carries a share marker (a store row
             // takes its root node's, like its icon and colour, and a partial
             // replica's row has no root of its own): the badge.
@@ -996,12 +1006,28 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     if dragged_value == nv { return; }
                     let Some((drag_store_id, Some(drag_node_id))) = parse_tree_value(&dragged_value) else { return; };
                     let new_parent_id = if let Some((target_store_id, target_node_id_opt)) = parse_tree_value(&nv) {
-                        // A store shared to read takes no moves: the rows do
-                        // not drag and the server would refuse it anyway
+                        // What is only read takes no moves: such rows do not
+                        // drag and the server would refuse it anyway
                         // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles").
-                        // An editor moves nodes inside their scope freely.
-                        if !store.store_access(target_store_id).allows_write() {
-                            tracing::info!("Ignoring drop into {:?}: it is shared with us to read", target_store_id);
+                        // An editor moves nodes inside their scope freely. A
+                        // move edits three documents, and the server judges
+                        // all three: the node, the list it leaves and the
+                        // list it joins. So does this, before anything is
+                        // sent, each by the server's own word on that node.
+                        // A drop on a store row lands in the root that row
+                        // stands for, so that node is the one judged.
+                        let target_access = match target_node_id_opt.or_else(|| store.root_node_id(target_store_id)) {
+                            Some(nid) => store.node_access(target_store_id, nid),
+                            None => store.store_access(target_store_id),
+                        };
+                        let leaves_access = store
+                            .cached_parent_id(drag_store_id, drag_node_id)
+                            .map_or(pimble_core::StoreAccess::Full, |old_parent| store.node_access(drag_store_id, old_parent));
+                        if !target_access.allows_write()
+                            || !leaves_access.allows_write()
+                            || !store.node_access(drag_store_id, drag_node_id).allows_write()
+                        {
+                            tracing::info!("Ignoring drop of {:?} into {}: one of them is shared with us to read", drag_node_id, nv);
                             return;
                         }
                         if drag_store_id != target_store_id {
@@ -1251,9 +1277,9 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 move || paste_mount_here(store, &nv)
             };
 
-            // Build the wrapper span with drag-and-drop via rsx. A node in a
-            // store whose structure this device may not change does not drag
-            // out of its place, as the drop handler refuses drops into one.
+            // Build the wrapper span with drag-and-drop via rsx. A node this
+            // device may not change does not drag out of its place, as the
+            // drop handler refuses drops into one.
             let draggable = if is_store_root || !can_write_tree { "false" } else { "true" };
 
             let icon_el = render_tabler_icon(__scope, icon, TablerIconStyle::Outline);
@@ -1474,7 +1500,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             // Why the items below are disabled, when some of them are: one
             // dimmed line at the top of the menu, rather than the same reason
             // repeated on every item or (worse) items greyed out saying
-            // nothing. Only a store shared to read has one — an editor's menu
+            // nothing. Only what is shared to read has one — an editor's menu
             // is a full menu (docs/NODE_DOCUMENT_CONTRACT.md section 5).
             let access_note_text = crate::state::access_note(access_now);
             let menu_note: Option<NodeHandle> = if access_note_text.is_empty() {
@@ -1811,10 +1837,10 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         store.root_node_id(sid).map(|rid| (sid, rid))
                     })
                 })
-                // Not into a store shared with this device to read
+                // Not under a node this device may only read
                 // (docs/NODE_DOCUMENT_CONTRACT.md section 5): the row's "New
                 // Node" is disabled there, and so is this.
-                .filter(|(s_id, _)| store.store_access(*s_id).allows_write());
+                .filter(|(s_id, root_id)| store.node_access(*s_id, *root_id).allows_write());
             match result {
                 Some((s_id, root_id)) => store.send(BackendCommand::CreateNode {
                     store_id: s_id,
@@ -1841,15 +1867,17 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
 
         let toolbar_handle = crate::toolbar::render_pimble_toolbar(__scope);
 
-        // Whether the document in the pane belongs to a store this device may
-        // only read (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles").
-        // `active_edit` holds the node's CANONICAL store — the one the edit
-        // would be written to, even when the node was reached through a mount
-        // — so that is the store whose access decides. Reactive on the active
-        // node and on its store's own signal, so the pane follows a store
-        // whose access arrives or changes. The toolbar gives way to a line
-        // saying so; `editor::reject_local_edit` is what happens if someone
-        // types anyway.
+        // Whether the document in the pane is one this device may only read
+        // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"): its store is
+        // held to read, or the server judged this node so (a reader's root
+        // in a store where other roots are edited) — `AppStore::node_access`,
+        // read here with tracking. `active_edit` holds the node's CANONICAL
+        // pair — where the edit would be written, even when the node was
+        // reached through a mount — so that is what decides. Reactive on the
+        // active node, on its store's own signal and on the node's, so the
+        // pane follows an access that arrives or changes. The toolbar gives
+        // way to a line saying so; `editor::reject_local_edit` is what
+        // happens if someone types anyway.
         //
         // The store's own signal comes out of the registry first and is read
         // after that borrow is released: rinch keeps every signal in one
@@ -1859,7 +1887,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         let editor_read_only = move || -> bool {
             let Some(active) = store.active_edit.get() else { return false };
             let sig = store.store_data.with(|map| map.get(&active.store_id).copied());
-            sig.map_or(false, |sig| sig.with(|s| !s.access.allows_write()))
+            if sig.map_or(false, |sig| sig.with(|s| !s.access.allows_write())) {
+                return true;
+            }
+            let node_sig = store.node_data.with(|map| map.get(&(active.store_id, active.node_id)).copied());
+            node_sig.map_or(false, |sig| sig.with(|n| !n.access.allows_write()))
         };
 
         // Editor empty state icon

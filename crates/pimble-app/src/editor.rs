@@ -77,11 +77,16 @@ pub(crate) fn start_editing(
     // (AppStore/StoreId/NodeId), so it is itself `Copy` and can be reused below.
     let outbound = move |delta: Vec<u8>| {
         use base64::Engine;
-        // A store shared read-only takes remote changes but sends none back.
-        // `store_id` is the node's CANONICAL store (`open_node` parses the
-        // tree value, which strips any mount path), so a node reached through
-        // a mount is judged by the store the edit would be written to.
-        if !store.store_access(store_id).allows_write() {
+        // A document shared read-only takes remote changes but sends none
+        // back. Judged per node, by the server's own word on it
+        // (`AppStore::node_access`): a store can hold a root this account
+        // reads beside one it edits, and a delta the server would refuse is
+        // text on this screen that exists nowhere. `store_id` is the node's
+        // CANONICAL store (`open_node` parses the tree value, which strips
+        // any mount path), so a node reached through a mount is judged as
+        // the node the edit would be written to. Asked at every edit, not
+        // once at open: a role changes while a document is open.
+        if !store.node_access(store_id, node_id).allows_write() {
             reject_local_edit(store, store_id, node_id);
             return;
         }
@@ -120,9 +125,9 @@ pub(crate) fn start_editing(
         handle.load_html("");
         match handle.start_collaboration_host(outbound) {
             Ok(snapshot) => {
-                // Seeding the node's document is a content write; a store
+                // Seeding the node's document is a content write; a node
                 // this device may only read is left exactly as it is.
-                if store.store_access(store_id).allows_write() {
+                if store.node_access(store_id, node_id).allows_write() {
                     store.send(BackendCommand::SetNodeContent {
                         store_id,
                         node_id,
@@ -241,12 +246,12 @@ pub(crate) fn apply_reconcile(
         schedule_label_refresh(store, store_id, node_id);
         crate::toolbar::bump_toolbar();
     }
-    // A store shared read-only sends nothing back, here as in `outbound`: the
-    // session's own state is not the server's to take
+    // A document shared read-only sends nothing back, here as in `outbound`:
+    // the session's own state is not the server's to take
     // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"). Without this the
     // reconcile that follows every open pushes the freshly hosted empty
     // document, and the server refuses it out loud.
-    if !store.store_access(store_id).allows_write() {
+    if !store.node_access(store_id, node_id).allows_write() {
         return;
     }
     if let Some(ours) = handle.collab_sync_diff(server_state_vector) {

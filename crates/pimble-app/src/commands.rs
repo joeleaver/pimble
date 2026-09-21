@@ -442,10 +442,8 @@ pub async fn process_command(
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
-            match c.set_store_sync_with_mode(store_id, remote).await {
-                Ok((remote, state, sync_mode)) => {
-                    Some(BackendEvent::StoreSyncChanged { store_id, remote, state, sync_mode })
-                }
+            match c.set_store_sync_response(store_id, remote).await {
+                Ok(answer) => Some(store_sync_changed(store_id, answer)),
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
         }
@@ -454,10 +452,8 @@ pub async fn process_command(
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
-            match c.get_store_sync_with_mode(store_id).await {
-                Ok((remote, state, sync_mode)) => {
-                    Some(BackendEvent::StoreSyncChanged { store_id, remote, state, sync_mode })
-                }
+            match c.get_store_sync_response(store_id).await {
+                Ok(answer) => Some(store_sync_changed(store_id, answer)),
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
         }
@@ -590,6 +586,20 @@ pub async fn process_command(
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
         }
+    }
+}
+
+/// A store's sync answer as the event the UI takes it as: all of it, what
+/// this device may change included. Dropping `access` here is how a role
+/// changed while the app ran used to reach nothing until a restart.
+fn store_sync_changed(store_id: pimble_core::StoreId, answer: pimble_rpc::GetStoreSyncResponse) -> BackendEvent {
+    BackendEvent::StoreSyncChanged {
+        store_id,
+        remote: answer.remote,
+        state: answer.state,
+        sync_mode: answer.sync_mode,
+        access: answer.access,
+        read_only_roots: answer.read_only_roots,
     }
 }
 

@@ -739,3 +739,68 @@ async fn a_reader_of_one_root_and_editor_of_another_writes_only_under_the_second
     assert_eq!(listed[0].access, pimble_core::StoreAccess::Full, "something here may be written");
     assert_eq!(listed[0].roots.len(), 3);
 }
+
+/// Every node an RPC returns says what its caller may change of it
+/// (`Node::access`), by the judgement a write of it would meet: a client
+/// disables what would be refused instead of letting someone type into a
+/// document the server will not take. The same store answers differently to
+/// a reader of one root who edits another, to a whole-store reader and to
+/// the operator, and `getStoreSync`/`listStores` name the roots only read.
+#[tokio::test]
+async fn a_returned_node_says_what_its_caller_may_change_of_it() {
+    use pimble_core::StoreAccess::{Full, Read};
+    let s = SharedStore::start().await;
+    let (store_id, read_root, read_doc) = (s.store_id, s.shared, s.inside);
+    let edit_root = s.admin.create_node(store_id, Some(s.root), "folder", "Edited").await.unwrap();
+    let edit_doc = s.admin.create_node(store_id, Some(edit_root), "document", "E").await.unwrap();
+    let nested_edit_root = s.admin.create_node(store_id, Some(read_root), "folder", "Edited inside").await.unwrap();
+    let nested_doc = s.admin.create_node(store_id, Some(nested_edit_root), "document", "Wider").await.unwrap();
+    let member = s.member("dana", &[(read_root, "reader"), (edit_root, "editor"), (nested_edit_root, "editor")]).await;
+
+    // getNode
+    for (id, expected, what) in [
+        (read_root, Read, "the root it reads"),
+        (read_doc, Read, "a document under the root it reads"),
+        (edit_root, Full, "the root it edits"),
+        (edit_doc, Full, "a document under the root it edits"),
+        (nested_edit_root, Full, "an edited root inside the read one"),
+        (nested_doc, Full, "in both scopes: the wider role"),
+    ] {
+        assert_eq!(member.get_node(store_id, id).await.unwrap().access, expected, "getNode: {what}");
+    }
+    // getNodes
+    let nodes = member.get_nodes(store_id, vec![read_doc, edit_doc, nested_doc]).await.unwrap();
+    assert_eq!(nodes.iter().map(|n| (n.id, n.access)).collect::<Vec<_>>(), vec![(read_doc, Read), (edit_doc, Full), (nested_doc, Full)]);
+    // getChildren: each child judged for itself, in one list.
+    let (_, under_read) = member.get_children(store_id, read_root).await.unwrap();
+    let mut under_read: Vec<_> = under_read.iter().map(|n| (n.id, n.access)).collect();
+    under_read.sort_by_key(|(id, _)| *id != read_doc);
+    assert_eq!(under_read, vec![(read_doc, Read), (nested_edit_root, Full)]);
+    let (_, under_edit) = member.get_children(store_id, edit_root).await.unwrap();
+    assert_eq!(under_edit.iter().map(|n| (n.id, n.access)).collect::<Vec<_>>(), vec![(edit_doc, Full)]);
+
+    // The judgement is the one a write meets.
+    refused_as_read_only(member.apply_edit(store_id, read_doc, "dana", edit_of("no")).await, "what was answered `read` refuses the edit");
+    member.apply_edit(store_id, nested_doc, "dana", edit_of("yes")).await.expect("what was answered `full` takes it");
+
+    // Which roots are only read, for a client to notice a change by.
+    let (_, _, _, access) = member.get_store_sync_with_access(store_id).await.unwrap();
+    assert_eq!(access, Full);
+    assert_eq!(member.get_store_sync_response(store_id).await.unwrap().read_only_roots, vec![read_root]);
+    assert_eq!(member.list_stores().await.unwrap()[0].read_only_roots, vec![read_root]);
+
+    // A whole-store reader: everything reads. The operator: everything is full.
+    let mut whole = HashMap::new();
+    whole.insert(store_id, "reader");
+    let reader_jwt = make_jwt(&s.sk, "kid-1", s.issuer, "reader", "reader@example.com", &whole, 3600);
+    let reader = PimbleClient::connect_with_auth(&s.url, &AuthMethod::Bearer { token: reader_jwt }).await.unwrap();
+    assert_eq!(reader.get_node(store_id, edit_doc).await.unwrap().access, Read);
+    assert!(reader.get_children(store_id, s.root).await.unwrap().1.iter().all(|n| n.access == Read));
+    assert!(reader.get_store_sync_response(store_id).await.unwrap().read_only_roots.is_empty(), "one answer covers the store");
+    assert_eq!(s.admin.get_node(store_id, read_doc).await.unwrap().access, Full);
+    assert!(s.admin.get_children(store_id, read_root).await.unwrap().1.iter().all(|n| n.access == Full));
+
+    // `full` is the absence of the field: an answer is what it was before.
+    let wire = serde_json::to_value(s.admin.get_node(store_id, read_doc).await.unwrap()).unwrap();
+    assert!(wire.get("access").is_none(), "{wire}");
+}
