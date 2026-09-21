@@ -22,13 +22,14 @@ const LOGIN_ROUTE: crate::route::Route = crate::route::Route::Login;
 
 /// A minted credential and the servers it opens.
 ///
-/// `rpc_url` and `token` are the session's own: the server the store list comes
-/// from, and the credential for it. `stores` names any store served somewhere
-/// else. Today it is always absent and every store is on `rpc_url`; in the
-/// relay phase a shared store is served by its owner's machine through a relay
-/// and arrives here with its own URL and, if it needs one, its own token
-/// (docs/CRYPTO_CONTRACT.md, "Endpoint-agnostic"). Nothing downstream asks
-/// which of the two a store came from.
+/// `rpc_url` and `token` are the session's own: the server every hosted store
+/// is on, and the credential for it. `stores` names each store served
+/// somewhere else: from its owner's computer, through Pimble Cloud's relay
+/// (docs/RELAY_CONTRACT.md), at a URL of its own and with a token that names
+/// that store alone, which is the only credential the relay takes. Absent on
+/// a service from before the relay (docs/CRYPTO_CONTRACT.md,
+/// "Endpoint-agnostic"). The vault client treats a store the same whichever
+/// it came from; only the backend loop knows that one of them can be away.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Session {
     /// The JWT, `aud` of `pimble`, carrying this user's grants.
@@ -47,7 +48,10 @@ pub struct Session {
 pub struct StoreEndpoint {
     pub store_id: pimble_core::StoreId,
     pub rpc_url: String,
-    /// The credential for `rpc_url`, when it differs from the session's.
+    /// The credential for `rpc_url`, when it differs from the session's: the
+    /// token minted for this store alone. It expires with the session's
+    /// (`exp` rides along in the answer and is the same hour), so one refresh
+    /// renews them all.
     #[serde(default)]
     pub token: Option<String>,
 }

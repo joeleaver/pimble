@@ -7,11 +7,14 @@
 //! noticing when a socket dies.
 //!
 //! **There is no "the" server.** Every command is answered through the endpoint
-//! that serves the store it names (`crate::endpoints`), which today is the one
-//! the session gave for everything and tomorrow may be a relay holding one
-//! shared store. The loop supervises the session's endpoint — the one the store
-//! list comes from — and any other endpoint connects the first time a store on
-//! it is touched.
+//! that serves the store it names (`crate::endpoints`): the session's own for
+//! every hosted store, and one of its own for each store served from its
+//! owner's computer through Pimble Cloud's relay (docs/RELAY_CONTRACT.md). The
+//! loop supervises all of them. The session's is the one everything waits for.
+//! A relayed store's is down whenever its owner's computer is, for hours or
+//! days, so it is tried on a backoff that never holds the loop up, its store
+//! is listed from the account's own row of it meanwhile (`owner offline`), and
+//! what it serves fills in when it connects ([`supervise_relayed`]).
 //!
 //! One thing sits in front of `process_command`: the vault client
 //! (`crate::vault`). A command for an encrypted store is answered from the
@@ -84,11 +87,15 @@ impl Subscriptions {
         self.wanted.insert(store_id);
     }
 
-    /// Which stores to subscribe to again on a new connection: the ones asked
-    /// for that the server still lists. A store that is gone — a grant
-    /// withdrawn, a store deleted — is forgotten rather than retried forever.
-    fn restore(&mut self, listed: &[StoreId]) -> Vec<StoreId> {
-        self.wanted.retain(|id| listed.contains(id));
+    /// Which stores to subscribe to again on a new connection to one
+    /// endpoint: the ones asked for that it lists. A store of that endpoint's
+    /// that is gone — a grant withdrawn, a store deleted — is forgotten rather
+    /// than retried forever. `served_here` says which stores are this
+    /// endpoint's to list: a store served somewhere else (from its owner's
+    /// computer, which may be off for days) is not gone because this endpoint
+    /// does not list it, and is restored when its own connects.
+    fn restore(&mut self, listed: &[StoreId], served_here: impl Fn(StoreId) -> bool) -> Vec<StoreId> {
+        self.wanted.retain(|id| !served_here(*id) || listed.contains(id));
         listed.iter().copied().filter(|id| self.wanted.contains(id)).collect()
     }
 }
@@ -136,6 +143,7 @@ async fn run(
 
     let mut vault = VaultClient::new(client_id.clone());
     let mut endpoints = Endpoints::from_session(&session);
+    vault.set_relayed(relayed_stores(&endpoints));
     let mut subscriptions = Subscriptions::default();
 
     loop {
@@ -156,7 +164,11 @@ async fn run(
                 Ok(fresh) => {
                     tracing::debug!("Refreshed the access token");
                     session = fresh;
+                    // Every store's endpoint and token again: a share
+                    // accepted since is a new endpoint to keep up, one given
+                    // up is an endpoint let go.
                     endpoints.adopt(&session);
+                    vault.set_relayed(relayed_stores(&endpoints));
                 }
                 Err(TokenError::Unauthorized) => {
                     tracing::warn!("The session is gone; going back to the login page");
@@ -170,9 +182,8 @@ async fn run(
             }
         }
 
-        // 2. Keep the session's endpoint up. It is the one the store list comes
-        //    from, so it is the one worth supervising; any other endpoint is
-        //    connected on demand by whatever first asks for a store on it.
+        // 2. Keep the session's endpoint up. It is the one the hosted stores
+        //    come from and the one everything else waits for.
         let session_url = endpoints.session_url();
         if !supervise(
             &mut endpoints,
@@ -188,14 +199,20 @@ async fn run(
             continue;
         }
 
+        // 2b. Keep each relayed store's endpoint up too, without ever waiting
+        //     on one: a store served from its owner's computer is listed from
+        //     its own endpoint, at the start and after every token refresh,
+        //     and from the account's row of it while that endpoint is down.
+        let mut ran_anything =
+            supervise_relayed(&mut endpoints, &mut vault, &mut subscriptions, &event_tx, &signal_ui, &client_id).await;
+
         // 3. Apply whatever the vault subscriptions delivered since the last
         //    pass. The subscription task only forwards raw notifications;
         //    decrypting and merging them needs the vault client itself, which
         //    lives here.
-        let mut ran_anything = false;
         for event in vault.pump() {
             ran_anything = true;
-            emit(&event_tx, &signal_ui, event);
+            emit(&event_tx, &signal_ui, described(&vault, event));
         }
 
         // 3b. Settle any tree whose merged updates have stopped arriving: the
@@ -208,7 +225,7 @@ async fn run(
             };
             for event in vault.repair(&client, store_id).await {
                 ran_anything = true;
-                emit(&event_tx, &signal_ui, event);
+                emit(&event_tx, &signal_ui, described(&vault, event));
             }
         }
 
@@ -224,7 +241,7 @@ async fn run(
             };
             for event in vault.retry_key(&client, store_id, &signal_ui).await {
                 ran_anything = true;
-                emit(&event_tx, &signal_ui, event);
+                emit(&event_tx, &signal_ui, described(&vault, event));
             }
         }
 
@@ -350,9 +367,15 @@ async fn supervise(
                 // neither (the desktop's vault link says the same thing in
                 // `connect_and_sync`). Anything the pull has already applied
                 // arrives again and merges to nothing.
-                vault.forget_subscriptions();
+                //
+                // Only what this endpoint serves: a store served from its
+                // owner's computer has a socket of its own, whose
+                // subscriptions and catch-up are `supervise_relayed`'s.
+                let relayed: HashSet<StoreId> = relayed_stores(endpoints).into_iter().collect();
+                let served_here = |store_id: StoreId| !relayed.contains(&store_id);
+                vault.forget_subscriptions(served_here);
                 let listed_ids: Vec<StoreId> = stores.iter().map(|store| store.id).collect();
-                for store_id in subscriptions.restore(&listed_ids) {
+                for store_id in subscriptions.restore(&listed_ids, served_here) {
                     let event = if vault.is_encrypted(store_id) {
                         vault.subscribe(c, store_id, signal_ui).await
                     } else {
@@ -374,7 +397,7 @@ async fn supervise(
                 // A store already open from before this connection: pull what
                 // the server took while the socket was down, and resend what
                 // this client could not deliver.
-                for event in vault.catch_up(c).await {
+                for event in vault.catch_up(c, served_here).await {
                     emit(event_tx, signal_ui, event);
                 }
                 for event in vault.open_listed(c, &stores, signal_ui).await {
@@ -429,6 +452,138 @@ async fn supervise(
     }
 }
 
+/// Every store the session says is served somewhere other than its own
+/// endpoint: from its owner's computer, through Pimble Cloud's relay.
+fn relayed_stores(endpoints: &Endpoints) -> Vec<StoreId> {
+    endpoints.relay_urls().iter().flat_map(|url| endpoints.stores_at(url)).collect()
+}
+
+/// Keep the endpoint of every store served from its owner's computer
+/// connected (docs/RELAY_CONTRACT.md, "The apps"), one pass of the loop at a
+/// time. Answers whether anything was done.
+///
+/// The same proof as the session's endpoint, the same restored subscriptions,
+/// the same catch-up and the same opening of what it lists, for the stores it
+/// serves and no others. Two things differ. A failed attempt is never sat
+/// out: the owner's computer being off is this endpoint's ordinary state for
+/// hours or days, so the next attempt is a time to come back at
+/// (`Endpoint::next_attempt_at`), and the loop carries on with everything
+/// else. And being down is said where the person looks for the store, not in
+/// the status bar: its row comes from the account's own list with `owner
+/// offline` ([`VaultClient::endpoint_down`]) until the endpoint answers, when
+/// it is announced as the store it is and the tree fills in
+/// ([`VaultClient::endpoint_up`]). Pimble Cloud has just answered this page
+/// (the session's endpoint is up, or this would not run), so "its relay does
+/// not reach the store" does mean that.
+async fn supervise_relayed(
+    endpoints: &mut Endpoints,
+    vault: &mut VaultClient,
+    subscriptions: &mut Subscriptions,
+    event_tx: &Sender<BackendEvent>,
+    signal_ui: &Arc<dyn Fn() + Send + Sync>,
+    client_id: &str,
+) -> bool {
+    let mut ran_anything = false;
+    for url in endpoints.relay_urls() {
+        let served = endpoints.stores_at(&url);
+        let Some(endpoint) = endpoints.get_mut(&url) else { continue };
+
+        // A connection that has held up for a while is a good one.
+        if let Some(since) = endpoint.connected_at {
+            if endpoint.is_connected() && now_ms() - since >= SETTLE_MS {
+                endpoint.backoff_ms = RECONNECT_MIN_MS;
+                endpoint.connected_at = None;
+            }
+        }
+        if endpoint.is_connected() {
+            continue;
+        }
+        if endpoint.client.take().is_some() {
+            // Tried again at once, and only a failed attempt says `owner
+            // offline`: the relay also closes a socket whose token has run
+            // out, about once an hour, and that is not the owner going
+            // anywhere.
+            tracing::info!("The connection to {} closed", url);
+            endpoint.connected_at = None;
+            endpoint.next_attempt_at = 0.0;
+        }
+        if now_ms() < endpoint.next_attempt_at {
+            continue;
+        }
+
+        ran_anything = true;
+        let auth = endpoint.auth();
+        let proven = match PimbleClient::connect_with_auth(&url, &auth).await {
+            Ok(c) => {
+                let mut candidate = Some(Arc::new(c));
+                match process_command(&mut candidate, BackendCommand::ListStores, event_tx, signal_ui, client_id).await {
+                    Some(BackendEvent::StoresListed { stores }) => Ok((candidate, stores)),
+                    Some(BackendEvent::Error { message }) => Err(message),
+                    _ => Err("the server did not answer listStores".to_string()),
+                }
+            }
+            Err(e) => Err(e.to_string()),
+        };
+
+        match proven {
+            Ok((candidate, mut stores)) => {
+                // Only the stores the session named at this endpoint: what
+                // else it may list is not this page's to take from it.
+                stores.retain(|store| served.contains(&store.id));
+                if let Some(c) = candidate.as_ref() {
+                    // A share accepted since the session's endpoint last
+                    // connected is in the account's list and not yet here.
+                    vault.learn_rows().await;
+                    let served_here = |store_id: StoreId| served.contains(&store_id);
+                    vault.forget_subscriptions(served_here);
+                    let listed_ids: Vec<StoreId> = stores.iter().map(|store| store.id).collect();
+                    for store_id in subscriptions.restore(&listed_ids, served_here) {
+                        if let Some(BackendEvent::Error { message }) = vault.subscribe(c, store_id, signal_ui).await {
+                            tracing::warn!("Subscribing to {} again failed: {}", store_id, message);
+                        }
+                    }
+                    for event in vault.catch_up(c, served_here).await {
+                        emit(event_tx, signal_ui, event);
+                    }
+                    for event in vault.open_listed(c, &stores, signal_ui).await {
+                        emit(event_tx, signal_ui, event);
+                    }
+                }
+                if let Some(endpoint) = endpoints.get_mut(&url) {
+                    endpoint.client = candidate;
+                    endpoint.connected_at = Some(now_ms());
+                    endpoint.reported_failure = false;
+                    endpoint.next_attempt_at = 0.0;
+                }
+                // Back from `owner offline`: the store it is, so the tree
+                // fetches it. Then the list, for a store the UI has never
+                // heard of (a store it knows is left as it is).
+                let back = vault.endpoint_up(&served, &stores);
+                for event in back {
+                    emit(event_tx, signal_ui, event);
+                }
+                vault.describe_all(&mut stores);
+                emit(event_tx, signal_ui, BackendEvent::StoresListed { stores });
+            }
+            Err(message) => {
+                let Some(endpoint) = endpoints.get_mut(&url) else { continue };
+                if !endpoint.reported_failure {
+                    endpoint.reported_failure = true;
+                    tracing::info!("{} does not answer ({}): its owner's computer is offline", url, message);
+                } else {
+                    tracing::debug!("{} still does not answer ({})", url, message);
+                }
+                endpoint.next_attempt_at = now_ms() + f64::from(endpoint.backoff_ms);
+                endpoint.backoff_ms = endpoint.backoff_ms.saturating_mul(2).min(RECONNECT_MAX_MS);
+                for event in vault.endpoint_down(&served) {
+                    emit(event_tx, signal_ui, event);
+                }
+            }
+        }
+    }
+    ran_anything
+}
+
 /// One command: the vault client first, then the shared implementation, both
 /// against the endpoint that serves the store the command names.
 async fn dispatch(
@@ -459,6 +614,17 @@ async fn dispatch(
     // by which connection happens to be open.
     let store_id = crate::vault::store_id_of(&cmd);
 
+    // A store served from its owner's computer whose socket has died since
+    // the supervisor last looked: down, as of now. The supervisor tries it
+    // again on its next pass and says so if it is back.
+    if let Some(store_id) = store_id.filter(|id| endpoints.is_relayed(*id)) {
+        if !endpoints.client_for(store_id).is_some_and(|c| c.is_connected()) {
+            for event in vault.endpoint_down(&[store_id]) {
+                emit(event_tx, signal_ui, event);
+            }
+        }
+    }
+
     // A reader's write is refused here, before anything is asked of any
     // server: the answer would be this same sentence, and it is the same one
     // whether the store is encrypted or plain
@@ -468,19 +634,33 @@ async fn dispatch(
         return;
     }
 
+    // A store whose owner's computer is off is answered from what this page
+    // holds of it, which may be nothing: there is no connection to ask, and
+    // that is no error (docs/RELAY_CONTRACT.md, "The apps").
+    let cmd = match vault.handle_unreachable(cmd) {
+        Handled::Yes(event) => {
+            if let Some(event) = event {
+                emit(event_tx, signal_ui, event);
+            }
+            return;
+        }
+        Handled::No(cmd) => cmd,
+    };
+
     let url = match store_id {
         Some(store_id) => endpoints.url_for(store_id),
         None => endpoints.session_url(),
     };
 
-    // An endpoint the supervisor does not drive connects the first time a
-    // store on it is touched.
     let live = match store_id {
         Some(store_id) => endpoints.client_for(store_id),
         None => endpoints.client_at(&url),
     };
     let client = match live.filter(|c| c.is_connected()) {
         Some(client) => Some(client),
+        // A relayed store's endpoint is `supervise_relayed`'s to connect, on
+        // its backoff: never once per command.
+        None if store_id.is_some_and(|id| endpoints.is_relayed(id)) => None,
         None => match endpoints.ensure_connected(&url).await {
             Ok(client) => Some(client),
             Err(message) => {
@@ -591,10 +771,10 @@ mod tests {
         // Asking twice is one subscription, not two.
         subscriptions.remember(a);
 
-        let again = subscriptions.restore(&[a, b]);
+        let again = subscriptions.restore(&[a, b], |_| true);
         assert_eq!(again, vec![a, b]);
         // And again on the connection after that: a restore does not consume.
-        assert_eq!(subscriptions.restore(&[a, b]), vec![a, b]);
+        assert_eq!(subscriptions.restore(&[a, b], |_| true), vec![a, b]);
     }
 
     #[test]
@@ -605,10 +785,37 @@ mod tests {
         subscriptions.remember(kept);
         subscriptions.remember(gone);
 
-        assert_eq!(subscriptions.restore(&[kept]), vec![kept]);
+        assert_eq!(subscriptions.restore(&[kept], |_| true), vec![kept]);
         // A grant withdrawn while the socket was down: not retried forever,
         // and not restored if the store comes back without the UI asking.
-        assert_eq!(subscriptions.restore(&[kept, gone]), vec![kept]);
+        assert_eq!(subscriptions.restore(&[kept, gone], |_| true), vec![kept]);
+    }
+
+    /// Subscriptions are restored per endpoint (docs/RELAY_CONTRACT.md): a
+    /// store served from its owner's computer is not on the session's list,
+    /// which is no reason to forget it, and it is subscribed again when its
+    /// own endpoint connects, however long that was down.
+    #[test]
+    fn a_store_served_elsewhere_is_restored_by_its_own_endpoint() {
+        let hosted = StoreId::new();
+        let relayed = StoreId::new();
+        let mut subscriptions = Subscriptions::default();
+        subscriptions.remember(hosted);
+        subscriptions.remember(relayed);
+
+        // The session's endpoint reconnects, twice, while the owner is away.
+        let at_session = |id: StoreId| id != relayed;
+        assert_eq!(subscriptions.restore(&[hosted], at_session), vec![hosted]);
+        assert_eq!(subscriptions.restore(&[hosted], at_session), vec![hosted]);
+
+        // The owner's computer is back: its endpoint lists the store.
+        let at_relay = |id: StoreId| id == relayed;
+        assert_eq!(subscriptions.restore(&[relayed], at_relay), vec![relayed]);
+        // A relay endpoint that no longer lists it (the share was stopped)
+        // forgets it, and the hosted store is none of its business.
+        assert!(subscriptions.restore(&[], at_relay).is_empty());
+        assert!(subscriptions.restore(&[relayed], at_relay).is_empty());
+        assert_eq!(subscriptions.restore(&[hosted], at_session), vec![hosted]);
     }
 
     #[test]
@@ -617,6 +824,6 @@ mod tests {
         // registered yet is not this loop's business.
         let listed = StoreId::new();
         let mut subscriptions = Subscriptions::default();
-        assert!(subscriptions.restore(&[listed]).is_empty());
+        assert!(subscriptions.restore(&[listed], |_| true).is_empty());
     }
 }

@@ -514,9 +514,33 @@ pub async fn process_command(
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::ListHostedStores, message: "Not connected".into() });
             };
-            match c.cloud_list_hosted_stores().await {
-                Ok(stores) => Some(BackendEvent::CloudHostedStoresListed { stores }),
+            // The whole answer: which rows are relay-tier rides beside them.
+            match c.cloud_list_hosted_stores_response().await {
+                Ok(answer) => Some(BackendEvent::CloudHostedStoresListed { stores: answer.stores, relayed: answer.relayed }),
                 Err(e) => Some(BackendEvent::CloudError { op: CloudOp::ListHostedStores, message: e.to_string() }),
+            }
+        }
+
+        // Sharing from this computer (docs/RELAY_CONTRACT.md). The link's
+        // state arrives afterwards as ordinary `SyncStateChanged`
+        // notifications; a refusal is the server's own sentence.
+        BackendCommand::CloudRelayStore { store_id } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::RelayStore, message: "Not connected".into() });
+            };
+            match c.cloud_relay_store(store_id).await {
+                Ok(store_id) => Some(BackendEvent::CloudStoreRelayed { store_id }),
+                Err(e) => Some(BackendEvent::CloudError { op: CloudOp::RelayStore, message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::CloudStopRelaying { store_id } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::StopRelaying, message: "Not connected".into() });
+            };
+            match c.cloud_stop_relaying(store_id).await {
+                Ok(()) => Some(BackendEvent::CloudRelayingStopped { store_id }),
+                Err(e) => Some(BackendEvent::CloudError { op: CloudOp::StopRelaying, message: e.to_string() }),
             }
         }
 
@@ -600,6 +624,12 @@ fn store_sync_changed(store_id: pimble_core::StoreId, answer: pimble_rpc::GetSto
         sync_mode: answer.sync_mode,
         access: answer.access,
         read_only_roots: answer.read_only_roots,
+        relay: answer.relay,
+        // A server says a member's link is `Offline` and not why: the
+        // owner's computer being off and this one having no network read
+        // the same (`GetStoreSyncResponse` carries no reason). Only a
+        // backend that knows says so.
+        owner_offline: false,
     }
 }
 

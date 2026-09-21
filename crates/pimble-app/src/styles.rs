@@ -206,6 +206,15 @@ pub(crate) const APP_CSS: &str = "
     line-height: 1.5;
 }
 
+/* One of the two ways to share from a store that is not hosted: its button,
+   then its sentence. */
+.pimble-share__way {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+}
+
 .pimble-share__members {
     display: flex;
     flex-direction: column;

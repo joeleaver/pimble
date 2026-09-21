@@ -239,6 +239,113 @@ pub fn shared_by_sentence(shared_by: Option<&str>, members: &[pimble_rpc::ShareM
     }
 }
 
+// ── Sharing from an unhosted store (docs/RELAY_CONTRACT.md, "The apps") ──
+
+/// Which face the Share modal shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareFace {
+    /// The node's store is neither hosted on Pimble Cloud nor shared from
+    /// this computer, so there is nowhere for a share to live yet: the two
+    /// ways to give it one, each with its sentence. Nothing is chosen for
+    /// the person, and neither button is a default.
+    Ways,
+    /// The node is not shared yet: a name and "Share".
+    Name,
+    /// The node is shared and this person manages the share.
+    Owner,
+    /// The node is shared and the share is someone else's.
+    Member,
+}
+
+/// The Share modal's face. `shared` is whether the node carries a share (its
+/// marker, then the server's answers), `manages` is [`manages_share`], and
+/// `link` is what the store's link is (`Store::sync_mode`): `Vault` for a
+/// store hosted on Pimble Cloud and for one shared from this computer alike,
+/// which is the very thing the server asks before it lets a node be shared
+/// (`pimble_server::share`, `NOT_HOSTED_REFUSAL`). A node that is shared
+/// already shows its share whatever the link says.
+pub fn share_face(shared: bool, manages: bool, link: pimble_core::StoreKind) -> ShareFace {
+    match (shared, manages) {
+        (true, true) => ShareFace::Owner,
+        (true, false) => ShareFace::Member,
+        (false, _) if link != pimble_core::StoreKind::Vault => ShareFace::Ways,
+        (false, _) => ShareFace::Name,
+    }
+}
+
+/// The first way to share from a store that is not hosted, and its sentence
+/// (docs/RELAY_CONTRACT.md, "The apps", word for word).
+pub const SHARE_FROM_HERE_LABEL: &str = "Share from this computer";
+pub const SHARE_FROM_HERE_SENTENCE: &str =
+    "Nothing is uploaded. People you invite reach it while this computer is on and online.";
+/// The second way, and its sentence.
+pub const HOST_ON_CLOUD_LABEL: &str = "Host on Pimble Cloud...";
+pub const HOST_ON_CLOUD_SENTENCE: &str = "An encrypted copy is kept there, so it works while this computer is off.";
+
+/// Whether "Host on Pimble Cloud..." is off for a store: one that has a link
+/// already (to another Pimble server, to its hosted twin, or to its twin on
+/// this computer), a copy of a store that lives somewhere else, or encrypted
+/// storage, which is nobody's store to host. One rule for the store row's
+/// menu and for the Share modal's two ways, because the server would not
+/// refuse all of these: hosting a store linked elsewhere would replace its
+/// link.
+pub fn host_item_disabled(linked: bool, replica: bool, vault: bool) -> bool {
+    linked || replica || vault
+}
+
+/// Why neither way of sharing is offered for a store the Share modal's
+/// [`ShareFace::Ways`] opened on, or empty when both are. The server refuses
+/// `cloudRelayStore` for the same stores, and says the same.
+pub fn share_ways_note(linked: bool, replica: bool, vault: bool) -> &'static str {
+    if replica {
+        "This is a copy of a store that lives somewhere else, and can only be shared from there."
+    } else if vault {
+        "This is encrypted storage, not a store of its own."
+    } else if linked {
+        "This store is linked to another Pimble server. Unlink it first."
+    } else {
+        ""
+    }
+}
+
+/// Why "Host on Pimble Cloud...", "Link to Remote..." and "Unlink from
+/// Remote" are all off on the row of a store shared from this computer: it
+/// is one or the other, and the person says which
+/// (`pimble_server::relay_face::RELAYED_LINK_REFUSAL` is what the server
+/// would answer any of them with).
+pub const RELAYED_STORE_NOTE: &str =
+    "This store is shared from this computer. To host it or link it elsewhere, stop sharing it from this computer first.";
+
+/// The sentence that says why a store row's hosting and linking items are
+/// disabled for a reason of their own, or empty: a store shared from this
+/// computer.
+pub fn relayed_store_note(relay: pimble_core::RelaySide) -> &'static str {
+    match relay {
+        pimble_core::RelaySide::Owner => RELAYED_STORE_NOTE,
+        pimble_core::RelaySide::None | pimble_core::RelaySide::Member => "",
+    }
+}
+
+/// Whether "Stop Sharing from This Computer..." is off: on every store but
+/// one shared from this computer.
+pub fn stop_relaying_item_disabled(relay: pimble_core::RelaySide) -> bool {
+    relay != pimble_core::RelaySide::Owner
+}
+
+/// Whether "Unlink from Remote" is off: a store with no link, and a store
+/// shared from this computer, whose link is to its own twin on this machine
+/// and is ended by "Stop Sharing from This Computer..." (the server refuses
+/// an unlink of one).
+pub fn unlink_item_disabled(linked: bool, relay: pimble_core::RelaySide) -> bool {
+    !linked || relay == pimble_core::RelaySide::Owner
+}
+
+/// What a store not yet named here is called in a list: the accounts service
+/// holds no name for a store shared from a computer (nothing on Pimble Cloud
+/// needs the owner's name for it), and the server calls the replica of one
+/// the same until the person names it.
+pub const RELAYED_PLACEHOLDER_NAME: &str = "Shared from another computer";
+
 /// Whether a mount row's icon and label render dimmed: its source is out of
 /// reach (`Unavailable`) or not reachable yet (`Connecting`). A `Cached`
 /// mount still shows its replica's content, so it reads normally and only
@@ -482,6 +589,10 @@ pub struct AppStore {
     // stores not already open here, one of which becomes a local replica.
     pub hosted_modal_open: Signal<bool>,
     pub hosted_modal_stores: Signal<Vec<pimble_rpc::CloudHostedStoreInfo>>,
+    /// The ids among `hosted_modal_stores` that are not hosted at all: served
+    /// from their owner's computer through Pimble Cloud's relay
+    /// (docs/RELAY_CONTRACT.md). The list says so on each.
+    pub hosted_modal_relayed: Signal<Vec<String>>,
     /// The selected store's id, as a string (the raw `Select` value).
     pub hosted_modal_selected: Signal<String>,
     /// True while a `CloudListHostedStores` or `CloudAddHostedStore` is in flight.
@@ -518,6 +629,25 @@ pub struct AppStore {
     pub share_modal_error: Signal<String>,
     /// The "Stop sharing" confirmation is showing instead of the member list.
     pub share_modal_confirm_stop: Signal<bool>,
+    /// The node whose Share modal sent the person to "Host on Pimble
+    /// Cloud..." (docs/RELAY_CONTRACT.md, the second of the two ways): once
+    /// the store is hosted the modal opens on it again, as it does at once
+    /// after "Share from this computer". Cleared when the hosting
+    /// confirmation is closed without hosting.
+    pub share_after_host: Signal<Option<(StoreId, NodeId)>>,
+
+    // "Stop Sharing from This Computer..." confirmation (store root context
+    // menu, docs/RELAY_CONTRACT.md). `Some(store_id)` is the store it is open
+    // for; `None` means closed.
+    pub stop_relay_modal_store: Signal<Option<StoreId>>,
+    /// True while a `CloudStopRelaying` is in flight.
+    pub stop_relay_modal_busy: Signal<bool>,
+    pub stop_relay_modal_error: Signal<String>,
+
+    /// The stores a backend has said are out of reach because their owner's
+    /// computer is (`StoreSyncChanged::owner_offline`): the row's badge reads
+    /// `owner offline`.
+    pub owner_offline: Signal<HashSet<StoreId>>,
 
     /// A sentence the server sent back refusing a command (`Forbidden`, e.g.
     /// a store shared read-only), shown in the status bar. Not an error
@@ -611,6 +741,7 @@ impl AppStore {
             host_modal_error: Signal::new(String::new()),
             hosted_modal_open: Signal::new(false),
             hosted_modal_stores: Signal::new(Vec::new()),
+            hosted_modal_relayed: Signal::new(Vec::new()),
             hosted_modal_selected: Signal::new(String::new()),
             hosted_modal_busy: Signal::new(false),
             hosted_modal_error: Signal::new(String::new()),
@@ -624,6 +755,11 @@ impl AppStore {
             share_modal_pending: Signal::new(None),
             share_modal_error: Signal::new(String::new()),
             share_modal_confirm_stop: Signal::new(false),
+            share_after_host: Signal::new(None),
+            stop_relay_modal_store: Signal::new(None),
+            stop_relay_modal_busy: Signal::new(false),
+            stop_relay_modal_error: Signal::new(String::new()),
+            owner_offline: Signal::new(HashSet::new()),
             notice: Signal::new(String::new()),
         }
     }
@@ -741,6 +877,34 @@ impl AppStore {
             .with(|members| manages_share(shared_by.as_deref(), members, &account_email))
     }
 
+    /// Which face the Share modal shows ([`share_face`]), from TRACKED reads
+    /// of the modal's node, whether it is shared, who manages it and what the
+    /// store's link is: the modal moves on by itself when the store becomes
+    /// shared from this computer, or hosted. `Name` while the modal is closed.
+    pub fn share_modal_face(&self) -> ShareFace {
+        let Some((store_id, _)) = self.share_modal_node.get() else { return ShareFace::Name };
+        let link = self
+            .get_store_signal(store_id)
+            .map(|sig| sig.with(|s| s.sync_mode))
+            .unwrap_or_default();
+        share_face(self.share_modal_shared.get(), self.share_modal_manages(), link)
+    }
+
+    /// Why the Share modal's two ways are both off for the store it is open
+    /// on ([`share_ways_note`]), or empty. Tracked reads, like the face.
+    pub fn share_modal_ways_note(&self) -> &'static str {
+        let Some((store_id, _)) = self.share_modal_node.get() else { return "" };
+        let linked = self
+            .sync_data
+            .with(|map| map.get(&store_id).copied())
+            .map_or(false, |sig| sig.with(|(remote, _)| remote.is_some()));
+        let (replica, vault) = self
+            .get_store_signal(store_id)
+            .map(|sig| sig.with(|s| (s.is_replica, s.kind == pimble_core::StoreKind::Vault)))
+            .unwrap_or((false, false));
+        share_ways_note(linked, replica, vault)
+    }
+
     /// The sentence the member's face of the Share modal shows
     /// ([`shared_by_sentence`]), from the same tracked reads.
     pub fn share_modal_shared_by_sentence(&self) -> String {
@@ -812,6 +976,46 @@ impl AppStore {
         }
     }
 
+    /// Which end of Pimble Cloud's relay this device is for a store, if
+    /// either (untracked, `Store::relay`): `Owner` for a store shared from
+    /// this computer.
+    pub fn store_relay(&self, store_id: StoreId) -> pimble_core::RelaySide {
+        untracked(|| {
+            self.store_data
+                .with(|map| map.get(&store_id).map_or(pimble_core::RelaySide::None, |sig| sig.with(|s| s.relay)))
+        })
+    }
+
+    /// Record which end of the relay this device is for a store, on the
+    /// store's own signal, where the row's badge reads it reactively. Answers
+    /// whether it changed: the store row's menu snapshots it ("Stop Sharing
+    /// from This Computer...", and what a store shared from here turns off),
+    /// so the caller rebuilds the tree then.
+    pub fn set_store_relay(&self, store_id: StoreId, relay: pimble_core::RelaySide) -> bool {
+        let Some(sig) = self.get_store_signal(store_id) else { return false };
+        let differs = untracked(|| sig.with(|s| s.relay != relay));
+        if differs {
+            sig.update(|s| s.relay = relay);
+        }
+        differs
+    }
+
+    /// Record whether a backend knows a store's owner's computer to be off
+    /// (`StoreSyncChanged::owner_offline`). A no-op when nothing changed, so
+    /// the badges do not re-run on every `GetStoreSync`.
+    pub fn set_owner_offline(&self, store_id: StoreId, offline: bool) {
+        let held = untracked(|| self.owner_offline.with(|set| set.contains(&store_id)));
+        if held != offline {
+            self.owner_offline.update(|set| {
+                if offline {
+                    set.insert(store_id);
+                } else {
+                    set.remove(&store_id);
+                }
+            });
+        }
+    }
+
     /// Bump the tree structure version to trigger a tree rebuild.
     pub fn bump_tree_structure(&self) {
         self.tree_structure_version.update(|v| *v += 1);
@@ -850,6 +1054,7 @@ impl AppStore {
         self.mount_data.update(|map| { map.retain(|(sid, _), _| *sid != store_id); });
         self.live_label.update(|map| { map.retain(|(sid, _), _| *sid != store_id); });
         self.sync_data.update(|map| { map.remove(&store_id); });
+        self.set_owner_offline(store_id, false);
     }
 
     /// Remove a node and its per-entity signals (node_data, mount_data, children_of).
@@ -1248,11 +1453,19 @@ impl AppStore {
             let access = self.store_data.with(|map| {
                 map.get(&sid).map(|sig| sig.with(|s| format!("{:?}{:?}", s.access, s.shared_by))).unwrap_or_default()
             });
+            // Which end of the relay this device is for the store
+            // (docs/RELAY_CONTRACT.md): the row's menu snapshots it for "Stop
+            // Sharing from This Computer..." and for what a store shared from
+            // here turns off, so sharing from this computer, or stopping,
+            // has to change the data.
+            let relay = self
+                .store_data
+                .with(|map| map.get(&sid).map_or(pimble_core::RelaySide::None, |sig| sig.with(|s| s.relay)));
             let roots_key: Vec<String> = roots.iter().map(|r| r.to_string()).collect();
             let store_node = TreeNodeData::new(
                 format!("store_{}", sid),
                 format!(
-                    "{store_name} (linked: {linked}, paste: {paste}, {access}, {root_appearance}, roots: {})",
+                    "{store_name} (linked: {linked}, relay: {relay:?}, paste: {paste}, {access}, {root_appearance}, roots: {})",
                     roots_key.join(",")
                 ),
             );
@@ -1534,6 +1747,114 @@ mod tests {
             "a shared node's row never re-renders"
         );
         assert!(app.is_shared(store_id, child_id));
+    }
+
+    /// The store row's menu snapshots which end of the relay this device is
+    /// ("Stop Sharing from This Computer...", and what a store shared from
+    /// here turns off), so sharing from this computer and stopping both have
+    /// to change the row's data, and `set_store_relay` says when they did
+    /// (docs/RELAY_CONTRACT.md; CLAUDE.md "Hardening", the row data rule).
+    #[test]
+    fn store_row_data_carries_the_relay_side() {
+        let (app, store_id, _) = store_with_a_child();
+        assert_eq!(app.store_relay(store_id), pimble_core::RelaySide::None);
+        let before = untracked(|| app.build_tree_data_structural());
+
+        assert!(app.set_store_relay(store_id, pimble_core::RelaySide::Owner));
+        assert!(!app.set_store_relay(store_id, pimble_core::RelaySide::Owner), "an answer that changes nothing rebuilt the tree");
+        assert_eq!(app.store_relay(store_id), pimble_core::RelaySide::Owner);
+        let relayed = untracked(|| app.build_tree_data_structural());
+        assert_ne!(before[0].label, relayed[0].label, "the store row never re-renders");
+
+        assert!(app.set_store_relay(store_id, pimble_core::RelaySide::None));
+        let stopped = untracked(|| app.build_tree_data_structural());
+        assert_eq!(before[0].label, stopped[0].label);
+    }
+
+    /// What a store row's menu offers a store shared from this computer, one
+    /// that is not, and a member's replica of one (docs/RELAY_CONTRACT.md,
+    /// "The apps").
+    #[test]
+    fn menu_states_for_a_store_shared_from_this_computer() {
+        use pimble_core::RelaySide::{Member, None as NotRelayed, Owner};
+
+        // "Stop Sharing from This Computer...": only where it is shared from.
+        assert!(stop_relaying_item_disabled(NotRelayed));
+        assert!(stop_relaying_item_disabled(Member));
+        assert!(!stop_relaying_item_disabled(Owner));
+
+        // "Host on Pimble Cloud...": a store with no link that is nobody's
+        // copy. A store shared from here has a link (to its own twin), so it
+        // is off, and the menu says why.
+        assert!(!host_item_disabled(false, false, false));
+        assert!(host_item_disabled(true, false, false));
+        assert!(host_item_disabled(false, true, false));
+        assert!(host_item_disabled(false, false, true));
+        assert_eq!(
+            relayed_store_note(Owner),
+            "This store is shared from this computer. To host it or link it elsewhere, stop sharing it from this computer first."
+        );
+        assert_eq!(relayed_store_note(NotRelayed), "");
+        assert_eq!(relayed_store_note(Member), "");
+        assert_eq!(
+            menu_note_text(&["", "", relayed_store_note(Owner)]),
+            "This store is shared from this computer. To host it or link it elsewhere, stop sharing it from this computer first."
+        );
+
+        // "Unlink from Remote": any linked store but one shared from here,
+        // whose link "Stop Sharing from This Computer..." ends.
+        assert!(unlink_item_disabled(false, NotRelayed));
+        assert!(!unlink_item_disabled(true, NotRelayed));
+        assert!(!unlink_item_disabled(true, Member));
+        assert!(unlink_item_disabled(true, Owner));
+    }
+
+    /// The Share dialog's four faces (docs/RELAY_CONTRACT.md, "The apps"): a
+    /// node that is shared shows its share, to whoever manages it or not; one
+    /// that is not shows the name form only where a share has somewhere to
+    /// live, and the two ways everywhere else.
+    #[test]
+    fn the_share_dialog_has_four_faces() {
+        use pimble_core::StoreKind::{Plain, Vault};
+
+        assert_eq!(share_face(false, true, Plain), ShareFace::Ways);
+        assert_eq!(share_face(false, true, Vault), ShareFace::Name);
+        assert_eq!(share_face(true, true, Vault), ShareFace::Owner);
+        assert_eq!(share_face(true, false, Vault), ShareFace::Member);
+        // A marker left on a node of a store that is no longer hosted still
+        // opens on the share it names, never on a form over it.
+        assert_eq!(share_face(true, true, Plain), ShareFace::Owner);
+        assert_eq!(share_face(true, false, Plain), ShareFace::Member);
+
+        // The two ways and their sentences, as the contract has them.
+        assert_eq!(SHARE_FROM_HERE_LABEL, "Share from this computer");
+        assert_eq!(
+            SHARE_FROM_HERE_SENTENCE,
+            "Nothing is uploaded. People you invite reach it while this computer is on and online."
+        );
+        assert_eq!(HOST_ON_CLOUD_LABEL, "Host on Pimble Cloud...");
+        assert_eq!(HOST_ON_CLOUD_SENTENCE, "An encrypted copy is kept there, so it works while this computer is off.");
+
+        // Both ways are open to an ordinary local store and to nothing else.
+        assert_eq!(share_ways_note(false, false, false), "");
+        assert!(!share_ways_note(true, false, false).is_empty());
+        assert!(!share_ways_note(false, true, false).is_empty());
+        assert!(!share_ways_note(false, false, true).is_empty());
+    }
+
+    /// A backend that knows a store's owner's computer to be off says so, and
+    /// the store forgets it when it goes.
+    #[test]
+    fn owner_offline_is_kept_per_store() {
+        let (app, store_id, _) = store_with_a_child();
+        assert!(!app.owner_offline.with(|set| set.contains(&store_id)));
+        app.set_owner_offline(store_id, true);
+        assert!(app.owner_offline.with(|set| set.contains(&store_id)));
+        app.set_owner_offline(store_id, false);
+        assert!(!app.owner_offline.with(|set| set.contains(&store_id)));
+        app.set_owner_offline(store_id, true);
+        app.remove_store(store_id);
+        assert!(!app.owner_offline.with(|set| set.contains(&store_id)));
     }
 
     /// One store can hold a root this account reads beside one it edits

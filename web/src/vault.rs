@@ -56,6 +56,18 @@
 //! when a marker arrives or a blob will not open (see [`KeyLook`]). A member's
 //! page asks for its grants' keys and nothing else, as before, and no page
 //! wraps anybody else's data key: that upkeep stays the desktops'.
+//!
+//! **A store served from its owner's computer** (docs/RELAY_CONTRACT.md) is
+//! the same thing through another endpoint: the twin this page reads is on the
+//! owner's machine and Pimble Cloud's relay pipes the connection to it. Two
+//! things differ. The twin is disposable, so its logs can start again from 1
+//! under a new [`epoch`](pimble_rpc::VaultListDocsResponse::epoch), and a page
+//! that kept its cursors would skip them ([`VaultStore::take_epoch`]). And the
+//! endpoint is down whenever the owner's computer is, which is an ordinary
+//! state and not an error: the backend loop says so
+//! ([`VaultClient::endpoint_down`]), the store's row reads `owner offline`,
+//! and until it is back this page changes nothing of it. A store it never
+//! opened is listed from the account's own row of it and opens empty.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -68,7 +80,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use pimble_app::protocol::{BackendCommand, BackendEvent};
 use pimble_client::PimbleClient;
 use pimble_core::{
-    custom_keys, node_types, Node, NodeId, NodeMetadata, Store, StoreAccess, StoreId, StoreKind,
+    custom_keys, node_types, Node, NodeId, NodeMetadata, RelaySide, Store, StoreAccess, StoreId, StoreKind,
 };
 use pimble_crdt::{NodeDoc, NodeFields, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_crypto::{blob_aad, dek_aad, unwrap_dek, wrap_dek, Blob, KeyId, SymmetricKey, WrappedDek};
@@ -116,6 +128,13 @@ const SHARE_KEY_FLOOR_MS: f64 = 10_000.0;
 /// What a store's name gains while its key has not reached this account: the
 /// row is listed, because the grant is real, and says why it will not open.
 const WAITING_SUFFIX: &str = " (waiting for the key)";
+
+/// What a write is answered with while the computer a store is served from is
+/// off (docs/RELAY_CONTRACT.md): nothing of such a store is on Pimble Cloud, a
+/// browser keeps no copy of its own for an edit to wait in, and a change made
+/// on this page would be gone with the tab.
+pub const OWNER_OFFLINE_REFUSAL: &str =
+    "This is shared from its owner's computer, which is offline. It can be changed again once that computer is back.";
 
 /// What [`VaultClient::handle`] decided about a command.
 pub enum Handled {
@@ -175,6 +194,10 @@ pub struct AccountStore {
     pub grants: Vec<AccountGrant>,
     /// An owner's email when the store reached this account as a share.
     pub shared_by: Option<String>,
+    /// The row's tier is `relay` (docs/RELAY_CONTRACT.md): nothing of the
+    /// store is on Pimble Cloud, and it is reached at an endpoint of its own
+    /// while its owner's computer is on.
+    pub relayed: bool,
 }
 
 impl AccountStore {
@@ -305,6 +328,10 @@ struct VaultStore {
     repair_due: Option<f64>,
     /// What this page is still owed to open what it holds of the store.
     look: KeyLook,
+    /// Which logs the cursors above are about: `vaultListDocs`'s `epoch` as
+    /// last read (see [`VaultStore::take_epoch`]). `None` for a server that
+    /// names none.
+    epoch: Option<String>,
 }
 
 /// What an open store is still owed from outside, and when to go and look.
@@ -420,6 +447,15 @@ pub struct VaultClient {
     /// event carries no node identity, so applying another node's update to it
     /// would corrupt what is on screen.
     active: Option<(StoreId, NodeId)>,
+    /// The stores whose endpoint is down because the computer they are served
+    /// from is (docs/RELAY_CONTRACT.md), as the backend loop last said
+    /// ([`VaultClient::endpoint_down`]): read from what this page holds,
+    /// which for one it never opened is nothing, and not changed.
+    owner_offline: HashSet<StoreId>,
+    /// The stores the session itself said are served somewhere other than its
+    /// own endpoint (`POST /token`'s `stores`): known to be relayed even when
+    /// the account's store list could not be read.
+    relayed: HashSet<StoreId>,
     /// The stores subscribed to on the current socket (see `subscribe`).
     subscribed: HashSet<StoreId>,
     /// Events raised somewhere with no reply of its own to carry them — a
@@ -439,6 +475,8 @@ impl VaultClient {
             waiting: HashMap::new(),
             announced: HashSet::new(),
             active: None,
+            owner_offline: HashSet::new(),
+            relayed: HashSet::new(),
             subscribed: HashSet::new(),
             pending: Vec::new(),
             notices_tx,
@@ -453,14 +491,44 @@ impl VaultClient {
 
     /// Whether a store's changes are this client's to subscribe to: an
     /// encrypted store, whether it is open here or only known to be encrypted
-    /// from the account's store list.
+    /// from the account's store list. A relayed store is always one.
     pub fn is_encrypted(&self, store_id: StoreId) -> bool {
-        self.owns(store_id) || self.rows.get(&store_id).is_some_and(|row| row.kind == "vault")
+        self.owns(store_id) || self.is_relayed(store_id) || self.rows.get(&store_id).is_some_and(|row| row.kind == "vault")
     }
 
-    /// What this account may change in a store, from the grants it holds.
+    /// The stores the freshly minted session says are served from their
+    /// owners' computers, each at an endpoint of its own.
+    pub fn set_relayed(&mut self, store_ids: Vec<StoreId>) {
+        self.relayed = store_ids.into_iter().collect();
+        // A store the session no longer names is not waited for.
+        let relayed = &self.relayed;
+        self.owner_offline.retain(|id| relayed.contains(id));
+    }
+
+    /// Whether a store is served from its owner's computer through Pimble
+    /// Cloud's relay (docs/RELAY_CONTRACT.md), as the session or the
+    /// account's store list says.
+    pub fn is_relayed(&self, store_id: StoreId) -> bool {
+        self.relayed.contains(&store_id) || self.rows.get(&store_id).is_some_and(|row| row.relayed)
+    }
+
+    /// What this account may change in a store, from the grants it holds;
+    /// nothing while the computer it is served from is off.
     pub fn access(&self, store_id: StoreId) -> StoreAccess {
+        if self.owner_offline.contains(&store_id) {
+            return StoreAccess::Read;
+        }
         self.rows.get(&store_id).map(AccountStore::access).unwrap_or(StoreAccess::Full)
+    }
+
+    /// The roots of a store this account only reads while it edits others
+    /// (`Store::read_only_roots`); none while [`VaultClient::access`] answers
+    /// for the whole store.
+    fn read_only_roots(&self, store_id: StoreId) -> Vec<NodeId> {
+        if self.owner_offline.contains(&store_id) {
+            return Vec::new();
+        }
+        self.rows.get(&store_id).map(AccountStore::read_only_roots).unwrap_or_default()
     }
 
     /// Read the account's store list: which stores are encrypted, and every
@@ -501,6 +569,7 @@ impl VaultClient {
             };
             let row = rows.entry(store_id).or_default();
             row.kind = view.kind;
+            row.relayed |= view.tier == "relay";
             if row.shared_by.is_none() {
                 row.shared_by = view.shared_by;
             }
@@ -524,6 +593,14 @@ impl VaultClient {
     /// For a share the row decides the rest: the name (the share's own, since
     /// the server's is the owner's store's), who shared it, the roots this
     /// account holds and whether any of them may be written to.
+    ///
+    /// A store served from its owner's computer (docs/RELAY_CONTRACT.md) says
+    /// so (`Store::relay`), and has no name anywhere but in its own documents:
+    /// Pimble Cloud holds none for it and its twin is made without one. An
+    /// account that holds the whole of it reads the root's title once that is
+    /// open here, and until then it is called what the desktop calls it.
+    /// While that computer is off nothing of the store may be changed from
+    /// this page ([`VaultClient::access`]).
     pub fn describe(&self, store: &mut Store) {
         if let Some(row) = self.rows.get(&store.id) {
             store.access = row.access();
@@ -537,6 +614,23 @@ impl VaultClient {
             if let Some(name) = row.name() {
                 store.name = name;
             }
+        }
+        if self.is_relayed(store.id) {
+            store.relay = RelaySide::Member;
+        }
+        if self.owner_offline.contains(&store.id) {
+            store.access = StoreAccess::Read;
+            store.read_only_roots.clear();
+        }
+        if store.relay == RelaySide::Member && store.name.trim().is_empty() {
+            store.name = self
+                .stores
+                .get(&store.id)
+                .filter(|open| !open.is_partial())
+                .and_then(|open| open.tree.get_node_info(open.tree.root()).ok())
+                .map(|root| root.title)
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| pimble_app::state::RELAYED_PLACEHOLDER_NAME.to_string());
         }
         if let Some(open) = self.stores.get(&store.id) {
             if open.scope_roots.is_empty() {
@@ -696,13 +790,15 @@ impl VaultClient {
             return Err(KeyError::Failed(message));
         }
 
-        let listed = client
-            .vault_list_docs(store_id)
+        let listing = client
+            .vault_list_docs_response(store_id)
             .await
             .map_err(|e| KeyError::Failed(format!("listing the vault's documents failed: {e}")))?;
+        // Which logs these are: everything read below is numbered in them.
+        let epoch = listing.epoch;
         let mut keys = StoreKeys::new(keyring);
         let mut wanted: Vec<(NodeId, u64)> = Vec::new();
-        for info in listed {
+        for info in listing.docs {
             match info.doc_id {
                 VaultDocId::Node(id) => {
                     if let Some(dek_id) = info.dek_id {
@@ -729,6 +825,7 @@ impl VaultClient {
         }
 
         let (mut vault_store, shut) = VaultStore::from_fetched(store.clone(), keys, scope_roots, fetched_docs);
+        vault_store.epoch = epoch;
         // The shares in a whole store: what the first pass opened says which
         // nodes are shared, and their keys open what members made that no
         // desktop of the owner's has wrapped under the store key yet. Before
@@ -763,9 +860,21 @@ impl VaultClient {
     /// every later edit's chance of being shown anywhere else (each depends on
     /// the one before). Called on every connect, after the subscriptions are
     /// made again and before `open_listed`.
-    pub async fn catch_up(&mut self, client: &Arc<PimbleClient>) -> Vec<BackendEvent> {
+    ///
+    /// `served` says which stores `client`'s endpoint serves: a store served
+    /// from its owner's computer has an endpoint of its own, and is caught up
+    /// when that one connects (docs/RELAY_CONTRACT.md).
+    ///
+    /// Such a store's twin is disposable, and one built again numbers its
+    /// logs from 1 under a new epoch. Every cursor this page kept would skip
+    /// what those logs hold, and what it believed the server held is about
+    /// logs that are gone, so both are forgotten
+    /// ([`VaultStore::take_epoch`]): everything is read again from the start,
+    /// and every document this account may write is then offered again, as
+    /// whatever it holds beyond what the new logs turned out to.
+    pub async fn catch_up(&mut self, client: &Arc<PimbleClient>, served: impl Fn(StoreId) -> bool) -> Vec<BackendEvent> {
         let mut events = Vec::new();
-        let store_ids: Vec<StoreId> = self.stores.keys().copied().collect();
+        let store_ids: Vec<StoreId> = self.stores.keys().copied().filter(|id| served(*id)).collect();
         for store_id in store_ids {
             // The shares in a whole store first, so what is read below opens.
             // A new connection may also ask again about every document it
@@ -780,18 +889,28 @@ impl VaultClient {
             // stopped reading it, or from the start for one it never held (a
             // node created elsewhere while the socket was down) or could not
             // open.
-            let listed = match client.vault_list_docs(store_id).await {
-                Ok(listed) => listed,
+            let listing = match client.vault_list_docs_response(store_id).await {
+                Ok(listing) => listing,
                 Err(e) => {
                     tracing::warn!("Listing the documents of {} failed: {}", store_id, e);
                     continue;
                 }
             };
             let wanted: Vec<(NodeId, u64)> = {
+                let row = self.rows.get(&store_id);
                 let Some(store) = self.stores.get_mut(&store_id) else { continue };
+                let rebuilt = store.take_epoch(listing.epoch.as_deref(), row);
+                if rebuilt {
+                    tracing::info!("Store {}: the server's logs are not the ones this page read (its twin was built again); reading them from the start and offering every document again", store_id);
+                }
                 let mut wanted = Vec::new();
-                for info in listed {
+                for info in listing.docs {
                     let VaultDocId::Node(id) = info.doc_id else { continue };
+                    if rebuilt {
+                        // Known to be there, whether or not the fetch below
+                        // succeeds: an append to it must not try to create it.
+                        store.heads.insert(id, info.head);
+                    }
                     if let Some(dek_id) = info.dek_id {
                         store.keys.listed_dek.insert(id, dek_id);
                     }
@@ -1086,14 +1205,7 @@ impl VaultClient {
             // registration path does not light up the status bar with errors.
             // What the account may change is what the store was described
             // with (`describe`), from the same rows.
-            BackendCommand::GetStoreSync { store_id } => Some(BackendEvent::StoreSyncChanged {
-                store_id,
-                remote: None,
-                state: pimble_core::SyncState::Offline,
-                sync_mode: pimble_core::StoreKind::Plain,
-                access: self.access(store_id),
-                read_only_roots: self.rows.get(&store_id).map(AccountStore::read_only_roots).unwrap_or_default(),
-            }),
+            BackendCommand::GetStoreSync { store_id } => Some(self.sync_event(store_id)),
             BackendCommand::RebuildIndex { store_id } => {
                 Some(BackendEvent::IndexRebuilt { store_id, indexed: 0 })
             }
@@ -1111,11 +1223,185 @@ impl VaultClient {
     /// so an encrypted store and a plain one are refused the same way and for
     /// the same reason. It answers from the account's grants, so it does not
     /// depend on the store being one this client holds.
+    ///
+    /// A store whose owner's computer is off takes no change either, and says
+    /// that instead ([`OWNER_OFFLINE_REFUSAL`]). With one exception: what the
+    /// editor has already put on screen. The app stops sending those the
+    /// moment it hears the store is to be read, but a keystroke can be on its
+    /// way before that, and refusing it would leave the editor holding text
+    /// its document here lacks, with every later edit built on it. Those are
+    /// kept ([`VaultClient::handle_unreachable`]) and go up when the owner's
+    /// computer is back.
     pub fn refuse_write(&self, store_id: StoreId, cmd: &BackendCommand) -> Option<BackendEvent> {
-        if !writes(cmd) || self.access(store_id).allows_write() {
+        if !writes(cmd) {
             return None;
         }
-        Some(BackendEvent::Error { message: StoreAccess::READ_ONLY_REFUSAL.to_string() })
+        let row_access = self.rows.get(&store_id).map(AccountStore::access).unwrap_or(StoreAccess::Full);
+        if !row_access.allows_write() {
+            return Some(BackendEvent::Error { message: StoreAccess::READ_ONLY_REFUSAL.to_string() });
+        }
+        if self.owner_offline.contains(&store_id) && !(self.owns(store_id) && is_content_edit(cmd)) {
+            return Some(notice(OWNER_OFFLINE_REFUSAL.to_string()));
+        }
+        None
+    }
+
+    // ── A store whose owner's computer is off ───────────────────────────────
+
+    /// The backend loop could not reach the endpoint that serves these stores
+    /// (docs/RELAY_CONTRACT.md): the computer they are shared from is off, or
+    /// offline. Pimble Cloud itself has just answered this page, so that is
+    /// what it means, and it is an ordinary state, not an error.
+    ///
+    /// A store this page never opened is listed all the same, from what the
+    /// account's own list says of it: the share's name and who shared it. It
+    /// opens empty and to be read, and fills in when the endpoint is back
+    /// ([`VaultClient::endpoint_up`]). Every one of them says `owner offline`
+    /// on its row, and takes no change until then. Answers only what is news.
+    pub fn endpoint_down(&mut self, store_ids: &[StoreId]) -> Vec<BackendEvent> {
+        let mut events = Vec::new();
+        for &store_id in store_ids {
+            if !self.owner_offline.insert(store_id) {
+                continue;
+            }
+            tracing::info!("Store {}: its owner's computer is offline", store_id);
+            if !self.owns(store_id) {
+                events.push(BackendEvent::StoresListed { stores: vec![self.offline_row(store_id)] });
+            }
+            events.push(self.sync_event(store_id));
+        }
+        events
+    }
+
+    /// The endpoint that serves these stores is connected again, and what it
+    /// lists has been opened (`listed`, already described). A store shown from
+    /// the account's row while it was down is announced as the store it is, so
+    /// the tree fetches what is in it with no reload; one this page held all
+    /// along only has its row say so. Answers nothing for a store that was
+    /// never down.
+    pub fn endpoint_up(&mut self, store_ids: &[StoreId], listed: &[Store]) -> Vec<BackendEvent> {
+        let mut events = Vec::new();
+        for &store_id in store_ids {
+            if !self.owner_offline.remove(&store_id) {
+                continue;
+            }
+            tracing::info!("Store {}: its owner's computer is back", store_id);
+            // `listed` was described while this store still read as offline.
+            if let Some(store) = listed.iter().find(|store| store.id == store_id) {
+                let mut store = store.clone();
+                self.describe(&mut store);
+                events.push(BackendEvent::StoreOpened { store });
+            }
+            events.push(self.sync_event(store_id));
+        }
+        events
+    }
+
+    /// The row of a store this page has never opened and cannot reach: what
+    /// the account's own list says of it, which for a share is the share's
+    /// name and who shared it. No root of its own is known (the twin's is on
+    /// the computer that is off), so the row stands alone, a placeholder under
+    /// it that answers as an empty folder.
+    fn offline_row(&self, store_id: StoreId) -> Store {
+        let row = self.rows.get(&store_id);
+        let name = row
+            .and_then(|row| row.name().or_else(|| row.grants.iter().map(|g| g.name.trim()).find(|name| !name.is_empty()).map(str::to_string)))
+            .unwrap_or_default();
+        let mut store = Store::new_local(name, std::path::PathBuf::new());
+        store.id = store_id;
+        store.kind = StoreKind::Vault;
+        store.root_node_id = offline_root(store_id);
+        store.shared_by = row.and_then(|row| row.shared_by.clone());
+        store.access = StoreAccess::Read;
+        store.relay = RelaySide::Member;
+        if store.name.trim().is_empty() {
+            store.name = pimble_app::state::RELAYED_PLACEHOLDER_NAME.to_string();
+        }
+        store
+    }
+
+    /// What `GetStoreSync` is answered with for a store this client answers
+    /// for. A vault store in the browser has no link, so there is no badge,
+    /// except the one that says its owner's computer is off.
+    fn sync_event(&self, store_id: StoreId) -> BackendEvent {
+        BackendEvent::StoreSyncChanged {
+            store_id,
+            remote: None,
+            state: pimble_core::SyncState::Offline,
+            sync_mode: pimble_core::StoreKind::Plain,
+            access: self.access(store_id),
+            read_only_roots: self.read_only_roots(store_id),
+            relay: if self.is_relayed(store_id) { RelaySide::Member } else { RelaySide::None },
+            owner_offline: self.owner_offline.contains(&store_id),
+        }
+    }
+
+    /// Answer `cmd` for a store whose endpoint is down because its owner's
+    /// computer is, with no connection to answer through; any other command
+    /// comes back untouched.
+    ///
+    /// A store this page holds is read from what it holds. One it never
+    /// opened (or whose key has not arrived) opens empty: its row, an empty
+    /// folder under it, nothing else, and no error, because nothing has gone
+    /// wrong. Subscriptions wait for the endpoint (the backend loop makes
+    /// them again when it connects). An edit the editor had already made is
+    /// merged and kept as unsent, which the next connection delivers; every
+    /// other write was refused before it got here
+    /// ([`VaultClient::refuse_write`]).
+    pub fn handle_unreachable(&mut self, cmd: BackendCommand) -> Handled {
+        let Some(store_id) = store_id_of(&cmd).filter(|id| self.owner_offline.contains(id)) else {
+            return Handled::No(cmd);
+        };
+        let held = self.owns(store_id);
+        Handled::Yes(match cmd {
+            BackendCommand::GetChildren { store_id, node_id } if held => Some(self.get_children(store_id, node_id)),
+            BackendCommand::GetChildren { store_id, node_id } => {
+                Some(BackendEvent::ChildrenLoaded { store_id, parent_id: node_id, children_store_id: store_id, children: Vec::new() })
+            }
+            BackendCommand::GetNode { store_id, node_id } if held => Some(self.get_node(store_id, node_id)),
+            BackendCommand::GetNode { store_id, node_id } => {
+                let title = self.offline_row(store_id).name;
+                Some(BackendEvent::NodeLoaded { store_id, node: empty_folder(node_id, &title) })
+            }
+            BackendCommand::ReconcileNodeContent { store_id, node_id, state_vector } if held => {
+                Some(self.reconcile(store_id, node_id, &state_vector))
+            }
+            BackendCommand::BroadcastChanges { store_id, node_id, changes } if held => {
+                match STANDARD.decode(&changes).map_err(|e| e.to_string()).and_then(|update| self.keep_unsent(store_id, node_id, &update)) {
+                    Ok(()) => None,
+                    Err(message) => {
+                        tracing::warn!("Keeping an edit of {} for later failed: {}", node_id, message);
+                        None
+                    }
+                }
+            }
+            BackendCommand::SetNodeContent { store_id, node_id, content } if held => {
+                match self.keep_unsent(store_id, node_id, &content) {
+                    Ok(()) => Some(BackendEvent::NodeContentUpdated { store_id, node_id }),
+                    Err(message) => Some(BackendEvent::Error { message }),
+                }
+            }
+            BackendCommand::SubscribeNodeChanges { store_id, node_id } => {
+                self.active = Some((store_id, node_id));
+                None
+            }
+            BackendCommand::SubscribeStoreChanges { .. } => None,
+            BackendCommand::GetStoreSync { store_id } => Some(self.sync_event(store_id)),
+            BackendCommand::RebuildIndex { store_id } => Some(BackendEvent::IndexRebuilt { store_id, indexed: 0 }),
+            _ => Some(notice(OWNER_OFFLINE_REFUSAL.to_string())),
+        })
+    }
+
+    /// Merge an edit the editor has already made into its document and mark
+    /// the document unsent, with nothing to append it through: the next
+    /// connection's catch-up sends everything the server lacks of it.
+    fn keep_unsent(&mut self, store_id: StoreId, node_id: NodeId, update: &[u8]) -> Result<(), String> {
+        let Some(store) = self.stores.get_mut(&store_id) else {
+            return Err("no such encrypted store".to_string());
+        };
+        store.tree.apply_update(node_id, update).map_err(|e| e.to_string())?;
+        store.doc_entry(node_id).unsent = true;
+        Ok(())
     }
 
     // ── Reads ───────────────────────────────────────────────────────────────
@@ -1130,7 +1416,7 @@ impl VaultClient {
         };
         let row = self.rows.get(&store_id);
         let children = match store.children_of(node_id) {
-            Ok(ids) => ids.iter().filter_map(|id| store.node_for(*id, row).ok()).collect(),
+            Ok(ids) => ids.iter().filter_map(|id| store.node_for(*id, row).ok()).map(|node| self.judged(store_id, node)).collect(),
             Err(message) => return BackendEvent::Error { message },
         };
         BackendEvent::ChildrenLoaded { store_id, parent_id: node_id, children_store_id: store_id, children }
@@ -1141,9 +1427,19 @@ impl VaultClient {
             return BackendEvent::Error { message: "no such encrypted store".into() };
         };
         match store.node_for(node_id, self.rows.get(&store_id)) {
-            Ok(node) => BackendEvent::NodeLoaded { store_id, node },
+            Ok(node) => BackendEvent::NodeLoaded { store_id, node: self.judged(store_id, node) },
             Err(message) => BackendEvent::Error { message },
         }
+    }
+
+    /// A node as the UI is handed it while its store's owner's computer is
+    /// off: to be read, whatever the account's grants say, because nothing
+    /// written to it here would reach anyone ([`OWNER_OFFLINE_REFUSAL`]).
+    fn judged(&self, store_id: StoreId, mut node: Node) -> Node {
+        if self.owner_offline.contains(&store_id) {
+            node.access = StoreAccess::Read;
+        }
+        node
     }
 
     // ── Tree writes ─────────────────────────────────────────────────────────
@@ -1529,11 +1825,12 @@ impl VaultClient {
         }
     }
 
-    /// Forget which stores are subscribed, because the socket that carried
-    /// those subscriptions is gone. Called once per new connection, before
-    /// anything subscribes again.
-    pub fn forget_subscriptions(&mut self) {
-        self.subscribed.clear();
+    /// Forget which of the stores an endpoint serves are subscribed, because
+    /// the socket that carried those subscriptions is gone. Called once per
+    /// new connection, before anything subscribes again on it. `served` says
+    /// which stores are that endpoint's: another endpoint's socket is its own.
+    pub fn forget_subscriptions(&mut self, served: impl Fn(StoreId) -> bool) {
+        self.subscribed.retain(|id| !served(*id));
     }
 
     // ── Search ──────────────────────────────────────────────────────────────
@@ -1585,8 +1882,10 @@ impl VaultClient {
             }
         }
 
-        // Plain stores in the same query keep their server-side index.
-        let plain: Vec<StoreId> = stores.iter().copied().filter(|id| !self.owns(*id)).collect();
+        // Plain stores in the same query keep their server-side index. An
+        // encrypted store not open here (its key or its owner's computer is
+        // still to come) has nothing anywhere to search.
+        let plain: Vec<StoreId> = stores.iter().copied().filter(|id| !self.is_encrypted(*id)).collect();
         if !plain.is_empty() {
             match client.search(query.to_string(), plain, true, limit).await {
                 Ok(mut items) => results.append(&mut items),
@@ -1675,7 +1974,7 @@ impl VaultStore {
                 tree = rerooted(tree, root);
             }
         }
-        Self { listed, keys, scope_roots, tree, docs, heads, repair_due: None, look: KeyLook::default() }
+        Self { listed, keys, scope_roots, tree, docs, heads, repair_due: None, look: KeyLook::default(), epoch: None }
     }
 
     /// Whether this page holds only a scope of the store: a share's recipient.
@@ -1896,6 +2195,67 @@ impl VaultStore {
         new
     }
 
+    // ── A twin built again ──────────────────────────────────────────────────
+
+    /// Take the `epoch` a `vaultListDocs` answered with: which logs the
+    /// server's sequence numbers belong to. Whether they turned out to be
+    /// other logs than the ones this page read, in which case everything
+    /// about the old ones has just been forgotten
+    /// ([`VaultStore::forget_remote_logs`]).
+    ///
+    /// A store served from its owner's computer keeps its twin there, derived
+    /// and disposable (docs/RELAY_CONTRACT.md): deleted, the owner's link
+    /// builds it again, and every log starts again from 1. A page that kept
+    /// its cursors would read each new log from wherever it had read the old
+    /// one to, and skip what lies before. The first epoch heard is simply
+    /// remembered, and a server that names none concludes nothing, as on the
+    /// desktop (`full_reconcile` in `crates/pimble-server/src/vault_link.rs`).
+    fn take_epoch(&mut self, epoch: Option<&str>, row: Option<&AccountStore>) -> bool {
+        let Some(epoch) = epoch else { return false };
+        let rebuilt = self.epoch.as_deref().is_some_and(|read| read != epoch);
+        if rebuilt {
+            self.forget_remote_logs(row);
+        }
+        self.epoch = Some(epoch.to_string());
+        rebuilt
+    }
+
+    /// The server's logs are other logs than the ones this page read: where
+    /// each was read to, how many appends it has had, what the server was
+    /// known to hold of each document and the data keys of the documents as
+    /// they were are all forgotten, as the desktop's link forgets them
+    /// (`Progress::forget_remote_logs`). The documents themselves stay: they
+    /// are this page's copy of the notes, not of the logs.
+    ///
+    /// What follows (`VaultClient::catch_up`) is every document read from the
+    /// start (a merge repeated is nothing), which is also what says what the
+    /// new logs hold, and then every document this account may write offered
+    /// again: a diff from there, so what the server already has merges to
+    /// nothing, and what only this page held is not lost with the old twin.
+    /// One it may only read is never offered: the server would refuse it, and
+    /// a refused append throws the local copy away to read the server's.
+    fn forget_remote_logs(&mut self, row: Option<&AccountStore>) {
+        let held: Vec<NodeId> = self.tree.ids();
+        let writable: HashSet<NodeId> = held.iter().copied().filter(|id| self.may_write(*id, row)).collect();
+        self.docs.clear();
+        for node_id in held {
+            let doc = self.docs.entry(node_id).or_default();
+            doc.unsent = writable.contains(&node_id);
+        }
+        self.heads.clear();
+        self.keys.forget_documents();
+        self.look.unread.clear();
+        self.look.asked.clear();
+    }
+
+    /// Whether this account may write `node_id`, by the rule
+    /// [`VaultStore::node_for`] puts on every node it hands the UI.
+    fn may_write(&self, node_id: NodeId, row: Option<&AccountStore>) -> bool {
+        let Some(row) = row else { return true };
+        let grant_roots: Vec<NodeId> = row.grants.iter().filter_map(|g| g.root).collect();
+        row.node_access(&roots_above(&self.tree, &grant_roots, node_id)).allows_write()
+    }
+
     /// How far `node_id`'s log has been read without a gap.
     fn read_through(&self, node_id: NodeId) -> u64 {
         self.docs.get(&node_id).map(|doc| doc.cursor.applied_through()).unwrap_or(0)
@@ -2091,9 +2451,8 @@ impl VaultStore {
     /// known about, which is no reason to disable anything.
     fn node_for(&self, node_id: NodeId, row: Option<&AccountStore>) -> Result<Node, String> {
         let mut node = self.node_of(node_id)?;
-        if let Some(row) = row {
-            let grant_roots: Vec<NodeId> = row.grants.iter().filter_map(|g| g.root).collect();
-            node.access = row.node_access(&roots_above(&self.tree, &grant_roots, node_id));
+        if !self.may_write(node_id, row) {
+            node.access = StoreAccess::Read;
         }
         Ok(node)
     }
@@ -2414,6 +2773,17 @@ impl StoreKeys {
         self.creating.remove(&node_id);
         self.listed_dek.insert(node_id, keys.dek_id);
         self.wraps.insert(node_id, keys.clone());
+    }
+
+    /// Every document's data key as it was is forgotten: the logs they were
+    /// read from are gone (`VaultStore::forget_remote_logs`), and a twin
+    /// built again gives each document a new one. The scope keys stay; they
+    /// are the account's, not the twin's.
+    fn forget_documents(&mut self) {
+        self.wraps.clear();
+        self.deks.clear();
+        self.listed_dek.clear();
+        self.creating.clear();
     }
 
     /// Forget one document's keys, for a document being pulled again from the
@@ -2757,6 +3127,36 @@ pub fn writes(cmd: &BackendCommand) -> bool {
             | SetStoreSync { .. }
             | RemoveReplica { .. }
     )
+}
+
+/// Whether a command carries what the editor has already put on screen: the
+/// two writes a store whose owner's computer is off still takes in
+/// ([`VaultClient::refuse_write`]).
+fn is_content_edit(cmd: &BackendCommand) -> bool {
+    matches!(cmd, BackendCommand::BroadcastChanges { .. } | BackendCommand::SetNodeContent { .. })
+}
+
+/// The placeholder root of a store listed from the account's row alone
+/// ([`VaultClient::offline_row`]): the store's own id, so it is the same every
+/// time and names no node of anybody's.
+fn offline_root(store_id: StoreId) -> NodeId {
+    NodeId(store_id.0)
+}
+
+/// An empty folder to be read: what the placeholder root of a store that
+/// cannot be reached answers as.
+fn empty_folder(node_id: NodeId, title: &str) -> Node {
+    let now = chrono::Utc::now();
+    Node {
+        id: node_id,
+        parent_id: None,
+        node_type: node_types::FOLDER.to_string(),
+        metadata: NodeMetadata { title: title.to_string(), created_at: now, modified_at: now, tags: Vec::new(), custom: HashMap::new() },
+        content: Vec::new(),
+        children: Vec::new(),
+        links: Vec::new(),
+        access: StoreAccess::Read,
+    }
 }
 
 /// Whether a failed request was the server refusing rather than failing: a
@@ -3408,7 +3808,12 @@ mod tests {
     }
 
     fn row(grants: Vec<AccountGrant>, shared_by: Option<&str>) -> AccountStore {
-        AccountStore { kind: "vault".to_string(), grants, shared_by: shared_by.map(str::to_string) }
+        AccountStore { kind: "vault".to_string(), grants, shared_by: shared_by.map(str::to_string), relayed: false }
+    }
+
+    /// The same row for a store served from its owner's computer.
+    fn relayed_row(grants: Vec<AccountGrant>, shared_by: Option<&str>) -> AccountStore {
+        AccountStore { relayed: true, ..row(grants, shared_by) }
     }
 
     #[test]
@@ -3478,6 +3883,338 @@ mod tests {
         again.name = "Ann's whole life".to_string();
         client.describe(&mut again);
         assert_eq!(again.name, format!("Recipes{WAITING_SUFFIX}"));
+    }
+
+    // ── A store served from its owner's computer ────────────────────────────
+
+    /// A page with one relayed share in the account's list: "Recipes", shared
+    /// by ann, which this account may edit.
+    fn page_with_a_relayed_share() -> (VaultClient, StoreId, NodeId) {
+        let (store_id, root) = (StoreId::new(), NodeId::new());
+        let mut client = VaultClient::new("me".to_string());
+        client.rows.insert(store_id, relayed_row(vec![grant(Some(root), "editor", "Recipes")], Some("ann@example.com")));
+        client.set_relayed(vec![store_id]);
+        (client, store_id, root)
+    }
+
+    fn sync_of(event: &BackendEvent) -> (StoreAccess, RelaySide, bool) {
+        match event {
+            BackendEvent::StoreSyncChanged { access, relay, owner_offline, .. } => (*access, *relay, *owner_offline),
+            other => panic!("not a sync answer: {other:?}"),
+        }
+    }
+
+    /// The endpoint of a store this page never opened is down: the row comes
+    /// from the account's own list (the share's name, who shared it) and says
+    /// `owner offline`, once (docs/RELAY_CONTRACT.md, "The apps").
+    #[test]
+    fn a_store_whose_owner_is_offline_is_listed_from_the_account_s_row() {
+        let (mut client, store_id, _) = page_with_a_relayed_share();
+
+        let events = client.endpoint_down(&[store_id]);
+        assert_eq!(events.len(), 2, "{events:?}");
+        let BackendEvent::StoresListed { stores } = &events[0] else { panic!("no row: {events:?}") };
+        let listed = &stores[0];
+        assert_eq!(listed.id, store_id);
+        assert_eq!(listed.name, "Recipes", "the share's own name");
+        assert_eq!(listed.shared_by.as_deref(), Some("ann@example.com"));
+        assert_eq!(listed.kind, StoreKind::Vault);
+        assert_eq!(listed.relay, RelaySide::Member);
+        assert_eq!(listed.access, StoreAccess::Read, "nothing can be changed of a store that is not there");
+        assert!(listed.roots.is_empty(), "the row stands alone: nothing under it is known");
+        assert_eq!(sync_of(&events[1]), (StoreAccess::Read, RelaySide::Member, true));
+
+        // Every failed attempt after the first has nothing new to say.
+        assert!(client.endpoint_down(&[store_id]).is_empty());
+
+        // A row the account's list could not be read for still has a name,
+        // the desktop's for the same thing.
+        let unnamed = StoreId::new();
+        client.set_relayed(vec![store_id, unnamed]);
+        let events = client.endpoint_down(&[unnamed]);
+        let BackendEvent::StoresListed { stores } = &events[0] else { panic!("no row: {events:?}") };
+        assert_eq!(stores[0].name, "Shared from another computer");
+        assert_eq!(stores[0].shared_by, None);
+    }
+
+    /// Such a store opens read-only and empty rather than erroring: its row,
+    /// an empty folder, no list, and a sentence for anything that would
+    /// change it. Nothing here needs a connection, and nothing is an `Error`
+    /// the status bar would show as one.
+    #[test]
+    fn a_store_whose_owner_is_offline_opens_empty_and_to_be_read() {
+        let (mut client, store_id, _) = page_with_a_relayed_share();
+        let placeholder = NodeId(store_id.0);
+
+        // Before anyone has said it is down, it is nobody's to answer here.
+        assert!(matches!(client.handle_unreachable(BackendCommand::GetChildren { store_id, node_id: placeholder }), Handled::No(_)));
+
+        client.endpoint_down(&[store_id]);
+        let answered = |handled: Handled| match handled {
+            Handled::Yes(event) => event,
+            Handled::No(cmd) => panic!("handed back: {cmd:?}"),
+        };
+
+        let children = answered(client.handle_unreachable(BackendCommand::GetChildren { store_id, node_id: placeholder }));
+        assert!(
+            matches!(&children, Some(BackendEvent::ChildrenLoaded { children, parent_id, .. }) if children.is_empty() && *parent_id == placeholder),
+            "{children:?}"
+        );
+        let node = answered(client.handle_unreachable(BackendCommand::GetNode { store_id, node_id: placeholder }));
+        let Some(BackendEvent::NodeLoaded { node, .. }) = node else { panic!("no node: {node:?}") };
+        assert_eq!(node.metadata.title, "Recipes");
+        assert_eq!(node.node_type, node_types::FOLDER);
+        assert_eq!(node.access, StoreAccess::Read);
+        assert!(node.children.is_empty());
+
+        // The UI's registration of a store: nothing to subscribe to yet, and
+        // a sync answer that says why.
+        assert!(answered(client.handle_unreachable(BackendCommand::SubscribeStoreChanges { store_id })).is_none());
+        let sync = answered(client.handle_unreachable(BackendCommand::GetStoreSync { store_id })).unwrap();
+        assert_eq!(sync_of(&sync), (StoreAccess::Read, RelaySide::Member, true));
+
+        // A write is refused with the sentence that says why, before anything
+        // is asked of anyone; a read is not.
+        let refused = client
+            .refuse_write(store_id, &BackendCommand::CreateNode { store_id, parent_id: None, title: "New".into() })
+            .expect("nothing can be created in a store that cannot be reached");
+        assert!(
+            matches!(&refused, BackendEvent::Error { message } if message == &format!("Forbidden: {OWNER_OFFLINE_REFUSAL}")),
+            "{refused:?}"
+        );
+        assert!(client.refuse_write(store_id, &BackendCommand::GetNode { store_id, node_id: placeholder }).is_none());
+
+        // Another store's commands are none of this.
+        let other = StoreId::new();
+        assert!(matches!(client.handle_unreachable(BackendCommand::GetChildren { store_id: other, node_id: placeholder }), Handled::No(_)));
+    }
+
+    /// When the endpoint answers, the store is opened like any hosted one and
+    /// announced as the store it is, so the tree fetches what is in it with no
+    /// reload: the share's root under the row, the account's real access, and
+    /// `owner offline` gone.
+    #[test]
+    fn a_store_fills_in_when_its_owner_is_back() {
+        let (mut client, store_id, _) = page_with_a_relayed_share();
+        client.endpoint_down(&[store_id]);
+
+        // What `open_listed` does once the endpoint lists the store: the
+        // share's documents, pulled and held. (The relay face lists it to a
+        // member as "Shared with you".)
+        let (mut peer, root) = origin();
+        peer.add_node(NodeId::new(), Some(root), None, "document", "Pasta", T0).unwrap();
+        client.rows.insert(store_id, relayed_row(vec![grant(Some(root), "editor", "Recipes")], Some("ann@example.com")));
+        let mut listed = Store::new_local("Shared with you", PathBuf::new());
+        listed.id = store_id;
+        listed.kind = StoreKind::Vault;
+        let held = VaultStore::assemble(listed.clone(), store_keys(), vec![root], pull_of(&peer));
+        client.stores.insert(store_id, held);
+
+        let events = client.endpoint_up(&[store_id], &[listed]);
+        assert_eq!(events.len(), 2, "{events:?}");
+        let BackendEvent::StoreOpened { store } = &events[0] else { panic!("not announced: {events:?}") };
+        assert_eq!(store.name, "Recipes");
+        assert_eq!(store.roots, vec![root]);
+        assert_eq!(store.access, StoreAccess::Full, "an editor edits again");
+        assert_eq!(store.relay, RelaySide::Member);
+        assert_eq!(sync_of(&events[1]), (StoreAccess::Full, RelaySide::Member, false));
+
+        // And it answers like any open store from here on.
+        assert!(matches!(client.handle_unreachable(BackendCommand::GetChildren { store_id, node_id: root }), Handled::No(_)));
+        assert!(client.refuse_write(store_id, &BackendCommand::CreateNode { store_id, parent_id: Some(root), title: "New".into() }).is_none());
+        let BackendEvent::ChildrenLoaded { children, .. } = client.get_children(store_id, root) else { panic!("no list") };
+        assert!(!children.is_empty());
+        assert!(children.iter().all(|node| node.access == StoreAccess::Full));
+
+        // An endpoint that was never down has nothing to announce.
+        assert!(client.endpoint_up(&[store_id], &[]).is_empty());
+    }
+
+    /// A store this page holds when its owner's computer goes off is read from
+    /// what is held, says so on its row, and takes no change until it is back,
+    /// except what the editor had already put on screen, which is kept for
+    /// the next connection rather than refused from under it.
+    #[test]
+    fn a_held_store_whose_owner_goes_offline_is_read_and_not_changed() {
+        let (mut client, store_id, _) = page_with_a_relayed_share();
+        let (mut peer, root) = origin();
+        peer.add_node(NodeId::new(), Some(root), None, "document", "Pasta", T0).unwrap();
+        client.rows.insert(store_id, relayed_row(vec![grant(None, "editor", "")], None));
+        client.stores.insert(store_id, opened(&peer));
+
+        let events = client.endpoint_down(&[store_id]);
+        assert_eq!(events.len(), 1, "a store the UI already has is not listed again: {events:?}");
+        assert_eq!(sync_of(&events[0]), (StoreAccess::Read, RelaySide::Member, true));
+
+        let Handled::Yes(Some(BackendEvent::ChildrenLoaded { children, .. })) =
+            client.handle_unreachable(BackendCommand::GetChildren { store_id, node_id: root })
+        else {
+            panic!("the held list was not served")
+        };
+        assert!(!children.is_empty(), "what is held is still read");
+        assert!(children.iter().all(|node| node.access == StoreAccess::Read));
+        let mut described = listed(root);
+        described.id = store_id;
+        client.describe(&mut described);
+        assert_eq!(described.access, StoreAccess::Read);
+
+        let rename = BackendCommand::RenameNode { store_id, node_id: root, title: "No".into() };
+        assert!(client.refuse_write(store_id, &rename).is_some());
+
+        // A keystroke already on its way: merged and kept, not refused.
+        let mut editor = NodeDoc::load(&peer.doc(root).unwrap().save()).unwrap();
+        let before = editor.state_vector();
+        let typed = {
+            let mut tree = Tree::from_docs(root, HashMap::from([(root, NodeDoc::load(&editor.save()).unwrap())]));
+            let edit = tree.set_title(root, "Typed while it went", T1).unwrap();
+            edit.touched[0].1.clone()
+        };
+        editor.apply_update(&typed).unwrap();
+        assert_ne!(editor.state_vector(), before);
+        let keystroke = BackendCommand::BroadcastChanges { store_id, node_id: root, changes: STANDARD.encode(&typed) };
+        assert!(client.refuse_write(store_id, &keystroke).is_none());
+        assert!(matches!(client.handle_unreachable(keystroke), Handled::Yes(None)));
+        let held = &client.stores[&store_id];
+        assert!(held.docs[&root].unsent, "the next connection has nothing to resend");
+        assert_eq!(held.tree.doc(root).unwrap().fields().unwrap().title, "Typed while it went");
+    }
+
+    /// A store the session says is relayed is one whether or not the
+    /// account's list could be read, and a whole store with no name anywhere
+    /// but in its own documents is called by its root's title once that is
+    /// open here.
+    #[test]
+    fn a_relayed_store_is_described_as_one() {
+        let store_id = StoreId::new();
+        let mut client = VaultClient::new("me".to_string());
+        client.set_relayed(vec![store_id]);
+        assert!(client.is_relayed(store_id));
+        assert!(client.is_encrypted(store_id));
+
+        // The twin is made without a name, and Pimble Cloud holds none.
+        let mut unnamed = Store::new_local("", PathBuf::new());
+        unnamed.id = store_id;
+        unnamed.kind = StoreKind::Vault;
+        let mut before_open = unnamed.clone();
+        client.describe(&mut before_open);
+        assert_eq!(before_open.relay, RelaySide::Member);
+        assert_eq!(before_open.name, "Shared from another computer");
+
+        let (peer, _) = origin();
+        let title = peer.get_node_info(peer.root()).unwrap().title;
+        client.stores.insert(store_id, opened(&peer));
+        let mut open = unnamed.clone();
+        client.describe(&mut open);
+        assert_eq!(open.name, title);
+
+        // A hosted store is not called any of this.
+        let mut hosted = Store::new_local("", PathBuf::new());
+        hosted.kind = StoreKind::Vault;
+        client.describe(&mut hosted);
+        assert_eq!(hosted.relay, RelaySide::None);
+        assert_eq!(hosted.name, "");
+
+        // A session that stops naming a store stops waiting for it.
+        client.endpoint_down(&[store_id]);
+        client.set_relayed(Vec::new());
+        assert!(matches!(client.handle_unreachable(BackendCommand::GetStoreSync { store_id }), Handled::No(_)));
+    }
+
+    // ── A twin built again ──────────────────────────────────────────────────
+
+    /// A relayed store's twin is disposable: built again, its logs start from
+    /// 1 under a new epoch, and a page that kept its cursors would skip them.
+    /// The first epoch heard is only remembered, the same one again changes
+    /// nothing, and a server that names none concludes nothing.
+    #[test]
+    fn a_new_epoch_makes_the_page_forget_what_it_read() {
+        let (mut peer, root) = origin();
+        peer.add_node(NodeId::new(), Some(root), None, "document", "Pasta", T0).unwrap();
+        let store_id = StoreId::new();
+        let mut store = opened(&peer);
+        let child = peer.get_children(root).unwrap()[0];
+        store.keys.listed_dek.insert(child, KeyId::new_v4());
+
+        // An edit this page made and the old twin took, moments before its
+        // owner's computer went off: the owner's own store never had it, so
+        // the twin built again from that store does not either.
+        let edit = store.tree.set_title(root, "Renamed here", T1).unwrap();
+        let outgoing = store.prepare(store_id, root, &edit.touched[0].1).unwrap();
+        store.record(root, &outgoing, Ok(2)).unwrap();
+        let read_to = store.docs[&root].cursor.applied_through();
+        let known = store.docs[&root].known_sv.clone();
+        assert_eq!(read_to, 2);
+        assert_eq!(known, store.tree.doc(root).unwrap().state_vector());
+
+        assert!(!store.take_epoch(None, None));
+        assert!(!store.take_epoch(Some("2026-09-21T10:00:00Z"), None), "the first epoch heard is remembered, nothing more");
+        assert!(!store.take_epoch(Some("2026-09-21T10:00:00Z"), None));
+        assert!(!store.take_epoch(None, None));
+        assert_eq!(store.docs[&root].cursor.applied_through(), read_to);
+        assert_eq!(store.docs[&root].known_sv, known);
+        assert!(!store.docs[&root].unsent);
+
+        // The twin was built again.
+        assert!(store.take_epoch(Some("2026-09-21T11:30:00Z"), None));
+        for id in peer.ids() {
+            let doc = &store.docs[&id];
+            assert_eq!(doc.cursor.applied_through(), 0, "{id} would be read from where the old log was read to");
+            assert_eq!(doc.known_sv, pimble_crdt::empty_state_vector(), "{id}: the old twin's holdings are believed of the new one");
+            assert_eq!(doc.appends, 0);
+            assert!(doc.unsent, "{id} is not offered to the new twin");
+        }
+        assert!(store.heads.is_empty());
+        assert!(store.keys.listed_dek.is_empty() && store.keys.wraps.is_empty() && store.keys.deks.is_empty());
+        assert!(store.keys.scope.current.is_some(), "the account's own keys went with the twin's");
+        assert_eq!(store.tree.doc(root).unwrap().fields().unwrap().title, "Renamed here", "the notes are this page's, not the twin's");
+        // Remembered: the same epoch again is not another rebuild.
+        assert!(!store.take_epoch(Some("2026-09-21T11:30:00Z"), None));
+
+        // Read again from the start (the new logs are one entry each, as the
+        // owner's link pushed them): what this page already holds merges to
+        // nothing and says nothing to the UI, and the cursors are the new
+        // logs' own.
+        for id in peer.ids() {
+            let merged = store.merge(store_id, id, vec![(Mark::Through(1), Ok(peer.doc(id).unwrap().save()))], false, None);
+            assert!(merged.events.is_empty() && !merged.structure, "{id}: a merge repeated said something");
+            store.heads.insert(id, 1);
+            assert_eq!(store.docs[&id].cursor.applied_through(), 1, "{id}");
+        }
+
+        // Offered again: everything beyond what the new twin is now known to
+        // hold, which brings it the edit only this page had.
+        let outgoing = store.prepare(store_id, root, &[]).unwrap();
+        assert!(outgoing.resend);
+        assert!(outgoing.created.is_none(), "the new twin lists it: an append must not try to create it");
+        let mut twin = NodeDoc::load(&peer.doc(root).unwrap().save()).unwrap();
+        assert_eq!(twin.fields().unwrap().title, "Vault");
+        twin.apply_update(&outgoing.payload).unwrap();
+        assert_eq!(twin.fields().unwrap().title, "Renamed here", "what only this page held was lost with the old twin");
+        assert_eq!(store.record(root, &outgoing, Ok(2)).unwrap(), None);
+        assert!(!store.docs[&root].unsent);
+        assert_eq!(store.docs[&root].known_sv, store.tree.doc(root).unwrap().state_vector());
+    }
+
+    /// What this account may only read is read again and never offered: the
+    /// server would refuse it, and a refused append throws the local copy
+    /// away.
+    #[test]
+    fn a_new_epoch_offers_only_what_the_account_may_write() {
+        let (peer, root) = origin();
+        let mut reader = VaultStore::assemble(listed(root), store_keys(), vec![root], pull_of(&peer));
+        let reads = relayed_row(vec![grant(Some(root), "reader", "Recipes")], Some("ann@example.com"));
+        reader.take_epoch(Some("a"), Some(&reads));
+        assert!(reader.take_epoch(Some("b"), Some(&reads)));
+        for id in peer.ids() {
+            assert_eq!(reader.docs[&id].cursor.applied_through(), 0);
+            assert!(!reader.docs[&id].unsent, "a reader's page offered {id}");
+        }
+
+        let mut editor = VaultStore::assemble(listed(root), store_keys(), vec![root], pull_of(&peer));
+        let edits = relayed_row(vec![grant(Some(root), "editor", "Recipes")], Some("ann@example.com"));
+        editor.take_epoch(Some("a"), Some(&edits));
+        assert!(editor.take_epoch(Some("b"), Some(&edits)));
+        assert!(peer.ids().iter().all(|id| editor.docs[id].unsent));
     }
 
     // ── Which key opens a blob ──────────────────────────────────────────────

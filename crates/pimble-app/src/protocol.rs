@@ -129,7 +129,8 @@ pub enum BackendCommand {
     /// creates directly, refuses it.
     CreateHostedStore { name: String, kind: String },
 
-    // Pimble Cloud account (docs/DESKTOP_ACCOUNT_CONTRACT.md). All six are
+    // Pimble Cloud account (docs/DESKTOP_ACCOUNT_CONTRACT.md, and
+    // docs/RELAY_CONTRACT.md for the two relay ones). All of them are
     // `Service`-only RPCs on the server this client talks to; the desktop's
     // embedded server is that principal. Each answers with a `Cloud*` event
     // that names the operation, so an outcome never has to be guessed at.
@@ -147,6 +148,14 @@ pub enum BackendCommand {
     /// Add an already-hosted store as a local replica; the store arrives as
     /// `StoreOpened`, exactly as `AddRemoteStore`'s does.
     CloudAddHostedStore { store_id: StoreId },
+    /// Share a local store from this computer (docs/RELAY_CONTRACT.md):
+    /// nothing of it is uploaded, and the people it is shared with reach it
+    /// through Pimble Cloud's relay while this computer is on and online
+    /// (`CloudStoreRelayed`). Sent only because the person chose it.
+    CloudRelayStore { store_id: StoreId },
+    /// The way back from `CloudRelayStore` (`CloudRelayingStopped`). The
+    /// server refuses it while the store still has shares.
+    CloudStopRelaying { store_id: StoreId },
 
     // Sharing (docs/NODE_DOCUMENT_CONTRACT.md section 5). `Service`-only like
     // the six above. The first four answer `CloudShareUpdated`, the last
@@ -174,6 +183,8 @@ pub enum CloudOp {
     HostStore,
     ListHostedStores,
     AddHostedStore,
+    RelayStore,
+    StopRelaying,
     Share,
     ShareInfo,
     ShareInvite,
@@ -262,7 +273,15 @@ pub enum BackendEvent {
     /// `Store::read_only_roots`): a role the owner changed while the app runs
     /// arrives here, and the handler refetches what it holds of the store
     /// when either differs, because every node carries the server's
-    /// judgement of itself (`Node::access`).
+    /// judgement of itself (`Node::access`). `relay` is which end of Pimble
+    /// Cloud's relay this device is for the store, if either
+    /// (`Store::relay`, docs/RELAY_CONTRACT.md): the owner's row says
+    /// `shared from here`. `owner_offline` is a backend that KNOWS the store
+    /// is out of reach because its owner's computer is: the browser's, which
+    /// has just heard from Pimble Cloud and cannot reach the store through
+    /// its relay. A Pimble server reports a member's link as `Offline` and
+    /// nothing more, which is also what no network looks like, so the
+    /// desktop never sets it.
     StoreSyncChanged {
         store_id: StoreId,
         remote: Option<RemoteEndpoint>,
@@ -270,6 +289,8 @@ pub enum BackendEvent {
         sync_mode: pimble_core::StoreKind,
         access: pimble_core::StoreAccess,
         read_only_roots: Vec<NodeId>,
+        relay: pimble_core::RelaySide,
+        owner_offline: bool,
     },
     /// Answer to `RemoveReplica`: the replica is gone. Handled exactly like
     /// `StoreClosed` (tree + saved open-store list cleanup).
@@ -289,10 +310,19 @@ pub enum BackendEvent {
     CloudError { op: CloudOp, message: String },
     /// The answer to `CloudListHostedStores`: every store the account has a
     /// grant on, unfiltered (the event handler keeps the ones worth adding).
-    CloudHostedStoresListed { stores: Vec<pimble_rpc::CloudHostedStoreInfo> },
+    /// `relayed` names the rows that are not hosted at all: served from
+    /// their owner's computer through Pimble Cloud's relay
+    /// (`CloudListHostedStoresResponse::relayed`).
+    CloudHostedStoresListed { stores: Vec<pimble_rpc::CloudHostedStoreInfo>, relayed: Vec<String> },
     /// The answer to `CloudHostStore`: the store is hosted and linked in
     /// vault mode.
     CloudStoreHosted { store_id: StoreId },
+    /// The answer to `CloudRelayStore`: the store is shared from this
+    /// computer. Nothing was uploaded.
+    CloudStoreRelayed { store_id: StoreId },
+    /// The answer to `CloudStopRelaying`: the store is no longer shared from
+    /// this computer, and is unlinked.
+    CloudRelayingStopped { store_id: StoreId },
     /// The answer to `CloudShareNode`, `CloudShareInfo`, `CloudShareInvite` and
     /// `CloudShareRemoveMember`: the share and everyone on it.
     CloudShareUpdated { store_id: StoreId, node_id: NodeId, share: pimble_rpc::ShareInfo, members: Vec<pimble_rpc::ShareMember> },

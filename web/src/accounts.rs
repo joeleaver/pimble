@@ -293,10 +293,21 @@ pub struct StoreView {
     /// one's own store.
     #[serde(default)]
     pub shared_by: Option<String>,
+    /// `hosted` or `relay` (docs/RELAY_CONTRACT.md): whether the store's
+    /// encrypted twin is on Pimble Cloud, or the store is served from its
+    /// owner's computer through the relay and reached at its own endpoint
+    /// (`POST /token`'s `stores`). Absent on a service from before the relay,
+    /// which means hosted.
+    #[serde(default = "default_tier")]
+    pub tier: String,
 }
 
 fn default_kind() -> String {
     "plain".to_string()
+}
+
+fn default_tier() -> String {
+    "hosted".to_string()
 }
 
 pub async fn list_stores() -> ApiResult<Vec<StoreView>> {

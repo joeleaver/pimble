@@ -20,6 +20,7 @@ use crate::events::{EVENT_PROCESSOR, process_backend_events};
 use crate::appearance::{display_color, icon_by_name, icons_matching, IconGlyph, COLOR_CHOICES};
 use crate::persistence::{load_dark_mode, save_dark_mode};
 use crate::state::{parse_tree_value, display_label_from_node, mount_is_dimmed, mount_label_suffix, AppStore, SearchState};
+use crate::state::{ShareFace, HOST_ON_CLOUD_LABEL, HOST_ON_CLOUD_SENTENCE, SHARE_FROM_HERE_LABEL, SHARE_FROM_HERE_SENTENCE};
 // Only "Mount Store Here...", which picks a directory on this machine, sets one.
 #[cfg(feature = "native")]
 use crate::state::PendingMount;
@@ -423,11 +424,51 @@ pub fn open_host_modal(store: AppStore, store_id: pimble_core::StoreId) {
     store.host_modal_store.set(Some(store_id));
 }
 
+/// "Stop Sharing from This Computer..." for `store_id`
+/// (docs/RELAY_CONTRACT.md): the confirmation, which sends
+/// `CloudStopRelaying`. The server refuses it while the store still has
+/// shares, and its sentence lands on the confirmation's error line.
+pub fn open_stop_relay_modal(store: AppStore, store_id: pimble_core::StoreId) {
+    store.stop_relay_modal_error.set(String::new());
+    store.stop_relay_modal_busy.set(false);
+    store.stop_relay_modal_store.set(Some(store_id));
+}
+
+/// "Share from this computer", the first of the Share modal's two ways for a
+/// store that is not hosted (docs/RELAY_CONTRACT.md, "The apps"): the person
+/// chose it, so the store is shared from here (`CloudRelayStore`; nothing is
+/// uploaded), and `CloudStoreRelayed` moves the modal on to the share's name.
+/// A refusal is the server's sentence on the modal's error line.
+pub fn share_from_this_computer(store: AppStore) {
+    let Some((store_id, _)) = untracked(|| store.share_modal_node.get()) else { return };
+    store.share_modal_error.set(String::new());
+    store.share_modal_pending.set(Some(crate::protocol::CloudOp::RelayStore));
+    store.send(BackendCommand::CloudRelayStore { store_id });
+}
+
+/// "Host on Pimble Cloud...", the second way: the hosting confirmation the
+/// store row's menu opens, which says what hosting does and asks before
+/// anything is uploaded. The Share modal makes way for it and remembers its
+/// node, so that a store the person then hosts carries on into the share
+/// (`CloudStoreHosted`); closing the confirmation forgets it.
+pub fn host_to_share(store: AppStore) {
+    let Some((store_id, node_id)) = untracked(|| store.share_modal_node.get()) else { return };
+    store.share_modal_node.set(None);
+    store.share_modal_error.set(String::new());
+    store.share_modal_pending.set(None);
+    // Nothing to carry on from when the confirmation does not open (nobody
+    // is signed in, and the Account modal opened in its place).
+    let signed_in = untracked(|| store.cloud_signed_in.get());
+    store.share_after_host.set(signed_in.then_some((store_id, node_id)));
+    open_host_modal(store, store_id);
+}
+
 /// Open the "Add Hosted Store..." modal and ask for the account's stores at
 /// once (decision 6). Not signed in, the modal says so and offers the
 /// Account modal instead of a list.
 pub fn open_hosted_modal(store: AppStore) {
     store.hosted_modal_stores.set(Vec::new());
+    store.hosted_modal_relayed.set(Vec::new());
     store.hosted_modal_selected.set(String::new());
     store.hosted_modal_error.set(String::new());
     let signed_in = untracked(|| store.cloud_signed_in.get());
@@ -448,6 +489,10 @@ pub fn open_hosted_modal(store: AppStore) {
 /// shared shows its share at once; `CloudShareInfo` then fills in the members
 /// the accounts service has. A share carries a name of its own, seeded here
 /// from the node's title because that is usually what the owner would type.
+/// In a store that is neither hosted nor shared from this computer the modal
+/// opens on the two ways to share from it instead
+/// (`crate::state::ShareFace::Ways`, docs/RELAY_CONTRACT.md), and moves on to
+/// the name once the person has chosen one and it is done.
 ///
 /// In a store that reached this device as someone else's share nothing can be
 /// shared from here (`share_item_disabled` keeps the menu item off every node
@@ -496,10 +541,21 @@ pub fn open_share_modal(store: AppStore, store_id: pimble_core::StoreId, node_id
 /// the share's own name and who shared it, never the owner's store name,
 /// which no recipient ever sees (docs/NODE_DOCUMENT_CONTRACT.md section 5,
 /// "A share has a name of its own").
-fn hosted_store_label(info: &pimble_rpc::CloudHostedStoreInfo) -> String {
-    match (info.root.is_some(), &info.shared_by) {
-        (true, Some(email)) => format!("{}, shared by {}", info.name, email),
-        _ => info.name.clone(),
+///
+/// `relayed` is the row's tier (docs/RELAY_CONTRACT.md): such a store is not
+/// hosted anywhere, it is served from its owner's computer while that is on,
+/// and the row says whose. Pimble Cloud holds no name for one, so a row that
+/// is not a share (one's own store on another of one's computers, or a grant
+/// on the whole of someone else's) has none to show and reads as where it is.
+fn hosted_store_label(info: &pimble_rpc::CloudHostedStoreInfo, relayed: bool) -> String {
+    let name = info.name.trim();
+    match (relayed, &info.shared_by) {
+        (false, Some(email)) if info.root.is_some() => format!("{}, shared by {}", info.name, email),
+        (false, _) => info.name.clone(),
+        (true, Some(email)) if name.is_empty() => format!("Shared from {email}'s computer"),
+        (true, Some(email)) => format!("{name}, shared from {email}'s computer"),
+        (true, None) if name.is_empty() => crate::state::RELAYED_PLACEHOLDER_NAME.to_string(),
+        (true, None) => format!("{name}, shared from another computer"),
     }
 }
 
@@ -625,16 +681,39 @@ fn kind_label(kind: &str) -> &'static str {
 /// conflicts to show yet) but still needs a label rather than a match gap.
 /// An encrypting vault link says so first (docs/DESKTOP_ACCOUNT_CONTRACT.md
 /// decision 4): `encrypted · synced`.
-fn sync_badge_text(state: &pimble_core::SyncState, mode: pimble_core::StoreKind) -> &'static str {
-    match (mode, state) {
-        (pimble_core::StoreKind::Plain, pimble_core::SyncState::Offline) => "offline",
-        (pimble_core::StoreKind::Plain, pimble_core::SyncState::Syncing) => "syncing",
-        (pimble_core::StoreKind::Plain, pimble_core::SyncState::Synced { .. }) => "synced",
-        (pimble_core::StoreKind::Plain, pimble_core::SyncState::Conflict { .. }) => "conflict",
-        (pimble_core::StoreKind::Vault, pimble_core::SyncState::Offline) => "encrypted · offline",
-        (pimble_core::StoreKind::Vault, pimble_core::SyncState::Syncing) => "encrypted · syncing",
-        (pimble_core::StoreKind::Vault, pimble_core::SyncState::Synced { .. }) => "encrypted · synced",
-        (pimble_core::StoreKind::Vault, pimble_core::SyncState::Conflict { .. }) => "encrypted · conflict",
+///
+/// A store shared from this computer (`relay` is `Owner`,
+/// docs/RELAY_CONTRACT.md) says that instead, in the same style: its link is
+/// to its own twin on this machine, and `shared from here · offline` is the
+/// people it is shared with being unable to reach it. A member's row reads as
+/// any encrypted store's does ("a member sees no difference"), except that a
+/// backend that knows the owner's computer to be off says `owner offline`.
+/// Only the browser's knows: a Pimble server reports a member's link as
+/// `Offline` whether the owner's computer is off or this one has no network,
+/// and the badge does not say of someone else what it cannot tell.
+fn sync_badge_text(
+    state: &pimble_core::SyncState,
+    mode: pimble_core::StoreKind,
+    relay: pimble_core::RelaySide,
+    owner_offline: bool,
+) -> &'static str {
+    use pimble_core::{RelaySide, StoreKind, SyncState};
+    if owner_offline {
+        return "owner offline";
+    }
+    match (relay, mode, state) {
+        (RelaySide::Owner, _, SyncState::Offline) => "shared from here · offline",
+        (RelaySide::Owner, _, SyncState::Syncing) => "shared from here · syncing",
+        (RelaySide::Owner, _, SyncState::Synced { .. }) => "shared from here · synced",
+        (RelaySide::Owner, _, SyncState::Conflict { .. }) => "shared from here · conflict",
+        (_, StoreKind::Plain, SyncState::Offline) => "offline",
+        (_, StoreKind::Plain, SyncState::Syncing) => "syncing",
+        (_, StoreKind::Plain, SyncState::Synced { .. }) => "synced",
+        (_, StoreKind::Plain, SyncState::Conflict { .. }) => "conflict",
+        (_, StoreKind::Vault, SyncState::Offline) => "encrypted · offline",
+        (_, StoreKind::Vault, SyncState::Syncing) => "encrypted · syncing",
+        (_, StoreKind::Vault, SyncState::Synced { .. }) => "encrypted · synced",
+        (_, StoreKind::Vault, SyncState::Conflict { .. }) => "encrypted · conflict",
     }
 }
 
@@ -910,6 +989,23 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             let is_vault_now = parsed
                 .map(|(s_id, _)| store.is_vault(s_id))
                 .unwrap_or(false);
+            // And which end of Pimble Cloud's relay this device is for the
+            // store (docs/RELAY_CONTRACT.md): a store shared from this
+            // computer offers "Stop Sharing from This Computer..." and turns
+            // off hosting and unlinking, with a line saying why. Snapshotted
+            // like the others; the store row's data carries it.
+            let relay_now = parsed
+                .map(|(s_id, _)| store.store_relay(s_id))
+                .unwrap_or_default();
+            let host_disabled = crate::state::host_item_disabled(is_linked_now, is_replica_now, is_vault_now);
+            let unlink_disabled = crate::state::unlink_item_disabled(is_linked_now, relay_now);
+            let stop_relaying_disabled = crate::state::stop_relaying_item_disabled(relay_now);
+            // A browser build has none of those items to explain.
+            let relayed_note_text = if CAN_ADMINISTER_STORES && is_store_root {
+                crate::state::relayed_store_note(relay_now)
+            } else {
+                ""
+            };
 
             // What this device may change of this row's node
             // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"): the
@@ -1160,7 +1256,18 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 let nv = nv_ctx.clone();
                 move || {
                     if let Some((s_id, _)) = parse_tree_value(&nv) {
+                        // Hosting asked for on its own is not on the way to
+                        // sharing anything.
+                        store.share_after_host.set(None);
                         open_host_modal(store, s_id);
+                    }
+                }
+            };
+            let on_stop_relaying = {
+                let nv = nv_ctx.clone();
+                move || {
+                    if let Some((s_id, _)) = parse_tree_value(&nv) {
+                        open_stop_relay_modal(store, s_id);
                     }
                 }
             };
@@ -1168,8 +1275,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             // node (a store row shares its root node), so they hold the same
             // documents and co-author them (docs/NODE_DOCUMENT_CONTRACT.md
             // section 5). Never disabled for a store that is not hosted: the
-            // server answers with the sentence that says what is missing, and
-            // the modal shows it. Disabled in someone else's store on every
+            // modal opens on the two ways to give the share somewhere to live
+            // (docs/RELAY_CONTRACT.md). Disabled in someone else's store on every
             // node but a shared root (`share_disabled` above), where it opens
             // the member's face of the modal.
             let on_share = {
@@ -1505,14 +1612,19 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
 
                     // Sync status badge (store roots only, linked stores
                     // only) — reactive per store, no tree rebuild
-                    // (docs/SYNC_CONTRACT.md "B: app side").
+                    // (docs/SYNC_CONTRACT.md "B: app side"). A store whose
+                    // owner's computer is known to be off says so whether or
+                    // not the backend calls what reaches it a link (the
+                    // browser holds no links, docs/RELAY_CONTRACT.md).
                     span {
                         style: {
                             move || {
                                 let linked = sync_sig
                                     .map(|sig| sig.with(|(remote, _)| remote.is_some()))
                                     .unwrap_or(false);
-                                if linked {
+                                let owner_offline = parsed
+                                    .map_or(false, |(s_id, _)| store.owner_offline.with(|set| set.contains(&s_id)));
+                                if linked || owner_offline {
                                     "margin-left: 6px; cursor: default; font-size: 10px; font-weight: 400; \
                                      text-transform: none; letter-spacing: normal; opacity: 0.6;"
                                 } else {
@@ -1522,12 +1634,15 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         },
                         {move || {
                             // The mode is the store's own signal (decision 4),
-                            // read here so the badge follows a new vault link.
-                            let mode = store_sig
-                                .map(|sig| sig.with(|s| s.sync_mode))
+                            // read here so the badge follows a new vault link;
+                            // so is which end of the relay this device is.
+                            let (mode, relay) = store_sig
+                                .map(|sig| sig.with(|s| (s.sync_mode, s.relay)))
                                 .unwrap_or_default();
+                            let owner_offline = parsed
+                                .map_or(false, |(s_id, _)| store.owner_offline.with(|set| set.contains(&s_id)));
                             sync_sig
-                                .map(|sig| sig.with(|(_, state)| sync_badge_text(state, mode).to_string()))
+                                .map(|sig| sig.with(|(_, state)| sync_badge_text(state, mode, relay, owner_offline).to_string()))
                                 .unwrap_or_default()
                         }}
                     }
@@ -1544,7 +1659,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             // menu is otherwise a full menu (docs/NODE_DOCUMENT_CONTRACT.md
             // section 5).
             let access_note_text = crate::state::access_note(access_now);
-            let menu_note_text = crate::state::menu_note_text(&[access_note_text, share_note_text]);
+            let menu_note_text = crate::state::menu_note_text(&[access_note_text, share_note_text, relayed_note_text]);
             let menu_note: Option<NodeHandle> = if menu_note_text.is_empty() {
                 None
             } else {
@@ -1612,7 +1727,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             if CAN_ADMINISTER_STORES {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::CloudUpload,
-                                    disabled: is_linked_now || is_replica_now || is_vault_now,
+                                    disabled: host_disabled,
                                     onclick: on_host_on_cloud.clone(),
                                     "Host on Pimble Cloud..."
                                 }
@@ -1627,8 +1742,16 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             }
                             if CAN_ADMINISTER_STORES {
                                 DropdownMenuItem {
+                                    left_section: TablerIcon::ShareOff,
+                                    disabled: stop_relaying_disabled,
+                                    onclick: on_stop_relaying.clone(),
+                                    "Stop Sharing from This Computer..."
+                                }
+                            }
+                            if CAN_ADMINISTER_STORES {
+                                DropdownMenuItem {
                                     left_section: TablerIcon::Unlink,
-                                    disabled: !is_linked_now,
+                                    disabled: unlink_disabled,
                                     onclick: on_unlink_from_remote.clone(),
                                     "Unlink from Remote"
                                 }
@@ -2722,6 +2845,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 onclose: move || {
                     store.host_modal_store.set(None);
                     store.host_modal_error.set(String::new());
+                    // Not hosted, so there is no share to carry on into.
+                    store.share_after_host.set(None);
                 },
                 title: "Host on Pimble Cloud",
                 size: "sm",
@@ -2763,6 +2888,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             onclick: move || {
                                 store.host_modal_store.set(None);
                                 store.host_modal_error.set(String::new());
+                                store.share_after_host.set(None);
                             },
                             "Cancel"
                         }
@@ -2778,6 +2904,83 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 store.send(BackendCommand::CloudHostStore { store_id });
                             },
                             "Host"
+                        }
+                    }
+                }
+            }
+        };
+
+        // ── "Stop Sharing from This Computer..." confirmation (store root
+        // context menu) ─────────────────────────────────────────────────
+        // docs/RELAY_CONTRACT.md: the way back from "Share from this
+        // computer". Names the store and says what stopping does, then
+        // `CloudStopRelaying`. `CloudRelayingStopped` closes it; the server's
+        // refusal while the store still has shares (a
+        // `CloudError { StopRelaying }`) lands on its error line as it is.
+        let stop_relay_modal = rsx! {
+            Modal {
+                opened_fn: move || store.stop_relay_modal_store.get().is_some(),
+                onclose: move || {
+                    store.stop_relay_modal_store.set(None);
+                    store.stop_relay_modal_error.set(String::new());
+                },
+                title: "Stop Sharing from This Computer",
+                size: "sm",
+
+                div {
+                    style: "display: flex; flex-direction: column; gap: 10px;",
+
+                    div {
+                        {|| {
+                            let Some(store_id) = store.stop_relay_modal_store.get() else {
+                                return String::new();
+                            };
+                            let name = store.get_store_signal(store_id)
+                                .map(|sig| sig.with(|s| s.name.clone()))
+                                .unwrap_or_default();
+                            format!("Stop sharing \"{}\" from this computer?", name)
+                        }}
+                    }
+
+                    div {
+                        style: "font-size: 12px; color: var(--rinch-color-dimmed);",
+                        "Nobody will reach this store through Pimble Cloud any more, and its \
+                         encrypted copy for them on this computer is deleted. The store and \
+                         everything in it stay as they are. Each share in it has to be stopped first."
+                    }
+
+                    if !store.stop_relay_modal_error.get().is_empty() {
+                        div {
+                            style: "color: var(--rinch-color-red-6); font-size: 12px;",
+                            {|| store.stop_relay_modal_error.get()}
+                        }
+                    }
+
+                    div {
+                        style: "display: flex; justify-content: flex-end; gap: 8px;",
+                        Button {
+                            variant: "light",
+                            size: "sm",
+                            disabled: {|| store.stop_relay_modal_busy.get()},
+                            onclick: move || {
+                                store.stop_relay_modal_store.set(None);
+                                store.stop_relay_modal_error.set(String::new());
+                            },
+                            "Cancel"
+                        }
+                        Button {
+                            variant: "filled",
+                            color: "red",
+                            size: "sm",
+                            loading: {|| store.stop_relay_modal_busy.get()},
+                            disabled: {|| store.stop_relay_modal_busy.get()},
+                            onclick: move || {
+                                let Some(store_id) = untracked(|| store.stop_relay_modal_store.get()) else { return };
+                                store.stop_relay_modal_error.set(String::new());
+                                store.stop_relay_modal_busy.set(true);
+                                store.send(BackendCommand::CloudStopRelaying { store_id });
+                            },
+                            "Stop Sharing"
                         }
                     }
                 }
@@ -2842,8 +3045,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 value_fn: move || store.hosted_modal_selected.get(),
                                 onchange: move |val: String| store.hosted_modal_selected.set(val),
                                 data: {|| {
+                                    // A row served from its owner's computer
+                                    // says so (docs/RELAY_CONTRACT.md).
+                                    let relayed = store.hosted_modal_relayed.get();
                                     store.hosted_modal_stores.get().iter()
-                                        .map(|s| SelectOption::new(s.store_id.clone(), hosted_store_label(s)))
+                                        .map(|s| SelectOption::new(s.store_id.clone(), hosted_store_label(s, relayed.contains(&s.store_id))))
                                         .collect::<Vec<_>>()
                                 }},
                             }
@@ -2895,9 +3101,19 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         // arrives as `CloudShareUpdated`, `CloudSharingStopped` or
         // `CloudError { op }`, so `events.rs` fills the busy and error lines
         // without guessing which request answered (the Account modal's rule,
-        // decision 3). A store that is not hosted is refused by the server
-        // with a sentence naming the relay; it lands in the error line like
-        // any other answer, which is how the person finds out.
+        // decision 3).
+        //
+        // A store that is neither hosted nor shared from this computer has
+        // nowhere for a share to live, and the server refuses one. So the
+        // modal opens on a fourth face there (`ShareFace::Ways`,
+        // docs/RELAY_CONTRACT.md "The apps"): the two ways, each with its
+        // sentence. "Share from this computer" sends `CloudRelayStore`, and
+        // when that answers the face moves on to the name by itself, because
+        // it is read from the store's link (`AppStore::share_modal_face`);
+        // "Host on Pimble Cloud..." hands over to the hosting confirmation,
+        // and a store hosted there opens this modal again on the same node.
+        // Nothing is chosen for the person: neither button is filled, neither
+        // answers Enter, and closing the modal does neither.
         let share_node_now = move || {
             let Some((store_id, node_id)) = untracked(|| store.share_modal_node.get()) else { return };
             let name = untracked(|| store.share_modal_name.get()).trim().to_string();
@@ -2951,8 +3167,57 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 div {
                     style: "display: flex; flex-direction: column; gap: 10px;",
 
+                    // The store is neither hosted nor shared from this
+                    // computer: the two ways, and the person picks.
+                    if store.share_modal_face() == ShareFace::Ways {
+                        div {
+                            style: "display: flex; flex-direction: column; gap: 14px;",
+
+                            div {
+                                class: "pimble-share__note",
+                                "This store is not hosted on Pimble Cloud or shared from this computer \
+                                 yet. Choose how the people you invite will reach it."
+                            }
+
+                            // The same weight for both, and neither filled:
+                            // there is no default here.
+                            div {
+                                class: "pimble-share__way",
+                                Button {
+                                    variant: "light",
+                                    size: "sm",
+                                    loading: {|| store.share_modal_pending.get() == Some(CloudOp::RelayStore)},
+                                    disabled: {|| store.share_modal_pending.get().is_some() || !store.share_modal_ways_note().is_empty()},
+                                    onclick: move || share_from_this_computer(store),
+                                    {SHARE_FROM_HERE_LABEL}
+                                }
+                                div { class: "pimble-share__note", {SHARE_FROM_HERE_SENTENCE} }
+                            }
+
+                            div {
+                                class: "pimble-share__way",
+                                Button {
+                                    variant: "light",
+                                    size: "sm",
+                                    disabled: {|| store.share_modal_pending.get().is_some() || !store.share_modal_ways_note().is_empty()},
+                                    onclick: move || host_to_share(store),
+                                    {HOST_ON_CLOUD_LABEL}
+                                }
+                                div { class: "pimble-share__note", {HOST_ON_CLOUD_SENTENCE} }
+                            }
+
+                            // A store neither way is open to says why, once.
+                            if !store.share_modal_ways_note().is_empty() {
+                                div {
+                                    class: "pimble-share__note",
+                                    {|| store.share_modal_ways_note()}
+                                }
+                            }
+                        }
+                    }
+
                     // The node is not shared yet: name it and share it.
-                    if !store.share_modal_shared.get() {
+                    if store.share_modal_face() == ShareFace::Name {
                         div {
                             style: "display: flex; flex-direction: column; gap: 10px;",
 
@@ -2994,7 +3259,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
 
                     // The node is shared and this person manages the share:
                     // who has it, and how to stop.
-                    if store.share_modal_shared.get() && store.share_modal_manages() {
+                    if store.share_modal_face() == ShareFace::Owner {
                         div {
                             style: "display: flex; flex-direction: column; gap: 10px;",
 
@@ -3172,7 +3437,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     // device's to report. The list is a courtesy: when it
                     // cannot be loaded the sentence stands alone, with no
                     // error line (`events.rs`, `CloudOp::ShareInfo`).
-                    if store.share_modal_shared.get() && !store.share_modal_manages() {
+                    if store.share_modal_face() == ShareFace::Member {
                         div {
                             style: "display: flex; flex-direction: column; gap: 10px;",
 
@@ -3409,6 +3674,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {appearance_modal}
                 {account_modal}
                 {host_modal}
+                {stop_relay_modal}
                 {hosted_modal}
                 {share_modal}
                 {body}
@@ -3432,6 +3698,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {appearance_modal}
                 {account_modal}
                 {host_modal}
+                {stop_relay_modal}
                 {hosted_modal}
                 {share_modal}
                 {body}
@@ -3508,16 +3775,20 @@ pub fn run() {
 }
 #[cfg(test)]
 mod tests {
-    use super::{hosted_store_label, member_role_text, member_status_text, open_share_modal, sync_badge_text, MOUNT_NOTE};
+    use super::{
+        hosted_store_label, host_to_share, member_role_text, member_status_text, open_share_modal, open_stop_relay_modal,
+        share_from_this_computer, sync_badge_text, MOUNT_NOTE,
+    };
     use crate::protocol::{BackendCommand, BackendHandle, CloudOp};
-    use crate::state::AppStore;
-    use pimble_core::{Node, NodeId, Store, StoreId, StoreKind, SyncState};
+    use crate::state::{AppStore, ShareFace};
+    use pimble_core::{Node, NodeId, RelaySide, Store, StoreId, StoreKind, SyncState};
     use pimble_rpc::{CloudHostedStoreInfo, MemberRole, ShareMemberStatus};
     use rinch::prelude::untracked;
 
-    /// A store with a shared folder and a plain document under its root, a
-    /// backend whose commands the test can read, and an account signed in.
-    /// `shared_by` is who shared the store with this account, if anyone did.
+    /// A hosted store with a shared folder and a plain document under its
+    /// root, a backend whose commands the test can read, and an account
+    /// signed in. `shared_by` is who shared the store with this account, if
+    /// anyone did.
     fn store_with_a_share(shared_by: Option<&str>) -> (AppStore, crossbeam_channel::Receiver<BackendCommand>, StoreId, NodeId, NodeId) {
         let app = AppStore::new();
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<BackendCommand>(16);
@@ -3530,6 +3801,8 @@ mod tests {
         let root = Node::folder("Notes");
         store.root_node_id = root.id;
         store.shared_by = shared_by.map(str::to_string);
+        // Hosted: its link is an encrypting one, which is what a share needs.
+        store.sync_mode = StoreKind::Vault;
         let mut recipes = Node::folder("Recipes");
         recipes.metadata.set_share(Some(&pimble_core::ShareMarker {
             v: pimble_core::ShareMarker::VERSION,
@@ -3571,6 +3844,7 @@ mod tests {
         assert_eq!(app.share_modal_node.get(), Some((store_id, plain_id)));
         assert!(!app.share_modal_shared.get());
         assert!(untracked(|| app.share_modal_manages()));
+        assert_eq!(untracked(|| app.share_modal_face()), ShareFace::Name);
         assert_eq!(app.share_modal_pending.get(), None);
         assert!(!asked_for_members(&commands, plain_id));
 
@@ -3625,6 +3899,112 @@ mod tests {
         assert!(commands.try_iter().next().is_none());
     }
 
+    /// The same store before anyone hosted it or shared it from anywhere: it
+    /// is only on this computer.
+    fn unhosted_store() -> (AppStore, crossbeam_channel::Receiver<BackendCommand>, StoreId, NodeId, NodeId) {
+        let (app, commands, store_id, shared_id, plain_id) = store_with_a_share(None);
+        app.get_store_signal(store_id).unwrap().update(|s| s.sync_mode = StoreKind::Plain);
+        app.ensure_sync_entry(store_id);
+        (app, commands, store_id, shared_id, plain_id)
+    }
+
+    /// In a store that is neither hosted nor shared from this computer the
+    /// dialog opens on the two ways and does nothing else: nothing is asked
+    /// of the server until the person picks one, and picking "Share from this
+    /// computer" asks for exactly that, never for hosting
+    /// (docs/RELAY_CONTRACT.md, "The apps"; `CLAUDE.md`, "Nothing is hosted
+    /// unless the person asked for it").
+    #[test]
+    fn share_in_a_store_that_is_not_hosted_offers_the_two_ways() {
+        let (app, commands, store_id, shared_id, plain_id) = unhosted_store();
+
+        open_share_modal(app, store_id, plain_id);
+        assert_eq!(app.share_modal_node.get(), Some((store_id, plain_id)));
+        assert_eq!(untracked(|| app.share_modal_face()), ShareFace::Ways);
+        assert_eq!(untracked(|| app.share_modal_ways_note()), "");
+        assert_eq!(app.share_modal_pending.get(), None);
+        assert!(commands.try_iter().next().is_none(), "opening the dialog asked the server for something");
+
+        share_from_this_computer(app);
+        assert_eq!(app.share_modal_pending.get(), Some(CloudOp::RelayStore));
+        let sent: Vec<BackendCommand> = commands.try_iter().collect();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(matches!(sent[0], BackendCommand::CloudRelayStore { store_id: s } if s == store_id), "{sent:?}");
+        // Still the two ways until the server has answered.
+        assert_eq!(untracked(|| app.share_modal_face()), ShareFace::Ways);
+
+        // The store's link is what moves the dialog on, whoever reports it.
+        app.get_store_signal(store_id).unwrap().update(|s| {
+            s.sync_mode = StoreKind::Vault;
+            s.relay = RelaySide::Owner;
+        });
+        assert_eq!(untracked(|| app.share_modal_face()), ShareFace::Name);
+
+        // A node that carries a share shows it whatever the link says.
+        app.get_store_signal(store_id).unwrap().update(|s| {
+            s.sync_mode = StoreKind::Plain;
+            s.relay = RelaySide::None;
+        });
+        open_share_modal(app, store_id, shared_id);
+        assert_eq!(untracked(|| app.share_modal_face()), ShareFace::Owner);
+    }
+
+    /// "Host on Pimble Cloud..." hands over to the hosting confirmation, which
+    /// is where hosting is said in full and agreed to: the dialog itself
+    /// uploads nothing. The node is remembered so that the share carries on
+    /// once the store is hosted.
+    #[test]
+    fn hosting_from_the_share_dialog_goes_through_the_confirmation() {
+        let (app, commands, store_id, _, plain_id) = unhosted_store();
+
+        open_share_modal(app, store_id, plain_id);
+        host_to_share(app);
+        assert_eq!(app.share_modal_node.get(), None);
+        assert_eq!(app.host_modal_store.get(), Some(store_id));
+        assert_eq!(app.share_after_host.get(), Some((store_id, plain_id)));
+        assert!(commands.try_iter().next().is_none(), "the store was hosted without the confirmation");
+    }
+
+    /// Neither way is open to a copy of a store that lives somewhere else, or
+    /// to a store linked to another Pimble server: the dialog says which, and
+    /// asks nothing of the server (hosting a linked store would replace its
+    /// link, and the server does not refuse it).
+    #[test]
+    fn the_two_ways_say_why_they_are_off() {
+        let (app, _commands, store_id, _, plain_id) = unhosted_store();
+        open_share_modal(app, store_id, plain_id);
+
+        app.set_sync(
+            store_id,
+            Some(pimble_core::RemoteEndpoint { url: "http://pimble.example:7462".parse().unwrap(), auth: pimble_core::AuthMethod::None }),
+            SyncState::Offline,
+        );
+        assert_eq!(untracked(|| app.share_modal_face()), ShareFace::Ways);
+        assert_eq!(
+            untracked(|| app.share_modal_ways_note()),
+            "This store is linked to another Pimble server. Unlink it first."
+        );
+
+        app.get_store_signal(store_id).unwrap().update(|s| s.is_replica = true);
+        assert_eq!(
+            untracked(|| app.share_modal_ways_note()),
+            "This is a copy of a store that lives somewhere else, and can only be shared from there."
+        );
+    }
+
+    /// "Stop Sharing from This Computer..." asks before it sends anything.
+    #[test]
+    fn stopping_sharing_from_this_computer_asks_first() {
+        let (app, commands, store_id, _, _) = unhosted_store();
+        app.stop_relay_modal_error.set("left over".to_string());
+
+        open_stop_relay_modal(app, store_id);
+        assert_eq!(app.stop_relay_modal_store.get(), Some(store_id));
+        assert!(app.stop_relay_modal_error.get().is_empty());
+        assert!(!app.stop_relay_modal_busy.get());
+        assert!(commands.try_iter().next().is_none());
+    }
+
     fn hosted(name: &str, share: bool, shared_by: Option<&str>) -> CloudHostedStoreInfo {
         CloudHostedStoreInfo {
             store_id: uuid::Uuid::new_v4().to_string(),
@@ -3642,13 +4022,32 @@ mod tests {
     /// share has a name of its own"). A store of one's own is just its name.
     #[test]
     fn a_shared_store_says_who_shared_it() {
-        assert_eq!(hosted_store_label(&hosted("Notes", false, None)), "Notes");
+        assert_eq!(hosted_store_label(&hosted("Notes", false, None), false), "Notes");
         assert_eq!(
-            hosted_store_label(&hosted("Recipes", true, Some("ann@example.com"))),
+            hosted_store_label(&hosted("Recipes", true, Some("ann@example.com")), false),
             "Recipes, shared by ann@example.com"
         );
         // A share whose owner the service did not name is still just a name.
-        assert_eq!(hosted_store_label(&hosted("Recipes", true, None)), "Recipes");
+        assert_eq!(hosted_store_label(&hosted("Recipes", true, None), false), "Recipes");
+    }
+
+    /// A relayed row is not hosted anywhere: it says whose computer it is
+    /// served from (docs/RELAY_CONTRACT.md). Pimble Cloud holds no name for
+    /// such a store, so a row that is not a share has words in place of one.
+    #[test]
+    fn a_relayed_store_says_whose_computer_it_is_on() {
+        assert_eq!(
+            hosted_store_label(&hosted("Recipes", true, Some("alice@example.com")), true),
+            "Recipes, shared from alice@example.com's computer"
+        );
+        // A grant on the whole of someone's relayed store: no name to show.
+        assert_eq!(
+            hosted_store_label(&hosted("", false, Some("alice@example.com")), true),
+            "Shared from alice@example.com's computer"
+        );
+        // One's own, seen from another of one's computers.
+        assert_eq!(hosted_store_label(&hosted("", false, None), true), "Shared from another computer");
+        assert_eq!(hosted_store_label(&hosted("Recipes", true, None), true), "Recipes, shared from another computer");
     }
 
     /// Every member state the service can report has words for it, and none of
@@ -3682,11 +4081,30 @@ mod tests {
         // Built through serde: this crate has no chrono of its own.
         let synced: SyncState =
             serde_json::from_str(r#"{"state":"synced","last_sync":"2026-09-16T00:00:00Z"}"#).unwrap();
-        assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Plain), "offline");
-        assert_eq!(sync_badge_text(&SyncState::Syncing, StoreKind::Plain), "syncing");
-        assert_eq!(sync_badge_text(&synced, StoreKind::Plain), "synced");
-        assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Vault), "encrypted · offline");
-        assert_eq!(sync_badge_text(&SyncState::Syncing, StoreKind::Vault), "encrypted · syncing");
-        assert_eq!(sync_badge_text(&synced, StoreKind::Vault), "encrypted · synced");
+        let none = RelaySide::None;
+        assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Plain, none, false), "offline");
+        assert_eq!(sync_badge_text(&SyncState::Syncing, StoreKind::Plain, none, false), "syncing");
+        assert_eq!(sync_badge_text(&synced, StoreKind::Plain, none, false), "synced");
+        assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Vault, none, false), "encrypted · offline");
+        assert_eq!(sync_badge_text(&SyncState::Syncing, StoreKind::Vault, none, false), "encrypted · syncing");
+        assert_eq!(sync_badge_text(&synced, StoreKind::Vault, none, false), "encrypted · synced");
+    }
+
+    /// A store shared from this computer says so, with the link's state in the
+    /// vault badge's style (docs/RELAY_CONTRACT.md, "The apps"). A member's
+    /// row reads as any encrypted store's does, and says `owner offline` only
+    /// when the backend knows that is why: a Pimble server reports a member's
+    /// link as `Offline` and no more, which no network looks like too.
+    #[test]
+    fn badge_text_says_which_end_of_the_relay_this_is() {
+        let synced: SyncState =
+            serde_json::from_str(r#"{"state":"synced","last_sync":"2026-09-21T00:00:00Z"}"#).unwrap();
+        assert_eq!(sync_badge_text(&synced, StoreKind::Vault, RelaySide::Owner, false), "shared from here · synced");
+        assert_eq!(sync_badge_text(&SyncState::Syncing, StoreKind::Vault, RelaySide::Owner, false), "shared from here · syncing");
+        assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Vault, RelaySide::Owner, false), "shared from here · offline");
+
+        assert_eq!(sync_badge_text(&synced, StoreKind::Vault, RelaySide::Member, false), "encrypted · synced");
+        assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Vault, RelaySide::Member, false), "encrypted · offline");
+        assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Vault, RelaySide::Member, true), "owner offline");
     }
 }
