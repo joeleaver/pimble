@@ -146,6 +146,14 @@ fn register_opened_store(store: AppStore, tree_state: UseTreeReturn, opened_stor
 fn refetch_parent_children(store: AppStore, changed_store: StoreId, parent_id: NodeId) {
     if store.has_children_loaded(changed_store, parent_id) {
         store.send(BackendCommand::GetChildren { store_id: changed_store, node_id: parent_id });
+    } else if store.get_node_signal(changed_store, parent_id).is_some() {
+        // A row that was never opened still says whether it can be: its
+        // node's own `children`. When the first child of such a folder turns
+        // up after the folder's own change did (a document made elsewhere,
+        // readable here only once its key wraps had been fetched), nothing
+        // else refreshes the row, and it stays without a chevron, its child
+        // out of reach (found in the browser, 2026-09-21).
+        store.send(BackendCommand::GetNode { store_id: changed_store, node_id: parent_id });
     }
     for (mount_store, mount_node) in store.mounts_sourced_from_node(changed_store, parent_id) {
         if store.has_children_loaded(mount_store, mount_node) {
@@ -548,6 +556,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                                     || cached.metadata.color() != node.metadata.color()
                                     || cached.metadata.share().is_some() != shared
                                     || cached.access != node.access
+                                    // A row not opened yet takes its chevron
+                                    // from whether the node lists children.
+                                    || cached.children.is_empty() != node.children.is_empty()
                             })
                         })
                     })
@@ -1629,6 +1640,43 @@ mod tests {
         events.send(listing).unwrap();
         pump(store);
         assert!(!commands.try_iter().any(|c| matches!(c, BackendCommand::GetChildren { .. } | BackendCommand::GetNode { .. })), "nothing changed the second time");
+    }
+
+    /// A folder that was never opened shows a chevron from its node's own
+    /// `children`. When its first child turns up after the folder's own change
+    /// was heard (a document made on another device, readable here only once
+    /// its key wraps had been fetched), the child's arrival has to refresh
+    /// the folder's node, and a node that starts listing children has to
+    /// rebuild its row, or the child stays out of reach.
+    #[test]
+    fn a_child_arriving_late_gives_its_unopened_folder_a_chevron() {
+        let (store, events, commands) = store_with_events();
+        let (store_id, [recipes, _], [pasta, _]) = a_replica_with_two_roots(store);
+        let walks = pimble_core::Node::folder("Walks");
+        let walks_id = walks.id;
+        store.set_children(store_id, recipes, vec![(store_id, pasta), (store_id, walks_id)]);
+        store.upsert_node(store_id, walks.clone());
+        assert!(!store.has_children_loaded(store_id, walks_id));
+
+        let storr = NodeId::new();
+        events
+            .send(BackendEvent::RemoteStoreChange {
+                store_id,
+                change_kind: pimble_rpc::StoreChangeKind::NodeCreated { node_id: storr, parent_id: walks_id },
+                source_client_id: None,
+            })
+            .unwrap();
+        pump(store);
+        let asked: Vec<BackendCommand> = commands.try_iter().collect();
+        assert!(asked.iter().any(|c| matches!(c, BackendCommand::GetNode { node_id, .. } if *node_id == walks_id)), "the folder's node is asked for again: {asked:?}");
+        assert!(!asked.iter().any(|c| matches!(c, BackendCommand::GetChildren { node_id, .. } if *node_id == walks_id)), "its list was never loaded and is not loaded now");
+
+        let before = untracked(|| store.tree_structure_version.get());
+        let mut listing = walks;
+        listing.children = vec![storr];
+        events.send(BackendEvent::NodeLoaded { store_id, node: listing }).unwrap();
+        pump(store);
+        assert_ne!(untracked(|| store.tree_structure_version.get()), before, "a node that starts listing children rebuilds its row");
     }
 
     /// A link reads how the account holds the store each time it connects,
