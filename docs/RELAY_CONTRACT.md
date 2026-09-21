@@ -1,8 +1,9 @@
 # Relay contract: sharing from an unhosted store, with nothing uploaded
 
-Status: the accounts-service half (d9f0d40, 6d95e38) and the owner's-server half (02c6564)
-are built and were verified headless by the PM on the local stack on 2026-09-21 (see
-"Verification" below); the apps' half is in progress. Nothing is merged or deployed.
+Status: built (accounts service d9f0d40 and 6d95e38, owner's server 02c6564 and 7ebf70f,
+apps 1f5eae6 and 2df6383) and verified by the PM on the local stack on 2026-09-21:
+headless, in the desktop app and with a member in the browser (see "Verification" below).
+Nothing is merged or deployed.
 
 Written 2026-09-21 by the PM from `docs/NODE_DOCUMENT_CONTRACT.md` section 5b,
 which Joe approved on 2026-09-18 (decision 3: "Not supposed to be hosted, that's what the
@@ -174,5 +175,24 @@ not see each other; the twin was deleted while it was off; on its return the twi
 rebuilt and all three converged, both members' offline notes and an offline text edit
 included. `cloudStopRelaying` was refused while shares existed. The accounts service was
 killed and restarted with a new signing key: members were `Synced` again within 45 s and
-what each side wrote meanwhile converged. Still to run: the two apps (the dialog's two
-ways, the badges) and a member in the browser, once the apps' half lands; `wss://`.
+what each side wrote meanwhile converged.
+
+**Run in the apps the same day.** Desktop, the owner: "Share..." on a folder of an unhosted
+store shows the two ways, neither pre-chosen, each with its sentence; "Share from this
+computer" turns the row to `shared from here · synced`, moves the dialog on to the share's
+name, and the share and an invitation are made from the dialog, with the hosted directory
+still empty. Desktop, a member: "Add Hosted Store..." offers "Plans, shared from
+alice@example.com's computer"; added, it shows the owner's notes through the relay; with
+the owner's app closed its badge reads `owner offline` (the server now says why a link is
+down: `GetStoreSyncResponse.owner_offline`, true only when the relay said so). Browser, a
+member: both relayed shares are listed and open from their own endpoints with their own
+tokens; typing in a note reaches the owner's plain store through the relay and is
+readable neither on the twin nor anywhere on Pimble Cloud; with the owner off the open
+page keeps its trees and the open note, read only, marked `owner offline`; when the owner
+returns it becomes editable again and shows the owner's new text, with no reload.
+
+**Known from that run.** The relay admits a browser only from the service's own public
+origin, so a page served from another host (the local stack's second-account trick,
+`localhost`) is refused and shows `owner offline`, which is the wrong reason; production
+has one origin. `wss://` has not been exercised locally. The sidebar clips a member's
+long badge ("shared by <address> · encrypted · synced").

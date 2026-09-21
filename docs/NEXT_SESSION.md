@@ -123,10 +123,10 @@ of it run, `scripts/local-stack/README.md`.
 
 ## Next
 
-1. The relay tier's apps' half (`docs/RELAY_CONTRACT.md`, "The apps"): in progress when
-   this was written. The accounts-service and owner's-server halves are committed and
-   passed the contract's bar headless (the contract's "Verification" says what was run).
-   Then the PM's pass of it in the desktop app and with a member in the browser.
+1. **The relay tier is built and verified** (`docs/RELAY_CONTRACT.md`, status and
+   "Verification"): headless, in the desktop app and with a member in the browser. What
+   is left of it is small: `wss://` has never run locally; a browser refused for its
+   origin reads `owner offline`; the twin holds the whole store, not only what is shared.
 2. Joe's decisions, then merge, deploy (the accounts database needs `HostedStore.tier`
    applied, and the hosted server and accounts service go together) and release.
 3. When rinch #832 (read-only editor switch) merges: `cargo update` the rinch crates in

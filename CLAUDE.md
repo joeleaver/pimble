@@ -395,8 +395,8 @@ Contract: `docs/NODE_DOCUMENT_CONTRACT.md` section 5. How to run it all on one m
 - **Nothing is hosted as a side effect**: `cloudShareNode` on a store that is neither
   hosted nor relayed answers "Sharing needs this store hosted on Pimble Cloud or shared
   from this computer."
-- **The relay tier** (`docs/RELAY_CONTRACT.md`; server halves built and verified headless
-  2026-09-21, apps' half in progress): `cloudRelayStore` shares an unhosted store from the
+- **The relay tier** (`docs/RELAY_CONTRACT.md`; built and verified headless, in the
+  desktop app and in the browser, 2026-09-21): `cloudRelayStore` shares an unhosted store from the
   computer it lives on. The owner's server runs a second Pimble server in its own process,
   the relay face (`relay_face.rs`: JWT mode, loopback, the store's encrypted twin under
   `<data dir>/pimble/relay/`), kept in step by an ordinary vault link (`sync.json` mode
@@ -405,7 +405,11 @@ Contract: `docs/NODE_DOCUMENT_CONTRACT.md` section 5. How to run it all on one m
   accounts service records the store as `tier: "relay"` with an empty name; `/token` names
   each relayed store's endpoint in `stores`, each with a token that names that store alone,
   the only kind the relay takes (Joe, 2026-09-21: it is handed to the owner's machine).
-  `Store.relay` says which end a device is; a member whose owner is off is plain `Offline`.
+  `Store.relay` says which end a device is; a member whose owner is off is plain `Offline`,
+  and `GetStoreSyncResponse.owner_offline` says so only when the relay did. The Share
+  dialog on an unhosted store offers both ways and chooses neither; the owner's row reads
+  `shared from here`, a member's `owner offline`; the web lists relayed stores from their
+  own endpoints and turns an open one read-only while its owner is away.
 - **Known limits**, all in the contract or `docs/NEXT_SESSION.md`: a scoped editor can move
   a node out of the share by setting its `parent_id`; no data-key rotation when a node or
   a member leaves; a removed member's connection lives until its token expires if their
