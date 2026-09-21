@@ -262,6 +262,44 @@ const E2EE_HTML: &str = "<p>These notes are end-to-end encrypted: Pimble Cloud s
      being able to read them. They will open for you once {sender}'s Pimble has been online \
      once to hand over the key, which usually takes a moment.</p>";
 
+/// The same paragraph for a store shared from its owner's computer
+/// (docs/RELAY_CONTRACT.md): Pimble Cloud stores nothing of it, so saying it
+/// "stores them without being able to read them" would be untrue, and the
+/// thing a recipient most needs to know is a different one: the notes are
+/// reachable while that computer is on.
+const RELAYED_TEXT: &str = "These notes are end-to-end encrypted and stay on {sender}'s computer: \
+     Pimble Cloud stores none of them. You can open and change them while that computer is on and \
+     online; the rest of the time you keep what you already have.";
+const RELAYED_HTML: &str = "<p>These notes are end-to-end encrypted and stay on {sender}'s computer: \
+     Pimble Cloud stores none of them. You can open and change them while that computer is on and \
+     online; the rest of the time you keep what you already have.</p>";
+
+/// Where the notes a sharing mail announces are kept, which decides what the
+/// mail may promise about them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kept {
+    /// As ciphertext on Pimble Cloud (a hosted store).
+    OnPimbleCloud,
+    /// On the owner's own computer, reached through the relay.
+    OnOwnersComputer,
+}
+
+impl Kept {
+    fn text(self) -> &'static str {
+        match self {
+            Kept::OnPimbleCloud => E2EE_TEXT,
+            Kept::OnOwnersComputer => RELAYED_TEXT,
+        }
+    }
+
+    fn html(self) -> &'static str {
+        match self {
+            Kept::OnPimbleCloud => E2EE_HTML,
+            Kept::OnOwnersComputer => RELAYED_HTML,
+        }
+    }
+}
+
 /// `sender` must already be escaped for the HTML form — only the substituted
 /// value is ever escaped, never the template around it.
 fn e2ee(template: &str, sender: &str) -> String {
@@ -272,7 +310,7 @@ fn e2ee(template: &str, sender: &str) -> String {
 /// (docs/SHARING_CONTRACT.md, "Accounts service"): `link` is
 /// `<PIMBLE_CLOUD_PUBLIC_URL>/app/signup?email=<urlencoded address>`, for an
 /// address with no verified account yet.
-pub fn invitation_email(inviter_email: &str, share_name: &str, link: &str) -> (String, String, String) {
+pub fn invitation_email(inviter_email: &str, share_name: &str, link: &str, kept: Kept) -> (String, String, String) {
     let inviter = one_line(inviter_email);
     let name = display_name(share_name);
     let subject = format!("{inviter} invited you to \"{name}\" on Pimble");
@@ -281,7 +319,7 @@ pub fn invitation_email(inviter_email: &str, share_name: &str, link: &str) -> (S
          Create your Pimble account with this address to open it:\n\n{link}\n\n\
          {e2ee}\n\n\
          If you were not expecting this, ignore this.",
-        e2ee = e2ee(E2EE_TEXT, &inviter),
+        e2ee = e2ee(kept.text(), &inviter),
     );
     let html = format!(
         "<p>{inviter} invited you to \"{name}\" on Pimble.</p>\
@@ -292,7 +330,7 @@ pub fn invitation_email(inviter_email: &str, share_name: &str, link: &str) -> (S
         inviter = escape_html(&inviter),
         name = escape_html(&name),
         link = escape_html(link),
-        e2ee = e2ee(E2EE_HTML, &escape_html(&inviter)),
+        e2ee = e2ee(kept.html(), &escape_html(&inviter)),
     );
     (subject, text, html)
 }
@@ -300,7 +338,7 @@ pub fn invitation_email(inviter_email: &str, share_name: &str, link: &str) -> (S
 /// The it-is-waiting-for-you email's subject, plain-text body, and HTML body
 /// (docs/SHARING_CONTRACT.md): `link` is `<PIMBLE_CLOUD_PUBLIC_URL>/app/`,
 /// for an address that already has a verified account and now has a grant.
-pub fn shared_with_you_email(inviter_email: &str, share_name: &str, link: &str) -> (String, String, String) {
+pub fn shared_with_you_email(inviter_email: &str, share_name: &str, link: &str, kept: Kept) -> (String, String, String) {
     let inviter = one_line(inviter_email);
     let name = display_name(share_name);
     let subject = format!("{inviter} shared \"{name}\" with you on Pimble");
@@ -309,7 +347,7 @@ pub fn shared_with_you_email(inviter_email: &str, share_name: &str, link: &str) 
          Open it in Pimble here:\n\n{link}\n\n\
          {e2ee}\n\n\
          If you were not expecting this, ignore this.",
-        e2ee = e2ee(E2EE_TEXT, &inviter),
+        e2ee = e2ee(kept.text(), &inviter),
     );
     let html = format!(
         "<p>{inviter} shared \"{name}\" with you on Pimble.</p>\
@@ -320,7 +358,7 @@ pub fn shared_with_you_email(inviter_email: &str, share_name: &str, link: &str) 
         inviter = escape_html(&inviter),
         name = escape_html(&name),
         link = escape_html(link),
-        e2ee = e2ee(E2EE_HTML, &escape_html(&inviter)),
+        e2ee = e2ee(kept.html(), &escape_html(&inviter)),
     );
     (subject, text, html)
 }
@@ -336,6 +374,24 @@ pub fn first_url(body: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+
+    /// A mail about a store shared from its owner's computer must not say
+    /// Pimble Cloud stores it, because it does not.
+    #[test]
+    fn a_relayed_stores_mail_says_where_the_notes_are() {
+        for (_subject, text, html) in [
+            invitation_email("ann@example.com", "Plans", "http://cloud.test/app/signup?email=b%40x.test", Kept::OnOwnersComputer),
+            shared_with_you_email("ann@example.com", "Plans", "http://cloud.test/app/", Kept::OnOwnersComputer),
+        ] {
+            for body in [&text, &html] {
+                assert!(body.contains("stay on ann@example.com's computer: Pimble Cloud stores none of them"), "{body}");
+                assert!(!body.contains("Pimble Cloud stores them"), "{body}");
+            }
+        }
+        let (_s, hosted, _h) = shared_with_you_email("ann@example.com", "Plans", "http://cloud.test/app/", Kept::OnPimbleCloud);
+        assert!(hosted.contains("Pimble Cloud stores them without being able to read them"));
+    }
+
     /// A share's name is typed by its owner and reaches an address that never
     /// asked for anything, in a mail from Pimble's own sending domain. The
     /// worst plausible name — markup that would forge a link, plus a CRLF and
@@ -348,7 +404,7 @@ mod tests {
 
     #[test]
     fn a_hostile_share_name_cannot_forge_markup_or_a_header() {
-        let (subject, text, html) = invitation_email("ann@example.com", HOSTILE_NAME, "http://cloud.test/app/signup?email=b%40x.test");
+        let (subject, text, html) = invitation_email("ann@example.com", HOSTILE_NAME, "http://cloud.test/app/signup?email=b%40x.test", Kept::OnPimbleCloud);
 
         // The subject is one line: the CRLF (and the rest of the control
         // characters) are gone, so nothing after them can be read as a header.
@@ -372,7 +428,7 @@ mod tests {
     #[test]
     fn a_long_share_name_is_cut_with_an_ellipsis() {
         let long = "x".repeat(200);
-        let (subject, text, html) = shared_with_you_email("ann@example.com", &long, "http://cloud.test/app/");
+        let (subject, text, html) = shared_with_you_email("ann@example.com", &long, "http://cloud.test/app/", Kept::OnPimbleCloud);
         let cut = format!("{}…", "x".repeat(MAIL_NAME_MAX_CHARS));
         assert!(subject.contains(&cut), "the name should be capped at {MAIL_NAME_MAX_CHARS}: {subject}");
         assert!(!subject.contains(&"x".repeat(MAIL_NAME_MAX_CHARS + 1)), "no more than the cap: {subject}");
@@ -384,7 +440,7 @@ mod tests {
     fn an_inviter_address_is_escaped_and_kept_to_one_line() {
         // An address that reached signup's `contains('@')` check and nothing
         // else: it is in the subject and the body of somebody else's mail.
-        let (subject, _text, html) = invitation_email("<b>ann</b>\r\n@example.com", "Recipes", "http://cloud.test/app/signup?email=b%40x.test");
+        let (subject, _text, html) = invitation_email("<b>ann</b>\r\n@example.com", "Recipes", "http://cloud.test/app/signup?email=b%40x.test", Kept::OnPimbleCloud);
         assert!(!subject.contains('\r') && !subject.contains('\n'));
         assert!(!html.contains("<b>ann</b>"), "the inviter must not become markup: {html}");
         assert!(html.contains("&lt;b&gt;ann&lt;/b&gt;"));

@@ -635,11 +635,13 @@ async fn send_share_mail(state: &AppState, store: &HostedStoreRow, share_name: &
     // an owner is no more dangerous here than the store name beside it.
     let name = if share_name.is_empty() { store.name.as_str() } else { share_name };
     let base = state.config.public_url.trim_end_matches('/');
+    // What the mail may promise depends on where the notes are kept.
+    let kept = if store.is_relayed() { crate::mail::Kept::OnOwnersComputer } else { crate::mail::Kept::OnPimbleCloud };
     let (subject, text, html) = if invited {
         let email_param: String = url::form_urlencoded::byte_serialize(recipient_email.trim().as_bytes()).collect();
-        invitation_email(inviter_email, name, &format!("{base}/app/signup?email={email_param}"))
+        invitation_email(inviter_email, name, &format!("{base}/app/signup?email={email_param}"), kept)
     } else {
-        shared_with_you_email(inviter_email, name, &format!("{base}/app/"))
+        shared_with_you_email(inviter_email, name, &format!("{base}/app/"), kept)
     };
     if let Err(e) = state.mailer.send(recipient_email, &subject, &text, &html).await {
         tracing::warn!(email = %recipient_email, error = %e, "sending the sharing email failed; the membership it announces stands");

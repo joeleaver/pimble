@@ -3407,8 +3407,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
 
                                     div {
                                         class: "pimble-share__note",
-                                        "Pimble Cloud stores the notes encrypted, and sees who is invited and the \
-                                         share's name. It never sees what is written in them, or their titles."
+                                        {|| store.share_modal_keeping_note()}
                                     }
 
                                     div {

@@ -273,6 +273,23 @@ pub fn share_face(shared: bool, manages: bool, link: pimble_core::StoreKind) -> 
     }
 }
 
+/// What Pimble Cloud holds of a share, said under the member list. It is a
+/// promise, so it has to be the true one for the store's tier: a hosted
+/// store's notes are kept there as ciphertext, a store shared from this
+/// computer keeps nothing there at all (docs/RELAY_CONTRACT.md).
+pub fn share_keeping_note(relay: pimble_core::RelaySide) -> &'static str {
+    match relay {
+        pimble_core::RelaySide::Owner => {
+            "The notes stay on this computer. Pimble Cloud stores none of them: it passes them along, \
+             encrypted, while this computer is on, and sees who is invited and the share's name."
+        }
+        _ => {
+            "Pimble Cloud stores the notes encrypted, and sees who is invited and the share's name. \
+             It never sees what is written in them, or their titles."
+        }
+    }
+}
+
 /// The first way to share from a store that is not hosted, and its sentence
 /// (docs/RELAY_CONTRACT.md, "The apps", word for word).
 pub const SHARE_FROM_HERE_LABEL: &str = "Share from this computer";
@@ -888,6 +905,17 @@ impl AppStore {
             .map(|sig| sig.with(|s| s.sync_mode))
             .unwrap_or_default();
         share_face(self.share_modal_shared.get(), self.share_modal_manages(), link)
+    }
+
+    /// What the Share modal says Pimble Cloud holds of this share
+    /// ([`share_keeping_note`]), for the store the modal is open on. Tracked.
+    pub fn share_modal_keeping_note(&self) -> &'static str {
+        let relay = self
+            .share_modal_node
+            .get()
+            .and_then(|(store_id, _)| self.get_store_signal(store_id))
+            .map_or(pimble_core::RelaySide::None, |sig| sig.with(|s| s.relay));
+        share_keeping_note(relay)
     }
 
     /// Why the Share modal's two ways are both off for the store it is open
@@ -1710,6 +1738,17 @@ mod tests {
     /// row's menu snapshots the store's access and the node's share marker at
     /// render time — so both have to be in the data
     /// (docs/NODE_DOCUMENT_CONTRACT.md section 5, CLAUDE.md "Hardening").
+    /// The note under the member list is a promise about where the notes are
+    /// kept, and the two tiers keep them in different places.
+    #[test]
+    fn the_share_dialog_says_where_the_notes_are_kept() {
+        use pimble_core::RelaySide;
+        assert!(share_keeping_note(RelaySide::None).starts_with("Pimble Cloud stores the notes encrypted"));
+        assert!(share_keeping_note(RelaySide::Member).starts_with("Pimble Cloud stores the notes encrypted"));
+        let from_here = share_keeping_note(RelaySide::Owner);
+        assert!(from_here.starts_with("The notes stay on this computer. Pimble Cloud stores none of them"), "{from_here}");
+    }
+
     #[test]
     fn row_data_carries_access_and_the_share_marker() {
         let (app, store_id, child_id) = store_with_a_child();
