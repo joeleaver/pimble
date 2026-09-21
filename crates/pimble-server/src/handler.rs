@@ -3829,7 +3829,7 @@ impl PimbleApiServer for RpcHandler {
 
         // `Service` only, and a store just linked or unlinked this way is
         // held whole: `sync.json` says `full` or is gone.
-        Ok(GetStoreSyncResponse { remote: remote_now, state, sync_mode, access: pimble_core::StoreAccess::Full, read_only_roots: Vec::new(), relay })
+        Ok(GetStoreSyncResponse { remote: remote_now, state, sync_mode, access: pimble_core::StoreAccess::Full, read_only_roots: Vec::new(), relay, owner_offline: false })
     }
 
     async fn get_store_sync(
@@ -3853,7 +3853,8 @@ impl PimbleApiServer for RpcHandler {
         let state = self.sync_state_of(request.store_id).await;
         let (sync_mode, relay) = self.link_kind_of(request.store_id).await;
 
-        Ok(GetStoreSyncResponse { remote, state, sync_mode, access: store.access, read_only_roots: store.read_only_roots, relay })
+        let owner_offline = self.vault_links.read().await.get(&request.store_id).is_some_and(|link| link.owner_offline());
+        Ok(GetStoreSyncResponse { remote, state, sync_mode, access: store.access, read_only_roots: store.read_only_roots, relay, owner_offline })
     }
 
     async fn list_remote_stores(

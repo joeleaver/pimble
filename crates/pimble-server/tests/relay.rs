@@ -1262,6 +1262,14 @@ async fn two_members_co_edit_a_relayed_folders_tree_and_outlast_the_owner_going_
     })
     .await;
     assert!(offline, "with the owner gone, members' links are offline: {:?} {:?}", link_state(&bob, store_id).await, link_state(&carol, store_id).await);
+    // And they say why: the relay answered that the owner is not there. It
+    // is the only reason a member's app may blame on somebody else's
+    // computer (the owner's own link never says it).
+    let said_why = wait_until(Duration::from_secs(15), || async {
+        bob.get_store_sync_response(store_id).await.is_ok_and(|a| a.owner_offline) && carol.get_store_sync_response(store_id).await.is_ok_and(|a| a.owner_offline)
+    })
+    .await;
+    assert!(said_why, "a member's sync answer names the reason");
     assert!(wait_until(Duration::from_secs(15), || async { env.stub.relay.owner_offline.load(Ordering::SeqCst) >= 2 }).await, "and their reconnects are answered `owner offline`");
     assert_eq!(env.stub.relay.open_conns(), 0, "the relay holds nothing once they are gone");
 

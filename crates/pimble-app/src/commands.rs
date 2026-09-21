@@ -625,11 +625,11 @@ fn store_sync_changed(store_id: pimble_core::StoreId, answer: pimble_rpc::GetSto
         access: answer.access,
         read_only_roots: answer.read_only_roots,
         relay: answer.relay,
-        // A server says a member's link is `Offline` and not why: the
-        // owner's computer being off and this one having no network read
-        // the same (`GetStoreSyncResponse` carries no reason). Only a
-        // backend that knows says so.
-        owner_offline: false,
+        // Only when the server knows: the relay said the owner's computer
+        // is not there. This device having no network reads as plain
+        // `offline`, so nobody is told somebody else's computer is off
+        // when it is their own connection.
+        owner_offline: answer.owner_offline,
     }
 }
 

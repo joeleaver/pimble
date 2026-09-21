@@ -175,6 +175,9 @@ const MAX_AWAITED_POLL: Duration = Duration::from_secs(60);
 pub struct VaultLinkHandle {
     state_rx: watch::Receiver<SyncState>,
     last_sync: Arc<Mutex<Option<DateTime<Utc>>>>,
+    /// Whether the link is down because the relay says the store's owner is
+    /// not there (see `run_loop`).
+    owner_offline: Arc<std::sync::atomic::AtomicBool>,
     join: JoinHandle<()>,
     /// The store's key sweep (`crate::share::run_sweeper`), which lives and
     /// dies with the link.
@@ -187,6 +190,12 @@ pub struct VaultLinkHandle {
 impl VaultLinkHandle {
     pub fn state(&self) -> SyncState {
         self.state_rx.borrow().clone()
+    }
+
+    /// True while the link is `Offline` and the reason is known to be that
+    /// the store's owner's computer is off (`GetStoreSyncResponse::owner_offline`).
+    pub fn owner_offline(&self) -> bool {
+        self.owner_offline.load(std::sync::atomic::Ordering::Relaxed) && matches!(self.state(), SyncState::Offline)
     }
 
     pub fn last_sync(&self) -> Option<DateTime<Utc>> {
@@ -251,14 +260,15 @@ impl VaultLink {
         let (state_tx, state_rx) = watch::channel(SyncState::Syncing);
         let last_sync = Arc::new(Mutex::new(last_sync));
 
-        let state = LinkState { store_id, state_tx, last_sync: Arc::clone(&last_sync) };
+        let owner_offline = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let state = LinkState { store_id, state_tx, last_sync: Arc::clone(&last_sync), owner_offline: Arc::clone(&owner_offline) };
         let sweep_kick = Arc::new(Notify::new());
         let (share_tx, share_rx) = mpsc::unbounded_channel();
         let sweep = tokio::spawn(crate::share::run_sweeper(handler.clone(), store_id, Arc::clone(&sweep_kick)));
         let shares = ShareSide { commands: share_rx, upkeep: Upkeep::new(), sweep_kick: Arc::clone(&sweep_kick) };
         let join = tokio::spawn(run_loop(handler, endpoint, key_id, link_id, state, shares));
 
-        VaultLinkHandle { state_rx, last_sync, join, sweep, sweep_kick, share_tx }
+        VaultLinkHandle { state_rx, last_sync, owner_offline, join, sweep, sweep_kick, share_tx }
     }
 }
 
@@ -286,6 +296,7 @@ struct LinkState {
     store_id: StoreId,
     state_tx: watch::Sender<SyncState>,
     last_sync: Arc<Mutex<Option<DateTime<Utc>>>>,
+    owner_offline: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn state_kind(state: &SyncState) -> u8 {
@@ -339,13 +350,24 @@ async fn run_loop(handler: RpcHandler, endpoint: LinkEndpoint, key_id: Uuid, lin
         // the next one is made at once.
         owner_offline = false;
         if let Err(e) = result {
-            set_state(&handler, &link, SyncState::Offline).await;
-            shares.upkeep.link_down(&handler, store_id).await;
+            // Why, before saying so: whoever hears `Offline` asks at once
+            // how the store is held (`getStoreSync`), and the answer has to
+            // carry the reason already. A link that stays `Offline` while
+            // the reason changes (the owner's computer came back and this
+            // one lost its network, or the other way round) says `Offline`
+            // again, which is what makes the app ask again.
             owner_offline = e.is::<OwnerOffline>()
                 || match &reached {
                     Some(reached) if reached.via_relay => crate::relay_tunnel::owner_is_offline(&reached.url, &reached.token).await,
                     _ => false,
                 };
+            let reason_changed = link.owner_offline.swap(owner_offline, std::sync::atomic::Ordering::Relaxed) != owner_offline;
+            let was_offline = matches!(*link.state_tx.borrow(), SyncState::Offline);
+            set_state(&handler, &link, SyncState::Offline).await;
+            if was_offline && reason_changed {
+                handler.notify_sync_state_changed(store_id, SyncState::Offline).await;
+            }
+            shares.upkeep.link_down(&handler, store_id).await;
             if owner_offline {
                 debug!("Vault link for store {}: its owner's computer is offline ({}); trying again later", store_id, e);
             } else {

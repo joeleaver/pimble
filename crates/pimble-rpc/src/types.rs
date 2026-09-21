@@ -417,6 +417,13 @@ pub struct GetStoreSyncResponse {
     /// `sync_mode` is `Vault` for a relayed store either way.
     #[serde(default, skip_serializing_if = "RelaySide::is_none")]
     pub relay: RelaySide,
+    /// Why a member's link to a relayed store is `Offline`, when the server
+    /// knows: the relay answered that the owner's computer is not there
+    /// (docs/RELAY_CONTRACT.md, close code 4404). False for every other
+    /// reason a link is down, this device having no network included, so
+    /// that nobody is told somebody else's computer is off when it is not.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub owner_offline: bool,
 }
 
 /// Ask this server for the stores a remote Pimble server has open. The
