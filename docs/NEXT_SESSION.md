@@ -87,26 +87,65 @@ of it run, `scripts/local-stack/README.md`.
   token with `stores` cut down to that one store, and the relay refuses any token naming
   another. The general token is unchanged.
 
-## Decisions waiting for Joe
+## Decided by Joe on 2026-09-21, after the verification
 
-1. **What a removed member's machine shows.** Today the folder stays, as it last was, read
-   only, with nothing saying why. Every sharing product removes it from view. Recommended:
-   drop the root from the explorer with a one-line notice, and delete the files when the
-   replica is removed. This deletes something from someone's screen because an owner said
-   so, which is why it is Joe's call.
-2. **Whether members see each other.** The accounts service answers the member list of a
-   share to any member of it, so an editor sees the other members' addresses.
-3. **The store's name on the hosted disk.** `cloudHostStore` sends the store's name to the
-   accounts service and the hosted manifest keeps it in the clear (the open question in
-   `docs/CRYPTO_CONTRACT.md`'s header). Members no longer see it; Pimble Cloud still does.
-4. **Merging.** The migration is one way. Back up, then move every device and the hosted
-   server together: deploy (hosted server and accounts service in one push), then the
-   desktop release the standing rule asks for.
+- **A removed member's machine**: the PM's recommendation. The folder leaves the explorer
+  with a one-line notice ("<title>" is no longer shared with you.), nothing is deleted from
+  disk until the replica is removed, and a replica whose every share has ended stays as a
+  row that says so and offers "Remove Replica". (Being built when this was written:
+  `manifest.ended_roots`, `Store.ended_roots`, `StoreChangeKind::SharesEnded`.)
+- **Members see each other's addresses**: yes, as today. Who people are to each other in a
+  share (nicknames, presence and the rest) is a session of its own, later.
+- **The store's name in the clear on the hosted manifest**: fine (it was decided on
+  2026-09-16 in `docs/CRYPTO_CONTRACT.md`; a relayed store sends no name at all).
+
+## Waiting for Joe
+
+1. **The go-ahead to merge and deploy.** Not a design question, only "now or not yet":
+   `node-document` replaces `master`'s store format, and the change is one way. The first
+   time the new version opens a store it rewrites it as node documents (`store.yrs` is kept
+   as `store.yrs.migrated`), after which the old version cannot open it; the same happens
+   to every hosted store when the new hosted server starts. So shipping means, in this
+   order: back up Joe's own stores and the production stores directory; push (hosted
+   server, accounts service and web app deploy together; the accounts database gets the
+   new optional `HostedStore.tier` field); cut the desktop release (the standing rule) and
+   update every device of Joe's before opening a store that another device syncs, because
+   a device still on v0.1.1 cannot sync with a migrated store. Nothing is merged until Joe
+   says so.
+2. **What moving a node out of a share means** (Joe, 2026-09-21: "if someone moves a node
+   out of the share, it needs to count as an undoable delete, I think"). Today: a member
+   cannot do it in the app (nothing outside the share is on their screen); when the owner
+   does, the node vanishes for members, who cannot bring it back, and keeps its identity
+   in the owner's private folder; and a tampered member's client can set a node's
+   `parent_id` to a place outside the share, which the owner's devices then complete
+   (repair lists the node in that folder): a member putting a node into the owner's
+   private tree and out of every member's reach. Two readings, which differ in what the
+   owner's own move does:
+   - **A. It leaves for real, but only when the destination agrees.** A move out of a
+     share is honoured only when the destination's own list names the node, which only
+     someone who may write the destination can do. Repair never completes a move across
+     a share's boundary by itself; a node whose `parent_id` points outside without that
+     is a node removed from the share: gone from the folder for everyone, still in the
+     share's scope, listed under "Removed from this share" where any editor puts it back.
+     The owner's deliberate move keeps the document's identity and takes it private;
+     members cannot undo that one (the owner can, by moving it back); true privacy for
+     what is written afterwards still needs the data-key rotation that is not built.
+   - **B. Nothing ever leaves a share; moving out is a delete there and a new node
+     outside.** For the share it is an ordinary delete (a tombstone, which stays in the
+     scope and which any editor can undo); what lands in the owner's private folder is a
+     new document with a new id and a new key, made once and never kept in step (so not a
+     mirror). No key rotation is ever needed, tampering has nothing to aim at, and members
+     keep what they co-authored; the costs are that the private node is not the same
+     document (links to the old id still point into the share) and that, once a member
+     undoes the delete, the two exist side by side and go their own ways.
+   The PM reads Joe's sentence as B and recommends it, and will not build either before
+   he says which.
 
 ## Known limits (none blocks the design; each is a follow-up)
 
-- A scoped editor can move a node out of the share by setting its `parent_id` to a node
-  outside it (the server checks the document written, not where it points).
+- A tampered member's client can move a node out of the share by setting its `parent_id`
+  to a node outside it (the hosted server sees ciphertext; the owner's devices complete
+  the move). See "Waiting for Joe", item 2.
 - No data-key rotation when a node or a member leaves a share (they keep what they had;
   the server stops serving them more). Two owner devices giving the same keyless document
   a data key at once need a compare-and-set on `vaultSetDocKeys`.
