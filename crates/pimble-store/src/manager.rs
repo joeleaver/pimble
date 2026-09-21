@@ -299,6 +299,13 @@ impl StoreManager {
         Ok(store.has_doc(doc_id))
     }
 
+    /// Whether `doc_id` in vault store `store_id` has ever been given a blob
+    /// (see [`VaultStore::has_blobs`]).
+    pub fn vault_has_blobs(&self, store_id: StoreId, doc_id: &str) -> Result<bool> {
+        let store = self.vault_stores.get(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        Ok(store.has_blobs(doc_id))
+    }
+
     /// `doc_id`'s wrapped data keys in vault store `store_id`, as stored.
     pub fn vault_doc_keys(&self, store_id: StoreId, doc_id: &str) -> Result<Option<DocKeys>> {
         let store = self.vault_stores.get(&store_id).ok_or(StoreError::NotOpen(store_id))?;

@@ -209,6 +209,10 @@ struct StoreKeys {
     /// Each document's data-key id as `vaultListDocs` reported it, for a
     /// document whose wraps have not been fetched yet.
     listed_dek: HashMap<NodeId, KeyId>,
+    /// The wraps this page made for a document whose create has not been
+    /// confirmed: a create tried again goes out under the same key, which
+    /// is the one the server holds if the first try's answer was lost.
+    creating: HashMap<NodeId, VaultDocKeys>,
 }
 
 /// One encrypted store.
@@ -1168,8 +1172,8 @@ impl VaultClient {
     ///
     /// A document the server has never seen is created: its append names the
     /// parent (which is how a scoped member's new document joins their scope)
-    /// and its data key is set right after, since the server admits keys only
-    /// for a document it has.
+    /// and carries its wrapped data key, which the server stores together
+    /// with the blob, so nothing is ever there under a key it has no wrap of.
     async fn append_prepared(
         &mut self,
         client: &Arc<PimbleClient>,
@@ -1184,13 +1188,15 @@ impl VaultClient {
             store.prepare(store_id, node_id, update)?
         };
         let parent_id = outgoing.created.as_ref().and_then(|(_, parent)| *parent);
+        let keys = outgoing.created.as_ref().map(|(keys, _)| keys.clone());
         let appended = client
-            .vault_append_new(
+            .vault_append_with_keys(
                 store_id,
                 outgoing.doc_id.clone(),
                 outgoing.blob.clone(),
                 Some(self.client_id.clone()),
                 parent_id,
+                keys,
             )
             .await
             .map_err(|e| e.to_string());
@@ -1212,14 +1218,9 @@ impl VaultClient {
         let Some(store) = self.stores.get_mut(&store_id) else { return Ok(()) };
         let snapshot = store.record(node_id, &outgoing, appended)?;
 
-        // The document is on the server now, so its wraps may be set. One that
-        // fails is not fatal: the document is readable to whoever made it, and
-        // the next append of it finds no keys and tries again.
-        if let Some((keys, _)) = outgoing.created {
-            store.keys.note_created(node_id, &keys);
-            if let Err(e) = client.vault_set_doc_keys(store_id, outgoing.doc_id.clone(), keys).await {
-                tracing::warn!("Setting the data key of {} failed: {}", node_id, e);
-            }
+        // The document is on the server now, and its wraps with it.
+        if let Some((keys, _)) = &outgoing.created {
+            store.keys.note_created(node_id, keys);
         }
 
         if let Some(upto_seq) = snapshot {
@@ -1931,7 +1932,7 @@ fn scope_groups(tree: &Tree, scope_roots: &[NodeId]) -> HashMap<NodeId, Vec<Node
 
 impl StoreKeys {
     fn new(scope: Keyring) -> Self {
-        Self { scope, wraps: HashMap::new(), deks: HashMap::new(), listed_dek: HashMap::new() }
+        Self { scope, wraps: HashMap::new(), deks: HashMap::new(), listed_dek: HashMap::new(), creating: HashMap::new() }
     }
 
     /// Take a `vaultFetch`'s answer about a document's data key. `None` is a
@@ -1956,6 +1957,7 @@ impl StoreKeys {
     /// Remember the key this page made for a document it created, so its own
     /// next blob resolves without a round trip.
     fn note_created(&mut self, node_id: NodeId, keys: &VaultDocKeys) {
+        self.creating.remove(&node_id);
         self.listed_dek.insert(node_id, keys.dek_id);
         self.wraps.insert(node_id, keys.clone());
     }
@@ -1967,6 +1969,7 @@ impl StoreKeys {
         self.wraps.remove(&node_id);
         self.deks.remove(&node_id);
         self.listed_dek.remove(&node_id);
+        self.creating.remove(&node_id);
     }
 
     /// The key a blob whose header names `key_id` was written under, in the
@@ -2019,6 +2022,12 @@ impl StoreKeys {
         node_id: NodeId,
         scope_key_ids: &[KeyId],
     ) -> Option<(KeyId, SymmetricKey, VaultDocKeys)> {
+        // A create being tried again: the same key as the first try.
+        if let (Some(keys), Some((dek_id, dek))) = (self.creating.get(&node_id), self.deks.get(&node_id)) {
+            if keys.dek_id == *dek_id {
+                return Some((*dek_id, dek.clone(), keys.clone()));
+            }
+        }
         let dek = SymmetricKey::generate();
         let dek_id = KeyId::new_v4();
         let aad = dek_aad(&store_id.to_string(), &VaultDocId::Node(node_id).as_str());
@@ -2034,8 +2043,10 @@ impl StoreKeys {
         if wraps.is_empty() {
             return None;
         }
+        let keys = VaultDocKeys { dek_id, wraps };
         self.deks.insert(node_id, (dek_id, dek.clone()));
-        Some((dek_id, dek, VaultDocKeys { dek_id, wraps }))
+        self.creating.insert(node_id, keys.clone());
+        Some((dek_id, dek, keys))
     }
 
     /// Open one blob of one document.
@@ -3140,6 +3151,14 @@ mod tests {
             Blob::decrypt(&dek, &blob_aad(&store_id.to_string(), &VaultDocId::Node(mine).as_str()), &blob).unwrap(),
             edit.touched[0].1
         );
+
+        // The append failed, or its answer was lost: the create tried again
+        // goes out under the same key and the same wraps, which are the ones
+        // the server holds if the first try did land.
+        store.record(mine, &outgoing, Err("the socket went away".to_string())).unwrap_err();
+        let again = store.prepare(store_id, mine, &[]).unwrap();
+        assert_eq!(again.created.as_ref().map(|(keys, _)| keys), Some(keys));
+        assert_eq!(Blob::key_id(&decode_blob(&again.blob).unwrap()).unwrap(), keys.dek_id);
 
         // A document the store already has is not created again: its key is
         // its own, not a fresh one.

@@ -567,6 +567,12 @@ impl VaultStore {
     pub fn has_doc(&self, doc_id: &str) -> bool {
         self.docs.contains_key(doc_id)
     }
+
+    /// Whether `doc_id` has ever been given a blob. Keys alone (set ahead of
+    /// a first blob that then never came) protect nothing yet.
+    pub fn has_blobs(&self, doc_id: &str) -> bool {
+        self.docs.get(doc_id).is_some_and(|doc| doc.head > 0 || doc.snapshot.is_some())
+    }
 }
 
 /// One row of [`VaultStore::list_docs`].

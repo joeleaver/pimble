@@ -1007,9 +1007,25 @@ impl PimbleClient {
         client_id: Option<String>,
         parent_id: Option<NodeId>,
     ) -> Result<u64> {
+        self.vault_append_with_keys(store_id, doc_id, blob, client_id, parent_id, None).await
+    }
+
+    /// [`PimbleClient::vault_append_new`] carrying the new document's wrapped
+    /// data key, which the server stores together with the first append
+    /// (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Keys"): the way a document
+    /// is created, so that no blob is ever under a key the server lacks.
+    pub async fn vault_append_with_keys(
+        &self,
+        store_id: StoreId,
+        doc_id: VaultDocId,
+        blob: String,
+        client_id: Option<String>,
+        parent_id: Option<NodeId>,
+        keys: Option<VaultDocKeys>,
+    ) -> Result<u64> {
         let response = self
             .client
-            .vault_append(VaultAppendRequest { store_id, doc_id, blob, client_id, parent_id })
+            .vault_append(VaultAppendRequest { store_id, doc_id, blob, client_id, parent_id, keys })
             .await
             .map_err(rpc_error)?;
         Ok(response.seq)

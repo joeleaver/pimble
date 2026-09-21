@@ -85,6 +85,14 @@ pub struct VaultAppendRequest {
     /// document the store already has and for an unscoped principal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<NodeId>,
+    /// For a document the store does not have yet: its wrapped data key, stored
+    /// together with this first append, so that no blob ever lands under a key
+    /// the server does not hold (an append whose answer was lost would
+    /// otherwise leave one, and every reader's cursor would stall on it for
+    /// good). Ignored for a document the store already has: its keys change
+    /// only through `vaultSetDocKeys`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<VaultDocKeys>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

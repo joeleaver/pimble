@@ -762,6 +762,57 @@ async fn data_keys_round_trip_and_merge_by_scope_key() {
 }
 
 #[tokio::test]
+async fn a_new_documents_first_append_carries_its_keys() {
+    let v = SharedVault::start().await;
+    let (store_id, share_root, inside) = (v.store_id, v.share_root, v.inside);
+    let member = v.member("bob", &[(share_root, "editor")]).await;
+    let reader = v.member("carol", &[(share_root, "reader")]).await;
+
+    let created = VaultDocId::Node(NodeId::new());
+    let aad = pimble_crypto::dek_aad(&store_id.to_string(), &created.as_str());
+    let (share_key, share_key_id) = (pimble_crypto::SymmetricKey::generate(), uuid::Uuid::new_v4());
+    let keys_of = |dek_id: uuid::Uuid| pimble_rpc::VaultDocKeys {
+        dek_id,
+        wraps: vec![pimble_crypto::wrap_dek(&pimble_crypto::SymmetricKey::generate(), &share_key, share_key_id, &aad)],
+    };
+    let keys = keys_of(uuid::Uuid::new_v4());
+
+    // A create that is refused leaves no keys behind either.
+    refused_as_no_grant(
+        member.vault_append_with_keys(store_id, VaultDocId::Node(NodeId::new()), b64(b"x"), None, Some(v.outside), Some(keys.clone())).await,
+        "a new document under a parent outside the scope",
+    );
+
+    // One call: the blob and the keys it is under are there together, for
+    // the share's other member as much as for the one who made it.
+    let seq = member.vault_append_with_keys(store_id, created.clone(), b64(b"made by bob"), None, Some(inside), Some(keys.clone())).await.expect("a create carrying its keys");
+    let fetched = reader.vault_fetch(store_id, created.clone(), 0).await.expect("in the share's scope");
+    assert_eq!((fetched.head, fetched.keys.as_ref()), (seq, Some(&keys)));
+    let listed = reader.vault_list_docs(store_id).await.unwrap();
+    assert_eq!(listed.iter().find(|d| d.doc_id == created).and_then(|d| d.dek_id), Some(keys.dek_id));
+
+    // The same create again (its answer was lost): appended, keys untouched.
+    member.vault_append_with_keys(store_id, created.clone(), b64(b"made by bob"), None, Some(inside), Some(keys.clone())).await.expect("a create tried again");
+    assert_eq!(reader.vault_fetch(store_id, created.clone(), 0).await.unwrap().keys, Some(keys.clone()));
+
+    // Under any other key it would be a blob nobody else can open: refused,
+    // and nothing appended.
+    let head_before = reader.vault_fetch(store_id, created.clone(), 0).await.unwrap().head;
+    let other = member.vault_append_with_keys(store_id, created.clone(), b64(b"under a key of its own"), None, Some(inside), Some(keys_of(uuid::Uuid::new_v4()))).await;
+    assert!(other.expect_err("a held document takes no other key this way").to_string().contains("already exists under another key"));
+    let after = reader.vault_fetch(store_id, created.clone(), 0).await.unwrap();
+    assert_eq!((after.head, after.keys), (head_before, Some(keys.clone())));
+
+    // Keys set ahead of a first blob that never came protect nothing: the
+    // create that does arrive brings the keys its blob is under.
+    let early = VaultDocId::Node(NodeId::new());
+    v.admin.vault_set_doc_keys(store_id, early.clone(), keys_of(uuid::Uuid::new_v4())).await.unwrap();
+    let carried = keys_of(uuid::Uuid::new_v4());
+    v.admin.vault_append_with_keys(store_id, early.clone(), b64(b"first"), None, None, Some(carried.clone())).await.unwrap();
+    assert_eq!(v.admin.vault_fetch(store_id, early, 0).await.unwrap().keys, Some(carried));
+}
+
+#[tokio::test]
 async fn delete_vault_store_removes_an_open_vault_and_nothing_else() {
     let sk = signing_key();
     let jwks_url = spawn_jwks(&sk, "kid-1").await;

@@ -189,7 +189,11 @@ live in exactly one place on Pimble Cloud, the owner's hosted store `S`, and now
   under it under the share key: any device with the store key does it, at share time and
   as nodes enter the subtree; a recipient that creates a document makes its DEK and
   wraps it under the share key, and the owner's devices wrap it under the store key when
-  they see it. Nested and overlapping shares are just more wraps. A node leaving a share
+  they see it. A new document's wraps ride its first `vaultAppend` (`keys`) and the server
+  stores the two together, so no blob is ever there under a key the server has no wrap of,
+  however that call ends; a create tried again carries the same key, and carried keys that
+  name another key than a document with blobs is under are refused. Nested and overlapping
+  shares are just more wraps. A node leaving a share
   gets a fresh DEK for what comes after (the recipients keep what they already had, as in
   any sharing system; the server stops them fetching more). Blobs from phase 2a whose key
   id names the store key itself keep decrypting: "look the key id up among the document's

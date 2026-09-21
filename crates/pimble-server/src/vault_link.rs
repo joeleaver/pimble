@@ -60,7 +60,9 @@
 //! document the remote has never seen gets a data key from the device that
 //! creates it, wrapped under every scope key this device holds that covers
 //! the node: the store key on a whole replica, the share's key on a share's
-//! recipient (see [`Keyring`] and `seal_plan`).
+//! recipient (see [`Keyring`] and `seal_plan`). Those wraps ride the
+//! document's first append and the remote stores the two together, so no
+//! blob is ever on the remote under a key it has no wrap of.
 //!
 //! **A share's recipient** links a partial replica: the hosted server lists
 //! and sends it exactly its scope, so the pull needs to know nothing about
@@ -617,15 +619,6 @@ struct ProgressFile {
     dirty_all: bool,
     #[serde(default)]
     cursor_version: u32,
-    /// The wraps of a data key this device made for a document it created
-    /// as a share's recipient, until the remote has them. Such a create has
-    /// to append first (the document is in nobody's scope until it exists)
-    /// and set the keys second; a crash between the two would leave a blob
-    /// under a key nobody can ever unwrap. The wraps are what goes to the
-    /// remote anyway, readable only with the share's key: the data key
-    /// itself is never written down.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pending_keys: HashMap<String, VaultDocKeys>,
     /// Documents from before data keys that this device gave one (they came
     /// under a share) and whose snapshot under it is not confirmed yet. The
     /// earlier blobs are under the store key, which no recipient holds;
@@ -989,7 +982,6 @@ async fn full_reconcile(
         info!("Vault link for store {}: reading every document's log once from the start", store_id);
     }
     progress.cursors.clear();
-    settle_pending_keys(client, store_id, progress).await;
     let mut remote_heads: HashMap<VaultDocId, u64> = HashMap::new();
     for doc in remote_docs {
         if doc.doc_id == VaultDocId::Tree {
@@ -1348,7 +1340,7 @@ enum Seal {
     /// The remote has never seen the document: this device creates it, with
     /// a data key of its own making wrapped under every scope key it holds
     /// that covers the node.
-    Create { dek_id: Uuid, dek: SymmetricKey, keys: VaultDocKeys, parent_id: Option<NodeId>, partial: bool },
+    Create { dek_id: Uuid, dek: SymmetricKey, keys: VaultDocKeys, parent_id: Option<NodeId> },
     /// The document has a data key and no wrap this device can open.
     Unreadable,
 }
@@ -1430,32 +1422,7 @@ async fn seal_plan(handler: &RpcHandler, client: &PimbleClient, store_id: StoreI
     if wraps.is_empty() {
         return Err(anyhow::anyhow!("no scope key held for store {}; cannot encrypt a new document", store_id));
     }
-    Ok(Seal::Create { dek_id, dek, keys: VaultDocKeys { dek_id, wraps }, parent_id, partial })
-}
-
-/// Hand the remote the wraps a crash (or a dropped connection) kept from it
-/// (see `ProgressFile::pending_keys`). One the remote refuses belongs to a
-/// create that never landed, and the next push of that document makes keys
-/// anew.
-async fn settle_pending_keys(client: &PimbleClient, store_id: StoreId, progress: &mut Progress) {
-    let pending: Vec<(String, VaultDocKeys)> = progress.file.pending_keys.iter().map(|(doc, keys)| (doc.clone(), keys.clone())).collect();
-    for (doc, keys) in pending {
-        let Some(doc_id) = VaultDocId::parse(&doc) else {
-            progress.file.pending_keys.remove(&doc);
-            progress.unsaved = true;
-            continue;
-        };
-        match client.vault_set_doc_keys(store_id, doc_id.clone(), keys).await {
-            Ok(()) => {}
-            Err(e) if is_refusal(&e) => debug!("Vault link for store {} doc {:?}: pending keys refused ({}); dropping them", store_id, doc_id, e),
-            Err(e) => {
-                debug!("Vault link for store {} doc {:?}: pending keys not set yet: {}", store_id, doc_id, e);
-                continue;
-            }
-        }
-        progress.file.pending_keys.remove(&doc);
-        progress.unsaved = true;
-    }
+    Ok(Seal::Create { dek_id, dek, keys: VaultDocKeys { dek_id, wraps }, parent_id })
 }
 
 /// Encrypt `plaintext` and append it to `doc_id`'s vault log, recording the
@@ -1478,7 +1445,7 @@ async fn append_blob(
     let plan = seal_plan(handler, client, store_id, &doc_id, key_id, progress).await?;
     let (blob, created) = match &plan {
         Seal::With { key_id, key } => (Blob::encrypt(key, *key_id, &aad, plaintext), None),
-        Seal::Create { dek_id, dek, keys, parent_id, partial } => (Blob::encrypt(dek, *dek_id, &aad, plaintext), Some((keys, *parent_id, *partial))),
+        Seal::Create { dek_id, dek, keys, parent_id } => (Blob::encrypt(dek, *dek_id, &aad, plaintext), Some((keys, *parent_id))),
         Seal::Unreadable => {
             warn!("Vault link for store {} doc {:?}: no wrap of its data key opens here; leaving the update for later", store_id, doc_id);
             return Ok(Appended::Refused);
@@ -1486,42 +1453,23 @@ async fn append_blob(
     };
     let blob_b64 = URL_SAFE_NO_PAD.encode(&blob);
 
-    // A whole replica sets a new document's keys before its first blob, so
-    // no blob is ever on the remote under a key the remote has no wrap of.
-    // A share's recipient cannot: the document is in nobody's scope until
-    // its first append, naming its parent, puts it there. Its wraps wait in
-    // `vault-link.json` from before the append until the remote has them.
-    if let Some((keys, _, partial)) = &created {
-        if *partial {
-            progress.file.pending_keys.insert(doc.clone(), (*keys).clone());
-            progress.unsaved = true;
-            progress.save_if_unsaved().await;
-        } else {
-            match client.vault_set_doc_keys(store_id, doc_id.clone(), (*keys).clone()).await {
-                Ok(()) => {}
-                Err(e) if is_refusal(&e) => {
-                    debug!("Vault link for store {} doc {:?}: keys refused ({}); leaving the document for later", store_id, doc_id, e);
-                    return Ok(Appended::Refused);
-                }
-                Err(e) => return Err(anyhow::anyhow!("remote vaultSetDocKeys for {:?} failed: {}", doc_id, e)),
-            }
-        }
-    }
-
-    // Attributed to this link's own id (`PimbleClient::vault_append_from`)
-    // so the notification it produces is dropped by identity if it echoes
-    // back through this link's own subscription; the seen-seq set below is
-    // kept as a second guard for anything that reaches the server without a
-    // `client_id`. A new document names its parent, which is what admits a
-    // scoped member's create (and is ignored for anyone else's).
-    let parent_id = created.as_ref().and_then(|(_, parent_id, _)| *parent_id);
-    let seq = match client.vault_append_new(store_id, doc_id.clone(), blob_b64, Some(link_id.to_string()), parent_id).await {
+    // A new document's first blob carries its wrapped data key, and the
+    // remote stores the two together (`VaultAppendRequest::keys`): no blob
+    // is ever there under a key the remote has no wrap of, whichever way
+    // this call ends. Attributed to this link's own id so the notification
+    // it produces is dropped by identity if it echoes back through this
+    // link's own subscription; the seen-seq set below is kept as a second
+    // guard for anything that reaches the server without a `client_id`. A
+    // new document names its parent, which is what admits a scoped member's
+    // create (and is ignored for anyone else's).
+    let (keys, parent_id) = match &created {
+        Some((keys, parent_id)) => (Some((*keys).clone()), *parent_id),
+        None => (None, None),
+    };
+    let seq = match client.vault_append_with_keys(store_id, doc_id.clone(), blob_b64, Some(link_id.to_string()), parent_id, keys).await {
         Ok(seq) => seq,
         Err(e) if is_refusal(&e) => {
             debug!("Vault link for store {} doc {:?}: append refused ({}); leaving the document for later", store_id, doc_id, e);
-            if progress.file.pending_keys.remove(&doc).is_some() {
-                progress.unsaved = true;
-            }
             return Ok(Appended::Refused);
         }
         Err(e) => return Err(anyhow::anyhow!("remote vaultAppend for {:?} failed: {}", doc_id, e)),
@@ -1529,18 +1477,8 @@ async fn append_blob(
     echoes.remember(&doc_id, seq);
     progress.keyring.remote_docs.insert(doc.clone());
     progress.keyring.pulled.insert(doc.clone());
-    if let Seal::Create { dek_id, dek, keys, partial, .. } = plan {
+    if let Seal::Create { dek_id, dek, keys, .. } = plan {
         progress.keyring.deks.insert(doc.clone(), (dek_id, dek));
-        if partial {
-            // Failing here fails the link; the wraps are on disk and the
-            // next connect hands them over (`settle_pending_keys`).
-            client
-                .vault_set_doc_keys(store_id, doc_id.clone(), keys.clone())
-                .await
-                .map_err(|e| anyhow::anyhow!("remote vaultSetDocKeys for {:?} failed: {}", doc_id, e))?;
-            progress.file.pending_keys.remove(&doc);
-            progress.unsaved = true;
-        }
         progress.keyring.note_wraps(&doc_id, Some(keys));
     }
     progress.cursor(&doc_id).mark(seq);

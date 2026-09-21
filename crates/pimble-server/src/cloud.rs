@@ -238,8 +238,16 @@ impl HeldAs {
         let (_, first) = shares.first()?;
         let reads = |row: &StoreView| row.access() == pimble_core::StoreAccess::Read;
         let all_read = shares.iter().all(|(_, row)| reads(row));
+        // One share is called what its owner called it. Several shares of one
+        // store have several names and the replica has one row: it says whose
+        // they are, and each shared folder shows its own title beneath.
+        let name = match (shares.len(), &first.shared_by) {
+            (1, _) => first.name.clone(),
+            (_, Some(email)) => format!("Shared by {email}"),
+            (_, None) => "Shared with you".to_string(),
+        };
         Some(Self {
-            name: Some(first.name.clone()),
+            name: Some(name),
             roots: shares.iter().map(|(root, _)| *root).collect(),
             read_only_roots: if all_read { Vec::new() } else { shares.iter().filter(|(_, row)| reads(row)).map(|(root, _)| *root).collect() },
             access: if all_read { pimble_core::StoreAccess::Read } else { pimble_core::StoreAccess::Full },

@@ -969,6 +969,10 @@ pub struct RpcHandler {
     shares: Arc<crate::share::Shares>,
 }
 
+/// What a share's member is told a store is called by this server, which
+/// knows the owner's name for it and must not pass it on.
+const SHARE_PLACEHOLDER_NAME: &str = "Shared with you";
+
 impl RpcHandler {
     pub fn new(store_manager: Arc<RwLock<StoreManager>>) -> Self {
         Self::with_semantic_available(store_manager, true)
@@ -1131,6 +1135,11 @@ impl RpcHandler {
                 store.root_node_id = *first;
             }
             store.roots = roots;
+            // The owner's store name is not a share's member's to learn
+            // (docs/NODE_DOCUMENT_CONTRACT.md "A share has a name of its own"):
+            // this server does not know the share's name, the accounts
+            // service does, and a client puts it here from its own row.
+            store.name = SHARE_PLACEHOLDER_NAME.to_string();
         }
     }
 
@@ -2364,6 +2373,33 @@ impl PimbleApiServer for RpcHandler {
                         joins_scopes = Some((roots, parent_id, *node_id));
                     }
                     _ => return Err(no_grant_for_document_error()),
+                }
+            }
+        }
+
+        // A document's first append carries its wrapped data key, stored
+        // before the blob and under the same lock, so nobody can ever fetch a
+        // blob whose key the server does not hold. For a document that has
+        // blobs already, carried keys must name the key it is under (a retry
+        // of a create whose answer was lost) and are otherwise ignored: such
+        // a document's keys change only through `vaultSetDocKeys`, which
+        // merges. Any other key would put a blob in the log that nobody but
+        // its sender can open, and every reader's cursor would stop at it.
+        if let Some(keys) = &request.keys {
+            let doc = request.doc_id.as_str();
+            if !manager.vault_has_blobs(request.store_id, &doc).map_err(to_rpc_error)? {
+                let json = serde_json::to_string(keys).map_err(to_rpc_error)?;
+                manager.vault_set_doc_keys(request.store_id, &doc, json).await.map_err(to_rpc_error)?;
+            } else {
+                let held = manager
+                    .vault_doc_keys(request.store_id, &doc)
+                    .map_err(to_rpc_error)?
+                    .and_then(|record| serde_json::from_str::<VaultDocKeys>(&record.json).ok());
+                if held.map(|held| held.dek_id) != Some(keys.dek_id) {
+                    return Err(to_rpc_error(format!(
+                        "document {:?} of store {} already exists under another key; fetch it before writing to it",
+                        request.doc_id, request.store_id
+                    )));
                 }
             }
         }
