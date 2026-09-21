@@ -363,6 +363,19 @@ impl VerifiedToken {
     }
 }
 
+impl VerifiedToken {
+    /// Whether `store_id` is the ONLY store the token names. The relay hands
+    /// a member's token to the owner's machine (that machine verifies it
+    /// itself, so that the relay is never trusted for who someone is), and a
+    /// token naming the member's other stores would be good for those too,
+    /// at the hosted server, for as long as it lives. So the relay takes only
+    /// the token `POST /token` mints for that one store (`stores[].token`),
+    /// and refuses the account's general one (Joe, 2026-09-21).
+    pub fn names_only(&self, store_id: &str) -> bool {
+        self.names_store(store_id) && self.stores.as_object().is_some_and(|stores| stores.len() == 1)
+    }
+}
+
 /// Why [`JwtSigner::verify`] refused a token. Never carries any part of the
 /// token, so it is safe to log and to show.
 #[derive(Debug, Clone, PartialEq, Eq)]

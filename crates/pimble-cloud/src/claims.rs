@@ -129,8 +129,21 @@ pub async fn claims_for_user(state: &AppState, user: &UserRow) -> CloudResult<Va
 /// [`claims_for_user`], and beside it the relay-tier stores those claims name
 /// ([`TokenStores::relayed`]) — what `POST /token` needs to say where each of
 /// them is reached. The claims are the same object either way: the relay tier
-/// adds nothing to a token.
+/// adds nothing to the account's token.
 pub async fn claims_and_relayed_for_user(state: &AppState, user: &UserRow) -> CloudResult<(Value, Vec<String>)> {
     let stores = stores_for_token(state, user.rid).await?;
     Ok((json!({ "email": user.email, "stores": stores.claim }), stores.relayed))
+}
+
+/// The claims of the token minted for ONE relayed store: `claims` (the
+/// account's own, from [`claims_and_relayed_for_user`]) with `stores` cut
+/// down to that store's entry, word for word. It is the credential that
+/// crosses the relay to the owner's machine, so it must be worth nothing
+/// anywhere else (Joe, 2026-09-21). `None` when the claims do not name the
+/// store.
+pub fn narrowed_to(claims: &Value, store_id: &str) -> Option<Value> {
+    let entry = claims.get("stores")?.get(store_id)?.clone();
+    let mut narrowed = claims.clone();
+    narrowed["stores"] = json!({ store_id: entry });
+    Some(narrowed)
 }

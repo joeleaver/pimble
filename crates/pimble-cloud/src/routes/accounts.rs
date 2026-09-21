@@ -665,21 +665,40 @@ pub struct TokenResponse {
     /// relay-tier ones (docs/RELAY_CONTRACT.md), each with the relay URL that
     /// reaches its owner's machine. The same token is the credential there.
     /// Always present, empty for an account with no relayed store. Nothing
-    /// about the token itself changes: its claims are what they always were.
+    /// about the account's own token changes: its claims are what they
+    /// always were.
     stores: Vec<StoreEndpoint>,
 }
 
-/// Where one relayed store is reached (`web/src/api.rs`'s `StoreEndpoint`).
+/// Where one relayed store is reached, and with what (`web/src/api.rs`'s
+/// `StoreEndpoint`).
 #[derive(Serialize)]
 pub struct StoreEndpoint {
     store_id: String,
     rpc_url: String,
+    /// The credential for `rpc_url`: a token like the account's own whose
+    /// `stores` claim names this store and no other. The relay hands a
+    /// member's token to the owner's machine, and takes only this one
+    /// (`crate::claims::narrowed_to`, `VerifiedToken::names_only`).
+    token: String,
+    /// Unix seconds at which `token` stops being accepted.
+    exp: i64,
 }
 
 pub async fn mint_token(State(state): State<AppState>, authed: AuthedUser) -> CloudResult<Json<TokenResponse>> {
     let (claims, relayed) = claims_and_relayed_for_user(&state, &authed.user).await?;
-    let minted = state.signer.mint(&authed.user.user_uuid, claims).await?;
-    let stores = relayed.into_iter().map(|store_id| StoreEndpoint { rpc_url: relay_url(&state, &store_id), store_id }).collect();
+    // One more token per relayed store, minted together: with jkbase-Auth
+    // each is a round trip.
+    let narrowed = relayed.iter().filter_map(|store_id| crate::claims::narrowed_to(&claims, store_id).map(|claims| (store_id.clone(), claims)));
+    let per_store = futures::future::try_join_all(narrowed.map(|(store_id, claims)| {
+        let state = &state;
+        let sub = &authed.user.user_uuid;
+        async move {
+            let minted = state.signer.mint(sub, claims).await?;
+            Ok::<_, crate::error::CloudError>(StoreEndpoint { rpc_url: relay_url(state, &store_id), store_id, token: minted.token, exp: minted.exp })
+        }
+    }));
+    let (minted, stores) = futures::future::try_join(state.signer.mint(&authed.user.user_uuid, claims.clone()), per_store).await?;
     Ok(Json(TokenResponse { token: minted.token, exp: minted.exp, rpc_url: rpc_url(&state), stores }))
 }
 

@@ -51,10 +51,19 @@ twin to documents under a share is a later optimisation.
   Everything else about grants, invitations, share names, key envelopes and the token's
   claims is the same for both tiers.
 - **`POST /api/v1/token`** answers, beside `token`, `exp` and `rpc_url`, a list
-  `stores: [{ store_id, rpc_url }]` naming every relay-tier store the account holds a
-  grant on, with `rpc_url = wss://<public host>/api/v1/relay/<store id>` (`ws://` for a
-  plain-http public URL). The web client already reads this shape (`web/src/api.rs`,
+  `stores: [{ store_id, rpc_url, token, exp }]` naming every relay-tier store the account
+  holds a grant on, with `rpc_url = wss://<public host>/api/v1/relay/<store id>` (`ws://`
+  for a plain-http public URL). The web client already reads this shape (`web/src/api.rs`,
   `Session.stores`).
+- **A token per relayed store** (Joe, 2026-09-21). The relay hands a member's token to the
+  owner's machine, which verifies it itself. The account's general token names every store
+  the member holds and is good at the hosted server for an hour, so a dishonest owner could
+  replay it against the member's other stores. `stores[].token` is therefore a token like
+  the account's own (same `sub`, `aud`, `iss`, lifetime, same claim shapes) whose `stores`
+  claim is cut down to that one store, word for word; clients present it at that store's
+  endpoint, and **the relay refuses any token that names another store** (403, before
+  anything reaches the owner). The account's general token is unchanged. The owner's own
+  link to its relay face never crosses the relay and may use either.
 - **The relay**, in memory only, under `/api/v1/relay` (already routed to this service by
   `"/api/*"` in `jkbase.toml`):
   - `GET /api/v1/relay` (WebSocket), **the owner's tunnel**. Authenticated with the
@@ -67,7 +76,8 @@ twin to documents under a share is a later optimisation.
   - `GET /api/v1/relay/<store id>` (WebSocket), **a member's connection**. The credential
     is the account's JWT, as for `/rpc`: `Authorization: Bearer`, or the `access_token`
     query parameter (a browser cannot set headers). The relay verifies the signature
-    against its own JWKS, `aud`, `exp`, and that the `stores` claim names the store;
+    against its own JWKS, `aud`, `exp`, and that the `stores` claim names the store and
+    no other (the token minted for this store, above);
     a browser's `Origin` must be this service's own public origin. No tunnel for the
     store: close with code 4404 and reason `owner offline`. Otherwise the relay opens a
     virtual connection over the tunnel and pipes WebSocket messages both ways, closing

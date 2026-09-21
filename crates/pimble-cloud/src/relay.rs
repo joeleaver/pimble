@@ -763,6 +763,13 @@ pub async fn member_connection(
     if !verified.names_store(&store_id) {
         return Err(CloudError::Forbidden("this token grants nothing on this store".to_string()));
     }
+    // The token travels on to the owner's machine. Only one that is good for
+    // this store and nothing else may (`VerifiedToken::names_only`).
+    if !verified.names_only(&store_id) {
+        return Err(CloudError::Forbidden(
+            "the relay takes the token minted for this store alone (`stores[].token` in the answer of POST /api/v1/token), not the account's general one".to_string(),
+        ));
+    }
 
     let limits = state.relay.limits().clone();
     Ok(ws

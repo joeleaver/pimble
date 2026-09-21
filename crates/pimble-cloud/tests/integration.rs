@@ -3227,6 +3227,20 @@ async fn mint_jwt(stack: &Stack, cookie: &str) -> String {
     token_response(stack, cookie).await["token"].as_str().expect("a minted token").to_string()
 }
 
+/// The token `POST /token` mints for ONE relayed store (`stores[].token`):
+/// the only kind the relay takes, since it travels on to the owner's machine.
+async fn relay_jwt(stack: &Stack, cookie: &str, store_id: &str) -> String {
+    let response = token_response(stack, cookie).await;
+    let entry = response["stores"].as_array().unwrap().iter().find(|entry| entry["store_id"] == store_id).unwrap_or_else(|| panic!("no endpoint for {store_id} in {response}"));
+    entry["token"].as_str().expect("a token for the store").to_string()
+}
+
+/// `stores` of a `POST /token` answer without the credentials, for comparing
+/// which stores are named and where.
+fn endpoints_of(response: &Value) -> Value {
+    Value::Array(response["stores"].as_array().unwrap().iter().map(|entry| json!({ "store_id": entry["store_id"], "rpc_url": entry["rpc_url"] })).collect())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn relay_tier_round_trips_and_is_recorded_as_sent() {
     let stack = skip_without_rhypedb!();
@@ -3403,10 +3417,11 @@ async fn token_lists_relayed_stores_with_the_relay_url() {
 
     let expected = json!([{ "store_id": relayed, "rpc_url": format!("ws://cloud.test/api/v1/relay/{relayed}") }]);
     let owner = token_response(&stack, &owner_cookie).await;
-    assert_eq!(owner["stores"], expected, "the owner, and only the relayed store: the hosted one is on rpc_url");
+    assert_eq!(endpoints_of(&owner), expected, "the owner, and only the relayed store: the hosted one is on rpc_url");
     assert!(owner["rpc_url"].as_str().unwrap().ends_with("/rpc"));
-    assert_eq!(token_response(&stack, &scoped_cookie).await["stores"], expected, "two shares of one store are one endpoint");
-    assert_eq!(token_response(&stack, &whole_cookie).await["stores"], expected);
+    assert_eq!(endpoints_of(&token_response(&stack, &scoped_cookie).await), expected, "two shares of one store are one endpoint");
+    let whole = token_response(&stack, &whole_cookie).await;
+    assert_eq!(endpoints_of(&whole), expected);
     assert_eq!(token_response(&stack, &stranger_cookie).await["stores"], json!([]), "a stranger learns of no relayed store");
 
     // The token's claims did not change shape for any of it.
@@ -3415,6 +3430,22 @@ async fn token_lists_relayed_stores_with_the_relay_url() {
     let claim_keys: Vec<&String> = payload["claims"].as_object().unwrap().keys().collect();
     assert_eq!(claim_keys, ["email", "stores"], "the JWT's claims are what they were before the relay tier");
     assert_eq!(payload["claims"]["stores"][&relayed], "owner");
+
+    // Each relayed store comes with a token of its own, which is the
+    // account's token with `stores` cut down to that store, word for word:
+    // it is what crosses the relay to the owner's machine, so it must be
+    // good for nothing else. This member holds a hosted store too.
+    let general = verify_and_decode(whole["token"].as_str().unwrap(), &jwks);
+    assert_eq!(general["claims"]["stores"].as_object().unwrap().len(), 2, "the account's own token names everything, as ever");
+    let narrowed = verify_and_decode(whole["stores"][0]["token"].as_str().unwrap(), &jwks);
+    assert_eq!(narrowed["claims"]["stores"], json!({ &relayed: general["claims"]["stores"][&relayed] }));
+    assert_eq!(narrowed["claims"]["email"], general["claims"]["email"]);
+    assert_eq!((&narrowed["sub"], &narrowed["aud"], &narrowed["iss"]), (&general["sub"], &general["aud"], &general["iss"]));
+    assert_eq!(whole["stores"][0]["exp"], narrowed["exp"]);
+    // Two shares of one store: both roots, and nothing else.
+    let scoped = token_response(&stack, &scoped_cookie).await;
+    let scoped_narrowed = verify_and_decode(scoped["stores"][0]["token"].as_str().unwrap(), &jwks);
+    assert_eq!(scoped_narrowed["claims"]["stores"], json!({ &relayed: { "roots": { &first: "reader", &second: "reader" } } }));
 
     // Deleted, it is named nowhere.
     let resp = stack.http.delete(format!("{}/stores/{relayed}", stack.base_url)).header("Cookie", &owner_cookie).send().await.unwrap();
@@ -3611,8 +3642,8 @@ async fn relay_cast(stack: &Stack, tag: &str) -> RelayCast {
     assert_eq!(put_member(stack, &owner_cookie, &store_id, &whole_email, "reader").await.status(), 200);
 
     RelayCast {
-        scoped_jwt: mint_jwt(stack, &scoped_cookie).await,
-        whole_jwt: mint_jwt(stack, &whole_cookie).await,
+        scoped_jwt: relay_jwt(stack, &scoped_cookie, &store_id).await,
+        whole_jwt: relay_jwt(stack, &whole_cookie, &store_id).await,
         owner_cookie,
         owner_session,
         store_id,
@@ -3650,7 +3681,7 @@ async fn relay_pipes_two_members_to_the_owner_and_back() {
     // Somebody else's store was left out, so its members find no owner there.
     let (_m_body, m_cookie) = signup_verify_login(&stack, "pipe-other-member@example.com", "other member password!!").await;
     assert_eq!(put_member(&stack, &other_cookie, &somebody_elses, "pipe-other-member@example.com", "reader").await.status(), 200);
-    let mut misdirected = connect_member(&stack, &somebody_elses, &mint_jwt(&stack, &m_cookie).await).await.unwrap();
+    let mut misdirected = connect_member(&stack, &somebody_elses, &relay_jwt(&stack, &m_cookie, &somebody_elses).await).await.unwrap();
     assert_eq!(next_close(&mut misdirected).await.0, 4404, "announcing a store you do not own puts nobody behind your tunnel");
 
     // Two members at once: one by query parameter, one by bearer header.
@@ -3757,6 +3788,17 @@ async fn relay_refuses_strangers_before_any_frame_reaches_the_owner() {
         assert_eq!(connect_member(&stack, store, &token).await.err(), Some(403), "a claim of {stores} grants nothing here");
     }
     assert_eq!(connect_member(&stack, "not-a-store-id", &good).await.err(), Some(400));
+    // A token that names this store AND another would be handed to the
+    // owner's machine good for both: refused, whoever signed it. That is the
+    // account's general token for anyone who holds more than this store.
+    let names_two = craft_jwt(DEV_SIGNING_SEED_HEX, None, jwt_payload(json!({ store: "editor", store_uuid(): "owner" }), 600));
+    assert_eq!(connect_member(&stack, store, &names_two).await.err(), Some(403), "a token good for more than this store");
+    let (_busy_body, busy_cookie) = signup_verify_login(&stack, "gate-busy@example.com", "gate busy password!!").await;
+    assert_eq!(put_member(&stack, &cast.owner_cookie, store, "gate-busy@example.com", "editor").await.status(), 200);
+    let own_store = create_store_with_body(&stack, &busy_cookie, json!({ "name": "Their Own", "kind": "vault" })).await;
+    assert!(own_store["store_id"].is_string());
+    assert_eq!(connect_member(&stack, store, &mint_jwt(&stack, &busy_cookie).await).await.err(), Some(403), "the account's general token");
+    let narrowed = relay_jwt(&stack, &busy_cookie, store).await;
 
     // A browser: only from this service's own origin.
     assert_eq!(ws_connect(&format!("{member_url}?access_token={good}"), &[("origin", "https://evil.example".to_string())]).await.err(), Some(403));
@@ -3782,6 +3824,16 @@ async fn relay_refuses_strangers_before_any_frame_reaches_the_owner() {
     assert_eq!(String::from_utf8(payload).unwrap(), scoped_claim);
     assert_eq!(stack.app_state.relay.counts().connections, 1);
     browser.close(None).await.unwrap();
+    let (_conn, kind, _payload) = next_frame(&mut tunnel).await;
+    assert_eq!(kind, KIND_CLOSE);
+
+    // The member whose general token was refused is let in with the one
+    // minted for this store, and that is the token the owner is shown.
+    let mut busy = connect_member(&stack, store, &narrowed).await.expect("the token for this store alone");
+    let (_conn, kind, payload) = next_frame(&mut tunnel).await;
+    assert_eq!(kind, KIND_OPEN);
+    assert_eq!(String::from_utf8(payload).unwrap(), narrowed, "what reaches the owner's machine names this store and no other");
+    busy.close(None).await.unwrap();
 }
 
 /// "A later tunnel for the same store replaces the earlier one (the owner
@@ -3792,7 +3844,7 @@ async fn a_later_tunnel_replaces_the_earlier_one() {
     let stack = skip_without_rhypedb!();
     let cast = relay_cast(&stack, "replace").await;
     let second_store = create_relayed_store(&stack, &cast.owner_cookie).await;
-    let owner_jwt = mint_jwt(&stack, &cast.owner_cookie).await;
+    let owner_jwt = relay_jwt(&stack, &cast.owner_cookie, &second_store).await;
 
     let mut old = open_tunnel(&stack, &cast.owner_session).await;
     let mut serving = announce(&mut old, &[cast.store_id.as_str(), second_store.as_str()]).await;

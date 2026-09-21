@@ -343,10 +343,13 @@ keys.
   hosting; whatever still named the old row is removed first. A live row with
   that id is `409`.
 - `GET /stores` rows carry `tier`.
-- `POST /token` answers `stores: [{ store_id, rpc_url }]` beside `token`,
-  `exp` and `rpc_url`: every relay-tier store the token's claim names, with
-  `rpc_url = wss://<public host>/api/v1/relay/<store id>`. Always present,
-  empty when there is none. The token's claims are unchanged.
+- `POST /token` answers `stores: [{ store_id, rpc_url, token, exp }]` beside
+  `token`, `exp` and `rpc_url`: every relay-tier store the token's claim
+  names, with `rpc_url = wss://<public host>/api/v1/relay/<store id>`. Always
+  present, empty when there is none. The account's own token is unchanged.
+  `stores[].token` is that token with its `stores` claim cut down to the one
+  store: the relay hands a member's token to the owner's machine, so it takes
+  only a token that is good for that store and nothing else (403 otherwise).
 - `DELETE /stores/{id}` (and an account deletion that takes a solely-owned
   store with it) also withdraws the store from the relay at once.
 
@@ -640,9 +643,10 @@ curl -sb cookies.txt -X POST http://127.0.0.1:8080/api/v1/me/recovery-code \
 # {"roots": {"<node id>": "<role>", ...}} for a store held by shares — a role
 # per shared root, and no store-level role.
 # -> {"token":"...","exp":...,"rpc_url":"ws://127.0.0.1:8080/rpc",
-#     "stores":[{"store_id":"<a relayed store>","rpc_url":"ws://127.0.0.1:8080/api/v1/relay/<that id>"}]}
-# `stores` names only relay-tier stores (everything else is at rpc_url); the
-# same token is the credential at both.
+#     "stores":[{"store_id":"<a relayed store>","rpc_url":"ws://127.0.0.1:8080/api/v1/relay/<that id>",
+#                "token":"<a token naming that store alone>","exp":...}]}
+# `stores` names only relay-tier stores (everything else is at rpc_url, with
+# `token`); each relayed store is reached with its own `stores[].token`.
 curl -sb cookies.txt -X POST http://127.0.0.1:8080/api/v1/token
 
 # JWKS, the latest release, and the health check need no auth
