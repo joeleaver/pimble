@@ -286,6 +286,20 @@ async fn main() -> Result<()> {
             }
             cloud_host_store(&args[2]).await?;
         }
+        "cloud-relay-store" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pimble-cli cloud-relay-store <store-id>");
+                std::process::exit(1);
+            }
+            cloud_relay_store(&args[2]).await?;
+        }
+        "cloud-stop-relaying" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pimble-cli cloud-stop-relaying <store-id>");
+                std::process::exit(1);
+            }
+            cloud_stop_relaying(&args[2]).await?;
+        }
         "cloud-list-hosted" => cloud_list_hosted().await?,
         "cloud-add-hosted" => {
             if args.len() < 3 {
@@ -384,6 +398,9 @@ COMMANDS:
     cloud-status        Show whether a Pimble Cloud account is signed in
     cloud-sign-out      Forget the signed-in Pimble Cloud account
     cloud-host-store    Host a local store's encrypted twin on Pimble Cloud
+    cloud-relay-store   Share a local store from this computer: nothing is uploaded, and people
+                        reach it through Pimble Cloud's relay while this server is running
+    cloud-stop-relaying Stop sharing a store from this computer (its shares are stopped first)
     cloud-list-hosted   List the stores the signed-in account has a grant on
     cloud-add-hosted    Add an already-hosted store as a local replica
     cloud-share         Share a node of a hosted store (--name <name>; the node's title otherwise)
@@ -455,6 +472,8 @@ EXAMPLES:
     pimble-cli cloud-sign-in https://pimble.app alice@example.com
     pimble-cli cloud-status
     pimble-cli cloud-host-store <store-id>
+    pimble-cli cloud-relay-store <store-id>
+    pimble-cli cloud-stop-relaying <store-id>
     pimble-cli cloud-list-hosted
     pimble-cli cloud-add-hosted <store-id>
     pimble-cli cloud-share <store-id> <node-id> --name "Holiday Plans"
@@ -758,14 +777,19 @@ async fn sync_state(store_id: &str) -> Result<()> {
     let store_id = parse_store_id(store_id)?;
 
     let client = connect().await?;
-    let (remote, state, mode, access) = client.get_store_sync_with_access(store_id).await?;
-    match remote {
+    let answer = client.get_store_sync_response(store_id).await?;
+    match &answer.remote {
         Some(r) => println!("Remote: {}", r.url),
         None => println!("Remote: (none)"),
     }
-    println!("State: {:?}", state);
-    println!("Mode: {:?}", mode);
-    println!("Access: {:?}", access);
+    println!("State: {:?}", answer.state);
+    println!("Mode: {:?}", answer.sync_mode);
+    println!("Access: {:?}", answer.access);
+    match answer.relay {
+        pimble_core::RelaySide::None => {}
+        pimble_core::RelaySide::Owner => println!("Relay: shared from this computer (the remote is where members reach it)"),
+        pimble_core::RelaySide::Member => println!("Relay: served from its owner's computer"),
+    }
     Ok(())
 }
 
@@ -844,19 +868,39 @@ async fn cloud_host_store(store_id: &str) -> Result<()> {
     Ok(())
 }
 
+async fn cloud_relay_store(store_id: &str) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let client = connect().await?;
+    let relayed_id = client.cloud_relay_store(store_id).await?;
+    println!("Sharing store {} from this computer. Nothing was uploaded;", relayed_id);
+    println!("people you invite reach it while this server is running and online.");
+    Ok(())
+}
+
+async fn cloud_stop_relaying(store_id: &str) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let client = connect().await?;
+    client.cloud_stop_relaying(store_id).await?;
+    println!("Store {} is no longer shared from this computer", store_id);
+    Ok(())
+}
+
 async fn cloud_list_hosted() -> Result<()> {
     let client = connect().await?;
-    let stores = client.cloud_list_hosted_stores().await?;
-    if stores.is_empty() {
+    let answer = client.cloud_list_hosted_stores_response().await?;
+    if answer.stores.is_empty() {
         println!("No hosted stores");
     } else {
-        // One row per grant: a share of a store names its root and whose it is.
-        for s in stores {
-            let mut line = format!("{}  {}  role={}  kind={}  created={}", s.store_id, s.name, s.role, s.kind, s.created_at);
+        // One row per grant: a share of a store names its root and whose it
+        // is. `tier`: hosted on Pimble Cloud, or relayed from its owner's
+        // computer (a relayed store of one's own has no name there).
+        for s in &answer.stores {
+            let tier = answer.tier_of(&s.store_id);
+            let mut line = format!("{}  {}  role={}  kind={}  tier={}  created={}", s.store_id, s.name, s.role, s.kind, tier, s.created_at);
             if let Some(root) = s.root {
                 line.push_str(&format!("  root={root}"));
             }
-            if let Some(shared_by) = s.shared_by {
+            if let Some(shared_by) = &s.shared_by {
                 line.push_str(&format!("  shared-by={shared_by}"));
             }
             println!("{line}");

@@ -208,6 +208,8 @@ impl StoreManager {
                 shared_by: store.shared_by(),
                 roots: manifest.scope_roots.clone(),
                 read_only_roots: store.read_only_roots(),
+                // A placeholder like `sync_mode`: `RpcHandler::link_kind_of`.
+                relay: pimble_core::RelaySide::None,
             });
         }
         if let Some(store) = self.vault_stores.get(&store_id) {
@@ -227,6 +229,7 @@ impl StoreManager {
                 shared_by: None,
                 roots: Vec::new(),
                 read_only_roots: Vec::new(),
+                relay: pimble_core::RelaySide::None,
             });
         }
         Err(StoreError::StoreNotFound(store_id))
@@ -286,6 +289,16 @@ impl StoreManager {
     pub async fn vault_snapshot(&mut self, store_id: StoreId, doc_id: &str, upto_seq: u64, blob: Vec<u8>) -> Result<()> {
         let store = self.vault_stores.get_mut(&store_id).ok_or(StoreError::NotOpen(store_id))?;
         store.snapshot(doc_id, upto_seq, blob).await
+    }
+
+    /// Which log this is (docs/RELAY_CONTRACT.md: a relayed store's twin is
+    /// derived and disposable, and one that was deleted is built again from
+    /// nothing under the same store id). The vault's creation time: a twin
+    /// built again has another, which is how a link that read the earlier
+    /// one's logs knows its sequence numbers say nothing about these.
+    pub fn vault_epoch(&self, store_id: StoreId) -> Result<String> {
+        let store = self.vault_stores.get(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        Ok(store.manifest().created_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
     }
 
     /// Every document in vault store `store_id`, with its head, snapshot seq

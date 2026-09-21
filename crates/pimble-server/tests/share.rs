@@ -1279,7 +1279,7 @@ async fn sharing_from_a_store_that_is_not_hosted_is_refused_and_nothing_is_uploa
     seed_content(&alice, store_id, doc, "seed", "NEVER-HOSTED-TEXT").await;
 
     let refused = alice.cloud_share_node(store_id, folder, "Holiday Plans").await.expect_err("sharing never hosts");
-    assert_eq!(refused.to_string(), "Sharing needs this store hosted on Pimble Cloud, or the relay, which is not built yet. Nothing was uploaded.");
+    assert_eq!(refused.to_string(), "Sharing needs this store hosted on Pimble Cloud or shared from this computer.");
     // Whoever is or is not signed in: the sentence is about the store.
     alice.cloud_sign_out().await.unwrap();
     assert_eq!(alice.cloud_share_node(store_id, folder, "Holiday Plans").await.expect_err("still").to_string(), pimble_server::share::NOT_HOSTED_REFUSAL);

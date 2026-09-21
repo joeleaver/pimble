@@ -122,6 +122,14 @@ pub struct Store {
     /// is here so a client can tell when that judgement has changed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_only_roots: Vec<NodeId>,
+
+    /// Whether the store is reached through Pimble Cloud's relay, and from
+    /// which end (docs/RELAY_CONTRACT.md). Beside `sync_mode`, which stays
+    /// `Vault` for a relayed store (its link is a vault link, and a client
+    /// from before the relay reads it as the encrypted link it is). Missing
+    /// in older serializations: not relayed.
+    #[serde(default, skip_serializing_if = "RelaySide::is_none")]
+    pub relay: RelaySide,
 }
 
 impl Store {
@@ -149,6 +157,7 @@ impl Store {
             shared_by: None,
             roots: Vec::new(),
             read_only_roots: Vec::new(),
+            relay: RelaySide::None,
         }
     }
 
@@ -167,6 +176,7 @@ impl Store {
             shared_by: None,
             roots: Vec::new(),
             read_only_roots: Vec::new(),
+            relay: RelaySide::None,
         }
     }
 
@@ -231,6 +241,33 @@ pub enum StoreKind {
     #[default]
     Plain,
     Vault,
+}
+
+/// Whether a store is reached through Pimble Cloud's relay, and which end of
+/// it this device is (docs/RELAY_CONTRACT.md). A relayed store is not hosted:
+/// its encrypted twin lives on its owner's own machine, and Pimble Cloud
+/// pipes members' connections to it and keeps nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RelaySide {
+    /// Not relayed: unlinked, linked to another Pimble server, or linked to
+    /// a twin hosted on Pimble Cloud.
+    #[default]
+    None,
+    /// Shared from this computer (`cloudRelayStore`): this server holds the
+    /// twin and serves it through the relay. People reach it while this
+    /// computer is on and online.
+    Owner,
+    /// Served from its owner's computer: this device's link reaches it
+    /// through the relay, and is `Offline` whenever the owner's computer is.
+    Member,
+}
+
+impl RelaySide {
+    /// Whether this is `None`, the value an answer leaves out.
+    pub fn is_none(&self) -> bool {
+        matches!(self, RelaySide::None)
+    }
 }
 
 /// What this device may change in a store (docs/NODE_DOCUMENT_CONTRACT.md

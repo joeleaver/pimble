@@ -22,7 +22,10 @@ use crate::error::{Result, StoreError};
 /// (`crate` re-exports nothing here — the running link is
 /// `pimble_server::sync_link::SyncLink`); `Vault` links a `Plain` local
 /// store to a hosted twin of kind `Vault` under the same id, kept in sync by
-/// `pimble_server::vault_link::VaultLink` instead. Missing in an older
+/// `pimble_server::vault_link::VaultLink` instead; `Relay`
+/// (docs/RELAY_CONTRACT.md) is the same vault link whose twin is not hosted
+/// anywhere: it lives on this machine, on this server's own relay face, and
+/// members reach it through Pimble Cloud's relay. Missing in an older
 /// `sync.json`: `Sync`, so an existing replica link still parses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -30,6 +33,15 @@ pub enum SyncMode {
     #[default]
     Sync,
     Vault,
+    Relay,
+}
+
+impl SyncMode {
+    /// Whether the link is an encrypting vault link (`Vault` or `Relay`)
+    /// rather than a plain sync link.
+    pub fn is_vault_link(self) -> bool {
+        matches!(self, SyncMode::Vault | SyncMode::Relay)
+    }
 }
 
 /// A store's replica sync link, persisted as `<store>/sync.json`
@@ -44,10 +56,22 @@ pub struct SyncConfig {
     /// by the sync link on category transitions; `None` until it first syncs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_sync: Option<DateTime<Utc>>,
-    /// `Sync` (default, so an older `sync.json` still parses) or `Vault`
-    /// (docs/CRYPTO_CONTRACT.md).
+    /// `Sync` (default, so an older `sync.json` still parses), `Vault`
+    /// (docs/CRYPTO_CONTRACT.md) or `Relay` (docs/RELAY_CONTRACT.md). For
+    /// `Relay`, `remote.url` is where members reach the store (Pimble
+    /// Cloud's relay endpoint for it), kept for the record only: the link
+    /// itself connects to this process's own relay face, whose port is new
+    /// every run and is never written down.
     #[serde(default)]
     pub mode: SyncMode,
+    /// A `Vault`-mode link whose remote is Pimble Cloud's relay endpoint for
+    /// the store (docs/RELAY_CONTRACT.md): the store is served from its
+    /// owner's computer, and the link is `Offline` whenever that computer
+    /// is. Written when the replica is added and kept in step with what the
+    /// accounts service's `/token` says at every connect. Missing in an
+    /// older `sync.json`: hosted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub via_relay: bool,
     /// Per-document last-applied vault sequence number
     /// (`pimble_rpc::VaultDocId::as_str()` -> seq), meaningful only when
     /// `mode` is `Vault`: lets a restarted `VaultLink` resume `vaultFetch`
@@ -2071,6 +2095,7 @@ mod tests {
             remote: RemoteEndpoint { url: "ws://127.0.0.1:1/rpc".parse().unwrap(), auth: pimble_core::AuthMethod::None },
             last_sync: None,
             mode: SyncMode::Vault,
+            via_relay: false,
             last_seq: Default::default(),
             vault_key_id: None,
             access,
@@ -2093,5 +2118,37 @@ mod tests {
         assert!(reopened.write_refused(&[under_edited]));
         reopened.clear_sync_config().await.unwrap();
         assert!(!reopened.write_refused(&[under_edited]));
+    }
+
+    /// `sync.json` across the relay tier (docs/RELAY_CONTRACT.md): a file
+    /// from before it reads as it always did, a hosted link writes nothing
+    /// new, and the two relayed shapes come back as written.
+    #[test]
+    fn sync_json_reads_old_files_and_the_relay_modes() {
+        let old_plain: SyncConfig = serde_json::from_str(r#"{ "remote": { "url": "ws://10.0.0.2:7462/", "auth": { "method": "none" } } }"#).unwrap();
+        assert_eq!(old_plain.mode, SyncMode::Sync);
+        assert!(!old_plain.via_relay);
+        assert!(!old_plain.mode.is_vault_link());
+
+        let old_vault: SyncConfig = serde_json::from_str(
+            r#"{ "remote": { "url": "wss://pimble.app/rpc", "auth": { "method": "none" } }, "mode": "vault", "vault_key_id": "7f0c1d8e-3a52-4b57-9a59-1f6a3b1f6c11" }"#,
+        )
+        .unwrap();
+        assert_eq!(old_vault.mode, SyncMode::Vault);
+        assert!(!old_vault.via_relay);
+        assert!(!serde_json::to_string(&old_vault).unwrap().contains("via_relay"), "a hosted link's file gains nothing");
+
+        let mut owner = old_vault.clone();
+        owner.mode = SyncMode::Relay;
+        let json = serde_json::to_string(&owner).unwrap();
+        assert!(json.contains(r#""mode":"relay""#), "{json}");
+        let back: SyncConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mode, SyncMode::Relay);
+        assert!(back.mode.is_vault_link());
+
+        let mut member = old_vault;
+        member.via_relay = true;
+        let back: SyncConfig = serde_json::from_str(&serde_json::to_string(&member).unwrap()).unwrap();
+        assert_eq!((back.mode, back.via_relay), (SyncMode::Vault, true));
     }
 }

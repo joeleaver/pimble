@@ -15,8 +15,8 @@ use pimble_core::{AuthMethod, Node, NodeId, RemoteEndpoint, Store, StoreAccess, 
 use pimble_core::MountRef;
 use pimble_rpc::{
     AddRemoteStoreRequest, ApplyEditRequest, CloseStoreRequest, CloudAddHostedStoreRequest,
-    CloudHostStoreRequest, CloudHostedStoreInfo, CloudShareInfoResponse, CloudShareInviteRequest, CloudShareNodeRequest, CloudShareRef,
-    CloudShareRemoveMemberRequest, CloudSignInRequest, CloudStatusResponse, DeleteVaultStoreRequest, GetScopesRequest, MemberRole, Scope,
+    CloudHostStoreRequest, CloudHostedStoreInfo, CloudListHostedStoresResponse, CloudRelayStoreRequest, CloudShareInfoResponse, CloudShareInviteRequest, CloudShareNodeRequest, CloudShareRef,
+    CloudShareRemoveMemberRequest, CloudSignInRequest, CloudStatusResponse, CloudStopRelayingRequest, DeleteVaultStoreRequest, GetScopesRequest, MemberRole, Scope,
     SetScopeRequest, VaultDocKeys, VaultSetDocKeysRequest,
     CreateMountRequest, CreateNodeRequest, CreateStoreRequest, CreateWorkspaceRequest, DeleteNodeRequest,
     EditOperation, GetChildrenRequest, GetMountStateRequest, GetNodeRequest, GetNodesRequest, GetStoreSyncRequest, GetStoreSyncResponse, SetStoreSyncRequest,
@@ -24,7 +24,7 @@ use pimble_rpc::{
     OpenStoreRequest, PimbleApiClient, RebuildIndexRequest, RemoveReplicaRequest, SaveWorkspaceRequest,
     SearchRequest, SearchResultItem, StoreChangedNotification, SyncNodesRequest, UndeleteNodeRequest,
     UpdateNodeContentRequest, UpdateNodeMetadataRequest, VaultAppendRequest, VaultDocId,
-    VaultDocInfo, VaultFetchRequest, VaultFetchResponse, VaultListDocsRequest,
+    VaultDocInfo, VaultFetchRequest, VaultFetchResponse, VaultListDocsRequest, VaultListDocsResponse,
     VaultSnapshotRequest, MAX_SYNC_NODE_CONTENTS,
 };
 use tracing::debug;
@@ -1141,6 +1141,12 @@ impl PimbleClient {
         Ok(response.docs)
     }
 
+    /// [`PimbleClient::vault_list_docs`] with the rest of the answer: the
+    /// `epoch` that says which log the sequence numbers belong to.
+    pub async fn vault_list_docs_response(&self, store_id: StoreId) -> Result<VaultListDocsResponse> {
+        self.client.vault_list_docs(VaultListDocsRequest { store_id }).await.map_err(rpc_error)
+    }
+
     // ========================================================================
     // Cloud (Pimble Cloud account) Operations, docs/CRYPTO_CONTRACT.md
     // ========================================================================
@@ -1171,10 +1177,31 @@ impl PimbleClient {
         Ok(response.store_id)
     }
 
+    /// Share a local store from this computer, with nothing uploaded
+    /// (docs/RELAY_CONTRACT.md): its encrypted twin stays on this machine and
+    /// Pimble Cloud's relay pipes members' connections to it.
+    pub async fn cloud_relay_store(&self, store_id: StoreId) -> Result<StoreId> {
+        let response = self.client.cloud_relay_store(CloudRelayStoreRequest { store_id }).await.map_err(rpc_error)?;
+        Ok(response.store_id)
+    }
+
+    /// Stop sharing a store from this computer. Refused while it has shares.
+    pub async fn cloud_stop_relaying(&self, store_id: StoreId) -> Result<()> {
+        self.client.cloud_stop_relaying(CloudStopRelayingRequest { store_id }).await.map_err(rpc_error)?;
+        Ok(())
+    }
+
     /// Every store the signed-in account has a grant on.
     pub async fn cloud_list_hosted_stores(&self) -> Result<Vec<CloudHostedStoreInfo>> {
         let response = self.client.cloud_list_hosted_stores().await.map_err(rpc_error)?;
         Ok(response.stores)
+    }
+
+    /// [`PimbleClient::cloud_list_hosted_stores`] with the rest of the
+    /// answer: which of the rows are relay-tier
+    /// (`CloudListHostedStoresResponse::tier_of`).
+    pub async fn cloud_list_hosted_stores_response(&self) -> Result<CloudListHostedStoresResponse> {
+        self.client.cloud_list_hosted_stores().await.map_err(rpc_error)
     }
 
     /// Add an already-hosted store as a local replica.

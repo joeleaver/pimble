@@ -253,6 +253,16 @@ pub trait PimbleApi {
     #[method(name = "cloudHostStore", with_extensions)]
     async fn cloud_host_store(&self, request: CloudHostStoreRequest) -> Result<CloudHostStoreResponse, ErrorObjectOwned>;
 
+    /// Share a local store from this computer, with nothing uploaded
+    /// (docs/RELAY_CONTRACT.md). `Service`-only.
+    #[method(name = "cloudRelayStore", with_extensions)]
+    async fn cloud_relay_store(&self, request: CloudRelayStoreRequest) -> Result<CloudRelayStoreResponse, ErrorObjectOwned>;
+
+    /// Stop sharing a store from this computer: the way back from
+    /// `cloudRelayStore`. Refused while the store has shares. `Service`-only.
+    #[method(name = "cloudStopRelaying", with_extensions)]
+    async fn cloud_stop_relaying(&self, request: CloudStopRelayingRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
     /// Every store the signed-in account has a grant on. `Service`-only.
     #[method(name = "cloudListHostedStores", with_extensions)]
     async fn cloud_list_hosted_stores(&self) -> Result<CloudListHostedStoresResponse, ErrorObjectOwned>;

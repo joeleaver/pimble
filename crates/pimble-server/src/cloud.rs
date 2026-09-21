@@ -28,6 +28,16 @@ pub enum CloudError {
     Decode { url: String, source: reqwest::Error },
 }
 
+impl CloudError {
+    /// The HTTP status the service answered with, when it answered at all.
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            CloudError::Status { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, CloudError>;
 
 fn client() -> reqwest::Client {
@@ -142,6 +152,53 @@ pub struct TokenResponse {
     #[allow(dead_code)]
     pub exp: i64,
     pub rpc_url: String,
+    /// The stores that are reached at an endpoint of their own rather than
+    /// `rpc_url` (docs/RELAY_CONTRACT.md): every relay-tier store the account
+    /// holds a grant on, its own relayed stores included. Defaulted so a
+    /// service from before the relay still parses.
+    #[serde(default)]
+    pub stores: Vec<StoreEndpoint>,
+}
+
+/// Where one store is reached, when that is not the hosted server.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StoreEndpoint {
+    pub store_id: String,
+    pub rpc_url: String,
+    /// A credential for this endpoint alone, when the service issues one;
+    /// the account's token otherwise.
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+/// Where a link connects for one store, and with what.
+pub struct Reach {
+    pub url: url::Url,
+    pub token: String,
+    /// Whether this is the store's own endpoint (relay tier) rather than
+    /// the hosted server.
+    pub via_relay: bool,
+}
+
+impl TokenResponse {
+    /// The endpoint and credential for `store_id`: its own entry in `stores`
+    /// when the answer lists one (with that entry's `token` when it carries
+    /// one), else `fallback` with the account's token. `fallback` is what
+    /// the caller would have connected to before stores had endpoints of
+    /// their own: `rpc_url` when a replica is first linked, `sync.json`'s
+    /// remote for a link that is already there.
+    pub fn reach(&self, store_id: pimble_core::StoreId, fallback: Option<&url::Url>) -> std::result::Result<Reach, String> {
+        let id = store_id.to_string();
+        if let Some(entry) = self.stores.iter().find(|entry| entry.store_id.eq_ignore_ascii_case(&id)) {
+            let url = entry.rpc_url.parse().map_err(|e| format!("cloud service returned an invalid rpc_url {:?} for store {}: {}", entry.rpc_url, id, e))?;
+            return Ok(Reach { url, token: entry.token.clone().unwrap_or_else(|| self.token.clone()), via_relay: true });
+        }
+        let url = match fallback {
+            Some(url) => url.clone(),
+            None => self.rpc_url.parse().map_err(|e| format!("cloud service returned an invalid rpc_url {:?}: {}", self.rpc_url, e))?,
+        };
+        Ok(Reach { url, token: self.token.clone(), via_relay: false })
+    }
 }
 
 /// Mint a fresh JWT for the Pimble RPC server (docs/CRYPTO_CONTRACT.md: "the
@@ -158,6 +215,21 @@ struct CreateStoreRequest<'a> {
     kind: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     store_id: Option<&'a str>,
+    /// `"relay"` for a store shared from this computer
+    /// (docs/RELAY_CONTRACT.md); left out for a hosted one, the default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tier: Option<&'a str>,
+}
+
+/// `StoreView::tier` of a store hosted on Pimble Cloud, and what a row
+/// without the field reads as.
+pub const TIER_HOSTED: &str = "hosted";
+/// `StoreView::tier` of a store served from its owner's computer through
+/// Pimble Cloud's relay.
+pub const TIER_RELAY: &str = "relay";
+
+fn default_tier() -> String {
+    TIER_HOSTED.to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -175,9 +247,17 @@ pub struct StoreView {
     /// An owner's email when the account is not an owner of the store.
     #[serde(default)]
     pub shared_by: Option<String>,
+    /// [`TIER_HOSTED`] or [`TIER_RELAY`] (docs/RELAY_CONTRACT.md). Defaulted
+    /// so a service from before the relay still parses: hosted.
+    #[serde(default = "default_tier")]
+    pub tier: String,
 }
 
 impl StoreView {
+    pub fn is_relayed(&self) -> bool {
+        self.tier == TIER_RELAY
+    }
+
     /// The shared node as a `NodeId`, if the row names one it can parse.
     pub fn scope_root(&self) -> Option<pimble_core::NodeId> {
         self.root.as_deref().and_then(|r| pimble_core::NodeId::parse(r).ok())
@@ -267,7 +347,53 @@ pub fn is_owner_of(rows: &[StoreView], store_id: pimble_core::StoreId) -> bool {
 }
 
 pub async fn create_store(base_url: &str, session: &str, name: &str, kind: &str, store_id: Option<&str>) -> Result<StoreView> {
-    post(&endpoint(base_url, "/api/v1/stores"), Some(session), &CreateStoreRequest { name, kind, store_id }).await
+    post(&endpoint(base_url, "/api/v1/stores"), Some(session), &CreateStoreRequest { name, kind, store_id, tier: None }).await
+}
+
+/// Record a store that is shared from this computer (docs/RELAY_CONTRACT.md):
+/// its id, the owner's grant, and nothing else. The name sent is empty, since
+/// nothing on Pimble Cloud needs the owner's name for it, and the accounts
+/// service makes no call to the hosted server for it.
+pub async fn create_relayed_store(base_url: &str, session: &str, store_id: &str) -> Result<StoreView> {
+    post(&endpoint(base_url, "/api/v1/stores"), Some(session), &CreateStoreRequest { name: "", kind: "vault", store_id: Some(store_id), tier: Some(TIER_RELAY) }).await
+}
+
+/// Remove a store's record: its grants, invitations and key envelopes go
+/// with it, and a relayed store is withdrawn from the relay at once.
+pub async fn delete_store(base_url: &str, session: &str, store_id: &str) -> Result<()> {
+    delete(&endpoint(base_url, &format!("/api/v1/stores/{store_id}")), session).await
+}
+
+/// `path` on the accounts service's origin as a WebSocket URL: `https` is
+/// `wss`, `http` is `ws`.
+fn ws_endpoint(base_url: &str, path: &str) -> std::result::Result<url::Url, String> {
+    let mut url: url::Url = endpoint(base_url, path).parse().map_err(|e| format!("{base_url} is not a URL: {e}"))?;
+    let scheme = match url.scheme() {
+        "https" | "wss" => "wss",
+        "http" | "ws" => "ws",
+        other => return Err(format!("{base_url}: cannot open a WebSocket over {other}")),
+    };
+    url.set_scheme(scheme).map_err(|_| format!("{base_url}: cannot open a WebSocket there"))?;
+    Ok(url)
+}
+
+/// The owner's tunnel (docs/RELAY_CONTRACT.md): `wss://<account url>/api/v1/relay`.
+pub fn relay_tunnel_url(base_url: &str) -> std::result::Result<url::Url, String> {
+    ws_endpoint(base_url, "/api/v1/relay")
+}
+
+/// Where members reach a relayed store, as far as this device can say from
+/// the URL it signed in at (the accounts service names the real one in
+/// `/token`'s `stores`, from its own public URL). Written to a relayed
+/// store's `sync.json` for the record; nothing connects to it from here.
+pub fn relay_member_url(base_url: &str, store_id: pimble_core::StoreId) -> std::result::Result<url::Url, String> {
+    ws_endpoint(base_url, &format!("/api/v1/relay/{store_id}"))
+}
+
+/// The accounts service's JWKS, which a relay face verifies members' tokens
+/// against, as the hosted server does.
+pub fn jwks_url(base_url: &str) -> std::result::Result<url::Url, String> {
+    endpoint(base_url, "/api/v1/.well-known/jwks.json").parse().map_err(|e| format!("{base_url} is not a URL: {e}"))
 }
 
 pub async fn list_stores(base_url: &str, session: &str) -> Result<Vec<StoreView>> {
@@ -440,4 +566,69 @@ pub async fn delete_member(base_url: &str, session: &str, store_id: &str, user_i
 pub async fn delete_invitation(base_url: &str, session: &str, store_id: &str, email: &str, root: Option<&pimble_core::NodeId>) -> Result<()> {
     let encoded_email: String = url::form_urlencoded::byte_serialize(email.as_bytes()).collect();
     delete(&endpoint(base_url, &format!("/api/v1/stores/{store_id}/invitations/{encoded_email}{}", root_query(root))), session).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minted(json: serde_json::Value) -> TokenResponse {
+        serde_json::from_value(json).expect("a /token answer")
+    }
+
+    /// `/token` across the relay tier (docs/RELAY_CONTRACT.md): an answer
+    /// from before it parses and reaches the hosted server; a store with an
+    /// endpoint of its own is reached there, with its own token when it has
+    /// one and the account's when it has not.
+    #[test]
+    fn a_store_is_reached_where_the_token_answer_says() {
+        let store = pimble_core::StoreId::new();
+        let other = pimble_core::StoreId::new();
+        let saved: url::Url = "wss://pimble.app/rpc".parse().unwrap();
+
+        let old = minted(serde_json::json!({ "token": "general", "exp": 1, "rpc_url": "wss://pimble.app/rpc" }));
+        assert!(old.stores.is_empty());
+        let reach = old.reach(store, None).unwrap();
+        assert_eq!((reach.url.as_str(), reach.token.as_str(), reach.via_relay), ("wss://pimble.app/rpc", "general", false));
+
+        let relay_url = format!("wss://pimble.app/api/v1/relay/{store}");
+        let answer = minted(serde_json::json!({
+            "token": "general", "exp": 1, "rpc_url": "wss://pimble.app/rpc",
+            "stores": [
+                { "store_id": store.to_string(), "rpc_url": relay_url, "token": "for-this-store", "exp": 1 },
+                { "store_id": other.to_string(), "rpc_url": format!("wss://pimble.app/api/v1/relay/{other}") },
+            ],
+        }));
+        let reach = answer.reach(store, Some(&saved)).unwrap();
+        assert_eq!((reach.url.as_str(), reach.token.as_str(), reach.via_relay), (relay_url.as_str(), "for-this-store", true));
+        let reach = answer.reach(other, Some(&saved)).unwrap();
+        assert_eq!((reach.token.as_str(), reach.via_relay), ("general", true), "no token of its own: the account's");
+
+        // Not listed: what the link had, with the account's token.
+        let hosted = pimble_core::StoreId::new();
+        let reach = answer.reach(hosted, Some(&saved)).unwrap();
+        assert_eq!((reach.url.as_str(), reach.token.as_str(), reach.via_relay), ("wss://pimble.app/rpc", "general", false));
+
+        let broken = minted(serde_json::json!({ "token": "t", "exp": 1, "rpc_url": "x", "stores": [ { "store_id": store.to_string(), "rpc_url": "not a url" } ] }));
+        assert!(broken.reach(store, None).is_err());
+    }
+
+    #[test]
+    fn the_relay_is_reached_over_a_websocket_on_the_accounts_services_origin() {
+        let store = pimble_core::StoreId::new();
+        assert_eq!(relay_tunnel_url("https://pimble.app").unwrap().as_str(), "wss://pimble.app/api/v1/relay");
+        assert_eq!(relay_tunnel_url("http://127.0.0.1:18090/").unwrap().as_str(), "ws://127.0.0.1:18090/api/v1/relay");
+        assert_eq!(relay_member_url("https://pimble.app/", store).unwrap().as_str(), format!("wss://pimble.app/api/v1/relay/{store}"));
+        assert_eq!(jwks_url("https://pimble.app").unwrap().as_str(), "https://pimble.app/api/v1/.well-known/jwks.json");
+        assert!(relay_tunnel_url("ftp://pimble.app").is_err());
+    }
+
+    /// A row from before tiers is a hosted one.
+    #[test]
+    fn a_store_row_without_a_tier_is_hosted() {
+        let row: StoreView = serde_json::from_value(serde_json::json!({ "store_id": "s", "name": "n", "role": "owner", "kind": "vault", "created_at": "" })).unwrap();
+        assert!(!row.is_relayed());
+        let row: StoreView = serde_json::from_value(serde_json::json!({ "store_id": "s", "name": "", "role": "owner", "kind": "vault", "tier": "relay", "created_at": "" })).unwrap();
+        assert!(row.is_relayed());
+    }
 }

@@ -65,6 +65,7 @@ fn held_as(access: StoreAccess, read_only_roots: Vec<NodeId>) -> SyncConfig {
         remote: RemoteEndpoint { url: "ws://127.0.0.1:1/rpc".parse().unwrap(), auth: AuthMethod::None },
         last_sync: None,
         mode: SyncMode::Vault,
+        via_relay: false,
         last_seq: Default::default(),
         vault_key_id: None,
         access,

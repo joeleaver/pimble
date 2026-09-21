@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use pimble_core::{MountRef, MountState, Node, NodeId, NodeMetadata, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState, Workspace};
+use pimble_core::{MountRef, MountState, Node, NodeId, NodeMetadata, RelaySide, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState, Workspace};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -162,6 +162,15 @@ pub struct VaultDocInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultListDocsResponse {
     pub docs: Vec<VaultDocInfo>,
+    /// Which log this is: a value that stays the same for the life of the
+    /// vault store and differs for one created again under the same id
+    /// (docs/RELAY_CONTRACT.md: a relayed store's twin is derived and
+    /// disposable, "deleted, it is pushed again by the link's reconcile").
+    /// A reader that kept sequence numbers or "what the remote holds" from
+    /// another epoch forgets them: they describe logs that are gone.
+    /// Missing from a server from before it: nothing is concluded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<String>,
 }
 
 /// Response after creating a store
@@ -403,6 +412,11 @@ pub struct GetStoreSyncResponse {
     /// connects again).
     #[serde(default)]
     pub read_only_roots: Vec<NodeId>,
+    /// Whether the store is reached through Pimble Cloud's relay and from
+    /// which end, mirroring `Store::relay` (docs/RELAY_CONTRACT.md).
+    /// `sync_mode` is `Vault` for a relayed store either way.
+    #[serde(default, skip_serializing_if = "RelaySide::is_none")]
+    pub relay: RelaySide,
 }
 
 /// Ask this server for the stores a remote Pimble server has open. The
@@ -759,6 +773,44 @@ pub struct CloudHostedStoreInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudListHostedStoresResponse {
     pub stores: Vec<CloudHostedStoreInfo>,
+    /// The `store_id`s among `stores` whose tier is `relay`
+    /// (docs/RELAY_CONTRACT.md): served from their owner's computer through
+    /// Pimble Cloud's relay, not hosted. Every other row is `hosted`. Beside
+    /// the rows rather than a field of each, so a row stays what callers
+    /// already build and match.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relayed: Vec<String>,
+}
+
+impl CloudListHostedStoresResponse {
+    /// `"relay"` or `"hosted"`, as the accounts service names a row's tier.
+    pub fn tier_of(&self, store_id: &str) -> &'static str {
+        if self.relayed.iter().any(|id| id == store_id) {
+            "relay"
+        } else {
+            "hosted"
+        }
+    }
+}
+
+/// Share a local store from this computer (docs/RELAY_CONTRACT.md): nothing
+/// of it is uploaded. Its encrypted twin is kept on this machine, on this
+/// server's own relay face, and the people it is shared with reach it
+/// through Pimble Cloud's relay while this computer is on and online.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudRelayStoreRequest {
+    pub store_id: StoreId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudRelayStoreResponse {
+    pub store_id: StoreId,
+}
+
+/// The way back from `cloudRelayStore`. Refused while the store has shares.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudStopRelayingRequest {
+    pub store_id: StoreId,
 }
 
 /// Add an already-hosted store as a local replica: fetch the caller's key

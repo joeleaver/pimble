@@ -63,6 +63,12 @@ pub struct ServerConfig {
     /// share's member who has the grant and not yet the key is handed it).
     /// `None` is the default minute; tests shorten it.
     pub share_sweep_interval: Option<std::time::Duration>,
+    /// Where the encrypted twins of the stores shared from this computer
+    /// live (docs/RELAY_CONTRACT.md; `crate::relay_face`). `None` puts it
+    /// beside the replicas directory, as `relay`: `<data dir>/pimble/relay`
+    /// by default, and inside a test's temp directory whenever
+    /// `replicas_dir` is.
+    pub relay_dir: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -77,6 +83,7 @@ impl Default for ServerConfig {
             replicas_dir: None,
             keystore_path: None,
             share_sweep_interval: None,
+            relay_dir: None,
         }
     }
 }
@@ -93,6 +100,10 @@ pub struct PimbleServer {
     /// (`Server::local_addr()`), so a config with port 0 (as used in tests)
     /// still has a meaningful `addr()`.
     local_addr: Option<SocketAddr>,
+    /// A relay face (`crate::relay_face`): a server inside another server's
+    /// process that holds vault twins and nothing else. It has no search
+    /// index to warm a model for.
+    face: bool,
 }
 
 impl PimbleServer {
@@ -109,7 +120,19 @@ impl PimbleServer {
             handle: None,
             handler: None,
             local_addr: None,
+            face: false,
         }
+    }
+
+    /// A relay face: see [`crate::relay_face`].
+    pub(crate) fn relay_face(config: ServerConfig) -> Self {
+        Self { face: true, ..Self::with_config(config) }
+    }
+
+    /// The handler a started server dispatches to, for calls made to it
+    /// in-process.
+    pub(crate) fn handler(&self) -> Option<RpcHandler> {
+        self.handler.clone()
     }
 
     /// Get a reference to the store manager
@@ -193,12 +216,16 @@ impl PimbleServer {
         let local_addr = server.local_addr().map_err(|e| crate::ServerError::Server(e.to_string()))?;
         self.local_addr = Some(local_addr);
 
-        let semantic_available = warm_up_embedding_model().await;
+        // A relay face holds vault twins only, and a vault has no index.
+        let semantic_available = if self.face { false } else { warm_up_embedding_model().await };
 
         let credentials_path = self.config.credentials_path.clone().unwrap_or_else(crate::credentials::default_credentials_path);
         let replicas_dir = self.config.replicas_dir.clone().unwrap_or_else(crate::handler::default_replicas_dir);
         let keystore_path = self.config.keystore_path.clone().unwrap_or_else(crate::keystore::default_keystore_path);
         let mut handler = RpcHandler::with_all_paths(Arc::clone(&self.store_manager), semantic_available, credentials_path, replicas_dir, keystore_path);
+        if let Some(relay_dir) = self.config.relay_dir.clone() {
+            handler = handler.with_relay_dir(relay_dir);
+        }
         if let Some(every) = self.config.share_sweep_interval {
             handler = handler.with_share_sweep_interval(every);
         }
@@ -217,8 +244,11 @@ impl PimbleServer {
         // The links first: a link is a task of its own, and one left running
         // after its server stopped keeps applying to (and writing the files
         // of) stores a restarted server in the same process has open again.
+        // Then what is shared from this computer: the tunnel, so no member
+        // is piped to a face that is going, and the face.
         if let Some(handler) = self.handler.take() {
             handler.stop_links().await;
+            handler.relay().stop().await;
         }
 
         // Flush any pending tree/content changes before the handle stops, so

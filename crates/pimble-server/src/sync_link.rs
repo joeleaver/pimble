@@ -196,6 +196,7 @@ async fn persist_last_sync(handler: &RpcHandler, store_id: StoreId, last_sync: O
         remote: RemoteEndpoint { url: existing.remote.url, auth: AuthMethod::None },
         last_sync,
         mode: existing.mode,
+        via_relay: existing.via_relay,
         last_seq: existing.last_seq,
         vault_key_id: existing.vault_key_id,
         access: existing.access,

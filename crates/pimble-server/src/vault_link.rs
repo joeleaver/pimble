@@ -99,6 +99,23 @@
 //! and connects to the store's hosted RPC url with that as `Bearer`. No
 //! signed-in account (or a mint failure) is treated like any other
 //! connection failure: `Offline`, retried with backoff.
+//!
+//! **The relay tier** (docs/RELAY_CONTRACT.md) is this same link with
+//! another remote ([`LinkEndpoint`]). A store shared from this computer
+//! (`sync.json`'s `mode: "relay"`) links to this process's own relay face
+//! (`crate::relay_face`), which the link has started, with the store's twin
+//! open on it, before every connect; once it has reconciled and the shares'
+//! upkeep has settled it tells the relay host the twin is whole, and the
+//! tunnel announces the store. A member's replica of such a store connects
+//! where the accounts service's `/token` says the store is reached (its
+//! entry in `stores`, with that entry's own `token` when it carries one),
+//! which is Pimble Cloud's relay; an owner who is not there answers close
+//! code 4404, `owner offline`, which is `Offline` with the usual backoff
+//! and nothing to report. A twin is derived and disposable: one that was
+//! deleted is built again by its owner's link, with logs that start again
+//! from 1, and its new `epoch` (`vaultListDocs`) is how every link that
+//! read the old logs knows to forget its cursors and what it believed the
+//! remote held (`Progress::forget_remote_logs`).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -121,8 +138,15 @@ use uuid::Uuid;
 use crate::handler::{LocalChange, Repair, RpcHandler};
 use crate::share::{ShareCommand, Upkeep};
 
-const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
+pub(crate) const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// How long a store shared from this computer waits, once its link has
+/// reconciled, for the shares' upkeep to settle before the tunnel announces
+/// it anyway (see [`crate::relay_face::RelayHost::ready`]). Upkeep that
+/// cannot settle (a share key this device was never handed) must not keep
+/// every other share of the store from its members.
+const ANNOUNCE_WAIT: Duration = Duration::from_secs(20);
+const ANNOUNCE_CHECK_EVERY: Duration = Duration::from_millis(250);
 /// Upload a snapshot of a document once this many entries have been appended
 /// since the last one (docs/CRYPTO_CONTRACT.md), and only when this device has
 /// applied every one of them (see `pimble_rpc::VaultCursor`).
@@ -187,18 +211,42 @@ impl VaultLinkHandle {
     }
 }
 
+/// Where a vault link's remote is.
+#[derive(Debug, Clone)]
+pub enum LinkEndpoint {
+    /// A twin held elsewhere: the hosted server at this URL (`sync.json`'s
+    /// `remote.url`), or, when the accounts service's `/token` names an
+    /// endpoint of the store's own, that one (a store served from its
+    /// owner's computer through Pimble Cloud's relay).
+    Remote(Url),
+    /// This process's own relay face: the store is shared from this
+    /// computer (docs/RELAY_CONTRACT.md). No URL, because the face's port
+    /// is new every run; the link asks for it at every connect.
+    RelayFace,
+}
+
+impl std::fmt::Display for LinkEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LinkEndpoint::Remote(url) => write!(f, "{url}"),
+            LinkEndpoint::RelayFace => f.write_str("this computer's relay face"),
+        }
+    }
+}
+
 /// Namespace for [`VaultLink::start`].
 pub struct VaultLink;
 
 impl VaultLink {
-    /// Start a vault link for `store_id`, whose hosted twin's RPC endpoint
-    /// is `rpc_url` (from `mint_token`'s `rpc_url`, saved in `sync.json`'s
-    /// `remote.url`) and whose blobs this link encrypts with `key_id` (the
-    /// key `cloudHostStore`/`cloudAddHostedStore` recorded in `sync.json`
-    /// as `vault_key_id`, looked up in the keystore fresh each connect —
-    /// never cached here, so a key added to the keystore after this link
-    /// started is picked up on the next reconnect).
-    pub fn start(handler: RpcHandler, store_id: StoreId, rpc_url: Url, key_id: Uuid, last_sync: Option<DateTime<Utc>>) -> VaultLinkHandle {
+    /// Start a vault link for `store_id`, whose twin is at `endpoint` (the
+    /// hosted server's RPC endpoint from `mint_token`, saved in
+    /// `sync.json`'s `remote.url`; or this process's relay face) and whose
+    /// blobs this link encrypts with `key_id` (the key `cloudHostStore`/
+    /// `cloudAddHostedStore`/`cloudRelayStore` recorded in `sync.json` as
+    /// `vault_key_id`, looked up in the keystore fresh each connect — never
+    /// cached here, so a key added to the keystore after this link started
+    /// is picked up on the next reconnect).
+    pub fn start(handler: RpcHandler, store_id: StoreId, endpoint: LinkEndpoint, key_id: Uuid, last_sync: Option<DateTime<Utc>>) -> VaultLinkHandle {
         let link_id = format!("vault-link:{}", Uuid::new_v4());
         let (state_tx, state_rx) = watch::channel(SyncState::Syncing);
         let last_sync = Arc::new(Mutex::new(last_sync));
@@ -208,7 +256,7 @@ impl VaultLink {
         let (share_tx, share_rx) = mpsc::unbounded_channel();
         let sweep = tokio::spawn(crate::share::run_sweeper(handler.clone(), store_id, Arc::clone(&sweep_kick)));
         let shares = ShareSide { commands: share_rx, upkeep: Upkeep::new(), sweep_kick: Arc::clone(&sweep_kick) };
-        let join = tokio::spawn(run_loop(handler, rpc_url, key_id, link_id, state, shares));
+        let join = tokio::spawn(run_loop(handler, endpoint, key_id, link_id, state, shares));
 
         VaultLinkHandle { state_rx, last_sync, join, sweep, sweep_kick, share_tx }
     }
@@ -265,7 +313,7 @@ async fn set_state(handler: &RpcHandler, link: &LinkState, state: SyncState) {
     handler.notify_sync_state_changed(link.store_id, state).await;
 }
 
-async fn run_loop(handler: RpcHandler, rpc_url: Url, key_id: Uuid, link_id: String, link: LinkState, mut shares: ShareSide) {
+async fn run_loop(handler: RpcHandler, endpoint: LinkEndpoint, key_id: Uuid, link_id: String, link: LinkState, mut shares: ShareSide) {
     let store_id = link.store_id;
     // Subscribed once, for the life of the task: a change made while the link
     // is down still arrives here, which is how the link knows what to push
@@ -273,23 +321,55 @@ async fn run_loop(handler: RpcHandler, rpc_url: Url, key_id: Uuid, link_id: Stri
     let mut local_rx = handler.subscribe_local_changes().await;
     let mut progress = Progress::load(&handler, store_id).await;
     let mut backoff = INITIAL_BACKOFF;
+    // A store served from its owner's computer is there while that computer
+    // is, and for the rest of the time the relay answers `owner offline`:
+    // this link being offline, the ordinary way, for hours or days. While
+    // that is what the last attempt met, the next one asks the relay first
+    // and stays `Offline`, quietly, until the owner is back (see `connect`).
+    let mut owner_offline = false;
     loop {
         let mut reached_synced = false;
-        let result = connect_and_sync(&handler, &rpc_url, key_id, &link_id, &link, &mut local_rx, &mut progress, &mut reached_synced, &mut shares).await;
+        let mut reached: Option<Reached> = None;
+        let result =
+            connect_and_sync(&handler, &endpoint, key_id, &link_id, &link, &mut local_rx, &mut progress, &mut reached_synced, &mut reached, owner_offline, &mut shares).await;
         if reached_synced {
             backoff = INITIAL_BACKOFF;
         }
         // `Ok` is a connection given up on purpose (the grant changed):
         // the next one is made at once.
+        owner_offline = false;
         if let Err(e) = result {
-            warn!("Vault link for store {} to {} dropped: {}", store_id, rpc_url, e);
             set_state(&handler, &link, SyncState::Offline).await;
             shares.upkeep.link_down(&handler, store_id).await;
+            owner_offline = e.is::<OwnerOffline>()
+                || match &reached {
+                    Some(reached) if reached.via_relay => crate::relay_tunnel::owner_is_offline(&reached.url, &reached.token).await,
+                    _ => false,
+                };
+            if owner_offline {
+                debug!("Vault link for store {}: its owner's computer is offline ({}); trying again later", store_id, e);
+            } else {
+                warn!("Vault link for store {} to {} dropped: {}", store_id, endpoint, e);
+            }
             note_local_changes_for(&mut local_rx, &mut progress, store_id, &link_id, backoff).await;
             backoff = (backoff * 2).min(MAX_BACKOFF);
         }
     }
 }
+
+/// What a connect attempt ends with when the relay says the store's owner
+/// is not there (docs/RELAY_CONTRACT.md: close code 4404, `owner offline`).
+/// Not a failure to report: the link is `Offline` and tries again.
+#[derive(Debug)]
+struct OwnerOffline;
+
+impl std::fmt::Display for OwnerOffline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the relay answers `owner offline`")
+    }
+}
+
+impl std::error::Error for OwnerOffline {}
 
 /// Wait out a backoff, recording which documents change locally meanwhile.
 async fn note_local_changes_for(
@@ -317,12 +397,39 @@ async fn note_local_changes_for(
     progress.save_if_unsaved().await;
 }
 
-/// Mint a fresh JWT from the currently signed-in account and connect to
-/// `rpc_url` with it as `Bearer`. Fails (and so goes through the retry
+/// Where a connect attempt went, and with what: kept by the retry loop so
+/// that a failure at a relayed endpoint can be asked about
+/// (`crate::relay_tunnel::owner_is_offline`).
+struct Reached {
+    url: Url,
+    token: String,
+    via_relay: bool,
+}
+
+/// Mint a fresh JWT from the currently signed-in account and connect to the
+/// store's twin with it as `Bearer`. Fails (and so goes through the retry
 /// loop's backoff) with no signed-in account, a mint failure, or a
 /// connection failure — all indistinguishable to a caller beyond the error
 /// text, same as `crate::sync_link`'s own connect failures.
-async fn connect(handler: &RpcHandler, rpc_url: &Url) -> anyhow::Result<PimbleClient> {
+///
+/// Where the twin is (see [`LinkEndpoint`]): this process's relay face,
+/// started here if it is not running, with the store's twin open on it; or
+/// the endpoint the accounts service names for the store in the same answer
+/// that carries the token, and failing that the one `sync.json` holds.
+///
+/// `ask_first`: the last attempt met `owner offline`. The relay is asked
+/// whether that still holds before anything else is tried, so a store whose
+/// owner stays away costs one short connection a try and the link never
+/// leaves `Offline` for it; `on_the_way` runs once the answer is that the
+/// owner is there.
+async fn connect(
+    handler: &RpcHandler,
+    store_id: StoreId,
+    endpoint: &LinkEndpoint,
+    reached: &mut Option<Reached>,
+    ask_first: bool,
+    on_the_way: impl std::future::Future<Output = ()>,
+) -> anyhow::Result<PimbleClient> {
     let account = handler
         .keystore()
         .account()
@@ -331,30 +438,86 @@ async fn connect(handler: &RpcHandler, rpc_url: &Url) -> anyhow::Result<PimbleCl
     let minted = crate::cloud::mint_token(&account.url, &account.session)
         .await
         .map_err(|e| anyhow::anyhow!("minting a cloud token from {} failed: {}", account.url, e))?;
-    let auth = AuthMethod::Bearer { token: minted.token };
-    PimbleClient::connect_with_auth(rpc_url.as_str(), &auth)
+    let (url, token, via_relay) = match endpoint {
+        LinkEndpoint::RelayFace => {
+            let url = handler
+                .relay()
+                .prepare(handler, store_id, &account, &minted.token, false)
+                .await
+                .map_err(|e| anyhow::anyhow!("sharing from this computer is not up yet: {}", e))?;
+            (url, minted.token.clone(), false)
+        }
+        LinkEndpoint::Remote(saved) => {
+            let reach = minted.reach(store_id, Some(saved)).map_err(|e| anyhow::anyhow!(e))?;
+            let via_relay = if reach.via_relay {
+                note_endpoint(handler, store_id, &reach.url).await;
+                true
+            } else {
+                // Not listed: the store is hosted, or this account holds
+                // nothing of it any more. `sync.json` says which it was.
+                let manager = handler.store_manager_handle();
+                let manager = manager.read().await;
+                manager.read_sync_config(store_id).await.ok().flatten().is_some_and(|config| config.via_relay)
+            };
+            (reach.url, reach.token, via_relay)
+        }
+    };
+    if ask_first {
+        if via_relay && crate::relay_tunnel::owner_is_offline(&url, &token).await {
+            return Err(anyhow::Error::new(OwnerOffline));
+        }
+        on_the_way.await;
+    }
+    *reached = Some(Reached { url: url.clone(), token: token.clone(), via_relay });
+    let auth = AuthMethod::Bearer { token };
+    PimbleClient::connect_with_auth(url.as_str(), &auth)
         .await
-        .map_err(|e| anyhow::anyhow!("{}", pimble_client::describe_connect_error(rpc_url, &e)))
+        .map_err(|e| anyhow::anyhow!("{}", pimble_client::describe_connect_error(&url, &e)))
+}
+
+/// The accounts service names an endpoint of the store's own: `sync.json`
+/// says so from now on (`Store::relay`, and where the next connect falls
+/// back to). Best effort, like every other note the link keeps there.
+async fn note_endpoint(handler: &RpcHandler, store_id: StoreId, url: &Url) {
+    let manager = handler.store_manager_handle();
+    let manager = manager.read().await;
+    let Ok(Some(mut config)) = manager.read_sync_config(store_id).await else { return };
+    if config.via_relay && config.remote.url == *url {
+        return;
+    }
+    info!("Vault link for store {}: it is served from its owner's computer, through {}", store_id, url);
+    config.via_relay = true;
+    config.remote.url = url.clone();
+    if let Err(e) = manager.write_sync_config(store_id, &config).await {
+        warn!("Vault link for store {}: could not record where the store is reached: {}", store_id, e);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn connect_and_sync(
     handler: &RpcHandler,
-    rpc_url: &Url,
+    endpoint: &LinkEndpoint,
     key_id: Uuid,
     link_id: &str,
     link: &LinkState,
     local_rx: &mut broadcast::Receiver<LocalChange>,
     progress: &mut Progress,
     reached_synced: &mut bool,
+    reached: &mut Option<Reached>,
+    owner_was_offline: bool,
     shares: &mut ShareSide,
 ) -> anyhow::Result<()> {
     let store_id = link.store_id;
-    set_state(handler, link, SyncState::Syncing).await;
+    // `Syncing` says a connection is being made. While a relayed store's
+    // owner is away none is: the link stays `Offline` until the relay says
+    // otherwise, and does not flap at every try.
+    if !owner_was_offline {
+        set_state(handler, link, SyncState::Syncing).await;
+    }
 
     let owner = refresh_grant(handler, store_id).await;
     let connected_as = grant_shape(handler, store_id).await;
-    let client = connect(handler, rpc_url).await?;
+    let client = connect(handler, store_id, endpoint, reached, owner_was_offline, set_state(handler, link, SyncState::Syncing)).await?;
     // What the last connection learned of the remote's documents and their
     // wraps is asked again; data keys already unwrapped stay.
     progress.keyring.forget_remote();
@@ -366,7 +529,7 @@ async fn connect_and_sync(
     let mut remote_sub = client
         .subscribe_store_changes(store_id)
         .await
-        .map_err(|e| anyhow::anyhow!("subscribe to {} storeChanged failed: {}", rpc_url, e))?;
+        .map_err(|e| anyhow::anyhow!("subscribe to {} storeChanged failed: {}", endpoint, e))?;
 
     // Whatever changed locally while no connection was up is not pushed as
     // the deltas it arrived as (the link was not there to push them in
@@ -391,7 +554,7 @@ async fn connect_and_sync(
 
     set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
     *reached_synced = true;
-    info!("Vault link for store {} connected to {}", store_id, rpc_url);
+    info!("Vault link for store {} connected to {}", store_id, endpoint);
 
     // The shares' upkeep at connect: a pass as soon as the loop below turns
     // (reconciled first, so the pass judges the converged tree), and the
@@ -399,8 +562,23 @@ async fn connect_and_sync(
     shares.upkeep.connected(handler, store_id, owner);
     shares.sweep_kick.notify_one();
 
+    // Shared from this computer: the twin now holds everything this store
+    // does. Members are let in once the shares' upkeep has settled too (the
+    // scopes published, every document wrapped under its shares' keys), so
+    // that nobody connects to a twin that was built again a moment ago and
+    // finds their share empty; or after a while regardless.
+    let mut announce_by = matches!(endpoint, LinkEndpoint::RelayFace).then(|| tokio::time::Instant::now() + ANNOUNCE_WAIT);
+    let mut announce_check = tokio::time::interval(ANNOUNCE_CHECK_EVERY);
+
     loop {
         tokio::select! {
+            _ = announce_check.tick(), if announce_by.is_some() => {
+                let waited_out = announce_by.is_some_and(|by| tokio::time::Instant::now() >= by);
+                if waited_out || crate::share::settled(handler, store_id).await {
+                    handler.relay().ready(store_id).await;
+                    announce_by = None;
+                }
+            }
             item = remote_sub.next() => {
                 match item {
                     Some(Ok(notif)) => {
@@ -686,6 +864,11 @@ pub(crate) async fn fetch_scope_keys(
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct ProgressFile {
+    /// Which logs the rest of this file (and `sync.json`'s `last_seq`) is
+    /// about: `vaultListDocs`'s `epoch` as last read. `None` in a file from
+    /// before epochs, and for a remote that names none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    epoch: Option<String>,
     #[serde(default)]
     pushed_sv: HashMap<String, String>,
     #[serde(default)]
@@ -848,6 +1031,33 @@ impl Progress {
 
     fn cursor(&mut self, doc_id: &VaultDocId) -> &mut VaultCursor {
         self.cursors.entry(doc_id.as_str()).or_default()
+    }
+
+    /// The remote's logs are other logs than the ones this device read (see
+    /// `ProgressFile::epoch`): where each was read to, what the remote was
+    /// known to hold and the data keys of the documents as they were are
+    /// all forgotten. Every document is read from the start (a merge
+    /// repeated is nothing) and offered whole (what the remote already has
+    /// of it merges to nothing there).
+    async fn forget_remote_logs(&mut self, handler: &RpcHandler, store_id: StoreId) {
+        self.file.pushed_sv.clear();
+        self.file.dirty.clear();
+        self.file.dirty_all = true;
+        self.file.rekeying.clear();
+        self.cursors.clear();
+        self.snapshot_seqs.clear();
+        self.keyring = Keyring::default();
+        self.unsaved = true;
+        let manager = handler.store_manager_handle();
+        let manager = manager.read().await;
+        if let Ok(Some(mut config)) = manager.read_sync_config(store_id).await {
+            if !config.last_seq.is_empty() {
+                config.last_seq.clear();
+                if let Err(e) = manager.write_sync_config(store_id, &config).await {
+                    warn!("Vault link for store {}: could not forget where the old logs were read to: {}", store_id, e);
+                }
+            }
+        }
     }
 
     fn snapshot_seq(&self, doc_id: &VaultDocId) -> u64 {
@@ -1047,7 +1257,26 @@ async fn full_reconcile(
     progress: &mut Progress,
     echoes: &Arc<EchoTracker>,
 ) -> anyhow::Result<()> {
-    let remote_docs = client.vault_list_docs(store_id).await.map_err(|e| anyhow::anyhow!("remote vaultListDocs failed: {}", e))?;
+    let listing = client.vault_list_docs_response(store_id).await.map_err(|e| anyhow::anyhow!("remote vaultListDocs failed: {}", e))?;
+    // Which logs these are. A relayed store's twin that was deleted is built
+    // again by its owner's link (docs/RELAY_CONTRACT.md), and its logs count
+    // from 1 again: every number this device kept, and everything it
+    // believed the remote held, was about logs that are gone.
+    if let Some(epoch) = &listing.epoch {
+        match &progress.file.epoch {
+            Some(read) if read != epoch => {
+                info!("Vault link for store {}: the remote's logs are not the ones this device read (its twin was built again); reading them from the start and offering every document again", store_id);
+                progress.forget_remote_logs(handler, store_id).await;
+                progress.file.epoch = Some(epoch.clone());
+            }
+            Some(_) => {}
+            None => {
+                progress.file.epoch = Some(epoch.clone());
+                progress.unsaved = true;
+            }
+        }
+    }
+    let remote_docs = listing.docs;
 
     // Where each document's log has been read to. A replica whose `last_seq`
     // predates gap-aware cursors reads everything once more from the start

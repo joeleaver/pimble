@@ -52,12 +52,27 @@ ed25519-dalek = "2.2"
 # contract; no default features so openssl-sys never enters the dependency
 # tree.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# The owner's tunnel to Pimble Cloud's relay and the loopback connections it
+# pipes members to (docs/RELAY_CONTRACT.md; src/relay_tunnel.rs): plain
+# WebSockets with binary frames, request headers and close codes, none of
+# which jsonrpsee's client hands over. The version axum's `ws` already
+# brings into the workspace (pimble-cloud), so the lock file gains nothing;
+# rustls with the platform's roots, as jsonrpsee's own `wss` has.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+futures = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
 # A tiny local JWKS endpoint for jwt.rs's and tests/auth.rs's tests
 # (docs/CLOUD_CONTRACT.md "B: pimble-server" item 8).
 axum = "0.8"
+# tests/relay.rs's stand-in for Pimble Cloud's relay upgrades two of the
+# accounts stub's routes to WebSockets by hand (hyper's upgrade, then
+# tokio-tungstenite in the server role), so axum's own `ws` feature, which
+# would bring a second tungstenite into the lock file, stays off. Both are in
+# the tree already, under axum.
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 [features]
 # Semantic search. Choose one ONNX link mode; see crates/pimble-search/Cargo.toml.

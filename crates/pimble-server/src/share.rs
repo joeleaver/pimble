@@ -34,8 +34,12 @@
 //!   envelope of a share key this device lacks.
 //!
 //! **Nothing is hosted unless the person asked for it** (`CLAUDE.md`):
-//! sharing never hosts. A store that is not hosted is refused with
-//! [`NOT_HOSTED_REFUSAL`] before anything is asked of anyone.
+//! sharing never hosts. A store that is neither hosted nor shared from this
+//! computer (docs/RELAY_CONTRACT.md) is refused with [`NOT_HOSTED_REFUSAL`]
+//! before anything is asked of anyone. For a store that is shared from this
+//! computer everything here is the same: "the hosted twin" is the twin on
+//! this machine's relay face, and the vault link the upkeep rides is the
+//! link to it.
 //!
 //! Only an owner's device keeps shares up: the accounts service takes
 //! `PUT members` and the hosted server `setScope` from an owner and nobody
@@ -66,11 +70,12 @@ use crate::keystore::SignedInAccount;
 use crate::principal::read_only_error;
 use crate::vault_link::{LinkSession, Rekeyed, RemoteKeys};
 
-/// What "Share..." answers on a store that is not hosted. Sharing never
-/// hosts anything: only "Host on Pimble Cloud..." uploads a store (Joe,
-/// 2026-09-18), and the relay that will serve an unhosted store's shares is
-/// a later wave.
-pub const NOT_HOSTED_REFUSAL: &str = "Sharing needs this store hosted on Pimble Cloud, or the relay, which is not built yet. Nothing was uploaded.";
+/// What "Share..." answers on a store that is neither hosted nor shared
+/// from this computer. Sharing never hosts anything and never chooses for
+/// the person: only "Host on Pimble Cloud..." uploads a store (Joe,
+/// 2026-09-18), only `cloudRelayStore` shares one from this computer, and
+/// the app offers both (docs/RELAY_CONTRACT.md).
+pub const NOT_HOSTED_REFUSAL: &str = "Sharing needs this store hosted on Pimble Cloud or shared from this computer.";
 
 /// What sharing from a store one does not own answers: a share's recipient,
 /// or an editor of the whole store.
@@ -141,6 +146,29 @@ fn markers_in(tree: &Tree) -> Vec<(NodeId, ShareMarker)> {
 /// is the accounts service's to say; see [`Upkeep::connected`].)
 fn holds_whole_store(manager: &StoreManager, store_id: StoreId) -> bool {
     manager.scope_roots(store_id).is_empty() && manager.store_access(store_id).allows_write()
+}
+
+/// Whether any node of the store carries a share's marker: what
+/// `cloudStopRelaying` refuses on (its shares are stopped first).
+pub(crate) fn has_shares(manager: &StoreManager, store_id: StoreId) -> bool {
+    manager.tree(store_id).is_ok_and(|tree| !markers_in(tree).is_empty())
+}
+
+/// Whether the upkeep of every share of the store has settled on this
+/// device: every document under each is wrapped under its key on the twin,
+/// and its scope is published. True for a store with no shares. What a store
+/// shared from this computer waits for before its members are let in
+/// (`crate::relay_face::RelayHost::ready`).
+pub(crate) async fn settled(handler: &RpcHandler, store_id: StoreId) -> bool {
+    let roots: Vec<NodeId> = {
+        let manager = handler.store_manager_handle();
+        let manager = manager.read().await;
+        match manager.tree(store_id) {
+            Ok(tree) => markers_in(tree).into_iter().map(|(root, _)| root).collect(),
+            Err(_) => return false,
+        }
+    };
+    handler.shares().all_settled(store_id, &roots)
 }
 
 /// The share roots in `node_id`'s subtree (itself included), for
@@ -280,6 +308,11 @@ impl Shares {
             Some(SyncState::Synced { .. }) => SyncState::Syncing,
             _ => SyncState::Offline,
         }
+    }
+
+    fn all_settled(&self, store_id: StoreId, roots: &[NodeId]) -> bool {
+        let statuses = self.statuses.lock().unwrap();
+        roots.iter().all(|root| statuses.get(&(store_id, *root)).is_some_and(|status| status.reach == Reach::Settled))
     }
 
     fn roots_of(&self, store_id: StoreId) -> Vec<NodeId> {

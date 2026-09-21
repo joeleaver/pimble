@@ -14,6 +14,8 @@ pub mod handler;
 pub mod jwt;
 pub mod keystore;
 pub mod principal;
+pub mod relay_face;
+mod relay_tunnel;
 pub mod server;
 pub mod share;
 pub mod sync_link;

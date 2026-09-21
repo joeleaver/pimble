@@ -50,13 +50,14 @@ use jsonrpsee::core::{async_trait, SubscriptionResult};
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{Extensions, PendingSubscriptionSink, SubscriptionMessage};
 use pimble_client::{describe_connect_error, PimbleClient};
-use pimble_core::{AuthMethod, Node, MountRef, MountState, NodeId, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState, Workspace};
+use pimble_core::{AuthMethod, Node, MountRef, MountState, NodeId, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState, Workspace};
 use pimble_crdt::{NodeDoc, NodeFields, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_plugins::PluginHost;
 use pimble_rpc::{
     encrypted_store_error, index_building_error, snapshot_required_error, to_rpc_error, ApplyEditRequest, ApplyEditResponse,
     AddRemoteStoreRequest, CloseStoreRequest, CloudAddHostedStoreRequest, CloudHostStoreRequest,
-    CloudHostStoreResponse, CloudHostedStoreInfo, CloudListHostedStoresResponse, CloudSignInRequest, CloudStatusResponse,
+    CloudHostStoreResponse, CloudHostedStoreInfo, CloudListHostedStoresResponse, CloudRelayStoreRequest, CloudRelayStoreResponse, CloudSignInRequest,
+    CloudStatusResponse, CloudStopRelayingRequest,
     CreateMountRequest, CreateMountResponse,
     CreateNodeRequest, CreateNodeResponse, CreateStoreRequest, CreateStoreResponse,
     CreateWorkspaceRequest, DeleteNodeRequest, EditOperation, EmptyResponse, GetChildrenRequest,
@@ -85,7 +86,7 @@ use crate::principal::{
     Principal,
 };
 use crate::sync_link::{SyncLink, SyncLinkHandle};
-use crate::vault_link::{VaultLink, VaultLinkHandle};
+use crate::vault_link::{LinkEndpoint, VaultLink, VaultLinkHandle};
 
 /// How long to wait, after a node's content last changed, before reading its
 /// units and upserting them into the search index. `applyEdit` fires on every
@@ -255,6 +256,14 @@ fn parent_named_by(update: &[u8]) -> Option<NodeId> {
     let mut scratch = NodeDoc::new();
     scratch.apply_update(update).ok()?;
     scratch.fields().ok()?.parent_id
+}
+
+/// Where the twins of relayed stores live unless the configuration says
+/// otherwise (docs/RELAY_CONTRACT.md): `relay`, beside the replicas
+/// directory, so `<data dir>/pimble/relay` by default and inside a test's
+/// temp directory whenever its replicas are.
+fn relay_dir_beside(replicas_dir: &std::path::Path) -> PathBuf {
+    replicas_dir.parent().map(|parent| parent.join("relay")).unwrap_or_else(|| replicas_dir.join("relay"))
 }
 
 /// The directory a server creates replicas in unless
@@ -988,11 +997,20 @@ pub struct RpcHandler {
     /// What this device knows of the shares it keeps up, as their owner's
     /// (docs/NODE_DOCUMENT_CONTRACT.md section 5; `crate::share`).
     shares: Arc<crate::share::Shares>,
+    /// What is shared from this computer (docs/RELAY_CONTRACT.md): the relay
+    /// face, the twins it holds and the tunnel to Pimble Cloud's relay
+    /// (`crate::relay_face`). Nothing of it runs until a store is relayed.
+    relay: Arc<crate::relay_face::RelayHost>,
 }
 
 /// What a share's member is told a store is called by this server, which
 /// knows the owner's name for it and must not pass it on.
 const SHARE_PLACEHOLDER_NAME: &str = "Shared with you";
+
+/// What a whole replica of a store shared from another computer is called
+/// here until the person names it: the accounts service holds no name for a
+/// relayed store (docs/RELAY_CONTRACT.md), by design.
+const RELAYED_PLACEHOLDER_NAME: &str = "Shared from another computer";
 
 impl RpcHandler {
     pub fn new(store_manager: Arc<RwLock<StoreManager>>) -> Self {
@@ -1057,12 +1075,21 @@ impl RpcHandler {
             semantic_available,
             links: Arc::new(RwLock::new(HashMap::new())),
             credentials: Arc::new(crate::credentials::CredentialStore::new(credentials_path)),
-            replicas_dir: Arc::new(replicas_dir),
             mounts: Arc::new(Mutex::new(MountTracking::default())),
             vault_links: Arc::new(RwLock::new(HashMap::new())),
             keystore: Arc::new(Keystore::new(keystore_path)),
             shares: Arc::new(crate::share::Shares::new(crate::share::DEFAULT_SWEEP_EVERY)),
+            relay: Arc::new(crate::relay_face::RelayHost::new(relay_dir_beside(&replicas_dir))),
+            replicas_dir: Arc::new(replicas_dir),
         }
+    }
+
+    /// Where the twins of the stores shared from this computer live
+    /// (`ServerConfig::relay_dir`), in place of `relay` beside the replicas
+    /// directory. Call before the handler is cloned or serves anything.
+    pub fn with_relay_dir(mut self, dir: PathBuf) -> Self {
+        self.relay = Arc::new(crate::relay_face::RelayHost::new(dir));
+        self
     }
 
     /// How often each hosted store's key sweep runs (`crate::share`), in
@@ -1087,7 +1114,7 @@ impl RpcHandler {
     /// Fill in the field of a `Store` only the server knows: whether it is
     /// a replica (its directory is inside this server's replicas
     /// directory).
-    fn mark_replica(&self, store: &mut pimble_core::Store) {
+    pub(crate) fn mark_replica(&self, store: &mut pimble_core::Store) {
         store.is_replica = store.local_path().map_or(false, |p| p.starts_with(self.replicas_dir.as_path()));
     }
 
@@ -1286,14 +1313,38 @@ impl RpcHandler {
     /// a store with no `sync.json` at all (unlinked, or itself a `Vault`
     /// store, which never has one) or one that fails to read.
     pub(crate) async fn sync_mode_of(&self, store_id: StoreId) -> StoreKind {
+        self.link_kind_of(store_id).await.0
+    }
+
+    /// [`Self::sync_mode_of`], and whether the store is relayed and from
+    /// which end (`Store::relay`, docs/RELAY_CONTRACT.md): `Owner` for a
+    /// store shared from this computer (`mode: "relay"`), `Member` for a
+    /// replica whose vault link goes through Pimble Cloud's relay to its
+    /// owner's computer (`via_relay`). A relayed store's link is a vault
+    /// link either way, so its `sync_mode` is `Vault`.
+    pub(crate) async fn link_kind_of(&self, store_id: StoreId) -> (StoreKind, RelaySide) {
         let manager = self.store_manager.read().await;
+        self.link_kind_of_locked(&manager, store_id).await
+    }
+
+    /// [`Self::link_kind_of`] for a caller that holds the manager's lock.
+    async fn link_kind_of_locked(&self, manager: &StoreManager, store_id: StoreId) -> (StoreKind, RelaySide) {
         match manager.read_sync_config(store_id).await {
             Ok(Some(config)) => match config.mode {
-                SyncMode::Sync => StoreKind::Plain,
-                SyncMode::Vault => StoreKind::Vault,
+                SyncMode::Sync => (StoreKind::Plain, RelaySide::None),
+                SyncMode::Vault if config.via_relay => (StoreKind::Vault, RelaySide::Member),
+                SyncMode::Vault => (StoreKind::Vault, RelaySide::None),
+                SyncMode::Relay => (StoreKind::Vault, RelaySide::Owner),
             },
-            _ => StoreKind::Plain,
+            _ => (StoreKind::Plain, RelaySide::None),
         }
+    }
+
+    /// Fill in what only the server knows of a `Store`'s link: its state,
+    /// its mode and whether it is relayed.
+    async fn describe_link(&self, store: &mut pimble_core::Store) {
+        store.sync_state = self.sync_state_of(store.id).await;
+        (store.sync_mode, store.relay) = self.link_kind_of(store.id).await;
     }
 
     /// Start a sync link for `store_id` if one isn't already running.
@@ -1304,15 +1355,24 @@ impl RpcHandler {
         // `last_sync` from `sync.json` until it next reaches `Synced`, so a
         // mount sourced from this store reports `Cached { last_sync }`
         // rather than `Connecting` after a restart with the remote down.
-        let last_sync = {
+        let config = {
             let manager = self.store_manager.read().await;
-            manager.read_sync_config(store_id).await.ok().flatten().and_then(|c| c.last_sync)
+            manager.read_sync_config(store_id).await.ok().flatten()
         };
+        let last_sync = config.as_ref().and_then(|c| c.last_sync);
         // A store has one link. A vault link (docs/CRYPTO_CONTRACT.md) talks
         // to the hosted twin with a minted JWT; a plain link started beside
-        // it would connect with no credential, be refused, and flap.
+        // it would connect with no credential, be refused, and flap. The
+        // same for a store shared from this computer
+        // (docs/RELAY_CONTRACT.md), whose vault link's remote is this
+        // process's own relay face: whether that link runs yet or not,
+        // `sync.json` says what the store's one link is.
         if self.vault_links.read().await.contains_key(&store_id) {
             warn!("store {} has a vault link; not starting a plain sync link beside it", store_id);
+            return;
+        }
+        if let Some(mode) = config.map(|c| c.mode).filter(|mode| mode.is_vault_link()) {
+            warn!("store {} is linked in {:?} mode; not starting a plain sync link for it", store_id, mode);
             return;
         }
         let mut links = self.links.write().await;
@@ -1353,6 +1413,12 @@ impl RpcHandler {
 
     pub(crate) fn shares(&self) -> &crate::share::Shares {
         &self.shares
+    }
+
+    // ── Sharing from this computer (crate::relay_face) ───────────────────
+
+    pub(crate) fn relay(&self) -> &crate::relay_face::RelayHost {
+        &self.relay
     }
 
     /// `store_id`'s vault link state; `None` when it has no vault link.
@@ -1422,11 +1488,14 @@ impl RpcHandler {
 
     /// Start a vault link for `store_id` if one isn't already running
     /// (`openStore` restarting one from `sync.json`, `cloudHostStore`,
-    /// `cloudAddHostedStore`). `rpc_url` is the hosted twin's Pimble RPC
-    /// endpoint (`mint_token`'s `rpc_url`); the link mints its own bearer
-    /// fresh from the keystore on every connect, so no credential is passed
-    /// in here.
-    async fn ensure_vault_link_started(&self, store_id: StoreId, rpc_url: url::Url, key_id: Uuid) {
+    /// `cloudAddHostedStore`, `cloudRelayStore`). `endpoint` is where the
+    /// twin is: the hosted server (`mint_token`'s `rpc_url`, or the store's
+    /// own endpoint when the accounts service names one), or this process's
+    /// relay face for a store shared from this computer, which the link
+    /// starts before every connect (docs/RELAY_CONTRACT.md: the face first,
+    /// then the link). The link mints its own bearer fresh from the keystore
+    /// on every connect, so no credential is passed in here.
+    pub(crate) async fn ensure_vault_link_started(&self, store_id: StoreId, endpoint: LinkEndpoint, key_id: Uuid) {
         // A replica whose tree was pulled before the manifest root was kept
         // in step (see `adopt_document_root`) heals on its next open: the
         // documents on disk already hold the real root.
@@ -1439,24 +1508,29 @@ impl RpcHandler {
         if vault_links.contains_key(&store_id) {
             return;
         }
-        let handle = VaultLink::start(self.clone(), store_id, rpc_url, key_id, last_sync);
+        let handle = VaultLink::start(self.clone(), store_id, endpoint, key_id, last_sync);
         vault_links.insert(store_id, handle);
     }
 
     /// Stop and remove `store_id`'s vault link, if any.
-    async fn stop_vault_link(&self, store_id: StoreId) {
+    pub(crate) async fn stop_vault_link(&self, store_id: StoreId) {
         if let Some(handle) = self.vault_links.write().await.remove(&store_id) {
             handle.stop();
         }
     }
 
-    /// Mint a fresh JWT (for its `rpc_url`) and write `store_id`'s
-    /// `sync.json` as a vault-mode link to it under `key_id`, stripped of
-    /// any credential (`auth: none`, matching `crate::sync_link`'s own
-    /// decision 4) — a vault link never trusts what's on disk for a
-    /// credential, only the keystore. Used by `cloudHostStore` and
-    /// `cloudAddHostedStore`, both of which then call
+    /// Mint a fresh JWT (for where the store is reached) and write
+    /// `store_id`'s `sync.json` as a vault-mode link to it under `key_id`,
+    /// stripped of any credential (`auth: none`, matching
+    /// `crate::sync_link`'s own decision 4) — a vault link never trusts
+    /// what's on disk for a credential, only the keystore. Used by
+    /// `cloudHostStore` and `cloudAddHostedStore`, both of which then call
     /// `ensure_vault_link_started` with the returned url.
+    ///
+    /// Where the store is reached: its own endpoint when the accounts
+    /// service's `/token` lists one (a relay-tier store, served from its
+    /// owner's computer; `via_relay`), else `rpc_url`, the hosted server
+    /// (docs/RELAY_CONTRACT.md, "Members' side").
     async fn link_hosted_store(
         &self,
         store_id: StoreId,
@@ -1465,10 +1539,8 @@ impl RpcHandler {
         held_as: &crate::cloud::HeldAs,
     ) -> Result<url::Url, ErrorObjectOwned> {
         let minted = crate::cloud::mint_token(&account.url, &account.session).await.map_err(to_rpc_error)?;
-        let rpc_url: url::Url = minted
-            .rpc_url
-            .parse()
-            .map_err(|e| to_rpc_error(format!("cloud service returned an invalid rpc_url {:?}: {}", minted.rpc_url, e)))?;
+        let reach = minted.reach(store_id, None).map_err(to_rpc_error)?;
+        let rpc_url = reach.url;
 
         let manager = self.store_manager.read().await;
         manager
@@ -1478,6 +1550,7 @@ impl RpcHandler {
                     remote: RemoteEndpoint { url: rpc_url.clone(), auth: AuthMethod::None },
                     last_sync: None,
                     mode: SyncMode::Vault,
+                    via_relay: reach.via_relay,
                     last_seq: Default::default(),
                     vault_key_id: Some(key_id),
                     access: held_as.access,
@@ -1807,7 +1880,7 @@ impl RpcHandler {
             .await
             .map_err(to_rpc_error)?;
         manager
-            .write_sync_config(created_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None, mode: pimble_store::SyncMode::Sync, last_seq: Default::default(), vault_key_id: None, access: StoreAccess::Full, shared_by: None, read_only_roots: Vec::new() })
+            .write_sync_config(created_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None, mode: pimble_store::SyncMode::Sync, via_relay: false, last_seq: Default::default(), vault_key_id: None, access: StoreAccess::Full, shared_by: None, read_only_roots: Vec::new() })
             .await
             .map_err(to_rpc_error)?;
         let mut store = manager.get_store_info(created_id).map_err(to_rpc_error)?;
@@ -2329,9 +2402,19 @@ impl RpcHandler {
         match config.mode {
             SyncMode::Sync => self.ensure_link_started(store_id, config.remote).await,
             SyncMode::Vault => match config.vault_key_id {
-                Some(key_id) => self.ensure_vault_link_started(store_id, config.remote.url, key_id).await,
+                Some(key_id) => self.ensure_vault_link_started(store_id, LinkEndpoint::Remote(config.remote.url), key_id).await,
                 None => warn!(
                     "store {} sync.json has mode: vault but no vault_key_id; not starting a vault link",
+                    store_id
+                ),
+            },
+            // Shared from this computer (docs/RELAY_CONTRACT.md): the same
+            // vault link, to this process's own relay face. `remote.url` is
+            // not where it connects: the face's port is new every run.
+            SyncMode::Relay => match config.vault_key_id {
+                Some(key_id) => self.ensure_vault_link_started(store_id, LinkEndpoint::RelayFace, key_id).await,
+                None => warn!(
+                    "store {} sync.json has mode: relay but no vault_key_id; not starting its link",
                     store_id
                 ),
             },
@@ -2538,6 +2621,7 @@ impl PimbleApiServer for RpcHandler {
 
         let manager = self.store_manager.read().await;
         let docs = manager.vault_list_docs(request.store_id).map_err(to_rpc_error)?;
+        let epoch = manager.vault_epoch(request.store_id).ok();
         // A scoped member is listed its scope and nothing else: the list is
         // how a recipient's replica learns which documents exist at all.
         let scope = scope_roots_of(&principal, request.store_id, Access::Read).map(|roots| scope_set(&manager, request.store_id, &roots));
@@ -2556,6 +2640,7 @@ impl PimbleApiServer for RpcHandler {
                     Some(VaultDocInfo { doc_id, head: doc.head, snapshot_seq: doc.snapshot_seq, dek_id: doc.dek_id })
                 })
                 .collect(),
+            epoch,
         })
     }
 
@@ -2577,6 +2662,8 @@ impl PimbleApiServer for RpcHandler {
             .sign_in(request.url.clone(), login.user.email.clone(), login.user.id.clone(), login.session.clone(), &account_keys)
             .await
             .map_err(to_rpc_error)?;
+        // A tunnel to the relay is opened with the account's session.
+        self.relay.account_changed(self).await;
 
         Ok(EmptyResponse {})
     }
@@ -2585,6 +2672,8 @@ impl PimbleApiServer for RpcHandler {
         authorize_service_only(&principal_of(ext), "cloudSignOut")?;
         info!("Signing out of Pimble Cloud");
         self.keystore.sign_out().await.map_err(to_rpc_error)?;
+        // Nothing is served to anyone on a session that was given up.
+        self.relay.account_changed(self).await;
         Ok(EmptyResponse {})
     }
 
@@ -2600,6 +2689,13 @@ impl PimbleApiServer for RpcHandler {
         authorize_service_only(&principal_of(ext), "cloudHostStore")?;
         let store_id = request.store_id;
         info!("Hosting store {} on Pimble Cloud", store_id);
+
+        // Shared from this computer: its record on the accounts service says
+        // `relay`, and its link is to the twin on this machine. One or the
+        // other, and the person says which.
+        if self.link_kind_of(store_id).await.1 == RelaySide::Owner {
+            return Err(to_rpc_error(crate::relay_face::RELAYED_LINK_REFUSAL));
+        }
 
         let account = self.keystore.account().await.ok_or_else(|| to_rpc_error("no Pimble Cloud account is signed in"))?;
 
@@ -2628,16 +2724,33 @@ impl PimbleApiServer for RpcHandler {
         self.keystore.add_store_key(store_id, key_id, &key).await.map_err(to_rpc_error)?;
 
         let rpc_url = self.link_hosted_store(store_id, &account, key_id, &crate::cloud::HeldAs::owner()).await?;
-        self.ensure_vault_link_started(store_id, rpc_url, key_id).await;
+        self.ensure_vault_link_started(store_id, LinkEndpoint::Remote(rpc_url), key_id).await;
 
         Ok(CloudHostStoreResponse { store_id })
+    }
+
+    async fn cloud_relay_store(&self, ext: &Extensions, request: CloudRelayStoreRequest) -> Result<CloudRelayStoreResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudRelayStore")?;
+        self.relay_store(request.store_id).await?;
+        Ok(CloudRelayStoreResponse { store_id: request.store_id })
+    }
+
+    async fn cloud_stop_relaying(&self, ext: &Extensions, request: CloudStopRelayingRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudStopRelaying")?;
+        self.stop_relaying(request.store_id).await?;
+        Ok(EmptyResponse {})
     }
 
     async fn cloud_list_hosted_stores(&self, ext: &Extensions) -> Result<CloudListHostedStoresResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "cloudListHostedStores")?;
         let account = self.keystore.account().await.ok_or_else(|| to_rpc_error("no Pimble Cloud account is signed in"))?;
         let stores = crate::cloud::list_stores(&account.url, &account.session).await.map_err(to_rpc_error)?;
+        // One id however many rows name the store (a row per grant).
+        let mut relayed: Vec<String> = stores.iter().filter(|s| s.is_relayed()).map(|s| s.store_id.clone()).collect();
+        relayed.sort();
+        relayed.dedup();
         Ok(CloudListHostedStoresResponse {
+            relayed,
             stores: stores
                 .into_iter()
                 .map(|s| CloudHostedStoreInfo {
@@ -2666,7 +2779,17 @@ impl PimbleApiServer for RpcHandler {
         // No row for it (an accounts service that lists nothing): held as
         // it always was, whole and writable.
         let held_as = crate::cloud::HeldAs::from_rows(&rows, store_id).unwrap_or_else(crate::cloud::HeldAs::owner);
-        let name = held_as.name.clone().unwrap_or_else(|| store_id.to_string());
+        // A store shared from its owner's computer has no name on Pimble
+        // Cloud (docs/RELAY_CONTRACT.md), and a store's name is in no
+        // document: held whole (the owner's other device), it is called what
+        // it is until the person renames it here.
+        let name = held_as.name.clone().filter(|name| !name.trim().is_empty()).unwrap_or_else(|| {
+            if rows.iter().any(|row| row.store_id == store_id.to_string() && row.is_relayed()) {
+                RELAYED_PLACEHOLDER_NAME.to_string()
+            } else {
+                store_id.to_string()
+            }
+        });
 
         // Open here already: an error for a whole store, and for a share's
         // replica unless the account has been given another share of the
@@ -2713,10 +2836,11 @@ impl PimbleApiServer for RpcHandler {
             }
             self.stop_vault_link(store_id).await;
             let rpc_url = self.link_hosted_store(store_id, &account, key_id, &held_as).await?;
-            self.ensure_vault_link_started(store_id, rpc_url, key_id).await;
+            self.ensure_vault_link_started(store_id, LinkEndpoint::Remote(rpc_url), key_id).await;
             let mut store = self.store_manager.read().await.get_store_info(store_id).map_err(to_rpc_error)?;
-            store.sync_state = self.sync_state_of(store_id).await;
-            store.sync_mode = StoreKind::Vault;
+            // `Vault`, and relayed or not: `link_hosted_store` has just
+            // written `sync.json`.
+            self.describe_link(&mut store).await;
             self.mark_replica(&mut store);
             return Ok(OpenStoreResponse { store });
         }
@@ -2749,7 +2873,7 @@ impl PimbleApiServer for RpcHandler {
         }
 
         let rpc_url = self.link_hosted_store(created_id, &account, key_id, &held_as).await?;
-        self.ensure_vault_link_started(created_id, rpc_url, key_id).await;
+        self.ensure_vault_link_started(created_id, LinkEndpoint::Remote(rpc_url), key_id).await;
 
         // Wait up to 10s for the first pull to land, same as
         // `addRemoteStore` (`create_replica_from`) does for a plain replica,
@@ -2772,10 +2896,10 @@ impl PimbleApiServer for RpcHandler {
         // (`access`, `shared_by`, `roots`).
         self.adopt_document_root(created_id).await;
         let mut store = self.store_manager.read().await.get_store_info(created_id).map_err(to_rpc_error)?;
-        store.sync_state = sync_state;
         // Always `Vault`: `link_hosted_store` above just wrote `sync.json`
-        // with `mode: "vault"`.
-        store.sync_mode = StoreKind::Vault;
+        // with `mode: "vault"`, and with whether the store is relayed.
+        self.describe_link(&mut store).await;
+        store.sync_state = sync_state;
         self.mark_replica(&mut store);
 
         Ok(OpenStoreResponse { store })
@@ -3007,8 +3131,7 @@ impl PimbleApiServer for RpcHandler {
             store.root_node_id = root;
         }
 
-        store.sync_state = self.sync_state_of(store_id).await;
-        store.sync_mode = self.sync_mode_of(store_id).await;
+        self.describe_link(&mut store).await;
         self.mark_replica(&mut store);
 
         Ok(OpenStoreResponse { store })
@@ -3025,6 +3148,12 @@ impl PimbleApiServer for RpcHandler {
         self.stop_link(request.store_id).await;
         self.stop_vault_link(request.store_id).await;
         self.shares.forget_store(request.store_id);
+        // Shared from this computer (docs/RELAY_CONTRACT.md): a store that is
+        // closed here is withdrawn from the relay and its twin closed with
+        // it. Members are told `owner offline` until it is open again.
+        if self.relay.is_relaying(request.store_id).await {
+            self.relay.withdraw(request.store_id, false).await;
+        }
         // Decision 5: a closing store's mounts are no longer this server's
         // to report on. Its entries as a mount *source* stay — the next
         // resolution reopens it.
@@ -3061,7 +3190,7 @@ impl PimbleApiServer for RpcHandler {
         for id in store_ids {
             if let Ok(mut store) = manager.get_store_info(id) {
                 store.sync_state = self.sync_state_of(id).await;
-                store.sync_mode = self.sync_mode_of(id).await;
+                (store.sync_mode, store.relay) = self.link_kind_of_locked(&manager, id).await;
                 self.mark_replica(&mut store);
                 Self::present_store_to(&principal, &mut store);
                 stores.push(store);
@@ -3617,6 +3746,13 @@ impl PimbleApiServer for RpcHandler {
         authorize_service_only(&principal_of(ext), "setStoreSync")?;
         info!("Setting sync for store {}: {:?}", request.store_id, request.remote.as_ref().map(|r| &r.url));
 
+        // A store shared from this computer has a twin on this machine, a
+        // record on the accounts service and a place in the tunnel, none of
+        // which unlinking or linking elsewhere would take down.
+        if self.link_kind_of(request.store_id).await.1 == RelaySide::Owner {
+            return Err(to_rpc_error(crate::relay_face::RELAYED_LINK_REFUSAL));
+        }
+
         match request.remote {
             Some(remote) => {
                 // Refuse if the remote has no store with this id.
@@ -3652,7 +3788,7 @@ impl PimbleApiServer for RpcHandler {
 
                 let manager = self.store_manager.read().await;
                 manager
-                    .write_sync_config(request.store_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None, mode: pimble_store::SyncMode::Sync, last_seq: Default::default(), vault_key_id: None, access: StoreAccess::Full, shared_by: None, read_only_roots: Vec::new() })
+                    .write_sync_config(request.store_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None, mode: pimble_store::SyncMode::Sync, via_relay: false, last_seq: Default::default(), vault_key_id: None, access: StoreAccess::Full, shared_by: None, read_only_roots: Vec::new() })
                     .await
                     .map_err(to_rpc_error)?;
                 drop(manager);
@@ -3689,11 +3825,11 @@ impl PimbleApiServer for RpcHandler {
             .map(|c| Self::without_auth(&c.remote));
         drop(manager);
         let state = self.sync_state_of(request.store_id).await;
-        let sync_mode = self.sync_mode_of(request.store_id).await;
+        let (sync_mode, relay) = self.link_kind_of(request.store_id).await;
 
         // `Service` only, and a store just linked or unlinked this way is
         // held whole: `sync.json` says `full` or is gone.
-        Ok(GetStoreSyncResponse { remote: remote_now, state, sync_mode, access: pimble_core::StoreAccess::Full, read_only_roots: Vec::new() })
+        Ok(GetStoreSyncResponse { remote: remote_now, state, sync_mode, access: pimble_core::StoreAccess::Full, read_only_roots: Vec::new(), relay })
     }
 
     async fn get_store_sync(
@@ -3715,9 +3851,9 @@ impl PimbleApiServer for RpcHandler {
         drop(manager);
         Self::present_store_to(&principal, &mut store);
         let state = self.sync_state_of(request.store_id).await;
-        let sync_mode = self.sync_mode_of(request.store_id).await;
+        let (sync_mode, relay) = self.link_kind_of(request.store_id).await;
 
-        Ok(GetStoreSyncResponse { remote, state, sync_mode, access: store.access, read_only_roots: store.read_only_roots })
+        Ok(GetStoreSyncResponse { remote, state, sync_mode, access: store.access, read_only_roots: store.read_only_roots, relay })
     }
 
     async fn list_remote_stores(
