@@ -81,6 +81,9 @@ twin to documents under a share is a later optimisation.
     on the tunnel itself.
   - Limits: 64 member connections per tunnel, 16 tunnels per account; over a limit is a
     refusal, not a queue.
+  - Keepalive: the platform edge reaps an upgraded connection after 600 s without a byte
+    in either direction, so the relay pings every tunnel and every member connection
+    every 30 s and closes one that has not answered in 90 s; the tunnel client pings too.
 - The relay never writes anything about a connection to the database, and logs store ids
   and counts only.
 
