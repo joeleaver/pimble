@@ -1,5 +1,16 @@
 # Pimble - Personal Information Manager Architecture
 
+> **On branch `node-document` (2026-09-21) parts of this document describe the design it
+> replaces.** A store no longer has a store document: every node is one yrs document
+> (`pimble_crdt::NodeDoc`: content, fields, children, plugin data) and the tree is the graph
+> of those documents (`pimble_crdt::Tree`). Wherever this file says `StoreDocument`,
+> `ContentDoc`, `store.yrs`, `applyStoreUpdate`, `syncStoreDocument` or `syncNodeContents`,
+> read `docs/NODE_DOCUMENT_CONTRACT.md` (sections 1 to 4) and the "Current design" section
+> of `CLAUDE.md` instead: `applyEdit` carries an update of any part of a node's document,
+> `syncNodes` is the one reconcile, repair runs over the documents. Mounts, replica links,
+> hardening, search and the cloud sections stand as written. Rewriting the affected
+> sections here is an open follow-up (`docs/NEXT_SESSION.md`).
+
 ## Overview
 
 Pimble is an offline-first personal information manager with:
