@@ -72,7 +72,7 @@ twin to documents under a share is a later optimisation.
     store: close with code 4404 and reason `owner offline`. Otherwise the relay opens a
     virtual connection over the tunnel and pipes WebSocket messages both ways, closing
     the member's socket when the token expires. It buffers nothing beyond what is in
-    flight; a slow side applies backpressure to the other; a message over 8 MiB closes
+    flight; a slow side applies backpressure to the other; a message over 16 MiB (above the 10 MiB a Pimble server itself accepts, so the relay is never the stricter of the two) closes
     the virtual connection.
   - **Tunnel framing** (binary WebSocket messages, owner tunnel only):
     `[conn: u32 BE][kind: u8][payload]`, kinds `1 open` (relay to owner; payload is the

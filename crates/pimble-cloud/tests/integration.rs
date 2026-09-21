@@ -43,6 +43,15 @@ impl pimble_cloud::mail::Mailer for FailingMailer {
 
 // ── Harness ──────────────────────────────────────────────────────────────
 
+/// The development signing seed every test stack runs with: fixed and
+/// non-secret, so a test can verify a minted token against the served JWKS,
+/// and a relay test can sign a token of its own (one that expires in two
+/// seconds, say) that the service will accept as its own.
+const DEV_SIGNING_SEED_HEX: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+/// `public_url` of every test stack — a fake host, see `spawn_stack_inner`.
+const PUBLIC_URL: &str = "http://cloud.test";
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
@@ -289,31 +298,39 @@ impl Drop for Stack {
 }
 
 pub async fn spawn_stack() -> Option<Stack> {
-    spawn_stack_inner(None, None, None).await
+    spawn_stack_inner(None, None, None, None).await
 }
 
 pub async fn spawn_stack_with_releases_base_url(releases_base_url: Option<String>) -> Option<Stack> {
-    spawn_stack_inner(releases_base_url, None, None).await
+    spawn_stack_inner(releases_base_url, None, None, None).await
+}
+
+/// Like [`spawn_stack`], but with the relay's limits and timings lowered
+/// (docs/RELAY_CONTRACT.md's are 64 connections, 16 tunnels, 16 MiB, 30 s and
+/// 90 s), so a test can reach one in a moment and with a handful of sockets.
+pub async fn spawn_stack_with_relay_limits(limits: pimble_cloud::relay::RelayLimits) -> Option<Stack> {
+    spawn_stack_inner(None, None, None, Some(limits)).await
 }
 
 /// Like [`spawn_stack`], but with `mailer` in place of the `LogMailer`
 /// every other test gets — for covering how a mail-provider failure is
 /// handled (`pimble_cloud::build_state_with_mailer`).
 pub async fn spawn_stack_with_mailer(mailer: std::sync::Arc<dyn pimble_cloud::mail::Mailer>) -> Option<Stack> {
-    spawn_stack_inner(None, Some(mailer), None).await
+    spawn_stack_inner(None, Some(mailer), None, None).await
 }
 
 /// Like [`spawn_stack`], but with a lowered "members plus invitations per
 /// store" cap (docs/SHARING_CONTRACT.md's fifty), so a test can reach it
 /// without fifty accounts.
 pub async fn spawn_stack_with_members_cap(cap: usize) -> Option<Stack> {
-    spawn_stack_inner(None, None, Some(cap)).await
+    spawn_stack_inner(None, None, Some(cap), None).await
 }
 
 async fn spawn_stack_inner(
     releases_base_url: Option<String>,
     mailer_override: Option<std::sync::Arc<dyn pimble_cloud::mail::Mailer>>,
     members_cap: Option<usize>,
+    relay_limits: Option<pimble_cloud::relay::RelayLimits>,
 ) -> Option<Stack> {
     // The ONLY skip condition: no rhypedb-server binary exists anywhere we
     // know to look. A binary that exists but fails to start (even after
@@ -344,7 +361,7 @@ async fn spawn_stack_inner(
     // A fixed, non-secret development seed: deterministic within a test run
     // so a test can verify a minted token's signature against the JWKS this
     // same process serves.
-    let dev_seed = "aa".repeat(32);
+    let dev_seed = DEV_SIGNING_SEED_HEX.to_string();
 
     let config = pimble_cloud::config::Config {
         port: 0,
@@ -359,7 +376,7 @@ async fn spawn_stack_inner(
         // full verify link against this address — they pull the `token`
         // query parameter out of it and hit `stack.base_url` (the real
         // bound address) directly. See `extract_verify_token`.
-        public_url: "http://cloud.test".to_string(),
+        public_url: PUBLIC_URL.to_string(),
         github_repo: "joeleaver/pimble".to_string(),
         releases_base_url,
         // No RESEND_API_KEY: every test runs against `LogMailer`, which is
@@ -374,6 +391,8 @@ async fn spawn_stack_inner(
         // exists exactly so a test can lower it — see
         // `store_member_cap_refuses_one_too_many`.
         max_members_per_store: members_cap.unwrap_or(pimble_cloud::config::DEFAULT_MAX_MEMBERS_PER_STORE),
+        // The contract's own numbers unless a relay test lowered them.
+        relay: relay_limits.unwrap_or_default(),
     };
 
     let app_state = match mailer_override {
@@ -1319,7 +1338,7 @@ async fn legacy_keyless_users_and_their_sessions_and_grants_are_deleted_at_start
     stack.app_state.db.create_session(legacy.rid, &token_hash, expires_at_ms).await.unwrap();
 
     let hosted =
-        stack.app_state.db.create_hosted_store(&uuid::Uuid::new_v4().to_string(), "Legacy's Store", "legacy.pimble", "plain").await.unwrap();
+        stack.app_state.db.create_hosted_store(&uuid::Uuid::new_v4().to_string(), "Legacy's Store", "legacy.pimble", "plain", "hosted").await.unwrap();
     stack.app_state.db.create_grant(legacy.rid, hosted.rid, &hosted.store_id, "owner", "", "").await.unwrap();
 
     // A fresh `build_state` against the exact same rhypedb-server and
@@ -2578,6 +2597,10 @@ async fn old_rows_read_without_error_and_as_whole_store_grants() {
     assert!(row["root"].is_null());
     assert_eq!(row["kind"], "vault");
     assert!(row.get("share").is_none(), "the dead field is never echoed back: {row}");
+    // That row predates `tier` too (docs/RELAY_CONTRACT.md): a store recorded
+    // before the relay tier existed is a hosted one.
+    assert_eq!(hosted.tier, "hosted", "an absent `tier` reads as hosted, not an error");
+    assert_eq!(row["tier"], "hosted");
 
     // ...and the token it mints is the plain string form.
     assert_eq!(token_stores_claim(&stack, &cookie).await[&store_id], "owner");
@@ -3169,4 +3192,938 @@ async fn a_scoped_row_without_a_name_is_shown_as_shared_folder() {
     assert_eq!(row["name"], "Shared folder");
     assert_eq!(row["root"], root);
     assert_eq!(members_body(&stack, &member_cookie, &store_id, Some(&root)).await["share_name"], "Shared folder");
+}
+
+// ── The relay tier (docs/RELAY_CONTRACT.md, "Accounts service") ──────────
+
+/// A fresh store id, as the owner's device would send for a store it already
+/// has.
+fn store_uuid() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// `POST /stores` for a relayed store, the way the desktop sends it: the
+/// store's own id, `kind: "vault"`, and the empty string for a name.
+async fn create_relayed_store(stack: &Stack, cookie: &str) -> String {
+    let store_id = store_uuid();
+    let store = create_store_with_body(stack, cookie, json!({ "name": "", "kind": "vault", "store_id": store_id, "tier": "relay" })).await;
+    assert_eq!(store["store_id"], store_id.as_str());
+    assert_eq!(store["tier"], "relay");
+    store_id
+}
+
+async fn post_store(stack: &Stack, cookie: &str, body: Value) -> reqwest::Response {
+    stack.http.post(format!("{}/stores", stack.base_url)).header("Cookie", cookie).json(&body).send().await.unwrap()
+}
+
+/// The whole `POST /token` body, not just the token.
+async fn token_response(stack: &Stack, cookie: &str) -> Value {
+    let resp = stack.http.post(format!("{}/token", stack.base_url)).header("Cookie", cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    resp.json().await.unwrap()
+}
+
+async fn mint_jwt(stack: &Stack, cookie: &str) -> String {
+    token_response(stack, cookie).await["token"].as_str().expect("a minted token").to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_tier_round_trips_and_is_recorded_as_sent() {
+    let stack = skip_without_rhypedb!();
+    let (_body, cookie) = signup_verify_login(&stack, "tier-owner@example.com", "tier owner password!!").await;
+
+    let relayed = create_relayed_store(&stack, &cookie).await;
+    let hosted = create_store_with_body(&stack, &cookie, json!({ "name": "Hosted Notes", "kind": "vault" })).await;
+    assert_eq!(hosted["tier"], "hosted", "no `tier` in the request is a hosted store, as it always was");
+    let hosted_id = hosted["store_id"].as_str().unwrap().to_string();
+
+    let rows = list_stores(&stack, &cookie).await;
+    let relayed_row = rows.iter().find(|s| s["store_id"] == relayed.as_str()).expect("the relayed store lists");
+    assert_eq!(relayed_row["tier"], "relay");
+    assert_eq!(relayed_row["kind"], "vault");
+    assert_eq!(relayed_row["role"], "owner", "the owner's grant is the same as for a hosted store");
+    assert_eq!(relayed_row["name"], "", "the name is what was sent: nothing, and no placeholder in its place");
+    assert_eq!(rows.iter().find(|s| s["store_id"] == hosted_id.as_str()).unwrap()["tier"], "hosted");
+
+    // What the database holds for it: the id, the tier, and no name or
+    // directory at all.
+    let row = stack.app_state.db.find_hosted_store(&relayed).await.unwrap().unwrap();
+    assert_eq!(row.tier, "relay");
+    assert!(row.is_relayed());
+    assert_eq!(row.name, "");
+
+    // A relayed store is somebody's existing store, served as a vault.
+    let resp = post_store(&stack, &cookie, json!({ "name": "", "kind": "vault", "tier": "relay" })).await;
+    assert_eq!(resp.status(), 400, "no store_id: there is nothing for the record to be of");
+    let resp = post_store(&stack, &cookie, json!({ "name": "", "store_id": store_uuid(), "tier": "relay" })).await;
+    assert_eq!(resp.status(), 400, "kind defaults to plain, which cannot be relayed");
+    // An empty name is for the relay tier only.
+    let resp = post_store(&stack, &cookie, json!({ "name": "", "kind": "vault", "store_id": store_uuid() })).await;
+    assert_eq!(resp.status(), 400, "a hosted store still needs a name");
+    // A name that is sent is still kept to one line and bounded.
+    let resp = post_store(&stack, &cookie, json!({ "name": "x".repeat(201), "kind": "vault", "store_id": store_uuid(), "tier": "relay" })).await;
+    assert_eq!(resp.status(), 400);
+    // An id that is already somebody's live store is refused, in either tier.
+    let resp = post_store(&stack, &cookie, json!({ "name": "", "kind": "vault", "store_id": relayed, "tier": "relay" })).await;
+    assert_eq!(resp.status(), 409);
+    let resp = post_store(&stack, &cookie, json!({ "name": "Again", "kind": "vault", "store_id": relayed })).await;
+    assert_eq!(resp.status(), 409);
+}
+
+/// "Stop sharing from this computer" deletes the record; the same store can
+/// be relayed again, or hosted instead, under the same id — and nothing that
+/// named the old record comes back with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relayed_store_can_be_recorded_again_after_it_was_deleted() {
+    let stack = skip_without_rhypedb!();
+    let (_owner_body, owner_cookie) = signup_verify_login(&stack, "again-owner@example.com", "again owner password!!").await;
+    let member_email = "again-member@example.com";
+    let (_member_body, member_cookie) = signup_verify_login(&stack, member_email, "again member password!!").await;
+
+    let store_id = create_relayed_store(&stack, &owner_cookie).await;
+    let resp = put_member_with(&stack, &owner_cookie, &store_id, json!({ "email": member_email, "role": "editor", "root": node_id(), "name": "Recipes" })).await;
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+    assert!(list_stores(&stack, &member_cookie).await.iter().any(|s| s["store_id"] == store_id.as_str()));
+
+    let resp = stack.http.delete(format!("{}/stores/{store_id}", stack.base_url)).header("Cookie", &owner_cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(list_stores(&stack, &owner_cookie).await.iter().all(|s| s["store_id"] != store_id.as_str()));
+
+    // Relayed again.
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "", "kind": "vault", "store_id": store_id, "tier": "relay" })).await;
+    assert_eq!(store["tier"], "relay");
+    assert_eq!(store["role"], "owner");
+    assert!(
+        list_stores(&stack, &member_cookie).await.iter().all(|s| s["store_id"] != store_id.as_str()),
+        "the share that was stopped stays stopped: the old member holds nothing on the new record"
+    );
+    assert!(token_stores_claim(&stack, &member_cookie).await.get(&store_id).is_none());
+
+    // And the other way out: stop relaying it, host it instead.
+    let resp = stack.http.delete(format!("{}/stores/{store_id}", stack.base_url)).header("Cookie", &owner_cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Hosted Now", "kind": "vault", "store_id": store_id })).await;
+    assert_eq!(store["tier"], "hosted");
+    assert_eq!(store["name"], "Hosted Now");
+    let rows = list_stores(&stack, &owner_cookie).await;
+    assert_eq!(rows.iter().filter(|s| s["store_id"] == store_id.as_str()).count(), 1, "one row, the same one: {rows:?}");
+}
+
+/// Waits until nothing listens at `addr` any more.
+async fn wait_until_refusing(addr: std::net::SocketAddr) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::net::TcpStream::connect(addr).await.is_ok() {
+        assert!(tokio::time::Instant::now() < deadline, "the hosted Pimble server at {addr} is still accepting connections");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// "Nothing is hosted unless the person asked for it": recording, sharing,
+/// keying and deleting a relayed store never call the hosted Pimble server.
+/// Shown twice over: with the hosted server up, it never hears of the store;
+/// and with it gone — refusing connections, which a hosted-tier create cannot
+/// survive — every one of those still succeeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relayed_store_never_touches_the_hosted_server() {
+    let mut stack = skip_without_rhypedb!();
+    let owner_email = "unhosted-owner@example.com";
+    let (_signup_body, owner_keys) = signup_with_material(&stack, owner_email, "unhosted owner password!!").await;
+    let (owner_body, owner_cookie) = verify_then_login(&stack, owner_email, "unhosted owner password!!").await;
+    let owner_id = owner_body["user"]["id"].as_str().unwrap().to_string();
+    let member_email = "unhosted-member@example.com";
+    signup_verify_login(&stack, member_email, "unhosted member password!!").await;
+
+    // With the hosted server up and listening: it is never told.
+    let first = create_relayed_store(&stack, &owner_cookie).await;
+    let pimble_client = pimble_client::PimbleClient::connect_with_auth(
+        format!("http://{}", stack.pimble_server.addr()),
+        &pimble_core::AuthMethod::Bearer { token: stack.service_token.clone() },
+    )
+    .await
+    .unwrap();
+    let open_stores = pimble_client.list_stores().await.unwrap();
+    assert!(open_stores.iter().all(|s| s.id.as_uuid().to_string() != first), "the hosted server must not have the relayed store");
+    assert_eq!(std::fs::read_dir(stack._stores_dir.path()).unwrap().count(), 0, "nothing was created in the hosted stores directory");
+    drop(pimble_client);
+
+    // Now take the hosted server away altogether.
+    let hosted_addr = stack.pimble_server.addr();
+    stack.pimble_server.stop().await.unwrap();
+    wait_until_refusing(hosted_addr).await;
+    let resp = post_store(&stack, &owner_cookie, json!({ "name": "Wants Hosting", "kind": "vault" })).await;
+    assert_eq!(resp.status(), 500, "the control: a hosted-tier create needs the hosted server, which is gone");
+
+    let store_id = create_relayed_store(&stack, &owner_cookie).await;
+
+    let root = node_id();
+    let resp = put_member_with(&stack, &owner_cookie, &store_id, json!({ "email": member_email, "role": "editor", "root": root, "name": "Recipes" })).await;
+    assert_eq!(resp.status(), 200, "sharing a relayed store: {:?}", resp.text().await);
+    assert_eq!(list_members_at(&stack, &owner_cookie, &store_id, Some(&root)).await.len(), 1);
+
+    let key_id = uuid::Uuid::new_v4();
+    let envelope = wrap_store_key(&pimble_crypto::SymmetricKey::generate(), key_id, &store_id, &owner_keys, &owner_keys.public_keys());
+    let resp = put_keys(&stack, &owner_cookie, &store_id, json!([{ "user_id": owner_id, "key_id": key_id.to_string(), "envelope": envelope }])).await;
+    assert_eq!(resp.status(), 200, "key envelopes for a relayed store: {:?}", resp.text().await);
+    assert_eq!(keys_response(&stack, &owner_cookie, &store_id, None).await.status(), 200);
+
+    let resp = stack.http.delete(format!("{}/stores/{store_id}/members/{}", stack.base_url, "nobody")).header("Cookie", &owner_cookie).send().await.unwrap();
+    assert_ne!(resp.status(), 500, "removing a member never reaches for the hosted server either");
+
+    let resp = stack.http.delete(format!("{}/stores/{store_id}", stack.base_url)).header("Cookie", &owner_cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "deleting a relayed store");
+    assert!(list_stores(&stack, &owner_cookie).await.iter().all(|s| s["store_id"] != store_id.as_str()));
+}
+
+/// `POST /token` says where each relayed store is reached — to everyone who
+/// holds anything on it, and to nobody else — and the token itself is what it
+/// always was.
+#[tokio::test(flavor = "multi_thread")]
+async fn token_lists_relayed_stores_with_the_relay_url() {
+    let stack = skip_without_rhypedb!();
+    let (_owner_body, owner_cookie) = signup_verify_login(&stack, "endpoint-owner@example.com", "endpoint owner password!!").await;
+    let scoped_email = "endpoint-scoped@example.com";
+    let (_scoped_body, scoped_cookie) = signup_verify_login(&stack, scoped_email, "endpoint scoped password!!").await;
+    let whole_email = "endpoint-whole@example.com";
+    let (_whole_body, whole_cookie) = signup_verify_login(&stack, whole_email, "endpoint whole password!!").await;
+    let (_stranger_body, stranger_cookie) = signup_verify_login(&stack, "endpoint-stranger@example.com", "endpoint stranger password!!").await;
+
+    // Nothing relayed yet: the field is there and empty.
+    assert_eq!(token_response(&stack, &owner_cookie).await["stores"], json!([]));
+
+    let relayed = create_relayed_store(&stack, &owner_cookie).await;
+    let hosted = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Hosted", "kind": "vault" })).await;
+    let hosted_id = hosted["store_id"].as_str().unwrap().to_string();
+    let (first, second) = (node_id(), node_id());
+    for root in [&first, &second] {
+        let resp = put_member_with(&stack, &owner_cookie, &relayed, json!({ "email": scoped_email, "role": "reader", "root": root, "name": "A Folder" })).await;
+        assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+    }
+    assert_eq!(put_member(&stack, &owner_cookie, &relayed, whole_email, "editor").await.status(), 200);
+    assert_eq!(put_member(&stack, &owner_cookie, &hosted_id, whole_email, "editor").await.status(), 200);
+
+    let expected = json!([{ "store_id": relayed, "rpc_url": format!("ws://cloud.test/api/v1/relay/{relayed}") }]);
+    let owner = token_response(&stack, &owner_cookie).await;
+    assert_eq!(owner["stores"], expected, "the owner, and only the relayed store: the hosted one is on rpc_url");
+    assert!(owner["rpc_url"].as_str().unwrap().ends_with("/rpc"));
+    assert_eq!(token_response(&stack, &scoped_cookie).await["stores"], expected, "two shares of one store are one endpoint");
+    assert_eq!(token_response(&stack, &whole_cookie).await["stores"], expected);
+    assert_eq!(token_response(&stack, &stranger_cookie).await["stores"], json!([]), "a stranger learns of no relayed store");
+
+    // The token's claims did not change shape for any of it.
+    let jwks: Value = stack.http.get(format!("{}/.well-known/jwks.json", stack.base_url)).send().await.unwrap().json().await.unwrap();
+    let payload = verify_and_decode(owner["token"].as_str().unwrap(), &jwks);
+    let claim_keys: Vec<&String> = payload["claims"].as_object().unwrap().keys().collect();
+    assert_eq!(claim_keys, ["email", "stores"], "the JWT's claims are what they were before the relay tier");
+    assert_eq!(payload["claims"]["stores"][&relayed], "owner");
+
+    // Deleted, it is named nowhere.
+    let resp = stack.http.delete(format!("{}/stores/{relayed}", stack.base_url)).header("Cookie", &owner_cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(token_response(&stack, &scoped_cookie).await["stores"], json!([]));
+}
+
+// ── The relay itself, end to end over real WebSockets ─────────────────────
+
+use futures::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+const KIND_OPEN: u8 = 1;
+const KIND_TEXT: u8 = 2;
+const KIND_CLOSE: u8 = 3;
+
+/// How long any one step of a relay test may take before it is a failure
+/// rather than a hang.
+const STEP: Duration = Duration::from_secs(15);
+
+fn relay_url(stack: &Stack) -> String {
+    format!("{}/relay", stack.base_url.replacen("http://", "ws://", 1))
+}
+
+/// A WebSocket handshake with whatever headers the test wants: `Ok` with the
+/// socket, or `Err` with the HTTP status the upgrade was refused with.
+async fn ws_connect(url: &str, headers: &[(&'static str, String)]) -> Result<Ws, u16> {
+    let mut request = url.into_client_request().unwrap();
+    for (name, value) in headers {
+        request.headers_mut().insert(*name, value.parse().unwrap());
+    }
+    match tokio::time::timeout(STEP, tokio_tungstenite::connect_async(request)).await.expect("the handshake should not hang") {
+        Ok((ws, _response)) => Ok(ws),
+        Err(tungstenite::Error::Http(response)) => Err(response.status().as_u16()),
+        Err(other) => panic!("the WebSocket handshake failed without an HTTP answer: {other}"),
+    }
+}
+
+/// The owner's tunnel: the session as a bearer header, as a Pimble server
+/// sends it.
+async fn open_tunnel(stack: &Stack, session: &str) -> Ws {
+    ws_connect(&relay_url(stack), &[("authorization", format!("Bearer {session}"))]).await.expect("the owner's tunnel should open")
+}
+
+/// Sends `{"serve": [...]}` and returns what came back as `serving`. An
+/// announce that withdraws a store closes that store's members, and their
+/// `close` frames may reach the tunnel on either side of the answer, so any
+/// that come first are stepped over.
+async fn announce(tunnel: &mut Ws, stores: &[&str]) -> Vec<String> {
+    tunnel.send(WsMessage::Text(json!({ "serve": stores }).to_string())).await.unwrap();
+    let text = loop {
+        match next_message(tunnel).await {
+            Some(WsMessage::Text(text)) => break text,
+            Some(WsMessage::Binary(bytes)) if bytes.len() == 5 && bytes[4] == KIND_CLOSE => continue,
+            other => panic!("expected `serving`, got {other:?}"),
+        }
+    };
+    let answer: Value = serde_json::from_str(&text).expect("`serving` is JSON");
+    answer["serving"].as_array().expect("a `serving` list").iter().map(|s| s.as_str().unwrap().to_string()).collect()
+}
+
+/// A `serving` list of exactly one store.
+fn only(store_id: &str) -> Vec<String> {
+    vec![store_id.to_string()]
+}
+
+/// A member's connection with the JWT in the query string, as a browser does.
+async fn connect_member(stack: &Stack, store_id: &str, jwt: &str) -> Result<Ws, u16> {
+    ws_connect(&format!("{}/{store_id}?access_token={jwt}", relay_url(stack)), &[]).await
+}
+
+/// The next message that is not keepalive traffic, or `None` when the socket
+/// ended without one.
+async fn next_message(ws: &mut Ws) -> Option<WsMessage> {
+    loop {
+        match tokio::time::timeout(STEP, ws.next()).await.expect("waiting for a message should not hang") {
+            Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => continue,
+            Some(Ok(message)) => return Some(message),
+            Some(Err(_)) | None => return None,
+        }
+    }
+}
+
+async fn next_text(ws: &mut Ws) -> String {
+    match next_message(ws).await {
+        Some(WsMessage::Text(text)) => text,
+        other => panic!("expected a text message, got {other:?}"),
+    }
+}
+
+/// The next tunnel frame, split into `(conn, kind, payload)`.
+async fn next_frame(tunnel: &mut Ws) -> (u32, u8, Vec<u8>) {
+    match next_message(tunnel).await {
+        Some(WsMessage::Binary(bytes)) => {
+            assert!(bytes.len() >= 5, "a frame is [conn u32][kind u8][payload]");
+            (u32::from_be_bytes(bytes[..4].try_into().unwrap()), bytes[4], bytes[5..].to_vec())
+        }
+        other => panic!("expected a tunnel frame, got {other:?}"),
+    }
+}
+
+fn tunnel_frame(conn: u32, kind: u8, payload: &[u8]) -> WsMessage {
+    let mut bytes = conn.to_be_bytes().to_vec();
+    bytes.push(kind);
+    bytes.extend_from_slice(payload);
+    WsMessage::Binary(bytes)
+}
+
+/// The close frame this socket ends with: `(code, reason)`.
+async fn next_close(ws: &mut Ws) -> (u16, String) {
+    match next_message(ws).await {
+        Some(WsMessage::Close(Some(frame))) => (u16::from(frame.code), frame.reason.to_string()),
+        other => panic!("expected a close frame with a code, got {other:?}"),
+    }
+}
+
+/// The relay's registry empties as the sockets go; give the tasks a moment.
+async fn wait_for_counts(stack: &Stack, expected: pimble_cloud::relay::RelayCounts) {
+    let deadline = tokio::time::Instant::now() + STEP;
+    loop {
+        let counts = stack.app_state.relay.counts();
+        if counts == expected {
+            return;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the relay holds {counts:?}, expected {expected:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A token signed with the test stack's own development key, so the service
+/// takes it for one of its own — with whatever payload the test needs (an
+/// `exp` two seconds away, a wrong audience). `kid` overrides the header's
+/// key id, for a token that names the right key and is signed with another.
+fn craft_jwt(seed_hex: &str, kid: Option<&str>, payload: Value) -> String {
+    use ed25519_dalek::Signer;
+    use sha2::Digest;
+    let seed: [u8; 32] = hex::decode(seed_hex).unwrap().try_into().unwrap();
+    let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let own_kid = hex::encode(&sha2::Sha256::digest(key.verifying_key().as_bytes())[..8]);
+    let header = json!({ "alg": "EdDSA", "typ": "JWT", "kid": kid.unwrap_or(&own_kid) });
+    let signing_input = format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
+    );
+    let signature = key.sign(signing_input.as_bytes());
+    format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+}
+
+fn dev_kid() -> String {
+    use sha2::Digest;
+    let seed: [u8; 32] = hex::decode(DEV_SIGNING_SEED_HEX).unwrap().try_into().unwrap();
+    hex::encode(&sha2::Sha256::digest(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().as_bytes())[..8])
+}
+
+/// The payload of a token this stack would mint for somebody holding `stores`.
+fn jwt_payload(stores: Value, exp_in_secs: i64) -> Value {
+    let now = chrono::Utc::now().timestamp();
+    json!({
+        "iss": format!("{PUBLIC_URL}/api/v1"),
+        "sub": uuid::Uuid::new_v4().to_string(),
+        "aud": "pimble",
+        "iat": now,
+        "exp": now + exp_in_secs,
+        "claims": { "email": "crafted@example.com", "stores": stores },
+    })
+}
+
+/// Everything a relay test starts from: an owner with a relayed store, and
+/// two members of it — one holding a share, one the whole store.
+struct RelayCast {
+    owner_cookie: String,
+    owner_session: String,
+    store_id: String,
+    scoped_jwt: String,
+    whole_jwt: String,
+}
+
+async fn relay_cast(stack: &Stack, tag: &str) -> RelayCast {
+    let (owner_body, owner_cookie) = signup_verify_login(stack, &format!("{tag}-owner@example.com"), "relay owner password!!").await;
+    let owner_session = owner_body["session"].as_str().unwrap().to_string();
+    let scoped_email = format!("{tag}-scoped@example.com");
+    let (_scoped_body, scoped_cookie) = signup_verify_login(stack, &scoped_email, "relay scoped password!!").await;
+    let whole_email = format!("{tag}-whole@example.com");
+    let (_whole_body, whole_cookie) = signup_verify_login(stack, &whole_email, "relay whole password!!").await;
+
+    let store_id = create_relayed_store(stack, &owner_cookie).await;
+    let resp = put_member_with(stack, &owner_cookie, &store_id, json!({ "email": scoped_email, "role": "editor", "root": node_id(), "name": "Shared Folder" })).await;
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+    assert_eq!(put_member(stack, &owner_cookie, &store_id, &whole_email, "reader").await.status(), 200);
+
+    RelayCast {
+        scoped_jwt: mint_jwt(stack, &scoped_cookie).await,
+        whole_jwt: mint_jwt(stack, &whole_cookie).await,
+        owner_cookie,
+        owner_session,
+        store_id,
+    }
+}
+
+/// The whole path: no tunnel is `owner offline`; the tunnel announces and is
+/// told what it serves; two members connect at once and the owner is shown
+/// each one's own token under its own `conn`; text goes both ways to the
+/// right end; a close on either side arrives on the other as a close; and
+/// when it is over the relay holds nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_pipes_two_members_to_the_owner_and_back() {
+    let stack = skip_without_rhypedb!();
+    let cast = relay_cast(&stack, "pipe").await;
+
+    // No tunnel yet: the upgrade succeeds and the answer is the close code.
+    let mut early = connect_member(&stack, &cast.store_id, &cast.scoped_jwt).await.expect("a member with a grant is let in");
+    assert_eq!(next_close(&mut early).await, (4404, "owner offline".to_string()));
+
+    // The owner announces: the relayed store it owns, and four things that
+    // are not that.
+    let hosted = create_store_with_body(&stack, &cast.owner_cookie, json!({ "name": "Hosted", "kind": "vault" })).await;
+    let (_other_body, other_cookie) = signup_verify_login(&stack, "pipe-other-owner@example.com", "other owner password!!").await;
+    let somebody_elses = create_relayed_store(&stack, &other_cookie).await;
+    let mut tunnel = open_tunnel(&stack, &cast.owner_session).await;
+    let serving = announce(
+        &mut tunnel,
+        &[cast.store_id.as_str(), hosted["store_id"].as_str().unwrap(), somebody_elses.as_str(), store_uuid().as_str(), "not an id"],
+    )
+    .await;
+    assert_eq!(serving, only(&cast.store_id), "only a relay-tier store this account owns is served");
+    assert_eq!(stack.app_state.relay.counts(), pimble_cloud::relay::RelayCounts { tunnels: 1, stores: 1, connections: 0 });
+
+    // Somebody else's store was left out, so its members find no owner there.
+    let (_m_body, m_cookie) = signup_verify_login(&stack, "pipe-other-member@example.com", "other member password!!").await;
+    assert_eq!(put_member(&stack, &other_cookie, &somebody_elses, "pipe-other-member@example.com", "reader").await.status(), 200);
+    let mut misdirected = connect_member(&stack, &somebody_elses, &mint_jwt(&stack, &m_cookie).await).await.unwrap();
+    assert_eq!(next_close(&mut misdirected).await.0, 4404, "announcing a store you do not own puts nobody behind your tunnel");
+
+    // Two members at once: one by query parameter, one by bearer header.
+    let mut scoped = connect_member(&stack, &cast.store_id, &cast.scoped_jwt).await.unwrap();
+    let (scoped_conn, kind, payload) = next_frame(&mut tunnel).await;
+    assert_eq!(kind, KIND_OPEN);
+    assert_eq!(String::from_utf8(payload).unwrap(), cast.scoped_jwt, "`open` carries the member's own token for the owner to verify");
+
+    let mut whole = ws_connect(&format!("{}/{}", relay_url(&stack), cast.store_id), &[("authorization", format!("Bearer {}", cast.whole_jwt))])
+        .await
+        .expect("a bearer header is as good as the query parameter");
+    let (whole_conn, kind, payload) = next_frame(&mut tunnel).await;
+    assert_eq!(kind, KIND_OPEN);
+    assert_eq!(String::from_utf8(payload).unwrap(), cast.whole_jwt);
+    assert_ne!(scoped_conn, whole_conn, "each virtual connection has its own id");
+    assert_eq!(stack.app_state.relay.counts().connections, 2);
+
+    // Members to owner, each under its own conn.
+    whole.send(WsMessage::Text(r#"{"from":"whole"}"#.to_string())).await.unwrap();
+    assert_eq!(next_frame(&mut tunnel).await, (whole_conn, KIND_TEXT, br#"{"from":"whole"}"#.to_vec()));
+    scoped.send(WsMessage::Text(r#"{"from":"scoped"}"#.to_string())).await.unwrap();
+    assert_eq!(next_frame(&mut tunnel).await, (scoped_conn, KIND_TEXT, br#"{"from":"scoped"}"#.to_vec()));
+
+    // Owner to members, each to its own socket and no other.
+    tunnel.send(tunnel_frame(scoped_conn, KIND_TEXT, br#"{"to":"scoped"}"#)).await.unwrap();
+    tunnel.send(tunnel_frame(whole_conn, KIND_TEXT, br#"{"to":"whole"}"#)).await.unwrap();
+    tunnel.send(tunnel_frame(scoped_conn, KIND_TEXT, br#"{"to":"scoped","n":2}"#)).await.unwrap();
+    assert_eq!(next_text(&mut scoped).await, r#"{"to":"scoped"}"#);
+    assert_eq!(next_text(&mut scoped).await, r#"{"to":"scoped","n":2}"#);
+    assert_eq!(next_text(&mut whole).await, r#"{"to":"whole"}"#);
+
+    // A frame for a connection that does not exist is dropped, not an error.
+    tunnel.send(tunnel_frame(9_999, KIND_TEXT, b"{}")).await.unwrap();
+
+    // The member closes: the owner is told.
+    scoped.close(None).await.unwrap();
+    assert_eq!(next_frame(&mut tunnel).await, (scoped_conn, KIND_CLOSE, Vec::new()));
+
+    // The owner closes, straight after a last answer: the member gets the
+    // answer and then the close, and the owner is not told what it just said
+    // itself.
+    tunnel.send(tunnel_frame(whole_conn, KIND_TEXT, br#"{"last":"word"}"#)).await.unwrap();
+    tunnel.send(tunnel_frame(whole_conn, KIND_CLOSE, &[])).await.unwrap();
+    assert_eq!(next_text(&mut whole).await, r#"{"last":"word"}"#);
+    assert_eq!(next_close(&mut whole).await.0, 1000);
+    wait_for_counts(&stack, pimble_cloud::relay::RelayCounts { tunnels: 1, stores: 1, connections: 0 }).await;
+
+    // The tunnel goes: a member connected at that moment is closed with it,
+    // and nothing at all is left in the relay.
+    let mut last = connect_member(&stack, &cast.store_id, &cast.scoped_jwt).await.unwrap();
+    let (_conn, kind, _payload) = next_frame(&mut tunnel).await;
+    assert_eq!(kind, KIND_OPEN, "the first frame after the owner's own close is the next open: no close was echoed back");
+    tunnel.close(None).await.unwrap();
+    assert_eq!(next_close(&mut last).await, (4404, "owner offline".to_string()));
+    wait_for_counts(&stack, pimble_cloud::relay::RelayCounts::default()).await;
+}
+
+/// Who is let onto a tunnel, and who is turned away before the owner ever
+/// hears of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_refuses_strangers_before_any_frame_reaches_the_owner() {
+    let stack = skip_without_rhypedb!();
+    let cast = relay_cast(&stack, "gate").await;
+    let (_stranger_body, stranger_cookie) = signup_verify_login(&stack, "gate-stranger@example.com", "gate stranger password!!").await;
+    let stranger_jwt = mint_jwt(&stack, &stranger_cookie).await;
+
+    let mut tunnel = open_tunnel(&stack, &cast.owner_session).await;
+    assert_eq!(announce(&mut tunnel, &[cast.store_id.as_str()]).await, only(&cast.store_id));
+
+    let member_url = format!("{}/{}", relay_url(&stack), cast.store_id);
+    let store = cast.store_id.as_str();
+    let bearer = |jwt: String| [("authorization", format!("Bearer {jwt}"))];
+
+    // A real, valid token that grants nothing on this store.
+    assert_eq!(connect_member(&stack, store, &stranger_jwt).await.err(), Some(403), "a stranger's token");
+    // No credential, garbage, and a real token with its signature tampered.
+    assert_eq!(ws_connect(&member_url, &[]).await.err(), Some(401));
+    assert_eq!(connect_member(&stack, store, "not.a.jwt").await.err(), Some(401));
+    let mut tampered = cast.scoped_jwt.clone();
+    let last = tampered.pop().unwrap();
+    tampered.push(if last == 'A' { 'B' } else { 'A' });
+    assert_eq!(connect_member(&stack, store, &tampered).await.err(), Some(401), "a tampered signature");
+    // A session is not a JWT.
+    assert_eq!(ws_connect(&member_url, &bearer(cast.owner_session.clone())).await.err(), Some(401));
+
+    // Tokens that say the right thing, signed by this stack's key or not.
+    let names_store = json!({ store: "editor" });
+    let good = craft_jwt(DEV_SIGNING_SEED_HEX, None, jwt_payload(names_store.clone(), 600));
+    let foreign_key = craft_jwt(&"bb".repeat(32), None, jwt_payload(names_store.clone(), 600));
+    let forged = craft_jwt(&"bb".repeat(32), Some(&dev_kid()), jwt_payload(names_store.clone(), 600));
+    let expired = craft_jwt(DEV_SIGNING_SEED_HEX, None, jwt_payload(names_store.clone(), -1));
+    let mut wrong_aud = jwt_payload(names_store.clone(), 600);
+    wrong_aud["aud"] = json!("somebody-else");
+    let mut wrong_iss = jwt_payload(names_store.clone(), 600);
+    wrong_iss["iss"] = json!("https://evil.example/api/v1");
+    assert_eq!(connect_member(&stack, store, &foreign_key).await.err(), Some(401), "signed by a key the JWKS does not list");
+    assert_eq!(connect_member(&stack, store, &forged).await.err(), Some(401), "names the right key, signed by another");
+    assert_eq!(connect_member(&stack, store, &expired).await.err(), Some(401), "expired");
+    assert_eq!(connect_member(&stack, store, &craft_jwt(DEV_SIGNING_SEED_HEX, None, wrong_aud)).await.err(), Some(401), "wrong audience");
+    assert_eq!(connect_member(&stack, store, &craft_jwt(DEV_SIGNING_SEED_HEX, None, wrong_iss)).await.err(), Some(401), "wrong issuer");
+    // The claim must name the store with a role, in one of its two shapes.
+    for stores in [json!({}), json!({ store: "superuser" }), json!({ store: { "roots": {} } }), json!({ store_uuid(): "owner" })] {
+        let token = craft_jwt(DEV_SIGNING_SEED_HEX, None, jwt_payload(stores.clone(), 600));
+        assert_eq!(connect_member(&stack, store, &token).await.err(), Some(403), "a claim of {stores} grants nothing here");
+    }
+    assert_eq!(connect_member(&stack, "not-a-store-id", &good).await.err(), Some(400));
+
+    // A browser: only from this service's own origin.
+    assert_eq!(ws_connect(&format!("{member_url}?access_token={good}"), &[("origin", "https://evil.example".to_string())]).await.err(), Some(403));
+
+    // The tunnel is never a browser's, whatever session it brings; and a
+    // session that is not one opens nothing.
+    assert_eq!(
+        ws_connect(&relay_url(&stack), &[("authorization", format!("Bearer {}", cast.owner_session)), ("origin", PUBLIC_URL.to_string())]).await.err(),
+        Some(403),
+        "the tunnel refuses every Origin, this service's own included"
+    );
+    assert_eq!(ws_connect(&relay_url(&stack), &bearer("pmbl_sess_nope".to_string())).await.err(), Some(401));
+    assert_eq!(ws_connect(&relay_url(&stack), &bearer(cast.scoped_jwt.clone())).await.err(), Some(401), "a JWT is not a session");
+
+    // After all of that, the first thing the owner hears is the first member
+    // who was really let in: from the right origin, with the `roots` shape.
+    let scoped_claim = craft_jwt(DEV_SIGNING_SEED_HEX, None, jwt_payload(json!({ store: { "roots": { node_id(): "reader" } } }), 600));
+    let mut browser = ws_connect(&format!("{member_url}?access_token={scoped_claim}"), &[("origin", PUBLIC_URL.to_string())])
+        .await
+        .expect("this service's own origin is a browser running the web app");
+    let (_conn, kind, payload) = next_frame(&mut tunnel).await;
+    assert_eq!(kind, KIND_OPEN, "nothing reached the owner for any refused connection");
+    assert_eq!(String::from_utf8(payload).unwrap(), scoped_claim);
+    assert_eq!(stack.app_state.relay.counts().connections, 1);
+    browser.close(None).await.unwrap();
+}
+
+/// "A later tunnel for the same store replaces the earlier one (the owner
+/// restarted)": the old tunnel's members are closed, the old tunnel with them
+/// once it serves nothing, and members land on the new one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_later_tunnel_replaces_the_earlier_one() {
+    let stack = skip_without_rhypedb!();
+    let cast = relay_cast(&stack, "replace").await;
+    let second_store = create_relayed_store(&stack, &cast.owner_cookie).await;
+    let owner_jwt = mint_jwt(&stack, &cast.owner_cookie).await;
+
+    let mut old = open_tunnel(&stack, &cast.owner_session).await;
+    let mut serving = announce(&mut old, &[cast.store_id.as_str(), second_store.as_str()]).await;
+    serving.sort();
+    let mut both = vec![cast.store_id.clone(), second_store.clone()];
+    both.sort();
+    assert_eq!(serving, both);
+
+    let mut member = connect_member(&stack, &cast.store_id, &cast.scoped_jwt).await.unwrap();
+    let (member_conn, kind, _) = next_frame(&mut old).await;
+    assert_eq!(kind, KIND_OPEN);
+    let mut on_second = connect_member(&stack, &second_store, &owner_jwt).await.unwrap();
+    let (second_conn, kind, _) = next_frame(&mut old).await;
+    assert_eq!(kind, KIND_OPEN);
+
+    // A later tunnel takes one of the two stores.
+    let mut new = open_tunnel(&stack, &cast.owner_session).await;
+    assert_eq!(announce(&mut new, &[cast.store_id.as_str()]).await, only(&cast.store_id));
+    assert_eq!(next_close(&mut member).await, (4404, "owner offline".to_string()), "the old tunnel's member of that store is closed");
+
+    // The old tunnel is still there, so it is told to let go of its end of
+    // that connection; and it still serves the other store, and its member.
+    assert_eq!(next_frame(&mut old).await, (member_conn, KIND_CLOSE, Vec::new()));
+    on_second.send(WsMessage::Text("still here".to_string())).await.unwrap();
+    assert_eq!(next_frame(&mut old).await, (second_conn, KIND_TEXT, b"still here".to_vec()));
+    assert_eq!(stack.app_state.relay.counts(), pimble_cloud::relay::RelayCounts { tunnels: 2, stores: 2, connections: 1 });
+
+    // The member comes back and is on the new tunnel.
+    let mut member = connect_member(&stack, &cast.store_id, &cast.scoped_jwt).await.unwrap();
+    let (conn, kind, _) = next_frame(&mut new).await;
+    assert_eq!(kind, KIND_OPEN);
+    member.send(WsMessage::Text("to the new one".to_string())).await.unwrap();
+    assert_eq!(next_frame(&mut new).await, (conn, KIND_TEXT, b"to the new one".to_vec()));
+
+    // The later tunnel announces again, now with both: the old one serves
+    // nothing any more and is closed, with the member it still had.
+    let mut serving = announce(&mut new, &[cast.store_id.as_str(), second_store.as_str()]).await;
+    serving.sort();
+    assert_eq!(serving, both);
+    assert_eq!(next_close(&mut on_second).await.0, 4404);
+    assert_eq!(next_close(&mut old).await, (4409, "replaced by a later tunnel".to_string()));
+    wait_for_counts(&stack, pimble_cloud::relay::RelayCounts { tunnels: 1, stores: 2, connections: 1 }).await;
+
+    // Announcing less withdraws the rest: its members are closed, the tunnel
+    // and its other store are untouched.
+    assert_eq!(announce(&mut new, &[second_store.as_str()]).await, only(&second_store));
+    assert_eq!(next_close(&mut member).await.0, 4404);
+    let mut late = connect_member(&stack, &cast.store_id, &cast.scoped_jwt).await.unwrap();
+    assert_eq!(next_close(&mut late).await.0, 4404, "a withdrawn store is behind nothing");
+    wait_for_counts(&stack, pimble_cloud::relay::RelayCounts { tunnels: 1, stores: 1, connections: 0 }).await;
+}
+
+/// "A message over 16 MiB closes the virtual connection" — that one, in
+/// whichever direction the message was going, and nothing else on the tunnel.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_message_closes_only_that_virtual_connection() {
+    const LIMIT: usize = 64 * 1024;
+    let Some(stack) = spawn_stack_with_relay_limits(pimble_cloud::relay::RelayLimits { max_message_bytes: LIMIT, ..Default::default() }).await else {
+        eprintln!("SKIP: no rhypedb-server binary found");
+        return;
+    };
+    let cast = relay_cast(&stack, "big").await;
+    let mut tunnel = open_tunnel(&stack, &cast.owner_session).await;
+    announce(&mut tunnel, &[cast.store_id.as_str()]).await;
+
+    let mut sender = connect_member(&stack, &cast.store_id, &cast.scoped_jwt).await.unwrap();
+    let (sender_conn, _, _) = next_frame(&mut tunnel).await;
+    let mut bystander = connect_member(&stack, &cast.store_id, &cast.whole_jwt).await.unwrap();
+    let (bystander_conn, _, _) = next_frame(&mut tunnel).await;
+
+    // Exactly the limit passes.
+    let at_limit = "a".repeat(LIMIT);
+    sender.send(WsMessage::Text(at_limit.clone())).await.unwrap();
+    assert_eq!(next_frame(&mut tunnel).await, (sender_conn, KIND_TEXT, at_limit.clone().into_bytes()));
+
+    // One byte more, from a member: that member's connection ends, and the
+    // owner is told so. (What the sender itself sees is a 1009 close or a
+    // reset, depending on how much of its message was still unsent.)
+    let _ = sender.send(WsMessage::Text("b".repeat(LIMIT + 1))).await;
+    assert_eq!(next_frame(&mut tunnel).await, (sender_conn, KIND_CLOSE, Vec::new()));
+    match next_message(&mut sender).await {
+        None => {}
+        Some(WsMessage::Close(Some(frame))) => assert_eq!(u16::from(frame.code), 1009),
+        other => panic!("the oversized sender should be closed, got {other:?}"),
+    }
+
+    // The bystander is untouched, both ways.
+    bystander.send(WsMessage::Text("unbothered".to_string())).await.unwrap();
+    assert_eq!(next_frame(&mut tunnel).await, (bystander_conn, KIND_TEXT, b"unbothered".to_vec()));
+    tunnel.send(tunnel_frame(bystander_conn, KIND_TEXT, at_limit.as_bytes())).await.unwrap();
+    assert_eq!(next_text(&mut bystander).await, at_limit);
+
+    // One byte more, from the owner: the member it was for is closed, the
+    // owner is told, and the tunnel carries on.
+    tunnel.send(tunnel_frame(bystander_conn, KIND_TEXT, "c".repeat(LIMIT + 1).as_bytes())).await.unwrap();
+    assert_eq!(next_close(&mut bystander).await, (1009, "message too large".to_string()));
+    assert_eq!(next_frame(&mut tunnel).await, (bystander_conn, KIND_CLOSE, Vec::new()));
+
+    let mut after = connect_member(&stack, &cast.store_id, &cast.whole_jwt).await.unwrap();
+    let (after_conn, kind, _) = next_frame(&mut tunnel).await;
+    assert_eq!(kind, KIND_OPEN, "the tunnel outlived both oversized messages");
+    tunnel.send(tunnel_frame(after_conn, KIND_TEXT, b"fine")).await.unwrap();
+    assert_eq!(next_text(&mut after).await, "fine");
+
+    // A member may only send text: that is all the framing carries.
+    after.send(WsMessage::Binary(vec![1, 2, 3])).await.unwrap();
+    assert_eq!(next_close(&mut after).await.0, 1003);
+    assert_eq!(next_frame(&mut tunnel).await, (after_conn, KIND_CLOSE, Vec::new()));
+}
+
+/// "Over a limit is a refusal, not a queue."
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_limits_refuse_rather_than_queue() {
+    let limits = pimble_cloud::relay::RelayLimits { max_connections_per_tunnel: 2, max_tunnels_per_account: 2, ..Default::default() };
+    let Some(stack) = spawn_stack_with_relay_limits(limits).await else {
+        eprintln!("SKIP: no rhypedb-server binary found");
+        return;
+    };
+    let cast = relay_cast(&stack, "limit").await;
+
+    let mut tunnel = open_tunnel(&stack, &cast.owner_session).await;
+    announce(&mut tunnel, &[cast.store_id.as_str()]).await;
+    let mut first = connect_member(&stack, &cast.store_id, &cast.scoped_jwt).await.unwrap();
+    let mut second = connect_member(&stack, &cast.store_id, &cast.whole_jwt).await.unwrap();
+    let (first_conn, _, _) = next_frame(&mut tunnel).await;
+    assert_eq!(next_frame(&mut tunnel).await.1, KIND_OPEN);
+
+    let mut third = connect_member(&stack, &cast.store_id, &cast.scoped_jwt).await.unwrap();
+    assert_eq!(next_close(&mut third).await, (4429, "too many connections".to_string()));
+
+    // A place freed is a place to be had, and the refused one never reached
+    // the owner: the next frames are the close and then the new open.
+    first.close(None).await.unwrap();
+    assert_eq!(next_frame(&mut tunnel).await, (first_conn, KIND_CLOSE, Vec::new()));
+    let mut fourth = connect_member(&stack, &cast.store_id, &cast.scoped_jwt).await.unwrap();
+    assert_eq!(next_frame(&mut tunnel).await.1, KIND_OPEN);
+
+    // Tunnels per account.
+    let mut second_tunnel = open_tunnel(&stack, &cast.owner_session).await;
+    assert_eq!(announce(&mut second_tunnel, &[]).await, Vec::<String>::new());
+    let mut third_tunnel = open_tunnel(&stack, &cast.owner_session).await;
+    assert_eq!(next_close(&mut third_tunnel).await, (4429, "too many tunnels".to_string()));
+    // Somebody else's account has tunnels of its own.
+    let (other_body, _) = signup_verify_login(&stack, "limit-other@example.com", "limit other password!!").await;
+    let mut others = open_tunnel(&stack, other_body["session"].as_str().unwrap()).await;
+    assert_eq!(announce(&mut others, &[cast.store_id.as_str()]).await, Vec::<String>::new(), "and serves nothing of anybody else's");
+
+    second.close(None).await.unwrap();
+    fourth.close(None).await.unwrap();
+}
+
+/// A tunnel that does not say what it serves is not held open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tunnel_must_announce() {
+    let limits = pimble_cloud::relay::RelayLimits { announce_timeout: Duration::from_millis(300), ..Default::default() };
+    let Some(stack) = spawn_stack_with_relay_limits(limits).await else {
+        eprintln!("SKIP: no rhypedb-server binary found");
+        return;
+    };
+    let (owner_body, _) = signup_verify_login(&stack, "mute-owner@example.com", "mute owner password!!").await;
+    let session = owner_body["session"].as_str().unwrap();
+
+    let mut silent = open_tunnel(&stack, session).await;
+    assert_eq!(next_close(&mut silent).await.0, 4400, "nothing announced in time");
+    let mut wrong = open_tunnel(&stack, session).await;
+    wrong.send(WsMessage::Text(r#"{"hello":"there"}"#.to_string())).await.unwrap();
+    assert_eq!(next_close(&mut wrong).await.0, 4400, "not a `serve`");
+    let mut hasty = open_tunnel(&stack, session).await;
+    hasty.send(tunnel_frame(1, KIND_TEXT, b"{}")).await.unwrap();
+    assert_eq!(next_close(&mut hasty).await.0, 4400, "a frame before the announce");
+    wait_for_counts(&stack, pimble_cloud::relay::RelayCounts::default()).await;
+}
+
+/// The member's socket closes when its token stops being one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_is_closed_when_its_token_expires() {
+    let stack = skip_without_rhypedb!();
+    let cast = relay_cast(&stack, "expiry").await;
+    let mut tunnel = open_tunnel(&stack, &cast.owner_session).await;
+    announce(&mut tunnel, &[cast.store_id.as_str()]).await;
+
+    let short_lived = craft_jwt(DEV_SIGNING_SEED_HEX, None, jwt_payload(json!({ cast.store_id.as_str(): "editor" }), 2));
+    let connected_at = std::time::Instant::now();
+    let mut member = connect_member(&stack, &cast.store_id, &short_lived).await.unwrap();
+    let (conn, kind, _) = next_frame(&mut tunnel).await;
+    assert_eq!(kind, KIND_OPEN);
+    member.send(WsMessage::Text("while it lasts".to_string())).await.unwrap();
+    assert_eq!(next_frame(&mut tunnel).await, (conn, KIND_TEXT, b"while it lasts".to_vec()));
+
+    assert_eq!(next_close(&mut member).await, (4401, "token expired".to_string()));
+    let lived = connected_at.elapsed();
+    assert!(lived >= Duration::from_millis(900) && lived < Duration::from_secs(10), "closed at `exp`, not before and not much after: {lived:?}");
+    assert_eq!(next_frame(&mut tunnel).await, (conn, KIND_CLOSE, Vec::new()), "and the owner is told");
+}
+
+/// Keepalive: every socket is pinged, one that answers stays, one that has
+/// gone quiet is closed — a member by itself, a tunnel with its members.
+#[tokio::test(flavor = "multi_thread")]
+async fn sockets_are_pinged_and_a_silent_one_is_dropped() {
+    let limits = pimble_cloud::relay::RelayLimits {
+        ping_interval: Duration::from_millis(100),
+        idle_timeout: Duration::from_millis(600),
+        ..Default::default()
+    };
+    let Some(stack) = spawn_stack_with_relay_limits(limits).await else {
+        eprintln!("SKIP: no rhypedb-server binary found");
+        return;
+    };
+    let cast = relay_cast(&stack, "ping").await;
+    let mut tunnel = open_tunnel(&stack, &cast.owner_session).await;
+    announce(&mut tunnel, &[cast.store_id.as_str()]).await;
+
+    // A member that is never read from answers no ping (the client library
+    // answers them only while it is polled).
+    let _silent = connect_member(&stack, &cast.store_id, &cast.scoped_jwt).await.unwrap();
+    let (silent_conn, kind, _) = next_frame(&mut tunnel).await;
+    assert_eq!(kind, KIND_OPEN);
+    // One that is read from does, for several idle timeouts on end, and sees
+    // the pings itself. The tunnel is read all the while as well (a client
+    // answers pings only while it is polled), which is also where the silent
+    // member's end shows up.
+    let mut lively = connect_member(&stack, &cast.store_id, &cast.whole_jwt).await.unwrap();
+    let (lively_conn, _, _) = next_frame(&mut tunnel).await;
+    let (mut member_pings, mut tunnel_pings, mut silent_closed) = (0, 0, false);
+    let watch_until = tokio::time::Instant::now() + Duration::from_millis(2_000);
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(watch_until) => break,
+            message = lively.next() => match message {
+                Some(Ok(WsMessage::Ping(_))) => member_pings += 1,
+                other => panic!("a live member should see nothing but pings, got {other:?}"),
+            },
+            message = tunnel.next() => match message {
+                Some(Ok(WsMessage::Ping(_))) => tunnel_pings += 1,
+                Some(Ok(WsMessage::Binary(bytes))) => {
+                    assert_eq!(bytes, silent_conn.to_be_bytes().iter().copied().chain([KIND_CLOSE]).collect::<Vec<u8>>(), "the silent member was dropped and the owner told");
+                    silent_closed = true;
+                }
+                other => panic!("a live tunnel should see pings and the silent member's close, got {other:?}"),
+            },
+        }
+    }
+    assert!(member_pings >= 5 && tunnel_pings >= 5, "pinged every 100 ms for two seconds: member {member_pings}, tunnel {tunnel_pings}");
+    assert!(silent_closed, "a member that answers nothing for the idle timeout is closed");
+    lively.send(WsMessage::Text("still here".to_string())).await.unwrap();
+    assert_eq!(next_frame(&mut tunnel).await, (lively_conn, KIND_TEXT, b"still here".to_vec()));
+
+    // Now the tunnel goes quiet: it is dropped, and its member with it.
+    let _quiet_tunnel = tunnel;
+    assert_eq!(next_close(&mut lively).await, (4404, "owner offline".to_string()));
+    wait_for_counts(&stack, pimble_cloud::relay::RelayCounts::default()).await;
+}
+
+/// A member that stops reading cannot make the relay hold what the owner
+/// sends it: the queue is a few messages, the owner is made to wait, and
+/// after `stall_timeout` that one virtual connection is closed. Everybody
+/// else on the tunnel carries on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_that_stops_reading_is_closed_not_buffered_for() {
+    let limits = pimble_cloud::relay::RelayLimits { stall_timeout: Duration::from_millis(500), ..Default::default() };
+    let Some(stack) = spawn_stack_with_relay_limits(limits).await else {
+        eprintln!("SKIP: no rhypedb-server binary found");
+        return;
+    };
+    let cast = relay_cast(&stack, "stall").await;
+    let mut tunnel = open_tunnel(&stack, &cast.owner_session).await;
+    announce(&mut tunnel, &[cast.store_id.as_str()]).await;
+
+    let _stalled = connect_member(&stack, &cast.store_id, &cast.scoped_jwt).await.unwrap();
+    let (stalled_conn, _, _) = next_frame(&mut tunnel).await;
+    let mut reader = connect_member(&stack, &cast.store_id, &cast.whole_jwt).await.unwrap();
+    let (reader_conn, _, _) = next_frame(&mut tunnel).await;
+
+    // The owner pours far more at the stalled member than any socket buffer
+    // takes (256 MiB), from a task of its own so that it can be made to wait.
+    let (mut to_relay, mut from_relay) = tunnel.split();
+    let chunk = "z".repeat(1024 * 1024);
+    let pump = tokio::spawn(async move {
+        let mut sent = 0usize;
+        for _ in 0..256 {
+            if to_relay.send(tunnel_frame(stalled_conn, KIND_TEXT, chunk.as_bytes())).await.is_err() {
+                break;
+            }
+            sent += 1;
+        }
+        (to_relay, sent)
+    });
+
+    // The relay gives up on that connection and says so...
+    let told = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            match from_relay.next().await {
+                Some(Ok(WsMessage::Binary(bytes))) => return (u32::from_be_bytes(bytes[..4].try_into().unwrap()), bytes[4]),
+                Some(Ok(_)) => continue,
+                other => panic!("the tunnel should survive a stalled member, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the stalled connection should be closed within the stall timeout, not buffered for");
+    assert_eq!(told, (stalled_conn, KIND_CLOSE));
+
+    // ...after which the rest of what was poured is dropped on arrival, the
+    // tunnel is as it was, and the other member hears from the owner.
+    let (mut to_relay, sent) = pump.await.unwrap();
+    assert_eq!(sent, 256, "the owner's sends all completed once the stalled connection was let go");
+    to_relay.send(tunnel_frame(reader_conn, KIND_TEXT, b"you still there?")).await.unwrap();
+    assert_eq!(next_text(&mut reader).await, "you still there?");
+    assert_eq!(stack.app_state.relay.counts(), pimble_cloud::relay::RelayCounts { tunnels: 1, stores: 1, connections: 1 });
+}
+
+/// Deleting a relayed store's record stops the relay piping to it at once,
+/// not when its members' tokens run out.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_relayed_store_closes_its_members() {
+    let stack = skip_without_rhypedb!();
+    let cast = relay_cast(&stack, "gone").await;
+    let mut tunnel = open_tunnel(&stack, &cast.owner_session).await;
+    announce(&mut tunnel, &[cast.store_id.as_str()]).await;
+    let mut member = connect_member(&stack, &cast.store_id, &cast.scoped_jwt).await.unwrap();
+    let (member_conn, kind, _) = next_frame(&mut tunnel).await;
+    assert_eq!(kind, KIND_OPEN);
+
+    let resp = stack.http.delete(format!("{}/stores/{}", stack.base_url, cast.store_id)).header("Cookie", &cast.owner_cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(next_close(&mut member).await.0, 4404);
+    assert_eq!(next_frame(&mut tunnel).await, (member_conn, KIND_CLOSE, Vec::new()), "the tunnel lives on, so it is told the connection is over");
+    // The member's token still names the store for up to an hour; there is
+    // simply nothing behind it, and the tunnel cannot put it back.
+    let mut again = connect_member(&stack, &cast.store_id, &cast.scoped_jwt).await.unwrap();
+    assert_eq!(next_close(&mut again).await.0, 4404);
+    assert_eq!(announce(&mut tunnel, &[cast.store_id.as_str()]).await, Vec::<String>::new(), "a deleted store cannot be served");
+    assert_eq!(stack.app_state.relay.counts(), pimble_cloud::relay::RelayCounts { tunnels: 1, stores: 0, connections: 0 });
 }

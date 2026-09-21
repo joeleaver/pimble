@@ -65,6 +65,11 @@ pub struct Config {
     /// field rather than a constant only so a test can lower it to something
     /// it can reach in a second.
     pub max_members_per_store: usize,
+    /// The relay's limits and timings (docs/RELAY_CONTRACT.md). The contract
+    /// fixes them, so like `max_members_per_store` they are **not**
+    /// environment variables; a field only so a test can reach a limit
+    /// without sixty-four sockets, or an idle timeout without ninety seconds.
+    pub relay: crate::relay::RelayLimits,
 }
 
 /// The value [`Config::from_env`] always uses for
@@ -93,6 +98,7 @@ impl Config {
             mail_from: env_var("PIMBLE_MAIL_FROM").unwrap_or_else(|| "Pimble <no-reply@m.pimble.app>".to_string()),
             kdf_decoy_secret: env_var("PIMBLE_CLOUD_KDF_DECOY_SECRET"),
             max_members_per_store: DEFAULT_MAX_MEMBERS_PER_STORE,
+            relay: crate::relay::RelayLimits::default(),
         }
     }
 

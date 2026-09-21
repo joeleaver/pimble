@@ -323,6 +323,98 @@ to `<PIMBLE_CLOUD_PUBLIC_URL>/app/signup?email=<urlencoded address>`; the
 "shared with you" mail links to `<PIMBLE_CLOUD_PUBLIC_URL>/app/`. Without
 `RESEND_API_KEY` both go to `LogMailer` like every other mail here.
 
+## The relay tier: a store that is shared and not hosted
+
+`docs/RELAY_CONTRACT.md`, "Accounts service". A store has a **tier**:
+`"hosted"` (the default, and what a row from before the field reads as) or
+`"relay"`. A relayed store is served by its owner's own machine; this service
+keeps a record of it — so grants, invitations, share names and key envelopes
+work exactly as for a hosted store — and pipes members' connections to that
+machine. **Nothing of the store is on Pimble Cloud**, and no endpoint calls
+the hosted Pimble server about one: not create, not delete, not members, not
+keys.
+
+- `POST /stores { name: "", kind: "vault", store_id, tier: "relay" }`:
+  `store_id` is required (the store already exists, on the owner's machine),
+  `kind` must be `vault` (what is relayed is the encrypted twin), and the name
+  may be empty — for this tier only — and is stored as sent. A `store_id`
+  whose row was **deleted** is taken over rather than refused, in either tier,
+  so "stop sharing from this computer" can be followed by sharing again, or by
+  hosting; whatever still named the old row is removed first. A live row with
+  that id is `409`.
+- `GET /stores` rows carry `tier`.
+- `POST /token` answers `stores: [{ store_id, rpc_url }]` beside `token`,
+  `exp` and `rpc_url`: every relay-tier store the token's claim names, with
+  `rpc_url = wss://<public host>/api/v1/relay/<store id>`. Always present,
+  empty when there is none. The token's claims are unchanged.
+- `DELETE /stores/{id}` (and an account deletion that takes a solely-owned
+  store with it) also withdraws the store from the relay at once.
+
+### The relay (`src/relay.rs`)
+
+In memory only: a registry of store id to tunnel, tunnel to virtual
+connections (`AppState::relay`, `Relay::counts()` for what it holds). Nothing
+about a connection is written to the database; log lines name store ids and
+counts, never a token, an account or a payload.
+
+**`GET /api/v1/relay` (WebSocket), the owner's tunnel.** The account's session
+(`Authorization: Bearer <session>`); any request with an `Origin` is `403`.
+The first message must be the text `{"serve": ["<store id>", ...]}`, within
+10 s, or the tunnel is closed `4400`. The answer is the text
+`{"serving": ["<store id>", ...]}`: the announced ids, in canonical form, that
+are live relay-tier stores this account owns (at most 256 are looked at;
+anything else is simply left out). A later `serve` on the same tunnel is the
+whole set again: new stores are added, missing ones withdrawn. A store
+another tunnel was serving moves to the later tunnel; the earlier tunnel's
+members of it are closed `4404`, the earlier tunnel is told (`close` frames),
+and if it now serves nothing it is closed `4409 replaced by a later tunnel`.
+Every other message on the tunnel is a binary frame:
+
+```
+[conn: u32 big-endian][kind: u8][payload]
+  1 open   relay -> owner   payload: the member's JWT, UTF-8
+  2 text   either way       payload: one text message (UTF-8)
+  3 close  either way       payload: empty
+```
+
+`conn` counts up from 1 per tunnel and is never reused while the tunnel
+lives. `open` always precedes that connection's first `text`. The owner's
+`close` is not echoed back; the relay sends `close` whenever a connection
+ends for any reason that was not the owner's own `close` or the tunnel going
+away. A frame for a `conn` the relay no longer has is dropped; a frame
+shorter than five bytes closes the tunnel `1002`; an unknown kind, or a
+`text` that is not UTF-8, closes that connection.
+
+**`GET /api/v1/relay/<store id>` (WebSocket), a member's connection.** The
+account's JWT as `Authorization: Bearer` or `?access_token=`. Refused before
+the upgrade, as plain HTTP: an `Origin` other than `PIMBLE_CLOUD_PUBLIC_URL`
+`403`; no token, or one that fails `JwtSigner::verify` (EdDSA only, `kid`
+found in this service's own JWKS, signature, `iss`, `aud == "pimble"`,
+`exp` ahead — no skew) `401`; a `stores` claim that does not name the store
+with a known role, in either shape (`"editor"` or `{"roots": {...}}`) `403`.
+After the upgrade, by close code:
+
+| Code | Reason | When |
+| --- | --- | --- |
+| `4404` | `owner offline` | no tunnel serves the store; or the tunnel went away, was replaced, or the store was withdrawn |
+| `4401` | `token expired` | the token's `exp` passed |
+| `4429` | `too many connections` / `too many tunnels` | the 65th connection on a tunnel; the 17th tunnel of an account |
+| `4408` | `not reading` | the member took nothing for `stall_timeout` (30 s) while the owner had more for it |
+| `1009` | `message too large` | a message over 16 MiB, in either direction — that virtual connection only |
+| `1003` | | a binary message from a member (only text is relayed) |
+| `1000` | `closed by the owner` | the owner sent `close`; what it sent before is delivered first |
+| `1001` | `no answer to pings` | nothing heard for 90 s |
+
+**Flow control.** Reading and writing are separate tasks per socket, joined
+by small bounded queues (8 frames to a tunnel, 2 messages to a member). A
+reader that cannot hand its message on stops reading, so TCP pushes back on
+whoever is sending; a socket write that does not complete in 30 s, or a
+member whose queue stays full that long, ends that connection (the tunnel,
+if the stuck peer is the owner). Every socket is pinged every 30 s and
+dropped after 90 s of silence. The numbers live in `relay::RelayLimits`
+(`Config::relay`), are not environment variables, and are fields only so the
+tests can lower them.
+
 ## Account recovery, password change, new recovery code (Phase 2a-2)
 
 The server holds neither the password KEK nor the recovery KEK, so recovery
@@ -468,12 +560,19 @@ curl -sb cookies.txt 'http://127.0.0.1:8080/api/v1/users/lookup?email=bob@exampl
 curl -sb cookies.txt -X POST http://127.0.0.1:8080/api/v1/stores \
   -H 'Content-Type: application/json' -d '{"name": "My Notes", "kind": "vault"}'
 
+# Record a RELAYED store instead: nothing is created anywhere, the hosted
+# Pimble server is not called, and the name may be (and from the desktop is)
+# empty. store_id is required: it is the store the owner's machine serves.
+curl -sb cookies.txt -X POST http://127.0.0.1:8080/api/v1/stores \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "", "kind": "vault", "store_id": "<store uuid>", "tier": "relay"}'
+
 # List my stores: one row per grant. A share's row is named by the SHARE
 # (never the store it lives in) and names the node and who shared it; a
 # whole-store row is named by the store and has root: null.
-# -> [{"store_id":"...","name":"My Notes","role":"owner","kind":"vault",
+# -> [{"store_id":"...","name":"My Notes","role":"owner","kind":"vault","tier":"hosted",
 #      "created_at":"...","root":null,"shared_by":null},
-#     {"store_id":"...","name":"Holiday Plans","role":"editor","kind":"vault",
+#     {"store_id":"...","name":"Holiday Plans","role":"editor","kind":"vault","tier":"relay",
 #      "created_at":"...","root":"<node id>","shared_by":"ann@example.com"}]
 curl -sb cookies.txt http://127.0.0.1:8080/api/v1/stores
 
@@ -540,6 +639,10 @@ curl -sb cookies.txt -X POST http://127.0.0.1:8080/api/v1/me/recovery-code \
 # claims.stores is "<role>" for a whole-store grant and
 # {"roots": {"<node id>": "<role>", ...}} for a store held by shares — a role
 # per shared root, and no store-level role.
+# -> {"token":"...","exp":...,"rpc_url":"ws://127.0.0.1:8080/rpc",
+#     "stores":[{"store_id":"<a relayed store>","rpc_url":"ws://127.0.0.1:8080/api/v1/relay/<that id>"}]}
+# `stores` names only relay-tier stores (everything else is at rpc_url); the
+# same token is the credential at both.
 curl -sb cookies.txt -X POST http://127.0.0.1:8080/api/v1/token
 
 # JWKS, the latest release, and the health check need no auth

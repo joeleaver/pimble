@@ -34,7 +34,7 @@ use serde_json::{json, Value};
 use pimble_crypto::{AccountKeyBlob, AccountPublicKeys, KdfParams};
 
 use crate::auth::{hash_password, hash_recovery_token, hash_verify_token, new_recovery_token, new_session_token, new_verify_token, verify_password_constant_time};
-use crate::claims::claims_for_user;
+use crate::claims::{claims_and_relayed_for_user, claims_for_user};
 use crate::db::{NewUserKeyMaterial, UserRow};
 use crate::error::{CloudError, CloudResult};
 use crate::kdf_decoy::decoy_kdf_params;
@@ -577,6 +577,9 @@ pub async fn recover_delete_account(State(state): State<AppState>, Path(token): 
                 state.db.grants_for_store(grant.store_rid).await?.into_iter().filter(|g| g.role == "owner" && g.is_whole_store()).count();
             if owner_count <= 1 {
                 state.db.mark_store_deleted(grant.store_rid).await?;
+                // If it was a relayed store with a tunnel up, nobody is piped
+                // to it from here on (a no-op for any other store).
+                state.relay.withdraw_store(&grant.store_uuid);
             }
         }
         state.db.delete_grant(grant.rid).await?;
@@ -658,12 +661,26 @@ pub struct TokenResponse {
     token: String,
     exp: i64,
     rpc_url: String,
+    /// Every store the token names that is **not** served at `rpc_url`: the
+    /// relay-tier ones (docs/RELAY_CONTRACT.md), each with the relay URL that
+    /// reaches its owner's machine. The same token is the credential there.
+    /// Always present, empty for an account with no relayed store. Nothing
+    /// about the token itself changes: its claims are what they always were.
+    stores: Vec<StoreEndpoint>,
+}
+
+/// Where one relayed store is reached (`web/src/api.rs`'s `StoreEndpoint`).
+#[derive(Serialize)]
+pub struct StoreEndpoint {
+    store_id: String,
+    rpc_url: String,
 }
 
 pub async fn mint_token(State(state): State<AppState>, authed: AuthedUser) -> CloudResult<Json<TokenResponse>> {
-    let claims = claims_for_user(&state, &authed.user).await?;
+    let (claims, relayed) = claims_and_relayed_for_user(&state, &authed.user).await?;
     let minted = state.signer.mint(&authed.user.user_uuid, claims).await?;
-    Ok(Json(TokenResponse { token: minted.token, exp: minted.exp, rpc_url: rpc_url(&state) }))
+    let stores = relayed.into_iter().map(|store_id| StoreEndpoint { rpc_url: relay_url(&state, &store_id), store_id }).collect();
+    Ok(Json(TokenResponse { token: minted.token, exp: minted.exp, rpc_url: rpc_url(&state), stores }))
 }
 
 /// `wss://<host>/rpc` (or `ws://` for a plain-http `PIMBLE_CLOUD_PUBLIC_URL`,
@@ -673,12 +690,25 @@ pub async fn mint_token(State(state): State<AppState>, authed: AuthedUser) -> Cl
 /// URL, not `PIMBLE_SERVER_URL` (which names the internal, same-VM address
 /// this service itself connects to).
 fn rpc_url(state: &AppState) -> String {
+    ws_url(state, "/rpc")
+}
+
+/// `wss://<host>/api/v1/relay/<store id>` (docs/RELAY_CONTRACT.md): where a
+/// member's connection to a relayed store goes — this service, which pipes
+/// it to the owner's machine. Derived from the public URL exactly as
+/// [`rpc_url`] is.
+fn relay_url(state: &AppState, store_id: &str) -> String {
+    ws_url(state, &format!("/api/v1/relay/{store_id}"))
+}
+
+/// `path` on this service's public origin, as a WebSocket URL.
+fn ws_url(state: &AppState, path: &str) -> String {
     let base = state.config.public_url.trim_end_matches('/');
     if let Some(host) = base.strip_prefix("https://") {
-        format!("wss://{host}/rpc")
+        format!("wss://{host}{path}")
     } else if let Some(host) = base.strip_prefix("http://") {
-        format!("ws://{host}/rpc")
+        format!("ws://{host}{path}")
     } else {
-        format!("{base}/rpc")
+        format!("{base}{path}")
     }
 }

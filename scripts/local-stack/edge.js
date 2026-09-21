@@ -23,7 +23,9 @@ const server = http.createServer((req, res) => {
   req.pipe(up);
 });
 server.on('upgrade', (req, socket, head) => {
-  const up = net.connect(rpc, '127.0.0.1', () => {
+  // /rpc is the hosted Pimble server's; any other upgrade (the relay, /api/v1/relay*)
+  // is the accounts service's.
+  const up = net.connect(req.url.startsWith('/api/') ? cloud : rpc, '127.0.0.1', () => {
     up.write(`${req.method} ${req.url} HTTP/1.1\r\n` + Object.entries(req.headers).map(([k, v]) => `${k}: ${v}`).join('\r\n') + '\r\n\r\n');
     if (head.length) up.write(head);
     socket.pipe(up); up.pipe(socket);

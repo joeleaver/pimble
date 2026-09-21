@@ -34,7 +34,7 @@ use serde_json::{json, Value};
 use pimble_core::{NodeId, StoreId, StoreKind};
 use pimble_crypto::{AccountPublicKeys, CryptoError, KeyEnvelope};
 
-use crate::db::{GrantRow, HostedStoreRow, UserRow};
+use crate::db::{GrantRow, HostedStoreRow, UserRow, TIER_HOSTED, TIER_RELAY};
 use crate::error::{CloudError, CloudResult};
 use crate::mail::{invitation_email, shared_with_you_email};
 use crate::session::AuthedUser;
@@ -127,6 +127,11 @@ pub struct StoreView {
     name: String,
     role: String,
     kind: String,
+    /// `"hosted"` or `"relay"` (docs/RELAY_CONTRACT.md): whether the store's
+    /// encrypted twin is on Pimble Cloud, or the store is served by its
+    /// owner's machine through the relay and reached at its own `rpc_url`
+    /// (`POST /token`'s `stores`).
+    tier: String,
     created_at: String,
     /// The node this row is rooted at, for a share; `null` for a whole-store
     /// grant (docs/NODE_DOCUMENT_CONTRACT.md section 5).
@@ -175,6 +180,7 @@ fn store_view(store: &HostedStoreRow, grant: &GrantRow, shared_by: Option<String
         name: row_name(store, grant),
         role: grant.role.clone(),
         kind: store.kind.clone(),
+        tier: store.tier.clone(),
         created_at: rfc3339(store.created_at_ms),
         root: root_view(&grant.root),
         shared_by,
@@ -277,6 +283,33 @@ pub struct CreateStoreRequest {
     /// thing to do silently.
     #[serde(default)]
     pub share: Option<bool>,
+    /// `"hosted"` (default) or `"relay"` (docs/RELAY_CONTRACT.md). A relayed
+    /// store is recorded here — so grants, invitations and key envelopes have
+    /// something to hang off — and created nowhere: the hosted Pimble server
+    /// is never told about it.
+    #[serde(default)]
+    pub tier: StoreTier,
+}
+
+/// Where a store's encrypted twin lives (docs/RELAY_CONTRACT.md).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StoreTier {
+    /// On the hosted Pimble server: the person asked for it to be hosted.
+    #[default]
+    Hosted,
+    /// On the owner's own machine, reached through the relay: nothing of the
+    /// store is on Pimble Cloud.
+    Relay,
+}
+
+impl StoreTier {
+    fn as_str(self) -> &'static str {
+        match self {
+            StoreTier::Hosted => TIER_HOSTED,
+            StoreTier::Relay => TIER_RELAY,
+        }
+    }
 }
 
 /// How long a store's (or a share's) name may be. A name is visible to this
@@ -293,10 +326,20 @@ const MAX_STORE_NAME_CHARS: usize = 200;
 /// `what` names the field in the error, since both a store's name and a
 /// share's come through here.
 fn stored_name(raw: &str, what: &str) -> CloudResult<String> {
-    let name = crate::mail::one_line(raw);
+    let name = stored_name_or_empty(raw, what)?;
     if name.is_empty() {
         return Err(CloudError::BadRequest(format!("{what} must not be empty")));
     }
+    Ok(name)
+}
+
+/// [`stored_name`] without the refusal of an empty one: what a relayed
+/// store's name goes through. The owner's device sends the empty string for
+/// it (docs/RELAY_CONTRACT.md: "nothing on Pimble Cloud needs the owner's
+/// name for it"), and that is stored as it came; a name that is sent is still
+/// kept to one line and bounded, for the same reasons as any other.
+fn stored_name_or_empty(raw: &str, what: &str) -> CloudResult<String> {
+    let name = crate::mail::one_line(raw);
     if name.chars().count() > MAX_STORE_NAME_CHARS {
         return Err(CloudError::BadRequest(format!("{what} must be at most {MAX_STORE_NAME_CHARS} characters")));
     }
@@ -312,18 +355,66 @@ pub async fn create_store(State(state): State<AppState>, authed: AuthedUser, Jso
             "`share` is gone: a share is a scoped grant on your own store now — create the store, then PUT a member with the node's `root`".to_string(),
         ));
     }
-    let name = stored_name(&req.name, "name")?;
     let store_id = req
         .store_id
         .as_deref()
         .map(StoreId::parse)
         .transpose()
         .map_err(|e| CloudError::BadRequest(format!("store_id is not a valid id: {e}")))?;
-
-    let (created_store_id, dir_name) = state.pimble.create_store(&name, req.kind, store_id).await?;
-    let store_id_str = created_store_id.as_uuid().to_string();
     let kind_str = store_kind_str(req.kind);
-    let hosted = state.db.create_hosted_store(&store_id_str, &name, &dir_name, kind_str).await?;
+
+    // A chosen id may already have a row. A live one is somebody's store and
+    // is refused. A deleted one is what "stop hosting" and "stop sharing from
+    // this computer" leave behind (`DELETE /stores/{id}` only marks the row,
+    // and `store_id` is `@unique`), and the same store may be hosted or
+    // relayed again — in either tier, whichever it was before — so that row is
+    // taken over below rather than left to fail the insert for ever.
+    let previous = match store_id {
+        Some(id) => state.db.find_hosted_store(&id.as_uuid().to_string()).await?,
+        None => None,
+    };
+    if previous.as_ref().is_some_and(|row| !row.deleted) {
+        return Err(CloudError::Conflict("a store with this id already exists".to_string()));
+    }
+
+    let (store_id_str, name, dir_name) = match req.tier {
+        StoreTier::Hosted => {
+            let name = stored_name(&req.name, "name")?;
+            let (created_store_id, dir_name) = state.pimble.create_store(&name, req.kind, store_id).await?;
+            (created_store_id.as_uuid().to_string(), name, dir_name)
+        }
+        // A relayed store is recorded and nothing else (docs/
+        // RELAY_CONTRACT.md): the hosted Pimble server is never called, so
+        // nothing of the store — not a directory, not its name — reaches
+        // Pimble Cloud's disk by this request. The store already exists on
+        // its owner's machine, so the id is theirs to say; and what members
+        // reach through the relay is the vault twin that machine serves, so
+        // no other kind can be relayed.
+        StoreTier::Relay => {
+            let store_id = store_id.ok_or_else(|| {
+                CloudError::BadRequest("a relayed store is recorded under its own id: `store_id` is required with `tier: \"relay\"`".to_string())
+            })?;
+            if req.kind != StoreKind::Vault {
+                return Err(CloudError::BadRequest(
+                    "a relayed store is served as an encrypted vault: `kind` must be \"vault\" with `tier: \"relay\"`".to_string(),
+                ));
+            }
+            (store_id.as_uuid().to_string(), stored_name_or_empty(&req.name, "name")?, String::new())
+        }
+    };
+    let hosted = match previous {
+        Some(deleted_row) => {
+            // Nothing that named the old store may come back to life with the
+            // id. `DELETE /stores/{id}` already removed all of it; an account
+            // deletion (`recover_delete_account`) removes only that account's
+            // own rows, so another member's grant can outlive the store.
+            state.db.delete_grants_for_store(deleted_row.rid).await?;
+            state.db.delete_key_grants_for_store(deleted_row.rid).await?;
+            state.db.delete_invitations_for_store(deleted_row.rid).await?;
+            state.db.revive_hosted_store(deleted_row.rid, &name, &dir_name, kind_str, req.tier.as_str()).await?
+        }
+        None => state.db.create_hosted_store(&store_id_str, &name, &dir_name, kind_str, req.tier.as_str()).await?,
+    };
     // The whole store, so no share name: this row is named by the store.
     let grant = state.db.create_grant(authed.user.rid, hosted.rid, &store_id_str, "owner", WHOLE_STORE, NO_SHARE_NAME).await?;
     // The creator owns the whole store, so never "shared by" anyone.
@@ -340,6 +431,16 @@ pub async fn delete_store(State(state): State<AppState>, authed: AuthedUser, Pat
     state.db.delete_key_grants_for_store(store.rid).await?;
     state.db.delete_invitations_for_store(store.rid).await?;
     state.db.mark_store_deleted(store.rid).await?;
+
+    // A relayed store was never on the hosted server, so there is nothing
+    // there to delete and it is not asked (docs/RELAY_CONTRACT.md). What
+    // there may be is a tunnel serving it right now: members still hold
+    // tokens that name the store, so the relay stops piping to it at once
+    // rather than when those tokens run out.
+    if store.is_relayed() {
+        state.relay.withdraw_store(&store.store_id);
+        return Ok(Json(json!({})));
+    }
 
     // A vault store's ciphertext is deleted from the hosted server too — a
     // share's whole point is that "stop sharing" leaves nothing behind. The

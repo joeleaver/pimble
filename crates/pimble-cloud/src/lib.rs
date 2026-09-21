@@ -18,6 +18,7 @@ pub mod kdf_decoy;
 pub mod mail;
 pub mod pimble;
 pub mod ratelimit;
+pub mod relay;
 pub mod releases;
 pub mod routes;
 pub mod session;

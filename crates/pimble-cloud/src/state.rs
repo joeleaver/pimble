@@ -7,6 +7,7 @@ use crate::jwt::JwtSigner;
 use crate::mail::Mailer;
 use crate::pimble::PimbleService;
 use crate::ratelimit::{QuotaLimiter, RateLimiter};
+use crate::relay::Relay;
 use crate::releases::ReleasesCache;
 
 /// One send per address per minute (docs/CLOUD_CONTRACT.md, "Phase 1b":
@@ -65,6 +66,11 @@ pub struct Inner {
     /// once at startup from `config.kdf_decoy_secret` — see
     /// [`resolve_kdf_decoy_secret`].
     pub kdf_decoy_secret: Vec<u8>,
+    /// The relay's registry (docs/RELAY_CONTRACT.md): which store is behind
+    /// which owner's tunnel, in this process's memory and nowhere else. It
+    /// dies with the process, and nothing is lost by that: every tunnel and
+    /// member reconnects and it fills again.
+    pub relay: Relay,
 }
 
 impl std::ops::Deref for AppState {
@@ -100,6 +106,7 @@ fn resolve_kdf_decoy_secret(config: &Config) -> Vec<u8> {
 impl AppState {
     pub fn new(config: Config, db: RhypeDb, pimble: PimbleService, signer: JwtSigner, releases: ReleasesCache, mailer: Arc<dyn Mailer>) -> Self {
         let kdf_decoy_secret = resolve_kdf_decoy_secret(&config);
+        let relay = Relay::new(config.relay.clone());
         AppState(Arc::new(Inner {
             config,
             db,
@@ -113,6 +120,7 @@ impl AppState {
             share_mail_rate_limit: RateLimiter::new(SHARE_MAIL_INTERVAL),
             invite_quota: QuotaLimiter::new(INVITES_PER_INVITER_WINDOW, INVITES_PER_INVITER_LIMIT),
             kdf_decoy_secret,
+            relay,
         }))
     }
 }

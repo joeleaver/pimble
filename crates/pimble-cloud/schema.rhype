@@ -100,6 +100,16 @@ type HostedStore {
     // declaration stays: a field a stored row has and the schema does not is
     // not a shape this database has ever been asked to load.
     share: Bool
+    // docs/RELAY_CONTRACT.md: `"hosted"` (the store's encrypted twin lives on
+    // the hosted Pimble server) or `"relay"` (nothing of the store is on
+    // Pimble Cloud at all: the owner's own machine serves it and this service
+    // only pipes members' connections to it). A relay-tier row is a record
+    // that grants, invitations and key envelopes can hang off, and nothing
+    // more: its `name` is whatever the owner's device sent (the empty string)
+    // and its `dir_name` is empty, because there is no directory. Absent on
+    // every row written before the relay tier existed — read optional as
+    // `"hosted"`, which is what every such store is.
+    tier: String
 }
 
 // An address invited to a store that has no verified account yet. One row per

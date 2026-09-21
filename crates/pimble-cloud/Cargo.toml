@@ -35,8 +35,11 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 base64 = { workspace = true }
 
-# HTTP server for /api/v1 (docs/CLOUD_CONTRACT.md, section C).
-axum = "0.7"
+# HTTP server for /api/v1 (docs/CLOUD_CONTRACT.md, section C). `ws` is the
+# relay (docs/RELAY_CONTRACT.md): the owner's tunnel and members' connections
+# are WebSockets this service pipes between, and axum's own upgrade does
+# binary frames and close codes, so there is no second WebSocket stack.
+axum = { version = "0.7", features = ["ws"] }
 # axum-core 0.4's `FromRequestParts`/`FromRequest` are still declared with
 # `#[async_trait]` (pre-AFIT), so `AuthedUser`'s impl (src/session.rs) needs
 # the same macro to match the trait's desugared signature.
@@ -76,3 +79,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 [dev-dependencies]
 pimble-server = { workspace = true }
 tempfile = "3"
+# Plain WebSocket clients for the relay's end-to-end tests (tests/integration.rs):
+# the owner's tunnel and members' connections, with close codes and custom
+# request headers. The same version axum 0.7's `ws` feature already pulls in,
+# so the lock file gains nothing beyond it.
+tokio-tungstenite = "0.24"

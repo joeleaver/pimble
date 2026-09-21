@@ -272,7 +272,26 @@ pub struct HostedStoreRow {
     /// `"plain"` or `"vault"` (docs/CRYPTO_CONTRACT.md), matching
     /// `pimble_core::StoreKind`'s serde spelling.
     pub kind: String,
+    /// [`TIER_HOSTED`] or [`TIER_RELAY`] (docs/RELAY_CONTRACT.md). A row from
+    /// before the field existed reads as hosted.
+    pub tier: String,
 }
+
+impl HostedStoreRow {
+    /// Whether nothing of this store is on Pimble Cloud: the owner's own
+    /// machine serves it through the relay, and no code path may call the
+    /// hosted Pimble server about it.
+    pub fn is_relayed(&self) -> bool {
+        self.tier == TIER_RELAY
+    }
+}
+
+/// The store's encrypted twin lives on the hosted Pimble server. The default,
+/// and what a row with no `tier` field is.
+pub const TIER_HOSTED: &str = "hosted";
+/// The store is served by its owner's machine through the relay; Pimble Cloud
+/// holds a record of it (for grants and key envelopes) and nothing else.
+pub const TIER_RELAY: &str = "relay";
 
 /// One address invited to a store that has no verified account yet. Becomes a
 /// [`GrantRow`] — with the same [`root`](Self::root) — the moment the address
@@ -404,6 +423,10 @@ fn hosted_store_from_object(o: &Object) -> CloudResult<HostedStoreRow> {
         // a share was a store of its own, is not read at all any more; a
         // production row may still carry it and that is simply ignored.)
         kind: get_string_opt(o, "kind")?.unwrap_or(DEFAULT_STORE_KIND).to_string(),
+        // The same rule again (docs/RELAY_CONTRACT.md: "what a row without
+        // the field reads as"): every store recorded before the relay tier
+        // existed is hosted.
+        tier: get_string_opt(o, "tier")?.unwrap_or(TIER_HOSTED).to_string(),
     })
 }
 
@@ -831,14 +854,17 @@ impl RhypeDb {
 
     // ── Hosted stores ──────────────────────────────────────────────────
 
-    pub async fn create_hosted_store(&self, store_id: &str, name: &str, dir_name: &str, kind: &str) -> CloudResult<HostedStoreRow> {
+    /// `tier` is [`TIER_HOSTED`] or [`TIER_RELAY`]. A relay-tier row has no
+    /// directory on the hosted server, so its `dir_name` is the empty string.
+    pub async fn create_hosted_store(&self, store_id: &str, name: &str, dir_name: &str, kind: &str, tier: &str) -> CloudResult<HostedStoreRow> {
         let q = format!(
-            "HostedStore.create({{ store_id: {sid}, name: {name}, dir_name: {dir}, created_at: {now}, deleted: false, kind: {kind} }})",
+            "HostedStore.create({{ store_id: {sid}, name: {name}, dir_name: {dir}, created_at: {now}, deleted: false, kind: {kind}, tier: {tier} }})",
             sid = ql_str(store_id),
             name = ql_str(name),
             dir = ql_str(dir_name),
             now = now_literal(),
             kind = ql_str(kind),
+            tier = ql_str(tier),
         );
         let obj = self
             .objects(&q)
@@ -849,12 +875,32 @@ impl RhypeDb {
         hosted_store_from_object(&obj)
     }
 
+    /// Takes over a **deleted** row for a store that is being hosted or
+    /// relayed again under the same id (`store_id` is `@unique`, and deleting
+    /// a store only marks its row): every field a fresh row would get, the
+    /// id kept. The caller has already checked the row is deleted and removed
+    /// whatever still named it.
+    pub async fn revive_hosted_store(&self, store_rid: u64, name: &str, dir_name: &str, kind: &str, tier: &str) -> CloudResult<HostedStoreRow> {
+        let q = format!(
+            "HostedStore.get({store_rid}).update({{ name: {name}, dir_name: {dir}, created_at: {now}, deleted: false, kind: {kind}, tier: {tier} }})",
+            name = ql_str(name),
+            dir = ql_str(dir_name),
+            now = now_literal(),
+            kind = ql_str(kind),
+            tier = ql_str(tier),
+        );
+        self.objects(&q).await?;
+        self.get_hosted_store(store_rid).await?.ok_or_else(|| CloudError::Internal("a revived HostedStore row is gone".into()))
+    }
+
     /// Test-only: creates a `HostedStore` row shaped like one from the cut
     /// where a share was a vault store of its own — `share: true`, a field
     /// nothing writes or reads any more — so a test can reproduce "a
     /// production row carries it" without a pre-migration database snapshot.
     /// Real stores go through [`Self::create_hosted_store`], which never
     /// writes it (compare [`Self::create_legacy_user_without_keys_for_tests`]).
+    /// Such a row also predates `tier`, so this writes none: it is the shape
+    /// `hosted_store_from_object` must read as a hosted store.
     pub async fn create_hosted_store_with_legacy_share_for_tests(&self, store_id: &str, name: &str, dir_name: &str, kind: &str) -> CloudResult<HostedStoreRow> {
         let q = format!(
             "HostedStore.create({{ store_id: {sid}, name: {name}, dir_name: {dir}, created_at: {now}, deleted: false, kind: {kind}, share: true }})",
