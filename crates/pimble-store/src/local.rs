@@ -471,6 +471,21 @@ impl LocalStore {
         Ok(())
     }
 
+    /// Rename a partial replica. Its name is this device's own label for the
+    /// shares it holds (the share's name, or "Shared by ..." once there are
+    /// several), never the owner's name for the store, which a member is
+    /// not told. A whole store's name is not this function's to change.
+    pub async fn set_partial_replica_name(&mut self, name: &str) -> Result<()> {
+        if self.manifest.scope_roots.is_empty() || self.manifest.name == name {
+            return Ok(());
+        }
+        self.manifest.name = name.to_string();
+        self.manifest.modified_at = Utc::now();
+        let manifest_json = serde_json::to_string_pretty(&self.manifest)?;
+        atomic_write(&self.path.join(Self::MANIFEST_FILE), manifest_json).await?;
+        Ok(())
+    }
+
     /// Open an existing local store: every node document is loaded, a store
     /// of the previous layout is migrated (see [`LocalStore::migrate`]), the
     /// manifest root is adopted from the documents when it names none of

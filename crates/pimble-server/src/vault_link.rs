@@ -73,7 +73,10 @@
 //! the server refuses for one document (it left the scope, or it is under
 //! a root this account only reads) leaves that document marked and the link
 //! up. How the account holds the store is read again from the accounts
-//! service at every connect (`refresh_grant`).
+//! service at every connect (`refresh_grant`), and asked about every two
+//! minutes while connected (`grant_shape`): a role the owner changed,
+//! another share of the store or a removal ends the connection, and the
+//! next one is made with a token minted from the grant as it is now.
 //!
 //! **Share upkeep** (docs/NODE_DOCUMENT_CONTRACT.md section 5, the owner's
 //! half; `crate::share`): on an owner's device the link's task also runs
@@ -137,6 +140,10 @@ const PROGRESS_SAVE_EVERY: Duration = Duration::from_secs(5);
 /// How long a share's recipient waits before asking the remote again for a
 /// document a held list names and the scope did not hold yet, doubling up
 /// to [`MAX_AWAITED_POLL`] while nothing new arrives.
+/// How often a connected link asks the accounts service whether the
+/// account's grant on the store is still what this connection was made
+/// with (see [`grant_shape`]).
+const GRANT_CHECK_EVERY: Duration = Duration::from_secs(120);
 const AWAITED_POLL: Duration = Duration::from_secs(5);
 const MAX_AWAITED_POLL: Duration = Duration::from_secs(60);
 
@@ -272,6 +279,8 @@ async fn run_loop(handler: RpcHandler, rpc_url: Url, key_id: Uuid, link_id: Stri
         if reached_synced {
             backoff = INITIAL_BACKOFF;
         }
+        // `Ok` is a connection given up on purpose (the grant changed):
+        // the next one is made at once.
         if let Err(e) = result {
             warn!("Vault link for store {} to {} dropped: {}", store_id, rpc_url, e);
             set_state(&handler, &link, SyncState::Offline).await;
@@ -344,6 +353,7 @@ async fn connect_and_sync(
     set_state(handler, link, SyncState::Syncing).await;
 
     let owner = refresh_grant(handler, store_id).await;
+    let connected_as = grant_shape(handler, store_id).await;
     let client = connect(handler, rpc_url).await?;
     // What the last connection learned of the remote's documents and their
     // wraps is asked again; data keys already unwrapped stay.
@@ -374,6 +384,7 @@ async fn connect_and_sync(
     full_reconcile(handler, &client, store_id, key_id, link_id, progress, &echoes).await?;
 
     let mut save_tick = tokio::time::interval(PROGRESS_SAVE_EVERY);
+    let mut grant_tick = tokio::time::interval_at(tokio::time::Instant::now() + GRANT_CHECK_EVERY, GRANT_CHECK_EVERY);
     let mut awaited_wait = AWAITED_POLL;
     let awaited_poll = tokio::time::sleep(awaited_wait);
     tokio::pin!(awaited_poll);
@@ -432,6 +443,18 @@ async fn connect_and_sync(
             _ = save_tick.tick() => {
                 progress.save_if_unsaved().await;
             }
+            // A role the owner changed, another share of the store, a
+            // removal: what this connection may do was settled by the token
+            // it was made with, so the answer is to connect again, which
+            // reads the grant and mints a token from it.
+            _ = grant_tick.tick() => {
+                let now = grant_shape(handler, store_id).await;
+                if now.is_some() && now != connected_as {
+                    info!("Vault link for store {}: the account's grant on it has changed; connecting again", store_id);
+                    progress.save_if_unsaved().await;
+                    return Ok(());
+                }
+            }
             // Upkeep that fails is tried again, and never takes the link
             // down with it: the link is the path of this device's own
             // edits, and a connection that really is gone shows in the
@@ -459,6 +482,26 @@ async fn connect_and_sync(
             }
         }
     }
+}
+
+/// How the account holds the store, as far as the accounts service's rows
+/// say: what a token minted now would carry. Compared between a connect and
+/// now ([`GRANT_CHECK_EVERY`]); never stored.
+#[derive(Debug, PartialEq, Eq)]
+struct GrantShape {
+    /// `None`: no row names the store.
+    held: Option<(pimble_core::StoreAccess, std::collections::BTreeSet<String>, std::collections::BTreeSet<String>)>,
+}
+
+/// `None` when it cannot be read (no account, no network): nothing is
+/// concluded from that, and the connection stands.
+async fn grant_shape(handler: &RpcHandler, store_id: StoreId) -> Option<GrantShape> {
+    let account = handler.keystore().account().await?;
+    let rows = crate::cloud::list_stores(&account.url, &account.session).await.ok()?;
+    let ids = |roots: &[NodeId]| roots.iter().map(|id| id.to_string()).collect::<std::collections::BTreeSet<_>>();
+    Some(GrantShape {
+        held: crate::cloud::HeldAs::from_rows(&rows, store_id).map(|held_as| (held_as.access, ids(&held_as.roots), ids(&held_as.read_only_roots))),
+    })
 }
 
 /// Read again, from the accounts service, how the signed-in account holds
@@ -491,9 +534,18 @@ async fn refresh_grant(handler: &RpcHandler, store_id: StoreId) -> Option<bool> 
     // Only a partial replica takes roots: a whole replica holds every
     // document already, whatever the account's grant has become since.
     if !local_roots.is_empty() {
+        let mut added = false;
         for root in held_as.roots.iter().filter(|root| !local_roots.contains(root)) {
-            if let Err(e) = manager.write().await.add_scope_root(store_id, *root).await {
-                warn!("Vault link for store {}: could not add scope root {}: {}", store_id, root, e);
+            match manager.write().await.add_scope_root(store_id, *root).await {
+                Ok(()) => added = true,
+                Err(e) => warn!("Vault link for store {}: could not add scope root {}: {}", store_id, root, e),
+            }
+        }
+        // One share's replica carries that share's name; with another it is
+        // "Shared by ...", as a replica added with both would be.
+        if let (true, Some(name)) = (added, &held_as.name) {
+            if let Err(e) = manager.write().await.set_partial_replica_name(store_id, name).await {
+                warn!("Vault link for store {}: could not rename the replica: {}", store_id, e);
             }
         }
     }

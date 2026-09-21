@@ -398,6 +398,11 @@ impl StoreManager {
         self.local_mut(store_id)?.add_scope_root(root).await
     }
 
+    /// Rename a partial replica (see [`LocalStore::set_partial_replica_name`]).
+    pub async fn set_partial_replica_name(&mut self, store_id: StoreId, name: &str) -> Result<()> {
+        self.local_mut(store_id)?.set_partial_replica_name(name).await
+    }
+
     /// Create a partial replica: [`StoreManager::create_replica`] with the
     /// scope roots the share grants (see [`LocalStore::create_replica_with_scope`]).
     pub async fn create_partial_replica(

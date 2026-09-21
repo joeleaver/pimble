@@ -2675,6 +2675,9 @@ impl PimbleApiServer for RpcHandler {
                 for root in &held_as.roots {
                     manager.add_scope_root(store_id, *root).await.map_err(to_rpc_error)?;
                 }
+                // One share's replica carries that share's name; with
+                // another it is "Shared by ...", as one added with both is.
+                manager.set_partial_replica_name(store_id, &name).await.map_err(to_rpc_error)?;
             }
             self.stop_vault_link(store_id).await;
             let rpc_url = self.link_hosted_store(store_id, &account, key_id, &held_as).await?;
