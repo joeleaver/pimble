@@ -45,19 +45,24 @@ of it run, `scripts/local-stack/README.md`.
     every device that held it, six times a second, 1048 appends in three minutes. Repair
     now acts on knowledge only (tombstones it holds), never on absence; the mirror case
     (a node under a parent not held being moved to the root) is gone with it.
-  - *In progress (agent, `web/`):* **the owner's page holds only the store key**, so it
-    cannot read what a member creates until one of the owner's desktops adds the store
-    key's wrap. It must fetch the keys of the shares in its own store, as the desktop
-    link does.
-  - *Open:* **a document created by someone else does not appear in an open page until it
-    reconnects.** The notification carries the blob and not the document's key wraps, and
-    nothing fetches them (`web/src/vault.rs`, `apply_notification`): an unknown document,
-    or an unknown data-key id, has to trigger a `vaultFetch` of that document.
-  - *Open, small:* Enter in the password field does not submit the sign-in or unlock form
-    (it does in the rename box); with several shares of one store the web names the store
-    row after the first share where the desktop says "Shared by <owner>"; the release web
-    build logs rinch's DEBUG lines to the console by the thousand, which hides the app's
-    own warnings.
+  - *Fixed, 83df753:* **the owner's page held only the store key**, so it could not read
+    what a member created until one of the owner's desktops added the store key's wrap. It
+    now fetches the key of every share whose marker it holds (at open, at every connect,
+    and when a marker or an unopenable blob turns up). Checked in the browser: the owner's
+    page shows folders and notes members made while every owner desktop was off.
+  - *Fixed, 83df753:* **a document created by someone else did not appear in an open page
+    until it reconnected** (a notification carries the blob and not the document's key
+    wraps). Such a document is now read again once, which brings its wraps. Checked live.
+  - *Fixed, bbdf75f:* a child that became readable a moment after its never-opened
+    folder's own change left the folder without a chevron (the app refreshed a parent only
+    when its list was loaded). Checked live.
+  - *Fixed:* Enter in the password field signs in or unlocks (a9b29a3); the web logs at
+    INFO, so the app's own warnings are readable in the console (0a3d2f7); with several
+    shares of one store the web names the row "Shared by <owner>", as the desktop does.
+  - **The bar was run in the browser** with the owner's desktop off: the owner's page, a
+    member's page and a member's desktop renamed, created, moved and deleted in one shared
+    folder close together; both desktops ended with identical lists, both pages showed
+    them, and no document kept gaining appends afterwards.
 - **Found and fixed by that verification** (all committed): a member never learns the
   owner's store name; a new document's wrapped key rides its first `vaultAppend` and is
   stored with it under one lock (a lost answer used to leave a blob nobody could open,
@@ -70,6 +75,14 @@ of it run, `scripts/local-stack/README.md`.
   document, shown and saved nowhere), and a role change reaches the running app; a share's
   member gets a member's Share dialog instead of the owner's management dialog. Both were
   checked again in the running app after the fix.
+
+## Decided on 2026-09-21
+
+- **A token per relayed store** (6d95e38). The relay hands a member's token to the owner's
+  machine; the account's general token would have been good for the member's other stores
+  at the hosted server for an hour. `POST /token` now mints `stores[].token`, the account's
+  token with `stores` cut down to that one store, and the relay refuses any token naming
+  another. The general token is unchanged.
 
 ## Decisions waiting for Joe
 
