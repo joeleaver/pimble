@@ -1,11 +1,100 @@
 # Next session: start here
 
-Updated 2026-09-16 evening after **v0.1.0, the desktop account UI and two server
-fixes**. Read this, then `CLAUDE.md` ("Cloud, phase 1", "Cloud, phase 2a", "Desktop
-account UI"), then `docs/CRYPTO_CONTRACT.md`, `docs/DESKTOP_ACCOUNT_CONTRACT.md` and
-`docs/DEPLOY.md`.
+Updated 2026-09-21 on branch **`node-document`**. Read this, then `CLAUDE.md` ("Current
+design", "Sharing on node documents"), then `docs/NODE_DOCUMENT_CONTRACT.md`. To see any
+of it run, `scripts/local-stack/README.md`.
 
-## Where things stand (2026-09-16 evening)
+## Where things stand (2026-09-21, branch `node-document`, nothing merged or deployed)
+
+- **The redesign Joe approved on 2026-09-18 is built.** Every node is one co-authored yrs
+  document; there is no store document; sharing is a scoped grant on the owner's own
+  documents. `cloud/phase-2b` (the share mirror) is the rejected cut, kept as a record,
+  never merged. `master` is still v0.1.1 with the old design.
+- **Verified by the PM against the real local stack on 2026-09-21** (accounts service,
+  hosted server in JWT mode, three desktops with their own keystores):
+  - Headless, through the CLI: the unhosted refusal sentence with nothing uploaded; host,
+    share, invite; members see the share's name and "shared by", never the owner's store
+    name; **with every owner device off, two members create, move, delete and write in the
+    shared folder and see each other's changes, a document one creates is readable by the
+    other at once**; a reader's writes are refused with the sentence; no typed word, title
+    or share name on the hosted disk; nothing of the owner's unshared folders on a member's
+    disk; the owner's tree has everything on its return; a note moved into the share reaches
+    members (keys included) and stops reaching them once moved out; a role change, a second
+    and third share of the same store, a removal and a stopped share each reach a member's
+    machine within two minutes.
+  - In the desktop app (rinch's debug server built from the cargo checkout and driven by a
+    script; the configured rinch MCP server binary is missing on this machine): the owner's
+    share badges, the Share dialog against the real RPCs (members, invite), the unhosted
+    refusal verbatim in the dialog, a member's replica with several shared roots under one
+    store row, a member typing in the app and the owner's app receiving it.
+- **Not verified: the browser.** The web vault client's share code has unit tests only.
+  Signing in to the web app means typing the account password into the page, which the PM
+  does not do. Joe (or a session where he types the passwords) runs the browser half of
+  the walk-through: a share listed under its own name with "shared by"; a member editing
+  text, titles and structure with the owner's web app seeing all of it; a reader's refusal
+  with nothing on the wire; a replica with an editor's and a reader's root not wedging;
+  "waiting for its key" opening within 30 s; subscriptions restored after a token refresh.
+- **Found and fixed by that verification** (all committed): a member never learns the
+  owner's store name; a new document's wrapped key rides its first `vaultAppend` and is
+  stored with it under one lock (a lost answer used to leave a blob nobody could open,
+  stalling every reader); the vault link asks the accounts service every two minutes
+  whether the grant changed and reconnects with a fresh token (a role change used to wait
+  for the token to expire, up to an hour); a second share renames the replica; a root a
+  member no longer holds takes no edits on their replica.
+
+## Decisions waiting for Joe
+
+1. **What a removed member's machine shows.** Today the folder stays, as it last was, read
+   only, with nothing saying why. Every sharing product removes it from view. Recommended:
+   drop the root from the explorer with a one-line notice, and delete the files when the
+   replica is removed. This deletes something from someone's screen because an owner said
+   so, which is why it is Joe's call.
+2. **Whether members see each other.** The accounts service answers the member list of a
+   share to any member of it, so an editor sees the other members' addresses.
+3. **The store's name on the hosted disk.** `cloudHostStore` sends the store's name to the
+   accounts service and the hosted manifest keeps it in the clear (the open question in
+   `docs/CRYPTO_CONTRACT.md`'s header). Members no longer see it; Pimble Cloud still does.
+4. **Merging.** The migration is one way. Back up, then move every device and the hosted
+   server together: deploy (hosted server and accounts service in one push), then the
+   desktop release the standing rule asks for.
+
+## Known limits (none blocks the design; each is a follow-up)
+
+- A scoped editor can move a node out of the share by setting its `parent_id` to a node
+  outside it (the server checks the document written, not where it points).
+- No data-key rotation when a node or a member leaves a share (they keep what they had;
+  the server stops serving them more). Two owner devices giving the same keyless document
+  a data key at once need a compare-and-set on `vaultSetDocKeys`.
+- A removed member's open connection is judged by its token until it expires (an hour at
+  most) if their client does not ask; an honest client asks every two minutes.
+- A co-owner is never handed a share's key. The accounts service cannot delete the owner's
+  own scoped key grant.
+- `derive_kinds`, `DocShape`, `merge_updates` and `document_root` exist in both the server
+  and the web client and belong in `pimble-crdt`. Uninitialised orphan node files (481 in
+  the family store) are synced as harmless documents and should be purged at migration.
+- `docs/ARCHITECTURE.md` still describes the store document in several sections (it says
+  so at its top).
+- The store row's badge is cut off when the replica's name is long ("Shared by <address>").
+
+## Next
+
+1. The relay tier (contract section 5b): an unhosted store shares through a reverse tunnel
+   to the owner's own server, and Pimble Cloud stores nothing.
+2. The browser pass above, then Joe's decisions, then merge, deploy and release.
+3. When rinch #832 (read-only editor switch) merges: `cargo update` the rinch crates in
+   the root and in `web/`, and replace the interim read-only handling in
+   `crates/pimble-app/src/editor.rs` with `set_read_only`.
+
+## Process notes that cost time before
+
+- Agents from an earlier session cannot be resumed after a restart: continue from
+  `git diff` with a fresh agent. No history-changing git while an agent works in the tree.
+- `pimble-cli` defaults to the person's own app on 7462. Use the wrappers in
+  `scripts/local-stack/env.sh`; never the bare binary, never a broad `pkill`.
+- The scratchpad does not survive a session: anything a later verification needs goes in
+  `scripts/`.
+
+## Earlier: where things stood on 2026-09-16 (master, before node documents)
 
 - **`cloud/phase-1` is merged into `master`** (fast-forward; `master` is at the workflow
   and release commits, the later commits below are on `cloud/phase-1` and fast-forward
