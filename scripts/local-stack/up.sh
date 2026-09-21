@@ -17,7 +17,7 @@ echo $! >> $STACK/pids
 XDG_CONFIG_HOME=$STACK/hosted/config XDG_DATA_HOME=$STACK/hosted/data RUST_LOG=pimble_server=info \
   $CLI server --addr 127.0.0.1:17490 --stores-dir $STACK/stores --token-file $STACK/hosted-token \
   --jwks http://127.0.0.1:18090/api/v1/.well-known/jwks.json --issuer $EDGE/api/v1 \
-  --allow-origin $EDGE > $STACK/hosted.log 2>&1 &
+  --allow-origin $EDGE --allow-origin http://localhost:18091 --allow-origin http://127.0.0.2:18091 > $STACK/hosted.log 2>&1 &
 echo $! >> $STACK/pids
 sleep 2
 

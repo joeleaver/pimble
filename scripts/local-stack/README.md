@@ -67,4 +67,14 @@ A sign-in made through the CLI lives in that identity's keystore, so the app sta
 in. The web app is at `http://127.0.0.1:18091/app/` (it asks for the password: keys live in
 memory only).
 
+## Two or three accounts in one browser
+
+Cookies are per host, so each account gets a host of its own: `127.0.0.1`, `localhost`
+(the same listener) and `127.0.0.2` (a second edge:
+`node scripts/local-stack/edge.js 18091 18090 17490 web/dist 127.0.0.2 &`). The hosted
+server has to admit each as an origin: start it with `--allow-origin` for all three
+(`up.sh` does). The token's issuer and the
+`rpc_url` stay `127.0.0.1` whichever host the page came from, which is fine: a WebSocket
+to another origin is allowed by the browser and judged by the server's allowlist.
+
 `scripts/local-stack/down.sh` stops everything.

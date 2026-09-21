@@ -3,6 +3,9 @@
 // the rest to the accounts service.
 const http = require('http'), net = require('net'), fs = require('fs'), path = require('path');
 const [listen, cloud, rpc, dist] = [+process.argv[2], +process.argv[3], +process.argv[4], process.argv[5]];
+// A second instance on another loopback address (127.0.0.2) gives a second cookie jar
+// in one browser: a second signed-in account side by side.
+const host = process.argv[6] || '127.0.0.1';
 const types = { '.html': 'text/html', '.js': 'text/javascript', '.wasm': 'application/wasm', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json' };
 const server = http.createServer((req, res) => {
   const url = req.url.split('?')[0];
@@ -27,4 +30,4 @@ server.on('upgrade', (req, socket, head) => {
   });
   up.on('error', () => socket.destroy()); socket.on('error', () => up.destroy());
 });
-server.listen(listen, '127.0.0.1');
+server.listen(listen, host);
