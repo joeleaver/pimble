@@ -12,10 +12,49 @@ use rinch::prelude::*;
 use crate::protocol::{BackendCommand, BackendEvent, CloudOp};
 use crate::editor::{apply_remote, start_editing};
 use crate::persistence::{load_app_state_file, save_app_state_file};
-use crate::state::{parse_tree_value, take_last_drop_target_value, AppStore, ConnectionState, MountInfo, SearchState};
+use crate::state::{
+    parse_tree_value, share_state_text, take_last_drop_target_value, AppStore, ConnectionState,
+    MountInfo, SearchState,
+};
 
 thread_local! {
     pub(crate) static EVENT_PROCESSOR: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    /// The timer that clears the status bar's notice again (see [`show_notice`]).
+    static NOTICE_TIMEOUT: RefCell<Option<TimeoutHandle>> = const { RefCell::new(None) };
+}
+
+/// How long a refusal stays in the status bar before it clears itself.
+const NOTICE_MS: u32 = 8000;
+
+/// Show a sentence in the status bar for a few seconds.
+///
+/// A refused command (`Forbidden`, e.g. a store shared read-only) is not a
+/// broken connection and must not read as one: the UI disables what a store's
+/// access forbids, so this is for the rare command that got through anyway —
+/// and it says what the server said (docs/SHARING_CONTRACT.md "Access on the
+/// recipient's side").
+fn show_notice(store: AppStore, message: String) {
+    if let Some(handle) = NOTICE_TIMEOUT.with(|slot| slot.borrow_mut().take()) {
+        clear_timeout(handle);
+    }
+    store.notice.set(message);
+    let timeout = set_timeout(NOTICE_MS, move || {
+        NOTICE_TIMEOUT.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        store.notice.set(String::new());
+    });
+    NOTICE_TIMEOUT.with(|slot| {
+        *slot.borrow_mut() = Some(timeout);
+    });
+}
+
+/// Whether an error is a refused write rather than a failure: one of the two
+/// sentences of `StoreAccess`, which the desktop's server sends as the whole
+/// `-32004` message and the browser backend answers itself, or any other
+/// `Forbidden: ` refusal, whose text is also meant for the person.
+fn refusal_sentence(message: &str) -> Option<&str> {
+    pimble_core::StoreAccess::refusal_in(message).or_else(|| message.strip_prefix("Forbidden: "))
 }
 
 /// Drain whatever the backend has posted into the UI, from a backend that has
@@ -237,6 +276,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 } else if untracked(|| store.mount_picker_pending.get()) {
                     store.mount_picker_pending.set(false);
                     store.mount_picker_error.set(message.clone());
+                } else if let Some(sentence) = refusal_sentence(message) {
+                    // The server refused the command; the connection is fine.
+                    show_notice(store, sentence.to_string());
                 } else {
                     store.connection.set(ConnectionState::Error(message.clone()));
                     store.connection_status.set(format!("Error: {}", message));
@@ -386,27 +428,30 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 let content_bytes = node.content.clone();
                 store.track_mount_info(*store_id, node);
 
-                // Whether the node's icon or colour changed against the cache: the
-                // row snapshots both at render time, so that (unlike a title or
-                // content change) needs the tree rebuilt to show. A node never
-                // cached before counts as changed when it carries either — a
-                // store's root node arrives after its row was first built.
-                let has_appearance = node.metadata.icon().is_some() || node.metadata.color().is_some();
-                let appearance_changed = untracked(|| {
+                // Whether the node's icon, colour or share marker changed against
+                // the cache: the row snapshots all three at render time, so that
+                // (unlike a title or content change) needs the tree rebuilt to
+                // show. A node never cached before counts as changed when it
+                // carries any of them — a store's root node arrives after its row
+                // was first built.
+                let shared = node.metadata.share().is_some();
+                let has_row_data = node.metadata.icon().is_some() || node.metadata.color().is_some() || shared;
+                let row_data_changed = untracked(|| {
                     store.node_data.with(|map| {
-                        map.get(&(*store_id, node_id)).map_or(has_appearance, |sig| {
+                        map.get(&(*store_id, node_id)).map_or(has_row_data, |sig| {
                             sig.with(|cached| {
                                 cached.metadata.icon() != node.metadata.icon()
                                     || cached.metadata.color() != node.metadata.color()
+                                    || cached.metadata.share().is_some() != shared
                             })
                         })
                     })
                 });
 
                 // Data-only: updates per-node signal, NO tree rebuild (except for
-                // an appearance change, below).
+                // a change to what the row snapshots, below).
                 store.upsert_node(*store_id, node.clone());
-                if appearance_changed {
+                if row_data_changed {
                     store.bump_tree_structure();
                 }
 
@@ -699,9 +744,14 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         }
                     }
                     StoreChangeKind::ShareStateChanged { node_id, state } => {
-                        // The Share dialog and the node's badge read this (the
-                        // sharing wave, docs/NODE_DOCUMENT_CONTRACT.md section 5).
+                        // What the share's link is doing, derived by the
+                        // server and never forwarded by a link. Only the
+                        // Share modal shows it, and only for the node it is
+                        // open for (docs/NODE_DOCUMENT_CONTRACT.md section 5).
                         tracing::info!("Share state of {:?}/{:?}: {:?}", store_id, node_id, state);
+                        if untracked(|| store.share_modal_node.get()) == Some((*store_id, *node_id)) {
+                            store.share_modal_state.set(share_state_text(state).to_string());
+                        }
                     }
                     StoreChangeKind::VaultAppended { .. } => {
                         // Encrypted-store blobs are handled by the vault client
@@ -876,11 +926,21 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         store.hosted_modal_error.set(message.clone());
                     }
                     CloudOp::Share
-                    | CloudOp::ShareInfo
                     | CloudOp::ShareInvite
                     | CloudOp::ShareRemoveMember
                     | CloudOp::StopSharing => {
-                        // The Share modal shows these (the sharing wave); logged above until it exists.
+                        // The modal that asked shows it, in the server's own
+                        // words (docs/NODE_DOCUMENT_CONTRACT.md section 5).
+                        store.share_modal_pending.set(None);
+                        store.share_modal_confirm_stop.set(false);
+                        store.share_modal_error.set(message.clone());
+                    }
+                    CloudOp::ShareInfo => {
+                        // Sent when the modal opens on a node that is already
+                        // shared; the marker still says it is, so the modal
+                        // keeps the shared face and says what went wrong.
+                        store.share_modal_pending.set(None);
+                        store.share_modal_error.set(message.clone());
                     }
                 }
             }
@@ -920,13 +980,252 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 store.bump_tree_structure();
             }
 
-            // The Share modal's state (the sharing wave, docs/NODE_DOCUMENT_CONTRACT.md section 5).
+            // The answer to every sharing request but "Stop sharing"
+            // (docs/NODE_DOCUMENT_CONTRACT.md section 5): the share as the accounts
+            // service has it now, and everyone on it.
             BackendEvent::CloudShareUpdated { store_id, node_id, share, members } => {
                 tracing::info!("Share of {:?}/{:?}: {:?}, {} members", store_id, node_id, share.state, members.len());
+                if untracked(|| store.share_modal_node.get()) == Some((*store_id, *node_id)) {
+                    store.share_modal_shared.set(true);
+                    store.share_modal_name.set(share.name.clone());
+                    store.share_modal_state.set(share_state_text(&share.state).to_string());
+                    store.share_modal_members.set(members.clone());
+                    store.share_modal_invite_email.set(String::new());
+                    store.share_modal_pending.set(None);
+                    store.share_modal_error.set(String::new());
+                }
+                // The marker the server wrote is what the tree's badge reads.
+                store.send(BackendCommand::GetNode { store_id: *store_id, node_id: *node_id });
             }
+
             BackendEvent::CloudSharingStopped { store_id, node_id } => {
                 tracing::info!("Stopped sharing {:?}/{:?}", store_id, node_id);
+                if untracked(|| store.share_modal_node.get()) == Some((*store_id, *node_id)) {
+                    store.share_modal_node.set(None);
+                    store.share_modal_shared.set(false);
+                    store.share_modal_members.set(Vec::new());
+                    store.share_modal_confirm_stop.set(false);
+                    store.share_modal_pending.set(None);
+                    store.share_modal_error.set(String::new());
+                }
+                // The marker is gone, so the badge goes with it.
+                store.send(BackendCommand::GetNode { store_id: *store_id, node_id: *node_id });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::bounded;
+    use pimble_core::{NodeId, StoreId, SyncState};
+    use pimble_rpc::{MemberRole, ShareInfo, ShareMember, ShareMemberStatus};
+
+    use crate::protocol::BackendHandle;
+
+    /// An `AppStore` with a backend whose events this test feeds by hand, and
+    /// the command channel the handlers send into, so a test can see what a
+    /// handler asked the server for.
+    fn store_with_events() -> (AppStore, crossbeam_channel::Sender<BackendEvent>, crossbeam_channel::Receiver<BackendCommand>) {
+        let store = AppStore::new();
+        let (cmd_tx, cmd_rx) = bounded::<BackendCommand>(64);
+        let (event_tx, event_rx) = bounded::<BackendEvent>(64);
+        store.backend.set(Some(BackendHandle { cmd_tx, event_rx }));
+        (store, event_tx, cmd_rx)
+    }
+
+    fn pump(store: AppStore) {
+        process_backend_events(store, UseTreeReturn::new(UseTreeOptions::default()));
+    }
+
+    fn share_info(store_id: StoreId, node_id: NodeId, name: &str) -> ShareInfo {
+        ShareInfo {
+            store_id,
+            node_id,
+            name: name.to_string(),
+            state: SyncState::Syncing,
+        }
+    }
+
+    /// The answer to every sharing request but "Stop sharing" moves the modal
+    /// to its shared face, with the members and the link's state in words, and
+    /// asks for the node again so the tree's badge appears.
+    #[test]
+    fn a_share_update_fills_the_modal() {
+        let (store, events, commands) = store_with_events();
+        let (store_id, node_id) = (StoreId::new(), NodeId::new());
+        store.share_modal_node.set(Some((store_id, node_id)));
+        store.share_modal_pending.set(Some(CloudOp::Share));
+
+        events
+            .send(BackendEvent::CloudShareUpdated {
+                store_id,
+                node_id,
+                share: share_info(store_id, node_id, "Recipes"),
+                members: vec![
+                    ShareMember { email: "me@example.com".into(), role: MemberRole::Owner, status: ShareMemberStatus::Active },
+                    ShareMember { email: "ann@example.com".into(), role: MemberRole::Editor, status: ShareMemberStatus::Invited },
+                ],
+            })
+            .unwrap();
+        pump(store);
+
+        assert!(store.share_modal_shared.get());
+        assert_eq!(store.share_modal_name.get(), "Recipes");
+        assert_eq!(store.share_modal_state.get(), "Sending changes to Pimble Cloud...");
+        assert_eq!(store.share_modal_members.with(|m| m.len()), 2);
+        assert_eq!(store.share_modal_pending.get(), None);
+        assert!(store.share_modal_error.get().is_empty());
+        assert!(commands
+            .try_iter()
+            .any(|cmd| matches!(cmd, BackendCommand::GetNode { node_id: n, .. } if n == node_id)));
+    }
+
+    /// An update for another node leaves a modal open on this one alone.
+    #[test]
+    fn a_share_update_for_another_node_is_ignored() {
+        let (store, events, _commands) = store_with_events();
+        let (store_id, node_id) = (StoreId::new(), NodeId::new());
+        store.share_modal_node.set(Some((store_id, node_id)));
+
+        let other = NodeId::new();
+        events
+            .send(BackendEvent::CloudShareUpdated {
+                store_id,
+                node_id: other,
+                share: share_info(store_id, other, "Somebody else's"),
+                members: Vec::new(),
+            })
+            .unwrap();
+        pump(store);
+
+        assert!(!store.share_modal_shared.get());
+        assert!(store.share_modal_name.get().is_empty());
+    }
+
+    /// A live `ShareStateChanged` is what the modal shows while it is open.
+    #[test]
+    fn a_share_state_change_shows_in_the_modal() {
+        let (store, events, _commands) = store_with_events();
+        let (store_id, node_id) = (StoreId::new(), NodeId::new());
+        store.share_modal_node.set(Some((store_id, node_id)));
+
+        events
+            .send(BackendEvent::RemoteStoreChange {
+                store_id,
+                change_kind: pimble_rpc::StoreChangeKind::ShareStateChanged { node_id, state: SyncState::Offline },
+                source_client_id: None,
+            })
+            .unwrap();
+        pump(store);
+
+        assert_eq!(
+            store.share_modal_state.get(),
+            "Offline. Changes go up when this device reconnects."
+        );
+    }
+
+    /// "Stop sharing" closes the modal and asks for the node again, so the
+    /// row's badge goes with the marker.
+    #[test]
+    fn stopping_a_share_closes_the_modal() {
+        let (store, events, commands) = store_with_events();
+        let (store_id, node_id) = (StoreId::new(), NodeId::new());
+        store.share_modal_node.set(Some((store_id, node_id)));
+        store.share_modal_shared.set(true);
+        store.share_modal_confirm_stop.set(true);
+        store.share_modal_pending.set(Some(CloudOp::StopSharing));
+
+        events.send(BackendEvent::CloudSharingStopped { store_id, node_id }).unwrap();
+        pump(store);
+
+        assert_eq!(store.share_modal_node.get(), None);
+        assert!(!store.share_modal_shared.get());
+        assert!(!store.share_modal_confirm_stop.get());
+        assert_eq!(store.share_modal_pending.get(), None);
+        assert!(commands
+            .try_iter()
+            .any(|cmd| matches!(cmd, BackendCommand::GetNode { node_id: n, .. } if n == node_id)));
+    }
+
+    /// A failed sharing request lands in the modal that asked, in the server's
+    /// own words — including the stub's, until the server side is built.
+    #[test]
+    fn a_sharing_error_lands_in_the_modal() {
+        let (store, events, _commands) = store_with_events();
+        store.share_modal_pending.set(Some(CloudOp::ShareInvite));
+
+        events
+            .send(BackendEvent::CloudError {
+                op: CloudOp::ShareInvite,
+                message: "Sharing a node is not built yet".to_string(),
+            })
+            .unwrap();
+        pump(store);
+
+        assert_eq!(store.share_modal_error.get(), "Sharing a node is not built yet");
+        assert_eq!(store.share_modal_pending.get(), None);
+        // The connection is fine; nothing about it changed.
+        assert_eq!(store.connection_status.get(), "Connecting...");
+    }
+
+    /// A refusal is the server saying no, not a broken connection: it shows
+    /// its own sentence and leaves the connection badge alone.
+    #[test]
+    fn a_refusal_is_a_notice_not_an_error() {
+        let (store, events, _commands) = store_with_events();
+
+        events
+            .send(BackendEvent::Error {
+                message: "Forbidden: The structure of a shared folder is managed by its owner.".to_string(),
+            })
+            .unwrap();
+        pump(store);
+
+        assert_eq!(store.notice.get(), "The structure of a shared folder is managed by its owner.");
+        assert_eq!(store.connection_status.get(), "Connecting...");
+    }
+
+    /// The desktop's server and the browser backend send the sentence alone.
+    #[test]
+    fn a_refusal_without_a_prefix_is_a_notice_too() {
+        let (store, events, _commands) = store_with_events();
+
+        events
+            .send(BackendEvent::Error { message: pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string() })
+            .unwrap();
+        pump(store);
+
+        assert_eq!(store.notice.get(), pimble_core::StoreAccess::READ_ONLY_REFUSAL);
+        assert_eq!(store.connection_status.get(), "Connecting...");
+    }
+
+    /// A node that has just been shared must re-render its row, and rinch
+    /// re-renders one only when its data changes — so the marker arriving
+    /// bumps the tree (docs/NODE_DOCUMENT_CONTRACT.md section 5).
+    #[test]
+    fn a_new_share_marker_rebuilds_the_row() {
+        let (store, events, _commands) = store_with_events();
+        let store_id = StoreId::new();
+        let mut node = pimble_core::Node::document("Recipes");
+        store.upsert_node(store_id, node.clone());
+        let before = store.tree_structure_version.get();
+
+        node.metadata.set_share(Some(&pimble_core::ShareMarker {
+            v: pimble_core::ShareMarker::VERSION,
+            key_id: uuid::Uuid::new_v4(),
+            url: "https://pimble.app".to_string(),
+            name: "Recipes".to_string(),
+        }));
+        events.send(BackendEvent::NodeLoaded { store_id, node: node.clone() }).unwrap();
+        pump(store);
+        assert!(store.tree_structure_version.get() > before, "the row never re-renders");
+
+        // The same node again changes nothing the row draws.
+        let after = store.tree_structure_version.get();
+        events.send(BackendEvent::NodeLoaded { store_id, node }).unwrap();
+        pump(store);
+        assert_eq!(store.tree_structure_version.get(), after);
     }
 }

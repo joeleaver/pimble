@@ -101,6 +101,44 @@ pub(crate) const APP_CSS: &str = "
     border-color: var(--rinch-color-border);
 }
 
+/* One dimmed line at the top of a context menu saying why the items below
+   are greyed out (docs/SHARING_CONTRACT.md): a menu that disables items
+   without a reason is what this prevents. */
+.pimble-menu-note {
+    padding: 6px 12px;
+    max-width: 260px;
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--rinch-color-dimmed);
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+
+/* The badge a shared node's row carries after its label
+   (docs/SHARING_CONTRACT.md, Apps). */
+.pimble-tree__share {
+    display: inline-flex;
+    align-items: center;
+    margin-left: 6px;
+    color: var(--rinch-color-dimmed);
+    opacity: 0.75;
+}
+.pimble-tree__share svg {
+    width: 0.75rem;
+    height: 0.75rem;
+}
+
+/* What a store row says about a store someone shared with this account:
+   who shared it and what it may do here. */
+.pimble-tree__shared-by {
+    margin-left: 6px;
+    font-size: 10px;
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: normal;
+    opacity: 0.6;
+    cursor: default;
+}
+
 /* Mount point icon gets a distinct color */
 .rinch-tree__icon--mount {
     color: var(--rinch-primary-color-6) !important;
@@ -158,6 +196,53 @@ pub(crate) const APP_CSS: &str = "
 .pimble-icon-choice svg {
     width: 18px;
     height: 18px;
+}
+
+/* ── Share modal ────────────────────────────────────────────── */
+
+.pimble-share__note {
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+    line-height: 1.5;
+}
+
+.pimble-share__members {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+}
+
+.pimble-share__member {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+.pimble-share__member:last-child {
+    border-bottom: none;
+}
+
+.pimble-share__member-email {
+    flex: 1;
+    min-width: 0;
+    font-size: 13px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.pimble-share__member-status {
+    font-size: 11px;
+    color: var(--rinch-color-dimmed);
+    white-space: nowrap;
+}
+
+.pimble-share__invite {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
 }
 
 /* ── Editor panel ───────────────────────────────────────────── */
@@ -361,6 +446,22 @@ pub(crate) const APP_CSS: &str = "
 .pimble-status-bar__account:hover {
     opacity: 1;
     text-decoration: underline;
+}
+
+/* A refusal the server sent back: not a broken connection, so it reads as a
+   plain sentence rather than as the error badge. */
+.pimble-status-bar__notice {
+    font-size: 11px;
+    color: var(--rinch-color-yellow-6);
+}
+
+/* The editor pane's read-only line, shown where the toolbar would be. */
+.pimble-editor__read-only {
+    padding: 6px 12px;
+    font-size: 11px;
+    color: var(--rinch-color-dimmed);
+    border-top: 1px solid var(--rinch-color-border);
+    border-bottom: 1px solid var(--rinch-color-border);
 }
 ";
 

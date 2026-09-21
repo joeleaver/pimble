@@ -124,6 +124,38 @@ pub fn mount_label_suffix(state: &MountState) -> &'static str {
     }
 }
 
+/// What a share's link is doing, in one plain sentence for the Share modal
+/// (docs/SHARING_CONTRACT.md "Apps"). `Conflict` cannot happen to a share
+/// today, but a state needs words rather than a gap in the match.
+pub fn share_state_text(state: &SyncState) -> &'static str {
+    match state {
+        SyncState::Synced { .. } => "Up to date with Pimble Cloud.",
+        SyncState::Syncing => "Sending changes to Pimble Cloud...",
+        SyncState::Offline => "Offline. Changes go up when this device reconnects.",
+        SyncState::Conflict { .. } => "This share could not be synced.",
+    }
+}
+
+/// What this device may do in a store someone shared with it, in words
+/// (docs/SHARING_CONTRACT.md "Access on the recipient's side"). Empty for a
+/// store of one's own, which the row says nothing about.
+pub fn access_words(access: pimble_core::StoreAccess) -> &'static str {
+    match access {
+        pimble_core::StoreAccess::Full => "",
+        pimble_core::StoreAccess::Read => "read only",
+    }
+}
+
+/// Why a row's tree-changing menu items are disabled, or empty when they are
+/// not. One sentence at the top of the menu rather than a reason repeated on
+/// every item.
+pub fn access_note(access: pimble_core::StoreAccess) -> &'static str {
+    match access {
+        pimble_core::StoreAccess::Full => "",
+        pimble_core::StoreAccess::Read => "Shared with you to read. Nothing here can be changed.",
+    }
+}
+
 /// Whether a mount row's icon and label render dimmed: its source is out of
 /// reach (`Unavailable`) or not reachable yet (`Connecting`). A `Cached`
 /// mount still shows its replica's content, so it reads normally and only
@@ -372,6 +404,39 @@ pub struct AppStore {
     /// True while a `CloudListHostedStores` or `CloudAddHostedStore` is in flight.
     pub hosted_modal_busy: Signal<bool>,
     pub hosted_modal_error: Signal<String>,
+
+    // "Share..." modal (node context menu, docs/SHARING_CONTRACT.md "Apps").
+    // One modal, two faces: the name field and "Share" while the node is not
+    // shared, the members and "Stop sharing" once it is.
+    /// The canonical node the modal is open for; `None` means closed.
+    pub share_modal_node: Signal<Option<(StoreId, NodeId)>>,
+    /// The share's name: the node's title while it is only a proposal, then
+    /// the name the share carries. Pimble Cloud sees it, and so does everyone
+    /// invited.
+    pub share_modal_name: Signal<String>,
+    /// Which face the modal shows. Seeded from the node's own share marker
+    /// when the modal opens (that is the local truth about whether a node is
+    /// shared) and moved by `CloudShareUpdated` / `CloudSharingStopped`.
+    pub share_modal_shared: Signal<bool>,
+    pub share_modal_members: Signal<Vec<pimble_rpc::ShareMember>>,
+    /// The share link's state in words. Kept apart from `share_modal_share`
+    /// because `ShareStateChanged` updates it on its own.
+    pub share_modal_state: Signal<String>,
+    pub share_modal_invite_email: Signal<String>,
+    /// `"editor"` or `"reader"` — the raw `Select` value of the role field.
+    pub share_modal_invite_role: Signal<String>,
+    /// Which sharing request is in flight, so its own button shows the
+    /// spinner and the others are held back; `None` when nothing is.
+    pub share_modal_pending: Signal<Option<crate::protocol::CloudOp>>,
+    pub share_modal_error: Signal<String>,
+    /// The "Stop sharing" confirmation is showing instead of the member list.
+    pub share_modal_confirm_stop: Signal<bool>,
+
+    /// A sentence the server sent back refusing a command (`Forbidden`, e.g.
+    /// a store shared read-only), shown in the status bar. Not an error
+    /// state: the connection is fine, the command was simply not allowed
+    /// (docs/SHARING_CONTRACT.md "Access on the recipient's side").
+    pub notice: Signal<String>,
 }
 
 /// Identifies the node currently open in the shared editor.
@@ -462,7 +527,50 @@ impl AppStore {
             hosted_modal_selected: Signal::new(String::new()),
             hosted_modal_busy: Signal::new(false),
             hosted_modal_error: Signal::new(String::new()),
+            share_modal_node: Signal::new(None),
+            share_modal_name: Signal::new(String::new()),
+            share_modal_shared: Signal::new(false),
+            share_modal_members: Signal::new(Vec::new()),
+            share_modal_state: Signal::new(String::new()),
+            share_modal_invite_email: Signal::new(String::new()),
+            share_modal_invite_role: Signal::new("editor".to_string()),
+            share_modal_pending: Signal::new(None),
+            share_modal_error: Signal::new(String::new()),
+            share_modal_confirm_stop: Signal::new(false),
+            notice: Signal::new(String::new()),
         }
+    }
+
+    /// What this device may change in a store (docs/SHARING_CONTRACT.md
+    /// "Access on the recipient's side"), untracked. A store the app has not
+    /// registered yet reads as `Full`: nothing is disabled on a guess.
+    pub fn store_access(&self, store_id: StoreId) -> pimble_core::StoreAccess {
+        untracked(|| {
+            self.store_data.with(|map| {
+                map.get(&store_id)
+                    .map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|s| s.access))
+            })
+        })
+    }
+
+    /// The email of whoever shared a store with this account, when it is
+    /// someone else's share (untracked).
+    pub fn shared_by(&self, store_id: StoreId) -> Option<String> {
+        untracked(|| {
+            self.store_data
+                .with(|map| map.get(&store_id).and_then(|sig| sig.with(|s| s.shared_by.clone())))
+        })
+    }
+
+    /// Whether a node carries a share marker — it is shared, and the row
+    /// shows the badge (untracked).
+    pub fn is_shared(&self, store_id: StoreId, node_id: NodeId) -> bool {
+        untracked(|| {
+            self.node_data.with(|map| {
+                map.get(&(store_id, node_id))
+                    .map_or(false, |sig| sig.with(|n| n.metadata.share().is_some()))
+            })
+        })
     }
 
     /// Record what a store's sync link is (`Plain` or `Vault`) on the store's
@@ -850,6 +958,27 @@ impl AppStore {
         })
     }
 
+    /// Everything a node's row snapshots from the node itself at render time:
+    /// its custom icon and colour, and whether it is shared. Part of the row's
+    /// `TreeNodeData` label so a change re-renders the row (rinch #714), and
+    /// nothing reads it back.
+    fn row_snapshot(&self, store_id: StoreId, node_id: NodeId) -> String {
+        self.node_data.with(|map| {
+            map.get(&(store_id, node_id))
+                .map(|sig| {
+                    sig.with(|n| {
+                        format!(
+                            "{}|{}|{}",
+                            n.metadata.icon().unwrap_or(""),
+                            n.metadata.color().unwrap_or(""),
+                            if n.metadata.share().is_some() { "shared" } else { "" },
+                        )
+                    })
+                })
+                .unwrap_or_default()
+        })
+    }
+
     /// Build structural tree data for the Tree component's data_source.
     ///
     /// Must be called from within an `untracked()` context. Builds TreeNodeData
@@ -880,14 +1009,16 @@ impl AppStore {
                 map.get(&sid).map_or(false, |sig| sig.with(|(remote, _)| remote.is_some()))
             });
             // A store row's icon and colour come from its root node's metadata.
-            let root_appearance = self.node_data.with(|map| {
-                map.get(&(sid, root_id)).map(|sig| {
-                    sig.with(|n| format!("{}|{}", n.metadata.icon().unwrap_or(""), n.metadata.color().unwrap_or("")))
-                })
+            let root_appearance = self.row_snapshot(sid, root_id);
+            // What this device may change here, and who shared it: the row's
+            // menu snapshots both (docs/SHARING_CONTRACT.md "Access on the
+            // recipient's side"), so a change has to change the data.
+            let access = self.store_data.with(|map| {
+                map.get(&sid).map(|sig| sig.with(|s| format!("{:?}{:?}", s.access, s.shared_by))).unwrap_or_default()
             });
             let store_node = TreeNodeData::new(
                 format!("store_{}", sid),
-                format!("{store_name} (linked: {linked}, paste: {paste}, {})", root_appearance.unwrap_or_default()),
+                format!("{store_name} (linked: {linked}, paste: {paste}, {access}, {root_appearance})"),
             );
             let children = self.build_children_structural(sid, root_id, paste, &[]);
             if children.is_empty() {
@@ -928,17 +1059,17 @@ impl AppStore {
 
             // The renderer never reads this label (render_node Effects draw
             // it reactively); it only carries what the row snapshots at render
-            // time — the "Paste Mount Here" state and the node's custom icon
-            // and colour — so the row re-renders when any of them changes
-            // (see `build_tree_data_structural`).
-            let appearance = self.node_data.with(|map| {
-                map.get(&(child_store, child_id)).map(|sig| {
-                    sig.with(|n| format!("{}|{}", n.metadata.icon().unwrap_or(""), n.metadata.color().unwrap_or("")))
-                })
+            // time — the "Paste Mount Here" state, the node's custom icon and
+            // colour, its share marker, and what this device may change in
+            // the node's own store — so the row re-renders when any of them
+            // changes (see `build_tree_data_structural`).
+            let appearance = self.row_snapshot(child_store, child_id);
+            let access = self.store_data.with(|map| {
+                map.get(&child_store).map(|sig| sig.with(|s| format!("{:?}", s.access))).unwrap_or_default()
             });
             let tree_node = TreeNodeData::new(
                 format!("node_{}_{}{}", child_store, child_id, suffix),
-                format!("{}|{}", if paste { "paste" } else { "" }, appearance.unwrap_or_default()),
+                format!("{}|{}|{}", if paste { "paste" } else { "" }, access, appearance),
             );
 
             // Crossing a mount node adds it to the path for everything below it.
@@ -1061,4 +1192,97 @@ pub enum ConnectionState {
     Disconnected,
     Connected,
     Error(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pimble_core::{Node, Store, StoreAccess, StoreId};
+
+    /// A store with one child under its root, and the child's canonical pair.
+    fn store_with_a_child() -> (AppStore, StoreId, NodeId) {
+        let app = AppStore::new();
+        let mut store = Store::new_local("Notes", "/tmp/notes.pimble".into());
+        let root = Node::folder("Notes");
+        store.root_node_id = root.id;
+        let child = Node::document("Recipes");
+        let (store_id, child_id) = (store.id, child.id);
+        app.upsert_store(store);
+        app.upsert_node(store_id, root.clone());
+        app.upsert_node(store_id, child);
+        app.set_children(store_id, root.id, vec![(store_id, child_id)]);
+        (app, store_id, child_id)
+    }
+
+    /// rinch re-renders a tree row only when its `TreeNodeData` changes, and a
+    /// row's menu snapshots the store's access and the node's share marker at
+    /// render time — so both have to be in the data (docs/SHARING_CONTRACT.md
+    /// "Apps", CLAUDE.md "Hardening").
+    #[test]
+    fn row_data_carries_access_and_the_share_marker() {
+        let (app, store_id, child_id) = store_with_a_child();
+        let before = untracked(|| app.build_tree_data_structural());
+
+        // A store shared read-only: every row that could write the tree has
+        // to re-render with its items disabled.
+        if let Some(sig) = app.get_store_signal(store_id) {
+            sig.update(|s| {
+                s.access = StoreAccess::Read;
+                s.shared_by = Some("ann@example.com".to_string());
+            });
+        }
+        let after_access = untracked(|| app.build_tree_data_structural());
+        assert_ne!(before[0].label, after_access[0].label, "the store row never re-renders");
+        assert_ne!(
+            before[0].children[0].label, after_access[0].children[0].label,
+            "the node row never re-renders"
+        );
+
+        // A marker appearing is the badge appearing.
+        if let Some(sig) = app.get_node_signal(store_id, child_id) {
+            sig.update(|n| {
+                n.metadata.set_share(Some(&pimble_core::ShareMarker {
+                    v: pimble_core::ShareMarker::VERSION,
+                    key_id: uuid::Uuid::new_v4(),
+                    url: "https://pimble.app".to_string(),
+                    name: "Recipes".to_string(),
+                }));
+            });
+        }
+        let after_share = untracked(|| app.build_tree_data_structural());
+        assert_ne!(
+            after_access[0].children[0].label, after_share[0].children[0].label,
+            "a shared node's row never re-renders"
+        );
+        assert!(app.is_shared(store_id, child_id));
+    }
+
+    /// A store nobody shared reads as `Full`, and so does one the app has not
+    /// registered: nothing is ever disabled on a guess.
+    #[test]
+    fn access_defaults_to_full() {
+        let (app, store_id, _) = store_with_a_child();
+        assert_eq!(app.store_access(store_id), StoreAccess::Full);
+        assert_eq!(app.store_access(StoreId::new()), StoreAccess::Full);
+        assert_eq!(app.shared_by(store_id), None);
+    }
+
+    /// What the recipient's side says, in words.
+    #[test]
+    fn access_reads_as_plain_words() {
+        assert_eq!(access_words(StoreAccess::Full), "");
+        assert_eq!(access_words(StoreAccess::Read), "read only");
+        assert!(access_note(StoreAccess::Full).is_empty());
+        assert!(access_note(StoreAccess::Read).contains("Shared with you"));
+    }
+
+    /// Every state a share's link can be in says what it means.
+    #[test]
+    fn share_state_reads_as_a_sentence() {
+        let synced: SyncState =
+            serde_json::from_str(r#"{"state":"synced","last_sync":"2026-09-17T00:00:00Z"}"#).unwrap();
+        assert_eq!(share_state_text(&synced), "Up to date with Pimble Cloud.");
+        assert_eq!(share_state_text(&SyncState::Syncing), "Sending changes to Pimble Cloud...");
+        assert!(share_state_text(&SyncState::Offline).starts_with("Offline."));
+    }
 }

@@ -12,7 +12,7 @@ use rinch::core::{request_focus, set_keyboard_interceptor, clear_keyboard_interc
 use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
 
 use crate::rinch_editor::Editor;
-use crate::protocol::BackendCommand;
+use crate::protocol::{BackendCommand, CloudOp};
 #[cfg(feature = "native")]
 use crate::protocol::BackendHandle;
 use crate::editor::{start_editing, stop_editing};
@@ -48,6 +48,10 @@ const CAN_ADMINISTER_STORES: bool = cfg!(feature = "native");
 /// browser build asks the accounts service for a hosted one and mints its key.
 /// Both are "New Store...", and no build offers neither.
 const CAN_CREATE_HOSTED_STORES: bool = !CAN_ADMINISTER_STORES;
+
+/// Why "Share..." is disabled on a mount row: the node itself lives in
+/// another store, and that is where a share of it belongs.
+const MOUNT_NOTE: &str = "A mount stands in for a node in another store. Share it there.";
 
 /// Milliseconds on a clock that only moves forward, for the double-click
 /// window above. `std::time::Instant` has no implementation on
@@ -434,6 +438,72 @@ pub fn open_hosted_modal(store: AppStore) {
     }
 }
 
+/// "Share..." for `(store_id, node_id)` (docs/SHARING_CONTRACT.md "Apps"):
+/// the Share modal when an account is signed in, the Account modal with a
+/// hint otherwise — the same rule "Host on Pimble Cloud..." follows, because
+/// a share lives on an account.
+///
+/// The node's own share marker decides which face opens, so a node already
+/// shared shows its share at once; `CloudShareInfo` then fills in the members
+/// the accounts service has.
+pub fn open_share_modal(store: AppStore, store_id: pimble_core::StoreId, node_id: pimble_core::NodeId) {
+    if !untracked(|| store.cloud_signed_in.get()) {
+        open_account_modal(store, "Sign in to share a node");
+        return;
+    }
+    let marker = store
+        .get_node_signal(store_id, node_id)
+        .and_then(|sig| untracked(|| sig.with(|n| n.metadata.share())));
+    let name = match &marker {
+        Some(marker) => marker.name.clone(),
+        None => store.display_label(store_id, node_id),
+    };
+    store.share_modal_shared.set(marker.is_some());
+    store.share_modal_name.set(name);
+    store.share_modal_members.set(Vec::new());
+    store.share_modal_state.set(String::new());
+    store.share_modal_invite_email.set(String::new());
+    store.share_modal_invite_role.set("editor".to_string());
+    store.share_modal_error.set(String::new());
+    store.share_modal_confirm_stop.set(false);
+    store.share_modal_pending.set(marker.is_some().then_some(crate::protocol::CloudOp::ShareInfo));
+    store.share_modal_node.set(Some((store_id, node_id)));
+    if marker.is_some() {
+        store.send(BackendCommand::CloudShareInfo { store_id, node_id });
+    }
+}
+
+/// How a hosted store reads in the "Add Hosted Store..." list. A share is
+/// one node of someone else's store, so it says whose
+/// (docs/SHARING_CONTRACT.md "Apps").
+fn hosted_store_label(info: &pimble_rpc::CloudHostedStoreInfo) -> String {
+    match (info.root.is_some(), &info.shared_by) {
+        (true, Some(email)) => format!("{}, shared by {}", info.name, email),
+        _ => info.name.clone(),
+    }
+}
+
+/// How far a member is from being able to open the share, in words
+/// (docs/SHARING_CONTRACT.md "Apps"). An invitation to an address with no
+/// account yet, and a member whose key no device of ours has wrapped yet, are
+/// both ordinary states rather than failures, so both say what is happening.
+fn member_status_text(status: pimble_rpc::ShareMemberStatus) -> &'static str {
+    match status {
+        pimble_rpc::ShareMemberStatus::Invited => "invited, no account yet",
+        pimble_rpc::ShareMemberStatus::WaitingForKey => "waiting for your Pimble to hand over the key",
+        pimble_rpc::ShareMemberStatus::Active => "active",
+    }
+}
+
+/// A member's role in words, for the member list.
+fn member_role_text(role: pimble_rpc::MemberRole) -> &'static str {
+    match role {
+        pimble_rpc::MemberRole::Owner => "owner",
+        pimble_rpc::MemberRole::Editor => "can edit",
+        pimble_rpc::MemberRole::Reader => "can read",
+    }
+}
+
 /// Open the "Appearance..." picker for `(store_id, node_id)`: seed the tags field
 /// from the node and clear the icon search.
 fn open_appearance_modal(store: AppStore, store_id: pimble_core::StoreId, node_id: pimble_core::NodeId) {
@@ -637,6 +707,16 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         return;
                     }
 
+                    // The tree of a shared folder is its owner's
+                    // (docs/SHARING_CONTRACT.md): the context menu's "Rename"
+                    // is disabled there, so the double-click shortcut is not
+                    // a way around it.
+                    let renameable = parse_tree_value(&value)
+                        .map_or(true, |(s_id, _)| store.store_access(s_id).allows_write());
+                    if !renameable {
+                        return;
+                    }
+
                     let edit_text = if let Some((store_id, Some(node_id))) = parse_tree_value(&value) {
                         store.get_node_signal(store_id, node_id)
                             .map(|sig| sig.with(|n| n.metadata.title.clone()))
@@ -800,6 +880,34 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 .map(|(s_id, _)| store.is_vault(s_id))
                 .unwrap_or(false);
 
+            // What this device may change in the store this row's node
+            // belongs to (docs/SHARING_CONTRACT.md "Access on the recipient's
+            // side"). `parse_tree_value` returns the CANONICAL pair, so a node
+            // reached through a mount is judged by its source store, which is
+            // the store the RPC would go to. Snapshotted like `is_linked_now`
+            // (rinch #714); the row's data carries it, so a store whose access
+            // changes re-renders its rows with fresh items.
+            let access_now = parsed
+                .map(|(s_id, _)| store.store_access(s_id))
+                .unwrap_or_default();
+            let can_write_tree = access_now.allows_write();
+            // A mount's "New Node" creates under the mount's SOURCE, so the
+            // source store's access is what governs that one item.
+            let can_write_mount_source = mount_sig
+                .and_then(|sig| untracked(|| sig.with(|m| m.mount_ref.as_ref().map(|r| r.source_store))))
+                .map_or(can_write_tree, |source| store.store_access(source).allows_write());
+            // Whether this row's node carries a share marker (a store row
+            // takes its root node's, like its icon and colour): the badge.
+            let is_shared_now = if is_store_root {
+                parsed
+                    .and_then(|(s_id, _)| store.root_node_id(s_id).map(|root| store.is_shared(s_id, root)))
+                    .unwrap_or(false)
+            } else {
+                parsed
+                    .and_then(|(s_id, n_id)| n_id.map(|n_id| store.is_shared(s_id, n_id)))
+                    .unwrap_or(false)
+            };
+
             // Choose icon (static — changes only on structural rebuild). Folders
             // are folders even when empty; documents are documents even with
             // children, so the icon follows node_type, not has_children.
@@ -876,6 +984,13 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     if dragged_value == nv { return; }
                     let Some((drag_store_id, Some(drag_node_id))) = parse_tree_value(&dragged_value) else { return; };
                     let new_parent_id = if let Some((target_store_id, target_node_id_opt)) = parse_tree_value(&nv) {
+                        // The tree of a shared folder belongs to its owner
+                        // (docs/SHARING_CONTRACT.md): nothing moves into one
+                        // from here, and the server would refuse it anyway.
+                        if !store.store_access(target_store_id).allows_write() {
+                            tracing::info!("Ignoring drop into {:?}: its structure is not ours to change", target_store_id);
+                            return;
+                        }
                         if drag_store_id != target_store_id {
                             tracing::warn!(
                                 "Ignoring drop: source store {:?} differs from target store {:?} (cross-store move not supported yet)",
@@ -970,6 +1085,18 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 move || {
                     if let Some((s_id, _)) = parse_tree_value(&nv) {
                         open_host_modal(store, s_id);
+                    }
+                }
+            };
+            // "Share...": share this node (a store row shares its root node)
+            // with people on Pimble Cloud (docs/SHARING_CONTRACT.md).
+            let on_share = {
+                let nv = nv_ctx.clone();
+                move || {
+                    if let Some((s_id, node_id_opt)) = parse_tree_value(&nv) {
+                        if let Some(n_id) = node_id_opt.or_else(|| store.root_node_id(s_id)) {
+                            open_share_modal(store, s_id, n_id);
+                        }
                     }
                 }
             };
@@ -1107,10 +1234,69 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 move || paste_mount_here(store, &nv)
             };
 
-            // Build the wrapper span with drag-and-drop via rsx
-            let draggable = if is_store_root { "false" } else { "true" };
+            // Build the wrapper span with drag-and-drop via rsx. A node in a
+            // store whose structure this device may not change does not drag
+            // out of its place, as the drop handler refuses drops into one.
+            let draggable = if is_store_root || !can_write_tree { "false" } else { "true" };
 
             let icon_el = render_tabler_icon(__scope, icon, TablerIconStyle::Outline);
+
+            // The badge a shared node's row carries after its label. Drawn
+            // from the render-time snapshot, like the type icon: the row's
+            // data holds the marker, so it re-renders when one appears or goes
+            // (docs/SHARING_CONTRACT.md "Apps").
+            let share_badge: Option<NodeHandle> = if is_shared_now {
+                let badge_icon = render_tabler_icon(__scope, TablerIcon::Share, TablerIconStyle::Outline);
+                Some(rsx! {
+                    span {
+                        class: "pimble-tree__share",
+                        title: "Shared on Pimble Cloud",
+                        {badge_icon}
+                    }
+                })
+            } else {
+                None
+            };
+
+            // A store someone else shared with this account says so on its
+            // row, and what it lets this device do. Reactive on the store's
+            // own signal so it appears as soon as the store arrives.
+            let shared_by_note: Option<NodeHandle> = if is_store_root {
+                // The sidebar is narrow enough to clip this, so the same
+                // sentence is the row's tooltip.
+                let shared_by_text = move || -> String {
+                    store_sig
+                        .map(|sig| {
+                            sig.with(|s| match &s.shared_by {
+                                Some(email) => {
+                                    let words = crate::state::access_words(s.access);
+                                    if words.is_empty() {
+                                        format!("shared by {email}")
+                                    } else {
+                                        format!("shared by {email} · {words}")
+                                    }
+                                }
+                                None => String::new(),
+                            })
+                        })
+                        .unwrap_or_default()
+                };
+                Some(rsx! {
+                    span {
+                        class: "pimble-tree__shared-by",
+                        style: {
+                            move || {
+                                let shared = store_sig.map_or(false, |sig| sig.with(|s| s.shared_by.is_some()));
+                                if shared { "" } else { "display: none;" }
+                            }
+                        },
+                        title: {move || shared_by_text()},
+                        {move || shared_by_text()}
+                    }
+                })
+            } else {
+                None
+            };
 
             let nv_submit = node_value.clone();
             let nv_effect = node_value.clone();
@@ -1232,6 +1418,9 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         }}
                     }
 
+                    {share_badge}
+                    {shared_by_note}
+
                     // Sync status badge (store roots only, linked stores
                     // only) — reactive per store, no tree rebuild
                     // (docs/SYNC_CONTRACT.md "B: app side").
@@ -1265,20 +1454,44 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 }
             };
 
+            // Why the items below are disabled, when some of them are: one
+            // dimmed line at the top of the menu, rather than the same reason
+            // repeated on every item or (worse) items greyed out saying
+            // nothing (docs/SHARING_CONTRACT.md "Apps").
+            let access_note_text = crate::state::access_note(access_now);
+            let menu_note: Option<NodeHandle> = if access_note_text.is_empty() {
+                None
+            } else {
+                Some(rsx! { div { class: "pimble-menu-note", {access_note_text} } })
+            };
+            let mount_menu_note: Option<NodeHandle> = if is_mount {
+                let text = if access_note_text.is_empty() {
+                    MOUNT_NOTE.to_string()
+                } else {
+                    format!("{access_note_text} {MOUNT_NOTE}")
+                };
+                Some(rsx! { div { class: "pimble-menu-note", {text} } })
+            } else {
+                None
+            };
+
             // Wrap in ContextMenu — different items for store roots vs nodes
             let context_menu = if is_store_root {
                 rsx! {
                     ContextMenu {
                         ContextMenuTarget { {wrapper} }
                         ContextMenuDropdown {
+                            {menu_note}
                             DropdownMenuItem {
                                 left_section: TablerIcon::FilePlus,
+                                disabled: !can_write_tree,
                                 onclick: on_new_child,
                                 "New Node"
                             }
                             if mounts_apply {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::Link,
+                                    disabled: !can_write_tree,
                                     onclick: on_mount_store.clone(),
                                     "Mount Store..."
                                 }
@@ -1286,6 +1499,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             if CAN_ADMINISTER_STORES {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::CloudDownload,
+                                    disabled: !can_write_tree,
                                     onclick: on_mount_remote_store.clone(),
                                     "Mount Remote Store Here..."
                                 }
@@ -1300,7 +1514,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             if mounts_apply {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::ClipboardCopy,
-                                    disabled: no_mount_source,
+                                    disabled: no_mount_source || !can_write_tree,
                                     onclick: on_paste_mount.clone(),
                                     "Paste Mount Here"
                                 }
@@ -1323,6 +1537,14 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             }
                             if CAN_ADMINISTER_STORES {
                                 DropdownMenuItem {
+                                    left_section: TablerIcon::Share,
+                                    disabled: !can_write_tree,
+                                    onclick: on_share.clone(),
+                                    "Share..."
+                                }
+                            }
+                            if CAN_ADMINISTER_STORES {
+                                DropdownMenuItem {
                                     left_section: TablerIcon::Unlink,
                                     disabled: !is_linked_now,
                                     onclick: on_unlink_from_remote.clone(),
@@ -1339,6 +1561,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Palette,
+                                disabled: !can_write_tree,
                                 onclick: on_appearance,
                                 "Appearance..."
                             }
@@ -1357,18 +1580,29 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     ContextMenu {
                         ContextMenuTarget { {wrapper} }
                         ContextMenuDropdown {
+                            {mount_menu_note}
                             DropdownMenuItem {
                                 left_section: TablerIcon::FilePlus,
+                                disabled: !can_write_mount_source,
                                 onclick: on_new_child_mount,
                                 "New Node"
                             }
+                            if CAN_ADMINISTER_STORES {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::Share,
+                                    disabled: true,
+                                    "Share..."
+                                }
+                            }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Palette,
+                                disabled: !can_write_tree,
                                 onclick: on_appearance,
                                 "Appearance..."
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Trash,
+                                disabled: !can_write_tree,
                                 onclick: on_delete,
                                 "Delete"
                             }
@@ -1418,14 +1652,17 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     ContextMenu {
                         ContextMenuTarget { {wrapper} }
                         ContextMenuDropdown {
+                            {menu_note}
                             DropdownMenuItem {
                                 left_section: TablerIcon::FilePlus,
+                                disabled: !can_write_tree,
                                 onclick: on_new_child,
                                 "New Node"
                             }
                             if mounts_apply {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::Link,
+                                    disabled: !can_write_tree,
                                     onclick: on_mount_store.clone(),
                                     "Mount Store..."
                                 }
@@ -1433,6 +1670,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             if CAN_ADMINISTER_STORES {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::CloudDownload,
+                                    disabled: !can_write_tree,
                                     onclick: on_mount_remote_store.clone(),
                                     "Mount Remote Store Here..."
                                 }
@@ -1447,23 +1685,34 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             if mounts_apply {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::ClipboardCopy,
-                                    disabled: no_mount_source,
+                                    disabled: no_mount_source || !can_write_tree,
                                     onclick: on_paste_mount.clone(),
                                     "Paste Mount Here"
                                 }
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Edit,
+                                disabled: !can_write_tree,
                                 onclick: on_rename,
                                 "Rename"
                             }
+                            if CAN_ADMINISTER_STORES {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::Share,
+                                    disabled: !can_write_tree,
+                                    onclick: on_share.clone(),
+                                    "Share..."
+                                }
+                            }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Palette,
+                                disabled: !can_write_tree,
                                 onclick: on_appearance,
                                 "Appearance..."
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Trash,
+                                disabled: !can_write_tree,
                                 onclick: on_delete,
                                 "Delete"
                             }
@@ -1543,7 +1792,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     first_sid.and_then(|sid| {
                         store.root_node_id(sid).map(|rid| (sid, rid))
                     })
-                });
+                })
+                // Not into a store whose structure is its owner's
+                // (docs/SHARING_CONTRACT.md): the row's "New Node" is
+                // disabled there, and so is this.
+                .filter(|(s_id, _)| store.store_access(*s_id).allows_write());
             match result {
                 Some((s_id, root_id)) => store.send(BackendCommand::CreateNode {
                     store_id: s_id,
@@ -1569,6 +1822,24 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         };
 
         let toolbar_handle = crate::toolbar::render_pimble_toolbar(__scope);
+
+        // Whether the document in the pane belongs to a store this device may
+        // only read (docs/SHARING_CONTRACT.md "Access on the recipient's
+        // side"). Reactive on the active node and on its store's own signal,
+        // so the pane follows a store whose access arrives or changes. The
+        // toolbar gives way to a line saying so; `editor::reject_local_edit`
+        // is what happens if someone types anyway.
+        //
+        // The store's own signal comes out of the registry first and is read
+        // after that borrow is released: rinch keeps every signal in one
+        // `RefCell`, and a *tracked* read takes it mutably to record the
+        // subscription — so reading one signal inside another's `with` panics.
+        // (`AppStore`'s own helpers nest freely because they are `untracked`.)
+        let editor_read_only = move || -> bool {
+            let Some(active) = store.active_edit.get() else { return false };
+            let sig = store.store_data.with(|map| map.get(&active.store_id).copied());
+            sig.map_or(false, |sig| sig.with(|s| !s.access.allows_write()))
+        };
 
         // Editor empty state icon
         let empty_icon = render_tabler_icon(__scope, TablerIcon::FileText, TablerIconStyle::Outline);
@@ -2479,7 +2750,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 onchange: move |val: String| store.hosted_modal_selected.set(val),
                                 data: {|| {
                                     store.hosted_modal_stores.get().iter()
-                                        .map(|s| SelectOption::new(s.store_id.clone(), s.name.clone()))
+                                        .map(|s| SelectOption::new(s.store_id.clone(), hosted_store_label(s)))
                                         .collect::<Vec<_>>()
                                 }},
                             }
@@ -2515,6 +2786,266 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         div {
                             style: "color: var(--rinch-color-red-6); font-size: 12px;",
                             {|| store.hosted_modal_error.get()}
+                        }
+                    }
+                }
+            }
+        };
+
+        // ── "Share..." modal (node context menu) ────────────────────────
+        // docs/SHARING_CONTRACT.md "Apps": one modal, two faces. A name and
+        // "Share" while the node is not shared; the share, its members and
+        // "Stop sharing" once it is. Every outcome arrives as
+        // `CloudShareUpdated`, `CloudSharingStopped` or `CloudError { op }`,
+        // so `events.rs` fills the busy and error lines without guessing
+        // which request answered (the Account modal's rule, decision 3).
+        let share_node_now = move || {
+            let Some((store_id, node_id)) = untracked(|| store.share_modal_node.get()) else { return };
+            let name = untracked(|| store.share_modal_name.get()).trim().to_string();
+            if name.is_empty() {
+                store.share_modal_error.set("Give the share a name.".to_string());
+                return;
+            }
+            store.share_modal_error.set(String::new());
+            store.share_modal_pending.set(Some(CloudOp::Share));
+            store.send(BackendCommand::CloudShareNode { store_id, node_id, name });
+        };
+        let invite_now = move || {
+            let Some((store_id, node_id)) = untracked(|| store.share_modal_node.get()) else { return };
+            let email = untracked(|| store.share_modal_invite_email.get()).trim().to_string();
+            if email.is_empty() {
+                store.share_modal_error.set("Type the address to invite.".to_string());
+                return;
+            }
+            let role = match untracked(|| store.share_modal_invite_role.get()).as_str() {
+                "reader" => pimble_rpc::MemberRole::Reader,
+                _ => pimble_rpc::MemberRole::Editor,
+            };
+            store.share_modal_error.set(String::new());
+            store.share_modal_pending.set(Some(CloudOp::ShareInvite));
+            store.send(BackendCommand::CloudShareInvite { store_id, node_id, email, role });
+        };
+        let remove_member = move |email: String| {
+            let Some((store_id, node_id)) = untracked(|| store.share_modal_node.get()) else { return };
+            store.share_modal_error.set(String::new());
+            store.share_modal_pending.set(Some(CloudOp::ShareRemoveMember));
+            store.send(BackendCommand::CloudShareRemoveMember { store_id, node_id, email });
+        };
+        let stop_sharing_now = move || {
+            let Some((store_id, node_id)) = untracked(|| store.share_modal_node.get()) else { return };
+            store.share_modal_error.set(String::new());
+            store.share_modal_pending.set(Some(CloudOp::StopSharing));
+            store.send(BackendCommand::CloudStopSharing { store_id, node_id });
+        };
+        let share_modal = rsx! {
+            Modal {
+                opened_fn: move || store.share_modal_node.get().is_some(),
+                onclose: move || {
+                    store.share_modal_node.set(None);
+                    store.share_modal_error.set(String::new());
+                    store.share_modal_confirm_stop.set(false);
+                    store.share_modal_pending.set(None);
+                },
+                title: "Share",
+                size: "md",
+
+                div {
+                    style: "display: flex; flex-direction: column; gap: 10px;",
+
+                    // The node is not shared yet: name it and share it.
+                    if !store.share_modal_shared.get() {
+                        div {
+                            style: "display: flex; flex-direction: column; gap: 10px;",
+
+                            TextInput {
+                                label: "Name",
+                                placeholder: "Recipes",
+                                value_fn: move || store.share_modal_name.get(),
+                                oninput: move |val: String| store.share_modal_name.set(val),
+                                onsubmit: share_node_now,
+                            }
+
+                            div {
+                                class: "pimble-share__note",
+                                "Pimble Cloud sees this name, and so does everyone you invite. \
+                                 The notes themselves stay encrypted."
+                            }
+
+                            div {
+                                style: "display: flex; justify-content: flex-end;",
+                                Button {
+                                    variant: "filled",
+                                    size: "sm",
+                                    loading: {|| store.share_modal_pending.get() == Some(CloudOp::Share)},
+                                    disabled: {|| store.share_modal_pending.get().is_some()},
+                                    onclick: share_node_now,
+                                    "Share"
+                                }
+                            }
+                        }
+                    }
+
+                    // The node is shared: who has it, and how to stop.
+                    if store.share_modal_shared.get() {
+                        div {
+                            style: "display: flex; flex-direction: column; gap: 10px;",
+
+                            div {
+                                style: "font-weight: 600;",
+                                {|| store.share_modal_name.get()}
+                            }
+                            div {
+                                class: "pimble-share__note",
+                                {|| store.share_modal_state.get()}
+                            }
+
+                            // The confirmation takes the modal over, so that
+                            // "Stop sharing" is never one stray click.
+                            if store.share_modal_confirm_stop.get() {
+                                div {
+                                    style: "display: flex; flex-direction: column; gap: 10px;",
+                                    div {
+                                        {|| format!(
+                                            "Stop sharing \"{}\"? It is deleted from Pimble Cloud and nobody gets \
+                                             anything new from it. What they have already synced stays on their \
+                                             own devices.",
+                                            store.share_modal_name.get(),
+                                        )}
+                                    }
+                                    div {
+                                        style: "display: flex; justify-content: flex-end; gap: 8px;",
+                                        Button {
+                                            variant: "light",
+                                            size: "sm",
+                                            onclick: move || store.share_modal_confirm_stop.set(false),
+                                            "Cancel"
+                                        }
+                                        Button {
+                                            variant: "filled",
+                                            color: "red",
+                                            size: "sm",
+                                            loading: {|| store.share_modal_pending.get() == Some(CloudOp::StopSharing)},
+                                            disabled: {|| store.share_modal_pending.get().is_some()},
+                                            onclick: stop_sharing_now,
+                                            "Stop sharing"
+                                        }
+                                    }
+                                }
+                            }
+
+                            if !store.share_modal_confirm_stop.get() {
+                                div {
+                                    style: "display: flex; flex-direction: column; gap: 10px;",
+
+                                    div {
+                                        class: "pimble-share__members",
+                                        // An empty bordered box would read as
+                                        // a list that failed to load; the line
+                                        // below says it plainly instead.
+                                        style: {
+                                            move || if store.share_modal_members.with(|m| m.is_empty()) {
+                                                "display: none;"
+                                            } else {
+                                                ""
+                                            }
+                                        },
+                                        for member in store.share_modal_members.get() {
+                                            div {
+                                                key: member.email.clone(),
+                                                class: "pimble-share__member",
+                                                span {
+                                                    class: "pimble-share__member-email",
+                                                    {member.email.clone()}
+                                                }
+                                                span {
+                                                    class: "pimble-share__member-status",
+                                                    {format!("{}, {}", member_role_text(member.role), member_status_text(member.status))}
+                                                }
+                                                // The owner is the account this
+                                                // Pimble is signed in as; there
+                                                // is no share without them.
+                                                if member.role != pimble_rpc::MemberRole::Owner {
+                                                    ActionIcon {
+                                                        icon: TablerIcon::X,
+                                                        variant: "subtle",
+                                                        size: "xs",
+                                                        onclick: {
+                                                            let email = member.email.clone();
+                                                            move || remove_member(email.clone())
+                                                        },
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    div {
+                                        style: {
+                                            move || if store.share_modal_members.with(|m| m.is_empty()) {
+                                                "font-size: 12px; color: var(--rinch-color-dimmed);"
+                                            } else {
+                                                "display: none;"
+                                            }
+                                        },
+                                        "Nobody else yet."
+                                    }
+
+                                    div {
+                                        class: "pimble-share__invite",
+                                        div {
+                                            style: "flex: 1;",
+                                            TextInput {
+                                                label: "Invite",
+                                                placeholder: "them@example.com",
+                                                value_fn: move || store.share_modal_invite_email.get(),
+                                                oninput: move |val: String| store.share_modal_invite_email.set(val),
+                                                onsubmit: invite_now,
+                                            }
+                                        }
+                                        Select {
+                                            value_fn: move || store.share_modal_invite_role.get(),
+                                            onchange: move |val: String| store.share_modal_invite_role.set(val),
+                                            data: {|| vec![
+                                                SelectOption::new("editor", "Editor"),
+                                                SelectOption::new("reader", "Reader"),
+                                            ]},
+                                        }
+                                        Button {
+                                            variant: "filled",
+                                            size: "sm",
+                                            loading: {|| store.share_modal_pending.get() == Some(CloudOp::ShareInvite)},
+                                            disabled: {|| store.share_modal_pending.get().is_some()},
+                                            onclick: invite_now,
+                                            "Invite"
+                                        }
+                                    }
+
+                                    div {
+                                        class: "pimble-share__note",
+                                        "Pimble Cloud stores the notes encrypted, and sees who is invited and the \
+                                         share's name. It never sees what is written in them, or their titles."
+                                    }
+
+                                    div {
+                                        style: "display: flex; justify-content: flex-end;",
+                                        Button {
+                                            variant: "light",
+                                            color: "red",
+                                            size: "sm",
+                                            disabled: {|| store.share_modal_pending.get().is_some()},
+                                            onclick: move || store.share_modal_confirm_stop.set(true),
+                                            "Stop sharing"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !store.share_modal_error.get().is_empty() {
+                        div {
+                            style: "color: var(--rinch-color-red-6); font-size: 12px;",
+                            {|| store.share_modal_error.get()}
                         }
                     }
                 }
@@ -2599,8 +3130,13 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
 
                             div {
                                 class: "pimble-editor__toolbar-wrap",
-                                style: {|| if store.show_editor.get() { "" } else { "display: none;" }},
+                                style: {move || if store.show_editor.get() && !editor_read_only() { "" } else { "display: none;" }},
                                 {toolbar_handle}
+                            }
+                            div {
+                                class: "pimble-editor__read-only",
+                                style: {move || if store.show_editor.get() && editor_read_only() { "" } else { "display: none;" }},
+                                "Read only. This was shared with you to read; nothing typed here is kept."
                             }
                             div {
                                 class: "pimble-editor__content-wrap",
@@ -2653,6 +3189,16 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             }}
                         }
 
+                        // A refusal the server sent back, in its own words
+                        // (docs/SHARING_CONTRACT.md "Access on the recipient's
+                        // side"). It is not a connection failure, so it does
+                        // not touch the badge beside it.
+                        span {
+                            class: "pimble-status-bar__notice",
+                            style: {|| if store.notice.get().is_empty() { "display: none;" } else { "" }},
+                            {|| store.notice.get()}
+                        }
+
                         // The signed-in account, when there is one; a click
                         // opens the Account modal (docs/DESKTOP_ACCOUNT_CONTRACT.md
                         // decision 7). Only a build whose server keeps an
@@ -2692,6 +3238,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {account_modal}
                 {host_modal}
                 {hosted_modal}
+                {share_modal}
                 {body}
             }
         };
@@ -2714,6 +3261,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {account_modal}
                 {host_modal}
                 {hosted_modal}
+                {share_modal}
                 {body}
             }
         };
@@ -2788,8 +3336,51 @@ pub fn run() {
 }
 #[cfg(test)]
 mod tests {
-    use super::sync_badge_text;
+    use super::{hosted_store_label, member_role_text, member_status_text, sync_badge_text, MOUNT_NOTE};
     use pimble_core::{StoreKind, SyncState};
+    use pimble_rpc::{CloudHostedStoreInfo, MemberRole, ShareMemberStatus};
+
+    fn hosted(name: &str, share: bool, shared_by: Option<&str>) -> CloudHostedStoreInfo {
+        CloudHostedStoreInfo {
+            store_id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            role: "editor".to_string(),
+            kind: "vault".to_string(),
+            created_at: String::new(),
+            root: share.then(pimble_core::NodeId::new),
+            shared_by: shared_by.map(str::to_string),
+        }
+    }
+
+    /// A share in "Add Hosted Store..." says whose it is; a store of one's own
+    /// is just its name (docs/SHARING_CONTRACT.md "Apps").
+    #[test]
+    fn a_shared_store_says_who_shared_it() {
+        assert_eq!(hosted_store_label(&hosted("Notes", false, None)), "Notes");
+        assert_eq!(
+            hosted_store_label(&hosted("Recipes", true, Some("ann@example.com"))),
+            "Recipes, shared by ann@example.com"
+        );
+        // A share whose owner the service did not name is still just a name.
+        assert_eq!(hosted_store_label(&hosted("Recipes", true, None)), "Recipes");
+    }
+
+    /// Every member state the service can report has words for it, and none of
+    /// them is jargon: an invitation and a key that has not been handed over
+    /// are ordinary things to be waiting for.
+    #[test]
+    fn a_member_reads_in_plain_words() {
+        assert_eq!(member_status_text(ShareMemberStatus::Invited), "invited, no account yet");
+        assert_eq!(
+            member_status_text(ShareMemberStatus::WaitingForKey),
+            "waiting for your Pimble to hand over the key"
+        );
+        assert_eq!(member_status_text(ShareMemberStatus::Active), "active");
+        assert_eq!(member_role_text(MemberRole::Owner), "owner");
+        assert_eq!(member_role_text(MemberRole::Editor), "can edit");
+        assert_eq!(member_role_text(MemberRole::Reader), "can read");
+        assert!(MOUNT_NOTE.contains("another store"));
+    }
 
     /// The badge is the server's `sync_mode` (docs/DESKTOP_ACCOUNT_CONTRACT.md
     /// decision 4): a vault link says "encrypted" first, a plain link reads

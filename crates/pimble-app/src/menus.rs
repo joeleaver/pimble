@@ -113,7 +113,15 @@ fn file_entries(store: AppStore) -> Vec<MenuEntry> {
 
 fn edit_entries(store: AppStore) -> Vec<MenuEntry> {
     vec![MenuEntry::item("Delete", "", move || {
+        // A native menu item cannot be greyed out reactively, so the check a
+        // row's "Delete" makes at render time is made here when it runs: the
+        // tree of a store shared with this device belongs to its owner
+        // (docs/SHARING_CONTRACT.md "Access on the recipient's side").
         if let Some((store_id, node_id)) = store.selected_store_and_node() {
+            if !store.store_access(store_id).allows_write() {
+                tracing::info!("Delete refused here: {:?} is not ours to restructure", store_id);
+                return;
+            }
             store.send(crate::protocol::BackendCommand::DeleteNode { store_id, node_id });
         }
     })]

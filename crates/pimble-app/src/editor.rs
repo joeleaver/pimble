@@ -32,6 +32,9 @@ thread_local! {
     /// edit at a time (one shared editor pane), so scheduling for a new node
     /// always supersedes whatever was pending.
     static LABEL_REFRESH: RefCell<Option<TimeoutHandle>> = const { RefCell::new(None) };
+    /// The pending reopen after typing into a document this device may only
+    /// read (see [`reject_local_edit`]).
+    static READ_ONLY_REOPEN: RefCell<Option<TimeoutHandle>> = const { RefCell::new(None) };
 }
 
 /// The app's editor handle (created on first use). Cheap to clone (an `Rc`); the
@@ -67,12 +70,18 @@ pub(crate) fn start_editing(
     handle.set_dark_mode(untracked(|| store.dark_mode.get()));
     handle.stop_collaboration(); // end any prior node's session
     cancel_pending_label_refresh();
+    cancel_pending_read_only_reopen();
 
     // Every local edit's delta is base64-broadcast to the server, which persists it
     // and relays it to the other clients. The closure captures only `Copy` values
     // (AppStore/StoreId/NodeId), so it is itself `Copy` and can be reused below.
     let outbound = move |delta: Vec<u8>| {
         use base64::Engine;
+        // A store shared read-only takes remote changes but sends none back.
+        if !store.store_access(store_id).allows_write() {
+            reject_local_edit(store, store_id, node_id);
+            return;
+        }
         let changes = base64::engine::general_purpose::STANDARD.encode(&delta);
         store.send(BackendCommand::BroadcastChanges {
             store_id,
@@ -108,11 +117,15 @@ pub(crate) fn start_editing(
         handle.load_html("");
         match handle.start_collaboration_host(outbound) {
             Ok(snapshot) => {
-                store.send(BackendCommand::SetNodeContent {
-                    store_id,
-                    node_id,
-                    content: snapshot,
-                });
+                // Seeding the node's document is a content write; a store
+                // this device may only read is left exactly as it is.
+                if store.store_access(store_id).allows_write() {
+                    store.send(BackendCommand::SetNodeContent {
+                        store_id,
+                        node_id,
+                        content: snapshot,
+                    });
+                }
             }
             Err(e) => tracing::warn!("start_collaboration_host failed: {e}"),
         }
@@ -150,7 +163,48 @@ pub(crate) fn stop_editing(store: AppStore) {
     handle.stop_collaboration();
     store.active_edit.set(None);
     cancel_pending_label_refresh();
+    cancel_pending_read_only_reopen();
     crate::toolbar::bump_toolbar();
+}
+
+/// Cancel a pending read-only reopen, if one is scheduled.
+fn cancel_pending_read_only_reopen() {
+    READ_ONLY_REOPEN.with(|slot| {
+        if let Some(handle) = slot.borrow_mut().take() {
+            clear_timeout(handle);
+        }
+    });
+}
+
+/// What happens when someone types into a document their device may only read
+/// (docs/SHARING_CONTRACT.md "Apps"): the delta is not sent, and the node is
+/// reopened from the server's copy so the typed text does not linger. Debounced,
+/// so a burst of keystrokes costs one reopen rather than one per character.
+///
+/// This is the interim. rinch's editor has no read-only switch yet; when it
+/// grows one, this function and the two lines that call it are the whole of
+/// what goes away — nothing else in the collaboration path knows about it.
+fn reject_local_edit(store: AppStore, store_id: StoreId, node_id: NodeId) {
+    cancel_pending_read_only_reopen();
+    let timeout = set_timeout(400, move || {
+        READ_ONLY_REOPEN.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        // Drop the session without `stop_editing`'s write-back: that snapshot
+        // is exactly the typed text this is undoing. Then open the node the
+        // ordinary way — `GetNode` answers with the server's copy and the
+        // `NodeLoaded` handler starts a fresh session from it, which is the
+        // one path a document is ever opened through.
+        editor().stop_collaboration();
+        store.active_edit.set(None);
+        store.live_label.update(|m| {
+            m.remove(&(store_id, node_id));
+        });
+        store.send(BackendCommand::GetNode { store_id, node_id });
+    });
+    READ_ONLY_REOPEN.with(|slot| {
+        *slot.borrow_mut() = Some(timeout);
+    });
 }
 
 /// Ask the server for what it has beyond the active session's state vector
