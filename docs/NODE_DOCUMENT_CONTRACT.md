@@ -140,9 +140,18 @@ repair touched. `applyStoreUpdate` and `syncStoreDocument` go away.
 A share is a grant with a scope: `(user, store, root node, role)`. The shared documents
 live in exactly one place on Pimble Cloud, the owner's hosted store `S`, and nowhere else.
 
-- **Token**: `stores: { S: "editor" }` stays for a whole-store grant; a scoped grant is
-  `stores: { S: { role: "editor", roots: [R] } }`. An older Pimble server cannot parse the
-  object and drops the grant (fails closed). *(Decision 1 below.)*
+- **Token**: `stores: { S: "editor" }` stays for a whole-store grant; shares are
+  `stores: { S: { roots: { "<R1>": "reader", "<R2>": "editor" } } }`, **a role per shared
+  root** (Joe, 2026-09-21: one role per store would have made a reader of one folder and
+  editor of another the lesser of the two on both). A whole-store grant on the same store
+  wins over any share. An older Pimble server cannot parse the object and drops the grant
+  (fails closed). A document in two of a member's scopes takes the wider role.
+  *(Decision 1 below.)*
+- **A share has a name of its own** (Joe, 2026-09-21): the owner types it in the Share
+  dialog, the accounts service keeps it on the scoped grant and the invitation, and it is
+  what a recipient's store list shows ("<share name>, shared by <email>"). The owner's
+  store name never reaches a recipient. Pimble Cloud sees the share's name, as it sees a
+  store's; the marker in the node's document carries it too.
 - **Scope sets on the hosted server**: `<store>/scopes.json` maps each scope root to the
   set of document ids under it. It is authorization metadata, not data: the owner's
   devices publish it (`setScope { store_id, root, docs }`, owner role) whenever the subtree
@@ -236,7 +245,7 @@ token expires and never buffers a byte across a reconnect.
 Answered 2026-09-18: 1 yes (and the sync question is answered in section 5); 2 yes; 3 no
 hosting of an unhosted store, the relay serves it (section 5b); 4 yes; 5 yes; 6 agreed.
 
-1. The token's scoped-grant shape (`stores: { S: { role, roots } }`), and that the hosted
+1. The token's scoped-grant shape (a role per root since 2026-09-21: `stores: { S: { roots: { R: role } } }`), and that the hosted
    server holds the scope sets published by the owner's devices and extended on create.
 2. Per-document data keys wrapped under scope keys (against re-encrypting a document under
    the share key when it enters a share, which stalls recipients on blobs they cannot read
