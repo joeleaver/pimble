@@ -164,6 +164,31 @@ fn heading_level(h: &EditorHandle) -> Option<i64> {
     block.attrs().get_int("level")
 }
 
+/// Turn the textblock(s) at the selection into plain paragraphs, keeping
+/// their inline marks and the alignment and indent of the block the cursor is
+/// in: the "off" half of a heading or code-block button. The same transaction
+/// step rinch's own block commands use, through the editor's one dispatch
+/// path, so it is recorded and broadcast like any other edit.
+fn set_plain_paragraph(h: &EditorHandle) -> bool {
+    use rinch_editor_core::{AttrValue, Attrs};
+    h.update(|state| {
+        let paragraph = state.schema().node_type("paragraph")?.clone();
+        let (from, to) = (state.selection.from().0, state.selection.to().0);
+        let resolved = state.doc.resolve(state.selection.head()).ok()?;
+        let block = resolved.parent();
+        let mut kept: Vec<(&str, AttrValue)> = Vec::new();
+        if let Some(align) = block.attrs().get_str("text_align") {
+            kept.push(("text_align", AttrValue::from(align)));
+        }
+        if let Some(indent) = block.attrs().get_int("indent") {
+            kept.push(("indent", AttrValue::Int(indent)));
+        }
+        let mut tr = state.tr();
+        tr.set_block_type(from, to, paragraph, Attrs::from_iter(kept)).ok()?;
+        tr.doc_changed().then_some(tr)
+    })
+}
+
 fn check_active(check: &ActiveCheck) -> bool {
     check_active_with(&editor(), check)
 }
@@ -200,6 +225,17 @@ fn execute_cmd(cmd: &Cmd) {
             h.command(name);
         }
         Cmd::SetBlock(tag) => {
+            // A block button is a toggle: pressed on a block that already is
+            // what it sets, it goes back to a plain paragraph. rinch's
+            // `setHeadingN`/`setCodeBlock` only ever set, and its
+            // `setParagraph` is "clear formatting" (it strips bold and links
+            // and lifts the block out of its list), which is not what turning
+            // a heading off means.
+            if matches!(*tag, "h1" | "h2" | "h3" | "pre") && check_active_with(&h, &ActiveCheck::Block(tag)) {
+                set_plain_paragraph(&h);
+                bump_toolbar();
+                return;
+            }
             let name = match *tag {
                 "h1" => "setHeading1",
                 "h2" => "setHeading2",
@@ -306,5 +342,43 @@ fn render_btn(
                 {icon_el}
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "native"))]
+mod tests {
+    use super::*;
+    use crate::rinch_editor::create_editor;
+    use rinch_editor_core::{Pos, Selection};
+
+    fn block_type(h: &EditorHandle) -> String {
+        h.state().doc.child(0).type_name().to_string()
+    }
+
+    /// A heading button is a toggle: pressed on its own heading it gives a plain
+    /// paragraph back, and the bold inside it is still bold (rinch's
+    /// `setParagraph` would have stripped it: that one is "clear formatting").
+    #[test]
+    fn a_heading_button_pressed_again_gives_the_paragraph_back_and_keeps_its_marks() {
+        let h = create_editor();
+        assert!(h.load_html("<h2>Plan for <strong>Friday</strong></h2>"));
+        h.set_selection(Selection::cursor(Pos(3)));
+        assert_eq!(block_type(&h), "heading");
+        assert!(check_active_with(&h, &ActiveCheck::Block("h2")));
+        assert!(!check_active_with(&h, &ActiveCheck::Block("h1")));
+
+        assert!(set_plain_paragraph(&h));
+        assert_eq!(block_type(&h), "paragraph");
+        assert!(!check_active_with(&h, &ActiveCheck::Block("h2")));
+        let state = h.state();
+        let block = state.doc.child(0);
+        let friday = (0..block.child_count())
+            .map(|i| block.child(i))
+            .find(|n| n.text() == Some("Friday"))
+            .expect("the bold run is still its own text node");
+        assert!(friday.marks().iter().any(|m| m.type_name() == "bold"), "the bold must survive the toggle");
+
+        // And it is a real toggle: nothing to turn off on a paragraph.
+        assert!(!set_plain_paragraph(&h));
     }
 }
