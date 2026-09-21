@@ -1,10 +1,33 @@
 # Next session: start here
 
-Updated 2026-09-21 on branch **`node-document`**. Read this, then `CLAUDE.md` ("Current
-design", "Sharing on node documents"), then `docs/NODE_DOCUMENT_CONTRACT.md`. To see any
-of it run, `scripts/local-stack/README.md`.
+Updated 2026-09-21. **v0.2.0 is shipped**: `master` fast-forwarded to `node-document`
+(Joe's go-ahead the same day), production is deployment v19 on jkbase, the desktop release
+`v0.2.0` is on GitHub (Linux; the Windows job still waits for rhypedb#23). Read this, then
+`CLAUDE.md` ("Current design", "Sharing on node documents"), then
+`docs/NODE_DOCUMENT_CONTRACT.md`, `docs/RELAY_CONTRACT.md` and `docs/MOVE_CONTRACT.md`. To
+see any of it run, `scripts/local-stack/README.md`.
 
-## Where things stand (2026-09-21, branch `node-document`, nothing merged or deployed)
+## The ship, 2026-09-21
+
+- Before the push: a fresh backup of the production accounts database
+  (`bkp_1790030572153_df62963df8ca5e70`; `jkbase db backups`, `jkbase db restore`), both
+  lock files agreeing on wasm-bindgen 0.2.128 and rinch c4845d3, the whole workspace green
+  (587 tests, web 53).
+- After it: the site, `/app/`, `/api/v1/health`, the JWKS and the releases endpoint answer
+  200; the relay's two routes and `/rpc` answer 401 to the unauthenticated; the accounts
+  service came up on the new schema and reads users; the hosted server opened every store
+  and migrated the one plain store it holds ("Live smoke", 2 nodes). `jkbase rollback
+  --version 18` is the way back for the services; a migrated plain store would then need
+  `store.yrs.migrated` renamed back by hand.
+- **Joe's part**: back up his own stores, install v0.2.0 on every device before it syncs
+  (0.1.1 cannot open or sync a migrated store), and let each desktop sync once so its
+  hosted twin receives the node documents; until a store's desktop has done that, the new
+  web app shows that store's tree empty.
+- Not watched yet: a real account signing in on production after the deploy (the PM has
+  none); `jkbase logs --service cloud` after Joe's first sign-in is the check that old
+  grant and store rows read cleanly under the new schema.
+
+## Where things stood before the ship (2026-09-21, branch `node-document`)
 
 - **The redesign Joe approved on 2026-09-18 is built.** Every node is one co-authored yrs
   document; there is no store document; sharing is a scoped grant on the owner's own
@@ -101,7 +124,7 @@ of it run, `scripts/local-stack/README.md`.
 - **The store's name in the clear on the hosted manifest**: fine (it was decided on
   2026-09-16 in `docs/CRYPTO_CONTRACT.md`; a relayed store sends no name at all).
 
-## Waiting for Joe
+## Waiting for Joe (both answered on 2026-09-21: the go-ahead given and used, the move contract approved)
 
 1. **The go-ahead to merge and deploy.** Not a design question, only "now or not yet":
    `node-document` replaces `master`'s store format, and the change is one way. The first
