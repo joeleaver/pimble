@@ -59,6 +59,10 @@ pub struct ServerConfig {
     /// tests set this to a temp path so a sign-in never touches the real
     /// config directory.
     pub keystore_path: Option<PathBuf>,
+    /// How often each hosted store's key sweep runs (`crate::share`: a
+    /// share's member who has the grant and not yet the key is handed it).
+    /// `None` is the default minute; tests shorten it.
+    pub share_sweep_interval: Option<std::time::Duration>,
 }
 
 impl Default for ServerConfig {
@@ -72,6 +76,7 @@ impl Default for ServerConfig {
             credentials_path: None,
             replicas_dir: None,
             keystore_path: None,
+            share_sweep_interval: None,
         }
     }
 }
@@ -193,7 +198,10 @@ impl PimbleServer {
         let credentials_path = self.config.credentials_path.clone().unwrap_or_else(crate::credentials::default_credentials_path);
         let replicas_dir = self.config.replicas_dir.clone().unwrap_or_else(crate::handler::default_replicas_dir);
         let keystore_path = self.config.keystore_path.clone().unwrap_or_else(crate::keystore::default_keystore_path);
-        let handler = RpcHandler::with_all_paths(Arc::clone(&self.store_manager), semantic_available, credentials_path, replicas_dir, keystore_path);
+        let mut handler = RpcHandler::with_all_paths(Arc::clone(&self.store_manager), semantic_available, credentials_path, replicas_dir, keystore_path);
+        if let Some(every) = self.config.share_sweep_interval {
+            handler = handler.with_share_sweep_interval(every);
+        }
         self.handler = Some(handler.clone());
         let methods = handler.into_rpc();
 

@@ -143,7 +143,7 @@ fn scope_set(manager: &StoreManager, store_id: StoreId, roots: &[NodeId]) -> Has
 /// id), and a document just created whose parent's list does not name it
 /// yet (a create is two documents' updates, and `parent_id` is the
 /// authoritative half).
-fn plain_scope(tree: &Tree, roots: &[NodeId]) -> HashSet<NodeId> {
+pub(crate) fn plain_scope(tree: &Tree, roots: &[NodeId]) -> HashSet<NodeId> {
     let mut scope: HashSet<NodeId> = HashSet::new();
     for root in roots {
         if let Ok(ids) = tree.subtree_ids(*root) {
@@ -964,6 +964,9 @@ pub struct RpcHandler {
     /// keys (docs/CRYPTO_CONTRACT.md), consulted by the `cloud*` RPCs and by
     /// every `VaultLink`.
     keystore: Arc<Keystore>,
+    /// What this device knows of the shares it keeps up, as their owner's
+    /// (docs/NODE_DOCUMENT_CONTRACT.md section 5; `crate::share`).
+    shares: Arc<crate::share::Shares>,
 }
 
 impl RpcHandler {
@@ -1033,7 +1036,17 @@ impl RpcHandler {
             mounts: Arc::new(Mutex::new(MountTracking::default())),
             vault_links: Arc::new(RwLock::new(HashMap::new())),
             keystore: Arc::new(Keystore::new(keystore_path)),
+            shares: Arc::new(crate::share::Shares::new(crate::share::DEFAULT_SWEEP_EVERY)),
         }
+    }
+
+    /// How often each hosted store's key sweep runs (`crate::share`), in
+    /// place of the default minute. `PimbleServer::start` passes
+    /// `ServerConfig::share_sweep_interval` through here; tests shorten it.
+    /// Call before the handler is cloned or serves anything.
+    pub fn with_share_sweep_interval(mut self, every: Duration) -> Self {
+        self.shares = Arc::new(crate::share::Shares::new(every));
+        self
     }
 
     /// Where `addRemoteStore` places a replica when the caller passes
@@ -1080,6 +1093,23 @@ impl RpcHandler {
     /// everything.
     async fn reject_if_read_only(&self, store_id: StoreId, ids: &[NodeId]) -> Result<(), ErrorObjectOwned> {
         if self.store_manager.read().await.write_refused(store_id, ids) {
+            return Err(read_only_error());
+        }
+        Ok(())
+    }
+
+    /// Whether `principal` may delete `node_id`. A delete edits the node
+    /// (and everything under it, which is in every scope the node is in)
+    /// and its parent's list: a member cannot delete their share's own
+    /// root, whose parent is not theirs.
+    fn may_delete(manager: &StoreManager, principal: &Principal, store_id: StoreId, node_id: NodeId) -> Result<(), ErrorObjectOwned> {
+        if let Some(reach) = Reach::of(manager, principal, store_id) {
+            reach.require(node_id, Access::Write)?;
+            if let Some(parent_id) = manager.get_node(store_id, node_id).map_err(to_rpc_error)?.parent_id {
+                reach.require(parent_id, Access::Write)?;
+            }
+        }
+        if manager.write_refused(store_id, &[node_id]) {
             return Err(read_only_error());
         }
         Ok(())
@@ -1214,7 +1244,7 @@ impl RpcHandler {
     /// docs/CRYPTO_CONTRACT.md), read from `sync.json`'s `mode`. `Plain` for
     /// a store with no `sync.json` at all (unlinked, or itself a `Vault`
     /// store, which never has one) or one that fails to read.
-    async fn sync_mode_of(&self, store_id: StoreId) -> StoreKind {
+    pub(crate) async fn sync_mode_of(&self, store_id: StoreId) -> StoreKind {
         let manager = self.store_manager.read().await;
         match manager.read_sync_config(store_id).await {
             Ok(Some(config)) => match config.mode {
@@ -1276,6 +1306,77 @@ impl RpcHandler {
     /// keys (to encrypt/decrypt blobs).
     pub(crate) fn keystore(&self) -> Arc<Keystore> {
         Arc::clone(&self.keystore)
+    }
+
+    // ── Sharing, the owner's half (crate::share) ─────────────────────────
+
+    pub(crate) fn shares(&self) -> &crate::share::Shares {
+        &self.shares
+    }
+
+    /// `store_id`'s vault link state; `None` when it has no vault link.
+    pub(crate) async fn vault_link_state(&self, store_id: StoreId) -> Option<SyncState> {
+        self.vault_links.read().await.get(&store_id).map(|handle| handle.state())
+    }
+
+    /// Hand `store_id`'s vault link a command for its share upkeep. `false`
+    /// when the store has no vault link to take it.
+    pub(crate) async fn share_command(&self, store_id: StoreId, command: crate::share::ShareCommand) -> bool {
+        self.vault_links.read().await.get(&store_id).is_some_and(|handle| handle.share_command(command))
+    }
+
+    /// Run `store_id`'s key sweep now (a member was just invited).
+    pub(crate) async fn kick_share_sweep(&self, store_id: StoreId) {
+        if let Some(handle) = self.vault_links.read().await.get(&store_id) {
+            handle.kick_sweep();
+        }
+    }
+
+    /// Tell a store's subscribers that one of its shares changed state on
+    /// this device. Derived state, like a link's: it carries no bytes and
+    /// no link forwards it.
+    pub(crate) async fn notify_share_state_changed(&self, store_id: StoreId, node_id: NodeId, state: SyncState) {
+        self.notify_store_change(store_id, StoreChangeKind::ShareStateChanged { node_id, state }, None).await;
+    }
+
+    /// Change `node_id`'s metadata under one lock and send the change out
+    /// exactly as `updateNodeMetadata` does (it is the same write): how a
+    /// share's marker is set and removed, so that it replicates like any
+    /// other metadata.
+    pub(crate) async fn edit_node_metadata(
+        &self,
+        store_id: StoreId,
+        node_id: NodeId,
+        change: impl FnOnce(&mut pimble_core::NodeMetadata),
+    ) -> Result<(), ErrorObjectOwned> {
+        let mut manager = self.store_manager.write().await;
+        let mut metadata = manager.get_node(store_id, node_id).map_err(to_rpc_error)?.metadata;
+        change(&mut metadata);
+        let edit = manager.update_node_metadata(store_id, node_id, metadata).map_err(to_rpc_error)?;
+        self.publish_metadata_edit(manager, store_id, node_id, edit).await
+    }
+
+    /// The tail of every metadata write: flush, broadcast, index. Takes the
+    /// manager's lock from the caller that made `edit` under it.
+    async fn publish_metadata_edit(
+        &self,
+        mut manager: tokio::sync::RwLockWriteGuard<'_, StoreManager>,
+        store_id: StoreId,
+        node_id: NodeId,
+        edit: TreeEdit,
+    ) -> Result<(), ErrorObjectOwned> {
+        if edit.is_empty() {
+            // The store writes only what differs, and nothing did: no
+            // flush, no broadcast (decision 8 applies to a client's resend
+            // of the same metadata as much as to a peer's).
+            return Ok(());
+        }
+        manager.flush(store_id).await.map_err(to_rpc_error)?;
+        drop(manager);
+
+        self.broadcast_tree_edit(store_id, &edit, Some((node_id, StoreChangeKind::MetadataUpdated { node_id })), None).await;
+        self.enqueue_index_event(store_id, IndexEvent::Upsert(node_id)).await;
+        Ok(())
     }
 
     /// Start a vault link for `store_id` if one isn't already running
@@ -2713,27 +2814,27 @@ impl PimbleApiServer for RpcHandler {
 
     async fn cloud_share_node(&self, ext: &Extensions, request: CloudShareNodeRequest) -> Result<CloudShareInfoResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "cloudShareNode")?;
-        Err(to_rpc_error(format!("cloudShareNode is not built yet (node {} of store {})", request.node_id, request.store_id)))
+        self.share_node(request).await
     }
 
     async fn cloud_share_info(&self, ext: &Extensions, request: CloudShareRef) -> Result<CloudShareInfoResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "cloudShareInfo")?;
-        Err(to_rpc_error(format!("cloudShareInfo is not built yet (node {} of store {})", request.node_id, request.store_id)))
+        self.share_info(request).await
     }
 
     async fn cloud_share_invite(&self, ext: &Extensions, request: CloudShareInviteRequest) -> Result<CloudShareInfoResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "cloudShareInvite")?;
-        Err(to_rpc_error(format!("cloudShareInvite is not built yet (node {} of store {})", request.node_id, request.store_id)))
+        self.share_invite(request).await
     }
 
     async fn cloud_share_remove_member(&self, ext: &Extensions, request: CloudShareRemoveMemberRequest) -> Result<CloudShareInfoResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "cloudShareRemoveMember")?;
-        Err(to_rpc_error(format!("cloudShareRemoveMember is not built yet (node {} of store {})", request.node_id, request.store_id)))
+        self.share_remove_member(request).await
     }
 
     async fn cloud_stop_sharing(&self, ext: &Extensions, request: CloudShareRef) -> Result<EmptyResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "cloudStopSharing")?;
-        Err(to_rpc_error(format!("cloudStopSharing is not built yet (node {} of store {})", request.node_id, request.store_id)))
+        self.stop_sharing(request).await
     }
 
     async fn create_store(
@@ -2852,6 +2953,7 @@ impl PimbleApiServer for RpcHandler {
 
         self.stop_link(request.store_id).await;
         self.stop_vault_link(request.store_id).await;
+        self.shares.forget_store(request.store_id);
         // Decision 5: a closing store's mounts are no longer this server's
         // to report on. Its entries as a mount *source* stay — the next
         // resolution reopens it.
@@ -3019,22 +3121,7 @@ impl PimbleApiServer for RpcHandler {
         let edit = manager
             .update_node_metadata(request.store_id, request.node_id, request.metadata)
             .map_err(to_rpc_error)?;
-        if edit.is_empty() {
-            // The store writes only what differs, and nothing did: no
-            // flush, no broadcast (decision 8 applies to a client's resend
-            // of the same metadata as much as to a peer's).
-            return Ok(EmptyResponse {});
-        }
-
-        manager
-            .flush(request.store_id)
-            .await
-            .map_err(to_rpc_error)?;
-
-        drop(manager);
-        let node_id = request.node_id;
-        self.broadcast_tree_edit(request.store_id, &edit, Some((node_id, StoreChangeKind::MetadataUpdated { node_id })), None).await;
-        self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
+        self.publish_metadata_edit(manager, request.store_id, request.node_id, edit).await?;
 
         Ok(EmptyResponse {})
     }
@@ -3102,19 +3189,22 @@ impl PimbleApiServer for RpcHandler {
             request.node_id, request.store_id
         );
 
+        // A share rooted in what is about to go is stopped first, best
+        // effort (`crate::share`): its members and its scope would
+        // otherwise outlive the node they are of. Judged before anything
+        // is asked of Pimble Cloud, and again under the lock the deletion
+        // is made under.
+        let shared_roots = {
+            let manager = self.store_manager.read().await;
+            Self::may_delete(&manager, &principal, request.store_id, request.node_id)?;
+            crate::share::shared_roots_under(&manager, request.store_id, request.node_id)
+        };
+        if !shared_roots.is_empty() {
+            self.stop_shares_before_delete(request.store_id, request.node_id, shared_roots).await;
+        }
+
         let mut manager = self.store_manager.write().await;
-        // A delete edits the node (and everything under it, which is in
-        // every scope the node is in) and its parent's list: a member
-        // cannot delete their share's own root, whose parent is not theirs.
-        if let Some(reach) = Reach::of(&manager, &principal, request.store_id) {
-            reach.require(request.node_id, Access::Write)?;
-            if let Some(parent_id) = manager.get_node(request.store_id, request.node_id).map_err(to_rpc_error)?.parent_id {
-                reach.require(parent_id, Access::Write)?;
-            }
-        }
-        if manager.write_refused(request.store_id, &[request.node_id]) {
-            return Err(read_only_error());
-        }
+        Self::may_delete(&manager, &principal, request.store_id, request.node_id)?;
         let (removal, edit) = manager
             .delete_node(request.store_id, request.node_id)
             .map_err(to_rpc_error)?;

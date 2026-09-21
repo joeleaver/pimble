@@ -294,6 +294,42 @@ async fn main() -> Result<()> {
             }
             cloud_add_hosted(&args[2]).await?;
         }
+        "cloud-share" => {
+            let (rest, name) = extract_flag_value(&args[2..], "--name");
+            if rest.len() < 2 {
+                eprintln!("Usage: pimble-cli cloud-share <store-id> <node-id> [--name <name>]");
+                return Ok(());
+            }
+            cloud_share(&rest[0], &rest[1], name).await?;
+        }
+        "cloud-share-info" => {
+            if args.len() < 4 {
+                eprintln!("Usage: pimble-cli cloud-share-info <store-id> <node-id>");
+                return Ok(());
+            }
+            cloud_share_info(&args[2], &args[3]).await?;
+        }
+        "cloud-share-invite" => {
+            if args.len() < 6 {
+                eprintln!("Usage: pimble-cli cloud-share-invite <store-id> <node-id> <email> <editor|reader>");
+                return Ok(());
+            }
+            cloud_share_invite(&args[2], &args[3], &args[4], &args[5]).await?;
+        }
+        "cloud-share-remove" => {
+            if args.len() < 5 {
+                eprintln!("Usage: pimble-cli cloud-share-remove <store-id> <node-id> <email>");
+                return Ok(());
+            }
+            cloud_share_remove(&args[2], &args[3], &args[4]).await?;
+        }
+        "cloud-stop-sharing" => {
+            if args.len() < 4 {
+                eprintln!("Usage: pimble-cli cloud-stop-sharing <store-id> <node-id>");
+                return Ok(());
+            }
+            cloud_stop_sharing(&args[2], &args[3]).await?;
+        }
         _ => {
             eprintln!("Unknown command: {}", command);
             print_help();
@@ -350,6 +386,11 @@ COMMANDS:
     cloud-host-store    Host a local store's encrypted twin on Pimble Cloud
     cloud-list-hosted   List the stores the signed-in account has a grant on
     cloud-add-hosted    Add an already-hosted store as a local replica
+    cloud-share         Share a node of a hosted store (--name <name>; the node's title otherwise)
+    cloud-share-info    Show a shared node's share, its state here and its members
+    cloud-share-invite  Invite an address to a share as editor or reader, or change its role
+    cloud-share-remove  Remove a member or a pending invitation from a share
+    cloud-stop-sharing  Stop sharing a node (its documents stay hosted where they are)
 
 ENVIRONMENT (client, for every command but `server` itself):
     PIMBLE_SERVER       Server URL (default: http://127.0.0.1:7462)
@@ -416,6 +457,11 @@ EXAMPLES:
     pimble-cli cloud-host-store <store-id>
     pimble-cli cloud-list-hosted
     pimble-cli cloud-add-hosted <store-id>
+    pimble-cli cloud-share <store-id> <node-id> --name "Holiday Plans"
+    pimble-cli cloud-share-invite <store-id> <node-id> bob@example.com editor
+    pimble-cli cloud-share-info <store-id> <node-id>
+    pimble-cli cloud-share-remove <store-id> <node-id> bob@example.com
+    pimble-cli cloud-stop-sharing <store-id> <node-id>
     pimble-cli cloud-sign-out
 "#
     );
@@ -833,6 +879,68 @@ async fn cloud_add_hosted(store_id: &str) -> Result<()> {
     for root in store.shown_roots() {
         println!("Root: {}", root);
     }
+    Ok(())
+}
+
+// ── Sharing, docs/NODE_DOCUMENT_CONTRACT.md section 5 ────────────────────
+
+fn print_share(answer: &pimble_rpc::CloudShareInfoResponse) {
+    println!("Share \"{}\": node {} of store {}", answer.share.name, answer.share.node_id, answer.share.store_id);
+    println!("State here: {:?}", answer.share.state);
+    for member in &answer.members {
+        let status = match member.status {
+            pimble_rpc::ShareMemberStatus::Invited => "invited, no account yet",
+            pimble_rpc::ShareMemberStatus::WaitingForKey => "waiting for the key",
+            pimble_rpc::ShareMemberStatus::Active => "active",
+        };
+        println!("  {}  {}  {}", member.email, member.role.as_str(), status);
+    }
+}
+
+async fn cloud_share(store_id: &str, node_id: &str, name: Option<String>) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let node_id = parse_node_id(node_id)?;
+    let client = connect().await?;
+    // A share has a name of its own; the node's title is the obvious one.
+    let name = match name {
+        Some(name) => name,
+        None => client.get_node(store_id, node_id).await?.metadata.title,
+    };
+    let answer = client.cloud_share_node(store_id, node_id, &name).await?;
+    print_share(&answer);
+    Ok(())
+}
+
+async fn cloud_share_info(store_id: &str, node_id: &str) -> Result<()> {
+    let client = connect().await?;
+    let answer = client.cloud_share_info(parse_store_id(store_id)?, parse_node_id(node_id)?).await?;
+    print_share(&answer);
+    Ok(())
+}
+
+async fn cloud_share_invite(store_id: &str, node_id: &str, email: &str, role: &str) -> Result<()> {
+    let role = match pimble_rpc::MemberRole::parse(role) {
+        Some(role @ (pimble_rpc::MemberRole::Editor | pimble_rpc::MemberRole::Reader)) => role,
+        _ => anyhow::bail!("unknown role '{}': expected 'editor' or 'reader'", role),
+    };
+    let client = connect().await?;
+    let answer = client.cloud_share_invite(parse_store_id(store_id)?, parse_node_id(node_id)?, email, role).await?;
+    print_share(&answer);
+    Ok(())
+}
+
+async fn cloud_share_remove(store_id: &str, node_id: &str, email: &str) -> Result<()> {
+    let client = connect().await?;
+    let answer = client.cloud_share_remove_member(parse_store_id(store_id)?, parse_node_id(node_id)?, email).await?;
+    print_share(&answer);
+    Ok(())
+}
+
+async fn cloud_stop_sharing(store_id: &str, node_id: &str) -> Result<()> {
+    let (store_id, node_id) = (parse_store_id(store_id)?, parse_node_id(node_id)?);
+    let client = connect().await?;
+    client.cloud_stop_sharing(store_id, node_id).await?;
+    println!("Stopped sharing node {} of store {}; its documents stay hosted where they are", node_id, store_id);
     Ok(())
 }
 

@@ -185,6 +185,21 @@ impl Keystore {
         self.write_atomic(&snapshot).await
     }
 
+    /// Forget a store key: a share's, once its owner has stopped sharing.
+    /// Forgetting one that is not held changes nothing.
+    pub async fn remove_store_key(&self, store_id: StoreId, key_id: Uuid) -> io::Result<()> {
+        let snapshot = {
+            let mut data = self.data.write().await;
+            let before = data.store_keys.len();
+            data.store_keys.retain(|e| !(e.store_id == store_id && e.key_id == key_id));
+            if data.store_keys.len() == before {
+                return Ok(());
+            }
+            data.clone()
+        };
+        self.write_atomic(&snapshot).await
+    }
+
     /// The symmetric key for (`store_id`, `key_id`), if this server has
     /// unwrapped one — what [`crate::vault_link::VaultLink`] looks a vault
     /// blob's key id up against, logging and skipping the blob on `None`
@@ -278,6 +293,24 @@ mod tests {
         assert_eq!(ks.store_key(store_a, key_2).await.unwrap().0, sym_2.0);
         assert!(ks.store_key(store_b, key_1).await.is_none());
         assert!(ks.store_key(store_a, Uuid::new_v4()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn removing_a_store_key_forgets_that_key_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.json");
+        let ks = Keystore::new(path.clone());
+        let store = StoreId::new();
+        let (kept, dropped) = (Uuid::new_v4(), Uuid::new_v4());
+        ks.add_store_key(store, kept, &SymmetricKey::generate()).await.unwrap();
+        ks.add_store_key(store, dropped, &SymmetricKey::generate()).await.unwrap();
+
+        ks.remove_store_key(store, dropped).await.unwrap();
+        ks.remove_store_key(store, Uuid::new_v4()).await.unwrap();
+
+        let reloaded = Keystore::new(path);
+        assert!(reloaded.store_key(store, kept).await.is_some());
+        assert!(reloaded.store_key(store, dropped).await.is_none());
     }
 
     #[tokio::test]

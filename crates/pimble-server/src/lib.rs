@@ -15,6 +15,7 @@ pub mod jwt;
 pub mod keystore;
 pub mod principal;
 pub mod server;
+pub mod share;
 pub mod sync_link;
 pub mod vault_link;
 

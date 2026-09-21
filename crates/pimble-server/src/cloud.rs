@@ -75,6 +75,17 @@ async fn put<B: Serialize, T: for<'de> Deserialize<'de>>(url: &str, bearer: &str
     finish(url, resp).await
 }
 
+async fn delete(url: &str, bearer: &str) -> Result<()> {
+    let resp = client()
+        .delete(url)
+        .bearer_auth(bearer)
+        .send()
+        .await
+        .map_err(|e| CloudError::Request { url: url.to_string(), source: e })?;
+    let _: serde_json::Value = finish(url, resp).await?;
+    Ok(())
+}
+
 fn endpoint(base_url: &str, path: &str) -> String {
     format!("{}{}", base_url.trim_end_matches('/'), path)
 }
@@ -237,6 +248,16 @@ impl HeldAs {
     }
 }
 
+/// Whether the account's rows say it is an owner of `store_id`: a
+/// whole-store grant with the owner role. Sharing is an owner's to do (the
+/// accounts service takes `PUT members` and the hosted server `setScope`
+/// from nobody else), so the owner's side of it runs on an owner's devices
+/// only.
+pub fn is_owner_of(rows: &[StoreView], store_id: pimble_core::StoreId) -> bool {
+    let id = store_id.to_string();
+    rows.iter().any(|row| row.store_id == id && row.root.is_none() && row.role == "owner")
+}
+
 pub async fn create_store(base_url: &str, session: &str, name: &str, kind: &str, store_id: Option<&str>) -> Result<StoreView> {
     post(&endpoint(base_url, "/api/v1/stores"), Some(session), &CreateStoreRequest { name, kind, store_id }).await
 }
@@ -332,4 +353,83 @@ pub async fn put_store_key(
     let body = PutStoreKeysRequest { envelopes: vec![EnvelopeUpsert { user_id, key_id: key_id.to_string(), envelope, root: root.map(|r| r.to_string()) }] };
     let _: serde_json::Value = put(&endpoint(base_url, &format!("/api/v1/stores/{store_id}/keys")), session, &body).await?;
     Ok(())
+}
+
+// ── GET/PUT/DELETE /stores/{id}/members, DELETE /stores/{id}/invitations ──
+//
+// A share is a scoped grant (docs/NODE_DOCUMENT_CONTRACT.md section 5;
+// `pimble-cloud`'s README, "Sharing"): every call here takes the shared node
+// as `root`, and means the whole store without one.
+
+/// One member or invitation of a scope, as `GET`/`PUT .../members` answer.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemberView {
+    /// `None` for an invitation: there is no account to name yet.
+    #[serde(default)]
+    pub user_id: Option<String>,
+    pub email: String,
+    pub role: String,
+    /// `"active"` (a grant) or `"invited"` (an invitation).
+    pub status: String,
+    /// Whether the member has been handed the scope's key: what the owner's
+    /// key sweep looks for.
+    #[serde(default)]
+    pub has_key: bool,
+    /// Filled in for an owner caller and an active member only.
+    #[serde(default)]
+    pub public_keys: Option<AccountPublicKeys>,
+}
+
+impl MemberView {
+    pub fn is_active(&self) -> bool {
+        self.status == "active"
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MembersResponse {
+    pub members: Vec<MemberView>,
+    /// The share's name; `None` for a whole-store listing.
+    #[serde(default)]
+    pub share_name: Option<String>,
+}
+
+pub async fn list_members(base_url: &str, session: &str, store_id: &str, root: Option<&pimble_core::NodeId>) -> Result<MembersResponse> {
+    get(&endpoint(base_url, &format!("/api/v1/stores/{store_id}/members{}", root_query(root))), Some(session)).await
+}
+
+#[derive(Serialize)]
+struct PutMemberRequest<'a> {
+    email: &'a str,
+    role: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root: Option<String>,
+    /// The share's name, required with a `root`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+}
+
+/// Give `email` a role on a scope: a grant when the address has an account
+/// (the answer then carries its `public_keys`), an invitation when not.
+pub async fn put_member(
+    base_url: &str,
+    session: &str,
+    store_id: &str,
+    email: &str,
+    role: &str,
+    root: Option<&pimble_core::NodeId>,
+    name: Option<&str>,
+) -> Result<MemberView> {
+    let body = PutMemberRequest { email, role, root: root.map(|r| r.to_string()), name };
+    put(&endpoint(base_url, &format!("/api/v1/stores/{store_id}/members")), session, &body).await
+}
+
+pub async fn delete_member(base_url: &str, session: &str, store_id: &str, user_id: &str, root: Option<&pimble_core::NodeId>) -> Result<()> {
+    delete(&endpoint(base_url, &format!("/api/v1/stores/{store_id}/members/{user_id}{}", root_query(root))), session).await
+}
+
+/// Withdraw an invitation; `200` whether or not there was one.
+pub async fn delete_invitation(base_url: &str, session: &str, store_id: &str, email: &str, root: Option<&pimble_core::NodeId>) -> Result<()> {
+    let encoded_email: String = url::form_urlencoded::byte_serialize(email.as_bytes()).collect();
+    delete(&endpoint(base_url, &format!("/api/v1/stores/{store_id}/invitations/{encoded_email}{}", root_query(root))), session).await
 }

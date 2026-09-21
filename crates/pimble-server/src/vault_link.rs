@@ -73,6 +73,20 @@
 //! up. How the account holds the store is read again from the accounts
 //! service at every connect (`refresh_grant`).
 //!
+//! **Share upkeep** (docs/NODE_DOCUMENT_CONTRACT.md section 5, the owner's
+//! half; `crate::share`): on an owner's device the link's task also runs
+//! the hosted-server half of keeping the store's shares up, the scope sets
+//! and the wraps of data keys, at every connect and a moment after the
+//! tree changes. It rides this connection, this keyring and this task on
+//! purpose: giving a document from before data keys its data key has to be
+//! serialized with this device's own appends to that document, and the
+//! keyring already knows every document's wraps from the pull
+//! ([`LinkSession`] is the narrow view of the link it works through). The
+//! accounts-service half, the key sweep, is a task of its own beside the
+//! link's (`crate::share::run_sweeper`), so a slow accounts service never
+//! holds up an edit on its way out. None of it is in the path of anyone
+//! else's edit.
+//!
 //! **Connecting**: `sync.json` never holds a credential (matching
 //! `crate::sync_link`'s decision 4) — a vault link instead asks
 //! `RpcHandler::keystore` for the currently signed-in account fresh on
@@ -93,13 +107,14 @@ use pimble_client::PimbleClient;
 use pimble_core::{AuthMethod, NodeId, StoreAccess, StoreId, SyncState};
 use pimble_crypto::{Blob, SymmetricKey};
 use pimble_rpc::{StoreChangeKind, StoreChangedNotification, VaultCursor, VaultDocId, VaultDocKeys};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use url::Url;
 use uuid::Uuid;
 
 use crate::handler::{LocalChange, Repair, RpcHandler};
+use crate::share::{ShareCommand, Upkeep};
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -128,6 +143,12 @@ pub struct VaultLinkHandle {
     state_rx: watch::Receiver<SyncState>,
     last_sync: Arc<Mutex<Option<DateTime<Utc>>>>,
     join: JoinHandle<()>,
+    /// The store's key sweep (`crate::share::run_sweeper`), which lives and
+    /// dies with the link.
+    sweep: JoinHandle<()>,
+    sweep_kick: Arc<Notify>,
+    /// What a `cloudShare*` RPC asks of the share upkeep in the link's task.
+    share_tx: mpsc::UnboundedSender<ShareCommand>,
 }
 
 impl VaultLinkHandle {
@@ -139,9 +160,21 @@ impl VaultLinkHandle {
         *self.last_sync.lock().unwrap()
     }
 
-    /// Stop the link's background task. Safe to call more than once.
+    /// Stop the link's background tasks. Safe to call more than once.
     pub fn stop(&self) {
         self.join.abort();
+        self.sweep.abort();
+    }
+
+    /// Hand the link's share upkeep a command. `false` when the link's task
+    /// has ended.
+    pub(crate) fn share_command(&self, command: ShareCommand) -> bool {
+        self.share_tx.send(command).is_ok()
+    }
+
+    /// Run the key sweep now rather than at its next tick.
+    pub(crate) fn kick_sweep(&self) {
+        self.sweep_kick.notify_one();
     }
 }
 
@@ -162,9 +195,33 @@ impl VaultLink {
         let last_sync = Arc::new(Mutex::new(last_sync));
 
         let state = LinkState { store_id, state_tx, last_sync: Arc::clone(&last_sync) };
-        let join = tokio::spawn(run_loop(handler, rpc_url, key_id, link_id, state));
+        let sweep_kick = Arc::new(Notify::new());
+        let (share_tx, share_rx) = mpsc::unbounded_channel();
+        let sweep = tokio::spawn(crate::share::run_sweeper(handler.clone(), store_id, Arc::clone(&sweep_kick)));
+        let shares = ShareSide { commands: share_rx, upkeep: Upkeep::new(), sweep_kick: Arc::clone(&sweep_kick) };
+        let join = tokio::spawn(run_loop(handler, rpc_url, key_id, link_id, state, shares));
 
-        VaultLinkHandle { state_rx, last_sync, join }
+        VaultLinkHandle { state_rx, last_sync, join, sweep, sweep_kick, share_tx }
+    }
+}
+
+/// What the link's task holds for the store's shares (see the module doc,
+/// "Share upkeep"): the upkeep's state, which outlives a connection, the
+/// commands the `cloudShare*` RPCs send it, and the key sweep's bell.
+struct ShareSide {
+    commands: mpsc::UnboundedReceiver<ShareCommand>,
+    upkeep: Upkeep,
+    sweep_kick: Arc<Notify>,
+}
+
+impl ShareSide {
+    /// The next command. A closed channel (the handle is gone, and this
+    /// task about to be) never resolves, so the select it sits in does not spin.
+    async fn next_command(&mut self) -> ShareCommand {
+        match self.commands.recv().await {
+            Some(command) => command,
+            None => std::future::pending().await,
+        }
     }
 }
 
@@ -199,7 +256,7 @@ async fn set_state(handler: &RpcHandler, link: &LinkState, state: SyncState) {
     handler.notify_sync_state_changed(link.store_id, state).await;
 }
 
-async fn run_loop(handler: RpcHandler, rpc_url: Url, key_id: Uuid, link_id: String, link: LinkState) {
+async fn run_loop(handler: RpcHandler, rpc_url: Url, key_id: Uuid, link_id: String, link: LinkState, mut shares: ShareSide) {
     let store_id = link.store_id;
     // Subscribed once, for the life of the task: a change made while the link
     // is down still arrives here, which is how the link knows what to push
@@ -209,13 +266,14 @@ async fn run_loop(handler: RpcHandler, rpc_url: Url, key_id: Uuid, link_id: Stri
     let mut backoff = INITIAL_BACKOFF;
     loop {
         let mut reached_synced = false;
-        let result = connect_and_sync(&handler, &rpc_url, key_id, &link_id, &link, &mut local_rx, &mut progress, &mut reached_synced).await;
+        let result = connect_and_sync(&handler, &rpc_url, key_id, &link_id, &link, &mut local_rx, &mut progress, &mut reached_synced, &mut shares).await;
         if reached_synced {
             backoff = INITIAL_BACKOFF;
         }
         if let Err(e) = result {
             warn!("Vault link for store {} to {} dropped: {}", store_id, rpc_url, e);
             set_state(&handler, &link, SyncState::Offline).await;
+            shares.upkeep.link_down(&handler, store_id).await;
             note_local_changes_for(&mut local_rx, &mut progress, store_id, &link_id, backoff).await;
             backoff = (backoff * 2).min(MAX_BACKOFF);
         }
@@ -278,11 +336,12 @@ async fn connect_and_sync(
     local_rx: &mut broadcast::Receiver<LocalChange>,
     progress: &mut Progress,
     reached_synced: &mut bool,
+    shares: &mut ShareSide,
 ) -> anyhow::Result<()> {
     let store_id = link.store_id;
     set_state(handler, link, SyncState::Syncing).await;
 
-    refresh_grant(handler, store_id).await;
+    let owner = refresh_grant(handler, store_id).await;
     let client = connect(handler, rpc_url).await?;
     // What the last connection learned of the remote's documents and their
     // wraps is asked again; data keys already unwrapped stay.
@@ -321,6 +380,12 @@ async fn connect_and_sync(
     *reached_synced = true;
     info!("Vault link for store {} connected to {}", store_id, rpc_url);
 
+    // The shares' upkeep at connect: a pass as soon as the loop below turns
+    // (reconciled first, so the pass judges the converged tree), and the
+    // key sweep beside it.
+    shares.upkeep.connected(handler, store_id, owner);
+    shares.sweep_kick.notify_one();
+
     loop {
         tokio::select! {
             item = remote_sub.next() => {
@@ -336,6 +401,10 @@ async fn connect_and_sync(
             change = local_rx.recv() => {
                 match change {
                     Ok(local_change) => {
+                        // Whoever made it, this link's own applies included:
+                        // a member's create and another device's move change
+                        // what is under a share as much as an edit made here.
+                        shares.upkeep.note(store_id, &local_change);
                         let doc = changed_doc(store_id, link_id, &local_change);
                         if let Err(e) = forward_local_change(handler, &client, store_id, key_id, link_id, local_change, &echoes, progress).await {
                             // Taken off the channel and not delivered: the
@@ -361,6 +430,24 @@ async fn connect_and_sync(
             _ = save_tick.tick() => {
                 progress.save_if_unsaved().await;
             }
+            // Upkeep that fails is tried again, and never takes the link
+            // down with it: the link is the path of this device's own
+            // edits, and a connection that really is gone shows in the
+            // branches above.
+            _ = crate::share::until(shares.upkeep.due()) => {
+                let mut session = LinkSession { handler, client: &client, store_id, link_key_id: key_id, progress: &mut *progress, calls: 0 };
+                if let Err(e) = shares.upkeep.run(&mut session, &shares.sweep_kick).await {
+                    warn!("Vault link for store {}: share upkeep failed ({}); trying again shortly", store_id, e);
+                    shares.upkeep.retry_later();
+                }
+            }
+            command = shares.next_command() => {
+                let mut session = LinkSession { handler, client: &client, store_id, link_key_id: key_id, progress: &mut *progress, calls: 0 };
+                if let Err(e) = shares.upkeep.command(&mut session, command, &shares.sweep_kick).await {
+                    warn!("Vault link for store {}: share upkeep failed ({}); trying again shortly", store_id, e);
+                    shares.upkeep.retry_later();
+                }
+            }
             _ = &mut awaited_poll => {
                 // Quiet again the moment nothing is awaited; slower while
                 // what is awaited stays away.
@@ -379,17 +466,22 @@ async fn connect_and_sync(
 /// key handed over since the replica was added. Best effort: the token the
 /// connect mints next is what the hosted server judges, and a link with no
 /// account or no network fails there, with its backoff.
-async fn refresh_grant(handler: &RpcHandler, store_id: StoreId) {
-    let Some(account) = handler.keystore().account().await else { return };
+///
+/// Answers whether the account is an owner of the store, as far as the
+/// rows say (`None`: they could not be read), which is what decides whether
+/// this device keeps the store's shares up (`crate::share`).
+async fn refresh_grant(handler: &RpcHandler, store_id: StoreId) -> Option<bool> {
+    let account = handler.keystore().account().await?;
     let rows = match crate::cloud::list_stores(&account.url, &account.session).await {
         Ok(rows) => rows,
         Err(e) => {
             debug!("Vault link for store {}: could not list the account's stores: {}", store_id, e);
-            return;
+            return None;
         }
     };
+    let owner = crate::cloud::is_owner_of(&rows, store_id);
     let Some(held_as) = crate::cloud::HeldAs::from_rows(&rows, store_id) else {
-        return;
+        return Some(owner);
     };
 
     let manager = handler.store_manager_handle();
@@ -447,6 +539,7 @@ async fn refresh_grant(handler: &RpcHandler, store_id: StoreId) {
             debug!("Vault link for store {}: could not fetch scope keys: {}", store_id, e);
         }
     }
+    Some(owner)
 }
 
 /// Fetch and unwrap the scope keys the signed-in account has been handed
@@ -533,6 +626,15 @@ struct ProgressFile {
     /// itself is never written down.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pending_keys: HashMap<String, VaultDocKeys>,
+    /// Documents from before data keys that this device gave one (they came
+    /// under a share) and whose snapshot under it is not confirmed yet. The
+    /// earlier blobs are under the store key, which no recipient holds;
+    /// only a snapshot under the data key, replacing them, makes the
+    /// document readable to the share. Written before the keys are set, so
+    /// a crash in between is finished by the next pass
+    /// ([`LinkSession::finish_rekey`]).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    rekeying: BTreeSet<String>,
 }
 
 struct Progress {
@@ -1541,12 +1643,13 @@ async fn full_doc_state(handler: &RpcHandler, store_id: StoreId, doc_id: &VaultD
     Ok((doc.state_vector(), doc.save()))
 }
 
-async fn upload_snapshot(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, doc_id: VaultDocId, key_id: Uuid, upto_seq: u64, progress: &mut Progress) -> anyhow::Result<()> {
+/// Answers whether the snapshot was stored.
+async fn upload_snapshot(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId, doc_id: VaultDocId, key_id: Uuid, upto_seq: u64, progress: &mut Progress) -> anyhow::Result<bool> {
     // Under the key the document's blobs go out under (it exists by now, so
     // never a create). Can't snapshot without it; the log still has
     // everything.
     let Seal::With { key_id, key } = seal_plan(handler, client, store_id, &doc_id, key_id, progress).await? else {
-        return Ok(());
+        return Ok(false);
     };
     let (_, plaintext) = full_doc_state(handler, store_id, &doc_id).await?;
     let aad = pimble_crypto::blob_aad(&store_id.to_string(), &doc_id.as_str());
@@ -1556,12 +1659,267 @@ async fn upload_snapshot(handler: &RpcHandler, client: &PimbleClient, store_id: 
         Ok(()) => {}
         Err(e) if is_refusal(&e) => {
             debug!("Vault link for store {} doc {:?}: snapshot refused ({}); the log keeps everything", store_id, doc_id, e);
-            return Ok(());
+            return Ok(false);
         }
         Err(e) => return Err(anyhow::anyhow!("remote vaultSnapshot for {:?} failed: {}", doc_id, e)),
     }
     debug!("Vault link for store {} uploaded a snapshot for doc {:?} up to seq {}", store_id, doc_id, upto_seq);
-    Ok(())
+    Ok(true)
+}
+
+// ── What share upkeep works through (crate::share) ───────────────────────
+
+/// The link's connection and keyring as the owner's share upkeep sees them
+/// (module doc, "Share upkeep"): what the remote holds of a document's
+/// keys, a document's data key, adding wraps, and giving a document from
+/// before data keys one. Built for the length of one pass, inside the
+/// link's own task, so nothing here races this device's appends.
+pub(crate) struct LinkSession<'a> {
+    handler: &'a RpcHandler,
+    client: &'a PimbleClient,
+    store_id: StoreId,
+    link_key_id: Uuid,
+    progress: &'a mut Progress,
+    /// Round trips made for keys so far: a pass that has a whole folder to
+    /// wrap works in slices, so the link's own forwarding gets its turn.
+    calls: usize,
+}
+
+/// What the remote holds of one document's keys.
+pub(crate) enum RemoteKeys {
+    /// The remote has never seen the document: the link creates it when it
+    /// pushes it, wrapped under every scope key that covers it (`seal_plan`).
+    Absent,
+    /// From before data keys: its blobs are under the store key itself.
+    Keyless,
+    Keys(VaultDocKeys),
+}
+
+/// What became of giving a document a data key.
+pub(crate) enum Rekeyed {
+    /// It has one now, and a snapshot under it stands for everything before.
+    Done,
+    /// Not yet: this device has not read the document's log to its head (a
+    /// snapshot may only vouch for what it has applied), or the remote
+    /// refused. Asked again by a later pass.
+    Waiting,
+    /// Someone else gave it one in the meantime: theirs stands.
+    HasKeys(VaultDocKeys),
+}
+
+impl LinkSession<'_> {
+    pub(crate) fn handler(&self) -> &RpcHandler {
+        self.handler
+    }
+
+    pub(crate) fn client(&self) -> &PimbleClient {
+        self.client
+    }
+
+    pub(crate) fn store_id(&self) -> StoreId {
+        self.store_id
+    }
+
+    /// The scope key this link seals under when a document has no data key:
+    /// on a whole replica, the store key.
+    pub(crate) fn link_key_id(&self) -> Uuid {
+        self.link_key_id
+    }
+
+    /// How many round trips this session has made for documents' keys.
+    pub(crate) fn calls(&self) -> usize {
+        self.calls
+    }
+
+    /// `node`'s keys on the remote: as the pull left them in the keyring,
+    /// asked for when the keyring has none (a document that had none when
+    /// it was pulled may have been given them since, by the member who
+    /// created it or by another of the owner's devices).
+    pub(crate) async fn remote_keys(&mut self, node: NodeId) -> anyhow::Result<RemoteKeys> {
+        let doc_id = VaultDocId::Node(node);
+        let doc = doc_id.as_str();
+        if !self.progress.keyring.remote_docs.contains(&doc) {
+            return Ok(RemoteKeys::Absent);
+        }
+        if let Some(keys) = self.progress.keyring.wraps.get(&doc) {
+            return Ok(RemoteKeys::Keys(keys.clone()));
+        }
+        self.calls += 1;
+        match self.client.vault_fetch(self.store_id, doc_id.clone(), u64::MAX).await {
+            Ok(fetch) => {
+                self.progress.keyring.note_wraps(&doc_id, fetch.keys.clone());
+                Ok(match fetch.keys {
+                    Some(keys) => RemoteKeys::Keys(keys),
+                    None if fetch.head == 0 => RemoteKeys::Absent,
+                    None => RemoteKeys::Keyless,
+                })
+            }
+            Err(e) if is_refusal(&e) => Ok(RemoteKeys::Absent),
+            Err(e) => Err(anyhow::anyhow!("remote vaultFetch for {:?} failed: {}", doc_id, e)),
+        }
+    }
+
+    /// `node`'s data key, when some scope key this device holds opens a wrap of it.
+    pub(crate) async fn data_key(&mut self, node: NodeId, dek_id: Uuid) -> Option<SymmetricKey> {
+        let doc_id = VaultDocId::Node(node);
+        // Only ever the data key: `blob_key`'s fall back to a scope key held
+        // under that id is for reading old blobs, not for wrapping.
+        if !self.progress.keyring.wraps.get(&doc_id.as_str()).is_some_and(|keys| keys.dek_id == dek_id) {
+            return None;
+        }
+        blob_key(self.handler, &mut self.progress.keyring, self.store_id, &doc_id, dek_id).await
+    }
+
+    /// Add wraps of `node`'s data key (the remote merges them by scope
+    /// key). `false` when the remote refused them.
+    pub(crate) async fn add_wraps(&mut self, node: NodeId, keys: VaultDocKeys) -> anyhow::Result<bool> {
+        let doc_id = VaultDocId::Node(node);
+        self.calls += 1;
+        match self.client.vault_set_doc_keys(self.store_id, doc_id.clone(), keys.clone()).await {
+            Ok(()) => {}
+            Err(e) if is_refusal(&e) => {
+                debug!("Vault link for store {} doc {:?}: wraps refused ({})", self.store_id, doc_id, e);
+                return Ok(false);
+            }
+            Err(e) => return Err(anyhow::anyhow!("remote vaultSetDocKeys for {:?} failed: {}", doc_id, e)),
+        }
+        // The keyring's copy follows the remote's merge.
+        let doc = doc_id.as_str();
+        let mut merged = keys;
+        if let Some(held) = self.progress.keyring.wraps.get(&doc).filter(|held| held.dek_id == merged.dek_id) {
+            for wrap in &held.wraps {
+                if !merged.wraps.iter().any(|w| w.scope_key_id == wrap.scope_key_id) {
+                    merged.wraps.push(wrap.clone());
+                }
+            }
+        }
+        self.progress.keyring.note_wraps(&doc_id, Some(merged));
+        Ok(true)
+    }
+
+    /// Give `node`, a document from before data keys, a data key wrapped
+    /// under `scope_key_ids`, and replace its log (blobs under the store
+    /// key, which no recipient of a share holds) with a snapshot under the
+    /// new key. Only when this device has applied the log to its head: the
+    /// snapshot deletes what it covers. The keys go first and the snapshot
+    /// second, because the other order could leave a snapshot nobody has
+    /// the key of where the log used to be; in between, the document reads
+    /// as it did to everyone who holds the store key.
+    pub(crate) async fn give_data_key(&mut self, node: NodeId, scope_key_ids: &[Uuid]) -> anyhow::Result<Rekeyed> {
+        let doc_id = VaultDocId::Node(node);
+        let doc = doc_id.as_str();
+        self.calls += 1;
+        let fetch = match self.client.vault_fetch(self.store_id, doc_id.clone(), u64::MAX).await {
+            Ok(fetch) => fetch,
+            Err(e) if is_refusal(&e) => return Ok(Rekeyed::Waiting),
+            Err(e) => return Err(anyhow::anyhow!("remote vaultFetch for {:?} failed: {}", doc_id, e)),
+        };
+        if let Some(keys) = fetch.keys {
+            self.progress.keyring.note_wraps(&doc_id, Some(keys.clone()));
+            return Ok(Rekeyed::HasKeys(keys));
+        }
+        if fetch.head == 0 || self.progress.cursor(&doc_id).applied_through() != fetch.head {
+            return Ok(Rekeyed::Waiting);
+        }
+
+        let dek = SymmetricKey::generate();
+        let dek_id = Uuid::new_v4();
+        let aad = pimble_crypto::dek_aad(&self.store_id.to_string(), &doc);
+        let mut wraps: Vec<pimble_crypto::WrappedDek> = Vec::new();
+        for scope_key_id in scope_key_ids {
+            if wraps.iter().any(|w| w.scope_key_id == *scope_key_id) {
+                continue;
+            }
+            if let Some(scope_key) = self.handler.keystore().store_key(self.store_id, *scope_key_id).await {
+                wraps.push(pimble_crypto::wrap_dek(&dek, &scope_key, *scope_key_id, &aad));
+            }
+        }
+        // Without the store key's wrap the owner's other devices could not
+        // read what comes after.
+        if !wraps.iter().any(|w| w.scope_key_id == self.link_key_id) {
+            return Ok(Rekeyed::Waiting);
+        }
+        let keys = VaultDocKeys { dek_id, wraps };
+
+        self.progress.file.rekeying.insert(doc.clone());
+        self.progress.unsaved = true;
+        self.progress.save_if_unsaved().await;
+        match self.client.vault_set_doc_keys(self.store_id, doc_id.clone(), keys.clone()).await {
+            Ok(()) => {}
+            Err(e) if is_refusal(&e) => {
+                self.progress.file.rekeying.remove(&doc);
+                self.progress.unsaved = true;
+                return Ok(Rekeyed::Waiting);
+            }
+            Err(e) => return Err(anyhow::anyhow!("remote vaultSetDocKeys for {:?} failed: {}", doc_id, e)),
+        }
+        // Another device of the owner's may have done the same a moment
+        // ago, and the remote keeps whichever keys came last: look before
+        // sealing anything under ours.
+        let after = self
+            .client
+            .vault_fetch(self.store_id, doc_id.clone(), u64::MAX)
+            .await
+            .map_err(|e| anyhow::anyhow!("remote vaultFetch for {:?} failed: {}", doc_id, e))?;
+        match after.keys {
+            Some(held) if held.dek_id == dek_id => {
+                self.progress.keyring.deks.insert(doc.clone(), (dek_id, dek));
+                self.progress.keyring.note_wraps(&doc_id, Some(held));
+            }
+            other => {
+                self.progress.file.rekeying.remove(&doc);
+                self.progress.unsaved = true;
+                self.progress.keyring.note_wraps(&doc_id, other.clone());
+                return Ok(match other {
+                    Some(held) => Rekeyed::HasKeys(held),
+                    None => Rekeyed::Waiting,
+                });
+            }
+        }
+        info!("Vault link for store {}: document {} has a data key now (it came under a share)", self.store_id, node);
+        Ok(if self.finish_rekey(node).await? { Rekeyed::Done } else { Rekeyed::Waiting })
+    }
+
+    /// The documents whose snapshot under their new data key is still owed.
+    pub(crate) fn rekeying(&self) -> Vec<NodeId> {
+        self.progress.file.rekeying.iter().filter_map(|doc| match VaultDocId::parse(doc)? {
+            VaultDocId::Node(id) => Some(id),
+            VaultDocId::Tree => None,
+        }).collect()
+    }
+
+    /// The second half of [`LinkSession::give_data_key`]: the snapshot.
+    /// `false` while it cannot be made (the log has entries this device has
+    /// not applied); the mark stays and a later pass asks again.
+    pub(crate) async fn finish_rekey(&mut self, node: NodeId) -> anyhow::Result<bool> {
+        let doc_id = VaultDocId::Node(node);
+        let doc = doc_id.as_str();
+        self.calls += 1;
+        let fetch = match self.client.vault_fetch(self.store_id, doc_id.clone(), u64::MAX).await {
+            Ok(fetch) => fetch,
+            Err(e) if is_refusal(&e) => return Ok(false),
+            Err(e) => return Err(anyhow::anyhow!("remote vaultFetch for {:?} failed: {}", doc_id, e)),
+        };
+        self.progress.keyring.note_wraps(&doc_id, fetch.keys.clone());
+        if fetch.keys.is_none() {
+            // The keys never landed (a crash between the mark and the
+            // call): the document is as it was, and the pass starts over.
+            self.progress.file.rekeying.remove(&doc);
+            self.progress.unsaved = true;
+            return Ok(false);
+        }
+        if self.progress.cursor(&doc_id).applied_through() != fetch.head {
+            return Ok(false);
+        }
+        if !upload_snapshot(self.handler, self.client, self.store_id, doc_id.clone(), self.link_key_id, fetch.head, self.progress).await? {
+            return Ok(false);
+        }
+        self.progress.note_snapshot(&doc_id, fetch.head);
+        self.progress.file.rekeying.remove(&doc);
+        self.progress.unsaved = true;
+        self.progress.save_if_unsaved().await;
+        Ok(true)
+    }
 }
 
 /// What a connection's first pass could not finish, asked for again on a
