@@ -24,6 +24,7 @@ mod imp {
         serde_json::from_str(&json).unwrap_or_else(|_| serde_json::json!({}))
     }
 
+    #[cfg(not(test))]
     fn write_state(state: &serde_json::Value) {
         let path = state_file_path();
         if let Some(parent) = path.parent() {
@@ -31,6 +32,13 @@ mod imp {
         }
         let _ = std::fs::write(&path, serde_json::to_string_pretty(state).unwrap_or_default());
     }
+
+    /// The unit tests drive the same event handlers the app does, and those
+    /// save the open-store list as they go. `state_file_path()` is the real
+    /// one, so a test run would rewrite the list of stores whoever ran it has
+    /// open. Under test the file is never written.
+    #[cfg(test)]
+    fn write_state(_state: &serde_json::Value) {}
 
     /// The saved open-store paths.
     pub(crate) fn load_app_state_file() -> Vec<String> {

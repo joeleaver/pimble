@@ -124,21 +124,24 @@ pub fn mount_label_suffix(state: &MountState) -> &'static str {
     }
 }
 
-/// What a share's link is doing, in one plain sentence for the Share modal
-/// (docs/SHARING_CONTRACT.md "Apps"). `Conflict` cannot happen to a share
-/// today, but a state needs words rather than a gap in the match.
+/// What the owner's side of a share is doing, in one plain sentence for the
+/// Share modal (docs/NODE_DOCUMENT_CONTRACT.md section 5, "What the owner's
+/// side keeps doing": publishing the scope and handing out the key).
+/// `Conflict` cannot happen to a share today, but a state needs words rather
+/// than a gap in the match.
 pub fn share_state_text(state: &SyncState) -> &'static str {
     match state {
-        SyncState::Synced { .. } => "Up to date with Pimble Cloud.",
-        SyncState::Syncing => "Sending changes to Pimble Cloud...",
-        SyncState::Offline => "Offline. Changes go up when this device reconnects.",
-        SyncState::Conflict { .. } => "This share could not be synced.",
+        SyncState::Synced { .. } => "Everyone invited has what they need.",
+        SyncState::Syncing => "Handing the key and the scope over...",
+        SyncState::Offline => "Offline. The rest goes up when this device reconnects.",
+        SyncState::Conflict { .. } => "This share could not be set up.",
     }
 }
 
 /// What this device may do in a store someone shared with it, in words
-/// (docs/SHARING_CONTRACT.md "Access on the recipient's side"). Empty for a
-/// store of one's own, which the row says nothing about.
+/// (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"). An editor edits
+/// everything in scope, so their row says nothing beyond who shared it; only
+/// a reader's row has something to add.
 pub fn access_words(access: pimble_core::StoreAccess) -> &'static str {
     match access {
         pimble_core::StoreAccess::Full => "",
@@ -146,13 +149,15 @@ pub fn access_words(access: pimble_core::StoreAccess) -> &'static str {
     }
 }
 
-/// Why a row's tree-changing menu items are disabled, or empty when they are
-/// not. One sentence at the top of the menu rather than a reason repeated on
-/// every item.
+/// Why a row's menu items are disabled, or empty when they are not. Reading
+/// is the only access that disables anything, and it disables everything that
+/// writes, so one sentence at the top of the menu says it once: the same
+/// sentence a refused write comes back with, so the person reads it in one
+/// wording wherever it appears.
 pub fn access_note(access: pimble_core::StoreAccess) -> &'static str {
     match access {
         pimble_core::StoreAccess::Full => "",
-        pimble_core::StoreAccess::Read => "Shared with you to read. Nothing here can be changed.",
+        pimble_core::StoreAccess::Read => pimble_core::StoreAccess::READ_ONLY_REFUSAL,
     }
 }
 
@@ -405,22 +410,24 @@ pub struct AppStore {
     pub hosted_modal_busy: Signal<bool>,
     pub hosted_modal_error: Signal<String>,
 
-    // "Share..." modal (node context menu, docs/SHARING_CONTRACT.md "Apps").
-    // One modal, two faces: the name field and "Share" while the node is not
-    // shared, the members and "Stop sharing" once it is.
+    // "Share..." modal (node context menu, docs/NODE_DOCUMENT_CONTRACT.md
+    // section 5). A share is a scoped grant on this store: the node and the
+    // documents under it, with a role per member. One modal, two faces: the
+    // name field and "Share" while the node is not shared, the members and
+    // "Stop sharing" once it is.
     /// The canonical node the modal is open for; `None` means closed.
     pub share_modal_node: Signal<Option<(StoreId, NodeId)>>,
-    /// The share's name: the node's title while it is only a proposal, then
-    /// the name the share carries. Pimble Cloud sees it, and so does everyone
-    /// invited.
+    /// The share's own name, which is not the node's title: the owner types it
+    /// and it is what a recipient's store list shows. Pimble Cloud sees it,
+    /// and so does everyone invited.
     pub share_modal_name: Signal<String>,
     /// Which face the modal shows. Seeded from the node's own share marker
     /// when the modal opens (that is the local truth about whether a node is
     /// shared) and moved by `CloudShareUpdated` / `CloudSharingStopped`.
     pub share_modal_shared: Signal<bool>,
     pub share_modal_members: Signal<Vec<pimble_rpc::ShareMember>>,
-    /// The share link's state in words. Kept apart from `share_modal_share`
-    /// because `ShareStateChanged` updates it on its own.
+    /// What the owner's side of the share is doing, in words. Kept apart from
+    /// `share_modal_shared` because `ShareStateChanged` updates it on its own.
     pub share_modal_state: Signal<String>,
     pub share_modal_invite_email: Signal<String>,
     /// `"editor"` or `"reader"` — the raw `Select` value of the role field.
@@ -435,7 +442,7 @@ pub struct AppStore {
     /// A sentence the server sent back refusing a command (`Forbidden`, e.g.
     /// a store shared read-only), shown in the status bar. Not an error
     /// state: the connection is fine, the command was simply not allowed
-    /// (docs/SHARING_CONTRACT.md "Access on the recipient's side").
+    /// (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles").
     pub notice: Signal<String>,
 }
 
@@ -541,9 +548,11 @@ impl AppStore {
         }
     }
 
-    /// What this device may change in a store (docs/SHARING_CONTRACT.md
-    /// "Access on the recipient's side"), untracked. A store the app has not
-    /// registered yet reads as `Full`: nothing is disabled on a guess.
+    /// What this device may change in a store (docs/NODE_DOCUMENT_CONTRACT.md
+    /// section 5, "Roles"), untracked. `Full` for one's own stores and for an
+    /// editor's scope — an editor edits everything in it, structure included —
+    /// and `Read` for a reader. A store the app has not registered yet reads
+    /// as `Full`: nothing is disabled on a guess.
     pub fn store_access(&self, store_id: StoreId) -> pimble_core::StoreAccess {
         untracked(|| {
             self.store_data.with(|map| {
@@ -559,6 +568,43 @@ impl AppStore {
         untracked(|| {
             self.store_data
                 .with(|map| map.get(&store_id).and_then(|sig| sig.with(|s| s.shared_by.clone())))
+        })
+    }
+
+    /// The nodes of a store this device holds the subtree of: the store's own
+    /// root for a whole store, the scope roots for a partial replica — one per
+    /// share of that store (docs/NODE_DOCUMENT_CONTRACT.md section 5, "The
+    /// recipient's replica"). Untracked; empty for a store the app has not
+    /// registered.
+    pub fn shown_roots(&self, store_id: StoreId) -> Vec<NodeId> {
+        untracked(|| {
+            self.store_data.with(|map| {
+                map.get(&store_id).map(|sig| sig.with(|s| s.shown_roots())).unwrap_or_default()
+            })
+        })
+    }
+
+    /// Whether a store is a partial replica — this device holds some shared
+    /// subtrees of it rather than the whole thing, so each of those roots is a
+    /// row of its own under the store row. A whole store's `roots` is empty.
+    pub fn is_partial_replica(&self, store_id: StoreId) -> bool {
+        untracked(|| {
+            self.store_data
+                .with(|map| map.get(&store_id).map_or(false, |sig| sig.with(|s| !s.roots.is_empty())))
+        })
+    }
+
+    /// The node a store row draws itself from: its root, whose icon, colour
+    /// and share marker the row shows as its own. A partial replica has none —
+    /// the row stands for someone else's store, whose root this device does
+    /// not hold, and each shared root is its own row with its own icon and
+    /// badge (docs/NODE_DOCUMENT_CONTRACT.md section 5).
+    pub fn store_row_node(&self, store_id: StoreId) -> Option<NodeId> {
+        untracked(|| {
+            self.store_data.with(|map| {
+                map.get(&store_id)
+                    .and_then(|sig| sig.with(|s| s.roots.is_empty().then_some(s.root_node_id)))
+            })
         })
     }
 
@@ -994,9 +1040,9 @@ impl AppStore {
         let mut result = Vec::new();
         for &sid in &store_ids {
             let store_info = self.store_data.with(|map| {
-                map.get(&sid).map(|sig| sig.with(|s| (s.name.clone(), s.root_node_id)))
+                map.get(&sid).map(|sig| sig.with(|s| (s.name.clone(), s.root_node_id, s.roots.clone())))
             });
-            let Some((store_name, root_id)) = store_info else { continue };
+            let Some((store_name, root_id, roots)) = store_info else { continue };
 
             // rinch's Tree re-renders a row only when its `TreeNodeData`
             // changes, and the store row's context menu snapshots whether the
@@ -1008,19 +1054,39 @@ impl AppStore {
             let linked = self.sync_data.with(|map| {
                 map.get(&sid).map_or(false, |sig| sig.with(|(remote, _)| remote.is_some()))
             });
-            // A store row's icon and colour come from its root node's metadata.
-            let root_appearance = self.row_snapshot(sid, root_id);
+            // A store row's icon and colour come from its root node's
+            // metadata — a partial replica's row has no root of its own to
+            // take them from (see `store_row_node`).
+            let root_appearance =
+                if roots.is_empty() { self.row_snapshot(sid, root_id) } else { String::new() };
             // What this device may change here, and who shared it: the row's
-            // menu snapshots both (docs/SHARING_CONTRACT.md "Access on the
-            // recipient's side"), so a change has to change the data.
+            // menu snapshots both (docs/NODE_DOCUMENT_CONTRACT.md section 5),
+            // so a change has to change the data. The scope roots are in there
+            // too: a second share of the same store extends this replica, and
+            // the row has to rebuild with the new root under it.
             let access = self.store_data.with(|map| {
                 map.get(&sid).map(|sig| sig.with(|s| format!("{:?}{:?}", s.access, s.shared_by))).unwrap_or_default()
             });
+            let roots_key: Vec<String> = roots.iter().map(|r| r.to_string()).collect();
             let store_node = TreeNodeData::new(
                 format!("store_{}", sid),
-                format!("{store_name} (linked: {linked}, paste: {paste}, {access}, {root_appearance})"),
+                format!(
+                    "{store_name} (linked: {linked}, paste: {paste}, {access}, {root_appearance}, roots: {})",
+                    roots_key.join(",")
+                ),
             );
-            let children = self.build_children_structural(sid, root_id, paste, &[]);
+            // A whole store's row stands for its root: the root's children hang
+            // straight off it, as they always have. A partial replica's row
+            // stands for someone else's store, of which this device holds only
+            // the shared subtrees — so each scope root is a row of its own
+            // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "The recipient's
+            // replica"). Its tree value is the ordinary `node_{store}_{node}`,
+            // so opening, renaming and the context menu need no special case.
+            let children = if roots.is_empty() {
+                self.build_children_structural(sid, root_id, paste, &[])
+            } else {
+                roots.iter().map(|&root| self.structural_node(sid, root, paste, &[])).collect()
+            };
             if children.is_empty() {
                 result.push(store_node);
             } else {
@@ -1049,71 +1115,83 @@ impl AppStore {
         });
         let Some(children) = children else { return Vec::new() };
 
+        children
+            .iter()
+            .map(|&(child_store, child_id)| self.structural_node(child_store, child_id, paste, mount_path))
+            .collect()
+    }
+
+    /// One row: the node itself plus whatever hangs below it. Used for every
+    /// child of a loaded parent, and for each scope root of a partial replica,
+    /// which is a row under the store row rather than a child of anything
+    /// (see `build_tree_data_structural`).
+    fn structural_node(
+        &self,
+        child_store: StoreId,
+        child_id: NodeId,
+        paste: bool,
+        mount_path: &[(StoreId, NodeId)],
+    ) -> TreeNodeData {
         let suffix = mount_path_suffix(mount_path);
+        let is_mount = self.mount_data.with(|map| {
+            map.get(&(child_store, child_id)).map_or(false, |sig| sig.with(|m| m.is_mount))
+        });
 
-        let mut result = Vec::new();
-        for &(child_store, child_id) in &children {
-            let is_mount = self.mount_data.with(|map| {
-                map.get(&(child_store, child_id)).map_or(false, |sig| sig.with(|m| m.is_mount))
-            });
+        // The renderer never reads this label (render_node Effects draw
+        // it reactively); it only carries what the row snapshots at render
+        // time — the "Paste Mount Here" state, the node's custom icon and
+        // colour, its share marker, and what this device may change in
+        // the node's own store — so the row re-renders when any of them
+        // changes (see `build_tree_data_structural`).
+        let appearance = self.row_snapshot(child_store, child_id);
+        let access = self.store_data.with(|map| {
+            map.get(&child_store).map(|sig| sig.with(|s| format!("{:?}", s.access))).unwrap_or_default()
+        });
+        let tree_node = TreeNodeData::new(
+            format!("node_{}_{}{}", child_store, child_id, suffix),
+            format!("{}|{}|{}", if paste { "paste" } else { "" }, access, appearance),
+        );
 
-            // The renderer never reads this label (render_node Effects draw
-            // it reactively); it only carries what the row snapshots at render
-            // time — the "Paste Mount Here" state, the node's custom icon and
-            // colour, its share marker, and what this device may change in
-            // the node's own store — so the row re-renders when any of them
-            // changes (see `build_tree_data_structural`).
-            let appearance = self.row_snapshot(child_store, child_id);
-            let access = self.store_data.with(|map| {
-                map.get(&child_store).map(|sig| sig.with(|s| format!("{:?}", s.access))).unwrap_or_default()
-            });
-            let tree_node = TreeNodeData::new(
-                format!("node_{}_{}{}", child_store, child_id, suffix),
-                format!("{}|{}|{}", if paste { "paste" } else { "" }, access, appearance),
+        // Crossing a mount node adds it to the path for everything below it.
+        let children_data = if is_mount {
+            let mut next_path = mount_path.to_vec();
+            next_path.push((child_store, child_id));
+            self.build_children_structural(child_store, child_id, paste, &next_path)
+        } else {
+            self.build_children_structural(child_store, child_id, paste, mount_path)
+        };
+        let has_children = !children_data.is_empty();
+        let has_loaded_children = self.children_of.with(|map| {
+            map.contains_key(&(child_store, child_id))
+        });
+
+        // Check if the node itself reports having children (from its
+        // children list) even if we haven't fetched them yet. This
+        // lets the tree show an expand chevron for unfetched subtrees.
+        let node_reports_children = !has_loaded_children && self.node_data.with(|map| {
+            map.get(&(child_store, child_id))
+                .map_or(false, |sig| sig.with(|n| !n.children.is_empty()))
+        });
+
+        if has_children {
+            tree_node.with_children(children_data)
+        } else if is_mount && !has_loaded_children {
+            let placeholder = TreeNodeData::new(
+                format!("mount_loading_{}_{}{}", child_store, child_id, suffix),
+                "Loading...",
             );
-
-            // Crossing a mount node adds it to the path for everything below it.
-            let children_data = if is_mount {
-                let mut next_path = mount_path.to_vec();
-                next_path.push((child_store, child_id));
-                self.build_children_structural(child_store, child_id, paste, &next_path)
-            } else {
-                self.build_children_structural(child_store, child_id, paste, mount_path)
-            };
-            let has_children = !children_data.is_empty();
-            let has_loaded_children = self.children_of.with(|map| {
-                map.contains_key(&(child_store, child_id))
-            });
-
-            // Check if the node itself reports having children (from its
-            // children list) even if we haven't fetched them yet. This
-            // lets the tree show an expand chevron for unfetched subtrees.
-            let node_reports_children = !has_loaded_children && self.node_data.with(|map| {
-                map.get(&(child_store, child_id))
-                    .map_or(false, |sig| sig.with(|n| !n.children.is_empty()))
-            });
-
-            if has_children {
-                result.push(tree_node.with_children(children_data));
-            } else if is_mount && !has_loaded_children {
-                let placeholder = TreeNodeData::new(
-                    format!("mount_loading_{}_{}{}", child_store, child_id, suffix),
-                    "Loading...",
-                );
-                result.push(tree_node.with_children(vec![placeholder]));
-            } else if node_reports_children {
-                // Node has children we haven't fetched yet — show a
-                // placeholder so the tree renders an expand chevron.
-                let placeholder = TreeNodeData::new(
-                    format!("placeholder_{}_{}{}", child_store, child_id, suffix),
-                    "",
-                );
-                result.push(tree_node.with_children(vec![placeholder]));
-            } else {
-                result.push(tree_node);
-            }
+            tree_node.with_children(vec![placeholder])
+        } else if node_reports_children {
+            // Node has children we haven't fetched yet — show a
+            // placeholder so the tree renders an expand chevron.
+            let placeholder = TreeNodeData::new(
+                format!("placeholder_{}_{}{}", child_store, child_id, suffix),
+                "",
+            );
+            tree_node.with_children(vec![placeholder])
+        } else {
+            tree_node
         }
-        result
     }
 
     /// Compute the display label for a node (untracked, for use in callbacks).
@@ -1216,8 +1294,8 @@ mod tests {
 
     /// rinch re-renders a tree row only when its `TreeNodeData` changes, and a
     /// row's menu snapshots the store's access and the node's share marker at
-    /// render time — so both have to be in the data (docs/SHARING_CONTRACT.md
-    /// "Apps", CLAUDE.md "Hardening").
+    /// render time — so both have to be in the data
+    /// (docs/NODE_DOCUMENT_CONTRACT.md section 5, CLAUDE.md "Hardening").
     #[test]
     fn row_data_carries_access_and_the_share_marker() {
         let (app, store_id, child_id) = store_with_a_child();
@@ -1267,22 +1345,115 @@ mod tests {
         assert_eq!(app.shared_by(store_id), None);
     }
 
-    /// What the recipient's side says, in words.
+    /// An editor of a share edits everything in it, so their rows have nothing
+    /// greyed out and their menus carry no note — only a reader's do
+    /// (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"). Every `disabled:`
+    /// on a tree-changing item, and every guard in front of one, is this
+    /// predicate.
+    #[test]
+    fn only_a_reader_has_anything_disabled() {
+        let (app, store_id, _) = store_with_a_child();
+        if let Some(sig) = app.get_store_signal(store_id) {
+            sig.update(|s| {
+                s.access = StoreAccess::Full;
+                s.shared_by = Some("ann@example.com".to_string());
+            });
+        }
+        assert!(app.store_access(store_id).allows_write(), "an editor's share disables tree actions");
+        assert!(access_note(app.store_access(store_id)).is_empty(), "an editor's menu carries a note");
+        assert_eq!(access_words(app.store_access(store_id)), "", "an editor's row says more than who shared it");
+
+        if let Some(sig) = app.get_store_signal(store_id) {
+            sig.update(|s| s.access = StoreAccess::Read);
+        }
+        assert!(!app.store_access(store_id).allows_write());
+        assert_eq!(access_note(app.store_access(store_id)), StoreAccess::READ_ONLY_REFUSAL);
+        assert_eq!(access_words(app.store_access(store_id)), "read only");
+    }
+
+    /// What the recipient's side says, in words. An editor's store says
+    /// nothing and disables nothing; a reader's says "read only" and gives the
+    /// one refusal sentence as the reason, the same one a refused write comes
+    /// back with (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles").
     #[test]
     fn access_reads_as_plain_words() {
         assert_eq!(access_words(StoreAccess::Full), "");
         assert_eq!(access_words(StoreAccess::Read), "read only");
         assert!(access_note(StoreAccess::Full).is_empty());
-        assert!(access_note(StoreAccess::Read).contains("Shared with you"));
+        assert_eq!(access_note(StoreAccess::Read), StoreAccess::READ_ONLY_REFUSAL);
     }
 
-    /// Every state a share's link can be in says what it means.
+    /// Every state a share can be in says what it means.
     #[test]
     fn share_state_reads_as_a_sentence() {
         let synced: SyncState =
             serde_json::from_str(r#"{"state":"synced","last_sync":"2026-09-17T00:00:00Z"}"#).unwrap();
-        assert_eq!(share_state_text(&synced), "Up to date with Pimble Cloud.");
-        assert_eq!(share_state_text(&SyncState::Syncing), "Sending changes to Pimble Cloud...");
+        assert_eq!(share_state_text(&synced), "Everyone invited has what they need.");
+        assert_eq!(share_state_text(&SyncState::Syncing), "Handing the key and the scope over...");
         assert!(share_state_text(&SyncState::Offline).starts_with("Offline."));
+    }
+
+    /// A partial replica of someone else's store shows each shared root as a
+    /// row of its own under the store row, addressed like any other node, and
+    /// with the root's own children below it — the store row stands for the
+    /// owner's store, not for the shared folder
+    /// (docs/NODE_DOCUMENT_CONTRACT.md section 5, "The recipient's replica").
+    #[test]
+    fn a_partial_replica_shows_every_shared_root() {
+        let app = AppStore::new();
+        let mut store = Store::new_local("Ann's notes", "/tmp/anns.pimble".into());
+        let recipes = Node::folder("Recipes");
+        let trips = Node::folder("Trips");
+        let pasta = Node::document("Pasta");
+        store.root_node_id = recipes.id;
+        store.roots = vec![recipes.id, trips.id];
+        store.shared_by = Some("ann@example.com".to_string());
+        let store_id = store.id;
+        app.upsert_store(store);
+        app.upsert_node(store_id, recipes.clone());
+        app.upsert_node(store_id, trips.clone());
+        app.upsert_node(store_id, pasta.clone());
+        app.set_children(store_id, recipes.id, vec![(store_id, pasta.id)]);
+
+        let data = untracked(|| app.build_tree_data_structural());
+        let store_row = &data[0];
+        assert_eq!(store_row.value, format!("store_{store_id}"));
+        assert_eq!(store_row.children.len(), 2, "both shared roots are rows under the store row");
+        assert_eq!(store_row.children[0].value, format!("node_{store_id}_{}", recipes.id));
+        assert_eq!(store_row.children[1].value, format!("node_{store_id}_{}", trips.id));
+        // The root's own children hang off its row, not off the store row.
+        assert_eq!(store_row.children[0].children[0].value, format!("node_{store_id}_{}", pasta.id));
+        assert!(store_row.children[1].children.is_empty());
+        assert_eq!(app.shown_roots(store_id), vec![recipes.id, trips.id]);
+        assert!(app.is_partial_replica(store_id));
+        // The store row stands for someone else's store, whose root this
+        // device does not hold: it takes no node's icon, colour or badge.
+        assert_eq!(app.store_row_node(store_id), None);
+
+        // A second share of the same store extends the replica: the row's data
+        // has to change, or rinch re-renders nothing and the new root never
+        // appears.
+        let before = store_row.label.clone();
+        let walks = Node::folder("Walks");
+        app.upsert_node(store_id, walks.clone());
+        if let Some(sig) = app.get_store_signal(store_id) {
+            sig.update(|s| s.roots.push(walks.id));
+        }
+        let after = untracked(|| app.build_tree_data_structural());
+        assert_ne!(before, after[0].label, "the store row never re-renders with the new root");
+        assert_eq!(after[0].children.len(), 3);
+    }
+
+    /// A whole store keeps the behaviour it always had: the store row stands
+    /// for the root, and the root's children hang straight off it.
+    #[test]
+    fn a_whole_store_still_shows_its_roots_children() {
+        let (app, store_id, child_id) = store_with_a_child();
+        let data = untracked(|| app.build_tree_data_structural());
+        assert_eq!(data[0].children.len(), 1);
+        assert_eq!(data[0].children[0].value, format!("node_{store_id}_{child_id}"));
+        assert!(!app.is_partial_replica(store_id));
+        assert_eq!(app.shown_roots(store_id), vec![app.root_node_id(store_id).unwrap()]);
+        assert_eq!(app.store_row_node(store_id), app.root_node_id(store_id));
     }
 }

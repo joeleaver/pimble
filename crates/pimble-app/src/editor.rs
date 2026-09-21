@@ -78,6 +78,9 @@ pub(crate) fn start_editing(
     let outbound = move |delta: Vec<u8>| {
         use base64::Engine;
         // A store shared read-only takes remote changes but sends none back.
+        // `store_id` is the node's CANONICAL store (`open_node` parses the
+        // tree value, which strips any mount path), so a node reached through
+        // a mount is judged by the store the edit would be written to.
         if !store.store_access(store_id).allows_write() {
             reject_local_edit(store, store_id, node_id);
             return;
@@ -177,9 +180,10 @@ fn cancel_pending_read_only_reopen() {
 }
 
 /// What happens when someone types into a document their device may only read
-/// (docs/SHARING_CONTRACT.md "Apps"): the delta is not sent, and the node is
-/// reopened from the server's copy so the typed text does not linger. Debounced,
-/// so a burst of keystrokes costs one reopen rather than one per character.
+/// (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"): the delta is not sent,
+/// and the node is reopened from the server's copy so the typed text does not
+/// linger. Debounced, so a burst of keystrokes costs one reopen rather than
+/// one per character.
 ///
 /// This is the interim. rinch's editor has no read-only switch yet; when it
 /// grows one, this function and the two lines that call it are the whole of
@@ -236,6 +240,14 @@ pub(crate) fn apply_reconcile(
         handle.collab_receive(diff);
         schedule_label_refresh(store, store_id, node_id);
         crate::toolbar::bump_toolbar();
+    }
+    // A store shared read-only sends nothing back, here as in `outbound`: the
+    // session's own state is not the server's to take
+    // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"). Without this the
+    // reconcile that follows every open pushes the freshly hosted empty
+    // document, and the server refuses it out loud.
+    if !store.store_access(store_id).allows_write() {
+        return;
     }
     if let Some(ours) = handle.collab_sync_diff(server_state_vector) {
         if !ours.is_empty() {

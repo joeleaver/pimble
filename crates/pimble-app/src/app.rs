@@ -438,14 +438,16 @@ pub fn open_hosted_modal(store: AppStore) {
     }
 }
 
-/// "Share..." for `(store_id, node_id)` (docs/SHARING_CONTRACT.md "Apps"):
-/// the Share modal when an account is signed in, the Account modal with a
-/// hint otherwise — the same rule "Host on Pimble Cloud..." follows, because
-/// a share lives on an account.
+/// "Share..." for `(store_id, node_id)` (docs/NODE_DOCUMENT_CONTRACT.md
+/// section 5): a share is a scoped grant on this store — the node and the
+/// documents under it — so it needs an account, and the Account modal opens
+/// with a hint when there is none, the same rule "Host on Pimble Cloud..."
+/// follows.
 ///
 /// The node's own share marker decides which face opens, so a node already
 /// shared shows its share at once; `CloudShareInfo` then fills in the members
-/// the accounts service has.
+/// the accounts service has. A share carries a name of its own, seeded here
+/// from the node's title because that is usually what the owner would type.
 pub fn open_share_modal(store: AppStore, store_id: pimble_core::StoreId, node_id: pimble_core::NodeId) {
     if !untracked(|| store.cloud_signed_in.get()) {
         open_account_modal(store, "Sign in to share a node");
@@ -473,9 +475,11 @@ pub fn open_share_modal(store: AppStore, store_id: pimble_core::StoreId, node_id
     }
 }
 
-/// How a hosted store reads in the "Add Hosted Store..." list. A share is
-/// one node of someone else's store, so it says whose
-/// (docs/SHARING_CONTRACT.md "Apps").
+/// How a hosted store reads in the "Add Hosted Store..." list. A row with a
+/// `root` is a share — a scope inside someone else's store — so it reads as
+/// the share's own name and who shared it, never the owner's store name,
+/// which no recipient ever sees (docs/NODE_DOCUMENT_CONTRACT.md section 5,
+/// "A share has a name of its own").
 fn hosted_store_label(info: &pimble_rpc::CloudHostedStoreInfo) -> String {
     match (info.root.is_some(), &info.shared_by) {
         (true, Some(email)) => format!("{}, shared by {}", info.name, email),
@@ -484,9 +488,10 @@ fn hosted_store_label(info: &pimble_rpc::CloudHostedStoreInfo) -> String {
 }
 
 /// How far a member is from being able to open the share, in words
-/// (docs/SHARING_CONTRACT.md "Apps"). An invitation to an address with no
-/// account yet, and a member whose key no device of ours has wrapped yet, are
-/// both ordinary states rather than failures, so both say what is happening.
+/// (docs/NODE_DOCUMENT_CONTRACT.md section 5). An invitation to an address
+/// with no account yet, and a member whose key no device of ours has wrapped
+/// yet, are both ordinary states rather than failures, so both say what is
+/// happening.
 fn member_status_text(status: pimble_rpc::ShareMemberStatus) -> &'static str {
     match status {
         pimble_rpc::ShareMemberStatus::Invited => "invited, no account yet",
@@ -495,7 +500,9 @@ fn member_status_text(status: pimble_rpc::ShareMemberStatus) -> &'static str {
     }
 }
 
-/// A member's role in words, for the member list.
+/// A member's role in words, for the member list. An editor edits everything
+/// in the share — the text, the titles, the structure — so "can edit" is the
+/// whole of it (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles").
 fn member_role_text(role: pimble_rpc::MemberRole) -> &'static str {
     match role {
         pimble_rpc::MemberRole::Owner => "owner",
@@ -707,10 +714,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         return;
                     }
 
-                    // The tree of a shared folder is its owner's
-                    // (docs/SHARING_CONTRACT.md): the context menu's "Rename"
-                    // is disabled there, so the double-click shortcut is not
-                    // a way around it.
+                    // A store shared with this device to read changes in no
+                    // way (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"):
+                    // the context menu's "Rename" is disabled there, so the
+                    // double-click shortcut is not a way around it. An editor
+                    // renames like anyone else.
                     let renameable = parse_tree_value(&value)
                         .map_or(true, |(s_id, _)| store.store_access(s_id).allows_write());
                     if !renameable {
@@ -881,8 +889,10 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 .unwrap_or(false);
 
             // What this device may change in the store this row's node
-            // belongs to (docs/SHARING_CONTRACT.md "Access on the recipient's
-            // side"). `parse_tree_value` returns the CANONICAL pair, so a node
+            // belongs to (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles").
+            // `Full` is one's own store and an editor's scope alike, so an
+            // editor of a share has nothing greyed out; only a reader does.
+            // `parse_tree_value` returns the CANONICAL pair, so a node
             // reached through a mount is judged by its source store, which is
             // the store the RPC would go to. Snapshotted like `is_linked_now`
             // (rinch #714); the row's data carries it, so a store whose access
@@ -897,10 +907,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 .and_then(|sig| untracked(|| sig.with(|m| m.mount_ref.as_ref().map(|r| r.source_store))))
                 .map_or(can_write_tree, |source| store.store_access(source).allows_write());
             // Whether this row's node carries a share marker (a store row
-            // takes its root node's, like its icon and colour): the badge.
+            // takes its root node's, like its icon and colour, and a partial
+            // replica's row has no root of its own): the badge.
             let is_shared_now = if is_store_root {
                 parsed
-                    .and_then(|(s_id, _)| store.root_node_id(s_id).map(|root| store.is_shared(s_id, root)))
+                    .and_then(|(s_id, _)| store.store_row_node(s_id).map(|root| store.is_shared(s_id, root)))
                     .unwrap_or(false)
             } else {
                 parsed
@@ -915,11 +926,12 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 .map(|sig| sig.with(|n| n.node_type == pimble_core::node_types::FOLDER))
                 .unwrap_or(has_children);
             // A custom icon or colour from the node's metadata (the "Appearance..."
-            // picker, or an import); a store row takes its root node's. Snapshotted
-            // here like the type icon: the row's `TreeNodeData` carries both, so a
-            // change re-renders the row.
+            // picker, or an import); a store row takes its root node's, and a
+            // partial replica's row has none. Snapshotted here like the type
+            // icon: the row's `TreeNodeData` carries both, so a change
+            // re-renders the row.
             let appearance_sig = if is_store_root {
-                parsed.and_then(|(s_id, _)| store.root_node_id(s_id).and_then(|root| store.get_node_signal(s_id, root)))
+                parsed.and_then(|(s_id, _)| store.store_row_node(s_id).and_then(|root| store.get_node_signal(s_id, root)))
             } else {
                 node_sig
             };
@@ -984,11 +996,12 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     if dragged_value == nv { return; }
                     let Some((drag_store_id, Some(drag_node_id))) = parse_tree_value(&dragged_value) else { return; };
                     let new_parent_id = if let Some((target_store_id, target_node_id_opt)) = parse_tree_value(&nv) {
-                        // The tree of a shared folder belongs to its owner
-                        // (docs/SHARING_CONTRACT.md): nothing moves into one
-                        // from here, and the server would refuse it anyway.
+                        // A store shared to read takes no moves: the rows do
+                        // not drag and the server would refuse it anyway
+                        // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles").
+                        // An editor moves nodes inside their scope freely.
                         if !store.store_access(target_store_id).allows_write() {
-                            tracing::info!("Ignoring drop into {:?}: its structure is not ours to change", target_store_id);
+                            tracing::info!("Ignoring drop into {:?}: it is shared with us to read", target_store_id);
                             return;
                         }
                         if drag_store_id != target_store_id {
@@ -1088,8 +1101,12 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     }
                 }
             };
-            // "Share...": share this node (a store row shares its root node)
-            // with people on Pimble Cloud (docs/SHARING_CONTRACT.md).
+            // "Share...": grant people a scope on this store rooted at this
+            // node (a store row shares its root node), so they hold the same
+            // documents and co-author them (docs/NODE_DOCUMENT_CONTRACT.md
+            // section 5). Never disabled for a store that is not hosted: the
+            // server answers with the sentence that says what is missing, and
+            // the modal shows it.
             let on_share = {
                 let nv = nv_ctx.clone();
                 move || {
@@ -1244,13 +1261,13 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             // The badge a shared node's row carries after its label. Drawn
             // from the render-time snapshot, like the type icon: the row's
             // data holds the marker, so it re-renders when one appears or goes
-            // (docs/SHARING_CONTRACT.md "Apps").
+            // (docs/NODE_DOCUMENT_CONTRACT.md section 5).
             let share_badge: Option<NodeHandle> = if is_shared_now {
                 let badge_icon = render_tabler_icon(__scope, TablerIcon::Share, TablerIconStyle::Outline);
                 Some(rsx! {
                     span {
                         class: "pimble-tree__share",
-                        title: "Shared on Pimble Cloud",
+                        title: "Shared with other people",
                         {badge_icon}
                     }
                 })
@@ -1457,7 +1474,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             // Why the items below are disabled, when some of them are: one
             // dimmed line at the top of the menu, rather than the same reason
             // repeated on every item or (worse) items greyed out saying
-            // nothing (docs/SHARING_CONTRACT.md "Apps").
+            // nothing. Only a store shared to read has one — an editor's menu
+            // is a full menu (docs/NODE_DOCUMENT_CONTRACT.md section 5).
             let access_note_text = crate::state::access_note(access_now);
             let menu_note: Option<NodeHandle> = if access_note_text.is_empty() {
                 None
@@ -1793,9 +1811,9 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         store.root_node_id(sid).map(|rid| (sid, rid))
                     })
                 })
-                // Not into a store whose structure is its owner's
-                // (docs/SHARING_CONTRACT.md): the row's "New Node" is
-                // disabled there, and so is this.
+                // Not into a store shared with this device to read
+                // (docs/NODE_DOCUMENT_CONTRACT.md section 5): the row's "New
+                // Node" is disabled there, and so is this.
                 .filter(|(s_id, _)| store.store_access(*s_id).allows_write());
             match result {
                 Some((s_id, root_id)) => store.send(BackendCommand::CreateNode {
@@ -1824,11 +1842,14 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         let toolbar_handle = crate::toolbar::render_pimble_toolbar(__scope);
 
         // Whether the document in the pane belongs to a store this device may
-        // only read (docs/SHARING_CONTRACT.md "Access on the recipient's
-        // side"). Reactive on the active node and on its store's own signal,
-        // so the pane follows a store whose access arrives or changes. The
-        // toolbar gives way to a line saying so; `editor::reject_local_edit`
-        // is what happens if someone types anyway.
+        // only read (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles").
+        // `active_edit` holds the node's CANONICAL store — the one the edit
+        // would be written to, even when the node was reached through a mount
+        // — so that is the store whose access decides. Reactive on the active
+        // node and on its store's own signal, so the pane follows a store
+        // whose access arrives or changes. The toolbar gives way to a line
+        // saying so; `editor::reject_local_edit` is what happens if someone
+        // types anyway.
         //
         // The store's own signal comes out of the registry first and is read
         // after that borrow is released: rinch keeps every signal in one
@@ -2694,10 +2715,12 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         };
 
         // ── "Add Hosted Store..." modal (Account menu) ──────────────────
-        // decision 6: the account's encrypted stores not already open here
-        // (the event handler filters `CloudHostedStoresListed`), one of
-        // which becomes a local replica. The store arrives as `StoreOpened`,
-        // which closes the modal.
+        // decision 6: the account's encrypted stores and shares not already
+        // open here (the event handler filters `CloudHostedStoresListed`),
+        // one of which becomes a local replica — a whole one for a store of
+        // one's own, a partial one for a share. The store arrives as
+        // `StoreOpened`, which closes the modal and carries the roots this
+        // device now holds (docs/NODE_DOCUMENT_CONTRACT.md section 5).
         let add_hosted_store = move || {
             let selected = untracked(|| store.hosted_modal_selected.get());
             let Ok(uuid) = selected.parse::<uuid::Uuid>() else {
@@ -2768,7 +2791,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                         }
                                     }
                                 },
-                                "Every encrypted store on this account is already open here."
+                                "Every encrypted store and share on this account is already open here."
                             }
 
                             Button {
@@ -2793,12 +2816,16 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         };
 
         // ── "Share..." modal (node context menu) ────────────────────────
-        // docs/SHARING_CONTRACT.md "Apps": one modal, two faces. A name and
-        // "Share" while the node is not shared; the share, its members and
-        // "Stop sharing" once it is. Every outcome arrives as
-        // `CloudShareUpdated`, `CloudSharingStopped` or `CloudError { op }`,
-        // so `events.rs` fills the busy and error lines without guessing
-        // which request answered (the Account modal's rule, decision 3).
+        // docs/NODE_DOCUMENT_CONTRACT.md section 5: a share is a scoped grant
+        // on this store, so everyone on it edits the same documents. One
+        // modal, two faces: a name and "Share" while the node is not shared;
+        // the share, its members and "Stop sharing" once it is. Every outcome
+        // arrives as `CloudShareUpdated`, `CloudSharingStopped` or
+        // `CloudError { op }`, so `events.rs` fills the busy and error lines
+        // without guessing which request answered (the Account modal's rule,
+        // decision 3). A store that is not hosted is refused by the server
+        // with a sentence naming the relay; it lands in the error line like
+        // any other answer, which is how the person finds out.
         let share_node_now = move || {
             let Some((store_id, node_id)) = untracked(|| store.share_modal_node.get()) else { return };
             let name = untracked(|| store.share_modal_name.get()).trim().to_string();
@@ -2867,8 +2894,16 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
 
                             div {
                                 class: "pimble-share__note",
-                                "Pimble Cloud sees this name, and so does everyone you invite. \
-                                 The notes themselves stay encrypted."
+                                "This name is the share's own: it is what the people you invite \
+                                 see, and the name of your store is not. Pimble Cloud sees it \
+                                 too. The notes themselves stay encrypted."
+                            }
+
+                            div {
+                                class: "pimble-share__note",
+                                "Everyone you invite to edit gets this folder and everything in \
+                                 it, and edits all of it: the writing, the titles, and where \
+                                 things sit. Their changes and yours are the same notes."
                             }
 
                             div {
@@ -2904,11 +2939,17 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             if store.share_modal_confirm_stop.get() {
                                 div {
                                     style: "display: flex; flex-direction: column; gap: 10px;",
+                                    // Stopping a share ends the grant. It
+                                    // deletes nothing: the notes are the
+                                    // owner's own documents and stay where
+                                    // they are (docs/NODE_DOCUMENT_CONTRACT.md
+                                    // section 5).
                                     div {
                                         {|| format!(
-                                            "Stop sharing \"{}\"? It is deleted from Pimble Cloud and nobody gets \
-                                             anything new from it. What they have already synced stays on their \
-                                             own devices.",
+                                            "Stop sharing \"{}\"? The people on it lose access and get nothing \
+                                             new from it, and what they have already synced stays on their own \
+                                             devices. The notes stay where they are, in your store and hosted \
+                                             as before.",
                                             store.share_modal_name.get(),
                                         )}
                                     }
@@ -3018,6 +3059,12 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                             onclick: invite_now,
                                             "Invite"
                                         }
+                                    }
+
+                                    div {
+                                        class: "pimble-share__note",
+                                        "Someone who can edit changes everything in this folder: the writing, \
+                                         the titles, and where things sit. Someone who can read changes nothing."
                                     }
 
                                     div {
@@ -3133,10 +3180,13 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 style: {move || if store.show_editor.get() && !editor_read_only() { "" } else { "display: none;" }},
                                 {toolbar_handle}
                             }
+                            // The same sentence a refused write comes back
+                            // with, so a reader meets one wording everywhere,
+                            // plus what it means for the pane in front of them.
                             div {
                                 class: "pimble-editor__read-only",
                                 style: {move || if store.show_editor.get() && editor_read_only() { "" } else { "display: none;" }},
-                                "Read only. This was shared with you to read; nothing typed here is kept."
+                                {format!("{} Nothing typed here is kept.", pimble_core::StoreAccess::READ_ONLY_REFUSAL)}
                             }
                             div {
                                 class: "pimble-editor__content-wrap",
@@ -3190,9 +3240,9 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         }
 
                         // A refusal the server sent back, in its own words
-                        // (docs/SHARING_CONTRACT.md "Access on the recipient's
-                        // side"). It is not a connection failure, so it does
-                        // not touch the badge beside it.
+                        // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles").
+                        // It is not a connection failure, so it does not touch
+                        // the badge beside it.
                         span {
                             class: "pimble-status-bar__notice",
                             style: {|| if store.notice.get().is_empty() { "display: none;" } else { "" }},
@@ -3352,8 +3402,9 @@ mod tests {
         }
     }
 
-    /// A share in "Add Hosted Store..." says whose it is; a store of one's own
-    /// is just its name (docs/SHARING_CONTRACT.md "Apps").
+    /// A row with a `root` is a share: its own name and who shared it, never
+    /// the owner's store name (docs/NODE_DOCUMENT_CONTRACT.md section 5, "A
+    /// share has a name of its own"). A store of one's own is just its name.
     #[test]
     fn a_shared_store_says_who_shared_it() {
         assert_eq!(hosted_store_label(&hosted("Notes", false, None)), "Notes");

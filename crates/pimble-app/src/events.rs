@@ -31,8 +31,8 @@ const NOTICE_MS: u32 = 8000;
 /// A refused command (`Forbidden`, e.g. a store shared read-only) is not a
 /// broken connection and must not read as one: the UI disables what a store's
 /// access forbids, so this is for the rare command that got through anyway —
-/// and it says what the server said (docs/SHARING_CONTRACT.md "Access on the
-/// recipient's side").
+/// and it says what the server said (docs/NODE_DOCUMENT_CONTRACT.md section 5,
+/// "Roles").
 fn show_notice(store: AppStore, message: String) {
     if let Some(handle) = NOTICE_TIMEOUT.with(|slot| slot.borrow_mut().take()) {
         clear_timeout(handle);
@@ -72,24 +72,33 @@ pub fn pump_backend_events() {
     });
 }
 
-/// Register a newly-known store in the tree: upsert its signal, fetch its
-/// root's children, subscribe to its changes, auto-expand its row, and
-/// persist the open-store list. Used both when the app explicitly opens a
-/// store (`StoreOpened`) and when it discovers one implicitly — a mount's
+/// Register a newly-known store in the tree: upsert its signal, fetch each of
+/// its roots and their children, subscribe to its changes, auto-expand its
+/// row, and persist the open-store list. Used both when the app explicitly
+/// opens a store (`StoreOpened`) and when it discovers one implicitly — a mount's
 /// source store the server opened to resolve a mount (`StoresListed`,
 /// decision 4) — minus the pending-mount finalization, which only applies to
 /// the explicit "Mount Store..." folder-picker flow.
 fn register_opened_store(store: AppStore, tree_state: UseTreeReturn, opened_store: &Store) {
     let store_id = opened_store.id;
-    let root_id = opened_store.root_node_id;
+    // A whole store has one root; a partial replica of someone else's store
+    // has one per share of it, each a row of its own under the store row
+    // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "The recipient's replica").
+    // Adding a second share of a store already open here extends the replica,
+    // and the `StoreOpened` that answers carries the longer list — `upsert_store`
+    // replaces the whole `Store`, so the new root is in the tree at once.
+    let roots = opened_store.shown_roots();
 
     // Structural: new store appears in tree
     store.upsert_store(opened_store.clone());
-    store.expanded.update(|e| { e.insert((store_id, root_id)); });
 
-    store.send(BackendCommand::GetChildren { store_id, node_id: root_id });
-    // The root node itself, for the store row's icon and colour (its metadata).
-    store.send(BackendCommand::GetNode { store_id, node_id: root_id });
+    for &root_id in &roots {
+        store.expanded.update(|e| { e.insert((store_id, root_id)); });
+        store.send(BackendCommand::GetChildren { store_id, node_id: root_id });
+        // The root node itself: a whole store's row takes its icon and colour
+        // from it, and a share's root is a row that needs its own label.
+        store.send(BackendCommand::GetNode { store_id, node_id: root_id });
+    }
 
     // Subscribe to store changes for real-time updates
     store.send(BackendCommand::SubscribeStoreChanges { store_id });
@@ -101,8 +110,15 @@ fn register_opened_store(store: AppStore, tree_state: UseTreeReturn, opened_stor
     store.ensure_sync_entry(store_id);
     store.send(BackendCommand::GetStoreSync { store_id });
 
-    // Auto-expand the store node in the tree
+    // Auto-expand the store node in the tree — and, for a partial replica,
+    // each shared root under it, so the store row does not open onto a list of
+    // folder names with nothing in them.
     tree_state.controller.expand(&format!("store_{}", store_id));
+    if !opened_store.roots.is_empty() {
+        for &root_id in &roots {
+            tree_state.controller.expand(&format!("node_{}_{}", store_id, root_id));
+        }
+    }
 
     // Persist open store paths
     save_app_state_file(&store.all_store_local_paths());
@@ -129,19 +145,21 @@ fn refetch_parent_children(store: AppStore, changed_store: StoreId, parent_id: N
     }
 }
 
-/// After a transition to `Synced`, refetch the root's children if none are
-/// loaded yet — a freshly added remote store's document starts empty and only
-/// gains a root once the first reconcile lands (docs/SYNC_CONTRACT.md "B: app
-/// side").
+/// After a transition to `Synced`, refetch the children of every root the
+/// store shows if none are loaded yet — a freshly added remote store's
+/// documents arrive empty and only gain their children once the first
+/// reconcile lands (docs/SYNC_CONTRACT.md "B: app side"). A partial replica
+/// has one root per share, and each fills in the same way.
 fn refetch_root_if_empty(store: AppStore, store_id: StoreId) {
-    let Some(root_id) = store.root_node_id(store_id) else { return };
-    let children_missing = untracked(|| {
-        store.get_children_signal(store_id, root_id)
-            .map(|sig| sig.with(|c| c.is_empty()))
-            .unwrap_or(true)
-    });
-    if children_missing {
-        store.send(BackendCommand::GetChildren { store_id, node_id: root_id });
+    for root_id in store.shown_roots(store_id) {
+        let children_missing = untracked(|| {
+            store.get_children_signal(store_id, root_id)
+                .map(|sig| sig.with(|c| c.is_empty()))
+                .unwrap_or(true)
+        });
+        if children_missing {
+            store.send(BackendCommand::GetChildren { store_id, node_id: root_id });
+        }
     }
 }
 
@@ -948,15 +966,36 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             BackendEvent::CloudHostedStoresListed { stores } => {
                 // Only an encrypted store not already open here can be added
                 // as a replica (the server refuses an open one anyway), so
-                // the modal lists just those (decision 6).
+                // the modal lists just those (decision 6). A share is the
+                // exception: a second share of a store already open here as a
+                // partial replica extends that replica with another root, so
+                // it is listed as long as this device does not hold that root
+                // already (docs/NODE_DOCUMENT_CONTRACT.md section 5).
                 let open: Vec<StoreId> = untracked(|| store.store_ids.get());
+                let mut listed: Vec<String> = Vec::new();
                 let candidates: Vec<pimble_rpc::CloudHostedStoreInfo> = stores
                     .iter()
                     .filter(|s| s.kind == "vault")
                     .filter(|s| {
-                        s.store_id
-                            .parse::<uuid::Uuid>()
-                            .map_or(false, |id| !open.contains(&StoreId(id)))
+                        let Ok(id) = s.store_id.parse::<uuid::Uuid>() else { return false };
+                        let store_id = StoreId(id);
+                        if open.contains(&store_id) {
+                            // Already here in full, or the share's root is one
+                            // of the ones this replica already holds.
+                            match s.root {
+                                Some(root) if !store.shown_roots(store_id).contains(&root) => {}
+                                _ => return false,
+                            }
+                        }
+                        // `cloudAddHostedStore` names a store, not a scope, so
+                        // two pending shares of one store are one row: adding
+                        // it brings every root the account is granted, and the
+                        // `StoreOpened` that answers says which arrived.
+                        if listed.contains(&s.store_id) {
+                            return false;
+                        }
+                        listed.push(s.store_id.clone());
+                        true
                     })
                     .cloned()
                     .collect();
@@ -1073,7 +1112,7 @@ mod tests {
 
         assert!(store.share_modal_shared.get());
         assert_eq!(store.share_modal_name.get(), "Recipes");
-        assert_eq!(store.share_modal_state.get(), "Sending changes to Pimble Cloud...");
+        assert_eq!(store.share_modal_state.get(), "Handing the key and the scope over...");
         assert_eq!(store.share_modal_members.with(|m| m.len()), 2);
         assert_eq!(store.share_modal_pending.get(), None);
         assert!(store.share_modal_error.get().is_empty());
@@ -1122,7 +1161,7 @@ mod tests {
 
         assert_eq!(
             store.share_modal_state.get(),
-            "Offline. Changes go up when this device reconnects."
+            "Offline. The rest goes up when this device reconnects."
         );
     }
 
@@ -1178,12 +1217,12 @@ mod tests {
 
         events
             .send(BackendEvent::Error {
-                message: "Forbidden: The structure of a shared folder is managed by its owner.".to_string(),
+                message: format!("Forbidden: {}", pimble_core::StoreAccess::READ_ONLY_REFUSAL),
             })
             .unwrap();
         pump(store);
 
-        assert_eq!(store.notice.get(), "The structure of a shared folder is managed by its owner.");
+        assert_eq!(store.notice.get(), pimble_core::StoreAccess::READ_ONLY_REFUSAL);
         assert_eq!(store.connection_status.get(), "Connecting...");
     }
 
@@ -1199,6 +1238,96 @@ mod tests {
 
         assert_eq!(store.notice.get(), pimble_core::StoreAccess::READ_ONLY_REFUSAL);
         assert_eq!(store.connection_status.get(), "Connecting...");
+    }
+
+    /// "Add Hosted Store..." lists a share of a store already open here when
+    /// this device does not hold that share's root yet — the server extends
+    /// the partial replica — and never one whose root it holds. Two pending
+    /// shares of one store are one row, because the RPC names a store rather
+    /// than a scope (docs/NODE_DOCUMENT_CONTRACT.md section 5).
+    #[test]
+    fn the_hosted_list_offers_a_second_share_of_an_open_store() {
+        let (store, events, _commands) = store_with_events();
+        let mut held = pimble_core::Store::new_local("Ann's notes", "/tmp/anns.pimble".into());
+        let (recipes, trips) = (NodeId::new(), NodeId::new());
+        held.root_node_id = recipes;
+        held.roots = vec![recipes];
+        let store_id = held.id;
+        store.upsert_store(held);
+
+        let other = uuid::Uuid::new_v4().to_string();
+        let row = |id: &str, name: &str, root: Option<NodeId>| pimble_rpc::CloudHostedStoreInfo {
+            store_id: id.to_string(),
+            name: name.to_string(),
+            role: "editor".to_string(),
+            kind: "vault".to_string(),
+            created_at: String::new(),
+            root,
+            shared_by: root.map(|_| "ann@example.com".to_string()),
+        };
+        events
+            .send(BackendEvent::CloudHostedStoresListed {
+                stores: vec![
+                    // Held already: not offered again.
+                    row(&store_id.to_string(), "Recipes", Some(recipes)),
+                    // A second share of the same store: offered, once.
+                    row(&store_id.to_string(), "Trips", Some(trips)),
+                    row(&store_id.to_string(), "Walks", Some(NodeId::new())),
+                    row(&other, "Ledger", None),
+                ],
+            })
+            .unwrap();
+        pump(store);
+
+        let offered: Vec<(String, String)> =
+            store.hosted_modal_stores.with(|v| v.iter().map(|s| (s.store_id.clone(), s.name.clone())).collect());
+        assert_eq!(
+            offered,
+            vec![(store_id.to_string(), "Trips".to_string()), (other, "Ledger".to_string())]
+        );
+    }
+
+    /// A store shared with this device arrives as a partial replica: the app
+    /// asks for each shared root and its children, not just the first, and a
+    /// second share of the same store extends the list in place
+    /// (docs/NODE_DOCUMENT_CONTRACT.md section 5, "The recipient's replica").
+    #[test]
+    fn a_partial_replica_fetches_every_shared_root() {
+        let (store, events, commands) = store_with_events();
+        let mut shared = pimble_core::Store::new_local("Ann's notes", "/tmp/anns.pimble".into());
+        let (recipes, trips) = (NodeId::new(), NodeId::new());
+        shared.root_node_id = recipes;
+        shared.roots = vec![recipes, trips];
+        shared.shared_by = Some("ann@example.com".to_string());
+        let store_id = shared.id;
+
+        events.send(BackendEvent::StoreOpened { store: shared.clone() }).unwrap();
+        pump(store);
+
+        let asked: Vec<BackendCommand> = commands.try_iter().collect();
+        for root in [recipes, trips] {
+            assert!(
+                asked.iter().any(|c| matches!(c, BackendCommand::GetChildren { node_id, .. } if *node_id == root)),
+                "no children asked for {root}"
+            );
+            assert!(
+                asked.iter().any(|c| matches!(c, BackendCommand::GetNode { node_id, .. } if *node_id == root)),
+                "the root node itself was never fetched for {root}"
+            );
+        }
+        assert_eq!(store.shown_roots(store_id), vec![recipes, trips]);
+
+        // A second share of the same store: the server extends the replica and
+        // answers with the longer list, which has to replace the held one.
+        let walks = NodeId::new();
+        let mut extended = shared.clone();
+        extended.roots = vec![recipes, trips, walks];
+        events.send(BackendEvent::StoreOpened { store: extended }).unwrap();
+        pump(store);
+        assert_eq!(store.shown_roots(store_id), vec![recipes, trips, walks]);
+        assert!(commands
+            .try_iter()
+            .any(|c| matches!(c, BackendCommand::GetChildren { node_id, .. } if node_id == walks)));
     }
 
     /// A node that has just been shared must re-render its row, and rinch

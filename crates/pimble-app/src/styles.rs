@@ -102,8 +102,8 @@ pub(crate) const APP_CSS: &str = "
 }
 
 /* One dimmed line at the top of a context menu saying why the items below
-   are greyed out (docs/SHARING_CONTRACT.md): a menu that disables items
-   without a reason is what this prevents. */
+   are greyed out (docs/NODE_DOCUMENT_CONTRACT.md section 5): a menu that
+   disables items without a reason is what this prevents. */
 .pimble-menu-note {
     padding: 6px 12px;
     max-width: 260px;
@@ -114,7 +114,7 @@ pub(crate) const APP_CSS: &str = "
 }
 
 /* The badge a shared node's row carries after its label
-   (docs/SHARING_CONTRACT.md, Apps). */
+   (docs/NODE_DOCUMENT_CONTRACT.md section 5). */
 .pimble-tree__share {
     display: inline-flex;
     align-items: center;
