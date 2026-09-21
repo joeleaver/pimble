@@ -525,12 +525,35 @@ async fn refresh_grant(handler: &RpcHandler, store_id: StoreId) -> Option<bool> 
         }
     };
     let owner = crate::cloud::is_owner_of(&rows, store_id);
-    let Some(held_as) = crate::cloud::HeldAs::from_rows(&rows, store_id) else {
-        return Some(owner);
-    };
-
     let manager = handler.store_manager_handle();
     let local_roots = manager.read().await.scope_roots(store_id);
+    let Some(mut held_as) = crate::cloud::HeldAs::from_rows(&rows, store_id) else {
+        // No row at all. For a share's replica that is a removal from every
+        // share of the store: the hosted server takes nothing from this
+        // account any more, so nothing is taken here either (an edit
+        // accepted here would sit on this device for good, looking saved).
+        if !local_roots.is_empty() {
+            let manager = manager.read().await;
+            if let Ok(Some(mut config)) = manager.read_sync_config(store_id).await {
+                if config.access != StoreAccess::Read {
+                    info!("Vault link for store {}: the account holds no share of it any more; read only here now", store_id);
+                    config.access = StoreAccess::Read;
+                    if let Err(e) = manager.write_sync_config(store_id, &config).await {
+                        warn!("Vault link for store {}: could not record how the store is held: {}", store_id, e);
+                    }
+                }
+            }
+        }
+        return Some(owner);
+    };
+    // A root this replica holds and the account does not any more (removed
+    // from that share, or its owner stopped sharing it) stays here as it
+    // last was and takes no edits, for the same reason.
+    for root in local_roots.iter().filter(|root| !held_as.roots.contains(root)) {
+        if !held_as.read_only_roots.contains(root) {
+            held_as.read_only_roots.push(*root);
+        }
+    }
     // Only a partial replica takes roots: a whole replica holds every
     // document already, whatever the account's grant has become since.
     if !local_roots.is_empty() {
