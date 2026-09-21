@@ -112,34 +112,30 @@ of it run, `scripts/local-stack/README.md`.
    update every device of Joe's before opening a store that another device syncs, because
    a device still on v0.1.1 cannot sync with a migrated store. Nothing is merged until Joe
    says so.
-2. **What moving a node out of a share means** (Joe, 2026-09-21: "if someone moves a node
-   out of the share, it needs to count as an undoable delete, I think"). Today: a member
-   cannot do it in the app (nothing outside the share is on their screen); when the owner
-   does, the node vanishes for members, who cannot bring it back, and keeps its identity
-   in the owner's private folder; and a tampered member's client can set a node's
-   `parent_id` to a place outside the share, which the owner's devices then complete
-   (repair lists the node in that folder): a member putting a node into the owner's
-   private tree and out of every member's reach. Two readings, which differ in what the
-   owner's own move does:
-   - **A. It leaves for real, but only when the destination agrees.** A move out of a
-     share is honoured only when the destination's own list names the node, which only
-     someone who may write the destination can do. Repair never completes a move across
-     a share's boundary by itself; a node whose `parent_id` points outside without that
-     is a node removed from the share: gone from the folder for everyone, still in the
-     share's scope, listed under "Removed from this share" where any editor puts it back.
-     The owner's deliberate move keeps the document's identity and takes it private;
-     members cannot undo that one (the owner can, by moving it back); true privacy for
-     what is written afterwards still needs the data-key rotation that is not built.
-   - **B. Nothing ever leaves a share; moving out is a delete there and a new node
-     outside.** For the share it is an ordinary delete (a tombstone, which stays in the
-     scope and which any editor can undo); what lands in the owner's private folder is a
-     new document with a new id and a new key, made once and never kept in step (so not a
-     mirror). No key rotation is ever needed, tampering has nothing to aim at, and members
-     keep what they co-authored; the costs are that the private node is not the same
-     document (links to the old id still point into the share) and that, once a member
-     undoes the delete, the two exist side by side and go their own ways.
-   The PM reads Joe's sentence as B and recommends it, and will not build either before
-   he says which.
+2. **Moving a node out of a share** (Joe, 2026-09-21: "if someone moves a node out of the
+   share, it needs to count as an undoable delete", and, correcting the PM: "both the
+   desktop and the web app should allow for multiple stores to be open at once", so there
+   IS somewhere outside a share on a member's screen). The facts, checked in the code:
+   both apps show several stores at once; a drag from one store onto another is ignored
+   with a log line and nothing on screen (`app.rs`, "cross-store move not supported yet");
+   a member who holds two shares of one store can move a node from one into the other
+   today (`moveNode` judges the three documents, all of which are theirs to write), and
+   for the first share's other members it vanishes with no undo; the owner can do the
+   same into their private part; and a tampered member's client can point a node's
+   `parent_id` outside the share, which the owner's devices then complete.
+   **The design that follows (the PM's reading B, taken as Joe's decision unless he says
+   otherwise; not built):** a move that crosses a share's boundary, to another share, to
+   the owner's private part or to another store, is an ordinary delete in the share it
+   leaves (a tombstone, which stays in that share's scope and which any editor there can
+   undo) and a new node where it lands, made once and never kept in step (so it is no
+   mirror); inside one share a move stays a move. Nothing ever leaves a scope, so no
+   data-key rotation is needed, and a `parent_id` pointing out of a share is never
+   completed by repair. A move between stores cannot be anything else (different stores
+   hold different documents), which also gives the cross-store drag its meaning. To
+   build: the boundary-aware move in `Tree`/the store layer (subtree copied with new ids,
+   content and `data` included), repair refusing to adopt across a boundary, the drag
+   between stores in both apps, and somewhere to see and undo what was removed from a
+   share (there is no app surface for `undeleteNode` at all yet).
 
 ## Known limits (none blocks the design; each is a follow-up)
 
