@@ -27,13 +27,37 @@ of it run, `scripts/local-stack/README.md`.
     share badges, the Share dialog against the real RPCs (members, invite), the unhosted
     refusal verbatim in the dialog, a member's replica with several shared roots under one
     store row, a member typing in the app and the owner's app receiving it.
-- **Not verified: the browser.** The web vault client's share code has unit tests only.
-  Signing in to the web app means typing the account password into the page, which the PM
-  does not do. Joe (or a session where he types the passwords) runs the browser half of
-  the walk-through: a share listed under its own name with "shared by"; a member editing
-  text, titles and structure with the owner's web app seeing all of it; a reader's refusal
-  with nothing on the wire; a replica with an editor's and a reader's root not wedging;
-  "waiting for its key" opening within 30 s; subscriptions restored after a token refresh.
+- **The browser pass was run on 2026-09-21** (the built-in browser, two accounts side by
+  side on `127.0.0.1` and `localhost`, test passwords typed by the PM: they are fixtures
+  of the local stack, never a real account's). Passed: a share listed under a share's
+  name with "shared by" and never the owner's store name; a member typing, creating and
+  renaming with the owner's desktop off, arriving on the other member's desktop and in the
+  owner's page; the owner's rename arriving live in the member's page; a reader's document
+  taking no typing, its menu disabled, and **nothing sent** (the documents' heads on the
+  hosted server did not move); the editable share still working right after a refusal; a
+  reload asking for the password and recovering everything, the keys of documents the page
+  itself created included; after a restart of the hosted server the open page reconnected,
+  subscribed again and received a desktop edit live; no typed word or title readable on
+  the hosted disk.
+- **Found by the browser pass:**
+  - *Fixed, 9b25614:* **repair treated "not held here" as "missing".** A member's new note
+    was unlisted by the owner's page (which had no key for it yet) and listed again by
+    every device that held it, six times a second, 1048 appends in three minutes. Repair
+    now acts on knowledge only (tombstones it holds), never on absence; the mirror case
+    (a node under a parent not held being moved to the root) is gone with it.
+  - *In progress (agent, `web/`):* **the owner's page holds only the store key**, so it
+    cannot read what a member creates until one of the owner's desktops adds the store
+    key's wrap. It must fetch the keys of the shares in its own store, as the desktop
+    link does.
+  - *Open:* **a document created by someone else does not appear in an open page until it
+    reconnects.** The notification carries the blob and not the document's key wraps, and
+    nothing fetches them (`web/src/vault.rs`, `apply_notification`): an unknown document,
+    or an unknown data-key id, has to trigger a `vaultFetch` of that document.
+  - *Open, small:* Enter in the password field does not submit the sign-in or unlock form
+    (it does in the rename box); with several shares of one store the web names the store
+    row after the first share where the desktop says "Shared by <owner>"; the release web
+    build logs rinch's DEBUG lines to the console by the thousand, which hides the app's
+    own warnings.
 - **Found and fixed by that verification** (all committed): a member never learns the
   owner's store name; a new document's wrapped key rides its first `vaultAppend` and is
   stored with it under one lock (a lost answer used to leave a blob nobody could open,
