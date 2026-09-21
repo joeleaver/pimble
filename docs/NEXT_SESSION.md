@@ -40,7 +40,12 @@ of it run, `scripts/local-stack/README.md`.
   stalling every reader); the vault link asks the accounts service every two minutes
   whether the grant changed and reconnects with a fresh token (a role change used to wait
   for the token to expire, up to an hour); a second share renames the replica; a root a
-  member no longer holds takes no edits on their replica.
+  member no longer holds takes no edits on their replica; **access is judged per node**
+  (every `Node` an RPC returns carries `access`; a replica holding one share as an editor
+  and another as a reader used to let the app's editor take typing in the read-only
+  document, shown and saved nowhere), and a role change reaches the running app; a share's
+  member gets a member's Share dialog instead of the owner's management dialog. Both were
+  checked again in the running app after the fix.
 
 ## Decisions waiting for Joe
 
