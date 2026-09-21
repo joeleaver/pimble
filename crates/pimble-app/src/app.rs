@@ -448,14 +448,30 @@ pub fn open_hosted_modal(store: AppStore) {
 /// shared shows its share at once; `CloudShareInfo` then fills in the members
 /// the accounts service has. A share carries a name of its own, seeded here
 /// from the node's title because that is usually what the owner would type.
+///
+/// In a store that reached this device as someone else's share nothing can be
+/// shared from here (`share_item_disabled` keeps the menu item off every node
+/// but a shared root), and a shared root opens on the member's face: whose
+/// share it is and who is on it, read only (`AppStore::share_modal_manages`).
+/// That face is drawn from what this device already holds, so it needs no
+/// sign-in; the member list is asked for when there is an account to ask as.
 pub fn open_share_modal(store: AppStore, store_id: pimble_core::StoreId, node_id: pimble_core::NodeId) {
-    if !untracked(|| store.cloud_signed_in.get()) {
-        open_account_modal(store, "Sign in to share a node");
-        return;
-    }
     let marker = store
         .get_node_signal(store_id, node_id)
         .and_then(|sig| untracked(|| sig.with(|n| n.metadata.share())));
+    let held_as_share = store.shared_by(store_id).is_some();
+    if held_as_share && marker.is_none() {
+        // The menu never offers this; if something else asks, it hears the
+        // reason rather than a form the server would refuse.
+        crate::events::show_notice(store, crate::state::ONLY_AN_OWNER_SHARES_NOTE.to_string());
+        return;
+    }
+    let signed_in = untracked(|| store.cloud_signed_in.get());
+    if !signed_in && !held_as_share {
+        open_account_modal(store, "Sign in to share a node");
+        return;
+    }
+    let ask_for_members = marker.is_some() && signed_in;
     let name = match &marker {
         Some(marker) => marker.name.clone(),
         None => store.display_label(store_id, node_id),
@@ -468,9 +484,9 @@ pub fn open_share_modal(store: AppStore, store_id: pimble_core::StoreId, node_id
     store.share_modal_invite_role.set("editor".to_string());
     store.share_modal_error.set(String::new());
     store.share_modal_confirm_stop.set(false);
-    store.share_modal_pending.set(marker.is_some().then_some(crate::protocol::CloudOp::ShareInfo));
+    store.share_modal_pending.set(ask_for_members.then_some(crate::protocol::CloudOp::ShareInfo));
     store.share_modal_node.set(Some((store_id, node_id)));
-    if marker.is_some() {
+    if ask_for_members {
         store.send(BackendCommand::CloudShareInfo { store_id, node_id });
     }
 }
@@ -491,12 +507,15 @@ fn hosted_store_label(info: &pimble_rpc::CloudHostedStoreInfo) -> String {
 /// (docs/NODE_DOCUMENT_CONTRACT.md section 5). An invitation to an address
 /// with no account yet, and a member whose key no device of ours has wrapped
 /// yet, are both ordinary states rather than failures, so both say what is
-/// happening.
-fn member_status_text(status: pimble_rpc::ShareMemberStatus) -> &'static str {
-    match status {
-        pimble_rpc::ShareMemberStatus::Invited => "invited, no account yet",
-        pimble_rpc::ShareMemberStatus::WaitingForKey => "waiting for your Pimble to hand over the key",
-        pimble_rpc::ShareMemberStatus::Active => "active",
+/// happening. The key is handed over by an owner's Pimble, which is "your
+/// Pimble" only to someone who manages the share (`manages`); a member
+/// reading the list is told whose it is.
+fn member_status_text(status: pimble_rpc::ShareMemberStatus, manages: bool) -> &'static str {
+    match (status, manages) {
+        (pimble_rpc::ShareMemberStatus::Invited, _) => "invited, no account yet",
+        (pimble_rpc::ShareMemberStatus::WaitingForKey, true) => "waiting for your Pimble to hand over the key",
+        (pimble_rpc::ShareMemberStatus::WaitingForKey, false) => "waiting for an owner's Pimble to hand over the key",
+        (pimble_rpc::ShareMemberStatus::Active, _) => "active",
     }
 }
 
@@ -928,6 +947,24 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     .and_then(|(s_id, n_id)| n_id.map(|n_id| store.is_shared(s_id, n_id)))
                     .unwrap_or(false)
             };
+            // "Share...": in a store that reached this device as someone
+            // else's share nothing can be shared from here, so the item opens
+            // only on a shared root (the member's read-only face of the
+            // modal) and every other row says why it is off. `parsed` is the
+            // canonical pair, so a node reached through a mount is judged by
+            // the store it lives in. Snapshotted like `is_linked_now` (rinch
+            // #714): the row's data carries the store's `shared_by`, the
+            // marker and the access, so a change of any re-renders the row.
+            let held_as_share_now = parsed
+                .map(|(s_id, _)| store.shared_by(s_id).is_some())
+                .unwrap_or(false);
+            let share_disabled = crate::state::share_item_disabled(access_now, held_as_share_now, is_shared_now);
+            // A browser build has no "Share..." item to explain.
+            let share_note_text = if CAN_ADMINISTER_STORES {
+                crate::state::share_item_note(held_as_share_now, is_shared_now)
+            } else {
+                ""
+            };
 
             // Choose icon (static — changes only on structural rebuild). Folders
             // are folders even when empty; documents are documents even with
@@ -1132,7 +1169,9 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             // documents and co-author them (docs/NODE_DOCUMENT_CONTRACT.md
             // section 5). Never disabled for a store that is not hosted: the
             // server answers with the sentence that says what is missing, and
-            // the modal shows it.
+            // the modal shows it. Disabled in someone else's store on every
+            // node but a shared root (`share_disabled` above), where it opens
+            // the member's face of the modal.
             let on_share = {
                 let nv = nv_ctx.clone();
                 move || {
@@ -1500,20 +1539,19 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             // Why the items below are disabled, when some of them are: one
             // dimmed line at the top of the menu, rather than the same reason
             // repeated on every item or (worse) items greyed out saying
-            // nothing. Only what is shared to read has one — an editor's menu
-            // is a full menu (docs/NODE_DOCUMENT_CONTRACT.md section 5).
+            // nothing. What is shared to read has one, and so has a node of
+            // someone else's store that "Share..." is off for; an editor's
+            // menu is otherwise a full menu (docs/NODE_DOCUMENT_CONTRACT.md
+            // section 5).
             let access_note_text = crate::state::access_note(access_now);
-            let menu_note: Option<NodeHandle> = if access_note_text.is_empty() {
+            let menu_note_text = crate::state::menu_note_text(&[access_note_text, share_note_text]);
+            let menu_note: Option<NodeHandle> = if menu_note_text.is_empty() {
                 None
             } else {
-                Some(rsx! { div { class: "pimble-menu-note", {access_note_text} } })
+                Some(rsx! { div { class: "pimble-menu-note", {menu_note_text} } })
             };
             let mount_menu_note: Option<NodeHandle> = if is_mount {
-                let text = if access_note_text.is_empty() {
-                    MOUNT_NOTE.to_string()
-                } else {
-                    format!("{access_note_text} {MOUNT_NOTE}")
-                };
+                let text = crate::state::menu_note_text(&[access_note_text, MOUNT_NOTE]);
                 Some(rsx! { div { class: "pimble-menu-note", {text} } })
             } else {
                 None
@@ -1582,7 +1620,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             if CAN_ADMINISTER_STORES {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::Share,
-                                    disabled: !can_write_tree,
+                                    disabled: share_disabled,
                                     onclick: on_share.clone(),
                                     "Share..."
                                 }
@@ -1743,7 +1781,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             if CAN_ADMINISTER_STORES {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::Share,
-                                    disabled: !can_write_tree,
+                                    disabled: share_disabled,
                                     onclick: on_share.clone(),
                                     "Share..."
                                 }
@@ -2851,7 +2889,9 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         // docs/NODE_DOCUMENT_CONTRACT.md section 5: a share is a scoped grant
         // on this store, so everyone on it edits the same documents. One
         // modal, two faces: a name and "Share" while the node is not shared;
-        // the share, its members and "Stop sharing" once it is. Every outcome
+        // the share, its members and "Stop sharing" once it is. A member
+        // looking at the share they are in gets a third, read only
+        // (`AppStore::share_modal_manages` decides). Every outcome
         // arrives as `CloudShareUpdated`, `CloudSharingStopped` or
         // `CloudError { op }`, so `events.rs` fills the busy and error lines
         // without guessing which request answered (the Account modal's rule,
@@ -2952,8 +2992,9 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         }
                     }
 
-                    // The node is shared: who has it, and how to stop.
-                    if store.share_modal_shared.get() {
+                    // The node is shared and this person manages the share:
+                    // who has it, and how to stop.
+                    if store.share_modal_shared.get() && store.share_modal_manages() {
                         div {
                             style: "display: flex; flex-direction: column; gap: 10px;",
 
@@ -3032,7 +3073,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                                 }
                                                 span {
                                                     class: "pimble-share__member-status",
-                                                    {format!("{}, {}", member_role_text(member.role), member_status_text(member.status))}
+                                                    {format!("{}, {}", member_role_text(member.role), member_status_text(member.status, true))}
                                                 }
                                                 // The owner is the account this
                                                 // Pimble is signed in as; there
@@ -3114,6 +3155,55 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                             disabled: {|| store.share_modal_pending.get().is_some()},
                                             onclick: move || store.share_modal_confirm_stop.set(true),
                                             "Stop sharing"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // The node is shared and the share is someone else's (a
+                    // member looking at the share they are in): whose it is
+                    // and who is on it, as the accounts service answers a
+                    // member. Inviting, removing and stopping are an owner's
+                    // and the server refuses them from anyone else, so none
+                    // of them is offered, and the owner's state line (what
+                    // the owner's devices are handing over) is not this
+                    // device's to report. The list is a courtesy: when it
+                    // cannot be loaded the sentence stands alone, with no
+                    // error line (`events.rs`, `CloudOp::ShareInfo`).
+                    if store.share_modal_shared.get() && !store.share_modal_manages() {
+                        div {
+                            style: "display: flex; flex-direction: column; gap: 10px;",
+
+                            div {
+                                style: "font-weight: 600;",
+                                {|| store.share_modal_name.get()}
+                            }
+                            div {
+                                class: "pimble-share__note",
+                                {|| store.share_modal_shared_by_sentence()}
+                            }
+                            div {
+                                class: "pimble-share__members",
+                                style: {
+                                    move || if store.share_modal_members.with(|m| m.is_empty()) {
+                                        "display: none;"
+                                    } else {
+                                        ""
+                                    }
+                                },
+                                for member in store.share_modal_members.get() {
+                                    div {
+                                        key: member.email.clone(),
+                                        class: "pimble-share__member",
+                                        span {
+                                            class: "pimble-share__member-email",
+                                            {member.email.clone()}
+                                        }
+                                        span {
+                                            class: "pimble-share__member-status",
+                                            {format!("{}, {}", member_role_text(member.role), member_status_text(member.status, false))}
                                         }
                                     }
                                 }
@@ -3418,9 +3508,122 @@ pub fn run() {
 }
 #[cfg(test)]
 mod tests {
-    use super::{hosted_store_label, member_role_text, member_status_text, sync_badge_text, MOUNT_NOTE};
-    use pimble_core::{StoreKind, SyncState};
+    use super::{hosted_store_label, member_role_text, member_status_text, open_share_modal, sync_badge_text, MOUNT_NOTE};
+    use crate::protocol::{BackendCommand, BackendHandle, CloudOp};
+    use crate::state::AppStore;
+    use pimble_core::{Node, NodeId, Store, StoreId, StoreKind, SyncState};
     use pimble_rpc::{CloudHostedStoreInfo, MemberRole, ShareMemberStatus};
+    use rinch::prelude::untracked;
+
+    /// A store with a shared folder and a plain document under its root, a
+    /// backend whose commands the test can read, and an account signed in.
+    /// `shared_by` is who shared the store with this account, if anyone did.
+    fn store_with_a_share(shared_by: Option<&str>) -> (AppStore, crossbeam_channel::Receiver<BackendCommand>, StoreId, NodeId, NodeId) {
+        let app = AppStore::new();
+        let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<BackendCommand>(16);
+        let (_event_tx, event_rx) = crossbeam_channel::bounded(16);
+        app.backend.set(Some(BackendHandle { cmd_tx, event_rx }));
+        app.cloud_signed_in.set(true);
+        app.cloud_email.set("me@example.com".to_string());
+
+        let mut store = Store::new_local("Notes", "/tmp/notes.pimble".into());
+        let root = Node::folder("Notes");
+        store.root_node_id = root.id;
+        store.shared_by = shared_by.map(str::to_string);
+        let mut recipes = Node::folder("Recipes");
+        recipes.metadata.set_share(Some(&pimble_core::ShareMarker {
+            v: pimble_core::ShareMarker::VERSION,
+            key_id: uuid::Uuid::new_v4(),
+            url: "https://pimble.app".to_string(),
+            name: "Family recipes".to_string(),
+        }));
+        let plain = Node::document("Pasta");
+        let (store_id, shared_id, plain_id) = (store.id, recipes.id, plain.id);
+        app.upsert_store(store);
+        app.upsert_node(store_id, root);
+        app.upsert_node(store_id, recipes);
+        app.upsert_node(store_id, plain);
+        (app, cmd_rx, store_id, shared_id, plain_id)
+    }
+
+    fn asked_for_members(commands: &crossbeam_channel::Receiver<BackendCommand>, node_id: NodeId) -> bool {
+        commands
+            .try_iter()
+            .any(|cmd| matches!(cmd, BackendCommand::CloudShareInfo { node_id: n, .. } if n == node_id))
+    }
+
+    /// One's own store keeps the dialog it always had: a shared node opens on
+    /// the owner's face and asks for its members, any other node opens on the
+    /// name field, and neither opens without an account.
+    #[test]
+    fn share_opens_the_owners_dialog_in_ones_own_store() {
+        let (app, commands, store_id, shared_id, plain_id) = store_with_a_share(None);
+
+        open_share_modal(app, store_id, shared_id);
+        assert_eq!(app.share_modal_node.get(), Some((store_id, shared_id)));
+        assert!(app.share_modal_shared.get());
+        assert!(untracked(|| app.share_modal_manages()));
+        assert_eq!(app.share_modal_name.get(), "Family recipes");
+        assert_eq!(app.share_modal_pending.get(), Some(CloudOp::ShareInfo));
+        assert!(asked_for_members(&commands, shared_id));
+
+        open_share_modal(app, store_id, plain_id);
+        assert_eq!(app.share_modal_node.get(), Some((store_id, plain_id)));
+        assert!(!app.share_modal_shared.get());
+        assert!(untracked(|| app.share_modal_manages()));
+        assert_eq!(app.share_modal_pending.get(), None);
+        assert!(!asked_for_members(&commands, plain_id));
+
+        app.share_modal_node.set(None);
+        app.cloud_signed_in.set(false);
+        open_share_modal(app, store_id, plain_id);
+        assert_eq!(app.share_modal_node.get(), None);
+        assert!(app.account_modal_open.get());
+        assert_eq!(app.account_modal_hint.get(), "Sign in to share a node");
+    }
+
+    /// In a store that reached this device as someone else's share, a shared
+    /// root opens on the member's face (the share's own name, no owner's
+    /// controls) and the member list is asked for as a courtesy. Signed out,
+    /// the face still opens from what this device holds, and asks nobody.
+    #[test]
+    fn share_opens_the_members_face_in_someone_elses_share() {
+        let (app, commands, store_id, shared_id, _) = store_with_a_share(Some("ann@example.com"));
+
+        open_share_modal(app, store_id, shared_id);
+        assert_eq!(app.share_modal_node.get(), Some((store_id, shared_id)));
+        assert!(app.share_modal_shared.get());
+        assert!(!untracked(|| app.share_modal_manages()), "a member is shown the owner's dialog");
+        assert_eq!(app.share_modal_name.get(), "Family recipes");
+        assert_eq!(
+            untracked(|| app.share_modal_shared_by_sentence()),
+            "Shared by ann@example.com. Only an owner changes who it is shared with."
+        );
+        assert!(app.share_modal_state.get().is_empty());
+        assert!(asked_for_members(&commands, shared_id));
+
+        app.share_modal_node.set(None);
+        app.cloud_signed_in.set(false);
+        open_share_modal(app, store_id, shared_id);
+        assert_eq!(app.share_modal_node.get(), Some((store_id, shared_id)));
+        assert!(!app.account_modal_open.get(), "a member is asked to sign in to read who shared it");
+        assert_eq!(app.share_modal_pending.get(), None);
+        assert!(!asked_for_members(&commands, shared_id));
+    }
+
+    /// The menu never offers "Share..." on any other node of someone else's
+    /// store; if something asks anyway, no form the server would refuse opens
+    /// and the status bar says why.
+    #[test]
+    fn share_does_not_open_on_a_node_that_is_not_ones_to_share() {
+        let (app, commands, store_id, _, plain_id) = store_with_a_share(Some("ann@example.com"));
+
+        open_share_modal(app, store_id, plain_id);
+        assert_eq!(app.share_modal_node.get(), None);
+        assert!(!app.account_modal_open.get());
+        assert_eq!(app.notice.get(), "Only an owner of this store can share from it.");
+        assert!(commands.try_iter().next().is_none());
+    }
 
     fn hosted(name: &str, share: bool, shared_by: Option<&str>) -> CloudHostedStoreInfo {
         CloudHostedStoreInfo {
@@ -3453,12 +3656,18 @@ mod tests {
     /// are ordinary things to be waiting for.
     #[test]
     fn a_member_reads_in_plain_words() {
-        assert_eq!(member_status_text(ShareMemberStatus::Invited), "invited, no account yet");
+        assert_eq!(member_status_text(ShareMemberStatus::Invited, true), "invited, no account yet");
         assert_eq!(
-            member_status_text(ShareMemberStatus::WaitingForKey),
+            member_status_text(ShareMemberStatus::WaitingForKey, true),
             "waiting for your Pimble to hand over the key"
         );
-        assert_eq!(member_status_text(ShareMemberStatus::Active), "active");
+        assert_eq!(member_status_text(ShareMemberStatus::Active, true), "active");
+        // A member reading the list is not the one whose Pimble hands keys over.
+        assert_eq!(
+            member_status_text(ShareMemberStatus::WaitingForKey, false),
+            "waiting for an owner's Pimble to hand over the key"
+        );
+        assert_eq!(member_status_text(ShareMemberStatus::Active, false), "active");
         assert_eq!(member_role_text(MemberRole::Owner), "owner");
         assert_eq!(member_role_text(MemberRole::Editor), "can edit");
         assert_eq!(member_role_text(MemberRole::Reader), "can read");

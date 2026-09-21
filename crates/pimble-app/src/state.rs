@@ -161,6 +161,84 @@ pub fn access_note(access: pimble_core::StoreAccess) -> &'static str {
     }
 }
 
+/// Why "Share..." is disabled on a node of a store that reached this device
+/// as someone else's share: sharing is an owner's to do, and the server
+/// refuses it from anyone else with a sentence that opens with this one
+/// (docs/NODE_DOCUMENT_CONTRACT.md section 5). An item that can only be
+/// refused is not offered; this says why.
+pub const ONLY_AN_OWNER_SHARES_NOTE: &str = "Only an owner of this store can share from it.";
+
+/// Whether a row's "Share..." is disabled. `held_as_share` is whether the
+/// node's store reached this device as someone else's share
+/// (`Store::shared_by`), `is_shared_root` whether the node carries a share
+/// marker.
+///
+/// In one's own store the item shares a node or opens the share it already
+/// has, and only a store held to read disables it, as ever. In someone else's
+/// store nothing can be shared from here, so the item opens only on a shared
+/// root, where it shows the share's read-only face: who shared it and who is
+/// on it. That changes nothing, so a reader gets it as an editor does.
+pub fn share_item_disabled(access: pimble_core::StoreAccess, held_as_share: bool, is_shared_root: bool) -> bool {
+    if held_as_share {
+        !is_shared_root
+    } else {
+        !access.allows_write()
+    }
+}
+
+/// The sentence that says why "Share..." is disabled for a reason of its own,
+/// or empty: a node of someone else's store that is not a shared root. (A
+/// store of one's own held to read is covered by [`access_note`].)
+pub fn share_item_note(held_as_share: bool, is_shared_root: bool) -> &'static str {
+    if held_as_share && !is_shared_root {
+        ONLY_AN_OWNER_SHARES_NOTE
+    } else {
+        ""
+    }
+}
+
+/// The one dimmed line at the top of a row's menu: every reason something
+/// below it is disabled, each said once, in the order given. Empty when
+/// nothing is.
+pub fn menu_note_text(notes: &[&str]) -> String {
+    notes.iter().copied().filter(|note| !note.is_empty()).collect::<Vec<_>>().join(" ")
+}
+
+/// Whether the person at this device manages a share: invites to it, removes
+/// from it, stops it. Decided from what the app already holds, never asked of
+/// anyone (the server judges every request whatever the dialog offers).
+///
+/// The account's own row in the share's member list says it where there is
+/// one, since that is the accounts service answering now: `owner` manages,
+/// anything else does not. Without that row (the list has not arrived, could
+/// not be loaded, or nobody is signed in) the store says it: one that reached
+/// this device as someone else's share (`Store::shared_by`) is not this
+/// account's to manage, and any other store is.
+pub fn manages_share(shared_by: Option<&str>, members: &[pimble_rpc::ShareMember], account_email: &str) -> bool {
+    let account_email = account_email.trim();
+    let own_row = members
+        .iter()
+        .find(|member| !account_email.is_empty() && member.email.trim().eq_ignore_ascii_case(account_email));
+    match own_row {
+        Some(row) => row.role == pimble_rpc::MemberRole::Owner,
+        None => shared_by.is_none(),
+    }
+}
+
+/// The member's face of the Share modal in one sentence: whose share this
+/// is, and that the list under it is not theirs to change. The owner is who
+/// the store says shared it, or the member list's owner row when the store
+/// does not say.
+pub fn shared_by_sentence(shared_by: Option<&str>, members: &[pimble_rpc::ShareMember]) -> String {
+    let owner = shared_by
+        .map(str::to_string)
+        .or_else(|| members.iter().find(|member| member.role == pimble_rpc::MemberRole::Owner).map(|member| member.email.clone()));
+    match owner {
+        Some(owner) => format!("Shared by {owner}. Only an owner changes who it is shared with."),
+        None => "Only an owner changes who it is shared with.".to_string(),
+    }
+}
+
 /// Whether a mount row's icon and label render dimmed: its source is out of
 /// reach (`Unavailable`) or not reachable yet (`Connecting`). A `Cached`
 /// mount still shows its replica's content, so it reads normally and only
@@ -414,7 +492,9 @@ pub struct AppStore {
     // section 5). A share is a scoped grant on this store: the node and the
     // documents under it, with a role per member. One modal, two faces: the
     // name field and "Share" while the node is not shared, the members and
-    // "Stop sharing" once it is.
+    // "Stop sharing" once it is. Someone who does not manage the share (a
+    // member looking at the share they are in, `share_modal_manages`) gets a
+    // third: who shared it and who is on it, with nothing to press.
     /// The canonical node the modal is open for; `None` means closed.
     pub share_modal_node: Signal<Option<(StoreId, NodeId)>>,
     /// The share's own name, which is not the node's title: the owner types it
@@ -645,6 +725,31 @@ impl AppStore {
             self.store_data
                 .with(|map| map.get(&store_id).and_then(|sig| sig.with(|s| s.shared_by.clone())))
         })
+    }
+
+    /// Whether the person at this device manages the share the Share modal is
+    /// open for ([`manages_share`]): the owner's face when they do, the
+    /// member's read-only face when they do not. Reads the modal's node, that
+    /// store's `shared_by`, the member list and the signed-in address as
+    /// TRACKED reads, so the modal's faces follow them; event handlers wrap it
+    /// in `untracked`. True while the modal is closed.
+    pub fn share_modal_manages(&self) -> bool {
+        let Some((store_id, _)) = self.share_modal_node.get() else { return true };
+        let shared_by = self.get_store_signal(store_id).and_then(|sig| sig.with(|s| s.shared_by.clone()));
+        let account_email = self.cloud_email.get();
+        self.share_modal_members
+            .with(|members| manages_share(shared_by.as_deref(), members, &account_email))
+    }
+
+    /// The sentence the member's face of the Share modal shows
+    /// ([`shared_by_sentence`]), from the same tracked reads.
+    pub fn share_modal_shared_by_sentence(&self) -> String {
+        let shared_by = self
+            .share_modal_node
+            .get()
+            .and_then(|(store_id, _)| self.get_store_signal(store_id))
+            .and_then(|sig| sig.with(|s| s.shared_by.clone()));
+        self.share_modal_members.with(|members| shared_by_sentence(shared_by.as_deref(), members))
     }
 
     /// The nodes of a store this device holds the subtree of: the store's own
@@ -1222,9 +1327,15 @@ impl AppStore {
         // disables its own rows and no others) — so the row re-renders when
         // any of them changes (see `build_tree_data_structural`). A mount
         // row's "New Node" goes to the mount's source, so that node's access
-        // rides along too.
+        // rides along too. "Share..." also snapshots whether the node's store
+        // reached this device as someone else's share (`share_item_disabled`),
+        // which the access does not say: an editor of a share and an owner
+        // both read as `Full`.
         let appearance = self.row_snapshot(child_store, child_id);
         let access = format!("{:?}", self.node_access_in(child_store, child_id));
+        let held_as_share = self
+            .store_data
+            .with(|map| map.get(&child_store).map_or(false, |sig| sig.with(|s| s.shared_by.is_some())));
         let source_access = self
             .mount_data
             .with(|map| map.get(&(child_store, child_id)).and_then(|sig| sig.with(|m| m.mount_ref.as_ref().map(|r| (r.source_store, r.source_node)))))
@@ -1232,7 +1343,14 @@ impl AppStore {
             .unwrap_or_default();
         let tree_node = TreeNodeData::new(
             format!("node_{}_{}{}", child_store, child_id, suffix),
-            format!("{}|{}{}|{}", if paste { "paste" } else { "" }, access, source_access, appearance),
+            format!(
+                "{}|{}{}|{}|{}",
+                if paste { "paste" } else { "" },
+                access,
+                source_access,
+                if held_as_share { "theirs" } else { "" },
+                appearance
+            ),
         );
 
         // Crossing a mount node adds it to the path for everything below it.
@@ -1538,6 +1656,165 @@ mod tests {
         assert_eq!(access_words(StoreAccess::Read), "read only");
         assert!(access_note(StoreAccess::Full).is_empty());
         assert_eq!(access_note(StoreAccess::Read), StoreAccess::READ_ONLY_REFUSAL);
+    }
+
+    fn member(email: &str, role: pimble_rpc::MemberRole) -> pimble_rpc::ShareMember {
+        pimble_rpc::ShareMember { email: email.to_string(), role, status: pimble_rpc::ShareMemberStatus::Active }
+    }
+
+    fn marker(name: &str) -> pimble_core::ShareMarker {
+        pimble_core::ShareMarker {
+            v: pimble_core::ShareMarker::VERSION,
+            key_id: uuid::Uuid::new_v4(),
+            url: "https://pimble.app".to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    /// Who manages a share: the account's own row in the member list where
+    /// there is one, the store's `shared_by` otherwise. The Share modal
+    /// offers inviting, removing and stopping only to someone who does; a
+    /// member of someone else's share was offered all three and refused each.
+    #[test]
+    fn who_manages_a_share() {
+        use pimble_rpc::MemberRole::{Editor, Owner, Reader};
+        let me = "me@example.com";
+
+        // One's own store: before the list arrives, and once it has.
+        assert!(manages_share(None, &[], me));
+        assert!(manages_share(None, &[member(me, Owner), member("ann@example.com", Editor)], me));
+
+        // Someone else's share: before the list arrives, when it never does,
+        // and with the account's own row in it, whatever the role.
+        let ann = Some("ann@example.com");
+        assert!(!manages_share(ann, &[], me));
+        assert!(!manages_share(ann, &[member("ann@example.com", Owner), member(me, Editor)], me));
+        assert!(!manages_share(ann, &[member("ann@example.com", Owner), member(me, Reader)], me));
+        // A list without the account's own row says nothing about it.
+        assert!(!manages_share(ann, &[member("ann@example.com", Owner), member("bob@example.com", Editor)], me));
+        assert!(manages_share(None, &[member("bob@example.com", Editor)], me));
+
+        // Where the row and the store disagree the row is the fresher word.
+        assert!(manages_share(ann, &[member(me, Owner)], me));
+        assert!(!manages_share(None, &[member("ann@example.com", Owner), member(me, Editor)], me));
+
+        // Addresses compare as addresses do, and nobody signed in has no row.
+        assert!(!manages_share(None, &[member("Me@Example.com", Editor)], " me@example.com "));
+        assert!(manages_share(None, &[member("", Editor)], ""));
+        assert!(!manages_share(ann, &[member("", Owner)], ""));
+    }
+
+    /// The modal decides its face from the store it is open on, the members
+    /// it has loaded and the signed-in address.
+    #[test]
+    fn the_modal_knows_whether_its_share_is_managed_here() {
+        let (app, store_id, child_id) = store_with_a_child();
+        app.cloud_email.set("me@example.com".to_string());
+        assert!(untracked(|| app.share_modal_manages()), "a closed modal has nothing to hold back");
+
+        // One's own store.
+        app.share_modal_node.set(Some((store_id, child_id)));
+        assert!(untracked(|| app.share_modal_manages()));
+
+        // The same store held as someone else's share: the member's face at
+        // once, before any list, and still once the list names this account.
+        if let Some(sig) = app.get_store_signal(store_id) {
+            sig.update(|s| s.shared_by = Some("ann@example.com".to_string()));
+        }
+        assert!(!untracked(|| app.share_modal_manages()));
+        assert_eq!(
+            untracked(|| app.share_modal_shared_by_sentence()),
+            "Shared by ann@example.com. Only an owner changes who it is shared with."
+        );
+        app.share_modal_members.set(vec![
+            member("ann@example.com", pimble_rpc::MemberRole::Owner),
+            member("me@example.com", pimble_rpc::MemberRole::Editor),
+        ]);
+        assert!(!untracked(|| app.share_modal_manages()));
+    }
+
+    /// The member's face says whose share it is: the store's `shared_by`,
+    /// else the list's owner row, else only what is true of any share.
+    #[test]
+    fn the_members_face_says_who_shared_it() {
+        use pimble_rpc::MemberRole::{Editor, Owner};
+        assert_eq!(
+            shared_by_sentence(Some("ann@example.com"), &[]),
+            "Shared by ann@example.com. Only an owner changes who it is shared with."
+        );
+        assert_eq!(
+            shared_by_sentence(None, &[member("me@example.com", Editor), member("ann@example.com", Owner)]),
+            "Shared by ann@example.com. Only an owner changes who it is shared with."
+        );
+        assert_eq!(shared_by_sentence(None, &[]), "Only an owner changes who it is shared with.");
+    }
+
+    /// "Share..." in someone else's store opens only on a shared root (the
+    /// member's read-only face), and every other node says why it is off. In
+    /// one's own store it is what it always was.
+    #[test]
+    fn share_is_offered_only_where_it_can_do_something() {
+        // One's own store: any node one may write, shared or not.
+        assert!(!share_item_disabled(StoreAccess::Full, false, false));
+        assert!(!share_item_disabled(StoreAccess::Full, false, true));
+        assert!(share_item_disabled(StoreAccess::Read, false, false));
+        assert_eq!(share_item_note(false, false), "");
+        assert_eq!(share_item_note(false, true), "");
+
+        // Someone else's: a shared root opens, for a reader as for an editor,
+        // since that face changes nothing; any other node is off with the note.
+        assert!(!share_item_disabled(StoreAccess::Full, true, true));
+        assert!(!share_item_disabled(StoreAccess::Read, true, true));
+        assert!(share_item_disabled(StoreAccess::Full, true, false));
+        assert!(share_item_disabled(StoreAccess::Read, true, false));
+        assert_eq!(share_item_note(true, true), "");
+        assert_eq!(share_item_note(true, false), "Only an owner of this store can share from it.");
+        assert_eq!(share_item_note(true, false), ONLY_AN_OWNER_SHARES_NOTE);
+
+        // The same judgement from the store and the node the app holds.
+        let (app, store_id, child_id) = store_with_a_child();
+        let item = |app: &AppStore| {
+            let (theirs, shared) = (app.shared_by(store_id).is_some(), app.is_shared(store_id, child_id));
+            (share_item_disabled(app.node_access(store_id, child_id), theirs, shared), share_item_note(theirs, shared))
+        };
+        assert_eq!(item(&app), (false, ""));
+        if let Some(sig) = app.get_store_signal(store_id) {
+            sig.update(|s| s.shared_by = Some("ann@example.com".to_string()));
+        }
+        assert_eq!(item(&app), (true, ONLY_AN_OWNER_SHARES_NOTE));
+        if let Some(sig) = app.get_node_signal(store_id, child_id) {
+            sig.update(|n| n.metadata.set_share(Some(&marker("Recipes"))));
+        }
+        assert_eq!(item(&app), (false, ""));
+    }
+
+    /// A menu's one note says every reason once, and nothing when there is none.
+    #[test]
+    fn a_menus_note_joins_its_reasons() {
+        assert_eq!(menu_note_text(&["", ""]), "");
+        assert_eq!(menu_note_text(&["", ONLY_AN_OWNER_SHARES_NOTE]), ONLY_AN_OWNER_SHARES_NOTE);
+        assert_eq!(
+            menu_note_text(&[access_note(StoreAccess::Read), ONLY_AN_OWNER_SHARES_NOTE]),
+            format!("{} {}", StoreAccess::READ_ONLY_REFUSAL, ONLY_AN_OWNER_SHARES_NOTE)
+        );
+    }
+
+    /// A node row's "Share..." snapshots whether its store is someone else's,
+    /// and an editor of a share reads as `Full` like an owner does, so the
+    /// access in the row's data does not say it: `shared_by` has to be there
+    /// itself, or the item never goes off (rinch re-renders a row only when
+    /// its `TreeNodeData` changes).
+    #[test]
+    fn row_data_carries_whose_store_it_is() {
+        let (app, store_id, _) = store_with_a_child();
+        let before = untracked(|| app.build_tree_data_structural());
+        if let Some(sig) = app.get_store_signal(store_id) {
+            sig.update(|s| s.shared_by = Some("ann@example.com".to_string()));
+        }
+        assert_eq!(app.store_access(store_id), StoreAccess::Full, "an editor's share");
+        let after = untracked(|| app.build_tree_data_structural());
+        assert_ne!(before[0].label, after[0].label, "the store row never re-renders");
+        assert_ne!(before[0].children[0].label, after[0].children[0].label, "the node row never re-renders");
     }
 
     /// Every state a share can be in says what it means.

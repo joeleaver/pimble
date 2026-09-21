@@ -33,7 +33,7 @@ const NOTICE_MS: u32 = 8000;
 /// access forbids, so this is for the rare command that got through anyway —
 /// and it says what the server said (docs/NODE_DOCUMENT_CONTRACT.md section 5,
 /// "Roles").
-fn show_notice(store: AppStore, message: String) {
+pub(crate) fn show_notice(store: AppStore, message: String) {
     if let Some(handle) = NOTICE_TIMEOUT.with(|slot| slot.borrow_mut().take()) {
         clear_timeout(handle);
     }
@@ -1074,8 +1074,14 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         // Sent when the modal opens on a node that is already
                         // shared; the marker still says it is, so the modal
                         // keeps the shared face and says what went wrong.
+                        // Not to a member looking at the share they are in:
+                        // their face is who shared it, which this device
+                        // holds, and the member list under it is a courtesy
+                        // that is simply absent when it cannot be had.
                         store.share_modal_pending.set(None);
-                        store.share_modal_error.set(message.clone());
+                        if untracked(|| store.share_modal_manages()) {
+                            store.share_modal_error.set(message.clone());
+                        }
                     }
                 }
             }
@@ -1324,6 +1330,42 @@ mod tests {
         assert_eq!(store.share_modal_pending.get(), None);
         // The connection is fine; nothing about it changed.
         assert_eq!(store.connection_status.get(), "Connecting...");
+    }
+
+    /// The member list is what the owner's face is for, so an owner whose
+    /// list cannot be loaded is told why. A member looking at the share they
+    /// are in is not: their face is who shared it, which this device holds,
+    /// and the list under it is a courtesy that is simply absent.
+    #[test]
+    fn a_member_list_that_cannot_be_loaded_is_an_error_only_to_an_owner() {
+        let (store, events, _commands) = store_with_events();
+        let mut own = pimble_core::Store::new_local("Notes", "/tmp/notes.pimble".into());
+        own.root_node_id = NodeId::new();
+        let mut theirs = pimble_core::Store::new_local("Recipes", "/tmp/recipes.pimble".into());
+        theirs.root_node_id = NodeId::new();
+        theirs.shared_by = Some("ann@example.com".to_string());
+        let (own_id, theirs_id, node_id) = (own.id, theirs.id, NodeId::new());
+        store.upsert_store(own);
+        store.upsert_store(theirs);
+        let failed = || BackendEvent::CloudError { op: CloudOp::ShareInfo, message: "Pimble Cloud cannot be reached".to_string() };
+
+        store.share_modal_node.set(Some((own_id, node_id)));
+        store.share_modal_shared.set(true);
+        store.share_modal_pending.set(Some(CloudOp::ShareInfo));
+        events.send(failed()).unwrap();
+        pump(store);
+        assert_eq!(store.share_modal_error.get(), "Pimble Cloud cannot be reached");
+        assert_eq!(store.share_modal_pending.get(), None);
+
+        store.share_modal_error.set(String::new());
+        store.share_modal_node.set(Some((theirs_id, node_id)));
+        store.share_modal_pending.set(Some(CloudOp::ShareInfo));
+        events.send(failed()).unwrap();
+        pump(store);
+        assert!(store.share_modal_error.get().is_empty(), "a member is shown an error for a courtesy");
+        assert_eq!(store.share_modal_pending.get(), None);
+        assert!(store.share_modal_shared.get(), "the face stays, with the sentence and no list");
+        assert_eq!(store.share_modal_node.get(), Some((theirs_id, node_id)));
     }
 
     /// A refusal is the server saying no, not a broken connection: it shows
