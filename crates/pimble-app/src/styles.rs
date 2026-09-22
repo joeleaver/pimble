@@ -300,10 +300,26 @@ pub(crate) const APP_CSS: &str = "
 
 /* Size the rinch Editor to fill the content area. Done via a CSS rule (NOT an
    inline `style:` prop on the Editor) so it doesn't clobber the inline
-   position/z-index the editor view sets for its caret + selection overlays. */
+   position/z-index the editor view sets for its caret + selection overlays.
+   No `min-height: 0` here: the editor never sets its own `overflow-y`
+   (it stays the CSS default, `visible`), so its automatic minimum size is
+   content-based — forcing it to 0 let flex-shrink compress the editor's own
+   layout box down to the content-wrap's visible height on a long document,
+   which made every descendant below the fold report as *inside* the editor's
+   box instead of overflowing it. `find_scroll_container`
+   (rinch/src/app/hit_testing.rs) and the paint scrollbar
+   (rinch-dom/src/paint/scrollbar.rs) both size a container from its
+   immediate children's own layout boxes, not a deep descendant walk, so an
+   editor box that never grows past its parent's visible height reads as
+   nothing to scroll — the wheel handler never finds a scrollable ancestor,
+   and no scrollbar is drawn. `.pimble-editor__content-wrap` supplies its own
+   `overflow-y: auto`, so its *own* automatic minimum size already resolves to
+   0 without help; the editor's must stay content-based so its box (and thus
+   this wrap's measured content height) reflects what is actually on the
+   page. A short document still fills the pane: `flex: 1 1 auto` grows it
+   from that content-based floor, same as before. */
 .pimble-editor__content-wrap > [data-pm-editor] {
     flex: 1 1 auto;
-    min-height: 0;
     border: none;
     border-radius: 0;
 }

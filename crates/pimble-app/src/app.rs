@@ -3868,6 +3868,15 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 show_minimize: true,
                 show_maximize: true,
                 show_close: true,
+                // `BorderlessWindow` only wires a control's click handler when
+                // its callback prop is set (rinch-components/src/borderless_window.rs:
+                // `if let Some(ref cb) = self.on_maximize { ... register_handler ... }`)
+                // — with no `on_maximize`/`on_minimize`, the buttons render but
+                // nothing is registered for `data-rid`, so clicking them did
+                // nothing. These two are the platform calls the component's
+                // own doc comment says to wire.
+                on_minimize: || minimize_current_window(),
+                on_maximize: || toggle_maximize_current_window(),
                 on_close: || close_current_window(),
 
                 style { {APP_CSS} }
