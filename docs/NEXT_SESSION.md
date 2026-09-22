@@ -59,7 +59,8 @@ see any of it run, `scripts/local-stack/README.md`.
 - **Two desktop bugs Joe reported the same day, fixed** (d3cc539): documents did not
   scroll (`min-height: 0` on the editor's box let it shrink to the pane), and the
   maximize and minimize buttons did nothing (no callbacks wired). Joe then reported no
-  scrollbar is drawn; an agent was on it as this was written.
+  scrollbar is drawn: fixed (1d5d9be), the editor pane is a stacking context of its own
+  so its scrollbar paints last.
 - **Waiting for Joe: the go-ahead to merge and ship.** Merge `node-document` to `master`,
   deploy (`git push jkbase`), and the desktop release (bump the workspace version, tag,
   push the tag), the standing rule. `placed_under` is a new key a v0.2.0 client does not
