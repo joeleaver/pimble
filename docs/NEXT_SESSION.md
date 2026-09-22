@@ -18,6 +18,50 @@ written before the ship and still describes the work. Before it, **v0.2.0 was sh
 `docs/NODE_DOCUMENT_CONTRACT.md`, `docs/RELAY_CONTRACT.md` and `docs/MOVE_CONTRACT.md`. To
 see any of it run, `scripts/local-stack/README.md`.
 
+## 2026-09-22, later: the follow-ups (branch `follow-ups` off `master`, verified, not merged)
+
+Five commits, none pushed. Each was checked as it landed; the whole workspace was checked
+(`cargo check --workspace --all-targets`, clean) and the suites it touches were run (crdt
+121, store 47, share 17, share_upkeep 1, the web 60); the full release run is recorded at
+the end of this section.
+
+- **rinch is on `main` at 651ecf7** (67b9b0f), the one commit since c4845d3: joeleaver/rinch#832,
+  the editor's runtime read-only switch. `editor::set_read_only` is driven by an effect
+  in `app.rs` over the same judgement that swaps the toolbar for the sentence
+  (`AppStore::node_access` of the active node), so a role that changes while a document
+  is open flips it; the interim (a keystroke sent nothing and reopened the node from the
+  server's copy 400 ms later) is gone, the outbound guard stays as the invariant and logs
+  if anything reaches it, and the read-only line is the refusal sentence alone. Verified
+  on the local stack on a reader's identity, desktop and browser: typing refused with the
+  caret in the document while the owner's edit landed live; made an editor, the desktop
+  unlocked at the next grant check (75 s) and its typing reached the owner; demoted with
+  the note open, it locked again at the next check and the typing was refused; the
+  browser the same both ways (focus in rinch-web's capture textarea with `readOnly` set),
+  picking the new role up on a reload (a page learns of a role change at reconnect, not
+  within two minutes as a desktop does). The wasm build with the new pin runs; both lock
+  files agree on wasm-bindgen 0.2.128.
+- **`tests/common`** (e940039): `share.rs` and `share_upkeep.rs` share one harness
+  (`crates/pimble-server/tests/common/mod.rs`). `vault_link.rs` and `relay.rs` keep their
+  own: an earlier stub shape and the relay's routes; folding them would be a rewrite of
+  their tests, not an extraction, so they stay.
+- **One node mapping** (54313d1): `NodeFields::into_node` and `parse_timestamp` in
+  `pimble-crdt` (`Tree::live_fields` is the door to a live node's fields); `LocalStore`
+  and the web vault client both use it, `get_node_any`/`node_of_any` included.
+- **The web refuses a plain transplant across two servers** (ca19caf) with a sentence
+  before anything is sent. Unreachable today (a store served from its owner's computer is
+  always encrypted, so every plain store a page sees is the hosted server's); the move
+  contract's "Between stores" paragraph says so.
+- The signup helper's lock file (f29f4e8).
+
+`cargo test --workspace --release` (CI's step) on the branch's head exited 0, every target
+green, with the local stack down.
+
+Not done: the partial-replica grouping limit (a follow-up only if it ever matters).
+
+**Next**: Joe's word on merging `follow-ups` into `master`. It moves the rinch pin and
+changes what ships, so the push goes with a desktop release (v0.3.1) and a deploy, per the
+standing rule; then whatever Joe reports from v0.3.0.
+
 ## 2026-09-22: the move contract, built and being verified
 
 - **Built** by four sonnet agents in parallel on disjoint files, from the seam the PM wrote
@@ -262,9 +306,10 @@ see any of it run, `scripts/local-stack/README.md`.
    origin reads `owner offline`; the twin holds the whole store, not only what is shared.
 2. Joe's decisions, then merge, deploy (the accounts database needs `HostedStore.tier`
    applied, and the hosted server and accounts service go together) and release.
-3. When rinch #832 (read-only editor switch) merges: `cargo update` the rinch crates in
+3. ~~When rinch #832 (read-only editor switch) merges: `cargo update` the rinch crates in
    the root and in `web/`, and replace the interim read-only handling in
-   `crates/pimble-app/src/editor.rs` with `set_read_only`.
+   `crates/pimble-app/src/editor.rs` with `set_read_only`.~~ Done on 2026-09-22 (the
+   section at the top).
 
 ## A flake to watch
 

@@ -80,6 +80,8 @@ raw bytes, runs repair 250 ms after a structural merge, and flushes dirty docume
 diffs and the server's vectors out, plus the ids the caller did not name).
 `syncStoreDocument`, `applyStoreUpdate`, `syncNodeContents`, `setNodeText` and
 `ServerSyncManager` do not exist.
+`NodeFields::into_node` (`pimble-crdt`) is the one mapping of a document's stored fields
+to a `Node`; `LocalStore` and the web's vault client both read nodes through it.
 
 ### Search index
 
@@ -211,6 +213,11 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
   `EditorHandle::collab_receive`.
 - Never wrap the editor in a document-model layer in the sync path. Never call
   `load_html`/`load_doc` on a collaborating editor.
+- A document this device may only read is locked with rinch's `EditorHandle::set_read_only`
+  (joeleaver/rinch#832), driven by an effect in `app.rs` over `AppStore::node_access` of the
+  active node (`editor::set_read_only`), so a role that changes while the document is open
+  flips it; remote changes keep applying while locked. The outbound closure's access
+  guard is the invariant, not the mechanism.
 - Rinch's collab scope is flat text blocks (paragraph, heading, code block), nested bullet
   and ordered lists, and the starter-kit marks (bold, italic, underline, strike, code, link,
   highlight, text colour, sub/superscript). Block quotes, tables, images and hard breaks in a
@@ -480,6 +487,7 @@ vault-link start), so a reopened replica no longer reports a placeholder root.
 - `docs/NODE_DOCUMENT_CONTRACT.md` - node documents and sharing on them
 - `crates/pimble-crdt/src/node_doc.rs`, `tree.rs` - NodeDoc (one node's document) and Tree
 - `crates/pimble-server/src/share.rs`, `vault_link.rs` - the owner's side of a share; the encrypted link, keys, grants
+- `crates/pimble-server/tests/common/mod.rs` - the sharing test harness (`share.rs`, `share_upkeep.rs`): stub accounts service, hosted server, cuttable relay, fixture
 - `docs/RELAY_CONTRACT.md`, `crates/pimble-server/src/relay_face.rs`, `relay_tunnel.rs`, `crates/pimble-cloud/src/relay.rs` - sharing from an unhosted store
 - `scripts/local-stack/` - the whole stack on one machine, and the sharing walk-through
 - `crates/pimble-store/src/local.rs` - LocalStore
