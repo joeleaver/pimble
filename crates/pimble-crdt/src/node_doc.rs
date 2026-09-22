@@ -61,6 +61,13 @@ const META_FORMAT: &str = "format";
 const NODE_TYPE: &str = "node_type";
 const TITLE: &str = "title";
 const PARENT_ID: &str = "parent_id";
+/// The parent this document was last placed under by an operation that also
+/// edited the lists (a create, move, undelete, plant, or a repair's own
+/// rewrite): written with `parent_id` in the same transaction. A `parent_id`
+/// that differs from it was written on its own, which is the shape repair
+/// judges (docs/MOVE_CONTRACT.md "Repair"); one that agrees is honoured by
+/// every device and never rewritten, which is what keeps repair convergent.
+const PLACED_UNDER: &str = "placed_under";
 const CREATED_AT: &str = "created_at";
 const MODIFIED_AT: &str = "modified_at";
 const DELETED_AT: &str = "deleted_at";
@@ -74,6 +81,10 @@ pub struct NodeFields {
     pub title: String,
     /// Absent on a store's root node.
     pub parent_id: Option<NodeId>,
+    /// The parent `parent_id` was last written together with (see
+    /// `PLACED_UNDER`); absent on the root and on a document from before it
+    /// was recorded.
+    pub placed_under: Option<NodeId>,
     pub created_at: String,
     pub modified_at: String,
     /// A tombstone (docs/NODE_DOCUMENT_CONTRACT.md section 2): set when the
@@ -492,6 +503,12 @@ impl NodeDoc {
         Some(string_value(self.node.get(&txn, PARENT_ID)).and_then(|s| NodeId::parse(&s).ok()))
     }
 
+    /// The stored `placed_under` (see `PLACED_UNDER`), read on its own.
+    pub(crate) fn placed_under(&self) -> Option<NodeId> {
+        let txn = self.doc.transact();
+        string_value(self.node.get(&txn, PLACED_UNDER)).and_then(|s| NodeId::parse(&s).ok())
+    }
+
     /// What walking up the tree needs of a held document, tombstoned or not:
     /// whether `custom` holds `key` (as [`NodeDoc::fields`] reports it: a
     /// value that parses) and the stored `parent_id`. `None` when the `node`
@@ -595,6 +612,7 @@ impl NodeDoc {
         self.node.insert(txn, TITLE, title.to_string());
         if let Some(parent) = parent_id {
             self.node.insert(txn, PARENT_ID, parent.to_string());
+            self.node.insert(txn, PLACED_UNDER, parent.to_string());
         }
         self.node.insert(txn, CREATED_AT, created_at.to_string());
         self.node.insert(txn, MODIFIED_AT, modified_at.to_string());
@@ -607,20 +625,44 @@ impl NodeDoc {
         self.node.insert(txn, MODIFIED_AT, now.to_string());
     }
 
-    /// `parent_id = Some(p)` or removed. Not written when already so: a
-    /// rewrite of the same value is a concurrent write that could win over
-    /// a real move of the node made elsewhere.
+    /// A placement: `parent_id = Some(p)` or removed, and `placed_under` with
+    /// it (see `PLACED_UNDER`). Each key is written only when it differs: a
+    /// rewrite of the same value is a concurrent write that could win over a
+    /// real move of the node made elsewhere.
     pub(crate) fn write_parent(&self, txn: &mut TransactionMut, parent_id: Option<NodeId>) {
-        let current = string_value(self.node.get(txn, PARENT_ID)).and_then(|s| NodeId::parse(&s).ok());
-        if current == parent_id {
+        self.write_key_if_changed(txn, PARENT_ID, parent_id);
+        self.write_key_if_changed(txn, PLACED_UNDER, parent_id);
+    }
+
+    /// `parent_id` alone, `placed_under` untouched: the shape of a `parent_id`
+    /// written by a client that keeps no rule. Repair's cycle-breaking writes
+    /// this way on purpose, so that a list in a share that names the node can
+    /// still claim it (a share is where a node broken out of a cycle belongs
+    /// more than the root does).
+    pub(crate) fn write_parent_only(&self, txn: &mut TransactionMut, parent_id: Option<NodeId>) {
+        self.write_key_if_changed(txn, PARENT_ID, parent_id);
+    }
+
+    /// Test only: forget the placement, as a document written by a client
+    /// from before `placed_under` looks.
+    #[cfg(test)]
+    pub(crate) fn clear_placement(&self, txn: &mut TransactionMut) {
+        if self.node.get(txn, PLACED_UNDER).is_some() {
+            self.node.remove(txn, PLACED_UNDER);
+        }
+    }
+
+    fn write_key_if_changed(&self, txn: &mut TransactionMut, key: &str, value: Option<NodeId>) {
+        let current = string_value(self.node.get(txn, key)).and_then(|s| NodeId::parse(&s).ok());
+        if current == value {
             return;
         }
-        match parent_id {
-            Some(parent) => {
-                self.node.insert(txn, PARENT_ID, parent.to_string());
+        match value {
+            Some(id) => {
+                self.node.insert(txn, key, id.to_string());
             }
             None => {
-                self.node.remove(txn, PARENT_ID);
+                self.node.remove(txn, key);
             }
         }
     }
@@ -672,6 +714,7 @@ impl NodeDoc {
             node_type: get(NODE_TYPE).unwrap_or_default(),
             title: get(TITLE).unwrap_or_default(),
             parent_id: get(PARENT_ID).and_then(|s| NodeId::parse(&s).ok()),
+            placed_under: get(PLACED_UNDER).and_then(|s| NodeId::parse(&s).ok()),
             created_at: get(CREATED_AT).unwrap_or_default(),
             modified_at: get(MODIFIED_AT).unwrap_or_default(),
             deleted_at: get(DELETED_AT),
@@ -843,6 +886,7 @@ mod tests {
             node_type: "folder".into(),
             title: "Renamed".into(),
             parent_id: Some(parent),
+            placed_under: Some(parent),
             created_at: "2020-01-01T00:00:00Z".into(),
             modified_at: "2020-01-02T00:00:00Z".into(),
             deleted_at: Some(T2.into()),

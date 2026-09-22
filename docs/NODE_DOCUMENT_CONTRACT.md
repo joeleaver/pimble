@@ -32,7 +32,7 @@ One yrs `Doc` per node, `nodes/{id}.yrs`, UTF-16 offsets, with these named roots
 | --- | --- | --- | --- |
 | `content` | Array | rinch-editor-collab | the rich text, as today |
 | `meta` | Map | rinch-editor-collab | its format tag (`format`), as today; Pimble writes nothing here |
-| `node` | Map | Pimble | `node_type`, `title`, `parent_id` (absent on the root), `created_at`, `modified_at`, `deleted_at` (absent unless deleted), `tags` (Array of String), `custom` (Map of String: JSON text, as today's `custom`) |
+| `node` | Map | Pimble | `node_type`, `title`, `parent_id` (absent on the root), `placed_under` (the parent `parent_id` was last written together with by an operation that also edited the lists; absent on the root and on documents from before 2026-09-22; docs/MOVE_CONTRACT.md "Repair"), `created_at`, `modified_at`, `deleted_at` (absent unless deleted), `tags` (Array of String), `custom` (Map of String: JSON text, as today's `custom`) |
 | `children` | Array | Pimble | child node ids, in order |
 | `data` | Map | a plugin | reserved now, used later: arbitrary co-edited JSON for plugin node types, as nested yrs Maps, Arrays and Texts so two people can edit one field at once |
 

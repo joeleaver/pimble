@@ -90,17 +90,38 @@ refused with a sentence until someone needs it.
 ## Repair
 
 `parent_id` stays the truth of where a node is, with one exception that closes the hole:
-**a list that still names a node wins over a `parent_id` that would take it out of a
-share.** If `F` lists `X`, `X.parent_id` is `Q`, and being under `Q` leaves a share that
-being under `F` is in, repair rewrites `X.parent_id` to `F` instead of unlisting `X` (every
-device that holds `F`, `X` and the marker decides the same, from the same documents).
+**a list that still names a node wins over a `parent_id` that was written on its own and
+would take it out of a share.** Every operation that places a node (a create, a move, an
+undelete, a plant, a repair's own rewrite) writes `parent_id` and, in the same
+transaction, `placed_under` with the same value (`docs/NODE_DOCUMENT_CONTRACT.md`, the
+`node` root). A `parent_id` that `placed_under` agrees with was placed by an operation
+that also edited the lists, and every device honours it whatever other lists say; so is
+one whose named parent's own list already names the node (a document from before
+`placed_under` existed, or a placement whose list edit arrived first). Neither counts
+for a node whose stored parent is deleted or not held: repair sends such a node to the
+root, and that is judged by the lists like any other. Only a `parent_id` written on its
+own, whose parent does not list the node, is judged: if
+`F` lists `X`, `X.parent_id` is `Q`, `X.placed_under` is not `Q`, `Q`'s list does not
+name `X`, and being under `Q` leaves a share that being under `F` is in, repair rewrites
+`X.parent_id` to `F`, placed, instead of unlisting `X`. Every device that holds `F`, `X`
+and the marker decides the same, from the same documents, and the rewrite is honoured by
+all of them afterwards.
 
-What remains is a tampered client that also unlists `X` from `F`. Then no list names `X`;
-the owner's devices adopt it under `Q` as they do today. Because a scope set only grows,
-`X` is still in the share's scope: every member still holds it and may write it, so any
-editor can put it back (below), and the owner can drag it back. It is vandalism an editor
-could always commit by deleting, made undoable. Joe, 2026-09-17: "if you share something,
-it can get vandalized."
+That bound is what keeps repair convergent, and it was learned the hard way: the first
+cut judged every `parent_id` by the lists, and the randomized convergence test
+(2026-09-22, seeds 76 and 1) found two devices that had nested two shared folders into
+each other by concurrent moves each sitting in a consistent tree of its own and rewriting
+the other's rewrite for ever, since each judged by the ancestry of the destination and by
+lists that the other's repair was changing at the same time. A judgement must be made
+from what is in the node's own document and be final once made.
+
+What remains is a tampered client that also unlists `X` from `F`, or that also writes
+`placed_under`, or that also appends `X` to `Q`'s list. Then the owner's devices adopt
+`X` under `Q` as they do today. Because a scope set only grows, `X` is still in the
+share's scope: every member still holds it and may write it, so any editor can put it
+back (below), and the owner can drag it back. It is vandalism an editor could always
+commit by deleting, made undoable. Joe, 2026-09-17: "if you share something, it can get
+vandalized."
 
 Share upkeep (`crates/pimble-server/src/share.rs`): a published scope set is the union of
 what it was and what the root reaches now. Only stopping the share empties it.

@@ -163,7 +163,7 @@ pub struct Tree {
 
 /// What one document gets from a repair: the node, its new `parent_id` if
 /// any, the list indices to remove (descending) and the ids to append.
-type DocRepair = (NodeId, Option<NodeId>, Vec<usize>, Vec<NodeId>);
+type DocRepair = (NodeId, Option<(NodeId, bool)>, Vec<usize>, Vec<NodeId>);
 
 /// Read-only analysis of the tree's current shape, shared by
 /// [`Tree::validate_tree`] and [`Tree::repair`] so the two can never drift
@@ -171,9 +171,13 @@ type DocRepair = (NodeId, Option<NodeId>, Vec<usize>, Vec<NodeId>);
 /// the fixes computed alongside them.
 struct TreeAnalysis {
     issues: Vec<TreeIssue>,
-    /// `(node, new_parent)` pairs whose stored `parent_id` needs to change
-    /// (decision 9 step 3).
-    parent_rewrites: Vec<(NodeId, NodeId)>,
+    /// `(node, new_parent, placed)` whose stored `parent_id` needs to change
+    /// (decision 9 step 3). `placed` is whether `placed_under` is written with
+    /// it: yes for a decision made from lists and shares (a share's claim, an
+    /// orphan or a detached node put under the root), which every device is
+    /// then to honour; no for a cycle broken by sending its smallest member
+    /// to the root, which a list in a share may still claim (`NodeDoc::write_parent_only`).
+    parent_rewrites: Vec<(NodeId, NodeId, bool)>,
     /// Per-owner children-list surgery (decision 9 steps 4-5): `remove_indices`
     /// are indices into the *current* stored array, in descending order (so
     /// removing one never shifts one still to be removed); `appends` go at the
@@ -727,8 +731,8 @@ impl Tree {
         // its list, or both. Ordered by id so two replicas produce the same
         // edit in the same order.
         let mut per_doc: BTreeMap<String, DocRepair> = BTreeMap::new();
-        for (id, parent) in analysis.parent_rewrites {
-            per_doc.entry(id.to_string()).or_insert((id, None, Vec::new(), Vec::new())).1 = Some(parent);
+        for (id, parent, placed) in analysis.parent_rewrites {
+            per_doc.entry(id.to_string()).or_insert((id, None, Vec::new(), Vec::new())).1 = Some((parent, placed));
         }
         for (owner, removals, appends) in analysis.list_rewrites {
             let entry = per_doc.entry(owner.to_string()).or_insert((owner, None, Vec::new(), Vec::new()));
@@ -738,8 +742,12 @@ impl Tree {
         let mut edit = TreeEdit::default();
         for (id, parent, removals, appends) in per_doc.into_values() {
             let (_, update) = self.docs[&id].edit(|d, txn| {
-                if let Some(parent) = parent {
-                    d.write_parent(txn, Some(parent));
+                if let Some((parent, placed)) = parent {
+                    if placed {
+                        d.write_parent(txn, Some(parent));
+                    } else {
+                        d.write_parent_only(txn, Some(parent));
+                    }
                 }
                 for index in removals {
                     d.list_remove_at(txn, index)?;
@@ -834,8 +842,38 @@ impl Tree {
             // what is above the destination decides the same, from the same
             // documents; one that does not hold all of the last decides
             // nothing (below), which is the 2026-09-21 rule again.
+            //
+            // A `parent_id` is honoured, whatever other lists say, when it was
+            // placed (`placed_under` agrees with it: the write came from an
+            // operation that also edited the lists) or when the destination's
+            // own list already names the node. Only a `parent_id` written on
+            // its own, whose destination does not list the node, is judged;
+            // and a judgement writes a placement, so every device honours it
+            // afterwards and nothing rewrites it again. That bound is what
+            // keeps repair convergent. Without it (found 2026-09-22 by the
+            // randomized test, seeds 76 and 1), two devices that had nested
+            // two shared folders into each other by concurrent moves each sat
+            // in a consistent tree of its own and rewrote the other's rewrite
+            // for ever: a device judged by the ancestry of the destination
+            // and by its lists, both of which the other device's repair was
+            // changing at the same time. A client that writes `parent_id`
+            // and `placed_under` together, leaving the old list naming the
+            // node, gets its move completed instead; the node stays in the
+            // share's scope (a scope set only grows), the share's members see
+            // it in "Recently Deleted..." as a node no list of theirs names,
+            // and any editor puts it back: the residual the contract accepts
+            // of a client that unlists the node.
             let lists_naming = listed_by.get(&id).map(Vec::as_slice).unwrap_or_default();
-            let e = match self.share_claim(id, destination, lists_naming) {
+            // Both kinds of evidence speak only for the parent the node
+            // names. A stored parent that is gone or missing sends the node
+            // to the root, which no operation placed it under, and a list of
+            // the root's that happens to name it (another device's adoption)
+            // is no evidence either: that is judged by the lists like any
+            // other `parent_id` written on its own.
+            let honoured = parent == Some(destination)
+                && (self.docs[&id].placed_under() == parent || lists_naming.contains(&destination));
+            let claim = if honoured { ShareClaim::None } else { self.share_claim(id, destination, lists_naming) };
+            let e = match claim {
                 ShareClaim::Wins(list) => {
                     analysis.issues.push(TreeIssue::LeavesShare { parent_id: list, child_id: id, stored_parent: parent });
                     list
@@ -858,6 +896,7 @@ impl Tree {
         // redirecting the smallest-id member (string order) of each to the root.
         let bound = node_ids.len();
         let mut visited: HashSet<NodeId> = HashSet::new();
+        let mut cycle_broken: HashSet<NodeId> = HashSet::new();
         for &start in &node_ids {
             if start == root || visited.contains(&start) {
                 continue;
@@ -898,6 +937,7 @@ impl Tree {
                         .copied()
                         .expect("a cycle has at least one member");
                     effective_parent.insert(smallest, root);
+                    cycle_broken.insert(smallest);
                     analysis.issues.push(TreeIssue::Cycle { node_ids: members });
                     break;
                 }
@@ -919,7 +959,7 @@ impl Tree {
             }
             let Some(&e) = effective_parent.get(&id) else { continue };
             if raw_parent[&id] != Some(e) {
-                analysis.parent_rewrites.push((id, e));
+                analysis.parent_rewrites.push((id, e, !cycle_broken.contains(&id)));
             }
         }
 
@@ -1999,7 +2039,7 @@ mod tests {
     fn tamper_parent(tree: &mut Tree, node: NodeId, parent: Option<NodeId>) -> TreeEdit {
         let (_, update) = tree.docs[&node]
             .edit_node(|d, txn| {
-                d.write_parent(txn, parent);
+                d.write_parent_only(txn, parent);
                 Ok(())
             })
             .unwrap();
@@ -2863,6 +2903,14 @@ mod tests {
         let in_a_cycle: HashSet<NodeId> = issues.iter().filter_map(|i| if let TreeIssue::Cycle { node_ids } = i { Some(node_ids.clone()) } else { None }).flatten().collect();
         stats.list_wins += issues.iter().filter(|i| matches!(i, TreeIssue::LeavesShare { .. })).count();
         let before = naming_lists(tree);
+        // Where each listed node's `parent_id` pointed before the repair: a
+        // list that agrees with it is honoured whatever other lists say (the
+        // exception is judged only while the destination's list lacks the
+        // node; see `analyze`).
+        let stored_before: HashMap<NodeId, Option<NodeId>> =
+            before.keys().map(|&n| (n, tree.doc(n).and_then(|d| d.fields().ok()).and_then(|f| f.parent_id))).collect();
+        let placed_before: HashMap<NodeId, Option<NodeId>> =
+            before.keys().map(|&n| (n, tree.doc(n).and_then(|d| d.fields().ok()).and_then(|f| f.placed_under))).collect();
         let chains: HashMap<NodeId, (Vec<NodeId>, bool)> = tree.list_node_ids().into_iter().map(|n| (n, chain_of(tree, n))).collect();
         let shares_of = |list: NodeId| -> Vec<NodeId> { chains[&list].0.iter().copied().filter(|&member| carries_marker(tree, member)).collect() };
         // (node, a list that names it, the shares that list is in)
@@ -2881,6 +2929,12 @@ mod tests {
             .collect();
 
         let repair = tree.repair(now).unwrap();
+        if let Some(edit) = &repair {
+            stats.trail.push_back((issues.clone(), edit.touched.iter().map(|(id, _)| *id).collect()));
+            if stats.trail.len() > 6 {
+                stats.trail.pop_front();
+            }
+        }
         if repair.is_some() {
             let after = naming_lists(tree);
             for (node, list, shares) in &facts {
@@ -2892,8 +2946,37 @@ mod tests {
                         continue;
                     }
                     let newly = !before[node].contains(holder);
+                    // Honoured: the `parent_id` named the holder and was
+                    // placed there, or the holder's list already named it.
+                    if stored_before[node] == Some(*holder) && (placed_before[node] == Some(*holder) || !newly) {
+                        continue;
+                    }
                     let kept_instead = !newly && !now_in.contains(list) && !competing[&(*list, *holder)];
-                    assert!(!newly && !kept_instead, "repair listed {node} under {holder}, outside share {share}, while {list} named it (newly: {newly})");
+                    let short = |id: &NodeId| id.to_string()[..8].to_string();
+                    let describe = |id: &NodeId| {
+                        let (chain, complete) = chain_of(tree, *id);
+                        format!(
+                            "{}{} chain [{}] complete {complete}",
+                            short(id),
+                            if carries_marker(tree, *id) { "*" } else { "" },
+                            chain.iter().map(|n| format!("{}{}", short(n), if carries_marker(tree, *n) { "*" } else { "" })).collect::<Vec<_>>().join(" > ")
+                        )
+                    };
+                    assert!(
+                        !newly && !kept_instead,
+                        "repair listed {} under {}, outside share {}, while {} named it (newly: {newly}, kept_instead: {kept_instead});\n stored {:?} placed {:?};\n lists before {:?} after {:?};\n holder: {};\n list: {};\n stored parent: {}",
+                        short(node),
+                        short(holder),
+                        short(share),
+                        short(list),
+                        stored_before[node].as_ref().map(short),
+                        placed_before[node].as_ref().map(short),
+                        before[node].iter().map(short).collect::<Vec<_>>(),
+                        now_in.iter().map(short).collect::<Vec<_>>(),
+                        describe(holder),
+                        describe(list),
+                        stored_before[node].as_ref().map(describe).unwrap_or_else(|| "none".into())
+                    );
                 }
             }
         }
@@ -2902,6 +2985,9 @@ mod tests {
 
     #[derive(Default, Debug)]
     struct Stats {
+        /// The last repairs: the issues found and the documents touched, for
+        /// reading a ping-pong when the drain cap fires.
+        trail: std::collections::VecDeque<(Vec<TreeIssue>, Vec<NodeId>)>,
         delivered: usize,
         repairs: usize,
         adds: usize,
@@ -3014,15 +3100,23 @@ mod tests {
                     continue;
                 }
             } else if roll < 78 {
-                // A client from before the contract: a plain move, wherever to.
+                // A client from before the contract: a plain move, wherever
+                // to, and no `placed_under` written (it did not know the key).
                 match (rng.pick(&non_root), rng.pick(&nodes)) {
-                    (Some(id), Some(parent)) => {
-                        let edit = tree.move_node(id, parent, None, &now);
-                        if edit.is_ok() {
+                    (Some(id), Some(parent)) => match tree.move_node(id, parent, None, &now) {
+                        Ok(mut edit) => {
                             stats.old_client_moves += 1;
+                            let (_, update) = tree.docs[&id]
+                                .edit_node(|d, txn| {
+                                    d.clear_placement(txn);
+                                    Ok(())
+                                })
+                                .unwrap();
+                            edit.push(id, update);
+                            Ok(edit)
                         }
-                        edit
-                    }
+                        Err(e) => Err(e),
+                    },
                     _ => continue,
                 }
             } else if roll < 90 {
@@ -3062,11 +3156,46 @@ mod tests {
             let mut drained = 0usize;
             while net.deliver_one(&mut rng, &mut replicas, &mut stats) {
                 drained += 1;
-                assert!(
-                    drained < 50_000,
-                    "seed {seed}: the network never drained in round {round}: {stats:?}; issues per replica: {:?}",
-                    replicas.iter().map(Tree::validate_tree).collect::<Vec<_>>()
-                );
+                if drained >= 50_000 {
+                    // The documents the last repairs touched or judged, on every replica.
+                    let mut involved: Vec<NodeId> = Vec::new();
+                    for (issues, touched) in &stats.trail {
+                        for issue in issues {
+                            match issue {
+                                TreeIssue::LeavesShare { parent_id, child_id, stored_parent } => {
+                                    involved.extend([*parent_id, *child_id]);
+                                    involved.extend(*stored_parent);
+                                }
+                                TreeIssue::MissingFromList { parent_id, child_id } | TreeIssue::WrongList { parent_id, child_id, .. } => {
+                                    involved.extend([*parent_id, *child_id]);
+                                }
+                                _ => {}
+                            }
+                        }
+                        involved.extend(touched.iter().copied());
+                    }
+                    involved = sorted(involved);
+                    involved.dedup();
+                    let mut dump = String::new();
+                    for (r, tree) in replicas.iter().enumerate() {
+                        dump.push_str(&format!("\nreplica {r}:"));
+                        for &id in &involved {
+                            let Some(doc) = tree.doc(id) else { dump.push_str(&format!("\n  {id}: not held")); continue };
+                            let fields = doc.fields().unwrap();
+                            let chain = chain_of(tree, id).0.iter().map(|n| n.to_string()[..8].to_string()).collect::<Vec<_>>().join(" > ");
+                            dump.push_str(&format!(
+                                "\n  {}: parent {:?} deleted {} marker {} listed_by {:?} children {:?} chain {chain}",
+                                &id.to_string()[..8],
+                                fields.parent_id.map(|p| p.to_string()[..8].to_string()),
+                                fields.deleted_at.is_some(),
+                                fields.custom.contains_key(SHARE),
+                                naming_lists(tree).get(&id).map(|l| l.iter().map(|n| n.to_string()[..8].to_string()).collect::<Vec<_>>()),
+                                doc.children().iter().map(|n| n.to_string()[..8].to_string()).collect::<Vec<_>>()
+                            ));
+                        }
+                    }
+                    panic!("seed {seed}: the network never drained in round {round}: {stats:?}; issues per replica: {:?}{dump}", replicas.iter().map(Tree::validate_tree).collect::<Vec<_>>());
+                }
             }
             let mut quiet = true;
             for (r, tree) in replicas.iter_mut().enumerate() {
@@ -3119,7 +3248,9 @@ mod tests {
         };
         let (mut transplants, mut list_wins) = (0, 0);
         for &seed in seeds {
-            let stats = run_convergence(seed, 400);
+            let mut stats = run_convergence(seed, 400);
+            // The trail is for reading a failure; a passing seed prints its counts.
+            stats.trail.clear();
             assert!(stats.adds > 20 && stats.moves > 10 && stats.removes > 5 && stats.tampers > 10 && stats.shares > 3, "seed {seed} did too little: {stats:?}");
             transplants += stats.transplants;
             list_wins += stats.list_wins;
