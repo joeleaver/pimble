@@ -55,10 +55,13 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
-  # Non-blocking until joeleaver/rhypedb#23 (rhypedb-storage's Unix-only
-  # `Mmap::advise`) is merged and pimble's pin moves past it: the release
-  # publishes with whatever packages built, and the download page hides the
-  # platform whose package is missing.
+  # Non-blocking until a tagged run has built it once: every Windows build up
+  # to v0.3.1 failed in rhypedb-storage's Unix-only `Mmap::advise`, which
+  # joeleaver/rhypedb#23 fixed and the pin now includes (checked locally with
+  # `cargo xwin check -p pimble-app --release --target x86_64-pc-windows-msvc`;
+  # it needs `llvm-lib` on PATH). Until then the release publishes with
+  # whatever packages built, and the download page hides the platform whose
+  # package is missing.
   build-windows:
     runs-on: windows-latest
     continue-on-error: true
