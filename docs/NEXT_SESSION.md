@@ -42,17 +42,30 @@ see any of it run, `scripts/local-stack/README.md`.
   the whole picture and decide right; a member can only reach shares they already write).
   A client that writes `placed_under` or appends to the destination's list too gets its
   move completed: the accepted residual (the node stays in scope, members put it back).
-- **Wave 4, the PM's walk-through on the local stack**, against the contract's
-  "Verification (the bar)": headless with the CLI first (`transplant-node`, `list-deleted`,
-  `undelete-node`), then the desktop app (the drag between stores, the notice, the
-  modal) and the browser. Rebuild everything from the committed state first
-  (`cargo build --release -p pimble-cli -p pimble-cloud -p pimble-app`, `trunk build
-  --release` in `web/`), since the release binaries were built while agents were still
-  editing.
-- **Then**: merge to `master`, deploy (`git push jkbase`), and the desktop release
-  (bump the workspace version, tag, push the tag), the standing rule. Every device and the
-  hosted server together, as at v0.2.0; `placed_under` is a new key old clients do not
-  write, which the repair rule tolerates (judged by lists).
+- **The review's fixes landed** (a13da3c server, ddb1f32 app): a move judges every list
+  that names the node; `listDeleted` without content; the modal takes only its own
+  errors; a test moves a two-node subtree between shares and the other share's member
+  reads both planted documents.
+- **Wave 4 passed on 2026-09-22** against the contract's "Verification (the bar)", on the
+  local stack rebuilt from the committed state: headless with the CLI (a member moving a
+  note between two shares, the owner moving a folder into a private one, a member moving
+  a note into a store of his own: each an undoable delete for the share's other member,
+  the text intact on the new node, nothing of the private copy on the member's disk);
+  in the desktop app on bob's identity (the drag between stores, the notice word for
+  word in the status bar, "Recently Deleted..." with "Put Back", the editor following an
+  open note into the other share); in the browser on carol's (Put Back, a new encrypted
+  store, the drag between stores). No typed word or title on the hosted disk. The steps
+  are in `scripts/local-stack/README.md`, "The move walk-through".
+- **Two desktop bugs Joe reported the same day, fixed** (d3cc539): documents did not
+  scroll (`min-height: 0` on the editor's box let it shrink to the pane), and the
+  maximize and minimize buttons did nothing (no callbacks wired). Joe then reported no
+  scrollbar is drawn; an agent was on it as this was written.
+- **Waiting for Joe: the go-ahead to merge and ship.** Merge `node-document` to `master`,
+  deploy (`git push jkbase`), and the desktop release (bump the workspace version, tag,
+  push the tag), the standing rule. `placed_under` is a new key a v0.2.0 client does not
+  write, which the repair rule tolerates (judged by lists), so no migration and no
+  lockstep update this time; a v0.2.0 client's plain move out of a share is put back by
+  the newer devices, which is the contract.
 
 ## The ship, 2026-09-21
 

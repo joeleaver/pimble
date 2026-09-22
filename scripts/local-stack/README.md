@@ -68,6 +68,37 @@ PIMBLE_CLOUD_PASSWORD=pw-alice-0123456789 own cloud-sign-in $EDGE alice@example.
 5. Kill `pimble-cloud` and start it again (the command is in `up.sh`): members are `Synced`
    again within a minute and nothing written meanwhile is lost.
 
+## The move walk-through (what the PM ran on 2026-09-22, docs/MOVE_CONTRACT.md "Verification")
+
+Setup as in the sharing walk-through: `Family` with `Holiday` (shared as "Holiday plans",
+bob and carol editors), `Errands` (shared, bob editor) and `Private`; `Tickets/Train` and
+`Packing` in Holiday, text set with `set-node-text`. The root id is `root_node_id` in the
+store's `manifest.json`; `create-node <store> <parent> <type> <title>`.
+
+1. bob `move-node <store> <Packing> <Errands>` answers "Moved node ... out of "Holiday
+   plans" as new node <id> under ...; the original is deleted there and can be put back".
+   carol's `list-children` of Holiday lacks it, her `list-deleted` names it ("Packing", in
+   "Holiday", when); `carol undelete-node <store> <Packing>` and both notes exist for bob,
+   carol and the owner; `show-node` of the new one has the text.
+2. `own move-node <store> <Tickets> <Private>`: the owner's Private has a new Tickets with a
+   new Train (text intact); bob's Holiday lacks Tickets, his `list-deleted` names it, his
+   replica's `nodes/` holds the originals and nothing of the new ids; `bob undelete-node`
+   puts the folder and Train back for everyone.
+3. `bob create-store ... Mine`; `bob transplant-node <store> <Packing> <Mine> <Mine root>`
+   lands it there with its text; carol sees the delete and puts it back.
+4. The desktop app on bob's identity (his headless server stopped, `state.json` naming the
+   replica and `Mine`), driven with `tools/rinch-debug.py --pid <pid>` (`mouse_down`,
+   `mouse_move`, `mouse_up` raw commands make a drag): a drag of Holiday's note onto
+   `Mine` transplants it and the status bar reads the notice verbatim; View > "Recently
+   Deleted..." lists it with "in Holiday" and the time, "Put Back" empties the list and
+   the tree shows it again; with the note open in the editor, a drag onto Errands moves
+   it there as a new document and the editor follows it.
+5. The browser on carol's account: View > "Recently Deleted..." lists what bob moved
+   away, "Put Back" restores it (bob's desktop shows it live); File > "New Store..."
+   makes an encrypted store in the page; a drag of the shared note onto it lands it there
+   with its text, and bob's desktop shows the delete in Holiday. `grep -rl` of any typed
+   word or title under `$STACK/stores` finds nothing.
+
 ## The apps on the same identities
 
 Stop the headless desktop for that name, write
