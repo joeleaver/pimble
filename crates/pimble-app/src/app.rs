@@ -2141,8 +2141,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         // reached through a mount — so that is what decides. Reactive on the
         // active node, on its store's own signal and on the node's, so the
         // pane follows an access that arrives or changes. The toolbar gives
-        // way to a line saying so; `editor::reject_local_edit` is what
-        // happens if someone types anyway.
+        // way to a line saying so, and the editor is locked (the effect
+        // below) so typing does nothing.
         //
         // The store's own signal comes out of the registry first and is read
         // after that borrow is released: rinch keeps every signal in one
@@ -2158,6 +2158,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             let node_sig = store.node_data.with(|map| map.get(&(active.store_id, active.node_id)).copied());
             node_sig.map_or(false, |sig| sig.with(|n| !n.access.allows_write()))
         };
+        // The editor's own switch follows the same judgement
+        // (`editor::set_read_only`): locked, it refuses every local change
+        // while remote ones keep landing, so a reader's keystroke changes
+        // nothing on screen. The effect lives as long as this component.
+        let _ = rinch::Effect::new(move || crate::editor::set_read_only(editor_read_only()));
 
         // Editor empty state icon
         let empty_icon = render_tabler_icon(__scope, TablerIcon::FileText, TablerIconStyle::Outline);
@@ -3775,12 +3780,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 {toolbar_handle}
                             }
                             // The same sentence a refused write comes back
-                            // with, so a reader meets one wording everywhere,
-                            // plus what it means for the pane in front of them.
+                            // with, so a reader meets one wording everywhere.
                             div {
                                 class: "pimble-editor__read-only",
                                 style: {move || if store.show_editor.get() && editor_read_only() { "" } else { "display: none;" }},
-                                {format!("{} Nothing typed here is kept.", pimble_core::StoreAccess::READ_ONLY_REFUSAL)}
+                                {pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string()}
                             }
                             div {
                                 class: "pimble-editor__content-wrap",

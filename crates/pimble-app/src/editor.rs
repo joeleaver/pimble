@@ -32,9 +32,6 @@ thread_local! {
     /// edit at a time (one shared editor pane), so scheduling for a new node
     /// always supersedes whatever was pending.
     static LABEL_REFRESH: RefCell<Option<TimeoutHandle>> = const { RefCell::new(None) };
-    /// The pending reopen after typing into a document this device may only
-    /// read (see [`reject_local_edit`]).
-    static READ_ONLY_REOPEN: RefCell<Option<TimeoutHandle>> = const { RefCell::new(None) };
 }
 
 /// The app's editor handle (created on first use). Cheap to clone (an `Rc`); the
@@ -70,7 +67,6 @@ pub(crate) fn start_editing(
     handle.set_dark_mode(untracked(|| store.dark_mode.get()));
     handle.stop_collaboration(); // end any prior node's session
     cancel_pending_label_refresh();
-    cancel_pending_read_only_reopen();
 
     // Every local edit's delta is base64-broadcast to the server, which persists it
     // and relays it to the other clients. The closure captures only `Copy` values
@@ -78,16 +74,19 @@ pub(crate) fn start_editing(
     let outbound = move |delta: Vec<u8>| {
         use base64::Engine;
         // A document shared read-only takes remote changes but sends none
-        // back. Judged per node, by the server's own word on it
-        // (`AppStore::node_access`): a store can hold a root this account
-        // reads beside one it edits, and a delta the server would refuse is
-        // text on this screen that exists nowhere. `store_id` is the node's
-        // CANONICAL store (`open_node` parses the tree value, which strips
-        // any mount path), so a node reached through a mount is judged as
-        // the node the edit would be written to. Asked at every edit, not
-        // once at open: a role changes while a document is open.
+        // back. The editor refuses the edit before it gets here
+        // ([`set_read_only`], which the pane switches as the access changes),
+        // so nothing reaches this from a read-only document; this is the
+        // invariant kept where a delta leaves, judged per node by the
+        // server's own word on it (`AppStore::node_access`): a store can
+        // hold a root this account reads beside one it edits, and a delta
+        // the server would refuse is text on this screen that exists
+        // nowhere. `store_id` is the node's CANONICAL store (`open_node`
+        // parses the tree value, which strips any mount path), so a node
+        // reached through a mount is judged as the node the edit would be
+        // written to.
         if !store.node_access(store_id, node_id).allows_write() {
-            reject_local_edit(store, store_id, node_id);
+            tracing::warn!("an edit to read-only node {node_id} reached the outbound path and was dropped");
             return;
         }
         let changes = base64::engine::general_purpose::STANDARD.encode(&delta);
@@ -171,49 +170,19 @@ pub(crate) fn stop_editing(store: AppStore) {
     handle.stop_collaboration();
     store.active_edit.set(None);
     cancel_pending_label_refresh();
-    cancel_pending_read_only_reopen();
     crate::toolbar::bump_toolbar();
 }
 
-/// Cancel a pending read-only reopen, if one is scheduled.
-fn cancel_pending_read_only_reopen() {
-    READ_ONLY_REOPEN.with(|slot| {
-        if let Some(handle) = slot.borrow_mut().take() {
-            clear_timeout(handle);
-        }
-    });
-}
-
-/// What happens when someone types into a document their device may only read
-/// (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"): the delta is not sent,
-/// and the node is reopened from the server's copy so the typed text does not
-/// linger. Debounced, so a burst of keystrokes costs one reopen rather than
-/// one per character.
-///
-/// This is the interim. rinch's editor has no read-only switch yet; when it
-/// grows one, this function and the two lines that call it are the whole of
-/// what goes away — nothing else in the collaboration path knows about it.
-fn reject_local_edit(store: AppStore, store_id: StoreId, node_id: NodeId) {
-    cancel_pending_read_only_reopen();
-    let timeout = set_timeout(400, move || {
-        READ_ONLY_REOPEN.with(|slot| {
-            slot.borrow_mut().take();
-        });
-        // Drop the session without `stop_editing`'s write-back: that snapshot
-        // is exactly the typed text this is undoing. Then open the node the
-        // ordinary way — `GetNode` answers with the server's copy and the
-        // `NodeLoaded` handler starts a fresh session from it, which is the
-        // one path a document is ever opened through.
-        editor().stop_collaboration();
-        store.active_edit.set(None);
-        store.live_label.update(|m| {
-            m.remove(&(store_id, node_id));
-        });
-        store.send(BackendCommand::GetNode { store_id, node_id });
-    });
-    READ_ONLY_REOPEN.with(|slot| {
-        *slot.borrow_mut() = Some(timeout);
-    });
+/// Lock or unlock the editor (docs/NODE_DOCUMENT_CONTRACT.md section 5,
+/// "Roles"). rinch's switch lives on the handle, so it works before the
+/// view mounts and survives a re-mount; locked, the editor refuses every
+/// local change (typing, IME, paste, commands, undo) while remote changes
+/// keep applying, and the caret, selection and copy still work. The pane
+/// calls this from an effect over the active node's access
+/// (`AppStore::node_access`), so a role that changes while a document is
+/// open flips it.
+pub(crate) fn set_read_only(read_only: bool) {
+    editor().set_read_only(read_only);
 }
 
 /// Ask the server for what it has beyond the active session's state vector
