@@ -1,8 +1,17 @@
 # Next session: start here
 
-Updated 2026-09-22. **The move contract is built** (waves 1 to 3 of `docs/MOVE_CONTRACT.md`,
-commits 312ddd9 to ac0ddcc on `node-document`; not merged to `master`, not deployed); see
-the first section. Below it, the 2026-09-21 ship notes still apply. **v0.2.0 is shipped**: `master` fast-forwarded to `node-document`
+Updated 2026-09-22 evening. **v0.3.0 is shipped**: the move contract (`docs/MOVE_CONTRACT.md`,
+built, reviewed and verified that day; the first section below), plus three desktop fixes.
+`master` is fast-forwarded from `node-document` and carries the release commit 3cf6521
+(tag `v0.3.0`) and, after it, a test-only fix 01fd278 and these notes; jkbase's `main` is
+at 3cf6521 (deployment v20, verified: every endpoint, the hosted server opening every
+store, the accounts service up); the GitHub release has the Linux package and the download
+page offers v0.3.0 (the Windows job still waits for rhypedb#23). CI failed once on the
+release commit: the randomized test's floor for how often the share exception must fire
+was too high for CI's eight seeds now that `placed_under` makes it rare; the floors are
+lowered in 01fd278 (the convergence itself passed). Backup taken before the deploy:
+`bkp_1790095295052_ea2d819bcc277fbd`. No migration this time. The section below was
+written before the ship and still describes the work. Before it, **v0.2.0 was shipped**: `master` fast-forwarded to `node-document`
 (Joe's go-ahead the same day), production is deployment v19 on jkbase, the desktop release
 `v0.2.0` is on GitHub (Linux; the Windows job still waits for rhypedb#23). Read this, then
 `CLAUDE.md` ("Current design", "Sharing on node documents"), then
@@ -61,12 +70,15 @@ see any of it run, `scripts/local-stack/README.md`.
   maximize and minimize buttons did nothing (no callbacks wired). Joe then reported no
   scrollbar is drawn: fixed (1d5d9be), the editor pane is a stacking context of its own
   so its scrollbar paints last.
-- **Waiting for Joe: the go-ahead to merge and ship.** Merge `node-document` to `master`,
-  deploy (`git push jkbase`), and the desktop release (bump the workspace version, tag,
-  push the tag), the standing rule. `placed_under` is a new key a v0.2.0 client does not
-  write, which the repair rule tolerates (judged by lists), so no migration and no
-  lockstep update this time; a v0.2.0 client's plain move out of a share is put back by
-  the newer devices, which is the contract.
+- **Shipped as v0.3.0 with Joe's go-ahead the same evening** (see the top of this file).
+  `placed_under` is a new key a v0.2.0 client does not write, which the repair rule
+  tolerates (judged by lists), so no migration and no lockstep update this time; a v0.2.0
+  client's plain move out of a share is put back by the newer devices, which is the
+  contract. Joe's part: install v0.3.0 where he wants the new behaviour; nothing breaks
+  on a device that stays on v0.2.0.
+- **Next**: the follow-ups above (a `tests/common` harness, the web plain-to-plain
+  transplant across endpoints, the partial-replica grouping limit if it ever matters),
+  and whatever Joe reports from using v0.3.0.
 
 ## The ship, 2026-09-21
 
