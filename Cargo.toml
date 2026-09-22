@@ -50,8 +50,9 @@ rhypedb-query = { git = "https://github.com/joeleaver/rhypedb.git", branch = "ma
 # UI framework, tracked from GitHub main (never the local checkout). `rinch` itself is
 # declared in crates/pimble-app/Cargo.toml (default features off there; the `native`
 # feature re-adds desktop, file-dialogs, clipboard, debug, collaboration; `web` uses
-# rinch-web), because the same UI library builds for the browser. Software rendering
-# (no `gpu`) avoids rinch's wgpu-fork patch.
+# rinch-web), because the same UI library builds for the browser. The desktop build
+# renders on the GPU (`rinch/gpu`), which needs rinch's wgpu fork: see `[patch.crates-io]`
+# at the end of this file.
 rinch-tabler-icons = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
 rinch-editor-core = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
 # Headless collab session (yrs projection of the editor model); pure Rust, no
@@ -99,3 +100,21 @@ pimble-server = { path = "crates/pimble-server" }
 pimble-client = { path = "crates/pimble-client" }
 pimble-plugins = { path = "crates/pimble-plugins" }
 pimble-import = { path = "crates/pimble-import" }
+
+# rinch's own patches, repeated here because a dependency's `[patch]` does not reach
+# the crates that use it. Keep this block the same as rinch's root Cargo.toml.
+# wgpu: fixes Rgba8Unorm storage texture validation, needed for transparent windows
+# with vello on Windows (DX12 + DirectComposition); gfx-rs/wgpu#8908.
+# winit: Wayland drag-and-drop, which upstream 0.31-beta.2 does not implement.
+[patch.crates-io]
+wgpu = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
+wgpu-core = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
+wgpu-hal = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
+wgpu-types = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
+naga = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
+winit = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+winit-core = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+winit-common = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+winit-wayland = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+winit-x11 = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+dpi = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }

@@ -523,7 +523,7 @@ The app has the rinch `debug` feature on, so the rinch MCP tools (`list_apps`, `
 
 ## Dependencies
 
-- `rinch` (git main), declared in `crates/pimble-app/Cargo.toml`: default features off, `native` adds `desktop, file-dialogs, clipboard, debug, collaboration`, `web` adds `rinch-web` with `collaboration`; software rendering (no `gpu`, which would need rinch's wgpu fork patch)
+- `rinch` (git main), declared in `crates/pimble-app/Cargo.toml`: default features off, `native` adds `desktop, gpu, file-dialogs, clipboard, debug, collaboration`, `web` adds `rinch-web` with `collaboration`. The desktop renders on the GPU (vello over wgpu): the CPU renderer repaints the whole window after every layout change, about 100 ms a frame at 4K. `gpu` needs rinch's wgpu and winit forks, so the root `Cargo.toml` repeats rinch's `[patch.crates-io]` block; keep the two identical. With `gpu` on, rinch has no runtime fallback to the CPU renderer: no adapter is a panic at startup
 - `rinch-editor-core` (git main)
 - `yrs` 0.27 for both CRDT documents; `rinch-editor-collab` (git main) wraps it for node
   content's rich-text schema, the store document uses `yrs` directly (Maps and Arrays)

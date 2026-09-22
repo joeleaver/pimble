@@ -81,6 +81,10 @@ native = [
     "dep:dirs",
     "dep:rand",
     "rinch/desktop",
+    # GPU rendering (vello over wgpu). The CPU renderer repaints the whole window
+    # on the CPU after every layout change, about 100 ms a frame at 3840x2160.
+    # Needs rinch's wgpu fork, patched in the root Cargo.toml.
+    "rinch/gpu",
     "rinch/file-dialogs",
     "rinch/clipboard",
     "rinch/debug",

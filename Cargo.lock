@@ -133,6 +133,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
+name = "anyrender"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "499246bec8f10bfc70f5ca4dbcd4b95e448f0b68b3e93ede7f93e47f13f4c5dc"
+dependencies = [
+ "kurbo",
+ "peniko",
+ "raw-window-handle",
+]
+
+[[package]]
+name = "anyrender_vello"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b47ec304e9ee64601df694022e67bb05585351aae2fd6dcf1b6f3293a1713c3"
+dependencies = [
+ "anyrender",
+ "debug_timer",
+ "kurbo",
+ "peniko",
+ "pollster",
+ "rustc-hash 2.1.1",
+ "vello",
+ "wgpu",
+ "wgpu_context",
+]
+
+[[package]]
 name = "app_units"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1463,6 +1491,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
+name = "debug_timer"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da220af51a1a335e9a930beaaef53d261e41ea9eecfb3d973a3ddae1a7284b9c"
+
+[[package]]
 name = "debugid"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1646,8 +1680,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 [[package]]
 name = "dpi"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
+source = "git+https://github.com/joeleaver/winit-fork?branch=rinch-patch#0009b12bd859cc700853ae64027203be992870a2"
 
 [[package]]
 name = "dtoa"
@@ -3961,6 +3994,31 @@ dependencies = [
 
 [[package]]
 name = "naga"
+version = "27.0.1"
+source = "git+https://github.com/joeleaver/wgpu-fork?branch=rinch-patch#54b7ce083ac9575b27884054ae74eb652cb541b3"
+dependencies = [
+ "arrayvec",
+ "bit-set",
+ "bitflags 2.10.0",
+ "cfg-if",
+ "cfg_aliases",
+ "codespan-reporting",
+ "half",
+ "hashbrown 0.16.1",
+ "hexf-parse",
+ "indexmap",
+ "libm",
+ "log",
+ "num-traits",
+ "once_cell",
+ "rustc-hash 1.1.0",
+ "spirv",
+ "thiserror 2.0.17",
+ "unicode-ident",
+]
+
+[[package]]
+name = "naga"
 version = "27.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "066cf25f0e8b11ee0df221219010f213ad429855f57c494f995590c861a9a7d8"
@@ -3980,7 +4038,6 @@ dependencies = [
  "num-traits",
  "once_cell",
  "rustc-hash 1.1.0",
- "spirv",
  "thiserror 2.0.17",
  "unicode-ident",
 ]
@@ -4570,9 +4627,9 @@ dependencies = [
 
 [[package]]
 name = "ordered-float"
-version = "5.1.0"
+version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f4779c6901a562440c3786d08192c6fbda7c1c2060edd10006b05ee35d10f2d"
+checksum = "e2c1f9f56e534ac6a9b8a4600bdf0f530fb393b5f393e7b4d03489c3cf0c3f01"
 dependencies = [
  "num-traits",
 ]
@@ -6071,14 +6128,18 @@ name = "rinch"
 version = "0.1.0"
 source = "git+https://github.com/joeleaver/rinch.git?branch=main#651ecf7aa6ed85cc878951b6cab09ebd73d9c109"
 dependencies = [
+ "anyrender",
+ "anyrender_vello",
  "base64 0.22.1",
  "bytemuck",
+ "futures-util",
  "js-sys",
  "keyboard-types 0.7.0",
  "muda",
  "parley",
  "peniko",
  "png 0.17.16",
+ "pollster",
  "rfd",
  "rinch-clipboard",
  "rinch-components",
@@ -6090,13 +6151,17 @@ dependencies = [
  "rinch-editor-view",
  "rinch-macros",
  "rinch-platform",
+ "rinch-renderer",
  "rinch-theme",
  "serde_json",
  "softbuffer",
+ "tokio",
  "tracing",
  "tracing-subscriber",
+ "vello",
  "wasm-bindgen",
  "web-sys",
+ "wgpu",
  "windows-sys 0.59.0",
  "winit",
 ]
@@ -6247,6 +6312,18 @@ dependencies = [
  "peniko",
  "vello",
  "web-time",
+]
+
+[[package]]
+name = "rinch-renderer"
+version = "0.1.0"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#651ecf7aa6ed85cc878951b6cab09ebd73d9c109"
+dependencies = [
+ "rinch-core",
+ "thiserror 1.0.69",
+ "tracing",
+ "vello",
+ "wgpu",
 ]
 
 [[package]]
@@ -8139,7 +8216,7 @@ checksum = "7a765d44d4bd354146e44f9a860f4e92effd91a97302549be9e47f0a18d8128c"
 dependencies = [
  "bytemuck",
  "log",
- "naga",
+ "naga 27.0.3",
  "thiserror 2.0.17",
  "vello_encoding",
 ]
@@ -8788,8 +8865,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 [[package]]
 name = "wgpu"
 version = "27.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfe68bac7cde125de7a731c3400723cadaaf1703795ad3f4805f187459cd7a77"
+source = "git+https://github.com/joeleaver/wgpu-fork?branch=rinch-patch#54b7ce083ac9575b27884054ae74eb652cb541b3"
 dependencies = [
  "arrayvec",
  "bitflags 2.10.0",
@@ -8799,7 +8875,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "js-sys",
  "log",
- "naga",
+ "naga 27.0.1",
  "parking_lot",
  "portable-atomic",
  "profiling",
@@ -8816,9 +8892,8 @@ dependencies = [
 
 [[package]]
 name = "wgpu-core"
-version = "27.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27a75de515543b1897b26119f93731b385a19aea165a1ec5f0e3acecc229cae7"
+version = "27.0.1"
+source = "git+https://github.com/joeleaver/wgpu-fork?branch=rinch-patch#54b7ce083ac9575b27884054ae74eb652cb541b3"
 dependencies = [
  "arrayvec",
  "bit-set",
@@ -8830,7 +8905,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "indexmap",
  "log",
- "naga",
+ "naga 27.0.1",
  "once_cell",
  "parking_lot",
  "portable-atomic",
@@ -8848,36 +8923,32 @@ dependencies = [
 
 [[package]]
 name = "wgpu-core-deps-apple"
-version = "27.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0772ae958e9be0c729561d5e3fd9a19679bcdfb945b8b1a1969d9bfe8056d233"
+version = "27.0.1"
+source = "git+https://github.com/joeleaver/wgpu-fork?branch=rinch-patch#54b7ce083ac9575b27884054ae74eb652cb541b3"
 dependencies = [
  "wgpu-hal",
 ]
 
 [[package]]
 name = "wgpu-core-deps-emscripten"
-version = "27.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b06ac3444a95b0813ecfd81ddb2774b66220b264b3e2031152a4a29fda4da6b5"
+version = "27.0.1"
+source = "git+https://github.com/joeleaver/wgpu-fork?branch=rinch-patch#54b7ce083ac9575b27884054ae74eb652cb541b3"
 dependencies = [
  "wgpu-hal",
 ]
 
 [[package]]
 name = "wgpu-core-deps-windows-linux-android"
-version = "27.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71197027d61a71748e4120f05a9242b2ad142e3c01f8c1b47707945a879a03c3"
+version = "27.0.1"
+source = "git+https://github.com/joeleaver/wgpu-fork?branch=rinch-patch#54b7ce083ac9575b27884054ae74eb652cb541b3"
 dependencies = [
  "wgpu-hal",
 ]
 
 [[package]]
 name = "wgpu-hal"
-version = "27.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b21cb61c57ee198bc4aff71aeadff4cbb80b927beb912506af9c780d64313ce"
+version = "27.0.1"
+source = "git+https://github.com/joeleaver/wgpu-fork?branch=rinch-patch#54b7ce083ac9575b27884054ae74eb652cb541b3"
 dependencies = [
  "android_system_properties",
  "arrayvec",
@@ -8901,7 +8972,7 @@ dependencies = [
  "libloading 0.8.9",
  "log",
  "metal",
- "naga",
+ "naga 27.0.1",
  "ndk-sys",
  "objc",
  "once_cell",
@@ -8925,8 +8996,7 @@ dependencies = [
 [[package]]
 name = "wgpu-types"
 version = "27.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "afdcf84c395990db737f2dd91628706cb31e86d72e53482320d368e52b5da5eb"
+source = "git+https://github.com/joeleaver/wgpu-fork?branch=rinch-patch#54b7ce083ac9575b27884054ae74eb652cb541b3"
 dependencies = [
  "bitflags 2.10.0",
  "bytemuck",
@@ -8934,6 +9004,16 @@ dependencies = [
  "log",
  "thiserror 2.0.17",
  "web-sys",
+]
+
+[[package]]
+name = "wgpu_context"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7810fecc0b2ea658f21add46e5a8a65ddb310d00b52949a365496984b3f44db5"
+dependencies = [
+ "futures-intrusive",
+ "wgpu",
 ]
 
 [[package]]
@@ -9403,8 +9483,7 @@ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 [[package]]
 name = "winit"
 version = "0.31.0-beta.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2879d2854d1a43e48f67322d4bd097afcb6eb8f8f775c8de0260a71aea1df1aa"
+source = "git+https://github.com/joeleaver/winit-fork?branch=rinch-patch#0009b12bd859cc700853ae64027203be992870a2"
 dependencies = [
  "bitflags 2.10.0",
  "cfg_aliases",
@@ -9430,8 +9509,7 @@ dependencies = [
 [[package]]
 name = "winit-android"
 version = "0.31.0-beta.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51d9c0d2cd93efec3a9f9ad819cfaf0834782403af7c0d248c784ec0c61761df"
+source = "git+https://github.com/joeleaver/winit-fork?branch=rinch-patch#0009b12bd859cc700853ae64027203be992870a2"
 dependencies = [
  "android-activity",
  "bitflags 2.10.0",
@@ -9446,8 +9524,7 @@ dependencies = [
 [[package]]
 name = "winit-appkit"
 version = "0.31.0-beta.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21310ca07851a49c348e0c2cc768e36b52ca65afda2c2354d78ed4b90074d8aa"
+source = "git+https://github.com/joeleaver/winit-fork?branch=rinch-patch#0009b12bd859cc700853ae64027203be992870a2"
 dependencies = [
  "bitflags 2.10.0",
  "block2 0.6.2",
@@ -9469,8 +9546,7 @@ dependencies = [
 [[package]]
 name = "winit-common"
 version = "0.31.0-beta.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45375fbac4cbb77260d83a30b1f9d8105880dbac99a9ae97f56656694680ff69"
+source = "git+https://github.com/joeleaver/winit-fork?branch=rinch-patch#0009b12bd859cc700853ae64027203be992870a2"
 dependencies = [
  "memmap2",
  "objc2 0.6.4",
@@ -9485,8 +9561,7 @@ dependencies = [
 [[package]]
 name = "winit-core"
 version = "0.31.0-beta.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4f0ccd7abb43740e2c6124ac7cae7d865ecec74eec63783e8922577ac232583"
+source = "git+https://github.com/joeleaver/winit-fork?branch=rinch-patch#0009b12bd859cc700853ae64027203be992870a2"
 dependencies = [
  "bitflags 2.10.0",
  "cursor-icon",
@@ -9500,8 +9575,7 @@ dependencies = [
 [[package]]
 name = "winit-orbital"
 version = "0.31.0-beta.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51ea1fb262e7209f265f12bd0cc792c399b14355675e65531e9c8a87db287d46"
+source = "git+https://github.com/joeleaver/winit-fork?branch=rinch-patch#0009b12bd859cc700853ae64027203be992870a2"
 dependencies = [
  "bitflags 2.10.0",
  "dpi",
@@ -9516,8 +9590,7 @@ dependencies = [
 [[package]]
 name = "winit-uikit"
 version = "0.31.0-beta.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "680a356e798837d8eb274d4556e83bceaf81698194e31aafc5cfb8a9f2fab643"
+source = "git+https://github.com/joeleaver/winit-fork?branch=rinch-patch#0009b12bd859cc700853ae64027203be992870a2"
 dependencies = [
  "bitflags 2.10.0",
  "block2 0.6.2",
@@ -9537,8 +9610,7 @@ dependencies = [
 [[package]]
 name = "winit-wayland"
 version = "0.31.0-beta.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ce5afb2ba07da603f84b722c95f9f9396d2cedae3944fb6c0cda4a6f88de545"
+source = "git+https://github.com/joeleaver/winit-fork?branch=rinch-patch#0009b12bd859cc700853ae64027203be992870a2"
 dependencies = [
  "ahash",
  "bitflags 2.10.0",
@@ -9564,8 +9636,7 @@ dependencies = [
 [[package]]
 name = "winit-web"
 version = "0.31.0-beta.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c2490a953fb776fbbd5e295d54f1c3847f4f15b6c3929ec53c09acda6487a92"
+source = "git+https://github.com/joeleaver/winit-fork?branch=rinch-patch#0009b12bd859cc700853ae64027203be992870a2"
 dependencies = [
  "atomic-waker",
  "bitflags 2.10.0",
@@ -9587,8 +9658,7 @@ dependencies = [
 [[package]]
 name = "winit-win32"
 version = "0.31.0-beta.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "644ea78af0e858aa3b092e5d1c67c41995a98220c81813f1353b28bc8bb91eaa"
+source = "git+https://github.com/joeleaver/winit-fork?branch=rinch-patch#0009b12bd859cc700853ae64027203be992870a2"
 dependencies = [
  "bitflags 2.10.0",
  "cursor-icon",
@@ -9604,8 +9674,7 @@ dependencies = [
 [[package]]
 name = "winit-x11"
 version = "0.31.0-beta.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa5b600756534c7041aa93cd0d244d44b09fca1b89e202bd1cd80dd9f3636c46"
+source = "git+https://github.com/joeleaver/winit-fork?branch=rinch-patch#0009b12bd859cc700853ae64027203be992870a2"
 dependencies = [
  "bitflags 2.10.0",
  "bytemuck",
