@@ -481,12 +481,39 @@ pub struct RhypeDb {
     client: AsyncClient,
 }
 
+/// How long [`RhypeDb::connect`] waits for the database to accept
+/// connections. On jkbase the managed RhypeDB starts with the service, so the
+/// first dial of a deployment is usually refused; exiting there made the
+/// platform restart the service five seconds later with an error line in
+/// every deployment's log.
+const CONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl RhypeDb {
     pub async fn connect(addr: &str) -> CloudResult<Self> {
-        let client = AsyncClient::connect(addr)
-            .await
-            .map_err(|e| CloudError::Internal(format!("connecting to rhypedb at {addr}: {e}")))?;
-        Ok(Self { client })
+        Self::connect_waiting(addr, CONNECT_WAIT).await
+    }
+
+    /// Dial `addr`, retrying a refused or failed connection for up to `wait`.
+    /// Any other error, and a connection still failing after `wait`, is
+    /// returned as before.
+    async fn connect_waiting(addr: &str, wait: std::time::Duration) -> CloudResult<Self> {
+        let deadline = tokio::time::Instant::now() + wait;
+        let mut delay = std::time::Duration::from_millis(100);
+        let mut logged = false;
+        loop {
+            match AsyncClient::connect(addr).await {
+                Ok(client) => return Ok(Self { client }),
+                Err(rhypedb_client::Error::Connect(e)) if tokio::time::Instant::now() + delay < deadline => {
+                    if !logged {
+                        tracing::info!(%addr, error = %e, "rhypedb is not accepting connections yet; waiting");
+                        logged = true;
+                    }
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(std::time::Duration::from_secs(2));
+                }
+                Err(e) => return Err(CloudError::Internal(format!("connecting to rhypedb at {addr}: {e}"))),
+            }
+        }
     }
 
     async fn objects(&self, query: &str) -> CloudResult<Vec<Object>> {
@@ -1283,5 +1310,41 @@ impl RhypeDb {
             self.delete_invitation(invitation.rid).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A free loopback port: bound, read, released.
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    /// A database that starts listening a moment after the service is the
+    /// jkbase deployment case: the connect waits for it instead of failing.
+    #[tokio::test]
+    async fn connect_waits_for_a_database_that_is_still_starting() {
+        let addr = format!("127.0.0.1:{}", free_port());
+        let listen_at = addr.clone();
+        let listener = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let listener = tokio::net::TcpListener::bind(&listen_at).await.unwrap();
+            let _held = listener.accept().await.unwrap();
+        });
+        RhypeDb::connect_waiting(&addr, Duration::from_secs(10)).await.expect("connected once the database listened");
+        listener.await.unwrap();
+    }
+
+    /// Nothing ever listening is still an error, once the wait is over.
+    #[tokio::test]
+    async fn connect_gives_up_after_the_wait() {
+        let addr = format!("127.0.0.1:{}", free_port());
+        let started = std::time::Instant::now();
+        let err = RhypeDb::connect_waiting(&addr, Duration::from_millis(500)).await.err().expect("nothing listens");
+        assert!(err.to_string().contains(&format!("connecting to rhypedb at {addr}")), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5), "gave up late: {:?}", started.elapsed());
     }
 }
