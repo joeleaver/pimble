@@ -2,11 +2,58 @@
 //!
 //! Entry point for the Rinch-based desktop application. Everything it draws and
 //! everything it talks to lives in the `pimble_app` library beside it; this file
-//! only starts the logger and opens the window. The library's `native` feature
-//! (which this binary requires) is what brings in the embedded server, the tokio
-//! backend thread and the desktop shell.
+//! only reads the command line, starts the logger and opens the window. The
+//! library's `native` feature (which this binary requires) is what brings in the
+//! embedded server, the tokio backend thread and the desktop shell.
+
+use rinch::prelude::Renderer;
+
+const USAGE: &str = "\
+Usage: pimble [--cpu | --renderer <auto|gpu|cpu>]
+
+  --renderer auto   draw on the GPU, and with the CPU if the GPU will not start (the default)
+  --renderer gpu    draw on the GPU, and stop if it will not start
+  --renderer cpu    draw with the CPU (software rendering)
+  --cpu             the same as --renderer cpu
+
+The RINCH_RENDERER environment variable (auto, gpu, cpu) overrides the flag.";
+
+/// The renderer the command line asks for, or the message to exit with.
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Renderer, String> {
+    let mut renderer = Renderer::Auto;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let value = match arg.as_str() {
+            "--cpu" => {
+                renderer = Renderer::Software;
+                continue;
+            }
+            "--renderer" => args.next().ok_or("--renderer needs a value")?,
+            "-h" | "--help" => return Err(String::new()),
+            other => match other.strip_prefix("--renderer=") {
+                Some(value) => value.to_string(),
+                None => return Err(format!("unrecognised argument: {other}")),
+            },
+        };
+        renderer = Renderer::parse(&value)
+            .ok_or_else(|| format!("unknown renderer {value:?}; use auto, gpu or cpu"))?;
+    }
+    Ok(renderer)
+}
 
 fn main() {
+    let renderer = match parse_args(std::env::args().skip(1)) {
+        Ok(renderer) => renderer,
+        Err(message) => {
+            if message.is_empty() {
+                println!("{USAGE}");
+                return;
+            }
+            eprintln!("pimble: {message}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -18,7 +65,37 @@ fn main() {
     tracing::info!("Starting Pimble with Rinch...");
 
     // Run the application
-    pimble_app::app::run();
+    pimble_app::app::run(renderer);
+}
+
+#[cfg(test)]
+mod args_tests {
+    use super::{Renderer, parse_args};
+
+    fn parse(args: &[&str]) -> Result<Renderer, String> {
+        parse_args(args.iter().map(|a| a.to_string()))
+    }
+
+    #[test]
+    fn no_arguments_mean_auto() {
+        assert_eq!(parse(&[]), Ok(Renderer::Auto));
+    }
+
+    #[test]
+    fn cpu_and_renderer_choose_the_renderer() {
+        assert_eq!(parse(&["--cpu"]), Ok(Renderer::Software));
+        assert_eq!(parse(&["--renderer", "gpu"]), Ok(Renderer::Gpu));
+        assert_eq!(parse(&["--renderer=cpu"]), Ok(Renderer::Software));
+        assert_eq!(parse(&["--renderer=auto"]), Ok(Renderer::Auto));
+    }
+
+    #[test]
+    fn a_bad_argument_is_an_error_with_a_reason() {
+        assert!(parse(&["--renderer"]).unwrap_err().contains("needs a value"));
+        assert!(parse(&["--renderer", "vulkan"]).unwrap_err().contains("unknown renderer"));
+        assert!(parse(&["--fast"]).unwrap_err().contains("unrecognised argument"));
+        assert_eq!(parse(&["--help"]), Err(String::new()));
+    }
 }
 
 #[cfg(test)]

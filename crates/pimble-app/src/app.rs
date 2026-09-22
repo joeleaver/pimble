@@ -3934,9 +3934,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
 }
 
 /// Open the desktop window: the same UI [`build_view`] builds, wrapped in a
-/// native menu bar, the borderless window and the saved theme.
+/// native menu bar, the borderless window and the saved theme. `renderer` is
+/// the GPU with a fall back to software unless the command line chose
+/// (`pimble --cpu`); `RINCH_RENDERER` overrides either.
 #[cfg(feature = "native")]
-pub fn run() {
+pub fn run(renderer: Renderer) {
     use std::sync::Arc;
 
     let (store, app_component) = build_view();
@@ -3986,6 +3988,7 @@ pub fn run() {
         .window_props(props)
         .theme(theme)
         .menu(menus)
+        .renderer(renderer)
         .run();
 
     EVENT_PROCESSOR.with(|cell| {
