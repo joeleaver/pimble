@@ -804,3 +804,153 @@ async fn a_returned_node_says_what_its_caller_may_change_of_it() {
     let wire = serde_json::to_value(s.admin.get_node(store_id, read_doc).await.unwrap()).unwrap();
     assert!(wire.get("access").is_none(), "{wire}");
 }
+
+// ── docs/MOVE_CONTRACT.md, wave 2: transplantNode and listDeleted ────────
+
+/// Two plain stores on one server, and the service client used to set them
+/// up: `transplantNode`'s "between stores" half needs two, unlike
+/// [`SharedStore`]'s one.
+struct TwoStores {
+    _server: PimbleServer,
+    _dir: tempfile::TempDir,
+    admin: PimbleClient,
+    sk: SigningKey,
+    issuer: &'static str,
+    url: String,
+    store_a: pimble_core::StoreId,
+    root_a: pimble_core::NodeId,
+    store_b: pimble_core::StoreId,
+    root_b: pimble_core::NodeId,
+}
+
+async fn two_stores() -> TwoStores {
+    let sk = signing_key();
+    let jwks_url = spawn_jwks(&sk, "kid-1").await;
+    let issuer = "https://issuer.example/v1";
+    let server = start_jwt_server("admin-secret", &jwks_url, issuer, Vec::new()).await;
+    let url = format!("http://{}", server.addr());
+    let admin = PimbleClient::connect_with_auth(&url, &AuthMethod::Bearer { token: "admin-secret".into() }).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (store_a, root_a) = admin.create_store(dir.path().join("a.pimble"), "A").await.unwrap();
+    let (store_b, root_b) = admin.create_store(dir.path().join("b.pimble"), "B").await.unwrap();
+    TwoStores { _server: server, _dir: dir, admin, sk, issuer, url, store_a, root_a, store_b, root_b }
+}
+
+/// A transplant between two plain stores lands with the text intact, the
+/// source tombstoned and found through `listDeleted`
+/// (docs/MOVE_CONTRACT.md "Between stores").
+#[tokio::test]
+async fn transplant_node_between_two_plain_stores_carries_the_text_and_tombstones_the_source() {
+    let t = two_stores().await;
+    let note = t.admin.create_node(t.store_a, Some(t.root_a), "document", "Note").await.unwrap();
+    t.admin.apply_edit(t.store_a, note, "admin", edit_of("packed and ready")).await.unwrap();
+    let inbox = t.admin.create_node(t.store_b, Some(t.root_b), "folder", "Inbox").await.unwrap();
+
+    let answer = t.admin.transplant_node(t.store_a, note, t.store_b, inbox, None).await.expect("a transplant between two plain stores");
+    assert_ne!(answer.node_id, note, "the note lands under a new id");
+    assert!(answer.left_shares.is_empty(), "neither store had a share in play");
+    let new_note = answer.node_id;
+
+    let landed = t.admin.get_node(t.store_b, new_note).await.expect("the note is in the target store");
+    assert_eq!(pimble_crdt::NodeDoc::text_of(&landed.content), "packed and ready", "the text is intact");
+    assert_eq!(landed.parent_id, Some(inbox));
+
+    assert!(t.admin.get_node(t.store_a, note).await.is_err(), "the source is gone");
+    let deleted = t.admin.list_deleted(t.store_a).await.unwrap();
+    assert!(deleted.iter().any(|d| d.node.id == note && d.deleted_at.is_some()), "and listed as a tombstone on the source");
+}
+
+/// The same store on both sides is a `moveNode`, answered as one
+/// (docs/MOVE_CONTRACT.md "Between stores").
+#[tokio::test]
+async fn transplant_node_between_the_same_store_answers_like_move_node() {
+    let t = two_stores().await;
+    let note = t.admin.create_node(t.store_a, Some(t.root_a), "document", "Note").await.unwrap();
+    let folder = t.admin.create_node(t.store_a, Some(t.root_a), "folder", "Folder").await.unwrap();
+
+    let answer = t.admin.transplant_node(t.store_a, note, t.store_a, folder, None).await.expect("same store, answered as a move");
+    assert_eq!(answer.node_id, note, "no share to leave here: a plain move keeps the id");
+    assert_eq!(t.admin.get_node(t.store_a, note).await.unwrap().parent_id, Some(folder));
+}
+
+/// A reader on either side refuses `transplantNode` with the reader's
+/// sentence, as `moveNode` is refused today.
+#[tokio::test]
+async fn transplant_node_is_refused_without_write_on_either_side() {
+    let t = two_stores().await;
+    let note = t.admin.create_node(t.store_a, Some(t.root_a), "document", "Note").await.unwrap();
+    let inbox = t.admin.create_node(t.store_b, Some(t.root_b), "folder", "Inbox").await.unwrap();
+
+    let mut roles = HashMap::new();
+    roles.insert(t.store_a, "reader");
+    roles.insert(t.store_b, "editor");
+    let jwt = make_jwt(&t.sk, "kid-1", t.issuer, "r1", "r1@example.com", &roles, 3600);
+    let reader_of_a = PimbleClient::connect_with_auth(&t.url, &AuthMethod::Bearer { token: jwt }).await.unwrap();
+    refused_as_read_only(reader_of_a.transplant_node(t.store_a, note, t.store_b, inbox, None).await, "a reader of the source store");
+
+    let mut roles = HashMap::new();
+    roles.insert(t.store_a, "editor");
+    roles.insert(t.store_b, "reader");
+    let jwt = make_jwt(&t.sk, "kid-1", t.issuer, "r2", "r2@example.com", &roles, 3600);
+    let reader_of_b = PimbleClient::connect_with_auth(&t.url, &AuthMethod::Bearer { token: jwt }).await.unwrap();
+    refused_as_read_only(reader_of_b.transplant_node(t.store_a, note, t.store_b, inbox, None).await, "a reader of the target store");
+
+    assert!(t.admin.get_node(t.store_a, note).await.is_ok(), "nothing refused changed the source");
+    assert_eq!(t.admin.get_children(t.store_b, inbox).await.unwrap().1.len(), 0, "nor planted anything in the target");
+}
+
+/// `listDeleted` judges like `getChildren`: a scoped member sees only their
+/// scope's tombstones (docs/MOVE_CONTRACT.md "Seeing and undoing what was
+/// removed").
+#[tokio::test]
+async fn list_deleted_shows_a_scoped_members_scope_only() {
+    let s = SharedStore::start().await;
+    let (store_id, shared, inside, outside) = (s.store_id, s.shared, s.inside, s.outside);
+    s.admin.delete_node(store_id, inside).await.unwrap();
+    s.admin.delete_node(store_id, outside).await.unwrap();
+
+    let member = s.member("eve", &[(shared, "editor")]).await;
+    let seen = member.list_deleted(store_id).await.unwrap();
+    assert_eq!(seen.iter().map(|d| d.node.id).collect::<Vec<_>>(), vec![inside], "only the scope's own tombstone");
+    assert_eq!(seen[0].parent_title.as_deref(), Some("Shared"), "the folder it was in, when that is held here");
+
+    let admin_seen = s.admin.list_deleted(store_id).await.unwrap();
+    let ids: std::collections::HashSet<_> = admin_seen.iter().map(|d| d.node.id).collect();
+    assert!(ids.contains(&inside) && ids.contains(&outside), "the owner sees both: {ids:?}");
+}
+
+/// "Put Back" (docs/MOVE_CONTRACT.md "Seeing and undoing what was
+/// removed"): a live node no held list names but whose `parent_id` still
+/// says a scope this principal may write is still theirs to move — there
+/// is no list for the move to leave, so only the node and the new parent
+/// are judged.
+#[tokio::test]
+async fn put_back_of_a_node_no_list_names_succeeds_for_an_editor_of_its_scope() {
+    let s = SharedStore::start().await;
+    let (store_id, shared, inside) = (s.store_id, s.shared, s.inside);
+
+    // A tampered client that unlists a node without moving it
+    // (docs/MOVE_CONTRACT.md "Repair", "a tampered client that also
+    // unlists X"): `inside`'s `parent_id` still says `shared`, but no list
+    // holds it any more.
+    let shared_bytes = s.admin.get_node(store_id, shared).await.unwrap().content;
+    let mut shared_doc = pimble_crdt::NodeDoc::load(&shared_bytes).unwrap();
+    let before_sv = shared_doc.state_vector();
+    shared_doc.remove_child(inside).unwrap();
+    let diff = shared_doc.diff_since(&before_sv).unwrap();
+    s.admin
+        .apply_edit(
+            store_id,
+            shared,
+            "tamperer",
+            pimble_rpc::EditOperation::IncrementalChanges { changes: base64::engine::general_purpose::STANDARD.encode(diff) },
+        )
+        .await
+        .unwrap();
+    assert!(s.admin.get_children(store_id, shared).await.unwrap().1.is_empty(), "no list names it any more");
+
+    let member = s.member("fay", &[(shared, "editor")]).await;
+    let answer = member.move_node(store_id, inside, shared, None).await.expect("an editor puts an unlisted node of their scope back");
+    assert_eq!(answer.node_id, inside, "putting it back under the same scope is a plain move, not a transplant");
+    assert_eq!(member.get_children(store_id, shared).await.unwrap().1.iter().map(|n| n.id).collect::<Vec<_>>(), vec![inside]);
+}

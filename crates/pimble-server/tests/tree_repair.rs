@@ -8,8 +8,10 @@
 
 use std::time::Duration;
 
-use pimble_core::{AuthMethod, NodeId, RemoteEndpoint, StoreId, SyncState};
+use base64::Engine;
+use pimble_core::{AuthMethod, Node, NodeId, RemoteEndpoint, ShareMarker, StoreId, SyncState};
 use pimble_server::{PimbleServer, ServerConfig};
+use pimble_store::LocalStore;
 
 /// Poll `cond` every 50ms until it returns `true` or `timeout` elapses.
 /// Returns whether it converged in time.
@@ -217,4 +219,86 @@ async fn deleting_a_folder_tombstones_its_subtree_and_keeps_the_documents() {
 
     let (_, root_children) = client.get_children(store_id, root_id).await.unwrap();
     assert!(root_children.iter().all(|n| n.id != folder_id));
+}
+
+// ── docs/MOVE_CONTRACT.md, wave 2: the "list wins" rule on a partial replica ──
+
+/// A partial replica of one store: one scope root, marked as a share (so
+/// the "list wins" repair rule, docs/MOVE_CONTRACT.md "Repair", has a
+/// share to judge by), listing one child.
+async fn partial_replica_with_shared_child(dir: &std::path::Path) -> (StoreId, NodeId, NodeId) {
+    let mut owner = LocalStore::create(dir.join("owner.pimble"), "Owner").await.unwrap();
+    let root = owner.root_node_id();
+    let mut folder = Node::folder("Shared");
+    folder.metadata.set_share(Some(&ShareMarker {
+        v: ShareMarker::VERSION,
+        key_id: uuid::Uuid::new_v4(),
+        url: "https://pimble.app".into(),
+        name: "Shared".into(),
+    }));
+    let (scope_root, _) = owner.create_node(folder, Some(root)).unwrap();
+    let (child, _) = owner.create_node(Node::document("Child"), Some(scope_root)).unwrap();
+
+    let path = dir.join("partial.pimble");
+    let mut partial = LocalStore::create_replica_with_scope(&path, owner.id, "Shared", scope_root, vec![scope_root]).await.unwrap();
+    for id in [scope_root, child] {
+        partial.apply_node_update(id, &owner.tree().doc(id).unwrap().save()).unwrap();
+    }
+    partial.flush().await.unwrap();
+    (owner.id, scope_root, child)
+}
+
+/// A partial replica keeps the "list wins" rule that closes the
+/// vandalism hole (docs/MOVE_CONTRACT.md "Repair"): a tampered client
+/// writes a `parent_id` that would take a node out of its share, with no
+/// list update to match. The replica holds nothing of where that
+/// `parent_id` points — the ordinary case, since a member's replica never
+/// holds what is outside its own scope — so repair, acting on knowledge
+/// only, leaves it exactly where the list says it is rather than adopting
+/// a guess: the folder never stops naming it.
+#[tokio::test]
+async fn a_partial_replicas_tampered_parent_id_never_unlists_a_node_its_folder_still_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store_id, scope_root, child) = partial_replica_with_shared_child(dir.path()).await;
+
+    let mut server = PimbleServer::with_config(ServerConfig { addr: "127.0.0.1:0".parse().unwrap(), ..Default::default() });
+    server.start().await.expect("server starts");
+    let client = pimble_client::PimbleClient::connect(format!("http://{}", server.addr())).await.expect("client connects");
+    let opened = client.open_store(dir.path().join("partial.pimble")).await.expect("the partial replica opens");
+    assert_eq!(opened.roots, vec![scope_root]);
+    assert_eq!(client.get_children(store_id, scope_root).await.unwrap().1.iter().map(|n| n.id).collect::<Vec<_>>(), vec![child]);
+
+    // The tamper: `child`'s own document gets a `parent_id` naming a node
+    // this replica holds nothing of, with the folder's list left as it
+    // was — exactly what a client that does not keep the rule would write.
+    let bytes = client.get_node(store_id, child).await.unwrap().content;
+    let mut doc = pimble_crdt::NodeDoc::load(&bytes).unwrap();
+    let before_sv = doc.state_vector();
+    doc.set_parent_id(Some(NodeId::new()), &chrono::Utc::now().to_rfc3339()).unwrap();
+    let diff = doc.diff_since(&before_sv).unwrap();
+    client
+        .apply_edit(
+            store_id,
+            child,
+            "tamperer",
+            pimble_rpc::EditOperation::IncrementalChanges { changes: base64::engine::general_purpose::STANDARD.encode(diff) },
+        )
+        .await
+        .expect("the merge itself is unconditional; only repair judges the result");
+
+    // Repair runs on a debounce after a structural merge; give it time,
+    // then confirm nothing was lost.
+    let settled = wait_until(Duration::from_secs(5), || async {
+        let listed = client.get_children(store_id, scope_root).await.map(|(_, c)| c.iter().map(|n| n.id).collect::<Vec<_>>()).unwrap_or_default();
+        listed == vec![child] && validate_tree(&server, store_id).await.is_empty()
+    })
+    .await;
+    assert!(settled, "the folder still lists the child, and there is nothing left for repair to report");
+    assert_eq!(
+        client.get_children(store_id, scope_root).await.unwrap().1.iter().map(|n| n.id).collect::<Vec<_>>(),
+        vec![child],
+        "never unlisted"
+    );
+
+    server.stop().await.unwrap();
 }

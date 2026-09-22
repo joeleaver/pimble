@@ -9,8 +9,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use pimble_core::{Node, NodeId, NodeMetadata, RemoteEndpoint, StoreAccess, StoreId, StoreManifest};
-use pimble_crdt::{NodeDoc, NodeUpdateEffect, StoreDocument, Tree, TreeEdit};
+use pimble_core::{LeftShare, Node, NodeId, NodeMetadata, RemoteEndpoint, StoreAccess, StoreId, StoreManifest};
+use pimble_crdt::{Cutting, NodeDoc, NodeUpdateEffect, StoreDocument, Tree, TreeEdit};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tracing::{debug, info, warn};
@@ -923,6 +923,43 @@ impl LocalStore {
         self.assemble_node(node_id)
     }
 
+    /// [`LocalStore::get_node`], but for a tombstone too
+    /// (docs/MOVE_CONTRACT.md "Seeing and undoing what was removed":
+    /// `listDeleted` reads a tombstone's fields and content the same way it
+    /// reads a live node's). Its children come straight off the document,
+    /// unrepaired: `Tree::get_children` refuses anything it does not
+    /// consider a node, and a tombstone's list is exactly what
+    /// `undeleteNode` restores, entries it does not hold included.
+    pub fn get_node_any(&self, node_id: NodeId) -> Result<Node> {
+        if self.tree.has_node(node_id) {
+            return self.assemble_node(node_id);
+        }
+        let doc = self.tree.doc(node_id).ok_or(StoreError::NodeNotFound(node_id))?;
+        let fields = doc.fields().map_err(|_| StoreError::NodeNotFound(node_id))?;
+        let created_at = DateTime::parse_from_rfc3339(&fields.created_at)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        let modified_at = DateTime::parse_from_rfc3339(&fields.modified_at)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        Ok(Node {
+            id: node_id,
+            parent_id: fields.parent_id,
+            node_type: fields.node_type,
+            metadata: NodeMetadata {
+                title: fields.title,
+                created_at,
+                modified_at,
+                tags: fields.tags,
+                custom: fields.custom,
+            },
+            content: doc.save(),
+            children: doc.children(),
+            links: Vec::new(),
+            access: StoreAccess::Full,
+        })
+    }
+
     /// Create a node under `parent_id` (the root when `None`), returning its
     /// id and the edit: the node's own document (its `node` root, then its
     /// content, tags and custom if any) and the parent's children list.
@@ -991,10 +1028,15 @@ impl LocalStore {
         Ok(edit)
     }
 
-    /// Move a node to a new parent, optionally at a specific position. The
-    /// edit names the old parent's list, the new parent's, and the node's
-    /// own `parent_id`.
-    pub fn move_node(&mut self, node_id: NodeId, new_parent_id: NodeId, position: Option<usize>) -> Result<TreeEdit> {
+    /// Move a node to a new parent, optionally at a specific position,
+    /// deciding a plain move or a transplant as every caller must
+    /// (docs/MOVE_CONTRACT.md "The rule"; `Tree::move_or_transplant`, a
+    /// fresh id per document a transplant creates). Answers the id the node
+    /// has now (`node_id` after a plain move, the new root's after a
+    /// transplant) and the shares the move left, read off `Tree::shares_left`
+    /// before the edit — a transplant strips every marker as it recreates
+    /// the subtree, so the shares must be named from the tree as it was.
+    pub fn move_node(&mut self, node_id: NodeId, new_parent_id: NodeId, position: Option<usize>) -> Result<(NodeId, Vec<LeftShare>, TreeEdit)> {
         if node_id == self.root_node_id() {
             return Err(StoreError::InvalidOperation("Cannot move the root node".into()));
         }
@@ -1007,17 +1049,75 @@ impl LocalStore {
         if !self.tree.has_node(new_parent_id) {
             return Err(StoreError::NodeNotFound(new_parent_id));
         }
-        // A move under one's own descendant: `Tree::move_node` refuses it
-        // too, but as a crdt error; here it is the invalid operation it is.
+        // A move under one's own descendant: `Tree::move_or_transplant`
+        // refuses it too, but as a crdt error; here it is the invalid
+        // operation it is.
         if self.tree.subtree_ids(node_id).map_err(StoreError::from)?.contains(&new_parent_id) {
             return Err(StoreError::InvalidOperation(
                 "Cannot move a node into one of its own descendants".into(),
             ));
         }
 
-        let edit = self.tree.move_node(node_id, new_parent_id, position, &now()).map_err(StoreError::from)?;
+        let left_shares = self.left_shares(node_id, new_parent_id);
+        let (new_id, edit) = self
+            .tree
+            .move_or_transplant(node_id, new_parent_id, position, &now(), &mut NodeId::new)
+            .map_err(StoreError::from)?;
         self.mark_edit_dirty(&edit);
-        Ok(edit)
+        Ok((new_id, left_shares, edit))
+    }
+
+    /// The shares moving `node_id` under `new_parent_id` would leave
+    /// (`Tree::shares_left`), named for `MoveNodeResponse`/
+    /// `TransplantNodeResponse` (docs/MOVE_CONTRACT.md): each root's
+    /// display name off its `ShareMarker`, or its title when the marker
+    /// does not parse.
+    fn left_shares(&self, node_id: NodeId, new_parent_id: NodeId) -> Vec<LeftShare> {
+        self.tree.shares_left(node_id, new_parent_id).into_iter().map(|root| LeftShare { root, name: self.share_name(root) }).collect()
+    }
+
+    /// Every share `node_id` is in, named the same way as [`LocalStore::left_shares`]:
+    /// what a cross-store transplant leaves (docs/MOVE_CONTRACT.md "Between
+    /// stores"), since two stores hold different documents and no marker
+    /// ever crosses, so a node landing in another store leaves every share
+    /// it was in here, not just the ones a same-store move would.
+    pub fn shares_of(&self, node_id: NodeId) -> Vec<LeftShare> {
+        self.tree.shares(node_id).into_iter().map(|root| LeftShare { root, name: self.share_name(root) }).collect()
+    }
+
+    /// `root`'s `ShareMarker.name`, or its title when the document is not
+    /// held, carries no marker, or the marker does not parse — a share is
+    /// still worth naming in a notice even from a stale or partial read.
+    fn share_name(&self, root: NodeId) -> String {
+        let fields = self.tree.doc(root).and_then(|doc| doc.fields().ok());
+        let marker = fields
+            .as_ref()
+            .and_then(|f| f.custom.get(pimble_core::custom_keys::SHARE))
+            .and_then(|v| serde_json::from_value::<pimble_core::ShareMarker>(v.clone()).ok());
+        match marker {
+            Some(marker) => marker.name,
+            None => fields.map(|f| f.title).unwrap_or_default(),
+        }
+    }
+
+    /// The first half of a transplant to another store
+    /// (docs/MOVE_CONTRACT.md "Between stores"): `node_id`'s live subtree
+    /// read out as data, ready to [`LocalStore::plant_cutting`] elsewhere
+    /// and then be removed here with [`LocalStore::delete_node`]. See
+    /// `Tree::take_cutting`.
+    pub fn take_cutting(&self, node_id: NodeId) -> Result<Cutting> {
+        self.tree.take_cutting(node_id).map_err(StoreError::from)
+    }
+
+    /// The second half: plant `cutting` under `new_parent_id` here, at
+    /// `position`, with a fresh id per node. See `Tree::plant`.
+    pub fn plant_cutting(&mut self, cutting: Cutting, new_parent_id: NodeId, position: Option<usize>) -> Result<(NodeId, TreeEdit)> {
+        if !self.tree.has_node(new_parent_id) {
+            return Err(StoreError::NodeNotFound(new_parent_id));
+        }
+        let (new_root, edit) = self.tree.plant(cutting, new_parent_id, position, &now(), &mut NodeId::new).map_err(StoreError::from)?;
+        self.mark_edit_dirty(&edit);
+        Ok((new_root, edit))
     }
 
     /// Merge `content`, a node document snapshot (or any update to one),
@@ -1337,7 +1437,9 @@ mod tests {
         let (folder_b_id, _) = store.create_node(Node::folder("B"), Some(root_id)).unwrap();
         let (doc_id, _) = store.create_node(Node::document("Doc"), Some(folder_a_id)).unwrap();
 
-        let edit = store.move_node(doc_id, folder_b_id, None).unwrap();
+        let (new_id, left_shares, edit) = store.move_node(doc_id, folder_b_id, None).unwrap();
+        assert_eq!(new_id, doc_id, "a plain move keeps the node's id");
+        assert!(left_shares.is_empty(), "no share is in play here");
         let touched: HashSet<NodeId> = edit.node_ids().into_iter().collect();
         assert_eq!(touched, HashSet::from([folder_a_id, folder_b_id, doc_id]));
 

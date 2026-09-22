@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use pimble_core::{MountRef, Node, NodeId, NodeMetadata, Store, StoreId, StoreKind, StoreLocation, SyncState};
+use pimble_core::{LeftShare, MountRef, Node, NodeId, NodeMetadata, Store, StoreId, StoreKind, StoreLocation, SyncState};
 use pimble_crdt::{NodeDoc, NodeUpdateEffect, Tree, TreeEdit};
 use tracing::info;
 
@@ -14,6 +14,20 @@ use crate::error::{Result, StoreError};
 use crate::local::{peek_manifest_kind, LocalStore, NodeRemoval, SyncConfig};
 use crate::registry::{StoreEndpoint, StoreRegistry};
 use crate::vault::{DocKeys, VaultDocSummary, VaultStore};
+
+/// What [`StoreManager::transplant_node`] did (docs/MOVE_CONTRACT.md
+/// "Between stores"): the new root's id in the target store, the shares the
+/// node left in the source, and one [`TreeEdit`] per store, since a
+/// transplant between stores is two documents' worth of writes, never one.
+pub struct TransplantOutcome {
+    pub new_node_id: NodeId,
+    pub left_shares: Vec<LeftShare>,
+    /// What the source's `delete_node` tombstoned: the parent the node was
+    /// removed from and its whole subtree, preorder.
+    pub source_removal: NodeRemoval,
+    pub source_edit: TreeEdit,
+    pub target_edit: TreeEdit,
+}
 
 /// Manages multiple open stores
 pub struct StoreManager {
@@ -471,6 +485,12 @@ impl StoreManager {
         self.local(store_id)?.get_node(node_id)
     }
 
+    /// [`StoreManager::get_node`], but for a tombstone too (see
+    /// [`LocalStore::get_node_any`]).
+    pub fn get_node_any(&self, store_id: StoreId, node_id: NodeId) -> Result<Node> {
+        self.local(store_id)?.get_node_any(node_id)
+    }
+
     /// Bring a node's title, tags and custom fields to `metadata` (the
     /// whole metadata; a custom key absent from it is removed). See
     /// [`LocalStore::update_node_metadata`].
@@ -495,11 +515,41 @@ impl StoreManager {
         store.create_node(node, parent_id)
     }
 
-    /// Move a node to a new parent in a store. The edit names the old
-    /// parent's list, the new parent's and the node itself; a caller that
-    /// wants the old parent for a notification reads it off the tree first.
-    pub fn move_node(&mut self, store_id: StoreId, node_id: NodeId, new_parent_id: NodeId, position: Option<usize>) -> Result<TreeEdit> {
+    /// Move a node to a new parent in a store, deciding a plain move or a
+    /// transplant as `LocalStore::move_node` does (docs/MOVE_CONTRACT.md
+    /// "The rule"). Answers the id the node has now, the shares it left,
+    /// and the edit; a caller that wants the old parent for a notification
+    /// reads it off the tree first.
+    pub fn move_node(&mut self, store_id: StoreId, node_id: NodeId, new_parent_id: NodeId, position: Option<usize>) -> Result<(NodeId, Vec<LeftShare>, TreeEdit)> {
         self.local_mut(store_id)?.move_node(node_id, new_parent_id, position)
+    }
+
+    /// Move a node into another store (docs/MOVE_CONTRACT.md "Between
+    /// stores"): always a transplant, since two stores hold different
+    /// documents. `take_cutting` on the source, `plant_cutting` on the
+    /// target, then the source's subtree tombstoned with `delete_node` —
+    /// created first, deleted second, so a failure between the two leaves
+    /// both, never neither. A mount node has no children of its own, so
+    /// planting under one is rejected exactly as `create_node` rejects
+    /// creating under one.
+    pub fn transplant_node(
+        &mut self,
+        from_store_id: StoreId,
+        node_id: NodeId,
+        to_store_id: StoreId,
+        new_parent_id: NodeId,
+        position: Option<usize>,
+    ) -> Result<TransplantOutcome> {
+        let target_parent = self.local(to_store_id)?.tree().get_node_info(new_parent_id).map_err(|_| StoreError::NodeNotFound(new_parent_id))?;
+        if target_parent.node_type == pimble_core::node_types::MOUNT {
+            return Err(StoreError::MountHasNoChildren { node_id: new_parent_id });
+        }
+
+        let left_shares = self.local(from_store_id)?.shares_of(node_id);
+        let cutting = self.local(from_store_id)?.take_cutting(node_id)?;
+        let (new_node_id, target_edit) = self.local_mut(to_store_id)?.plant_cutting(cutting, new_parent_id, position)?;
+        let (source_removal, source_edit) = self.local_mut(from_store_id)?.delete_node(node_id)?;
+        Ok(TransplantOutcome { new_node_id, left_shares, source_removal, source_edit, target_edit })
     }
 
     /// Delete a node and its subtree from a store: every member becomes a
@@ -1104,7 +1154,7 @@ mod tests {
         relay(&mut manager, &edit);
         let (folder_id, edit) = manager.create_node(store_id, Node::folder("Folder"), None).unwrap();
         relay(&mut manager, &edit);
-        let edit = manager.move_node(store_id, doc_id, folder_id, Some(0)).unwrap();
+        let (_, _, edit) = manager.move_node(store_id, doc_id, folder_id, Some(0)).unwrap();
         relay(&mut manager, &edit);
         let mut metadata = manager.get_node(store_id, doc_id).unwrap().metadata;
         metadata.title = "Renamed".into();

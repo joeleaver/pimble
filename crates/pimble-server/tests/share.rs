@@ -1142,23 +1142,124 @@ async fn a_node_moved_into_a_share_reaches_its_member_and_one_moved_out_stops_ar
     seed_content(&bob, store_id, sums, "bob", "and a contingency").await;
     assert!(wait_until(Duration::from_secs(10), || async { node_text(&alice, store_id, sums).await.contains("and a contingency") }).await, "which they edit like the rest");
 
-    // Out: the list the member holds stops naming it, the scope stops
-    // holding it, and nothing about it arrives any more.
-    alice.move_node(store_id, fx.inside, fx.root_id, None).await.unwrap();
-    let out = wait_until(Duration::from_secs(15), || async { env.scope_on_h(store_id, shared).await.is_some_and(|docs| !docs.contains(&fx.inside)) }).await;
-    assert!(out, "a document leaving the share leaves its scope");
-    assert!(wait_until(Duration::from_secs(10), || async { child_ids(&bob, store_id, shared).await == vec![fx.deeper, budget] }).await);
-    seed_content(&alice, store_id, fx.inside, "alice", "AFTER-MOVING-OUT").await;
-    rename(&alice, store_id, fx.inside, "Private packing").await;
-    let pushed = wait_until(Duration::from_secs(10), || async { env.head_on_h(store_id, fx.inside).await >= 5 }).await;
-    assert!(pushed, "the owner's later edits are hosted as ever");
+    // Out: leaving the share is a transplant (docs/MOVE_CONTRACT.md): the
+    // original stays in the share's scope, a tombstone any member can undo,
+    // while a new node with a new id and no share-key wrap lands in the
+    // owner's private tree. Nothing ever leaves a scope while its share
+    // stands, so the member's list stops naming it without the scope itself
+    // shrinking.
+    let moved = alice.move_node(store_id, fx.inside, fx.root_id, None).await.unwrap();
+    let new_inside = moved.node_id;
+    assert_ne!(new_inside, fx.inside, "the node that leaves the share gets a new id");
+    assert_eq!(
+        moved.left_shares.iter().map(|s| (s.root, s.name.as_str())).collect::<Vec<_>>(),
+        vec![(shared, "Holiday Plans")],
+        "it answers which share it left"
+    );
+    let still_scoped = wait_until(Duration::from_secs(15), || async { env.scope_on_h(store_id, shared).await.is_some_and(|docs| docs.contains(&fx.inside)) }).await;
+    assert!(still_scoped, "the tombstone stays in the share's scope: nothing ever leaves a scope while its share stands");
+    assert!(
+        wait_until(Duration::from_secs(10), || async { child_ids(&bob, store_id, shared).await == vec![fx.deeper, budget] }).await,
+        "but the member's list no longer names it"
+    );
+    let never_wrapped = wait_until(Duration::from_secs(15), || async { env.wrap_key_ids(store_id, new_inside).await == vec![store_key_id] }).await;
+    assert!(never_wrapped, "the new private node has no wrap under the share's key");
+
+    seed_content(&alice, store_id, new_inside, "alice", "AFTER-MOVING-OUT").await;
+    rename(&alice, store_id, new_inside, "Private packing").await;
+    let pushed = wait_until(Duration::from_secs(10), || async { env.head_on_h(store_id, new_inside).await >= 1 }).await;
+    assert!(pushed, "the owner's later edits to the new, private node are hosted as ever");
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(!contains_bytes_recursive(b_dir.path(), b"AFTER-MOVING-OUT"), "and never reach the member");
-    assert_ne!(node_title(&bob, store_id, fx.inside).await, "Private packing");
+    assert!(bob.get_node(store_id, new_inside).await.is_err(), "the new private node was never in any share bob holds");
     assert_eq!(child_ids(&bob, store_id, shared).await, vec![fx.deeper, budget]);
+
+    // The member sees the original deleted and can put it back
+    // (docs/MOVE_CONTRACT.md "Seeing and undoing what was removed"): both
+    // notes then exist, side by side, the owner sees the same.
+    let seen_deleted = wait_until(Duration::from_secs(15), || async {
+        bob.list_deleted(store_id).await.unwrap_or_default().iter().any(|d| d.node.id == fx.inside && d.deleted_at.is_some())
+    })
+    .await;
+    assert!(seen_deleted, "the member finds the tombstone in Recently Deleted");
+    bob.undelete_node(store_id, fx.inside).await.expect("any editor of the share can put it back");
+    let restored = wait_until(Duration::from_secs(15), || async { child_ids(&bob, store_id, shared).await.contains(&fx.inside) }).await;
+    assert!(restored, "the note is back, alongside the new one that took its place outside");
+    let owner_sees_both = wait_until(Duration::from_secs(15), || async {
+        alice.get_node(store_id, fx.inside).await.is_ok() && alice.get_node(store_id, new_inside).await.is_ok()
+    })
+    .await;
+    assert!(owner_sees_both, "the owner sees the same two notes");
 
     a.stop().await.unwrap();
     b.stop().await.unwrap();
+}
+
+/// A member who holds two shares of one store moves a note from one into
+/// the other (docs/MOVE_CONTRACT.md, "Verification"): it leaves the first
+/// share, whose other member sees the note deleted, undoes it from
+/// "Recently Deleted...", and then both notes exist — the owner sees the
+/// same. The new document shares nothing with the old but its text.
+#[tokio::test]
+async fn a_member_who_holds_two_shares_moves_a_note_from_one_into_the_other() {
+    let env = spawn_env().await;
+    let (mut a, alice, a_dir) = start_local_server().await;
+    let fx = hosted_fixture(&env, &alice, a_dir.path()).await;
+    let (store_id, holiday) = (fx.store_id, fx.shared);
+
+    // A second share of the same store, disjoint from Holiday.
+    let errands = alice.create_node(store_id, Some(fx.root_id), "folder", "Errands").await.unwrap();
+    wait_all_seeded(&env, store_id, &[errands]).await;
+    alice.cloud_share_node(store_id, holiday, "Holiday Plans").await.unwrap();
+    alice.cloud_share_node(store_id, errands, "Errands").await.unwrap();
+    // Bob holds both shares; Carol holds only Holiday, the one the note leaves.
+    alice.cloud_share_invite(store_id, holiday, BOB.0, MemberRole::Editor).await.unwrap();
+    alice.cloud_share_invite(store_id, errands, BOB.0, MemberRole::Editor).await.unwrap();
+    alice.cloud_share_invite(store_id, holiday, CAROL.0, MemberRole::Editor).await.unwrap();
+
+    let (mut b, bob, _b_dir) = member_device(&env, BOB, &fx).await;
+    let pulled_errands = wait_until(Duration::from_secs(15), || async { bob.get_node(store_id, errands).await.is_ok() }).await;
+    assert!(pulled_errands, "bob's one replica pulled both shares at once");
+    let (mut c, carol, _c_dir) = member_device(&env, CAROL, &fx).await;
+
+    // Bob moves a note out of Holiday and into Errands: two shares of one
+    // store, so the note leaves Holiday (docs/MOVE_CONTRACT.md "The rule").
+    let moved = bob.move_node(store_id, fx.inside, errands, None).await.expect("a move between two shares of one store");
+    let new_inside = moved.node_id;
+    assert_ne!(new_inside, fx.inside, "the note that leaves Holiday gets a new id");
+    assert_eq!(moved.left_shares.iter().map(|s| s.root).collect::<Vec<_>>(), vec![holiday], "it names the share it left");
+
+    // Carol, Holiday's other member, sees the note deleted and puts it back.
+    let carol_sees_deleted = wait_until(Duration::from_secs(20), || async { carol.get_node(store_id, fx.inside).await.is_err() }).await;
+    assert!(carol_sees_deleted, "carol sees the note leave as a delete");
+    let carol_lists_it = wait_until(Duration::from_secs(15), || async {
+        carol.list_deleted(store_id).await.unwrap_or_default().iter().any(|d| d.node.id == fx.inside && d.deleted_at.is_some())
+    })
+    .await;
+    assert!(carol_lists_it, "and finds it in Recently Deleted");
+    carol.undelete_node(store_id, fx.inside).await.expect("carol, an editor of Holiday, puts it back");
+
+    // Both notes now exist, side by side, with the same text but no shared
+    // history: everyone who can reach them sees both.
+    let both_exist = wait_until(Duration::from_secs(20), || async {
+        bob.get_node(store_id, fx.inside).await.is_ok()
+            && bob.get_node(store_id, new_inside).await.is_ok()
+            && node_text(&bob, store_id, fx.inside).await.contains("socks and a map")
+            && node_text(&bob, store_id, new_inside).await.contains("socks and a map")
+    })
+    .await;
+    assert!(both_exist, "bob sees both notes, each with the packing list's text");
+    let owner_sees_both = wait_until(Duration::from_secs(15), || async {
+        alice.get_node(store_id, fx.inside).await.is_ok() && alice.get_node(store_id, new_inside).await.is_ok()
+    })
+    .await;
+    assert!(owner_sees_both, "the owner sees the same two notes");
+    assert!(child_ids(&carol, store_id, holiday).await.contains(&fx.inside), "restored under Holiday, where carol put it back");
+    assert!(child_ids(&bob, store_id, errands).await.contains(&new_inside), "the new one stayed under Errands");
+
+    a.stop().await.unwrap();
+    b.stop().await.unwrap();
+    c.stop().await.unwrap();
 }
 
 #[tokio::test]

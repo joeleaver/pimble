@@ -562,6 +562,28 @@ fn shape_of(tree: &Tree, id: NodeId) -> Option<DocShape> {
     tree.doc(id).map(|doc| DocShape { fields: doc.fields().ok(), children: doc.children() })
 }
 
+/// The scope root on `id`'s stored parent chain, nearest first, through
+/// held documents (tombstones included: a deleted document stays with its
+/// scope) — `listDeleted`'s `put_back_under` for a live node no list names
+/// (docs/MOVE_CONTRACT.md "Seeing and undoing what was removed"). `None`
+/// when `id` is not reached by any of `scope_roots` (a whole store, where
+/// `scope_roots` is empty, or a document outside every scope this replica
+/// holds). Bounded, so an unrepaired cycle cannot loop.
+fn scope_root_reaching(tree: &Tree, scope_roots: &HashSet<NodeId>, id: NodeId) -> Option<NodeId> {
+    let mut cur = id;
+    for _ in 0..=tree.ids().len() {
+        if scope_roots.contains(&cur) {
+            return Some(cur);
+        }
+        let fields = tree.doc(cur)?.fields().ok()?;
+        match fields.parent_id {
+            Some(parent) if tree.doc(parent).is_some() => cur = parent,
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// The notifications a merged update earns, from what it changed in the
 /// document (docs/NODE_DOCUMENT_CONTRACT.md section 2): the `node` root
 /// newly written is `NodeCreated` (or `NodeDeleted` when it arrived as a
@@ -1514,7 +1536,7 @@ impl RpcHandler {
         manager.flush(store_id).await.map_err(to_rpc_error)?;
         drop(manager);
 
-        self.broadcast_tree_edit(store_id, &edit, Some((node_id, StoreChangeKind::MetadataUpdated { node_id })), None).await;
+        self.broadcast_tree_edit(store_id, &edit, &[(node_id, StoreChangeKind::MetadataUpdated { node_id })], None).await;
         self.enqueue_index_event(store_id, IndexEvent::Upsert(node_id)).await;
         Ok(())
     }
@@ -2018,7 +2040,7 @@ impl RpcHandler {
         *self.flush_debouncer.scheduled.lock().unwrap() = false;
 
         for (store_id, node_id, edit) in stamped {
-            self.broadcast_tree_edit(store_id, &edit, Some((node_id, StoreChangeKind::MetadataUpdated { node_id })), None).await;
+            self.broadcast_tree_edit(store_id, &edit, &[(node_id, StoreChangeKind::MetadataUpdated { node_id })], None).await;
         }
     }
 
@@ -2064,17 +2086,21 @@ impl RpcHandler {
 
     /// Broadcast a [`TreeEdit`]: one notification per document it touched,
     /// carrying that document's update, so a link forwards bytes and never
-    /// reconciles for a live edit. The document named by `primary` gets that
+    /// reconciles for a live edit. A document named in `primaries` gets that
     /// kind (the RPC's own: `NodeCreated` for the node it created), every
     /// other one `TreeStructure { [id] }` (a parent's list, a descendant's
-    /// tombstone). An edit that wrote one document in several transactions
+    /// tombstone). Most edits name one primary document (a create, a
+    /// rename); a transplant names two — the tombstoned node's `NodeDeleted`
+    /// and the new root's `NodeCreated` — since `TreeEdit` has no shape of
+    /// its own to derive both from (docs/MOVE_CONTRACT.md "The operation:
+    /// transplant"). An edit that wrote one document in several transactions
     /// (a create with tags, a metadata update of several fields) names it
     /// once, with the transactions merged into one update.
-    async fn broadcast_tree_edit(&self, store_id: StoreId, edit: &TreeEdit, primary: Option<(NodeId, StoreChangeKind)>, source: Option<&str>) {
+    async fn broadcast_tree_edit(&self, store_id: StoreId, edit: &TreeEdit, primaries: &[(NodeId, StoreChangeKind)], source: Option<&str>) {
         for (node_id, update) in coalesce_edit(edit) {
-            let kind = match &primary {
-                Some((primary_id, kind)) if *primary_id == node_id => kind.clone(),
-                _ => StoreChangeKind::TreeStructure { node_ids: vec![node_id] },
+            let kind = match primaries.iter().find(|(primary_id, _)| *primary_id == node_id) {
+                Some((_, kind)) => kind.clone(),
+                None => StoreChangeKind::TreeStructure { node_ids: vec![node_id] },
             };
             let update_b64 = base64::engine::general_purpose::STANDARD.encode(&update);
             self.broadcast_document_change(store_id, kind, source, Some(update_b64)).await;
@@ -2184,7 +2210,7 @@ impl RpcHandler {
         // `source_client_id: None`, like any change with no single originating
         // client, so a sync link forwards it rather than treating it as its
         // own echo.
-        self.broadcast_tree_edit(store_id, &repair, None, None).await;
+        self.broadcast_tree_edit(store_id, &repair, &[], None).await;
 
         // A repair only ever reassigns a node's parent or reorders/fixes a
         // children list, never removes a node entry — every touched id is
@@ -3339,7 +3365,7 @@ impl PimbleApiServer for RpcHandler {
             .map_err(to_rpc_error)?;
 
         drop(manager);
-        self.broadcast_tree_edit(request.store_id, &edit, Some((node_id, StoreChangeKind::NodeCreated { node_id, parent_id })), None).await;
+        self.broadcast_tree_edit(request.store_id, &edit, &[(node_id, StoreChangeKind::NodeCreated { node_id, parent_id })], None).await;
         self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
 
         Ok(CreateNodeResponse { node_id })
@@ -3415,7 +3441,7 @@ impl PimbleApiServer for RpcHandler {
 
         self.broadcast_document_change(store_id, StoreChangeKind::ContentUpdated { node_id }, request.client_id.as_deref(), Some(request.content))
             .await;
-        self.broadcast_tree_edit(store_id, &stamp, Some((node_id, StoreChangeKind::MetadataUpdated { node_id })), None).await;
+        self.broadcast_tree_edit(store_id, &stamp, &[(node_id, StoreChangeKind::MetadataUpdated { node_id })], None).await;
         self.enqueue_index_event(store_id, IndexEvent::ContentChanged(node_id)).await;
 
         Ok(EmptyResponse {})
@@ -3473,7 +3499,7 @@ impl PimbleApiServer for RpcHandler {
         self.broadcast_tree_edit(
             request.store_id,
             &edit,
-            Some((node_id, StoreChangeKind::NodeDeleted { node_id, parent_id: removal.parent_id })),
+            &[(node_id, StoreChangeKind::NodeDeleted { node_id, parent_id: removal.parent_id })],
             None,
         )
         .await;
@@ -3518,7 +3544,7 @@ impl PimbleApiServer for RpcHandler {
 
         // Back under its parent: `NodeCreated` is what a subscriber does
         // about a node it does not have appearing in a list.
-        self.broadcast_tree_edit(store_id, &edit, Some((node_id, StoreChangeKind::NodeCreated { node_id, parent_id })), None).await;
+        self.broadcast_tree_edit(store_id, &edit, &[(node_id, StoreChangeKind::NodeCreated { node_id, parent_id })], None).await;
         for id in restored {
             self.enqueue_index_event(store_id, IndexEvent::Upsert(id)).await;
         }
@@ -3542,21 +3568,50 @@ impl PimbleApiServer for RpcHandler {
         let mut manager = self.store_manager.write().await;
         let reach = Reach::of(&manager, &principal, request.store_id);
         require_in_scope(&reach, request.node_id, Access::Write)?;
-        // The old parent is read off the tree before the move rewrites it.
+        // The old parent is read off the tree before the move rewrites it,
+        // and whether its list actually names the node: it may not
+        // (docs/MOVE_CONTRACT.md "Seeing and undoing what was removed", "Put
+        // Back" of a node no list names). A `parent_id` a tampered client
+        // wrote can point anywhere, including somewhere this principal has
+        // no grant on at all; when no list there claims the node, there is
+        // no list to leave, so only the node and the new parent are judged.
         let old_parent_id = manager
             .get_node(request.store_id, request.node_id)
             .map_err(to_rpc_error)?
             .parent_id
             .ok_or_else(|| to_rpc_error("Cannot move the root node"))?;
-        // A move edits three documents, and both parents are among them: a
-        // member moves within what they may write, never into or out of it
-        // (a parent outside the scope is not theirs to edit).
-        require_in_scope(&reach, old_parent_id, Access::Write)?;
+        let old_parent_lists_it = manager
+            .tree(request.store_id)
+            .map_err(to_rpc_error)?
+            .get_children(old_parent_id)
+            .map(|children| children.contains(&request.node_id))
+            .unwrap_or(false);
+        // A move edits the node and the new parent always, and the old
+        // parent when it is actually the list the node leaves: a member
+        // moves within what they may write, never into or out of it (a
+        // parent outside the scope is not theirs to edit).
+        if old_parent_lists_it {
+            require_in_scope(&reach, old_parent_id, Access::Write)?;
+        }
         require_in_scope(&reach, request.new_parent_id, Access::Write)?;
-        if manager.write_refused(request.store_id, &[request.node_id, old_parent_id, request.new_parent_id]) {
+        let mut judged_ids = vec![request.node_id, request.new_parent_id];
+        if old_parent_lists_it {
+            judged_ids.push(old_parent_id);
+        }
+        if manager.write_refused(request.store_id, &judged_ids) {
             return Err(read_only_error());
         }
-        let edit = manager
+
+        // What a transplant would tombstone, read before the edit: the id
+        // the node has now is `Tree::move_or_transplant`'s to decide, but
+        // the ids it would remove are only known from what was there before.
+        let old_subtree_ids = manager
+            .tree(request.store_id)
+            .map_err(to_rpc_error)?
+            .subtree_ids(request.node_id)
+            .unwrap_or_else(|_| vec![request.node_id]);
+
+        let (new_node_id, left_shares, edit) = manager
             .move_node(request.store_id, request.node_id, request.new_parent_id, request.position)
             .map_err(to_rpc_error)?;
 
@@ -3565,19 +3620,55 @@ impl PimbleApiServer for RpcHandler {
             .await
             .map_err(to_rpc_error)?;
 
+        // The planted subtree, now live under its new id, if this was a
+        // transplant (docs/MOVE_CONTRACT.md "The rule"): every document a
+        // transplant created needs indexing, the same as `deleteNode` needs
+        // every tombstoned one removed.
+        let new_subtree_ids = if new_node_id != request.node_id {
+            manager.tree(request.store_id).map_err(to_rpc_error)?.subtree_ids(new_node_id).unwrap_or_else(|_| vec![new_node_id])
+        } else {
+            Vec::new()
+        };
+
         drop(manager);
         let node_id = request.node_id;
-        self.broadcast_tree_edit(
-            request.store_id,
-            &edit,
-            Some((node_id, StoreChangeKind::NodeMoved { node_id, old_parent_id, new_parent_id: request.new_parent_id })),
-            None,
-        )
-        .await;
-        // Re-upsert the moved node: its `parent` relationship is what changed.
-        self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
+        if new_node_id == node_id {
+            // A plain move: one document, one changed relationship.
+            self.broadcast_tree_edit(
+                request.store_id,
+                &edit,
+                &[(node_id, StoreChangeKind::NodeMoved { node_id, old_parent_id, new_parent_id: request.new_parent_id })],
+                None,
+            )
+            .await;
+            // Re-upsert the moved node: its `parent` relationship is what changed.
+            self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
+        } else {
+            // A transplant: the old subtree is a tombstone that stays in
+            // its share, undoable; the new one is a fresh document each,
+            // sharing nothing with the old (docs/MOVE_CONTRACT.md "The
+            // operation: transplant"). Both halves get their own
+            // notification, since nothing about a `TreeEdit` says which
+            // touched document is which on its own.
+            self.broadcast_tree_edit(
+                request.store_id,
+                &edit,
+                &[
+                    (node_id, StoreChangeKind::NodeDeleted { node_id, parent_id: old_parent_id }),
+                    (new_node_id, StoreChangeKind::NodeCreated { node_id: new_node_id, parent_id: request.new_parent_id }),
+                ],
+                None,
+            )
+            .await;
+            for id in new_subtree_ids {
+                self.enqueue_index_event(request.store_id, IndexEvent::Upsert(id)).await;
+            }
+            for id in old_subtree_ids {
+                self.enqueue_index_event(request.store_id, IndexEvent::Remove(id)).await;
+            }
+        }
 
-        Ok(MoveNodeResponse { node_id, left_shares: Vec::new() })
+        Ok(MoveNodeResponse { node_id: new_node_id, left_shares })
     }
 
     async fn transplant_node(
@@ -3588,7 +3679,114 @@ impl PimbleApiServer for RpcHandler {
         let principal = principal_of(ext);
         authorize(&principal, request.from_store_id, Access::Write)?;
         authorize(&principal, request.to_store_id, Access::Write)?;
-        Err(to_rpc_error("transplantNode is not built yet (docs/MOVE_CONTRACT.md, wave 2)"))
+        self.reject_if_vault(request.from_store_id).await?;
+        self.reject_if_vault(request.to_store_id).await?;
+        info!(
+            "Transplanting node {} from store {} to parent {} in store {}",
+            request.node_id, request.from_store_id, request.new_parent_id, request.to_store_id
+        );
+
+        // Two stores holding different documents is the whole reason a
+        // cross-store move is always a transplant; the same store on both
+        // sides has nothing to transplant between, so it is the plain
+        // decision `moveNode` already makes (docs/MOVE_CONTRACT.md "Between
+        // stores": "Same store on both sides is a moveNode, answer it as
+        // one").
+        if request.to_store_id == request.from_store_id {
+            let answer = self
+                .move_node(
+                    ext,
+                    MoveNodeRequest {
+                        store_id: request.from_store_id,
+                        node_id: request.node_id,
+                        new_parent_id: request.new_parent_id,
+                        position: request.position,
+                    },
+                )
+                .await?;
+            return Ok(TransplantNodeResponse { node_id: answer.node_id, left_shares: answer.left_shares });
+        }
+
+        let mut manager = self.store_manager.write().await;
+        // Authorization is judged per store, in its own store (a mount is
+        // addressed by its canonical store everywhere else in this file;
+        // `node_id`/`new_parent_id` here name no mount, since planting under
+        // one is refused below the same way `createNode` refuses it).
+        let source_reach = Reach::of(&manager, &principal, request.from_store_id);
+        require_in_scope(&source_reach, request.node_id, Access::Write)?;
+        let old_parent_id = manager
+            .get_node(request.from_store_id, request.node_id)
+            .map_err(to_rpc_error)?
+            .parent_id
+            .ok_or_else(|| to_rpc_error("Cannot transplant the root node"))?;
+        let old_parent_lists_it = manager
+            .tree(request.from_store_id)
+            .map_err(to_rpc_error)?
+            .get_children(old_parent_id)
+            .map(|children| children.contains(&request.node_id))
+            .unwrap_or(false);
+        if old_parent_lists_it {
+            require_in_scope(&source_reach, old_parent_id, Access::Write)?;
+        }
+        let mut source_judged_ids = vec![request.node_id];
+        if old_parent_lists_it {
+            source_judged_ids.push(old_parent_id);
+        }
+        if manager.write_refused(request.from_store_id, &source_judged_ids) {
+            return Err(read_only_error());
+        }
+
+        let target_reach = Reach::of(&manager, &principal, request.to_store_id);
+        require_in_scope(&target_reach, request.new_parent_id, Access::Write)?;
+        if manager.write_refused(request.to_store_id, &[request.new_parent_id]) {
+            return Err(read_only_error());
+        }
+
+        let outcome = manager
+            .transplant_node(request.from_store_id, request.node_id, request.to_store_id, request.new_parent_id, request.position)
+            .map_err(to_rpc_error)?;
+
+        manager.flush(request.from_store_id).await.map_err(to_rpc_error)?;
+        manager.flush(request.to_store_id).await.map_err(to_rpc_error)?;
+
+        drop(manager);
+        // A deleted subtree may contain mount nodes; stop reporting their
+        // source's state to a client that no longer has them (as `deleteNode` does).
+        self.forget_mounts(request.from_store_id, &outcome.source_removal.removed);
+        let node_id = request.node_id;
+        self.broadcast_tree_edit(
+            request.from_store_id,
+            &outcome.source_edit,
+            &[(node_id, StoreChangeKind::NodeDeleted { node_id, parent_id: outcome.source_removal.parent_id })],
+            None,
+        )
+        .await;
+        self.broadcast_tree_edit(
+            request.to_store_id,
+            &outcome.target_edit,
+            &[(outcome.new_node_id, StoreChangeKind::NodeCreated { node_id: outcome.new_node_id, parent_id: request.new_parent_id })],
+            None,
+        )
+        .await;
+        for id in outcome.source_removal.removed {
+            self.enqueue_index_event(request.from_store_id, IndexEvent::Remove(id)).await;
+        }
+        // Every planted node, upserted in its new store's index; read back
+        // from the tree since a transplant makes one document per node of
+        // the subtree, not only the root.
+        let planted_ids = self
+            .store_manager
+            .read()
+            .await
+            .tree(request.to_store_id)
+            .ok()
+            .and_then(|tree| tree.subtree_ids(outcome.new_node_id).ok())
+            .unwrap_or_else(|| vec![outcome.new_node_id]);
+        for id in planted_ids {
+            self.enqueue_index_event(request.to_store_id, IndexEvent::Upsert(id)).await;
+        }
+
+        Ok(TransplantNodeResponse { node_id: outcome.new_node_id, left_shares: outcome.left_shares })
     }
 
     async fn list_deleted(
@@ -3598,7 +3796,104 @@ impl PimbleApiServer for RpcHandler {
     ) -> Result<ListDeletedResponse, ErrorObjectOwned> {
         let principal = principal_of(ext);
         authorize(&principal, request.store_id, Access::Read)?;
-        Err(to_rpc_error("listDeleted is not built yet (docs/MOVE_CONTRACT.md, wave 2)"))
+        self.reject_if_vault(request.store_id).await?;
+
+        let manager = self.store_manager.read().await;
+        let reach = Reach::of(&manager, &principal, request.store_id);
+        let tree = manager.tree(request.store_id).map_err(to_rpc_error)?;
+        let root = manager.root_node_id(request.store_id).map_err(to_rpc_error)?;
+        let scope_roots: HashSet<NodeId> = manager.scope_roots(request.store_id).into_iter().collect();
+
+        // Every held document, tombstoned or not: `listDeleted` looks past
+        // ordinary tree reachability on purpose, since exactly the entries
+        // it names are the ones normal reachability leaves out (a
+        // tombstone keeps its list for `undeleteNode`; a node no list
+        // names is unreachable by definition).
+        let mut node_ids: Vec<NodeId> = Vec::new();
+        let mut tombstones: Vec<NodeId> = Vec::new();
+        for id in tree.ids() {
+            let Some(doc) = tree.doc(id) else { continue };
+            let Ok(fields) = doc.fields() else { continue };
+            if fields.deleted_at.is_some() {
+                tombstones.push(id);
+            } else {
+                node_ids.push(id);
+            }
+        }
+
+        // Which lists name which held children, once: a node is "no list
+        // names it" when it is absent from every one of these.
+        let mut listed: HashSet<NodeId> = HashSet::new();
+        for &owner in node_ids.iter().chain(tombstones.iter()) {
+            if let Ok(children) = tree.get_children(owner) {
+                listed.extend(children);
+            }
+            if let Some(doc) = tree.doc(owner) {
+                // A tombstone's own (unrepaired) list still counts: it is
+                // what `undeleteNode` restores.
+                listed.extend(doc.children());
+            }
+        }
+
+        let mut entries: Vec<pimble_core::DeletedNode> = Vec::new();
+
+        // The top-most tombstones: a tombstoned node whose held parent is
+        // not itself tombstoned, or whose parent is not held. Read access
+        // only: a scoped member reads what `Reach` reaches, same as
+        // `getChildren`.
+        let tombstone_set: HashSet<NodeId> = tombstones.iter().copied().collect();
+        let mut top_tombstones: Vec<(NodeId, String)> = Vec::new();
+        for &id in &tombstones {
+            if let Some(reach) = &reach {
+                if reach.require(id, Access::Read).is_err() {
+                    continue;
+                }
+            }
+            let Some(doc) = tree.doc(id) else { continue };
+            let Ok(fields) = doc.fields() else { continue };
+            let is_top = fields.parent_id.map(|p| !tombstone_set.contains(&p)).unwrap_or(true);
+            if !is_top {
+                continue;
+            }
+            let Some(deleted_at) = fields.deleted_at.clone() else { continue };
+            top_tombstones.push((id, deleted_at));
+        }
+        // Most recent first.
+        top_tombstones.sort_by(|a, b| b.1.cmp(&a.1));
+        for (id, deleted_at) in top_tombstones {
+            let fields = tree.doc(id).and_then(|d| d.fields().ok());
+            let parent_title = fields
+                .as_ref()
+                .and_then(|f| f.parent_id)
+                .and_then(|p| tree.doc(p))
+                .and_then(|d| d.fields().ok())
+                .map(|f| f.title);
+            let Ok(node) = manager.get_node_any(request.store_id, id) else { continue };
+            entries.push(pimble_core::DeletedNode { node, parent_title, deleted_at: Some(deleted_at), put_back_under: None });
+        }
+
+        // The live nodes no held list names, excluding the store's root and
+        // (on a partial replica) its scope roots and anything under an
+        // ended root: what "Put Back" would move under the scope root that
+        // reaches it, or the store's root on a whole store.
+        for &id in &node_ids {
+            if id == root || scope_roots.contains(&id) || listed.contains(&id) {
+                continue;
+            }
+            if manager.under_ended_root(request.store_id, id) {
+                continue;
+            }
+            if let Some(reach) = &reach {
+                if reach.require(id, Access::Read).is_err() {
+                    continue;
+                }
+            }
+            let Ok(node) = manager.get_node(request.store_id, id) else { continue };
+            let put_back_under = scope_root_reaching(tree, &scope_roots, id).unwrap_or(root);
+            entries.push(pimble_core::DeletedNode { node, parent_title: None, deleted_at: None, put_back_under: Some(put_back_under) });
+        }
+
+        Ok(ListDeletedResponse { nodes: entries })
     }
 
     async fn get_children(
@@ -3771,7 +4066,7 @@ impl PimbleApiServer for RpcHandler {
         drop(manager);
 
         self.adopt_newly_opened(newly_opened).await;
-        self.broadcast_tree_edit(request.store_id, &edit, Some((node_id, StoreChangeKind::NodeCreated { node_id, parent_id: request.parent_id })), None).await;
+        self.broadcast_tree_edit(request.store_id, &edit, &[(node_id, StoreChangeKind::NodeCreated { node_id, parent_id: request.parent_id })], None).await;
         self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
 
         // Record the new mount so a later change to its source's link
