@@ -1,6 +1,19 @@
 # Next session: start here
 
-Updated 2026-09-22 evening. **v0.3.0 is shipped**: the move contract (`docs/MOVE_CONTRACT.md`,
+Updated 2026-09-22, late. **v0.3.1 is shipped**: `follow-ups` fast-forwarded into `master`
+with Joe's word, release commit 038f76e (tag `v0.3.1`), jkbase deployment v21 (verified:
+site, `/app/`, health, JWKS and releases answer 200, `/rpc` 401 to the unauthenticated, the
+hosted server opened every store, the accounts service up; backup before it:
+`bkp_1790100112989_7578868ac966b8b0`, no migration), the GitHub release with the Linux
+package (Windows still waits for rhypedb#23), the download page picking it up within its
+ten-minute cache. Two things seen on the way: the accounts service logs one refused
+connection to the managed RhypeDB at every deployment's start (v19, v20 and v21 each have
+one line) and comes up five seconds later, so a startup retry would remove the line; and
+CI on the release commit failed on the known flake
+(`remote_mounts::a_mount_whose_source_link_is_down_is_cached_and_still_readable`, "A flake
+to watch" below), which passed in the full local release run minutes earlier. The re-run of the failed job passed, and the download page offers v0.3.1.
+Joe's part: install v0.3.1 where he wants the read-only switch; nothing breaks on a device
+that stays on v0.3.0. Next: whatever Joe reports. Before it, **v0.3.0 was shipped**: the move contract (`docs/MOVE_CONTRACT.md`,
 built, reviewed and verified that day; the first section below), plus three desktop fixes.
 `master` is fast-forwarded from `node-document` and carries the release commit 3cf6521
 (tag `v0.3.0`) and, after it, a test-only fix 01fd278 and these notes; jkbase's `main` is
@@ -58,9 +71,7 @@ green, with the local stack down.
 
 Not done: the partial-replica grouping limit (a follow-up only if it ever matters).
 
-**Next**: Joe's word on merging `follow-ups` into `master`. It moves the rinch pin and
-changes what ships, so the push goes with a desktop release (v0.3.1) and a deploy, per the
-standing rule; then whatever Joe reports from v0.3.0.
+**Merged and shipped as v0.3.1 the same evening** (the top of this file).
 
 ## 2026-09-22: the move contract, built and being verified
 
@@ -318,7 +329,10 @@ windows and a browser were running) ended with the `pimble-server` `auth` test t
 failing without naming a test or printing a result line. The target passed alone (20 of
 20), the whole server suite passed twice, and a second full workspace run was clean. The
 relay agent saw one like it in `remote_mounts::a_mount_whose_source_link_is_down...`.
-Both look like load; neither has been explained.
+Both look like load; neither has been explained. On 2026-09-22 the remote-mounts one
+fired on CI for the v0.3.1 release commit (a 10 s `wait_for_mount_state` for the
+`Cached` notification after the source server stops; nothing in that release touches
+mounts or links, and the full release run had passed locally minutes before). The re-run passed.
 
 ## Process notes that cost time before
 
