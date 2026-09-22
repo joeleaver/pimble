@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use pimble_client::PimbleClient;
+use pimble_client::{ClientError, PimbleClient};
 use pimble_core::{AuthMethod, StoreId, StoreKind};
 
 use crate::config::Config;
@@ -16,15 +16,36 @@ pub struct PimbleService {
     stores_dir: PathBuf,
 }
 
+/// Connect to the Pimble server at `url`, retrying for up to `wait` while
+/// nothing answers there. A server that answers, even with a refusal (401,
+/// 403), and a connection still failing after `wait`, are returned as before.
+async fn connect_waiting(url: &str, auth: &AuthMethod, wait: std::time::Duration) -> CloudResult<PimbleClient> {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut delay = std::time::Duration::from_millis(100);
+    let mut logged = false;
+    loop {
+        match PimbleClient::connect_with_auth(url, auth).await {
+            Ok(client) => return Ok(client),
+            Err(ClientError::Connection(e)) if !e.contains("status code") && tokio::time::Instant::now() + delay < deadline => {
+                if !logged {
+                    tracing::info!(%url, error = %e, "the Pimble server is not accepting connections yet; waiting");
+                    logged = true;
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(2));
+            }
+            Err(e) => return Err(crate::error::CloudError::Internal(format!("connecting to Pimble server at {}: {}", url, e))),
+        }
+    }
+}
+
 impl PimbleService {
     pub async fn connect(config: &Config) -> CloudResult<Self> {
         let auth = match &config.pimble_server_token {
             Some(token) => AuthMethod::Bearer { token: token.clone() },
             None => AuthMethod::None,
         };
-        let client = PimbleClient::connect_with_auth(&config.pimble_server_url, &auth)
-            .await
-            .map_err(|e| crate::error::CloudError::Internal(format!("connecting to Pimble server at {}: {}", config.pimble_server_url, e)))?;
+        let client = connect_waiting(&config.pimble_server_url, &auth, crate::DEPENDENCY_WAIT).await?;
         Ok(Self { client, stores_dir: config.pimble_stores_dir.clone() })
     }
 
@@ -52,5 +73,62 @@ impl PimbleService {
     pub async fn delete_vault_store(&self, store_id: StoreId) -> CloudResult<()> {
         self.client.delete_vault_store(store_id).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A Pimble server with `token`, on `port` (0 for any), and a temporary
+    /// directory for what it keeps.
+    async fn pimble_server(port: u16, token: &str) -> (pimble_server::PimbleServer, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = pimble_server::PimbleServer::with_config(pimble_server::ServerConfig {
+            addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            auth_token: Some(token.to_string()),
+            credentials_path: Some(dir.path().join("credentials.json")),
+            replicas_dir: Some(dir.path().join("replicas")),
+            ..Default::default()
+        });
+        server.start().await.expect("server starts");
+        (server, dir)
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    /// The hosted server starting a moment after this service is the jkbase
+    /// deployment case: the connect waits for it instead of failing.
+    #[tokio::test]
+    async fn connect_waits_for_a_pimble_server_that_is_still_starting() {
+        let port = free_port();
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            pimble_server(port, "t").await
+        });
+        let auth = AuthMethod::Bearer { token: "t".to_string() };
+        connect_waiting(&format!("http://127.0.0.1:{port}"), &auth, Duration::from_secs(10))
+            .await
+            .expect("connected once the server listened");
+        let (mut server, _dir) = server.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    /// A server that answers with a refusal is up: waiting would only delay
+    /// the error.
+    #[tokio::test]
+    async fn a_refusal_is_not_waited_out() {
+        let (mut server, _dir) = pimble_server(0, "right").await;
+        let auth = AuthMethod::Bearer { token: "wrong".to_string() };
+        let started = std::time::Instant::now();
+        let err = connect_waiting(&format!("http://{}", server.addr()), &auth, Duration::from_secs(30))
+            .await
+            .err()
+            .expect("the token is refused");
+        assert!(started.elapsed() < Duration::from_secs(5), "waited on a refusal: {:?} ({err})", started.elapsed());
+        server.stop().await.unwrap();
     }
 }

@@ -26,6 +26,13 @@ pub mod state;
 
 use axum::Router;
 
+/// How long startup waits for each service it depends on (the managed
+/// RhypeDB, the hosted Pimble server) to accept connections. On jkbase they
+/// start together with this one, so the first dial of a deployment is
+/// usually refused; exiting there made the platform restart the service five
+/// seconds later with an error line in every deployment's log.
+pub(crate) const DEPENDENCY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 use config::Config;
 use db::RhypeDb;
 use jwt::JwtSigner;

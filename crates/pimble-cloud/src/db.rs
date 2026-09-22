@@ -481,16 +481,9 @@ pub struct RhypeDb {
     client: AsyncClient,
 }
 
-/// How long [`RhypeDb::connect`] waits for the database to accept
-/// connections. On jkbase the managed RhypeDB starts with the service, so the
-/// first dial of a deployment is usually refused; exiting there made the
-/// platform restart the service five seconds later with an error line in
-/// every deployment's log.
-const CONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
-
 impl RhypeDb {
     pub async fn connect(addr: &str) -> CloudResult<Self> {
-        Self::connect_waiting(addr, CONNECT_WAIT).await
+        Self::connect_waiting(addr, crate::DEPENDENCY_WAIT).await
     }
 
     /// Dial `addr`, retrying a refused or failed connection for up to `wait`.
