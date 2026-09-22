@@ -618,6 +618,26 @@ async fn dispatch(
         return;
     }
 
+    // A transplant between stores names two, so it is judged and routed here
+    // rather than by the single-`store_id` path every other command takes
+    // below (docs/MOVE_CONTRACT.md "Between stores").
+    if let BackendCommand::TransplantNode { from_store_id, node_id, to_store_id, new_parent_id, position } = cmd {
+        dispatch_transplant(
+            endpoints,
+            vault,
+            from_store_id,
+            node_id,
+            to_store_id,
+            new_parent_id,
+            position,
+            event_tx,
+            signal_ui,
+            client_id,
+        )
+        .await;
+        return;
+    }
+
     // Which server answers this command is decided by the store it names, not
     // by which connection happens to be open.
     let store_id = crate::vault::store_id_of(&cmd);
@@ -692,6 +712,95 @@ async fn dispatch(
     };
 
     let mut client = client;
+    if let Some(event) = process_command(&mut client, cmd, event_tx, signal_ui, client_id).await {
+        emit(event_tx, signal_ui, described(vault, event));
+    }
+}
+
+/// `TransplantNode` names two stores, which may be served by two different
+/// endpoints, so it never goes through [`dispatch`]'s single-`store_id`
+/// routing (docs/MOVE_CONTRACT.md "Between stores"). Refused first, the same
+/// way and with the same sentences as any other write
+/// (`VaultClient::refuse_write`, which judges a store from the account's
+/// grants alone and does not need it held here); then routed by what kind of
+/// store each side is: both encrypted is the vault client's, in the page,
+/// between the two endpoints that serve them; one of each is refused with a
+/// sentence, since the two are not one operation yet; both plain is the
+/// hosted server's, exactly as every other plain-store write reaches it.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_transplant(
+    endpoints: &mut Endpoints,
+    vault: &mut VaultClient,
+    from_store_id: StoreId,
+    node_id: pimble_core::NodeId,
+    to_store_id: StoreId,
+    new_parent_id: pimble_core::NodeId,
+    position: Option<usize>,
+    event_tx: &Sender<BackendEvent>,
+    signal_ui: &Arc<dyn Fn() + Send + Sync>,
+    client_id: &str,
+) {
+    let cmd = BackendCommand::TransplantNode { from_store_id, node_id, to_store_id, new_parent_id, position };
+
+    // A relayed store's socket may have died since the supervisor last
+    // looked, exactly as the single-`store_id` path checks before its own
+    // `refuse_write` in `dispatch`, above: freshen `owner_offline` for both
+    // sides so the refusal below is not stale.
+    for id in [from_store_id, to_store_id] {
+        if endpoints.is_relayed(id) && !endpoints.client_for(id).is_some_and(|c| c.is_connected()) {
+            for event in vault.endpoint_down(&[id]) {
+                emit(event_tx, signal_ui, event);
+            }
+        }
+    }
+
+    if let Some(event) = vault.refuse_write(from_store_id, &cmd).or_else(|| vault.refuse_write(to_store_id, &cmd)) {
+        emit(event_tx, signal_ui, event);
+        return;
+    }
+
+    let from_vault = vault.is_encrypted(from_store_id);
+    let to_vault = vault.is_encrypted(to_store_id);
+
+    if let Some(event) = crate::vault::refuse_mixed_transplant(from_vault, to_vault) {
+        emit(event_tx, signal_ui, event);
+        return;
+    }
+
+    if from_vault && to_vault {
+        let from_url = endpoints.url_for(from_store_id);
+        let to_url = endpoints.url_for(to_store_id);
+        let from_client = match endpoints.ensure_connected(&from_url).await {
+            Ok(c) => c,
+            Err(message) => {
+                emit(event_tx, signal_ui, BackendEvent::Error { message: format!("Could not reach {from_url}: {message}") });
+                return;
+            }
+        };
+        let to_client = match endpoints.ensure_connected(&to_url).await {
+            Ok(c) => c,
+            Err(message) => {
+                emit(event_tx, signal_ui, BackendEvent::Error { message: format!("Could not reach {to_url}: {message}") });
+                return;
+            }
+        };
+        let event = vault
+            .transplant_node(&from_client, &to_client, from_store_id, node_id, to_store_id, new_parent_id, position)
+            .await;
+        emit(event_tx, signal_ui, event);
+        return;
+    }
+
+    // Both plain: the server does it, through whichever endpoint serves the
+    // node's own store, as every other write on it does.
+    let url = endpoints.url_for(from_store_id);
+    let mut client = match endpoints.ensure_connected(&url).await {
+        Ok(c) => Some(c),
+        Err(message) => {
+            emit(event_tx, signal_ui, BackendEvent::Error { message: format!("Could not reach {url}: {message}") });
+            return;
+        }
+    };
     if let Some(event) = process_command(&mut client, cmd, event_tx, signal_ui, client_id).await {
         emit(event_tx, signal_ui, described(vault, event));
     }

@@ -80,7 +80,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use pimble_app::protocol::{BackendCommand, BackendEvent};
 use pimble_client::PimbleClient;
 use pimble_core::{
-    custom_keys, node_types, Node, NodeId, NodeMetadata, RelaySide, Store, StoreAccess, StoreId, StoreKind,
+    custom_keys, node_types, DeletedNode, LeftShare, Node, NodeId, NodeMetadata, RelaySide, Store, StoreAccess, StoreId, StoreKind,
 };
 use pimble_crdt::{NodeDoc, NodeFields, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_crypto::{blob_aad, dek_aad, unwrap_dek, wrap_dek, Blob, KeyId, SymmetricKey, WrappedDek};
@@ -1252,6 +1252,12 @@ impl VaultClient {
                 Some(self.move_node(client, store_id, node_id, new_parent_id, position).await)
             }
 
+            BackendCommand::UndeleteNode { store_id, node_id } => {
+                Some(self.undelete_node(client, store_id, node_id).await)
+            }
+
+            BackendCommand::ListDeleted { store_id } => Some(self.list_deleted(store_id)),
+
             BackendCommand::BroadcastChanges { store_id, node_id, changes } => {
                 match self.broadcast(client, store_id, node_id, &changes).await {
                     Ok(()) => None,
@@ -1487,6 +1493,8 @@ impl VaultClient {
             BackendCommand::SubscribeStoreChanges { .. } => None,
             BackendCommand::GetStoreSync { store_id } => Some(self.sync_event(store_id)),
             BackendCommand::RebuildIndex { store_id } => Some(BackendEvent::IndexRebuilt { store_id, indexed: 0 }),
+            BackendCommand::ListDeleted { store_id } if held => Some(self.list_deleted(store_id)),
+            BackendCommand::ListDeleted { store_id } => Some(BackendEvent::DeletedListed { store_id, nodes: Vec::new() }),
             _ => Some(notice(OWNER_OFFLINE_REFUSAL.to_string())),
         })
     }
@@ -1648,6 +1656,15 @@ impl VaultClient {
         }
     }
 
+    /// `Tree::move_or_transplant` decides, as every caller of a move does
+    /// (docs/MOVE_CONTRACT.md): a plain move inside a share or outside all of
+    /// them, or a transplant when it would take the node out of one, with a
+    /// fresh document (its key riding its first append, exactly as
+    /// [`VaultClient::create_node`] makes one) for every node of the subtree
+    /// and the original tombstoned. `Tree::transplant` orders the touched
+    /// documents new-first, tombstones-last, and one `append_edit` call sends
+    /// them in that order; a document an append fails on is marked unsent and
+    /// resent by the existing mechanism, whichever half of the move it was.
     async fn move_node(
         &mut self,
         client: &Arc<PimbleClient>,
@@ -1657,22 +1674,178 @@ impl VaultClient {
         position: Option<usize>,
     ) -> BackendEvent {
         let now = now_rfc3339();
-        let (old_parent_id, edit) = {
+        let (old_parent_id, title, left_shares, new_node_id, edit) = {
             let Some(store) = self.stores.get_mut(&store_id) else {
                 return BackendEvent::Error { message: "no such encrypted store".into() };
             };
-            let old_parent_id = match store.tree.get_node_info(node_id) {
-                Ok(info) => info.parent_id.unwrap_or(new_parent_id),
+            let info = match store.tree.get_node_info(node_id) {
+                Ok(info) => info,
                 Err(e) => return BackendEvent::Error { message: e.to_string() },
             };
-            match store.tree.move_node(node_id, new_parent_id, position, &now) {
-                Ok(edit) => (old_parent_id, edit),
+            let old_parent_id = info.parent_id.unwrap_or(new_parent_id);
+            // What the move would leave, read before it happens: a
+            // transplant's original is a tombstone afterwards and answers
+            // nothing about the shares it used to be in.
+            let left_shares = as_left_shares(&store.tree, store.tree.shares_left(node_id, new_parent_id));
+            let mut edit = store.seed_root(&now);
+            let (new_node_id, more) = match store.tree.move_or_transplant(node_id, new_parent_id, position, &now, &mut NodeId::new) {
+                Ok(v) => v,
+                Err(e) => return BackendEvent::Error { message: e.to_string() },
+            };
+            edit.touched.extend(more.touched);
+            (old_parent_id, info.title, left_shares, new_node_id, edit)
+        };
+        match self.append_edit(client, store_id, &edit).await {
+            Ok(()) if new_node_id == node_id => {
+                BackendEvent::NodeMoved { store_id, node_id, old_parent_id, new_parent_id }
+            }
+            Ok(()) => BackendEvent::NodeTransplanted {
+                from_store_id: store_id,
+                old_node_id: node_id,
+                old_parent_id,
+                to_store_id: store_id,
+                node_id: new_node_id,
+                new_parent_id,
+                title,
+                left_shares,
+            },
+            Err(message) => BackendEvent::Error { message },
+        }
+    }
+
+    /// "Put Back": clear the tombstone `undelete_node` finds and everything
+    /// the same deletion took with it, and answer where it landed, exactly as
+    /// the desktop reads the same answer off `undeleteNode` plus a `getNode`
+    /// (`crates/pimble-app/src/commands.rs`).
+    async fn undelete_node(&mut self, client: &Arc<PimbleClient>, store_id: StoreId, node_id: NodeId) -> BackendEvent {
+        let now = now_rfc3339();
+        let edit = {
+            let Some(store) = self.stores.get_mut(&store_id) else {
+                return BackendEvent::Error { message: "no such encrypted store".into() };
+            };
+            match store.tree.undelete_node(node_id, &now) {
+                Ok(edit) => edit,
                 Err(e) => return BackendEvent::Error { message: e.to_string() },
             }
         };
-        match self.append_edit(client, store_id, &edit).await {
-            Ok(()) => BackendEvent::NodeMoved { store_id, node_id, old_parent_id, new_parent_id },
-            Err(message) => BackendEvent::Error { message },
+        if let Err(message) = self.append_edit(client, store_id, &edit).await {
+            return BackendEvent::Error { message };
+        }
+        let Some(store) = self.stores.get(&store_id) else {
+            return BackendEvent::Error { message: "no such encrypted store".into() };
+        };
+        match store.tree.get_node_info(node_id) {
+            Ok(info) => BackendEvent::NodeCreated { store_id, parent_id: info.parent_id, node_id },
+            Err(e) => BackendEvent::Error { message: e.to_string() },
+        }
+    }
+
+    /// What "Recently Deleted..." shows, answered from the tree this page
+    /// holds — a scoped member's page holds only its scope's documents to
+    /// begin with, so nothing further is judged here.
+    fn list_deleted(&self, store_id: StoreId) -> BackendEvent {
+        let Some(store) = self.stores.get(&store_id) else {
+            return BackendEvent::Error { message: "no such encrypted store".into() };
+        };
+        let nodes = store.list_deleted(self.rows.get(&store_id));
+        BackendEvent::DeletedListed { store_id, nodes }
+    }
+
+    /// `TransplantNode` between two vault stores this page holds
+    /// (docs/MOVE_CONTRACT.md "Between stores"): the subtree read out of the
+    /// source as data ([`pimble_crdt::Tree::take_cutting`]), planted under
+    /// `new_parent_id` in the destination with a fresh id and a fresh key per
+    /// node ([`pimble_crdt::Tree::plant`]), appended there, and only once
+    /// that whole append succeeds is the source tombstoned and its own
+    /// tombstones appended: created first, deleted second, so a failure
+    /// between the two leaves the original exactly where it was.
+    ///
+    /// `left_shares` is every share the node was in: leaving the store leaves
+    /// all of them, since two stores never share an ancestor.
+    ///
+    /// The caller (`web/src/backend.rs`) is the one place this is reached
+    /// from: it is not routed through [`VaultClient::handle`], which answers
+    /// only a single store's commands, because a transplant needs the
+    /// destination's endpoint too.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn transplant_node(
+        &mut self,
+        from_client: &Arc<PimbleClient>,
+        to_client: &Arc<PimbleClient>,
+        from_store_id: StoreId,
+        node_id: NodeId,
+        to_store_id: StoreId,
+        new_parent_id: NodeId,
+        position: Option<usize>,
+    ) -> BackendEvent {
+        let now = now_rfc3339();
+
+        let (old_parent_id, title, left_shares, cutting) = {
+            let Some(from_store) = self.stores.get(&from_store_id) else {
+                return BackendEvent::Error { message: "no such encrypted store".into() };
+            };
+            let info = match from_store.tree.get_node_info(node_id) {
+                Ok(info) => info,
+                Err(e) => return BackendEvent::Error { message: e.to_string() },
+            };
+            let Some(old_parent_id) = info.parent_id else {
+                return BackendEvent::Error { message: "the root node cannot be moved into another store".into() };
+            };
+            let left_shares = as_left_shares(&from_store.tree, from_store.tree.shares(node_id));
+            let cutting = match from_store.tree.take_cutting(node_id) {
+                Ok(cutting) => cutting,
+                Err(e) => return BackendEvent::Error { message: e.to_string() },
+            };
+            (old_parent_id, info.title, left_shares, cutting)
+        };
+
+        let (new_node_id, edit_to) = {
+            let Some(to_store) = self.stores.get_mut(&to_store_id) else {
+                return BackendEvent::Error { message: "no such encrypted store".into() };
+            };
+            let mut edit = to_store.seed_root(&now);
+            match to_store.tree.plant(cutting, new_parent_id, position, &now, &mut NodeId::new) {
+                Ok((new_root, more)) => {
+                    edit.touched.extend(more.touched);
+                    (new_root, edit)
+                }
+                Err(e) => return BackendEvent::Error { message: e.to_string() },
+            }
+        };
+
+        // Created first: a failure appending the new documents leaves the
+        // original untouched, never tombstoned with nothing to show for it.
+        if let Err(message) = self.append_edit(to_client, to_store_id, &edit_to).await {
+            return BackendEvent::Error { message };
+        }
+
+        // Deleted second, only now that the new home is on the server.
+        let tombstone_edit = {
+            let Some(from_store) = self.stores.get_mut(&from_store_id) else {
+                return BackendEvent::Error { message: "no such encrypted store".into() };
+            };
+            match from_store.tree.remove_node(node_id, &now) {
+                Ok(edit) => edit,
+                Err(e) => return BackendEvent::Error { message: e.to_string() },
+            }
+        };
+        if let Err(message) = self.append_edit(from_client, from_store_id, &tombstone_edit).await {
+            // The new node is already live and answered below; a failed
+            // tombstone is unsent like any other failed append and resent by
+            // the same mechanism, not a reason to tell the person their move
+            // did not happen.
+            tracing::warn!("Appending the tombstone of {} after a transplant failed: {}", node_id, message);
+        }
+
+        BackendEvent::NodeTransplanted {
+            from_store_id,
+            old_node_id: node_id,
+            old_parent_id,
+            to_store_id,
+            node_id: new_node_id,
+            new_parent_id,
+            title,
+            left_shares,
         }
     }
 
@@ -2604,6 +2777,109 @@ impl VaultStore {
         })
     }
 
+    /// [`VaultStore::node_of`] without requiring the node to be live and
+    /// connected: a tombstone, or a live node no held list names, still has
+    /// fields worth showing in "Recently Deleted..." even though
+    /// `Tree::get_node_info`/`Tree::get_children` (which `node_of` uses)
+    /// refuse a deleted document. `None` only for a document not held here at
+    /// all. Content and children are left empty: the list is a name and a
+    /// place to put it back, not a place to read the note itself.
+    fn node_of_any(&self, node_id: NodeId) -> Option<Node> {
+        let doc = self.tree.doc(node_id)?;
+        let fields = doc.fields().ok()?;
+        Some(Node {
+            id: node_id,
+            parent_id: fields.parent_id,
+            node_type: fields.node_type,
+            metadata: NodeMetadata {
+                title: fields.title,
+                created_at: parse_time(&fields.created_at),
+                modified_at: parse_time(&fields.modified_at),
+                tags: fields.tags,
+                custom: fields.custom,
+            },
+            content: Vec::new(),
+            children: Vec::new(),
+            links: Vec::new(),
+            access: StoreAccess::Full,
+        })
+    }
+
+    /// The title of a held document, whatever its state.
+    fn title_of(&self, node_id: NodeId) -> Option<String> {
+        self.tree.doc(node_id).and_then(|doc| doc.fields().ok()).map(|fields| fields.title)
+    }
+
+    /// "Recently Deleted..." (docs/MOVE_CONTRACT.md "Seeing and undoing what
+    /// was removed"): the top-most tombstones — a tombstoned node whose held
+    /// parent is not itself a tombstone, or whose parent is not held — most
+    /// recently deleted first, then the live nodes no held list names,
+    /// excluding the store's root and, on a partial replica, its scope roots
+    /// (named by no list by design). A share that has ended has already taken
+    /// its documents with it ([`VaultStore::drop_roots`]), so nothing further
+    /// is excluded for that here.
+    fn list_deleted(&self, row: Option<&AccountStore>) -> Vec<DeletedNode> {
+        let mut tombstones: Vec<(NodeId, NodeFields)> = self
+            .tree
+            .ids()
+            .into_iter()
+            .filter_map(|id| self.tree.doc(id).and_then(|doc| doc.fields().ok()).map(|fields| (id, fields)))
+            .filter(|(_, fields)| fields.deleted_at.is_some())
+            .filter(|(_, fields)| {
+                fields
+                    .parent_id
+                    .and_then(|parent| self.tree.doc(parent))
+                    .and_then(|doc| doc.fields().ok())
+                    .is_none_or(|parent_fields| parent_fields.deleted_at.is_none())
+            })
+            .collect();
+        tombstones.sort_by(|(_, a), (_, b)| b.deleted_at.cmp(&a.deleted_at));
+
+        let mut out = Vec::with_capacity(tombstones.len());
+        for (id, fields) in tombstones {
+            let Some(mut node) = self.node_of_any(id) else { continue };
+            if !self.may_write(id, row) {
+                node.access = StoreAccess::Read;
+            }
+            let parent_title = fields.parent_id.and_then(|parent| self.title_of(parent));
+            out.push(DeletedNode { node, parent_title, deleted_at: fields.deleted_at, put_back_under: None });
+        }
+
+        // A live node no held list names: built the way repair reads a list
+        // (only a node's own list is ever repaired, so only a node's own list
+        // is worth reading here — `Tree::repair`'s doc comment).
+        let mut listed: HashSet<NodeId> = HashSet::new();
+        for id in self.tree.list_node_ids() {
+            if let Some(doc) = self.tree.doc(id) {
+                listed.extend(doc.children());
+            }
+        }
+        let roots: Vec<NodeId> = if self.is_partial() { self.scope_roots.clone() } else { vec![self.tree.root()] };
+        let mut unlisted: Vec<NodeId> = self
+            .tree
+            .list_node_ids()
+            .into_iter()
+            .filter(|id| !listed.contains(id) && !roots.contains(id))
+            .collect();
+        unlisted.sort_by_key(|id| id.to_string());
+
+        for id in unlisted {
+            let Some(mut node) = self.node_of_any(id) else { continue };
+            if !self.may_write(id, row) {
+                node.access = StoreAccess::Read;
+            }
+            let put_back_under = if self.is_partial() {
+                roots_above(&self.tree, &self.scope_roots, id).first().copied().unwrap_or_else(|| self.tree.root())
+            } else {
+                self.tree.root()
+            };
+            let parent_title = node.parent_id.and_then(|parent| self.title_of(parent));
+            out.push(DeletedNode { node, parent_title, deleted_at: None, put_back_under: Some(put_back_under) });
+        }
+
+        out
+    }
+
     /// Encrypt what goes to the server for one document: `update`, already
     /// merged into the document here, or — after a failed append, when the
     /// server is behind by more than this one change — everything it lacks.
@@ -2793,6 +3069,25 @@ fn share_marker_of(fields: &NodeFields) -> Option<pimble_core::ShareMarker> {
         .custom
         .get(custom_keys::SHARE)
         .and_then(|value| serde_json::from_value::<pimble_core::ShareMarker>(value.clone()).ok())
+}
+
+/// `roots` (nearest first, from [`pimble_crdt::Tree::shares`] or
+/// [`pimble_crdt::Tree::shares_left`]) resolved to what the move notice and
+/// "Recently Deleted..." show: each root's [`pimble_core::ShareMarker`] name,
+/// or its title when the marker does not parse (docs/MOVE_CONTRACT.md
+/// "Seeing and undoing what was removed").
+fn as_left_shares(tree: &Tree, roots: Vec<NodeId>) -> Vec<LeftShare> {
+    roots
+        .into_iter()
+        .map(|root| {
+            let name = tree
+                .doc(root)
+                .and_then(|doc| doc.fields().ok())
+                .map(|fields| share_marker_of(&fields).map(|marker| marker.name).unwrap_or(fields.title))
+                .unwrap_or_default();
+            LeftShare { root, name }
+        })
+        .collect()
 }
 
 /// Ask the accounts service for the keys of the shares in a whole store that
@@ -3228,6 +3523,8 @@ pub fn store_id_of(cmd: &BackendCommand) -> Option<StoreId> {
         | SetNodeAppearance { store_id, .. }
         | DeleteNode { store_id, .. }
         | MoveNode { store_id, .. }
+        | UndeleteNode { store_id, .. }
+        | ListDeleted { store_id }
         | CreateMount { store_id, .. }
         | GetMountState { store_id, .. }
         | BroadcastChanges { store_id, .. }
@@ -3305,6 +3602,21 @@ fn empty_folder(node_id: NodeId, title: &str) -> Node {
 /// pending — it is shown.
 pub fn is_refusal(message: &str) -> bool {
     StoreAccess::refusal_in(message).is_some() || message.starts_with("Forbidden: ")
+}
+
+/// What a `TransplantNode` earns when one of its stores is encrypted and the
+/// other is plain (docs/MOVE_CONTRACT.md "Between stores"): the vault client
+/// does a transplant between two stores it holds, and a plain store's is the
+/// hosted server's to do; the two are not one operation yet.
+pub const MIXED_TRANSPLANT_REFUSAL: &str = "Moving a node between an encrypted store and a plain one is not supported yet.";
+
+/// Whether a `TransplantNode` needs refusing because its two stores are not
+/// the same kind. `None` when both are encrypted (the vault client's to do,
+/// [`VaultClient::transplant_node`]) or both are plain (`process_command`'s,
+/// through whichever endpoint serves the source, as any other plain-store
+/// write).
+pub fn refuse_mixed_transplant(from_vault: bool, to_vault: bool) -> Option<BackendEvent> {
+    (from_vault != to_vault).then(|| BackendEvent::Error { message: MIXED_TRANSPLANT_REFUSAL.to_string() })
 }
 
 /// A sentence written for the person rather than an error: the app shows it in
@@ -5180,5 +5492,185 @@ mod tests {
         assert!(!writes(&BackendCommand::GetChildren { store_id, node_id }));
         assert!(!writes(&BackendCommand::SubscribeStoreChanges { store_id }));
         assert!(!writes(&BackendCommand::ListStores));
+    }
+
+    // ── Moving a node (docs/MOVE_CONTRACT.md) ────────────────────────────────
+
+    #[test]
+    fn a_move_that_leaves_a_share_appends_new_documents_with_their_own_keys_and_tombstones_the_original() {
+        let (mut peer, root) = origin();
+        let (share_a, share_b, note) = (NodeId::new(), NodeId::new(), NodeId::new());
+        peer.add_node(share_a, Some(root), None, "folder", "Alpha", T0).unwrap();
+        peer.add_node(share_b, Some(root), None, "folder", "Beta", T0).unwrap();
+        peer.add_node(note, Some(share_a), None, "document", "Note", T0).unwrap();
+
+        // The owner's page: the store key, and the key of each share.
+        let mut scope = keyring_for(None);
+        let store_key_id = scope.current.unwrap();
+        let (key_a_id, key_a) = scope_key();
+        let (key_b_id, key_b) = scope_key();
+        scope.keys.insert(key_a_id, key_a);
+        scope.keys.insert(key_b_id, key_b);
+        scope.scopes.push((Some(share_a), key_a_id));
+        scope.scopes.push((Some(share_b), key_b_id));
+
+        let store_id = StoreId::new();
+        let mut store = VaultStore::assemble(listed(root), StoreKeys::new(scope), Vec::new(), pull_of(&peer));
+        mark_shared(&mut store.tree, share_a, key_a_id, "Alpha");
+        mark_shared(&mut store.tree, share_b, key_b_id, "Beta");
+
+        // Read before the move happens: afterwards the original is a
+        // tombstone and answers nothing about the shares it used to be in.
+        let left_shares = as_left_shares(&store.tree, store.tree.shares_left(note, share_b));
+        assert_eq!(left_shares.len(), 1);
+        assert_eq!(left_shares[0].root, share_a);
+        assert_eq!(left_shares[0].name, "Alpha", "the first share it leaves, named from its marker");
+
+        let (new_id, edit) = store.tree.move_or_transplant(note, share_b, None, T1, &mut NodeId::new).unwrap();
+        assert_ne!(new_id, note, "moving into a different share is a transplant, not a move");
+        assert!(store.tree.doc(note).unwrap().fields().unwrap().deleted_at.is_some(), "the original is tombstoned");
+
+        for (id, update) in &edit.touched {
+            let outgoing = store.prepare(store_id, *id, update).unwrap();
+            if *id == new_id {
+                let (keys, parent_id) =
+                    outgoing.created.as_ref().expect("a document the server has never seen gets a key of its own");
+                assert_eq!(*parent_id, Some(share_b), "the append names the parent it lands under");
+                let mut under: Vec<KeyId> = keys.wraps.iter().map(|w| w.scope_key_id).collect();
+                under.sort_by_key(|id| id.to_string());
+                let mut want = vec![store_key_id, key_b_id];
+                want.sort_by_key(|id| id.to_string());
+                assert_eq!(under, want, "the store key, and the key of the share it lands in — never Alpha's");
+            } else {
+                assert!(outgoing.created.is_none(), "{id} already existed on the server");
+            }
+        }
+    }
+
+    #[test]
+    fn a_transplant_between_two_vault_stores_lands_with_the_text_intact_and_the_source_tombstoned() {
+        let (mut peer_from, root_from) = origin();
+        let note = NodeId::new();
+        peer_from.add_node(note, Some(root_from), None, "document", "Note", T0).unwrap();
+        peer_from.doc_mut(note).unwrap().replace_plain_text("Hello, world").unwrap();
+
+        let (peer_to, root_to) = origin();
+
+        let from_store_id = StoreId::new();
+        let to_store_id = StoreId::new();
+        let mut from_store = opened(&peer_from);
+        let mut to_store = opened(&peer_to);
+
+        // Created first: the cutting read out of the source, planted in the
+        // target with a fresh id, and appended there — as
+        // `VaultClient::transplant_node` does, minus the network.
+        let cutting = from_store.tree.take_cutting(note).unwrap();
+        let (new_id, edit_to) = to_store.tree.plant(cutting, root_to, None, T1, &mut NodeId::new).unwrap();
+        assert_ne!(new_id, note);
+        assert_eq!(to_store.tree.doc(new_id).unwrap().text(), "Hello, world", "the text survives a transplant");
+        assert_eq!(to_store.tree.get_node_info(new_id).unwrap().title, "Note");
+
+        for (id, update) in &edit_to.touched {
+            let outgoing = to_store.prepare(to_store_id, *id, update).unwrap();
+            if *id == new_id {
+                assert!(outgoing.created.is_some(), "a document the target has never seen gets a key of its own");
+            } else {
+                assert!(outgoing.created.is_none(), "the target's own root already existed");
+            }
+        }
+
+        // Deleted second, only once the new home would be on the server.
+        let tombstone_edit = from_store.tree.remove_node(note, T1).unwrap();
+        assert!(from_store.tree.doc(note).unwrap().fields().unwrap().deleted_at.is_some());
+        for (id, update) in &tombstone_edit.touched {
+            let outgoing = from_store.prepare(from_store_id, *id, update).unwrap();
+            assert!(outgoing.created.is_none(), "the source's documents already existed");
+        }
+    }
+
+    #[test]
+    fn a_plain_store_on_either_side_of_a_transplant_is_refused_with_the_sentence() {
+        assert!(refuse_mixed_transplant(true, true).is_none(), "both encrypted: the vault client's to do");
+        assert!(refuse_mixed_transplant(false, false).is_none(), "both plain: the server's to do");
+        for (from_vault, to_vault) in [(true, false), (false, true)] {
+            let refused = refuse_mixed_transplant(from_vault, to_vault).expect("one of each store kind is refused");
+            assert!(
+                matches!(&refused, BackendEvent::Error { message } if message == MIXED_TRANSPLANT_REFUSAL),
+                "the sentence alone: {refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_deleted_names_a_tombstone_s_parent_and_an_unlisted_node_s_place_to_go_back_to() {
+        let (mut peer, root) = origin();
+        let folder = NodeId::new();
+        peer.add_node(folder, Some(root), None, "folder", "Notes", T0).unwrap();
+        let gone = NodeId::new();
+        peer.add_node(gone, Some(folder), None, "document", "Gone", T0).unwrap();
+        peer.remove_node(gone, T1).unwrap();
+
+        let stray = NodeId::new();
+        peer.add_node(stray, Some(root), None, "document", "Stray", T0).unwrap();
+        // A tampered or half-applied edit: still under `root` by `parent_id`,
+        // but `root`'s own list no longer names it.
+        peer.doc_mut(root).unwrap().remove_child(stray).unwrap();
+
+        let store = opened(&peer);
+        let nodes = store.list_deleted(None);
+
+        let tombstone = nodes.iter().find(|d| d.node.id == gone).expect("the tombstone is listed");
+        assert_eq!(tombstone.parent_title.as_deref(), Some("Notes"));
+        assert!(tombstone.deleted_at.is_some());
+        assert!(tombstone.put_back_under.is_none(), "undeleteNode puts it back where it was");
+
+        let unlisted = nodes.iter().find(|d| d.node.id == stray).expect("the unlisted node is listed");
+        assert!(unlisted.deleted_at.is_none());
+        assert_eq!(unlisted.put_back_under, Some(root));
+
+        // Neither the folder (holds a tombstone but is not one itself) nor
+        // the root (the store's own, never a candidate) is listed.
+        assert!(!nodes.iter().any(|d| d.node.id == folder || d.node.id == root));
+    }
+
+    #[test]
+    fn undeleting_a_node_puts_it_back_under_the_parent_it_was_deleted_from() {
+        let (mut peer, root) = origin();
+        let folder = NodeId::new();
+        peer.add_node(folder, Some(root), None, "folder", "Notes", T0).unwrap();
+        let note = NodeId::new();
+        peer.add_node(note, Some(folder), None, "document", "Note", T0).unwrap();
+        peer.remove_node(note, T1).unwrap();
+        assert!(peer.get_node_info(note).is_err(), "a tombstone answers nothing to get_node_info");
+
+        // What `VaultClient::undelete_node` does: `Tree::undelete_node`, then
+        // read the parent it went back to, which is what its `NodeCreated`
+        // names.
+        peer.undelete_node(note, T2).unwrap();
+        let info = peer.get_node_info(note).unwrap();
+        assert_eq!(info.parent_id, Some(folder));
+        assert_eq!(peer.get_children(folder).unwrap(), vec![note]);
+    }
+
+    #[test]
+    fn a_reader_s_transplant_and_undelete_are_refused_with_the_read_only_sentence() {
+        let (store_id, other_id) = (StoreId::new(), StoreId::new());
+        let root = NodeId::new();
+        let mut client = VaultClient::new("me".to_string());
+        client.rows.insert(store_id, row(vec![grant(Some(root), "reader", "Recipes")], Some("ann@example.com")));
+
+        let transplant = BackendCommand::TransplantNode {
+            from_store_id: store_id,
+            node_id: NodeId::new(),
+            to_store_id: other_id,
+            new_parent_id: NodeId::new(),
+            position: None,
+        };
+        let refused = client.refuse_write(store_id, &transplant).expect("a reader may not transplant out of their root");
+        assert!(matches!(&refused, BackendEvent::Error { message } if message == StoreAccess::READ_ONLY_REFUSAL));
+
+        let undelete = BackendCommand::UndeleteNode { store_id, node_id: NodeId::new() };
+        let refused = client.refuse_write(store_id, &undelete).expect("a reader may not undelete either");
+        assert!(matches!(&refused, BackendEvent::Error { message } if message == StoreAccess::READ_ONLY_REFUSAL));
     }
 }
