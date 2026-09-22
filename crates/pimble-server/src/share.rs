@@ -14,7 +14,13 @@
 //!   the hosted server holds wrapped under the share key alone, gets the
 //!   store key's wrap, so the owner's other devices and web app read it.
 //! - **The scope set**: which documents are under the node, published to
-//!   the hosted server from this device's own tree.
+//!   the hosted server from this device's own tree. What is published only
+//!   grows until the share is stopped (docs/MOVE_CONTRACT.md, "Repair"):
+//!   this device's own tree can reach fewer documents than a member
+//!   already holds (a tombstone's chain still includes it, but a
+//!   vandalized `parent_id` that also unlists a node, or another owner
+//!   device mid-sync, can not), so a pass grows the hosted server's own
+//!   account of the set rather than replacing it (see [`grown_scope`]).
 //!
 //! Three pieces:
 //!
@@ -398,6 +404,20 @@ async fn plan(handler: &RpcHandler, store_id: StoreId) -> Option<Vec<SharePlan>>
     )
 }
 
+/// The set to publish for a root: never smaller than what the hosted
+/// server already holds of it (docs/MOVE_CONTRACT.md, "Repair": "a
+/// published scope set is the union of what it was and what the root
+/// reaches now"). This device's own tree can compute a smaller reach than
+/// a member already holds — a vandalized `parent_id` that also unlists a
+/// node leaves nothing in this device's tree pointing at it, and another
+/// owner device can be mid-sync — so a pass grows the remote's own account
+/// of the scope instead of replacing it with what this pass alone can
+/// see. Only stopping the share may shrink it (`retire`, which empties it
+/// outright).
+fn grown_scope(remote: &HashSet<NodeId>, computed: &HashSet<NodeId>) -> HashSet<NodeId> {
+    computed.union(remote).copied().collect()
+}
+
 /// What became of bringing one document's wraps up to what is wanted.
 enum Settle {
     Done,
@@ -413,9 +433,14 @@ pub(crate) struct Upkeep {
     due: Option<Instant>,
     /// When the run of changes the pending pass waits out began.
     first_noted: Option<Instant>,
-    /// The sets this connection has published, so an unchanged scope is not
-    /// sent again by every pass. Every connect publishes afresh: the last
-    /// publisher wins, and another device may have published since.
+    /// The fullest set known published for each root this connection, so
+    /// an unchanged scope is not sent again by every pass: `None` (no
+    /// entry) until a root has something new to publish, at which point it
+    /// is seeded from the hosted server's own account of the scope and
+    /// grown (`grown_scope`), never replaced by a smaller one. Cleared at
+    /// every connect, since a pass that finds nothing new to add simply
+    /// does not publish, and the remote's own account, read again the next
+    /// time there is something new, is always at least as current as this.
     published: HashMap<NodeId, HashSet<NodeId>>,
     /// Roots being stopped: not published again, even though the marker is
     /// still there for a moment (the scope goes first, the marker second).
@@ -601,14 +626,33 @@ impl Upkeep {
             if self.retired.contains(&share.root) {
                 continue;
             }
-            if self.published.get(&share.root) != Some(&share.docs) {
-                let mut doc_ids: Vec<NodeId> = share.docs.iter().copied().collect();
+            // Nothing new to publish when what this pass can see is
+            // already inside what is known published: skip the remote
+            // read too, so a quiet share costs nothing per pass.
+            let known = self.published.get(&share.root);
+            if !known.is_some_and(|known| share.docs.is_subset(known)) {
+                // Something in this device's reach is not yet known
+                // published. Read the hosted server's own account back and
+                // grow it (`grown_scope`) rather than replacing it: another
+                // owner device may have published documents this device's
+                // own tree does not reach right now.
+                let remote: HashSet<NodeId> = link
+                    .client()
+                    .get_scopes(store_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("remote getScopes for {} failed: {}", share.root, e))?
+                    .into_iter()
+                    .find(|scope| scope.root == share.root)
+                    .map(|scope| scope.doc_ids.into_iter().collect())
+                    .unwrap_or_default();
+                let grown = grown_scope(&remote, &share.docs);
+                let mut doc_ids: Vec<NodeId> = grown.iter().copied().collect();
                 doc_ids.sort_by_key(|id| id.to_string());
                 let scope = Scope { root: share.root, doc_ids };
                 match link.client().set_scope(store_id, scope, false).await {
                     Ok(()) => {
-                        debug!("Share {} of store {}: published a scope of {} document(s)", share.root, store_id, share.docs.len());
-                        self.published.insert(share.root, share.docs.clone());
+                        debug!("Share {} of store {}: published a scope of {} document(s)", share.root, store_id, grown.len());
+                        self.published.insert(share.root, grown);
                     }
                     // Not an owner after all (the rows could not be read at
                     // connect, or the role changed since): not this
@@ -1164,6 +1208,31 @@ mod tests {
 
     fn member(status: &str, has_key: bool, role: &str) -> MemberView {
         MemberView { user_id: None, email: "m@example.com".into(), role: role.into(), status: status.into(), has_key, public_keys: None }
+    }
+
+    #[test]
+    fn a_grown_scope_never_drops_a_document_the_remote_already_published() {
+        let a = NodeId::new();
+        let b = NodeId::new();
+        let c = NodeId::new();
+
+        // The remote holds a document (`c`, a tombstone a tampered client
+        // also unlisted, or one another owner device published) that this
+        // device's own tree does not currently reach.
+        let remote: HashSet<NodeId> = [a, b, c].into_iter().collect();
+        let computed: HashSet<NodeId> = [a, b].into_iter().collect();
+        assert_eq!(grown_scope(&remote, &computed), remote, "the union keeps what the remote already has");
+
+        // The reverse: this device sees a document the remote has not
+        // heard of yet (a fresh create); the union grows to include it.
+        let remote: HashSet<NodeId> = [a].into_iter().collect();
+        let computed: HashSet<NodeId> = [a, b].into_iter().collect();
+        assert_eq!(grown_scope(&remote, &computed), computed, "the union grows to include a new document");
+
+        // Neither side ever shrinks what the other already had.
+        let remote: HashSet<NodeId> = [a, c].into_iter().collect();
+        let computed: HashSet<NodeId> = [a, b].into_iter().collect();
+        assert_eq!(grown_scope(&remote, &computed), [a, b, c].into_iter().collect(), "the union is never smaller than either side");
     }
 
     #[test]

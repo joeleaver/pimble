@@ -158,6 +158,20 @@ async fn main() -> Result<()> {
             }
             undelete_node(&args[2], &args[3]).await?;
         }
+        "transplant-node" => {
+            if args.len() < 6 {
+                eprintln!("Usage: pimble-cli transplant-node <from-store> <node> <to-store> <parent>");
+                return Ok(());
+            }
+            transplant_node(&args[2], &args[3], &args[4], &args[5]).await?;
+        }
+        "list-deleted" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pimble-cli list-deleted <store>");
+                return Ok(());
+            }
+            list_deleted(&args[2]).await?;
+        }
         "set-node-text" => {
             if args.len() < 5 {
                 eprintln!("Usage: pimble-cli set-node-text <store-id> <node-id> <text>");
@@ -372,6 +386,8 @@ COMMANDS:
     move-node           Move a node under a new parent (appended last)
     delete-node         Delete a node and its whole subtree (a tombstone)
     undelete-node       Bring a deleted node and its subtree back
+    transplant-node     Move a node into another store (always a transplant)
+    list-deleted        List a store's tombstones and unlisted live nodes
     set-node-text       Set a node's content from plain text
     show-node           Print a node's metadata and content text
     search              Search across all open stores
@@ -455,6 +471,8 @@ EXAMPLES:
     pimble-cli move-node <store-id> <node-id> <new-parent-id>
     pimble-cli delete-node <store-id> <node-id>
     pimble-cli undelete-node <store-id> <node-id>
+    pimble-cli transplant-node <from-store-id> <node-id> <to-store-id> <new-parent-id>
+    pimble-cli list-deleted <store-id>
     pimble-cli set-node-text <store-id> <node-id> "Hello, world"
     pimble-cli show-node <store-id> <node-id>
     pimble-cli search "hello"
@@ -1211,6 +1229,58 @@ async fn undelete_node(store_id: &str, node_id: &str) -> Result<()> {
     let client = connect().await?;
     client.undelete_node(store_id, node_id).await?;
     println!("Undeleted node {} and what its deletion took with it", node_id);
+    Ok(())
+}
+
+/// A move between stores is always a transplant (docs/MOVE_CONTRACT.md "The
+/// operation: transplant"): two stores hold different documents, so the node
+/// lands as a new id in `to_store_id` and the original is tombstoned, in
+/// place, in `from_store_id`.
+async fn transplant_node(from_store_id: &str, node_id: &str, to_store_id: &str, new_parent_id: &str) -> Result<()> {
+    let from_store_id = parse_store_id(from_store_id)?;
+    let node_id = parse_node_id(node_id)?;
+    let to_store_id = parse_store_id(to_store_id)?;
+    let new_parent_id = parse_node_id(new_parent_id)?;
+
+    let client = connect().await?;
+    let answer = client.transplant_node(from_store_id, node_id, to_store_id, new_parent_id, None).await?;
+    let out_of = if answer.left_shares.is_empty() {
+        String::new()
+    } else {
+        let left: Vec<String> = answer.left_shares.iter().map(|share| format!("\"{}\"", share.name)).collect();
+        format!(" out of {}", left.join(", "))
+    };
+    println!(
+        "Transplanted node {} of store {}{} as new node {} under {} of store {}; the original is deleted there and can be put back",
+        node_id, from_store_id, out_of, answer.node_id, new_parent_id, to_store_id
+    );
+    Ok(())
+}
+
+/// "Recently Deleted...": the top-most tombstones and the live nodes no
+/// list names, most recently deleted first (docs/MOVE_CONTRACT.md "Seeing
+/// and undoing what was removed").
+async fn list_deleted(store_id: &str) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+
+    let client = connect().await?;
+    let nodes = client.list_deleted(store_id).await?;
+    if nodes.is_empty() {
+        println!("Nothing deleted in store {}", store_id);
+        return Ok(());
+    }
+    for entry in nodes {
+        let title = if entry.node.metadata.title.trim().is_empty() { "Untitled" } else { entry.node.metadata.title.as_str() };
+        let mut clauses = vec![format!("\"{}\"", title)];
+        if let Some(parent_title) = &entry.parent_title {
+            clauses.push(format!("in \"{}\"", parent_title));
+        }
+        clauses.push(entry.deleted_at.clone().unwrap_or_else(|| "unlisted".to_string()));
+        if let Some(put_back_under) = entry.put_back_under {
+            clauses.push(format!("put back under {}", put_back_under));
+        }
+        println!("{} {}", entry.node.id, clauses.join(", "));
+    }
     Ok(())
 }
 
