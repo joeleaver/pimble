@@ -1262,6 +1262,76 @@ async fn a_member_who_holds_two_shares_moves_a_note_from_one_into_the_other() {
     c.stop().await.unwrap();
 }
 
+/// A subtree of more than its root node, transplanted between two shares of
+/// one store (docs/MOVE_CONTRACT.md "The operation: transplant" step 1:
+/// "For `node` and its live subtree, in preorder, a new document each"):
+/// every document the transplant plants, not only the one `moveNode` names,
+/// must reach the hosted twin wrapped under the destination share's key —
+/// otherwise a member who holds only that share could open the folder the
+/// move planted and find the document inside it unreadable. Carol never
+/// held Holiday, the share the subtree leaves, so anything she can read of
+/// it came from Errands' own wrap alone.
+#[tokio::test]
+async fn a_subtree_transplanted_between_shares_is_readable_at_every_planted_node() {
+    let env = spawn_env().await;
+    let (mut a, alice, a_dir) = start_local_server().await;
+    let fx = hosted_fixture(&env, &alice, a_dir.path()).await;
+    let (store_id, holiday) = (fx.store_id, fx.shared);
+    // `Tickets` (`fx.deeper`, a folder) already carries `Train` (`fx.leaf`)
+    // inside it (see `Fixture`'s diagram) — a real two-node subtree, not a
+    // single document, and text on the leaf a member can look for after
+    // the move to know its content, not only its id, made the trip.
+    seed_content(&alice, store_id, fx.leaf, "alice", "TRAIN-DEPARTS-NINE").await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // A second share of the same store, disjoint from Holiday.
+    let errands = alice.create_node(store_id, Some(fx.root_id), "folder", "Errands").await.unwrap();
+    wait_all_seeded(&env, store_id, &[errands]).await;
+    alice.cloud_share_node(store_id, holiday, "Holiday Plans").await.unwrap();
+    alice.cloud_share_node(store_id, errands, "Errands").await.unwrap();
+    // Bob holds both shares and makes the move; Carol holds only Errands,
+    // the share the subtree lands in, and is never invited to Holiday.
+    alice.cloud_share_invite(store_id, holiday, BOB.0, MemberRole::Editor).await.unwrap();
+    alice.cloud_share_invite(store_id, errands, BOB.0, MemberRole::Editor).await.unwrap();
+    alice.cloud_share_invite(store_id, errands, CAROL.0, MemberRole::Editor).await.unwrap();
+
+    let (mut b, bob, _b_dir) = member_device(&env, BOB, &fx).await;
+    let pulled_errands = wait_until(Duration::from_secs(15), || async { bob.get_node(store_id, errands).await.is_ok() }).await;
+    assert!(pulled_errands, "bob's one replica pulled both shares at once");
+
+    let (mut c, carol, _c_dir) = start_local_server().await;
+    env.sign_in(&carol, CAROL).await;
+    carol.cloud_add_hosted_store(store_id).await.expect("a share is added like any hosted store");
+    let carol_pulled = wait_until(Duration::from_secs(15), || async { carol.get_node(store_id, errands).await.is_ok() }).await;
+    assert!(carol_pulled, "carol's replica pulls the one share she holds");
+
+    // Bob moves `Tickets`, with `Train` inside it, out of Holiday and into
+    // Errands: two shares of one store, so the whole subtree leaves
+    // Holiday and is replanted under Errands, fresh documents and all.
+    let moved = bob.move_node(store_id, fx.deeper, errands, None).await.expect("a move between two shares of one store");
+    let new_deeper = moved.node_id;
+    assert_ne!(new_deeper, fx.deeper, "the subtree's root gets a new id");
+
+    let got_child = wait_until(Duration::from_secs(20), || async { !child_ids(&alice, store_id, new_deeper).await.is_empty() }).await;
+    assert!(got_child, "the child came along with its folder");
+    let new_leaf = child_ids(&alice, store_id, new_deeper).await[0];
+    assert_ne!(new_leaf, fx.leaf, "the child gets a new id too: nothing of the old document is shared with the new one");
+
+    // Carol, who never held Holiday, reads both planted nodes once the
+    // owner's vault link wraps their data keys under Errands' key and
+    // publishes them into its scope — the whole subtree the transplant
+    // made, not only the node `moveNode` named.
+    let carol_reads_the_folder = wait_until(Duration::from_secs(20), || async { carol.get_node(store_id, new_deeper).await.is_ok() }).await;
+    assert!(carol_reads_the_folder, "the planted folder reaches carol, who only holds Errands");
+    let carol_reads_the_leaf = wait_until(Duration::from_secs(20), || async { node_text(&carol, store_id, new_leaf).await.contains("TRAIN-DEPARTS-NINE") }).await;
+    assert!(carol_reads_the_leaf, "and so does the document planted inside it, with the text it carried before the move");
+    assert!(child_ids(&carol, store_id, errands).await.contains(&new_deeper), "listed under Errands, where carol can see it");
+
+    a.stop().await.unwrap();
+    b.stop().await.unwrap();
+    c.stop().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_reader_reads_the_share_and_cannot_write() {
     let env = spawn_env().await;

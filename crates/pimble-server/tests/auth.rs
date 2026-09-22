@@ -954,3 +954,57 @@ async fn put_back_of_a_node_no_list_names_succeeds_for_an_editor_of_its_scope() 
     assert_eq!(answer.node_id, inside, "putting it back under the same scope is a plain move, not a transplant");
     assert_eq!(member.get_children(store_id, shared).await.unwrap().1.iter().map(|n| n.id).collect::<Vec<_>>(), vec![inside]);
 }
+
+/// The list a move leaves is the list that names the node, not the node's
+/// `parent_id` (docs/MOVE_CONTRACT.md "Repair", and the write-judgement
+/// finding it left open): a tampered client points a node's `parent_id` at
+/// a root the mover may write, with no list update to match, exactly what
+/// would otherwise launder the node into a scope its real list never put
+/// it in. A member who may only read the folder that still lists the node
+/// is refused moving it, even though the tampered `parent_id` alone would
+/// place the node in a root they may write.
+#[tokio::test]
+async fn a_move_is_refused_when_the_list_naming_the_node_is_a_root_the_member_only_reads() {
+    let s = SharedStore::start().await;
+    let (store_id, root, shared, inside) = (s.store_id, s.root, s.shared, s.inside);
+    let edited = s.admin.create_node(store_id, Some(root), "folder", "Edited").await.unwrap();
+    // Connected before the tamper, so the JWT/JWKS round trip a fresh
+    // client needs is not part of the window below: without a share marker
+    // on either folder (this store is scoped by JWT roots, not
+    // `custom["share"]`), general repair treats a bare `parent_id` as the
+    // truth and would relist the node itself once its 250ms debounce
+    // fires, which is a real and separate behaviour this test is not
+    // about — the write judgement below is.
+    let member = s.member("gail", &[(shared, "reader"), (edited, "editor")]).await;
+
+    // The tamper: `inside`'s own document gets a `parent_id` naming
+    // `edited`, a root this principal may write, with `shared`'s list left
+    // exactly as it was — what a client that does not keep
+    // docs/MOVE_CONTRACT.md's "list wins" rule would write.
+    let bytes = s.admin.get_node(store_id, inside).await.unwrap().content;
+    let mut doc = pimble_crdt::NodeDoc::load(&bytes).unwrap();
+    let before_sv = doc.state_vector();
+    doc.set_parent_id(Some(edited), &chrono::Utc::now().to_rfc3339()).unwrap();
+    let diff = doc.diff_since(&before_sv).unwrap();
+    s.admin
+        .apply_edit(
+            store_id,
+            inside,
+            "tamperer",
+            pimble_rpc::EditOperation::IncrementalChanges { changes: base64::engine::general_purpose::STANDARD.encode(diff) },
+        )
+        .await
+        .expect("the merge itself is unconditional; only the write judgement below is what this test checks");
+
+    // A member who reads `shared` and edits `edited`: the tampered
+    // `parent_id` alone would place `inside` in `edited`'s write scope, but
+    // `shared`'s list is the one the move actually leaves, and that is
+    // theirs to read only. Called at once, with nothing else awaited in
+    // between, to land inside the window above.
+    refused_as_read_only(member.move_node(store_id, inside, edited, None).await, "shared's list, not the tampered parent_id, is judged");
+    assert_eq!(
+        s.admin.get_children(store_id, shared).await.unwrap().1.iter().map(|n| n.id).collect::<Vec<_>>(),
+        vec![inside],
+        "the refused move left shared's own list exactly as it was"
+    );
+}

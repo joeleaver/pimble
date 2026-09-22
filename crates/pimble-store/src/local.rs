@@ -880,33 +880,30 @@ impl LocalStore {
 
     // ── Nodes ────────────────────────────────────────────────────────────
 
+    /// A RFC 3339 timestamp pair as the `created_at`/`modified_at` a
+    /// [`NodeMetadata`] carries, defaulting to now on a document too old or
+    /// too damaged to parse. The one place either
+    /// [`LocalStore::assemble_node`] or [`LocalStore::get_node_any`] turns a
+    /// node's stored fields into metadata, so they read timestamps the same
+    /// way instead of each parsing its own copy.
+    fn node_metadata(title: String, created_at: &str, modified_at: &str, tags: Vec<String>, custom: HashMap<String, serde_json::Value>) -> NodeMetadata {
+        let parse = |s: &str| DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now());
+        NodeMetadata { title, created_at: parse(created_at), modified_at: parse(modified_at), tags, custom }
+    }
+
     /// Assemble a Node from the tree's view of `node_id` and its document's
     /// bytes. The content is the whole node document (the editor joins it
     /// as it joined a content document; Pimble's roots ride along).
     fn assemble_node(&self, node_id: NodeId) -> Result<Node> {
         let info = self.tree.get_node_info(node_id).map_err(|_| StoreError::NodeNotFound(node_id))?;
         let children = self.tree.get_children(node_id).map_err(|_| StoreError::NodeNotFound(node_id))?;
-
-        let created_at = DateTime::parse_from_rfc3339(&info.created_at)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
-        let modified_at = DateTime::parse_from_rfc3339(&info.modified_at)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
-
         let content = self.tree.doc(node_id).map(NodeDoc::save).unwrap_or_default();
 
         Ok(Node {
             id: node_id,
             parent_id: info.parent_id,
             node_type: info.node_type,
-            metadata: NodeMetadata {
-                title: info.title,
-                created_at,
-                modified_at,
-                tags: info.tags,
-                custom: info.custom,
-            },
+            metadata: Self::node_metadata(info.title, &info.created_at, &info.modified_at, info.tags, info.custom),
             content,
             children,
             links: Vec::new(),
@@ -923,38 +920,28 @@ impl LocalStore {
         self.assemble_node(node_id)
     }
 
-    /// [`LocalStore::get_node`], but for a tombstone too
-    /// (docs/MOVE_CONTRACT.md "Seeing and undoing what was removed":
-    /// `listDeleted` reads a tombstone's fields and content the same way it
-    /// reads a live node's). Its children come straight off the document,
-    /// unrepaired: `Tree::get_children` refuses anything it does not
-    /// consider a node, and a tombstone's list is exactly what
-    /// `undeleteNode` restores, entries it does not hold included.
+    /// [`LocalStore::get_node`] without requiring the node to be live: for
+    /// "Recently Deleted..." (docs/MOVE_CONTRACT.md "Seeing and undoing what
+    /// was removed"), which needs a tombstone's fields (and a live node's,
+    /// for the ones no held list names) even though
+    /// `Tree::get_node_info`/`Tree::get_children` refuse anything not live.
+    /// `NodeNotFound` only for an id with no document at all, or whose
+    /// `node` root has not arrived. Content and children are left empty on
+    /// purpose: the list shows a name and a place to put it back, not the
+    /// note itself, the same choice `pimble-web`'s
+    /// `VaultStore::node_of_any` makes on the encrypted side. Something
+    /// that wants the note back reads it with `get_node` after
+    /// `undelete_node`, not from here.
     pub fn get_node_any(&self, node_id: NodeId) -> Result<Node> {
-        if self.tree.has_node(node_id) {
-            return self.assemble_node(node_id);
-        }
         let doc = self.tree.doc(node_id).ok_or(StoreError::NodeNotFound(node_id))?;
         let fields = doc.fields().map_err(|_| StoreError::NodeNotFound(node_id))?;
-        let created_at = DateTime::parse_from_rfc3339(&fields.created_at)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
-        let modified_at = DateTime::parse_from_rfc3339(&fields.modified_at)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
         Ok(Node {
             id: node_id,
             parent_id: fields.parent_id,
             node_type: fields.node_type,
-            metadata: NodeMetadata {
-                title: fields.title,
-                created_at,
-                modified_at,
-                tags: fields.tags,
-                custom: fields.custom,
-            },
-            content: doc.save(),
-            children: doc.children(),
+            metadata: Self::node_metadata(fields.title, &fields.created_at, &fields.modified_at, fields.tags, fields.custom),
+            content: Vec::new(),
+            children: Vec::new(),
             links: Vec::new(),
             access: StoreAccess::Full,
         })

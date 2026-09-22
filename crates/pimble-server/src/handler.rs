@@ -584,6 +584,54 @@ fn scope_root_reaching(tree: &Tree, scope_roots: &HashSet<NodeId>, id: NodeId) -
     None
 }
 
+/// Every held document in `store_id` whose stored list currently names
+/// `node_id` (docs/MOVE_CONTRACT.md "The list a move leaves is the list
+/// that names the node, not the node's `parent_id`"): a node's stored
+/// `parent_id` and the list that actually claims it can disagree, either
+/// because a tampered client wrote `parent_id` on its own or because a
+/// move's list edits are still in flight, so the list is what a write
+/// judgement must find and check on its own, not assume from `parent_id`.
+/// Raw `NodeDoc::children`, not `Tree::get_children`'s filtered view: a
+/// tombstoned owner's list counts too (it is what `undeleteNode` would
+/// restore the node into), and a list is what a move's `TreeEdit` actually
+/// edits, whatever `get_children` would filter out of it. Usually empty or
+/// one entry; more than one only while concurrent edits are still merging.
+fn lists_naming(tree: &Tree, node_id: NodeId) -> Vec<NodeId> {
+    tree.ids().into_iter().filter(|&owner| tree.doc(owner).is_some_and(|doc| doc.children().contains(&node_id))).collect()
+}
+
+/// The write judgement `moveNode` and `transplantNode` both make on the
+/// store a node moves out of, before either touches anything
+/// (docs/MOVE_CONTRACT.md item 1 of the server's move findings): one
+/// helper, so the two can never drift the way they had (each read the old
+/// parent slightly differently). The caller must hold Write on `node_id`
+/// and on every list in `store_id` that names it (`lists_naming`) — not
+/// only on the document `parent_id` happens to name, since that is exactly
+/// what a tamper or an in-flight move can make disagree with the lists.
+/// When no list names the node, there is nothing to leave (the contract's
+/// "Put Back" of a node no list names, "Seeing and undoing what was
+/// removed"): only the node itself is judged, as before. Returns the old
+/// parent id a notification should name: the first list that names the
+/// node, or, when none does, the document's own stored `parent_id`.
+fn judge_move_source(manager: &StoreManager, reach: &Option<Reach>, store_id: StoreId, node_id: NodeId) -> Result<NodeId, ErrorObjectOwned> {
+    require_in_scope(reach, node_id, Access::Write)?;
+    let stored_parent_id = manager
+        .get_node(store_id, node_id)
+        .map_err(to_rpc_error)?
+        .parent_id
+        .ok_or_else(|| to_rpc_error("Cannot move the root node"))?;
+    let listing = lists_naming(manager.tree(store_id).map_err(to_rpc_error)?, node_id);
+    for &owner in &listing {
+        require_in_scope(reach, owner, Access::Write)?;
+    }
+    let mut judged_ids = vec![node_id];
+    judged_ids.extend(listing.iter().copied());
+    if manager.write_refused(store_id, &judged_ids) {
+        return Err(read_only_error());
+    }
+    Ok(listing.first().copied().unwrap_or(stored_parent_id))
+}
+
 /// The notifications a merged update earns, from what it changed in the
 /// document (docs/NODE_DOCUMENT_CONTRACT.md section 2): the `node` root
 /// newly written is `NodeCreated` (or `NodeDeleted` when it arrived as a
@@ -3567,38 +3615,14 @@ impl PimbleApiServer for RpcHandler {
 
         let mut manager = self.store_manager.write().await;
         let reach = Reach::of(&manager, &principal, request.store_id);
-        require_in_scope(&reach, request.node_id, Access::Write)?;
-        // The old parent is read off the tree before the move rewrites it,
-        // and whether its list actually names the node: it may not
-        // (docs/MOVE_CONTRACT.md "Seeing and undoing what was removed", "Put
-        // Back" of a node no list names). A `parent_id` a tampered client
-        // wrote can point anywhere, including somewhere this principal has
-        // no grant on at all; when no list there claims the node, there is
-        // no list to leave, so only the node and the new parent are judged.
-        let old_parent_id = manager
-            .get_node(request.store_id, request.node_id)
-            .map_err(to_rpc_error)?
-            .parent_id
-            .ok_or_else(|| to_rpc_error("Cannot move the root node"))?;
-        let old_parent_lists_it = manager
-            .tree(request.store_id)
-            .map_err(to_rpc_error)?
-            .get_children(old_parent_id)
-            .map(|children| children.contains(&request.node_id))
-            .unwrap_or(false);
-        // A move edits the node and the new parent always, and the old
-        // parent when it is actually the list the node leaves: a member
-        // moves within what they may write, never into or out of it (a
-        // parent outside the scope is not theirs to edit).
-        if old_parent_lists_it {
-            require_in_scope(&reach, old_parent_id, Access::Write)?;
-        }
+        // The node and every list that names it (docs/MOVE_CONTRACT.md
+        // item 1 of the server's move findings, `judge_move_source`): a
+        // move edits the node and the new parent always, and every list
+        // it actually leaves — never only what its `parent_id` claims,
+        // which a tamper or an in-flight move can point anywhere.
+        let old_parent_id = judge_move_source(&manager, &reach, request.store_id, request.node_id)?;
         require_in_scope(&reach, request.new_parent_id, Access::Write)?;
-        let mut judged_ids = vec![request.node_id, request.new_parent_id];
-        if old_parent_lists_it {
-            judged_ids.push(old_parent_id);
-        }
-        if manager.write_refused(request.store_id, &judged_ids) {
+        if manager.write_refused(request.store_id, &[request.new_parent_id]) {
             return Err(read_only_error());
         }
 
@@ -3711,30 +3735,12 @@ impl PimbleApiServer for RpcHandler {
         // Authorization is judged per store, in its own store (a mount is
         // addressed by its canonical store everywhere else in this file;
         // `node_id`/`new_parent_id` here name no mount, since planting under
-        // one is refused below the same way `createNode` refuses it).
+        // one is refused below the same way `createNode` refuses it). The
+        // source side is the same judgement `moveNode` makes on the store a
+        // node leaves (`judge_move_source`): the node and every list that
+        // names it, not only what its `parent_id` claims.
         let source_reach = Reach::of(&manager, &principal, request.from_store_id);
-        require_in_scope(&source_reach, request.node_id, Access::Write)?;
-        let old_parent_id = manager
-            .get_node(request.from_store_id, request.node_id)
-            .map_err(to_rpc_error)?
-            .parent_id
-            .ok_or_else(|| to_rpc_error("Cannot transplant the root node"))?;
-        let old_parent_lists_it = manager
-            .tree(request.from_store_id)
-            .map_err(to_rpc_error)?
-            .get_children(old_parent_id)
-            .map(|children| children.contains(&request.node_id))
-            .unwrap_or(false);
-        if old_parent_lists_it {
-            require_in_scope(&source_reach, old_parent_id, Access::Write)?;
-        }
-        let mut source_judged_ids = vec![request.node_id];
-        if old_parent_lists_it {
-            source_judged_ids.push(old_parent_id);
-        }
-        if manager.write_refused(request.from_store_id, &source_judged_ids) {
-            return Err(read_only_error());
-        }
+        let old_parent_id = judge_move_source(&manager, &source_reach, request.from_store_id, request.node_id)?;
 
         let target_reach = Reach::of(&manager, &principal, request.to_store_id);
         require_in_scope(&target_reach, request.new_parent_id, Access::Write)?;
@@ -3757,7 +3763,7 @@ impl PimbleApiServer for RpcHandler {
         self.broadcast_tree_edit(
             request.from_store_id,
             &outcome.source_edit,
-            &[(node_id, StoreChangeKind::NodeDeleted { node_id, parent_id: outcome.source_removal.parent_id })],
+            &[(node_id, StoreChangeKind::NodeDeleted { node_id, parent_id: old_parent_id })],
             None,
         )
         .await;
@@ -3822,15 +3828,14 @@ impl PimbleApiServer for RpcHandler {
         }
 
         // Which lists name which held children, once: a node is "no list
-        // names it" when it is absent from every one of these.
+        // names it" when it is absent from every one of these. Each
+        // owner's raw stored list, read once — `Tree::get_children`'s
+        // filtered view is always a subset of it, so reading that too
+        // would only read the same list twice — and a tombstone's own
+        // (unrepaired) list still counts: it is what `undeleteNode` restores.
         let mut listed: HashSet<NodeId> = HashSet::new();
         for &owner in node_ids.iter().chain(tombstones.iter()) {
-            if let Ok(children) = tree.get_children(owner) {
-                listed.extend(children);
-            }
             if let Some(doc) = tree.doc(owner) {
-                // A tombstone's own (unrepaired) list still counts: it is
-                // what `undeleteNode` restores.
                 listed.extend(doc.children());
             }
         }
