@@ -1,11 +1,58 @@
 # Next session: start here
 
-Updated 2026-09-21. **v0.2.0 is shipped**: `master` fast-forwarded to `node-document`
+Updated 2026-09-22. **The move contract is built** (waves 1 to 3 of `docs/MOVE_CONTRACT.md`,
+commits 312ddd9 to ac0ddcc on `node-document`; not merged to `master`, not deployed); see
+the first section. Below it, the 2026-09-21 ship notes still apply. **v0.2.0 is shipped**: `master` fast-forwarded to `node-document`
 (Joe's go-ahead the same day), production is deployment v19 on jkbase, the desktop release
 `v0.2.0` is on GitHub (Linux; the Windows job still waits for rhypedb#23). Read this, then
 `CLAUDE.md` ("Current design", "Sharing on node documents"), then
 `docs/NODE_DOCUMENT_CONTRACT.md`, `docs/RELAY_CONTRACT.md` and `docs/MOVE_CONTRACT.md`. To
 see any of it run, `scripts/local-stack/README.md`.
+
+## 2026-09-22: the move contract, built and being verified
+
+- **Built** by four sonnet agents in parallel on disjoint files, from the seam the PM wrote
+  first (3967585: `LeftShare`, `DeletedNode`, `MoveNodeResponse`, `transplantNode`,
+  `listDeleted`, the app's `UndeleteNode`/`TransplantNode`/`ListDeleted` commands and
+  `NodeTransplanted`/`DeletedListed` events): the server (00ada49), the share upkeep and
+  CLI (9b51573), the web vault client (97799e8), the shared UI (ac0ddcc). The whole
+  workspace passed (629 tests, 35 targets) and the web (59) with all four together.
+  `CLAUDE.md` has the design summary ("Moves that leave a share").
+- **The repair rule of wave 1 did not converge, and was narrowed** (cf1e1a1, 85a2d1e).
+  The randomized convergence test could not replay a seed (yrs client ids were random),
+  so one ten-minute run from the previous session could not be explained; with client
+  ids seeded under test, a drain cap and an oracle that prints its facts, seeds 76 and 1
+  showed two devices rewriting each other's `parent_id` rewrites for ever. Now every
+  placement writes `placed_under` with `parent_id`; a `parent_id` that agrees with it (or
+  whose named parent's list names the node) is honoured everywhere, and only one written
+  on its own is judged, once. 600 seeds converge (`PIMBLE_CONVERGENCE_SEEDS=$(seq -s, 1
+  600) cargo test --release -p pimble-crdt three_replicas_converge`). The contract's
+  "Repair" section and `docs/NODE_DOCUMENT_CONTRACT.md` (the `node` root) say so.
+- **A review of the combined diff** (nine findings) is being fixed by two agents as this
+  is written: `moveNode`/`transplantNode` judged "the list the node leaves" by its
+  `parent_id`'s owner instead of by the lists that name it (a member reading share F and
+  editing P could move a note out of F when its `parent_id` had been pointed elsewhere);
+  `listDeleted` shipped every tombstone's whole content; the "Recently Deleted..." modal
+  took every error as its own. Deferred: a plain-to-plain transplant in the web assumes
+  one endpoint serves both stores; the harness copied into `tests/share_upkeep.rs` should
+  become a `tests/common` module; `get_node_any`/`node_of_any` duplicate the node mapping.
+- **Known limits of the design as built**: on a member's replica holding two scopes,
+  `repair_scopes` groups documents per scope by `parent_id`, so a tampered `parent_id`
+  into the other scope is adopted there instead of corrected (the owner's devices hold
+  the whole picture and decide right; a member can only reach shares they already write).
+  A client that writes `placed_under` or appends to the destination's list too gets its
+  move completed: the accepted residual (the node stays in scope, members put it back).
+- **Wave 4, the PM's walk-through on the local stack**, against the contract's
+  "Verification (the bar)": headless with the CLI first (`transplant-node`, `list-deleted`,
+  `undelete-node`), then the desktop app (the drag between stores, the notice, the
+  modal) and the browser. Rebuild everything from the committed state first
+  (`cargo build --release -p pimble-cli -p pimble-cloud -p pimble-app`, `trunk build
+  --release` in `web/`), since the release binaries were built while agents were still
+  editing.
+- **Then**: merge to `master`, deploy (`git push jkbase`), and the desktop release
+  (bump the workspace version, tag, push the tag), the standing rule. Every device and the
+  hosted server together, as at v0.2.0; `placed_under` is a new key old clients do not
+  write, which the repair rule tolerates (judged by lists).
 
 ## The ship, 2026-09-21
 

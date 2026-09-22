@@ -418,6 +418,36 @@ Contract: `docs/NODE_DOCUMENT_CONTRACT.md` section 5. How to run it all on one m
   a member leaves; a removed member's connection lives until its token expires if their
   client does not ask; the hosted manifest still holds the store's name in the clear.
 
+### Moves that leave a share (built 2026-09-22, not merged or deployed)
+
+Contract: `docs/MOVE_CONTRACT.md` (Joe, 2026-09-21: moving a node out of a share counts as
+an undoable delete there). **Inside one share a move is a move; a move that would take a
+node out of a share is a delete there and a new node where it lands**, and a move between
+stores is always that. `Tree::move_or_transplant` is what every caller moves with
+(`moveNode` answers the id the node has now and the shares it left; `transplantNode` moves
+between stores; `Tree::take_cutting`/`plant` are its halves); content travels as a fresh
+projection (its own yrs history, nothing deleted). `listDeleted` and View > "Recently
+Deleted..." (both apps) show the top-most tombstones and the nodes no list names, each
+with "Put Back" (`undeleteNode`, or a `moveNode` under the scope root, which judges only
+the node and the new parent when no list names it). The drag between stores works in both
+apps; the web refuses a transplant between an encrypted store and a plain one with a
+sentence. A published scope set only grows (the owner's upkeep publishes the union of
+what the hosted server holds and what the root reaches), so a tombstone stays reachable
+by every member. **Repair**: every placement writes `placed_under` with `parent_id` in
+one transaction; a `parent_id` that agrees with it, or whose named parent's list names the
+node, is honoured everywhere; only a `parent_id` written on its own, whose parent does not
+list the node, is judged (a share's list that still names it wins, and the judgement
+writes a placement, so it is final). That bound is what keeps repair convergent: the
+first cut judged every `parent_id` by the lists and two devices rewrote each other's
+rewrites for ever (found by the randomized test once it could replay a seed; 600 seeds
+now converge, `PIMBLE_CONVERGENCE_SEEDS=1,5 cargo test --release -p pimble-crdt
+three_replicas_converge`). Known limits: on a member's replica holding two scopes,
+repair groups documents per scope by `parent_id`, so a tampered `parent_id` into the other
+scope is completed there rather than corrected (a member can only reach shares they
+already write; the owner's devices hold the whole picture); a client that writes
+`placed_under` or the destination's list too gets its move completed (the accepted
+residual: the node stays in scope, members put it back).
+
 ### Desktop account UI (done 2026-09-16)
 
 Contract: `docs/DESKTOP_ACCOUNT_CONTRACT.md`. `native` only; the browser keeps its own

@@ -1,7 +1,11 @@
 # Move contract: a node never leaves a share; moving it out is a delete there and a new node elsewhere
 
-Status: written by the PM on 2026-09-21 from Joe's decision of that day. Not built. It ships
-after v0.2.0; until then the limits at the end of `docs/NEXT_SESSION.md` stand.
+Status: written by the PM on 2026-09-21 from Joe's decision of that day. Waves 1 to 3 built on
+2026-09-22 (commits 312ddd9 to ac0ddcc on `node-document`, after v0.2.0): pimble-crdt, the
+server, the share upkeep and CLI, the web vault client and the shared UI, with the repair
+rule narrowed to what converges ("Repair" below, `placed_under`). Wave 4, the PM's
+walk-through on the local stack, is what `docs/NEXT_SESSION.md` records. Not merged to
+`master` or deployed yet.
 
 ## The decision
 
