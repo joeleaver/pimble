@@ -726,7 +726,9 @@ async fn dispatch(
 /// store each side is: both encrypted is the vault client's, in the page,
 /// between the two endpoints that serve them; one of each is refused with a
 /// sentence, since the two are not one operation yet; both plain is the
-/// hosted server's, exactly as every other plain-store write reaches it.
+/// hosted server's, exactly as every other plain-store write reaches it,
+/// and refused with a sentence when two servers serve the two stores (a
+/// server plants only into a store it holds).
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_transplant(
     endpoints: &mut Endpoints,
@@ -792,8 +794,13 @@ async fn dispatch_transplant(
     }
 
     // Both plain: the server does it, through whichever endpoint serves the
-    // node's own store, as every other write on it does.
+    // node's own store, as every other write on it does. It plants only into
+    // a store it holds, so two endpoints are refused before anything is sent.
     let url = endpoints.url_for(from_store_id);
+    if let Some(event) = crate::vault::refuse_split_transplant(&url, &endpoints.url_for(to_store_id)) {
+        emit(event_tx, signal_ui, event);
+        return;
+    }
     let mut client = match endpoints.ensure_connected(&url).await {
         Ok(c) => Some(c),
         Err(message) => {

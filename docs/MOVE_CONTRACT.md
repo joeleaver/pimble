@@ -89,7 +89,10 @@ and on the new parent in the second, each judged in its own store (through a mou
 source store, as everywhere). On the desktop both stores are the local server's. In the
 browser the vault client does it in the page, between two stores it holds, whichever
 endpoints serve them; a plain store on the hosted server and a vault store in the page is
-refused with a sentence until someone needs it.
+refused with a sentence until someone needs it; two plain stores are the server's, and
+two plain stores served by different servers are refused with a sentence too (a server
+plants only into a store it holds; today no page sees such a pair, since a store served
+from its owner's computer is always encrypted).
 
 ## Repair
 

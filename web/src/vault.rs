@@ -3594,6 +3594,21 @@ pub fn refuse_mixed_transplant(from_vault: bool, to_vault: bool) -> Option<Backe
     (from_vault != to_vault).then(|| BackendEvent::Error { message: MIXED_TRANSPLANT_REFUSAL.to_string() })
 }
 
+/// What a `TransplantNode` between two plain stores earns when different
+/// endpoints serve them (docs/MOVE_CONTRACT.md "Between stores"): the server
+/// holding the source does the transplant, and it can only plant into a
+/// store it holds too. Today every plain store a page sees is the hosted
+/// server's (a store served from its owner's computer is always encrypted),
+/// so this is the fence for the day that changes, not a path anyone reaches.
+pub const SPLIT_TRANSPLANT_REFUSAL: &str = "Moving a node between stores on different servers is not supported yet.";
+
+/// Whether a plain-to-plain `TransplantNode` needs refusing because its two
+/// stores are served by different endpoints. `None` when one server holds
+/// both, which is when `process_command` can hand it to that server.
+pub fn refuse_split_transplant(from_url: &str, to_url: &str) -> Option<BackendEvent> {
+    (from_url != to_url).then(|| BackendEvent::Error { message: SPLIT_TRANSPLANT_REFUSAL.to_string() })
+}
+
 /// A sentence written for the person rather than an error: the app shows it in
 /// the status bar and clears it again on a timer
 /// (`pimble_app::events::show_notice`, reached by a message it recognises as
@@ -5568,6 +5583,16 @@ mod tests {
                 "the sentence alone: {refused:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_plain_transplant_across_two_servers_is_refused_with_the_sentence() {
+        assert!(refuse_split_transplant("wss://a.example/rpc", "wss://a.example/rpc").is_none(), "one server holds both: its to do");
+        let refused = refuse_split_transplant("wss://a.example/rpc", "wss://b.example/rpc").expect("two servers are refused");
+        assert!(
+            matches!(&refused, BackendEvent::Error { message } if message == SPLIT_TRANSPLANT_REFUSAL),
+            "the sentence alone: {refused:?}"
+        );
     }
 
     #[test]
