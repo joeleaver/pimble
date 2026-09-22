@@ -25,7 +25,7 @@ use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{Doc, OffsetKind, Options, ReadTxn, StateVector, Transact, TransactionMut, Update};
 
-use crate::blocks::{blocks_from_plain_text, build_doc, Block};
+use crate::blocks::{blocks_from_plain_text, build_doc, read_doc, Block};
 use crate::error::{CrdtError, Result};
 
 /// A node's rich-text content, backed by a yrs CRDT document.
@@ -230,6 +230,46 @@ pub(crate) fn replacement_delta(current: &[u8], seed: bool, text: &str) -> Resul
         .record_local(&schema, &before, &after)
         .map_err(|e| CrdtError::Collab(e.to_string()))?;
     session.save_incremental().map_err(|e| CrdtError::Collab(e.to_string()))
+}
+
+/// The content of the projection in `bytes` (a document's whole state) as a NEW
+/// document: the snapshot of a fresh projection of the same editor model, from a new
+/// client id. This is how a transplant carries content from one node document to
+/// another (docs/MOVE_CONTRACT.md "The operation: transplant"), and why it is done
+/// this way and no other:
+///
+/// - **Its own history.** The old document's bytes under a new id would be the same
+///   CRDT twice: an update meant for one would merge cleanly into the other, and two
+///   nodes that are supposed to go their own ways could be folded into each other by
+///   one misdirected update. A fresh projection shares no struct with the old
+///   document, so an update of the one depends on structs the other will never have.
+/// - **Nothing deleted comes along.** A yrs document keeps what was deleted from it
+///   (tombstoned structs, and their text wherever garbage collection has not run or
+///   is off). The projection reads only what the document says now, so text a member
+///   deleted from a shared note is not in the bytes of the private note it became.
+/// - **Everything the collaboration scope knows comes along**, not what some
+///   intermediate vocabulary knows. The model that comes out of the old projection is
+///   the model that goes into the new one, so a heading's alignment, a code block's
+///   language and a link's title survive although [`Block`] cannot say them, and a
+///   mark rinch adds later survives without a change here.
+///
+/// An error when the content cannot be projected (content outside the collaboration
+/// scope fails loudly in rinch by design): the caller must not go on to delete the
+/// original.
+pub(crate) fn fresh_snapshot(bytes: &[u8]) -> Result<Vec<u8>> {
+    let collab = |e: rinch_editor_collab::CollabError| CrdtError::Collab(e.to_string());
+    let schema = Rc::new(Schema::starter_kit());
+    let model = CollabSession::from_bytes(bytes).map_err(collab)?.projected_doc(&schema).map_err(collab)?;
+    let state = EditorState::create(schema.clone(), model, default_plugins());
+    Ok(CollabSession::new(&state).map_err(collab)?.snapshot())
+}
+
+/// The projection in `bytes` (a document's whole state) as [`Block`]s: see
+/// [`crate::blocks::read_doc`] for what that reading keeps.
+pub(crate) fn blocks_of_projection(bytes: &[u8]) -> Result<Vec<Block>> {
+    let collab = |e: rinch_editor_collab::CollabError| CrdtError::Collab(e.to_string());
+    let model = CollabSession::from_bytes(bytes).map_err(collab)?.projected_doc(&Schema::starter_kit()).map_err(collab)?;
+    read_doc(&model)
 }
 
 /// The index units of the projection in `bytes` (a document's whole state):

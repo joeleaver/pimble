@@ -113,6 +113,25 @@ impl Mark {
             _ => Attrs::new(),
         }
     }
+
+    /// The reverse of [`Mark::name`] and [`Mark::attrs`]: an editor mark as one of
+    /// ours. An error for a mark this vocabulary has no variant for.
+    fn from_editor(mark: &EditorMark) -> Result<Self> {
+        let color = || mark.attrs.get_str("color").filter(|c| !c.is_empty()).map(str::to_string);
+        Ok(match mark.type_name() {
+            "bold" => Mark::Bold,
+            "italic" => Mark::Italic,
+            "underline" => Mark::Underline,
+            "strike" => Mark::Strike,
+            "code" => Mark::Code,
+            "link" => Mark::Link { href: mark.attrs.get_str("href").unwrap_or_default().to_string() },
+            "highlight" => Mark::Highlight { color: color() },
+            "text_color" => Mark::TextColor { color: color().unwrap_or_default() },
+            "subscript" => Mark::Subscript,
+            "superscript" => Mark::Superscript,
+            other => return Err(CrdtError::Collab(format!("mark `{other}` has no `Mark` variant"))),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -131,6 +150,16 @@ impl Align {
             Align::Center => "center",
             Align::Right => "right",
             Align::Justify => "justify",
+        }
+    }
+
+    /// Anything the editor does not write reads as the default, as the editor reads it.
+    fn from_attr(value: Option<&str>) -> Self {
+        match value {
+            Some("center") => Align::Center,
+            Some("right") => Align::Right,
+            Some("justify") => Align::Justify,
+            _ => Align::Left,
         }
     }
 }
@@ -238,4 +267,70 @@ fn build_runs(schema: &Rc<Schema>, runs: &[Run]) -> Result<Fragment> {
         nodes.push(schema.text_with_marks(&run.text, marks).map_err(collab)?);
     }
     Ok(Fragment::from_children(nodes))
+}
+
+// ── Reading: an editor document back to blocks ───────────────────────────
+
+/// The blocks of an editor `doc` node: the reverse of [`build_doc`], for reading a
+/// document's content from outside the editor (an export, a test's assertion).
+///
+/// [`Block`] is the importer's vocabulary and is narrower than the schema in three
+/// places, all read here without complaint and without the value: a heading's
+/// `text_align` and `indent`, a code block's `language`, and a link's `title` and
+/// `target`. So this is not how content is carried from one document to another (a
+/// transplant goes through the editor's own model and loses none of them, see
+/// `content_doc::fresh_snapshot`); it is a faithful reading of everything `Block` can
+/// say. Runs come back canonical: adjacent text with the same marks is one run, marks
+/// in the order the projection keeps them (by name), and empty text is no run. A node
+/// or mark with no variant here is an error, never a silent drop.
+pub(crate) fn read_doc(doc: &Node) -> Result<Vec<Block>> {
+    doc.content().iter().map(read_block).collect()
+}
+
+fn read_block(node: &Node) -> Result<Block> {
+    Ok(match node.type_name() {
+        "paragraph" => Block::Paragraph {
+            runs: read_runs(node)?,
+            align: Align::from_attr(node.attrs().get_str("text_align")),
+            indent: node.attrs().get_int("indent").unwrap_or(0).clamp(0, u32::MAX as i64) as u32,
+        },
+        "heading" => Block::Heading {
+            level: node.attrs().get_int("level").unwrap_or(1).clamp(1, 6) as u8,
+            runs: read_runs(node)?,
+        },
+        "code_block" => Block::CodeBlock { text: read_runs(node)?.into_iter().map(|run| run.text).collect() },
+        "bullet_list" => Block::BulletList { items: read_items(node)? },
+        "ordered_list" => {
+            Block::OrderedList { start: node.attrs().get_int("start").unwrap_or(1), items: read_items(node)? }
+        }
+        other => return Err(CrdtError::Collab(format!("block `{other}` has no `Block` variant"))),
+    })
+}
+
+fn read_items(list: &Node) -> Result<Vec<ListItem>> {
+    list.content()
+        .iter()
+        .map(|item| match item.type_name() {
+            "list_item" => Ok(ListItem { blocks: item.content().iter().map(read_block).collect::<Result<_>>()? }),
+            other => Err(CrdtError::Collab(format!("`{other}` in a list has no `Block` variant"))),
+        })
+        .collect()
+}
+
+fn read_runs(textblock: &Node) -> Result<Vec<Run>> {
+    let mut runs: Vec<Run> = Vec::new();
+    for child in textblock.content().iter() {
+        let Some(text) = child.text() else {
+            return Err(CrdtError::Collab(format!("inline `{}` has no `Block` variant", child.type_name())));
+        };
+        if text.is_empty() {
+            continue;
+        }
+        let marks = child.marks().iter().map(Mark::from_editor).collect::<Result<Vec<_>>>()?;
+        match runs.last_mut() {
+            Some(last) if last.marks == marks => last.text.push_str(text),
+            _ => runs.push(Run { text: text.to_string(), marks }),
+        }
+    }
+    Ok(runs)
 }

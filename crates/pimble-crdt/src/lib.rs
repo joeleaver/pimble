@@ -5,7 +5,8 @@
 //!   rich text, its place in the tree, its metadata and a plugin's JSON
 //!   (docs/NODE_DOCUMENT_CONTRACT.md)
 //! - The tree over node documents (`Tree`): the operations, validation and
-//!   repair, each edit reported per document (`TreeEdit`)
+//!   repair, each edit reported per document (`TreeEdit`); a node never leaves
+//!   a share, so a move that would is a transplant (docs/MOVE_CONTRACT.md)
 //! - The previous layout, until wave 2 switches the workspace over: per-node
 //!   content documents (`ContentDoc`) and the store document (`StoreDocument`)
 //! - Shared error types
@@ -23,5 +24,5 @@ pub use content_doc::*;
 pub use error::*;
 pub use node_doc::{NodeDoc, NodeFields, NodeUpdateEffect, ROOT_CHILDREN, ROOT_DATA, ROOT_NODE};
 pub use store_document::*;
-pub use tree::{Tree, TreeEdit};
+pub use tree::{Cutting, CuttingNode, Tree, TreeEdit};
 pub use sync_util::{advance_state_vector, empty_state_vector, state_vector_exceeds};

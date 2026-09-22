@@ -55,6 +55,12 @@ pub enum TreeIssue {
     RootInList { parent_id: NodeId },
     /// A cycle in the effective-parent chain (none of these nodes' chains reach the root).
     Cycle { node_ids: Vec<NodeId> },
+    /// Node documents only (`Tree`, docs/MOVE_CONTRACT.md "Repair"): `parent_id`'s list
+    /// names `child_id`, whose stored `parent_id` (`stored_parent`; `None` when it has
+    /// none) would take it out of a share that list is in. The list wins: the node's
+    /// effective parent is `parent_id` and its `parent_id` is rewritten to it. Reported
+    /// instead of the `OrphanNode` or `DetachedNode` the stored value would otherwise be.
+    LeavesShare { parent_id: NodeId, child_id: NodeId, stored_parent: Option<NodeId> },
 }
 
 /// What [`StoreDocument::repair`] changed: the yrs update its transaction

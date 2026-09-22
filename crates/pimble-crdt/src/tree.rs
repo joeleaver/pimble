@@ -14,9 +14,18 @@
 //! a list or read as a parent, and neither is a content-only document (one
 //! whose `node` root has not arrived yet). Tombstoned documents keep their
 //! children lists as they were, so an undelete finds the subtree again.
+//!
+//! A node never leaves a share (docs/MOVE_CONTRACT.md). [`Tree::shares`] and
+//! [`Tree::leaves_a_share`] say what a move would do, [`Tree::move_or_transplant`]
+//! is what every caller moves a node with (a plain [`Tree::move_node`] inside a
+//! share or outside all of them, a [`Tree::transplant`] when the move would
+//! take the node out of one: new documents where it lands, a tombstone where
+//! it was), and repair does not complete a move the operations would not have
+//! made (`analyze`, "the list wins").
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use pimble_core::custom_keys::SHARE;
 use pimble_core::NodeId;
 
 use crate::error::{CrdtError, Result};
@@ -44,6 +53,106 @@ impl TreeEdit {
             self.touched.push((id, update));
         }
     }
+}
+
+/// A subtree read out of a tree as data ([`Tree::take_cutting`]), to be planted
+/// once, in the same tree or another ([`Tree::plant`]): the two halves of a
+/// transplant between two stores (docs/MOVE_CONTRACT.md "The operation:
+/// transplant"). It holds nothing of the documents it was read from but what
+/// they say now: no yrs history, no share marker, no ids but as a record of
+/// where each node came from. Planting consumes it, and it cannot be cloned:
+/// planted twice, the two plantings' content would be one CRDT history under
+/// two ids.
+pub struct Cutting {
+    nodes: Vec<CuttingNode>,
+}
+
+/// One node of a [`Cutting`].
+#[non_exhaustive]
+pub struct CuttingNode {
+    /// The id the node had where it was read. The planted node gets a new one.
+    pub source_id: NodeId,
+    /// Its parent's index in [`Cutting::nodes`]; `None` for the first, the
+    /// subtree's root.
+    pub parent: Option<usize>,
+    pub node_type: String,
+    pub title: String,
+    pub tags: Vec<String>,
+    /// Every custom field but the share marker.
+    pub custom: HashMap<String, serde_json::Value>,
+    pub created_at: String,
+    /// The plugin root as JSON (`NodeDoc::data_json`).
+    pub data: serde_json::Value,
+    /// The content as a new document's bytes (`NodeDoc::fresh_content`);
+    /// `None` when the node has no projection.
+    content: Option<Vec<u8>>,
+}
+
+impl Cutting {
+    /// The nodes in preorder: the subtree's root first, every node after its
+    /// parent, siblings in their list's order.
+    pub fn nodes(&self) -> &[CuttingNode] {
+        &self.nodes
+    }
+
+    /// How many nodes it holds (at least one).
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+}
+
+impl CuttingNode {
+    pub fn has_content(&self) -> bool {
+        self.content.is_some()
+    }
+}
+
+// A server carries a cutting from one store's lock to another's, across an
+// `.await`. Fail here, not there.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<Cutting>();
+};
+
+/// A walk up the tree from a document by stored `parent_id`s, through held,
+/// initialised documents, tombstoned or not (a deleted document stays where it
+/// was, and with its share).
+struct Ancestry {
+    /// The document the walk started at, then its ancestors, nearest first;
+    /// with each, whether it carries a share marker.
+    chain: Vec<(NodeId, bool)>,
+    /// Whether the walk ended knowing everything above its start: at the
+    /// tree's root, at a document with no parent, or where it met itself (a
+    /// cycle, every member of it held). `false` when it ended at a document
+    /// this device does not hold, or holds without its `node` root: what is
+    /// above that is unknown here.
+    complete: bool,
+}
+
+impl Ancestry {
+    fn names(&self, id: NodeId) -> bool {
+        self.chain.iter().any(|(member, _)| *member == id)
+    }
+
+    fn shares(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.chain.iter().filter(|(_, carries)| *carries).map(|(id, _)| *id)
+    }
+}
+
+/// What the lists that name a node say against where its `parent_id` would
+/// put it (`Tree::share_claim`).
+enum ShareClaim {
+    /// No list naming it is in a share the destination is outside of.
+    None,
+    /// This list is, and the destination is known to be outside: the list wins.
+    Wins(NodeId),
+    /// A list is in a share the destination is not known to be in, and what
+    /// is above the destination is not all held: not judged.
+    Unknown,
 }
 
 /// A store's node documents.
@@ -367,6 +476,223 @@ impl Tree {
         })
     }
 
+    // ── Shares: a node never leaves one (docs/MOVE_CONTRACT.md) ──────────
+
+    /// The shares `id` is in: the documents carrying a share marker
+    /// (`custom["share"]`) among `id` and its ancestors, nearest first. Read
+    /// off what this device holds, by stored `parent_id`s: the walk ends at
+    /// the tree's root, at a document that is not held (what is above it is
+    /// unknown here, and "a share it holds nothing of is one it cannot write
+    /// outside of either"), or where it meets itself, so an unrepaired cycle
+    /// cannot loop. Empty when `id` is not held.
+    pub fn shares(&self, id: NodeId) -> Vec<NodeId> {
+        self.ancestry(id).shares().collect()
+    }
+
+    /// The shares that moving `id` under `new_parent` would take it out of,
+    /// nearest first: every share `id` is in that `new_parent` is not in,
+    /// not counting `id` itself or anything under it (a share's own root, and
+    /// the shares inside the subtree, travel with it). Entering a share is
+    /// not leaving one. Judged on held documents only, like [`Tree::shares`].
+    pub fn shares_left(&self, id: NodeId, new_parent: NodeId) -> Vec<NodeId> {
+        let target = self.ancestry(new_parent);
+        self.ancestry(id)
+            .shares()
+            .filter(|&share| share != id && !target.names(share) && !self.ancestry(share).names(id))
+            .collect()
+    }
+
+    /// Whether moving `id` under `new_parent` leaves a share
+    /// (docs/MOVE_CONTRACT.md "What 'out of a share' means"): such a move is
+    /// a [`Tree::transplant`], never a [`Tree::move_node`].
+    pub fn leaves_a_share(&self, id: NodeId, new_parent: NodeId) -> bool {
+        !self.shares_left(id, new_parent).is_empty()
+    }
+
+    /// Move `id` under `new_parent` at `position`, as every caller moves a
+    /// node: a plain [`Tree::move_node`] when the move leaves no share, a
+    /// [`Tree::transplant`] when it does. Answers the id the node has now:
+    /// `id` after a plain move, the new root's after a transplant. `new_id`
+    /// is only called for a transplant.
+    pub fn move_or_transplant(
+        &mut self,
+        id: NodeId,
+        new_parent: NodeId,
+        position: Option<usize>,
+        now: &str,
+        new_id: &mut dyn FnMut() -> NodeId,
+    ) -> Result<(NodeId, TreeEdit)> {
+        if self.leaves_a_share(id, new_parent) {
+            self.transplant(id, new_parent, position, now, new_id)
+        } else {
+            self.move_node(id, new_parent, position, now).map(|edit| (id, edit))
+        }
+    }
+
+    /// Take `id` out of the shares it is in by making it again under
+    /// `new_parent` (docs/MOVE_CONTRACT.md "The operation: transplant"): a
+    /// new document with a fresh id for `id` and for every live node under
+    /// it ([`Tree::take_cutting`], [`Tree::plant`]), then the original
+    /// subtree tombstoned ([`Tree::remove_node`]), which stays in its share
+    /// and which any editor of it can undo; the two then exist side by side
+    /// and go their own ways. The new nodes are made once and never kept in
+    /// step with the old.
+    ///
+    /// One [`TreeEdit`] whose order is the order things happened in: the new
+    /// documents in preorder, the list that names the new root, then the
+    /// tombstones and the list the original left. Created first, deleted
+    /// second: a failure between the two leaves both, never neither.
+    /// Everything that can be refused is refused before anything is written.
+    ///
+    /// `new_id` is called once per node of the subtree, in the order of
+    /// [`Tree::subtree_ids`], so a caller that wants to know which new node
+    /// is which old one can pair the two. Answers the new root's id.
+    pub fn transplant(
+        &mut self,
+        id: NodeId,
+        new_parent: NodeId,
+        position: Option<usize>,
+        now: &str,
+        new_id: &mut dyn FnMut() -> NodeId,
+    ) -> Result<(NodeId, TreeEdit)> {
+        self.require_node(new_parent)?;
+        if new_parent == id || self.is_under(new_parent, id) {
+            return Err(CrdtError::Serialization(format!("cannot transplant node {id} under its own descendant {new_parent}")));
+        }
+        let cutting = self.take_cutting(id)?;
+        let (new_root, mut edit) = self.plant(cutting, new_parent, position, now, new_id)?;
+        edit.touched.extend(self.remove_node(id, now)?.touched);
+        Ok((new_root, edit))
+    }
+
+    /// The first half of a transplant between two trees: `id` and its live
+    /// subtree (exactly the nodes [`Tree::remove_node`] would tombstone) read
+    /// out as data. Per node: its type, title, tags, custom fields without
+    /// the share marker (a share is its root document, its key and its
+    /// grants; none of that is duplicated), `created_at`, the plugin root as
+    /// JSON, and its content as a new yrs document
+    /// (`content_doc::fresh_snapshot` says why). A mount node is the
+    /// reference it is: its type and its custom fields. Tombstoned
+    /// descendants are not read, and neither is a listed document that is
+    /// not held. Nothing is changed here.
+    ///
+    /// The tree's root is refused: it cannot be deleted, so it cannot be
+    /// transplanted, and that must be said before anything is planted. An
+    /// error when some node's content cannot be projected: better no
+    /// transplant than one that loses a note's text and then deletes the note.
+    ///
+    /// The caller plants it in the other tree and then calls
+    /// [`Tree::remove_node`] here, in that order.
+    pub fn take_cutting(&self, id: NodeId) -> Result<Cutting> {
+        if id == self.root {
+            return Err(CrdtError::Serialization("cannot transplant the root node: it cannot be deleted".into()));
+        }
+        self.require_node(id)?;
+        let members = self.collect_subtree(id, &|f| f.deleted_at.is_none());
+        let index_of: HashMap<NodeId, usize> = members.iter().enumerate().map(|(index, member)| (*member, index)).collect();
+        let mut nodes = Vec::with_capacity(members.len());
+        for (index, &member) in members.iter().enumerate() {
+            let doc = &self.docs[&member];
+            let fields = doc.fields()?;
+            let mut custom = fields.custom;
+            custom.remove(SHARE);
+            // Every member but the first was reached from the node its
+            // `parent_id` names (`walk`), which therefore came before it.
+            let parent = match index {
+                0 => None,
+                _ => Some(
+                    fields
+                        .parent_id
+                        .and_then(|parent| index_of.get(&parent).copied())
+                        .filter(|&parent| parent < index)
+                        .ok_or_else(|| CrdtError::Serialization(format!("node {member} is in the subtree of {id} under no node of it")))?,
+                ),
+            };
+            nodes.push(CuttingNode {
+                source_id: member,
+                parent,
+                node_type: fields.node_type,
+                title: fields.title,
+                tags: fields.tags,
+                custom,
+                created_at: fields.created_at,
+                data: doc.data_json(),
+                content: doc.fresh_content()?,
+            });
+        }
+        Ok(Cutting { nodes })
+    }
+
+    /// The second half of a transplant: make the nodes of `cutting` under
+    /// `new_parent` at `position` (the end when `None`), in this tree, which
+    /// need not be the one the cutting was taken from. A new document per
+    /// node with an id from `new_id` (called once per node, in the cutting's
+    /// preorder), `created_at` kept, `modified_at` = `now`, no share marker.
+    /// The update for each new document is the whole document, since nothing
+    /// else holds any of it; the last update lists the new root under
+    /// `new_parent`. Every document is built before the tree is touched, so
+    /// an error leaves nothing behind. Answers the new root's id.
+    pub fn plant(
+        &mut self,
+        cutting: Cutting,
+        new_parent: NodeId,
+        position: Option<usize>,
+        now: &str,
+        new_id: &mut dyn FnMut() -> NodeId,
+    ) -> Result<(NodeId, TreeEdit)> {
+        self.require_node(new_parent)?;
+        if cutting.nodes.is_empty() {
+            return Err(CrdtError::Serialization("an empty cutting cannot be planted".into()));
+        }
+        let ids: Vec<NodeId> = cutting.nodes.iter().map(|_| new_id()).collect();
+        let mut distinct = HashSet::new();
+        for id in &ids {
+            if self.docs.contains_key(id) || !distinct.insert(*id) {
+                return Err(CrdtError::Serialization(format!("node {id} is already held")));
+            }
+        }
+        let mut children: Vec<Vec<NodeId>> = vec![Vec::new(); ids.len()];
+        for (index, node) in cutting.nodes.iter().enumerate() {
+            if let Some(parent) = node.parent {
+                children[parent].push(ids[index]);
+            }
+        }
+
+        let mut built = Vec::with_capacity(ids.len());
+        for (index, node) in cutting.nodes.into_iter().enumerate() {
+            let doc = match &node.content {
+                Some(bytes) => NodeDoc::load(bytes)?,
+                None => NodeDoc::new(),
+            };
+            let parent = node.parent.map(|parent| ids[parent]).unwrap_or(new_parent);
+            let created_at = if node.created_at.is_empty() { now } else { node.created_at.as_str() };
+            doc.edit(|d, txn| {
+                d.write_init_as(txn, &node.node_type, &node.title, Some(parent), created_at, now, &node.tags)?;
+                for (key, value) in node.custom.iter().filter(|(key, _)| key.as_str() != SHARE) {
+                    d.put_custom(txn, key, value)?;
+                }
+                if let serde_json::Value::Object(data) = &node.data {
+                    for (key, value) in data {
+                        d.put_data(txn, key, value);
+                    }
+                }
+                for &child in &children[index] {
+                    d.list_insert(txn, None, child);
+                }
+                Ok(())
+            })?;
+            built.push(doc);
+        }
+
+        let mut edit = TreeEdit::default();
+        for (&id, doc) in ids.iter().zip(built) {
+            edit.push(id, Some(doc.save()));
+            self.docs.insert(id, doc);
+        }
+        edit.push(new_parent, self.list_edit(new_parent, |d, txn| d.list_insert(txn, position, ids[0]))?);
+        Ok((ids[0], edit))
+    }
+
     // ── Shape ────────────────────────────────────────────────────────────
 
     /// Exactly the conditions [`Tree::repair`] fixes; empty after a repair.
@@ -378,11 +704,13 @@ impl Tree {
         self.analyze().issues
     }
 
-    /// Decision 9 over documents: effective parents, cycles broken at the
-    /// smallest id, every list made to hold the undeleted nodes whose
-    /// effective parent is its owner (first occurrence kept, missing ones
-    /// appended in id order), tombstones and duplicates taken out, and every
-    /// entry naming a document not held here left exactly where it is.
+    /// Decision 9 over documents: effective parents (a node's `parent_id`,
+    /// except that a list which still names it wins over a `parent_id` that
+    /// would take it out of a share: docs/MOVE_CONTRACT.md "Repair"), cycles
+    /// broken at the smallest id, every list made to hold the undeleted nodes
+    /// whose effective parent is its owner (first occurrence kept, missing
+    /// ones appended in id order), tombstones and duplicates taken out, and
+    /// every entry naming a document not held here left exactly where it is.
     /// Deterministic in the held state, and acting on knowledge only, so two
     /// devices that hold different subsets never undo each other. `None`
     /// when nothing needed fixing.
@@ -460,6 +788,20 @@ impl Tree {
         // unlisting a member's new note six times a second).
         let gone: HashSet<NodeId> = self.docs.iter().filter(|(_, doc)| doc.is_tombstone()).map(|(&id, _)| id).collect();
 
+        // Every node's list as stored, read once, and from them the nodes
+        // whose list names each id (in id order, each once): what step 1
+        // needs to know before it believes a `parent_id`.
+        let lists: HashMap<NodeId, Vec<Option<NodeId>>> = node_ids.iter().map(|&owner| (owner, self.docs[&owner].raw_children())).collect();
+        let mut listed_by: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for &owner in &node_ids {
+            for &child in lists[&owner].iter().flatten() {
+                let owners = listed_by.entry(child).or_default();
+                if owners.last() != Some(&owner) {
+                    owners.push(owner);
+                }
+            }
+        }
+
         // Step 1: effective parent for every node but the root.
         let mut raw_parent: HashMap<NodeId, Option<NodeId>> = HashMap::new();
         let mut effective_parent: HashMap<NodeId, NodeId> = HashMap::new();
@@ -468,21 +810,46 @@ impl Tree {
                 continue;
             }
             raw_parent.insert(id, parent);
-            let e = match parent {
-                None => {
-                    analysis.issues.push(TreeIssue::DetachedNode { node_id: id });
-                    root
-                }
-                Some(p) if node_set.contains(&p) && p != id => p,
+            // Where its `parent_id` puts the node, with the issue that says
+            // so when that is not simply "under the node it names".
+            let (destination, issue) = match parent {
+                None => (root, Some(TreeIssue::DetachedNode { node_id: id })),
+                Some(p) if node_set.contains(&p) && p != id => (p, None),
                 // Its own parent, or under a document known to be deleted.
-                Some(p) if p == id || gone.contains(&p) => {
-                    analysis.issues.push(TreeIssue::OrphanNode { node_id: id, missing_parent: p });
-                    root
-                }
+                Some(p) if p == id || gone.contains(&p) => (root, Some(TreeIssue::OrphanNode { node_id: id, missing_parent: p })),
                 // Under a document this device does not hold: where it
                 // belongs is not known here, so it is left exactly where it
                 // says it is (no effective parent, no rewrite, no listing).
                 Some(_) => continue,
+            };
+            // The one exception to "`parent_id` is the truth of where a node
+            // is" (docs/MOVE_CONTRACT.md "Repair"): a list that still names
+            // a node wins over a `parent_id` that would take it out of a
+            // share. No operation makes such a move (one that leaves a share
+            // is a transplant: the node stays and is tombstoned), so a
+            // `parent_id` that says so was written by a client that does not
+            // keep the rule, and completing its move would put a member's
+            // node in the owner's private tree, out of every member's reach.
+            // Every device that holds the list, the node, the marker and
+            // what is above the destination decides the same, from the same
+            // documents; one that does not hold all of the last decides
+            // nothing (below), which is the 2026-09-21 rule again.
+            let lists_naming = listed_by.get(&id).map(Vec::as_slice).unwrap_or_default();
+            let e = match self.share_claim(id, destination, lists_naming) {
+                ShareClaim::Wins(list) => {
+                    analysis.issues.push(TreeIssue::LeavesShare { parent_id: list, child_id: id, stored_parent: parent });
+                    list
+                }
+                // Whether the destination is outside the share is not known
+                // here: some document above it is not held. Believing the
+                // `parent_id` would unlist the node from the share, which
+                // no later repair puts right; so nothing is decided until
+                // the documents are here, as for a parent that is not held.
+                ShareClaim::Unknown => continue,
+                ShareClaim::None => {
+                    analysis.issues.extend(issue);
+                    destination
+                }
             };
             effective_parent.insert(id, e);
         }
@@ -563,7 +930,7 @@ impl Tree {
         let mut placed: HashSet<NodeId> = HashSet::new();
         for &owner in &node_ids {
             let mut seen: HashSet<NodeId> = HashSet::new();
-            for (index, entry) in self.docs[&owner].raw_children().into_iter().enumerate() {
+            for (index, &entry) in lists[&owner].iter().enumerate() {
                 let Some(child) = entry else {
                     remove_indices.entry(owner).or_default().push(index);
                     continue;
@@ -634,6 +1001,59 @@ impl Tree {
             return Err(CrdtError::KeyNotFound(format!("node {id} (deleted)")));
         }
         Ok(fields)
+    }
+
+    /// `start` and its ancestors by stored `parent_id`s: see [`Ancestry`].
+    /// Each document once, so the walk is bounded by what is held.
+    fn ancestry(&self, start: NodeId) -> Ancestry {
+        let mut chain = Vec::new();
+        let mut seen = HashSet::new();
+        let mut cur = start;
+        let complete = loop {
+            if !seen.insert(cur) {
+                break true;
+            }
+            let Some((carries, parent)) = self.docs.get(&cur).and_then(|doc| doc.link(SHARE)) else {
+                break false;
+            };
+            chain.push((cur, carries));
+            // The tree's root is the top whatever its `parent_id` says: a
+            // scope's tree is rooted at a node whose parent is never held.
+            match parent.filter(|_| cur != self.root) {
+                Some(parent) => cur = parent,
+                None => break true,
+            }
+        };
+        Ancestry { chain, complete }
+    }
+
+    /// Whether a list that names `id` wins over where its `parent_id` would
+    /// put it (`destination`): see step 1 of `analyze`. `lists` are the nodes
+    /// whose list names `id`, in id order. A list claims the node when it is
+    /// in a share the destination is outside of; of several, the one that
+    /// keeps the node in the most shares wins (a list in a share inside a
+    /// share, over one in the outer share only), the first in id order among
+    /// equals. A list whose owner is `id` or under it claims nothing: making
+    /// it the parent would close a cycle.
+    fn share_claim(&self, id: NodeId, destination: NodeId, lists: &[NodeId]) -> ShareClaim {
+        let mut to: Option<Ancestry> = None;
+        let mut best: Option<(usize, NodeId)> = None;
+        for &list in lists.iter().filter(|&&list| list != destination) {
+            let from = self.ancestry(list);
+            if from.names(id) {
+                continue;
+            }
+            let to = to.get_or_insert_with(|| self.ancestry(destination));
+            let kept = from.shares().filter(|&share| !to.names(share)).count();
+            if kept > best.map_or(0, |(most, _)| most) {
+                best = Some((kept, list));
+            }
+        }
+        match (best, to) {
+            (Some((_, list)), Some(to)) if to.complete => ShareClaim::Wins(list),
+            (Some(_), _) => ShareClaim::Unknown,
+            _ => ShareClaim::None,
+        }
     }
 
     /// Whether `id` is `ancestor` or under it, following stored parents
@@ -1539,6 +1959,774 @@ mod tests {
         assert!(a.get_children(p).unwrap().is_empty());
     }
 
+    // ── Shares (docs/MOVE_CONTRACT.md "What 'out of a share' means") ────
+
+    fn marker(name: &str) -> serde_json::Value {
+        serde_json::json!({ "v": 1, "key_id": "5b0f6c1e-0000-4000-8000-00000000c0de", "url": "https://pimble.example", "name": name })
+    }
+
+    fn share(tree: &mut Tree, id: NodeId) -> TreeEdit {
+        tree.set_custom(id, SHARE, &marker("Shared"), T1).unwrap()
+    }
+
+    fn folder(tree: &mut Tree, parent: NodeId, title: &str) -> NodeId {
+        let new = id();
+        tree.add_node(new, Some(parent), None, "folder", title, T1).unwrap();
+        new
+    }
+
+    fn note(tree: &mut Tree, parent: NodeId, title: &str) -> NodeId {
+        let new = id();
+        tree.add_node(new, Some(parent), None, "document", title, T1).unwrap();
+        new
+    }
+
+    /// An id source that records what it handed out.
+    fn fresh_ids(handed_out: &mut Vec<NodeId>) -> impl FnMut() -> NodeId + '_ {
+        move || {
+            let new = NodeId::new();
+            handed_out.push(new);
+            new
+        }
+    }
+
+    fn never_asked() -> NodeId {
+        panic!("a plain move needs no new id")
+    }
+
+    /// What a client that does not keep the rule writes: a `parent_id`, and
+    /// no list. `None` removes it.
+    fn tamper_parent(tree: &mut Tree, node: NodeId, parent: Option<NodeId>) -> TreeEdit {
+        let (_, update) = tree.docs[&node]
+            .edit_node(|d, txn| {
+                d.write_parent(txn, parent);
+                Ok(())
+            })
+            .unwrap();
+        let mut edit = TreeEdit::default();
+        edit.push(node, update);
+        edit
+    }
+
+    /// The store the share tests use:
+    /// ```text
+    /// root ─ private ─ own
+    ///      └ r0* ─ a ─ x
+    ///            │   └ r2* ─ y
+    ///            └ b
+    /// ```
+    /// `*` carries a share marker; `r2` is a share inside a share.
+    struct Shared {
+        tree: Tree,
+        root: NodeId,
+        private: NodeId,
+        own: NodeId,
+        r0: NodeId,
+        a: NodeId,
+        b: NodeId,
+        x: NodeId,
+        r2: NodeId,
+        y: NodeId,
+    }
+
+    fn shared() -> Shared {
+        let (mut tree, root) = tree();
+        let private = folder(&mut tree, root, "Private");
+        let own = note(&mut tree, private, "Own");
+        let r0 = folder(&mut tree, root, "Shared");
+        let a = folder(&mut tree, r0, "A");
+        let b = folder(&mut tree, r0, "B");
+        let x = note(&mut tree, a, "X");
+        let r2 = folder(&mut tree, a, "Shared inside");
+        let y = note(&mut tree, r2, "Y");
+        share(&mut tree, r0);
+        share(&mut tree, r2);
+        Shared { tree, root, private, own, r0, a, b, x, r2, y }
+    }
+
+    #[test]
+    fn shares_are_the_markers_among_a_node_and_its_ancestors_nearest_first() {
+        let s = shared();
+        assert_eq!(s.tree.shares(s.y), vec![s.r2, s.r0]);
+        assert_eq!(s.tree.shares(s.r2), vec![s.r2, s.r0], "a share's root is in its own share");
+        assert_eq!(s.tree.shares(s.x), vec![s.r0]);
+        assert_eq!(s.tree.shares(s.r0), vec![s.r0]);
+        assert!(s.tree.shares(s.own).is_empty());
+        assert!(s.tree.shares(s.root).is_empty());
+        assert!(s.tree.shares(id()).is_empty(), "a document not held is in nothing known");
+    }
+
+    #[test]
+    fn a_deleted_document_stays_in_its_share() {
+        let mut s = shared();
+        s.tree.remove_node(s.a, T2).unwrap();
+        assert_eq!(s.tree.shares(s.y), vec![s.r2, s.r0], "tombstones are walked through, and a tombstoned root still marks its share");
+    }
+
+    #[test]
+    fn a_move_inside_a_share_leaves_none_and_a_move_out_leaves_it() {
+        let s = shared();
+        assert!(!s.tree.leaves_a_share(s.x, s.b), "inside r0");
+        assert!(!s.tree.leaves_a_share(s.x, s.r0));
+        assert!(!s.tree.leaves_a_share(s.x, s.a), "a reorder under its own parent");
+        assert!(s.tree.leaves_a_share(s.x, s.private));
+        assert_eq!(s.tree.shares_left(s.x, s.private), vec![s.r0]);
+        assert!(s.tree.leaves_a_share(s.x, s.root));
+        // Out of the inner share alone, and out of both.
+        assert_eq!(s.tree.shares_left(s.y, s.b), vec![s.r2]);
+        assert_eq!(s.tree.shares_left(s.y, s.private), vec![s.r2, s.r0]);
+        assert!(!s.tree.leaves_a_share(s.own, s.root), "a node in no share leaves none");
+    }
+
+    #[test]
+    fn entering_a_share_is_not_leaving_one() {
+        let s = shared();
+        assert!(!s.tree.leaves_a_share(s.own, s.a));
+        assert!(!s.tree.leaves_a_share(s.own, s.r2));
+        assert!(!s.tree.leaves_a_share(s.x, s.r2), "deeper into a share inside the one it is in");
+        assert!(s.tree.shares_left(s.own, s.r2).is_empty());
+    }
+
+    #[test]
+    fn a_shares_own_root_travels_with_its_share() {
+        let s = shared();
+        assert!(!s.tree.leaves_a_share(s.r0, s.private), "r0 is in no share but its own");
+        assert!(!s.tree.leaves_a_share(s.r2, s.b), "r2 stays inside r0");
+        // The consequence the contract names: a share inside a share cannot
+        // leave the outer one as itself.
+        assert_eq!(s.tree.shares_left(s.r2, s.private), vec![s.r0]);
+    }
+
+    #[test]
+    fn a_share_inside_the_moved_subtree_does_not_count() {
+        let mut s = shared();
+        assert!(!s.tree.leaves_a_share(s.a, s.b), "a holds r2 and stays in r0");
+        assert_eq!(s.tree.shares_left(s.a, s.private), vec![s.r0], "r0 is left; r2 is under a and travels with it");
+        // A private folder that holds a share leaves nothing wherever it goes.
+        let holder = folder(&mut s.tree, s.root, "Holder");
+        let r3 = folder(&mut s.tree, holder, "Held");
+        share(&mut s.tree, r3);
+        assert!(!s.tree.leaves_a_share(holder, s.private));
+        assert!(!s.tree.leaves_a_share(holder, s.b), "into r0: entering");
+    }
+
+    /// A member's device holds the shares and nothing above them. It judges
+    /// with what it holds: two shares of one store are two shares, and
+    /// whatever is not held is outside everything known.
+    #[test]
+    fn a_parent_not_held_ends_the_walk() {
+        let (mut full, root) = tree();
+        let r1 = folder(&mut full, root, "Trips");
+        let in_r1 = note(&mut full, r1, "Lisbon");
+        let r2 = folder(&mut full, root, "Recipes");
+        let sub = folder(&mut full, r2, "Soups");
+        let in_r2 = note(&mut full, sub, "Leek");
+        share(&mut full, r1);
+        share(&mut full, r2);
+
+        let held = [r1, in_r1, r2, sub, in_r2];
+        let docs = held.iter().map(|&n| (n, NodeDoc::load(&full.doc(n).unwrap().save()).unwrap())).collect();
+        let member = Tree::from_docs(r1, docs);
+        assert!(member.doc(root).is_none());
+        assert_eq!(member.shares(in_r2), vec![r2], "the walk ends where the store's root would be");
+        assert_eq!(member.shares(in_r1), vec![r1]);
+        assert!(member.leaves_a_share(in_r1, sub), "from one share into the other");
+        assert_eq!(member.shares_left(in_r2, r1), vec![r2]);
+        assert!(!member.leaves_a_share(in_r2, r2), "inside one");
+        assert!(member.leaves_a_share(in_r1, root), "a parent not held is in no share this device knows");
+        assert!(!member.leaves_a_share(root, r1), "and a node not held is in none to leave");
+
+        // An ancestor missing in the middle: what is above it is not known.
+        let (mut gap, gap_root) = tree();
+        let top = folder(&mut gap, gap_root, "Top");
+        let middle = folder(&mut gap, top, "Middle");
+        let leaf = note(&mut gap, middle, "Leaf");
+        share(&mut gap, top);
+        gap.take_doc(middle);
+        assert!(gap.shares(leaf).is_empty());
+    }
+
+    #[test]
+    fn an_unrepaired_cycle_cannot_loop_the_walk() {
+        let (mut t, root) = tree();
+        let (fa, fb) = (folder(&mut t, root, "A"), folder(&mut t, root, "B"));
+        let leaf = note(&mut t, fa, "Leaf");
+        share(&mut t, fb);
+        tamper_parent(&mut t, fa, Some(fb));
+        tamper_parent(&mut t, fb, Some(fa));
+        assert_eq!(t.shares(leaf), vec![fb]);
+        assert_eq!(t.shares(fb), vec![fb]);
+        assert!(!t.leaves_a_share(leaf, fb));
+        assert!(t.leaves_a_share(leaf, root));
+    }
+
+    // ── `move_or_transplant` and `transplant` ───────────────────────────
+
+    #[test]
+    fn move_or_transplant_moves_inside_a_share_and_transplants_out_of_it() {
+        let mut s = shared();
+        let (now_id, edit) = s.tree.move_or_transplant(s.x, s.b, None, T2, &mut never_asked).unwrap();
+        assert_eq!(now_id, s.x, "a plain move keeps the id");
+        assert_eq!(ids_of(&edit), HashSet::from([s.a, s.b, s.x]));
+        assert_eq!(s.tree.get_children(s.b).unwrap(), vec![s.x]);
+
+        let (now_id, _) = s.tree.move_or_transplant(s.own, s.b, Some(0), T2, &mut never_asked).unwrap();
+        assert_eq!(now_id, s.own, "entering a share is a plain move");
+        assert_eq!(s.tree.get_children(s.b).unwrap(), vec![s.own, s.x]);
+
+        let mut made = Vec::new();
+        let (now_id, edit) = s.tree.move_or_transplant(s.x, s.private, None, T3, &mut fresh_ids(&mut made)).unwrap();
+        assert_eq!(made, vec![now_id], "one node, one new id");
+        assert_ne!(now_id, s.x);
+        assert_eq!(edit.node_ids(), vec![now_id, s.private, s.x, s.b], "made, listed, tombstoned, unlisted");
+        assert!(!s.tree.has_node(s.x));
+        assert_eq!(s.tree.get_children(s.private).unwrap(), vec![now_id]);
+        assert_eq!(s.tree.get_children(s.b).unwrap(), vec![s.own]);
+        assert_eq!(s.tree.get_node_info(now_id).unwrap().title, "X");
+        assert!(s.tree.validate_tree().is_empty());
+
+        // What `move_node` refuses, this refuses, whichever way it would go.
+        assert!(s.tree.move_or_transplant(s.root, s.b, None, T3, &mut never_asked).is_err());
+        assert!(s.tree.move_or_transplant(s.a, s.r2, None, T3, &mut never_asked).is_err());
+        assert!(s.tree.move_or_transplant(s.y, id(), None, T3, &mut never_asked).is_err());
+        assert!(s.tree.has_node(s.y), "a refused transplant deletes nothing");
+    }
+
+    #[test]
+    fn transplant_makes_the_subtree_again_and_tombstones_the_original() {
+        let mut s = shared();
+        let mut replica = replica_of(&s.tree);
+        // Under `a` already: x, r2 (a share, with y). More: a note deleted
+        // earlier, a mount, tags, custom fields, plugin data, text.
+        let dead = note(&mut s.tree, s.a, "Deleted earlier");
+        s.tree.remove_node(dead, T1).unwrap();
+        let mount = id();
+        s.tree.add_node(mount, Some(s.a), None, pimble_core::node_types::MOUNT, "Elsewhere", T1).unwrap();
+        let mount_ref = serde_json::json!({ "source_store": "6a7e6f52-0000-4000-8000-000000000001", "source_node": null, "source_path": "/stores/other.pimble" });
+        s.tree.set_custom(mount, "mount", &mount_ref, T1).unwrap();
+        s.tree.set_tags(s.x, &["one".into(), "two".into()], T1).unwrap();
+        s.tree.set_custom(s.x, "icon", &serde_json::json!("star"), T1).unwrap();
+        s.tree.set_custom(s.x, "explicit_title", &serde_json::json!(true), T1).unwrap();
+        s.tree.doc_mut(s.x).unwrap().set_data("plugin", &serde_json::json!({ "n": 3, "list": ["a", { "b": null }] })).unwrap();
+        s.tree.doc_mut(s.x).unwrap().replace_plain_text("first line\nsecond line").unwrap();
+        s.tree.doc_mut(s.y).unwrap().replace_plain_text("inside the inner share").unwrap();
+        sync(&mut s.tree, &mut replica);
+
+        let before = s.tree.subtree_ids(s.a).unwrap();
+        assert_eq!(before, vec![s.a, s.x, s.r2, s.y, mount], "preorder, the tombstone not among them");
+        let mut made = Vec::new();
+        let (new_a, edit) = s.tree.transplant(s.a, s.private, Some(0), T3, &mut fresh_ids(&mut made)).unwrap();
+
+        // New ids, all of them, one per live node in the subtree's preorder.
+        assert_eq!(made.len(), before.len());
+        assert_eq!(made[0], new_a);
+        assert!(made.iter().all(|new| !before.contains(new)));
+        let new_of: HashMap<NodeId, NodeId> = before.iter().copied().zip(made.iter().copied()).collect();
+
+        // The edit's order says what happened in what order: every new
+        // document, the list that names the new root, then every tombstone
+        // and the list the original left.
+        let mut expected = made.clone();
+        expected.push(s.private);
+        expected.extend(&before);
+        expected.push(s.r0);
+        assert_eq!(edit.node_ids(), expected);
+
+        // The same nodes again, under the new parent, in the same order.
+        assert_eq!(s.tree.get_children(s.private).unwrap(), vec![new_a, s.own]);
+        assert_eq!(s.tree.subtree_ids(new_a).unwrap(), made);
+        for (&old, &new) in &new_of {
+            let (was, is) = (s.tree.doc(old).unwrap().fields().unwrap(), s.tree.get_node_info(new).unwrap());
+            assert_eq!((&is.node_type, &is.title, &is.tags), (&was.node_type, &was.title, &was.tags), "{}", was.title);
+            assert_eq!(is.created_at, was.created_at, "created when the original was");
+            assert_eq!(is.modified_at, T3, "modified now");
+            let expected_parent = if old == s.a { s.private } else { new_of[&was.parent_id.unwrap()] };
+            assert_eq!(is.parent_id, Some(expected_parent));
+            // Every custom field but the share marker, on every node.
+            let mut custom = was.custom.clone();
+            custom.remove(SHARE);
+            assert_eq!(is.custom, custom, "{}", was.title);
+            assert_eq!(s.tree.doc(new).unwrap().data_json(), s.tree.doc(old).unwrap().data_json());
+            assert_eq!(s.tree.doc(new).unwrap().text(), s.tree.doc(old).unwrap().text());
+        }
+        assert!(s.tree.shares(new_of[&s.y]).is_empty(), "no share marker survives: the new nodes are in no share");
+        assert_eq!(s.tree.doc(new_of[&s.x]).unwrap().text(), "first line\nsecond line");
+        assert_eq!(s.tree.get_node_info(new_of[&s.x]).unwrap().custom.get("icon"), Some(&serde_json::json!("star")));
+        // A mount is copied as the reference it is.
+        let new_mount = s.tree.get_node_info(new_of[&mount]).unwrap();
+        assert_eq!(new_mount.node_type, pimble_core::node_types::MOUNT);
+        assert_eq!(new_mount.custom.get("mount"), Some(&mount_ref));
+
+        // The original: an ordinary delete. Tombstones with one stamp, lists
+        // below kept, the marker still on the inner share's root, and the
+        // note deleted earlier neither copied nor restamped.
+        for &old in &before {
+            assert!(!s.tree.has_node(old));
+            assert_eq!(s.tree.doc(old).unwrap().fields().unwrap().deleted_at.as_deref(), Some(T3));
+        }
+        assert_eq!(s.tree.doc(dead).unwrap().fields().unwrap().deleted_at.as_deref(), Some(T1));
+        assert!(s.tree.doc(s.r2).unwrap().fields().unwrap().custom.contains_key(SHARE));
+        assert_eq!(s.tree.doc(s.a).unwrap().children(), vec![s.x, s.r2, mount], "an undelete finds the subtree again");
+        assert_eq!(s.tree.get_children(s.r0).unwrap(), vec![s.b]);
+        assert_eq!(s.tree.list_node_ids().len(), 5 + before.len(), "root, private, own, r0, b and the new nodes");
+        assert!(s.tree.validate_tree().is_empty());
+        assert!(s.tree.repair(T3).unwrap().is_none());
+
+        // A peer that applies the edit holds the same.
+        apply_edit(&mut replica, &edit);
+        assert_same(&s.tree, &replica);
+        assert!(replica.validate_tree().is_empty());
+    }
+
+    #[test]
+    fn undeleting_the_original_after_a_transplant_leaves_both() {
+        let mut s = shared();
+        s.tree.doc_mut(s.y).unwrap().replace_plain_text("kept").unwrap();
+        let mut made = Vec::new();
+        let (new_a, _) = s.tree.transplant(s.a, s.private, None, T2, &mut fresh_ids(&mut made)).unwrap();
+
+        let edit = s.tree.undelete_node(s.a, T3).unwrap();
+        assert_eq!(ids_of(&edit), HashSet::from([s.a, s.x, s.r2, s.y, s.r0]));
+        // The members' folder is back where it was, a share inside it still
+        // a share; the new one is where it landed; they go their own ways.
+        assert_eq!(s.tree.get_children(s.r0).unwrap(), vec![s.b, s.a]);
+        assert_eq!(s.tree.subtree_ids(s.a).unwrap(), vec![s.a, s.x, s.r2, s.y]);
+        assert_eq!(s.tree.shares(s.y), vec![s.r2, s.r0]);
+        assert_eq!(s.tree.subtree_ids(new_a).unwrap(), made);
+        assert!(s.tree.shares(*made.last().unwrap()).is_empty());
+        s.tree.set_title(s.x, "Theirs", T3).unwrap();
+        assert_eq!(s.tree.get_node_info(made[1]).unwrap().title, "X");
+        assert!(s.tree.validate_tree().is_empty());
+    }
+
+    #[test]
+    fn transplant_refuses_before_it_writes_anything() {
+        let mut s = shared();
+        let before = snapshot(&s.tree);
+        let mut no_ids = || -> NodeId { panic!("nothing should be made") };
+        assert!(s.tree.transplant(s.root, s.private, None, T2, &mut no_ids).is_err(), "the root");
+        assert!(s.tree.transplant(s.a, s.r2, None, T2, &mut no_ids).is_err(), "under its own descendant");
+        assert!(s.tree.transplant(s.a, s.a, None, T2, &mut no_ids).is_err(), "under itself");
+        assert!(s.tree.transplant(s.a, id(), None, T2, &mut no_ids).is_err(), "under nothing");
+        assert!(s.tree.transplant(id(), s.private, None, T2, &mut no_ids).is_err(), "nothing");
+        assert!(s.tree.take_cutting(s.root).is_err());
+        // An id already held, and the same id twice.
+        let mut held = || s.own;
+        assert!(s.tree.transplant(s.a, s.private, None, T2, &mut held).is_err());
+        let twice = id();
+        let mut same = || twice;
+        assert!(s.tree.transplant(s.a, s.private, None, T2, &mut same).is_err());
+        assert_eq!(snapshot(&s.tree), before, "refused means untouched");
+        assert!(s.tree.doc(twice).is_none());
+
+        // Deleted already: not a node.
+        s.tree.remove_node(s.x, T2).unwrap();
+        assert!(s.tree.transplant(s.x, s.private, None, T3, &mut no_ids).is_err());
+    }
+
+    /// Content rinch's projection refuses (it fails loudly by design on what
+    /// is outside the collaboration scope) stops the transplant: better none
+    /// than one that loses the text and then deletes the note.
+    #[test]
+    fn content_that_cannot_be_projected_refuses_the_transplant() {
+        use yrs::{Array, Map, ReadTxn, Transact};
+        let mut s = shared();
+        // The format tag, and a `content` entry that is no projected node.
+        let junk = yrs::Doc::with_options(yrs::Options { offset_kind: yrs::OffsetKind::Utf16, ..Default::default() });
+        let (meta, content) = (junk.get_or_insert_map("meta"), junk.get_or_insert_array("content"));
+        {
+            let mut txn = junk.transact_mut();
+            meta.insert(&mut txn, "format", "rinch-editor-collab/yrs-1");
+            content.insert(&mut txn, 0, "not a block");
+        }
+        let bytes = junk.transact().encode_state_as_update_v1(&yrs::StateVector::default());
+        s.tree.apply_update(s.y, &bytes).unwrap();
+
+        let before = snapshot(&s.tree);
+        let mut made = Vec::new();
+        let err = s.tree.transplant(s.a, s.private, None, T2, &mut fresh_ids(&mut made)).unwrap_err();
+        assert!(matches!(err, CrdtError::Collab(_)), "{err}");
+        assert_eq!(snapshot(&s.tree), before);
+        assert!(s.tree.has_node(s.a) && s.tree.has_node(s.y));
+    }
+
+    /// Between two stores: read out of one, planted in the other, deleted in
+    /// the first, in that order; one `TreeEdit` per store.
+    #[test]
+    fn a_transplant_between_two_trees_is_a_cutting_planted_and_a_delete() {
+        let mut s = shared();
+        s.tree.doc_mut(s.y).unwrap().replace_plain_text("carried across").unwrap();
+        s.tree.set_tags(s.y, &["t".into()], T1).unwrap();
+        let (mut other, other_root) = tree();
+        let landing = folder(&mut other, other_root, "Landing");
+        let mut other_replica = replica_of(&other);
+
+        let cutting = s.tree.take_cutting(s.a).unwrap();
+        assert_eq!(cutting.len(), 4);
+        assert!(!cutting.is_empty());
+        let sources: Vec<NodeId> = cutting.nodes().iter().map(|n| n.source_id).collect();
+        assert_eq!(sources, s.tree.subtree_ids(s.a).unwrap());
+        assert_eq!(cutting.nodes().iter().map(|n| n.parent).collect::<Vec<_>>(), vec![None, Some(0), Some(0), Some(2)]);
+        assert!(cutting.nodes().iter().all(|n| !n.custom.contains_key(SHARE)), "the marker is not even read out");
+        assert!(cutting.nodes()[3].has_content() && !cutting.nodes()[0].has_content());
+        assert!(s.tree.has_node(s.a), "reading changes nothing");
+
+        let mut made = Vec::new();
+        let (new_a, planted) = other.plant(cutting, landing, None, T2, &mut fresh_ids(&mut made)).unwrap();
+        let mut expected = made.clone();
+        expected.push(landing);
+        assert_eq!(planted.node_ids(), expected);
+        let removed = s.tree.remove_node(s.a, T2).unwrap();
+        assert_eq!(removed.node_ids(), vec![s.a, s.x, s.r2, s.y, s.r0]);
+
+        assert_eq!(other.get_children(landing).unwrap(), vec![new_a]);
+        assert_eq!(other.subtree_ids(new_a).unwrap(), made);
+        let new_y = other.get_node_info(made[3]).unwrap();
+        assert_eq!((new_y.title.as_str(), new_y.parent_id, new_y.tags.clone()), ("Y", Some(made[2]), vec!["t".to_string()]));
+        assert_eq!(other.doc(made[3]).unwrap().text(), "carried across");
+        assert!(other.shares(made[3]).is_empty());
+        assert!(other.validate_tree().is_empty() && s.tree.validate_tree().is_empty());
+        assert!(!s.tree.has_node(s.y));
+
+        apply_edit(&mut other_replica, &planted);
+        assert_same(&other, &other_replica);
+
+        // The second half refuses what `add_node` refuses.
+        let again = s.tree.take_cutting(s.b).unwrap();
+        assert!(other.plant(again, id(), None, T2, &mut NodeId::new).is_err(), "under nothing");
+    }
+
+    fn contains(haystack: &[u8], needle: &str) -> bool {
+        haystack.windows(needle.len()).any(|window| window == needle.as_bytes())
+    }
+
+    fn clients_of(doc: &NodeDoc) -> HashSet<yrs::ClientID> {
+        use yrs::updates::decoder::Decode;
+        yrs::StateVector::decode_v1(&doc.state_vector()).unwrap().iter().map(|(client, _)| *client).collect()
+    }
+
+    /// The new document is a NEW yrs document: no struct of the old one, no
+    /// deletion, nothing that was ever taken out of the old one.
+    #[test]
+    fn a_transplanted_document_has_its_own_history_and_nothing_that_was_deleted() {
+        use yrs::updates::decoder::Decode;
+        let mut s = shared();
+        let mut others = replica_of(&s.tree);
+        let key_id = marker("")["key_id"].as_str().unwrap().to_string();
+        // A share's root with a past: a title it no longer has, text that was
+        // deleted, a custom field that was removed, plugin data replaced.
+        s.tree.set_title(s.r2, "WITHDRAWN-TITLE", T1).unwrap();
+        s.tree.set_title(s.r2, "Recipes", T1).unwrap();
+        s.tree.doc_mut(s.r2).unwrap().replace_plain_text("keep this\nand the REDACTED-PARAGRAPH").unwrap();
+        s.tree.doc_mut(s.r2).unwrap().replace_plain_text("keep this").unwrap();
+        s.tree.set_custom(s.r2, "note", &serde_json::json!("RETRACTED-FIELD"), T1).unwrap();
+        s.tree.remove_custom(s.r2, "note", T1).unwrap();
+        s.tree.doc_mut(s.r2).unwrap().set_data("k", &serde_json::json!("REPLACED-DATA")).unwrap();
+        s.tree.doc_mut(s.r2).unwrap().set_data("k", &serde_json::json!("data now")).unwrap();
+        assert!(contains(&s.tree.doc(s.r2).unwrap().save(), &key_id), "the original carries its marker");
+
+        let mut made = Vec::new();
+        let (new_r2, _) = s.tree.transplant(s.r2, s.private, None, T2, &mut fresh_ids(&mut made)).unwrap();
+        let new_doc = s.tree.doc(new_r2).unwrap();
+        assert_eq!(new_doc.text(), "keep this");
+        assert_eq!(new_doc.data_json(), serde_json::json!({ "k": "data now" }));
+        let bytes = new_doc.save();
+        for gone in ["WITHDRAWN-TITLE", "REDACTED-PARAGRAPH", "RETRACTED-FIELD", "REPLACED-DATA", key_id.as_str(), "pimble.example"] {
+            assert!(!contains(&bytes, gone), "{gone} is in the new document's bytes");
+        }
+        assert!(contains(&bytes, "keep this") && contains(&bytes, "Recipes"));
+        // Nothing was ever deleted in it, and no client that wrote the old
+        // document wrote any of it.
+        let update = yrs::Update::decode_v1(&bytes).unwrap();
+        assert!(update.delete_set().iter().all(|(_, ranges)| ranges.is_empty()), "a new document has no deletions");
+        assert!(clients_of(new_doc).is_disjoint(&clients_of(s.tree.doc(s.r2).unwrap())));
+
+        // So an edit of the one, misdirected at the other, merges into
+        // nothing: it continues a history the other does not have.
+        sync(&mut s.tree, &mut others);
+        let theirs = others.doc_mut(s.r2).unwrap().replace_plain_text("the members' text moves on").unwrap();
+        let mut misdirected = NodeDoc::load(&bytes).unwrap();
+        misdirected.apply_update(&theirs).unwrap();
+        assert_eq!(misdirected.text(), "keep this");
+        assert_eq!(misdirected.fields().unwrap().title, "Recipes");
+    }
+
+    #[test]
+    fn a_node_with_no_content_yet_is_transplanted_with_none() {
+        let mut s = shared();
+        assert_eq!(s.tree.doc(s.x).unwrap().text(), "");
+        let (new_x, _) = s.tree.transplant(s.x, s.private, None, T2, &mut NodeId::new).unwrap();
+        // No projection was made up for it: its first edit seeds it, as for
+        // any node whose content was never written.
+        let mut peer = NodeDoc::load(&s.tree.doc(new_x).unwrap().save()).unwrap();
+        let seed = s.tree.doc_mut(new_x).unwrap().replace_plain_text("first words").unwrap();
+        peer.apply_update(&seed).unwrap();
+        assert_eq!(peer.text(), "first words");
+    }
+
+    // ── The list wins (docs/MOVE_CONTRACT.md "Repair") ──────────────────
+
+    fn leaves_share_issue(issues: &[TreeIssue], list: NodeId, node: NodeId, stored: Option<NodeId>) -> bool {
+        issues.iter().any(|i| matches!(i, TreeIssue::LeavesShare { parent_id, child_id, stored_parent } if *parent_id == list && *child_id == node && *stored_parent == stored))
+    }
+
+    #[test]
+    fn a_list_that_still_names_a_node_wins_over_a_parent_id_pointing_out_of_its_share() {
+        let mut s = shared();
+        tamper_parent(&mut s.tree, s.x, Some(s.private));
+
+        let issues = s.tree.validate_tree();
+        assert!(leaves_share_issue(&issues, s.a, s.x, Some(s.private)), "{issues:?}");
+        assert_eq!(issues.len(), 1, "and nothing else: the list is right, so it is not touched: {issues:?}");
+        let repair = s.tree.repair(T3).unwrap().expect("the parent_id needs rewriting");
+        assert_eq!(repair.node_ids(), vec![s.x], "the node's own document, and no list");
+        assert_eq!(s.tree.get_node_info(s.x).unwrap().parent_id, Some(s.a));
+        assert_eq!(s.tree.get_children(s.a).unwrap(), vec![s.x, s.r2]);
+        assert_eq!(s.tree.get_children(s.private).unwrap(), vec![s.own], "it never showed up outside");
+        assert_eq!(s.tree.get_node_info(s.x).unwrap().modified_at, T1, "repair never touches a timestamp");
+        assert!(s.tree.validate_tree().is_empty());
+        assert!(s.tree.repair(T3).unwrap().is_none());
+
+        // Out of the inner share alone is out of a share too.
+        tamper_parent(&mut s.tree, s.y, Some(s.b));
+        assert!(leaves_share_issue(&s.tree.validate_tree(), s.r2, s.y, Some(s.b)));
+        s.tree.repair(T3).unwrap().unwrap();
+        assert_eq!(s.tree.get_children(s.r2).unwrap(), vec![s.y]);
+        assert!(s.tree.get_children(s.b).unwrap().is_empty());
+        assert!(s.tree.validate_tree().is_empty());
+    }
+
+    #[test]
+    fn both_devices_decide_the_same_about_a_tampered_parent_id() {
+        let mut s = shared();
+        let mut other = replica_of(&s.tree);
+        let mut tamperer = replica_of(&s.tree);
+        let tampering = tamper_parent(&mut tamperer, s.x, Some(s.private));
+        apply_edit(&mut s.tree, &tampering);
+        apply_edit(&mut other, &tampering);
+
+        // Each repairs what it holds before it hears from the other.
+        let (ours, theirs) = (s.tree.repair(T3).unwrap().unwrap(), other.repair(T3).unwrap().unwrap());
+        assert_eq!(ours.node_ids(), vec![s.x]);
+        assert_eq!(theirs.node_ids(), vec![s.x]);
+        apply_edit(&mut other, &ours);
+        apply_edit(&mut s.tree, &theirs);
+        sync_and_repair_round(&mut s.tree, &mut other);
+        assert_converged(&mut s.tree, &mut other);
+        assert_eq!(other.get_node_info(s.x).unwrap().parent_id, Some(s.a));
+        assert_eq!(other.get_children(s.a).unwrap(), vec![s.x, s.r2]);
+
+        // The tamperer's own device, once it runs an honest repair, agrees.
+        sync_and_repair_round(&mut s.tree, &mut tamperer);
+        sync_and_repair_round(&mut s.tree, &mut tamperer);
+        assert_converged(&mut s.tree, &mut tamperer);
+        assert_eq!(tamperer.get_children(s.private).unwrap(), vec![s.own]);
+    }
+
+    /// The same hole by another door: a `parent_id` that names a tombstone,
+    /// the node itself, or nothing sends a node under the root, which is as
+    /// far out of the share as any folder.
+    #[test]
+    fn a_parent_id_that_would_send_a_listed_node_to_the_root_loses_to_the_list_too() {
+        let mut s = shared();
+        let dead = note(&mut s.tree, s.b, "Deleted");
+        s.tree.remove_node(dead, T2).unwrap();
+        for stored in [Some(dead), Some(s.x), None] {
+            tamper_parent(&mut s.tree, s.x, stored);
+            let issues = s.tree.validate_tree();
+            assert!(leaves_share_issue(&issues, s.a, s.x, stored), "{stored:?}: {issues:?}");
+            assert_eq!(issues.len(), 1, "reported instead of the orphan or detached node it would be: {issues:?}");
+            let repair = s.tree.repair(T3).unwrap().unwrap();
+            assert_eq!(repair.node_ids(), vec![s.x]);
+            assert_eq!(s.tree.get_node_info(s.x).unwrap().parent_id, Some(s.a));
+            assert_eq!(s.tree.get_children(s.root).unwrap(), vec![s.private, s.r0]);
+            assert!(s.tree.validate_tree().is_empty());
+        }
+        // Outside every share the orphan goes under the root, as ever.
+        tamper_parent(&mut s.tree, s.own, Some(dead));
+        assert!(s.tree.validate_tree().iter().any(|i| matches!(i, TreeIssue::OrphanNode { node_id, .. } if *node_id == s.own)));
+        s.tree.repair(T3).unwrap().unwrap();
+        assert_eq!(s.tree.get_node_info(s.own).unwrap().parent_id, Some(s.root));
+    }
+
+    #[test]
+    fn a_plain_move_in_flight_inside_one_share_is_still_completed() {
+        // The node's document arrived; neither list's did.
+        let mut s = shared();
+        tamper_parent(&mut s.tree, s.x, Some(s.b));
+        let issues = s.tree.validate_tree();
+        assert!(issues.iter().any(|i| matches!(i, TreeIssue::WrongList { parent_id, child_id, effective_parent } if *parent_id == s.a && *child_id == s.x && *effective_parent == s.b)), "{issues:?}");
+        assert!(issues.iter().any(|i| matches!(i, TreeIssue::MissingFromList { parent_id, child_id } if *parent_id == s.b && *child_id == s.x)), "{issues:?}");
+        let repair = s.tree.repair(T3).unwrap().unwrap();
+        assert_eq!(ids_of(&repair), HashSet::from([s.a, s.b]));
+        assert_eq!(s.tree.get_children(s.b).unwrap(), vec![s.x]);
+        assert_eq!(s.tree.get_children(s.a).unwrap(), vec![s.r2]);
+        assert!(s.tree.validate_tree().is_empty());
+
+        // Into the share inside it, and into a share from outside: entering.
+        tamper_parent(&mut s.tree, s.x, Some(s.r2));
+        tamper_parent(&mut s.tree, s.own, Some(s.b));
+        s.tree.repair(T3).unwrap().unwrap();
+        assert_eq!(s.tree.get_children(s.r2).unwrap(), vec![s.y, s.x]);
+        assert_eq!(s.tree.get_children(s.b).unwrap(), vec![s.own]);
+        assert!(s.tree.get_children(s.private).unwrap().is_empty());
+        assert!(s.tree.validate_tree().is_empty());
+
+        // And as two devices see it: the mover's three updates arrive at the
+        // other one document at a time, a repair after each.
+        let mut s = shared();
+        let mut other = replica_of(&s.tree);
+        let moved = s.tree.move_node(s.x, s.b, None, T2).unwrap();
+        for (doc_id, update) in moved.touched.iter().rev() {
+            other.apply_update(*doc_id, update).unwrap();
+            if let Some(repair) = other.repair(T3).unwrap() {
+                apply_edit(&mut s.tree, &repair);
+            }
+        }
+        sync_and_repair_round(&mut s.tree, &mut other);
+        assert_converged(&mut s.tree, &mut other);
+        assert_eq!(other.get_children(s.b).unwrap(), vec![s.x]);
+    }
+
+    #[test]
+    fn a_node_named_by_no_list_is_adopted_where_its_parent_id_says() {
+        // What remains (the contract says so): a client that also unlists
+        // the node. No list names it, so there is nothing to win; it is
+        // adopted as before, still in the share's scope, and any editor can
+        // put it back.
+        let mut s = shared();
+        tamper_parent(&mut s.tree, s.x, Some(s.private));
+        s.tree.doc_mut(s.a).unwrap().remove_child(s.x).unwrap();
+        let issues = s.tree.validate_tree();
+        assert!(issues.iter().all(|i| matches!(i, TreeIssue::MissingFromList { parent_id, child_id } if *parent_id == s.private && *child_id == s.x)), "{issues:?}");
+        let repair = s.tree.repair(T3).unwrap().unwrap();
+        assert_eq!(repair.node_ids(), vec![s.private]);
+        assert_eq!(s.tree.get_children(s.private).unwrap(), vec![s.own, s.x]);
+        assert!(s.tree.validate_tree().is_empty());
+        // Putting it back is a plain move: it enters the share.
+        let (back, _) = s.tree.move_or_transplant(s.x, s.a, None, T3, &mut never_asked).unwrap();
+        assert_eq!(back, s.x);
+    }
+
+    /// The 2026-09-21 rule, for the exception too: whether the destination is
+    /// outside the share is only known when everything above it is held.
+    #[test]
+    fn a_destination_whose_ancestors_are_not_all_held_is_not_judged() {
+        for lands_inside in [true, false] {
+            let mut s = shared();
+            let mut holds_all = replica_of(&s.tree);
+            // Someone made a folder and a folder in it, and the node says it
+            // is in the inner one. Here: the inner folder, and not the outer.
+            let outer = id();
+            let made_outer = holds_all.add_node(outer, Some(if lands_inside { s.b } else { s.private }), None, "folder", "Outer", T2).unwrap();
+            let inner = id();
+            let made_inner = holds_all.add_node(inner, Some(outer), None, "folder", "Inner", T2).unwrap();
+            let moved = tamper_parent(&mut holds_all, s.x, Some(inner));
+            for (doc_id, update) in made_inner.touched.iter().chain(&moved.touched) {
+                if *doc_id != outer {
+                    s.tree.apply_update(*doc_id, update).unwrap();
+                }
+            }
+            assert!(s.tree.validate_tree().is_empty(), "{:?}", s.tree.validate_tree());
+            assert!(s.tree.repair(T3).unwrap().is_none(), "not known, so not decided");
+            assert_eq!(s.tree.doc(s.a).unwrap().children(), vec![s.x, s.r2], "the list still names it");
+            assert_eq!(s.tree.get_node_info(s.x).unwrap().parent_id, Some(inner), "and its parent_id is as it came");
+
+            // The outer folder arrives, and with it the answer.
+            apply_edit(&mut s.tree, &made_outer);
+            apply_edit(&mut s.tree, &made_inner);
+            s.tree.repair(T3).unwrap().expect("now it is known");
+            assert!(s.tree.validate_tree().is_empty());
+            if lands_inside {
+                assert_eq!(s.tree.get_children(inner).unwrap(), vec![s.x], "inside the share: a move, completed");
+                assert_eq!(s.tree.get_children(s.a).unwrap(), vec![s.r2]);
+            } else {
+                assert_eq!(s.tree.get_children(s.a).unwrap(), vec![s.x, s.r2], "outside: the list wins");
+                assert!(s.tree.get_children(inner).unwrap().is_empty());
+            }
+            // The device that held everything all along decides the same.
+            holds_all.repair(T3).unwrap().unwrap();
+            sync_and_repair_round(&mut s.tree, &mut holds_all);
+            assert_converged(&mut s.tree, &mut holds_all);
+        }
+    }
+
+    /// A scope is repaired as a tree of its own, rooted at the share's root,
+    /// whose `parent_id` names a document a member never holds. The root is
+    /// the top: what is under it is known to be in it.
+    #[test]
+    fn in_a_scopes_tree_the_root_is_the_top() {
+        let s = shared();
+        let held = [s.r0, s.a, s.b, s.x, s.r2, s.y];
+        let docs = held.iter().map(|&n| (n, NodeDoc::load(&s.tree.doc(n).unwrap().save()).unwrap())).collect();
+        let mut scope = Tree::from_docs(s.r0, docs);
+        assert!(scope.validate_tree().is_empty());
+        // Out of the inner share, inside the outer: known, so the list wins.
+        tamper_parent(&mut scope, s.y, Some(s.b));
+        assert!(leaves_share_issue(&scope.validate_tree(), s.r2, s.y, Some(s.b)));
+        scope.repair(T3).unwrap().unwrap();
+        assert_eq!(scope.get_children(s.r2).unwrap(), vec![s.y]);
+        // Inside the outer share: a move, completed.
+        tamper_parent(&mut scope, s.x, Some(s.b));
+        scope.repair(T3).unwrap().unwrap();
+        assert_eq!(scope.get_children(s.b).unwrap(), vec![s.x]);
+        // Out of everything this device holds: not held, not judged.
+        tamper_parent(&mut scope, s.x, Some(s.private));
+        assert!(scope.validate_tree().is_empty());
+        assert!(scope.repair(T3).unwrap().is_none());
+        assert_eq!(scope.doc(s.b).unwrap().children(), vec![s.x]);
+    }
+
+    #[test]
+    fn of_two_lists_the_one_that_keeps_the_node_in_more_shares_wins() {
+        // Both `a` (in r0) and `r2` (in r2 and r0) name the node; its
+        // parent_id points outside both.
+        let mut s = shared();
+        s.tree.doc_mut(s.a).unwrap().insert_child(99, s.y).unwrap();
+        tamper_parent(&mut s.tree, s.y, Some(s.private));
+        assert!(leaves_share_issue(&s.tree.validate_tree(), s.r2, s.y, Some(s.private)));
+        let repair = s.tree.repair(T3).unwrap().unwrap();
+        assert_eq!(ids_of(&repair), HashSet::from([s.y, s.a]), "the parent_id, and the other list's entry");
+        assert_eq!(s.tree.get_children(s.r2).unwrap(), vec![s.y]);
+        assert_eq!(s.tree.get_children(s.a).unwrap(), vec![s.x, s.r2]);
+        assert!(s.tree.validate_tree().is_empty());
+
+        // Two shares side by side: the first list in id order, on every device.
+        let (mut t, root) = tree();
+        let (r1, r3) = (folder(&mut t, root, "One"), folder(&mut t, root, "Other"));
+        let elsewhere = folder(&mut t, root, "Elsewhere");
+        let n = note(&mut t, r1, "N");
+        share(&mut t, r1);
+        share(&mut t, r3);
+        t.doc_mut(r3).unwrap().insert_child(0, n).unwrap();
+        tamper_parent(&mut t, n, Some(elsewhere));
+        let mut other = replica_of(&t);
+        t.repair(T3).unwrap().unwrap();
+        other.repair(T3).unwrap().unwrap();
+        let winner = if r1.to_string() < r3.to_string() { r1 } else { r3 };
+        assert_eq!(t.get_node_info(n).unwrap().parent_id, Some(winner));
+        assert_eq!(other.get_node_info(n).unwrap().parent_id, Some(winner));
+        sync_and_repair_round(&mut t, &mut other);
+        assert_converged(&mut t, &mut other);
+    }
+
+    #[test]
+    fn a_list_under_the_node_itself_claims_nothing() {
+        // `a`'s parent_id points out of the share, and the only list that
+        // names `a` is one under it. Making that list its parent would close
+        // a cycle, so there is nothing to win: the move is completed.
+        let mut s = shared();
+        s.tree.doc_mut(s.r0).unwrap().remove_child(s.a).unwrap();
+        s.tree.doc_mut(s.r2).unwrap().insert_child(0, s.a).unwrap();
+        tamper_parent(&mut s.tree, s.a, Some(s.private));
+        let issues = s.tree.validate_tree();
+        assert!(!issues.iter().any(|i| matches!(i, TreeIssue::LeavesShare { .. } | TreeIssue::Cycle { .. })), "{issues:?}");
+        s.tree.repair(T3).unwrap().unwrap();
+        assert_eq!(s.tree.get_children(s.private).unwrap(), vec![s.own, s.a]);
+        assert_eq!(s.tree.get_children(s.r2).unwrap(), vec![s.y]);
+        assert!(s.tree.validate_tree().is_empty());
+    }
+
     // ── Randomized convergence over three replicas ──────────────────────
 
     /// xorshift64*: enough randomness for a scripted network, no dependency.
@@ -1617,13 +2805,99 @@ mod tests {
             let effect = replicas[to].apply_update(id, &update).unwrap();
             stats.delivered += 1;
             if effect.structure {
-                if let Some(repair) = replicas[to].repair("repair").unwrap() {
+                if let Some(repair) = checked_repair(&mut replicas[to], "repair", stats) {
                     stats.repairs += 1;
                     self.broadcast(to, replicas.len(), &repair);
                 }
             }
             true
         }
+    }
+
+    /// A document's ancestors by stored `parent_id`s as the oracle reads
+    /// them (through `fields()`, not through the tree's own walk), and
+    /// whether the walk ended knowing everything above its start.
+    fn chain_of(tree: &Tree, start: NodeId) -> (Vec<NodeId>, bool) {
+        let mut chain = Vec::new();
+        let mut cur = start;
+        loop {
+            if chain.contains(&cur) {
+                return (chain, true);
+            }
+            let Some(fields) = tree.doc(cur).and_then(|doc| doc.fields().ok()) else { return (chain, false) };
+            chain.push(cur);
+            match fields.parent_id.filter(|_| cur != tree.root()) {
+                Some(parent) => cur = parent,
+                None => return (chain, true),
+            }
+        }
+    }
+
+    fn carries_marker(tree: &Tree, id: NodeId) -> bool {
+        tree.doc(id).and_then(|doc| doc.fields().ok()).is_some_and(|fields| fields.custom.contains_key(SHARE))
+    }
+
+    /// Per live node, the live nodes whose stored list names it.
+    fn naming_lists(tree: &Tree) -> HashMap<NodeId, Vec<NodeId>> {
+        let mut naming: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for owner in sorted(tree.list_node_ids()) {
+            for child in tree.doc(owner).unwrap().children() {
+                if tree.has_node(child) && !naming.get(&child).is_some_and(|owners| owners.contains(&owner)) {
+                    naming.entry(child).or_default().push(owner);
+                }
+            }
+        }
+        naming
+    }
+
+    /// [`Tree::repair`] under the move contract's oracle: **a repair never
+    /// lists a node under a parent outside a share while a list in that share
+    /// names it.** Shares are judged as the contract says, on the documents
+    /// held when the repair runs. Two ways to break it, both checked:
+    /// the repair newly listed the node outside the share; or the node was in
+    /// two lists and the repair kept the outside one (allowed only when that
+    /// one is in a share the losing list is outside of: two shares cannot
+    /// both keep it). Breaking a cycle is its own rule and is left out.
+    fn checked_repair(tree: &mut Tree, now: &str, stats: &mut Stats) -> Option<TreeEdit> {
+        let issues = tree.validate_tree();
+        let in_a_cycle: HashSet<NodeId> = issues.iter().filter_map(|i| if let TreeIssue::Cycle { node_ids } = i { Some(node_ids.clone()) } else { None }).flatten().collect();
+        stats.list_wins += issues.iter().filter(|i| matches!(i, TreeIssue::LeavesShare { .. })).count();
+        let before = naming_lists(tree);
+        let chains: HashMap<NodeId, (Vec<NodeId>, bool)> = tree.list_node_ids().into_iter().map(|n| (n, chain_of(tree, n))).collect();
+        let shares_of = |list: NodeId| -> Vec<NodeId> { chains[&list].0.iter().copied().filter(|&member| carries_marker(tree, member)).collect() };
+        // (node, a list that names it, the shares that list is in)
+        let mut facts: Vec<(NodeId, NodeId, Vec<NodeId>)> = Vec::new();
+        for (&node, lists) in &before {
+            for &list in lists {
+                if !chains[&list].0.contains(&node) && !in_a_cycle.contains(&node) {
+                    facts.push((node, list, shares_of(list)));
+                }
+            }
+        }
+        let competing: HashMap<(NodeId, NodeId), bool> = facts
+            .iter()
+            .flat_map(|(node, list, _)| before[node].iter().map(move |other| (*list, *other)))
+            .map(|(list, other)| ((list, other), shares_of(other).iter().any(|share| !chains[&list].0.contains(share))))
+            .collect();
+
+        let repair = tree.repair(now).unwrap();
+        if repair.is_some() {
+            let after = naming_lists(tree);
+            for (node, list, shares) in &facts {
+                let Some(now_in) = after.get(node) else { continue };
+                for holder in now_in.iter().filter(|holder| *holder != list) {
+                    let (chain, complete) = &chains[holder];
+                    let Some(share) = shares.iter().find(|share| !chain.contains(share)) else { continue };
+                    if !complete {
+                        continue;
+                    }
+                    let newly = !before[node].contains(holder);
+                    let kept_instead = !newly && !now_in.contains(list) && !competing[&(*list, *holder)];
+                    assert!(!newly && !kept_instead, "repair listed {node} under {holder}, outside share {share}, while {list} named it (newly: {newly})");
+                }
+            }
+        }
+        repair
     }
 
     #[derive(Default, Debug)]
@@ -1637,6 +2911,12 @@ mod tests {
         renames: usize,
         content_edits: usize,
         refused: usize,
+        shares: usize,
+        unshares: usize,
+        transplants: usize,
+        old_client_moves: usize,
+        tampers: usize,
+        list_wins: usize,
     }
 
     fn sorted(mut ids: Vec<NodeId>) -> Vec<NodeId> {
@@ -1665,8 +2945,11 @@ mod tests {
             let tree = &mut replicas[r];
             let nodes = sorted(tree.list_node_ids());
             let non_root: Vec<NodeId> = nodes.iter().copied().filter(|&n| n != root).collect();
+            let dead = |tree: &Tree| -> Vec<NodeId> {
+                sorted(tree.ids()).into_iter().filter(|&id| tree.doc(id).unwrap().fields().ok().is_some_and(|f| f.deleted_at.is_some())).collect()
+            };
             let roll = rng.below(100);
-            let result = if roll < 30 {
+            let result = if roll < 24 {
                 let id = rng.node_id();
                 let parent = rng.pick(&nodes).unwrap();
                 let position = if rng.below(2) == 0 { None } else { Some(rng.below(4)) };
@@ -1676,34 +2959,81 @@ mod tests {
                     stats.adds += 1;
                 }
                 edit
-            } else if roll < 55 {
+            } else if roll < 46 {
+                // Every move an honest client makes: a plain move, or a
+                // transplant when it would leave a share.
                 match (rng.pick(&non_root), rng.pick(&nodes)) {
                     (Some(id), Some(parent)) => {
                         let position = if rng.below(2) == 0 { None } else { Some(rng.below(4)) };
-                        let edit = tree.move_node(id, parent, position, &now);
+                        let mut made = Vec::new();
+                        let moved = tree.move_or_transplant(id, parent, position, &now, &mut || {
+                            made.push(rng.node_id());
+                            *made.last().unwrap()
+                        });
+                        match moved {
+                            Ok((now_id, edit)) => {
+                                if now_id == id {
+                                    stats.moves += 1;
+                                } else {
+                                    stats.transplants += 1;
+                                }
+                                created.extend(made);
+                                Ok(edit)
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    _ => continue,
+                }
+            } else if roll < 54 {
+                let Some(id) = rng.pick(&non_root) else { continue };
+                stats.removes += 1;
+                tree.remove_node(id, &now)
+            } else if roll < 60 {
+                let Some(id) = rng.pick(&dead(tree)) else { continue };
+                stats.undeletes += 1;
+                tree.undelete_node(id, &now)
+            } else if roll < 66 {
+                let Some(id) = rng.pick(&nodes) else { continue };
+                stats.renames += 1;
+                tree.set_title(id, &format!("t{step}"), &now)
+            } else if roll < 74 {
+                // A folder is shared, or a share is stopped.
+                let Some(id) = rng.pick(&non_root) else { continue };
+                if carries_marker(tree, id) {
+                    stats.unshares += 1;
+                    tree.remove_custom(id, SHARE, &now)
+                } else if nodes.iter().filter(|&&n| carries_marker(tree, n)).count() < 4 {
+                    stats.shares += 1;
+                    tree.set_custom(id, SHARE, &marker(&format!("s{step}")), &now)
+                } else {
+                    continue;
+                }
+            } else if roll < 78 {
+                // A client from before the contract: a plain move, wherever to.
+                match (rng.pick(&non_root), rng.pick(&nodes)) {
+                    (Some(id), Some(parent)) => {
+                        let edit = tree.move_node(id, parent, None, &now);
                         if edit.is_ok() {
-                            stats.moves += 1;
+                            stats.old_client_moves += 1;
                         }
                         edit
                     }
                     _ => continue,
                 }
-            } else if roll < 65 {
+            } else if roll < 90 {
+                // A client that does not keep the rule: a `parent_id` written
+                // on its own, pointing at any node (out of the node's share,
+                // more often than not), a tombstone, the node itself, nothing.
                 let Some(id) = rng.pick(&non_root) else { continue };
-                stats.removes += 1;
-                tree.remove_node(id, &now)
-            } else if roll < 72 {
-                let dead: Vec<NodeId> = sorted(tree.ids())
-                    .into_iter()
-                    .filter(|&id| tree.doc(id).unwrap().fields().ok().is_some_and(|f| f.deleted_at.is_some()))
-                    .collect();
-                let Some(id) = rng.pick(&dead) else { continue };
-                stats.undeletes += 1;
-                tree.undelete_node(id, &now)
-            } else if roll < 82 {
-                let Some(id) = rng.pick(&nodes) else { continue };
-                stats.renames += 1;
-                tree.set_title(id, &format!("t{step}"), &now)
+                let target = match rng.below(10) {
+                    0 => Some(id),
+                    1 => None,
+                    2 | 3 => rng.pick(&dead(tree)).or(Some(root)),
+                    _ => rng.pick(&nodes),
+                };
+                stats.tampers += 1;
+                Ok(tamper_parent(tree, id, target))
             } else {
                 let Some(id) = rng.pick(&nodes) else { continue };
                 match tree.doc_mut(id).unwrap().replace_plain_text(&format!("text {step}\nline")) {
@@ -1726,7 +3056,7 @@ mod tests {
             while net.deliver_one(&mut rng, &mut replicas, &mut stats) {}
             let mut quiet = true;
             for (r, tree) in replicas.iter_mut().enumerate() {
-                if let Some(repair) = tree.repair("final").unwrap() {
+                if let Some(repair) = checked_repair(tree, "final", &mut stats) {
                     quiet = false;
                     stats.repairs += 1;
                     net.broadcast(r, REPLICAS, &repair);
@@ -1754,14 +3084,27 @@ mod tests {
         stats
     }
 
+    /// Eight seeds in a release build (five seconds); one in a debug build,
+    /// where the oracle in `checked_repair` (chains and naming lists
+    /// recomputed at every one of some thousand repairs per seed) takes
+    /// minutes per seed. `cargo test --release -p pimble-crdt` runs the lot.
     #[test]
     fn three_replicas_converge_under_random_edits_delivered_in_random_order() {
         let started = std::time::Instant::now();
-        for seed in [1, 2, 3, 4, 5, 6] {
+        let seeds: &[u64] = if cfg!(debug_assertions) { &[2] } else { &[1, 2, 3, 4, 5, 6, 7, 8] };
+        let (mut transplants, mut list_wins) = (0, 0);
+        for &seed in seeds {
             let stats = run_convergence(seed, 400);
-            assert!(stats.adds > 20 && stats.moves > 10 && stats.removes > 5, "seed {seed} did too little: {stats:?}");
+            assert!(stats.adds > 20 && stats.moves > 10 && stats.removes > 5 && stats.tampers > 10 && stats.shares > 3, "seed {seed} did too little: {stats:?}");
+            transplants += stats.transplants;
+            list_wins += stats.list_wins;
             eprintln!("seed {seed}: {stats:?}");
         }
-        eprintln!("randomized convergence: {:?}", started.elapsed());
+        let (least_transplants, least_wins) = (3 * seeds.len(), 10 * seeds.len());
+        assert!(
+            transplants >= least_transplants && list_wins >= least_wins,
+            "the move contract was hardly exercised: {transplants} transplants, {list_wins} lists that won"
+        );
+        eprintln!("randomized convergence over {} seed(s): {:?}", seeds.len(), started.elapsed());
     }
 }

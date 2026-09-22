@@ -38,8 +38,8 @@ use yrs::{
 
 use crate::blocks::{blocks_from_plain_text, Block};
 use crate::content_doc::{
-    decode_update, diff_since, join_units, replacement_delta, snapshot_from_blocks,
-    transaction_changed, units_of_projection,
+    blocks_of_projection, decode_update, diff_since, fresh_snapshot, join_units, replacement_delta,
+    snapshot_from_blocks, transaction_changed, units_of_projection,
 };
 use crate::error::{CrdtError, Result};
 
@@ -245,6 +245,30 @@ impl NodeDoc {
         Self::load(bytes).map(|doc| doc.units()).unwrap_or_default()
     }
 
+    /// The content as [`Block`]s, the reverse of [`NodeDoc::from_blocks`]: `[]`
+    /// when there is no projection yet, an error when the content cannot be
+    /// projected or holds something `Block` has no variant for. `Block` cannot
+    /// say everything the editor can (see `blocks::read_doc`), so this is for
+    /// reading a document from outside the editor, never for copying one.
+    pub fn blocks(&self) -> Result<Vec<Block>> {
+        if !self.has_projection() {
+            return Ok(Vec::new());
+        }
+        blocks_of_projection(&self.save())
+    }
+
+    /// The content as a NEW document's bytes (its own history, nothing that
+    /// was deleted, everything the editor's model holds: see
+    /// `content_doc::fresh_snapshot` for why a transplant carries content this
+    /// way). `None` when there is no projection yet, which the new node keeps
+    /// as it is: no projection, seeded by its first edit like any other.
+    pub(crate) fn fresh_content(&self) -> Result<Option<Vec<u8>>> {
+        if !self.has_projection() {
+            return Ok(None);
+        }
+        fresh_snapshot(&self.save()).map(Some)
+    }
+
     /// Whether rinch-editor-collab has written its format tag: the content
     /// roots hold a projection an editor can join.
     fn has_projection(&self) -> bool {
@@ -377,7 +401,7 @@ impl NodeDoc {
     /// the plugins; this is enough to round-trip.
     pub fn set_data(&mut self, key: &str, value: &serde_json::Value) -> Result<()> {
         self.edit(|d, txn| {
-            d.data.insert(txn, key.to_string(), json_to_in(value));
+            d.put_data(txn, key, value);
             Ok(())
         })
         .map(|_| ())
@@ -445,6 +469,23 @@ impl NodeDoc {
         Some(string_value(self.node.get(&txn, PARENT_ID)).and_then(|s| NodeId::parse(&s).ok()))
     }
 
+    /// What walking up the tree needs of a held document, tombstoned or not:
+    /// whether `custom` holds `key` (as [`NodeDoc::fields`] reports it: a
+    /// value that parses) and the stored `parent_id`. `None` when the `node`
+    /// root has not arrived, which is a document that says nothing yet.
+    pub(crate) fn link(&self, key: &str) -> Option<(bool, Option<NodeId>)> {
+        let txn = self.doc.transact();
+        if self.node.len(&txn) == 0 {
+            return None;
+        }
+        let carries = self
+            .custom_map_if_present(&txn)
+            .and_then(|custom| string_value(custom.get(&txn, key)))
+            .is_some_and(|json| serde_json::from_str::<serde_json::Value>(&json).is_ok());
+        let parent = string_value(self.node.get(&txn, PARENT_ID)).and_then(|s| NodeId::parse(&s).ok());
+        Some((carries, parent))
+    }
+
     pub(crate) fn write_title(&self, txn: &mut TransactionMut, title: &str, now: &str) -> Result<()> {
         self.node.insert(txn, TITLE, title.to_string());
         self.stamp_modified(txn, now);
@@ -470,10 +511,21 @@ impl NodeDoc {
         value: &serde_json::Value,
         now: &str,
     ) -> Result<()> {
-        let json = serde_json::to_string(value).map_err(|e| CrdtError::Serialization(e.to_string()))?;
-        self.custom_map(txn).insert(txn, key.to_string(), json);
+        self.put_custom(txn, key, value)?;
         self.stamp_modified(txn, now);
         Ok(())
+    }
+
+    /// [`NodeDoc::write_custom`] without the stamp, for a document being made.
+    pub(crate) fn put_custom(&self, txn: &mut TransactionMut, key: &str, value: &serde_json::Value) -> Result<()> {
+        let json = serde_json::to_string(value).map_err(|e| CrdtError::Serialization(e.to_string()))?;
+        self.custom_map(txn).insert(txn, key.to_string(), json);
+        Ok(())
+    }
+
+    /// One top-level key of the `data` root (see [`NodeDoc::set_data`]).
+    pub(crate) fn put_data(&self, txn: &mut TransactionMut, key: &str, value: &serde_json::Value) {
+        self.data.insert(txn, key.to_string(), json_to_in(value));
     }
 
     /// Whether the key was there; nothing is written when it was not.
@@ -496,6 +548,23 @@ impl NodeDoc {
         parent_id: Option<NodeId>,
         now: &str,
     ) -> Result<()> {
+        self.write_init_as(txn, node_type, title, parent_id, now, now, &[])
+    }
+
+    /// [`NodeDoc::write_init`] for a node that has a past (a transplant): its
+    /// own `created_at`, and its tags written once rather than as an empty
+    /// array that is then replaced.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_init_as(
+        &self,
+        txn: &mut TransactionMut,
+        node_type: &str,
+        title: &str,
+        parent_id: Option<NodeId>,
+        created_at: &str,
+        modified_at: &str,
+        tags: &[String],
+    ) -> Result<()> {
         if self.node.len(txn) > 0 {
             return Err(CrdtError::Serialization("node document is already initialised".into()));
         }
@@ -504,9 +573,9 @@ impl NodeDoc {
         if let Some(parent) = parent_id {
             self.node.insert(txn, PARENT_ID, parent.to_string());
         }
-        self.node.insert(txn, CREATED_AT, now.to_string());
-        self.node.insert(txn, MODIFIED_AT, now.to_string());
-        self.node.insert(txn, TAGS, ArrayPrelim::default());
+        self.node.insert(txn, CREATED_AT, created_at.to_string());
+        self.node.insert(txn, MODIFIED_AT, modified_at.to_string());
+        self.node.insert(txn, TAGS, ArrayPrelim::from(tags.iter().cloned()));
         self.node.insert(txn, CUSTOM, MapPrelim::default());
         Ok(())
     }
