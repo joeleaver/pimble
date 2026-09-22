@@ -1721,7 +1721,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "crossbeam-channel",
@@ -1745,7 +1745,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "jsonrpsee",
@@ -1759,7 +1759,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1772,7 +1772,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-crdt"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "pimble-core",
@@ -1787,7 +1787,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-crypto"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -1807,7 +1807,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-rpc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "jsonrpsee",
  "pimble-core",
@@ -1820,7 +1820,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-web"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
