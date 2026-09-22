@@ -2755,26 +2755,16 @@ impl VaultStore {
                 access: StoreAccess::Full,
             });
         }
-        let info = self.tree.get_node_info(node_id).map_err(|e| e.to_string())?;
+        // `NodeFields::into_node` is the one mapping of stored fields to a
+        // node, here and in `LocalStore`; `access` is judged per account in
+        // `node_for`, never part of the node.
+        let fields = self.tree.live_fields(node_id).map_err(|e| e.to_string())?;
         let children = self.tree.get_children(node_id).map_err(|e| e.to_string())?;
         let content = self.tree.doc(node_id).map(NodeDoc::save).unwrap_or_default();
-        Ok(Node {
-            id: node_id,
-            parent_id: info.parent_id,
-            node_type: info.node_type,
-            metadata: NodeMetadata {
-                title: info.title,
-                created_at: parse_time(&info.created_at),
-                modified_at: parse_time(&info.modified_at),
-                tags: info.tags,
-                custom: info.custom,
-            },
-            content,
-            children,
-            links: Vec::new(),
-            // Judged per account in `node_for`, never part of the node.
-            access: StoreAccess::Full,
-        })
+        let mut node = fields.into_node(node_id);
+        node.content = content;
+        node.children = children;
+        Ok(node)
     }
 
     /// [`VaultStore::node_of`] without requiring the node to be live and
@@ -2787,22 +2777,7 @@ impl VaultStore {
     fn node_of_any(&self, node_id: NodeId) -> Option<Node> {
         let doc = self.tree.doc(node_id)?;
         let fields = doc.fields().ok()?;
-        Some(Node {
-            id: node_id,
-            parent_id: fields.parent_id,
-            node_type: fields.node_type,
-            metadata: NodeMetadata {
-                title: fields.title,
-                created_at: parse_time(&fields.created_at),
-                modified_at: parse_time(&fields.modified_at),
-                tags: fields.tags,
-                custom: fields.custom,
-            },
-            content: Vec::new(),
-            children: Vec::new(),
-            links: Vec::new(),
-            access: StoreAccess::Full,
-        })
+        Some(fields.into_node(node_id))
     }
 
     /// The title of a held document, whatever its state.
@@ -3639,12 +3614,6 @@ fn name_of(cmd: &BackendCommand) -> &'static str {
         CloseStore { .. } => "Closing a store",
         _ => "That",
     }
-}
-
-fn parse_time(raw: &str) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .unwrap_or_else(|_| chrono::Utc::now())
 }
 
 /// The timestamp this page's edits carry (`created_at`, `modified_at`,

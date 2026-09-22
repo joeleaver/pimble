@@ -880,38 +880,22 @@ impl LocalStore {
 
     // ── Nodes ────────────────────────────────────────────────────────────
 
-    /// A RFC 3339 timestamp pair as the `created_at`/`modified_at` a
-    /// [`NodeMetadata`] carries, defaulting to now on a document too old or
-    /// too damaged to parse. The one place either
-    /// [`LocalStore::assemble_node`] or [`LocalStore::get_node_any`] turns a
-    /// node's stored fields into metadata, so they read timestamps the same
-    /// way instead of each parsing its own copy.
-    fn node_metadata(title: String, created_at: &str, modified_at: &str, tags: Vec<String>, custom: HashMap<String, serde_json::Value>) -> NodeMetadata {
-        let parse = |s: &str| DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now());
-        NodeMetadata { title, created_at: parse(created_at), modified_at: parse(modified_at), tags, custom }
-    }
-
     /// Assemble a Node from the tree's view of `node_id` and its document's
-    /// bytes. The content is the whole node document (the editor joins it
-    /// as it joined a content document; Pimble's roots ride along).
+    /// bytes (`NodeFields::into_node`, the one mapping of stored fields to a
+    /// node, here and in `pimble-web`'s vault client). The content is the
+    /// whole node document (the editor joins it as it joined a content
+    /// document; Pimble's roots ride along). `access` stays `Full`: a
+    /// judgement the server that answers makes per caller, from
+    /// `write_refused` and the caller's role, never a property of the
+    /// stored node.
     fn assemble_node(&self, node_id: NodeId) -> Result<Node> {
-        let info = self.tree.get_node_info(node_id).map_err(|_| StoreError::NodeNotFound(node_id))?;
+        let fields = self.tree.live_fields(node_id).map_err(|_| StoreError::NodeNotFound(node_id))?;
         let children = self.tree.get_children(node_id).map_err(|_| StoreError::NodeNotFound(node_id))?;
         let content = self.tree.doc(node_id).map(NodeDoc::save).unwrap_or_default();
-
-        Ok(Node {
-            id: node_id,
-            parent_id: info.parent_id,
-            node_type: info.node_type,
-            metadata: Self::node_metadata(info.title, &info.created_at, &info.modified_at, info.tags, info.custom),
-            content,
-            children,
-            links: Vec::new(),
-            // A judgement the server that answers makes per caller, from
-            // `write_refused` and the caller's role; never a property of
-            // the stored node.
-            access: StoreAccess::Full,
-        })
+        let mut node = fields.into_node(node_id);
+        node.content = content;
+        node.children = children;
+        Ok(node)
     }
 
     /// Get a node by ID. `NodeNotFound` for an id with no document, a
@@ -935,16 +919,7 @@ impl LocalStore {
     pub fn get_node_any(&self, node_id: NodeId) -> Result<Node> {
         let doc = self.tree.doc(node_id).ok_or(StoreError::NodeNotFound(node_id))?;
         let fields = doc.fields().map_err(|_| StoreError::NodeNotFound(node_id))?;
-        Ok(Node {
-            id: node_id,
-            parent_id: fields.parent_id,
-            node_type: fields.node_type,
-            metadata: Self::node_metadata(fields.title, &fields.created_at, &fields.modified_at, fields.tags, fields.custom),
-            content: Vec::new(),
-            children: Vec::new(),
-            links: Vec::new(),
-            access: StoreAccess::Full,
-        })
+        Ok(fields.into_node(node_id))
     }
 
     /// Create a node under `parent_id` (the root when `None`), returning its

@@ -264,6 +264,13 @@ impl Tree {
         })
     }
 
+    /// The stored fields of a live node (what [`Tree::get_node_info`] is
+    /// built from), for [`NodeFields::into_node`]: an error for an id that is
+    /// not held, not initialised or deleted.
+    pub fn live_fields(&self, id: NodeId) -> Result<NodeFields> {
+        self.require_node(id)
+    }
+
     /// The undeleted, held children of `id` in stored order, each once: the
     /// stored list with every entry that is not a node dropped and a repeat
     /// collapsed to its first occurrence, which is what repair keeps of it.

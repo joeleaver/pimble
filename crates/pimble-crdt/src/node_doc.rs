@@ -29,7 +29,8 @@
 
 use std::collections::HashMap;
 
-use pimble_core::{IndexUnit, NodeId};
+use chrono::{DateTime, Utc};
+use pimble_core::{IndexUnit, Node, NodeId, NodeMetadata, StoreAccess};
 use yrs::updates::encoder::Encode;
 use yrs::{
     Any, Array, ArrayPrelim, ArrayRef, BranchID, Doc, GetString, In, Map, MapPrelim, MapRef, Out,
@@ -92,6 +93,41 @@ pub struct NodeFields {
     pub deleted_at: Option<String>,
     pub tags: Vec<String>,
     pub custom: HashMap<String, serde_json::Value>,
+}
+
+impl NodeFields {
+    /// The node these fields describe and nothing more: content, children
+    /// and links empty, `access` `Full` (a judgement the server that answers
+    /// makes per caller, never a property of the stored node). The one place
+    /// a document's stored timestamps become a `NodeMetadata`'s, so every
+    /// reader of a document, on every side, reads them the same way
+    /// ([`parse_timestamp`]). What wants the content or the children reads
+    /// the tree for them (`Tree::get_children`, `NodeDoc::save`).
+    pub fn into_node(self, id: NodeId) -> Node {
+        Node {
+            id,
+            parent_id: self.parent_id,
+            node_type: self.node_type,
+            metadata: NodeMetadata {
+                title: self.title,
+                created_at: parse_timestamp(&self.created_at),
+                modified_at: parse_timestamp(&self.modified_at),
+                tags: self.tags,
+                custom: self.custom,
+            },
+            content: Vec::new(),
+            children: Vec::new(),
+            links: Vec::new(),
+            access: StoreAccess::Full,
+        }
+    }
+}
+
+/// A stored RFC 3339 timestamp (`created_at`, `modified_at`) as a
+/// `DateTime`, defaulting to now on a document too old or too damaged to
+/// parse.
+pub fn parse_timestamp(raw: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(raw).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now())
 }
 
 /// What merging a peer's update changed (decision 8 of
