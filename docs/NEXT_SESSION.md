@@ -1,5 +1,41 @@
 # Next session: start here
 
+Updated 2026-09-22, night. **Branch `rhypedb-pin` off `master`: three commits, checked,
+not merged or pushed** (the section just below). Nothing Joe reported is in it; it clears
+three of the small items the v0.3.1 notes left: the Windows build, the accounts service's
+startup line and the remote-mounts flake. Shipping it is a v0.3.2 (the standing release
+rule) and waits for Joe's word.
+
+## 2026-09-22, night: branch `rhypedb-pin`
+
+- **rhypedb on master, 48424ea** (8ebfc4a). joeleaver/rhypedb#23 (the Windows fix) was
+  merged on 2026-09-17, but the pin stayed 17 commits behind it, so every Windows release
+  job up to v0.3.1 failed on the same two errors. The commits in between are full-text
+  hardening in the engine, query, storage and server crates; the wire protocol and client
+  did not change. The analyzer changed, so a store's full-text index is rebuilt in the
+  background at its first open after the upgrade (search answers `IndexBuilding` until it
+  is done); an index written by the v0.3.1 CLI opened and answered at once under the new
+  one (three notes, prefix search included). The Windows check can now run locally:
+  `cargo xwin check -p pimble-app --release --target x86_64-pc-windows-msvc` with
+  `llvm-lib` on PATH (`/usr/bin/llvm-lib-21` symlinked as `llvm-lib`). It fails on the old
+  pin with CI's two errors and passes on this one. `continue-on-error` stays on the
+  Windows job until a tagged run has built it once, since a full link has not been tried.
+- **The accounts service waits for RhypeDB** (f1bcf4e): a refused dial is retried with
+  backoff for up to 60 s and logged once at INFO, instead of exiting (the line in every
+  deployment's log was `Error: ... connecting to rhypedb at 127.0.0.1:4201: connect
+  failed: Connection refused`, then a restart five seconds later).
+- **The remote-mounts flake, explained and fixed** (61e44ef). A replica is opened a moment
+  before its link starts, and that moment read `Live` ("open, no link") over an empty
+  replica. The test took that `Live`, stopped the remote, and the link, which had never
+  synced, reported `Connecting` instead of the `Cached` the test waited for. A `sync.json`
+  naming a plain link that is not running yet now counts as a link that has not synced.
+  The new test `a_mount_is_not_live_before_its_source_replica_has_synced` failed 22 of 30
+  runs before the fix and 0 of 30 after.
+- Checked: `cargo check --workspace --all-targets` clean; `cargo test --workspace
+  --release` (CI's step) on the branch's head exited 0: 636 passed, 49 targets.
+
+## Before that: v0.3.1
+
 Updated 2026-09-22, late. **v0.3.1 is shipped**: `follow-ups` fast-forwarded into `master`
 with Joe's word, release commit 038f76e (tag `v0.3.1`), jkbase deployment v21 (verified:
 site, `/app/`, health, JWKS and releases answer 200, `/rpc` 401 to the unauthenticated, the
@@ -329,10 +365,12 @@ windows and a browser were running) ended with the `pimble-server` `auth` test t
 failing without naming a test or printing a result line. The target passed alone (20 of
 20), the whole server suite passed twice, and a second full workspace run was clean. The
 relay agent saw one like it in `remote_mounts::a_mount_whose_source_link_is_down...`.
-Both look like load; neither has been explained. On 2026-09-22 the remote-mounts one
+Both look like load. On 2026-09-22 the remote-mounts one
 fired on CI for the v0.3.1 release commit (a 10 s `wait_for_mount_state` for the
 `Cached` notification after the source server stops; nothing in that release touches
 mounts or links, and the full release run had passed locally minutes before). The re-run passed.
+**The remote-mounts one is explained and fixed on branch `rhypedb-pin`** (a real race,
+not load: the top of this file). The `auth` one is still unexplained.
 
 ## Process notes that cost time before
 
