@@ -495,6 +495,7 @@ pub fn open_deleted_modal(store: AppStore, store_id: pimble_core::StoreId) {
     store.deleted_modal_store.set(Some(store_id));
     store.deleted_modal_nodes.set(Vec::new());
     store.deleted_modal_error.set(String::new());
+    store.deleted_modal_pending.set(true);
     store.send(BackendCommand::ListDeleted { store_id });
 }
 
@@ -2831,13 +2832,16 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             let Some(store_id) = untracked(|| store.deleted_modal_store.get()) else { return };
             if deleted_at.is_some() {
                 // A tombstone: `undeleteNode` brings back what its deletion took.
+                store.deleted_modal_pending.set(true);
                 store.send(BackendCommand::UndeleteNode { store_id, node_id });
             } else if let Some(new_parent_id) = put_back_under {
                 // A live node no list names: put it back under the scope's root.
+                store.deleted_modal_pending.set(true);
                 store.send(BackendCommand::MoveNode { store_id, node_id, new_parent_id, position: None });
             } else {
                 return;
             }
+            store.deleted_modal_pending.set(true);
             store.send(BackendCommand::ListDeleted { store_id });
         };
         let deleted_modal = rsx! {

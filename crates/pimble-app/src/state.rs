@@ -876,6 +876,13 @@ pub struct AppStore {
     pub deleted_modal_store: Signal<Option<StoreId>>,
     /// Filled by `DeletedListed`; cleared whenever the modal opens on a store.
     pub deleted_modal_nodes: Signal<Vec<DeletedRow>>,
+    /// True while a `ListDeleted`, `UndeleteNode` or "Put Back" `MoveNode`
+    /// this modal sent is still in flight. An `Error` only reaches this
+    /// modal's own error line while this is set — otherwise it is some
+    /// other command's refusal or failure and takes the path it always did
+    /// (the notice or the status bar), never something the modal claims for
+    /// its own "Put Back" that never asked.
+    pub deleted_modal_pending: Signal<bool>,
     /// A `BackendEvent::Error` while this modal is open lands here rather
     /// than the connection status bar.
     pub deleted_modal_error: Signal<String>,
@@ -1007,6 +1014,7 @@ impl AppStore {
             notice: Signal::new(String::new()),
             deleted_modal_store: Signal::new(None),
             deleted_modal_nodes: Signal::new(Vec::new()),
+            deleted_modal_pending: Signal::new(false),
             deleted_modal_error: Signal::new(String::new()),
         }
     }

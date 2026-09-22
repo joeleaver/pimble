@@ -441,10 +441,14 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 } else if untracked(|| store.mount_picker_pending.get()) {
                     store.mount_picker_pending.set(false);
                     store.mount_picker_error.set(message.clone());
-                } else if untracked(|| store.deleted_modal_store.get()).is_some() {
-                    // "Recently Deleted..." has no pending flag of its own —
-                    // `ListDeleted` and a "Put Back" are the only requests it
-                    // ever sends, and both land here while it is open.
+                } else if untracked(|| store.deleted_modal_pending.get()) {
+                    // Only an error answering this modal's own `ListDeleted`,
+                    // `UndeleteNode` or "Put Back" `MoveNode` lands here — a
+                    // refusal or failure from anything else in flight while
+                    // the modal happens to be open (a sync link, a mount
+                    // fetch) takes the path below instead, same as before
+                    // this modal existed.
+                    store.deleted_modal_pending.set(false);
                     store.deleted_modal_error.set(message.clone());
                 } else if let Some(sentence) = refusal_sentence(message) {
                     // The server refused the command; the connection is fine.
@@ -839,6 +843,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // closed) names nothing to fill.
                 if untracked(|| store.deleted_modal_store.get()) == Some(*store_id) {
                     store.deleted_modal_nodes.set(nodes.iter().map(crate::state::deleted_row).collect());
+                    store.deleted_modal_pending.set(false);
                 }
             }
             BackendEvent::NodeDeleted { store_id, node_id, parent_id } => {
@@ -2700,5 +2705,44 @@ mod tests {
         events.send(BackendEvent::DeletedListed { store_id, nodes: Vec::new() }).unwrap();
         pump(store);
         assert_eq!(store.deleted_modal_nodes.with(|rows| rows.len()), 2, "a late answer for a store the modal left changes nothing");
+    }
+
+    /// The modal being open is not enough to claim an `Error`: something else
+    /// in flight (a sync refusal, a mount fetch) while the person happens to
+    /// have "Recently Deleted..." open must still reach the notice or the
+    /// status bar, or a "Put Back" would look like it failed when it never
+    /// even ran.
+    #[test]
+    fn an_error_with_nothing_pending_skips_the_deleted_modal() {
+        let (store, events, _commands) = store_with_events();
+        store.deleted_modal_store.set(Some(StoreId::new()));
+
+        events
+            .send(BackendEvent::Error {
+                message: format!("Forbidden: {}", pimble_core::StoreAccess::READ_ONLY_REFUSAL),
+            })
+            .unwrap();
+        pump(store);
+
+        assert!(store.deleted_modal_error.get().is_empty(), "not this modal's request");
+        assert_eq!(store.notice.get(), pimble_core::StoreAccess::READ_ONLY_REFUSAL);
+    }
+
+    /// A "Put Back" that fails lands in the modal, the way `open_deleted_modal`
+    /// and `put_back_now` set `deleted_modal_pending` before sending.
+    #[test]
+    fn a_failed_put_back_lands_in_the_deleted_modal() {
+        let (store, events, _commands) = store_with_events();
+        store.deleted_modal_store.set(Some(StoreId::new()));
+        store.deleted_modal_pending.set(true);
+
+        events
+            .send(BackendEvent::Error { message: "Put Back failed".to_string() })
+            .unwrap();
+        pump(store);
+
+        assert_eq!(store.deleted_modal_error.get(), "Put Back failed");
+        assert!(!store.deleted_modal_pending.get(), "the flag clears once the error lands");
+        assert!(store.notice.get().is_empty(), "not the status bar's error");
     }
 }
