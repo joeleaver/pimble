@@ -4,7 +4,7 @@
 //! button active-state and dropdowns update correctly — unlike the upstream
 //! `render_toolbar` which renders once and never updates.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use rinch::prelude::*;
 use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
@@ -12,17 +12,17 @@ use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
 use crate::editor::editor;
 use crate::rinch_editor::EditorHandle;
 
-/// A Signal bumped whenever the toolbar's active states may have changed, so
-/// the per-button style closures re-evaluate.
-static TOOLBAR_VERSION: std::sync::OnceLock<Signal<u32>> = std::sync::OnceLock::new();
-
-pub(crate) fn toolbar_version() -> Signal<u32> {
-    *TOOLBAR_VERSION.get_or_init(|| Signal::new(0))
-}
-
 thread_local! {
-    /// The last active-state fingerprint the watcher saw (see `watch_toolbar`).
-    static LAST_FINGERPRINT: Cell<u64> = const { Cell::new(u64::MAX) };
+    /// Each mounted button's active state, in `button_groups` order (see
+    /// `fingerprint`). Written with `set_if_changed`, and each button's style
+    /// reads only its own, so a keystroke that leaves the formatting at the
+    /// caret alone writes nothing to the toolbar, and one that changes it
+    /// restyles only the buttons that flipped. (Until 2026-09-22 every editor
+    /// change bumped a version every button's style read: fifteen identical
+    /// style writes and about a hundred restyled nodes, twice per keystroke.
+    /// A `Memo` per button would not have helped: rinch's `Memo` notifies its
+    /// readers whenever its inputs change, equal or not.)
+    static BUTTON_ACTIVE: RefCell<Vec<Signal<bool>>> = const { RefCell::new(Vec::new()) };
     /// Whether the self-rescheduling watcher is running.
     static WATCHING: Cell<bool> = const { Cell::new(false) };
 }
@@ -32,14 +32,25 @@ thread_local! {
 /// caret travels; a handful of RefCell reads per tick, nothing more.
 const WATCH_INTERVAL_MS: u32 = 120;
 
-/// Refresh the toolbar now. Deferred via `run_on_main_thread` so it never
-/// runs while the editor's RefCell is still mutably borrowed by the
+/// Re-read the active states now. Deferred via `run_on_main_thread` so it
+/// never runs while the editor's RefCell is still mutably borrowed by the
 /// operation that triggered it (a command, a change callback).
 pub(crate) fn bump_toolbar() {
-    run_on_main_thread(|| {
-        LAST_FINGERPRINT.with(|f| f.set(u64::MAX));
-        toolbar_version().update(|v| *v = v.wrapping_add(1));
-    });
+    run_on_main_thread(refresh_active_bits);
+}
+
+/// Store the current active states, notifying only the buttons that flipped.
+fn refresh_active_bits() {
+    let signals = BUTTON_ACTIVE.with(|b| b.borrow().clone());
+    if signals.is_empty() {
+        return;
+    }
+    let now = fingerprint();
+    for (i, signal) in signals.iter().enumerate() {
+        if signal.is_alive() {
+            signal.set_if_changed(now & (1 << i) != 0);
+        }
+    }
 }
 
 /// Every button's active state packed into bits, so a change anywhere is
@@ -62,15 +73,7 @@ fn watch_toolbar() {
         return;
     }
     fn tick() {
-        let now = fingerprint();
-        let changed = LAST_FINGERPRINT.with(|f| {
-            let changed = f.get() != now;
-            f.set(now);
-            changed
-        });
-        if changed {
-            toolbar_version().update(|v| *v = v.wrapping_add(1));
-        }
+        refresh_active_bits();
         set_timeout(WATCH_INTERVAL_MS, tick);
     }
     set_timeout(WATCH_INTERVAL_MS, tick);
@@ -189,10 +192,6 @@ fn set_plain_paragraph(h: &EditorHandle) -> bool {
     })
 }
 
-fn check_active(check: &ActiveCheck) -> bool {
-    check_active_with(&editor(), check)
-}
-
 fn check_active_with(h: &EditorHandle, check: &ActiveCheck) -> bool {
     match check {
         ActiveCheck::Mark(tag) => mark_name(tag).map(|m| h.is_mark_active(m)).unwrap_or(false),
@@ -283,8 +282,10 @@ fn btn_style(active: bool) -> String {
 // ── Public render ────────────────────────────────────────────────────────
 
 pub(crate) fn render_pimble_toolbar(__scope: &mut RenderScope) -> NodeHandle {
-    let version = toolbar_version();
     let groups = button_groups();
+    let count = groups.iter().map(Vec::len).sum();
+    BUTTON_ACTIVE.with(|b| *b.borrow_mut() = (0..count).map(|_| Signal::new(false)).collect());
+    refresh_active_bits();
     watch_toolbar();
 
     let toolbar = rsx! {
@@ -295,6 +296,9 @@ pub(crate) fn render_pimble_toolbar(__scope: &mut RenderScope) -> NodeHandle {
         }
     };
 
+    // Each button's index into `BUTTON_ACTIVE`, counted the way `fingerprint`
+    // flattens the groups.
+    let mut bit = 0u32;
     for (gi, group) in groups.into_iter().enumerate() {
         // Divider between groups
         if gi > 0 {
@@ -307,8 +311,9 @@ pub(crate) fn render_pimble_toolbar(__scope: &mut RenderScope) -> NodeHandle {
         }
 
         for btn_def in group {
-            let btn = render_btn(__scope, version, btn_def);
+            let btn = render_btn(__scope, bit, btn_def);
             toolbar.append_child(&btn);
+            bit += 1;
         }
     }
 
@@ -317,21 +322,23 @@ pub(crate) fn render_pimble_toolbar(__scope: &mut RenderScope) -> NodeHandle {
 
 fn render_btn(
     __scope: &mut RenderScope,
-    version: Signal<u32>,
+    bit: u32,
     def: BtnDef,
 ) -> NodeHandle {
-    let check = def.active_check; // Copy
     let cmd = def.cmd;
     let icon_el = render_tabler_icon(__scope, def.icon, TablerIconStyle::Outline);
+    // A button with no active state never restyles; the rest follow their
+    // own signal only.
+    let active = match def.active_check {
+        ActiveCheck::None => None,
+        _ => BUTTON_ACTIVE.with(|b| b.borrow().get(bit as usize).copied()),
+    };
 
     rsx! {
         div {
             title: def.tooltip,
             style: {
-                move || {
-                    let _ = version.get();
-                    btn_style(check_active(&check))
-                }
+                move || btn_style(active.is_some_and(|a| a.get()))
             },
             onclick: {
                 let cmd = cmd.clone();
@@ -380,5 +387,49 @@ mod tests {
 
         // And it is a real toggle: nothing to turn off on a paragraph.
         assert!(!set_plain_paragraph(&h));
+    }
+
+    /// A refresh that finds the formatting at the caret unchanged notifies no
+    /// button, and one that finds bold switched on notifies the bold button
+    /// alone: a keystroke must not restyle the whole toolbar.
+    #[test]
+    fn a_refresh_wakes_only_the_buttons_whose_state_changed() {
+        use std::rc::Rc;
+
+        let h = editor();
+        assert!(h.load_html("<p><strong>bold</strong> plain</p>"));
+        h.set_selection(Selection::cursor(Pos(8)));
+
+        let count: usize = button_groups().iter().map(Vec::len).sum();
+        let signals: Vec<Signal<bool>> = (0..count).map(|_| Signal::new(false)).collect();
+        BUTTON_ACTIVE.with(|b| *b.borrow_mut() = signals.clone());
+        let runs: Vec<Rc<Cell<u32>>> = (0..count).map(|_| Rc::new(Cell::new(0))).collect();
+        let _effects: Vec<rinch::Effect> = signals
+            .iter()
+            .zip(&runs)
+            .map(|(signal, runs)| {
+                let (signal, runs) = (*signal, runs.clone());
+                rinch::Effect::new(move || {
+                    let _ = signal.get();
+                    runs.set(runs.get() + 1);
+                })
+            })
+            .collect();
+        let snapshot = || runs.iter().map(|r| r.get()).collect::<Vec<_>>();
+        let before = snapshot();
+
+        refresh_active_bits();
+        refresh_active_bits();
+        assert_eq!(snapshot(), before, "nothing changed, so nothing is notified");
+
+        h.set_selection(Selection::cursor(Pos(3)));
+        refresh_active_bits();
+        let after = snapshot();
+        let bold = 0; // the first button of the first group
+        assert!(signals[bold].get(), "the caret is in bold text");
+        for i in 0..count {
+            let expected = before[i] + u32::from(i == bold);
+            assert_eq!(after[i], expected, "button {i}");
+        }
     }
 }

@@ -1565,7 +1565,18 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             let nv_effect = node_value.clone();
             let nv_for_context_menu = node_value.clone();
 
-            // Memo: only propagates when THIS node's rename state actually changes.
+            // This row's own locally-computed label (see `AppStore::live_label`):
+            // the label below subscribes to it and not to any other row's.
+            let live_label = if is_store_root {
+                None
+            } else {
+                parsed.and_then(|(s_id, n_id)| Some(store.live_label_signal((s_id, n_id?))))
+            };
+
+            // Whether THIS node is being renamed. (A rinch `Memo` re-notifies
+            // its readers whenever `renaming_node` changes, equal result or
+            // not, so every row's rename-dependent closures re-run on a
+            // rename; renames are rare enough for that to be fine.)
             let is_renaming = {
                 let nv = node_value.clone();
                 Memo::new(move || store.renaming_node.get().as_deref() == Some(&nv))
@@ -1662,10 +1673,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 store_sig.map(|s| s.with(|st| st.name.clone()))
                                     .unwrap_or_default()
                             } else {
-                                let live = parsed.and_then(|(s_id, n_id)| {
-                                    let n_id = n_id?;
-                                    store.live_label.with(|m| m.get(&(s_id, n_id)).cloned())
-                                });
+                                let live = live_label.and_then(|sig| sig.get());
                                 live.or_else(|| node_sig.map(|s| s.with(|n| display_label_from_node(n))))
                                     .unwrap_or_else(|| "Untitled".to_string())
                             };

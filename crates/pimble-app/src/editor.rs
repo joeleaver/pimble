@@ -250,7 +250,7 @@ fn schedule_label_refresh(store: AppStore, store_id: StoreId, node_id: NodeId) {
     let timeout = set_timeout(300, move || {
         LABEL_REFRESH.with(|slot| { slot.borrow_mut().take(); });
         if let Some(label) = compute_live_label(store, store_id, node_id, &editor()) {
-            store.live_label.update(|m| { m.insert((store_id, node_id), label); });
+            store.live_label_signal((store_id, node_id)).set_if_changed(Some(label));
         }
     });
     LABEL_REFRESH.with(|slot| { *slot.borrow_mut() = Some(timeout); });
@@ -273,6 +273,9 @@ fn compute_live_label(store: AppStore, store_id: StoreId, node_id: NodeId, handl
             (explicit, n.metadata.title.clone())
         })
     });
+    if has_explicit_title && !title.is_empty() {
+        return Some(title);
+    }
     let content = doc_text(handle);
     Some(label_from_title_and_content(has_explicit_title, &title, &content))
 }
