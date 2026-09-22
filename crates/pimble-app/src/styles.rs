@@ -296,6 +296,26 @@ pub(crate) const APP_CSS: &str = "
     display: flex;
     flex-direction: column;
     overflow-y: auto;
+    /* `position: relative` + an explicit `z-index` (rather than the default
+       `auto`) makes this its own CSS stacking context
+       (rinch-dom/src/node.rs `Node::creates_stacking_context`: a positioned
+       box only qualifies when `z_index.is_some()`). Without it, the overlay
+       scrollbar this wrap paints for itself
+       (rinch-dom/src/paint/mod.rs, the scroll-container overlay block right
+       after this node's own children are painted) is drawn too early: the
+       editor is `position: relative; z-index: 0`
+       (rinch-editor-view/src/styles.rs, for its caret/selection overlays),
+       which makes IT a stacking context too, so rinch's paint order
+       (rinch-dom/src/stacking.rs) hoists the editor out of this wrap's own
+       tree-order paint and defers it to the *nearest stacking-context
+       ancestor* — previously several levels up, past this scrollbar draw —
+       so the editor's own opaque background painted over the scrollbar a
+       moment after it was drawn. Making this wrap the nearest stacking
+       context keeps that hoist local: the editor now paints (via
+       `paint_children_with_stacking`) before control returns to this node's
+       own `paint_node` call, where the scrollbar is drawn last, on top. */
+    position: relative;
+    z-index: 0;
 }
 
 /* Size the rinch Editor to fill the content area. Done via a CSS rule (NOT an
