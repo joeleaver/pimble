@@ -82,9 +82,22 @@ pub trait PimbleApi {
     #[method(name = "undeleteNode", with_extensions)]
     async fn undelete_node(&self, request: UndeleteNodeRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
 
-    /// Move a node to a new parent. Write.
+    /// Move a node to a new parent. Write. A move that would take the node
+    /// out of a share is a transplant (docs/MOVE_CONTRACT.md): a tombstone
+    /// where it was, a new node where it lands; the answer names the id the
+    /// node has now.
     #[method(name = "moveNode", with_extensions)]
-    async fn move_node(&self, request: MoveNodeRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+    async fn move_node(&self, request: MoveNodeRequest) -> Result<MoveNodeResponse, ErrorObjectOwned>;
+
+    /// Move a node into another store (docs/MOVE_CONTRACT.md "Between
+    /// stores"): always a transplant. Write in both stores.
+    #[method(name = "transplantNode", with_extensions)]
+    async fn transplant_node(&self, request: TransplantNodeRequest) -> Result<TransplantNodeResponse, ErrorObjectOwned>;
+
+    /// What "Recently Deleted..." shows for a store: the top-most tombstones
+    /// and the live nodes no list names. Read, judged like `getChildren`.
+    #[method(name = "listDeleted", with_extensions)]
+    async fn list_deleted(&self, request: ListDeletedRequest) -> Result<ListDeletedResponse, ErrorObjectOwned>;
 
     /// Get children of a node. Read, and — when the node is a mount —
     /// also checked against the mount's source store.

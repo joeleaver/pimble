@@ -3257,7 +3257,9 @@ pub fn writes(cmd: &BackendCommand) -> bool {
             | RenameNode { .. }
             | SetNodeAppearance { .. }
             | DeleteNode { .. }
+            | UndeleteNode { .. }
             | MoveNode { .. }
+            | TransplantNode { .. }
             | SetNodeContent { .. }
             | BroadcastChanges { .. }
             | CreateMount { .. }

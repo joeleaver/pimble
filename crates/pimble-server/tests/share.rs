@@ -1177,7 +1177,7 @@ async fn a_reader_reads_the_share_and_cannot_write() {
     let heads_before: HashMap<VaultDocId, u64> = env.h_admin.vault_list_docs(store_id).await.unwrap().into_iter().map(|d| (d.doc_id, d.head)).collect();
     let refused = |result: Result<(), pimble_client::ClientError>| assert_eq!(result.expect_err("a reader's replica refuses writes").to_string(), StoreAccess::READ_ONLY_REFUSAL);
     refused(carol.create_node(store_id, Some(shared), "document", "no").await.map(|_| ()));
-    refused(carol.move_node(store_id, fx.leaf, shared, None).await);
+    refused(carol.move_node(store_id, fx.leaf, shared, None).await.map(|_| ()));
     refused(carol.delete_node(store_id, fx.inside).await);
     let mut metadata = carol.get_node(store_id, fx.inside).await.unwrap().metadata;
     metadata.title = "no".into();

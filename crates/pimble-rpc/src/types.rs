@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use pimble_core::{MountRef, MountState, Node, NodeId, NodeMetadata, RelaySide, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState, Workspace};
+use pimble_core::{DeletedNode, LeftShare, MountRef, MountState, Node, NodeId, NodeMetadata, RelaySide, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState, Workspace};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -301,6 +301,57 @@ pub struct MoveNodeRequest {
     pub new_parent_id: NodeId,
     /// Position within the new parent's children (None = append)
     pub position: Option<usize>,
+}
+
+/// Answer to `moveNode` (docs/MOVE_CONTRACT.md): the id the node has now.
+/// The request's `node_id` after a plain move. After a transplant (the move
+/// would have taken the node out of a share, so the node is a tombstone where
+/// it was and a new node where it landed) the new root's id, with
+/// `left_shares` naming the shares it left, nearest first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveNodeResponse {
+    pub node_id: NodeId,
+    #[serde(default)]
+    pub left_shares: Vec<LeftShare>,
+}
+
+/// Request to move a node into another store (docs/MOVE_CONTRACT.md "Between
+/// stores"): always a transplant, since two stores hold different documents.
+/// Write on `node_id` and the list it leaves in `from_store_id`, Write on
+/// `new_parent_id` in `to_store_id`, each judged in its own store (through a
+/// mount: the source store, as everywhere).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransplantNodeRequest {
+    pub from_store_id: StoreId,
+    pub node_id: NodeId,
+    pub to_store_id: StoreId,
+    pub new_parent_id: NodeId,
+    /// Position within the new parent's children (None = append)
+    pub position: Option<usize>,
+}
+
+/// Answer to `transplantNode`: the new root's id in `to_store_id`, and the
+/// shares the node left in `from_store_id` (see `MoveNodeResponse`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransplantNodeResponse {
+    pub node_id: NodeId,
+    #[serde(default)]
+    pub left_shares: Vec<LeftShare>,
+}
+
+/// Request for what "Recently Deleted..." shows (docs/MOVE_CONTRACT.md
+/// "Seeing and undoing what was removed"). Judged like `getChildren`: a
+/// scoped member gets their scope's entries only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListDeletedRequest {
+    pub store_id: StoreId,
+}
+
+/// Answer to `listDeleted`: the most recently deleted first, then the live
+/// nodes no list names.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListDeletedResponse {
+    pub nodes: Vec<DeletedNode>,
 }
 
 /// Request to get children of a node

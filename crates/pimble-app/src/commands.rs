@@ -199,13 +199,74 @@ pub async fn process_command(
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
-            // Get old parent before moving
-            let old_parent_id = match c.get_node(store_id, node_id).await {
-                Ok(node) => node.parent_id.unwrap_or(NodeId(uuid::Uuid::nil())),
+            // The old parent and the title are read before the move: after a
+            // transplant the node is a tombstone under its old id.
+            let (old_parent_id, title) = match c.get_node(store_id, node_id).await {
+                Ok(node) => (node.parent_id.unwrap_or(NodeId(uuid::Uuid::nil())), node.metadata.title),
                 Err(e) => return Some(BackendEvent::Error { message: e.to_string() }),
             };
             match c.move_node(store_id, node_id, new_parent_id, position).await {
-                Ok(()) => Some(BackendEvent::NodeMoved { store_id, node_id, old_parent_id, new_parent_id }),
+                Ok(answer) if answer.node_id == node_id => {
+                    Some(BackendEvent::NodeMoved { store_id, node_id, old_parent_id, new_parent_id })
+                }
+                Ok(answer) => Some(BackendEvent::NodeTransplanted {
+                    from_store_id: store_id,
+                    old_node_id: node_id,
+                    old_parent_id,
+                    to_store_id: store_id,
+                    node_id: answer.node_id,
+                    new_parent_id,
+                    title,
+                    left_shares: answer.left_shares,
+                }),
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::TransplantNode { from_store_id, node_id, to_store_id, new_parent_id, position } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            let (old_parent_id, title) = match c.get_node(from_store_id, node_id).await {
+                Ok(node) => (node.parent_id.unwrap_or(NodeId(uuid::Uuid::nil())), node.metadata.title),
+                Err(e) => return Some(BackendEvent::Error { message: e.to_string() }),
+            };
+            match c.transplant_node(from_store_id, node_id, to_store_id, new_parent_id, position).await {
+                Ok(answer) => Some(BackendEvent::NodeTransplanted {
+                    from_store_id,
+                    old_node_id: node_id,
+                    old_parent_id,
+                    to_store_id,
+                    node_id: answer.node_id,
+                    new_parent_id,
+                    title,
+                    left_shares: answer.left_shares,
+                }),
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::UndeleteNode { store_id, node_id } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            if let Err(e) = c.undelete_node(store_id, node_id).await {
+                return Some(BackendEvent::Error { message: e.to_string() });
+            }
+            // Back under its parent: the list it went back into is what the
+            // tree refetches on `NodeCreated`.
+            match c.get_node(store_id, node_id).await {
+                Ok(node) => Some(BackendEvent::NodeCreated { store_id, parent_id: node.parent_id, node_id }),
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::ListDeleted { store_id } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            match c.list_deleted(store_id).await {
+                Ok(nodes) => Some(BackendEvent::DeletedListed { store_id, nodes }),
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
         }

@@ -235,6 +235,33 @@ pub struct ShareMarker {
     pub name: String,
 }
 
+/// A share a node left in a move (docs/MOVE_CONTRACT.md): a move that would
+/// take a node out of a share is, for that share, a delete, and where it lands
+/// a new node is made. Named by the share's root node and the display name on
+/// its marker (`ShareMarker.name`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeftShare {
+    pub root: NodeId,
+    pub name: String,
+}
+
+/// One entry of "Recently Deleted..." (docs/MOVE_CONTRACT.md "Seeing and
+/// undoing what was removed"): a top-most tombstone (the node a deletion
+/// started at; `undeleteNode` brings back what it took with it), or a live
+/// node no held list names.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeletedNode {
+    pub node: Node,
+    /// The title of the folder it was in, when that folder is held here.
+    pub parent_title: Option<String>,
+    /// When it was deleted (RFC 3339); `None` for a live node no list names.
+    pub deleted_at: Option<String>,
+    /// For a live node no list names: where "Put Back" moves it (the root of
+    /// the scope that reaches it, or the store's root). `None` for a
+    /// tombstone, which `undeleteNode` puts back where it was.
+    pub put_back_under: Option<NodeId>,
+}
+
 impl ShareMarker {
     pub const VERSION: u8 = 1;
 }

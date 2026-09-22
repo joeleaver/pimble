@@ -63,7 +63,7 @@ use pimble_rpc::{
     CreateWorkspaceRequest, DeleteNodeRequest, EditOperation, EmptyResponse, GetChildrenRequest,
     GetChildrenResponse, GetMountStateRequest, GetMountStateResponse, GetNodeRequest, GetStoreSyncRequest, GetStoreSyncResponse, SetStoreSyncRequest,
     GetNodeResponse, GetNodesRequest, GetNodesResponse, ListRemoteStoresRequest, ListStoresResponse, LoadWorkspaceRequest,
-    LoadWorkspaceResponse, MoveNodeRequest, NodeContentChangedNotification, NodeContentDiff, OpenStoreRequest,
+    LoadWorkspaceResponse, MoveNodeRequest, MoveNodeResponse, ListDeletedRequest, ListDeletedResponse, TransplantNodeRequest, TransplantNodeResponse, NodeContentChangedNotification, NodeContentDiff, OpenStoreRequest,
     OpenStoreResponse, PimbleApiServer, RebuildIndexRequest, RebuildIndexResponse, RemoveReplicaRequest,
     SaveWorkspaceRequest, SearchRequest, SearchResponse, SearchResultItem, StoreChangeKind,
     CloudShareInfoResponse, CloudShareInviteRequest, CloudShareNodeRequest, CloudShareRef, CloudShareRemoveMemberRequest, DeleteVaultStoreRequest,
@@ -3530,7 +3530,7 @@ impl PimbleApiServer for RpcHandler {
         &self,
         ext: &Extensions,
         request: MoveNodeRequest,
-    ) -> Result<EmptyResponse, ErrorObjectOwned> {
+    ) -> Result<MoveNodeResponse, ErrorObjectOwned> {
         let principal = principal_of(ext);
         authorize(&principal, request.store_id, Access::Write)?;
         self.reject_if_vault(request.store_id).await?;
@@ -3577,7 +3577,28 @@ impl PimbleApiServer for RpcHandler {
         // Re-upsert the moved node: its `parent` relationship is what changed.
         self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
 
-        Ok(EmptyResponse {})
+        Ok(MoveNodeResponse { node_id, left_shares: Vec::new() })
+    }
+
+    async fn transplant_node(
+        &self,
+        ext: &Extensions,
+        request: TransplantNodeRequest,
+    ) -> Result<TransplantNodeResponse, ErrorObjectOwned> {
+        let principal = principal_of(ext);
+        authorize(&principal, request.from_store_id, Access::Write)?;
+        authorize(&principal, request.to_store_id, Access::Write)?;
+        Err(to_rpc_error("transplantNode is not built yet (docs/MOVE_CONTRACT.md, wave 2)"))
+    }
+
+    async fn list_deleted(
+        &self,
+        ext: &Extensions,
+        request: ListDeletedRequest,
+    ) -> Result<ListDeletedResponse, ErrorObjectOwned> {
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Read)?;
+        Err(to_rpc_error("listDeleted is not built yet (docs/MOVE_CONTRACT.md, wave 2)"))
     }
 
     async fn get_children(

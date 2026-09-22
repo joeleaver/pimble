@@ -11,7 +11,7 @@
 //! and `try_recv` never block and work on every target.
 
 use crossbeam_channel::{Receiver, Sender};
-use pimble_core::{MountRef, MountState, Node, NodeId, RemoteEndpoint, Store, StoreId, SyncState};
+use pimble_core::{DeletedNode, LeftShare, MountRef, MountState, Node, NodeId, RemoteEndpoint, Store, StoreId, SyncState};
 
 /// Commands sent from UI to backend
 #[derive(Debug)]
@@ -45,7 +45,18 @@ pub enum BackendCommand {
         tags: Option<Vec<String>>,
     },
     DeleteNode { store_id: StoreId, node_id: NodeId },
+    /// Answers `NodeMoved`, or `NodeTransplanted` when the move would have
+    /// taken the node out of a share (docs/MOVE_CONTRACT.md).
     MoveNode { store_id: StoreId, node_id: NodeId, new_parent_id: NodeId, position: Option<usize> },
+    /// Bring a deleted node and what its deletion took with it back
+    /// (`undeleteNode`): "Put Back" in "Recently Deleted...". Answers
+    /// `NodeCreated` under the parent it went back to.
+    UndeleteNode { store_id: StoreId, node_id: NodeId },
+    /// Move a node into another store (docs/MOVE_CONTRACT.md "Between
+    /// stores"): always a transplant. Answers `NodeTransplanted`.
+    TransplantNode { from_store_id: StoreId, node_id: NodeId, to_store_id: StoreId, new_parent_id: NodeId, position: Option<usize> },
+    /// What "Recently Deleted..." shows for a store. Answers `DeletedListed`.
+    ListDeleted { store_id: StoreId },
 
     // Mount operations
     CreateMount {
@@ -216,6 +227,25 @@ pub enum BackendEvent {
     NodeRenamed { store_id: StoreId, node_id: NodeId },
     NodeDeleted { store_id: StoreId, node_id: NodeId, parent_id: NodeId },
     NodeMoved { store_id: StoreId, node_id: NodeId, old_parent_id: NodeId, new_parent_id: NodeId },
+    /// A move that crossed a share's or a store's boundary
+    /// (docs/MOVE_CONTRACT.md): `old_node_id` is now a tombstone under
+    /// `old_parent_id` in `from_store_id`, and `node_id` is the new node under
+    /// `new_parent_id` in `to_store_id` (the same store for a move between
+    /// shares). `left_shares` names the shares it left, nearest first, for the
+    /// notice: `"<title>" was moved out of "<share's name>". The people it is
+    /// shared with see it as deleted and can put it back.`
+    NodeTransplanted {
+        from_store_id: StoreId,
+        old_node_id: NodeId,
+        old_parent_id: NodeId,
+        to_store_id: StoreId,
+        node_id: NodeId,
+        new_parent_id: NodeId,
+        title: String,
+        left_shares: Vec<LeftShare>,
+    },
+    /// Answer to `ListDeleted`.
+    DeletedListed { store_id: StoreId, nodes: Vec<DeletedNode> },
 
     // Mount events
     MountCreated {

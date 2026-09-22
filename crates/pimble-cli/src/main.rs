@@ -1178,8 +1178,19 @@ async fn move_node(store_id: &str, node_id: &str, new_parent_id: &str) -> Result
     let new_parent_id = parse_node_id(new_parent_id)?;
 
     let client = connect().await?;
-    client.move_node(store_id, node_id, new_parent_id, None).await?;
-    println!("Moved node {} under {}", node_id, new_parent_id);
+    let answer = client.move_node(store_id, node_id, new_parent_id, None).await?;
+    if answer.node_id == node_id {
+        println!("Moved node {} under {}", node_id, new_parent_id);
+    } else {
+        let left: Vec<String> = answer.left_shares.iter().map(|share| format!("\"{}\"", share.name)).collect();
+        println!(
+            "Moved node {} out of {} as new node {} under {}; the original is deleted there and can be put back",
+            node_id,
+            left.join(", "),
+            answer.node_id,
+            new_parent_id
+        );
+    }
     Ok(())
 }
 

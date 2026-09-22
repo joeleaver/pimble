@@ -772,6 +772,14 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 store.send(BackendCommand::GetNode { store_id: *store_id, node_id: *node_id });
             }
 
+            BackendEvent::NodeTransplanted { from_store_id, old_node_id, to_store_id, node_id, .. } => {
+                // docs/MOVE_CONTRACT.md wave 3 builds the tree's handling, the
+                // notice and the editor following the id.
+                tracing::info!("Node {:?}/{:?} transplanted to {:?}/{:?}", from_store_id, old_node_id, to_store_id, node_id);
+            }
+            BackendEvent::DeletedListed { store_id, nodes } => {
+                tracing::info!("Store {:?}: {} recently deleted", store_id, nodes.len());
+            }
             BackendEvent::NodeDeleted { store_id, node_id, parent_id } => {
                 tracing::info!("Node deleted: {:?}/{:?}", store_id, node_id);
 

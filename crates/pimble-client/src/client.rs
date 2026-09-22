@@ -20,7 +20,8 @@ use pimble_rpc::{
     SetScopeRequest, VaultDocKeys, VaultSetDocKeysRequest,
     CreateMountRequest, CreateNodeRequest, CreateStoreRequest, CreateWorkspaceRequest, DeleteNodeRequest,
     EditOperation, GetChildrenRequest, GetMountStateRequest, GetNodeRequest, GetNodesRequest, GetStoreSyncRequest, GetStoreSyncResponse, SetStoreSyncRequest,
-    ListRemoteStoresRequest, LoadWorkspaceRequest, MoveNodeRequest, NodeContentChangedNotification, NodeStateVector,
+    ListDeletedRequest, ListRemoteStoresRequest, LoadWorkspaceRequest, MoveNodeRequest, MoveNodeResponse, NodeContentChangedNotification, NodeStateVector,
+    TransplantNodeRequest, TransplantNodeResponse,
     OpenStoreRequest, PimbleApiClient, RebuildIndexRequest, RemoveReplicaRequest, SaveWorkspaceRequest,
     SearchRequest, SearchResultItem, StoreChangedNotification, SyncNodesRequest, UndeleteNodeRequest,
     UpdateNodeContentRequest, UpdateNodeMetadataRequest, VaultAppendRequest, VaultDocId,
@@ -478,14 +479,16 @@ impl PimbleClient {
         Ok(())
     }
 
-    /// Move a node to a new parent
+    /// Move a node to a new parent. The answer names the id the node has
+    /// now: `node_id` after a plain move, a new one after a transplant (the
+    /// move left a share, docs/MOVE_CONTRACT.md), with the shares it left.
     pub async fn move_node(
         &self,
         store_id: StoreId,
         node_id: NodeId,
         new_parent_id: NodeId,
         position: Option<usize>,
-    ) -> Result<()> {
+    ) -> Result<MoveNodeResponse> {
         let request = MoveNodeRequest {
             store_id,
             node_id,
@@ -496,9 +499,37 @@ impl PimbleClient {
         self.client
             .move_node(request)
             .await
-            .map_err(rpc_error)?;
+            .map_err(rpc_error)
+    }
 
-        Ok(())
+    /// Move a node into another store: always a transplant
+    /// (docs/MOVE_CONTRACT.md "Between stores"). The answer names the new
+    /// root's id in `to_store_id`.
+    pub async fn transplant_node(
+        &self,
+        from_store_id: StoreId,
+        node_id: NodeId,
+        to_store_id: StoreId,
+        new_parent_id: NodeId,
+        position: Option<usize>,
+    ) -> Result<TransplantNodeResponse> {
+        let request = TransplantNodeRequest { from_store_id, node_id, to_store_id, new_parent_id, position };
+
+        self.client
+            .transplant_node(request)
+            .await
+            .map_err(rpc_error)
+    }
+
+    /// What "Recently Deleted..." shows for a store.
+    pub async fn list_deleted(&self, store_id: StoreId) -> Result<Vec<pimble_core::DeletedNode>> {
+        let request = ListDeletedRequest { store_id };
+
+        self.client
+            .list_deleted(request)
+            .await
+            .map(|answer| answer.nodes)
+            .map_err(rpc_error)
     }
 
     /// Get children of a node. Returns the canonical store the children live
