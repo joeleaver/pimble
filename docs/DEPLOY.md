@@ -137,8 +137,10 @@ download page reads it through `/api/v1/releases` (cached for ten minutes) and n
 deploy of its own. The release build is a fresh checkout, so every git dependency must
 resolve there: **a rinch branch that was deleted after its pull request merged fails the
 build** even though it still builds locally from cargo's cache (`fix/collab-remote-caret`,
-2026-09-17). Move the pins to `main` before tagging. The Windows job is
-`continue-on-error` until joeleaver/rhypedb#23 merges; the Linux binary needs glibc 2.38.
+2026-09-17). Move the pins to `main` before tagging. Both packages are required (the
+Windows job built for the first time at v0.3.2, once joeleaver/rhypedb#23 was in the pin);
+check Windows before tagging with `cargo xwin check -p pimble-app --release --target
+x86_64-pc-windows-msvc` (`llvm-lib` on PATH). The Linux binary needs glibc 2.38.
 
 ## Deploy
 

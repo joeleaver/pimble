@@ -55,16 +55,13 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
-  # Non-blocking until a tagged run has built it once: every Windows build up
-  # to v0.3.1 failed in rhypedb-storage's Unix-only `Mmap::advise`, which
-  # joeleaver/rhypedb#23 fixed and the pin now includes (checked locally with
-  # `cargo xwin check -p pimble-app --release --target x86_64-pc-windows-msvc`;
-  # it needs `llvm-lib` on PATH). Until then the release publishes with
-  # whatever packages built, and the download page hides the platform whose
-  # package is missing.
+  # Required since v0.3.2, the first tag it built for: every Windows build up
+  # to v0.3.1 failed in rhypedb-storage's Unix-only `Mmap::advise`
+  # (joeleaver/rhypedb#23). Check it locally before tagging with
+  # `cargo xwin check -p pimble-app --release --target x86_64-pc-windows-msvc`
+  # (it needs `llvm-lib` on PATH).
   build-windows:
     runs-on: windows-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -99,8 +96,6 @@ jobs:
 
   release:
     needs: [build-linux, build-windows]
-    # The Linux package is what the release needs; Windows may be missing (above).
-    if: always() && needs.build-linux.result == 'success'
     runs-on: ubuntu-24.04
     steps:
       - name: Download packaged artifacts
