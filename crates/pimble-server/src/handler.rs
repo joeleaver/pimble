@@ -1840,8 +1840,20 @@ impl RpcHandler {
     /// no link at all, or a link that is `Synced`, is `Live`; a link that
     /// is down or still reconciling is `Cached { last_sync }` once it has
     /// ever synced, and `Connecting` until then.
+    ///
+    /// A store is opened a moment before its link starts (a replica being
+    /// created, `openStore`); `sync.json` naming a plain link it does not
+    /// have yet is that moment, and reads as a link that has not synced this
+    /// session, never as `Live` over what may be an empty replica.
     async fn mount_state_of_open_source(&self, source: StoreId) -> MountState {
         let link = self.links.read().await.get(&source).map(|h| (h.state(), h.last_sync()));
+        let link = match link {
+            Some(link) => Some(link),
+            None => {
+                let config = self.store_manager.read().await.read_sync_config(source).await.ok().flatten();
+                config.filter(|c| !c.mode.is_vault_link()).map(|c| (SyncState::Syncing, c.last_sync))
+            }
+        };
         match link {
             None => MountState::Live,
             Some((SyncState::Synced { .. }, _)) => MountState::Live,

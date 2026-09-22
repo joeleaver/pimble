@@ -82,7 +82,9 @@ its report and the PM decides.
 3. **Mount state is derived from the source's link.** For an open source store:
    no link → `Live`; link `Synced` → `Live`; link `Syncing` or `Offline` with a known
    `last_sync` → `Cached { last_sync }`; link `Syncing` or `Offline` that has never synced
-   → `Connecting`. For a source that is not open: replica creation in flight →
+   → `Connecting`. (2026-09-22: a `sync.json` naming a plain link that has not started
+   yet counts as a link `Syncing`, not as no link; the moment between opening a replica
+   and starting its link used to read `Live` over an empty replica.) For a source that is not open: replica creation in flight →
    `Connecting`; nothing to try (no path, no remote) or the last creation attempt failed →
    `Unavailable { reason }`. The reason is the human-readable error ("remote
    http://host:7463 refused the credentials", "no remote has store <id>", "source store

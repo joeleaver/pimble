@@ -403,6 +403,31 @@ async fn a_mount_resolves_through_the_mounting_stores_remote() {
     );
 }
 
+/// A source replica is opened a moment before its link starts; in between
+/// the mount must still read `Connecting`, not `Live`. It read `Live` there
+/// once (an open store with no link), over an empty replica, and a caller
+/// that took that `Live` at its word and then lost the remote got
+/// `Connecting` instead of `Cached`, since the link had never synced (the
+/// CI flake of 2026-09-22 in the next test).
+#[tokio::test]
+async fn a_mount_is_not_live_before_its_source_replica_has_synced() {
+    let (r, _r_dir, a_id, _a_root, mount_node, _b_id, _b_root, b_doc) =
+        setup_two_local_stores_on_one_server(None).await;
+    let l = start_server(None).await;
+    l.client.add_remote_store(r.endpoint(), a_id, None).await.unwrap();
+
+    // No sleep between polls: the gap is short.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(tokio::time::Instant::now() < deadline, "the mount never became Live");
+        if let Ok((MountState::Live, _)) = l.client.get_mount_state(a_id, mount_node).await {
+            break;
+        }
+    }
+    let (_, children) = mount_children(&l.client, a_id, mount_node).await;
+    assert!(children.contains(&b_doc), "a Live mount shows its source's children, got {children:?}");
+}
+
 // ── 4. Cached ────────────────────────────────────────────────────────
 
 #[tokio::test]

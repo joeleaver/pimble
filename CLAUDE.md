@@ -129,7 +129,9 @@ when the source is a linked replica), then the mounting store's own `sync.json` 
 means creating a replica exactly as `addRemoteStore` does (`create_replica_from`), in a
 detached task; the RPC answers `Connecting` at once and a per-source in-flight set makes
 two resolutions start one task. Mount state is derived from the source's link, never
-stored: no link or `Synced` is `Live`; `Syncing`/`Offline` is `Cached { last_sync }` once
+stored: no link or `Synced` is `Live` (a `sync.json` naming a plain link not started yet is
+a link that has not synced: the moment between opening a replica and starting its link
+read `Live` over an empty replica until 2026-09-22); `Syncing`/`Offline` is `Cached { last_sync }` once
 the link has ever synced (`SyncConfig.last_sync`, written on transitions into and out of
 `Synced`) and `Connecting` until then; nothing to try or a failed attempt is
 `Unavailable { reason }`. The server remembers which mounts it resolved per source

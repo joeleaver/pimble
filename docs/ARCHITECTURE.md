@@ -469,6 +469,8 @@ pub enum MountState {
 - **Mount state is derived from the source's link**, never stored. For a source open on
   this server: no link, or a link that is `Synced`, is `Live`; a link that is `Offline` or
   `Syncing` is `Cached { last_sync }` once it has ever synced, and `Connecting` until then.
+  A `sync.json` naming a plain link that has not started yet (a store is opened a moment
+  before its link starts) counts as such a link, never as no link.
   For a source that isn't open: a replica creation in flight is `Connecting`; nothing to
   try, or a failed last attempt, is `Unavailable { reason }`.
 - **`last_sync` is persisted.** `<store>/sync.json` gains `last_sync`, which the link seeds
