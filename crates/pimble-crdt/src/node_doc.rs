@@ -106,12 +106,35 @@ pub struct NodeDoc {
     meta: MapRef,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test only: while set, every new document on this thread takes the next
+    /// client id from here instead of a random one, so a seeded test replays
+    /// the same merges (yrs orders concurrent inserts by client id).
+    static NEXT_CLIENT_ID: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test only: from here on, documents made on this thread take client ids
+/// `first`, `first + 1`, ... (see `NEXT_CLIENT_ID`).
+#[cfg(test)]
+pub(crate) fn seed_client_ids(first: u64) {
+    NEXT_CLIENT_ID.with(|next| next.set(Some(first)));
+}
+
 impl NodeDoc {
     // ── Construction and bytes (the `ContentDoc` surface, kept) ──────────
 
     /// An empty document: empty content, no `node` root yet.
     pub fn new() -> Self {
-        let options = yrs::Options { offset_kind: yrs::OffsetKind::Utf16, ..Default::default() };
+        #[allow(unused_mut)]
+        let mut options = yrs::Options { offset_kind: yrs::OffsetKind::Utf16, ..Default::default() };
+        #[cfg(test)]
+        NEXT_CLIENT_ID.with(|next| {
+            if let Some(id) = next.get() {
+                options.client_id = yrs::ClientID::new(id);
+                next.set(Some(id + 1));
+            }
+        });
         let doc = Doc::with_options(options);
         // Resolving a root opens its own transaction, so all five are resolved
         // here, before any caller can hold one (see the module doc for why the

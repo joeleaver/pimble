@@ -2925,6 +2925,10 @@ mod tests {
     }
 
     fn run_convergence(seed: u64, steps: usize) -> Stats {
+        // Every document's client id follows the seed too, so a seed names
+        // one trajectory: which concurrent inserts win is decided by client
+        // id inside yrs.
+        crate::node_doc::seed_client_ids(seed * 1_000_000 + 1);
         const REPLICAS: usize = 3;
         let mut rng = Rng::new(seed);
         let root = rng.node_id();
@@ -3053,7 +3057,17 @@ mod tests {
         // Everything delivered, repairs included, then rounds of repair and
         // exchange until nothing moves.
         for round in 0..10 {
-            while net.deliver_one(&mut rng, &mut replicas, &mut stats) {}
+            // A drain that never ends is repairs answering each other's
+            // repairs; a whole run delivers some thousands of updates.
+            let mut drained = 0usize;
+            while net.deliver_one(&mut rng, &mut replicas, &mut stats) {
+                drained += 1;
+                assert!(
+                    drained < 50_000,
+                    "seed {seed}: the network never drained in round {round}: {stats:?}; issues per replica: {:?}",
+                    replicas.iter().map(Tree::validate_tree).collect::<Vec<_>>()
+                );
+            }
             let mut quiet = true;
             for (r, tree) in replicas.iter_mut().enumerate() {
                 if let Some(repair) = checked_repair(tree, "final", &mut stats) {
@@ -3091,7 +3105,18 @@ mod tests {
     #[test]
     fn three_replicas_converge_under_random_edits_delivered_in_random_order() {
         let started = std::time::Instant::now();
-        let seeds: &[u64] = if cfg!(debug_assertions) { &[2] } else { &[1, 2, 3, 4, 5, 6, 7, 8] };
+        // `PIMBLE_CONVERGENCE_SEEDS=1,5` runs exactly those seeds, in either build.
+        let chosen: Vec<u64> = std::env::var("PIMBLE_CONVERGENCE_SEEDS")
+            .ok()
+            .map(|list| list.split(',').filter_map(|seed| seed.trim().parse().ok()).collect())
+            .unwrap_or_default();
+        let seeds: &[u64] = if !chosen.is_empty() {
+            &chosen
+        } else if cfg!(debug_assertions) {
+            &[2]
+        } else {
+            &[1, 2, 3, 4, 5, 6, 7, 8]
+        };
         let (mut transplants, mut list_wins) = (0, 0);
         for &seed in seeds {
             let stats = run_convergence(seed, 400);
