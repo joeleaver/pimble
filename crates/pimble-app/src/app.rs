@@ -20,6 +20,7 @@ use crate::events::{EVENT_PROCESSOR, process_backend_events};
 use crate::appearance::{display_color, icon_by_name, icons_matching, IconGlyph, COLOR_CHOICES};
 use crate::persistence::{load_dark_mode, save_dark_mode};
 use crate::state::{parse_tree_value, display_label_from_node, mount_is_dimmed, mount_label_suffix, AppStore, SearchState};
+use crate::state::{deleted_row_meta, deleted_row_read_only};
 use crate::state::{ShareFace, HOST_ON_CLOUD_LABEL, HOST_ON_CLOUD_SENTENCE, SHARE_FROM_HERE_LABEL, SHARE_FROM_HERE_SENTENCE};
 // Only "Mount Store Here...", which picks a directory on this machine, sets one.
 #[cfg(feature = "native")]
@@ -307,6 +308,58 @@ fn open_node(store: AppStore, tree_state: UseTreeReturn, value: String) {
     store.editor_dirty.set(false);
 }
 
+/// What a drop should do, or why it must not (`decide_drop`'s answer).
+/// `BackendCommand` carries no `PartialEq`, so this doesn't either — a test
+/// matches on it with `matches!`.
+#[derive(Debug)]
+pub(crate) enum DropDecision {
+    /// Send this command: `MoveNode` within one store, `TransplantNode`
+    /// between two (docs/MOVE_CONTRACT.md "The operation: transplant").
+    Send(BackendCommand),
+    /// Send nothing; show this sentence the way every other refusal is shown.
+    Refused(&'static str),
+}
+
+/// What a drop of `dragged` onto the resolved target parent `target` should
+/// do, judged by what this account may write at each of the three places a
+/// move touches (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"): the
+/// node itself, the list it leaves, and the list it joins. Pure and
+/// window-free, so the decision is tested on its own — the caller resolves
+/// `dragged`/`target` from the drop (through a mount: the source store, as
+/// everywhere) and the three access judgements from `AppStore` first.
+///
+/// Same store or not is the only question left once every access is fine
+/// (docs/MOVE_CONTRACT.md "A move between stores is always this, because two
+/// stores hold different documents"): a move within one, a transplant
+/// between two.
+pub(crate) fn decide_drop(
+    dragged: (pimble_core::StoreId, pimble_core::NodeId),
+    target: (pimble_core::StoreId, pimble_core::NodeId),
+    node_access: pimble_core::StoreAccess,
+    leaves_access: pimble_core::StoreAccess,
+    target_access: pimble_core::StoreAccess,
+) -> DropDecision {
+    if !node_access.allows_write() || !leaves_access.allows_write() || !target_access.allows_write() {
+        return DropDecision::Refused(pimble_core::StoreAccess::READ_ONLY_REFUSAL);
+    }
+    if dragged.0 == target.0 {
+        DropDecision::Send(BackendCommand::MoveNode {
+            store_id: dragged.0,
+            node_id: dragged.1,
+            new_parent_id: target.1,
+            position: None,
+        })
+    } else {
+        DropDecision::Send(BackendCommand::TransplantNode {
+            from_store_id: dragged.0,
+            node_id: dragged.1,
+            to_store_id: target.0,
+            new_parent_id: target.1,
+            position: None,
+        })
+    }
+}
+
 /// "Copy as Mount Source": record the canonical pair and display title of the
 /// node or store root identified by `value` into `store.mount_source`, for a
 /// subsequent "Paste Mount Here" elsewhere in the tree.
@@ -432,6 +485,30 @@ pub fn open_stop_relay_modal(store: AppStore, store_id: pimble_core::StoreId) {
     store.stop_relay_modal_error.set(String::new());
     store.stop_relay_modal_busy.set(false);
     store.stop_relay_modal_store.set(Some(store_id));
+}
+
+/// "Recently Deleted..." for `store_id` (docs/MOVE_CONTRACT.md "Seeing and
+/// undoing what was removed"): the store row's context menu already knows
+/// which store. Clears the last list before asking, so a reopen never shows
+/// a stale one while the answer is on its way.
+pub fn open_deleted_modal(store: AppStore, store_id: pimble_core::StoreId) {
+    store.deleted_modal_store.set(Some(store_id));
+    store.deleted_modal_nodes.set(Vec::new());
+    store.deleted_modal_error.set(String::new());
+    store.send(BackendCommand::ListDeleted { store_id });
+}
+
+/// View > "Recently Deleted...": the store of the current selection (a node
+/// or a store root), else the first open store — there is always one to ask
+/// while any store is open.
+pub fn open_deleted_modal_for_selection(store: AppStore) {
+    let selected_store = untracked(|| store.selected_id.get())
+        .and_then(|value| parse_tree_value(&value))
+        .map(|(store_id, _)| store_id);
+    let target = selected_store.or_else(|| untracked(|| store.store_ids.get().first().copied()));
+    if let Some(store_id) = target {
+        open_deleted_modal(store, store_id);
+    }
 }
 
 /// "Share from this computer", the first of the Share modal's two ways for a
@@ -1141,65 +1218,63 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     let Some(dragged_value) = dragged_value else { return; };
                     if dragged_value == nv { return; }
                     let Some((drag_store_id, Some(drag_node_id))) = parse_tree_value(&dragged_value) else { return; };
-                    let new_parent_id = if let Some((target_store_id, target_node_id_opt)) = parse_tree_value(&nv) {
-                        // What is only read takes no moves: such rows do not
-                        // drag and the server would refuse it anyway
-                        // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles").
-                        // An editor moves nodes inside their scope freely. A
-                        // move edits three documents, and the server judges
-                        // all three: the node, the list it leaves and the
-                        // list it joins. So does this, before anything is
-                        // sent, each by the server's own word on that node.
-                        // A drop on a store row lands in the root that row
-                        // stands for, so that node is the one judged.
-                        let target_access = match target_node_id_opt.or_else(|| store.root_node_id(target_store_id)) {
-                            Some(nid) => store.node_access(target_store_id, nid),
-                            None => store.store_access(target_store_id),
-                        };
-                        let leaves_access = store
-                            .cached_parent_id(drag_store_id, drag_node_id)
-                            .map_or(pimble_core::StoreAccess::Full, |old_parent| store.node_access(drag_store_id, old_parent));
-                        if !target_access.allows_write()
-                            || !leaves_access.allows_write()
-                            || !store.node_access(drag_store_id, drag_node_id).allows_write()
-                        {
-                            tracing::info!("Ignoring drop of {:?} into {}: one of them is shared with us to read", drag_node_id, nv);
-                            return;
-                        }
-                        if drag_store_id != target_store_id {
-                            tracing::warn!(
-                                "Ignoring drop: source store {:?} differs from target store {:?} (cross-store move not supported yet)",
-                                drag_store_id, target_store_id
-                            );
-                            return;
-                        }
-                        match target_node_id_opt {
-                            Some(nid) => {
-                                if store.is_mount(target_store_id, nid) {
-                                    tracing::warn!("Ignoring drop onto mount node {:?}/{:?}", target_store_id, nid);
-                                    return;
-                                }
-                                nid
+                    let Some((target_store_id, target_node_id_opt)) = parse_tree_value(&nv) else { return; };
+
+                    // A drop on a store row lands in the root that row
+                    // stands for. A drop onto a mount node stays refused: the
+                    // node it stands for lives in another store, and that is
+                    // where it moves (docs/MOVE_CONTRACT.md).
+                    let new_parent_id = match target_node_id_opt {
+                        Some(nid) => {
+                            if store.is_mount(target_store_id, nid) {
+                                tracing::warn!("Ignoring drop onto mount node {:?}/{:?}", target_store_id, nid);
+                                return;
                             }
-                            None => {
-                                match store.root_node_id(target_store_id) {
-                                    Some(id) => id,
-                                    None => return,
-                                }
-                            }
+                            nid
                         }
-                    } else {
-                        return;
+                        None => match store.root_node_id(target_store_id) {
+                            Some(id) => id,
+                            None => return,
+                        },
                     };
-                    tracing::info!("Drop: moving {:?} into {:?}", drag_node_id, new_parent_id);
-                    // Record the exact (possibly mount-path-qualified) tree
-                    // value dropped onto, so the resulting `NodeMoved` event
-                    // can auto-expand precisely this place (decision 7).
-                    crate::state::set_last_drop_target_value(nv.clone());
-                    store.send(BackendCommand::MoveNode {
-                        store_id: drag_store_id, node_id: drag_node_id,
-                        new_parent_id, position: None,
-                    });
+
+                    // A move edits three documents, and the server judges
+                    // all three: the node, the list it leaves and the list it
+                    // joins (docs/NODE_DOCUMENT_CONTRACT.md section 5,
+                    // "Roles"). `decide_drop` turns those three judgements
+                    // into a move within one store, a transplant between two
+                    // (docs/MOVE_CONTRACT.md "The operation: transplant"), or
+                    // a refusal — before anything is sent, by the server's
+                    // own word on each.
+                    let target_access = store.node_access(target_store_id, new_parent_id);
+                    let leaves_access = store
+                        .cached_parent_id(drag_store_id, drag_node_id)
+                        .map_or(pimble_core::StoreAccess::Full, |old_parent| store.node_access(drag_store_id, old_parent));
+                    let node_access = store.node_access(drag_store_id, drag_node_id);
+
+                    match decide_drop(
+                        (drag_store_id, drag_node_id),
+                        (target_store_id, new_parent_id),
+                        node_access,
+                        leaves_access,
+                        target_access,
+                    ) {
+                        DropDecision::Send(cmd) => {
+                            tracing::info!("Drop: {:?}", cmd);
+                            // Record the exact (possibly mount-path-qualified)
+                            // tree value dropped onto, so a same-store move's
+                            // `NodeMoved` event can auto-expand precisely this
+                            // place (decision 7). A transplant lands in
+                            // another store's own tree and has nothing here
+                            // to expand.
+                            crate::state::set_last_drop_target_value(nv.clone());
+                            store.send(cmd);
+                        }
+                        DropDecision::Refused(sentence) => {
+                            tracing::info!("Drop of {:?} into {} refused: {}", drag_node_id, nv, sentence);
+                            crate::events::show_notice(store, sentence.to_string());
+                        }
+                    }
                 }
             };
             let on_dragenter = move || { store.drop_target.set(Some(nv_enter.clone())); };
@@ -1299,6 +1374,14 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         store.remove_replica_modal_store.set(Some(s_id));
                         store.remove_replica_modal_error.set(String::new());
                         store.remove_replica_modal_pending.set(false);
+                    }
+                }
+            };
+            let on_recently_deleted = {
+                let nv = nv_ctx.clone();
+                move || {
+                    if let Some((s_id, _)) = parse_tree_value(&nv) {
+                        open_deleted_modal(store, s_id);
                     }
                 }
             };
@@ -1777,6 +1860,12 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                     onclick: on_remove_replica.clone(),
                                     "Remove Replica..."
                                 }
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::History,
+                                disabled: store_menu.recently_deleted,
+                                onclick: on_recently_deleted,
+                                "Recently Deleted..."
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Palette,
@@ -2726,6 +2815,107 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         div {
                             style: "color: var(--rinch-color-red-6); font-size: 12px;",
                             {|| store.remove_replica_modal_error.get()}
+                        }
+                    }
+                }
+            }
+        };
+
+        // ── "Recently Deleted..." modal (View menu, store row context menu)
+        // ─────────────────────────────────────────────────────────────────
+        // docs/MOVE_CONTRACT.md "Seeing and undoing what was removed": the
+        // top-most tombstones and the live nodes no list names, one store at
+        // a time. `DeletedListed` fills `deleted_modal_nodes`; a "Put Back"
+        // re-asks so the row it worked on leaves.
+        let put_back_now = move |node_id: pimble_core::NodeId, deleted_at: Option<String>, put_back_under: Option<pimble_core::NodeId>| {
+            let Some(store_id) = untracked(|| store.deleted_modal_store.get()) else { return };
+            if deleted_at.is_some() {
+                // A tombstone: `undeleteNode` brings back what its deletion took.
+                store.send(BackendCommand::UndeleteNode { store_id, node_id });
+            } else if let Some(new_parent_id) = put_back_under {
+                // A live node no list names: put it back under the scope's root.
+                store.send(BackendCommand::MoveNode { store_id, node_id, new_parent_id, position: None });
+            } else {
+                return;
+            }
+            store.send(BackendCommand::ListDeleted { store_id });
+        };
+        let deleted_modal = rsx! {
+            Modal {
+                opened_fn: move || store.deleted_modal_store.get().is_some(),
+                onclose: move || {
+                    store.deleted_modal_store.set(None);
+                    store.deleted_modal_error.set(String::new());
+                },
+                title: {move || {
+                    let name = store.deleted_modal_store.get()
+                        .and_then(|sid| store.get_store_signal(sid))
+                        .map(|sig| sig.with(|s| s.name.clone()))
+                        .unwrap_or_default();
+                    format!("Recently Deleted in \"{}\"", name)
+                }},
+                size: "sm",
+
+                div {
+                    style: "display: flex; flex-direction: column; gap: 10px;",
+
+                    div {
+                        style: {
+                            move || if store.deleted_modal_nodes.with(|n| n.is_empty()) {
+                                "font-size: 12px; color: var(--rinch-color-dimmed);"
+                            } else {
+                                "display: none;"
+                            }
+                        },
+                        "Nothing deleted recently."
+                    }
+
+                    div {
+                        class: "pimble-deleted__list",
+                        style: {
+                            move || if store.deleted_modal_nodes.with(|n| n.is_empty()) { "display: none;" } else { "" }
+                        },
+                        for row in store.deleted_modal_nodes.get() {
+                            let read_only = store.deleted_modal_store.get()
+                                .map(|sid| deleted_row_read_only(store.store_access(sid), &row))
+                                .unwrap_or(true);
+                            let node_id = row.node_id;
+                            let deleted_at = row.deleted_at.clone();
+                            let put_back_under = row.put_back_under;
+                            let title_text = row.title.clone();
+                            let meta_text = deleted_row_meta(&row);
+                            div {
+                                key: node_id.to_string(),
+                                class: "pimble-deleted__row",
+                                div {
+                                    style: "flex: 1; min-width: 0;",
+                                    div {
+                                        style: "font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                                        {title_text}
+                                    }
+                                    div {
+                                        style: "font-size: 12px; color: var(--rinch-color-dimmed);",
+                                        {meta_text}
+                                    }
+                                }
+                                span {
+                                    title: if read_only { pimble_core::StoreAccess::READ_ONLY_REFUSAL } else { "" },
+                                    Button {
+                                        variant: "light",
+                                        size: "xs",
+                                        disabled: read_only,
+                                        onclick: move || put_back_now(node_id, deleted_at.clone(), put_back_under),
+                                        "Put Back"
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !store.deleted_modal_error.get().is_empty() {
+                        div {
+                            style: "color: var(--rinch-color-red-6); font-size: 12px;",
+                            {|| store.deleted_modal_error.get()}
                         }
                     }
                 }
@@ -3682,6 +3872,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {connect_modal}
                 {link_modal}
                 {remove_replica_modal}
+                {deleted_modal}
                 {new_store_modal}
                 {mount_picker_modal}
                 {appearance_modal}
@@ -3706,6 +3897,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {connect_modal}
                 {link_modal}
                 {remove_replica_modal}
+                {deleted_modal}
                 {new_store_modal}
                 {mount_picker_modal}
                 {appearance_modal}
@@ -4119,5 +4311,67 @@ mod tests {
         assert_eq!(sync_badge_text(&synced, StoreKind::Vault, RelaySide::Member, false), "encrypted · synced");
         assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Vault, RelaySide::Member, false), "encrypted · offline");
         assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Vault, RelaySide::Member, true), "owner offline");
+    }
+
+    // ── The drop handler's decision (docs/MOVE_CONTRACT.md) ──────────────
+    use super::{decide_drop, DropDecision};
+    use pimble_core::StoreAccess::{Full, Read};
+
+    /// A drop within one store is a move — the id-preserving path, since
+    /// nothing about it can take a node out of a share (`Tree::repair`'s
+    /// concern, not the drop handler's).
+    #[test]
+    fn a_drop_within_one_store_is_a_move() {
+        let store_id = StoreId::new();
+        let (dragged, parent) = (NodeId::new(), NodeId::new());
+
+        let decision = decide_drop((store_id, dragged), (store_id, parent), Full, Full, Full);
+        match decision {
+            DropDecision::Send(BackendCommand::MoveNode { store_id: s, node_id: n, new_parent_id: p, position: None }) => {
+                assert_eq!((s, n, p), (store_id, dragged, parent));
+            }
+            other => panic!("expected a MoveNode, got {other:?}"),
+        }
+    }
+
+    /// A drop between two stores is always a transplant
+    /// (docs/MOVE_CONTRACT.md "A move between stores is always this,
+    /// because two stores hold different documents"): what gives the drag
+    /// between stores its meaning.
+    #[test]
+    fn a_drop_between_stores_is_a_transplant() {
+        let (from_store, to_store) = (StoreId::new(), StoreId::new());
+        let (dragged, parent) = (NodeId::new(), NodeId::new());
+
+        let decision = decide_drop((from_store, dragged), (to_store, parent), Full, Full, Full);
+        match decision {
+            DropDecision::Send(BackendCommand::TransplantNode {
+                from_store_id, node_id, to_store_id, new_parent_id, position: None,
+            }) => {
+                assert_eq!((from_store_id, node_id, to_store_id, new_parent_id), (from_store, dragged, to_store, parent));
+            }
+            other => panic!("expected a TransplantNode, got {other:?}"),
+        }
+    }
+
+    /// Any of the three documents a move touches being read only refuses the
+    /// drop and sends nothing, same store or not: the node itself, the list
+    /// it leaves, and the list it joins (docs/NODE_DOCUMENT_CONTRACT.md
+    /// section 5, "Roles").
+    #[test]
+    fn a_read_only_place_refuses_the_drop_and_sends_nothing() {
+        let (store_id, other_store) = (StoreId::new(), StoreId::new());
+        let (dragged, parent) = (NodeId::new(), NodeId::new());
+        let cases = [(Read, Full, Full), (Full, Read, Full), (Full, Full, Read)];
+
+        for (node_access, leaves_access, target_access) in cases {
+            for target_store in [store_id, other_store] {
+                let decision = decide_drop((store_id, dragged), (target_store, parent), node_access, leaves_access, target_access);
+                match decision {
+                    DropDecision::Refused(reason) => assert_eq!(reason, pimble_core::StoreAccess::READ_ONLY_REFUSAL),
+                    other => panic!("expected a refusal for {node_access:?}/{leaves_access:?}/{target_access:?} into store {target_store:?}, got {other:?}"),
+                }
+            }
+        }
     }
 }

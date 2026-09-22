@@ -254,6 +254,28 @@ pub(crate) const APP_CSS: &str = "
     gap: 8px;
 }
 
+/* ── \"Recently Deleted...\" modal ──────────────────────────────── */
+
+.pimble-deleted__list {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+    max-height: 320px;
+    overflow-y: auto;
+}
+
+.pimble-deleted__row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+.pimble-deleted__row:last-child {
+    border-bottom: none;
+}
+
 /* ── Editor panel ───────────────────────────────────────────── */
 
 .pimble-editor {

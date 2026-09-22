@@ -441,6 +441,11 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 } else if untracked(|| store.mount_picker_pending.get()) {
                     store.mount_picker_pending.set(false);
                     store.mount_picker_error.set(message.clone());
+                } else if untracked(|| store.deleted_modal_store.get()).is_some() {
+                    // "Recently Deleted..." has no pending flag of its own —
+                    // `ListDeleted` and a "Put Back" are the only requests it
+                    // ever sends, and both land here while it is open.
+                    store.deleted_modal_error.set(message.clone());
                 } else if let Some(sentence) = refusal_sentence(message) {
                     // The server refused the command; the connection is fine.
                     show_notice(store, sentence.to_string());
@@ -772,13 +777,69 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 store.send(BackendCommand::GetNode { store_id: *store_id, node_id: *node_id });
             }
 
-            BackendEvent::NodeTransplanted { from_store_id, old_node_id, to_store_id, node_id, .. } => {
-                // docs/MOVE_CONTRACT.md wave 3 builds the tree's handling, the
-                // notice and the editor following the id.
-                tracing::info!("Node {:?}/{:?} transplanted to {:?}/{:?}", from_store_id, old_node_id, to_store_id, node_id);
+            BackendEvent::NodeTransplanted {
+                from_store_id, old_node_id, old_parent_id, to_store_id, node_id, new_parent_id, title, left_shares,
+            } => {
+                tracing::info!(
+                    "Node {:?}/{:?} transplanted to {:?}/{:?} under {:?}",
+                    from_store_id, old_node_id, to_store_id, node_id, new_parent_id
+                );
+
+                // The store it left: exactly what `NodeDeleted` does — the
+                // old id is a tombstone now, gone from its old parent's list
+                // and everything cached under it.
+                if let Some(parent_sig) = store.get_children_signal(*from_store_id, *old_parent_id) {
+                    parent_sig.update(|children| {
+                        children.retain(|&pair| pair != (*from_store_id, *old_node_id));
+                    });
+                }
+                store.remove_subtree(*from_store_id, *old_node_id);
+
+                // The store it landed in: exactly what `NodeCreated` does —
+                // ask for the new parent's children again, whether or not
+                // they were ever loaded, so the person sees where it landed.
+                store.send(BackendCommand::GetChildren { store_id: *to_store_id, node_id: *new_parent_id });
+
+                // The editor follows the node it had open to its new id: a
+                // fresh collab session on the new document, the old one
+                // closed. Selecting first and then asking for the node is
+                // what makes `NodeLoaded`'s own "selected and not already
+                // editing" check start that session once the answer lands —
+                // the one path a document is ever opened through.
+                let was_open = untracked(|| store.active_edit.get())
+                    .map_or(false, |active| active.store_id == *from_store_id && active.node_id == *old_node_id);
+                if was_open {
+                    let value = format!("node_{}_{}", to_store_id, node_id);
+                    store.selected_id.set(Some(value.clone()));
+                    tree_state.controller.select(&value);
+                    store.node_title.set(title.clone());
+                    store.show_editor.set(true);
+                    store.send(BackendCommand::GetNode { store_id: *to_store_id, node_id: *node_id });
+                }
+
+                // The nearest share it left, if any: one line for the person
+                // who moved it (docs/MOVE_CONTRACT.md "Seeing and undoing
+                // what was removed"). A plain move between stores, with no
+                // share left, says nothing.
+                if let Some(nearest) = left_shares.first() {
+                    show_notice(
+                        store,
+                        format!(
+                            "\"{}\" was moved out of \"{}\". The people it is shared with see it as deleted and can put it back.",
+                            title, nearest.name
+                        ),
+                    );
+                }
+
+                store.bump_tree_structure();
             }
             BackendEvent::DeletedListed { store_id, nodes } => {
                 tracing::info!("Store {:?}: {} recently deleted", store_id, nodes.len());
+                // A late answer for a store the modal has moved on from (or
+                // closed) names nothing to fill.
+                if untracked(|| store.deleted_modal_store.get()) == Some(*store_id) {
+                    store.deleted_modal_nodes.set(nodes.iter().map(crate::state::deleted_row).collect());
+                }
             }
             BackendEvent::NodeDeleted { store_id, node_id, parent_id } => {
                 tracing::info!("Node deleted: {:?}/{:?}", store_id, node_id);
@@ -2448,5 +2509,196 @@ mod tests {
         events.send(listed(vec![recipes])).unwrap();
         pump(store);
         assert_eq!(store.tree_structure_version.get(), settled);
+    }
+
+    fn left_share(name: &str) -> pimble_core::LeftShare {
+        pimble_core::LeftShare { root: NodeId::new(), name: name.to_string() }
+    }
+
+    fn transplanted(
+        from_store_id: StoreId,
+        old_node_id: NodeId,
+        old_parent_id: NodeId,
+        to_store_id: StoreId,
+        node_id: NodeId,
+        new_parent_id: NodeId,
+        title: &str,
+        left_shares: Vec<pimble_core::LeftShare>,
+    ) -> BackendEvent {
+        BackendEvent::NodeTransplanted {
+            from_store_id, old_node_id, old_parent_id, to_store_id, node_id, new_parent_id,
+            title: title.to_string(), left_shares,
+        }
+    }
+
+    /// A move between two shares of one store, the way a member holding both
+    /// drags a note from one into the other (docs/MOVE_CONTRACT.md
+    /// "Verification (the bar)"): the old row leaves the list it came from,
+    /// the new parent's list is asked for so the person sees where it
+    /// landed, and the notice names the nearest share left.
+    #[test]
+    fn a_transplant_leaving_a_share_drops_the_old_row_refetches_both_lists_and_shows_the_notice() {
+        let (store, events, commands) = store_with_events();
+        let store_id = StoreId::new();
+        let (old_parent, new_parent) = (NodeId::new(), NodeId::new());
+        let (old_id, new_id) = (NodeId::new(), NodeId::new());
+        store.set_children(store_id, old_parent, vec![(store_id, old_id)]);
+
+        events
+            .send(transplanted(
+                store_id, old_id, old_parent, store_id, new_id, new_parent,
+                "Grocery list", vec![left_share("Trips"), left_share("Recipes")],
+            ))
+            .unwrap();
+        pump(store);
+
+        assert_eq!(
+            store.get_children_signal(store_id, old_parent).unwrap().with(|c| c.clone()),
+            Vec::new(),
+            "the old row leaves the list it was in"
+        );
+        assert!(
+            commands.try_iter().any(|c| matches!(c, BackendCommand::GetChildren { store_id: s, node_id: n, .. } if s == store_id && n == new_parent)),
+            "the new parent's list is asked for, so the person sees where it landed"
+        );
+        assert_eq!(
+            store.notice.get(),
+            "\"Grocery list\" was moved out of \"Trips\". The people it is shared with see it as deleted and can put it back.",
+            "the nearest share left, first in the list"
+        );
+    }
+
+    /// A plain move between stores, with no share left, is quiet: both lists
+    /// still refetch, but there is nothing to tell anyone.
+    #[test]
+    fn a_transplant_between_stores_with_no_share_left_shows_no_notice() {
+        let (store, events, commands) = store_with_events();
+        let (from_store, to_store) = (StoreId::new(), StoreId::new());
+        let (old_parent, new_parent) = (NodeId::new(), NodeId::new());
+        let (old_id, new_id) = (NodeId::new(), NodeId::new());
+        store.set_children(from_store, old_parent, vec![(from_store, old_id)]);
+
+        events
+            .send(transplanted(from_store, old_id, old_parent, to_store, new_id, new_parent, "Notes", Vec::new()))
+            .unwrap();
+        pump(store);
+
+        assert_eq!(store.get_children_signal(from_store, old_parent).unwrap().with(|c| c.clone()), Vec::new());
+        let asked: Vec<BackendCommand> = commands.try_iter().collect();
+        assert!(asked.iter().any(|c| matches!(c, BackendCommand::GetChildren { store_id: s, node_id: n, .. } if *s == to_store && *n == new_parent)));
+        assert_eq!(store.notice.get(), "");
+    }
+
+    /// The document open in the editor when it is transplanted follows to
+    /// its new id: a document opens on the new pair as any newly-selected
+    /// one does, and the old one is gone from the tree.
+    #[test]
+    fn a_transplant_of_the_open_document_moves_the_editor_to_the_new_id() {
+        let (store, events, commands) = store_with_events();
+        let store_id = StoreId::new();
+        let (old_parent, new_parent) = (NodeId::new(), NodeId::new());
+        let (old_id, new_id) = (NodeId::new(), NodeId::new());
+        store.set_children(store_id, old_parent, vec![(store_id, old_id)]);
+        store.selected_id.set(Some(format!("node_{store_id}_{old_id}")));
+        store.active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id: old_id }));
+        store.node_title.set("Grocery list".to_string());
+        store.show_editor.set(true);
+
+        events
+            .send(transplanted(store_id, old_id, old_parent, store_id, new_id, new_parent, "Grocery list", Vec::new()))
+            .unwrap();
+        pump(store);
+
+        assert_eq!(store.selected_id.get(), Some(format!("node_{store_id}_{new_id}")));
+        assert!(store.show_editor.get());
+        assert_eq!(store.node_title.get(), "Grocery list");
+        assert!(
+            commands.try_iter().any(|c| matches!(c, BackendCommand::GetNode { store_id: s, node_id: n } if s == store_id && n == new_id)),
+            "the new document is fetched, which is what starts its session"
+        );
+    }
+
+    /// A transplant of a node that was not open in the editor leaves the
+    /// selection and the editor alone — only the tree changes.
+    #[test]
+    fn a_transplant_of_a_node_not_open_leaves_the_editor_alone() {
+        let (store, events, commands) = store_with_events();
+        let store_id = StoreId::new();
+        let (old_parent, new_parent) = (NodeId::new(), NodeId::new());
+        let (old_id, new_id) = (NodeId::new(), NodeId::new());
+        let open_id = NodeId::new();
+        store.set_children(store_id, old_parent, vec![(store_id, old_id)]);
+        store.selected_id.set(Some(format!("node_{store_id}_{open_id}")));
+        store.active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id: open_id }));
+
+        events
+            .send(transplanted(store_id, old_id, old_parent, store_id, new_id, new_parent, "Untitled", Vec::new()))
+            .unwrap();
+        pump(store);
+
+        assert_eq!(store.selected_id.get(), Some(format!("node_{store_id}_{open_id}")), "a document open elsewhere stays open");
+        assert!(!commands.try_iter().any(|c| matches!(c, BackendCommand::GetNode { node_id: n, .. } if n == new_id)));
+    }
+
+    fn deleted_node(
+        node: pimble_core::Node,
+        parent_title: Option<&str>,
+        deleted_at: Option<&str>,
+        put_back_under: Option<NodeId>,
+    ) -> pimble_core::DeletedNode {
+        pimble_core::DeletedNode {
+            node,
+            parent_title: parent_title.map(str::to_string),
+            deleted_at: deleted_at.map(str::to_string),
+            put_back_under,
+        }
+    }
+
+    /// `DeletedListed` fills the modal's rows exactly as the contract lists
+    /// them: an empty title reads "Untitled", and each `DeletedNode` becomes
+    /// one row. A late answer for a store the modal has moved on from names
+    /// nothing.
+    #[test]
+    fn deleted_listed_fills_the_modals_rows() {
+        let (store, events, _commands) = store_with_events();
+        let store_id = StoreId::new();
+        store.deleted_modal_store.set(Some(store_id));
+
+        let named = pimble_core::Node::document("Pasta");
+        let named_id = named.id;
+        let mut untitled = pimble_core::Node::document("");
+        untitled.access = pimble_core::StoreAccess::Read;
+        let untitled_id = untitled.id;
+        let put_back_under = NodeId::new();
+
+        events
+            .send(BackendEvent::DeletedListed {
+                store_id,
+                nodes: vec![
+                    deleted_node(named, Some("Recipes"), Some("2026-09-21T14:32:10Z"), None),
+                    deleted_node(untitled, None, None, Some(put_back_under)),
+                ],
+            })
+            .unwrap();
+        pump(store);
+
+        let rows = store.deleted_modal_nodes.with(|rows| rows.clone());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].node_id, named_id);
+        assert_eq!(rows[0].title, "Pasta");
+        assert_eq!(rows[0].parent_title.as_deref(), Some("Recipes"));
+        assert_eq!(rows[0].deleted_at.as_deref(), Some("2026-09-21T14:32:10Z"));
+        assert_eq!(rows[0].access, pimble_core::StoreAccess::Full);
+        assert_eq!(rows[1].node_id, untitled_id);
+        assert_eq!(rows[1].title, "Untitled", "an empty title reads Untitled");
+        assert_eq!(rows[1].put_back_under, Some(put_back_under));
+        assert_eq!(rows[1].access, pimble_core::StoreAccess::Read);
+
+        // The modal moved to another store meanwhile: a late answer for the
+        // one it left is not shown.
+        store.deleted_modal_store.set(Some(StoreId::new()));
+        events.send(BackendEvent::DeletedListed { store_id, nodes: Vec::new() }).unwrap();
+        pump(store);
+        assert_eq!(store.deleted_modal_nodes.with(|rows| rows.len()), 2, "a late answer for a store the modal left changes nothing");
     }
 }

@@ -136,6 +136,12 @@ fn view_entries(store: AppStore) -> Vec<MenuEntry> {
         MenuEntry::item("Rebuild Search Index", "", move || {
             crate::app::rebuild_search_indexes(store)
         }),
+        MenuEntry::Separator,
+        // docs/MOVE_CONTRACT.md "Seeing and undoing what was removed": the
+        // store of the current selection, else the first open store.
+        MenuEntry::item("Recently Deleted...", "", move || {
+            crate::app::open_deleted_modal_for_selection(store)
+        }),
     ]
 }
 

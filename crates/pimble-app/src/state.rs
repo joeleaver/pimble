@@ -160,6 +160,76 @@ pub fn share_ended_sentence(title: Option<&str>) -> String {
     }
 }
 
+/// One row of "Recently Deleted..." (docs/MOVE_CONTRACT.md "Seeing and
+/// undoing what was removed"), copied out of a `pimble_core::DeletedNode`
+/// into its own small type: `Clone` and `PartialEq` so the row list can key
+/// and diff like any other (`DeletedNode` carries a whole `Node`, with no
+/// other reason to be either).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeletedRow {
+    pub node_id: NodeId,
+    /// Never empty: an untitled node reads "Untitled" here already.
+    pub title: String,
+    /// The folder it was in, when the app holds that folder's title.
+    pub parent_title: Option<String>,
+    /// When it was deleted (RFC 3339); `None` for a live node no list names.
+    pub deleted_at: Option<String>,
+    /// For a live node no list names: where "Put Back" moves it.
+    pub put_back_under: Option<NodeId>,
+    /// What this account may change of the node itself.
+    pub access: pimble_core::StoreAccess,
+}
+
+/// Turn one `DeletedNode` the server sent into the row "Recently
+/// Deleted..." renders and acts on.
+pub fn deleted_row(entry: &pimble_core::DeletedNode) -> DeletedRow {
+    let title = entry.node.metadata.title.clone();
+    DeletedRow {
+        node_id: entry.node.id,
+        title: if title.is_empty() { "Untitled".to_string() } else { title },
+        parent_title: entry.parent_title.clone(),
+        deleted_at: entry.deleted_at.clone(),
+        put_back_under: entry.put_back_under,
+        access: entry.node.access,
+    }
+}
+
+/// `deleted_at` read the way a person reads a timestamp rather than the RFC
+/// 3339 a server sends it as: the date and the minute, seconds and offset
+/// dropped. Pulling in a date library for one line is not worth it —
+/// pimble-app depends on no date crate of its own.
+pub fn readable_instant(rfc3339: &str) -> String {
+    match rfc3339.split_once('T') {
+        Some((date, rest)) => {
+            let time = rest.get(0..5).unwrap_or(rest);
+            format!("{date} {time}")
+        }
+        None => rfc3339.to_string(),
+    }
+}
+
+/// The second line of a "Recently Deleted..." row: the folder it was in,
+/// when known, and either when it was deleted or, for a live node no list
+/// names, that it is in none.
+pub fn deleted_row_meta(row: &DeletedRow) -> String {
+    let mut parts = Vec::new();
+    if let Some(parent) = row.parent_title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        parts.push(format!("in {parent}"));
+    }
+    match &row.deleted_at {
+        Some(when) => parts.push(readable_instant(when)),
+        None => parts.push("not in any folder".to_string()),
+    }
+    parts.join(" · ")
+}
+
+/// Whether "Put Back" is off for this row: the store or the node itself is
+/// read only for this account (docs/NODE_DOCUMENT_CONTRACT.md section 5,
+/// "Roles").
+pub fn deleted_row_read_only(store_access: pimble_core::StoreAccess, row: &DeletedRow) -> bool {
+    !store_access.allows_write() || !row.access.allows_write()
+}
+
 /// What the row of a share's replica says once every share it held has
 /// ended, in place of who shared it, what may be done with it and how its
 /// link is doing: none of that is true of it any more. The row stays because
@@ -437,6 +507,11 @@ pub struct StoreRowMenu {
     pub unlink: bool,
     pub remove_replica: bool,
     pub appearance: bool,
+    /// "Recently Deleted...": off only once every share has ended, when
+    /// there is no scope left to list (docs/MOVE_CONTRACT.md "Seeing and
+    /// undoing what was removed"). A reader sees it like an editor does;
+    /// only "Put Back" on a row is gated by what this account may write.
+    pub recently_deleted: bool,
 }
 
 /// The `disabled` value of every item of a store row's menu. A replica whose
@@ -459,6 +534,7 @@ pub fn store_row_menu(facts: StoreRowFacts) -> StoreRowMenu {
             unlink: true,
             remove_replica,
             appearance: true,
+            recently_deleted: true,
         };
     }
     let read_only = !facts.access.allows_write();
@@ -475,6 +551,7 @@ pub fn store_row_menu(facts: StoreRowFacts) -> StoreRowMenu {
         unlink: unlink_item_disabled(facts.linked, facts.relay),
         remove_replica,
         appearance: read_only,
+        recently_deleted: false,
     }
 }
 
@@ -792,6 +869,16 @@ pub struct AppStore {
     /// state: the connection is fine, the command was simply not allowed
     /// (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles").
     pub notice: Signal<String>,
+
+    // "Recently Deleted..." modal (View menu, store row context menu;
+    // docs/MOVE_CONTRACT.md "Seeing and undoing what was removed"). One
+    // store at a time: `Some(store_id)` is the store it is open for.
+    pub deleted_modal_store: Signal<Option<StoreId>>,
+    /// Filled by `DeletedListed`; cleared whenever the modal opens on a store.
+    pub deleted_modal_nodes: Signal<Vec<DeletedRow>>,
+    /// A `BackendEvent::Error` while this modal is open lands here rather
+    /// than the connection status bar.
+    pub deleted_modal_error: Signal<String>,
 }
 
 /// What changed in the roots a store's row shows (`AppStore::set_store_roots`).
@@ -918,6 +1005,9 @@ impl AppStore {
             stop_relay_modal_error: Signal::new(String::new()),
             owner_offline: Signal::new(HashSet::new()),
             notice: Signal::new(String::new()),
+            deleted_modal_store: Signal::new(None),
+            deleted_modal_nodes: Signal::new(Vec::new()),
+            deleted_modal_error: Signal::new(String::new()),
         }
     }
 
