@@ -1,12 +1,26 @@
 # Next session: start here
 
-Updated 2026-09-22, night. **Branch `rhypedb-pin` off `master`: three commits, checked,
-not merged or pushed** (the section just below). Nothing Joe reported is in it; it clears
-three of the small items the v0.3.1 notes left: the Windows build, the accounts service's
-startup line and the remote-mounts flake. Shipping it is a v0.3.2 (the standing release
-rule) and waits for Joe's word.
+Updated 2026-09-22, night. **v0.3.2 and v0.3.3 are shipped** with Joe's word ("yes yes,
+do it please"). v0.3.2 (release commit 2b604fe, deployment v22, backup before it
+`bkp_1790107649039_3bc277db966e4da8`) is branch `rhypedb-pin` (the section below): the
+rhypedb pin that makes Windows build, the accounts service waiting for RhypeDB, the mount
+fix. **Its release is the first with a Windows package** (`pimble-0.3.2-windows-x86_64.zip`
+beside the Linux one), and CI passed on the release commit. Its deployment showed the
+RhypeDB wait working and a second dependency failing the same way (the hosted Pimble
+server on 7462 was not listening yet), so the service still exited once; v0.3.3 (e2aeef3,
+release commit 251ad26, backup `bkp_1790109106982_63cfd81d6a864353`) waits for that
+connection too (a refusal, 401/403, is not waited out) and makes the Windows package a
+required job. Verified on deployment v23: the site, `/app/`, health, JWKS and releases answer
+200 and `/rpc` 401; the accounts service logged the one INFO wait for RhypeDB and was
+listening 100 ms later with no exit (no `Error:` line after v22's); the hosted server
+opened its three stores with no warning; CI passed on the release commit; the GitHub
+release has both packages (Windows now a required job), and the download API was already
+listing v0.3.2's Windows zip. Joe's part: install v0.3.3 where he wants it (Windows now
+has a package); each store's search index rebuilds in the background at its first open
+on the new version, and search says it is still building until then. Next: whatever Joe
+reports; the `auth` test target flake ("A flake to watch") is the one unexplained item.
 
-## 2026-09-22, night: branch `rhypedb-pin`
+## 2026-09-22, night: branch `rhypedb-pin` (shipped as v0.3.2)
 
 - **rhypedb on master, 48424ea** (8ebfc4a). joeleaver/rhypedb#23 (the Windows fix) was
   merged on 2026-09-17, but the pin stayed 17 commits behind it, so every Windows release
@@ -18,8 +32,8 @@ rule) and waits for Joe's word.
   one (three notes, prefix search included). The Windows check can now run locally:
   `cargo xwin check -p pimble-app --release --target x86_64-pc-windows-msvc` with
   `llvm-lib` on PATH (`/usr/bin/llvm-lib-21` symlinked as `llvm-lib`). It fails on the old
-  pin with CI's two errors and passes on this one. `continue-on-error` stays on the
-  Windows job until a tagged run has built it once, since a full link has not been tried.
+  pin with CI's two errors and passes on this one. The Windows job built for the v0.3.2
+  tag and is a required job from v0.3.3 on.
 - **The accounts service waits for RhypeDB** (f1bcf4e): a refused dial is retried with
   backoff for up to 60 s and logged once at INFO, instead of exiting (the line in every
   deployment's log was `Error: ... connecting to rhypedb at 127.0.0.1:4201: connect
