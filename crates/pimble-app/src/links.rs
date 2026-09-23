@@ -22,6 +22,64 @@ impl Plugin for LinksPlugin {
     }
 }
 
+/// Follow a clicked link's `href` (docs/LINKS_CONTRACT.md "One experience
+/// for both kinds"): a Pimble link is resolved (`ResolveLink`, answered by
+/// `events::follow_resolution`), a web link opens outside the app, anything
+/// else is left alone. Answers what it did, for the caller's tests and logs.
+pub fn follow_href(store: crate::state::AppStore, href: &str) -> Followed {
+    if let Some(url) = pimble_core::PimbleUrl::parse(href) {
+        store.send(crate::protocol::BackendCommand::ResolveLink { url, hops: 0 });
+        return Followed::Resolving;
+    }
+    let Some(url) = web_url(href).filter(|_| {
+        let lower = href.trim().to_ascii_lowercase();
+        lower.starts_with("http://") || lower.starts_with("https://")
+    }) else {
+        return Followed::Ignored;
+    };
+    if let Err(e) = open_external(&url) {
+        crate::events::show_notice(store, format!("The link could not be opened: {e}"));
+    }
+    Followed::Opened
+}
+
+/// What [`follow_href`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Followed {
+    Resolving,
+    Opened,
+    Ignored,
+}
+
+/// Open a web link outside the app: the system browser on the desktop, a new
+/// tab (no opener) in the browser.
+pub fn open_external(url: &str) -> Result<(), String> {
+    #[cfg(feature = "native")]
+    {
+        #[cfg(test)]
+        {
+            OPENED.with(|opened| opened.borrow_mut().push(url.to_string()));
+            Ok(())
+        }
+        #[cfg(not(test))]
+        {
+            open::that_detached(url).map_err(|e| e.to_string())
+        }
+    }
+    #[cfg(not(feature = "native"))]
+    {
+        let window = web_sys::window().ok_or("no window")?;
+        window.open_with_url_and_target_and_features(url, "_blank", "noopener,noreferrer").map_err(|e| format!("{e:?}"))?;
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "native"))]
+thread_local! {
+    /// Test only: what `open_external` was asked to open, instead of a browser.
+    static OPENED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Put `text` on the system clipboard: rinch's clipboard on the desktop, the
 /// browser's (`navigator.clipboard`, which answers later; a refusal is
 /// logged) in the web build.
@@ -131,6 +189,33 @@ fn autolink_rule() -> InputRule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn following_a_pimble_link_resolves_it_a_web_link_opens_it_and_nothing_else_moves() {
+        use crate::protocol::{BackendCommand, BackendHandle};
+        use crate::state::AppStore;
+        use crossbeam_channel::bounded;
+
+        let store = AppStore::new();
+        let (cmd_tx, commands) = bounded::<BackendCommand>(8);
+        let (_event_tx, event_rx) = bounded(8);
+        store.backend.set(Some(BackendHandle { cmd_tx, event_rx }));
+
+        let url = pimble_core::PimbleUrl::node(pimble_core::StoreId::new(), pimble_core::NodeId::new());
+        assert_eq!(follow_href(store, &url.to_string()), Followed::Resolving);
+        match commands.try_recv().unwrap() {
+            BackendCommand::ResolveLink { url: asked, hops } => assert_eq!((asked, hops), (url, 0)),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        assert_eq!(follow_href(store, "https://example.com/a"), Followed::Opened);
+        OPENED.with(|opened| assert_eq!(*opened.borrow(), vec!["https://example.com/a".to_string()]));
+        for href in ["example.com", "javascript:alert(1)", "file:///etc/passwd", "mailto:a@example.com", ""] {
+            assert_eq!(follow_href(store, href), Followed::Ignored, "{href:?}");
+        }
+        OPENED.with(|opened| assert_eq!(opened.borrow().len(), 1, "nothing else was opened"));
+        assert!(commands.try_recv().is_err());
+    }
 
     #[test]
     fn web_urls_and_bare_domains_are_web_links_and_nothing_else_is() {

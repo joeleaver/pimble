@@ -48,6 +48,8 @@ tokio = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 dirs = { version = "6", optional = true }
 rand = { version = "0.9", optional = true }
+# Opens a followed web link in the system browser (docs/LINKS_CONTRACT.md).
+open = { version = "5", optional = true }
 
 # --- web only (the browser DOM backend) ------------------------------------
 # The same `EditorHandle` / `Editor` as desktop, reached through the browser
@@ -76,6 +78,7 @@ web-sys = { version = "0.3", optional = true, features = ["Window", "Storage", "
 default = ["native", "onnx-download"]
 native = [
     "dep:pimble-server",
+    "dep:open",
     "dep:pimble-store",
     "dep:tokio",
     "dep:tracing-subscriber",
