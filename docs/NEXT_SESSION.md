@@ -31,6 +31,24 @@ metadata section is designed; a link follows a transplanted node through its tom
 - **The index's links** come from the text (`build_index_node`), same store only.
 - Found for wave 3: `getNode` refuses a tombstone, so following a link needs the
   `resolveLink` RPC the contract's "Waves" now names.
+
+Later the same day, on the same branch:
+- **rinch `main` 4f7496f** in both locks (#880 to #887, all perf; pimble built unchanged),
+  checked in the app. `scripts/perf/scenario.py` no longer parses `RINCH_PERF` (#877).
+- **Joe's calls**: Ctrl+L links (Ctrl+K stays search); web links get the same experience
+  as Pimble links (the contract's "One experience for both kinds").
+- **Built without rinch** (wave 3's parts that need no new hook): `resolveLink` (server,
+  `tests/links.rs`, mutant-checked), `ResolveLink`/`LinkResolved` in both apps with the
+  vault client's `resolve_in`, `follow_resolution` (open, ask again, or the sentence),
+  `follow_href` (Pimble link resolved, web link opened with `open`/`window.open`),
+  `LinksPlugin` (a typed URL + space links it), link styling in both themes, "Copy Link"
+  on every tree row (checked in the app with `wl-paste`).
+- **rinch**: PR 1 (link click and hover) is being built by an agent on branch
+  `feat/editor-link-events` of a scratch clone; issue joeleaver/rinch#891 filed (an
+  `::after` in the editor misplaces the caret; the web-link arrow waits for it).
+- Still to do in wave 3 once rinch has the hooks: Ctrl+click and hover (PR 1), the `[[` and
+  Ctrl+L picker (PR 2), paste (PR 3), deep links in the live editor (PRs 4, 5), links
+  that do not grow (PR 6).
 - Checked: `pimble-crdt` 131 tests (new: links, anchors, `became` within and between
   stores), the server's index-links test, the web crate's vault tests (47) and its
   wasm32 check. Three full release runs (`--workspace --release`): the first two each had
