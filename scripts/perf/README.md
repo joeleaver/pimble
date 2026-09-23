@@ -30,6 +30,11 @@ XDG_CONFIG_HOME=$P/env/config XDG_DATA_HOME=$P/env/data RINCH_PERF=1 \
 The embedded server takes `127.0.0.1:7462`, so quit your own Pimble first. Find the
 process with `pgrep -x pimble` (never `pgrep -f`: it matches your own shell).
 
+- **Out of date since rinch #877 (2026-09-23):** `RINCH_PERF` now prints one `[PERF] frame N:`
+  summary line per frame with rinch's counters, and `scenario.py` still parses the old
+  per-phase lines, so it reports `frames=0`. `rd.py`, screenshots and the per-thread CPU
+  method below still work; rinch's own `perf_stats` debug command returns the counters
+  as JSON. Update `scenario.py` before the next measurement.
 - `RINCH_PERF=1`: rinch logs every frame's resolve (style, layout, `build_ifc`,
   `taffy_compute`) and paint times.
 - `RINCH_RENDERER=cpu` or `--cpu`: the software renderer instead of the GPU.
