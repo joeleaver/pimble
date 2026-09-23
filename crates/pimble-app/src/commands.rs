@@ -271,6 +271,16 @@ pub async fn process_command(
             }
         }
 
+        BackendCommand::ResolveLink { url, hops } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            match c.resolve_link(url.store, url.node).await {
+                Ok(resolution) => Some(BackendEvent::LinkResolved { url, hops, resolution }),
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
         BackendCommand::CreateMount { store_id, parent_id, source_store_id, source_node_id, title } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });

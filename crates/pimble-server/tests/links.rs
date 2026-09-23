@@ -165,3 +165,35 @@ async fn this_device_opens_a_closed_store_it_knows_and_a_token_holder_does_not()
     assert_eq!(fx.resolve_as(&reader, a, note).await, LinkResolution::StoreNotHere { store_id: a, node_id: note });
     assert_eq!(fx.resolve(a, note).await, LinkResolution::Live { store_id: a, node_id: note }, "the registry knows it");
 }
+
+#[tokio::test]
+async fn on_a_members_replica_what_it_does_not_hold_and_what_ended_are_not_reachable() {
+    use pimble_core::Node;
+    use pimble_rpc::OpenStoreRequest;
+    use pimble_store::LocalStore;
+
+    let fx = Fixture::new();
+    let dir = fx._dir.path();
+    let mut owner = LocalStore::create(dir.join("owner.pimble"), "Owner").await.unwrap();
+    let root = owner.root_node_id();
+    let (kept, _) = owner.create_node(Node::folder("Kept"), Some(root)).unwrap();
+    let (in_kept, _) = owner.create_node(Node::document("In kept"), Some(kept)).unwrap();
+    let (ended, _) = owner.create_node(Node::folder("Ended"), Some(root)).unwrap();
+    let (in_ended, _) = owner.create_node(Node::document("In ended"), Some(ended)).unwrap();
+    let (private, _) = owner.create_node(Node::document("Private"), Some(root)).unwrap();
+
+    let path = dir.join("member.pimble");
+    let mut replica = LocalStore::create_replica_with_scope(&path, owner.id, "Shares", root, vec![kept, ended]).await.unwrap();
+    for id in [kept, in_kept, ended, in_ended] {
+        replica.apply_node_update(id, &owner.tree().doc(id).unwrap().save()).unwrap();
+    }
+    replica.set_ended_roots(vec![ended]).await.unwrap();
+    replica.flush().await.unwrap();
+    drop(replica);
+
+    fx.handler.open_store(&service_extensions(), OpenStoreRequest { path }).await.unwrap();
+    let store = owner.id;
+    assert_eq!(fx.resolve(store, in_kept).await, LinkResolution::Live { store_id: store, node_id: in_kept });
+    assert_eq!(fx.resolve(store, private).await, LinkResolution::NoAccess, "never held here: outside the shares");
+    assert_eq!(fx.resolve(store, in_ended).await, LinkResolution::NoAccess, "held, but the share ended");
+}

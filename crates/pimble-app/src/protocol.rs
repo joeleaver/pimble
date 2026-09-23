@@ -11,7 +11,7 @@
 //! and `try_recv` never block and work on every target.
 
 use crossbeam_channel::{Receiver, Sender};
-use pimble_core::{DeletedNode, LeftShare, MountRef, MountState, Node, NodeId, RemoteEndpoint, Store, StoreId, SyncState};
+use pimble_core::{DeletedNode, LeftShare, LinkResolution, MountRef, PimbleUrl, MountState, Node, NodeId, RemoteEndpoint, Store, StoreId, SyncState};
 
 /// Commands sent from UI to backend
 #[derive(Debug)]
@@ -57,6 +57,13 @@ pub enum BackendCommand {
     TransplantNode { from_store_id: StoreId, node_id: NodeId, to_store_id: StoreId, new_parent_id: NodeId, position: Option<usize> },
     /// What "Recently Deleted..." shows for a store. Answers `DeletedListed`.
     ListDeleted { store_id: StoreId },
+    /// Where a Pimble link leads now (`resolveLink`, docs/LINKS_CONTRACT.md
+    /// "Following a link"). Answers `LinkResolved`, whose `url` is this one.
+    /// Asked of whoever holds `url.store`: the server, or for an encrypted
+    /// store in the browser, the vault client. `hops` is how many times the
+    /// app has asked again for this one link, so a chain passed between two
+    /// holders cannot go round for ever.
+    ResolveLink { url: PimbleUrl, hops: usize },
 
     // Mount operations
     CreateMount {
@@ -246,6 +253,10 @@ pub enum BackendEvent {
     },
     /// Answer to `ListDeleted`.
     DeletedListed { store_id: StoreId, nodes: Vec<DeletedNode> },
+    /// Answer to `ResolveLink`: `url` as asked, and where it leads. A
+    /// `StoreNotHere` in another store the app holds is asked again there
+    /// (whoever holds a store answers for it).
+    LinkResolved { url: PimbleUrl, hops: usize, resolution: LinkResolution },
 
     // Mount events
     MountCreated {

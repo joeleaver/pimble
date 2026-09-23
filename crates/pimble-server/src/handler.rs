@@ -1263,6 +1263,11 @@ impl RpcHandler {
         if require_in_scope(&reach, node_id, Access::Read).is_err() {
             return LinkHop::Done(LinkResolution::NoAccess);
         }
+        // A share that ended stays on disk until its replica is removed, but
+        // it is no longer the account's: its documents are not followed into.
+        if manager.under_ended_root(store_id, node_id) {
+            return LinkHop::Done(LinkResolution::NoAccess);
+        }
         let fields = manager.tree(store_id).ok().and_then(|tree| tree.doc(node_id)).map(|doc| doc.fields());
         match fields {
             None if manager.scope_roots(store_id).is_empty() => LinkHop::Done(LinkResolution::Missing),

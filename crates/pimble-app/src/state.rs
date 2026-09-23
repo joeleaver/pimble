@@ -607,6 +607,16 @@ pub fn display_label_from_node(node: &Node) -> String {
     label_from_title_and_content(has_explicit_title, &node.metadata.title, &content)
 }
 
+/// Where a followed link leads, as `AppStore::link_open` carries it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkOpen {
+    /// `node_{store}_{node}`, as a search hit opens.
+    pub value: String,
+    pub store_id: StoreId,
+    pub node_id: NodeId,
+    pub anchor: Option<pimble_core::Anchor>,
+}
+
 /// Global application state with per-entity reactive signals.
 ///
 /// Structural changes bump `tree_structure_version` to trigger tree rebuilds.
@@ -884,6 +894,17 @@ pub struct AppStore {
     /// (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles").
     pub notice: Signal<String>,
 
+    /// A followed link's target, for `app.rs` to open with `open_node` (the
+    /// one way to open a node): its tree value and, for a deep link, the
+    /// anchor the editor puts the caret at once the session is up
+    /// (docs/LINKS_CONTRACT.md "Following a link").
+    pub link_open: Signal<Option<LinkOpen>>,
+    /// A deep link's anchor waiting for its node's editor session: the
+    /// editor resolves it (`NodeDoc::resolve_anchor`) and puts the caret
+    /// there once rinch can place and scroll a caret it was not clicked to
+    /// (docs/LINKS_CONTRACT.md, rinch PRs 4 and 5).
+    pub pending_anchor: Signal<Option<(StoreId, NodeId, pimble_core::Anchor)>>,
+
     // "Recently Deleted..." modal (View menu, store row context menu;
     // docs/MOVE_CONTRACT.md "Seeing and undoing what was removed"). One
     // store at a time: `Some(store_id)` is the store it is open for.
@@ -1026,6 +1047,8 @@ impl AppStore {
             stop_relay_modal_error: Signal::new(String::new()),
             owner_offline: Signal::new(HashSet::new()),
             notice: Signal::new(String::new()),
+            link_open: Signal::new(None),
+            pending_anchor: Signal::new(None),
             deleted_modal_store: Signal::new(None),
             deleted_modal_nodes: Signal::new(Vec::new()),
             deleted_modal_pending: Signal::new(false),

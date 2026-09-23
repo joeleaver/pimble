@@ -834,6 +834,23 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
     // Persistent tree state — created once, preserves expanded/selected across data changes
     let tree_state = UseTreeReturn::new(UseTreeOptions::default());
 
+    // A followed link's target opens the way a search hit does, with
+    // `open_node` (docs/LINKS_CONTRACT.md "Following a link"), deferred out
+    // of the effect so opening, which writes signals other effects read,
+    // never runs inside it. A deep link's anchor waits in `pending_anchor`
+    // for the editor session of that node.
+    let _ = rinch::Effect::new(move || {
+        let Some(open) = store.link_open.get() else { return };
+        let _ = set_timeout(0, move || {
+            if untracked(|| store.link_open.get()).as_ref() != Some(&open) {
+                return;
+            }
+            store.link_open.set(None);
+            store.pending_anchor.set(open.anchor.clone().map(|anchor| (open.store_id, open.node_id, anchor)));
+            open_node(store, tree_state, open.value);
+        });
+    });
+
     // Drag-and-drop state for tree node rearrangement
     let drag_ctx: DragContext<String> = DragContext::new();
 

@@ -6,14 +6,14 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 
-use pimble_core::{NodeId, Store, StoreId};
+use pimble_core::{LinkResolution, NodeId, PimbleUrl, Store, StoreId, MAX_LINK_HOPS};
 use rinch::prelude::*;
 
 use crate::protocol::{BackendCommand, BackendEvent, CloudOp};
 use crate::editor::{apply_remote, start_editing};
 use crate::persistence::{load_app_state_file, save_app_state_file};
 use crate::state::{
-    parse_tree_value, share_state_text, take_last_drop_target_value, AppStore, ConnectionState,
+    parse_tree_value, share_state_text, take_last_drop_target_value, AppStore, ConnectionState, LinkOpen,
     MountInfo, SearchState,
 };
 
@@ -47,6 +47,32 @@ pub(crate) fn show_notice(store: AppStore, message: String) {
     NOTICE_TIMEOUT.with(|slot| {
         *slot.borrow_mut() = Some(timeout);
     });
+}
+
+/// What following a link does with where `resolveLink` says it leads
+/// (docs/LINKS_CONTRACT.md "Following a link"): a live node opens, with the
+/// link's anchor for the editor; a chain that stopped in another store this
+/// app holds is asked again of whoever holds that one (the server or, in the
+/// browser, the vault client), at most `MAX_LINK_HOPS` times; anything else
+/// is its one sentence in the status bar.
+pub(crate) fn follow_resolution(store: AppStore, url: &PimbleUrl, hops: usize, resolution: &LinkResolution) {
+    match resolution {
+        LinkResolution::Live { store_id, node_id } => {
+            store.link_open.set(Some(LinkOpen {
+                value: format!("node_{store_id}_{node_id}"),
+                store_id: *store_id,
+                node_id: *node_id,
+                anchor: url.anchor.clone(),
+            }));
+        }
+        LinkResolution::StoreNotHere { store_id, node_id }
+            if *store_id != url.store && hops < MAX_LINK_HOPS && store.get_store_signal(*store_id).is_some() =>
+        {
+            let next = PimbleUrl { store: *store_id, node: *node_id, anchor: url.anchor.clone() };
+            store.send(BackendCommand::ResolveLink { url: next, hops: hops + 1 });
+        }
+        other => show_notice(store, other.sentence().unwrap_or_default().to_string()),
+    }
 }
 
 /// Whether an error is a refused write rather than a failure: one of the two
@@ -836,6 +862,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 }
 
                 store.bump_tree_structure();
+            }
+            BackendEvent::LinkResolved { url, hops, resolution } => {
+                follow_resolution(store, url, *hops, resolution);
             }
             BackendEvent::DeletedListed { store_id, nodes } => {
                 tracing::info!("Store {:?}: {} recently deleted", store_id, nodes.len());
@@ -2656,6 +2685,56 @@ mod tests {
             parent_title: parent_title.map(str::to_string),
             deleted_at: deleted_at.map(str::to_string),
             put_back_under,
+        }
+    }
+
+    /// What following a link does with each answer (docs/LINKS_CONTRACT.md
+    /// "Following a link"): a live node is asked to open with the link's
+    /// anchor; a chain that stopped in another store this app holds is asked
+    /// again there, up to the hop limit; everything else is its sentence.
+    #[test]
+    fn a_resolved_link_opens_asks_again_or_says_why_not() {
+        use pimble_core::{Anchor, LinkResolution, PimbleUrl, MAX_LINK_HOPS};
+        let (store, events, commands) = store_with_events();
+        let held = pimble_core::Store::new_local("Other", "/tmp/other.pimble".into());
+        let held_id = held.id;
+        store.upsert_store(held);
+        let (asked_store, asked_node, moved_to) = (StoreId::new(), NodeId::new(), NodeId::new());
+        let anchor = Anchor::new(None, "the spot");
+        let url = PimbleUrl::deep(asked_store, asked_node, anchor.clone());
+
+        events.send(BackendEvent::LinkResolved { url: url.clone(), hops: 0, resolution: LinkResolution::Live { store_id: held_id, node_id: moved_to } }).unwrap();
+        pump(store);
+        let open = store.link_open.get().expect("a live node is asked to open");
+        assert_eq!((open.store_id, open.node_id, open.anchor), (held_id, moved_to, Some(anchor.clone())));
+        assert_eq!(open.value, format!("node_{held_id}_{moved_to}"));
+        store.link_open.set(None);
+
+        // Stopped in a store this app holds: asked again there, one hop on.
+        events.send(BackendEvent::LinkResolved { url: url.clone(), hops: 2, resolution: LinkResolution::StoreNotHere { store_id: held_id, node_id: moved_to } }).unwrap();
+        pump(store);
+        match commands.try_recv().expect("asked again") {
+            BackendCommand::ResolveLink { url: next, hops } => {
+                assert_eq!((next.store, next.node, next.anchor, hops), (held_id, moved_to, Some(anchor.clone()), 3));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Not held, the store it was asked of, or out of hops: the sentence.
+        for (resolution, hops) in [
+            (LinkResolution::StoreNotHere { store_id: StoreId::new(), node_id: moved_to }, 0),
+            (LinkResolution::StoreNotHere { store_id: asked_store, node_id: asked_node }, 0),
+            (LinkResolution::StoreNotHere { store_id: held_id, node_id: moved_to }, MAX_LINK_HOPS),
+            (LinkResolution::NoAccess, 0),
+            (LinkResolution::Missing, 0),
+            (LinkResolution::Deleted { store_id: asked_store, node_id: asked_node }, 0),
+        ] {
+            let sentence = resolution.sentence().unwrap();
+            events.send(BackendEvent::LinkResolved { url: url.clone(), hops, resolution }).unwrap();
+            pump(store);
+            assert_eq!(store.notice.get(), sentence);
+            assert!(commands.try_recv().is_err(), "nothing asked again for {sentence}");
+            assert_eq!(store.link_open.get(), None);
         }
     }
 

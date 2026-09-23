@@ -80,7 +80,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use pimble_app::protocol::{BackendCommand, BackendEvent};
 use pimble_client::PimbleClient;
 use pimble_core::{
-    custom_keys, node_types, DeletedNode, LeftShare, Node, NodeId, NodeMetadata, RelaySide, Store, StoreAccess, StoreId, StoreKind,
+    custom_keys, node_types, DeletedNode, LeftShare, LinkResolution, Node, NodeId, PimbleUrl, MAX_LINK_HOPS, NodeMetadata, RelaySide, Store, StoreAccess, StoreId, StoreKind,
 };
 use pimble_crdt::{NodeDoc, NodeFields, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_crypto::{blob_aad, dek_aad, unwrap_dek, wrap_dek, Blob, KeyId, SymmetricKey, WrappedDek};
@@ -1258,6 +1258,8 @@ impl VaultClient {
 
             BackendCommand::ListDeleted { store_id } => Some(self.list_deleted(store_id)),
 
+            BackendCommand::ResolveLink { url, hops } => Some(self.resolve_link(url, hops)),
+
             BackendCommand::BroadcastChanges { store_id, node_id, changes } => {
                 match self.broadcast(client, store_id, node_id, &changes).await {
                     Ok(()) => None,
@@ -1495,6 +1497,8 @@ impl VaultClient {
             BackendCommand::RebuildIndex { store_id } => Some(BackendEvent::IndexRebuilt { store_id, indexed: 0 }),
             BackendCommand::ListDeleted { store_id } if held => Some(self.list_deleted(store_id)),
             BackendCommand::ListDeleted { store_id } => Some(BackendEvent::DeletedListed { store_id, nodes: Vec::new() }),
+            // Reading, and answered from what this page holds, owner or not.
+            BackendCommand::ResolveLink { url, hops } => Some(self.resolve_link(url, hops)),
             _ => Some(notice(OWNER_OFFLINE_REFUSAL.to_string())),
         })
     }
@@ -1743,6 +1747,16 @@ impl VaultClient {
     /// What "Recently Deleted..." shows, answered from the tree this page
     /// holds — a scoped member's page holds only its scope's documents to
     /// begin with, so nothing further is judged here.
+    /// `ResolveLink` for an encrypted store (docs/LINKS_CONTRACT.md
+    /// "Following a link"): the server's `resolveLink`, answered from the
+    /// documents this page holds, hop by hop through the tombstones'
+    /// `became`. A hop into a store this page does not hold answers
+    /// `StoreNotHere` there, and the app asks whoever holds that one.
+    fn resolve_link(&self, url: PimbleUrl, hops: usize) -> BackendEvent {
+        let resolution = resolve_in(&self.stores, url.store, url.node);
+        BackendEvent::LinkResolved { url, hops, resolution }
+    }
+
     fn list_deleted(&self, store_id: StoreId) -> BackendEvent {
         let Some(store) = self.stores.get(&store_id) else {
             return BackendEvent::Error { message: "no such encrypted store".into() };
@@ -3511,6 +3525,7 @@ pub fn store_id_of(cmd: &BackendCommand) -> Option<StoreId> {
         | GetStoreSync { store_id }
         | RemoveReplica { store_id, .. } => *store_id,
         MountRemoteStore { target_store_id, .. } => *target_store_id,
+        ResolveLink { url, .. } => url.store,
         _ => return None,
     })
 }
@@ -3557,6 +3572,36 @@ fn offline_root(store_id: StoreId) -> NodeId {
 
 /// An empty folder to be read: what the placeholder root of a store that
 /// cannot be reached answers as.
+/// Where a link to `node_id` in `store_id` leads, among the encrypted
+/// stores this page holds: the same answers, by the same rules, as the
+/// server's `resolveLink` (a document a scoped page does not hold is outside
+/// its shares, so no access rather than missing).
+fn resolve_in(stores: &HashMap<StoreId, VaultStore>, store_id: StoreId, node_id: NodeId) -> LinkResolution {
+    let mut at = (store_id, node_id);
+    let mut seen = HashSet::new();
+    for _ in 0..=MAX_LINK_HOPS {
+        if !seen.insert(at) {
+            break;
+        }
+        let (store_id, node_id) = at;
+        let Some(store) = stores.get(&store_id) else {
+            return LinkResolution::StoreNotHere { store_id, node_id };
+        };
+        let fields = store.tree.doc(node_id).map(|doc| doc.fields());
+        match fields {
+            None if store.scope_roots.is_empty() => return LinkResolution::Missing,
+            None => return LinkResolution::NoAccess,
+            Some(Err(_)) => return LinkResolution::Missing,
+            Some(Ok(fields)) => match (fields.deleted_at, fields.became) {
+                (Some(_), Some(became)) => at = (became.store, became.node),
+                (Some(_), None) => return LinkResolution::Deleted { store_id, node_id },
+                (None, _) => return LinkResolution::Live { store_id, node_id },
+            },
+        }
+    }
+    LinkResolution::Missing
+}
+
 fn empty_folder(node_id: NodeId, title: &str) -> Node {
     let now = chrono::Utc::now();
     Node {
@@ -3766,7 +3811,6 @@ pub fn should_apply(source_client_id: Option<&str>, my_client_id: &str) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pimble_core::PimbleUrl;
     use pimble_crypto::SymmetricKey;
     use std::path::PathBuf;
 
@@ -5574,6 +5618,46 @@ mod tests {
             let outgoing = from_store.prepare(from_store_id, *id, update).unwrap();
             assert!(outgoing.created.is_none(), "the source's documents already existed");
         }
+    }
+
+    /// `resolveLink` answered in the page, by the server's rules: through
+    /// a transplant's `became` into another store this page holds, a plain
+    /// delete, an id nobody holds, a store this page does not hold, and a
+    /// scoped page's document outside its shares.
+    #[test]
+    fn a_link_is_resolved_in_the_page_through_became_by_the_servers_rules() {
+        let (mut peer_from, root_from) = origin();
+        let note = NodeId::new();
+        let gone = NodeId::new();
+        peer_from.add_node(note, Some(root_from), None, "document", "Note", T0).unwrap();
+        peer_from.add_node(gone, Some(root_from), None, "document", "Gone", T0).unwrap();
+        let (peer_to, root_to) = origin();
+        let (from_id, to_id) = (StoreId::new(), StoreId::new());
+        let mut from_store = opened(&peer_from);
+        let mut to_store = opened(&peer_to);
+
+        let cutting = from_store.tree.take_cutting(note).unwrap();
+        let (planted, _) = to_store.tree.plant(cutting, root_to, None, T1, &mut NodeId::new).unwrap();
+        from_store.tree.remove_transplanted(note, to_id, &planted, T1).unwrap();
+        from_store.tree.remove_node(gone, T1).unwrap();
+        let mut stores = HashMap::from([(from_id, from_store), (to_id, to_store)]);
+
+        assert_eq!(resolve_in(&stores, from_id, note), LinkResolution::Live { store_id: to_id, node_id: planted.root });
+        assert_eq!(resolve_in(&stores, from_id, gone), LinkResolution::Deleted { store_id: from_id, node_id: gone });
+        assert_eq!(resolve_in(&stores, from_id, NodeId::new()), LinkResolution::Missing);
+        let (elsewhere, somewhere) = (StoreId::new(), NodeId::new());
+        assert_eq!(resolve_in(&stores, elsewhere, somewhere), LinkResolution::StoreNotHere { store_id: elsewhere, node_id: somewhere });
+
+        // Where the node went is a store this page does not hold: the app
+        // asks whoever does.
+        let to_store = stores.remove(&to_id).unwrap();
+        assert_eq!(resolve_in(&stores, from_id, note), LinkResolution::StoreNotHere { store_id: to_id, node_id: planted.root });
+
+        // A scoped page does not hold what is outside its shares.
+        let mut scoped = to_store;
+        scoped.scope_roots = vec![planted.root];
+        stores.insert(to_id, scoped);
+        assert_eq!(resolve_in(&stores, to_id, NodeId::new()), LinkResolution::NoAccess);
     }
 
     #[test]

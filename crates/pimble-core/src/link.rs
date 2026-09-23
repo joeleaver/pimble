@@ -120,6 +120,20 @@ pub enum LinkResolution {
     StoreNotHere { store_id: StoreId, node_id: NodeId },
 }
 
+impl LinkResolution {
+    /// What the person is told when a followed link leads nowhere they can
+    /// open; `None` for `Live`. One sentence per case, the same in every app.
+    pub fn sentence(&self) -> Option<&'static str> {
+        match self {
+            LinkResolution::Live { .. } => None,
+            LinkResolution::Deleted { .. } => Some("This note was deleted. Recently Deleted can put it back."),
+            LinkResolution::NoAccess => Some("You don't have access to where this link points."),
+            LinkResolution::Missing => Some("This note no longer exists."),
+            LinkResolution::StoreNotHere { .. } => Some("This link is to a store that isn't on this device."),
+        }
+    }
+}
+
 /// How many `became` hops a resolution follows before it calls the link
 /// `Missing`. A node moved out of a share and then between stores is two.
 pub const MAX_LINK_HOPS: usize = 8;

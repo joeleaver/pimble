@@ -69,12 +69,14 @@ pimble:<store uuid>/<node uuid>#<anchor>
 1. **The store.** Open here: go on. Known here but closed (registry, a replica, a mount's
    `source_path`): open it as a mount resolution does. Otherwise: "This link is to a store
    that isn't on this device."
-2. **The node.** `getNode`. If it is tombstoned and records `became`, follow that (one
-   hop at a time, at most 8, a cycle stops). If it is tombstoned with no `became`: open it
-   read-only with the one-line notice "This note was deleted." and "Put Back" where the
-   reader may. Denied (`-32004`), not in a share the reader holds, or unknown: "You don't
-   have access to where this link points." / "This note no longer exists." The last hop
-   decides the sentence: a `became` that the reader cannot reach reads as no access.
+2. **The node.** If it is tombstoned and records `became`, follow that (one hop at a time,
+   at most `MAX_LINK_HOPS`, a cycle stops). A tombstone with no `became`: "This note was
+   deleted. Recently Deleted can put it back." (a tombstone is not opened: its content is
+   not served, and "Put Back" lives in Recently Deleted). No grant, outside every share
+   the reader holds, or under a share that ended: "You don't have access to where this
+   link points." Unknown: "This note no longer exists." The last hop decides the
+   sentence: a `became` the reader cannot reach reads as no access. The sentences are
+   `LinkResolution::sentence`, one set for both apps.
 3. **Open it** through `open_node` (the one way to open a node; it fetches a node the tree
    has not loaded, as a search hit does). With an anchor, once the editor session is up,
    `NodeDoc::resolve_anchor`: the sticky index when the quote still reads there; else
@@ -225,7 +227,11 @@ Opening an external URL is pimble's own business, not rinch's: `open::that` on t
    `StoreNotHere` names where the chain stood, so whoever holds that store (the web vault
    client, for the encrypted ones, answering in the page as it answers every tree
    command) continues from there. A loop or more than `MAX_LINK_HOPS` (8) is `Missing`.
-   Still to build in this wave: the vault client's half.
+   The vault client's half is `resolve_in` (`web/src/vault.rs`), by the same rules; the
+   app's is `BackendCommand::ResolveLink { url, hops }` -> `LinkResolved`, and
+   `follow_resolution` (`events.rs`) opens a live node through `AppStore::link_open`
+   (`open_node`, with the anchor waiting in `pending_anchor`), asks again when the chain
+   stopped in another store the app holds, or shows the sentence. Built 2026-09-23.
 4. The PM's walk-through: both apps, a link across stores, across a mount, into a share a
    second account holds and one it does not, through a transplant, a deep link surviving
    edits by the other window.
