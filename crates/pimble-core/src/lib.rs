@@ -6,12 +6,14 @@
 //! - `Workspace`: User's view into one or more stores
 
 pub mod index_unit;
+pub mod link;
 pub mod node;
 pub mod store;
 pub mod workspace;
 pub mod error;
 
 pub use index_unit::*;
+pub use link::*;
 pub use node::*;
 pub use store::*;
 pub use workspace::*;

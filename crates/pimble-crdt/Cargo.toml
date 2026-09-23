@@ -16,3 +16,6 @@ tracing = { workspace = true }
 yrs = { workspace = true }
 rinch-editor-core = { workspace = true }
 rinch-editor-collab = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }

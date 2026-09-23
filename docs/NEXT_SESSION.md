@@ -1,12 +1,41 @@
 # Next session: start here
 
-Updated 2026-09-23. **Where things stand:** v0.4.0 is released (desktop only; production is
-still jkbase deployment v23, which v0.4.0 did not need). `master` is clean and pushed;
-every rinch dependency is on rinch `main` (4200dda). **Next:** whatever Joe reports. The
-agreed performance follow-ups are rinch work, one at a time (the list at the end of the
-section below); measure before and after with `scripts/perf/` (its README has the method,
-the store copy, and the DOM-write logging patch). Unexplained: the server test-process
-crashes in "A flake to watch".
+Updated 2026-09-23, later. **Where things stand:** Joe moved off performance ("let's move
+on from performance now and go back to core features"): the rinch perf follow-ups are being
+done in rinch by another session (joeleaver/rinch#880, #881), not here. The next roadmap
+item is **links**, contract `docs/LINKS_CONTRACT.md` (approved by Joe the same day). **Wave 1
+is on branch `links`** (below); next is wave 2, the six rinch PRs of the contract's "rinch"
+section, one at a time. v0.4.0 is the released version; `master` is untouched by `links`.
+Unexplained: the test flakes in "A flake to watch" (one more today, in `pimble-cloud`).
+
+## 2026-09-23, later: links, wave 1 (branch `links`, not merged)
+
+Joe's decisions (the contract's first section): `[[` picker, Ctrl+K and "Copy Link" to make
+a link; Ctrl/Cmd+click to follow one; deep links in the same wave; no backlinks view until a
+metadata section is designed; a link follows a transplanted node through its tombstone's
+`became`, and breaks with a sentence for a reader who cannot reach where it went.
+
+- **`pimble_core::PimbleUrl`** (`link.rs`): `pimble:<store>/<node>[#p=<sticky>&q=<quote>]`,
+  the one parser and printer. `Node.links`, `NodeLink`, `LinkTarget` and the
+  `InvalidLinkTarget` error are gone (nothing ever wrote them). `Node.became` is new
+  (skipped when `None`).
+- **`pimble-crdt`** (`links.rs`): `NodeDoc::links()`/`links_of` read the `pimble:` link
+  marks out of the content; `anchor_at(Spot)` and `resolve_anchor` make and find a deep
+  link's spot (a yrs `StickyIndex` into a textblock's text plus a quote). The sticky index
+  wins where the quote still reads, the quote where the words moved (a deleted character
+  resolves to where it was), the sticky index where the words were edited in place.
+- **`became`**: `Tree::plant` answers `Planted { root, ids }`; `Tree::remove_transplanted`
+  tombstones and writes `became` in the same transaction; `transplant`/`move_or_transplant`
+  take the tree's `StoreId`. Callers: `LocalStore` (`remove_transplanted`,
+  `plant_cutting`), `StoreManager::transplant_node`, the web vault client.
+- **The index's links** come from the text (`build_index_node`), same store only.
+- Found for wave 3: `getNode` refuses a tombstone, so following a link needs the
+  `resolveLink` RPC the contract's "Waves" now names.
+- Checked: `pimble-crdt` 131 tests (new: links, anchors, `became` within and between
+  stores), the server's index-links test, the web crate's vault tests (47) and its
+  wasm32 check. Two full release runs (`--workspace --release`): 661 passed, and one flake
+  each, a different test each time, both unrelated and passing on re-runs ("A flake to
+  watch").
 
 ## 2026-09-23: desktop performance, released as v0.4.0 (branch `perf/gpu-and-caret`)
 
@@ -451,6 +480,21 @@ checked: `cargo test --workspace` unifies pimble-app's `onnx-download` onto
 `pimble-server`, so its test binaries link the static ONNX runtime, whose global state is
 known to crash when torn down while its threads still run. To check: `cargo tree -p
 pimble-server -e features` under the workspace, and a core dump from a failing run.
+
+Also on 2026-09-23, on branch `links` (which does not touch `pimble-cloud`), one full
+release run failed `pimble-cloud`'s `a_later_tunnel_replaces_the_earlier_one`: the test
+expected the replaced tunnel's close frame and read a binary frame first ("expected a
+close frame with a code, got Some(Binary([0, 0, 0, 2, 3]))",
+`crates/pimble-cloud/tests/integration.rs:3565`). It passed 3 of 3 on its own. It looks
+like a race in the test: a frame already on its way to the old tunnel arrives before the
+close. The fix would be to skip non-close frames until the close, with a deadline.
+The next full run passed that and failed `pimble-server`'s
+`share::two_members_edit_the_same_folder_with_the_owners_server_stopped` instead ("a move",
+a 10 s wait for Bob to see Carol's move inside the share; the target took 17 s against
+its usual 9.5 s, so the machine was loaded). It passed 5 of 5 alone and the whole `share`
+target 3 of 3. Plain moves are unchanged on `links` (`move_or_transplant` only gained the
+store id a transplant's tombstones name). Load, most likely; the 10 s wait is the
+candidate if it comes back.
 
 ## Process notes that cost time before
 

@@ -276,19 +276,25 @@ pub(crate) fn blocks_of_projection(bytes: &[u8]) -> Result<Vec<Block>> {
 /// `[]` when there is none or it cannot be projected, logged at debug under
 /// `who`. See [`ContentDoc::units`] for the mapping.
 pub(crate) fn units_of_projection(bytes: &[u8], who: &str) -> Vec<IndexUnit> {
+    project(bytes, who).map(|node| project_units(&node)).unwrap_or_default()
+}
+
+/// The editor model of the projection in `bytes`, `None` (logged at debug)
+/// when it cannot be read.
+pub(crate) fn project(bytes: &[u8], who: &str) -> Option<Node> {
     let session = match CollabSession::from_bytes(bytes) {
         Ok(session) => session,
         Err(e) => {
             tracing::debug!("{who}: CollabSession::from_bytes failed: {e}");
-            return Vec::new();
+            return None;
         }
     };
     let schema = Schema::starter_kit();
     match session.projected_doc(&schema) {
-        Ok(node) => project_units(&node),
+        Ok(node) => Some(node),
         Err(e) => {
             tracing::debug!("{who}: projected_doc failed: {e}");
-            Vec::new()
+            None
         }
     }
 }

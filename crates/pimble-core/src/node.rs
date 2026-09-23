@@ -58,7 +58,6 @@ impl fmt::Display for NodeId {
 /// - Metadata (title, timestamps, tags)
 /// - Content stored as CRDT data
 /// - Ordered children
-/// - Links to other nodes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
     /// Unique identifier for this node
@@ -81,8 +80,11 @@ pub struct Node {
     /// Ordered list of child node IDs
     pub children: Vec<NodeId>,
 
-    /// Links from this node to other nodes
-    pub links: Vec<NodeLink>,
+    /// On a tombstone left by a transplant: the node this one became
+    /// (docs/LINKS_CONTRACT.md "`became`"). Following a link to a deleted
+    /// node follows this; a live node's is ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub became: Option<crate::PimbleUrl>,
 
     /// What the device that asked may change of this node, as the server
     /// that answered judges it (docs/NODE_DOCUMENT_CONTRACT.md section 5,
@@ -113,7 +115,7 @@ impl Node {
             },
             content: Vec::new(),
             children: Vec::new(),
-            links: Vec::new(),
+            became: None,
             access: StoreAccess::Full,
         }
     }
@@ -160,12 +162,6 @@ impl Node {
         } else {
             false
         }
-    }
-
-    /// Add a link to another node
-    pub fn add_link(&mut self, link: NodeLink) {
-        self.links.push(link);
-        self.touch();
     }
 
     /// Create a new mount node referencing a subtree in another store, with
@@ -334,89 +330,6 @@ impl NodeMetadata {
             None => {
                 self.custom.remove(custom_keys::COLOR);
             }
-        }
-    }
-}
-
-/// A link from one node to another
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeLink {
-    /// Where the link points to
-    pub target: LinkTarget,
-
-    /// Type of link (e.g., "reference", "embed", "related")
-    pub link_type: String,
-
-    /// Optional anchor within the source node
-    pub source_anchor: Option<String>,
-}
-
-impl NodeLink {
-    /// Create a simple reference link to another node
-    pub fn reference(target_id: NodeId) -> Self {
-        Self {
-            target: LinkTarget::Node(target_id),
-            link_type: "reference".to_string(),
-            source_anchor: None,
-        }
-    }
-
-    /// Create an embed link to another node
-    pub fn embed(target_id: NodeId) -> Self {
-        Self {
-            target: LinkTarget::Node(target_id),
-            link_type: "embed".to_string(),
-            source_anchor: None,
-        }
-    }
-
-    /// Create a deep link to a specific location within a node
-    pub fn deep(target_id: NodeId, anchor: impl Into<String>) -> Self {
-        Self {
-            target: LinkTarget::Deep {
-                node_id: target_id,
-                anchor: anchor.into(),
-            },
-            link_type: "reference".to_string(),
-            source_anchor: None,
-        }
-    }
-
-    /// Create an external link
-    pub fn external(url: Url) -> Self {
-        Self {
-            target: LinkTarget::External(url),
-            link_type: "external".to_string(),
-            source_anchor: None,
-        }
-    }
-}
-
-/// Target of a link
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum LinkTarget {
-    /// Link to another node
-    Node(NodeId),
-
-    /// Deep link to a specific location within a node
-    Deep {
-        node_id: NodeId,
-        /// Anchor identifier (e.g., "paragraph:3", "text:100-150")
-        anchor: String,
-    },
-
-    /// Link to an external URL
-    External(Url),
-}
-
-impl LinkTarget {
-    /// Get the target node ID if this is an internal link
-    pub fn node_id(&self) -> Option<NodeId> {
-        match self {
-            LinkTarget::Node(id) => Some(*id),
-            LinkTarget::Deep { node_id, .. } => Some(*node_id),
-            LinkTarget::External(_) => None,
         }
     }
 }

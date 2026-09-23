@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use pimble_core::{LeftShare, Node, NodeId, NodeMetadata, RemoteEndpoint, StoreAccess, StoreId, StoreManifest};
-use pimble_crdt::{Cutting, NodeDoc, NodeUpdateEffect, StoreDocument, Tree, TreeEdit};
+use pimble_crdt::{Cutting, NodeDoc, Planted, NodeUpdateEffect, StoreDocument, Tree, TreeEdit};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tracing::{debug, info, warn};
@@ -964,12 +964,27 @@ impl LocalStore {
     /// `parent_id` agree (an unrepaired half-move below it stays where its
     /// `parent_id` says, and the next repair places it).
     pub fn delete_node(&mut self, node_id: NodeId) -> Result<(NodeRemoval, TreeEdit)> {
+        self.tombstone(node_id, None)
+    }
+
+    /// The last half of a transplant to another store: [`LocalStore::delete_node`],
+    /// with each original's tombstone naming the node it became in `to_store`
+    /// (`Tree::remove_transplanted`, docs/LINKS_CONTRACT.md "`became`").
+    pub fn remove_transplanted(&mut self, node_id: NodeId, to_store: StoreId, planted: &Planted) -> Result<(NodeRemoval, TreeEdit)> {
+        self.tombstone(node_id, Some((to_store, planted)))
+    }
+
+    fn tombstone(&mut self, node_id: NodeId, became: Option<(StoreId, &Planted)>) -> Result<(NodeRemoval, TreeEdit)> {
         let info = self.tree.get_node_info(node_id).map_err(|_| StoreError::NodeNotFound(node_id))?;
         let parent_id = info
             .parent_id
             .ok_or_else(|| StoreError::InvalidOperation("Cannot delete the root node".into()))?;
         let removed = self.tree.subtree_ids(node_id).map_err(StoreError::from)?;
-        let edit = self.tree.remove_node(node_id, &now()).map_err(StoreError::from)?;
+        let edit = match became {
+            Some((to_store, planted)) => self.tree.remove_transplanted(node_id, to_store, planted, &now()),
+            None => self.tree.remove_node(node_id, &now()),
+        }
+        .map_err(StoreError::from)?;
         self.mark_edit_dirty(&edit);
 
         debug!("Deleted node {} ({} document(s) tombstoned) from store {}", node_id, removed.len(), self.id);
@@ -1023,7 +1038,7 @@ impl LocalStore {
         let left_shares = self.left_shares(node_id, new_parent_id);
         let (new_id, edit) = self
             .tree
-            .move_or_transplant(node_id, new_parent_id, position, &now(), &mut NodeId::new)
+            .move_or_transplant(self.id, node_id, new_parent_id, position, &now(), &mut NodeId::new)
             .map_err(StoreError::from)?;
         self.mark_edit_dirty(&edit);
         Ok((new_id, left_shares, edit))
@@ -1065,7 +1080,7 @@ impl LocalStore {
     /// The first half of a transplant to another store
     /// (docs/MOVE_CONTRACT.md "Between stores"): `node_id`'s live subtree
     /// read out as data, ready to [`LocalStore::plant_cutting`] elsewhere
-    /// and then be removed here with [`LocalStore::delete_node`]. See
+    /// and then be removed here with [`LocalStore::remove_transplanted`]. See
     /// `Tree::take_cutting`.
     pub fn take_cutting(&self, node_id: NodeId) -> Result<Cutting> {
         self.tree.take_cutting(node_id).map_err(StoreError::from)
@@ -1073,7 +1088,7 @@ impl LocalStore {
 
     /// The second half: plant `cutting` under `new_parent_id` here, at
     /// `position`, with a fresh id per node. See `Tree::plant`.
-    pub fn plant_cutting(&mut self, cutting: Cutting, new_parent_id: NodeId, position: Option<usize>) -> Result<(NodeId, TreeEdit)> {
+    pub fn plant_cutting(&mut self, cutting: Cutting, new_parent_id: NodeId, position: Option<usize>) -> Result<(Planted, TreeEdit)> {
         if !self.tree.has_node(new_parent_id) {
             return Err(StoreError::NodeNotFound(new_parent_id));
         }

@@ -458,7 +458,7 @@ impl StoreIndexer {
                 Err(_) => return Ok(()),
             }
         };
-        let index_node = build_index_node(&node, &self.plugin_host);
+        let index_node = build_index_node(self.store_id, &node, &self.plugin_host);
         self.index.upsert(&index_node)
     }
 }
@@ -516,8 +516,10 @@ fn index_title(node: &Node, content_text: &str) -> String {
 /// type's plugin (`NodeDoc::units()` for `document` nodes, via
 /// `DocumentPlugin`; `node.content` is the node document's bytes, title and
 /// text alike). A node type with no registered plugin (e.g. `mount`) indexes
-/// with no units/text.
-fn build_index_node(node: &Node, plugin_host: &PluginHost) -> IndexNode {
+/// with no units/text. Its links are the `pimble:` link marks in its content,
+/// whatever its type (docs/LINKS_CONTRACT.md "Where a link lives"): only those
+/// into `store_id`, since the index is per store.
+fn build_index_node(store_id: StoreId, node: &Node, plugin_host: &PluginHost) -> IndexNode {
     let units = plugin_host
         .get(&node.node_type)
         .and_then(|plugin| plugin.index_units(&node.content).ok())
@@ -528,11 +530,13 @@ fn build_index_node(node: &Node, plugin_host: &PluginHost) -> IndexNode {
         .collect::<Vec<_>>()
         .join("\n");
     let title = index_title(node, &text);
-    let links = node
-        .links
-        .iter()
-        .filter_map(|link| link.target.node_id())
+    let mut links: Vec<NodeId> = NodeDoc::links_of(&node.content)
+        .into_iter()
+        .filter(|link| link.target.store == store_id && link.target.node != node.id)
+        .map(|link| link.target.node)
         .collect();
+    links.sort_by_key(|id| id.0);
+    links.dedup();
 
     IndexNode {
         node_id: node.id,
@@ -2374,7 +2378,7 @@ impl RpcHandler {
         let mut count = 0usize;
         while let Some(node_id) = stack.pop() {
             let node = manager.get_node(store_id, node_id)?;
-            let index_node = build_index_node(&node, &self.plugin_host);
+            let index_node = build_index_node(store_id, &node, &self.plugin_host);
             index.upsert(&index_node)?;
             count += 1;
             if !node.is_mount() {
@@ -4719,6 +4723,42 @@ mod tests {
     /// create, then its tags and a custom key) is broadcast as one update
     /// per document, and a peer merging the merged update ends up exactly
     /// where it would applying each transaction in turn.
+    /// A node's index entry links to what the `pimble:` link marks in its
+    /// text name in the same store, whatever else they name
+    /// (docs/LINKS_CONTRACT.md "Where a link lives").
+    #[test]
+    fn a_nodes_index_links_are_the_links_in_its_text_into_its_own_store() {
+        use pimble_core::PimbleUrl;
+        use pimble_crdt::{Block, Mark, Run};
+
+        let (here, elsewhere) = (StoreId::new(), StoreId::new());
+        let (me, a, b, far) = (NodeId::new(), NodeId::new(), NodeId::new(), NodeId::new());
+        let link = |text: &str, store: StoreId, node: NodeId| {
+            Run::marked(text, vec![Mark::Link { href: PimbleUrl::node(store, node).to_string() }])
+        };
+        let content = NodeDoc::from_blocks(&[
+            Block::paragraph(vec![link("b", here, b), Run::plain(" and "), link("a", here, a)]),
+            Block::paragraph(vec![
+                link("a again", here, a),
+                link("far away", elsewhere, far),
+                link("myself", here, me),
+                Run::marked("web", vec![Mark::Link { href: "https://example.com".into() }]),
+            ]),
+        ])
+        .unwrap();
+        let mut node = Node::document("Linker");
+        node.id = me;
+        node.content = content.save();
+
+        let mut plugins = PluginHost::new();
+        plugins.register(pimble_plugins::DocumentPlugin);
+        let indexed = build_index_node(here, &node, &plugins);
+        let mut want = vec![a, b];
+        want.sort_by_key(|id| id.0);
+        assert_eq!(indexed.links, want, "same store only, once each, never itself");
+        assert!(indexed.text.contains("far away"), "the words are indexed as ever");
+    }
+
     #[test]
     fn coalesce_edit_merges_a_documents_transactions_into_one_update() {
         let root = NodeId::new();

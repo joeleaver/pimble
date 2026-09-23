@@ -1688,7 +1688,7 @@ impl VaultClient {
             // nothing about the shares it used to be in.
             let left_shares = as_left_shares(&store.tree, store.tree.shares_left(node_id, new_parent_id));
             let mut edit = store.seed_root(&now);
-            let (new_node_id, more) = match store.tree.move_or_transplant(node_id, new_parent_id, position, &now, &mut NodeId::new) {
+            let (new_node_id, more) = match store.tree.move_or_transplant(store_id, node_id, new_parent_id, position, &now, &mut NodeId::new) {
                 Ok(v) => v,
                 Err(e) => return BackendEvent::Error { message: e.to_string() },
             };
@@ -1799,15 +1799,15 @@ impl VaultClient {
             (old_parent_id, info.title, left_shares, cutting)
         };
 
-        let (new_node_id, edit_to) = {
+        let (planted, edit_to) = {
             let Some(to_store) = self.stores.get_mut(&to_store_id) else {
                 return BackendEvent::Error { message: "no such encrypted store".into() };
             };
             let mut edit = to_store.seed_root(&now);
             match to_store.tree.plant(cutting, new_parent_id, position, &now, &mut NodeId::new) {
-                Ok((new_root, more)) => {
+                Ok((planted, more)) => {
                     edit.touched.extend(more.touched);
-                    (new_root, edit)
+                    (planted, edit)
                 }
                 Err(e) => return BackendEvent::Error { message: e.to_string() },
             }
@@ -1824,7 +1824,7 @@ impl VaultClient {
             let Some(from_store) = self.stores.get_mut(&from_store_id) else {
                 return BackendEvent::Error { message: "no such encrypted store".into() };
             };
-            match from_store.tree.remove_node(node_id, &now) {
+            match from_store.tree.remove_transplanted(node_id, to_store_id, &planted, &now) {
                 Ok(edit) => edit,
                 Err(e) => return BackendEvent::Error { message: e.to_string() },
             }
@@ -1842,7 +1842,7 @@ impl VaultClient {
             old_node_id: node_id,
             old_parent_id,
             to_store_id,
-            node_id: new_node_id,
+            node_id: planted.root,
             new_parent_id,
             title,
             left_shares,
@@ -2751,7 +2751,7 @@ impl VaultStore {
                 },
                 content: Vec::new(),
                 children: Vec::new(),
-                links: Vec::new(),
+                became: None,
                 access: StoreAccess::Full,
             });
         }
@@ -3566,7 +3566,7 @@ fn empty_folder(node_id: NodeId, title: &str) -> Node {
         metadata: NodeMetadata { title: title.to_string(), created_at: now, modified_at: now, tags: Vec::new(), custom: HashMap::new() },
         content: Vec::new(),
         children: Vec::new(),
-        links: Vec::new(),
+        became: None,
         access: StoreAccess::Read,
     }
 }
@@ -3766,6 +3766,7 @@ pub fn should_apply(source_client_id: Option<&str>, my_client_id: &str) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pimble_core::PimbleUrl;
     use pimble_crypto::SymmetricKey;
     use std::path::PathBuf;
 
@@ -5510,7 +5511,7 @@ mod tests {
         assert_eq!(left_shares[0].root, share_a);
         assert_eq!(left_shares[0].name, "Alpha", "the first share it leaves, named from its marker");
 
-        let (new_id, edit) = store.tree.move_or_transplant(note, share_b, None, T1, &mut NodeId::new).unwrap();
+        let (new_id, edit) = store.tree.move_or_transplant(store_id, note, share_b, None, T1, &mut NodeId::new).unwrap();
         assert_ne!(new_id, note, "moving into a different share is a transplant, not a move");
         assert!(store.tree.doc(note).unwrap().fields().unwrap().deleted_at.is_some(), "the original is tombstoned");
 
@@ -5549,7 +5550,8 @@ mod tests {
         // target with a fresh id, and appended there — as
         // `VaultClient::transplant_node` does, minus the network.
         let cutting = from_store.tree.take_cutting(note).unwrap();
-        let (new_id, edit_to) = to_store.tree.plant(cutting, root_to, None, T1, &mut NodeId::new).unwrap();
+        let (planted, edit_to) = to_store.tree.plant(cutting, root_to, None, T1, &mut NodeId::new).unwrap();
+        let new_id = planted.root;
         assert_ne!(new_id, note);
         assert_eq!(to_store.tree.doc(new_id).unwrap().text(), "Hello, world", "the text survives a transplant");
         assert_eq!(to_store.tree.get_node_info(new_id).unwrap().title, "Note");
@@ -5564,8 +5566,10 @@ mod tests {
         }
 
         // Deleted second, only once the new home would be on the server.
-        let tombstone_edit = from_store.tree.remove_node(note, T1).unwrap();
-        assert!(from_store.tree.doc(note).unwrap().fields().unwrap().deleted_at.is_some());
+        let tombstone_edit = from_store.tree.remove_transplanted(note, to_store_id, &planted, T1).unwrap();
+        let tombstone = from_store.tree.doc(note).unwrap().fields().unwrap();
+        assert!(tombstone.deleted_at.is_some());
+        assert_eq!(tombstone.became, Some(PimbleUrl::node(to_store_id, new_id)), "a link to the original follows it");
         for (id, update) in &tombstone_edit.touched {
             let outgoing = from_store.prepare(from_store_id, *id, update).unwrap();
             assert!(outgoing.created.is_none(), "the source's documents already existed");

@@ -547,9 +547,9 @@ impl StoreManager {
 
         let left_shares = self.local(from_store_id)?.shares_of(node_id);
         let cutting = self.local(from_store_id)?.take_cutting(node_id)?;
-        let (new_node_id, target_edit) = self.local_mut(to_store_id)?.plant_cutting(cutting, new_parent_id, position)?;
-        let (source_removal, source_edit) = self.local_mut(from_store_id)?.delete_node(node_id)?;
-        Ok(TransplantOutcome { new_node_id, left_shares, source_removal, source_edit, target_edit })
+        let (planted, target_edit) = self.local_mut(to_store_id)?.plant_cutting(cutting, new_parent_id, position)?;
+        let (source_removal, source_edit) = self.local_mut(from_store_id)?.remove_transplanted(node_id, to_store_id, &planted)?;
+        Ok(TransplantOutcome { new_node_id: planted.root, left_shares, source_removal, source_edit, target_edit })
     }
 
     /// Delete a node and its subtree from a store: every member becomes a

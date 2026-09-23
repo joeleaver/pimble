@@ -16,6 +16,7 @@
 //!                    parent_id: String | absent (the store's root),
 //!                    created_at: String (rfc3339), modified_at: String (rfc3339),
 //!                    deleted_at: String (rfc3339) | absent (the tombstone),
+//!                    became: String (a pimble: link) | absent,
 //!                    tags: Array<String>, custom: Map<String, String (json)> }
 //! root array "children": [String (node id), ...]
 //! root map "data": arbitrary JSON as nested Maps, Arrays and Texts
@@ -30,7 +31,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use pimble_core::{IndexUnit, Node, NodeId, NodeMetadata, StoreAccess};
+use pimble_core::{Anchor, IndexUnit, Node, NodeId, NodeMetadata, PimbleUrl, StoreAccess};
 use yrs::updates::encoder::Encode;
 use yrs::{
     Any, Array, ArrayPrelim, ArrayRef, BranchID, Doc, GetString, In, Map, MapPrelim, MapRef, Out,
@@ -40,8 +41,9 @@ use yrs::{
 use crate::blocks::{blocks_from_plain_text, Block};
 use crate::content_doc::{
     blocks_of_projection, decode_update, diff_since, fresh_snapshot, join_units, replacement_delta,
-    snapshot_from_blocks, transaction_changed, units_of_projection,
+    project, snapshot_from_blocks, transaction_changed, units_of_projection,
 };
+use crate::links::{self, links_of_model, LinkRef, Resolved, Spot};
 use crate::error::{CrdtError, Result};
 
 /// The root map holding a node's structure and metadata.
@@ -72,6 +74,10 @@ const PLACED_UNDER: &str = "placed_under";
 const CREATED_AT: &str = "created_at";
 const MODIFIED_AT: &str = "modified_at";
 const DELETED_AT: &str = "deleted_at";
+/// On a transplanted original's tombstone: the `pimble:` link of the node it
+/// became (docs/LINKS_CONTRACT.md "`became`"). Never cleared: a live node's
+/// is not followed.
+const BECAME: &str = "became";
 const TAGS: &str = "tags";
 const CUSTOM: &str = "custom";
 
@@ -91,13 +97,15 @@ pub struct NodeFields {
     /// A tombstone (docs/NODE_DOCUMENT_CONTRACT.md section 2): set when the
     /// node was deleted, cleared by an undelete. The document stays.
     pub deleted_at: Option<String>,
+    /// On a transplanted original: the node it became (see `BECAME`).
+    pub became: Option<PimbleUrl>,
     pub tags: Vec<String>,
     pub custom: HashMap<String, serde_json::Value>,
 }
 
 impl NodeFields {
-    /// The node these fields describe and nothing more: content, children
-    /// and links empty, `access` `Full` (a judgement the server that answers
+    /// The node these fields describe and nothing more: content and
+    /// children empty, `access` `Full` (a judgement the server that answers
     /// makes per caller, never a property of the stored node). The one place
     /// a document's stored timestamps become a `NodeMetadata`'s, so every
     /// reader of a document, on every side, reads them the same way
@@ -117,7 +125,7 @@ impl NodeFields {
             },
             content: Vec::new(),
             children: Vec::new(),
-            links: Vec::new(),
+            became: self.became,
             access: StoreAccess::Full,
         }
     }
@@ -151,6 +159,7 @@ pub struct NodeDoc {
     children: ArrayRef,
     data: MapRef,
     meta: MapRef,
+    content: ArrayRef,
 }
 
 #[cfg(test)]
@@ -191,8 +200,8 @@ impl NodeDoc {
         let children = doc.get_or_insert_array(ROOT_CHILDREN);
         let data = doc.get_or_insert_map(ROOT_DATA);
         let meta = doc.get_or_insert_map(ROOT_META);
-        let _content = doc.get_or_insert_array(ROOT_CONTENT);
-        Self { doc, node, children, data, meta }
+        let content = doc.get_or_insert_array(ROOT_CONTENT);
+        Self { doc, node, children, data, meta, content }
     }
 
     /// Load from `bytes`, a yrs v1 update (a full snapshot or any update).
@@ -313,6 +322,39 @@ impl NodeDoc {
     /// [`NodeDoc::units`] of a serialized document.
     pub fn units_of(bytes: &[u8]) -> Vec<IndexUnit> {
         Self::load(bytes).map(|doc| doc.units()).unwrap_or_default()
+    }
+
+    /// Every `pimble:` link in the content, in document order
+    /// (docs/LINKS_CONTRACT.md "Where a link lives"). `[]` when there is no
+    /// projection yet.
+    pub fn links(&self) -> Vec<LinkRef> {
+        if !self.has_projection() {
+            return Vec::new();
+        }
+        project(&self.save(), "NodeDoc::links").map(|model| links_of_model(&model)).unwrap_or_default()
+    }
+
+    /// [`NodeDoc::links`] of a serialized document.
+    pub fn links_of(bytes: &[u8]) -> Vec<LinkRef> {
+        Self::load(bytes).map(|doc| doc.links()).unwrap_or_default()
+    }
+
+    /// A deep-link anchor at `spot` (docs/LINKS_CONTRACT.md "The URL"):
+    /// `None` when the content has no such textblock.
+    pub fn anchor_at(&self, spot: Spot) -> Option<Anchor> {
+        links::anchor_at(&self.doc, &self.content(), spot)
+    }
+
+    /// Where `anchor` is in the content now: by its sticky index, else by its
+    /// quote, else `None` (docs/LINKS_CONTRACT.md "Following a link").
+    pub fn resolve_anchor(&self, anchor: &Anchor) -> Option<Resolved> {
+        links::resolve_anchor(&self.doc, &self.content(), anchor)
+    }
+
+    /// The `content` root (resolved when the document was built, so this
+    /// opens no transaction of its own that could meet a caller's).
+    fn content(&self) -> ArrayRef {
+        self.content.clone()
     }
 
     /// The content as [`Block`]s, the reverse of [`NodeDoc::from_blocks`]: `[]`
@@ -714,6 +756,10 @@ impl NodeDoc {
         }
     }
 
+    pub(crate) fn write_became(&self, txn: &mut TransactionMut, url: &PimbleUrl) {
+        self.node.insert(txn, BECAME, url.to_string());
+    }
+
     /// The `custom` map, made if a peer's `node` root somehow lacks one.
     fn custom_map(&self, txn: &mut TransactionMut) -> MapRef {
         match self.custom_map_if_present(txn) {
@@ -754,6 +800,7 @@ impl NodeDoc {
             created_at: get(CREATED_AT).unwrap_or_default(),
             modified_at: get(MODIFIED_AT).unwrap_or_default(),
             deleted_at: get(DELETED_AT),
+            became: get(BECAME).and_then(|s| PimbleUrl::parse(&s)),
             tags,
             custom,
         })
@@ -926,6 +973,7 @@ mod tests {
             created_at: "2020-01-01T00:00:00Z".into(),
             modified_at: "2020-01-02T00:00:00Z".into(),
             deleted_at: Some(T2.into()),
+            became: None,
             tags: vec!["a".into(), "b".into()],
             custom: HashMap::from([
                 ("icon".to_string(), json!("star")),

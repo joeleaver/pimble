@@ -15,9 +15,6 @@ pub enum CoreError {
     #[error("Invalid node type: {0}")]
     InvalidNodeType(String),
 
-    #[error("Invalid link target: {0}")]
-    InvalidLinkTarget(String),
-
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
