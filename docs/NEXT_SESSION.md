@@ -59,10 +59,15 @@ Later the same day, on the same branch:
 - **Not checked by hand**: a real Ctrl+click (the debug port cannot hold a modifier on a
   click) and a real paste (a window driven over the debug port reads nothing from the
   Wayland clipboard). Joe's own try in the app is the check.
-- **The picker is built and checked in the app** (`[[` and Ctrl+L, Remove Link);
-  `pimble/links` carries #916 (merge 30c9d7f).
-- **Next**: PR 5 (programmatic focus and scroll-into-view) and scrolling to a deep link's
-  spot, then the walk-through (wave 4). The hover underline does not show on the desktop
+- **The picker is built and checked in the app** (`[[` and Ctrl+L, Remove Link).
+- **rinch now**: #892 and #900 are merged upstream. Pimble points at **`pimble/links-2`**
+  (5cc77d8): main a53bec0 + #901, #915, #916, #922 (focus and scroll, stacked on #916) and
+  #921 (debug `click`/`mouse_down`/`mouse_up` take `"modifiers": ["ctrl"]`). The old
+  `pimble/links` is superseded. A real Ctrl+click on a Pimble link and on a deep link was
+  checked in the app (the deep link scrolls to its words and selects them).
+- **Next**: the walk-through (wave 4). Open questions for Joe: should the tree reveal and
+  select a followed node it has not expanded (a link to a nested folder shows nothing);
+  should a deep link's words land mid-view rather than at the edge. The hover underline does not show on the desktop
   (not yet filed).
 - **Driving the app over the debug port**: `key_press` needs `"shift"` and `"ctrl"` in its
   JSON (`{"key":"ArrowDown","shift":false,"ctrl":false}`); without them the command is

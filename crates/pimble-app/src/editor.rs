@@ -69,6 +69,9 @@ pub(crate) fn start_editing(
     handle.set_dark_mode(untracked(|| store.dark_mode.get()));
     handle.stop_collaboration(); // end any prior node's session
     crate::links::set_app_store(store);
+    // An unmounted or switched editor says nothing more about its hovered
+    // link (rinch #892): the tooltip goes with the note it was over.
+    crate::links::hover_link(store, None);
     // Links (docs/LINKS_CONTRACT.md): Ctrl/Cmd+click follows one, a plain
     // click places the caret as ever; resting on one shows where it leads.
     handle.on_link_click(move |click| {
@@ -197,6 +200,8 @@ pub(crate) fn stop_editing(store: AppStore) {
         }
     }
     handle.stop_collaboration();
+    crate::links::hover_link(store, None);
+    crate::link_picker::close(store);
     store.active_edit.set(None);
     cancel_pending_label_refresh();
     crate::toolbar::bump_toolbar();

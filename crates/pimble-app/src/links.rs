@@ -187,7 +187,8 @@ pub fn pos_of_spot(doc: &rinch_editor_core::Node, spot: pimble_crdt::Spot) -> Op
 }
 
 /// Put the caret at a followed deep link's spot in the note just opened,
-/// with the quoted words selected so the eye finds it
+/// with the quoted words selected so the eye finds it, scrolled into view and
+/// the editor focused
 /// (docs/LINKS_CONTRACT.md "Following a link"). The spot is found the way
 /// `NodeDoc::resolve_anchor` finds it, in the session's own content; the top
 /// of the note when it is found nowhere.
@@ -207,6 +208,10 @@ pub fn place_anchor(handle: &crate::rinch_editor::EditorHandle, anchor: &pimble_
         rinch_editor_core::selection::Selection::cursor(from)
     };
     handle.set_selection(selection);
+    // A range never scrolls by itself, and nothing was clicked to focus the
+    // editor: bring the words on screen and give it the keyboard (rinch #922).
+    handle.scroll_into_view(from, to);
+    handle.focus();
 }
 
 /// Follow a clicked link's `href` (docs/LINKS_CONTRACT.md "One experience

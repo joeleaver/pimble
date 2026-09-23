@@ -83,9 +83,13 @@ pimble:<store uuid>/<node uuid>#<anchor>
    the first place the quote reads (the anchored characters were deleted and the words
    written elsewhere: a paragraph cut and pasted, or rewritten wholesale, and yrs
    resolves a deleted character to where it was); else the sticky index (the words were
-   edited in place); else the top. The quoted words are selected, which is the highlight
-   (`links::place_anchor`, built 2026-09-23, when the note's session starts); scrolling
-   them into view waits for rinch PR 5.
+   edited in place); else the top. The quoted words are selected, which is the highlight,
+   scrolled into view and the editor focused (`links::place_anchor` on rinch #922's
+   `scroll_into_view` and `focus`). Checked in the app on 2026-09-23 with a real Ctrl+click
+   (rinch #921 lets the debug port hold a modifier): a deep link into "Open SRS" opened it
+   halfway down with "Order ID 4465511" selected; a link to a folder selected the folder.
+   The words land at the edge of the view (the scroll brings them just inside it); the
+   tree does not yet reveal a followed node it has not expanded.
 
 Following never writes to the target: a reader can deep-link into a node they may only
 read.
