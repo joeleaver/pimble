@@ -7,9 +7,9 @@ comes from a survey of rinch `main` (7bdc352) and lists the six upstream PRs thi
 ## The decisions (Joe, 2026-09-23)
 
 1. **Making a link:** typing `[[` opens a search-as-you-type picker that inserts a link
-   titled with the target's name; Ctrl+K (Cmd+K) links the selected text through the same
-   picker; a tree row's menu has "Copy Link", and pasting a Pimble link over selected text
-   links it.
+   titled with the target's name; Ctrl+L (Cmd+L) links the selected text through the same
+   picker (Ctrl+K stays the search box's: Joe, 2026-09-23); a tree row's menu has
+   "Copy Link", and pasting a Pimble link over selected text links it.
 2. **Following a link:** Ctrl+click (Cmd+click) opens the target. Hovering a link shows the
    target's title and the modifier hint. A plain click places the caret, as today.
 3. **Deep links** (to a spot inside a document) are built in the same wave as node links.
@@ -104,11 +104,11 @@ vault client transplants through the same `Tree` code, so it writes the same fie
   text as typed. Picking replaces `[[query` with the target's title linked to it, in one
   editor transaction (one undo step). Holding Alt (Option) while picking inserts only the
   link over the query text as typed.
-- **Ctrl+K** with a selection opens the same picker (query empty) and links the selection;
+- **Ctrl+L** with a selection opens the same picker (query empty) and links the selection;
   with the caret inside a link it offers "Remove Link" and "Edit Link" (the picker again).
   With nothing selected and not in a link it does nothing.
 - **Copy Link** on a tree row puts `pimble:<store>/<node>` on the system clipboard.
-  **Copy Link to Here** (editor context menu and Ctrl+Shift+K) copies a deep link to the
+  **Copy Link to Here** (editor context menu and Ctrl+Shift+L) copies a deep link to the
   caret.
 - **Paste**: plain text that parses as a Pimble URL, pasted over a selection, links the
   selection (like any URL over a selection); pasted with no selection it inserts the
@@ -129,8 +129,9 @@ target); the tooltip says so.
 Surveyed on rinch `main` (7bdc352), 2026-09-23. **What is there already:**
 - The `link` mark renders as `<a data-pm-mark="link" href=…>`, and `is_safe_url` keeps a
   `pimble:` href through HTML, markdown and collaboration.
-- Ctrl+K needs nothing new: a pimble editor plugin's `keymap()` binds `Mod-k`, which is
-  unbound today.
+- Ctrl+L needs nothing new: a pimble editor plugin's `keymap()` binds `Mod-l`, which is
+  unbound today. In the browser Ctrl+L is the address bar's, so the web editor must
+  `preventDefault` a key its keymap handled; wave 3 checks that it does.
 - Replacing `[[query` with linked text is one `handle.update` transaction (`replace_with`
   plus `set_stored_marks(Some(vec![]))`, so the next typed character is not linked).
 - The `[[` trigger is an `InputRule` on `\[\[$`.
@@ -188,7 +189,7 @@ Opening an external URL is pimble's own business, not rinch's: `open::that` on t
    transplant.
 2. The six rinch PRs of the section above, one at a time, in the order listed. Wave 1
    needs none of them: it resolves anchors with yrs directly.
-3. The app, desktop and web: picker, Ctrl+K, Copy Link, Copy Link to Here, paste, hover,
+3. The app, desktop and web: picker, Ctrl+L, Copy Link, Copy Link to Here, paste, hover,
    Ctrl+click, `follow_link`. Steps 1 and 2 of "Following" are one RPC, `resolveLink {
    url } -> Live { store, node } | Deleted { store, node } | NoAccess | Missing |
    StoreNotHere`: `getNode` refuses a tombstone, and only the server can judge access at
