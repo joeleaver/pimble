@@ -137,15 +137,20 @@ ever leaves the app without the modifier.
   selection, links the selection. With no selection, a Pimble URL inserts the target's
   title (or the quote, for a deep link) linked to it, and a web URL inserts itself,
   linked.
-- **Typing a web URL** followed by a space or Enter links it (an input rule on the text
-  before the caret); Ctrl+Z right after takes the link back and keeps the text.
+- **Typing a web URL** followed by a space links it (`LinksPlugin`'s input rule in
+  `crates/pimble-app/src/links.rs`, built 2026-09-23): an `http(s)` URL only, sentence
+  punctuation after it left out, the words after it not linked. Ctrl+Z right after takes
+  back the link and the space. Enter does not link (input rules run on typed text; Enter
+  is a command).
 - Linking needs write access to the node being edited, as any edit does. It needs nothing
   of the target.
 
 ## What a link looks like
 
-The link colour (`--rinch-primary-color-4`), no underline until hover; a web link also
-carries a small arrow after its words (CSS on `a[href^="http"]`, not text). Hover after
+The link colour (`--rinch-primary-color-4` dark, `-6` light), no underline until hover
+(built 2026-09-23, `styles.rs`). A web link is to carry a small arrow after its words (CSS
+on `a[href^="http"]`, not text), which waits for joeleaver/rinch#891: generated content
+inside the editor puts the caret beside the wrong character. Hover after
 400 ms: a tooltip with the target's title and store name (or the sentence from "Following"
 when it cannot be reached), or a web link's URL, and "Ctrl+click to open". A link whose target is known to be missing or
 unreachable is not restyled in the text (that would be a second source of truth about the

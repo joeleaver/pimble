@@ -41,6 +41,8 @@ pub(crate) fn editor() -> EditorHandle {
         e.borrow_mut()
             .get_or_insert_with(|| {
                 let handle = create_editor();
+                // Before any content: adding a plugin resets history.
+                handle.add_plugin(std::rc::Rc::new(crate::links::LinksPlugin));
                 // Typing, commands and remote deltas all land here; the
                 // toolbar's active states follow immediately (cursor-only
                 // moves are covered by the toolbar's own watcher).

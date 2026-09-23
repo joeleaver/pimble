@@ -559,8 +559,19 @@ pub(crate) const EDITOR_CSS: &str = "
     color: var(--rinch-color-dimmed);
 }
 
+/* Links, Pimble and web alike (docs/LINKS_CONTRACT.md \"What a link looks like\"):
+   the link colour, underlined only under the pointer. The contract's arrow after a
+   web link waits for rinch: generated content (`::after`) inside the editor puts the
+   caret beside the wrong character (joeleaver/rinch#891). */
+.pimble-editor__content-wrap > [data-pm-editor] a {
+    color: var(--rinch-primary-color-6);
+    text-decoration: none;
+}
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] a {
     color: var(--rinch-primary-color-4);
+}
+.pimble-editor__content-wrap > [data-pm-editor] a:hover {
+    text-decoration: underline;
 }
 
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] code {
