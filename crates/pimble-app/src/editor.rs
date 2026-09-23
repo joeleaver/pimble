@@ -68,6 +68,16 @@ pub(crate) fn start_editing(
     // mounts, so apply the app's scheme here, once a document is opened.
     handle.set_dark_mode(untracked(|| store.dark_mode.get()));
     handle.stop_collaboration(); // end any prior node's session
+    // Links (docs/LINKS_CONTRACT.md): Ctrl/Cmd+click follows one, a plain
+    // click places the caret as ever; resting on one shows where it leads.
+    handle.on_link_click(move |click| {
+        if !click.primary {
+            return false;
+        }
+        crate::links::follow_href(store, &click.link.href);
+        true
+    });
+    handle.on_link_hover(move |hover| crate::links::hover_link(store, hover));
     cancel_pending_label_refresh();
 
     // Every local edit's delta is base64-broadcast to the server, which persists it

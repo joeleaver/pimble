@@ -51,6 +51,61 @@ pub enum Followed {
     Ignored,
 }
 
+/// The modifier a link opens with, as the tooltip names it.
+pub const OPEN_HINT: &str = if cfg!(target_os = "macos") { "Cmd+click to open" } else { "Ctrl+click to open" };
+
+/// How long the pointer rests on a link before its tooltip shows.
+const HOVER_DELAY_MS: u32 = 400;
+
+thread_local! {
+    /// The pending tooltip, until the pointer has rested long enough.
+    static HOVER_TIMER: std::cell::RefCell<Option<rinch::prelude::TimeoutHandle>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The editor's hover callback: the link under the pointer changed
+/// (`None`: it left every link). The tooltip shows after the pointer has
+/// rested for [`HOVER_DELAY_MS`] and goes at once when it leaves.
+pub fn hover_link(store: crate::state::AppStore, hover: Option<&crate::rinch_editor::LinkHover>) {
+    use rinch::prelude::{clear_timeout, set_timeout};
+    if let Some(pending) = HOVER_TIMER.with(|t| t.borrow_mut().take()) {
+        clear_timeout(pending);
+    }
+    let Some(hover) = hover else {
+        store.link_hover.set(None);
+        return;
+    };
+    let tooltip = crate::state::LinkTooltip {
+        target: tooltip_target(store, &hover.link.href),
+        x: hover.rect.x,
+        y: hover.rect.y + hover.rect.height + 4.0,
+    };
+    store.link_hover.set(None);
+    let handle = set_timeout(HOVER_DELAY_MS, move || {
+        HOVER_TIMER.with(|t| t.borrow_mut().take());
+        store.link_hover.set(Some(tooltip));
+    });
+    HOVER_TIMER.with(|t| *t.borrow_mut() = Some(handle));
+}
+
+/// What the tooltip says a link points at: a Pimble link's note title and
+/// store as this app knows them (no request is made: hovering must stay
+/// free), or a web link's URL.
+pub fn tooltip_target(store: crate::state::AppStore, href: &str) -> String {
+    let Some(url) = pimble_core::PimbleUrl::parse(href) else {
+        return href.to_string();
+    };
+    let store_name = store
+        .get_store_signal(url.store)
+        .map(|sig| rinch::prelude::untracked(|| sig.with(|s| s.name.clone())));
+    let known = rinch::prelude::untracked(|| store.node_data.with(|map| map.contains_key(&(url.store, url.node))));
+    let place = if url.anchor.is_some() { "A place in " } else { "" };
+    match (store_name, known) {
+        (Some(name), true) => format!("{place}{} · {name}", store.display_label(url.store, url.node)),
+        (Some(name), false) => format!("A note in {name}"),
+        (None, _) => "A note in a store that isn't open here".to_string(),
+    }
+}
+
 /// Open a web link outside the app: the system browser on the desktop, a new
 /// tab (no opener) in the browser.
 pub fn open_external(url: &str) -> Result<(), String> {

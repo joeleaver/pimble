@@ -607,6 +607,16 @@ pub fn display_label_from_node(node: &Node) -> String {
     label_from_title_and_content(has_explicit_title, &node.metadata.title, &content)
 }
 
+/// What the link tooltip shows and where: under the hovered link, `x`/`y`
+/// in the coordinates `position: fixed` uses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkTooltip {
+    /// The target: a note's title and store, a sentence, or a web link's URL.
+    pub target: String,
+    pub x: f32,
+    pub y: f32,
+}
+
 /// Where a followed link leads, as `AppStore::link_open` carries it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinkOpen {
@@ -904,6 +914,9 @@ pub struct AppStore {
     /// there once rinch can place and scroll a caret it was not clicked to
     /// (docs/LINKS_CONTRACT.md, rinch PRs 4 and 5).
     pub pending_anchor: Signal<Option<(StoreId, NodeId, pimble_core::Anchor)>>,
+    /// The tooltip over a hovered link, once the pointer has rested on it
+    /// (docs/LINKS_CONTRACT.md "What a link looks like").
+    pub link_hover: Signal<Option<LinkTooltip>>,
 
     // "Recently Deleted..." modal (View menu, store row context menu;
     // docs/MOVE_CONTRACT.md "Seeing and undoing what was removed"). One
@@ -1049,6 +1062,7 @@ impl AppStore {
             notice: Signal::new(String::new()),
             link_open: Signal::new(None),
             pending_anchor: Signal::new(None),
+            link_hover: Signal::new(None),
             deleted_modal_store: Signal::new(None),
             deleted_modal_nodes: Signal::new(Vec::new()),
             deleted_modal_pending: Signal::new(false),

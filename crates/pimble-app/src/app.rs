@@ -3914,6 +3914,21 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
 
                         div { style: "flex: 1;", }
                     }
+
+                    // Where the hovered link leads (docs/LINKS_CONTRACT.md
+                    // "What a link looks like"), under the link.
+                    div {
+                        class: "pimble-link-tooltip",
+                        style: {|| match store.link_hover.get() {
+                            Some(tip) => format!("left: {}px; top: {}px;", tip.x, tip.y),
+                            None => "display: none;".to_string(),
+                        }},
+                        div {
+                            class: "pimble-link-tooltip__target",
+                            {|| store.link_hover.get().map(|tip| tip.target).unwrap_or_default()}
+                        }
+                        div { class: "pimble-link-tooltip__hint", {crate::links::OPEN_HINT} }
+                    }
                 }
         };
 

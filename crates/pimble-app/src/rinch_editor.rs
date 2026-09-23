@@ -12,7 +12,7 @@
 //! `editor.rs` — the one place collaboration is wired — free of `cfg`.
 
 #[cfg(feature = "native")]
-pub use rinch::prelude::{create_editor, Editor, EditorHandle};
+pub use rinch::prelude::{create_editor, Editor, EditorHandle, LinkClick, LinkHover};
 
 #[cfg(not(feature = "native"))]
-pub use rinch_web::{create_editor, Editor, EditorHandle};
+pub use rinch_web::{create_editor, Editor, EditorHandle, LinkClick, LinkHover};

@@ -265,6 +265,24 @@ mod tests {
     }
 
     #[test]
+    fn appended_blocks_are_an_edit_of_the_existing_content() {
+        let a = url();
+        let mut doc = NodeDoc::from_blocks(&[Block::plain("first")]).unwrap();
+        let before = NodeDoc::load(&doc.save()).unwrap();
+        let delta = doc.append_blocks(&[Block::paragraph(vec![Run::plain("see "), link("the plan", &a)])]).unwrap();
+        assert_eq!(doc.text(), "first\nsee the plan");
+        assert_eq!(doc.links().len(), 1);
+        // A replica holding the old content merges the delta into the same
+        // two paragraphs, not beside a second copy of the first.
+        let mut replica = before;
+        replica.apply_update(&delta).unwrap();
+        assert_eq!(replica.text(), "first\nsee the plan");
+        let mut empty = NodeDoc::new();
+        empty.append_blocks(&[Block::plain("only")]).unwrap();
+        assert_eq!(empty.text(), "only");
+    }
+
+    #[test]
     fn a_link_in_one_paragraph_does_not_run_into_the_next() {
         let a = url();
         let doc = NodeDoc::from_blocks(&[Block::paragraph(vec![link("one", &a)]), Block::paragraph(vec![link("two", &a)])]).unwrap();

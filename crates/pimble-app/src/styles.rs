@@ -530,6 +530,29 @@ pub(crate) const APP_CSS: &str = "
     border-top: 1px solid var(--rinch-color-border);
     border-bottom: 1px solid var(--rinch-color-border);
 }
+
+/* The tooltip over a hovered link (docs/LINKS_CONTRACT.md). */
+.pimble-link-tooltip {
+    position: fixed;
+    z-index: 1000;
+    /* Fills max-width instead of fitting its text: joeleaver/rinch#893. */
+    max-width: 420px;
+    padding: 4px 8px;
+    background: var(--rinch-color-surface);
+    border: 1px solid var(--rinch-color-border);
+    border-radius: 4px;
+    font-size: 12px;
+    pointer-events: none;
+}
+.pimble-link-tooltip__target {
+    color: var(--rinch-color-text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.pimble-link-tooltip__hint {
+    color: var(--rinch-color-dimmed);
+}
 ";
 
 /// Editor content styles for the editor pane.

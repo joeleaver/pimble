@@ -41,7 +41,7 @@ use yrs::{
 use crate::blocks::{blocks_from_plain_text, Block};
 use crate::content_doc::{
     blocks_of_projection, decode_update, diff_since, fresh_snapshot, join_units, replacement_delta,
-    project, snapshot_from_blocks, transaction_changed, units_of_projection,
+    append_delta, project, snapshot_from_blocks, transaction_changed, units_of_projection,
 };
 use crate::links::{self, links_of_model, LinkRef, Resolved, Spot};
 use crate::error::{CrdtError, Result};
@@ -296,6 +296,16 @@ impl NodeDoc {
     pub fn replace_plain_text(&mut self, text: &str) -> Result<Vec<u8>> {
         let seed = !self.has_projection();
         let delta = replacement_delta(&self.save(), seed, text)?;
+        self.apply_update(&delta)?;
+        Ok(delta)
+    }
+
+    /// Append `blocks` after the content, as an edit of its history (what
+    /// `pimble-cli append-link` sends; the importer's `from_blocks` is for a
+    /// node whose content was never written). Answers the delta applied.
+    pub fn append_blocks(&mut self, blocks: &[Block]) -> Result<Vec<u8>> {
+        let seed = !self.has_projection();
+        let delta = append_delta(&self.save(), seed, blocks)?;
         self.apply_update(&delta)?;
         Ok(delta)
     }

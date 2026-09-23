@@ -182,6 +182,14 @@ async fn main() -> Result<()> {
             let text = args[4..].join(" ");
             set_node_text(&args[2], &args[3], &text).await?;
         }
+        "append-link" => {
+            if args.len() < 5 {
+                eprintln!("Usage: pimble-cli append-link <store-id> <node-id> <href> [text]");
+                return Ok(());
+            }
+            let text = if args.len() > 5 { args[5..].join(" ") } else { args[4].clone() };
+            append_link(&args[2], &args[3], &args[4], &text).await?;
+        }
         "show-node" => {
             if args.len() < 4 {
                 eprintln!("Usage: pimble-cli show-node <store-id> <node-id>");
@@ -389,6 +397,7 @@ COMMANDS:
     transplant-node     Move a node into another store (always a transplant)
     list-deleted        List a store's tombstones and unlisted live nodes
     set-node-text       Set a node's content from plain text
+    append-link         Append a paragraph linking <text> to <href> (a pimble: or web link)
     show-node           Print a node's metadata and content text
     search              Search across all open stores
     rebuild-index       Rebuild a store's search index from scratch
@@ -1306,6 +1315,28 @@ async fn set_node_text(store_id: &str, node_id: &str, text: &str) -> Result<()> 
         .apply_edit(store_id, node_id, "pimble-cli", EditOperation::IncrementalChanges { changes })
         .await?;
     println!("Updated content for node {}", node_id);
+    Ok(())
+}
+
+/// Append a paragraph whose words link to `href` (docs/LINKS_CONTRACT.md), as
+/// an `applyEdit` of the node's existing document like `set-node-text`.
+async fn append_link(store_id: &str, node_id: &str, href: &str, text: &str) -> Result<()> {
+    use pimble_crdt::{Block, Mark, Run};
+    let store_id = parse_store_id(store_id)?;
+    let node_id = parse_node_id(node_id)?;
+    let client = connect().await?;
+    let node = client.get_node(store_id, node_id).await?;
+    let mut doc = NodeDoc::load(&node.content)
+        .map_err(|e| anyhow::anyhow!("failed to load the node's document: {e}"))?;
+    let block = Block::paragraph(vec![Run::marked(text, vec![Mark::Link { href: href.to_string() }])]);
+    let delta = doc
+        .append_blocks(&[block])
+        .map_err(|e| anyhow::anyhow!("failed to build the edit: {e}"))?;
+    let changes = base64::engine::general_purpose::STANDARD.encode(delta);
+    client
+        .apply_edit(store_id, node_id, "pimble-cli", EditOperation::IncrementalChanges { changes })
+        .await?;
+    println!("Linked \"{}\" to {} in node {}", text, href, node_id);
     Ok(())
 }
 

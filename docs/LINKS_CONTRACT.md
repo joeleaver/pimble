@@ -151,7 +151,13 @@ ever leaves the app without the modifier.
 ## What a link looks like
 
 The link colour (`--rinch-primary-color-4` dark, `-6` light), no underline until hover
-(built 2026-09-23, `styles.rs`). A web link is to carry a small arrow after its words (CSS
+(built 2026-09-23, `styles.rs`; the hover underline does not show on the desktop yet).
+Hover and Ctrl/Cmd+click are built on rinch PR joeleaver/rinch#892 (`on_link_hover`,
+`on_link_click`, wired in `editor::start_editing`): the tooltip (`links::hover_link`,
+`tooltip_target`: the note's title and store as the app knows them, or a web link's URL,
+and "Ctrl+click to open") shows after 400 ms, checked in the app; it fills its
+`max-width` instead of fitting its text (joeleaver/rinch#893). `pimble-cli append-link`
+(`NodeDoc::append_blocks`) makes a link headlessly until paste and the picker exist. A web link is to carry a small arrow after its words (CSS
 on `a[href^="http"]`, not text), which waits for joeleaver/rinch#891: generated content
 inside the editor puts the caret beside the wrong character. Hover after
 400 ms: a tooltip with the target's title and store name (or the sentence from "Following"

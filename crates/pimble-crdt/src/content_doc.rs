@@ -232,6 +232,26 @@ pub(crate) fn replacement_delta(current: &[u8], seed: bool, text: &str) -> Resul
     session.save_incremental().map_err(|e| CrdtError::Collab(e.to_string()))
 }
 
+/// The delta that appends `blocks` after the content in `current` (a
+/// document's whole state), as an edit of that content's history. With
+/// `seed`, the document holds no projection yet and the delta is a fresh
+/// snapshot of `blocks` alone. The caller applies the delta itself.
+pub(crate) fn append_delta(current: &[u8], seed: bool, blocks: &[Block]) -> Result<Vec<u8>> {
+    let schema = Rc::new(Schema::starter_kit());
+    if seed {
+        return snapshot_from_blocks(blocks);
+    }
+    let mut session = CollabSession::from_bytes(current).map_err(|e| CrdtError::Collab(e.to_string()))?;
+    let before = session.projected_doc(&schema).map_err(|e| CrdtError::Collab(e.to_string()))?;
+    let added = build_doc(&schema, blocks)?;
+    let children: Vec<Node> = before.content().iter().chain(added.content().iter()).cloned().collect();
+    let after = before.copy_with_content(rinch_editor_core::Fragment::from_children(children));
+    session
+        .record_local(&schema, &before, &after)
+        .map_err(|e| CrdtError::Collab(e.to_string()))?;
+    session.save_incremental().map_err(|e| CrdtError::Collab(e.to_string()))
+}
+
 /// The content of the projection in `bytes` (a document's whole state) as a NEW
 /// document: the snapshot of a fresh projection of the same editor model, from a new
 /// client id. This is how a transplant carries content from one node document to
