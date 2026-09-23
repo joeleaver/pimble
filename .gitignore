@@ -44,3 +44,6 @@ nul
 
 # The local stack's throwaway signup helper
 scripts/local-stack/signup-helper/target/
+
+# Python bytecode (scripts/perf)
+__pycache__/
