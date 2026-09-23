@@ -24,6 +24,7 @@ pub mod appearance;
 pub mod commands;
 pub mod editor;
 pub mod events;
+pub mod link_picker;
 pub mod links;
 pub mod menus;
 pub mod persistence;
