@@ -1,5 +1,13 @@
 # Next session: start here
 
+Updated 2026-09-23. **Where things stand:** v0.4.0 is released (desktop only; production is
+still jkbase deployment v23, which v0.4.0 did not need). `master` is clean and pushed;
+every rinch dependency is on rinch `main` (4200dda). **Next:** whatever Joe reports. The
+agreed performance follow-ups are rinch work, one at a time (the list at the end of the
+section below); measure before and after with `scripts/perf/` (its README has the method,
+the store copy, and the DOM-write logging patch). Unexplained: the server test-process
+crashes in "A flake to watch".
+
 ## 2026-09-23: desktop performance, released as v0.4.0 (branch `perf/gpu-and-caret`)
 
 **v0.4.0 is released** (release commit aa6354a, tag `v0.4.0`): the GitHub release has the

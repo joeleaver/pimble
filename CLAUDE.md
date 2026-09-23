@@ -492,6 +492,7 @@ vault-link start), so a reopened replica no longer reports a placeholder root.
 - `crates/pimble-server/tests/common/mod.rs` - the sharing test harness (`share.rs`, `share_upkeep.rs`): stub accounts service, hosted server, cuttable relay, fixture
 - `docs/RELAY_CONTRACT.md`, `crates/pimble-server/src/relay_face.rs`, `relay_tunnel.rs`, `crates/pimble-cloud/src/relay.rs` - sharing from an unhosted store
 - `scripts/local-stack/` - the whole stack on one machine, and the sharing walk-through
+- `scripts/perf/` - profiling the desktop app: an isolated app on a store copy, a driver for rinch's debug port, per-thread CPU, and a patch that logs every DOM write
 - `crates/pimble-store/src/local.rs` - LocalStore
 - `crates/pimble-rpc/src/methods.rs` - RPC API trait
 - `crates/pimble-server/src/handler.rs` - RPC method implementations

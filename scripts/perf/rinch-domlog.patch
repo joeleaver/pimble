@@ -1,0 +1,181 @@
+diff --git a/crates/rinch-dom/src/dom_impl/dom_document_impl.rs b/crates/rinch-dom/src/dom_impl/dom_document_impl.rs
+index ef572b8..bdc6cb9 100644
+--- a/crates/rinch-dom/src/dom_impl/dom_document_impl.rs
++++ b/crates/rinch-dom/src/dom_impl/dom_document_impl.rs
+@@ -107,6 +107,7 @@ impl DomDocument for RinchDocument {
+     }
+ 
+     fn append_child(&mut self, parent: NodeId, child: NodeId) {
++        prof_log(&self.tree, "append_child", parent.0);
+         let p = parent.0;
+         let c = child.0;
+         // Invalidate old IFC if child was in one
+@@ -159,6 +160,7 @@ impl DomDocument for RinchDocument {
+     }
+ 
+     fn remove_child(&mut self, parent: NodeId, child: NodeId) {
++        prof_log(&self.tree, "remove_child", parent.0);
+         let p = parent.0;
+         let c = child.0;
+         // Clear IFC state on removed child
+@@ -182,6 +184,7 @@ impl DomDocument for RinchDocument {
+     }
+ 
+     fn insert_before(&mut self, parent: NodeId, child: NodeId, reference: NodeId) {
++        prof_log(&self.tree, "insert_before", parent.0);
+         let p = parent.0;
+         let c = child.0;
+         let r = reference.0;
+@@ -242,6 +245,7 @@ impl DomDocument for RinchDocument {
+     }
+ 
+     fn replace_node(&mut self, old: NodeId, new: NodeId) {
++        prof_log(&self.tree, "replace_node", old.0);
+         // Replacing a node with itself is a no-op the browser accepts (the DOM
+         // spec re-inserts `node` before its own next sibling), and the same must
+         // hold here. Without this guard the "detach `new` from its old parent"
+@@ -379,6 +383,7 @@ impl DomDocument for RinchDocument {
+     }
+ 
+     fn set_text_content(&mut self, node: NodeId, text: &str) {
++        if prof_on() { let same = match self.tree.nodes.get(node.0).map(|n| &n.kind) { Some(crate::node::NodeKind::Text(t)) => t.content == text, _ => false }; prof_log(&self.tree, &format!("set_text{} {:?}", if same {"(same)"} else {""}, text), node.0); }
+         let n = node.0;
+ 
+         // Fast path: skip if content is already identical.
+@@ -505,6 +510,7 @@ impl DomDocument for RinchDocument {
+     }
+ 
+     fn set_attribute(&mut self, node: NodeId, name: &str, value: &str) {
++        if prof_on() { let same = self.tree.nodes.get(node.0).and_then(|n| n.attributes.get(&name.to_ascii_lowercase())).is_some_and(|v| v == value); prof_log(&self.tree, &format!("set_attr{} {}={:?}", if same {"(same)"} else {""}, name, value), node.0); }
+         // #688: in HTML content the name is ASCII case-insensitive, so it is
+         // stored folded — every reader below and in `stylo_impl` looks an
+         // attribute up by a lowercase literal (`"style"`, `"class"`, `"id"`,
+@@ -600,6 +606,7 @@ impl DomDocument for RinchDocument {
+     }
+ 
+     fn remove_attribute(&mut self, node: NodeId, name: &str) {
++        if prof_on() { let had = self.tree.nodes.get(node.0).is_some_and(|n| n.attributes.contains_key(&name.to_ascii_lowercase())); prof_log(&self.tree, &format!("remove_attr{} {}", if had {""} else {"(absent)"}, name), node.0); }
+         // Folded exactly as the write was (#688) — `NodeHandle::write_attribute`
+         // turns a falsey boolean attribute into a `remove_attribute` with the
+         // caller's own spelling, so a fold on one side and not the other could
+@@ -684,6 +691,7 @@ impl DomDocument for RinchDocument {
+     }
+ 
+     fn set_styles(&mut self, node: NodeId, properties: &[(&str, &str)]) {
++        if prof_on() { prof_log(&self.tree, &format!("set_styles {:?}", properties), node.0); }
+         // Merge into the inline style attribute and parse it once; both paths
+         // below store exactly this string and this declaration block.
+         let style_str = self.merged_inline_style(node.0, properties);
+@@ -747,6 +755,7 @@ impl DomDocument for RinchDocument {
+     }
+ 
+     fn insert_child(&mut self, parent: NodeId, child: NodeId, index: usize) {
++        prof_log(&self.tree, "insert_child", parent.0);
+         let p = parent.0;
+         let c = child.0;
+         // Invalidate old IFC
+@@ -821,6 +830,7 @@ impl DomDocument for RinchDocument {
+     }
+ 
+     fn set_inner_html(&mut self, node: NodeId, html: &str) {
++        prof_log(&self.tree, "set_inner_html", node.0);
+         use crate::html_parser::parse_html_string;
+ 
+         // Clear existing children (including taffy sync)
+@@ -1587,3 +1597,38 @@ mod attach_taffy_child_tests {
+         assert_eq!(doc.tree.taffy_attach_faults, 0);
+     }
+ }
++
++
++/// PROFILING ONLY (scratch copy): describe a node and its ancestors.
++pub(crate) fn prof_describe(tree: &crate::node::NodeTree, id: usize) -> String {
++    let mut out = Vec::new();
++    let mut cur = Some(id);
++    let mut n = 0;
++    while let Some(i) = cur {
++        let Some(node) = tree.nodes.get(i) else { break };
++        let d = match &node.kind {
++            crate::node::NodeKind::Element(e) => {
++                let c = node.attributes.get("class").map(|c| c.split_whitespace().take(2).collect::<Vec<_>>().join(".")).unwrap_or_default();
++                if c.is_empty() { e.tag.clone() } else { format!("{}.{}", e.tag, c) }
++            }
++            _ => "#text".into(),
++        };
++        out.push(d);
++        n += 1;
++        if n >= 9 { break; }
++        cur = node.parent.map(|p| p as usize);
++    }
++    out.join(" < ")
++}
++
++pub(crate) fn prof_on() -> bool {
++    thread_local!(static ON: bool = std::env::var("RINCH_DOMLOG").is_ok());
++    ON.with(|v| *v)
++}
++
++pub(crate) fn prof_log(tree: &crate::node::NodeTree, what: &str, id: usize) {
++    if prof_on() {
++        let w: String = what.chars().take(90).collect();
++        eprintln!("[DOM] {} @ {}", w.replace('\n', " "), prof_describe(tree, id));
++    }
++}
+diff --git a/crates/rinch-dom/src/dom_impl/mod.rs b/crates/rinch-dom/src/dom_impl/mod.rs
+index 024fed1..d6328e5 100644
+--- a/crates/rinch-dom/src/dom_impl/mod.rs
++++ b/crates/rinch-dom/src/dom_impl/mod.rs
+@@ -20,7 +20,7 @@ use stylo_config as style_config;
+ 
+ use crate::node::{DirtyFlags, NodeTree};
+ 
+-mod dom_document_impl;
++pub(crate) mod dom_document_impl;
+ 
+ /// A simple FontMetricsProvider that returns default/fixed values.
+ /// This is used by the Stylist's Device to resolve font-relative units.
+diff --git a/crates/rinch-dom/src/paint/mod.rs b/crates/rinch-dom/src/paint/mod.rs
+index 6a87ce7..a4edd14 100644
+--- a/crates/rinch-dom/src/paint/mod.rs
++++ b/crates/rinch-dom/src/paint/mod.rs
+@@ -951,6 +951,9 @@ pub fn paint_subtree(
+ ///
+ /// Passing a zero in either axis means "no target", and disables the cull and
+ /// the covers-the-window clip elision rather than culling the whole document.
++thread_local!(pub(crate) static PROF_PAINTED: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) });
++
++/// PROFILING ONLY: paint_document plus a count of nodes visited / text layouts drawn.
+ pub fn paint_document(
+     tree: &NodeTree,
+     painter: &mut dyn Painter,
+@@ -958,6 +961,22 @@ pub fn paint_document(
+     viewport: (f32, f32),
+     font_cx: &mut parley::FontContext,
+     layout_cx: &mut parley::LayoutContext<Brush>,
++) {
++    PROF_PAINTED.with(|c| c.set((0, 0)));
++    paint_document_inner(tree, painter, scale, viewport, font_cx, layout_cx);
++    if crate::dom_impl::dom_document_impl::prof_on() {
++        let (n, t) = PROF_PAINTED.with(|c| c.get());
++        eprintln!("[PAINTED] nodes={n} text_layouts={t}");
++    }
++}
++
++fn paint_document_inner(
++    tree: &NodeTree,
++    painter: &mut dyn Painter,
++    scale: f64,
++    viewport: (f32, f32),
++    font_cx: &mut parley::FontContext,
++    layout_cx: &mut parley::LayoutContext<Brush>,
+ ) {
+     // The window, in the physical pixels paint works in, plus the margin the
+     // cull tests against. Nothing outside the second is emitted; see
+@@ -1206,6 +1225,7 @@ fn paint_node(
+     layout_cx: &mut parley::LayoutContext<Brush>,
+     parent_transform: Affine,
+ ) {
++    PROF_PAINTED.with(|c| { let (n, t) = c.get(); c.set((n + 1, t + tree.get(node_id).map_or(0, |n| n.text_layout.is_some() as usize))) });
+     let Some(node) = tree.get(node_id) else {
+         return;
+     };
