@@ -33,9 +33,9 @@ metadata section is designed; a link follows a transplanted node through its tom
   `resolveLink` RPC the contract's "Waves" now names.
 - Checked: `pimble-crdt` 131 tests (new: links, anchors, `became` within and between
   stores), the server's index-links test, the web crate's vault tests (47) and its
-  wasm32 check. Two full release runs (`--workspace --release`): 661 passed, and one flake
-  each, a different test each time, both unrelated and passing on re-runs ("A flake to
-  watch").
+  wasm32 check. Three full release runs (`--workspace --release`): the first two each had
+  one flake, a different test each time, both unrelated and passing on re-runs ("A flake to
+  watch"); the third was clean, 662 passed.
 
 ## 2026-09-23: desktop performance, released as v0.4.0 (branch `perf/gpu-and-caret`)
 
