@@ -20,7 +20,7 @@ use pimble_rpc::{
     SetScopeRequest, VaultDocKeys, VaultSetDocKeysRequest,
     CreateMountRequest, CreateNodeRequest, CreateStoreRequest, CreateWorkspaceRequest, DeleteNodeRequest,
     EditOperation, GetChildrenRequest, GetMountStateRequest, GetNodeRequest, GetNodesRequest, GetStoreSyncRequest, GetStoreSyncResponse, SetStoreSyncRequest,
-    ListDeletedRequest, ListRemoteStoresRequest, LoadWorkspaceRequest, MoveNodeRequest, MoveNodeResponse, NodeContentChangedNotification, NodeStateVector,
+    ListDeletedRequest, ResolveLinkRequest, ListRemoteStoresRequest, LoadWorkspaceRequest, MoveNodeRequest, MoveNodeResponse, NodeContentChangedNotification, NodeStateVector,
     TransplantNodeRequest, TransplantNodeResponse,
     OpenStoreRequest, PimbleApiClient, RebuildIndexRequest, RemoveReplicaRequest, SaveWorkspaceRequest,
     SearchRequest, SearchResultItem, StoreChangedNotification, SyncNodesRequest, UndeleteNodeRequest,
@@ -529,6 +529,15 @@ impl PimbleClient {
             .list_deleted(request)
             .await
             .map(|answer| answer.nodes)
+            .map_err(rpc_error)
+    }
+
+    /// Where a link to `node_id` in `store_id` leads now (`resolveLink`).
+    pub async fn resolve_link(&self, store_id: StoreId, node_id: NodeId) -> Result<pimble_core::LinkResolution> {
+        self.client
+            .resolve_link(ResolveLinkRequest { store_id, node_id })
+            .await
+            .map(|answer| answer.resolution)
             .map_err(rpc_error)
     }
 

@@ -95,6 +95,35 @@ impl fmt::Display for PimbleUrl {
     }
 }
 
+/// Where a Pimble link leads now (`resolveLink`, docs/LINKS_CONTRACT.md
+/// "Following a link"): the last hop of the tombstones' `became` chain
+/// decides. Whoever holds a store answers for it, so a resolution that stops
+/// at `StoreNotHere` may be continued by someone who holds that store (the
+/// browser holds the encrypted ones).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LinkResolution {
+    /// A live node: open it.
+    Live { store_id: StoreId, node_id: NodeId },
+    /// A tombstone that became nothing: "This note was deleted.", with "Put
+    /// Back" where the reader may.
+    Deleted { store_id: StoreId, node_id: NodeId },
+    /// A store or node the reader has no grant for: "You don't have access to
+    /// where this link points."
+    NoAccess,
+    /// No such node, or a `became` chain that loops: "This note no longer
+    /// exists."
+    Missing,
+    /// A store this server does not hold (or holds only encrypted): "This
+    /// link is to a store that isn't on this device." `store_id`/`node_id`
+    /// say where the chain stood, for whoever holds that store.
+    StoreNotHere { store_id: StoreId, node_id: NodeId },
+}
+
+/// How many `became` hops a resolution follows before it calls the link
+/// `Missing`. A node moved out of a share and then between stores is two.
+pub const MAX_LINK_HOPS: usize = 8;
+
 /// Why a string is not a Pimble link.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PimbleUrlError {

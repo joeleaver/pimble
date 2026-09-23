@@ -99,6 +99,12 @@ pub trait PimbleApi {
     #[method(name = "listDeleted", with_extensions)]
     async fn list_deleted(&self, request: ListDeletedRequest) -> Result<ListDeletedResponse, ErrorObjectOwned>;
 
+    /// Where a link to a node leads now: the node, or through the `became`
+    /// of the tombstones a transplant left, the node it became
+    /// (docs/LINKS_CONTRACT.md "Following a link"). Read, judged at every hop.
+    #[method(name = "resolveLink", with_extensions)]
+    async fn resolve_link(&self, request: ResolveLinkRequest) -> Result<ResolveLinkResponse, ErrorObjectOwned>;
+
     /// Get children of a node. Read, and — when the node is a mount —
     /// also checked against the mount's source store.
     #[method(name = "getChildren", with_extensions)]

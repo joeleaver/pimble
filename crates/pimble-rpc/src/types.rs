@@ -354,6 +354,22 @@ pub struct ListDeletedResponse {
     pub nodes: Vec<DeletedNode>,
 }
 
+/// Request to follow a link to `node_id` in `store_id` to where it leads
+/// now (docs/LINKS_CONTRACT.md "Following a link"). Judged hop by hop like
+/// `getNode`; never an error for a link that leads nowhere, which is an
+/// answer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveLinkRequest {
+    pub store_id: StoreId,
+    pub node_id: NodeId,
+}
+
+/// Answer to `resolveLink`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveLinkResponse {
+    pub resolution: pimble_core::LinkResolution,
+}
+
 /// Request to get children of a node
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetChildrenRequest {

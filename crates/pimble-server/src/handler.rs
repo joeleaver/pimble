@@ -50,11 +50,11 @@ use jsonrpsee::core::{async_trait, SubscriptionResult};
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{Extensions, PendingSubscriptionSink, SubscriptionMessage};
 use pimble_client::{describe_connect_error, PimbleClient};
-use pimble_core::{AuthMethod, Node, MountRef, MountState, NodeId, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState, Workspace};
+use pimble_core::{AuthMethod, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState, Workspace};
 use pimble_crdt::{NodeDoc, NodeFields, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_plugins::PluginHost;
 use pimble_rpc::{
-    encrypted_store_error, index_building_error, snapshot_required_error, to_rpc_error, ApplyEditRequest, ApplyEditResponse,
+    encrypted_store_error, index_building_error, snapshot_required_error, to_rpc_error, ApplyEditRequest, ApplyEditResponse, ResolveLinkRequest, ResolveLinkResponse,
     AddRemoteStoreRequest, CloseStoreRequest, CloudAddHostedStoreRequest, CloudHostStoreRequest,
     CloudHostStoreResponse, CloudHostedStoreInfo, CloudListHostedStoresResponse, CloudRelayStoreRequest, CloudRelayStoreResponse, CloudSignInRequest,
     CloudStatusResponse, CloudStopRelayingRequest,
@@ -215,6 +215,13 @@ impl Reach {
             _ => Ok(()),
         }
     }
+}
+
+/// What one hop of `resolveLink` found: an answer, or a tombstone's
+/// `became` to follow.
+enum LinkHop {
+    Done(LinkResolution),
+    Became((StoreId, NodeId)),
 }
 
 /// `Ok` when `reach` is `None` (the principal reaches the whole store, and
@@ -1221,6 +1228,55 @@ impl RpcHandler {
     /// those RPCs may touch it. `Ok(())` when the store is `Plain` or not
     /// open at all — a missing store still fails downstream with its own,
     /// more specific `NotOpen`/`StoreNotFound` error.
+    /// One hop of `resolveLink` (docs/LINKS_CONTRACT.md "Following a link"):
+    /// what `node_id` in `store_id` is to `principal`, judged as `getNode`
+    /// judges it. Only `Service` opens a store the registry knows and this
+    /// server has not opened; a token holder gets `StoreNotHere` instead of
+    /// making the server open stores. A document a partial replica does not
+    /// hold is outside every share this device holds: no access, not missing.
+    async fn link_hop(&self, principal: &Principal, store_id: StoreId, node_id: NodeId) -> LinkHop {
+        let not_here = LinkHop::Done(LinkResolution::StoreNotHere { store_id, node_id });
+        if authorize(principal, store_id, Access::Read).is_err() {
+            return LinkHop::Done(LinkResolution::NoAccess);
+        }
+        let open = self.store_manager.read().await.is_open(store_id);
+        if !open {
+            if !matches!(principal, Principal::Service) {
+                return not_here;
+            }
+            let newly_opened = {
+                let mut manager = self.store_manager.write().await;
+                if manager.open_registered_store(store_id).await.is_err() {
+                    return not_here;
+                }
+                manager.opened_since()
+            };
+            self.adopt_newly_opened(newly_opened).await;
+        }
+
+        let manager = self.store_manager.read().await;
+        if manager.store_kind(store_id) != Some(StoreKind::Plain) {
+            // Encrypted here: whoever holds the keys resolves it.
+            return not_here;
+        }
+        let reach = Reach::of(&manager, principal, store_id);
+        if require_in_scope(&reach, node_id, Access::Read).is_err() {
+            return LinkHop::Done(LinkResolution::NoAccess);
+        }
+        let fields = manager.tree(store_id).ok().and_then(|tree| tree.doc(node_id)).map(|doc| doc.fields());
+        match fields {
+            None if manager.scope_roots(store_id).is_empty() => LinkHop::Done(LinkResolution::Missing),
+            None => LinkHop::Done(LinkResolution::NoAccess),
+            // A document whose `node` root has not arrived is not a node yet.
+            Some(Err(_)) => LinkHop::Done(LinkResolution::Missing),
+            Some(Ok(fields)) => match (fields.deleted_at, fields.became) {
+                (Some(_), Some(became)) => LinkHop::Became((became.store, became.node)),
+                (Some(_), None) => LinkHop::Done(LinkResolution::Deleted { store_id, node_id }),
+                (None, _) => LinkHop::Done(LinkResolution::Live { store_id, node_id }),
+            },
+        }
+    }
+
     async fn reject_if_vault(&self, store_id: StoreId) -> Result<(), ErrorObjectOwned> {
         if self.store_manager.read().await.store_kind(store_id) == Some(StoreKind::Vault) {
             return Err(encrypted_store_error(format!(
@@ -3809,6 +3865,27 @@ impl PimbleApiServer for RpcHandler {
         }
 
         Ok(TransplantNodeResponse { node_id: outcome.new_node_id, left_shares: outcome.left_shares })
+    }
+
+    async fn resolve_link(
+        &self,
+        ext: &Extensions,
+        request: ResolveLinkRequest,
+    ) -> Result<ResolveLinkResponse, ErrorObjectOwned> {
+        let principal = principal_of(ext);
+        let mut at = (request.store_id, request.node_id);
+        let mut seen = HashSet::new();
+        for _ in 0..=MAX_LINK_HOPS {
+            if !seen.insert(at) {
+                break;
+            }
+            match self.link_hop(&principal, at.0, at.1).await {
+                LinkHop::Done(resolution) => return Ok(ResolveLinkResponse { resolution }),
+                LinkHop::Became(next) => at = next,
+            }
+        }
+        // A chain that loops or runs past the limit leads nowhere.
+        Ok(ResolveLinkResponse { resolution: LinkResolution::Missing })
     }
 
     async fn list_deleted(

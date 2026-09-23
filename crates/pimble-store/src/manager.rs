@@ -757,7 +757,7 @@ impl StoreManager {
     /// otherwise `MountSourceUnavailable`. Does not consult a `MountRef`'s
     /// `source_path` hint — see [`StoreManager::ensure_store_open`] for the
     /// full resolution order used when resolving a specific mount.
-    async fn open_registered_store(&mut self, store_id: StoreId) -> Result<()> {
+    pub async fn open_registered_store(&mut self, store_id: StoreId) -> Result<()> {
         if self.local_stores.contains_key(&store_id) {
             return Ok(());
         }

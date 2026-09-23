@@ -215,11 +215,17 @@ Opening an external URL is pimble's own business, not rinch's: `open::that` on t
 2. The six rinch PRs of the section above, one at a time, in the order listed. Wave 1
    needs none of them: it resolves anchors with yrs directly.
 3. The app, desktop and web: picker, Ctrl+L, Copy Link, Copy Link to Here, paste, hover,
-   Ctrl+click, `follow_link`. Steps 1 and 2 of "Following" are one RPC, `resolveLink {
-   url } -> Live { store, node } | Deleted { store, node } | NoAccess | Missing |
-   StoreNotHere`: `getNode` refuses a tombstone, and only the server can judge access at
-   each `became` hop (the web vault client answers it in the page from the documents it
-   holds, as it answers every tree command). Server-boundary tests for each answer.
+   Ctrl+click, `follow_link`. Steps 1 and 2 of "Following" are one RPC, **built on
+   2026-09-23** (`crates/pimble-server/tests/links.rs`): `resolveLink { store_id, node_id }
+   -> LinkResolution::{Live, Deleted, NoAccess, Missing, StoreNotHere}`, because `getNode`
+   refuses a tombstone and only whoever holds a store can judge access at each `became`
+   hop. Each hop is judged as `getNode` is (a grant, a share's reach; a document a partial
+   replica does not hold is `NoAccess`, not `Missing`); only this device's own principal
+   opens a closed store the registry knows, and a token holder gets `StoreNotHere`;
+   `StoreNotHere` names where the chain stood, so whoever holds that store (the web vault
+   client, for the encrypted ones, answering in the page as it answers every tree
+   command) continues from there. A loop or more than `MAX_LINK_HOPS` (8) is `Missing`.
+   Still to build in this wave: the vault client's half.
 4. The PM's walk-through: both apps, a link across stores, across a mount, into a share a
    second account holds and one it does not, through a transplant, a deep link surviving
    edits by the other window.
