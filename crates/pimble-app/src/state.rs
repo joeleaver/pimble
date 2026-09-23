@@ -917,6 +917,9 @@ pub struct AppStore {
     /// The tooltip over a hovered link, once the pointer has rested on it
     /// (docs/LINKS_CONTRACT.md "What a link looks like").
     pub link_hover: Signal<Option<LinkTooltip>>,
+    /// The link picker while it is open (`[[` or Ctrl+L,
+    /// docs/LINKS_CONTRACT.md "Making a link"); `link_picker.rs` drives it.
+    pub link_picker: Signal<Option<crate::link_picker::PickerView>>,
 
     // "Recently Deleted..." modal (View menu, store row context menu;
     // docs/MOVE_CONTRACT.md "Seeing and undoing what was removed"). One
@@ -1063,6 +1066,7 @@ impl AppStore {
             link_open: Signal::new(None),
             pending_anchor: Signal::new(None),
             link_hover: Signal::new(None),
+            link_picker: Signal::new(None),
             deleted_modal_store: Signal::new(None),
             deleted_modal_nodes: Signal::new(Vec::new()),
             deleted_modal_pending: Signal::new(false),

@@ -13,6 +13,15 @@
 use crossbeam_channel::{Receiver, Sender};
 use pimble_core::{DeletedNode, LeftShare, LinkResolution, MountRef, PimbleUrl, MountState, Node, NodeId, RemoteEndpoint, Store, StoreId, SyncState};
 
+/// Who asked a `Search`, so its answer reaches them and nobody else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchPurpose {
+    /// The search box and its results panel.
+    Panel,
+    /// The link picker (`[[` and Ctrl+L, docs/LINKS_CONTRACT.md).
+    LinkPicker,
+}
+
 /// Commands sent from UI to backend
 #[derive(Debug)]
 pub enum BackendCommand {
@@ -102,7 +111,9 @@ pub enum BackendCommand {
     ConnectionLost { generation: u64 },
 
     // Search
-    Search { query: String, stores: Vec<StoreId>, limit: usize },
+    /// `purpose` says whose results these are, and comes back on
+    /// `SearchResults`: the search box's or the link picker's.
+    Search { query: String, stores: Vec<StoreId>, limit: usize, purpose: SearchPurpose },
     RebuildIndex { store_id: StoreId },
 
     // Replica sync (docs/history/HARDENING_CONTRACT.md "B: app") — routed through
@@ -295,7 +306,7 @@ pub enum BackendEvent {
     /// into the generic `Error` event so a failed search (including "the
     /// index is still building") shows inline in the results panel without
     /// touching the connection status bar or the reconnect-on-error path.
-    SearchResults { results: Result<Vec<pimble_rpc::SearchResultItem>, String> },
+    SearchResults { purpose: SearchPurpose, results: Result<Vec<pimble_rpc::SearchResultItem>, String> },
     IndexRebuilt { store_id: StoreId, indexed: usize },
 
     // Replica sync (docs/SYNC_CONTRACT.md "B: app side")

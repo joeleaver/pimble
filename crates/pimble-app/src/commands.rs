@@ -394,15 +394,15 @@ pub async fn process_command(
         // Handled in `backend_loop` before dispatch; never reaches here.
         BackendCommand::ConnectionLost { .. } => None,
 
-        BackendCommand::Search { query, stores, limit } => {
+        BackendCommand::Search { query, stores, limit, purpose } => {
             let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::SearchResults { results: Err("Not connected".into()) });
+                return Some(BackendEvent::SearchResults { purpose, results: Err("Not connected".into()) });
             };
             // Ask for hybrid (keyword + semantic); a server built without an ONNX
             // link mode answers keyword-only.
             match c.search(query, stores, true, limit).await {
-                Ok(results) => Some(BackendEvent::SearchResults { results: Ok(results) }),
-                Err(e) => Some(BackendEvent::SearchResults { results: Err(e.to_string()) }),
+                Ok(results) => Some(BackendEvent::SearchResults { purpose, results: Ok(results) }),
+                Err(e) => Some(BackendEvent::SearchResults { purpose, results: Err(e.to_string()) }),
             }
         }
 

@@ -1133,7 +1133,11 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 }
             }
 
-            BackendEvent::SearchResults { results } => {
+            BackendEvent::SearchResults { purpose: crate::protocol::SearchPurpose::LinkPicker, results } => {
+                crate::link_picker::search_answered(store, results);
+            }
+
+            BackendEvent::SearchResults { purpose: crate::protocol::SearchPurpose::Panel, results } => {
                 match results {
                     Ok(items) => store.search_results.set(SearchState::Results(items.clone())),
                     Err(message) => store.search_results.set(SearchState::Error(message.clone())),

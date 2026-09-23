@@ -16,6 +16,8 @@ pub const MAX_NODE_ROWS: usize = 8;
 /// One row of the picker.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PickerRow {
+    /// "Remove Link": Ctrl+L with the caret in a link.
+    RemoveLink,
     /// "Link to <href>": what was typed reads as a web link.
     Web { href: String },
     /// A note the search found.
@@ -26,6 +28,7 @@ impl PickerRow {
     /// The link's href.
     pub fn href(&self) -> String {
         match self {
+            PickerRow::RemoveLink => String::new(),
             PickerRow::Web { href } => href.clone(),
             PickerRow::Node { store_id, node_id, .. } => PimbleUrl::node(*store_id, *node_id).to_string(),
         }
@@ -35,6 +38,7 @@ impl PickerRow {
     /// as it was typed.
     pub fn link_text(&self, query: &str) -> String {
         match self {
+            PickerRow::RemoveLink => String::new(),
             PickerRow::Web { .. } => query.trim().to_string(),
             PickerRow::Node { title, .. } if title.trim().is_empty() => "Untitled".to_string(),
             PickerRow::Node { title, .. } => title.clone(),
@@ -64,6 +68,157 @@ pub fn picker_rows(query: &str, hits: &[SearchResultItem], store_name: impl Fn(S
     }
     rows.truncate(MAX_NODE_ROWS + usize::from(matches!(rows.first(), Some(PickerRow::Web { .. }))));
     rows
+}
+
+/// How the picker was opened, which says where its query comes from and
+/// what a pick does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerKind {
+    /// `[[` typed at `from` (the first bracket): the query is the text
+    /// typed after the brackets, in the note, and a pick replaces
+    /// `[[query` with the linked title.
+    Typed { from: usize },
+    /// Ctrl+L over `from..to`: the query is typed in the popup's own field,
+    /// and a pick links those words as they are. `editing` when they are a
+    /// link already (then "Remove Link" is offered too).
+    Selection { from: usize, to: usize, editing: bool },
+}
+
+/// The open picker, as `AppStore::link_picker` holds it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PickerView {
+    pub kind: PickerKind,
+    pub query: String,
+    pub rows: Vec<PickerRow>,
+    pub selected: usize,
+    /// Where the popup sits (`position: fixed` coordinates): under the caret
+    /// or the selection's start.
+    pub x: f32,
+    pub y: f32,
+}
+
+thread_local! {
+    /// The picker's latest search answer, which the rows are rebuilt from
+    /// as the query changes before the next answer arrives.
+    static HITS: std::cell::RefCell<Vec<SearchResultItem>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The pending search, debounced as the query is typed.
+    static SEARCH_TIMER: std::cell::RefCell<Option<rinch::prelude::TimeoutHandle>> = const { std::cell::RefCell::new(None) };
+}
+
+/// How long the query rests before the picker searches.
+const SEARCH_DEBOUNCE_MS: u32 = 120;
+
+/// Open the picker (`kind`) under `(x, y)`, its query empty.
+pub fn open(store: crate::state::AppStore, kind: PickerKind, x: f32, y: f32) {
+    HITS.with(|h| h.borrow_mut().clear());
+    let view = PickerView { kind, query: String::new(), rows: Vec::new(), selected: 0, x, y };
+    store.link_picker.set(Some(rebuilt(store, view)));
+}
+
+/// Close the picker; what was typed stays as it is.
+pub fn close(store: crate::state::AppStore) {
+    if let Some(pending) = SEARCH_TIMER.with(|t| t.borrow_mut().take()) {
+        rinch::prelude::clear_timeout(pending);
+    }
+    if rinch::prelude::untracked(|| store.link_picker.get()).is_some() {
+        store.link_picker.set(None);
+    }
+}
+
+/// Whether the picker is open.
+pub fn is_open(store: crate::state::AppStore) -> bool {
+    rinch::prelude::untracked(|| store.link_picker.with(|p| p.is_some()))
+}
+
+/// The query changed: the rows follow at once from the last answer, and a
+/// search for the new query is asked once typing rests.
+pub fn set_query(store: crate::state::AppStore, query: String) {
+    let Some(mut view) = rinch::prelude::untracked(|| store.link_picker.get()) else { return };
+    if view.query == query {
+        return;
+    }
+    view.query = query.clone();
+    view.selected = 0;
+    store.link_picker.set(Some(rebuilt(store, view)));
+    if let Some(pending) = SEARCH_TIMER.with(|t| t.borrow_mut().take()) {
+        rinch::prelude::clear_timeout(pending);
+    }
+    if query.trim().is_empty() {
+        return;
+    }
+    let handle = rinch::prelude::set_timeout(SEARCH_DEBOUNCE_MS, move || {
+        SEARCH_TIMER.with(|t| t.borrow_mut().take());
+        let stores = rinch::prelude::untracked(|| store.store_ids.get());
+        store.send(crate::protocol::BackendCommand::Search {
+            query,
+            stores,
+            limit: 30,
+            purpose: crate::protocol::SearchPurpose::LinkPicker,
+        });
+    });
+    SEARCH_TIMER.with(|t| *t.borrow_mut() = Some(handle));
+}
+
+/// A search the picker asked for was answered. An answer that comes after
+/// the picker closed changes nothing; an error leaves the last rows.
+pub fn search_answered(store: crate::state::AppStore, results: &Result<Vec<SearchResultItem>, String>) {
+    let Ok(hits) = results else { return };
+    let Some(view) = rinch::prelude::untracked(|| store.link_picker.get()) else { return };
+    HITS.with(|h| *h.borrow_mut() = hits.clone());
+    store.link_picker.set(Some(rebuilt(store, view)));
+}
+
+/// Move the highlight (+1 down, -1 up).
+pub fn step(store: crate::state::AppStore, delta: isize) {
+    let Some(mut view) = rinch::prelude::untracked(|| store.link_picker.get()) else { return };
+    view.selected = step_selection(view.selected, view.rows.len(), delta);
+    store.link_picker.set(Some(view));
+}
+
+/// Move the popup (the caret moved, or its position became known).
+pub fn place(store: crate::state::AppStore, x: f32, y: f32) {
+    let Some(mut view) = rinch::prelude::untracked(|| store.link_picker.get()) else { return };
+    if (view.x, view.y) != (x, y) {
+        view.x = x;
+        view.y = y;
+        store.link_picker.set(Some(view));
+    }
+}
+
+/// Pick row `index` (the highlighted one for Enter): make the link in
+/// `handle`'s document, or remove it, and close. Answers whether anything
+/// was picked.
+pub fn accept(store: crate::state::AppStore, handle: &EditorHandle, index: usize) -> bool {
+    let Some(view) = rinch::prelude::untracked(|| store.link_picker.get()) else { return false };
+    let Some(row) = view.rows.get(index).cloned() else { return false };
+    close(store);
+    match (view.kind, &row) {
+        (PickerKind::Selection { from, to, .. }, PickerRow::RemoveLink) => handle.update(move |state| {
+            // The mark exactly as it is on the text: removal matches attrs too.
+            let link = state.doc.node_at(from)?.marks().iter().find(|m| m.type_name() == "link")?.clone();
+            let mut tr = state.tr();
+            tr.remove_mark(from, to, link).ok()?;
+            Some(tr)
+        }),
+        (PickerKind::Selection { from, to, .. }, row) => insert_link(handle, from, to, "", &row.href(), true),
+        (PickerKind::Typed { from }, row) => {
+            let to = handle.selection().head().0;
+            insert_link(handle, from, to, &row.link_text(&view.query), &row.href(), false)
+        }
+    }
+}
+
+/// `view`'s rows for its query and the last answer, "Remove Link" first
+/// when a link is being edited.
+fn rebuilt(store: crate::state::AppStore, mut view: PickerView) -> PickerView {
+    let store_name = |id: StoreId| store.get_store_signal(id).map(|sig| rinch::prelude::untracked(|| sig.with(|s| s.name.clone())));
+    let mut rows = HITS.with(|h| picker_rows(&view.query, &h.borrow(), store_name));
+    if let PickerKind::Selection { editing: true, .. } = view.kind {
+        rows.insert(0, PickerRow::RemoveLink);
+    }
+    view.selected = view.selected.min(rows.len().saturating_sub(1));
+    view.rows = rows;
+    view
 }
 
 /// The highlighted row after `step` (+1 down, -1 up) from `selected` among
@@ -201,6 +356,50 @@ mod tests {
             runs(&handle),
             vec![("read ".into(), None), ("the plan".into(), Some("https://example.com".into())), (" today".into(), None)]
         );
+    }
+
+    #[test]
+    fn a_typed_pick_follows_the_answer_and_links_the_title() {
+        let store = crate::state::AppStore::new();
+        let handle = crate::rinch_editor::create_editor();
+        typed(&handle, "see [[pla");
+        let (s, a, b) = (StoreId::new(), NodeId::new(), NodeId::new());
+
+        open(store, PickerKind::Typed { from: 5 }, 10.0, 20.0);
+        set_query(store, "pla".into());
+        assert!(store.link_picker.get().unwrap().rows.is_empty(), "nothing answered yet");
+        search_answered(store, &Ok(vec![hit(s, a, "Plan"), hit(s, b, "Plants")]));
+        step(store, 1);
+        let view = store.link_picker.get().unwrap();
+        assert_eq!((view.rows.len(), view.selected, view.x, view.y), (2, 1, 10.0, 20.0));
+
+        assert!(accept(store, &handle, 1));
+        assert_eq!(store.link_picker.get(), None, "a pick closes it");
+        let href = format!("pimble:{s}/{b}");
+        assert_eq!(runs(&handle), vec![("see ".into(), None), ("Plants".into(), Some(href))]);
+
+        // An answer after it closed changes nothing.
+        search_answered(store, &Ok(vec![hit(s, a, "Plan")]));
+        assert_eq!(store.link_picker.get(), None);
+    }
+
+    #[test]
+    fn a_selection_is_linked_as_it_is_and_an_edited_link_can_be_removed() {
+        let store = crate::state::AppStore::new();
+        let handle = crate::rinch_editor::create_editor();
+        typed(&handle, "read the plan today");
+        open(store, PickerKind::Selection { from: 6, to: 14, editing: false }, 0.0, 0.0);
+        set_query(store, "example.com".into());
+        assert!(accept(store, &handle, 0));
+        assert_eq!(
+            runs(&handle),
+            vec![("read ".into(), None), ("the plan".into(), Some("https://example.com".into())), (" today".into(), None)]
+        );
+
+        open(store, PickerKind::Selection { from: 6, to: 14, editing: true }, 0.0, 0.0);
+        assert_eq!(store.link_picker.get().unwrap().rows, vec![PickerRow::RemoveLink]);
+        assert!(accept(store, &handle, 0));
+        assert_eq!(runs(&handle), vec![("read the plan today".into(), None)]);
     }
 
     #[test]

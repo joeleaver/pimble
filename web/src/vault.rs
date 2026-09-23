@@ -1211,9 +1211,9 @@ impl VaultClient {
         signal_ui: &Arc<dyn Fn() + Send + Sync>,
     ) -> Handled {
         // A search spans every store, so it is decided before the store id is.
-        if let BackendCommand::Search { query, stores, limit } = &cmd {
+        if let BackendCommand::Search { query, stores, limit, purpose } = &cmd {
             if stores.iter().any(|id| self.owns(*id)) {
-                let event = self.search(client, query, stores, *limit).await;
+                let event = self.search(client, query, stores, *limit, *purpose).await;
                 return Handled::Yes(Some(event));
             }
             return Handled::No(cmd);
@@ -2133,10 +2133,11 @@ impl VaultClient {
         query: &str,
         stores: &[StoreId],
         limit: usize,
+        purpose: pimble_app::protocol::SearchPurpose,
     ) -> BackendEvent {
         let needle = query.trim().to_lowercase();
         if needle.is_empty() {
-            return BackendEvent::SearchResults { results: Ok(Vec::new()) };
+            return BackendEvent::SearchResults { purpose, results: Ok(Vec::new()) };
         }
 
         let mut results = Vec::new();
@@ -2181,7 +2182,7 @@ impl VaultClient {
 
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(limit);
-        BackendEvent::SearchResults { results: Ok(results) }
+        BackendEvent::SearchResults { purpose, results: Ok(results) }
     }
 }
 
