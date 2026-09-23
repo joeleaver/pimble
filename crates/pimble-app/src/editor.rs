@@ -68,6 +68,7 @@ pub(crate) fn start_editing(
     // mounts, so apply the app's scheme here, once a document is opened.
     handle.set_dark_mode(untracked(|| store.dark_mode.get()));
     handle.stop_collaboration(); // end any prior node's session
+    crate::links::set_app_store(store);
     // Links (docs/LINKS_CONTRACT.md): Ctrl/Cmd+click follows one, a plain
     // click places the caret as ever; resting on one shows where it leads.
     handle.on_link_click(move |click| {
@@ -152,6 +153,13 @@ pub(crate) fn start_editing(
 
     store.active_edit.set(Some(ActiveEdit { store_id, node_id }));
     store.editor_dirty.set(false);
+    // A followed deep link into this note: its spot, now that the session
+    // holds the content.
+    let arrived = untracked(|| store.pending_anchor.get()).filter(|(s, n, _)| (*s, *n) == (store_id, node_id));
+    if let Some((_, _, anchor)) = arrived {
+        store.pending_anchor.set(None);
+        crate::links::place_anchor(&handle, &anchor);
+    }
     // See edits from other clients.
     store.send(BackendCommand::SubscribeNodeChanges { store_id, node_id });
     // Offline-first open: the session started from the cached bytes above

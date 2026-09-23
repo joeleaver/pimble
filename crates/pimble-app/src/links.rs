@@ -20,6 +20,122 @@ impl Plugin for LinksPlugin {
     fn input_rules(&self) -> Vec<InputRule> {
         vec![autolink_rule()]
     }
+
+    fn keymap(&self) -> Vec<(rinch_editor_core::KeyBinding, &'static str)> {
+        rinch_editor_core::KeyBinding::parse("Mod-Shift-l").map(|k| (k, COPY_LINK_HERE)).into_iter().collect()
+    }
+
+    fn commands(&self) -> Vec<(&'static str, rinch_editor_core::Command)> {
+        // A command runs while the editor is mid-dispatch: reading the
+        // handle waits a turn.
+        vec![(
+            COPY_LINK_HERE,
+            std::rc::Rc::new(|_state, dispatch| {
+                if dispatch.is_some() {
+                    rinch::prelude::set_timeout(0, || {
+                        if let Some(store) = APP_STORE.with(|s| s.get()) {
+                            copy_link_here(store);
+                        }
+                    });
+                }
+                true
+            }),
+        )]
+    }
+}
+
+/// The command "Copy Link to Here" is bound to (Ctrl/Cmd+Shift+L).
+const COPY_LINK_HERE: &str = "pimbleCopyLinkHere";
+
+thread_local! {
+    /// The app's store, for the editor's own commands (set by
+    /// `editor::start_editing`; an `AppStore` is a handful of signal ids).
+    static APP_STORE: std::cell::Cell<Option<crate::state::AppStore>> = const { std::cell::Cell::new(None) };
+}
+
+/// Let the editor's commands reach the app.
+pub fn set_app_store(store: crate::state::AppStore) {
+    APP_STORE.with(|s| s.set(Some(store)));
+}
+
+/// "Copy Link to Here" (docs/LINKS_CONTRACT.md "Making a link"): a deep link
+/// to the caret in the open note, its sticky position from the
+/// collaboration session and a quote of the words after it.
+pub fn copy_link_here(store: crate::state::AppStore) {
+    let Some(active) = rinch::prelude::untracked(|| store.active_edit.get()) else { return };
+    let handle = crate::editor::editor();
+    let head = handle.selection().head();
+    let sticky = handle.collab_sticky_index(head);
+    let after = text_after(&handle.doc(), head);
+    let url = pimble_core::PimbleUrl::deep(active.store_id, active.node_id, pimble_core::Anchor::new(sticky, &after));
+    match copy_text(&url.to_string()) {
+        Ok(()) => crate::events::show_notice(store, "Link to here copied.".to_string()),
+        Err(e) => crate::events::show_notice(store, format!("The link could not be copied: {e}")),
+    }
+}
+
+/// The text after `pos` in its textblock, an inline atom as U+FFFC (as the
+/// collaboration projection holds it, so a quote matches there).
+fn text_after(doc: &rinch_editor_core::Node, pos: Pos) -> String {
+    let Ok(resolved) = doc.resolve(pos) else { return String::new() };
+    let parent = resolved.parent();
+    let mut text = String::new();
+    for i in 0..parent.child_count() {
+        let child = parent.child(i);
+        match child.text() {
+            Some(t) => text.push_str(t),
+            None => text.push('\u{fffc}'),
+        }
+    }
+    text.chars().skip(resolved.parent_offset()).collect()
+}
+
+/// The model position of `spot` in `doc`: the `textblock`-th textblock in
+/// document order and a character offset into it, clamped to its end. The
+/// inverse of what a deep link's anchor names (`pimble_crdt::Spot`).
+pub fn pos_of_spot(doc: &rinch_editor_core::Node, spot: pimble_crdt::Spot) -> Option<Pos> {
+    fn walk(node: &rinch_editor_core::Node, content_start: usize, seen: &mut usize, spot: pimble_crdt::Spot) -> Option<Pos> {
+        let mut at = content_start;
+        for i in 0..node.child_count() {
+            let child = node.child(i);
+            if child.is_textblock() {
+                if *seen == spot.textblock {
+                    return Some(Pos(at + 1 + spot.offset.min(child.content_size())));
+                }
+                *seen += 1;
+            } else if !child.is_leaf() {
+                if let Some(pos) = walk(child, at + 1, seen, spot) {
+                    return Some(pos);
+                }
+            }
+            at += child.node_size();
+        }
+        None
+    }
+    walk(doc, 0, &mut 0, spot)
+}
+
+/// Put the caret at a followed deep link's spot in the note just opened,
+/// with the quoted words selected so the eye finds it
+/// (docs/LINKS_CONTRACT.md "Following a link"). The spot is found the way
+/// `NodeDoc::resolve_anchor` finds it, in the session's own content; the top
+/// of the note when it is found nowhere.
+pub fn place_anchor(handle: &crate::rinch_editor::EditorHandle, anchor: &pimble_core::Anchor) {
+    let Some(snapshot) = handle.collab_snapshot() else { return };
+    let Ok(content) = pimble_crdt::NodeDoc::load(&snapshot) else { return };
+    let doc = handle.doc();
+    let Some(from) = content.resolve_anchor(anchor).and_then(|found| pos_of_spot(&doc, found.spot())) else {
+        return;
+    };
+    let quoted = anchor.quote.chars().count();
+    let block_end = doc.resolve(from).map(|r| from.0 + (r.parent().content_size() - r.parent_offset())).unwrap_or(from.0);
+    let to = Pos((from.0 + quoted).min(block_end));
+    let selection = if to.0 > from.0 {
+        rinch_editor_core::selection::Selection::text(from, to)
+    } else {
+        rinch_editor_core::selection::Selection::cursor(from)
+    };
+    handle.set_selection(selection);
 }
 
 /// Follow a clicked link's `href` (docs/LINKS_CONTRACT.md "One experience
@@ -270,6 +386,50 @@ mod tests {
         }
         OPENED.with(|opened| assert_eq!(opened.borrow().len(), 1, "nothing else was opened"));
         assert!(commands.try_recv().is_err());
+    }
+
+    /// An anchor made from the session's content, then the note typed into
+    /// before it: opening the link puts the caret where the words went and
+    /// selects them; Copy Link to Here's quote is what follows the caret.
+    #[test]
+    fn a_deep_link_lands_on_its_words_after_edits_before_them() {
+        let handle = crate::rinch_editor::create_editor();
+        let typed = |text: &'static str, at: usize| {
+            assert!(handle.update(move |s| {
+                let mut tr = s.tr();
+                tr.set_selection(rinch_editor_core::selection::Selection::cursor(Pos(at)));
+                tr.insert_text(text).ok()?;
+                Some(tr)
+            }));
+        };
+        typed("the part that matters", 1);
+        handle.start_collaboration_host(|_| {}).expect("a session");
+        let content = pimble_crdt::NodeDoc::load(&handle.collab_snapshot().unwrap()).unwrap();
+        let anchor = content.anchor_at(pimble_crdt::Spot { textblock: 0, offset: 4 }).unwrap();
+        assert_eq!(anchor.quote, "part that matters");
+        assert_eq!(text_after(&handle.doc(), Pos(5)), "part that matters");
+
+        typed("first, ", 1);
+        place_anchor(&handle, &anchor);
+        let selection = handle.selection();
+        assert_eq!((selection.from(), selection.to()), (Pos(12), Pos(29)), "the quoted words, moved by what was typed before them");
+    }
+
+    #[test]
+    fn a_spot_names_the_nth_textblock_in_document_order_lists_included() {
+        use rinch_editor_core::{Fragment, Schema};
+        let schema = Schema::starter_kit();
+        let para = |t: &str| schema.branch("paragraph", Fragment::from_node(schema.text(t).unwrap())).unwrap();
+        let item = |t: &str| schema.branch("list_item", Fragment::from_children(vec![para(t)])).unwrap();
+        let list = schema.branch("bullet_list", Fragment::from_children(vec![item("one"), item("two")])).unwrap();
+        let doc = schema.branch(&schema.top_node, Fragment::from_children(vec![para("intro"), list, para("end")])).unwrap();
+        let spot = |textblock, offset| pimble_crdt::Spot { textblock, offset };
+        for (s, word) in [(spot(0, 0), "intro"), (spot(1, 0), "one"), (spot(2, 1), "wo"), (spot(3, 0), "end")] {
+            let pos = pos_of_spot(&doc, s).unwrap();
+            assert_eq!(text_after(&doc, pos), word, "{s:?}");
+        }
+        assert_eq!(text_after(&doc, pos_of_spot(&doc, spot(0, 99)).unwrap()), "", "an offset past the end is its end");
+        assert_eq!(pos_of_spot(&doc, spot(4, 0)), None);
     }
 
     #[test]

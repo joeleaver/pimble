@@ -83,8 +83,9 @@ pimble:<store uuid>/<node uuid>#<anchor>
    the first place the quote reads (the anchored characters were deleted and the words
    written elsewhere: a paragraph cut and pasted, or rewritten wholesale, and yrs
    resolves a deleted character to where it was); else the sticky index (the words were
-   edited in place); else the top. Put the caret there, scroll it
-   into view, and highlight the block's line briefly (about 1.5 s).
+   edited in place); else the top. The quoted words are selected, which is the highlight
+   (`links::place_anchor`, built 2026-09-23, when the note's session starts); scrolling
+   them into view waits for rinch PR 5.
 
 Following never writes to the target: a reader can deep-link into a node they may only
 read.
@@ -135,7 +136,9 @@ ever leaves the app without the modifier.
   clipboard on the desktop, `navigator.clipboard` in the browser; "Link copied." in the
   status bar).
   **Copy Link to Here** (editor context menu and Ctrl+Shift+L) copies a deep link to the
-  caret.
+  caret. Ctrl+Shift+L is built (2026-09-23, `LinksPlugin`'s keymap, `links::copy_link_here`
+  on rinch PR joeleaver/rinch#900's `collab_sticky_index`; checked in the app); the
+  editor context menu item is not.
 - **Paste**: plain text that parses as a Pimble URL or an `http(s)` URL, pasted over a
   selection, links the selection. With no selection, a Pimble URL inserts the target's
   title (or the quote, for a deep link) linked to it, and a web URL inserts itself,
