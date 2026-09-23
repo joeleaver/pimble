@@ -382,6 +382,19 @@ fn copy_as_mount_source(store: AppStore, value: &str) {
     bump_tree_after_menu_closes(store);
 }
 
+/// "Copy Link" (docs/LINKS_CONTRACT.md "Making a link"): the row's node, or a
+/// store row's root, as a `pimble:` link on the system clipboard. Through a
+/// mount the value names the source store's node, as every address does.
+fn copy_link(store: AppStore, value: &str) {
+    let Some((s_id, node_id_opt)) = parse_tree_value(value) else { return };
+    let Some(node_id) = node_id_opt.or_else(|| store.root_node_id(s_id)) else { return };
+    let url = pimble_core::PimbleUrl::node(s_id, node_id).to_string();
+    match crate::links::copy_text(&url) {
+        Ok(()) => crate::events::show_notice(store, "Link copied.".to_string()),
+        Err(e) => crate::events::show_notice(store, format!("The link could not be copied: {e}")),
+    }
+}
+
 /// Re-render every row's context menu (so "Paste Mount Here" reads its fresh
 /// `disabled` value: every row's `TreeNodeData` carries that flag) **after**
 /// the menu item's click has finished, never inside it.
@@ -1502,6 +1515,10 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 let nv = nv_ctx.clone();
                 move || copy_as_mount_source(store, &nv)
             };
+            let on_copy_link = {
+                let nv = nv_ctx.clone();
+                move || copy_link(store, &nv)
+            };
             // "Paste Mount Here" is always rendered, disabled while nothing is
             // copied, because a `DropdownMenuItem`'s `disabled` is a value
             // snapshotted at render time rather than a reactive one.
@@ -1823,6 +1840,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                     "Mount Remote Store Here..."
                                 }
                             }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::Link,
+                                onclick: on_copy_link.clone(),
+                                "Copy Link"
+                            }
                             if mounts_apply {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::Copy,
@@ -2008,6 +2030,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                     onclick: on_mount_remote_store.clone(),
                                     "Mount Remote Store Here..."
                                 }
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::Link,
+                                onclick: on_copy_link.clone(),
+                                "Copy Link"
                             }
                             if mounts_apply {
                                 DropdownMenuItem {

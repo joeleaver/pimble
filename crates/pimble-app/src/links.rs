@@ -22,6 +22,27 @@ impl Plugin for LinksPlugin {
     }
 }
 
+/// Put `text` on the system clipboard: rinch's clipboard on the desktop, the
+/// browser's (`navigator.clipboard`, which answers later; a refusal is
+/// logged) in the web build.
+pub fn copy_text(text: &str) -> Result<(), String> {
+    #[cfg(feature = "native")]
+    {
+        rinch::clipboard::copy_text(text).map_err(|e| e.to_string())
+    }
+    #[cfg(not(feature = "native"))]
+    {
+        let window = web_sys::window().ok_or("no window")?;
+        let promise = window.navigator().clipboard().write_text(text);
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = wasm_bindgen_futures::JsFuture::from(promise).await {
+                tracing::warn!("copying to the clipboard was refused: {e:?}");
+            }
+        });
+        Ok(())
+    }
+}
+
 /// `text` as a web link's href, or `None`: an `http:`/`https:` URL with a
 /// host, or a bare domain with a path or not (`example.com/x`), which
 /// becomes `https://`. What the Ctrl+L picker offers as "Link to <url>" and

@@ -130,7 +130,10 @@ ever leaves the app without the modifier.
   to a node or a URL;
   with the caret inside a link it offers "Remove Link" and "Edit Link" (the picker again).
   With nothing selected and not in a link it does nothing.
-- **Copy Link** on a tree row puts `pimble:<store>/<node>` on the system clipboard.
+- **Copy Link** on a tree row puts `pimble:<store>/<node>` on the system clipboard (a
+  store row: its root; built 2026-09-23, `app.rs` `copy_link`, `links::copy_text`: rinch's
+  clipboard on the desktop, `navigator.clipboard` in the browser; "Link copied." in the
+  status bar).
   **Copy Link to Here** (editor context menu and Ctrl+Shift+L) copies a deep link to the
   caret.
 - **Paste**: plain text that parses as a Pimble URL or an `http(s)` URL, pasted over a

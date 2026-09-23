@@ -58,8 +58,9 @@ rinch-web = { git = "https://github.com/joeleaver/rinch.git", branch = "main", f
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 # `persistence.rs` remembers the theme choice in `localStorage`, which is the
-# browser's equivalent of the desktop's `state.json`.
-web-sys = { version = "0.3", optional = true, features = ["Window", "Storage"] }
+# browser's equivalent of the desktop's `state.json`; `links.rs` copies a link
+# with `navigator.clipboard`.
+web-sys = { version = "0.3", optional = true, features = ["Window", "Storage", "Navigator", "Clipboard"] }
 
 [features]
 # `native` is the desktop app: the embedded server, the tokio backend thread,
