@@ -43,17 +43,26 @@ Later the same day, on the same branch:
   `follow_href` (Pimble link resolved, web link opened with `open`/`window.open`),
   `LinksPlugin` (a typed URL + space links it), link styling in both themes, "Copy Link"
   on every tree row (checked in the app with `wl-paste`).
-- **rinch**: PR 1 (link click and hover) is being built by an agent on branch
-  `feat/editor-link-events` of a scratch clone; issue joeleaver/rinch#891 filed (an
-  `::after` in the editor misplaces the caret; the web-link arrow waits for it).
-- Still to do in wave 3 once rinch has the hooks: Ctrl+click and hover (PR 1), the `[[` and
-  Ctrl+L picker (PR 2), paste (PR 3), deep links in the live editor (PRs 4, 5), links
-  that do not grow (PR 6).
-- Checked: `pimble-crdt` 131 tests (new: links, anchors, `became` within and between
-  stores), the server's index-links test, the web crate's vault tests (47) and its
-  wasm32 check. Three full release runs (`--workspace --release`): the first two each had
-  one flake, a different test each time, both unrelated and passing on re-runs ("A flake to
-  watch"); the third was clean, 662 passed.
+- **rinch, the six PRs** (all open on joeleaver/rinch, none merged): #892 link click and
+  hover; #916 caret rect, editor key hook, selection and caret-moved notices (the
+  picker's needs); #915 paste hook; #900 collab sticky positions; #901 a non-inclusive
+  link mark; PR 5 (programmatic focus and scroll-into-view) not started (it overlaps
+  #916's code). Pimble's rinch deps point at the integration branch **`pimble/links`**
+  (main 4f7496f + #892 + #900 + #901 + #915; #916 being merged in, its conflicts with
+  #892 are in `handle.rs`). When they merge upstream, go back to `main`. Issues filed:
+  #891 (`::after` in the editor misplaces the caret; the web-link arrow waits for it),
+  #893 (a fixed box does not shrink to fit; the link tooltip is too wide).
+- **Built in pimble on top of them**: hover tooltip and Ctrl/Cmd+click (`editor.rs`,
+  `links::hover_link`, `follow_href`), Copy Link to Here (Ctrl+Shift+L), a followed deep
+  link selecting its words (`place_anchor`), pasting a link (`LinksPlugin::handle_paste`),
+  the picker's logic (`link_picker.rs`), `pimble-cli append-link`.
+- **Not checked by hand**: a real Ctrl+click (the debug port cannot hold a modifier on a
+  click) and a real paste (a window driven over the debug port reads nothing from the
+  Wayland clipboard). Joe's own try in the app is the check.
+- **Next**: finish the `pimble/links` merge of #916, then the picker's popup (`[[` and
+  Ctrl+L: `on_key`, `on_selection_change`, `on_caret_moved` + `caret_rect`, rows from
+  `link_picker`), then PR 5 and scrolling to a deep link's spot, then the walk-through
+  (wave 4). The hover underline does not show on the desktop (not yet filed).
 
 ## 2026-09-23: desktop performance, released as v0.4.0 (branch `perf/gpu-and-caret`)
 
