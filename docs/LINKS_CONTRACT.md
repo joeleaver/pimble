@@ -143,6 +143,11 @@ ever leaves the app without the modifier.
   selection, links the selection. With no selection, a Pimble URL inserts the target's
   title (or the quote, for a deep link) linked to it, and a web URL inserts itself,
   linked.
+  Built 2026-09-23 on rinch PR joeleaver/rinch#915 (`Plugin::handle_paste`):
+  `LinksPlugin::handle_paste`, `pasted_link`, sharing `link_picker::link_transaction` with
+  the picker; a bare domain pasted is words, not a link; an unknown note goes in as
+  "link". Tested through `EditorHandle::paste`; not checked by hand (a window driven from
+  the debug port cannot read the Wayland clipboard: the search box does not paste either).
 - **Typing a web URL** followed by a space links it (`LinksPlugin`'s input rule in
   `crates/pimble-app/src/links.rs`, built 2026-09-23): an `http(s)` URL only, sentence
   punctuation after it left out, the words after it not linked. Ctrl+Z right after takes

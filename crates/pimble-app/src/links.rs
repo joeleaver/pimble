@@ -21,6 +21,16 @@ impl Plugin for LinksPlugin {
         vec![autolink_rule()]
     }
 
+    /// A pasted link (docs/LINKS_CONTRACT.md "Making a link"): a Pimble or
+    /// web URL pasted over selected words links them; with nothing selected
+    /// it goes in as linked words: a note's title (or a deep link's quote), a
+    /// web link's URL. Anything else is pasted as ever.
+    fn handle_paste(&self, state: &rinch_editor_core::state::EditorState, paste: &rinch_editor_core::PasteContent) -> Option<rinch_editor_core::state::Transaction> {
+        let (href, words) = pasted_link(paste.text.as_deref()?)?;
+        let (from, to) = (state.selection.from().0, state.selection.to().0);
+        crate::link_picker::link_transaction(state, from, to, &words, &href, from < to)
+    }
+
     fn keymap(&self) -> Vec<(rinch_editor_core::KeyBinding, &'static str)> {
         rinch_editor_core::KeyBinding::parse("Mod-Shift-l").map(|k| (k, COPY_LINK_HERE)).into_iter().collect()
     }
@@ -42,6 +52,31 @@ impl Plugin for LinksPlugin {
             }),
         )]
     }
+}
+
+/// What a pasted text links to and the words it goes in as, when it is a
+/// link: a `pimble:` URL (its note's title as the app knows it, a deep
+/// link's quote, or "link") or an `http(s)` URL (itself). A bare domain is
+/// not taken as a link when pasted: it may be meant as words.
+fn pasted_link(text: &str) -> Option<(String, String)> {
+    let text = text.trim();
+    if text.is_empty() || text.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if let Some(url) = pimble_core::PimbleUrl::parse(text) {
+        let quote = url.anchor.as_ref().map(|a| a.quote.trim().to_string()).filter(|q| !q.is_empty());
+        let title = APP_STORE.with(|s| s.get()).and_then(|store| {
+            let known = rinch::prelude::untracked(|| store.node_data.with(|map| map.contains_key(&(url.store, url.node))));
+            known.then(|| store.display_label(url.store, url.node))
+        });
+        let words = quote.or(title).unwrap_or_else(|| "link".to_string());
+        return Some((url.to_string(), words));
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return web_url(text).map(|href| (href, text.to_string()));
+    }
+    None
 }
 
 /// The command "Copy Link to Here" is bound to (Ctrl/Cmd+Shift+L).
@@ -430,6 +465,77 @@ mod tests {
         }
         assert_eq!(text_after(&doc, pos_of_spot(&doc, spot(0, 99)).unwrap()), "", "an offset past the end is its end");
         assert_eq!(pos_of_spot(&doc, spot(4, 0)), None);
+    }
+
+    /// Each run of the first paragraph with its link's href.
+    fn handle_runs(handle: &crate::rinch_editor::EditorHandle) -> Vec<(String, Option<String>)> {
+        let doc = handle.doc();
+        let para = doc.child(0);
+        (0..para.child_count())
+            .map(|i| {
+                let run = para.child(i);
+                let href = run.marks().iter().find(|m| m.type_name() == "link").and_then(|m| m.attrs.get_str("href")).map(str::to_string);
+                (run.text().unwrap_or_default().to_string(), href)
+            })
+            .collect()
+    }
+
+    fn editor_with(text: &'static str) -> crate::rinch_editor::EditorHandle {
+        let handle = crate::rinch_editor::create_editor();
+        handle.add_plugin(std::rc::Rc::new(LinksPlugin));
+        assert!(handle.update(move |s| {
+            let mut tr = s.tr();
+            tr.insert_text(text).ok()?;
+            Some(tr)
+        }));
+        handle
+    }
+
+    fn select(handle: &crate::rinch_editor::EditorHandle, from: usize, to: usize) {
+        handle.set_selection(rinch_editor_core::selection::Selection::text(Pos(from), Pos(to)));
+    }
+
+    #[test]
+    fn a_link_pasted_over_words_links_them_and_one_pasted_alone_goes_in_linked() {
+        use rinch_editor_core::PasteContent;
+        let (s, n) = (pimble_core::StoreId::new(), pimble_core::NodeId::new());
+        let pimble = pimble_core::PimbleUrl::node(s, n).to_string();
+
+        let handle = editor_with("read the plan today");
+        select(&handle, 6, 14);
+        assert!(handle.paste(&PasteContent::text(format!(" {pimble} "))));
+        assert_eq!(handle_runs(&handle), vec![("read ".into(), None), ("the plan".into(), Some(pimble.clone())), (" today".into(), None)]);
+
+        let handle = editor_with("see ");
+        assert!(handle.paste(&PasteContent::text("https://example.com/a".to_string())));
+        assert!(handle.update(|s| {
+            let mut tr = s.tr();
+            tr.insert_text(" next").ok()?;
+            Some(tr)
+        }));
+        assert_eq!(
+            handle_runs(&handle),
+            vec![("see ".into(), None), ("https://example.com/a".into(), Some("https://example.com/a".into())), (" next".into(), None)]
+        );
+
+        // A deep link goes in as its quote; an unknown note as "link".
+        let deep = pimble_core::PimbleUrl::deep(s, n, pimble_core::Anchor::new(None, "the spot")).to_string();
+        let handle = editor_with("");
+        assert!(handle.paste(&PasteContent::text(deep.clone())));
+        assert_eq!(handle_runs(&handle), vec![("the spot".into(), Some(deep))]);
+        let handle = editor_with("");
+        assert!(handle.paste(&PasteContent::text(pimble.clone())));
+        assert_eq!(handle_runs(&handle), vec![("link".into(), Some(pimble))]);
+    }
+
+    #[test]
+    fn anything_else_pastes_as_ever() {
+        use rinch_editor_core::PasteContent;
+        for text in ["example.com", "two words", "javascript:alert(1)"] {
+            let handle = editor_with("x ");
+            assert!(handle.paste(&PasteContent::text(text.to_string())));
+            assert_eq!(handle_runs(&handle), vec![(format!("x {text}"), None)], "{text:?}");
+        }
     }
 
     #[test]

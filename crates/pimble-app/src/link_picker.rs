@@ -86,33 +86,43 @@ pub fn step_selection(selected: usize, len: usize, step: isize) -> usize {
 ///
 /// Answers whether the editor took the change.
 pub fn insert_link(handle: &EditorHandle, from: usize, to: usize, text: &str, href: &str, keep_text: bool) -> bool {
-    let href = href.to_string();
-    let text = text.to_string();
-    handle.update(move |state| {
-        let link_type = state.schema().mark_type("link")?.clone();
-        let link = Mark::new(link_type, Attrs::from_iter([("href", AttrValue::from(href))]));
-        let mut tr = state.tr();
-        if keep_text {
-            tr.add_mark(from, to, link).ok()?;
-            return Some(tr);
-        }
-        let kept: Vec<Mark> = state
-            .doc
-            .resolve(rinch_editor_core::Pos(from))
-            .ok()?
-            .marks()
-            .into_iter()
-            .filter(|m| m.type_name() != "link")
-            .collect();
-        let mut marks = kept.clone();
-        marks.push(link);
-        let node = state.schema().text_with_marks(&text, marks).ok()?;
-        let end = from + node.text_len();
-        tr.replace_with(from, to, Fragment::from_node(node)).ok()?;
-        tr.set_selection(rinch_editor_core::selection::Selection::cursor(rinch_editor_core::Pos(end)));
-        tr.set_stored_marks(Some(kept));
-        Some(tr)
-    })
+    let (text, href) = (text.to_string(), href.to_string());
+    handle.update(move |state| link_transaction(state, from, to, &text, &href, keep_text))
+}
+
+/// The transaction [`insert_link`] dispatches, for whoever holds the state
+/// rather than the handle (the paste hook, which runs mid-dispatch).
+pub fn link_transaction(
+    state: &rinch_editor_core::state::EditorState,
+    from: usize,
+    to: usize,
+    text: &str,
+    href: &str,
+    keep_text: bool,
+) -> Option<rinch_editor_core::state::Transaction> {
+    let link_type = state.schema().mark_type("link")?.clone();
+    let link = Mark::new(link_type, Attrs::from_iter([("href", AttrValue::from(href.to_string()))]));
+    let mut tr = state.tr();
+    if keep_text {
+        tr.add_mark(from, to, link).ok()?;
+        return Some(tr);
+    }
+    let kept: Vec<Mark> = state
+        .doc
+        .resolve(rinch_editor_core::Pos(from))
+        .ok()?
+        .marks()
+        .into_iter()
+        .filter(|m| m.type_name() != "link")
+        .collect();
+    let mut marks = kept.clone();
+    marks.push(link);
+    let node = state.schema().text_with_marks(text, marks).ok()?;
+    let end = from + node.text_len();
+    tr.replace_with(from, to, Fragment::from_node(node)).ok()?;
+    tr.set_selection(rinch_editor_core::selection::Selection::cursor(rinch_editor_core::Pos(end)));
+    tr.set_stored_marks(Some(kept));
+    Some(tr)
 }
 
 #[cfg(test)]
