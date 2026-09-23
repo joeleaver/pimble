@@ -59,10 +59,15 @@ Later the same day, on the same branch:
 - **Not checked by hand**: a real Ctrl+click (the debug port cannot hold a modifier on a
   click) and a real paste (a window driven over the debug port reads nothing from the
   Wayland clipboard). Joe's own try in the app is the check.
-- **Next**: finish the `pimble/links` merge of #916, then the picker's popup (`[[` and
-  Ctrl+L: `on_key`, `on_selection_change`, `on_caret_moved` + `caret_rect`, rows from
-  `link_picker`), then PR 5 and scrolling to a deep link's spot, then the walk-through
-  (wave 4). The hover underline does not show on the desktop (not yet filed).
+- **The picker is built and checked in the app** (`[[` and Ctrl+L, Remove Link);
+  `pimble/links` carries #916 (merge 30c9d7f).
+- **Next**: PR 5 (programmatic focus and scroll-into-view) and scrolling to a deep link's
+  spot, then the walk-through (wave 4). The hover underline does not show on the desktop
+  (not yet filed).
+- **Driving the app over the debug port**: `key_press` needs `"shift"` and `"ctrl"` in its
+  JSON (`{"key":"ArrowDown","shift":false,"ctrl":false}`); without them the command is
+  refused and `rd.py` prints nothing to say so. The scratchpad can vanish between
+  sessions: every rinch branch lives on GitHub, clone again when needed.
 
 ## 2026-09-23: desktop performance, released as v0.4.0 (branch `perf/gpu-and-caret`)
 

@@ -531,6 +531,48 @@ pub(crate) const APP_CSS: &str = "
     border-bottom: 1px solid var(--rinch-color-border);
 }
 
+/* The link picker (docs/LINKS_CONTRACT.md \"Making a link\"). */
+.pimble-link-picker {
+    position: fixed;
+    z-index: 1001;
+    width: 320px;
+    padding: 4px 0;
+    background: var(--rinch-color-surface);
+    border: 1px solid var(--rinch-color-border);
+    border-radius: 6px;
+    font-size: 13px;
+}
+.pimble-link-picker__query {
+    padding: 4px 10px 6px;
+    margin-bottom: 4px;
+    border-bottom: 1px solid var(--rinch-color-border);
+    color: var(--rinch-color-text);
+}
+.pimble-link-picker__row {
+    display: flex;
+    gap: 8px;
+    padding: 4px 10px;
+    cursor: pointer;
+}
+.pimble-link-picker__row--selected {
+    background: var(--rinch-color-option-hover);
+}
+.pimble-link-picker__label {
+    flex: 1;
+    color: var(--rinch-color-text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.pimble-link-picker__detail {
+    color: var(--rinch-color-dimmed);
+    white-space: nowrap;
+}
+.pimble-link-picker__empty {
+    padding: 4px 10px;
+    color: var(--rinch-color-dimmed);
+}
+
 /* The tooltip over a hovered link (docs/LINKS_CONTRACT.md). */
 .pimble-link-tooltip {
     position: fixed;

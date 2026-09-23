@@ -18,7 +18,7 @@ impl Plugin for LinksPlugin {
     }
 
     fn input_rules(&self) -> Vec<InputRule> {
-        vec![autolink_rule()]
+        vec![autolink_rule(), picker_rule()]
     }
 
     /// A pasted link (docs/LINKS_CONTRACT.md "Making a link"): a Pimble or
@@ -32,25 +32,35 @@ impl Plugin for LinksPlugin {
     }
 
     fn keymap(&self) -> Vec<(rinch_editor_core::KeyBinding, &'static str)> {
-        rinch_editor_core::KeyBinding::parse("Mod-Shift-l").map(|k| (k, COPY_LINK_HERE)).into_iter().collect()
+        [("Mod-Shift-l", COPY_LINK_HERE), ("Mod-l", OPEN_PICKER)]
+            .into_iter()
+            .filter_map(|(key, command)| rinch_editor_core::KeyBinding::parse(key).map(|k| (k, command)))
+            .collect()
     }
 
     fn commands(&self) -> Vec<(&'static str, rinch_editor_core::Command)> {
         // A command runs while the editor is mid-dispatch: reading the
         // handle waits a turn.
-        vec![(
-            COPY_LINK_HERE,
-            std::rc::Rc::new(|_state, dispatch| {
-                if dispatch.is_some() {
-                    rinch::prelude::set_timeout(0, || {
-                        if let Some(store) = APP_STORE.with(|s| s.get()) {
-                            copy_link_here(store);
-                        }
-                    });
-                }
-                true
-            }),
-        )]
+        vec![
+            (
+                COPY_LINK_HERE,
+                std::rc::Rc::new(|_state, dispatch| {
+                    if dispatch.is_some() {
+                        later(copy_link_here);
+                    }
+                    true
+                }),
+            ),
+            (
+                OPEN_PICKER,
+                std::rc::Rc::new(|_state, dispatch| {
+                    if dispatch.is_some() {
+                        later(|store| crate::link_picker::start_from_selection(store, &crate::editor::editor()));
+                    }
+                    true
+                }),
+            ),
+        ]
     }
 }
 
@@ -81,6 +91,32 @@ fn pasted_link(text: &str) -> Option<(String, String)> {
 
 /// The command "Copy Link to Here" is bound to (Ctrl/Cmd+Shift+L).
 const COPY_LINK_HERE: &str = "pimbleCopyLinkHere";
+
+/// The command Ctrl/Cmd+L runs: the link picker over the selection.
+const OPEN_PICKER: &str = "pimbleOpenLinkPicker";
+
+/// Run `f` with the app's store a turn later: an editor command or input
+/// rule runs mid-dispatch, and the handle is not to be touched until it ends.
+fn later(f: impl FnOnce(crate::state::AppStore) + 'static) {
+    rinch::prelude::set_timeout(0, move || {
+        if let Some(store) = APP_STORE.with(|s| s.get()) {
+            f(store);
+        }
+    });
+}
+
+/// Typing a second `[` right after a first opens the link picker there
+/// (docs/LINKS_CONTRACT.md "Making a link"). The rule types the bracket
+/// itself (its transaction replaces the plain insert) and opens the picker
+/// once the dispatch is over.
+fn picker_rule() -> InputRule {
+    InputRule::new(r"\[\[$", |state, _caps, start, _end| {
+        let mut tr = state.tr();
+        tr.insert_text("[").ok()?;
+        later(move |store| crate::link_picker::start_typed(store, &crate::editor::editor(), start));
+        Some(tr)
+    })
+}
 
 thread_local! {
     /// The app's store, for the editor's own commands (set by

@@ -127,6 +127,14 @@ ever leaves the app without the modifier.
   text as typed. Picking replaces `[[query` with the target's title linked to it, in one
   editor transaction (one undo step). Holding Alt (Option) while picking inserts only the
   link over the query text as typed.
+- **The picker is built** (2026-09-23, on rinch #916's `on_key`, `on_selection_change`,
+  `on_caret_moved`, `caret_rect`; `link_picker.rs`, `LinksPlugin`'s `[[` rule and Mod-L,
+  the popup in `app.rs`) and checked in the app: `[[vend`, Down, Enter makes "Vendors" a
+  link with the next words unlinked; Ctrl+L over a word, typing an address, Enter links
+  it; Ctrl+L on a link offers "Remove Link" first. In a Ctrl+L picker the query is typed
+  into the popup through `on_key` (the editor keeps focus, the same code on both
+  platforms); searches carry `SearchPurpose::LinkPicker` so the search panel never sees
+  them.
 - **Ctrl+L** with a selection opens the same picker (query empty) and links the selection
   to a node or a URL;
   with the caret inside a link it offers "Remove Link" and "Edit Link" (the picker again).

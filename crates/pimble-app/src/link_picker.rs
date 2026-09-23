@@ -221,6 +221,169 @@ fn rebuilt(store: crate::state::AppStore, mut view: PickerView) -> PickerView {
     view
 }
 
+/// One line of the popup, ready to draw.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PickerLine {
+    pub key: String,
+    pub index: usize,
+    pub label: String,
+    pub detail: String,
+    pub selected: bool,
+}
+
+/// The popup's lines for `view`.
+pub fn lines(view: &PickerView) -> Vec<PickerLine> {
+    view.rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let (label, detail) = match row {
+                PickerRow::RemoveLink => ("Remove Link".to_string(), String::new()),
+                PickerRow::Web { href } => (format!("Link to {href}"), "opens in the browser".to_string()),
+                PickerRow::Node { title, store_name, .. } => (
+                    if title.trim().is_empty() { "Untitled".to_string() } else { title.clone() },
+                    store_name.clone().unwrap_or_default(),
+                ),
+            };
+            PickerLine { key: format!("{index}:{label}"), index, label, detail, selected: index == view.selected }
+        })
+        .collect()
+}
+
+/// What the popup says with no rows.
+pub fn empty_line(view: &PickerView) -> &'static str {
+    if view.query.trim().is_empty() {
+        "Type to find a note, or a web address"
+    } else {
+        "No matches"
+    }
+}
+
+/// Ctrl/Cmd+L in the editor: link the selection, or edit the link the
+/// caret is in; nothing with a bare caret outside a link.
+pub fn start_from_selection(store: crate::state::AppStore, handle: &EditorHandle) {
+    let selection = handle.selection();
+    let (from, to) = (selection.from(), selection.to());
+    let (from, to, editing) = if from < to {
+        (from, to, handle.link_at(from).is_some())
+    } else if let Some(link) = handle.link_at(from) {
+        handle.set_selection(rinch_editor_core::selection::Selection::text(link.from, link.to));
+        (link.from, link.to, true)
+    } else {
+        return;
+    };
+    let (x, y) = below(handle.caret_rect(from).map(|r| (r.x, r.y, r.height)));
+    open(store, PickerKind::Selection { from: from.0, to: to.0, editing }, x, y);
+}
+
+/// `[[` was typed with its first bracket at `from`.
+pub fn start_typed(store: crate::state::AppStore, handle: &EditorHandle, from: usize) {
+    let (x, y) = below(handle.caret_rect(handle.selection().head()).map(|r| (r.x, r.y, r.height)));
+    open(store, PickerKind::Typed { from }, x, y);
+    // The picker opens a turn after the brackets: whatever was typed after
+    // them meanwhile is already its query.
+    match typed_query(&handle.doc(), from, handle.selection()) {
+        Some(query) => set_query(store, query),
+        None => close(store),
+    }
+}
+
+/// The editor's selection changed: a `[[` picker follows what is typed
+/// after the brackets and closes when the caret leaves them; a Ctrl+L
+/// picker closes when the selection moves at all.
+pub fn selection_changed(store: crate::state::AppStore, handle: &EditorHandle) {
+    let Some(view) = rinch::prelude::untracked(|| store.link_picker.get()) else { return };
+    match view.kind {
+        PickerKind::Selection { .. } => close(store),
+        PickerKind::Typed { from } => match typed_query(&handle.doc(), from, handle.selection()) {
+            Some(query) => set_query(store, query),
+            None => close(store),
+        },
+    }
+}
+
+/// The query of a `[[` picker whose brackets start at `from`, with the
+/// caret at `selection`: what follows the brackets, in the same textblock,
+/// up to the caret. `None` when the caret left it (before the brackets,
+/// another block, a range), the brackets are gone, or it grew past a line's
+/// worth.
+pub fn typed_query(doc: &rinch_editor_core::Node, from: usize, selection: rinch_editor_core::selection::Selection) -> Option<String> {
+    let head = selection.head().0;
+    if selection.from() != selection.to() || head < from + 2 {
+        return None;
+    }
+    let (Ok(start), Ok(end)) = (doc.resolve(rinch_editor_core::Pos(from)), doc.resolve(rinch_editor_core::Pos(head))) else {
+        return None;
+    };
+    if !start.parent().same_ref(end.parent()) {
+        return None;
+    }
+    let parent = start.parent();
+    let mut block = String::new();
+    for i in 0..parent.child_count() {
+        match parent.child(i).text() {
+            Some(t) => block.push_str(t),
+            None => block.push('\u{fffc}'),
+        }
+    }
+    let text: String = block.chars().skip(start.parent_offset()).take(end.parent_offset() - start.parent_offset()).collect();
+    if !text.starts_with("[[") {
+        return None;
+    }
+    let query: String = text.chars().skip(2).collect();
+    (query.chars().count() <= 80 && !query.contains("]]")).then_some(query)
+}
+
+/// A key the editor offers first: the open picker takes the ones that
+/// drive it, and in a Ctrl+L picker the typing that makes its query.
+/// Answers whether it took the key.
+pub fn key(store: crate::state::AppStore, handle: &EditorHandle, key: &str, modified: bool) -> bool {
+    let Some(view) = rinch::prelude::untracked(|| store.link_picker.get()) else { return false };
+    match key {
+        "ArrowDown" => step(store, 1),
+        "ArrowUp" => step(store, -1),
+        "Escape" => close(store),
+        "Enter" | "Tab" if !view.rows.is_empty() => {
+            accept(store, handle, view.selected);
+        }
+        "Enter" | "Tab" => close(store),
+        _ => match view.kind {
+            // A `[[` query is typed in the note itself.
+            PickerKind::Typed { .. } => return false,
+            PickerKind::Selection { .. } if key == "Backspace" => {
+                let mut query = view.query.clone();
+                query.pop();
+                set_query(store, query);
+            }
+            PickerKind::Selection { .. } if !modified && key.chars().count() == 1 => {
+                set_query(store, format!("{}{key}", view.query));
+            }
+            // Anything else (a shortcut, a caret move) closes it and goes on.
+            PickerKind::Selection { .. } => {
+                close(store);
+                return false;
+            }
+        },
+    }
+    true
+}
+
+/// The caret moved after layout (its rectangle is known now): a `[[`
+/// picker sits under it.
+pub fn caret_moved(store: crate::state::AppStore, handle: &EditorHandle) {
+    let Some(PickerView { kind: PickerKind::Typed { .. }, .. }) = rinch::prelude::untracked(|| store.link_picker.get()) else { return };
+    if let Some(rect) = handle.caret_rect(handle.selection().head()) {
+        let (x, y) = below(Some((rect.x, rect.y, rect.height)));
+        place(store, x, y);
+    }
+}
+
+/// Just under a caret rectangle `(x, y, height)`; the top left when there is
+/// none yet.
+fn below(rect: Option<(f32, f32, f32)>) -> (f32, f32) {
+    rect.map(|(x, y, h)| (x, y + h + 4.0)).unwrap_or((0.0, 0.0))
+}
+
 /// The highlighted row after `step` (+1 down, -1 up) from `selected` among
 /// `len` rows, wrapping at both ends.
 pub fn step_selection(selected: usize, len: usize, step: isize) -> usize {
@@ -400,6 +563,23 @@ mod tests {
         assert_eq!(store.link_picker.get().unwrap().rows, vec![PickerRow::RemoveLink]);
         assert!(accept(store, &handle, 0));
         assert_eq!(runs(&handle), vec![("read the plan today".into(), None)]);
+    }
+
+    #[test]
+    fn the_typed_query_is_what_follows_the_brackets_up_to_the_caret() {
+        use rinch_editor_core::selection::Selection;
+        use rinch_editor_core::Pos;
+        let handle = crate::rinch_editor::create_editor();
+        typed(&handle, "see [[ven dors");
+        let doc = handle.doc();
+        // The brackets are 5..7; the caret moves along the text.
+        assert_eq!(typed_query(&doc, 5, Selection::cursor(Pos(7))).as_deref(), Some(""));
+        assert_eq!(typed_query(&doc, 5, Selection::cursor(Pos(10))).as_deref(), Some("ven"));
+        assert_eq!(typed_query(&doc, 5, Selection::cursor(Pos(15))).as_deref(), Some("ven dors"));
+        assert_eq!(typed_query(&doc, 5, Selection::cursor(Pos(6))), None, "inside the brackets");
+        assert_eq!(typed_query(&doc, 5, Selection::cursor(Pos(3))), None, "before them");
+        assert_eq!(typed_query(&doc, 5, Selection::text(Pos(7), Pos(10))), None, "a range");
+        assert_eq!(typed_query(&doc, 4, Selection::cursor(Pos(10))), None, "no brackets there");
     }
 
     #[test]

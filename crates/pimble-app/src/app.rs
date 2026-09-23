@@ -734,6 +734,35 @@ struct SearchRow {
     kind: &'static str,
 }
 
+/// The link picker's lines (a bare call for the rsx `for`; see
+/// `search_rows`).
+fn picker_lines(store: AppStore) -> Vec<crate::link_picker::PickerLine> {
+    store.link_picker.with(|view| view.as_ref().map(crate::link_picker::lines).unwrap_or_default())
+}
+
+/// Whether the open picker shows its own query line (Ctrl+L: the query is
+/// typed into the popup, not the note).
+fn picker_is_field(store: AppStore) -> bool {
+    store.link_picker.with(|view| matches!(view.as_ref().map(|v| v.kind), Some(crate::link_picker::PickerKind::Selection { .. })))
+}
+
+/// The Ctrl+L picker's query line.
+fn picker_query_text(store: AppStore) -> String {
+    store.link_picker.with(|view| match view {
+        Some(view) if view.query.is_empty() => "Link to…".to_string(),
+        Some(view) => view.query.clone(),
+        None => String::new(),
+    })
+}
+
+/// What the open picker says with no rows; empty when it has some.
+fn picker_empty_text(store: AppStore) -> String {
+    store.link_picker.with(|view| match view {
+        Some(view) if view.rows.is_empty() => crate::link_picker::empty_line(view).to_string(),
+        _ => String::new(),
+    })
+}
+
 /// Resolve raw search hits into display-ready `SearchRow`s (looking up each
 /// store's name from already-cached signals — cheap, no new fetch). A plain
 /// function so the rsx `for`'s iterable expression is a bare call with no
@@ -3928,6 +3957,41 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             {|| store.link_hover.get().map(|tip| tip.target).unwrap_or_default()}
                         }
                         div { class: "pimble-link-tooltip__hint", {crate::links::OPEN_HINT} }
+                    }
+
+                    // The link picker (`[[` and Ctrl+L, docs/LINKS_CONTRACT.md
+                    // "Making a link"), under the caret. Keys reach it through
+                    // the editor (`link_picker::key`); a click picks a row.
+                    div {
+                        class: "pimble-link-picker",
+                        style: {|| match store.link_picker.get() {
+                            Some(view) => format!("left: {}px; top: {}px;", view.x, view.y),
+                            None => "display: none;".to_string(),
+                        }},
+                        div {
+                            class: "pimble-link-picker__query",
+                            style: {|| if picker_is_field(store) { "" } else { "display: none;" }},
+                            {|| picker_query_text(store)}
+                        }
+                        for line in picker_lines(store) {
+                            div {
+                                key: format!("{}:{}", line.key, line.selected),
+                                class: if line.selected { "pimble-link-picker__row pimble-link-picker__row--selected" } else { "pimble-link-picker__row" },
+                                onclick: {
+                                    let index = line.index;
+                                    move || {
+                                        crate::link_picker::accept(store, &crate::editor::editor(), index);
+                                    }
+                                },
+                                span { class: "pimble-link-picker__label", {line.label.clone()} }
+                                span { class: "pimble-link-picker__detail", {line.detail.clone()} }
+                            }
+                        }
+                        div {
+                            class: "pimble-link-picker__empty",
+                            style: {|| if picker_empty_text(store).is_empty() { "display: none;" } else { "" }},
+                            {|| picker_empty_text(store)}
+                        }
                     }
                 }
         };

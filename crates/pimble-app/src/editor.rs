@@ -79,6 +79,15 @@ pub(crate) fn start_editing(
         true
     });
     handle.on_link_hover(move |hover| crate::links::hover_link(store, hover));
+    // The link picker (`[[`, Ctrl+L): its keys come first, it follows the
+    // caret and the typing after the brackets.
+    crate::link_picker::close(store);
+    handle.on_key(move |key| {
+        let modified = key.primary || key.ctrl || key.meta || key.alt;
+        crate::link_picker::key(store, &editor(), key.key, modified)
+    });
+    handle.on_selection_change(move |_| crate::link_picker::selection_changed(store, &editor()));
+    handle.on_caret_moved(move || crate::link_picker::caret_moved(store, &editor()));
     cancel_pending_label_refresh();
 
     // Every local edit's delta is base64-broadcast to the server, which persists it
