@@ -38,8 +38,10 @@ list of a node's links to keep in step with the text.
 - `build_index_node` (server) feeds the index's `links` edges from `NodeDoc::links`,
   keeping only targets in the same store and not the node itself (the index is per
   store; links into other stores wait for the backlinks view, see "Later").
-- A link to an external `https:` URL is an ordinary link mark and stays one; Ctrl+click
-  opens it in the system browser (desktop) or a new tab (web).
+- A link to the web (`http:`/`https:`) is the same `link` mark with that href, made,
+  shown, followed and edited the same way as a Pimble link (Joe, 2026-09-23: "it would be
+  nice if the user experience was unified"): see "One experience for both kinds". Any
+  other scheme is left as it is: shown, never followed.
 
 ## The URL
 
@@ -96,6 +98,24 @@ place's title, content or path. `undeleteNode` ("Put Back") leaves `became` alon
 node's `became` is never followed, so a put-back original is simply itself again. The web
 vault client transplants through the same `Tree` code, so it writes the same field.
 
+## One experience for both kinds
+
+Every rule below applies to a Pimble link and a web link alike; only what "open" means and
+what the tooltip names differ.
+
+| | Pimble link | Web link |
+|---|---|---|
+| Make it | `[[`, Ctrl+L picker, paste | Ctrl+L picker (type or paste a URL), paste, and typing a URL followed by a space |
+| Hover | the target's title and store, or why it can't be reached | the URL (its host in bold) |
+| Ctrl/Cmd+click | `follow_link` in the app | the system browser (desktop: `open::that`), a new tab (web: `window.open`, `noopener`) |
+| Ctrl+L inside it | Edit Link (the picker again), Remove Link | the same |
+| Look | the link colour, underline on hover | the same, plus a small "opens outside" arrow after the words |
+
+The picker takes both: while what is typed parses as an `http(s)` URL (or looks like a
+bare domain, `example.com/x`, which becomes `https://`), its first row is "Link to
+<url>"; the node search rows follow. A plain click on either kind places the caret; nothing
+ever leaves the app without the modifier.
+
 ## Making a link
 
 - **`[[`**: typing `[[` opens the picker at the caret. What follows is the query (search as
@@ -104,23 +124,28 @@ vault client transplants through the same `Tree` code, so it writes the same fie
   text as typed. Picking replaces `[[query` with the target's title linked to it, in one
   editor transaction (one undo step). Holding Alt (Option) while picking inserts only the
   link over the query text as typed.
-- **Ctrl+L** with a selection opens the same picker (query empty) and links the selection;
+- **Ctrl+L** with a selection opens the same picker (query empty) and links the selection
+  to a node or a URL;
   with the caret inside a link it offers "Remove Link" and "Edit Link" (the picker again).
   With nothing selected and not in a link it does nothing.
 - **Copy Link** on a tree row puts `pimble:<store>/<node>` on the system clipboard.
   **Copy Link to Here** (editor context menu and Ctrl+Shift+L) copies a deep link to the
   caret.
-- **Paste**: plain text that parses as a Pimble URL, pasted over a selection, links the
-  selection (like any URL over a selection); pasted with no selection it inserts the
-  target's title (or the quote, for a deep link) linked to it.
+- **Paste**: plain text that parses as a Pimble URL or an `http(s)` URL, pasted over a
+  selection, links the selection. With no selection, a Pimble URL inserts the target's
+  title (or the quote, for a deep link) linked to it, and a web URL inserts itself,
+  linked.
+- **Typing a web URL** followed by a space or Enter links it (an input rule on the text
+  before the caret); Ctrl+Z right after takes the link back and keeps the text.
 - Linking needs write access to the node being edited, as any edit does. It needs nothing
   of the target.
 
 ## What a link looks like
 
-The link colour (`--rinch-primary-color-4`), no underline until hover. Hover after 400 ms:
-a tooltip with the target's title and store name (or the sentence from "Following" when it
-cannot be reached) and "Ctrl+click to open". A link whose target is known to be missing or
+The link colour (`--rinch-primary-color-4`), no underline until hover; a web link also
+carries a small arrow after its words (CSS on `a[href^="http"]`, not text). Hover after
+400 ms: a tooltip with the target's title and store name (or the sentence from "Following"
+when it cannot be reached), or a web link's URL, and "Ctrl+click to open". A link whose target is known to be missing or
 unreachable is not restyled in the text (that would be a second source of truth about the
 target); the tooltip says so.
 
