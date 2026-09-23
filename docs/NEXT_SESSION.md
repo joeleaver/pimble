@@ -2,6 +2,12 @@
 
 ## 2026-09-23: desktop performance, released as v0.4.0 (branch `perf/gpu-and-caret`)
 
+**v0.4.0 is released** (release commit aa6354a, tag `v0.4.0`): the GitHub release has the
+Linux and Windows packages and `/api/v1/releases` serves it. No jkbase deploy: nothing
+server-side changed. CI on the release commit failed once on a crash at the exit of the
+`vault_link` test process after all 15 tests passed ("A flake to watch"); the re-run passed.
+Joe's part: install v0.4.0; `pimble --cpu` is there if the GPU misbehaves.
+
 Joe reported the desktop "almost unusably slow". Profiled on a copy of the family store
 (perf plus rinch's `RINCH_PERF`, driven over the rinch-debug port): pimble's own code was
 about 1% of the UI thread; the time was rinch. As shipped, at 3840x2160, a keystroke cost
@@ -428,6 +434,15 @@ fired on CI for the v0.3.1 release commit (a 10 s `wait_for_mount_state` for the
 mounts or links, and the full release run had passed locally minutes before). The re-run passed.
 **The remote-mounts one is explained and fixed on branch `rhypedb-pin`** (a real race,
 not load: the top of this file). The `auth` one is still unexplained.
+
+On 2026-09-23 CI for the v0.4.0 release commit failed with the `pimble-server` `vault_link`
+test process dying of SIGSEGV six seconds after printing `15 passed` (so in teardown, not
+in a test); the re-run passed, and 25 local runs of that binary were clean. It may be the
+`auth` one's cause too (a server test process dying without a test to blame). A guess, not
+checked: `cargo test --workspace` unifies pimble-app's `onnx-download` onto
+`pimble-server`, so its test binaries link the static ONNX runtime, whose global state is
+known to crash when torn down while its threads still run. To check: `cargo tree -p
+pimble-server -e features` under the workspace, and a core dump from a failing run.
 
 ## Process notes that cost time before
 
