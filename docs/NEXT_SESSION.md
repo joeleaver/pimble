@@ -1,6 +1,6 @@
 # Next session: start here
 
-## 2026-09-22, late night: desktop performance (branch `perf/gpu-and-caret`, merged to `master`, not pushed)
+## 2026-09-23: desktop performance, released as v0.4.0 (branch `perf/gpu-and-caret`)
 
 Joe reported the desktop "almost unusably slow". Profiled on a copy of the family store
 (perf plus rinch's `RINCH_PERF`, driven over the rinch-debug port): pimble's own code was
@@ -8,16 +8,18 @@ about 1% of the UI thread; the time was rinch. As shipped, at 3840x2160, a keyst
 ~175 ms in a short document and ~670 ms in a 9,500-word one; now ~12 ms and ~22 ms of
 UI-thread CPU, and two frames per keystroke instead of four plus the blinks.
 
-- **rinch PRs** (Joe has rinch upstream take them): joeleaver/rinch#857 (a text block laid
+- **rinch PRs**, all merged upstream on 2026-09-23: joeleaver/rinch#857 (a text block laid
   out with no width constraint was reshaped on every layout pass: `(inf - inf).abs()` is
   NaN), #858 (the caret hid with `display`, a structural change that reshaped every text
   block in the window, twice per keystroke; now `visibility`), #869 (a `gpu` build keeps
   the software renderer, chooses at run time, falls back to it when the GPU will not
   start; `App::renderer`, `RINCH_RENDERER`), #871 (an identical attribute or style write
-  restyles nothing). **Until they are merged, every rinch dependency (root,
-  `crates/pimble-app`, `web/`) points at rinch's `pimble/perf` branch**, which merges them
-  (both lock files at 6f922c8); move all of them back to `main` together, and delete that
-  branch.
+  restyles nothing). Upstream refined #869 as it merged it: an app that configured the GPU
+  device itself ignores a software choice (pimble does not configure one). Every rinch
+  dependency is back on `main`, both lock files at 4200dda (#869's merge); the interim
+  `pimble/perf` branch is deleted. The web lock moved with it, so the browser build picks
+  up rinch's web fixes since 651ecf7 (#862, #867) at the next jkbase deploy, which v0.4.0
+  did not need (nothing server-side changed).
 - **GPU again** (e061347): the desktop build turns `rinch/gpu` on (it was dropped on
   2026-09-12 without Joe's OK, which he says was the wrong call) and repeats rinch's wgpu and
   winit `[patch.crates-io]` in the root `Cargo.toml`. At 4K the software renderer spent
@@ -29,15 +31,15 @@ UI-thread CPU, and two frames per keystroke instead of four plus the blinks.
   values), tree rows watch only their own node's live label (per-node signals, leaked so
   they outlive the row that first asks), and an explicitly titled node's label no longer
   decodes its content.
-- Checked: `cargo test --workspace --release`, pimble-app's tests (90), the Windows
-  cross-check, the web crate's wasm32 check.
+- Checked on rinch `main`: `cargo test --workspace --release`, the Windows cross-check,
+  the web crate's wasm32 check, and the app itself (Vulkan by default, `--cpu` software).
 - **Next, in rinch, one at a time:** the caret's position as a paint-only offset (it still
   forces a second layout pass), keeping unchanged parts of the scene instead of repainting
   the whole window every frame (and on every blink), and not laying out a whole long
   document per keystroke. Also open: the search box costs ~70 ms per character; selecting
   text creates and deletes highlight elements.
-- Shipping this is a release (the rule in CLAUDE.md) and the first Windows package drawn on
-  the GPU; it builds against rinch's `pimble/perf` branch until the PRs merge.
+- v0.4.0 is the first Windows package drawn on the GPU (DX12/Vulkan through the wgpu
+  fork), with the software fallback if it will not start.
 
 ## Before that: v0.3.2 and v0.3.3
 
