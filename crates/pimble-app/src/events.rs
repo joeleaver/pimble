@@ -49,6 +49,34 @@ pub(crate) fn show_notice(store: AppStore, message: String) {
     });
 }
 
+/// Open the tree down to `node_id` and select it (a followed link's target,
+/// docs/LINKS_CONTRACT.md): the store's row and every ancestor below the
+/// root expanded, their children fetched where they are not loaded. The
+/// root's own children are the store row's. Only if the node is still the
+/// one selected: a later click has the last word.
+pub(crate) fn reveal_in_tree(store: AppStore, tree_state: UseTreeReturn, store_id: StoreId, node_id: NodeId, ancestors: &[NodeId]) {
+    let value = format!("node_{store_id}_{node_id}");
+    if untracked(|| store.selected_id.get()).as_deref() != Some(value.as_str()) {
+        return;
+    }
+    let root = store.root_node_id(store_id);
+    tree_state.controller.expand(&format!("store_{store_id}"));
+    for &ancestor in ancestors {
+        store.expanded.update(|e| {
+            e.insert((store_id, ancestor));
+        });
+        if Some(ancestor) != root {
+            tree_state.controller.expand(&format!("node_{store_id}_{ancestor}"));
+        }
+        if !store.has_children_loaded(store_id, ancestor) {
+            store.send(BackendCommand::GetChildren { store_id, node_id: ancestor });
+        }
+    }
+    tree_state.controller.select(&value);
+    store.bump_tree_structure();
+    crate::app::reveal_row(value);
+}
+
 /// What following a link does with where `resolveLink` says it leads
 /// (docs/LINKS_CONTRACT.md "Following a link"): a live node opens, with the
 /// link's anchor for the editor; a chain that stopped in another store this
@@ -865,6 +893,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             }
             BackendEvent::LinkResolved { url, hops, resolution } => {
                 follow_resolution(store, url, *hops, resolution);
+            }
+            BackendEvent::AncestorsLoaded { store_id, node_id, ancestors } => {
+                reveal_in_tree(store, tree_state, *store_id, *node_id, ancestors);
             }
             BackendEvent::DeletedListed { store_id, nodes } => {
                 tracing::info!("Store {:?}: {} recently deleted", store_id, nodes.len());

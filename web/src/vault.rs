@@ -1260,6 +1260,8 @@ impl VaultClient {
 
             BackendCommand::ResolveLink { url, hops } => Some(self.resolve_link(url, hops)),
 
+            BackendCommand::GetAncestors { store_id, node_id } => Some(self.ancestors(store_id, node_id)),
+
             BackendCommand::BroadcastChanges { store_id, node_id, changes } => {
                 match self.broadcast(client, store_id, node_id, &changes).await {
                     Ok(()) => None,
@@ -1499,6 +1501,7 @@ impl VaultClient {
             BackendCommand::ListDeleted { store_id } => Some(BackendEvent::DeletedListed { store_id, nodes: Vec::new() }),
             // Reading, and answered from what this page holds, owner or not.
             BackendCommand::ResolveLink { url, hops } => Some(self.resolve_link(url, hops)),
+            BackendCommand::GetAncestors { store_id, node_id } => Some(self.ancestors(store_id, node_id)),
             _ => Some(notice(OWNER_OFFLINE_REFUSAL.to_string())),
         })
     }
@@ -1747,6 +1750,24 @@ impl VaultClient {
     /// What "Recently Deleted..." shows, answered from the tree this page
     /// holds — a scoped member's page holds only its scope's documents to
     /// begin with, so nothing further is judged here.
+    /// `GetAncestors` for an encrypted store: `parent_id` by `parent_id` in
+    /// the documents this page holds, the root first.
+    fn ancestors(&self, store_id: StoreId, node_id: NodeId) -> BackendEvent {
+        let mut ancestors = Vec::new();
+        if let Some(store) = self.stores.get(&store_id) {
+            let mut at = node_id;
+            while let Some(parent) = store.tree.doc(at).and_then(|doc| doc.fields().ok()).and_then(|f| f.parent_id) {
+                if ancestors.contains(&parent) || ancestors.len() >= 256 {
+                    break;
+                }
+                ancestors.push(parent);
+                at = parent;
+            }
+        }
+        ancestors.reverse();
+        BackendEvent::AncestorsLoaded { store_id, node_id, ancestors }
+    }
+
     /// `ResolveLink` for an encrypted store (docs/LINKS_CONTRACT.md
     /// "Following a link"): the server's `resolveLink`, answered from the
     /// documents this page holds, hop by hop through the tombstones'
@@ -3515,6 +3536,7 @@ pub fn store_id_of(cmd: &BackendCommand) -> Option<StoreId> {
         | MoveNode { store_id, .. }
         | UndeleteNode { store_id, .. }
         | ListDeleted { store_id }
+        | GetAncestors { store_id, .. }
         | CreateMount { store_id, .. }
         | GetMountState { store_id, .. }
         | BroadcastChanges { store_id, .. }

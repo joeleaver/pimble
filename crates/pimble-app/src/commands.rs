@@ -271,6 +271,29 @@ pub async fn process_command(
             }
         }
 
+        BackendCommand::GetAncestors { store_id, node_id } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            // Parent by parent; a chain longer than any real tree is broken.
+            let mut ancestors = Vec::new();
+            let mut at = node_id;
+            for _ in 0..256 {
+                match c.get_node(store_id, at).await {
+                    Ok(node) => match node.parent_id {
+                        Some(parent) if !ancestors.contains(&parent) => {
+                            ancestors.push(parent);
+                            at = parent;
+                        }
+                        _ => break,
+                    },
+                    Err(_) => break,
+                }
+            }
+            ancestors.reverse();
+            Some(BackendEvent::AncestorsLoaded { store_id, node_id, ancestors })
+        }
+
         BackendCommand::ResolveLink { url, hops } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });

@@ -99,6 +99,26 @@ pub fn toggle_dark_mode(store: AppStore) {
 }
 
 thread_local! {
+    /// Each tree row's label element by its tree value, the latest render's,
+    /// so a revealed row can be scrolled to (`reveal_row`).
+    static TREE_ROWS: RefCell<std::collections::HashMap<String, NodeHandle>> = RefCell::new(std::collections::HashMap::new());
+    /// A row to scroll to as soon as it is rendered (its parents' children
+    /// may still be loading when it is revealed).
+    static REVEAL_ROW: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Scroll the tree to the row for `value` (a followed link's target, after
+/// `events::reveal_in_tree` opened its parents): now if the row is drawn,
+/// and again when it is next drawn, since rows appear only once their
+/// parent's children arrive.
+pub(crate) fn reveal_row(value: String) {
+    if let Some(row) = TREE_ROWS.with(|rows| rows.borrow().get(&value).cloned()) {
+        row.scroll_into_view();
+    }
+    REVEAL_ROW.with(|pending| *pending.borrow_mut() = Some(value));
+}
+
+thread_local! {
     /// What the sidebar's account button does, when there is one.
     ///
     /// The browser build has account pages of its own (`/app/account`) and has
@@ -890,6 +910,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             store.link_open.set(None);
             store.pending_anchor.set(open.anchor.clone().map(|anchor| (open.store_id, open.node_id, anchor)));
             open_node(store, tree_state, open.value);
+            // Where it is in the tree, which may not have been opened that far.
+            store.send(BackendCommand::GetAncestors { store_id: open.store_id, node_id: open.node_id });
         });
     });
 
@@ -1682,6 +1704,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
 
             // Clone before wrapper rsx moves rename_input
             let rename_input_for_focus = rename_input.clone();
+            let row_value = node_value.clone();
 
             let wrapper = rsx! {
                 span {
@@ -1839,6 +1862,14 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 mount_source_copied: !no_mount_source,
                 every_share_ended: ended_now,
             });
+
+            // Remember this row for `reveal_row`, and scroll to it now if it
+            // is the one a followed link revealed.
+            TREE_ROWS.with(|rows| rows.borrow_mut().insert(row_value.clone(), wrapper.clone()));
+            if REVEAL_ROW.with(|pending| pending.borrow().as_deref() == Some(row_value.as_str())) {
+                REVEAL_ROW.with(|pending| pending.borrow_mut().take());
+                wrapper.scroll_into_view();
+            }
 
             // Wrap in ContextMenu — different items for store roots vs nodes
             let context_menu = if is_store_root {
@@ -3841,10 +3872,12 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             }
 
                             div {
+                                class: "pimble-sidebar__pane",
                                 style: {|| if store.search_query.get().is_empty() { "" } else { "display: none;" }},
                                 {tree_scroll}
                             }
                             div {
+                                class: "pimble-sidebar__pane",
                                 style: {|| if store.search_query.get().is_empty() { "display: none;" } else { "" }},
                                 {search_panel}
                             }

@@ -88,8 +88,10 @@ pimble:<store uuid>/<node uuid>#<anchor>
    `scroll_into_view` and `focus`). Checked in the app on 2026-09-23 with a real Ctrl+click
    (rinch #921 lets the debug port hold a modifier): a deep link into "Open SRS" opened it
    halfway down with "Order ID 4465511" selected; a link to a folder selected the folder.
-   The words land at the edge of the view (the scroll brings them just inside it); the
-   tree does not yet reveal a followed node it has not expanded.
+   The tree opens down to the followed node, selects it and scrolls to it (Joe, 2026-09-23:
+   `GetAncestors`/`AncestorsLoaded`, `events::reveal_in_tree`, `app::reveal_row`; checked
+   in the app three folders deep). The words are to land a third of the way down the
+   view, with context above (Joe, the same day), on a follow-up to rinch #922.
 
 Following never writes to the target: a reader can deep-link into a node they may only
 read.

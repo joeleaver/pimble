@@ -73,6 +73,9 @@ pub enum BackendCommand {
     /// app has asked again for this one link, so a chain passed between two
     /// holders cannot go round for ever.
     ResolveLink { url: PimbleUrl, hops: usize },
+    /// The nodes above `node_id`, so the tree can open down to it (a followed
+    /// link's target, docs/LINKS_CONTRACT.md). Answers `AncestorsLoaded`.
+    GetAncestors { store_id: StoreId, node_id: NodeId },
 
     // Mount operations
     CreateMount {
@@ -268,6 +271,9 @@ pub enum BackendEvent {
     /// `StoreNotHere` in another store the app holds is asked again there
     /// (whoever holds a store answers for it).
     LinkResolved { url: PimbleUrl, hops: usize, resolution: LinkResolution },
+    /// Answer to `GetAncestors`: the store's root first, down to `node_id`'s
+    /// parent. Empty for the root, or when the chain could not be read.
+    AncestorsLoaded { store_id: StoreId, node_id: NodeId, ancestors: Vec<NodeId> },
 
     // Mount events
     MountCreated {

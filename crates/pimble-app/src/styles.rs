@@ -33,8 +33,22 @@ pub(crate) const APP_CSS: &str = "
     text-overflow: ellipsis;
 }
 
+/* The tree and the search results each sit in a pane that takes the rest of
+   the sidebar and may be shorter than what it holds (`min-height: 0`), so the
+   pane's content is what scrolls. Without it the pane grew to its content
+   (the tree was 1134px in a 707px sidebar on the family store with a few
+   folders open): the tree ran off the window with nothing to scroll, and a
+   revealed row below the fold could not be reached. */
+.pimble-sidebar__pane {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+
 .pimble-sidebar__tree {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
     padding: 0 4px 8px 8px;
 }

@@ -65,9 +65,13 @@ Later the same day, on the same branch:
   #921 (debug `click`/`mouse_down`/`mouse_up` take `"modifiers": ["ctrl"]`). The old
   `pimble/links` is superseded. A real Ctrl+click on a Pimble link and on a deep link was
   checked in the app (the deep link scrolls to its words and selects them).
-- **Next**: the walk-through (wave 4). Open questions for Joe: should the tree reveal and
-  select a followed node it has not expanded (a link to a nested folder shows nothing);
-  should a deep link's words land mid-view rather than at the edge. The hover underline does not show on the desktop
+- **Joe said yes to both** (2026-09-23): a followed node is revealed in the tree (built,
+  checked), and a deep link's words land a third of the way down (a follow-up commit on
+  rinch #922 adds an alignment; then `place_anchor` uses it). Found on the way and fixed:
+  the sidebar's tree and search results never scrolled (their panes grew with their
+  content; `.pimble-sidebar__pane` with `min-height: 0`).
+- **Next**: the #922 alignment into `pimble/links-2` and `place_anchor`, then the
+  walk-through (wave 4). The hover underline does not show on the desktop
   (not yet filed).
 - **Driving the app over the debug port**: `key_press` needs `"shift"` and `"ctrl"` in its
   JSON (`{"key":"ArrowDown","shift":false,"ctrl":false}`); without them the command is
