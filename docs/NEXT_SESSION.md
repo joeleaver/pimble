@@ -70,8 +70,11 @@ Later the same day, on the same branch:
   rinch #922 adds an alignment; then `place_anchor` uses it). Found on the way and fixed:
   the sidebar's tree and search results never scrolled (their panes grew with their
   content; `.pimble-sidebar__pane` with `min-height: 0`).
-- **Next**: the #922 alignment into `pimble/links-2` and `place_anchor`, then the
-  walk-through (wave 4). The hover underline does not show on the desktop
+- **rinch now**: #892, #900, #901 and #921 are merged upstream; open are #915 (paste) and
+  #922 (focus, scroll, `ScrollAlign`; its branch carries #916). Pimble points at
+  **`pimble/links-3`** (35be31d) = main 4b0c747 + #922 + #915; go back to `main` when
+  those two merge (the older `pimble/links` and `pimble/links-2` are superseded).
+- **Next**: the walk-through (wave 4). The hover underline does not show on the desktop
   (not yet filed).
 - **Driving the app over the debug port**: `key_press` needs `"shift"` and `"ctrl"` in its
   JSON (`{"key":"ArrowDown","shift":false,"ctrl":false}`); without them the command is

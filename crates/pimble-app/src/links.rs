@@ -209,8 +209,9 @@ pub fn place_anchor(handle: &crate::rinch_editor::EditorHandle, anchor: &pimble_
     };
     handle.set_selection(selection);
     // A range never scrolls by itself, and nothing was clicked to focus the
-    // editor: bring the words on screen and give it the keyboard (rinch #922).
-    handle.scroll_into_view(from, to);
+    // editor: put the words a third of the way down, with what leads up to
+    // them above (Joe, 2026-09-23), and give it the keyboard (rinch #922).
+    handle.scroll_into_view_aligned(from, to, crate::rinch_editor::ScrollAlign::Fraction(1.0 / 3.0));
     handle.focus();
 }
 

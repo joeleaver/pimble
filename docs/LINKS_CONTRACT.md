@@ -90,8 +90,9 @@ pimble:<store uuid>/<node uuid>#<anchor>
    halfway down with "Order ID 4465511" selected; a link to a folder selected the folder.
    The tree opens down to the followed node, selects it and scrolls to it (Joe, 2026-09-23:
    `GetAncestors`/`AncestorsLoaded`, `events::reveal_in_tree`, `app::reveal_row`; checked
-   in the app three folders deep). The words are to land a third of the way down the
-   view, with context above (Joe, the same day), on a follow-up to rinch #922.
+   in the app three folders deep). The words land a third of the way down the view, with
+   context above (Joe, the same day; `ScrollAlign::Fraction(1/3)` on rinch #922's
+   `scroll_into_view_aligned`, checked in the app).
 
 Following never writes to the target: a reader can deep-link into a node they may only
 read.
