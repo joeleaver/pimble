@@ -71,13 +71,14 @@ Later the same day, on the same branch:
   the sidebar's tree and search results never scrolled (their panes grew with their
   content; `.pimble-sidebar__pane` with `min-height: 0`).
 - **rinch now**: every links PR is merged upstream (#892 #900 #901 #915 #916 #921 #922).
-  Pimble points at **`pimble/fixes`** (cb9161b) = rinch main + joeleaver/rinch#1011
-  (the editor's right-click menu ignored real clicks: a press was judged where the menu
+  The editor's right-click menu ignored real clicks (a press was judged where the menu
   opened, so items never ran and a click elsewhere never closed it; found with real input,
-  fixed and checked with `xdotool`) + joeleaver/rinch#1018 (a list item's bullet dropped a
+  checked with `xdotool` on #1011) and is fixed on rinch main by joeleaver/rinch#1044,
+  which superseded #1011. Pimble points at **`pimble/fixes`** (640b2ff) = rinch main
+  (2707671) + joeleaver/rinch#1018 (a list item's bullet dropped a
   line whenever its text ended in a space: a paragraph was measured without its trailing
   space, and parley 0.11.1 wraps a second trailing space onto a new line; checked in the
-  app). Go back to `main` when both merge. The `pimble/links*` integration branches are
+  app). Go back to `main` when #1018 merges. The `pimble/links*` integration branches are
   superseded. Left open upstream: joeleaver/rinch#1013 (flex baseline alignment uses the
   bottom edge, since Taffy 0.12 reports no baselines; a wrapping list item's bullet
   would sit at its last line).
