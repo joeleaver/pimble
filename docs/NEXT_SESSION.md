@@ -71,14 +71,16 @@ Later the same day, on the same branch:
   the sidebar's tree and search results never scrolled (their panes grew with their
   content; `.pimble-sidebar__pane` with `min-height: 0`).
 - **rinch now**: every links PR is merged upstream (#892 #900 #901 #915 #916 #921 #922).
-  Pimble points at **`fix/text-menu-cursor-pos`** (f1af63d) = rinch main + joeleaver/rinch#1011
+  Pimble points at **`pimble/fixes`** (cb9161b) = rinch main + joeleaver/rinch#1011
   (the editor's right-click menu ignored real clicks: a press was judged where the menu
   opened, so items never ran and a click elsewhere never closed it; found with real input,
-  fixed and checked with `xdotool`). Go back to `main` when #1011 merges. The
-  `pimble/links*` integration branches are superseded.
-- **Open rinch work from Joe's reports (2026-09-25)**: the bullet that drops a line after a
-  trailing space in a list item (an agent is on it: pre-wrap trailing space wraps at the
-  measured width, and flex baseline uses the last line).
+  fixed and checked with `xdotool`) + joeleaver/rinch#1018 (a list item's bullet dropped a
+  line whenever its text ended in a space: a paragraph was measured without its trailing
+  space, and parley 0.11.1 wraps a second trailing space onto a new line; checked in the
+  app). Go back to `main` when both merge. The `pimble/links*` integration branches are
+  superseded. Left open upstream: joeleaver/rinch#1013 (flex baseline alignment uses the
+  bottom edge, since Taffy 0.12 reports no baselines; a wrapping list item's bullet
+  would sit at its last line).
 - **Real input for testing**: `kwin_wayland --virtual --xwayland --socket <name>` plus a
   rootful `Xwayland :5` inside it, the app run with `DISPLAY=:5` and no `WAYLAND_DISPLAY`,
   driven with `DISPLAY=:5 xdotool` (never touches Joe's screen). Caution: starting and
