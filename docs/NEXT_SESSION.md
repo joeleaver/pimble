@@ -70,10 +70,20 @@ Later the same day, on the same branch:
   rinch #922 adds an alignment; then `place_anchor` uses it). Found on the way and fixed:
   the sidebar's tree and search results never scrolled (their panes grew with their
   content; `.pimble-sidebar__pane` with `min-height: 0`).
-- **rinch now**: #892, #900, #901 and #921 are merged upstream; open are #915 (paste) and
-  #922 (focus, scroll, `ScrollAlign`; its branch carries #916). Pimble points at
-  **`pimble/links-3`** (35be31d) = main 4b0c747 + #922 + #915; go back to `main` when
-  those two merge (the older `pimble/links` and `pimble/links-2` are superseded).
+- **rinch now**: every links PR is merged upstream (#892 #900 #901 #915 #916 #921 #922).
+  Pimble points at **`fix/text-menu-cursor-pos`** (f1af63d) = rinch main + joeleaver/rinch#1011
+  (the editor's right-click menu ignored real clicks: a press was judged where the menu
+  opened, so items never ran and a click elsewhere never closed it; found with real input,
+  fixed and checked with `xdotool`). Go back to `main` when #1011 merges. The
+  `pimble/links*` integration branches are superseded.
+- **Open rinch work from Joe's reports (2026-09-25)**: the bullet that drops a line after a
+  trailing space in a list item (an agent is on it: pre-wrap trailing space wraps at the
+  measured width, and flex baseline uses the last line).
+- **Real input for testing**: `kwin_wayland --virtual --xwayland --socket <name>` plus a
+  rootful `Xwayland :5` inside it, the app run with `DISPLAY=:5` and no `WAYLAND_DISPLAY`,
+  driven with `DISPLAY=:5 xdotool` (never touches Joe's screen). Caution: starting and
+  stopping that KWin removed `/tmp/.X11-unix/X0` and `X1` from Joe's session (his X
+  display still answered through the abstract socket).
 - **Next**: the walk-through (wave 4). The hover underline does not show on the desktop
   (not yet filed).
 - **Driving the app over the debug port**: `key_press` needs `"shift"` and `"ctrl"` in its
