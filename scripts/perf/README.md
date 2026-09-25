@@ -23,12 +23,19 @@ mkdir -p $P/env/config/pimble $P/env/data/pimble
 cp -r ~/dev/scrivener_convert/family-management.pimble $P/env/family.pimble
 ln -sfn ~/.local/share/pimble/models $P/env/data/pimble/models   # skip the model download
 printf '{"open_stores":["%s/env/family.pimble"]}\n' $P > $P/env/config/pimble/state.json
-XDG_CONFIG_HOME=$P/env/config XDG_DATA_HOME=$P/env/data RINCH_PERF=1 \
+PIMBLE_APP_ADDR=127.0.0.1:7473 XDG_CONFIG_HOME=$P/env/config XDG_DATA_HOME=$P/env/data RINCH_PERF=1 \
   $P/target/release/pimble > $P/app.log 2>&1 &
 ```
 
-The embedded server takes `127.0.0.1:7462`, so quit your own Pimble first. Find the
-process with `pgrep -x pimble` (never `pgrep -f`: it matches your own shell).
+**Always give the test app its own port** with `PIMBLE_APP_ADDR=127.0.0.1:7473` (any free
+port). The embedded server takes `127.0.0.1:7462` by default; if Joe's own app is running,
+a test instance without its own port cannot bind, connects to *his* server instead, and
+asks it to open the store copy. His server already holds the original (same store id) and
+answers with the original's path, which the test app saves into its `state.json`: its next
+launch opens Joe's real store (2026-09-25; only the derived search index was touched).
+Check `state.json` points at the copy before every launch. Find the test process by the
+pid you started (`$!`), never `pgrep -x pimble` alone (Joe's app is a `pimble` too), and
+never `pgrep -f` (it matches your own shell).
 
 - **Out of date since rinch #877 (2026-09-23):** `RINCH_PERF` now prints one `[PERF] frame N:`
   summary line per frame with rinch's counters, and `scenario.py` still parses the old
