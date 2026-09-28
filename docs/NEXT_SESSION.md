@@ -1,5 +1,8 @@
 # Next session: start here
 
+**2026-09-28: links are done on branch `links`** (all four waves; the walk-through passed,
+see "rinch now" and "Wave 4" below), rinch is back on `main`, and merging is Joe's call.
+
 Updated 2026-09-23, later. **Where things stand:** Joe moved off performance ("let's move
 on from performance now and go back to core features"): the rinch perf follow-ups are being
 done in rinch by another session (joeleaver/rinch#880, #881), not here. The next roadmap
@@ -87,8 +90,17 @@ Later the same day, on the same branch:
   driven with `DISPLAY=:5 xdotool` (never touches Joe's screen). Caution: starting and
   stopping that KWin removed `/tmp/.X11-unix/X0` and `X1` from Joe's session (his X
   display still answered through the abstract socket).
-- **Next**: the walk-through (wave 4). The hover underline does not show on the desktop
-  (not yet filed).
+- **Wave 4, the walk-through, passed on 2026-09-28** (docs/LINKS_CONTRACT.md, "Waves",
+  item 4; steps in `scripts/local-stack/README.md`, "The links walk-through"; data from
+  `scripts/local-stack/links-setup.sh`), with three fixes it found: a note moved into a
+  store the reader does not hold now reads as no access; revealing a followed note on a
+  member's replica no longer asks for the store's root ("Node not found" in the badge);
+  Copy Link to Here with words selected links to them. New CLI: `resolve-link <url>`.
+- **Next**: Joe's call on merging `links` into `master` (and a release with it). Seen and
+  not fixed: in the browser, opening a note keeps the previous note's scroll position (a
+  short note opens blank until scrolled up; the desktop resets it); the `[[` picker ranks
+  a note whose text mentions the query above one whose title has it; the hover underline
+  does not show on the desktop (not yet filed).
 - **Driving the app over the debug port**: `key_press` needs `"shift"` and `"ctrl"` in its
   JSON (`{"key":"ArrowDown","shift":false,"ctrl":false}`); without them the command is
   refused and `rd.py` prints nothing to say so. The scratchpad can vanish between

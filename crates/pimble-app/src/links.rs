@@ -131,17 +131,34 @@ pub fn set_app_store(store: crate::state::AppStore) {
 
 /// "Copy Link to Here" (docs/LINKS_CONTRACT.md "Making a link"): a deep link
 /// to the caret in the open note, its sticky position from the
-/// collaboration session and a quote of the words after it.
+/// collaboration session and a quote of the words after it. With words
+/// selected, the spot is where they start and the quote is those words, so
+/// following the link selects what was selected.
 pub fn copy_link_here(store: crate::state::AppStore) {
     let Some(active) = rinch::prelude::untracked(|| store.active_edit.get()) else { return };
     let handle = crate::editor::editor();
-    let head = handle.selection().head();
-    let sticky = handle.collab_sticky_index(head);
-    let after = text_after(&handle.doc(), head);
-    let url = pimble_core::PimbleUrl::deep(active.store_id, active.node_id, pimble_core::Anchor::new(sticky, &after));
+    let selection = handle.selection();
+    let sticky = handle.collab_sticky_index(selection.from());
+    let quote = quote_of(&handle.doc(), selection.from(), selection.to());
+    let url = pimble_core::PimbleUrl::deep(active.store_id, active.node_id, pimble_core::Anchor::new(sticky, &quote));
     match copy_text(&url.to_string()) {
         Ok(()) => crate::events::show_notice(store, "Link to here copied.".to_string()),
         Err(e) => crate::events::show_notice(store, format!("The link could not be copied: {e}")),
+    }
+}
+
+/// A deep link's quote for the selection `from..to`: the selected words
+/// when they lie in one textblock, else the words after `from`.
+fn quote_of(doc: &rinch_editor_core::Node, from: Pos, to: Pos) -> String {
+    let after = text_after(doc, from);
+    let same_block = match (doc.resolve(from), doc.resolve(to)) {
+        (Ok(a), Ok(b)) => a.start(a.depth()) == b.start(b.depth()),
+        _ => false,
+    };
+    if to > from && same_block {
+        after.chars().take(to.0 - from.0).collect()
+    } else {
+        after
     }
 }
 
@@ -490,6 +507,26 @@ mod tests {
         place_anchor(&handle, &anchor);
         let selection = handle.selection();
         assert_eq!((selection.from(), selection.to()), (Pos(12), Pos(29)), "the quoted words, moved by what was typed before them");
+    }
+
+    /// Copy Link to Here quotes the selected words, or with nothing selected
+    /// (or a selection across paragraphs) the words after the caret.
+    #[test]
+    fn a_deep_link_quotes_the_selected_words() {
+        let handle = crate::rinch_editor::create_editor();
+        assert!(handle.update(|s| {
+            let mut tr = s.tr();
+            tr.set_selection(rinch_editor_core::selection::Selection::cursor(Pos(1)));
+            tr.insert_text("the key code is 4827 today").ok()?;
+            tr.split(27, 1, None).ok()?;
+            tr.set_selection(rinch_editor_core::selection::Selection::cursor(Pos(29)));
+            tr.insert_text("next").ok()?;
+            Some(tr)
+        }));
+        let doc = handle.doc();
+        assert_eq!(quote_of(&doc, Pos(5), Pos(21)), "key code is 4827");
+        assert_eq!(quote_of(&doc, Pos(5), Pos(5)), "key code is 4827 today");
+        assert_eq!(quote_of(&doc, Pos(22), Pos(31)), "today", "across paragraphs: the words after the start");
     }
 
     #[test]

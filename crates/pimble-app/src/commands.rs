@@ -275,19 +275,20 @@ pub async fn process_command(
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
-            // Parent by parent; a chain longer than any real tree is broken.
+            // Parent by parent, as far as this device may read: a member's
+            // replica stops at the share's root, whose parent it does not
+            // hold, and a parent it cannot fetch is no row to open. A chain
+            // longer than any real tree is broken.
             let mut ancestors = Vec::new();
-            let mut at = node_id;
-            for _ in 0..256 {
-                match c.get_node(store_id, at).await {
-                    Ok(node) => match node.parent_id {
-                        Some(parent) if !ancestors.contains(&parent) => {
-                            ancestors.push(parent);
-                            at = parent;
-                        }
-                        _ => break,
-                    },
-                    Err(_) => break,
+            let mut at = c.get_node(store_id, node_id).await.ok();
+            while let Some(node) = at.take() {
+                let Some(parent) = node.parent_id else { break };
+                if ancestors.contains(&parent) || ancestors.len() >= 256 {
+                    break;
+                }
+                if let Ok(parent_node) = c.get_node(store_id, parent).await {
+                    ancestors.push(parent);
+                    at = Some(parent_node);
                 }
             }
             ancestors.reverse();

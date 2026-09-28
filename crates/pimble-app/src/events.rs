@@ -82,7 +82,7 @@ pub(crate) fn reveal_in_tree(store: AppStore, tree_state: UseTreeReturn, store_i
 /// link's anchor for the editor; a chain that stopped in another store this
 /// app holds is asked again of whoever holds that one (the server or, in the
 /// browser, the vault client), at most `MAX_LINK_HOPS` times; anything else
-/// is its one sentence in the status bar.
+/// is its one sentence in the status bar (`stop_sentence`).
 pub(crate) fn follow_resolution(store: AppStore, url: &PimbleUrl, hops: usize, resolution: &LinkResolution) {
     match resolution {
         LinkResolution::Live { store_id, node_id } => {
@@ -99,8 +99,24 @@ pub(crate) fn follow_resolution(store: AppStore, url: &PimbleUrl, hops: usize, r
             let next = PimbleUrl { store: *store_id, node: *node_id, anchor: url.anchor.clone() };
             store.send(BackendCommand::ResolveLink { url: next, hops: hops + 1 });
         }
-        other => show_notice(store, other.sentence().unwrap_or_default().to_string()),
+        other => show_notice(store, stop_sentence(url, hops, other).to_string()),
     }
+}
+
+/// The sentence for a link that does not open. The last hop decides it: a
+/// chain that moved on (a `became`) and stopped in a store this app does not
+/// hold reads as no access, since the reader cannot reach where the note went;
+/// only a link whose own store is not here says so. A chain still going after
+/// `MAX_LINK_HOPS` is one that no longer leads anywhere.
+fn stop_sentence(url: &PimbleUrl, hops: usize, resolution: &LinkResolution) -> &'static str {
+    let said = match resolution {
+        LinkResolution::StoreNotHere { .. } if hops >= MAX_LINK_HOPS => LinkResolution::Missing.sentence(),
+        LinkResolution::StoreNotHere { store_id, node_id } if (*store_id, *node_id) != (url.store, url.node) => {
+            LinkResolution::NoAccess.sentence()
+        }
+        other => other.sentence(),
+    };
+    said.unwrap_or_default()
 }
 
 /// Whether an error is a refused write rather than a failure: one of the two
@@ -2726,7 +2742,8 @@ mod tests {
     /// What following a link does with each answer (docs/LINKS_CONTRACT.md
     /// "Following a link"): a live node is asked to open with the link's
     /// anchor; a chain that stopped in another store this app holds is asked
-    /// again there, up to the hop limit; everything else is its sentence.
+    /// again there, up to the hop limit; everything else is a sentence, and a
+    /// note that moved where this app cannot follow reads as no access.
     #[test]
     fn a_resolved_link_opens_asks_again_or_says_why_not() {
         use pimble_core::{Anchor, LinkResolution, PimbleUrl, MAX_LINK_HOPS};
@@ -2755,16 +2772,20 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
 
-        // Not held, the store it was asked of, or out of hops: the sentence.
-        for (resolution, hops) in [
-            (LinkResolution::StoreNotHere { store_id: StoreId::new(), node_id: moved_to }, 0),
-            (LinkResolution::StoreNotHere { store_id: asked_store, node_id: asked_node }, 0),
-            (LinkResolution::StoreNotHere { store_id: held_id, node_id: moved_to }, MAX_LINK_HOPS),
-            (LinkResolution::NoAccess, 0),
-            (LinkResolution::Missing, 0),
-            (LinkResolution::Deleted { store_id: asked_store, node_id: asked_node }, 0),
+        // The link's own store is not here: that sentence. The note moved on
+        // into a store this app does not hold: no access, whichever hop it
+        // was. Out of hops: it leads nowhere. The rest: their own sentence.
+        let not_here = LinkResolution::StoreNotHere { store_id: asked_store, node_id: asked_node };
+        for (resolution, hops, said) in [
+            (not_here.clone(), 0, not_here.sentence()),
+            (LinkResolution::StoreNotHere { store_id: StoreId::new(), node_id: moved_to }, 0, LinkResolution::NoAccess.sentence()),
+            (LinkResolution::StoreNotHere { store_id: asked_store, node_id: moved_to }, 1, LinkResolution::NoAccess.sentence()),
+            (LinkResolution::StoreNotHere { store_id: held_id, node_id: moved_to }, MAX_LINK_HOPS, LinkResolution::Missing.sentence()),
+            (LinkResolution::NoAccess, 0, LinkResolution::NoAccess.sentence()),
+            (LinkResolution::Missing, 0, LinkResolution::Missing.sentence()),
+            (LinkResolution::Deleted { store_id: asked_store, node_id: asked_node }, 0, LinkResolution::Deleted { store_id: asked_store, node_id: asked_node }.sentence()),
         ] {
-            let sentence = resolution.sentence().unwrap();
+            let sentence = said.unwrap();
             events.send(BackendEvent::LinkResolved { url: url.clone(), hops, resolution }).unwrap();
             pump(store);
             assert_eq!(store.notice.get(), sentence);

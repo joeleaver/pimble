@@ -190,6 +190,13 @@ async fn main() -> Result<()> {
             let text = if args.len() > 5 { args[5..].join(" ") } else { args[4].clone() };
             append_link(&args[2], &args[3], &args[4], &text).await?;
         }
+        "resolve-link" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pimble-cli resolve-link <pimble:store/node>");
+                return Ok(());
+            }
+            resolve_link(&args[2]).await?;
+        }
         "show-node" => {
             if args.len() < 4 {
                 eprintln!("Usage: pimble-cli show-node <store-id> <node-id>");
@@ -398,6 +405,7 @@ COMMANDS:
     list-deleted        List a store's tombstones and unlisted live nodes
     set-node-text       Set a node's content from plain text
     append-link         Append a paragraph linking <text> to <href> (a pimble: or web link)
+    resolve-link        Say where a pimble: link leads from this server (live, deleted, ...)
     show-node           Print a node's metadata and content text
     search              Search across all open stores
     rebuild-index       Rebuild a store's search index from scratch
@@ -1337,6 +1345,19 @@ async fn append_link(store_id: &str, node_id: &str, href: &str, text: &str) -> R
         .apply_edit(store_id, node_id, "pimble-cli", EditOperation::IncrementalChanges { changes })
         .await?;
     println!("Linked \"{}\" to {} in node {}", text, href, node_id);
+    Ok(())
+}
+
+/// One `resolveLink` from this server: where the link leads, or the sentence a
+/// reader would see.
+async fn resolve_link(href: &str) -> Result<()> {
+    let url = pimble_core::PimbleUrl::parse(href).ok_or_else(|| anyhow::anyhow!("not a pimble: link: {href}"))?;
+    let client = connect().await?;
+    let resolution = client.resolve_link(url.store, url.node).await?;
+    match &resolution {
+        pimble_core::LinkResolution::Live { store_id, node_id } => println!("Live pimble:{}/{}", store_id, node_id),
+        other => println!("{:?}: {}", other, other.sentence().unwrap_or("")),
+    }
     Ok(())
 }
 

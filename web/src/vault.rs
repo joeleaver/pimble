@@ -1756,8 +1756,10 @@ impl VaultClient {
         let mut ancestors = Vec::new();
         if let Some(store) = self.stores.get(&store_id) {
             let mut at = node_id;
+            // As far as this page holds: a member's page stops at the
+            // share's root, whose parent it does not hold.
             while let Some(parent) = store.tree.doc(at).and_then(|doc| doc.fields().ok()).and_then(|f| f.parent_id) {
-                if ancestors.contains(&parent) || ancestors.len() >= 256 {
+                if ancestors.contains(&parent) || ancestors.len() >= 256 || store.tree.doc(parent).is_none() {
                     break;
                 }
                 ancestors.push(parent);

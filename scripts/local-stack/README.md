@@ -99,6 +99,34 @@ store's `manifest.json`; `create-node <store> <parent> <type> <title>`.
    with its text, and bob's desktop shows the delete in Holiday. `grep -rl` of any typed
    word or title under `$STACK/stores` finds nothing.
 
+## The links walk-through (what the PM ran on 2026-09-28, docs/LINKS_CONTRACT.md wave 4)
+
+`scripts/local-stack/links-setup.sh` starts the stack and builds the data: alice's `Family`
+(hosted; `Holiday` shared as "Holiday plans" with bob and carol, `Private` not) and `Work`
+(plain, with `Holiday` mounted and a `Plan` that links into `Family`); bob's `Hotel` (forty
+paragraphs) and `Links` (a link each to a note alice moved out of the share, a note bob
+deleted, a note alice transplanted into `Work`, one in `Private`, `Hotel`, a web page); then
+the move, the delete and the transplant. Ids land in `$STACK/ids.sh`. Nodes the app opens
+must be `document`s (a `note` selects in the tree and never opens).
+
+1. Headless, `resolve-link <url>` on each machine: alice gets `Live` for every moved note
+   (the new ids) and `Deleted` for the scrap; bob and carol get `NoAccess` for the note
+   moved out of the share and the private one, `Deleted` for the scrap, and
+   `StoreNotHere` (the server's answer; the app turns it into no access) for the one in
+   `Work`.
+2. bob's desktop app (headless server stopped, `state.json` naming his replica), driven over
+   the debug port (`click` with `"modifiers":["ctrl"]`): each broken link's sentence in the
+   status bar, word for word; "the hotel" opens it and selects its row, the badge stays
+   `Connected`; in `Hotel`, select words and Ctrl+Shift+L, then Ctrl+V on a new line in
+   `Links` inserts the quoted words, linked.
+3. carol in the browser: lines added above the linked paragraph and words typed at its
+   start; bob's Ctrl+click on the deep link opens `Hotel` with exactly the quoted words
+   selected. The same links Ctrl+clicked in carol's page: the same sentences, and the deep
+   link lands on the same words.
+4. alice's desktop app (both stores open): `Plan`'s link follows the `became` into
+   `Family/Private`, the one to `Hotel` reveals it under `Family`'s `Holiday` (its own
+   store, not the mount), and `[[diary` offers the private note and links it.
+
 ## The apps on the same identities
 
 Stop the headless desktop for that name, write

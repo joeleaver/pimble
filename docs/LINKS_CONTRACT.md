@@ -151,7 +151,9 @@ ever leaves the app without the modifier.
   clipboard on the desktop, `navigator.clipboard` in the browser; "Link copied." in the
   status bar).
   **Copy Link to Here** (editor context menu and Ctrl+Shift+L) copies a deep link to the
-  caret. Ctrl+Shift+L is built (2026-09-23, `LinksPlugin`'s keymap, `links::copy_link_here`
+  caret; with words selected, to where they start, quoting those words, so following it
+  selects what was selected (2026-09-28, found in the walk-through: the head of a
+  selection made left to right is its end, and the link skipped the chosen words). Ctrl+Shift+L is built (2026-09-23, `LinksPlugin`'s keymap, `links::copy_link_here`
   on rinch PR joeleaver/rinch#900's `collab_sticky_index`; checked in the app); the
   editor context menu item is not.
 - **Paste**: plain text that parses as a Pimble URL or an `http(s)` URL, pasted over a
@@ -271,7 +273,14 @@ Opening an external URL is pimble's own business, not rinch's: `open::that` on t
    stopped in another store the app holds, or shows the sentence. Built 2026-09-23.
 4. The PM's walk-through: both apps, a link across stores, across a mount, into a share a
    second account holds and one it does not, through a transplant, a deep link surviving
-   edits by the other window.
+   edits by the other window. **Passed on 2026-09-28** on the local stack
+   (`scripts/local-stack/links-setup.sh`, steps in `scripts/local-stack/README.md`, "The
+   links walk-through"), with three fixes: a note moved into a store the reader does not
+   hold read "This link is to a store that isn't on this device." instead of no access
+   (`events::stop_sentence`: the last hop decides); revealing a followed note on a
+   member's replica asked for the store's root, which a partial replica does not hold,
+   and the status bar showed "Node not found" (`GetAncestors` on both backends stops at
+   the first parent this device cannot read); Copy Link to Here with a selection.
 
 ## Later
 
