@@ -1,7 +1,11 @@
 # Next session: start here
 
-**2026-09-28: links are done on branch `links`** (all four waves; the walk-through passed,
-see "rinch now" and "Wave 4" below), rinch is back on `main`, and merging is Joe's call.
+**2026-09-28: links shipped as v0.5.0** (Joe: "merge links into master and cut a
+release"). `links` fast-forwarded into `master`; release commit 50bb706, tag `v0.5.0`; the Release run built both packages and
+/api/v1/releases serves them. No
+jkbase deploy: the hosted web app and server are still the v0.4.0 code, so links in the
+browser against production wait for a deploy (Joe's call). Nothing in a store changed
+shape that an older client trips on: `became` is one more key a v0.4.0 client ignores.
 
 Updated 2026-09-23, later. **Where things stand:** Joe moved off performance ("let's move
 on from performance now and go back to core features"): the rinch perf follow-ups are being
