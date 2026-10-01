@@ -41,8 +41,10 @@ use yrs::{
 use crate::blocks::{blocks_from_plain_text, Block};
 use crate::content_doc::{
     blocks_of_projection, decode_update, diff_since, fresh_snapshot, join_units, replacement_delta,
-    append_delta, project, snapshot_from_blocks, transaction_changed, units_of_projection,
+    append_delta, model_edit_delta, model_of, project, snapshot_from_blocks, transaction_changed,
+    units_of_projection,
 };
+use crate::markdown;
 use crate::links::{self, links_of_model, LinkRef, Resolved, Spot};
 use crate::error::{CrdtError, Result};
 
@@ -306,6 +308,64 @@ impl NodeDoc {
     pub fn append_blocks(&mut self, blocks: &[Block]) -> Result<Vec<u8>> {
         let seed = !self.has_projection();
         let delta = append_delta(&self.save(), seed, blocks)?;
+        self.apply_update(&delta)?;
+        Ok(delta)
+    }
+
+    // ── Content as Markdown (docs/MCP_CONTRACT.md) ───────────────────────
+    //
+    // Each edit below is an edit of the content's existing history, like
+    // `append_blocks`: it answers the delta it applied, and touches only the
+    // blocks it names, so whatever anyone else typed elsewhere merges beside
+    // it. A refusal (`CrdtError::Refused`) changes nothing.
+
+    /// The content as Markdown; empty when nothing was ever written. See
+    /// [`markdown::render`] for what Markdown cannot say yet.
+    pub fn markdown(&self) -> Result<String> {
+        let seed = !self.has_projection();
+        let model = model_of(&self.save(), seed)?;
+        Ok(if markdown::is_blank(&model) { String::new() } else { markdown::render(&model) })
+    }
+
+    /// The first content of a node nothing was written in yet; refused when it
+    /// has content.
+    pub fn write_markdown(&mut self, md: &str) -> Result<Vec<u8>> {
+        self.markdown_edit(|schema, doc| markdown::write_new(schema, doc, md))
+    }
+
+    /// `md` after the content (instead of it, when the content is blank).
+    pub fn append_markdown(&mut self, md: &str) -> Result<Vec<u8>> {
+        self.markdown_edit(|schema, doc| markdown::append(schema, doc, md))
+    }
+
+    /// `md` after the top-level block `quote` names, or with `after_section`
+    /// after the section under the heading it names.
+    pub fn insert_markdown_after(&mut self, quote: &str, after_section: bool, md: &str) -> Result<Vec<u8>> {
+        self.markdown_edit(|schema, doc| markdown::insert_after(schema, doc, quote, after_section, md))
+    }
+
+    /// The blocks under the heading `heading` names, up to the next heading of
+    /// its level or higher, replaced by `md`. The heading itself stays.
+    pub fn replace_section_markdown(&mut self, heading: &str, md: &str) -> Result<Vec<u8>> {
+        self.markdown_edit(|schema, doc| markdown::replace_section(schema, doc, heading, md))
+    }
+
+    /// The one occurrence of `quote` in the content replaced by `text` (plain
+    /// text, taking the marks of the quote's first character).
+    pub fn replace_text(&mut self, quote: &str, text: &str) -> Result<Vec<u8>> {
+        self.markdown_edit(|schema, doc| markdown::replace_text(schema, doc, quote, text))
+    }
+
+    fn markdown_edit(
+        &mut self,
+        edit: impl FnOnce(&std::rc::Rc<rinch_editor_core::Schema>, &rinch_editor_core::Node) -> Result<rinch_editor_core::Node>,
+    ) -> Result<Vec<u8>> {
+        let seed = !self.has_projection();
+        let delta = model_edit_delta(&self.save(), seed, edit)?;
+        if delta.is_empty() {
+            // `record_local` recorded nothing: the model after is the model before.
+            return Err(CrdtError::Refused("That would change nothing, so nothing was written.".into()));
+        }
         self.apply_update(&delta)?;
         Ok(delta)
     }

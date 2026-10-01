@@ -14,7 +14,8 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 yrs = { workspace = true }
-rinch-editor-core = { workspace = true }
+rinch-editor-core = { workspace = true, features = ["markdown"] }
+pulldown-cmark = { version = "0.12", default-features = false }
 rinch-editor-collab = { workspace = true }
 
 [dev-dependencies]

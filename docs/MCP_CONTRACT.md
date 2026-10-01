@@ -108,12 +108,19 @@ lands, `docs/MOVE_CONTRACT.md`; the tool reports the new id and the shares left)
 
 ### Markdown, in and out
 
-The LLM reads and writes Markdown (CommonMark plus `~~strike~~`). The conversion lives in
-`pimble-crdt` (`markdown.rs`: `blocks_to_markdown`, `markdown_to_blocks`), so the CLI and
-the importer can use it too. rinch's editor core already has a Markdown serializer
-(`rinch-editor-core/src/serialize/markdown.rs`, images and unsafe URLs included); wave 1
-starts by deciding whether to build on it (going through the editor model) or to convert
-straight between Markdown and `Block`.
+The LLM reads and writes Markdown (CommonMark plus `~~strike~~`). **Decided in wave 1:
+the conversion is rinch's own** (`rinch_editor_core::serialize::markdown`), between
+Markdown and the editor model, never through `pimble_crdt::Block`: the model that comes out
+of a document is the one an edit goes back in through, so a block nobody names keeps
+everything the collaboration scope knows about it. `pimble_crdt::markdown` adds the strict
+pre-pass (`check`: the refusals below, with line numbers, since rinch's parser drops what
+it does not know silently) and the block edits; `NodeDoc::markdown`, `write_markdown`,
+`append_markdown`, `insert_markdown_after`, `replace_section_markdown` and `replace_text`
+are the API, each answering the delta it applied or `CrdtError::Refused(sentence)`.
+Upstream (rinch PR, in progress 2026-10-01): the five marks below as HTML tags both ways,
+tables built from and written to Markdown, edge whitespace moved outside emphasis
+delimiters, and a strict parse; until it lands those marks read as plain text, and a
+rewrite of a block that held them drops them.
 
 - It covers exactly the collaboration scope, `pimble_crdt::Block`: paragraphs, headings
   1-6, code blocks, nested bullet and ordered lists, and the marks bold, italic,

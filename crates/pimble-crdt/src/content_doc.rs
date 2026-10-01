@@ -252,6 +252,46 @@ pub(crate) fn append_delta(current: &[u8], seed: bool, blocks: &[Block]) -> Resu
     session.save_incremental().map_err(|e| CrdtError::Collab(e.to_string()))
 }
 
+/// The delta of `edit`, a function from the editor model of the content in
+/// `current` (a document's whole state) to the model after, as an edit of that
+/// content's history. With `seed`, the document holds no projection yet: `edit` is
+/// given a blank document (one empty paragraph) and the delta is a fresh snapshot of
+/// what it answers. The caller applies the delta itself.
+///
+/// What `edit` leaves the same node is not touched: the projection's diff skips
+/// blocks by identity and splices only the changed text inside a changed block, so a
+/// concurrent edit anywhere else, or in the same paragraph outside the splice,
+/// survives the merge.
+pub(crate) fn model_edit_delta(
+    current: &[u8],
+    seed: bool,
+    edit: impl FnOnce(&Rc<Schema>, &Node) -> Result<Node>,
+) -> Result<Vec<u8>> {
+    let collab = |e: rinch_editor_collab::CollabError| CrdtError::Collab(e.to_string());
+    let schema = Rc::new(Schema::starter_kit());
+    if seed {
+        let after = edit(&schema, &build_doc(&schema, &[])?)?;
+        let state = EditorState::create(schema.clone(), after, default_plugins());
+        return Ok(CollabSession::new(&state).map_err(collab)?.snapshot());
+    }
+    let mut session = CollabSession::from_bytes(current).map_err(collab)?;
+    let before = session.projected_doc(&schema).map_err(collab)?;
+    let after = edit(&schema, &before)?;
+    session.record_local(&schema, &before, &after).map_err(collab)?;
+    session.save_incremental().map_err(collab)
+}
+
+/// The editor model of the content in `bytes`, a blank document when there is no
+/// projection yet. An error when the content cannot be projected.
+pub(crate) fn model_of(bytes: &[u8], seed: bool) -> Result<Node> {
+    let schema = Rc::new(Schema::starter_kit());
+    if seed {
+        return build_doc(&schema, &[]);
+    }
+    let collab = |e: rinch_editor_collab::CollabError| CrdtError::Collab(e.to_string());
+    CollabSession::from_bytes(bytes).map_err(collab)?.projected_doc(&schema).map_err(collab)
+}
+
 /// The content of the projection in `bytes` (a document's whole state) as a NEW
 /// document: the snapshot of a fresh projection of the same editor model, from a new
 /// client id. This is how a transplant carries content from one node document to

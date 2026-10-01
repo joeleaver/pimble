@@ -5044,6 +5044,7 @@ version = "0.5.1"
 dependencies = [
  "chrono",
  "pimble-core",
+ "pulldown-cmark",
  "rinch-editor-collab",
  "rinch-editor-core",
  "serde",
@@ -5469,6 +5470,17 @@ checksum = "d11f2fedc3b7dafdc2851bc52f277377c5473d378859be234bc7ebb593144d01"
 dependencies = [
  "ar_archive_writer",
  "cc",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f86ba2052aebccc42cbbb3ed234b8b13ce76f75c3551a303cb2bcffcff12bb14"
+dependencies = [
+ "bitflags 2.10.0",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]
@@ -6314,6 +6326,7 @@ name = "rinch-editor-core"
 version = "0.1.0"
 source = "git+https://github.com/joeleaver/rinch.git?branch=main#63fee3a365d5a96172cf465a4c1a2bebe78ba377"
 dependencies = [
+ "pulldown-cmark",
  "regex",
  "thiserror 1.0.69",
 ]
@@ -8037,6 +8050,12 @@ checksum = "7c8a2469e56e6e5095c82ccd3afb98dad95f7af7929aab6d8ba8d6e0f73657da"
 dependencies = [
  "arrayvec",
 ]
+
+[[package]]
+name = "unicase"
+version = "2.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
 
 [[package]]
 name = "unicode-ident"
