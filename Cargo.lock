@@ -4930,7 +4930,6 @@ version = "0.5.1"
 dependencies = [
  "base64 0.22.1",
  "crossbeam-channel",
- "dirs",
  "js-sys",
  "open",
  "pimble-client",
@@ -4939,7 +4938,6 @@ dependencies = [
  "pimble-rpc",
  "pimble-server",
  "pimble-store",
- "rand 0.9.2",
  "rinch",
  "rinch-editor-core",
  "rinch-tabler-icons",

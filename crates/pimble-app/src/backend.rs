@@ -6,12 +6,11 @@
 //! 3. Signal Rinch to process events when data arrives
 
 use std::thread;
-use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use pimble_client::PimbleClient;
+use pimble_server::local::{ensure_connected, reconnect, server_addr, shut_down};
 use pimble_server::PimbleServer;
-use rand::Rng;
 use tokio::runtime::Runtime;
 
 use crate::commands::process_command;
@@ -36,128 +35,6 @@ impl BackendHandle {
 
         Self { cmd_tx, event_rx }
     }
-}
-
-// 7462 spells PIMB on a phone keypad. (The previous 9876 collided with the
-// Blender MCP add-on's default port: its raw TCP socket accepted our WebSocket
-// handshake and never answered, so the app sat at "Connecting..." forever.)
-//
-// `PIMBLE_APP_ADDR` (a `host:port`) moves both the address the embedded server
-// binds and the URL this client connects to, so a second instance — a test one
-// beside the app someone is actually using — runs on its own port and never
-// borrows the other's server.
-const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:7462";
-
-/// The address the embedded server binds and the client connects to.
-fn server_addr() -> String {
-    let Ok(addr) = std::env::var("PIMBLE_APP_ADDR") else {
-        return DEFAULT_SERVER_ADDR.to_string();
-    };
-    match addr.parse::<std::net::SocketAddr>() {
-        Ok(_) => addr,
-        Err(e) => {
-            tracing::warn!("PIMBLE_APP_ADDR ({addr}) is not a host:port ({e}); using {DEFAULT_SERVER_ADDR}");
-            DEFAULT_SERVER_ADDR.to_string()
-        }
-    }
-}
-
-/// That address as the URL of its JSON-RPC endpoint.
-fn server_url() -> String {
-    format!("http://{}", server_addr())
-}
-
-const MAX_CONNECT_ATTEMPTS: u32 = 6;
-const BASE_RETRY_MS: u64 = 250;
-/// Upper bound on probing an existing server. A foreign listener on our port
-/// (anything that accepts TCP but never speaks JSON-RPC) must fail fast.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Try to connect to an existing server, or start one and connect.
-/// Returns the client and optionally the server we started (if we own it).
-async fn ensure_connected() -> Result<(PimbleClient, Option<PimbleServer>), String> {
-    let mut rng = rand::rng();
-    let addr = server_addr();
-    let url = server_url();
-
-    for attempt in 0..MAX_CONNECT_ATTEMPTS {
-        // First, try connecting to an existing server (another Pimble instance),
-        // verifying it is really ours with a cheap call. Bounded by PROBE_TIMEOUT.
-        let probe = async {
-            let client = PimbleClient::connect(&url).await.ok()?;
-            client.list_stores().await.ok()?;
-            Some(client)
-        };
-        match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
-            Ok(Some(client)) => {
-                tracing::info!("Connected to existing server at {}", addr);
-                return Ok((client, None));
-            }
-            Ok(None) => {}
-            Err(_) => tracing::warn!(
-                "Something on {} accepted the connection but did not answer as a Pimble server",
-                addr
-            ),
-        }
-
-        // No server running — try to start one
-        let mut server = match addr.parse() {
-            Ok(addr) => PimbleServer::with_config(pimble_server::ServerConfig {
-                addr,
-                ..Default::default()
-            }),
-            Err(_) => PimbleServer::new(),
-        };
-        match server.start().await {
-            Ok(()) => {
-                tracing::info!("Started embedded server on {}", addr);
-                // Connect to the server we just started
-                match PimbleClient::connect(&url).await {
-                    Ok(client) => return Ok((client, Some(server))),
-                    Err(e) => {
-                        tracing::warn!("Started server but failed to connect: {}", e);
-                        let _ = server.stop().await;
-                        // Fall through to retry
-                    }
-                }
-            }
-            Err(e) => {
-                // Port might be claimed by another instance that's still starting up
-                tracing::warn!(
-                    "Failed to start server on {} (attempt {}): {}",
-                    addr,
-                    attempt + 1,
-                    e
-                );
-            }
-        }
-
-        // Exponential backoff with jitter before retrying
-        if attempt + 1 < MAX_CONNECT_ATTEMPTS {
-            let base = BASE_RETRY_MS * 2u64.pow(attempt);
-            let jitter = rng.random_range(0..=base / 2);
-            let delay = Duration::from_millis(base + jitter);
-            tracing::debug!("Retrying connection in {:?} (attempt {})", delay, attempt + 1);
-            tokio::time::sleep(delay).await;
-        }
-    }
-
-    Err(format!(
-        "Failed to connect or start a server on {} after {} attempts (is the port in use?)",
-        addr, MAX_CONNECT_ATTEMPTS
-    ))
-}
-
-/// Try to reconnect after a connection loss, optionally starting a new server.
-async fn reconnect(owned_server: &mut Option<PimbleServer>) -> Result<PimbleClient, String> {
-    // If we owned the server previously, stop it first (it may be dead anyway)
-    if let Some(mut server) = owned_server.take() {
-        let _ = server.stop().await;
-    }
-
-    let (client, new_server) = ensure_connected().await?;
-    *owned_server = new_server;
-    Ok(client)
 }
 
 /// Returns true if an error looks like a connection/transport failure
@@ -306,10 +183,5 @@ async fn backend_loop(
     }
 
     // Cleanup: only stop the server if we own it
-    if let Some(mut server) = owned_server.take() {
-        let store_manager = server.store_manager();
-        let _ = server.stop().await;
-        let mut manager = store_manager.write().await;
-        let _ = manager.flush_all().await;
-    }
+    shut_down(&mut owned_server).await;
 }

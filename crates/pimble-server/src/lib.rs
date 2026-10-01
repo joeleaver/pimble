@@ -13,6 +13,7 @@ mod fs_util;
 pub mod handler;
 pub mod jwt;
 pub mod keystore;
+pub mod local;
 pub mod principal;
 pub mod relay_face;
 mod relay_tunnel;

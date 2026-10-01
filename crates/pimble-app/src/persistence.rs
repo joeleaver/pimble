@@ -12,9 +12,11 @@
 mod imp {
     use std::path::PathBuf;
 
+    /// The file is the one `pimble_server::local` names: the open-store list
+    /// in it is shared with `pimble-mcp` (docs/MCP_CONTRACT.md "The open-store
+    /// list").
     fn state_file_path() -> PathBuf {
-        let config_dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-        config_dir.join("pimble").join("state.json")
+        pimble_server::local::state_file_path()
     }
 
     fn read_state() -> serde_json::Value {
@@ -42,10 +44,7 @@ mod imp {
 
     /// The saved open-store paths.
     pub(crate) fn load_app_state_file() -> Vec<String> {
-        read_state()["open_stores"]
-            .as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            .unwrap_or_default()
+        pimble_server::local::load_open_stores()
     }
 
     /// Save the open-store paths, keeping every other saved preference.
