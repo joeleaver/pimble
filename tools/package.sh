@@ -15,7 +15,8 @@
 #   out-dir      Defaults to dist/.
 #
 # Produces <out-dir>/pimble-<version>-linux-x86_64.tar.gz containing the
-# `pimble` binary plus LICENSE and README.md, when those are present at the
+# `pimble` binary, `pimble-mcp` beside it when built (docs/MCP_CONTRACT.md;
+# `cargo build -p pimble-mcp --release`), plus LICENSE and README.md, when those are present at the
 # repo root (as of 2026-09-15 neither is committed yet, so the archive may
 # ship with only the binary -- add them at the root and re-run to include
 # them; nothing here requires it).
@@ -51,6 +52,11 @@ trap 'rm -rf "$stage_dir"' EXIT
 
 cp "$binary_path" "$stage_dir/pimble"
 chmod 755 "$stage_dir/pimble"
+mcp_path="$(dirname "$binary_path")/pimble-mcp"
+if [ -f "$mcp_path" ]; then
+  cp "$mcp_path" "$stage_dir/pimble-mcp"
+  chmod 755 "$stage_dir/pimble-mcp"
+fi
 [ -f LICENSE ] && cp LICENSE "$stage_dir/"
 [ -f README.md ] && cp README.md "$stage_dir/"
 

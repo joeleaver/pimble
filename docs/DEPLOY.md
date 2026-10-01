@@ -142,6 +142,30 @@ Windows job built for the first time at v0.3.2, once joeleaver/rhypedb#23 was in
 check Windows before tagging with `cargo xwin check -p pimble-app --release --target
 x86_64-pc-windows-msvc` (`llvm-lib` on PATH). The Linux binary needs glibc 2.38.
 
+### pimble-mcp in the packages
+
+Both packages carry `pimble-mcp` (`pimble-mcp.exe`) beside the app (docs/MCP_CONTRACT.md):
+an MCP server over stdio that an LLM client launches. Check Windows before tagging with
+`cargo xwin check -p pimble-mcp --release --target x86_64-pc-windows-msvc` too. To connect
+a client, point it at the binary from the unpacked package:
+
+```jsonc
+// Claude Desktop: claude_desktop_config.json (Settings > Developer > Edit Config)
+{ "mcpServers": { "pimble": { "command": "/opt/pimble/pimble-mcp" } } }
+// on Windows: "command": "C:\\Program Files\\Pimble\\pimble-mcp.exe"
+```
+
+```bash
+claude mcp add pimble -- /opt/pimble/pimble-mcp      # Claude Code, Linux
+claude mcp add pimble -- "C:\Program Files\Pimble\pimble-mcp.exe"   # Claude Code, Windows
+```
+
+It joins the app's server when the app runs and starts the same server (opening the app's
+saved stores) when it does not; logs go to stderr (`RUST_LOG=debug` for more).
+`PIMBLE_APP_ADDR` moves it with the app, `PIMBLE_SERVER`/`PIMBLE_TOKEN` point it at some
+other server. The Windows build has no console window, so run it from a client, not a
+terminal.
+
 ## Deploy
 
 ```bash

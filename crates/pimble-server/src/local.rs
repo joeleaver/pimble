@@ -54,7 +54,6 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Try to connect to an existing server, or start one and connect.
 /// Returns the client and optionally the server we started (if we own it).
 pub async fn ensure_connected() -> Result<(PimbleClient, Option<PimbleServer>), String> {
-    let mut rng = rand::rng();
     let addr = server_addr();
     let url = server_url();
 
@@ -113,7 +112,9 @@ pub async fn ensure_connected() -> Result<(PimbleClient, Option<PimbleServer>), 
         // Exponential backoff with jitter before retrying
         if attempt + 1 < MAX_CONNECT_ATTEMPTS {
             let base = BASE_RETRY_MS * 2u64.pow(attempt);
-            let jitter = rng.random_range(0..=base / 2);
+            // Drawn and dropped at once: the thread-local generator is not `Send`,
+            // and this future is (pimble-mcp runs it on a multi-threaded runtime).
+            let jitter = rand::rng().random_range(0..=base / 2);
             let delay = Duration::from_millis(base + jitter);
             tracing::debug!("Retrying connection in {:?} (attempt {})", delay, attempt + 1);
             tokio::time::sleep(delay).await;

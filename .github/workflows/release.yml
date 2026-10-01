@@ -41,8 +41,8 @@ jobs:
 
       # Default features (native + onnx-download, crates/pimble-app/Cargo.toml)
       # ship semantic search statically linked, as intended for a real release.
-      - name: Build pimble-app (release)
-        run: cargo build -p pimble-app --release
+      - name: Build pimble-app and pimble-mcp (release)
+        run: cargo build -p pimble-app -p pimble-mcp --release
 
       - name: Package
         run: |
@@ -74,8 +74,8 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build pimble-app (release)
-        run: cargo build -p pimble-app --release
+      - name: Build pimble-app and pimble-mcp (release)
+        run: cargo build -p pimble-app -p pimble-mcp --release
 
       - name: Package
         shell: pwsh
@@ -84,6 +84,7 @@ jobs:
           $stage = "dist/pimble-$version-windows-x86_64"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item target/release/pimble.exe "$stage/pimble.exe"
+          Copy-Item target/release/pimble-mcp.exe "$stage/pimble-mcp.exe"
           if (Test-Path LICENSE) { Copy-Item LICENSE "$stage/" }
           if (Test-Path README.md) { Copy-Item README.md "$stage/" }
           Compress-Archive -Path "$stage/*" -DestinationPath "dist/pimble-$version-windows-x86_64.zip"

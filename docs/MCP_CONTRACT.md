@@ -2,7 +2,9 @@
 
 Status: written by the PM, 2026-10-01, from Joe's decisions of that day; approved by him
 the same day ("Yes"), with node references and subtree listing added at his request.
-Wave 1 in progress.
+Waves 1-3 built 2026-10-01 on branch `mcp`; the walk-through passed on Linux (every tool
+on a store copy, the app and `pimble-mcp` editing one paragraph at once, the server handed
+over in both directions), `scripts/mcp/`. Not yet run on Windows, not merged.
 
 ## The decisions (Joe, 2026-10-01)
 

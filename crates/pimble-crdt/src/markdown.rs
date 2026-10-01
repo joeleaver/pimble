@@ -50,7 +50,6 @@ pub fn check(md: &str) -> Result<()> {
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_FOOTNOTES);
-    options.insert(Options::ENABLE_MATH);
     let line = |offset: usize| md[..offset.min(md.len())].matches('\n').count() + 1;
     for (event, range) in Parser::new_ext(md, options).into_offset_iter() {
         let what = match &event {
@@ -60,7 +59,6 @@ pub fn check(md: &str) -> Result<()> {
             Event::Start(Tag::FootnoteDefinition(_)) | Event::FootnoteReference(_) => Some("a footnote"),
             Event::Start(Tag::HtmlBlock) | Event::Html(_) | Event::InlineHtml(_) => Some("HTML"),
             Event::TaskListMarker(_) => Some("a task list item"),
-            Event::InlineMath(_) | Event::DisplayMath(_) => Some("math"),
             Event::Start(Tag::MetadataBlock(_)) => Some("a metadata block"),
             Event::Start(Tag::Link { dest_url, .. }) if !safe_link(dest_url) => Some("a link to an unsafe address"),
             _ => None,
@@ -371,6 +369,11 @@ mod tests {
         assert!(check("[x](javascript:alert(1))").unwrap_err().to_string().contains("unsafe"));
         check("# H\n\n**b** *i* ~~s~~ `c` [l](pimble:a/b)\n\n- one\n  - two\n\n1. x\n\n```rust\nfn x() {}\n```\n\n---\n")
             .unwrap();
+    }
+
+    #[test]
+    fn dollar_signs_are_text_not_math() {
+        check("it cost $5 and then $10").unwrap();
     }
 
     #[test]

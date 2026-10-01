@@ -58,6 +58,7 @@ the hosted server to this version together.
 | `pimble-plugins` | `NodePlugin` trait, built-ins | Skeleton |
 | `pimble-app` | UI library (desktop and web) plus the `pimble` desktop binary | Works: two-window live editing, persistence, local and remote mounts, replica sync UI |
 | `pimble-cli` | server, stores, nodes, mounts, replica sync, search | Complete |
+| `pimble-mcp` | MCP server over stdio: an LLM reads, searches and writes the open stores through the local server (`docs/MCP_CONTRACT.md`) | Built, Linux walk-through passed |
 | `pimble-import` | Scrivener + RTF import | Complete |
 | `pimble-cloud` | Pimble Cloud accounts service: users, sessions, verification mail, hosted stores, grants, keys, JWTs | Complete (phases 1 and 2a) |
 | `pimble-crypto` | client-side cryptography: password-derived keys, account keys, envelopes, blobs | Complete |
@@ -220,10 +221,11 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
   active node (`editor::set_read_only`), so a role that changes while the document is open
   flips it; remote changes keep applying while locked. The outbound closure's access
   guard is the invariant, not the mechanism.
-- Rinch's collab scope is flat text blocks (paragraph, heading, code block), nested bullet
-  and ordered lists, and the starter-kit marks (bold, italic, underline, strike, code, link,
-  highlight, text colour, sub/superscript). Block quotes, tables, images and hard breaks in a
-  collaborating document fail loudly by design. `pimble_crdt::Block` is that scope as data;
+- Rinch's collab scope (at `63fee3a`) is flat text blocks (paragraph, heading, code block),
+  nested bullet and ordered lists, horizontal rules, the inline atoms image and hard break,
+  and the starter-kit marks (bold, italic, underline, strike, code, link, highlight, text
+  colour, sub/superscript). Block quotes and tables fail loudly until joeleaver/rinch#1229
+  and #1233 merge; images have no storage in Pimble yet (`docs/IMAGES_CONTRACT.md`). `pimble_crdt::Block` is that scope as data;
   `NodeDoc::from_blocks` builds a document from it (the importer's way in).
 
 ### Tree appearance (done 2026-09-15)
@@ -492,6 +494,9 @@ vault-link start), so a reopened replica no longer reports a placeholder root.
 - `crates/pimble-server/tests/common/mod.rs` - the sharing test harness (`share.rs`, `share_upkeep.rs`): stub accounts service, hosted server, cuttable relay, fixture
 - `docs/RELAY_CONTRACT.md`, `crates/pimble-server/src/relay_face.rs`, `relay_tunnel.rs`, `crates/pimble-cloud/src/relay.rs` - sharing from an unhosted store
 - `scripts/local-stack/` - the whole stack on one machine, and the sharing walk-through
+- `docs/MCP_CONTRACT.md`, `crates/pimble-mcp/`, `scripts/mcp/` - the MCP server, its tools, and driving it over stdio
+- `crates/pimble-crdt/src/markdown.rs` - Markdown in and out of a node's content, and the edits that touch only the blocks they name
+- `crates/pimble-server/src/local.rs` - how every local client finds, joins or starts the server; the open-store list
 - `scripts/perf/` - profiling the desktop app: an isolated app on a store copy, a driver for rinch's debug port, per-thread CPU, and a patch that logs every DOM write
 - `crates/pimble-store/src/local.rs` - LocalStore
 - `crates/pimble-rpc/src/methods.rs` - RPC API trait
