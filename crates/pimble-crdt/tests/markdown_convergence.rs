@@ -109,6 +109,38 @@ fn an_edit_that_changes_nothing_is_refused() {
     assert_eq!(a.save(), before);
 }
 
+/// Reported 2026-10-01: a replacement that only deletes (a shorter phrase next to a
+/// link or inline code) was refused as changing nothing, because the check compared
+/// state vectors and a deletion does not move one. It must apply and reach a replica.
+#[test]
+fn a_deletion_only_replacement_applies_and_merges() {
+    let (mut a, mut b) = replicas("See [the docs](https://example.com) for more details.\n\nRun `make` and then wait.");
+    let delta = a.replace_text("for more details", "for details").unwrap();
+    assert!(b.apply_update(&delta).unwrap().changed, "the deletion changes the other replica");
+    a.replace_text("and then wait", "and wait").unwrap();
+    let merged = merge(&mut a, &mut b);
+    assert_eq!(merged, "See [the docs](https://example.com) for details.\n\nRun `make` and wait.");
+}
+
+#[test]
+fn replace_content_leaves_a_paragraph_someone_is_typing_in() {
+    let (mut a, mut b) = replicas("# Plan\n\nkeep this paragraph\n\nold step one\n\nold step two");
+    a.replace_content_markdown("# Plan\n\nkeep this paragraph\n\n## Steps\n\n- new step").unwrap();
+    b.replace_text("keep this paragraph", "keep this paragraph, typed meanwhile").unwrap();
+    let merged = merge(&mut a, &mut b);
+    assert_eq!(merged, "# Plan\n\nkeep this paragraph, typed meanwhile\n\n## Steps\n\n- new step");
+}
+
+#[test]
+fn remove_section_and_replace_block_merge_beside_other_edits() {
+    let (mut a, mut b) = replicas(DOC);
+    a.remove_section("Errands").unwrap();
+    b.replace_block_markdown("Groceries", "## Shopping").unwrap();
+    let merged = merge(&mut a, &mut b);
+    assert!(merged.starts_with("## Shopping\n\nthe quick brown fox"), "{merged}");
+    assert!(!merged.contains("Errands") && !merged.contains("post office"), "{merged}");
+}
+
 /// A tiny deterministic generator, so a failing seed replays.
 struct Rng(u64);
 impl Rng {
@@ -127,11 +159,18 @@ fn random_edit(doc: &mut NodeDoc, rng: &mut Rng, step: usize) {
     let words = ["quick", "fox", "milk", "eggs", "post", "bank", "Errands", "Groceries", "new"];
     let quote = rng.pick(&words);
     let text = format!("w{step}");
-    let _ = match rng.next() % 5 {
+    let _ = match rng.next() % 9 {
         0 => doc.replace_text(quote, &format!("{quote} {text}")),
         1 => doc.replace_text(quote, &text),
         2 => doc.insert_markdown_after(quote, rng.next().is_multiple_of(2), &format!("new {text}")),
         3 => doc.replace_section_markdown(quote, &format!("- {text}\n- more")),
+        4 => doc.replace_text(quote, ""),
+        5 => doc.replace_block_markdown(quote, if rng.next().is_multiple_of(2) { "" } else { "## Groceries" }),
+        6 => doc.remove_section(quote),
+        7 => {
+            let current = doc.markdown().unwrap_or_default();
+            doc.replace_content_markdown(&format!("{current}\n\n{text}").replace("milk", "oat milk"))
+        }
         _ => doc.append_markdown(&format!("**{text}** end")),
     };
 }

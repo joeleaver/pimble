@@ -21,7 +21,7 @@
 
 use std::rc::Rc;
 
-use pulldown_cmark::{Event, Options, Parser, Tag};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use rinch_editor_core::serialize::markdown::{doc_from_markdown, doc_to_markdown};
 use rinch_editor_core::{Fragment, Node, Schema};
 
@@ -51,7 +51,28 @@ pub fn check(md: &str) -> Result<()> {
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_FOOTNOTES);
     let line = |offset: usize| md[..offset.min(md.len())].matches('\n').count() + 1;
+    // The marks open around the current text: inline code cannot carry any of them.
+    let mut open: Vec<&'static str> = Vec::new();
     for (event, range) in Parser::new_ext(md, options).into_offset_iter() {
+        match &event {
+            Event::Start(Tag::Strong) => open.push("bold"),
+            Event::Start(Tag::Emphasis) => open.push("italic"),
+            Event::Start(Tag::Strikethrough) => open.push("struck through"),
+            Event::Start(Tag::Link { .. }) => open.push("a link"),
+            Event::End(TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough | TagEnd::Link) => {
+                open.pop();
+            }
+            Event::Code(_) if !open.is_empty() => {
+                return Err(refused(format!(
+                    "Line {} puts inline code inside {}; inline code in Pimble cannot also be bold, \
+                     italic, struck through or a link, so nothing was written. Put the code \
+                     outside it (\"**Run** `make`\", \"see [the docs](url): `make`\").",
+                    line(range.start),
+                    open.last().unwrap()
+                )));
+            }
+            _ => {}
+        }
         let what = match &event {
             Event::Start(Tag::BlockQuote(_)) => Some("a block quote"),
             Event::Start(Tag::Table(_)) => Some("a table"),
@@ -251,6 +272,96 @@ pub(crate) fn replace_section(schema: &Rc<Schema>, doc: &Node, heading: &str, md
     let end = section_end(doc, index, level);
     let blocks = parsed_blocks(schema, md)?;
     Ok(splice(doc, index + 1, end, &blocks))
+}
+
+/// `doc` with `children` as its blocks, one empty paragraph when there are none (an
+/// editor document always has a block).
+fn with_blocks(schema: &Rc<Schema>, doc: &Node, mut children: Vec<Node>) -> Result<Node> {
+    if children.is_empty() {
+        children.push(schema.branch("paragraph", Fragment::empty()).map_err(collab)?);
+    }
+    Ok(doc.copy_with_content(Fragment::from_children(children)))
+}
+
+/// The top-level block a quote names, replaced by `md`; an empty `md` deletes it.
+/// What removes or re-levels one heading, or turns a paragraph into a list.
+pub(crate) fn replace_block(schema: &Rc<Schema>, doc: &Node, quote: &str, md: &str) -> Result<Node> {
+    let index = block_index(doc, quote)?;
+    let blocks = if md.trim().is_empty() { Vec::new() } else { parsed_blocks(schema, md)? };
+    let after = splice(doc, index, index + 1, &blocks);
+    with_blocks(schema, &after, after.content().children().to_vec())
+}
+
+/// The heading a quote names and everything under it, up to the next heading of its
+/// level or higher, removed.
+pub(crate) fn remove_section(schema: &Rc<Schema>, doc: &Node, heading: &str) -> Result<Node> {
+    let (index, level) = heading_index(doc, heading)?;
+    let end = section_end(doc, index, level);
+    let after = splice(doc, index, end, &[]);
+    with_blocks(schema, &after, after.content().children().to_vec())
+}
+
+/// The whole content replaced by `md`, as the smallest set of block edits: blocks
+/// that read the same before and after (the same Markdown) stay the same nodes, and
+/// each stretch between them is one step, last stretch first so earlier indices hold.
+/// Recorded step by step, an unchanged block between two changed ones is never touched,
+/// so anyone typing in it keeps their words and caret, and it keeps whatever Markdown
+/// cannot say about it. An empty `md` clears the content.
+pub(crate) fn replace_content(schema: &Rc<Schema>, doc: &Node, md: &str) -> Result<Vec<Node>> {
+    let new: Vec<Node> = if md.trim().is_empty() { Vec::new() } else { parsed_blocks(schema, md)? };
+    let old: Vec<Node> = doc.content().children().to_vec();
+    let key = |block: &Node| -> Result<String> {
+        Ok(render(&schema.branch("doc", Fragment::from_node(block.clone())).map_err(collab)?))
+    };
+    let old_keys = old.iter().map(key).collect::<Result<Vec<_>>>()?;
+    let new_keys = new.iter().map(key).collect::<Result<Vec<_>>>()?;
+    // A blank document is replaced outright.
+    if is_blank(doc) {
+        return Ok(vec![with_blocks(schema, doc, new)?]);
+    }
+
+    // Longest common subsequence of the blocks' Markdown.
+    let (n, m) = (old.len(), new.len());
+    let mut lcs = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if old_keys[i] == new_keys[j] { lcs[i + 1][j + 1] + 1 } else { lcs[i + 1][j].max(lcs[i][j + 1]) };
+        }
+    }
+    // The changed stretches: (old range, new blocks).
+    let mut hunks: Vec<(usize, usize, Vec<Node>)> = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    let (mut start_i, mut start_j) = (0, 0);
+    let flush = |i: usize, j: usize, start_i: usize, start_j: usize, hunks: &mut Vec<(usize, usize, Vec<Node>)>| {
+        if i > start_i || j > start_j {
+            hunks.push((start_i, i, new[start_j..j].to_vec()));
+        }
+    };
+    while i < n || j < m {
+        if i < n && j < m && old_keys[i] == new_keys[j] {
+            flush(i, j, start_i, start_j, &mut hunks);
+            i += 1;
+            j += 1;
+            start_i = i;
+            start_j = j;
+        } else if j < m && (i == n || lcs[i][j + 1] >= lcs[i + 1][j]) {
+            j += 1;
+        } else {
+            i += 1;
+        }
+    }
+    flush(i, j, start_i, start_j, &mut hunks);
+
+    let mut steps = Vec::with_capacity(hunks.len());
+    let mut current = doc.clone();
+    for (from, to, blocks) in hunks.into_iter().rev() {
+        current = splice(&current, from, to, &blocks);
+        if current.child_count() == 0 {
+            current = with_blocks(schema, &current, Vec::new())?;
+        }
+        steps.push(current.clone());
+    }
+    Ok(steps)
 }
 
 /// The one occurrence of `quote` replaced by `text` inside its textblock. Text the two
@@ -472,6 +583,52 @@ mod tests {
         let d = doc("- milk\n- eggs\n  - brown");
         assert_eq!(render(&replace_text(&s, &d, "brown", "white").unwrap()), render(&doc("- milk\n- eggs\n  - white")));
         assert!(same_text(&replace_text(&s, &d, "brown", "brown").unwrap(), &d));
+    }
+
+    #[test]
+    fn inline_code_inside_a_mark_is_refused() {
+        for md in ["**`make`**", "**Run `make` now**", "[`foo`](https://x.y)", "~~`x`~~", "*a `b`*"] {
+            let err = check(md).unwrap_err().to_string();
+            assert!(err.contains("inline code inside"), "{md}: {err}");
+        }
+        check("**Run** `make`, see [the docs](https://x.y): `foo`").unwrap();
+    }
+
+    #[test]
+    fn replace_block_re_levels_or_removes_one_block() {
+        let s = schema();
+        let d = doc("# Title\n\nintro\n\n## Old heading\n\nbody");
+        assert_eq!(render(&replace_block(&s, &d, "Old heading", "### New heading").unwrap()), "# Title\n\nintro\n\n### New heading\n\nbody");
+        assert_eq!(render(&replace_block(&s, &d, "Old heading", "").unwrap()), "# Title\n\nintro\n\nbody");
+        assert_eq!(render(&replace_block(&s, &d, "intro", "- a\n- b").unwrap()), "# Title\n\n- a\n- b\n\n## Old heading\n\nbody");
+    }
+
+    #[test]
+    fn remove_section_takes_the_heading_and_its_body() {
+        let s = schema();
+        let d = doc("# A\n\na1\n\n## A.x\n\nax\n\n# B\n\nb1");
+        assert_eq!(render(&remove_section(&s, &d, "A.x").unwrap()), "# A\n\na1\n\n# B\n\nb1");
+        assert_eq!(render(&remove_section(&s, &d, "B").unwrap()), "# A\n\na1\n\n## A.x\n\nax");
+        let only = doc("# Only\n\ntext");
+        assert!(is_blank(&remove_section(&s, &only, "Only").unwrap()));
+    }
+
+    #[test]
+    fn replace_content_keeps_unchanged_blocks_as_the_same_nodes() {
+        let s = schema();
+        let d = doc("one\n\ntwo\n\nthree\n\nfour");
+        let steps = replace_content(&s, &d, "one\n\n2\n\nthree\n\nfour\n\nfive").unwrap();
+        let after = steps.last().unwrap();
+        assert_eq!(render(after), "one\n\n2\n\nthree\n\nfour\n\nfive");
+        assert!(after.child(0).same_ref(d.child(0)));
+        assert!(after.child(2).same_ref(d.child(2)));
+        assert!(after.child(3).same_ref(d.child(3)));
+        assert_eq!(steps.len(), 2, "two separate stretches changed");
+        // Reordering, deleting everything, and the same content.
+        let swapped = replace_content(&s, &d, "four\n\none\n\ntwo\n\nthree").unwrap();
+        assert_eq!(render(swapped.last().unwrap()), "four\n\none\n\ntwo\n\nthree");
+        assert!(is_blank(replace_content(&s, &d, "").unwrap().last().unwrap()));
+        assert!(replace_content(&s, &d, "one\n\ntwo\n\nthree\n\nfour").unwrap().is_empty());
     }
 
     fn same_text(a: &Node, b: &Node) -> bool {

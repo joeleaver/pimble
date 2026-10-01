@@ -38,8 +38,12 @@ is written then. Link to another node with its pimble: link as the href.
 
 Edits touch only what they name: append, insert_after (after a block, or after a heading's \
 section), replace_section (the blocks under a heading), replace_text (an exact quote inside \
-one paragraph). A quote must appear exactly once in the node. There is no whole-document \
-rewrite. create_node takes the new node's first content. Deleting is undoable \
+one paragraph, plain text), replace_block (one block replaced, or removed with empty \
+Markdown: a heading removed or re-levelled), remove_section (a heading and everything under \
+it). A quote must appear exactly once in the node. For restructuring, replace_content \
+rewrites the whole content but writes only the blocks that differ, and the node keeps its \
+link: never delete and recreate a note to restructure it. create_node takes the new node's \
+first content. Inline code cannot also be bold, italic, struck through or a link. Deleting is undoable \
 (undelete_node, and the app's Recently Deleted).";
 
 pub struct Pimble {
@@ -93,13 +97,17 @@ impl Pimble {
         if node.access == StoreAccess::Read {
             return Err(StoreAccess::READ_ONLY_REFUSAL.to_string());
         }
-        let mut doc = NodeDoc::load(&node.content).map_err(|e| format!("The node's document could not be read: {e}"))?;
+        let unreadable = |e: CrdtError| format!("The node's document could not be read: {e}");
+        let mut doc = NodeDoc::load(&node.content).map_err(unreadable)?;
         let before = doc.state_vector();
         edit(&mut doc)?;
-        if doc.state_vector() == before {
+        let delta = doc.diff_since(&before).map_err(|e| e.to_string())?;
+        // Whether the edit changed anything is what merging it into the document as it
+        // was says, never the state vector: a deletion alone does not move it.
+        let mut untouched = NodeDoc::load(&node.content).map_err(unreadable)?;
+        if !untouched.apply_update(&delta).map_err(|e| e.to_string())?.changed {
             return Err("That would change nothing, so nothing was written.".into());
         }
-        let delta = doc.diff_since(&before).map_err(|e| e.to_string())?;
         let changes = base64::engine::general_purpose::STANDARD.encode(delta);
         client
             .apply_edit(addr.store, addr.node, &self.client_id, EditOperation::IncrementalChanges { changes })
@@ -224,6 +232,35 @@ pub struct ReplaceTextParams {
     pub quote: String,
     /// What replaces it (plain text; empty deletes the quote).
     pub text: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ReplaceBlockParams {
+    /// The node.
+    pub node: String,
+    /// Text that appears in exactly one block (a heading, a paragraph, a list item's
+    /// text names its whole list).
+    pub block: String,
+    /// What replaces that block, as Markdown; empty removes it.
+    #[serde(default)]
+    pub markdown: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RemoveSectionParams {
+    /// The node.
+    pub node: String,
+    /// Text of the heading to remove, together with everything under it.
+    pub heading: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ReplaceContentParams {
+    /// The node.
+    pub node: String,
+    /// The node's whole new content, as Markdown. Blocks that stay the same are left
+    /// untouched; empty clears the content.
+    pub markdown: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -589,6 +626,40 @@ impl Pimble {
         let addr = nodes::resolve(&client, &p.node).await?;
         self.edit(&client, addr, |doc| doc.replace_text(&p.quote, &p.text).map(drop).map_err(crdt)).await?;
         Ok(format!("Replaced the text in {}.", addr.link()))
+    }
+
+    /// Replace one block (a heading, a paragraph, a list, a code block) with
+    /// Markdown, or remove it with empty Markdown: removing or re-levelling a heading,
+    /// turning a paragraph into a list.
+    #[tool(name = "replace_block")]
+    async fn replace_block(&self, Parameters(p): Parameters<ReplaceBlockParams>) -> Result<String, String> {
+        let client = self.client().await?;
+        let addr = nodes::resolve(&client, &p.node).await?;
+        self.edit(&client, addr, |doc| doc.replace_block_markdown(&p.block, &p.markdown).map(drop).map_err(crdt))
+            .await?;
+        let did = if p.markdown.trim().is_empty() { "Removed" } else { "Replaced" };
+        Ok(format!("{did} the block in {}.", addr.link()))
+    }
+
+    /// Remove a heading and everything under it, up to the next heading of its level
+    /// or higher.
+    #[tool(name = "remove_section")]
+    async fn remove_section(&self, Parameters(p): Parameters<RemoveSectionParams>) -> Result<String, String> {
+        let client = self.client().await?;
+        let addr = nodes::resolve(&client, &p.node).await?;
+        self.edit(&client, addr, |doc| doc.remove_section(&p.heading).map(drop).map_err(crdt)).await?;
+        Ok(format!("Removed the section \"{}\" from {}.", p.heading, addr.link()))
+    }
+
+    /// Replace the node's whole content, for restructuring. Only what differs is
+    /// written: blocks that read the same stay untouched (and so does anyone typing in
+    /// them), and the node keeps its link. Prefer the smaller edits for small changes.
+    #[tool(name = "replace_content")]
+    async fn replace_content(&self, Parameters(p): Parameters<ReplaceContentParams>) -> Result<String, String> {
+        let client = self.client().await?;
+        let addr = nodes::resolve(&client, &p.node).await?;
+        self.edit(&client, addr, |doc| doc.replace_content_markdown(&p.markdown).map(drop).map_err(crdt)).await?;
+        Ok(format!("Replaced the content of {}.", addr.link()))
     }
 
     /// Rename a node.

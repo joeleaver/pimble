@@ -41,7 +41,7 @@ use yrs::{
 use crate::blocks::{blocks_from_plain_text, Block};
 use crate::content_doc::{
     blocks_of_projection, decode_update, diff_since, fresh_snapshot, join_units, replacement_delta,
-    append_delta, model_edit_delta, model_of, project, snapshot_from_blocks, transaction_changed,
+    append_delta, model_edit_delta, model_edit_steps, model_of, project, snapshot_from_blocks, transaction_changed,
     units_of_projection,
 };
 use crate::markdown;
@@ -356,17 +356,46 @@ impl NodeDoc {
         self.markdown_edit(|schema, doc| markdown::replace_text(schema, doc, quote, text))
     }
 
+    /// The top-level block `quote` names replaced by `md`, or removed when `md`
+    /// is empty (one heading removed or re-levelled, a paragraph made a list).
+    pub fn replace_block_markdown(&mut self, quote: &str, md: &str) -> Result<Vec<u8>> {
+        self.markdown_edit(|schema, doc| markdown::replace_block(schema, doc, quote, md))
+    }
+
+    /// The heading `heading` names and everything under it removed.
+    pub fn remove_section(&mut self, heading: &str) -> Result<Vec<u8>> {
+        self.markdown_edit(|schema, doc| markdown::remove_section(schema, doc, heading))
+    }
+
+    /// The whole content replaced by `md`, recorded as the smallest set of block
+    /// edits: the blocks that read the same stay untouched (see
+    /// [`markdown::replace_content`]). The node keeps its id and its link.
+    pub fn replace_content_markdown(&mut self, md: &str) -> Result<Vec<u8>> {
+        let seed = !self.has_projection();
+        let delta = model_edit_steps(&self.save(), seed, |schema, doc| markdown::replace_content(schema, doc, md))?;
+        self.apply_markdown_delta(delta)
+    }
+
     fn markdown_edit(
         &mut self,
         edit: impl FnOnce(&std::rc::Rc<rinch_editor_core::Schema>, &rinch_editor_core::Node) -> Result<rinch_editor_core::Node>,
     ) -> Result<Vec<u8>> {
         let seed = !self.has_projection();
         let delta = model_edit_delta(&self.save(), seed, edit)?;
+        self.apply_markdown_delta(delta)
+    }
+
+    fn apply_markdown_delta(&mut self, delta: Vec<u8>) -> Result<Vec<u8>> {
+        // Nothing recorded (an empty delta), or a delta whose merge changes nothing: the
+        // model after is the model before. Judged by the merge, never by the state
+        // vector, which a deletion alone does not move.
+        let nothing = || CrdtError::Refused("That would change nothing, so nothing was written.".into());
         if delta.is_empty() {
-            // `record_local` recorded nothing: the model after is the model before.
-            return Err(CrdtError::Refused("That would change nothing, so nothing was written.".into()));
+            return Err(nothing());
         }
-        self.apply_update(&delta)?;
+        if !self.apply_update(&delta)?.changed {
+            return Err(nothing());
+        }
         Ok(delta)
     }
 

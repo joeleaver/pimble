@@ -149,8 +149,9 @@ rewrite of a block that held them drops them.
 
 ### Edits that touch only what they name
 
-A whole-document rewrite drops what Markdown cannot say, and fights with a person typing
-in the same node. So there is none. The write tools name the blocks they change:
+A wholesale rewrite (a fresh document, or one edit spanning every block) drops what
+Markdown cannot say, and fights with a person typing in the same node. So there is none.
+The write tools name the blocks they change:
 
 | Tool | Edit |
 | --- | --- |
@@ -159,6 +160,18 @@ in the same node. So there is none. The write tools name the blocks they change:
 | `replace_section` | the blocks under a heading, up to the next heading of its level or higher |
 | `replace_text` | an exact quote inside one block, replaced by new text; marks outside the quote untouched |
 | `write_new` | the content of a node whose content was never written (a node `create_node` just made) |
+| `replace_block` | the one top-level block a quote names, replaced by Markdown or removed when it is empty (a heading removed or re-levelled) |
+| `remove_section` | a heading and everything under it, up to the next heading of its level or higher |
+| `replace_content` | the whole content, written as the smallest set of block edits: blocks whose Markdown is the same before and after stay the same nodes, and each changed stretch is recorded as its own step (last first), so an unchanged block between two changed ones is never touched and anyone typing in it keeps their words. The node keeps its id and link |
+
+`replace_block`, `remove_section` and `replace_content` were added on Joe's bug report of
+2026-10-01: restructuring a note meant deleting and recreating it, which changed its
+link. The same report found that `pimble-mcp` refused a replacement that only deletes as
+"changing nothing" (it compared state vectors, which a deletion does not move; whether an
+edit changes anything is now what merging it into the document as it was says,
+`NodeUpdateEffect::changed`), and that bold, italic, strikethrough or a link around inline
+code was dropped without a word: rinch's `code` mark excludes them, so `check` refuses
+inline code inside any of them with a sentence that says how to write it instead.
 
 A quote names a block by its text, the way a deep link's quote does
 (`docs/LINKS_CONTRACT.md`, `quote`). It must match exactly one block; zero or several
@@ -193,7 +206,7 @@ Write:
 | Tool | What it does |
 | --- | --- |
 | `create_node` | a child of a node, with a title and optional Markdown content |
-| `append`, `insert_after`, `replace_section`, `replace_text` | as above |
+| `append`, `insert_after`, `replace_section`, `replace_text`, `replace_block`, `remove_section`, `replace_content` | as above |
 | `rename`, `set_tags` | the node's title and tags |
 | `move_node` | within a store, or between stores (`transplantNode`) |
 | `delete_node`, `undelete_node` | tombstone, put back |

@@ -267,17 +267,33 @@ pub(crate) fn model_edit_delta(
     seed: bool,
     edit: impl FnOnce(&Rc<Schema>, &Node) -> Result<Node>,
 ) -> Result<Vec<u8>> {
+    model_edit_steps(current, seed, |schema, before| Ok(vec![edit(schema, before)?]))
+}
+
+/// [`model_edit_delta`] for an edit made of several steps: `edit` answers the
+/// successive models after the one it is given, and each step is recorded against the
+/// one before it, so an edit of several separate stretches (a whole-content rewrite
+/// that keeps the blocks it did not change) records each stretch on its own and never
+/// re-projects an unchanged block that sits between two changed ones.
+pub(crate) fn model_edit_steps(
+    current: &[u8],
+    seed: bool,
+    edit: impl FnOnce(&Rc<Schema>, &Node) -> Result<Vec<Node>>,
+) -> Result<Vec<u8>> {
     let collab = |e: rinch_editor_collab::CollabError| CrdtError::Collab(e.to_string());
     let schema = Rc::new(Schema::starter_kit());
     if seed {
-        let after = edit(&schema, &build_doc(&schema, &[])?)?;
+        let blank = build_doc(&schema, &[])?;
+        let after = edit(&schema, &blank)?.pop().unwrap_or(blank);
         let state = EditorState::create(schema.clone(), after, default_plugins());
         return Ok(CollabSession::new(&state).map_err(collab)?.snapshot());
     }
     let mut session = CollabSession::from_bytes(current).map_err(collab)?;
-    let before = session.projected_doc(&schema).map_err(collab)?;
-    let after = edit(&schema, &before)?;
-    session.record_local(&schema, &before, &after).map_err(collab)?;
+    let mut before = session.projected_doc(&schema).map_err(collab)?;
+    for after in edit(&schema, &before)? {
+        session.record_local(&schema, &before, &after).map_err(collab)?;
+        before = after;
+    }
     session.save_incremental().map_err(collab)
 }
 
