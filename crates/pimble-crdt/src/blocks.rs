@@ -3,12 +3,11 @@
 //!
 //! The vocabulary is exactly what rinch's collaboration projection accepts and the
 //! app's editor renders: text blocks (paragraph, heading, code block), nested
-//! bullet/ordered lists, block quotes and tables, with the starter-kit marks. Anything
-//! outside it (task lists) or with nothing behind it in Pimble yet (images) has no
-//! variant here on purpose: a document built from these blocks always projects, so an
-//! import never produces a node the editor refuses to open. Horizontal rules and hard
-//! breaks are in the editor's scope and have no variant either: nothing builds them
-//! from outside yet.
+//! bullet/ordered lists, block quotes, tables and horizontal rules, with the
+//! starter-kit marks and, inside a paragraph or heading, the inline atoms (an image, a
+//! hard break). Anything outside it (task lists) has no variant here on purpose: a
+//! document built from these blocks always projects, so an import never produces a
+//! node the editor refuses to open.
 
 use std::rc::Rc;
 
@@ -19,19 +18,22 @@ use crate::error::{CrdtError, Result};
 /// One top-level block of a document, or one block inside a list item.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
-    Paragraph { runs: Vec<Run>, align: Align, indent: u32 },
-    Heading { level: u8, runs: Vec<Run> },
+    Paragraph { runs: Vec<Inline>, align: Align, indent: u32 },
+    Heading { level: u8, runs: Vec<Inline> },
     CodeBlock { text: String },
     BulletList { items: Vec<ListItem> },
     OrderedList { start: i64, items: Vec<ListItem> },
     Blockquote { blocks: Vec<Block> },
     Table { rows: Vec<TableRow> },
+    /// A rule across the page (a scene break): a block with nothing in it.
+    HorizontalRule,
 }
 
 impl Block {
-    /// A left-aligned, unindented paragraph.
-    pub fn paragraph(runs: Vec<Run>) -> Self {
-        Block::Paragraph { runs, align: Align::Left, indent: 0 }
+    /// A left-aligned, unindented paragraph of text runs, images and hard
+    /// breaks (a `Vec<Run>` does as well as a `Vec<Inline>`).
+    pub fn paragraph<I: Into<Inline>>(runs: Vec<I>) -> Self {
+        Block::Paragraph { runs: runs.into_iter().map(Into::into).collect(), align: Align::Left, indent: 0 }
     }
 
     /// A paragraph of unmarked text.
@@ -39,9 +41,11 @@ impl Block {
         Self::paragraph(vec![Run::plain(text)])
     }
 
-    /// The block's text with no formatting, list items joined by newlines.
+    /// The block's text with no formatting, list items joined by newlines. A
+    /// hard break reads as a newline; an image and a rule read as nothing.
     pub fn plain_text(&self) -> String {
         match self {
+            Block::HorizontalRule => String::new(),
             Block::Paragraph { runs, .. } | Block::Heading { runs, .. } => runs_text(runs),
             Block::CodeBlock { text } => text.clone(),
             Block::BulletList { items } | Block::OrderedList { items, .. } => items
@@ -95,6 +99,66 @@ impl TableCell {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListItem {
     pub blocks: Vec<Block>,
+}
+
+/// One piece of a paragraph's or a heading's content: a run of text, or one
+/// of the inline atoms rinch's collaboration scope holds.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Inline {
+    Text(Run),
+    Image(Image),
+    /// A line break inside the block (Shift+Enter). The marks of the text
+    /// around it are not kept on it: they change nothing a reader sees.
+    HardBreak,
+}
+
+impl Inline {
+    /// The run, when this is text.
+    pub fn as_run(&self) -> Option<&Run> {
+        match self {
+            Inline::Text(run) => Some(run),
+            _ => None,
+        }
+    }
+
+    /// The image, when this is one.
+    pub fn as_image(&self) -> Option<&Image> {
+        match self {
+            Inline::Image(image) => Some(image),
+            _ => None,
+        }
+    }
+}
+
+impl From<Run> for Inline {
+    fn from(run: Run) -> Self {
+        Inline::Text(run)
+    }
+}
+
+impl From<Image> for Inline {
+    fn from(image: Image) -> Self {
+        Inline::Image(image)
+    }
+}
+
+/// A picture in the text: rinch's `image` atom. `src` is a URL, for a picture
+/// kept in a store a `pimble-blob:` one (`pimble_core::BlobUrl`); `alt` and
+/// `title` are empty when the image has none. An image can carry marks (a
+/// link makes it clickable).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Image {
+    pub src: String,
+    pub alt: String,
+    pub title: String,
+    pub marks: Vec<Mark>,
+}
+
+impl Image {
+    /// An image with no title and no marks.
+    pub fn new(src: impl Into<String>, alt: impl Into<String>) -> Self {
+        Image { src: src.into(), alt: alt.into(), title: String::new(), marks: Vec::new() }
+    }
 }
 
 /// A stretch of text sharing one set of marks.
@@ -206,8 +270,14 @@ impl Align {
     }
 }
 
-fn runs_text(runs: &[Run]) -> String {
-    runs.iter().map(|r| r.text.as_str()).collect()
+fn runs_text(runs: &[Inline]) -> String {
+    runs.iter()
+        .map(|inline| match inline {
+            Inline::Text(run) => run.text.as_str(),
+            Inline::HardBreak => "\n",
+            Inline::Image(_) => "",
+        })
+        .collect()
 }
 
 /// One paragraph per line of `text` (a blank line is an empty paragraph; empty `text`
@@ -294,6 +364,7 @@ fn build_block(schema: &Rc<Schema>, block: &Block) -> Result<Node> {
             }
             schema.branch("table", Fragment::from_children(row_nodes)).map_err(collab)
         }
+        Block::HorizontalRule => schema.branch("horizontal_rule", Fragment::empty()).map_err(collab),
     }
 }
 
@@ -331,24 +402,43 @@ fn build_items(schema: &Rc<Schema>, items: &[ListItem]) -> Result<Fragment> {
     Ok(Fragment::from_children(nodes))
 }
 
-fn build_runs(schema: &Rc<Schema>, runs: &[Run]) -> Result<Fragment> {
+fn build_runs(schema: &Rc<Schema>, runs: &[Inline]) -> Result<Fragment> {
     let collab = |e: rinch_editor_core::EditorError| CrdtError::Collab(e.to_string());
     let mut nodes = Vec::with_capacity(runs.len());
-    for run in runs {
-        if run.text.is_empty() {
-            continue;
+    for inline in runs {
+        match inline {
+            Inline::Text(run) if run.text.is_empty() => {}
+            Inline::Text(run) => {
+                nodes.push(schema.text_with_marks(&run.text, build_marks(schema, &run.marks)?).map_err(collab)?);
+            }
+            Inline::Image(image) => {
+                let mut attrs = Attrs::new().with("src", image.src.clone());
+                if !image.alt.is_empty() {
+                    attrs = attrs.with("alt", image.alt.clone());
+                }
+                if !image.title.is_empty() {
+                    attrs = attrs.with("title", image.title.clone());
+                }
+                let node = schema.create_node("image", attrs, Fragment::empty()).map_err(collab)?;
+                nodes.push(node.with_marks(build_marks(schema, &image.marks)?));
+            }
+            Inline::HardBreak => nodes.push(schema.branch("hard_break", Fragment::empty()).map_err(collab)?),
         }
-        let mut marks = Vec::with_capacity(run.marks.len());
-        for mark in &run.marks {
+    }
+    Ok(Fragment::from_children(nodes))
+}
+
+fn build_marks(schema: &Rc<Schema>, marks: &[Mark]) -> Result<Vec<EditorMark>> {
+    marks
+        .iter()
+        .map(|mark| {
             let typ = schema
                 .mark_type(mark.name())
                 .ok_or_else(|| CrdtError::Collab(format!("schema has no mark `{}`", mark.name())))?
                 .clone();
-            marks.push(EditorMark::new(typ, mark.attrs()));
-        }
-        nodes.push(schema.text_with_marks(&run.text, marks).map_err(collab)?);
-    }
-    Ok(Fragment::from_children(nodes))
+            Ok(EditorMark::new(typ, mark.attrs()))
+        })
+        .collect()
 }
 
 // ── Reading: an editor document back to blocks ───────────────────────────
@@ -356,10 +446,10 @@ fn build_runs(schema: &Rc<Schema>, runs: &[Run]) -> Result<Fragment> {
 /// The blocks of an editor `doc` node: the reverse of [`build_doc`], for reading a
 /// document's content from outside the editor (an export, a test's assertion).
 ///
-/// [`Block`] is the importer's vocabulary and is narrower than the schema in three
+/// [`Block`] is the importer's vocabulary and is narrower than the schema in four
 /// places, all read here without complaint and without the value: a heading's
-/// `text_align` and `indent`, a code block's `language`, and a link's `title` and
-/// `target`. So this is not how content is carried from one document to another (a
+/// `text_align` and `indent`, a code block's `language`, a link's `title` and
+/// `target`, and the marks on a hard break. So this is not how content is carried from one document to another (a
 /// transplant goes through the editor's own model and loses none of them, see
 /// `content_doc::fresh_snapshot`); it is a faithful reading of everything `Block` can
 /// say. Runs come back canonical: adjacent text with the same marks is one run, marks
@@ -380,7 +470,9 @@ fn read_block(node: &Node) -> Result<Block> {
             level: node.attrs().get_int("level").unwrap_or(1).clamp(1, 6) as u8,
             runs: read_runs(node)?,
         },
-        "code_block" => Block::CodeBlock { text: read_runs(node)?.into_iter().map(|run| run.text).collect() },
+        // A code block holds text and nothing else (the schema allows no atom in one).
+        "code_block" => Block::CodeBlock { text: runs_text(&read_runs(node)?) },
+        "horizontal_rule" => Block::HorizontalRule,
         "bullet_list" => Block::BulletList { items: read_items(node)? },
         "ordered_list" => {
             Block::OrderedList { start: node.attrs().get_int("start").unwrap_or(1), items: read_items(node)? }
@@ -423,19 +515,28 @@ fn read_items(list: &Node) -> Result<Vec<ListItem>> {
         .collect()
 }
 
-fn read_runs(textblock: &Node) -> Result<Vec<Run>> {
-    let mut runs: Vec<Run> = Vec::new();
+fn read_runs(textblock: &Node) -> Result<Vec<Inline>> {
+    let mut runs: Vec<Inline> = Vec::new();
     for child in textblock.content().iter() {
+        let read_marks = || child.marks().iter().map(Mark::from_editor).collect::<Result<Vec<_>>>();
         let Some(text) = child.text() else {
-            return Err(CrdtError::Collab(format!("inline `{}` has no `Block` variant", child.type_name())));
+            runs.push(match child.type_name() {
+                "image" => {
+                    let attr = |name| child.attrs().get_str(name).unwrap_or_default().to_string();
+                    Inline::Image(Image { src: attr("src"), alt: attr("alt"), title: attr("title"), marks: read_marks()? })
+                }
+                "hard_break" => Inline::HardBreak,
+                other => return Err(CrdtError::Collab(format!("inline `{other}` has no `Block` variant"))),
+            });
+            continue;
         };
         if text.is_empty() {
             continue;
         }
-        let marks = child.marks().iter().map(Mark::from_editor).collect::<Result<Vec<_>>>()?;
+        let marks = read_marks()?;
         match runs.last_mut() {
-            Some(last) if last.marks == marks => last.text.push_str(text),
-            _ => runs.push(Run { text: text.to_string(), marks }),
+            Some(Inline::Text(last)) if last.marks == marks => last.text.push_str(text),
+            _ => runs.push(Inline::Text(Run { text: text.to_string(), marks })),
         }
     }
     Ok(runs)

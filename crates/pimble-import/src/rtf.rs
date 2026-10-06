@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 
-use pimble_crdt::{Align, Block, ListItem, Mark, Run, TableCell, TableRow};
+use pimble_crdt::{Align, Block, Inline, ListItem, Mark, Run, TableCell, TableRow};
 
 // ── Tokenizer ────────────────────────────────────────────────────────
 
@@ -757,7 +757,7 @@ fn paras_to_blocks(mut paras: Vec<Para>, tables: &Tables) -> Vec<Block> {
                 .and_then(|id| tables.lists.iter().find(|l| l.id == Some(*id)))
                 .and_then(|l| l.ordered_levels.get(level.max(0) as usize).copied())
                 .unwrap_or(false);
-            let block = Block::Paragraph { runs: para.runs, align: para.fmt.align, indent: 0 };
+            let block = Block::Paragraph { runs: inlines(para.runs), align: para.fmt.align, indent: 0 };
             lists.push_item(&mut out, ls, level.max(0), ordered, block);
             continue;
         }
@@ -782,7 +782,7 @@ impl TableBuilder {
     fn push(&mut self, para: Para) {
         // The paragraph `\row` ends holds nothing: a row's text is all in its cells.
         if para.end != ParaEnd::Row || !para.runs.is_empty() {
-            self.cell.push(Block::Paragraph { runs: para.runs, align: para.fmt.align, indent: 0 });
+            self.cell.push(Block::Paragraph { runs: inlines(para.runs), align: para.fmt.align, indent: 0 });
         }
         if para.end != ParaEnd::Par {
             self.end_cell();
@@ -830,10 +830,10 @@ fn plain_block(para: Para, tables: &Tables, body_size: Option<i32>) -> Block {
         _ => None,
     };
     if let Some(level) = styled_level.or(size_level) {
-        return Block::Heading { level, runs: para.runs };
+        return Block::Heading { level, runs: inlines(para.runs) };
     }
     let indent = if para.fmt.left_indent >= 360 { (para.fmt.left_indent as f32 / 720.0).round() as u32 } else { 0 };
-    Block::Paragraph { runs: para.runs, align: para.fmt.align, indent }
+    Block::Paragraph { runs: inlines(para.runs), align: para.fmt.align, indent }
 }
 
 fn heading_level_from_style(name: &str) -> Option<u8> {
@@ -858,6 +858,12 @@ fn dominant_size(paras: &[Para]) -> Option<i32> {
         }
     }
     weights.into_iter().max_by_key(|(size, w)| (*w, -*size)).map(|(size, _)| size)
+}
+
+/// RTF text as a block's content: runs of text and nothing else (a picture in
+/// the RTF is not imported yet, docs/IMAGES_CONTRACT.md wave 5).
+fn inlines(runs: Vec<Run>) -> Vec<Inline> {
+    runs.into_iter().map(Inline::Text).collect()
 }
 
 fn merge_adjacent_runs(runs: &mut Vec<Run>) {
@@ -1014,9 +1020,9 @@ fn decode_windows_1252(byte: u8) -> char {
 mod tests {
     use super::*;
 
-    fn runs_of(block: &Block) -> &[Run] {
+    fn runs_of(block: &Block) -> Vec<Run> {
         match block {
-            Block::Paragraph { runs, .. } | Block::Heading { runs, .. } => runs,
+            Block::Paragraph { runs, .. } | Block::Heading { runs, .. } => runs.iter().filter_map(Inline::as_run).cloned().collect(),
             other => panic!("expected a text block, got {other:?}"),
         }
     }

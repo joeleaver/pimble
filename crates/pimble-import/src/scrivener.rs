@@ -98,18 +98,19 @@ struct ImportStats {
 
 impl ImportStats {
     fn count_blocks(&mut self, blocks: &[pimble_crdt::Block]) {
-        use pimble_crdt::Block;
+        use pimble_crdt::{Block, Inline};
         for block in blocks {
             match block {
                 Block::Paragraph { runs, .. } => {
                     self.paragraphs += 1;
-                    self.marked_runs += runs.iter().filter(|r| !r.marks.is_empty()).count();
+                    self.marked_runs += runs.iter().filter_map(Inline::as_run).filter(|r| !r.marks.is_empty()).count();
                 }
                 Block::Heading { runs, .. } => {
                     self.headings += 1;
-                    self.marked_runs += runs.iter().filter(|r| !r.marks.is_empty()).count();
+                    self.marked_runs += runs.iter().filter_map(Inline::as_run).filter(|r| !r.marks.is_empty()).count();
                 }
                 Block::CodeBlock { .. } => self.paragraphs += 1,
+                Block::HorizontalRule => {}
                 Block::BulletList { items } | Block::OrderedList { items, .. } => {
                     self.lists += 1;
                     for item in items {
