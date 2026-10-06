@@ -5116,6 +5116,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pimble-image"
+version = "0.6.0"
+dependencies = [
+ "image",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "pimble-import"
 version = "0.6.0"
 dependencies = [

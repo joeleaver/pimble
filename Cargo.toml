@@ -15,6 +15,7 @@ members = [
     "crates/pimble-cloud",
     "crates/pimble-crypto",
     "crates/pimble-mcp",
+    "crates/pimble-image",
 ]
 
 [workspace.package]
@@ -101,6 +102,7 @@ pimble-server = { path = "crates/pimble-server" }
 pimble-client = { path = "crates/pimble-client" }
 pimble-plugins = { path = "crates/pimble-plugins" }
 pimble-import = { path = "crates/pimble-import" }
+pimble-image = { path = "crates/pimble-image" }
 
 # rinch's own patches, repeated here because a dependency's `[patch]` does not reach
 # the crates that use it. Keep this block the same as rinch's root Cargo.toml.

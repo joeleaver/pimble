@@ -1,0 +1,11 @@
+[package]
+name = "pimble-image"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Fitting a picture under Pimble's size limit before it is stored: one function for the desktop, the browser and the MCP server. Pure Rust, native and wasm32."
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+thiserror = { workspace = true }
