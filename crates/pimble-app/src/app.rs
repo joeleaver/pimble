@@ -11,7 +11,6 @@ use rinch::prelude::*;
 use rinch::core::{request_focus, set_keyboard_interceptor, clear_keyboard_interceptor};
 use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
 
-use crate::rinch_editor::Editor;
 use crate::protocol::{BackendCommand, CloudOp};
 #[cfg(feature = "native")]
 use crate::protocol::BackendHandle;
@@ -2088,11 +2087,28 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     }
                 };
 
+                // "Open in Split View" (docs/SPLIT_VIEW_CONTRACT.md decision
+                // 2): the focused pane is split to the right and this
+                // document opens in the new half. Off with four panes open.
+                let nv_split = nv_for_context_menu.clone();
+                let on_open_in_split = move || {
+                    let focused = store.focused();
+                    if let Some(new) = crate::pane_view::split_pane(store, focused, crate::panes::Direction::Right) {
+                        open_node_in(store, tree_state, new, nv_split.clone());
+                    }
+                };
+
                 rsx! {
                     ContextMenu {
                         ContextMenuTarget { {wrapper} }
                         ContextMenuDropdown {
                             {menu_note}
+                            DropdownMenuItem {
+                                left_section: TablerIcon::LayoutColumns,
+                                disabled: {move || !store.tiling.with(|tiling| tiling.can_split())},
+                                onclick: on_open_in_split.clone(),
+                                "Open in Split View"
+                            }
                             DropdownMenuItem {
                                 left_section: TablerIcon::FilePlus,
                                 disabled: !can_write_tree,
@@ -2256,52 +2272,30 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             }
         };
 
-        // Rich text editor (the rinch `Editor {}` component over the shared
-        // thread-local `EditorHandle`). Collaboration is wired in `start_editing`:
-        // local edits broadcast their deltas through the server relay, and remote
-        // deltas arrive via `BackendEvent::RemoteChanges`. There is no manual
-        // autosave — the collab session persists edits live (the server applies
-        // and relays each delta).
-        let editor_view = rsx! {
-            Editor { editor: crate::editor::editor(PaneId::FIRST) }
-        };
+        // The split view: one to four panes beside the explorer, each with
+        // its own title strip, toolbar and editor
+        // (docs/SPLIT_VIEW_CONTRACT.md; `pane_view.rs` draws it).
+        let mut empty_hints: Vec<&'static str> = Vec::new();
+        if CAN_ADMINISTER_STORES {
+            empty_hints.push("Or press Ctrl+N to create a new store");
+        }
+        if CAN_CREATE_HOSTED_STORES {
+            empty_hints.push("Or use + above the tree to make a store");
+        }
+        let panes_view = crate::pane_view::render_panes(__scope, store, &empty_hints);
 
-        let toolbar_handle = crate::toolbar::render_pimble_toolbar(__scope, PaneId::FIRST);
-
-        // Whether the document in the pane is one this device may only read
-        // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"): its store is
-        // held to read, or the server judged this node so (a reader's root
-        // in a store where other roots are edited) — `AppStore::node_access`,
-        // read here with tracking. `active_edit` holds the node's CANONICAL
-        // pair — where the edit would be written, even when the node was
-        // reached through a mount — so that is what decides. Reactive on the
-        // active node, on its store's own signal and on the node's, so the
-        // pane follows an access that arrives or changes. The toolbar gives
-        // way to a line saying so, and the editor is locked (the effect
-        // below) so typing does nothing.
-        //
-        // The store's own signal comes out of the registry first and is read
-        // after that borrow is released: rinch keeps every signal in one
-        // `RefCell`, and a *tracked* read takes it mutably to record the
-        // subscription — so reading one signal inside another's `with` panics.
-        // (`AppStore`'s own helpers nest freely because they are `untracked`.)
-        let editor_read_only = move || -> bool {
-            let Some(active) = store.pane(PaneId::FIRST).active_edit.get() else { return false };
-            let sig = store.store_data.with(|map| map.get(&active.store_id).copied());
-            if sig.map_or(false, |sig| sig.with(|s| !s.access.allows_write())) {
-                return true;
-            }
-            let node_sig = store.node_data.with(|map| map.get(&(active.store_id, active.node_id)).copied());
-            node_sig.map_or(false, |sig| sig.with(|n| !n.access.allows_write()))
-        };
-        // The editor's own switch follows the same judgement
-        // (`editor::set_read_only`): locked, it refuses every local change
-        // while remote ones keep landing, so a reader's keystroke changes
-        // nothing on screen. The effect lives as long as this component.
-        let _ = rinch::Effect::new(move || crate::editor::set_read_only(PaneId::FIRST, editor_read_only()));
-
-        // Editor empty state icon
-        let empty_icon = render_tabler_icon(__scope, TablerIcon::FileText, TablerIconStyle::Outline);
+        // The tree's selected row is the focused pane's document: it follows
+        // when the focus moves to another pane, by a click in it or by its
+        // editor taking the keyboard, and when that pane's document changes.
+        // Untracked inside: the tree's own selection is written here, never
+        // read.
+        let _ = rinch::Effect::new(move || {
+            let selected = store.selected_id.get();
+            untracked(|| match &selected {
+                Some(value) => tree_state.controller.select(value),
+                None => tree_state.controller.clear_selected(),
+            });
+        });
 
         // Connection status color (pure derivation → Memo)
         let status_color = Memo::new(move || {
@@ -3922,52 +3916,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             },
                         }
 
-                        // ── Editor panel ──────────────────────────
+                        // ── Panes ─────────────────────────────────
                         div {
                             class: "pimble-editor",
                             onclick: move || cancel_rename(true),
-
-                            div {
-                                class: "pimble-editor__toolbar-wrap",
-                                style: {move || if store.pane(PaneId::FIRST).show_editor.get() && !editor_read_only() { "" } else { "display: none;" }},
-                                {toolbar_handle}
-                            }
-                            // The same sentence a refused write comes back
-                            // with, so a reader meets one wording everywhere.
-                            div {
-                                class: "pimble-editor__read-only",
-                                style: {move || if store.pane(PaneId::FIRST).show_editor.get() && editor_read_only() { "" } else { "display: none;" }},
-                                {pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string()}
-                            }
-                            div {
-                                class: "pimble-editor__content-wrap",
-                                style: {|| if store.pane(PaneId::FIRST).show_editor.get() { "" } else { "display: none;" }},
-                                {editor_view}
-                            }
-                            div {
-                                class: "pimble-empty-state",
-                                style: {|| if store.pane(PaneId::FIRST).show_editor.get() { "display: none;" } else { "" }},
-                                div {
-                                    class: "pimble-empty-state__icon",
-                                    {empty_icon}
-                                }
-                                div {
-                                    class: "pimble-empty-state__text",
-                                    "Select a document to start editing"
-                                }
-                                if CAN_ADMINISTER_STORES {
-                                    div {
-                                        class: "pimble-empty-state__hint",
-                                        "Or press Ctrl+N to create a new store"
-                                    }
-                                }
-                                if CAN_CREATE_HOSTED_STORES {
-                                    div {
-                                        class: "pimble-empty-state__hint",
-                                        "Or use + above the tree to make a store"
-                                    }
-                                }
-                            }
+                            {panes_view}
                         }
                     }
 

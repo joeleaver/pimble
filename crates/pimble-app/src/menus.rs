@@ -132,6 +132,17 @@ fn view_entries(store: AppStore) -> Vec<MenuEntry> {
     vec![
         MenuEntry::item("Toggle Dark Mode", "", move || crate::app::toggle_dark_mode(store)),
         MenuEntry::Separator,
+        // The split view (docs/SPLIT_VIEW_CONTRACT.md): each acts on the
+        // focused pane. A native menu item cannot be greyed out reactively,
+        // so with four panes open a split says so instead of doing nothing.
+        MenuEntry::item("Split Right", "", move || {
+            crate::pane_view::split_focused(store, crate::panes::Direction::Right)
+        }),
+        MenuEntry::item("Split Down", "", move || {
+            crate::pane_view::split_focused(store, crate::panes::Direction::Down)
+        }),
+        MenuEntry::item("Close Pane", "", move || crate::pane_view::close_focused(store)),
+        MenuEntry::Separator,
         MenuEntry::item("Focus Search", "Ctrl+K", crate::app::focus_search),
         MenuEntry::item("Rebuild Search Index", "", move || {
             crate::app::rebuild_search_indexes(store)

@@ -312,6 +312,102 @@ pub(crate) const APP_CSS: &str = "
     background: var(--rinch-color-body);
 }
 
+/* ── The split view (docs/SPLIT_VIEW_CONTRACT.md) ───────────── */
+
+/* The tiled area: every pane and divider slot is positioned inside it. */
+.pimble-panes {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+}
+
+.pimble-pane {
+    position: absolute;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: var(--rinch-color-body);
+}
+
+.pimble-pane__title {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 28px;
+    padding: 0 6px 0 12px;
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+    border-top: 2px solid var(--rinch-color-border);
+    user-select: none;
+}
+
+/* The focused pane's strip carries the accent colour. */
+.pimble-pane--focused > .pimble-pane__title {
+    color: var(--rinch-color-text);
+    border-top-color: var(--rinch-primary-color);
+}
+
+.pimble-pane__icon {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+}
+
+.pimble-pane__icon-glyph {
+    display: inline-flex;
+    align-items: center;
+}
+
+.pimble-pane__icon svg {
+    width: 14px;
+    height: 14px;
+}
+
+.pimble-pane__name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* A split's whole space, which lets every press through but the ones on
+   its line (see `pane_view::render_divider`). */
+.pimble-pane-split {
+    position: absolute;
+    z-index: 5;
+    pointer-events: none;
+}
+
+/* The line between two panes: a strip wide enough to catch the drag. */
+.pimble-pane-divider {
+    position: absolute;
+    pointer-events: auto;
+}
+
+.pimble-pane-divider--right {
+    top: 0;
+    bottom: 0;
+    width: 7px;
+    margin-left: -3px;
+    cursor: col-resize;
+}
+
+.pimble-pane-divider--down {
+    left: 0;
+    right: 0;
+    height: 7px;
+    margin-top: -3px;
+    cursor: row-resize;
+}
+
+.pimble-pane-divider:hover {
+    background: var(--rinch-primary-color);
+    opacity: 0.5;
+}
+
 .pimble-editor__toolbar-wrap {
     border-top: 1px solid var(--rinch-color-border);
     border-bottom: 1px solid var(--rinch-color-border);

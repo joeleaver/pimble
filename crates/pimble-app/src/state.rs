@@ -690,6 +690,9 @@ pub struct AppStore {
     /// The pane a link being resolved was followed from, until it opens or
     /// is refused.
     pub link_from: Signal<Option<PaneId>>,
+    /// True while a divider between panes is being dragged: the layout is
+    /// saved when the drag ends, not on every move.
+    pub pane_dragging: Signal<bool>,
 
     // Inline rename
     pub renaming_node: Signal<Option<String>>,
@@ -1043,6 +1046,7 @@ impl AppStore {
             focused_pane: Signal::new(PaneId::FIRST),
             panes: std::array::from_fn(|_| PaneState::new()),
             link_from: Signal::new(None),
+            pane_dragging: Signal::new(false),
             renaming_node: Signal::new(None),
             rename_text: Signal::new(String::new()),
             drop_target: Signal::new(None),
