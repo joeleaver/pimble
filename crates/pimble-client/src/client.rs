@@ -11,7 +11,7 @@ use jsonrpsee::core::client::Client as RpcClient;
 use jsonrpsee::wasm_client::WasmClientBuilder;
 #[cfg(not(target_arch = "wasm32"))]
 use jsonrpsee::ws_client::{HeaderMap, HeaderValue, WsClientBuilder};
-use pimble_core::{AuthMethod, Node, NodeId, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState, Workspace};
+use pimble_core::{AuthMethod, BlobId, BlobUrl, Node, NodeId, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState, Workspace};
 use pimble_core::MountRef;
 use pimble_rpc::{
     AddRemoteStoreRequest, ApplyEditRequest, CloseStoreRequest, CloudAddHostedStoreRequest,
@@ -27,6 +27,7 @@ use pimble_rpc::{
     UpdateNodeContentRequest, UpdateNodeMetadataRequest, VaultAppendRequest, VaultDocId,
     VaultDocInfo, VaultFetchRequest, VaultFetchResponse, VaultListDocsRequest, VaultListDocsResponse,
     VaultSnapshotRequest, MAX_SYNC_NODE_CONTENTS,
+    GetBlobRequest, HaveBlobsRequest, PutBlobRequest, BLOB_CHUNK_BYTES,
 };
 use tracing::debug;
 use url::Url;
@@ -815,6 +816,81 @@ impl PimbleClient {
             .map_err(rpc_error)?;
 
         Ok(())
+    }
+
+    // ========================================================================
+    // Pictures (docs/IMAGES_CONTRACT.md)
+    // ========================================================================
+
+    /// Store `bytes` as a picture about to be inserted in `node_id`'s text
+    /// and return the `src` to give the image. `mime` is one of
+    /// `pimble_core::ImageMime::ALL` and must be what the bytes are. A
+    /// picture too large for one message goes in chunks of
+    /// [`BLOB_CHUNK_BYTES`]; the caller sees one call either way. The server
+    /// refuses a picture over `pimble_core::MAX_IMAGE_BYTES` with a sentence.
+    pub async fn put_blob(&self, store_id: StoreId, node_id: NodeId, mime: &str, bytes: &[u8]) -> Result<BlobUrl> {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let whole = bytes.len() <= BLOB_CHUNK_BYTES;
+        let total = bytes.len() as u64;
+
+        let mut url: Option<BlobUrl> = None;
+        let mut offset = 0usize;
+        loop {
+            let end = bytes.len().min(offset + BLOB_CHUNK_BYTES);
+            let request = PutBlobRequest {
+                store_id,
+                node_id,
+                mime: mime.to_string(),
+                bytes: b64.encode(&bytes[offset..end]),
+                offset: offset as u64,
+                total: (!whole).then_some(total),
+                blob_id: url.map(|url| url.blob),
+            };
+            let response = self.client.put_blob(request).await.map_err(rpc_error)?;
+            if response.complete {
+                return Ok(response.url);
+            }
+            if response.received != end as u64 || end == bytes.len() {
+                return Err(ClientError::Rpc("The server lost track of this picture's upload.".to_string()));
+            }
+            url = Some(response.url);
+            offset = end;
+        }
+    }
+
+    /// Read a picture: its MIME type and its bytes, fetched in as many
+    /// messages as its size needs.
+    pub async fn get_blob(&self, store_id: StoreId, blob_id: BlobId) -> Result<(String, Vec<u8>)> {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let mut bytes: Vec<u8> = Vec::new();
+        loop {
+            let request = GetBlobRequest { store_id, blob_id, offset: bytes.len() as u64 };
+            let response = self.client.get_blob(request).await.map_err(rpc_error)?;
+            let chunk = b64.decode(&response.bytes).map_err(|e| ClientError::Rpc(format!("Invalid base64: {}", e)))?;
+            // A blob never changes, so the chunks of one are always chunks
+            // of the same bytes; an answer that does not continue where the
+            // last one stopped is a broken server, not a new version.
+            if response.offset != bytes.len() as u64 || chunk.is_empty() || bytes.len() + chunk.len() > response.total as usize {
+                return Err(ClientError::Rpc("The server sent this picture out of order.".to_string()));
+            }
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() as u64 == response.total {
+                return Ok((response.mime, bytes));
+            }
+        }
+    }
+
+    /// Which of `ids` the server does not hold in `store_id`, in the order
+    /// given.
+    pub async fn have_blobs(&self, store_id: StoreId, ids: &[BlobId]) -> Result<Vec<BlobId>> {
+        self.client
+            .have_blobs(HaveBlobsRequest { store_id, ids: ids.to_vec() })
+            .await
+            .map(|answer| answer.missing)
+            .map_err(rpc_error)
     }
 
     // ========================================================================

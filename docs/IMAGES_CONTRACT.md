@@ -1,8 +1,9 @@
 # Images contract: pictures in a node's text, stored once beside the store
 
 Status: written by the PM, 2026-10-01, from Joe's choice of that day (a blob store per
-store, over images inline in the document or links only). Not yet approved; nothing is
-built.
+store, over images inline in the document or links only). Wave 1's server side is built
+on branch `images` (2026-10-06, not merged): see "Built in wave 1 (server side)" at the
+end. The app's loader and inserting, and waves 2 to 5, are not.
 
 ## The decisions (Joe, 2026-10-01)
 
@@ -146,8 +147,8 @@ store's images stay on the machine.
 
 - `pimble_crdt::Block`: `Run` gains an inline image (`Inline::Image { src, alt, title }`)
   alongside text, plus `HardBreak`, and `Block::HorizontalRule`, so `blocks()` and
-  `from_blocks` cover what rinch's collaboration scope now covers. Block quotes and tables
-  join when rinch's PRs for them land (an agent is on them, 2026-10-01).
+  `from_blocks` cover what rinch's collaboration scope now covers (done; block quotes
+  and tables joined with v0.6.0).
 - `NodeDoc::blob_refs`, the blob store in `pimble-store`, the three RPCs, `Reach` for blobs,
   the sync link and vault link carrying them, share upkeep wrapping their keys.
 - The app's loader, the paste/drop/menu insert, the placeholder.
@@ -166,6 +167,45 @@ store's images stay on the machine.
    the hosted disk, a member sees the owner's picture with the owner offline.
 4. Web: rinch PR 2, the vault client's fetch, paste and drop in the browser.
 5. Importer pictures; the MCP's `attach_image`.
+
+## Built in wave 1 (server side)
+
+Storage and RPCs for a plain store or replica; nothing in the app, the sync link, vault
+stores or the web yet.
+
+- **`pimble-core`** (`blob.rs`): `BlobUrl` (`pimble-blob:<store uuid>/<blob id>`, one
+  parser, one printer), `BlobId` (128 random bits as 26 characters of lowercase base32,
+  parsed strictly: it is a file name), `ImageMime` (the five accepted types, `parse` and a
+  magic-number `sniff`), `MAX_IMAGE_BYTES`, and the two refusal sentences.
+- **`pimble-crdt`**: `NodeDoc::blob_refs` / `blob_refs_of` (`BlobRef { url, alt, path }`
+  for every `image` whose `src` is a blob URL, in document order, at any depth), read
+  from the projected model as links are. `Block` gained `HorizontalRule`, and a
+  paragraph's or heading's content is `Vec<Inline>`: `Text(Run)`, `Image(Image { src,
+  alt, title, marks })`, `HardBreak`.
+- **`pimble-store`** (`blobs.rs`): `BlobStore`, reached as `LocalStore::blobs()` and
+  `StoreManager::blobs(store)`. `<store>/blobs/<blob id>` is `PIMG`, a version byte (1),
+  the MIME type (a length byte and the bytes), the image's length (`u64` LE), its
+  SHA-256, then the image. Written as `.<blob id>.part` and renamed; every read checks
+  length and hash. `put`, `put_as` (a given id: the same bytes are a no-op, other bytes
+  an error), `get`, `has`, `missing`, `upload_chunk`, and `sweep_partial` (run when the
+  store opens; a new upload also clears parts an hour old).
+- **RPCs**: as the table above, with chunking spelled out. `putBlob { store_id, node_id,
+  mime, bytes, offset?, total?, blob_id? }` answers `{ url, received, complete }`: a
+  picture that fits one message is sent whole; otherwise the first request carries
+  `total`, the answer's `url` names the id, and each later chunk names that `blob_id` and
+  the `offset` it continues from, in order. `getBlob { store_id, blob_id, offset? }`
+  answers `{ mime, bytes, offset, total }`, at most one chunk at a time. A chunk is 3 MiB
+  (`BLOB_CHUNK_BYTES`; 4 MiB as base64): the message limit in force is jsonrpsee's
+  default of **10 MiB**, not 16, since neither the server nor the client sets one.
+  `PimbleClient::put_blob` / `get_blob` / `have_blobs` hide the chunks.
+- **Who may**: `putBlob` is judged as `applyEdit` on `node_id` is (role, a member's
+  scope, a read-only replica); for a mount node the picture goes to the mount's source
+  store, judged there, and the URL names that store. `getBlob` / `haveBlobs` are for the
+  operator and whole-store readers; **a share's member is refused** with "Pictures in
+  shares are not available yet." until wave 2 judges a blob by the nodes that name it
+  (`TODO(images wave 2)` in `handler.rs`). A vault store answers `-32005`.
+- **CLI**: `put-blob <store> <node> <file>` (prints the URL; the type comes from the
+  file's first bytes) and `get-blob <url> <out file>`.
 
 ## Later
 

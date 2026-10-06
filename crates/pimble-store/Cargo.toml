@@ -19,6 +19,9 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 notify = { workspace = true }
+# A blob's header carries the SHA-256 of its image (docs/IMAGES_CONTRACT.md);
+# the version pimble-crypto already uses.
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

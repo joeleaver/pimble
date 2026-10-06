@@ -10,6 +10,7 @@ use tracing::info;
 /// Maximum depth for transitive mount resolution
 const MAX_MOUNT_DEPTH: usize = 16;
 
+use crate::blobs::BlobStore;
 use crate::error::{Result, StoreError};
 use crate::local::{peek_manifest_kind, LocalStore, NodeRemoval, SyncConfig};
 use crate::registry::{StoreEndpoint, StoreRegistry};
@@ -282,6 +283,14 @@ impl StoreManager {
 
     fn local_mut(&mut self, store_id: StoreId) -> Result<&mut LocalStore> {
         self.local_stores.get_mut(&store_id).ok_or(StoreError::NotOpen(store_id))
+    }
+
+    /// The pictures of plain store `store_id` (docs/IMAGES_CONTRACT.md): a
+    /// handle to put, get and check blobs with, used after the manager's
+    /// lock is let go. `NotOpen` for a store that is not open as a plain one
+    /// (a vault's pictures are vault documents, not files here).
+    pub fn blobs(&self, store_id: StoreId) -> Result<BlobStore> {
+        Ok(self.local(store_id)?.blobs())
     }
 
     // ── Vault (encrypted store) storage, docs/CRYPTO_CONTRACT.md ────────

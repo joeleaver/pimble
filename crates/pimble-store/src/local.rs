@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tracing::{debug, info, warn};
 
+use crate::blobs::BlobStore;
 use crate::error::{Result, StoreError};
 
 /// Which kind of link `<store>/sync.json` describes (docs/CRYPTO_CONTRACT.md
@@ -163,6 +164,8 @@ pub async fn peek_manifest_kind(path: impl AsRef<Path>) -> Result<pimble_core::S
 /// │                       # store created under this layout)
 /// ├── assets/             # Binary files
 /// │   └── {hash}.{ext}
+/// ├── blobs/              # Pictures the text names (docs/IMAGES_CONTRACT.md),
+/// │   └── {blob id}       # each written once and never changed; see `BlobStore`
 /// ├── index/              # Search index (derived, disposable)
 /// ├── sync.json           # Replica sync link, when linked
 /// └── vault-link.json     # What the hosted twin is known to hold, when vault-linked
@@ -201,6 +204,10 @@ pub struct LocalStore {
     /// `&self` (a link records its cursor on every append, under the
     /// manager's read guard, and must not hold every other RPC up to do it).
     link_access: std::sync::RwLock<LinkAccess>,
+
+    /// The store's pictures (`blobs/`), which no document holds: a handle
+    /// over the directory, cloned out by whoever reads or writes one.
+    blobs: BlobStore,
 }
 
 /// The part of [`SyncConfig`] the store keeps in memory.
@@ -279,6 +286,7 @@ impl LocalStore {
 
         let mut store = Self {
             id: manifest.id,
+            blobs: BlobStore::new(manifest.id, &path),
             path,
             manifest,
             tree,
@@ -361,6 +369,7 @@ impl LocalStore {
 
         let store = Self {
             id: manifest.id,
+            blobs: BlobStore::new(manifest.id, &path),
             path,
             manifest,
             tree: Tree::from_docs(root_node_id, HashMap::new()),
@@ -626,12 +635,19 @@ impl LocalStore {
 
         let mut store = Self {
             id: manifest.id,
+            blobs: BlobStore::new(manifest.id, &path),
             path,
             tree: Tree::from_docs(manifest.root_node_id, docs),
             manifest,
             dirty,
             link_access: std::sync::RwLock::new(link_access),
         };
+
+        // Nothing is mid-upload in a store that is only now opening: what an
+        // abandoned picture upload left in `blobs/` goes.
+        if let Err(e) = store.blobs.sweep_partial().await {
+            warn!("Store {}: could not clear unfinished picture uploads: {}", store.id, e);
+        }
 
         if store_doc_path.exists() {
             // Every migrated document reaches disk before the tree document
@@ -738,6 +754,13 @@ impl LocalStore {
             written.insert(id);
         }
         Ok(written)
+    }
+
+    /// The store's pictures: put, get and "which of these are missing"
+    /// (docs/IMAGES_CONTRACT.md). A handle, so the reading and writing
+    /// happen without a borrow of the store.
+    pub fn blobs(&self) -> BlobStore {
+        self.blobs.clone()
     }
 
     /// Get the store manifest

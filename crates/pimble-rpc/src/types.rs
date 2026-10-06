@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use pimble_core::{DeletedNode, LeftShare, MountRef, MountState, Node, NodeId, NodeMetadata, RelaySide, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState, Workspace};
+use pimble_core::{BlobId, BlobUrl, DeletedNode, LeftShare, MountRef, MountState, Node, NodeId, NodeMetadata, RelaySide, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState, Workspace};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -630,6 +630,103 @@ pub struct ApplyEditRequest {
 /// Response after applying an edit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplyEditResponse {}
+
+// ============================================================================
+// Pictures (docs/IMAGES_CONTRACT.md "RPCs")
+// ============================================================================
+
+/// The most image bytes one `putBlob` or `getBlob` message carries when a
+/// picture travels in chunks: 3 MiB, which is 4 MiB as base64. The server's
+/// and the client's message limit is jsonrpsee's default of 10 MiB (neither
+/// configures another), so a chunk fits with room to spare, and a 20 MiB
+/// picture is seven messages.
+pub const BLOB_CHUNK_BYTES: usize = 3 * 1024 * 1024;
+
+/// What `getBlob` answers a share's member until blobs are judged by the
+/// nodes that name them (docs/IMAGES_CONTRACT.md wave 2).
+pub const BLOBS_IN_SHARES_REFUSAL: &str = "Pictures in shares are not available yet.";
+
+/// What `getBlob` answers for a blob the store does not hold (yet): a
+/// replica's text can arrive before its pictures do.
+pub const BLOB_NOT_HERE: &str = "This picture has not arrived yet.";
+
+/// Store a picture about to be inserted in `node_id`'s text, or one chunk of
+/// it.
+///
+/// A picture that fits one message is sent whole: `bytes` and nothing else.
+/// A larger one is sent in order, at most [`BLOB_CHUNK_BYTES`] at a time:
+/// the first request carries `total` (the whole image's length) and the
+/// first bytes; each later one repeats `mime` and `total` and names the
+/// `blob_id` the first answer's `url` gave and the `offset` its bytes start
+/// at, which must be exactly what the server has so far. The blob exists
+/// once the answer says `complete`; an upload that is never finished leaves
+/// nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PutBlobRequest {
+    pub store_id: StoreId,
+    /// The node whose text will name the picture: what the write is judged
+    /// by (a share's member may add pictures to the nodes they may edit).
+    pub node_id: NodeId,
+    /// One of `pimble_core::ImageMime::ALL`; the bytes must be that type.
+    pub mime: String,
+    /// The image's bytes, or this chunk of them, base64.
+    pub bytes: String,
+    /// Where this chunk starts in the image. 0 for the first or only one.
+    #[serde(default)]
+    pub offset: u64,
+    /// The whole image's length. Absent: `bytes` is the whole image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    /// The upload this chunk continues. Absent on the first or only request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_id: Option<BlobId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PutBlobResponse {
+    /// The `src` to give the image: `pimble-blob:<store>/<blob id>`. The
+    /// store is the one the blob was put in (a mount's source store when
+    /// `node_id` was a mount).
+    pub url: BlobUrl,
+    /// How many of the image's bytes the server holds.
+    pub received: u64,
+    /// Whether the blob is in place. False while chunks are still to come.
+    pub complete: bool,
+}
+
+/// Read a picture, or one chunk of it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetBlobRequest {
+    pub store_id: StoreId,
+    pub blob_id: BlobId,
+    /// Where in the image to read from. 0 for the first or only request.
+    #[serde(default)]
+    pub offset: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetBlobResponse {
+    pub mime: String,
+    /// At most [`BLOB_CHUNK_BYTES`] of the image from `offset`, base64.
+    pub bytes: String,
+    /// Where `bytes` starts in the image.
+    pub offset: u64,
+    /// The whole image's length: the caller asks again from
+    /// `offset + bytes` until it has this many.
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HaveBlobsRequest {
+    pub store_id: StoreId,
+    pub ids: Vec<BlobId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HaveBlobsResponse {
+    /// Which of the ids this server does not hold, in the order asked.
+    pub missing: Vec<BlobId>,
+}
 
 // ============================================================================
 // Sync Operations

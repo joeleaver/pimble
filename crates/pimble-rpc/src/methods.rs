@@ -202,6 +202,24 @@ pub trait PimbleApi {
     async fn apply_edit(&self, request: ApplyEditRequest) -> Result<ApplyEditResponse, ErrorObjectOwned>;
 
     // ========================================================================
+    // Pictures (docs/IMAGES_CONTRACT.md)
+    // ========================================================================
+
+    /// Store a picture for an image about to be inserted in a node's text,
+    /// whole or in chunks (see [`PutBlobRequest`]). Write, judged as a write
+    /// of that node; when the node is a mount, of the mount's source.
+    #[method(name = "putBlob", with_extensions)]
+    async fn put_blob(&self, request: PutBlobRequest) -> Result<PutBlobResponse, ErrorObjectOwned>;
+
+    /// Read a picture, whole or in chunks (see [`GetBlobResponse`]). Read.
+    #[method(name = "getBlob", with_extensions)]
+    async fn get_blob(&self, request: GetBlobRequest) -> Result<GetBlobResponse, ErrorObjectOwned>;
+
+    /// Which of these blobs the server lacks. Read.
+    #[method(name = "haveBlobs", with_extensions)]
+    async fn have_blobs(&self, request: HaveBlobsRequest) -> Result<HaveBlobsResponse, ErrorObjectOwned>;
+
+    // ========================================================================
     // Sync Operations
     // ========================================================================
 
