@@ -5,12 +5,24 @@ pub(crate) const APP_CSS: &str = "
 /* ── Sidebar ────────────────────────────────────────────────── */
 
 .pimble-sidebar {
-    width: 260px;
-    min-width: 200px;
+    flex-shrink: 0;
     display: flex;
     flex-direction: column;
     background: var(--rinch-color-body);
-    border-right: 1px solid var(--rinch-color-border);
+}
+
+/* The explorer's right edge: a hairline with a wider strip to catch the drag. */
+.pimble-sidebar__resizer {
+    flex-shrink: 0;
+    width: 5px;
+    margin-right: -4px;
+    z-index: 1;
+    cursor: col-resize;
+    border-left: 1px solid var(--rinch-color-border);
+}
+
+.pimble-sidebar__resizer:hover {
+    border-left-color: var(--rinch-primary-color-filled);
 }
 
 .pimble-sidebar__header {

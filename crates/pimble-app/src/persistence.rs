@@ -65,6 +65,18 @@ mod imp {
         state["dark_mode"] = serde_json::json!(dark);
         write_state(&state);
     }
+
+    /// The explorer's width in pixels, when the person has dragged it.
+    pub(crate) fn load_sidebar_width() -> Option<f32> {
+        read_state()["sidebar_width"].as_f64().map(|w| w as f32)
+    }
+
+    /// Save the explorer's width, keeping every other saved preference.
+    pub(crate) fn save_sidebar_width(width: f32) {
+        let mut state = read_state();
+        state["sidebar_width"] = serde_json::json!(width.round());
+        write_state(&state);
+    }
 }
 
 #[cfg(not(feature = "native"))]
@@ -100,6 +112,21 @@ mod imp {
             let _ = storage.set_item(DARK_MODE_KEY, if dark { "true" } else { "false" });
         }
     }
+
+    /// Where the explorer's width lives in the browser.
+    const SIDEBAR_WIDTH_KEY: &str = "pimble.sidebar_width";
+
+    pub(crate) fn load_sidebar_width() -> Option<f32> {
+        storage()?.get_item(SIDEBAR_WIDTH_KEY).ok().flatten()?.parse().ok()
+    }
+
+    pub(crate) fn save_sidebar_width(width: f32) {
+        if let Some(storage) = storage() {
+            let _ = storage.set_item(SIDEBAR_WIDTH_KEY, &width.round().to_string());
+        }
+    }
 }
 
-pub(crate) use imp::{load_app_state_file, load_dark_mode, save_app_state_file, save_dark_mode};
+pub(crate) use imp::{
+    load_app_state_file, load_dark_mode, load_sidebar_width, save_app_state_file, save_dark_mode, save_sidebar_width,
+};

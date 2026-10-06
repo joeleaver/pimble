@@ -627,6 +627,12 @@ pub struct LinkOpen {
     pub anchor: Option<pimble_core::Anchor>,
 }
 
+/// The explorer's width before anyone drags it, and the range a drag keeps it in:
+/// wide enough to read a title, narrow enough to leave the document room.
+pub const SIDEBAR_DEFAULT_WIDTH: f32 = 260.0;
+pub const SIDEBAR_MIN_WIDTH: f32 = 160.0;
+pub const SIDEBAR_MAX_WIDTH: f32 = 640.0;
+
 /// Global application state with per-entity reactive signals.
 ///
 /// Structural changes bump `tree_structure_version` to trigger tree rebuilds.
@@ -770,6 +776,10 @@ pub struct AppStore {
     /// The theme in use (View > "Toggle Dark Mode"), persisted in `state.json`.
     /// Read reactively wherever a colour depends on the scheme.
     pub dark_mode: Signal<bool>,
+
+    /// The explorer's width in pixels: dragged at its right edge, persisted
+    /// with the theme.
+    pub sidebar_width: Signal<f32>,
 
     // "Mount Store..." picker (browser builds). The desktop picks a directory
     // on this machine; a browser has no directories to pick from, so it picks
@@ -1016,6 +1026,7 @@ impl AppStore {
             appearance_icon_query: Signal::new(String::new()),
             appearance_tags_text: Signal::new(String::new()),
             dark_mode: Signal::new(true),
+            sidebar_width: Signal::new(SIDEBAR_DEFAULT_WIDTH),
             mount_picker_target: Signal::new(None),
             mount_picker_selected: Signal::new(String::new()),
             mount_picker_error: Signal::new(String::new()),

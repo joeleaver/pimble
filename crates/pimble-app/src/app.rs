@@ -18,13 +18,14 @@ use crate::protocol::BackendHandle;
 use crate::editor::{start_editing, stop_editing};
 use crate::events::{EVENT_PROCESSOR, process_backend_events};
 use crate::appearance::{display_color, icon_by_name, icons_matching, IconGlyph, COLOR_CHOICES};
-use crate::persistence::{load_dark_mode, save_dark_mode};
+use crate::persistence::{load_dark_mode, load_sidebar_width, save_dark_mode, save_sidebar_width};
 use crate::state::{parse_tree_value, display_label_from_node, mount_is_dimmed, mount_label_suffix, AppStore, SearchState};
 use crate::state::{deleted_row_meta, deleted_row_read_only};
 use crate::state::{ShareFace, HOST_ON_CLOUD_LABEL, HOST_ON_CLOUD_SENTENCE, SHARE_FROM_HERE_LABEL, SHARE_FROM_HERE_SENTENCE};
 // Only "Mount Store Here...", which picks a directory on this machine, sets one.
 #[cfg(feature = "native")]
 use crate::state::PendingMount;
+use crate::state::{SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH};
 use crate::styles::{APP_CSS, EDITOR_CSS};
 
 /// How long after a click a second one on the same row still counts as a
@@ -889,6 +890,9 @@ fn find_context_menu_handler(node: &NodeHandle) -> Option<String> {
 pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
     let store = AppStore::new();
     store.dark_mode.set(load_dark_mode());
+    if let Some(width) = load_sidebar_width() {
+        store.sidebar_width.set(width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH));
+    }
 
     // Double-click detection for rename: (last_click_time, last_click_value)
     let last_click: Rc<Cell<(f64, String)>> = Rc::new(Cell::new((now_ms(), String::new())));
@@ -3841,6 +3845,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         // ── Sidebar ───────────────────────────────
                         div {
                             class: "pimble-sidebar",
+                            style: {move || format!("width: {}px;", store.sidebar_width.get())},
 
                             // Header: store name + new-node button
                             div {
@@ -3881,6 +3886,20 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 style: {|| if store.search_query.get().is_empty() { "display: none;" } else { "" }},
                                 {search_panel}
                             }
+                        }
+
+                        // The explorer's right edge, dragged to resize it.
+                        div {
+                            class: "pimble-sidebar__resizer",
+                            onmousedown: move || {
+                                let start_width = untracked(|| store.sidebar_width.get());
+                                let start_x = rinch::core::get_click_context().mouse_x;
+                                let width_at = move |x: f32| (start_width + x - start_x).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+                                rinch::core::Drag::absolute()
+                                    .on_move(move |x, _| store.sidebar_width.set(width_at(x)))
+                                    .on_end(move |x, _| save_sidebar_width(width_at(x)))
+                                    .start();
+                            },
                         }
 
                         // ── Editor panel ──────────────────────────
