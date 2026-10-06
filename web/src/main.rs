@@ -11,8 +11,8 @@
 //! (docs/CRYPTO_CONTRACT.md). A link that reloads would lose them, so
 //! `crate::route` moves between pages in place.
 //!
-//! The collaboration path is unchanged and deliberately so: one editor pane,
-//! one `EditorHandle`, edits travelling as yrs bytes through
+//! The collaboration path is unchanged and deliberately so: the app's four
+//! pane slots, an `EditorHandle` each, edits travelling as yrs bytes through
 //! `BroadcastChanges` and `RemoteChanges`. For an encrypted store those bytes
 //! are encrypted on their way out and decrypted on their way in
 //! (`crate::vault`), and the editor never learns the difference.

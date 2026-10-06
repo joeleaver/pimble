@@ -1,7 +1,10 @@
 # Split view contract: up to four tiled panes beside the explorer
 
-Status: written by the PM on 2026-10-06 from Joe's request and answers of that day. Not
-built.
+Status: written by the PM on 2026-10-06 from Joe's request and answers of that day. Built
+the same day on branch `split-view` (not merged): verification items 1 to 5 and 7 passed
+on the desktop; item 6 (the browser on the local stack) is recorded at the end of this
+file. Where the build differs from the text, the section says so in a line marked "As
+built".
 
 ## The decisions (Joe, 2026-10-06)
 
@@ -60,6 +63,11 @@ Pure functions on `Tiling`, unit-tested: `split(pane, direction) -> new PaneId` 
 four), `close(pane)`, `rects() -> [(PaneId, Rect)]` in fractions of the area, `dividers()`
 (each with its rect and the split it drags), `set_ratio`, and serde for persistence.
 
+As built: `drag_ratio` beside `set_ratio` (the pixel floors need the area's size); a pane
+also holds the tree value it was opened on (`selected`, which a mount path needs) and the
+document it is waiting to restore; the link tooltip and the link picker stay one each and
+belong to the focused pane (the picker closes when the focus leaves its pane).
+
 ## How it is drawn (the part that must not be done another way)
 
 **Four pane slots and three divider slots are rendered once and never re-parented.** A
@@ -84,7 +92,10 @@ and rinch's `Editor {}` component is mounted exactly four times in the app's lif
   own fan-out; a pane never receives its own delta).
 - **Remote changes** (`BackendEvent::RemoteChanges`) go to every pane holding that node.
 - `SubscribeNodeChanges` once per node, however many panes hold it; unsubscribe when the
-  last one lets go.
+  last one lets go. As built: `BackendCommand::UnsubscribeNodeChanges` is new, and
+  `BackendEvent::RemoteChanges` now names its store and node (it named neither, and every
+  node ever opened stayed subscribed). On the desktop the subscription task ends at the
+  next notification it is handed after the unsubscribe, and forwards nothing meanwhile.
 - The label refresh, the node cache write-back at `stop_editing`, and reconcile are per
   pane; the debounced label refresh is per node.
 
@@ -95,6 +106,11 @@ it held. The browser keeps the same JSON in `localStorage`. At start the tiling 
 restored at once; a pane opens its document when its store is open and the node is known
 (a store that never opens leaves the pane empty; a node that is gone leaves it empty).
 Saved on every change of tiling, ratio (at the end of a drag) and pane document.
+
+As built: `panes` is `{ tiling, focused, documents: [{ pane, store_id, node_id }] }`; the
+focus is remembered too. "The node is known" is asked with `resolveLink`, which answers
+live, deleted or missing in one go; a pane whose store has not opened keeps its document
+in what is saved.
 
 ## Out of scope
 
@@ -116,3 +132,9 @@ a pane; node types other than documents (the toolbar is per pane so they can com
    pane holding it.
 6. The browser on the local stack (`scripts/local-stack/`): 2, 3 and 4 again.
 7. `cargo test --workspace --release`, the wasm check, zero warnings.
+
+As built, two things in "What the person sees" differ. A native menu item cannot be greyed
+out reactively, so with four panes open View > "Split Right" / "Split Down" answer "Four
+panes are open. Close one to split again." in the status bar; the title-strip buttons and
+"Open in Split View" are disabled as written. And in a narrow pane the toolbar wraps onto
+several rows rather than scrolling.

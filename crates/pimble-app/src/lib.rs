@@ -14,10 +14,10 @@
 //!   with an embedded `PimbleServer`); the web app runs the same loop on
 //!   `wasm_bindgen_futures::spawn_local` against a hosted server.
 //!
-//! The collaboration invariants in `CLAUDE.md` hold on both: one editor pane,
-//! one thread-local `EditorHandle`, edits travelling as yrs bytes through
-//! `BroadcastChanges` and `RemoteChanges`, and never a document model in the
-//! sync path.
+//! The collaboration invariants in `CLAUDE.md` hold on both: four pane slots,
+//! each with its own `EditorHandle` in one thread-local table, edits travelling
+//! as yrs bytes through `BroadcastChanges` and `RemoteChanges`, and never a
+//! document model in the sync path.
 
 pub mod app;
 pub mod appearance;

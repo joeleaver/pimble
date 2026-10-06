@@ -210,16 +210,26 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
 
 ### Collaboration shape (keep these invariants)
 
-- The app has ONE editor pane and one thread-local `EditorHandle` (`pimble-app/src/editor.rs`).
-- Local edits: `EditorHandle` outbound closure -> `BackendCommand::BroadcastChanges` ->
-  server persists and relays -> peers receive `BackendEvent::RemoteChanges` ->
-  `EditorHandle::collab_receive`.
+- The app has FOUR pane slots, each with its own `EditorHandle` in a thread-local table
+  keyed by `PaneId` (`pimble-app/src/editor.rs`: `editor(pane)`, `focused_editor`), and its
+  own collaboration session while it holds a document. rinch's `Editor {}` is mounted
+  exactly four times in the app's life and never re-parented (see "Split view").
+- Local edits: a pane's outbound closure -> `BackendCommand::BroadcastChanges` -> server
+  persists and relays -> peers receive `BackendEvent::RemoteChanges { store_id, node_id, .. }`
+  -> `collab_receive` of every pane holding that node. The same delta also goes straight to
+  every other pane of the window holding the node (the server does not relay back to the
+  sender); a pane never receives its own delta.
+- A node is subscribed once however many panes hold it (`SubscribeNodeChanges` when the
+  first pane opens it, `UnsubscribeNodeChanges` when the last lets go). A pane opening a
+  note another pane holds joins from that pane's `collab_snapshot`, never from the cache:
+  two panes each hosting an empty document would merge into two paragraphs.
 - Never wrap the editor in a document-model layer in the sync path. Never call
   `load_html`/`load_doc` on a collaborating editor.
 - A document this device may only read is locked with rinch's `EditorHandle::set_read_only`
-  (joeleaver/rinch#832), driven by an effect in `app.rs` over `AppStore::node_access` of the
-  active node (`editor::set_read_only`), so a role that changes while the document is open
-  flips it; remote changes keep applying while locked. The outbound closure's access
+  (joeleaver/rinch#832), driven by an effect per pane in `pane_view.rs` over
+  `AppStore::node_access` of that pane's node (`editor::set_read_only`), so a role that
+  changes while the document is open flips it in every pane holding it; remote changes keep
+  applying while locked. The outbound closure's access
   guard is the invariant, not the mechanism.
 - Rinch's collab scope (at `51cb7c7`) is text blocks (paragraph, heading, code block),
   nested bullet and ordered lists, block quotes, tables (rows and columns with identities,
@@ -230,6 +240,30 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
   the scope as data, less rules, hard breaks and images (nothing builds those from outside
   yet); `NodeDoc::from_blocks` builds a document from it (the importer's way in, and RTF
   tables arrive as tables). The toolbar has a quote button and table buttons.
+
+### Split view (built 2026-10-06, branch `split-view`, not merged)
+
+Contract: `docs/SPLIT_VIEW_CONTRACT.md`. The area beside the explorer is a `Tiling`
+(`pimble-app/src/panes.rs`: a binary tree of at most four `PaneId` leaves, with pure
+`split`/`close`/`rects`/`dividers`/`drag_ratio` and serde). `pane_view.rs` renders four pane
+slots and three divider slots once and positions them in percent from the tiling; a slot
+not in the tiling is `display: none`. Splitting, closing and dragging change styles only.
+`AppStore` holds `tiling`, `focused_pane` and `panes: [PaneState; 4]` (`selected`,
+`show_editor`, `active_edit`, `pending_anchor`, `restore`); there is no single
+`active_edit`. `selected_id` is the tree's selected row and is the focused pane's
+`selected`: only `select_in_pane` and `focus_pane` write the pair. A pane takes the focus
+on a press in it and on a key in its editor (and, in the browser, on a release in it,
+because rinch-web's editor keeps its own presses). `open_node` opens in the focused pane,
+`open_node_in` in a named one ("Open in Split View", a link followed from a pane, which
+`AppStore::link_from` carries to `LinkOpen.pane`). The toolbar's button state is per pane.
+The layout is `state.json`'s `panes` (`localStorage` `pimble.panes` in the browser), saved
+on every change and at the end of a divider drag; at start the tiling comes back at once
+and each pane's document when its store opens and `resolveLink` says it is live
+(`events::restore_pane_documents`), with nothing said when it is gone. A divider's
+press is heard by an element covering its split's whole space with `pointer-events: none`
+(the line inside it takes the press), so the drag reads its ratio from the click context's
+element bounds on both backends: rinch-web feeds no `bounds_signal`. rinch gives a percent
+`Drag`'s `on_end` raw pixels, so the last `on_move` is the drag's answer.
 
 ### Tree appearance (done 2026-09-15)
 
@@ -505,7 +539,8 @@ vault-link start), so a reopened replica no longer reports a placeholder root.
 - `crates/pimble-rpc/src/methods.rs` - RPC API trait
 - `crates/pimble-server/src/handler.rs` - RPC method implementations
 - `crates/pimble-app/src/app.rs` - UI tree, menus, rename, drag-and-drop
-- `crates/pimble-app/src/editor.rs` - editor pane + collaboration wiring
+- `crates/pimble-app/src/editor.rs` - the editor of each pane + collaboration wiring
+- `docs/SPLIT_VIEW_CONTRACT.md`, `crates/pimble-app/src/panes.rs`, `pane_view.rs` - the split view: the tiling model, and the pane and divider slots
 - `crates/pimble-app/src/protocol.rs` - `BackendCommand`/`BackendEvent`; `commands.rs` - `process_command`, shared by desktop and web
 - `crates/pimble-app/src/backend.rs` - desktop background thread and embedded server (`native` only)
 - `crates/pimble-server/src/auth.rs`, `jwt.rs`, `principal.rs` - HTTP-edge auth, JWT verification, `Principal` and `authorize`
