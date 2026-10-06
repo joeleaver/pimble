@@ -221,12 +221,15 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
   active node (`editor::set_read_only`), so a role that changes while the document is open
   flips it; remote changes keep applying while locked. The outbound closure's access
   guard is the invariant, not the mechanism.
-- Rinch's collab scope (at `63fee3a`) is flat text blocks (paragraph, heading, code block),
-  nested bullet and ordered lists, horizontal rules, the inline atoms image and hard break,
-  and the starter-kit marks (bold, italic, underline, strike, code, link, highlight, text
-  colour, sub/superscript). Block quotes and tables fail loudly until joeleaver/rinch#1229
-  and #1233 merge; images have no storage in Pimble yet (`docs/IMAGES_CONTRACT.md`). `pimble_crdt::Block` is that scope as data;
-  `NodeDoc::from_blocks` builds a document from it (the importer's way in).
+- Rinch's collab scope (at `51cb7c7`) is text blocks (paragraph, heading, code block),
+  nested bullet and ordered lists, block quotes, tables (rows and columns with identities,
+  so concurrent row and column edits keep the grid rectangular), horizontal rules, the
+  inline atoms image and hard break, and the starter-kit marks (bold, italic, underline,
+  strike, code, link, highlight, text colour, sub/superscript). Task lists fail loudly;
+  images have no storage in Pimble yet (`docs/IMAGES_CONTRACT.md`). `pimble_crdt::Block` is
+  the scope as data, less rules, hard breaks and images (nothing builds those from outside
+  yet); `NodeDoc::from_blocks` builds a document from it (the importer's way in, and RTF
+  tables arrive as tables). The toolbar has a quote button and table buttons.
 
 ### Tree appearance (done 2026-09-15)
 

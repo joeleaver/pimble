@@ -2,11 +2,13 @@
 //! from outside the editor: importers (Scrivener RTF), the CLI, tests.
 //!
 //! The vocabulary is exactly what rinch's collaboration projection accepts and the
-//! app's editor renders: flat text blocks (paragraph, heading, code block) and nested
-//! bullet/ordered lists, with the starter-kit marks. Anything outside it (block
-//! quotes, tables, images, hard breaks) has no variant here on purpose: a document
-//! built from these blocks always projects, so an import never produces a node the
-//! editor refuses to open.
+//! app's editor renders: text blocks (paragraph, heading, code block), nested
+//! bullet/ordered lists, block quotes and tables, with the starter-kit marks. Anything
+//! outside it (task lists) or with nothing behind it in Pimble yet (images) has no
+//! variant here on purpose: a document built from these blocks always projects, so an
+//! import never produces a node the editor refuses to open. Horizontal rules and hard
+//! breaks are in the editor's scope and have no variant either: nothing builds them
+//! from outside yet.
 
 use std::rc::Rc;
 
@@ -22,6 +24,8 @@ pub enum Block {
     CodeBlock { text: String },
     BulletList { items: Vec<ListItem> },
     OrderedList { start: i64, items: Vec<ListItem> },
+    Blockquote { blocks: Vec<Block> },
+    Table { rows: Vec<TableRow> },
 }
 
 impl Block {
@@ -45,7 +49,45 @@ impl Block {
                 .map(|item| item.blocks.iter().map(Block::plain_text).collect::<Vec<_>>().join("\n"))
                 .collect::<Vec<_>>()
                 .join("\n"),
+            Block::Blockquote { blocks } => blocks_text(blocks),
+            Block::Table { rows } => rows
+                .iter()
+                .map(|row| row.cells.iter().map(|cell| blocks_text(&cell.blocks)).collect::<Vec<_>>().join("\t"))
+                .collect::<Vec<_>>()
+                .join("\n"),
         }
+    }
+}
+
+fn blocks_text(blocks: &[Block]) -> String {
+    blocks.iter().map(Block::plain_text).collect::<Vec<_>>().join("\n")
+}
+
+/// One row of a table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableRow {
+    pub cells: Vec<TableCell>,
+}
+
+/// One cell of a table: a paragraph, usually. A cell spanning several columns or rows
+/// says so, and the cells it covers are left out of their rows, as in HTML.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableCell {
+    pub header: bool,
+    pub colspan: u32,
+    pub rowspan: u32,
+    pub blocks: Vec<Block>,
+}
+
+impl TableCell {
+    /// A body cell holding `blocks`, spanning nothing.
+    pub fn new(blocks: Vec<Block>) -> Self {
+        TableCell { header: false, colspan: 1, rowspan: 1, blocks }
+    }
+
+    /// A header cell holding `blocks`, spanning nothing.
+    pub fn header(blocks: Vec<Block>) -> Self {
+        TableCell { header: true, ..Self::new(blocks) }
     }
 }
 
@@ -225,7 +267,47 @@ fn build_block(schema: &Rc<Schema>, block: &Block) -> Result<Node> {
             }
             schema.create_node("ordered_list", attrs, build_items(schema, items)?).map_err(collab)
         }
+        Block::Blockquote { blocks } => {
+            schema.branch("blockquote", build_blocks(schema, blocks)?).map_err(collab)
+        }
+        Block::Table { rows } => {
+            let mut row_nodes = Vec::with_capacity(rows.len().max(1));
+            for row in rows {
+                let mut cells = Vec::with_capacity(row.cells.len());
+                for cell in &row.cells {
+                    let mut attrs = Attrs::new();
+                    if cell.colspan > 1 {
+                        attrs = attrs.with("colspan", AttrValue::Int(cell.colspan as i64));
+                    }
+                    if cell.rowspan > 1 {
+                        attrs = attrs.with("rowspan", AttrValue::Int(cell.rowspan as i64));
+                    }
+                    let name = if cell.header { "table_header_cell" } else { "table_cell" };
+                    cells.push(schema.create_node(name, attrs, build_blocks(schema, &cell.blocks)?).map_err(collab)?);
+                }
+                row_nodes.push(schema.branch("table_row", Fragment::from_children(cells)).map_err(collab)?);
+            }
+            if row_nodes.is_empty() {
+                // A table needs a row; one with no rows is one empty cell.
+                let cell = schema.branch("table_cell", build_blocks(schema, &[])?).map_err(collab)?;
+                row_nodes.push(schema.branch("table_row", Fragment::from_node(cell)).map_err(collab)?);
+            }
+            schema.branch("table", Fragment::from_children(row_nodes)).map_err(collab)
+        }
     }
+}
+
+/// The blocks of a container that needs at least one (a quote, a cell): an empty
+/// slice is one empty paragraph.
+fn build_blocks(schema: &Rc<Schema>, blocks: &[Block]) -> Result<Fragment> {
+    let mut nodes = Vec::with_capacity(blocks.len().max(1));
+    for block in blocks {
+        nodes.push(build_block(schema, block)?);
+    }
+    if nodes.is_empty() {
+        nodes.push(build_block(schema, &Block::plain(""))?);
+    }
+    Ok(Fragment::from_children(nodes))
 }
 
 fn build_items(schema: &Rc<Schema>, items: &[ListItem]) -> Result<Fragment> {
@@ -303,8 +385,32 @@ fn read_block(node: &Node) -> Result<Block> {
         "ordered_list" => {
             Block::OrderedList { start: node.attrs().get_int("start").unwrap_or(1), items: read_items(node)? }
         }
+        "blockquote" => Block::Blockquote { blocks: node.content().iter().map(read_block).collect::<Result<_>>()? },
+        "table" => Block::Table { rows: node.content().iter().map(read_row).collect::<Result<_>>()? },
         other => return Err(CrdtError::Collab(format!("block `{other}` has no `Block` variant"))),
     })
+}
+
+fn read_row(row: &Node) -> Result<TableRow> {
+    let span = |cell: &Node, name: &str| cell.attrs().get_int(name).unwrap_or(1).clamp(1, u32::MAX as i64) as u32;
+    let cells = row
+        .content()
+        .iter()
+        .map(|cell| {
+            let header = match cell.type_name() {
+                "table_cell" => false,
+                "table_header_cell" => true,
+                other => return Err(CrdtError::Collab(format!("`{other}` in a table row has no `Block` variant"))),
+            };
+            Ok(TableCell {
+                header,
+                colspan: span(cell, "colspan"),
+                rowspan: span(cell, "rowspan"),
+                blocks: cell.content().iter().map(read_block).collect::<Result<_>>()?,
+            })
+        })
+        .collect::<Result<_>>()?;
+    Ok(TableRow { cells })
 }
 
 fn read_items(list: &Node) -> Result<Vec<ListItem>> {

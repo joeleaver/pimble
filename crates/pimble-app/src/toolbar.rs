@@ -85,6 +85,8 @@ fn watch_toolbar() {
 enum Cmd {
     ToggleWrap(&'static str),
     SetBlock(&'static str),
+    /// One of rinch's editor commands, by name.
+    Run(&'static str),
     HorizontalRule,
     Undo,
     Redo,
@@ -121,14 +123,23 @@ fn button_groups() -> Vec<Vec<BtnDef>> {
             BtnDef { icon: TablerIcon::H2, tooltip: "Heading 2", cmd: Cmd::SetBlock("h2"), active_check: ActiveCheck::Block("h2") },
             BtnDef { icon: TablerIcon::H3, tooltip: "Heading 3", cmd: Cmd::SetBlock("h3"), active_check: ActiveCheck::Block("h3") },
         ],
-        // Lists & blocks. Bullet and ordered lists are inside rinch's
-        // collaboration scope (flat text blocks, marks, and nested lists);
-        // blockquote stays hidden because a blockquote in a collaborating
-        // document fails loudly by design (CLAUDE.md "Collaboration shape").
+        // Lists & blocks: everything here is inside rinch's collaboration scope
+        // (CLAUDE.md "Collaboration shape"). Task lists are not, so they have no button.
         vec![
             BtnDef { icon: TablerIcon::List, tooltip: "Bullet List", cmd: Cmd::SetBlock("ul"), active_check: ActiveCheck::Block("ul") },
             BtnDef { icon: TablerIcon::ListNumbers, tooltip: "Ordered List", cmd: Cmd::SetBlock("ol"), active_check: ActiveCheck::Block("ol") },
+            BtnDef { icon: TablerIcon::Blockquote, tooltip: "Block Quote (Ctrl+Shift+B)", cmd: Cmd::SetBlock("blockquote"), active_check: ActiveCheck::Block("blockquote") },
             BtnDef { icon: TablerIcon::SourceCode, tooltip: "Code Block", cmd: Cmd::SetBlock("pre"), active_check: ActiveCheck::Block("pre") },
+        ],
+        // Tables. The row and column buttons act on the cell the caret is in and do
+        // nothing outside a table.
+        vec![
+            BtnDef { icon: TablerIcon::TablePlus, tooltip: "Insert Table", cmd: Cmd::Run("insertTable"), active_check: ActiveCheck::None },
+            BtnDef { icon: TablerIcon::RowInsertBottom, tooltip: "Add Row Below", cmd: Cmd::Run("addRowAfter"), active_check: ActiveCheck::None },
+            BtnDef { icon: TablerIcon::ColumnInsertRight, tooltip: "Add Column to the Right", cmd: Cmd::Run("addColumnAfter"), active_check: ActiveCheck::None },
+            BtnDef { icon: TablerIcon::RowRemove, tooltip: "Delete Row", cmd: Cmd::Run("deleteRow"), active_check: ActiveCheck::None },
+            BtnDef { icon: TablerIcon::ColumnRemove, tooltip: "Delete Column", cmd: Cmd::Run("deleteColumn"), active_check: ActiveCheck::None },
+            BtnDef { icon: TablerIcon::TableMinus, tooltip: "Delete Table", cmd: Cmd::Run("deleteTable"), active_check: ActiveCheck::None },
         ],
         // Insert & utility
         vec![
@@ -235,6 +246,12 @@ fn execute_cmd(cmd: &Cmd) {
                 bump_toolbar();
                 return;
             }
+            // And so is the quote button: inside a quote it lifts the block out.
+            if *tag == "blockquote" && check_active_with(&h, &ActiveCheck::Block(tag)) {
+                h.command("liftListItem");
+                bump_toolbar();
+                return;
+            }
             let name = match *tag {
                 "h1" => "setHeading1",
                 "h2" => "setHeading2",
@@ -245,6 +262,9 @@ fn execute_cmd(cmd: &Cmd) {
                 "pre" => "setCodeBlock",
                 _ => return,
             };
+            h.command(name);
+        }
+        Cmd::Run(name) => {
             h.command(name);
         }
         Cmd::HorizontalRule => {

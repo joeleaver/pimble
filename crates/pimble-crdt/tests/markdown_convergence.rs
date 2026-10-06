@@ -79,10 +79,26 @@ fn concurrent_section_replacements_converge() {
 }
 
 #[test]
+fn quotes_and_tables_are_written_read_and_edited_beside_each_other() {
+    let md = "> a quoted line\n\n| item | count |\n| --- | --- |\n| milk | 2 |\n| eggs | 12 |";
+    let (mut a, mut b) = replicas(md);
+    assert_eq!(b.markdown().unwrap(), md);
+    // One edits inside a cell, the other inside the quote.
+    a.replace_text("milk", "oat milk").unwrap();
+    b.replace_text("quoted", "well quoted").unwrap();
+    let merged = merge(&mut a, &mut b);
+    assert_eq!(merged, "> a well quoted line\n\n| item | count |\n| --- | --- |\n| oat milk | 2 |\n| eggs | 12 |");
+    // And the blocks vocabulary reads both.
+    let blocks = a.blocks().unwrap();
+    assert!(matches!(blocks[0], pimble_crdt::Block::Blockquote { .. }), "{blocks:?}");
+    assert!(matches!(&blocks[1], pimble_crdt::Block::Table { rows } if rows.len() == 3 && rows[0].cells[0].header), "{blocks:?}");
+}
+
+#[test]
 fn a_refusal_writes_nothing() {
     let (mut a, _) = replicas(DOC);
     let before = a.save();
-    let err = a.append_markdown("| a | b |\n|---|---|").unwrap_err();
+    let err = a.append_markdown("![a cat](cat.png)").unwrap_err();
     assert!(matches!(err, CrdtError::Refused(_)), "{err}");
     assert!(matches!(a.replace_text("milk", "oat milk\nand more"), Err(CrdtError::Refused(_))));
     assert!(matches!(a.write_markdown("again"), Err(CrdtError::Refused(_))));
@@ -159,7 +175,7 @@ fn random_edit(doc: &mut NodeDoc, rng: &mut Rng, step: usize) {
     let words = ["quick", "fox", "milk", "eggs", "post", "bank", "Errands", "Groceries", "new"];
     let quote = rng.pick(&words);
     let text = format!("w{step}");
-    let _ = match rng.next() % 9 {
+    let _ = match rng.next() % 11 {
         0 => doc.replace_text(quote, &format!("{quote} {text}")),
         1 => doc.replace_text(quote, &text),
         2 => doc.insert_markdown_after(quote, rng.next().is_multiple_of(2), &format!("new {text}")),
@@ -171,6 +187,8 @@ fn random_edit(doc: &mut NodeDoc, rng: &mut Rng, step: usize) {
             let current = doc.markdown().unwrap_or_default();
             doc.replace_content_markdown(&format!("{current}\n\n{text}").replace("milk", "oat milk"))
         }
+        8 => doc.insert_markdown_after(quote, false, &format!("> quoted {text}\n>\n> - in a quote")),
+        9 => doc.append_markdown(&format!("| item | count |\n| --- | --- |\n| {text} | 1 |\n| cell {step} | 2 |")),
         _ => doc.append_markdown(&format!("**{text}** end")),
     };
 }

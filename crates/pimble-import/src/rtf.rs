@@ -9,14 +9,16 @@
 //! or bold-and-larger paragraphs into headings, and produces the [`Block`]s a
 //! [`pimble_crdt::NodeDoc`] is built from.
 //!
+//! A table (`\cell`, `\row`) is a [`Block::Table`], each cell holding its paragraphs.
+//!
 //! Everything the content model cannot hold is reduced rather than dropped silently:
-//! a table becomes one paragraph per row with cells separated by tabs, a line break
-//! becomes a paragraph break, a picture is skipped, and Scrivener's inline placeholder
+//! a line break becomes a paragraph break, a picture is skipped, a table's merged
+//! cells and header rows read as plain cells, and Scrivener's inline placeholder
 //! tags (`<$Scr_Ps::0>`, `<!$Scr_H::4>`) are stripped from the text.
 
 use std::collections::HashMap;
 
-use pimble_crdt::{Align, Block, ListItem, Mark, Run};
+use pimble_crdt::{Align, Block, ListItem, Mark, Run, TableCell, TableRow};
 
 // ── Tokenizer ────────────────────────────────────────────────────────
 
@@ -176,6 +178,15 @@ struct Para {
     all_bold: bool,
     /// The font size of the paragraph's first text, in half-points.
     size: Option<i32>,
+    end: ParaEnd,
+}
+
+/// What ended a paragraph: an ordinary break, or the end of a table cell or row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ParaEnd {
+    Par,
+    Cell,
+    Row,
 }
 
 #[derive(Debug, Default)]
@@ -279,7 +290,7 @@ impl Interp {
             }
         }
         self.flush_run();
-        self.finish_para();
+        self.finish_para(ParaEnd::Par);
     }
 
     fn open(&mut self) {
@@ -415,14 +426,17 @@ impl Interp {
     fn text_word(&mut self, word: &str, param: Option<i32>) {
         let on = param != Some(0);
         match word {
-            "par" | "line" | "row" => {
+            "par" | "line" => {
                 self.flush_run();
-                self.finish_para();
+                self.finish_para(ParaEnd::Par);
             }
             "cell" => {
                 self.flush_run();
-                self.push_text('\t');
+                self.finish_para(ParaEnd::Cell);
+            }
+            "row" => {
                 self.flush_run();
+                self.finish_para(ParaEnd::Row);
             }
             "pard" => {
                 self.group().para = ParaFmt::default();
@@ -491,7 +505,7 @@ impl Interp {
             "emspace" | "enspace" | "qmspace" => self.push_text(' '),
             "sect" | "page" | "column" => {
                 self.flush_run();
-                self.finish_para();
+                self.finish_para(ParaEnd::Par);
             }
             _ => {}
         }
@@ -686,13 +700,13 @@ impl Interp {
         marks
     }
 
-    fn finish_para(&mut self) {
+    fn finish_para(&mut self, end: ParaEnd) {
         let runs = std::mem::take(&mut self.runs);
         let all_bold = self.all_bold && runs.iter().any(|r| r.text.chars().any(|c| !c.is_whitespace()));
         let size = self.para_size.take();
         self.all_bold = true;
         let fmt = self.stack.last().map(|g| g.para.clone()).unwrap_or_default();
-        self.paras.push(Para { runs, fmt, all_bold, size });
+        self.paras.push(Para { runs, fmt, all_bold, size, end });
     }
 }
 
@@ -720,15 +734,22 @@ fn paras_to_blocks(mut paras: Vec<Para>, tables: &Tables) -> Vec<Block> {
         para.runs.retain(|r| !r.text.is_empty());
         merge_adjacent_runs(&mut para.runs);
     }
-    while paras.last().map_or(false, |p| p.runs.iter().all(|r| r.text.trim().is_empty())) {
+    while paras.last().map_or(false, |p| p.end == ParaEnd::Par && p.runs.iter().all(|r| r.text.trim().is_empty())) {
         paras.pop();
     }
 
     let body_size = dominant_size(&paras);
     let mut out: Vec<Block> = Vec::new();
     let mut lists = ListStack::default();
+    let mut table = TableBuilder::default();
 
     for para in paras {
+        if para.end != ParaEnd::Par || para.fmt.in_table {
+            lists.flush(&mut out);
+            table.push(para);
+            continue;
+        }
+        table.flush(&mut out);
         if let Some((ls, level)) = para.fmt.list {
             let ordered = tables
                 .overrides
@@ -744,7 +765,53 @@ fn paras_to_blocks(mut paras: Vec<Para>, tables: &Tables) -> Vec<Block> {
         out.push(plain_block(para, tables, body_size));
     }
     lists.flush(&mut out);
+    table.flush(&mut out);
     out
+}
+
+/// The table being read: paragraphs gather into a cell until `\cell`, cells into a
+/// row until `\row`, rows into a table until a paragraph outside one.
+#[derive(Default)]
+struct TableBuilder {
+    cell: Vec<Block>,
+    row: Vec<TableCell>,
+    rows: Vec<TableRow>,
+}
+
+impl TableBuilder {
+    fn push(&mut self, para: Para) {
+        // The paragraph `\row` ends holds nothing: a row's text is all in its cells.
+        if para.end != ParaEnd::Row || !para.runs.is_empty() {
+            self.cell.push(Block::Paragraph { runs: para.runs, align: para.fmt.align, indent: 0 });
+        }
+        if para.end != ParaEnd::Par {
+            self.end_cell();
+        }
+        if para.end == ParaEnd::Row {
+            self.end_row();
+        }
+    }
+
+    fn end_cell(&mut self) {
+        if !self.cell.is_empty() {
+            self.row.push(TableCell::new(std::mem::take(&mut self.cell)));
+        }
+    }
+
+    fn end_row(&mut self) {
+        if !self.row.is_empty() {
+            self.rows.push(TableRow { cells: std::mem::take(&mut self.row) });
+        }
+    }
+
+    /// The table read so far, if any; a cell or row the RTF never closed is closed here.
+    fn flush(&mut self, out: &mut Vec<Block>) {
+        self.end_cell();
+        self.end_row();
+        if !self.rows.is_empty() {
+            out.push(Block::Table { rows: std::mem::take(&mut self.rows) });
+        }
+    }
 }
 
 /// A non-list paragraph: a heading when its style says so or it is bold and larger
@@ -1093,11 +1160,17 @@ mod tests {
     }
 
     #[test]
-    fn tables_flatten_to_tab_separated_rows_and_pictures_are_skipped() {
-        let rtf = br"{\rtf1 \trowd\cellx100\cellx200 \pard\intbl a\cell \pard\intbl b\cell \row \pard {\*\shppict{\pict\pngblip 89504e470d}} after\par}";
+    fn tables_are_tables_and_pictures_are_skipped() {
+        let rtf = br"{\rtf1 \trowd\cellx100\cellx200 \pard\intbl a\cell \pard\intbl b\cell \row \trowd\cellx100\cellx200 \pard\intbl c\par more\cell \pard\intbl\cell \row \pard {\*\shppict{\pict\pngblip 89504e470d}} after\par}";
         let blocks = rtf_to_blocks(rtf);
-        assert_eq!(blocks[0].plain_text(), "a\tb\t");
+        let Block::Table { rows } = &blocks[0] else { panic!("{:?}", blocks[0]) };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].cells.len(), 2);
+        assert_eq!(rows[1].cells.len(), 2, "an empty cell is still a cell");
+        assert_eq!(rows[1].cells[0].blocks.len(), 2, "two paragraphs in one cell");
+        assert_eq!(blocks[0].plain_text(), "a\tb\nc\nmore\t");
         assert_eq!(blocks[1].plain_text(), " after");
+        pimble_crdt::NodeDoc::from_blocks(&blocks).unwrap();
         assert!(!rtf_to_text(rtf).contains("89504e"));
     }
 

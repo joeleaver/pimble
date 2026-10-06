@@ -119,24 +119,25 @@ pre-pass (`check`: the refusals below, with line numbers, since rinch's parser d
 it does not know silently) and the block edits; `NodeDoc::markdown`, `write_markdown`,
 `append_markdown`, `insert_markdown_after`, `replace_section_markdown` and `replace_text`
 are the API, each answering the delta it applied or `CrdtError::Refused(sentence)`.
-Upstream (rinch PR, in progress 2026-10-01): the five marks below as HTML tags both ways,
-tables built from and written to Markdown, edge whitespace moved outside emphasis
-delimiters, and a strict parse; until it lands those marks read as plain text, and a
-rewrite of a block that held them drops them.
+rinch's Markdown (joeleaver/rinch#1242, on `main`) writes and reads the five marks below
+as HTML tags, builds and writes tables, moves whitespace at a mark's edge outside its
+delimiters, and has a strict parse (`doc_from_markdown_strict`) that names what it would
+drop; `check` is Pimble's own refusals (images, task lists, inline code inside a mark)
+and then that parse.
 
-- It covers exactly the collaboration scope, `pimble_crdt::Block`: paragraphs, headings
-  1-6, code blocks, nested bullet and ordered lists, and the marks bold, italic,
+- It covers the collaboration scope: paragraphs, headings 1-6, code blocks, nested
+  bullet and ordered lists, block quotes, tables, and the marks bold, italic,
   strikethrough, inline code and links. Underline, highlight, text colour and
   sub/superscript are written as the HTML tags `<u>`, `<mark>`, `<span style="color:..">`,
   `<sub>`, `<sup>`, and read back from them only.
 - A link is a Markdown link; a Pimble link's href is its `pimble:` URL.
-- Hard breaks (a trailing backslash or two spaces) and horizontal rules (`---`) are in
-  rinch's collaboration scope at `63fee3a` and map both ways.
-- **Block quotes and tables** join when rinch's PRs for them merge (joeleaver/rinch#1229,
-  #1233) and `pimble_crdt::Block` gains `Blockquote` and `Table`: `>` quotes, and GFM
-  pipe tables (a header row, no merged cells; a table read from a document with merged
-  cells is written as HTML `<table>` with `colspan`/`rowspan`, and read back from it).
-  Until then they are refused like the rest below.
+- Hard breaks (a trailing backslash, or `<br>` where that does not read back) and
+  horizontal rules (`---`) map both ways.
+- **Block quotes and tables** (in since rinch `51cb7c7`, joeleaver/rinch#1229 and #1233):
+  `>` quotes, and GFM pipe tables for a table with a header row, no merged cells and one
+  paragraph per cell; any other table is written as HTML `<table>` (`colspan`/`rowspan`,
+  blocks in cells) and read back from it. `pimble_crdt::Block` has `Blockquote` and
+  `Table` for the importer.
 - **Images** follow `docs/IMAGES_CONTRACT.md`: `![alt](pimble-blob:...)` both ways once
   blobs exist, and `attach_image` (a local file in, a blob and an inserted image out).
   Until then an image is refused.

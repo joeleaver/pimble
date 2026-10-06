@@ -6,10 +6,11 @@
 //! Markdown and the editor model, so the model that comes out of a document is the
 //! model an edit goes back in through: a block nobody names keeps everything the
 //! collaboration scope knows about it, including what [`crate::Block`] cannot say.
-//! This module adds what rinch's lenient parser does not do:
+//! This module adds:
 //!
-//! - [`check`] refuses, with a sentence naming the construct and its line, anything the
-//!   collaboration scope cannot hold or the parser would drop. A refusal writes nothing.
+//! - [`check`] refuses, with a sentence naming the construct and its line, anything a
+//!   document cannot hold: what rinch's strict parser names as something it would drop,
+//!   and what it reads that Pimble has no place for yet. A refusal writes nothing.
 //! - The block edits, as functions from the model before to the model after. Each one
 //!   rebuilds only the branch it changes, so every other node is the same `Rc` and the
 //!   projection's diff (`CollabSession::record_local`, block prefix and suffix by
@@ -22,7 +23,7 @@
 use std::rc::Rc;
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
-use rinch_editor_core::serialize::markdown::{doc_from_markdown, doc_to_markdown};
+use rinch_editor_core::serialize::markdown::{doc_from_markdown_strict, doc_to_markdown, Construct, MarkdownError};
 use rinch_editor_core::{Fragment, Node, Schema};
 
 use crate::error::{CrdtError, Result};
@@ -44,12 +45,22 @@ fn collab(e: impl std::fmt::Display) -> CrdtError {
 /// Refuse what a node's content cannot hold: the first such construct, with its
 /// 1-based line. `Ok` means [`parse`] keeps everything `md` says.
 pub fn check(md: &str) -> Result<()> {
+    strict(&Schema::starter_kit(), md).map(|_| ())
+}
+
+fn cannot_hold(line: usize, what: &str) -> CrdtError {
+    refused(format!("Line {line} is {what}; Pimble documents cannot hold that yet, so nothing was written."))
+}
+
+/// What rinch's strict parser accepts and a Pimble document still cannot hold: images
+/// (no storage yet, `docs/IMAGES_CONTRACT.md`), task lists (outside the collaboration
+/// scope), and inline code inside a mark the code mark excludes (dropped without a word).
+fn check_scope(md: &str) -> Result<()> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
-    // Turned on to be recognised and refused, never to be parsed into something.
     options.insert(Options::ENABLE_TABLES);
+    // Turned on to be recognised and refused, never to be parsed into something.
     options.insert(Options::ENABLE_TASKLISTS);
-    options.insert(Options::ENABLE_FOOTNOTES);
     let line = |offset: usize| md[..offset.min(md.len())].matches('\n').count() + 1;
     // The marks open around the current text: inline code cannot carry any of them.
     let mut open: Vec<&'static str> = Vec::new();
@@ -71,49 +82,69 @@ pub fn check(md: &str) -> Result<()> {
                     open.last().unwrap()
                 )));
             }
+            Event::Start(Tag::Image { .. }) => return Err(cannot_hold(line(range.start), "an image")),
+            Event::TaskListMarker(_) => return Err(cannot_hold(line(range.start), "a task list item")),
             _ => {}
-        }
-        let what = match &event {
-            Event::Start(Tag::BlockQuote(_)) => Some("a block quote"),
-            Event::Start(Tag::Table(_)) => Some("a table"),
-            Event::Start(Tag::Image { .. }) => Some("an image"),
-            Event::Start(Tag::FootnoteDefinition(_)) | Event::FootnoteReference(_) => Some("a footnote"),
-            Event::Start(Tag::HtmlBlock) | Event::Html(_) | Event::InlineHtml(_) => Some("HTML"),
-            Event::TaskListMarker(_) => Some("a task list item"),
-            Event::Start(Tag::MetadataBlock(_)) => Some("a metadata block"),
-            Event::Start(Tag::Link { dest_url, .. }) if !safe_link(dest_url) => Some("a link to an unsafe address"),
-            _ => None,
-        };
-        if let Some(what) = what {
-            return Err(refused(format!(
-                "Line {} is {what}; Pimble documents cannot hold that yet, so nothing was written.",
-                line(range.start)
-            )));
         }
     }
     Ok(())
 }
 
-/// What rinch's parser keeps a link for (`is_safe_url`, which it does not export):
-/// anything but script and data URLs.
-fn safe_link(url: &str) -> bool {
-    let url: String = url.trim().chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
-    !(url.starts_with("javascript:") || url.starts_with("vbscript:") || url.starts_with("data:"))
+/// The same two, where Markdown's own syntax did not show them: inside an HTML table.
+fn check_scope_of(node: &Node) -> Result<()> {
+    let what = match node.type_name() {
+        "image" => Some("an image"),
+        "task_list" => Some("a task list"),
+        _ => None,
+    };
+    if let Some(what) = what {
+        return Err(refused(format!(
+            "This Markdown has {what} inside an HTML table; Pimble documents cannot hold that yet, so nothing was written."
+        )));
+    }
+    node.content().iter().try_for_each(check_scope_of)
+}
+
+/// `md` as an editor `doc`, or the refusal: [`check_scope`], then rinch's strict parse,
+/// which names whatever else it would drop (HTML other than the tags it reads marks,
+/// line breaks and tables from, footnotes, unsafe addresses).
+fn strict(schema: &Schema, md: &str) -> Result<Node> {
+    check_scope(md)?;
+    let doc = doc_from_markdown_strict(schema, md).map_err(|e| match e {
+        MarkdownError::Unsupported { construct, line, .. } => cannot_hold(
+            line,
+            match construct {
+                Construct::InlineHtml | Construct::HtmlBlock => {
+                    "HTML other than the tags for underline, highlight, colour, sub/superscript, line breaks and tables"
+                }
+                Construct::UnmatchedTag => "an HTML tag without its partner",
+                Construct::Footnote => "a footnote",
+                Construct::TaskList => "a task list item",
+                Construct::UnsafeLink => "a link to an unsafe address",
+                Construct::UnsafeImage => "an image",
+                Construct::UnsupportedMark => "formatting with no place in a document",
+                _ => "something with no place in a document",
+            },
+        ),
+        MarkdownError::Invalid(e) => collab(e),
+    })?;
+    check_scope_of(&doc)?;
+    Ok(doc)
 }
 
 /// `md` as an editor `doc`, after [`check`]. Markdown with no blocks at all is
 /// refused, since writing it would change nothing anyone asked for.
 pub fn parse(schema: &Schema, md: &str) -> Result<Node> {
-    check(md)?;
+    let doc = strict(schema, md)?;
     if md.trim().is_empty() {
         return Err(refused("There is no Markdown to write."));
     }
-    doc_from_markdown(schema, md).map_err(collab)
+    Ok(doc)
 }
 
-/// An editor `doc` as Markdown. Marks Markdown has no syntax for (underline,
-/// highlight, text colour, sub/superscript) come out as plain text until rinch writes
-/// them as HTML tags.
+/// An editor `doc` as Markdown: CommonMark with `~~strike~~` and pipe tables, and the
+/// HTML tags rinch writes for what Markdown has no syntax for (underline, highlight,
+/// text colour, sub/superscript, a table with merged cells or blocks in a cell).
 pub fn render(doc: &Node) -> String {
     doc_to_markdown(doc)
 }
@@ -468,14 +499,18 @@ mod tests {
 
     #[test]
     fn check_names_the_construct_and_its_line() {
-        let err = check("# Title\n\nsome text\n\n| a | b |\n|---|---|\n| 1 | 2 |\n").unwrap_err();
+        let err = check("# Title\n\nsome text\n\n![cat](cat.png)\n").unwrap_err();
         assert_eq!(
             err.to_string(),
-            "Line 5 is a table; Pimble documents cannot hold that yet, so nothing was written."
+            "Line 5 is an image; Pimble documents cannot hold that yet, so nothing was written."
         );
-        assert!(check("> quoted").unwrap_err().to_string().starts_with("Line 1 is a block quote"));
         assert!(check("a\n\n- [ ] task").unwrap_err().to_string().starts_with("Line 3 is a task list item"));
-        assert!(check("see <u>this</u>").unwrap_err().to_string().contains("HTML"));
+        assert!(check("a\n\nsee <kbd>this</kbd>").unwrap_err().to_string().starts_with("Line 3 is HTML other than"));
+        assert!(check("<div>x</div>").unwrap_err().to_string().starts_with("Line 1 is HTML other than"));
+        assert!(check("a <u>b").unwrap_err().to_string().contains("without its partner"));
+        assert!(check("a[^1]\n\n[^1]: note").unwrap_err().to_string().contains("a footnote"));
+        let in_table = "<table><tr><td><img src=\"https://x.y/c.png\"></td></tr></table>";
+        assert!(check(in_table).unwrap_err().to_string().contains("an image inside an HTML table"));
         assert!(check("![cat](cat.png)").unwrap_err().to_string().contains("an image"));
         assert!(check("[x](javascript:alert(1))").unwrap_err().to_string().contains("unsafe"));
         check("# H\n\n**b** *i* ~~s~~ `c` [l](pimble:a/b)\n\n- one\n  - two\n\n1. x\n\n```rust\nfn x() {}\n```\n\n---\n")
@@ -492,6 +527,21 @@ mod tests {
         let md = "# Plan\n\nSome **bold** and *italic* text with a [link](pimble:s/n).\n\n- one\n- two\n\n```\ncode\n```";
         let doc = parse(&schema(), md).unwrap();
         assert_eq!(render(&doc), md);
+    }
+
+    #[test]
+    fn quotes_tables_and_html_marks_round_trip() {
+        for md in [
+            "> quoted **words**\n>\n> - and a list",
+            "| a | b |\n| --- | --- |\n| 1 | 2 |",
+            "<u>under</u> <mark>lit</mark> <span style=\"color:#ff0000\">red</span> H<sub>2</sub>O x<sup>2</sup>",
+        ] {
+            let doc = parse(&schema(), md).unwrap();
+            assert_eq!(render(&parse(&schema(), &render(&doc)).unwrap()), render(&doc), "{md}");
+        }
+        let doc = parse(&schema(), "> q\n\n| a |\n| --- |\n| 1 |").unwrap();
+        assert_eq!(doc.child(0).type_name(), "blockquote");
+        assert_eq!(doc.child(1).type_name(), "table");
     }
 
     #[test]
@@ -567,14 +617,13 @@ mod tests {
         assert_eq!(render(&after), "Plainly **bold words here** end");
         // Text that differs across a mark boundary takes the first replaced char's marks.
         let after = replace_text(&s, &d, "plain bold", "a new").unwrap();
-        assert_eq!(render(&after), "a new** words here** end");
+        assert_eq!(render(&after), "a new **words here** end");
         let after = replace_text(&s, &d, "here** end", "x").map(|d| render(&d));
         assert!(after.is_err(), "markdown syntax is not in the text");
-        // The space before "here" is bold, so it stays bold. (rinch renders a bold run
-        // ending in a space as `**... **`, which does not parse back as bold; reported
-        // upstream with the Markdown marks PR.)
+        // The space before "here" is bold in the document; Markdown writes whitespace
+        // at a mark's edge outside it, and a paragraph's trailing space not at all.
         let after = replace_text(&s, &d, "here end", "").unwrap();
-        assert_eq!(render(&after), "plain **bold words **");
+        assert_eq!(render(&after), "plain **bold words**");
     }
 
     #[test]

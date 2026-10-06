@@ -472,7 +472,7 @@ mod tests {
     /// runs, and a replica loading the bytes reads the same thing.
     #[test]
     fn rich_blocks_round_trip_through_the_projection() {
-        use crate::blocks::{Align, Block, ListItem, Mark, Run};
+        use crate::blocks::{Align, Block, ListItem, Mark, Run, TableCell, TableRow};
         let blocks = vec![
             Block::Heading { level: 2, runs: vec![Run::plain("Title")] },
             Block::Paragraph {
@@ -497,11 +497,26 @@ mod tests {
                 ],
             },
             Block::CodeBlock { text: "let x = 1;".into() },
+            Block::Blockquote { blocks: vec![Block::plain("quoted"), Block::BulletList { items: vec![ListItem { blocks: vec![Block::plain("inside")] }] }] },
+            Block::Table {
+                rows: vec![
+                    TableRow { cells: vec![TableCell::header(vec![Block::plain("h1")]), TableCell::header(vec![Block::plain("h2")])] },
+                    TableRow { cells: vec![TableCell { colspan: 2, ..TableCell::new(vec![Block::plain("wide")]) }] },
+                    TableRow { cells: vec![TableCell::new(vec![Block::plain("a")]), TableCell::new(vec![])] },
+                ],
+            },
         ];
         let doc = ContentDoc::from_blocks(&blocks).unwrap();
         let peer = ContentDoc::load(&doc.save()).unwrap();
+        // What was built reads back as the same blocks (an empty cell holds one empty paragraph).
+        let session = CollabSession::from_bytes(&peer.save()).unwrap();
+        let mut expected = blocks.clone();
+        if let Some(Block::Table { rows }) = expected.last_mut() {
+            rows[2].cells[1].blocks = vec![Block::Paragraph { runs: vec![], align: Align::Left, indent: 0 }];
+        }
+        assert_eq!(crate::blocks::read_doc(&session.projected_doc(&Schema::starter_kit()).unwrap()).unwrap(), expected);
         let units = peer.units();
-        assert_eq!(units.len(), 4, "one unit per top-level block: {:?}", units);
+        assert_eq!(units.len(), 6, "one unit per top-level block: {:?}", units);
         assert!(matches!(units[0].kind, UnitKind::Heading(2)));
         assert_eq!(units[0].text, "Title");
         assert_eq!(units[1].text, "plain bold link red");

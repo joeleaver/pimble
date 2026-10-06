@@ -21,7 +21,7 @@ pub mod store_document;
 pub mod tree;
 mod sync_util;
 
-pub use blocks::{blocks_from_plain_text, Align, Block, ListItem, Mark, Run};
+pub use blocks::{blocks_from_plain_text, Align, Block, ListItem, Mark, Run, TableCell, TableRow};
 pub use content_doc::*;
 pub use error::*;
 pub use node_doc::{NodeDoc, NodeFields, NodeUpdateEffect, ROOT_CHILDREN, ROOT_DATA, ROOT_NODE};

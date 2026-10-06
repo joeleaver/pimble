@@ -32,9 +32,11 @@ the tool says so and lists the links to choose from. Use list_stores and list_ch
 depth for an outline) or find_node to discover where things are.
 
 Content is Markdown: headings, paragraphs, bold, italic, strikethrough, inline code, links, \
-fenced code, bullet and numbered lists (nested), horizontal rules. Tables, block quotes, \
-images, task lists, footnotes and HTML are refused with a sentence naming the line; nothing \
-is written then. Link to another node with its pimble: link as the href.
+fenced code, bullet and numbered lists (nested), block quotes, pipe tables, horizontal \
+rules. Underline, highlight, text colour, subscript and superscript are the HTML tags <u>, \
+<mark>, <span style=\"color:#rrggbb\">, <sub> and <sup>; a table with merged cells or blocks \
+in a cell is an HTML <table>. Images, task lists, footnotes and any other HTML are refused \
+with a sentence naming the line; nothing is written then. Link to another node with its pimble: link as the href.
 
 Edits touch only what they name: append, insert_after (after a block, or after a heading's \
 section), replace_section (the blocks under a heading), replace_text (an exact quote inside \

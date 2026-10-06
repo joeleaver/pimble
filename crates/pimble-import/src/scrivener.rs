@@ -75,8 +75,8 @@ pub async fn import_scrivener(scriv_path: &Path, output_path: &Path) -> Result<(
     store.flush().await?;
 
     info!(
-        "Import complete: {} folders, {} documents ({} with content); {} paragraphs, {} headings, {} lists, {} marked runs; {} labelled, {} with icons",
-        stats.folders, stats.documents, stats.with_content, stats.paragraphs, stats.headings, stats.lists, stats.marked_runs, stats.labelled, stats.with_icon
+        "Import complete: {} folders, {} documents ({} with content); {} paragraphs, {} headings, {} lists, {} tables, {} marked runs; {} labelled, {} with icons",
+        stats.folders, stats.documents, stats.with_content, stats.paragraphs, stats.headings, stats.lists, stats.tables, stats.marked_runs, stats.labelled, stats.with_icon
     );
 
     Ok(())
@@ -90,6 +90,7 @@ struct ImportStats {
     paragraphs: usize,
     headings: usize,
     lists: usize,
+    tables: usize,
     marked_runs: usize,
     labelled: usize,
     with_icon: usize,
@@ -113,6 +114,13 @@ impl ImportStats {
                     self.lists += 1;
                     for item in items {
                         self.count_blocks(&item.blocks);
+                    }
+                }
+                Block::Blockquote { blocks } => self.count_blocks(blocks),
+                Block::Table { rows } => {
+                    self.tables += 1;
+                    for cell in rows.iter().flat_map(|row| &row.cells) {
+                        self.count_blocks(&cell.blocks);
                     }
                 }
             }
@@ -157,7 +165,7 @@ async fn import_binder_item(
 
     // The item's RTF, as rich blocks: paragraphs with their marks (bold, italic,
     // underline, strike, link, colour, highlight, code, sub/superscript),
-    // headings, nested bullet and ordered lists, alignment and indent. The
+    // headings, nested bullet and ordered lists, tables, alignment and indent. The
     // content goes into the node before it is placed: `create_node` merges
     // `node.content` into the new document as its first update, which is
     // the one way content reaches a document, and right here because
