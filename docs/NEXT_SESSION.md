@@ -1,5 +1,46 @@
 # Next session: start here
 
+**2026-10-06: v0.6.0, the MCP server, block quotes and tables.** `mcp` is merged into
+`master` (Joe: "let's do all those things"). What ships:
+
+- **`pimble-mcp`** in both packages (docs/MCP_CONTRACT.md; the Linux walk-through passed on
+  2026-10-01, `scripts/mcp/`). **Joe's part: a run on Windows** from the v0.6.0 package
+  (docs/DEPLOY.md, "pimble-mcp in the packages").
+- **rinch `main` at 51cb7c7**: joeleaver/rinch#1229 (block quotes), #1233 (tables), #1239
+  and #1242 (Markdown keeps every mark and tables, a strict reader) are merged.
+  `pimble_crdt::Block` has `Blockquote` and `Table`; `markdown::check` is Pimble's own
+  refusals (images, task lists, inline code inside a mark) and then rinch's strict parse;
+  the RTF importer reads tables as tables; the toolbar has a quote button and table
+  buttons. Checked in the app with `pimble-mcp` reading and writing beside the editor, and
+  every document of the family store read with the new code (545 with content, none
+  refused). 600 seeds of the Markdown convergence test with quotes and tables in the mix.
+- No jkbase deploy yet: production is still the v0.4.0 code.
+
+**Open, in order:**
+
+1. **joeleaver/rinch#1422** (Joe's bug of 2026-10-06: two bullet items selected, the second
+   nested under the first, Delete did nothing; any delete whose ends are at different
+   depths failed silently). The fix is on Pimble branch `rinch-1422` (rinch pinned to the
+   pull request's branch, checked in the app). When it merges: both lock files back to
+   `main`, then v0.6.1. It is not in v0.6.0 because a release pins `main` only.
+2. **Images** (docs/IMAGES_CONTRACT.md, Joe's go-ahead 2026-10-06), wave 1 in progress on
+   branch `images`: the blob store and three RPCs; rinch pull requests for an app-installed
+   image loader, an image paste/drop hook and a collab test of image attrs; then the
+   desktop loader and inserting.
+3. **A jkbase deploy** (links, MCP-era server, quotes and tables in the browser): Joe's
+   call, with a backup first (docs/DEPLOY.md).
+
+Seen and not fixed: Markdown writes an empty list item as nothing, so a rewrite through
+`pimble-mcp` of a block holding one drops it; a table made with the toolbar has no header
+row, so it reads through `pimble-mcp` as an HTML `<table>`; inserting a table leaves the
+caret after it. A worktree from March (`typed-growing-shore`, an Automerge-era relay
+sketch) was removed, its branch deleted with Joe's word.
+
+**2026-10-01: v0.5.1** (rinch 63fee3a for #1108, the selection highlight on wrapped
+lines). The MCP and images contracts were written that day; `pimble-mcp` was built on
+branch `mcp` (`pimble_crdt::markdown`, `pimble_server::local`, 19 tools, then
+`replace_block`, `remove_section`, `replace_content` after Joe's bug report).
+
 **2026-09-28: links shipped as v0.5.0** (Joe: "merge links into master and cut a
 release"). `links` fast-forwarded into `master`; release commit 50bb706, tag `v0.5.0`; the Release run built both packages and
 /api/v1/releases serves them. No

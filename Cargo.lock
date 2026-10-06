@@ -4966,7 +4966,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-app"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "crossbeam-channel",
@@ -4995,7 +4995,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-cli"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5016,7 +5016,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-client"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "jsonrpsee",
@@ -5030,7 +5030,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-cloud"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5065,7 +5065,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-core"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5078,7 +5078,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-crdt"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "pimble-core",
@@ -5095,7 +5095,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-crypto"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -5116,7 +5116,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-import"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5131,7 +5131,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-mcp"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5152,7 +5152,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-plugins"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "pimble-core",
@@ -5166,7 +5166,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-rpc"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "jsonrpsee",
  "pimble-core",
@@ -5179,7 +5179,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-search"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "pimble-core",
@@ -5202,7 +5202,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-server"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -5243,7 +5243,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-store"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
