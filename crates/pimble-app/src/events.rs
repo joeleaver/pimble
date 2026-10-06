@@ -11,6 +11,7 @@ use rinch::prelude::*;
 
 use crate::protocol::{BackendCommand, BackendEvent, CloudOp};
 use crate::editor::{apply_remote, start_editing};
+use crate::panes::PaneId;
 use crate::persistence::{load_app_state_file, save_app_state_file};
 use crate::state::{
     parse_tree_value, share_state_text, take_last_drop_target_value, AppStore, ConnectionState, LinkOpen,
@@ -91,7 +92,9 @@ pub(crate) fn follow_resolution(store: AppStore, url: &PimbleUrl, hops: usize, r
                 store_id: *store_id,
                 node_id: *node_id,
                 anchor: url.anchor.clone(),
+                pane: untracked(|| store.link_from.get()),
             }));
+            store.link_from.set(None);
         }
         LinkResolution::StoreNotHere { store_id, node_id }
             if *store_id != url.store && hops < MAX_LINK_HOPS && store.get_store_signal(*store_id).is_some() =>
@@ -99,7 +102,10 @@ pub(crate) fn follow_resolution(store: AppStore, url: &PimbleUrl, hops: usize, r
             let next = PimbleUrl { store: *store_id, node: *node_id, anchor: url.anchor.clone() };
             store.send(BackendCommand::ResolveLink { url: next, hops: hops + 1 });
         }
-        other => show_notice(store, stop_sentence(url, hops, other).to_string()),
+        other => {
+            store.link_from.set(None);
+            show_notice(store, stop_sentence(url, hops, other).to_string())
+        }
     }
 }
 
@@ -245,8 +251,8 @@ fn refetch_parent_children(store: AppStore, changed_store: StoreId, parent_id: N
 /// judgement of itself (`Node::access`): every loaded children list with
 /// nodes of the store in it (its own, and a mount's that shows them from
 /// another store), each root the store row shows (a share's root is in no
-/// list this device holds), and the document in the editor, which may have
-/// been opened from a search hit and be in no loaded list at all. The
+/// list this device holds), and the document in each pane's editor, which may
+/// have been opened from a search hit and be in no loaded list at all. The
 /// answers arrive as `ChildrenLoaded` and `NodeLoaded` like any other; a
 /// `NodeLoaded` for the document being edited updates the node and leaves
 /// the session alone.
@@ -255,7 +261,7 @@ fn refetch_held_nodes(store: AppStore, store_id: StoreId) {
         store.send(BackendCommand::GetChildren { store_id: list_store, node_id: parent_id });
     }
     let mut singles = store.shown_roots(store_id);
-    if let Some(active) = untracked(|| store.active_edit.get()).filter(|active| active.store_id == store_id) {
+    for active in store.edited_nodes().into_iter().filter(|active| active.store_id == store_id) {
         if !singles.contains(&active.node_id) {
             singles.push(active.node_id);
         }
@@ -283,7 +289,7 @@ fn refetch_below_changed_access(store: AppStore, store_id: StoreId, changed: &[N
             store.send(BackendCommand::GetChildren { store_id, node_id });
         }
     }
-    if let Some(active) = untracked(|| store.active_edit.get()) {
+    for active in store.edited_nodes() {
         if active.store_id == store_id && !changed.contains(&active.node_id) {
             store.send(BackendCommand::GetNode { store_id, node_id: active.node_id });
         }
@@ -332,12 +338,13 @@ fn apply_roots_change(store: AppStore, tree_state: UseTreeReturn, store_id: Stor
             !shown.iter().any(|root| store.is_at_or_under(store_id, node_id, *root))
                 && (shown.is_empty() || left.iter().any(|root| store.is_at_or_under(store_id, node_id, *root)))
         };
-        let selected = untracked(|| store.selected_id.get()).and_then(|value| parse_tree_value(&value));
-        if let Some((selected_store, Some(selected_node))) = selected {
-            if selected_store == store_id && has_left(selected_node) {
-                store.selected_id.set(None);
-                store.node_title.set(String::new());
-                store.show_editor.set(false);
+        // In every pane that holds one of them.
+        for pane in PaneId::ALL {
+            let selected = untracked(|| store.pane(pane).selected.get()).and_then(|value| parse_tree_value(&value));
+            if let Some((selected_store, Some(selected_node))) = selected {
+                if selected_store == store_id && has_left(selected_node) {
+                    store.clear_pane(pane);
+                }
             }
         }
         for root in left.iter().filter(|root| has_left(**root)) {
@@ -461,19 +468,21 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     }
                 });
 
-                // A document was being edited across the reconnect: its
+                // Documents were being edited across the reconnect: each one's
                 // subscription died with the old connection and any delta
                 // sent during the gap was lost. Commands run in order, so
                 // the store is open again by the time these execute:
                 // subscribe again and reconcile (state vector in, diff out,
                 // then our diff back), so nothing typed offline is lost and
                 // nothing the new server holds is missed.
-                if let Some(active) = untracked(|| store.active_edit.get()) {
+                for active in store.edited_nodes() {
                     store.send(BackendCommand::SubscribeNodeChanges {
                         store_id: active.store_id,
                         node_id: active.node_id,
                     });
-                    crate::editor::request_reconcile(store, active.store_id, active.node_id);
+                    for pane in store.panes_editing(active.store_id, active.node_id) {
+                        crate::editor::request_reconcile(store, pane, active.store_id, active.node_id);
+                    }
                 }
 
                 // Whether the server's keystore holds a signed-in account
@@ -744,25 +753,33 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     store.bump_tree_structure();
                 }
 
-                if let Some(selected_id) = store.selected_id.get() {
-                    if let Some((sel_store_id, Some(sel_node_id))) = parse_tree_value(&selected_id) {
-                        if sel_store_id == *store_id && sel_node_id == node_id {
-                            store.node_title.set(store.display_label(*store_id, node_id));
-                            // First load of the selected document (its content just
-                            // arrived from GetNode) — start the editing/collab session.
-                            // Guard against restarting an already-active session.
-                            let already_editing = untracked(|| store.active_edit.get())
-                                .map_or(false, |e| e.store_id == *store_id && e.node_id == node_id);
-                            if node.node_type == pimble_core::node_types::DOCUMENT
-                                && !already_editing
-                            {
-                                // `open_node` could not tell this was a document
-                                // (a search hit the tree had not loaded), so the
-                                // pane is still hidden: show it with the session.
-                                store.show_editor.set(true);
-                                start_editing(store, *store_id, node_id, &content_bytes);
-                            }
-                        }
+                // A pane the saved layout names this node for opens on it
+                // now that it is known (docs/SPLIT_VIEW_CONTRACT.md
+                // "Persistence"), by becoming a pane it is selected in.
+                for pane in PaneId::ALL {
+                    if untracked(|| store.pane(pane).restore.get()) == Some((*store_id, node_id)) {
+                        store.pane(pane).restore.set(None);
+                        store.select_in_pane(pane, Some(format!("node_{store_id}_{node_id}")));
+                    }
+                }
+
+                // Every pane opened on this node.
+                for pane in store.panes_showing(*store_id, node_id) {
+                    if pane == store.focused() {
+                        store.node_title.set(store.display_label(*store_id, node_id));
+                    }
+                    // First load of the pane's document (its content just
+                    // arrived from GetNode) — start the editing/collab session.
+                    // Guard against restarting an already-active session.
+                    let state = store.pane(pane);
+                    let already_editing = untracked(|| state.active_edit.get())
+                        .map_or(false, |e| e.store_id == *store_id && e.node_id == node_id);
+                    if node.node_type == pimble_core::node_types::DOCUMENT && !already_editing {
+                        // `open_node` could not tell this was a document
+                        // (a search hit the tree had not loaded), so the
+                        // pane is still hidden: show it with the session.
+                        state.show_editor.set(true);
+                        start_editing(store, pane, *store_id, node_id, &content_bytes);
                     }
                 }
             }
@@ -834,10 +851,8 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
 
             BackendEvent::NodeContentUpdated { store_id, node_id } => {
                 tracing::info!("Node content updated: {:?}/{:?}", store_id, node_id);
-                // Only re-fetch if this isn't the currently-selected node.
-                let is_selected = store.selected_id.get()
-                    .and_then(|sel| parse_tree_value(&sel))
-                    .map_or(false, |(sid, nid)| sid == *store_id && nid == Some(*node_id));
+                // Only re-fetch if this isn't a node some pane is opened on.
+                let is_selected = !store.panes_showing(*store_id, *node_id).is_empty();
                 if !is_selected {
                     // Data-only: NodeLoaded will upsert_node without tree rebuild
                     store.send(BackendCommand::GetNode { store_id: *store_id, node_id: *node_id });
@@ -874,20 +889,23 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // they were ever loaded, so the person sees where it landed.
                 store.send(BackendCommand::GetChildren { store_id: *to_store_id, node_id: *new_parent_id });
 
-                // The editor follows the node it had open to its new id: a
-                // fresh collab session on the new document, the old one
+                // Each pane's editor follows the node it had open to its new
+                // id: a fresh collab session on the new document, the old one
                 // closed. Selecting first and then asking for the node is
                 // what makes `NodeLoaded`'s own "selected and not already
                 // editing" check start that session once the answer lands —
                 // the one path a document is ever opened through.
-                let was_open = untracked(|| store.active_edit.get())
-                    .map_or(false, |active| active.store_id == *from_store_id && active.node_id == *old_node_id);
-                if was_open {
+                let was_open = store.panes_editing(*from_store_id, *old_node_id);
+                for &pane in &was_open {
                     let value = format!("node_{}_{}", to_store_id, node_id);
-                    store.selected_id.set(Some(value.clone()));
-                    tree_state.controller.select(&value);
-                    store.node_title.set(title.clone());
-                    store.show_editor.set(true);
+                    store.select_in_pane(pane, Some(value.clone()));
+                    store.pane(pane).show_editor.set(true);
+                    if pane == store.focused() {
+                        tree_state.controller.select(&value);
+                        store.node_title.set(title.clone());
+                    }
+                }
+                if !was_open.is_empty() {
                     store.send(BackendCommand::GetNode { store_id: *to_store_id, node_id: *node_id });
                 }
 
@@ -1061,11 +1079,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     }
                     StoreChangeKind::ContentUpdated { node_id } => {
                         // CRDT-edited nodes are synced by the subscription task directly.
-                        let is_active_crdt = untracked(|| {
-                            store.active_edit.with(|ae| {
-                                ae.as_ref().map_or(false, |e| e.store_id == *store_id && e.node_id == *node_id)
-                            })
-                        });
+                        let is_active_crdt = store.is_editing(*store_id, *node_id);
 
                         if !is_active_crdt {
                             store.send(BackendCommand::GetNode {
@@ -1171,12 +1185,13 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 crate::editor::apply_reconcile(store, *store_id, *node_id, diff, server_state_vector);
             }
 
-            BackendEvent::RemoteChanges { changes } => {
+            BackendEvent::RemoteChanges { store_id, node_id, changes } => {
                 use base64::Engine;
-                // A peer's delta: integrate it into the editor's collab session (which
-                // re-projects the view and does NOT re-broadcast).
+                // A peer's delta: integrate it into the collab session of every
+                // pane holding the node (which re-projects the view and does
+                // NOT re-broadcast).
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(changes) {
-                    apply_remote(&bytes);
+                    apply_remote(store, *store_id, *node_id, &bytes);
                 }
             }
 
@@ -2143,7 +2158,7 @@ mod tests {
         use pimble_core::StoreAccess::{Full, Read};
         let (store, events, commands) = store_with_events();
         let (store_id, [recipes, trips], [pasta, rome]) = a_replica_with_two_roots(store);
-        store.active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id: rome }));
+        store.panes[0].active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id: rome }));
 
         events.send(sync_changed(store_id, Full, Vec::new())).unwrap();
         pump(store);
@@ -2222,7 +2237,7 @@ mod tests {
         use pimble_core::StoreAccess::Read;
         let (store, events, commands) = store_with_events();
         let (store_id, [recipes, trips], [pasta, _]) = a_replica_with_two_roots(store);
-        store.active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id: pasta }));
+        store.panes[0].active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id: pasta }));
 
         let mut moved = store.get_node_signal(store_id, trips).unwrap().with(|n| n.clone());
         moved.access = Read;
@@ -2355,10 +2370,10 @@ mod tests {
         for node in [recipes, trips, pasta, rome] {
             store.upsert_node(store_id, node);
         }
-        store.selected_id.set(Some(format!("node_{store_id}_{}", ids.1[1])));
+        store.select_in_pane(crate::panes::PaneId::FIRST, Some(format!("node_{store_id}_{}", ids.1[1])));
         store.node_title.set("Rome".to_string());
-        store.show_editor.set(true);
-        store.active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id: ids.1[1] }));
+        store.panes[0].show_editor.set(true);
+        store.panes[0].active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id: ids.1[1] }));
         (store_id, ids.0, ids.1)
     }
 
@@ -2397,7 +2412,7 @@ mod tests {
         }
         // The open document was under it: closed as a deleted node's is.
         assert_eq!(store.selected_id.get(), None);
-        assert!(!store.show_editor.get());
+        assert!(!store.panes[0].show_editor.get());
         assert_eq!(store.node_title.get(), "");
 
         let asked: Vec<BackendCommand> = commands.try_iter().collect();
@@ -2426,8 +2441,8 @@ mod tests {
     fn a_share_that_ended_closes_nothing_else_and_names_only_what_it_knows() {
         let (store, events, _commands) = store_with_events();
         let (store_id, [recipes, trips], [pasta, _]) = a_replica_with_rome_open(store);
-        store.selected_id.set(Some(format!("node_{store_id}_{pasta}")));
-        store.active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id: pasta }));
+        store.select_in_pane(crate::panes::PaneId::FIRST, Some(format!("node_{store_id}_{pasta}")));
+        store.panes[0].active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id: pasta }));
         store.remove_node(store_id, trips);
 
         events.send(shares_ended(store_id, vec![trips])).unwrap();
@@ -2435,8 +2450,8 @@ mod tests {
         assert_eq!(store.notice.get(), "A shared folder is no longer shared with you.");
         assert_eq!(store.shown_roots(store_id), vec![recipes]);
         assert_eq!(store.selected_id.get(), Some(format!("node_{store_id}_{pasta}")));
-        assert!(store.show_editor.get());
-        assert!(store.active_edit.get().is_some_and(|active| active.node_id == pasta));
+        assert!(store.panes[0].show_editor.get());
+        assert!(store.panes[0].active_edit.get().is_some_and(|active| active.node_id == pasta));
     }
 
     /// Removed from every share at once: a sentence for each, no folder
@@ -2454,7 +2469,7 @@ mod tests {
         let data = untracked(|| store.build_tree_data_structural());
         assert_eq!(data.len(), 1, "the store row stays");
         assert!(data[0].children.is_empty());
-        assert!(store.selected_id.get().is_none() && !store.show_editor.get());
+        assert!(store.selected_id.get().is_none() && !store.panes[0].show_editor.get());
 
         let held = store.get_store_signal(store_id).unwrap();
         assert_eq!(held.with(crate::state::shared_by_words), "no longer shared");
@@ -2490,7 +2505,7 @@ mod tests {
         assert_eq!(store.shown_roots(store_id), vec![recipes]);
         assert!(store.get_node_signal(store_id, trips).is_some() && store.get_node_signal(store_id, rome).is_some(), "still held: they are under Recipes");
         assert_eq!(store.selected_id.get(), Some(format!("node_{store_id}_{rome}")), "and the open document stays open");
-        assert!(store.show_editor.get());
+        assert!(store.panes[0].show_editor.get());
     }
 
     /// At start-up an ended share is simply not shown: no notice (the person
@@ -2546,7 +2561,7 @@ mod tests {
         pump(store);
         assert_eq!(store.notice.get(), "\"Trips\" is no longer shared with you.");
         assert_eq!(store.shown_roots(store_id), vec![recipes]);
-        assert!(store.selected_id.get().is_none() && !store.show_editor.get(), "the document open under it closed");
+        assert!(store.selected_id.get().is_none() && !store.panes[0].show_editor.get(), "the document open under it closed");
         let _ = commands.try_iter().count();
 
         // A share granted again: the server says the set changed and names
@@ -2684,10 +2699,10 @@ mod tests {
         let (old_parent, new_parent) = (NodeId::new(), NodeId::new());
         let (old_id, new_id) = (NodeId::new(), NodeId::new());
         store.set_children(store_id, old_parent, vec![(store_id, old_id)]);
-        store.selected_id.set(Some(format!("node_{store_id}_{old_id}")));
-        store.active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id: old_id }));
+        store.select_in_pane(crate::panes::PaneId::FIRST, Some(format!("node_{store_id}_{old_id}")));
+        store.panes[0].active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id: old_id }));
         store.node_title.set("Grocery list".to_string());
-        store.show_editor.set(true);
+        store.panes[0].show_editor.set(true);
 
         events
             .send(transplanted(store_id, old_id, old_parent, store_id, new_id, new_parent, "Grocery list", Vec::new()))
@@ -2695,7 +2710,7 @@ mod tests {
         pump(store);
 
         assert_eq!(store.selected_id.get(), Some(format!("node_{store_id}_{new_id}")));
-        assert!(store.show_editor.get());
+        assert!(store.panes[0].show_editor.get());
         assert_eq!(store.node_title.get(), "Grocery list");
         assert!(
             commands.try_iter().any(|c| matches!(c, BackendCommand::GetNode { store_id: s, node_id: n } if s == store_id && n == new_id)),
@@ -2713,8 +2728,8 @@ mod tests {
         let (old_id, new_id) = (NodeId::new(), NodeId::new());
         let open_id = NodeId::new();
         store.set_children(store_id, old_parent, vec![(store_id, old_id)]);
-        store.selected_id.set(Some(format!("node_{store_id}_{open_id}")));
-        store.active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id: open_id }));
+        store.select_in_pane(crate::panes::PaneId::FIRST, Some(format!("node_{store_id}_{open_id}")));
+        store.panes[0].active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id: open_id }));
 
         events
             .send(transplanted(store_id, old_id, old_parent, store_id, new_id, new_parent, "Untitled", Vec::new()))

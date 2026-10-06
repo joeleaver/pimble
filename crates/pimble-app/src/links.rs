@@ -8,9 +8,12 @@
 use rinch_editor_core::commands::range_has_mark;
 use rinch_editor_core::{AttrValue, Attrs, InputRule, Mark, Plugin, PluginKey, Pos};
 
-/// The plugin pimble adds to its editor before any content loads (adding a
-/// plugin resets history).
-pub struct LinksPlugin;
+/// The plugin pimble adds to each pane's editor before any content loads
+/// (adding a plugin resets history). It knows which pane's editor it is in,
+/// so its commands act on that pane.
+pub struct LinksPlugin {
+    pub pane: crate::panes::PaneId,
+}
 
 impl Plugin for LinksPlugin {
     fn key(&self) -> PluginKey {
@@ -18,7 +21,7 @@ impl Plugin for LinksPlugin {
     }
 
     fn input_rules(&self) -> Vec<InputRule> {
-        vec![autolink_rule(), picker_rule()]
+        vec![autolink_rule(), picker_rule(self.pane)]
     }
 
     /// A pasted link (docs/LINKS_CONTRACT.md "Making a link"): a Pimble or
@@ -41,21 +44,22 @@ impl Plugin for LinksPlugin {
     fn commands(&self) -> Vec<(&'static str, rinch_editor_core::Command)> {
         // A command runs while the editor is mid-dispatch: reading the
         // handle waits a turn.
+        let pane = self.pane;
         vec![
             (
                 COPY_LINK_HERE,
-                std::rc::Rc::new(|_state, dispatch| {
+                std::rc::Rc::new(move |_state, dispatch| {
                     if dispatch.is_some() {
-                        later(copy_link_here);
+                        later(move |store| copy_link_here(store, pane));
                     }
                     true
                 }),
             ),
             (
                 OPEN_PICKER,
-                std::rc::Rc::new(|_state, dispatch| {
+                std::rc::Rc::new(move |_state, dispatch| {
                     if dispatch.is_some() {
-                        later(|store| crate::link_picker::start_from_selection(store, &crate::editor::editor()));
+                        later(move |store| crate::link_picker::start_from_selection(store, &crate::editor::editor(pane)));
                     }
                     true
                 }),
@@ -109,11 +113,11 @@ fn later(f: impl FnOnce(crate::state::AppStore) + 'static) {
 /// (docs/LINKS_CONTRACT.md "Making a link"). The rule types the bracket
 /// itself (its transaction replaces the plain insert) and opens the picker
 /// once the dispatch is over.
-fn picker_rule() -> InputRule {
-    InputRule::new(r"\[\[$", |state, _caps, start, _end| {
+fn picker_rule(pane: crate::panes::PaneId) -> InputRule {
+    InputRule::new(r"\[\[$", move |state, _caps, start, _end| {
         let mut tr = state.tr();
         tr.insert_text("[").ok()?;
-        later(move |store| crate::link_picker::start_typed(store, &crate::editor::editor(), start));
+        later(move |store| crate::link_picker::start_typed(store, &crate::editor::editor(pane), start));
         Some(tr)
     })
 }
@@ -130,13 +134,13 @@ pub fn set_app_store(store: crate::state::AppStore) {
 }
 
 /// "Copy Link to Here" (docs/LINKS_CONTRACT.md "Making a link"): a deep link
-/// to the caret in the open note, its sticky position from the
+/// to the caret in the note open in pane `pane`, its sticky position from the
 /// collaboration session and a quote of the words after it. With words
 /// selected, the spot is where they start and the quote is those words, so
 /// following the link selects what was selected.
-pub fn copy_link_here(store: crate::state::AppStore) {
-    let Some(active) = rinch::prelude::untracked(|| store.active_edit.get()) else { return };
-    let handle = crate::editor::editor();
+pub fn copy_link_here(store: crate::state::AppStore, pane: crate::panes::PaneId) {
+    let Some(active) = rinch::prelude::untracked(|| store.pane(pane).active_edit.get()) else { return };
+    let handle = crate::editor::editor(pane);
     let selection = handle.selection();
     let sticky = handle.collab_sticky_index(selection.from());
     let quote = quote_of(&handle.doc(), selection.from(), selection.to());
@@ -561,7 +565,7 @@ mod tests {
 
     fn editor_with(text: &'static str) -> crate::rinch_editor::EditorHandle {
         let handle = crate::rinch_editor::create_editor();
-        handle.add_plugin(std::rc::Rc::new(LinksPlugin));
+        handle.add_plugin(std::rc::Rc::new(LinksPlugin { pane: crate::panes::PaneId::FIRST }));
         assert!(handle.update(move |s| {
             let mut tr = s.tr();
             tr.insert_text(text).ok()?;
@@ -651,13 +655,13 @@ mod tests {
         let para = schema.branch("paragraph", Fragment::from_node(schema.text(text).unwrap())).unwrap();
         let doc = schema.branch(&schema.top_node, Fragment::from_children(vec![para])).unwrap();
         let mut plugins = default_plugins();
-        plugins.push(Rc::new(LinksPlugin) as Rc<dyn Plugin>);
+        plugins.push(Rc::new(LinksPlugin { pane: crate::panes::PaneId::FIRST }) as Rc<dyn Plugin>);
         let mut state = EditorState::create(schema, doc, plugins);
         let end = 1 + text.chars().count();
         let mut tr = state.tr();
         tr.set_selection(rinch_editor_core::selection::Selection::cursor(Pos(end)));
         state = state.apply(tr);
-        let rules = LinksPlugin.input_rules();
+        let rules = LinksPlugin { pane: crate::panes::PaneId::FIRST }.input_rules();
         let tr = apply_input_rules(&state, &rules, end, typed).unwrap_or_else(|| {
             let mut tr = state.tr();
             tr.insert_text(typed).unwrap();

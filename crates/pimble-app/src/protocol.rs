@@ -106,7 +106,11 @@ pub enum BackendCommand {
 
     // Subscription operations
     SubscribeStoreChanges { store_id: StoreId },
+    /// Sent once per node however many panes hold it, when the first pane
+    /// opens it (docs/SPLIT_VIEW_CONTRACT.md "Editors and collaboration").
     SubscribeNodeChanges { store_id: StoreId, node_id: NodeId },
+    /// The last pane holding the node let go of it.
+    UnsubscribeNodeChanges { store_id: StoreId, node_id: NodeId },
 
     /// Internal: the connection watchdog saw the WebSocket close. Carries the
     /// connection generation it watched so a stale watchdog (from before a
@@ -302,10 +306,10 @@ pub enum BackendEvent {
     RemoteStoreChange { store_id: StoreId, change_kind: pimble_rpc::StoreChangeKind, source_client_id: Option<String> },
 
     // Collaborative editing
-    /// Remote incremental changes arrived — apply to the local editor's collab
-    /// session. No node identity carried: pimble has one shared editor pane and
-    /// the subscription that produces this is already scoped to that node.
-    RemoteChanges { changes: String },
+    /// Remote incremental changes of one node arrived: apply them to the
+    /// collab session of every pane that holds it. The node is named because
+    /// several panes hold different documents at once.
+    RemoteChanges { store_id: StoreId, node_id: NodeId, changes: String },
 
     // Search
     /// The outcome of a `Search` command. Carries `Err` rather than folding

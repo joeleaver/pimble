@@ -30,6 +30,21 @@ fn spawn_task(fut: impl Future<Output = ()> + 'static) {
     wasm_bindgen_futures::spawn_local(fut);
 }
 
+/// The node subscriptions this process holds, each with the number of the
+/// task that feeds it. `UnsubscribeNodeChanges` takes a node out and a second
+/// `SubscribeNodeChanges` (after a reconnect) renumbers it; a task whose
+/// number is no longer the node's forwards nothing more and ends, dropping
+/// its subscription, at the next notification it is handed. So a node no
+/// pane holds reaches no editor, and one a pane holds is fed exactly once.
+static NODE_SUBSCRIPTIONS: std::sync::Mutex<Option<std::collections::HashMap<(pimble_core::StoreId, NodeId), u64>>> =
+    std::sync::Mutex::new(None);
+static NEXT_NODE_SUBSCRIPTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn node_subscriptions<T>(f: impl FnOnce(&mut std::collections::HashMap<(pimble_core::StoreId, NodeId), u64>) -> T) -> T {
+    let mut held = NODE_SUBSCRIPTIONS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(held.get_or_insert_with(Default::default))
+}
+
 pub async fn process_command(
     client: &mut Option<std::sync::Arc<PimbleClient>>,
     cmd: BackendCommand,
@@ -376,6 +391,8 @@ pub async fn process_command(
                     let tx = event_tx.clone();
                     let signal = signal_ui.clone();
                     let my_client_id = client_id.to_string();
+                    let number = NEXT_NODE_SUBSCRIPTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    node_subscriptions(|held| held.insert((store_id, node_id), number));
                     spawn_task(async move {
                         loop {
                             let notification = match sub.next().await {
@@ -386,6 +403,11 @@ pub async fn process_command(
                                 }
                                 None => break,
                             };
+                            // Let go of, or taken over by a later
+                            // subscription: this one is done.
+                            if node_subscriptions(|held| held.get(&(store_id, node_id)).copied()) != Some(number) {
+                                break;
+                            }
 
                             tracing::info!("Node sub: received notification, source={:?}, has_op={}", notification.source_client_id, notification.operation.is_some());
 
@@ -401,6 +423,8 @@ pub async fn process_command(
                                 use pimble_rpc::EditOperation;
                                 let EditOperation::IncrementalChanges { changes } = op;
                                 if let Err(e) = tx.try_send(BackendEvent::RemoteChanges {
+                                    store_id,
+                                    node_id,
                                     changes: changes.clone(),
                                 }) {
                                     tracing::warn!("RemoteChanges channel full, dropped: {}", e);
@@ -413,6 +437,11 @@ pub async fn process_command(
                 }
                 Err(e) => Some(BackendEvent::Error { message: format!("Subscribe failed: {}", e) }),
             }
+        }
+
+        BackendCommand::UnsubscribeNodeChanges { store_id, node_id } => {
+            node_subscriptions(|held| held.remove(&(store_id, node_id)));
+            None
         }
 
         // Handled in `backend_loop` before dispatch; never reaches here.

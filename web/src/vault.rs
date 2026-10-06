@@ -480,12 +480,13 @@ pub struct VaultClient {
     /// Which of those this session has already said out loud: once per store,
     /// not once per retry.
     announced: HashSet<StoreId>,
-    /// The node the editor currently has open, learned from
-    /// `SubscribeNodeChanges`. A decrypted content update is only turned into
-    /// `RemoteChanges` for this node: the app has one editor pane and that
-    /// event carries no node identity, so applying another node's update to it
-    /// would corrupt what is on screen.
-    active: Option<(StoreId, NodeId)>,
+    /// The nodes the app's panes have open, learned from
+    /// `SubscribeNodeChanges` and forgotten at `UnsubscribeNodeChanges`
+    /// (docs/SPLIT_VIEW_CONTRACT.md: once per node, however many panes hold
+    /// it). A decrypted content update is turned into `RemoteChanges` only
+    /// for one of these; for any other node the app is told its content
+    /// changed and fetches it when it wants it.
+    active: HashSet<(StoreId, NodeId)>,
     /// The stores whose endpoint is down because the computer they are served
     /// from is (docs/RELAY_CONTRACT.md), as the backend loop last said
     /// ([`VaultClient::endpoint_down`]): read from what this page holds,
@@ -519,7 +520,7 @@ impl VaultClient {
             rows: HashMap::new(),
             waiting: HashMap::new(),
             announced: HashSet::new(),
-            active: None,
+            active: HashSet::new(),
             owner_offline: HashSet::new(),
             relayed: HashSet::new(),
             ended: HashSet::new(),
@@ -655,9 +656,10 @@ impl VaultClient {
             if !still_open {
                 self.stores.remove(&share.store_id);
             }
-            if self.active.is_some_and(|(store_id, node_id)| store_id == share.store_id && !self.stores.get(&store_id).is_some_and(|open| open.tree.doc(node_id).is_some())) {
-                self.active = None;
-            }
+            let stores = &self.stores;
+            self.active.retain(|(store_id, node_id)| {
+                *store_id != share.store_id || stores.get(store_id).is_some_and(|open| open.tree.doc(*node_id).is_some())
+            });
             if share.every {
                 self.waiting.remove(&share.store_id);
                 self.subscribed.remove(&share.store_id);
@@ -1060,7 +1062,7 @@ impl VaultClient {
         let now = now_ms();
         for (node_id, fetched) in fetched {
             let Ok(fetched) = fetched else { continue };
-            let active = self.active == Some((store_id, node_id));
+            let active = self.active.contains(&(store_id, node_id));
             let Some(store) = self.stores.get_mut(&store_id) else { continue };
             let merged = store.take_fetched(store_id, node_id, &fetched, active, now);
             structure |= merged.structure;
@@ -1146,7 +1148,7 @@ impl VaultClient {
         blob: &str,
         source_client_id: Option<String>,
     ) -> Vec<BackendEvent> {
-        let active = self.active == Some((store_id, node_id));
+        let active = self.active.contains(&(store_id, node_id));
         let apply = should_apply(source_client_id.as_deref(), &self.client_id);
         let Some(store) = self.stores.get_mut(&store_id) else { return Vec::new() };
 
@@ -1292,12 +1294,15 @@ impl VaultClient {
                 self.subscribe(client, store_id, signal_ui).await
             }
 
-            // One editor pane, one open node: this is how the vault client
-            // learns which node a decrypted update belongs on screen. No
-            // server subscription is needed — the store's already delivers
-            // every blob.
+            // This is how the vault client learns which nodes a decrypted
+            // update belongs on screen for. No server subscription is
+            // needed — the store's already delivers every blob.
             BackendCommand::SubscribeNodeChanges { store_id, node_id } => {
-                self.active = Some((store_id, node_id));
+                self.active.insert((store_id, node_id));
+                None
+            }
+            BackendCommand::UnsubscribeNodeChanges { store_id, node_id } => {
+                self.active.remove(&(store_id, node_id));
                 None
             }
 
@@ -1491,7 +1496,11 @@ impl VaultClient {
                 }
             }
             BackendCommand::SubscribeNodeChanges { store_id, node_id } => {
-                self.active = Some((store_id, node_id));
+                self.active.insert((store_id, node_id));
+                None
+            }
+            BackendCommand::UnsubscribeNodeChanges { store_id, node_id } => {
+                self.active.remove(&(store_id, node_id));
                 None
             }
             BackendCommand::SubscribeStoreChanges { .. } => None,
@@ -2044,7 +2053,7 @@ impl VaultClient {
             touched
         };
         let fetched = client.vault_fetch(store_id, VaultDocId::Node(node_id), 0).await;
-        let active = self.active == Some((store_id, node_id));
+        let active = self.active.contains(&(store_id, node_id));
         let Some(store) = self.stores.get_mut(&store_id) else { return Vec::new() };
         let fetched = match fetched {
             Ok(fetched) => fetched,
@@ -2359,7 +2368,7 @@ impl VaultStore {
                     // The editor has this node open, so hand it each delta
                     // the same way a plain store's subscription would.
                     for bytes in &content_updates {
-                        events.push(BackendEvent::RemoteChanges { changes: STANDARD.encode(bytes) });
+                        events.push(BackendEvent::RemoteChanges { store_id, node_id, changes: STANDARD.encode(bytes) });
                     }
                 }
                 StoreChangeKind::ContentUpdated { .. } => {
@@ -3545,6 +3554,7 @@ pub fn store_id_of(cmd: &BackendCommand) -> Option<StoreId> {
         | ReconcileNodeContent { store_id, .. }
         | SubscribeStoreChanges { store_id }
         | SubscribeNodeChanges { store_id, .. }
+        | UnsubscribeNodeChanges { store_id, .. }
         | RebuildIndex { store_id }
         | SetStoreSync { store_id, .. }
         | GetStoreSync { store_id }
@@ -4186,7 +4196,7 @@ mod tests {
         let delta = peer.doc_mut(x).unwrap().replace_plain_text("and more").unwrap();
         let edit = TreeEdit { touched: vec![(x, delta.clone())] };
         let (events, _) = arrive(&mut again, store_id, &edit, &mut seq, Some(x));
-        assert!(matches!(&events[..], [BackendEvent::RemoteChanges { changes }] if *changes == STANDARD.encode(&delta)), "{events:?}");
+        assert!(matches!(&events[..], [BackendEvent::RemoteChanges { changes, .. }] if *changes == STANDARD.encode(&delta)), "{events:?}");
     }
 
     // ── Repair only after a whole pull ──────────────────────────────────────
@@ -5392,7 +5402,7 @@ mod tests {
         let mut client = VaultClient::new("me".to_string());
         client.stores.insert(store_id, store);
         client.rows.insert(store_id, both.clone());
-        client.active = Some((store_id, bread));
+        client.active.insert((store_id, bread));
 
         // The same list again: nothing to say.
         assert!(client.take_rows(HashMap::from([(store_id, both)])).is_empty());
@@ -5410,7 +5420,7 @@ mod tests {
             assert!(open.tree.doc(gone).is_none() && !open.docs.contains_key(&gone) && !open.heads.contains_key(&gone), "{gone} is still in memory");
         }
         assert!(open.tree.doc(monday).is_some() && open.tree.doc(plans).is_some());
-        assert_eq!(client.active, None, "the open document was under it");
+        assert!(client.active.is_empty(), "the open document was under it");
         let mut described = scoped.clone();
         client.describe(&mut described);
         assert_eq!((described.roots.clone(), described.root_node_id), (vec![plans], plans));

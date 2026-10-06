@@ -12,6 +12,7 @@ use pimble_core::{MountRef, MountState, Node, NodeId, RemoteEndpoint, Store, Sto
 use rinch::components::TreeNodeData;
 use rinch::prelude::*;
 
+use crate::panes::{PaneId, Tiling, MAX_PANES};
 use crate::protocol::BackendHandle;
 
 thread_local! {
@@ -625,6 +626,10 @@ pub struct LinkOpen {
     pub store_id: StoreId,
     pub node_id: NodeId,
     pub anchor: Option<pimble_core::Anchor>,
+    /// The pane the link was followed from, which is where it opens
+    /// (docs/SPLIT_VIEW_CONTRACT.md); the focused pane when it was followed
+    /// from none.
+    pub pane: Option<PaneId>,
 }
 
 /// The explorer's width before anyone drags it, and the range a drag keeps it in:
@@ -673,7 +678,18 @@ pub struct AppStore {
     pub server_addr: Signal<String>,
     pub selected_id: Signal<Option<String>>,
     pub node_title: Signal<String>,
-    pub show_editor: Signal<bool>,
+
+    // The split view (docs/SPLIT_VIEW_CONTRACT.md): how the area beside the
+    // explorer is tiled, which pane has the focus, and what each of the four
+    // pane slots holds. `selected_id` above is the tree's selected row, which
+    // is the focused pane's document: `select_in_pane` and `focus_pane` are
+    // the two places that keep it so.
+    pub tiling: Signal<Tiling>,
+    pub focused_pane: Signal<PaneId>,
+    pub panes: [PaneState; MAX_PANES],
+    /// The pane a link being resolved was followed from, until it opens or
+    /// is refused.
+    pub link_from: Signal<Option<PaneId>>,
 
     // Inline rename
     pub renaming_node: Signal<Option<String>>,
@@ -696,11 +712,6 @@ pub struct AppStore {
 
     // Editor dirty flag — set when user edits content, cleared on save/load
     pub editor_dirty: Signal<bool>,
-
-    // Active editing state — which node is currently open in the shared editor.
-    // Its content lives in the editor's collab session; edits broadcast to the
-    // server live rather than being saved by wholesale replacement.
-    pub active_edit: Signal<Option<ActiveEdit>>,
 
     // Locally-computed display label for the node currently being typed into,
     // refreshed on a debounce by `editor::schedule_label_refresh` straight from
@@ -919,11 +930,6 @@ pub struct AppStore {
     /// anchor the editor puts the caret at once the session is up
     /// (docs/LINKS_CONTRACT.md "Following a link").
     pub link_open: Signal<Option<LinkOpen>>,
-    /// A deep link's anchor waiting for its node's editor session: the
-    /// editor resolves it (`NodeDoc::resolve_anchor`) and puts the caret
-    /// there once rinch can place and scroll a caret it was not clicked to
-    /// (docs/LINKS_CONTRACT.md, rinch PRs 4 and 5).
-    pub pending_anchor: Signal<Option<(StoreId, NodeId, pimble_core::Anchor)>>,
     /// The tooltip over a hovered link, once the pointer has rested on it
     /// (docs/LINKS_CONTRACT.md "What a link looks like").
     pub link_hover: Signal<Option<LinkTooltip>>,
@@ -968,11 +974,51 @@ impl RootsChange {
     }
 }
 
-/// Identifies the node currently open in the shared editor.
-#[derive(Clone)]
+/// Identifies the node open in a pane's editor: the CANONICAL pair, where an
+/// edit would be written, even when the node was reached through a mount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActiveEdit {
     pub store_id: StoreId,
     pub node_id: NodeId,
+}
+
+/// What one pane slot holds (docs/SPLIT_VIEW_CONTRACT.md "The model"). The
+/// slot exists for the app's life whether or not the tiling shows it; a
+/// slot that is not shown holds nothing.
+#[derive(Clone, Copy)]
+pub struct PaneState {
+    /// The tree value the pane was opened on (a node's, with any mount
+    /// path, or a store row's), which is the tree's selected row while the
+    /// pane has the focus.
+    pub selected: Signal<Option<String>>,
+    /// Whether the pane shows its editor (it holds a document) or the
+    /// empty state.
+    pub show_editor: Signal<bool>,
+    /// The node open in the pane's editor. Its content lives in that
+    /// editor's collab session; edits broadcast to the server live rather
+    /// than being saved by wholesale replacement.
+    pub active_edit: Signal<Option<ActiveEdit>>,
+    /// A deep link's anchor waiting for its node's editor session in this
+    /// pane: the editor resolves it (`NodeDoc::resolve_anchor`) and puts the
+    /// caret there once the session holds the content
+    /// (docs/LINKS_CONTRACT.md "Following a link").
+    pub pending_anchor: Signal<Option<(StoreId, NodeId, pimble_core::Anchor)>>,
+    /// A document the saved layout names for this pane, opened once its
+    /// store is open and the node is known (docs/SPLIT_VIEW_CONTRACT.md
+    /// "Persistence").
+    pub restore: Signal<Option<(StoreId, NodeId)>>,
+}
+
+impl PaneState {
+    fn new() -> Self {
+        Self {
+            selected: Signal::new(None),
+            show_editor: Signal::new(false),
+            active_edit: Signal::new(None),
+            pending_anchor: Signal::new(None),
+            restore: Signal::new(None),
+        }
+    }
 }
 
 impl AppStore {
@@ -993,7 +1039,10 @@ impl AppStore {
             server_addr: Signal::new(String::new()),
             selected_id: Signal::new(None),
             node_title: Signal::new(String::new()),
-            show_editor: Signal::new(false),
+            tiling: Signal::new(Tiling::default()),
+            focused_pane: Signal::new(PaneId::FIRST),
+            panes: std::array::from_fn(|_| PaneState::new()),
+            link_from: Signal::new(None),
             renaming_node: Signal::new(None),
             rename_text: Signal::new(String::new()),
             drop_target: Signal::new(None),
@@ -1001,7 +1050,6 @@ impl AppStore {
             pending_mount: Signal::new(None),
             mount_source: Signal::new(None),
             editor_dirty: Signal::new(false),
-            active_edit: Signal::new(None),
             live_label: Signal::new(HashMap::new()),
             client_id: Signal::new(String::new()),
             search_query: Signal::new(String::new()),
@@ -1075,7 +1123,6 @@ impl AppStore {
             owner_offline: Signal::new(HashSet::new()),
             notice: Signal::new(String::new()),
             link_open: Signal::new(None),
-            pending_anchor: Signal::new(None),
             link_hover: Signal::new(None),
             link_picker: Signal::new(None),
             deleted_modal_store: Signal::new(None),
@@ -1500,15 +1547,100 @@ impl AppStore {
         }
         self.remove_node(store_id, node_id);
 
-        if let Some(selected_id) = self.selected_id.get() {
-            if let Some((sel_sid, Some(sel_nid))) = parse_tree_value(&selected_id) {
-                if sel_sid == store_id && sel_nid == node_id {
-                    self.selected_id.set(None);
-                    self.node_title.set(String::new());
-                    self.show_editor.set(false);
+        // Every pane that holds it, not only the focused one
+        // (docs/SPLIT_VIEW_CONTRACT.md "What the person sees").
+        for pane in self.panes_showing(store_id, node_id) {
+            self.clear_pane(pane);
+        }
+    }
+
+    /// What pane `pane` holds.
+    pub fn pane(&self, pane: PaneId) -> PaneState {
+        self.panes[pane.index()]
+    }
+
+    /// The focused pane, untracked.
+    pub fn focused(&self) -> PaneId {
+        untracked(|| self.focused_pane.get())
+    }
+
+    /// The node open in the focused pane's editor, untracked: what "the
+    /// active edit" means now that there are several panes.
+    pub fn focused_edit(&self) -> Option<ActiveEdit> {
+        untracked(|| self.pane(self.focused()).active_edit.get())
+    }
+
+    /// The panes whose editor has this node open, untracked.
+    pub fn panes_editing(&self, store_id: StoreId, node_id: NodeId) -> Vec<PaneId> {
+        let edit = Some(ActiveEdit { store_id, node_id });
+        untracked(|| PaneId::ALL.into_iter().filter(|pane| self.pane(*pane).active_edit.get() == edit).collect())
+    }
+
+    /// Whether any pane's editor has this node open, untracked.
+    pub fn is_editing(&self, store_id: StoreId, node_id: NodeId) -> bool {
+        !self.panes_editing(store_id, node_id).is_empty()
+    }
+
+    /// Every node open in some pane's editor, each once, untracked.
+    pub fn edited_nodes(&self) -> Vec<ActiveEdit> {
+        let mut nodes: Vec<ActiveEdit> = Vec::new();
+        for pane in PaneId::ALL {
+            if let Some(edit) = untracked(|| self.pane(pane).active_edit.get()) {
+                if !nodes.contains(&edit) {
+                    nodes.push(edit);
                 }
             }
         }
+        nodes
+    }
+
+    /// The panes opened on this node (their tree value names it, through a
+    /// mount or not), untracked: the ones a `NodeLoaded` for it is news to,
+    /// and the ones that close when it is deleted.
+    pub fn panes_showing(&self, store_id: StoreId, node_id: NodeId) -> Vec<PaneId> {
+        untracked(|| {
+            PaneId::ALL
+                .into_iter()
+                .filter(|pane| {
+                    self.pane(*pane).selected.get().and_then(|value| parse_tree_value(&value)) == Some((store_id, Some(node_id)))
+                })
+                .collect()
+        })
+    }
+
+    /// Open pane `pane` on a tree value, or on nothing. The tree's selected
+    /// row follows when the pane has the focus.
+    pub fn select_in_pane(&self, pane: PaneId, value: Option<String>) {
+        self.pane(pane).selected.set(value.clone());
+        if pane == self.focused() {
+            self.selected_id.set(value);
+        }
+    }
+
+    /// Empty pane `pane`: nothing selected, the empty state shown. The
+    /// editor itself is left alone, and the next document opened there ends
+    /// its session as it ends any other.
+    pub fn clear_pane(&self, pane: PaneId) {
+        self.select_in_pane(pane, None);
+        self.pane(pane).show_editor.set(false);
+        self.pane(pane).restore.set(None);
+        if pane == self.focused() {
+            self.node_title.set(String::new());
+        }
+    }
+
+    /// Give pane `pane` the focus: the tree's selected row becomes its
+    /// document. Answers whether the focus moved.
+    pub fn focus_pane(&self, pane: PaneId) -> bool {
+        if pane == self.focused() {
+            return false;
+        }
+        self.focused_pane.set(pane);
+        let value = untracked(|| self.pane(pane).selected.get());
+        if untracked(|| self.selected_id.get()) != value {
+            self.selected_id.set(value);
+        }
+        true
     }
 
     /// Insert or update a node's per-entity signal.

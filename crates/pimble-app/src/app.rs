@@ -16,6 +16,7 @@ use crate::protocol::{BackendCommand, CloudOp};
 #[cfg(feature = "native")]
 use crate::protocol::BackendHandle;
 use crate::editor::{start_editing, stop_editing};
+use crate::panes::PaneId;
 use crate::events::{EVENT_PROCESSOR, process_backend_events};
 use crate::appearance::{display_color, icon_by_name, icons_matching, IconGlyph, COLOR_CHOICES};
 use crate::persistence::{load_dark_mode, load_sidebar_width, save_dark_mode, save_sidebar_width};
@@ -95,7 +96,7 @@ pub fn toggle_dark_mode(store: AppStore) {
     let dark = !untracked(|| store.dark_mode.get());
     store.dark_mode.set(dark);
     rinch::update_theme(&theme_props(dark));
-    crate::editor::editor().set_dark_mode(dark);
+    crate::editor::set_dark_mode(dark);
     save_dark_mode(dark);
 }
 
@@ -269,9 +270,24 @@ pub fn open_new_store_modal(store: AppStore) {
 /// (`"store_{uuid}"` / `"node_{store_uuid}_{node_uuid}"`) — the single
 /// implementation behind both a tree click and a search-result click, per
 /// CLAUDE.md's "one way to write node content": there is one way to open one.
+///
+/// It opens in the focused pane (docs/SPLIT_VIEW_CONTRACT.md "What the
+/// person sees"); [`open_node_in`] names another.
 fn open_node(store: AppStore, tree_state: UseTreeReturn, value: String) {
-    store.selected_id.set(Some(value.clone()));
-    tree_state.controller.select(&value);
+    open_node_in(store, tree_state, store.focused(), value);
+}
+
+/// Open a tree value in pane `pane`. The tree's selected row follows when
+/// the pane has the focus.
+fn open_node_in(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value: String) {
+    let focused = pane == store.focused();
+    let state = store.pane(pane);
+    store.select_in_pane(pane, Some(value.clone()));
+    // Whatever the saved layout meant this pane for, the person chose this.
+    state.restore.set(None);
+    if focused {
+        tree_state.controller.select(&value);
+    }
 
     // Offline-first: a document opens from the cached content at once and
     // `start_editing` then reconciles the session with the server (state
@@ -312,19 +328,19 @@ fn open_node(store: AppStore, tree_state: UseTreeReturn, value: String) {
         (None, None, false, None)
     };
 
-    store.show_editor.set(is_document);
+    state.show_editor.set(is_document);
 
-    if let Some(title) = title_opt {
+    if let Some(title) = title_opt.filter(|_| focused) {
         store.node_title.set(title);
     }
 
     if is_document {
         let content_bytes = content_bytes_opt.unwrap_or_default();
         if let Some((s_id, n_id)) = sel_ids {
-            start_editing(store, s_id, n_id, &content_bytes);
+            start_editing(store, pane, s_id, n_id, &content_bytes);
         }
     } else {
-        stop_editing(store);
+        stop_editing(store, pane);
     }
     store.editor_dirty.set(false);
 }
@@ -903,8 +919,10 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
     // A followed link's target opens the way a search hit does, with
     // `open_node` (docs/LINKS_CONTRACT.md "Following a link"), deferred out
     // of the effect so opening, which writes signals other effects read,
-    // never runs inside it. A deep link's anchor waits in `pending_anchor`
-    // for the editor session of that node.
+    // never runs inside it. It opens in the pane it was followed from (the
+    // focused one when that pane has closed since, or it was followed from
+    // none). A deep link's anchor waits in that pane's `pending_anchor` for
+    // the editor session of that node.
     let _ = rinch::Effect::new(move || {
         let Some(open) = store.link_open.get() else { return };
         let _ = set_timeout(0, move || {
@@ -912,8 +930,10 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 return;
             }
             store.link_open.set(None);
-            store.pending_anchor.set(open.anchor.clone().map(|anchor| (open.store_id, open.node_id, anchor)));
-            open_node(store, tree_state, open.value);
+            let shown = untracked(|| store.tiling.with(|tiling| tiling.panes()));
+            let pane = open.pane.filter(|pane| shown.contains(pane)).unwrap_or_else(|| store.focused());
+            store.pane(pane).pending_anchor.set(open.anchor.clone().map(|anchor| (open.store_id, open.node_id, anchor)));
+            open_node_in(store, tree_state, pane, open.value);
             // Where it is in the tree, which may not have been opened that far.
             store.send(BackendCommand::GetAncestors { store_id: open.store_id, node_id: open.node_id });
         });
@@ -2243,10 +2263,10 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         // autosave — the collab session persists edits live (the server applies
         // and relays each delta).
         let editor_view = rsx! {
-            Editor { editor: crate::editor::editor() }
+            Editor { editor: crate::editor::editor(PaneId::FIRST) }
         };
 
-        let toolbar_handle = crate::toolbar::render_pimble_toolbar(__scope);
+        let toolbar_handle = crate::toolbar::render_pimble_toolbar(__scope, PaneId::FIRST);
 
         // Whether the document in the pane is one this device may only read
         // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"): its store is
@@ -2266,7 +2286,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         // subscription — so reading one signal inside another's `with` panics.
         // (`AppStore`'s own helpers nest freely because they are `untracked`.)
         let editor_read_only = move || -> bool {
-            let Some(active) = store.active_edit.get() else { return false };
+            let Some(active) = store.pane(PaneId::FIRST).active_edit.get() else { return false };
             let sig = store.store_data.with(|map| map.get(&active.store_id).copied());
             if sig.map_or(false, |sig| sig.with(|s| !s.access.allows_write())) {
                 return true;
@@ -2278,7 +2298,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         // (`editor::set_read_only`): locked, it refuses every local change
         // while remote ones keep landing, so a reader's keystroke changes
         // nothing on screen. The effect lives as long as this component.
-        let _ = rinch::Effect::new(move || crate::editor::set_read_only(editor_read_only()));
+        let _ = rinch::Effect::new(move || crate::editor::set_read_only(PaneId::FIRST, editor_read_only()));
 
         // Editor empty state icon
         let empty_icon = render_tabler_icon(__scope, TablerIcon::FileText, TablerIconStyle::Outline);
@@ -3909,24 +3929,24 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
 
                             div {
                                 class: "pimble-editor__toolbar-wrap",
-                                style: {move || if store.show_editor.get() && !editor_read_only() { "" } else { "display: none;" }},
+                                style: {move || if store.pane(PaneId::FIRST).show_editor.get() && !editor_read_only() { "" } else { "display: none;" }},
                                 {toolbar_handle}
                             }
                             // The same sentence a refused write comes back
                             // with, so a reader meets one wording everywhere.
                             div {
                                 class: "pimble-editor__read-only",
-                                style: {move || if store.show_editor.get() && editor_read_only() { "" } else { "display: none;" }},
+                                style: {move || if store.pane(PaneId::FIRST).show_editor.get() && editor_read_only() { "" } else { "display: none;" }},
                                 {pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string()}
                             }
                             div {
                                 class: "pimble-editor__content-wrap",
-                                style: {|| if store.show_editor.get() { "" } else { "display: none;" }},
+                                style: {|| if store.pane(PaneId::FIRST).show_editor.get() { "" } else { "display: none;" }},
                                 {editor_view}
                             }
                             div {
                                 class: "pimble-empty-state",
-                                style: {|| if store.show_editor.get() { "display: none;" } else { "" }},
+                                style: {|| if store.pane(PaneId::FIRST).show_editor.get() { "display: none;" } else { "" }},
                                 div {
                                     class: "pimble-empty-state__icon",
                                     {empty_icon}
@@ -4032,7 +4052,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 onclick: {
                                     let index = line.index;
                                     move || {
-                                        crate::link_picker::accept(store, &crate::editor::editor(), index);
+                                        crate::link_picker::accept(store, &crate::editor::focused_editor(store), index);
                                     }
                                 },
                                 span { class: "pimble-link-picker__label", {line.label.clone()} }
