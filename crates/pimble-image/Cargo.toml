@@ -8,4 +8,5 @@ description = "Fitting a picture under Pimble's size limit before it is stored: 
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+pimble-core = { workspace = true }
 thiserror = { workspace = true }

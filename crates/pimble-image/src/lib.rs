@@ -17,9 +17,7 @@ use std::io::Cursor;
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
-
-/// The largest picture a store holds, in bytes (decision 2 of the images contract).
-pub const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+use pimble_core::{ImageMime, MAX_IMAGE_BYTES};
 
 /// The quality an oversize picture without transparency is rewritten at.
 const JPEG_QUALITY: u8 = 90;
@@ -31,7 +29,7 @@ const STEP: f64 = 0.9;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fitted {
     pub bytes: Vec<u8>,
-    pub mime: &'static str,
+    pub mime: ImageMime,
     /// The sentence for the person when the picture was changed to fit; `None` when
     /// it went through as it was.
     pub notice: Option<String>,
@@ -48,43 +46,25 @@ pub enum FitError {
     Unreadable { size: String, limit: String, reason: String },
 }
 
-/// The MIME type of `bytes` by their first bytes: one of the five kinds a store
-/// holds, or `None`. Never SVG, whatever a file's name says.
-pub fn sniff(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("image/png")
-    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        Some("image/jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" && matches!(&bytes[8..12], b"avif" | b"avis") {
-        Some("image/avif")
-    } else {
-        None
-    }
-}
-
 /// `bytes` as a picture of at most [`MAX_IMAGE_BYTES`].
 pub fn fit(bytes: Vec<u8>) -> Result<Fitted, FitError> {
-    fit_within(bytes, MAX_IMAGE_BYTES)
+    fit_within(bytes, MAX_IMAGE_BYTES as usize)
 }
 
 /// [`fit`] with the limit given, so a test need not build a 20 MiB picture.
 pub fn fit_within(bytes: Vec<u8>, limit: usize) -> Result<Fitted, FitError> {
-    let mime = sniff(&bytes).ok_or(FitError::NotAnImage)?;
+    let mime = ImageMime::sniff(&bytes).ok_or(FitError::NotAnImage)?;
     if bytes.len() <= limit {
         return Ok(Fitted { bytes, mime, notice: None });
     }
     let (size, limit_text) = (mebibytes(bytes.len()), mebibytes(limit));
-    if mime == "image/avif" {
+    if mime == ImageMime::Avif {
         // Nothing in the stack reads AVIF without a C decoder.
         return Err(FitError::OversizeAvif { size, limit: limit_text });
     }
     let unreadable = |reason: String| FitError::Unreadable { size: size.clone(), limit: limit_text.clone(), reason };
 
-    let format = ImageFormat::from_mime_type(mime).ok_or(FitError::NotAnImage)?;
+    let format = ImageFormat::from_mime_type(mime.as_str()).ok_or(FitError::NotAnImage)?;
     let mut decoder = ImageReader::with_format(Cursor::new(&bytes), format)
         .into_decoder()
         .map_err(|e| unreadable(e.to_string()))?;
@@ -105,7 +85,7 @@ pub fn fit_within(bytes: Vec<u8>, limit: usize) -> Result<Fitted, FitError> {
         };
         let (encoded, out_mime) = encode(&scaled, transparent).map_err(&unreadable)?;
         if encoded.len() <= limit || (width == 1 && height == 1) {
-            let still = if mime == "image/gif" { " An animated GIF this large keeps only its first frame." } else { "" };
+            let still = if mime == ImageMime::Gif { " An animated GIF this large keeps only its first frame." } else { "" };
             let notice = format!(
                 "This picture was {size}, so it was scaled to {width} × {height} ({}) to fit Pimble's {limit_text} limit.{still}",
                 mebibytes(encoded.len())
@@ -117,15 +97,15 @@ pub fn fit_within(bytes: Vec<u8>, limit: usize) -> Result<Fitted, FitError> {
 }
 
 /// PNG for a picture with transparency, JPEG at quality 90 for one without.
-fn encode(picture: &DynamicImage, transparent: bool) -> Result<(Vec<u8>, &'static str), String> {
+fn encode(picture: &DynamicImage, transparent: bool) -> Result<(Vec<u8>, ImageMime), String> {
     let mut out = Vec::new();
     if transparent {
         picture.write_to(&mut Cursor::new(&mut out), ImageFormat::Png).map_err(|e| e.to_string())?;
-        Ok((out, "image/png"))
+        Ok((out, ImageMime::Png))
     } else {
         let rgb = picture.to_rgb8();
         JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY).encode_image(&rgb).map_err(|e| e.to_string())?;
-        Ok((out, "image/jpeg"))
+        Ok((out, ImageMime::Jpeg))
     }
 }
 
@@ -175,7 +155,7 @@ mod tests {
     fn a_picture_under_the_limit_goes_through_byte_for_byte() {
         let bytes = png(&noise(40, 30, |_, _| 255));
         let fitted = fit(bytes.clone()).unwrap();
-        assert_eq!(fitted, Fitted { bytes, mime: "image/png", notice: None });
+        assert_eq!(fitted, Fitted { bytes, mime: ImageMime::Png, notice: None });
     }
 
     #[test]
@@ -183,7 +163,7 @@ mod tests {
         let bytes = png(&noise(400, 300, |_, _| 255));
         let limit = bytes.len() / 4;
         let fitted = fit_within(bytes.clone(), limit).unwrap();
-        assert_eq!(fitted.mime, "image/jpeg");
+        assert_eq!(fitted.mime, ImageMime::Jpeg);
         assert!(fitted.bytes.len() <= limit);
         let (width, height) = dimensions(&fitted.bytes);
         assert!(width < 400 && height < 300, "{width} x {height}");
@@ -199,7 +179,7 @@ mod tests {
         let bytes = png(&noise(300, 300, |x, _| if x < 150 { 0 } else { 255 }));
         let limit = bytes.len() / 3;
         let fitted = fit_within(bytes, limit).unwrap();
-        assert_eq!(fitted.mime, "image/png");
+        assert_eq!(fitted.mime, ImageMime::Png);
         assert!(fitted.bytes.len() <= limit);
         let picture = image::load_from_memory(&fitted.bytes).unwrap().to_rgba8();
         assert_eq!(picture.get_pixel(0, 0).0[3], 0, "the transparent half is still transparent");
@@ -218,9 +198,9 @@ mod tests {
                 encoder.encode_frame(Frame::new(frame)).unwrap();
             }
         }
-        assert_eq!(sniff(&bytes), Some("image/gif"));
+        assert_eq!(ImageMime::sniff(&bytes), Some(ImageMime::Gif));
         let fitted = fit_within(bytes.clone(), bytes.len() / 2).unwrap();
-        assert_ne!(fitted.mime, "image/gif");
+        assert_ne!(fitted.mime, ImageMime::Gif);
         assert!(fitted.notice.unwrap().ends_with("An animated GIF this large keeps only its first frame."));
     }
 
@@ -249,8 +229,6 @@ mod tests {
     fn what_is_not_one_of_the_five_kinds_is_refused() {
         assert_eq!(fit(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>".to_vec()), Err(FitError::NotAnImage));
         assert_eq!(fit(b"plain text".to_vec()), Err(FitError::NotAnImage));
-        assert_eq!(sniff(b"RIFF\x00\x00\x00\x00WEBPVP8 "), Some("image/webp"));
-        assert_eq!(sniff(b"\x00\x00\x00\x1cftypavif\x00\x00\x00\x00"), Some("image/avif"));
     }
 
     #[test]
