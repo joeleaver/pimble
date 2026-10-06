@@ -18,7 +18,7 @@ use crate::editor::{start_editing, stop_editing};
 use crate::panes::PaneId;
 use crate::events::{EVENT_PROCESSOR, process_backend_events};
 use crate::appearance::{display_color, icon_by_name, icons_matching, IconGlyph, COLOR_CHOICES};
-use crate::persistence::{load_dark_mode, load_sidebar_width, save_dark_mode, save_sidebar_width};
+use crate::persistence::{load_dark_mode, load_panes, load_sidebar_width, save_dark_mode, save_panes, save_sidebar_width};
 use crate::state::{parse_tree_value, display_label_from_node, mount_is_dimmed, mount_label_suffix, AppStore, SearchState};
 use crate::state::{deleted_row_meta, deleted_row_read_only};
 use crate::state::{ShareFace, HOST_ON_CLOUD_LABEL, HOST_ON_CLOUD_SENTENCE, SHARE_FROM_HERE_LABEL, SHARE_FROM_HERE_SENTENCE};
@@ -908,6 +908,37 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
     if let Some(width) = load_sidebar_width() {
         store.sidebar_width.set(width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH));
     }
+
+    // The split view as it was left (docs/SPLIT_VIEW_CONTRACT.md
+    // "Persistence"): the tiling at once, each pane's document when its
+    // store is open. From then on the layout is saved whenever the tiling,
+    // a pane's document or the focus changes; a divider being dragged is
+    // saved when it is let go. Coalesced over a turn, because switching a
+    // pane's document passes through holding none.
+    let remembered = load_panes();
+    if let Some(saved) = remembered.clone() {
+        store.restore_panes(saved);
+    }
+    let last_saved = Rc::new(RefCell::new(remembered));
+    let save_pending = Rc::new(Cell::new(false));
+    // The first run only subscribes: nothing has changed yet, and there is
+    // no event loop to run a timer before the window exists.
+    let subscribed = Cell::new(false);
+    let _ = rinch::Effect::new(move || {
+        let _ = store.saved_panes();
+        if store.pane_dragging.get() || !subscribed.replace(true) || save_pending.replace(true) {
+            return;
+        }
+        let (last_saved, save_pending) = (last_saved.clone(), save_pending.clone());
+        let _ = set_timeout(0, move || {
+            save_pending.set(false);
+            let now = untracked(|| store.saved_panes());
+            if last_saved.borrow().as_ref() != Some(&now) {
+                save_panes(&now);
+                *last_saved.borrow_mut() = Some(now);
+            }
+        });
+    });
 
     // Double-click detection for rename: (last_click_time, last_click_value)
     let last_click: Rc<Cell<(f64, String)>> = Rc::new(Cell::new((now_ms(), String::new())));

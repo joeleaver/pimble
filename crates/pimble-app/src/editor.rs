@@ -73,15 +73,12 @@ pub(crate) fn set_dark_mode(dark: bool) {
     }
 }
 
-/// The keyboard or the pointer is in pane `pane`'s editor, so the pane has
-/// the focus. A click reaches the pane's own `onmousedown` on the desktop,
-/// but the browser's editor keeps a press inside it to itself, so this is
-/// how a pane learns of one there. The link picker belongs to the pane it
+/// A key was pressed in pane `pane`'s editor, so that is where the keyboard
+/// is and the pane has the focus (a press of the pointer reaches the pane
+/// itself: `pane_view::render_pane`). The link picker belongs to the pane it
 /// was opened in and closes when the focus leaves it.
 fn editor_took_focus(store: AppStore, pane: PaneId) {
-    if store.focus_pane(pane) {
-        crate::link_picker::close(store);
-    }
+    crate::pane_view::focus_pane(store, pane);
 }
 
 /// Begin editing `node_id` in pane `pane`: load its content into the pane's
@@ -141,11 +138,10 @@ pub(crate) fn start_editing(
             crate::link_picker::selection_changed(store, &editor(pane));
         }
     });
-    // rinch calls this for the focused editor only, so it also says where
-    // the keyboard is.
     handle.on_caret_moved(move || {
-        editor_took_focus(store, pane);
-        crate::link_picker::caret_moved(store, &editor(pane));
+        if store.focused() == pane {
+            crate::link_picker::caret_moved(store, &editor(pane));
+        }
     });
 
     // Every local edit's delta is base64-broadcast to the server, which persists it
@@ -424,5 +420,109 @@ fn doc_text(handle: &EditorHandle) -> String {
 pub(crate) fn apply_remote(store: AppStore, store_id: StoreId, node_id: NodeId, bytes: &[u8]) {
     for pane in store.panes_editing(store_id, node_id) {
         editor(pane).collab_receive(bytes);
+    }
+}
+
+#[cfg(all(test, feature = "native"))]
+mod tests {
+    use super::*;
+    use crate::protocol::{BackendEvent, BackendHandle};
+    use crossbeam_channel::bounded;
+    use rinch_editor_core::{Pos, Selection};
+
+    const P: [PaneId; MAX_PANES] = PaneId::ALL;
+
+    fn store_with_commands() -> (AppStore, crossbeam_channel::Receiver<BackendCommand>) {
+        let store = AppStore::new();
+        let (cmd_tx, cmd_rx) = bounded::<BackendCommand>(256);
+        let (_event_tx, event_rx) = bounded::<BackendEvent>(1);
+        store.backend.set(Some(BackendHandle { cmd_tx, event_rx }));
+        (store, cmd_rx)
+    }
+
+    fn type_at_end(pane: PaneId, text: &str) {
+        let handle = editor(pane);
+        let end = handle.doc().content_size().saturating_sub(1);
+        handle.set_selection(Selection::cursor(Pos(end)));
+        assert!(handle.insert_text(text));
+    }
+
+    fn subscribes(commands: &[BackendCommand], node_id: NodeId) -> usize {
+        commands.iter().filter(|c| matches!(c, BackendCommand::SubscribeNodeChanges { node_id: n, .. } if *n == node_id)).count()
+    }
+
+    fn unsubscribes(commands: &[BackendCommand], node_id: NodeId) -> usize {
+        commands.iter().filter(|c| matches!(c, BackendCommand::UnsubscribeNodeChanges { node_id: n, .. } if *n == node_id)).count()
+    }
+
+    /// The same note in two panes (docs/SPLIT_VIEW_CONTRACT.md "Editors and
+    /// collaboration"): what is typed in one appears in the other and goes
+    /// to the server once; a peer's delta reaches both and no other pane;
+    /// the node is subscribed once and let go of when the last pane does.
+    #[test]
+    fn the_same_note_in_two_panes_is_one_document() {
+        let (store, commands) = store_with_commands();
+        let (store_id, node_id, other_id) = (StoreId::new(), NodeId::new(), NodeId::new());
+
+        // A note nothing was ever written to: the first pane hosts it, the
+        // second joins the first rather than hosting an empty one of its own.
+        start_editing(store, P[0], store_id, node_id, &[]);
+        start_editing(store, P[1], store_id, node_id, &[]);
+        start_editing(store, P[2], store_id, other_id, &[]);
+        assert_eq!(store.panes_editing(store_id, node_id), vec![P[0], P[1]]);
+        let sent: Vec<BackendCommand> = commands.try_iter().collect();
+        assert_eq!(subscribes(&sent, node_id), 1, "once per node, however many panes hold it");
+        assert_eq!(subscribes(&sent, other_id), 1);
+
+        type_at_end(P[0], "typed in the first");
+        assert_eq!(doc_text(&editor(P[1])), "typed in the first", "the window hands the delta across");
+        assert_eq!(doc_text(&editor(P[2])), "", "a pane on another note hears nothing");
+        let sent: Vec<BackendCommand> = commands.try_iter().collect();
+        let broadcasts = sent.iter().filter(|c| matches!(c, BackendCommand::BroadcastChanges { node_id: n, .. } if *n == node_id)).count();
+        assert_eq!(broadcasts, 1, "the server is sent the delta once, and the second pane does not send it again");
+
+        type_at_end(P[1], ", and in the second");
+        assert_eq!(doc_text(&editor(P[0])), "typed in the first, and in the second");
+        assert_eq!(doc_text(&editor(P[0])), doc_text(&editor(P[1])));
+
+        // A peer: joins from the session's snapshot, types, and its delta
+        // arrives as `RemoteChanges` would bring it.
+        let peer = create_editor();
+        let outbox = std::rc::Rc::new(RefCell::new(Vec::<Vec<u8>>::new()));
+        let out = outbox.clone();
+        let snapshot = editor(P[0]).collab_snapshot().unwrap();
+        peer.start_collaboration_guest(&snapshot, move |delta| out.borrow_mut().push(delta)).unwrap();
+        peer.set_selection(Selection::cursor(Pos(1)));
+        assert!(peer.insert_text("Peer: "));
+        for delta in outbox.borrow_mut().drain(..) {
+            apply_remote(store, store_id, node_id, &delta);
+        }
+        assert_eq!(doc_text(&editor(P[0])), "Peer: typed in the first, and in the second");
+        assert_eq!(doc_text(&editor(P[1])), doc_text(&editor(P[0])));
+        assert_eq!(doc_text(&editor(P[2])), "", "and not the pane on another note");
+        let _ = commands.try_iter().count();
+
+        // Letting go: the subscription lasts as long as one pane holds it.
+        stop_editing(store, P[0]);
+        let sent: Vec<BackendCommand> = commands.try_iter().collect();
+        assert_eq!(unsubscribes(&sent, node_id), 0, "the second pane still holds it");
+        type_at_end(P[1], "!");
+        assert!(doc_text(&editor(P[1])).ends_with("second!"), "the pane left keeps working");
+        stop_editing(store, P[1]);
+        let sent: Vec<BackendCommand> = commands.try_iter().collect();
+        assert_eq!(unsubscribes(&sent, node_id), 1, "the last pane lets go of it");
+        assert!(store.edited_nodes() == vec![ActiveEdit { store_id, node_id: other_id }]);
+        stop_editing(store, P[2]);
+    }
+
+    /// A document this device may only read is locked in every pane that
+    /// holds it, and a pane beside it on a document it may edit is not.
+    #[test]
+    fn a_read_only_switch_is_per_pane() {
+        set_read_only(P[3], true);
+        assert!(editor(P[3]).is_read_only());
+        assert!(!editor(P[2]).is_read_only());
+        set_read_only(P[3], false);
+        assert!(!editor(P[3]).is_read_only());
     }
 }

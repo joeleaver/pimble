@@ -78,6 +78,57 @@ pub(crate) fn reveal_in_tree(store: AppStore, tree_state: UseTreeReturn, store_i
     crate::app::reveal_row(value);
 }
 
+/// The store a remembered layout names documents of is open: ask where each
+/// of them is now (docs/SPLIT_VIEW_CONTRACT.md "Persistence"). `resolveLink`
+/// is the question, because it says in one answer whether the note is there,
+/// deleted or gone, and nothing is said to the person either way;
+/// `restore_resolved` takes the answer.
+fn restore_pane_documents(store: AppStore, store_id: StoreId) {
+    let mut asked: Vec<NodeId> = Vec::new();
+    for pane in PaneId::ALL {
+        if let Some((s, node_id)) = untracked(|| store.pane(pane).restore.get()) {
+            if s == store_id && !asked.contains(&node_id) {
+                asked.push(node_id);
+                store.send(BackendCommand::ResolveLink { url: PimbleUrl::node(store_id, node_id), hops: 0 });
+            }
+        }
+    }
+}
+
+/// An answer to `restore_pane_documents`, when `url` is a document a pane is
+/// waiting to open: a note that is there opens in every pane that held it,
+/// the way a search hit the tree has not loaded opens (selected, then
+/// fetched, and `NodeLoaded` starts the session); one that is gone leaves
+/// its pane empty. Answers whether the resolution was one of these.
+fn restore_resolved(store: AppStore, url: &PimbleUrl, resolution: &LinkResolution) -> bool {
+    if url.anchor.is_some() {
+        return false;
+    }
+    let waiting: Vec<PaneId> = PaneId::ALL
+        .into_iter()
+        .filter(|pane| untracked(|| store.pane(*pane).restore.get()) == Some((url.store, url.node)))
+        .collect();
+    if waiting.is_empty() {
+        return false;
+    }
+    let live = matches!(resolution, LinkResolution::Live { store_id, node_id } if (*store_id, *node_id) == (url.store, url.node));
+    for &pane in &waiting {
+        store.pane(pane).restore.set(None);
+        if live {
+            store.select_in_pane(pane, Some(format!("node_{}_{}", url.store, url.node)));
+        }
+    }
+    if live {
+        store.send(BackendCommand::GetNode { store_id: url.store, node_id: url.node });
+        // Where the focused pane's document is in the tree, which has not
+        // been opened that far.
+        if waiting.contains(&store.focused()) {
+            store.send(BackendCommand::GetAncestors { store_id: url.store, node_id: url.node });
+        }
+    }
+    true
+}
+
 /// What following a link does with where `resolveLink` says it leads
 /// (docs/LINKS_CONTRACT.md "Following a link"): a live node opens, with the
 /// link's anchor for the editor; a chain that stopped in another store this
@@ -195,6 +246,8 @@ fn register_opened_store(store: AppStore, tree_state: UseTreeReturn, opened_stor
 
     // Subscribe to store changes for real-time updates
     store.send(BackendCommand::SubscribeStoreChanges { store_id });
+
+    restore_pane_documents(store, store_id);
 
     // Sync status (docs/SYNC_CONTRACT.md "B: app side"): a placeholder
     // unlinked/offline entry exists immediately so the store row's badge
@@ -753,16 +806,6 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     store.bump_tree_structure();
                 }
 
-                // A pane the saved layout names this node for opens on it
-                // now that it is known (docs/SPLIT_VIEW_CONTRACT.md
-                // "Persistence"), by becoming a pane it is selected in.
-                for pane in PaneId::ALL {
-                    if untracked(|| store.pane(pane).restore.get()) == Some((*store_id, node_id)) {
-                        store.pane(pane).restore.set(None);
-                        store.select_in_pane(pane, Some(format!("node_{store_id}_{node_id}")));
-                    }
-                }
-
                 // Every pane opened on this node.
                 for pane in store.panes_showing(*store_id, node_id) {
                     if pane == store.focused() {
@@ -926,7 +969,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 store.bump_tree_structure();
             }
             BackendEvent::LinkResolved { url, hops, resolution } => {
-                follow_resolution(store, url, *hops, resolution);
+                if !restore_resolved(store, url, resolution) {
+                    follow_resolution(store, url, *hops, resolution);
+                }
             }
             BackendEvent::AncestorsLoaded { store_id, node_id, ancestors } => {
                 reveal_in_tree(store, tree_state, *store_id, *node_id, ancestors);
@@ -2738,6 +2783,148 @@ mod tests {
 
         assert_eq!(store.selected_id.get(), Some(format!("node_{store_id}_{open_id}")), "a document open elsewhere stays open");
         assert!(!commands.try_iter().any(|c| matches!(c, BackendCommand::GetNode { node_id: n, .. } if n == new_id)));
+    }
+
+    /// Three panes: the first two on one document, the third on another
+    /// (docs/SPLIT_VIEW_CONTRACT.md). The second has the focus.
+    fn two_panes_on_one_document(store: AppStore) -> (StoreId, NodeId, NodeId, NodeId) {
+        use crate::panes::PaneId;
+        let store_id = StoreId::new();
+        let (parent, shared, other) = (NodeId::new(), NodeId::new(), NodeId::new());
+        store.set_children(store_id, parent, vec![(store_id, shared), (store_id, other)]);
+        for (pane, node_id) in [(0, shared), (1, shared), (2, other)] {
+            store.select_in_pane(PaneId::ALL[pane], Some(format!("node_{store_id}_{node_id}")));
+            store.panes[pane].show_editor.set(true);
+            store.panes[pane].active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id }));
+        }
+        store.focus_pane(PaneId::ALL[1]);
+        assert_eq!(store.selected_id.get(), Some(format!("node_{store_id}_{shared}")), "the tree's row is the focused pane's");
+        (store_id, parent, shared, other)
+    }
+
+    /// A document deleted elsewhere closes in every pane holding it, and in
+    /// no other (docs/SPLIT_VIEW_CONTRACT.md "What the person sees").
+    #[test]
+    fn a_document_deleted_elsewhere_closes_in_every_pane_holding_it() {
+        let (store, events, _commands) = store_with_events();
+        let (store_id, parent, shared, other) = two_panes_on_one_document(store);
+
+        events
+            .send(BackendEvent::RemoteStoreChange {
+                store_id,
+                change_kind: pimble_rpc::StoreChangeKind::NodeDeleted { node_id: shared, parent_id: parent },
+                source_client_id: None,
+            })
+            .unwrap();
+        pump(store);
+
+        for pane in [0, 1] {
+            assert_eq!(store.panes[pane].selected.get(), None, "pane {pane}");
+            assert!(!store.panes[pane].show_editor.get(), "pane {pane}");
+        }
+        assert_eq!(store.selected_id.get(), None, "the focused pane held it");
+        assert_eq!(store.panes[2].selected.get(), Some(format!("node_{store_id}_{other}")));
+        assert!(store.panes[2].show_editor.get(), "a pane on another document stays as it is");
+    }
+
+    /// A transplanted document is followed to its new id in every pane that
+    /// had it open.
+    #[test]
+    fn a_transplant_is_followed_in_every_pane_holding_the_document() {
+        let (store, events, commands) = store_with_events();
+        let (store_id, parent, shared, other) = two_panes_on_one_document(store);
+        let (new_id, new_parent) = (NodeId::new(), NodeId::new());
+
+        events.send(transplanted(store_id, shared, parent, store_id, new_id, new_parent, "Moved", Vec::new())).unwrap();
+        pump(store);
+
+        let value = Some(format!("node_{store_id}_{new_id}"));
+        assert_eq!(store.panes[0].selected.get(), value);
+        assert_eq!(store.panes[1].selected.get(), value);
+        assert_eq!(store.selected_id.get(), value);
+        assert_eq!(store.panes[2].selected.get(), Some(format!("node_{store_id}_{other}")));
+        let fetched = commands.try_iter().filter(|c| matches!(c, BackendCommand::GetNode { node_id: n, .. } if *n == new_id)).count();
+        assert_eq!(fetched, 1, "the new document is fetched once for both panes");
+    }
+
+    /// A remembered layout's documents (docs/SPLIT_VIEW_CONTRACT.md
+    /// "Persistence"): asked after when their store opens, opened in every
+    /// pane that held one when it is there, and left empty, with nothing
+    /// said, when it is gone.
+    #[test]
+    fn a_remembered_layout_opens_its_documents_when_their_store_does() {
+        use crate::panes::{Direction, PaneId, SavedDocument, SavedPanes, Tiling};
+        use pimble_core::{LinkResolution, PimbleUrl};
+        let (store, events, commands) = store_with_events();
+        let opened = pimble_core::Store::new_local("Notes", "/tmp/notes.pimble".into());
+        let store_id = opened.id;
+        let (kept, gone) = (NodeId::new(), NodeId::new());
+        let mut tiling = Tiling::default();
+        tiling.split(PaneId::ALL[0], Direction::Right);
+        tiling.split(PaneId::ALL[1], Direction::Down);
+        store.restore_panes(SavedPanes {
+            tiling: tiling.clone(),
+            focused: PaneId::ALL[1],
+            documents: vec![
+                SavedDocument { pane: PaneId::ALL[0], store_id, node_id: kept },
+                SavedDocument { pane: PaneId::ALL[1], store_id, node_id: kept },
+                SavedDocument { pane: PaneId::ALL[2], store_id, node_id: gone },
+            ],
+        });
+        assert_eq!(store.tiling.get(), tiling, "the tiling is back at once");
+        assert_eq!(store.focused(), PaneId::ALL[1]);
+        assert_eq!(store.saved_panes().documents.len(), 3, "a pane still waiting keeps its document in what is saved");
+
+        events.send(BackendEvent::StoreOpened { store: opened }).unwrap();
+        pump(store);
+        let asked: Vec<NodeId> = commands
+            .try_iter()
+            .filter_map(|c| match c {
+                BackendCommand::ResolveLink { url, hops: 0 } if url.store == store_id => Some(url.node),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asked, vec![kept, gone], "each document is asked after once");
+
+        events.send(BackendEvent::LinkResolved { url: PimbleUrl::node(store_id, kept), hops: 0, resolution: LinkResolution::Live { store_id, node_id: kept } }).unwrap();
+        events.send(BackendEvent::LinkResolved { url: PimbleUrl::node(store_id, gone), hops: 0, resolution: LinkResolution::Deleted { store_id, node_id: gone } }).unwrap();
+        pump(store);
+        let value = Some(format!("node_{store_id}_{kept}"));
+        assert_eq!(store.panes[0].selected.get(), value);
+        assert_eq!(store.panes[1].selected.get(), value);
+        assert_eq!(store.selected_id.get(), value, "the focused pane's document is the tree's row");
+        assert_eq!(store.panes[2].selected.get(), None, "a note that is gone leaves its pane empty");
+        assert_eq!(store.link_open.get(), None, "nothing is followed");
+        assert!(store.notice.get().is_empty(), "and nothing is said");
+        let sent: Vec<BackendCommand> = commands.try_iter().collect();
+        assert_eq!(sent.iter().filter(|c| matches!(c, BackendCommand::GetNode { node_id: n, .. } if *n == kept)).count(), 1);
+        assert!(!sent.iter().any(|c| matches!(c, BackendCommand::GetNode { node_id: n, .. } if *n == gone)));
+        assert_eq!(store.saved_panes().documents, Vec::new(), "nothing is open yet, and nothing is waiting");
+    }
+
+    /// A link followed from a pane opens in that pane: the resolution names
+    /// it, whichever pane has the focus by the time the answer arrives.
+    #[test]
+    fn a_link_followed_from_a_pane_opens_in_that_pane() {
+        use crate::panes::PaneId;
+        use pimble_core::{LinkResolution, PimbleUrl};
+        let (store, events, _commands) = store_with_events();
+        let (store_id, node_id) = (StoreId::new(), NodeId::new());
+        let url = PimbleUrl::node(store_id, node_id);
+
+        store.link_from.set(Some(PaneId::ALL[2]));
+        events.send(BackendEvent::LinkResolved { url: url.clone(), hops: 0, resolution: LinkResolution::Live { store_id, node_id } }).unwrap();
+        pump(store);
+        assert_eq!(store.link_open.get().expect("it opens").pane, Some(PaneId::ALL[2]));
+        assert_eq!(store.link_from.get(), None);
+        store.link_open.set(None);
+
+        // A link that leads nowhere forgets the pane it was followed from.
+        store.link_from.set(Some(PaneId::ALL[1]));
+        events.send(BackendEvent::LinkResolved { url, hops: 0, resolution: LinkResolution::Missing }).unwrap();
+        pump(store);
+        assert_eq!(store.link_open.get(), None);
+        assert_eq!(store.link_from.get(), None);
     }
 
     fn deleted_node(

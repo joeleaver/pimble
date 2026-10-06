@@ -1,5 +1,5 @@
-//! State file persistence: the open stores and the theme choice, in
-//! `<config dir>/pimble/state.json`.
+//! State file persistence: the open stores, the theme choice, the explorer's
+//! width and the split view's layout, in `<config dir>/pimble/state.json`.
 //!
 //! A web build has no config directory and no store paths to remember (its
 //! stores come from the account service's `listStores`), so those two calls
@@ -77,6 +77,20 @@ mod imp {
         state["sidebar_width"] = serde_json::json!(width.round());
         write_state(&state);
     }
+
+    /// The split view's layout as it was last saved, as JSON
+    /// (docs/SPLIT_VIEW_CONTRACT.md "Persistence").
+    pub(super) fn load_panes_json() -> Option<serde_json::Value> {
+        let state = read_state();
+        (!state["panes"].is_null()).then(|| state["panes"].clone())
+    }
+
+    /// Save the split view's layout, keeping every other saved preference.
+    pub(super) fn save_panes_json(panes: serde_json::Value) {
+        let mut state = read_state();
+        state["panes"] = panes;
+        write_state(&state);
+    }
 }
 
 #[cfg(not(feature = "native"))]
@@ -124,6 +138,35 @@ mod imp {
         if let Some(storage) = storage() {
             let _ = storage.set_item(SIDEBAR_WIDTH_KEY, &width.round().to_string());
         }
+    }
+
+    /// Where the split view's layout lives in the browser: the same JSON
+    /// the desktop keeps under `panes` in `state.json`.
+    const PANES_KEY: &str = "pimble.panes";
+
+    pub(super) fn load_panes_json() -> Option<serde_json::Value> {
+        serde_json::from_str(&storage()?.get_item(PANES_KEY).ok().flatten()?).ok()
+    }
+
+    pub(super) fn save_panes_json(panes: serde_json::Value) {
+        if let Some(storage) = storage() {
+            let _ = storage.set_item(PANES_KEY, &panes.to_string());
+        }
+    }
+}
+
+/// The split view's layout as it was last saved, safe to restore; `None`
+/// when none was saved or what is there cannot be read (the single empty
+/// pane is the answer to both).
+pub(crate) fn load_panes() -> Option<crate::panes::SavedPanes> {
+    let saved: crate::panes::SavedPanes = serde_json::from_value(imp::load_panes_json()?).ok()?;
+    Some(saved.sanitized())
+}
+
+/// Save the split view's layout: the panes, their sizes, their documents.
+pub(crate) fn save_panes(panes: &crate::panes::SavedPanes) {
+    if let Ok(json) = serde_json::to_value(panes) {
+        imp::save_panes_json(json);
     }
 }
 

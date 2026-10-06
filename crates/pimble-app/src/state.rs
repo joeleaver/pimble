@@ -1633,6 +1633,37 @@ impl AppStore {
         }
     }
 
+    /// The layout as it is to be remembered (docs/SPLIT_VIEW_CONTRACT.md
+    /// "Persistence"), tracked: the tiling, the focus, and for each pane
+    /// shown the document its editor has open, or the one it is still
+    /// waiting to open from the last layout (a store that is not open yet
+    /// must not cost the pane its document).
+    pub fn saved_panes(&self) -> crate::panes::SavedPanes {
+        let tiling = self.tiling.get();
+        let focused = self.focused_pane.get();
+        let mut documents = Vec::new();
+        for pane in tiling.panes() {
+            let state = self.pane(pane);
+            let held = state.active_edit.get().map(|edit| (edit.store_id, edit.node_id)).or_else(|| state.restore.get());
+            if let Some((store_id, node_id)) = held {
+                documents.push(crate::panes::SavedDocument { pane, store_id, node_id });
+            }
+        }
+        crate::panes::SavedPanes { tiling, focused, documents }
+    }
+
+    /// Put back a remembered layout at start: the tiling and the focus at
+    /// once, and each pane's document as one it opens when its store is
+    /// open and the node is known (`events::restore_pane_documents`).
+    pub fn restore_panes(&self, saved: crate::panes::SavedPanes) {
+        let saved = saved.sanitized();
+        for document in &saved.documents {
+            self.pane(document.pane).restore.set(Some((document.store_id, document.node_id)));
+        }
+        self.tiling.set(saved.tiling);
+        self.focused_pane.set(saved.focused);
+    }
+
     /// Give pane `pane` the focus: the tree's selected row becomes its
     /// document. Answers whether the focus moved.
     pub fn focus_pane(&self, pane: PaneId) -> bool {

@@ -88,6 +88,46 @@ pub enum Tiling {
     Split { direction: Direction, ratio: f32, first: Box<Tiling>, second: Box<Tiling> },
 }
 
+/// The layout as it is remembered across restarts
+/// (docs/SPLIT_VIEW_CONTRACT.md "Persistence"): `state.json`'s `panes` on the
+/// desktop, the same JSON in `localStorage` in the browser.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct SavedPanes {
+    pub tiling: Tiling,
+    #[serde(default)]
+    pub focused: PaneId,
+    /// The document each pane held: the canonical pair, where the note
+    /// lives, however it was reached.
+    #[serde(default)]
+    pub documents: Vec<SavedDocument>,
+}
+
+/// One pane's document in a [`SavedPanes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedDocument {
+    pub pane: PaneId,
+    pub store_id: pimble_core::StoreId,
+    pub node_id: pimble_core::NodeId,
+}
+
+impl SavedPanes {
+    /// What was read from disk, made safe to restore: a tiling that can be
+    /// drawn, the focus on a pane it shows, and one document at most for
+    /// each pane it shows.
+    pub fn sanitized(self) -> SavedPanes {
+        let tiling = self.tiling.sanitized();
+        let shown = tiling.panes();
+        let focused = if shown.contains(&self.focused) { self.focused } else { shown[0] };
+        let mut documents: Vec<SavedDocument> = Vec::new();
+        for document in self.documents {
+            if shown.contains(&document.pane) && !documents.iter().any(|held| held.pane == document.pane) {
+                documents.push(document);
+            }
+        }
+        SavedPanes { tiling, focused, documents }
+    }
+}
+
 impl Default for Tiling {
     fn default() -> Self {
         Tiling::Pane(PaneId::FIRST)
@@ -583,6 +623,41 @@ mod tests {
             serde_json::to_value(&tiling).unwrap(),
             serde_json::json!({"split": {"direction": "down", "ratio": 0.5, "first": {"pane": 0}, "second": {"pane": 1}}})
         );
+    }
+
+    #[test]
+    fn a_saved_layout_round_trips_and_is_made_safe_to_restore() {
+        let (store_id, node_id, other) = (pimble_core::StoreId::new(), pimble_core::NodeId::new(), pimble_core::NodeId::new());
+        let mut tiling = Tiling::default();
+        tiling.split(P[0], Direction::Right);
+        tiling.set_ratio(0, 0.3);
+        let saved = SavedPanes {
+            tiling,
+            focused: P[1],
+            documents: vec![
+                SavedDocument { pane: P[0], store_id, node_id },
+                SavedDocument { pane: P[1], store_id, node_id },
+            ],
+        };
+        let json = serde_json::to_string(&saved).unwrap();
+        let back: SavedPanes = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, saved, "the same note in two panes is two entries");
+        assert_eq!(back.clone().sanitized(), saved);
+
+        // A pane the tiling does not show holds nothing, a pane is named
+        // once, and the focus is on a pane that is shown.
+        let mut odd = saved.clone();
+        odd.focused = P[3];
+        odd.documents.push(SavedDocument { pane: P[2], store_id, node_id: other });
+        odd.documents.push(SavedDocument { pane: P[0], store_id, node_id: other });
+        let safe = odd.sanitized();
+        assert_eq!(safe.focused, P[0]);
+        assert_eq!(safe.documents, saved.documents);
+
+        // A file from before the split view has no `panes`; one with only a
+        // tiling is the tiling with nothing in it.
+        let bare: SavedPanes = serde_json::from_value(serde_json::json!({"tiling": {"pane": 0}})).unwrap();
+        assert_eq!(bare, SavedPanes::default());
     }
 
     #[test]

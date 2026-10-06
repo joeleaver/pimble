@@ -17,6 +17,14 @@ use crate::panes::{Direction, PaneId, MAX_PANES};
 use crate::rinch_editor::Editor;
 use crate::state::{display_label_from_node, parse_tree_value, AppStore};
 
+/// Whether the editor keeps a press of the pointer inside it to itself. The
+/// browser's does (rinch-web consumes an in-editor `pointerdown` before any
+/// ancestor's `onmousedown` hears of it, `rinch-web/src/editor_input.rs`),
+/// so there a pane also takes the focus when the pointer is released in it;
+/// the desktop's does not, and a release means nothing (a selection dragged
+/// from one pane and let go over another stays where it began).
+const EDITOR_KEEPS_ITS_PRESSES: bool = cfg!(not(feature = "native"));
+
 /// What a split refused for want of room says.
 pub(crate) const FOUR_PANES_NOTICE: &str = "Four panes are open. Close one to split again.";
 
@@ -191,10 +199,13 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                 ),
                 None => "display: none;".to_string(),
             }},
-            // A press anywhere in the pane focuses it. (In the browser the
-            // editor keeps its own presses; `editor::editor_took_focus` hears
-            // of those.)
+            // A press anywhere in the pane focuses it.
             onmousedown: move || focus_pane(store, pane),
+            onmouseup: move || {
+                if EDITOR_KEEPS_ITS_PRESSES && !untracked(|| store.pane_dragging.get()) {
+                    focus_pane(store, pane);
+                }
+            },
 
             div {
                 class: "pimble-pane__title",
@@ -335,9 +346,14 @@ fn render_divider(__scope: &mut RenderScope, store: AppStore, index: usize) -> N
                 store.pane_dragging.set(true);
                 rinch::core::Drag::percent()
                     .on_move(drag_to)
-                    .on_end(move |px, py| {
-                        drag_to(px, py);
-                        store.pane_dragging.set(false);
+                    // The last move left the line where it was let go; the
+                    // release itself says nothing more (rinch hands `on_end`
+                    // of a percent drag the raw pointer position, not a
+                    // fraction: rinch-core/src/events/drag.rs `finish_drag`).
+                    .on_end(move |_, _| {
+                        // A turn later: the release that ends the drag is
+                        // not a click in the pane it happens over.
+                        set_timeout(0, move || store.pane_dragging.set(false));
                     })
                     .on_cancel(move |_, _| store.pane_dragging.set(false))
                     .start();
