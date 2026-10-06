@@ -5,6 +5,7 @@
 //! - `Store`: A container for a tree of nodes
 //! - `Workspace`: User's view into one or more stores
 
+pub mod blob;
 pub mod index_unit;
 pub mod link;
 pub mod node;
@@ -12,6 +13,7 @@ pub mod store;
 pub mod workspace;
 pub mod error;
 
+pub use blob::*;
 pub use index_unit::*;
 pub use link::*;
 pub use node::*;
