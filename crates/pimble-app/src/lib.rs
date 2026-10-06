@@ -27,6 +27,7 @@ pub mod events;
 pub mod link_picker;
 pub mod links;
 pub mod menus;
+pub mod panes;
 pub mod persistence;
 pub mod protocol;
 pub mod rinch_editor;
