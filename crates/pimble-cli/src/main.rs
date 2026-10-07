@@ -467,7 +467,8 @@ COMMANDS:
     cloud-stop-sharing  Stop sharing a node (its documents stay hosted where they are)
 
 ENVIRONMENT (client, for every command but `server` itself):
-    PIMBLE_SERVER       Server URL (default: http://127.0.0.1:7462)
+    PIMBLE_SERVER       Server URL (default: the local server, http://127.0.0.1:7462,
+                        or http://$PIMBLE_APP_ADDR when that is set)
     PIMBLE_TOKEN        Bearer token sent with every request to PIMBLE_SERVER.
                         If unset and PIMBLE_SERVER is loopback, the default
                         server token file's token is used if it exists.
@@ -1615,7 +1616,11 @@ fn auth_method_of(token: Option<String>) -> AuthMethod {
 
 /// Connect to `PIMBLE_SERVER`, authenticating per [`resolve_cli_auth`].
 async fn connect() -> Result<PimbleClient> {
-    let url = std::env::var("PIMBLE_SERVER").unwrap_or_else(|_| "http://127.0.0.1:7462".to_string());
+    // With no server named, the local one, wherever `PIMBLE_APP_ADDR` puts it: a
+    // test instance on its own port sets that for the app and `pimble-mcp`, and a
+    // CLI in the same environment that ignored it would talk to the person's own
+    // app on the default port instead (it did, on 2026-10-07).
+    let url = std::env::var("PIMBLE_SERVER").unwrap_or_else(|_| pimble_server::local::server_url());
     let client = match resolve_cli_auth(&url) {
         Some(token) => PimbleClient::connect_with_auth(&url, &AuthMethod::Bearer { token }).await?,
         None => PimbleClient::connect(&url).await?,
