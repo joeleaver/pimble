@@ -50,11 +50,12 @@ use jsonrpsee::core::{async_trait, SubscriptionResult};
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{Extensions, PendingSubscriptionSink, SubscriptionMessage};
 use pimble_client::{describe_connect_error, PimbleClient};
-use pimble_core::{AuthMethod, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState, Workspace};
+use pimble_core::{AuthMethod, BlobUrl, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState, Workspace};
 use pimble_crdt::{NodeDoc, NodeFields, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_plugins::PluginHost;
 use pimble_rpc::{
     encrypted_store_error, index_building_error, snapshot_required_error, to_rpc_error, ApplyEditRequest, ApplyEditResponse, ResolveLinkRequest, ResolveLinkResponse,
+    GetBlobRequest, GetBlobResponse, HaveBlobsRequest, HaveBlobsResponse, PutBlobRequest, PutBlobResponse, BLOBS_IN_SHARES_REFUSAL, BLOB_CHUNK_BYTES, BLOB_NOT_HERE,
     AddRemoteStoreRequest, CloseStoreRequest, CloudAddHostedStoreRequest, CloudHostStoreRequest,
     CloudHostStoreResponse, CloudHostedStoreInfo, CloudListHostedStoresResponse, CloudRelayStoreRequest, CloudRelayStoreResponse, CloudSignInRequest,
     CloudStatusResponse, CloudStopRelayingRequest,
@@ -75,7 +76,7 @@ use pimble_rpc::{
     MAX_SYNC_NODE_CONTENTS,
 };
 use pimble_search::{IndexNode, SearchError, SearchIndex, SearchQuery};
-use pimble_store::{StoreEndpoint, StoreError, StoreManager, SyncConfig, SyncMode};
+use pimble_store::{BlobStore, StoreEndpoint, StoreError, StoreManager, SyncConfig, SyncMode};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -1289,6 +1290,57 @@ impl RpcHandler {
             )));
         }
         Ok(())
+    }
+
+    // ── Pictures (docs/IMAGES_CONTRACT.md) ───────────────────────────────
+
+    /// Where a picture for `node_id`'s text is kept, once `principal` is
+    /// found to be allowed to write that node: the judgement `applyEdit` on
+    /// the node gets (the caller's role, a member's scope, how this device
+    /// holds the store). A mount has no text of its own, so a picture put
+    /// for one is put for its source node, in the source store, judged
+    /// there; the answer names the store the blob lands in.
+    async fn blob_target_for_write(&self, principal: &Principal, store_id: StoreId, node_id: NodeId) -> Result<(StoreId, BlobStore), ErrorObjectOwned> {
+        let (mut store_id, mut node_id) = (store_id, node_id);
+        // A mount may show a mount; a cycle is refused at `createMount`, and
+        // this gives up long before one could matter.
+        for _ in 0..MAX_LINK_HOPS {
+            authorize(principal, store_id, Access::Write)?;
+            self.reject_if_vault(store_id).await?;
+            let manager = self.store_manager.read().await;
+            require_in_scope(&Reach::of(&manager, principal, store_id), node_id, Access::Write)?;
+            let node = manager.get_node(store_id, node_id).map_err(to_rpc_error)?;
+            if let Some(mount_ref) = node.mount_ref().filter(|_| node.is_mount()) {
+                if !manager.is_open(mount_ref.source_store) {
+                    return Err(to_rpc_error("This mount's store is not open here, so a picture cannot be added to it."));
+                }
+                (store_id, node_id) = (mount_ref.source_store, mount_ref.source_node);
+                continue;
+            }
+            if manager.write_refused(store_id, &[node_id]) {
+                return Err(read_only_error());
+            }
+            return Ok((store_id, manager.blobs(store_id).map_err(to_rpc_error)?));
+        }
+        Err(to_rpc_error("This mount leads through too many mounts to add a picture to."))
+    }
+
+    /// The blobs of `store_id`, once `principal` is found to be allowed to
+    /// read them.
+    async fn blobs_for_read(&self, principal: &Principal, store_id: StoreId) -> Result<BlobStore, ErrorObjectOwned> {
+        authorize(principal, store_id, Access::Read)?;
+        self.reject_if_vault(store_id).await?;
+        // TODO(images wave 2): a blob is readable by whoever may read a node
+        // whose text names it (docs/IMAGES_CONTRACT.md "Who may read a
+        // blob"): judge a scoped principal by an index `blob id ->
+        // referencing nodes` and `Reach`, tombstones included. Until that
+        // index exists a share's member is refused outright, since a blob id
+        // alone says nothing about which share it belongs to.
+        if scope_roots_of(principal, store_id, Access::Read).is_some() {
+            // The sentence is the whole message, as a reader's refusal is.
+            return Err(ErrorObjectOwned::owned(pimble_rpc::RpcError::Forbidden(String::new()).code(), BLOBS_IN_SHARES_REFUSAL, None::<()>));
+        }
+        self.store_manager.read().await.blobs(store_id).map_err(to_rpc_error)
     }
 
     // ── Scoped grants and read-only replicas (docs/NODE_DOCUMENT_CONTRACT.md
@@ -4604,6 +4656,82 @@ impl PimbleApiServer for RpcHandler {
         }
 
         Ok(ApplyEditResponse {})
+    }
+
+    async fn put_blob(
+        &self,
+        ext: &Extensions,
+        request: PutBlobRequest,
+    ) -> Result<PutBlobResponse, ErrorObjectOwned> {
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Write)?;
+        self.reject_if_vault(request.store_id).await?;
+        let (store_id, blobs) = self.blob_target_for_write(&principal, request.store_id, request.node_id).await?;
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&request.bytes)
+            .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
+        let len = bytes.len() as u64;
+        let total = request.total.unwrap_or(len);
+
+        // The whole picture in one message is written in one step; anything
+        // else is a chunk of an upload the store assembles and only names
+        // once it is whole.
+        let (id, received, complete) = if request.blob_id.is_none() && request.offset == 0 && total == len {
+            let id = blobs.put(&request.mime, bytes).await.map_err(to_rpc_error)?;
+            (id, len, true)
+        } else {
+            let upload = blobs
+                .upload_chunk(request.blob_id, &request.mime, total, request.offset, bytes)
+                .await
+                .map_err(to_rpc_error)?;
+            (upload.id, upload.received, upload.complete)
+        };
+        if complete {
+            debug!("Stored blob {} ({} bytes, {}) in store {}", id, received, request.mime, store_id);
+        }
+
+        Ok(PutBlobResponse { url: BlobUrl::new(store_id, id), received, complete })
+    }
+
+    async fn get_blob(
+        &self,
+        ext: &Extensions,
+        request: GetBlobRequest,
+    ) -> Result<GetBlobResponse, ErrorObjectOwned> {
+        let principal = principal_of(ext);
+        let blobs = self.blobs_for_read(&principal, request.store_id).await?;
+
+        // Read whole and checked against its hash for every chunk asked for:
+        // a blob is at most 20 MiB, and a chunk of a file that no longer
+        // matches its hash must not be served.
+        let blob = blobs
+            .get(request.blob_id)
+            .await
+            .map_err(to_rpc_error)?
+            .ok_or_else(|| to_rpc_error(BLOB_NOT_HERE))?;
+        let total = blob.bytes.len();
+        let start = usize::try_from(request.offset).ok().filter(|start| *start < total).ok_or_else(|| {
+            to_rpc_error(format!("This picture is {} bytes long; there is nothing at byte {}.", total, request.offset))
+        })?;
+        let end = total.min(start + BLOB_CHUNK_BYTES);
+
+        Ok(GetBlobResponse {
+            mime: blob.mime.to_string(),
+            bytes: base64::engine::general_purpose::STANDARD.encode(&blob.bytes[start..end]),
+            offset: request.offset,
+            total: total as u64,
+        })
+    }
+
+    async fn have_blobs(
+        &self,
+        ext: &Extensions,
+        request: HaveBlobsRequest,
+    ) -> Result<HaveBlobsResponse, ErrorObjectOwned> {
+        let principal = principal_of(ext);
+        let blobs = self.blobs_for_read(&principal, request.store_id).await?;
+        Ok(HaveBlobsResponse { missing: blobs.missing(&request.ids).await })
     }
 
     async fn subscribe_store_changes(

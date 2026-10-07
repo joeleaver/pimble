@@ -5,12 +5,14 @@
 //! - Store management (create, open, close)
 //! - Node persistence using yrs CRDT documents
 
+pub mod blobs;
 pub mod error;
 pub mod local;
 pub mod manager;
 pub mod registry;
 pub mod vault;
 
+pub use blobs::*;
 pub use error::*;
 pub use local::*;
 pub use manager::*;

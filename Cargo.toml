@@ -15,6 +15,7 @@ members = [
     "crates/pimble-cloud",
     "crates/pimble-crypto",
     "crates/pimble-mcp",
+    "crates/pimble-image",
 ]
 
 [workspace.package]
@@ -54,11 +55,11 @@ rhypedb-query = { git = "https://github.com/joeleaver/rhypedb.git", branch = "ma
 # rinch-web), because the same UI library builds for the browser. The desktop build
 # renders on the GPU (`rinch/gpu`), which needs rinch's wgpu fork: see `[patch.crates-io]`
 # at the end of this file.
-rinch-tabler-icons = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
-rinch-editor-core = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
+rinch-tabler-icons = { git = "https://github.com/joeleaver/rinch.git", branch = "pimble/images" }
+rinch-editor-core = { git = "https://github.com/joeleaver/rinch.git", branch = "pimble/images" }
 # Headless collab session (yrs projection of the editor model); pure Rust, no
 # platform deps, so the server and store can link it for text projection.
-rinch-editor-collab = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
+rinch-editor-collab = { git = "https://github.com/joeleaver/rinch.git", branch = "pimble/images" }
 
 # CRDT for node content: the same engine rinch's editor collaboration uses.
 yrs = "0.27"
@@ -101,6 +102,7 @@ pimble-server = { path = "crates/pimble-server" }
 pimble-client = { path = "crates/pimble-client" }
 pimble-plugins = { path = "crates/pimble-plugins" }
 pimble-import = { path = "crates/pimble-import" }
+pimble-image = { path = "crates/pimble-image" }
 
 # rinch's own patches, repeated here because a dependency's `[patch]` does not reach
 # the crates that use it. Keep this block the same as rinch's root Cargo.toml.

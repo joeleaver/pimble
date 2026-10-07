@@ -474,13 +474,13 @@ mod tests {
     fn rich_blocks_round_trip_through_the_projection() {
         use crate::blocks::{Align, Block, ListItem, Mark, Run, TableCell, TableRow};
         let blocks = vec![
-            Block::Heading { level: 2, runs: vec![Run::plain("Title")] },
+            Block::Heading { level: 2, runs: vec![Run::plain("Title").into()] },
             Block::Paragraph {
                 runs: vec![
-                    Run::plain("plain "),
-                    Run::marked("bold", vec![Mark::Bold]),
-                    Run::marked(" link", vec![Mark::Link { href: "https://example.com".into() }]),
-                    Run::marked(" red", vec![Mark::TextColor { color: "#ff0000".into() }]),
+                    Run::plain("plain ").into(),
+                    Run::marked("bold", vec![Mark::Bold]).into(),
+                    Run::marked(" link", vec![Mark::Link { href: "https://example.com".into() }]).into(),
+                    Run::marked(" red", vec![Mark::TextColor { color: "#ff0000".into() }]).into(),
                 ],
                 align: Align::Center,
                 indent: 1,
@@ -534,6 +534,62 @@ mod tests {
             .flat_map(|i| para.child(i).marks().iter().map(|m| m.type_name().to_string()).collect::<Vec<_>>())
             .collect();
         assert_eq!(names, vec!["bold", "link", "text_color"]);
+    }
+
+    /// The rest of the collaboration scope: a rule, and the inline atoms (an
+    /// image with its attrs and marks, a hard break) inside a paragraph, a
+    /// heading, a list item, a quote and a table cell. What `from_blocks`
+    /// builds, `blocks()` reads back the same, on a replica too.
+    #[test]
+    fn rules_images_and_hard_breaks_round_trip_through_the_projection() {
+        use crate::blocks::{Block, Image, Inline, ListItem, Mark, Run, TableCell, TableRow};
+        use crate::NodeDoc;
+        let src = "pimble-blob:6f1c2b1e-8d3a-4f63-9a54-2c0f5a1e7b90/aaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let text = |t: &str| Inline::Text(Run::plain(t));
+        let image = |alt: &str| Inline::Image(Image::new(src, alt));
+        let blocks = vec![
+            Block::Heading { level: 1, runs: vec![text("Title "), image("in a heading")] },
+            Block::paragraph(vec![
+                text("before "),
+                Inline::Image(Image {
+                    src: src.into(),
+                    alt: "a cat".into(),
+                    title: "Tibbles".into(),
+                    marks: vec![Mark::Link { href: "https://example.com".into() }],
+                }),
+                text(" after"),
+                Inline::HardBreak,
+                Inline::Text(Run::marked("next line", vec![Mark::Bold])),
+                Inline::HardBreak,
+                Inline::HardBreak,
+                image(""),
+                image(""),
+            ]),
+            Block::HorizontalRule,
+            Block::BulletList { items: vec![ListItem { blocks: vec![Block::paragraph(vec![image("in a list"), Inline::HardBreak, text("x")])] }] },
+            Block::Blockquote { blocks: vec![Block::paragraph(vec![image("in a quote")]), Block::HorizontalRule] },
+            Block::Table { rows: vec![TableRow { cells: vec![TableCell::new(vec![Block::paragraph(vec![text("a"), Inline::HardBreak, image("in a cell")])])] }] },
+            Block::HorizontalRule,
+            Block::paragraph(vec![Inline::HardBreak]),
+        ];
+        let doc = NodeDoc::from_blocks(&blocks).unwrap();
+        assert_eq!(doc.blocks().unwrap(), blocks);
+        let peer = NodeDoc::load(&doc.save()).unwrap();
+        assert_eq!(peer.blocks().unwrap(), blocks);
+        assert_eq!(blocks[1].plain_text(), "before  after\nnext line\n\n");
+        assert_eq!(blocks[2].plain_text(), "");
+
+        // What the editor's model holds is the schema's own nodes.
+        let model = project(&peer.save(), "test").unwrap();
+        assert_eq!(model.child(2).type_name(), "horizontal_rule");
+        let para = model.child(1);
+        let picture = para.child(1);
+        assert_eq!(picture.type_name(), "image");
+        assert_eq!(picture.attrs().get_str("src"), Some(src));
+        assert_eq!(picture.attrs().get_str("alt"), Some("a cat"));
+        assert_eq!(picture.attrs().get_str("title"), Some("Tibbles"));
+        assert_eq!(picture.marks().iter().map(|m| m.type_name().to_string()).collect::<Vec<_>>(), vec!["link"]);
+        assert_eq!(para.child(3).type_name(), "hard_break");
     }
 
     #[test]

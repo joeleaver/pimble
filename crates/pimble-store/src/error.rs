@@ -54,6 +54,12 @@ pub enum StoreError {
     #[error("Vault document log is at its size limit; a snapshot is required before more updates can be appended")]
     VaultSnapshotRequired,
 
+    /// A picture the store will not keep (docs/IMAGES_CONTRACT.md): too
+    /// large, not an accepted image type, or not the type it says. The whole
+    /// message is the sentence a person reads.
+    #[error("{0}")]
+    BlobRefused(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

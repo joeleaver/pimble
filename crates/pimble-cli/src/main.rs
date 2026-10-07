@@ -190,6 +190,20 @@ async fn main() -> Result<()> {
             let text = if args.len() > 5 { args[5..].join(" ") } else { args[4].clone() };
             append_link(&args[2], &args[3], &args[4], &text).await?;
         }
+        "put-blob" => {
+            if args.len() < 5 {
+                eprintln!("Usage: pimble-cli put-blob <store-id> <node-id> <image file>");
+                return Ok(());
+            }
+            put_blob(&args[2], &args[3], &args[4]).await?;
+        }
+        "get-blob" => {
+            if args.len() < 4 {
+                eprintln!("Usage: pimble-cli get-blob <pimble-blob:store/blob> <out file>");
+                return Ok(());
+            }
+            get_blob(&args[2], &args[3]).await?;
+        }
         "resolve-link" => {
             if args.len() < 3 {
                 eprintln!("Usage: pimble-cli resolve-link <pimble:store/node>");
@@ -406,6 +420,8 @@ COMMANDS:
     set-node-text       Set a node's content from plain text
     append-link         Append a paragraph linking <text> to <href> (a pimble: or web link)
     resolve-link        Say where a pimble: link leads from this server (live, deleted, ...)
+    put-blob            Store an image file as a picture for a node; prints its pimble-blob: URL
+    get-blob            Write the picture a pimble-blob: URL names to a file
     show-node           Print a node's metadata and content text
     search              Search across all open stores
     rebuild-index       Rebuild a store's search index from scratch
@@ -491,6 +507,8 @@ EXAMPLES:
     pimble-cli transplant-node <from-store-id> <node-id> <to-store-id> <new-parent-id>
     pimble-cli list-deleted <store-id>
     pimble-cli set-node-text <store-id> <node-id> "Hello, world"
+    pimble-cli put-blob <store-id> <node-id> ./cat.png
+    pimble-cli get-blob pimble-blob:<store-id>/<blob-id> ./cat.png
     pimble-cli show-node <store-id> <node-id>
     pimble-cli search "hello"
     pimble-cli rebuild-index <store-id>
@@ -1323,6 +1341,35 @@ async fn set_node_text(store_id: &str, node_id: &str, text: &str) -> Result<()> 
         .apply_edit(store_id, node_id, "pimble-cli", EditOperation::IncrementalChanges { changes })
         .await?;
     println!("Updated content for node {}", node_id);
+    Ok(())
+}
+
+/// Store an image file as a blob of the store `node_id` lives in
+/// (docs/IMAGES_CONTRACT.md) and print the URL an image in that node's text
+/// would carry. The type is read from the file's first bytes, never from its
+/// name; the text itself is not touched.
+async fn put_blob(store_id: &str, node_id: &str, file: &str) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let node_id = parse_node_id(node_id)?;
+    let bytes = std::fs::read(file).map_err(|e| anyhow::anyhow!("cannot read {file}: {e}"))?;
+    let mime = pimble_core::ImageMime::sniff(&bytes).ok_or_else(|| anyhow::anyhow!("{file}: {}", pimble_core::NOT_AN_IMAGE))?;
+    if bytes.len() as u64 > pimble_core::MAX_IMAGE_BYTES {
+        anyhow::bail!("{file}: {}", pimble_core::IMAGE_TOO_LARGE);
+    }
+
+    let client = connect().await?;
+    let url = client.put_blob(store_id, node_id, mime.as_str(), &bytes).await?;
+    println!("{}", url);
+    Ok(())
+}
+
+/// Write the picture `url` names to `out`.
+async fn get_blob(url: &str, out: &str) -> Result<()> {
+    let url: pimble_core::BlobUrl = url.parse().map_err(|e| anyhow::anyhow!("{url}: {e}"))?;
+    let client = connect().await?;
+    let (mime, bytes) = client.get_blob(url.store, url.blob).await?;
+    std::fs::write(out, &bytes).map_err(|e| anyhow::anyhow!("cannot write {out}: {e}"))?;
+    println!("Wrote {} ({}, {} bytes)", out, mime, bytes.len());
     Ok(())
 }
 

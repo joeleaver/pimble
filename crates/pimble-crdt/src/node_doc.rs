@@ -45,6 +45,7 @@ use crate::content_doc::{
     units_of_projection,
 };
 use crate::markdown;
+use crate::blobs::{blob_refs_of_model, BlobRef};
 use crate::links::{self, links_of_model, LinkRef, Resolved, Spot};
 use crate::error::{CrdtError, Result};
 
@@ -436,6 +437,22 @@ impl NodeDoc {
     /// [`NodeDoc::links`] of a serialized document.
     pub fn links_of(bytes: &[u8]) -> Vec<LinkRef> {
         Self::load(bytes).map(|doc| doc.links()).unwrap_or_default()
+    }
+
+    /// Every picture the content names that is kept in a store's blobs: each
+    /// `image` whose `src` is a `pimble-blob:` URL, in document order, at any
+    /// depth (docs/IMAGES_CONTRACT.md "On disk"). `[]` when there is no
+    /// projection yet.
+    pub fn blob_refs(&self) -> Vec<BlobRef> {
+        if !self.has_projection() {
+            return Vec::new();
+        }
+        project(&self.save(), "NodeDoc::blob_refs").map(|model| blob_refs_of_model(&model)).unwrap_or_default()
+    }
+
+    /// [`NodeDoc::blob_refs`] of a serialized document.
+    pub fn blob_refs_of(bytes: &[u8]) -> Vec<BlobRef> {
+        Self::load(bytes).map(|doc| doc.blob_refs()).unwrap_or_default()
     }
 
     /// A deep-link anchor at `spot` (docs/LINKS_CONTRACT.md "The URL"):
