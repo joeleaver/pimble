@@ -81,6 +81,28 @@ fn editor_took_focus(store: AppStore, pane: PaneId) {
     crate::pane_view::focus_pane(store, pane);
 }
 
+/// Give `delta`, which pane `from` just made, to every other pane of this
+/// window that holds the node. A turn later, not from inside the edit: this
+/// is called while `from`'s editor is mid-dispatch, and an editor receiving
+/// a change runs whatever effects are waiting, some of which reach back
+/// into the editor that is still busy (in the browser that was a `RefCell`
+/// panic on the second key typed). Deltas are handed over in the order they
+/// were made; a pane that has moved to another note by then gets nothing.
+fn hand_across(store: AppStore, from: PaneId, store_id: StoreId, node_id: NodeId, delta: Vec<u8>) {
+    let deliver = move || {
+        for other in store.panes_editing(store_id, node_id) {
+            if other != from {
+                editor(other).collab_receive(&delta);
+            }
+        }
+    };
+    // No event loop runs a timer under `cargo test`.
+    #[cfg(test)]
+    deliver();
+    #[cfg(not(test))]
+    let _ = set_timeout(0, deliver);
+}
+
 /// Begin editing `node_id` in pane `pane`: load its content into the pane's
 /// editor and start a collaboration session wired to the server relay.
 /// `content_bytes` is the node's stored content from the server — a yrs collab
@@ -174,11 +196,7 @@ pub(crate) fn start_editing(
         // The same note open in another pane of this window: the server
         // relays to other clients, not back to the one that sent, so the
         // window hands the delta across itself. Never to this pane.
-        for other in store.panes_editing(store_id, node_id) {
-            if other != pane {
-                editor(other).collab_receive(&delta);
-            }
-        }
+        hand_across(store, pane, store_id, node_id, delta);
         // The tree's label Effect only reads `node_data`/`live_label`, neither
         // of which reflects this edit on its own — refresh our own label so
         // this window doesn't wait on a GetNode round trip to stop showing a

@@ -1,10 +1,11 @@
 # Split view contract: up to four tiled panes beside the explorer
 
 Status: written by the PM on 2026-10-06 from Joe's request and answers of that day. Built
-the same day on branch `split-view` (not merged): verification items 1 to 5 and 7 passed
-on the desktop; item 6 (the browser on the local stack) is recorded at the end of this
-file. Where the build differs from the text, the section says so in a line marked "As
-built".
+on 2026-10-06 and 07 on branch `split-view` (not merged). Verification items 1 to 5 and 7
+passed on the desktop, and item 6 in Chromium on the local stack, except a read-only
+document in the browser, which was not run (it needs a second account and a reader's
+share); Firefox was not run. Where the build differs from the text, the section says so in
+a line marked "As built".
 
 ## The decisions (Joe, 2026-10-06)
 
@@ -89,7 +90,10 @@ and rinch's `Editor {}` component is mounted exactly four times in the app's lif
 - **Local edits**: a pane's outbound delta goes to `BackendCommand::BroadcastChanges` as
   today **and** to `collab_receive` of every other pane in this window that holds the same
   node (the server relays to other clients, not back to the sender, so the window does its
-  own fan-out; a pane never receives its own delta).
+  own fan-out; a pane never receives its own delta). As built: the other panes are handed
+  the delta a turn later (`set_timeout(0)`), not from inside the edit. Handed over
+  mid-dispatch, the second key typed in the browser panicked on a `RefCell` in rinch's
+  editor handle.
 - **Remote changes** (`BackendEvent::RemoteChanges`) go to every pane holding that node.
 - `SubscribeNodeChanges` once per node, however many panes hold it; unsubscribe when the
   last one lets go. As built: `BackendCommand::UnsubscribeNodeChanges` is new, and

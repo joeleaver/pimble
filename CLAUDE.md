@@ -216,9 +216,11 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
   exactly four times in the app's life and never re-parented (see "Split view").
 - Local edits: a pane's outbound closure -> `BackendCommand::BroadcastChanges` -> server
   persists and relays -> peers receive `BackendEvent::RemoteChanges { store_id, node_id, .. }`
-  -> `collab_receive` of every pane holding that node. The same delta also goes straight to
-  every other pane of the window holding the node (the server does not relay back to the
-  sender); a pane never receives its own delta.
+  -> `collab_receive` of every pane holding that node. The same delta also goes to every
+  other pane of the window holding the node (the server does not relay back to the
+  sender), a turn later (`editor::hand_across`: handed over from inside the edit, rinch's
+  editor handle panicked on a `RefCell` in the browser); a pane never receives its own
+  delta.
 - A node is subscribed once however many panes hold it (`SubscribeNodeChanges` when the
   first pane opens it, `UnsubscribeNodeChanges` when the last lets go). A pane opening a
   note another pane holds joins from that pane's `collab_snapshot`, never from the cache:
@@ -252,8 +254,10 @@ not in the tiling is `display: none`. Splitting, closing and dragging change sty
 `show_editor`, `active_edit`, `pending_anchor`, `restore`); there is no single
 `active_edit`. `selected_id` is the tree's selected row and is the focused pane's
 `selected`: only `select_in_pane` and `focus_pane` write the pair. A pane takes the focus
-on a press in it and on a key in its editor (and, in the browser, on a release in it,
-because rinch-web's editor keeps its own presses). `open_node` opens in the focused pane,
+on a press in it and on a key in its editor. In the browser rinch-web's editor keeps its
+own presses, so there a release in a pane focuses it too, but only when no pane heard the
+press (`PRESS_HEARD`): a split button's press focuses the new pane, and its release is
+still over the old one. `open_node` opens in the focused pane,
 `open_node_in` in a named one ("Open in Split View", a link followed from a pane, which
 `AppStore::link_from` carries to `LinkOpen.pane`). The toolbar's button state is per pane.
 The layout is `state.json`'s `panes` (`localStorage` `pimble.panes` in the browser), saved

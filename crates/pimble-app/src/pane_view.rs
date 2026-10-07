@@ -25,6 +25,16 @@ use crate::state::{display_label_from_node, parse_tree_value, AppStore};
 /// from one pane and let go over another stays where it began).
 const EDITOR_KEEPS_ITS_PRESSES: bool = cfg!(not(feature = "native"));
 
+thread_local! {
+    /// Whether the press now held was heard by a pane or a divider. The
+    /// release that follows it then decides nothing: the press already did,
+    /// and what it did may have moved the focus on (a split's button focuses
+    /// the new pane, and the pointer is still over the old one when it is
+    /// let go). Only a press nothing here heard, which is one the browser's
+    /// editor kept, leaves the release to say which pane was clicked.
+    static PRESS_HEARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// What a split refused for want of room says.
 pub(crate) const FOUR_PANES_NOTICE: &str = "Four panes are open. Close one to split again.";
 
@@ -200,9 +210,13 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                 None => "display: none;".to_string(),
             }},
             // A press anywhere in the pane focuses it.
-            onmousedown: move || focus_pane(store, pane),
+            onmousedown: move || {
+                PRESS_HEARD.with(|heard| heard.set(true));
+                focus_pane(store, pane);
+            },
             onmouseup: move || {
-                if EDITOR_KEEPS_ITS_PRESSES && !untracked(|| store.pane_dragging.get()) {
+                let heard = PRESS_HEARD.with(|heard| heard.replace(false));
+                if EDITOR_KEEPS_ITS_PRESSES && !heard {
                     focus_pane(store, pane);
                 }
             },
@@ -317,6 +331,7 @@ fn render_divider(__scope: &mut RenderScope, store: AppStore, index: usize) -> N
                 None => "display: none;".to_string(),
             }},
             onmousedown: move || {
+                PRESS_HEARD.with(|heard| heard.set(true));
                 let Some(d) = untracked(divider) else { return };
                 let ctx = rinch::core::get_click_context();
                 if ctx.element_width <= 0.0 || ctx.element_height <= 0.0 {
@@ -350,11 +365,7 @@ fn render_divider(__scope: &mut RenderScope, store: AppStore, index: usize) -> N
                     // release itself says nothing more (rinch hands `on_end`
                     // of a percent drag the raw pointer position, not a
                     // fraction: rinch-core/src/events/drag.rs `finish_drag`).
-                    .on_end(move |_, _| {
-                        // A turn later: the release that ends the drag is
-                        // not a click in the pane it happens over.
-                        set_timeout(0, move || store.pane_dragging.set(false));
-                    })
+                    .on_end(move |_, _| store.pane_dragging.set(false))
                     .on_cancel(move |_, _| store.pane_dragging.set(false))
                     .start();
             },
