@@ -22,7 +22,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crossbeam_channel::Sender;
 use pimble_core::{BlobUrl, NodeId, StoreId};
@@ -297,7 +297,7 @@ struct Shown {
 }
 
 #[cfg(not(test))]
-static SHOWN: Mutex<Option<Shown>> = Mutex::new(None);
+static SHOWN: std::sync::Mutex<Option<Shown>> = std::sync::Mutex::new(None);
 
 #[cfg(not(test))]
 fn shown<T>(f: impl FnOnce(&mut Shown) -> T) -> T {

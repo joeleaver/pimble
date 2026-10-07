@@ -238,10 +238,20 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
   so concurrent row and column edits keep the grid rectangular), horizontal rules, the
   inline atoms image and hard break, and the starter-kit marks (bold, italic, underline,
   strike, code, link, highlight, text colour, sub/superscript). Task lists fail loudly;
-  images have no storage in Pimble yet (`docs/IMAGES_CONTRACT.md`). `pimble_crdt::Block` is
+  a picture is an `image` whose `src` is a `pimble-blob:` URL, its bytes a blob beside the
+  store (`docs/IMAGES_CONTRACT.md`; wave 1 only: blobs do not replicate yet, and an
+  encrypted store in the browser takes and shows none). `pimble_crdt::Block` is
   the scope as data, less rules, hard breaks and images (nothing builds those from outside
   yet); `NodeDoc::from_blocks` builds a document from it (the importer's way in, and RTF
   tables arrive as tables). The toolbar has a quote button and table buttons.
+- Pictures (`crates/pimble-app/src/pictures.rs`, both targets): a paste, a drop and Edit >
+  "Insert Image..." all end in `add_picture`, which sends `BackendCommand::PutBlob`
+  (`pimble_image::fit`, then `putBlob`, beside the command loop) and inserts the image at
+  the anchored place when `BlobStored` brings the URL; nothing but that URL enters a
+  document, and `PicturesPlugin` strips every other `<img>` from pasted HTML. Showing is
+  one rinch scheme loader for `pimble-blob:` on the desktop and in the browser, answering
+  from a cache that `GetBlob`/`BlobLoaded` fill through the server (never the blob file)
+  and calling `rinch::image::reload_image` when the bytes arrive.
 
 ### Split view (built 2026-10-06, branch `split-view`, not merged)
 

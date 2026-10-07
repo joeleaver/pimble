@@ -3,7 +3,10 @@
 Status: written by the PM, 2026-10-01, from Joe's choice of that day (a blob store per
 store, over images inline in the document or links only). Wave 1's server side is built
 on branch `images` (2026-10-06, not merged): see "Built in wave 1 (server side)" at the
-end. The app's loader and inserting, and waves 2 to 5, are not.
+end. The app's loader and inserting are built on branch `pictures-ui` (2026-10-07, not
+merged), for the desktop and for plain stores in the browser: see "Built in wave 1 (app
+side)". Waves 2 to 5 are not: pictures do not replicate, and an encrypted store in the
+browser takes and shows none.
 
 ## The decisions (Joe, 2026-10-01)
 
@@ -206,6 +209,65 @@ stores or the web yet.
   (`TODO(images wave 2)` in `handler.rs`). A vault store answers `-32005`.
 - **CLI**: `put-blob <store> <node> <file>` (prints the URL; the type comes from the
   file's first bytes) and `get-blob <url> <out file>`.
+
+## Built in wave 1 (app side)
+
+Built on branch `pictures-ui` (2026-10-07, not merged), on the storage half above and
+rinch's `pimble/images` branch. One module, `crates/pimble-app/src/pictures.rs`, serves the
+desktop and the browser; only the file picker differs between them.
+
+- **Protocol** (`protocol.rs`, `commands.rs`): `BackendCommand::PutBlob { store_id, node_id,
+  bytes, request_id }` answers `BlobStored { request_id, result }` with the `BlobUrl` and
+  the notice sentence, or a refusal sentence; `GetBlob { url }` answers `BlobLoaded`. Both
+  run as tasks beside the command loop, so typing does not wait behind a picture, and on
+  the desktop `pimble_image::fit` runs on a blocking thread. In the browser the page waits
+  while an oversize picture is scaled (one thread).
+- **Inserting**: a pasted picture and a dropped image file reach the app through
+  `EditorHandle::on_image_input`, registered on each pane's editor; Edit > "Insert
+  Image..." is rinch's file dialog on the desktop and a hidden `<input type="file">` in
+  the browser. All three call `add_picture`, which keeps the anchored place, sends
+  `PutBlob`, and inserts with `insert_image_at` when the URL comes back (at the caret when
+  a peer's change re-projected the document meanwhile and the anchor is gone). `alt` is the
+  file's name without its extension, empty for a pasted bitmap. A note this device may
+  only read, or a pane with no note, answers with a sentence and sends nothing. The notice
+  and every refusal go to the status bar's notice line.
+- **Showing**: one loader for the `pimble-blob:` scheme (`rinch::image::register_image_scheme`,
+  which rinch-web honours too by making the object URL itself, so there is no
+  browser-only resolver). It never blocks: a picture it does not hold is asked for with
+  `GetBlob` once and answered "not yet", and `rinch::image::reload_image` is called when
+  `BlobLoaded` brings the bytes. Fetched bytes sit in a cache keyed by `BlobUrl`, 64 MiB,
+  oldest out first. A picture that is not here is asked for again when a document opens
+  and when the connection comes back. Pictures are never wider than their pane.
+- **Pasted HTML** (`PicturesPlugin::handle_paste`): every `<img>` whose `src` is not a
+  `pimble-blob:` URL of a store open here is left out, with a sentence; a top-level block
+  that held only such pictures goes with them. No `data:` or remote address enters a
+  document. Remote pictures are not fetched into blobs.
+- **Encrypted stores**: in the browser a vault store (open or only known from the
+  account's list) answers `PutBlob` with "Pictures in encrypted stores are not available
+  in the browser yet." and writes nothing, and its pictures are not fetched. On the
+  desktop a hosted store's replica is a plain local store, so pictures are added and shown
+  there, but **they do not travel**: neither the sync link nor the vault link carries
+  blobs yet (waves 2 and 3), so another device sees the image's place and no picture.
+- **CLI**: `blob-refs <store> <node>` prints the pictures a node's text names.
+- **Verified** (2026-10-07): on the desktop, in an isolated app driven over the debug
+  port, "Insert Image..." with a PNG (the blob read back byte for byte with `get-blob`),
+  the paste and drop hooks through `PIMBLE_DEBUG_PICTURE_AS` (a real clipboard paste and
+  a real OS drop were not exercised), the same note in two panes, an edit from the CLI
+  beside it, a restart, a 24.3 MiB PNG scaled with its notice, an SVG and a text file
+  refused, and a read-only store refused. In Chromium on the local stack, in a plain
+  hosted store: a synthetic paste event and the file input (handed its file by script, the
+  browser's own chooser not opened) stored, inserted and showed pictures, and they were
+  still there after a reload; in an encrypted store the refusal sentence and nothing
+  inserted. Firefox was not run.
+- **Not built, against the text above**: the placeholder that says "This picture has not
+  arrived yet." (a missing picture shows whatever rinch shows for an image that failed to
+  load); a share's member on a plain hosted store is still refused `getBlob` by the
+  server, so sees no pictures; nothing tells the app that a blob arrived, so a missing
+  picture appears when its note is next opened, not the moment it lands. A picture stored
+  for a note that was closed before the upload finished stays in the blob store,
+  unreferenced. `PIMBLE_DEBUG_PICTURE` (and `PIMBLE_DEBUG_PICTURE_AS=paste|drop`) names a
+  file that "Insert Image..." takes instead of opening the dialog, for driving the
+  desktop app over rinch's debug port; it is read only when set.
 
 ## Later
 
