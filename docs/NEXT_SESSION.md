@@ -1,5 +1,15 @@
 # Next session: start here
 
+**2026-10-07, later: v0.7.1, rinch `main` (431bc67)**, which carries the list-delete fix
+(joeleaver/rinch#1422: a selection whose ends are at different list depths now deletes).
+Branch `rinch-1422` is retired. Open rinch PRs Pimble waits on: #1472 (a modal opening
+while a browser editor holds the keyboard panicked the page: File > "New Store..." with a
+note focused), #1466 (Firefox caret on a code block's last line), #1436 (image paste and
+drop in the browser), #1474 (rinch CI runs the web tests in Firefox). rinch's
+`pimble/images` (a4a11f6) carries them; Pimble's `pictures-ui` pins it. The v0.7.0
+Release run built both packages but never started its publish job; the release was
+published by hand from those packages (`gh run download`, `gh release create`).
+
 **2026-10-07: v0.7.0, the split view and a resizable explorer** (Joe asked for both on
 2026-10-06). `ui/panes` and `split-view` are merged into `master`, on rinch `main`
 (51cb7c7).
