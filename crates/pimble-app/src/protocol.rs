@@ -11,7 +11,7 @@
 //! and `try_recv` never block and work on every target.
 
 use crossbeam_channel::{Receiver, Sender};
-use pimble_core::{DeletedNode, LeftShare, LinkResolution, MountRef, PimbleUrl, MountState, Node, NodeId, RemoteEndpoint, Store, StoreId, SyncState};
+use pimble_core::{BlobUrl, DeletedNode, LeftShare, LinkResolution, MountRef, PimbleUrl, MountState, Node, NodeId, RemoteEndpoint, Store, StoreId, SyncState};
 
 /// Who asked a `Search`, so its answer reaches them and nobody else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +103,17 @@ pub enum BackendCommand {
     /// vector out (`NodeContentReconciled`). Stateless on both ends; the
     /// same primitive the replica sync link uses between servers.
     ReconcileNodeContent { store_id: StoreId, node_id: NodeId, state_vector: Vec<u8> },
+
+    // Pictures (docs/IMAGES_CONTRACT.md "Showing and inserting images")
+    /// Store a picture that is about to be inserted in `node_id`: fitted
+    /// under the size limit first (`pimble_image::fit`), then `putBlob`.
+    /// Answers `BlobStored` with the same `request_id`, which is how the
+    /// pane that asked finds the place the picture was aimed at. Nothing is
+    /// written to the node; the insert is an ordinary edit made afterwards.
+    PutBlob { store_id: StoreId, node_id: NodeId, bytes: Vec<u8>, request_id: u64 },
+    /// Fetch the picture a `pimble-blob:` URL names, for showing. Answers
+    /// `BlobLoaded`.
+    GetBlob { url: BlobUrl },
 
     // Subscription operations
     SubscribeStoreChanges { store_id: StoreId },
@@ -228,6 +239,14 @@ pub enum CloudOp {
     StopSharing,
 }
 
+/// A picture that was stored (`BackendEvent::BlobStored`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredBlob {
+    pub url: BlobUrl,
+    /// "This picture was 34.2 MiB, so it was scaled to ...", when it was.
+    pub notice: Option<String>,
+}
+
 /// Events sent from backend to UI
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
@@ -310,6 +329,15 @@ pub enum BackendEvent {
     /// collab session of every pane that holds it. The node is named because
     /// several panes hold different documents at once.
     RemoteChanges { store_id: StoreId, node_id: NodeId, changes: String },
+
+    // Pictures
+    /// Answer to `PutBlob`: the URL the document should carry and, when the
+    /// picture was scaled down to fit, the sentence that says so; or the
+    /// sentence that says why nothing was stored.
+    BlobStored { request_id: u64, result: Result<StoredBlob, String> },
+    /// Answer to `GetBlob`: the picture's encoded bytes, or why there are
+    /// none (it has not arrived, or this device may not read it).
+    BlobLoaded { url: BlobUrl, result: Result<std::sync::Arc<Vec<u8>>, String> },
 
     // Search
     /// The outcome of a `Search` command. Carries `Err` rather than folding

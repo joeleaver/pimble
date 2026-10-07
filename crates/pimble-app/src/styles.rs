@@ -466,6 +466,14 @@ pub(crate) const APP_CSS: &str = "
     border-radius: 0;
 }
 
+/* A picture is never wider than the pane it is read in
+   (docs/IMAGES_CONTRACT.md): a phone's photograph is thousands of pixels
+   across, and a narrow split pane is a few hundred. */
+.pimble-editor__content-wrap > [data-pm-editor] img {
+    max-width: 100%;
+    height: auto;
+}
+
 .editor-toolbar {
     background: var(--rinch-color-surface) !important;
     border-bottom-color: var(--rinch-color-border) !important;

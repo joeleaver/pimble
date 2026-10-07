@@ -22,6 +22,8 @@ pimble-core = { workspace = true }
 pimble-client = { workspace = true }
 pimble-rpc = { workspace = true }
 pimble-crdt = { workspace = true }
+# Fits a picture under the size limit before it is stored (docs/IMAGES_CONTRACT.md).
+pimble-image = { workspace = true }
 # rinch is declared here rather than inherited from the workspace because this
 # crate is the only consumer and it needs `default-features = false`: `desktop`
 # (and `collaboration`, which implies it) must stay out of a web build, and a
@@ -60,7 +62,13 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 # `persistence.rs` remembers the theme choice in `localStorage`, which is the
 # browser's equivalent of the desktop's `state.json`; `links.rs` copies a link
 # with `navigator.clipboard`.
-web-sys = { version = "0.3", optional = true, features = ["Window", "Storage", "Navigator", "Clipboard"] }
+# `pictures.rs` picks a file with a hidden `<input type="file">` and reads it.
+web-sys = { version = "0.3", optional = true, features = [
+    "Window", "Storage", "Navigator", "Clipboard",
+    "Document", "Node", "Element", "HtmlElement", "HtmlInputElement",
+    "Event", "EventTarget", "FileList", "File", "Blob",
+] }
+wasm-bindgen = { version = "0.2", optional = true }
 
 [features]
 # `native` is the desktop app: the embedded server, the tokio backend thread,
@@ -92,6 +100,6 @@ native = [
     # `rinch-web/collaboration` instead.
     "rinch/collaboration",
 ]
-web = ["dep:rinch-web", "dep:js-sys", "dep:wasm-bindgen-futures", "dep:web-sys"]
+web = ["dep:rinch-web", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys"]
 onnx-download = ["native", "pimble-server/onnx-download"]
 onnx-dynamic = ["native", "pimble-server/onnx-dynamic"]

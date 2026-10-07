@@ -112,7 +112,13 @@ fn file_entries(store: AppStore) -> Vec<MenuEntry> {
 }
 
 fn edit_entries(store: AppStore) -> Vec<MenuEntry> {
-    vec![MenuEntry::item("Delete", "", move || {
+    vec![
+        // docs/IMAGES_CONTRACT.md "Showing and inserting images": into the
+        // focused pane's note, at its caret. With no note there, or one this
+        // device may only read, it says so.
+        MenuEntry::item("Insert Image...", "", move || crate::pictures::insert_image(store)),
+        MenuEntry::Separator,
+        MenuEntry::item("Delete", "", move || {
         // A native menu item cannot be greyed out reactively, so the check a
         // row's "Delete" makes at render time is made here when it runs: a
         // node shared with this device to read changes in no way
@@ -125,7 +131,8 @@ fn edit_entries(store: AppStore) -> Vec<MenuEntry> {
             }
             store.send(crate::protocol::BackendCommand::DeleteNode { store_id, node_id });
         }
-    })]
+        }),
+    ]
 }
 
 fn view_entries(store: AppStore) -> Vec<MenuEntry> {

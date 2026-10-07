@@ -618,6 +618,14 @@ async fn dispatch(
         return;
     }
 
+    // Pictures in an encrypted store are a later wave: answered here, under
+    // the event the app waits for, before any server is asked. A plain
+    // store's go on to its server like every other command.
+    if let Some(event) = vault.answer_picture(&cmd) {
+        emit(event_tx, signal_ui, event);
+        return;
+    }
+
     // A transplant between stores names two, so it is judged and routed here
     // rather than by the single-`store_id` path every other command takes
     // below (docs/MOVE_CONTRACT.md "Between stores").

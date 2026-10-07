@@ -725,6 +725,38 @@ pub async fn process_command(
             message: "This build cannot create a hosted store".into(),
         }),
 
+        // Both picture commands run beside the command loop, not in it: a
+        // 20 MiB picture takes a moment to send and a huge one seconds to
+        // scale down, and typing must not wait behind either.
+        BackendCommand::PutBlob { store_id, node_id, bytes, request_id } => {
+            let Some(c) = client.clone() else {
+                return Some(BackendEvent::BlobStored { request_id, result: Err(crate::pictures::NOT_CONNECTED.to_string()) });
+            };
+            let (event_tx, signal_ui) = (event_tx.clone(), signal_ui.clone());
+            spawn_task(async move {
+                let result = store_picture(&c, store_id, node_id, bytes).await;
+                let _ = event_tx.try_send(BackendEvent::BlobStored { request_id, result });
+                signal_ui();
+            });
+            None
+        }
+
+        BackendCommand::GetBlob { url } => {
+            let Some(c) = client.clone() else {
+                return Some(BackendEvent::BlobLoaded { url, result: Err(crate::pictures::NOT_CONNECTED.to_string()) });
+            };
+            let (event_tx, signal_ui) = (event_tx.clone(), signal_ui.clone());
+            spawn_task(async move {
+                let result = match c.get_blob(url.store, url.blob).await {
+                    Ok((_mime, bytes)) => Ok(std::sync::Arc::new(bytes)),
+                    Err(e) => Err(e.to_string()),
+                };
+                let _ = event_tx.try_send(BackendEvent::BlobLoaded { url, result });
+                signal_ui();
+            });
+            None
+        }
+
         BackendCommand::RemoveReplica { store_id, force } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
@@ -735,6 +767,43 @@ pub async fn process_command(
             }
         }
     }
+}
+
+/// Fit a picture under the size limit and store it: the one way a picture
+/// the person adds reaches a store (docs/IMAGES_CONTRACT.md "Too large").
+/// Every error is a sentence for the person.
+async fn store_picture(
+    client: &PimbleClient,
+    store_id: pimble_core::StoreId,
+    node_id: NodeId,
+    bytes: Vec<u8>,
+) -> Result<crate::protocol::StoredBlob, String> {
+    let fitted = fit_picture(bytes).await?;
+    let url = client
+        .put_blob(store_id, node_id, fitted.mime.as_str(), &fitted.bytes)
+        .await
+        .map_err(|e| {
+            let message = e.to_string();
+            message.strip_prefix("Forbidden: ").map(str::to_string).unwrap_or(message)
+        })?;
+    Ok(crate::protocol::StoredBlob { url, notice: fitted.notice })
+}
+
+/// `pimble_image::fit` off the runtime's own threads: scaling a huge picture
+/// down decodes and re-encodes it, which takes seconds.
+#[cfg(feature = "native")]
+async fn fit_picture(bytes: Vec<u8>) -> Result<pimble_image::Fitted, String> {
+    tokio::task::spawn_blocking(move || pimble_image::fit(bytes))
+        .await
+        .map_err(|e| format!("The picture could not be read: {e}"))?
+        .map_err(|e| e.to_string())
+}
+
+/// The browser has one thread, so the page waits while an oversize picture
+/// is scaled. One under the limit is only looked at, not decoded.
+#[cfg(not(feature = "native"))]
+async fn fit_picture(bytes: Vec<u8>) -> Result<pimble_image::Fitted, String> {
+    pimble_image::fit(bytes).map_err(|e| e.to_string())
 }
 
 /// A store's sync answer as the event the UI takes it as: all of it, what

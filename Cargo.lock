@@ -4975,6 +4975,7 @@ dependencies = [
  "pimble-client",
  "pimble-core",
  "pimble-crdt",
+ "pimble-image",
  "pimble-rpc",
  "pimble-server",
  "pimble-store",
@@ -4989,6 +4990,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
 ]

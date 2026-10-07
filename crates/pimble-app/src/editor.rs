@@ -50,6 +50,8 @@ pub(crate) fn editor(pane: PaneId) -> EditorHandle {
                 let handle = create_editor();
                 // Before any content: adding a plugin resets history.
                 handle.add_plugin(std::rc::Rc::new(crate::links::LinksPlugin { pane }));
+                // After the links plugin: a pasted link is claimed there.
+                handle.add_plugin(std::rc::Rc::new(crate::pictures::PicturesPlugin));
                 // Typing, commands and remote deltas all land here; the
                 // toolbar's active states follow immediately (cursor-only
                 // moves are covered by the toolbar's own watcher).
@@ -131,6 +133,9 @@ pub(crate) fn start_editing(
     // mounts, so apply the app's scheme here, once a document is opened.
     handle.set_dark_mode(untracked(|| store.dark_mode.get()));
     crate::links::set_app_store(store);
+    // Pictures (docs/IMAGES_CONTRACT.md): shown from the store's blobs, and
+    // a pasted or dropped one stored there before it enters the document.
+    crate::pictures::opening(store, pane);
     // An unmounted or switched editor says nothing more about its hovered
     // link (rinch #892): the tooltip goes with the note it was over.
     crate::links::hover_link(store, None);

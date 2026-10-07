@@ -1322,6 +1322,36 @@ impl VaultClient {
         })
     }
 
+    /// What a picture command is answered with when no server is to be asked
+    /// (docs/IMAGES_CONTRACT.md): the answer to `PutBlob` or `GetBlob`, under
+    /// the event the app is waiting for, or `None` when the command should go
+    /// on to the plain store's server.
+    ///
+    /// Pictures in ciphertext are a later wave. Until then an encrypted
+    /// store, open here or only known from the account's list, takes no
+    /// picture from the browser and shows none, and nothing is written. A
+    /// reader's picture is refused like any other write of theirs.
+    pub fn answer_picture(&self, cmd: &BackendCommand) -> Option<BackendEvent> {
+        match cmd {
+            BackendCommand::PutBlob { store_id, request_id, .. } => {
+                let row_access = self.rows.get(store_id).map(AccountStore::access).unwrap_or(StoreAccess::Full);
+                let refusal = if !row_access.allows_write() {
+                    StoreAccess::READ_ONLY_REFUSAL
+                } else if self.is_encrypted(*store_id) {
+                    pimble_app::pictures::ENCRYPTED_IN_BROWSER
+                } else {
+                    return None;
+                };
+                Some(BackendEvent::BlobStored { request_id: *request_id, result: Err(refusal.to_string()) })
+            }
+            BackendCommand::GetBlob { url } if self.is_encrypted(url.store) => Some(BackendEvent::BlobLoaded {
+                url: *url,
+                result: Err(pimble_app::pictures::ENCRYPTED_IN_BROWSER.to_string()),
+            }),
+            _ => None,
+        }
+    }
+
     /// The refusal a writing command earns on a store this account may only
     /// read, or `None` when there is nothing to refuse.
     ///
@@ -3558,7 +3588,9 @@ pub fn store_id_of(cmd: &BackendCommand) -> Option<StoreId> {
         | RebuildIndex { store_id }
         | SetStoreSync { store_id, .. }
         | GetStoreSync { store_id }
+        | PutBlob { store_id, .. }
         | RemoveReplica { store_id, .. } => *store_id,
+        GetBlob { url } => url.store,
         MountRemoteStore { target_store_id, .. } => *target_store_id,
         ResolveLink { url, .. } => url.store,
         _ => return None,
@@ -3584,6 +3616,7 @@ pub fn writes(cmd: &BackendCommand) -> bool {
             | TransplantNode { .. }
             | SetNodeContent { .. }
             | BroadcastChanges { .. }
+            | PutBlob { .. }
             | CreateMount { .. }
             | MountRemoteStore { .. }
             | SetStoreSync { .. }

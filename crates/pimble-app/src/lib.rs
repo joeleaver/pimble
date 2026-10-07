@@ -30,6 +30,7 @@ pub mod menus;
 pub mod pane_view;
 pub mod panes;
 pub mod persistence;
+pub mod pictures;
 pub mod protocol;
 pub mod rinch_editor;
 pub mod state;

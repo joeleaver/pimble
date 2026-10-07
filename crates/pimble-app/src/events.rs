@@ -506,6 +506,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 if !client_id.is_empty() {
                     store.client_id.set(client_id.clone());
                 }
+                // A picture that could not be fetched while there was no
+                // connection is asked for again.
+                crate::pictures::retry_missing();
 
                 // Auto-open previously loaded stores. On a reconnect this is
                 // the same list (every open store is persisted there), so
@@ -1238,6 +1241,14 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(changes) {
                     apply_remote(store, *store_id, *node_id, &bytes);
                 }
+            }
+
+            BackendEvent::BlobStored { request_id, result } => {
+                crate::pictures::stored(store, *request_id, result);
+            }
+
+            BackendEvent::BlobLoaded { url, result } => {
+                crate::pictures::loaded(*url, result);
             }
 
             BackendEvent::SearchResults { purpose: crate::protocol::SearchPurpose::LinkPicker, results } => {

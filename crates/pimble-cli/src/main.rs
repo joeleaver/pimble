@@ -204,6 +204,13 @@ async fn main() -> Result<()> {
             }
             get_blob(&args[2], &args[3]).await?;
         }
+        "blob-refs" => {
+            if args.len() < 4 {
+                eprintln!("Usage: pimble-cli blob-refs <store-id> <node-id>");
+                return Ok(());
+            }
+            blob_refs(&args[2], &args[3]).await?;
+        }
         "resolve-link" => {
             if args.len() < 3 {
                 eprintln!("Usage: pimble-cli resolve-link <pimble:store/node>");
@@ -422,6 +429,7 @@ COMMANDS:
     resolve-link        Say where a pimble: link leads from this server (live, deleted, ...)
     put-blob            Store an image file as a picture for a node; prints its pimble-blob: URL
     get-blob            Write the picture a pimble-blob: URL names to a file
+    blob-refs           List the pictures a node's text names, one URL a line
     show-node           Print a node's metadata and content text
     search              Search across all open stores
     rebuild-index       Rebuild a store's search index from scratch
@@ -509,6 +517,7 @@ EXAMPLES:
     pimble-cli set-node-text <store-id> <node-id> "Hello, world"
     pimble-cli put-blob <store-id> <node-id> ./cat.png
     pimble-cli get-blob pimble-blob:<store-id>/<blob-id> ./cat.png
+    pimble-cli blob-refs <store-id> <node-id>
     pimble-cli show-node <store-id> <node-id>
     pimble-cli search "hello"
     pimble-cli rebuild-index <store-id>
@@ -1370,6 +1379,20 @@ async fn get_blob(url: &str, out: &str) -> Result<()> {
     let (mime, bytes) = client.get_blob(url.store, url.blob).await?;
     std::fs::write(out, &bytes).map_err(|e| anyhow::anyhow!("cannot write {out}: {e}"))?;
     println!("Wrote {} ({}, {} bytes)", out, mime, bytes.len());
+    Ok(())
+}
+
+/// The pictures a node's text names (`NodeDoc::blob_refs`), in document
+/// order: each one's URL, then its `alt` text. `show-node` prints words, and
+/// a picture has none.
+async fn blob_refs(store_id: &str, node_id: &str) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let node_id = parse_node_id(node_id)?;
+    let client = connect().await?;
+    let node = client.get_node(store_id, node_id).await?;
+    for blob in NodeDoc::blob_refs_of(&node.content) {
+        println!("{}\t{}", blob.url, blob.alt);
+    }
     Ok(())
 }
 

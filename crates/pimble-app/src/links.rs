@@ -101,7 +101,7 @@ const OPEN_PICKER: &str = "pimbleOpenLinkPicker";
 
 /// Run `f` with the app's store a turn later: an editor command or input
 /// rule runs mid-dispatch, and the handle is not to be touched until it ends.
-fn later(f: impl FnOnce(crate::state::AppStore) + 'static) {
+pub(crate) fn later(f: impl FnOnce(crate::state::AppStore) + 'static) {
     rinch::prelude::set_timeout(0, move || {
         if let Some(store) = APP_STORE.with(|s| s.get()) {
             f(store);
@@ -131,6 +131,11 @@ thread_local! {
 /// Let the editor's commands reach the app.
 pub fn set_app_store(store: crate::state::AppStore) {
     APP_STORE.with(|s| s.set(Some(store)));
+}
+
+/// Read the app's state from inside an editor plugin, when there is an app.
+pub(crate) fn with_app_store<T>(f: impl FnOnce(crate::state::AppStore) -> T) -> Option<T> {
+    APP_STORE.with(|s| s.get()).map(f)
 }
 
 /// "Copy Link to Here" (docs/LINKS_CONTRACT.md "Making a link"): a deep link

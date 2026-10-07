@@ -13,6 +13,8 @@
 
 #[cfg(feature = "native")]
 pub use rinch::prelude::{create_editor, Editor, EditorHandle, LinkClick, LinkHover, ScrollAlign};
+#[cfg(feature = "native")]
+pub use rinch::editor::{ImageInputSource, SelectionAnchor};
 
 #[cfg(not(feature = "native"))]
-pub use rinch_web::{create_editor, Editor, EditorHandle, LinkClick, LinkHover, ScrollAlign};
+pub use rinch_web::{create_editor, Editor, EditorHandle, ImageInputSource, LinkClick, LinkHover, ScrollAlign, SelectionAnchor};
