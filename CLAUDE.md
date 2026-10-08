@@ -269,7 +269,9 @@ own presses, so there a release in a pane focuses it too, but only when no pane 
 press (`PRESS_HEARD`): a split button's press focuses the new pane, and its release is
 still over the old one. `open_node` opens in the focused pane,
 `open_node_in` in a named one ("Open in Split View", a link followed from a pane, which
-`AppStore::link_from` carries to `LinkOpen.pane`). The toolbar's button state is per pane.
+`AppStore::link_from` carries to `LinkOpen.pane`). There is ONE toolbar, above the panes, for
+the focused pane (`toolbar.rs`: `TARGET` follows `focused_pane`; dimmed while that pane has
+no document or a read-only one; Joe, 2026-10-08).
 The layout is `state.json`'s `panes` (`localStorage` `pimble.panes` in the browser), saved
 on every change and at the end of a divider drag; at start the tiling comes back at once
 and each pane's document when its store opens and `resolveLink` says it is live

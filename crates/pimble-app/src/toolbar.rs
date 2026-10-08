@@ -1,5 +1,7 @@
-//! Reactive editor toolbar for Pimble: one per pane
-//! (docs/SPLIT_VIEW_CONTRACT.md decision 3), each over its own pane's editor.
+//! Reactive editor toolbar for Pimble: one, above the panes, acting on and
+//! showing the state of the focused pane's editor (docs/SPLIT_VIEW_CONTRACT.md,
+//! "One toolbar", Joe 2026-10-08). It greys out while the focused pane holds
+//! no document or one this device may only read.
 //!
 //! Built with proper rinch patterns (Signals, reactive closures) so that
 //! button active-state and dropdowns update correctly — unlike the upstream
@@ -11,12 +13,13 @@ use rinch::prelude::*;
 use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
 
 use crate::editor::editor;
-use crate::panes::{PaneId, MAX_PANES};
+use crate::panes::PaneId;
 use crate::rinch_editor::EditorHandle;
+use crate::state::AppStore;
 
 thread_local! {
-    /// Each mounted button's active state, per pane, in `button_groups` order
-    /// (see `fingerprint`). Written with `set_if_changed`, and each button's style
+    /// Each mounted button's active state, for the focused pane, in
+    /// `button_groups` order (see `fingerprint`). Written with `set_if_changed`, and each button's style
     /// reads only its own, so a keystroke that leaves the formatting at the
     /// caret alone writes nothing to the toolbar, and one that changes it
     /// restyles only the buttons that flipped. (Until 2026-09-22 every editor
@@ -24,8 +27,10 @@ thread_local! {
     /// style writes and about a hundred restyled nodes, twice per keystroke.
     /// A `Memo` per button would not have helped: rinch's `Memo` notifies its
     /// readers whenever its inputs change, equal or not.)
-    static BUTTON_ACTIVE: RefCell<[Vec<Signal<bool>>; MAX_PANES]> =
-        const { RefCell::new([Vec::new(), Vec::new(), Vec::new(), Vec::new()]) };
+    static BUTTON_ACTIVE: RefCell<Vec<Signal<bool>>> = const { RefCell::new(Vec::new()) };
+    /// The pane the buttons show and act on: the focused one, kept in step by
+    /// an effect in `render_pimble_toolbar`.
+    static TARGET: Cell<PaneId> = const { Cell::new(PaneId::FIRST) };
     /// Whether the self-rescheduling watcher is running.
     static WATCHING: Cell<bool> = const { Cell::new(false) };
 }
@@ -35,17 +40,22 @@ thread_local! {
 /// caret travels; a handful of RefCell reads per tick, nothing more.
 const WATCH_INTERVAL_MS: u32 = 120;
 
-/// Re-read pane `pane`'s active states now. Deferred via `run_on_main_thread`
-/// so it never runs while the editor's RefCell is still mutably borrowed by
-/// the operation that triggered it (a command, a change callback).
+/// Re-read the buttons' active states now, if `pane` is the one they show.
+/// Deferred via `run_on_main_thread` so it never runs while the editor's
+/// RefCell is still mutably borrowed by the operation that triggered it (a
+/// command, a change callback).
 pub(crate) fn bump_toolbar(pane: PaneId) {
-    run_on_main_thread(move || refresh_active_bits(pane));
+    run_on_main_thread(move || {
+        if TARGET.with(Cell::get) == pane {
+            refresh_active_bits(pane);
+        }
+    });
 }
 
-/// Store pane `pane`'s current active states, notifying only the buttons
-/// that flipped.
+/// Store pane `pane`'s current active states in the buttons, notifying only
+/// the buttons that flipped.
 fn refresh_active_bits(pane: PaneId) {
-    let signals = BUTTON_ACTIVE.with(|b| b.borrow()[pane.index()].clone());
+    let signals = BUTTON_ACTIVE.with(|b| b.borrow().clone());
     if signals.is_empty() {
         return;
     }
@@ -77,9 +87,7 @@ fn watch_toolbar() {
         return;
     }
     fn tick() {
-        for pane in PaneId::ALL {
-            refresh_active_bits(pane);
-        }
+        refresh_active_bits(TARGET.with(Cell::get));
         set_timeout(WATCH_INTERVAL_MS, tick);
     }
     set_timeout(WATCH_INTERVAL_MS, tick);
@@ -307,18 +315,33 @@ fn btn_style(active: bool) -> String {
 
 // ── Public render ────────────────────────────────────────────────────────
 
-pub(crate) fn render_pimble_toolbar(__scope: &mut RenderScope, pane: PaneId) -> NodeHandle {
+/// The toolbar, rendered once. `usable` says whether the focused pane holds a
+/// document this device may write; while it does not, the buttons are dimmed
+/// and do nothing.
+pub(crate) fn render_pimble_toolbar(
+    __scope: &mut RenderScope,
+    store: AppStore,
+    usable: impl Fn() -> bool + Copy + 'static,
+) -> NodeHandle {
     let groups = button_groups();
     let count = groups.iter().map(Vec::len).sum();
-    BUTTON_ACTIVE.with(|b| b.borrow_mut()[pane.index()] = (0..count).map(|_| Signal::new(false)).collect());
-    refresh_active_bits(pane);
+    BUTTON_ACTIVE.with(|b| *b.borrow_mut() = (0..count).map(|_| Signal::new(false)).collect());
+    // The buttons follow the focus: a click in another pane, or its editor
+    // taking the keyboard, re-reads them from that pane's editor.
+    let _ = rinch::Effect::new(move || {
+        let pane = store.focused_pane.get();
+        TARGET.with(|t| t.set(pane));
+        untracked(|| refresh_active_bits(pane));
+    });
     watch_toolbar();
 
     let toolbar = rsx! {
         div {
             class: "editor-toolbar",
-            style: "display: flex; flex-wrap: wrap; gap: 6px; align-items: center; \
-                    padding: 6px 12px;",
+            style: {move || format!(
+                "display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 6px 12px;{}",
+                if usable() { "" } else { " opacity: 0.4; pointer-events: none;" }
+            )},
         }
     };
 
@@ -337,7 +360,7 @@ pub(crate) fn render_pimble_toolbar(__scope: &mut RenderScope, pane: PaneId) -> 
         }
 
         for btn_def in group {
-            let btn = render_btn(__scope, pane, bit, btn_def);
+            let btn = render_btn(__scope, bit, btn_def);
             toolbar.append_child(&btn);
             bit += 1;
         }
@@ -348,7 +371,6 @@ pub(crate) fn render_pimble_toolbar(__scope: &mut RenderScope, pane: PaneId) -> 
 
 fn render_btn(
     __scope: &mut RenderScope,
-    pane: PaneId,
     bit: u32,
     def: BtnDef,
 ) -> NodeHandle {
@@ -358,7 +380,7 @@ fn render_btn(
     // own signal only.
     let active = match def.active_check {
         ActiveCheck::None => None,
-        _ => BUTTON_ACTIVE.with(|b| b.borrow()[pane.index()].get(bit as usize).copied()),
+        _ => BUTTON_ACTIVE.with(|b| b.borrow().get(bit as usize).copied()),
     };
 
     rsx! {
@@ -369,7 +391,7 @@ fn render_btn(
             },
             onclick: {
                 let cmd = cmd.clone();
-                move || execute_cmd(pane, &cmd)
+                move || execute_cmd(TARGET.with(Cell::get), &cmd)
             },
             span {
                 style: "width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center;",
@@ -431,7 +453,7 @@ mod tests {
 
         let count: usize = button_groups().iter().map(Vec::len).sum();
         let signals: Vec<Signal<bool>> = (0..count).map(|_| Signal::new(false)).collect();
-        BUTTON_ACTIVE.with(|b| b.borrow_mut()[pane.index()] = signals.clone());
+        BUTTON_ACTIVE.with(|b| *b.borrow_mut() = signals.clone());
         let runs: Vec<Rc<Cell<u32>>> = (0..count).map(|_| Rc::new(Cell::new(0))).collect();
         let _effects: Vec<rinch::Effect> = signals
             .iter()

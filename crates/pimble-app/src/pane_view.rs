@@ -141,8 +141,9 @@ fn pane_icon(store: AppStore, pane: PaneId) -> Vec<(String, String)> {
 /// the edit would be written, even when the node was reached through a mount
 /// — so that is what decides. Reactive on the pane's node, on its store's
 /// own signal and on the node's, so the pane follows an access that arrives
-/// or changes. The toolbar gives way to a line saying so, and the editor is
-/// locked so typing does nothing, in every pane that holds the document.
+/// or changes. The pane shows a line saying so, the toolbar greys out while
+/// the pane is focused, and the editor is locked so typing does nothing, in
+/// every pane that holds the document.
 ///
 /// The store's own signal comes out of the registry first and is read after
 /// that borrow is released: rinch keeps every signal in one `RefCell`, and a
@@ -159,7 +160,7 @@ fn editor_read_only(store: AppStore, pane: PaneId) -> bool {
     node_sig.map_or(false, |sig| sig.with(|n| !n.access.allows_write()))
 }
 
-/// One pane slot: its title strip, its toolbar (or the read-only sentence),
+/// One pane slot: its title strip, the read-only sentence when it applies,
 /// its editor and the empty state. Rendered once per slot.
 fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: &[&'static str]) -> NodeHandle {
     let state = store.pane(pane);
@@ -173,7 +174,6 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
     let editor_view = rsx! {
         Editor { editor: crate::editor::editor(pane) }
     };
-    let toolbar = crate::toolbar::render_pimble_toolbar(__scope, pane);
 
     // The editor's own switch follows the read-only judgement
     // (`editor::set_read_only`): locked, it refuses every local change while
@@ -269,11 +269,6 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                 }
             }
 
-            div {
-                class: "pimble-editor__toolbar-wrap",
-                style: {move || if state.show_editor.get() && !editor_read_only(store, pane) { "" } else { "display: none;" }},
-                {toolbar}
-            }
             // The same sentence a refused write comes back with, so a
             // reader meets one wording everywhere.
             div {
@@ -389,16 +384,32 @@ fn render_divider(__scope: &mut RenderScope, store: AppStore, index: usize) -> N
     }
 }
 
-/// The area beside the explorer: every pane slot and every divider slot,
-/// once. `hints` are the lines under the empty state's sentence.
+/// The area beside the explorer: the one toolbar, then every pane slot and
+/// every divider slot, once. `hints` are the lines under the empty state's
+/// sentence.
 pub(crate) fn render_panes(__scope: &mut RenderScope, store: AppStore, hints: &[&'static str]) -> NodeHandle {
+    // The toolbar acts on the focused pane (docs/SPLIT_VIEW_CONTRACT.md "One
+    // toolbar"), and has nothing to act on while that pane holds no document
+    // or one this device may only read.
+    let usable = move || {
+        let pane = store.focused_pane.get();
+        store.pane(pane).show_editor.get() && !editor_read_only(store, pane)
+    };
+    let toolbar = crate::toolbar::render_pimble_toolbar(__scope, store, usable);
     let slots: Vec<NodeHandle> = PaneId::ALL.into_iter().map(|pane| render_pane(__scope, store, pane, hints)).collect();
     let dividers: Vec<NodeHandle> = (0..MAX_PANES - 1).map(|index| render_divider(__scope, store, index)).collect();
     rsx! {
         div {
-            class: "pimble-panes",
-            {slots}
-            {dividers}
+            class: "pimble-panes-area",
+            div {
+                class: "pimble-editor__toolbar-wrap",
+                {toolbar}
+            }
+            div {
+                class: "pimble-panes",
+                {slots}
+                {dividers}
+            }
         }
     }
 }

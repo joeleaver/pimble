@@ -314,6 +314,14 @@ pub(crate) const APP_CSS: &str = "
 
 /* ── The split view (docs/SPLIT_VIEW_CONTRACT.md) ───────────── */
 
+/* The toolbar above the tiled area, then the tiled area. */
+.pimble-panes-area {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+
 /* The tiled area: every pane and divider slot is positioned inside it. */
 .pimble-panes {
     flex: 1;
@@ -409,7 +417,7 @@ pub(crate) const APP_CSS: &str = "
 }
 
 .pimble-editor__toolbar-wrap {
-    border-top: 1px solid var(--rinch-color-border);
+    flex-shrink: 0;
     border-bottom: 1px solid var(--rinch-color-border);
 }
 

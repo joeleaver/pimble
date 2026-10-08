@@ -14,7 +14,9 @@ a line marked "As built".
    neighbour. That covers side by side, stacked, one beside two, and two by two.
 2. **"Open in Split View"** in a tree row's menu is how a document gets into a new pane. A
    plain click keeps opening in the focused pane.
-3. **Each pane has its own toolbar**, because panes will hold different node types later.
+3. **One toolbar, above the panes, for the focused pane** (Joe, 2026-10-08, replacing "each
+   pane has its own toolbar" of 2026-10-06): it shows and acts on the focused pane's tools,
+   so a pane holding another node type later swaps what it shows. See "One toolbar".
 4. **The same note may be open in two panes**, each with its own caret, edits appearing in
    both as they are typed.
 5. **The layout is remembered** across restarts: the panes, their sizes, their documents.
@@ -25,8 +27,8 @@ a line marked "As built".
 
 - The area right of the explorer is a tiling of one to four **panes**. Each pane has, top
   to bottom: a **title strip** (the document's icon and title, then "split right", "split
-  down" and "close" buttons), its **toolbar** (or the read-only sentence), and its
-  document. A pane with no document shows the empty state the single pane shows today.
+  down" and "close" buttons), the read-only sentence when its document is one this device
+  may only read, and its document. A pane with no document shows the empty state the single pane shows today.
 - One pane is **focused**: the one last clicked in or opened into. Its title strip carries
   the accent colour. The tree's selected row is the focused pane's document. Everything
   that today acts on "the editor" acts on the focused pane: a click in the tree, a search
@@ -119,7 +121,8 @@ in what is saved.
 ## Out of scope
 
 Dragging a tree row onto a pane; Ctrl+click to open in a split; moving a pane; tabs inside
-a pane; node types other than documents (the toolbar is per pane so they can come).
+a pane; node types other than documents (the one toolbar shows the focused pane's tools, so
+they can come).
 
 ## Verification (the bar)
 
@@ -140,5 +143,16 @@ a pane; node types other than documents (the toolbar is per pane so they can com
 As built, two things in "What the person sees" differ. A native menu item cannot be greyed
 out reactively, so with four panes open View > "Split Right" / "Split Down" answer "Four
 panes are open. Close one to split again." in the status bar; the title-strip buttons and
-"Open in Split View" are disabled as written. And in a narrow pane the toolbar wraps onto
-several rows rather than scrolling.
+"Open in Split View" are disabled as written.
+
+## One toolbar (Joe, 2026-10-08)
+
+One toolbar sits across the top of the pane area (not over the explorer). Its buttons show
+the formatting at the caret of the focused pane's editor and act on that editor; when the
+focus moves to another pane they follow it at once. While the focused pane holds no
+document, or one this device may only read, the toolbar is dimmed and takes no presses
+(the pane itself shows the read-only sentence). Pressing a button never moves the pane
+focus or the keyboard. Built in `toolbar.rs` (one set of button signals, `TARGET` kept in
+step with `focused_pane` by an effect) and `pane_view::render_panes`. It replaced one
+toolbar per pane, which wrapped onto two or three rows in a narrow pane and took the
+keyboard from the editor when another pane's button was pressed.
