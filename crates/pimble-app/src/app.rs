@@ -4089,11 +4089,14 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             }
         };
 
-        // A browser tab has its own chrome; the app just fills it.
+        // A browser tab has its own chrome; the app just fills it. It fills
+        // what the menu bar leaves, not the viewport: rinch-web puts this
+        // under a 28px bar inside a viewport-tall box, and `100vh` here put
+        // the status bar that far below the fold.
         #[cfg(not(feature = "native"))]
         let root = rsx! {
             div {
-                style: "height: 100vh; display: flex; flex-direction: column;",
+                style: "height: 100%; display: flex; flex-direction: column;",
 
                 style { {APP_CSS} }
                 style { {EDITOR_CSS} }
