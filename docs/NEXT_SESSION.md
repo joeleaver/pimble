@@ -1,5 +1,10 @@
 # Next session: start here
 
+**2026-10-08, later: v0.8.1, one toolbar above the panes** for the focused pane (Joe's
+call that day, docs/SPLIT_VIEW_CONTRACT.md "One toolbar"), desktop and browser. Known
+gap kept: with an empty pane focused, typing still goes to the editor rinch last
+focused, while the toolbar is dimmed.
+
 **2026-10-08: v0.8.0, pictures (wave 1)**, on rinch `main` (5c83eb2): every rinch PR it
 waited on merged overnight (#1429 #1431 #1433 #1435 #1436 image hooks; #1466 the Firefox
 caret; #1472 the modal-focus panic; #1474 rinch CI runs the web tests in Firefox).
