@@ -209,10 +209,13 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                 ),
                 None => "display: none;".to_string(),
             }},
-            // A press anywhere in the pane focuses it.
+            // A press anywhere in the pane focuses it, and gives it the
+            // keyboard even when it already had the focus (a press on its
+            // title strip after the keyboard went to the tree).
             onmousedown: move || {
                 PRESS_HEARD.with(|heard| heard.set(true));
                 focus_pane(store, pane);
+                crate::editor::give_keyboard_to(store, pane);
             },
             onmouseup: move || {
                 let heard = PRESS_HEARD.with(|heard| heard.replace(false));
@@ -396,6 +399,15 @@ pub(crate) fn render_panes(__scope: &mut RenderScope, store: AppStore, hints: &[
         store.pane(pane).show_editor.get() && !editor_read_only(store, pane)
     };
     let toolbar = crate::toolbar::render_pimble_toolbar(__scope, store, usable);
+    // The keyboard follows the pane focus, however it moved (a press in the
+    // pane, a split, a close, the View menu): the focused pane's editor when
+    // it holds a document, no editor when it holds none. Only a change of the
+    // focus moves it, so opening a note from the tree leaves the keyboard on
+    // the tree.
+    let _ = rinch::Effect::new(move || {
+        let pane = store.focused_pane.get();
+        untracked(|| crate::editor::give_keyboard_to(store, pane));
+    });
     let slots: Vec<NodeHandle> = PaneId::ALL.into_iter().map(|pane| render_pane(__scope, store, pane, hints)).collect();
     let dividers: Vec<NodeHandle> = (0..MAX_PANES - 1).map(|index| render_divider(__scope, store, index)).collect();
     rsx! {

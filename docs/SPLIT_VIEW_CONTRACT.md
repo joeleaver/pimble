@@ -156,3 +156,15 @@ focus or the keyboard. Built in `toolbar.rs` (one set of button signals, `TARGET
 step with `focused_pane` by an effect) and `pane_view::render_panes`. It replaced one
 toolbar per pane, which wrapped onto two or three rows in a narrow pane and took the
 keyboard from the editor when another pane's button was pressed.
+
+## The keyboard follows the pane focus (Joe, 2026-10-08: "Focus should work as expected")
+
+When the focused pane changes (a press in it, a split, a close, the View menu), the
+keyboard goes to that pane's editor if it holds a document, and to no editor if it holds
+none: typing with an empty pane focused changes nothing anywhere. A press anywhere in a
+pane does the same even when the pane already had the focus (its title strip, after the
+keyboard went to the tree). Opening a note from the tree leaves the keyboard on the tree.
+Built as `editor::give_keyboard_to` (an effect over `focused_pane` in
+`pane_view::render_panes`, and the pane's press handler) on rinch's `EditorHandle::focus`
+and `EditorHandle::blur` (joeleaver/rinch#1481), which releases the keyboard only from an
+editor that holds it.

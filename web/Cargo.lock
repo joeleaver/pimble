@@ -2113,7 +2113,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rinch"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5c83eb2af9bad0b9e26f555f4e21819b9b399e88"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Feditor-blur#abdd2fe7b16297cf5b3fb17953fc3e353cfc6ebd"
 dependencies = [
  "js-sys",
  "rinch-components",
@@ -2130,7 +2130,7 @@ dependencies = [
 [[package]]
 name = "rinch-android"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5c83eb2af9bad0b9e26f555f4e21819b9b399e88"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Feditor-blur#abdd2fe7b16297cf5b3fb17953fc3e353cfc6ebd"
 dependencies = [
  "android-activity",
  "base64 0.22.1",
@@ -2143,7 +2143,7 @@ dependencies = [
 [[package]]
 name = "rinch-clipboard"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5c83eb2af9bad0b9e26f555f4e21819b9b399e88"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Feditor-blur#abdd2fe7b16297cf5b3fb17953fc3e353cfc6ebd"
 dependencies = [
  "arboard",
  "js-sys",
@@ -2156,7 +2156,7 @@ dependencies = [
 [[package]]
 name = "rinch-components"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5c83eb2af9bad0b9e26f555f4e21819b9b399e88"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Feditor-blur#abdd2fe7b16297cf5b3fb17953fc3e353cfc6ebd"
 dependencies = [
  "rinch-core",
  "rinch-macros",
@@ -2168,7 +2168,7 @@ dependencies = [
 [[package]]
 name = "rinch-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5c83eb2af9bad0b9e26f555f4e21819b9b399e88"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Feditor-blur#abdd2fe7b16297cf5b3fb17953fc3e353cfc6ebd"
 dependencies = [
  "thiserror 1.0.69",
  "tracing",
@@ -2178,12 +2178,12 @@ dependencies = [
 [[package]]
 name = "rinch-editable"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5c83eb2af9bad0b9e26f555f4e21819b9b399e88"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Feditor-blur#abdd2fe7b16297cf5b3fb17953fc3e353cfc6ebd"
 
 [[package]]
 name = "rinch-editor-collab"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5c83eb2af9bad0b9e26f555f4e21819b9b399e88"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Feditor-blur#abdd2fe7b16297cf5b3fb17953fc3e353cfc6ebd"
 dependencies = [
  "rinch-editor-core",
  "thiserror 1.0.69",
@@ -2193,7 +2193,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5c83eb2af9bad0b9e26f555f4e21819b9b399e88"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Feditor-blur#abdd2fe7b16297cf5b3fb17953fc3e353cfc6ebd"
 dependencies = [
  "pulldown-cmark",
  "regex",
@@ -2203,7 +2203,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-view"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5c83eb2af9bad0b9e26f555f4e21819b9b399e88"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Feditor-blur#abdd2fe7b16297cf5b3fb17953fc3e353cfc6ebd"
 dependencies = [
  "rinch-core",
  "rinch-editor-collab",
@@ -2213,7 +2213,7 @@ dependencies = [
 [[package]]
 name = "rinch-macros"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5c83eb2af9bad0b9e26f555f4e21819b9b399e88"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Feditor-blur#abdd2fe7b16297cf5b3fb17953fc3e353cfc6ebd"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2223,7 +2223,7 @@ dependencies = [
 [[package]]
 name = "rinch-platform"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5c83eb2af9bad0b9e26f555f4e21819b9b399e88"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Feditor-blur#abdd2fe7b16297cf5b3fb17953fc3e353cfc6ebd"
 dependencies = [
  "web-time",
 ]
@@ -2231,7 +2231,7 @@ dependencies = [
 [[package]]
 name = "rinch-tabler-icons"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5c83eb2af9bad0b9e26f555f4e21819b9b399e88"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Feditor-blur#abdd2fe7b16297cf5b3fb17953fc3e353cfc6ebd"
 dependencies = [
  "heck",
  "rinch-core",
@@ -2243,12 +2243,12 @@ dependencies = [
 [[package]]
 name = "rinch-theme"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5c83eb2af9bad0b9e26f555f4e21819b9b399e88"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Feditor-blur#abdd2fe7b16297cf5b3fb17953fc3e353cfc6ebd"
 
 [[package]]
 name = "rinch-web"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5c83eb2af9bad0b9e26f555f4e21819b9b399e88"
+source = "git+https://github.com/joeleaver/rinch.git?branch=feat%2Feditor-blur#abdd2fe7b16297cf5b3fb17953fc3e353cfc6ebd"
 dependencies = [
  "js-sys",
  "rinch",
