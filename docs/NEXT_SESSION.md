@@ -1,5 +1,25 @@
 # Next session: start here
 
+**2026-10-08: v0.8.0, pictures (wave 1)**, on rinch `main` (5c83eb2): every rinch PR it
+waited on merged overnight (#1429 #1431 #1433 #1435 #1436 image hooks; #1466 the Firefox
+caret; #1472 the modal-focus panic; #1474 rinch CI runs the web tests in Firefox).
+`images`, `images-ui` and `pictures-ui` are merged and retired.
+
+- What a person can do: paste, drop or Edit > "Insert Image..." a picture in any pane;
+  it is a blob beside the store (`putBlob`), shown in every pane and after a restart, on
+  the desktop and, for a plain store, in the browser. Over 20 MiB it is scaled down with
+  a sentence (`pimble-image`). An encrypted store in the browser refuses pictures with a
+  sentence. Pasted HTML keeps no outside image address.
+- Not yet (docs/IMAGES_CONTRACT.md waves 2 to 5): pictures do not replicate (sync link,
+  vault link, shares); a share member is refused `getBlob`; no placeholder for a picture
+  not yet arrived; Markdown/MCP images; importer pictures; search on `alt`.
+- Checked for this release: the full workspace suite, the web tests, the Windows
+  cross-check, and Insert Image in an isolated desktop app (both panes holding the note
+  showed it). A real OS paste and drop were not driven (the agent's debug hook,
+  `PIMBLE_DEBUG_PICTURE`, stands in for them).
+- Firefox: rinch-web's whole browser suite passes in Firefox 157 and Chrome 153;
+  Playwright's Firefox is installed in `~/.cache/ms-playwright`.
+
 **2026-10-07, later: v0.7.1, rinch `main` (431bc67)**, which carries the list-delete fix
 (joeleaver/rinch#1422: a selection whose ends are at different list depths now deletes).
 Branch `rinch-1422` is retired. Open rinch PRs Pimble waits on: #1472 (a modal opening
