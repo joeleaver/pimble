@@ -1,5 +1,55 @@
 # Next session: start here
 
+**2026-10-07, later: v0.7.1, rinch `main` (431bc67)**, which carries the list-delete fix
+(joeleaver/rinch#1422: a selection whose ends are at different list depths now deletes).
+Branch `rinch-1422` is retired. Open rinch PRs Pimble waits on: #1472 (a modal opening
+while a browser editor holds the keyboard panicked the page: File > "New Store..." with a
+note focused), #1466 (Firefox caret on a code block's last line), #1436 (image paste and
+drop in the browser), #1474 (rinch CI runs the web tests in Firefox). rinch's
+`pimble/images` (a4a11f6) carries them; Pimble's `pictures-ui` pins it. The v0.7.0
+Release run built both packages but never started its publish job; the release was
+published by hand from those packages (`gh run download`, `gh release create`).
+
+**2026-10-07: v0.7.0, the split view and a resizable explorer** (Joe asked for both on
+2026-10-06). `ui/panes` and `split-view` are merged into `master`, on rinch `main`
+(51cb7c7).
+
+- **Split view** (docs/SPLIT_VIEW_CONTRACT.md, "As built" notes inside): one to four tiled
+  panes, each with a title strip, its own toolbar and its own editor and collaboration
+  session; "Open in Split View" on a tree row; View > "Split Right", "Split Down", "Close
+  Pane"; the same note in two panes; the layout remembered (`state.json` `panes`,
+  `localStorage` in the browser). Four pane slots and three dividers are drawn once and
+  positioned from the tiling, so an editor is never re-mounted. Verified by the agent on
+  the desktop and in Chromium on the local stack, and by the PM in the app (split, same
+  note in two panes, typing mirrored). Not run: a read-only document in the browser.
+- **The explorer's width** is dragged at its right edge and remembered.
+- **Known gaps:** the toolbar wraps to several rows in a narrow pane; pressing another
+  pane's split or close button takes the keyboard from the editor; View > "Split ..." at
+  four panes answers a sentence instead of being greyed out; closing a store does not
+  empty panes holding its documents. rinch findings to file: `Drag::percent()` hands
+  `on_end` raw pixels; `NodeHandle::bounds_signal` is never fed in the browser; a
+  `RefCell already borrowed` when one editor's `collab_receive` runs inside another's
+  outbound callback (worked around with a `set_timeout(0)` fan-out).
+- **Joe's standing rule (2026-10-06): the browser matches the desktop** for every UI
+  feature, from shared `pimble-app` code.
+
+**In flight on 2026-10-07:**
+
+- **Firefox.** Playwright's Firefox 155 is installed (`~/.cache/ms-playwright`); the runner
+  is `scratchpad/ff/run.mjs` (wasm-bindgen-test-runner in `NO_HEADLESS` mode, a page per
+  test file). At least ten of rinch-web's 62 browser test files fail in Firefox (caret at
+  line ends and empty lines, paste, the right-click menu, read-only, Home/End). An agent
+  is triaging and fixing upstream. joeleaver/rinch#1449 (caretPositionFromPoint fallback)
+  only matters for older Firefox: Firefox 155 has `caretRangeFromPoint`.
+- **Pictures, wave 1.** Storage and RPCs are done on branch `images` (blob store,
+  `putBlob`/`getBlob`/`haveBlobs`, `blob_refs`, `pimble-image` scale-to-fit). rinch pull
+  requests open: #1429 and #1435 (image schemes and reload, desktop and web), #1433 and
+  #1436 (paste and drop), #1431 (collab tests). The integration branch is rinch
+  `pimble/images`; Pimble branch `images-ui` = split view + `images`; an agent is building
+  the app side on `pictures-ui`.
+- **joeleaver/rinch#1422** (the list-delete bug) still waits for Joe's review; branch
+  `rinch-1422` pins it. When it merges: both locks to `main`, a release.
+
 **2026-10-06: v0.6.0, the MCP server, block quotes and tables.** `mcp` is merged into
 `master` (Joe: "let's do all those things"). What ships:
 
