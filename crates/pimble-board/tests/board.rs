@@ -417,6 +417,18 @@ fn pictures_render_from_their_source_and_highlighter_multiplies() {
     // Multiply: yellow keeps red and green, takes blue out.
     let (r, g, b) = at(20, 20);
     assert!(r >= 195 && g >= 95 && b < 10, "{:?}", (r, g, b));
+    // One picture pixel per pixel is a straight copy.
+    let pic = Picture::from_rgba(2, 1, vec![10, 20, 30, 255, 40, 50, 60, 255]).unwrap();
+    let one: HashMap<String, Arc<Picture>> = [("pimble-blob:y".to_string(), Arc::new(pic))].into();
+    let small = Board::standalone();
+    small.create(st).unwrap();
+    let geom = PictureGeom { rect: Rect::new(3.0, 2.0, 2.0, 1.0), src: "pimble-blob:y".into(), px_w: 2, px_h: 1, crop: None };
+    small.add_element(st, NewElement::new(Kind::Picture, Geom::Picture(geom))).unwrap();
+    let px1 = render(&small.snapshot(), &one, &View::new(0.0, 0.0, 1.0), 8, 4, Some(Color::WHITE)).unwrap();
+    let p = px1.pixel(4, 2).unwrap();
+    assert_eq!((p.red(), p.green(), p.blue()), (40, 50, 60));
+    let p = px1.pixel(2, 2).unwrap();
+    assert_eq!((p.red(), p.green(), p.blue()), (255, 255, 255));
     // A missing picture draws its placeholder, not nothing.
     let placeholder = render(&snap, &NoPictures, &View::new(0.0, 0.0, 1.0), 40, 40, Some(Color::WHITE)).unwrap();
     let p = placeholder.pixel(20, 5).unwrap();

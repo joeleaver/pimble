@@ -461,13 +461,12 @@ impl BoardView {
             let oy = ((view.y - cache.origin.y) * cache.zoom).round() as i64;
             copy_rows(&cache.pixmap, ox, oy, &mut self.frame, self.background);
         } else {
-            // A zoom not settled: the cache, scaled.
-            self.frame.fill(tiny_color(self.background, 1.0));
-            let k = self.zoom / cache.zoom;
-            let tx = (cache.origin.x - view.x) * self.zoom;
-            let ty = (cache.origin.y - view.y) * self.zoom;
-            let paint = PixmapPaint { opacity: 1.0, blend_mode: BlendMode::Source, quality: FilterQuality::Nearest };
-            self.frame.draw_pixmap(0, 0, cache.pixmap.as_ref(), &paint, Affine::from_row(k, 0.0, 0.0, k, tx, ty), None);
+            // A zoom not settled: the cache, scaled (nearest, as paint's
+            // view resample does).
+            let k = cache.zoom / self.zoom;
+            let sx0 = (view.x - cache.origin.x) * cache.zoom;
+            let sy0 = (view.y - cache.origin.y) * cache.zoom;
+            resample_nearest(&cache.pixmap, sx0, sy0, k, &mut self.frame, self.background);
         }
     }
 }
@@ -484,6 +483,38 @@ fn stamp(pixmap: &mut Pixmap, view: &View, kind: &Kind, style: &ResolvedStyle, p
         ..Default::default()
     };
     pixmap.stroke_path(&path, &paint, &stroke, view.transform(), None);
+}
+
+/// Fill `dst` from `src` scaled: `dst` pixel (x, y) shows `src` pixel
+/// (`sx0` + x * `k`, `sy0` + y * `k`), nearest; what `src` does not cover is
+/// `background`. A column table and whole-pixel copies: no blending, no
+/// filtering, a frame in a few milliseconds even at 4K.
+fn resample_nearest(src: &Pixmap, sx0: f32, sy0: f32, k: f32, dst: &mut Pixmap, background: Color) {
+    let (sw, sh) = (src.width() as i64, src.height() as i64);
+    let (dw, dh) = (dst.width() as usize, dst.height() as usize);
+    let bg = [background.r, background.g, background.b, 255u8];
+    let columns: Vec<i64> = (0..dw).map(|x| (sx0 + (x as f32 + 0.5) * k).floor() as i64).collect();
+    let s = src.data();
+    let d = dst.data_mut();
+    for y in 0..dh {
+        let sy = (sy0 + (y as f32 + 0.5) * k).floor() as i64;
+        let row = &mut d[y * dw * 4..(y + 1) * dw * 4];
+        if sy < 0 || sy >= sh {
+            for px in row.chunks_exact_mut(4) {
+                px.copy_from_slice(&bg);
+            }
+            continue;
+        }
+        let base = (sy * sw * 4) as usize;
+        for (px, sx) in row.chunks_exact_mut(4).zip(columns.iter()) {
+            if *sx < 0 || *sx >= sw {
+                px.copy_from_slice(&bg);
+            } else {
+                let i = base + (*sx as usize) * 4;
+                px.copy_from_slice(&s[i..i + 4]);
+            }
+        }
+    }
 }
 
 /// Copy `src` into `dst` with `src` pixel (`ox`, `oy`) at `dst` (0, 0),

@@ -28,6 +28,8 @@ pub const MAX_EXTENT_PX: f32 = 8192.0;
 pub struct Picture {
     base: Pixmap,
     levels: OnceLock<Vec<Pixmap>>,
+    /// Every pixel opaque: drawn 1:1 it is a row copy.
+    opaque: bool,
 }
 
 impl std::fmt::Debug for Picture {
@@ -42,16 +44,18 @@ impl Picture {
         if rgba.len() != (width as usize) * (height as usize) * 4 {
             return None;
         }
+        let mut opaque = true;
         for px in rgba.chunks_exact_mut(4) {
             let a = px[3] as u16;
             if a < 255 {
+                opaque = false;
                 px[0] = ((px[0] as u16 * a + 127) / 255) as u8;
                 px[1] = ((px[1] as u16 * a + 127) / 255) as u8;
                 px[2] = ((px[2] as u16 * a + 127) / 255) as u8;
             }
         }
         let base = Pixmap::from_vec(rgba, tiny_skia::IntSize::from_wh(width, height)?)?;
-        Some(Picture { base, levels: OnceLock::new() })
+        Some(Picture { base, levels: OnceLock::new(), opaque })
     }
 
     /// Decode PNG, JPEG, GIF or WebP bytes (a blob's).
@@ -647,6 +651,10 @@ fn draw_picture(pixmap: &mut Pixmap, e: &Element, p: &PictureGeom, pictures: &dy
         && (full.tx - full.tx.round()).abs() < 1e-3
         && (full.ty - full.ty.round()).abs() < 1e-3;
     if exact && p.crop.is_none() && e.opacity >= 1.0 {
+        if picture.opaque && factor == 1.0 {
+            copy_opaque(pixmap, level, full.tx.round() as i64, full.ty.round() as i64);
+            return;
+        }
         let paint = PixmapPaint { opacity: 1.0, blend_mode: BlendMode::SourceOver, quality: FilterQuality::Nearest };
         pixmap.draw_pixmap(full.tx.round() as i32, full.ty.round() as i32, level.as_ref(), &paint, Affine::identity(), None);
         return;
@@ -655,4 +663,25 @@ fn draw_picture(pixmap: &mut Pixmap, e: &Element, p: &PictureGeom, pictures: &dy
     let shader = Pattern::new(level.as_ref(), SpreadMode::Pad, quality, e.opacity, image_ts);
     let paint = Paint { shader, anti_alias: true, ..Paint::default() };
     pixmap.fill_path(&rect_path, &paint, FillRule::Winding, ts, None);
+}
+
+/// An opaque picture drawn one pixel per pixel at (`x`, `y`): rows copied,
+/// clipped to `dst`.
+fn copy_opaque(dst: &mut Pixmap, src: &Pixmap, x: i64, y: i64) {
+    let (dw, dh) = (dst.width() as i64, dst.height() as i64);
+    let (sw, sh) = (src.width() as i64, src.height() as i64);
+    let x0 = x.max(0);
+    let x1 = (x + sw).min(dw);
+    if x1 <= x0 {
+        return;
+    }
+    let s = src.data();
+    let d = dst.data_mut();
+    for dy in y.max(0)..(y + sh).min(dh) {
+        let sy = dy - y;
+        let si = ((sy * sw + (x0 - x)) * 4) as usize;
+        let di = ((dy * dw + x0) * 4) as usize;
+        let n = ((x1 - x0) * 4) as usize;
+        d[di..di + n].copy_from_slice(&s[si..si + n]);
+    }
 }
