@@ -635,6 +635,51 @@ impl NodeDoc {
         .map(|_| ())
     }
 
+    /// The yrs document and its `data` root, for code that keeps a finer
+    /// schema under `data` than JSON (a board, docs/IMAGE_MARKUP_CONTRACT.md
+    /// section 3: `pimble_board::Board::of_node`). What it writes is an
+    /// ordinary update of this document and travels through `applyEdit` like
+    /// every other edit; it must not hold a transaction across calls here.
+    pub fn ydoc(&self) -> &Doc {
+        &self.doc
+    }
+
+    /// The `data` root (see [`NodeDoc::ydoc`]).
+    pub fn data_root(&self) -> MapRef {
+        self.data.clone()
+    }
+
+    /// The text written on this node's boards, for search
+    /// (docs/IMAGE_MARKUP_CONTRACT.md section 1, "Search"): every board
+    /// element with text (text elements, sticky notes, text inside shapes,
+    /// callouts, connector labels, frame names), from the board node's own
+    /// board (`data.board`) and from the boards of marked-up pictures in its
+    /// text (`data.boards.<id>`). One `Field` unit per element, named
+    /// `board.<kind>`, its path `f:board/<element>` or
+    /// `f:boards/<board>/<element>`. Only where text lives is known here;
+    /// the schema itself is pimble-board's.
+    pub fn board_units(&self) -> Vec<IndexUnit> {
+        let txn = self.doc.transact();
+        let mut units = Vec::new();
+        if let Some(Out::YMap(board)) = self.data.get(&txn, BOARD) {
+            board_texts(&txn, &board, "f:board", &mut units);
+        }
+        if let Some(Out::YMap(boards)) = self.data.get(&txn, BOARDS) {
+            let mut ids: Vec<(String, MapRef)> = boards
+                .iter(&txn)
+                .filter_map(|(id, out)| match out {
+                    Out::YMap(map) => Some((id.to_string(), map)),
+                    _ => None,
+                })
+                .collect();
+            ids.sort_by(|a, b| a.0.cmp(&b.0));
+            for (id, board) in ids {
+                board_texts(&txn, &board, &format!("f:boards/{id}"), &mut units);
+            }
+        }
+        units
+    }
+
     // ── Transactions (shared with `Tree`) ────────────────────────────────
 
     /// Run `f` in one write transaction and return its value with the update
@@ -981,6 +1026,33 @@ fn string_value(out: Option<Out>) -> Option<String> {
     match out {
         Some(Out::Any(any)) => String::try_from(any).ok(),
         _ => None,
+    }
+}
+
+// ── Board text, for search (see `NodeDoc::board_units`) ─────────────────
+
+/// A board node's board, under `data`.
+const BOARD: &str = "board";
+/// The boards of marked-up pictures in a node's text, under `data`, by id.
+const BOARDS: &str = "boards";
+
+/// One unit per element of `board` with text, in element id order.
+fn board_texts<T: ReadTxn>(txn: &T, board: &MapRef, prefix: &str, units: &mut Vec<IndexUnit>) {
+    let Some(Out::YMap(elements)) = board.get(txn, "elements") else { return };
+    let mut found: Vec<(String, String, String)> = Vec::new();
+    for (id, out) in elements.iter(txn) {
+        let Out::YMap(element) = out else { continue };
+        let Some(Out::YText(text)) = element.get(txn, "text") else { continue };
+        let text = text.get_string(txn);
+        if text.trim().is_empty() {
+            continue;
+        }
+        let kind = string_value(element.get(txn, "kind")).unwrap_or_default();
+        found.push((id.to_string(), kind, text));
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    for (id, kind, text) in found {
+        units.push(IndexUnit::new(pimble_core::UnitKind::Field(format!("board.{kind}")), format!("{prefix}/{id}"), text));
     }
 }
 
