@@ -4969,6 +4969,7 @@ name = "pimble-app"
 version = "0.8.1"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "crossbeam-channel",
  "js-sys",
  "open",
@@ -4976,6 +4977,7 @@ dependencies = [
  "pimble-core",
  "pimble-crdt",
  "pimble-image",
+ "pimble-import",
  "pimble-rpc",
  "pimble-server",
  "pimble-store",
@@ -4985,6 +4987,7 @@ dependencies = [
  "rinch-web",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -5132,10 +5135,12 @@ version = "0.8.1"
 dependencies = [
  "anyhow",
  "chrono",
+ "miniz_oxide",
  "pimble-core",
  "pimble-crdt",
  "pimble-store",
  "quick-xml 0.37.5",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

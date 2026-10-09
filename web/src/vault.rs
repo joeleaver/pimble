@@ -1242,8 +1242,8 @@ impl VaultClient {
                 Some(self.rename_node(client, store_id, node_id, title).await)
             }
 
-            BackendCommand::SetNodeAppearance { store_id, node_id, icon, color, tags } => {
-                Some(self.set_appearance(client, store_id, node_id, icon, color, tags).await)
+            BackendCommand::SetNodeAppearance { store_id, node_id, icon, color, background, tags } => {
+                Some(self.set_appearance(client, store_id, node_id, icon, color, background, tags).await)
             }
 
             BackendCommand::DeleteNode { store_id, node_id } => {
@@ -1656,6 +1656,7 @@ impl VaultClient {
         node_id: NodeId,
         icon: Option<Option<String>>,
         color: Option<Option<String>>,
+        background: Option<Option<String>>,
         tags: Option<Vec<String>>,
     ) -> BackendEvent {
         let now = now_rfc3339();
@@ -1664,7 +1665,7 @@ impl VaultClient {
                 return BackendEvent::Error { message: "no such encrypted store".into() };
             };
             let mut edit = store.seed_root(&now);
-            match appearance_edit(&mut store.tree, node_id, icon, color, tags, &now) {
+            match appearance_edit(&mut store.tree, node_id, icon, color, background, tags, &now) {
                 Ok(more) => edit.touched.extend(more.touched),
                 Err(e) => return BackendEvent::Error { message: e.to_string() },
             }
@@ -3413,11 +3414,12 @@ fn appearance_edit(
     node_id: NodeId,
     icon: Option<Option<String>>,
     color: Option<Option<String>>,
+    background: Option<Option<String>>,
     tags: Option<Vec<String>>,
     now: &str,
 ) -> pimble_crdt::Result<TreeEdit> {
     let mut edit = TreeEdit::default();
-    for (key, value) in [(custom_keys::ICON, icon), (custom_keys::COLOR, color)] {
+    for (key, value) in [(custom_keys::ICON, icon), (custom_keys::COLOR, color), (custom_keys::BACKGROUND, background)] {
         let Some(value) = value else { continue };
         let more = match value.filter(|s| !s.is_empty()) {
             Some(value) => tree.set_custom(node_id, key, &serde_json::Value::String(value), now)?,

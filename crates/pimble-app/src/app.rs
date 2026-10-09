@@ -17,7 +17,7 @@ use crate::protocol::BackendHandle;
 use crate::editor::{start_editing, stop_editing};
 use crate::panes::PaneId;
 use crate::events::{EVENT_PROCESSOR, process_backend_events};
-use crate::appearance::{display_color, icon_by_name, icons_matching, IconGlyph, COLOR_CHOICES};
+use crate::appearance::{display_color, icon_by_name, icons_matching, row_background, IconGlyph, COLOR_CHOICES, ROW_COLOR_CHOICES};
 use crate::persistence::{load_dark_mode, load_panes, load_sidebar_width, save_dark_mode, save_panes, save_sidebar_width};
 use crate::state::{parse_tree_value, display_label_from_node, mount_is_dimmed, mount_label_suffix, AppStore, SearchState};
 use crate::state::{deleted_row_meta, deleted_row_read_only};
@@ -1294,9 +1294,17 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             } else {
                 node_sig
             };
-            let (custom_icon, node_color) = appearance_sig
-                .map(|sig| sig.with(|n| (n.metadata.icon().and_then(icon_by_name), n.metadata.color().map(String::from))))
-                .unwrap_or((None, None));
+            let (custom_icon, node_color, row_color) = appearance_sig
+                .map(|sig| {
+                    sig.with(|n| {
+                        (
+                            n.metadata.icon().and_then(icon_by_name),
+                            n.metadata.color().map(String::from),
+                            n.metadata.background().map(String::from),
+                        )
+                    })
+                })
+                .unwrap_or((None, None, None));
             let icon = if let Some(custom) = custom_icon {
                 custom
             } else if is_store_root {
@@ -1764,6 +1772,19 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 span {
                     class: "rinch-tree__label",
                     style: "flex: 1; display: inline-flex; align-items: center;",
+
+                    // The row colour: a band across the whole row, the
+                    // indent and chevron included, behind the icon and title
+                    // (the row is `position: relative`, `APP_CSS`).
+                    span {
+                        class: "pimble-row-band",
+                        style: {
+                            move || match &row_color {
+                                Some(hex) => format!("background: {};", row_background(hex, store.dark_mode.get())),
+                                None => "display: none;".to_string(),
+                            }
+                        },
+                    }
 
                     span {
                         class: icon_class,
@@ -2648,9 +2669,13 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             let (s_id, n_id) = store.appearance_modal_node.get()?;
             store.get_node_signal(s_id, n_id)?.with(|n| n.metadata.icon().map(String::from))
         };
-        let send_appearance = move |icon: Option<Option<String>>, color: Option<Option<String>>| {
+        let appearance_node_background = move || -> Option<String> {
+            let (s_id, n_id) = store.appearance_modal_node.get()?;
+            store.get_node_signal(s_id, n_id)?.with(|n| n.metadata.background().map(String::from))
+        };
+        let send_appearance = move |icon: Option<Option<String>>, color: Option<Option<String>>, background: Option<Option<String>>| {
             if let Some((store_id, node_id)) = untracked(|| store.appearance_modal_node.get()) {
-                store.send(BackendCommand::SetNodeAppearance { store_id, node_id, icon, color, tags: None });
+                store.send(BackendCommand::SetNodeAppearance { store_id, node_id, icon, color, background, tags: None });
             }
         };
         let send_tags = move || {
@@ -2660,7 +2685,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     .map(|t| t.trim().to_string())
                     .filter(|t| !t.is_empty())
                     .collect();
-                store.send(BackendCommand::SetNodeAppearance { store_id, node_id, icon: None, color: None, tags: Some(tags) });
+                store.send(BackendCommand::SetNodeAppearance { store_id, node_id, icon: None, color: None, background: None, tags: Some(tags) });
             }
         };
         let swatches: Vec<NodeHandle> = COLOR_CHOICES
@@ -2673,7 +2698,22 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         }},
                         style: format!("background: {hex};"),
                         title: name,
-                        onclick: move || send_appearance(None, Some(Some(hex.to_string()))),
+                        onclick: move || send_appearance(None, Some(Some(hex.to_string())), None),
+                    }
+                }
+            })
+            .collect();
+        let row_swatches: Vec<NodeHandle> = ROW_COLOR_CHOICES
+            .iter()
+            .map(|&(name, hex)| {
+                rsx! {
+                    div {
+                        class: {move || {
+                            if appearance_node_background().as_deref() == Some(hex) { "pimble-swatch pimble-swatch--active" } else { "pimble-swatch" }
+                        }},
+                        style: format!("background: {hex};"),
+                        title: name,
+                        onclick: move || send_appearance(None, None, Some(Some(hex.to_string()))),
                     }
                 }
             })
@@ -2686,17 +2726,31 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 size: "md",
 
                 div {
-                    div { class: "pimble-appearance__label", "Colour" }
+                    div { class: "pimble-appearance__label", "Text" }
                     div {
                         class: "pimble-appearance__row",
                         div {
                             class: {move || {
                                 if appearance_node_color().is_none() { "pimble-swatch pimble-swatch--none pimble-swatch--active" } else { "pimble-swatch pimble-swatch--none" }
                             }},
-                            onclick: move || send_appearance(None, Some(None)),
+                            onclick: move || send_appearance(None, Some(None), None),
                             "None"
                         }
                         {swatches}
+                    }
+                    // The whole row tinted, as Scrivener's full-width binder
+                    // labels are; independent of the text color above.
+                    div { class: "pimble-appearance__label", "Background" }
+                    div {
+                        class: "pimble-appearance__row",
+                        div {
+                            class: {move || {
+                                if appearance_node_background().is_none() { "pimble-swatch pimble-swatch--none pimble-swatch--active" } else { "pimble-swatch pimble-swatch--none" }
+                            }},
+                            onclick: move || send_appearance(None, None, Some(None)),
+                            "None"
+                        }
+                        {row_swatches}
                     }
                     div { class: "pimble-appearance__label", "Icon" }
                     TextInput {
@@ -2711,7 +2765,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             class: {move || {
                                 if appearance_node_icon().is_none() { "pimble-swatch pimble-swatch--none pimble-swatch--active" } else { "pimble-swatch pimble-swatch--none" }
                             }},
-                            onclick: move || send_appearance(Some(None), None),
+                            onclick: move || send_appearance(Some(None), None, None),
                             "Default"
                         }
                         // The curated set, or every Tabler icon matching the
@@ -2723,7 +2777,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                     if appearance_node_icon().as_deref() == Some(icon.name()) { "pimble-icon-choice pimble-icon-choice--active" } else { "pimble-icon-choice" }
                                 }},
                                 title: icon.name(),
-                                onclick: move || send_appearance(Some(Some(icon.name().to_string())), None),
+                                onclick: move || send_appearance(Some(Some(icon.name().to_string())), None, None),
                                 IconGlyph { name: icon.name() }
                             }
                         }
@@ -2812,6 +2866,72 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         disabled: {|| store.new_store_modal_pending.get()},
                         onclick: create_hosted_store,
                         "Create"
+                    }
+                }
+            }
+        };
+
+        // ── File > Import: where it goes ────────────────────────────────
+        // docs/IMPORT_CONTRACT.md. The files are already read; this only
+        // asks for the place: under the selected node (when there is one
+        // this device may write), or a new store made for it.
+        let import_modal = rsx! {
+            Modal {
+                opened_fn: move || store.import_modal_open.get(),
+                onclose: move || crate::import::cancel(store),
+                title: "Import",
+                size: "sm",
+
+                div {
+                    style: "display: flex; flex-direction: column; gap: 10px;",
+
+                    div {
+                        style: "font-size: 13px;",
+                        {|| store.import_modal_label.get()}
+                    }
+
+                    div {
+                        style: {
+                            move || if store.import_modal_under.get().is_some() { "display: flex; flex-direction: column; gap: 6px;" } else { "display: none;" }
+                        },
+                        Button {
+                            variant: "filled",
+                            size: "sm",
+                            onclick: move || crate::import::under_selection(store),
+                            {|| match store.import_modal_under.get() {
+                                Some((_, _, title)) => format!("Import under \"{title}\""),
+                                None => String::new(),
+                            }}
+                        }
+                        div {
+                            style: "font-size: 12px; color: var(--rinch-color-dimmed); text-align: center;",
+                            "or"
+                        }
+                    }
+
+                    TextInput {
+                        label: "New store",
+                        value_fn: move || store.import_modal_store_name.get(),
+                        oninput: move |val: String| store.import_modal_store_name.set(val),
+                        onsubmit: move || crate::import::into_new_store(store),
+                    }
+
+                    div {
+                        style: {
+                            move || if store.import_modal_error.get().is_empty() {
+                                "display: none;"
+                            } else {
+                                "color: var(--rinch-color-red-6); font-size: 12px;"
+                            }
+                        },
+                        {|| store.import_modal_error.get()}
+                    }
+
+                    Button {
+                        variant: "default",
+                        size: "sm",
+                        onclick: move || crate::import::into_new_store(store),
+                        "Import into a new store"
                     }
                 }
             }
@@ -4078,6 +4198,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {remove_replica_modal}
                 {deleted_modal}
                 {new_store_modal}
+                {import_modal}
                 {mount_picker_modal}
                 {appearance_modal}
                 {account_modal}
@@ -4103,6 +4224,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {remove_replica_modal}
                 {deleted_modal}
                 {new_store_modal}
+                {import_modal}
                 {mount_picker_modal}
                 {appearance_modal}
                 {account_modal}

@@ -209,6 +209,9 @@ pub mod custom_keys {
     pub const ICON: &str = "icon";
     /// A CSS colour (`#rrggbb`) for the node's icon and label in the tree.
     pub const COLOR: &str = "color";
+    /// A CSS colour (`#rrggbb`) the node's whole row in the tree is tinted with
+    /// (Scrivener's full-width binder labels). Independent of [`COLOR`].
+    pub const BACKGROUND: &str = "background";
     /// A [`super::ShareMarker`]: this node is a share's root (docs/NODE_DOCUMENT_CONTRACT.md).
     pub const SHARE: &str = "share";
 }
@@ -317,6 +320,23 @@ impl NodeMetadata {
             }
             None => {
                 self.custom.remove(custom_keys::SHARE);
+            }
+        }
+    }
+
+    /// The row colour, if one is set (see [`custom_keys::BACKGROUND`]).
+    pub fn background(&self) -> Option<&str> {
+        self.custom.get(custom_keys::BACKGROUND).and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+    }
+
+    /// Set or clear the row colour.
+    pub fn set_background(&mut self, color: Option<String>) {
+        match color.filter(|s| !s.is_empty()) {
+            Some(color) => {
+                self.custom.insert(custom_keys::BACKGROUND.to_string(), serde_json::Value::String(color));
+            }
+            None => {
+                self.custom.remove(custom_keys::BACKGROUND);
             }
         }
     }

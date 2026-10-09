@@ -817,6 +817,18 @@ pub struct AppStore {
     /// so its outcome lands in the modal rather than the status bar.
     pub new_store_modal_pending: Signal<bool>,
 
+    // File > Import (docs/IMPORT_CONTRACT.md). The picked files wait in
+    // `crate::import` while the modal asks where they go.
+    pub import_modal_open: Signal<bool>,
+    /// What was picked, as the modal names it ("Novel.scriv, a Scrivener project").
+    pub import_modal_label: Signal<String>,
+    /// The node an import would land under, and its title for the button;
+    /// `None` when nothing writable is selected.
+    pub import_modal_under: Signal<Option<(StoreId, NodeId, String)>>,
+    /// The name a new store made for the import gets.
+    pub import_modal_store_name: Signal<String>,
+    pub import_modal_error: Signal<String>,
+
     // "Remove Replica..." confirmation modal (store root context menu,
     // docs/history/HARDENING_CONTRACT.md "B: app"). `Some(store_id)` is the replica
     // the modal is open for; `None` means closed.
@@ -1087,6 +1099,11 @@ impl AppStore {
             new_store_modal_name: Signal::new(String::new()),
             new_store_modal_error: Signal::new(String::new()),
             new_store_modal_pending: Signal::new(false),
+            import_modal_open: Signal::new(false),
+            import_modal_label: Signal::new(String::new()),
+            import_modal_under: Signal::new(None),
+            import_modal_store_name: Signal::new(String::new()),
+            import_modal_error: Signal::new(String::new()),
             remove_replica_modal_store: Signal::new(None),
             remove_replica_modal_error: Signal::new(String::new()),
             remove_replica_modal_pending: Signal::new(false),
@@ -1989,7 +2006,7 @@ impl AppStore {
     }
 
     /// Everything a node's row snapshots from the node itself at render time:
-    /// its custom icon and colour, and whether it is shared. Part of the row's
+    /// its custom icon, colour and row colour, and whether it is shared. Part of the row's
     /// `TreeNodeData` label so a change re-renders the row (rinch #714), and
     /// nothing reads it back.
     fn row_snapshot(&self, store_id: StoreId, node_id: NodeId) -> String {
@@ -1998,9 +2015,10 @@ impl AppStore {
                 .map(|sig| {
                     sig.with(|n| {
                         format!(
-                            "{}|{}|{}",
+                            "{}|{}|{}|{}",
                             n.metadata.icon().unwrap_or(""),
                             n.metadata.color().unwrap_or(""),
+                            n.metadata.background().unwrap_or(""),
                             if n.metadata.share().is_some() { "shared" } else { "" },
                         )
                     })

@@ -298,7 +298,10 @@ render time, so the row's `TreeNodeData` label carries them (with the paste flag
 `NodeLoaded` bumps the tree when they change. `display_color` lifts a dark stored colour
 on the dark theme and caps a light one on the light theme, at render time and reactively
 on `AppStore::dark_mode`; the stored value is never altered. "Appearance..." opens the
-picker (every click applies at once; the tags field applies on Enter or Done). Tags are
+picker (every click applies at once; the tags field applies on Enter or Done). A background color
+(`custom_keys::BACKGROUND`, "Background" in the picker beside "Text", docs/IMPORT_CONTRACT.md "Background colors")
+tints the whole row behind its text, a band the label draws over the
+`position: relative` row. Tags are
 not shown in the tree. The Scrivener importer maps a binder item's label to colour plus a
 tag with the label's name, and its `IconFileName` to an icon where one matches. View >
 "Toggle Dark Mode" switches the theme at runtime (`rinch::update_theme`, the editor's

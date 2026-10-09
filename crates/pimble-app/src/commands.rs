@@ -65,6 +65,12 @@ pub async fn process_command(
             }
         }
 
+        // Each backend's loop answers an import itself, as a run of the
+        // commands here (`crate::import`); it never reaches this match.
+        BackendCommand::Import { .. } => Some(BackendEvent::ImportFailed {
+            message: "This backend cannot import.".into(),
+        }),
+
         BackendCommand::OpenStore { path } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
@@ -151,7 +157,7 @@ pub async fn process_command(
             None
         }
 
-        BackendCommand::SetNodeAppearance { store_id, node_id, icon, color, tags } => {
+        BackendCommand::SetNodeAppearance { store_id, node_id, icon, color, background, tags } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
@@ -162,6 +168,9 @@ pub async fn process_command(
                     }
                     if let Some(color) = color {
                         node.metadata.set_color(color);
+                    }
+                    if let Some(background) = background {
+                        node.metadata.set_background(background);
                     }
                     if let Some(tags) = tags {
                         node.metadata.tags = tags;

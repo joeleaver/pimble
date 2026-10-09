@@ -1,4 +1,4 @@
-//! The tree's per-node appearance: a custom icon and a colour, stored in the node's
+//! The tree's per-node appearance: a custom icon and a color, stored in the node's
 //! metadata (`pimble_core::custom_keys::ICON` / `COLOR`) so they replicate with the
 //! store and any client can render them.
 //!
@@ -85,7 +85,7 @@ pub const ICON_CHOICES: &[TablerIcon] = &[
     TablerIcon::Link,
 ];
 
-/// The colours the picker offers: a display name and its CSS value. Any `#rrggbb` is
+/// The colors the picker offers: a display name and its CSS value. Any `#rrggbb` is
 /// accepted in metadata (an import may bring its own); these are the ones offered.
 pub const COLOR_CHOICES: &[(&str, &str)] = &[
     ("Red", "#e5484d"),
@@ -98,6 +98,22 @@ pub const COLOR_CHOICES: &[(&str, &str)] = &[
     ("Pink", "#e93d82"),
     ("Brown", "#ad7f58"),
     ("Grey", "#8b8d98"),
+];
+
+/// The row colors the picker offers. Soft ones, as Scrivener's binder labels
+/// usually are: a row is tinted behind its text, which stays the theme's
+/// color. Any `#rrggbb` is accepted, as for [`COLOR_CHOICES`].
+pub const ROW_COLOR_CHOICES: &[(&str, &str)] = &[
+    ("Red", "#ffd6d2"),
+    ("Orange", "#ffdcb8"),
+    ("Yellow", "#fff3a8"),
+    ("Green", "#a2ffb5"),
+    ("Teal", "#b3f0e6"),
+    ("Blue", "#b0d7ff"),
+    ("Indigo", "#cfc8ff"),
+    ("Purple", "#dfb7ff"),
+    ("Pink", "#ffc8e0"),
+    ("Grey", "#d9dae0"),
 ];
 
 /// The icon stored under `name`: one of the picker's, or any icon in the Tabler set
@@ -153,7 +169,7 @@ pub fn IconGlyph(name: String) -> NodeHandle {
     }
 }
 
-/// The colour to draw `hex` with on the current theme. Stored colours are kept as
+/// The color to draw `hex` with on the current theme. Stored colors are kept as
 /// given (an import brings Scrivener's, which are made for light backgrounds), but
 /// text and icons drawn in a dark navy on the dark theme are unreadable, so in dark
 /// mode the lightness is raised to a floor; in light mode it is capped. Anything
@@ -168,6 +184,21 @@ pub fn display_color(hex: &str, dark_mode: bool) -> String {
     }
     let (r, g, b) = hsl_to_rgb(h, s, adjusted);
     format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+/// The CSS background for a row tinted `hex` on the current theme: the stored
+/// color at an opacity that keeps the row's text readable. A light theme
+/// shows it nearly as given (Scrivener's pastels are made for one); a dark
+/// theme lets a little of it through, so a pastel reads as a tint of the dark
+/// row rather than a light bar under light text. A dark stored color is
+/// lifted first, as [`display_color`] lifts text. Anything that is not
+/// `#rrggbb` is passed through untouched.
+pub fn row_background(hex: &str, dark_mode: bool) -> String {
+    let Some((r, g, b)) = parse_hex(hex) else { return hex.to_string() };
+    let (h, s, l) = rgb_to_hsl(r, g, b);
+    let (l, alpha) = if dark_mode { (l.max(0.55), 0.28) } else { (l.max(0.72), 0.85) };
+    let (r, g, b) = hsl_to_rgb(h, s, l);
+    format!("rgba({r}, {g}, {b}, {alpha})")
 }
 
 fn parse_hex(hex: &str) -> Option<(u8, u8, u8)> {
@@ -227,13 +258,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_row_is_a_translucent_tint_and_a_dark_one_is_lifted() {
+        assert_eq!(row_background("#b0d7ff", false), "rgba(176, 215, 255, 0.85)");
+        assert!(row_background("#b0d7ff", true).ends_with(", 0.28)"));
+        // The navy "TOP LEVEL TOPIC" label is lifted to a light tint on a light theme.
+        let shown = row_background("#2317be", false);
+        let rgb: Vec<u8> = shown.trim_start_matches("rgba(").split(", ").take(3).map(|v| v.parse().unwrap()).collect();
+        let (_, _, l) = rgb_to_hsl(rgb[0], rgb[1], rgb[2]);
+        assert!(l >= 0.7, "{shown}");
+        assert_eq!(row_background("red", true), "red");
+    }
+
+    #[test]
     fn dark_mode_lifts_a_navy_label_to_something_readable() {
         // Scrivener's "TOP LEVEL TOPIC" label: 0.137 0.090 0.745.
         let shown = display_color("#2317be", true);
         let (r, g, b) = parse_hex(&shown).unwrap();
         let (_, _, l) = rgb_to_hsl(r, g, b);
         assert!(l >= 0.6, "lightness {l} for {shown}");
-        // Already-light colours are left alone.
+        // Already-light colors are left alone.
         assert_eq!(display_color("#f5e6b3", true), "#f5e6b3");
         // Non-hex passes through.
         assert_eq!(display_color("rebeccapurple", true), "rebeccapurple");

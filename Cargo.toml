@@ -101,7 +101,7 @@ pimble-rpc = { path = "crates/pimble-rpc" }
 pimble-server = { path = "crates/pimble-server" }
 pimble-client = { path = "crates/pimble-client" }
 pimble-plugins = { path = "crates/pimble-plugins" }
-pimble-import = { path = "crates/pimble-import" }
+pimble-import = { path = "crates/pimble-import", default-features = false }
 pimble-image = { path = "crates/pimble-image" }
 
 # rinch's own patches, repeated here because a dependency's `[patch]` does not reach

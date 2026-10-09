@@ -50,6 +50,8 @@ pub enum BackendCommand {
         node_id: NodeId,
         icon: Option<Option<String>>,
         color: Option<Option<String>>,
+        /// The row colour (`custom_keys::BACKGROUND`), the same way.
+        background: Option<Option<String>>,
         /// `Some(tags)` replaces the node's tags.
         tags: Option<Vec<String>>,
     },
@@ -76,6 +78,19 @@ pub enum BackendCommand {
     /// The nodes above `node_id`, so the tree can open down to it (a followed
     /// link's target, docs/LINKS_CONTRACT.md). Answers `AncestorsLoaded`.
     GetAncestors { store_id: StoreId, node_id: NodeId },
+
+    /// Parse picked files and write what they hold under `parent_id` (the
+    /// store's root when `None`) as new nodes, through the same commands the
+    /// app writes with, so an import is an ordinary edit in any store
+    /// (docs/IMPORT_CONTRACT.md). Answers `Imported`, or `ImportFailed`.
+    Import {
+        store_id: StoreId,
+        parent_id: Option<NodeId>,
+        format: pimble_import::Format,
+        /// What was picked: a file name, or a `.scriv` directory's.
+        name: String,
+        files: pimble_import::Files,
+    },
 
     // Mount operations
     CreateMount {
@@ -393,7 +408,14 @@ pub enum BackendEvent {
     /// A `CreateHostedStore` succeeded. Carries only the name, because the
     /// store itself arrives the ordinary way: the backend mints a token that
     /// carries the new grant and reconnects, and `StoresListed` brings it in.
-    HostedStoreCreated { name: String },
+    HostedStoreCreated { name: String, store_id: Option<StoreId> },
+
+    /// An `Import` finished: `node_id` is the top node it made under
+    /// `parent_id`, and `count` how many nodes it made in all.
+    Imported { store_id: StoreId, parent_id: Option<NodeId>, node_id: NodeId, title: String, count: usize },
+    /// An `Import` stopped, with a sentence that says why (and how much of it
+    /// was written before it did).
+    ImportFailed { message: String },
 
     // Pimble Cloud account (docs/DESKTOP_ACCOUNT_CONTRACT.md).
     /// The answer to `CloudStatus`, `CloudSignIn` (`signed_in: true`) and
