@@ -4999,6 +4999,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pimble-board"
+version = "0.9.0"
+dependencies = [
+ "image",
+ "pimble-crdt",
+ "thiserror 2.0.17",
+ "tiny-skia",
+ "ttf-parser",
+ "uuid",
+ "yrs",
+]
+
+[[package]]
 name = "pimble-cli"
 version = "0.9.0"
 dependencies = [

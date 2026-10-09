@@ -1,0 +1,24 @@
+[package]
+name = "pimble-board"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Boards (docs/IMAGE_MARKUP_CONTRACT.md): the co-edited board document in a node's `data` root, and its renderer and raster cache. No UI. Pure Rust, native and wasm32."
+
+[dependencies]
+pimble-crdt = { workspace = true }
+yrs = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+# Rendering: pure Rust, runs in wasm. tiny-skia without its PNG codec (pictures are
+# decoded by `image`, the same build pimble-image uses).
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+# Glyph outlines from the one bundled font (fonts/NotoSans-Regular.ttf, SIL OFL 1.1,
+# fonts/OFL.txt), filled as tiny-skia paths so board text transforms like any shape.
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+
+# uuid v4 needs a randomness backend in the browser; the native build has one.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+uuid = { workspace = true, features = ["js"] }
