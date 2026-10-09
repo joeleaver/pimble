@@ -247,6 +247,9 @@ fn register_opened_store(store: AppStore, tree_state: UseTreeReturn, opened_stor
     // Subscribe to store changes for real-time updates
     store.send(BackendCommand::SubscribeStoreChanges { store_id });
 
+    // A store made for an import is open: the import goes into it.
+    crate::import::store_opened(store, store_id, roots.first().copied());
+
     restore_pane_documents(store, store_id);
 
     // Sync status (docs/SYNC_CONTRACT.md "B: app side"): a placeholder
@@ -585,6 +588,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     // this modal existed.
                     store.deleted_modal_pending.set(false);
                     store.deleted_modal_error.set(message.clone());
+                } else if crate::import::store_failed() {
+                    // The store an import was waiting for was not made.
+                    show_notice(store, format!("The store for the import could not be made: {message}"));
                 } else if let Some(sentence) = refusal_sentence(message) {
                     // The server refused the command; the connection is fine.
                     show_notice(store, sentence.to_string());
@@ -649,6 +655,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
 
             BackendEvent::StoreCreated { store_id, root_node_id } => {
                 tracing::info!("Store created: {:?} with root {:?}", store_id, root_node_id);
+                crate::import::store_created(*store_id);
                 let pending = store.pending_create_path.get();
                 if let Some(path) = pending {
                     store.pending_create_path.set(None);
@@ -778,6 +785,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 let shared = node.metadata.share().is_some();
                 let has_row_data = node.metadata.icon().is_some()
                     || node.metadata.color().is_some()
+                    || node.metadata.background().is_some()
                     || shared
                     || !node.access.allows_write();
                 let row_data_changed = untracked(|| {
@@ -786,6 +794,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                             sig.with(|cached| {
                                 cached.metadata.icon() != node.metadata.icon()
                                     || cached.metadata.color() != node.metadata.color()
+                                    || cached.metadata.background() != node.metadata.background()
                                     || cached.metadata.share().is_some() != shared
                                     || cached.access != node.access
                                     // A row not opened yet takes its chevron
@@ -1344,8 +1353,11 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 }
             }
 
-            BackendEvent::HostedStoreCreated { name } => {
+            BackendEvent::HostedStoreCreated { name, store_id } => {
                 tracing::info!("Hosted store created: {}", name);
+                if let Some(store_id) = store_id {
+                    crate::import::store_created(*store_id);
+                }
                 // The store itself arrives through `StoresListed`, once the
                 // backend has a token carrying the new grant. Nothing to do
                 // here but close the modal.
@@ -1353,6 +1365,30 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 store.new_store_modal_open.set(false);
                 store.new_store_modal_name.set(String::new());
                 store.new_store_modal_error.set(String::new());
+            }
+
+            BackendEvent::Imported { store_id, parent_id, node_id, title, count } => {
+                tracing::info!("Imported {title} as {node_id:?} ({count} nodes)");
+                let notes = if *count == 1 { "1 note".to_string() } else { format!("{count} notes") };
+                show_notice(store, format!("Imported \"{title}\" ({notes})."));
+                // The parent's list has a new entry: fetch it, and open the
+                // parent so the import is in view.
+                let root = store.root_node_id(*store_id);
+                if let Some(parent) = parent_id.or(root) {
+                    store.expanded.update(|e| { e.insert((*store_id, parent)); });
+                    // A root's children are its store row's.
+                    if Some(parent) == root {
+                        tree_state.controller.expand(&format!("store_{store_id}"));
+                    } else {
+                        tree_state.controller.expand(&format!("node_{store_id}_{parent}"));
+                    }
+                    store.send(BackendCommand::GetChildren { store_id: *store_id, node_id: parent });
+                }
+            }
+
+            BackendEvent::ImportFailed { message } => {
+                tracing::warn!("Import failed: {message}");
+                show_notice(store, message.clone());
             }
 
             BackendEvent::ReplicaRemoved { store_id } => {

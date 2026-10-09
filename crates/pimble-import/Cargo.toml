@@ -4,17 +4,26 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Import external formats (Scrivener, etc.) into Pimble stores"
+description = "Import external formats (Scrivener, RTF, Word) into Pimble"
+
+[features]
+default = ["store"]
+# Writing an import into a `LocalStore` on disk (the CLI's `import-scrivener`).
+# Without it the crate only parses, and builds for the browser.
+store = ["dep:pimble-store", "dep:tokio"]
 
 [dependencies]
 pimble-core = { workspace = true }
 pimble-crdt = { workspace = true }
-pimble-store = { workspace = true }
+pimble-store = { workspace = true, optional = true }
 quick-xml = { version = "0.37", features = ["serialize"] }
-tokio = { workspace = true }
+miniz_oxide = "0.8"
+tokio = { workspace = true, optional = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+serde_json = { workspace = true }
+tokio = { workspace = true }

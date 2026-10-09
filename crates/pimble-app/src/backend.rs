@@ -157,7 +157,15 @@ async fn backend_loop(
             }
         }
 
-        let event = process_command(&mut client, cmd, &event_tx, &signal_arc, &client_id).await;
+        // An import is many commands, each answered as the UI's own would be
+        // (docs/IMPORT_CONTRACT.md).
+        let event = match cmd {
+            BackendCommand::Import { store_id, parent_id, format, name, files } => {
+                let mut runner = Desktop { client: &mut client, event_tx: &event_tx, signal_ui: &signal_arc, client_id: &client_id };
+                Some(crate::import::import(&mut runner, store_id, parent_id, format, &name, &files).await)
+            }
+            cmd => process_command(&mut client, cmd, &event_tx, &signal_arc, &client_id).await,
+        };
 
         if let Some(ref event) = event {
             // A call that failed because the connection died under it: the
@@ -184,4 +192,94 @@ async fn backend_loop(
 
     // Cleanup: only stop the server if we own it
     shut_down(&mut owned_server).await;
+}
+
+/// `process_command`, as `crate::import` asks it.
+struct Desktop<'a> {
+    client: &'a mut Option<std::sync::Arc<pimble_client::PimbleClient>>,
+    event_tx: &'a crossbeam_channel::Sender<BackendEvent>,
+    signal_ui: &'a std::sync::Arc<dyn Fn() + Send + Sync>,
+    client_id: &'a str,
+}
+
+impl crate::import::Runner for Desktop<'_> {
+    async fn run(&mut self, cmd: BackendCommand) -> Option<BackendEvent> {
+        process_command(self.client, cmd, self.event_tx, self.signal_ui, self.client_id).await
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+    use pimble_import::{Files, Format};
+    use pimble_server::{PimbleServer, ServerConfig};
+
+    /// File > Import end to end on the desktop's own path: a real server, the
+    /// runner over `process_command`, an RTF file and a Scrivener project
+    /// written under a node of an open store.
+    #[tokio::test]
+    async fn imports_land_under_the_chosen_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = PimbleServer::with_config(ServerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            keystore_path: Some(dir.path().join("keys.json")),
+            credentials_path: Some(dir.path().join("credentials.json")),
+            replicas_dir: Some(dir.path().join("replicas")),
+            ..Default::default()
+        });
+        server.start().await.unwrap();
+        let c = std::sync::Arc::new(PimbleClient::connect(format!("http://{}", server.addr())).await.unwrap());
+        let (store_id, root) = c.create_store(dir.path().join("t.pimble"), "T").await.unwrap();
+        let parent = c.create_node(store_id, Some(root), "document", "Inbox").await.unwrap();
+
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+        let signal: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(|| {});
+        let mut client = Some(c.clone());
+        let mut runner = Desktop { client: &mut client, event_tx: &event_tx, signal_ui: &signal, client_id: "test" };
+
+        let rtf = Files::from([("Letter.rtf".to_string(), br"{\rtf1\ansi Dear {\b Sam},\par}".to_vec())]);
+        let event = crate::import::import(&mut runner, store_id, Some(parent), Format::Rtf, "Letter.rtf", &rtf).await;
+        let BackendEvent::Imported { node_id, count: 1, .. } = event else { panic!("{event:?}") };
+        let letter = c.get_node(store_id, node_id).await.unwrap();
+        assert_eq!(letter.metadata.title, "Letter");
+        assert_eq!(letter.parent_id, Some(parent));
+        assert_eq!(pimble_crdt::NodeDoc::text_of(&letter.content).trim(), "Dear Sam,");
+
+        let scrivx = r#"<ScrivenerProject><Binder>
+            <BinderItem UUID="A" Type="DraftFolder"><Title>Draft</Title>
+              <MetaData><LabelID>1</LabelID></MetaData>
+              <Children>
+                <BinderItem UUID="B" Type="Text"><Title>One</Title></BinderItem>
+                <BinderItem UUID="C" Type="Text"><Title>Two</Title></BinderItem>
+              </Children>
+            </BinderItem>
+          </Binder>
+          <LabelSettings><Labels><Label ID="1" Color="1 0 0">Hot</Label></Labels></LabelSettings>
+        </ScrivenerProject>"#;
+        let scriv = Files::from([
+            ("Novel.scrivx".to_string(), scrivx.as_bytes().to_vec()),
+            ("Files/Data/B/content.rtf".to_string(), br"{\rtf1\ansi First.\par}".to_vec()),
+        ]);
+        let event = crate::import::import(&mut runner, store_id, Some(parent), Format::Scrivener, "Novel.scriv", &scriv).await;
+        let BackendEvent::Imported { node_id: novel, count: 4, title, .. } = event else { panic!("{event:?}") };
+        assert_eq!(title, "Novel");
+
+        let (_, under_parent) = c.get_children(store_id, parent).await.unwrap();
+        assert_eq!(under_parent.iter().map(|n| n.metadata.title.as_str()).collect::<Vec<_>>(), ["Letter", "Novel"]);
+        let (_, binder) = c.get_children(store_id, novel).await.unwrap();
+        let draft = &binder[0];
+        assert_eq!(draft.node_type, "folder");
+        assert_eq!(draft.metadata.color(), Some("#ff0000"));
+        assert_eq!(draft.metadata.tags, ["Hot"]);
+        let (_, chapters) = c.get_children(store_id, draft.id).await.unwrap();
+        assert_eq!(chapters.iter().map(|n| n.metadata.title.as_str()).collect::<Vec<_>>(), ["One", "Two"]);
+        let one = c.get_node(store_id, chapters[0].id).await.unwrap();
+        assert_eq!(pimble_crdt::NodeDoc::text_of(&one.content).trim(), "First.");
+
+        // Something that is not what it says is refused before anything is made.
+        let bad = Files::from([("x.rtf".to_string(), b"hello".to_vec())]);
+        let event = crate::import::import(&mut runner, store_id, Some(parent), Format::Rtf, "x.rtf", &bad).await;
+        assert!(matches!(event, BackendEvent::ImportFailed { .. }), "{event:?}");
+        assert_eq!(c.get_children(store_id, parent).await.unwrap().1.len(), 2);
+    }
 }

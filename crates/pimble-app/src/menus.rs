@@ -88,6 +88,19 @@ fn file_entries(store: AppStore) -> Vec<MenuEntry> {
         entries.push(MenuEntry::item("Add Remote Store...", "", move || {
             crate::app::open_connect_modal(store, None)
         }));
+    }
+
+    // docs/IMPORT_CONTRACT.md: pick, then choose where it goes (under the
+    // selected node, or a new store). Both targets.
+    entries.push(MenuEntry::Separator);
+    for format in crate::import::FORMATS {
+        entries.push(MenuEntry::item(crate::import::menu_label(format), "", move || {
+            crate::import::start(store, format)
+        }));
+    }
+
+    #[cfg(feature = "native")]
+    {
         entries.push(MenuEntry::Separator);
         entries.push(MenuEntry::item("Close Store", "", move || {
             if let Some((store_id, _)) = store.selected_store_and_node() {

@@ -115,7 +115,7 @@ fn strict(schema: &Schema, md: &str) -> Result<Node> {
             line,
             match construct {
                 Construct::InlineHtml | Construct::HtmlBlock => {
-                    "HTML other than the tags for underline, highlight, colour, sub/superscript, line breaks and tables"
+                    "HTML other than the tags for underline, highlight, color, sub/superscript, line breaks and tables"
                 }
                 Construct::UnmatchedTag => "an HTML tag without its partner",
                 Construct::Footnote => "a footnote",

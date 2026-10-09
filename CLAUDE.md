@@ -271,7 +271,9 @@ still over the old one. `open_node` opens in the focused pane,
 `open_node_in` in a named one ("Open in Split View", a link followed from a pane, which
 `AppStore::link_from` carries to `LinkOpen.pane`). There is ONE toolbar, above the panes, for
 the focused pane (`toolbar.rs`: `TARGET` follows `focused_pane`; dimmed while that pane has
-no document or a read-only one; Joe, 2026-10-08).
+no document or a read-only one; Joe, 2026-10-08). The keyboard follows the pane focus
+(`editor::give_keyboard_to`: the focused pane's editor when it holds a document, no editor
+when it holds none; rinch `EditorHandle::blur`).
 The layout is `state.json`'s `panes` (`localStorage` `pimble.panes` in the browser), saved
 on every change and at the end of a divider drag; at start the tiling comes back at once
 and each pane's document when its store opens and `resolveLink` says it is live
@@ -296,7 +298,10 @@ render time, so the row's `TreeNodeData` label carries them (with the paste flag
 `NodeLoaded` bumps the tree when they change. `display_color` lifts a dark stored colour
 on the dark theme and caps a light one on the light theme, at render time and reactively
 on `AppStore::dark_mode`; the stored value is never altered. "Appearance..." opens the
-picker (every click applies at once; the tags field applies on Enter or Done). Tags are
+picker (every click applies at once; the tags field applies on Enter or Done). A background color
+(`custom_keys::BACKGROUND`, "Background" in the picker beside "Text", docs/IMPORT_CONTRACT.md "Background colors")
+tints the whole row behind its text, a band the label draws over the
+`position: relative` row. Tags are
 not shown in the tree. The Scrivener importer maps a binder item's label to colour plus a
 tag with the label's name, and its `IconFileName` to an icon where one matches. View >
 "Toggle Dark Mode" switches the theme at runtime (`rinch::update_theme`, the editor's

@@ -3,7 +3,7 @@
 //! Two passes. The tokenizer turns the bytes into groups, control words and characters
 //! (decoding `\'xx` as Windows-1252 and `\uN` as Unicode with its fallback skipped).
 //! The interpreter walks the tokens with a stack of group-scoped formatting states,
-//! reads the font, colour, stylesheet and list tables, and emits one [`Para`] per
+//! reads the font, color, stylesheet and list tables, and emits one [`Para`] per
 //! `\par` with its runs and paragraph properties. [`paras_to_blocks`] then groups list
 //! paragraphs into nested [`Block::BulletList`]/[`Block::OrderedList`]s, turns styled
 //! or bold-and-larger paragraphs into headings, and produces the [`Block`]s a
@@ -11,10 +11,17 @@
 //!
 //! A table (`\cell`, `\row`) is a [`Block::Table`], each cell holding its paragraphs.
 //!
+//! What people type to stand in for formatting is read as that formatting: a line
+//! of `=====` or `* * *` is a horizontal rule, `===== Title =====` a heading, and a
+//! paragraph starting `• ` or `- ` a bullet. A bold or italic face (`Calibri-Bold`)
+//! is bold or italic, a line break (`\line`) is a hard break, and colors no one
+//! chose (near-black text, white or black highlights from pasted web pages) are
+//! left for the theme.
+//!
 //! Everything the content model cannot hold is reduced rather than dropped silently:
-//! a line break becomes a paragraph break, a picture is skipped, a table's merged
-//! cells and header rows read as plain cells, and Scrivener's inline placeholder
-//! tags (`<$Scr_Ps::0>`, `<!$Scr_H::4>`) are stripped from the text.
+//! a picture is skipped, a table's merged cells and header rows read as plain cells,
+//! and Scrivener's inline placeholder tags (`<$Scr_Ps::0>`, `<!$Scr_H::4>`) are
+//! stripped from the text.
 
 use std::collections::HashMap;
 
@@ -115,9 +122,9 @@ struct CharFmt {
     strike: bool,
     superscript: bool,
     subscript: bool,
-    /// Index into the colour table; `None` or `Some(0)` is the automatic colour.
+    /// Index into the color table; `None` or `Some(0)` is the automatic color.
     color: Option<usize>,
-    /// Index into the colour table, for `\highlightN` / `\cbN`.
+    /// Index into the color table, for `\highlightN` / `\cbN`.
     highlight: Option<usize>,
     /// Index into the font table.
     font: Option<usize>,
@@ -172,7 +179,7 @@ struct Group {
 /// One paragraph as the interpreter emitted it, before list/heading grouping.
 #[derive(Debug, Clone)]
 struct Para {
-    runs: Vec<Run>,
+    runs: Vec<Inline>,
     fmt: ParaFmt,
     /// Whether every run with text is bold (a heading candidate).
     all_bold: bool,
@@ -199,7 +206,7 @@ struct ListDef {
 #[derive(Debug, Default)]
 struct Tables {
     fonts: HashMap<usize, String>,
-    /// `#rrggbb` per colour-table entry; entry 0 is the automatic colour.
+    /// `#rrggbb` per color-table entry; entry 0 is the automatic color.
     colors: Vec<Option<String>>,
     /// Stylesheet index to style name.
     styles: HashMap<i32, String>,
@@ -212,7 +219,7 @@ struct Interp {
     tables: Tables,
     stack: Vec<Group>,
     paras: Vec<Para>,
-    runs: Vec<Run>,
+    runs: Vec<Inline>,
     text: String,
     /// The formatting the text in `text` was written with.
     text_fmt: CharFmt,
@@ -426,9 +433,14 @@ impl Interp {
     fn text_word(&mut self, word: &str, param: Option<i32>) {
         let on = param != Some(0);
         match word {
-            "par" | "line" => {
+            "par" => {
                 self.flush_run();
                 self.finish_para(ParaEnd::Par);
+            }
+            "line" => {
+                // A line break inside the paragraph (Shift+Enter).
+                self.flush_run();
+                self.runs.push(Inline::HardBreak);
             }
             "cell" => {
                 self.flush_run();
@@ -467,7 +479,8 @@ impl Interp {
             "cf" => self.set_chr(|c| c.color = param.map(|p| p.max(0) as usize)),
             "highlight" | "cb" => self.set_chr(|c| c.highlight = param.map(|p| p.max(0) as usize)),
             "f" => self.set_chr(|c| c.font = param.map(|p| p.max(0) as usize)),
-            "fs" => self.set_chr(|c| c.size = param),
+            // Scrivener writes `\fs-2` for "no size of its own": not a size.
+            "fs" => self.set_chr(|c| c.size = param.filter(|&p| p > 0)),
             "qc" => self.group().para.align = Align::Center,
             "qr" => self.group().para.align = Align::Right,
             "qj" => self.group().para.align = Align::Justify,
@@ -639,8 +652,13 @@ impl Interp {
             return;
         }
         let text = std::mem::take(&mut self.text);
-        let fmt = self.text_fmt.clone();
-        let marks = self.marks_for(&fmt);
+        let mut fmt = self.text_fmt.clone();
+        // A bold or italic face (`Calibri-Bold` with `\b0`, as Scrivener writes
+        // text pasted from elsewhere) is bold or italic text.
+        let face = self.face(&fmt);
+        fmt.bold |= face.bold;
+        fmt.italic |= face.italic;
+        let marks = self.marks_for(&fmt, face.monospace);
         if text.chars().any(|c| !c.is_whitespace()) {
             if !fmt.bold {
                 self.all_bold = false;
@@ -649,19 +667,16 @@ impl Interp {
                 self.para_size = fmt.size;
             }
         }
-        self.runs.push(Run { text, marks });
+        self.runs.push(Inline::Text(Run { text, marks }));
     }
 
-    fn marks_for(&self, fmt: &CharFmt) -> Vec<Mark> {
+    /// What the name of the run's font says about it.
+    fn face(&self, fmt: &CharFmt) -> Face {
+        fmt.font.and_then(|f| self.tables.fonts.get(&f)).map(|name| Face::of(name)).unwrap_or_default()
+    }
+
+    fn marks_for(&self, fmt: &CharFmt, monospace: bool) -> Vec<Mark> {
         let mut marks = Vec::new();
-        let monospace = fmt
-            .font
-            .and_then(|f| self.tables.fonts.get(&f))
-            .map(|name| {
-                let n = name.to_ascii_lowercase();
-                n.contains("courier") || n.contains("mono") || n.contains("menlo") || n.contains("consolas")
-            })
-            .unwrap_or(false);
         if monospace {
             // `code` excludes the other formatting marks in the schema.
             marks.push(Mark::Code);
@@ -688,26 +703,71 @@ impl Interp {
         if fmt.subscript {
             marks.push(Mark::Subscript);
         }
+        // Black and the near-blacks of text pasted from the web (#333333) are the
+        // body color: kept as a color they would be dark text on the dark theme.
         if let Some(color) = fmt.color.filter(|&i| i > 0).and_then(|i| self.tables.colors.get(i)).and_then(|c| c.clone()) {
-            if color != "#000000" {
+            if !is_near_black(&color) {
                 marks.push(Mark::TextColor { color });
             }
         }
+        // A white highlight is the background of a pasted web page, and a black
+        // one hides the text it is on: neither is a highlight anyone chose.
         if let Some(index) = fmt.highlight.filter(|&i| i > 0) {
             let color = self.tables.colors.get(index).and_then(|c| c.clone());
-            marks.push(Mark::Highlight { color });
+            if !color.as_deref().is_some_and(|c| is_near_white(c) || is_near_black(c)) {
+                marks.push(Mark::Highlight { color });
+            }
         }
         marks
     }
 
     fn finish_para(&mut self, end: ParaEnd) {
         let runs = std::mem::take(&mut self.runs);
-        let all_bold = self.all_bold && runs.iter().any(|r| r.text.chars().any(|c| !c.is_whitespace()));
+        let all_bold = self.all_bold && runs.iter().filter_map(Inline::as_run).any(|r| r.text.chars().any(|c| !c.is_whitespace()));
         let size = self.para_size.take();
         self.all_bold = true;
         let fmt = self.stack.last().map(|g| g.para.clone()).unwrap_or_default();
         self.paras.push(Para { runs, fmt, all_bold, size, end });
     }
+}
+
+/// What a font's name says: `Calibri-Bold`, `Calibri-BoldItalic`, `Courier New`.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct Face {
+    bold: bool,
+    italic: bool,
+    monospace: bool,
+}
+
+impl Face {
+    fn of(name: &str) -> Self {
+        let n = name.to_ascii_lowercase();
+        Face {
+            bold: ["bold", "black", "heavy"].iter().any(|w| n.contains(w)),
+            italic: n.contains("italic") || n.contains("oblique"),
+            monospace: ["courier", "mono", "menlo", "consolas"].iter().any(|w| n.contains(w)),
+        }
+    }
+}
+
+fn rgb(hex: &str) -> Option<[u8; 3]> {
+    let digits = hex.strip_prefix('#').filter(|d| d.len() == 6)?;
+    let byte = |i: usize| u8::from_str_radix(&digits[i..i + 2], 16).ok();
+    Some([byte(0)?, byte(2)?, byte(4)?])
+}
+
+/// Black, or a grey dark enough to read as black (#333333, #241e12): a dark
+/// color with no hue to speak of. A dark blue (#00334d) is a color.
+fn is_near_black(hex: &str) -> bool {
+    rgb(hex).is_some_and(|c| {
+        let (max, min) = (*c.iter().max().expect("3"), *c.iter().min().expect("3"));
+        max <= 0x40 && max - min <= 0x18
+    })
+}
+
+/// White or nearly so.
+fn is_near_white(hex: &str) -> bool {
+    rgb(hex).is_some_and(|c| c.iter().all(|&v| v >= 0xf0))
 }
 
 // ── Paragraphs to blocks ─────────────────────────────────────────────
@@ -728,13 +788,19 @@ pub fn rtf_to_text(rtf: &[u8]) -> String {
 
 fn paras_to_blocks(mut paras: Vec<Para>, tables: &Tables) -> Vec<Block> {
     for para in &mut paras {
-        for run in &mut para.runs {
-            run.text = strip_scrivener_tags(&run.text);
+        for inline in &mut para.runs {
+            if let Inline::Text(run) = inline {
+                run.text = strip_scrivener_tags(&run.text);
+            }
         }
-        para.runs.retain(|r| !r.text.is_empty());
+        para.runs.retain(|r| r.as_run().map_or(true, |r| !r.text.is_empty()));
         merge_adjacent_runs(&mut para.runs);
+        // A break at the end of a paragraph shows nothing.
+        while matches!(para.runs.last(), Some(Inline::HardBreak)) {
+            para.runs.pop();
+        }
     }
-    while paras.last().map_or(false, |p| p.end == ParaEnd::Par && p.runs.iter().all(|r| r.text.trim().is_empty())) {
+    while paras.last().map_or(false, |p| p.end == ParaEnd::Par && para_text(p).trim().is_empty()) {
         paras.pop();
     }
 
@@ -743,7 +809,7 @@ fn paras_to_blocks(mut paras: Vec<Para>, tables: &Tables) -> Vec<Block> {
     let mut lists = ListStack::default();
     let mut table = TableBuilder::default();
 
-    for para in paras {
+    for mut para in paras {
         if para.end != ParaEnd::Par || para.fmt.in_table {
             lists.flush(&mut out);
             table.push(para);
@@ -757,8 +823,14 @@ fn paras_to_blocks(mut paras: Vec<Para>, tables: &Tables) -> Vec<Block> {
                 .and_then(|id| tables.lists.iter().find(|l| l.id == Some(*id)))
                 .and_then(|l| l.ordered_levels.get(level.max(0) as usize).copied())
                 .unwrap_or(false);
-            let block = Block::Paragraph { runs: inlines(para.runs), align: para.fmt.align, indent: 0 };
+            let block = Block::Paragraph { runs: para.runs, align: para.fmt.align, indent: 0 };
             lists.push_item(&mut out, ls, level.max(0), ordered, block);
+            continue;
+        }
+        // A paragraph typed as a bullet (`• item`, `- item`) is a list item.
+        if !is_typed_rule(&para_text(&para)) && strip_typed_bullet(&mut para.runs) {
+            let block = Block::Paragraph { runs: para.runs, align: para.fmt.align, indent: 0 };
+            lists.push_item(&mut out, TYPED_BULLETS, 0, false, block);
             continue;
         }
         lists.flush(&mut out);
@@ -766,6 +838,102 @@ fn paras_to_blocks(mut paras: Vec<Para>, tables: &Tables) -> Vec<Block> {
     }
     lists.flush(&mut out);
     table.flush(&mut out);
+    out
+}
+
+/// The list id the bullets typed as text gather under.
+const TYPED_BULLETS: i32 = i32::MIN;
+
+fn para_text(para: &Para) -> String {
+    para.runs.iter().filter_map(Inline::as_run).map(|r| r.text.as_str()).collect()
+}
+
+/// When the paragraph starts with a bullet typed as text (`•`, `◦`, `▪`, or `-`
+/// followed by a space or tab), remove it and the space after it and say so.
+fn strip_typed_bullet(runs: &mut Vec<Inline>) -> bool {
+    let Some(Inline::Text(first)) = runs.first() else { return false };
+    let text = first.text.trim_start();
+    let mut chars = text.chars();
+    let Some(marker) = chars.next() else { return false };
+    let rest = chars.as_str();
+    let is_bullet = match marker {
+        '\u{2022}' | '\u{25E6}' | '\u{25AA}' => true,
+        '-' => rest.starts_with([' ', '\t']),
+        _ => false,
+    };
+    let rest = rest.trim_start().to_string();
+    // A bullet with nothing after it is a bullet character, not an item.
+    let more = runs[1..].iter().filter_map(Inline::as_run).any(|r| !r.text.trim().is_empty());
+    if !is_bullet || (rest.is_empty() && !more) {
+        return false;
+    }
+    if rest.is_empty() {
+        runs.remove(0);
+        // The bullet stood alone in its run: the space may open the next.
+        if let Some(Inline::Text(next)) = runs.first_mut() {
+            next.text = next.text.trim_start().to_string();
+        }
+        runs.retain(|r| r.as_run().map_or(true, |r| !r.text.is_empty()));
+    } else if let Some(Inline::Text(first)) = runs.first_mut() {
+        first.text = rest;
+    }
+    true
+}
+
+/// A line drawn with characters: `=====`, `-----`, `* * *`, `___`. At least three
+/// of one character, nothing else but spaces.
+fn is_typed_rule(text: &str) -> bool {
+    let marks: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    marks.len() >= 3 && ['=', '-', '*', '_', '~', '#'].contains(&marks[0]) && marks.iter().all(|&c| c == marks[0])
+}
+
+/// The title of a heading typed between rules, `===== Las Vegas =====`: three or
+/// more of one rule character on each side.
+fn typed_heading_title(text: &str) -> Option<&str> {
+    let text = text.trim();
+    let first = text.chars().next()?;
+    if !['=', '-', '*', '~', '#'].contains(&first) {
+        return None;
+    }
+    let inner = text.trim_matches(first);
+    let lead = text.len() - text.trim_start_matches(first).len();
+    let trail = text.len() - text.trim_end_matches(first).len();
+    let title = inner.trim();
+    (lead >= 3 && trail >= 3 && !title.is_empty() && !title.contains(first)).then_some(title)
+}
+
+/// Remove `count_start` characters from the front of the runs' text and
+/// `count_end` from the back, then the whitespace that leaves at either end.
+fn trim_runs(runs: Vec<Inline>, count_start: usize, count_end: usize) -> Vec<Inline> {
+    let total: usize = runs.iter().filter_map(Inline::as_run).map(|r| r.text.chars().count()).sum();
+    let keep_end = total.saturating_sub(count_end);
+    let mut pos = 0;
+    let mut out = Vec::new();
+    for inline in runs {
+        match inline {
+            Inline::Text(run) => {
+                let len = run.text.chars().count();
+                let (from, to) = (count_start.max(pos), keep_end.min(pos + len));
+                if from < to {
+                    let text: String = run.text.chars().skip(from - pos).take(to - from).collect();
+                    out.push(Inline::Text(Run { text, marks: run.marks }));
+                }
+                pos += len;
+            }
+            other => {
+                if pos >= count_start && pos <= keep_end {
+                    out.push(other);
+                }
+            }
+        }
+    }
+    if let Some(Inline::Text(run)) = out.first_mut() {
+        run.text = run.text.trim_start().to_string();
+    }
+    if let Some(Inline::Text(run)) = out.last_mut() {
+        run.text = run.text.trim_end().to_string();
+    }
+    out.retain(|r| r.as_run().map_or(true, |r| !r.text.is_empty()));
     out
 }
 
@@ -782,7 +950,7 @@ impl TableBuilder {
     fn push(&mut self, para: Para) {
         // The paragraph `\row` ends holds nothing: a row's text is all in its cells.
         if para.end != ParaEnd::Row || !para.runs.is_empty() {
-            self.cell.push(Block::Paragraph { runs: inlines(para.runs), align: para.fmt.align, indent: 0 });
+            self.cell.push(Block::Paragraph { runs: para.runs, align: para.fmt.align, indent: 0 });
         }
         if para.end != ParaEnd::Par {
             self.end_cell();
@@ -815,8 +983,23 @@ impl TableBuilder {
 }
 
 /// A non-list paragraph: a heading when its style says so or it is bold and larger
-/// than the body text; otherwise a paragraph with its alignment and indent.
+/// than the body text, or when it is a title typed between rules (`=== Title ===`);
+/// a horizontal rule when it is a line typed with characters (`=====`, `* * *`);
+/// otherwise a paragraph with its alignment and indent.
 fn plain_block(para: Para, tables: &Tables, body_size: Option<i32>) -> Block {
+    let text = para_text(&para);
+    if para.runs.iter().all(|r| r.as_run().is_some()) {
+        if is_typed_rule(&text) {
+            return Block::HorizontalRule;
+        }
+        if let Some(title) = typed_heading_title(&text) {
+            // Everything before the first sight of the title is rule and space.
+            let start = text.find(title).expect("the title is inside the text");
+            let lead = text[..start].chars().count();
+            let tail = text[start + title.len()..].chars().count();
+            return Block::Heading { level: 2, runs: trim_runs(para.runs, lead, tail) };
+        }
+    }
     let styled_level = para
         .fmt
         .style
@@ -830,10 +1013,10 @@ fn plain_block(para: Para, tables: &Tables, body_size: Option<i32>) -> Block {
         _ => None,
     };
     if let Some(level) = styled_level.or(size_level) {
-        return Block::Heading { level, runs: inlines(para.runs) };
+        return Block::Heading { level, runs: para.runs };
     }
     let indent = if para.fmt.left_indent >= 360 { (para.fmt.left_indent as f32 / 720.0).round() as u32 } else { 0 };
-    Block::Paragraph { runs: inlines(para.runs), align: para.fmt.align, indent }
+    Block::Paragraph { runs: para.runs, align: para.fmt.align, indent }
 }
 
 fn heading_level_from_style(name: &str) -> Option<u8> {
@@ -853,29 +1036,25 @@ fn dominant_size(paras: &[Para]) -> Option<i32> {
     let mut weights: HashMap<i32, usize> = HashMap::new();
     for para in paras {
         if let Some(size) = para.size {
-            let len: usize = para.runs.iter().map(|r| r.text.len()).sum();
+            let len: usize = para.runs.iter().filter_map(Inline::as_run).map(|r| r.text.len()).sum();
             *weights.entry(size).or_insert(0) += len;
         }
     }
     weights.into_iter().max_by_key(|(size, w)| (*w, -*size)).map(|(size, _)| size)
 }
 
-/// RTF text as a block's content: runs of text and nothing else (a picture in
-/// the RTF is not imported yet, docs/IMAGES_CONTRACT.md wave 5).
-fn inlines(runs: Vec<Run>) -> Vec<Inline> {
-    runs.into_iter().map(Inline::Text).collect()
-}
-
-fn merge_adjacent_runs(runs: &mut Vec<Run>) {
-    let mut merged: Vec<Run> = Vec::with_capacity(runs.len());
-    for run in runs.drain(..) {
-        if let Some(last) = merged.last_mut() {
+/// Join adjacent text runs with the same marks. (A picture in the RTF is not
+/// imported yet, docs/IMAGES_CONTRACT.md wave 5.)
+fn merge_adjacent_runs(runs: &mut Vec<Inline>) {
+    let mut merged: Vec<Inline> = Vec::with_capacity(runs.len());
+    for inline in runs.drain(..) {
+        if let (Some(Inline::Text(last)), Inline::Text(run)) = (merged.last_mut(), &inline) {
             if last.marks == run.marks {
                 last.text.push_str(&run.text);
                 continue;
             }
         }
-        merged.push(run);
+        merged.push(inline);
     }
     *runs = merged;
 }
@@ -907,10 +1086,13 @@ impl OpenList {
 
 impl ListStack {
     fn push_item(&mut self, out: &mut Vec<Block>, ls: i32, level: i32, ordered: bool, block: Block) {
-        // Close lists deeper than this level, and a same-level list of another kind
-        // or another list id (a new list started right after the previous one).
+        // Close lists deeper than this level, and a same-level list of another kind,
+        // or a numbered one with another list id (a new list started right after
+        // the previous one, numbered afresh). Bullets in a row are one list
+        // whatever their ids: Scrivener gives each bullet of a list typed on
+        // Windows a list of its own.
         while let Some(top) = self.open.last() {
-            let same = top.level == level && top.ls == ls && top.ordered == ordered;
+            let same = top.level == level && top.ordered == ordered && (top.ls == ls || !ordered);
             if top.level > level || (top.level == level && !same) {
                 self.close_top(out);
             } else {
@@ -1094,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn colours_become_text_colour_marks_except_black() {
+    fn colors_become_text_color_marks_except_black() {
         let rtf = br"{\rtf1{\colortbl;\red0\green0\blue0;\red255\green255\blue255;\red251\green4\blue7;}\pard {\cf1 black} {\cf3 red} {\cf0 auto}\par}";
         let runs = runs_of(&rtf_to_blocks(rtf)[0]).to_vec();
         assert!(runs.iter().find(|r| r.text.trim() == "black").unwrap().marks.is_empty());
@@ -1178,6 +1360,95 @@ mod tests {
         assert_eq!(blocks[1].plain_text(), " after");
         pimble_crdt::NodeDoc::from_blocks(&blocks).unwrap();
         assert!(!rtf_to_text(rtf).contains("89504e"));
+    }
+
+    #[test]
+    fn a_line_break_is_a_hard_break_inside_the_paragraph() {
+        let rtf = br"{\rtf1 \pard first line\line second line\line\par next\par}";
+        let blocks = rtf_to_blocks(rtf);
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        let Block::Paragraph { runs, .. } = &blocks[0] else { panic!("{:?}", blocks[0]) };
+        assert_eq!(runs, &vec![Inline::Text(Run::plain("first line")), Inline::HardBreak, Inline::Text(Run::plain("second line"))], "the trailing break is dropped");
+        assert_eq!(blocks[0].plain_text(), "first line\nsecond line");
+        pimble_crdt::NodeDoc::from_blocks(&blocks).unwrap();
+    }
+
+    #[test]
+    fn a_bold_or_italic_face_is_bold_or_italic() {
+        let rtf = br"{\rtf1{\fonttbl{\f0\fnil Calibri;}{\f1\fnil Calibri-Bold;}{\f2\fnil Calibri-Italic;}{\f3\fnil Calibri-BoldItalic;}}\pard {\f0\b0 plain }{\f1\b0 strong }{\f2\i0 leaning }{\f3\b0\i0 both}\par}";
+        let runs = runs_of(&rtf_to_blocks(rtf)[0]);
+        let find = |t: &str| runs.iter().find(|r| r.text.trim() == t).unwrap_or_else(|| panic!("no run {t:?} in {runs:?}")).marks.clone();
+        assert!(find("plain").is_empty());
+        assert_eq!(find("strong"), vec![Mark::Bold]);
+        assert_eq!(find("leaning"), vec![Mark::Italic]);
+        assert_eq!(find("both"), vec![Mark::Bold, Mark::Italic]);
+    }
+
+    /// Scrivener writes `\fs-2` for text with no size of its own: it is not a size,
+    /// so it neither makes the body size nor a heading.
+    #[test]
+    fn a_negative_font_size_is_no_size() {
+        let rtf = br"{\rtf1 \pard {\fs24 body text that is long enough to be the body}\par\pard {\fs-2\b short bold}\par\pard {\fs-2 more}\par}";
+        let blocks = rtf_to_blocks(rtf);
+        assert!(blocks.iter().all(|b| matches!(b, Block::Paragraph { .. })), "{blocks:?}");
+    }
+
+    #[test]
+    fn near_black_text_and_white_or_black_highlights_are_left_to_the_theme() {
+        let rtf = br"{\rtf1{\colortbl;\red0\green0\blue0;\red255\green255\blue255;\red51\green51\blue51;\red0\green51\blue77;\red229\green255\blue79;}\pard {\cf3 grey} {\cf4 navy} {\cb2\highlight2 white} {\cb1\highlight1 black} {\cb5\highlight5 yellow}\par}";
+        let runs = runs_of(&rtf_to_blocks(rtf)[0]);
+        let find = |t: &str| runs.iter().find(|r| r.text.contains(t)).unwrap_or_else(|| panic!("no run {t:?} in {runs:?}")).marks.clone();
+        assert!(find("grey").is_empty(), "#333333 reads as black");
+        assert_eq!(find("navy"), vec![Mark::TextColor { color: "#00334d".into() }], "a dark color with a hue is kept");
+        assert!(find("white").is_empty());
+        assert!(find("black").is_empty());
+        assert_eq!(find("yellow"), vec![Mark::Highlight { color: Some("#e5ff4f".into()) }]);
+    }
+
+    #[test]
+    fn typed_rules_are_rules_and_titles_between_rules_are_headings() {
+        let rtf = br"{\rtf1 \pard before\par\pard =====\par\pard - - -\par\pard {\b ===== }{\b\i Las Vegas}{\b  =====}\par\pard == not a rule\par\pard a -- b\par}";
+        let blocks = rtf_to_blocks(rtf);
+        assert_eq!(blocks.len(), 6, "{blocks:#?}");
+        assert_eq!(blocks[1], Block::HorizontalRule);
+        assert_eq!(blocks[2], Block::HorizontalRule);
+        let Block::Heading { level: 2, runs } = &blocks[3] else { panic!("{:?}", blocks[3]) };
+        assert_eq!(runs, &vec![Inline::Text(Run::marked("Las Vegas", vec![Mark::Bold, Mark::Italic]))], "the rules and the spaces go, the marks stay");
+        assert!(matches!(&blocks[4], Block::Paragraph { .. }), "two characters are not a rule: {:?}", blocks[4]);
+        assert_eq!(blocks[5].plain_text(), "a -- b");
+        pimble_crdt::NodeDoc::from_blocks(&blocks).unwrap();
+    }
+
+    #[test]
+    fn typed_bullets_are_a_bullet_list() {
+        let rtf = br"{\rtf1 \pard intro\par\pard {\bullet  first}\par\pard {\bullet }{\b second}\par\pard - third\par\pard -not a bullet\par\pard \bullet\par}";
+        let blocks = rtf_to_blocks(rtf);
+        assert_eq!(blocks.len(), 4, "{blocks:#?}");
+        let Block::BulletList { items } = &blocks[1] else { panic!("{:?}", blocks[1]) };
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].blocks, vec![Block::plain("first")]);
+        assert_eq!(items[1].blocks, vec![Block::paragraph(vec![Run::marked("second", vec![Mark::Bold])])]);
+        assert_eq!(items[2].blocks, vec![Block::plain("third")]);
+        assert_eq!(blocks[2].plain_text(), "-not a bullet");
+        assert_eq!(blocks[3].plain_text(), "\u{2022}", "a bullet alone is text");
+    }
+
+    /// Scrivener for Windows gives each bullet of a list a list (`\lsN`) of its own;
+    /// bullets in a row are still one list. Numbered lists with different ids are
+    /// different lists, numbered afresh.
+    #[test]
+    fn bullets_with_their_own_list_ids_are_one_list() {
+        let rtf = br"{\rtf1\ansi
+{\*\listtable
+{\list{\listlevel\levelnfc23}\listid1}{\list{\listlevel\levelnfc23}\listid2}{\list{\listlevel\levelnfc23}\listid3}{\list{\listlevel\levelnfc0}\listid4}{\list{\listlevel\levelnfc0}\listid5}}
+{\*\listoverridetable{\listoverride\listid1\ls1}{\listoverride\listid2\ls2}{\listoverride\listid3\ls3}{\listoverride\listid4\ls4}{\listoverride\listid5\ls5}}
+\pard\ls1\ilvl0 a\par\pard\ls2\ilvl0 b\par\pard\ls3\ilvl0 c\par\pard\ls4\ilvl0 one\par\pard\ls5\ilvl0 again\par}";
+        let blocks = rtf_to_blocks(rtf);
+        assert_eq!(blocks.len(), 3, "{blocks:#?}");
+        let Block::BulletList { items } = &blocks[0] else { panic!("{:?}", blocks[0]) };
+        assert_eq!(items.len(), 3);
+        assert!(matches!(&blocks[1], Block::OrderedList { items, .. } if items.len() == 1));
+        assert!(matches!(&blocks[2], Block::OrderedList { items, .. } if items.len() == 1));
     }
 
     #[test]

@@ -646,6 +646,46 @@ async fn dispatch(
         return;
     }
 
+    // An import is many commands, each routed exactly as the UI's own would
+    // be (docs/IMPORT_CONTRACT.md).
+    if let BackendCommand::Import { store_id, parent_id, format, name, files } = cmd {
+        let mut runner = Web { endpoints, vault, event_tx, signal_ui, client_id };
+        let event = pimble_app::import::import(&mut runner, store_id, parent_id, format, &name, &files).await;
+        emit(event_tx, signal_ui, event);
+        return;
+    }
+
+    if let Some(event) = route(endpoints, vault, cmd, event_tx, signal_ui, client_id).await {
+        emit(event_tx, signal_ui, described(vault, event));
+    }
+}
+
+/// `route`, as `pimble_app::import` asks it.
+struct Web<'a> {
+    endpoints: &'a mut Endpoints,
+    vault: &'a mut VaultClient,
+    event_tx: &'a Sender<BackendEvent>,
+    signal_ui: &'a Arc<dyn Fn() + Send + Sync>,
+    client_id: &'a str,
+}
+
+impl pimble_app::import::Runner for Web<'_> {
+    async fn run(&mut self, cmd: BackendCommand) -> Option<BackendEvent> {
+        route(self.endpoints, self.vault, cmd, self.event_tx, self.signal_ui, self.client_id).await
+    }
+}
+
+/// Answer a command that names at most one store: from the vault client for
+/// an encrypted store, from the store's server for a plain one. What happens
+/// on the way (an endpoint found down) is emitted; the answer is returned.
+async fn route(
+    endpoints: &mut Endpoints,
+    vault: &mut VaultClient,
+    cmd: BackendCommand,
+    event_tx: &Sender<BackendEvent>,
+    signal_ui: &Arc<dyn Fn() + Send + Sync>,
+    client_id: &str,
+) -> Option<BackendEvent> {
     // Which server answers this command is decided by the store it names, not
     // by which connection happens to be open.
     let store_id = crate::vault::store_id_of(&cmd);
@@ -666,20 +706,14 @@ async fn dispatch(
     // whether the store is encrypted or plain
     // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles").
     if let Some(event) = store_id.and_then(|id| vault.refuse_write(id, &cmd)) {
-        emit(event_tx, signal_ui, event);
-        return;
+        return Some(event);
     }
 
     // A store whose owner's computer is off is answered from what this page
     // holds of it, which may be nothing: there is no connection to ask, and
     // that is no error (docs/RELAY_CONTRACT.md, "The apps").
     let cmd = match vault.handle_unreachable(cmd) {
-        Handled::Yes(event) => {
-            if let Some(event) = event {
-                emit(event_tx, signal_ui, event);
-            }
-            return;
-        }
+        Handled::Yes(event) => return event,
         Handled::No(cmd) => cmd,
     };
 
@@ -708,21 +742,14 @@ async fn dispatch(
 
     let cmd = match client.as_ref() {
         Some(connected) => match vault.handle(connected, cmd, signal_ui).await {
-            Handled::Yes(event) => {
-                if let Some(event) = event {
-                    emit(event_tx, signal_ui, event);
-                }
-                return;
-            }
+            Handled::Yes(event) => return event,
             Handled::No(cmd) => cmd,
         },
         None => cmd,
     };
 
     let mut client = client;
-    if let Some(event) = process_command(&mut client, cmd, event_tx, signal_ui, client_id).await {
-        emit(event_tx, signal_ui, described(vault, event));
-    }
+    process_command(&mut client, cmd, event_tx, signal_ui, client_id).await
 }
 
 /// `TransplantNode` names two stores, which may be served by two different
@@ -869,7 +896,7 @@ async fn create_hosted_store(name: &str, kind: &str) -> BackendEvent {
     }
 
     request_refresh();
-    BackendEvent::HostedStoreCreated { name: created.name }
+    BackendEvent::HostedStoreCreated { name: created.name, store_id: StoreId::parse(&created.store_id).ok() }
 }
 
 fn emit(event_tx: &Sender<BackendEvent>, signal_ui: &Arc<dyn Fn() + Send + Sync>, event: BackendEvent) {

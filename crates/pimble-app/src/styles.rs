@@ -103,6 +103,29 @@ pub(crate) const APP_CSS: &str = "
 .rinch-tree__node-content--selected .rinch-tree__chevron {
     color: var(--rinch-color-text);
 }
+/* A node's row color (`custom_keys::BACKGROUND`): a band the label draws
+   across the whole row, indent included, under the chevron, icon and title.
+   Held back on the selected row so the selection still shows through it. */
+.rinch-tree__node-content {
+    position: relative;
+}
+.rinch-tree__chevron, .rinch-tree__spacer, .rinch-tree__label > span {
+    position: relative;
+    z-index: 1;
+}
+.rinch-tree__label > .pimble-row-band {
+    position: absolute;
+    left: 0;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 0;
+    border-radius: var(--rinch-radius-sm);
+    pointer-events: none;
+}
+.rinch-tree__node-content--selected .pimble-row-band {
+    opacity: 0.5;
+}
 
 /* ── Context menu ───────────────────────────────────────────── */
 
@@ -351,7 +374,7 @@ pub(crate) const APP_CSS: &str = "
     user-select: none;
 }
 
-/* The focused pane's strip carries the accent colour. */
+/* The focused pane's strip carries the accent color. */
 .pimble-pane--focused > .pimble-pane__title {
     color: var(--rinch-color-text);
     border-top-color: var(--rinch-primary-color);
@@ -763,7 +786,7 @@ pub(crate) const EDITOR_CSS: &str = "
 }
 
 /* Links, Pimble and web alike (docs/LINKS_CONTRACT.md \"What a link looks like\"):
-   the link colour, underlined only under the pointer. The contract's arrow after a
+   the link color, underlined only under the pointer. The contract's arrow after a
    web link waits for rinch: generated content (`::after`) inside the editor puts the
    caret beside the wrong character (joeleaver/rinch#891). */
 .pimble-editor__content-wrap > [data-pm-editor] a {

@@ -24,6 +24,10 @@ pimble-rpc = { workspace = true }
 pimble-crdt = { workspace = true }
 # Fits a picture under the size limit before it is stored (docs/IMAGES_CONTRACT.md).
 pimble-image = { workspace = true }
+# File > Import: parses RTF, Word and Scrivener into nodes (docs/IMPORT_CONTRACT.md).
+# Parsing only; the app writes what it parses through its own commands.
+pimble-import = { workspace = true }
+chrono = { workspace = true }
 # rinch is declared here rather than inherited from the workspace because this
 # crate is the only consumer and it needs `default-features = false`: `desktop`
 # (and `collaboration`, which implies it) must stay out of a web build, and a
@@ -69,6 +73,9 @@ web-sys = { version = "0.3", optional = true, features = [
     "Event", "EventTarget", "FileList", "File", "Blob",
 ] }
 wasm-bindgen = { version = "0.2", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
 # `native` is the desktop app: the embedded server, the tokio backend thread,

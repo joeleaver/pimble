@@ -68,6 +68,21 @@ pub(crate) fn focused_editor(store: AppStore) -> EditorHandle {
     editor(store.focused())
 }
 
+/// Give the keyboard to pane `pane`: to its editor when it holds a document,
+/// and to no editor when it holds none (Joe, 2026-10-08: "Focus should work as
+/// expected"). Called when the focused pane changes; an editor that already
+/// has the keyboard is left alone, and an editor that does not hold it is not
+/// touched by `blur`, so a tree row or a text field keeps what is its own.
+pub(crate) fn give_keyboard_to(store: AppStore, pane: PaneId) {
+    if untracked(|| store.pane(pane).show_editor.get()) {
+        editor(pane).focus();
+    } else {
+        for other in PaneId::ALL {
+            editor(other).blur();
+        }
+    }
+}
+
 /// Switch every pane's editor stylesheet between the dark and light schemes.
 pub(crate) fn set_dark_mode(dark: bool) {
     for pane in PaneId::ALL {
