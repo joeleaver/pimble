@@ -444,6 +444,108 @@ pub(crate) const APP_CSS: &str = "
     border-bottom: 1px solid var(--rinch-color-border);
 }
 
+/* ── Boards (docs/IMAGE_MARKUP_CONTRACT.md) ─────────────────── */
+
+/* A board pane: the surface fills it; the selection outline and the markup
+   control sit over it and let the pointer through to it except where the
+   control is. */
+.pimble-board {
+    flex: 1;
+    position: relative;
+    z-index: 0;
+    overflow: hidden;
+    min-height: 0;
+}
+
+.pimble-board__selection {
+    position: absolute;
+    border: 1px dashed var(--rinch-primary-color-5);
+    pointer-events: none;
+}
+
+.pimble-board__markup {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 12px;
+    cursor: pointer;
+    color: var(--rinch-color-text);
+    background: var(--rinch-color-body);
+    border: 1px solid var(--rinch-color-border);
+}
+
+.pimble-board__markup--hidden {
+    opacity: 0.55;
+}
+
+.pimble-board__markup-icon {
+    display: inline-flex;
+    width: 14px;
+    height: 14px;
+}
+
+.pimble-board-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+    padding: 6px 12px;
+}
+
+.pimble-board-toolbar__group {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+
+.pimble-board-toolbar__divider {
+    width: 1px;
+    height: 20px;
+    background: var(--rinch-color-border);
+    margin: 0 2px;
+}
+
+.pimble-board-tool {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    border-radius: 4px;
+    cursor: pointer;
+    border: 1px solid transparent;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-board-tool--active {
+    border-color: var(--rinch-primary-color-4);
+    color: var(--rinch-primary-color-4);
+}
+
+.pimble-board-swatch {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    cursor: pointer;
+    border: 2px solid transparent;
+    /* The black swatch on the dark theme. */
+    box-shadow: 0 0 0 1px var(--rinch-color-border);
+}
+
+.pimble-board-swatch--active {
+    border-color: var(--rinch-color-text);
+}
+
+.pimble-board-width {
+    border-radius: 50%;
+    background: currentColor;
+}
+
 .pimble-editor__content-wrap {
     flex: 1;
     display: flex;

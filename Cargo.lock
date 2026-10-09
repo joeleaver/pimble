@@ -4971,8 +4971,10 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "crossbeam-channel",
+ "image",
  "js-sys",
  "open",
+ "pimble-board",
  "pimble-client",
  "pimble-core",
  "pimble-crdt",
@@ -4996,6 +4998,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "yrs",
 ]
 
 [[package]]
@@ -5247,6 +5250,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jsonrpsee",
+ "pimble-board",
  "pimble-client",
  "pimble-core",
  "pimble-crdt",

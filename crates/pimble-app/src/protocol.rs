@@ -36,7 +36,9 @@ pub enum BackendCommand {
     ListStores,
 
     // Node operations
-    CreateNode { store_id: StoreId, parent_id: Option<NodeId>, title: String },
+    /// `init` is what the node starts with, written in the edit that creates
+    /// it; `None` makes an ordinary empty document.
+    CreateNode { store_id: StoreId, parent_id: Option<NodeId>, title: String, init: Option<NodeInit> },
     GetNode { store_id: StoreId, node_id: NodeId },
     GetChildren { store_id: StoreId, node_id: NodeId },
     SetNodeContent { store_id: StoreId, node_id: NodeId, content: Vec<u8> },
@@ -254,10 +256,24 @@ pub enum CloudOp {
     StopSharing,
 }
 
+/// What a new node starts with (`BackendCommand::CreateNode`'s `init`): its
+/// type, a yrs update merged into its document, and `metadata.custom` keys,
+/// all in the one edit that creates it. A board node's board is written this
+/// way, never after (docs/IMAGE_MARKUP_CONTRACT.md section 1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeInit {
+    pub node_type: String,
+    pub content: Vec<u8>,
+    pub custom: Vec<(String, serde_json::Value)>,
+}
+
 /// A picture that was stored (`BackendEvent::BlobStored`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredBlob {
     pub url: BlobUrl,
+    /// Its size in pixels as stored (after any scaling), when it could be
+    /// read: an image node places it at one board unit per pixel.
+    pub size: Option<(u32, u32)>,
     /// "This picture was 34.2 MiB, so it was scaled to ...", when it was.
     pub notice: Option<String>,
 }
@@ -420,7 +436,8 @@ pub enum BackendEvent {
     // Pimble Cloud account (docs/DESKTOP_ACCOUNT_CONTRACT.md).
     /// The answer to `CloudStatus`, `CloudSignIn` (`signed_in: true`) and
     /// `CloudSignOut` (`signed_in: false`).
-    CloudStatusChanged { signed_in: bool, email: Option<String>, url: Option<String> },
+    /// `user_id` is the account's `sub`, what board edits are stamped with.
+    CloudStatusChanged { signed_in: bool, email: Option<String>, user_id: Option<String>, url: Option<String> },
     /// A cloud request failed; `op` says which, so the error lands in the
     /// modal that sent it.
     CloudError { op: CloudOp, message: String },

@@ -363,7 +363,7 @@ pub async fn write<R: Runner>(runner: &mut R, store_id: StoreId, parent_id: Opti
 /// One node: create it, then write its fields and content as one update of
 /// the document the server made.
 async fn write_one<R: Runner>(runner: &mut R, store_id: StoreId, parent_id: Option<NodeId>, item: &Imported) -> Result<NodeId, String> {
-    let node_id = match runner.run(BackendCommand::CreateNode { store_id, parent_id, title: item.title.clone() }).await {
+    let node_id = match runner.run(BackendCommand::CreateNode { store_id, parent_id, title: item.title.clone(), init: None }).await {
         Some(BackendEvent::NodeCreated { node_id, .. }) => node_id,
         other => return Err(unexpected(other)),
     };

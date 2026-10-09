@@ -288,6 +288,8 @@ pub(crate) fn start_editing(
 /// Stop editing pane `pane`'s node (detach the collab session). Nothing to do
 /// for a pane that holds none.
 pub(crate) fn stop_editing(store: AppStore, pane: PaneId) {
+    // A pane holds a document or a board, never both: whatever it held goes.
+    crate::boards::stop(store, pane);
     let state = store.pane(pane);
     let Some(active) = untracked(|| state.active_edit.get()) else { return };
     let handle = editor(pane);

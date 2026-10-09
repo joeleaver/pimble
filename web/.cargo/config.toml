@@ -1,0 +1,6 @@
+# The browser build turns on wasm SIMD (`simd128`, in every current browser):
+# pimble-board's renderer (tiny-skia) is up to twice as fast with it, and a 4K
+# board view settling a zoom needs it to stay under 200 ms
+# (docs/IMAGE_MARKUP_CONTRACT.md, "Spike 3 numbers").
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]

@@ -24,6 +24,13 @@ pimble-rpc = { workspace = true }
 pimble-crdt = { workspace = true }
 # Fits a picture under the size limit before it is stored (docs/IMAGES_CONTRACT.md).
 pimble-image = { workspace = true }
+# Boards (docs/IMAGE_MARKUP_CONTRACT.md): the board document, its renderer and
+# the raster cache a board pane paints from; yrs for its per-person undo.
+pimble-board = { workspace = true }
+yrs = { workspace = true }
+# A stored picture's pixel size (an image node places it at one unit per
+# pixel), and a pasted clipboard bitmap as PNG. The same build pimble-board's is.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 # File > Import: parses RTF, Word and Scrivener into nodes (docs/IMPORT_CONTRACT.md).
 # Parsing only; the app writes what it parses through its own commands.
 pimble-import = { workspace = true }
@@ -71,6 +78,7 @@ web-sys = { version = "0.3", optional = true, features = [
     "Window", "Storage", "Navigator", "Clipboard",
     "Document", "Node", "Element", "HtmlElement", "HtmlInputElement",
     "Event", "EventTarget", "FileList", "File", "Blob",
+    "DragEvent", "DataTransfer", "ClipboardEvent",
 ] }
 wasm-bindgen = { version = "0.2", optional = true }
 

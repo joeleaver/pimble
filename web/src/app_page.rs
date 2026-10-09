@@ -52,6 +52,9 @@ pub fn start() {
         // component; here the backend exists first and is handed in, which is
         // the same seam either way.
         let (store, view) = pimble_app::app::build_view();
+        // Who board edits are stamped as (docs/IMAGE_MARKUP_CONTRACT.md
+        // section 6): the account this page is unlocked for.
+        pimble_app::boards::set_author(session::user_id(), session::email());
         store.backend.set(Some(backend::spawn(session_token)));
         route::mount_app(store, view);
     });

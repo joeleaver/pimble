@@ -95,7 +95,7 @@ pub(crate) fn close_focused(store: AppStore) {
 /// The node pane `pane` shows as a document, tracked: its canonical pair.
 fn pane_document(store: AppStore, pane: PaneId) -> Option<(pimble_core::StoreId, pimble_core::NodeId)> {
     let state = store.pane(pane);
-    if !state.show_editor.get() {
+    if !state.show_editor.get() && !state.show_board.get() {
         return None;
     }
     match parse_tree_value(&state.selected.get()?) {
@@ -127,8 +127,9 @@ fn pane_icon(store: AppStore, pane: PaneId) -> Vec<(String, String)> {
         .map(|sig| sig.with(|n| (n.metadata.icon().map(str::to_string), n.metadata.color().map(str::to_string))))
         .unwrap_or_default();
     let dark = store.dark_mode.get();
+    let fallback = if store.pane(pane).show_board.get() { TablerIcon::Chalkboard } else { TablerIcon::FileText };
     vec![(
-        icon.unwrap_or_else(|| TablerIcon::FileText.name().to_string()),
+        icon.unwrap_or_else(|| fallback.name().to_string()),
         color.map(|hex| display_color(&hex, dark)).unwrap_or_default(),
     )]
 }
@@ -151,7 +152,8 @@ fn pane_icon(store: AppStore, pane: PaneId) -> Vec<(String, String)> {
 /// one signal inside another's `with` panics. (`AppStore`'s own helpers nest
 /// freely because they are `untracked`.)
 fn editor_read_only(store: AppStore, pane: PaneId) -> bool {
-    let Some(active) = store.pane(pane).active_edit.get() else { return false };
+    let state = store.pane(pane);
+    let Some(active) = state.active_edit.get().or_else(|| state.board.get()) else { return false };
     let sig = store.store_data.with(|map| map.get(&active.store_id).copied());
     if sig.map_or(false, |sig| sig.with(|s| !s.access.allows_write())) {
         return true;
@@ -180,6 +182,10 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
     // remote ones keep landing, so a reader's keystroke changes nothing on
     // screen. The effect lives as long as the app.
     let _ = rinch::Effect::new(move || crate::editor::set_read_only(pane, editor_read_only(store, pane)));
+
+    // A board node's view (docs/IMAGE_MARKUP_CONTRACT.md "Showing one"),
+    // beside the editor and rendered once with it; shown instead of it.
+    let board_view = crate::boards::render_board(__scope, store, pane);
 
     let empty_icon = render_tabler_icon(__scope, TablerIcon::FileText, TablerIconStyle::Outline);
     let hint_lines: Vec<NodeHandle> = hints
@@ -276,7 +282,7 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
             // reader meets one wording everywhere.
             div {
                 class: "pimble-editor__read-only",
-                style: {move || if state.show_editor.get() && editor_read_only(store, pane) { "" } else { "display: none;" }},
+                style: {move || if (state.show_editor.get() || state.show_board.get()) && editor_read_only(store, pane) { "" } else { "display: none;" }},
                 {pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string()}
             }
             div {
@@ -284,9 +290,10 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                 style: {move || if state.show_editor.get() { "" } else { "display: none;" }},
                 {editor_view}
             }
+            {board_view}
             div {
                 class: "pimble-empty-state",
-                style: {move || if state.show_editor.get() { "display: none;" } else { "" }},
+                style: {move || if state.show_editor.get() || state.show_board.get() { "display: none;" } else { "" }},
                 div {
                     class: "pimble-empty-state__icon",
                     {empty_icon}
@@ -399,6 +406,10 @@ pub(crate) fn render_panes(__scope: &mut RenderScope, store: AppStore, hints: &[
         store.pane(pane).show_editor.get() && !editor_read_only(store, pane)
     };
     let toolbar = crate::toolbar::render_pimble_toolbar(__scope, store, usable);
+    // The board tools take the toolbar's place while the focused pane shows a
+    // board (docs/IMAGE_MARKUP_CONTRACT.md section 1).
+    let board_toolbar = crate::boards::render_board_toolbar(__scope, store);
+    let board_focused = move || store.pane(store.focused_pane.get()).show_board.get();
     // The keyboard follows the pane focus, however it moved (a press in the
     // pane, a split, a close, the View menu): the focused pane's editor when
     // it holds a document, no editor when it holds none. Only a change of the
@@ -415,7 +426,14 @@ pub(crate) fn render_panes(__scope: &mut RenderScope, store: AppStore, hints: &[
             class: "pimble-panes-area",
             div {
                 class: "pimble-editor__toolbar-wrap",
-                {toolbar}
+                div {
+                    style: {move || if board_focused() { "display: none;" } else { "" }},
+                    {toolbar}
+                }
+                div {
+                    style: {move || if board_focused() { "" } else { "display: none;" }},
+                    {board_toolbar}
+                }
             }
             div {
                 class: "pimble-panes",

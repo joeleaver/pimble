@@ -1234,8 +1234,8 @@ impl VaultClient {
 
             BackendCommand::GetNode { store_id, node_id } => Some(self.get_node(store_id, node_id)),
 
-            BackendCommand::CreateNode { store_id, parent_id, title } => {
-                Some(self.create_node(client, store_id, parent_id, title).await)
+            BackendCommand::CreateNode { store_id, parent_id, title, init } => {
+                Some(self.create_node(client, store_id, parent_id, title, init).await)
             }
 
             BackendCommand::RenameNode { store_id, node_id, title } => {
@@ -1603,6 +1603,7 @@ impl VaultClient {
         store_id: StoreId,
         parent_id: Option<NodeId>,
         title: String,
+        init: Option<pimble_app::protocol::NodeInit>,
     ) -> BackendEvent {
         let node_id = NodeId::new();
         let now = now_rfc3339();
@@ -1612,9 +1613,26 @@ impl VaultClient {
             };
             let parent = parent_id.unwrap_or(store.tree.root());
             let mut edit = store.seed_root(&now);
-            match store.tree.add_node(node_id, Some(parent), None, node_types::DOCUMENT, &title, &now) {
+            let node_type = init.as_ref().map_or(node_types::DOCUMENT, |init| init.node_type.as_str());
+            match store.tree.add_node(node_id, Some(parent), None, node_type, &title, &now) {
                 Ok(more) => edit.touched.extend(more.touched),
                 Err(e) => return BackendEvent::Error { message: e.to_string() },
+            }
+            // What the node starts with goes in with the create, as the
+            // server's `createNode` does it (a board node's board).
+            if let Some(init) = &init {
+                if !init.content.is_empty() {
+                    match store.tree.apply_update(node_id, &init.content) {
+                        Ok(_) => edit.touched.push((node_id, init.content.clone())),
+                        Err(e) => return BackendEvent::Error { message: e.to_string() },
+                    }
+                }
+                for (key, value) in &init.custom {
+                    match store.tree.set_custom(node_id, key, value, &now) {
+                        Ok(more) => edit.touched.extend(more.touched),
+                        Err(e) => return BackendEvent::Error { message: e.to_string() },
+                    }
+                }
             }
             (parent, edit)
         };
@@ -2208,7 +2226,18 @@ impl VaultClient {
             let Some(store) = self.stores.get(store_id) else { continue };
             for node_id in store.tree.list_node_ids() {
                 let Ok(info) = store.tree.get_node_info(node_id) else { continue };
-                let text = store.tree.doc(node_id).map(NodeDoc::text).unwrap_or_default();
+                // A board node's words are the ones on its board.
+                let text = store
+                    .tree
+                    .doc(node_id)
+                    .map(|doc| {
+                        if info.node_type == node_types::BOARD {
+                            doc.board_units().into_iter().map(|u| u.text).collect::<Vec<_>>().join("\n")
+                        } else {
+                            doc.text()
+                        }
+                    })
+                    .unwrap_or_default();
 
                 let in_title = info.title.to_lowercase().contains(&needle);
                 let at = text.to_lowercase().find(&needle);
@@ -4527,7 +4556,7 @@ mod tests {
         // A write is refused with the sentence that says why, before anything
         // is asked of anyone; a read is not.
         let refused = client
-            .refuse_write(store_id, &BackendCommand::CreateNode { store_id, parent_id: None, title: "New".into() })
+            .refuse_write(store_id, &BackendCommand::CreateNode { store_id, parent_id: None, title: "New".into(), init: None })
             .expect("nothing can be created in a store that cannot be reached");
         assert!(
             matches!(&refused, BackendEvent::Error { message } if message == &format!("Forbidden: {OWNER_OFFLINE_REFUSAL}")),
@@ -4572,7 +4601,7 @@ mod tests {
 
         // And it answers like any open store from here on.
         assert!(matches!(client.handle_unreachable(BackendCommand::GetChildren { store_id, node_id: root }), Handled::No(_)));
-        assert!(client.refuse_write(store_id, &BackendCommand::CreateNode { store_id, parent_id: Some(root), title: "New".into() }).is_none());
+        assert!(client.refuse_write(store_id, &BackendCommand::CreateNode { store_id, parent_id: Some(root), title: "New".into(), init: None }).is_none());
         let BackendEvent::ChildrenLoaded { children, .. } = client.get_children(store_id, root) else { panic!("no list") };
         assert!(!children.is_empty());
         assert!(children.iter().all(|node| node.access == StoreAccess::Full));
@@ -5585,7 +5614,7 @@ mod tests {
     fn only_the_commands_that_change_something_are_writes() {
         let store_id = StoreId::new();
         let node_id = NodeId::new();
-        assert!(writes(&BackendCommand::CreateNode { store_id, parent_id: None, title: String::new() }));
+        assert!(writes(&BackendCommand::CreateNode { store_id, parent_id: None, title: String::new(), init: None }));
         assert!(writes(&BackendCommand::MoveNode { store_id, node_id, new_parent_id: node_id, position: None }));
         assert!(writes(&BackendCommand::BroadcastChanges { store_id, node_id, changes: String::new() }));
         assert!(!writes(&BackendCommand::GetChildren { store_id, node_id }));

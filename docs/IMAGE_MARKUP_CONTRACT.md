@@ -601,3 +601,105 @@ each side, which is most of its cost at 1:1.
   `index_units` by plugin; there is no board plugin yet).
 - The `pimble-blob:` loader for marked-up pictures and `pimble-board:` embeds:
   `render_extent` at the text's width times the screen scale.
+
+## Built in wave 1 (app side)
+
+Built 2026-10-09 on branch `boards`, desktop and browser from one module,
+`crates/pimble-app/src/boards.rs`, on rinch `main` (3c9958c).
+
+**What exists:**
+- **Node type** `pimble_core::node_types::BOARD`. A board node is made with its board in
+  the edit that creates it: `createNode` takes an optional `content` (a yrs update merged
+  into the new document) and `custom` keys (`BackendCommand::CreateNode`'s `init`,
+  `NodeInit`); the vault client does the same for an encrypted store in the browser. The
+  icon is the ordinary custom icon, `photo` for an image node and `chalkboard` for a
+  whiteboard; the title is explicit.
+- **Making one**: a row's menu has "New Whiteboard", "New Image..." (several files; the
+  browser's hidden file input) and "Paste Image" (desktop: the clipboard's bitmap as
+  PNG). Image files dropped on a tree row (desktop: rinch's `onfiledrop` on the row;
+  browser: page-level `dragover`/`drop` listeners finding the row by `data-pimble-row`)
+  and, in the browser, Ctrl+V with no editor or field holding the keyboard (the tree's
+  selected row is the parent) make an image node per picture, in order: one `PutBlob` at
+  a time (`pictures.rs`'s path: scaled to fit, refusals as sentences), then the node.
+  `StoredBlob` now carries the stored picture's pixel size. An image node's board is
+  "Layer 1" over a locked layer "Picture" holding the picture at one unit per pixel. A
+  row on a mount makes the node under the mount's source.
+- **Showing one**: a pane holding a board node shows a `RenderSurface` painted by
+  `BoardView` (`PaneState::show_board`, `PaneState::board`); its editor stays mounted
+  and hidden. The render callback and every change call `present`, which resizes the
+  view to `layout_size` and submits a frame only when `frame()` answers one. Fitted to the
+  visible extent on first show (never above one unit per CSS pixel), wheel zoom about the
+  cursor with `settle` 150 ms after the last step, pan with middle-drag and space-drag,
+  Fit and 1:1 in the toolbar. Pictures come from the blob cache (`GetBlob`/`BlobLoaded`,
+  `pictures::held_bytes`), decoded on a thread of their own on the desktop and on a
+  timer turn in the browser; the rectangles of the elements showing a picture are
+  re-rendered when it arrives. Layouts with board panes are remembered and restored like
+  documents.
+- **Collaboration**: each pane holds its own `NodeDoc` of the node (joined from a sibling
+  pane's copy when one holds it), `Board::of_node` with a per-pane origin, a `Board::watch`
+  and `BoardView::update` on every change. A local edit is one `Board::edit`, sent as
+  `BroadcastChanges` (`applyEdit`, the one write path) and handed to the window's other
+  panes on the node a turn later; `RemoteChanges` and the open/reconnect reconcile
+  (`ReconcileNodeContent`) apply to every board pane holding the node. One subscription
+  per node, counted across editors and boards (`AppStore::is_editing`).
+- **Tools** (the one toolbar shows them while a board pane has the focus): select (click,
+  drag to move by writing `transform` about every 80 ms and on release, Delete or
+  Backspace, Escape), pen (an element at the press, points appended every 100 ms, then
+  `smooth_stroke` and `replace_points` on release), six colors and three widths, undo and
+  redo per pane (`UndoManager` over the pane's origin, a step per stroke; Ctrl+Z,
+  Ctrl+Shift+Z, Ctrl+Y). Locked elements and elements in locked layers cannot be selected.
+  The floating markup control sits top-right ("Markup · N", dimmed "Markup hidden") and
+  writes `markup_visible`; it is shown whenever the board has marks, not only on hover.
+  A node this device may only read refuses tool edits and the toggle with the read-only
+  sentence; the editing half of the toolbar is dimmed.
+- **Author**: the desktop takes the account from `cloudStatus` (which now answers
+  `user_id`), the browser from its unlocked session; the name is the email's local part.
+- **Search**: `BoardPlugin` in `pimble-plugins` indexes `NodeDoc::board_units()` for board
+  nodes; the browser's vault search reads the same units for an encrypted store.
+- **Web build**: `web/.cargo/config.toml` turns on `+simd128` for `wasm32-unknown-unknown`
+  (the release wasm carries SIMD instructions; trunk's wasm-opt took it as is).
+
+**Verified (2026-10-09):**
+- Tests: `pimble-app` (all 136, including `boards::tests`: two panes in step, a peer's
+  update in both, per-pane undo, one subscription; an image board's locked picture
+  layer), `pimble-server --test search` (a board node created with its board and found by
+  its words), `pimble-plugins`; `cargo check --workspace --all-targets` and the wasm check
+  clean.
+- Desktop, an isolated release app (own port 7473, own config and data, a scratch store),
+  driven over rinch's debug port (`PIMBLE_DEBUG_IMAGES` names the files "New Image..."
+  takes instead of the dialog): New Whiteboard and New Image with two PNGs (three rows in
+  order, the right icons), the image shown 1:1, a pen stroke, the markup toggle both ways,
+  "Open in Split View" with the same board in both panes and a stroke from the second
+  appearing in the first, wheel zoom, select and drag, Delete, Ctrl+Z bringing it back, a
+  stroke on the whiteboard, then a restart with both panes and both boards back.
+- Chromium (Playwright) on the local stack, a plain hosted store, the stack's own made-up
+  account: New Whiteboard, a pen stroke in one tab arriving live in a second tab, New
+  Image with two files through the file input, a synthetic file drop on the store row and
+  a synthetic paste with a row selected (nodes "dropped square" and "Picture"), and the
+  stroke's element stamped with the account's id and name on the hosted disk.
+
+**Not exercised / known gaps:**
+- Firefox was not run. A real OS drop on the desktop tree and the desktop "Paste Image"
+  with a real clipboard bitmap were not driven (the debug port cannot), nor a read-only
+  board.
+- The desktop has no Ctrl+V on a tree row: rinch gives elements no key events and a menu
+  chord with Ctrl would take Ctrl+V from the editor, so it is the row's "Paste Image".
+- `SurfaceEvent::MouseWheel` carries no modifiers, so a plain wheel zooms (Ctrl+wheel and
+  a trackpad pinch cannot be told apart from scrolling yet). The wheel's sign differs per
+  backend and is flipped in `boards.rs`.
+- Desktop pointer events are logical pixels and frames physical; the scale is read from
+  the surface's box (`bounds_signal`), the browser's from `devicePixelRatio`.
+- Hit testing is by element bounds, so a click inside a long diagonal stroke's box selects
+  it. No marquee, resize or rotate; the selection outline is a DOM box.
+- A board pane does not follow a transplant of its node (documents do); a board in a
+  pane whose store closes stays as it was, as documents do.
+- Images wave 2 and 3 still apply: pictures on boards do not replicate, and an encrypted
+  store in the browser takes no image node ("Pictures in encrypted stores ...").
+- Pen pressure is stored as 0.5; strokes draw at constant width.
+
+**For rinch's pointer-event PR (pressure, pinch, capture)**, to wire in later in
+`boards.rs::on_event`: pen pressure into the third point value (it is stored per point
+already), pointer type to choose pen vs. touch-pan, a pinch gesture into `zoom_at` plus the
+same settle timer, wheel modifiers for Ctrl+wheel versus plain-wheel pan, and pointer
+capture on the desktop so a stroke or drag that leaves the surface keeps its moves and
+gets its release (the browser already captures on `pointerdown`).

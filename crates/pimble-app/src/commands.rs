@@ -101,11 +101,18 @@ pub async fn process_command(
             }
         }
 
-        BackendCommand::CreateNode { store_id, parent_id, title } => {
+        BackendCommand::CreateNode { store_id, parent_id, title, init } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
-            match c.create_node(store_id, parent_id, "document", &title).await {
+            let created = match init {
+                None => c.create_node(store_id, parent_id, pimble_core::node_types::DOCUMENT, &title).await,
+                Some(init) => {
+                    c.create_node_with(store_id, parent_id, init.node_type, &title, Some(init.content), init.custom.into_iter().collect())
+                        .await
+                }
+            };
+            match created {
                 Ok(node_id) => Some(BackendEvent::NodeCreated { store_id, parent_id, node_id }),
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
@@ -618,6 +625,7 @@ pub async fn process_command(
                 Err(_) => Some(BackendEvent::CloudStatusChanged {
                     signed_in: true,
                     email: Some(email),
+                    user_id: None,
                     url: Some(url),
                 }),
             }
@@ -628,7 +636,7 @@ pub async fn process_command(
                 return Some(BackendEvent::CloudError { op: CloudOp::SignOut, message: "Not connected".into() });
             };
             match c.cloud_sign_out().await {
-                Ok(()) => Some(BackendEvent::CloudStatusChanged { signed_in: false, email: None, url: None }),
+                Ok(()) => Some(BackendEvent::CloudStatusChanged { signed_in: false, email: None, user_id: None, url: None }),
                 Err(e) => Some(BackendEvent::CloudError { op: CloudOp::SignOut, message: e.to_string() }),
             }
         }
@@ -795,7 +803,11 @@ async fn store_picture(
             let message = e.to_string();
             message.strip_prefix("Forbidden: ").map(str::to_string).unwrap_or(message)
         })?;
-    Ok(crate::protocol::StoredBlob { url, notice: fitted.notice })
+    let size = ::image::ImageReader::new(std::io::Cursor::new(&fitted.bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(|reader| reader.into_dimensions().ok());
+    Ok(crate::protocol::StoredBlob { url, size, notice: fitted.notice })
 }
 
 /// `pimble_image::fit` off the runtime's own threads: scaling a huge picture
@@ -838,7 +850,7 @@ fn store_sync_changed(store_id: pimble_core::StoreId, answer: pimble_rpc::GetSto
 
 /// The `CloudStatusChanged` event for a `cloudStatus` answer.
 fn cloud_status_event(status: pimble_rpc::CloudStatusResponse) -> BackendEvent {
-    BackendEvent::CloudStatusChanged { signed_in: status.signed_in, email: status.email, url: status.url }
+    BackendEvent::CloudStatusChanged { signed_in: status.signed_in, email: status.email, user_id: status.user_id, url: status.url }
 }
 
 /// Build a `RemoteEndpoint` for a URL typed into a modal: an empty token

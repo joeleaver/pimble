@@ -791,6 +791,13 @@ pub struct AppStore {
     /// Read reactively wherever a colour depends on the scheme.
     pub dark_mode: Signal<bool>,
 
+    /// The board tools (docs/IMAGE_MARKUP_CONTRACT.md section 4), one set for
+    /// the one toolbar: the tool, the pen's color (`#rrggbb`) and width in
+    /// board units. They act on whichever board pane has the focus.
+    pub board_tool: Signal<crate::boards::Tool>,
+    pub board_color: Signal<String>,
+    pub board_width: Signal<f32>,
+
     /// The explorer's width in pixels: dragged at its right edge, persisted
     /// with the theme.
     pub sidebar_width: Signal<f32>,
@@ -1022,6 +1029,18 @@ pub struct PaneState {
     /// store is open and the node is known (docs/SPLIT_VIEW_CONTRACT.md
     /// "Persistence").
     pub restore: Signal<Option<(StoreId, NodeId)>>,
+    /// Whether the pane shows a board (docs/IMAGE_MARKUP_CONTRACT.md section
+    /// 1, "Showing one") instead of its editor, which stays mounted, hidden.
+    pub show_board: Signal<bool>,
+    /// The board node the pane holds: its canonical pair, like
+    /// `active_edit` for a document. Never both at once.
+    pub board: Signal<Option<ActiveEdit>>,
+    /// What the floating markup control shows: how many marks the board has
+    /// and whether they are shown (`markup_visible`).
+    pub board_marks: Signal<(usize, bool)>,
+    /// The selected element's rectangle over the board view, in the pane's
+    /// logical pixels (left, top, width, height), for the selection outline.
+    pub board_selection: Signal<Option<(f32, f32, f32, f32)>>,
 }
 
 impl PaneState {
@@ -1032,6 +1051,10 @@ impl PaneState {
             active_edit: Signal::new(None),
             pending_anchor: Signal::new(None),
             restore: Signal::new(None),
+            show_board: Signal::new(false),
+            board: Signal::new(None),
+            board_marks: Signal::new((0, true)),
+            board_selection: Signal::new(None),
         }
     }
 }
@@ -1090,6 +1113,9 @@ impl AppStore {
             appearance_icon_query: Signal::new(String::new()),
             appearance_tags_text: Signal::new(String::new()),
             dark_mode: Signal::new(true),
+            board_tool: Signal::new(crate::boards::Tool::default()),
+            board_color: Signal::new(crate::boards::DEFAULT_COLOR.to_string()),
+            board_width: Signal::new(crate::boards::DEFAULT_WIDTH),
             sidebar_width: Signal::new(SIDEBAR_DEFAULT_WIDTH),
             mount_picker_target: Signal::new(None),
             mount_picker_selected: Signal::new(String::new()),
@@ -1180,6 +1206,19 @@ impl AppStore {
     /// and drop. A store row's own items ask [`AppStore::store_access`].
     pub fn node_access(&self, store_id: StoreId, node_id: NodeId) -> pimble_core::StoreAccess {
         untracked(|| self.node_access_in(store_id, node_id))
+    }
+
+    /// [`AppStore::node_access`], tracked, for a reactive closure: one signal
+    /// read at a time (a tracked read inside another signal's `with` panics,
+    /// see `pane_view::editor_read_only`).
+    pub fn node_access_tracked(&self, store_id: StoreId, node_id: NodeId) -> pimble_core::StoreAccess {
+        let store_sig = self.store_data.with(|map| map.get(&store_id).copied());
+        let store_access = store_sig.map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|s| s.access));
+        if !store_access.allows_write() {
+            return store_access;
+        }
+        let node_sig = self.node_data.with(|map| map.get(&(store_id, node_id)).copied());
+        node_sig.map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|n| n.access))
     }
 
     /// The access the held copy of a node carries (untracked), whatever its
@@ -1597,16 +1636,25 @@ impl AppStore {
         untracked(|| PaneId::ALL.into_iter().filter(|pane| self.pane(*pane).active_edit.get() == edit).collect())
     }
 
-    /// Whether any pane's editor has this node open, untracked.
-    pub fn is_editing(&self, store_id: StoreId, node_id: NodeId) -> bool {
-        !self.panes_editing(store_id, node_id).is_empty()
+    /// The panes holding this board node, untracked.
+    pub fn panes_boarding(&self, store_id: StoreId, node_id: NodeId) -> Vec<PaneId> {
+        let edit = Some(ActiveEdit { store_id, node_id });
+        untracked(|| PaneId::ALL.into_iter().filter(|pane| self.pane(*pane).board.get() == edit).collect())
     }
 
-    /// Every node open in some pane's editor, each once, untracked.
+    /// Whether any pane holds this node, in its editor or as a board,
+    /// untracked: what a node's subscription is counted by.
+    pub fn is_editing(&self, store_id: StoreId, node_id: NodeId) -> bool {
+        !self.panes_editing(store_id, node_id).is_empty() || !self.panes_boarding(store_id, node_id).is_empty()
+    }
+
+    /// Every node some pane holds (a document in its editor, or a board),
+    /// each once, untracked.
     pub fn edited_nodes(&self) -> Vec<ActiveEdit> {
         let mut nodes: Vec<ActiveEdit> = Vec::new();
         for pane in PaneId::ALL {
-            if let Some(edit) = untracked(|| self.pane(pane).active_edit.get()) {
+            let held = untracked(|| self.pane(pane).active_edit.get().or_else(|| self.pane(pane).board.get()));
+            if let Some(edit) = held {
                 if !nodes.contains(&edit) {
                     nodes.push(edit);
                 }
@@ -1644,6 +1692,7 @@ impl AppStore {
     pub fn clear_pane(&self, pane: PaneId) {
         self.select_in_pane(pane, None);
         self.pane(pane).show_editor.set(false);
+        self.pane(pane).show_board.set(false);
         self.pane(pane).restore.set(None);
         if pane == self.focused() {
             self.node_title.set(String::new());
@@ -1661,7 +1710,12 @@ impl AppStore {
         let mut documents = Vec::new();
         for pane in tiling.panes() {
             let state = self.pane(pane);
-            let held = state.active_edit.get().map(|edit| (edit.store_id, edit.node_id)).or_else(|| state.restore.get());
+            let held = state
+                .active_edit
+                .get()
+                .or_else(|| state.board.get())
+                .map(|edit| (edit.store_id, edit.node_id))
+                .or_else(|| state.restore.get());
             if let Some((store_id, node_id)) = held {
                 documents.push(crate::panes::SavedDocument { pane, store_id, node_id });
             }

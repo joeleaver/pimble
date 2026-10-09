@@ -295,6 +295,7 @@ fn open_node_in(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
     // in place rather than reloaded. A node the cache has never seen is
     // fetched; `NodeLoaded` starts the session then.
     let parsed = parse_tree_value(&value);
+    let mut is_board = false;
     let (title_opt, content_bytes_opt, is_document, sel_ids) = if let Some((s_id, node_id_opt)) = parsed {
         if let Some(n_id) = node_id_opt {
             let result = store.get_node_signal(s_id, n_id).map(|sig| {
@@ -305,11 +306,15 @@ fn open_node_in(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
                         "Untitled".to_string()
                     };
                     let is_doc = node.node_type == pimble_core::node_types::DOCUMENT;
-                    (label, node.content.clone(), is_doc)
+                    let board = node.node_type == pimble_core::node_types::BOARD;
+                    (label, node.content.clone(), is_doc, board)
                 })
             });
             match result {
-                Some((label, content, is_doc)) => (Some(label), Some(content), is_doc, Some((s_id, n_id))),
+                Some((label, content, is_doc, board)) => {
+                    is_board = board;
+                    (Some(label), Some(content), is_doc, Some((s_id, n_id)))
+                }
                 None => {
                     store.send(BackendCommand::GetNode { store_id: s_id, node_id: n_id });
                     (None, None, false, None)
@@ -328,6 +333,7 @@ fn open_node_in(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
     };
 
     state.show_editor.set(is_document);
+    state.show_board.set(is_board);
 
     if let Some(title) = title_opt.filter(|_| focused) {
         store.node_title.set(title);
@@ -337,6 +343,13 @@ fn open_node_in(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
         let content_bytes = content_bytes_opt.unwrap_or_default();
         if let Some((s_id, n_id)) = sel_ids {
             start_editing(store, pane, s_id, n_id, &content_bytes);
+        }
+    } else if is_board {
+        // A board node (docs/IMAGE_MARKUP_CONTRACT.md section 1): the pane
+        // shows its board, the editor stays mounted and hidden.
+        let content_bytes = content_bytes_opt.unwrap_or_default();
+        if let Some((s_id, n_id)) = sel_ids {
+            crate::boards::start(store, pane, s_id, n_id, &content_bytes);
         }
     } else {
         stop_editing(store, pane);
@@ -905,6 +918,11 @@ fn find_context_menu_handler(node: &NodeHandle) -> Option<String> {
 pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
     let store = AppStore::new();
     store.dark_mode.set(load_dark_mode());
+    // Image files dropped on a tree row, and a picture pasted with a row
+    // selected, become image nodes (docs/IMAGE_MARKUP_CONTRACT.md section 1);
+    // the desktop hears both through rinch, the browser through the page.
+    #[cfg(not(feature = "native"))]
+    crate::boards::install_browser_handlers(store);
     if let Some(width) = load_sidebar_width() {
         store.sidebar_width.set(width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH));
     }
@@ -1440,11 +1458,45 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         let parent_id = node_id_opt.or_else(|| store.root_node_id(s_id));
                         if let Some(pid) = parent_id {
                             store.send(BackendCommand::CreateNode {
-                                store_id: s_id, parent_id: Some(pid), title: String::new(),
+                                store_id: s_id, parent_id: Some(pid), title: String::new(), init: None,
                             });
                         }
                     }
                 }
+            };
+            // Boards (docs/IMAGE_MARKUP_CONTRACT.md section 1, "Making one"):
+            // under this row's node, a store row's root, or a mount's source.
+            let on_new_whiteboard = {
+                let nv = nv_ctx.clone();
+                move || {
+                    if let Some((s_id, parent)) = crate::boards::parent_for_row(store, &nv) {
+                        crate::boards::new_whiteboard(store, s_id, parent);
+                    }
+                }
+            };
+            let on_new_image = {
+                let nv = nv_ctx.clone();
+                move || {
+                    if let Some((s_id, parent)) = crate::boards::parent_for_row(store, &nv) {
+                        crate::boards::pick_images(store, s_id, parent);
+                    }
+                }
+            };
+            #[cfg(feature = "native")]
+            let on_paste_image = {
+                let nv = nv_ctx.clone();
+                move || {
+                    if let Some((s_id, parent)) = crate::boards::parent_for_row(store, &nv) {
+                        crate::boards::paste_image(store, s_id, parent);
+                    }
+                }
+            };
+            // The browser takes a paste with the row selected instead
+            // (`boards::install_browser_handlers`): a page cannot read the
+            // clipboard from a menu without asking.
+            #[cfg(not(feature = "native"))]
+            let on_paste_image = move || {
+                crate::events::show_notice(store, "Select the row and press Ctrl+V to paste a picture as an image node.".to_string());
             };
             let on_close_store = {
                 let nv = nv_ctx.clone();
@@ -1614,6 +1666,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 store_id: mount_ref.source_store,
                                 parent_id: Some(mount_ref.source_node),
                                 title: String::new(),
+                                init: None,
                             });
                         }
                         None => tracing::warn!("Mount node has no mount_ref yet; cannot create a child under it"),
@@ -1959,6 +2012,24 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 onclick: on_new_child,
                                 "New Node"
                             }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::Chalkboard,
+                                disabled: store_menu.new_node,
+                                onclick: on_new_whiteboard.clone(),
+                                "New Whiteboard"
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::Photo,
+                                disabled: store_menu.new_node,
+                                onclick: on_new_image.clone(),
+                                "New Image..."
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::ClipboardCopy,
+                                disabled: store_menu.new_node,
+                                onclick: on_paste_image.clone(),
+                                "Paste Image"
+                            }
                             if mounts_apply {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::Link,
@@ -2167,6 +2238,24 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 onclick: on_new_child,
                                 "New Node"
                             }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::Chalkboard,
+                                disabled: !can_write_tree,
+                                onclick: on_new_whiteboard.clone(),
+                                "New Whiteboard"
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::Photo,
+                                disabled: !can_write_tree,
+                                onclick: on_new_image.clone(),
+                                "New Image..."
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::ClipboardCopy,
+                                disabled: !can_write_tree,
+                                onclick: on_paste_image.clone(),
+                                "Paste Image"
+                            }
                             if mounts_apply {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::Link,
@@ -2270,6 +2359,21 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 }
             };
             hoist_context_menu_handler(&hit_area, &hit_area);
+            // Image files dropped on the row from the OS become image nodes
+            // under it, one per file, in order (docs/IMAGE_MARKUP_CONTRACT.md
+            // section 1). The browser finds the row by this attribute
+            // (`boards::install_browser_handlers`).
+            hit_area.set_attribute("data-pimble-row", &node_value);
+            #[cfg(feature = "native")]
+            {
+                let nv = node_value.clone();
+                let handler = __scope.register_file_drop_handler(move |paths: Vec<std::path::PathBuf>| {
+                    if let Some((s_id, parent)) = crate::boards::parent_for_row(store, &nv) {
+                        crate::boards::add_image_files(store, s_id, parent, paths);
+                    }
+                });
+                hit_area.set_attribute("data-onfiledrop", &handler.0.to_string());
+            }
             hit_area
         });
 
@@ -2315,6 +2419,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     store_id: s_id,
                     parent_id: Some(root_id),
                     title: String::new(),
+                    init: None,
                 }),
                 // Nothing to create a node under. On the desktop "New
                 // Store..." is a menu item away; a browser has no menu bar, so

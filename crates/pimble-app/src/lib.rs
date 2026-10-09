@@ -21,6 +21,7 @@
 
 pub mod app;
 pub mod appearance;
+pub mod boards;
 pub mod commands;
 pub mod editor;
 pub mod events;

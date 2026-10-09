@@ -396,6 +396,12 @@ pub(crate) fn loaded(url: BlobUrl, result: &Result<Arc<Vec<u8>>, String>) {
     }
 }
 
+/// A picture's bytes, when the cache holds them (a board shows the same
+/// pictures, decoded).
+pub(crate) fn held_bytes(url: &BlobUrl) -> Option<Arc<Vec<u8>>> {
+    shown(|shown| shown.held.get(url).cloned())
+}
+
 /// Ask again for every picture that was not here: it may have arrived since.
 /// Called when a document opens and when the connection comes back.
 pub(crate) fn retry_missing() {
@@ -555,7 +561,7 @@ mod tests {
         assert!(handle.insert_text("typed "));
 
         let url = BlobUrl::new(store_id, pimble_core::BlobId::new());
-        stored(store, request_id, &Ok(StoredBlob { url, notice: Some("It was scaled.".to_string()) }));
+        stored(store, request_id, &Ok(StoredBlob { url, size: None, notice: Some("It was scaled.".to_string()) }));
         assert_eq!(images_in(P[0]), vec![(url.to_string(), "cat".to_string())]);
         let doc = handle.doc();
         let paragraph = doc.child(0);
@@ -568,7 +574,7 @@ mod tests {
         );
 
         // An answer nobody is waiting for does nothing.
-        stored(store, request_id, &Ok(StoredBlob { url, notice: None }));
+        stored(store, request_id, &Ok(StoredBlob { url, size: None, notice: None }));
         assert_eq!(images_in(P[0]).len(), 1);
 
         // A refusal: its sentence, and nothing inserted.
@@ -588,7 +594,7 @@ mod tests {
             _ => None,
         });
         crate::editor::stop_editing(store, P[0]);
-        stored(store, request_id.expect("asked"), &Ok(StoredBlob { url, notice: None }));
+        stored(store, request_id.expect("asked"), &Ok(StoredBlob { url, size: None, notice: None }));
         assert_eq!(store.notice.get(), NOTE_CLOSED);
 
         // No note in the pane: the menu says so and asks for nothing.

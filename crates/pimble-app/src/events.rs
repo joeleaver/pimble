@@ -542,6 +542,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     for pane in store.panes_editing(active.store_id, active.node_id) {
                         crate::editor::request_reconcile(store, pane, active.store_id, active.node_id);
                     }
+                    crate::boards::request_reconcile_all(store, active.store_id, active.node_id);
                 }
 
                 // Whether the server's keystore holds a signed-in account
@@ -829,6 +830,15 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     let state = store.pane(pane);
                     let already_editing = untracked(|| state.active_edit.get())
                         .map_or(false, |e| e.store_id == *store_id && e.node_id == node_id);
+                    let already_boarding = untracked(|| state.board.get())
+                        .is_some_and(|b| b.store_id == *store_id && b.node_id == node_id);
+                    if node.node_type == pimble_core::node_types::BOARD && !already_boarding {
+                        // A board node (docs/IMAGE_MARKUP_CONTRACT.md): the
+                        // pane shows its board, its editor hidden.
+                        state.show_editor.set(false);
+                        state.show_board.set(true);
+                        crate::boards::start(store, pane, *store_id, node_id, &content_bytes);
+                    }
                     if node.node_type == pimble_core::node_types::DOCUMENT && !already_editing {
                         // `open_node` could not tell this was a document
                         // (a search hit the tree had not loaded), so the
@@ -1240,6 +1250,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
 
             BackendEvent::NodeContentReconciled { store_id, node_id, diff, server_state_vector } => {
                 crate::editor::apply_reconcile(store, *store_id, *node_id, diff, server_state_vector);
+                crate::boards::apply_reconcile(store, *store_id, *node_id, diff, server_state_vector);
             }
 
             BackendEvent::RemoteChanges { store_id, node_id, changes } => {
@@ -1249,15 +1260,20 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // NOT re-broadcast).
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(changes) {
                     apply_remote(store, *store_id, *node_id, &bytes);
+                    crate::boards::apply_remote(store, *store_id, *node_id, &bytes);
                 }
             }
 
             BackendEvent::BlobStored { request_id, result } => {
-                crate::pictures::stored(store, *request_id, result);
+                // An image node's picture, or a picture for a note's text.
+                if !crate::boards::stored(store, *request_id, result) {
+                    crate::pictures::stored(store, *request_id, result);
+                }
             }
 
             BackendEvent::BlobLoaded { url, result } => {
                 crate::pictures::loaded(*url, result);
+                crate::boards::blob_loaded(url, result);
             }
 
             BackendEvent::SearchResults { purpose: crate::protocol::SearchPurpose::LinkPicker, results } => {
@@ -1408,7 +1424,14 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             }
 
             // Pimble Cloud account (docs/DESKTOP_ACCOUNT_CONTRACT.md "Events").
-            BackendEvent::CloudStatusChanged { signed_in, email, url } => {
+            BackendEvent::CloudStatusChanged { signed_in, email, user_id, url } => {
+                // Who board edits are stamped as (docs/IMAGE_MARKUP_CONTRACT.md
+                // section 6): the account, or nobody when signed out.
+                if *signed_in {
+                    crate::boards::set_author(user_id.clone(), email.clone());
+                } else {
+                    crate::boards::set_author(None, None);
+                }
                 tracing::info!("Cloud account: signed_in={} email={:?}", signed_in, email);
                 store.cloud_signed_in.set(*signed_in);
                 store.cloud_email.set(email.clone().unwrap_or_default());
