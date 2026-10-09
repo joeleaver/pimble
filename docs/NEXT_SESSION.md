@@ -1,5 +1,20 @@
 # Next session: start here
 
+**2026-10-09: v0.9.0, File > Import and background colors**, on rinch `main` (3c9958c,
+rinch#1481 `EditorHandle::blur` merged), with the keyboard following the pane focus.
+
+- File > "Import RTF...", "Import Word Document..." (.docx only, Joe's choice), "Import
+  Scrivener Project...", desktop and browser; a modal asks where: under the selected
+  node, or a new store (docs/IMPORT_CONTRACT.md). Verified in an isolated desktop app:
+  an RTF file and a copy of the Family Management project (634 notes, about 11 s).
+  Not driven in a browser yet.
+- Background colors: `custom_keys::BACKGROUND` tints a whole tree row; Appearance... has
+  "Text" and "Background". Scrivener labels go where the project shows them; Trash and
+  "Recovered Files" are skipped.
+- Open: pictures in RTF/Word, Scrivener notes and synopses; a large import holds the
+  command queue while it runs. `pimble-server --test vault_link` failed once in a loaded
+  full-suite run and passed alone (15/15): watch for flakiness.
+
 **2026-10-08, later: v0.8.1, one toolbar above the panes** for the focused pane (Joe's
 call that day, docs/SPLIT_VIEW_CONTRACT.md "One toolbar"), desktop and browser. Known
 gap kept: with an empty pane focused, typing still goes to the editor rinch last

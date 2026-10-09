@@ -1758,7 +1758,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-app"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1786,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-client"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "jsonrpsee",
@@ -1800,7 +1800,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-core"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1814,7 +1814,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-crdt"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "pimble-core",
@@ -1830,7 +1830,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-crypto"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -1850,7 +1850,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-image"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "image",
  "pimble-core",
@@ -1859,7 +1859,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-import"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1872,7 +1872,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-rpc"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "jsonrpsee",
  "pimble-core",
@@ -1885,7 +1885,7 @@ dependencies = [
 
 [[package]]
 name = "pimble-web"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
