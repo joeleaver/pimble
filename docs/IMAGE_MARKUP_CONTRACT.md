@@ -489,3 +489,115 @@ tools (a scale bar and distances).
     pixels, always live; a frozen copy is "Flatten into New Image".
 12. **Showing and hiding markup** is one setting on the node, shared by everyone, never
     per person or per device (section 5).
+
+## Built in wave 1 (pimble-board)
+
+`crates/pimble-board` (2026-10-09, branch `boards`): the board document, the renderer and
+the raster cache, native and wasm32, no UI and no rinch. The app is not wired yet.
+
+**The document** (`Board`, `BoardTxn`, `doc.rs`). A `Board` is a handle on where a board
+lives: `Board::of_node(&NodeDoc)` (`data.board`), `Board::in_text(&NodeDoc, id)`
+(`data.boards.<id>`), `Board::standalone()`. Writes go through `board.edit(stamp, |t| ...)`,
+one transaction answering `Edited { result, update }`: the update is an ordinary yrs update
+of the node's document, sent with `applyEdit` (there is no other way in). `BoardTxn`:
+`create`, `add_element(NewElement)`, `append_points`, `replace_points`, `set_geom`,
+`set_style`, `clear_style`, `set_transform`, `set_text` (the smallest middle edit, so
+concurrent typing in one note merges), `set_locked`, `set_parent`, `move_element`,
+`delete_element`, `add_layer`, `rename_layer`, `set_layer_visible/locked/opacity`,
+`move_layer`, `delete_layer` (with its elements), `merge_layer_down`, `move_to_layer`,
+`set_markup_visible`, `set_page`. `Stamp { author: Option<&Author>, now }`. Per-person
+undo: `Board::with_origin(o)`, `undo_manager(options)`, `undo(&mut manager, redo)` (answers
+the bytes to send). `Board::watch()` reports which elements changed (local and remote), so
+`BoardSnapshot::update` / `BoardView::update` re-read only those. `NodeDoc` gained
+`ydoc()`, `data_root()` and `board_units()` (search: one `Field("board.<kind>")` unit per
+element with text, path `f:board/<id>` or `f:boards/<board>/<id>`).
+
+**Reading and drawing.** `BoardSnapshot` (z-order, members moved with their frame or
+group, routed connectors, step numbers, text layout, bounds, `visible_extent()`,
+`render_rect()`, `markup_count()`, `authors()`, `texts()`, `hit()`, a spatial grid, a
+fingerprint per element). `render(snapshot, pictures, view, w, h, background)`,
+`render_extent(snapshot, pictures, scale)` (page, or visible extent trimmed to visible
+pixels, as straight RGBA with `encode_png`), `draw_region`. Pictures come from a
+`PictureSource` (a closure or a map from `src` to `Arc<Picture>`; `Picture::decode` takes
+PNG, JPEG, GIF, WebP; a missing one draws a grey placeholder). `BoardView` is the raster
+cache: `set_camera`, `pan_by`, `zoom_at`, `fit`, `screen_to_board`, `update(board,
+changes)` or `set_snapshot`, `begin_stroke` / `extend_stroke` / `end_stroke` /
+`cancel_stroke`, `settle(pictures)` when a zoom stops, `frame(pictures) -> Option<&[u8]>`
+(opaque RGBA at exactly the surface's size, `None` when nothing changed: hand it to
+`SurfaceWriter::submit_frame`).
+
+**Decisions where this contract was silent** (Joe may overrule any):
+- `geom` and `transform` are each one value written whole (last writer wins as a unit);
+  `style` is a map whose keys merge one by one; a picture's rotation is its `transform`
+  (no second rotation in `geom`). Transform: translate (`tx`, `ty`), then rotate `rot`
+  degrees clockwise and scale (`sx`, `sy`) about the center of the element's own
+  untransformed extent. A member's world transform is its parent's then its own, so moving
+  a frame moves its members with no writes to them.
+- A connector end that names an element also stores its last point, which is where it
+  stays if the element is deleted. Connector-to-connector ends use that point.
+- An element whose layer was deleted while it was being added is drawn in the top layer; a
+  `parent` that names nothing or makes a cycle reads as none. Unknown kinds are kept and
+  not drawn. A board keeps at least one layer.
+- `created_at` is always written; `author`, `edited_by` and `edited_at` only when someone
+  is signed in. Appending points while drawing does not stamp `edited_by` (it is the
+  drawing itself); smoothing on release does. Board-level writes (markup toggle, page,
+  layers) stamp `edited_by`/`edited_at` on the board. Timestamps are RFC 3339 UTC strings
+  and steps sort by them as strings, so every writer must use one shape.
+- Ids are 64 random bits as hex. `order` uses Greenspan's fractional-indexing keys in base
+  62 with the integer part, so adding on top keeps keys short (2000 appends: 3 characters).
+- Creating a board is explicit (`create`). Two devices creating the same board at once
+  would leave one board (a yrs map key is last-writer-wins), so a board node's board is
+  created with the node, and a picture's board gets a fresh id as section 2 says.
+- Rendering: shadows are an offset translucent fill (tiny-skia has no blur); an element's
+  opacity applies per part; pen pressure is stored but strokes draw at constant width;
+  text is Noto Sans Regular only, no shaping or kerning, a box for characters the font lacks
+  (CJK and emoji), and bars below 4 px; a spotlight dims the region being drawn and its
+  extent is its own rectangle; a card shows its element text (the node's title, written by
+  the app) or its link. A stroke stamped live blends segment by segment (a translucent
+  highlighter darkens at the joins) until its element arrives and its rectangle is
+  re-rendered from the document.
+- Elements outside a page are not dimmed yet (the view's job, later).
+
+**Spike 3 numbers** (bench: `cargo run -p pimble-board --release --example bench`; wasm:
+build the example for `wasm32-wasip1` and run it in wasmtime, which compiles wasm much as a
+browser does). Taken on a 24-core machine with a load average of 25 to 50 from other work,
+so treat them as upper bounds; the first, quieter native run was 20 to 40 % faster.
+
+| | native | wasm | wasm + simd128 |
+| --- | --- | --- | --- |
+| 4000x3000 picture + 200 elements, full render at 1:1 (4000x3000 out) | 84 ms | 101 ms | 72 ms |
+| the same fitted into 1920x1080 (scale 0.36) | 51 ms | 130 ms | 68 ms |
+| the same fitted into 3840x2160 | 150 ms | 462 ms | 220 ms |
+| a 2000-point stroke: stamping one segment into the cache (median) | 0.04 ms | 0.06 ms | 0.05 ms |
+| a frame from the cache (1920x1080 row copy) | 2 ms | 1.4 ms | 1.5 ms |
+| a frame while a zoom has not settled (nearest resample) | 3 ms | 3 ms | 3 ms |
+| 5000-element whiteboard, view settles zoomed out (all 5000 in view) | 102 ms | 134 ms | 109 ms |
+| the same, settled at about 1:1 (39 in view) | 61 ms | 82 ms | 68 ms |
+| 5000-element whiteboard: one element changes (`BoardView::update`, then the frame) | 24 + 2 ms | 19 + 2 ms | 21 + 3 ms |
+| 5000-element whiteboard: a full read and resolve | 64 ms | 53 ms | 56 ms |
+
+The contract's target (a 4000x3000 picture with 200 elements in under 200 ms in the
+browser) holds for the view-sized render a zoom settle does, with or without simd128;
+only a 4K-wide view of it passes 200 ms without simd128, so the web build should turn on
+`+simd128` (every current browser has it). A settle renders the view plus a 25 % margin
+each side, which is most of its cost at 1:1.
+
+**What the app needs to wire it** (wave 1 and 2 integration):
+- Hold the board node's `NodeDoc` (as the web's vault client does; the desktop through
+  the same `getNode`/`syncNodes` bytes), `Board::of_node`, a `Board::watch`, and on every
+  local edit or `RemoteChanges` call `BoardView::update(&board, &watch.take())`.
+- Send every `Edited.update` (and `Board::undo`'s bytes) as `BackendCommand` `applyEdit`
+  of that node; one `UndoManager` per pane session with the device's own origin.
+- A `RenderSurface` per board pane: the render callback calls `view.resize(layout_size)`
+  and `writer.submit_frame(view.frame(..))`; pointer events map through
+  `screen_to_board`; a timer calls `settle` about 150 ms after the last wheel or pinch;
+  `begin/extend/end_stroke` while drawing, appending points to the document every ~100 ms
+  and `smooth_stroke` + `replace_points` on release.
+- A `PictureSource` over the blob cache (`GetBlob`/`BlobLoaded`), decoding with
+  `Picture::decode` off the UI thread, and `view.invalidate(rect)` for a picture whose
+  bytes arrive late.
+- `Author` from `CloudStatus` (desktop) or the token (browser); `None` when signed out.
+- Search: call `NodeDoc::board_units()` from the indexer for board nodes (the server picks
+  `index_units` by plugin; there is no board plugin yet).
+- The `pimble-blob:` loader for marked-up pictures and `pimble-board:` embeds:
+  `render_extent` at the text's width times the screen scale.
