@@ -88,6 +88,8 @@ async fn search_finds_the_document_containing_the_query_term() {
             parent_id: Some(root_id),
             node_type: "document".into(),
             title: "Alpha".into(),
+            content: None,
+            custom: Default::default(),
         })
         .await
         .unwrap()
@@ -98,6 +100,8 @@ async fn search_finds_the_document_containing_the_query_term() {
             parent_id: Some(root_id),
             node_type: "document".into(),
             title: "Beta".into(),
+            content: None,
+            custom: Default::default(),
         })
         .await
         .unwrap()
@@ -142,6 +146,8 @@ async fn search_no_longer_finds_a_deleted_node() {
             parent_id: Some(root_id),
             node_type: "document".into(),
             title: "Gone Soon".into(),
+            content: None,
+            custom: Default::default(),
         })
         .await
         .unwrap()
@@ -183,6 +189,8 @@ async fn rebuild_index_reindexes_every_node_from_scratch() {
             parent_id: Some(root_id),
             node_type: "document".into(),
             title: "Rebuilt".into(),
+            content: None,
+            custom: Default::default(),
         })
         .await
         .unwrap()
@@ -225,6 +233,8 @@ async fn empty_stores_list_searches_all_open_stores() {
             parent_id: Some(root_a),
             node_type: "document".into(),
             title: "In A".into(),
+            content: None,
+            custom: Default::default(),
         })
         .await
         .unwrap()
@@ -237,6 +247,8 @@ async fn empty_stores_list_searches_all_open_stores() {
             parent_id: Some(root_b),
             node_type: "document".into(),
             title: "In B".into(),
+            content: None,
+            custom: Default::default(),
         })
         .await
         .unwrap()
@@ -274,6 +286,8 @@ async fn reopening_a_store_preserves_its_search_index() {
             parent_id: Some(root_id),
             node_type: "document".into(),
             title: "Survives Restart".into(),
+            content: None,
+            custom: Default::default(),
         })
         .await
         .unwrap()
@@ -295,4 +309,56 @@ async fn reopening_a_store_preserves_its_search_index() {
         after.results
     );
     assert_eq!(after.results[0].node_id, doc_id);
+}
+
+/// A board node (docs/IMAGE_MARKUP_CONTRACT.md): created with its board in
+/// the same edit, the way the app makes one, it holds that board and its
+/// custom keys at once, and the words written on the board are what search
+/// finds in it.
+#[tokio::test]
+async fn a_board_node_starts_with_its_board_and_its_words_are_found() {
+    use pimble_board::{Board, Geom, Kind, NewElement, Rect, Stamp};
+
+    let (handler, store_id, root_id, _dir) = new_handler_with_store().await;
+
+    let board = Board::standalone();
+    let (_, update) = board
+        .edit(Stamp::new(None, "2026-10-09T10:00:00.000Z"), |t| {
+            t.create()?;
+            t.add_element(NewElement::new(Kind::Sticky, Geom::Rect(Rect::new(0.0, 0.0, 200.0, 120.0))).with_text("periwinkle retro notes"))
+        })
+        .into_result()
+        .unwrap();
+    let mut custom = std::collections::HashMap::new();
+    custom.insert("icon".to_string(), serde_json::json!("chalkboard"));
+    let node_id = handler
+        .create_node(&pimble_server::service_extensions(), CreateNodeRequest {
+            store_id,
+            parent_id: Some(root_id),
+            node_type: pimble_core::node_types::BOARD.into(),
+            title: "Whiteboard".into(),
+            content: Some(base64::engine::general_purpose::STANDARD.encode(update.unwrap())),
+            custom,
+        })
+        .await
+        .unwrap()
+        .node_id;
+
+    let node = handler
+        .get_node(&pimble_server::service_extensions(), pimble_rpc::GetNodeRequest { store_id, node_id })
+        .await
+        .unwrap()
+        .node;
+    assert_eq!(node.node_type, pimble_core::node_types::BOARD);
+    assert_eq!(node.metadata.icon(), Some("chalkboard"));
+    let doc = NodeDoc::load(&node.content).unwrap();
+    let held = Board::of_node(&doc).snapshot();
+    assert!(held.exists, "the board came with the node");
+    assert_eq!(held.texts().len(), 1);
+
+    tokio::time::sleep(PAST_INDEX_DEBOUNCE).await;
+    let response = search(&handler, "periwinkle", Vec::new()).await;
+    assert_eq!(response.results.len(), 1, "got {:?}", response.results);
+    assert_eq!(response.results[0].node_id, node_id);
+    assert_eq!(response.results[0].node_type, pimble_core::node_types::BOARD);
 }

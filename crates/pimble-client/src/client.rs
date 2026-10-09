@@ -391,11 +391,28 @@ impl PimbleClient {
         node_type: impl Into<String>,
         title: impl Into<String>,
     ) -> Result<NodeId> {
+        self.create_node_with(store_id, parent_id, node_type, title, None, Default::default()).await
+    }
+
+    /// Create a new node that starts with `content` (a yrs update merged into
+    /// its document) and `custom` metadata, in the one edit that creates it.
+    pub async fn create_node_with(
+        &self,
+        store_id: StoreId,
+        parent_id: Option<NodeId>,
+        node_type: impl Into<String>,
+        title: impl Into<String>,
+        content: Option<Vec<u8>>,
+        custom: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<NodeId> {
+        use base64::Engine;
         let request = CreateNodeRequest {
             store_id,
             parent_id,
             node_type: node_type.into(),
             title: title.into(),
+            content: content.map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+            custom,
         };
 
         let response = self

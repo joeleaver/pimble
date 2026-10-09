@@ -168,11 +168,58 @@ impl NodePlugin for FolderPlugin {
     }
 }
 
+/// Built-in board plugin (docs/IMAGE_MARKUP_CONTRACT.md): a board node is
+/// only its board, so what search finds in it is the text written on the
+/// board (`NodeDoc::board_units`), never the unused `content` root.
+pub struct BoardPlugin;
+
+impl NodePlugin for BoardPlugin {
+    fn info(&self) -> PluginInfo {
+        PluginInfo {
+            id: "builtin.board".to_string(),
+            name: "Board".to_string(),
+            version: "0.1.0".to_string(),
+            node_type: pimble_core::node_types::BOARD.to_string(),
+            description: "An image node or a whiteboard: a co-edited canvas".to_string(),
+        }
+    }
+
+    fn node_type(&self) -> &str {
+        pimble_core::node_types::BOARD
+    }
+
+    fn schema(&self) -> NodeSchema {
+        NodeSchema { version: 1, fields: vec![] }
+    }
+
+    fn render(&self, _content: &[u8]) -> Result<RenderOutput> {
+        Ok(RenderOutput { widgets: serde_json::json!({ "type": "board_view" }), actions: vec![] })
+    }
+
+    fn extract_text(&self, content: &[u8]) -> Result<String> {
+        let units = self.index_units(content)?;
+        Ok(units.into_iter().map(|u| u.text).collect::<Vec<_>>().join("\n"))
+    }
+
+    fn index_units(&self, content: &[u8]) -> Result<Vec<pimble_core::IndexUnit>> {
+        Ok(pimble_crdt::NodeDoc::load(content).map(|doc| doc.board_units()).unwrap_or_default())
+    }
+
+    fn validate(&self, _content: &[u8]) -> Result<ValidationResult> {
+        Ok(ValidationResult::ok())
+    }
+
+    fn init_content(&self) -> Result<Vec<u8>> {
+        Ok(pimble_crdt::NodeDoc::new().save())
+    }
+}
+
 /// Create a plugin host with built-in plugins registered
 pub fn create_default_host() -> PluginHost {
     let mut host = PluginHost::new();
     host.register(DocumentPlugin);
     host.register(FolderPlugin);
+    host.register(BoardPlugin);
     host
 }
 

@@ -245,6 +245,16 @@ pub struct CreateNodeRequest {
     pub parent_id: Option<NodeId>,
     pub node_type: String,
     pub title: String,
+    /// A yrs update (base64) merged into the new node's document in the same
+    /// edit that creates it: what a node starts with that must never be
+    /// written twice (a board node's board, docs/IMAGE_MARKUP_CONTRACT.md
+    /// section 1: two devices creating one board would keep only one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// `metadata.custom` keys the node starts with (its icon, an explicit
+    /// title), written in the same edit.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub custom: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Response after creating a node
@@ -919,6 +929,10 @@ pub struct CloudStatusResponse {
     pub signed_in: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+    /// The account's id (its `sub`): who a board element is stamped as
+    /// (docs/IMAGE_MARKUP_CONTRACT.md section 6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 }

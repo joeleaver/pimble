@@ -2916,8 +2916,13 @@ impl PimbleApiServer for RpcHandler {
     async fn cloud_status(&self, ext: &Extensions) -> Result<CloudStatusResponse, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "cloudStatus")?;
         match self.keystore.account().await {
-            Some(account) => Ok(CloudStatusResponse { signed_in: true, email: Some(account.email), url: Some(account.url) }),
-            None => Ok(CloudStatusResponse { signed_in: false, email: None, url: None }),
+            Some(account) => Ok(CloudStatusResponse {
+                signed_in: true,
+                email: Some(account.email),
+                user_id: Some(account.user_id),
+                url: Some(account.url),
+            }),
+            None => Ok(CloudStatusResponse { signed_in: false, email: None, user_id: None, url: None }),
         }
     }
 
@@ -3517,6 +3522,15 @@ impl PimbleApiServer for RpcHandler {
 
         let mut node = Node::new(&request.node_type);
         node.metadata.title = request.title;
+        // What the node starts with goes in with the create, one edit
+        // (`LocalStore::create_node` merges it into the new document).
+        if let Some(content) = &request.content {
+            use base64::Engine;
+            node.content = base64::engine::general_purpose::STANDARD
+                .decode(content)
+                .map_err(|e| to_rpc_error(format!("the new node's content is not base64: {e}")))?;
+        }
+        node.metadata.custom = request.custom;
 
         let mut manager = self.store_manager.write().await;
         // `parent_id: None` creates under the root.

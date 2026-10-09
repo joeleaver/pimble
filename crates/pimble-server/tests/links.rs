@@ -47,6 +47,8 @@ impl Fixture {
                 parent_id: Some(parent),
                 node_type: "document".into(),
                 title: title.into(),
+                content: None,
+                custom: Default::default(),
             })
             .await
             .unwrap()

@@ -62,6 +62,8 @@ async fn create(handler: &RpcHandler, store_id: StoreId, parent_id: NodeId, node
             parent_id: Some(parent_id),
             node_type: node_type.into(),
             title: title.into(),
+            content: None,
+            custom: Default::default(),
         })
         .await
         .unwrap()

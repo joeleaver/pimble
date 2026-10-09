@@ -63,6 +63,9 @@ futures = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# tests/search.rs makes a board node the way the app does (its board written
+# with the create) and finds the words on it.
+pimble-board = { workspace = true }
 # A tiny local JWKS endpoint for jwt.rs's and tests/auth.rs's tests
 # (docs/CLOUD_CONTRACT.md "B: pimble-server" item 8).
 axum = "0.8"

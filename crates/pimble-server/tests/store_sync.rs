@@ -88,6 +88,8 @@ async fn sync_nodes_hands_a_fresh_replica_the_whole_tree() {
             parent_id: Some(root_id),
             node_type: "folder".into(),
             title: "Folder".into(),
+            content: None,
+            custom: Default::default(),
         })
         .await
         .unwrap()
@@ -98,6 +100,8 @@ async fn sync_nodes_hands_a_fresh_replica_the_whole_tree() {
             parent_id: Some(folder_id),
             node_type: "document".into(),
             title: "Doc".into(),
+            content: None,
+            custom: Default::default(),
         })
         .await
         .unwrap()
@@ -108,6 +112,8 @@ async fn sync_nodes_hands_a_fresh_replica_the_whole_tree() {
             parent_id: Some(root_id),
             node_type: "document".into(),
             title: "Doomed".into(),
+            content: None,
+            custom: Default::default(),
         })
         .await
         .unwrap()
