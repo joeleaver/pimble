@@ -264,10 +264,17 @@ pub fn render(
     background: Option<Color>,
 ) -> Option<Pixmap> {
     let mut pixmap = Pixmap::new(width.max(1), height.max(1))?;
-    if let Some(bg) = background {
-        pixmap.fill(tiny_color(bg, 1.0));
-    }
     draw_region(&mut pixmap, snapshot, pictures, view);
+    // The elements are drawn on a transparent layer and laid over the
+    // background, so a highlighter multiplies only what is under it on the
+    // board, never the background (which would turn it black on a dark one).
+    if let Some(bg) = background {
+        let mut out = Pixmap::new(pixmap.width(), pixmap.height())?;
+        out.fill(tiny_color(bg, 1.0));
+        let over = PixmapPaint { opacity: 1.0, blend_mode: BlendMode::SourceOver, quality: FilterQuality::Nearest };
+        out.draw_pixmap(0, 0, pixmap.as_ref(), &over, Affine::identity(), None);
+        return Some(out);
+    }
     Some(pixmap)
 }
 

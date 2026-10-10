@@ -156,3 +156,36 @@ fn hiding_markup_re_renders_everything() {
     let f = view.frame(&NoPictures).unwrap();
     assert!(f.chunks_exact(4).all(|p| p[..3] == [250, 250, 250]), "nothing but pictures shows, and there are none");
 }
+
+#[test]
+fn a_highlighter_keeps_its_color_over_a_dark_background_and_multiplies_what_is_under_it() {
+    let dark = Color::rgb(30, 31, 34);
+    let board = Board::standalone();
+    let st = Stamp::new(None, T0);
+    board.create(st).unwrap();
+    board
+        .edit(st, |t| {
+            t.add_element(
+                NewElement::new(Kind::Rect, Geom::Rect(Rect::new(0.0, -40.0, 100.0, 80.0)))
+                    .with_style(Style { fill: Some(Color::rgb(255, 255, 255)), ..Style::default() }),
+            )?;
+            t.add_element(NewElement::stroke(Kind::Highlighter, vec![[-100.0, 0.0, 0.5], [100.0, 0.0, 0.5]]))?;
+            Ok(())
+        })
+        .into_result()
+        .unwrap();
+    let mut view = BoardView::new(400, 200, dark);
+    view.set_snapshot(board.snapshot());
+    view.set_camera(Point::new(0.0, 0.0), 1.0);
+    let frame = view.frame(&NoPictures).unwrap().to_vec();
+    let px = |x: usize, y: usize| { let i = (y * 400 + x) * 4; [frame[i], frame[i + 1], frame[i + 2]] };
+    // Over empty space (x = -50 on the board): the highlighter's own yellow, not near black.
+    let empty = px(150, 100);
+    assert!(empty[0] > 150 && empty[1] > 150, "highlighter over the dark background was {empty:?}");
+    // Over the white rectangle (x = 50): white multiplied by yellow, still yellow.
+    let over = px(250, 100);
+    assert!(over[0] > 200 && over[1] > 200 && over[2] < 150, "highlighter over white was {over:?}");
+    let (w, h) = view.size();
+    let f = render(&board.snapshot(), &NoPictures, &view.view(), w, h, Some(dark)).unwrap().take();
+    assert_eq!(differing(&frame, &f), 0);
+}

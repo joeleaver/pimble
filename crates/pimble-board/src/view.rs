@@ -323,7 +323,10 @@ impl BoardView {
         let segment = &live.points[start..];
         if let Some(cache) = self.cache.as_mut() {
             let view = cache.view();
-            stamp(&mut cache.pixmap, &view, &live.kind, &live.style, segment);
+            // The cache has the background baked in, so a highlighter's
+            // multiply would darken empty space here: while drawing it is laid
+            // over plainly, and the element's own render settles it.
+            stamp(&mut cache.pixmap, &view, &live.kind, &live.style, segment, false);
         }
         self.frame_dirty = true;
     }
@@ -390,15 +393,27 @@ impl BoardView {
         (Point::new(ox, oy), w, h)
     }
 
+    /// Render the board into `pixmap` (the background filled first). The
+    /// elements are drawn on a transparent layer and laid over the
+    /// background, so a highlighter multiplies only what is under it on the
+    /// board and shows as its own color over empty space, never darkened by
+    /// the view's background (a dark theme turned it black).
+    fn render_region(&self, pixmap: &mut Pixmap, view: &View, pictures: &dyn PictureSource) {
+        self.fill_background(pixmap, view);
+        let Some(mut content) = Pixmap::new(pixmap.width(), pixmap.height()) else { return };
+        draw_region(&mut content, &self.snapshot, pictures, view);
+        if let Some(live) = &self.live {
+            stamp(&mut content, view, &live.kind, &live.style, &live.points, true);
+        }
+        let over = PixmapPaint { opacity: 1.0, blend_mode: BlendMode::SourceOver, quality: FilterQuality::Nearest };
+        pixmap.draw_pixmap(0, 0, content.as_ref(), &over, Affine::identity(), None);
+    }
+
     fn rebuild_cache(&mut self, pictures: &dyn PictureSource) {
         let (origin, w, h) = self.cache_rect_for_view();
         let mut pixmap = Pixmap::new(w, h).expect("cache size");
         let view = View::new(origin.x, origin.y, self.zoom);
-        self.fill_background(&mut pixmap, &view);
-        draw_region(&mut pixmap, &self.snapshot, pictures, &view);
-        if let Some(live) = &self.live {
-            stamp(&mut pixmap, &view, &live.kind, &live.style, &live.points);
-        }
+        self.render_region(&mut pixmap, &view, pictures);
         self.cache = Some(Cache { pixmap, origin, zoom: self.zoom });
         self.dirty.clear();
     }
@@ -418,11 +433,7 @@ impl BoardView {
         let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
         let Some(mut tmp) = Pixmap::new(w, h) else { return };
         let view = View::new(cache.origin.x + x0 as f32 / z, cache.origin.y + y0 as f32 / z, z);
-        self.fill_background(&mut tmp, &view);
-        draw_region(&mut tmp, &self.snapshot, pictures, &view);
-        if let Some(live) = &self.live {
-            stamp(&mut tmp, &view, &live.kind, &live.style, &live.points);
-        }
+        self.render_region(&mut tmp, &view, pictures);
         let paint = PixmapPaint { opacity: 1.0, blend_mode: BlendMode::Source, quality: FilterQuality::Nearest };
         if let Some(cache) = self.cache.as_mut() {
             cache.pixmap.draw_pixmap(x0, y0, tmp.as_ref(), &paint, Affine::identity(), None);
@@ -578,9 +589,14 @@ fn draw_grid(pixmap: &mut Pixmap, view: &View, spacing: f32, color: Color) {
 
 /// Stamp a run of stroke points (a segment or the whole stroke) into
 /// `pixmap` seen through `view`.
-fn stamp(pixmap: &mut Pixmap, view: &View, kind: &Kind, style: &ResolvedStyle, points: &[[f32; 3]]) {
+/// `multiply` false lays a highlighter over plainly (stamping into a cache
+/// whose background is baked in).
+fn stamp(pixmap: &mut Pixmap, view: &View, kind: &Kind, style: &ResolvedStyle, points: &[[f32; 3]], multiply: bool) {
     let Some(path) = stroke_path(points) else { return };
-    let paint = stroke_paint(kind, style.stroke, style.opacity);
+    let mut paint = stroke_paint(kind, style.stroke, style.opacity);
+    if !multiply {
+        paint.blend_mode = BlendMode::SourceOver;
+    }
     let stroke = tiny_skia::Stroke {
         width: style.width.max(0.5),
         line_cap: tiny_skia::LineCap::Round,
