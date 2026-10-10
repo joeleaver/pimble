@@ -703,3 +703,153 @@ already), pointer type to choose pen vs. touch-pan, a pinch gesture into `zoom_a
 same settle timer, wheel modifiers for Ctrl+wheel versus plain-wheel pan, and pointer
 capture on the desktop so a stroke or drag that leaves the surface keeps its moves and
 gets its release (the browser already captures on `pointerdown`).
+
+## Built in waves 2 and 3
+
+Built 2026-10-09/10 on branch `boards`, shared `pimble-app` code for the desktop and the
+browser (`crates/pimble-app/src/boards.rs` and `boards/{tools,ui,nav,export}.rs`), over
+`pimble-board` additions. Presence was left out (Joe deferred it, section 7).
+
+**pimble-board:**
+- `Element::hits` / `BoardSnapshot::hit_precise`: hit testing on what an element paints,
+  in element space through its world transform (a stroke's or line's distance, an
+  unfilled shape's outline, a filled one's or one with text's inside, a frame's border
+  and name only, a connector's route and label; groups and spotlights never).
+  `within(rect)` for the marquee (wholly inside), `frames()`.
+- `ViewOptions` carried by snapshots through `update`: `color_by_author` (every element
+  but pictures in `author_color(id)`, ten colors by an FNV hash; unauthored grey; a set
+  fill becomes the same color, translucent), `show_all` (every layer and the markup
+  drawn, nothing stored changed), `card_labels` (a card's live title and icon color by
+  its link). `BoardView::set_options`, `BoardView::set_grid` (lines under the elements,
+  multiplied by 5 until 8 px apart).
+- `render_area` (a rectangle, optionally only some elements and their members, trimmed or
+  not; `render_extent` uses it), `selection_bounds`, `RgbaImage::encode_jpeg`,
+  `render_svg` (the same `tiny-skia` paths the raster renderer fills, serialized; pictures
+  as base64 data URIs with their crop; text as glyph outlines). `paint.rs` builds every
+  part an element paints once, for both.
+- `pimble-crdt`: `NodeDoc::links()` also answers the node cards on the node's boards
+  (`f:board/<id>`, `f:boards/<board>/<id>`), so the boards that point at a node count in
+  its backlinks (the index's `links`); the backlinks UI is still deferred.
+
+**The app:**
+- **Tools** (the one toolbar; their letters in the tooltips): select V, hand H, pen P,
+  highlighter M, line L, arrow A (heads at the end, the start, both or none), rectangle
+  R, ellipse O, diamond D (fill from the style), text T, numbered step N, sticky note S,
+  connector C, frame F, eraser E (whole elements, never locked ones). Shift: lines at
+  45°, squares and circles, moves along one axis, proportional corner resizes, rotation
+  in 15° steps. Shapes, lines and frames are made once the drag passes 3 px and written
+  every 80 ms while dragged; a click with a shape tool makes one of the usual size.
+  Plain letters reach a board only while it has the keyboard, so none collide with the
+  app's own keys. An image opens on the arrow, a whiteboard on select (chosen once its
+  board is here).
+- **Text** is typed into a real `<textarea>` over the surface, at the element's place
+  and size on screen: a new text element is made by its first character, every later
+  keystroke is `set_text` (the smallest edit), so two people typing in one sticky note
+  merge (verified: two browser tabs typing at opposite ends of one note at once both
+  end with both edits). The input is given its text only when typing starts or a
+  collaborator's typing merges in, never echoed per keystroke (that dropped fast
+  letters in the browser). Escape ends it; an emptied text element goes. Double-click
+  types into a text, sticky note, shape (text inside shapes), frame name or connector
+  label; double-click on a node card opens its node in the focused pane (`follow_href`).
+- **Selection**: hit tests on geometry, outermost group picked as one, shift adds or
+  takes out, a marquee (wholly inside; shift adds), Ctrl+A. Outlines per element and
+  one box with eight resize handles and a rotate handle (DOM overlays; the press is
+  judged in `handle_at`). A plain shape's resize edits its geometry (its outline keeps
+  its width); strokes, text, groups and rotated elements scale their transform (rotated:
+  uniformly). Rotation turns each element about the selection's center. Arrow keys
+  nudge (shift ×10, a grid step when snapping), Ctrl+D duplicates (a group with its
+  members), Ctrl+]/[ (with shift: to front/back), Ctrl+G / Ctrl+Shift+G, Ctrl+L lock,
+  Delete (a group with its members); the Arrange menu has all of these plus align
+  left/centers/right/top/middles/bottom and distribute across/down. Locked elements can
+  be selected (to unlock them) but not moved; elements in locked layers are not picked.
+- **Style panel** (a side panel per board, toggled from the toolbar): color (the marks'
+  red, the appearance palette, black, white, and rinch's `ColorPicker`), fill (none or the
+  palette), width, dash, arrow heads, opacity, font size S/M/L/XL, alignment. Selecting
+  loads the first element's style; a change writes every selected element (one style key
+  each, so concurrent changes of other keys merge). A highlighter left on the first red
+  draws in the highlighter's yellow.
+- **Layers panel**: rows top first with visibility and lock (shared, undoable), the name,
+  the element count; click a row to pick it (new elements go there; a locked one refuses
+  them with a sentence), click the picked row's name to rename it (an input over the
+  list, Enter keeps, Escape drops), drag a row onto another to reorder (writes `order`),
+  the picked layer's opacity slider, New (above the picked), Delete (with its elements;
+  never the last), Merge Down, Move Selection Here.
+- **Whiteboarding**: sticky notes (grow with their text), text inside shapes,
+  connectors from an element (or a point) to an element (or a point), snapping to the
+  side whose middle the end is near, routed at render time so they follow what they
+  join; frames (named "Frame N", drawn below their contents, adopting what is wholly
+  inside when drawn; an element moved into or out of a frame joins or leaves it, its
+  transform compensated; moving a frame moves its members); groups; node cards (a tree
+  row dropped on the board, desktop through the surface's `Drop`, browser through the
+  canvas's `ondrop`; the dropped node's title is stored as the fallback text, the live
+  title and color come from the node cache, tracked, so a rename or a color change shows
+  at once); grid and snapping per viewer (toolbar; not remembered across restarts);
+  the navigator (a second surface: the visible extent and the view, re-rendered 250 ms
+  after changes, the view's rectangle over it, press or drag to move the view, the frames
+  listed below it, a click fits one).
+- **Export** (the toolbar's Export menu; Ctrl+C is Copy Picture): what is rendered is a
+  selected frame's rectangle, else just the selected elements trimmed, else the page or
+  the visible extent trimmed. Copy Picture (desktop: `rinch::clipboard::copy_image`;
+  browser: `navigator.clipboard.write` with a `ClipboardItem` looked up at run time), Save
+  as PNG / JPEG / SVG, Save with All Markup (PNG, `show_all`, the board unchanged), Save
+  Original As (a selected picture's stored bytes), Flatten into New Image (a PNG of what
+  the board shows, a new image node beside the board). Desktop saves through rinch's save
+  dialog (`PIMBLE_DEBUG_SAVE_DIR` names a directory instead, for driving it over the
+  debug port), the browser downloads. Exports are never colored by author.
+- **Attribution**: on a board with two or more authors the element under the resting
+  pointer says "Arrow, by bob, 2 hours ago (changed by alice, 5 minutes ago)" ("changed",
+  not "moved": the document records who edited last, not what); "before sign-in" for an
+  unauthored one. Color by Author is a toolbar toggle for the focused pane only.
+- **Markup control**: shown while the pointer is over the board (600 ms grace on leave)
+  or over the control itself; always shown, dimmed, while the markup is hidden.
+
+**Verified (2026-10-10):**
+- Tests: `pimble-board` (37 incl. hit testing, options, grid, export and SVG),
+  `pimble-crdt` (153, incl. a card counted as a link), `pimble-app` (141, incl. typing
+  making and editing a text element, group/duplicate/ungroup/delete, a locked layer
+  refusing new elements, constraints, resize, rotation, grid snapping, the attribution
+  sentence), `pimble-server --test search`; wasm check of `pimble-app --features web`.
+- Desktop, isolated release app (port 7473, own config and data, a scratch copy of wave
+  1's store), over rinch's debug port: every shape tool, steps, highlighter, a click in
+  an unfilled rectangle selecting nothing and on its edge selecting it, the empty
+  corner of a diagonal arrow's box selecting nothing, resize and rotate by the handles,
+  text and a sticky note typed into, a connector following a moved sticky note, a frame
+  moving its text, the eraser, a marquee, group and duplicate, a new layer drawn into,
+  renamed and reordered by drag, a layer hidden, Save as PNG / JPEG / SVG / with all
+  markup (the SVG rendered with `rsvg-convert` matches the PNG), Copy Picture (the
+  clipboard holds `image/png`), Flatten into New Image (a new node), a tree row dropped
+  as a node card and double-clicked open, Color by Author, the grid with snapping, undo
+  of typed text, a restart. Screenshots in the scratchpad's `tools/` (`02-shapes`,
+  `03b-edge-click`, `05-select-resize-rotate`, `06b-text-sticky`, `07-connector-frame`,
+  `08-eraser-marquee`, `09-group-dup-layers`, `11-layers`, `14-png-vs-svg`,
+  `13-after-export`, `15-card`, `16-card-opened`, `17b-by-author`, `20-reordered`,
+  `21-desktop-fast-typing`, `25-undo-text`, `26-grid-snap`).
+- Chromium (Playwright) on the local stack, a plain hosted store, fixture accounts
+  alice and bob (bob an editor): shapes and an arrow drawn in one tab arriving in a second
+  tab, fast typing into a sticky note, two tabs typing into one note at once converging,
+  bob's arrow and alice's note each attributed on hover, a tree row dropped as a card
+  whose title and icon color follow a rename and an Appearance change, SVG and PNG
+  downloads (`web-05-two-tabs`, `web-07-attribution`, `web-08-card`, `web-11-card-live`).
+
+**Not built, or known gaps:**
+- Wave 5 kinds (callout, spotlight, crop) have no tools; the renderer draws them. No
+  smart guides; no shadow control in the style panel; no endpoint handles on lines and
+  arrows (they resize with the box).
+- A node card's icon is a square in the node's color, not its Tabler glyph (the renderer
+  has no icon outlines).
+- Desktop: when typing ends the board hears keys again only after its next press (rinch
+  can give a surface the keyboard only through a press; a `RenderSurfaceHandle::focus`
+  would fix it upstream). The layer name is edited in one input above the list, not in
+  the row (rinch cannot focus an input created inside a reactive list row from code).
+- Moving, resizing and grouping treat a frame's or group's transform as a translation:
+  members of a rotated or scaled group keep only its offset when ungrouped, and a
+  member's move inside a rotated parent is not rotated into it.
+- Connectors are straight, from side middles or where the line leaves the box; no
+  routing around elements.
+- Exports and the navigator draw pictures that have not arrived on this device as
+  placeholders. Copy Picture in the browser was not driven (clipboard permission); Firefox
+  was not run; a read-only board and an encrypted store's board in the browser were not
+  driven with the new tools.
+- The markup control's chevron with a checkbox per layer (section 5) is not built (the
+  layers panel does it); grid, snapping, the side panel and Color by Author are not
+  remembered across restarts.
