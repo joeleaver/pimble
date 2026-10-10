@@ -550,6 +550,8 @@ struct Session {
     /// Bumped by every change; the navigator's timer of an older one does
     /// nothing.
     nav_generation: u64,
+    /// The tool this board opens on has been picked (once its board is here).
+    tool_chosen: bool,
 }
 
 impl Session {
@@ -704,17 +706,13 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
         text: None,
         options: ViewOptions { color_by_author: untracked(|| ui.by_author.get()), ..ViewOptions::default() },
         nav_generation: 0,
+        tool_chosen: false,
     };
     session.sync_view();
-    // An image opens on the arrow, a whiteboard on select (contract section 4).
-    let has_picture = session.snapshot().elements.iter().any(|e| e.raw.kind.is_picture());
     SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()] = Some(session));
     let state = store.pane(pane);
     state.board.set(Some(ActiveEdit { store_id, node_id }));
     ui.layer.set(None);
-    if untracked(|| store.focused_pane.get()) == pane {
-        store.board_tool.set(if has_picture { Tool::Arrow } else { Tool::Select });
-    }
     if first {
         store.send(BackendCommand::SubscribeNodeChanges { store_id, node_id });
     }
@@ -925,6 +923,21 @@ fn after_change(store: AppStore, pane: PaneId) {
         };
         (marks, outlines, handles, layers, frames, picture, authors, marquee, s.selected.len())
     });
+    // An image opens on the arrow, a whiteboard on select (contract section
+    // 4), once its board is here.
+    let opening = with_session(pane, |s| {
+        if s.tool_chosen || !s.snapshot().exists {
+            return None;
+        }
+        s.tool_chosen = true;
+        Some(s.snapshot().elements.iter().any(|e| e.raw.kind.is_picture()))
+    })
+    .flatten();
+    if let Some(picture) = opening {
+        if untracked(|| store.focused_pane.get()) == pane {
+            store.board_tool.set(if picture { Tool::Arrow } else { Tool::Select });
+        }
+    }
     match published {
         Some((marks, outlines, handles, layers, frames, picture, authors, marquee, count)) => {
             state.board_marks.set_if_changed(marks);

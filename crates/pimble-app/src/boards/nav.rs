@@ -56,6 +56,12 @@ fn shown_rect(s: &Session) -> Rect {
     }
 }
 
+/// The navigator's view of the board at its surface's size: everything it
+/// shows, fitted with a small margin.
+fn nav_view(s: &Session, width: u32, height: u32, scale: f32) -> pimble_board::View {
+    pimble_board::View::fit(&shown_rect(s), width, height, 6.0 * scale)
+}
+
 fn render(store: AppStore, pane: PaneId) {
     let Some(surface) = NAV_SURFACES.with(|s| s.borrow()[pane.index()].clone()) else { return };
     let (width, height) = surface.layout_size();
@@ -66,8 +72,7 @@ fn render(store: AppStore, pane: PaneId) {
     let dark = untracked(|| store.dark_mode.get());
     let writer = surface.writer();
     let drawn = with_session(pane, |s| {
-        let rect = shown_rect(s);
-        let view = pimble_board::View::fit(&rect, width, height, 6.0 * scale);
+        let view = nav_view(s, width, height, scale);
         let pixmap = pimble_board::render(s.snapshot(), &picture_source(), &view, width, height, Some(background(dark)))?;
         writer.submit_frame(pixmap.data(), width, height);
         Some(view)
@@ -79,11 +84,18 @@ fn render(store: AppStore, pane: PaneId) {
     }
 }
 
-/// The main view's rectangle over the navigator, logical pixels.
+/// The main view's rectangle over the navigator, logical pixels, from the
+/// navigator as it is now (its picture follows a moment later).
 fn place_view_rect(store: AppStore, pane: PaneId) {
-    let Some(nav) = NAV_VIEWS.with(|v| v.borrow()[pane.index()]) else { return };
+    let Some(surface) = NAV_SURFACES.with(|s| s.borrow()[pane.index()].clone()) else { return };
+    let (width, height) = surface.layout_size();
+    if width == 0 || height == 0 {
+        return;
+    }
     let scale = scale_of(pane);
     let rect = with_session(pane, |s| {
+        let nav = nav_view(s, width, height, scale);
+        NAV_VIEWS.with(|v| v.borrow_mut()[pane.index()] = Some(nav));
         let (w, h) = s.view.size();
         let r = s.view.view().board_rect(w, h);
         let (x0, y0) = nav.to_pixels(Point::new(r.x, r.y));

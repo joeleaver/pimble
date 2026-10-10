@@ -13,8 +13,46 @@ use crate::appearance::IconGlyph;
 thread_local! {
     /// Each pane's text input: (document key, node id), for focusing it.
     static TEXT_INPUTS: RefCell<[Option<(u64, usize)>; MAX_PANES]> = const { RefCell::new([None, None, None, None]) };
+    /// Each pane's layer rename input.
+    static RENAME_INPUTS: RefCell<[Option<(u64, usize)>; MAX_PANES]> = const { RefCell::new([None, None, None, None]) };
     /// Nodes a card asked about once already (`GetNode`).
     static CARD_ASKED: RefCell<HashSet<(StoreId, NodeId)>> = RefCell::new(HashSet::new());
+}
+
+/// Start renaming layer `id` (named `name`) in pane `pane`'s layers panel:
+/// Enter keeps the new name, Escape drops it.
+fn begin_rename(pane: PaneId, ui: PaneUi, id: &str, name: &str) {
+    ui.rename_text.set(name.to_string());
+    ui.renaming.set(Some(id.to_string()));
+    rinch::core::set_keyboard_interceptor(move |data| match data.key.as_str() {
+        "Enter" => {
+            run_on_main_thread(move || finish_rename(pane, ui, true));
+            true
+        }
+        "Escape" => {
+            run_on_main_thread(move || finish_rename(pane, ui, false));
+            true
+        }
+        _ => false,
+    });
+    let _ = set_timeout(0, move || {
+        if let Some((doc_key, node)) = RENAME_INPUTS.with(|t| t.borrow()[pane.index()]) {
+            rinch::core::request_focus(doc_key, node);
+        }
+    });
+}
+
+/// End a layer rename, keeping the typed name when `keep`.
+fn finish_rename(pane: PaneId, ui: PaneUi, keep: bool) {
+    rinch::core::clear_keyboard_interceptor();
+    let Some(id) = untracked(|| ui.renaming.get()) else { return };
+    ui.renaming.set(None);
+    let name = untracked(|| ui.rename_text.get());
+    if keep && !name.trim().is_empty() {
+        let Some(store) = APP.with(Cell::get) else { return };
+        new_undo_step(pane);
+        local_edit(store, pane, |t| t.rename_layer(&id, name.trim()));
+    }
 }
 
 /// Put the keyboard in pane `pane`'s text input.
@@ -123,87 +161,90 @@ pub(crate) fn render_board(__scope: &mut RenderScope, store: AppStore, pane: Pan
         untracked(|| set_card_labels(store, pane, labels));
     });
 
+    let canvas = rsx! {
+    div {
+        class: "pimble-board__canvas",
+        // A tree row dropped here becomes a node card (the browser's
+        // drop; the desktop's arrives as the surface's own `Drop`).
+        ondrop: move || tools::drop_tree_row(store, pane),
+        RenderSurface { surface: Some(surface) }
+        for (x, y, w, h) in ui.outlines.get() {
+            div {
+                key: format!("{x:.1} {y:.1} {w:.1} {h:.1}"),
+                class: "pimble-board__outline",
+                style: format!("left: {x:.1}px; top: {y:.1}px; width: {w:.1}px; height: {h:.1}px;"),
+            }
+        }
+        div {
+            class: "pimble-board__selection",
+            style: {move || match ui.handles.get() {
+                Some((x, y, w, h)) if !read_only() => format!("left: {x:.1}px; top: {y:.1}px; width: {w:.1}px; height: {h:.1}px;"),
+                _ => "display: none;".to_string(),
+            }},
+            {handles}
+        }
+        div {
+            class: "pimble-board__marquee",
+            style: {move || match ui.marquee.get() {
+                Some((x, y, w, h)) => format!("left: {x:.1}px; top: {y:.1}px; width: {w:.1}px; height: {h:.1}px;"),
+                None => "display: none;".to_string(),
+            }},
+        }
+        {text_input}
+        div {
+            class: "pimble-board__tip",
+            style: {move || match ui.tip.get() {
+                Some((x, y, _)) => format!("left: {x:.1}px; top: {y:.1}px;"),
+                None => "display: none;".to_string(),
+            }},
+            {move || ui.tip.get().map(|(_, _, text)| text).unwrap_or_default()}
+        }
+        // The floating markup control (contract section 5): shown
+        // while the pointer is over the board, and always (dimmed)
+        // while the markup is hidden.
+        div {
+            class: {move || {
+                let (_, visible) = state.board_marks.get();
+                match (visible, ui.hover.get()) {
+                    (false, _) => "pimble-board__markup pimble-board__markup--hidden",
+                    (true, true) => "pimble-board__markup pimble-board__markup--shown",
+                    (true, false) => "pimble-board__markup",
+                }
+            }},
+            style: {move || if state.board_marks.get().0 > 0 { "" } else { "display: none;" }},
+            title: {move || if read_only() { "You can read this, not change it." } else { "Show or hide the markup, for everyone" }},
+            onclick: move || {
+                if !read_only() {
+                    toggle_markup(store, pane);
+                }
+            },
+            span {
+                class: "pimble-board__markup-icon",
+                if state.board_marks.get().1 {
+                    IconGlyph { name: TablerIcon::Eye.name().to_string() }
+                } else {
+                    IconGlyph { name: TablerIcon::EyeOff.name().to_string() }
+                }
+            }
+            span {
+                {move || {
+                    let (count, visible) = state.board_marks.get();
+                    if visible { format!("Markup · {count}") } else { "Markup hidden".to_string() }
+                }}
+            }
+        }
+    }
+    };
+    // The desktop's pixel scale reads the box the surface fills.
+    BOUNDS.with(|b| b.borrow_mut()[pane.index()] = Some(canvas.bounds_signal()));
     let view = rsx! {
         div {
             class: "pimble-board",
             style: {move || if state.show_board.get() { "" } else { "display: none;" }},
-            div {
-                class: "pimble-board__canvas",
-                // A tree row dropped here becomes a node card (the browser's
-                // drop; the desktop's arrives as the surface's own `Drop`).
-                ondrop: move || tools::drop_tree_row(store, pane),
-                RenderSurface { surface: Some(surface) }
-                for (x, y, w, h) in ui.outlines.get() {
-                    div {
-                        key: format!("{x:.1} {y:.1} {w:.1} {h:.1}"),
-                        class: "pimble-board__outline",
-                        style: format!("left: {x:.1}px; top: {y:.1}px; width: {w:.1}px; height: {h:.1}px;"),
-                    }
-                }
-                div {
-                    class: "pimble-board__selection",
-                    style: {move || match ui.handles.get() {
-                        Some((x, y, w, h)) if !read_only() => format!("left: {x:.1}px; top: {y:.1}px; width: {w:.1}px; height: {h:.1}px;"),
-                        _ => "display: none;".to_string(),
-                    }},
-                    {handles}
-                }
-                div {
-                    class: "pimble-board__marquee",
-                    style: {move || match ui.marquee.get() {
-                        Some((x, y, w, h)) => format!("left: {x:.1}px; top: {y:.1}px; width: {w:.1}px; height: {h:.1}px;"),
-                        None => "display: none;".to_string(),
-                    }},
-                }
-                {text_input}
-                div {
-                    class: "pimble-board__tip",
-                    style: {move || match ui.tip.get() {
-                        Some((x, y, _)) => format!("left: {x:.1}px; top: {y:.1}px;"),
-                        None => "display: none;".to_string(),
-                    }},
-                    {move || ui.tip.get().map(|(_, _, text)| text).unwrap_or_default()}
-                }
-                // The floating markup control (contract section 5): shown
-                // while the pointer is over the board, and always (dimmed)
-                // while the markup is hidden.
-                div {
-                    class: {move || {
-                        let (_, visible) = state.board_marks.get();
-                        match (visible, ui.hover.get()) {
-                            (false, _) => "pimble-board__markup pimble-board__markup--hidden",
-                            (true, true) => "pimble-board__markup pimble-board__markup--shown",
-                            (true, false) => "pimble-board__markup",
-                        }
-                    }},
-                    style: {move || if state.board_marks.get().0 > 0 { "" } else { "display: none;" }},
-                    title: {move || if read_only() { "You can read this, not change it." } else { "Show or hide the markup, for everyone" }},
-                    onclick: move || {
-                        if !read_only() {
-                            toggle_markup(store, pane);
-                        }
-                    },
-                    span {
-                        class: "pimble-board__markup-icon",
-                        if state.board_marks.get().1 {
-                            IconGlyph { name: TablerIcon::Eye.name().to_string() }
-                        } else {
-                            IconGlyph { name: TablerIcon::EyeOff.name().to_string() }
-                        }
-                    }
-                    span {
-                        {move || {
-                            let (count, visible) = state.board_marks.get();
-                            if visible { format!("Markup · {count}") } else { "Markup hidden".to_string() }
-                        }}
-                    }
-                }
-            }
+            {canvas}
             {panel}
         }
     };
-    // The desktop's pixel scale reads the box the surface fills.
-    BOUNDS.with(|b| b.borrow_mut()[pane.index()] = Some(view.bounds_signal()));
     // The theme's background, on every board.
     let _ = rinch::Effect::new(move || {
         let dark = store.dark_mode.get();
@@ -445,10 +486,10 @@ fn render_style(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> Nod
                 class: "pimble-board__swatches",
                 {strokes}
                 div {
-                    title: "Pick a color",
+                    title: "Pick any color",
                     class: "pimble-board-swatch pimble-board-swatch--picker",
-                    style: {move || format!("background: {};", st.stroke.get())},
                     onclick: move || picker_open.update(|v| *v = !*v),
+                    IconGlyph { name: TablerIcon::ColorPicker.name().to_string() }
                 }
             }
             div {
@@ -529,6 +570,19 @@ fn render_layers(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> No
     });
     let picked = move || ui.layer.get().or_else(|| ui.layers.get().iter().find(|l| !l.locked).map(|l| l.id.clone()));
 
+    // Renaming a layer: one input over the list, given the keyboard when a
+    // rename starts; Enter keeps the name, Escape (the board's) drops it.
+    let rename_input = rsx! {
+        input {
+            r#type: "text",
+            class: "pimble-board__layer-name-input",
+            value: move || ui.rename_text.get(),
+            oninput: move |v: String| ui.rename_text.set(v),
+            onsubmit: move || finish_rename(pane, ui, true),
+        }
+    };
+    RENAME_INPUTS.with(|t| t.borrow_mut()[pane.index()] = Some((rename_input.doc_key(), rename_input.node_id().0)));
+
     let new_layer = text_button(__scope, "New", "New Layer (above the picked one)", || false, move || {
         let count = untracked(|| ui.layers.get().len());
         let above = untracked(|| ui.layer.get());
@@ -575,6 +629,11 @@ fn render_layers(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> No
         div {
             class: "pimble-board__section",
             div { class: "pimble-board__panel-title", "Layers" }
+            div {
+                class: "pimble-board__row",
+                style: {move || if ui.renaming.get().is_some() { "" } else { "display: none;" }},
+                {rename_input}
+            }
             div {
                 class: "pimble-board__layers",
                 for (row, class) in layer_rows(ui.layers.get(), ui.layer.get()) {
@@ -637,39 +696,24 @@ fn render_layers(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> No
                             },
                             IconGlyph { name: if row.locked { TablerIcon::Lock.name().to_string() } else { TablerIcon::LockOpen.name().to_string() } }
                         }
-                        if ui.renaming.get().as_deref() == Some(row.id.as_str()) {
-                            input {
-                                r#type: "text",
-                                class: "pimble-board__layer-name-input",
-                                value: move || ui.rename_text.get(),
-                                oninput: move |v: String| ui.rename_text.set(v),
-                                onsubmit: {
-                                    let id = row.id.clone();
-                                    move || {
-                                        let name = untracked(|| ui.rename_text.get());
-                                        ui.renaming.set(None);
-                                        if !name.trim().is_empty() {
-                                            new_undo_step(pane);
-                                            local_edit(store, pane, |t| t.rename_layer(&id, name.trim()));
-                                        }
+                        span {
+                            class: "pimble-board__layer-name",
+                            title: "Click to pick this layer; click its name again to rename it",
+                            onclick: {
+                                let id = row.id.clone();
+                                let name = row.name.clone();
+                                move || {
+                                    // The row's own click does not reach past this one.
+                                    if untracked(|| ui.layer.get()).as_deref() == Some(id.as_str()) {
+                                        begin_rename(pane, ui, &id, &name);
+                                    } else {
+                                        ui.layer.set(Some(id.clone()));
                                     }
-                                },
-                            }
-                        } else {
-                            span {
-                                class: "pimble-board__layer-name",
-                                title: "Double-click to rename",
-                                ondblclick: {
-                                    let id = row.id.clone();
-                                    let name = row.name.clone();
-                                    move || {
-                                        ui.rename_text.set(name.clone());
-                                        ui.renaming.set(Some(id.clone()));
-                                    }
-                                },
-                                {row.name.clone()}
-                            }
+                                }
+                            },
+                            {row.name.clone()}
                         }
+
                         span { class: "pimble-board__layer-count", title: "Elements in this layer", {row.count.to_string()} }
                     }
                 }

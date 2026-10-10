@@ -1537,7 +1537,12 @@ pub(super) fn new_style(store: AppStore, kind: &Kind) -> Style {
     let dash = (dash != Dash::Solid).then_some(dash);
     match kind {
         Kind::Pen => Style { stroke, width: Some(width), opacity, dash, ..Style::default() },
-        Kind::Highlighter => Style { stroke, width: Some(width * 5.0), opacity, ..Style::default() },
+        // The marks' red multiplied over a picture reads as a dark smear: a
+        // highlighter left on the first color is the highlighter's yellow.
+        Kind::Highlighter => {
+            let stroke = stroke.filter(|c| c.to_hex() != DEFAULT_COLOR);
+            Style { stroke, width: Some(width * 5.0), opacity, ..Style::default() }
+        }
         Kind::Line => Style { stroke, width: Some(width), opacity, dash, arrow_heads: Some(ArrowHeads::None), ..Style::default() },
         Kind::Arrow => Style { stroke, width: Some(width), opacity, dash, arrow_heads: Some(heads), ..Style::default() },
         Kind::Connector => Style { stroke, width: Some((width / 2.0).max(1.0)), opacity, dash, arrow_heads: Some(heads), ..Style::default() },

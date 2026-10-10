@@ -651,7 +651,11 @@ pub(crate) const APP_CSS: &str = "
 }
 
 .pimble-board-swatch--picker {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     border-radius: 4px;
+    color: var(--rinch-color-dimmed);
 }
 
 .pimble-board-chip {
@@ -702,6 +706,7 @@ pub(crate) const APP_CSS: &str = "
 
 .pimble-board__layer-name-input {
     flex: 1;
+    width: 100%;
     min-width: 0;
     font-size: 12px;
     height: 18px;
