@@ -265,6 +265,9 @@ pub struct NodeInit {
     pub node_type: String,
     pub content: Vec<u8>,
     pub custom: Vec<(String, serde_json::Value)>,
+    /// Handed back on `NodeCreated`, for a caller that must know which node
+    /// it made ("Convert to Image Node" writes the new node into the text).
+    pub request: Option<u64>,
 }
 
 /// A picture that was stored (`BackendEvent::BlobStored`).
@@ -293,7 +296,8 @@ pub enum BackendEvent {
     StoresListed { stores: Vec<Store> },
 
     // Node events
-    NodeCreated { store_id: StoreId, parent_id: Option<NodeId>, node_id: NodeId },
+    /// `request` is the `NodeInit::request` the node was made with.
+    NodeCreated { store_id: StoreId, parent_id: Option<NodeId>, node_id: NodeId, request: Option<u64> },
     NodeLoaded { store_id: StoreId, node: Node },
     /// `children` live in `children_store_id`: the same as `store_id` for an
     /// ordinary parent, the mount's source store when `parent_id` is a mount point.

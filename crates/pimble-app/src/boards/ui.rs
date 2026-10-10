@@ -282,6 +282,19 @@ pub(crate) fn render_board(__scope: &mut RenderScope, store: AppStore, pane: Pan
         }
     }
     };
+    // Marking up a picture in text (contract section 2): "Done" goes back
+    // to the text.
+    let done = rsx! {
+        div {
+            class: "pimble-board__done",
+            style: {move || if state.markup.get() { "" } else { "display: none;" }},
+            Button {
+                size: "xs",
+                onclick: move || end_markup(store, pane),
+                "Done"
+            }
+        }
+    };
     // The desktop's pixel scale reads the box the surface fills.
     BOUNDS.with(|b| b.borrow_mut()[pane.index()] = Some(canvas.bounds_signal()));
     let view = rsx! {
@@ -289,6 +302,7 @@ pub(crate) fn render_board(__scope: &mut RenderScope, store: AppStore, pane: Pan
             class: "pimble-board",
             style: {move || if state.show_board.get() { "" } else { "display: none;" }},
             {canvas}
+            {done}
             {panel}
         }
     };

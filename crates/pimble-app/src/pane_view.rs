@@ -127,7 +127,7 @@ fn pane_icon(store: AppStore, pane: PaneId) -> Vec<(String, String)> {
         .map(|sig| sig.with(|n| (n.metadata.icon().map(str::to_string), n.metadata.color().map(str::to_string))))
         .unwrap_or_default();
     let dark = store.dark_mode.get();
-    let fallback = if store.pane(pane).show_board.get() { TablerIcon::Chalkboard } else { TablerIcon::FileText };
+    let fallback = if store.pane(pane).show_board.get() && !store.pane(pane).markup.get() { TablerIcon::Chalkboard } else { TablerIcon::FileText };
     vec![(
         icon.unwrap_or_else(|| fallback.name().to_string()),
         color.map(|hex| display_color(&hex, dark)).unwrap_or_default(),
@@ -186,6 +186,9 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
     // A board node's view (docs/IMAGE_MARKUP_CONTRACT.md "Showing one"),
     // beside the editor and rendered once with it; shown instead of it.
     let board_view = crate::boards::render_board(__scope, store, pane);
+    // The floating controls over the picture under the pointer in the text
+    // (docs/IMAGE_MARKUP_CONTRACT.md section 5).
+    let picture_controls = crate::text_boards::render_controls(__scope, store, pane);
 
     let empty_icon = render_tabler_icon(__scope, TablerIcon::FileText, TablerIconStyle::Outline);
     let hint_lines: Vec<NodeHandle> = hints
@@ -228,6 +231,9 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                 if EDITOR_KEEPS_ITS_PRESSES && !heard {
                     focus_pane(store, pane);
                 }
+                // A click on a board embedded in the text opens it; a
+                // double-click on a picture marks it up.
+                crate::text_boards::pane_mouseup(store, pane);
             },
 
             div {
@@ -287,10 +293,18 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
             }
             div {
                 class: "pimble-editor__content-wrap",
-                style: {move || if state.show_editor.get() { "" } else { "display: none;" }},
+                // Hidden under a picture's board view while it is marked up.
+                style: {move || if state.show_editor.get() && !state.show_board.get() { "" } else { "display: none;" }},
+                onscroll: move |_| crate::text_boards::scrolled(store, pane),
+                // A board node's row dropped on the text goes in as a picture
+                // of it (docs/IMAGE_MARKUP_CONTRACT.md section 2).
+                ondrop: move || {
+                    crate::boards::take_tree_drag(|value| crate::text_boards::drop_tree_row(store, pane, value));
+                },
                 {editor_view}
             }
             {board_view}
+            {picture_controls}
             div {
                 class: "pimble-empty-state",
                 style: {move || if state.show_editor.get() || state.show_board.get() { "display: none;" } else { "" }},

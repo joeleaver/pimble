@@ -415,6 +415,11 @@ fn author() -> Option<Author> {
     AUTHOR.with(|a| a.borrow().clone())
 }
 
+/// Who board edits made outside a pane's board view are stamped as.
+pub(crate) fn current_author() -> Option<Author> {
+    author()
+}
+
 /// Milliseconds since the epoch, on both targets.
 fn now_ms() -> f64 {
     #[cfg(feature = "native")]
@@ -429,7 +434,7 @@ fn now_ms() -> f64 {
 
 /// A board timestamp: RFC 3339 UTC with milliseconds, the one shape every
 /// writer uses (steps sort by it as a string).
-fn now_stamp() -> String {
+pub(crate) fn now_stamp() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
@@ -568,6 +573,25 @@ struct Session {
     nav_generation: u64,
     /// The tool this board opens on has been picked (once its board is here).
     tool_chosen: bool,
+    /// The board view is over a note's text, marking up one of its pictures
+    /// (contract section 2): the board is `data.boards.<id>` of the note.
+    markup: Option<Markup>,
+}
+
+/// A picture in text being marked up in a pane.
+struct Markup {
+    /// The picture's `src`, by which its atom is found again.
+    src: String,
+    /// Where the atom was when the view opened (the nearest such picture to
+    /// it is the one).
+    pos: usize,
+    board_id: String,
+    /// The board, made in this pane's copy of the note when the view opened
+    /// so the picture shows, and sent with the first mark ("the first mark
+    /// mints the board id"): opening and closing the view writes nothing.
+    pending: Option<Vec<u8>>,
+    /// The atom's `board` is still to be written (with the first mark).
+    attr_needed: bool,
 }
 
 impl Session {
@@ -637,6 +661,19 @@ thread_local! {
 /// The tree's drag-and-drop context, handed over once by the app.
 pub(crate) fn set_tree_drag(ctx: DragContext<String>) {
     TREE_DRAG.with(|d| d.set(Some(ctx)));
+}
+
+/// The tree row being dragged (its tree value), when a drop takes it.
+/// `take` decides whether it is taken: a drop that does not want it leaves
+/// it to whoever else might.
+pub(crate) fn take_tree_drag(take: impl FnOnce(&str) -> bool) -> bool {
+    let Some(ctx) = TREE_DRAG.with(Cell::get) else { return false };
+    let Some(value) = ctx.get() else { return false };
+    if !take(&value) {
+        return false;
+    }
+    ctx.take();
+    true
 }
 
 fn with_session<R>(pane: PaneId, f: impl FnOnce(&mut Session) -> R) -> Option<R> {
@@ -726,6 +763,7 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
         options: ViewOptions { color_by_author: untracked(|| ui.by_author.get()), ..ViewOptions::default() },
         nav_generation: 0,
         tool_chosen: false,
+        markup: None,
     };
     session.sync_view();
     SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()] = Some(session));
@@ -746,11 +784,17 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
 pub(crate) fn stop(store: AppStore, pane: PaneId) {
     tools::end_text(store, pane);
     let Some(session) = SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()].take()) else { return };
-    if let Some(sig) = store.get_node_signal(session.store_id, session.node_id) {
+    let state = store.pane(pane);
+    if session.markup.is_some() {
+        // The note's own editor holds the note: the board view over it goes,
+        // and the text shows again. The pane's copy (which may hold a board
+        // made for a mark that never came) is dropped.
+        state.markup.set(false);
+        state.show_board.set(false);
+    } else if let Some(sig) = store.get_node_signal(session.store_id, session.node_id) {
         let bytes = session.doc.save();
         sig.update(|node| node.content = bytes);
     }
-    let state = store.pane(pane);
     state.board.set(None);
     state.board_marks.set((0, true));
     let ui = state.board_ui;
@@ -839,6 +883,8 @@ fn send_update(store: AppStore, from: PaneId, store_id: StoreId, node_id: NodeId
     use base64::Engine;
     let changes = base64::engine::general_purpose::STANDARD.encode(&bytes);
     store.send(BackendCommand::BroadcastChanges { store_id, node_id, changes });
+    // A board shown in text (a picture's markup, an embed) follows.
+    crate::text_boards::local_update(store_id, node_id, &bytes);
     let others: Vec<PaneId> = store.panes_boarding(store_id, node_id).into_iter().filter(|p| *p != from).collect();
     if others.is_empty() {
         return;
@@ -852,6 +898,168 @@ fn send_update(store: AppStore, from: PaneId, store_id: StoreId, node_id: NodeId
     deliver();
     #[cfg(not(test))]
     let _ = set_timeout(0, deliver);
+}
+
+/// Send an update of node `node_id` made outside any pane's board view (the
+/// markup toggle over a picture in text or an embed, a board copied in with a
+/// paste): to the server, to every board pane holding the node, and to what
+/// shows it in text.
+pub(crate) fn send_node_update(store: AppStore, store_id: StoreId, node_id: NodeId, bytes: Vec<u8>) {
+    use base64::Engine;
+    let changes = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    store.send(BackendCommand::BroadcastChanges { store_id, node_id, changes });
+    crate::text_boards::local_update(store_id, node_id, &bytes);
+    for pane in store.panes_boarding(store_id, node_id) {
+        apply_to(store, pane, store_id, node_id, &bytes);
+    }
+}
+
+/// The first mark on a picture in text: the board made when the view
+/// opened goes out first, then the atom's `board` is written, so the text
+/// names a board that exists.
+fn first_mark(store: AppStore, pane: PaneId, held: (StoreId, NodeId)) {
+    let Some((pending, attr)) = with_session(pane, |s| {
+        let markup = s.markup.as_mut()?;
+        let pending = markup.pending.take();
+        let attr = std::mem::take(&mut markup.attr_needed).then(|| (markup.src.clone(), markup.pos, markup.board_id.clone()));
+        Some((pending, attr))
+    })
+    .flatten() else {
+        return;
+    };
+    if let Some(bytes) = pending {
+        send_update(store, pane, held.0, held.1, bytes);
+    }
+    if let Some((src, pos, board)) = attr {
+        if !crate::text_boards::write_board_attr(pane, &src, pos, &board) {
+            tracing::warn!("the picture {src} was not in the text any more; its board {board} stays in the note's data");
+        }
+    }
+}
+
+/// "Mark Up..." on a picture in pane `pane`'s text (contract section 2):
+/// the board view over the pane, on the picture's board in the note's
+/// `data.boards`. A picture with no board yet gets one in this pane's copy
+/// of the note, shown at once and written with the first mark.
+pub(crate) fn start_markup(store: AppStore, pane: PaneId, store_id: StoreId, node_id: NodeId, src: &str, pos: usize, board: Option<String>) {
+    let Some(blob) = BlobUrl::parse(src) else { return };
+    if !store.node_access(store_id, node_id).allows_write() {
+        crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
+        return;
+    }
+    stop(store, pane);
+    APP.with(|app| app.set(Some(store)));
+    let bytes = crate::text_boards::host_bytes(store_id, node_id)
+        .or_else(|| crate::editor::editor(pane).collab_snapshot())
+        .unwrap_or_default();
+    let doc = NodeDoc::load(&bytes).unwrap_or_else(|_| NodeDoc::new());
+    let attr_needed = board.is_none();
+    let board_id = board.unwrap_or_else(pimble_board::doc::new_id);
+    let board = Board::in_text(&doc, &board_id).with_origin(format!("pimble-board-pane-{}", pane.index()));
+    let pending = if board.exists() {
+        None
+    } else {
+        // The picture at one unit per pixel in a locked layer of its own,
+        // and a layer above it to draw in, as an image node starts.
+        let size = crate::pictures::held_bytes(&blob)
+            .and_then(|bytes| Picture::decode(&bytes).ok())
+            .map(|p| (p.width(), p.height()))
+            .unwrap_or((640, 480));
+        let author = author();
+        let now = now_stamp();
+        let made = Board::in_text(&doc, &board_id).edit(Stamp::new(author.as_ref(), &now), |t| {
+            t.create()?;
+            let layer = t.add_layer("Picture", Placement::Bottom)?;
+            let geom = PictureGeom { rect: Rect::new(0.0, 0.0, size.0 as f32, size.1 as f32), src: blob.to_string(), px_w: size.0, px_h: size.1, crop: None };
+            t.add_element(NewElement::new(Kind::Picture, Geom::Picture(geom)).in_layer(layer.clone()))?;
+            t.set_layer_locked(&layer, true)?;
+            Ok(())
+        });
+        made.update
+    };
+    let dark = untracked(|| store.dark_mode.get());
+    let ui = store.pane(pane).board_ui;
+    let mut view = BoardView::new(1, 1, background(dark));
+    if untracked(|| store.board_style.grid.get()) {
+        view.set_grid(Some(GRID));
+    }
+    let mut session = Session {
+        store_id,
+        node_id,
+        doc,
+        board,
+        watch: None,
+        undo: None,
+        view,
+        fitted: false,
+        gesture: Gesture::Idle,
+        selected: Vec::new(),
+        space: false,
+        shift: false,
+        settle_generation: 0,
+        last_press: (0.0, 0.0, 0.0),
+        pointer: (0.0, 0.0),
+        driver: None,
+        touches: Vec::new(),
+        pressure: 0.5,
+        text: None,
+        options: ViewOptions { color_by_author: untracked(|| ui.by_author.get()), ..ViewOptions::default() },
+        nav_generation: 0,
+        tool_chosen: false,
+        markup: Some(Markup { src: src.to_string(), pos, board_id, pending, attr_needed }),
+    };
+    // The watch and the undo manager start after the board was made here,
+    // so undo never takes back the board itself.
+    session.sync_view();
+    SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()] = Some(session));
+    let state = store.pane(pane);
+    state.board.set(Some(ActiveEdit { store_id, node_id }));
+    state.markup.set(true);
+    state.show_board.set(true);
+    ui.layer.set(None);
+    after_change(store, pane);
+    crate::pictures::retry_missing();
+    // The keyboard goes to the board (its tools' letters, Escape).
+    crate::editor::editor(pane).blur();
+}
+
+/// A mark on pane `pane`'s board, as a tool would make one (tests).
+#[cfg(test)]
+pub(crate) fn mark_for_test(store: AppStore, pane: PaneId) {
+    local_edit(store, pane, |t| t.add_element(NewElement::new(Kind::Rect, Geom::Rect(Rect::new(10.0, 10.0, 20.0, 20.0)))));
+}
+
+/// "Done" on the board view over pane `pane`'s text: back to the text.
+pub(crate) fn end_markup(store: AppStore, pane: PaneId) {
+    if with_session(pane, |s| s.markup.is_some()) != Some(true) {
+        return;
+    }
+    stop(store, pane);
+    crate::toolbar::bump_toolbar(pane);
+    crate::editor::editor(pane).focus();
+}
+
+/// The decoded pictures `snapshot` names, for drawing it elsewhere (a
+/// picture in text, an embed), and whether every one is here; the missing
+/// ones are fetched, and `text_boards::picture_arrived` hears when they are.
+pub(crate) fn pictures_of(snapshot: &BoardSnapshot) -> (HashMap<String, Arc<Picture>>, bool) {
+    let source = picture_source();
+    let mut found = HashMap::new();
+    let mut all = true;
+    for e in &snapshot.elements {
+        if let Geom::Picture(g) = &e.raw.geom {
+            match source(&g.src) {
+                Some(picture) => {
+                    found.insert(g.src.clone(), picture);
+                }
+                None => all = false,
+            }
+        }
+    }
+    if !all {
+        request_wanted_pictures();
+    }
+    (found, all)
 }
 
 /// Whether this device may write pane `pane`'s board; says the read-only
@@ -873,6 +1081,7 @@ fn local_edit<R>(store: AppStore, pane: PaneId, f: impl FnOnce(&mut BoardTxn<'_,
     if !writable_or_say(store, pane) {
         return None;
     }
+    first_mark(store, pane, held);
     let author = author();
     let now = now_stamp();
     let (result, update) = with_session(pane, |s| {
@@ -1128,9 +1337,12 @@ fn decode(src: String, bytes: Arc<Vec<u8>>) {
 
 fn installed(src: String, picture: Result<Arc<Picture>, String>) {
     match picture {
-        Ok(picture) => PICTURES.with(|p| {
-            p.borrow_mut().decoded.insert(src.clone(), picture);
-        }),
+        Ok(picture) => {
+            PICTURES.with(|p| {
+                p.borrow_mut().decoded.insert(src.clone(), picture);
+            });
+            crate::text_boards::picture_arrived();
+        }
         Err(e) => {
             tracing::warn!("the picture {src} could not be decoded: {e}");
             return;
@@ -1274,7 +1486,7 @@ pub(crate) fn surface(store: AppStore, pane: PaneId) -> RenderSurfaceHandle {
 /// The update that makes a new board: one layer to draw in and, for an image
 /// node, the picture at one unit per pixel in a locked layer of its own below
 /// it (contract sections 1 and 3).
-fn new_board(picture: Option<(&BlobUrl, u32, u32)>) -> Option<Vec<u8>> {
+pub(crate) fn new_board(picture: Option<(&BlobUrl, u32, u32)>) -> Option<Vec<u8>> {
     let board = Board::standalone();
     let author = author();
     let now = now_stamp();
@@ -1299,7 +1511,7 @@ fn new_board(picture: Option<(&BlobUrl, u32, u32)>) -> Option<Vec<u8>> {
 
 /// Make a board node under `parent_id`, its board written in the edit that
 /// creates it (two devices creating one board would keep only one).
-fn create_board_node(store: AppStore, store_id: StoreId, parent_id: NodeId, title: &str, icon: &str, board: Vec<u8>) {
+pub(crate) fn create_board_node(store: AppStore, store_id: StoreId, parent_id: NodeId, title: &str, icon: &str, board: Vec<u8>, request: Option<u64>) {
     store.send(BackendCommand::CreateNode {
         store_id,
         parent_id: Some(parent_id),
@@ -1311,6 +1523,7 @@ fn create_board_node(store: AppStore, store_id: StoreId, parent_id: NodeId, titl
                 (pimble_core::custom_keys::ICON.to_string(), serde_json::json!(icon)),
                 (pimble_core::custom_keys::EXPLICIT_TITLE.to_string(), serde_json::json!(true)),
             ],
+            request,
         }),
     });
 }
@@ -1318,7 +1531,7 @@ fn create_board_node(store: AppStore, store_id: StoreId, parent_id: NodeId, titl
 /// A row's "New Whiteboard": an empty board under `parent_id`.
 pub(crate) fn new_whiteboard(store: AppStore, store_id: StoreId, parent_id: NodeId) {
     if let Some(board) = new_board(None) {
-        create_board_node(store, store_id, parent_id, "Whiteboard", WHITEBOARD_ICON, board);
+        create_board_node(store, store_id, parent_id, "Whiteboard", WHITEBOARD_ICON, board, None);
     }
 }
 
@@ -1393,7 +1606,7 @@ pub(crate) fn stored(store: AppStore, request_id: u64, result: &Result<StoredBlo
         Ok(blob) => match blob.size {
             Some((w, h)) if w > 0 && h > 0 => {
                 if let Some(board) = new_board(Some((&blob.url, w, h))) {
-                    create_board_node(store, store_id, parent_id, &title, PHOTO_ICON, board);
+                    create_board_node(store, store_id, parent_id, &title, PHOTO_ICON, board, None);
                 }
                 if let Some(notice) = &blob.notice {
                     crate::events::show_notice(store, notice.clone());

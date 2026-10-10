@@ -1606,6 +1606,7 @@ impl VaultClient {
         init: Option<pimble_app::protocol::NodeInit>,
     ) -> BackendEvent {
         let node_id = NodeId::new();
+        let request = init.as_ref().and_then(|init| init.request);
         let now = now_rfc3339();
         let (parent, edit) = {
             let Some(store) = self.stores.get_mut(&store_id) else {
@@ -1637,7 +1638,7 @@ impl VaultClient {
             (parent, edit)
         };
         match self.append_edit(client, store_id, &edit).await {
-            Ok(()) => BackendEvent::NodeCreated { store_id, parent_id: Some(parent), node_id },
+            Ok(()) => BackendEvent::NodeCreated { store_id, parent_id: Some(parent), node_id, request },
             Err(message) => BackendEvent::Error { message },
         }
     }
@@ -1800,7 +1801,7 @@ impl VaultClient {
             return BackendEvent::Error { message: "no such encrypted store".into() };
         };
         match store.tree.get_node_info(node_id) {
-            Ok(info) => BackendEvent::NodeCreated { store_id, parent_id: info.parent_id, node_id },
+            Ok(info) => BackendEvent::NodeCreated { store_id, parent_id: info.parent_id, node_id, request: None },
             Err(e) => BackendEvent::Error { message: e.to_string() },
         }
     }

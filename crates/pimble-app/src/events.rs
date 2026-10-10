@@ -544,6 +544,8 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     }
                     crate::boards::request_reconcile_all(store, active.store_id, active.node_id);
                 }
+                // The boards embedded in text hold their nodes again.
+                crate::text_boards::reconnected(store);
 
                 // Whether the server's keystore holds a signed-in account
                 // (a sign-in survives an app restart), for the status bar
@@ -905,7 +907,10 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 store.bump_tree_structure();
             }
 
-            BackendEvent::NodeCreated { store_id, parent_id, node_id } => {
+            BackendEvent::NodeCreated { store_id, parent_id, node_id, request } => {
+                if let Some(request) = request {
+                    crate::text_boards::node_created(store, *request, *store_id, *node_id);
+                }
                 tracing::info!("Node created: {:?}/{:?} under {:?}", store_id, node_id, parent_id);
                 let parent = parent_id.unwrap_or_else(|| {
                     store.root_node_id(*store_id).unwrap()
@@ -991,7 +996,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 store.bump_tree_structure();
             }
             BackendEvent::LinkResolved { url, hops, resolution } => {
-                if !restore_resolved(store, url, resolution) {
+                if crate::text_boards::link_resolved(store, url, *hops, resolution) {
+                    // A board embedded in text, not a link followed.
+                } else if !restore_resolved(store, url, resolution) {
                     follow_resolution(store, url, *hops, resolution);
                 }
             }
@@ -1251,6 +1258,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             BackendEvent::NodeContentReconciled { store_id, node_id, diff, server_state_vector } => {
                 crate::editor::apply_reconcile(store, *store_id, *node_id, diff, server_state_vector);
                 crate::boards::apply_reconcile(store, *store_id, *node_id, diff, server_state_vector);
+                crate::text_boards::apply_reconcile(*store_id, *node_id, diff);
             }
 
             BackendEvent::RemoteChanges { store_id, node_id, changes } => {
@@ -1261,6 +1269,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(changes) {
                     apply_remote(store, *store_id, *node_id, &bytes);
                     crate::boards::apply_remote(store, *store_id, *node_id, &bytes);
+                    crate::text_boards::apply_remote(*store_id, *node_id, &bytes);
                 }
             }
 

@@ -51,7 +51,7 @@ pub(crate) fn editor(pane: PaneId) -> EditorHandle {
                 // Before any content: adding a plugin resets history.
                 handle.add_plugin(std::rc::Rc::new(crate::links::LinksPlugin { pane }));
                 // After the links plugin: a pasted link is claimed there.
-                handle.add_plugin(std::rc::Rc::new(crate::pictures::PicturesPlugin));
+                handle.add_plugin(std::rc::Rc::new(crate::pictures::PicturesPlugin { pane }));
                 // Typing, commands and remote deltas all land here; the
                 // toolbar's active states follow immediately (cursor-only
                 // moves are covered by the toolbar's own watcher).
@@ -74,7 +74,8 @@ pub(crate) fn focused_editor(store: AppStore) -> EditorHandle {
 /// has the keyboard is left alone, and an editor that does not hold it is not
 /// touched by `blur`, so a tree row or a text field keeps what is its own.
 pub(crate) fn give_keyboard_to(store: AppStore, pane: PaneId) {
-    if untracked(|| store.pane(pane).show_editor.get()) {
+    // A picture being marked up over the text has the board's keys.
+    if untracked(|| store.pane(pane).show_editor.get() && !store.pane(pane).show_board.get()) {
         editor(pane).focus();
     } else {
         for other in PaneId::ALL {
@@ -166,6 +167,9 @@ pub(crate) fn start_editing(
         true
     });
     handle.on_link_hover(move |hover| crate::links::hover_link(store, hover));
+    // Pictures in text (docs/IMAGE_MARKUP_CONTRACT.md sections 2 and 5): the
+    // floating controls over the one under the pointer.
+    handle.on_image_hover(move |hover| crate::text_boards::hovered(store, pane, hover));
     // The link picker (`[[`, Ctrl+L): its keys come first, it follows the
     // caret and the typing after the brackets.
     // The picker is the focused pane's: a selection that moves in another
@@ -217,6 +221,8 @@ pub(crate) fn start_editing(
         // relays to other clients, not back to the one that sent, so the
         // window hands the delta across itself. Never to this pane.
         hand_across(store, pane, store_id, node_id, delta);
+        // An embedded board may have come or gone with this edit.
+        crate::text_boards::text_changed(store);
         // The tree's label Effect only reads `node_data`/`live_label`, neither
         // of which reflects this edit on its own — refresh our own label so
         // this window doesn't wait on a GetNode round trip to stop showing a
@@ -263,6 +269,9 @@ pub(crate) fn start_editing(
     let state = store.pane(pane);
     state.active_edit.set(Some(ActiveEdit { store_id, node_id }));
     store.editor_dirty.set(false);
+    // The note's boards (its marked-up pictures) are read from its document
+    // as this window holds it.
+    crate::text_boards::host_opened(store, pane, store_id, node_id, content_bytes);
     // A followed deep link into this note: its spot, now that the session
     // holds the content.
     let arrived = untracked(|| state.pending_anchor.get()).filter(|(s, n, _)| (*s, *n) == (store_id, node_id));
@@ -305,6 +314,7 @@ pub(crate) fn stop_editing(store: AppStore, pane: PaneId) {
     }
     handle.stop_collaboration();
     crate::links::hover_link(store, None);
+    crate::text_boards::host_closed(store, pane);
     if store.focused() == pane {
         crate::link_picker::close(store);
     }

@@ -792,12 +792,18 @@ fn picker_lines(store: AppStore) -> Vec<crate::link_picker::PickerLine> {
 /// Whether the open picker shows its own query line (Ctrl+L: the query is
 /// typed into the popup, not the note).
 fn picker_is_field(store: AppStore) -> bool {
-    store.link_picker.with(|view| matches!(view.as_ref().map(|v| v.kind), Some(crate::link_picker::PickerKind::Selection { .. })))
+    store.link_picker.with(|view| {
+        matches!(
+            view.as_ref().map(|v| v.kind),
+            Some(crate::link_picker::PickerKind::Selection { .. } | crate::link_picker::PickerKind::Board { .. })
+        )
+    })
 }
 
 /// The Ctrl+L picker's query line.
 fn picker_query_text(store: AppStore) -> String {
     store.link_picker.with(|view| match view {
+        Some(view) if view.query.is_empty() && matches!(view.kind, crate::link_picker::PickerKind::Board { .. }) => "Board…".to_string(),
         Some(view) if view.query.is_empty() => "Link to…".to_string(),
         Some(view) => view.query.clone(),
         None => String::new(),
@@ -918,6 +924,11 @@ fn find_context_menu_handler(node: &NodeHandle) -> Option<String> {
 pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
     let store = AppStore::new();
     store.dark_mode.set(load_dark_mode());
+    // Pictures in text with a board ask for the board drawn over them, and
+    // boards embedded in text are drawn by the app (docs/IMAGE_MARKUP_CONTRACT.md
+    // section 2). Installed here, outside any render, so it lasts as long
+    // as the app.
+    crate::text_boards::install_image_source();
     // Image files dropped on a tree row, and a picture pasted with a row
     // selected, become image nodes (docs/IMAGE_MARKUP_CONTRACT.md section 1);
     // the desktop hears both through rinch, the browser through the page.

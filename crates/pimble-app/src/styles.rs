@@ -568,6 +568,38 @@ pub(crate) const APP_CSS: &str = "
     height: 14px;
 }
 
+/* Over a picture in text (docs/IMAGE_MARKUP_CONTRACT.md section 5): a box
+   the size of the picture that lets the pointer through to the editor, with
+   the controls in its top-right corner. */
+.pimble-picture-overlay {
+    position: fixed;
+    z-index: 40;
+    pointer-events: none;
+}
+
+.pimble-picture-controls {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    pointer-events: auto;
+}
+
+.pimble-picture-controls__eye,
+.pimble-picture-controls__menu {
+    position: static;
+}
+
+/* The Done button over a picture being marked up in text. */
+.pimble-board__done {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    z-index: 5;
+}
+
 .pimble-board__panel {
     width: 232px;
     flex-shrink: 0;

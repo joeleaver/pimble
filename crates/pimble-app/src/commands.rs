@@ -105,6 +105,7 @@ pub async fn process_command(
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
+            let request = init.as_ref().and_then(|init| init.request);
             let created = match init {
                 None => c.create_node(store_id, parent_id, pimble_core::node_types::DOCUMENT, &title).await,
                 Some(init) => {
@@ -113,7 +114,7 @@ pub async fn process_command(
                 }
             };
             match created {
-                Ok(node_id) => Some(BackendEvent::NodeCreated { store_id, parent_id, node_id }),
+                Ok(node_id) => Some(BackendEvent::NodeCreated { store_id, parent_id, node_id, request }),
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
         }
@@ -287,7 +288,7 @@ pub async fn process_command(
             // Back under its parent: the list it went back into is what the
             // tree refetches on `NodeCreated`.
             match c.get_node(store_id, node_id).await {
-                Ok(node) => Some(BackendEvent::NodeCreated { store_id, parent_id: node.parent_id, node_id }),
+                Ok(node) => Some(BackendEvent::NodeCreated { store_id, parent_id: node.parent_id, node_id, request: None }),
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
         }

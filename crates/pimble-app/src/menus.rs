@@ -130,6 +130,7 @@ fn edit_entries(store: AppStore) -> Vec<MenuEntry> {
         // focused pane's note, at its caret. With no note there, or one this
         // device may only read, it says so.
         MenuEntry::item("Insert Image...", "", move || crate::pictures::insert_image(store)),
+        MenuEntry::item("Insert Board...", "", move || crate::text_boards::insert_board(store)),
         MenuEntry::Separator,
         MenuEntry::item("Delete", "", move || {
         // A native menu item cannot be greyed out reactively, so the check a

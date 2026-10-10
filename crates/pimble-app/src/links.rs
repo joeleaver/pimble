@@ -29,6 +29,11 @@ impl Plugin for LinksPlugin {
     /// it goes in as linked words: a note's title (or a deep link's quote), a
     /// web link's URL. Anything else is pasted as ever.
     fn handle_paste(&self, state: &rinch_editor_core::state::EditorState, paste: &rinch_editor_core::PasteContent) -> Option<rinch_editor_core::state::Transaction> {
+        // A board node's link pasted with nothing selected goes in as a
+        // picture of the board (docs/IMAGE_MARKUP_CONTRACT.md section 2).
+        if let Some(tr) = pasted_board(state, paste.text.as_deref()?) {
+            return Some(tr);
+        }
         let (href, words) = pasted_link(paste.text.as_deref()?)?;
         let (from, to) = (state.selection.from().0, state.selection.to().0);
         crate::link_picker::link_transaction(state, from, to, &words, &href, from < to)
@@ -91,6 +96,24 @@ fn pasted_link(text: &str) -> Option<(String, String)> {
         return web_url(text).map(|href| (href, text.to_string()));
     }
     None
+}
+
+/// The embed a pasted text makes: a `pimble:` link (no anchor) to a node
+/// this window knows is a board, pasted with nothing selected.
+fn pasted_board(state: &rinch_editor_core::state::EditorState, text: &str) -> Option<rinch_editor_core::state::Transaction> {
+    if state.selection.from() != state.selection.to() {
+        return None;
+    }
+    let url = pimble_core::PimbleUrl::parse(text.trim()).filter(|url| url.anchor.is_none())?;
+    let store = APP_STORE.with(|s| s.get())?;
+    if !crate::text_boards::is_board_node(store, url.store, url.node) {
+        return None;
+    }
+    let title = store.display_label(url.store, url.node);
+    let node = crate::text_boards::embed_node(state.schema(), &pimble_core::BoardUrl::new(url.store, url.node), &title)?;
+    let mut tr = state.tr();
+    tr.replace_selection_with(node).ok()?;
+    Some(tr)
 }
 
 /// The command "Copy Link to Here" is bound to (Ctrl/Cmd+Shift+L).

@@ -37,6 +37,7 @@ pub mod protocol;
 pub mod rinch_editor;
 pub mod state;
 pub mod styles;
+pub mod text_boards;
 pub mod toolbar;
 
 /// The desktop backend: a background thread with a tokio runtime, an embedded

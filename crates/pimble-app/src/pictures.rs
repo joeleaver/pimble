@@ -326,6 +326,7 @@ fn shown<T>(f: impl FnOnce(&mut Shown) -> T) -> T {
 pub(crate) fn opening(store: AppStore, pane: PaneId) {
     static REGISTERED: std::sync::Once = std::sync::Once::new();
     REGISTERED.call_once(|| rinch::image::register_image_scheme(SCHEME, load));
+    crate::text_boards::install_image_source();
     connect(store);
     take_image_input(store, pane);
     retry_missing();
@@ -341,6 +342,11 @@ fn connect(store: AppStore) {
 /// they are here, else "not yet" and a request for them. Never blocks, and
 /// never reads a store's files: the server is the one way in.
 fn load(src: &str) -> ImageLoadResult {
+    // A picture with a board asks for the board drawn over it
+    // (docs/IMAGE_MARKUP_CONTRACT.md section 2).
+    if crate::text_boards::is_marked_src(src) {
+        return crate::text_boards::load(src);
+    }
     let Some(url) = BlobUrl::parse(src) else {
         return ImageLoadResult::Failed(format!("{src} is not a picture's address"));
     };
@@ -418,7 +424,11 @@ pub(crate) fn retry_missing() {
 /// else (a `data:` URL, a web address, a file path) is left out and the rest
 /// of the paste goes in as it would have. Fetching a remote picture into a
 /// blob is not done.
-pub(crate) struct PicturesPlugin;
+pub(crate) struct PicturesPlugin {
+    /// The pane whose editor it is in: a pasted marked-up picture's board is
+    /// copied into that pane's note.
+    pub pane: PaneId,
+}
 
 impl Plugin for PicturesPlugin {
     fn key(&self) -> PluginKey {
@@ -431,10 +441,24 @@ impl Plugin for PicturesPlugin {
             return None;
         }
         let slice = rinch_editor_core::serialize::html::slice_from_html(state.schema(), html).ok()?;
-        let kept = strip_foreign_images(&slice, &|src| {
-            BlobUrl::parse(src).is_some_and(|url| crate::links::with_app_store(|store| store.get_store_signal(url.store).is_some()).unwrap_or(false))
-        })?;
-        crate::links::later(|store| crate::events::show_notice(store, PASTE_STRIPPED.to_string()));
+        let stripped = strip_foreign_images(&slice, &|src| {
+            // A board node embedded in text is a picture of the board
+            // wherever it is kept (a store not here shows a placeholder).
+            pimble_core::BoardUrl::parse(src).is_some()
+                || BlobUrl::parse(src).is_some_and(|url| crate::links::with_app_store(|store| store.get_store_signal(url.store).is_some()).unwrap_or(false))
+        });
+        let removed = stripped.is_some();
+        let base = stripped.unwrap_or(slice);
+        // A marked-up picture brings its board, under a fresh id
+        // (docs/IMAGE_MARKUP_CONTRACT.md section 2, "Copy and paste").
+        let rebound = crate::text_boards::rebind_pasted_boards(state.schema(), &base, self.pane);
+        if !removed && rebound.is_none() {
+            return None;
+        }
+        let kept = rebound.unwrap_or(base);
+        if removed {
+            crate::links::later(|store| crate::events::show_notice(store, PASTE_STRIPPED.to_string()));
+        }
         // In code a paste is its text, and the default does that.
         let in_code = state.doc.resolve(state.selection.from()).is_ok_and(|pos| pos.parent().node_type().spec().code);
         if in_code && paste.text.is_some() {
@@ -692,7 +716,7 @@ mod tests {
         });
 
         let handle = crate::rinch_editor::create_editor();
-        handle.add_plugin(std::rc::Rc::new(PicturesPlugin));
+        handle.add_plugin(std::rc::Rc::new(PicturesPlugin { pane: P[0] }));
         let html = format!(
             "<p>one <img src=\"data:image/png;base64,AAAA\" alt=\"inline\"> two</p>\
              <p><img src=\"https://example.com/a.png\"></p>\
@@ -714,7 +738,7 @@ mod tests {
         // Only foreign pictures: nothing is pasted, and no `data:` URL slips
         // in through the default path.
         let handle = crate::rinch_editor::create_editor();
-        handle.add_plugin(std::rc::Rc::new(PicturesPlugin));
+        handle.add_plugin(std::rc::Rc::new(PicturesPlugin { pane: P[0] }));
         handle.paste(&PasteContent::new(None, Some("<img src=\"data:image/png;base64,AAAA\">".to_string())));
         let mut found = Vec::new();
         images(&handle.doc(), &mut found);
@@ -722,7 +746,7 @@ mod tests {
 
         // No pictures at all: not this plugin's paste.
         let handle = crate::rinch_editor::create_editor();
-        handle.add_plugin(std::rc::Rc::new(PicturesPlugin));
+        handle.add_plugin(std::rc::Rc::new(PicturesPlugin { pane: P[0] }));
         assert!(handle.paste(&PasteContent::new(None, Some("<p>plain <b>words</b></p>".to_string()))));
         assert_eq!(handle.doc().child(0).child_count(), 2);
     }

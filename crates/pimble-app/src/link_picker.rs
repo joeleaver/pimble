@@ -82,6 +82,10 @@ pub enum PickerKind {
     /// and a pick links those words as they are. `editing` when they are a
     /// link already (then "Remove Link" is offered too).
     Selection { from: usize, to: usize, editing: bool },
+    /// Insert > "Board..." (docs/IMAGE_MARKUP_CONTRACT.md section 2): the
+    /// query is typed in the popup, only board nodes are offered, and a pick
+    /// goes in at `at` as a picture of the board.
+    Board { at: usize },
 }
 
 /// The open picker, as `AppStore::link_picker` holds it.
@@ -205,6 +209,10 @@ pub fn accept(store: crate::state::AppStore, handle: &EditorHandle, index: usize
             let to = handle.selection().head().0;
             insert_link(handle, from, to, &row.link_text(&view.query), &row.href(), false)
         }
+        (PickerKind::Board { at }, PickerRow::Node { store_id, node_id, .. }) => {
+            crate::text_boards::insert_embed(store, store.focused(), pimble_core::BoardUrl::new(*store_id, *node_id), Some(at))
+        }
+        (PickerKind::Board { .. }, _) => false,
     }
 }
 
@@ -212,7 +220,14 @@ pub fn accept(store: crate::state::AppStore, handle: &EditorHandle, index: usize
 /// when a link is being edited.
 fn rebuilt(store: crate::state::AppStore, mut view: PickerView) -> PickerView {
     let store_name = |id: StoreId| store.get_store_signal(id).map(|sig| rinch::prelude::untracked(|| sig.with(|s| s.name.clone())));
-    let mut rows = HITS.with(|h| picker_rows(&view.query, &h.borrow(), store_name));
+    let mut rows = match view.kind {
+        // Boards only, and no web address.
+        PickerKind::Board { .. } => HITS.with(|h| {
+            let boards: Vec<SearchResultItem> = h.borrow().iter().filter(|hit| hit.node_type == pimble_core::node_types::BOARD).cloned().collect();
+            picker_rows("", &boards, store_name)
+        }),
+        _ => HITS.with(|h| picker_rows(&view.query, &h.borrow(), store_name)),
+    };
     if let PickerKind::Selection { editing: true, .. } = view.kind {
         rows.insert(0, PickerRow::RemoveLink);
     }
@@ -252,6 +267,9 @@ pub fn lines(view: &PickerView) -> Vec<PickerLine> {
 
 /// What the popup says with no rows.
 pub fn empty_line(view: &PickerView) -> &'static str {
+    if let PickerKind::Board { .. } = view.kind {
+        return if view.query.trim().is_empty() { "Type to find a board" } else { "No boards match" };
+    }
     if view.query.trim().is_empty() {
         "Type to find a note, or a web address"
     } else {
@@ -295,6 +313,8 @@ pub fn selection_changed(store: crate::state::AppStore, handle: &EditorHandle) {
     let Some(view) = rinch::prelude::untracked(|| store.link_picker.get()) else { return };
     match view.kind {
         PickerKind::Selection { .. } => close(store),
+        // Its query is in the popup; where it goes was taken when it opened.
+        PickerKind::Board { .. } => {}
         PickerKind::Typed { from } => match typed_query(&handle.doc(), from, handle.selection()) {
             Some(query) => set_query(store, query),
             None => close(store),
@@ -350,16 +370,16 @@ pub fn key(store: crate::state::AppStore, handle: &EditorHandle, key: &str, modi
         _ => match view.kind {
             // A `[[` query is typed in the note itself.
             PickerKind::Typed { .. } => return false,
-            PickerKind::Selection { .. } if key == "Backspace" => {
+            PickerKind::Selection { .. } | PickerKind::Board { .. } if key == "Backspace" => {
                 let mut query = view.query.clone();
                 query.pop();
                 set_query(store, query);
             }
-            PickerKind::Selection { .. } if !modified && key.chars().count() == 1 => {
+            PickerKind::Selection { .. } | PickerKind::Board { .. } if !modified && key.chars().count() == 1 => {
                 set_query(store, format!("{}{key}", view.query));
             }
             // Anything else (a shortcut, a caret move) closes it and goes on.
-            PickerKind::Selection { .. } => {
+            PickerKind::Selection { .. } | PickerKind::Board { .. } => {
                 close(store);
                 return false;
             }

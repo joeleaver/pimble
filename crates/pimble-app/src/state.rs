@@ -1041,6 +1041,13 @@ pub struct PaneState {
     /// What the board view shows over its surface and in its side panel
     /// (the selection, the layers, the text being typed, ...).
     pub board_ui: crate::boards::PaneUi,
+    /// The board view shows over the pane's text, marking up a picture in it
+    /// (docs/IMAGE_MARKUP_CONTRACT.md section 2, "Marking up"): `board`
+    /// holds the note itself, and "Done" goes back to the text.
+    pub markup: Signal<bool>,
+    /// The picture in the pane's text the pointer is over, and what its
+    /// floating controls show (section 5, "Showing and hiding markup").
+    pub picture: Signal<Option<crate::text_boards::PictureHover>>,
 }
 
 impl PaneState {
@@ -1055,6 +1062,8 @@ impl PaneState {
             board: Signal::new(None),
             board_marks: Signal::new((0, true)),
             board_ui: crate::boards::PaneUi::new(),
+            markup: Signal::new(false),
+            picture: Signal::new(None),
         }
     }
 }
@@ -1644,7 +1653,11 @@ impl AppStore {
     /// Whether any pane holds this node, in its editor or as a board,
     /// untracked: what a node's subscription is counted by.
     pub fn is_editing(&self, store_id: StoreId, node_id: NodeId) -> bool {
-        !self.panes_editing(store_id, node_id).is_empty() || !self.panes_boarding(store_id, node_id).is_empty()
+        !self.panes_editing(store_id, node_id).is_empty()
+            || !self.panes_boarding(store_id, node_id).is_empty()
+            // A board embedded in a note's text holds its subscription too
+            // (docs/IMAGE_MARKUP_CONTRACT.md section 2, "Showing").
+            || crate::text_boards::embed_holds(store_id, node_id)
     }
 
     /// Every node some pane holds (a document in its editor, or a board),
