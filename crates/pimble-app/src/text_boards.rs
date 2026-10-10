@@ -894,9 +894,9 @@ pub(crate) fn embed_node(schema: &rinch_editor_core::Schema, url: &BoardUrl, tit
     schema.create_node("image", attrs, Fragment::empty()).ok()
 }
 
-/// Put board node `url` into pane `pane`'s text at `at` (the caret when
-/// `None`), as a picture.
-pub(crate) fn insert_embed(store: AppStore, pane: PaneId, url: BoardUrl, at: Option<usize>) -> bool {
+/// Put board node `url` into pane `pane`'s text over `at` (a range; the
+/// caret when `None`), as a picture.
+pub(crate) fn insert_embed(store: AppStore, pane: PaneId, url: BoardUrl, at: Option<(usize, usize)>) -> bool {
     let Some(active) = untracked(|| store.pane(pane).active_edit.get()) else {
         crate::events::show_notice(store, NO_NOTE.to_string());
         return false;
@@ -909,8 +909,8 @@ pub(crate) fn insert_embed(store: AppStore, pane: PaneId, url: BoardUrl, at: Opt
     crate::editor::editor(pane).update(move |state| {
         let node = embed_node(state.schema(), &url, &title)?;
         let mut tr = state.tr();
-        if let Some(at) = at {
-            tr.set_selection(rinch_editor_core::Selection::cursor(rinch_editor_core::Pos(at)));
+        if let Some((from, to)) = at {
+            tr.set_selection(rinch_editor_core::Selection::text(rinch_editor_core::Pos(from), rinch_editor_core::Pos(to)));
         }
         tr.replace_selection_with(node).ok()?;
         Some(tr)

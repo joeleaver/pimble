@@ -942,3 +942,148 @@ pointer events, #1501, #1500).
   it (its element is written with its first append).
 - Cancelling an erase does not bring back what it erased (undo does).
 
+
+## Built in wave 4 (boards in text)
+
+Built 2026-10-10 on branch `boards`, on rinch `main` at 2b9346e (joeleaver/rinch#1500 the
+atom's `board` and `width`, #1501 `set_image_source` and `on_image_hover`, #1503 attrs
+merging one by one). Shared `pimble-app` code for the desktop and the browser, one module,
+`crates/pimble-app/src/text_boards.rs`, plus the board view's markup mode in `boards.rs`.
+
+**pimble-core / pimble-crdt / pimble-board:**
+- `pimble_core::BoardUrl` (`pimble-board:<store>/<node>[#frame=<element id>]`), one parser
+  and printer; `BoardUrl::link()` is the board as a `pimble:` link.
+- `NodeDoc::links` counts an `image` atom whose `src` is a `BoardUrl` as a link to the board
+  (its `alt` the words), so backlinks and the index's `links` see embeds (search indexes the
+  embed as a link; the board's own text stays indexed on the board).
+- A transplant carries the `data` root as a fresh copy **with its yrs types**
+  (`NodeDoc::fresh_data`/`put_data_copy`, `CuttingNode::data_copy`). Before this a
+  transplant went through JSON, which turned a board's whole values into nested maps and its
+  point buffers into arrays of numbers: a board node moved between stores lost its geometry,
+  and so would a note's marked-up pictures.
+- `BoardTxn::copy_from(&RawBoard)`: another board, layers and elements with their ids,
+  authors and times, page and markup switch, written into a new board (pasting, converting).
+
+**Marked-up pictures in text:**
+- The app installs `set_image_source` once, outside any render (`app::build_view`): a
+  `pimble-blob:` picture whose atom has a `board` asks for `<blob url>#board=<id>`. The
+  `pimble-blob:` loader hands those to `text_boards::load`, which answers with the board
+  rendered (`render_extent`, its visible extent trimmed, one unit per CSS pixel, no wider
+  than the widest pane's text) or, while it is drawn, with the plain picture.
+- The board is read from the note's document as this window holds it (`HOSTS`: loaded when
+  a pane opens the note, fed `RemoteChanges`, reconciles and every board edit made here). A
+  change re-renders 150 ms later (debounced), off the UI thread on the desktop, and
+  `reload_image` swaps the picture; an unchanged rendering is not handed over again.
+- **Mark Up...**: the picture's menu (a "⋯" button in the floating controls) or a
+  double-click on the picture opens the board view over the pane (`PaneState::markup`; the
+  pane's editor stays mounted, hidden; the board toolbar shows) with **Done**. The board is
+  `data.boards.<id>` of the note. A picture with no board gets one in the pane's copy of the
+  note when the view opens (the picture at one unit per pixel in a locked "Picture" layer
+  and "Layer 1" above, as an image node starts), so opening and closing writes nothing; the
+  **first mark** sends that board, then writes the atom's `board` (`SetNodeAttrStep`
+  through the editor, so it is an ordinary text edit), then the mark. These are three
+  updates, in that order, not one: the text's atom lives in the editor's collaboration
+  document, the board in the board session's copy, and no transaction spans both. Per-pane
+  undo in the board view never takes back the board itself.
+- **The floating controls** (contract section 5) over the picture under the pointer
+  (`on_image_hover`): the eye with "Markup · N" (or dimmed "Markup hidden", which stays
+  while the markup is hidden), writing the board's `markup_visible`, and the "⋯" menu
+  (Mark Up..., Convert to Image Node, Open Board, Open Board in Split View). A picture with
+  no markup shows only the menu. The controls keep themselves while the pointer is on them
+  (their own enter/leave, 300 ms grace), stay inside the text's box when the picture is
+  half scrolled out, and hide on a scroll or a key (rinch#1506: the desktop never clears its
+  hover after a wheel scroll). A reader sees the state and is refused the toggle with the
+  read-only sentence.
+
+**Board nodes embedded in text:**
+- `pimble-board:` is a registered image scheme answered by the same module. An embed is
+  resolved with `resolveLink` (the server judges the read, `Reach` included, and follows
+  `became`), then the window subscribes to the board node (counted in
+  `AppStore::is_editing`, so a pane on the same node and an embed share one subscription)
+  and fetches it with `ReconcileNodeContent` from an empty state vector; it is drawn live on
+  every change (a stroke in another pane or another device shows as it is drawn, debounced).
+  `#frame=` draws that frame's rectangle. Placeholders, drawn by `pimble-board` with one
+  sentence: "This board was deleted.", "This board has not arrived yet." (also a store not
+  here, a missing node), "You cannot see this board.", "This board is empty.". An embed no
+  open text shows is let go of (a sweep 1.5 s after an edit, and when a note closes), its
+  subscription with it; one that comes back (undo) is held again.
+- Making one: Edit > "Insert Board..." (the link picker limited to board nodes; in the
+  browser the query may be typed into the note, where it is replaced), a board node's
+  `pimble:` link pasted with nothing selected (when this window knows the node is a board),
+  a board row dragged from the tree onto the text (goes in at the caret: rinch gives no
+  position for a point), and Convert to Image Node.
+- Clicking an embed opens the board node in that pane (Ctrl/Cmd+click: split view, the
+  pane split to the right), through `follow_href`, so `became` and the sentences are the
+  links'. "Mark Up..." on an embed opens the board node itself. The eye on an embed writes
+  the board node's own `markup_visible` (hiding it there hides it in its pane and every
+  embed).
+
+**Convert to Image Node:** a board node under the note (title the picture's `alt`, or
+"Picture"; the photo icon) whose board is a copy of the picture's markup (or a new image
+board for an unmarked picture), naming the same blob; `NodeInit::request` /
+`NodeCreated::request` say which node was made, and one editor transaction then sets the
+atom's `src` to the embed, its `alt` to the title and removes its `board`. Undo in the text
+takes the embed back to the picture (with its board); it does **not** delete the node made.
+
+**Clipboard and transplant:** `PicturesPlugin::handle_paste` (now per pane) keeps
+`pimble-board:` pictures and, for every pasted picture with `data-board`, mints a fresh id
+and copies the board (found in any note this window holds) into the pasting pane's note a
+turn later; the same note too. A board this window does not hold (copied in another window
+or app) cannot come along: the picture is pasted without it. There is no Pimble MIME part:
+rinch has no copy hook, so the board travels by id within a window, not on the clipboard.
+`transplantNode` carries `data.boards` with the content (above).
+
+**Verified (2026-10-10):**
+- Tests: `pimble-core` (BoardUrl), `pimble-crdt` (155, incl. an embed is a link, a
+  transplant keeps the shapes of data), `pimble-board` (incl. a copied board is the same
+  board and then its own), `pimble-app` (148, incl. `text_boards::tests`: the first mark
+  mints the board and names it on the picture, three updates in order, Done; a pasted
+  marked-up picture brings a copy of its board, and one from elsewhere goes in plain;
+  converting makes an image node with the markup and embeds it, undo takes the embed back;
+  an embed is resolved, held, drawn, a no-access one shows its sentence, and it is let go
+  of), `pimble-server --test search --test links`; release check of the wasm build.
+- Desktop, an isolated release app (port 7473, own config and data, a scratch store), over
+  rinch's debug port: Insert Image, the "⋯" menu, Mark Up..., an arrow drawn from outside
+  the picture and a pen stroke, Done: the text shows the visible extent with the arrow;
+  the eye hides the marks, a restart keeps them hidden ("Markup hidden"), the eye shows them
+  again; Insert Board... with the picker limited to boards; a click on the embed opens the
+  whiteboard; split view with the whiteboard in one pane and the note in the other, a pen
+  stroke in the board pane appearing in the embed; Convert to Image Node (a child "sunset"
+  under the note, the embed with the copied markup); its eye hiding the marks in the embed
+  and in the board node's own pane, and the board pane's toggle showing them in the embed;
+  a board row dropped on the text; a restart with both panes back. Screenshots `01`-`33`
+  in the scratchpad's `text/`.
+- Chromium (Playwright) on the local stack, a plain hosted store, the stack's made-up
+  account, two tabs: a picture inserted, Mark Up... from the controls, an arrow drawn in
+  tab 1 showing in tab 2's text; a synthetic paste of the marked-up picture's HTML in tab 2
+  going in with a fresh board, drawn with the copied arrow; a whiteboard embedded with
+  Insert Board... (typed into the note), first as "This board is empty.", then redrawn live
+  in tab 2 when a stroke was drawn on the whiteboard in tab 1. Screenshots `web-01`-`web-14`.
+
+**Not built, or known gaps:**
+- The board and the atom's `board` are separate updates (above), so a peer can see the
+  board a moment before the picture names it; and undoing the text does not take back a
+  board (unreferenced boards stay in `data`, as the contract says, swept later).
+- Convert's undo leaves the image node; a drag of a tree row inserts at the caret, not at
+  the drop point; dragging a picture inside the editor is rinch's own move (the board id
+  goes with it).
+- Copying between windows, apps or tabs carries no board (no clipboard part; rinch has no
+  copy hook to add one). A real clipboard was not driven on the desktop (the debug port
+  cannot read the Wayland clipboard): desktop paste is covered by the unit test only.
+- The controls are positioned from the last hover report: an image that grows or moves
+  under a resting pointer (its board redrawn, the toolbar changing height) leaves them at
+  the old place until the pointer moves. The "⋯" menu is not flipped at the window edge.
+- The editor has no context menu, so "its context menu's Mark Up..." is the controls' "⋯"
+  menu; a single click on a picture still only selects it.
+- In the browser the Board picker's query goes into the note (rinch-web does not hand
+  printable keys to `on_key`); it is read back from there and replaced on a pick. The same
+  likely holds for the Ctrl+L picker in the browser; not looked at here.
+- Rendering in text is at one unit per CSS pixel, not times the screen's scale, so a board
+  in text is not sharp on a HiDPI screen; it is re-rendered only when the board changes,
+  not when a pane is resized.
+- Markdown `![title](pimble-board:...)` both ways, the MCP's `render_board`, and export of a
+  picture in text are not built: Markdown import refuses every image today, and
+  `render_board` is wave 5. Blobs are still not copied on a transplant between stores
+  (images wave 2): the copied board names the source store's blob URL.
+- Firefox was not run; an encrypted store in the browser takes no pictures yet (images wave
+  3), so marked-up pictures there were not driven.

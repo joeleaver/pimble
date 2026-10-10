@@ -210,7 +210,9 @@ pub fn accept(store: crate::state::AppStore, handle: &EditorHandle, index: usize
             insert_link(handle, from, to, &row.link_text(&view.query), &row.href(), false)
         }
         (PickerKind::Board { at }, PickerRow::Node { store_id, node_id, .. }) => {
-            crate::text_boards::insert_embed(store, store.focused(), pimble_core::BoardUrl::new(*store_id, *node_id), Some(at))
+            // A query typed into the note goes, replaced by the board.
+            let to = typed_since(handle, at).filter(|t| *t == view.query).map(|_| handle.selection().head().0);
+            crate::text_boards::insert_embed(store, store.focused(), pimble_core::BoardUrl::new(*store_id, *node_id), Some((at, to.unwrap_or(at))))
         }
         (PickerKind::Board { .. }, _) => false,
     }
@@ -313,8 +315,13 @@ pub fn selection_changed(store: crate::state::AppStore, handle: &EditorHandle) {
     let Some(view) = rinch::prelude::untracked(|| store.link_picker.get()) else { return };
     match view.kind {
         PickerKind::Selection { .. } => close(store),
-        // Its query is in the popup; where it goes was taken when it opened.
-        PickerKind::Board { .. } => {}
+        // Its query is typed in the popup, or (in the browser) after where it
+        // opened, in the note.
+        PickerKind::Board { at } => {
+            if let Some(query) = typed_since(handle, at) {
+                set_query(store, query);
+            }
+        }
         PickerKind::Typed { from } => match typed_query(&handle.doc(), from, handle.selection()) {
             Some(query) => set_query(store, query),
             None => close(store),
@@ -328,8 +335,22 @@ pub fn selection_changed(store: crate::state::AppStore, handle: &EditorHandle) {
 /// another block, a range), the brackets are gone, or it grew past a line's
 /// worth.
 pub fn typed_query(doc: &rinch_editor_core::Node, from: usize, selection: rinch_editor_core::selection::Selection) -> Option<String> {
+    if selection.head().0 < from + 2 {
+        return None;
+    }
+    let text = text_up_to_caret(doc, from, selection)?;
+    if !text.starts_with("[[") {
+        return None;
+    }
+    let query: String = text.chars().skip(2).collect();
+    (query.chars().count() <= 80 && !query.contains("]]")).then_some(query)
+}
+
+/// The text from `from` to the caret, in the same textblock; `None` when the
+/// caret is not there (before it, another block, a range).
+fn text_up_to_caret(doc: &rinch_editor_core::Node, from: usize, selection: rinch_editor_core::selection::Selection) -> Option<String> {
     let head = selection.head().0;
-    if selection.from() != selection.to() || head < from + 2 {
+    if selection.from() != selection.to() || head < from {
         return None;
     }
     let (Ok(start), Ok(end)) = (doc.resolve(rinch_editor_core::Pos(from)), doc.resolve(rinch_editor_core::Pos(head))) else {
@@ -347,11 +368,14 @@ pub fn typed_query(doc: &rinch_editor_core::Node, from: usize, selection: rinch_
         }
     }
     let text: String = block.chars().skip(start.parent_offset()).take(end.parent_offset() - start.parent_offset()).collect();
-    if !text.starts_with("[[") {
-        return None;
-    }
-    let query: String = text.chars().skip(2).collect();
-    (query.chars().count() <= 80 && !query.contains("]]")).then_some(query)
+    Some(text)
+}
+
+/// What was typed into the note after a board picker opened at `at` (in the
+/// browser the editor keeps typed characters; the desktop hands them to the
+/// popup through `key`).
+fn typed_since(handle: &EditorHandle, at: usize) -> Option<String> {
+    text_up_to_caret(&handle.doc(), at, handle.selection()).filter(|t| !t.is_empty() && t.chars().count() <= 80)
 }
 
 /// A key the editor offers first: the open picker takes the ones that
