@@ -572,6 +572,7 @@ pub(crate) const APP_CSS: &str = "
     width: 232px;
     flex-shrink: 0;
     overflow-y: auto;
+    overflow-x: hidden;
     padding: 8px;
     border-left: 1px solid var(--rinch-color-border);
     background: var(--rinch-color-body);

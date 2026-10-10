@@ -314,9 +314,12 @@ pub struct PaneUi {
     /// The attribution under the pointer (contract section 6): where, and
     /// the sentence.
     pub tip: Signal<Option<(f32, f32, String)>>,
-    /// The text being typed, and its box.
+    /// The text being typed: its box, and what the input is given to hold
+    /// (only when typing starts or a collaborator's typing merges in, never
+    /// echoed back per keystroke: a write racing fast typing drops letters),
+    /// with a count so the same text given twice is written twice.
     pub text_box: Signal<Option<TextBox>>,
-    pub text_value: Signal<String>,
+    pub text_value: Signal<(u64, String)>,
     /// "Color by author" (contract section 6), a way of looking, per pane.
     pub by_author: Signal<bool>,
     /// The pointer is over the board (the markup control shows).
@@ -345,7 +348,7 @@ impl PaneUi {
             frames: Signal::new(Vec::new()),
             tip: Signal::new(None),
             text_box: Signal::new(None),
-            text_value: Signal::new(String::new()),
+            text_value: Signal::new((0, String::new())),
             by_author: Signal::new(false),
             hover: Signal::new(false),
             nav_view: Signal::new(None),

@@ -37,6 +37,11 @@ const CARD_SIZE: (f32, f32) = (240.0, 56.0);
 
 /// Which keys a focused board keeps from the rest of the app.
 pub(super) fn claims_key(pane: PaneId, key: &SurfaceKeyData) -> bool {
+    // While text is being typed every key is the input's (in the browser the
+    // surface still hears the keys of the page it was last pressed in).
+    if with_session(pane, |s| s.text.is_some()).unwrap_or(false) {
+        return false;
+    }
     let primary = key.ctrl || key.meta;
     let active = with_session(pane, |s| !s.selected.is_empty() || !matches!(s.gesture, Gesture::Idle)).unwrap_or(false);
     let selected = with_session(pane, |s| !s.selected.is_empty()).unwrap_or(false);
@@ -1569,7 +1574,8 @@ fn load_selection_style(store: AppStore, pane: PaneId) {
     let Some((kind, s)) = style else { return };
     let st = store.board_style;
     match kind {
-        Kind::Sticky => st.fill.set_if_changed(s.fill.map(|c| c.to_hex())),
+        // A sticky note's color is its own: shapes drawn next do not take it.
+        Kind::Sticky => {}
         Kind::Highlighter => {
             st.stroke.set_if_changed(s.stroke.to_hex());
             st.width.set_if_changed((s.width / 5.0).max(1.0));
@@ -1589,7 +1595,8 @@ fn load_selection_style(store: AppStore, pane: PaneId) {
     }
     st.opacity.set_if_changed(s.opacity);
     st.dash.set_if_changed(s.dash);
-    st.font_size.set_if_changed(s.font_size);
+    // A sticky note's text is drawn smaller than the size picked (`new_style`).
+    st.font_size.set_if_changed(if kind == Kind::Sticky { (s.font_size / 0.85).round() } else { s.font_size });
     st.align.set_if_changed(s.align);
 }
 
@@ -1676,7 +1683,10 @@ pub(super) fn begin_text_existing(store: AppStore, pane: PaneId, id: &str) {
 
 fn open_text_input(store: AppStore, pane: PaneId, text: String) {
     let ui = store.pane(pane).board_ui;
-    ui.text_value.set(text);
+    ui.text_value.update(|(n, v)| {
+        *n += 1;
+        *v = text;
+    });
     place_text_box(store, pane);
     // Escape ends the typing; everything else is the input's.
     rinch::core::set_keyboard_interceptor(move |data| {
@@ -1694,8 +1704,6 @@ fn open_text_input(store: AppStore, pane: PaneId, text: String) {
 /// edit from what it holds (so someone typing elsewhere in it keeps theirs);
 /// a new text is made by its first character.
 pub(super) fn text_input(store: AppStore, pane: PaneId, value: String) {
-    let ui = store.pane(pane).board_ui;
-    ui.text_value.set(value.clone());
     let Some((id, at)) = with_session(pane, |s| s.text.as_ref().map(|t| (t.id.clone(), t.at))).flatten() else { return };
     match id {
         None => {
@@ -1766,7 +1774,10 @@ pub(super) fn text_changed_elsewhere(store: AppStore, pane: PaneId) {
                     edit.last = text.clone();
                 }
             });
-            store.pane(pane).board_ui.text_value.set(text);
+            store.pane(pane).board_ui.text_value.update(|(n, v)| {
+                *n += 1;
+                *v = text;
+            });
         }
         None => {}
     }
@@ -1947,6 +1958,9 @@ fn hover_attribution(store: AppStore, pane: PaneId, px: f32, py: f32) {
 // ── Keys ────────────────────────────────────────────────────────────────────
 
 fn key_down(store: AppStore, pane: PaneId, key: &SurfaceKeyData) {
+    if with_session(pane, |s| s.text.is_some()).unwrap_or(false) {
+        return;
+    }
     let primary = key.ctrl || key.meta;
     let lower = key.key.to_ascii_lowercase();
     match key.key.as_str() {

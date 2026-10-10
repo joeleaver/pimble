@@ -40,6 +40,7 @@ fn begin_rename(pane: PaneId, ui: PaneUi, id: &str, name: &str) {
             rinch::core::request_focus(doc_key, node);
         }
     });
+    focus_in_browser("input.pimble-board__layer-name-input");
 }
 
 /// End a layer rename, keeping the typed name when `keep`.
@@ -60,6 +61,30 @@ pub(super) fn focus_text_input(pane: PaneId) {
     if let Some((doc_key, node)) = TEXT_INPUTS.with(|t| t.borrow()[pane.index()]) {
         rinch::core::request_focus(doc_key, node);
     }
+    focus_in_browser("textarea.pimble-board__text-input");
+}
+
+/// The browser: focus the shown element matching `selector` once the press
+/// that asked for it is over (the canvas keeps the focus of its own press,
+/// and rinch-web's focus request does not reach a field it shows that late).
+fn focus_in_browser(selector: &'static str) {
+    #[cfg(not(feature = "native"))]
+    {
+        use wasm_bindgen::JsCast;
+        let _ = set_timeout(40, move || {
+            let Some(document) = web_sys::window().and_then(|w| w.document()) else { return };
+            let Ok(list) = document.query_selector_all(selector) else { return };
+            for i in 0..list.length() {
+                let Some(el) = list.get(i).and_then(|n| n.dyn_into::<web_sys::HtmlElement>().ok()) else { continue };
+                if el.offset_width() > 0 {
+                    let _ = el.focus();
+                    return;
+                }
+            }
+        });
+    }
+    #[cfg(feature = "native")]
+    let _ = selector;
 }
 
 /// Publish the node cards on pane `pane`'s board, whose live titles and
@@ -114,7 +139,7 @@ pub(crate) fn render_board(__scope: &mut RenderScope, store: AppStore, pane: Pan
                 ),
                 None => "display: none;".to_string(),
             }},
-            value: move || ui.text_value.get(),
+            value: move || ui.text_value.get().1,
             oninput: move |value: String| tools::text_input(store, pane, value),
         }
     };
