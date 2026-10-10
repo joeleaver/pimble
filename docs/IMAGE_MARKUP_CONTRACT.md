@@ -549,7 +549,7 @@ changes)` or `set_snapshot`, `begin_stroke` / `extend_stroke` / `end_stroke` /
   would leave one board (a yrs map key is last-writer-wins), so a board node's board is
   created with the node, and a picture's board gets a fresh id as section 2 says.
 - Rendering: shadows are an offset translucent fill (tiny-skia has no blur); an element's
-  opacity applies per part; pen pressure is stored but strokes draw at constant width;
+  opacity applies per part; a pen's width follows each point's pressure (see "Pointer events" below; a highlighter's does not);
   text is Noto Sans Regular only, no shaping or kerning, a box for characters the font lacks
   (CJK and emoji), and bars below 4 px; a spotlight dims the region being drawn and its
   extent is its own rectangle; a card shows its element text (the node's title, written by
@@ -684,9 +684,8 @@ Built 2026-10-09 on branch `boards`, desktop and browser from one module,
   board.
 - The desktop has no Ctrl+V on a tree row: rinch gives elements no key events and a menu
   chord with Ctrl would take Ctrl+V from the editor, so it is the row's "Paste Image".
-- `SurfaceEvent::MouseWheel` carries no modifiers, so a plain wheel zooms (Ctrl+wheel and
-  a trackpad pinch cannot be told apart from scrolling yet). The wheel's sign differs per
-  backend and is flipped in `boards.rs`.
+- (Done since: see "Pointer events" below. Ctrl+wheel and a pinch zoom, a plain wheel
+  pans.)
 - Desktop pointer events are logical pixels and frames physical; the scale is read from
   the surface's box (`bounds_signal`), the browser's from `devicePixelRatio`.
 - Hit testing is by element bounds, so a click inside a long diagonal stroke's box selects
@@ -695,9 +694,10 @@ Built 2026-10-09 on branch `boards`, desktop and browser from one module,
   pane whose store closes stays as it was, as documents do.
 - Images wave 2 and 3 still apply: pictures on boards do not replicate, and an encrypted
   store in the browser takes no image node ("Pictures in encrypted stores ...").
-- Pen pressure is stored as 0.5; strokes draw at constant width.
+- (Done since: pen pressure is stored and drawn, "Pointer events" below.)
 
-**For rinch's pointer-event PR (pressure, pinch, capture)**, to wire in later in
+**For rinch's pointer-event PR (pressure, pinch, capture)**, built since ("Pointer
+events" below); what was planned, in
 `boards.rs::on_event`: pen pressure into the third point value (it is stored per point
 already), pointer type to choose pen vs. touch-pan, a pinch gesture into `zoom_at` plus the
 same settle timer, wheel modifiers for Ctrl+wheel versus plain-wheel pan, and pointer
@@ -853,3 +853,92 @@ browser (`crates/pimble-app/src/boards.rs` and `boards/{tools,ui,nav,export}.rs`
 - The markup control's chevron with a checkbox per layer (section 5) is not built (the
   layers panel does it); grid, snapping, the side panel and Color by Author are not
   remembered across restarts.
+
+## Pointer events (pen pressure, touch, pinch, capture)
+
+Built 2026-10-10 on branch `boards`, on rinch `main` at 2c1b02c (joeleaver/rinch#1502
+pointer events, #1501, #1500).
+
+**What changed:**
+- **The board surface takes pointer events** (`RenderSurfaceHandle::set_pointer_events`,
+  in `boards.rs::surface`); `boards/tools.rs` handles `PointerDown/Move/Up/Cancel` and
+  `Pinch` (the navigator keeps plain mouse events). One gesture at a time: the pointer and
+  button that began it (`Session::driver`) drive it, and only the release of that button
+  ends it; other pointers' presses meanwhile, and a chord's other button, start nothing.
+- **Pressure**: a pen's (and a finger's, where the screen measures force) `pressure` is
+  each point's third value; a mouse always writes 0.5. A release reports no pressure, so
+  the last point keeps the last pressure drawn with; a momentary 0 mid-stroke keeps the
+  last too.
+- **Drawn by pressure** (`pimble-board`, `paint.rs`): a solid pen's width at a point is
+  its style's width times `pressure_width(p) = 0.25 + 1.5 p` (exactly the width at 0.5).
+  A pen whose points share one pressure strokes its polyline as before; otherwise it is a
+  filled outline, the union (nonzero, every part wound the same way) of a disc at each
+  point and the band between each pair of neighbors' discs along their outer tangents.
+  The same shape is used by the renderer, the live stamps (`BoardView::extend_stroke`,
+  segment by segment), the SVG export (a filled `<path>` instead of a stroked one), the
+  element's bounds and hit testing (the width interpolated along each segment). A
+  highlighter and a dashed pen keep one width.
+- **Touch**: one finger acts as the tool does (the pen draws, the hand pans, select
+  selects and drags); a second finger cancels what the first began and the two pan (the
+  move of their middle) and zoom (`Pinch`) until both are lifted; a third is ignored.
+- **The eraser end** (`SurfacePointerKind::Eraser`) erases whatever tool is chosen.
+- **Zoom and pan**: `Pinch` (two fingers, a trackpad pinch, Ctrl+wheel) is `zoom_at`
+  about its point plus the existing 150 ms settle; a plain wheel pans, vertically, or
+  sideways when the event says so (`delta_x`) or shift is held. The per-backend sign of
+  the old wheel zoom is gone (rinch's `Pinch` agrees on both); the plain wheel's delta
+  sign still differs per backend and `wheel_pan` maps both to "the page would scroll
+  that way".
+- **Capture and cancel**: a stroke or drag that leaves the surface keeps going and ends
+  where it is released (rinch's capture, on both backends now). `PointerCancel` and
+  Escape take the gesture back (`cancel_gesture`): a stroke or a shape or connector being
+  made is deleted, what a move, resize or rotation wrote is written back, a marquee leaves
+  the selection it started from (an erase is not taken back; undo has it). A stroke's
+  element is now written with its first append (about 100 ms in) rather than at the
+  press, so a stroke cancelled at once, or a finger that becomes the first of a pinch,
+  writes nothing at all; a stroke released sooner is written once, whole.
+
+**Verified (2026-10-10):**
+- Tests: `pimble-board` (new `tests/pressure.rs`: a stroke at 0.5 matches a plain
+  tiny-skia stroke of its polyline pixel for pixel and is a stroked path in SVG; pressure
+  widens a pen where it was harder, its bounds and hit testing follow; a zigzag with
+  changing pressure has no holes; a highlighter ignores pressure; live stamps of a
+  varying stroke are within 40 pixels of its settled render, the existing tolerance), all
+  pimble-board tests; `pimble-app` (143, incl. `pointers_draw_with_their_pressure_and_
+  cancelled_strokes_leave_nothing`: a pen's pressures stored and written once on release,
+  a second pointer ignored mid-stroke, a mouse at 0.5, a cancelled stroke writing
+  nothing, a finger then a second finger becoming a pinch that pans and writes nothing,
+  the eraser end with the pen tool chosen; and `a_wheel_pans_the_way_the_page_would_
+  scroll`); release check of the wasm build.
+- Desktop, an isolated release app (port 7473, own config and data, a scratch copy of
+  the wave 2/3 store), over rinch's debug port: a plain wheel pans down and sideways
+  without zooming, Ctrl+wheel (Ctrl held through the debug port's `mouse_down`
+  modifiers) zooms in and out with the point under the cursor fixed, a pen stroke dragged
+  off the surface over the side panel and released there keeps drawing and ends there
+  (moves over the board afterwards draw nothing), a sticky note dragged off the surface
+  and released outside lands there, Escape mid-drag puts the dragged element back.
+  Screenshots `d01`-`d11` in the scratchpad's `pointer/`.
+- Chromium (Playwright) on the local stack with the stack's made-up account, an
+  encrypted store: a CDP pen stroke (`Input.dispatchMouseEvent`, `pointerType: pen`,
+  force 0.05 to 1.0) drawn thin to thick beside a mouse stroke of one width; the eraser
+  end (a synthetic `PointerEvent` with `buttons: 32`) erasing the mouse stroke with the
+  pen tool chosen; with touch emulation, a one-finger stroke drawn, a finger stroke ended
+  by `touchCancel` gone, a finger joined by a second spreading and moving (zoomed about
+  their middle and panned, the first finger's stroke not written); Ctrl+wheel zooming
+  out, a plain wheel panning; a mouse stroke leaving the canvas, released outside, then
+  moves over the canvas drawing nothing. Screenshots `web-w06`-`web-w14`.
+
+**Not exercised / known gaps:**
+- No real pen, tablet or touch screen was available: pressure, the eraser end, touch and
+  the pinch were simulated (CDP in Chromium, synthetic events, unit tests). The desktop's
+  pen and touch paths (winit's tablet force, two touches, a trackpad's `PinchGesture`)
+  and its capture ending on window blur were not driven; only the mouse and Ctrl+wheel
+  were, over the debug port.
+- Firefox was not run; its wheel reports lines, so a plain wheel there pans about three
+  pixels a notch (rinch converts lines only for Ctrl+wheel; the plain wheel event carries
+  no delta mode).
+- Smoothing (two passes of a three-point average on release) averages pressure as well as
+  position, so a sharp change of pressure softens; a fast zigzag flattens, as before.
+- A stroke being drawn appears to collaborators about 100 ms after the press instead of at
+  it (its element is written with its first append).
+- Cancelling an erase does not bring back what it erased (undo does).
+
