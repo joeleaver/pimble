@@ -236,6 +236,125 @@ pub(crate) fn stroke_path(points: &[[f32; 3]]) -> Option<Path> {
     pb.finish()
 }
 
+/// How much of its style's width a pen stroke is drawn at, at a point's
+/// pressure: exactly its width at 0.5 (a mouse, a touch screen that cannot
+/// tell, and every stroke drawn before pressure was), a quarter of it with no
+/// pressure, 1.75 times it at full pressure.
+pub fn pressure_width(pressure: f32) -> f32 {
+    let p = if pressure.is_finite() { pressure.clamp(0.0, 1.0) } else { 0.5 };
+    0.25 + 1.5 * p
+}
+
+/// How a pen's or highlighter's points are drawn.
+pub(crate) enum StrokeShape {
+    /// One width all along: the polyline, stroked with round caps and joins
+    /// (a highlighter, a dashed pen, a pen at one pressure).
+    Line(Path, StrokeStyle),
+    /// A pen whose pressure varies: its outline, filled (nonzero), as the
+    /// union of a disc at every point and the band joining each pair of
+    /// neighbors' discs.
+    Outline(Path),
+}
+
+/// The width a stroke of `kind` and `width` is drawn at a point of
+/// `pressure`: pressure widens a solid pen only.
+pub(crate) fn width_at(kind: &Kind, width: f32, dash: Dash, pressure: f32) -> f32 {
+    if matches!(kind, Kind::Pen) && dash == Dash::Solid {
+        (width * pressure_width(pressure)).max(0.5)
+    } else {
+        width.max(0.5)
+    }
+}
+
+/// The widest a stroke's points are drawn, for its bounds and hit testing.
+pub(crate) fn stroke_max_width(kind: &Kind, points: &[[f32; 3]], width: f32, dash: Dash) -> f32 {
+    points
+        .iter()
+        .filter(|p| p[0].is_finite() && p[1].is_finite())
+        .map(|p| width_at(kind, width, dash, p[2]))
+        .fold(0.0, f32::max)
+        .max(width_at(kind, width, dash, 0.0))
+}
+
+/// How `points` of a `kind` stroke styled `width` and `dash` are drawn.
+pub(crate) fn stroke_shape(kind: &Kind, points: &[[f32; 3]], width: f32, dash: Dash) -> Option<StrokeShape> {
+    let finite: Vec<[f32; 3]> = points.iter().copied().filter(|p| p[0].is_finite() && p[1].is_finite()).collect();
+    let first = width_at(kind, width, dash, finite.first()?[2]);
+    if finite.iter().all(|p| (width_at(kind, width, dash, p[2]) - first).abs() < 1e-4) {
+        return Some(StrokeShape::Line(stroke_path(&finite)?, StrokeStyle { width: first, dash }));
+    }
+    let discs: Vec<(f32, f32, f32)> = finite.iter().map(|p| (p[0], p[1], width_at(kind, width, dash, p[2]) / 2.0)).collect();
+    pressure_outline(&discs).map(StrokeShape::Outline)
+}
+
+/// Twice the signed area of a closed polygon.
+fn signed_area(pts: &[(f32, f32)]) -> f32 {
+    let mut a = 0.0;
+    for i in 0..pts.len() {
+        let (x0, y0) = pts[i];
+        let (x1, y1) = pts[(i + 1) % pts.len()];
+        a += x0 * y1 - x1 * y0;
+    }
+    a
+}
+
+/// The sign of the area tiny-skia's circles wind with, so every band can
+/// wind the same way and nonzero filling makes their union (no holes where
+/// two parts overlap).
+fn circle_winding() -> f32 {
+    let Some(circle) = PathBuilder::from_circle(0.0, 0.0, 1.0) else { return 1.0 };
+    let mut pts = Vec::new();
+    for seg in circle.segments() {
+        match seg {
+            tiny_skia::PathSegment::MoveTo(p) | tiny_skia::PathSegment::LineTo(p) => pts.push((p.x, p.y)),
+            tiny_skia::PathSegment::QuadTo(_, p) => pts.push((p.x, p.y)),
+            tiny_skia::PathSegment::CubicTo(_, _, p) => pts.push((p.x, p.y)),
+            tiny_skia::PathSegment::Close => {}
+        }
+    }
+    signed_area(&pts).signum()
+}
+
+/// A variable-width stroke's outline from its discs `(x, y, radius)`.
+fn pressure_outline(discs: &[(f32, f32, f32)]) -> Option<Path> {
+    let winding = circle_winding();
+    let mut pb = PathBuilder::new();
+    for &(x, y, r) in discs {
+        pb.push_circle(x, y, r.max(0.01));
+    }
+    for pair in discs.windows(2) {
+        let [(x0, y0, r0), (x1, y1, r1)] = [pair[0], pair[1]];
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let d = (dx * dx + dy * dy).sqrt();
+        // One disc inside the other: the discs are the whole of it.
+        if d <= (r1 - r0).abs() + 1e-4 {
+            continue;
+        }
+        let (ux, uy) = (dx / d, dy / d);
+        // The outer tangents touch each disc where its normal n has
+        // n · u = (r0 - r1) / d.
+        let k = (r0 - r1) / d;
+        let s = (1.0 - k * k).max(0.0).sqrt();
+        let (nax, nay) = (k * ux - s * uy, k * uy + s * ux);
+        let (nbx, nby) = (k * ux + s * uy, k * uy - s * ux);
+        let mut quad = [
+            (x0 + r0 * nax, y0 + r0 * nay),
+            (x1 + r1 * nax, y1 + r1 * nay),
+            (x1 + r1 * nbx, y1 + r1 * nby),
+            (x0 + r0 * nbx, y0 + r0 * nby),
+        ];
+        if signed_area(&quad).signum() != winding {
+            quad.reverse();
+        }
+        pb.move_to(quad[0].0, quad[0].1);
+        for p in &quad[1..] {
+            pb.line_to(p.0, p.1);
+        }
+        pb.close();
+    }
+    pb.finish()
+}
+
 fn segment_ops<'a>(out: &mut Vec<Op<'a>>, e: &Element, a: Point, b: Point, space: Space) {
     let s = &e.style;
     let (heads, a2, b2) = segment_parts(s, a, b);
@@ -300,15 +419,26 @@ pub(crate) fn element_ops<'a>(e: &'a Element, region: &Rect, px_per_unit: Option
     let el = Space::Element;
     match (&e.raw.kind, &e.raw.geom) {
         (Kind::Pen | Kind::Highlighter, _) => {
-            if let Some(path) = stroke_path(&e.raw.points) {
-                out.push(Op::Stroke {
+            let multiply = matches!(e.raw.kind, Kind::Highlighter);
+            match stroke_shape(&e.raw.kind, &e.raw.points, s.width, s.dash) {
+                Some(StrokeShape::Line(path, stroke)) => out.push(Op::Stroke {
                     path: PathRef::Owned(path),
                     color: s.stroke,
                     opacity: e.opacity,
-                    stroke: StrokeStyle { width: s.width.max(0.5), dash: s.dash },
+                    stroke,
                     space: el,
-                    multiply: matches!(e.raw.kind, Kind::Highlighter),
-                });
+                    multiply,
+                }),
+                Some(StrokeShape::Outline(path)) => out.push(Op::Fill {
+                    path: PathRef::Owned(path),
+                    color: s.stroke,
+                    opacity: e.opacity,
+                    rule: FillRule::Winding,
+                    space: el,
+                    shadow: false,
+                    multiply,
+                }),
+                None => {}
             }
         }
         (Kind::Picture, Geom::Picture(p)) => {

@@ -26,6 +26,7 @@ use tiny_skia::{BlendMode, FilterQuality, Pixmap, PixmapPaint, Transform as Affi
 
 use crate::model::*;
 use crate::options::ViewOptions;
+use crate::paint::{stroke_max_width, stroke_shape, StrokeShape};
 use crate::render::{draw_region, stroke_paint, stroke_path, tiny_color, PictureSource, View};
 use crate::doc::{Board, Changes};
 use crate::snapshot::{id_hash, BoardSnapshot};
@@ -343,7 +344,8 @@ impl BoardView {
         if let Some(live) = self.live.take() {
             if let Some(path) = stroke_path(&live.points) {
                 let b = path.bounds();
-                self.invalidate(Rect::new(b.x(), b.y(), b.width(), b.height()).inflate(live.style.width));
+                let width = stroke_max_width(&live.kind, &live.points, live.style.width, live.style.dash);
+                self.invalidate(Rect::new(b.x(), b.y(), b.width(), b.height()).inflate(width));
             }
         }
     }
@@ -592,18 +594,27 @@ fn draw_grid(pixmap: &mut Pixmap, view: &View, spacing: f32, color: Color) {
 /// `multiply` false lays a highlighter over plainly (stamping into a cache
 /// whose background is baked in).
 fn stamp(pixmap: &mut Pixmap, view: &View, kind: &Kind, style: &ResolvedStyle, points: &[[f32; 3]], multiply: bool) {
-    let Some(path) = stroke_path(points) else { return };
     let mut paint = stroke_paint(kind, style.stroke, style.opacity);
     if !multiply {
         paint.blend_mode = BlendMode::SourceOver;
     }
-    let stroke = tiny_skia::Stroke {
-        width: style.width.max(0.5),
-        line_cap: tiny_skia::LineCap::Round,
-        line_join: tiny_skia::LineJoin::Round,
-        ..Default::default()
-    };
-    pixmap.stroke_path(&path, &paint, &stroke, view.transform(), None);
+    // The same shape the element's own rendering draws (a pen's width
+    // follows its pressure), a run of points at a time.
+    match stroke_shape(kind, points, style.width, style.dash) {
+        Some(StrokeShape::Line(path, s)) => {
+            let stroke = tiny_skia::Stroke {
+                width: s.width,
+                line_cap: tiny_skia::LineCap::Round,
+                line_join: tiny_skia::LineJoin::Round,
+                ..Default::default()
+            };
+            pixmap.stroke_path(&path, &paint, &stroke, view.transform(), None);
+        }
+        Some(StrokeShape::Outline(path)) => {
+            pixmap.fill_path(&path, &paint, tiny_skia::FillRule::Winding, view.transform(), None);
+        }
+        None => {}
+    }
 }
 
 /// Fill `dst` from `src` scaled: `dst` pixel (x, y) shows `src` pixel

@@ -9,6 +9,7 @@
 //! (so others watch it happen) and once more on release.
 
 use pimble_board::{End, Side};
+use rinch::render_surface::{SurfacePointer, SurfacePointerKind};
 
 use super::*;
 
@@ -59,14 +60,35 @@ pub(super) fn claims_key(pane: PaneId, key: &SurfaceKeyData) -> bool {
     }
 }
 
-fn wheel_zooms_out(delta_y: f32) -> bool {
-    // A wheel turned toward the person: negative on the desktop (winit's
-    // sign), positive in the browser (`WheelEvent.deltaY`).
-    if cfg!(feature = "native") {
-        delta_y < 0.0
-    } else {
-        delta_y > 0.0
+/// How far a plain wheel turn moves the board's content (physical pixels
+/// are this times the scale): Ctrl+wheel zooms (it arrives as `Pinch`), a
+/// wheel pans, vertically unless the event moves sideways or shift is held.
+/// The desktop's deltas carry winit's sign (positive: the content moves down
+/// or right), the browser's the DOM's (positive: scrolled down or right, so
+/// the content moves up or left).
+fn wheel_pan(delta_x: f32, delta_y: f32, shift: bool) -> (f32, f32) {
+    let (mut x, mut y) = if cfg!(feature = "native") { (delta_x, delta_y) } else { (-delta_x, -delta_y) };
+    if shift && x == 0.0 {
+        (x, y) = (y, 0.0);
     }
+    (x, y)
+}
+
+/// The pressure a pointer draws with: a pen's (or a finger's, where the
+/// screen measures it) as reported, a mouse's always 0.5.
+fn pressure_of(pointer: &SurfacePointer) -> f32 {
+    match pointer.kind {
+        SurfacePointerKind::Pen | SurfacePointerKind::Eraser | SurfacePointerKind::Touch if pointer.pressure.is_finite() => {
+            pointer.pressure.clamp(0.0, 1.0)
+        }
+        _ => 0.5,
+    }
+}
+
+/// The middle of the first two fingers down.
+fn two_finger_center(touches: &[(u64, (f32, f32))]) -> Option<(f32, f32)> {
+    let [(_, a), (_, b), ..] = touches else { return None };
+    Some(((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0))
 }
 
 pub(super) fn on_event(store: AppStore, pane: PaneId, event: SurfaceEvent) {
@@ -76,60 +98,22 @@ pub(super) fn on_event(store: AppStore, pane: PaneId, event: SurfaceEvent) {
     let scale = scale_of(pane);
     let ui = store.pane(pane).board_ui;
     match event {
-        SurfaceEvent::MouseDown { x, y, button } => {
-            let (px, py) = (x * scale, y * scale);
-            // A press on the board focuses its pane, as a press in an editor does.
-            crate::pane_view::focus_pane(store, pane);
-            crate::editor::give_keyboard_to(store, pane);
-            // A press anywhere else ends the text being typed.
-            end_text(store, pane);
-            ui.tip.set(None);
-            let now = now_ms();
-            let (space, double) = with_session(pane, |s| {
-                let (t, lx, ly) = s.last_press;
-                let double = now - t < DOUBLE_CLICK_MS && (lx - px).hypot(ly - py) < 6.0 * scale;
-                s.last_press = if double { (0.0, 0.0, 0.0) } else { (now, px, py) };
-                s.pointer = (px, py);
-                (s.space, double)
-            })
-            .unwrap_or((false, false));
-            let tool = untracked(|| store.board_tool.get());
-            match button {
-                SurfaceMouseButton::Middle => begin_pan(pane, px, py),
-                SurfaceMouseButton::Left if space || tool == Tool::Hand => begin_pan(pane, px, py),
-                SurfaceMouseButton::Left => {
-                    if double && double_click(store, pane, px, py) {
-                        return;
-                    }
-                    press(store, pane, tool, px, py);
-                }
-                SurfaceMouseButton::Right => {}
-            }
-        }
-        SurfaceEvent::MouseMove { x, y } => {
+        SurfaceEvent::PointerDown { x, y, button, pointer } => pointer_down(store, pane, x * scale, y * scale, button, pointer),
+        SurfaceEvent::PointerMove { x, y, pointer } => {
             ui.hover.set_if_changed(true);
-            pointer_moved(store, pane, x * scale, y * scale);
+            pointer_move(store, pane, x * scale, y * scale, pointer);
         }
-        SurfaceEvent::MouseUp { x, y, .. } => pointer_released(store, pane, x * scale, y * scale),
-        SurfaceEvent::MouseWheel { x, y, delta_y, .. } => {
-            if delta_y == 0.0 {
+        SurfaceEvent::PointerUp { x, y, button, pointer } => pointer_up(store, pane, x * scale, y * scale, button, pointer),
+        SurfaceEvent::PointerCancel { pointer } => pointer_cancel(store, pane, pointer),
+        SurfaceEvent::Pinch { x, y, scale: factor } => zoom_about(store, pane, x * scale, y * scale, factor),
+        SurfaceEvent::MouseWheel { delta_x, delta_y, .. } => {
+            let shift = with_session(pane, |s| s.shift).unwrap_or(false);
+            let (dx, dy) = wheel_pan(delta_x, delta_y, shift);
+            if dx == 0.0 && dy == 0.0 {
                 return;
             }
-            let factor = if wheel_zooms_out(delta_y) { 1.0 / 1.1 } else { 1.1 };
-            let generation = with_session(pane, |s| {
-                s.view.zoom_at(x * scale, y * scale, factor);
-                s.settle_generation += 1;
-                s.settle_generation
-            });
+            with_session(pane, |s| s.view.pan_by(dx * scale, dy * scale));
             camera_moved(store, pane);
-            if let Some(generation) = generation {
-                let _ = set_timeout(SETTLE_MS, move || {
-                    let settled = with_session(pane, |s| s.settle_generation == generation && s.view.settle(&picture_source()));
-                    if settled == Some(true) {
-                        present(pane);
-                    }
-                });
-            }
         }
         SurfaceEvent::KeyDown(key) => key_down(store, pane, &key),
         SurfaceEvent::KeyUp(key) => {
@@ -160,6 +144,230 @@ pub(super) fn on_event(store: AppStore, pane: PaneId, event: SurfaceEvent) {
             drop_tree_row(store, pane);
         }
         _ => {}
+    }
+}
+
+/// Zoom by `factor` about physical pixel (`px`, `py`) (a pinch, Ctrl+wheel),
+/// re-rendering at the new zoom once it has been still for a moment.
+pub(super) fn zoom_about(store: AppStore, pane: PaneId, px: f32, py: f32, factor: f32) {
+    if !factor.is_finite() || factor <= 0.0 {
+        return;
+    }
+    let generation = with_session(pane, |s| {
+        s.view.zoom_at(px, py, factor);
+        s.settle_generation += 1;
+        s.settle_generation
+    });
+    camera_moved(store, pane);
+    if let Some(generation) = generation {
+        let _ = set_timeout(SETTLE_MS, move || {
+            let settled = with_session(pane, |s| s.settle_generation == generation && s.view.settle(&picture_source()));
+            if settled == Some(true) {
+                present(pane);
+            }
+        });
+    }
+}
+
+// ── Pointers ────────────────────────────────────────────────────────────────
+
+/// A mouse button, pen tip or finger went down. One finger acts as the
+/// tool does (the pen draws, the hand pans, select selects); a second finger
+/// cancels what the first began and the two pan and zoom; a pen's eraser
+/// end erases whatever the tool. One gesture at a time: presses of another
+/// pointer, or another button of the same one, meanwhile start nothing.
+pub(super) fn pointer_down(store: AppStore, pane: PaneId, px: f32, py: f32, button: SurfaceMouseButton, pointer: SurfacePointer) {
+    if pointer.kind == SurfacePointerKind::Touch {
+        let fingers = with_session(pane, |s| {
+            s.touches.retain(|t| t.0 != pointer.id);
+            s.touches.push((pointer.id, (px, py)));
+            s.touches.len()
+        })
+        .unwrap_or(0);
+        if fingers >= 2 {
+            if fingers == 2 {
+                cancel_gesture(store, pane);
+                with_session(pane, |s| s.gesture = Gesture::Pinch);
+            }
+            return;
+        }
+    }
+    let busy = with_session(pane, |s| s.driver.is_some() || matches!(s.gesture, Gesture::Pinch)).unwrap_or(true);
+    if busy || button == SurfaceMouseButton::Right {
+        return;
+    }
+    with_session(pane, |s| {
+        s.driver = Some((pointer.id, button));
+        s.pressure = pressure_of(&pointer);
+    });
+    let eraser = pointer.kind == SurfacePointerKind::Eraser;
+    press_button(store, pane, px, py, button, eraser.then_some(Tool::Eraser));
+}
+
+/// A pointer moved: two fingers pan (their spread zooms through `Pinch`),
+/// the pointer driving the gesture carries it on, any other only hovers.
+pub(super) fn pointer_move(store: AppStore, pane: PaneId, px: f32, py: f32, pointer: SurfacePointer) {
+    if pointer.kind == SurfacePointerKind::Touch {
+        let pinching = with_session(pane, |s| {
+            let before = two_finger_center(&s.touches);
+            if let Some(t) = s.touches.iter_mut().find(|t| t.0 == pointer.id) {
+                t.1 = (px, py);
+            }
+            if !matches!(s.gesture, Gesture::Pinch) {
+                return false;
+            }
+            if let (Some(a), Some(b)) = (before, two_finger_center(&s.touches)) {
+                s.view.pan_by(b.0 - a.0, b.1 - a.1);
+            }
+            true
+        })
+        .unwrap_or(false);
+        if pinching {
+            camera_moved(store, pane);
+            return;
+        }
+    }
+    let driving = with_session(pane, |s| match s.driver {
+        Some((id, _)) if id == pointer.id => {
+            // A pen can report no pressure for a moment mid-stroke; keep the
+            // last it had rather than drawing a pinch.
+            let p = pressure_of(&pointer);
+            if p > 0.0 {
+                s.pressure = p;
+            }
+            Some(true)
+        }
+        Some(_) => None,
+        None => Some(false),
+    })
+    .flatten();
+    match driving {
+        Some(true) => pointer_moved(store, pane, px, py),
+        // Hovering: a mouse or a pen in range, never a finger.
+        Some(false) if pointer.kind != SurfacePointerKind::Touch => pointer_moved(store, pane, px, py),
+        _ => {}
+    }
+}
+
+/// A press that started on the surface ended (wherever the pointer is now:
+/// the surface keeps the pointer from its press to its release). Only the
+/// release of the button that began the gesture ends it.
+pub(super) fn pointer_up(store: AppStore, pane: PaneId, px: f32, py: f32, button: SurfaceMouseButton, pointer: SurfacePointer) {
+    if pointer.kind == SurfacePointerKind::Touch {
+        let pinching = with_session(pane, |s| {
+            s.touches.retain(|t| t.0 != pointer.id);
+            let pinching = matches!(s.gesture, Gesture::Pinch);
+            if pinching && s.touches.is_empty() {
+                s.gesture = Gesture::Idle;
+            }
+            pinching
+        })
+        .unwrap_or(false);
+        if pinching {
+            return;
+        }
+    }
+    let ends = with_session(pane, |s| {
+        let ends = s.driver == Some((pointer.id, button));
+        if ends {
+            s.driver = None;
+        }
+        ends
+    })
+    .unwrap_or(false);
+    if ends {
+        pointer_released(store, pane, px, py);
+    }
+}
+
+/// The platform took a pointer away (a cancelled touch, a palm rejected):
+/// what it was doing is undone, as if it had not happened.
+pub(super) fn pointer_cancel(store: AppStore, pane: PaneId, pointer: SurfacePointer) {
+    let driving = with_session(pane, |s| {
+        s.touches.retain(|t| t.0 != pointer.id);
+        if matches!(s.gesture, Gesture::Pinch) && s.touches.is_empty() {
+            s.gesture = Gesture::Idle;
+        }
+        s.driver.is_some_and(|(id, _)| id == pointer.id)
+    })
+    .unwrap_or(false);
+    if driving {
+        cancel_gesture(store, pane);
+    }
+}
+
+/// Drop the gesture under way as if it had not happened: a stroke and a
+/// shape or connector being made go (nothing is written for a stroke
+/// cancelled in its first moments), what a move, resize or rotation wrote is
+/// written back as it was, a marquee leaves the selection it started from.
+/// Erasing is not taken back (each erase is its own edit; undo has it).
+pub(super) fn cancel_gesture(store: AppStore, pane: PaneId) {
+    let Some(gesture) = with_session(pane, |s| {
+        s.driver = None;
+        std::mem::replace(&mut s.gesture, Gesture::Idle)
+    }) else {
+        return;
+    };
+    match gesture {
+        Gesture::Stroke { id, .. } => {
+            with_session(pane, |s| s.view.cancel_stroke());
+            if let Some(id) = id {
+                local_edit(store, pane, |t| t.delete_element(&id));
+            }
+        }
+        Gesture::Shape { id: Some(id), .. } | Gesture::Connector { id: Some(id), .. } => {
+            local_edit(store, pane, |t| t.delete_element(&id));
+        }
+        Gesture::Move { bases, written_at, .. } if written_at > 0.0 => {
+            let writes: Vec<_> = bases.iter().filter_map(|b| translated(b, 0.0, 0.0)).collect();
+            write_elements(store, pane, &writes);
+        }
+        Gesture::Resize { bounds, bases, written_at, .. } if written_at > 0.0 => {
+            let writes: Vec<_> = bases.iter().filter_map(|b| resized(b, &bounds, &bounds)).collect();
+            write_elements(store, pane, &writes);
+        }
+        Gesture::Rotate { center, bases, written_at, .. } if written_at > 0.0 => {
+            let writes: Vec<_> = bases.iter().filter_map(|b| rotated(b, center, 0.0)).collect();
+            write_elements(store, pane, &writes);
+        }
+        Gesture::Marquee { base, .. } => {
+            with_session(pane, |s| s.selected = base);
+        }
+        _ => {}
+    }
+    after_change(store, pane);
+}
+
+/// A press of `button` at physical pixel (`px`, `py`) with the current tool
+/// (or `tool`, a pen's eraser end).
+fn press_button(store: AppStore, pane: PaneId, px: f32, py: f32, button: SurfaceMouseButton, tool: Option<Tool>) {
+    let scale = scale_of(pane);
+    // A press on the board focuses its pane, as a press in an editor does.
+    crate::pane_view::focus_pane(store, pane);
+    crate::editor::give_keyboard_to(store, pane);
+    // A press anywhere else ends the text being typed.
+    end_text(store, pane);
+    store.pane(pane).board_ui.tip.set(None);
+    let now = now_ms();
+    let (space, double) = with_session(pane, |s| {
+        let (t, lx, ly) = s.last_press;
+        let double = now - t < DOUBLE_CLICK_MS && (lx - px).hypot(ly - py) < 6.0 * scale;
+        s.last_press = if double { (0.0, 0.0, 0.0) } else { (now, px, py) };
+        s.pointer = (px, py);
+        (s.space, double)
+    })
+    .unwrap_or((false, false));
+    let tool = tool.unwrap_or_else(|| untracked(|| store.board_tool.get()));
+    match button {
+        SurfaceMouseButton::Middle => begin_pan(pane, px, py),
+        SurfaceMouseButton::Left if space || tool == Tool::Hand => begin_pan(pane, px, py),
+        SurfaceMouseButton::Left => {
+            if double && tool != Tool::Eraser && double_click(store, pane, px, py) {
+                return;
+            }
+            press(store, pane, tool, px, py);
+        }
+        SurfaceMouseButton::Right => {}
     }
 }
 
@@ -370,18 +578,14 @@ fn begin_stroke(store: AppStore, pane: PaneId, kind: Kind, p: Point) {
     }
     let Some(layer) = target_layer(store, pane) else { return };
     let style = new_style(store, &kind);
-    let point = [p.x, p.y, 0.5];
-    with_session(pane, |s| s.view.begin_stroke(kind.clone(), &style, point));
     // A new stroke is a new undo step, however soon after the last.
     new_undo_step(pane);
-    let element = with_layer(NewElement::stroke(kind, vec![point]).with_style(style), &layer);
-    let id = local_edit(store, pane, |t| t.add_element(element));
-    with_session(pane, |s| match id {
-        Some(id) => {
-            s.selected.clear();
-            s.gesture = Gesture::Stroke { id, pending: Vec::new(), appended_at: now_ms() };
-        }
-        None => s.view.cancel_stroke(),
+    with_session(pane, |s| {
+        let point = [p.x, p.y, s.pressure];
+        s.view.begin_stroke(kind.clone(), &style, point);
+        s.selected.clear();
+        // Its element is written with its first append (`Write::MakeStroke`).
+        s.gesture = Gesture::Stroke { id: None, kind, style, layer, pending: vec![point], appended_at: now_ms() };
     });
     after_change(store, pane);
 }
@@ -422,6 +626,8 @@ enum Write {
     Nothing,
     Redraw,
     Append(String, Vec<[f32; 3]>),
+    /// A stroke's first ~100 ms of points: its element.
+    MakeStroke(Kind, Style, String, Vec<[f32; 3]>),
     /// Element writes: geometry and transform per element.
     Elements(Vec<(String, Option<Geom>, Option<Transform>)>),
     MakeShape(Kind, Point, Point),
@@ -454,21 +660,22 @@ fn pointer_moved(store: AppStore, pane: PaneId, px: f32, py: f32) {
                 s.view.pan_by(dx, dy);
                 Write::Redraw
             }
-            Gesture::Stroke { id, pending, appended_at } => {
-                let point = [p.x, p.y, 0.5];
+            Gesture::Stroke { id, kind, style, layer, pending, appended_at } => {
+                let point = [p.x, p.y, s.pressure];
                 pending.push(point);
-                let id = id.clone();
                 let batch = if now_ms() - *appended_at >= APPEND_EVERY_MS {
                     *appended_at = now_ms();
                     Some(std::mem::take(pending))
                 } else {
                     None
                 };
+                let write = match (batch, id) {
+                    (Some(points), Some(id)) => Write::Append(id.clone(), points),
+                    (Some(points), None) => Write::MakeStroke(kind.clone(), style.clone(), layer.clone(), points),
+                    (None, _) => Write::Redraw,
+                };
                 s.view.extend_stroke(&[point]);
-                match batch {
-                    Some(points) => Write::Append(id, points),
-                    None => Write::Redraw,
-                }
+                write
             }
             Gesture::Shape { kind, start, last, id, written_at } => {
                 let p = constrain(kind, *start, snap_point(snap_on, p), shift);
@@ -538,6 +745,7 @@ fn pointer_moved(store: AppStore, pane: PaneId, px: f32, py: f32) {
                 Write::Redraw
             }
             Gesture::Erase => Write::Erase(p),
+            Gesture::Pinch => Write::Nothing,
         }
     });
     let Some(next) = next else { return };
@@ -548,6 +756,22 @@ fn pointer_moved(store: AppStore, pane: PaneId, px: f32, py: f32) {
         Write::Redraw => after_change(store, pane),
         Write::Append(id, points) => {
             local_edit(store, pane, |t| t.append_points(&id, &points));
+        }
+        Write::MakeStroke(kind, style, layer, points) => {
+            let element = with_layer(NewElement::stroke(kind, points).with_style(style), &layer);
+            let id = local_edit(store, pane, |t| t.add_element(element));
+            with_session(pane, |s| match id {
+                Some(id) => {
+                    if let Gesture::Stroke { id: slot, .. } = &mut s.gesture {
+                        *slot = Some(id);
+                    }
+                }
+                None => {
+                    s.view.cancel_stroke();
+                    s.gesture = Gesture::Idle;
+                }
+            });
+            after_change(store, pane);
         }
         Write::Elements(writes) => write_elements(store, pane, &writes),
         Write::MakeShape(kind, start, p) => {
@@ -594,18 +818,33 @@ fn pointer_released(store: AppStore, pane: PaneId, px: f32, py: f32) {
     let shift = with_session(pane, |s| s.shift).unwrap_or(false);
     let p = with_session(pane, |s| s.view.screen_to_board(px, py)).unwrap_or_default();
     match gesture {
-        Gesture::Stroke { id, mut pending, .. } => {
+        Gesture::Stroke { id, kind, style, layer, mut pending, .. } => {
             let (points, min_gap) = with_session(pane, |s| {
-                pending.push([p.x, p.y, 0.5]);
+                // The release's own pressure is none: the stroke ends at the
+                // last it was drawn with.
+                let last = [p.x, p.y, s.pressure];
+                pending.push(last);
                 s.view.extend_stroke(&pending[pending.len() - 1..]);
                 let mut points = s.view.end_stroke();
-                points.push([p.x, p.y, 0.5]);
+                points.push(last);
                 (points, 0.75 / s.view.zoom().max(1e-3))
             })
             .unwrap_or_default();
             // Smoothed once, on release, and never edited after.
             let smoothed = smooth_stroke(&points, min_gap);
-            local_edit(store, pane, |t| t.replace_points(&id, &smoothed));
+            match id {
+                Some(id) => {
+                    local_edit(store, pane, |t| t.replace_points(&id, &smoothed));
+                }
+                None => {
+                    // Released within its first moments: written once, whole.
+                    let element = with_layer(NewElement::stroke(kind, smoothed).with_style(style), &layer);
+                    if local_edit(store, pane, |t| t.add_element(element)).is_none() {
+                        with_session(pane, |s| s.view.invalidate_all());
+                    }
+                }
+            }
+            after_change(store, pane);
         }
         Gesture::Shape { kind, start, last, id, .. } => match id {
             Some(id) => {
@@ -1973,13 +2212,10 @@ fn key_down(store: AppStore, pane: PaneId, key: &SurfaceKeyData) {
         }
         "Delete" | "Backspace" => delete_selected(store, pane),
         "Escape" => {
-            with_session(pane, |s| {
-                if matches!(s.gesture, Gesture::Stroke { .. }) {
-                    s.view.cancel_stroke();
-                }
-                s.gesture = Gesture::Idle;
-                s.selected.clear();
-            });
+            // Escape mid-gesture takes the gesture back, as a cancelled
+            // pointer does.
+            cancel_gesture(store, pane);
+            with_session(pane, |s| s.selected.clear());
             after_change(store, pane);
         }
         "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" => {
@@ -2055,6 +2291,20 @@ mod tests {
             plain: true,
             bounds: Rect::new(0.0, 0.0, 100.0, 50.0),
         }
+    }
+
+    /// A plain wheel pans (Ctrl+wheel zooms, as `Pinch`): turned toward the
+    /// person it shows what is below, so the content moves up, on both
+    /// backends whatever their sign; shift turns a vertical wheel sideways.
+    #[test]
+    fn a_wheel_pans_the_way_the_page_would_scroll() {
+        // Toward the person: winit's delta is negative, the DOM's positive.
+        let toward = if cfg!(feature = "native") { -40.0 } else { 40.0 };
+        assert_eq!(wheel_pan(0.0, toward, false), (0.0, -40.0));
+        assert_eq!(wheel_pan(0.0, toward, true), (-40.0, 0.0));
+        // A sideways wheel (or the browser's shift+wheel) moves sideways.
+        assert_eq!(wheel_pan(toward, 0.0, false), (-40.0, 0.0));
+        assert_eq!(wheel_pan(toward, 0.0, true), (-40.0, 0.0));
     }
 
     #[test]

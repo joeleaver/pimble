@@ -712,7 +712,8 @@ fn own_extent(e: &RawElement, s: &ResolvedStyle, text_box: Option<Rect>, grown: 
             for p in it {
                 r = r.union(&Rect::new(p[0], p[1], 0.0, 0.0));
             }
-            (r, r.inflate(half.max(0.5)))
+            // Pressure widens a pen where it was pressed harder.
+            (r, r.inflate((crate::paint::stroke_max_width(&e.kind, &e.points, s.width, s.dash) / 2.0).max(0.5)))
         }
         (Kind::Group | Kind::Other(_), _) => return None,
         (_, Geom::Picture(p)) => {

@@ -5,7 +5,7 @@
 //! elements a marquee holds.
 
 use crate::model::*;
-use crate::paint::{callout_pointer, diamond_points, segment_parts};
+use crate::paint::{callout_pointer, diamond_points, segment_parts, width_at};
 use crate::render::ts_scale;
 use crate::snapshot::{BoardSnapshot, Element, STEP_RADIUS};
 
@@ -25,15 +25,6 @@ fn dist_to_segment(p: Point, a: Point, b: Point) -> f32 {
     }
     let t = (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0);
     dist(p, Point::new(a.x + t * dx, a.y + t * dy))
-}
-
-/// The distance from `p` to an open polyline.
-fn dist_to_polyline(p: Point, pts: &[Point]) -> f32 {
-    match pts {
-        [] => f32::INFINITY,
-        [only] => dist(p, *only),
-        _ => pts.windows(2).map(|w| dist_to_segment(p, w[0], w[1])).fold(f32::INFINITY, f32::min),
-    }
 }
 
 /// The distance from `p` to a closed polygon's outline.
@@ -114,14 +105,26 @@ impl Element {
         let half = s.width / 2.0;
         match (&self.raw.kind, &self.raw.geom) {
             (Kind::Pen | Kind::Highlighter, _) => {
-                let pts: Vec<Point> = self
+                // Each point as drawn: where it is and its width there (a
+                // pen's follows its pressure).
+                let pts: Vec<(Point, f32)> = self
                     .raw
                     .points
                     .iter()
                     .filter(|v| v[0].is_finite() && v[1].is_finite())
-                    .map(|v| Point::new(v[0], v[1]))
+                    .map(|v| (Point::new(v[0], v[1]), width_at(&self.raw.kind, s.width, s.dash, v[2]) / 2.0))
                     .collect();
-                dist_to_polyline(q, &pts) <= s.width.max(0.5) / 2.0 + tol
+                match pts.as_slice() {
+                    [] => false,
+                    [(only, half)] => dist(q, *only) <= half + tol,
+                    _ => pts.windows(2).any(|w| {
+                        let ((a, ha), (b, hb)) = (w[0], w[1]);
+                        let (dx, dy) = (b.x - a.x, b.y - a.y);
+                        let len2 = dx * dx + dy * dy;
+                        let t = if len2 > 0.0 { (((q.x - a.x) * dx + (q.y - a.y) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+                        dist_to_segment(q, a, b) <= ha + (hb - ha) * t + tol
+                    }),
+                }
             }
             (Kind::Line | Kind::Arrow, Geom::Segment { a, b }) => hits_segment(s, *a, *b, q, half + tol, tol),
             (Kind::Rect | Kind::Ellipse | Kind::Diamond, Geom::Rect(r)) => {

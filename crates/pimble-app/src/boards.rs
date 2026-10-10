@@ -489,9 +489,11 @@ enum Gesture {
     /// Middle-drag, space-drag or the hand tool: the last position, physical
     /// pixels.
     Pan { last: (f32, f32) },
-    /// A pen or highlighter stroke: its element, and the points not yet
-    /// appended.
-    Stroke { id: String, pending: Vec<[f32; 3]>, appended_at: f64 },
+    /// A pen or highlighter stroke: its element once it is written (its
+    /// first ~100 ms of points make it, so a stroke cancelled at once, a
+    /// finger that turns out to be the first of a pinch, writes nothing),
+    /// what it is made with, and the points not yet appended.
+    Stroke { id: Option<String>, kind: Kind, style: Style, layer: String, pending: Vec<[f32; 3]>, appended_at: f64 },
     /// A line, arrow, shape or frame being dragged out from `start`: its
     /// element once the drag has gone far enough to make one.
     Shape { kind: Kind, start: Point, last: Point, id: Option<String>, written_at: f64 },
@@ -508,6 +510,9 @@ enum Gesture {
     Marquee { start: (f32, f32), now: (f32, f32), base: Vec<String> },
     /// The eraser, held down.
     Erase,
+    /// Two fingers down: their moves pan, their spread zooms (`Pinch`),
+    /// until the last of them is lifted.
+    Pinch,
 }
 
 /// A text being typed into an element (contract section 4: "typed in a real
@@ -547,6 +552,14 @@ struct Session {
     last_press: (f64, f32, f32),
     /// The pointer's last position over the surface, physical pixels.
     pointer: (f32, f32),
+    /// The pointer and button whose press the gesture is (one at a time:
+    /// another pointer's or button's presses meanwhile start nothing).
+    driver: Option<(u64, SurfaceMouseButton)>,
+    /// The fingers on the surface, in the order they came down, with where
+    /// they are (physical pixels).
+    touches: Vec<(u64, (f32, f32))>,
+    /// The pressure of the pointer drawing (0.5 for a mouse).
+    pressure: f32,
     text: Option<TextEdit>,
     /// The way of looking (color by author, card titles).
     options: ViewOptions,
@@ -706,6 +719,9 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
         settle_generation: 0,
         last_press: (0.0, 0.0, 0.0),
         pointer: (0.0, 0.0),
+        driver: None,
+        touches: Vec::new(),
+        pressure: 0.5,
         text: None,
         options: ViewOptions { color_by_author: untracked(|| ui.by_author.get()), ..ViewOptions::default() },
         nav_generation: 0,
@@ -1244,6 +1260,9 @@ pub(crate) fn surface(store: AppStore, pane: PaneId) -> RenderSurfaceHandle {
     APP.with(|app| app.set(Some(store)));
     let surface = create_render_surface();
     surface.set_render_callback(move |_writer, _width, _height| present(pane));
+    // Pointer events: which device (pen, its eraser, a finger) and how hard,
+    // two-finger and Ctrl+wheel zoom as `Pinch`.
+    surface.set_pointer_events(true);
     surface.set_event_handler(move |event| tools::on_event(store, pane, event));
     surface.set_key_handler(move |key| tools::claims_key(pane, key));
     SURFACES.with(|s| s.borrow_mut()[pane.index()] = Some(surface.clone()));
@@ -1791,6 +1810,98 @@ mod tests {
         tools::begin_text_new_for_test(store, P[0], Point::new(0.0, 0.0));
         tools::text_input(store, P[0], "x".to_string());
         assert_eq!(element_count(P[0]), 0);
+        stop(store, P[0]);
+    }
+
+    fn pen(id: u64, pressure: f32) -> rinch::render_surface::SurfacePointer {
+        rinch::render_surface::SurfacePointer { id, kind: rinch::render_surface::SurfacePointerKind::Pen, pressure, primary: true }
+    }
+
+    fn finger(id: u64) -> rinch::render_surface::SurfacePointer {
+        rinch::render_surface::SurfacePointer { id, kind: rinch::render_surface::SurfacePointerKind::Touch, pressure: 0.5, primary: id == 10 }
+    }
+
+    fn broadcasts(commands: &crossbeam_channel::Receiver<BackendCommand>) -> usize {
+        commands.try_iter().filter(|c| matches!(c, BackendCommand::BroadcastChanges { .. })).count()
+    }
+
+    /// Pointer events (rinch's `set_pointer_events`): a pen's pressure is
+    /// stored with each point, a mouse's is 0.5; a cancelled stroke and a
+    /// finger that turns out to be the first of a pinch write nothing; the
+    /// pen's eraser end erases whatever the tool; one gesture at a time.
+    #[test]
+    fn pointers_draw_with_their_pressure_and_cancelled_strokes_leave_nothing() {
+        use rinch::render_surface::{SurfacePointer, SurfacePointerKind};
+        let left = SurfaceMouseButton::Left;
+        let (store, commands) = store_with_commands();
+        let (store_id, node_id) = (StoreId::new(), NodeId::new());
+        start(store, P[0], store_id, node_id, &whiteboard_bytes());
+        store.board_tool.set(Tool::Pen);
+        let _ = broadcasts(&commands);
+
+        // A pen pressed harder as it goes.
+        tools::pointer_down(store, P[0], 0.0, 0.0, left, pen(7, 0.2));
+        for i in 1..=10 {
+            tools::pointer_move(store, P[0], i as f32 * 8.0, 0.0, pen(7, 0.2 + i as f32 * 0.07));
+        }
+        // A second pointer's press meanwhile starts nothing.
+        tools::pointer_down(store, P[0], 50.0, 50.0, left, SurfacePointer::mouse(true));
+        tools::pointer_up(store, P[0], 50.0, 50.0, left, SurfacePointer::mouse(false));
+        tools::pointer_up(store, P[0], 80.0, 0.0, left, pen(7, 0.0));
+        assert_eq!(element_count(P[0]), 1);
+        let pressures: Vec<f32> = with_session(P[0], |s| s.snapshot().elements[0].raw.points.iter().map(|p| p[2]).collect()).unwrap();
+        assert!(pressures.first().unwrap() < &0.35 && pressures.last().unwrap() > &0.8, "{pressures:?}");
+        assert_eq!(broadcasts(&commands), 1, "written once, whole, on release");
+
+        // A mouse draws at 0.5, whatever it reports.
+        let mut mouse = SurfacePointer::mouse(true);
+        mouse.pressure = 0.9;
+        tools::pointer_down(store, P[0], 0.0, 40.0, left, mouse);
+        tools::pointer_move(store, P[0], 30.0, 40.0, mouse);
+        tools::pointer_up(store, P[0], 30.0, 40.0, left, SurfacePointer::mouse(false));
+        assert_eq!(element_count(P[0]), 2);
+        let all_half = with_session(P[0], |s| s.snapshot().elements[1].raw.points.iter().all(|p| p[2] == 0.5)).unwrap();
+        assert!(all_half);
+        let _ = broadcasts(&commands);
+
+        // A stroke the platform cancels is gone, and nothing was written.
+        tools::pointer_down(store, P[0], 0.0, 80.0, left, pen(7, 0.5));
+        tools::pointer_move(store, P[0], 40.0, 80.0, pen(7, 0.6));
+        tools::pointer_cancel(store, P[0], pen(7, 0.0));
+        assert_eq!(element_count(P[0]), 2);
+        assert_eq!(broadcasts(&commands), 0);
+        assert!(with_session(P[0], |s| matches!(s.gesture, Gesture::Idle) && s.driver.is_none()).unwrap());
+
+        // One finger starts a stroke; a second makes it a pinch: the stroke
+        // goes unwritten, and moving the fingers pans.
+        tools::pointer_down(store, P[0], 0.0, 120.0, left, finger(10));
+        tools::pointer_move(store, P[0], 10.0, 120.0, finger(10));
+        tools::pointer_down(store, P[0], 100.0, 120.0, left, finger(11));
+        assert!(with_session(P[0], |s| matches!(s.gesture, Gesture::Pinch)).unwrap());
+        let before = with_session(P[0], |s| s.view.screen_to_board(0.0, 0.0)).unwrap();
+        tools::pointer_move(store, P[0], 30.0, 140.0, finger(10));
+        tools::pointer_move(store, P[0], 120.0, 140.0, finger(11));
+        let after = with_session(P[0], |s| s.view.screen_to_board(0.0, 0.0)).unwrap();
+        let zoom = with_session(P[0], |s| s.view.zoom()).unwrap();
+        assert!(((before.x - after.x) * zoom - 20.0).abs() < 1e-3 && ((before.y - after.y) * zoom - 20.0).abs() < 1e-3, "{before:?} {after:?}");
+        tools::pointer_up(store, P[0], 30.0, 140.0, left, finger(10));
+        tools::pointer_move(store, P[0], 200.0, 200.0, finger(11));
+        tools::pointer_up(store, P[0], 200.0, 200.0, left, finger(11));
+        assert_eq!(element_count(P[0]), 2);
+        assert_eq!(broadcasts(&commands), 0);
+        assert!(with_session(P[0], |s| matches!(s.gesture, Gesture::Idle) && s.touches.is_empty()).unwrap());
+
+        // The pen's eraser end erases with the pen tool still chosen.
+        let on_first = with_session(P[0], |s| {
+            let e = &s.snapshot().elements[0];
+            s.view.board_to_screen(Point::new(e.raw.points[3][0], e.raw.points[3][1]))
+        })
+        .unwrap();
+        let eraser = SurfacePointer { kind: SurfacePointerKind::Eraser, ..pen(8, 0.5) };
+        tools::pointer_down(store, P[0], on_first.0, on_first.1, left, eraser);
+        tools::pointer_up(store, P[0], on_first.0, on_first.1, left, eraser);
+        assert_eq!(element_count(P[0]), 1);
+        assert_eq!(untracked(|| store.board_tool.get()), Tool::Pen);
         stop(store, P[0]);
     }
 }
