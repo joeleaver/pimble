@@ -73,12 +73,14 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 # `persistence.rs` remembers the theme choice in `localStorage`, which is the
 # browser's equivalent of the desktop's `state.json`; `links.rs` copies a link
 # with `navigator.clipboard`.
-# `pictures.rs` picks a file with a hidden `<input type="file">` and reads it.
+# `pictures.rs` picks a file with a hidden `<input type="file">` and reads it;
+# `boards/export.rs` downloads a saved picture through an anchor and a blob URL.
 web-sys = { version = "0.3", optional = true, features = [
     "Window", "Storage", "Navigator", "Clipboard",
     "Document", "Node", "Element", "HtmlElement", "HtmlInputElement",
     "Event", "EventTarget", "FileList", "File", "Blob",
     "DragEvent", "DataTransfer", "ClipboardEvent",
+    "BlobPropertyBag", "Url", "HtmlAnchorElement",
 ] }
 wasm-bindgen = { version = "0.2", optional = true }
 

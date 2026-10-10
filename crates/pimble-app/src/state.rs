@@ -792,11 +792,11 @@ pub struct AppStore {
     pub dark_mode: Signal<bool>,
 
     /// The board tools (docs/IMAGE_MARKUP_CONTRACT.md section 4), one set for
-    /// the one toolbar: the tool, the pen's color (`#rrggbb`) and width in
-    /// board units. They act on whichever board pane has the focus.
+    /// the one toolbar: the tool, and the style new elements take (and the
+    /// style panel shows), with this viewer's grid and snapping. They act on
+    /// whichever board pane has the focus.
     pub board_tool: Signal<crate::boards::Tool>,
-    pub board_color: Signal<String>,
-    pub board_width: Signal<f32>,
+    pub board_style: crate::boards::StyleUi,
 
     /// The explorer's width in pixels: dragged at its right edge, persisted
     /// with the theme.
@@ -1038,9 +1038,9 @@ pub struct PaneState {
     /// What the floating markup control shows: how many marks the board has
     /// and whether they are shown (`markup_visible`).
     pub board_marks: Signal<(usize, bool)>,
-    /// The selected element's rectangle over the board view, in the pane's
-    /// logical pixels (left, top, width, height), for the selection outline.
-    pub board_selection: Signal<Option<(f32, f32, f32, f32)>>,
+    /// What the board view shows over its surface and in its side panel
+    /// (the selection, the layers, the text being typed, ...).
+    pub board_ui: crate::boards::PaneUi,
 }
 
 impl PaneState {
@@ -1054,7 +1054,7 @@ impl PaneState {
             show_board: Signal::new(false),
             board: Signal::new(None),
             board_marks: Signal::new((0, true)),
-            board_selection: Signal::new(None),
+            board_ui: crate::boards::PaneUi::new(),
         }
     }
 }
@@ -1114,8 +1114,7 @@ impl AppStore {
             appearance_tags_text: Signal::new(String::new()),
             dark_mode: Signal::new(true),
             board_tool: Signal::new(crate::boards::Tool::default()),
-            board_color: Signal::new(crate::boards::DEFAULT_COLOR.to_string()),
-            board_width: Signal::new(crate::boards::DEFAULT_WIDTH),
+            board_style: crate::boards::StyleUi::new(),
             sidebar_width: Signal::new(SIDEBAR_DEFAULT_WIDTH),
             mount_picker_target: Signal::new(None),
             mount_picker_selected: Signal::new(String::new()),

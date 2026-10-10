@@ -451,16 +451,87 @@ pub(crate) const APP_CSS: &str = "
    control is. */
 .pimble-board {
     flex: 1;
+    display: flex;
+    flex-direction: row;
     position: relative;
     z-index: 0;
     overflow: hidden;
     min-height: 0;
 }
 
+.pimble-board__canvas {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+    min-width: 0;
+    display: flex;
+}
+
+.pimble-board__outline {
+    position: absolute;
+    border: 1px solid var(--rinch-primary-color-5);
+    pointer-events: none;
+}
+
 .pimble-board__selection {
     position: absolute;
     border: 1px dashed var(--rinch-primary-color-5);
     pointer-events: none;
+}
+
+.pimble-board__handle {
+    position: absolute;
+    width: 9px;
+    height: 9px;
+    margin-left: -5px;
+    margin-top: -5px;
+    background: var(--rinch-color-body);
+    border: 1px solid var(--rinch-primary-color-5);
+    pointer-events: none;
+}
+
+.pimble-board__handle--nw { left: 0; top: 0; }
+.pimble-board__handle--n { left: 50%; top: 0; }
+.pimble-board__handle--ne { left: 100%; top: 0; }
+.pimble-board__handle--e { left: 100%; top: 50%; }
+.pimble-board__handle--se { left: 100%; top: 100%; }
+.pimble-board__handle--s { left: 50%; top: 100%; }
+.pimble-board__handle--sw { left: 0; top: 100%; }
+.pimble-board__handle--w { left: 0; top: 50%; }
+.pimble-board__handle--rotate { left: 50%; top: -22px; border-radius: 50%; }
+
+.pimble-board__marquee {
+    position: absolute;
+    border: 1px solid var(--rinch-primary-color-5);
+    background: rgba(34, 139, 230, 0.08);
+    pointer-events: none;
+}
+
+.pimble-board__text-input {
+    position: absolute;
+    z-index: 2;
+    margin: 0;
+    padding: 0 2px;
+    border: 1px dashed var(--rinch-primary-color-5);
+    outline: none;
+    resize: none;
+    overflow: hidden;
+    line-height: 1.25;
+    font-family: sans-serif;
+    white-space: pre-wrap;
+}
+
+.pimble-board__tip {
+    position: absolute;
+    z-index: 3;
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    white-space: nowrap;
+    pointer-events: none;
+    color: var(--rinch-color-text);
+    background: var(--rinch-color-body);
+    border: 1px solid var(--rinch-color-border);
 }
 
 .pimble-board__markup {
@@ -477,8 +548,16 @@ pub(crate) const APP_CSS: &str = "
     color: var(--rinch-color-text);
     background: var(--rinch-color-body);
     border: 1px solid var(--rinch-color-border);
+    opacity: 0;
 }
 
+/* Shown while the pointer is over the board or the control itself. */
+.pimble-board__markup--shown,
+.pimble-board__markup:hover {
+    opacity: 1;
+}
+
+/* Markup hidden: the control stays, dimmed, so nobody forgets the marks. */
 .pimble-board__markup--hidden {
     opacity: 0.55;
 }
@@ -487,6 +566,150 @@ pub(crate) const APP_CSS: &str = "
     display: inline-flex;
     width: 14px;
     height: 14px;
+}
+
+.pimble-board__panel {
+    width: 232px;
+    flex-shrink: 0;
+    overflow-y: auto;
+    padding: 8px;
+    border-left: 1px solid var(--rinch-color-border);
+    background: var(--rinch-color-body);
+    font-size: 12px;
+    color: var(--rinch-color-text);
+}
+
+.pimble-board__panel-title {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: var(--rinch-color-dimmed);
+    margin: 6px 0 4px 0;
+}
+
+.pimble-board__nav {
+    position: relative;
+    width: 214px;
+    height: 140px;
+    display: flex;
+    overflow: hidden;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: 4px;
+}
+
+.pimble-board__nav-view {
+    position: absolute;
+    border: 1.5px solid var(--rinch-primary-color-5);
+    pointer-events: none;
+}
+
+.pimble-board__frame-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 4px;
+    cursor: pointer;
+    border-radius: 3px;
+}
+
+.pimble-board__frame-row:hover {
+    background: var(--rinch-color-option-hover);
+}
+
+.pimble-board__section {
+    margin-top: 8px;
+}
+
+.pimble-board__label {
+    margin: 6px 0 3px 0;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-board__row {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+}
+
+.pimble-board__row--wrap {
+    flex-wrap: wrap;
+    margin-top: 6px;
+}
+
+.pimble-board__swatches {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+}
+
+.pimble-board__picker {
+    margin-top: 6px;
+}
+
+.pimble-board-swatch--none {
+    background: linear-gradient(135deg, transparent 45%, #e5484d 45%, #e5484d 55%, transparent 55%);
+}
+
+.pimble-board-swatch--picker {
+    border-radius: 4px;
+}
+
+.pimble-board-chip {
+    padding: 2px 7px;
+    border-radius: 4px;
+    cursor: pointer;
+    border: 1px solid var(--rinch-color-border);
+    color: var(--rinch-color-text);
+}
+
+.pimble-board-chip--active {
+    border-color: var(--rinch-primary-color-4);
+    color: var(--rinch-primary-color-4);
+}
+
+.pimble-board__layers {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+
+.pimble-board__layer {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 4px;
+    border-radius: 3px;
+    cursor: pointer;
+    border: 1px solid transparent;
+}
+
+.pimble-board__layer--picked {
+    border-color: var(--rinch-primary-color-4);
+}
+
+.pimble-board__layer-icon {
+    display: inline-flex;
+    width: 16px;
+    height: 16px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-board__layer-name {
+    flex: 1;
+    overflow: hidden;
+    white-space: nowrap;
+}
+
+.pimble-board__layer-name-input {
+    flex: 1;
+    min-width: 0;
+    font-size: 12px;
+    height: 18px;
+}
+
+.pimble-board__layer-count {
+    color: var(--rinch-color-dimmed);
+    font-size: 11px;
 }
 
 .pimble-board-toolbar {

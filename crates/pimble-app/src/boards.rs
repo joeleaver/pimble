@@ -22,46 +22,345 @@
 //! surface only when something changed. The pane's editor stays mounted and
 //! hidden (docs/SPLIT_VIEW_CONTRACT.md: four editors, never re-mounted).
 //!
+//! The parts:
+//! * here: the pane's session, the collaboration plumbing, pictures, making
+//!   board nodes;
+//! * [`tools`]: the pointer and the keyboard (every tool, selection, moving,
+//!   resizing, rotating, typing text, arranging);
+//! * [`ui`]: the board view's DOM (the surface and what floats over it, the
+//!   side panel with the navigator, style and layers) and the board toolbar;
+//! * [`nav`]: the navigator's own surface;
+//! * [`export`]: Copy Picture, Save Picture As, Save Original As, Flatten.
+//!
 //! Pictures on a board come from the same blob cache text pictures do
 //! (`GetBlob`/`BlobLoaded`), decoded off the UI thread on the desktop.
+
+mod export;
+mod nav;
+mod tools;
+mod ui;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use pimble_board::{
-    smooth_stroke, Author, Board, BoardTxn, BoardView, BoardWatch, Color, Geom, Kind, NewElement, Picture, PictureGeom, Placement,
-    Point, Rect, Stamp, Style, Transform,
+    smooth_stroke, Align, ArrowHeads, Author, Board, BoardSnapshot, BoardTxn, BoardView, BoardWatch, CardLabel, Color, Dash,
+    Geom, Kind, NewElement, Picture, PictureGeom, Placement, Point, Rect, Stamp, Style, Transform, ViewOptions,
 };
 use pimble_core::{node_types, BlobUrl, NodeId, StoreId};
 use pimble_crdt::NodeDoc;
 use rinch::prelude::*;
 use rinch_tabler_icons::TablerIcon;
 
-use crate::appearance::IconGlyph;
 use crate::panes::{PaneId, MAX_PANES};
 use crate::protocol::{BackendCommand, NodeInit, StoredBlob};
 use crate::state::{ActiveEdit, AppStore};
 
+pub(crate) use tools::delete_selected;
+pub(crate) use ui::{render_board, render_board_toolbar};
+
 // ── Tools ───────────────────────────────────────────────────────────────────
 
-/// The board tools of wave 1 (contract section 4): select (click, drag to
-/// move, Delete) and the pen.
+/// The board tools (contract section 4). One set for the one toolbar; they act
+/// on whichever board pane has the focus.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Tool {
     #[default]
     Select,
+    Hand,
     Pen,
+    Highlighter,
+    Line,
+    Arrow,
+    Rect,
+    Ellipse,
+    Diamond,
+    Text,
+    Step,
+    Sticky,
+    Connector,
+    Frame,
+    Eraser,
 }
 
-/// The pen's first color: the marks' red.
+impl Tool {
+    /// In toolbar order.
+    pub const ALL: [Tool; 15] = [
+        Tool::Select,
+        Tool::Hand,
+        Tool::Pen,
+        Tool::Highlighter,
+        Tool::Line,
+        Tool::Arrow,
+        Tool::Rect,
+        Tool::Ellipse,
+        Tool::Diamond,
+        Tool::Text,
+        Tool::Step,
+        Tool::Sticky,
+        Tool::Connector,
+        Tool::Frame,
+        Tool::Eraser,
+    ];
+
+    /// The tool's letter on the keyboard (contract section 4: Spectacle's
+    /// where they do not collide; a board only hears plain letters while it
+    /// has the keyboard, so none of them reach the app's own keys).
+    pub fn key(self) -> char {
+        match self {
+            Tool::Select => 'v',
+            Tool::Hand => 'h',
+            Tool::Pen => 'p',
+            Tool::Highlighter => 'm',
+            Tool::Line => 'l',
+            Tool::Arrow => 'a',
+            Tool::Rect => 'r',
+            Tool::Ellipse => 'o',
+            Tool::Diamond => 'd',
+            Tool::Text => 't',
+            Tool::Step => 'n',
+            Tool::Sticky => 's',
+            Tool::Connector => 'c',
+            Tool::Frame => 'f',
+            Tool::Eraser => 'e',
+        }
+    }
+
+    /// The tool a plain letter picks.
+    pub fn from_key(key: &str) -> Option<Tool> {
+        let mut chars = key.chars();
+        let c = chars.next()?.to_ascii_lowercase();
+        if chars.next().is_some() {
+            return None;
+        }
+        Tool::ALL.into_iter().find(|t| t.key() == c)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Tool::Select => "Select",
+            Tool::Hand => "Hand",
+            Tool::Pen => "Pen",
+            Tool::Highlighter => "Highlighter",
+            Tool::Line => "Line",
+            Tool::Arrow => "Arrow",
+            Tool::Rect => "Rectangle",
+            Tool::Ellipse => "Ellipse",
+            Tool::Diamond => "Diamond",
+            Tool::Text => "Text",
+            Tool::Step => "Numbered step",
+            Tool::Sticky => "Sticky note",
+            Tool::Connector => "Connector",
+            Tool::Frame => "Frame",
+            Tool::Eraser => "Eraser",
+        }
+    }
+
+    pub fn icon(self) -> TablerIcon {
+        match self {
+            Tool::Select => TablerIcon::Pointer,
+            Tool::Hand => TablerIcon::HandStop,
+            Tool::Pen => TablerIcon::Pencil,
+            Tool::Highlighter => TablerIcon::Highlight,
+            Tool::Line => TablerIcon::Line,
+            Tool::Arrow => TablerIcon::ArrowUpRight,
+            Tool::Rect => TablerIcon::Square,
+            Tool::Ellipse => TablerIcon::Circle,
+            Tool::Diamond => TablerIcon::Diamond,
+            Tool::Text => TablerIcon::Typography,
+            Tool::Step => TablerIcon::CircleNumber1,
+            Tool::Sticky => TablerIcon::Note,
+            Tool::Connector => TablerIcon::Route,
+            Tool::Frame => TablerIcon::Frame,
+            Tool::Eraser => TablerIcon::Eraser,
+        }
+    }
+
+    /// What the tool's style controls apply to: the kind it makes.
+    pub fn kind(self) -> Option<Kind> {
+        Some(match self {
+            Tool::Pen => Kind::Pen,
+            Tool::Highlighter => Kind::Highlighter,
+            Tool::Line => Kind::Line,
+            Tool::Arrow => Kind::Arrow,
+            Tool::Rect => Kind::Rect,
+            Tool::Ellipse => Kind::Ellipse,
+            Tool::Diamond => Kind::Diamond,
+            Tool::Text => Kind::Text,
+            Tool::Step => Kind::Step,
+            Tool::Sticky => Kind::Sticky,
+            Tool::Connector => Kind::Connector,
+            Tool::Frame => Kind::Frame,
+            Tool::Select | Tool::Hand | Tool::Eraser => return None,
+        })
+    }
+}
+
+/// The marks' first color: the marks' red.
 pub const DEFAULT_COLOR: &str = "#e53935";
 /// The pen's first width, in board units.
 pub const DEFAULT_WIDTH: f32 = 4.0;
-/// The pen colors the toolbar offers.
-const COLORS: [&str; 6] = ["#e53935", "#fb8c00", "#fdd835", "#43a047", "#1e88e5", "#212121"];
-/// The pen widths the toolbar offers (thin, medium, thick).
-const WIDTHS: [f32; 3] = [2.0, 4.0, 8.0];
+/// The first font size, in board units.
+pub const DEFAULT_FONT_SIZE: f32 = 24.0;
+/// The quick colors the toolbar offers (the marks' red first, then the
+/// appearance palette's, then black and white).
+pub(crate) fn palette() -> Vec<String> {
+    let mut colors = vec![DEFAULT_COLOR.to_string()];
+    colors.extend(crate::appearance::COLOR_CHOICES.iter().map(|(_, c)| c.to_string()));
+    colors.push("#212121".to_string());
+    colors.push("#ffffff".to_string());
+    colors
+}
+/// The widths the style panel offers (thin to extra thick), board units.
+pub(crate) const WIDTHS: [f32; 4] = [2.0, 4.0, 8.0, 16.0];
+/// The font sizes the style panel offers (S, M, L, XL), board units.
+pub(crate) const FONT_SIZES: [(&str, f32); 4] = [("S", 16.0), ("M", 24.0), ("L", 36.0), ("XL", 56.0)];
+/// The grid's spacing, in board units (contract section 4, "grid").
+pub(crate) const GRID: f32 = 20.0;
+
+/// The style new elements take, and what the style panel shows: one set for
+/// the window, like the tool. Selecting elements loads the first one's style
+/// here; changing a value writes it to every selected element too.
+#[derive(Clone, Copy)]
+pub struct StyleUi {
+    pub stroke: Signal<String>,
+    /// `None`: no fill.
+    pub fill: Signal<Option<String>>,
+    pub width: Signal<f32>,
+    pub opacity: Signal<f32>,
+    pub dash: Signal<Dash>,
+    pub font_size: Signal<f32>,
+    pub align: Signal<Align>,
+    /// The arrow tool's heads (the line tool draws none).
+    pub heads: Signal<ArrowHeads>,
+    /// Per viewer (contract section 4): the grid shown, and snapping to it.
+    pub grid: Signal<bool>,
+    pub snap: Signal<bool>,
+    /// The side panel (navigator, style, layers) shown beside every board.
+    pub panel: Signal<bool>,
+}
+
+impl StyleUi {
+    pub fn new() -> Self {
+        Self {
+            stroke: Signal::new(DEFAULT_COLOR.to_string()),
+            fill: Signal::new(None),
+            width: Signal::new(DEFAULT_WIDTH),
+            opacity: Signal::new(1.0),
+            dash: Signal::new(Dash::Solid),
+            font_size: Signal::new(DEFAULT_FONT_SIZE),
+            align: Signal::new(Align::Left),
+            heads: Signal::new(ArrowHeads::End),
+            grid: Signal::new(false),
+            snap: Signal::new(false),
+            panel: Signal::new(true),
+        }
+    }
+}
+
+impl Default for StyleUi {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One layer as the layers panel shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayerRow {
+    pub id: String,
+    pub name: String,
+    pub visible: bool,
+    pub locked: bool,
+    pub opacity: f32,
+    pub count: usize,
+}
+
+/// The box a text being typed sits in over the board, logical pixels.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextBox {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub font_px: f32,
+    pub color: String,
+    pub background: String,
+    pub align: Align,
+}
+
+/// What a pane's board view shows over its surface, and its side panel, as
+/// signals (logical pixels).
+#[derive(Clone, Copy)]
+pub struct PaneUi {
+    /// Every selected element's outline.
+    pub outlines: Signal<Vec<(f32, f32, f32, f32)>>,
+    /// The selection's box, where the handles go; `None` without a
+    /// selection that can be resized.
+    pub handles: Signal<Option<(f32, f32, f32, f32)>>,
+    /// How many elements are selected.
+    pub selected: Signal<usize>,
+    /// The marquee being dragged.
+    pub marquee: Signal<Option<(f32, f32, f32, f32)>>,
+    /// The layers, top first.
+    pub layers: Signal<Vec<LayerRow>>,
+    /// The layer new elements go into.
+    pub layer: Signal<Option<String>>,
+    /// The layer being renamed in place, and the name being typed.
+    pub renaming: Signal<Option<String>>,
+    pub rename_text: Signal<String>,
+    /// The frames, for the navigator: (id, name).
+    pub frames: Signal<Vec<(String, String)>>,
+    /// The attribution under the pointer (contract section 6): where, and
+    /// the sentence.
+    pub tip: Signal<Option<(f32, f32, String)>>,
+    /// The text being typed, and its box.
+    pub text_box: Signal<Option<TextBox>>,
+    pub text_value: Signal<String>,
+    /// "Color by author" (contract section 6), a way of looking, per pane.
+    pub by_author: Signal<bool>,
+    /// The pointer is over the board (the markup control shows).
+    pub hover: Signal<bool>,
+    /// The navigator: the view's rectangle over it, logical pixels.
+    pub nav_view: Signal<Option<(f32, f32, f32, f32)>>,
+    /// Distinct authors on the board.
+    pub authors: Signal<usize>,
+    /// The node cards on the board: the node each links to, and the link.
+    pub cards: Signal<Vec<(StoreId, NodeId, String)>>,
+    /// The board has a picture selected (Save Original As...).
+    pub picture_selected: Signal<bool>,
+}
+
+impl PaneUi {
+    pub fn new() -> Self {
+        Self {
+            outlines: Signal::new(Vec::new()),
+            handles: Signal::new(None),
+            selected: Signal::new(0),
+            marquee: Signal::new(None),
+            layers: Signal::new(Vec::new()),
+            layer: Signal::new(None),
+            renaming: Signal::new(None),
+            rename_text: Signal::new(String::new()),
+            frames: Signal::new(Vec::new()),
+            tip: Signal::new(None),
+            text_box: Signal::new(None),
+            text_value: Signal::new(String::new()),
+            by_author: Signal::new(false),
+            hover: Signal::new(false),
+            nav_view: Signal::new(None),
+            authors: Signal::new(0),
+            cards: Signal::new(Vec::new()),
+            picture_selected: Signal::new(false),
+        }
+    }
+}
+
+impl Default for PaneUi {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// The icon a board node made from a picture starts with (the node's ordinary
 /// custom icon, so the person can change it).
@@ -82,6 +381,9 @@ const REQUEST_BASE: u64 = 1 << 40;
 
 /// "New Image..." on a store that refuses pictures, or with nothing picked.
 const NOT_A_PICTURE: &str = "That file is not a picture Pimble can show.";
+/// A tool refused on a locked layer or element (a guard against accidents,
+/// contract section 5, not a permission).
+const LOCKED: &str = "That is locked. Unlock it in the layers panel or with Arrange > Unlock.";
 
 // ── Who is drawing ──────────────────────────────────────────────────────────
 
@@ -143,16 +445,77 @@ fn undo_options() -> yrs::undo::Options<()> {
 
 // ── A pane's board ──────────────────────────────────────────────────────────
 
+/// An element as a gesture found it: what the gesture writes is computed from
+/// this, never from the moving document.
+#[derive(Debug, Clone)]
+struct Base {
+    id: String,
+    kind: Kind,
+    geom: Geom,
+    transform: Transform,
+    /// Its own geometry's extent (the pivot of its rotation and scale),
+    /// element space.
+    pivot: Rect,
+    /// Its parent's world transform as a translation (frames and groups are
+    /// moved, not rotated, by the tools).
+    parent_offset: (f32, f32),
+    /// Its world transform is a plain translation (no rotation or scale
+    /// anywhere above it): its geometry can be edited directly.
+    plain: bool,
+    /// Its bounds in board units.
+    bounds: Rect,
+}
+
+/// A resize or rotate handle of the selection box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Handle {
+    N,
+    NE,
+    E,
+    SE,
+    S,
+    SW,
+    W,
+    NW,
+    Rotate,
+}
+
 /// What the pointer is doing on a board.
 enum Gesture {
     Idle,
-    /// Middle-drag or space-drag: the last position, physical pixels.
+    /// Middle-drag, space-drag or the hand tool: the last position, physical
+    /// pixels.
     Pan { last: (f32, f32) },
-    /// A pen stroke: its element, and the points not yet appended.
+    /// A pen or highlighter stroke: its element, and the points not yet
+    /// appended.
     Stroke { id: String, pending: Vec<[f32; 3]>, appended_at: f64 },
-    /// Moving an element: where the drag began (board units), the element's
-    /// transform then, and the last position written.
-    Drag { id: String, start: Point, base: Transform, last: Point, written_at: f64 },
+    /// A line, arrow, shape or frame being dragged out from `start`: its
+    /// element once the drag has gone far enough to make one.
+    Shape { kind: Kind, start: Point, last: Point, id: Option<String>, written_at: f64 },
+    /// A connector being dragged from `from`.
+    Connector { from: pimble_board::End, last: Point, id: Option<String>, written_at: f64 },
+    /// Moving the selection.
+    Move { start: Point, last: Point, bases: Vec<Base>, written_at: f64, clicked: Option<String> },
+    /// Resizing the selection by a handle.
+    Resize { handle: Handle, bounds: Rect, last: Point, bases: Vec<Base>, written_at: f64 },
+    /// Rotating the selection about `center`.
+    Rotate { center: Point, start: f32, last: f32, bases: Vec<Base>, written_at: f64 },
+    /// A marquee from `start` (physical pixels); `base` is the selection it
+    /// adds to (shift).
+    Marquee { start: (f32, f32), now: (f32, f32), base: Vec<String> },
+    /// The eraser, held down.
+    Erase,
+}
+
+/// A text being typed into an element (contract section 4: "typed in a real
+/// input overlaid on the surface"). `id` is `None` until the first character
+/// makes the element.
+struct TextEdit {
+    id: Option<String>,
+    kind: Kind,
+    at: Point,
+    /// What the input held after the last keystroke.
+    last: String,
 }
 
 /// One pane's board: the node's document, the board in it, and the view.
@@ -169,14 +532,31 @@ struct Session {
     /// Fitted to the visible extent once, the first time it showed a board.
     fitted: bool,
     gesture: Gesture,
-    selected: Option<String>,
+    /// The selection, in the order it was made.
+    selected: Vec<String>,
     /// The space bar is held: a left drag pans.
     space: bool,
+    /// Shift is held: constrain, add to the selection.
+    shift: bool,
     /// Bumped by every wheel step; the settle timer of an older one does nothing.
     settle_generation: u64,
+    /// The last press: when, where (physical pixels), for double-clicks.
+    last_press: (f64, f32, f32),
+    /// The pointer's last position over the surface, physical pixels.
+    pointer: (f32, f32),
+    text: Option<TextEdit>,
+    /// The way of looking (color by author, card titles).
+    options: ViewOptions,
+    /// Bumped by every change; the navigator's timer of an older one does
+    /// nothing.
+    nav_generation: u64,
 }
 
 impl Session {
+    fn snapshot(&self) -> &BoardSnapshot {
+        self.view.snapshot()
+    }
+
     /// Bring the view up to date with the document after any change to it:
     /// only what changed is re-read, once the board exists.
     fn sync_view(&mut self) {
@@ -188,26 +568,37 @@ impl Session {
             None => {
                 if let Some(watch) = self.board.watch() {
                     self.watch = Some(watch);
-                    self.view.set_snapshot(self.board.snapshot());
+                    let snapshot = self.board.snapshot().with_options(self.options.clone(), &self.board);
+                    self.view.set_snapshot(snapshot);
                 }
             }
         }
         if self.undo.is_none() {
             self.undo = self.board.undo_manager(undo_options());
         }
-        if let Some(id) = &self.selected {
-            if self.view.snapshot().get(id).is_none() {
-                self.selected = None;
-            }
-        }
+        let snapshot = self.view.snapshot();
+        self.selected.retain(|id| snapshot.get(id).is_some());
     }
 
-    /// The selected element's rectangle on screen, in physical pixels.
-    fn selection_rect(&self) -> Option<(f32, f32, f32, f32)> {
-        let e = self.view.snapshot().get(self.selected.as_deref()?)?;
-        let (x0, y0) = self.view.board_to_screen(Point::new(e.bounds.x, e.bounds.y));
-        let (x1, y1) = self.view.board_to_screen(Point::new(e.bounds.right(), e.bounds.bottom()));
-        Some((x0, y0, x1 - x0, y1 - y0))
+    /// A board rectangle on screen, physical pixels (left, top, width, height).
+    fn to_screen(&self, r: &Rect) -> (f32, f32, f32, f32) {
+        let (x0, y0) = self.view.board_to_screen(Point::new(r.x, r.y));
+        let (x1, y1) = self.view.board_to_screen(Point::new(r.right(), r.bottom()));
+        (x0, y0, x1 - x0, y1 - y0)
+    }
+
+    /// The union of the selected elements' bounds.
+    fn selection_bounds(&self) -> Option<Rect> {
+        let snapshot = self.snapshot();
+        self.selected.iter().filter_map(|id| snapshot.get(id)).map(|e| e.bounds).reduce(|a, b| a.union(&b))
+    }
+
+    /// Whether element `id` may be changed by the tools: neither it nor its
+    /// layer is locked (contract section 5).
+    fn editable(&self, id: &str) -> bool {
+        let snapshot = self.snapshot();
+        let Some(e) = snapshot.get(id) else { return false };
+        !e.raw.locked && !snapshot.layer(&e.layer).is_some_and(|l| l.locked)
     }
 }
 
@@ -220,6 +611,14 @@ thread_local! {
     static BOUNDS: RefCell<[Option<Signal<rinch::core::ElementBounds>>; MAX_PANES]> = const { RefCell::new([None, None, None, None]) };
     /// The app, for the callbacks rinch calls with nothing in hand.
     static APP: Cell<Option<AppStore>> = const { Cell::new(None) };
+    /// The tree's drag (a row's tree value), so a row dropped on a board
+    /// becomes a node card (contract section 4).
+    static TREE_DRAG: Cell<Option<DragContext<String>>> = const { Cell::new(None) };
+}
+
+/// The tree's drag-and-drop context, handed over once by the app.
+pub(crate) fn set_tree_drag(ctx: DragContext<String>) {
+    TREE_DRAG.with(|d| d.set(Some(ctx)));
 }
 
 fn with_session<R>(pane: PaneId, f: impl FnOnce(&mut Session) -> R) -> Option<R> {
@@ -281,6 +680,11 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
     };
     let board = Board::of_node(&doc).with_origin(format!("pimble-board-pane-{}", pane.index()));
     let dark = untracked(|| store.dark_mode.get());
+    let ui = store.pane(pane).board_ui;
+    let mut view = BoardView::new(1, 1, background(dark));
+    if untracked(|| store.board_style.grid.get()) {
+        view.set_grid(Some(GRID));
+    }
     let mut session = Session {
         store_id,
         node_id,
@@ -288,17 +692,29 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
         board,
         watch: None,
         undo: None,
-        view: BoardView::new(1, 1, background(dark)),
+        view,
         fitted: false,
         gesture: Gesture::Idle,
-        selected: None,
+        selected: Vec::new(),
         space: false,
+        shift: false,
         settle_generation: 0,
+        last_press: (0.0, 0.0, 0.0),
+        pointer: (0.0, 0.0),
+        text: None,
+        options: ViewOptions { color_by_author: untracked(|| ui.by_author.get()), ..ViewOptions::default() },
+        nav_generation: 0,
     };
     session.sync_view();
+    // An image opens on the arrow, a whiteboard on select (contract section 4).
+    let has_picture = session.snapshot().elements.iter().any(|e| e.raw.kind.is_picture());
     SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()] = Some(session));
     let state = store.pane(pane);
     state.board.set(Some(ActiveEdit { store_id, node_id }));
+    ui.layer.set(None);
+    if untracked(|| store.focused_pane.get()) == pane {
+        store.board_tool.set(if has_picture { Tool::Arrow } else { Tool::Select });
+    }
     if first {
         store.send(BackendCommand::SubscribeNodeChanges { store_id, node_id });
     }
@@ -311,6 +727,7 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
 /// document as this pane last had it, and the last pane holding the node lets
 /// go of its subscription.
 pub(crate) fn stop(store: AppStore, pane: PaneId) {
+    tools::end_text(store, pane);
     let Some(session) = SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()].take()) else { return };
     if let Some(sig) = store.get_node_signal(session.store_id, session.node_id) {
         let bytes = session.doc.save();
@@ -318,8 +735,15 @@ pub(crate) fn stop(store: AppStore, pane: PaneId) {
     }
     let state = store.pane(pane);
     state.board.set(None);
-    state.board_selection.set(None);
     state.board_marks.set((0, true));
+    let ui = state.board_ui;
+    ui.outlines.set(Vec::new());
+    ui.handles.set(None);
+    ui.selected.set(0);
+    ui.marquee.set(None);
+    ui.tip.set(None);
+    ui.layers.set(Vec::new());
+    ui.frames.set(Vec::new());
     if !store.is_editing(session.store_id, session.node_id) {
         store.send(BackendCommand::UnsubscribeNodeChanges { store_id: session.store_id, node_id: session.node_id });
     }
@@ -386,6 +810,7 @@ fn apply_to(store: AppStore, pane: PaneId, store_id: StoreId, node_id: NodeId, b
         true
     });
     if applied == Some(true) {
+        tools::text_changed_elsewhere(store, pane);
         after_change(store, pane);
     }
 }
@@ -412,13 +837,23 @@ fn send_update(store: AppStore, from: PaneId, store_id: StoreId, node_id: NodeId
     let _ = set_timeout(0, deliver);
 }
 
+/// Whether this device may write pane `pane`'s board; says the read-only
+/// sentence when it may not.
+fn writable_or_say(store: AppStore, pane: PaneId) -> bool {
+    let Some(held) = with_session(pane, |s| (s.store_id, s.node_id)) else { return false };
+    if store.node_access(held.0, held.1).allows_write() {
+        return true;
+    }
+    crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
+    false
+}
+
 /// One local edit of pane `pane`'s board, stamped with who and when: refused
 /// (with the sentence) when this device may only read the node. Answers the
 /// closure's result.
 fn local_edit<R>(store: AppStore, pane: PaneId, f: impl FnOnce(&mut BoardTxn<'_, '_>) -> pimble_board::doc::Result<R>) -> Option<R> {
     let held = with_session(pane, |s| (s.store_id, s.node_id))?;
-    if !store.node_access(held.0, held.1).allows_write() {
-        crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
+    if !writable_or_say(store, pane) {
         return None;
     }
     let author = author();
@@ -441,27 +876,81 @@ fn local_edit<R>(store: AppStore, pane: PaneId, f: impl FnOnce(&mut BoardTxn<'_,
     }
 }
 
-/// After the pane's board or view changed: the floating controls follow,
-/// then the surface is handed a frame if one is due.
+/// Start a new undo step: the next edit is taken back on its own, however
+/// soon after the last.
+fn new_undo_step(pane: PaneId) {
+    with_session(pane, |s| {
+        if let Some(undo) = s.undo.as_mut() {
+            undo.reset();
+        }
+    });
+}
+
+/// After the pane's board or view changed: what floats over the board and the
+/// side panel follow, then the surface is handed a frame if one is due.
 fn after_change(store: AppStore, pane: PaneId) {
     let scale = scale_of(pane);
-    let ui = with_session(pane, |s| {
-        let snapshot = s.view.snapshot();
-        let marks = (snapshot.markup_count(), snapshot.markup_visible);
-        let selection = s.selection_rect().map(|(x, y, w, h)| (x / scale, y / scale, w / scale, h / scale));
-        (marks, selection)
-    });
     let state = store.pane(pane);
-    match ui {
-        Some((marks, selection)) => {
+    let ui = state.board_ui;
+    let published = with_session(pane, |s| {
+        let snapshot = s.snapshot();
+        let marks = (snapshot.markup_count(), snapshot.markup_visible);
+        let logical = |r: (f32, f32, f32, f32)| (r.0 / scale, r.1 / scale, r.2 / scale, r.3 / scale);
+        let outlines: Vec<(f32, f32, f32, f32)> =
+            s.selected.iter().filter_map(|id| snapshot.get(id)).map(|e| logical(s.to_screen(&e.bounds))).collect();
+        let handles = if s.selected.iter().any(|id| s.editable(id)) {
+            s.selection_bounds().map(|b| logical(s.to_screen(&b)))
+        } else {
+            None
+        };
+        let layers: Vec<LayerRow> = snapshot
+            .layers
+            .iter()
+            .rev()
+            .map(|l| LayerRow { id: l.id.clone(), name: l.name.clone(), visible: l.visible, locked: l.locked, opacity: l.opacity, count: l.count })
+            .collect();
+        let frames: Vec<(String, String)> = snapshot
+            .frames()
+            .into_iter()
+            .map(|e| (e.raw.id.clone(), e.raw.text.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| "Frame".to_string())))
+            .collect();
+        let picture = s.selected.len() == 1 && snapshot.get(&s.selected[0]).is_some_and(|e| e.raw.kind.is_picture());
+        let authors = snapshot.authors().len();
+        let marquee = match &s.gesture {
+            Gesture::Marquee { start, now, .. } => {
+                let (x0, y0) = (start.0.min(now.0), start.1.min(now.1));
+                Some(logical((x0, y0, (start.0 - now.0).abs(), (start.1 - now.1).abs())))
+            }
+            _ => None,
+        };
+        (marks, outlines, handles, layers, frames, picture, authors, marquee, s.selected.len())
+    });
+    match published {
+        Some((marks, outlines, handles, layers, frames, picture, authors, marquee, count)) => {
             state.board_marks.set_if_changed(marks);
-            state.board_selection.set_if_changed(selection);
+            ui.outlines.set_if_changed(outlines);
+            ui.handles.set_if_changed(handles);
+            ui.selected.set_if_changed(count);
+            // The selected layer must still exist.
+            let chosen = untracked(|| ui.layer.get());
+            if chosen.as_ref().is_some_and(|id| !layers.iter().any(|l| &l.id == id)) {
+                ui.layer.set(None);
+            }
+            ui.layers.set_if_changed(layers);
+            ui.frames.set_if_changed(frames);
+            ui.picture_selected.set_if_changed(picture);
+            ui.authors.set_if_changed(authors);
+            ui.marquee.set_if_changed(marquee);
+            tools::place_text_box(store, pane);
+            ui::refresh_card_labels(store, pane);
         }
         None => {
-            state.board_selection.set_if_changed(None);
+            ui.outlines.set_if_changed(Vec::new());
+            ui.handles.set_if_changed(None);
         }
     }
     present(pane);
+    nav::changed(store, pane);
 }
 
 /// Hand pane `pane`'s surface its next frame, if anything changed: the
@@ -500,12 +989,19 @@ fn present(pane: PaneId) {
     request_wanted_pictures();
 }
 
+/// The camera moved: the floating boxes follow, a frame is due.
+fn camera_moved(store: AppStore, pane: PaneId) {
+    after_change(store, pane);
+}
+
 // ── Pictures on boards ──────────────────────────────────────────────────────
 
 #[derive(Default)]
 struct Pictures {
     /// Decoded, by `src`.
     decoded: HashMap<String, Arc<Picture>>,
+    /// Their bytes as stored, by `src` (Save Original As..., SVG export).
+    raw: HashMap<String, Arc<Vec<u8>>>,
     /// Asked for by a render and not yet fetched.
     wanted: HashSet<String>,
     /// Asked of the backend (or being decoded).
@@ -533,6 +1029,15 @@ fn picture_source() -> impl Fn(&str) -> Option<Arc<Picture>> {
             }
         })
     }
+}
+
+/// A picture's bytes as stored, when this window has them.
+fn picture_bytes(src: &str) -> Option<Vec<u8>> {
+    if let Some(bytes) = PICTURES.with(|p| p.borrow().raw.get(src).cloned()) {
+        return Some(bytes.as_ref().clone());
+    }
+    let url = BlobUrl::parse(src)?;
+    crate::pictures::held_bytes(&url).map(|b| b.as_ref().clone())
 }
 
 /// Fetch what the last frames wanted: from the text pictures' cache when it
@@ -575,6 +1080,9 @@ pub(crate) fn blob_loaded(url: &BlobUrl, result: &Result<Arc<Vec<u8>>, String>) 
 /// Decode a picture's bytes, off the UI thread on the desktop, and show it on
 /// every board that names it.
 fn decode(src: String, bytes: Arc<Vec<u8>>) {
+    PICTURES.with(|p| {
+        p.borrow_mut().raw.insert(src.clone(), bytes.clone());
+    });
     #[cfg(feature = "native")]
     std::thread::spawn(move || {
         let picture = Picture::decode(&bytes);
@@ -609,307 +1117,19 @@ fn installed(src: String, picture: Result<Arc<Picture>, String>) {
             for rect in &rects {
                 s.view.invalidate(*rect);
             }
+            s.nav_generation += 1;
             !rects.is_empty()
         });
         if touched == Some(true) {
             present(pane);
-        }
-    }
-}
-
-// ── Pointer and keys ────────────────────────────────────────────────────────
-
-/// Pane `pane`'s surface, made once and wired to its board.
-pub(crate) fn surface(store: AppStore, pane: PaneId) -> RenderSurfaceHandle {
-    if let Some(surface) = surface_of(pane) {
-        return surface;
-    }
-    APP.with(|app| app.set(Some(store)));
-    let surface = create_render_surface();
-    surface.set_render_callback(move |_writer, _width, _height| present(pane));
-    surface.set_event_handler(move |event| on_event(store, pane, event));
-    surface.set_key_handler(move |key| claims_key(pane, key));
-    SURFACES.with(|s| s.borrow_mut()[pane.index()] = Some(surface.clone()));
-    surface
-}
-
-/// Which keys a focused board keeps from the rest of the app.
-fn claims_key(pane: PaneId, key: &SurfaceKeyData) -> bool {
-    let primary = key.ctrl || key.meta;
-    match key.key.as_str() {
-        " " => true,
-        "Delete" | "Backspace" => with_session(pane, |s| s.selected.is_some()).unwrap_or(false),
-        "z" | "Z" | "y" | "Y" => primary,
-        "Escape" => with_session(pane, |s| s.selected.is_some() || !matches!(s.gesture, Gesture::Idle)).unwrap_or(false),
-        _ => false,
-    }
-}
-
-fn wheel_zooms_out(delta_y: f32) -> bool {
-    // A wheel turned toward the person: negative on the desktop (winit's
-    // sign), positive in the browser (`WheelEvent.deltaY`).
-    if cfg!(feature = "native") {
-        delta_y < 0.0
-    } else {
-        delta_y > 0.0
-    }
-}
-
-fn on_event(store: AppStore, pane: PaneId, event: SurfaceEvent) {
-    if with_session(pane, |_| ()).is_none() {
-        return;
-    }
-    let scale = scale_of(pane);
-    match event {
-        SurfaceEvent::MouseDown { x, y, button } => {
-            let (px, py) = (x * scale, y * scale);
-            // A press on the board focuses its pane, as a press in an editor does.
-            crate::pane_view::focus_pane(store, pane);
-            crate::editor::give_keyboard_to(store, pane);
-            let space = with_session(pane, |s| s.space).unwrap_or(false);
-            match button {
-                SurfaceMouseButton::Middle => begin_pan(pane, px, py),
-                SurfaceMouseButton::Left if space => begin_pan(pane, px, py),
-                SurfaceMouseButton::Left => match untracked(|| store.board_tool.get()) {
-                    Tool::Pen => begin_stroke(store, pane, px, py),
-                    Tool::Select => begin_select(store, pane, px, py),
-                },
-                SurfaceMouseButton::Right => {}
+            if let Some(store) = APP.with(Cell::get) {
+                nav::changed(store, pane);
             }
         }
-        SurfaceEvent::MouseMove { x, y } => pointer_moved(store, pane, x * scale, y * scale),
-        SurfaceEvent::MouseUp { x, y, .. } => pointer_released(store, pane, x * scale, y * scale),
-        SurfaceEvent::MouseWheel { x, y, delta_y, .. } => {
-            if delta_y == 0.0 {
-                return;
-            }
-            let factor = if wheel_zooms_out(delta_y) { 1.0 / 1.1 } else { 1.1 };
-            let generation = with_session(pane, |s| {
-                s.view.zoom_at(x * scale, y * scale, factor);
-                s.settle_generation += 1;
-                s.settle_generation
-            });
-            after_change(store, pane);
-            if let Some(generation) = generation {
-                let _ = set_timeout(SETTLE_MS, move || {
-                    let settled = with_session(pane, |s| s.settle_generation == generation && s.view.settle(&picture_source()));
-                    if settled == Some(true) {
-                        present(pane);
-                    }
-                });
-            }
-        }
-        SurfaceEvent::KeyDown(key) => key_down(store, pane, &key),
-        SurfaceEvent::KeyUp(key) => {
-            if key.key == " " {
-                with_session(pane, |s| s.space = false);
-            }
-        }
-        SurfaceEvent::FocusLost | SurfaceEvent::MouseLeave => {
-            with_session(pane, |s| s.space = false);
-        }
-        _ => {}
     }
 }
 
-fn begin_pan(pane: PaneId, px: f32, py: f32) {
-    with_session(pane, |s| s.gesture = Gesture::Pan { last: (px, py) });
-}
-
-fn begin_stroke(store: AppStore, pane: PaneId, px: f32, py: f32) {
-    let Some(held) = with_session(pane, |s| (s.store_id, s.node_id)) else { return };
-    if !store.node_access(held.0, held.1).allows_write() {
-        crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
-        return;
-    }
-    let style = Style {
-        stroke: Color::parse(&untracked(|| store.board_color.get())),
-        width: Some(untracked(|| store.board_width.get())),
-        ..Style::default()
-    };
-    let point = with_session(pane, |s| {
-        let p = s.view.screen_to_board(px, py);
-        let point = [p.x, p.y, 0.5];
-        s.view.begin_stroke(Kind::Pen, &style, point);
-        // A new stroke is a new undo step, however soon after the last.
-        if let Some(undo) = s.undo.as_mut() {
-            undo.reset();
-        }
-        point
-    });
-    let Some(point) = point else { return };
-    let id = local_edit(store, pane, |t| t.add_element(NewElement::stroke(Kind::Pen, vec![point]).with_style(style)));
-    with_session(pane, |s| match id {
-        Some(id) => {
-            s.selected = None;
-            s.gesture = Gesture::Stroke { id, pending: Vec::new(), appended_at: now_ms() };
-        }
-        None => s.view.cancel_stroke(),
-    });
-    after_change(store, pane);
-}
-
-fn begin_select(store: AppStore, pane: PaneId, px: f32, py: f32) {
-    with_session(pane, |s| {
-        let p = s.view.screen_to_board(px, py);
-        let snapshot = s.view.snapshot();
-        let hit = snapshot.hit(p).filter(|e| {
-            let layer_locked = snapshot.layer(&e.layer).is_some_and(|l| l.locked);
-            !e.raw.locked && !layer_locked
-        });
-        match hit {
-            Some(e) => {
-                let id = e.id().to_string();
-                s.gesture = Gesture::Drag { id: id.clone(), start: p, base: e.raw.transform, last: p, written_at: 0.0 };
-                s.selected = Some(id);
-            }
-            None => {
-                s.selected = None;
-                s.gesture = Gesture::Idle;
-            }
-        }
-    });
-    after_change(store, pane);
-}
-
-fn pointer_moved(store: AppStore, pane: PaneId, px: f32, py: f32) {
-    enum Next {
-        Nothing,
-        Redraw,
-        Append(String, Vec<[f32; 3]>),
-        Move(String, Transform),
-    }
-    let writable = with_session(pane, |s| store.node_access(s.store_id, s.node_id).allows_write()).unwrap_or(false);
-    let next = with_session(pane, |s| {
-        let p = s.view.screen_to_board(px, py);
-        match &mut s.gesture {
-            Gesture::Idle => Next::Nothing,
-            Gesture::Pan { last } => {
-                let (dx, dy) = (px - last.0, py - last.1);
-                *last = (px, py);
-                s.view.pan_by(dx, dy);
-                Next::Redraw
-            }
-            Gesture::Stroke { id, pending, appended_at } => {
-                let point = [p.x, p.y, 0.5];
-                pending.push(point);
-                let id = id.clone();
-                let due = now_ms() - *appended_at >= APPEND_EVERY_MS;
-                let batch = if due {
-                    *appended_at = now_ms();
-                    Some(std::mem::take(pending))
-                } else {
-                    None
-                };
-                s.view.extend_stroke(&[point]);
-                match batch {
-                    Some(points) => Next::Append(id, points),
-                    None => Next::Redraw,
-                }
-            }
-            Gesture::Drag { id, start, base, last, written_at } => {
-                if !writable {
-                    return Next::Nothing;
-                }
-                *last = p;
-                if now_ms() - *written_at < DRAG_WRITE_EVERY_MS {
-                    return Next::Nothing;
-                }
-                *written_at = now_ms();
-                let moved = Transform { tx: base.tx + p.x - start.x, ty: base.ty + p.y - start.y, ..*base };
-                Next::Move(id.clone(), moved)
-            }
-        }
-    });
-    match next {
-        Some(Next::Redraw) => after_change(store, pane),
-        Some(Next::Append(id, points)) => {
-            local_edit(store, pane, |t| t.append_points(&id, &points));
-        }
-        Some(Next::Move(id, transform)) => {
-            local_edit(store, pane, |t| t.set_transform(&id, &transform));
-        }
-        _ => {}
-    }
-}
-
-fn pointer_released(store: AppStore, pane: PaneId, px: f32, py: f32) {
-    let gesture = with_session(pane, |s| std::mem::replace(&mut s.gesture, Gesture::Idle));
-    match gesture {
-        Some(Gesture::Stroke { id, mut pending, .. }) => {
-            let (points, min_gap) = with_session(pane, |s| {
-                let p = s.view.screen_to_board(px, py);
-                pending.push([p.x, p.y, 0.5]);
-                s.view.extend_stroke(&pending[pending.len() - 1..]);
-                let mut points = s.view.end_stroke();
-                points.push([p.x, p.y, 0.5]);
-                (points, 0.75 / s.view.zoom().max(1e-3))
-            })
-            .unwrap_or_default();
-            // Smoothed once, on release, and never edited after.
-            let smoothed = smooth_stroke(&points, min_gap);
-            local_edit(store, pane, |t| t.replace_points(&id, &smoothed));
-        }
-        Some(Gesture::Drag { id, start, base, last, .. }) => {
-            if (last.x - start.x).abs() > f32::EPSILON || (last.y - start.y).abs() > f32::EPSILON {
-                let moved = Transform { tx: base.tx + last.x - start.x, ty: base.ty + last.y - start.y, ..base };
-                if with_session(pane, |s| store.node_access(s.store_id, s.node_id).allows_write()) == Some(true) {
-                    local_edit(store, pane, |t| t.set_transform(&id, &moved));
-                }
-            }
-            after_change(store, pane);
-        }
-        _ => after_change(store, pane),
-    }
-}
-
-fn key_down(store: AppStore, pane: PaneId, key: &SurfaceKeyData) {
-    let primary = key.ctrl || key.meta;
-    match key.key.as_str() {
-        " " => {
-            with_session(pane, |s| s.space = true);
-        }
-        "Delete" | "Backspace" => delete_selected(store, pane),
-        "Escape" => {
-            with_session(pane, |s| {
-                if matches!(s.gesture, Gesture::Stroke { .. }) {
-                    s.view.cancel_stroke();
-                }
-                s.gesture = Gesture::Idle;
-                s.selected = None;
-            });
-            after_change(store, pane);
-        }
-        "z" | "Z" if primary => undo(store, pane, key.shift),
-        "y" | "Y" if primary => undo(store, pane, true),
-        _ => {}
-    }
-}
-
-/// Delete the selected element of pane `pane`'s board.
-pub(crate) fn delete_selected(store: AppStore, pane: PaneId) {
-    let Some(id) = with_session(pane, |s| s.selected.clone()).flatten() else { return };
-    local_edit(store, pane, |t| t.delete_element(&id));
-}
-
-/// Undo (or redo) this person's last edit of pane `pane`'s board, never a
-/// collaborator's (contract section 4).
-pub(crate) fn undo(store: AppStore, pane: PaneId, redo: bool) {
-    let Some(held) = with_session(pane, |s| (s.store_id, s.node_id)) else { return };
-    if !store.node_access(held.0, held.1).allows_write() {
-        return;
-    }
-    let update = with_session(pane, |s| {
-        let update = s.undo.as_mut().and_then(|undo| s.board.undo(undo, redo));
-        s.sync_view();
-        update
-    })
-    .flatten();
-    if let Some(bytes) = update {
-        send_update(store, pane, held.0, held.1, bytes);
-    }
-    after_change(store, pane);
-}
+// ── The view's own settings ─────────────────────────────────────────────────
 
 /// Fit pane `pane`'s board to what it shows.
 pub(crate) fn fit(store: AppStore, pane: PaneId) {
@@ -928,10 +1148,21 @@ pub(crate) fn actual_size(store: AppStore, pane: PaneId) {
     after_change(store, pane);
 }
 
+/// Show board rectangle `rect` in pane `pane` (a frame from the navigator).
+pub(crate) fn show_rect(store: AppStore, pane: PaneId, rect: Rect) {
+    let scale = scale_of(pane);
+    with_session(pane, |s| {
+        s.view.fit(&rect, 32.0 * scale);
+        s.view.settle(&picture_source());
+    });
+    after_change(store, pane);
+}
+
 /// The floating markup control (contract section 5): show or hide every
 /// mark on the board, for everyone.
 pub(crate) fn toggle_markup(store: AppStore, pane: PaneId) {
     let Some(visible) = with_session(pane, |s| s.view.snapshot().markup_visible) else { return };
+    new_undo_step(pane);
     local_edit(store, pane, |t| t.set_markup_visible(!visible));
 }
 
@@ -942,6 +1173,65 @@ pub(crate) fn set_dark_mode(dark: bool) {
             present(pane);
         }
     }
+}
+
+/// The grid shown or hidden (per viewer): every board follows.
+pub(crate) fn set_grid(store: AppStore, shown: bool) {
+    for pane in PaneId::ALL {
+        if with_session(pane, |s| s.view.set_grid(shown.then_some(GRID))).is_some() {
+            after_change(store, pane);
+        }
+    }
+}
+
+/// "Color by author" in pane `pane` (contract section 6): a way of looking
+/// that hides nothing, this pane only.
+pub(crate) fn set_color_by_author(store: AppStore, pane: PaneId, on: bool) {
+    store.pane(pane).board_ui.by_author.set(on);
+    let changed = with_session(pane, |s| {
+        if s.options.color_by_author == on {
+            return false;
+        }
+        s.options.color_by_author = on;
+        let options = s.options.clone();
+        s.view.set_options(options, &s.board);
+        true
+    });
+    if changed == Some(true) {
+        after_change(store, pane);
+    }
+}
+
+/// Node cards' live titles and colors (contract section 4): the view is
+/// re-read only when they changed.
+fn set_card_labels(store: AppStore, pane: PaneId, labels: HashMap<String, CardLabel>) {
+    let changed = with_session(pane, |s| {
+        if *s.options.card_labels == labels {
+            return false;
+        }
+        s.options.card_labels = Arc::new(labels);
+        let options = s.options.clone();
+        s.view.set_options(options, &s.board);
+        true
+    });
+    if changed == Some(true) {
+        present(pane);
+        let _ = store;
+    }
+}
+
+/// Pane `pane`'s surface, made once and wired to its board.
+pub(crate) fn surface(store: AppStore, pane: PaneId) -> RenderSurfaceHandle {
+    if let Some(surface) = surface_of(pane) {
+        return surface;
+    }
+    APP.with(|app| app.set(Some(store)));
+    let surface = create_render_surface();
+    surface.set_render_callback(move |_writer, _width, _height| present(pane));
+    surface.set_event_handler(move |event| tools::on_event(store, pane, event));
+    surface.set_key_handler(move |key| tools::claims_key(pane, key));
+    SURFACES.with(|s| s.borrow_mut()[pane.index()] = Some(surface.clone()));
+    surface
 }
 
 // ── Making board nodes ──────────────────────────────────────────────────────
@@ -1314,173 +1604,6 @@ pub(crate) fn parent_for_row(store: AppStore, row: &str) -> Option<(StoreId, Nod
     Some((store_id, node_id))
 }
 
-// ── Drawing the pane ────────────────────────────────────────────────────────
-
-/// Pane `pane`'s board view: the surface, the selection outline over it,
-/// and the floating markup control. Rendered once per pane slot.
-pub(crate) fn render_board(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> NodeHandle {
-    let state = store.pane(pane);
-    let surface = surface(store, pane);
-    let read_only = move || {
-        state
-            .board
-            .get()
-            .is_some_and(|held| !store.node_access_tracked(held.store_id, held.node_id).allows_write())
-    };
-    let view = rsx! {
-        div {
-            class: "pimble-board",
-            style: {move || if state.show_board.get() { "" } else { "display: none;" }},
-            RenderSurface { surface: Some(surface) }
-            div {
-                class: "pimble-board__selection",
-                style: {move || match state.board_selection.get() {
-                    Some((x, y, w, h)) => format!("left: {x:.1}px; top: {y:.1}px; width: {w:.1}px; height: {h:.1}px;"),
-                    None => "display: none;".to_string(),
-                }},
-            }
-            div {
-                class: {move || {
-                    let (_, visible) = state.board_marks.get();
-                    if visible { "pimble-board__markup" } else { "pimble-board__markup pimble-board__markup--hidden" }
-                }},
-                style: {move || if state.board_marks.get().0 > 0 { "" } else { "display: none;" }},
-                title: {move || if read_only() { "You can read this, not change it." } else { "Show or hide the markup, for everyone" }},
-                onclick: move || {
-                    if !read_only() {
-                        toggle_markup(store, pane);
-                    }
-                },
-                span {
-                    class: "pimble-board__markup-icon",
-                    if state.board_marks.get().1 {
-                        IconGlyph { name: TablerIcon::Eye.name().to_string() }
-                    } else {
-                        IconGlyph { name: TablerIcon::EyeOff.name().to_string() }
-                    }
-                }
-                span {
-                    {move || {
-                        let (count, visible) = state.board_marks.get();
-                        if visible { format!("Markup · {count}") } else { "Markup hidden".to_string() }
-                    }}
-                }
-            }
-        }
-    };
-    // The desktop's pixel scale reads the box the surface fills.
-    BOUNDS.with(|b| b.borrow_mut()[pane.index()] = Some(view.bounds_signal()));
-    // The theme's background, on every board.
-    let _ = rinch::Effect::new(move || {
-        let dark = store.dark_mode.get();
-        untracked(|| set_dark_mode(dark));
-    });
-    view
-}
-
-/// The board tools in the one toolbar (docs/SPLIT_VIEW_CONTRACT.md "One
-/// toolbar"), for the focused pane's board: select and pen, the pen's
-/// color and width, undo and redo, delete, fit and 1:1. The editing tools are
-/// dimmed on a board this device may only read.
-pub(crate) fn render_board_toolbar(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
-    let focused = move || store.focused_pane.get();
-    let writable = move || {
-        let pane = focused();
-        store
-            .pane(pane)
-            .board
-            .get()
-            .is_some_and(|held| store.node_access_tracked(held.store_id, held.node_id).allows_write())
-    };
-    let tool_button = move |__scope: &mut RenderScope, tool: Tool, icon: TablerIcon, tip: &'static str| {
-        rsx! {
-            div {
-                title: tip,
-                class: {move || if store.board_tool.get() == tool { "pimble-board-tool pimble-board-tool--active" } else { "pimble-board-tool" }},
-                onclick: move || store.board_tool.set(tool),
-                IconGlyph { name: icon.name().to_string() }
-            }
-        }
-    };
-    let action = move |__scope: &mut RenderScope, icon: TablerIcon, tip: &'static str, run: fn(AppStore, PaneId)| {
-        rsx! {
-            div {
-                title: tip,
-                class: "pimble-board-tool",
-                onclick: move || run(store, untracked(|| store.focused_pane.get())),
-                IconGlyph { name: icon.name().to_string() }
-            }
-        }
-    };
-    let select = tool_button(__scope, Tool::Select, TablerIcon::Pointer, "Select (click, drag to move, Delete)");
-    let pen = tool_button(__scope, Tool::Pen, TablerIcon::Pencil, "Pen");
-    let swatches: Vec<NodeHandle> = COLORS
-        .iter()
-        .map(|color| {
-            let color = *color;
-            rsx! {
-                div {
-                    title: color,
-                    class: {move || if store.board_color.get() == color { "pimble-board-swatch pimble-board-swatch--active" } else { "pimble-board-swatch" }},
-                    style: format!("background: {color};"),
-                    onclick: move || {
-                        store.board_color.set(color.to_string());
-                        store.board_tool.set(Tool::Pen);
-                    },
-                }
-            }
-        })
-        .collect();
-    let widths: Vec<NodeHandle> = WIDTHS
-        .iter()
-        .map(|width| {
-            let width = *width;
-            let dot = (width * 1.5 + 2.0).round();
-            rsx! {
-                div {
-                    title: format!("Width {width}"),
-                    class: {move || if store.board_width.get() == width { "pimble-board-tool pimble-board-tool--active" } else { "pimble-board-tool" }},
-                    onclick: move || {
-                        store.board_width.set(width);
-                        store.board_tool.set(Tool::Pen);
-                    },
-                    div {
-                        class: "pimble-board-width",
-                        style: format!("width: {dot}px; height: {dot}px;"),
-                    }
-                }
-            }
-        })
-        .collect();
-    let undo_btn = action(__scope, TablerIcon::ArrowBackUp, "Undo (Ctrl+Z)", |store, pane| undo(store, pane, false));
-    let redo_btn = action(__scope, TablerIcon::ArrowForwardUp, "Redo (Ctrl+Shift+Z)", |store, pane| undo(store, pane, true));
-    let delete_btn = action(__scope, TablerIcon::Trash, "Delete the selection (Delete)", delete_selected);
-    let fit_btn = action(__scope, TablerIcon::FocusCentered, "Fit", fit);
-    let one_btn = action(__scope, TablerIcon::ZoomReset, "Actual size", actual_size);
-    rsx! {
-        div {
-            class: "pimble-board-toolbar",
-            div {
-                class: "pimble-board-toolbar__group",
-                style: {move || if writable() { "" } else { "opacity: 0.4; pointer-events: none;" }},
-                {select}
-                {pen}
-                div { class: "pimble-board-toolbar__divider" }
-                {swatches}
-                div { class: "pimble-board-toolbar__divider" }
-                {widths}
-                div { class: "pimble-board-toolbar__divider" }
-                {undo_btn}
-                {redo_btn}
-                {delete_btn}
-            }
-            div { class: "pimble-board-toolbar__divider" }
-            {fit_btn}
-            {one_btn}
-        }
-    }
-}
-
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
@@ -1544,7 +1667,7 @@ mod tests {
         assert_eq!(texts(P[1]), 2);
 
         // Undo is this pane's own: it takes back the first stroke, never the peer's.
-        undo(store, P[0], false);
+        tools::undo(store, P[0], false);
         assert_eq!(texts(P[0]), 1);
         assert_eq!(texts(P[1]), 1);
 
@@ -1578,5 +1701,80 @@ mod tests {
         assert_eq!(image_title(Some("/tmp/Screenshot 1.png")), "Screenshot 1");
         assert_eq!(image_title(None), "Picture");
         assert_eq!(image_title(Some(".png")), ".png");
+    }
+
+    fn rect_element(x: f32) -> NewElement {
+        NewElement::new(Kind::Rect, Geom::Rect(Rect::new(x, 0.0, 50.0, 50.0)))
+    }
+
+    fn element_count(pane: PaneId) -> usize {
+        with_session(pane, |s| s.snapshot().elements.len()).unwrap()
+    }
+
+    /// Text is typed into a real input (contract section 4): the first
+    /// character makes the element, later ones edit its yrs Text, and a text
+    /// left empty goes when the typing ends.
+    #[test]
+    fn typing_makes_and_edits_a_text_element() {
+        let (store, _commands) = store_with_commands();
+        let (store_id, node_id) = (StoreId::new(), NodeId::new());
+        start(store, P[0], store_id, node_id, &whiteboard_bytes());
+        tools::begin_text_new_for_test(store, P[0], Point::new(10.0, 10.0));
+        assert_eq!(element_count(P[0]), 0, "nothing until a character is typed");
+        tools::text_input(store, P[0], "Hi".to_string());
+        tools::text_input(store, P[0], "Hi there".to_string());
+        let text = with_session(P[0], |s| s.snapshot().elements[0].raw.text.clone()).unwrap();
+        assert_eq!(text.as_deref(), Some("Hi there"));
+        tools::text_input(store, P[0], String::new());
+        tools::end_text(store, P[0]);
+        assert_eq!(element_count(P[0]), 0, "an emptied text goes");
+        stop(store, P[0]);
+    }
+
+    /// Groups (contract section 4): grouping makes one element the members
+    /// name as parent; a duplicate copies the members too; ungrouping lets
+    /// them go where they were; deleting a group deletes its members.
+    #[test]
+    fn grouping_duplicating_and_ungrouping() {
+        let (store, _commands) = store_with_commands();
+        let (store_id, node_id) = (StoreId::new(), NodeId::new());
+        start(store, P[0], store_id, node_id, &whiteboard_bytes());
+        let a = local_edit(store, P[0], |t| t.add_element(rect_element(0.0))).unwrap();
+        let b = local_edit(store, P[0], |t| t.add_element(rect_element(100.0))).unwrap();
+        tools::select(store, P[0], vec![a.clone(), b.clone()]);
+        tools::group(store, P[0]);
+        let group = with_session(P[0], |s| s.selected.clone()).unwrap();
+        assert_eq!(group.len(), 1);
+        let parents = with_session(P[0], |s| [s.snapshot().get(&a).unwrap().parent.clone(), s.snapshot().get(&b).unwrap().parent.clone()]).unwrap();
+        assert_eq!(parents, [Some(group[0].clone()), Some(group[0].clone())]);
+
+        tools::duplicate(store, P[0]);
+        assert_eq!(element_count(P[0]), 6, "a group and two members, twice");
+        let copy = with_session(P[0], |s| s.selected.clone()).unwrap();
+        assert_ne!(copy, group);
+        tools::delete_selected(store, P[0]);
+        assert_eq!(element_count(P[0]), 3, "the copy went with its members");
+
+        tools::select(store, P[0], group.clone());
+        tools::ungroup(store, P[0]);
+        assert_eq!(element_count(P[0]), 2);
+        let (pa, bounds) = with_session(P[0], |s| (s.snapshot().get(&a).unwrap().parent.clone(), s.snapshot().get(&b).unwrap().bounds)).unwrap();
+        assert_eq!(pa, None);
+        assert_eq!(bounds.x, 98.0, "it stayed where it was (its outline included)");
+        stop(store, P[0]);
+    }
+
+    /// New elements go into the picked layer, and a locked one refuses them.
+    #[test]
+    fn a_locked_layer_takes_no_new_elements() {
+        let (store, _commands) = store_with_commands();
+        let (store_id, node_id) = (StoreId::new(), NodeId::new());
+        start(store, P[0], store_id, node_id, &whiteboard_bytes());
+        let layer = with_session(P[0], |s| s.snapshot().layers[0].id.clone()).unwrap();
+        local_edit(store, P[0], |t| t.set_layer_locked(&layer, true));
+        tools::begin_text_new_for_test(store, P[0], Point::new(0.0, 0.0));
+        tools::text_input(store, P[0], "x".to_string());
+        assert_eq!(element_count(P[0]), 0);
+        stop(store, P[0]);
     }
 }

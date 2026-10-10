@@ -989,6 +989,9 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
 
     // Drag-and-drop state for tree node rearrangement
     let drag_ctx: DragContext<String> = DragContext::new();
+    // A row dropped on a board becomes a node card there
+    // (docs/IMAGE_MARKUP_CONTRACT.md section 4).
+    crate::boards::set_tree_drag(drag_ctx);
 
     // Set up event processing via thread-local so run_on_main_thread
     // can trigger it without capturing non-Send types. (No autosave loop
