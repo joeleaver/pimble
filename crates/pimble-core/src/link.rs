@@ -191,6 +191,91 @@ fn parse_anchor(fragment: &str) -> Result<Anchor, PimbleUrlError> {
     Ok(Anchor { sticky, quote })
 }
 
+/// The scheme of a board node embedded in text as a picture
+/// (docs/IMAGE_MARKUP_CONTRACT.md section 2, "Board nodes embedded in text").
+pub const BOARD_SCHEME: &str = "pimble-board:";
+
+/// A board node shown inside text: an `image` atom whose `src` is
+/// `pimble-board:<store uuid>/<node uuid>`, optionally `#frame=<element id>`
+/// to show one frame of it. Like a `pimble:` link it names the canonical
+/// store and node, so it works through mounts and across stores, and it is a
+/// link: it follows a moved board's `became` and counts in its backlinks.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BoardUrl {
+    pub store: StoreId,
+    pub node: NodeId,
+    /// One frame of the board, by its element id.
+    pub frame: Option<String>,
+}
+
+impl BoardUrl {
+    pub fn new(store: StoreId, node: NodeId) -> Self {
+        Self { store, node, frame: None }
+    }
+
+    /// `Some` when `src` is a board embed's address.
+    pub fn parse(src: &str) -> Option<Self> {
+        let rest = src.get(..BOARD_SCHEME.len()).filter(|head| head.eq_ignore_ascii_case(BOARD_SCHEME)).map(|_| &src[BOARD_SCHEME.len()..])?;
+        let (path, fragment) = match rest.split_once('#') {
+            Some((path, fragment)) => (path, Some(fragment)),
+            None => (rest, None),
+        };
+        let (store, node) = path.split_once('/')?;
+        if node.contains('/') {
+            return None;
+        }
+        let store = StoreId::parse(store).ok()?;
+        let node = NodeId::parse(node).ok()?;
+        let frame = match fragment {
+            None => None,
+            Some(fragment) => {
+                let frame = form_urlencoded::parse(fragment.as_bytes()).find(|(k, _)| k == "frame").map(|(_, v)| v.to_string())?;
+                if frame.is_empty() || !frame.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                    return None;
+                }
+                Some(frame)
+            }
+        };
+        Some(Self { store, node, frame })
+    }
+
+    /// The board node as a `pimble:` link (what it counts as in backlinks,
+    /// and what following it resolves).
+    pub fn link(&self) -> PimbleUrl {
+        PimbleUrl::node(self.store, self.node)
+    }
+}
+
+impl fmt::Display for BoardUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{BOARD_SCHEME}{}/{}", self.store, self.node)?;
+        if let Some(frame) = &self.frame {
+            write!(f, "#frame={frame}")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod board_url_tests {
+    use super::*;
+
+    #[test]
+    fn a_board_url_round_trips_with_and_without_a_frame() {
+        let (store, node) = (StoreId::new(), NodeId::new());
+        let url = BoardUrl::new(store, node);
+        assert_eq!(BoardUrl::parse(&url.to_string()), Some(url.clone()));
+        assert_eq!(url.link(), PimbleUrl::node(store, node));
+        let framed = BoardUrl { frame: Some("a1b2".into()), ..url };
+        assert_eq!(framed.to_string(), format!("pimble-board:{store}/{node}#frame=a1b2"));
+        assert_eq!(BoardUrl::parse(&framed.to_string()), Some(framed));
+        assert_eq!(BoardUrl::parse(&format!("pimble:{store}/{node}")), None);
+        assert_eq!(BoardUrl::parse(&format!("pimble-board:{store}/{node}/x")), None);
+        assert_eq!(BoardUrl::parse(&format!("pimble-board:{store}/{node}#frame=<x>")), None);
+        assert_eq!(BoardUrl::parse("pimble-board:nonsense"), None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -83,6 +83,10 @@ pub struct CuttingNode {
     pub created_at: String,
     /// The plugin root as JSON (`NodeDoc::data_json`).
     pub data: serde_json::Value,
+    /// The plugin root copied with its yrs types (`NodeDoc::fresh_data`):
+    /// what is planted, since a board's shapes do not survive JSON. `None`
+    /// when it is empty.
+    data_copy: Option<Vec<u8>>,
     /// The content as a new document's bytes (`NodeDoc::fresh_content`);
     /// `None` when the node has no projection.
     content: Option<Vec<u8>>,
@@ -664,6 +668,7 @@ impl Tree {
                 custom,
                 created_at: fields.created_at,
                 data: doc.data_json(),
+                data_copy: doc.fresh_data(),
                 content: doc.fresh_content()?,
             });
         }
@@ -720,9 +725,14 @@ impl Tree {
                 for (key, value) in node.custom.iter().filter(|(key, _)| key.as_str() != SHARE) {
                     d.put_custom(txn, key, value)?;
                 }
-                if let serde_json::Value::Object(data) = &node.data {
-                    for (key, value) in data {
-                        d.put_data(txn, key, value);
+                match &node.data_copy {
+                    Some(bytes) => d.put_data_copy(txn, bytes)?,
+                    None => {
+                        if let serde_json::Value::Object(data) = &node.data {
+                            for (key, value) in data {
+                                d.put_data(txn, key, value);
+                            }
+                        }
                     }
                 }
                 for &child in &children[index] {
@@ -2392,6 +2402,39 @@ mod tests {
         s.tree.set_title(s.x, "Theirs", T3).unwrap();
         assert_eq!(s.tree.get_node_info(made[1]).unwrap().title, "X");
         assert!(s.tree.validate_tree().is_empty());
+    }
+
+    /// A transplant carries the `data` root with its yrs types (a board's
+    /// value written whole, its points as buffers, its text as text), not
+    /// through JSON, which would turn them into nested maps and numbers.
+    #[test]
+    fn transplant_keeps_the_shapes_of_data() {
+        use yrs::{Any, Array, ArrayPrelim, ArrayRef, Map, MapPrelim, MapRef, Out, TextPrelim, Transact};
+        let mut s = shared();
+        {
+            let doc = s.tree.doc_mut(s.x).unwrap();
+            let data = doc.data_root();
+            let mut txn = doc.ydoc().transact_mut();
+            let boards: MapRef = data.insert(&mut txn, "boards", MapPrelim::default());
+            let board: MapRef = boards.insert(&mut txn, "b1", MapPrelim::default());
+            let mut geom = std::collections::HashMap::new();
+            geom.insert("x".to_string(), Any::Number(1.5));
+            board.insert(&mut txn, "geom", Any::Map(geom.into()));
+            let points: ArrayRef = board.insert(&mut txn, "points", ArrayPrelim::default());
+            points.push_back(&mut txn, Any::Buffer(vec![1u8, 2, 3].into()));
+            board.insert(&mut txn, "text", TextPrelim::new("note"));
+        }
+        let mut made = Vec::new();
+        let (new_a, _) = s.tree.transplant(HERE, s.a, s.private, None, T3, &mut fresh_ids(&mut made)).unwrap();
+        let new_x = s.tree.subtree_ids(new_a).unwrap()[1];
+        let doc = s.tree.doc(new_x).unwrap();
+        let txn = doc.ydoc().transact();
+        let Some(Out::YMap(boards)) = doc.data_root().get(&txn, "boards") else { panic!("no boards") };
+        let Some(Out::YMap(board)) = boards.get(&txn, "b1") else { panic!("no board") };
+        assert!(matches!(board.get(&txn, "geom"), Some(Out::Any(Any::Map(_)))), "a value written whole stays one");
+        let Some(Out::YArray(points)) = board.get(&txn, "points") else { panic!("no points") };
+        assert!(matches!(points.get(&txn, 0), Some(Out::Any(Any::Buffer(b))) if b.as_ref() == [1u8, 2, 3]));
+        assert!(matches!(board.get(&txn, "text"), Some(Out::YText(_))));
     }
 
     #[test]

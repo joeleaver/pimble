@@ -95,6 +95,18 @@ fn collect_links(node: &ModelNode, path: &str, open: &mut Option<(String, String
         }
         return;
     }
+    // A board node embedded as a picture is a link to the board
+    // (docs/IMAGE_MARKUP_CONTRACT.md section 2, "It is a link"): it counts in
+    // the board's backlinks and is indexed as one. Its words are its `alt`,
+    // the board's title when it was embedded.
+    if node.type_name() == "image" {
+        if let Some(url) = node.attrs().get_str("src").and_then(pimble_core::BoardUrl::parse) {
+            flush(path, open, out);
+            let text = node.attrs().get_str("alt").unwrap_or_default().to_string();
+            out.push(LinkRef { target: url.link(), path: path.to_string(), text });
+        }
+        return;
+    }
     if node.is_textblock() {
         // A link never runs from one textblock into the next.
         flush(path, open, out);
@@ -227,6 +239,34 @@ mod tests {
 
     fn url() -> PimbleUrl {
         PimbleUrl::node(StoreId::new(), NodeId::new())
+    }
+
+    /// A board node embedded in text is a link to it (its `alt` the words),
+    /// a frame of it too; a picture that is not a board is not.
+    #[test]
+    fn an_embedded_board_is_a_link_to_its_node() {
+        use crate::blocks::{Image, Inline};
+        let (store, board) = (StoreId::new(), NodeId::new());
+        let embed = pimble_core::BoardUrl::new(store, board);
+        let framed = pimble_core::BoardUrl { frame: Some("f1".into()), ..embed.clone() };
+        let to = url();
+        let doc = NodeDoc::from_blocks(&[
+            Block::paragraph(vec![Inline::Text(link("see", &to)), Inline::Image(Image::new(embed.to_string(), "Plan"))]),
+            Block::paragraph(vec![
+                Inline::Image(Image::new("https://example.com/a.png", "web")),
+                Inline::Image(Image::new(framed.to_string(), "")),
+            ]),
+        ])
+        .unwrap();
+        let found: Vec<(PimbleUrl, String, String)> = doc.links().into_iter().map(|l| (l.target, l.path, l.text)).collect();
+        assert_eq!(
+            found,
+            vec![
+                (to, "b:0".into(), "see".into()),
+                (embed.link(), "b:0".into(), "Plan".into()),
+                (embed.link(), "b:1".into(), String::new()),
+            ]
+        );
     }
 
     fn link(text: &str, to: &PimbleUrl) -> Run {

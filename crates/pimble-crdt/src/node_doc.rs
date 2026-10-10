@@ -838,6 +838,45 @@ impl NodeDoc {
         self.data.insert(txn, key.to_string(), json_to_in(value));
     }
 
+    /// The `data` root copied into a new document of its own, every value
+    /// keeping its yrs type (a map stays a map, text stays text, a value
+    /// written whole stays one value, a buffer stays a buffer), with a fresh
+    /// history: what a transplant carries (a board, docs/IMAGE_MARKUP_CONTRACT.md
+    /// section 2, "Moving between stores", lives in `data` in shapes JSON
+    /// would lose). `None` when `data` is empty.
+    pub(crate) fn fresh_data(&self) -> Option<Vec<u8>> {
+        let txn = self.doc.transact();
+        if self.data.len(&txn) == 0 {
+            return None;
+        }
+        let copy = Doc::new();
+        let root = copy.get_or_insert_map(ROOT_DATA);
+        {
+            let mut out = copy.transact_mut();
+            for (key, value) in self.data.iter(&txn) {
+                root.insert(&mut out, key.to_string(), out_to_in(&txn, value));
+            }
+        }
+        let bytes = copy.transact().encode_state_as_update_v1(&StateVector::default());
+        Some(bytes)
+    }
+
+    /// Write every key of a [`NodeDoc::fresh_data`] copy into this document's
+    /// `data` root, types kept.
+    pub(crate) fn put_data_copy(&self, txn: &mut TransactionMut, bytes: &[u8]) -> Result<()> {
+        let source = Doc::new();
+        let root = source.get_or_insert_map(ROOT_DATA);
+        {
+            let update = <yrs::Update as yrs::updates::decoder::Decode>::decode_v1(bytes).map_err(|e| CrdtError::Serialization(e.to_string()))?;
+            source.transact_mut().apply_update(update).map_err(|e| CrdtError::Serialization(e.to_string()))?;
+        }
+        let read = source.transact();
+        for (key, value) in root.iter(&read) {
+            self.data.insert(txn, key.to_string(), out_to_in(&read, value));
+        }
+        Ok(())
+    }
+
     /// Whether the key was there; nothing is written when it was not.
     pub(crate) fn remove_custom_key(&self, txn: &mut TransactionMut, key: &str, now: &str) -> bool {
         let Some(custom) = self.custom_map_if_present(txn) else { return false };
@@ -1132,6 +1171,19 @@ fn json_to_in(value: &serde_json::Value) -> In {
         Value::String(s) => In::from(TextPrelim::new(s.clone())),
         Value::Array(items) => In::Array(items.iter().map(json_to_in).collect()),
         Value::Object(fields) => In::Map(fields.iter().map(|(k, v)| (k.as_str(), json_to_in(v))).collect()),
+    }
+}
+
+/// A value read from one document as a value to write into another, its yrs
+/// type kept (text without its formatting: `data` holds none).
+fn out_to_in<T: ReadTxn>(txn: &T, out: Out) -> In {
+    match out {
+        Out::Any(any) => In::Any(any),
+        Out::YText(text) => In::from(TextPrelim::new(text.get_string(txn))),
+        Out::YArray(array) => In::Array(array.iter(txn).map(|item| out_to_in(txn, item)).collect()),
+        Out::YMap(map) => In::Map(map.iter(txn).map(|(key, value)| (key.to_string(), out_to_in(txn, value))).collect()),
+        // XML types, subdocuments and links are never written here.
+        _ => In::Any(Any::Null),
     }
 }
 

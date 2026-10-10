@@ -427,6 +427,94 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         self.board.clone().ok_or(BoardError::NoBoard)
     }
 
+    /// Make this board a copy of `raw` (another board read whole,
+    /// [`Board::read`]): its layers and elements with their ids, orders,
+    /// styles, text, authors and timestamps, its page and its markup switch.
+    /// The marks of a picture in text copied to another node, or to a new
+    /// image node ("Convert to Image Node"), keep saying who made them
+    /// (contract section 6: the name is stamped, not looked up). Refused
+    /// when this board exists already: a copy is a new board.
+    pub fn copy_from(&mut self, raw: &RawBoard) -> Result<()> {
+        if self.board.is_some() {
+            return Err(BoardError::Invalid("a board is copied only into a new one".into()));
+        }
+        let mut map = self.location.root.clone();
+        let path = self.location.path.clone();
+        for key in &path {
+            map = match map.get(self.txn, key) {
+                Some(Out::YMap(next)) => next,
+                _ => map.insert(self.txn, key.clone(), MapPrelim::default()),
+            };
+        }
+        let board = map;
+        board.insert(self.txn, V, Any::BigInt(VERSION));
+        board.insert(self.txn, MARKUP_VISIBLE, raw.markup_visible);
+        let layers: MapRef = board.insert(self.txn, LAYERS, MapPrelim::default());
+        let elements: MapRef = board.insert(self.txn, ELEMENTS, MapPrelim::default());
+        self.board = Some(board);
+        if let Some(page) = &raw.page {
+            self.set_page(Some(page))?;
+        }
+        if raw.layers.is_empty() {
+            insert_layer(self.txn, &layers, &new_id(), FIRST_LAYER_NAME, &order::after(None));
+        }
+        for layer in &raw.layers {
+            insert_layer(self.txn, &layers, &layer.id, &layer.name, &layer.order);
+            if let Some(Out::YMap(map)) = layers.get(self.txn, &layer.id) {
+                map.insert(self.txn, VISIBLE, layer.visible);
+                map.insert(self.txn, LOCKED, layer.locked);
+                map.insert(self.txn, OPACITY, layer.opacity as f64);
+            }
+        }
+        for e in &raw.elements {
+            let map: MapRef = elements.insert(self.txn, e.id.clone(), MapPrelim::default());
+            map.insert(self.txn, LAYER, e.layer.clone());
+            map.insert(self.txn, ORDER, e.order.clone());
+            if let Some(parent) = &e.parent {
+                map.insert(self.txn, PARENT, parent.clone());
+            }
+            map.insert(self.txn, KIND, e.kind.as_str().to_string());
+            match &e.geom {
+                Geom::Stroke => {
+                    let array: ArrayRef = map.insert(self.txn, GEOM, ArrayPrelim::default());
+                    if !e.points.is_empty() {
+                        array.push_back(self.txn, Any::Buffer(pack_points(&e.points).into()));
+                    }
+                }
+                geom => {
+                    map.insert(self.txn, GEOM, geom_any(geom));
+                }
+            }
+            if let Some(text) = &e.text {
+                map.insert(self.txn, TEXT, TextPrelim::new(text.clone()));
+            }
+            let style: MapRef = map.insert(self.txn, STYLE, MapPrelim::default());
+            write_style(self.txn, &style, &e.style);
+            if !e.transform.is_identity() {
+                map.insert(self.txn, TRANSFORM, transform_any(&e.transform));
+            }
+            map.insert(self.txn, LOCKED, e.locked);
+            if let Some(author) = &e.author {
+                map.insert(self.txn, AUTHOR, author_any(author));
+            }
+            map.insert(self.txn, CREATED_AT, e.created_at.clone());
+            if let Some(by) = &e.edited_by {
+                map.insert(self.txn, EDITED_BY, author_any(by));
+            }
+            if let Some(at) = &e.edited_at {
+                map.insert(self.txn, EDITED_AT, at.clone());
+            }
+        }
+        if let (Some(by), Some(at)) = (&raw.edited_by, &raw.edited_at) {
+            if let Some(board) = self.board.clone() {
+                board.insert(self.txn, EDITED_BY, author_any(by));
+                board.insert(self.txn, EDITED_AT, at.clone());
+            }
+        }
+        Ok(())
+    }
+
+
     fn sub(&self, key: &str) -> Result<MapRef> {
         let board = self.board()?;
         match board.get(self.txn, key) {

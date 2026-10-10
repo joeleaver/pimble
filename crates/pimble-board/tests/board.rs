@@ -629,3 +629,45 @@ fn a_watched_snapshot_updates_to_what_a_full_read_gives() {
     let n = snap.elements.len();
     assert_eq!(snap.update(&board, &changes).elements.len(), n);
 }
+
+/// A picture's board copied to another node (a paste, "Convert to Image
+/// Node"): the same layers and elements, who made them and when, the
+/// markup switch, and points; the copy is a board of its own afterwards.
+#[test]
+fn a_board_copied_into_a_new_one_is_the_same_board_and_then_its_own() {
+    let host = node();
+    let marked = Board::in_text(&host, "b1");
+    marked
+        .edit(Stamp::new(Some(&sam()), T0), |t| {
+            t.create()?;
+            let picture = t.add_layer("Picture", Placement::Bottom)?;
+            let geom = PictureGeom { rect: Rect::new(0.0, 0.0, 40.0, 30.0), src: "pimble-blob:x/y".into(), px_w: 40, px_h: 30, crop: None };
+            t.add_element(NewElement::new(Kind::Picture, Geom::Picture(geom)).in_layer(picture.clone()))?;
+            t.set_layer_locked(&picture, true)?;
+            t.add_element(NewElement::new(Kind::Pen, Geom::Stroke).with_points(vec![[1.0, 2.0, 0.5], [3.0, 4.0, 0.7]]))?;
+            let id = t.add_element(rect_el(5.0, 5.0, 10.0, 10.0).with_text("note"))?;
+            t.set_transform(&id, &Transform { tx: 3.0, ..Transform::IDENTITY })?;
+            t.set_markup_visible(false)
+        })
+        .into_result()
+        .unwrap();
+    let raw = marked.read().unwrap();
+
+    let target = node();
+    let copy = Board::of_node(&target);
+    let (_, update) = copy.edit(Stamp::new(Some(&joe()), T1), |t| t.copy_from(&raw)).into_result().unwrap();
+    assert!(update.is_some());
+    let mut copied = copy.read().unwrap();
+    let mut original = raw.clone();
+    for board in [&mut copied, &mut original] {
+        board.layers.sort_by(|a, b| a.id.cmp(&b.id));
+        board.elements.sort_by(|a, b| a.id.cmp(&b.id));
+    }
+    assert_eq!(copied, original, "the same board, authors and times kept");
+    assert!(copy.edit(Stamp::new(None, T2), |t| t.copy_from(&raw)).result.is_err(), "only into a new board");
+
+    // Its own afterwards: a mark on the copy is not on the original.
+    copy.edit(Stamp::new(Some(&joe()), T2), |t| t.add_element(rect_el(0.0, 0.0, 1.0, 1.0))).into_result().unwrap();
+    assert_eq!(copy.read().unwrap().elements.len(), raw.elements.len() + 1);
+    assert_eq!(marked.read().unwrap().elements.len(), raw.elements.len());
+}
