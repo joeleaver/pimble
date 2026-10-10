@@ -6,7 +6,7 @@
 //! `image` atom; what its `<img>` asks the loader for is chosen from its
 //! attributes ([`install_image_source`]):
 //!
-//! * a picture whose atom carries a `board` id asks for
+//! * a picture whose atom carries a `data-board` id asks for
 //!   `pimble-blob:<store>/<blob>#board=<id>`, and the loader answers with the
 //!   board in the host node's `data.boards.<id>` rendered (its visible extent,
 //!   trimmed);
@@ -43,6 +43,12 @@ use rinch::image::ImageLoadResult;
 use rinch::prelude::*;
 use rinch_editor_core::{AttrValue, Attrs, Fragment, Node as EditorNode, SetNodeAttrStep};
 use rinch_tabler_icons::TablerIcon;
+
+/// The picture attribute naming its board in the host node's `data.boards`
+/// (contract section 2). A `data-*` attribute, which rinch keeps, writes on
+/// the `<img>` and merges per attribute between collaborators; rinch knows
+/// nothing of what it means.
+pub(crate) const BOARD_ATTR: &str = "data-board";
 
 use crate::appearance::IconGlyph;
 use crate::panes::PaneId;
@@ -135,7 +141,7 @@ pub(crate) fn install_image_source() {
     // Outside any render, so it lasts as long as the app.
     untracked(|| {
         crate::rinch_editor::set_image_source(|attrs: &Attrs| {
-            let board = attrs.get_str("board").filter(|b| !b.is_empty())?;
+            let board = attrs.get_str(BOARD_ATTR).filter(|b| !b.is_empty())?;
             let src = attrs.get_str("src")?;
             BlobUrl::parse(src)?;
             Some(marked_src(src, board))
@@ -871,7 +877,7 @@ fn images(doc: &EditorNode) -> Vec<(usize, Attrs)> {
 fn find_image(doc: &EditorNode, src: &str, board: Option<&str>, hint: usize) -> Option<usize> {
     images(doc)
         .into_iter()
-        .filter(|(_, attrs)| attrs.get_str("src") == Some(src) && attrs.get_str("board").filter(|b| !b.is_empty()) == board)
+        .filter(|(_, attrs)| attrs.get_str("src") == Some(src) && attrs.get_str(BOARD_ATTR).filter(|b| !b.is_empty()) == board)
         .min_by_key(|(pos, _)| pos.abs_diff(hint))
         .map(|(pos, _)| pos)
 }
@@ -883,7 +889,7 @@ pub(crate) fn write_board_attr(pane: PaneId, src: &str, hint: usize, board: &str
     crate::editor::editor(pane).update(move |state| {
         let pos = find_image(&state.doc, &src, None, hint)?;
         let mut tr = state.tr();
-        tr.step(Box::new(SetNodeAttrStep::new(pos, "board", AttrValue::from(board.as_str())))).ok()?;
+        tr.step(Box::new(SetNodeAttrStep::new(pos, BOARD_ATTR, AttrValue::from(board.as_str())))).ok()?;
         Some(tr)
     })
 }
@@ -965,7 +971,7 @@ pub fn insert_board(store: AppStore) {
 // ── Pasting a marked-up picture ─────────────────────────────────────────────
 
 /// The pasted pictures' boards (contract section 2, "Copy and paste"): every
-/// image in `slice` with a `board` gets a fresh id, and the board it names
+/// image in `slice` with a `data-board` gets a fresh id, and the board it names
 /// is copied under that id into pane `pane`'s note a turn later. A board
 /// this window does not hold (copied in another window) cannot come along:
 /// the picture is pasted as it came in. Answers the slice to paste, or
@@ -973,13 +979,13 @@ pub fn insert_board(store: AppStore) {
 pub(crate) fn rebind_pasted_boards(schema: &rinch_editor_core::Schema, slice: &rinch_editor_core::Slice, pane: PaneId) -> Option<rinch_editor_core::Slice> {
     fn walk(node: &EditorNode, schema: &rinch_editor_core::Schema, jobs: &mut Vec<(String, String)>) -> EditorNode {
         if node.type_name() == "image" {
-            let Some(old) = node.attrs().get_str("board").filter(|b| !b.is_empty()) else { return node.clone() };
+            let Some(old) = node.attrs().get_str(BOARD_ATTR).filter(|b| !b.is_empty()) else { return node.clone() };
             let held = find_board(old).is_some();
-            let mut attrs = node.attrs().without("board");
+            let mut attrs = node.attrs().without(BOARD_ATTR);
             if held {
                 let fresh = pimble_board::doc::new_id();
                 jobs.push((old.to_string(), fresh.clone()));
-                attrs = attrs.with("board", AttrValue::from(fresh.as_str()));
+                attrs = attrs.with(BOARD_ATTR, AttrValue::from(fresh.as_str()));
             }
             return schema
                 .create_node("image", attrs, Fragment::empty())
@@ -995,10 +1001,10 @@ pub(crate) fn rebind_pasted_boards(schema: &rinch_editor_core::Schema, slice: &r
     let mut any = false;
     slice.content.iter().for_each(|n| {
         n.nodes_between(0, n.content_size(), &mut |c, _, _| {
-            any |= c.type_name() == "image" && c.attrs().get_str("board").is_some_and(|b| !b.is_empty());
+            any |= c.type_name() == "image" && c.attrs().get_str(BOARD_ATTR).is_some_and(|b| !b.is_empty());
             true
         });
-        any |= n.type_name() == "image" && n.attrs().get_str("board").is_some_and(|b| !b.is_empty());
+        any |= n.type_name() == "image" && n.attrs().get_str(BOARD_ATTR).is_some_and(|b| !b.is_empty());
     });
     if !any {
         return None;
@@ -1100,7 +1106,7 @@ pub(crate) fn hovered(store: AppStore, pane: PaneId, hover: Option<&crate::rinch
     let mut picture = PictureHover {
         pos: h.pos.0,
         alt: h.attrs.get_str("alt").unwrap_or_default().to_string(),
-        board: h.attrs.get_str("board").filter(|b| !b.is_empty()).map(str::to_string),
+        board: h.attrs.get_str(BOARD_ATTR).filter(|b| !b.is_empty()).map(str::to_string),
         embed,
         src,
         rect: (h.rect.x, h.rect.y, h.rect.width, h.rect.height),
@@ -1325,7 +1331,7 @@ pub(crate) fn node_created(store: AppStore, request: u64, store_id: StoreId, nod
         let mut tr = state.tr();
         tr.step(Box::new(SetNodeAttrStep::new(pos, "src", AttrValue::from(url.to_string())))).ok()?;
         tr.step(Box::new(SetNodeAttrStep::new(pos, "alt", AttrValue::from(job.title.as_str())))).ok()?;
-        tr.step(Box::new(SetNodeAttrStep { pos, attr: "board".into(), value: None })).ok()?;
+        tr.step(Box::new(SetNodeAttrStep { pos, attr: BOARD_ATTR.into(), value: None })).ok()?;
         Some(tr)
     });
     if !replaced {
@@ -1516,14 +1522,14 @@ mod tests {
 
     /// "Mark Up..." on a picture (contract section 2): opening the board
     /// view writes nothing; the first mark sends the board, writes the
-    /// atom's `board` and the mark; the note's boards here follow, and
+    /// atom's `data-board` and the mark; the note's boards here follow, and
     /// "Done" goes back to the text.
     #[test]
     fn the_first_mark_mints_the_board_and_names_it_on_the_picture() {
         let (store, commands) = store_with_commands();
         let (store_id, node_id, src) = note_with_picture(store, P[0]);
         let (pos, attrs) = atoms(P[0]).remove(0);
-        assert_eq!(attrs.get_str("board"), None);
+        assert_eq!(attrs.get_str(BOARD_ATTR), None);
         let _ = commands.try_iter().count();
 
         crate::boards::start_markup(store, P[0], store_id, node_id, &src, pos, None);
@@ -1534,7 +1540,7 @@ mod tests {
         crate::boards::mark_for_test(store, P[0]);
         let sent: Vec<BackendCommand> = commands.try_iter().collect();
         assert_eq!(broadcasts(&sent, node_id), 3, "the board, the atom's attribute, the mark");
-        let board = atoms(P[0])[0].1.get_str("board").map(str::to_string).expect("the picture names its board");
+        let board = atoms(P[0])[0].1.get_str(BOARD_ATTR).map(str::to_string).expect("the picture names its board");
         let snapshot = board_snapshot(store_id, node_id, &board).expect("the note's board here");
         assert_eq!(snapshot.markup_count(), 1);
         assert_eq!(snapshot.elements.iter().filter(|e| e.raw.kind == Kind::Picture).count(), 1);
@@ -1568,7 +1574,7 @@ mod tests {
         crate::boards::start_markup(store, P[1], store_id, node_id, &src, pos, None);
         crate::boards::mark_for_test(store, P[1]);
         crate::boards::end_markup(store, P[1]);
-        let board = atoms(P[1])[0].1.get_str("board").unwrap().to_string();
+        let board = atoms(P[1])[0].1.get_str(BOARD_ATTR).unwrap().to_string();
         let _ = commands.try_iter().count();
         // Pictures of a store open here are pasted (any other is left out).
         let mut open = pimble_core::Store::new_local("Notes", std::path::PathBuf::from("/nowhere/notes.pimble"));
@@ -1579,7 +1585,7 @@ mod tests {
 
         let html = format!("<p><img src=\"{src}\" alt=\"shot\" data-board=\"{board}\"></p>");
         assert!(crate::editor::editor(P[1]).paste(&rinch_editor_core::PasteContent::new(None, Some(html))));
-        let boards: Vec<String> = atoms(P[1]).iter().filter_map(|(_, a)| a.get_str("board").map(str::to_string)).collect();
+        let boards: Vec<String> = atoms(P[1]).iter().filter_map(|(_, a)| a.get_str(BOARD_ATTR).map(str::to_string)).collect();
         assert_eq!(boards.len(), 2, "{boards:?}");
         assert_ne!(boards[0], boards[1], "two pictures, two boards");
         for b in &boards {
@@ -1593,7 +1599,7 @@ mod tests {
         let html = format!("<p><img src=\"{src}\" data-board=\"0123456789abcdef\"></p>");
         assert!(crate::editor::editor(P[1]).paste(&rinch_editor_core::PasteContent::new(None, Some(html))));
         assert_eq!(atoms(P[1]).len(), 3);
-        assert_eq!(atoms(P[1]).iter().filter(|(_, a)| a.get_str("board").is_some()).count(), 2);
+        assert_eq!(atoms(P[1]).iter().filter(|(_, a)| a.get_str(BOARD_ATTR).is_some()).count(), 2);
         crate::editor::stop_editing(store, P[1]);
     }
 
@@ -1607,7 +1613,7 @@ mod tests {
         crate::boards::start_markup(store, P[2], store_id, node_id, &src, pos, None);
         crate::boards::mark_for_test(store, P[2]);
         crate::boards::end_markup(store, P[2]);
-        let board = atoms(P[2])[0].1.get_str("board").unwrap().to_string();
+        let board = atoms(P[2])[0].1.get_str(BOARD_ATTR).unwrap().to_string();
         let _ = commands.try_iter().count();
 
         let hover = PictureHover {
@@ -1642,7 +1648,7 @@ mod tests {
         node_created(store, request, store_id, new_node);
         let (_, attrs) = atoms(P[2]).remove(0);
         assert_eq!(attrs.get_str("src"), Some(BoardUrl::new(store_id, new_node).to_string().as_str()));
-        assert_eq!(attrs.get_str("board"), None);
+        assert_eq!(attrs.get_str(BOARD_ATTR), None);
         assert_eq!(attrs.get_str("alt"), Some("shot"));
         // An edit of the text like any other: undo takes the embed back.
         let embed = BoardUrl::new(store_id, new_node).to_string();

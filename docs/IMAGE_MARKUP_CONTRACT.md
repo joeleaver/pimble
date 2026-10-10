@@ -102,9 +102,12 @@ links, so the boards that point at a node show in its backlinks. OCR of pictures
 
 ## 2. Pictures in text
 
-A picture in a node's text is rinch's `image` atom. It gains one attribute, `board` (an id,
-absent until the picture is first marked up; a rinch pull request: the atom keeps and
-merges an attribute it does not render). The board lives in **the host node's**
+A picture in a node's text is rinch's `image` atom. It gains one attribute, `data-board`
+(an id, absent until the picture is first marked up). It is an ordinary `data-*`
+attribute: rinch keeps any an app sets on an image, round-trips them through copy and
+paste, writes them on the `<img>` and merges them per attribute between collaborators
+(joeleaver/rinch#1518, which replaced the `board` attribute #1500 had put into rinch;
+Joe, 2026-10-10: Pimble concepts stay out of rinch). The board lives in **the host node's**
 `data.boards.<board id>`, with the picture as an element on it, so it is co-edited
 with that node, replicates with it, is shared with whoever may read that node, and is
 undone by the same undo.
@@ -300,7 +303,7 @@ it stays that way until someone shows it again.
 - **rinch**: floating controls over an image inside the editor need the editor to say
   where an image atom is drawn and when the pointer is over it (an `EditorHandle` hook
   giving the atom's rectangle and its attributes, or an overlay slot per image atom). A
-  pull request upstream; spike 2 covers it with the atom's `board` attribute.
+  pull request upstream; spike 2 covers it with the atom's `data-board` attribute.
 
 ## 6. Attribution
 
@@ -946,7 +949,7 @@ pointer events, #1501, #1500).
 ## Built in wave 4 (boards in text)
 
 Built 2026-10-10 on branch `boards`, on rinch `main` at 2b9346e (joeleaver/rinch#1500 the
-atom's `board` and `width`, #1501 `set_image_source` and `on_image_hover`, #1503 attrs
+atom's `board` (since replaced by `data-board`, #1518) and `width`, #1501 `set_image_source` and `on_image_hover`, #1503 attrs
 merging one by one). Shared `pimble-app` code for the desktop and the browser, one module,
 `crates/pimble-app/src/text_boards.rs`, plus the board view's markup mode in `boards.rs`.
 
@@ -966,7 +969,7 @@ merging one by one). Shared `pimble-app` code for the desktop and the browser, o
 
 **Marked-up pictures in text:**
 - The app installs `set_image_source` once, outside any render (`app::build_view`): a
-  `pimble-blob:` picture whose atom has a `board` asks for `<blob url>#board=<id>`. The
+  `pimble-blob:` picture whose atom has a `data-board` asks for `<blob url>#board=<id>`. The
   `pimble-blob:` loader hands those to `text_boards::load`, which answers with the board
   rendered (`render_extent`, its visible extent trimmed, one unit per CSS pixel, no wider
   than the widest pane's text) or, while it is drawn, with the plain picture.
@@ -980,7 +983,7 @@ merging one by one). Shared `pimble-app` code for the desktop and the browser, o
   `data.boards.<id>` of the note. A picture with no board gets one in the pane's copy of the
   note when the view opens (the picture at one unit per pixel in a locked "Picture" layer
   and "Layer 1" above, as an image node starts), so opening and closing writes nothing; the
-  **first mark** sends that board, then writes the atom's `board` (`SetNodeAttrStep`
+  **first mark** sends that board, then writes the atom's `data-board` (`SetNodeAttrStep`
   through the editor, so it is an ordinary text edit), then the mark. These are three
   updates, in that order, not one: the text's atom lives in the editor's collaboration
   document, the board in the board session's copy, and no transaction spans both. Per-pane
@@ -1022,7 +1025,7 @@ merging one by one). Shared `pimble-app` code for the desktop and the browser, o
 "Picture"; the photo icon) whose board is a copy of the picture's markup (or a new image
 board for an unmarked picture), naming the same blob; `NodeInit::request` /
 `NodeCreated::request` say which node was made, and one editor transaction then sets the
-atom's `src` to the embed, its `alt` to the title and removes its `board`. Undo in the text
+atom's `src` to the embed, its `alt` to the title and removes its `data-board`. Undo in the text
 takes the embed back to the picture (with its board); it does **not** delete the node made.
 
 **Clipboard and transplant:** `PicturesPlugin::handle_paste` (now per pane) keeps
@@ -1061,7 +1064,7 @@ rinch has no copy hook, so the board travels by id within a window, not on the c
   in tab 2 when a stroke was drawn on the whiteboard in tab 1. Screenshots `web-01`-`web-14`.
 
 **Not built, or known gaps:**
-- The board and the atom's `board` are separate updates (above), so a peer can see the
+- The board and the atom's `data-board` are separate updates (above), so a peer can see the
   board a moment before the picture names it; and undoing the text does not take back a
   board (unreferenced boards stay in `data`, as the contract says, swept later).
 - Convert's undo leaves the image node; a drag of a tree row inserts at the caret, not at
