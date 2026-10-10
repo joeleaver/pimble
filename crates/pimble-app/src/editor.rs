@@ -176,6 +176,10 @@ pub(crate) fn start_editing(
     // pane (a peer's edit above its caret) is not the picker's business.
     handle.on_key(move |key| {
         editor_took_focus(store, pane);
+        // Typing moves pictures from under their floating controls.
+        if untracked(|| store.pane(pane).picture.with(Option::is_some)) {
+            crate::links::later(move |store| crate::text_boards::scrolled(store, pane));
+        }
         let modified = key.primary || key.ctrl || key.meta || key.alt;
         crate::link_picker::key(store, &editor(pane), key.key, modified)
     });

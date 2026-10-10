@@ -167,9 +167,9 @@ fn rendered<T>(f: impl FnOnce(&mut Rendered) -> T) -> T {
 /// rendering if there is one, else "not yet" and a render asked for on the
 /// UI thread. Never blocks.
 pub(crate) fn load(src: &str) -> ImageLoadResult {
-    if parse_source(src).is_none() {
+    let Some(source) = parse_source(src) else {
         return ImageLoadResult::Failed(format!("{src} is not a board's address"));
-    }
+    };
     let (answer, first) = rendered(|r| match r.images.get(src) {
         Some(bytes) => (Some(bytes.to_vec()), false),
         None => (None, r.asked.insert(src.to_string())),
@@ -182,8 +182,27 @@ pub(crate) fn load(src: &str) -> ImageLoadResult {
     }
     match answer {
         Some(bytes) => ImageLoadResult::Loaded(bytes),
-        None => ImageLoadResult::Failed("This board is being drawn.".to_string()),
+        None => match source {
+            // The picture as it came in, while its board is drawn over it.
+            Source::Marked { blob, .. } => match crate::pictures::held_bytes(&blob) {
+                Some(bytes) => ImageLoadResult::Loaded(bytes.to_vec()),
+                None => ImageLoadResult::Loaded(nothing_yet()),
+            },
+            // Not "failed": an `<img>` whose load failed is laid out as
+            // nothing, and the line it is in is not wrapped again when the
+            // picture comes (seen on the desktop); one pixel that shows
+            // nothing is replaced like any picture.
+            Source::Embed(_) => ImageLoadResult::Loaded(nothing_yet()),
+        },
     }
+}
+
+/// A transparent pixel: what a board shows while it is being drawn.
+fn nothing_yet() -> Vec<u8> {
+    static PIXEL: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    PIXEL
+        .get_or_init(|| pimble_board::RgbaImage { width: 1, height: 1, data: vec![0; 4] }.encode_png().unwrap_or_default())
+        .clone()
 }
 
 /// Run `f` on the UI thread, a turn later (the loader runs on a thread of
@@ -251,6 +270,33 @@ thread_local! {
     static OVER: RefCell<[bool; crate::panes::MAX_PANES]> = const { RefCell::new([false; crate::panes::MAX_PANES]) };
     static HIDE: RefCell<[Option<TimeoutHandle>; crate::panes::MAX_PANES]> = const { RefCell::new([None, None, None, None]) };
     static LAST_UP: RefCell<[(f64, usize); crate::panes::MAX_PANES]> = const { RefCell::new([(0.0, usize::MAX); crate::panes::MAX_PANES]) };
+    /// Each pane's text area on screen.
+    static TEXT_BOUNDS: RefCell<[Option<Signal<rinch::core::ElementBounds>>; crate::panes::MAX_PANES]> = const { RefCell::new([None, None, None, None]) };
+}
+
+/// Where pane `pane`'s text is on screen (its scroller's box).
+pub(crate) fn set_text_bounds(pane: PaneId, bounds: Signal<rinch::core::ElementBounds>) {
+    TEXT_BOUNDS.with(|b| b.borrow_mut()[pane.index()] = Some(bounds));
+}
+
+fn text_bounds(pane: PaneId) -> Option<Signal<rinch::core::ElementBounds>> {
+    TEXT_BOUNDS.with(|b| b.borrow()[pane.index()])
+}
+
+/// The widest a board in text is drawn: the widest pane's text, less its
+/// margins (a board's natural size is one CSS pixel per unit, capped by the
+/// pane, contract section 2).
+fn text_width() -> f32 {
+    let widest = PaneId::ALL
+        .into_iter()
+        .filter_map(text_bounds)
+        .map(|b| untracked(|| b.get().width))
+        .fold(0.0f32, f32::max);
+    if widest > 0.0 {
+        (widest - 64.0).max(160.0)
+    } else {
+        MAX_TEXT_PX
+    }
 }
 
 fn app() -> Option<AppStore> {
@@ -315,13 +361,16 @@ fn board_snapshot(store_id: StoreId, node_id: NodeId, board: &str) -> Option<Boa
 
 /// An update of node `node_id` (a peer's, a reconcile's, an edit made in
 /// this window): its document here, and whatever shows it, follow.
-fn applied(store_id: StoreId, node_id: NodeId, bytes: &[u8]) {
+/// `made_here`: the update was made in this window, perhaps on the host's
+/// own document (the markup toggle, a copied board), where applying it again
+/// changes nothing: what shows it is drawn again all the same.
+fn applied(store_id: StoreId, node_id: NodeId, bytes: &[u8], made_here: bool) {
     let hosted = HOSTS.with(|hosts| {
         let mut hosts = hosts.borrow_mut();
         match hosts.get_mut(&(store_id, node_id)) {
             Some(host) => {
                 match host.doc.apply_update(bytes) {
-                    Ok(effect) => effect.data,
+                    Ok(effect) => effect.data || made_here,
                     Err(e) => {
                         tracing::warn!("an update of note {node_id} did not apply to its boards: {e}");
                         false
@@ -363,21 +412,21 @@ fn applied(store_id: StoreId, node_id: NodeId, bytes: &[u8]) {
 
 /// A peer's update (`RemoteChanges`).
 pub(crate) fn apply_remote(store_id: StoreId, node_id: NodeId, bytes: &[u8]) {
-    applied(store_id, node_id, bytes);
+    applied(store_id, node_id, bytes, false);
 }
 
 /// The server's answer to a reconcile of the node (an editor's, a board
 /// pane's, or an embed's own).
 pub(crate) fn apply_reconcile(store_id: StoreId, node_id: NodeId, diff: &[u8]) {
     if !diff.is_empty() {
-        applied(store_id, node_id, diff);
+        applied(store_id, node_id, diff, false);
     }
 }
 
 /// An update this window made to a node's boards (a mark in the board view
 /// over a pane, a board copied in, the markup toggle).
 pub(crate) fn local_update(store_id: StoreId, node_id: NodeId, bytes: &[u8]) {
-    applied(store_id, node_id, bytes);
+    applied(store_id, node_id, bytes, true);
 }
 
 // ── Rendering ───────────────────────────────────────────────────────────────
@@ -528,17 +577,18 @@ fn held_picture(blob: &BlobUrl) -> Option<Arc<Vec<u8>>> {
 
 /// Render a board, off the UI thread on the desktop.
 fn draw(src: String, snapshot: BoardSnapshot, pictures: HashMap<String, Arc<Picture>>, area: Option<Rect>) {
+    let width = text_width();
     let work = move || -> Option<Vec<u8>> {
+        let fit = |rect: &Rect| TEXT_SCALE.min(MAX_TEXT_PX / rect.w.max(rect.h).max(1.0)).min(width / rect.w.max(1.0));
         let rendered = match area {
             Some(rect) => {
-                let scale = TEXT_SCALE.min(MAX_TEXT_PX / rect.w.max(rect.h).max(1.0));
+                let scale = fit(&rect);
                 let fill = snapshot.page.as_ref().and_then(|p| p.fill).unwrap_or(Color::WHITE);
                 render_area(&snapshot, &pictures, rect, scale, Some(fill), None, false)
             }
             None => {
                 let rect = snapshot.render_rect()?;
-                let scale = TEXT_SCALE.min(MAX_TEXT_PX / rect.w.max(rect.h).max(1.0));
-                render_extent(&snapshot, &pictures, scale)
+                render_extent(&snapshot, &pictures, fit(&rect))
             }
         }?;
         rendered.image.encode_png().ok()
@@ -1313,7 +1363,17 @@ pub(crate) fn render_controls(__scope: &mut RenderScope, store: AppStore, pane: 
             class: "pimble-picture-overlay",
             style: {move || match state.picture.get() {
                 Some(PictureHover { rect: (x, y, w, h), .. }) if !state.markup.get() => {
-                    format!("left: {x:.1}px; top: {y:.1}px; width: {w:.1}px; height: {h:.1}px;")
+                    // Inside the text's box: a tall picture scrolled half
+                    // out of view keeps its controls in sight.
+                    let (top, bottom) = match text_bounds(pane).map(|b| b.get()) {
+                        Some(b) if b.height > 0.0 => (y.max(b.y), (y + h).min(b.y + b.height)),
+                        _ => (y, y + h),
+                    };
+                    if bottom - top < 24.0 {
+                        "display: none;".to_string()
+                    } else {
+                        format!("left: {x:.1}px; top: {top:.1}px; width: {w:.1}px; height: {:.1}px;", bottom - top)
+                    }
                 }
                 _ => "display: none;".to_string(),
             }},

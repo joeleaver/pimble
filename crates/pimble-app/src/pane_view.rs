@@ -190,6 +190,24 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
     // (docs/IMAGE_MARKUP_CONTRACT.md section 5).
     let picture_controls = crate::text_boards::render_controls(__scope, store, pane);
 
+    let content_wrap = rsx! {
+        div {
+            class: "pimble-editor__content-wrap",
+            // Hidden under a picture's board view while it is marked up.
+            style: {move || if state.show_editor.get() && !state.show_board.get() { "" } else { "display: none;" }},
+            onscroll: move |_| crate::text_boards::scrolled(store, pane),
+            // A board node's row dropped on the text goes in as a picture
+            // of it (docs/IMAGE_MARKUP_CONTRACT.md section 2).
+            ondrop: move || {
+                crate::boards::take_tree_drag(|value| crate::text_boards::drop_tree_row(store, pane, value));
+            },
+            {editor_view}
+        }
+    };
+    // Where the text is on screen: the controls over a picture stay inside
+    // it, and a board in text is drawn no wider than it.
+    crate::text_boards::set_text_bounds(pane, content_wrap.bounds_signal());
+
     let empty_icon = render_tabler_icon(__scope, TablerIcon::FileText, TablerIconStyle::Outline);
     let hint_lines: Vec<NodeHandle> = hints
         .iter()
@@ -291,18 +309,7 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                 style: {move || if (state.show_editor.get() || state.show_board.get()) && editor_read_only(store, pane) { "" } else { "display: none;" }},
                 {pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string()}
             }
-            div {
-                class: "pimble-editor__content-wrap",
-                // Hidden under a picture's board view while it is marked up.
-                style: {move || if state.show_editor.get() && !state.show_board.get() { "" } else { "display: none;" }},
-                onscroll: move |_| crate::text_boards::scrolled(store, pane),
-                // A board node's row dropped on the text goes in as a picture
-                // of it (docs/IMAGE_MARKUP_CONTRACT.md section 2).
-                ondrop: move || {
-                    crate::boards::take_tree_drag(|value| crate::text_boards::drop_tree_row(store, pane, value));
-                },
-                {editor_view}
-            }
+            {content_wrap}
             {board_view}
             {picture_controls}
             div {
