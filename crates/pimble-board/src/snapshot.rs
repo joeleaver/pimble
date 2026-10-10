@@ -12,6 +12,7 @@ use tiny_skia::{Path, Transform as Affine};
 
 use crate::doc::{Board, Changes, RawBoard, RawElement, RawLayer};
 use crate::model::*;
+use crate::options::{author_color, CardLabel, ViewOptions, UNAUTHORED_COLOR};
 use crate::spatial::Grid;
 use crate::text::{self, TextLayout};
 
@@ -78,6 +79,9 @@ pub struct Element {
     /// Has anything to show: false for an empty group, a stroke with no
     /// points yet, a kind this version does not know.
     pub has_extent: bool,
+    /// A card's label from [`ViewOptions::card_labels`], when the app gave
+    /// one for its link.
+    pub card: Option<CardLabel>,
     /// Changes whenever anything about how it looks changes.
     pub fingerprint: u64,
     pub(crate) text_path: OnceLock<Option<Path>>,
@@ -120,6 +124,7 @@ pub struct BoardSnapshot {
     /// Element index by a hash of its id (checked against the id on lookup).
     index: HashMap<u64, usize>,
     grid: Grid,
+    options: ViewOptions,
 }
 
 impl BoardSnapshot {
@@ -129,6 +134,11 @@ impl BoardSnapshot {
     }
 
     pub fn build(raw: Option<RawBoard>) -> Self {
+        Self::build_with(raw, ViewOptions::default())
+    }
+
+    /// [`BoardSnapshot::build`] seen with `options`.
+    pub fn build_with(raw: Option<RawBoard>, options: ViewOptions) -> Self {
         let Some(raw) = raw else {
             return BoardSnapshot {
                 exists: false,
@@ -141,16 +151,30 @@ impl BoardSnapshot {
                 elements: Vec::new(),
                 index: HashMap::new(),
                 grid: Grid::default(),
+                options,
             };
         };
-        Resolver::run(raw, HashMap::new())
+        Resolver::run(raw, HashMap::new(), options)
+    }
+
+    /// The viewer's choices this snapshot is drawn with.
+    pub fn options(&self) -> &ViewOptions {
+        &self.options
+    }
+
+    /// This board read again from `board` with other view options. Nothing
+    /// is reused (options change rarely, and a card's title may change with
+    /// them).
+    pub fn with_options(self, options: ViewOptions, board: &Board) -> Self {
+        Self::build_with(board.read(), options)
     }
 
     /// [`BoardSnapshot::build`], keeping what this snapshot already worked
     /// out (text layout, glyph outlines) for every element that has not
     /// changed.
     pub fn rebuild(self, raw: Option<RawBoard>) -> Self {
-        let Some(raw) = raw else { return Self::build(None) };
+        let options = self.options;
+        let Some(raw) = raw else { return Self::build_with(None, options) };
         let mut prev: HashMap<String, Element> = self.elements.into_iter().map(|e| (e.raw.id.clone(), e)).collect();
         let mut reuse = HashMap::new();
         for e in &raw.elements {
@@ -160,7 +184,7 @@ impl BoardSnapshot {
                 }
             }
         }
-        Resolver::run(raw, reuse)
+        Resolver::run(raw, reuse, options)
     }
 
     /// Bring this snapshot up to date with `board` given what changed
@@ -175,7 +199,8 @@ impl BoardSnapshot {
         if changes.all || !self.exists {
             return self.rebuild(board.read());
         }
-        let Some((mut raw, changed)) = board.read_some(&changes.elements) else { return Self::build(None) };
+        let options = self.options;
+        let Some((mut raw, changed)) = board.read_some(&changes.elements) else { return Self::build_with(None, options) };
         let mut reuse = HashMap::new();
         let mut fresh: HashMap<String, Option<RawElement>> = changed.into_iter().collect();
         let mut elements = Vec::with_capacity(self.elements.len() + fresh.len());
@@ -200,7 +225,7 @@ impl BoardSnapshot {
         // Elements this snapshot did not have.
         elements.extend(fresh.into_values().flatten());
         raw.elements = elements;
-        Resolver::run(raw, reuse)
+        Resolver::run(raw, reuse, options)
     }
 
     pub fn get(&self, id: &str) -> Option<&Element> {
@@ -312,10 +337,11 @@ struct Resolver {
     layer_rank: HashMap<String, usize>,
     raws: Vec<RawElement>,
     by_id: HashMap<u64, usize>,
+    options: ViewOptions,
 }
 
 impl Resolver {
-    fn run(raw: RawBoard, reuse: HashMap<String, Reuse>) -> BoardSnapshot {
+    fn run(raw: RawBoard, reuse: HashMap<String, Reuse>, options: ViewOptions) -> BoardSnapshot {
         let RawBoard { version, page, markup_visible, edited_by, edited_at, layers: raw_layers, elements } = raw;
         let mut raw_layers: Vec<RawLayer> = raw_layers;
         raw_layers.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.id.cmp(&b.id)));
@@ -332,7 +358,7 @@ impl Resolver {
         ranked.sort_by(|(ra, a), (rb, b)| ra.cmp(rb).then_with(|| a.order.cmp(&b.order)).then_with(|| a.id.cmp(&b.id)));
         let raws: Vec<RawElement> = ranked.into_iter().map(|(_, e)| e).collect();
         let by_id: HashMap<u64, usize> = raws.iter().enumerate().map(|(i, e)| (id_hash(&e.id), i)).collect();
-        let mut r = Resolver { reuse, layers, layer_rank, raws, by_id };
+        let mut r = Resolver { reuse, layers, layer_rank, raws, by_id, options };
         let snapshot_elements = r.resolve(markup_visible);
         let index = snapshot_elements.iter().enumerate().map(|(i, e)| (id_hash(&e.raw.id), i)).collect();
         let grid = Grid::build(&snapshot_elements);
@@ -347,6 +373,7 @@ impl Resolver {
             elements: snapshot_elements,
             index,
             grid,
+            options: r.options,
         }
     }
 
@@ -406,7 +433,28 @@ impl Resolver {
             }
         }
 
-        let styles: Vec<ResolvedStyle> = self.raws.iter().map(|e| e.style.resolved(&e.kind)).collect();
+        let by_author = self.options.color_by_author;
+        let styles: Vec<ResolvedStyle> = self
+            .raws
+            .iter()
+            .map(|e| {
+                let mut s = e.style.resolved(&e.kind);
+                if by_author && !e.kind.is_picture() {
+                    let c = e.author.as_ref().map_or(UNAUTHORED_COLOR, |a| author_color(&a.id));
+                    s.stroke = c;
+                    s.fill = s.fill.map(|_| Color { a: 0x40, ..c });
+                }
+                s
+            })
+            .collect();
+        let mut cards: Vec<Option<CardLabel>> = self
+            .raws
+            .iter()
+            .map(|e| match &e.geom {
+                Geom::Card { link, .. } if e.kind == Kind::Card => self.options.card_labels.get(link).cloned(),
+                _ => None,
+            })
+            .collect();
 
         // Text layout and each element's own extent, children before
         // parents (a group's extent is its members').
@@ -426,7 +474,8 @@ impl Resolver {
                     text_paths.push(r.text_path);
                 }
                 None => {
-                    let (layout, tb, g) = lay_out(&self.raws[i], &styles[i], step_number[i]);
+                    let title = cards[i].as_ref().map(|c| c.title.as_str());
+                    let (layout, tb, g) = lay_out(&self.raws[i], &styles[i], step_number[i], title);
                     layouts.push(layout.map(Arc::new));
                     text_boxes.push(tb);
                     grown.push(g);
@@ -538,8 +587,9 @@ impl Resolver {
                 Some(l) => (self.layers[l].id.clone(), self.layers[l].visible, self.layers[l].opacity),
                 None => (raw.layer.clone(), true, 1.0),
             };
+            let show_all = self.options.show_all;
             let known = !matches!(raw.kind, Kind::Other(_));
-            let visible = known && layer_visible && (markup_visible || raw.kind.is_picture());
+            let visible = known && (layer_visible || show_all) && (markup_visible || show_all || raw.kind.is_picture());
             let style = styles[i].clone();
             let opacity = style.opacity * layer_opacity;
             let global = matches!(raw.kind, Kind::Spotlight);
@@ -564,6 +614,7 @@ impl Resolver {
                 grown: grown[i],
                 global,
                 has_extent: local[i].is_some() || routes[i].is_some(),
+                card: cards[i].take(),
                 fingerprint: 0,
                 text_path,
                 raw,
@@ -582,7 +633,12 @@ pub(crate) fn head_size(width: f32) -> f32 {
 
 /// The text an element shows, its layout and its box (element space), and
 /// a sticky note's grown rectangle.
-fn lay_out(e: &RawElement, s: &ResolvedStyle, step: Option<u32>) -> (Option<TextLayout>, Option<Rect>, Option<Rect>) {
+fn lay_out(
+    e: &RawElement,
+    s: &ResolvedStyle,
+    step: Option<u32>,
+    card_title: Option<&str>,
+) -> (Option<TextLayout>, Option<Rect>, Option<Rect>) {
     let text = e.text.as_deref().unwrap_or("");
     match (&e.kind, &e.geom) {
         (Kind::Step, Geom::Anchor(c)) => {
@@ -626,7 +682,7 @@ fn lay_out(e: &RawElement, s: &ResolvedStyle, step: Option<u32>) -> (Option<Text
             (Some(l), Some(tb), None)
         }
         (Kind::Card, Geom::Card { rect: r, link }) => {
-            let title = if text.is_empty() { link.as_str() } else { text };
+            let title = card_title.unwrap_or(if text.is_empty() { link.as_str() } else { text });
             let pad = s.font_size * 0.6;
             let icon = s.font_size * 1.2;
             let inner_w = (r.w - 3.0 * pad - icon).max(1.0);
@@ -863,6 +919,7 @@ fn fingerprint(e: &Element) -> u64 {
     }
     e.visible.hash(&mut h);
     e.step_number.hash(&mut h);
+    e.card.hash(&mut h);
     if let Some((a, b)) = e.route {
         for v in [a.x, a.y, b.x, b.y] {
             f(&mut h, v);

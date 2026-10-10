@@ -4,19 +4,15 @@
 //! clipboard and the MCP all draw through [`draw_region`], so every copy of a
 //! board agrees with the live view by construction.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
-use tiny_skia::{
-    BlendMode, FillRule, FilterQuality, LineCap, LineJoin, Paint, Path, PathBuilder, Pattern, Pixmap, PixmapPaint,
-    SpreadMode, Stroke, StrokeDash, Transform as Affine,
-};
+use tiny_skia::{BlendMode, FillRule, FilterQuality, Paint, Pattern, Pixmap, PixmapPaint, SpreadMode, Stroke, Transform as Affine};
 
 use crate::model::*;
-use crate::snapshot::{head_size, BoardSnapshot, Element, SHADOW_OFFSET, STEP_RADIUS};
-
-/// Text smaller than this many pixels is drawn as bars.
-const GREEK_BELOW_PX: f32 = 4.0;
+pub(crate) use crate::paint::stroke_path;
+use crate::paint::{element_ops, rect_path, Op, Space, StrokeStyle};
+use crate::snapshot::{BoardSnapshot, Element, SHADOW_OFFSET};
 /// The most pixels on a side [`render_extent`] renders.
 pub const MAX_EXTENT_PX: f32 = 8192.0;
 
@@ -225,6 +221,26 @@ impl RgbaImage {
         RgbaImage { width, height, data }
     }
 
+    /// JPEG bytes at `quality` (1 to 100), flattened onto `background`
+    /// (JPEG has no transparency).
+    pub fn encode_jpeg(&self, quality: u8, background: Color) -> Result<Vec<u8>, image::ImageError> {
+        let mut rgb = Vec::with_capacity((self.width * self.height * 3) as usize);
+        for px in self.data.chunks_exact(4) {
+            let a = px[3] as u32;
+            for (c, b) in px[..3].iter().zip([background.r, background.g, background.b]) {
+                rgb.push(((*c as u32 * a + b as u32 * (255 - a) + 127) / 255) as u8);
+            }
+        }
+        let mut out = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality.clamp(1, 100)).encode(
+            &rgb,
+            self.width,
+            self.height,
+            image::ExtendedColorType::Rgb8,
+        )?;
+        Ok(out)
+    }
+
     /// PNG bytes (Copy Picture, Save Picture As...).
     pub fn encode_png(&self) -> Result<Vec<u8>, image::ImageError> {
         let mut out = std::io::Cursor::new(Vec::new());
@@ -273,7 +289,28 @@ pub struct Rendered {
 /// shows.
 pub fn render_extent(snapshot: &BoardSnapshot, pictures: &dyn PictureSource, scale: f32) -> Option<Rendered> {
     let rect = snapshot.render_rect()?;
-    if rect.w <= 0.0 || rect.h <= 0.0 {
+    let background = snapshot.page.as_ref().map(|p| p.fill.unwrap_or(Color::WHITE));
+    render_area(snapshot, pictures, rect, scale, background, None, snapshot.page.is_none())
+}
+
+/// Render `rect` of the board (export, a selection, a frame) at `scale`
+/// pixels per board unit, lowered so no side passes [`MAX_EXTENT_PX`], over
+/// `background` (transparent when `None`). `only` draws just those elements
+/// and their members (everything whose chain of parents reaches one of
+/// them). `trim` cuts the image down to the pixels that are not fully
+/// transparent. `None` when the rectangle is empty, or trimming leaves
+/// nothing.
+pub fn render_area(
+    snapshot: &BoardSnapshot,
+    pictures: &dyn PictureSource,
+    rect: Rect,
+    scale: f32,
+    background: Option<Color>,
+    only: Option<&HashSet<String>>,
+    trim: bool,
+) -> Option<Rendered> {
+    let rect = rect.normalized();
+    if !(rect.w > 0.0 && rect.h > 0.0 && rect.is_finite()) {
         return None;
     }
     let scale = scale.min(MAX_EXTENT_PX / rect.w.max(rect.h)).max(1e-4);
@@ -282,12 +319,29 @@ pub fn render_extent(snapshot: &BoardSnapshot, pictures: &dyn PictureSource, sca
     let w = ((rect.right() * scale).ceil() - x0).max(1.0) as u32;
     let h = ((rect.bottom() * scale).ceil() - y0).max(1.0) as u32;
     let view = View::new(x0 / scale, y0 / scale, scale);
-    let background = snapshot.page.as_ref().map(|p| p.fill.unwrap_or(Color::WHITE));
-    let pixmap = render(snapshot, pictures, &view, w, h, background)?;
-    if snapshot.page.is_some() {
+    let mut pixmap = Pixmap::new(w, h)?;
+    if let Some(bg) = background {
+        pixmap.fill(tiny_color(bg, 1.0));
+    }
+    let mask = only.map(|ids| included(snapshot, ids));
+    draw_region_masked(&mut pixmap, snapshot, pictures, &view, mask.as_deref());
+    if !trim {
         return Some(Rendered { rect: view.board_rect(w, h), image: RgbaImage::from_pixmap(pixmap) });
     }
-    // Trim to the pixels that are not fully transparent.
+    let (pixmap, (minx, miny)) = trim_transparent(pixmap)?;
+    let rect = Rect::new(
+        view.x + minx as f32 / scale,
+        view.y + miny as f32 / scale,
+        pixmap.width() as f32 / scale,
+        pixmap.height() as f32 / scale,
+    );
+    Some(Rendered { rect, image: RgbaImage::from_pixmap(pixmap) })
+}
+
+/// `pixmap` cut down to the pixels that are not fully transparent, and where
+/// the cut starts in it. `None` when every pixel is transparent.
+fn trim_transparent(pixmap: Pixmap) -> Option<(Pixmap, (u32, u32))> {
+    let (w, h) = (pixmap.width(), pixmap.height());
     let data = pixmap.data();
     let (mut minx, mut miny, mut maxx, mut maxy) = (u32::MAX, u32::MAX, 0u32, 0u32);
     for y in 0..h {
@@ -311,21 +365,60 @@ pub fn render_extent(snapshot: &BoardSnapshot, pictures: &dyn PictureSource, sca
         return None;
     }
     let (tw, th) = (maxx - minx + 1, maxy - miny + 1);
-    let trimmed = if (tw, th) == (w, h) {
-        pixmap
-    } else {
-        pixmap.clone_rect(tiny_skia::IntRect::from_xywh(minx as i32, miny as i32, tw, th)?)?
-    };
-    let rect = Rect::new(view.x + minx as f32 / scale, view.y + miny as f32 / scale, tw as f32 / scale, th as f32 / scale);
-    Some(Rendered { rect, image: RgbaImage::from_pixmap(trimmed) })
+    if (tw, th) == (w, h) {
+        return Some((pixmap, (0, 0)));
+    }
+    let cut = pixmap.clone_rect(tiny_skia::IntRect::from_xywh(minx as i32, miny as i32, tw, th)?)?;
+    Some((cut, (minx, miny)))
+}
+
+/// Per element (z-order), whether it is one of `ids` or a member, at any
+/// depth, of one of them.
+pub(crate) fn included(snapshot: &BoardSnapshot, ids: &HashSet<String>) -> Vec<bool> {
+    snapshot
+        .elements
+        .iter()
+        .map(|e| {
+            let mut at = Some(e);
+            // Parents never make a cycle (the snapshot cut them); the bound
+            // is a guard.
+            for _ in 0..=snapshot.elements.len() {
+                let Some(cur) = at else { break };
+                if ids.contains(cur.id()) {
+                    return true;
+                }
+                at = cur.parent.as_deref().and_then(|p| snapshot.get(p));
+            }
+            false
+        })
+        .collect()
+}
+
+/// The union of the bounds of the elements `ids` names (that have anything
+/// to show); `None` when none do.
+pub fn selection_bounds(snapshot: &BoardSnapshot, ids: &[String]) -> Option<Rect> {
+    ids.iter()
+        .filter_map(|id| snapshot.get(id))
+        .filter(|e| e.has_extent && e.bounds.is_finite())
+        .map(|e| e.bounds)
+        .reduce(|a, b| a.union(&b))
 }
 
 /// Draw every visible element `view` touches over what `pixmap` holds. The
 /// one drawing path: everything else calls this.
 pub fn draw_region(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &dyn PictureSource, view: &View) {
+    draw_region_masked(pixmap, snapshot, pictures, view, None);
+}
+
+/// [`draw_region`], drawing only the elements `mask` (by z-order index)
+/// allows when given.
+fn draw_region_masked(pixmap: &mut Pixmap, snapshot: &BoardSnapshot, pictures: &dyn PictureSource, view: &View, mask: Option<&[bool]>) {
     let region = view.board_rect(pixmap.width(), pixmap.height());
     let vt = view.transform();
     for i in snapshot.query(&region) {
+        if mask.is_some_and(|m| !m[i]) {
+            continue;
+        }
         draw_element(pixmap, &snapshot.elements[i], pictures, vt, &region);
     }
 }
@@ -338,144 +431,12 @@ fn paint_of(color: Color, opacity: f32) -> Paint<'static> {
 }
 
 fn stroke_of(width: f32, dash: Dash) -> Stroke {
-    let mut s = Stroke { width: width.max(0.01), line_cap: LineCap::Round, line_join: LineJoin::Round, ..Stroke::default() };
-    match dash {
-        Dash::Solid => {}
-        Dash::Dashed => {
-            s.line_cap = LineCap::Butt;
-            s.dash = StrokeDash::new(vec![width * 3.0, width * 2.0], 0.0);
-        }
-        Dash::Dotted => s.dash = StrokeDash::new(vec![0.01, width * 2.0], 0.0),
-    }
-    s
-}
-
-fn rect_path(r: &Rect) -> Option<Path> {
-    tiny_skia::Rect::from_xywh(r.x, r.y, r.w.max(0.01), r.h.max(0.01)).map(PathBuilder::from_rect)
-}
-
-fn shape_path(kind: &Kind, r: &Rect) -> Option<Path> {
-    match kind {
-        Kind::Ellipse => tiny_skia::Rect::from_xywh(r.x, r.y, r.w.max(0.01), r.h.max(0.01)).and_then(PathBuilder::from_oval),
-        Kind::Diamond => {
-            let c = r.center();
-            let mut pb = PathBuilder::new();
-            pb.move_to(c.x, r.y);
-            pb.line_to(r.right(), c.y);
-            pb.line_to(c.x, r.bottom());
-            pb.line_to(r.x, c.y);
-            pb.close();
-            pb.finish()
-        }
-        _ => rect_path(r),
-    }
-}
-
-fn draw_shadow(pixmap: &mut Pixmap, path: &Path, ts: Affine, opacity: f32) {
-    let paint = paint_of(Color::rgba(0, 0, 0, 56), opacity);
-    pixmap.fill_path(path, &paint, FillRule::Winding, ts.pre_translate(SHADOW_OFFSET, SHADOW_OFFSET), None);
-}
-
-/// Draw `path` filled and/or stroked per the element's style.
-fn fill_and_stroke(pixmap: &mut Pixmap, e: &Element, path: &Path, ts: Affine) {
-    let s = &e.style;
-    if s.shadow {
-        draw_shadow(pixmap, path, ts, e.opacity);
-    }
-    if let Some(fill) = s.fill {
-        pixmap.fill_path(path, &paint_of(fill, e.opacity), FillRule::Winding, ts, None);
-    }
-    if s.width > 0.0 {
-        pixmap.stroke_path(path, &paint_of(s.stroke, e.opacity), &stroke_of(s.width, s.dash), ts, None);
-    }
-}
-
-fn draw_text(pixmap: &mut Pixmap, e: &Element, ts: Affine, color: Color) {
-    let (Some(layout), Some(tb)) = (&e.layout, e.text_box) else { return };
-    if layout.is_empty() {
-        return;
-    }
-    let px = layout.font_size * ts_scale(&ts);
-    if px < GREEK_BELOW_PX {
-        let paint = paint_of(color, e.opacity * 0.35);
-        for r in layout.line_boxes(Point::new(tb.x, tb.y), tb.w, e.style.align) {
-            if let Some(path) = rect_path(&r) {
-                pixmap.fill_path(&path, &paint, FillRule::Winding, ts, None);
-            }
-        }
-        return;
-    }
-    if let Some(path) = e.text_path() {
-        pixmap.fill_path(path, &paint_of(color, e.opacity), FillRule::Winding, ts, None);
-    }
+    StrokeStyle { width, dash }.tiny()
 }
 
 /// The scale a transform applies (its area factor's square root).
-fn ts_scale(ts: &Affine) -> f32 {
+pub(crate) fn ts_scale(ts: &Affine) -> f32 {
     (ts.sx * ts.sy - ts.kx * ts.ky).abs().sqrt()
-}
-
-fn arrow_head(tip: Point, from: Point, width: f32) -> Option<(Path, Point)> {
-    let (dx, dy) = (tip.x - from.x, tip.y - from.y);
-    let len = (dx * dx + dy * dy).sqrt();
-    if len < 1e-3 {
-        return None;
-    }
-    let (ux, uy) = (dx / len, dy / len);
-    let size = head_size(width).min(len * 0.9);
-    let half = size * 0.5;
-    let base = Point::new(tip.x - ux * size, tip.y - uy * size);
-    let mut pb = PathBuilder::new();
-    pb.move_to(tip.x, tip.y);
-    pb.line_to(base.x - uy * half, base.y + ux * half);
-    pb.line_to(base.x + uy * half, base.y - ux * half);
-    pb.close();
-    // The line stops inside the head so its round cap does not show.
-    let stop = Point::new(tip.x - ux * size * 0.7, tip.y - uy * size * 0.7);
-    Some((pb.finish()?, stop))
-}
-
-fn draw_segment(pixmap: &mut Pixmap, e: &Element, a: Point, b: Point, ts: Affine) {
-    let s = &e.style;
-    let paint = paint_of(s.stroke, e.opacity);
-    let (mut a2, mut b2) = (a, b);
-    if s.arrow_heads.end() {
-        if let Some((head, stop)) = arrow_head(b, a, s.width) {
-            pixmap.fill_path(&head, &paint, FillRule::Winding, ts, None);
-            b2 = stop;
-        }
-    }
-    if s.arrow_heads.start() {
-        if let Some((head, stop)) = arrow_head(a, b, s.width) {
-            pixmap.fill_path(&head, &paint, FillRule::Winding, ts, None);
-            a2 = stop;
-        }
-    }
-    let mut pb = PathBuilder::new();
-    pb.move_to(a2.x, a2.y);
-    pb.line_to(b2.x, b2.y);
-    if let Some(path) = pb.finish() {
-        pixmap.stroke_path(&path, &paint, &stroke_of(s.width, s.dash), ts, None);
-    }
-}
-
-/// A stroke's points as one path (a straight polyline: smoothing happens
-/// once, when the drawer releases, contract section 3).
-pub(crate) fn stroke_path(points: &[[f32; 3]]) -> Option<Path> {
-    let mut it = points.iter().filter(|p| p[0].is_finite() && p[1].is_finite());
-    let first = it.next()?;
-    let mut pb = PathBuilder::new();
-    pb.move_to(first[0], first[1]);
-    let mut any = false;
-    for p in it {
-        pb.line_to(p[0], p[1]);
-        any = true;
-    }
-    if !any {
-        // A dot: a zero-length segment, which a round cap draws as a disc.
-        pb.line_to(first[0] + 0.01, first[1]);
-    }
-    pb.finish()
 }
 
 pub(crate) fn stroke_paint(kind: &Kind, color: Color, opacity: f32) -> Paint<'static> {
@@ -487,145 +448,36 @@ pub(crate) fn stroke_paint(kind: &Kind, color: Color, opacity: f32) -> Paint<'st
 }
 
 fn draw_element(pixmap: &mut Pixmap, e: &Element, pictures: &dyn PictureSource, vt: Affine, region: &Rect) {
-    if !e.visible || e.opacity <= 0.0 {
-        return;
-    }
     let ts = vt.pre_concat(e.world);
-    let s = &e.style;
-    match (&e.raw.kind, &e.raw.geom) {
-        (Kind::Pen | Kind::Highlighter, _) => {
-            if let Some(path) = stroke_path(&e.raw.points) {
-                let paint = stroke_paint(&e.raw.kind, s.stroke, e.opacity);
-                pixmap.stroke_path(&path, &paint, &stroke_of(s.width.max(0.5), s.dash), ts, None);
-            }
-        }
-        (Kind::Picture, Geom::Picture(p)) => draw_picture(pixmap, e, p, pictures, ts),
-        (Kind::Line | Kind::Arrow, Geom::Segment { a, b }) => draw_segment(pixmap, e, *a, *b, ts),
-        (Kind::Rect | Kind::Ellipse | Kind::Diamond, Geom::Rect(r)) => {
-            if let Some(path) = shape_path(&e.raw.kind, &r.normalized()) {
-                fill_and_stroke(pixmap, e, &path, ts);
-            }
-            draw_text(pixmap, e, ts, s.stroke);
-        }
-        (Kind::Text, Geom::Rect(_)) => {
-            if let Some(fill) = s.fill {
-                if let Some(path) = e.text_box.and_then(|tb| rect_path(&tb.inflate(s.font_size * 0.2))) {
-                    pixmap.fill_path(&path, &paint_of(fill, e.opacity), FillRule::Winding, ts, None);
+    for op in element_ops(e, region, Some(ts_scale(&ts))) {
+        match op {
+            Op::Fill { path, color, opacity, rule, space, shadow, multiply } => {
+                let mut t = if space == Space::Element { ts } else { vt };
+                if shadow {
+                    t = t.pre_translate(SHADOW_OFFSET, SHADOW_OFFSET);
                 }
-            }
-            draw_text(pixmap, e, ts, s.stroke);
-        }
-        (Kind::Sticky, Geom::Rect(r)) => {
-            let g = e.grown.unwrap_or(*r).normalized();
-            if let Some(path) = rect_path(&g) {
-                if s.shadow {
-                    draw_shadow(pixmap, &path, ts, e.opacity);
+                let mut paint = paint_of(color, opacity);
+                if multiply {
+                    paint.blend_mode = BlendMode::Multiply;
                 }
-                let fill = s.fill.unwrap_or(STICKY_YELLOW);
-                pixmap.fill_path(&path, &paint_of(fill, e.opacity), FillRule::Winding, ts, None);
-                if s.width > 0.0 {
-                    pixmap.stroke_path(&path, &paint_of(s.stroke, e.opacity), &stroke_of(s.width, s.dash), ts, None);
+                pixmap.fill_path(path.get(), &paint, rule, t, None);
+            }
+            Op::Stroke { path, color, opacity, stroke, space, multiply } => {
+                let t = if space == Space::Element { ts } else { vt };
+                let mut paint = paint_of(color, opacity);
+                if multiply {
+                    paint.blend_mode = BlendMode::Multiply;
                 }
+                pixmap.stroke_path(path.get(), &paint, &stroke.tiny(), t, None);
             }
-            draw_text(pixmap, e, ts, s.stroke);
+            Op::Picture(p) => draw_picture(pixmap, e, p, pictures, ts),
         }
-        (Kind::Step, Geom::Anchor(c)) => {
-            let rad = s.font_size * STEP_RADIUS;
-            if let Some(path) = PathBuilder::from_circle(c.x, c.y, rad) {
-                if s.shadow {
-                    draw_shadow(pixmap, &path, ts, e.opacity);
-                }
-                pixmap.fill_path(&path, &paint_of(s.stroke, e.opacity), FillRule::Winding, ts, None);
-            }
-            draw_text(pixmap, e, ts, s.fill.unwrap_or(Color::WHITE));
-        }
-        (Kind::Callout, Geom::Callout { rect, tip }) => {
-            let r = rect.normalized();
-            // The pointer leaves from the box's center toward the tip.
-            let c = r.center();
-            let (dx, dy) = (tip.x - c.x, tip.y - c.y);
-            let len = (dx * dx + dy * dy).sqrt().max(1e-3);
-            let half = (r.w.min(r.h) * 0.2).max(4.0);
-            let mut pb = PathBuilder::new();
-            pb.push_rect(tiny_skia::Rect::from_xywh(r.x, r.y, r.w.max(0.01), r.h.max(0.01)).unwrap_or(tiny_skia::Rect::from_xywh(0.0, 0.0, 1.0, 1.0).unwrap()));
-            pb.move_to(c.x - dy / len * half, c.y + dx / len * half);
-            pb.line_to(tip.x, tip.y);
-            pb.line_to(c.x + dy / len * half, c.y - dx / len * half);
-            pb.close();
-            if let Some(path) = pb.finish() {
-                if s.shadow {
-                    draw_shadow(pixmap, &path, ts, e.opacity);
-                }
-                // Stroke first, fill over it: the outline shows only outside
-                // the union of the box and the pointer.
-                if s.width > 0.0 {
-                    pixmap.stroke_path(&path, &paint_of(s.stroke, e.opacity), &stroke_of(s.width * 2.0, Dash::Solid), ts, None);
-                }
-                if let Some(fill) = s.fill {
-                    pixmap.fill_path(&path, &paint_of(fill, 1.0_f32.min(e.opacity)), FillRule::Winding, ts, None);
-                }
-            }
-            draw_text(pixmap, e, ts, Color::rgb(0x21, 0x21, 0x21));
-        }
-        (Kind::Connector, _) => {
-            if let Some((a, b)) = e.route {
-                draw_segment(pixmap, e, a, b, vt);
-                if let (Some(layout), Some(tb)) = (&e.layout, e.text_box) {
-                    if !layout.is_empty() {
-                        if let Some(bg) = rect_path(&tb.inflate(s.font_size * 0.25)) {
-                            pixmap.fill_path(&bg, &paint_of(Color::WHITE, e.opacity), FillRule::Winding, vt, None);
-                        }
-                        draw_text(pixmap, e, vt, s.stroke);
-                    }
-                }
-            }
-        }
-        (Kind::Frame, Geom::Rect(r)) => {
-            if let Some(path) = rect_path(&r.normalized()) {
-                if let Some(fill) = s.fill {
-                    pixmap.fill_path(&path, &paint_of(fill, e.opacity), FillRule::Winding, ts, None);
-                }
-                pixmap.stroke_path(&path, &paint_of(s.stroke, e.opacity), &stroke_of(s.width.max(0.5), s.dash), ts, None);
-            }
-            draw_text(pixmap, e, ts, Color::rgb(0x61, 0x61, 0x61));
-        }
-        (Kind::Card, Geom::Card { rect, .. }) => {
-            let r = rect.normalized();
-            if let Some(path) = rect_path(&r) {
-                fill_and_stroke(pixmap, e, &path, ts);
-            }
-            // A small square where the node's icon goes.
-            let pad = s.font_size * 0.6;
-            let icon = s.font_size * 1.2;
-            if let Some(path) = rect_path(&Rect::new(r.x + pad, r.y + (r.h - icon) / 2.0, icon, icon)) {
-                pixmap.fill_path(&path, &paint_of(s.stroke, e.opacity * 0.5), FillRule::Winding, ts, None);
-            }
-            draw_text(pixmap, e, ts, Color::rgb(0x21, 0x21, 0x21));
-        }
-        (Kind::Spotlight, Geom::Rect(r)) => {
-            // Everything outside the rectangle is dimmed, across the region.
-            let mut pb = PathBuilder::new();
-            if let Some(outer) = tiny_skia::Rect::from_xywh(region.x - 1.0, region.y - 1.0, region.w + 2.0, region.h + 2.0) {
-                pb.push_rect(outer);
-            }
-            if let Some(inner) = rect_path(&r.normalized()).and_then(|p| p.transform(e.world)) {
-                pb.push_path(&inner);
-            }
-            if let Some(path) = pb.finish() {
-                let fill = s.fill.unwrap_or(Color::rgba(0, 0, 0, 0x99));
-                pixmap.fill_path(&path, &paint_of(fill, e.opacity), FillRule::EvenOdd, vt, None);
-            }
-        }
-        _ => {}
     }
 }
 
 fn draw_picture(pixmap: &mut Pixmap, e: &Element, p: &PictureGeom, pictures: &dyn PictureSource, ts: Affine) {
     let r = p.rect.normalized();
     let Some(rect_path) = rect_path(&r) else { return };
-    if e.style.shadow {
-        draw_shadow(pixmap, &rect_path, ts, e.opacity);
-    }
     let Some(picture) = pictures.picture(&p.src) else {
         // Not here yet (or not decodable): a placeholder.
         pixmap.fill_path(&rect_path, &paint_of(Color::rgb(0xe0, 0xe0, 0xe0), e.opacity), FillRule::Winding, ts, None);

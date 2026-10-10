@@ -16,14 +16,24 @@
 //!   tiny-skia, with one bundled font (Noto Sans, SIL OFL 1.1,
 //!   `fonts/OFL.txt`).
 //! - [`BoardView`]: the raster cache the board view paints from, after
-//!   rinch's `paint` example (contract spike 1).
+//!   rinch's `paint` example (contract spike 1), with a per-viewer grid.
+//! - [`Element::hits`], [`BoardSnapshot::hit_precise`],
+//!   [`BoardSnapshot::within`]: hit testing against painted geometry.
+//! - [`ViewOptions`]: a viewer's choices (color by author, show everything,
+//!   card titles), carried by the snapshot.
+//! - [`render_area`], [`render_svg`]: export of a part of a board, as pixels
+//!   (PNG, JPEG) or as SVG.
 
 pub mod doc;
+mod hit;
 pub mod model;
+pub mod options;
 pub mod order;
+mod paint;
 pub mod render;
 pub mod snapshot;
 mod spatial;
+pub mod svg;
 pub mod text;
 pub mod view;
 
@@ -32,11 +42,14 @@ pub use doc::{
     BOARD_KEY,
 };
 pub use model::*;
+pub use options::{author_color, CardLabel, ViewOptions, UNAUTHORED_COLOR};
 pub use render::{
-    draw_region, render, render_extent, NoPictures, Picture, PictureSource, Rendered, RgbaImage, View,
+    draw_region, render, render_area, render_extent, selection_bounds, NoPictures, Picture, PictureSource, Rendered,
+    RgbaImage, View, MAX_EXTENT_PX,
 };
 pub use snapshot::{BoardSnapshot, Element, Layer};
-pub use view::BoardView;
+pub use svg::render_svg;
+pub use view::{grid_color, BoardView};
 
 /// The renderer's pixel types, for callers that keep a pixmap.
 pub use tiny_skia;

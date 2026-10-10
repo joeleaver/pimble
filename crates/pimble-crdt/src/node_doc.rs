@@ -427,11 +427,42 @@ impl NodeDoc {
     /// Every `pimble:` link in the content, in document order
     /// (docs/LINKS_CONTRACT.md "Where a link lives"). `[]` when there is no
     /// projection yet.
+    ///
+    /// A board's node cards are links too (docs/IMAGE_MARKUP_CONTRACT.md
+    /// section 4, "node card": "it is a `pimble:` link, so it ... counts as a
+    /// backlink"): after the content's links come the cards of the node's own
+    /// board and of the boards of marked-up pictures in its text, path
+    /// `f:board/<element>` or `f:boards/<board>/<element>`, the card's title
+    /// as the text.
     pub fn links(&self) -> Vec<LinkRef> {
-        if !self.has_projection() {
-            return Vec::new();
+        let mut out = if self.has_projection() {
+            project(&self.save(), "NodeDoc::links").map(|model| links_of_model(&model)).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        self.board_card_links(&mut out);
+        out
+    }
+
+    /// The node cards on this node's boards, in element id order per board.
+    fn board_card_links(&self, out: &mut Vec<LinkRef>) {
+        let txn = self.doc.transact();
+        if let Some(Out::YMap(board)) = self.data.get(&txn, BOARD) {
+            board_cards(&txn, &board, "f:board", out);
         }
-        project(&self.save(), "NodeDoc::links").map(|model| links_of_model(&model)).unwrap_or_default()
+        if let Some(Out::YMap(boards)) = self.data.get(&txn, BOARDS) {
+            let mut ids: Vec<(String, MapRef)> = boards
+                .iter(&txn)
+                .filter_map(|(id, out)| match out {
+                    Out::YMap(map) => Some((id.to_string(), map)),
+                    _ => None,
+                })
+                .collect();
+            ids.sort_by(|a, b| a.0.cmp(&b.0));
+            for (id, board) in ids {
+                board_cards(&txn, &board, &format!("f:boards/{id}"), out);
+            }
+        }
     }
 
     /// [`NodeDoc::links`] of a serialized document.
@@ -1056,6 +1087,34 @@ fn board_texts<T: ReadTxn>(txn: &T, board: &MapRef, prefix: &str, units: &mut Ve
     }
 }
 
+/// One link per node card of `board` whose link is a `pimble:` URL, in
+/// element id order.
+fn board_cards<T: ReadTxn>(txn: &T, board: &MapRef, prefix: &str, out: &mut Vec<LinkRef>) {
+    let Some(Out::YMap(elements)) = board.get(txn, "elements") else { return };
+    let mut found: Vec<(String, LinkRef)> = Vec::new();
+    for (id, element) in elements.iter(txn) {
+        let Out::YMap(element) = element else { continue };
+        if string_value(element.get(txn, "kind")).as_deref() != Some("card") {
+            continue;
+        }
+        let href = match element.get(txn, "geom") {
+            Some(Out::Any(Any::Map(geom))) => match geom.get("link") {
+                Some(Any::String(s)) => s.to_string(),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let Some(target) = pimble_core::PimbleUrl::parse(&href) else { continue };
+        let text = match element.get(txn, "text") {
+            Some(Out::YText(t)) => t.get_string(txn),
+            _ => String::new(),
+        };
+        found.push((id.to_string(), LinkRef { target, path: format!("{prefix}/{id}"), text }));
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    out.extend(found.into_iter().map(|(_, link)| link));
+}
+
 // ── JSON in and out of the `data` root ──────────────────────────────────
 
 /// A JSON value as something to insert: objects and arrays as nested shared
@@ -1401,5 +1460,33 @@ mod tests {
         local.set_deleted(None).unwrap();
         let remote_diff = remote.diff_since(&local.state_vector()).unwrap();
         assert!(local.diff_if_peer_lacks_it(&remote.state_vector(), &remote_diff).unwrap().is_some());
+    }
+
+    /// A node card on a board is a link (docs/IMAGE_MARKUP_CONTRACT.md
+    /// section 4), so the boards that point at a node count in its backlinks.
+    #[test]
+    fn a_board_node_card_is_a_link() {
+        let mut doc = NodeDoc::new();
+        doc.init("board", "Board", None, T0).unwrap();
+        let target = pimble_core::PimbleUrl { store: pimble_core::StoreId::new(), node: id(), anchor: None };
+        {
+            let data = doc.data_root();
+            let mut txn = doc.ydoc().transact_mut();
+            let board: MapRef = data.insert(&mut txn, "board", MapPrelim::default());
+            let elements: MapRef = board.insert(&mut txn, "elements", MapPrelim::default());
+            let card: MapRef = elements.insert(&mut txn, "c1", MapPrelim::default());
+            card.insert(&mut txn, "kind", "card");
+            let geom: HashMap<String, Any> =
+                [("link".to_string(), Any::String(target.to_string().into())), ("x".to_string(), Any::Number(0.0))].into();
+            card.insert(&mut txn, "geom", Any::Map(geom.into()));
+            card.insert(&mut txn, "text", TextPrelim::new("Target"));
+            let pen: MapRef = elements.insert(&mut txn, "p1", MapPrelim::default());
+            pen.insert(&mut txn, "kind", "pen");
+        }
+        let links = NodeDoc::links_of(&doc.save());
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, target);
+        assert_eq!(links[0].path, "f:board/c1");
+        assert_eq!(links[0].text, "Target");
     }
 }

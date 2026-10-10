@@ -5005,6 +5005,7 @@ dependencies = [
 name = "pimble-board"
 version = "0.9.0"
 dependencies = [
+ "base64 0.22.1",
  "image",
  "pimble-crdt",
  "thiserror 2.0.17",

@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use tiny_skia::{BlendMode, FilterQuality, Pixmap, PixmapPaint, Transform as Affine};
 
 use crate::model::*;
+use crate::options::ViewOptions;
 use crate::render::{draw_region, stroke_paint, stroke_path, tiny_color, PictureSource, View};
 use crate::doc::{Board, Changes};
 use crate::snapshot::{id_hash, BoardSnapshot};
@@ -77,6 +78,8 @@ pub struct BoardView {
     /// Per element (by a hash of its id): (fingerprint, bounds, global),
     /// from the last snapshot.
     seen: HashMap<u64, (u64, Rect, bool)>,
+    /// Grid spacing in board units, when this viewer shows a grid.
+    grid: Option<f32>,
 }
 
 impl BoardView {
@@ -97,6 +100,7 @@ impl BoardView {
             frame_dirty: true,
             live: None,
             seen: HashMap::new(),
+            grid: None,
         }
     }
 
@@ -124,6 +128,44 @@ impl BoardView {
     pub fn set_background(&mut self, background: Color) {
         self.background = Color { a: 255, ..background };
         self.invalidate_all();
+    }
+
+    /// Show a grid every `spacing` board units under the elements (this
+    /// viewer's choice, not the document's), or none. Zoomed out so far that
+    /// lines would be closer than 8 pixels, the spacing is multiplied by 5
+    /// until they are not.
+    pub fn set_grid(&mut self, spacing: Option<f32>) {
+        let spacing = spacing.filter(|s| s.is_finite() && *s > 0.0);
+        if spacing != self.grid {
+            self.grid = spacing;
+            self.invalidate_all();
+        }
+    }
+
+    pub fn grid(&self) -> Option<f32> {
+        self.grid
+    }
+
+    /// Draw the board with other view options ([`ViewOptions`]): the
+    /// snapshot is read again from `board` with them, and what changed is
+    /// re-rendered. [`BoardView::update`] keeps them.
+    pub fn set_options(&mut self, options: ViewOptions, board: &Board) {
+        let old = std::mem::replace(&mut self.snapshot, BoardSnapshot::empty());
+        let global = old.options().color_by_author != options.color_by_author || old.options().show_all != options.show_all;
+        let next = old.with_options(options, board);
+        self.set_snapshot(next);
+        if global {
+            self.invalidate_all();
+        }
+    }
+
+    /// The background of a cache region: the background color, and the grid
+    /// when one shows.
+    fn fill_background(&self, pixmap: &mut Pixmap, view: &View) {
+        pixmap.fill(tiny_color(self.background, 1.0));
+        if let Some(spacing) = self.grid {
+            draw_grid(pixmap, view, spacing, grid_color(self.background));
+        }
     }
 
     // ── The camera ───────────────────────────────────────────────────────
@@ -351,8 +393,8 @@ impl BoardView {
     fn rebuild_cache(&mut self, pictures: &dyn PictureSource) {
         let (origin, w, h) = self.cache_rect_for_view();
         let mut pixmap = Pixmap::new(w, h).expect("cache size");
-        pixmap.fill(tiny_color(self.background, 1.0));
         let view = View::new(origin.x, origin.y, self.zoom);
+        self.fill_background(&mut pixmap, &view);
         draw_region(&mut pixmap, &self.snapshot, pictures, &view);
         if let Some(live) = &self.live {
             stamp(&mut pixmap, &view, &live.kind, &live.style, &live.points);
@@ -363,7 +405,7 @@ impl BoardView {
 
     /// Re-render `rect` of the cache from the document.
     fn render_into_cache(&mut self, rect: Rect, pictures: &dyn PictureSource) {
-        let Some(cache) = self.cache.as_mut() else { return };
+        let Some(cache) = self.cache.as_ref() else { return };
         let Some(r) = rect.intersect(&cache.board_rect()) else { return };
         let z = cache.zoom;
         let x0 = ((r.x - cache.origin.x) * z).floor().max(0.0) as i32;
@@ -375,14 +417,16 @@ impl BoardView {
         }
         let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
         let Some(mut tmp) = Pixmap::new(w, h) else { return };
-        tmp.fill(tiny_color(self.background, 1.0));
         let view = View::new(cache.origin.x + x0 as f32 / z, cache.origin.y + y0 as f32 / z, z);
+        self.fill_background(&mut tmp, &view);
         draw_region(&mut tmp, &self.snapshot, pictures, &view);
         if let Some(live) = &self.live {
             stamp(&mut tmp, &view, &live.kind, &live.style, &live.points);
         }
         let paint = PixmapPaint { opacity: 1.0, blend_mode: BlendMode::Source, quality: FilterQuality::Nearest };
-        cache.pixmap.draw_pixmap(x0, y0, tmp.as_ref(), &paint, Affine::identity(), None);
+        if let Some(cache) = self.cache.as_mut() {
+            cache.pixmap.draw_pixmap(x0, y0, tmp.as_ref(), &paint, Affine::identity(), None);
+        }
     }
 
     /// Move the cache so it covers the view again at the same zoom: copy
@@ -468,6 +512,67 @@ impl BoardView {
             let sy0 = (view.y - cache.origin.y) * cache.zoom;
             resample_nearest(&cache.pixmap, sx0, sy0, k, &mut self.frame, self.background);
         }
+    }
+}
+
+/// The grid's line color over `background`: a slightly darker shade of a
+/// light background, a slightly lighter one of a dark background.
+pub fn grid_color(background: Color) -> Color {
+    let luma = 0.299 * background.r as f32 + 0.587 * background.g as f32 + 0.114 * background.b as f32;
+    let shift = |c: u8| -> u8 {
+        if luma > 128.0 {
+            (c as f32 * 0.9).round() as u8
+        } else {
+            (c as f32 + (255.0 - c as f32) * 0.1).round() as u8
+        }
+    };
+    Color::rgb(shift(background.r), shift(background.g), shift(background.b))
+}
+
+/// The grid spacing actually drawn at `zoom`: `spacing` times 5 until lines
+/// are at least 8 pixels apart.
+pub(crate) fn grid_step(spacing: f32, zoom: f32) -> f32 {
+    let mut s = spacing;
+    while s * zoom < 8.0 && s.is_finite() {
+        s *= 5.0;
+    }
+    s
+}
+
+/// One-pixel grid lines over `pixmap` seen through `view`, at board
+/// multiples of the spacing, so every region of one cache lines up.
+fn draw_grid(pixmap: &mut Pixmap, view: &View, spacing: f32, color: Color) {
+    let step = grid_step(spacing, view.scale);
+    if !(step.is_finite() && step > 0.0) {
+        return;
+    }
+    let (w, h) = (pixmap.width(), pixmap.height());
+    let r = view.board_rect(w, h);
+    let mut paint = tiny_skia::Paint::default();
+    paint.set_color(tiny_color(color, 1.0));
+    paint.anti_alias = false;
+    // A hair over the line's exact pixel so float error in a region's
+    // origin never moves a line by one pixel between regions.
+    let px = |b: f32, o: f32| ((b - o) * view.scale + 1e-3).floor();
+    let mut k = (r.x / step).floor();
+    while k * step <= r.right() {
+        let x = px(k * step, view.x);
+        if x >= 0.0 && x < w as f32 {
+            if let Some(rect) = tiny_skia::Rect::from_xywh(x, 0.0, 1.0, h as f32) {
+                pixmap.fill_rect(rect, &paint, Affine::identity(), None);
+            }
+        }
+        k += 1.0;
+    }
+    let mut k = (r.y / step).floor();
+    while k * step <= r.bottom() {
+        let y = px(k * step, view.y);
+        if y >= 0.0 && y < h as f32 {
+            if let Some(rect) = tiny_skia::Rect::from_xywh(0.0, y, w as f32, 1.0) {
+                pixmap.fill_rect(rect, &paint, Affine::identity(), None);
+            }
+        }
+        k += 1.0;
     }
 }
 

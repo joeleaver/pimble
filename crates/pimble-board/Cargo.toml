@@ -11,6 +11,8 @@ pimble-crdt = { workspace = true }
 yrs = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
+# Pictures embedded in SVG export as data URIs.
+base64 = { workspace = true }
 # Rendering: pure Rust, runs in wasm. tiny-skia without its PNG codec (pictures are
 # decoded by `image`, the same build pimble-image uses).
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
