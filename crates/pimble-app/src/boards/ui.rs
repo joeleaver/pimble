@@ -64,6 +64,28 @@ pub(super) fn focus_text_input(pane: PaneId) {
     focus_in_browser("textarea.pimble-board__text-input");
 }
 
+/// Typing ended: the text input lets go of the keyboard. (On the desktop the
+/// board hears keys again from its next press: rinch has no way to give a
+/// surface the keyboard from code, only a press on it does.)
+pub(super) fn release_text_input(pane: PaneId) {
+    if let Some((doc_key, node)) = TEXT_INPUTS.with(|t| t.borrow()[pane.index()]) {
+        rinch::core::post_release_request(doc_key, node);
+    }
+    #[cfg(not(feature = "native"))]
+    {
+        use wasm_bindgen::JsCast;
+        if let Some(el) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.active_element())
+            .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+        {
+            if el.class_name().contains("pimble-board__text-input") {
+                let _ = el.blur();
+            }
+        }
+    }
+}
+
 /// The browser: focus the shown element matching `selector` once the press
 /// that asked for it is over (the canvas keeps the focus of its own press,
 /// and rinch-web's focus request does not reach a field it shows that late).

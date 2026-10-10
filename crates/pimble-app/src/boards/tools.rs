@@ -1740,6 +1740,7 @@ pub(crate) fn end_text(store: AppStore, pane: PaneId) {
     let ui = store.pane(pane).board_ui;
     ui.text_box.set(None);
     rinch::core::clear_keyboard_interceptor();
+    ui::release_text_input(pane);
     if let Some(id) = edit.id {
         let empty = with_session(pane, |s| s.snapshot().get(&id).map(|e| e.raw.text.as_deref().unwrap_or("").trim().is_empty())).flatten();
         if empty == Some(true) && edit.kind == Kind::Text {
