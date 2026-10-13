@@ -1,5 +1,42 @@
 # Next session: start here
 
+**2026-10-10: boards, on branch `boards`** (24 commits on `master`, not merged, not
+pushed), on rinch `main` 2ae3577. Contract: docs/IMAGE_MARKUP_CONTRACT.md (every decision
+Joe made on 2026-10-09 is in its "Decisions" list; each wave's "Built in ..." section at
+the end says what exists, how it was verified and its gaps).
+
+- **What it is**: image nodes, whiteboards and markup on pictures in text are one thing,
+  a board (`node_type = "board"`, `pimble-board` crate: the yrs board document in the
+  node's `data`, a tiny-skia renderer, a raster cache drawn into incrementally like
+  rinch's `paint` example). Infinite canvas; a board renders as its visible extent.
+  Attribution from the signed-in account; layers for organization; markup show/hide is
+  one shared setting on the node.
+- **Built and verified** (isolated desktop app on 7473 and Chromium on the local stack;
+  Firefox never run): waves 1-4. Board nodes made from the tree (New Whiteboard, New
+  Image..., drop, paste); the board view in a pane; every tool of waves 2-3 (shapes,
+  text, steps, highlighter, eraser, sticky notes, connectors, frames, groups, node cards,
+  grid, navigator, layers panel, style panel, export to PNG/JPEG/SVG, Flatten); pen
+  pressure, pinch, wheel pan, capture (rinch#1502); marked-up pictures in text
+  (`data-board` on the image, the board in the host node's `data.boards`), board nodes
+  embedded in text (`pimble-board:` URLs, live), Convert to Image Node, the floating
+  controls.
+- **rinch**: #1500 #1501 #1502 #1503 #1518 merged. #1503 is a collab format change:
+  every device and the hosted server must run the new build together before anyone
+  marks up a picture in text. Joe, 2026-10-10: no Pimble concepts in rinch (#1500's
+  `board` attribute was replaced by a general `data-*` passthrough, #1518). Open rinch
+  issues from the reviews: #1504, #1505 (wheel sign differs desktop/web), #1506 (desktop
+  editor hover not cleared on window leave / wheel scroll).
+- **Next, in the order proposed to Joe** (not yet confirmed): (1) the leftovers: Escape
+  does not close a picture's "⋯" menu on the desktop and the open menu follows the
+  pointer to another picture; undo after Convert leaves the new image node; board
+  markup travels by copy/paste only within one window; a board dropped on text goes in
+  at the caret; boards in text not HiDPI-sharp; smart guides; line/arrow end handles;
+  the browser board picker's query is typed into the note; the toolbar wraps to two
+  rows. (2) Wave 5: callout, spotlight, crop tools; the MCP reading boards and
+  `render_board`. (3) Images waves 2 and 3 (pictures replicate), which Joe decided come
+  before boards ship across devices. Then merge `boards` and release (bump, tag; desktop,
+  web and hosted together because of #1503).
+
 **2026-10-09: v0.9.0, File > Import and background colors**, on rinch `main` (3c9958c,
 rinch#1481 `EditorHandle::blur` merged), with the keyboard following the pane focus.
 

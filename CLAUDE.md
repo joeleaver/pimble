@@ -283,6 +283,27 @@ press is heard by an element covering its split's whole space with `pointer-even
 element bounds on both backends: rinch-web feeds no `bounds_signal`. rinch gives a percent
 `Drag`'s `on_end` raw pixels, so the last `on_move` is the drag's answer.
 
+### Boards (built 2026-10-09/10, branch `boards`, not merged)
+
+Contract: `docs/IMAGE_MARKUP_CONTRACT.md` (decisions at the end; "Built in ..." sections
+per wave). Image nodes, whiteboards and markup on pictures in text are one model, a
+**board**: a yrs map in a node document's `data` (`data.board` for a board node,
+`node_type = "board"`; `data.boards.<id>` for a picture in text, named by the image
+atom's `data-board` attribute, `text_boards::BOARD_ATTR`). Elements in Maps keyed by
+id (never moved in Arrays), fractional `order`, layers for organization only, author
+stamped from the signed-in account (none when signed out), `markup_visible` shared on
+the node. Every canvas is infinite; a board renders as its visible extent trimmed to
+visible pixels (a page is optional). `crates/pimble-board`: the document API
+(`Board::of_node`/`in_text`, `edit(Stamp, |BoardTxn|)` answering the yrs update to send
+through `applyEdit`), `BoardSnapshot`, a tiny-skia renderer, `BoardView` (a raster cache
+drawn into incrementally, frames at the surface's size and opaque, as rinch's `paint`
+example does), SVG export. The app shows a board in a pane through a rinch
+`RenderSurface` with pointer events (pressure, pinch, capture), and pictures in text
+through `set_image_source` (`<blob>#board=<id>`) and the `pimble-blob:` /
+`pimble-board:` loaders. Pictures do not replicate yet (images waves 2-3), and boards do
+not ship across devices until they do (Joe). Never put a Pimble concept into rinch:
+propose a general mechanism (Joe, 2026-10-10).
+
 ### Tree appearance (done 2026-09-15)
 
 A node's custom icon and colour live in `metadata.custom` under
@@ -569,6 +590,7 @@ vault-link start), so a reopened replica no longer reports a placeholder root.
 - `web/src/backend.rs` - the browser backend (token, connection, reconnect)
 - `jkbase.toml`, `docs/DEPLOY.md` - deployment
 - `crates/pimble-app/src/events.rs` - `BackendEvent` -> UI state
+- `docs/IMAGE_MARKUP_CONTRACT.md`, `crates/pimble-board/`, `crates/pimble-app/src/boards.rs`, `boards/`, `text_boards.rs` - boards: image nodes, whiteboards, markup on pictures in text
 - `crates/pimble-app/src/appearance.rs` - tree icon and colour choices, name lookup, dark-theme legibility
 
 ## Build & Run
