@@ -181,7 +181,15 @@ fn origin(pane: PaneId) -> String {
 
 fn undo_options() -> yrs::undo::Options<()> {
     // One edit is one undo step: a cell committed, a column changed.
-    yrs::undo::Options { capture_timeout_millis: 0, ..Default::default() }
+    // Spelled out: the browser build of yrs has no default clock.
+    yrs::undo::Options {
+        capture_timeout_millis: 0,
+        tracked_origins: Default::default(),
+        capture_transaction: None,
+        timestamp: std::sync::Arc::new(|| crate::boards::now_ms() as u64),
+        init_undo_stack: Vec::new(),
+        init_redo_stack: Vec::new(),
+    }
 }
 
 /// Show sheet node `node_id` in pane `pane`.

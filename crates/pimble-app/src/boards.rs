@@ -421,7 +421,7 @@ pub(crate) fn current_author() -> Option<Author> {
 }
 
 /// Milliseconds since the epoch, on both targets.
-fn now_ms() -> f64 {
+pub(crate) fn now_ms() -> f64 {
     #[cfg(feature = "native")]
     {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0)

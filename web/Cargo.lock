@@ -1784,6 +1784,7 @@ dependencies = [
  "pimble-image",
  "pimble-import",
  "pimble-rpc",
+ "pimble-sheet",
  "rinch",
  "rinch-editor-core",
  "rinch-tabler-icons",
@@ -1910,6 +1911,19 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "uuid",
+]
+
+[[package]]
+name = "pimble-sheet"
+version = "0.9.0"
+dependencies = [
+ "chrono",
+ "pimble-core",
+ "pimble-crdt",
+ "serde",
+ "thiserror 2.0.20",
+ "uuid",
+ "yrs",
 ]
 
 [[package]]
