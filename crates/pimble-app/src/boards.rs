@@ -574,7 +574,7 @@ struct Session {
     /// The tool this board opens on has been picked (once its board is here).
     tool_chosen: bool,
     /// The board view is over a note's text, marking up one of its pictures
-    /// (contract section 2): the board is `data.boards.<id>` of the note.
+    /// (contract section 2): the board is `data["board:<id>"]` of the note.
     markup: Option<Markup>,
 }
 
@@ -939,7 +939,7 @@ fn first_mark(store: AppStore, pane: PaneId, held: (StoreId, NodeId)) {
 
 /// "Mark Up..." on a picture in pane `pane`'s text (contract section 2):
 /// the board view over the pane, on the picture's board in the note's
-/// `data.boards`. A picture with no board yet gets one in this pane's copy
+/// `data["board:<id>"]`. A picture with no board yet gets one in this pane's copy
 /// of the note, shown at once and written with the first mark.
 pub(crate) fn start_markup(store: AppStore, pane: PaneId, store_id: StoreId, node_id: NodeId, src: &str, pos: usize, board: Option<String>) {
     let Some(blob) = BlobUrl::parse(src) else { return };

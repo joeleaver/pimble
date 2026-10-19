@@ -108,7 +108,7 @@ attribute: rinch keeps any an app sets on an image, round-trips them through cop
 paste, writes them on the `<img>` and merges them per attribute between collaborators
 (joeleaver/rinch#1518, which replaced the `board` attribute #1500 had put into rinch;
 Joe, 2026-10-10: Pimble concepts stay out of rinch). The board lives in **the host node's**
-`data.boards.<board id>`, with the picture as an element on it, so it is co-edited
+`data["board:<board id>"]` (one key of the data root per board, never a map made on first use: two devices marking up their first pictures while apart would each make it, and one would be lost), with the picture as an element on it, so it is co-edited
 with that node, replicates with it, is shared with whoever may read that node, and is
 undone by the same undo.
 
@@ -500,7 +500,7 @@ the raster cache, native and wasm32, no UI and no rinch. The app is not wired ye
 
 **The document** (`Board`, `BoardTxn`, `doc.rs`). A `Board` is a handle on where a board
 lives: `Board::of_node(&NodeDoc)` (`data.board`), `Board::in_text(&NodeDoc, id)`
-(`data.boards.<id>`), `Board::standalone()`. Writes go through `board.edit(stamp, |t| ...)`,
+(`data["board:<id>"]`), `Board::standalone()`. Writes go through `board.edit(stamp, |t| ...)`,
 one transaction answering `Edited { result, update }`: the update is an ordinary yrs update
 of the node's document, sent with `applyEdit` (there is no other way in). `BoardTxn`:
 `create`, `add_element(NewElement)`, `append_points`, `replace_points`, `set_geom`,
@@ -980,7 +980,7 @@ merging one by one). Shared `pimble-app` code for the desktop and the browser, o
 - **Mark Up...**: the picture's menu (a "⋯" button in the floating controls) or a
   double-click on the picture opens the board view over the pane (`PaneState::markup`; the
   pane's editor stays mounted, hidden; the board toolbar shows) with **Done**. The board is
-  `data.boards.<id>` of the note. A picture with no board gets one in the pane's copy of the
+  `data["board:<id>"]` of the note. A picture with no board gets one in the pane's copy of the
   note when the view opens (the picture at one unit per pixel in a locked "Picture" layer
   and "Layer 1" above, as an image node starts), so opening and closing writes nothing; the
   **first mark** sends that board, then writes the atom's `data-board` (`SetNodeAttrStep`
@@ -1034,7 +1034,7 @@ and copies the board (found in any note this window holds) into the pasting pane
 turn later; the same note too. A board this window does not hold (copied in another window
 or app) cannot come along: the picture is pasted without it. There is no Pimble MIME part:
 rinch has no copy hook, so the board travels by id within a window, not on the clipboard.
-`transplantNode` carries `data.boards` with the content (above).
+`transplantNode` carries each `board:<id>` key of `data` with the content (above).
 
 **Verified (2026-10-10):**
 - Tests: `pimble-core` (BoardUrl), `pimble-crdt` (155, incl. an embed is a link, a

@@ -450,18 +450,8 @@ impl NodeDoc {
         if let Some(Out::YMap(board)) = self.data.get(&txn, BOARD) {
             board_cards(&txn, &board, "f:board", out);
         }
-        if let Some(Out::YMap(boards)) = self.data.get(&txn, BOARDS) {
-            let mut ids: Vec<(String, MapRef)> = boards
-                .iter(&txn)
-                .filter_map(|(id, out)| match out {
-                    Out::YMap(map) => Some((id.to_string(), map)),
-                    _ => None,
-                })
-                .collect();
-            ids.sort_by(|a, b| a.0.cmp(&b.0));
-            for (id, board) in ids {
-                board_cards(&txn, &board, &format!("f:boards/{id}"), out);
-            }
+        for (id, board) in text_boards(&txn, &self.data) {
+            board_cards(&txn, &board, &format!("f:boards/{id}"), out);
         }
     }
 
@@ -685,7 +675,7 @@ impl NodeDoc {
     /// element with text (text elements, sticky notes, text inside shapes,
     /// callouts, connector labels, frame names), from the board node's own
     /// board (`data.board`) and from the boards of marked-up pictures in its
-    /// text (`data.boards.<id>`). One `Field` unit per element, named
+    /// text (`data["board:<id>"]`). One `Field` unit per element, named
     /// `board.<kind>`, its path `f:board/<element>` or
     /// `f:boards/<board>/<element>`. Only where text lives is known here;
     /// the schema itself is pimble-board's.
@@ -695,18 +685,8 @@ impl NodeDoc {
         if let Some(Out::YMap(board)) = self.data.get(&txn, BOARD) {
             board_texts(&txn, &board, "f:board", &mut units);
         }
-        if let Some(Out::YMap(boards)) = self.data.get(&txn, BOARDS) {
-            let mut ids: Vec<(String, MapRef)> = boards
-                .iter(&txn)
-                .filter_map(|(id, out)| match out {
-                    Out::YMap(map) => Some((id.to_string(), map)),
-                    _ => None,
-                })
-                .collect();
-            ids.sort_by(|a, b| a.0.cmp(&b.0));
-            for (id, board) in ids {
-                board_texts(&txn, &board, &format!("f:boards/{id}"), &mut units);
-            }
+        for (id, board) in text_boards(&txn, &self.data) {
+            board_texts(&txn, &board, &format!("f:boards/{id}"), &mut units);
         }
         units
     }
@@ -1103,8 +1083,24 @@ fn string_value(out: Option<Out>) -> Option<String> {
 
 /// A board node's board, under `data`.
 const BOARD: &str = "board";
-/// The boards of marked-up pictures in a node's text, under `data`, by id.
-const BOARDS: &str = "boards";
+/// The prefix of the keys, in `data`, of the boards of marked-up pictures in
+/// a node's text: `board:<id>`, one key of the data root per board, so two
+/// devices marking up their first pictures while apart never write two maps
+/// to one key.
+const TEXT_BOARD_PREFIX: &str = "board:";
+
+/// The boards of marked-up pictures in a node's text, by id, in id order.
+fn text_boards<T: ReadTxn>(txn: &T, data: &MapRef) -> Vec<(String, MapRef)> {
+    let mut boards: Vec<(String, MapRef)> = data
+        .iter(txn)
+        .filter_map(|(key, out)| match (key.strip_prefix(TEXT_BOARD_PREFIX), out) {
+            (Some(id), Out::YMap(map)) => Some((id.to_string(), map)),
+            _ => None,
+        })
+        .collect();
+    boards.sort_by(|a, b| a.0.cmp(&b.0));
+    boards
+}
 
 /// One unit per element of `board` with text, in element id order.
 fn board_texts<T: ReadTxn>(txn: &T, board: &MapRef, prefix: &str, units: &mut Vec<IndexUnit>) {

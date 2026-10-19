@@ -38,7 +38,7 @@ pub mod text;
 pub mod view;
 
 pub use doc::{
-    Board, BoardError, BoardTxn, BoardWatch, ChangedElements, Changes, Edited, RawBoard, RawElement, RawLayer, BOARDS_KEY,
+    Board, BoardError, BoardTxn, BoardWatch, ChangedElements, Changes, Edited, RawBoard, RawElement, RawLayer, text_board_key, TEXT_BOARD_PREFIX,
     BOARD_KEY,
 };
 pub use model::*;

@@ -8,7 +8,7 @@
 //!
 //! * a picture whose atom carries a `data-board` id asks for
 //!   `pimble-blob:<store>/<blob>#board=<id>`, and the loader answers with the
-//!   board in the host node's `data.boards.<id>` rendered (its visible extent,
+//!   board in the host node's `data["board:<id>"]` rendered (its visible extent,
 //!   trimmed);
 //! * a board node embedded in text has `src` `pimble-board:<store>/<node>`
 //!   (`#frame=<id>` for one frame), and the loader answers with that board
@@ -44,7 +44,7 @@ use rinch::prelude::*;
 use rinch_editor_core::{AttrValue, Attrs, Fragment, Node as EditorNode, SetNodeAttrStep};
 use rinch_tabler_icons::TablerIcon;
 
-/// The picture attribute naming its board in the host node's `data.boards`
+/// The picture attribute naming its board in the host node's `data` root (`board:<id>`)
 /// (contract section 2). A `data-*` attribute, which rinch keeps, writes on
 /// the `<img>` and merges per attribute between collaborators; rinch knows
 /// nothing of what it means.
@@ -1535,7 +1535,7 @@ mod tests {
         crate::boards::start_markup(store, P[0], store_id, node_id, &src, pos, None);
         assert!(store.pane(P[0]).markup.get());
         assert!(commands.try_iter().all(|c| !matches!(c, BackendCommand::BroadcastChanges { .. })), "opening writes nothing");
-        assert!(HOSTS.with(|h| h.borrow()[&(store_id, node_id)].doc.data_json().get("boards").is_none()));
+        assert!(HOSTS.with(|h| h.borrow()[&(store_id, node_id)].doc.data_json().as_object().is_none_or(|d| d.keys().all(|k| !k.starts_with(pimble_board::TEXT_BOARD_PREFIX)))));
 
         crate::boards::mark_for_test(store, P[0]);
         let sent: Vec<BackendCommand> = commands.try_iter().collect();

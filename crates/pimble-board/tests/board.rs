@@ -539,7 +539,7 @@ fn undo_takes_back_my_edits_and_never_a_collaborators() {
 }
 
 #[test]
-fn boards_of_pictures_in_text_live_under_boards_and_are_searchable() {
+fn boards_of_pictures_in_text_live_under_their_own_keys_and_are_searchable() {
     let doc = node();
     let st = Stamp::new(None, T0);
     let first = Board::in_text(&doc, "b1");
@@ -555,7 +555,7 @@ fn boards_of_pictures_in_text_live_under_boards_and_are_searchable() {
     assert_eq!(units.len(), 1);
     assert!(units[0].path.starts_with("f:boards/b1/"));
     assert_eq!(units[0].text, "look here");
-    assert!(doc.data_json()["boards"]["b1"]["elements"].is_object());
+    assert!(doc.data_json()["board:b1"]["elements"].is_object());
 }
 
 /// What a snapshot brought up to date from a watch reads is what a fresh
@@ -670,4 +670,26 @@ fn a_board_copied_into_a_new_one_is_the_same_board_and_then_its_own() {
     copy.edit(Stamp::new(Some(&joe()), T2), |t| t.add_element(rect_el(0.0, 0.0, 1.0, 1.0))).into_result().unwrap();
     assert_eq!(copy.read().unwrap().elements.len(), raw.elements.len() + 1);
     assert_eq!(marked.read().unwrap().elements.len(), raw.elements.len());
+}
+
+/// Two people marking up the first pictures of one note while apart both keep
+/// their boards: each board is its own key of the data root, so neither
+/// writes a container the other also made (a `data.boards` map made on first
+/// use lost one side's boards).
+#[test]
+fn first_boards_in_text_made_apart_both_survive_the_merge() {
+    let st = Stamp::new(None, T0);
+    let mut mine = node();
+    let mut theirs = peer(&mine);
+    let a = Board::in_text(&mine, "mine");
+    a.create(st).unwrap();
+    a.add_element(st, rect_el(0.0, 0.0, 10.0, 10.0)).unwrap();
+    let b = Board::in_text(&theirs, "theirs");
+    b.create(st).unwrap();
+    b.add_element(st, rect_el(5.0, 5.0, 10.0, 10.0)).unwrap();
+    sync(&mut mine, &mut theirs);
+    for doc in [&mine, &theirs] {
+        assert_eq!(Board::in_text(doc, "mine").snapshot().elements.len(), 1);
+        assert_eq!(Board::in_text(doc, "theirs").snapshot().elements.len(), 1);
+    }
 }

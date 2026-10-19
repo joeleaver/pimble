@@ -49,9 +49,18 @@ use crate::order;
 
 /// The key of a board node's board in its `data` root.
 pub const BOARD_KEY: &str = "board";
-/// The key, in a node's `data` root, of the map holding the boards of
-/// marked-up pictures in its text, by board id (contract section 2).
-pub const BOARDS_KEY: &str = "boards";
+/// The prefix of the keys, in a node's `data` root, of the boards of
+/// marked-up pictures in its text: `board:<board id>` (contract section 2).
+/// Each board is a key of the data root itself, never an entry of a map made
+/// on first use: two devices marking up their first pictures in one note
+/// while apart would each make that map, and yrs would keep only one of them
+/// (and its boards).
+pub const TEXT_BOARD_PREFIX: &str = "board:";
+
+/// The `data` key of the board of a marked-up picture in text.
+pub fn text_board_key(board_id: &str) -> String {
+    format!("{TEXT_BOARD_PREFIX}{board_id}")
+}
 /// The schema version written to `v`.
 pub const VERSION: i64 = 1;
 /// The first layer's name.
@@ -144,9 +153,9 @@ impl Board {
     }
 
     /// The board of a marked-up picture in a node's text:
-    /// `data.boards.<board_id>` (contract section 2).
+    /// `data["board:<board_id>"]` (contract section 2).
     pub fn in_text(node: &NodeDoc, board_id: &str) -> Self {
-        Self::new(node.ydoc().clone(), node.data_root(), &[BOARDS_KEY, board_id])
+        Self::new(node.ydoc().clone(), node.data_root(), &[&text_board_key(board_id)])
     }
 
     /// A board in a document of its own (root map `data`, key `board`), for

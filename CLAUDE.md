@@ -288,7 +288,7 @@ element bounds on both backends: rinch-web feeds no `bounds_signal`. rinch gives
 Contract: `docs/IMAGE_MARKUP_CONTRACT.md` (decisions at the end; "Built in ..." sections
 per wave). Image nodes, whiteboards and markup on pictures in text are one model, a
 **board**: a yrs map in a node document's `data` (`data.board` for a board node,
-`node_type = "board"`; `data.boards.<id>` for a picture in text, named by the image
+`node_type = "board"`; `data["board:<id>"]` for a picture in text, named by the image
 atom's `data-board` attribute, `text_boards::BOARD_ATTR`). Elements in Maps keyed by
 id (never moved in Arrays), fractional `order`, layers for organization only, author
 stamped from the signed-in account (none when signed out), `markup_visible` shared on

@@ -2415,8 +2415,7 @@ mod tests {
             let doc = s.tree.doc_mut(s.x).unwrap();
             let data = doc.data_root();
             let mut txn = doc.ydoc().transact_mut();
-            let boards: MapRef = data.insert(&mut txn, "boards", MapPrelim::default());
-            let board: MapRef = boards.insert(&mut txn, "b1", MapPrelim::default());
+            let board: MapRef = data.insert(&mut txn, "board:b1", MapPrelim::default());
             let mut geom = std::collections::HashMap::new();
             geom.insert("x".to_string(), Any::Number(1.5));
             board.insert(&mut txn, "geom", Any::Map(geom.into()));
@@ -2429,8 +2428,7 @@ mod tests {
         let new_x = s.tree.subtree_ids(new_a).unwrap()[1];
         let doc = s.tree.doc(new_x).unwrap();
         let txn = doc.ydoc().transact();
-        let Some(Out::YMap(boards)) = doc.data_root().get(&txn, "boards") else { panic!("no boards") };
-        let Some(Out::YMap(board)) = boards.get(&txn, "b1") else { panic!("no board") };
+        let Some(Out::YMap(board)) = doc.data_root().get(&txn, "board:b1") else { panic!("no board") };
         assert!(matches!(board.get(&txn, "geom"), Some(Out::Any(Any::Map(_)))), "a value written whole stays one");
         let Some(Out::YArray(points)) = board.get(&txn, "points") else { panic!("no points") };
         assert!(matches!(points.get(&txn, 0), Some(Out::Any(Any::Buffer(b))) if b.as_ref() == [1u8, 2, 3]));
