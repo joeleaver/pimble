@@ -304,6 +304,19 @@ through `set_image_source` (`<blob>#board=<id>`) and the `pimble-blob:` /
 not ship across devices until they do (Joe). Never put a Pimble concept into rinch:
 propose a general mechanism (Joe, 2026-10-10).
 
+### Explorer tree (wave 1 built 2026-10-19, branch `tree`, not merged)
+
+Contract: `docs/TREE_CONTRACT.md` (decisions answered by Joe 2026-10-19; four waves:
+drops, keyboard, multi-select, undo). A move's place is a `pimble_core::Place` (`First`,
+`Last`, `After(sibling)`), never an index, everywhere a move is made (`moveNode`,
+`transplantNode`, `Tree`, the CLI's `--first`/`--after`, MCP `after`/`first`). rinch's
+`Tree` owns the drag (`draggable`, `judge_drop`, `ondropchange`, `ondrop`; rinch branch
+`feat/tree-drop-places`, which the `Cargo.toml`s point at until it merges): before,
+inside or after a row, the depth at the end of a group from the pointer's indent column.
+`pimble-app/src/tree_drop.rs` `plan_drop` is the one judgement of a drop; the strip at the
+foot of the explorer (`AppStore::drop_hint`) says where it lands, or why not, before the
+release.
+
 ### Tree appearance (done 2026-09-15)
 
 A node's custom icon and colour live in `metadata.custom` under

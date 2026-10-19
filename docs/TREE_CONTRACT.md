@@ -337,10 +337,14 @@ deletes, creates, renames from the tree), cleared on restart.
   row's redraw, a refused drop beside a store row (red line, red sentence, nothing sent),
   "Where it is" sending nothing, Escape cancelling, nothing left dimmed after a drop, a row
   onto a whiteboard.
+- **Verified in the browser** (the local stack, Chromium, an encrypted store, so the web
+  vault client's move path): reorder, into a row (which opens), outdent over the row's own
+  bottom edge, the line and outline and the strip mid-drag ("Into Tree Test", "Where it
+  is", "In Tree Test, after Alpha"), nothing left drawn or dimmed after a drop. Firefox and
+  a member's read-only share were not run.
 - **Not built yet**: auto-scroll near the tree's edges (it belongs in rinch's drag
   machinery for every scroll container, a separate PR), the count badge (one row drags
-  until wave 3), selecting the moved rows after a drop, and the browser walk-through
-  (below, when run).
+  until wave 3), and selecting the moved rows after a drop.
 
 ## Out of scope
 
