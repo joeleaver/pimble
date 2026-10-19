@@ -3779,7 +3779,7 @@ impl PimbleApiServer for RpcHandler {
             .unwrap_or_else(|_| vec![request.node_id]);
 
         let (new_node_id, left_shares, edit) = manager
-            .move_node(request.store_id, request.node_id, request.new_parent_id, request.position)
+            .move_node(request.store_id, request.node_id, request.new_parent_id, request.place)
             .map_err(to_rpc_error)?;
 
         manager
@@ -3867,7 +3867,7 @@ impl PimbleApiServer for RpcHandler {
                         store_id: request.from_store_id,
                         node_id: request.node_id,
                         new_parent_id: request.new_parent_id,
-                        position: request.position,
+                        place: request.place,
                     },
                 )
                 .await?;
@@ -3892,7 +3892,7 @@ impl PimbleApiServer for RpcHandler {
         }
 
         let outcome = manager
-            .transplant_node(request.from_store_id, request.node_id, request.to_store_id, request.new_parent_id, request.position)
+            .transplant_node(request.from_store_id, request.node_id, request.to_store_id, request.new_parent_id, request.place)
             .map_err(to_rpc_error)?;
 
         manager.flush(request.from_store_id).await.map_err(to_rpc_error)?;
@@ -4934,6 +4934,7 @@ impl PimbleApiServer for RpcHandler {
 mod tests {
     use super::*;
     use pimble_crdt::Tree;
+    use pimble_core::Place;
 
     const T0: &str = "2026-09-18T10:00:00Z";
     const T1: &str = "2026-09-18T10:00:01Z";
@@ -5047,7 +5048,7 @@ mod tests {
 
         // Moved.
         let before = replica_of(&tree);
-        tree.move_node(x, q, None, T1).unwrap();
+        tree.move_node(x, q, Place::Last, T1).unwrap();
         let (b, a) = shapes(&before, &tree, x);
         assert!(matches!(
             derive_kinds(x, root, b.as_ref(), a.as_ref(), structural())[..],

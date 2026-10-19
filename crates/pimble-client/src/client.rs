@@ -11,7 +11,7 @@ use jsonrpsee::core::client::Client as RpcClient;
 use jsonrpsee::wasm_client::WasmClientBuilder;
 #[cfg(not(target_arch = "wasm32"))]
 use jsonrpsee::ws_client::{HeaderMap, HeaderValue, WsClientBuilder};
-use pimble_core::{AuthMethod, BlobId, BlobUrl, Node, NodeId, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState, Workspace};
+use pimble_core::{AuthMethod, BlobId, BlobUrl, Node, NodeId, Place, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState, Workspace};
 use pimble_core::MountRef;
 use pimble_rpc::{
     AddRemoteStoreRequest, ApplyEditRequest, CloseStoreRequest, CloudAddHostedStoreRequest,
@@ -505,13 +505,13 @@ impl PimbleClient {
         store_id: StoreId,
         node_id: NodeId,
         new_parent_id: NodeId,
-        position: Option<usize>,
+        place: Place,
     ) -> Result<MoveNodeResponse> {
         let request = MoveNodeRequest {
             store_id,
             node_id,
             new_parent_id,
-            position,
+            place,
         };
 
         self.client
@@ -529,9 +529,9 @@ impl PimbleClient {
         node_id: NodeId,
         to_store_id: StoreId,
         new_parent_id: NodeId,
-        position: Option<usize>,
+        place: Place,
     ) -> Result<TransplantNodeResponse> {
-        let request = TransplantNodeRequest { from_store_id, node_id, to_store_id, new_parent_id, position };
+        let request = TransplantNodeRequest { from_store_id, node_id, to_store_id, new_parent_id, place };
 
         self.client
             .transplant_node(request)

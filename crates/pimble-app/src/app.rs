@@ -396,7 +396,7 @@ pub(crate) fn decide_drop(
             store_id: dragged.0,
             node_id: dragged.1,
             new_parent_id: target.1,
-            position: None,
+            place: pimble_core::Place::Last,
         })
     } else {
         DropDecision::Send(BackendCommand::TransplantNode {
@@ -404,7 +404,7 @@ pub(crate) fn decide_drop(
             node_id: dragged.1,
             to_store_id: target.0,
             new_parent_id: target.1,
-            position: None,
+            place: pimble_core::Place::Last,
         })
     }
 }
@@ -3242,7 +3242,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             } else if let Some(new_parent_id) = put_back_under {
                 // A live node no list names: put it back under the scope's root.
                 store.deleted_modal_pending.set(true);
-                store.send(BackendCommand::MoveNode { store_id, node_id, new_parent_id, position: None });
+                store.send(BackendCommand::MoveNode { store_id, node_id, new_parent_id, place: pimble_core::Place::Last });
             } else {
                 return;
             }
@@ -4778,7 +4778,7 @@ mod tests {
 
         let decision = decide_drop((store_id, dragged), (store_id, parent), Full, Full, Full);
         match decision {
-            DropDecision::Send(BackendCommand::MoveNode { store_id: s, node_id: n, new_parent_id: p, position: None }) => {
+            DropDecision::Send(BackendCommand::MoveNode { store_id: s, node_id: n, new_parent_id: p, place: pimble_core::Place::Last }) => {
                 assert_eq!((s, n, p), (store_id, dragged, parent));
             }
             other => panic!("expected a MoveNode, got {other:?}"),
@@ -4797,7 +4797,7 @@ mod tests {
         let decision = decide_drop((from_store, dragged), (to_store, parent), Full, Full, Full);
         match decision {
             DropDecision::Send(BackendCommand::TransplantNode {
-                from_store_id, node_id, to_store_id, new_parent_id, position: None,
+                from_store_id, node_id, to_store_id, new_parent_id, place: pimble_core::Place::Last,
             }) => {
                 assert_eq!((from_store_id, node_id, to_store_id, new_parent_id), (from_store, dragged, to_store, parent));
             }

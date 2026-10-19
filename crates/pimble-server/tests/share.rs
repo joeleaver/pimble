@@ -28,7 +28,7 @@ use std::time::Duration;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use pimble_client::PimbleClient;
-use pimble_core::{AuthMethod, NodeId, StoreAccess, StoreKind, SyncState};
+use pimble_core::{AuthMethod, NodeId, Place, StoreAccess, StoreKind, SyncState};
 use pimble_crdt::NodeDoc;
 use pimble_crypto::{derive_password_keys, wrap_account_keys, AccountKeys};
 use pimble_rpc::{EditOperation, MemberRole, ShareMemberStatus, StoreChangeKind, VaultDocId};
@@ -133,7 +133,7 @@ async fn sharing_a_folder_gives_a_member_its_subtree_and_both_sides_edit_the_tre
     tokio::time::sleep(Duration::from_millis(2500)).await;
     assert_eq!(env.head_on_h(store_id, fx.inside).await, head_before + 1, "the owner's device is not in the path of the member's edit");
 
-    bob.move_node(store_id, made, shared, None).await.expect("a move inside the share");
+    bob.move_node(store_id, made, shared, Place::Last).await.expect("a move inside the share");
     let moved = wait_until(Duration::from_secs(10), || async {
         child_ids(&alice, store_id, shared).await == vec![fx.inside, fx.deeper, made] && child_ids(&alice, store_id, fx.deeper).await == vec![fx.leaf]
     })
@@ -162,7 +162,7 @@ async fn sharing_a_folder_gives_a_member_its_subtree_and_both_sides_edit_the_tre
     let created = wait_until(Duration::from_secs(30), || async { node_text(&bob, store_id, hotel).await.contains("two nights") }).await;
     assert!(created, "the owner's create reaches the member once the scope names it");
     rename(&alice, store_id, fx.deeper, "Travel").await;
-    alice.move_node(store_id, hotel, fx.deeper, None).await.unwrap();
+    alice.move_node(store_id, hotel, fx.deeper, Place::Last).await.unwrap();
     alice.delete_node(store_id, made).await.unwrap();
     let followed = wait_until(Duration::from_secs(15), || async {
         node_title(&bob, store_id, fx.deeper).await == "Travel"
@@ -227,7 +227,7 @@ async fn two_members_edit_the_same_folder_with_the_owners_server_stopped() {
     assert!(wait_until(Duration::from_secs(10), || async { node_title(&bob, store_id, ferry).await == "Night ferry" }).await, "a rename");
 
     // Move inside the share, and an edit to what was moved.
-    carol.move_node(store_id, ferry, fx.deeper, Some(0)).await.unwrap();
+    carol.move_node(store_id, ferry, fx.deeper, Place::First).await.unwrap();
     seed_content(&carol, store_id, ferry, "carol", "cabin booked").await;
     let moved = wait_until(Duration::from_secs(10), || async {
         child_ids(&bob, store_id, fx.deeper).await == vec![ferry, fx.leaf]
@@ -305,7 +305,7 @@ async fn a_node_moved_into_a_share_reaches_its_member_and_one_moved_out_stops_ar
     assert_eq!(env.wrap_key_ids(store_id, sums).await, vec![store_key_id]);
     assert!(bob.get_node(store_id, sums).await.is_err() && !contains_bytes_recursive(b_dir.path(), b"BUDGET-FIGURES"), "outside the share it is none of the member's");
 
-    alice.move_node(store_id, budget, shared, None).await.unwrap();
+    alice.move_node(store_id, budget, shared, Place::Last).await.unwrap();
     let wrapped = wait_until(Duration::from_secs(15), || async {
         sorted_uuids(env.wrap_key_ids(store_id, sums).await) == sorted_uuids(vec![store_key_id, share_key_id])
             && env.scope_on_h(store_id, shared).await.is_some_and(|docs| docs.contains(&budget) && docs.contains(&sums))
@@ -326,7 +326,7 @@ async fn a_node_moved_into_a_share_reaches_its_member_and_one_moved_out_stops_ar
     // owner's private tree. Nothing ever leaves a scope while its share
     // stands, so the member's list stops naming it without the scope itself
     // shrinking.
-    let moved = alice.move_node(store_id, fx.inside, fx.root_id, None).await.unwrap();
+    let moved = alice.move_node(store_id, fx.inside, fx.root_id, Place::Last).await.unwrap();
     let new_inside = moved.node_id;
     assert_ne!(new_inside, fx.inside, "the node that leaves the share gets a new id");
     assert_eq!(
@@ -402,7 +402,7 @@ async fn a_member_who_holds_two_shares_moves_a_note_from_one_into_the_other() {
 
     // Bob moves a note out of Holiday and into Errands: two shares of one
     // store, so the note leaves Holiday (docs/MOVE_CONTRACT.md "The rule").
-    let moved = bob.move_node(store_id, fx.inside, errands, None).await.expect("a move between two shares of one store");
+    let moved = bob.move_node(store_id, fx.inside, errands, Place::Last).await.expect("a move between two shares of one store");
     let new_inside = moved.node_id;
     assert_ne!(new_inside, fx.inside, "the note that leaves Holiday gets a new id");
     assert_eq!(moved.left_shares.iter().map(|s| s.root).collect::<Vec<_>>(), vec![holiday], "it names the share it left");
@@ -486,7 +486,7 @@ async fn a_subtree_transplanted_between_shares_is_readable_at_every_planted_node
     // Bob moves `Tickets`, with `Train` inside it, out of Holiday and into
     // Errands: two shares of one store, so the whole subtree leaves
     // Holiday and is replanted under Errands, fresh documents and all.
-    let moved = bob.move_node(store_id, fx.deeper, errands, None).await.expect("a move between two shares of one store");
+    let moved = bob.move_node(store_id, fx.deeper, errands, Place::Last).await.expect("a move between two shares of one store");
     let new_deeper = moved.node_id;
     assert_ne!(new_deeper, fx.deeper, "the subtree's root gets a new id");
 
@@ -526,7 +526,7 @@ async fn a_reader_reads_the_share_and_cannot_write() {
     let heads_before: HashMap<VaultDocId, u64> = env.h_admin.vault_list_docs(store_id).await.unwrap().into_iter().map(|d| (d.doc_id, d.head)).collect();
     let refused = |result: Result<(), pimble_client::ClientError>| assert_eq!(result.expect_err("a reader's replica refuses writes").to_string(), StoreAccess::READ_ONLY_REFUSAL);
     refused(carol.create_node(store_id, Some(shared), "document", "no").await.map(|_| ()));
-    refused(carol.move_node(store_id, fx.leaf, shared, None).await.map(|_| ()));
+    refused(carol.move_node(store_id, fx.leaf, shared, Place::Last).await.map(|_| ()));
     refused(carol.delete_node(store_id, fx.inside).await);
     let mut metadata = carol.get_node(store_id, fx.inside).await.unwrap().metadata;
     metadata.title = "no".into();

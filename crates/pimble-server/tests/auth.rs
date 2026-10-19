@@ -11,7 +11,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use pimble_client::PimbleClient;
-use pimble_core::AuthMethod;
+use pimble_core::{AuthMethod, Place};
 use pimble_server::{PimbleServer, ServerConfig};
 use serde_json::json;
 
@@ -554,7 +554,7 @@ async fn a_scoped_editor_reads_and_writes_exactly_its_scope() {
     let mut renamed = member.get_node(store_id, inside).await.unwrap().metadata;
     renamed.title = "Renamed by Bob".into();
     member.update_node_metadata(store_id, inside, renamed).await.expect("metadata in scope");
-    member.move_node(store_id, inside, created, None).await.expect("a move inside the scope");
+    member.move_node(store_id, inside, created, Place::Last).await.expect("a move inside the scope");
     member.apply_edit(store_id, inside, "bob-editor", edit_of("typed by bob")).await.expect("an edit in scope");
     let by_edit = pimble_core::NodeId::new();
     member.apply_edit(store_id, by_edit, "bob-editor", create_edit("By edit", shared)).await.expect("a document created by applyEdit under a parent in scope");
@@ -567,8 +567,8 @@ async fn a_scoped_editor_reads_and_writes_exactly_its_scope() {
     refused_as_no_grant(member.create_node(store_id, Some(outside), "document", "x").await, "a create under a node outside");
     let outside_meta = s.admin.get_node(store_id, outside).await.unwrap().metadata;
     refused_as_no_grant(member.update_node_metadata(store_id, outside, outside_meta).await, "metadata outside");
-    refused_as_no_grant(member.move_node(store_id, inside, root, None).await, "a move out of the scope");
-    refused_as_no_grant(member.move_node(store_id, outside, shared, None).await, "a move into the scope");
+    refused_as_no_grant(member.move_node(store_id, inside, root, Place::Last).await, "a move out of the scope");
+    refused_as_no_grant(member.move_node(store_id, outside, shared, Place::Last).await, "a move into the scope");
     refused_as_no_grant(member.delete_node(store_id, outside).await, "a delete outside");
     refused_as_no_grant(member.delete_node(store_id, shared).await, "deleting the share's own root edits its parent's list");
     refused_as_no_grant(member.undelete_node(store_id, outside).await, "an undelete outside");
@@ -609,7 +609,7 @@ async fn a_scoped_subscriber_hears_of_its_scope_and_of_nothing_else() {
     // The owner moves the share itself: the member's own root changed, and
     // the parents it moved between are not the member's to hear of.
     let elsewhere = s.admin.create_node(store_id, Some(root), "folder", "Elsewhere").await.unwrap();
-    s.admin.move_node(store_id, shared, elsewhere, None).await.unwrap();
+    s.admin.move_node(store_id, shared, elsewhere, Place::Last).await.unwrap();
     let sentinel = s.admin.create_node(store_id, Some(shared), "document", "Sentinel").await.unwrap();
 
     let mut heard = Vec::new();
@@ -699,7 +699,7 @@ async fn a_reader_is_refused_every_write_with_the_sentence_as_the_whole_message(
         refused_as_read_only(reader.set_node_content_bytes(store_id, inside, pimble_crdt::NodeDoc::from_plain_text("x").unwrap().save(), None).await, who);
         refused_as_read_only(reader.delete_node(store_id, inside).await, who);
         refused_as_read_only(reader.undelete_node(store_id, inside).await, who);
-        refused_as_read_only(reader.move_node(store_id, inside, shared, None).await, who);
+        refused_as_read_only(reader.move_node(store_id, inside, shared, Place::Last).await, who);
         refused_as_read_only(reader.apply_edit(store_id, inside, "reader-editor", edit_of("x")).await, who);
         refused_as_read_only(reader.create_mount(store_id, shared, store_id, inside, None).await, who);
         refused_as_read_only(reader.rebuild_index(store_id).await, who);
@@ -727,8 +727,8 @@ async fn a_reader_of_one_root_and_editor_of_another_writes_only_under_the_second
     refused_as_read_only(member.apply_edit(store_id, read_doc, "dana", edit_of("no")).await, "an edit under the read root");
     refused_as_read_only(member.create_node(store_id, Some(read_root), "document", "no").await, "a create under the read root");
     refused_as_read_only(member.delete_node(store_id, read_doc).await, "a delete under the read root");
-    refused_as_read_only(member.move_node(store_id, edit_doc, read_root, None).await, "a move into the read root edits its list");
-    refused_as_read_only(member.move_node(store_id, read_doc, edit_root, None).await, "a move out of the read root edits the node");
+    refused_as_read_only(member.move_node(store_id, edit_doc, read_root, Place::Last).await, "a move into the read root edits its list");
+    refused_as_read_only(member.move_node(store_id, read_doc, edit_root, Place::Last).await, "a move out of the read root edits the node");
 
     member.apply_edit(store_id, edit_doc, "dana", edit_of("yes")).await.expect("an edit under the edited root");
     member.create_node(store_id, Some(edit_root), "document", "yes").await.expect("a create under the edited root");
@@ -846,7 +846,7 @@ async fn transplant_node_between_two_plain_stores_carries_the_text_and_tombstone
     t.admin.apply_edit(t.store_a, note, "admin", edit_of("packed and ready")).await.unwrap();
     let inbox = t.admin.create_node(t.store_b, Some(t.root_b), "folder", "Inbox").await.unwrap();
 
-    let answer = t.admin.transplant_node(t.store_a, note, t.store_b, inbox, None).await.expect("a transplant between two plain stores");
+    let answer = t.admin.transplant_node(t.store_a, note, t.store_b, inbox, Place::Last).await.expect("a transplant between two plain stores");
     assert_ne!(answer.node_id, note, "the note lands under a new id");
     assert!(answer.left_shares.is_empty(), "neither store had a share in play");
     let new_note = answer.node_id;
@@ -868,7 +868,7 @@ async fn transplant_node_between_the_same_store_answers_like_move_node() {
     let note = t.admin.create_node(t.store_a, Some(t.root_a), "document", "Note").await.unwrap();
     let folder = t.admin.create_node(t.store_a, Some(t.root_a), "folder", "Folder").await.unwrap();
 
-    let answer = t.admin.transplant_node(t.store_a, note, t.store_a, folder, None).await.expect("same store, answered as a move");
+    let answer = t.admin.transplant_node(t.store_a, note, t.store_a, folder, Place::Last).await.expect("same store, answered as a move");
     assert_eq!(answer.node_id, note, "no share to leave here: a plain move keeps the id");
     assert_eq!(t.admin.get_node(t.store_a, note).await.unwrap().parent_id, Some(folder));
 }
@@ -886,14 +886,14 @@ async fn transplant_node_is_refused_without_write_on_either_side() {
     roles.insert(t.store_b, "editor");
     let jwt = make_jwt(&t.sk, "kid-1", t.issuer, "r1", "r1@example.com", &roles, 3600);
     let reader_of_a = PimbleClient::connect_with_auth(&t.url, &AuthMethod::Bearer { token: jwt }).await.unwrap();
-    refused_as_read_only(reader_of_a.transplant_node(t.store_a, note, t.store_b, inbox, None).await, "a reader of the source store");
+    refused_as_read_only(reader_of_a.transplant_node(t.store_a, note, t.store_b, inbox, Place::Last).await, "a reader of the source store");
 
     let mut roles = HashMap::new();
     roles.insert(t.store_a, "editor");
     roles.insert(t.store_b, "reader");
     let jwt = make_jwt(&t.sk, "kid-1", t.issuer, "r2", "r2@example.com", &roles, 3600);
     let reader_of_b = PimbleClient::connect_with_auth(&t.url, &AuthMethod::Bearer { token: jwt }).await.unwrap();
-    refused_as_read_only(reader_of_b.transplant_node(t.store_a, note, t.store_b, inbox, None).await, "a reader of the target store");
+    refused_as_read_only(reader_of_b.transplant_node(t.store_a, note, t.store_b, inbox, Place::Last).await, "a reader of the target store");
 
     assert!(t.admin.get_node(t.store_a, note).await.is_ok(), "nothing refused changed the source");
     assert_eq!(t.admin.get_children(t.store_b, inbox).await.unwrap().1.len(), 0, "nor planted anything in the target");
@@ -950,7 +950,7 @@ async fn put_back_of_a_node_no_list_names_succeeds_for_an_editor_of_its_scope() 
     assert!(s.admin.get_children(store_id, shared).await.unwrap().1.is_empty(), "no list names it any more");
 
     let member = s.member("fay", &[(shared, "editor")]).await;
-    let answer = member.move_node(store_id, inside, shared, None).await.expect("an editor puts an unlisted node of their scope back");
+    let answer = member.move_node(store_id, inside, shared, Place::Last).await.expect("an editor puts an unlisted node of their scope back");
     assert_eq!(answer.node_id, inside, "putting it back under the same scope is a plain move, not a transplant");
     assert_eq!(member.get_children(store_id, shared).await.unwrap().1.iter().map(|n| n.id).collect::<Vec<_>>(), vec![inside]);
 }
@@ -1001,7 +1001,7 @@ async fn a_move_is_refused_when_the_list_naming_the_node_is_a_root_the_member_on
     // `shared`'s list is the one the move actually leaves, and that is
     // theirs to read only. Called at once, with nothing else awaited in
     // between, to land inside the window above.
-    refused_as_read_only(member.move_node(store_id, inside, edited, None).await, "shared's list, not the tampered parent_id, is judged");
+    refused_as_read_only(member.move_node(store_id, inside, edited, Place::Last).await, "shared's list, not the tampered parent_id, is judged");
     assert_eq!(
         s.admin.get_children(store_id, shared).await.unwrap().1.iter().map(|n| n.id).collect::<Vec<_>>(),
         vec![inside],

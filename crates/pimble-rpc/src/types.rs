@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use pimble_core::{BlobId, BlobUrl, DeletedNode, LeftShare, MountRef, MountState, Node, NodeId, NodeMetadata, RelaySide, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState, Workspace};
+use pimble_core::{BlobId, BlobUrl, DeletedNode, LeftShare, MountRef, MountState, Node, NodeId, NodeMetadata, Place, RelaySide, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState, Workspace};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -309,8 +309,10 @@ pub struct MoveNodeRequest {
     pub store_id: StoreId,
     pub node_id: NodeId,
     pub new_parent_id: NodeId,
-    /// Position within the new parent's children (None = append)
-    pub position: Option<usize>,
+    /// Where among the new parent's children (docs/TREE_CONTRACT.md "Places
+    /// on the wire"); the end when left out.
+    #[serde(default)]
+    pub place: Place,
 }
 
 /// Answer to `moveNode` (docs/MOVE_CONTRACT.md): the id the node has now.
@@ -336,8 +338,10 @@ pub struct TransplantNodeRequest {
     pub node_id: NodeId,
     pub to_store_id: StoreId,
     pub new_parent_id: NodeId,
-    /// Position within the new parent's children (None = append)
-    pub position: Option<usize>,
+    /// Where among the new parent's children (docs/TREE_CONTRACT.md "Places
+    /// on the wire"); the end when left out.
+    #[serde(default)]
+    pub place: Place,
 }
 
 /// Answer to `transplantNode`: the new root's id in `to_store_id`, and the

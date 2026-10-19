@@ -62,7 +62,7 @@ impl Fixture {
                 node_id,
                 to_store_id: to,
                 new_parent_id: parent,
-                position: None,
+                place: pimble_core::Place::Last,
             })
             .await
             .unwrap()

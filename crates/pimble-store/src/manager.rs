@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use pimble_core::{LeftShare, MountRef, Node, NodeId, NodeMetadata, Store, StoreId, StoreKind, StoreLocation, SyncState};
+use pimble_core::{LeftShare, MountRef, Node, NodeId, NodeMetadata, Place, Store, StoreId, StoreKind, StoreLocation, SyncState};
 use pimble_crdt::{NodeDoc, NodeUpdateEffect, Tree, TreeEdit};
 use tracing::info;
 
@@ -529,8 +529,8 @@ impl StoreManager {
     /// "The rule"). Answers the id the node has now, the shares it left,
     /// and the edit; a caller that wants the old parent for a notification
     /// reads it off the tree first.
-    pub fn move_node(&mut self, store_id: StoreId, node_id: NodeId, new_parent_id: NodeId, position: Option<usize>) -> Result<(NodeId, Vec<LeftShare>, TreeEdit)> {
-        self.local_mut(store_id)?.move_node(node_id, new_parent_id, position)
+    pub fn move_node(&mut self, store_id: StoreId, node_id: NodeId, new_parent_id: NodeId, place: Place) -> Result<(NodeId, Vec<LeftShare>, TreeEdit)> {
+        self.local_mut(store_id)?.move_node(node_id, new_parent_id, place)
     }
 
     /// Move a node into another store (docs/MOVE_CONTRACT.md "Between
@@ -547,7 +547,7 @@ impl StoreManager {
         node_id: NodeId,
         to_store_id: StoreId,
         new_parent_id: NodeId,
-        position: Option<usize>,
+        place: Place,
     ) -> Result<TransplantOutcome> {
         let target_parent = self.local(to_store_id)?.tree().get_node_info(new_parent_id).map_err(|_| StoreError::NodeNotFound(new_parent_id))?;
         if target_parent.node_type == pimble_core::node_types::MOUNT {
@@ -556,7 +556,7 @@ impl StoreManager {
 
         let left_shares = self.local(from_store_id)?.shares_of(node_id);
         let cutting = self.local(from_store_id)?.take_cutting(node_id)?;
-        let (planted, target_edit) = self.local_mut(to_store_id)?.plant_cutting(cutting, new_parent_id, position)?;
+        let (planted, target_edit) = self.local_mut(to_store_id)?.plant_cutting(cutting, new_parent_id, place)?;
         let (source_removal, source_edit) = self.local_mut(from_store_id)?.remove_transplanted(node_id, to_store_id, &planted)?;
         Ok(TransplantOutcome { new_node_id: planted.root, left_shares, source_removal, source_edit, target_edit })
     }
@@ -1163,7 +1163,7 @@ mod tests {
         relay(&mut manager, &edit);
         let (folder_id, edit) = manager.create_node(store_id, Node::folder("Folder"), None).unwrap();
         relay(&mut manager, &edit);
-        let (_, _, edit) = manager.move_node(store_id, doc_id, folder_id, Some(0)).unwrap();
+        let (_, _, edit) = manager.move_node(store_id, doc_id, folder_id, Place::First).unwrap();
         relay(&mut manager, &edit);
         let mut metadata = manager.get_node(store_id, doc_id).unwrap().metadata;
         metadata.title = "Renamed".into();

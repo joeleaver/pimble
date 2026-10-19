@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
-use pimble_core::{NodeId, StoreId};
+use pimble_core::{NodeId, Place, StoreId};
 use pimble_crdt::{NodeDoc, Tree, TreeEdit};
 use pimble_rpc::{
     ApplyEditRequest, CreateNodeRequest, CreateStoreRequest, DeleteNodeRequest, EditOperation, GetChildrenRequest,
@@ -154,7 +154,7 @@ async fn a_peers_structure_edits_earn_the_derived_kinds() {
     assert_eq!(children_of(&handler, store_id, root_id).await, vec![folder, x]);
 
     // Move.
-    let edit = peer.move_node(x, folder, None, T1).unwrap();
+    let edit = peer.move_node(x, folder, Place::Last, T1).unwrap();
     send_edit(&handler, store_id, "peer", &edit).await;
     let notifs = drain(&mut sub, Duration::from_millis(300)).await;
     let kinds: Vec<&StoreChangeKind> = notifs.iter().map(|n| &n.change_kind).collect();

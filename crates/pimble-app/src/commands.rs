@@ -227,7 +227,7 @@ pub async fn process_command(
             }
         }
 
-        BackendCommand::MoveNode { store_id, node_id, new_parent_id, position } => {
+        BackendCommand::MoveNode { store_id, node_id, new_parent_id, place } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
@@ -237,7 +237,7 @@ pub async fn process_command(
                 Ok(node) => (node.parent_id.unwrap_or(NodeId(uuid::Uuid::nil())), node.metadata.title),
                 Err(e) => return Some(BackendEvent::Error { message: e.to_string() }),
             };
-            match c.move_node(store_id, node_id, new_parent_id, position).await {
+            match c.move_node(store_id, node_id, new_parent_id, place).await {
                 Ok(answer) if answer.node_id == node_id => {
                     Some(BackendEvent::NodeMoved { store_id, node_id, old_parent_id, new_parent_id })
                 }
@@ -255,7 +255,7 @@ pub async fn process_command(
             }
         }
 
-        BackendCommand::TransplantNode { from_store_id, node_id, to_store_id, new_parent_id, position } => {
+        BackendCommand::TransplantNode { from_store_id, node_id, to_store_id, new_parent_id, place } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
@@ -263,7 +263,7 @@ pub async fn process_command(
                 Ok(node) => (node.parent_id.unwrap_or(NodeId(uuid::Uuid::nil())), node.metadata.title),
                 Err(e) => return Some(BackendEvent::Error { message: e.to_string() }),
             };
-            match c.transplant_node(from_store_id, node_id, to_store_id, new_parent_id, position).await {
+            match c.transplant_node(from_store_id, node_id, to_store_id, new_parent_id, place).await {
                 Ok(answer) => Some(BackendEvent::NodeTransplanted {
                     from_store_id,
                     old_node_id: node_id,

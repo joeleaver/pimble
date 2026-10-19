@@ -80,7 +80,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use pimble_app::protocol::{BackendCommand, BackendEvent};
 use pimble_client::PimbleClient;
 use pimble_core::{
-    custom_keys, node_types, DeletedNode, LeftShare, LinkResolution, Node, NodeId, PimbleUrl, MAX_LINK_HOPS, NodeMetadata, RelaySide, Store, StoreAccess, StoreId, StoreKind,
+    custom_keys, node_types, DeletedNode, LeftShare, LinkResolution, Node, NodeId, PimbleUrl, MAX_LINK_HOPS, NodeMetadata, Place, RelaySide, Store, StoreAccess, StoreId, StoreKind,
 };
 use pimble_crdt::{NodeDoc, NodeFields, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_crypto::{blob_aad, dek_aad, unwrap_dek, wrap_dek, Blob, KeyId, SymmetricKey, WrappedDek};
@@ -1250,8 +1250,8 @@ impl VaultClient {
                 Some(self.delete_node(client, store_id, node_id).await)
             }
 
-            BackendCommand::MoveNode { store_id, node_id, new_parent_id, position } => {
-                Some(self.move_node(client, store_id, node_id, new_parent_id, position).await)
+            BackendCommand::MoveNode { store_id, node_id, new_parent_id, place } => {
+                Some(self.move_node(client, store_id, node_id, new_parent_id, place).await)
             }
 
             BackendCommand::UndeleteNode { store_id, node_id } => {
@@ -1737,7 +1737,7 @@ impl VaultClient {
         store_id: StoreId,
         node_id: NodeId,
         new_parent_id: NodeId,
-        position: Option<usize>,
+        place: Place,
     ) -> BackendEvent {
         let now = now_rfc3339();
         let (old_parent_id, title, left_shares, new_node_id, edit) = {
@@ -1754,7 +1754,7 @@ impl VaultClient {
             // nothing about the shares it used to be in.
             let left_shares = as_left_shares(&store.tree, store.tree.shares_left(node_id, new_parent_id));
             let mut edit = store.seed_root(&now);
-            let (new_node_id, more) = match store.tree.move_or_transplant(store_id, node_id, new_parent_id, position, &now, &mut NodeId::new) {
+            let (new_node_id, more) = match store.tree.move_or_transplant(store_id, node_id, new_parent_id, place, &now, &mut NodeId::new) {
                 Ok(v) => v,
                 Err(e) => return BackendEvent::Error { message: e.to_string() },
             };
@@ -1872,7 +1872,7 @@ impl VaultClient {
         node_id: NodeId,
         to_store_id: StoreId,
         new_parent_id: NodeId,
-        position: Option<usize>,
+        place: Place,
     ) -> BackendEvent {
         let now = now_rfc3339();
 
@@ -1900,7 +1900,7 @@ impl VaultClient {
                 return BackendEvent::Error { message: "no such encrypted store".into() };
             };
             let mut edit = to_store.seed_root(&now);
-            match to_store.tree.plant(cutting, new_parent_id, position, &now, &mut NodeId::new) {
+            match to_store.tree.plant(cutting, new_parent_id, place, &now, &mut NodeId::new) {
                 Ok((planted, more)) => {
                     edit.touched.extend(more.touched);
                     (planted, edit)
@@ -4025,7 +4025,7 @@ mod tests {
         assert_eq!(store.node_of(z).unwrap().metadata.title, "z");
 
         // A move: three documents' updates.
-        let edit = peer.move_node(y, root, None, T1).unwrap();
+        let edit = peer.move_node(y, root, Place::Last, T1).unwrap();
         arrive(&mut store, store_id, &edit, &mut seq, None);
         assert_eq!(store.children_of(folder).unwrap(), vec![z]);
         assert_eq!(store.children_of(root).unwrap(), vec![folder, x, y]);
@@ -4220,7 +4220,7 @@ mod tests {
         assert!(matches!(kinds_of(&events)[..], [StoreChangeKind::MetadataUpdated { node_id }] if node_id == x), "{events:?}");
 
         // Move: `NodeMoved` for the node, `TreeStructure` for both lists.
-        let edit = peer.move_node(x, q, None, T1).unwrap();
+        let edit = peer.move_node(x, q, Place::Last, T1).unwrap();
         let (events, _) = arrive(&mut store, store_id, &edit, &mut seq, None);
         let kinds = kinds_of(&events);
         assert!(kinds.iter().any(|k| matches!(k, StoreChangeKind::NodeMoved { node_id, old_parent_id, new_parent_id } if *node_id == x && *old_parent_id == p && *new_parent_id == q)), "{kinds:?}");
@@ -4275,7 +4275,7 @@ mod tests {
         peer.add_node(x, Some(p), None, "document", "x", T0).unwrap();
         let before = pull_of(&peer);
         let before_the_move = opened(&peer);
-        let edit = peer.move_node(x, q, None, T1).unwrap();
+        let edit = peer.move_node(x, q, Place::Last, T1).unwrap();
         assert_eq!(edit.touched.len(), 3);
 
         // The pull holds the snapshots and, after them, the move's three
@@ -5616,7 +5616,7 @@ mod tests {
         let store_id = StoreId::new();
         let node_id = NodeId::new();
         assert!(writes(&BackendCommand::CreateNode { store_id, parent_id: None, title: String::new(), init: None }));
-        assert!(writes(&BackendCommand::MoveNode { store_id, node_id, new_parent_id: node_id, position: None }));
+        assert!(writes(&BackendCommand::MoveNode { store_id, node_id, new_parent_id: node_id, place: Place::Last }));
         assert!(writes(&BackendCommand::BroadcastChanges { store_id, node_id, changes: String::new() }));
         assert!(!writes(&BackendCommand::GetChildren { store_id, node_id }));
         assert!(!writes(&BackendCommand::SubscribeStoreChanges { store_id }));
@@ -5655,7 +5655,7 @@ mod tests {
         assert_eq!(left_shares[0].root, share_a);
         assert_eq!(left_shares[0].name, "Alpha", "the first share it leaves, named from its marker");
 
-        let (new_id, edit) = store.tree.move_or_transplant(store_id, note, share_b, None, T1, &mut NodeId::new).unwrap();
+        let (new_id, edit) = store.tree.move_or_transplant(store_id, note, share_b, Place::Last, T1, &mut NodeId::new).unwrap();
         assert_ne!(new_id, note, "moving into a different share is a transplant, not a move");
         assert!(store.tree.doc(note).unwrap().fields().unwrap().deleted_at.is_some(), "the original is tombstoned");
 
@@ -5694,7 +5694,7 @@ mod tests {
         // target with a fresh id, and appended there — as
         // `VaultClient::transplant_node` does, minus the network.
         let cutting = from_store.tree.take_cutting(note).unwrap();
-        let (planted, edit_to) = to_store.tree.plant(cutting, root_to, None, T1, &mut NodeId::new).unwrap();
+        let (planted, edit_to) = to_store.tree.plant(cutting, root_to, Place::Last, T1, &mut NodeId::new).unwrap();
         let new_id = planted.root;
         assert_ne!(new_id, note);
         assert_eq!(to_store.tree.doc(new_id).unwrap().text(), "Hello, world", "the text survives a transplant");
@@ -5737,7 +5737,7 @@ mod tests {
         let mut to_store = opened(&peer_to);
 
         let cutting = from_store.tree.take_cutting(note).unwrap();
-        let (planted, _) = to_store.tree.plant(cutting, root_to, None, T1, &mut NodeId::new).unwrap();
+        let (planted, _) = to_store.tree.plant(cutting, root_to, Place::Last, T1, &mut NodeId::new).unwrap();
         from_store.tree.remove_transplanted(note, to_id, &planted, T1).unwrap();
         from_store.tree.remove_node(gone, T1).unwrap();
         let mut stores = HashMap::from([(from_id, from_store), (to_id, to_store)]);
@@ -5846,7 +5846,7 @@ mod tests {
             node_id: NodeId::new(),
             to_store_id: other_id,
             new_parent_id: NodeId::new(),
-            position: None,
+            place: Place::Last,
         };
         let refused = client.refuse_write(store_id, &transplant).expect("a reader may not transplant out of their root");
         assert!(matches!(&refused, BackendEvent::Error { message } if message == StoreAccess::READ_ONLY_REFUSAL));

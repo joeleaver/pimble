@@ -11,7 +11,7 @@
 //! and `try_recv` never block and work on every target.
 
 use crossbeam_channel::{Receiver, Sender};
-use pimble_core::{BlobUrl, DeletedNode, LeftShare, LinkResolution, MountRef, PimbleUrl, MountState, Node, NodeId, RemoteEndpoint, Store, StoreId, SyncState};
+use pimble_core::{BlobUrl, DeletedNode, LeftShare, LinkResolution, MountRef, PimbleUrl, MountState, Node, NodeId, Place, RemoteEndpoint, Store, StoreId, SyncState};
 
 /// Who asked a `Search`, so its answer reaches them and nobody else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,14 +60,14 @@ pub enum BackendCommand {
     DeleteNode { store_id: StoreId, node_id: NodeId },
     /// Answers `NodeMoved`, or `NodeTransplanted` when the move would have
     /// taken the node out of a share (docs/MOVE_CONTRACT.md).
-    MoveNode { store_id: StoreId, node_id: NodeId, new_parent_id: NodeId, position: Option<usize> },
+    MoveNode { store_id: StoreId, node_id: NodeId, new_parent_id: NodeId, place: Place },
     /// Bring a deleted node and what its deletion took with it back
     /// (`undeleteNode`): "Put Back" in "Recently Deleted...". Answers
     /// `NodeCreated` under the parent it went back to.
     UndeleteNode { store_id: StoreId, node_id: NodeId },
     /// Move a node into another store (docs/MOVE_CONTRACT.md "Between
     /// stores"): always a transplant. Answers `NodeTransplanted`.
-    TransplantNode { from_store_id: StoreId, node_id: NodeId, to_store_id: StoreId, new_parent_id: NodeId, position: Option<usize> },
+    TransplantNode { from_store_id: StoreId, node_id: NodeId, to_store_id: StoreId, new_parent_id: NodeId, place: Place },
     /// What "Recently Deleted..." shows for a store. Answers `DeletedListed`.
     ListDeleted { store_id: StoreId },
     /// Where a Pimble link leads now (`resolveLink`, docs/LINKS_CONTRACT.md

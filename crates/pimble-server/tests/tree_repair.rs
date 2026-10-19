@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use base64::Engine;
-use pimble_core::{AuthMethod, Node, NodeId, RemoteEndpoint, ShareMarker, StoreId, SyncState};
+use pimble_core::{AuthMethod, Node, NodeId, Place, RemoteEndpoint, ShareMarker, StoreId, SyncState};
 use pimble_server::{PimbleServer, ServerConfig};
 use pimble_store::LocalStore;
 
@@ -100,8 +100,8 @@ async fn concurrent_moves_to_different_parents_repair_to_one_winner() {
     client_a.set_store_sync(store_id, None).await.unwrap();
 
     // Diverge: A moves the child to folder B; B (unaware) moves it to the root.
-    client_a.move_node(store_id, child, folder_b, None).await.unwrap();
-    client_b.move_node(store_id, child, root_id, None).await.unwrap();
+    client_a.move_node(store_id, child, folder_b, Place::Last).await.unwrap();
+    client_b.move_node(store_id, child, root_id, Place::Last).await.unwrap();
 
     let remote = remote_endpoint(server_b.addr());
     client_a.set_store_sync(store_id, Some(remote)).await.unwrap();
@@ -157,8 +157,8 @@ async fn concurrent_a_under_b_and_b_under_a_repairs_the_cycle() {
     client_a.set_store_sync(store_id, None).await.unwrap();
 
     // Diverge: A moves B under A; B (unaware) moves A under B — a 2-cycle once merged.
-    client_a.move_node(store_id, folder_b, folder_a, None).await.unwrap();
-    client_b.move_node(store_id, folder_a, folder_b, None).await.unwrap();
+    client_a.move_node(store_id, folder_b, folder_a, Place::Last).await.unwrap();
+    client_b.move_node(store_id, folder_a, folder_b, Place::Last).await.unwrap();
 
     let remote = remote_endpoint(server_b.addr());
     client_a.set_store_sync(store_id, Some(remote)).await.unwrap();

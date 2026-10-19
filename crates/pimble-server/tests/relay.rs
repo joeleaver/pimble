@@ -39,7 +39,7 @@ use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey, Verifier};
 use futures::{SinkExt, StreamExt};
 use pimble_client::PimbleClient;
-use pimble_core::{AuthMethod, NodeId, RelaySide, StoreAccess, StoreId, StoreKind, SyncState};
+use pimble_core::{AuthMethod, NodeId, Place, RelaySide, StoreAccess, StoreId, StoreKind, SyncState};
 use pimble_crdt::NodeDoc;
 use pimble_crypto::{derive_password_keys, wrap_account_keys, AccountKeyBlob, AccountKeys, KdfParams, KeyEnvelope};
 use pimble_rpc::{EditOperation, MemberRole, VaultDocId};
@@ -1221,7 +1221,7 @@ async fn two_members_co_edit_a_relayed_folders_tree_and_outlast_the_owner_going_
     assert!(created, "one member's create reaches the other member and the owner, readable");
 
     rename(&carol, store_id, ferry, "Night ferry").await;
-    carol.move_node(store_id, ferry, shared, None).await.expect("a move inside the share");
+    carol.move_node(store_id, ferry, shared, Place::Last).await.expect("a move inside the share");
     write_text(&carol, store_id, fx.inside, "carol", "and sunscreen").await;
     let followed = wait_until(Duration::from_secs(20), || async {
         node_title(&bob, store_id, ferry).await == "Night ferry"

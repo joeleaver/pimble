@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use pimble_core::{Anchor, IndexUnit, Node, NodeId, NodeMetadata, PimbleUrl, StoreAccess};
+use pimble_core::{Anchor, IndexUnit, Node, NodeId, NodeMetadata, PimbleUrl, Place, StoreAccess};
 use yrs::updates::encoder::Encode;
 use yrs::{
     Any, Array, ArrayPrelim, ArrayRef, BranchID, Doc, GetString, In, Map, MapPrelim, MapRef, Out,
@@ -1033,6 +1033,25 @@ impl NodeDoc {
         let len = self.children.len(txn);
         let at = at.map(|at| (at.min(u32::MAX as usize) as u32).min(len)).unwrap_or(len);
         self.children.insert(txn, at, id.to_string());
+    }
+
+    /// Insert `id` at `place` (docs/TREE_CONTRACT.md "Places on the wire"):
+    /// `After(x)` right after `x`'s last entry, the end when the list no
+    /// longer names `x`. A caller moving within one list removes `id` first,
+    /// so the anchor is found in the list as it will be.
+    pub(crate) fn list_place(&self, txn: &mut TransactionMut, place: Place, id: NodeId) {
+        let at = match place {
+            Place::First => Some(0),
+            Place::Last => None,
+            Place::After(anchor) => {
+                let wanted = anchor.to_string();
+                (0..self.children.len(txn))
+                    .rev()
+                    .find(|&index| string_value(self.children.get(txn, index)).as_deref() == Some(wanted.as_str()))
+                    .map(|index| index as usize + 1)
+            }
+        };
+        self.list_insert(txn, at, id);
     }
 
     /// Remove every entry naming `id`; whether there was one.

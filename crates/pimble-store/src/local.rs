@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use pimble_core::{LeftShare, Node, NodeId, NodeMetadata, RemoteEndpoint, StoreAccess, StoreId, StoreManifest};
+use pimble_core::{LeftShare, Node, NodeId, NodeMetadata, Place, RemoteEndpoint, StoreAccess, StoreId, StoreManifest};
 use pimble_crdt::{Cutting, NodeDoc, Planted, NodeUpdateEffect, StoreDocument, Tree, TreeEdit};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -1028,7 +1028,7 @@ impl LocalStore {
         Ok(edit)
     }
 
-    /// Move a node to a new parent, optionally at a specific position,
+    /// Move a node to a new parent at `place` (docs/TREE_CONTRACT.md),
     /// deciding a plain move or a transplant as every caller must
     /// (docs/MOVE_CONTRACT.md "The rule"; `Tree::move_or_transplant`, a
     /// fresh id per document a transplant creates). Answers the id the node
@@ -1036,7 +1036,7 @@ impl LocalStore {
     /// transplant) and the shares the move left, read off `Tree::shares_left`
     /// before the edit — a transplant strips every marker as it recreates
     /// the subtree, so the shares must be named from the tree as it was.
-    pub fn move_node(&mut self, node_id: NodeId, new_parent_id: NodeId, position: Option<usize>) -> Result<(NodeId, Vec<LeftShare>, TreeEdit)> {
+    pub fn move_node(&mut self, node_id: NodeId, new_parent_id: NodeId, place: Place) -> Result<(NodeId, Vec<LeftShare>, TreeEdit)> {
         if node_id == self.root_node_id() {
             return Err(StoreError::InvalidOperation("Cannot move the root node".into()));
         }
@@ -1061,7 +1061,7 @@ impl LocalStore {
         let left_shares = self.left_shares(node_id, new_parent_id);
         let (new_id, edit) = self
             .tree
-            .move_or_transplant(self.id, node_id, new_parent_id, position, &now(), &mut NodeId::new)
+            .move_or_transplant(self.id, node_id, new_parent_id, place, &now(), &mut NodeId::new)
             .map_err(StoreError::from)?;
         self.mark_edit_dirty(&edit);
         Ok((new_id, left_shares, edit))
@@ -1110,12 +1110,12 @@ impl LocalStore {
     }
 
     /// The second half: plant `cutting` under `new_parent_id` here, at
-    /// `position`, with a fresh id per node. See `Tree::plant`.
-    pub fn plant_cutting(&mut self, cutting: Cutting, new_parent_id: NodeId, position: Option<usize>) -> Result<(Planted, TreeEdit)> {
+    /// `place`, with a fresh id per node. See `Tree::plant`.
+    pub fn plant_cutting(&mut self, cutting: Cutting, new_parent_id: NodeId, place: Place) -> Result<(Planted, TreeEdit)> {
         if !self.tree.has_node(new_parent_id) {
             return Err(StoreError::NodeNotFound(new_parent_id));
         }
-        let (new_root, edit) = self.tree.plant(cutting, new_parent_id, position, &now(), &mut NodeId::new).map_err(StoreError::from)?;
+        let (new_root, edit) = self.tree.plant(cutting, new_parent_id, place, &now(), &mut NodeId::new).map_err(StoreError::from)?;
         self.mark_edit_dirty(&edit);
         Ok((new_root, edit))
     }
@@ -1437,7 +1437,7 @@ mod tests {
         let (folder_b_id, _) = store.create_node(Node::folder("B"), Some(root_id)).unwrap();
         let (doc_id, _) = store.create_node(Node::document("Doc"), Some(folder_a_id)).unwrap();
 
-        let (new_id, left_shares, edit) = store.move_node(doc_id, folder_b_id, None).unwrap();
+        let (new_id, left_shares, edit) = store.move_node(doc_id, folder_b_id, Place::Last).unwrap();
         assert_eq!(new_id, doc_id, "a plain move keeps the node's id");
         assert!(left_shares.is_empty(), "no share is in play here");
         let touched: HashSet<NodeId> = edit.node_ids().into_iter().collect();
@@ -1450,10 +1450,10 @@ mod tests {
         let moved_doc = store.get_node(doc_id).unwrap();
         assert_eq!(moved_doc.parent_id, Some(folder_b_id));
 
-        assert!(matches!(store.move_node(root_id, folder_a_id, None), Err(StoreError::InvalidOperation(_))));
-        assert!(matches!(store.move_node(folder_b_id, doc_id, None), Err(StoreError::InvalidOperation(_))), "under its own descendant");
-        assert!(matches!(store.move_node(doc_id, doc_id, None), Err(StoreError::InvalidOperation(_))));
-        assert!(matches!(store.move_node(doc_id, NodeId::new(), None), Err(StoreError::NodeNotFound(_))));
+        assert!(matches!(store.move_node(root_id, folder_a_id, Place::Last), Err(StoreError::InvalidOperation(_))));
+        assert!(matches!(store.move_node(folder_b_id, doc_id, Place::Last), Err(StoreError::InvalidOperation(_))), "under its own descendant");
+        assert!(matches!(store.move_node(doc_id, doc_id, Place::Last), Err(StoreError::InvalidOperation(_))));
+        assert!(matches!(store.move_node(doc_id, NodeId::new(), Place::Last), Err(StoreError::NodeNotFound(_))));
     }
 
     #[tokio::test]
