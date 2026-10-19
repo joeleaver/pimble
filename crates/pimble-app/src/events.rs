@@ -543,6 +543,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         crate::editor::request_reconcile(store, pane, active.store_id, active.node_id);
                     }
                     crate::boards::request_reconcile_all(store, active.store_id, active.node_id);
+                    crate::sheets::request_reconcile_all(store, active.store_id, active.node_id);
                 }
                 // The boards embedded in text hold their nodes again.
                 crate::text_boards::reconnected(store);
@@ -814,6 +815,8 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // Data-only: updates per-node signal, NO tree rebuild (except for
                 // a change to what the row snapshots, below).
                 store.upsert_node(*store_id, node.clone());
+                // A formula in a sheet may name this node (its tables, its title).
+                crate::sheets::node_loaded(store);
                 if access_changed {
                     refetch_below_changed_access(store, *store_id, &[node_id]);
                 }
@@ -834,6 +837,15 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         .map_or(false, |e| e.store_id == *store_id && e.node_id == node_id);
                     let already_boarding = untracked(|| state.board.get())
                         .is_some_and(|b| b.store_id == *store_id && b.node_id == node_id);
+                    let already_sheeting = untracked(|| state.sheet.get())
+                        .is_some_and(|b| b.store_id == *store_id && b.node_id == node_id);
+                    if node.node_type == pimble_core::node_types::SHEET && !already_sheeting {
+                        // A sheet node (docs/SHEETS_CONTRACT.md section 1).
+                        state.show_editor.set(false);
+                        state.show_board.set(false);
+                        state.show_sheet.set(true);
+                        crate::sheets::start(store, pane, *store_id, node_id, &content_bytes);
+                    }
                     if node.node_type == pimble_core::node_types::BOARD && !already_boarding {
                         // A board node (docs/IMAGE_MARKUP_CONTRACT.md): the
                         // pane shows its board, its editor hidden.
@@ -1258,6 +1270,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             BackendEvent::NodeContentReconciled { store_id, node_id, diff, server_state_vector } => {
                 crate::editor::apply_reconcile(store, *store_id, *node_id, diff, server_state_vector);
                 crate::boards::apply_reconcile(store, *store_id, *node_id, diff, server_state_vector);
+                crate::sheets::apply_reconcile(store, *store_id, *node_id, diff, server_state_vector);
                 crate::text_boards::apply_reconcile(*store_id, *node_id, diff);
             }
 
@@ -1269,6 +1282,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(changes) {
                     apply_remote(store, *store_id, *node_id, &bytes);
                     crate::boards::apply_remote(store, *store_id, *node_id, &bytes);
+                    crate::sheets::apply_remote(store, *store_id, *node_id, &bytes);
                     crate::text_boards::apply_remote(*store_id, *node_id, &bytes);
                 }
             }

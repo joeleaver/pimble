@@ -422,6 +422,11 @@ pub mod node_types {
     /// (docs/IMAGE_MARKUP_CONTRACT.md section 1). Its document's
     /// `data.board` is the board; its `content` is unused.
     pub const BOARD: &str = "board";
+
+    /// Sheet node - small live tables (docs/SHEETS_CONTRACT.md section 1).
+    /// Its document's `data` root holds its tables, one `sheet:<id>` key
+    /// each; its `content` is unused.
+    pub const SHEET: &str = "sheet";
 }
 
 /// Helper module for base64 encoding of bytes in serde

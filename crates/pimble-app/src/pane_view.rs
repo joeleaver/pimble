@@ -95,7 +95,7 @@ pub(crate) fn close_focused(store: AppStore) {
 /// The node pane `pane` shows as a document, tracked: its canonical pair.
 fn pane_document(store: AppStore, pane: PaneId) -> Option<(pimble_core::StoreId, pimble_core::NodeId)> {
     let state = store.pane(pane);
-    if !state.show_editor.get() && !state.show_board.get() {
+    if !state.show_editor.get() && !state.show_board.get() && !state.show_sheet.get() {
         return None;
     }
     match parse_tree_value(&state.selected.get()?) {
@@ -127,7 +127,13 @@ fn pane_icon(store: AppStore, pane: PaneId) -> Vec<(String, String)> {
         .map(|sig| sig.with(|n| (n.metadata.icon().map(str::to_string), n.metadata.color().map(str::to_string))))
         .unwrap_or_default();
     let dark = store.dark_mode.get();
-    let fallback = if store.pane(pane).show_board.get() && !store.pane(pane).markup.get() { TablerIcon::Chalkboard } else { TablerIcon::FileText };
+    let fallback = if store.pane(pane).show_sheet.get() {
+        TablerIcon::Table
+    } else if store.pane(pane).show_board.get() && !store.pane(pane).markup.get() {
+        TablerIcon::Chalkboard
+    } else {
+        TablerIcon::FileText
+    };
     vec![(
         icon.unwrap_or_else(|| fallback.name().to_string()),
         color.map(|hex| display_color(&hex, dark)).unwrap_or_default(),
@@ -153,7 +159,7 @@ fn pane_icon(store: AppStore, pane: PaneId) -> Vec<(String, String)> {
 /// freely because they are `untracked`.)
 fn editor_read_only(store: AppStore, pane: PaneId) -> bool {
     let state = store.pane(pane);
-    let Some(active) = state.active_edit.get().or_else(|| state.board.get()) else { return false };
+    let Some(active) = state.active_edit.get().or_else(|| state.board.get()).or_else(|| state.sheet.get()) else { return false };
     let sig = store.store_data.with(|map| map.get(&active.store_id).copied());
     if sig.map_or(false, |sig| sig.with(|s| !s.access.allows_write())) {
         return true;
@@ -186,6 +192,8 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
     // A board node's view (docs/IMAGE_MARKUP_CONTRACT.md "Showing one"),
     // beside the editor and rendered once with it; shown instead of it.
     let board_view = crate::boards::render_board(__scope, store, pane);
+    // A sheet node's tables (docs/SHEETS_CONTRACT.md section 1), likewise.
+    let sheet_view = crate::sheets::render_sheet(__scope, store, pane);
     // The floating controls over the picture under the pointer in the text
     // (docs/IMAGE_MARKUP_CONTRACT.md section 5).
     let picture_controls = crate::text_boards::render_controls(__scope, store, pane);
@@ -194,7 +202,7 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
         div {
             class: "pimble-editor__content-wrap",
             // Hidden under a picture's board view while it is marked up.
-            style: {move || if state.show_editor.get() && !state.show_board.get() { "" } else { "display: none;" }},
+            style: {move || if state.show_editor.get() && !state.show_board.get() && !state.show_sheet.get() { "" } else { "display: none;" }},
             onscroll: move |_| crate::text_boards::scrolled(store, pane),
             // A board node's row dropped on the text goes in as a picture
             // of it (docs/IMAGE_MARKUP_CONTRACT.md section 2).
@@ -306,15 +314,16 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
             // reader meets one wording everywhere.
             div {
                 class: "pimble-editor__read-only",
-                style: {move || if (state.show_editor.get() || state.show_board.get()) && editor_read_only(store, pane) { "" } else { "display: none;" }},
+                style: {move || if (state.show_editor.get() || state.show_board.get() || state.show_sheet.get()) && editor_read_only(store, pane) { "" } else { "display: none;" }},
                 {pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string()}
             }
             {content_wrap}
             {board_view}
+            {sheet_view}
             {picture_controls}
             div {
                 class: "pimble-empty-state",
-                style: {move || if state.show_editor.get() || state.show_board.get() { "display: none;" } else { "" }},
+                style: {move || if state.show_editor.get() || state.show_board.get() || state.show_sheet.get() { "display: none;" } else { "" }},
                 div {
                     class: "pimble-empty-state__icon",
                     {empty_icon}

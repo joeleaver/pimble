@@ -296,6 +296,7 @@ fn open_node_in(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
     // fetched; `NodeLoaded` starts the session then.
     let parsed = parse_tree_value(&value);
     let mut is_board = false;
+    let mut is_sheet = false;
     let (title_opt, content_bytes_opt, is_document, sel_ids) = if let Some((s_id, node_id_opt)) = parsed {
         if let Some(n_id) = node_id_opt {
             let result = store.get_node_signal(s_id, n_id).map(|sig| {
@@ -307,12 +308,14 @@ fn open_node_in(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
                     };
                     let is_doc = node.node_type == pimble_core::node_types::DOCUMENT;
                     let board = node.node_type == pimble_core::node_types::BOARD;
-                    (label, node.content.clone(), is_doc, board)
+                    let sheet = node.node_type == pimble_core::node_types::SHEET;
+                    (label, node.content.clone(), is_doc, board, sheet)
                 })
             });
             match result {
-                Some((label, content, is_doc, board)) => {
+                Some((label, content, is_doc, board, sheet)) => {
                     is_board = board;
+                    is_sheet = sheet;
                     (Some(label), Some(content), is_doc, Some((s_id, n_id)))
                 }
                 None => {
@@ -334,6 +337,7 @@ fn open_node_in(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
 
     state.show_editor.set(is_document);
     state.show_board.set(is_board);
+    state.show_sheet.set(is_sheet);
 
     if let Some(title) = title_opt.filter(|_| focused) {
         store.node_title.set(title);
@@ -350,6 +354,13 @@ fn open_node_in(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
         let content_bytes = content_bytes_opt.unwrap_or_default();
         if let Some((s_id, n_id)) = sel_ids {
             crate::boards::start(store, pane, s_id, n_id, &content_bytes);
+        }
+    } else if is_sheet {
+        // A sheet node (docs/SHEETS_CONTRACT.md section 1): the pane shows
+        // its tables, the editor stays mounted and hidden.
+        let content_bytes = content_bytes_opt.unwrap_or_default();
+        if let Some((s_id, n_id)) = sel_ids {
+            crate::sheets::start(store, pane, s_id, n_id, &content_bytes);
         }
     } else {
         stop_editing(store, pane);
@@ -1488,6 +1499,14 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     }
                 }
             };
+            let on_new_sheet = {
+                let nv = nv_ctx.clone();
+                move || {
+                    if let Some((s_id, parent)) = crate::boards::parent_for_row(store, &nv) {
+                        crate::sheets::new_sheet(store, s_id, parent);
+                    }
+                }
+            };
             let on_new_image = {
                 let nv = nv_ctx.clone();
                 move || {
@@ -2033,6 +2052,12 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 "New Whiteboard"
                             }
                             DropdownMenuItem {
+                                left_section: TablerIcon::Table,
+                                disabled: store_menu.new_node,
+                                onclick: on_new_sheet.clone(),
+                                "New Sheet"
+                            }
+                            DropdownMenuItem {
                                 left_section: TablerIcon::Photo,
                                 disabled: store_menu.new_node,
                                 onclick: on_new_image.clone(),
@@ -2257,6 +2282,12 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 disabled: !can_write_tree,
                                 onclick: on_new_whiteboard.clone(),
                                 "New Whiteboard"
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::Table,
+                                disabled: store_menu.new_node,
+                                onclick: on_new_sheet.clone(),
+                                "New Sheet"
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Photo,

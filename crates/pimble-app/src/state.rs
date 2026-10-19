@@ -1048,6 +1048,14 @@ pub struct PaneState {
     /// The picture in the pane's text the pointer is over, and what its
     /// floating controls show (section 5, "Showing and hiding markup").
     pub picture: Signal<Option<crate::text_boards::PictureHover>>,
+    /// Whether the pane shows a sheet node's tables (docs/SHEETS_CONTRACT.md
+    /// section 1) instead of its editor, which stays mounted, hidden.
+    pub show_sheet: Signal<bool>,
+    /// The sheet node the pane holds, like `board` for a board node.
+    pub sheet: Signal<Option<ActiveEdit>>,
+    /// What the sheet view shows: the computed tables, the cell being typed
+    /// into, the column settings, the formula bar.
+    pub sheet_ui: crate::sheets::SheetUi,
 }
 
 impl PaneState {
@@ -1064,6 +1072,9 @@ impl PaneState {
             board_ui: crate::boards::PaneUi::new(),
             markup: Signal::new(false),
             picture: Signal::new(None),
+            show_sheet: Signal::new(false),
+            sheet: Signal::new(None),
+            sheet_ui: crate::sheets::SheetUi::new(),
         }
     }
 }
@@ -1650,22 +1661,29 @@ impl AppStore {
         untracked(|| PaneId::ALL.into_iter().filter(|pane| self.pane(*pane).board.get() == edit).collect())
     }
 
-    /// Whether any pane holds this node, in its editor or as a board,
-    /// untracked: what a node's subscription is counted by.
+    /// The panes holding this sheet node, untracked.
+    pub fn panes_sheeting(&self, store_id: StoreId, node_id: NodeId) -> Vec<PaneId> {
+        let edit = Some(ActiveEdit { store_id, node_id });
+        untracked(|| PaneId::ALL.into_iter().filter(|pane| self.pane(*pane).sheet.get() == edit).collect())
+    }
+
+    /// Whether any pane holds this node, in its editor, as a board or as a
+    /// sheet, untracked: what a node's subscription is counted by.
     pub fn is_editing(&self, store_id: StoreId, node_id: NodeId) -> bool {
         !self.panes_editing(store_id, node_id).is_empty()
             || !self.panes_boarding(store_id, node_id).is_empty()
+            || !self.panes_sheeting(store_id, node_id).is_empty()
             // A board embedded in a note's text holds its subscription too
             // (docs/IMAGE_MARKUP_CONTRACT.md section 2, "Showing").
             || crate::text_boards::embed_holds(store_id, node_id)
     }
 
-    /// Every node some pane holds (a document in its editor, or a board),
-    /// each once, untracked.
+    /// Every node some pane holds (a document in its editor, a board or a
+    /// sheet), each once, untracked.
     pub fn edited_nodes(&self) -> Vec<ActiveEdit> {
         let mut nodes: Vec<ActiveEdit> = Vec::new();
         for pane in PaneId::ALL {
-            let held = untracked(|| self.pane(pane).active_edit.get().or_else(|| self.pane(pane).board.get()));
+            let held = untracked(|| self.pane(pane).active_edit.get().or_else(|| self.pane(pane).board.get()).or_else(|| self.pane(pane).sheet.get()));
             if let Some(edit) = held {
                 if !nodes.contains(&edit) {
                     nodes.push(edit);
@@ -1705,6 +1723,7 @@ impl AppStore {
         self.select_in_pane(pane, None);
         self.pane(pane).show_editor.set(false);
         self.pane(pane).show_board.set(false);
+        self.pane(pane).show_sheet.set(false);
         self.pane(pane).restore.set(None);
         if pane == self.focused() {
             self.node_title.set(String::new());

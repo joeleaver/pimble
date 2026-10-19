@@ -444,6 +444,306 @@ pub(crate) const APP_CSS: &str = "
     border-bottom: 1px solid var(--rinch-color-border);
 }
 
+/* ── Sheets (docs/SHEETS_CONTRACT.md) ─────────────────────────── */
+
+/* A sheet pane: its tables stacked, scrolling as one. Typed cells are plain,
+   computed ones tinted; a header is one line, its type a faint mark. */
+.pimble-sheet {
+    flex: 1;
+    overflow: auto;
+    padding: 16px 20px 48px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    min-height: 0;
+}
+
+.pimble-sheet__message {
+    padding: 6px 10px;
+    border-radius: var(--rinch-radius-sm);
+    border: 1px solid var(--rinch-color-red-6);
+    color: var(--rinch-color-red-6);
+    font-size: 13px;
+}
+
+.pimble-sheet__table {
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+    background: var(--rinch-color-body);
+}
+
+.pimble-sheet__title {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+
+.pimble-sheet__name {
+    font-weight: 600;
+    font-size: 14px;
+    border: none;
+    background: transparent;
+    color: var(--rinch-color-text);
+    padding: 2px 4px;
+    width: 14em;
+}
+
+.pimble-sheet__kind {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--rinch-color-dimmed);
+    border: 1px solid var(--rinch-color-border);
+    border-radius: 4px;
+    padding: 0 5px;
+}
+
+.pimble-sheet__source,
+.pimble-sheet__formula {
+    flex: 1 1 260px;
+    min-width: 0;
+    font-family: monospace;
+    font-size: 13px;
+    padding: 3px 6px;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: 4px;
+    background: var(--rinch-color-surface);
+    color: var(--rinch-color-text);
+}
+
+.pimble-sheet__note,
+.pimble-sheet__error,
+.pimble-sheet__form-error {
+    color: var(--rinch-color-red-6);
+    font-size: 12px;
+}
+
+.pimble-sheet__error {
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+
+.pimble-sheet__count {
+    margin-left: auto;
+    color: var(--rinch-color-dimmed);
+    font-size: 12px;
+}
+
+.pimble-sheet__delete-table,
+.pimble-sheet__delete-row {
+    border: none;
+    background: transparent;
+    color: var(--rinch-color-dimmed);
+    cursor: pointer;
+    font-size: 14px;
+    padding: 0 6px;
+}
+
+.pimble-sheet__scroll {
+    overflow-x: auto;
+}
+
+.pimble-sheet__grid {
+    display: grid;
+    font-size: 13px;
+}
+
+/* A row is only a grouping: its cells are the grid's own items, so every
+   row's columns line up. */
+.pimble-sheet__row {
+    display: contents;
+}
+
+.pimble-sheet__head {
+    text-align: left;
+    font-weight: 500;
+    white-space: nowrap;
+    padding: 5px 8px;
+    border-bottom: 1px solid var(--rinch-color-border);
+    border-right: 1px solid var(--rinch-color-border);
+    cursor: pointer;
+}
+
+.pimble-sheet__head:hover {
+    background: var(--rinch-color-option-hover);
+}
+
+.pimble-sheet__mark {
+    margin-left: 6px;
+    font-family: monospace;
+    font-size: 11px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-sheet__add-col {
+    width: 28px;
+    text-align: center;
+    color: var(--rinch-color-dimmed);
+    cursor: pointer;
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+
+.pimble-sheet__cell {
+    position: relative;
+    padding: 5px 8px;
+    min-width: 80px;
+    border-bottom: 1px solid var(--rinch-color-border);
+    border-right: 1px solid var(--rinch-color-border);
+    white-space: nowrap;
+    cursor: text;
+}
+
+.pimble-sheet__num {
+    text-align: right;
+}
+
+.pimble-sheet__cell--computed {
+    background: var(--rinch-color-surface);
+    cursor: default;
+}
+
+.pimble-sheet__cell--error {
+    color: var(--rinch-color-red-6);
+}
+
+.pimble-sheet__cell--placeholder {
+    color: var(--rinch-color-placeholder);
+}
+
+.pimble-sheet__new-row .pimble-sheet__cell--computed {
+    background: transparent;
+}
+
+.pimble-sheet__tail {
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+
+.pimble-sheet__chip {
+    padding: 0 7px;
+    border-radius: 999px;
+    background: var(--rinch-primary-color-filled);
+    color: var(--rinch-color-body);
+    font-size: 12px;
+}
+
+.pimble-sheet__edit {
+    width: 100%;
+    box-sizing: border-box;
+    font: inherit;
+    border: 2px solid var(--rinch-primary-color-6);
+    padding: 2px 4px;
+    margin: -4px -6px;
+    background: var(--rinch-color-body);
+    color: var(--rinch-color-text);
+}
+
+.pimble-sheet__choices {
+    position: absolute;
+    left: 0;
+    top: 100%;
+    z-index: 5;
+    min-width: 180px;
+    max-height: 220px;
+    overflow: auto;
+    padding: 4px;
+    background: var(--rinch-color-body);
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+}
+
+.pimble-sheet__choice {
+    padding: 5px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+.pimble-sheet__choice:hover,
+.pimble-sheet__choice--on {
+    background: var(--rinch-color-option-hover);
+}
+
+.pimble-sheet__empty {
+    padding: 8px 10px;
+    color: var(--rinch-color-dimmed);
+    font-size: 12px;
+}
+
+.pimble-sheet__form {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: flex-end;
+    padding: 10px;
+    border-bottom: 1px solid var(--rinch-color-border);
+    background: var(--rinch-color-surface);
+}
+
+.pimble-sheet__form label {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-sheet__form input,
+.pimble-sheet__form select {
+    font-size: 13px;
+    padding: 3px 6px;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: 4px;
+    background: var(--rinch-color-body);
+    color: var(--rinch-color-text);
+}
+
+.pimble-sheet__form-formula {
+    flex: 1 1 280px;
+}
+
+.pimble-sheet__form-formula input {
+    font-family: monospace;
+}
+
+.pimble-sheet__form-hint {
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-sheet__form-buttons {
+    display: flex;
+    gap: 8px;
+    margin-left: auto;
+}
+
+.pimble-sheet__form-buttons button,
+.pimble-sheet__adder {
+    font-size: 13px;
+    padding: 4px 10px;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: 4px;
+    background: var(--rinch-color-body);
+    color: var(--rinch-color-text);
+    cursor: pointer;
+}
+
+.pimble-sheet__primary {
+    background: var(--rinch-primary-color-filled) !important;
+    color: var(--rinch-color-body) !important;
+    border-color: transparent !important;
+}
+
+.pimble-sheet__danger {
+    color: var(--rinch-color-red-6) !important;
+}
+
+.pimble-sheet__adders {
+    display: flex;
+    gap: 8px;
+}
+
 /* ── Boards (docs/IMAGE_MARKUP_CONTRACT.md) ─────────────────── */
 
 /* A board pane: the surface fills it; the selection outline and the markup
