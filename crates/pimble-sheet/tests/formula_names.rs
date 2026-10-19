@@ -96,11 +96,11 @@ fn stored_forms() {
     let home = b.at(BUDGET);
     assert_eq!(
         to_stored(&home, Some("bymonth"), "=[@category].[monthly budget]").unwrap(),
-        "=[@category].{c:cats.monthly_budget}"
+        "=[@{r:1}].{c:cats.monthly_budget}"
     );
     assert_eq!(
         to_stored(&home, Some("bymonth"), "=[@budget]-[@spent]").unwrap(),
-        "=[@{c:bymonth.budget}]-[@spent]"
+        "=[@{c:bymonth.budget}]-[@{r:2}]"
     );
     // LET names are not tables, and their links are followed.
     assert_eq!(
@@ -379,4 +379,140 @@ fn stability_over_many_forms() {
     assert_eq!(st, "=COUNTA({t:veh}[#Headers])");
     // A this-row reference into another note is refused.
     assert!(to_stored(&b2, None, "='Household budget'!Transactions[@amount]").is_err());
+}
+
+#[test]
+fn summary_result_columns_are_stored_by_position() {
+    let mut b = examples();
+    b.store_formulas();
+    let home = b.at(BUDGET);
+    // Every way a result column is named.
+    let forms: &[(Option<&str>, &str, &str)] = &[
+        (Some("bymonth"), "=[@spent]*2", "=[@{r:2}]*2"),
+        (
+            Some("bymonth"),
+            "=[@[spent]]+[@month]",
+            "=[@{r:2}]+[@{r:0}]",
+        ),
+        (None, "=SUM(ByMonth[spent])", "=SUM({t:bymonth}[{r:2}])"),
+        (
+            None,
+            "=SUM(ByMonth[[spent]:[budget]])",
+            "=SUM({t:bymonth}[[{r:2}]:[{c:bymonth.budget}]])",
+        ),
+        (
+            None,
+            "=XLOOKUP(\"2026-10\", ByMonth[month], ByMonth).spent",
+            "=XLOOKUP(\"2026-10\", {t:bymonth}[{r:0}], {t:bymonth}).{r:2}",
+        ),
+    ];
+    for (table, shown, stored) in forms {
+        let st = to_stored(&home, *table, shown).unwrap_or_else(|e| panic!("{shown}: {e:?}"));
+        assert_eq!(&st, stored, "{shown}");
+        assert_eq!(
+            to_stored(&home, *table, &to_shown(&home, *table, &st)).unwrap(),
+            st
+        );
+    }
+    // An unknown result column is refused with the summary's columns.
+    let e = to_stored(&home, Some("bymonth"), "=[@price]").unwrap_err();
+    assert_eq!(
+        e.message,
+        "ByMonth has no column \"price\"; its columns are month, category, spent, budget, left"
+    );
+
+    // Renaming through headers leaves stored formulas working and shows the new names.
+    let total = to_stored(&home, None, "=SUM(ByMonth[spent])").unwrap();
+    let mut r = home.clone();
+    r.table_mut(BUDGET, "bymonth")
+        .headers
+        .insert(2, "total".into());
+    r.table_mut(BUDGET, "bymonth")
+        .headers
+        .insert(1, "what".into());
+    assert_eq!(to_shown(&r, None, &total), "=SUM(ByMonth[total])");
+    let left = match &r.table_mut(BUDGET, "bymonth").columns[1].ty {
+        ColumnType::Formula { formula, .. } => formula.clone(),
+        _ => unreachable!(),
+    };
+    assert_eq!(to_shown(&r, Some("bymonth"), &left), "=[@budget]-[@total]");
+    let budget = match &r.table_mut(BUDGET, "bymonth").columns[0].ty {
+        ColumnType::Formula { formula, .. } => formula.clone(),
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        to_shown(&r, Some("bymonth"), &budget),
+        "=[@what].[monthly budget]"
+    );
+    let en = Engine::new(&r);
+    let tables = en.compute_node(&node(BUDGET)).unwrap();
+    let bym = table(&tables, "ByMonth");
+    let names: Vec<&str> = bym.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["month", "what", "total", "budget", "left"]);
+    // September groceries: 650 - 319.64.
+    assert!(close(num(&bym.rows[2].values[4]), 650.0 - 319.64));
+    let Evaluated::Value(v) = en.evaluate(&node(BUDGET), None, None, &total).unwrap() else {
+        panic!()
+    };
+    assert!(close(
+        num(&v),
+        188.20
+            + 61.30
+            + 205.90
+            + 72.15
+            + 131.44
+            + 45.00
+            + 142.18
+            + 46.20
+            + 38.75
+            + 212.40
+            + 96.33
+            + 64.00
+            + 51.10
+            + 27.40
+            + 118.62
+    ));
+
+    // A position past the result's width is #REF! with a sentence.
+    let mut n = home.clone();
+    n.table_mut(BUDGET, "bymonth").source = Some(
+        to_stored(
+            &home,
+            None,
+            "=GROUPBY(Transactions[category], Transactions[amount], SUM)",
+        )
+        .unwrap(),
+    );
+    assert_eq!(to_shown(&n, None, &total), "=SUM(#REF!)");
+    let en = Engine::new(&n);
+    let tables = en.compute_node(&node(BUDGET)).unwrap();
+    let bym = table(&tables, "ByMonth");
+    let Evaluated::Value(v) = en
+        .evaluate(
+            &node(BUDGET),
+            Some("bymonth"),
+            Some(&bym.rows[0].id),
+            "=[@{r:2}]",
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    let msg = assert_err(&v, "#REF!");
+    assert_eq!(
+        msg,
+        "This formula reads column 3 of ByMonth's result, and its formula now gives 2"
+    );
+    let Evaluated::Value(v) = en
+        .evaluate(&node(BUDGET), None, None, "=SUM({t:bymonth}[{r:5}])")
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_err(&v, "#REF!");
+    // A summary that fails keeps its tokens: they come back when it does.
+    let mut f = home.clone();
+    f.table_mut(BUDGET, "bymonth").source = Some("=1+".into());
+    assert_eq!(to_shown(&f, None, &total), "=SUM(ByMonth[{r:2}])");
+    assert_eq!(to_stored(&f, None, "=SUM(ByMonth[{r:2}])").unwrap(), total);
 }

@@ -4982,6 +4982,7 @@ dependencies = [
  "pimble-import",
  "pimble-rpc",
  "pimble-server",
+ "pimble-sheet",
  "pimble-store",
  "rinch",
  "rinch-editor-core",
@@ -5174,6 +5175,7 @@ dependencies = [
  "pimble-crdt",
  "pimble-rpc",
  "pimble-server",
+ "pimble-sheet",
  "rmcp",
  "schemars",
  "serde",
@@ -5182,6 +5184,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "yrs",
 ]
 
 [[package]]

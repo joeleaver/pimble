@@ -479,7 +479,7 @@ impl<'b> Engine<'b> {
     ) -> Result<Option<&'b TableSnap>, FormulaError> {
         match name {
             NameRef::Id(id) => Ok(snap.table(id)),
-            NameRef::Dead => Err(FormulaError::reference(
+            NameRef::Dead | NameRef::Pos(_) => Err(FormulaError::reference(
                 "This formula points at a table that was deleted",
             )),
             NameRef::Name(n) => {
@@ -582,6 +582,9 @@ impl<'b> Engine<'b> {
                 let n = norm(n);
                 cols.iter().position(|c| norm(&c.meta.name) == n)
             }
+            NameRef::Pos(i) => cols
+                .iter()
+                .position(|c| matches!(c.src, ColSrc::Result(j) if j == *i)),
             NameRef::Dead => None,
         }
     }
@@ -594,6 +597,17 @@ impl<'b> Engine<'b> {
                     "{} has no column \"{n}\"; its columns are {}",
                     t.name,
                     list.join(", ")
+                ))
+            }
+            NameRef::Pos(i) => {
+                let n = cols
+                    .iter()
+                    .filter(|c| matches!(c.src, ColSrc::Result(_)))
+                    .count();
+                FormulaError::reference(format!(
+                    "This formula reads column {} of {}'s result, and its formula now gives {n}",
+                    i + 1,
+                    t.name
                 ))
             }
             _ => FormulaError::reference(format!(
@@ -1291,15 +1305,10 @@ impl<'b> Engine<'b> {
                 NameRef::Name(s) => self.field(n, s),
                 _ => Value::err(FormulaError::reference("A node has fields, not columns")),
             },
-            _ => {
-                let n = match name {
-                    NameRef::Name(n) => n.as_str(),
-                    _ => "column",
-                };
-                Value::err(FormulaError::value(format!(
-                    "Only a link can be followed with \".{n}\""
-                )))
-            }
+            _ => Value::err(FormulaError::value(match name {
+                NameRef::Name(n) => format!("Only a link can be followed with \".{n}\""),
+                _ => "Only a link can be followed with a dot".to_string(),
+            })),
         }
     }
 

@@ -106,6 +106,8 @@ enum Tok {
     Bracket(Spec),
     /// `{c:<id>}` outside brackets: a column after a dot.
     ColId(String),
+    /// `{r:<index>}` outside brackets: a summary's result column after a dot.
+    ColPos(usize),
     Op(Op),
     End,
 }
@@ -417,6 +419,13 @@ impl<'s> Lexer<'s> {
                 self.pos = end;
                 self.push(Tok::ColId(id.to_string()), start);
             }
+            "r" => {
+                let i = id.trim().parse::<usize>().map_err(|_| {
+                    ParseError::new(format!("\"{body}\" isn't a result column"), start..end)
+                })?;
+                self.pos = end;
+                self.push(Tok::ColPos(i), start);
+            }
             _ => {
                 return Err(ParseError::new(
                     "Lists written in braces, like {1,2,3}, aren't supported yet",
@@ -551,6 +560,12 @@ fn piece(src: &str, start: usize, end: usize, outer: Span, bracketed: bool) -> C
         .and_then(|s| s.strip_suffix('}'))
     {
         NameRef::Id(id.to_string())
+    } else if let Some(i) = trimmed
+        .strip_prefix("{r:")
+        .and_then(|s| s.strip_suffix('}'))
+        .and_then(|s| s.trim().parse::<usize>().ok())
+    {
+        NameRef::Pos(i)
     } else {
         NameRef::Name(text)
     };
@@ -866,6 +881,7 @@ impl<'s> Parser<'s> {
                     Tok::Ident(w) => NameRef::Name(w.clone()),
                     Tok::Bool(b) => NameRef::Name(if *b { "TRUE" } else { "FALSE" }.to_string()),
                     Tok::ColId(id) => NameRef::Id(id.clone()),
+                    Tok::ColPos(i) => NameRef::Pos(*i),
                     Tok::Bracket(spec) if spec.single && !spec.this_row => match &spec.cols {
                         Cols::One(p) => p.name.clone(),
                         _ => unreachable_member(&t.span)?,

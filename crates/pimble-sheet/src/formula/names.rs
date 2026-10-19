@@ -5,8 +5,10 @@
 //! `{c:<column>}` for a column, inside brackets and after a dot that follows
 //! a row link whose table is known. A reference to this note's own tables
 //! carries no note token, so tables copied together keep pointing at each
-//! other. A node's fields, a summary's result columns (which have no ids)
-//! and links whose table cannot be known before computing keep their names.
+//! other. A summary's result columns have no ids, so they are stored by
+//! position in the result, `{r:<index>}`, before `headers` renames them. A
+//! node's fields and links whose table cannot be known before computing
+//! keep their names.
 //!
 //! Both directions rewrite only the spans of names, so the rest of the
 //! formula stays as it was typed, and `to_stored(to_shown(s)) == s`. A
@@ -302,6 +304,7 @@ impl<'e, 'b> Walk<'e, 'b> {
                 let n = norm(n);
                 t.columns.iter().find(|c| norm(&c.name) == n)
             }
+            NameRef::Pos(_) => None,
             NameRef::Dead => return None,
         };
         if let Some(c) = own {
@@ -483,7 +486,27 @@ impl<'e, 'b> Walk<'e, 'b> {
                     }
                     0 => {
                         if t.is_summary() {
-                            return Ok(());
+                            let Ok(cols) = self.en.table_cols(&tt.node, t) else {
+                                return Ok(());
+                            };
+                            return match self.en.find_col(&cols, &m.name).map(|i| cols[i].src) {
+                                Some(ColSrc::Result(j)) => {
+                                    self.edit(m.span.clone(), format!("{{r:{j}}}"));
+                                    Ok(())
+                                }
+                                _ => {
+                                    let list: Vec<String> =
+                                        cols.iter().map(|c| c.meta.name.clone()).collect();
+                                    Err(NameError::unknown(
+                                        format!(
+                                            "{} has no column \"{s}\"; its columns are {}",
+                                            t.name,
+                                            list.join(", ")
+                                        ),
+                                        m.span.clone(),
+                                    ))
+                                }
+                            };
                         }
                         let list: Vec<&str> = t.columns.iter().map(|c| c.name.as_str()).collect();
                         Err(NameError::unknown(
@@ -615,7 +638,7 @@ impl<'e, 'b> Walk<'e, 'b> {
                 }
             },
             Some(part) => match &part.name {
-                NameRef::Dead => return Ok(()),
+                NameRef::Dead | NameRef::Pos(_) => return Ok(()),
                 NameRef::Id(id) => match snap.table(id) {
                     Some(t) => t,
                     None => {
@@ -744,11 +767,23 @@ impl<'e, 'b> Walk<'e, 'b> {
                     self.edit(span, format!("{{c:{}}}", hits[0].id));
                 }
                 0 => {
-                    // A summary's result columns have only names.
+                    // A summary's result columns are stored by position.
                     if table.is_summary() {
                         match self.en.table_cols(&node, table) {
                             Err(_) => continue,
-                            Ok(cols) if self.en.find_col(&cols, &p.name).is_some() => continue,
+                            Ok(cols) if self.en.find_col(&cols, &p.name).is_some() => {
+                                if let Some(i) = self.en.find_col(&cols, &p.name) {
+                                    if let ColSrc::Result(j) = cols[i].src {
+                                        let span = if spec.single {
+                                            p.outer.clone()
+                                        } else {
+                                            p.span.clone()
+                                        };
+                                        self.edit(span, format!("{{r:{j}}}"));
+                                    }
+                                }
+                                continue;
+                            }
                             Ok(cols) => {
                                 let list: Vec<String> =
                                     cols.iter().map(|c| c.meta.name.clone()).collect();
@@ -820,6 +855,29 @@ impl<'e, 'b> Walk<'e, 'b> {
                         }
                     }
                 }
+                if let NameRef::Pos(i) = &m.name {
+                    // Only a summary row's result columns; when the summary
+                    // can't be worked out the token stays as it is.
+                    let tt = self.target(o, &self.node.clone(), self.table, &mut env.clone(), 0);
+                    let found = tt.and_then(|tt| {
+                        let snap = self.en.snap(&tt.node).ok()?;
+                        let t = snap.table(&tt.table)?;
+                        let cols = self.en.table_cols(&tt.node, t).ok()?;
+                        Some(
+                            self.en
+                                .find_col(&cols, &NameRef::Pos(*i))
+                                .map(|k| cols[k].meta.name.clone()),
+                        )
+                    });
+                    match found {
+                        Some(Some(n)) => self.edit(m.span.clone(), member_text(&n)),
+                        Some(None) => {
+                            self.edit(e.span.clone(), "#REF!");
+                            return;
+                        }
+                        None => {}
+                    }
+                }
                 self.shown(o, env);
             }
             ExprKind::Call(name, args)
@@ -880,7 +938,7 @@ impl<'e, 'b> Walk<'e, 'b> {
                 }
             },
             Some(part) => match &part.name {
-                NameRef::Dead => {
+                NameRef::Dead | NameRef::Pos(_) => {
                     self.edits.extend(local);
                     return;
                 }
@@ -905,6 +963,22 @@ impl<'e, 'b> Walk<'e, 'b> {
         };
         if let Some(spec) = &r.spec {
             for p in pieces(spec) {
+                if let NameRef::Pos(i) = &p.name {
+                    // When the summary fails its result is unknown: keep the token.
+                    let Ok(cols) = self.en.table_cols(&node, table) else {
+                        continue;
+                    };
+                    match self.en.find_col(&cols, &NameRef::Pos(*i)) {
+                        Some(k) => {
+                            let text = col_text(&cols[k].meta.name, spec, p);
+                            local.push((p.span.clone(), text));
+                        }
+                        None => {
+                            self.edit(span, "#REF!");
+                            return;
+                        }
+                    }
+                }
                 if let NameRef::Id(id) = &p.name {
                     match table.column(id) {
                         Some(c) => {

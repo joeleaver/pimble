@@ -73,6 +73,9 @@ impl BinOp {
 pub enum NameRef {
     Name(String),
     Id(String),
+    /// A summary's result column by its 0-based position in the result
+    /// (`{r:<index>}`), before `headers` renames it.
+    Pos(usize),
     Dead,
 }
 
