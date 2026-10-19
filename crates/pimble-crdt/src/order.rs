@@ -1,4 +1,4 @@
-//! Fractional indexing for `order` (docs/IMAGE_MARKUP_CONTRACT.md section 3):
+//! Fractional indexing for `order` keys (first written for boards, docs/IMAGE_MARKUP_CONTRACT.md section 3; sheets use it too):
 //! a layer's place among layers and an element's z-order within its layer are
 //! strings that sort, and a new place between two others is a new string
 //! between them, so a reorder writes one key of one map and two concurrent

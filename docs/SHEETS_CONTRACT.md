@@ -49,10 +49,10 @@ used both ways"):
   (rinch's `embed` with `data-sheet=<table id>`). Pimble renders it there as a live
   component through rinch's node views (section 9). Insert > "Sheet" adds one at the
   caret.
-- **Both keep their tables in the same place**: `data.sheets.<table id>` in the node's
-  own document. A table in a text node that no atom names any more, e.g. after its atom
-  was deleted, shows in a "Tables no longer in the text" list on that node, with "Put
-  Back". Nothing is deleted behind the person's back.
+- **Both keep their tables in the same place**: each table is a key `sheet:<table id>` of
+  the node's own `data` root (section 2). A table in a text node that no atom names any
+  more, e.g. after its atom was deleted, shows in a "Tables no longer in the text" list on
+  that node, with "Put Back". Nothing is deleted behind the person's back.
 
 "Convert to Sheet Node" and its reverse move tables between a text node and a new sheet
 node, the way "Convert to Image Node" does for boards.
@@ -63,7 +63,8 @@ Everything a person types is co-edited data in the node's `data` root, keyed by 
 never move inside arrays, so concurrent edits to different rows, columns or cells merge.
 
 ```
-data.sheets.<table id>: Map
+data["sheet:<table id>"]: Map           one key of the node's `data` root per table
+  v:       1
   name:    String           unique within the note when set (section 5)
   order:   String           fractional; a sheet node's stacking order
   source:  String | absent  a summary's formula (section 4); absent for a plain table
@@ -78,6 +79,13 @@ data.sheets.<table id>: Map
     order: String (fractional)
     cells: Map<column id, value>
 ```
+
+- **No container is ever created on first use.** Each table is a key of the `data` root,
+  which always exists, and its inner maps are made by whoever makes the table. A map
+  created on first use (a `data.sheets` holding the tables) would lose one side's tables
+  when two devices each added a note's first table while apart: both would write a new
+  map to the same key, and yrs keeps one. Other users of the `data` root (boards,
+  plugins) keep their own keys beside these.
 
 - **A cell's value** is plain data: a number, a string, an ISO date string, a link as
   `{ row: <row id> }` or `{ node: [store, node] }`, or the text as typed when it does not

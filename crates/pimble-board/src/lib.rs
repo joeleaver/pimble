@@ -28,7 +28,7 @@ pub mod doc;
 mod hit;
 pub mod model;
 pub mod options;
-pub mod order;
+pub use pimble_crdt::order;
 mod paint;
 pub mod render;
 pub mod snapshot;

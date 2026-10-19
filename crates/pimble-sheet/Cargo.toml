@@ -1,0 +1,20 @@
+[package]
+name = "pimble-sheet"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Sheets (docs/SHEETS_CONTRACT.md): small live tables in a node's `data` root, and the Excel formula engine that computes them. No UI. Pure Rust, native and wasm32."
+
+[dependencies]
+pimble-core = { workspace = true }
+pimble-crdt = { workspace = true }
+yrs = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+
+# uuid v4 needs a randomness backend in the browser; the native build has one.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+uuid = { workspace = true, features = ["js"] }

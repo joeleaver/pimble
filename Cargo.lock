@@ -5277,6 +5277,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pimble-sheet"
+version = "0.9.0"
+dependencies = [
+ "chrono",
+ "pimble-core",
+ "pimble-crdt",
+ "serde",
+ "thiserror 2.0.17",
+ "uuid",
+ "yrs",
+]
+
+[[package]]
 name = "pimble-store"
 version = "0.9.0"
 dependencies = [

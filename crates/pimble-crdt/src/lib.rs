@@ -18,6 +18,7 @@ pub mod error;
 pub mod links;
 pub mod markdown;
 pub mod node_doc;
+pub mod order;
 pub mod store_document;
 pub mod tree;
 mod sync_util;
