@@ -319,7 +319,10 @@ release. Wave 2 (keyboard, rinch branch `feat/tree-keyboard`): the Tree moves a 
 offers keys to `handle_key` first; `pimble-app/src/tree_keys.rs` binds Pimble's (Enter,
 F2, Alt+Shift+arrows through `plan_drop`, new sibling/child, Delete, cut/paste); the
 document follows the cursor; creating takes a `Place` too. `start_rename` is the one way a
-rename starts.
+rename starts. Wave 3 (multi-select, rinch branch `feat/tree-multiselect`): Ctrl/Shift
+clicks and keys select several rows; drops, keyboard moves, Delete, cut/paste and the row
+menu act on the selection; several nodes of one store move with the `moveNodes` RPC (all
+judged first, one refusal refuses all).
 
 ### Tree appearance (done 2026-09-15)
 

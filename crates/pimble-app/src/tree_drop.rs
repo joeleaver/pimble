@@ -5,7 +5,9 @@
 //! The Tree knows rows; this knows stores. `plan_drop` is the one place a
 //! drop is judged: the Tree asks it while dragging (`judge_drop`), the strip
 //! shows its sentence (`ondropchange`), and a release sends what it planned
-//! (`ondrop`), so what was shown is what happens.
+//! (`ondrop`), so what was shown is what happens. A drop carries one row or
+//! a selection (wave 3); every node of it is judged, and one refusal refuses
+//! them all (Joe, 2026-10-19).
 
 use pimble_core::{NodeId, Place, StoreAccess, StoreId};
 use rinch::prelude::{untracked, DropVerdict, TreeDrop, TreeSlot};
@@ -27,9 +29,10 @@ pub struct DropHint {
 /// What a drop does.
 #[derive(Debug)]
 pub(crate) enum DropPlan {
-    /// Send `cmd`; `hint` says where it lands. `expand` is the tree value of
-    /// the new parent, opened once the move is answered so the node is seen.
-    Send { cmd: BackendCommand, hint: DropHint, expand: Option<String> },
+    /// Send `cmds`, in order; `hint` says where it lands. `expand` is the
+    /// tree value of the new parent, opened once the move is answered so the
+    /// nodes are seen.
+    Send { cmds: Vec<BackendCommand>, hint: DropHint, expand: Option<String> },
     /// It is already there: nothing to send.
     Stays(DropHint),
     Refused(DropHint),
@@ -56,29 +59,37 @@ pub(crate) const INTO_ITSELF: &str = "A node can't go inside itself.";
 pub(crate) const MOUNT_NOT_HERE: &str = "This mount's store isn't open here.";
 pub(crate) const NOT_A_NODE: &str = "Only nodes can be moved.";
 
+/// One dragged node, as `judge` needs it.
+#[derive(Clone, Debug)]
+pub(crate) struct NodeFacts {
+    pub node: (StoreId, NodeId),
+    /// The node itself, and the list it leaves.
+    pub node_access: StoreAccess,
+    pub leaves_access: StoreAccess,
+    /// The new parent is this node or under it.
+    pub into_itself: bool,
+    /// The drop puts it exactly where it is.
+    pub stays: bool,
+    /// The nearest share the move would take it out of.
+    pub leaves_share: Option<String>,
+    pub store_name: String,
+}
+
 /// Everything `judge` needs, read from the app's state by `facts_of`.
 #[derive(Clone, Debug)]
 pub(crate) struct DropFacts {
-    pub dragged: (StoreId, NodeId),
+    /// The dragged nodes, top to bottom.
+    pub nodes: Vec<NodeFacts>,
     /// The new parent as a node (through a mount: its source), or why
     /// there is none.
     pub target: Result<(StoreId, NodeId), &'static str>,
     pub place: Place,
-    /// The node itself, the list it leaves, the list it joins.
-    pub node_access: StoreAccess,
-    pub leaves_access: StoreAccess,
+    /// The list the nodes join.
     pub target_access: StoreAccess,
-    /// The new parent is the dragged node or under it.
-    pub into_itself: bool,
-    /// The drop puts it exactly where it is.
-    pub stays: bool,
     /// Names for the sentence.
     pub parent_name: String,
     pub anchor_name: Option<String>,
-    pub from_store_name: String,
     pub to_store_name: String,
-    /// The nearest share the move would take it out of.
-    pub leaves_share: Option<String>,
     /// The new parent's tree value, to open after the move.
     pub parent_value: Option<String>,
 }
@@ -90,45 +101,77 @@ pub(crate) fn judge(facts: &DropFacts) -> DropPlan {
         Ok(target) => target,
         Err(reason) => return refuse(reason),
     };
-    if facts.into_itself {
+    if facts.nodes.is_empty() {
+        return refuse(NOT_A_NODE);
+    }
+    // One refusal refuses them all.
+    if facts.nodes.iter().any(|n| n.into_itself) {
         return refuse(INTO_ITSELF);
     }
-    if !facts.node_access.allows_write() || !facts.leaves_access.allows_write() || !facts.target_access.allows_write() {
+    let read_only = |n: &NodeFacts| !n.node_access.allows_write() || !n.leaves_access.allows_write();
+    if !facts.target_access.allows_write() || facts.nodes.iter().any(read_only) {
         return refuse(StoreAccess::READ_ONLY_REFUSAL);
     }
+
+    let count = facts.nodes.len();
+    let what = format!("{count} items");
     let line = match (&facts.place, &facts.anchor_name) {
-        (Place::After(_), Some(anchor)) => format!("In {}, after {}", facts.parent_name, anchor),
-        (Place::First, _) => format!("Into {}, first", facts.parent_name),
-        _ => format!("Into {}", facts.parent_name),
+        (Place::After(_), Some(anchor)) if count == 1 => format!("In {}, after {}", facts.parent_name, anchor),
+        (Place::After(_), Some(anchor)) => format!("{what} in {}, after {}", facts.parent_name, anchor),
+        (Place::First, _) if count == 1 => format!("Into {}, first", facts.parent_name),
+        (Place::First, _) => format!("{what} into {}, first", facts.parent_name),
+        _ if count == 1 => format!("Into {}", facts.parent_name),
+        _ => format!("{what} into {}", facts.parent_name),
     };
-    if facts.stays {
+    if count == 1 && facts.nodes[0].stays {
         return DropPlan::Stays(DropHint { line: "Where it is".into(), warning: None, refused: false });
     }
-    let (dragged_store, dragged_node) = facts.dragged;
-    let (cmd, warning) = if dragged_store == target.0 {
-        let warning = facts.leaves_share.as_ref().map(|share| {
-            format!("Leaves the share {share}: its members will see it deleted and can put it back.")
-        });
-        (
-            BackendCommand::MoveNode { store_id: dragged_store, node_id: dragged_node, new_parent_id: target.1, place: facts.place },
-            warning,
-        )
-    } else {
-        (
-            BackendCommand::TransplantNode {
-                from_store_id: dragged_store,
-                node_id: dragged_node,
-                to_store_id: target.0,
-                new_parent_id: target.1,
-                place: facts.place,
-            },
-            Some(format!(
-                "A new node in {}; it is deleted from {} (Put Back in Recently Deleted).",
-                facts.to_store_name, facts.from_store_name
-            )),
-        )
+
+    // What else it does: new nodes in another store, or leaving a share.
+    let (it, they) = if count == 1 { ("it", "it is") } else { ("them", "they are") };
+    let warning = match facts.nodes.iter().find(|n| n.node.0 != target.0) {
+        Some(from) => Some(format!(
+            "{} in {}; {they} deleted from {} (Put Back in Recently Deleted).",
+            if count == 1 { "A new node" } else { "New nodes" },
+            facts.to_store_name,
+            from.store_name
+        )),
+        None => facts
+            .nodes
+            .iter()
+            .find_map(|n| n.leaves_share.as_ref())
+            .map(|share| format!("Leaves the share {share}: its members will see {it} deleted and can put {it} back.")),
     };
-    DropPlan::Send { cmd, hint: DropHint { line, warning, refused: false }, expand: facts.parent_value.clone() }
+
+    DropPlan::Send { cmds: commands(facts, target), hint: DropHint { line, warning, refused: false }, expand: facts.parent_value.clone() }
+}
+
+/// The commands that make the drop. All in the target's store: one
+/// `moveNodes` (or `moveNode` for one), judged by the server all or none.
+/// Otherwise one per node, each at the same place, the last first (in order
+/// when the place is the end), so they land in their order without waiting
+/// on the ids a transplant gives.
+fn commands(facts: &DropFacts, target: (StoreId, NodeId)) -> Vec<BackendCommand> {
+    let (to_store, parent) = target;
+    let place = facts.place;
+    if facts.nodes.iter().all(|n| n.node.0 == to_store) {
+        let ids: Vec<NodeId> = facts.nodes.iter().map(|n| n.node.1).collect();
+        return match ids.as_slice() {
+            [one] => vec![BackendCommand::MoveNode { store_id: to_store, node_id: *one, new_parent_id: parent, place }],
+            _ => vec![BackendCommand::MoveNodes { store_id: to_store, node_ids: ids, new_parent_id: parent, place }],
+        };
+    }
+    let one = |n: &NodeFacts| {
+        if n.node.0 == to_store {
+            BackendCommand::MoveNode { store_id: to_store, node_id: n.node.1, new_parent_id: parent, place }
+        } else {
+            BackendCommand::TransplantNode { from_store_id: n.node.0, node_id: n.node.1, to_store_id: to_store, new_parent_id: parent, place }
+        }
+    };
+    match place {
+        Place::Last => facts.nodes.iter().map(one).collect(),
+        _ => facts.nodes.iter().rev().map(one).collect(),
+    }
 }
 
 /// What a drag from the row `value` carries: a node, never a store row.
@@ -144,6 +187,25 @@ pub(crate) fn plan_drop(store: AppStore, drop: &TreeDrop) -> DropPlan {
     match facts_of(store, drop) {
         Ok(facts) => judge(&facts),
         Err(reason) => DropPlan::Refused(DropHint { line: reason.to_string(), warning: None, refused: true }),
+    }
+}
+
+/// Send what a plan says to send; `true` when it sent anything.
+pub(crate) fn send_plan(store: AppStore, plan: DropPlan) -> bool {
+    match plan {
+        DropPlan::Send { cmds, expand, .. } => {
+            // The new parent's exact (possibly mount-path-qualified) tree
+            // value, so `NodeMoved` opens precisely this place.
+            if let Some(value) = expand {
+                crate::state::set_last_drop_target_value(value);
+            }
+            for cmd in cmds {
+                tracing::info!("Drop: {:?}", cmd);
+                store.send(cmd);
+            }
+            true
+        }
+        _ => false,
     }
 }
 
@@ -170,10 +232,6 @@ fn path_up(store: AppStore, store_id: StoreId, node: NodeId) -> Vec<NodeId> {
 
 /// Read what `judge` needs from the app's state.
 fn facts_of(store: AppStore, drop: &TreeDrop) -> Result<DropFacts, &'static str> {
-    // One row at a time until the explorer has a selection (wave 3).
-    let dragged_value = drop.dragged.first().ok_or(NOT_A_NODE)?;
-    let Some((drag_store, Some(drag_node))) = parse_tree_value(dragged_value) else { return Err(NOT_A_NODE) };
-
     // The new parent: a store row stands for its root, and a mount for the
     // node it mounts, whose children are the ones drawn under it.
     let target = match drop.parent.as_deref().map(parse_tree_value) {
@@ -200,48 +258,52 @@ fn facts_of(store: AppStore, drop: &TreeDrop) -> Result<DropFacts, &'static str>
         (Place::After(anchor), Ok((s, _))) => Some(store.display_label(*s, *anchor)),
         _ => None,
     };
-
-    let old_parent = store.cached_parent_id(drag_store, drag_node);
-    let node_access = store.node_access(drag_store, drag_node);
-    let leaves_access = old_parent.map_or(StoreAccess::Full, |p| store.node_access(drag_store, p));
-    let (target_access, into_itself, stays, parent_name, leaves_share) = match target {
+    let (target_access, target_path, parent_name) = match target {
         Ok((ts, tn)) => {
-            let same_store = ts == drag_store;
-            let target_path = path_up(store, ts, tn);
-            let into_itself = same_store && target_path.contains(&drag_node);
-            let stays = same_store && old_parent == Some(tn) && stays_put(store, ts, tn, drag_node, place);
             let parent_name = if store.root_node_id(ts) == Some(tn) { store_name(store, ts) } else { store.display_label(ts, tn) };
-            // docs/MOVE_CONTRACT.md "What 'out of a share' means": a share
-            // above the node that is not above (or at) the new parent. A
-            // move to another store leaves every share, and says so anyway.
-            let leaves_share = if same_store {
-                path_up(store, drag_store, drag_node)
+            (store.node_access(ts, tn), path_up(store, ts, tn), parent_name)
+        }
+        Err(_) => (StoreAccess::Full, Vec::new(), String::new()),
+    };
+
+    let mut nodes = Vec::with_capacity(drop.dragged.len());
+    for value in &drop.dragged {
+        let Some((s, Some(n))) = parse_tree_value(value) else { return Err(NOT_A_NODE) };
+        let old_parent = store.cached_parent_id(s, n);
+        let (into_itself, stays, leaves_share) = match target {
+            Ok((ts, tn)) if ts == s => {
+                let stays = old_parent == Some(tn) && stays_put(store, ts, tn, n, place);
+                // docs/MOVE_CONTRACT.md "What 'out of a share' means": a
+                // share above the node that is not above (or at) the new
+                // parent.
+                let leaves_share = path_up(store, s, n)
                     .into_iter()
                     .skip(1)
-                    .find(|r| store.is_shared(drag_store, *r) && !target_path.contains(r))
-                    .map(|r| store.display_label(drag_store, r))
-            } else {
-                None
-            };
-            (store.node_access(ts, tn), into_itself, stays, parent_name, leaves_share)
-        }
-        Err(_) => (StoreAccess::Full, false, false, String::new(), None),
-    };
-    let to_store = target.map(|(s, _)| s).unwrap_or(drag_store);
+                    .find(|r| store.is_shared(s, *r) && !target_path.contains(r))
+                    .map(|r| store.display_label(s, r));
+                (target_path.contains(&n), stays, leaves_share)
+            }
+            _ => (false, false, None),
+        };
+        nodes.push(NodeFacts {
+            node: (s, n),
+            node_access: store.node_access(s, n),
+            leaves_access: old_parent.map_or(StoreAccess::Full, |p| store.node_access(s, p)),
+            into_itself,
+            stays,
+            leaves_share,
+            store_name: store_name(store, s),
+        });
+    }
+    let to_store = target.map(|(s, _)| s).ok().or(nodes.first().map(|n| n.node.0));
     Ok(DropFacts {
-        dragged: (drag_store, drag_node),
+        nodes,
         target,
         place,
-        node_access,
-        leaves_access,
         target_access,
-        into_itself,
-        stays,
         parent_name,
         anchor_name,
-        from_store_name: store_name(store, drag_store),
-        to_store_name: store_name(store, to_store),
-        leaves_share,
+        to_store_name: to_store.map(|s| store_name(store, s)).unwrap_or_default(),
         parent_value: drop.parent.clone().filter(|v| v.starts_with("node_")),
     })
 }
@@ -263,22 +325,28 @@ mod tests {
     use super::*;
     use pimble_core::StoreAccess::{Full, Read};
 
+    fn node(s: StoreId) -> NodeFacts {
+        NodeFacts {
+            node: (s, NodeId::new()),
+            node_access: Full,
+            leaves_access: Full,
+            into_itself: false,
+            stays: false,
+            leaves_share: None,
+            store_name: "Family".into(),
+        }
+    }
+
     fn facts() -> DropFacts {
         let s = StoreId::new();
         DropFacts {
-            dragged: (s, NodeId::new()),
+            nodes: vec![node(s)],
             target: Ok((s, NodeId::new())),
             place: Place::Last,
-            node_access: Full,
-            leaves_access: Full,
             target_access: Full,
-            into_itself: false,
-            stays: false,
             parent_name: "MEDICAL".into(),
             anchor_name: None,
-            from_store_name: "Family".into(),
             to_store_name: "Family".into(),
-            leaves_share: None,
             parent_value: Some("node_x_y".into()),
         }
     }
@@ -296,10 +364,12 @@ mod tests {
         let plan = judge(&f);
         assert_eq!(line(&plan), "In MEDICAL, after Boo Kitty Medical");
         match plan {
-            DropPlan::Send { cmd: BackendCommand::MoveNode { store_id, node_id, new_parent_id, place }, hint, expand } => {
-                assert_eq!((store_id, node_id), f.dragged);
-                assert_eq!(new_parent_id, f.target.unwrap().1);
-                assert_eq!(place, Place::After(anchor));
+            DropPlan::Send { cmds, hint, expand } => {
+                assert!(matches!(
+                    cmds.as_slice(),
+                    [BackendCommand::MoveNode { store_id, node_id, new_parent_id, place }]
+                        if (*store_id, *node_id) == f.nodes[0].node && *new_parent_id == f.target.unwrap().1 && *place == Place::After(anchor)
+                ));
                 assert_eq!(hint.warning, None);
                 assert_eq!(expand.as_deref(), Some("node_x_y"));
             }
@@ -315,6 +385,52 @@ mod tests {
         assert_eq!(line(&judge(&f)), "Into MEDICAL, first");
     }
 
+    /// Several nodes of the target's store go as one `moveNodes`, in order,
+    /// and the sentence counts them.
+    #[test]
+    fn several_nodes_move_as_one_request_and_are_counted() {
+        let mut f = facts();
+        let s = f.nodes[0].node.0;
+        f.nodes.push(node(s));
+        f.nodes.push(node(s));
+        let ids: Vec<NodeId> = f.nodes.iter().map(|n| n.node.1).collect();
+        let plan = judge(&f);
+        assert_eq!(line(&plan), "3 items into MEDICAL");
+        match plan {
+            DropPlan::Send { cmds, .. } => assert!(matches!(
+                cmds.as_slice(),
+                [BackendCommand::MoveNodes { node_ids, place: Place::Last, .. }] if *node_ids == ids
+            )),
+            other => panic!("expected a move, got {other:?}"),
+        }
+    }
+
+    /// Nodes from another store go one command each, the last first, at the
+    /// same place: they land in their order.
+    #[test]
+    fn nodes_from_another_store_go_last_first_at_one_place() {
+        let mut f = facts();
+        let other = StoreId::new();
+        f.nodes = vec![node(other), node(other)];
+        f.place = Place::First;
+        f.to_store_name = "Work".into();
+        let ids: Vec<NodeId> = f.nodes.iter().map(|n| n.node.1).collect();
+        match judge(&f) {
+            DropPlan::Send { cmds, hint, .. } => {
+                let sent: Vec<NodeId> = cmds
+                    .iter()
+                    .map(|c| match c {
+                        BackendCommand::TransplantNode { node_id, place: Place::First, .. } => *node_id,
+                        other => panic!("expected a transplant, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(sent, vec![ids[1], ids[0]]);
+                assert_eq!(hint.warning.as_deref(), Some("New nodes in Work; they are deleted from Family (Put Back in Recently Deleted)."));
+            }
+            other => panic!("expected transplants, got {other:?}"),
+        }
+    }
+
     /// docs/MOVE_CONTRACT.md: a move between stores is always a transplant,
     /// and the strip says what that means before the drop.
     #[test]
@@ -324,12 +440,9 @@ mod tests {
         f.target = Ok((other, NodeId::new()));
         f.to_store_name = "Work".into();
         match judge(&f) {
-            DropPlan::Send { cmd: BackendCommand::TransplantNode { to_store_id, place, .. }, hint, .. } => {
-                assert_eq!((to_store_id, place), (other, Place::Last));
-                assert_eq!(
-                    hint.warning.as_deref(),
-                    Some("A new node in Work; it is deleted from Family (Put Back in Recently Deleted).")
-                );
+            DropPlan::Send { cmds, hint, .. } => {
+                assert!(matches!(cmds.as_slice(), [BackendCommand::TransplantNode { to_store_id, place: Place::Last, .. }] if *to_store_id == other));
+                assert_eq!(hint.warning.as_deref(), Some("A new node in Work; it is deleted from Family (Put Back in Recently Deleted)."));
             }
             other => panic!("expected a transplant, got {other:?}"),
         }
@@ -338,7 +451,7 @@ mod tests {
     #[test]
     fn leaving_a_share_is_said_before_the_drop() {
         let mut f = facts();
-        f.leaves_share = Some("Taxes 2025".into());
+        f.nodes[0].leaves_share = Some("Taxes 2025".into());
         assert_eq!(
             judge(&f).hint().warning.as_deref(),
             Some("Leaves the share Taxes 2025: its members will see it deleted and can put it back.")
@@ -346,12 +459,15 @@ mod tests {
     }
 
     /// Any of the three documents a move touches being read only refuses
-    /// the drop (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles").
+    /// the drop (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"), and one
+    /// node that may not move refuses all of them.
     #[test]
     fn a_read_only_place_refuses_the_drop() {
         for (n, l, t) in [(Read, Full, Full), (Full, Read, Full), (Full, Full, Read)] {
             let mut f = facts();
-            (f.node_access, f.leaves_access, f.target_access) = (n, l, t);
+            let s = f.nodes[0].node.0;
+            f.nodes.insert(0, node(s));
+            (f.nodes[1].node_access, f.nodes[1].leaves_access, f.target_access) = (n, l, t);
             let plan = judge(&f);
             assert_eq!(plan.verdict(), DropVerdict::Refused);
             assert_eq!(line(&plan), StoreAccess::READ_ONLY_REFUSAL);
@@ -364,7 +480,7 @@ mod tests {
         f.target = Err(BESIDE_A_STORE);
         assert_eq!(line(&judge(&f)), BESIDE_A_STORE);
         let mut f = facts();
-        f.into_itself = true;
+        f.nodes[0].into_itself = true;
         assert_eq!(line(&judge(&f)), INTO_ITSELF);
         let mut f = facts();
         f.target = Err(MOUNT_NOT_HERE);
@@ -374,7 +490,7 @@ mod tests {
     #[test]
     fn a_drop_where_it_already_is_sends_nothing() {
         let mut f = facts();
-        f.stays = true;
+        f.nodes[0].stays = true;
         let plan = judge(&f);
         assert!(matches!(plan, DropPlan::Stays(_)));
         assert_eq!(plan.verdict(), DropVerdict::Allowed);

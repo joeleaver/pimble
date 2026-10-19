@@ -73,7 +73,7 @@ pub(crate) fn reveal_in_tree(store: AppStore, tree_state: UseTreeReturn, store_i
             store.send(BackendCommand::GetChildren { store_id, node_id: ancestor });
         }
     }
-    tree_state.controller.select(&value);
+    tree_state.controller.set_selection([value.clone()]);
     store.bump_tree_structure();
     crate::app::reveal_row(value);
 }
@@ -919,7 +919,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // and its row starts renaming once drawn.
                 if let Some(value) = crate::state::take_pending_create(*store_id, parent, *node_id) {
                     tree_state.controller.set_cursor(&value);
-                    tree_state.controller.select(&value);
+                    tree_state.controller.set_selection([value.clone()]);
                 }
                 // Re-fetch parent's children so the new node appears (triggers ChildrenLoaded → bump)
                 store.send(BackendCommand::GetChildren { store_id: *store_id, node_id: parent });
@@ -977,7 +977,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     store.select_in_pane(pane, Some(value.clone()));
                     store.pane(pane).show_editor.set(true);
                     if pane == store.focused() {
-                        tree_state.controller.select(&value);
+                        tree_state.controller.set_selection([value.clone()]);
                         store.node_title.set(title.clone());
                     }
                 }

@@ -50,7 +50,7 @@ use jsonrpsee::core::{async_trait, SubscriptionResult};
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{Extensions, PendingSubscriptionSink, SubscriptionMessage};
 use pimble_client::{describe_connect_error, PimbleClient};
-use pimble_core::{AuthMethod, BlobUrl, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState, Workspace};
+use pimble_core::{AuthMethod, BlobUrl, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, Place, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState, Workspace};
 use pimble_crdt::{NodeDoc, NodeFields, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_plugins::PluginHost;
 use pimble_rpc::{
@@ -64,7 +64,7 @@ use pimble_rpc::{
     CreateWorkspaceRequest, DeleteNodeRequest, EditOperation, EmptyResponse, GetChildrenRequest,
     GetChildrenResponse, GetMountStateRequest, GetMountStateResponse, GetNodeRequest, GetStoreSyncRequest, GetStoreSyncResponse, SetStoreSyncRequest,
     GetNodeResponse, GetNodesRequest, GetNodesResponse, ListRemoteStoresRequest, ListStoresResponse, LoadWorkspaceRequest,
-    LoadWorkspaceResponse, MoveNodeRequest, MoveNodeResponse, ListDeletedRequest, ListDeletedResponse, TransplantNodeRequest, TransplantNodeResponse, NodeContentChangedNotification, NodeContentDiff, OpenStoreRequest,
+    LoadWorkspaceResponse, MoveNodeRequest, MoveNodeResponse, MoveNodesRequest, MoveNodesResponse, ListDeletedRequest, ListDeletedResponse, TransplantNodeRequest, TransplantNodeResponse, NodeContentChangedNotification, NodeContentDiff, OpenStoreRequest,
     OpenStoreResponse, PimbleApiServer, RebuildIndexRequest, RebuildIndexResponse, RemoveReplicaRequest,
     SaveWorkspaceRequest, SearchRequest, SearchResponse, SearchResultItem, StoreChangeKind,
     CloudShareInfoResponse, CloudShareInviteRequest, CloudShareNodeRequest, CloudShareRef, CloudShareRemoveMemberRequest, DeleteVaultStoreRequest,
@@ -3836,6 +3836,62 @@ impl PimbleApiServer for RpcHandler {
         }
 
         Ok(MoveNodeResponse { node_id: new_node_id, left_shares })
+    }
+
+    async fn move_nodes(
+        &self,
+        ext: &Extensions,
+        request: MoveNodesRequest,
+    ) -> Result<MoveNodesResponse, ErrorObjectOwned> {
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Write)?;
+        self.reject_if_vault(request.store_id).await?;
+        let mut node_ids: Vec<NodeId> = Vec::with_capacity(request.node_ids.len());
+        for id in &request.node_ids {
+            if !node_ids.contains(id) {
+                node_ids.push(*id);
+            }
+        }
+
+        // Every node is judged before any is moved: one refusal refuses
+        // them all (docs/TREE_CONTRACT.md, Joe 2026-10-19).
+        {
+            let manager = self.store_manager.write().await;
+            let reach = Reach::of(&manager, &principal, request.store_id);
+            require_in_scope(&reach, request.new_parent_id, Access::Write)?;
+            if manager.write_refused(request.store_id, &[request.new_parent_id]) {
+                return Err(read_only_error());
+            }
+            let tree = manager.tree(request.store_id).map_err(to_rpc_error)?;
+            for &id in &node_ids {
+                judge_move_source(&manager, &reach, request.store_id, id)?;
+                let under = tree.subtree_ids(id).unwrap_or_else(|_| vec![id]);
+                if under.contains(&request.new_parent_id) {
+                    return Err(to_rpc_error(pimble_store::StoreError::InvalidOperation(
+                        "Cannot move a node into one of its own descendants".into(),
+                    )));
+                }
+            }
+        }
+
+        // Then each through `moveNode`. To keep their order without
+        // waiting on the ids transplants give them, every node goes to the
+        // same place, the last first; at the end they simply go in order.
+        let mut answers: HashMap<NodeId, MoveNodeResponse> = HashMap::new();
+        let order: Vec<NodeId> = match request.place {
+            Place::Last => node_ids.clone(),
+            _ => node_ids.iter().rev().copied().collect(),
+        };
+        for id in order {
+            let answer = self
+                .move_node(
+                    ext,
+                    MoveNodeRequest { store_id: request.store_id, node_id: id, new_parent_id: request.new_parent_id, place: request.place },
+                )
+                .await?;
+            answers.insert(id, answer);
+        }
+        Ok(MoveNodesResponse { moved: node_ids.iter().filter_map(|id| answers.remove(id)).collect() })
     }
 
     async fn transplant_node(

@@ -714,6 +714,12 @@ async fn route(
     // that is no error (docs/RELAY_CONTRACT.md, "The apps").
     let cmd = match vault.handle_unreachable(cmd) {
         Handled::Yes(event) => return event,
+        Handled::Several(events) => {
+            for event in events {
+                emit(event_tx, signal_ui, event);
+            }
+            return None;
+        }
         Handled::No(cmd) => cmd,
     };
 
@@ -743,6 +749,12 @@ async fn route(
     let cmd = match client.as_ref() {
         Some(connected) => match vault.handle(connected, cmd, signal_ui).await {
             Handled::Yes(event) => return event,
+            Handled::Several(events) => {
+                for event in events {
+                    emit(event_tx, signal_ui, event);
+                }
+                return None;
+            }
             Handled::No(cmd) => cmd,
         },
         None => cmd,

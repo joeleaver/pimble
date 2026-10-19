@@ -303,7 +303,7 @@ pub(crate) fn open_node_in(store: AppStore, tree_state: UseTreeReturn, pane: Pan
     // Whatever the saved layout meant this pane for, the person chose this.
     state.restore.set(None);
     if focused {
-        tree_state.controller.select(&value);
+        tree_state.controller.set_selection([value.clone()]);
     }
 
     // Offline-first: a document opens from the cached content at once and
@@ -469,6 +469,39 @@ pub(crate) fn start_rename(store: AppStore, tree_state: UseTreeReturn, value: &s
         let _ = set_timeout(0, move || input.focus());
     }
     true
+}
+
+/// What a row's menu acts on: the selection when the row is one of several
+/// selected rows, the row alone otherwise (docs/TREE_CONTRACT.md
+/// "Multi-select"). A right-click does not change the selection.
+fn rows_for_menu(tree_state: UseTreeReturn, value: &str) -> Vec<String> {
+    let selected = untracked(|| tree_state.selected.get());
+    if selected.len() > 1 && selected.contains(value) {
+        let mut rows: Vec<String> = selected.into_iter().collect();
+        rows.sort();
+        rows
+    } else {
+        vec![value.to_string()]
+    }
+}
+
+/// "Copy Link" over several rows: one link per line.
+fn copy_links(store: AppStore, values: &[String]) {
+    if let [one] = values {
+        return copy_link(store, one);
+    }
+    let links: Vec<String> = values
+        .iter()
+        .filter_map(|v| {
+            let (s_id, node_id_opt) = parse_tree_value(v)?;
+            let node_id = node_id_opt.or_else(|| store.root_node_id(s_id))?;
+            Some(pimble_core::PimbleUrl::node(s_id, node_id).to_string())
+        })
+        .collect();
+    match crate::links::copy_text(&links.join("\n")) {
+        Ok(()) => crate::events::show_notice(store, format!("{} links copied.", links.len())),
+        Err(e) => crate::events::show_notice(store, format!("The links could not be copied: {e}")),
+    }
 }
 
 /// "Copy Link" (docs/LINKS_CONTRACT.md "Making a link"): the row's node, or a
@@ -1013,7 +1046,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
     let last_click: Rc<Cell<(f64, String)>> = Rc::new(Cell::new((now_ms(), String::new())));
 
     // Persistent tree state — created once, preserves expanded/selected across data changes
-    let tree_state = UseTreeReturn::new(UseTreeOptions::default());
+    let tree_state = UseTreeReturn::new(UseTreeOptions { multiple: true, ..Default::default() });
     TREE_STATE.with(|cell| cell.set(Some(tree_state)));
 
     // A followed link's target opens the way a search hit does, with
@@ -1533,10 +1566,12 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             let on_delete = {
                 let nv = nv_ctx.clone();
                 move || {
-                    if let Some((s_id, Some(n_id))) = parse_tree_value(&nv) {
-                        store.send(BackendCommand::DeleteNode {
-                            store_id: s_id, node_id: n_id,
-                        });
+                    for value in rows_for_menu(tree_state, &nv) {
+                        if let Some((s_id, Some(n_id))) = parse_tree_value(&value) {
+                            store.send(BackendCommand::DeleteNode {
+                                store_id: s_id, node_id: n_id,
+                            });
+                        }
                     }
                 }
             };
@@ -1585,7 +1620,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             };
             let on_copy_link = {
                 let nv = nv_ctx.clone();
-                move || copy_link(store, &nv)
+                move || copy_links(store, &rows_for_menu(tree_state, &nv))
             };
             // "Paste Mount Here" is always rendered, disabled while nothing is
             // copied, because a `DropdownMenuItem`'s `disabled` is a value
@@ -2081,6 +2116,13 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 // "Open in Split View" (docs/SPLIT_VIEW_CONTRACT.md decision
                 // 2): the focused pane is split to the right and this
                 // document opens in the new half. Off with four panes open.
+                // With several rows selected and this one among them, the
+                // menu acts on all of them where that makes sense (Delete,
+                // Copy Link) and turns off what is for one row alone
+                // (docs/TREE_CONTRACT.md "Multi-select").
+                let nv_count = nv_for_context_menu.clone();
+                let acts_on = Memo::new(move || tree_state.selected.with(|s| if s.contains(&nv_count) { s.len().max(1) } else { 1 }));
+                let several = move || acts_on.get() > 1;
                 let nv_split = nv_for_context_menu.clone();
                 let on_open_in_split = move || {
                     let focused = store.focused();
@@ -2096,7 +2138,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             {menu_note}
                             DropdownMenuItem {
                                 left_section: TablerIcon::LayoutColumns,
-                                disabled: {move || !store.tiling.with(|tiling| tiling.can_split())},
+                                disabled: {move || several() || !store.tiling.with(|tiling| tiling.can_split())},
                                 onclick: on_open_in_split.clone(),
                                 "Open in Split View"
                             }
@@ -2162,14 +2204,14 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Edit,
-                                disabled: !can_write_tree,
-                                onclick: on_rename,
+                                disabled: {move || !can_write_tree || several()},
+                                onclick: on_rename.clone(),
                                 "Rename"
                             }
                             if CAN_ADMINISTER_STORES {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::Share,
-                                    disabled: share_disabled,
+                                    disabled: {move || share_disabled || several()},
                                     onclick: on_share.clone(),
                                     "Share..."
                                 }
@@ -2184,7 +2226,10 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 left_section: TablerIcon::Trash,
                                 disabled: !can_write_tree,
                                 onclick: on_delete,
-                                "Delete"
+                                {move || match acts_on.get() {
+                                    1 => "Delete".to_string(),
+                                    n => format!("Delete {n} Nodes"),
+                                }}
                             }
                         }
                     }
@@ -2233,15 +2278,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             store.drop_hint.set(offer.map(|(drop, _)| crate::tree_drop::plan_drop(store, &drop).hint().clone()));
         });
         let on_tree_drop = ValueCallback::new(move |drop: TreeDrop| {
-            if let crate::tree_drop::DropPlan::Send { cmd, expand, .. } = crate::tree_drop::plan_drop(store, &drop) {
-                tracing::info!("Drop: {:?}", cmd);
-                // The new parent's exact (possibly mount-path-qualified) tree
-                // value, so `NodeMoved` opens precisely this place.
-                if let Some(value) = expand {
-                    crate::state::set_last_drop_target_value(value);
-                }
-                store.send(cmd);
-            }
+            crate::tree_drop::send_plan(store, crate::tree_drop::plan_drop(store, &drop));
         });
         // A row dragged out of the tree onto a board becomes a node card
         // there (docs/IMAGE_MARKUP_CONTRACT.md section 4).
@@ -2352,7 +2389,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         let _ = rinch::Effect::new(move || {
             let selected = store.selected_id.get();
             untracked(|| match &selected {
-                Some(value) => tree_state.controller.select(value),
+                Some(value) => tree_state.controller.set_selection([value.clone()]),
                 None => tree_state.controller.clear_selected(),
             });
         });

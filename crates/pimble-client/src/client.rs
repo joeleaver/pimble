@@ -20,7 +20,7 @@ use pimble_rpc::{
     SetScopeRequest, VaultDocKeys, VaultSetDocKeysRequest,
     CreateMountRequest, CreateNodeRequest, CreateStoreRequest, CreateWorkspaceRequest, DeleteNodeRequest,
     EditOperation, GetChildrenRequest, GetMountStateRequest, GetNodeRequest, GetNodesRequest, GetStoreSyncRequest, GetStoreSyncResponse, SetStoreSyncRequest,
-    ListDeletedRequest, ResolveLinkRequest, ListRemoteStoresRequest, LoadWorkspaceRequest, MoveNodeRequest, MoveNodeResponse, NodeContentChangedNotification, NodeStateVector,
+    ListDeletedRequest, ResolveLinkRequest, ListRemoteStoresRequest, LoadWorkspaceRequest, MoveNodeRequest, MoveNodeResponse, MoveNodesRequest, MoveNodesResponse, NodeContentChangedNotification, NodeStateVector,
     TransplantNodeRequest, TransplantNodeResponse,
     OpenStoreRequest, PimbleApiClient, RebuildIndexRequest, RemoveReplicaRequest, SaveWorkspaceRequest,
     SearchRequest, SearchResultItem, StoreChangedNotification, SyncNodesRequest, UndeleteNodeRequest,
@@ -518,6 +518,21 @@ impl PimbleClient {
 
         self.client
             .move_node(request)
+            .await
+            .map_err(rpc_error)
+    }
+
+    /// Move several nodes of one store under one parent, in order, all or
+    /// none (`moveNodes`).
+    pub async fn move_nodes(
+        &self,
+        store_id: StoreId,
+        node_ids: Vec<NodeId>,
+        new_parent_id: NodeId,
+        place: Place,
+    ) -> Result<MoveNodesResponse> {
+        self.client
+            .move_nodes(MoveNodesRequest { store_id, node_ids, new_parent_id, place })
             .await
             .map_err(rpc_error)
     }

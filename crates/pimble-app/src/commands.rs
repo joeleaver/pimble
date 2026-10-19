@@ -258,6 +258,45 @@ pub async fn process_command(
             }
         }
 
+        BackendCommand::MoveNodes { store_id, node_ids, new_parent_id, place } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            // Each node's old parent and title, read before the move (as
+            // `MoveNode` does): after a transplant the node is a tombstone.
+            let mut before = Vec::with_capacity(node_ids.len());
+            for &node_id in &node_ids {
+                match c.get_node(store_id, node_id).await {
+                    Ok(node) => before.push((node_id, node.parent_id.unwrap_or(NodeId(uuid::Uuid::nil())), node.metadata.title)),
+                    Err(e) => return Some(BackendEvent::Error { message: e.to_string() }),
+                }
+            }
+            match c.move_nodes(store_id, node_ids, new_parent_id, place).await {
+                Ok(answer) => {
+                    for ((node_id, old_parent_id, title), moved) in before.into_iter().zip(answer.moved) {
+                        let event = if moved.node_id == node_id {
+                            BackendEvent::NodeMoved { store_id, node_id, old_parent_id, new_parent_id }
+                        } else {
+                            BackendEvent::NodeTransplanted {
+                                from_store_id: store_id,
+                                old_node_id: node_id,
+                                old_parent_id,
+                                to_store_id: store_id,
+                                node_id: moved.node_id,
+                                new_parent_id,
+                                title,
+                                left_shares: moved.left_shares,
+                            }
+                        };
+                        let _ = event_tx.try_send(event);
+                    }
+                    signal_ui();
+                    None
+                }
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
         BackendCommand::TransplantNode { from_store_id, node_id, to_store_id, new_parent_id, place } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });

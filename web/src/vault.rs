@@ -142,6 +142,9 @@ pub enum Handled {
     No(BackendCommand),
     /// Answered here. The event, if there is one, is the command's reply.
     Yes(Option<BackendEvent>),
+    /// Answered here with several events, in order (a `MoveNodes`: one per
+    /// node).
+    Several(Vec<BackendEvent>),
 }
 
 /// What this page knows about one node document's log. The document itself
@@ -1250,6 +1253,10 @@ impl VaultClient {
                 Some(self.delete_node(client, store_id, node_id).await)
             }
 
+            BackendCommand::MoveNodes { store_id, node_ids, new_parent_id, place } => {
+                return Handled::Several(self.move_nodes(client, store_id, node_ids, new_parent_id, place).await);
+            }
+
             BackendCommand::MoveNode { store_id, node_id, new_parent_id, place } => {
                 Some(self.move_node(client, store_id, node_id, new_parent_id, place).await)
             }
@@ -1732,6 +1739,45 @@ impl VaultClient {
     /// documents new-first, tombstones-last, and one `append_edit` call sends
     /// them in that order; a document an append fails on is marked unsent and
     /// resent by the existing mechanism, whichever half of the move it was.
+    /// Several nodes under one parent, in order, all or none: what `moveNodes`
+    /// is for a plain store (docs/TREE_CONTRACT.md). Every node is judged
+    /// first; then each goes to the same place, the last first (in order when
+    /// the place is the end), so they keep their order without waiting on the
+    /// ids transplants give them.
+    async fn move_nodes(
+        &mut self,
+        client: &Arc<PimbleClient>,
+        store_id: StoreId,
+        node_ids: Vec<NodeId>,
+        new_parent_id: NodeId,
+        place: Place,
+    ) -> Vec<BackendEvent> {
+        {
+            let Some(store) = self.stores.get(&store_id) else {
+                return vec![BackendEvent::Error { message: "no such encrypted store".into() }];
+            };
+            for &id in &node_ids {
+                let inside = store.tree.subtree_ids(id).map(|ids| ids.contains(&new_parent_id));
+                match inside {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        return vec![BackendEvent::Error { message: "Cannot move a node into one of its own descendants".into() }];
+                    }
+                    Err(e) => return vec![BackendEvent::Error { message: e.to_string() }],
+                }
+            }
+        }
+        let order: Vec<NodeId> = match place {
+            Place::Last => node_ids,
+            _ => node_ids.into_iter().rev().collect(),
+        };
+        let mut events = Vec::with_capacity(order.len());
+        for id in order {
+            events.push(self.move_node(client, store_id, id, new_parent_id, place).await);
+        }
+        events
+    }
+
     async fn move_node(
         &mut self,
         client: &Arc<PimbleClient>,
@@ -3608,6 +3654,7 @@ pub fn store_id_of(cmd: &BackendCommand) -> Option<StoreId> {
         | SetNodeAppearance { store_id, .. }
         | DeleteNode { store_id, .. }
         | MoveNode { store_id, .. }
+        | MoveNodes { store_id, .. }
         | UndeleteNode { store_id, .. }
         | ListDeleted { store_id }
         | GetAncestors { store_id, .. }
@@ -3646,6 +3693,7 @@ pub fn writes(cmd: &BackendCommand) -> bool {
             | DeleteNode { .. }
             | UndeleteNode { .. }
             | MoveNode { .. }
+            | MoveNodes { .. }
             | TransplantNode { .. }
             | SetNodeContent { .. }
             | BroadcastChanges { .. }
@@ -4534,6 +4582,7 @@ mod tests {
         client.endpoint_down(&[store_id]);
         let answered = |handled: Handled| match handled {
             Handled::Yes(event) => event,
+            Handled::Several(events) => panic!("answered with several: {events:?}"),
             Handled::No(cmd) => panic!("handed back: {cmd:?}"),
         };
 

@@ -331,6 +331,27 @@ pub struct MoveNodeResponse {
     pub left_shares: Vec<LeftShare>,
 }
 
+/// Request to move several nodes of one store under one new parent, kept in
+/// the order given (docs/TREE_CONTRACT.md "Places on the wire",
+/// `moveNodes`): the first lands at `place` and each next one right after
+/// the one before. Every node is judged before any is moved: one refusal
+/// refuses them all.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveNodesRequest {
+    pub store_id: StoreId,
+    pub node_ids: Vec<NodeId>,
+    pub new_parent_id: NodeId,
+    #[serde(default)]
+    pub place: Place,
+}
+
+/// Answer to `moveNodes`: one `MoveNodeResponse` per node, in the order of
+/// the request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveNodesResponse {
+    pub moved: Vec<MoveNodeResponse>,
+}
+
 /// Request to move a node into another store (docs/MOVE_CONTRACT.md "Between
 /// stores"): always a transplant, since two stores hold different documents.
 /// Write on `node_id` and the list it leaves in `from_store_id`, Write on

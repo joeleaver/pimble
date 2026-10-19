@@ -389,6 +389,45 @@ deletes, creates, renames from the tree), cleared on restart.
 - **Not built yet**: Shift+arrows and Ctrl+A (multi-select, wave 3), Ctrl+Z (wave 4),
   the active indent guide.
 
+## Built in wave 3 (2026-10-19, branch `tree`, not merged)
+
+- **`moveNodes`** (`MoveNodesRequest { store_id, node_ids, new_parent_id, place }`): every
+  node judged before any moves (one refusal refuses all), then each through `moveNode`,
+  all to the same place, the last first (in order when the place is the end), which keeps
+  their order without waiting on the ids a transplant gives. The client, the app's
+  `BackendCommand::MoveNodes` (a `NodeMoved` or `NodeTransplanted` per node) and the web
+  vault client (`Handled::Several`). Server test: order at every kind of place, and a
+  refused node leaves everything where it was.
+- **rinch** (branch `feat/tree-multiselect`, stacked on `feat/tree-keyboard`; Pimble's
+  `Cargo.toml`s point at it): with `UseTreeOptions::multiple`, Ctrl-click (or Cmd) adds or
+  removes a row, Shift-click and Shift+arrows select the run of drawn rows from the anchor,
+  Ctrl+A the cursor row's siblings; none opens anything. `onselectionchange`,
+  `TreeController::set_selection`. Collapsing a row unselects what it hides. A drag of a
+  selected row and `TreeKey::drop_for` carry the selection top to bottom, leaving out rows
+  inside other selected rows; a keyboard move of several needs them to share a parent.
+  `TreeKey::carried()`, and `above`/`below` around the carried block. The built-in drag
+  ghost is hidden during a tree drag (it sat over the row the drop is drawn on and hid it),
+  and "inside" is drawn as an outline on the row itself.
+- **Pimble**: the explorer selects several rows; the tree's selection follows the open row
+  as one row (`set_selection`) whenever the open document changes. `plan_drop` judges every
+  carried node (one refusal refuses all) and counts them in the strip ("3 items into
+  MEDICAL"); all in the target's store go as one `MoveNodes`, otherwise one command per node,
+  the last first. The row menu acts on the selection when the row is in one ("Delete 3
+  Nodes", Copy Link copies one link per line) and turns off Open in Split View, Rename and
+  Share. Delete, Ctrl+X/Ctrl+V and Alt+Shift+arrows act on the selection; Escape first
+  drops a cut, then narrows a selection to the cursor row.
+- **Verified on the desktop** (family store copy): Ctrl-clicks, a Shift-click run from the
+  anchor, a drag of two selected rows ("2 items into MEDICAL", both landing in order),
+  Shift+Down twice then Alt+Shift+Down moving the block of three, the menu's "Delete 3
+  Nodes" with the single-row items off, the inside outline with the label visible. **In
+  the browser** (encrypted store): Ctrl-click, Alt+Shift+Down of two rows (through the
+  vault client's `MoveNodes`), Delete of both.
+- **Not built**: the count badge beside the pointer (the strip counts instead), a distinct
+  accent for the open row among several selected (the cursor ring and the selection fill
+  carry it for now), Appearance over several rows (it still edits the row it was opened
+  on), one `deleteNodes` request (several `DeleteNode`s, each its own Recently Deleted
+  entry until wave 4's undo).
+
 ## Out of scope
 
 Reordering stores in the explorer; duplicating a node (a separate decision: its content

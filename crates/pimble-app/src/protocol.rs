@@ -61,6 +61,10 @@ pub enum BackendCommand {
     /// Answers `NodeMoved`, or `NodeTransplanted` when the move would have
     /// taken the node out of a share (docs/MOVE_CONTRACT.md).
     MoveNode { store_id: StoreId, node_id: NodeId, new_parent_id: NodeId, place: Place },
+    /// Several nodes of one store under one parent, in this order, all or
+    /// none (`moveNodes`, docs/TREE_CONTRACT.md). Answers a `NodeMoved` or
+    /// `NodeTransplanted` per node.
+    MoveNodes { store_id: StoreId, node_ids: Vec<NodeId>, new_parent_id: NodeId, place: Place },
     /// Bring a deleted node and what its deletion took with it back
     /// (`undeleteNode`): "Put Back" in "Recently Deleted...". Answers
     /// `NodeCreated` under the parent it went back to.

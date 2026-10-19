@@ -10,7 +10,7 @@ use rinch::prelude::{untracked, DropZone, TreeDrop, TreeKey, TreeMove, TreeSlot,
 
 use crate::protocol::BackendCommand;
 use crate::state::{parse_tree_value, AppStore};
-use crate::tree_drop::{plan_drop, DropHint, DropPlan, BESIDE_A_STORE};
+use crate::tree_drop::{plan_drop, send_plan, DropHint, DropPlan, BESIDE_A_STORE};
 
 /// What a key does, before anything is done: pure, so the map is tested on
 /// its own.
@@ -55,21 +55,23 @@ pub(crate) fn action(key: &str, ctrl: bool, shift: bool, alt: bool) -> Option<Ac
 }
 
 thread_local! {
-    /// The row cut with Ctrl+X, waiting for Ctrl+V.
-    static CUT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// The rows cut with Ctrl+X (the selection, or the cursor row), waiting
+    /// for Ctrl+V.
+    static CUT: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn cut_row() -> Option<String> {
+fn cut_rows() -> Vec<String> {
     CUT.with(|c| c.borrow().clone())
 }
 
-fn set_cut(store: AppStore, value: Option<String>) {
-    let hint = value.as_ref().map(|v| DropHint {
-        line: format!("Cut {}. Ctrl+V puts it after a row, Ctrl+Shift+V into one.", label_of(store, v)),
-        warning: None,
-        refused: false,
-    });
-    CUT.with(|c| *c.borrow_mut() = value);
+fn set_cut(store: AppStore, values: Vec<String>) {
+    let hint = match values.as_slice() {
+        [] => None,
+        [one] => Some(format!("Cut {}. Ctrl+V puts it after a row, Ctrl+Shift+V into one.", label_of(store, one))),
+        many => Some(format!("Cut {} items. Ctrl+V puts them after a row, Ctrl+Shift+V into one.", many.len())),
+    }
+    .map(|line| DropHint { line, warning: None, refused: false });
+    CUT.with(|c| *c.borrow_mut() = values);
     store.drop_hint.set(hint);
 }
 
@@ -95,15 +97,11 @@ fn suffix(value: &str) -> String {
 /// a node beside a store (outdenting the top level) does nothing.
 fn deliver(store: AppStore, drop: &TreeDrop) {
     match plan_drop(store, drop) {
-        DropPlan::Send { cmd, expand, .. } => {
-            if let Some(value) = expand {
-                crate::state::set_last_drop_target_value(value);
-            }
-            store.send(cmd);
-        }
-        DropPlan::Stays(_) => {}
         DropPlan::Refused(hint) if hint.line == BESIDE_A_STORE => {}
         DropPlan::Refused(hint) => crate::events::show_notice(store, hint.line),
+        plan => {
+            send_plan(store, plan);
+        }
     }
 }
 
@@ -138,40 +136,58 @@ pub(crate) fn on_key(store: AppStore, tree_state: UseTreeReturn, key: &TreeKey) 
             }
         }
         Action::Delete => {
-            let Some((s, Some(n))) = parse_tree_value(&cursor) else { return true };
-            if !store.node_access(s, n).allows_write() {
+            // The selection, or the cursor row; nodes only, all or none.
+            let nodes: Vec<_> = key.carried().iter().filter_map(|v| match parse_tree_value(v) {
+                Some((s, Some(n))) => Some((s, n)),
+                _ => None,
+            }).collect();
+            if nodes.is_empty() {
+                return true;
+            }
+            if nodes.iter().any(|&(s, n)| !store.node_access(s, n).allows_write()) {
                 crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
                 return true;
             }
-            // The cursor goes on to the row below (or above) before this one
-            // is gone, so the keyboard stays in the tree.
+            // The cursor goes on to the row below what is deleted (or
+            // above) before it is gone, so the keyboard stays in the tree.
             if let Some(next) = key.below.clone().or_else(|| key.above.clone()) {
                 tree_state.controller.set_cursor(&next);
+                tree_state.controller.set_selection([next.clone()]);
                 tree_state.controller.focus();
             }
-            store.send(BackendCommand::DeleteNode { store_id: s, node_id: n });
+            for (s, n) in nodes {
+                store.send(BackendCommand::DeleteNode { store_id: s, node_id: n });
+            }
         }
         Action::Cut => {
-            if matches!(parse_tree_value(&cursor), Some((_, Some(_)))) {
-                set_cut(store, Some(cursor));
+            let rows: Vec<String> = key.carried().iter().filter(|v| matches!(parse_tree_value(v), Some((_, Some(_))))).cloned().collect();
+            if !rows.is_empty() {
+                set_cut(store, rows);
             }
         }
         Action::Paste { into } => {
-            let Some(cut) = cut_row() else { return true };
+            let cut = cut_rows();
+            if cut.is_empty() {
+                return true;
+            }
             let drop = TreeDrop {
-                dragged: vec![cut],
+                dragged: cut,
                 parent: if into { Some(cursor.clone()) } else { key.parent.clone() },
                 slot: if into { TreeSlot::Last } else { TreeSlot::After(cursor.clone()) },
                 over: cursor,
                 zone: if into { DropZone::Inside } else { DropZone::After },
             };
-            set_cut(store, None);
+            set_cut(store, Vec::new());
             deliver(store, &drop);
         }
         Action::CopyLink => crate::app::copy_link(store, &cursor),
         Action::Escape => {
-            if cut_row().is_some() {
-                set_cut(store, None);
+            let several = untracked(|| tree_state.selected.with(|s| s.len() > 1));
+            if !cut_rows().is_empty() {
+                set_cut(store, Vec::new());
+            } else if several {
+                // Back to the one row the keyboard is on.
+                tree_state.controller.set_selection([cursor]);
             } else {
                 crate::editor::give_keyboard_to(store, store.focused());
             }
