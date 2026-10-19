@@ -105,6 +105,12 @@ from the `ondragover` click context on both backends):
     can't go inside itself." and "Drop inside the mounted store instead: a mount holds no
     nodes of its own." Letting go over a refused place does nothing and shows no notice
     (the strip already said why).
+  - As built (wave 1): a drop into a mount, or among the rows drawn under it, lands in
+    the node it mounts (a move in that store, or a transplant from another), since those
+    are the children drawn there; only a mount whose store is not open here refuses ("This
+    mount's store isn't open here."). Beside a store row: "Nodes go inside a store, not
+    beside it." A drop exactly where the node is says "Where it is" and sends nothing.
+    Store rows do not drag.
 - **The dragged rows** stay at 0.4 opacity in place. A count badge follows the pointer
   when more than one row is dragged.
 
@@ -300,6 +306,41 @@ deletes, creates, renames from the tree), cleared on restart.
 3. **Multi-select** (R2, `moveNodes`, the rest of P5).
 4. **Undo and the rest** (P6, type-ahead, Collapse All, Reveal); windowing only if
    measured.
+
+## Built in wave 1 (2026-10-19, branch `tree`, not merged)
+
+- **`Place`** (`pimble_core::Place`) replaces `position` in `moveNode`, `transplantNode`,
+  `Tree::{move_node, move_or_transplant, transplant, plant}`, the store, the client, the
+  app's commands, the web vault client, the CLI (`move-node --first | --after <id>`) and
+  the MCP `move_node` tool (`after`, `first`). `NodeDoc::list_place` resolves it; after
+  itself is where it is. `add_node` (creating) still takes an index; wave 2's "new sibling
+  after the cursor" moves it to `Place`. The convergence test moves to every kind of place
+  (600 seeds converge).
+- **rinch** (`joeleaver/rinch` branch `feat/tree-drop-places`; Pimble's `Cargo.toml`s point
+  at it until it merges): `Tree` takes `draggable`, `drag_values`, `judge_drop`,
+  `ondropchange`, `ondrop`, `ondragstart`, `ondragend`, `indent`, `hover_expand_ms`,
+  `guides`, and reports `TreeDrop { dragged, parent, slot: First | Last | After, over, zone }`.
+  The drop is drawn on the row under the pointer as classes and an `::after` at
+  `--tree-drop-level` (not one moving element: a row redrawn mid-drag would have taken
+  it away, and rinch-web retires a discarded subtree). A dragged row's own top and bottom
+  edges are places, so the last row of a group drags out of it over itself. A drop ends
+  the drag (the source row a drag's end goes to is often gone by then).
+- **Pimble** (`crates/pimble-app/src/tree_drop.rs`): `plan_drop` is the one judgement
+  (the Tree's `judge_drop`, the strip, and the release all use it), with `judge` pure and
+  tested. The strip is `.pimble-drop-hint` at the foot of the explorer
+  (`AppStore::drop_hint`, which replaced `drop_target`). Indent 12 px, guides on. A row
+  dragged onto a board still becomes a node card (the Tree's `ondragstart` fills the
+  board's drag context).
+- **Verified on the desktop** (an isolated app, the family store copy, dark and light
+  theme): reorder, outdent by drag (onto the next group's top edge, and over the row's own
+  bottom edge), into a collapsed row with hover-to-expand, the indicator surviving the
+  row's redraw, a refused drop beside a store row (red line, red sentence, nothing sent),
+  "Where it is" sending nothing, Escape cancelling, nothing left dimmed after a drop, a row
+  onto a whiteboard.
+- **Not built yet**: auto-scroll near the tree's edges (it belongs in rinch's drag
+  machinery for every scroll container, a separate PR), the count badge (one row drags
+  until wave 3), selecting the moved rows after a drop, and the browser walk-through
+  (below, when run).
 
 ## Out of scope
 

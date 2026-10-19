@@ -31,6 +31,9 @@ use crate::styles::{APP_CSS, EDITOR_CSS};
 /// How long after a click a second one on the same row still counts as a
 /// double-click, and so starts an inline rename.
 const DOUBLE_CLICK_MS: f64 = 500.0;
+/// The explorer's indent per level, in pixels: wide enough that the depths a drag
+/// offers at the end of a group are easy to aim at (docs/TREE_CONTRACT.md).
+const TREE_INDENT: f32 = 12.0;
 
 /// Whether this build may administer the stores on its server: open one from a
 /// path, add a remote as a replica, link, unlink, remove a replica, close one,
@@ -355,58 +358,6 @@ fn open_node_in(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
         stop_editing(store, pane);
     }
     store.editor_dirty.set(false);
-}
-
-/// What a drop should do, or why it must not (`decide_drop`'s answer).
-/// `BackendCommand` carries no `PartialEq`, so this doesn't either — a test
-/// matches on it with `matches!`.
-#[derive(Debug)]
-pub(crate) enum DropDecision {
-    /// Send this command: `MoveNode` within one store, `TransplantNode`
-    /// between two (docs/MOVE_CONTRACT.md "The operation: transplant").
-    Send(BackendCommand),
-    /// Send nothing; show this sentence the way every other refusal is shown.
-    Refused(&'static str),
-}
-
-/// What a drop of `dragged` onto the resolved target parent `target` should
-/// do, judged by what this account may write at each of the three places a
-/// move touches (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"): the
-/// node itself, the list it leaves, and the list it joins. Pure and
-/// window-free, so the decision is tested on its own — the caller resolves
-/// `dragged`/`target` from the drop (through a mount: the source store, as
-/// everywhere) and the three access judgements from `AppStore` first.
-///
-/// Same store or not is the only question left once every access is fine
-/// (docs/MOVE_CONTRACT.md "A move between stores is always this, because two
-/// stores hold different documents"): a move within one, a transplant
-/// between two.
-pub(crate) fn decide_drop(
-    dragged: (pimble_core::StoreId, pimble_core::NodeId),
-    target: (pimble_core::StoreId, pimble_core::NodeId),
-    node_access: pimble_core::StoreAccess,
-    leaves_access: pimble_core::StoreAccess,
-    target_access: pimble_core::StoreAccess,
-) -> DropDecision {
-    if !node_access.allows_write() || !leaves_access.allows_write() || !target_access.allows_write() {
-        return DropDecision::Refused(pimble_core::StoreAccess::READ_ONLY_REFUSAL);
-    }
-    if dragged.0 == target.0 {
-        DropDecision::Send(BackendCommand::MoveNode {
-            store_id: dragged.0,
-            node_id: dragged.1,
-            new_parent_id: target.1,
-            place: pimble_core::Place::Last,
-        })
-    } else {
-        DropDecision::Send(BackendCommand::TransplantNode {
-            from_store_id: dragged.0,
-            node_id: dragged.1,
-            to_store_id: target.0,
-            new_parent_id: target.1,
-            place: pimble_core::Place::Last,
-        })
-    }
 }
 
 /// "Copy as Mount Source": record the canonical pair and display title of the
@@ -998,7 +949,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         });
     });
 
-    // Drag-and-drop state for tree node rearrangement
+    // The tree row being dragged, for drop targets outside the tree
     let drag_ctx: DragContext<String> = DragContext::new();
     // A row dropped on a board becomes a node card there
     // (docs/IMAGE_MARKUP_CONTRACT.md section 4).
@@ -1369,100 +1320,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 "cursor: default;"
             };
 
-            // Drag-and-drop callbacks
-            let nv_dragstart = node_value.clone();
-            let nv_drop = node_value.clone();
-            let nv_enter = node_value.clone();
-            let nv_leave = node_value.clone();
-
-            let on_dragstart = move || {
-                tracing::info!("DragStart: {}", nv_dragstart);
-                drag_ctx.set(nv_dragstart.clone());
-            };
-            let on_dragend = move || {
-                tracing::info!("DragEnd");
-                drag_ctx.clear();
-                store.drop_target.set(None);
-            };
-            let on_drop = {
-                let nv = nv_drop.clone();
-                move || {
-                    // Always clear drag state first, even if the drop is invalid
-                    let dragged_value = drag_ctx.take();
-                    store.drop_target.set(None);
-
-                    let Some(dragged_value) = dragged_value else { return; };
-                    if dragged_value == nv { return; }
-                    let Some((drag_store_id, Some(drag_node_id))) = parse_tree_value(&dragged_value) else { return; };
-                    let Some((target_store_id, target_node_id_opt)) = parse_tree_value(&nv) else { return; };
-
-                    // A drop on a store row lands in the root that row
-                    // stands for. A drop onto a mount node stays refused: the
-                    // node it stands for lives in another store, and that is
-                    // where it moves (docs/MOVE_CONTRACT.md).
-                    let new_parent_id = match target_node_id_opt {
-                        Some(nid) => {
-                            if store.is_mount(target_store_id, nid) {
-                                tracing::warn!("Ignoring drop onto mount node {:?}/{:?}", target_store_id, nid);
-                                return;
-                            }
-                            nid
-                        }
-                        None => match store.root_node_id(target_store_id) {
-                            Some(id) => id,
-                            None => return,
-                        },
-                    };
-
-                    // A move edits three documents, and the server judges
-                    // all three: the node, the list it leaves and the list it
-                    // joins (docs/NODE_DOCUMENT_CONTRACT.md section 5,
-                    // "Roles"). `decide_drop` turns those three judgements
-                    // into a move within one store, a transplant between two
-                    // (docs/MOVE_CONTRACT.md "The operation: transplant"), or
-                    // a refusal — before anything is sent, by the server's
-                    // own word on each.
-                    let target_access = store.node_access(target_store_id, new_parent_id);
-                    let leaves_access = store
-                        .cached_parent_id(drag_store_id, drag_node_id)
-                        .map_or(pimble_core::StoreAccess::Full, |old_parent| store.node_access(drag_store_id, old_parent));
-                    let node_access = store.node_access(drag_store_id, drag_node_id);
-
-                    match decide_drop(
-                        (drag_store_id, drag_node_id),
-                        (target_store_id, new_parent_id),
-                        node_access,
-                        leaves_access,
-                        target_access,
-                    ) {
-                        DropDecision::Send(cmd) => {
-                            tracing::info!("Drop: {:?}", cmd);
-                            // Record the exact (possibly mount-path-qualified)
-                            // tree value dropped onto, so a same-store move's
-                            // `NodeMoved` event can auto-expand precisely this
-                            // place (decision 7). A transplant lands in
-                            // another store's own tree and has nothing here
-                            // to expand.
-                            crate::state::set_last_drop_target_value(nv.clone());
-                            store.send(cmd);
-                        }
-                        DropDecision::Refused(sentence) => {
-                            tracing::info!("Drop of {:?} into {} refused: {}", drag_node_id, nv, sentence);
-                            crate::events::show_notice(store, sentence.to_string());
-                        }
-                    }
-                }
-            };
-            let on_dragenter = move || { store.drop_target.set(Some(nv_enter.clone())); };
-            let on_dragleave = {
-                let nv = nv_leave.clone();
-                move || {
-                    if store.drop_target.get().as_deref() == Some(&nv) {
-                        store.drop_target.set(None);
-                    }
-                }
-            };
-
             // Context menu actions
             let nv_ctx = node_value.clone();
             let on_new_child = {
@@ -1724,11 +1581,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 move || paste_mount_here(store, &nv)
             };
 
-            // Build the wrapper span with drag-and-drop via rsx. A node this
-            // device may not change does not drag out of its place, as the
-            // drop handler refuses drops into one.
-            let draggable = if is_store_root || !can_write_tree { "false" } else { "true" };
-
             let icon_el = render_tabler_icon(__scope, icon, TablerIconStyle::Outline);
 
             // The badge a shared node's row carries after its label. Drawn
@@ -1776,7 +1628,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             };
 
             let nv_submit = node_value.clone();
-            let nv_effect = node_value.clone();
             let nv_for_context_menu = node_value.clone();
 
             // This row's own locally-computed label (see `AppStore::live_label`):
@@ -2340,35 +2191,13 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             // The ContextMenu sets data-oncontextmenu on its ContextMenuTarget,
             // but both rinch-context-menu and rinch-context-menu__target have
             // display:contents — they're invisible to hit testing. Wrap in a
-            // visible div that carries:
-            //  - context menu handler (hoisted from ContextMenuTarget)
-            //  - drag-and-drop attributes (draggable, ondragstart, etc.)
-            //  - visual feedback for drag state (opacity, highlight)
-            // This ensures right-click, drag, and drop all work on the full row.
+            // visible div that carries the context menu handler (hoisted from
+            // ContextMenuTarget), so right-click works on the full row. The
+            // Tree's own row box is the drag source and drop target
+            // (docs/TREE_CONTRACT.md "The drop model"; `tree_drop.rs`).
             let hit_area = rsx! {
                 div {
-                    style: {
-                        let nv = nv_effect.clone();
-                        move || {
-                            let base = "flex: 1; display: flex; align-items: center; border-radius: 2px; transition: background 0.1s, opacity 0.1s;";
-                            let is_being_dragged = drag_ctx.get().as_deref() == Some(&nv);
-                            let is_target = store.drop_target.get().as_deref() == Some(&nv)
-                                && drag_ctx.is_active();
-                            if is_being_dragged {
-                                format!("{} opacity: 0.3;", base)
-                            } else if is_target {
-                                format!("{} background: var(--rinch-color-blue-1); outline: 1px solid var(--rinch-color-blue-4);", base)
-                            } else {
-                                base.to_string()
-                            }
-                        }
-                    },
-                    draggable: draggable,
-                    ondragstart: on_dragstart,
-                    ondragend: on_dragend,
-                    ondrop: on_drop,
-                    ondragenter: on_dragenter,
-                    ondragleave: on_dragleave,
+                    style: "flex: 1; display: flex; align-items: center; border-radius: 2px;",
                     {context_menu}
                 }
             };
@@ -2391,6 +2220,38 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             hit_area
         });
 
+        // Drops (docs/TREE_CONTRACT.md "The drop model"): `tree_drop` judges
+        // each one the Tree offers, the strip at the foot of the explorer
+        // says where it lands, and a release sends what was planned.
+        let tree_drag_values: rinch::prelude::DragValues = Rc::new(crate::tree_drop::drag_values);
+        let tree_judge_drop: rinch::prelude::JudgeDrop =
+            Rc::new(move |drop: &TreeDrop| crate::tree_drop::plan_drop(store, drop).verdict());
+        let on_tree_drop_change = ValueCallback::new(move |offer: Option<(TreeDrop, DropVerdict)>| {
+            store.drop_hint.set(offer.map(|(drop, _)| crate::tree_drop::plan_drop(store, &drop).hint().clone()));
+        });
+        let on_tree_drop = ValueCallback::new(move |drop: TreeDrop| {
+            if let crate::tree_drop::DropPlan::Send { cmd, expand, .. } = crate::tree_drop::plan_drop(store, &drop) {
+                tracing::info!("Drop: {:?}", cmd);
+                // The new parent's exact (possibly mount-path-qualified) tree
+                // value, so `NodeMoved` opens precisely this place.
+                if let Some(value) = expand {
+                    crate::state::set_last_drop_target_value(value);
+                }
+                store.send(cmd);
+            }
+        });
+        // A row dragged out of the tree onto a board becomes a node card
+        // there (docs/IMAGE_MARKUP_CONTRACT.md section 4).
+        let on_tree_drag_start = ValueCallback::new(move |values: Vec<String>| {
+            if let Some(value) = values.into_iter().next() {
+                drag_ctx.set(value);
+            }
+        });
+        let on_tree_drag_end = ValueCallback::new(move |()| {
+            drag_ctx.clear();
+            store.drop_hint.set(None);
+        });
+
         let tree_scroll = rsx! {
             div {
                 class: "pimble-sidebar__tree",
@@ -2398,13 +2259,21 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     data: untracked(|| store.build_tree_data_structural()),
                     tree: tree_state,
                     data_source: data_source,
-                    level_offset: "xs",
+                    indent: TREE_INDENT,
+                    guides: true,
                     select_on_click: true,
                     expand_on_click: false,
                     onselect: on_tree_select,
                     onexpand: on_tree_expand,
                     oncollapse: on_tree_collapse,
                     render_node: render_node_fn,
+                    draggable: true,
+                    drag_values: tree_drag_values,
+                    judge_drop: tree_judge_drop,
+                    ondropchange: on_tree_drop_change,
+                    ondrop: on_tree_drop,
+                    ondragstart: on_tree_drag_start,
+                    ondragend: on_tree_drag_end,
                 }
             }
         };
@@ -4170,6 +4039,26 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 style: {|| if store.search_query.get().is_empty() { "display: none;" } else { "" }},
                                 {search_panel}
                             }
+
+                            // Where a dragged row lands, in words, for the
+                            // whole drag (docs/TREE_CONTRACT.md "Feedback").
+                            div {
+                                class: {move || if store.drop_hint.with(|h| h.as_ref().is_some_and(|h| h.refused)) {
+                                    "pimble-drop-hint pimble-drop-hint--refused"
+                                } else {
+                                    "pimble-drop-hint"
+                                }},
+                                style: {move || if store.drop_hint.with(|h| h.is_some()) { "" } else { "display: none;" }},
+                                div {
+                                    class: "pimble-drop-hint__line",
+                                    {move || store.drop_hint.with(|h| h.as_ref().map(|h| h.line.clone()).unwrap_or_default())}
+                                }
+                                div {
+                                    class: "pimble-drop-hint__warning",
+                                    style: {move || if store.drop_hint.with(|h| h.as_ref().is_some_and(|h| h.warning.is_some())) { "" } else { "display: none;" }},
+                                    {move || store.drop_hint.with(|h| h.as_ref().and_then(|h| h.warning.clone()).unwrap_or_default())}
+                                }
+                            }
                         }
 
                         // The explorer's right edge, dragged to resize it.
@@ -4762,67 +4651,5 @@ mod tests {
         assert_eq!(sync_badge_text(&synced, StoreKind::Vault, RelaySide::Member, false), "encrypted · synced");
         assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Vault, RelaySide::Member, false), "encrypted · offline");
         assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Vault, RelaySide::Member, true), "owner offline");
-    }
-
-    // ── The drop handler's decision (docs/MOVE_CONTRACT.md) ──────────────
-    use super::{decide_drop, DropDecision};
-    use pimble_core::StoreAccess::{Full, Read};
-
-    /// A drop within one store is a move — the id-preserving path, since
-    /// nothing about it can take a node out of a share (`Tree::repair`'s
-    /// concern, not the drop handler's).
-    #[test]
-    fn a_drop_within_one_store_is_a_move() {
-        let store_id = StoreId::new();
-        let (dragged, parent) = (NodeId::new(), NodeId::new());
-
-        let decision = decide_drop((store_id, dragged), (store_id, parent), Full, Full, Full);
-        match decision {
-            DropDecision::Send(BackendCommand::MoveNode { store_id: s, node_id: n, new_parent_id: p, place: pimble_core::Place::Last }) => {
-                assert_eq!((s, n, p), (store_id, dragged, parent));
-            }
-            other => panic!("expected a MoveNode, got {other:?}"),
-        }
-    }
-
-    /// A drop between two stores is always a transplant
-    /// (docs/MOVE_CONTRACT.md "A move between stores is always this,
-    /// because two stores hold different documents"): what gives the drag
-    /// between stores its meaning.
-    #[test]
-    fn a_drop_between_stores_is_a_transplant() {
-        let (from_store, to_store) = (StoreId::new(), StoreId::new());
-        let (dragged, parent) = (NodeId::new(), NodeId::new());
-
-        let decision = decide_drop((from_store, dragged), (to_store, parent), Full, Full, Full);
-        match decision {
-            DropDecision::Send(BackendCommand::TransplantNode {
-                from_store_id, node_id, to_store_id, new_parent_id, place: pimble_core::Place::Last,
-            }) => {
-                assert_eq!((from_store_id, node_id, to_store_id, new_parent_id), (from_store, dragged, to_store, parent));
-            }
-            other => panic!("expected a TransplantNode, got {other:?}"),
-        }
-    }
-
-    /// Any of the three documents a move touches being read only refuses the
-    /// drop and sends nothing, same store or not: the node itself, the list
-    /// it leaves, and the list it joins (docs/NODE_DOCUMENT_CONTRACT.md
-    /// section 5, "Roles").
-    #[test]
-    fn a_read_only_place_refuses_the_drop_and_sends_nothing() {
-        let (store_id, other_store) = (StoreId::new(), StoreId::new());
-        let (dragged, parent) = (NodeId::new(), NodeId::new());
-        let cases = [(Read, Full, Full), (Full, Read, Full), (Full, Full, Read)];
-
-        for (node_access, leaves_access, target_access) in cases {
-            for target_store in [store_id, other_store] {
-                let decision = decide_drop((store_id, dragged), (target_store, parent), node_access, leaves_access, target_access);
-                match decision {
-                    DropDecision::Refused(reason) => assert_eq!(reason, pimble_core::StoreAccess::READ_ONLY_REFUSAL),
-                    other => panic!("expected a refusal for {node_access:?}/{leaves_access:?}/{target_access:?} into store {target_store:?}, got {other:?}"),
-                }
-            }
-        }
     }
 }

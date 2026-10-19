@@ -2099,7 +2099,7 @@ pub(super) fn place_text_box(store: AppStore, pane: PaneId) {
 pub(super) fn drop_tree_row(store: AppStore, pane: PaneId) {
     let Some(ctx) = TREE_DRAG.with(Cell::get) else { return };
     let Some(value) = ctx.take() else { return };
-    store.drop_target.set(None);
+    store.drop_hint.set(None);
     let Some((store_id, Some(node_id))) = crate::state::parse_tree_value(&value) else { return };
     let Some(layer) = target_layer(store, pane) else { return };
     let title = store

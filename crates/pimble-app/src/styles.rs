@@ -126,6 +126,37 @@ pub(crate) const APP_CSS: &str = "
 .rinch-tree__node-content--selected .pimble-row-band {
     opacity: 0.5;
 }
+/* Guides sit under the middle of this stylesheet's smaller chevron, and a
+   drop indicator draws over a row's band (docs/TREE_CONTRACT.md). */
+.rinch-tree {
+    --tree-guide-offset: 0.4375rem;
+}
+.rinch-tree__drop-indicator {
+    z-index: 2;
+}
+
+/* The strip at the foot of the explorer that says, during a drag, where the
+   dragged row lands. */
+.pimble-drop-hint {
+    flex-shrink: 0;
+    padding: 6px 10px;
+    border-top: 1px solid var(--rinch-color-border);
+    background-color: var(--rinch-color-surface);
+    font-size: 12px;
+    color: var(--rinch-color-text);
+}
+.pimble-drop-hint__line {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.pimble-drop-hint--refused .pimble-drop-hint__line {
+    color: var(--rinch-color-red-6);
+}
+.pimble-drop-hint__warning {
+    margin-top: 2px;
+    color: var(--rinch-color-dimmed);
+}
 
 /* ── Context menu ───────────────────────────────────────────── */
 

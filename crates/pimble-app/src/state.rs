@@ -698,8 +698,10 @@ pub struct AppStore {
     pub renaming_node: Signal<Option<String>>,
     pub rename_text: Signal<String>,
 
-    // Drag-and-drop
-    pub drop_target: Signal<Option<String>>,
+    /// What the strip at the foot of the explorer says during a drag in the
+    /// tree: where the dragged row lands, or why it cannot
+    /// (docs/TREE_CONTRACT.md "Feedback").
+    pub drop_hint: Signal<Option<crate::tree_drop::DropHint>>,
 
     // Rename input DOM node IDs (tree_value → input element node ID for request_focus)
     /// Rename inputs by tree value as `(doc_key, node_id)`, so the double-click
@@ -1093,7 +1095,7 @@ impl AppStore {
             pane_dragging: Signal::new(false),
             renaming_node: Signal::new(None),
             rename_text: Signal::new(String::new()),
-            drop_target: Signal::new(None),
+            drop_hint: Signal::new(None),
             rename_input_ids: Signal::new(HashMap::new()),
             pending_mount: Signal::new(None),
             mount_source: Signal::new(None),
