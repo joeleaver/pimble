@@ -915,6 +915,12 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 let parent = parent_id.unwrap_or_else(|| {
                     store.root_node_id(*store_id).unwrap()
                 });
+                // A node the explorer's keyboard made: the cursor goes to it,
+                // and its row starts renaming once drawn.
+                if let Some(value) = crate::state::take_pending_create(*store_id, parent, *node_id) {
+                    tree_state.controller.set_cursor(&value);
+                    tree_state.controller.select(&value);
+                }
                 // Re-fetch parent's children so the new node appears (triggers ChildrenLoaded → bump)
                 store.send(BackendCommand::GetChildren { store_id: *store_id, node_id: parent });
             }

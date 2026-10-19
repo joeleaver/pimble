@@ -3545,7 +3545,7 @@ impl PimbleApiServer for RpcHandler {
             return Err(read_only_error());
         }
         let (node_id, edit) = manager
-            .create_node(request.store_id, node, Some(parent_id))
+            .create_node_at(request.store_id, node, Some(parent_id), request.place)
             .map_err(to_rpc_error)?;
 
         // A node that is created and never edited again has no other flush
@@ -4992,7 +4992,7 @@ mod tests {
         let mut merged = replica_of(&tree);
 
         let x = NodeId::new();
-        let mut edit = tree.add_node(x, Some(root), None, "document", "X", T0).unwrap();
+        let mut edit = tree.add_node(x, Some(root), Place::Last, "document", "X", T0).unwrap();
         edit.touched.extend(tree.set_tags(x, &["a".into(), "b".into()], T1).unwrap().touched);
         edit.touched.extend(tree.set_custom(x, "icon", &serde_json::json!("star"), T1).unwrap().touched);
         edit.touched.extend(tree.set_title(x, "Renamed", T1).unwrap().touched);
@@ -5034,13 +5034,13 @@ mod tests {
         let root = NodeId::new();
         let mut tree = Tree::new(root, "Store", T0).unwrap();
         let (p, q) = (NodeId::new(), NodeId::new());
-        tree.add_node(p, Some(root), None, "folder", "P", T0).unwrap();
-        tree.add_node(q, Some(root), None, "folder", "Q", T0).unwrap();
+        tree.add_node(p, Some(root), Place::Last, "folder", "P", T0).unwrap();
+        tree.add_node(q, Some(root), Place::Last, "folder", "Q", T0).unwrap();
         let x = NodeId::new();
 
         // Created: the node is new, the parent's list changed.
         let before = replica_of(&tree);
-        tree.add_node(x, Some(p), None, "document", "X", T0).unwrap();
+        tree.add_node(x, Some(p), Place::Last, "document", "X", T0).unwrap();
         let (b, a) = shapes(&before, &tree, x);
         assert!(matches!(derive_kinds(x, root, b.as_ref(), a.as_ref(), structural())[..], [StoreChangeKind::NodeCreated { node_id, parent_id }] if node_id == x && parent_id == p));
         let (b, a) = shapes(&before, &tree, p);

@@ -101,15 +101,18 @@ pub async fn process_command(
             }
         }
 
-        BackendCommand::CreateNode { store_id, parent_id, title, init } => {
+        BackendCommand::CreateNode { store_id, parent_id, title, init, place } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
             let request = init.as_ref().and_then(|init| init.request);
             let created = match init {
-                None => c.create_node(store_id, parent_id, pimble_core::node_types::DOCUMENT, &title).await,
+                None => {
+                    c.create_node_with(store_id, parent_id, pimble_core::node_types::DOCUMENT, &title, None, Default::default(), place)
+                        .await
+                }
                 Some(init) => {
-                    c.create_node_with(store_id, parent_id, init.node_type, &title, Some(init.content), init.custom.into_iter().collect())
+                    c.create_node_with(store_id, parent_id, init.node_type, &title, Some(init.content), init.custom.into_iter().collect(), place)
                         .await
                 }
             };

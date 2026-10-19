@@ -164,6 +164,7 @@ fn view_entries(store: AppStore) -> Vec<MenuEntry> {
         }),
         MenuEntry::item("Close Pane", "", move || crate::pane_view::close_focused(store)),
         MenuEntry::Separator,
+        MenuEntry::item("Focus Explorer", "Ctrl+Shift+E", crate::app::focus_explorer),
         MenuEntry::item("Focus Search", "Ctrl+K", crate::app::focus_search),
         MenuEntry::item("Rebuild Search Index", "", move || {
             crate::app::rebuild_search_indexes(store)

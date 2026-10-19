@@ -951,6 +951,12 @@ impl LocalStore {
     /// `node.content`, when given, is merged into the new document as an
     /// update, the one way content reaches a document.
     pub fn create_node(&mut self, node: Node, parent_id: Option<NodeId>) -> Result<(NodeId, TreeEdit)> {
+        self.create_node_at(node, parent_id, Place::Last)
+    }
+
+    /// [`LocalStore::create_node`] at `place` among the parent's children
+    /// (docs/TREE_CONTRACT.md "Places on the wire").
+    pub fn create_node_at(&mut self, node: Node, parent_id: Option<NodeId>, place: Place) -> Result<(NodeId, TreeEdit)> {
         let node_id = node.id;
         let parent = parent_id.unwrap_or_else(|| self.root_node_id());
         if !self.tree.has_node(parent) {
@@ -960,7 +966,7 @@ impl LocalStore {
         let now = now();
         let mut edit = self
             .tree
-            .add_node(node_id, Some(parent), None, &node.node_type, &node.metadata.title, &now)
+            .add_node(node_id, Some(parent), place, &node.node_type, &node.metadata.title, &now)
             .map_err(StoreError::from)?;
         if !node.content.is_empty() {
             let effect = self.tree.apply_update(node_id, &node.content).map_err(StoreError::from)?;
@@ -1666,7 +1672,7 @@ mod tests {
         let mut peer = Tree::from_docs(root_id, HashMap::new());
         peer.apply_update(root_id, &store.tree().doc(root_id).unwrap().save()).unwrap();
         let child_id = NodeId::new();
-        let edit = peer.add_node(child_id, Some(root_id), None, "document", "From peer", &now()).unwrap();
+        let edit = peer.add_node(child_id, Some(root_id), Place::Last, "document", "From peer", &now()).unwrap();
 
         assert!(matches!(store.node_state_vector(child_id), Err(StoreError::NodeNotFound(_))));
         for (id, update) in &edit.touched {
@@ -1790,7 +1796,7 @@ mod tests {
         origin.set_tags(root_id, &["shared".into()], &now()).unwrap();
         origin.set_custom(root_id, "icon", &serde_json::json!("home"), &now()).unwrap();
         let child_id = NodeId::new();
-        origin.add_node(child_id, Some(root_id), None, "document", "Doc", &now()).unwrap();
+        origin.add_node(child_id, Some(root_id), Place::Last, "document", "Doc", &now()).unwrap();
         for id in origin.ids() {
             store.apply_node_update(id, &origin.doc(id).unwrap().save()).unwrap();
         }
@@ -1815,7 +1821,7 @@ mod tests {
         let real_root = NodeId::new();
         let mut origin = Tree::new(real_root, "Origin", &now()).unwrap();
         let child_id = NodeId::new();
-        origin.add_node(child_id, Some(real_root), None, "document", "Doc", &now()).unwrap();
+        origin.add_node(child_id, Some(real_root), Place::Last, "document", "Doc", &now()).unwrap();
         for id in origin.ids() {
             store.apply_node_update(id, &origin.doc(id).unwrap().save()).unwrap();
         }

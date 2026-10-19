@@ -49,6 +49,7 @@ impl Fixture {
                 title: title.into(),
                 content: None,
                 custom: Default::default(),
+                place: Default::default(),
             })
             .await
             .unwrap()

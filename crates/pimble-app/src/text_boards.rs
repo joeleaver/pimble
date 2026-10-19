@@ -1630,7 +1630,7 @@ mod tests {
         let (request, content) = sent
             .iter()
             .find_map(|c| match c {
-                BackendCommand::CreateNode { store_id: s, parent_id: Some(p), title, init: Some(init) } if (*s, *p) == (store_id, node_id) => {
+                BackendCommand::CreateNode { store_id: s, parent_id: Some(p), title, init: Some(init), .. } if (*s, *p) == (store_id, node_id) => {
                     assert_eq!(title, "shot");
                     assert_eq!(init.node_type, pimble_core::node_types::BOARD);
                     Some((init.request.expect("a request"), init.content.clone()))

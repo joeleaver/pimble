@@ -263,7 +263,7 @@ deletes, creates, renames from the tree), cleared on restart.
 - R1 **Cursor and keyboard**: `UseTreeReturn.cursor: Signal<Option<String>>`, roving
   `tabindex`, the ARIA keys (arrows, Home/End, PageUp/Down, Right/Left, `*`, type-ahead)
   through `push_key_handler` on the container, and a hook
-  `onkey: Fn(&TreeKey { value, key, modifiers }) -> bool` that runs first, so an app binds
+  `handle_key: Fn(&TreeKey { value, key, modifiers }) -> bool` that runs first, so an app binds
   its own keys (Alt+Shift+arrows, F2, Delete) without the Tree knowing what they mean.
   `oncursor(value)` once the cursor has rested (the delay is a prop, 120 ms by default),
   which is what an app that wants the document to follow the cursor listens to.
@@ -290,7 +290,7 @@ deletes, creates, renames from the tree), cleared on restart.
 - P2 `judge_drop` (from `decide_drop`): access, self-or-descendant, mounts, stores,
   leaving a share, with the sentences above; pure and unit-tested like `decide_drop`.
 - P3 the destination strip at the foot of the explorer.
-- P4 the key bindings through R1's `onkey`: indent, outdent, reorder, new sibling or child,
+- P4 the key bindings through R1's `handle_key`: indent, outdent, reorder, new sibling or child,
   F2, Delete, cut and paste, Ctrl+C, Focus Explorer, Reveal Open Document, Collapse All.
 - P5 open row, selection and cursor in `AppStore` (`selected_id` stays the open row:
   `select_in_pane`/`focus_pane` keep writing it), and the context menu over a selection.
@@ -345,6 +345,49 @@ deletes, creates, renames from the tree), cleared on restart.
 - **Not built yet**: auto-scroll near the tree's edges (it belongs in rinch's drag
   machinery for every scroll container, a separate PR), the count badge (one row drags
   until wave 3), and selecting the moved rows after a drop.
+
+## Built in wave 2 (2026-10-19, branch `tree`, not merged)
+
+- **rinch** (branch `feat/tree-keyboard`, stacked on `feat/tree-drop-places`; Pimble's
+  `Cargo.toml`s point at it): `Tree { keyboard, handle_key, oncursor, cursor_delay_ms,
+  label_of }`, `UseTreeReturn::cursor`, `TreeController::{set_cursor, cursor, focus}`.
+  The Tree moves the cursor (arrows, Home, End, PageUp, PageDown, Right and Left, `*`,
+  type-ahead) and offers every key to `handle_key` first, with
+  `TreeKey::drop_for(TreeMove::{Indent, Outdent, Up, Down})` turning one into the same
+  `TreeDrop` a drag would make, and `above`/`below` naming the neighbors. Keys are the
+  tree's only while focus is on one of its rows. The hook is `handle_key`, not `onkey`:
+  `rsx!` reads every `on*` prop as an event handler. Focus: a cursor row redrawn while it
+  has the keyboard (its data changed, or it moved) gives it back to the row as drawn
+  now, on both backends (a browser says nothing when a focused element is removed), and
+  never takes it from an editor or a field the app opened.
+- **Creating takes a `Place`** too: `createNode`'s `place`, `Tree::add_node`,
+  `LocalStore::create_node_at`, `BackendCommand::CreateNode { place }`, the web vault
+  client. The convergence test creates at every kind of place (600 seeds converge).
+- **Pimble** (`crates/pimble-app/src/tree_keys.rs`, the key map as a pure, tested
+  `action`): the document follows the cursor once it rests (`oncursor` opens it); Enter
+  gives its editor the keyboard (waiting for a document that is still loading; a folder
+  has no editor and leaves the keyboard in the tree); Ctrl+Enter or Alt+Enter opens in
+  split view; F2 renames; Ctrl+Shift+Enter or Insert makes a sibling after the cursor and
+  Ctrl+Alt+Enter a child, each renamed at once; Alt+Shift+arrows move (judged and sent by
+  `tree_drop::plan_drop`, as a drop is; outdenting from a store's top level does
+  nothing); Delete moves the cursor on and deletes; Ctrl+X then Ctrl+V or Ctrl+Shift+V
+  cut and paste (the strip says what is cut); Ctrl+C copies the link; Escape drops a cut
+  or gives the keyboard back to the document; View > "Focus Explorer" (Ctrl+Shift+E)
+  gives the tree the keyboard. Type-ahead matches the row's displayed title.
+  `start_rename` is the one way a rename starts (double-click, the menu, F2, a new node),
+  and focuses the rename box by its element a moment after showing it: `request_focus`
+  is the desktop runtime's alone, so the menu's Rename used to need a click in the
+  browser.
+- **Verified on the desktop** (an isolated app, the family store copy): arrows open
+  documents as they rest and keep the keyboard, Alt+Shift+Down/Up reorder, Alt+Shift+Right
+  and Left indent and outdent, a new sibling lands after the cursor and takes its typed
+  name, cut and paste, Delete, Enter into a document and typing there, Ctrl+Shift+E back.
+  **In the browser** (local stack, an encrypted store): F2 rename, Down, a new sibling
+  with its name, Alt+Shift+Up and Right, type-ahead. F2 and Insert cannot be sent through
+  rinch's debug port (its key table lacks them), so F2 was checked in the browser and by
+  rinch's key test.
+- **Not built yet**: Shift+arrows and Ctrl+A (multi-select, wave 3), Ctrl+Z (wave 4),
+  the active indent guide.
 
 ## Out of scope
 

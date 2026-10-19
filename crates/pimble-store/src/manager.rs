@@ -512,6 +512,11 @@ impl StoreManager {
     /// (its subtree lives entirely in the source store), so creating under
     /// one is rejected; create under the mount's `mount_ref` instead.
     pub fn create_node(&mut self, store_id: StoreId, node: Node, parent_id: Option<NodeId>) -> Result<(NodeId, TreeEdit)> {
+        self.create_node_at(store_id, node, parent_id, Place::Last)
+    }
+
+    /// [`StoreManager::create_node`] at `place` among the parent's children.
+    pub fn create_node_at(&mut self, store_id: StoreId, node: Node, parent_id: Option<NodeId>, place: Place) -> Result<(NodeId, TreeEdit)> {
         let store = self.local_mut(store_id)?;
 
         if let Some(parent_id) = parent_id {
@@ -521,7 +526,7 @@ impl StoreManager {
             }
         }
 
-        store.create_node(node, parent_id)
+        store.create_node_at(node, parent_id, place)
     }
 
     /// Move a node to a new parent in a store, deciding a plain move or a

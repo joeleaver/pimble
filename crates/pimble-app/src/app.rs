@@ -8,7 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use rinch::prelude::*;
-use rinch::core::{request_focus, set_keyboard_interceptor, clear_keyboard_interceptor};
+use rinch::core::{set_keyboard_interceptor, clear_keyboard_interceptor};
 use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
 
 use crate::protocol::{BackendCommand, CloudOp};
@@ -141,6 +141,13 @@ thread_local! {
     /// before the box exists — can reach it later. Same reach-across-closures
     /// need as `EVENT_PROCESSOR`/`CLOSE_HANDLER` below.
     static SEARCH_INPUT: RefCell<Option<NodeHandle>> = const { RefCell::new(None) };
+    /// The explorer tree's state, for the View menu's "Focus Explorer",
+    /// built before the tree is.
+    static TREE_STATE: Cell<Option<UseTreeReturn>> = const { Cell::new(None) };
+    /// Each tree row's rename box, by tree value, for `start_rename` to give
+    /// the keyboard to. A handle and not an id: `request_focus` is the
+    /// desktop runtime's alone, and a browser needs the element's own focus.
+    static RENAME_INPUTS: RefCell<std::collections::HashMap<String, NodeHandle>> = RefCell::new(std::collections::HashMap::new());
     /// The debounced `Search` command pending from the last keystroke, if any.
     static SEARCH_DEBOUNCE: RefCell<Option<TimeoutHandle>> = const { RefCell::new(None) };
 }
@@ -228,6 +235,14 @@ pub fn focus_search() {
     });
 }
 
+/// Give the explorer the keyboard (View > "Focus Explorer"): its cursor row,
+/// or its first (docs/TREE_CONTRACT.md "The keyboard").
+pub fn focus_explorer() {
+    if let Some(tree_state) = TREE_STATE.with(Cell::get) {
+        tree_state.controller.focus();
+    }
+}
+
 /// Rebuild the search index of every open store that has one.
 ///
 /// An encrypted store has no server-side index and cannot have one — the
@@ -275,13 +290,13 @@ pub fn open_new_store_modal(store: AppStore) {
 ///
 /// It opens in the focused pane (docs/SPLIT_VIEW_CONTRACT.md "What the
 /// person sees"); [`open_node_in`] names another.
-fn open_node(store: AppStore, tree_state: UseTreeReturn, value: String) {
+pub(crate) fn open_node(store: AppStore, tree_state: UseTreeReturn, value: String) {
     open_node_in(store, tree_state, store.focused(), value);
 }
 
 /// Open a tree value in pane `pane`. The tree's selected row follows when
 /// the pane has the focus.
-fn open_node_in(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value: String) {
+pub(crate) fn open_node_in(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value: String) {
     let focused = pane == store.focused();
     let state = store.pane(pane);
     store.select_in_pane(pane, Some(value.clone()));
@@ -382,10 +397,84 @@ fn copy_as_mount_source(store: AppStore, value: &str) {
     bump_tree_after_menu_closes(store);
 }
 
+/// Start renaming the row of tree value `value` in place: a double-click, F2,
+/// or a node the keyboard just made. Enter commits and Escape cancels, and
+/// either gives the keyboard back to the tree. `false` when the row cannot
+/// be renamed here (a mount, or a node this device may only read).
+pub(crate) fn start_rename(store: AppStore, tree_state: UseTreeReturn, value: &str) -> bool {
+    // Don't allow rename on mount nodes
+    let is_mount_node = if let Some((sid, Some(nid))) = parse_tree_value(value) {
+        store.is_mount(sid, nid)
+    } else {
+        false
+    };
+    if is_mount_node {
+        return false;
+    }
+
+    // A node this device may only read changes in no way
+    // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"):
+    // the context menu's "Rename" is disabled there, so the
+    // double-click shortcut is not a way around it. An editor
+    // renames like anyone else. Judged per node: a reader's
+    // root may sit beside an editor's in the same store.
+    let renameable = match parse_tree_value(value) {
+        Some((s_id, Some(n_id))) => store.node_access(s_id, n_id).allows_write(),
+        Some((s_id, None)) => store.store_access(s_id).allows_write(),
+        None => true,
+    };
+    if !renameable {
+        return false;
+    }
+
+    let edit_text = if let Some((store_id, Some(node_id))) = parse_tree_value(value) {
+        store.get_node_signal(store_id, node_id)
+            .map(|sig| sig.with(|n| n.metadata.title.clone()))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    store.rename_text.set(edit_text);
+    store.renaming_node.set(Some(value.to_string()));
+    let nv_interceptor = value.to_string();
+    set_keyboard_interceptor(move |data| {
+        if data.key == "Escape" {
+            run_on_main_thread(move || {
+                store.renaming_node.set(None);
+                clear_keyboard_interceptor();
+                tree_state.controller.focus();
+            });
+            return true;
+        }
+        if data.key == "Enter" {
+            let nv = nv_interceptor.clone();
+            run_on_main_thread(move || {
+                let new_title = untracked(|| store.rename_text.get());
+                store.renaming_node.set(None);
+                clear_keyboard_interceptor();
+                tree_state.controller.focus();
+                if let Some((s_id, Some(n_id))) = parse_tree_value(&nv) {
+                    store.send(BackendCommand::RenameNode {
+                        store_id: s_id, node_id: n_id, title: new_title,
+                    });
+                }
+            });
+            return true;
+        }
+        false
+    });
+    // A moment later: the box is shown by an effect of `renaming_node`, and
+    // a browser will not focus it while it is still `display: none`.
+    if let Some(input) = RENAME_INPUTS.with(|inputs| inputs.borrow().get(value).cloned()) {
+        let _ = set_timeout(0, move || input.focus());
+    }
+    true
+}
+
 /// "Copy Link" (docs/LINKS_CONTRACT.md "Making a link"): the row's node, or a
 /// store row's root, as a `pimble:` link on the system clipboard. Through a
 /// mount the value names the source store's node, as every address does.
-fn copy_link(store: AppStore, value: &str) {
+pub(crate) fn copy_link(store: AppStore, value: &str) {
     let Some((s_id, node_id_opt)) = parse_tree_value(value) else { return };
     let Some(node_id) = node_id_opt.or_else(|| store.root_node_id(s_id)) else { return };
     let url = pimble_core::PimbleUrl::node(s_id, node_id).to_string();
@@ -925,6 +1014,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
 
     // Persistent tree state — created once, preserves expanded/selected across data changes
     let tree_state = UseTreeReturn::new(UseTreeOptions::default());
+    TREE_STATE.with(|cell| cell.set(Some(tree_state)));
 
     // A followed link's target opens the way a search hit does, with
     // `open_node` (docs/LINKS_CONTRACT.md "Following a link"), deferred out
@@ -998,68 +1088,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 let is_double_click = prev_value == value && now - prev_time < DOUBLE_CLICK_MS;
 
                 if is_double_click && value.starts_with("node_") {
-                    // Don't allow rename on mount nodes
-                    let is_mount_node = if let Some((sid, Some(nid))) = parse_tree_value(&value) {
-                        store.is_mount(sid, nid)
-                    } else {
-                        false
-                    };
-                    if is_mount_node {
-                        return;
-                    }
-
-                    // A node this device may only read changes in no way
-                    // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"):
-                    // the context menu's "Rename" is disabled there, so the
-                    // double-click shortcut is not a way around it. An editor
-                    // renames like anyone else. Judged per node: a reader's
-                    // root may sit beside an editor's in the same store.
-                    let renameable = match parse_tree_value(&value) {
-                        Some((s_id, Some(n_id))) => store.node_access(s_id, n_id).allows_write(),
-                        Some((s_id, None)) => store.store_access(s_id).allows_write(),
-                        None => true,
-                    };
-                    if !renameable {
-                        return;
-                    }
-
-                    let edit_text = if let Some((store_id, Some(node_id))) = parse_tree_value(&value) {
-                        store.get_node_signal(store_id, node_id)
-                            .map(|sig| sig.with(|n| n.metadata.title.clone()))
-                            .unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
-                    store.rename_text.set(edit_text);
-                    store.renaming_node.set(Some(value.clone()));
-                    let nv_interceptor = value.clone();
-                    set_keyboard_interceptor(move |data| {
-                        if data.key == "Escape" {
-                            run_on_main_thread(move || {
-                                store.renaming_node.set(None);
-                                clear_keyboard_interceptor();
-                            });
-                            return true;
-                        }
-                        if data.key == "Enter" {
-                            let nv = nv_interceptor.clone();
-                            run_on_main_thread(move || {
-                                let new_title = untracked(|| store.rename_text.get());
-                                store.renaming_node.set(None);
-                                clear_keyboard_interceptor();
-                                if let Some((s_id, Some(n_id))) = parse_tree_value(&nv) {
-                                    store.send(BackendCommand::RenameNode {
-                                        store_id: s_id, node_id: n_id, title: new_title,
-                                    });
-                                }
-                            });
-                            return true;
-                        }
-                        false
-                    });
-                    if let Some((doc_key, input_node_id)) = store.rename_input_ids.with(|ids| ids.get(&value).copied()) {
-                        request_focus(doc_key, input_node_id);
-                    }
+                    start_rename(store, tree_state, &value);
                     return;
                 }
 
@@ -1330,6 +1359,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         if let Some(pid) = parent_id {
                             store.send(BackendCommand::CreateNode {
                                 store_id: s_id, parent_id: Some(pid), title: String::new(), init: None,
+                                place: Default::default(),
                             });
                         }
                     }
@@ -1538,6 +1568,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 parent_id: Some(mount_ref.source_node),
                                 title: String::new(),
                                 init: None,
+                                place: Default::default(),
                             });
                         }
                         None => tracing::warn!("Mount node has no mount_ref yet; cannot create a child under it"),
@@ -1677,13 +1708,17 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 }
             };
 
-            // Register this input's DOM node ID so the double-click handler can focus it
-            store.rename_input_ids.update(|ids| {
-                ids.insert(node_value.clone(), (rename_input.doc_key(), rename_input.node_id().0));
-            });
+            // Register this row's rename box so `start_rename` can focus it
+            RENAME_INPUTS.with(|inputs| inputs.borrow_mut().insert(node_value.clone(), rename_input.clone()));
+            // A node the keyboard just made is named as soon as its row is
+            // drawn (docs/TREE_CONTRACT.md "The keyboard").
+            if crate::state::take_pending_rename(&node_value) {
+                let value = node_value.clone();
+                run_on_main_thread(move || {
+                    start_rename(store, tree_state, &value);
+                });
+            }
 
-            // Clone before wrapper rsx moves rename_input
-            let rename_input_for_focus = rename_input.clone();
             let row_value = node_value.clone();
 
             let wrapper = rsx! {
@@ -2040,39 +2075,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 // Regular nodes: new child, mount store, rename
                 let nv_rename_ctx = nv_for_context_menu.clone();
                 let on_rename = move || {
-                    if let Some((s_id, Some(n_id))) = parse_tree_value(&nv_rename_ctx) {
-                        let edit_text = store.get_node_signal(s_id, n_id)
-                            .map(|sig| sig.with(|n| n.metadata.title.clone()))
-                            .unwrap_or_default();
-                        store.rename_text.set(edit_text);
-                        store.renaming_node.set(Some(nv_rename_ctx.clone()));
-                        let nv_interceptor = nv_rename_ctx.clone();
-                        set_keyboard_interceptor(move |data| {
-                            if data.key == "Escape" {
-                                run_on_main_thread(move || {
-                                    store.renaming_node.set(None);
-                                    clear_keyboard_interceptor();
-                                });
-                                return true;
-                            }
-                            if data.key == "Enter" {
-                                let nv = nv_interceptor.clone();
-                                run_on_main_thread(move || {
-                                    let new_title = untracked(|| store.rename_text.get());
-                                    store.renaming_node.set(None);
-                                    clear_keyboard_interceptor();
-                                    if let Some((s_id, Some(n_id))) = parse_tree_value(&nv) {
-                                        store.send(BackendCommand::RenameNode {
-                                            store_id: s_id, node_id: n_id, title: new_title,
-                                        });
-                                    }
-                                });
-                                return true;
-                            }
-                            false
-                        });
-                        rename_input_for_focus.focus();
-                    }
+                    start_rename(store, tree_state, &nv_rename_ctx);
                 };
 
                 // "Open in Split View" (docs/SPLIT_VIEW_CONTRACT.md decision
@@ -2252,6 +2255,18 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             store.drop_hint.set(None);
         });
 
+        // The keyboard (docs/TREE_CONTRACT.md "The keyboard"): the Tree moves
+        // the cursor; `tree_keys` binds Pimble's keys; the document follows
+        // the cursor once it rests (Joe, 2026-10-19).
+        let tree_onkey: rinch::prelude::TreeKeyHandler =
+            Rc::new(move |key: &rinch::prelude::TreeKey| crate::tree_keys::on_key(store, tree_state, key));
+        let on_tree_cursor = ValueCallback::new(move |value: String| {
+            if untracked(|| store.selected_id.get()).as_deref() != Some(value.as_str()) {
+                open_node(store, tree_state, value);
+            }
+        });
+        let tree_label_of: rinch::prelude::LabelOf = Rc::new(move |value: &str| crate::tree_keys::label_of(store, value));
+
         let tree_scroll = rsx! {
             div {
                 class: "pimble-sidebar__tree",
@@ -2274,6 +2289,10 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     ondrop: on_tree_drop,
                     ondragstart: on_tree_drag_start,
                     ondragend: on_tree_drag_end,
+                    keyboard: true,
+                    handle_key: tree_onkey,
+                    oncursor: on_tree_cursor,
+                    label_of: tree_label_of,
                 }
             }
         };
@@ -2303,6 +2322,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     parent_id: Some(root_id),
                     title: String::new(),
                     init: None,
+                    place: Default::default(),
                 }),
                 // Nothing to create a node under. On the desktop "New
                 // Store..." is a menu item away; a browser has no menu bar, so

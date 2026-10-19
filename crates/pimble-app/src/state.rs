@@ -36,6 +36,52 @@ pub fn take_last_drop_target_value() -> Option<String> {
     LAST_DROP_TARGET_VALUE.with(|cell| cell.borrow_mut().take())
 }
 
+thread_local! {
+    /// A node the explorer's keyboard asked for (docs/TREE_CONTRACT.md "The
+    /// keyboard": a new sibling or child, renamed at once): its store, its
+    /// parent, and the mount-path suffix its tree value will carry.
+    static PENDING_CREATE: RefCell<Option<(StoreId, NodeId, String)>> = const { RefCell::new(None) };
+    /// The tree value of that node once it exists, renamed when its row is
+    /// drawn.
+    static PENDING_RENAME: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// The keyboard is making a node under `parent`; its row, when it comes,
+/// starts renaming.
+pub fn set_pending_create(store_id: StoreId, parent: NodeId, suffix: String) {
+    PENDING_CREATE.with(|cell| *cell.borrow_mut() = Some((store_id, parent, suffix)));
+}
+
+/// `NodeCreated` for `node` under `parent`: the tree value to rename, when
+/// it is the node the keyboard asked for.
+pub fn take_pending_create(store_id: StoreId, parent: NodeId, node: NodeId) -> Option<String> {
+    PENDING_CREATE.with(|cell| {
+        let mut pending = cell.borrow_mut();
+        match pending.as_ref() {
+            Some((s, p, _)) if *s == store_id && *p == parent => {
+                let (_, _, suffix) = pending.take()?;
+                let value = format!("node_{store_id}_{node}{suffix}");
+                PENDING_RENAME.with(|r| *r.borrow_mut() = Some(value.clone()));
+                Some(value)
+            }
+            _ => None,
+        }
+    })
+}
+
+/// Whether the row of `value` is the one to rename as it is drawn (once).
+pub fn take_pending_rename(value: &str) -> bool {
+    PENDING_RENAME.with(|cell| {
+        let mut pending = cell.borrow_mut();
+        if pending.as_deref() == Some(value) {
+            pending.take();
+            true
+        } else {
+            false
+        }
+    })
+}
+
 /// A pending mount operation waiting for a store to be opened.
 #[derive(Debug, Clone)]
 pub struct PendingMount {
@@ -703,10 +749,6 @@ pub struct AppStore {
     /// (docs/TREE_CONTRACT.md "Feedback").
     pub drop_hint: Signal<Option<crate::tree_drop::DropHint>>,
 
-    // Rename input DOM node IDs (tree_value → input element node ID for request_focus)
-    /// Rename inputs by tree value as `(doc_key, node_id)`, so the double-click
-    /// handler can focus one via `request_focus`.
-    pub rename_input_ids: Signal<HashMap<String, (u64, usize)>>,
 
     // Mount picker
     pub pending_mount: Signal<Option<PendingMount>>,
@@ -1096,7 +1138,6 @@ impl AppStore {
             renaming_node: Signal::new(None),
             rename_text: Signal::new(String::new()),
             drop_hint: Signal::new(None),
-            rename_input_ids: Signal::new(HashMap::new()),
             pending_mount: Signal::new(None),
             mount_source: Signal::new(None),
             editor_dirty: Signal::new(false),

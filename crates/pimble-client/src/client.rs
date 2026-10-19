@@ -391,11 +391,11 @@ impl PimbleClient {
         node_type: impl Into<String>,
         title: impl Into<String>,
     ) -> Result<NodeId> {
-        self.create_node_with(store_id, parent_id, node_type, title, None, Default::default()).await
+        self.create_node_with(store_id, parent_id, node_type, title, None, Default::default(), Place::Last).await
     }
 
     /// Create a new node that starts with `content` (a yrs update merged into
-    /// its document) and `custom` metadata, in the one edit that creates it.
+    /// its document) and `custom` metadata, in the one edit that creates it, at `place` among the parent's children.
     pub async fn create_node_with(
         &self,
         store_id: StoreId,
@@ -404,6 +404,7 @@ impl PimbleClient {
         title: impl Into<String>,
         content: Option<Vec<u8>>,
         custom: std::collections::HashMap<String, serde_json::Value>,
+        place: Place,
     ) -> Result<NodeId> {
         use base64::Engine;
         let request = CreateNodeRequest {
@@ -413,6 +414,7 @@ impl PimbleClient {
             title: title.into(),
             content: content.map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
             custom,
+            place,
         };
 
         let response = self

@@ -315,7 +315,11 @@ drops, keyboard, multi-select, undo). A move's place is a `pimble_core::Place` (
 inside or after a row, the depth at the end of a group from the pointer's indent column.
 `pimble-app/src/tree_drop.rs` `plan_drop` is the one judgement of a drop; the strip at the
 foot of the explorer (`AppStore::drop_hint`) says where it lands, or why not, before the
-release.
+release. Wave 2 (keyboard, rinch branch `feat/tree-keyboard`): the Tree moves a cursor and
+offers keys to `handle_key` first; `pimble-app/src/tree_keys.rs` binds Pimble's (Enter,
+F2, Alt+Shift+arrows through `plan_drop`, new sibling/child, Delete, cut/paste); the
+document follows the cursor; creating takes a `Place` too. `start_rename` is the one way a
+rename starts.
 
 ### Tree appearance (done 2026-09-15)
 

@@ -46,6 +46,7 @@ async fn create_doc(handler: &RpcHandler, store_id: StoreId, parent_id: NodeId, 
             title: title.into(),
             content: None,
             custom: Default::default(),
+            place: Default::default(),
         })
         .await
         .unwrap()
@@ -460,6 +461,7 @@ async fn create_node_under_a_mount_is_an_error() {
             title: "Should fail".into(),
             content: None,
             custom: Default::default(),
+            place: Default::default(),
         })
         .await;
 

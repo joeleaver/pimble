@@ -255,6 +255,10 @@ pub struct CreateNodeRequest {
     /// title), written in the same edit.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub custom: std::collections::HashMap<String, serde_json::Value>,
+    /// Where among the parent's children (docs/TREE_CONTRACT.md "Places on
+    /// the wire"); the end when left out.
+    #[serde(default)]
+    pub place: Place,
 }
 
 /// Response after creating a node

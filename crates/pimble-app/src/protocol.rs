@@ -38,7 +38,7 @@ pub enum BackendCommand {
     // Node operations
     /// `init` is what the node starts with, written in the edit that creates
     /// it; `None` makes an ordinary empty document.
-    CreateNode { store_id: StoreId, parent_id: Option<NodeId>, title: String, init: Option<NodeInit> },
+    CreateNode { store_id: StoreId, parent_id: Option<NodeId>, title: String, init: Option<NodeInit>, place: Place },
     GetNode { store_id: StoreId, node_id: NodeId },
     GetChildren { store_id: StoreId, node_id: NodeId },
     SetNodeContent { store_id: StoreId, node_id: NodeId, content: Vec<u8> },

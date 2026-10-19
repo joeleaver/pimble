@@ -90,6 +90,7 @@ async fn sync_nodes_hands_a_fresh_replica_the_whole_tree() {
             title: "Folder".into(),
             content: None,
             custom: Default::default(),
+            place: Default::default(),
         })
         .await
         .unwrap()
@@ -102,6 +103,7 @@ async fn sync_nodes_hands_a_fresh_replica_the_whole_tree() {
             title: "Doc".into(),
             content: None,
             custom: Default::default(),
+            place: Default::default(),
         })
         .await
         .unwrap()
@@ -114,6 +116,7 @@ async fn sync_nodes_hands_a_fresh_replica_the_whole_tree() {
             title: "Doomed".into(),
             content: None,
             custom: Default::default(),
+            place: Default::default(),
         })
         .await
         .unwrap()
@@ -191,7 +194,7 @@ async fn apply_edit_with_a_peers_new_node_reaches_get_children() {
     let mut peer = Tree::from_docs(root_id, docs);
 
     let new_node_id = NodeId::new();
-    let edit = peer.add_node(new_node_id, Some(root_id), None, "document", "From Peer", T0).unwrap();
+    let edit = peer.add_node(new_node_id, Some(root_id), pimble_core::Place::Last, "document", "From Peer", T0).unwrap();
     assert_eq!(edit.touched.len(), 2, "the node's init and the root's list");
 
     for (node_id, update) in &edit.touched {

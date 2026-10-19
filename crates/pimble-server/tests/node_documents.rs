@@ -64,6 +64,7 @@ async fn create(handler: &RpcHandler, store_id: StoreId, parent_id: NodeId, node
             title: title.into(),
             content: None,
             custom: Default::default(),
+            place: Default::default(),
         })
         .await
         .unwrap()
@@ -144,7 +145,7 @@ async fn a_peers_structure_edits_earn_the_derived_kinds() {
 
     // Create.
     let x = NodeId::new();
-    let edit = peer.add_node(x, Some(root_id), None, "document", "X", T0).unwrap();
+    let edit = peer.add_node(x, Some(root_id), Place::Last, "document", "X", T0).unwrap();
     send_edit(&handler, store_id, "peer", &edit).await;
     let notifs = drain(&mut sub, Duration::from_millis(300)).await;
     let kinds: Vec<&StoreChangeKind> = notifs.iter().map(|n| &n.change_kind).collect();

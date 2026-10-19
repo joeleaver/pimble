@@ -40,6 +40,7 @@ pub mod styles;
 pub mod text_boards;
 pub mod toolbar;
 pub mod tree_drop;
+pub mod tree_keys;
 
 /// The desktop backend: a background thread with a tokio runtime, an embedded
 /// [`pimble_server::PimbleServer`] and the WebSocket client that talks to it.

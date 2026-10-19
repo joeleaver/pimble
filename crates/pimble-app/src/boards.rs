@@ -1525,6 +1525,7 @@ pub(crate) fn create_board_node(store: AppStore, store_id: StoreId, parent_id: N
             ],
             request,
         }),
+        place: Default::default(),
     });
 }
 
