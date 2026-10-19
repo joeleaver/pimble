@@ -507,26 +507,24 @@ impl Book for AppBook {
             if title.trim().to_lowercase() != *last {
                 continue;
             }
-            // Every earlier part names an ancestor, in order, nearest last.
+            // Every earlier part names the next parent up, in order: a path
+            // is a run of titles straight down the tree, never skipping a
+            // level (a same-titled note further down must not match too).
             let mut ok = true;
             for part in parts.iter().rev().skip(1) {
-                loop {
-                    let Some(p) = parent else {
-                        ok = false;
-                        break;
-                    };
-                    let Some((t, up)) = self.title(&node_ref(s, p)) else {
-                        ok = false;
-                        break;
-                    };
-                    parent = up;
-                    if t.trim().to_lowercase() == *part {
-                        break;
-                    }
-                }
-                if !ok {
+                let Some(p) = parent else {
+                    ok = false;
+                    break;
+                };
+                let Some((t, up)) = self.title(&node_ref(s, p)) else {
+                    ok = false;
+                    break;
+                };
+                if t.trim().to_lowercase() != *part {
+                    ok = false;
                     break;
                 }
+                parent = up;
             }
             if ok {
                 found.push(r);

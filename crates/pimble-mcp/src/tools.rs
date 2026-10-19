@@ -12,13 +12,20 @@ use pimble_crdt::{CrdtError, NodeDoc};
 use pimble_rpc::EditOperation;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
-use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use rmcp::model::{
+    Implementation, ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, Resource, ResourceContents, ServerCapabilities, ServerConfig,
+};
+use rmcp::service::RequestContext;
+use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::connection::Connection;
 use crate::nodes::{self, label, Addr};
+use crate::sheets::guide;
+
+mod sheet_tools;
 
 const INSTRUCTIONS: &str = "\
 Pimble is the person's personal information manager: stores hold trees of nodes, each node \
@@ -46,7 +53,15 @@ it). A quote must appear exactly once in the node. For restructuring, replace_co
 rewrites the whole content but writes only the blocks that differ, and the node keeps its \
 link: never delete and recreate a note to restructure it. create_node takes the new node's \
 first content. Inline code cannot also be bold, italic, struck through or a link. Deleting is undoable \
-(undelete_node, and the app's Recently Deleted).";
+(undelete_node, and the app's Recently Deleted).
+
+Sheets are small named tables of typed columns and rows, with Excel formulas per column, kept \
+in a sheet node. list_tables and get_table read them (get_node shows them too); create_sheet, \
+create_table, add_rows, update_rows, delete_rows, add_column, update_column, delete_column, \
+set_summary, rename_table and delete_table write them, touching only what they name; evaluate \
+runs a formula without saving it. Values go in as a person types them (\"$12.50\", \"yesterday\", \
+a linked row's first-column value); rows are named by id or by their first column's value. \
+Before writing a formula, read sheet_formula_guide (also the resource \"Sheet formulas\").";
 
 pub struct Pimble {
     conn: Arc<Connection>,
@@ -79,7 +94,7 @@ impl Pimble {
         Self {
             conn,
             client_id: format!("mcp:{}", uuid::Uuid::new_v4()),
-            tool_router: Self::tool_router(),
+            tool_router: Self::tool_router() + Self::sheet_router(),
         }
     }
 
@@ -444,7 +459,16 @@ impl Pimble {
             out.push_str("(a mount: its children are another store's; list_children shows them)\n");
         }
         out.push_str("---\n");
-        out.push_str(if content.is_empty() { "(no content)" } else { &content });
+        let tables = self.tables_of_node(&client, addr, &node).await;
+        if node.node_type == pimble_core::node_types::SHEET {
+            out.push_str("(a sheet node: its content is its tables)\n");
+        } else {
+            out.push_str(if content.is_empty() { "(no content)" } else { &content });
+        }
+        if let Some(tables) = tables {
+            out.push_str("\n\n## Tables\n\n");
+            out.push_str(&tables);
+        }
         Ok(out)
     }
 
@@ -785,8 +809,34 @@ fn outline<'a>(
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Pimble {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_resources().build())
             .with_server_info(Implementation::new("pimble", env!("CARGO_PKG_VERSION")))
             .with_instructions(INSTRUCTIONS)
+    }
+
+    /// The one resource: the sheet formula guide (also the
+    /// `sheet_formula_guide` tool, for clients that ignore resources).
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        let guide = Resource::new(guide::URI, guide::NAME)
+            .with_title(guide::NAME)
+            .with_description("How to write formulas for Pimble's sheets: Excel Table syntax, links, other notes, functions, examples.")
+            .with_mime_type("text/markdown");
+        Ok(ListResourcesResult::with_all_items(vec![guide]))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        if request.uri != guide::URI {
+            return Err(ErrorData::resource_not_found(format!("There is no resource {}.", request.uri), None));
+        }
+        let contents = ResourceContents::text(guide::text(), guide::URI).with_mime_type("text/markdown");
+        Ok(ReadResourceResponse::Complete(ReadResourceResult::new(vec![contents])))
     }
 }

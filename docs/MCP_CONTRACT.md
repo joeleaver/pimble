@@ -213,6 +213,34 @@ Write:
 | `delete_node`, `undelete_node` | tombstone, put back |
 | `add_hosted_store` | open a hosted store here as a replica (`cloudAddHostedStore`) and add it to the open-store list |
 
+Sheets (docs/SHEETS_CONTRACT.md section 10, wave 1; built 2026-10-19 on branch `sheets`).
+`pimble-mcp` links `pimble-sheet` and computes what it reads exactly as the app does, over
+the node documents it fetches (`crates/pimble-mcp/src/sheets/`: a `Book` filled with the
+home node, the notes its stored formulas name, and the open stores' titles when a formula
+names or shows another note). Every write is one `applyEdit` of the update the
+`Sheets::edit` transactions made, so it touches only what it names. Formulas go in and
+come out as people write them (names), turned into ids with `to_stored` as the formula
+editor does. Tables, columns and rows are named the way people name them (a row by its
+id or its first column's value); an ambiguous name is refused with the candidates.
+
+| Tool | What it does |
+| --- | --- |
+| `list_tables` | a node's tables, a store's (`store`), or the tables whose formulas read a given one (`reads`): name, kind, row count, columns with types, the node they sit in |
+| `get_table` | columns (type, link target, formula, format) and rows as a Markdown table, typed values as typed and computed values as shown, each error's code and sentence; `filter` (column = value) and `limit` |
+| `evaluate` | a formula run in a note's context (and a table's, and one row's) without storing it |
+| `sheet_formula_guide` | the guide "Sheet formulas", also published as the MCP resource `pimble://guides/sheet-formulas` |
+| `create_sheet` | a sheet node under a parent, its first table, columns and rows written in the edit that creates it (`createNode` with content, as the app's "New Sheet") |
+| `create_table` | a table in a sheet node with columns and rows; in a text node it is refused until wave 2 |
+| `add_rows`, `update_rows`, `delete_rows` | values as typed (`"$12.50"`, `"yesterday"`, `"Civic"` for a link), parsed by the column's type; a value that does not parse or a link that matches no row is refused unless `keep_as_typed`; an update writes only the cells that change |
+| `add_column`, `update_column`, `delete_column` | name, type, link target, formula, format; a type change carries values over as typed; a formula that does not parse, names something that does not resolve, gives `#SPILL!`, `#CIRC!` or `#NAME?` is refused, and an accepted one answers its first values |
+| `set_summary` | a summary's formula (made when no table has the name) and its result columns' names, checked the same way |
+| `rename_table`, `delete_table` | a table of the node; the answer names the formulas and link columns that read a deleted table or column |
+
+`get_node` shows a node's tables as Markdown tables after its content (a sheet node's
+content is its tables). Not yet: link-to-a-node columns, tables in text and `move_table`
+(waves 2-3), and the later waves' `get_fields`, `set_fields`, `rows_pointing_here` and
+`paste_table`.
+
 Not exposed, on purpose: hosting a store (`cloudHostStore`), sharing, relaying, linking to
 a remote, closing or removing stores, signing in or out. Nothing is hosted unless the
 person asked for it (CLAUDE.md), and an LLM asking is not the person asking. Signing in

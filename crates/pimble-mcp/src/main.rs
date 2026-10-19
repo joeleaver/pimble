@@ -9,6 +9,7 @@
 
 mod connection;
 mod nodes;
+mod sheets;
 mod tools;
 
 use std::sync::Arc;
