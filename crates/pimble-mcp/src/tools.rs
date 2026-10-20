@@ -59,7 +59,8 @@ Sheets are small named tables of typed columns and rows, with Excel formulas per
 in a sheet node or in a text node's text. list_tables and get_table read them (get_node shows them \
 too, a text node's where they are in its text); create_sheet, create_table, add_rows, update_rows, \
 delete_rows, add_column, update_column, delete_column, set_summary, rename_table, move_table and \
-delete_table write them, touching only what they name; evaluate \
+delete_table write them, touching only what they name; rows_pointing_here lists the rows that \
+link to a node; evaluate \
 runs a formula without saving it. Values go in as a person types them (\"$12.50\", \"yesterday\", \
 a linked row's first-column value); rows are named by id or by their first column's value. \
 Before writing a formula, read sheet_formula_guide (also the resource \"Sheet formulas\").";

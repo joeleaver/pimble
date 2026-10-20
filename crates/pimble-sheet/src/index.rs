@@ -59,6 +59,25 @@ pub fn units_of(snap: &SheetsSnap) -> Vec<IndexUnit> {
     out
 }
 
+/// The nodes the typed cells of a node's tables link to (link-to-a-node
+/// columns), each once: links of the node for the index, so a node's
+/// backlinks include the rows that point at it (contract section 8).
+pub fn linked_nodes(doc: &NodeDoc) -> Vec<crate::model::NodeRef> {
+    let mut out = Vec::new();
+    for t in Sheets::of_node(doc).read().tables {
+        for r in &t.rows {
+            for v in r.cells.values() {
+                if let Stored::Node(n) = v {
+                    if !out.contains(n) {
+                        out.push(*n);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The first cell of row `row` of whichever table a row link of `typed`
 /// points at (a row id is unique, so the first match is it).
 fn snap_link(snap: &SheetsSnap, typed: &[&crate::model::ColumnSnap], row: &str) -> Option<String> {

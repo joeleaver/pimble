@@ -1,7 +1,8 @@
 # Sheets contract: small live tables in notes, with Excel formulas
 
-Status: **waves 1 and 2 built** (branch `sheets`, not merged; "Built in wave 2" at the
-end says what exists and how it was checked). Written on 2026-10-19 from a brainstorm with Joe. It
+Status: **waves 1 and 2 built, wave 3 built except node fields** (branch `sheets`, not
+merged; the "Built in wave ..." sections at the end say what exists and how it was
+checked). Node fields wait on open decision 1. Written on 2026-10-19 from a brainstorm with Joe. It
 started from "a spreadsheet-like node, but not exactly. What you want isn't a giant sheet
 full of data, but a quick little tool, and you end up using just a few little ranges".
 Joe's examples were a trip cost calculator, a household budget and a time tracker. Every
@@ -436,7 +437,49 @@ In layers (Joe, 2026-10-19: "would be nice"):
   `sheets::in_text::tests`, `pimble-crdt` `an_embed_reads_back_and_every_reader_copes`,
   `pimble-sheet` `a_copied_table_keeps_its_ids_and_contents` and
   `tables_read_names_this_notes_tables_only`.
-- **Gaps**: no summary can be inserted in text (Insert Sheet makes a plain table); the
-  table name field is wide; the reverse of Move and `move_table`; a table's edits made
-  between pressing Move and the node arriving stay in the note's copy only.
+- **Gaps**: no summary can be inserted in text (Insert Sheet makes a plain table); a
+  table's edits made between pressing Move and the node arriving stay in the note's copy
+  only. (The name field and `move_table` were done in wave 3's first commits.)
+
+## Built in wave 3 (2026-10-20, branch `sheets`), all but node fields
+
+- **Moves keep references.** `formula::rehome` rewrites stored formulas when a table moves
+  to another note: its own formulas name the note it left (`moved_out`), the tables left
+  behind name it in its new note (`left_behind`), and the new note's tables that read it
+  there read it as their own (`arrived`); string literals are left alone. A moved table
+  and the ones around it compute what they computed before (test
+  `a_moved_table_computes_the_same_on_both_sides`). The app's Move and the MCP's
+  `move_table` (within a node, or into another node either way, the copy first) both use
+  it; only a row link still ties a table to its note.
+- **Notes a formula reads** (`sheets/reads.rs`): each resolved once (`resolveLink`); a
+  deleted one reads `#REF!` "… was deleted", one this account cannot read "You can't read
+  …", one not on this device "Loading…", one that became another (a move out of a share)
+  reads the note it became. While read it is subscribed and fetched fresh, counted by
+  `AppStore::is_editing`, a peer's update of it is merged into its cached copy so the
+  sheets reading it recompute, and it is let go when nothing reads it. A pane's live copy
+  of a note beats the cache. Not built: "From your offline copy of …" (the link state is
+  not consulted).
+- **Link-to-a-node columns**: "Nodes under" in the column form (a title or path, resolved
+  as formulas name notes; empty for anywhere); typing in such a cell fetches the parent's
+  children for its choices; a name that matches none offers `Create "X" under Parent`,
+  which makes the node there and links the cell to it when it arrives (siblings' field
+  names wait on node fields). A linked node not held is fetched so its title shows. The
+  MCP takes `under` and node values (a pimble: link, or a child's title).
+- **Search**: `pimble_sheet::index::index_units`, per table a name unit, a header of its
+  typed columns and a row per row; formula columns and summaries stay out. The document
+  plugin adds them after a note's text, a new `SheetPlugin` indexes sheet nodes, and the
+  browser's search of encrypted stores reads the same units. A table's node links are
+  links in the index (`index::linked_nodes`), so backlinks include rows that point here.
+- **MCP `rows_pointing_here`**: every row in every open store linking to a node, grouped
+  by table, with totals of its number columns (it walks the stores; the backlinks index
+  is for the node page, whose UI is deferred with backlinks).
+- **Wave 1 bugs found on screen**: link chips and the summary button used
+  `--rinch-primary-color-filled`, which rinch does not define (a linked row or node was
+  invisible); the table's scroller clipped a link cell's choices.
+- **Checked** in a release build on the scratch store (Move with a formula reading the
+  moved table, `move_table` back into the text, a node link set by the MCP and shown,
+  Create from a cell, the column form) and by tests (`sheets::in_text::tests`, pimble-sheet
+  `rehome` and `index`). Not yet in a browser: wave 3's app parts.
+- **Waiting on open decision 1**: node fields, `[@project].rate`, `get_fields`/`set_fields`,
+  a created node getting its siblings' field names.
 

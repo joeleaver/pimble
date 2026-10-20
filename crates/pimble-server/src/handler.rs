@@ -543,6 +543,16 @@ fn build_index_node(store_id: StoreId, node: &Node, plugin_host: &PluginHost) ->
         .filter(|link| link.target.store == store_id && link.target.node != node.id)
         .map(|link| link.target.node)
         .collect();
+    // A table's link-to-a-node cells link too (docs/SHEETS_CONTRACT.md
+    // section 8, "rows that point here").
+    if let Ok(doc) = NodeDoc::load(&node.content) {
+        links.extend(
+            pimble_sheet::index::linked_nodes(&doc)
+                .into_iter()
+                .filter(|n| n.store == store_id && n.node != node.id)
+                .map(|n| n.node),
+        );
+    }
     links.sort_by_key(|id| id.0);
     links.dedup();
 

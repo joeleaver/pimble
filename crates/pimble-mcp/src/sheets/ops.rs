@@ -579,10 +579,15 @@ pub fn table_summary(book: &McpBook, snap: &SheetsSnap, t: &TableSnap) -> String
 }
 
 /// Rows to show: those whose cells match every `(column, value)` (the text
-/// shown, case-insensitive, or the same number), at most `limit`.
+/// shown, case-insensitive, or the same number), and are among `rows` when
+/// it is set, at most `limit`; with `totals`, a line summing each number
+/// column over them.
+#[derive(Default)]
 pub struct Filter {
     pub equals: Vec<(String, String)>,
     pub limit: usize,
+    pub rows: Option<std::collections::HashSet<String>>,
+    pub totals: bool,
 }
 
 fn number_of(s: &str) -> Option<f64> {
@@ -647,6 +652,7 @@ pub fn render_table(work: &Work, table: &str, filter: &Filter) -> Result<String,
     let mut lines = vec![format!("| {} |", header.join(" | ")), format!("|{}", " --- |".repeat(header.len()))];
     let mut errors = Vec::new();
     let mut matched = 0;
+    let mut sums: BTreeMap<usize, f64> = BTreeMap::new();
     for (i, row) in ct.rows.iter().enumerate() {
         let stored_row = t.row(&row.id);
         let mut cells = Vec::with_capacity(ct.columns.len());
@@ -668,6 +674,14 @@ pub fn render_table(work: &Work, table: &str, filter: &Filter) -> Result<String,
         }
         if !wanted.iter().all(|(ci, value)| matches(&cells[*ci].0, cells[*ci].1, value)) {
             continue;
+        }
+        if filter.rows.as_ref().is_some_and(|only| !only.contains(&row.id)) {
+            continue;
+        }
+        for (ci, (_, v)) in cells.iter().enumerate() {
+            if let Value::Number(n) = v {
+                *sums.entry(ci).or_insert(0.0) += *n;
+            }
         }
         matched += 1;
         if matched > filter.limit {
@@ -697,6 +711,16 @@ pub fn render_table(work: &Work, table: &str, filter: &Filter) -> Result<String,
     } else {
         out.push_str(&lines.join("\n"));
         out.push('\n');
+        if filter.totals && !sums.is_empty() {
+            let parts: Vec<String> = sums
+                .iter()
+                .filter(|(ci, _)| matches!(ct.columns[**ci].format, Format::Number | Format::Money | Format::Hours | Format::Auto))
+                .map(|(ci, n)| format!("{} {}", ct.columns[*ci].name, shown(&engine, &Value::Number(*n), ct.columns[*ci].format)))
+                .collect();
+            if !parts.is_empty() {
+                out.push_str(&format!("totals: {}\n", parts.join(", ")));
+            }
+        }
         if matched > filter.limit {
             out.push_str(&format!("(showing {} of {matched} rows; raise limit or filter to see more)\n", filter.limit));
         }
@@ -718,7 +742,7 @@ pub fn render_all(work: &Work, limit: usize) -> String {
         out.push_str(&format!("Two tables here are called {name}; rename one.\n"));
     }
     for id in ids {
-        match render_table(work, &id, &Filter { equals: Vec::new(), limit }) {
+        match render_table(work, &id, &Filter { equals: Vec::new(), limit, ..Default::default() }) {
             Ok(s) => out.push_str(&s),
             Err(e) => out.push_str(&format!("(a table could not be shown: {e})\n")),
         }
@@ -922,7 +946,7 @@ pub fn set_summary(work: &mut Work, table: &str, shown: &str, columns: Option<&[
     if let Some(e) = error {
         out.push_str(&format!("It computes to {} {}\n", e.code.code(), sentence(&e.message)));
     }
-    out.push_str(&render_table(work, &id, &Filter { equals: Vec::new(), limit: PREVIEW_ROWS })?);
+    out.push_str(&render_table(work, &id, &Filter { equals: Vec::new(), limit: PREVIEW_ROWS, ..Default::default() })?);
     Ok(out)
 }
 

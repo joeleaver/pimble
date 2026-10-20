@@ -269,6 +269,12 @@ pub struct MoveTableParams {
     pub after_text: Option<String>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct RowsPointingHereParams {
+    /// The node the rows link to.
+    pub node: String,
+}
+
 // ── Plumbing ─────────────────────────────────────────────────────────────
 
 /// Every formula of a column spec, as typed.
@@ -329,7 +335,7 @@ impl Pimble {
         let Ok(doc) = NodeDoc::load(&node.content) else { return (markdown.to_string(), None) };
         let work = Work::new(Sheets::of_node(&doc), &mut book);
         let render = |id: &str| {
-            ops::render_table(&work, id, &Filter { equals: Vec::new(), limit: NODE_ROWS })
+            ops::render_table(&work, id, &Filter { equals: Vec::new(), limit: NODE_ROWS, ..Default::default() })
                 .unwrap_or_else(|e| format!("(a table could not be shown: {e})\n"))
         };
         let mut shown = HashSet::new();
@@ -493,7 +499,7 @@ impl Pimble {
         let equals: Vec<(String, String)> = p.filter.clone().unwrap_or_default().into_iter().collect();
         self.sheet_read(&client, addr, &[], |w| {
             let id = find_table(w.snap(), &p.table)?.id.clone();
-            ops::render_table(w, &id, &Filter { equals, limit })
+            ops::render_table(w, &id, &Filter { equals, limit, ..Default::default() })
         })
         .await
     }
@@ -568,7 +574,7 @@ impl Pimble {
             return self
                 .sheet_edit(&client, addr, &shown, |w| {
                     let id = ops::create_table(w, &p.name, &p.columns, &p.rows, p.keep_as_typed, p.after.as_deref())?;
-                    let out = ops::render_table(w, &id, &Filter { equals: Vec::new(), limit: 5 })?;
+                    let out = ops::render_table(w, &id, &Filter { equals: Vec::new(), limit: 5, ..Default::default() })?;
                     Ok(format!("Created the table.\n{out}"))
                 })
                 .await;
@@ -585,7 +591,7 @@ impl Pimble {
             let id = {
                 let mut work = Work::new(Sheets::of_node(doc), &mut book);
                 let id = ops::create_table(&mut work, &p.name, &p.columns, &p.rows, p.keep_as_typed, p.after.as_deref())?;
-                *answer_ref = ops::render_table(&work, &id, &Filter { equals: Vec::new(), limit: 5 })?;
+                *answer_ref = ops::render_table(&work, &id, &Filter { equals: Vec::new(), limit: 5, ..Default::default() })?;
                 id
             };
             let atom = embed_markdown(&id);
@@ -702,6 +708,56 @@ impl Pimble {
         let client = self.client().await?;
         let addr = nodes::resolve(&client, &p.node).await?;
         self.sheet_edit(&client, addr, &[], |w| ops::rename_table(w, &p.table, &p.new_name)).await
+    }
+
+    /// Every row of every table, in every open store, whose link-to-a-node
+    /// column links to this node, grouped by table with totals for its number
+    /// columns (contract section 8, "rows that point here"). Computed values
+    /// are computed as the app does.
+    #[tool(name = "rows_pointing_here")]
+    async fn rows_pointing_here(&self, Parameters(p): Parameters<RowsPointingHereParams>) -> Result<String, String> {
+        let client = self.client().await?;
+        let target = nodes::resolve(&client, &p.node).await?;
+        let target_ref = node_ref(target);
+        let stores = client.list_stores().await.map_err(rpc)?;
+        let mut out = String::new();
+        for store in &stores {
+            for (at, node, path) in walk_store(&client, store).await {
+                let snap = sheets_of(&node);
+                let hits: Vec<(String, HashSet<String>)> = snap
+                    .tables
+                    .iter()
+                    .filter_map(|t| {
+                        let cols: Vec<&str> = t.columns.iter().filter(|c| matches!(c.ty, ColumnType::NodeLink { .. })).map(|c| c.id.as_str()).collect();
+                        let rows: HashSet<String> = t
+                            .rows
+                            .iter()
+                            .filter(|r| cols.iter().any(|c| r.cells.get(*c) == Some(&pimble_sheet::Stored::Node(target_ref))))
+                            .map(|r| r.id.clone())
+                            .collect();
+                        (!rows.is_empty()).then(|| (t.id.clone(), rows))
+                    })
+                    .collect();
+                if hits.is_empty() {
+                    continue;
+                }
+                let mut book = load_book(&client, at, &node, &[]).await;
+                let Ok(doc) = NodeDoc::load(&node.content) else { continue };
+                let work = Work::new(Sheets::of_node(&doc), &mut book);
+                for (table, rows) in hits {
+                    let n = rows.len();
+                    let filter = Filter { limit: NODE_ROWS, rows: Some(rows), totals: n > 1, ..Default::default() };
+                    match ops::render_table(&work, &table, &filter) {
+                        Ok(text) => out.push_str(&format!("{} {path} ({}):\n{text}\n", place_of(&node), at.link())),
+                        Err(e) => out.push_str(&format!("(a table in {path} could not be shown: {e})\n")),
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            return Ok("No table links to that node.".into());
+        }
+        Ok(out)
     }
 
     /// Delete a table with its columns and rows (in a text node, its place

@@ -57,7 +57,7 @@ impl Note {
     fn render(&mut self, table: &str) -> String {
         self.work(|w| {
             let id = find_table(w.snap(), table).unwrap().id.clone();
-            render_table(w, &id, &Filter { equals: Vec::new(), limit: 100 }).unwrap()
+            render_table(w, &id, &Filter { equals: Vec::new(), limit: 100, ..Default::default() }).unwrap()
         })
     }
 }
@@ -288,20 +288,20 @@ fn filters_and_limits() {
     n.work(|w| add_rows(w, "Trips", &[row(&[("name", "Grandma"), ("miles", "140"), ("vehicle", "Civic")])], false, None)).unwrap();
     let out = n.work(|w| {
         let id = find_table(w.snap(), "Trips").unwrap().id.clone();
-        render_table(w, &id, &Filter { equals: vec![("vehicle".into(), "civic".into())], limit: 1 }).unwrap()
+        render_table(w, &id, &Filter { equals: vec![("vehicle".into(), "civic".into())], limit: 1, ..Default::default() }).unwrap()
     });
     assert!(out.contains("| Chicago |"), "{out}");
     assert!(!out.contains("| Grandma |") && !out.contains("| Tahoe |"), "{out}");
     assert!(out.contains("showing 1 of 2 rows"), "{out}");
     let out = n.work(|w| {
         let id = find_table(w.snap(), "Trips").unwrap().id.clone();
-        render_table(w, &id, &Filter { equals: vec![("miles".into(), "620".into())], limit: 10 }).unwrap()
+        render_table(w, &id, &Filter { equals: vec![("miles".into(), "620".into())], limit: 10, ..Default::default() }).unwrap()
     });
     assert!(out.contains("| Tahoe |") && !out.contains("| Chicago |"), "{out}");
     // Grandma has no gas price or nights: her cells compute, no error.
     let e = n.work(|w| {
         let id = find_table(w.snap(), "Trips").unwrap().id.clone();
-        render_table(w, &id, &Filter { equals: vec![("price".into(), "1".into())], limit: 10 })
+        render_table(w, &id, &Filter { equals: vec![("price".into(), "1".into())], limit: 10, ..Default::default() })
     });
     assert!(e.unwrap_err().contains("no column \"price\""));
 }
@@ -381,7 +381,7 @@ fn a_new_sheet_is_made_in_one_update() {
     doc.apply_update(&content).unwrap();
     let mut book = McpBook::new(r(2), SheetsSnap::default(), today());
     let w = Work::new(Sheets::of_node(&doc), &mut book);
-    let out = render_table(&w, &w.snap().tables[0].id.clone(), &Filter { equals: Vec::new(), limit: 10 }).unwrap();
+    let out = render_table(&w, &w.snap().tables[0].id.clone(), &Filter { equals: Vec::new(), limit: 10, ..Default::default() }).unwrap();
     assert!(out.contains("### Budget"), "{out}");
     assert!(out.contains("| Food | $400.00 | $4,800.00 |"), "{out}");
     // The defaults when no columns are given, as the app's New Sheet.
