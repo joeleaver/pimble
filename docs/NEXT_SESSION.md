@@ -1,25 +1,49 @@
 # Next session: start here
 
-**2026-10-20 (later): sheets wave 3 built**, node fields included (Joe decided them:
-`node` root keys `field:<name>`, docs/SHEETS_CONTRACT.md open decision 1). Moves keep
-formulas reading (`formula::rehome`), MCP `move_table`, `rows_pointing_here`,
-`get_fields`, `set_fields`; notes a formula reads are resolved, held and followed live
-(`sheets/reads.rs`); link-to-a-node columns with "Nodes under" and Create; fields band
-(`fields.rs`); search indexes typed cells and fields. Then sheet nodes embedded in text,
-as board nodes are (Joe asked; `Slot::Embed`, Insert > "Sheet from a Node...", Move
-leaves one). Next: wave 4 (copy and paste) or wave 6 (boards in text onto node views).
+**2026-10-20, end of session: sheets waves 1 to 3 built, plus sheet nodes embedded in
+text.** Branch `sheets` (on `master`, 25 commits, nothing pushed); rinch at `main` fc14187
+in both locks. docs/SHEETS_CONTRACT.md is the reference: "Built in wave 2", "Built in
+wave 3" and "Built after wave 3" say what exists, how it was checked (release desktop
+build on a scratch store over the debug port, and Chromium on the local stack in an
+encrypted store) and the gaps.
 
-**2026-10-20: rinch at `main` fc14187, sheets wave 2 built** (branch `sheets`, nothing
-pushed). Sheets in text on rinch node views: Insert Sheet, typing in a table in a note,
-the lost list with Put Back, Move to a sheet node, the MCP's `create_table` in text and
-`get_node` showing tables in place. Checked on the desktop and in Chromium on the local
-stack; docs/SHEETS_CONTRACT.md "Built in wave 2" has the details and the gaps. Next, as
-before: wave 3 (nodes in sheets, cross-note references; open decision 1 is Joe's first),
-or wave 6 (boards in text onto node views). Still true from 2026-10-19: master has boards
-merged locally, unpushed (pushing ships boards: ask Joe).
+What exists, in one breath: tables in a note's text on rinch node views (Insert Sheet,
+the lost list, Move to a sheet node, which leaves an embed); sheet nodes embedded in text
+and edited there (`sheets.rs` `Slot::Embed`, Insert > "Sheet from a Node..."); formulas
+across notes, kept reading through moves (`formula::rehome`), with the notes they read
+resolved, held and followed live (`sheets/reads.rs`); link-to-a-node columns ("Nodes
+under", Create from a cell); node fields (Joe's decision 1: `node` root keys
+`field:<name>`, the band in `fields.rs`, `[@link].field`); search over typed cells and
+fields; MCP `create_table` in text, `move_table`, `rows_pointing_here`, `get_fields`,
+`set_fields`.
 
-Testing lesson: `scripts/perf/rd.py ... key_press` needs `"shift":false,"ctrl":false` or
-the debug port refuses it (the error is printed, the run goes on).
+**Start here next:**
+
+1. Ask Joe which comes next: wave 4 (copy and paste with Excel and Google Sheets) or
+   wave 6 (boards in text onto node views). Recommended: wave 4.
+2. Small gaps worth a pass first or alongside: dropping a sheet node's tree row on the
+   text and pasting its link to embed it (boards have both); a summary cannot be inserted
+   in text; "From your offline copy of ..." for a read note; contract open decisions 2-5
+   are still Joe's (hours vs day fractions, A1 references, per-cell formulas, GROUPBY
+   totals).
+3. Still true from 2026-10-19: local `master` has boards merged, unpushed. Pushing
+   `master` ships boards (and is a release): ask Joe. `sheets` merges onto `master`.
+
+How to check things on screen (all used this session):
+
+- Desktop: `scripts/perf/README.md`; the session's scratch app ran on port 7495 with its
+  own `XDG_*` dirs and a scratch store. Pick a free port (`ss -ltn | grep :74`), launch
+  by pid, check `state.json` points at the copy. Drive it with `python3
+  scripts/perf/rd.py <pid> <method> '<json>'`; `key_press` needs `"shift":false,
+  "ctrl":false` or the port refuses it (and prints the error while the run goes on).
+  The rinch MCP server does not start (its binary path is under the off-limits rinch
+  checkout), so `rd.py` is the way.
+- Browser: `scripts/local-stack/README.md` with `PIMBLE_STACK_DIR` in the scratchpad,
+  the signup helper's made-up `alice@example.com`, `down.sh` after.
+- MCP: `scripts/mcp/drive.py` with `PIMBLE_APP_ADDR` pointing at the scratch app; the
+  column spec of `add_column` is flattened into its parameters.
+- Disk: the root filesystem filled up once this session (old sessions' scratch dirs under
+  `/tmp/claude-1000/-home-joe-dev-pimble/` held 18G); `df -h /` before long builds.
 
 **2026-10-19: sheets wave 1, node views in rinch, boards merged locally.** Nothing is
 pushed. Branches, newest first:
