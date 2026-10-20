@@ -63,9 +63,11 @@
             <div class="asset__os">Linux: any distribution<span class="asset__tag" data-rec hidden>For this computer</span></div>
             <div class="asset__file" data-name></div>
             <div class="asset__note">
-              The same two programs in a tar.gz, with no installer. Extract it and run
-              <code>./pimble</code>; nothing else is installed on your system. 64-bit x86,
-              glibc 2.38 or newer (Ubuntu 24.04, Fedora 39, Debian 13 and later).
+              The same two programs in a tar.gz. Extract it and run
+              <code>./pimble --install</code> to put Pimble in your home folder, your app menu
+              and your PATH, where it keeps itself up to date; or just run <code>./pimble</code>
+              from where it is. 64-bit x86, glibc 2.38 or newer (Ubuntu 24.04, Fedora 39,
+              Debian 13 and later).
             </div>
           </div>
         </div>
@@ -78,9 +80,17 @@
           <div>
             <div class="asset__os">Windows<span class="asset__tag" data-rec hidden>For this computer</span></div>
             <div class="asset__file" data-name></div>
-            <div class="asset__note">
+            <div class="asset__note" data-note-setup hidden>
+              An installer that sets Pimble up for your account alone, with
+              <code>pimble-mcp.exe</code> beside it; no administrator rights needed. 64-bit Windows.
+            </div>
+            <div class="asset__note" data-note-zip hidden>
               A zip holding <code>pimble.exe</code> and <code>pimble-mcp.exe</code>, with no
               installer. Unzip it anywhere and run <code>pimble.exe</code>. 64-bit Windows.
+            </div>
+            <div class="asset__note" data-portable hidden>
+              Or the <a href="#" data-portable-link>portable zip</a> <span data-portable-size></span>:
+              unzip it anywhere and run <code>pimble.exe</code>, nothing installed.
             </div>
           </div>
         </div>
@@ -145,13 +155,16 @@
       const otherEl = document.getElementById("asset-other");
 
       // Which entry a release asset belongs in, from its file name: the .deb
-      // (pimble_X.Y.Z_amd64.deb), the Linux tar.gz, the Windows zip. Checksums
-      // and anything new go under "Other files", so nothing attached is hidden.
+      // (pimble_X.Y.Z_amd64.deb), the Linux tar.gz, the Windows installer
+      // (-setup.exe) and the Windows zip, which is the installer's portable
+      // alternative. Checksums and anything new go under "Other files", so
+      // nothing attached is hidden; signatures (.sig) are never shown.
       function kindOf(asset) {
         const name = (asset.name || "").toLowerCase();
         if (name.endsWith(".deb")) return "deb";
         if (asset.os === "linux" && (name.endsWith(".tar.gz") || name.endsWith(".tgz"))) return "linux";
-        if (asset.os === "windows" && (name.endsWith(".zip") || name.endsWith(".exe") || name.endsWith(".msi"))) return "windows";
+        if (asset.os === "windows" && (name.endsWith(".exe") || name.endsWith(".msi"))) return "windows";
+        if (asset.os === "windows" && name.endsWith(".zip")) return "windows-zip";
         return "other";
       }
 
@@ -175,7 +188,10 @@
 
       try {
         const data = await apiFetch("/releases");
-        const assets = (data && data.assets) || [];
+        // A feed from before signatures were folded into `signature_url` lists
+        // each package's .sig as an asset of its own.
+        const assets = ((data && data.assets) || [])
+          .filter((a) => !(a.name || "").toLowerCase().endsWith(".sig"));
         loadingEl.hidden = true;
         if (assets.length === 0) {
           emptyEl.hidden = false;
@@ -197,8 +213,26 @@
           if (kind === "other" || found[kind]) others.push(asset);
           else found[kind] = asset;
         }
-        for (const kind of ["deb", "linux", "windows"]) {
+        for (const kind of ["deb", "linux"]) {
           if (found[kind]) fill(document.getElementById("asset-" + kind), found[kind]);
+        }
+        // Windows: the installer is the download, the zip a smaller link under
+        // it; a release with only the zip offers the zip.
+        const winEl = document.getElementById("asset-windows");
+        if (found.windows) {
+          fill(winEl, found.windows);
+          winEl.querySelector("[data-note-setup]").hidden = false;
+          if (found["windows-zip"]) {
+            const zip = found["windows-zip"];
+            winEl.querySelector("[data-portable]").hidden = false;
+            winEl.querySelector("[data-portable-link]").href = zip.url;
+            const zipSize = formatBytes(zip.size);
+            winEl.querySelector("[data-portable-size]").textContent = zipSize ? `(${zipSize})` : "";
+          }
+        } else if (found["windows-zip"]) {
+          fill(winEl, found["windows-zip"]);
+          winEl.querySelector("[data-note-zip]").hidden = false;
+          found.windows = found["windows-zip"];
         }
 
         let rec = recommendedKind();
