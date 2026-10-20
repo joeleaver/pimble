@@ -565,4 +565,48 @@ mod tests {
         assert_eq!(untracked(|| store.pane(P[0]).sheet_ui.embedded.get()), vec![id]);
         assert!(untracked(|| lost_tables(store.pane(P[0]).sheet_ui)).is_empty());
     }
+
+    /// A link-to-a-node column under a parent: typing a name that is not
+    /// there offers "Create ... under ...", which makes the node there and
+    /// links the cell to it when it arrives.
+    #[test]
+    fn a_node_link_cell_creates_the_node_it_names() {
+        let (store, commands) = store_with_commands();
+        let (store_id, node_id) = (StoreId::new(), NodeId::new());
+        let projects = NodeId::new();
+        let mut parent = pimble_core::Node::new("document");
+        parent.id = projects;
+        parent.metadata.title = "Projects".into();
+        store.upsert_node(store_id, parent);
+        crate::editor::start_editing(store, P[0], store_id, node_id, &[]);
+        insert_sheet(store);
+        let table = table_ids(P[0]).remove(0);
+        let col = local_edit(store, P[0], |t| {
+            t.add_column(&table, "project", ColumnType::NodeLink { under: Some(node_ref(store_id, projects)) }, Placement::Last)
+        })
+        .unwrap();
+        let _ = commands.try_iter().count();
+
+        let key = CellKey { table: table.clone(), row: None, col: col.clone() };
+        begin_typing(store, P[0], key);
+        let sent: Vec<BackendCommand> = commands.try_iter().collect();
+        assert!(sent.iter().any(|c| matches!(c, BackendCommand::GetChildren { node_id, .. } if *node_id == projects)), "its choices are fetched");
+        typed(store, P[0], "Deck repair".to_string());
+        let ui = store.pane(P[0]).sheet_ui;
+        assert_eq!(untracked(|| ui.choices.get()), vec!["Create \"Deck repair\" under Projects".to_string()]);
+        typing_key(store, P[0], "Enter");
+        let request = commands
+            .try_iter()
+            .find_map(|c| match c {
+                BackendCommand::CreateNode { parent_id: Some(p), title, init: Some(init), .. } if p == projects && title == "Deck repair" => init.request,
+                _ => None,
+            })
+            .expect("the node is made under Projects");
+        let made = NodeId::new();
+        crate::sheets::node_created(store, request, store_id, made);
+        let snap = snapshot(P[0]).unwrap();
+        let row = &snap.table(&table).unwrap().rows[0];
+        assert_eq!(row.cells.get(&col), Some(&Stored::Node(node_ref(store_id, made))));
+        end_typing();
+    }
 }

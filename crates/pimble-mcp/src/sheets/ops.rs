@@ -28,13 +28,18 @@ pub struct ColumnSpec {
     /// The column's name, unique in its table.
     pub name: String,
     /// text, number, money, date, hours, link (each cell names a row of the
-    /// table `target`) or formula. Defaults to text, or to formula when
-    /// `formula` is given.
+    /// table `target`), node_link (each cell names a node; see `under`) or
+    /// formula. Defaults to text, or to formula when `formula` is given.
     #[serde(rename = "type", default)]
     pub ty: Option<String>,
     /// A link column's table: the name of a table in the same note.
     #[serde(default)]
     pub target: Option<String>,
+    /// A node_link column's parent: the node whose children its cells choose
+    /// from (a title, a path like "Home/Projects", or a pimble: link). Any
+    /// node when left out.
+    #[serde(default)]
+    pub under: Option<String>,
     /// A formula column's formula, as you would type it in Excel inside a
     /// Table, starting with =: `=[@miles]*2`, `=[@vehicle].mpg`. Read
     /// sheet_formula_guide first.
@@ -137,6 +142,23 @@ fn quoted_list(names: impl IntoIterator<Item = String>) -> String {
 // ── Finding tables, columns and rows by name ─────────────────────────────
 
 /// A table of this note by name (case-insensitive) or id.
+/// The node a column's `under` names: a pimble: link, or a title or path
+/// one node answers to.
+fn find_node(work: &Work, name: &str) -> Result<NodeRef, String> {
+    let name = name.trim().trim_matches('\'');
+    if let Some(url) = pimble_core::PimbleUrl::parse(name) {
+        return Ok(NodeRef { store: url.store, node: url.node });
+    }
+    match work.book.find_nodes(name).as_slice() {
+        [one] => Ok(*one),
+        [] => Err(format!("No node here is called {name}.")),
+        many => Err(format!(
+            "Several nodes are called {name}: {}. Give the one you mean as its path or its pimble: link.",
+            many.iter().map(|n| work.book.display_name(n)).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
 pub fn find_table<'s>(snap: &'s SheetsSnap, name: &str) -> Result<&'s TableSnap, String> {
     let name = name.trim();
     if let Some(t) = snap.table(name) {
@@ -280,7 +302,13 @@ pub fn column_type(work: &Work, table: Option<&str>, spec: &ColumnSpec, current:
             ColumnType::RowLink { table: target }
         }
         "node_link" | "node link" | "node" => {
-            return Err("Columns that link to nodes come in a later wave of sheets; for now link to a row of a table (type link).".into())
+            let under = match (&spec.under, current) {
+                (Some(u), _) if u.trim().is_empty() => None,
+                (Some(u), _) => Some(find_node(work, u)?),
+                (None, Some(ColumnType::NodeLink { under })) => *under,
+                (None, _) => None,
+            };
+            ColumnType::NodeLink { under }
         }
         "formula" => {
             let format = match (&spec.format, current) {
@@ -374,11 +402,30 @@ pub fn parse_value(engine: &Engine<'_>, work: &Work, col: &ColumnSnap, value: &s
                 )),
             }
         }
-        ColumnType::NodeLink { .. } => {
-            if keep_as_typed {
-                Ok(Some(Stored::Unparsed(trimmed.to_string())))
-            } else {
-                Err(format!("{} links to nodes, which the MCP cannot set yet; pass keep_as_typed to keep the text.", col.name))
+        ColumnType::NodeLink { under } => {
+            if let Some(url) = pimble_core::PimbleUrl::parse(trimmed) {
+                return Ok(Some(Stored::Node(NodeRef { store: url.store, node: url.node })));
+            }
+            let hits: Vec<NodeRef> = match under {
+                Some(u) => work.book.children_of(u).into_iter().filter(|(_, t)| norm(t) == norm(trimmed)).map(|(n, _)| n).collect(),
+                None => work.book.find_nodes(trimmed),
+            };
+            let place = match under.and_then(|u| work.book.node(&u)) {
+                Some(info) => format!("under {}", info.title),
+                None => "here".to_string(),
+            };
+            match hits.as_slice() {
+                [one] => Ok(Some(Stored::Node(*one))),
+                [] if keep_as_typed => Ok(Some(Stored::Unparsed(trimmed.to_string()))),
+                [] => Err(format!(
+                    "No node {place} is called \"{trimmed}\", so {} can't link to it. Create it first (create_node), give its pimble: link, or pass keep_as_typed to keep the text (it shows #N/A).",
+                    col.name
+                )),
+                several => Err(format!(
+                    "{} nodes {place} are called \"{trimmed}\"; give the one you mean as its pimble: link: {}.",
+                    several.len(),
+                    several.iter().map(|n| format!("pimble:{}/{}", n.store, n.node)).collect::<Vec<_>>().join(", ")
+                )),
             }
         }
         ty => {

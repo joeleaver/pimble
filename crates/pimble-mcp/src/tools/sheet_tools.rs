@@ -194,6 +194,10 @@ pub struct UpdateColumnParams {
     /// A link column's table.
     #[serde(default)]
     pub target: Option<String>,
+    /// A node_link column's parent (title, path or pimble: link); "" for any
+    /// node.
+    #[serde(default)]
+    pub under: Option<String>,
     /// A new formula, starting with = (makes it a formula column). Read
     /// sheet_formula_guide first.
     #[serde(default)]
@@ -268,8 +272,16 @@ pub struct MoveTableParams {
 // ── Plumbing ─────────────────────────────────────────────────────────────
 
 /// Every formula of a column spec, as typed.
-fn shown_of(columns: &[ColumnSpec]) -> Vec<&str> {
-    columns.iter().filter_map(|c| c.formula.as_deref()).collect()
+/// What the book is loaded for: the specs' formulas, and their `under`s
+/// (marked, see `UNDER_MARK`).
+fn shown_of(columns: &[ColumnSpec]) -> Vec<String> {
+    let mut out: Vec<String> = columns.iter().filter_map(|c| c.formula.clone()).collect();
+    out.extend(columns.iter().filter_map(|c| c.under.as_ref()).map(|u| format!("{}{u}", crate::sheets::load::UNDER_MARK)));
+    out
+}
+
+fn as_strs(shown: &[String]) -> Vec<&str> {
+    shown.iter().map(String::as_str).collect()
 }
 
 impl Pimble {
@@ -548,6 +560,7 @@ impl Pimble {
         let addr = nodes::resolve(&client, &p.node).await?;
         let node = client.get_node(addr.store, addr.node).await.map_err(rpc)?;
         let shown = shown_of(&p.columns);
+        let shown = as_strs(&shown);
         if node.node_type == node_types::SHEET {
             if p.after_text.is_some() {
                 return Err("after_text places a table in a text node's text; a sheet node has no text (use after).".into());
@@ -637,6 +650,7 @@ impl Pimble {
         let client = self.client().await?;
         let addr = nodes::resolve(&client, &p.node).await?;
         let shown = shown_of(std::slice::from_ref(&p.column));
+        let shown = as_strs(&shown);
         self.sheet_edit(&client, addr, &shown, |w| ops::add_column(w, &p.table, &p.column)).await
     }
 
@@ -647,8 +661,16 @@ impl Pimble {
     async fn update_column(&self, Parameters(p): Parameters<UpdateColumnParams>) -> Result<String, String> {
         let client = self.client().await?;
         let addr = nodes::resolve(&client, &p.node).await?;
-        let spec = ColumnSpec { name: String::new(), ty: p.ty.clone(), target: p.target.clone(), formula: p.formula.clone(), format: p.format.clone() };
+        let spec = ColumnSpec {
+            name: String::new(),
+            ty: p.ty.clone(),
+            target: p.target.clone(),
+            under: p.under.clone(),
+            formula: p.formula.clone(),
+            format: p.format.clone(),
+        };
         let shown = shown_of(std::slice::from_ref(&spec));
+        let shown = as_strs(&shown);
         self.sheet_edit(&client, addr, &shown, |w| ops::update_column(w, &p.table, &p.column, p.new_name.as_deref(), &spec))
             .await
     }

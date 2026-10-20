@@ -115,6 +115,9 @@ pub struct ColumnForm {
     pub name: String,
     pub kind: String,
     pub target: String,
+    /// A link-to-a-node column's "Nodes under": a node's title or path, as
+    /// typed; empty for anywhere.
+    pub under: String,
     pub formula: String,
     pub format: String,
     pub error: Option<String>,
@@ -565,6 +568,22 @@ impl AppBook {
             }
             pending = next;
             hops += 1;
+        }
+        // The nodes its cells link to show by title: fetch any not here yet
+        // (`node_loaded` recomputes when one arrives).
+        if let Some(home_snap) = snaps.get(&home) {
+            let mut asked = std::collections::HashSet::new();
+            for t in &home_snap.tables {
+                for r in &t.rows {
+                    for v in r.cells.values() {
+                        if let Stored::Node(n) = v {
+                            if store.get_node_signal(n.store, n.node).is_none() && asked.insert(*n) {
+                                store.send(BackendCommand::GetNode { store_id: n.store, node_id: n.node });
+                            }
+                        }
+                    }
+                }
+            }
         }
         let today = chrono::Local::now().date_naive();
         use chrono::Datelike;
@@ -1028,6 +1047,10 @@ fn begin_typing(store: AppStore, pane: PaneId, key: CellKey) {
     if matches!(col.ty, ColumnType::RowLink { .. } | ColumnType::NodeLink { .. }) {
         filter_choices(store, pane, true);
     }
+    // The nodes a link-to-a-node column chooses from may not be here yet.
+    if let ColumnType::NodeLink { under: Some(u) } = &col.ty {
+        store.send(BackendCommand::GetChildren { store_id: u.store, node_id: u.node });
+    }
     TYPING.with(|t| t.set(Some(pane)));
     rinch::core::set_keyboard_interceptor(move |data| {
         let key = data.key.clone();
@@ -1135,13 +1158,74 @@ fn filter_choices(store: AppStore, pane: PaneId, all: bool) {
         return;
     }
     let q = if all { String::new() } else { untracked(|| ui.edit_text.get()).trim().to_lowercase() };
-    let labels: Vec<String> = link_choices(store, pane, &col.ty)
-        .into_iter()
-        .map(|(l, _)| l)
-        .filter(|l| l.to_lowercase().contains(&q))
-        .collect();
+    let all: Vec<String> = link_choices(store, pane, &col.ty).into_iter().map(|(l, _)| l).collect();
+    let exact = all.iter().any(|l| l.to_lowercase() == q);
+    let mut labels: Vec<String> = all.into_iter().filter(|l| l.to_lowercase().contains(&q)).collect();
+    // A name that is not there yet can be made under the column's parent
+    // (contract section 3).
+    let offer = match (&col.ty, q.is_empty() || exact) {
+        (ColumnType::NodeLink { under: Some(u) }, false) => {
+            let typed = untracked(|| ui.edit_text.get()).trim().to_string();
+            let parent = store.get_node_signal(u.store, u.node).map(|s| untracked(|| s.with(|n| n.metadata.title.clone()))).unwrap_or_default();
+            let label = format!("Create \"{typed}\" under {parent}");
+            labels.push(label.clone());
+            Some(CreateOffer { label, title: typed, under: *u })
+        }
+        _ => None,
+    };
+    OFFER.with(|o| *o.borrow_mut() = offer);
     ui.choice.set(if q.is_empty() || labels.is_empty() { None } else { Some(0) });
     ui.choices.set(labels);
+}
+
+/// The "Create ... under ..." choice of the link cell being typed into.
+struct CreateOffer {
+    label: String,
+    title: String,
+    under: NodeRef,
+}
+
+/// A node being made for a link cell: where its link goes when it arrives.
+struct CreateJob {
+    pane: PaneId,
+    node: (StoreId, NodeId),
+    key: CellKey,
+}
+
+thread_local! {
+    static OFFER: RefCell<Option<CreateOffer>> = const { RefCell::new(None) };
+    static CREATES: RefCell<HashMap<u64, CreateJob>> = RefCell::new(HashMap::new());
+    /// Request ids of node creations for link cells.
+    static NEXT_CREATE: Cell<u64> = const { Cell::new(3 << 48) };
+}
+
+/// The children of a node arrived: a link-to-a-node cell being typed into
+/// that chooses from them shows them.
+pub(crate) fn children_loaded(store: AppStore, store_id: StoreId, parent_id: NodeId) {
+    let Some(pane) = TYPING.with(Cell::get) else { return };
+    let Some(key) = untracked(|| store.pane(pane).sheet_ui.editing.get()) else { return };
+    if let Some((_, col)) = column_of(pane, &key) {
+        if matches!(col.ty, ColumnType::NodeLink { under: Some(u) } if u.store == store_id && u.node == parent_id) {
+            filter_choices(store, pane, false);
+        }
+    }
+}
+
+/// A node made for a link cell: the cell links to it.
+pub(crate) fn node_created(store: AppStore, request: u64, store_id: StoreId, node_id: NodeId) {
+    let Some(job) = CREATES.with(|c| c.borrow_mut().remove(&request)) else { return };
+    if with_session(job.pane, |s| (s.store_id, s.node_id)) != Some(job.node) {
+        return;
+    }
+    let value = Stored::Node(node_ref(store_id, node_id));
+    match &job.key.row {
+        Some(row) => {
+            local_edit(store, job.pane, |t| t.set_cell(&job.key.table, row, &job.key.col, Some(&value)));
+        }
+        None => {
+            local_edit(store, job.pane, |t| t.add_row(&job.key.table, Placement::Last, &[(job.key.col.clone(), value.clone())]));
+        }
+    }
 }
 
 /// A press on one of a link cell's choices.
@@ -1166,6 +1250,25 @@ pub(crate) fn commit(store: AppStore, pane: PaneId, mv: Move) {
     ui.choices.set(Vec::new());
     let text = untracked(|| ui.edit_text.get());
     let Some((table, col)) = column_of(pane, &key) else { return };
+    // "Create ... under ...": the node is made, and the cell links to it
+    // when it arrives.
+    if let Some(offer) = OFFER.with(|o| o.borrow_mut().take()).filter(|o| o.label == text) {
+        let Some(node) = with_session(pane, |s| (s.store_id, s.node_id)) else { return };
+        let request = NEXT_CREATE.with(|n| n.replace(n.get() + 1));
+        CREATES.with(|c| c.borrow_mut().insert(request, CreateJob { pane, node, key: key.clone() }));
+        store.send(BackendCommand::CreateNode {
+            store_id: offer.under.store,
+            parent_id: Some(offer.under.node),
+            title: offer.title,
+            init: Some(NodeInit {
+                node_type: node_types::DOCUMENT.to_string(),
+                content: Vec::new(),
+                custom: vec![(pimble_core::custom_keys::EXPLICIT_TITLE.to_string(), serde_json::json!(true))],
+                request: Some(request),
+            }),
+        });
+        return;
+    }
     let trimmed = text.trim();
     let mut row_id = key.row.clone();
     if trimmed.starts_with('=') && trimmed.len() > 1 {
@@ -1318,6 +1421,7 @@ pub(crate) fn open_column(store: AppStore, pane: PaneId, table: &str, col: Optio
             name,
             kind: "formula".to_string(),
             target: String::new(),
+            under: String::new(),
             formula: String::new(),
             format: "auto".to_string(),
             error: None,
@@ -1338,6 +1442,10 @@ pub(crate) fn open_column(store: AppStore, pane: PaneId, table: &str, col: Optio
                 ColumnType::RowLink { table } => table.clone(),
                 _ => first_table,
             },
+            under: match (&c.ty, &book) {
+                (ColumnType::NodeLink { under: Some(u) }, Some(b)) => b.display_name(u),
+                _ => String::new(),
+            },
             formula: match (&c.ty, &book) {
                 (ColumnType::Formula { formula, .. }, Some(b)) => formula::to_shown(b, Some(table), formula),
                 _ => "=".to_string(),
@@ -1352,6 +1460,7 @@ pub(crate) fn open_column(store: AppStore, pane: PaneId, table: &str, col: Optio
             name: String::new(),
             kind: if t.is_summary() { "formula".to_string() } else { "text".to_string() },
             target: first_table,
+            under: String::new(),
             formula: "=".to_string(),
             format: "auto".to_string(),
             error: None,
@@ -1403,7 +1512,22 @@ pub(crate) fn apply_column(store: AppStore, pane: PaneId) {
             }
             ColumnType::RowLink { table: form.target.clone() }
         }
-        "node_link" => ColumnType::NodeLink { under: None },
+        "node_link" => {
+            let under = form.under.trim().trim_matches('\'');
+            if under.is_empty() {
+                ColumnType::NodeLink { under: None }
+            } else {
+                let Some(book) = book_for(store, pane) else { return };
+                match book.find_nodes(under).as_slice() {
+                    [one] => ColumnType::NodeLink { under: Some(*one) },
+                    [] => return form_error(store, pane, format!("No node here is called {under}.")),
+                    many => {
+                        let paths: Vec<String> = many.iter().map(|n| book.display_name(n)).collect();
+                        return form_error(store, pane, format!("Several nodes are called {under}: {}. Write the one you mean as its path.", paths.join(", ")));
+                    }
+                }
+            }
+        }
         "formula" => {
             let shown = form.formula.trim();
             if shown.trim_start_matches('=').trim().is_empty() {

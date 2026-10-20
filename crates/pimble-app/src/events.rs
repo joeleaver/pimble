@@ -707,6 +707,8 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
 
             BackendEvent::ChildrenLoaded { store_id, parent_id, children_store_id, children } => {
                 tracing::info!("Children loaded for {:?}: {} nodes (in store {:?})", parent_id, children.len(), children_store_id);
+                // A link-to-a-node cell being typed into offers these.
+                let sheet_choices = (*children_store_id, *parent_id);
 
                 // Each child's own canonical store is `children_store_id`
                 // (the mount's source store when `parent_id` is a mount
@@ -771,6 +773,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
 
                 // Structural change
                 store.bump_tree_structure();
+                crate::sheets::children_loaded(store, sheet_choices.0, sheet_choices.1);
             }
 
             BackendEvent::NodeLoaded { store_id, node } => {
@@ -923,6 +926,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 if let Some(request) = request {
                     crate::text_boards::node_created(store, *request, *store_id, *node_id);
                     crate::sheets::in_text::node_created(store, *request, *store_id, *node_id);
+                    crate::sheets::node_created(store, *request, *store_id, *node_id);
                 }
                 tracing::info!("Node created: {:?}/{:?} under {:?}", store_id, node_id, parent_id);
                 let parent = parent_id.unwrap_or_else(|| {

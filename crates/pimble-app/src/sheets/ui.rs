@@ -219,6 +219,7 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
     let form_tid = tid.clone();
     let bar_tid = tid.clone();
     let note_tid = tid.clone();
+    let scroll_tid = tid.clone();
     rsx! {
         section {
             class: "pimble-sheet__table",
@@ -275,7 +276,15 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
                 {column_form(__scope, store, pane)}
             }
             div {
-                class: "pimble-sheet__scroll",
+                // A link cell's choices hang below the grid: the scroller,
+                // which would clip them, lets them show while they are open.
+                class: {
+                    let tid = scroll_tid.clone();
+                    move || {
+                        let open = ui.editing.get().is_some_and(|k| k.table == tid) && !ui.choices.get().is_empty();
+                        if open { "pimble-sheet__scroll pimble-sheet__scroll--open" } else { "pimble-sheet__scroll" }
+                    }
+                },
                 div {
                     class: "pimble-sheet__grid",
                     style: grid_style,
@@ -402,6 +411,7 @@ fn column_form(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> Node
     let field = move |f: fn(&ColumnForm) -> String| move || ui.column_form.get().map(|form| f(&form)).unwrap_or_default();
     let shown = move |kind: &'static str| move || ui.column_form.get().is_some_and(|f| f.kind == kind && f.result.is_none());
     let is_link = shown("row_link");
+    let is_node_link = shown("node_link");
     let is_formula = shown("formula");
     let is_formula2 = shown("formula");
     rsx! {
@@ -430,6 +440,16 @@ fn column_form(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> Node
                     value_fn: field(|f| f.target.clone()),
                     onchange: set(|f, v| f.target = v),
                     data: tables.clone(),
+                }
+            }
+            if is_node_link() {
+                TextInput {
+                    label: "Nodes under",
+                    size: "xs",
+                    placeholder: "anywhere",
+                    value_fn: field(|f| f.under.clone()),
+                    oninput: set(|f, v| f.under = v),
+                    onsubmit: move || apply_column(store, pane),
                 }
             }
             if is_formula() {

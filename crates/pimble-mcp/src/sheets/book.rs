@@ -87,6 +87,14 @@ impl McpBook {
     fn known(&self, node: &NodeRef) -> Option<&Known> {
         self.nodes.get(node)
     }
+
+    /// The known children of `parent`, with their titles.
+    pub fn children_of(&self, parent: &NodeRef) -> Vec<(NodeRef, String)> {
+        let mut out: Vec<(NodeRef, String)> =
+            self.nodes.iter().filter(|(_, k)| k.parent == Some(*parent)).map(|(n, k)| (*n, k.title.clone())).collect();
+        out.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        out
+    }
 }
 
 fn lower(s: &str) -> String {

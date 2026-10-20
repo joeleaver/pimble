@@ -22,7 +22,7 @@ pub(crate) const APP_CSS: &str = "
 }
 
 .pimble-sidebar__resizer:hover {
-    border-left-color: var(--rinch-primary-color-filled);
+    border-left-color: var(--rinch-primary-color);
 }
 
 .pimble-sidebar__header {
@@ -576,6 +576,10 @@ pub(crate) const APP_CSS: &str = "
     overflow-x: auto;
 }
 
+.pimble-sheet__scroll--open {
+    overflow: visible;
+}
+
 .pimble-sheet__grid {
     display: grid;
     font-size: 13px;
@@ -654,8 +658,8 @@ pub(crate) const APP_CSS: &str = "
 .pimble-sheet__chip {
     padding: 0 7px;
     border-radius: 999px;
-    background: var(--rinch-primary-color-filled);
-    color: var(--rinch-color-body);
+    background: var(--rinch-primary-color);
+    color: var(--rinch-color-white);
     font-size: 12px;
 }
 
@@ -760,8 +764,8 @@ pub(crate) const APP_CSS: &str = "
 }
 
 .pimble-sheet__primary {
-    background: var(--rinch-primary-color-filled) !important;
-    color: var(--rinch-color-body) !important;
+    background: var(--rinch-primary-color) !important;
+    color: var(--rinch-color-white) !important;
     border-color: transparent !important;
 }
 

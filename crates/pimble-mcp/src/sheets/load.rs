@@ -43,6 +43,10 @@ fn absent_from(message: &str) -> Absent {
 /// The book for `home`, whose node (and so its tables) was just fetched.
 /// `shown` are formulas as typed that are about to be stored: the notes they
 /// name are looked up too.
+/// Marks an entry of `shown` that is a column's `under` (a node name to
+/// resolve) rather than a formula, so every node is indexed by title.
+pub const UNDER_MARK: &str = "under:";
+
 pub async fn load_book(client: &PimbleClient, home: Addr, home_node: &Node, shown: &[&str]) -> McpBook {
     let mut book = McpBook::new(node_ref(home), sheets_of(home_node), McpBook::local_today());
     book.add_node(node_ref(home), label(home_node), home_node.parent_id.map(|p| NodeRef { store: home.store, node: p }));
@@ -99,7 +103,11 @@ pub async fn load_book(client: &PimbleClient, home: Addr, home_node: &Node, show
         }
         pending = next;
     }
-    if !wanted.is_empty() {
+    // A link-to-a-node column chooses among nodes by title: they are all
+    // known then (the tables of only the wanted ones are read).
+    let node_links = book.home_snap().tables.iter().any(|t| t.columns.iter().any(|c| matches!(c.ty, pimble_sheet::ColumnType::NodeLink { .. })))
+        || shown.iter().any(|s| s.starts_with(UNDER_MARK));
+    if !wanted.is_empty() || node_links {
         index_titles(client, &mut book, &wanted).await;
     }
     book
