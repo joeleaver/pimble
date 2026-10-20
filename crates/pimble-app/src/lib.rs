@@ -20,6 +20,8 @@
 //! document model in the sync path.
 
 pub mod app;
+#[cfg(feature = "native")]
+pub mod brand;
 pub mod appearance;
 pub mod boards;
 pub mod commands;
@@ -41,6 +43,8 @@ pub mod styles;
 pub mod sheets;
 pub mod text_boards;
 pub mod toolbar;
+#[cfg(feature = "native")]
+pub mod update;
 
 /// The desktop backend: a background thread with a tokio runtime, an embedded
 /// [`pimble_server::PimbleServer`] and the WebSocket client that talks to it.

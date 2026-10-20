@@ -2,6 +2,23 @@
 
 /// Application-wide layout styles.
 pub(crate) const APP_CSS: &str = "
+/* ── Title bar brand (brand.rs) ─────────────────────────────── */
+
+.pimble-titlebar-brand {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    /* 4px on top centres the lockup 2px lower in the 36px row, which puts the
+       word's baseline on the menu labels' (measured on the release build). */
+    padding: 4px 12px 0 10px;
+    gap: 4px;
+}
+
+.pimble-titlebar-brand__mark {
+    display: flex;
+    align-items: center;
+}
+
 /* ── Sidebar ────────────────────────────────────────────────── */
 
 .pimble-sidebar {
@@ -1288,9 +1305,11 @@ pub(crate) const APP_CSS: &str = "
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 6px 12px;
+    /* As tall as the toolbar beside it (42px), so the line under both is one
+       line across the window: the explorer header's top border here, the
+       toolbar's bottom border there. */
+    padding: 11px 12px;
     background: var(--rinch-color-body);
-    border-bottom: 1px solid var(--rinch-color-border);
     flex-shrink: 0;
 }
 
@@ -1304,6 +1323,7 @@ pub(crate) const APP_CSS: &str = "
 
 .pimble-search-bar__input {
     flex: 1;
+    min-width: 0;
     background: transparent;
     border: none;
     outline: none;
@@ -1408,6 +1428,18 @@ pub(crate) const APP_CSS: &str = "
 .pimble-status-bar__account {
     font-size: 11px;
     opacity: 0.7;
+}
+
+/* Restart to update (docs/UPDATE_CONTRACT.md): the one thing on the bar that
+   asks for a click, so in the accent. */
+.pimble-status-bar__update {
+    font-size: 11px;
+    color: var(--rinch-primary-color-6);
+    cursor: pointer;
+}
+
+.pimble-status-bar__update:hover {
+    text-decoration: underline;
 }
 
 .pimble-status-bar__account:hover {
@@ -1571,5 +1603,115 @@ pub(crate) const EDITOR_CSS: &str = "
 
 .pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"dark\"] [data-pm-placeholder] {
     color: var(--rinch-color-dimmed);
+}
+
+/* The light scheme, the same rules over rinch's GitHub-light palette: the app's
+   tokens, the dark scheme's size and leading, and code in a muted red as dark's
+   is in a bright one. */
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"light\"] {
+    background: var(--rinch-color-surface);
+    color: var(--rinch-color-text);
+    border-color: var(--rinch-color-border);
+    font-size: 15px;
+    line-height: 1.7;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"light\"] h1,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"light\"] h2,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"light\"] h3,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"light\"] h4 {
+    color: var(--rinch-color-text);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"light\"] h5,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"light\"] h6 {
+    color: var(--rinch-color-dimmed);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"light\"] code {
+    background: #eef1f4;
+    color: #a3404c;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"light\"] pre {
+    background: var(--rinch-color-body);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"light\"] pre code {
+    background: none;
+    color: #383a42;
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"light\"] blockquote {
+    border-left-color: var(--rinch-primary-color-3);
+    color: var(--rinch-color-dimmed);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"light\"] hr {
+    border-top-color: var(--rinch-color-border);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"light\"] table,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"light\"] td,
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"light\"] th {
+    border-color: var(--rinch-color-border);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"light\"] th {
+    background: var(--rinch-color-body);
+}
+.pimble-editor__content-wrap > [data-pm-editor][data-pm-theme=\"light\"] [data-pm-placeholder] {
+    color: var(--rinch-color-dimmed);
+}
+";
+
+/// Pimble's variables for the dark scheme, added to rinch's theme sheet
+/// (`app::theme_css`). Dark keeps rinch's palette; these name what the toolbar
+/// draws with, so both schemes style it from the same rules.
+pub(crate) const DARK_THEME_VARS: &str = "
+:root {
+    --pimble-toolbar-icon: #909296;
+    --pimble-toolbar-active-bg: var(--rinch-color-dark-4);
+    --pimble-toolbar-active-fg: var(--rinch-primary-color-4);
+    --pimble-toolbar-active-border: var(--rinch-primary-color-4);
+}
+";
+
+/// Pimble's light scheme (2026-10-20), added to rinch's theme sheet
+/// (`app::theme_css`). rinch's light theme is Mantine's stock grays with a bright
+/// blue primary and a blue title bar; this one uses the site's cool neutrals
+/// (`site/style.css`) and the brand slate (`assets/brand/README.md`) as the
+/// primary, ten shades around `#3f6491` at 6. The chrome (title bar, explorer,
+/// pane headers) sits on a cool off-white, and the page being written on is white.
+pub(crate) const LIGHT_THEME_VARS: &str = "
+:root {
+    --rinch-color-body: #f5f7f8;
+    --rinch-color-surface: #ffffff;
+    --rinch-color-text: #1c2024;
+    --rinch-color-dimmed: #5c6570;
+    --rinch-color-border: #dde1e5;
+    --rinch-color-default-border: #dde1e5;
+    --rinch-color-placeholder: #8a929c;
+    --rinch-color-default: #eceff2;
+    --rinch-color-default-hover: #e2e6ea;
+    --rinch-color-filled: #f0f2f4;
+    --rinch-color-filled-hover: #e6e9ec;
+    --rinch-color-state-disabled: #f0f2f4;
+    --rinch-color-option-hover: #edf1f5;
+    --rinch-color-option-selected: #e1e8f0;
+
+    --rinch-primary-color: #3f6491;
+    --rinch-primary-color-0: #eef2f7;
+    --rinch-primary-color-1: #dde5ef;
+    --rinch-primary-color-2: #bccbdf;
+    --rinch-primary-color-3: #98aecb;
+    --rinch-primary-color-4: #7793b8;
+    --rinch-primary-color-5: #5a7ba6;
+    --rinch-primary-color-6: #3f6491;
+    --rinch-primary-color-7: #34557c;
+    --rinch-primary-color-8: #2a4665;
+    --rinch-primary-color-9: #1f354d;
+
+    --rinch-titlebar-bg: #eaeef1;
+    --rinch-titlebar-text: #1c2024;
+    --rinch-titlebar-icon: #5c6570;
+    --rinch-titlebar-hover: rgba(28, 32, 36, 0.07);
+    --rinch-titlebar-active: rgba(28, 32, 36, 0.12);
+
+    --pimble-toolbar-icon: #5c6570;
+    --pimble-toolbar-active-bg: #e1e8f0;
+    --pimble-toolbar-active-fg: #2a4665;
+    --pimble-toolbar-active-border: #bccbdf;
 }
 ";

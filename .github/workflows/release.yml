@@ -110,6 +110,26 @@ jobs:
           find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release/ \;
           ls -la release
 
+      # Every package gets a detached Ed25519 signature beside it, which the
+      # desktop app verifies before it installs an update
+      # (docs/UPDATE_CONTRACT.md). No key, no release: an unsigned package would
+      # be refused by every installed copy anyway.
+      - name: Sign packages
+        env:
+          SIGNING_KEY: ${{ secrets.PIMBLE_UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "PIMBLE_UPDATE_SIGNING_KEY is not set: run tools/update-key.sh once" >&2
+            exit 1
+          fi
+          key="$(mktemp)"
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$SIGNING_KEY" > "$key"
+          for package in release/*.tar.gz release/*.zip; do
+            openssl pkeyutl -sign -rawin -inkey "$key" -in "$package" -out "$package.sig"
+          done
+          ls -la release
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:

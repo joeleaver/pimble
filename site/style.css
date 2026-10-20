@@ -104,11 +104,17 @@ small, .dim { color: var(--text-dim); }
 }
 
 .nav__brand {
-  font-family: var(--font-serif);
-  font-size: 1.3rem;
-  font-style: italic;
-  color: var(--text);
+  display: flex;
+  align-items: center;
   text-decoration: none;
+}
+
+/* The lockup is drawn (assets/brand/), not set in a font: the pebble and
+   "pimble" in Manrope Medium, with a light version for dark grounds. */
+.nav__brand img {
+  display: block;
+  height: 26px;
+  width: auto;
 }
 
 .nav__links {

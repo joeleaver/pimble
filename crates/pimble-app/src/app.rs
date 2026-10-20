@@ -88,13 +88,37 @@ pub fn theme_props(dark_mode: bool) -> ThemeProviderProps {
     }
 }
 
+/// The theme stylesheet: rinch's own for the scheme, then Pimble's variables for
+/// it (`styles::LIGHT_THEME_VARS`, `styles::DARK_THEME_VARS`). They ride in the
+/// theme sheet because it is the one sheet rinch replaces when the scheme
+/// changes; an app sheet is parsed once.
+pub fn theme_css(dark_mode: bool) -> String {
+    let mut css = rinch::generate_theme_css_string(&theme_props(dark_mode));
+    css.push_str(if dark_mode { crate::styles::DARK_THEME_VARS } else { crate::styles::LIGHT_THEME_VARS });
+    css
+}
+
+/// "Restart to update" (docs/UPDATE_CONTRACT.md). The browser has nothing to
+/// update; its status bar never shows the control.
+fn restart_to_update(store: AppStore) {
+    #[cfg(feature = "native")]
+    crate::update::restart_to_update(store);
+    #[cfg(not(feature = "native"))]
+    let _ = store;
+}
+
+/// Put [`theme_css`] in force, at start and on every switch.
+pub fn apply_theme(dark_mode: bool) {
+    rinch::core::set_current_theme_css(Some(theme_css(dark_mode)));
+}
+
 /// Switch between the dark and light themes: the theme CSS, the editor's
 /// stylesheet, every colour the app derives (they read `dark_mode`), and the
 /// saved preference.
 pub fn toggle_dark_mode(store: AppStore) {
     let dark = !untracked(|| store.dark_mode.get());
     store.dark_mode.set(dark);
-    rinch::update_theme(&theme_props(dark));
+    apply_theme(dark);
     crate::editor::set_dark_mode(dark);
     save_dark_mode(dark);
 }
@@ -1026,6 +1050,9 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
     });
     // Build app component - parameter must be named __scope for the rsx! macro
     let app_component = move |__scope: &mut RenderScope| -> NodeHandle {
+        // The shell put rinch's theme sheet in force; this one adds Pimble's
+        // variables for the scheme the app starts in.
+        apply_theme(untracked(|| store.dark_mode.get()));
         // Cancel any in-progress rename, optionally committing the change.
         let cancel_last_click = last_click.clone();
         let cancel_rename = move |commit: bool| {
@@ -4152,8 +4179,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             div {
                     style: "display: flex; flex-direction: column; height: 100%;",
 
-                    {search_bar}
-
                     // ── Main content ──────────────────────────────
                     div {
                         style: "display: flex; flex: 1; overflow: hidden;",
@@ -4162,6 +4187,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         div {
                             class: "pimble-sidebar",
                             style: {move || format!("width: {}px;", store.sidebar_width.get())},
+
+                            // Search heads the explorer, whose column its
+                            // results take over (Joe, 2026-10-20: across the
+                            // whole window it cost the panes a row).
+                            {search_bar}
 
                             // Header: store name + new-node button
                             div {
@@ -4269,6 +4299,17 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         }
 
                         div { style: "flex: 1;", }
+
+                        // A verified update is staged (docs/UPDATE_CONTRACT.md);
+                        // nothing restarts until this is clicked.
+                        if CAN_ADMINISTER_STORES {
+                            span {
+                                class: "pimble-status-bar__update",
+                                style: {|| if store.update_ready.get().is_some() { "" } else { "display: none;" }},
+                                onclick: move || restart_to_update(store),
+                                {|| store.update_ready.get().map(|v| format!("Restart to update to {v}")).unwrap_or_default()}
+                            }
+                        }
                     }
 
                     // Where the hovered link leads (docs/LINKS_CONTRACT.md
@@ -4323,10 +4364,17 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 }
         };
 
+        // The title bar shows the pebble and the wordmark, not a text title
+        // (BorderlessWindow draws a title in the inline menu row as letters in
+        // rotating colors).
+        #[cfg(feature = "native")]
+        let brand: rinch::components::SectionRenderer =
+            Rc::new(move |__scope| crate::brand::titlebar_lockup(__scope, store));
         #[cfg(feature = "native")]
         let root = rsx! {
             BorderlessWindow {
-                title: "Pimble",
+                title: "",
+                left_section: Some(brand),
                 show_minimize: true,
                 show_maximize: true,
                 show_close: true,
@@ -4405,6 +4453,7 @@ pub fn run(renderer: Renderer) {
     use std::sync::Arc;
 
     let (store, app_component) = build_view();
+    crate::update::start(store);
 
     // One spec, two shells: `crates/pimble-app/src/menus.rs` says what the
     // menus hold and which target each item belongs on, so the browser's menu
@@ -4443,6 +4492,7 @@ pub fn run(renderer: Renderer) {
         transparent: true,
         resizable: true,
         menu_in_titlebar: true,
+        icon: Some(include_bytes!("../../../assets/brand/png/pimble-256.png")),
         on_close_requested: Some(on_close),
         ..Default::default()
     };

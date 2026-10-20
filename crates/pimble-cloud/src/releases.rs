@@ -20,6 +20,12 @@ pub struct ReleaseAsset {
     pub os: String,
     pub url: String,
     pub size: u64,
+    /// The package's detached Ed25519 signature (`<name>.sig` beside it in the
+    /// release), which the desktop app verifies before it installs an update
+    /// (docs/UPDATE_CONTRACT.md). Signature files are not listed as assets of
+    /// their own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -122,12 +128,48 @@ impl ReleasesCache {
         Ok(ReleaseInfo {
             version: release.tag_name,
             published_at: Some(release.published_at),
-            assets: release
-                .assets
-                .into_iter()
-                .map(|a| ReleaseAsset { os: infer_os(&a.name), name: a.name, url: a.browser_download_url, size: a.size })
-                .collect(),
+            assets: pair_signatures(release.assets),
         })
+    }
+}
+
+/// The release's packages, each with its `<name>.sig` when the release has one.
+fn pair_signatures(assets: Vec<GitHubAsset>) -> Vec<ReleaseAsset> {
+    let signatures: std::collections::HashMap<String, String> = assets
+        .iter()
+        .filter_map(|a| a.name.strip_suffix(".sig").map(|base| (base.to_string(), a.browser_download_url.clone())))
+        .collect();
+    assets
+        .into_iter()
+        .filter(|a| !a.name.ends_with(".sig"))
+        .map(|a| ReleaseAsset {
+            os: infer_os(&a.name),
+            signature_url: signatures.get(&a.name).cloned(),
+            name: a.name,
+            url: a.browser_download_url,
+            size: a.size,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::*;
+
+    fn asset(name: &str) -> GitHubAsset {
+        GitHubAsset { name: name.into(), browser_download_url: format!("https://dl/{name}"), size: 1 }
+    }
+
+    #[test]
+    fn a_signature_rides_on_its_package_and_is_not_listed_itself() {
+        let paired = pair_signatures(vec![
+            asset("pimble-1.0.0-linux-x86_64.tar.gz"),
+            asset("pimble-1.0.0-linux-x86_64.tar.gz.sig"),
+            asset("pimble-1.0.0-windows-x86_64.zip"),
+        ]);
+        assert_eq!(paired.len(), 2);
+        assert_eq!(paired[0].signature_url.as_deref(), Some("https://dl/pimble-1.0.0-linux-x86_64.tar.gz.sig"));
+        assert_eq!(paired[1].signature_url, None);
     }
 }
 
