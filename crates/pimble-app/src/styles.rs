@@ -929,9 +929,11 @@ pub(crate) const APP_CSS: &str = "
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 6px 12px;
+    /* As tall as the toolbar beside it (42px), so the line under both is one
+       line across the window: the explorer header's top border here, the
+       toolbar's bottom border there. */
+    padding: 11px 12px;
     background: var(--rinch-color-body);
-    border-bottom: 1px solid var(--rinch-color-border);
     flex-shrink: 0;
 }
 
@@ -945,6 +947,7 @@ pub(crate) const APP_CSS: &str = "
 
 .pimble-search-bar__input {
     flex: 1;
+    min-width: 0;
     background: transparent;
     border: none;
     outline: none;

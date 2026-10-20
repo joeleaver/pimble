@@ -4138,8 +4138,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             div {
                     style: "display: flex; flex-direction: column; height: 100%;",
 
-                    {search_bar}
-
                     // ── Main content ──────────────────────────────
                     div {
                         style: "display: flex; flex: 1; overflow: hidden;",
@@ -4148,6 +4146,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         div {
                             class: "pimble-sidebar",
                             style: {move || format!("width: {}px;", store.sidebar_width.get())},
+
+                            // Search heads the explorer, whose column its
+                            // results take over (Joe, 2026-10-20: across the
+                            // whole window it cost the panes a row).
+                            {search_bar}
 
                             // Header: store name + new-node button
                             div {
