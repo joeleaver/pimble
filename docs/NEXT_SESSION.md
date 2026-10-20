@@ -1,5 +1,17 @@
 # Next session: start here
 
+**2026-10-20: rinch at `main` fc14187, sheets wave 2 built** (branch `sheets`, nothing
+pushed). Sheets in text on rinch node views: Insert Sheet, typing in a table in a note,
+the lost list with Put Back, Move to a sheet node, the MCP's `create_table` in text and
+`get_node` showing tables in place. Checked on the desktop and in Chromium on the local
+stack; docs/SHEETS_CONTRACT.md "Built in wave 2" has the details and the gaps. Next, as
+before: wave 3 (nodes in sheets, cross-note references; open decision 1 is Joe's first),
+or wave 6 (boards in text onto node views). Still true from 2026-10-19: master has boards
+merged locally, unpushed (pushing ships boards: ask Joe).
+
+Testing lesson: `scripts/perf/rd.py ... key_press` needs `"shift":false,"ctrl":false` or
+the debug port refuses it (the error is printed, the run goes on).
+
 **2026-10-19: sheets wave 1, node views in rinch, boards merged locally.** Nothing is
 pushed. Branches, newest first:
 

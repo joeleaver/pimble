@@ -1,6 +1,7 @@
 # Sheets contract: small live tables in notes, with Excel formulas
 
-Status: **decided, not built**. Written on 2026-10-19 from a brainstorm with Joe. It
+Status: **waves 1 and 2 built** (branch `sheets`, not merged; "Built in wave 2" at the
+end says what exists and how it was checked). Written on 2026-10-19 from a brainstorm with Joe. It
 started from "a spreadsheet-like node, but not exactly. What you want isn't a giant sheet
 full of data, but a quick little tool, and you end up using just a few little ranges".
 Joe's examples were a trip cost calculator, a household budget and a time tracker. Every
@@ -395,3 +396,47 @@ In layers (Joe, 2026-10-19: "would be nice"):
   are unique only where they can be, and titles never have to be.
 - Copy and paste are wanted, in layers.
 - Full MCP support: everything a person can do with a sheet, an LLM can do too.
+
+## Built in wave 2 (2026-10-20, branch `sheets`, on rinch `main` fc14187)
+
+- **The atom.** `pimble_crdt::Block::Embed { attrs }` reads and builds rinch's `embed` by
+  its `data-*` attributes, so a note holding a table still reads as blocks, text, index
+  units, links and Markdown (the embed as `<div data-pm-type="embed" data-sheet="…">`,
+  which rinch's Markdown reads back).
+- **The session.** A pane holding a note holds a sheet session over the note's document
+  too (`sheets::text_opened`, from `start_editing`; `in_text: true`): the editor's own
+  typing reaches it (`sheets::text_delta`, from the outbound closure), its table edits go
+  to the editors holding the note, and when it stops it merges its copy into the node
+  cache after the editor's. Subscription and reconcile are the editor's.
+- **The view.** `sheets/in_text.rs` registers a `NodeViewSpec` for `embed` atoms with a
+  `data-sheet` on every pane's editor, drawing the same `table_node` a sheet node uses
+  from the pane's `SheetUi`. Keys in a table come through the view's `on_key` (the editor
+  offers them there before the keyboard interceptor a sheet node's typing uses): Enter,
+  Tab, arrows, Escape (drops the cell's edit and gives the keyboard back to the text,
+  caret after the table), Ctrl+Z/Ctrl+Y (the sheet's own undo). A press inside a table
+  marks itself (`pane_view::press_in_view`) so the pane does not hand the keyboard to the
+  editor.
+- **Edit > Insert Sheet**: a table and its atom at the caret, with a paragraph after it
+  when it ends the text (with nothing after, Escape node-selects the table and the next
+  key types over it).
+- **The table's "×" in text** takes its atom out; "Tables no longer in the text", under the
+  note, lists every table no atom shows, with Put Back (at the caret) and Delete.
+- **Move** (Convert to Sheet Node): `SheetsTxn::copy_table` copies the table, ids kept,
+  into a new sheet node under the note; when the node is made, the table's place in the
+  text becomes a link to it and the note lets go of the table. A table that reads another
+  of the note's tables or is read by one (`TableSnap::tables_read`) is refused with a
+  sentence until cross-note references (wave 3). The reverse is not built.
+- **MCP**: `create_table` takes a text node (the table and its atom in one edit, after
+  `after_text` or at the end); `get_node` renders a text node's tables where their atoms
+  are, and lists the rest under "Tables no longer in the text". `move_table` is not built.
+- **Checked** in a release build on a scratch store (desktop: insert, typing, a formula
+  typed into an empty column, the column form, Escape, the lost list and Put Back,
+  Ctrl+Z, a restart, an MCP `create_table` arriving live) and in Chromium on the local
+  stack in an encrypted store (insert, typing, rename, a reload and unlock, Move). Tests:
+  `sheets::in_text::tests`, `pimble-crdt` `an_embed_reads_back_and_every_reader_copes`,
+  `pimble-sheet` `a_copied_table_keeps_its_ids_and_contents` and
+  `tables_read_names_this_notes_tables_only`.
+- **Gaps**: no summary can be inserted in text (Insert Sheet makes a plain table); the
+  table name field is wide; the reverse of Move and `move_table`; a table's edits made
+  between pressing Move and the node arriving stay in the note's copy only.
+
