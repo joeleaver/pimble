@@ -459,14 +459,17 @@ impl Pimble {
             out.push_str("(a mount: its children are another store's; list_children shows them)\n");
         }
         out.push_str("---\n");
-        let tables = self.tables_of_node(&client, addr, &node).await;
-        if node.node_type == pimble_core::node_types::SHEET {
+        let tables = if node.node_type == pimble_core::node_types::SHEET {
             out.push_str("(a sheet node: its content is its tables)\n");
+            self.tables_of_node(&client, addr, &node).await.map(|t| ("Tables", t))
         } else {
+            // A text node's tables are shown where they are in its text.
+            let (content, lost) = self.tables_in_text(&client, addr, &node, &content).await;
             out.push_str(if content.is_empty() { "(no content)" } else { &content });
-        }
-        if let Some(tables) = tables {
-            out.push_str("\n\n## Tables\n\n");
+            lost.map(|t| ("Tables no longer in the text", t))
+        };
+        if let Some((heading, tables)) = tables {
+            out.push_str(&format!("\n\n## {heading}\n\n"));
             out.push_str(&tables);
         }
         Ok(out)

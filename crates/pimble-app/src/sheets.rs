@@ -777,6 +777,9 @@ pub(crate) fn recompute(store: AppStore, pane: PaneId) {
     let ui = store.pane(pane).sheet_ui;
     ui.tables.set(views);
     refresh_formula_bar(store, pane);
+    // A peer's update may have brought or taken a table's atom, and the
+    // editor tells of its own changes only.
+    in_text::text_changed(pane);
 }
 
 // ── Editing ──────────────────────────────────────────────────────────────

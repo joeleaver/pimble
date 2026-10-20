@@ -487,4 +487,26 @@ mod tests {
         assert!(commands.try_iter().all(|c| !matches!(c, BackendCommand::CreateNode { .. })));
         assert!(untracked(|| store.pane(P[0]).sheet_ui.message.get()).is_some_and(|m| m.contains("cannot move")));
     }
+
+    /// A peer's table and its atom, arriving together (the MCP's
+    /// create_table): the text shows it, and it is not listed as lost.
+    #[test]
+    fn a_peers_table_in_text_is_shown_not_lost() {
+        let (store, _commands) = store_with_commands();
+        let (store_id, node_id) = (StoreId::new(), NodeId::new());
+        crate::editor::start_editing(store, P[0], store_id, node_id, &[]);
+        crate::editor::editor(P[0]).insert_text("Trip");
+        let mut peer = NodeDoc::load(&crate::editor::editor(P[0]).collab_snapshot().unwrap()).unwrap();
+        let before = peer.state_vector();
+        let made = Sheets::of_node(&peer).edit(|t| new_table(t, "Budget"));
+        let id = made.result.unwrap();
+        peer.append_markdown(&format!("<div data-pm-type=\"embed\" data-sheet=\"{id}\"></div>\n")).unwrap();
+        let bytes = peer.diff_since(&before).unwrap();
+
+        crate::editor::apply_remote(store, store_id, node_id, &bytes);
+        crate::sheets::apply_remote(store, store_id, node_id, &bytes);
+        assert_eq!(embedded_ids(P[0]), vec![id.clone()]);
+        assert_eq!(untracked(|| store.pane(P[0]).sheet_ui.embedded.get()), vec![id]);
+        assert!(untracked(|| lost_tables(store.pane(P[0]).sheet_ui)).is_empty());
+    }
 }

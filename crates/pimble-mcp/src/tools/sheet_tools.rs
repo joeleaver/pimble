@@ -76,7 +76,8 @@ pub struct EvaluateParams {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct CreateTableParams {
-    /// The sheet node the table goes in.
+    /// The node the table goes in: a sheet node, or a text node (the table
+    /// goes into its text, see after_text).
     pub node: String,
     /// The table's name: letters, digits and underscores (spaces become
     /// underscores), unique in the note.
@@ -94,6 +95,11 @@ pub struct CreateTableParams {
     /// Place it after this table; at the end when left out.
     #[serde(default)]
     pub after: Option<String>,
+    /// In a text node: put the table after the top-level block this quote
+    /// names (a few words of it, as replace_text quotes); at the end of the
+    /// text when left out.
+    #[serde(default)]
+    pub after_text: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -279,6 +285,38 @@ impl Pimble {
         Ok(answer)
     }
 
+    /// A text node's Markdown with each table its text shows rendered where its
+    /// atom is (contract section 10), and the tables no atom shows, rendered
+    /// after it under "Tables no longer in the text" (`None` when there are
+    /// none).
+    pub(super) async fn tables_in_text(&self, client: &PimbleClient, addr: Addr, node: &Node, markdown: &str) -> (String, Option<String>) {
+        if sheets_of(node).tables.is_empty() {
+            return (markdown.to_string(), None);
+        }
+        let mut book = load_book(client, addr, node, &[]).await;
+        let Ok(doc) = NodeDoc::load(&node.content) else { return (markdown.to_string(), None) };
+        let work = Work::new(Sheets::of_node(&doc), &mut book);
+        let render = |id: &str| {
+            ops::render_table(&work, id, &Filter { equals: Vec::new(), limit: NODE_ROWS })
+                .unwrap_or_else(|e| format!("(a table could not be shown: {e})\n"))
+        };
+        let mut shown = HashSet::new();
+        let mut out = String::new();
+        for line in markdown.split_inclusive('\n') {
+            match embedded_table(line) {
+                Some(id) if work.snap().table(&id).is_some() => {
+                    out.push_str(&render(&id));
+                    shown.insert(id);
+                }
+                Some(_) => out.push_str("(a table that has not arrived, or was deleted)\n"),
+                None => out.push_str(line),
+            }
+        }
+        let lost: Vec<String> = work.snap().tables.iter().filter(|t| !shown.contains(&t.id)).map(|t| t.id.clone()).collect();
+        let rest = (!lost.is_empty()).then(|| lost.iter().map(|id| render(id) + "\n").collect::<String>());
+        (out, rest)
+    }
+
     /// The tables of a node as get_node shows them, after its content.
     pub(super) async fn tables_of_node(&self, client: &PimbleClient, addr: Addr, node: &Node) -> Option<String> {
         if sheets_of(node).tables.is_empty() {
@@ -312,6 +350,23 @@ async fn walk_store(client: &PimbleClient, store: &Store) -> Vec<(Addr, Node, St
         }
     }
     out
+}
+
+/// The embed atom of table `id` as Markdown (rinch writes and reads it as
+/// its element).
+fn embed_markdown(id: &str) -> String {
+    format!("<div data-pm-type=\"embed\" data-sheet=\"{id}\"></div>\n")
+}
+
+/// The table a Markdown line's embed atom names, if the line is one.
+fn embedded_table(line: &str) -> Option<String> {
+    let line = line.trim();
+    if !line.starts_with("<div") || !line.contains("data-pm-type=\"embed\"") {
+        return None;
+    }
+    let (_, rest) = line.split_once("data-sheet=\"")?;
+    let (id, _) = rest.split_once('"')?;
+    Some(id.to_string())
 }
 
 fn place_of(node: &Node) -> &'static str {
@@ -472,19 +527,44 @@ impl Pimble {
         let client = self.client().await?;
         let addr = nodes::resolve(&client, &p.node).await?;
         let node = client.get_node(addr.store, addr.node).await.map_err(rpc)?;
-        if node.node_type != node_types::SHEET {
-            return Err(
-                "Tables inside a text node's text come in a later wave; create_sheet makes a sheet node, or name a sheet node."
-                    .into(),
-            );
-        }
         let shown = shown_of(&p.columns);
-        self.sheet_edit(&client, addr, &shown, |w| {
-            let id = ops::create_table(w, &p.name, &p.columns, &p.rows, p.keep_as_typed, p.after.as_deref())?;
-            let out = ops::render_table(w, &id, &Filter { equals: Vec::new(), limit: 5 })?;
-            Ok(format!("Created the table.\n{out}"))
+        if node.node_type == node_types::SHEET {
+            if p.after_text.is_some() {
+                return Err("after_text places a table in a text node's text; a sheet node has no text (use after).".into());
+            }
+            return self
+                .sheet_edit(&client, addr, &shown, |w| {
+                    let id = ops::create_table(w, &p.name, &p.columns, &p.rows, p.keep_as_typed, p.after.as_deref())?;
+                    let out = ops::render_table(w, &id, &Filter { equals: Vec::new(), limit: 5 })?;
+                    Ok(format!("Created the table.\n{out}"))
+                })
+                .await;
+        }
+        if node.node_type == node_types::MOUNT || node.node_type == node_types::BOARD {
+            return Err(format!("A table goes in a text node or a sheet node; this is a {} node.", node.node_type));
+        }
+        // A text node: the table, and its embed atom in the text, in one edit
+        // (contract section 10).
+        let mut book = load_book(&client, addr, &node, &shown).await;
+        let mut answer = String::new();
+        let answer_ref = &mut answer;
+        self.edit(&client, addr, move |doc| {
+            let id = {
+                let mut work = Work::new(Sheets::of_node(doc), &mut book);
+                let id = ops::create_table(&mut work, &p.name, &p.columns, &p.rows, p.keep_as_typed, p.after.as_deref())?;
+                *answer_ref = ops::render_table(&work, &id, &Filter { equals: Vec::new(), limit: 5 })?;
+                id
+            };
+            let atom = embed_markdown(&id);
+            match p.after_text.as_deref() {
+                Some(quote) => doc.insert_markdown_after(quote, false, &atom),
+                None => doc.append_markdown(&atom),
+            }
+            .map_err(|e| e.to_string())?;
+            Ok(())
         })
-        .await
+        .await?;
+        Ok(format!("Created the table in the text.\n{answer}"))
     }
 
     /// Add rows to a table. Values by column name, as a person types them:
