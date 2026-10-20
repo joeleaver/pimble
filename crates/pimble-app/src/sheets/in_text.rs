@@ -578,6 +578,12 @@ mod tests {
         parent.id = projects;
         parent.metadata.title = "Projects".into();
         store.upsert_node(store_id, parent);
+        // A project already there, with a field.
+        let mut deck = pimble_core::Node::new("document");
+        deck.metadata.title = "Fence".into();
+        deck.parent_id = Some(projects);
+        deck.metadata.fields = vec![("rate".into(), "90".into())];
+        store.upsert_node(store_id, deck);
         crate::editor::start_editing(store, P[0], store_id, node_id, &[]);
         insert_sheet(store);
         let table = table_ids(P[0]).remove(0);
@@ -594,6 +600,7 @@ mod tests {
         typed(store, P[0], "Deck repair".to_string());
         let ui = store.pane(P[0]).sheet_ui;
         assert_eq!(untracked(|| ui.choices.get()), vec!["Create \"Deck repair\" under Projects".to_string()]);
+        // (Fence does not match "Deck repair".)
         typing_key(store, P[0], "Enter");
         let request = commands
             .try_iter()
@@ -604,6 +611,16 @@ mod tests {
             .expect("the node is made under Projects");
         let made = NodeId::new();
         crate::sheets::node_created(store, request, store_id, made);
+        // It got its siblings' field names, empty.
+        let sent: Vec<BackendCommand> = commands.try_iter().collect();
+        let field_write = sent.iter().find_map(|c| match c {
+            BackendCommand::BroadcastChanges { node_id: n, changes, .. } if *n == made => Some(changes.clone()),
+            _ => None,
+        });
+        let bytes = { use base64::Engine; base64::engine::general_purpose::STANDARD.decode(field_write.expect("a field write")).unwrap() };
+        let mut probe = NodeDoc::new();
+        probe.apply_update(&bytes).unwrap();
+        assert_eq!(probe.node_fields(), vec![("rate".to_string(), String::new())]);
         let snap = snapshot(P[0]).unwrap();
         let row = &snap.table(&table).unwrap().rows[0];
         assert_eq!(row.cells.get(&col), Some(&Stored::Node(node_ref(store_id, made))));

@@ -83,6 +83,11 @@ const DELETED_AT: &str = "deleted_at";
 const BECAME: &str = "became";
 const TAGS: &str = "tags";
 const CUSTOM: &str = "custom";
+/// A node field is the `node` root's key `field:<name>` (docs/SHEETS_CONTRACT.md
+/// section 8, decision 1): one co-edited entry per field, apart from Pimble's
+/// own keys, and no container made on first use (two devices adding a
+/// node's first field while apart would each make one, and one would be lost).
+pub const FIELD_PREFIX: &str = "field:";
 
 /// What the `node` root holds, read out as plain values.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -104,6 +109,8 @@ pub struct NodeFields {
     pub became: Option<PimbleUrl>,
     pub tags: Vec<String>,
     pub custom: HashMap<String, serde_json::Value>,
+    /// The node's fields, name and value as typed, ordered by name.
+    pub fields: Vec<(String, String)>,
 }
 
 impl NodeFields {
@@ -125,6 +132,7 @@ impl NodeFields {
                 modified_at: parse_timestamp(&self.modified_at),
                 tags: self.tags,
                 custom: self.custom,
+                fields: self.fields,
             },
             content: Vec::new(),
             children: Vec::new(),
@@ -606,6 +614,67 @@ impl NodeDoc {
         self.edit_node(|d, txn| d.write_custom(txn, key, value, now)).map(|_| ())
     }
 
+    /// Set node field `name` to `value` as typed, or with `None` remove it.
+    /// A field named the same in another case is that field (names are
+    /// unique case-insensitively, as a table's columns are).
+    pub fn set_field(&mut self, name: &str, value: Option<&str>, now: &str) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(CrdtError::Serialization("A field needs a name.".into()));
+        }
+        let existing = self.node_fields().into_iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(n, _)| n);
+        let key = format!("{FIELD_PREFIX}{}", existing.as_deref().unwrap_or(name));
+        self.edit_node(|d, txn| {
+            match value {
+                Some(v) => {
+                    d.node.insert(txn, key.as_str(), v.to_string());
+                }
+                None => {
+                    d.node.remove(txn, &key);
+                }
+            }
+            d.stamp_modified(txn, now);
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    /// The node's own fields (`field:<name>` keys), ordered by name.
+    pub fn node_fields(&self) -> Vec<(String, String)> {
+        let txn = self.doc.transact();
+        self.read_node_fields(&txn)
+    }
+
+    fn read_node_fields<T: ReadTxn>(&self, txn: &T) -> Vec<(String, String)> {
+        let mut fields: Vec<(String, String)> = self
+            .node
+            .iter(txn)
+            .filter_map(|(key, value)| Some((key.strip_prefix(FIELD_PREFIX)?.to_string(), string_value(Some(value))?)))
+            .collect();
+        fields.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()).then(a.0.cmp(&b.0)));
+        fields
+    }
+
+    /// An update setting field `name` (exactly as named; `None` removes it)
+    /// of a node whose document the caller does not hold: made on a blank
+    /// document, it merges into the node's own, since the `node` root is a
+    /// root of every node document.
+    pub fn field_update(name: &str, value: Option<&str>) -> Vec<u8> {
+        let doc = Doc::new();
+        let node = doc.get_or_insert_map(ROOT_NODE);
+        let mut txn = doc.transact_mut();
+        let key = format!("{FIELD_PREFIX}{}", name.trim());
+        match value {
+            Some(v) => {
+                node.insert(&mut txn, key.as_str(), v.to_string());
+            }
+            None => {
+                node.remove(&mut txn, &key);
+            }
+        }
+        txn.encode_update_v1()
+    }
+
     /// Returns whether the key was there; an absent key writes nothing.
     pub fn remove_custom(&mut self, key: &str, now: &str) -> Result<bool> {
         self.edit_node(|d, txn| Ok(d.remove_custom_key(txn, key, now))).map(|(removed, _)| removed)
@@ -1031,6 +1100,7 @@ impl NodeDoc {
                 }
             }
         }
+        let fields = self.read_node_fields(txn);
         Ok(NodeFields {
             node_type: get(NODE_TYPE).unwrap_or_default(),
             title: get(TITLE).unwrap_or_default(),
@@ -1042,6 +1112,7 @@ impl NodeDoc {
             became: get(BECAME).and_then(|s| PimbleUrl::parse(&s)),
             tags,
             custom,
+            fields,
         })
     }
 
@@ -1247,6 +1318,35 @@ mod tests {
     use crate::ContentDoc;
     use serde_json::json;
 
+    /// Node fields (docs/SHEETS_CONTRACT.md section 8): one `node` root key
+    /// each, set case-insensitively, read in name order, merged per field,
+    /// and writable by a peer that does not hold the document.
+    #[test]
+    fn node_fields_merge_per_field() {
+        let mut a = NodeDoc::new();
+        a.init("document", "Client website", None, T0).unwrap();
+        let mut b = NodeDoc::load(&a.save()).unwrap();
+        a.set_field("rate", Some("120"), T1).unwrap();
+        b.set_field("Client", Some("Acme"), T1).unwrap();
+        let (sa, sb) = (a.state_vector(), b.state_vector());
+        let to_b = a.diff_since(&sb).unwrap();
+        let to_a = b.diff_since(&sa).unwrap();
+        a.apply_update(&to_a).unwrap();
+        b.apply_update(&to_b).unwrap();
+        let both = vec![("Client".to_string(), "Acme".to_string()), ("rate".to_string(), "120".to_string())];
+        assert_eq!(a.node_fields(), both);
+        assert_eq!(b.node_fields(), both, "two first fields made apart both survive");
+        a.set_field("Rate", Some("130"), T2).unwrap();
+        assert_eq!(a.node_fields()[1], ("rate".to_string(), "130".to_string()), "the same field in another case");
+        assert_eq!(a.fields().unwrap().into_node(NodeId::new()).metadata.fields, a.node_fields());
+        // From a blank document, as a client that does not hold the node writes.
+        let effect = a.apply_update(&NodeDoc::field_update("phone", Some("555"))).unwrap();
+        assert!(effect.structure, "a field is metadata");
+        assert!(a.node_fields().iter().any(|(n, v)| n == "phone" && v == "555"));
+        a.set_field("client", None, T2).unwrap();
+        assert!(!a.node_fields().iter().any(|(n, _)| n == "Client"));
+    }
+
     /// An app's `embed` atom (a sheet's table in text) reads back with its
     /// `data-*` attributes, and every reader of the content copes with it.
     #[test]
@@ -1330,6 +1430,7 @@ mod tests {
                 ("icon".to_string(), json!("star")),
                 ("nested".to_string(), json!({"x": [1, 2, {"y": null}]})),
             ]),
+            fields: Vec::new(),
         };
         assert_eq!(doc.fields().unwrap(), expected);
 

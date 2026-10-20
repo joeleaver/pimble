@@ -1,8 +1,7 @@
 # Sheets contract: small live tables in notes, with Excel formulas
 
-Status: **waves 1 and 2 built, wave 3 built except node fields** (branch `sheets`, not
-merged; the "Built in wave ..." sections at the end say what exists and how it was
-checked). Node fields wait on open decision 1. Written on 2026-10-19 from a brainstorm with Joe. It
+Status: **waves 1 to 3 built** (branch `sheets`, not merged; the "Built in wave ..."
+sections at the end say what exists and how it was checked). Written on 2026-10-19 from a brainstorm with Joe. It
 started from "a spreadsheet-like node, but not exactly. What you want isn't a giant sheet
 full of data, but a quick little tool, and you end up using just a few little ranges".
 Joe's examples were a trip cost calculator, a household budget and a time tracker. Every
@@ -369,10 +368,11 @@ In layers (Joe, 2026-10-19: "would be nice"):
 
 ## Open decisions (Joe's)
 
-1. **Where node fields live.** Either a new `fields` Map in the `node` root, with one
-   co-edited entry per field, or keys inside `node.custom` (where icon and color live
-   today). A `fields` Map keeps a person's fields apart from Pimble's own keys. I
-   recommend it.
+1. **Where node fields live.** Decided (Joe, 2026-10-20): apart from Pimble's own keys
+   in `custom`, one co-edited entry per field. Stored as `node` root keys
+   `field:<name>`, not a nested map, by the rule of section 2 ("No container is ever
+   created on first use"): two devices giving an old node its first field while apart
+   would each make the map, and one device's fields would be lost.
 2. **Hours.** Plain hours (`[@hours]*rate` just works), or Excel's fraction of a day (a
    paste from Excel stays exact, but rates need `*24`). The mockup uses plain hours.
 3. **A1 references** inside a table (`B2`, `C2:C9`). The mockup has none; names are
@@ -483,6 +483,16 @@ In layers (Joe, 2026-10-19: "would be nice"):
   link-to-a-node column under an untitled note, its children as choices, Create from a
   cell). That pass found that an untitled note's name (its first words, as the tree shows
   it) was not what formulas and "Nodes under" matched; they now match what the tree shows.
-- **Waiting on open decision 1**: node fields, `[@project].rate`, `get_fields`/`set_fields`,
-  a created node getting its siblings' field names.
+- **Node fields** (decision 1, Joe 2026-10-20): `node` root keys `field:<name>`
+  (`pimble_crdt::FIELD_PREFIX`, `NodeDoc::set_field`, `node_fields`, and
+  `field_update`, an update made on a blank document so a client that does not hold the
+  node can write one), read into `NodeMetadata::fields` and so into every `Node`; a field
+  change is `MetadataUpdated`. Formulas read them (`'Packing'!rate`, `[@where].rate`) in
+  the app and the MCP. The app shows them in a band under the pane's title strip
+  (`fields.rs`: edit in place, Enter writes; ×; "+ Field"; Edit > "Add Field"). A node
+  made from a link cell gets its new siblings' field names, empty. Search indexes them
+  (`name: value`). MCP `get_fields`, `set_fields`, and `get_node` lists them. Checked on
+  the desktop: the band, a rate changed there recomputing `[@where].rate` in another
+  note, Add Field.
+
 

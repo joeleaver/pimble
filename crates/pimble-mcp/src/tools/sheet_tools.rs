@@ -270,6 +270,16 @@ pub struct MoveTableParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct SetFieldsParams {
+    /// The node whose fields change.
+    pub node: String,
+    /// Field names to values as typed ("120", "Acme", "2026-10-20"); null
+    /// removes a field. A name matching an existing field in another case is
+    /// that field. Fields not named are left as they are.
+    pub fields: BTreeMap<String, Option<String>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct RowsPointingHereParams {
     /// The node the rows link to.
     pub node: String,
@@ -708,6 +718,44 @@ impl Pimble {
         let client = self.client().await?;
         let addr = nodes::resolve(&client, &p.node).await?;
         self.sheet_edit(&client, addr, &[], |w| ops::rename_table(w, &p.table, &p.new_name)).await
+    }
+
+    /// A node's fields: its own named values (a project's rate, a person's
+    /// phone), which formulas read as `'Note'!rate` and, through a
+    /// link-to-a-node column, `[@project].rate`.
+    #[tool(name = "get_fields")]
+    async fn get_fields(&self, Parameters(p): Parameters<super::NodeParam>) -> Result<String, String> {
+        let client = self.client().await?;
+        let addr = nodes::resolve(&client, &p.node).await?;
+        let node = client.get_node(addr.store, addr.node).await.map_err(rpc)?;
+        if node.metadata.fields.is_empty() {
+            return Ok(format!("{} has no fields.", label(&node)));
+        }
+        let lines: Vec<String> = node.metadata.fields.iter().map(|(n, v)| format!("- {n}: {v}")).collect();
+        Ok(format!("Fields of {}:\n{}", label(&node), lines.join("\n")))
+    }
+
+    /// Set (or with null, remove) a node's fields; each field is its own
+    /// co-edited value, so only the fields named are written.
+    #[tool(name = "set_fields")]
+    async fn set_fields(&self, Parameters(p): Parameters<SetFieldsParams>) -> Result<String, String> {
+        let client = self.client().await?;
+        let addr = nodes::resolve(&client, &p.node).await?;
+        if p.fields.keys().any(|n| n.trim().is_empty()) {
+            return Err("A field needs a name.".into());
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let fields = p.fields.clone();
+        self.edit(&client, addr, move |doc| {
+            for (name, value) in &fields {
+                doc.set_field(name, value.as_deref(), &now).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })
+        .await?;
+        let node = client.get_node(addr.store, addr.node).await.map_err(rpc)?;
+        let lines: Vec<String> = node.metadata.fields.iter().map(|(n, v)| format!("- {n}: {v}")).collect();
+        Ok(format!("Fields of {} now:\n{}", label(&node), if lines.is_empty() { "(none)".to_string() } else { lines.join("\n") }))
     }
 
     /// Every row of every table, in every open store, whose link-to-a-node

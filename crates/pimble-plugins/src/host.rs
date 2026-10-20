@@ -114,6 +114,7 @@ impl NodePlugin for DocumentPlugin {
         let Ok(doc) = pimble_crdt::NodeDoc::load(content) else { return Ok(Vec::new()) };
         let mut units = doc.units();
         units.extend(pimble_sheet::index::index_units(&doc));
+        units.extend(field_units(&doc));
         Ok(units)
     }
 
@@ -252,7 +253,13 @@ impl NodePlugin for SheetPlugin {
     }
 
     fn index_units(&self, content: &[u8]) -> Result<Vec<pimble_core::IndexUnit>> {
-        Ok(pimble_crdt::NodeDoc::load(content).map(|doc| pimble_sheet::index::index_units(&doc)).unwrap_or_default())
+        Ok(pimble_crdt::NodeDoc::load(content)
+            .map(|doc| {
+                let mut units = field_units(&doc);
+                units.extend(pimble_sheet::index::index_units(&doc));
+                units
+            })
+            .unwrap_or_default())
     }
 
     fn validate(&self, _content: &[u8]) -> Result<ValidationResult> {
@@ -262,6 +269,16 @@ impl NodePlugin for SheetPlugin {
     fn init_content(&self) -> Result<Vec<u8>> {
         Ok(pimble_crdt::NodeDoc::new().save())
     }
+}
+
+/// A node's own fields as index units (`name: value`), so "Acme" finds the
+/// project whose client field is Acme.
+fn field_units(doc: &pimble_crdt::NodeDoc) -> Vec<pimble_core::IndexUnit> {
+    doc.node_fields()
+        .into_iter()
+        .filter(|(_, v)| !v.trim().is_empty())
+        .map(|(n, v)| pimble_core::IndexUnit::new(pimble_core::UnitKind::Field(n.clone()), format!("field:{n}"), format!("{n}: {v}")))
+        .collect()
 }
 
 /// Create a plugin host with built-in plugins registered

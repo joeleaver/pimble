@@ -112,6 +112,7 @@ impl Node {
                 modified_at: now,
                 tags: Vec::new(),
                 custom: HashMap::new(),
+                fields: Vec::new(),
             },
             content: Vec::new(),
             children: Vec::new(),
@@ -282,6 +283,12 @@ pub struct NodeMetadata {
 
     /// Custom metadata fields
     pub custom: HashMap<String, serde_json::Value>,
+
+    /// The node's own fields (docs/SHEETS_CONTRACT.md section 8): a person's
+    /// named values on the node (a project's rate, a person's phone), name
+    /// and value as typed, ordered by name. Pimble's own keys are `custom`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<(String, String)>,
 }
 
 impl NodeMetadata {

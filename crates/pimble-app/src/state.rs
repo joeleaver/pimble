@@ -1051,6 +1051,8 @@ pub struct PaneState {
     /// Whether the pane shows a sheet node's tables (docs/SHEETS_CONTRACT.md
     /// section 1) instead of its editor, which stays mounted, hidden.
     pub show_sheet: Signal<bool>,
+    /// A field is being added to the node (Edit > "Add Field", `fields.rs`).
+    pub adding_field: Signal<bool>,
     /// The sheet node the pane holds, like `board` for a board node.
     pub sheet: Signal<Option<ActiveEdit>>,
     /// What the sheet view shows: the computed tables, the cell being typed
@@ -1073,6 +1075,7 @@ impl PaneState {
             markup: Signal::new(false),
             picture: Signal::new(None),
             show_sheet: Signal::new(false),
+            adding_field: Signal::new(false),
             sheet: Signal::new(None),
             sheet_ui: crate::sheets::SheetUi::new(),
         }

@@ -60,7 +60,8 @@ in a sheet node or in a text node's text. list_tables and get_table read them (g
 too, a text node's where they are in its text); create_sheet, create_table, add_rows, update_rows, \
 delete_rows, add_column, update_column, delete_column, set_summary, rename_table, move_table and \
 delete_table write them, touching only what they name; rows_pointing_here lists the rows that \
-link to a node; evaluate \
+link to a node; get_fields and set_fields read and write a node's own fields (read in formulas as \
+'Note'!field and [@link].field); evaluate \
 runs a formula without saving it. Values go in as a person types them (\"$12.50\", \"yesterday\", \
 a linked row's first-column value); rows are named by id or by their first column's value. \
 Before writing a formula, read sheet_formula_guide (also the resource \"Sheet formulas\").";
@@ -451,6 +452,10 @@ impl Pimble {
         );
         if !node.metadata.tags.is_empty() {
             out.push_str(&format!("tags: {}\n", node.metadata.tags.join(", ")));
+        }
+        if !node.metadata.fields.is_empty() {
+            let fields: Vec<String> = node.metadata.fields.iter().map(|(n, v)| format!("{n} = {v}")).collect();
+            out.push_str(&format!("fields: {}\n", fields.join("; ")));
         }
         out.push_str(&format!("children: {}\n", node.children.len()));
         out.push_str(&format!("modified: {}\n", node.metadata.modified_at.to_rfc3339()));

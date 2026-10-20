@@ -1,12 +1,12 @@
 # Next session: start here
 
-**2026-10-20 (later): sheets wave 3 built except node fields** (same branch): moves keep
-formulas reading (`formula::rehome`), MCP `move_table` and `rows_pointing_here`, notes a
-formula reads are resolved, held and followed live (`sheets/reads.rs`), link-to-a-node
-columns with "Nodes under" and Create, search indexes typed cells. Two wave 1 bugs found
-on screen (invisible link chips, clipped link choices). **Open decision 1 (where node
-fields live) is the one thing blocking the rest of wave 3**; ask Joe. Then wave 4 (copy
-and paste) or wave 6.
+**2026-10-20 (later): sheets wave 3 built**, node fields included (Joe decided them:
+`node` root keys `field:<name>`, docs/SHEETS_CONTRACT.md open decision 1). Moves keep
+formulas reading (`formula::rehome`), MCP `move_table`, `rows_pointing_here`,
+`get_fields`, `set_fields`; notes a formula reads are resolved, held and followed live
+(`sheets/reads.rs`); link-to-a-node columns with "Nodes under" and Create; fields band
+(`fields.rs`); search indexes typed cells and fields. Next: wave 4 (copy and paste) or
+wave 6 (boards in text onto node views).
 
 **2026-10-20: rinch at `main` fc14187, sheets wave 2 built** (branch `sheets`, nothing
 pushed). Sheets in text on rinch node views: Insert Sheet, typing in a table in a note,

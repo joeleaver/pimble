@@ -50,6 +50,7 @@ pub const UNDER_MARK: &str = "under:";
 pub async fn load_book(client: &PimbleClient, home: Addr, home_node: &Node, shown: &[&str]) -> McpBook {
     let mut book = McpBook::new(node_ref(home), sheets_of(home_node), McpBook::local_today());
     book.add_node(node_ref(home), label(home_node), home_node.parent_id.map(|p| NodeRef { store: home.store, node: p }));
+    book.set_fields(node_ref(home), home_node.metadata.fields.clone());
     let mut pending: Vec<NodeRef> = formulas_of(book.home_snap()).into_iter().flat_map(named_nodes).collect();
     let mut wanted: HashSet<String> = HashSet::new();
     for f in shown {
@@ -82,6 +83,7 @@ pub async fn load_book(client: &PimbleClient, home: Addr, home_node: &Node, show
                         book.add_sheets(n, snap);
                     }
                     book.add_node(n, label(&node), node.parent_id.map(|p| NodeRef { store: n.store, node: p }));
+                    book.set_fields(n, node.metadata.fields.clone());
                 }
                 Err(e) => {
                     // A tombstone is not served as a node; the link says so.
@@ -148,6 +150,7 @@ async fn index_titles(client: &PimbleClient, book: &mut McpBook, wanted: &HashSe
                     book.add_sheets(r, sheets_of(&node));
                 }
                 book.add_node(r, title, Some(node_ref(at)));
+                book.set_fields(r, node.metadata.fields.clone());
                 queue.push((addr, Some(node_ref(at))));
             }
         }

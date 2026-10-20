@@ -38,9 +38,10 @@ thread_local! {
     static PRESS_IN_VIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// A press inside a component drawn in a pane's text (a node view): the
-/// pane it bubbles up to focuses but leaves the keyboard where the press put
-/// it, or a press on a table's input would hand the keyboard to the editor.
+/// A press inside something of the pane's with inputs of its own (a table in
+/// the text, the node's fields): the pane it bubbles up to focuses but
+/// leaves the keyboard where the press put it, or a press on one of those
+/// inputs would hand the keyboard to the editor.
 pub(crate) fn press_in_view() {
     PRESS_IN_VIEW.with(|p| p.set(true));
 }
@@ -211,6 +212,7 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
     // The note's tables no atom shows any more (docs/SHEETS_CONTRACT.md
     // section 1), under its text.
     let lost_tables = crate::sheets::in_text::render_lost(__scope, store, pane);
+    let fields_band = crate::fields::render_fields(__scope, store, pane);
     let content_wrap = rsx! {
         div {
             class: "pimble-editor__content-wrap",
@@ -326,6 +328,8 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                 }
             }
 
+            // The node's own fields (docs/SHEETS_CONTRACT.md section 8).
+            {fields_band}
             // The same sentence a refused write comes back with, so a
             // reader meets one wording everywhere.
             div {

@@ -25,6 +25,8 @@ pub enum Absent {
 pub struct Known {
     pub title: String,
     pub parent: Option<NodeRef>,
+    /// Its fields (contract section 8), as typed.
+    pub fields: Vec<(String, String)>,
 }
 
 /// The engine's view of the stores from one node ("this note").
@@ -77,7 +79,15 @@ impl McpBook {
 
     /// A node's title and the parent it sits under, for naming and paths.
     pub fn add_node(&mut self, node: NodeRef, title: impl Into<String>, parent: Option<NodeRef>) {
-        self.nodes.insert(node, Known { title: title.into(), parent });
+        let fields = self.nodes.get(&node).map(|k| k.fields.clone()).unwrap_or_default();
+        self.nodes.insert(node, Known { title: title.into(), parent, fields });
+    }
+
+    /// A known node's fields.
+    pub fn set_fields(&mut self, node: NodeRef, fields: Vec<(String, String)>) {
+        if let Some(k) = self.nodes.get_mut(&node) {
+            k.fields = fields;
+        }
     }
 
     pub fn has_sheets(&self, node: &NodeRef) -> bool {
@@ -120,7 +130,7 @@ impl Book for McpBook {
 
     fn node(&self, node: &NodeRef) -> Option<NodeInfo> {
         let k = self.known(node)?;
-        Some(NodeInfo { title: k.title.clone(), fields: Vec::new(), parent: k.parent })
+        Some(NodeInfo { title: k.title.clone(), fields: k.fields.clone(), parent: k.parent })
     }
 
     fn find_nodes(&self, name_or_path: &str) -> Vec<NodeRef> {

@@ -468,6 +468,40 @@ pub(crate) const APP_CSS: &str = "
     font-size: 14px;
 }
 
+/* A node's fields, under the pane's title strip. */
+.pimble-fields {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 14px;
+    padding: 6px 16px;
+    border-bottom: 1px solid var(--rinch-color-border);
+    font-size: 13px;
+}
+
+.pimble-fields__item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.pimble-fields__name {
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-fields__item .rinch-text-input {
+    width: 11em;
+}
+
+.pimble-fields__remove,
+.pimble-fields__add {
+    border: none;
+    background: transparent;
+    color: var(--rinch-color-dimmed);
+    cursor: pointer;
+    font-size: 12px;
+}
+
 /* The tables no longer in the text, listed under it. */
 .pimble-sheet-lost {
     display: flex;

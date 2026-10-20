@@ -133,6 +133,8 @@ fn edit_entries(store: AppStore) -> Vec<MenuEntry> {
         MenuEntry::item("Insert Board...", "", move || crate::text_boards::insert_board(store)),
         // docs/SHEETS_CONTRACT.md section 1: a new table at the caret.
         MenuEntry::item("Insert Sheet", "", move || crate::sheets::in_text::insert_sheet(store)),
+        // docs/SHEETS_CONTRACT.md section 8: a named value on the node.
+        MenuEntry::item("Add Field", "", move || crate::fields::add_field(store)),
         MenuEntry::Separator,
         MenuEntry::item("Delete", "", move || {
         // A native menu item cannot be greyed out reactively, so the check a

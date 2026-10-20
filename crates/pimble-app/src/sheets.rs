@@ -656,7 +656,8 @@ impl Book for AppBook {
 
     fn node(&self, node: &NodeRef) -> Option<NodeInfo> {
         let (title, parent) = self.title(node)?;
-        Some(NodeInfo { title, fields: Vec::new(), parent: parent.map(|p| node_ref(node.store, p)) })
+        let fields = self.store.get_node_signal(node.store, node.node).map(|sig| untracked(|| sig.with(|n| n.metadata.fields.clone()))).unwrap_or_default();
+        Some(NodeInfo { title, fields, parent: parent.map(|p| node_ref(node.store, p)) })
     }
 
     fn find_nodes(&self, name_or_path: &str) -> Vec<NodeRef> {
@@ -1243,6 +1244,8 @@ struct CreateJob {
     pane: PaneId,
     node: (StoreId, NodeId),
     key: CellKey,
+    /// The parent it is made under.
+    under: Option<NodeId>,
 }
 
 thread_local! {
@@ -1267,6 +1270,29 @@ pub(crate) fn children_loaded(store: AppStore, store_id: StoreId, parent_id: Nod
 /// A node made for a link cell: the cell links to it.
 pub(crate) fn node_created(store: AppStore, request: u64, store_id: StoreId, node_id: NodeId) {
     let Some(job) = CREATES.with(|c| c.borrow_mut().remove(&request)) else { return };
+    // It gets its siblings' field names, empty (contract section 3).
+    let names: Vec<String> = {
+        let mut names: Vec<String> = Vec::new();
+        let all: Vec<(StoreId, NodeId)> = untracked(|| store.node_data.with(|m| m.keys().copied().collect()));
+        for (s, n) in all {
+            if s != store_id || n == node_id {
+                continue;
+            }
+            let Some(sig) = store.get_node_signal(s, n) else { continue };
+            let (parent, fields) = untracked(|| sig.with(|node| (node.parent_id, node.metadata.fields.clone())));
+            if parent.is_some() && parent == job.under {
+                for (name, _) in fields {
+                    if !names.iter().any(|x| x.eq_ignore_ascii_case(&name)) {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+        names
+    };
+    for name in names {
+        crate::fields::write(store, store_id, node_id, &name, Some(""));
+    }
     if with_session(job.pane, |s| (s.store_id, s.node_id)) != Some(job.node) {
         return;
     }
@@ -1308,7 +1334,7 @@ pub(crate) fn commit(store: AppStore, pane: PaneId, mv: Move) {
     if let Some(offer) = OFFER.with(|o| o.borrow_mut().take()).filter(|o| o.label == text) {
         let Some(node) = with_session(pane, |s| (s.store_id, s.node_id)) else { return };
         let request = NEXT_CREATE.with(|n| n.replace(n.get() + 1));
-        CREATES.with(|c| c.borrow_mut().insert(request, CreateJob { pane, node, key: key.clone() }));
+        CREATES.with(|c| c.borrow_mut().insert(request, CreateJob { pane, node, key: key.clone(), under: Some(offer.under.node) }));
         store.send(BackendCommand::CreateNode {
             store_id: offer.under.store,
             parent_id: Some(offer.under.node),
