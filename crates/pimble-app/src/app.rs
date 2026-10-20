@@ -1726,7 +1726,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             }
                         }
                     },
-                    value_fn: move || store.rename_text.get(),
+                    value: {move || store.rename_text.get()},
                     oninput: move |value: String| {
                         store.rename_text.set(value);
                     },
