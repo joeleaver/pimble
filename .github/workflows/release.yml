@@ -4,6 +4,9 @@ on:
   push:
     tags:
       - "v*"
+  # Builds and checks the packages from a branch, without releasing them: the
+  # release job runs for a tag only.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -46,7 +49,7 @@ jobs:
 
       - name: Package
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
           tools/package.sh "$version" target/release/pimble dist
 
       - uses: actions/upload-artifact@v4
@@ -80,7 +83,7 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}" -replace '^v', ''
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
           $stage = "dist/pimble-$version-windows-x86_64"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item target/release/pimble.exe "$stage/pimble.exe"
@@ -88,15 +91,50 @@ jobs:
           if (Test-Path LICENSE) { Copy-Item LICENSE "$stage/" }
           if (Test-Path README.md) { Copy-Item README.md "$stage/" }
           Compress-Archive -Path "$stage/*" -DestinationPath "dist/pimble-$version-windows-x86_64.zip"
+          "version=$version" >> $env:GITHUB_ENV
+
+      # The per-user installer (tools/windows/pimble.iss): the folder the
+      # updater keeps current, with its marker (docs/UPDATE_CONTRACT.md).
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $installer = "dist/installer-stage"
+          New-Item -ItemType Directory -Force -Path $installer | Out-Null
+          Copy-Item target/release/pimble.exe, target/release/pimble-mcp.exe $installer
+          Set-Content -Path "$installer/pimble-install.json" -Value "{`"version`":`"$env:version`"}" -NoNewline -Encoding ascii
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$env:version" "/DStage=$PWD\$installer" "/DOutDir=$PWD\dist" tools\windows\pimble.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Install, look, uninstall, look again: the runner is a real Windows.
+      - name: Check the installer
+        shell: pwsh
+        run: |
+          $setup = "dist/pimble-$env:version-windows-x86_64-setup.exe"
+          Start-Process -Wait -FilePath $setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"
+          $app = "$env:LOCALAPPDATA\Programs\Pimble"
+          foreach ($f in "pimble.exe", "pimble-mcp.exe", "pimble-install.json") {
+            if (-not (Test-Path "$app\$f")) { throw "the installer did not put $f in $app" }
+          }
+          $marker = Get-Content "$app\pimble-install.json" | ConvertFrom-Json
+          if ($marker.version -ne $env:version) { throw "the marker says $($marker.version), not $env:version" }
+          if (-not (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Pimble.lnk")) { throw "no Start-menu entry" }
+          Start-Process -Wait -FilePath "$app\unins000.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"
+          Start-Sleep -Seconds 3
+          if (Test-Path "$app\pimble.exe") { throw "the uninstaller left pimble.exe" }
+          Write-Host "installed to $app, marker $($marker.version), Start-menu entry, uninstalled cleanly"
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows-package
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            dist/*-setup.exe
           if-no-files-found: error
 
   release:
     needs: [build-linux, build-windows]
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     steps:
       - name: Download packaged artifacts
@@ -107,7 +145,7 @@ jobs:
       - name: Flatten artifact layout
         run: |
           mkdir -p release
-          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release/ \;
+          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*-setup.exe' \) -exec cp {} release/ \;
           ls -la release
 
       # Every package gets a detached Ed25519 signature beside it, which the
@@ -125,7 +163,7 @@ jobs:
           key="$(mktemp)"
           trap 'rm -f "$key"' EXIT
           printf '%s\n' "$SIGNING_KEY" > "$key"
-          for package in release/*.tar.gz release/*.zip; do
+          for package in release/*.tar.gz release/*.zip release/*-setup.exe; do
             openssl pkeyutl -sign -rawin -inkey "$key" -in "$package" -out "$package.sig"
           done
           ls -la release
