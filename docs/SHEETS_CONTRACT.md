@@ -492,7 +492,8 @@ In layers (Joe, 2026-10-19: "would be nice"):
   (`fields.rs`: edit in place, Enter writes; ×; "+ Field"; Edit > "Add Field"). A node
   made from a link cell gets its new siblings' field names, empty. Search indexes them
   (`name: value`). MCP `get_fields`, `set_fields`, and `get_node` lists them. Checked on
-  the desktop: the band, a rate changed there recomputing `[@where].rate` in another
-  note, Add Field.
+  the desktop (the band, a rate changed there recomputing `[@where].rate` in another
+  note, Add Field) and in Chromium on the local stack in an encrypted store (Add Field,
+  a reload and unlock).
 
 
