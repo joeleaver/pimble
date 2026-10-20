@@ -55,7 +55,11 @@ pub(crate) fn editor(pane: PaneId) -> EditorHandle {
                 // Typing, commands and remote deltas all land here; the
                 // toolbar's active states follow immediately (cursor-only
                 // moves are covered by the toolbar's own watcher).
-                handle.on_change(move || crate::toolbar::bump_toolbar(pane));
+                handle.on_change(move || {
+                    crate::toolbar::bump_toolbar(pane);
+                    // The tables its text shows (docs/SHEETS_CONTRACT.md section 1).
+                    crate::sheets::in_text::text_changed(pane);
+                });
                 handle
             })
             .clone()
@@ -216,6 +220,8 @@ pub(crate) fn start_editing(
             return;
         }
         let changes = base64::engine::general_purpose::STANDARD.encode(&delta);
+        // The note's sheets in this window hold its document too.
+        crate::sheets::text_delta(store, store_id, node_id, &delta);
         store.send(BackendCommand::BroadcastChanges {
             store_id,
             node_id,
@@ -276,6 +282,9 @@ pub(crate) fn start_editing(
     // The note's boards (its marked-up pictures) are read from its document
     // as this window holds it.
     crate::text_boards::host_opened(store, pane, store_id, node_id, content_bytes);
+    // And its sheets in text (docs/SHEETS_CONTRACT.md section 1).
+    crate::sheets::in_text::register(store, pane);
+    crate::sheets::text_opened(store, pane, store_id, node_id, content_bytes);
     // A followed deep link into this note: its spot, now that the session
     // holds the content.
     let arrived = untracked(|| state.pending_anchor.get()).filter(|(s, n, _)| (*s, *n) == (store_id, node_id));
@@ -319,6 +328,7 @@ pub(crate) fn stop_editing(store: AppStore, pane: PaneId) {
     handle.stop_collaboration();
     crate::links::hover_link(store, None);
     crate::text_boards::host_closed(store, pane);
+    crate::sheets::text_closed(store, pane);
     if store.focused() == pane {
         crate::link_picker::close(store);
     }

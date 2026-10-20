@@ -12,11 +12,14 @@
 //! `editor.rs` — the one place collaboration is wired — free of `cfg`.
 
 #[cfg(feature = "native")]
-pub use rinch::prelude::{create_editor, Editor, EditorHandle, LinkClick, LinkHover, ScrollAlign};
+pub use rinch::prelude::{
+    create_editor, Editor, EditorHandle, EditorKey, LinkClick, LinkHover, NodeViewCtx, NodeViewRegistration, NodeViewSpec, ScrollAlign,
+};
 #[cfg(feature = "native")]
 pub use rinch::editor::{set_image_source, ImageHover, ImageInputSource, SelectionAnchor};
 
 #[cfg(not(feature = "native"))]
 pub use rinch_web::{
-    create_editor, set_image_source, Editor, EditorHandle, ImageHover, ImageInputSource, LinkClick, LinkHover, ScrollAlign, SelectionAnchor,
+    create_editor, set_image_source, Editor, EditorHandle, EditorKey, ImageHover, ImageInputSource, LinkClick, LinkHover, NodeViewCtx,
+    NodeViewRegistration, NodeViewSpec, ScrollAlign, SelectionAnchor,
 };

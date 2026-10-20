@@ -33,6 +33,16 @@ thread_local! {
     /// let go). Only a press nothing here heard, which is one the browser's
     /// editor kept, leaves the release to say which pane was clicked.
     static PRESS_HEARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The press now bubbling up was inside an app component drawn in the
+    /// text (a sheet's table): its inputs take the keyboard themselves.
+    static PRESS_IN_VIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A press inside a component drawn in a pane's text (a node view): the
+/// pane it bubbles up to focuses but leaves the keyboard where the press put
+/// it, or a press on a table's input would hand the keyboard to the editor.
+pub(crate) fn press_in_view() {
+    PRESS_IN_VIEW.with(|p| p.set(true));
 }
 
 /// What a split refused for want of room says.
@@ -198,6 +208,9 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
     // (docs/IMAGE_MARKUP_CONTRACT.md section 5).
     let picture_controls = crate::text_boards::render_controls(__scope, store, pane);
 
+    // The note's tables no atom shows any more (docs/SHEETS_CONTRACT.md
+    // section 1), under its text.
+    let lost_tables = crate::sheets::in_text::render_lost(__scope, store, pane);
     let content_wrap = rsx! {
         div {
             class: "pimble-editor__content-wrap",
@@ -210,6 +223,7 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                 crate::boards::take_tree_drag(|value| crate::text_boards::drop_tree_row(store, pane, value));
             },
             {editor_view}
+            {lost_tables}
         }
     };
     // Where the text is on screen: the controls over a picture stay inside
@@ -250,7 +264,9 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
             onmousedown: move || {
                 PRESS_HEARD.with(|heard| heard.set(true));
                 focus_pane(store, pane);
-                crate::editor::give_keyboard_to(store, pane);
+                if !PRESS_IN_VIEW.with(|p| p.replace(false)) {
+                    crate::editor::give_keyboard_to(store, pane);
+                }
             },
             onmouseup: move || {
                 let heard = PRESS_HEARD.with(|heard| heard.replace(false));

@@ -458,6 +458,36 @@ pub(crate) const APP_CSS: &str = "
     min-height: 0;
 }
 
+/* A table in a note's text: no pane padding, and it scrolls sideways
+   itself rather than the text. */
+.pimble-sheet--in-text {
+    flex: none;
+    overflow: visible;
+    padding: 0;
+    gap: 6px;
+    font-size: 14px;
+}
+
+/* The tables no longer in the text, listed under it. */
+.pimble-sheet-lost {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin: 12px 24px 32px;
+    padding: 8px 10px;
+    border: 1px dashed var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+    font-size: 13px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-sheet-lost__item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
 .pimble-sheet__message {
     padding: 6px 10px;
     border-radius: var(--rinch-radius-sm);

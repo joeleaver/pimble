@@ -41,24 +41,51 @@ pub(super) fn focus_edit_input(pane: PaneId) {
 /// keyboard interceptor, like the app's other inline fields.
 fn enter_commits(store: AppStore, pane: PaneId, commit: impl Fn() + 'static) {
     super::commit(store, pane, Move::Stay);
-    let commit = std::rc::Rc::new(commit);
+    let commit: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(commit);
+    // A table in text hears its keys through its node view instead
+    // (`field_key`), which the editor offers them to first.
+    FIELD.with(|f| *f.borrow_mut() = Some((pane, commit.clone())));
     rinch::core::set_keyboard_interceptor(move |data| {
         let key = data.key.clone();
         let handled = matches!(key.as_str(), "Enter" | "Escape");
         if !handled || data.kind != rinch::core::KeyEventKind::Down {
             return handled;
         }
-        let commit = commit.clone();
-        let _ = set_timeout(0, move || {
-            rinch::core::clear_keyboard_interceptor();
-            if key == "Enter" {
-                commit();
-            } else {
-                recompute(store, pane);
-            }
-        });
-        true
+        field_key(store, pane, &key)
     });
+}
+
+thread_local! {
+    /// The one-line field being edited: its pane, and what Enter commits.
+    static FIELD: RefCell<Option<(PaneId, std::rc::Rc<dyn Fn()>)>> = const { RefCell::new(None) };
+}
+
+/// Enter or Escape in pane `pane`'s one-line field: commit it, or drop the
+/// change, a turn later. `false` when no field of the pane is being edited.
+pub(super) fn field_key(store: AppStore, pane: PaneId, key: &str) -> bool {
+    if !matches!(key, "Enter" | "Escape") {
+        return false;
+    }
+    let Some(commit) = FIELD.with(|f| {
+        let mut f = f.borrow_mut();
+        if f.as_ref().is_some_and(|(p, _)| *p == pane) {
+            f.take().map(|(_, c)| c)
+        } else {
+            None
+        }
+    }) else {
+        return false;
+    };
+    let enter = key == "Enter";
+    let _ = set_timeout(0, move || {
+        rinch::core::clear_keyboard_interceptor();
+        if enter {
+            commit();
+        } else {
+            recompute(store, pane);
+        }
+    });
+    true
 }
 
 /// Pane `pane`'s sheet view: shown while it holds a sheet node.
@@ -72,7 +99,8 @@ pub(crate) fn render_sheet(__scope: &mut RenderScope, store: AppStore, pane: Pan
             if let Some(message) = ui.message.get() {
                 div { class: "pimble-sheet__message", {message} }
             }
-            for table in ui.tables.get() {
+            // A pane holding a note draws its tables in the text instead.
+            for table in node_tables(store, pane) {
                 div {
                     key: format!("{}:{}", table.id, table.version),
                     {table_node(__scope, store, pane, table.clone())}
@@ -89,7 +117,18 @@ pub(crate) fn render_sheet(__scope: &mut RenderScope, store: AppStore, pane: Pan
     }
 }
 
-fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneId, t: TableView) -> NodeHandle {
+/// The tables pane `pane`'s sheet view draws: none while the pane holds a
+/// note, whose tables are drawn in its text.
+fn node_tables(store: AppStore, pane: PaneId) -> Vec<TableView> {
+    let state = store.pane(pane);
+    if state.show_sheet.get() {
+        state.sheet_ui.tables.get()
+    } else {
+        Vec::new()
+    }
+}
+
+pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneId, t: TableView) -> NodeHandle {
     let ui = store.pane(pane).sheet_ui;
     let tid = t.id.clone();
     let name = Signal::new(t.name.clone());

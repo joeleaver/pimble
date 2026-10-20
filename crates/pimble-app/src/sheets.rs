@@ -12,7 +12,15 @@
 //!
 //! Nothing computed is stored: a cell's value, a row's label, a summary's
 //! rows are all derived from the document every time.
+//!
+//! A pane holding a note in its editor holds a session too, over the note's
+//! document ([`text_opened`], wave 2): its tables are the note's sheets in
+//! text, each drawn where its `embed` atom is by a rinch node view
+//! ([`in_text`]). That session hears the editor's own typing
+//! ([`text_delta`]) and hands its table edits to the editors holding the
+//! note, so every copy of the document in this window stays whole.
 
+pub(crate) mod in_text;
 mod ui;
 
 use std::cell::{Cell, RefCell};
@@ -130,6 +138,8 @@ pub struct SheetUi {
     pub column_form: Signal<Option<ColumnForm>>,
     /// A refused edit's sentence, shown over the tables until the next edit.
     pub message: Signal<Option<String>>,
+    /// The tables a note's text shows (its `embed` atoms), in order.
+    pub embedded: Signal<Vec<String>>,
 }
 
 impl SheetUi {
@@ -145,6 +155,7 @@ impl SheetUi {
             formula_note: Signal::new(None),
             column_form: Signal::new(None),
             message: Signal::new(None),
+            embedded: Signal::new(Vec::new()),
         }
     }
 }
@@ -164,6 +175,9 @@ struct Session {
     doc: NodeDoc,
     sheets: Sheets,
     undo: yrs::undo::UndoManager<()>,
+    /// The note's sheets in text: the pane's editor holds the note, and its
+    /// subscription and node cache are the editor's.
+    in_text: bool,
 }
 
 thread_local! {
@@ -173,6 +187,19 @@ thread_local! {
 
 fn with_session<R>(pane: PaneId, f: impl FnOnce(&mut Session) -> R) -> Option<R> {
     SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()].as_mut().map(f))
+}
+
+/// The panes holding node `node_id`'s tables, as a sheet node or in text.
+fn panes_holding(store_id: StoreId, node_id: NodeId) -> Vec<PaneId> {
+    PaneId::ALL
+        .into_iter()
+        .filter(|pane| with_session(*pane, |s| (s.store_id, s.node_id) == (store_id, node_id)).unwrap_or(false))
+        .collect()
+}
+
+/// Whether pane `pane` holds a note's sheets in text.
+pub(crate) fn holds_text(pane: PaneId) -> bool {
+    with_session(pane, |s| s.in_text).unwrap_or(false)
 }
 
 fn origin(pane: PaneId) -> String {
@@ -197,11 +224,28 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
     crate::editor::stop_editing(store, pane);
     crate::boards::stop(store, pane);
     stop(store, pane);
+    open(store, pane, store_id, node_id, content, false);
+}
+
+/// Pane `pane`'s editor opened note `node_id` from `content`: hold its
+/// document for the sheets in its text.
+pub(crate) fn text_opened(store: AppStore, pane: PaneId, store_id: StoreId, node_id: NodeId, content: &[u8]) {
+    stop(store, pane);
+    open(store, pane, store_id, node_id, content, true);
+}
+
+/// Pane `pane`'s editor let go of its note.
+pub(crate) fn text_closed(store: AppStore, pane: PaneId) {
+    if holds_text(pane) {
+        stop(store, pane);
+    }
+}
+
+fn open(store: AppStore, pane: PaneId, store_id: StoreId, node_id: NodeId, content: &[u8], in_text: bool) {
     APP.with(|app| app.set(Some(store)));
     let first = !store.is_editing(store_id, node_id);
     // A pane opening a sheet another pane holds starts from that pane's copy.
-    let sibling = store
-        .panes_sheeting(store_id, node_id)
+    let sibling = panes_holding(store_id, node_id)
         .into_iter()
         .find_map(|other| with_session(other, |s| s.doc.save()));
     let bytes = sibling.as_deref().unwrap_or(content);
@@ -214,19 +258,24 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
     };
     let sheets = Sheets::of_node(&doc).with_origin(origin(pane));
     let undo = sheets.undo_manager(undo_options());
-    SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()] = Some(Session { store_id, node_id, doc, sheets, undo }));
+    SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()] = Some(Session { store_id, node_id, doc, sheets, undo, in_text }));
     let state = store.pane(pane);
     let ui = state.sheet_ui;
     ui.editing.set(None);
     ui.selected.set(None);
     ui.column_form.set(None);
     ui.message.set(None);
-    state.sheet.set(Some(ActiveEdit { store_id, node_id }));
-    if first {
-        store.send(BackendCommand::SubscribeNodeChanges { store_id, node_id });
+    if !in_text {
+        state.sheet.set(Some(ActiveEdit { store_id, node_id }));
+        if first {
+            store.send(BackendCommand::SubscribeNodeChanges { store_id, node_id });
+        }
     }
     request_reconcile(store, pane);
     recompute(store, pane);
+    if in_text {
+        in_text::text_changed(pane);
+    }
 }
 
 /// Stop showing pane `pane`'s sheet, if it shows one: the node cache gets the
@@ -238,13 +287,48 @@ pub(crate) fn stop(store: AppStore, pane: PaneId) {
     let state = store.pane(pane);
     if let Some(sig) = store.get_node_signal(session.store_id, session.node_id) {
         let bytes = session.doc.save();
-        sig.update(|node| node.content = bytes);
+        if session.in_text {
+            // The editor wrote its copy first: this one is merged into it.
+            sig.update(|node| node.content = merged(&node.content, &bytes));
+        } else {
+            sig.update(|node| node.content = bytes);
+        }
     }
-    state.sheet.set(None);
     state.sheet_ui.tables.set(Vec::new());
     state.sheet_ui.editing.set(None);
+    state.sheet_ui.embedded.set(Vec::new());
+    if session.in_text {
+        return;
+    }
+    state.sheet.set(None);
     if !store.is_editing(session.store_id, session.node_id) {
         store.send(BackendCommand::UnsubscribeNodeChanges { store_id: session.store_id, node_id: session.node_id });
+    }
+}
+
+/// `ours` merged into the document `cached` (either may be empty).
+fn merged(cached: &[u8], ours: &[u8]) -> Vec<u8> {
+    if cached.is_empty() {
+        return ours.to_vec();
+    }
+    match NodeDoc::load(cached) {
+        Ok(mut doc) => match doc.apply_update(ours) {
+            Ok(_) => doc.save(),
+            Err(_) => ours.to_vec(),
+        },
+        Err(_) => ours.to_vec(),
+    }
+}
+
+/// An edit typed in an editor of this window holding note `node_id`: the
+/// sessions holding the note's sheets take it too (nothing to recompute
+/// unless it touched the tables).
+pub(crate) fn text_delta(store: AppStore, store_id: StoreId, node_id: NodeId, delta: &[u8]) {
+    for pane in panes_holding(store_id, node_id) {
+        let data = with_session(pane, |s| s.doc.apply_update(delta).map(|e| e.data).unwrap_or(false)).unwrap_or(false);
+        if data {
+            recompute(store, pane);
+        }
     }
 }
 
@@ -257,7 +341,7 @@ pub(crate) fn request_reconcile(store: AppStore, pane: PaneId) {
 
 /// Every sheet pane holding the node asks again (the connection came back).
 pub(crate) fn request_reconcile_all(store: AppStore, store_id: StoreId, node_id: NodeId) {
-    for pane in store.panes_sheeting(store_id, node_id) {
+    for pane in panes_holding(store_id, node_id) {
         request_reconcile(store, pane);
     }
 }
@@ -266,7 +350,7 @@ pub(crate) fn request_reconcile_all(store: AppStore, store_id: StoreId, node_id:
 /// the node, then what the server lacks goes back.
 pub(crate) fn apply_reconcile(store: AppStore, store_id: StoreId, node_id: NodeId, diff: &[u8], server_state_vector: &[u8]) {
     let writable = store.node_access(store_id, node_id).allows_write();
-    for pane in store.panes_sheeting(store_id, node_id) {
+    for pane in panes_holding(store_id, node_id) {
         let ours = with_session(pane, |s| {
             if !diff.is_empty() {
                 if let Err(e) = s.doc.apply_update(diff) {
@@ -289,7 +373,7 @@ pub(crate) fn apply_reconcile(store: AppStore, store_id: StoreId, node_id: NodeI
 
 /// A peer's update of a node: applied in every pane holding it as a sheet.
 pub(crate) fn apply_remote(store: AppStore, store_id: StoreId, node_id: NodeId, bytes: &[u8]) {
-    for pane in store.panes_sheeting(store_id, node_id) {
+    for pane in panes_holding(store_id, node_id) {
         apply_to(store, pane, store_id, node_id, bytes);
     }
     // A formula elsewhere may read this node.
@@ -339,10 +423,14 @@ fn encode(bytes: &[u8]) -> String {
 /// every other pane of this window holding the sheet, a turn later.
 fn send_update(store: AppStore, from: PaneId, store_id: StoreId, node_id: NodeId, bytes: Vec<u8>) {
     store.send(BackendCommand::BroadcastChanges { store_id, node_id, changes: encode(&bytes) });
-    let others: Vec<PaneId> = store.panes_sheeting(store_id, node_id).into_iter().filter(|p| *p != from).collect();
+    let others: Vec<PaneId> = panes_holding(store_id, node_id).into_iter().filter(|p| *p != from).collect();
     let deliver = move || {
         for other in others {
             apply_to(store, other, store_id, node_id, &bytes);
+        }
+        // The note's text is open in editors here: their documents take it.
+        for pane in store.panes_editing(store_id, node_id) {
+            crate::editor::editor(pane).collab_receive(&bytes);
         }
         recompute_others(store, store_id, node_id);
     };
@@ -749,12 +837,15 @@ fn next_table_name(snap: &SheetsSnap, base: &str) -> String {
 pub(crate) fn add_table(store: AppStore, pane: PaneId) {
     let Some(snap) = snapshot(pane) else { return };
     let name = next_table_name(&snap, "Table");
-    local_edit(store, pane, |t| {
-        let table = t.create_table(&name, Placement::Last)?;
-        t.add_column(&table, "name", ColumnType::Text, Placement::Last)?;
-        t.add_column(&table, "amount", ColumnType::Number, Placement::Last)?;
-        Ok(())
-    });
+    local_edit(store, pane, |t| new_table(t, &name));
+}
+
+/// A new plain table named `name`, with a text and a number column.
+fn new_table(t: &mut doc::SheetsTxn<'_, '_>, name: &str) -> doc::Result<String> {
+    let table = t.create_table(name, Placement::Last)?;
+    t.add_column(&table, "name", ColumnType::Text, Placement::Last)?;
+    t.add_column(&table, "amount", ColumnType::Number, Placement::Last)?;
+    Ok(table)
 }
 
 /// A summary of the first plain table: grouped by its first link column (or
@@ -814,7 +905,18 @@ pub(crate) fn rename_table(store: AppStore, pane: PaneId, table: &str, text: &st
     local_edit(store, pane, |t| t.rename_table(table, &name));
 }
 
+/// A table's "×": in a sheet node the table goes; in text its atom leaves
+/// the text and the table is listed under it ([`in_text::remove_embeds`]).
 pub(crate) fn delete_table(store: AppStore, pane: PaneId, table: &str) {
+    if holds_text(pane) {
+        in_text::remove_embeds(pane, table);
+    } else {
+        discard_table(store, pane, table);
+    }
+}
+
+/// Delete a table and everything in it.
+pub(crate) fn discard_table(store: AppStore, pane: PaneId, table: &str) {
     local_edit(store, pane, |t| t.delete_table(table));
 }
 
@@ -944,6 +1046,29 @@ fn end_typing() {
     if TYPING.with(|t| t.take()).is_some() {
         rinch::core::clear_keyboard_interceptor();
     }
+}
+
+/// A key pressed in one of pane `pane`'s tables in text, which the editor
+/// offers its node view before anything else (the keyboard interceptor a
+/// sheet node's typing uses never hears it): what typing in a cell or in a
+/// one-line field does with it, a turn later. `true` when it was used.
+pub(crate) fn key_in_table(store: AppStore, pane: PaneId, key: &str) -> bool {
+    if TYPING.with(Cell::get) == Some(pane) {
+        if key == "Escape" && untracked(|| store.pane(pane).sheet_ui.choice.get()).is_none() {
+            // The edit is dropped and, the cell's input gone, the keyboard
+            // goes back to the text after the table: rinch does that with
+            // an Escape the view leaves.
+            cancel(store, pane);
+            return false;
+        }
+        if !matches!(key, "Enter" | "Tab" | "Escape" | "ArrowUp" | "ArrowDown") {
+            return false;
+        }
+        let key = key.to_string();
+        let _ = set_timeout(0, move || typing_key(store, pane, &key));
+        return true;
+    }
+    ui::field_key(store, pane, key)
 }
 
 /// Where typing goes after a commit.
