@@ -1682,6 +1682,8 @@ impl AppStore {
             // So does a note a sheet's formulas read (docs/SHEETS_CONTRACT.md
             // section 7).
             || crate::sheets::reads::holds(store_id, node_id)
+            // And a sheet node embedded in a note's text.
+            || crate::sheets::embed_holds(store_id, node_id)
     }
 
     /// Every node some pane holds (a document in its editor, a board or a

@@ -338,6 +338,9 @@ impl Pimble {
     /// after it under "Tables no longer in the text" (`None` when there are
     /// none).
     pub(super) async fn tables_in_text(&self, client: &PimbleClient, addr: Addr, node: &Node, markdown: &str) -> (String, Option<String>) {
+        // Sheet nodes the text embeds, rendered where they are.
+        let markdown = self.embedded_sheet_nodes(client, markdown).await;
+        let markdown = markdown.as_str();
         if sheets_of(node).tables.is_empty() {
             return (markdown.to_string(), None);
         }
@@ -363,6 +366,30 @@ impl Pimble {
         let lost: Vec<String> = work.snap().tables.iter().filter(|t| !shown.contains(&t.id)).map(|t| t.id.clone()).collect();
         let rest = (!lost.is_empty()).then(|| lost.iter().map(|id| render(id) + "\n").collect::<String>());
         (out, rest)
+    }
+
+    /// `markdown` with each embedded sheet node (an embed with `data-node`
+    /// and `data-kind="sheet"`) replaced by its tables, under its title.
+    async fn embedded_sheet_nodes(&self, client: &PimbleClient, markdown: &str) -> String {
+        let mut out = String::new();
+        for line in markdown.split_inclusive('\n') {
+            let Some(url) = embedded_sheet_node(line) else {
+                out.push_str(line);
+                continue;
+            };
+            let at = Addr { store: url.store, node: url.node };
+            match client.get_node(at.store, at.node).await {
+                Ok(n) => {
+                    let mut book = load_book(client, at, &n, &[]).await;
+                    let rendered = NodeDoc::load(&n.content)
+                        .map(|doc| ops::render_all(&Work::new(Sheets::of_node(&doc), &mut book), NODE_ROWS))
+                        .unwrap_or_default();
+                    out.push_str(&format!("(the sheet node {} is shown here, {})\n{rendered}", label(&n), at.link()));
+                }
+                Err(e) => out.push_str(&format!("(a sheet node shown here could not be read: {e})\n")),
+            }
+        }
+        out
     }
 
     /// The tables of a node as get_node shows them, after its content.
@@ -404,6 +431,17 @@ async fn walk_store(client: &PimbleClient, store: &Store) -> Vec<(Addr, Node, St
 /// its element).
 fn embed_markdown(id: &str) -> String {
     format!("<div data-pm-type=\"embed\" {SHEET_ATTR}=\"{id}\"></div>\n")
+}
+
+/// The sheet node a Markdown line's embed atom shows, if the line is one.
+fn embedded_sheet_node(line: &str) -> Option<pimble_core::PimbleUrl> {
+    let line = line.trim();
+    if !line.starts_with("<div") || !line.contains("data-pm-type=\"embed\"") || !line.contains("data-kind=\"sheet\"") {
+        return None;
+    }
+    let (_, rest) = line.split_once("data-node=\"")?;
+    let (url, _) = rest.split_once('"')?;
+    pimble_core::PimbleUrl::parse(url)
 }
 
 /// The table a Markdown line's embed atom names, if the line is one.

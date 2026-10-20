@@ -549,6 +549,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 crate::text_boards::reconnected(store);
                 // And the notes sheets read.
                 crate::sheets::reads::reconnected(store);
+                crate::sheets::embeds_reconnected(store);
 
                 // Whether the server's keystore holds a signed-in account
                 // (a sign-in survives an app restart), for the status bar

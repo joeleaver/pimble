@@ -253,7 +253,7 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
                     span { class: "pimble-sheet__note", {note} }
                 }
                 span { class: "pimble-sheet__count", {rows_label} }
-                if holds_text(pane) {
+                if holds_text(pane) && is_own_table(pane, &id_convert) {
                     button {
                         class: "pimble-sheet__delete-table",
                         title: "Move this table to a sheet node of its own, under this note",

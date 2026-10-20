@@ -658,7 +658,9 @@ impl NodeDoc {
     /// An update setting field `name` (exactly as named; `None` removes it)
     /// of a node whose document the caller does not hold: made on a blank
     /// document, it merges into the node's own, since the `node` root is a
-    /// root of every node document.
+    /// root of every node document. Only for a field the node does not have
+    /// yet: over an existing value it merges as concurrent with it, and either
+    /// may win. To change a value, `set_field` on a copy of the document.
     pub fn field_update(name: &str, value: Option<&str>) -> Vec<u8> {
         let doc = Doc::new();
         let node = doc.get_or_insert_map(ROOT_NODE);

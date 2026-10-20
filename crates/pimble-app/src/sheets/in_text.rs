@@ -19,25 +19,48 @@ use crate::rinch_editor::{EditorKey, NodeViewCtx, NodeViewRegistration, NodeView
 /// keeps and merges per attribute; rinch knows nothing of what it means).
 pub(crate) const SHEET_ATTR: &str = "data-sheet";
 
+/// The embed attributes naming a sheet node shown in the text (contract
+/// section 1, "a sheet node embedded"): the node as a `pimble:` link, which
+/// any reader of the content counts as a link to it; its kind, which says
+/// this view draws it; and optionally the one table shown.
+pub(crate) const NODE_ATTR: &str = "data-node";
+pub(crate) const KIND_ATTR: &str = "data-kind";
+pub(crate) const KIND_SHEET: &str = "sheet";
+pub(crate) const TABLE_ATTR: &str = "data-table";
+pub(crate) const TITLE_ATTR: &str = "data-title";
+
+/// The sheet node an embed's attributes name, if they name one.
+fn embedded_node(attrs: &Attrs) -> Option<(StoreId, NodeId)> {
+    if attrs.get_str(KIND_ATTR) != Some(KIND_SHEET) {
+        return None;
+    }
+    let url = pimble_core::PimbleUrl::parse(attrs.get_str(NODE_ATTR)?)?;
+    Some((url.store, url.node))
+}
+
 /// Insert > "Sheet" with no note to put it in.
 const NO_NOTE: &str = "Open a note to put a table in it.";
 
 thread_local! {
     /// Each pane's editor's node view, registered once for the editor's life.
-    static REGISTERED: RefCell<[Option<NodeViewRegistration>; MAX_PANES]> = const { RefCell::new([None, None, None, None]) };
+    static REGISTERED: RefCell<[Vec<NodeViewRegistration>; MAX_PANES]> = const { RefCell::new([Vec::new(), Vec::new(), Vec::new(), Vec::new()]) };
 }
 
 /// Draw sheets in pane `pane`'s editor (once per editor; the editors live as
 /// long as the window).
 pub(crate) fn register(store: AppStore, pane: PaneId) {
-    if REGISTERED.with(|r| r.borrow()[pane.index()].is_some()) {
+    if REGISTERED.with(|r| !r.borrow()[pane.index()].is_empty()) {
         return;
     }
-    let spec = NodeViewSpec::new("embed", move |__scope: &mut RenderScope, ctx: NodeViewCtx| render_embed(__scope, store, pane, ctx))
+    let own = NodeViewSpec::new("embed", move |__scope: &mut RenderScope, ctx: NodeViewCtx| render_embed(__scope, store, pane, ctx))
         .matches(|attrs: &Attrs| attrs.get_str(SHEET_ATTR).is_some_and(|id| !id.is_empty()))
         .on_key(move |key: &EditorKey<'_>| key_in_view(store, pane, key));
-    let registration = crate::editor::editor(pane).register_node_view(spec);
-    REGISTERED.with(|r| r.borrow_mut()[pane.index()] = Some(registration));
+    let node = NodeViewSpec::new("embed", move |__scope: &mut RenderScope, ctx: NodeViewCtx| render_node_embed(__scope, store, pane, ctx))
+        .matches(|attrs: &Attrs| embedded_node(attrs).is_some())
+        .on_key(move |key: &EditorKey<'_>| key_in_view(store, pane, key));
+    let handle = crate::editor::editor(pane);
+    let registrations = vec![handle.register_node_view(own), handle.register_node_view(node)];
+    REGISTERED.with(|r| r.borrow_mut()[pane.index()] = registrations);
 }
 
 /// The tables of pane `pane` named `id` (one, or none before it arrives).
@@ -64,6 +87,140 @@ fn render_embed(__scope: &mut RenderScope, store: AppStore, pane: PaneId, ctx: N
             }
         }
     }
+}
+
+/// The tables of sheet node `node` that pane `pane` holds, or its one
+/// table `only`.
+fn node_tables(ui: SheetUi, node: (StoreId, NodeId), only: Option<String>) -> Vec<TableView> {
+    ui.tables.get().into_iter().filter(|t| t.node == node && only.as_ref().is_none_or(|o| *o == t.id)).collect()
+}
+
+/// A sheet node embedded in the text: its title (a link to it) over its
+/// tables, edited as the node's own.
+fn render_node_embed(__scope: &mut RenderScope, store: AppStore, pane: PaneId, ctx: NodeViewCtx) -> NodeHandle {
+    let ui = store.pane(pane).sheet_ui;
+    let attrs = ctx.attrs;
+    let node = move || embedded_node(&attrs.get());
+    let only = move || attrs.get().get_str(TABLE_ATTR).filter(|t| !t.is_empty()).map(str::to_string);
+    let title = move || match node() {
+        Some((s, n)) if store.get_node_signal(s, n).is_some() => store.display_label(s, n),
+        _ => attrs.get().get_str(TITLE_ATTR).unwrap_or("Sheet").to_string(),
+    };
+    let open = move || {
+        if let Some(href) = untracked(|| attrs.get()).get_str(NODE_ATTR).map(str::to_string) {
+            crate::links::follow_href(store, &href);
+        }
+    };
+    let tables = move || node().map(|n| node_tables(ui, n, only())).unwrap_or_default();
+    rsx! {
+        div {
+            class: "pimble-sheet pimble-sheet--in-text pimble-sheet--embedded",
+            onmousedown: move || crate::pane_view::press_in_view(),
+            div {
+                class: "pimble-sheet__embed-title",
+                title: "Open this sheet",
+                onclick: open,
+                {move || title()}
+            }
+            for table in tables() {
+                div {
+                    key: format!("{}:{}", table.id, table.version),
+                    {super::ui::table_node(__scope, store, pane, table.clone())}
+                }
+            }
+            if tables().is_empty() {
+                div { class: "pimble-sheet__empty", "This sheet has not arrived yet, or was deleted." }
+            }
+        }
+    }
+}
+
+/// The sheet nodes pane `pane`'s text embeds, each once, in document order.
+pub(crate) fn embedded_nodes(pane: PaneId) -> Vec<(StoreId, NodeId)> {
+    let doc = crate::editor::editor(pane).doc();
+    let mut out = Vec::new();
+    doc.nodes_between(0, doc.content_size(), &mut |node, _, _| {
+        if node.type_name() == "embed" {
+            if let Some(n) = embedded_node(node.attrs()) {
+                if !out.contains(&n) {
+                    out.push(n);
+                }
+            }
+        }
+        !node.is_textblock()
+    });
+    out
+}
+
+/// The attributes of an embed of sheet node `(store_id, node_id)`.
+pub(crate) fn node_embed_attrs(store: AppStore, store_id: StoreId, node_id: NodeId) -> Attrs {
+    Attrs::new()
+        .with(NODE_ATTR, pimble_core::PimbleUrl::node(store_id, node_id).to_string())
+        .with(KIND_ATTR, KIND_SHEET)
+        .with(TITLE_ATTR, store.display_label(store_id, node_id))
+}
+
+/// Insert > "Sheet from a Node...": the picker, sheet nodes only; the pick
+/// goes in at the caret, shown live.
+pub fn insert_sheet_node(store: AppStore) {
+    let pane = store.focused();
+    let Some(active) = untracked(|| store.pane(pane).active_edit.get()) else {
+        crate::events::show_notice(store, NO_NOTE.to_string());
+        return;
+    };
+    if !store.node_access(active.store_id, active.node_id).allows_write() {
+        crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
+        return;
+    }
+    let handle = crate::editor::editor(pane);
+    let at = handle.selection().from().0;
+    let (x, y) = handle.caret_rect(handle.selection().head()).map(|r| (r.x, r.y + r.height + 4.0)).unwrap_or((40.0, 80.0));
+    crate::link_picker::open(store, crate::link_picker::PickerKind::Sheet { at }, x, y);
+    handle.focus();
+}
+
+/// Sheet node `(store_id, node_id)` embedded in pane `pane`'s text at
+/// `from..to` (a query typed there goes), with a paragraph after it when it
+/// ends the text.
+pub(crate) fn insert_node_embed(store: AppStore, pane: PaneId, store_id: StoreId, node_id: NodeId, range: Option<(usize, usize)>) -> bool {
+    let handle = crate::editor::editor(pane);
+    if let Some((from, to)) = range.filter(|(f, t)| t > f) {
+        handle.update(move |state| {
+            let mut tr = state.tr();
+            tr.delete(from, to).ok()?;
+            Some(tr)
+        });
+    }
+    handle.focus();
+    let ok = handle.insert_embed(node_embed_attrs(store, store_id, node_id));
+    if ok {
+        paragraph_after(pane);
+    }
+    text_changed(pane);
+    ok
+}
+
+/// Every embed of sheet node `(s, n)` leaves pane `pane`'s text (the node
+/// keeps its tables).
+pub(crate) fn remove_node_embeds(pane: PaneId, s: StoreId, n: NodeId) {
+    crate::editor::editor(pane).update(|state| {
+        let mut at = Vec::new();
+        state.doc.nodes_between(0, state.doc.content_size(), &mut |node, pos, _| {
+            if node.type_name() == "embed" && embedded_node(node.attrs()) == Some((s, n)) {
+                at.push((pos, node.node_size()));
+            }
+            !node.is_textblock()
+        });
+        if at.is_empty() {
+            return None;
+        }
+        let mut tr = state.tr();
+        for (pos, size) in at.into_iter().rev() {
+            tr.delete(pos, pos + size).ok()?;
+        }
+        Some(tr)
+    });
+    text_changed(pane);
 }
 
 /// A key while the keyboard is in a table (an input of it): typing's own
@@ -113,6 +270,32 @@ pub(crate) fn text_changed(pane: PaneId) {
     if untracked(|| ui.embedded.get()) != ids {
         ui.embedded.set(ids);
     }
+    // The sheet nodes it embeds: held while shown (a turn later, as this
+    // runs inside the editor's change).
+    let nodes = embedded_nodes(pane);
+    let changed = EMBEDDED_NODES.with(|e| {
+        let mut e = e.borrow_mut();
+        let changed = e[pane.index()] != nodes;
+        e[pane.index()] = nodes;
+        changed
+    });
+    if changed {
+        #[cfg(test)]
+        super::sync_embeds(store);
+        #[cfg(not(test))]
+        let _ = set_timeout(0, move || super::sync_embeds(store));
+    }
+}
+
+/// Pane `pane`'s session stopped: what its text embedded is unknown again,
+/// so the next look holds it afresh.
+pub(crate) fn forget(pane: PaneId) {
+    EMBEDDED_NODES.with(|e| e.borrow_mut()[pane.index()].clear());
+}
+
+thread_local! {
+    /// Per pane, the sheet nodes its text embedded at the last look.
+    static EMBEDDED_NODES: RefCell<[Vec<(StoreId, NodeId)>; MAX_PANES]> = const { RefCell::new([Vec::new(), Vec::new(), Vec::new(), Vec::new()]) };
 }
 
 /// Insert > "Sheet": a new table in the focused pane's note, at the caret.
@@ -129,6 +312,7 @@ pub fn insert_sheet(store: AppStore) {
     if !holds_text(pane) {
         return;
     }
+    aim(pane, None);
     let Some(snap) = snapshot(pane) else { return };
     let name = next_table_name(&snap, "Table");
     let Some(id) = local_edit(store, pane, |t| new_table(t, &name)) else { return };
@@ -148,7 +332,15 @@ fn put_in(pane: PaneId, table: &str) -> bool {
     if !handle.insert_embed(Attrs::new().with(SHEET_ATTR, table)) {
         return false;
     }
-    handle.update(|state| {
+    paragraph_after(pane);
+    true
+}
+
+/// A paragraph after the text's last block when that is an embed: Escape
+/// out of an embed puts the caret there, and with nothing after it the
+/// embed itself would be selected and the next key typed over it.
+fn paragraph_after(pane: PaneId) {
+    crate::editor::editor(pane).update(|state| {
         let doc = &state.doc;
         let last = doc.child_count().checked_sub(1).map(|i| doc.child(i))?;
         if last.type_name() != "embed" {
@@ -161,7 +353,6 @@ fn put_in(pane: PaneId, table: &str) -> bool {
         tr.set_selection(rinch_editor_core::Selection::cursor(rinch_editor_core::Pos(end + 1)));
         Some(tr)
     });
-    true
 }
 
 /// The table's "×" in text: its atom leaves the text (one undo step of the
@@ -195,9 +386,10 @@ fn put_back(pane: PaneId, table: &str) {
 }
 
 /// The tables of pane `pane`'s note that its text does not show.
-fn lost_tables(ui: SheetUi) -> Vec<(String, String)> {
+fn lost_tables(ui: SheetUi, pane: PaneId) -> Vec<(String, String)> {
     let shown = ui.embedded.get();
-    ui.tables.get().into_iter().filter(|t| !shown.contains(&t.id)).map(|t| (t.id, t.name)).collect()
+    // The note's own tables only: an embedded sheet node's are its node's.
+    ui.tables.get().into_iter().filter(|t| !shown.contains(&t.id) && is_own_table(pane, &t.id)).map(|t| (t.id, t.name)).collect()
 }
 
 /// "Tables no longer in the text", under pane `pane`'s text.
@@ -207,9 +399,9 @@ pub(crate) fn render_lost(__scope: &mut RenderScope, store: AppStore, pane: Pane
     rsx! {
         div {
             class: "pimble-sheet-lost",
-            style: {move || if state.show_editor.get() && !lost_tables(ui).is_empty() { "" } else { "display: none;" }},
+            style: {move || if state.show_editor.get() && !lost_tables(ui, pane).is_empty() { "" } else { "display: none;" }},
             span { class: "pimble-sheet-lost__title", "Tables no longer in the text:" }
-            for (id, name) in lost_tables(ui) {
+            for (id, name) in lost_tables(ui, pane) {
                 span {
                     key: id.clone(),
                     class: "pimble-sheet-lost__item",
@@ -264,6 +456,7 @@ thread_local! {
 /// holding the table, ids kept; when it is made, the table's place in the
 /// text becomes a link to it and the table leaves the note.
 pub(crate) fn convert_to_sheet_node(store: AppStore, pane: PaneId, table: &str) {
+    aim(pane, None);
     let Some((store_id, node_id)) = with_session(pane, |s| (s.store_id, s.node_id)) else { return };
     if !store.node_access(store_id, node_id).allows_write() {
         say(store, pane, pimble_core::StoreAccess::READ_ONLY_REFUSAL);
@@ -316,8 +509,8 @@ pub(crate) fn node_created(store: AppStore, request: u64, store_id: StoreId, nod
         crate::events::show_notice(store, "The note was closed before the sheet node was made; the table is in both.".to_string());
         return;
     }
-    let href = pimble_core::PimbleUrl::node(store_id, node_id).to_string();
-    let (table, title) = (job.table.clone(), job.title.clone());
+    let embed_attrs = node_embed_attrs(store, store_id, node_id).with(TITLE_ATTR, job.title.as_str());
+    let table = job.table.clone();
     crate::editor::editor(job.pane).update(move |state| {
         let mut at = Vec::new();
         state.doc.nodes_between(0, state.doc.content_size(), &mut |node, pos, _| {
@@ -329,13 +522,12 @@ pub(crate) fn node_created(store: AppStore, request: u64, store_id: StoreId, nod
         if at.is_empty() {
             return None;
         }
-        let schema = state.schema();
-        let link = rinch_editor_core::Mark::new(schema.mark_type("link")?.clone(), Attrs::new().with("href", href.as_str()));
-        let text = schema.text_with_marks(&title, vec![link]).ok()?;
-        let paragraph = schema.create_node("paragraph", Attrs::new(), rinch_editor_core::Fragment::from_node(text)).ok()?;
+        // In its place, the sheet node it now is, shown live (as "Convert to
+        // Image Node" leaves an embed of the image node).
+        let embed = state.schema().create_node("embed", embed_attrs, rinch_editor_core::Fragment::empty()).ok()?;
         let mut tr = state.tr();
         for (pos, size) in at.into_iter().rev() {
-            tr.replace_with(pos, pos + size, rinch_editor_core::Fragment::from_node(paragraph.clone())).ok()?;
+            tr.replace_with(pos, pos + size, rinch_editor_core::Fragment::from_node(embed.clone())).ok()?;
         }
         Some(tr)
     });
@@ -343,6 +535,7 @@ pub(crate) fn node_created(store: AppStore, request: u64, store_id: StoreId, nod
     let rest: Vec<pimble_sheet::TableSnap> = snapshot(job.pane)
         .map(|s| s.tables.into_iter().filter(|t| t.id != job.table).collect())
         .unwrap_or_default();
+    aim(job.pane, None);
     local_edit(store, job.pane, |t| {
         t.delete_table(&job.table)?;
         for table in &rest {
@@ -408,7 +601,7 @@ mod tests {
         assert_eq!(ids.len(), 1);
         assert_eq!(embedded_ids(P[0]), ids, "the atom names the table");
         assert_eq!(untracked(|| store.pane(P[0]).sheet_ui.embedded.get()), ids);
-        assert!(untracked(|| lost_tables(store.pane(P[0]).sheet_ui)).is_empty());
+        assert!(untracked(|| lost_tables(store.pane(P[0]).sheet_ui, P[0])).is_empty());
         let sent: Vec<BackendCommand> = commands.try_iter().collect();
         assert!(broadcasts(&sent, node_id) >= 2, "the table and the atom both travel");
         crate::editor::stop_editing(store, P[0]);
@@ -455,16 +648,16 @@ mod tests {
         delete_table(store, P[0], &id);
         assert!(embedded_ids(P[0]).is_empty());
         assert_eq!(table_ids(P[0]), vec![id.clone()], "the table stays");
-        assert_eq!(untracked(|| lost_tables(ui)).into_iter().map(|(i, _)| i).collect::<Vec<_>>(), vec![id.clone()]);
+        assert_eq!(untracked(|| lost_tables(ui, P[0])).into_iter().map(|(i, _)| i).collect::<Vec<_>>(), vec![id.clone()]);
 
         put_back(P[0], &id);
         assert_eq!(embedded_ids(P[0]), vec![id.clone()]);
-        assert!(untracked(|| lost_tables(ui)).is_empty());
+        assert!(untracked(|| lost_tables(ui, P[0])).is_empty());
 
         delete_table(store, P[0], &id);
         discard_table(store, P[0], &id);
         assert!(table_ids(P[0]).is_empty());
-        assert!(untracked(|| lost_tables(ui)).is_empty());
+        assert!(untracked(|| lost_tables(ui, P[0])).is_empty());
     }
 
     /// "Convert to Sheet Node": a sheet node under the note with the table
@@ -497,14 +690,7 @@ mod tests {
         node_created(store, request, store_id, new_node);
         assert!(embedded_ids(P[0]).is_empty());
         assert!(table_ids(P[0]).is_empty(), "the note no longer holds it");
-        let href = pimble_core::PimbleUrl::node(store_id, new_node).to_string();
-        let mut linked = false;
-        let doc = crate::editor::editor(P[0]).doc();
-        doc.nodes_between(0, doc.content_size(), &mut |node, _, _| {
-            linked |= node.marks().iter().any(|m| m.attrs.get_str("href") == Some(href.as_str()));
-            true
-        });
-        assert!(linked, "its place in the text links to the sheet node");
+        assert_eq!(embedded_nodes(P[0]), vec![(store_id, new_node)], "its place in the text shows the sheet node");
 
         // Two tables, one linking to the other: neither moves.
         insert_sheet(store);
@@ -563,7 +749,7 @@ mod tests {
         crate::sheets::apply_remote(store, store_id, node_id, &bytes);
         assert_eq!(embedded_ids(P[0]), vec![id.clone()]);
         assert_eq!(untracked(|| store.pane(P[0]).sheet_ui.embedded.get()), vec![id]);
-        assert!(untracked(|| lost_tables(store.pane(P[0]).sheet_ui)).is_empty());
+        assert!(untracked(|| lost_tables(store.pane(P[0]).sheet_ui, P[0])).is_empty());
     }
 
     /// A link-to-a-node column under a parent: typing a name that is not
@@ -706,5 +892,53 @@ mod tests {
         let cell = &t.rows[0].cells[i];
         assert_eq!(cell.text, "#REF!");
         assert!(cell.error.as_deref().is_some_and(|e| e.contains("deleted")), "{:?}", cell.error);
+    }
+
+    /// A sheet node embedded in a note (contract section 1): held while the
+    /// text shows it, its tables drawn among the pane's, an edit of them an
+    /// edit of the sheet node (reaching a pane that shows that node), and let
+    /// go when the embed leaves the text.
+    #[test]
+    fn an_embedded_sheet_node_is_held_shown_and_edited_as_itself() {
+        let (store, commands) = store_with_commands();
+        let store_id = StoreId::new();
+        let (sheet, s_table, s_col, _) = cached_note(store, store_id, "Rates", &[10.0]);
+        if let Some(sig) = store.get_node_signal(store_id, sheet) {
+            sig.update(|n| n.node_type = pimble_core::node_types::SHEET.to_string());
+        }
+        let note = NodeId::new();
+        crate::editor::start_editing(store, P[0], store_id, note, &[]);
+        let content = untracked(|| store.get_node_signal(store_id, sheet).unwrap().with(|n| n.content.clone()));
+        crate::sheets::start(store, P[1], store_id, sheet, &content);
+        let _ = commands.try_iter().count();
+
+        assert!(insert_node_embed(store, P[0], store_id, sheet, None));
+        assert_eq!(embedded_nodes(P[0]), vec![(store_id, sheet)]);
+        assert!(untracked(|| lost_tables(store.pane(P[0]).sheet_ui, P[0])).is_empty(), "its tables are not the note's lost ones");
+        assert!(embed_holds(store_id, sheet));
+        let tables = untracked(|| store.pane(P[0]).sheet_ui.tables.get());
+        assert!(tables.iter().any(|t| t.id == s_table && t.node == (store_id, sheet)), "its table is among the pane's");
+        assert!(!is_own_table(P[0], &s_table));
+
+        // Typing in its table edits the sheet node.
+        let _ = commands.try_iter().count();
+        let row = Sheets::of_node(&NodeDoc::load(&content).unwrap()).read().tables[0].rows[0].id.clone();
+        cell_pressed(store, P[0], CellKey { table: s_table.clone(), row: Some(row), col: s_col.clone() });
+        typed(store, P[0], "12".into());
+        typing_key(store, P[0], "Escape");
+        cell_pressed(store, P[0], CellKey { table: s_table.clone(), row: None, col: s_col.clone() });
+        typed(store, P[0], "5".into());
+        commit(store, P[0], Move::Stay);
+        let sent: Vec<BackendCommand> = commands.try_iter().collect();
+        assert!(sent.iter().any(|c| matches!(c, BackendCommand::BroadcastChanges { node_id, .. } if *node_id == sheet)), "an edit of the sheet node");
+        assert!(!sent.iter().any(|c| matches!(c, BackendCommand::BroadcastChanges { node_id, .. } if *node_id == note)), "not of the note");
+        let other = with_session(P[1], |s| s.sheets.read().tables[0].rows.len()).unwrap();
+        assert_eq!(other, 2, "the pane showing the sheet node has the new row");
+
+        // Out of the text: let go.
+        remove_node_embeds(P[0], store_id, sheet);
+        assert!(!embed_holds(store_id, sheet));
+        assert!(untracked(|| store.pane(P[0]).sheet_ui.tables.get()).iter().all(|t| t.node != (store_id, sheet)));
+        end_typing();
     }
 }

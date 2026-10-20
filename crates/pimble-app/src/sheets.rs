@@ -93,6 +93,9 @@ pub struct RowView {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableView {
     pub id: String,
+    /// The node it is a table of: the pane's own, or a sheet node its text
+    /// embeds.
+    pub node: (StoreId, NodeId),
     pub name: String,
     pub summary: bool,
     /// A summary's formula, shown with names.
@@ -194,6 +197,184 @@ thread_local! {
 
 fn with_session<R>(pane: PaneId, f: impl FnOnce(&mut Session) -> R) -> Option<R> {
     SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()].as_mut().map(f))
+}
+
+/// Where a table's document is held: a pane's own session (its note, or
+/// its sheet node), or the session of a sheet node embedded in this
+/// window's text, shared by every pane whose text shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Slot {
+    Pane(PaneId),
+    Embed(StoreId, NodeId),
+}
+
+/// A sheet node embedded in text: its document, and the panes showing it.
+struct Embedded {
+    session: Session,
+    panes: std::collections::HashSet<PaneId>,
+}
+
+thread_local! {
+    static EMBEDS: RefCell<HashMap<(StoreId, NodeId), Embedded>> = RefCell::new(HashMap::new());
+    /// Per pane, the slot its last table action named (a table of the
+    /// pane's own, or of a sheet node its text embeds): where edits, the
+    /// formula bar, undo and lookups of that pane go.
+    static AIM: RefCell<[Option<Slot>; MAX_PANES]> = const { RefCell::new([None, None, None, None]) };
+}
+
+fn with_slot<R>(slot: Slot, f: impl FnOnce(&mut Session) -> R) -> Option<R> {
+    match slot {
+        Slot::Pane(pane) => with_session(pane, f),
+        Slot::Embed(s, n) => EMBEDS.with(|e| e.borrow_mut().get_mut(&(s, n)).map(|x| f(&mut x.session))),
+    }
+}
+
+/// The panes showing a slot's tables.
+fn slot_panes(slot: Slot) -> Vec<PaneId> {
+    match slot {
+        Slot::Pane(pane) => vec![pane],
+        Slot::Embed(s, n) => EMBEDS.with(|e| e.borrow().get(&(s, n)).map(|x| x.panes.iter().copied().collect()).unwrap_or_default()),
+    }
+}
+
+/// The sheet nodes pane `pane`'s text embeds that this window holds.
+fn embeds_in(pane: PaneId) -> Vec<(StoreId, NodeId)> {
+    let mut out: Vec<(StoreId, NodeId)> = EMBEDS.with(|e| e.borrow().iter().filter(|(_, x)| x.panes.contains(&pane)).map(|(k, _)| *k).collect());
+    out.sort_by_key(|(s, n)| (s.0, n.0));
+    out
+}
+
+/// Aim pane `pane`'s table actions at the slot holding `table` (its own
+/// session for `None` or a table of its own).
+pub(crate) fn aim(pane: PaneId, table: Option<&str>) {
+    let slot = table
+        .filter(|t| !with_session(pane, |s| s.sheets.table(t).is_some()).unwrap_or(false))
+        .and_then(|t| embeds_in(pane).into_iter().find(|(s, n)| with_slot(Slot::Embed(*s, *n), |x| x.sheets.table(t).is_some()).unwrap_or(false)))
+        .map(|(s, n)| Slot::Embed(s, n))
+        .unwrap_or(Slot::Pane(pane));
+    AIM.with(|a| a.borrow_mut()[pane.index()] = Some(slot));
+}
+
+/// Where pane `pane`'s table actions go now.
+fn current(pane: PaneId) -> Slot {
+    let aimed = AIM.with(|a| a.borrow()[pane.index()]);
+    match aimed {
+        Some(slot @ Slot::Embed(s, n)) if embeds_in(pane).contains(&(s, n)) => slot,
+        _ => Slot::Pane(pane),
+    }
+}
+
+/// Whether `table` is a table of pane `pane`'s own node (not of a sheet
+/// node its text embeds).
+pub(crate) fn is_own_table(pane: PaneId, table: &str) -> bool {
+    with_session(pane, |s| s.sheets.table(table).is_some()).unwrap_or(false)
+}
+
+/// Every slot holding node `node_id`'s document in this window.
+fn holders(store_id: StoreId, node_id: NodeId) -> Vec<Slot> {
+    let mut out: Vec<Slot> = panes_holding(store_id, node_id).into_iter().map(Slot::Pane).collect();
+    if EMBEDS.with(|e| e.borrow().contains_key(&(store_id, node_id))) {
+        out.push(Slot::Embed(store_id, node_id));
+    }
+    out
+}
+
+/// The freshest copy of node `node_id`'s document this window holds as a
+/// sheet (a pane's, or an embed's), saved.
+pub(crate) fn held_copy(store_id: StoreId, node_id: NodeId) -> Option<Vec<u8>> {
+    holders(store_id, node_id).into_iter().find_map(|slot| with_slot(slot, |s| s.doc.save()))
+}
+
+/// Whether this window holds node `node_id` as a sheet embedded in text
+/// (counted with the panes holding nodes, `AppStore::is_editing`).
+pub(crate) fn embed_holds(store_id: StoreId, node_id: NodeId) -> bool {
+    EMBEDS.with(|e| e.borrow().contains_key(&(store_id, node_id)))
+}
+
+thread_local! {
+    /// Sheet nodes asked for (`GetNode`) to be embedded once they arrive.
+    static EMBED_ASKED: RefCell<std::collections::HashSet<(StoreId, NodeId)>> = RefCell::new(std::collections::HashSet::new());
+}
+
+/// The sheet nodes the panes' texts embed, held: a session opened for each
+/// newly embedded node (from the node cache, or a pane's copy; fetched first
+/// when not here), subscribed unless held already; and let go of when no
+/// text embeds it.
+pub(crate) fn sync_embeds(store: AppStore) {
+    let mut wanted: HashMap<(StoreId, NodeId), std::collections::HashSet<PaneId>> = HashMap::new();
+    for pane in PaneId::ALL {
+        if holds_text(pane) {
+            for node in in_text::embedded_nodes(pane) {
+                wanted.entry(node).or_default().insert(pane);
+            }
+        }
+    }
+    let mut touched: std::collections::HashSet<PaneId> = std::collections::HashSet::new();
+    // Let go of what no text embeds.
+    let gone: Vec<(StoreId, NodeId)> = EMBEDS.with(|e| e.borrow().keys().filter(|k| !wanted.contains_key(k)).copied().collect());
+    for key in gone {
+        let Some(x) = EMBEDS.with(|e| e.borrow_mut().remove(&key)) else { continue };
+        touched.extend(x.panes.iter().copied());
+        if let Some(sig) = store.get_node_signal(key.0, key.1) {
+            let bytes = x.session.doc.save();
+            sig.update(|node| node.content = merged(&node.content, &bytes));
+        }
+        if !store.is_editing(key.0, key.1) {
+            store.send(BackendCommand::UnsubscribeNodeChanges { store_id: key.0, node_id: key.1 });
+        }
+    }
+    for (key, panes) in wanted {
+        let held = EMBEDS.with(|e| {
+            let mut e = e.borrow_mut();
+            match e.get_mut(&key) {
+                Some(x) => {
+                    if x.panes != panes {
+                        touched.extend(x.panes.symmetric_difference(&panes).copied());
+                        x.panes = panes.clone();
+                    }
+                    true
+                }
+                None => false,
+            }
+        });
+        if held {
+            continue;
+        }
+        // A pane showing the sheet node has the freshest copy, then the cache.
+        let sibling = panes_holding(key.0, key.1).into_iter().find_map(|p| with_session(p, |s| s.doc.save()));
+        let cached = store.get_node_signal(key.0, key.1).map(|sig| untracked(|| sig.with(|n| n.content.clone()))).filter(|c| !c.is_empty());
+        let Some(bytes) = sibling.or(cached) else {
+            if EMBED_ASKED.with(|a| a.borrow_mut().insert(key)) {
+                store.send(BackendCommand::GetNode { store_id: key.0, node_id: key.1 });
+            }
+            continue;
+        };
+        EMBED_ASKED.with(|a| a.borrow_mut().remove(&key));
+        let Ok(doc) = NodeDoc::load(&bytes) else { continue };
+        let subscribe = !store.is_editing(key.0, key.1);
+        let sheets = Sheets::of_node(&doc).with_origin(format!("pimble-sheet-embed-{}", key.1));
+        let undo = sheets.undo_manager(undo_options());
+        let session = Session { store_id: key.0, node_id: key.1, doc, sheets, undo, in_text: false, reads: Vec::new() };
+        touched.extend(panes.iter().copied());
+        EMBEDS.with(|e| e.borrow_mut().insert(key, Embedded { session, panes }));
+        if subscribe {
+            store.send(BackendCommand::SubscribeNodeChanges { store_id: key.0, node_id: key.1 });
+        }
+        request_reconcile_slot(store, Slot::Embed(key.0, key.1));
+    }
+    for pane in touched {
+        recompute(store, pane);
+    }
+}
+
+/// The connection came back: every embedded sheet node is subscribed and
+/// reconciled again.
+pub(crate) fn embeds_reconnected(store: AppStore) {
+    let keys: Vec<(StoreId, NodeId)> = EMBEDS.with(|e| e.borrow().keys().copied().collect());
+    for (s, n) in keys {
+        store.send(BackendCommand::SubscribeNodeChanges { store_id: s, node_id: n });
+        request_reconcile_slot(store, Slot::Embed(s, n));
+    }
 }
 
 /// The panes holding node `node_id`'s tables, as a sheet node or in text.
@@ -304,8 +485,11 @@ pub(crate) fn stop(store: AppStore, pane: PaneId) {
     state.sheet_ui.tables.set(Vec::new());
     state.sheet_ui.editing.set(None);
     state.sheet_ui.embedded.set(Vec::new());
-    // What it read may be read by nothing now.
+    AIM.with(|a| a.borrow_mut()[pane.index()] = None);
+    in_text::forget(pane);
+    // What it read, or embedded, may be read or embedded by nothing now.
     reads::sync(store);
+    sync_embeds(store);
     if session.in_text {
         return;
     }
@@ -343,15 +527,19 @@ pub(crate) fn text_delta(store: AppStore, store_id: StoreId, node_id: NodeId, de
 
 /// Ask the server for what it has beyond pane `pane`'s copy of its sheet.
 pub(crate) fn request_reconcile(store: AppStore, pane: PaneId) {
-    if let Some((store_id, node_id, state_vector)) = with_session(pane, |s| (s.store_id, s.node_id, s.doc.state_vector())) {
+    request_reconcile_slot(store, Slot::Pane(pane));
+}
+
+fn request_reconcile_slot(store: AppStore, slot: Slot) {
+    if let Some((store_id, node_id, state_vector)) = with_slot(slot, |s| (s.store_id, s.node_id, s.doc.state_vector())) {
         store.send(BackendCommand::ReconcileNodeContent { store_id, node_id, state_vector });
     }
 }
 
-/// Every sheet pane holding the node asks again (the connection came back).
+/// Every sheet holding the node asks again (the connection came back).
 pub(crate) fn request_reconcile_all(store: AppStore, store_id: StoreId, node_id: NodeId) {
-    for pane in panes_holding(store_id, node_id) {
-        request_reconcile(store, pane);
+    for slot in holders(store_id, node_id) {
+        request_reconcile_slot(store, slot);
     }
 }
 
@@ -359,8 +547,8 @@ pub(crate) fn request_reconcile_all(store: AppStore, store_id: StoreId, node_id:
 /// the node, then what the server lacks goes back.
 pub(crate) fn apply_reconcile(store: AppStore, store_id: StoreId, node_id: NodeId, diff: &[u8], server_state_vector: &[u8]) {
     let writable = store.node_access(store_id, node_id).allows_write();
-    for pane in panes_holding(store_id, node_id) {
-        let ours = with_session(pane, |s| {
+    for slot in holders(store_id, node_id) {
+        let ours = with_slot(slot, |s| {
             if !diff.is_empty() {
                 if let Err(e) = s.doc.apply_update(diff) {
                     tracing::warn!("a sheet's reconcile did not apply: {e}");
@@ -376,7 +564,9 @@ pub(crate) fn apply_reconcile(store: AppStore, store_id: StoreId, node_id: NodeI
         if let Some(ours) = ours {
             store.send(BackendCommand::BroadcastChanges { store_id, node_id, changes: encode(&ours) });
         }
-        recompute(store, pane);
+        for pane in slot_panes(slot) {
+            recompute(store, pane);
+        }
     }
 }
 
@@ -384,15 +574,15 @@ pub(crate) fn apply_reconcile(store: AppStore, store_id: StoreId, node_id: NodeI
 pub(crate) fn apply_remote(store: AppStore, store_id: StoreId, node_id: NodeId, bytes: &[u8]) {
     // A note a sheet reads: its cached copy, which formulas read, takes it.
     reads::remote(store, store_id, node_id, bytes);
-    for pane in panes_holding(store_id, node_id) {
-        apply_to(store, pane, store_id, node_id, bytes);
+    for slot in holders(store_id, node_id) {
+        apply_to(store, slot, store_id, node_id, bytes);
     }
     // A formula elsewhere may read this node.
     recompute_others(store, store_id, node_id);
 }
 
-fn apply_to(store: AppStore, pane: PaneId, store_id: StoreId, node_id: NodeId, bytes: &[u8]) {
-    let applied = with_session(pane, |s| {
+fn apply_to(store: AppStore, slot: Slot, store_id: StoreId, node_id: NodeId, bytes: &[u8]) {
+    let applied = with_slot(slot, |s| {
         if (s.store_id, s.node_id) != (store_id, node_id) {
             return false;
         }
@@ -402,13 +592,19 @@ fn apply_to(store: AppStore, pane: PaneId, store_id: StoreId, node_id: NodeId, b
         true
     });
     if applied == Some(true) {
-        recompute(store, pane);
+        for pane in slot_panes(slot) {
+            recompute(store, pane);
+        }
     }
 }
 
 /// A node this window learned about (loaded, renamed): sheets whose formulas
 /// name nodes recompute.
 pub(crate) fn node_loaded(store: AppStore) {
+    // A sheet node a text embeds may be the one that arrived.
+    if EMBED_ASKED.with(|a| !a.borrow().is_empty()) {
+        sync_embeds(store);
+    }
     for pane in PaneId::ALL {
         if with_session(pane, |_| ()).is_some() {
             recompute(store, pane);
@@ -432,9 +628,9 @@ fn encode(bytes: &[u8]) -> String {
 
 /// Send an update this pane made: to the server through `applyEdit`, and to
 /// every other pane of this window holding the sheet, a turn later.
-fn send_update(store: AppStore, from: PaneId, store_id: StoreId, node_id: NodeId, bytes: Vec<u8>) {
+fn send_update(store: AppStore, from: Slot, store_id: StoreId, node_id: NodeId, bytes: Vec<u8>) {
     store.send(BackendCommand::BroadcastChanges { store_id, node_id, changes: encode(&bytes) });
-    let others: Vec<PaneId> = panes_holding(store_id, node_id).into_iter().filter(|p| *p != from).collect();
+    let others: Vec<Slot> = holders(store_id, node_id).into_iter().filter(|p| *p != from).collect();
     let deliver = move || {
         for other in others {
             apply_to(store, other, store_id, node_id, &bytes);
@@ -545,7 +741,7 @@ fn formulas_of(snap: &SheetsSnap) -> Vec<&str> {
 fn cached_sheets(store: AppStore, node: &NodeRef) -> Option<SheetsSnap> {
     // A pane of this window holding the note has the freshest copy; the
     // cache is as old as the last fetch.
-    if let Some(live) = panes_holding(node.store, node.node).into_iter().find_map(|p| with_session(p, |s| s.sheets.read())) {
+    if let Some(live) = holders(node.store, node.node).into_iter().find_map(|slot| with_slot(slot, |s| s.sheets.read())) {
         return Some(live);
     }
     let sig = store.get_node_signal(node.store, node.node)?;
@@ -719,7 +915,11 @@ impl Book for AppBook {
 }
 
 fn book_for(store: AppStore, pane: PaneId) -> Option<AppBook> {
-    let (home, snap) = with_session(pane, |s| (node_ref(s.store_id, s.node_id), s.sheets.read()))?;
+    book_in(store, current(pane))
+}
+
+fn book_in(store: AppStore, slot: Slot) -> Option<AppBook> {
+    let (home, snap) = with_slot(slot, |s| (node_ref(s.store_id, s.node_id), s.sheets.read()))?;
     Some(AppBook::new(store, home, snap))
 }
 
@@ -815,6 +1015,7 @@ fn table_view(engine: &Engine<'_>, book: &AppBook, snap: &SheetsSnap, computed: 
         .unwrap_or_default();
     let mut view = TableView {
         id: computed.id.clone(),
+        node: (book.home.store, book.home.node),
         name: computed.name.clone(),
         summary: computed.summary,
         source,
@@ -831,7 +1032,22 @@ fn table_view(engine: &Engine<'_>, book: &AppBook, snap: &SheetsSnap, computed: 
 
 /// Recompute pane `pane`'s tables and hand them to the view.
 pub(crate) fn recompute(store: AppStore, pane: PaneId) {
-    let Some(book) = book_for(store, pane) else { return };
+    let Some(mut views) = compute_slot(store, Slot::Pane(pane)) else { return };
+    // The sheet nodes its text embeds.
+    for (s, n) in embeds_in(pane) {
+        views.extend(compute_slot(store, Slot::Embed(s, n)).unwrap_or_default());
+    }
+    let ui = store.pane(pane).sheet_ui;
+    ui.tables.set(views);
+    refresh_formula_bar(store, pane);
+    // A peer's update may have brought or taken a table's atom, and the
+    // editor tells of its own changes only.
+    in_text::text_changed(pane);
+}
+
+/// A slot's tables computed (and what its formulas read, held).
+fn compute_slot(store: AppStore, slot: Slot) -> Option<Vec<TableView>> {
+    let book = book_in(store, slot)?;
     let home = book.home;
     let engine = Engine::new(&book);
     let snap = book.snaps.get(&home).cloned().unwrap_or_default();
@@ -843,16 +1059,11 @@ pub(crate) fn recompute(store: AppStore, pane: PaneId) {
         }
     };
     let read = book.reads.clone();
-    let changed = with_session(pane, |s| std::mem::replace(&mut s.reads, read.clone()) != read).unwrap_or(false);
+    let changed = with_slot(slot, |s| std::mem::replace(&mut s.reads, read.clone()) != read).unwrap_or(false);
     if changed {
         reads::sync(store);
     }
-    let ui = store.pane(pane).sheet_ui;
-    ui.tables.set(views);
-    refresh_formula_bar(store, pane);
-    // A peer's update may have brought or taken a table's atom, and the
-    // editor tells of its own changes only.
-    in_text::text_changed(pane);
+    Some(views)
 }
 
 // ── Editing ──────────────────────────────────────────────────────────────
@@ -864,27 +1075,35 @@ fn say(store: AppStore, pane: PaneId, sentence: impl Into<String>) {
 /// One local edit of pane `pane`'s sheet: refused (with the sentence) when
 /// this device may only read the node, sent through `applyEdit` otherwise.
 fn local_edit<R>(store: AppStore, pane: PaneId, f: impl FnOnce(&mut doc::SheetsTxn<'_, '_>) -> doc::Result<R>) -> Option<R> {
-    let held = with_session(pane, |s| (s.store_id, s.node_id))?;
+    let slot = current(pane);
+    let held = with_slot(slot, |s| (s.store_id, s.node_id))?;
     if !store.node_access(held.0, held.1).allows_write() {
         say(store, pane, pimble_core::StoreAccess::READ_ONLY_REFUSAL);
         return None;
     }
-    let (result, update) = with_session(pane, |s| {
+    let (result, update) = with_slot(slot, |s| {
         let edited = s.sheets.edit(f);
         (edited.result, edited.update)
     })?;
     if let Some(bytes) = update {
-        send_update(store, pane, held.0, held.1, bytes);
+        send_update(store, slot, held.0, held.1, bytes);
     }
+    let shown = slot_panes(slot);
+    let recompute_all = |store: AppStore| {
+        recompute(store, pane);
+        for other in shown.iter().filter(|p| **p != pane) {
+            recompute(store, *other);
+        }
+    };
     match result {
         Ok(r) => {
             store.pane(pane).sheet_ui.message.set(None);
-            recompute(store, pane);
+            recompute_all(store);
             Some(r)
         }
         Err(e) => {
             say(store, pane, e.to_string());
-            recompute(store, pane);
+            recompute_all(store);
             None
         }
     }
@@ -892,17 +1111,20 @@ fn local_edit<R>(store: AppStore, pane: PaneId, f: impl FnOnce(&mut doc::SheetsT
 
 /// Undo (or redo) this pane's last sheet edit.
 pub(crate) fn undo(store: AppStore, pane: PaneId, redo: bool) -> bool {
-    let Some(held) = with_session(pane, |s| (s.store_id, s.node_id)) else { return false };
-    let update = with_session(pane, |s| s.sheets.undo(&mut s.undo, redo)).flatten();
+    let slot = current(pane);
+    let Some(held) = with_slot(slot, |s| (s.store_id, s.node_id)) else { return false };
+    let update = with_slot(slot, |s| s.sheets.undo(&mut s.undo, redo)).flatten();
     if let Some(bytes) = update {
-        send_update(store, pane, held.0, held.1, bytes);
-        recompute(store, pane);
+        send_update(store, slot, held.0, held.1, bytes);
+        for p in slot_panes(slot) {
+            recompute(store, p);
+        }
     }
     true
 }
 
 fn snapshot(pane: PaneId) -> Option<SheetsSnap> {
-    with_session(pane, |s| s.sheets.read())
+    with_slot(current(pane), |s| s.sheets.read())
 }
 
 fn next_table_name(snap: &SheetsSnap, base: &str) -> String {
@@ -911,6 +1133,7 @@ fn next_table_name(snap: &SheetsSnap, base: &str) -> String {
 }
 
 pub(crate) fn add_table(store: AppStore, pane: PaneId) {
+    aim(pane, None);
     let Some(snap) = snapshot(pane) else { return };
     let name = next_table_name(&snap, "Table");
     local_edit(store, pane, |t| new_table(t, &name));
@@ -927,6 +1150,7 @@ fn new_table(t: &mut doc::SheetsTxn<'_, '_>, name: &str) -> doc::Result<String> 
 /// A summary of the first plain table: grouped by its first link column (or
 /// its first column), totalling its first number column.
 pub(crate) fn add_summary(store: AppStore, pane: PaneId) {
+    aim(pane, None);
     let Some(snap) = snapshot(pane) else { return };
     let Some(src) = snap.tables.iter().find(|t| !t.is_summary()) else {
         say(store, pane, "A summary is made from a table; add a table first.");
@@ -973,6 +1197,7 @@ fn bracket(name: &str) -> String {
 }
 
 pub(crate) fn rename_table(store: AppStore, pane: PaneId, table: &str, text: &str) {
+    aim(pane, Some(table));
     let name = doc::table_name_from(text);
     let current = snapshot(pane).and_then(|s| s.table(table).map(|t| t.name.clone()));
     if current.as_deref() == Some(name.as_str()) {
@@ -984,7 +1209,13 @@ pub(crate) fn rename_table(store: AppStore, pane: PaneId, table: &str, text: &st
 /// A table's "×": in a sheet node the table goes; in text its atom leaves
 /// the text and the table is listed under it ([`in_text::remove_embeds`]).
 pub(crate) fn delete_table(store: AppStore, pane: PaneId, table: &str) {
-    if holds_text(pane) {
+    if holds_text(pane) && !is_own_table(pane, table) {
+        // A table of an embedded sheet node: the embed leaves the text, the
+        // sheet node keeps its tables.
+        if let Some((s, n)) = embeds_in(pane).into_iter().find(|(s, n)| with_slot(Slot::Embed(*s, *n), |x| x.sheets.table(table).is_some()).unwrap_or(false)) {
+            in_text::remove_node_embeds(pane, s, n);
+        }
+    } else if holds_text(pane) {
         in_text::remove_embeds(pane, table);
     } else {
         discard_table(store, pane, table);
@@ -993,10 +1224,12 @@ pub(crate) fn delete_table(store: AppStore, pane: PaneId, table: &str) {
 
 /// Delete a table and everything in it.
 pub(crate) fn discard_table(store: AppStore, pane: PaneId, table: &str) {
+    aim(pane, Some(table));
     local_edit(store, pane, |t| t.delete_table(table));
 }
 
 pub(crate) fn set_source(store: AppStore, pane: PaneId, table: &str, shown: &str) {
+    aim(pane, Some(table));
     let Some(book) = book_for(store, pane) else { return };
     match formula::to_stored(&book, Some(table), shown) {
         Ok(stored) => {
@@ -1007,6 +1240,7 @@ pub(crate) fn set_source(store: AppStore, pane: PaneId, table: &str, shown: &str
 }
 
 pub(crate) fn delete_row(store: AppStore, pane: PaneId, table: &str, row: &str) {
+    aim(pane, Some(table));
     local_edit(store, pane, |t| t.delete_row(table, row));
 }
 
@@ -1068,6 +1302,7 @@ pub(crate) fn cell_pressed(store: AppStore, pane: PaneId, key: CellKey) {
         return;
     }
     commit(store, pane, Move::Stay);
+    aim(pane, Some(&key.table));
     let typed = column_of(pane, &key).is_some_and(|(t, c)| !t.is_summary() && !matches!(c.ty, ColumnType::Formula { .. }));
     if typed {
         ui.selected.set(None);
@@ -1080,6 +1315,7 @@ pub(crate) fn cell_pressed(store: AppStore, pane: PaneId, key: CellKey) {
 
 fn begin_typing(store: AppStore, pane: PaneId, key: CellKey) {
     tracing::debug!("sheet typing in {key:?}");
+    aim(pane, Some(&key.table));
     let ui = store.pane(pane).sheet_ui;
     let Some((table, col)) = column_of(pane, &key) else { return };
     let text = key
@@ -1242,6 +1478,7 @@ struct CreateOffer {
 /// A node being made for a link cell: where its link goes when it arrives.
 struct CreateJob {
     pane: PaneId,
+    slot: Slot,
     node: (StoreId, NodeId),
     key: CellKey,
     /// The parent it is made under.
@@ -1293,9 +1530,10 @@ pub(crate) fn node_created(store: AppStore, request: u64, store_id: StoreId, nod
     for name in names {
         crate::fields::write(store, store_id, node_id, &name, Some(""));
     }
-    if with_session(job.pane, |s| (s.store_id, s.node_id)) != Some(job.node) {
+    if with_slot(job.slot, |s| (s.store_id, s.node_id)) != Some(job.node) {
         return;
     }
+    aim(job.pane, Some(&job.key.table));
     let value = Stored::Node(node_ref(store_id, node_id));
     match &job.key.row {
         Some(row) => {
@@ -1332,9 +1570,10 @@ pub(crate) fn commit(store: AppStore, pane: PaneId, mv: Move) {
     // "Create ... under ...": the node is made, and the cell links to it
     // when it arrives.
     if let Some(offer) = OFFER.with(|o| o.borrow_mut().take()).filter(|o| o.label == text) {
-        let Some(node) = with_session(pane, |s| (s.store_id, s.node_id)) else { return };
+        let slot = current(pane);
+        let Some(node) = with_slot(slot, |s| (s.store_id, s.node_id)) else { return };
         let request = NEXT_CREATE.with(|n| n.replace(n.get() + 1));
-        CREATES.with(|c| c.borrow_mut().insert(request, CreateJob { pane, node, key: key.clone(), under: Some(offer.under.node) }));
+        CREATES.with(|c| c.borrow_mut().insert(request, CreateJob { pane, slot, node, key: key.clone(), under: Some(offer.under.node) }));
         store.send(BackendCommand::CreateNode {
             store_id: offer.under.store,
             parent_id: Some(offer.under.node),
@@ -1465,6 +1704,7 @@ fn refresh_formula_bar(store: AppStore, pane: PaneId) {
 pub(crate) fn set_formula(store: AppStore, pane: PaneId, shown: String) {
     let ui = store.pane(pane).sheet_ui;
     let Some(key) = untracked(|| ui.selected.get()) else { return };
+    aim(pane, Some(&key.table));
     let Some((table, col)) = column_of(pane, &key) else { return };
     let ColumnType::Formula { format, .. } = col.ty else { return };
     let Some(book) = book_for(store, pane) else { return };
@@ -1485,6 +1725,7 @@ fn kind_of(ty: &ColumnType) -> &'static str {
 pub(crate) fn open_column(store: AppStore, pane: PaneId, table: &str, col: Option<&str>) {
     let ui = store.pane(pane).sheet_ui;
     commit(store, pane, Move::Stay);
+    aim(pane, Some(table));
     let Some(snap) = snapshot(pane) else { return };
     let Some(t) = snap.table(table) else { return };
     if let Some(index) = col.and_then(|c| c.strip_prefix("r:")).and_then(|i| i.parse::<usize>().ok()) {
@@ -1565,6 +1806,7 @@ fn form_error(store: AppStore, pane: PaneId, sentence: impl Into<String>) {
 pub(crate) fn apply_column(store: AppStore, pane: PaneId) {
     let ui = store.pane(pane).sheet_ui;
     let Some(form) = untracked(|| ui.column_form.get()) else { return };
+    aim(pane, Some(&form.table));
     let name = doc::column_name_from(&form.name);
     if name.is_empty() {
         return form_error(store, pane, "Give the column a name.");
@@ -1686,6 +1928,7 @@ fn carry_over(store: AppStore, pane: PaneId, table: &pimble_sheet::TableSnap, ol
 pub(crate) fn delete_column(store: AppStore, pane: PaneId) {
     let ui = store.pane(pane).sheet_ui;
     let Some(form) = untracked(|| ui.column_form.get()) else { return };
+    aim(pane, Some(&form.table));
     if let Some(col) = &form.col {
         if local_edit(store, pane, |t| t.delete_column(&form.table, col)).is_some() {
             ui.column_form.set(None);

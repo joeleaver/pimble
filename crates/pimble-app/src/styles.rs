@@ -502,6 +502,14 @@ pub(crate) const APP_CSS: &str = "
     font-size: 12px;
 }
 
+/* A sheet node shown in the text: its title, a link to it. */
+.pimble-sheet__embed-title {
+    font-size: 12px;
+    color: var(--rinch-primary-color);
+    cursor: pointer;
+    padding: 0 2px;
+}
+
 /* The tables no longer in the text, listed under it. */
 .pimble-sheet-lost {
     display: flex;

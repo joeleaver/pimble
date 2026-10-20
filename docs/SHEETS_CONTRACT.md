@@ -58,6 +58,16 @@ used both ways"):
 "Convert to Sheet Node" and its reverse move tables between a text node and a new sheet
 node, the way "Convert to Image Node" does for boards.
 
+- **A sheet node embedded in text** (Joe, 2026-10-20, as board nodes are): an `embed` atom
+  with `data-node` (the node as a `pimble:` link), `data-kind="sheet"`, optionally
+  `data-table` (one table) and `data-title` (the node's title when it was embedded). It
+  shows the sheet node's tables live, under its title (a link to it); editing them edits
+  the sheet node. It is a link to the node (backlinks, `became`, placeholders when it is
+  not there). Insert > "Sheet from a Node..." (the picker, sheet nodes only) puts one in;
+  Move leaves one where the table was, as "Convert to Image Node" leaves an embed. A
+  table of a note stays in the note's document (it goes wherever the note goes); a table
+  to share between notes lives in a sheet node that any number of notes embed.
+
 ## 2. The sheet document
 
 Everything a person types is co-edited data in the node's `data` root, keyed by id. Ids
@@ -496,4 +506,22 @@ In layers (Joe, 2026-10-19: "would be nice"):
   note, Add Field) and in Chromium on the local stack in an encrypted store (Add Field,
   a reload and unlock).
 
+## Built after wave 3 (2026-10-20): sheet nodes embedded in text
+
+- The window holds a session per sheet node its texts embed (`sheets.rs` `Slot::Embed`,
+  `sync_embeds`), shared by the panes showing it, subscribed unless held already, and
+  counted by `AppStore::is_editing`. A pane's tables are its own plus those of the sheet
+  nodes its text embeds (`TableView::node` says whose); a table action aims at the slot
+  holding its table (`aim`), so edits, the formula bar, typing and undo go to the sheet
+  node's document. The table's "×" in an embed takes the embed out of the text (the sheet
+  node keeps its tables).
+- `pimble-crdt` counts any `embed` with `data-node` as a link to that node.
+- The MCP's `get_node` shows an embedded sheet node's tables where it is.
+- Found while checking it: a node field written from a blank document did not replace an
+  existing value (it merged as concurrent, and the old value can win); the app now
+  writes on the node's document as this window has it, and its cache takes the update.
+- Checked in a release build: Insert Sheet from a Node, typing in the embed reaching the
+  sheet node, a restart, Move leaving an embed (tests), the lost list ignoring an
+  embed's tables. Not yet in a browser. Not built: dropping a sheet node's tree row on the
+  text, and pasting its link, as boards have.
 

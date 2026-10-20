@@ -86,6 +86,9 @@ pub enum PickerKind {
     /// query is typed in the popup, only board nodes are offered, and a pick
     /// goes in at `at` as a picture of the board.
     Board { at: usize },
+    /// Insert > "Sheet from a Node..." (docs/SHEETS_CONTRACT.md section 1):
+    /// as `Board`, sheet nodes only, a pick embedded live at `at`.
+    Sheet { at: usize },
 }
 
 /// The open picker, as `AppStore::link_picker` holds it.
@@ -215,6 +218,11 @@ pub fn accept(store: crate::state::AppStore, handle: &EditorHandle, index: usize
             crate::text_boards::insert_embed(store, store.focused(), pimble_core::BoardUrl::new(*store_id, *node_id), Some((at, to.unwrap_or(at))))
         }
         (PickerKind::Board { .. }, _) => false,
+        (PickerKind::Sheet { at }, PickerRow::Node { store_id, node_id, .. }) => {
+            let to = typed_since(handle, at).filter(|t| *t == view.query).map(|_| handle.selection().head().0);
+            crate::sheets::in_text::insert_node_embed(store, store.focused(), *store_id, *node_id, Some((at, to.unwrap_or(at))))
+        }
+        (PickerKind::Sheet { .. }, _) => false,
     }
 }
 
@@ -227,6 +235,11 @@ fn rebuilt(store: crate::state::AppStore, mut view: PickerView) -> PickerView {
         PickerKind::Board { .. } => HITS.with(|h| {
             let boards: Vec<SearchResultItem> = h.borrow().iter().filter(|hit| hit.node_type == pimble_core::node_types::BOARD).cloned().collect();
             picker_rows("", &boards, store_name)
+        }),
+        // Sheet nodes only.
+        PickerKind::Sheet { .. } => HITS.with(|h| {
+            let sheets: Vec<SearchResultItem> = h.borrow().iter().filter(|hit| hit.node_type == pimble_core::node_types::SHEET).cloned().collect();
+            picker_rows("", &sheets, store_name)
         }),
         _ => HITS.with(|h| picker_rows(&view.query, &h.borrow(), store_name)),
     };
@@ -271,6 +284,9 @@ pub fn lines(view: &PickerView) -> Vec<PickerLine> {
 pub fn empty_line(view: &PickerView) -> &'static str {
     if let PickerKind::Board { .. } = view.kind {
         return if view.query.trim().is_empty() { "Type to find a board" } else { "No boards match" };
+    }
+    if let PickerKind::Sheet { .. } = view.kind {
+        return if view.query.trim().is_empty() { "Type to find a sheet" } else { "No sheets match" };
     }
     if view.query.trim().is_empty() {
         "Type to find a note, or a web address"
@@ -317,7 +333,7 @@ pub fn selection_changed(store: crate::state::AppStore, handle: &EditorHandle) {
         PickerKind::Selection { .. } => close(store),
         // Its query is typed in the popup, or (in the browser) after where it
         // opened, in the note.
-        PickerKind::Board { at } => {
+        PickerKind::Board { at } | PickerKind::Sheet { at } => {
             if let Some(query) = typed_since(handle, at) {
                 set_query(store, query);
             }
@@ -394,16 +410,16 @@ pub fn key(store: crate::state::AppStore, handle: &EditorHandle, key: &str, modi
         _ => match view.kind {
             // A `[[` query is typed in the note itself.
             PickerKind::Typed { .. } => return false,
-            PickerKind::Selection { .. } | PickerKind::Board { .. } if key == "Backspace" => {
+            PickerKind::Selection { .. } | PickerKind::Board { .. } | PickerKind::Sheet { .. } if key == "Backspace" => {
                 let mut query = view.query.clone();
                 query.pop();
                 set_query(store, query);
             }
-            PickerKind::Selection { .. } | PickerKind::Board { .. } if !modified && key.chars().count() == 1 => {
+            PickerKind::Selection { .. } | PickerKind::Board { .. } | PickerKind::Sheet { .. } if !modified && key.chars().count() == 1 => {
                 set_query(store, format!("{}{key}", view.query));
             }
             // Anything else (a shortcut, a caret move) closes it and goes on.
-            PickerKind::Selection { .. } | PickerKind::Board { .. } => {
+            PickerKind::Selection { .. } | PickerKind::Board { .. } | PickerKind::Sheet { .. } => {
                 close(store);
                 return false;
             }

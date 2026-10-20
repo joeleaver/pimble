@@ -99,6 +99,18 @@ fn collect_links(node: &ModelNode, path: &str, open: &mut Option<(String, String
     // (docs/IMAGE_MARKUP_CONTRACT.md section 2, "It is a link"): it counts in
     // the board's backlinks and is indexed as one. Its words are its `alt`,
     // the board's title when it was embedded.
+    // An app's embed of a node (`data-node`, a `pimble:` link: a sheet node
+    // shown in the text) is a link to it, as a board embedded as a picture
+    // is. Its words are its `data-title`, the node's title when it was
+    // embedded.
+    if node.type_name() == "embed" {
+        if let Some(url) = node.attrs().get_str("data-node").and_then(PimbleUrl::parse) {
+            flush(path, open, out);
+            let text = node.attrs().get_str("data-title").unwrap_or_default().to_string();
+            out.push(LinkRef { target: url, path: path.to_string(), text });
+        }
+        return;
+    }
     if node.type_name() == "image" {
         if let Some(url) = node.attrs().get_str("src").and_then(pimble_core::BoardUrl::parse) {
             flush(path, open, out);

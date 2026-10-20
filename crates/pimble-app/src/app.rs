@@ -806,7 +806,7 @@ fn picker_is_field(store: AppStore) -> bool {
     store.link_picker.with(|view| {
         matches!(
             view.as_ref().map(|v| v.kind),
-            Some(crate::link_picker::PickerKind::Selection { .. } | crate::link_picker::PickerKind::Board { .. })
+            Some(crate::link_picker::PickerKind::Selection { .. } | crate::link_picker::PickerKind::Board { .. } | crate::link_picker::PickerKind::Sheet { .. })
         )
     })
 }
@@ -815,6 +815,7 @@ fn picker_is_field(store: AppStore) -> bool {
 fn picker_query_text(store: AppStore) -> String {
     store.link_picker.with(|view| match view {
         Some(view) if view.query.is_empty() && matches!(view.kind, crate::link_picker::PickerKind::Board { .. }) => "Board…".to_string(),
+        Some(view) if view.query.is_empty() && matches!(view.kind, crate::link_picker::PickerKind::Sheet { .. }) => "Sheet…".to_string(),
         Some(view) if view.query.is_empty() => "Link to…".to_string(),
         Some(view) => view.query.clone(),
         None => String::new(),
