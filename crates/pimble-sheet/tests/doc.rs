@@ -886,3 +886,20 @@ fn other_keys_of_the_data_root_are_left_alone() {
     let txn = s.doc().transact();
     assert!(matches!(s.root().get(&txn, "board"), Some(Out::YMap(_))));
 }
+
+/// A table copied into another node (Convert to Sheet Node) keeps its ids,
+/// columns, rows and summary, so its formulas still read.
+#[test]
+fn a_copied_table_keeps_its_ids_and_contents() {
+    let f = fixture();
+    let source = Sheets::of_node(&f.a).table(&f.table).unwrap();
+    let dest = Sheets::standalone();
+    let copied = dest.edit(|t| t.copy_table(&source));
+    copied.result.unwrap();
+    let back = dest.table(&f.table).expect("the copy, under the same id");
+    assert_eq!(back.name, source.name);
+    assert_eq!(back.columns, source.columns);
+    assert_eq!(back.rows, source.rows);
+    // Twice is refused: the id (and the name) are taken.
+    assert!(dest.edit(|t| t.copy_table(&source)).result.is_err());
+}

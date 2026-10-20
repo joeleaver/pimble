@@ -3,7 +3,7 @@
 //! ([`crate::doc`]), the formula engine computes over them ([`crate::formula`]),
 //! and the app and the MCP show them. Nothing here is computed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pimble_core::{NodeId, StoreId};
 
@@ -148,6 +148,41 @@ pub struct TableSnap {
 }
 
 impl TableSnap {
+    /// The tables of its own note this table reads (by id, itself left out):
+    /// a row link's target, and every table a formula or a summary's source
+    /// names without a note. A table that reads another, or is read by one,
+    /// cannot leave its note alone without that reference breaking.
+    pub fn tables_read(&self) -> BTreeSet<String> {
+        fn scan(stored: &str, out: &mut BTreeSet<String>) {
+            let mut rest = stored;
+            while let Some(at) = rest.find("{t:") {
+                let before = &stored[..stored.len() - rest.len() + at];
+                rest = &rest[at + 3..];
+                let Some(end) = rest.find('}') else { break };
+                // `{n:<store>/<node>}!{t:..}` names another note's table.
+                if !before.ends_with("}!") {
+                    out.insert(rest[..end].to_string());
+                }
+                rest = &rest[end..];
+            }
+        }
+        let mut out = BTreeSet::new();
+        if let Some(source) = &self.source {
+            scan(source, &mut out);
+        }
+        for column in &self.columns {
+            match &column.ty {
+                ColumnType::RowLink { table } => {
+                    out.insert(table.clone());
+                }
+                ColumnType::Formula { formula, .. } => scan(formula, &mut out),
+                _ => {}
+            }
+        }
+        out.remove(&self.id);
+        out
+    }
+
     pub fn column(&self, id: &str) -> Option<&ColumnSnap> {
         self.columns.iter().find(|c| c.id == id)
     }

@@ -238,6 +238,107 @@ pub(crate) fn render_lost(__scope: &mut RenderScope, store: AppStore, pane: Pane
     }
 }
 
+// ── Convert to Sheet Node ────────────────────────────────────────────────
+
+/// "Convert to Sheet Node" refused: the table and the note's other tables
+/// read each other, and references across notes come later (wave 3).
+fn tied_sentence(name: &str) -> String {
+    format!("{name} reads another table of this note, or another reads it, so it cannot move to a node of its own yet.")
+}
+
+/// A table on its way to a sheet node of its own.
+struct ConvertJob {
+    pane: PaneId,
+    host: (StoreId, NodeId),
+    table: String,
+    title: String,
+}
+
+thread_local! {
+    static CONVERTS: RefCell<HashMap<u64, ConvertJob>> = RefCell::new(HashMap::new());
+    /// Request ids of this module (the boards in text count from 1 << 48).
+    static NEXT_REQUEST: Cell<u64> = const { Cell::new(2 << 48) };
+}
+
+/// "Convert to Sheet Node" (contract section 1): a sheet node under the note
+/// holding the table, ids kept; when it is made, the table's place in the
+/// text becomes a link to it and the table leaves the note.
+pub(crate) fn convert_to_sheet_node(store: AppStore, pane: PaneId, table: &str) {
+    let Some((store_id, node_id)) = with_session(pane, |s| (s.store_id, s.node_id)) else { return };
+    if !store.node_access(store_id, node_id).allows_write() {
+        say(store, pane, pimble_core::StoreAccess::READ_ONLY_REFUSAL);
+        return;
+    }
+    let Some(snap) = snapshot(pane) else { return };
+    let Some(t) = snap.table(table).cloned() else { return };
+    let tied = !t.tables_read().is_empty() || snap.tables.iter().any(|o| o.id != t.id && o.tables_read().contains(&t.id));
+    if tied {
+        say(store, pane, tied_sentence(&t.name));
+        return;
+    }
+    let copied = Sheets::standalone().edit(|x| x.copy_table(&t));
+    let content = match (copied.result, copied.update) {
+        (Ok(()), Some(content)) => content,
+        (Err(e), _) => {
+            say(store, pane, e.to_string());
+            return;
+        }
+        (Ok(()), None) => return,
+    };
+    let request = NEXT_REQUEST.with(|n| n.replace(n.get() + 1));
+    CONVERTS.with(|c| c.borrow_mut().insert(request, ConvertJob { pane, host: (store_id, node_id), table: t.id.clone(), title: t.name.clone() }));
+    store.send(BackendCommand::CreateNode {
+        store_id,
+        parent_id: Some(node_id),
+        title: t.name.clone(),
+        init: Some(NodeInit {
+            node_type: node_types::SHEET.to_string(),
+            content,
+            custom: vec![
+                (pimble_core::custom_keys::ICON.to_string(), serde_json::json!(SHEET_ICON)),
+                (pimble_core::custom_keys::EXPLICIT_TITLE.to_string(), serde_json::json!(true)),
+            ],
+            request: Some(request),
+        }),
+    });
+}
+
+/// A node made for a request of this module: the converted table's place
+/// in the text becomes a link to it, and the table leaves the note.
+pub(crate) fn node_created(store: AppStore, request: u64, store_id: StoreId, node_id: NodeId) {
+    let Some(job) = CONVERTS.with(|c| c.borrow_mut().remove(&request)) else { return };
+    let holds = holds_text(job.pane) && with_session(job.pane, |s| (s.store_id, s.node_id)) == Some(job.host);
+    if !holds {
+        crate::events::show_notice(store, "The note was closed before the sheet node was made; the table is in both.".to_string());
+        return;
+    }
+    let href = pimble_core::PimbleUrl::node(store_id, node_id).to_string();
+    let (table, title) = (job.table.clone(), job.title.clone());
+    crate::editor::editor(job.pane).update(move |state| {
+        let mut at = Vec::new();
+        state.doc.nodes_between(0, state.doc.content_size(), &mut |node, pos, _| {
+            if node.type_name() == "embed" && node.attrs().get_str(SHEET_ATTR) == Some(table.as_str()) {
+                at.push((pos, node.node_size()));
+            }
+            !node.is_textblock()
+        });
+        if at.is_empty() {
+            return None;
+        }
+        let schema = state.schema();
+        let link = rinch_editor_core::Mark::new(schema.mark_type("link")?.clone(), Attrs::new().with("href", href.as_str()));
+        let text = schema.text_with_marks(&title, vec![link]).ok()?;
+        let paragraph = schema.create_node("paragraph", Attrs::new(), rinch_editor_core::Fragment::from_node(text)).ok()?;
+        let mut tr = state.tr();
+        for (pos, size) in at.into_iter().rev() {
+            tr.replace_with(pos, pos + size, rinch_editor_core::Fragment::from_node(paragraph.clone())).ok()?;
+        }
+        Some(tr)
+    });
+    local_edit(store, job.pane, |t| t.delete_table(&job.table));
+    text_changed(job.pane);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +436,55 @@ mod tests {
         discard_table(store, P[0], &id);
         assert!(table_ids(P[0]).is_empty());
         assert!(untracked(|| lost_tables(ui)).is_empty());
+    }
+
+    /// "Convert to Sheet Node": a sheet node under the note with the table
+    /// (ids kept); once made, the table's place in the text is a link to it
+    /// and the note no longer holds the table. A table another reads stays.
+    #[test]
+    fn convert_moves_a_table_to_a_sheet_node_of_its_own() {
+        let (store, commands) = store_with_commands();
+        let (store_id, node_id) = (StoreId::new(), NodeId::new());
+        crate::editor::start_editing(store, P[0], store_id, node_id, &[]);
+        insert_sheet(store);
+        let id = table_ids(P[0]).remove(0);
+        let _ = commands.try_iter().count();
+
+        convert_to_sheet_node(store, P[0], &id);
+        let sent: Vec<BackendCommand> = commands.try_iter().collect();
+        let (request, content) = sent
+            .iter()
+            .find_map(|c| match c {
+                BackendCommand::CreateNode { parent_id: Some(p), init: Some(init), .. } if *p == node_id => {
+                    Some((init.request.expect("a request"), init.content.clone()))
+                }
+                _ => None,
+            })
+            .expect("a sheet node under the note");
+        let made = NodeDoc::load(&content).unwrap();
+        assert!(Sheets::of_node(&made).table(&id).is_some(), "the table, under its own id");
+
+        let new_node = NodeId::new();
+        node_created(store, request, store_id, new_node);
+        assert!(embedded_ids(P[0]).is_empty());
+        assert!(table_ids(P[0]).is_empty(), "the note no longer holds it");
+        let href = pimble_core::PimbleUrl::node(store_id, new_node).to_string();
+        let mut linked = false;
+        let doc = crate::editor::editor(P[0]).doc();
+        doc.nodes_between(0, doc.content_size(), &mut |node, _, _| {
+            linked |= node.marks().iter().any(|m| m.attrs.get_str("href") == Some(href.as_str()));
+            true
+        });
+        assert!(linked, "its place in the text links to the sheet node");
+
+        // Two tables, one linking to the other: neither moves.
+        insert_sheet(store);
+        insert_sheet(store);
+        let ids = table_ids(P[0]);
+        local_edit(store, P[0], |t| t.add_column(&ids[0], "other", ColumnType::RowLink { table: ids[1].clone() }, Placement::Last).map(|_| ()));
+        let _ = commands.try_iter().count();
+        convert_to_sheet_node(store, P[0], &ids[1]);
+        assert!(commands.try_iter().all(|c| !matches!(c, BackendCommand::CreateNode { .. })));
+        assert!(untracked(|| store.pane(P[0]).sheet_ui.message.get()).is_some_and(|m| m.contains("cannot move")));
     }
 }

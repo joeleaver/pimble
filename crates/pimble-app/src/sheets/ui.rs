@@ -139,6 +139,7 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
     let id_name = tid.clone();
     let id_source = tid.clone();
     let id_delete = tid.clone();
+    let id_convert = tid.clone();
     let id_add = tid.clone();
     let summary = t.summary;
     let source_row = summary.then(|| {
@@ -249,6 +250,17 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
                     span { class: "pimble-sheet__note", {note} }
                 }
                 span { class: "pimble-sheet__count", {rows_label} }
+                if holds_text(pane) {
+                    button {
+                        class: "pimble-sheet__delete-table",
+                        title: "Move this table to a sheet node of its own, under this note",
+                        onclick: {
+                            let id = id_convert.clone();
+                            move || in_text::convert_to_sheet_node(store, pane, &id)
+                        },
+                        "Move"
+                    }
+                }
                 button {
                     class: "pimble-sheet__delete-table",
                     title: "Delete this table",

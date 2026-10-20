@@ -922,6 +922,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             BackendEvent::NodeCreated { store_id, parent_id, node_id, request } => {
                 if let Some(request) = request {
                     crate::text_boards::node_created(store, *request, *store_id, *node_id);
+                    crate::sheets::in_text::node_created(store, *request, *store_id, *node_id);
                 }
                 tracing::info!("Node created: {:?}/{:?} under {:?}", store_id, node_id, parent_id);
                 let parent = parent_id.unwrap_or_else(|| {

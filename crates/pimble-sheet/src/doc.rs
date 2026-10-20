@@ -390,6 +390,48 @@ impl<'a, 'doc> SheetsTxn<'a, 'doc> {
         Ok(id)
     }
 
+    /// A copy of `table` (read from another node's tables), placed last. It
+    /// keeps its ids, so its formulas, which name its own columns by id, still
+    /// read, and so does a formula elsewhere that named it with its note.
+    /// Refused when this node has a table of that id or name already.
+    pub fn copy_table(&mut self, table: &TableSnap) -> Result<()> {
+        if self.location.root.get(self.txn, &table_key(&table.id)).is_some() {
+            return Err(SheetError::DuplicateTable(table.name.clone()));
+        }
+        let name = self.check_table_name(&table.name, None)?;
+        let keys = self.table_order_keys(None, &Placement::Last, 1)?;
+        let t: MapRef = self.location.root.insert(self.txn, table_key(&table.id), MapPrelim::default());
+        t.insert(self.txn, V, Any::BigInt(VERSION));
+        t.insert(self.txn, NAME, name);
+        t.insert(self.txn, ORDER, keys[0].clone());
+        if let Some(source) = &table.source {
+            t.insert(self.txn, SOURCE, source.clone());
+        }
+        if !table.headers.is_empty() {
+            let headers: MapRef = t.insert(self.txn, HEADERS, MapPrelim::default());
+            for (index, header) in &table.headers {
+                headers.insert(self.txn, index.to_string(), header.clone());
+            }
+        }
+        let columns: MapRef = t.insert(self.txn, COLUMNS, MapPrelim::default());
+        for column in &table.columns {
+            let c: MapRef = columns.insert(self.txn, column.id.clone(), MapPrelim::default());
+            c.insert(self.txn, NAME, column.name.clone());
+            c.insert(self.txn, ORDER, column.order.clone());
+            write_type(self.txn, &c, &column.ty);
+        }
+        let rows: MapRef = t.insert(self.txn, ROWS, MapPrelim::default());
+        for row in &table.rows {
+            let r: MapRef = rows.insert(self.txn, row.id.clone(), MapPrelim::default());
+            r.insert(self.txn, ORDER, row.order.clone());
+            let cells: MapRef = r.insert(self.txn, CELLS, MapPrelim::default());
+            for (column, value) in &row.cells {
+                cells.insert(self.txn, column.clone(), stored_to_any(value));
+            }
+        }
+        Ok(())
+    }
+
     /// Rename a table (same rules as [`SheetsTxn::create_table`]; renaming a
     /// table to its own name in another case is allowed).
     pub fn rename_table(&mut self, table: &str, name: &str) -> Result<()> {

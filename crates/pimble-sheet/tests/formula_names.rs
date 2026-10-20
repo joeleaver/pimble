@@ -516,3 +516,25 @@ fn summary_result_columns_are_stored_by_position() {
     assert_eq!(to_shown(&f, None, &total), "=SUM(ByMonth[{r:2}])");
     assert_eq!(to_stored(&f, None, "=SUM(ByMonth[{r:2}])").unwrap(), total);
 }
+
+/// What a table reads of its own note (contract section 1, "Convert to Sheet
+/// Node"): a row link's table and the tables its formulas name without a
+/// note; another note's tables are not its note's.
+#[test]
+fn tables_read_names_this_notes_tables_only() {
+    let mut b = examples();
+    b.store_formulas();
+    let trip = b.notes.iter().find(|n| n.node == node(TRIP)).unwrap();
+    let trips = trip.sheets.tables.iter().find(|t| t.id == "trips").unwrap();
+    let veh = trip.sheets.tables.iter().find(|t| t.id == "veh").unwrap();
+    assert!(trips.tables_read().contains("veh"), "a row link and the dot");
+    assert!(veh.tables_read().contains("trips"), "COUNTIF(Trips[vehicle], ..)");
+    let mut lone = TB::new("lone", "Lone").number("x").build();
+    lone.columns.push(pimble_sheet::ColumnSnap {
+        id: "other".into(),
+        name: "other".into(),
+        order: "z".into(),
+        ty: ColumnType::Formula { formula: format!("=SUM({}!{{t:cats}}[{{c:cats.spent}}])+SUM({{t:lone}}[{{c:lone.x}}])", note_token(&node(BUDGET))), format: Format::Auto },
+    });
+    assert!(lone.tables_read().is_empty(), "another note's table, and itself: {:?}", lone.tables_read());
+}
