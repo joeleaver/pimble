@@ -11,7 +11,8 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <main class="shell">
+  <main class="shell redirect">
+    <picture><source srcset="brand/pimble-lockup-on-dark.svg" media="(prefers-color-scheme: dark)"><img src="brand/pimble-lockup.svg" alt="Pimble" width="120" height="28"></picture>
     <p>Sign-in happens inside the app, where your password unlocks your keys on this device. <a href="/app/login">Continue to /app/login</a>.</p>
   </main>
   <script>window.location.replace("/app/login");</script>
