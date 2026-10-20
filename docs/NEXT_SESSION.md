@@ -1,5 +1,43 @@
 # Next session: start here
 
+**2026-10-19: sheets wave 1, node views in rinch, boards merged locally.** Nothing is
+pushed. Branches, newest first:
+
+- `sheets` (on `master`): docs/SHEETS_CONTRACT.md (every decision Joe made on 2026-10-19
+  is in its "Decisions"; five "Open decisions" are his: where node fields live, hours vs
+  Excel day fractions, A1 references, per-cell formulas, GROUPBY totals); the
+  `pimble-sheet` crate (document in `data["sheet:<id>"]`, the Excel formula engine,
+  stored-by-id formulas, 80 tests incl. a 280-case conformance table); sheet nodes in
+  the app (`sheets.rs`, `sheets/ui.rs`: New Sheet, typing, link picker, `=` makes a
+  formula column, column settings, summaries, formula bar, Undo/Redo buttons); the MCP
+  sheet tools (contract section 10). Checked in a release build on store copies: new
+  sheet, typing (Enter/Tab/Escape), rows, rename, formula column, summary, restart.
+  **Not yet seen on screen:** the link picker and `=` typed into a cell (the test
+  window stopped repainting while hidden). Ctrl+Z does nothing in a sheet yet.
+- `master` (local, 26 ahead of `origin/master`): `boards` fast-forwarded in (Joe,
+  2026-10-19), plus boards in text stored as `data["board:<id>"]` (no map made on first
+  use; boards never shipped, no migration) and the tree rename's `value:` fix for rinch
+  #1600. **The next push of master ships boards**: release rule, and desktop, web and
+  hosted together (rinch #1503). Ask Joe before pushing.
+- `deb`: a .deb beside the Linux tar.gz (`tools/package-deb.sh`, `tools/linux/`, the
+  download page, docs/DEPLOY.md). Joe wants every release installed on his machine from
+  the published .deb. The icon is a placeholder (Pimble has none).
+
+**Next, as agreed with Joe:** bump rinch to `main` (fc14187 or later: node views
+merged as rinch #1565, and #1600, which makes unknown `on*` names and `*_fn:` on HTML
+elements compile errors; Pimble's one offender is fixed). It is 36 commits past the pin:
+`cargo update rinch rinch-tabler-icons rinch-editor-core` in the root and in `web/`,
+full build and tests. Node views change the collab wire (every peer upgrades together)
+and pasted pictures now get a new identity: check marked-up pictures survive copy/paste.
+Then sheets wave 2 (sheets in text on node views), later wave 6 (boards in text onto
+node views).
+
+**Testing the app, lessons from 2026-10-19:** a store copy keeps its `sync.json` /
+`vault-link.json` (remove them) and its mounts resolve by saved path to the *real*
+source store (copy the mounted store too and open both copies). rinch: no HTML table
+layout (CSS grid with `display: contents` rows); the keyboard interceptor hears key
+releases (`KeyEventKind::Down`); `run_on_main_thread` needs `Send` (`set_timeout(0, ..)`).
+
 **2026-10-10: boards, on branch `boards`** (24 commits on `master`, not merged, not
 pushed), on rinch `main` 2ae3577. Contract: docs/IMAGE_MARKUP_CONTRACT.md (every decision
 Joe made on 2026-10-09 is in its "Decisions" list; each wave's "Built in ..." section at
