@@ -304,12 +304,12 @@ const BTN_BASE: &str = "display: inline-flex; align-items: center; justify-conte
 
 fn btn_style(active: bool) -> String {
     if active {
-        format!("{} border: 1px solid var(--rinch-primary-color-4); \
-                 background: var(--rinch-color-dark-4); \
-                 color: var(--rinch-primary-color-4);", BTN_BASE)
+        format!("{} border: 1px solid var(--pimble-toolbar-active-border); \
+                 background: var(--pimble-toolbar-active-bg); \
+                 color: var(--pimble-toolbar-active-fg);", BTN_BASE)
     } else {
         format!("{} border: 1px solid transparent; \
-                 color: #909296;", BTN_BASE)
+                 color: var(--pimble-toolbar-icon);", BTN_BASE)
     }
 }
 
@@ -353,7 +353,7 @@ pub(crate) fn render_pimble_toolbar(
         if gi > 0 {
             let divider = rsx! {
                 div {
-                    style: "width: 1px; height: 20px; background: var(--rinch-color-dark-4); margin: 0 2px;",
+                    style: "width: 1px; height: 20px; background: var(--rinch-color-border); margin: 0 2px;",
                 }
             };
             toolbar.append_child(&divider);

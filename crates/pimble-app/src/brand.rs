@@ -3,8 +3,7 @@
 //! The pebble and the lowercase wordmark (Manrope Medium, outlined, so no font
 //! file ships for it) are the same shapes as `assets/brand/` (Joe, 2026-10-20).
 //! They are two inline SVGs in their own coordinates rather than one with
-//! transforms. On the dark theme the pebble is the brand slate lifted for a dark
-//! ground; on the light theme the lockup is the title bar's text color.
+//! transforms. The pebble is the brand slate, lifted on the dark theme.
 
 use rinch::prelude::*;
 
@@ -51,16 +50,16 @@ pub fn titlebar_lockup(__scope: &mut RenderScope, store: AppStore) -> NodeHandle
     // The gap is 0.28 em of the word, 4 px at this size (`.pimble-titlebar-brand`).
     debug_assert!((em * 0.28 - 4.0).abs() < 0.1);
     // The dark title bar is near-black: the pebble in the light slate, the word
-    // in the body text color, apart from the menus' blue. The light one is
-    // rinch's blue with white menus, where slate sinks: the whole lockup is
-    // the title bar's text color there.
+    // in the body text color, apart from the menus' blue. The light one is a
+    // cool off-white (`styles::LIGHT_THEME_VARS`): the pebble in the slate, the
+    // word in the title bar's ink, as on the site.
     rsx! {
         div {
             class: "pimble-titlebar-brand",
             style: {move || if store.dark_mode.get() { "color: var(--rinch-color-text);" } else { "color: var(--rinch-titlebar-text);" }},
             span {
                 class: "pimble-titlebar-brand__mark",
-                style: {move || if store.dark_mode.get() { format!("color: {SLATE_ON_DARK};") } else { String::new() }},
+                style: {move || format!("color: {};", if store.dark_mode.get() { SLATE_ON_DARK } else { SLATE })},
                 {mark}
             }
             {word}

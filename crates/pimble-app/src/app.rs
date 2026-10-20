@@ -88,13 +88,28 @@ pub fn theme_props(dark_mode: bool) -> ThemeProviderProps {
     }
 }
 
+/// The theme stylesheet: rinch's own for the scheme, then Pimble's variables for
+/// it (`styles::LIGHT_THEME_VARS`, `styles::DARK_THEME_VARS`). They ride in the
+/// theme sheet because it is the one sheet rinch replaces when the scheme
+/// changes; an app sheet is parsed once.
+pub fn theme_css(dark_mode: bool) -> String {
+    let mut css = rinch::generate_theme_css_string(&theme_props(dark_mode));
+    css.push_str(if dark_mode { crate::styles::DARK_THEME_VARS } else { crate::styles::LIGHT_THEME_VARS });
+    css
+}
+
+/// Put [`theme_css`] in force, at start and on every switch.
+pub fn apply_theme(dark_mode: bool) {
+    rinch::core::set_current_theme_css(Some(theme_css(dark_mode)));
+}
+
 /// Switch between the dark and light themes: the theme CSS, the editor's
 /// stylesheet, every colour the app derives (they read `dark_mode`), and the
 /// saved preference.
 pub fn toggle_dark_mode(store: AppStore) {
     let dark = !untracked(|| store.dark_mode.get());
     store.dark_mode.set(dark);
-    rinch::update_theme(&theme_props(dark));
+    apply_theme(dark);
     crate::editor::set_dark_mode(dark);
     save_dark_mode(dark);
 }
@@ -1014,6 +1029,9 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
     });
     // Build app component - parameter must be named __scope for the rsx! macro
     let app_component = move |__scope: &mut RenderScope| -> NodeHandle {
+        // The shell put rinch's theme sheet in force; this one adds Pimble's
+        // variables for the scheme the app starts in.
+        apply_theme(untracked(|| store.dark_mode.get()));
         // Cancel any in-progress rename, optionally committing the change.
         let cancel_last_click = last_click.clone();
         let cancel_rename = move |commit: bool| {
