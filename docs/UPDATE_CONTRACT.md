@@ -24,12 +24,22 @@ does.
 | | Linux | Windows |
 | --- | --- | --- |
 | Install folder | `~/.local/share/pimble/app/` | `%LOCALAPPDATA%\Programs\Pimble\` |
+| How | `pimble --install` from the unpacked tar.gz | `pimble-<v>-windows-x86_64-setup.exe` (per user, no administrator), or `pimble.exe --install` from the zip |
 | On the PATH | `~/.local/bin/pimble`, `~/.local/bin/pimble-mcp` (symlinks) | not yet |
-| Menu entry | `~/.local/share/applications/pimble.desktop` | not yet (no Start-menu shortcut) |
-| Icon | `~/.local/share/icons/hicolor/{32..256}/apps/pimble.png`, `scalable/apps/pimble.svg` | the window icon only |
+| Menu entry | `~/.local/share/applications/pimble.desktop` | Start menu `Pimble` (the installer), optional desktop shortcut |
+| Uninstall | delete the folder, the links and the menu entry | Apps & features (the installer's uninstaller; notes and stores are elsewhere and stay) |
+| Icon | `~/.local/share/icons/hicolor/{32..256}/apps/pimble.png`, `scalable/apps/pimble.svg` | the installer's and the Start menu's, from `assets/brand/pimble.ico` |
 
 The menu entry's `Exec` names the install folder's binary, and its name matches
 the binary's file name, which is the Wayland `app_id` the window carries.
+
+## The Windows installer
+
+`tools/windows/pimble.iss` (Inno Setup 6, built and checked in the Release
+workflow's Windows job). It installs `pimble.exe`, `pimble-mcp.exe` and the marker
+into the updater's folder, so an installed copy keeps itself current like a Linux
+one; the next Setup is an upgrade of the same app (a fixed `AppId`). Its
+uninstaller also removes what the updater leaves there (`update\`, `*.old`).
 
 ## The feed
 
@@ -82,7 +92,11 @@ is tested is what shipped.
 
 ## Not done
 
-- Windows: no Start-menu shortcut and nothing on the PATH; `--install` and the
-  update itself are built but not run on Windows yet.
+- Windows: nothing on the PATH. The installer is checked on CI's Windows runner
+  (install, the files and marker, the Start-menu entry, uninstall), but the update
+  itself has not run on Windows yet. Apps & features keeps showing the version
+  the installer put there after the app updates itself. Setup is not
+  Authenticode-signed, so SmartScreen warns on first run until a code-signing
+  certificate is bought and used.
 - No "Check for Updates" menu item, no release notes shown, no channel choice.
 - Old versions are not kept for a rollback.
