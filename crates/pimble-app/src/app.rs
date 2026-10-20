@@ -4291,10 +4291,17 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 }
         };
 
+        // The title bar shows the pebble and the wordmark, not a text title
+        // (BorderlessWindow draws a title in the inline menu row as letters in
+        // rotating colors).
+        #[cfg(feature = "native")]
+        let brand: rinch::components::SectionRenderer =
+            Rc::new(move |__scope| crate::brand::titlebar_lockup(__scope, store));
         #[cfg(feature = "native")]
         let root = rsx! {
             BorderlessWindow {
-                title: "Pimble",
+                title: "",
+                left_section: Some(brand),
                 show_minimize: true,
                 show_maximize: true,
                 show_close: true,
@@ -4411,6 +4418,7 @@ pub fn run(renderer: Renderer) {
         transparent: true,
         resizable: true,
         menu_in_titlebar: true,
+        icon: Some(include_bytes!("../../../assets/brand/png/pimble-256.png")),
         on_close_requested: Some(on_close),
         ..Default::default()
     };

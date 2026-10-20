@@ -20,6 +20,8 @@
 //! document model in the sync path.
 
 pub mod app;
+#[cfg(feature = "native")]
+pub mod brand;
 pub mod appearance;
 pub mod boards;
 pub mod commands;

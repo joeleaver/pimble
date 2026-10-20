@@ -2,6 +2,23 @@
 
 /// Application-wide layout styles.
 pub(crate) const APP_CSS: &str = "
+/* ── Title bar brand (brand.rs) ─────────────────────────────── */
+
+.pimble-titlebar-brand {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    /* 4px on top centres the lockup 2px lower in the 36px row, which puts the
+       word's baseline on the menu labels' (measured on the release build). */
+    padding: 4px 12px 0 10px;
+    gap: 4px;
+}
+
+.pimble-titlebar-brand__mark {
+    display: flex;
+    align-items: center;
+}
+
 /* ── Sidebar ────────────────────────────────────────────────── */
 
 .pimble-sidebar {
