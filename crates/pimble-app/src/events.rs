@@ -547,6 +547,8 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 }
                 // The boards embedded in text hold their nodes again.
                 crate::text_boards::reconnected(store);
+                // And the notes sheets read.
+                crate::sheets::reads::reconnected(store);
 
                 // Whether the server's keystore holds a signed-in account
                 // (a sign-in survives an app restart), for the status bar
@@ -1015,6 +1017,8 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             BackendEvent::LinkResolved { url, hops, resolution } => {
                 if crate::text_boards::link_resolved(store, url, *hops, resolution) {
                     // A board embedded in text, not a link followed.
+                } else if crate::sheets::reads::link_resolved(store, url, resolution) {
+                    // A note a sheet's formulas read, not a link followed.
                 } else if !restore_resolved(store, url, resolution) {
                     follow_resolution(store, url, *hops, resolution);
                 }

@@ -1676,6 +1676,9 @@ impl AppStore {
             // A board embedded in a note's text holds its subscription too
             // (docs/IMAGE_MARKUP_CONTRACT.md section 2, "Showing").
             || crate::text_boards::embed_holds(store_id, node_id)
+            // So does a note a sheet's formulas read (docs/SHEETS_CONTRACT.md
+            // section 7).
+            || crate::sheets::reads::holds(store_id, node_id)
     }
 
     /// Every node some pane holds (a document in its editor, a board or a

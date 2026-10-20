@@ -21,6 +21,7 @@
 //! note, so every copy of the document in this window stays whole.
 
 pub(crate) mod in_text;
+pub(crate) mod reads;
 mod ui;
 
 use std::cell::{Cell, RefCell};
@@ -181,6 +182,9 @@ struct Session {
     /// The note's sheets in text: the pane's editor holds the note, and its
     /// subscription and node cache are the editor's.
     in_text: bool,
+    /// The other notes its formulas read, as of the last recompute
+    /// ([`reads`] holds them).
+    reads: Vec<NodeRef>,
 }
 
 thread_local! {
@@ -261,7 +265,7 @@ fn open(store: AppStore, pane: PaneId, store_id: StoreId, node_id: NodeId, conte
     };
     let sheets = Sheets::of_node(&doc).with_origin(origin(pane));
     let undo = sheets.undo_manager(undo_options());
-    SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()] = Some(Session { store_id, node_id, doc, sheets, undo, in_text }));
+    SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()] = Some(Session { store_id, node_id, doc, sheets, undo, in_text, reads: Vec::new() }));
     let state = store.pane(pane);
     let ui = state.sheet_ui;
     ui.editing.set(None);
@@ -300,6 +304,8 @@ pub(crate) fn stop(store: AppStore, pane: PaneId) {
     state.sheet_ui.tables.set(Vec::new());
     state.sheet_ui.editing.set(None);
     state.sheet_ui.embedded.set(Vec::new());
+    // What it read may be read by nothing now.
+    reads::sync(store);
     if session.in_text {
         return;
     }
@@ -376,6 +382,8 @@ pub(crate) fn apply_reconcile(store: AppStore, store_id: StoreId, node_id: NodeI
 
 /// A peer's update of a node: applied in every pane holding it as a sheet.
 pub(crate) fn apply_remote(store: AppStore, store_id: StoreId, node_id: NodeId, bytes: &[u8]) {
+    // A note a sheet reads: its cached copy, which formulas read, takes it.
+    reads::remote(store, store_id, node_id, bytes);
     for pane in panes_holding(store_id, node_id) {
         apply_to(store, pane, store_id, node_id, bytes);
     }
@@ -491,6 +499,10 @@ struct AppBook {
     store: AppStore,
     home: NodeRef,
     snaps: HashMap<NodeRef, SheetsSnap>,
+    /// Read notes whose tables cannot be read, and why.
+    absent: HashMap<NodeRef, reads::Where>,
+    /// The other notes its formulas read.
+    reads: Vec<NodeRef>,
     today: f64,
 }
 
@@ -543,6 +555,8 @@ fn cached_sheets(store: AppStore, node: &NodeRef) -> Option<SheetsSnap> {
 impl AppBook {
     fn new(store: AppStore, home: NodeRef, snap: SheetsSnap) -> Self {
         let mut snaps = HashMap::new();
+        let mut absent = HashMap::new();
+        let mut read_notes = Vec::new();
         let mut pending: Vec<NodeRef> = Vec::new();
         for f in formulas_of(&snap) {
             named_nodes(f, &mut pending);
@@ -554,16 +568,24 @@ impl AppBook {
         while !pending.is_empty() && hops < 4 {
             let mut next = Vec::new();
             for node in pending.drain(..) {
-                if snaps.contains_key(&node) {
+                if snaps.contains_key(&node) || absent.contains_key(&node) {
                     continue;
                 }
-                if let Some(s) = cached_sheets(store, &node) {
-                    for f in formulas_of(&s) {
-                        named_nodes(f, &mut next);
+                read_notes.push(node);
+                match reads::reach(store, &node) {
+                    reads::Where::Read(at) => {
+                        if let Some(s) = cached_sheets(store, &at) {
+                            for f in formulas_of(&s) {
+                                named_nodes(f, &mut next);
+                            }
+                            snaps.insert(node, s);
+                        } else if store.get_node_signal(at.store, at.node).is_none() {
+                            store.send(BackendCommand::GetNode { store_id: at.store, node_id: at.node });
+                        }
                     }
-                    snaps.insert(node, s);
-                } else if store.get_node_signal(node.store, node.node).is_none() {
-                    store.send(BackendCommand::GetNode { store_id: node.store, node_id: node.node });
+                    other => {
+                        absent.insert(node, other);
+                    }
                 }
             }
             pending = next;
@@ -588,7 +610,7 @@ impl AppBook {
         let today = chrono::Local::now().date_naive();
         use chrono::Datelike;
         let today = formula::dates::serial(today.year() as i64, today.month() as i64, today.day() as i64) as f64;
-        Self { store, home, snaps, today }
+        Self { store, home, snaps, absent, reads: read_notes, today }
     }
 
     fn title(&self, node: &NodeRef) -> Option<(String, Option<NodeId>)> {
@@ -605,6 +627,12 @@ impl Book for AppBook {
     fn sheets(&self, node: &NodeRef) -> Reach<'_> {
         if let Some(s) = self.snaps.get(node) {
             return Reach::Ready(s);
+        }
+        match self.absent.get(node) {
+            Some(reads::Where::Deleted) => return Reach::Deleted,
+            Some(reads::Where::NoAccess) => return Reach::NoAccess,
+            Some(reads::Where::Missing) => return Reach::Missing,
+            _ => {}
         }
         // Asked for (`AppBook::new`) and not here yet, or held but not
         // readable as a document yet.
@@ -798,6 +826,11 @@ pub(crate) fn recompute(store: AppStore, pane: PaneId) {
             Vec::new()
         }
     };
+    let read = book.reads.clone();
+    let changed = with_session(pane, |s| std::mem::replace(&mut s.reads, read.clone()) != read).unwrap_or(false);
+    if changed {
+        reads::sync(store);
+    }
     let ui = store.pane(pane).sheet_ui;
     ui.tables.set(views);
     refresh_formula_bar(store, pane);

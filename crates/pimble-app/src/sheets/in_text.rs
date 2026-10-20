@@ -609,4 +609,85 @@ mod tests {
         assert_eq!(row.cells.get(&col), Some(&Stored::Node(node_ref(store_id, made))));
         end_typing();
     }
+
+    /// A note with a table, in the node cache as the server sent it.
+    fn cached_note(store: AppStore, store_id: StoreId, title: &str, amounts: &[f64]) -> (NodeId, String, String, NodeDoc) {
+        let doc = NodeDoc::new();
+        let made = Sheets::of_node(&doc).edit(|t| {
+            let table = t.create_table("Costs", Placement::Last)?;
+            let col = t.add_column(&table, "amount", ColumnType::Number, Placement::Last)?;
+            for a in amounts {
+                t.add_row(&table, Placement::Last, &[(col.clone(), Stored::Number(*a))])?;
+            }
+            Ok((table, col))
+        });
+        let (table, col) = made.result.unwrap();
+        let mut node = pimble_core::Node::new("document");
+        node.metadata.title = title.into();
+        node.content = doc.save();
+        let id = node.id;
+        store.upsert_node(store_id, node);
+        (id, table, col, doc)
+    }
+
+    fn cell_text(store: AppStore, pane: PaneId, table: &str, col_name: &str) -> String {
+        let tables = untracked(|| store.pane(pane).sheet_ui.tables.get());
+        let t = tables.iter().find(|t| t.id == table).unwrap();
+        let i = t.columns.iter().position(|c| c.name == col_name).unwrap();
+        t.rows[0].cells[i].text.clone()
+    }
+
+    /// Another note a formula reads (contract sections 6 and 7): resolved,
+    /// subscribed while read and let go after, a peer's edit of it shown,
+    /// and a deleted one `#REF!` with its sentence.
+    #[test]
+    fn a_note_a_formula_reads_is_resolved_held_and_followed() {
+        let (store, commands) = store_with_commands();
+        let store_id = StoreId::new();
+        let (b, b_table, b_col, b_doc) = cached_note(store, store_id, "Budget", &[40.0]);
+        let node_id = NodeId::new();
+        crate::editor::start_editing(store, P[0], store_id, node_id, &[]);
+        insert_sheet(store);
+        let table = table_ids(P[0]).remove(0);
+        let token = formula::note_token(&node_ref(store_id, b));
+        let total = format!("=SUM({token}!{{t:{b_table}}}[{{c:{b_col}}}])");
+        let col = local_edit(store, P[0], |t| t.add_column(&table, "total", ColumnType::Formula { formula: total.clone(), format: pimble_sheet::Format::Auto }, Placement::Last)).unwrap();
+        local_edit(store, P[0], |t| t.add_row(&table, Placement::Last, &[]).map(|_| ()));
+        assert_eq!(cell_text(store, P[0], &table, "total"), "40", "the cache answers at once");
+        let sent: Vec<BackendCommand> = commands.try_iter().collect();
+        let url = pimble_core::PimbleUrl::node(store_id, b);
+        assert!(sent.iter().any(|c| matches!(c, BackendCommand::ResolveLink { url: u, .. } if *u == url)), "its resolution is asked");
+
+        assert!(reads::link_resolved(store, &url, &pimble_core::LinkResolution::Live { store_id, node_id: b }));
+        let sent: Vec<BackendCommand> = commands.try_iter().collect();
+        assert!(sent.iter().any(|c| matches!(c, BackendCommand::SubscribeNodeChanges { node_id: n, .. } if *n == b)), "held while read");
+        assert!(store.is_editing(store_id, b));
+
+        // A peer adds a row to Budget: the total follows.
+        let before = b_doc.state_vector();
+        Sheets::of_node(&b_doc).edit(|t| t.add_row(&b_table, Placement::Last, &[(b_col.clone(), Stored::Number(2.0))]).map(|_| ())).result.unwrap();
+        let update = b_doc.diff_since(&before).unwrap();
+        crate::sheets::apply_remote(store, store_id, b, &update);
+        assert_eq!(cell_text(store, P[0], &table, "total"), "42");
+
+        // No longer read: let go.
+        local_edit(store, P[0], |t| t.delete_column(&table, &col));
+        let sent: Vec<BackendCommand> = commands.try_iter().collect();
+        assert!(sent.iter().any(|c| matches!(c, BackendCommand::UnsubscribeNodeChanges { node_id: n, .. } if *n == b)));
+        assert!(!store.is_editing(store_id, b));
+
+        // A deleted note: #REF!, and why.
+        let (gone, g_table, g_col, _) = cached_note(store, store_id, "Old plan", &[1.0]);
+        let token = formula::note_token(&node_ref(store_id, gone));
+        let f = format!("=SUM({token}!{{t:{g_table}}}[{{c:{g_col}}}])");
+        local_edit(store, P[0], |t| t.add_column(&table, "old", ColumnType::Formula { formula: f.clone(), format: pimble_sheet::Format::Auto }, Placement::Last).map(|_| ()));
+        let url = pimble_core::PimbleUrl::node(store_id, gone);
+        assert!(reads::link_resolved(store, &url, &pimble_core::LinkResolution::Deleted { store_id, node_id: gone }));
+        let tables = untracked(|| store.pane(P[0]).sheet_ui.tables.get());
+        let t = tables.iter().find(|t| t.id == table).unwrap();
+        let i = t.columns.iter().position(|c| c.name == "old").unwrap();
+        let cell = &t.rows[0].cells[i];
+        assert_eq!(cell.text, "#REF!");
+        assert!(cell.error.as_deref().is_some_and(|e| e.contains("deleted")), "{:?}", cell.error);
+    }
 }
