@@ -479,7 +479,10 @@ In layers (Joe, 2026-10-19: "would be nice"):
 - **Checked** in a release build on the scratch store (Move with a formula reading the
   moved table, `move_table` back into the text, a node link set by the MCP and shown,
   Create from a cell, the column form) and by tests (`sheets::in_text::tests`, pimble-sheet
-  `rehome` and `index`). Not yet in a browser: wave 3's app parts.
+  `rehome` and `index`), and in Chromium on the local stack in an encrypted store (a
+  link-to-a-node column under an untitled note, its children as choices, Create from a
+  cell). That pass found that an untitled note's name (its first words, as the tree shows
+  it) was not what formulas and "Nodes under" matched; they now match what the tree shows.
 - **Waiting on open decision 1**: node fields, `[@project].rate`, `get_fields`/`set_fields`,
   a created node getting its siblings' field names.
 

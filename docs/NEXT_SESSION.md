@@ -6,7 +6,7 @@ formula reads are resolved, held and followed live (`sheets/reads.rs`), link-to-
 columns with "Nodes under" and Create, search indexes typed cells. Two wave 1 bugs found
 on screen (invisible link chips, clipped link choices). **Open decision 1 (where node
 fields live) is the one thing blocking the rest of wave 3**; ask Joe. Then wave 4 (copy
-and paste) or wave 6. A browser pass over wave 3's app parts is still to do.
+and paste) or wave 6.
 
 **2026-10-20: rinch at `main` fc14187, sheets wave 2 built** (branch `sheets`, nothing
 pushed). Sheets in text on rinch node views: Insert Sheet, typing in a table in a note,

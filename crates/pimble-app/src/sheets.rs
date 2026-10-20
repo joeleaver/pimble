@@ -503,6 +503,8 @@ struct AppBook {
     absent: HashMap<NodeRef, reads::Where>,
     /// The other notes its formulas read.
     reads: Vec<NodeRef>,
+    /// Untitled notes' shown labels (their first words), worked out once.
+    labels: RefCell<HashMap<NodeRef, String>>,
     today: f64,
 }
 
@@ -610,12 +612,25 @@ impl AppBook {
         let today = chrono::Local::now().date_naive();
         use chrono::Datelike;
         let today = formula::dates::serial(today.year() as i64, today.month() as i64, today.day() as i64) as f64;
-        Self { store, home, snaps, absent, reads: read_notes, today }
+        Self { store, home, snaps, absent, reads: read_notes, labels: RefCell::new(HashMap::new()), today }
     }
 
+    /// A note's name as the tree shows it: its title, or for an untitled
+    /// note its first words (what a person reads there and types in a
+    /// formula), and its parent.
     fn title(&self, node: &NodeRef) -> Option<(String, Option<NodeId>)> {
         let sig = self.store.get_node_signal(node.store, node.node)?;
-        Some(untracked(|| sig.with(|n| (n.metadata.title.clone(), n.parent_id))))
+        let (title, parent) = untracked(|| sig.with(|n| (n.metadata.title.clone(), n.parent_id)));
+        if !title.is_empty() {
+            return Some((title, parent));
+        }
+        let label = self
+            .labels
+            .borrow_mut()
+            .entry(*node)
+            .or_insert_with(|| untracked(|| sig.with(crate::state::display_label_from_node)))
+            .clone();
+        Some((label, parent))
     }
 }
 
@@ -1012,12 +1027,17 @@ fn link_choices(store: AppStore, pane: PaneId, ty: &ColumnType) -> Vec<(String, 
                 .into_iter()
                 .filter_map(|(s, n)| {
                     let sig = store.get_node_signal(s, n)?;
-                    let (title, parent) = untracked(|| sig.with(|node| (node.metadata.title.clone(), node.parent_id)));
+                    let (stored_title, parent) = untracked(|| sig.with(|node| (node.metadata.title.clone(), node.parent_id)));
                     let fits = match under {
                         Some(u) => u.store == s && parent == Some(u.node),
                         None => true,
                     };
-                    (fits && !title.is_empty()).then(|| (title, Stored::Node(node_ref(s, n))))
+                    if !fits {
+                        return None;
+                    }
+                    // As the tree shows it: an untitled note by its first words.
+                    let title = if stored_title.is_empty() { store.display_label(s, n) } else { stored_title };
+                    (!title.is_empty()).then(|| (title, Stored::Node(node_ref(s, n))))
                 })
                 .collect();
             out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
@@ -1199,7 +1219,7 @@ fn filter_choices(store: AppStore, pane: PaneId, all: bool) {
     let offer = match (&col.ty, q.is_empty() || exact) {
         (ColumnType::NodeLink { under: Some(u) }, false) => {
             let typed = untracked(|| ui.edit_text.get()).trim().to_string();
-            let parent = store.get_node_signal(u.store, u.node).map(|s| untracked(|| s.with(|n| n.metadata.title.clone()))).unwrap_or_default();
+            let parent = store.display_label(u.store, u.node);
             let label = format!("Create \"{typed}\" under {parent}");
             labels.push(label.clone());
             Some(CreateOffer { label, title: typed, under: *u })
