@@ -304,6 +304,8 @@ pub(crate) fn open_node_in(store: AppStore, tree_state: UseTreeReturn, pane: Pan
     state.restore.set(None);
     if focused {
         tree_state.controller.set_selection([value.clone()]);
+        // The open row is where the next Shift run starts.
+        tree_state.controller.set_anchor(Some(&value));
     }
 
     // Offline-first: a document opens from the cached content at once and
@@ -2396,7 +2398,10 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         let _ = rinch::Effect::new(move || {
             let selected = store.selected_id.get();
             untracked(|| match &selected {
-                Some(value) => tree_state.controller.set_selection([value.clone()]),
+                Some(value) => {
+                    tree_state.controller.set_selection([value.clone()]);
+                    tree_state.controller.set_anchor(Some(value));
+                }
                 None => tree_state.controller.clear_selected(),
             });
         });

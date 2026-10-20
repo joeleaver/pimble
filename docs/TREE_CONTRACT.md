@@ -417,9 +417,9 @@ deletes, creates, renames from the tree), cleared on restart.
   select nothing; Space toggles a row; the anchor is the row last clicked, Ctrl-clicked,
   Space-toggled or Enter-activated. The explorer opens the row the cursor rests on and
   selects it alone, except when it rests on one of several selected rows (the end of a
-  Shift run), which opens nothing. Known gap: a row opened by the cursor is not the anchor,
-  so Shift+arrows after plain arrows run from the row last clicked; rinch has no way for
-  the app to set the anchor yet.
+  Shift run), which opens nothing. The row the explorer opens is also the anchor
+  (`TreeController::set_anchor`, rinch #1610, `0e7410c7`), so Shift+arrows after plain
+  arrows run from the open row.
 - **Verified on the desktop** (family store copy): Ctrl-clicks, a Shift-click run from the
   anchor, a drag of two selected rows ("2 items into MEDICAL", both landing in order),
   Shift+Down twice then Alt+Shift+Down moving the block of three, the menu's "Delete 3
