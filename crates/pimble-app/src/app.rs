@@ -2298,6 +2298,13 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         let tree_onkey: rinch::prelude::TreeKeyHandler =
             Rc::new(move |key: &rinch::prelude::TreeKey| crate::tree_keys::on_key(store, tree_state, key));
         let on_tree_cursor = ValueCallback::new(move |value: String| {
+            // A cursor that rests on one of several selected rows (the end
+            // of a Shift run) opens nothing: opening selects the row alone.
+            // Off the selection it opens the row, as a click would.
+            let selected = untracked(|| tree_state.selected.get());
+            if selected.len() > 1 && selected.contains(&value) {
+                return;
+            }
             if untracked(|| store.selected_id.get()).as_deref() != Some(value.as_str()) {
                 open_node(store, tree_state, value);
             }

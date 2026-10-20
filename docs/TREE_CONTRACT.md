@@ -316,8 +316,7 @@ deletes, creates, renames from the tree), cleared on restart.
   itself is where it is. `add_node` (creating) still takes an index; wave 2's "new sibling
   after the cursor" moves it to `Place`. The convergence test moves to every kind of place
   (600 seeds converge).
-- **rinch** (`joeleaver/rinch` branch `feat/tree-drop-places`; Pimble's `Cargo.toml`s point
-  at it until it merges): `Tree` takes `draggable`, `drag_values`, `judge_drop`,
+- **rinch** (`joeleaver/rinch` #1589, merged to `main`): `Tree` takes `draggable`, `drag_values`, `judge_drop`,
   `ondropchange`, `ondrop`, `ondragstart`, `ondragend`, `indent`, `hover_expand_ms`,
   `guides`, and reports `TreeDrop { dragged, parent, slot: First | Last | After, over, zone }`.
   The drop is drawn on the row under the pointer as classes and an `::after` at
@@ -348,8 +347,7 @@ deletes, creates, renames from the tree), cleared on restart.
 
 ## Built in wave 2 (2026-10-19, branch `tree`, not merged)
 
-- **rinch** (branch `feat/tree-keyboard`, stacked on `feat/tree-drop-places`; Pimble's
-  `Cargo.toml`s point at it): `Tree { keyboard, handle_key, oncursor, cursor_delay_ms,
+- **rinch** (#1601, merged to `main`): `Tree { keyboard, handle_key, oncursor, cursor_delay_ms,
   label_of }`, `UseTreeReturn::cursor`, `TreeController::{set_cursor, cursor, focus}`.
   The Tree moves the cursor (arrows, Home, End, PageUp, PageDown, Right and Left, `*`,
   type-ahead) and offers every key to `handle_key` first, with
@@ -398,8 +396,7 @@ deletes, creates, renames from the tree), cleared on restart.
   `BackendCommand::MoveNodes` (a `NodeMoved` or `NodeTransplanted` per node) and the web
   vault client (`Handled::Several`). Server test: order at every kind of place, and a
   refused node leaves everything where it was.
-- **rinch** (branch `feat/tree-multiselect`, stacked on `feat/tree-keyboard`; Pimble's
-  `Cargo.toml`s point at it): with `UseTreeOptions::multiple`, Ctrl-click (or Cmd) adds or
+- **rinch** (#1598, merged to `main` as `dc6a87bf`; Pimble is back on rinch `main`): with `UseTreeOptions::multiple`, Ctrl-click (or Cmd) adds or
   removes a row, Shift-click and Shift+arrows select the run of drawn rows from the anchor,
   Ctrl+A the cursor row's siblings; none opens anything. `onselectionchange`,
   `TreeController::set_selection`. Collapsing a row unselects what it hides. A drag of a
@@ -416,6 +413,13 @@ deletes, creates, renames from the tree), cleared on restart.
   Nodes", Copy Link copies one link per line) and turns off Open in Split View, Rename and
   Share. Delete, Ctrl+X/Ctrl+V and Alt+Shift+arrows act on the selection; Escape first
   drops a cut, then narrows a selection to the cursor row.
+- **After review (rinch `dc6a87bf`)**: in a `multiple` tree the arrows move the cursor and
+  select nothing; Space toggles a row; the anchor is the row last clicked, Ctrl-clicked,
+  Space-toggled or Enter-activated. The explorer opens the row the cursor rests on and
+  selects it alone, except when it rests on one of several selected rows (the end of a
+  Shift run), which opens nothing. Known gap: a row opened by the cursor is not the anchor,
+  so Shift+arrows after plain arrows run from the row last clicked; rinch has no way for
+  the app to set the anchor yet.
 - **Verified on the desktop** (family store copy): Ctrl-clicks, a Shift-click run from the
   anchor, a drag of two selected rows ("2 items into MEDICAL", both landing in order),
   Shift+Down twice then Alt+Shift+Down moving the block of three, the menu's "Delete 3

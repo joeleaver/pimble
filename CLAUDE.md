@@ -304,22 +304,22 @@ through `set_image_source` (`<blob>#board=<id>`) and the `pimble-blob:` /
 not ship across devices until they do (Joe). Never put a Pimble concept into rinch:
 propose a general mechanism (Joe, 2026-10-10).
 
-### Explorer tree (wave 1 built 2026-10-19, branch `tree`, not merged)
+### Explorer tree (waves 1-3 built 2026-10-19, branch `tree`, not merged; rinch `main`)
 
 Contract: `docs/TREE_CONTRACT.md` (decisions answered by Joe 2026-10-19; four waves:
 drops, keyboard, multi-select, undo). A move's place is a `pimble_core::Place` (`First`,
 `Last`, `After(sibling)`), never an index, everywhere a move is made (`moveNode`,
 `transplantNode`, `Tree`, the CLI's `--first`/`--after`, MCP `after`/`first`). rinch's
-`Tree` owns the drag (`draggable`, `judge_drop`, `ondropchange`, `ondrop`; rinch branch
-`feat/tree-drop-places`, which the `Cargo.toml`s point at until it merges): before,
+`Tree` owns the drag (`draggable`, `judge_drop`, `ondropchange`, `ondrop`; rinch #1589,
+on `main`): before,
 inside or after a row, the depth at the end of a group from the pointer's indent column.
 `pimble-app/src/tree_drop.rs` `plan_drop` is the one judgement of a drop; the strip at the
 foot of the explorer (`AppStore::drop_hint`) says where it lands, or why not, before the
-release. Wave 2 (keyboard, rinch branch `feat/tree-keyboard`): the Tree moves a cursor and
+release. Wave 2 (keyboard, rinch #1601): the Tree moves a cursor and
 offers keys to `handle_key` first; `pimble-app/src/tree_keys.rs` binds Pimble's (Enter,
 F2, Alt+Shift+arrows through `plan_drop`, new sibling/child, Delete, cut/paste); the
 document follows the cursor; creating takes a `Place` too. `start_rename` is the one way a
-rename starts. Wave 3 (multi-select, rinch branch `feat/tree-multiselect`): Ctrl/Shift
+rename starts. Wave 3 (multi-select, rinch #1598): Ctrl/Shift
 clicks and keys select several rows; drops, keyboard moves, Delete, cut/paste and the row
 menu act on the selection; several nodes of one store move with the `moveNodes` RPC (all
 judged first, one refusal refuses all).
