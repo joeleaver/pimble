@@ -1943,6 +1943,7 @@ dependencies = [
  "pimble-crdt",
  "pimble-crypto",
  "pimble-rpc",
+ "pimble-sheet",
  "rinch",
  "rinch-core",
  "rinch-editor-core",

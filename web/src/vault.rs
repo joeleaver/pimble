@@ -2235,7 +2235,14 @@ impl VaultClient {
                         if info.node_type == node_types::BOARD {
                             doc.board_units().into_iter().map(|u| u.text).collect::<Vec<_>>().join("\n")
                         } else {
-                            doc.text()
+                            // The text, then the typed cells of its tables
+                            // (docs/SHEETS_CONTRACT.md section 10).
+                            let cells = pimble_sheet::index::index_units(doc).into_iter().map(|u| u.text).collect::<Vec<_>>().join("\n");
+                            match doc.text() {
+                                text if cells.is_empty() => text,
+                                text if text.is_empty() => cells,
+                                text => format!("{text}\n{cells}"),
+                            }
                         }
                     })
                     .unwrap_or_default();

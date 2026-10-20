@@ -40,6 +40,7 @@ pimble-rpc = { path = "../crates/pimble-rpc" }
 # over them (docs/CRYPTO_CONTRACT.md, "Web app"; docs/NODE_DOCUMENT_CONTRACT.md);
 # the same yrs documents the desktop's server holds, built from decrypted blobs.
 pimble-crdt = { path = "../crates/pimble-crdt" }
+pimble-sheet = { path = "../crates/pimble-sheet" }
 # Every byte that leaves this page is encrypted here. Pure Rust, no I/O, so
 # the browser runs exactly what the desktop runs.
 pimble-crypto = { path = "../crates/pimble-crypto" }

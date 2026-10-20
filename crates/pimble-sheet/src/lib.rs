@@ -14,6 +14,7 @@
 pub mod book;
 pub mod doc;
 pub mod formula;
+pub mod index;
 pub mod input;
 pub mod model;
 

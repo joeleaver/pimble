@@ -109,7 +109,12 @@ impl NodePlugin for DocumentPlugin {
     }
 
     fn index_units(&self, content: &[u8]) -> Result<Vec<pimble_core::IndexUnit>> {
-        Ok(pimble_crdt::NodeDoc::units_of(content))
+        // The text, then the typed cells of the tables in it
+        // (docs/SHEETS_CONTRACT.md section 10).
+        let Ok(doc) = pimble_crdt::NodeDoc::load(content) else { return Ok(Vec::new()) };
+        let mut units = doc.units();
+        units.extend(pimble_sheet::index::index_units(&doc));
+        Ok(units)
     }
 
     fn validate(&self, _content: &[u8]) -> Result<ValidationResult> {
@@ -214,12 +219,58 @@ impl NodePlugin for BoardPlugin {
     }
 }
 
+/// Built-in sheet plugin (docs/SHEETS_CONTRACT.md section 1): a sheet node is
+/// only its tables, so what search finds in it is their typed cells.
+pub struct SheetPlugin;
+
+impl NodePlugin for SheetPlugin {
+    fn info(&self) -> PluginInfo {
+        PluginInfo {
+            id: "builtin.sheet".to_string(),
+            name: "Sheet".to_string(),
+            version: "0.1.0".to_string(),
+            node_type: pimble_core::node_types::SHEET.to_string(),
+            description: "Small live tables with Excel formulas".to_string(),
+        }
+    }
+
+    fn node_type(&self) -> &str {
+        pimble_core::node_types::SHEET
+    }
+
+    fn schema(&self) -> NodeSchema {
+        NodeSchema { version: 1, fields: vec![] }
+    }
+
+    fn render(&self, _content: &[u8]) -> Result<RenderOutput> {
+        Ok(RenderOutput { widgets: serde_json::json!({ "type": "sheet_view" }), actions: vec![] })
+    }
+
+    fn extract_text(&self, content: &[u8]) -> Result<String> {
+        let units = self.index_units(content)?;
+        Ok(units.into_iter().map(|u| u.text).collect::<Vec<_>>().join("\n"))
+    }
+
+    fn index_units(&self, content: &[u8]) -> Result<Vec<pimble_core::IndexUnit>> {
+        Ok(pimble_crdt::NodeDoc::load(content).map(|doc| pimble_sheet::index::index_units(&doc)).unwrap_or_default())
+    }
+
+    fn validate(&self, _content: &[u8]) -> Result<ValidationResult> {
+        Ok(ValidationResult::ok())
+    }
+
+    fn init_content(&self) -> Result<Vec<u8>> {
+        Ok(pimble_crdt::NodeDoc::new().save())
+    }
+}
+
 /// Create a plugin host with built-in plugins registered
 pub fn create_default_host() -> PluginHost {
     let mut host = PluginHost::new();
     host.register(DocumentPlugin);
     host.register(FolderPlugin);
     host.register(BoardPlugin);
+    host.register(SheetPlugin);
     host
 }
 
