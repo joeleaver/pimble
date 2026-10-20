@@ -5,8 +5,9 @@
 formulas reading (`formula::rehome`), MCP `move_table`, `rows_pointing_here`,
 `get_fields`, `set_fields`; notes a formula reads are resolved, held and followed live
 (`sheets/reads.rs`); link-to-a-node columns with "Nodes under" and Create; fields band
-(`fields.rs`); search indexes typed cells and fields. Next: wave 4 (copy and paste) or
-wave 6 (boards in text onto node views).
+(`fields.rs`); search indexes typed cells and fields. Then sheet nodes embedded in text,
+as board nodes are (Joe asked; `Slot::Embed`, Insert > "Sheet from a Node...", Move
+leaves one). Next: wave 4 (copy and paste) or wave 6 (boards in text onto node views).
 
 **2026-10-20: rinch at `main` fc14187, sheets wave 2 built** (branch `sheets`, nothing
 pushed). Sheets in text on rinch node views: Insert Sheet, typing in a table in a note,

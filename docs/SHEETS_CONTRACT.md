@@ -522,6 +522,7 @@ In layers (Joe, 2026-10-19: "would be nice"):
   writes on the node's document as this window has it, and its cache takes the update.
 - Checked in a release build: Insert Sheet from a Node, typing in the embed reaching the
   sheet node, a restart, Move leaving an embed (tests), the lost list ignoring an
-  embed's tables. Not yet in a browser. Not built: dropping a sheet node's tree row on the
+  embed's tables; and in Chromium on the local stack in an encrypted store (Insert Sheet
+  from a Node, a row typed in the embed found in the sheet node). Not built: dropping a sheet node's tree row on the
   text, and pasting its link, as boards have.
 
