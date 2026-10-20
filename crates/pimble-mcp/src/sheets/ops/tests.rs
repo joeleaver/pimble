@@ -334,8 +334,9 @@ fn names_tables_and_deletes() {
     let out = n.work(|w| delete_table(w, "My_cars")).unwrap();
     assert!(out.contains("Trips[vehicle]"), "{out}");
     assert_eq!(n.snap().tables.len(), 1);
-    let e = n.work(|w| add_column(w, "Trips", &col("who", "node_link"))).unwrap_err();
-    assert!(e.contains("later wave"), "{e}");
+    // A link-to-a-node column, choosing from any node.
+    n.work(|w| add_column(w, "Trips", &col("who", "node_link"))).unwrap();
+    assert!(n.render("Trips").contains("who: link to a node"), "{}", n.render("Trips"));
 }
 
 /// The whole document as one update.
