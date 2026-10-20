@@ -245,6 +245,26 @@ pub struct RenameTableParams {
     pub new_name: String,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct MoveTableParams {
+    /// The node holding the table.
+    pub node: String,
+    /// The table's name (or id).
+    pub table: String,
+    /// The node it moves to: a sheet node, or a text node (into its text).
+    /// Left out, the table moves within its own node.
+    #[serde(default)]
+    pub to: Option<String>,
+    /// Place it after this table of the node it ends up in; last when left out.
+    #[serde(default)]
+    pub after: Option<String>,
+    /// When it ends up in a text node: after the top-level block this quote
+    /// names; at the end of the text when left out (and, within a text node,
+    /// where it was).
+    #[serde(default)]
+    pub after_text: Option<String>,
+}
+
 // ── Plumbing ─────────────────────────────────────────────────────────────
 
 /// Every formula of a column spec, as typed.
@@ -355,7 +375,7 @@ async fn walk_store(client: &PimbleClient, store: &Store) -> Vec<(Addr, Node, St
 /// The embed atom of table `id` as Markdown (rinch writes and reads it as
 /// its element).
 fn embed_markdown(id: &str) -> String {
-    format!("<div data-pm-type=\"embed\" data-sheet=\"{id}\"></div>\n")
+    format!("<div data-pm-type=\"embed\" {SHEET_ATTR}=\"{id}\"></div>\n")
 }
 
 /// The table a Markdown line's embed atom names, if the line is one.
@@ -662,11 +682,155 @@ impl Pimble {
         self.sheet_edit(&client, addr, &[], |w| ops::rename_table(w, &p.table, &p.new_name)).await
     }
 
-    /// Delete a table with its columns and rows.
+    /// Delete a table with its columns and rows (in a text node, its place
+    /// in the text goes too).
     #[tool(name = "delete_table")]
     async fn delete_table(&self, Parameters(p): Parameters<TableParams>) -> Result<String, String> {
         let client = self.client().await?;
         let addr = nodes::resolve(&client, &p.node).await?;
-        self.sheet_edit(&client, addr, &[], |w| ops::delete_table(w, &p.table)).await
+        let node = client.get_node(addr.store, addr.node).await.map_err(rpc)?;
+        let mut book = load_book(&client, addr, &node, &[]).await;
+        let mut answer = String::new();
+        let answer_ref = &mut answer;
+        self.edit(&client, addr, move |doc| {
+            let id = {
+                let mut work = Work::new(Sheets::of_node(doc), &mut book);
+                let id = find_table(work.snap(), &p.table)?.id.clone();
+                *answer_ref = ops::delete_table(&mut work, &p.table)?;
+                id
+            };
+            // Nothing in the text names it: fine.
+            let _ = doc.remove_embeds(SHEET_ATTR, &id);
+            Ok(())
+        })
+        .await?;
+        Ok(answer)
+    }
+
+    /// Move a table: within its node (after another table, or in a text node
+    /// to another place in the text), or into another node, a sheet node or
+    /// a text node's text (Convert to Sheet Node, and back). Its rows, columns
+    /// and ids go with it; formulas on both sides that read it, or that it
+    /// reads, are rewritten to name the other note, so they compute as before.
+    /// A table a link column ties to another table of its note cannot leave
+    /// it (a link reaches its own note's rows only).
+    #[tool(name = "move_table")]
+    async fn move_table(&self, Parameters(p): Parameters<MoveTableParams>) -> Result<String, String> {
+        let client = self.client().await?;
+        let from = nodes::resolve(&client, &p.node).await?;
+        let from_node = client.get_node(from.store, from.node).await.map_err(rpc)?;
+        let snap = sheets_of(&from_node);
+        let table = find_table(&snap, &p.table)?.clone();
+        let to = match &p.to {
+            Some(to) => nodes::resolve(&client, to).await?,
+            None => from,
+        };
+        let to_node = if to == from { from_node.clone() } else { client.get_node(to.store, to.node).await.map_err(rpc)? };
+        let to_text = to_node.node_type != node_types::SHEET;
+        if to_node.node_type == node_types::MOUNT || to_node.node_type == node_types::BOARD {
+            return Err(format!("A table goes in a text node or a sheet node; that is a {} node.", to_node.node_type));
+        }
+        if p.after_text.is_some() && !to_text {
+            return Err("after_text places a table in a text node's text; a sheet node has no text (use after).".into());
+        }
+        let after = p.after.clone();
+        if to == from {
+            let (id, quote) = (table.id.clone(), p.after_text.clone());
+            self.edit(&client, from, move |doc| {
+                if let Some(a) = &after {
+                    let target = find_table(&Sheets::of_node(doc).read(), a)?.id.clone();
+                    let edited = Sheets::of_node(doc).edit(|t| t.move_table(&id, pimble_sheet::doc::Placement::After(target)));
+                    edited.result.map_err(|e| e.to_string())?;
+                }
+                if let Some(quote) = quote.as_deref() {
+                    let _ = doc.remove_embeds(SHEET_ATTR, &id);
+                    doc.insert_markdown_after(quote, false, &embed_markdown(&id)).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            })
+            .await?;
+            return Ok(format!("Moved {} within its node.", table.name));
+        }
+        let tied = !table.row_links().is_empty() || snap.tables.iter().any(|o| o.id != table.id && o.row_links().contains(&table.id));
+        if tied {
+            return Err(format!(
+                "A link column ties {} to another table of its note, and a link reaches rows of its own note only, so it cannot move to another node.",
+                table.name
+            ));
+        }
+        let (from_ref, to_ref) = (node_ref(from), node_ref(to));
+        let moved = table.map_formulas(|f| pimble_sheet::formula::rehome::moved_out(f, &table.id, &from_ref, Some(&to_ref)));
+        // Its new node first: if the second edit fails, the table is in both,
+        // never in neither.
+        let (id, quote) = (table.id.clone(), p.after_text.clone());
+        self.edit(&client, to, move |doc| {
+            let sheets = Sheets::of_node(doc);
+            let target = match &after {
+                Some(a) => Some(find_table(&sheets.read(), a)?.id.clone()),
+                None => None,
+            };
+            // This note's tables that read it in its old note now read it here.
+            let here: Vec<pimble_sheet::TableSnap> = sheets.read().tables;
+            let edited = sheets.edit(|t| {
+                for before in &here {
+                    let after = before.map_formulas(|f| pimble_sheet::formula::rehome::arrived(f, &moved.id, &from_ref));
+                    write_formulas(t, before, &after)?;
+                }
+                t.copy_table(&moved)?;
+                if let Some(target) = target {
+                    t.move_table(&moved.id, pimble_sheet::doc::Placement::After(target))?;
+                }
+                Ok(())
+            });
+            edited.result.map_err(|e| e.to_string())?;
+            if to_text {
+                let atom = embed_markdown(&id);
+                match quote.as_deref() {
+                    Some(q) => doc.insert_markdown_after(q, false, &atom),
+                    None => doc.append_markdown(&atom),
+                }
+                .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })
+        .await?;
+        let id = table.id.clone();
+        let rest: Vec<pimble_sheet::TableSnap> = snap.tables.iter().filter(|t| t.id != id).cloned().collect();
+        let left = self
+            .edit(&client, from, move |doc| {
+                let edited = Sheets::of_node(doc).edit(|t| {
+                    t.delete_table(&id)?;
+                    for before in &rest {
+                        let after = before.map_formulas(|f| pimble_sheet::formula::rehome::left_behind(f, &id, &to_ref));
+                        write_formulas(t, before, &after)?;
+                    }
+                    Ok(())
+                });
+                edited.result.map_err(|e| e.to_string())?;
+                let _ = doc.remove_embeds(SHEET_ATTR, &id);
+                Ok(())
+            })
+            .await;
+        match left {
+            Ok(()) => Ok(format!("Moved {} to {}.", table.name, to.link())),
+            Err(e) => Err(format!("{} was copied to {} but could not be taken out of its old node ({e}); it is in both now.", table.name, to.link())),
+        }
     }
 }
+
+/// Write the formulas and source of `after` where they differ from `before`
+/// (the same table, rewritten).
+fn write_formulas(t: &mut pimble_sheet::doc::SheetsTxn<'_, '_>, before: &pimble_sheet::TableSnap, after: &pimble_sheet::TableSnap) -> pimble_sheet::doc::Result<()> {
+    if after.source != before.source {
+        t.set_source(&after.id, after.source.as_deref())?;
+    }
+    for (old, new) in before.columns.iter().zip(&after.columns) {
+        if old.ty != new.ty {
+            t.set_column_type(&after.id, &new.id, new.ty.clone())?;
+        }
+    }
+    Ok(())
+}
+
+/// The embed attribute naming a table in a text node's text.
+const SHEET_ATTR: &str = "data-sheet";

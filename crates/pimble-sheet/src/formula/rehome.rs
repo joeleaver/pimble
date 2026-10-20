@@ -111,6 +111,13 @@ pub fn moved_out(stored: &str, own: &str, from: &NodeRef, to: Option<&NodeRef>) 
     })
 }
 
+/// A formula of note `to` after table `moved` arrived there from note
+/// `from`: what named it in `from` names it as its own note's table.
+pub fn arrived(stored: &str, moved: &str, from: &NodeRef) -> String {
+    let from_inner = note_inner(from);
+    rewrite(stored, |r| (r.table == moved && r.note.as_deref() == Some(from_inner.as_str())).then(|| format!("{{t:{}}}", r.table)))
+}
+
 /// A formula left in a note after its table `moved` went to note `to`.
 pub fn left_behind(stored: &str, moved: &str, to: &NodeRef) -> String {
     rewrite(stored, |r| (r.note.is_none() && r.table == moved).then(|| format!("{}!{{t:{}}}", note_token(to), r.table)))
@@ -142,6 +149,8 @@ mod tests {
             ),
             "this note's tables get its token; the new note's lose theirs; strings stay"
         );
+        let there = format!("=SUM({}!{{t:own}}[{{c:v}}])+{}!{{t:own}}[{{c:v}}]", note_token(&from), note_token(&other));
+        assert_eq!(arrived(&there, "own", &from), format!("=SUM({{t:own}}[{{c:v}}])+{}!{{t:own}}[{{c:v}}]", note_token(&other)));
         let left = "=COUNTIF({t:own}[{c:v}], [@{c:n}])&\"{t:own}\"+SUM({t:a}[{c:x}])";
         assert_eq!(
             left_behind(left, "own", &to),

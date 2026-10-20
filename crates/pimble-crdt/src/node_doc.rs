@@ -377,6 +377,34 @@ impl NodeDoc {
         self.apply_markdown_delta(delta)
     }
 
+    /// Take every `embed` block whose attribute `attr` is `value` out of the
+    /// content, at any depth (an app's atom whose thing has moved elsewhere).
+    /// Refused as "nothing to change" when there is none.
+    pub fn remove_embeds(&mut self, attr: &str, value: &str) -> Result<Vec<u8>> {
+        fn without(node: &rinch_editor_core::Node, attr: &str, value: &str) -> rinch_editor_core::Node {
+            if node.is_leaf() || node.is_textblock() {
+                return node.clone();
+            }
+            let children: Vec<rinch_editor_core::Node> = node
+                .content()
+                .iter()
+                .filter(|c| !(c.type_name() == "embed" && c.attrs().get_str(attr) == Some(value)))
+                .map(|c| without(c, attr, value))
+                .collect();
+            node.copy_with_content(rinch_editor_core::Fragment::from_children(children))
+        }
+        let (attr, value) = (attr.to_string(), value.to_string());
+        self.markdown_edit(move |schema, doc| {
+            let after = without(doc, &attr, &value);
+            if after.content().child_count() == 0 {
+                // A document needs a block: an empty paragraph.
+                let p = schema.branch("paragraph", rinch_editor_core::Fragment::empty()).map_err(|e| CrdtError::Collab(e.to_string()))?;
+                return Ok(after.copy_with_content(rinch_editor_core::Fragment::from_node(p)));
+            }
+            Ok(after)
+        })
+    }
+
     fn markdown_edit(
         &mut self,
         edit: impl FnOnce(&std::rc::Rc<rinch_editor_core::Schema>, &rinch_editor_core::Node) -> Result<rinch_editor_core::Node>,
@@ -1234,6 +1262,17 @@ mod tests {
         assert!(peer.links().is_empty());
         let md = peer.markdown().unwrap();
         assert!(md.contains("data-sheet=\"t1\""), "{md}");
+    }
+
+    /// `remove_embeds` takes the matching embeds out, at any depth, and
+    /// leaves the rest.
+    #[test]
+    fn remove_embeds_takes_out_only_the_matching_ones() {
+        let embed = |id: &str| Block::Embed { attrs: vec![("data-sheet".to_string(), id.to_string())] };
+        let mut doc = NodeDoc::from_blocks(&[Block::plain("a"), embed("t1"), Block::Blockquote { blocks: vec![embed("t1"), Block::plain("q")] }, embed("t2")]).unwrap();
+        doc.remove_embeds("data-sheet", "t1").unwrap();
+        assert_eq!(doc.blocks().unwrap(), vec![Block::plain("a"), Block::Blockquote { blocks: vec![Block::plain("q")] }, embed("t2")]);
+        assert!(doc.remove_embeds("data-sheet", "t1").is_err(), "nothing left to take out");
     }
 
     const T0: &str = "2026-09-18T10:00:00Z";
