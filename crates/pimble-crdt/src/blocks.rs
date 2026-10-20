@@ -5,7 +5,8 @@
 //! app's editor renders: text blocks (paragraph, heading, code block), nested
 //! bullet/ordered lists, block quotes, tables and horizontal rules, with the
 //! starter-kit marks and, inside a paragraph or heading, the inline atoms (an image, a
-//! hard break). Anything outside it (task lists) has no variant here on purpose: a
+//! hard break), and an app's `embed` atom by its `data-*` attributes. Anything
+//! outside it (task lists) has no variant here on purpose: a
 //! document built from these blocks always projects, so an import never produces a
 //! node the editor refuses to open.
 
@@ -27,6 +28,9 @@ pub enum Block {
     Table { rows: Vec<TableRow> },
     /// A rule across the page (a scene break): a block with nothing in it.
     HorizontalRule,
+    /// A block an app draws itself (rinch's `embed`, e.g. a sheet's table in
+    /// text): nothing but its `data-*` attributes, by name.
+    Embed { attrs: Vec<(String, String)> },
 }
 
 impl Block {
@@ -45,7 +49,7 @@ impl Block {
     /// hard break reads as a newline; an image and a rule read as nothing.
     pub fn plain_text(&self) -> String {
         match self {
-            Block::HorizontalRule => String::new(),
+            Block::HorizontalRule | Block::Embed { .. } => String::new(),
             Block::Paragraph { runs, .. } | Block::Heading { runs, .. } => runs_text(runs),
             Block::CodeBlock { text } => text.clone(),
             Block::BulletList { items } | Block::OrderedList { items, .. } => items
@@ -365,6 +369,10 @@ fn build_block(schema: &Rc<Schema>, block: &Block) -> Result<Node> {
             schema.branch("table", Fragment::from_children(row_nodes)).map_err(collab)
         }
         Block::HorizontalRule => schema.branch("horizontal_rule", Fragment::empty()).map_err(collab),
+        Block::Embed { attrs } => {
+            let attrs = attrs.iter().fold(Attrs::new(), |a, (k, v)| a.with(k.as_str(), v.clone()));
+            schema.create_node("embed", attrs, Fragment::empty()).map_err(collab)
+        }
     }
 }
 
@@ -473,6 +481,9 @@ fn read_block(node: &Node) -> Result<Block> {
         // A code block holds text and nothing else (the schema allows no atom in one).
         "code_block" => Block::CodeBlock { text: runs_text(&read_runs(node)?) },
         "horizontal_rule" => Block::HorizontalRule,
+        "embed" => Block::Embed {
+            attrs: node.attrs().iter().filter_map(|(k, v)| v.as_str().map(|v| (k.to_string(), v.to_string()))).collect(),
+        },
         "bullet_list" => Block::BulletList { items: read_items(node)? },
         "ordered_list" => {
             Block::OrderedList { start: node.attrs().get_int("start").unwrap_or(1), items: read_items(node)? }

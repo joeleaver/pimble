@@ -1219,6 +1219,23 @@ mod tests {
     use crate::ContentDoc;
     use serde_json::json;
 
+    /// An app's `embed` atom (a sheet's table in text) reads back with its
+    /// `data-*` attributes, and every reader of the content copes with it.
+    #[test]
+    fn an_embed_reads_back_and_every_reader_copes() {
+        let embed = Block::Embed { attrs: vec![("data-sheet".to_string(), "t1".to_string())] };
+        let blocks = vec![Block::plain("before"), embed.clone(), Block::plain("after")];
+        let doc = NodeDoc::from_blocks(&blocks).unwrap();
+        let peer = NodeDoc::load(&doc.save()).unwrap();
+        assert_eq!(peer.blocks().unwrap(), blocks);
+        // The embed is an empty line of the text, as a rule is.
+        assert_eq!(peer.text(), "before\n\nafter");
+        assert_eq!(peer.units().len(), 3);
+        assert!(peer.links().is_empty());
+        let md = peer.markdown().unwrap();
+        assert!(md.contains("data-sheet=\"t1\""), "{md}");
+    }
+
     const T0: &str = "2026-09-18T10:00:00Z";
     const T1: &str = "2026-09-18T10:00:01Z";
     const T2: &str = "2026-09-18T10:00:02Z";

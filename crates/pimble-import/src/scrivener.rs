@@ -160,7 +160,7 @@ impl ImportStats {
                     self.marked_runs += runs.iter().filter_map(Inline::as_run).filter(|r| !r.marks.is_empty()).count();
                 }
                 Block::CodeBlock { .. } => self.paragraphs += 1,
-                Block::HorizontalRule => {}
+                Block::HorizontalRule | Block::Embed { .. } => {}
                 Block::BulletList { items } | Block::OrderedList { items, .. } => {
                     self.lists += 1;
                     for item in items {
