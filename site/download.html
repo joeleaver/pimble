@@ -3,94 +3,181 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Download — Pimble</title>
-  <meta name="description" content="Download Pimble for Linux or Windows.">
+  <title>Download Pimble</title>
+  <meta name="description" content="Download Pimble for Linux or Windows, or open the web app.">
   <link rel="icon" href="brand/pimble-icon.svg" type="image/svg+xml">
   <link rel="icon" href="brand/pimble-32.png" sizes="32x32" type="image/png">
   <link rel="apple-touch-icon" href="brand/apple-touch-icon.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <header class="nav">
-    <a class="nav__brand" href="index.html"><picture><source srcset="brand/pimble-lockup-on-dark.svg" media="(prefers-color-scheme: dark)"><img src="brand/pimble-lockup.svg" alt="Pimble" height="26"></picture></a>
+    <a class="nav__brand" href="index.html"><picture><source srcset="brand/pimble-lockup-on-dark.svg" media="(prefers-color-scheme: dark)"><img src="brand/pimble-lockup.svg" alt="Pimble" width="111" height="26"></picture></a>
     <nav class="nav__links">
-      <a href="download.html">Download</a>
+      <a href="download.html" aria-current="page">Download</a>
+      <a href="/app/" class="nav__hide-sm">Web app</a>
       <a href="/app/login">Log in</a>
       <a href="/app/signup" class="nav__cta">Sign up</a>
     </nav>
   </header>
 
-  <main>
-    <section class="shell hero">
+  <main class="wrap">
+    <div class="page-head">
       <h1>Download Pimble</h1>
-      <p class="lead">
-        The desktop app runs entirely on your own machine — no account, no
-        network, no server. Sign up separately if you also want a hosted
-        store you can reach from a browser.
-      </p>
+      <p>The desktop app keeps your stores on your own disk and runs without a network or an account. Each package carries two programs: <code>pimble</code>, the app, and <code>pimble-mcp</code>, the MCP server for LLM clients.</p>
+    </div>
 
-      <p id="release-meta" class="release-meta" hidden>
-        Version <span data-version></span>, published <span data-date></span>.
-      </p>
+    <p id="release-meta" class="release-meta" hidden>
+      <span class="pill" data-version></span> published <span data-date></span>
+      · <a data-notes href="https://github.com/joeleaver/pimble/releases/latest">Release notes</a>
+    </p>
 
-      <div id="asset-linux" class="asset" hidden>
-        <div>
-          <div class="asset__os">Linux</div>
-          <div class="asset__note">
-            A plain binary in a tar.gz — no installer, no package repository.
-            Extract it and run it; nothing else is installed on your system.
+    <p id="release-loading" class="dim">Looking up the latest release…</p>
+
+    <!-- One entry per kind of package a release attaches (.github/workflows/release.yml).
+         The script fills the entries it finds and lists anything else under "Other files". -->
+    <div class="assets">
+      <div id="asset-deb" class="asset" hidden>
+        <div class="asset__main">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12 4 7.5"/></svg></div>
+          <div>
+            <div class="asset__os">Linux: Ubuntu and Debian<span class="asset__tag" data-rec hidden>For this computer</span></div>
+            <div class="asset__file" data-name></div>
+            <div class="asset__note">
+              Puts Pimble in your app launcher and <code>pimble</code> and <code>pimble-mcp</code>
+              on your PATH. Install it with <code>sudo apt install ./pimble_*.deb</code>;
+              installing a newer one upgrades it. Needs Ubuntu 24.04, Debian 13 or newer.
+            </div>
           </div>
         </div>
-        <a class="btn" href="#" data-download>Download (<span data-size></span>)</a>
+        <a class="btn" href="#" data-download>Download <span data-size></span></a>
+      </div>
+
+      <div id="asset-linux" class="asset" hidden>
+        <div class="asset__main">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="m7.5 9.5 3 2.5-3 2.5M13 15h4"/></svg></div>
+          <div>
+            <div class="asset__os">Linux: any distribution<span class="asset__tag" data-rec hidden>For this computer</span></div>
+            <div class="asset__file" data-name></div>
+            <div class="asset__note">
+              The same two programs in a tar.gz, with no installer. Extract it and run
+              <code>./pimble</code>; nothing else is installed on your system. 64-bit x86,
+              glibc 2.38 or newer (Ubuntu 24.04, Fedora 39, Debian 13 and later).
+            </div>
+          </div>
+        </div>
+        <a class="btn" href="#" data-download>Download <span data-size></span></a>
       </div>
 
       <div id="asset-windows" class="asset" hidden>
-        <div>
-          <div class="asset__os">Windows</div>
-          <div class="asset__note">A zip file containing pimble.exe.</div>
+        <div class="asset__main">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M4 5.6 10.8 4.6v6.7H4zM12.2 4.4 20 3.3v8H12.2zM4 12.7h6.8v6.7L4 18.4zM12.2 12.7H20v8l-7.8-1.1z"/></svg></div>
+          <div>
+            <div class="asset__os">Windows<span class="asset__tag" data-rec hidden>For this computer</span></div>
+            <div class="asset__file" data-name></div>
+            <div class="asset__note">
+              A zip holding <code>pimble.exe</code> and <code>pimble-mcp.exe</code>, with no
+              installer. Unzip it anywhere and run <code>pimble.exe</code>. 64-bit Windows.
+            </div>
+          </div>
         </div>
-        <a class="btn" href="#" data-download>Download (<span data-size></span>)</a>
+        <a class="btn" href="#" data-download>Download <span data-size></span></a>
       </div>
 
-      <div id="release-empty" class="panel quiet" hidden>
-        No release has been published yet. In the meantime you can build
-        Pimble from source: <a href="https://github.com/pimble/pimble">clone
-        the repository</a> and run <code>cargo build -p pimble-app --release</code>.
+      <div id="asset-other" class="panel" hidden>
+        <h3>Other files in this release</h3>
+        <ul class="steps" data-list></ul>
       </div>
+    </div>
 
-      <div id="release-error" class="panel quiet" hidden>
-        <span data-message>Couldn't load the current release.</span>
-        In the meantime, get the source directly from
-        <a href="https://github.com/pimble/pimble">GitHub</a>.
+    <div id="release-empty" class="panel quiet" hidden>
+      No release has been published yet. In the meantime you can build Pimble from source:
+      <a href="https://github.com/joeleaver/pimble">clone the repository</a> and run
+      <code>cargo build -p pimble-app --release</code>.
+    </div>
+
+    <div id="release-error" class="panel quiet" hidden>
+      <span data-message>Couldn't load the current release.</span>
+      Every release is also on
+      <a href="https://github.com/joeleaver/pimble/releases/latest">GitHub</a>.
+    </div>
+
+    <div class="subgrid">
+      <div class="panel">
+        <h3>No download needed</h3>
+        <p>The web app opens your hosted stores and the ones shared with you in any browser. Encrypted stores are decrypted there, on your device.</p>
+        <a class="btn small secondary" href="/app/">Open the web app</a>
       </div>
-    </section>
+      <div class="panel">
+        <h3>Connect an LLM</h3>
+        <p>Point your MCP client at <code>pimble-mcp</code> from the package. For Claude Code:</p>
+        <p><code>claude mcp add pimble -- /path/to/pimble-mcp</code></p>
+        <p>It joins the Pimble app if it is running, or opens your stores itself if not.</p>
+      </div>
+    </div>
   </main>
 
   <footer class="site">
-    <div class="shell" style="padding: 0;">
-      Pimble. <a href="https://github.com/pimble/pimble">Source on GitHub</a>.
+    <div class="wrap footer__inner">
+      <div class="footer__brand">
+        <picture><source srcset="brand/pimble-lockup-on-dark.svg" media="(prefers-color-scheme: dark)"><img src="brand/pimble-lockup.svg" alt="Pimble" width="86" height="20"></picture>
+        <span>Open source, MIT license.</span>
+      </div>
+      <nav class="footer__links">
+        <a href="download.html">Download</a>
+        <a href="/app/">Web app</a>
+        <a href="/app/login">Log in</a>
+        <a href="https://github.com/joeleaver/pimble">GitHub</a>
+      </nav>
     </div>
   </footer>
 
   <script src="site.js"></script>
   <script>
     (async function () {
-      const linuxEl = document.getElementById("asset-linux");
-      const windowsEl = document.getElementById("asset-windows");
       const metaEl = document.getElementById("release-meta");
+      const loadingEl = document.getElementById("release-loading");
       const emptyEl = document.getElementById("release-empty");
       const errorEl = document.getElementById("release-error");
+      const otherEl = document.getElementById("asset-other");
+
+      // Which entry a release asset belongs in, from its file name: the .deb
+      // (pimble_X.Y.Z_amd64.deb), the Linux tar.gz, the Windows zip. Checksums
+      // and anything new go under "Other files", so nothing attached is hidden.
+      function kindOf(asset) {
+        const name = (asset.name || "").toLowerCase();
+        if (name.endsWith(".deb")) return "deb";
+        if (asset.os === "linux" && (name.endsWith(".tar.gz") || name.endsWith(".tgz"))) return "linux";
+        if (asset.os === "windows" && (name.endsWith(".zip") || name.endsWith(".exe") || name.endsWith(".msi"))) return "windows";
+        return "other";
+      }
+
+      // The package to point this visitor at, as far as the browser can tell.
+      function recommendedKind() {
+        const ua = (navigator.userAgent || "").toLowerCase();
+        if (ua.includes("windows")) return "windows";
+        if (ua.includes("android") || ua.includes("iphone") || ua.includes("ipad")) return null;
+        if (ua.includes("ubuntu") || ua.includes("debian")) return "deb";
+        if (ua.includes("linux") || ua.includes("x11")) return "linux";
+        return null;
+      }
+
+      function fill(el, asset) {
+        el.hidden = false;
+        el.querySelector("[data-download]").href = asset.url;
+        el.querySelector("[data-name]").textContent = asset.name;
+        const size = formatBytes(asset.size);
+        el.querySelector("[data-size]").textContent = size ? `(${size})` : "";
+      }
 
       try {
         const data = await apiFetch("/releases");
         const assets = (data && data.assets) || [];
-        const linux = assets.find((a) => a.os === "linux");
-        const windows = assets.find((a) => a.os === "windows");
-
-        if (!linux && !windows) {
+        loadingEl.hidden = true;
+        if (assets.length === 0) {
           emptyEl.hidden = false;
           return;
         }
@@ -98,18 +185,39 @@
         metaEl.hidden = false;
         metaEl.querySelector("[data-version]").textContent = data.version;
         metaEl.querySelector("[data-date]").textContent = formatDate(data.published_at);
-
-        if (linux) {
-          linuxEl.hidden = false;
-          linuxEl.querySelector("[data-download]").href = linux.url;
-          linuxEl.querySelector("[data-size]").textContent = formatBytes(linux.size);
+        if (data.version) {
+          metaEl.querySelector("[data-notes]").href =
+            "https://github.com/joeleaver/pimble/releases/tag/" + encodeURIComponent(data.version);
         }
-        if (windows) {
-          windowsEl.hidden = false;
-          windowsEl.querySelector("[data-download]").href = windows.url;
-          windowsEl.querySelector("[data-size]").textContent = formatBytes(windows.size);
+
+        const found = {};
+        const others = [];
+        for (const asset of assets) {
+          const kind = kindOf(asset);
+          if (kind === "other" || found[kind]) others.push(asset);
+          else found[kind] = asset;
+        }
+        for (const kind of ["deb", "linux", "windows"]) {
+          if (found[kind]) fill(document.getElementById("asset-" + kind), found[kind]);
+        }
+
+        let rec = recommendedKind();
+        if (rec === "deb" && !found.deb) rec = "linux";
+        if (rec && found[rec]) {
+          const el = document.getElementById("asset-" + rec);
+          el.classList.add("recommended");
+          el.querySelector("[data-rec]").hidden = false;
+          el.parentNode.prepend(el);
+        }
+
+        if (others.length) {
+          otherEl.hidden = false;
+          otherEl.querySelector("[data-list]").innerHTML = others
+            .map((a) => `<li><a href="${escapeHtml(a.url)}">${escapeHtml(a.name)}</a> <span class="dim">${escapeHtml(formatBytes(a.size))}</span></li>`)
+            .join("");
         }
       } catch (err) {
+        loadingEl.hidden = true;
         errorEl.hidden = false;
         errorEl.querySelector("[data-message]").textContent = err.message;
       }

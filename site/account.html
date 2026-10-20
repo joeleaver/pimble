@@ -11,7 +11,8 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <main class="shell">
+  <main class="shell redirect">
+    <picture><source srcset="brand/pimble-lockup-on-dark.svg" media="(prefers-color-scheme: dark)"><img src="brand/pimble-lockup.svg" alt="Pimble" width="120" height="28"></picture>
     <p>Your account page lives inside the app. <a href="/app/account">Continue to /app/account</a>.</p>
   </main>
   <script>window.location.replace("/app/account");</script>

@@ -4,211 +4,256 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Pimble: your notes, on your disk, shared when you choose</title>
-  <meta name="description" content="Pimble is an offline-first personal information manager: your notes, plans and references in a folder on your own disk, easy to share and edit together in real time.">
+  <title>Pimble: your notes in one tree, on your own disk</title>
+  <meta name="description" content="Pimble keeps your notes, plans and references in a tree on your own disk. It works offline, merges edits from every device and person, and shares a branch through Pimble Cloud or straight from your computer, end-to-end encrypted.">
   <link rel="icon" href="brand/pimble-icon.svg" type="image/svg+xml">
   <link rel="icon" href="brand/pimble-32.png" sizes="32x32" type="image/png">
   <link rel="apple-touch-icon" href="brand/apple-touch-icon.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <header class="nav">
-    <a class="nav__brand" href="index.html"><picture><source srcset="brand/pimble-lockup-on-dark.svg" media="(prefers-color-scheme: dark)"><img src="brand/pimble-lockup.svg" alt="Pimble" height="26"></picture></a>
+    <a class="nav__brand" href="index.html"><picture><source srcset="brand/pimble-lockup-on-dark.svg" media="(prefers-color-scheme: dark)"><img src="brand/pimble-lockup.svg" alt="Pimble" width="111" height="26"></picture></a>
     <nav class="nav__links">
       <a href="download.html">Download</a>
+      <a href="/app/" class="nav__hide-sm">Web app</a>
       <a href="/app/login">Log in</a>
       <a href="/app/signup" class="nav__cta">Sign up</a>
     </nav>
   </header>
 
   <main>
-    <section class="shell hero">
-      <h1>One place for everything you write down, and it's actually yours.</h1>
+    <section class="wrap hero">
+      <h1>Everything you write down, in one tree that's yours.</h1>
       <p class="lead">
-        Pimble is a personal information manager: notes, plans, references,
-        whatever else you'd otherwise scatter across a dozen apps, organized
-        into one tree you shape yourself. It lives in a folder on your own
-        disk, so it's there whether or not you have a network, and whether or
-        not Pimble's servers are running. Share a piece of it, and edits from
-        two people — or two of your own devices — merge back together on
-        their own.
+        Pimble keeps your notes, plans and references in stores on your own
+        disk. It works without a network and without an account. When you want
+        company, share a branch of the tree: everyone edits it at once, and
+        every change merges.
       </p>
       <div class="hero__actions">
-        <a class="btn" href="download.html">Download for desktop</a>
-        <a class="btn secondary" href="/app/signup">Create a free account</a>
+        <a class="btn" href="download.html">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11m-4.5-4.5L12 15l4.5-4.5M5 20h14"/></svg>
+          Download for desktop
+        </a>
+        <a class="btn secondary" href="/app/">Open the web app</a>
       </div>
-    </section>
+      <p class="hero__note">Linux and Windows. Free and open source.</p>
 
-    <section class="shell">
-      <h2>Organized your way</h2>
-      <p class="prose">
-        A store is a folder on disk, and everything in it is a node in a
-        tree: a page of formatted text, a project, a room in the house, a
-        person you keep notes about — whatever shape your life actually
-        takes. There's no separate database quietly keeping itself in sync
-        with your files. The folder is the store. And because it's a folder
-        you own, it's still there even if Pimble the company someday isn't.
-      </p>
-
-      <figure class="tree-figure">
-        <ul>
-          <li>Home
+      <figure class="window" aria-label="An illustration of the Pimble app">
+        <div class="window__bar">
+          <picture><source srcset="brand/pimble-lockup-on-dark.svg" media="(prefers-color-scheme: dark)"><img src="brand/pimble-lockup.svg" alt="" width="68" height="16"></picture>
+          <span class="window__title">Q4 planning</span>
+        </div>
+        <div class="window__body">
+          <div class="window__tree" aria-hidden="true">
+            <div class="window__search">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="6"/><path d="m20 20-4.5-4.5"/></svg>
+              Search
+            </div>
+            <div class="row store"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M3 7.5A2 2 0 0 1 5 5.5h4l2 2h8a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>Home</div>
+            <div class="row l1"><span class="swatch" style="background:#5f9d6b"></span>House</div>
+            <div class="row l2"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M7 4h7l4 4v12H7z"/><path d="M10 12h5M10 16h5"/></svg>Contractor quotes</div>
+            <div class="row l2 hide-sm"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M7 4h7l4 4v12H7z"/><path d="M10 12h5M10 16h5"/></svg>Garden plan</div>
+            <div class="row l1 hide-sm"><span class="swatch" style="background:#c0883a"></span>Taxes 2026</div>
+            <div class="row l1 hide-sm"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 4 3 9l9 5 9-5z"/><path d="m3 14 9 5 9-5"/></svg>Reading list<span class="badge">mounted</span></div>
+            <div class="row store"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M3 7.5A2 2 0 0 1 5 5.5h4l2 2h8a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>Work<span class="badge">encrypted · synced</span></div>
+            <div class="row l1 selected"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M7 4h7l4 4v12H7z"/><path d="M10 12h5M10 16h5"/></svg>Q4 planning</div>
+            <div class="row l1 hide-sm"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M7 4h7l4 4v12H7z"/><path d="M10 12h5M10 16h5"/></svg>Hiring</div>
+            <div class="row l1 hide-sm"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 4 3 9l9 5 9-5z"/><path d="m3 14 9 5 9-5"/></svg>Reading list<span class="badge">mounted</span></div>
+          </div>
+          <div class="window__pane focused">
+            <div class="pane__title">Q4 planning</div>
+            <p>Three things have to land before the end of the year, in this order:</p>
             <ul>
-              <li>House
-                <ul>
-                  <li>Contractor quotes</li>
-                  <li>Reading list <span class="mount-tag">mounted</span></li>
-                </ul>
-              </li>
-              <li>Taxes</li>
+              <li>Ship the new onboarding flow</li>
+              <li>Close the two open roles (see <a href="#" tabindex="-1">Hiring</a>)</li>
+              <li>Move the team wiki out of the old tool<span class="caret" title="Someone else's caret"></span></li>
             </ul>
-          </li>
-          <li>Work
-            <ul>
-              <li>Q3 planning</li>
-              <li>Reading list <span class="mount-tag">mounted</span></li>
-            </ul>
-          </li>
-        </ul>
-        <figcaption>
-          An illustration of a Pimble tree, not a screenshot. "Reading list"
-          is one store, mounted inside both Home and Work — a single thing,
-          edited from either, never copied.
-        </figcaption>
+            <p>Dana and I are both in this note right now; our edits merge as we type.</p>
+          </div>
+          <div class="window__pane second">
+            <div class="pane__title">Contractor quotes</div>
+            <table class="mini-table">
+              <tr><th>Job</th><th>Who</th><th>Quote</th></tr>
+              <tr><td>Roof</td><td>Ridgeline</td><td>$8,400</td></tr>
+              <tr><td>Gutters</td><td>Ridgeline</td><td>$1,150</td></tr>
+              <tr><td>Deck</td><td>Halvorsen</td><td>$5,900</td></tr>
+            </table>
+            <p>Ridgeline can start the week of the 9th if we confirm by Friday.</p>
+          </div>
+        </div>
       </figure>
+      <p class="window__caption">An illustration, not a screenshot: two stores, a reading list mounted in both, and two notes side by side in split view.</p>
     </section>
 
-    <section class="shell">
-      <h2>Three ways to run it</h2>
-      <p class="prose">Pick the one that fits, and change your mind later.</p>
-
-      <div class="plans">
-        <div class="plan">
-          <div class="plan__head">
-            <h3>On your own</h3>
-          </div>
-          <p>
-            Download the app, point it at a folder, and start writing.
-            There's no account to create and nothing leaves your machine.
-            This isn't a limited trial of the real product — it is the real
-            product.
-          </p>
+    <section class="wrap section">
+      <div class="section__head">
+        <span class="eyebrow">What it does</span>
+        <h2>A notebook shaped like your life, not like an app.</h2>
+        <p>Projects, rooms of the house, people you keep notes about: whatever you keep, it goes in one tree you arrange yourself.</p>
+      </div>
+      <div class="features">
+        <div class="feature">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 4v14a2 2 0 0 0 2 2h3M6 10h5"/><rect x="13" y="7" width="7" height="6" rx="2"/><rect x="13" y="16" width="7" height="6" rx="2"/></svg></div>
+          <h3>A tree you shape</h3>
+          <p>Every note is a node in a tree you arrange by dragging. Give a row an icon and a color, tag it, and link one note to another by typing <code>[[</code>.</p>
         </div>
-
-        <div class="plan">
-          <div class="plan__head">
-            <h3>Shared through a relay</h3>
-            <span class="tag">coming soon</span>
-          </div>
-          <p>
-            Share a store with someone else, and Pimble's servers pass the
-            changes between you as they happen, without ever storing what's
-            in them. For when you want to collaborate but keep your data off
-            anyone else's disk.
-          </p>
+        <div class="feature">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M3 7.5A2 2 0 0 1 5 5.5h4l2 2h8a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></div>
+          <h3>Stores on your own disk</h3>
+          <p>A store is a folder you can see, back up and carry. Pimble opens it with or without a network, and it stays yours if Pimble someday doesn't.</p>
         </div>
-
-        <div class="plan">
-          <div class="plan__head">
-            <h3>Hosted on Pimble Cloud</h3>
-            <span class="tag">coming soon</span>
-          </div>
-          <p>
-            For a team that wants the store itself hosted, not just relayed:
-            it lives on Pimble Cloud, encrypted so that even Pimble can't
-            read it. Everything that goes through the cloud is designed to
-            be unreadable to us, end to end.
-          </p>
+        <div class="feature">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="12" r="2"/><path d="M6 7v10M6 8c0 3 4 4 10 4"/></svg></div>
+          <h3>Edits that merge</h3>
+          <p>Two people, or two of your own devices, can write in the same note at once, or apart for months. The changes merge on their own; nothing locks and nothing is thrown away.</p>
+        </div>
+        <div class="feature">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M12 4 3 9l9 5 9-5z"/><path d="m3 14 9 5 9-5"/></svg></div>
+          <h3>Mounts</h3>
+          <p>Show any branch of any store inside another: the same notes, edited from either place, never a copy. A store on another server comes along and stays in step.</p>
+        </div>
+        <div class="feature">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M12 4v16M12 12h9"/></svg></div>
+          <h3>Split view</h3>
+          <p>Up to four notes side by side, tiled however you like. Open the same note twice to write in one place while you read in another.</p>
+        </div>
+        <div class="feature">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="m20 20-4.5-4.5"/></svg></div>
+          <h3>Search that keeps up</h3>
+          <p>Results narrow as you type. Semantic search finds a passage by what it's about, even when you've forgotten the words, with a small model that runs on your machine.</p>
+        </div>
+        <div class="feature">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="1.5"/><path d="m21 16-5-5-8 9"/></svg></div>
+          <h3>Rich text, tables, pictures</h3>
+          <p>Headings, lists, quotes, code, tables and pictures, every one of them co-editable. Paste or drop a picture straight into a note.</p>
+        </div>
+        <div class="feature">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19c3-1 4-5 7-5s3 3 6 2"/><path d="m14 5 5 5M16.5 3.5l4 4L12 16H8v-4z"/></svg></div>
+          <h3>Whiteboards and markup</h3>
+          <p>Sketch on an infinite board with pen pressure, shapes, sticky notes and connectors, or mark up a picture right where it sits in a note.</p>
+        </div>
+        <div class="feature">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11m-4.5-4.5L12 15l4.5-4.5M5 20h14"/></svg></div>
+          <h3>Bring your old notes</h3>
+          <p>Import RTF files, Word documents and whole Scrivener projects, with their folders, labels and icons.</p>
         </div>
       </div>
     </section>
 
-    <section class="shell">
-      <h2>Search that understands what you meant</h2>
-      <p class="prose">
-        Every store keeps its own index, right there next to your files:
-        ordinary keyword search across every title and every word you've
-        written, narrowing results as you type. Alongside it, semantic
-        search finds a passage by what it's about, even when you don't
-        remember the words you used for it — and because the model behind
-        it runs locally on your machine, that search never touches a network
-        either.
-      </p>
+    <section class="wrap section" id="sharing">
+      <div class="section__head">
+        <span class="eyebrow">Sharing</span>
+        <h2>Share a branch, not a copy.</h2>
+        <p>Share any note and everything under it with the people you choose, as editors or readers. They work in the same documents you do, on their own devices, and see each other's edits as they type. Nothing goes to Pimble Cloud unless you ask for it.</p>
+      </div>
+      <div class="ways">
+        <div class="way">
+          <h3>Hosted on Pimble Cloud</h3>
+          <div class="way__sub">Always there, whether your computer is on or not</div>
+          <p>Host a store and every device and every member reaches it at any hour, from the desktop app or a browser.</p>
+          <div class="diagram" aria-hidden="true">
+            <div class="node">You<small>your devices</small></div>
+            <span class="arrow"><svg viewBox="0 0 22 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2 6h18M16 2l4 4-4 4M6 2 2 6l4 4"/></svg></span>
+            <div class="node middle">Pimble Cloud<small>holds ciphertext</small></div>
+            <span class="arrow"><svg viewBox="0 0 22 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2 6h18M16 2l4 4-4 4M6 2 2 6l4 4"/></svg></span>
+            <div class="node">Members<small>desktop or browser</small></div>
+          </div>
+        </div>
+        <div class="way">
+          <h3>Shared from your computer</h3>
+          <div class="way__sub">The store never leaves your disk</div>
+          <p>Pimble Cloud only relays members' connections to your computer and stores nothing. While you're away, members' desktop apps keep working on their copy and catch up when you're back.</p>
+          <div class="diagram" aria-hidden="true">
+            <div class="node">You<small>the store</small></div>
+            <span class="arrow"><svg viewBox="0 0 22 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2 6h18M16 2l4 4-4 4M6 2 2 6l4 4"/></svg></span>
+            <div class="node middle">Relay<small>stores nothing</small></div>
+            <span class="arrow"><svg viewBox="0 0 22 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2 6h18M16 2l4 4-4 4M6 2 2 6l4 4"/></svg></span>
+            <div class="node">Members<small>desktop or browser</small></div>
+          </div>
+        </div>
+      </div>
+      <div class="lockline">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2.5"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
+        <div><strong>End-to-end encrypted.</strong> Your password unlocks keys that stay on your devices, and every note is encrypted before it leaves them. Pimble Cloud can't read your notes or their titles, and neither can anyone who gets hold of its disks. A recovery code, given when you sign up, gets you back in if you forget the password.</div>
+      </div>
     </section>
 
-    <section class="shell">
-      <h2>No more "someone else has this open"</h2>
-      <p class="prose">
-        Two people can open the same page at the same time — on two laptops
-        anywhere in the world, or two windows on your own machine — and both
-        keep working. Nothing locks, nothing gets thrown away, and neither
-        person waits for the other to close their editor. It's the same
-        trick that lets Pimble work offline in the first place: every
-        document is built to reconcile changes from more than one place,
-        whether that place has been disconnected for five minutes or five
-        months.
-      </p>
+    <section class="wrap section">
+      <div class="split">
+        <div>
+          <span class="eyebrow">For your assistant</span>
+          <h2>An LLM that edits like a collaborator.</h2>
+          <p>Pimble comes with <code>pimble-mcp</code>, an MCP server for Claude and other LLM clients. Your assistant can search your stores, read notes and write to them, and its edits merge like another device's, even in the note you're typing in.</p>
+          <ul class="checks">
+            <li>It reaches what you can and nothing more: a read-only share stays read-only.</li>
+            <li>An edit touches only the blocks it names, never the whole note.</li>
+            <li>It runs on your machine. Hosted stores are reached through your own app, so your keys stay with you.</li>
+          </ul>
+        </div>
+        <div class="terminal" aria-label="An example of an assistant using Pimble">
+          <p><span class="t-dim">$</span> claude mcp add pimble -- /path/to/pimble-mcp</p>
+          <p><span class="t-you">you ›</span> What did the contractors quote for the roof? Add a note that Ridgeline needs an answer by Friday.</p>
+          <p><span class="t-acc">claude ›</span> Ridgeline quoted $8,400 for the roof (House › Contractor quotes). I added a line under the table: "Confirm with Ridgeline by Friday."</p>
+        </div>
+      </div>
     </section>
 
-    <section class="shell">
-      <p class="dim" style="margin-bottom: 4px;">Under the hood, for the curious:</p>
-      <ul class="outline">
-        <li class="outline__item">
-          <h2>Nodes in a tree</h2>
-          <p>
-            A store is a folder of nodes, arranged however you like. There's
-            no separate database to keep in sync with the files — the
-            folder is the store.
-          </p>
-        </li>
-        <li class="outline__item">
-          <h2>CRDTs, not locks</h2>
-          <p>
-            A node's content and the tree's structure are both CRDTs: data
-            structures built to merge. Two edits from two places reconcile
-            automatically, and neither one is thrown away.
-          </p>
-        </li>
-        <li class="outline__item">
-          <h2>Mounts</h2>
-          <p>
-            Any subtree of any store can appear inside any other store's
-            tree, resolved to the same underlying node wherever it shows up
-            — whether that store is on this machine or another server
-            entirely.
-          </p>
-        </li>
-        <li class="outline__item">
-          <h2>A local search index</h2>
-          <p>
-            Each store keeps its own index on disk: keyword search over
-            titles and text, plus a small embedding model for semantic
-            search, both running without a network call.
-          </p>
-        </li>
-      </ul>
+    <section class="wrap section">
+      <div class="section__head">
+        <span class="eyebrow">Where it runs</span>
+        <h2>On your desk and in your browser.</h2>
+      </div>
+      <div class="platforms">
+        <div class="platform">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2.5"/><path d="M8 21h8M12 17v4"/></svg></div>
+          <h3>Desktop, for Linux and Windows</h3>
+          <p>The whole of Pimble: your stores on your disk, offline, with semantic search and the MCP server. No account needed.</p>
+          <a class="btn small" href="download.html">Download</a>
+        </div>
+        <div class="platform">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 3.8 5.7 3.8 9s-1.3 6.3-3.8 9M12 3C9.5 5.7 8.2 8.7 8.2 12s1.3 6.3 3.8 9"/></svg></div>
+          <h3>In a browser</h3>
+          <p>Your hosted stores and the ones shared with you, from any computer. Encrypted stores are decrypted in the browser, on your device.</p>
+          <a class="btn small secondary" href="/app/">Open the web app</a>
+        </div>
+        <div class="platform">
+          <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 8-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14"/></svg></div>
+          <h3>Open source</h3>
+          <p>Pimble is written in Rust and released under the MIT license. Read it, build it, change it.</p>
+          <a class="btn small secondary" href="https://github.com/joeleaver/pimble">Source on GitHub</a>
+        </div>
+      </div>
     </section>
 
-    <section class="shell hero">
-      <h2>Start now. No account needed.</h2>
-      <p class="lead">
-        Download the desktop app and open a store today — nothing to sign
-        up for. Create a free account only when you're ready to share, or
-        want the store in a browser.
-      </p>
-      <div class="hero__actions">
-        <a class="btn" href="download.html">Download for desktop</a>
-        <a class="btn secondary" href="/app/signup">Create a free account</a>
+    <section class="wrap section">
+      <div class="closing">
+        <h2>Start with a store on your own disk.</h2>
+        <p>Download the app and start writing today. You need an account only when you want to share a store or host one.</p>
+        <div class="hero__actions">
+          <a class="btn" href="download.html">Download for desktop</a>
+          <a class="btn secondary" href="/app/signup">Create an account</a>
+        </div>
       </div>
     </section>
   </main>
 
   <footer class="site">
-    <div class="shell" style="padding: 0;">
-      Pimble. <a href="https://github.com/pimble/pimble">Source on GitHub</a>.
+    <div class="wrap footer__inner">
+      <div class="footer__brand">
+        <picture><source srcset="brand/pimble-lockup-on-dark.svg" media="(prefers-color-scheme: dark)"><img src="brand/pimble-lockup.svg" alt="Pimble" width="86" height="20"></picture>
+        <span>Open source, MIT license.</span>
+      </div>
+      <nav class="footer__links">
+        <a href="download.html">Download</a>
+        <a href="/app/">Web app</a>
+        <a href="/app/login">Log in</a>
+        <a href="https://github.com/joeleaver/pimble">GitHub</a>
+      </nav>
     </div>
   </footer>
 </body>
