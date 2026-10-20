@@ -34,6 +34,8 @@ Thumbs.db
 # Debug/temp files
 *.txt
 *.png
+!assets/brand/png/*.png
+!site/brand/*.png
 *.ps1
 nul
 # fastembed model cache (a run with the ONNX feature in this directory writes here)
