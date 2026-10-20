@@ -61,6 +61,12 @@ tokio = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 # Opens a followed web link in the system browser (docs/LINKS_CONTRACT.md).
 open = { version = "5", optional = true }
+# The home-folder install keeps itself current (docs/UPDATE_CONTRACT.md): the
+# feed and the package over HTTPS, its Ed25519 signature, the version order.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"], optional = true }
+ed25519-dalek = { version = "2.2", optional = true }
+semver = { version = "1", optional = true }
+dirs = { version = "6", optional = true }
 
 # --- web only (the browser DOM backend) ------------------------------------
 # The same `EditorHandle` / `Editor` as desktop, reached through the browser
@@ -105,6 +111,10 @@ native = [
     "dep:pimble-store",
     "dep:tokio",
     "dep:tracing-subscriber",
+    "dep:reqwest",
+    "dep:ed25519-dalek",
+    "dep:semver",
+    "dep:dirs",
     "rinch/desktop",
     # GPU rendering (vello over wgpu). The CPU renderer repaints the whole window
     # on the CPU after every layout change, about 100 ms a frame at 3840x2160.

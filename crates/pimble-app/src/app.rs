@@ -98,6 +98,15 @@ pub fn theme_css(dark_mode: bool) -> String {
     css
 }
 
+/// "Restart to update" (docs/UPDATE_CONTRACT.md). The browser has nothing to
+/// update; its status bar never shows the control.
+fn restart_to_update(store: AppStore) {
+    #[cfg(feature = "native")]
+    crate::update::restart_to_update(store);
+    #[cfg(not(feature = "native"))]
+    let _ = store;
+}
+
 /// Put [`theme_css`] in force, at start and on every switch.
 pub fn apply_theme(dark_mode: bool) {
     rinch::core::set_current_theme_css(Some(theme_css(dark_mode)));
@@ -4258,6 +4267,17 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         }
 
                         div { style: "flex: 1;", }
+
+                        // A verified update is staged (docs/UPDATE_CONTRACT.md);
+                        // nothing restarts until this is clicked.
+                        if CAN_ADMINISTER_STORES {
+                            span {
+                                class: "pimble-status-bar__update",
+                                style: {|| if store.update_ready.get().is_some() { "" } else { "display: none;" }},
+                                onclick: move || restart_to_update(store),
+                                {|| store.update_ready.get().map(|v| format!("Restart to update to {v}")).unwrap_or_default()}
+                            }
+                        }
                     }
 
                     // Where the hovered link leads (docs/LINKS_CONTRACT.md
@@ -4401,6 +4421,7 @@ pub fn run(renderer: Renderer) {
     use std::sync::Arc;
 
     let (store, app_component) = build_view();
+    crate::update::start(store);
 
     // One spec, two shells: `crates/pimble-app/src/menus.rs` says what the
     // menus hold and which target each item belongs on, so the browser's menu

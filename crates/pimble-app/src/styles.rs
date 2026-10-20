@@ -1054,6 +1054,18 @@ pub(crate) const APP_CSS: &str = "
     opacity: 0.7;
 }
 
+/* Restart to update (docs/UPDATE_CONTRACT.md): the one thing on the bar that
+   asks for a click, so in the accent. */
+.pimble-status-bar__update {
+    font-size: 11px;
+    color: var(--rinch-primary-color-6);
+    cursor: pointer;
+}
+
+.pimble-status-bar__update:hover {
+    text-decoration: underline;
+}
+
 .pimble-status-bar__account:hover {
     opacity: 1;
     text-decoration: underline;

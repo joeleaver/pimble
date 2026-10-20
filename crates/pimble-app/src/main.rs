@@ -10,6 +10,10 @@ use rinch::prelude::Renderer;
 
 const USAGE: &str = "\
 Usage: pimble [--cpu | --renderer <auto|gpu|cpu>]
+       pimble --install
+
+  --install         put this copy in your home folder (on the menu and the PATH),
+                    where it keeps itself up to date
 
   --renderer auto   draw on the GPU, and with the CPU if the GPU will not start (the default)
   --renderer gpu    draw on the GPU, and stop if it will not start
@@ -42,6 +46,20 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Renderer, String
 }
 
 fn main() {
+    // `pimble --install` (docs/UPDATE_CONTRACT.md): copy this program into the
+    // home-folder install, which keeps itself current, and stop.
+    if std::env::args().nth(1).as_deref() == Some("--install") {
+        match pimble_app::update::install() {
+            Ok(dir) => println!("Installed Pimble {} in {}", env!("CARGO_PKG_VERSION"), dir.display()),
+            Err(e) => {
+                eprintln!("pimble: could not install: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    pimble_app::update::at_start();
+
     let renderer = match parse_args(std::env::args().skip(1)) {
         Ok(renderer) => renderer,
         Err(message) => {

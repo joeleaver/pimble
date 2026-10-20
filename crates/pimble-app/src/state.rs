@@ -946,6 +946,9 @@ pub struct AppStore {
     /// state: the connection is fine, the command was simply not allowed
     /// (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles").
     pub notice: Signal<String>,
+    /// A verified update staged beside a managed install, waiting for "Restart
+    /// to update" (docs/UPDATE_CONTRACT.md); `None` everywhere else.
+    pub update_ready: Signal<Option<String>>,
 
     /// A followed link's target, for `app.rs` to open with `open_node` (the
     /// one way to open a node): its tree value and, for a deep link, the
@@ -1177,6 +1180,7 @@ impl AppStore {
             stop_relay_modal_error: Signal::new(String::new()),
             owner_offline: Signal::new(HashSet::new()),
             notice: Signal::new(String::new()),
+            update_ready: Signal::new(None),
             link_open: Signal::new(None),
             link_hover: Signal::new(None),
             link_picker: Signal::new(None),
