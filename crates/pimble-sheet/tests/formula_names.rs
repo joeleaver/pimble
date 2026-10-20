@@ -538,3 +538,57 @@ fn tables_read_names_this_notes_tables_only() {
     });
     assert!(lone.tables_read().is_empty(), "another note's table, and itself: {:?}", lone.tables_read());
 }
+
+/// A table moved to another note (Convert to Sheet Node) with the formulas on
+/// both sides rewritten (`formula::rehome`) computes what it computed before,
+/// and so do the tables it left behind.
+#[test]
+fn a_moved_table_computes_the_same_on_both_sides() {
+    use pimble_sheet::formula::rehome::{left_behind, moved_out};
+    const NOTE: u128 = 900;
+    const NEW: u128 = 901;
+    let mut b = TestBook::new(NOTE);
+    b.add(NOTE, "Trip", None).sheets.tables = vec![
+        TB::new("costs", "Costs").text("item").number("amount").row("r1", vec![("item", s("Gas")), ("amount", n(40.0))]).row("r2", vec![("item", s("Hotel")), ("amount", n(120.0))]).build(),
+        TB::new("tot", "Totals").text("what").formula("sum", "=SUM(Costs[amount])+COUNT(Shares[people])", Format::Number).row("t1", vec![("what", s("all"))]).build(),
+        TB::new("shares", "Shares").number("people").formula("each", "=SUM(Costs[amount])/[@people]", Format::Number).row("s1", vec![("people", n(4.0))]).build(),
+    ];
+    b.add(NEW, "Shares", Some(NOTE));
+    b.store_formulas();
+    let before = Engine::new(&b.at(NOTE)).compute_node(&node(NOTE)).unwrap();
+    let total = num(cell(table(&before, "Totals"), "t1", "sum"));
+    let each = num(cell(table(&before, "Shares"), "s1", "each"));
+    assert_eq!((total, each), (161.0, 40.0));
+
+    // Move Shares to NEW, rewriting both sides.
+    let moved = {
+        let note = b.note(NOTE);
+        let at = note.sheets.tables.iter().position(|t| t.id == "shares").unwrap();
+        note.sheets.tables.remove(at)
+    };
+    let mut moved = moved;
+    for c in &mut moved.columns {
+        if let ColumnType::Formula { formula, .. } = &mut c.ty {
+            *formula = moved_out(formula, "shares", &node(NOTE), Some(&node(NEW)));
+        }
+    }
+    for t in &mut b.note(NOTE).sheets.tables {
+        for c in &mut t.columns {
+            if let ColumnType::Formula { formula, .. } = &mut c.ty {
+                *formula = left_behind(formula, "shares", &node(NEW));
+            }
+        }
+    }
+    b.note(NEW).sheets.tables = vec![moved];
+
+    let left = Engine::new(&b.at(NOTE)).compute_node(&node(NOTE)).unwrap();
+    let there = Engine::new(&b.at(NEW)).compute_node(&node(NEW)).unwrap();
+    assert_eq!(num(cell(table(&left, "Totals"), "t1", "sum")), total);
+    assert_eq!(num(cell(table(&there, "Shares"), "s1", "each")), each);
+    // And they show with the other note's name.
+    let shown = to_shown(&b.at(NEW), Some("shares"), match &b.note(NEW).sheets.tables[0].columns[1].ty {
+        ColumnType::Formula { formula, .. } => formula,
+        _ => unreachable!(),
+    });
+    assert_eq!(shown, "=SUM(Trip!Costs[amount])/[@people]");
+}

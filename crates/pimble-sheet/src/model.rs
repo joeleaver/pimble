@@ -183,6 +183,30 @@ impl TableSnap {
         out
     }
 
+    /// The tables of its own note this table's row link columns point at.
+    pub fn row_links(&self) -> BTreeSet<String> {
+        self.columns
+            .iter()
+            .filter_map(|c| match &c.ty {
+                ColumnType::RowLink { table } if *table != self.id => Some(table.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// This table with every formula and its summary's source passed
+    /// through `f` (a stored formula in, its rewrite out).
+    pub fn map_formulas(&self, f: impl Fn(&str) -> String) -> TableSnap {
+        let mut t = self.clone();
+        t.source = t.source.as_deref().map(&f);
+        for c in &mut t.columns {
+            if let ColumnType::Formula { formula, .. } = &mut c.ty {
+                *formula = f(formula);
+            }
+        }
+        t
+    }
+
     pub fn column(&self, id: &str) -> Option<&ColumnSnap> {
         self.columns.iter().find(|c| c.id == id)
     }

@@ -518,7 +518,7 @@ pub(crate) const APP_CSS: &str = "
     background: transparent;
     color: var(--rinch-color-text);
     padding: 2px 4px;
-    width: 14em;
+    max-width: 24em;
 }
 
 .pimble-sheet__kind {

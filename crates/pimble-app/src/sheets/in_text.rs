@@ -240,10 +240,10 @@ pub(crate) fn render_lost(__scope: &mut RenderScope, store: AppStore, pane: Pane
 
 // ── Convert to Sheet Node ────────────────────────────────────────────────
 
-/// "Convert to Sheet Node" refused: the table and the note's other tables
-/// read each other, and references across notes come later (wave 3).
+/// "Convert to Sheet Node" refused: a row link ties the table to another of
+/// the note's tables, and a row link points within its own node only.
 fn tied_sentence(name: &str) -> String {
-    format!("{name} reads another table of this note, or another reads it, so it cannot move to a node of its own yet.")
+    format!("A link column ties {name} to another table of this note, and a link reaches rows of its own note only, so it cannot move to a node of its own.")
 }
 
 /// A table on its way to a sheet node of its own.
@@ -271,12 +271,16 @@ pub(crate) fn convert_to_sheet_node(store: AppStore, pane: PaneId, table: &str) 
     }
     let Some(snap) = snapshot(pane) else { return };
     let Some(t) = snap.table(table).cloned() else { return };
-    let tied = !t.tables_read().is_empty() || snap.tables.iter().any(|o| o.id != t.id && o.tables_read().contains(&t.id));
+    let tied = !t.row_links().is_empty() || snap.tables.iter().any(|o| o.id != t.id && o.row_links().contains(&t.id));
     if tied {
         say(store, pane, tied_sentence(&t.name));
         return;
     }
-    let copied = Sheets::standalone().edit(|x| x.copy_table(&t));
+    // Its formulas name this note's tables with the note (references across
+    // notes); the ones left here name it in its new node once that is made.
+    let from = node_ref(store_id, node_id);
+    let moved = t.map_formulas(|f| formula::rehome::moved_out(f, &t.id, &from, None));
+    let copied = Sheets::standalone().edit(|x| x.copy_table(&moved));
     let content = match (copied.result, copied.update) {
         (Ok(()), Some(content)) => content,
         (Err(e), _) => {
@@ -335,8 +339,33 @@ pub(crate) fn node_created(store: AppStore, request: u64, store_id: StoreId, nod
         }
         Some(tr)
     });
-    local_edit(store, job.pane, |t| t.delete_table(&job.table));
+    let to = node_ref(store_id, node_id);
+    let rest: Vec<pimble_sheet::TableSnap> = snapshot(job.pane)
+        .map(|s| s.tables.into_iter().filter(|t| t.id != job.table).collect())
+        .unwrap_or_default();
+    local_edit(store, job.pane, |t| {
+        t.delete_table(&job.table)?;
+        for table in &rest {
+            let after = table.map_formulas(|f| formula::rehome::left_behind(f, &job.table, &to));
+            write_formulas(t, table, &after)?;
+        }
+        Ok(())
+    });
     text_changed(job.pane);
+}
+
+/// Write the formulas and source of `after` where they differ from `before`
+/// (the same table, rewritten).
+fn write_formulas(t: &mut doc::SheetsTxn<'_, '_>, before: &pimble_sheet::TableSnap, after: &pimble_sheet::TableSnap) -> doc::Result<()> {
+    if after.source != before.source {
+        t.set_source(&after.id, after.source.as_deref())?;
+    }
+    for (old, new) in before.columns.iter().zip(&after.columns) {
+        if old.ty != new.ty {
+            t.set_column_type(&after.id, &new.id, new.ty.clone())?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -486,6 +515,33 @@ mod tests {
         convert_to_sheet_node(store, P[0], &ids[1]);
         assert!(commands.try_iter().all(|c| !matches!(c, BackendCommand::CreateNode { .. })));
         assert!(untracked(|| store.pane(P[0]).sheet_ui.message.get()).is_some_and(|m| m.contains("cannot move")));
+
+        // A formula reading the moved table: it names the new node after.
+        let third = local_edit(store, P[0], |t| new_table(t, "Totals")).unwrap();
+        local_edit(store, P[0], |t| {
+            t.add_column(&third, "sum", ColumnType::Formula { formula: format!("=SUM({{t:{}}}[{{c:x}}])", ids[0]), format: pimble_sheet::Format::Auto }, Placement::Last)
+                .map(|_| ())
+        });
+        let link = snapshot(P[0]).unwrap().table(&ids[0]).unwrap().columns.last().unwrap().id.clone();
+        local_edit(store, P[0], |t| t.delete_column(&ids[0], &link));
+        let _ = commands.try_iter().count();
+        convert_to_sheet_node(store, P[0], &ids[0]);
+        let request = commands
+            .try_iter()
+            .find_map(|c| match c {
+                BackendCommand::CreateNode { init: Some(init), .. } => init.request,
+                _ => None,
+            })
+            .expect("it moves: only a row link ties a table");
+        let new_node = NodeId::new();
+        node_created(store, request, store_id, new_node);
+        let totals = snapshot(P[0]).unwrap().table(&third).cloned().unwrap();
+        let formula = totals.columns.iter().find_map(|c| match &c.ty {
+            ColumnType::Formula { formula, .. } => Some(formula.clone()),
+            _ => None,
+        });
+        let token = formula::note_token(&node_ref(store_id, new_node));
+        assert_eq!(formula, Some(format!("=SUM({token}!{{t:{}}}[{{c:x}}])", ids[0])));
     }
 
     /// A peer's table and its atom, arriving together (the MCP's

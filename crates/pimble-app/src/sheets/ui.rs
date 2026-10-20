@@ -226,6 +226,8 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
                 class: "pimble-sheet__title",
                 input {
                     class: "pimble-sheet__name",
+                    // As wide as the name, so the chip after it sits beside it.
+                    style: move || format!("width: {}ch;", name.get().chars().count().max(4) + 2),
                     value: move || name.get(),
                     oninput: move |v: String| name.set(v),
                     onclick: {

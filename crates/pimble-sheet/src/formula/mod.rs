@@ -31,6 +31,7 @@ mod format;
 mod functions;
 mod names;
 mod parser;
+pub mod rehome;
 mod value;
 
 pub use coerce::general as general_number;

@@ -526,6 +526,11 @@ fn formulas_of(snap: &SheetsSnap) -> Vec<&str> {
 }
 
 fn cached_sheets(store: AppStore, node: &NodeRef) -> Option<SheetsSnap> {
+    // A pane of this window holding the note has the freshest copy; the
+    // cache is as old as the last fetch.
+    if let Some(live) = panes_holding(node.store, node.node).into_iter().find_map(|p| with_session(p, |s| s.sheets.read())) {
+        return Some(live);
+    }
     let sig = store.get_node_signal(node.store, node.node)?;
     let bytes = untracked(|| sig.with(|n| n.content.clone()));
     let doc = NodeDoc::load(&bytes).ok()?;
