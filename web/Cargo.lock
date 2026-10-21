@@ -2188,7 +2188,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rinch"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#08b8a6fde4b7aa7c6464abf0a51c99a6b2824869"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fcontext-menu-viewport#7c2951c97bddc2c9df4b7b11e8b55e6d5f29382a"
 dependencies = [
  "js-sys",
  "rinch-components",
@@ -2205,7 +2205,7 @@ dependencies = [
 [[package]]
 name = "rinch-android"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#08b8a6fde4b7aa7c6464abf0a51c99a6b2824869"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fcontext-menu-viewport#7c2951c97bddc2c9df4b7b11e8b55e6d5f29382a"
 dependencies = [
  "android-activity",
  "base64 0.22.1",
@@ -2218,7 +2218,7 @@ dependencies = [
 [[package]]
 name = "rinch-clipboard"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#08b8a6fde4b7aa7c6464abf0a51c99a6b2824869"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fcontext-menu-viewport#7c2951c97bddc2c9df4b7b11e8b55e6d5f29382a"
 dependencies = [
  "arboard",
  "js-sys",
@@ -2231,7 +2231,7 @@ dependencies = [
 [[package]]
 name = "rinch-components"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#08b8a6fde4b7aa7c6464abf0a51c99a6b2824869"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fcontext-menu-viewport#7c2951c97bddc2c9df4b7b11e8b55e6d5f29382a"
 dependencies = [
  "rinch-core",
  "rinch-macros",
@@ -2243,7 +2243,7 @@ dependencies = [
 [[package]]
 name = "rinch-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#08b8a6fde4b7aa7c6464abf0a51c99a6b2824869"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fcontext-menu-viewport#7c2951c97bddc2c9df4b7b11e8b55e6d5f29382a"
 dependencies = [
  "thiserror 1.0.69",
  "tracing",
@@ -2253,12 +2253,15 @@ dependencies = [
 [[package]]
 name = "rinch-editable"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#08b8a6fde4b7aa7c6464abf0a51c99a6b2824869"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fcontext-menu-viewport#7c2951c97bddc2c9df4b7b11e8b55e6d5f29382a"
+dependencies = [
+ "rinch-words",
+]
 
 [[package]]
 name = "rinch-editor-collab"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#08b8a6fde4b7aa7c6464abf0a51c99a6b2824869"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fcontext-menu-viewport#7c2951c97bddc2c9df4b7b11e8b55e6d5f29382a"
 dependencies = [
  "rinch-editor-core",
  "thiserror 1.0.69",
@@ -2268,17 +2271,18 @@ dependencies = [
 [[package]]
 name = "rinch-editor-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#08b8a6fde4b7aa7c6464abf0a51c99a6b2824869"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fcontext-menu-viewport#7c2951c97bddc2c9df4b7b11e8b55e6d5f29382a"
 dependencies = [
  "pulldown-cmark",
  "regex",
+ "rinch-words",
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "rinch-editor-view"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#08b8a6fde4b7aa7c6464abf0a51c99a6b2824869"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fcontext-menu-viewport#7c2951c97bddc2c9df4b7b11e8b55e6d5f29382a"
 dependencies = [
  "rinch-core",
  "rinch-editor-collab",
@@ -2289,7 +2293,7 @@ dependencies = [
 [[package]]
 name = "rinch-macros"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#08b8a6fde4b7aa7c6464abf0a51c99a6b2824869"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fcontext-menu-viewport#7c2951c97bddc2c9df4b7b11e8b55e6d5f29382a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2299,7 +2303,7 @@ dependencies = [
 [[package]]
 name = "rinch-platform"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#08b8a6fde4b7aa7c6464abf0a51c99a6b2824869"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fcontext-menu-viewport#7c2951c97bddc2c9df4b7b11e8b55e6d5f29382a"
 dependencies = [
  "web-time",
 ]
@@ -2307,7 +2311,7 @@ dependencies = [
 [[package]]
 name = "rinch-tabler-icons"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#08b8a6fde4b7aa7c6464abf0a51c99a6b2824869"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fcontext-menu-viewport#7c2951c97bddc2c9df4b7b11e8b55e6d5f29382a"
 dependencies = [
  "heck",
  "rinch-core",
@@ -2319,12 +2323,12 @@ dependencies = [
 [[package]]
 name = "rinch-theme"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#08b8a6fde4b7aa7c6464abf0a51c99a6b2824869"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fcontext-menu-viewport#7c2951c97bddc2c9df4b7b11e8b55e6d5f29382a"
 
 [[package]]
 name = "rinch-web"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#08b8a6fde4b7aa7c6464abf0a51c99a6b2824869"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fcontext-menu-viewport#7c2951c97bddc2c9df4b7b11e8b55e6d5f29382a"
 dependencies = [
  "js-sys",
  "rinch",
@@ -2335,6 +2339,14 @@ dependencies = [
  "rinch-editor-view",
  "wasm-bindgen",
  "web-sys",
+]
+
+[[package]]
+name = "rinch-words"
+version = "0.1.0"
+source = "git+https://github.com/joeleaver/rinch.git?branch=fix%2Fcontext-menu-viewport#7c2951c97bddc2c9df4b7b11e8b55e6d5f29382a"
+dependencies = [
+ "regex",
 ]
 
 [[package]]

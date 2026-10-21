@@ -19,6 +19,16 @@ pub(crate) const APP_CSS: &str = "
     align-items: center;
 }
 
+/* ── Modals ─────────────────────────────────────────────────── */
+
+/* A Select's list is absolutely positioned inside the modal, whose
+   `overflow-y: auto` clipped it at the modal's bottom edge (the Add Hosted
+   Store list showed one row). While a Select in it is open the modal stops
+   clipping, so the list hangs past its edge as a native one would. */
+.rinch-modal:has([aria-expanded=\"true\"]) {
+    overflow: visible;
+}
+
 /* ── Sidebar ────────────────────────────────────────────────── */
 
 .pimble-sidebar {
