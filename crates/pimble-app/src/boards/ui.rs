@@ -219,8 +219,8 @@ pub(crate) fn render_board(__scope: &mut RenderScope, store: AppStore, pane: Pan
         // a numbered marker each; a press opens its discussion beside the board.
         for pin in ui.pins.get() {
             div {
-                key: format!("{} {:.1} {:.1} {} {}", pin.node_id, pin.x, pin.y, pin.number, pin.count),
-                class: "pimble-board__pin",
+                key: format!("{} {:.1} {:.1} {} {} {}", pin.node_id, pin.x, pin.y, pin.number, pin.count, pin.unread),
+                class: if pin.unread { "pimble-board__pin pimble-board__pin--unread" } else { "pimble-board__pin" },
                 title: format!("{} ({} message{})", pin.title, pin.count, if pin.count == 1 { "" } else { "s" }),
                 style: format!("left: {:.1}px; top: {:.1}px;", pin.x, pin.y),
                 onmousedown: move || crate::pane_view::press_in_view(),

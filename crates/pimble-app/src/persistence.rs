@@ -91,6 +91,32 @@ mod imp {
         state["panes"] = panes;
         write_state(&state);
     }
+
+    /// The personal document (docs/DISCUSSIONS_CONTRACT.md section 8):
+    /// `<data dir>/pimble/personal.yrs`, empty when there is none.
+    fn personal_path() -> PathBuf {
+        dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("pimble").join("personal.yrs")
+    }
+
+    pub(crate) fn load_personal() -> Vec<u8> {
+        std::fs::read(personal_path()).unwrap_or_default()
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn save_personal(bytes: &[u8]) {
+        let path = personal_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Written beside and renamed, so a crash never leaves half a file.
+        let tmp = path.with_extension("yrs.tmp");
+        if std::fs::write(&tmp, bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn save_personal(_bytes: &[u8]) {}
 }
 
 #[cfg(not(feature = "native"))]
@@ -153,6 +179,24 @@ mod imp {
             let _ = storage.set_item(PANES_KEY, &panes.to_string());
         }
     }
+
+    /// Where the personal document lives in the browser, base64.
+    const PERSONAL_KEY: &str = "pimble.personal";
+
+    pub(crate) fn load_personal() -> Vec<u8> {
+        use base64::Engine as _;
+        storage()
+            .and_then(|s| s.get_item(PERSONAL_KEY).ok().flatten())
+            .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn save_personal(bytes: &[u8]) {
+        use base64::Engine as _;
+        if let Some(storage) = storage() {
+            let _ = storage.set_item(PERSONAL_KEY, &base64::engine::general_purpose::STANDARD.encode(bytes));
+        }
+    }
 }
 
 /// The split view's layout as it was last saved, safe to restore; `None`
@@ -171,5 +215,6 @@ pub(crate) fn save_panes(panes: &crate::panes::SavedPanes) {
 }
 
 pub(crate) use imp::{
-    load_app_state_file, load_dark_mode, load_sidebar_width, save_app_state_file, save_dark_mode, save_sidebar_width,
+    load_app_state_file, load_dark_mode, load_personal, load_sidebar_width, save_app_state_file, save_dark_mode, save_personal,
+    save_sidebar_width,
 };

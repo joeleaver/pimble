@@ -968,6 +968,10 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 crate::discussions::attachments_listed(store, *store_id, *node_id, nodes.clone());
             }
 
+            BackendEvent::DiscussionsListed { store_id, nodes } => {
+                crate::discussions::discussions_listed(store, *store_id, nodes.clone());
+            }
+
             BackendEvent::NodeContentUpdated { store_id, node_id } => {
                 tracing::info!("Node content updated: {:?}/{:?}", store_id, node_id);
                 // Only re-fetch if this isn't a node some pane is opened on.

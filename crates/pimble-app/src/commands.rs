@@ -140,6 +140,16 @@ pub async fn process_command(
             }
         }
 
+        BackendCommand::ListDiscussions { store_id } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            match c.list_discussions(store_id).await {
+                Ok(nodes) => Some(BackendEvent::DiscussionsListed { store_id, nodes }),
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
         BackendCommand::GetNode { store_id, node_id } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });

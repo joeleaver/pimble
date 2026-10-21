@@ -45,6 +45,8 @@ pub enum BackendCommand {
     CreateAttachment { store_id: StoreId, host_id: NodeId, title: String, init: NodeInit },
     /// The live attachments of a node. Answers with `AttachmentsListed`.
     ListAttachments { store_id: StoreId, node_id: NodeId },
+    /// Every discussion of a store. Answers with `DiscussionsListed`.
+    ListDiscussions { store_id: StoreId },
     GetNode { store_id: StoreId, node_id: NodeId },
     GetChildren { store_id: StoreId, node_id: NodeId },
     SetNodeContent { store_id: StoreId, node_id: NodeId, content: Vec<u8> },
@@ -320,6 +322,8 @@ pub enum BackendEvent {
     AttachmentCreated { store_id: StoreId, host_id: NodeId, node_id: NodeId, request: Option<u64> },
     /// A node's live attachments, oldest first, each with its content.
     AttachmentsListed { store_id: StoreId, node_id: NodeId, nodes: Vec<Node> },
+    /// A store's discussions, each with its content.
+    DiscussionsListed { store_id: StoreId, nodes: Vec<Node> },
     NodeLoaded { store_id: StoreId, node: Node },
     /// `children` live in `children_store_id`: the same as `store_id` for an
     /// ordinary parent, the mount's source store when `parent_id` is a mount point.

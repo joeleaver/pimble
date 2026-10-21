@@ -274,6 +274,19 @@ pub struct CreateAttachmentRequest {
     pub custom: std::collections::HashMap<String, serde_json::Value>,
 }
 
+/// Request for every discussion in a store the caller may read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListDiscussionsRequest {
+    pub store_id: StoreId,
+}
+
+/// A store's live discussions (standalone ones and those on a live node),
+/// each with its content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListDiscussionsResponse {
+    pub nodes: Vec<Node>,
+}
+
 /// Who the caller is, as the server judges it: what a client stamps its
 /// writes with when it has no account of its own to read (an agent's
 /// discussion messages, docs/DISCUSSIONS_CONTRACT.md section 3).

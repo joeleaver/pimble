@@ -665,6 +665,7 @@ pub struct PinView {
     pub number: usize,
     pub title: String,
     pub count: usize,
+    pub unread: bool,
 }
 
 /// The discussions pinned to some board changed: every board pane draws its
@@ -1194,7 +1195,7 @@ fn after_change(store: AppStore, pane: PaneId) {
                 .enumerate()
                 .map(|(i, pin)| {
                     let (x, y) = s.view.board_to_screen(Point::new(pin.x, pin.y));
-                    PinView { store_id: s.store_id, node_id: pin.node_id, x: x / scale, y: y / scale, number: i + 1, title: pin.title, count: pin.count }
+                    PinView { store_id: s.store_id, node_id: pin.node_id, x: x / scale, y: y / scale, number: i + 1, title: pin.title, count: pin.count, unread: pin.unread }
                 })
                 .collect()
         };

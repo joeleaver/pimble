@@ -994,6 +994,13 @@ pub struct AppStore {
     /// (`ListAttachments`, docs/DISCUSSIONS_CONTRACT.md section 1), oldest
     /// first; each discussion's node is in the node cache.
     pub attachments: Signal<HashMap<(StoreId, NodeId), Vec<NodeId>>>,
+    /// Bumped whenever the personal document changes (`crate::personal`):
+    /// what shows read state reads it, to follow.
+    pub read_version: Signal<u64>,
+    /// View > "Discussions..." (docs/DISCUSSIONS_CONTRACT.md section 8): open,
+    /// and the discussions the open stores hold (`ListDiscussions`).
+    pub discussions_modal: Signal<bool>,
+    pub all_discussions: Signal<Vec<(StoreId, NodeId)>>,
 }
 
 /// What changed in the roots a store's row shows (`AppStore::set_store_roots`).
@@ -1235,6 +1242,9 @@ impl AppStore {
             deleted_modal_pending: Signal::new(false),
             deleted_modal_error: Signal::new(String::new()),
             attachments: Signal::new(HashMap::new()),
+            read_version: Signal::new(0),
+            discussions_modal: Signal::new(false),
+            all_discussions: Signal::new(Vec::new()),
         }
     }
 

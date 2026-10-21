@@ -876,6 +876,52 @@ pub(crate) const APP_CSS: &str = "
     z-index: 3;
 }
 
+/* What is new in a discussion (docs/DISCUSSIONS_CONTRACT.md section 8). */
+.pimble-discussion__new {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--rinch-primary-color);
+    border-top: 1px solid var(--rinch-primary-color);
+    padding-top: 2px;
+    margin: 4px 0 2px;
+}
+
+.pimble-discussion__msg--fresh .pimble-discussion__body {
+    font-weight: 500;
+}
+
+.pimble-discussions__unread {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--rinch-primary-color);
+}
+
+.pimble-discussions--modal {
+    margin: 0;
+    max-height: 60vh;
+    overflow: auto;
+}
+
+.pimble-tree-discussions__unread {
+    width: 6px;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--rinch-primary-color);
+    margin-left: 2px;
+}
+
+.pimble-board__pin--unread::after {
+    content: '';
+    position: absolute;
+    top: -2px;
+    right: -2px;
+    width: 8px;
+    height: 8px;
+    border-radius: 4px;
+    background: var(--rinch-color-red-6, #e03131);
+    border: 1px solid var(--rinch-color-body);
+}
+
 /* The discussions on a node, under its content. */
 .pimble-discussions {
     margin: 12px 16px 24px;

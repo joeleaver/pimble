@@ -1244,6 +1244,8 @@ impl VaultClient {
 
             BackendCommand::ListAttachments { store_id, node_id } => Some(self.list_attachments(store_id, node_id)),
 
+            BackendCommand::ListDiscussions { store_id } => Some(self.list_discussions(store_id)),
+
             BackendCommand::RenameNode { store_id, node_id, title } => {
                 Some(self.rename_node(client, store_id, node_id, title).await)
             }
@@ -1685,6 +1687,26 @@ impl VaultClient {
             Ok(()) => BackendEvent::AttachmentCreated { store_id, host_id, node_id, request },
             Err(message) => BackendEvent::Error { message },
         }
+    }
+
+    fn list_discussions(&self, store_id: StoreId) -> BackendEvent {
+        let Some(store) = self.stores.get(&store_id) else {
+            return BackendEvent::Error { message: "no such encrypted store".into() };
+        };
+        let row = self.rows.get(&store_id);
+        let nodes = store
+            .tree
+            .list_node_ids()
+            .into_iter()
+            .filter(|id| {
+                store.tree.live_fields(*id).is_ok_and(|f| {
+                    f.node_type == node_types::DISCUSSION && f.attached_to.is_none_or(|host| store.tree.has_node(host))
+                })
+            })
+            .filter_map(|id| store.node_for(id, row).ok())
+            .map(|node| self.judged(store_id, node))
+            .collect();
+        BackendEvent::DiscussionsListed { store_id, nodes }
     }
 
     fn list_attachments(&self, store_id: StoreId, node_id: NodeId) -> BackendEvent {
@@ -3692,6 +3714,7 @@ pub fn store_id_of(cmd: &BackendCommand) -> Option<StoreId> {
         | CreateNode { store_id, .. }
         | CreateAttachment { store_id, .. }
         | ListAttachments { store_id, .. }
+        | ListDiscussions { store_id }
         | GetNode { store_id, .. }
         | GetChildren { store_id, .. }
         | SetNodeContent { store_id, .. }

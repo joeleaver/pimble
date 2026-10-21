@@ -9,6 +9,7 @@ use std::hash::{Hash, Hasher};
 use rinch_tabler_icons::{render_tabler_icon, TablerIcon, TablerIconStyle};
 
 use super::*;
+use crate::panes::MAX_PANES;
 
 /// The emoji the picker offers (contract section 5: emoji are plain Unicode).
 const EMOJI: [&str; 40] = [
@@ -175,9 +176,19 @@ fn discussion_view(__scope: &mut RenderScope, store: AppStore, slot: Slot, ui: D
                 if ui.messages.get().is_empty() {
                     div { class: "pimble-discussion__empty", "No messages yet. Write the first one below." }
                 }
-                for m in ui.messages.get() {
+                for (i, m) in ui.messages.get().into_iter().enumerate() {
                     div {
                         key: message_key(&m, ui.editing.get().as_deref() == Some(m.id.as_str())),
+                        // Where what is new begins (contract section 8).
+                        if m.fresh && ui.messages.with(|all| all.iter().position(|m| m.fresh) == Some(i)) {
+                            div {
+                                class: "pimble-discussion__new",
+                                {move || {
+                                    let n = ui.messages.with(|all| all.iter().filter(|m| m.fresh).count());
+                                    format!("{n} new")
+                                }}
+                            }
+                        }
                         {message_node(__scope, store, slot, ui, m.clone())}
                     }
                 }
@@ -326,7 +337,7 @@ fn message_node(__scope: &mut RenderScope, store: AppStore, slot: Slot, ui: Disc
     let indent_level = m.indent;
     let indent = format!("margin-left: {}px;", m.indent * 22);
     let (author, agent, at, when) = (m.author.clone(), m.agent, m.at.clone(), m.when.clone());
-    let (edited, deleted, own) = (m.edited && !m.deleted, m.deleted, m.own);
+    let (edited, deleted, own, fresh) = (m.edited && !m.deleted, m.deleted, m.own, m.fresh);
     let replying = m.replying_to.clone().map(|to| format!("replying to {to}"));
     let author_node = (!author.is_empty()).then(|| rsx! { span { class: "pimble-discussion__author", {author} } });
     let agent_node = agent.then(|| rsx! { span { class: "pimble-discussion__agent", "agent" } });
@@ -403,7 +414,12 @@ fn message_node(__scope: &mut RenderScope, store: AppStore, slot: Slot, ui: Disc
     });
     rsx! {
         div {
-            class: if indent_level > 0 { "pimble-discussion__msg pimble-discussion__msg--reply" } else { "pimble-discussion__msg" },
+            class: match (indent_level > 0, fresh) {
+                (true, true) => "pimble-discussion__msg pimble-discussion__msg--reply pimble-discussion__msg--fresh",
+                (true, false) => "pimble-discussion__msg pimble-discussion__msg--reply",
+                (false, true) => "pimble-discussion__msg pimble-discussion__msg--fresh",
+                (false, false) => "pimble-discussion__msg",
+            },
             style: indent,
             {meta}
             {content}
@@ -443,6 +459,7 @@ pub(crate) fn render_host_panel(__scope: &mut RenderScope, store: AppStore, pane
         }
     });
     let rows = move || -> Vec<DiscussionRow> {
+        store.read_version.get();
         let Some((store_id, host)) = pane_host(store, pane) else { return Vec::new() };
         let now = crate::boards::now_ms();
         host_discussions(store, store_id, host)
@@ -492,6 +509,7 @@ pub(crate) fn render_host_panel(__scope: &mut RenderScope, store: AppStore, pane
 fn host_row(__scope: &mut RenderScope, store: AppStore, pane: PaneId, row: DiscussionRow) -> NodeHandle {
     let (s, n) = (row.store_id, row.node_id);
     let resolved = row.resolved.then(|| rsx! { span { class: "pimble-discussions__resolved", "resolved" } });
+    let unread = (row.unread > 0).then(|| rsx! { span { class: "pimble-discussions__unread", {format!("{} new", row.unread)} } });
     let when = (!row.when.is_empty()).then(|| rsx! { span { class: "pimble-discussions__when", {format!(" · {}", row.when)} } });
     rsx! {
         div {
@@ -501,6 +519,7 @@ fn host_row(__scope: &mut RenderScope, store: AppStore, pane: PaneId, row: Discu
                 class: "pimble-discussions__topic",
                 {row.topic.clone()}
                 {resolved}
+                {unread}
                 span { class: "pimble-discussions__count", {format!("{}", row.count)} }
             }
             div {
@@ -575,6 +594,65 @@ fn render_inline(__scope: &mut RenderScope, store: AppStore, pane: PaneId, ctx: 
             contenteditable: "false",
             onmousedown: move || crate::pane_view::press_in_view(),
             {view}
+        }
+    }
+}
+
+// ── View > "Discussions..." (contract section 8) ────────────────────────
+
+/// The window listing every discussion with unread messages in the open
+/// stores, newest first; a line opens its discussion in the focused pane.
+pub(crate) fn render_unread_modal(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
+    let rows = move || unread_rows(store);
+    rsx! {
+        Modal {
+            opened_fn: move || store.discussions_modal.get(),
+            onclose: move || store.discussions_modal.set(false),
+            title: "Discussions",
+            size: "md",
+            div {
+                class: "pimble-discussions pimble-discussions--modal",
+                if rows().is_empty() {
+                    div { class: "pimble-discussion__empty", "Nothing unread." }
+                }
+                for row in rows() {
+                    div {
+                        key: format!("{:?}", row),
+                        onclick: {
+                            let (s, n) = (row.store_id, row.node_id);
+                            move || {
+                                store.discussions_modal.set(false);
+                                let pane = untracked(|| store.focused_pane.get());
+                                store.link_open.set(Some(LinkOpen { value: format!("node_{s}_{n}"), store_id: s, node_id: n, anchor: None, pane: Some(pane) }));
+                            }
+                        },
+                        {host_row_static(__scope, store, row.clone())}
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A row of the unread list: as a host's row, with what it is on.
+fn host_row_static(__scope: &mut RenderScope, store: AppStore, row: DiscussionRow) -> NodeHandle {
+    let on = store
+        .get_node_signal(row.store_id, row.node_id)
+        .and_then(|sig| untracked(|| sig.with(|n| n.attached_to)))
+        .map(|host| format!(" · on {}", store.display_label(row.store_id, host)))
+        .unwrap_or_default();
+    rsx! {
+        div {
+            class: "pimble-discussions__row",
+            div {
+                class: "pimble-discussions__topic",
+                {row.topic.clone()}
+                span { class: "pimble-discussions__unread", {format!("{} new", row.unread)} }
+            }
+            div {
+                class: "pimble-discussions__latest",
+                {format!("{}{on}", row.latest)}
+            }
         }
     }
 }

@@ -454,6 +454,12 @@ impl PimbleClient {
         self.client.who_am_i().await.map(|r| (r.sub, r.name)).map_err(rpc_error)
     }
 
+    /// Every discussion in a store this connection may read, with content.
+    pub async fn list_discussions(&self, store_id: StoreId) -> Result<Vec<Node>> {
+        let request = pimble_rpc::types::ListDiscussionsRequest { store_id };
+        self.client.list_discussions(request).await.map(|r| r.nodes).map_err(rpc_error)
+    }
+
     /// A node's live attachments, oldest first, with their content.
     pub async fn list_attachments(&self, store_id: StoreId, node_id: NodeId) -> Result<Vec<Node>> {
         let request = pimble_rpc::types::ListAttachmentsRequest { store_id, node_id };

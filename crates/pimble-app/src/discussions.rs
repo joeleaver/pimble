@@ -18,18 +18,18 @@
 mod ui;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use pimble_core::{custom_keys, node_types, Node, NodeId, StoreId};
 use pimble_crdt::NodeDoc;
 use pimble_discussion::{Author, Body, Discussion, DiscussionSnapshot, Span, Stamp};
 use rinch::prelude::*;
 
-use crate::panes::{PaneId, MAX_PANES};
+use crate::panes::PaneId;
 use crate::protocol::{BackendCommand, NodeInit};
 use crate::state::{ActiveEdit, AppStore, LinkOpen};
 
-pub(crate) use ui::{register, render_discussion, render_host_panel};
+pub(crate) use ui::{register, render_discussion, render_host_panel, render_unread_modal};
 
 /// A new discussion node's icon (a Tabler icon name).
 pub const DISCUSSION_ICON: &str = "messages";
@@ -79,6 +79,8 @@ pub struct MessageView {
     pub spans: Vec<Span>,
     pub deleted: bool,
     pub edited: bool,
+    /// Not read when this view opened, or arrived since (contract section 8).
+    pub fresh: bool,
 }
 
 /// Which message box is being typed in.
@@ -153,6 +155,11 @@ struct Session {
     node_id: NodeId,
     doc: NodeDoc,
     discussion: Discussion,
+    /// The messages that were unread while this slot showed them: they stay
+    /// marked new for as long as it does, though they count as read.
+    fresh: HashSet<String>,
+    /// A mark-as-read is due.
+    marking: bool,
 }
 
 thread_local! {
@@ -226,7 +233,7 @@ fn open_session(store: AppStore, slot: Slot, store_id: StoreId, node_id: NodeId,
         }
     };
     let discussion = Discussion::of_node(&doc).with_origin(origin(slot));
-    SESSIONS.with(|sessions| sessions.borrow_mut().insert(slot, Session { store_id, node_id, doc, discussion }));
+    SESSIONS.with(|sessions| sessions.borrow_mut().insert(slot, Session { store_id, node_id, doc, discussion, fresh: HashSet::new(), marking: false }));
     if first {
         store.send(BackendCommand::SubscribeNodeChanges { store_id, node_id });
     }
@@ -469,7 +476,7 @@ pub(crate) fn ago(at: &str, now_ms: f64) -> String {
 }
 
 /// The thread as the view shows it, from a snapshot.
-pub(crate) fn views_of(snap: &DiscussionSnapshot, me: Option<&Author>, now_ms: f64) -> Vec<MessageView> {
+pub(crate) fn views_of(snap: &DiscussionSnapshot, me: Option<&Author>, now_ms: f64, fresh: &HashSet<String>) -> Vec<MessageView> {
     let named = !snap.authors().is_empty();
     let name_of = |id: &str| -> String {
         snap.message(id)
@@ -508,6 +515,7 @@ pub(crate) fn views_of(snap: &DiscussionSnapshot, me: Option<&Author>, now_ms: f
                 spans: m.body.spans.clone(),
                 deleted: m.deleted_at.is_some(),
                 edited: m.edited.is_some(),
+                fresh: fresh.contains(&m.id) && !own,
             }
         })
         .collect()
@@ -525,11 +533,20 @@ fn preview(body: &Body, n: usize) -> String {
 
 /// Read `slot`'s discussion again into its view.
 pub(crate) fn recompute(store: AppStore, slot: Slot) {
-    let Some(snap) = with_session(slot, |s| s.discussion.read()) else { return };
+    let Some((snap, store_id, node_id)) = with_session(slot, |s| (s.discussion.read(), s.store_id, s.node_id)) else { return };
     let Some(ui) = ui_of(store, slot) else { return };
     let now = crate::boards::now_ms();
     let me = author();
-    let mut views = views_of(&snap, me.as_ref(), now);
+    let unread = crate::personal::with(|p| p.unread(&store_id.to_string(), &node_id.to_string(), &snap, me.as_ref().map(|a| a.id.as_str())));
+    let fresh = with_session(slot, |s| {
+        s.fresh.extend(unread.iter().cloned());
+        s.fresh.clone()
+    })
+    .unwrap_or_default();
+    if !unread.is_empty() {
+        mark_soon(store, slot);
+    }
+    let mut views = views_of(&snap, me.as_ref(), now, &fresh);
     let collapsed = snap.resolved.is_some() && !untracked(|| ui.show_all.get()) && views.len() > 1;
     ui.hidden.set(if collapsed { views.len() - 1 } else { 0 });
     if collapsed {
@@ -541,6 +558,63 @@ pub(crate) fn recompute(store: AppStore, slot: Slot) {
         format!("Resolved{by}, {}", ago(&r.at, now))
     }));
     ui.deleted.set(snap.deleted().into_iter().map(|m| (m.id.clone(), preview(&m.body, 60))).collect());
+}
+
+/// Whether `slot` is on screen: a pane the tiling shows, holding its
+/// discussion; or an inline discussion (shown while its atom is).
+fn slot_visible(store: AppStore, slot: Slot) -> bool {
+    match slot {
+        Slot::Pane(p) => untracked(|| store.pane(p).show_discussion.get() && store.tiling.with(|t| t.rect_of(p).is_some())),
+        Slot::Inline(p, ..) => untracked(|| store.pane(p).show_editor.get() && store.tiling.with(|t| t.rect_of(p).is_some())),
+    }
+}
+
+/// What `slot` shows unread counts as read once it has been on screen for
+/// about a second (contract section 8).
+fn mark_soon(store: AppStore, slot: Slot) {
+    let already = with_session(slot, |s| std::mem::replace(&mut s.marking, true)).unwrap_or(true);
+    if already {
+        return;
+    }
+    rinch::core::reactive::unowned(|| {
+        set_timeout(1000, move || {
+            with_session(slot, |s| s.marking = false);
+            if !slot_visible(store, slot) {
+                return;
+            }
+            let Some((snap, store_id, node_id)) = with_session(slot, |s| (s.discussion.read(), s.store_id, s.node_id)) else { return };
+            let me = author();
+            let changed = crate::personal::with(|p| {
+                let (s, n) = (store_id.to_string(), node_id.to_string());
+                let unread = p.unread(&s, &n, &snap, me.as_ref().map(|a| a.id.as_str()));
+                p.mark_read(&s, &n, &snap, &unread)
+            });
+            if changed {
+                crate::personal::changed(store);
+                crate::boards::pins_changed(store);
+            }
+        })
+    });
+}
+
+/// How many messages of discussion `(store_id, node_id)` are unread, from
+/// its cached document.
+pub(crate) fn unread_of(store_id: StoreId, node_id: NodeId, node: &Node) -> usize {
+    let Ok(doc) = NodeDoc::load(&node.content) else { return 0 };
+    let snap = Discussion::of_node(&doc).read();
+    let me = author();
+    crate::personal::with(|p| p.unread(&store_id.to_string(), &node_id.to_string(), &snap, me.as_ref().map(|a| a.id.as_str())).len())
+}
+
+/// How many unread messages the discussions on node `(store_id, host)` hold,
+/// of those this window knows of; tracked.
+pub(crate) fn host_unread(store: AppStore, store_id: StoreId, host: NodeId) -> usize {
+    store.read_version.get();
+    host_discussions(store, store_id, host)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(id, node)| node.map(|n| unread_of(store_id, id, &n)))
+        .sum()
 }
 
 // ── Writing ─────────────────────────────────────────────────────────────
@@ -921,6 +995,7 @@ pub struct BoardPin {
     pub y: f32,
     pub title: String,
     pub count: usize,
+    pub unread: bool,
 }
 
 /// The discussions pinned to board node `(store_id, host)`'s own board, in
@@ -940,6 +1015,7 @@ pub(crate) fn board_pins(store: AppStore, store_id: StoreId, host: NodeId) -> Ve
                     y: y as f32,
                     title: row_of(store_id, id, Some(&node), 0.0).topic,
                     count,
+                    unread: unread_of(store_id, id, &node) > 0,
                 }),
                 _ => None,
             }
@@ -962,6 +1038,53 @@ pub(crate) fn start_pin(store: AppStore, from: PaneId, store_id: StoreId, host: 
     store.send(BackendCommand::CreateAttachment { store_id, host_id: host, title: String::new(), init });
 }
 
+/// `ListDiscussions` answered: the discussions go in the node cache and in
+/// what View > "Discussions..." lists.
+pub(crate) fn discussions_listed(store: AppStore, store_id: StoreId, nodes: Vec<Node>) {
+    let ids: Vec<(StoreId, NodeId)> = nodes.iter().map(|n| (store_id, n.id)).collect();
+    for node in nodes {
+        store.upsert_node(store_id, node);
+    }
+    store.all_discussions.update(|all| {
+        all.retain(|(s, _)| *s != store_id);
+        all.extend(ids);
+    });
+}
+
+/// View > "Discussions...": every discussion with unread messages in the
+/// open stores, newest first.
+pub(crate) fn open_unread(store: AppStore) {
+    store.all_discussions.set(Vec::new());
+    store.discussions_modal.set(true);
+    let stores: Vec<StoreId> = untracked(|| store.store_data.with(|m| m.keys().copied().collect()));
+    for store_id in stores {
+        store.send(BackendCommand::ListDiscussions { store_id });
+    }
+}
+
+/// What View > "Discussions..." shows: the discussions with unread messages,
+/// newest message first; tracked.
+pub(crate) fn unread_rows(store: AppStore) -> Vec<DiscussionRow> {
+    store.read_version.get();
+    let now = crate::boards::now_ms();
+    let mut rows: Vec<(String, DiscussionRow)> = store
+        .all_discussions
+        .get()
+        .into_iter()
+        .filter_map(|(s, n)| {
+            let node = store.node_data.with(|m| m.get(&(s, n)).copied())?.get();
+            let row = row_of(s, n, Some(&node), now);
+            if row.unread == 0 {
+                return None;
+            }
+            let latest = NodeDoc::load(&node.content).ok().and_then(|d| Discussion::of_node(&d).read().latest().map(|m| m.created.clone())).unwrap_or_default();
+            Some((latest, row))
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    rows.into_iter().map(|(_, r)| r).collect()
+}
+
 /// One line about a discussion for its host's list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiscussionRow {
@@ -973,6 +1096,7 @@ pub struct DiscussionRow {
     pub latest: String,
     pub when: String,
     pub resolved: bool,
+    pub unread: usize,
 }
 
 pub(crate) fn row_of(store_id: StoreId, node_id: NodeId, node: Option<&Node>, now_ms: f64) -> DiscussionRow {
@@ -995,6 +1119,7 @@ pub(crate) fn row_of(store_id: StoreId, node_id: NodeId, node: Option<&Node>, no
         },
         when: latest.map(|m| ago(&m.created, now_ms)).unwrap_or_default(),
         resolved: snap.resolved.is_some(),
+        unread: node.map(|n| unread_of(store_id, node_id, n)).unwrap_or(0),
     }
 }
 
@@ -1033,7 +1158,7 @@ mod tests {
             let id = d.edit(|t| t.post(Stamp::new(Some(who), &at), parent.as_deref(), &Body::plain(format!("m{i}")))).into_result().unwrap().0;
             parent = Some(id);
         }
-        let views = views_of(&d.read(), Some(&alice), now_ms());
+        let views = views_of(&d.read(), Some(&alice), now_ms(), &HashSet::new());
         assert_eq!(views.iter().map(|v| v.indent).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 5, 5, 5]);
         assert_eq!(views[6].replying_to.as_deref(), Some("Bob"));
         assert!(views[0].own && !views[1].own, "Alice's are hers, Bob's are not");

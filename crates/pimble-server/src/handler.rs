@@ -60,7 +60,7 @@ use pimble_rpc::{
     CloudHostStoreResponse, CloudHostedStoreInfo, CloudListHostedStoresResponse, CloudRelayStoreRequest, CloudRelayStoreResponse, CloudSignInRequest,
     CloudStatusResponse, CloudStopRelayingRequest,
     CreateMountRequest, CreateMountResponse,
-    CreateAttachmentRequest, CreateNodeRequest, CreateNodeResponse, CreateStoreRequest, CreateStoreResponse, ListAttachmentsRequest, ListAttachmentsResponse, WhoAmIResponse,
+    CreateAttachmentRequest, CreateNodeRequest, CreateNodeResponse, CreateStoreRequest, CreateStoreResponse, ListAttachmentsRequest, ListAttachmentsResponse, ListDiscussionsRequest, ListDiscussionsResponse, WhoAmIResponse,
     CreateWorkspaceRequest, DeleteNodeRequest, EditOperation, EmptyResponse, GetChildrenRequest,
     GetChildrenResponse, GetMountStateRequest, GetMountStateResponse, GetNodeRequest, GetStoreSyncRequest, GetStoreSyncResponse, SetStoreSyncRequest,
     GetNodeResponse, GetNodesRequest, GetNodesResponse, ListRemoteStoresRequest, ListStoresResponse, LoadWorkspaceRequest,
@@ -3718,6 +3718,38 @@ impl PimbleApiServer for RpcHandler {
         self.broadcast_tree_edit(request.store_id, &edit, &[(node_id, StoreChangeKind::AttachmentChanged { node_id, host_id, live: true })], None).await;
         self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
         Ok(CreateNodeResponse { node_id })
+    }
+
+    async fn list_discussions(
+        &self,
+        ext: &Extensions,
+        request: ListDiscussionsRequest,
+    ) -> Result<ListDiscussionsResponse, ErrorObjectOwned> {
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Read)?;
+        self.reject_if_vault(request.store_id).await?;
+        let manager = self.store_manager.read().await;
+        let reach = Reach::of(&manager, &principal, request.store_id);
+        let tree = manager.tree(request.store_id).map_err(to_rpc_error)?;
+        let mut nodes = Vec::new();
+        for id in tree.list_node_ids() {
+            let Ok(fields) = tree.live_fields(id) else { continue };
+            if fields.node_type != pimble_core::node_types::DISCUSSION {
+                continue;
+            }
+            // One on a deleted node is hidden with it.
+            if fields.attached_to.is_some_and(|host| !tree.has_node(host)) {
+                continue;
+            }
+            if require_in_scope(&reach, id, Access::Read).is_err() {
+                continue;
+            }
+            if let Ok(mut node) = manager.get_node(request.store_id, id) {
+                node.access = judge_access(&manager, &principal, &reach, request.store_id, id);
+                nodes.push(node);
+            }
+        }
+        Ok(ListDiscussionsResponse { nodes })
     }
 
     async fn who_am_i(&self, ext: &Extensions) -> Result<WhoAmIResponse, ErrorObjectOwned> {

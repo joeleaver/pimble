@@ -2041,6 +2041,14 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         style: {move || if node_sig.map_or(0, |s| s.with(|n| n.attachments)) > 0 { "" } else { "display: none;" }},
                         span { class: "pimble-tree-discussions__icon", IconGlyph { name: "messages".to_string() } }
                         {move || node_sig.map_or(String::new(), |s| s.with(|n| n.attachments.to_string()))}
+                        // Something unread in them (docs/DISCUSSIONS_CONTRACT.md section 8).
+                        span {
+                            class: "pimble-tree-discussions__unread",
+                            style: {move || match parsed {
+                                Some((s_id, Some(n_id))) if crate::discussions::host_unread(store, s_id, n_id) > 0 => "",
+                                _ => "display: none;",
+                            }},
+                        }
                     }
 
                     // Sync status badge (store roots only, linked stores
@@ -3406,6 +3414,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             store.deleted_modal_pending.set(true);
             store.send(BackendCommand::ListDeleted { store_id });
         };
+        let discussions_modal = crate::discussions::render_unread_modal(__scope, store);
         let deleted_modal = rsx! {
             Modal {
                 opened_fn: move || store.deleted_modal_store.get().is_some(),
@@ -4540,6 +4549,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {link_modal}
                 {remove_replica_modal}
                 {deleted_modal}
+                {discussions_modal}
                 {new_store_modal}
                 {import_modal}
                 {mount_picker_modal}
@@ -4570,6 +4580,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {link_modal}
                 {remove_replica_modal}
                 {deleted_modal}
+                {discussions_modal}
                 {new_store_modal}
                 {import_modal}
                 {mount_picker_modal}
