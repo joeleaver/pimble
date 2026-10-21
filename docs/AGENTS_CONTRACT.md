@@ -1,10 +1,10 @@
 # Agents contract: connecting AI apps to Pimble, with access you choose
 
-Status: **proposal, not approved.** Written 2026-10-20 from Joe's request: "something
+Status: **decided 2026-10-20, not built.** Written that day from Joe's request: "something
 in-app that makes it easy for users to configure MCP for their local agents, e.g. Claude
 Desktop, GPT, etc. We need granular control for which node-trees MCP has access to, and I
-suspect it needs to be handled differently for local MCP vs Pimble Cloud." The questions
-for Joe are at the end; nothing here is built.
+suspect it needs to be handled differently for local MCP vs Pimble Cloud." Joe's
+decisions are in section 8.
 
 Builds on `docs/MCP_CONTRACT.md` (pimble-mcp, its tools, the CRDT write path) and the
 sharing model in `docs/NODE_DOCUMENT_CONTRACT.md` section 5 (scoped grants, `Reach`).
@@ -56,13 +56,14 @@ Agent {
   `credentials.json`. Agents are not synced, not hosted, not shared; another device has
   its own (Joe, 2026-09-18: "nothing is hosted unless the person asked").
 
-### "Everything" stays possible
+### Every agent is scoped, and so is every setup
 
-An agent can be granted whole stores, or "Everything open on this computer" (today's
-behaviour, the `Service` principal minus lifecycle). Existing setups, which launch
-`pimble-mcp` with no key, keep working as "Everything" until the person picks
-otherwise; the Agents window lists that as an agent named "Unrestricted (set up by
-hand)" with a button to replace it with a scoped one.
+An agent can be granted whole stores, but there is no unscoped agent. `pimble-mcp`
+started without an agent key refuses to connect (Joe, 2026-10-20: setups made by hand
+stop until scoped), and every tool answers one sentence: "Pimble needs this app set up
+as an agent: in Pimble, Account > AI Agents... > New Agent." The release that ships this
+says so in its notes, and `docs/DEPLOY.md`'s hand-written config section is replaced by
+the Agents window.
 
 ## 3. Local agents (stdio: Claude Desktop, Claude Code, Cursor, ...)
 
@@ -147,22 +148,21 @@ snippet instead. Removing an agent removes its entry the same way.
    (reusing the share judgement), lifecycle RPCs refused, `agents.json`, attribution.
    Tests: an agent reads and writes only inside its grants, through every tool and
    search; a reader is refused writes with the sentence; a removed agent's key fails.
-2. **pimble-mcp**: `--agent` / `PIMBLE_AGENT_KEY`; no key stays unrestricted.
+2. **pimble-mcp**: `--agent` / `PIMBLE_AGENT_KEY`; no key refuses with the sentence.
 3. **App**: the Agents window, the tree picker, config writing for Claude Desktop,
    Claude Code and Cursor, the copy-paste fallback; desktop and web.
-4. **Remote**: Streamable HTTP on the relay face, `/mcp/<id>` and OAuth in the accounts
-   service, the offline sentence. Last, since it touches the hosted service and deploys.
+4. **Remote** (in this same piece of work, Joe 2026-10-20): Streamable HTTP on the relay
+   face, `/mcp/<id>` and OAuth in the accounts service, the offline sentence. Last of
+   the waves, since it touches the hosted service, and deployed only with Joe's go.
 
-## 8. Questions for Joe
+## 8. Decisions (Joe, 2026-10-20)
 
-1. **Is "an agent is a scoped collaborator, enforced by the server" the right model?**
-   The alternative is a filter inside pimble-mcp, which is less code but trusted to
-   pimble-mcp and easy to get wrong in one tool.
-2. **Remote agents through the relay (section 4): now, later, or never?** They need the
-   computer on, an OAuth flow in the accounts service and a deploy.
-3. **Default for today's unrestricted setups**: keep them working as "Unrestricted"
-   (proposed), or require everyone to create a scoped agent after updating?
-4. **Roles**: reader and editor only (proposed), or also "can create nodes but not
-   change existing ones" (an inbox-style agent)? Roles are Joe's call (memory: ask
-   before changing the roles model).
-5. **Writing other apps' config files** directly (with a backup), or copy-paste only?
+1. **Enforced by the server**: an agent is a scoped principal with share-shaped grants,
+   judged by `Reach`; not a filter in pimble-mcp.
+2. **Remote agents in the same piece of work**, through the relay, working while the
+   computer is on.
+3. **Setups made by hand stop until scoped**: no unrestricted agent, no key no access.
+4. **Roles: reader and editor**, as share members have.
+5. Not asked, the proposal stands until Joe says otherwise: Pimble writes the config of
+   the apps it knows (Claude Desktop, Claude Code, Cursor) with a backup, and offers the
+   snippet for everything else.
