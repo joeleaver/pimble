@@ -29,13 +29,32 @@ use crate::panes::{PaneId, MAX_PANES};
 use crate::protocol::{BackendCommand, NodeInit};
 use crate::state::{ActiveEdit, AppStore, LinkOpen};
 
-pub(crate) use ui::{render_discussion, render_host_panel};
+pub(crate) use ui::{register, render_discussion, render_host_panel};
 
 /// A new discussion node's icon (a Tabler icon name).
 pub const DISCUSSION_ICON: &str = "messages";
 /// How deep replies are indented before they are shown flat, with whom
 /// they reply to (Joe, 2026-10-21).
 pub const MAX_INDENT: usize = 5;
+
+// ── Where a discussion is shown ─────────────────────────────────────────
+
+/// Where a discussion's document is held and shown: a pane showing the
+/// discussion node, or a discussion shown inline in a pane's text (an
+/// `embed` atom, docs/DISCUSSIONS_CONTRACT.md section 6), one per atom's node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Slot {
+    Pane(PaneId),
+    Inline(PaneId, StoreId, NodeId),
+}
+
+impl Slot {
+    pub fn pane(self) -> PaneId {
+        match self {
+            Slot::Pane(p) | Slot::Inline(p, _, _) => p,
+        }
+    }
+}
 
 // ── What the view shows ──────────────────────────────────────────────────
 
@@ -137,32 +156,133 @@ struct Session {
 }
 
 thread_local! {
-    static SESSIONS: RefCell<[Option<Session>; MAX_PANES]> = const { RefCell::new([None, None, None, None]) };
+    static SESSIONS: RefCell<HashMap<Slot, Session>> = RefCell::new(HashMap::new());
+    /// Each inline discussion's view state (a pane's own is its `PaneState`'s).
+    static INLINE_UI: RefCell<HashMap<Slot, DiscussionUi>> = RefCell::new(HashMap::new());
     static APP: Cell<Option<AppStore>> = const { Cell::new(None) };
     /// What a create asked for once it is made: open the new discussion,
     /// from this pane.
     static OPEN_AFTER: RefCell<HashMap<u64, PaneId>> = RefCell::new(HashMap::new());
     static NEXT_REQUEST: Cell<u64> = const { Cell::new(0xD15C_0000) };
+    /// What `insert_inline` asked for: the pane and the note the atom goes in.
+    static INSERT_AFTER: RefCell<HashMap<u64, (PaneId, StoreId, NodeId, Option<Vec<u8>>)>> = RefCell::new(HashMap::new());
 }
 
-fn with_session<R>(pane: PaneId, f: impl FnOnce(&mut Session) -> R) -> Option<R> {
-    SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()].as_mut().map(f))
+fn with_session<R>(slot: Slot, f: impl FnOnce(&mut Session) -> R) -> Option<R> {
+    SESSIONS.with(|sessions| sessions.borrow_mut().get_mut(&slot).map(f))
 }
 
-fn panes_holding(store_id: StoreId, node_id: NodeId) -> Vec<PaneId> {
-    PaneId::ALL
-        .into_iter()
-        .filter(|pane| with_session(*pane, |s| (s.store_id, s.node_id) == (store_id, node_id)).unwrap_or(false))
-        .collect()
+/// Every slot holding node `node_id`'s document in this window.
+fn slots_holding(store_id: StoreId, node_id: NodeId) -> Vec<Slot> {
+    let mut out: Vec<Slot> = SESSIONS.with(|s| s.borrow().iter().filter(|(_, x)| (x.store_id, x.node_id) == (store_id, node_id)).map(|(k, _)| *k).collect());
+    out.sort_by_key(|slot| format!("{slot:?}"));
+    out
+}
+
+/// The view state of a slot: a pane's own, or an inline discussion's.
+pub(crate) fn ui_of(store: AppStore, slot: Slot) -> Option<DiscussionUi> {
+    match slot {
+        Slot::Pane(p) => Some(store.pane(p).discussion_ui),
+        Slot::Inline(..) => INLINE_UI.with(|u| u.borrow().get(&slot).copied()),
+    }
+}
+
+/// The node a slot holds, if any.
+pub(crate) fn held_by(slot: Slot) -> Option<(StoreId, NodeId)> {
+    with_session(slot, |s| (s.store_id, s.node_id))
 }
 
 /// The node pane `pane`'s discussion view holds, if any.
 pub(crate) fn held(pane: PaneId) -> Option<(StoreId, NodeId)> {
-    with_session(pane, |s| (s.store_id, s.node_id))
+    held_by(Slot::Pane(pane))
 }
 
-fn origin(pane: PaneId) -> String {
-    format!("pimble-discussion-pane-{}", pane.index())
+/// Whether this window holds node `(store_id, node_id)` as a discussion
+/// shown inline in some text (counted with the panes holding nodes,
+/// `AppStore::is_editing`).
+pub(crate) fn inline_holds(store_id: StoreId, node_id: NodeId) -> bool {
+    slots_holding(store_id, node_id).iter().any(|s| matches!(s, Slot::Inline(..)))
+}
+
+fn origin(slot: Slot) -> String {
+    match slot {
+        Slot::Pane(p) => format!("pimble-discussion-pane-{}", p.index()),
+        Slot::Inline(p, _, n) => format!("pimble-discussion-inline-{}-{n}", p.index()),
+    }
+}
+
+/// Hold node `node_id`'s document in `slot`, from the freshest copy this
+/// window has (another slot's) or `content`.
+fn open_session(store: AppStore, slot: Slot, store_id: StoreId, node_id: NodeId, content: &[u8]) {
+    APP.with(|app| app.set(Some(store)));
+    let first = !store.is_editing(store_id, node_id);
+    let sibling = slots_holding(store_id, node_id).into_iter().find_map(|other| with_session(other, |s| s.doc.save()));
+    let bytes = sibling.as_deref().unwrap_or(content);
+    let doc = match NodeDoc::load(bytes) {
+        Ok(doc) => doc,
+        Err(e) => {
+            tracing::warn!("discussion {node_id} could not be read ({e}); showing it empty until the server's copy arrives");
+            NodeDoc::new()
+        }
+    };
+    let discussion = Discussion::of_node(&doc).with_origin(origin(slot));
+    SESSIONS.with(|sessions| sessions.borrow_mut().insert(slot, Session { store_id, node_id, doc, discussion }));
+    if first {
+        store.send(BackendCommand::SubscribeNodeChanges { store_id, node_id });
+    }
+    request_reconcile(store, slot);
+    recompute(store, slot);
+}
+
+/// Let go of `slot`'s document: the node cache gets it as the slot last had
+/// it, and the last slot holding the node lets go of its subscription.
+fn close_session(store: AppStore, slot: Slot) {
+    let Some(session) = SESSIONS.with(|sessions| sessions.borrow_mut().remove(&slot)) else { return };
+    if COMPOSING.with(Cell::get).is_some_and(|(s, _)| s == slot) {
+        end_composing();
+    }
+    if let Some(sig) = store.get_node_signal(session.store_id, session.node_id) {
+        let bytes = session.doc.save();
+        sig.update(|node| node.content = bytes);
+    }
+    if !store.is_editing(session.store_id, session.node_id) {
+        store.send(BackendCommand::UnsubscribeNodeChanges { store_id: session.store_id, node_id: session.node_id });
+    }
+}
+
+/// An inline discussion's view came: it holds the node (from the cache,
+/// once the node is there) and its view state.
+pub(crate) fn inline_opened(store: AppStore, slot: Slot, ui: DiscussionUi) {
+    INLINE_UI.with(|u| u.borrow_mut().insert(slot, ui));
+    if let Slot::Inline(_, store_id, node_id) = slot {
+        if held_by(slot).is_some() {
+            return;
+        }
+        match store.get_node_signal(store_id, node_id) {
+            Some(sig) => {
+                let content = untracked(|| sig.with(|n| n.content.clone()));
+                open_session(store, slot, store_id, node_id, &content);
+            }
+            None => store.send(BackendCommand::GetNode { store_id, node_id }),
+        }
+    }
+}
+
+/// The node an inline discussion waits for arrived.
+pub(crate) fn node_loaded(store: AppStore, store_id: StoreId, node_id: NodeId, content: &[u8]) {
+    let waiting: Vec<Slot> = INLINE_UI.with(|u| u.borrow().keys().copied().filter(|s| matches!(s, Slot::Inline(_, st, n) if (*st, *n) == (store_id, node_id))).collect());
+    for slot in waiting {
+        if held_by(slot).is_none() {
+            open_session(store, slot, store_id, node_id, content);
+        }
+    }
+}
+
+/// An inline discussion's view went (its atom left the text, or the text
+/// its pane showed).
+pub(crate) fn inline_closed(store: AppStore, slot: Slot) {
+    INLINE_UI.with(|u| u.borrow_mut().remove(&slot));
+    close_session(store, slot);
 }
 
 /// Who discussion messages are stamped as: the signed-in account (contract
@@ -177,20 +297,6 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
     crate::boards::stop(store, pane);
     crate::sheets::stop(store, pane);
     stop(store, pane);
-    APP.with(|app| app.set(Some(store)));
-    let first = !store.is_editing(store_id, node_id);
-    // A pane opening a discussion another pane holds starts from that copy.
-    let sibling = panes_holding(store_id, node_id).into_iter().find_map(|other| with_session(other, |s| s.doc.save()));
-    let bytes = sibling.as_deref().unwrap_or(content);
-    let doc = match NodeDoc::load(bytes) {
-        Ok(doc) => doc,
-        Err(e) => {
-            tracing::warn!("discussion {node_id} could not be read ({e}); showing it empty until the server's copy arrives");
-            NodeDoc::new()
-        }
-    };
-    let discussion = Discussion::of_node(&doc).with_origin(origin(pane));
-    SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()] = Some(Session { store_id, node_id, doc, discussion }));
     let state = store.pane(pane);
     let ui = state.discussion_ui;
     ui.draft.set(String::new());
@@ -201,29 +307,18 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
     ui.show_deleted.set(false);
     ui.show_all.set(false);
     state.discussion.set(Some(ActiveEdit { store_id, node_id }));
-    if first {
-        store.send(BackendCommand::SubscribeNodeChanges { store_id, node_id });
-    }
-    request_reconcile(store, pane);
-    recompute(store, pane);
+    open_session(store, Slot::Pane(pane), store_id, node_id, content);
 }
 
-/// Stop showing pane `pane`'s discussion, if it shows one: the node cache
-/// gets the document as this pane last had it, and the last pane holding
-/// the node lets go of its subscription.
+/// Stop showing pane `pane`'s discussion, if it shows one.
 pub(crate) fn stop(store: AppStore, pane: PaneId) {
-    let Some(session) = SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()].take()) else { return };
-    end_composing();
-    if let Some(sig) = store.get_node_signal(session.store_id, session.node_id) {
-        let bytes = session.doc.save();
-        sig.update(|node| node.content = bytes);
+    if held(pane).is_none() {
+        return;
     }
     let state = store.pane(pane);
     state.discussion_ui.messages.set(Vec::new());
     state.discussion.set(None);
-    if !store.is_editing(session.store_id, session.node_id) {
-        store.send(BackendCommand::UnsubscribeNodeChanges { store_id: session.store_id, node_id: session.node_id });
-    }
+    close_session(store, Slot::Pane(pane));
 }
 
 fn encode(bytes: &[u8]) -> String {
@@ -231,17 +326,17 @@ fn encode(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// Ask the server for what it has beyond pane `pane`'s copy.
-fn request_reconcile(store: AppStore, pane: PaneId) {
-    if let Some((store_id, node_id, state_vector)) = with_session(pane, |s| (s.store_id, s.node_id, s.doc.state_vector())) {
+/// Ask the server for what it has beyond `slot`'s copy.
+fn request_reconcile(store: AppStore, slot: Slot) {
+    if let Some((store_id, node_id, state_vector)) = with_session(slot, |s| (s.store_id, s.node_id, s.doc.state_vector())) {
         store.send(BackendCommand::ReconcileNodeContent { store_id, node_id, state_vector });
     }
 }
 
 /// Every pane holding the node asks again (the connection came back).
 pub(crate) fn request_reconcile_all(store: AppStore, store_id: StoreId, node_id: NodeId) {
-    for pane in panes_holding(store_id, node_id) {
-        request_reconcile(store, pane);
+    for slot in slots_holding(store_id, node_id) {
+        request_reconcile(store, slot);
     }
 }
 
@@ -249,8 +344,8 @@ pub(crate) fn request_reconcile_all(store: AppStore, store_id: StoreId, node_id:
 /// node, then what the server lacks goes back.
 pub(crate) fn apply_reconcile(store: AppStore, store_id: StoreId, node_id: NodeId, diff: &[u8], server_state_vector: &[u8]) {
     let writable = store.node_access(store_id, node_id).allows_write();
-    for pane in panes_holding(store_id, node_id) {
-        let ours = with_session(pane, |s| {
+    for slot in slots_holding(store_id, node_id) {
+        let ours = with_session(slot, |s| {
             if !diff.is_empty() {
                 if let Err(e) = s.doc.apply_update(diff) {
                     tracing::warn!("a discussion's reconcile did not apply: {e}");
@@ -266,35 +361,35 @@ pub(crate) fn apply_reconcile(store: AppStore, store_id: StoreId, node_id: NodeI
         if let Some(ours) = ours {
             store.send(BackendCommand::BroadcastChanges { store_id, node_id, changes: encode(&ours) });
         }
-        refresh_cache(store, pane);
-        recompute(store, pane);
+        refresh_cache(store, slot);
+        recompute(store, slot);
     }
 }
 
 /// A peer's update of a node: applied in every pane holding it.
 pub(crate) fn apply_remote(store: AppStore, store_id: StoreId, node_id: NodeId, bytes: &[u8]) {
-    for pane in panes_holding(store_id, node_id) {
-        apply_to(store, pane, bytes);
+    for slot in slots_holding(store_id, node_id) {
+        apply_to(store, slot, bytes);
     }
 }
 
-fn apply_to(store: AppStore, pane: PaneId, bytes: &[u8]) {
-    let applied = with_session(pane, |s| {
+fn apply_to(store: AppStore, slot: Slot, bytes: &[u8]) {
+    let applied = with_session(slot, |s| {
         if let Err(e) = s.doc.apply_update(bytes) {
             tracing::warn!("a discussion update did not apply: {e}");
         }
     });
     if applied.is_some() {
-        refresh_cache(store, pane);
-        recompute(store, pane);
+        refresh_cache(store, slot);
+        recompute(store, slot);
     }
 }
 
 /// The node cache takes pane `pane`'s copy of its discussion: what this
 /// window shows of it elsewhere (its host's list) reads the cache, and no
 /// refetch comes for a node a pane holds.
-fn refresh_cache(store: AppStore, pane: PaneId) {
-    let Some((store_id, node_id, bytes)) = with_session(pane, |s| (s.store_id, s.node_id, s.doc.save())) else { return };
+fn refresh_cache(store: AppStore, slot: Slot) {
+    let Some((store_id, node_id, bytes)) = with_session(slot, |s| (s.store_id, s.node_id, s.doc.save())) else { return };
     if let Some(sig) = store.get_node_signal(store_id, node_id) {
         sig.update(|node| node.content = bytes);
     }
@@ -302,9 +397,9 @@ fn refresh_cache(store: AppStore, pane: PaneId) {
 
 /// Send an update this pane made: to the server through `applyEdit`, and to
 /// every other pane of this window holding the discussion, a turn later.
-fn send_update(store: AppStore, from: PaneId, store_id: StoreId, node_id: NodeId, bytes: Vec<u8>) {
+fn send_update(store: AppStore, from: Slot, store_id: StoreId, node_id: NodeId, bytes: Vec<u8>) {
     store.send(BackendCommand::BroadcastChanges { store_id, node_id, changes: encode(&bytes) });
-    let others: Vec<PaneId> = panes_holding(store_id, node_id).into_iter().filter(|p| *p != from).collect();
+    let others: Vec<Slot> = slots_holding(store_id, node_id).into_iter().filter(|p| *p != from).collect();
     if others.is_empty() {
         return;
     }
@@ -321,35 +416,39 @@ fn send_update(store: AppStore, from: PaneId, store_id: StoreId, node_id: NodeId
     rinch::core::reactive::unowned(|| set_timeout(0, deliver));
 }
 
-fn say(store: AppStore, pane: PaneId, sentence: impl Into<String>) {
-    store.pane(pane).discussion_ui.message.set(Some(sentence.into()));
+fn say(store: AppStore, slot: Slot, sentence: impl Into<String>) {
+    if let Some(ui) = ui_of(store, slot) {
+        ui.message.set(Some(sentence.into()));
+    }
 }
 
 /// One write of pane `pane`'s discussion, sent once it is made. `false`
 /// (with the reason said) when it was refused.
-fn local_edit(store: AppStore, pane: PaneId, f: impl FnOnce(&mut pimble_discussion::DiscussionTxn<'_, '_>) -> pimble_discussion::doc::Result<()>) -> bool {
-    let Some((store_id, node_id)) = held(pane) else { return false };
+fn local_edit(store: AppStore, slot: Slot, f: impl FnOnce(&mut pimble_discussion::DiscussionTxn<'_, '_>) -> pimble_discussion::doc::Result<()>) -> bool {
+    let Some((store_id, node_id)) = held_by(slot) else { return false };
     if !store.node_access(store_id, node_id).allows_write() {
-        say(store, pane, pimble_core::StoreAccess::READ_ONLY_REFUSAL);
+        say(store, slot, pimble_core::StoreAccess::READ_ONLY_REFUSAL);
         return false;
     }
-    let Some(edited) = with_session(pane, |s| s.discussion.edit(f)) else { return false };
+    let Some(edited) = with_session(slot, |s| s.discussion.edit(f)) else { return false };
     let ok = match edited.result {
         Ok(()) => {
-            store.pane(pane).discussion_ui.message.set(None);
+            if let Some(ui) = ui_of(store, slot) {
+                ui.message.set(None);
+            }
             true
         }
         Err(e) => {
-            say(store, pane, e.to_string());
+            say(store, slot, e.to_string());
             false
         }
     };
     if let Some(update) = edited.update {
-        send_update(store, pane, store_id, node_id, update);
+        send_update(store, slot, store_id, node_id, update);
         // No echo of our own edit refreshes the cache either.
-        refresh_cache(store, pane);
+        refresh_cache(store, slot);
     }
-    recompute(store, pane);
+    recompute(store, slot);
     ok
 }
 
@@ -422,12 +521,12 @@ fn preview(body: &Body, n: usize) -> String {
     }
 }
 
-/// Read pane `pane`'s discussion again into its view.
-pub(crate) fn recompute(store: AppStore, pane: PaneId) {
-    let Some(snap) = with_session(pane, |s| s.discussion.read()) else { return };
+/// Read `slot`'s discussion again into its view.
+pub(crate) fn recompute(store: AppStore, slot: Slot) {
+    let Some(snap) = with_session(slot, |s| s.discussion.read()) else { return };
+    let Some(ui) = ui_of(store, slot) else { return };
     let now = crate::boards::now_ms();
     let me = author();
-    let ui = store.pane(pane).discussion_ui;
     let mut views = views_of(&snap, me.as_ref(), now);
     let collapsed = snap.resolved.is_some() && !untracked(|| ui.show_all.get()) && views.len() > 1;
     ui.hidden.set(if collapsed { views.len() - 1 } else { 0 });
@@ -446,8 +545,8 @@ pub(crate) fn recompute(store: AppStore, pane: PaneId) {
 
 /// Send pane `pane`'s draft: a new message, or a reply to the message it
 /// replies to.
-pub(crate) fn post(store: AppStore, pane: PaneId) {
-    let ui = store.pane(pane).discussion_ui;
+pub(crate) fn post(store: AppStore, slot: Slot) {
+    let Some(ui) = ui_of(store, slot) else { return };
     let draft = untracked(|| ui.draft.get());
     let body = Body::from_markdown(&draft);
     if body.is_blank() {
@@ -456,7 +555,7 @@ pub(crate) fn post(store: AppStore, pane: PaneId) {
     let reply_to = untracked(|| ui.replying_to.get()).map(|(id, _)| id);
     let me = author();
     let now = crate::boards::now_stamp();
-    let posted = local_edit(store, pane, |t| t.post(Stamp::new(me.as_ref(), &now), reply_to.as_deref(), &body).map(|_| ()));
+    let posted = local_edit(store, slot, |t| t.post(Stamp::new(me.as_ref(), &now), reply_to.as_deref(), &body).map(|_| ()));
     if posted {
         ui.draft.set(String::new());
         ui.replying_to.set(None);
@@ -465,15 +564,15 @@ pub(crate) fn post(store: AppStore, pane: PaneId) {
 }
 
 /// Reply to message `id`: the message box at the bottom says so.
-pub(crate) fn reply_to(store: AppStore, pane: PaneId, id: &str) {
-    let ui = store.pane(pane).discussion_ui;
+pub(crate) fn reply_to(store: AppStore, slot: Slot, id: &str) {
+    let Some(ui) = ui_of(store, slot) else { return };
     let who = untracked(|| ui.messages.get())
         .into_iter()
         .find(|m| m.id == id)
         .map(|m| if m.author.is_empty() { spans_preview(&m.spans) } else { m.author.clone() })
         .unwrap_or_default();
     ui.replying_to.set(Some((id.to_string(), who)));
-    ui::focus_composer(pane, Composer::New);
+    ui::focus_composer(slot, Composer::New);
 }
 
 fn spans_preview(spans: &[Span]) -> String {
@@ -481,66 +580,74 @@ fn spans_preview(spans: &[Span]) -> String {
 }
 
 /// Start editing message `id`: its text as Markdown in the edit box.
-pub(crate) fn begin_edit(store: AppStore, pane: PaneId, id: &str) {
-    let Some(body) = with_session(pane, |s| s.discussion.read().message(id).map(|m| m.body.clone())).flatten() else { return };
-    let ui = store.pane(pane).discussion_ui;
+pub(crate) fn begin_edit(store: AppStore, slot: Slot, id: &str) {
+    let Some(body) = with_session(slot, |s| s.discussion.read().message(id).map(|m| m.body.clone())).flatten() else { return };
+    let Some(ui) = ui_of(store, slot) else { return };
     ui.edit_text.set(body.to_markdown());
     ui.editing.set(Some(id.to_string()));
-    ui::focus_composer(pane, Composer::Edit);
+    ui::focus_composer(slot, Composer::Edit);
 }
 
-pub(crate) fn save_edit(store: AppStore, pane: PaneId) {
-    let ui = store.pane(pane).discussion_ui;
+pub(crate) fn save_edit(store: AppStore, slot: Slot) {
+    let Some(ui) = ui_of(store, slot) else { return };
     let Some(id) = untracked(|| ui.editing.get()) else { return };
     let body = Body::from_markdown(&untracked(|| ui.edit_text.get()));
     let me = author();
     let now = crate::boards::now_stamp();
-    if local_edit(store, pane, |t| t.edit_message(Stamp::new(me.as_ref(), &now), &id, &body)) {
+    if local_edit(store, slot, |t| t.edit_message(Stamp::new(me.as_ref(), &now), &id, &body)) {
         ui.editing.set(None);
         ui.emoji.set(None);
     }
 }
 
-pub(crate) fn cancel_edit(store: AppStore, pane: PaneId) {
-    let ui = store.pane(pane).discussion_ui;
+pub(crate) fn cancel_edit(store: AppStore, slot: Slot) {
+    let Some(ui) = ui_of(store, slot) else { return };
     ui.editing.set(None);
     ui.emoji.set(None);
 }
 
-pub(crate) fn delete_message(store: AppStore, pane: PaneId, id: &str) {
+pub(crate) fn delete_message(store: AppStore, slot: Slot, id: &str) {
     let me = author();
     let now = crate::boards::now_stamp();
     let id = id.to_string();
-    local_edit(store, pane, |t| t.delete_message(Stamp::new(me.as_ref(), &now), &id));
+    local_edit(store, slot, |t| t.delete_message(Stamp::new(me.as_ref(), &now), &id));
 }
 
-pub(crate) fn restore_message(store: AppStore, pane: PaneId, id: &str) {
+pub(crate) fn restore_message(store: AppStore, slot: Slot, id: &str) {
     let id = id.to_string();
-    local_edit(store, pane, |t| t.restore_message(&id));
+    local_edit(store, slot, |t| t.restore_message(&id));
 }
 
 /// Show every message of a resolved discussion.
-pub(crate) fn show_all(store: AppStore, pane: PaneId) {
-    store.pane(pane).discussion_ui.show_all.set(true);
-    recompute(store, pane);
+pub(crate) fn show_all(store: AppStore, slot: Slot) {
+    if let Some(ui) = ui_of(store, slot) {
+        ui.show_all.set(true);
+    }
+    recompute(store, slot);
 }
 
-pub(crate) fn resolve(store: AppStore, pane: PaneId, reopen: bool) {
-    store.pane(pane).discussion_ui.show_all.set(false);
+pub(crate) fn resolve(store: AppStore, slot: Slot, reopen: bool) {
+    if let Some(ui) = ui_of(store, slot) {
+        ui.show_all.set(false);
+    }
     let me = author();
     let now = crate::boards::now_stamp();
-    local_edit(store, pane, |t| if reopen { t.reopen() } else { t.resolve(Stamp::new(me.as_ref(), &now)) });
+    local_edit(store, slot, |t| if reopen { t.reopen() } else { t.resolve(Stamp::new(me.as_ref(), &now)) });
 }
 
 /// The topic, as typed: the discussion node's title.
-pub(crate) fn set_topic(store: AppStore, pane: PaneId, text: &str) {
-    let Some((store_id, node_id)) = held(pane) else { return };
+pub(crate) fn set_topic(store: AppStore, slot: Slot, text: &str) {
+    let Some((store_id, node_id)) = held_by(slot) else { return };
     store.send(BackendCommand::RenameNode { store_id, node_id, title: text.trim().to_string() });
 }
 
 /// The discussion node's title, for the topic field.
-pub(crate) fn topic_of(store: AppStore, pane: PaneId) -> String {
-    let Some((store_id, node_id)) = store.pane(pane).discussion.get().map(|e| (e.store_id, e.node_id)) else { return String::new() };
+pub(crate) fn topic_of(store: AppStore, slot: Slot) -> String {
+    let held = match slot {
+        Slot::Pane(pane) => store.pane(pane).discussion.get().map(|e| (e.store_id, e.node_id)),
+        Slot::Inline(_, s, n) => Some((s, n)),
+    };
+    let Some((store_id, node_id)) = held else { return String::new() };
     let sig = store.node_data.with(|map| map.get(&(store_id, node_id)).copied());
     sig.map(|s| s.with(|n| n.metadata.title.clone())).unwrap_or_default()
 }
@@ -549,7 +656,7 @@ pub(crate) fn topic_of(store: AppStore, pane: PaneId) -> String {
 
 thread_local! {
     /// The message box being typed in: its pane and which one.
-    static COMPOSING: Cell<Option<(PaneId, Composer)>> = const { Cell::new(None) };
+    static COMPOSING: Cell<Option<(Slot, Composer)>> = const { Cell::new(None) };
     /// A press landed in a message box this turn (heard before the pane's).
     static PRESS_IN_BOX: Cell<bool> = const { Cell::new(false) };
 }
@@ -558,9 +665,9 @@ thread_local! {
 /// Shift+Enter starts a new line, Escape cancels. Plain inputs hear Enter
 /// only through the keyboard interceptor (rinch has no keydown on them yet,
 /// joeleaver/rinch#1678), so the box takes it until a press lands elsewhere.
-pub(crate) fn begin_composing(store: AppStore, pane: PaneId, which: Composer) {
+pub(crate) fn begin_composing(store: AppStore, slot: Slot, which: Composer) {
     PRESS_IN_BOX.with(|p| p.set(true));
-    COMPOSING.with(|c| c.set(Some((pane, which))));
+    COMPOSING.with(|c| c.set(Some((slot, which))));
     // Owned by no component: a click on Edit rebuilds the message it is in,
     // and an interceptor owned by that button would go with it.
     rinch::core::reactive::unowned(|| rinch::core::set_keyboard_interceptor(move |data| {
@@ -578,19 +685,22 @@ pub(crate) fn begin_composing(store: AppStore, pane: PaneId, which: Composer) {
         let _ = set_timeout(0, move || match (which, escape) {
             (Composer::New, false) => post(store, p),
             (Composer::New, true) => {
-                let ui = store.pane(p).discussion_ui;
-                ui.replying_to.set(None);
-                ui.emoji.set(None);
+                if let Some(ui) = ui_of(store, p) {
+                    ui.replying_to.set(None);
+                    ui.emoji.set(None);
+                }
             }
             (Composer::Edit, false) => save_edit(store, p),
             (Composer::Edit, true) => cancel_edit(store, p),
             (Composer::Topic, false) => {
-                let text = untracked(|| store.pane(p).discussion_ui.topic.get());
+                let text = ui_of(store, p).map(|ui| untracked(|| ui.topic.get())).unwrap_or_default();
                 set_topic(store, p, &text);
                 end_composing();
             }
             (Composer::Topic, true) => {
-                store.pane(p).discussion_ui.topic.set(untracked(|| topic_of(store, p)));
+                if let Some(ui) = ui_of(store, p) {
+                    ui.topic.set(untracked(|| topic_of(store, p)));
+                }
                 end_composing();
             }
         });
@@ -668,6 +778,51 @@ pub(crate) fn start_on_focused(store: AppStore) {
     }
 }
 
+/// Edit > "Insert Discussion": a discussion on the focused pane's note,
+/// anchored at the caret and shown there inline once it is made.
+pub(crate) fn insert_inline(store: AppStore) {
+    let pane = store.focused();
+    let Some(active) = untracked(|| store.pane(pane).active_edit.get()) else {
+        crate::events::show_notice(store, "Open a note to put a discussion in it.".to_string());
+        return;
+    };
+    if !store.node_access(active.store_id, active.node_id).allows_write() {
+        crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
+        return;
+    }
+    let handle = crate::editor::editor(pane);
+    let at = handle.selection().from();
+    let sticky = handle.collab_sticky_index_with(at, rinch_editor_collab::StickyAssoc::After);
+    let anchor = sticky.clone().map(|sticky| pimble_discussion::Anchor::Text { sticky });
+    let request = next_request();
+    INSERT_AFTER.with(|o| o.borrow_mut().insert(request, (pane, active.store_id, active.node_id, sticky)));
+    let mut init = init(request);
+    init.content = pimble_discussion::new_content(anchor.as_ref());
+    store.send(BackendCommand::CreateAttachment { store_id: active.store_id, host_id: active.node_id, title: String::new(), init });
+}
+
+/// The discussion `insert_inline` asked for was made: its atom goes in at
+/// the place its anchor names now (where the caret was, moved with what was
+/// typed since), when the pane still shows the note.
+fn insert_made(store: AppStore, request: u64, store_id: StoreId, node_id: NodeId) -> bool {
+    let Some((pane, host_store, host, sticky)) = INSERT_AFTER.with(|o| o.borrow_mut().remove(&request)) else { return false };
+    store.send(BackendCommand::ListAttachments { store_id, node_id: host });
+    store.send(BackendCommand::GetNode { store_id, node_id: host });
+    let still = untracked(|| store.pane(pane).active_edit.get()).is_some_and(|e| (e.store_id, e.node_id) == (host_store, host));
+    if !still {
+        return true;
+    }
+    let handle = crate::editor::editor(pane);
+    if let Some(place) = sticky.and_then(|bytes| handle.collab_locate_sticky(&bytes)) {
+        handle.set_selection(rinch_editor_core::selection::Selection::cursor(place.pos));
+    }
+    handle.focus();
+    if handle.insert_embed(ui::embed_attrs(store, store_id, node_id)) {
+        crate::sheets::in_text::paragraph_after(pane);
+    }
+    true
+}
+
 /// Open discussion `node_id` from pane `from`: in a new pane to its right
 /// when there is room for one, in `from` otherwise.
 pub(crate) fn open_beside(store: AppStore, from: PaneId, store_id: StoreId, node_id: NodeId) {
@@ -696,6 +851,9 @@ pub(crate) fn open_beside(store: AppStore, from: PaneId, store_id: StoreId, node
 
 /// A create this module asked for was made: open it.
 pub(crate) fn created(store: AppStore, request: u64, store_id: StoreId, node_id: NodeId, host: Option<NodeId>) {
+    if host.is_some() && insert_made(store, request, store_id, node_id) {
+        return;
+    }
     let Some(from) = OPEN_AFTER.with(|o| o.borrow_mut().remove(&request)) else { return };
     match host {
         Some(host) => {

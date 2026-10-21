@@ -284,6 +284,7 @@ pub(crate) fn start_editing(
     crate::text_boards::host_opened(store, pane, store_id, node_id, content_bytes);
     // And its sheets in text (docs/SHEETS_CONTRACT.md section 1).
     crate::sheets::in_text::register(store, pane);
+    crate::discussions::register(store, pane);
     crate::sheets::text_opened(store, pane, store_id, node_id, content_bytes);
     // A followed deep link into this note: its spot, now that the session
     // holds the content.

@@ -827,6 +827,8 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 store.upsert_node(*store_id, node.clone());
                 // A formula in a sheet may name this node (its tables, its title).
                 crate::sheets::node_loaded(store);
+                // An inline discussion may be waiting for it.
+                crate::discussions::node_loaded(store, *store_id, node_id, &content_bytes);
                 if access_changed {
                     refetch_below_changed_access(store, *store_id, &[node_id]);
                 }

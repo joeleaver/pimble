@@ -1721,6 +1721,8 @@ impl AppStore {
             || !self.panes_boarding(store_id, node_id).is_empty()
             || !self.panes_sheeting(store_id, node_id).is_empty()
             || !self.panes_discussing(store_id, node_id).is_empty()
+            // And a discussion shown inline in a note's text.
+            || crate::discussions::inline_holds(store_id, node_id)
             // A board embedded in a note's text holds its subscription too
             // (docs/IMAGE_MARKUP_CONTRACT.md section 2, "Showing").
             || crate::text_boards::embed_holds(store_id, node_id)

@@ -339,7 +339,7 @@ fn put_in(pane: PaneId, table: &str) -> bool {
 /// A paragraph after the text's last block when that is an embed: Escape
 /// out of an embed puts the caret there, and with nothing after it the
 /// embed itself would be selected and the next key typed over it.
-fn paragraph_after(pane: PaneId) {
+pub(crate) fn paragraph_after(pane: PaneId) {
     crate::editor::editor(pane).update(|state| {
         let doc = &state.doc;
         let last = doc.child_count().checked_sub(1).map(|i| doc.child(i))?;

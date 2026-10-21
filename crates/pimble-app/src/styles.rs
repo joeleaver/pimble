@@ -822,6 +822,39 @@ pub(crate) const APP_CSS: &str = "
     padding: 4px 0;
 }
 
+/* A discussion shown inline in a note's text: the pane's view in a box,
+   its thread scrolling inside it. */
+.pimble-discussion-inline {
+    margin: 8px 0;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-default);
+    background: var(--rinch-color-body);
+    overflow: hidden;
+    font-size: 14px;
+}
+
+.pimble-discussion--inline .pimble-discussion__head {
+    padding: 6px 12px;
+}
+
+.pimble-discussion--inline .pimble-discussion__topic {
+    font-size: 15px;
+}
+
+.pimble-discussion--inline .pimble-discussion__thread {
+    flex: none;
+    max-height: 360px;
+    padding: 8px 12px;
+}
+
+.pimble-discussion--inline .pimble-discussion__composer {
+    padding: 6px 12px 8px;
+}
+
+.pimble-discussion--inline .pimble-discussion__input {
+    min-height: 36px;
+}
+
 /* The discussions on a node, under its content. */
 .pimble-discussions {
     margin: 12px 16px 24px;
