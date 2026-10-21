@@ -23,17 +23,21 @@ use crate::state::AppStore;
 pub enum ClientApp {
     ClaudeDesktop,
     ClaudeCode,
+    /// The ChatGPT desktop app and the Codex CLI and IDE extension, which
+    /// share `~/.codex/config.toml` (learn.chatgpt.com/docs/extend/mcp).
+    ChatGpt,
     Cursor,
     Other,
 }
 
 impl ClientApp {
-    pub const ALL: [ClientApp; 4] = [ClientApp::ClaudeDesktop, ClientApp::ClaudeCode, ClientApp::Cursor, ClientApp::Other];
+    pub const ALL: [ClientApp; 5] = [ClientApp::ClaudeDesktop, ClientApp::ClaudeCode, ClientApp::ChatGpt, ClientApp::Cursor, ClientApp::Other];
 
     pub fn name(self) -> &'static str {
         match self {
             ClientApp::ClaudeDesktop => "Claude Desktop",
             ClientApp::ClaudeCode => "Claude Code",
+            ClientApp::ChatGpt => "ChatGPT / Codex",
             ClientApp::Cursor => "Cursor",
             ClientApp::Other => "Another MCP app",
         }
@@ -43,6 +47,7 @@ impl ClientApp {
         match self {
             ClientApp::ClaudeDesktop => "claude-desktop",
             ClientApp::ClaudeCode => "claude-code",
+            ClientApp::ChatGpt => "chatgpt",
             ClientApp::Cursor => "cursor",
             ClientApp::Other => "other",
         }
@@ -339,10 +344,57 @@ pub fn entry_json(app: ClientApp, mcp: &str, key: &str) -> serde_json::Value {
     entry
 }
 
-/// The whole snippet to paste, for an app Pimble does not set up itself.
+/// The whole snippet to paste, in the app's own format.
 pub fn snippet(app: ClientApp, agent_name: &str, key: &str) -> String {
+    if app == ClientApp::ChatGpt {
+        let mut doc = toml_edit::Document::new();
+        insert_toml_entry(&mut doc, &entry_name(agent_name), &mcp_path(), key);
+        return doc.to_string();
+    }
     let config = serde_json::json!({ "mcpServers": { entry_name(agent_name): entry_json(app, &mcp_path(), key) } });
     serde_json::to_string_pretty(&config).unwrap_or_default()
+}
+
+/// `[mcp_servers.<name>]` with the command and the key in its `env`.
+fn insert_toml_entry(doc: &mut toml_edit::Document, name: &str, mcp: &str, key: &str) -> bool {
+    let servers = doc.entry("mcp_servers").or_insert(toml_edit::table());
+    let Some(servers) = servers.as_table_mut() else { return false };
+    servers.set_implicit(true);
+    let mut entry = toml_edit::Table::new();
+    entry.insert("command", toml_edit::value(mcp));
+    let mut env = toml_edit::Table::new();
+    env.insert("PIMBLE_AGENT_KEY", toml_edit::value(key));
+    entry.insert("env", toml_edit::Item::Table(env));
+    servers.insert(name, toml_edit::Item::Table(entry));
+    true
+}
+
+/// Add an agent to ChatGPT / Codex's `config.toml` at `path`, keeping the
+/// rest of the file as written (its comments too), with the same backup and
+/// one-rename write as [`write_entry`]. A file that does not parse is left alone.
+pub fn write_toml_entry(path: &std::path::Path, entry_name: &str, mcp: &str, key: &str) -> Result<(), String> {
+    let mut doc = match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let doc: toml_edit::Document = text.parse().map_err(|_| format!("{} is not TOML Pimble can read, so it was left alone", path.display()))?;
+            std::fs::write(backup_path(path), &text).map_err(|e| format!("Could not keep a backup of {}: {e}", path.display()))?;
+            doc
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml_edit::Document::new(),
+        Err(e) => return Err(format!("Could not read {}: {e}", path.display())),
+    };
+    if !insert_toml_entry(&mut doc, entry_name, mcp, key) {
+        return Err(format!("{}'s mcp_servers is not a table, so it was left alone", path.display()));
+    }
+    write_replacing(path, &doc.to_string())
+}
+
+fn write_replacing(path: &std::path::Path, text: &str) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Could not make {}: {e}", dir.display()))?;
+    }
+    let tmp = path.with_extension("pimble-tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("Could not write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("Could not write {}: {e}", path.display()))
 }
 
 /// Where an app keeps its MCP servers.
@@ -352,6 +404,11 @@ fn config_path(app: ClientApp) -> Option<std::path::PathBuf> {
         // `config_dir` is ~/.config, %APPDATA% and ~/Library/Application Support.
         ClientApp::ClaudeDesktop => dirs::config_dir().map(|d| d.join("Claude").join("claude_desktop_config.json")),
         ClientApp::ClaudeCode => dirs::home_dir().map(|h| h.join(".claude.json")),
+        // `CODEX_HOME` moves it, as Codex itself honours.
+        ClientApp::ChatGpt => std::env::var_os("CODEX_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))
+            .map(|d| d.join("config.toml")),
         ClientApp::Cursor => dirs::home_dir().map(|h| h.join(".cursor").join("mcp.json")),
         ClientApp::Other => None,
     }
@@ -381,12 +438,7 @@ pub fn write_entry(path: &std::path::Path, entry_name: &str, entry: serde_json::
     };
     servers.insert(entry_name.to_string(), entry);
     let text = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("Could not make {}: {e}", dir.display()))?;
-    }
-    let tmp = path.with_extension("pimble-tmp");
-    std::fs::write(&tmp, text).map_err(|e| format!("Could not write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("Could not write {}: {e}", path.display()))
+    write_replacing(path, &text)
 }
 
 fn backup_path(path: &std::path::Path) -> std::path::PathBuf {
@@ -402,7 +454,11 @@ fn set_up(store: AppStore) {
     let ui = store.agents_ui;
     let Some((agent, key, app)) = untracked(|| ui.created.get()) else { return };
     let Some(path) = config_path(app) else { return };
-    let sentence = match write_entry(&path, &entry_name(&agent.name), entry_json(app, &mcp_path(), &key)) {
+    let written = match app {
+        ClientApp::ChatGpt => write_toml_entry(&path, &entry_name(&agent.name), &mcp_path(), &key),
+        _ => write_entry(&path, &entry_name(&agent.name), entry_json(app, &mcp_path(), &key)),
+    };
+    let sentence = match written {
         Ok(()) => format!("Added to {}. Restart {} to connect it.", app.name(), app.name()),
         Err(e) => format!("{e}. Copy the setup below into {} instead.", app.name()),
     };
@@ -725,6 +781,27 @@ mod tests {
         std::fs::write(&broken, "{ not json").unwrap();
         assert!(write_entry(&broken, "pimble-x", entry_json(ClientApp::Cursor, "m", "k")).is_err());
         assert_eq!(std::fs::read_to_string(&broken).unwrap(), "{ not json", "untouched");
+    }
+
+    #[test]
+    fn a_codex_config_keeps_its_comments_and_other_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "# my settings\nmodel = \"gpt\"\n\n[mcp_servers.other]\ncommand = \"x\" # keep me\n").unwrap();
+        write_toml_entry(&path, "pimble-chatgpt", "/opt/pimble-mcp", "pmbl_agent_k").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# my settings") && text.contains("# keep me"), "comments kept:\n{text}");
+        let doc: toml_edit::Document = text.parse().unwrap();
+        assert_eq!(doc["model"].as_str(), Some("gpt"));
+        assert_eq!(doc["mcp_servers"]["other"]["command"].as_str(), Some("x"));
+        assert_eq!(doc["mcp_servers"]["pimble-chatgpt"]["command"].as_str(), Some("/opt/pimble-mcp"));
+        assert_eq!(doc["mcp_servers"]["pimble-chatgpt"]["env"]["PIMBLE_AGENT_KEY"].as_str(), Some("pmbl_agent_k"));
+        assert!(std::fs::read_to_string(backup_path(&path)).unwrap().contains("# my settings"));
+
+        let broken = dir.path().join("broken.toml");
+        std::fs::write(&broken, "[[[ not toml").unwrap();
+        assert!(write_toml_entry(&broken, "pimble-x", "m", "k").is_err());
+        assert_eq!(std::fs::read_to_string(&broken).unwrap(), "[[[ not toml");
     }
 
     #[test]
