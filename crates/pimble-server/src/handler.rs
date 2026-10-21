@@ -60,7 +60,7 @@ use pimble_rpc::{
     CloudHostStoreResponse, CloudHostedStoreInfo, CloudListHostedStoresResponse, CloudRelayStoreRequest, CloudRelayStoreResponse, CloudSignInRequest,
     CloudStatusResponse, CloudStopRelayingRequest,
     CreateMountRequest, CreateMountResponse,
-    CreateAttachmentRequest, CreateNodeRequest, CreateNodeResponse, CreateStoreRequest, CreateStoreResponse, ListAttachmentsRequest, ListAttachmentsResponse, ListDiscussionsRequest, ListDiscussionsResponse, WhoAmIResponse,
+    CreateAttachmentRequest, CreateNodeRequest, CreateNodeResponse, CreateStoreRequest, CreateStoreResponse, ListAttachmentsRequest, ListAttachmentsResponse, ListDiscussionsRequest, ListDiscussionsResponse, WhoAmIResponse, CloudPersonalSyncRequest, CloudPersonalSyncResponse,
     CreateWorkspaceRequest, DeleteNodeRequest, EditOperation, EmptyResponse, GetChildrenRequest,
     GetChildrenResponse, GetMountStateRequest, GetMountStateResponse, GetNodeRequest, GetStoreSyncRequest, GetStoreSyncResponse, SetStoreSyncRequest,
     GetNodeResponse, GetNodesRequest, GetNodesResponse, ListRemoteStoresRequest, ListStoresResponse, LoadWorkspaceRequest,
@@ -3750,6 +3750,49 @@ impl PimbleApiServer for RpcHandler {
             }
         }
         Ok(ListDiscussionsResponse { nodes })
+    }
+
+    async fn cloud_personal_sync(&self, ext: &Extensions, request: CloudPersonalSyncRequest) -> Result<CloudPersonalSyncResponse, ErrorObjectOwned> {
+        use base64::Engine;
+        authorize_service_only(&principal_of(ext), "cloudPersonalSync")?;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let local = b64.decode(&request.state).map_err(|e| to_rpc_error(format!("the personal document is not base64: {e}")))?;
+        let account = self.keystore.account().await.ok_or_else(|| to_rpc_error("no Pimble Cloud account is signed in"))?;
+        if !request.enabled {
+            crate::cloud::delete_personal(&account.url, &account.session).await.map_err(to_rpc_error)?;
+            return Ok(CloudPersonalSyncResponse { state: request.state, off: true });
+        }
+        let key = pimble_crypto::personal_key(&account.keys);
+        let aad = pimble_crypto::personal_aad(&account.user_id);
+        // Fetch, merge, write; again when another device wrote in between.
+        for _ in 0..4 {
+            let remote = crate::cloud::get_personal(&account.url, &account.session).await.map_err(to_rpc_error)?;
+            // An empty copy: another device of theirs turned it off.
+            if remote.as_ref().is_some_and(|b| b.blob.is_empty()) && !request.turn_on {
+                return Ok(CloudPersonalSyncResponse { state: request.state, off: true });
+            }
+            let (version, remote_plain) = match &remote {
+                Some(body) if body.blob.is_empty() => (body.version, Vec::new()),
+                Some(body) => {
+                    let sealed = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&body.blob).map_err(to_rpc_error)?;
+                    (body.version, pimble_crypto::Blob::decrypt(&key, &aad, &sealed).map_err(|e| to_rpc_error(format!("the personal document could not be opened: {e}")))?)
+                }
+                None => (0, Vec::new()),
+            };
+            let merged = pimble_discussion::Personal::load(&remote_plain);
+            let before = merged.save();
+            merged.merge(&local);
+            let after = merged.save();
+            if remote.as_ref().is_some_and(|b| !b.blob.is_empty()) && after == before {
+                return Ok(CloudPersonalSyncResponse { state: b64.encode(after), off: false });
+            }
+            let sealed = pimble_crypto::Blob::encrypt(&key, uuid::Uuid::nil(), &aad, &after);
+            let blob = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sealed);
+            if crate::cloud::put_personal(&account.url, &account.session, version, &blob).await.map_err(to_rpc_error)?.is_some() {
+                return Ok(CloudPersonalSyncResponse { state: b64.encode(after), off: false });
+            }
+        }
+        Err(to_rpc_error("the personal document kept changing on another device; try again"))
     }
 
     async fn who_am_i(&self, ext: &Extensions) -> Result<WhoAmIResponse, ErrorObjectOwned> {

@@ -100,6 +100,48 @@ fn endpoint(base_url: &str, path: &str) -> String {
     format!("{}{}", base_url.trim_end_matches('/'), path)
 }
 
+// ── /me/personal (docs/DISCUSSIONS_CONTRACT.md section 8) ─────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PersonalBody {
+    pub version: u64,
+    pub blob: String,
+}
+
+/// The account's sealed personal document, `None` when it has none.
+pub async fn get_personal(base_url: &str, session: &str) -> Result<Option<PersonalBody>> {
+    match get(&endpoint(base_url, "/api/v1/me/personal"), Some(session)).await {
+        Ok(body) => Ok(Some(body)),
+        Err(e) if e.status() == Some(404) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Replace it, naming the version replaced; `Ok(None)` when another device
+/// wrote first (409): fetch, merge, write again.
+pub async fn put_personal(base_url: &str, session: &str, version: u64, blob: &str) -> Result<Option<u64>> {
+    let body = PersonalBody { version, blob: blob.to_string() };
+    match put::<_, PersonalBody>(&endpoint(base_url, "/api/v1/me/personal"), session, &body).await {
+        Ok(answer) => Ok(Some(answer.version)),
+        Err(e) if e.status() == Some(409) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+pub async fn delete_personal(base_url: &str, session: &str) -> Result<()> {
+    let resp = client()
+        .delete(endpoint(base_url, "/api/v1/me/personal"))
+        .bearer_auth(session)
+        .send()
+        .await
+        .map_err(|e| CloudError::Request { url: base_url.to_string(), source: e })?;
+    if resp.status().is_success() || resp.status().as_u16() == 404 {
+        Ok(())
+    } else {
+        Err(CloudError::Status { url: base_url.to_string(), status: resp.status().as_u16(), body: resp.text().await.unwrap_or_default() })
+    }
+}
+
 // ── GET /kdf ──────────────────────────────────────────────────────────────
 
 pub async fn kdf(base_url: &str, email: &str) -> Result<KdfParams> {

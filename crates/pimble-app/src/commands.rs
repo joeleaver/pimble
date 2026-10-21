@@ -140,6 +140,19 @@ pub async fn process_command(
             }
         }
 
+        BackendCommand::SyncPersonal { state, enabled, turn_on } => {
+            let c = client.as_ref()?;
+            match c.cloud_personal_sync(&state, enabled, turn_on).await {
+                Ok((state, off)) => Some(BackendEvent::PersonalSynced { state, off }),
+                Err(e) => {
+                    // Nobody signed in, or the service unreachable: this
+                    // device keeps its copy and tries again later.
+                    tracing::debug!("personal document not synced: {e}");
+                    None
+                }
+            }
+        }
+
         BackendCommand::ListDiscussions { store_id } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });

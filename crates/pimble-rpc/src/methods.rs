@@ -74,6 +74,11 @@ pub trait PimbleApi {
     #[method(name = "listDiscussions", with_extensions)]
     async fn list_discussions(&self, request: ListDiscussionsRequest) -> Result<ListDiscussionsResponse, ErrorObjectOwned>;
 
+    /// Merge this device's personal document with the account's hosted one,
+    /// sealed (docs/DISCUSSIONS_CONTRACT.md section 8). `Service`-only.
+    #[method(name = "cloudPersonalSync", with_extensions)]
+    async fn cloud_personal_sync(&self, request: CloudPersonalSyncRequest) -> Result<CloudPersonalSyncResponse, ErrorObjectOwned>;
+
     /// Who the caller is (an agent's id and name). Any principal.
     #[method(name = "whoAmI", with_extensions)]
     async fn who_am_i(&self) -> Result<WhoAmIResponse, ErrorObjectOwned>;

@@ -102,6 +102,17 @@ mod imp {
         std::fs::read(personal_path()).unwrap_or_default()
     }
 
+    /// Whether the personal document follows the account (on unless off).
+    pub(crate) fn load_personal_sync() -> bool {
+        read_state()["personal_sync"].as_bool().unwrap_or(true)
+    }
+
+    pub(crate) fn save_personal_sync(on: bool) {
+        let mut state = read_state();
+        state["personal_sync"] = serde_json::json!(on);
+        write_state(&state);
+    }
+
     #[cfg(not(test))]
     pub(crate) fn save_personal(bytes: &[u8]) {
         let path = personal_path();
@@ -180,6 +191,18 @@ mod imp {
         }
     }
 
+    const PERSONAL_SYNC_KEY: &str = "pimble.personal_sync";
+
+    pub(crate) fn load_personal_sync() -> bool {
+        storage().and_then(|s| s.get_item(PERSONAL_SYNC_KEY).ok().flatten()).map(|v| v != "false").unwrap_or(true)
+    }
+
+    pub(crate) fn save_personal_sync(on: bool) {
+        if let Some(storage) = storage() {
+            let _ = storage.set_item(PERSONAL_SYNC_KEY, if on { "true" } else { "false" });
+        }
+    }
+
     /// Where the personal document lives in the browser, base64.
     const PERSONAL_KEY: &str = "pimble.personal";
 
@@ -215,6 +238,6 @@ pub(crate) fn save_panes(panes: &crate::panes::SavedPanes) {
 }
 
 pub(crate) use imp::{
-    load_app_state_file, load_dark_mode, load_personal, load_sidebar_width, save_app_state_file, save_dark_mode, save_personal,
-    save_sidebar_width,
+    load_app_state_file, load_dark_mode, load_personal, load_personal_sync, load_sidebar_width, save_app_state_file, save_dark_mode,
+    save_personal, save_personal_sync, save_sidebar_width,
 };

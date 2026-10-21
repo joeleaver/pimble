@@ -47,6 +47,11 @@ pub enum BackendCommand {
     ListAttachments { store_id: StoreId, node_id: NodeId },
     /// Every discussion of a store. Answers with `DiscussionsListed`.
     ListDiscussions { store_id: StoreId },
+    /// Merge the personal document with the signed-in account's other
+    /// devices' (docs/DISCUSSIONS_CONTRACT.md section 8); `enabled: false`
+    /// deletes the hosted copy. Answers with `PersonalSynced`, or nothing
+    /// when nobody is signed in.
+    SyncPersonal { state: Vec<u8>, enabled: bool, turn_on: bool },
     GetNode { store_id: StoreId, node_id: NodeId },
     GetChildren { store_id: StoreId, node_id: NodeId },
     SetNodeContent { store_id: StoreId, node_id: NodeId, content: Vec<u8> },
@@ -324,6 +329,9 @@ pub enum BackendEvent {
     AttachmentsListed { store_id: StoreId, node_id: NodeId, nodes: Vec<Node> },
     /// A store's discussions, each with its content.
     DiscussionsListed { store_id: StoreId, nodes: Vec<Node> },
+    /// The personal document as merged with the account's other devices'.
+    /// `off`: another device turned it off, and this one stops too.
+    PersonalSynced { state: Vec<u8>, off: bool },
     NodeLoaded { store_id: StoreId, node: Node },
     /// `children` live in `children_store_id`: the same as `store_id` for an
     /// ordinary parent, the mount's source store when `parent_id` is a mount point.

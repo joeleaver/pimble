@@ -1956,6 +1956,7 @@ dependencies = [
  "pimble-core",
  "pimble-crdt",
  "pimble-crypto",
+ "pimble-discussion",
  "pimble-rpc",
  "pimble-sheet",
  "rinch",

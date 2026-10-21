@@ -997,6 +997,8 @@ pub struct AppStore {
     /// Bumped whenever the personal document changes (`crate::personal`):
     /// what shows read state reads it, to follow.
     pub read_version: Signal<u64>,
+    /// The Account window's "Keep what I've read in step across my devices".
+    pub personal_sync: Signal<bool>,
     /// View > "Discussions..." (docs/DISCUSSIONS_CONTRACT.md section 8): open,
     /// and the discussions the open stores hold (`ListDiscussions`).
     pub discussions_modal: Signal<bool>,
@@ -1243,6 +1245,7 @@ impl AppStore {
             deleted_modal_error: Signal::new(String::new()),
             attachments: Signal::new(HashMap::new()),
             read_version: Signal::new(0),
+            personal_sync: Signal::new(crate::persistence::load_personal_sync()),
             discussions_modal: Signal::new(false),
             all_discussions: Signal::new(Vec::new()),
         }

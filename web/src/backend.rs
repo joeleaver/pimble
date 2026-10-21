@@ -646,6 +646,16 @@ async fn dispatch(
         return;
     }
 
+    // The personal document is the account's, not a store's: this page
+    // seals and syncs it itself (docs/DISCUSSIONS_CONTRACT.md section 8).
+    if let BackendCommand::SyncPersonal { state, enabled, turn_on } = cmd {
+        match crate::personal_sync::sync(&state, enabled, turn_on).await {
+            Ok((state, off)) => emit(event_tx, signal_ui, BackendEvent::PersonalSynced { state, off }),
+            Err(e) => tracing::debug!("personal document not synced: {e}"),
+        }
+        return;
+    }
+
     // An import is many commands, each routed exactly as the UI's own would
     // be (docs/IMPORT_CONTRACT.md).
     if let BackendCommand::Import { store_id, parent_id, format, name, files } = cmd {

@@ -454,6 +454,18 @@ impl PimbleClient {
         self.client.who_am_i().await.map(|r| (r.sub, r.name)).map_err(rpc_error)
     }
 
+    /// Merge `state` (this device's personal document) with the signed-in
+    /// account's hosted one; answers the merged state.
+    /// `(merged, off)`: `off` when another device turned it off.
+    pub async fn cloud_personal_sync(&self, state: &[u8], enabled: bool, turn_on: bool) -> Result<(Vec<u8>, bool)> {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let request = pimble_rpc::types::CloudPersonalSyncRequest { state: b64.encode(state), enabled, turn_on };
+        let answer = self.client.cloud_personal_sync(request).await.map_err(rpc_error)?;
+        let merged = b64.decode(answer.state).map_err(|e| crate::ClientError::Rpc(e.to_string()))?;
+        Ok((merged, answer.off))
+    }
+
     /// Every discussion in a store this connection may read, with content.
     pub async fn list_discussions(&self, store_id: StoreId) -> Result<Vec<Node>> {
         let request = pimble_rpc::types::ListDiscussionsRequest { store_id };

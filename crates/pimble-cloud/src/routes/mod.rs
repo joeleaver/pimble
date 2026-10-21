@@ -21,6 +21,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/logout", post(accounts::logout))
         .route("/api/v1/me", get(accounts::me))
         .route("/api/v1/me/keys", get(accounts::me_keys))
+        .route("/api/v1/me/personal", get(accounts::get_personal).put(accounts::put_personal).delete(accounts::delete_personal))
         .route("/api/v1/me/password", post(accounts::change_password))
         .route("/api/v1/me/recovery-code", post(accounts::change_recovery_code))
         .route("/api/v1/users/lookup", get(accounts::users_lookup))

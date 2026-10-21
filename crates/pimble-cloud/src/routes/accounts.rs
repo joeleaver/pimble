@@ -731,3 +731,56 @@ fn ws_url(state: &AppState, path: &str) -> String {
         format!("{base}{path}")
     }
 }
+
+// ── The personal document (docs/DISCUSSIONS_CONTRACT.md section 8) ──────
+
+/// The largest personal document accepted, sealed and base64.
+const MAX_PERSONAL_BLOB: usize = 4 * 1024 * 1024;
+
+#[derive(Serialize, Deserialize)]
+pub struct PersonalBody {
+    /// On a `PUT`: the version the write replaces (0 when there is none).
+    /// In an answer: the version held now.
+    pub version: u64,
+    /// The sealed document (`pimble_crypto::Blob`), base64url.
+    pub blob: String,
+}
+
+/// `GET /api/v1/me/personal`: the account's sealed personal document, 404
+/// when it has none.
+pub async fn get_personal(State(state): State<AppState>, authed: AuthedUser) -> CloudResult<Json<PersonalBody>> {
+    match state.db.get_personal(&authed.user.user_uuid).await? {
+        Some((_, version, blob)) => Ok(Json(PersonalBody { version, blob })),
+        None => Err(CloudError::NotFound("no personal document".into())),
+    }
+}
+
+/// `PUT /api/v1/me/personal`: replace it, when `version` is the one held
+/// (409 otherwise: the caller fetches, merges and writes again). Answers the
+/// new version.
+pub async fn put_personal(State(state): State<AppState>, authed: AuthedUser, Json(body): Json<PersonalBody>) -> CloudResult<Json<PersonalBody>> {
+    if body.blob.len() > MAX_PERSONAL_BLOB {
+        return Err(CloudError::BadRequest("the personal document is too large".into()));
+    }
+    let _one_at_a_time = state.personal_lock.lock().await;
+    let held = state.db.get_personal(&authed.user.user_uuid).await?;
+    let held_version = held.as_ref().map(|(_, v, _)| *v).unwrap_or(0);
+    if held_version != body.version {
+        return Err(CloudError::Conflict("the personal document changed; fetch it and merge".into()));
+    }
+    let version = held_version + 1;
+    state.db.put_personal(&authed.user.user_uuid, held.map(|(rid, _, _)| rid), version, &body.blob).await?;
+    Ok(Json(PersonalBody { version, blob: String::new() }))
+}
+
+/// `DELETE /api/v1/me/personal`: the person turned keeping it in step off.
+/// The sealed copy is gone and an empty one stays in its place, which is
+/// how every other device of theirs learns it is off (until one of them
+/// writes a copy again: the person turned it on there).
+pub async fn delete_personal(State(state): State<AppState>, authed: AuthedUser) -> CloudResult<Json<Value>> {
+    let _one_at_a_time = state.personal_lock.lock().await;
+    let held = state.db.get_personal(&authed.user.user_uuid).await?;
+    let version = held.as_ref().map(|(_, v, _)| *v).unwrap_or(0) + 1;
+    state.db.put_personal(&authed.user.user_uuid, held.map(|(rid, _, _)| rid), version, "").await?;
+    Ok(Json(json!({})))
+}

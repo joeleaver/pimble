@@ -56,6 +56,7 @@ fn member_role_words(member: &MemberView) -> String {
 
 #[component]
 pub fn account_page() -> NodeHandle {
+    let personal_sync = Signal::new(crate::personal_sync::enabled());
     let stores: Signal<Vec<StoreView>> = Signal::new(Vec::new());
     let loading = Signal::new(true);
     let error = Signal::new(String::new());
@@ -444,6 +445,25 @@ pub fn account_page() -> NodeHandle {
                 p { class: "pimble-page__lede",
                     "An encrypted store's key is made here and sealed to your account. \
                      Pimble Cloud stores the blobs and never sees the key."
+                }
+
+                Divider { size: "sm" }
+
+                // docs/DISCUSSIONS_CONTRACT.md section 8: signing in is the
+                // asking; this turns it off, for the account.
+                h2 { style: "margin: 0; font-size: 16px;", "What you've read" }
+                Checkbox {
+                    label: "Keep what I've read in step across my signed-in devices",
+                    checked_fn: move || personal_sync.get(),
+                    onchange: move || {
+                        let on = !untracked(|| personal_sync.get());
+                        personal_sync.set(on);
+                        crate::personal_sync::set_enabled(on);
+                    },
+                }
+                p { class: "pimble-page__lede",
+                    "What you have read in discussions, and where you were in each note, \
+                     sealed so only your devices can open it."
                 }
 
                 Divider { size: "sm" }

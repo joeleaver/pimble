@@ -531,6 +531,15 @@ fn preview(body: &Body, n: usize) -> String {
     }
 }
 
+/// Every slot reads its discussion again (read state came from another device).
+pub(crate) fn recompute_all(store: AppStore) {
+    let slots: Vec<Slot> = SESSIONS.with(|s| s.borrow().keys().copied().collect());
+    for slot in slots {
+        recompute(store, slot);
+    }
+    crate::boards::pins_changed(store);
+}
+
 /// Read `slot`'s discussion again into its view.
 pub(crate) fn recompute(store: AppStore, slot: Slot) {
     let Some((snap, store_id, node_id)) = with_session(slot, |s| (s.discussion.read(), s.store_id, s.node_id)) else { return };

@@ -274,6 +274,30 @@ pub struct CreateAttachmentRequest {
     pub custom: std::collections::HashMap<String, serde_json::Value>,
 }
 
+/// Keep the personal document in step with the signed-in account's other
+/// devices (docs/DISCUSSIONS_CONTRACT.md section 8). `Service`-only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudPersonalSyncRequest {
+    /// This device's copy (base64 of the yrs state).
+    pub state: String,
+    /// `false`: the person turned it off; the hosted copy is emptied, which
+    /// turns it off on their other devices too.
+    pub enabled: bool,
+    /// The person turned it on here: write even over a copy another device
+    /// emptied.
+    #[serde(default)]
+    pub turn_on: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudPersonalSyncResponse {
+    /// The merged copy (base64), to merge into this device's.
+    pub state: String,
+    /// Another device turned it off: this one stops too.
+    #[serde(default)]
+    pub off: bool,
+}
+
 /// Request for every discussion in a store the caller may read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListDiscussionsRequest {

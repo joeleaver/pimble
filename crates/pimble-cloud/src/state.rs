@@ -71,6 +71,9 @@ pub struct Inner {
     /// dies with the process, and nothing is lost by that: every tunnel and
     /// member reconnects and it fills again.
     pub relay: Relay,
+    /// One personal-document write at a time, so a version check and its
+    /// write are one step (docs/DISCUSSIONS_CONTRACT.md section 8).
+    pub personal_lock: tokio::sync::Mutex<()>,
 }
 
 impl std::ops::Deref for AppState {
@@ -121,6 +124,7 @@ impl AppState {
             invite_quota: QuotaLimiter::new(INVITES_PER_INVITER_WINDOW, INVITES_PER_INVITER_LIMIT),
             kdf_decoy_secret,
             relay,
+            personal_lock: tokio::sync::Mutex::new(()),
         }))
     }
 }

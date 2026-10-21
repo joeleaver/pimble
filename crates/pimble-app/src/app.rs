@@ -3588,6 +3588,18 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 {|| store.cloud_url.get()}
                             }
 
+                            // docs/DISCUSSIONS_CONTRACT.md section 8: signing in
+                            // is the asking; this turns it off.
+                            Checkbox {
+                                label: "Keep what I've read in step",
+                                checked_fn: move || store.personal_sync.get(),
+                                onchange: move || crate::personal::set_sync_enabled(store, !untracked(|| store.personal_sync.get())),
+                            }
+                            div {
+                                style: "font-size: 12px; color: var(--rinch-color-dimmed);",
+                                "What you have read in discussions, and where you were in each note, sealed so only your devices can open it."
+                            }
+
                             Button {
                                 variant: "light",
                                 size: "sm",

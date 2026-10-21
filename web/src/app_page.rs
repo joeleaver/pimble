@@ -56,6 +56,10 @@ pub fn start() {
         // section 6): the account this page is unlocked for.
         pimble_app::boards::set_author(session::user_id(), session::email());
         store.backend.set(Some(backend::spawn(session_token)));
+        // An unlocked page is a signed-in account: its personal document
+        // follows it (docs/DISCUSSIONS_CONTRACT.md section 8).
+        store.cloud_signed_in.set(true);
+        pimble_app::personal::sync_now(store);
         route::mount_app(store, view);
     });
 }

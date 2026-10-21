@@ -968,6 +968,10 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 crate::discussions::attachments_listed(store, *store_id, *node_id, nodes.clone());
             }
 
+            BackendEvent::PersonalSynced { state, off } => {
+                crate::personal::synced(store, state, *off);
+            }
+
             BackendEvent::DiscussionsListed { store_id, nodes } => {
                 crate::discussions::discussions_listed(store, *store_id, nodes.clone());
             }
@@ -1503,6 +1507,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 // section 6): the account, or nobody when signed out.
                 if *signed_in {
                     crate::boards::set_author(user_id.clone(), email.clone());
+                    // Signing in is the asking (docs/DISCUSSIONS_CONTRACT.md
+                    // section 8): the personal document follows the account.
+                    crate::personal::sync_now(store);
                 } else {
                     crate::boards::set_author(None, None);
                 }
