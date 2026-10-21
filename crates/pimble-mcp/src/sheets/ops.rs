@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use pimble_sheet::doc::{self, Placement, Sheets, SheetsTxn};
 use pimble_sheet::formula::{self, ComputedTable, Engine, ErrorCode, Evaluated, NameError, NameErrorKind, RowRef, Value};
 use pimble_sheet::input;
-use pimble_sheet::{Book, ColumnSnap, ColumnType, Format, NodeRef, ResultKey, SheetsSnap, Stored, TableSnap};
+use pimble_sheet::{Book, ColumnSnap, ColumnType, Format, NodeRef, ResultKey, SheetsSnap, Stored, SummaryCell, TableSnap};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -731,7 +731,173 @@ pub fn render_table(work: &Work, table: &str, filter: &Filter) -> Result<String,
         out.push_str(&errors.join("\n"));
         out.push('\n');
     }
+    out.push_str(&render_summary_rows(&engine, book, &t, &ct));
     Ok(out)
+}
+
+/// A table's summary rows and groups (contract section 4b), as get_table
+/// shows them: each row's name, what each column shows and its value.
+fn render_summary_rows(engine: &Engine<'_>, book: &McpBook, t: &TableSnap, ct: &ComputedTable) -> String {
+    let mut out = String::new();
+    let line = |s: &pimble_sheet::formula::ComputedSummaryRow| -> String {
+        let def = t.summary_row(&s.id);
+        let parts: Vec<String> = ct
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                let col = c.id.as_deref()?;
+                let cell = def?.cells.get(col)?;
+                let how = match cell {
+                    SummaryCell::Formula(f) => format!("={}", formula::to_shown(book, Some(&t.id), f).trim_start_matches('=')),
+                    other => other.label().to_lowercase(),
+                };
+                let v = &s.values[i];
+                let value = match v {
+                    Value::Error(e) => format!("{} ({})", e.code.code(), sentence(&e.message)),
+                    _ => shown(engine, v, s.formats[i]),
+                };
+                Some(format!("{} {} ({how})", c.name, value))
+            })
+            .collect();
+        format!("{}: {}", s.name, if parts.is_empty() { "nothing yet".to_string() } else { parts.join(", ") })
+    };
+    if !ct.summary_rows.is_empty() {
+        out.push_str("summary rows (read with Table[[#Totals],[column]] for the first, Table[[#Name],[column]] by name):\n");
+        for s in &ct.summary_rows {
+            out.push_str(&format!("- {}\n", line(s)));
+        }
+    }
+    if let Some(gi) = ct.group_by {
+        out.push_str(&format!("grouped by: {}\n", ct.columns[gi].name));
+        for g in &ct.groups {
+            let label = if g.label.is_empty() { "(blank)" } else { g.label.as_str() };
+            out.push_str(&format!("- {label} ({} row{})", g.rows.len(), if g.rows.len() == 1 { "" } else { "s" }));
+            if g.subtotals.is_empty() {
+                out.push('\n');
+            } else {
+                let subs: Vec<String> = g.subtotals.iter().map(line).collect();
+                out.push_str(&format!(": {}\n", subs.join("; ")));
+            }
+        }
+    }
+    out
+}
+
+// ── Summary rows and groups (contract section 4b) ──────────────────────
+
+fn find_summary_row<'s>(t: &'s TableSnap, name: &str) -> Result<&'s pimble_sheet::SummaryRowSnap, String> {
+    t.summary_rows.iter().find(|s| norm(&s.name) == norm(name) || s.id == name).ok_or_else(|| {
+        if t.summary_rows.is_empty() {
+            format!("{} has no summary rows; add_summary_row makes one.", t.name)
+        } else {
+            format!("{} has no summary row \"{name}\"; its summary rows are {}.", t.name, quoted_list(t.summary_rows.iter().map(|s| s.name.clone())))
+        }
+    })
+}
+
+/// What a column of a summary row shows, as asked for: sum, average, count,
+/// min, max, none (nothing), or a formula starting with `=`.
+fn summary_choice(work: &Work, t: &TableSnap, column: &str, choice: &str) -> Result<(String, Option<SummaryCell>), String> {
+    let c = find_column(t, column)?;
+    let choice = choice.trim();
+    let cell = match choice.to_lowercase().as_str() {
+        "" | "none" | "nothing" => None,
+        "sum" => Some(SummaryCell::Sum),
+        "average" => Some(SummaryCell::Average),
+        "count" => Some(SummaryCell::Count),
+        "min" => Some(SummaryCell::Min),
+        "max" => Some(SummaryCell::Max),
+        _ if choice.starts_with('=') => match formula::to_stored(&*work.book, Some(&t.id), choice) {
+            Ok(stored) => Some(SummaryCell::Formula(stored.trim_start().trim_start_matches('=').to_string())),
+            Err(e) => return Err(format!("The {} column's formula: {}", c.name, name_error(&e))),
+        },
+        _ => return Err(format!("\"{choice}\" isn't something a summary cell shows; use sum, average, count, min, max, none, or a formula starting with =.")),
+    };
+    Ok((c.id.clone(), cell))
+}
+
+pub fn add_summary_row(work: &mut Work, table: &str, name: Option<&str>, cells: &BTreeMap<String, String>) -> Result<String, String> {
+    let t = find_table(work.snap(), table)?.clone();
+    plain(&t).map_err(|_| format!("{} is a summary table; summary rows go on a plain table.", t.name))?;
+    let mut parsed = Vec::new();
+    for (column, choice) in cells {
+        if let (id, Some(cell)) = summary_choice(work, &t, column, choice)? {
+            parsed.push((id, cell));
+        }
+    }
+    work.write(|txn| txn.add_summary_row(&t.id, name, &parsed, Placement::Last))?;
+    Ok(format!("Added the summary row.\n{}", summary_part(work, &t.id)?))
+}
+
+/// The summary rows and groups of a table, as get_table ends with them.
+fn summary_part(work: &Work, table: &str) -> Result<String, String> {
+    let t = work.table(table)?;
+    let book: &McpBook = &*work.book;
+    let engine = Engine::new(book);
+    let ct = compute(&engine, work.home(), table)?;
+    Ok(render_summary_rows(&engine, book, &t, &ct))
+}
+
+pub fn update_summary_row(work: &mut Work, table: &str, row: &str, new_name: Option<&str>, cells: &BTreeMap<String, String>, position: Option<&str>) -> Result<String, String> {
+    let t = find_table(work.snap(), table)?.clone();
+    let sr = find_summary_row(&t, row)?.clone();
+    let mut parsed = Vec::new();
+    for (column, choice) in cells {
+        parsed.push(summary_choice(work, &t, column, choice)?);
+    }
+    let ids: Vec<String> = t.summary_rows.iter().map(|s| s.id.clone()).collect();
+    let i = ids.iter().position(|x| *x == sr.id).unwrap_or(0);
+    let placement = match position.map(|p| p.trim().to_lowercase()) {
+        None => None,
+        Some(p) => Some(match p.as_str() {
+            "first" | "top" => Placement::First,
+            "last" | "bottom" => Placement::Last,
+            "up" if i > 0 => Placement::Before(ids[i - 1].clone()),
+            "down" if i + 1 < ids.len() => Placement::After(ids[i + 1].clone()),
+            "up" | "down" => return Err(format!("{} is already the {} summary row.", sr.name, if p == "up" { "first" } else { "last" })),
+            _ => return Err("position is first, last, up or down.".to_string()),
+        }),
+    };
+    work.write(|txn| {
+        if let Some(n) = new_name {
+            txn.rename_summary_row(&t.id, &sr.id, n)?;
+        }
+        for (col, cell) in &parsed {
+            txn.set_summary_cell(&t.id, &sr.id, col, cell.as_ref())?;
+        }
+        if let Some(p) = placement {
+            txn.move_summary_row(&t.id, &sr.id, p)?;
+        }
+        Ok(())
+    })?;
+    Ok(format!("Changed the summary row.\n{}", summary_part(work, &t.id)?))
+}
+
+pub fn remove_summary_row(work: &mut Work, table: &str, row: &str) -> Result<String, String> {
+    let t = find_table(work.snap(), table)?.clone();
+    let sr = find_summary_row(&t, row)?.clone();
+    let reading = readers(work.snap(), &format!("{{s:{}}}", sr.id), None);
+    work.write(|txn| txn.delete_summary_row(&t.id, &sr.id))?;
+    let mut out = format!("Removed the summary row {} of {}.", sr.name, t.name);
+    if !reading.is_empty() {
+        out.push_str(&format!(" These formulas read it and now show #REF!: {}.", reading.join(", ")));
+    }
+    Ok(out)
+}
+
+pub fn group_table(work: &mut Work, table: &str, column: Option<&str>) -> Result<String, String> {
+    let t = find_table(work.snap(), table)?.clone();
+    plain(&t).map_err(|_| format!("{} is a summary table; its rows come from its formula and can't be grouped.", t.name))?;
+    let col = match column.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(c) => Some(find_column(&t, c)?.id.clone()),
+        None => None,
+    };
+    work.write(|txn| txn.set_group_by(&t.id, col.as_deref()))?;
+    Ok(match col {
+        Some(_) => format!("Grouped {}.\n{}", t.name, summary_part(work, &t.id)?),
+        None => format!("{} is no longer grouped.", t.name),
+    })
 }
 
 /// Every table of the node, rendered.
@@ -863,6 +1029,14 @@ fn readers(snap: &SheetsSnap, needle: &str, except_table: Option<&str>) -> Vec<S
             if let ColumnType::Formula { formula, .. } = &c.ty {
                 if formula.contains(needle) {
                     out.push(format!("{}[{}]", t.name, c.name));
+                }
+            }
+        }
+        for sr in &t.summary_rows {
+            for (col, cell) in &sr.cells {
+                if matches!(cell, SummaryCell::Formula(f) if f.contains(needle)) {
+                    let name = t.column(col).map(|c| c.name.as_str()).unwrap_or("?");
+                    out.push(format!("{}'s {} row, {name}", t.name, sr.name));
                 }
             }
         }

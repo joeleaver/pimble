@@ -141,6 +141,10 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
     let id_delete = tid.clone();
     let id_convert = tid.clone();
     let id_add = tid.clone();
+    let id_sum = tid.clone();
+    let id_collapse = tid.clone();
+    let grouped = !t.groups.is_empty();
+    let summary_tid = tid.clone();
     let summary = t.summary;
     let source_row = summary.then(|| {
         rsx! {
@@ -180,24 +184,60 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
         })
         .collect();
 
-    let body: Vec<NodeHandle> = t
-        .rows
-        .iter()
-        .map(|r| {
-            let cells: Vec<NodeHandle> = columns
-                .iter()
-                .zip(&r.cells)
-                .map(|(c, cell)| cell_node(__scope, store, pane, CellKey { table: tid.clone(), row: Some(r.id.clone()), col: c.key.clone() }, c, Some(cell.clone())))
-                .collect();
-            let tail = (!summary).then(|| {
-                let (tid, rid) = (tid.clone(), r.id.clone());
-                rsx! {
-                    button { class: "pimble-sheet__delete-row", title: "Delete this row", onclick: move || delete_row(store, pane, &tid, &rid), "×" }
+    // A row, hidden while the group it is in is collapsed (`group`: that
+    // group's key).
+    let row_node = |__scope: &mut RenderScope, r: &RowView, group: Option<String>| {
+        let cells: Vec<NodeHandle> = columns
+            .iter()
+            .zip(&r.cells)
+            .map(|(c, cell)| cell_node(__scope, store, pane, CellKey { table: tid.clone(), row: Some(r.id.clone()), col: c.key.clone() }, c, Some(cell.clone())))
+            .collect();
+        let tail = (!summary).then(|| {
+            let (tid, rid) = (tid.clone(), r.id.clone());
+            rsx! {
+                button { class: "pimble-sheet__delete-row", title: "Delete this row", onclick: move || delete_row(store, pane, &tid, &rid), "×" }
+            }
+        });
+        let hidden = collapsed_fn(store, pane, &tid, group);
+        rsx! {
+            div {
+                class: "pimble-sheet__row",
+                style: move || if hidden.get() { "display: none;" } else { "" },
+                {cells}
+                div { class: "pimble-sheet__tail", {tail} }
+            }
+        }
+    };
+    let mut body: Vec<NodeHandle> = Vec::new();
+    if t.groups.is_empty() {
+        for r in &t.rows {
+            body.push(row_node(__scope, r, None));
+        }
+    } else {
+        for g in &t.groups {
+            let (gt, gk) = (tid.clone(), g.key.clone());
+            let open = collapsed_fn(store, pane, &tid, Some(g.key.clone()));
+            let count = format!("{} {}", g.rows.len(), if g.rows.len() == 1 { "row" } else { "rows" });
+            body.push(rsx! {
+                div {
+                    class: "pimble-sheet__group",
+                    onclick: move || toggle_group(store, pane, &gt, &gk),
+                    span { class: "pimble-sheet__group-chevron", {move || if open.get() { "▸" } else { "▾" }} }
+                    span { class: "pimble-sheet__group-label", {g.label.clone()} }
+                    span { class: "pimble-sheet__group-count", {count} }
                 }
             });
-            rsx! { div { class: "pimble-sheet__row", {cells} div { class: "pimble-sheet__tail", {tail} } } }
-        })
-        .collect();
+            for &i in &g.rows {
+                if let Some(r) = t.rows.get(i) {
+                    body.push(row_node(__scope, r, Some(g.key.clone())));
+                }
+            }
+            for s in &g.subtotals {
+                body.push(summary_row_node(__scope, store, pane, &tid, &columns, s, true));
+            }
+        }
+    }
+    let bottom: Vec<NodeHandle> = t.summary_rows.iter().map(|s| summary_row_node(__scope, store, pane, &tid, &columns, s, false)).collect();
 
     let new_row = (!summary).then(|| {
         let mut first = true;
@@ -253,6 +293,28 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
                     span { class: "pimble-sheet__note", {note} }
                 }
                 span { class: "pimble-sheet__count", {rows_label} }
+                if !summary {
+                    button {
+                        class: "pimble-sheet__delete-table",
+                        title: "Add a row that sums up this table's columns",
+                        onclick: {
+                            let id = id_sum.clone();
+                            move || add_summary_row(store, pane, &id)
+                        },
+                        "+ Summary Row"
+                    }
+                }
+                if grouped {
+                    button {
+                        class: "pimble-sheet__delete-table",
+                        title: "Collapse every group to its subtotals, or open them all",
+                        onclick: {
+                            let id = id_collapse.clone();
+                            move || toggle_all_groups(store, pane, &id)
+                        },
+                        "Collapse All"
+                    }
+                }
                 if holds_text(pane) && is_own_table(pane, &id_convert) {
                     button {
                         class: "pimble-sheet__delete-table",
@@ -274,6 +336,9 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
             {error}
             if ui.column_form.get().is_some_and(|f| f.table == form_tid) {
                 {column_form(__scope, store, pane)}
+            }
+            if ui.summary_form.get().is_some_and(|f| f.table == summary_tid) {
+                {summary_form(__scope, store, pane)}
             }
             div {
                 // A link cell's choices hang below the grid: the scroller,
@@ -299,6 +364,7 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
                         }
                     }
                     {body}
+                    {bottom}
                     {new_row}
                 }
             }
@@ -408,6 +474,11 @@ fn column_form(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> Node
     let tables: Vec<SelectOption> = plain_tables(pane).into_iter().map(|(id, name)| SelectOption::new(id, name)).collect();
     let result = form.result.is_some();
     let existing = form.col.is_some();
+    // An existing column of a plain table can group its rows.
+    let group_choice = form.col.clone().and_then(|col| {
+        let view = untracked(|| ui.tables.get()).into_iter().find(|t| t.id == form.table)?;
+        (!view.summary).then(|| (form.table.clone(), col.clone(), view.group_by.as_deref() == Some(col.as_str())))
+    });
     let field = move |f: fn(&ColumnForm) -> String| move || ui.column_form.get().map(|form| f(&form)).unwrap_or_default();
     let shown = move |kind: &'static str| move || ui.column_form.get().is_some_and(|f| f.kind == kind && f.result.is_none());
     let is_link = shown("row_link");
@@ -484,8 +555,129 @@ fn column_form(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> Node
                 if existing {
                     Button { variant: "subtle", color: "red", size: "xs", onclick: move || delete_column(store, pane), "Delete column" }
                 }
+                if let Some((table, col, grouped)) = group_choice.clone() {
+                    Button {
+                        variant: "default",
+                        size: "xs",
+                        onclick: move || group_by(store, pane, &table, if grouped { None } else { Some(&col) }),
+                        {if grouped { "Ungroup" } else { "Group by This Column" }}
+                    }
+                }
                 Button { variant: "default", size: "xs", onclick: move || close_column(store, pane), "Cancel" }
                 Button { variant: "filled", size: "xs", onclick: move || apply_column(store, pane), {if existing || result { "Done" } else { "Add column" }} }
+            }
+        }
+    }
+}
+
+/// Whether rows of `group` in `table` are collapsed in this pane, tracked.
+fn collapsed_fn(store: AppStore, pane: PaneId, table: &str, group: Option<String>) -> rinch::core::reactive::Memo<bool> {
+    let ui = store.pane(pane).sheet_ui;
+    let table = table.to_string();
+    rinch::core::reactive::Memo::new(move || group.as_ref().is_some_and(|g| ui.collapsed.with(|c| c.contains(&(table.clone(), g.clone())))))
+}
+
+/// A summary row (contract section 4b): its name in the first cell, a
+/// press on a cell opening its settings about that column.
+fn summary_row_node(__scope: &mut RenderScope, store: AppStore, pane: PaneId, table: &str, columns: &[ColView], s: &SummaryRowView, subtotal: bool) -> NodeHandle {
+    let cells: Vec<NodeHandle> = columns
+        .iter()
+        .zip(&s.cells)
+        .enumerate()
+        .map(|(i, (c, cell))| {
+            let mut class = String::from("pimble-sheet__cell pimble-sheet__summary-cell");
+            if c.numeric {
+                class.push_str(" pimble-sheet__num");
+            }
+            if cell.error.is_some() {
+                class.push_str(" pimble-sheet__cell--error");
+            }
+            if i == 0 {
+                class.push_str(" pimble-sheet__summary-cell--named");
+            }
+            let (t, r, k) = (table.to_string(), s.id.clone(), c.key.clone());
+            let name = (i == 0).then(|| rsx! { span { class: "pimble-sheet__summary-name", {s.name.clone()} } });
+            let tip = cell.error.clone().unwrap_or_else(|| format!("{} · click to change what it shows", s.name));
+            rsx! {
+                div {
+                    class: class,
+                    title: tip,
+                    onclick: move || open_summary(store, pane, &t, &r, Some(&k)),
+                    {name}
+                    span { {cell.text.clone()} }
+                }
+            }
+        })
+        .collect();
+    let class = if subtotal { "pimble-sheet__row pimble-sheet__summary-row pimble-sheet__summary-row--sub" } else { "pimble-sheet__row pimble-sheet__summary-row" };
+    rsx! { div { class: class, {cells} div { class: "pimble-sheet__tail" } } }
+}
+
+/// A summary row's settings: its name, and what the clicked column shows.
+fn summary_form(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> NodeHandle {
+    let ui = store.pane(pane).sheet_ui;
+    let Some(form) = untracked(|| ui.summary_form.get()) else { return rsx! {} };
+    let set = move |f: fn(&mut SummaryForm, String)| {
+        move |v: String| {
+            ui.summary_form.update(|form| {
+                if let Some(form) = form {
+                    f(form, v);
+                }
+            })
+        }
+    };
+    let field = move |f: fn(&SummaryForm) -> String| move || ui.summary_form.get().map(|form| f(&form)).unwrap_or_default();
+    let choices: Vec<SelectOption> = [("none", "Nothing"), ("sum", "Sum"), ("average", "Average"), ("count", "Count"), ("min", "Min"), ("max", "Max"), ("formula", "Formula")]
+        .iter()
+        .map(|(v, l)| SelectOption::new(*v, *l))
+        .collect();
+    let column = form.col.clone().and_then(|c| untracked(|| ui.tables.get()).into_iter().find(|t| t.id == form.table)?.columns.into_iter().find(|x| x.key == c).map(|x| x.name));
+    let is_formula = move || ui.summary_form.get().is_some_and(|f| f.choice == "formula");
+    rsx! {
+        div {
+            class: "pimble-sheet__form",
+            TextInput {
+                label: "Summary row",
+                size: "xs",
+                value_fn: field(|f| f.name.clone()),
+                oninput: set(|f, v| f.name = v),
+                onsubmit: move || apply_summary(store, pane),
+            }
+            if let Some(name) = column.clone() {
+                Select {
+                    label: {format!("{name} shows")},
+                    size: "xs",
+                    value_fn: field(|f| f.choice.clone()),
+                    onchange: set(|f, v| f.choice = v),
+                    data: choices.clone(),
+                }
+            }
+            if is_formula() {
+                div {
+                    class: "pimble-sheet__form-formula",
+                    TextInput {
+                        label: "Formula",
+                        size: "xs",
+                        placeholder: "=SUM([amount])/COUNT([nights])",
+                        value_fn: field(|f| f.formula.clone()),
+                        oninput: set(|f, v| f.formula = v),
+                        onsubmit: move || apply_summary(store, pane),
+                    }
+                }
+            }
+            if let Some(error) = ui.summary_form.get().and_then(|f| f.error) {
+                div { class: "pimble-sheet__form-error", {error} }
+            }
+            if is_formula() {
+                div { class: "pimble-sheet__form-hint", "[column] is the rows this sums up: the whole table at the bottom, the group in a subtotal." }
+            }
+            div {
+                class: "pimble-sheet__form-buttons",
+                Button { variant: "subtle", color: "red", size: "xs", onclick: move || delete_summary_row(store, pane), "Remove summary row" }
+                Button { variant: "default", size: "xs", onclick: move || move_summary_row(store, pane, true), "Move up" }
+                Button { variant: "default", size: "xs", onclick: move || move_summary_row(store, pane, false), "Move down" }
+                Button { variant: "default", size: "xs", onclick: move || close_summary(store, pane), "Cancel" }
+                Button { variant: "filled", size: "xs", onclick: move || apply_summary(store, pane), "Done" }
             }
         }
     }

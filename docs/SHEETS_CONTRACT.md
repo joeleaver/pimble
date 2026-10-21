@@ -224,7 +224,7 @@ in a Map, so last writer wins per cell, as cells do.
   and a row typed there goes to its group.
 - **Collapsing** a group (its header's chevron) shows only its header and subtotals;
   "Collapse All" turns the table into its summary. What is collapsed is the viewer's own,
-  kept on this device like the explorer's open folders, never in the document.
+  per pane and for as long as the pane shows the table, never in the document.
 - **Reading them from formulas**, Excel's way: `Trips[[#Totals],[cost]]` is the cost cell of
   the table's first summary row (Excel's Total Row), and `Trips[[#Average],[cost]]` reads the
   summary row named Average (a `#` part that is not one of Excel's: `#All`, `#Data`,
@@ -236,9 +236,20 @@ in a Map, so last writer wins per cell, as cells do.
 - **Old apps** ignore keys they do not know: they show the table ungrouped and without its
   summary rows. A formula that reads a summary row (`{s:<id>}`) is an unknown token there,
   so every device moves to the version that has them together.
-- **MCP** (section 10): `add_summary_row`, `update_summary_row` (name, order, cells),
-  `remove_summary_row`, `group_table` (a column, or none); `list_tables` and `read_table`
-  give the summary rows and, for a grouped table, each group's subtotals.
+- **MCP** (section 10): `add_summary_row`, `update_summary_row` (name, cells, position),
+  `remove_summary_row`, `group_table` (a column, or none); `get_table` ends with the summary
+  rows (each cell's value and what it is) and, for a grouped table, each group's subtotals.
+
+**Built (2026-10-21, branch `summary-rows`).** The document and engine (`pimble-sheet`:
+`SummaryCell`, `SummaryRowSnap`, `SheetsTxn::add_summary_row` and kin, `set_group_by`;
+`ComputedTable::summary_rows`, `groups`; `[#Totals]`/`[#Name]` in the parser, `names.rs`
+and the engine), the app on both targets ("+ Summary Row" on a table's title, a summary row's
+settings from a press on any of its cells, "Group by This Column"/"Ungroup" in a column's
+settings, group headers that collapse, "Collapse All"), and the four MCP tools with the
+formula guide's section. Checked in the release desktop app on a scratch store and in the
+browser on the local stack (an encrypted store): totals, count, a formula over each scope,
+grouping with subtotals, collapsing. **Open (Joe's):** `#Totals` is the first summary row,
+so reordering the rows changes what it reads.
 
 ## 5. Names, and what is unique
 

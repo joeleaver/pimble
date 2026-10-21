@@ -218,6 +218,68 @@ pub struct ColumnParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct AddSummaryRowParams {
+    /// The node holding the table.
+    pub node: String,
+    /// The table's name (a plain table, not a summary table).
+    pub table: String,
+    /// The summary row's name ("Total", "Average"); the next free "Total" when
+    /// left out.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// What each column shows, by column name: sum, average, count (the
+    /// cells that are not blank), min, max, or a formula starting with = in
+    /// which [column] is the rows it sums up (the whole table, or a group
+    /// for a subtotal): "=SUM([amount])/SUM([nights])". Columns left out
+    /// show nothing.
+    #[serde(default)]
+    pub cells: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct UpdateSummaryRowParams {
+    /// The node holding the table.
+    pub node: String,
+    /// The table's name.
+    pub table: String,
+    /// The summary row's name (or id).
+    pub row: String,
+    /// A new name.
+    #[serde(default)]
+    pub new_name: Option<String>,
+    /// What columns show, as in add_summary_row; "none" shows nothing.
+    /// Columns left out keep what they show.
+    #[serde(default)]
+    pub cells: std::collections::BTreeMap<String, String>,
+    /// Move it: first, last, up or down among the table's summary rows.
+    #[serde(default)]
+    pub position: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SummaryRowParams {
+    /// The node holding the table.
+    pub node: String,
+    /// The table's name.
+    pub table: String,
+    /// The summary row's name (or id).
+    pub row: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct GroupTableParams {
+    /// The node holding the table.
+    pub node: String,
+    /// The table's name (a plain table).
+    pub table: String,
+    /// The column its rows are grouped by (any column, formula columns too,
+    /// like a month column =TEXT([@date],"yyyy-mm")); left out or empty to
+    /// ungroup.
+    #[serde(default)]
+    pub column: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct SetSummaryParams {
     /// The sheet node.
     pub node: String,
@@ -750,6 +812,50 @@ impl Pimble {
         let formula = p.formula.trim().to_string();
         self.sheet_edit(&client, addr, &[&formula], |w| ops::set_summary(w, &p.table, &formula, p.column_names.as_deref()))
             .await
+    }
+
+    /// Add a summary row under a plain table's rows: totals, averages, counts
+    /// or a formula per column (docs: summary rows). The bottom rows sum
+    /// every row; a grouped table (group_table) also shows them under each
+    /// group as subtotals. Other formulas read the first summary row as
+    /// Table[[#Totals],[column]] and any by name as Table[[#Average],[column]].
+    #[tool(name = "add_summary_row")]
+    async fn add_summary_row(&self, Parameters(p): Parameters<AddSummaryRowParams>) -> Result<String, String> {
+        let client = self.client().await?;
+        let addr = nodes::resolve(&client, &p.node).await?;
+        let shown: Vec<String> = p.cells.values().filter(|v| v.trim_start().starts_with('=')).cloned().collect();
+        let shown = as_strs(&shown);
+        self.sheet_edit(&client, addr, &shown, |w| ops::add_summary_row(w, &p.table, p.name.as_deref(), &p.cells)).await
+    }
+
+    /// Change a summary row: its name, what columns show (as in
+    /// add_summary_row), or its place among the summary rows.
+    #[tool(name = "update_summary_row")]
+    async fn update_summary_row(&self, Parameters(p): Parameters<UpdateSummaryRowParams>) -> Result<String, String> {
+        let client = self.client().await?;
+        let addr = nodes::resolve(&client, &p.node).await?;
+        let shown: Vec<String> = p.cells.values().filter(|v| v.trim_start().starts_with('=')).cloned().collect();
+        let shown = as_strs(&shown);
+        self.sheet_edit(&client, addr, &shown, |w| ops::update_summary_row(w, &p.table, &p.row, p.new_name.as_deref(), &p.cells, p.position.as_deref()))
+            .await
+    }
+
+    /// Remove a summary row; formulas that read it show #REF!.
+    #[tool(name = "remove_summary_row")]
+    async fn remove_summary_row(&self, Parameters(p): Parameters<SummaryRowParams>) -> Result<String, String> {
+        let client = self.client().await?;
+        let addr = nodes::resolve(&client, &p.node).await?;
+        self.sheet_edit(&client, addr, &[], |w| ops::remove_summary_row(w, &p.table, &p.row)).await
+    }
+
+    /// Group a table's rows by a column, with the summary rows computed under
+    /// each group as subtotals; or, without a column, ungroup it. Everyone
+    /// sees the grouping.
+    #[tool(name = "group_table")]
+    async fn group_table(&self, Parameters(p): Parameters<GroupTableParams>) -> Result<String, String> {
+        let client = self.client().await?;
+        let addr = nodes::resolve(&client, &p.node).await?;
+        self.sheet_edit(&client, addr, &[], |w| ops::group_table(w, &p.table, p.column.as_deref())).await
     }
 
     /// Rename a table; formulas that read it show the new name.

@@ -1261,6 +1261,55 @@ pub(crate) const APP_CSS: &str = "
     border-bottom: 1px solid var(--rinch-color-border);
 }
 
+/* Summary rows and groups (docs/SHEETS_CONTRACT.md section 4b). */
+.pimble-sheet__summary-cell {
+    font-weight: 600;
+    cursor: pointer;
+    background: var(--rinch-color-surface);
+    border-top: 1px solid var(--rinch-color-border);
+}
+
+.pimble-sheet__summary-row--sub .pimble-sheet__summary-cell {
+    font-weight: 500;
+    background: transparent;
+    border-top: none;
+}
+
+/* The first cell carries the row's name at its left, its value at its right. */
+.pimble-sheet__summary-cell--named {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.pimble-sheet__summary-name {
+    font-weight: 500;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-sheet__group {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 6px 8px 4px;
+    border-bottom: 1px solid var(--rinch-color-border);
+    font-weight: 600;
+    cursor: pointer;
+    user-select: none;
+}
+
+.pimble-sheet__group-chevron {
+    width: 12px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-sheet__group-count {
+    font-weight: 400;
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+}
+
 .pimble-sheet__chip {
     padding: 0 7px;
     border-radius: 999px;
@@ -1354,6 +1403,7 @@ pub(crate) const APP_CSS: &str = "
 
 .pimble-sheet__form-buttons {
     display: flex;
+    flex-wrap: wrap;
     gap: 8px;
     margin-left: auto;
 }

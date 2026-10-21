@@ -30,6 +30,8 @@ needs no *24.
 - `Entries[[hours]:[billable]]`: a range of columns.
 - `Vehicles`: a whole table.
 - A bare table name means this note only; there are no global table names.
+- `Trips[[#Totals],[cost]]`: the cost cell of the table's first summary row (Excel's Total
+  Row); `Trips[[#Average],[cost]]`: the summary row named Average.
 
 ## Pimble's extension: a dot follows a link
 
@@ -46,6 +48,15 @@ Excel's form for another workbook, with a note as the workbook:
 - `'Home/Budget'!Transactions[amount]`: two notes with one title are told apart by the
   shortest unique path of titles. An ambiguous name is refused with the candidates.
 - `'Family/Household budget'!...`: a path can start at a store's name.
+
+## Summary rows and groups
+
+A plain table can sum itself up without a second table: add_summary_row puts a named row
+("Total") under its rows, each column showing sum, average, count, min, max or a formula.
+In a summary row's formula, `[amount]` (no @) is the rows it sums up: `=SUM([amount])/SUM([nights])`.
+group_table groups the rows by a column (a formula column too, like
+`=TEXT([@date],"yyyy-mm")` for months), and the summary rows then also show under each
+group as subtotals. Prefer these to a summary table for totals and per-group totals.
 
 ## Summaries
 
