@@ -33,6 +33,8 @@ thread_local! {
     static TARGET: Cell<PaneId> = const { Cell::new(PaneId::FIRST) };
     /// Whether the self-rescheduling watcher is running.
     static WATCHING: Cell<bool> = const { Cell::new(false) };
+    /// Whether the focused pane's caret is in a table: the Table group shows.
+    static IN_TABLE: RefCell<Option<Signal<bool>>> = const { RefCell::new(None) };
 }
 
 /// How often the watcher re-reads the editor state. Cursor moves fire no
@@ -65,6 +67,9 @@ fn refresh_active_bits(pane: PaneId) {
             signal.set_if_changed(now & (1 << i) != 0);
         }
     }
+    if let Some(in_table) = IN_TABLE.with(|t| *t.borrow()).filter(|s| s.is_alive()) {
+        in_table.set_if_changed(editor(pane).in_node_type("table"));
+    }
 }
 
 /// Every button's active state packed into bits, so a change anywhere is
@@ -72,7 +77,7 @@ fn refresh_active_bits(pane: PaneId) {
 fn fingerprint(pane: PaneId) -> u64 {
     let h = editor(pane);
     let mut bits = 0u64;
-    for (i, def) in button_groups().into_iter().flatten().enumerate() {
+    for (i, def) in button_groups().into_iter().flat_map(|g| g.buttons).enumerate() {
         if check_active_with(&h, &def.active_check) {
             bits |= 1 << i;
         }
@@ -133,62 +138,82 @@ struct BtnDef {
     active_check: ActiveCheck,
 }
 
-fn button_groups() -> Vec<Vec<BtnDef>> {
+/// A labeled run of buttons (Joe, 2026-10-20: group them in a way that makes
+/// sense, with category labels).
+struct Group {
+    label: &'static str,
+    buttons: Vec<BtnDef>,
+    /// Shown only while the caret is in a table: the row and column buttons
+    /// do nothing anywhere else.
+    in_table_only: bool,
+}
+
+fn button_groups() -> Vec<Group> {
+    let b = |icon, tooltip, cmd, active_check| BtnDef { icon, tooltip, cmd, active_check };
     vec![
-        // Inline formatting
-        vec![
-            BtnDef { icon: TablerIcon::Bold, tooltip: "Bold (Ctrl+B)", cmd: Cmd::ToggleWrap("strong"), active_check: ActiveCheck::Mark("strong") },
-            BtnDef { icon: TablerIcon::Italic, tooltip: "Italic (Ctrl+I)", cmd: Cmd::ToggleWrap("em"), active_check: ActiveCheck::Mark("em") },
-            BtnDef { icon: TablerIcon::Underline, tooltip: "Underline (Ctrl+U)", cmd: Cmd::ToggleWrap("u"), active_check: ActiveCheck::Mark("u") },
-            BtnDef { icon: TablerIcon::Strikethrough, tooltip: "Strikethrough", cmd: Cmd::ToggleWrap("s"), active_check: ActiveCheck::Mark("s") },
-            BtnDef { icon: TablerIcon::Code, tooltip: "Inline Code", cmd: Cmd::ToggleWrap("code"), active_check: ActiveCheck::Mark("code") },
-        ],
-        // Block structure
-        vec![
-            BtnDef { icon: TablerIcon::H1, tooltip: "Heading 1", cmd: Cmd::SetBlock("h1"), active_check: ActiveCheck::Block("h1") },
-            BtnDef { icon: TablerIcon::H2, tooltip: "Heading 2", cmd: Cmd::SetBlock("h2"), active_check: ActiveCheck::Block("h2") },
-            BtnDef { icon: TablerIcon::H3, tooltip: "Heading 3", cmd: Cmd::SetBlock("h3"), active_check: ActiveCheck::Block("h3") },
-        ],
-        // Lists & blocks: everything here is inside rinch's collaboration scope
-        // (CLAUDE.md "Collaboration shape"). Task lists are not, so they have no button.
-        vec![
-            BtnDef { icon: TablerIcon::List, tooltip: "Bullet List", cmd: Cmd::SetBlock("ul"), active_check: ActiveCheck::Block("ul") },
-            BtnDef { icon: TablerIcon::ListNumbers, tooltip: "Ordered List", cmd: Cmd::SetBlock("ol"), active_check: ActiveCheck::Block("ol") },
-            BtnDef { icon: TablerIcon::Blockquote, tooltip: "Block Quote (Ctrl+Shift+B)", cmd: Cmd::SetBlock("blockquote"), active_check: ActiveCheck::Block("blockquote") },
-            BtnDef { icon: TablerIcon::SourceCode, tooltip: "Code Block", cmd: Cmd::SetBlock("pre"), active_check: ActiveCheck::Block("pre") },
-        ],
-        // Tables. The row and column buttons act on the cell the caret is in and do
-        // nothing outside a table.
-        vec![
-            BtnDef { icon: TablerIcon::TablePlus, tooltip: "Insert Table", cmd: Cmd::Run("insertTable"), active_check: ActiveCheck::None },
-            BtnDef { icon: TablerIcon::RowInsertBottom, tooltip: "Add Row Below", cmd: Cmd::Run("addRowAfter"), active_check: ActiveCheck::None },
-            BtnDef { icon: TablerIcon::ColumnInsertRight, tooltip: "Add Column to the Right", cmd: Cmd::Run("addColumnAfter"), active_check: ActiveCheck::None },
-            BtnDef { icon: TablerIcon::RowRemove, tooltip: "Delete Row", cmd: Cmd::Run("deleteRow"), active_check: ActiveCheck::None },
-            BtnDef { icon: TablerIcon::ColumnRemove, tooltip: "Delete Column", cmd: Cmd::Run("deleteColumn"), active_check: ActiveCheck::None },
-            BtnDef { icon: TablerIcon::TableMinus, tooltip: "Delete Table", cmd: Cmd::Run("deleteTable"), active_check: ActiveCheck::None },
-        ],
-        // Things that go in a note: the Edit menu's inserts, at the caret.
-        vec![
-            BtnDef { icon: TablerIcon::Photo, tooltip: "Insert Image...", cmd: Cmd::Insert(Insert::Image), active_check: ActiveCheck::None },
-            BtnDef { icon: TablerIcon::Chalkboard, tooltip: "Insert Board...", cmd: Cmd::Insert(Insert::Board), active_check: ActiveCheck::None },
-            BtnDef { icon: TablerIcon::Table, tooltip: "Insert Sheet", cmd: Cmd::Insert(Insert::Sheet), active_check: ActiveCheck::None },
-            BtnDef { icon: TablerIcon::TableShare, tooltip: "Insert Sheet from a Node...", cmd: Cmd::Insert(Insert::SheetNode), active_check: ActiveCheck::None },
-            BtnDef { icon: TablerIcon::Forms, tooltip: "Add Field", cmd: Cmd::Insert(Insert::Field), active_check: ActiveCheck::None },
-        ],
-        // Insert & utility
-        vec![
-            BtnDef { icon: TablerIcon::SeparatorHorizontal, tooltip: "Horizontal Rule", cmd: Cmd::HorizontalRule, active_check: ActiveCheck::None },
-            BtnDef { icon: TablerIcon::ClearFormatting, tooltip: "Clear Formatting", cmd: Cmd::ClearFormatting, active_check: ActiveCheck::None },
-        ],
-        // Undo/Redo
-        vec![
-            BtnDef { icon: TablerIcon::ArrowBackUp, tooltip: "Undo (Ctrl+Z)", cmd: Cmd::Undo, active_check: ActiveCheck::None },
-            BtnDef { icon: TablerIcon::ArrowForwardUp, tooltip: "Redo (Ctrl+Shift+Z)", cmd: Cmd::Redo, active_check: ActiveCheck::None },
-        ],
+        Group {
+            label: "Text",
+            buttons: vec![
+                b(TablerIcon::Bold, "Bold (Ctrl+B)", Cmd::ToggleWrap("strong"), ActiveCheck::Mark("strong")),
+                b(TablerIcon::Italic, "Italic (Ctrl+I)", Cmd::ToggleWrap("em"), ActiveCheck::Mark("em")),
+                b(TablerIcon::Underline, "Underline (Ctrl+U)", Cmd::ToggleWrap("u"), ActiveCheck::Mark("u")),
+                b(TablerIcon::Strikethrough, "Strikethrough", Cmd::ToggleWrap("s"), ActiveCheck::Mark("s")),
+                b(TablerIcon::Code, "Inline Code", Cmd::ToggleWrap("code"), ActiveCheck::Mark("code")),
+                b(TablerIcon::ClearFormatting, "Clear Formatting", Cmd::ClearFormatting, ActiveCheck::None),
+            ],
+            in_table_only: false,
+        },
+        // Everything here is inside rinch's collaboration scope (CLAUDE.md
+        // "Collaboration shape"). Task lists are not, so they have no button.
+        Group {
+            label: "Paragraph",
+            buttons: vec![
+                b(TablerIcon::H1, "Heading 1", Cmd::SetBlock("h1"), ActiveCheck::Block("h1")),
+                b(TablerIcon::H2, "Heading 2", Cmd::SetBlock("h2"), ActiveCheck::Block("h2")),
+                b(TablerIcon::H3, "Heading 3", Cmd::SetBlock("h3"), ActiveCheck::Block("h3")),
+                b(TablerIcon::List, "Bullet List", Cmd::SetBlock("ul"), ActiveCheck::Block("ul")),
+                b(TablerIcon::ListNumbers, "Numbered List", Cmd::SetBlock("ol"), ActiveCheck::Block("ol")),
+                b(TablerIcon::Blockquote, "Block Quote (Ctrl+Shift+B)", Cmd::SetBlock("blockquote"), ActiveCheck::Block("blockquote")),
+                b(TablerIcon::SourceCode, "Code Block", Cmd::SetBlock("pre"), ActiveCheck::Block("pre")),
+            ],
+            in_table_only: false,
+        },
+        // The Edit menu's inserts, at the caret, plus the text's own table and rule.
+        Group {
+            label: "Insert",
+            buttons: vec![
+                b(TablerIcon::Photo, "Insert Image...", Cmd::Insert(Insert::Image), ActiveCheck::None),
+                b(TablerIcon::Chalkboard, "Insert Board...", Cmd::Insert(Insert::Board), ActiveCheck::None),
+                b(TablerIcon::Table, "Insert Sheet", Cmd::Insert(Insert::Sheet), ActiveCheck::None),
+                b(TablerIcon::TableShare, "Insert Sheet from a Node...", Cmd::Insert(Insert::SheetNode), ActiveCheck::None),
+                b(TablerIcon::TablePlus, "Insert Table", Cmd::Run("insertTable"), ActiveCheck::None),
+                b(TablerIcon::SeparatorHorizontal, "Horizontal Rule", Cmd::HorizontalRule, ActiveCheck::None),
+                b(TablerIcon::Forms, "Add Field", Cmd::Insert(Insert::Field), ActiveCheck::None),
+            ],
+            in_table_only: false,
+        },
+        Group {
+            label: "Table",
+            buttons: vec![
+                b(TablerIcon::RowInsertBottom, "Add Row Below", Cmd::Run("addRowAfter"), ActiveCheck::None),
+                b(TablerIcon::ColumnInsertRight, "Add Column to the Right", Cmd::Run("addColumnAfter"), ActiveCheck::None),
+                b(TablerIcon::RowRemove, "Delete Row", Cmd::Run("deleteRow"), ActiveCheck::None),
+                b(TablerIcon::ColumnRemove, "Delete Column", Cmd::Run("deleteColumn"), ActiveCheck::None),
+                b(TablerIcon::TableMinus, "Delete Table", Cmd::Run("deleteTable"), ActiveCheck::None),
+            ],
+            in_table_only: true,
+        },
+        Group {
+            label: "History",
+            buttons: vec![
+                b(TablerIcon::ArrowBackUp, "Undo (Ctrl+Z)", Cmd::Undo, ActiveCheck::None),
+                b(TablerIcon::ArrowForwardUp, "Redo (Ctrl+Shift+Z)", Cmd::Redo, ActiveCheck::None),
+            ],
+            in_table_only: false,
+        },
     ]
 }
 
-/// Map an inline HTML tag to the new editor's mark name.
 fn mark_name(tag: &str) -> Option<&'static str> {
     Some(match tag {
         "strong" => "bold",
@@ -355,8 +380,10 @@ pub(crate) fn render_pimble_toolbar(
     usable: impl Fn() -> bool + Copy + 'static,
 ) -> NodeHandle {
     let groups = button_groups();
-    let count = groups.iter().map(Vec::len).sum();
+    let count = groups.iter().map(|g| g.buttons.len()).sum();
     BUTTON_ACTIVE.with(|b| *b.borrow_mut() = (0..count).map(|_| Signal::new(false)).collect());
+    let in_table = Signal::new(false);
+    IN_TABLE.with(|t| *t.borrow_mut() = Some(in_table));
     // The buttons follow the focus: a click in another pane, or its editor
     // taking the keyboard, re-reads them from that pane's editor.
     let _ = rinch::Effect::new(move || {
@@ -368,33 +395,32 @@ pub(crate) fn render_pimble_toolbar(
 
     let toolbar = rsx! {
         div {
-            class: "editor-toolbar",
-            style: {move || format!(
-                "display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 6px 12px;{}",
-                if usable() { "" } else { " opacity: 0.4; pointer-events: none;" }
-            )},
+            class: "editor-toolbar pimble-toolbar",
+            style: {move || if usable() { "" } else { "opacity: 0.4; pointer-events: none;" }},
         }
     };
 
     // Each button's index into `BUTTON_ACTIVE`, counted the way `fingerprint`
     // flattens the groups.
     let mut bit = 0u32;
-    for (gi, group) in groups.into_iter().enumerate() {
-        // Divider between groups
-        if gi > 0 {
-            let divider = rsx! {
-                div {
-                    style: "width: 1px; height: 20px; background: var(--rinch-color-border); margin: 0 2px;",
-                }
-            };
-            toolbar.append_child(&divider);
-        }
-
-        for btn_def in group {
+    for group in groups {
+        let in_table_only = group.in_table_only;
+        let element = rsx! {
+            div {
+                class: "pimble-toolbar__group",
+                style: {move || if in_table_only && !in_table.get() { "display: none;" } else { "" }},
+            }
+        };
+        let row = rsx! { div { class: "pimble-toolbar__buttons" } };
+        for btn_def in group.buttons {
             let btn = render_btn(__scope, store, bit, btn_def);
-            toolbar.append_child(&btn);
+            row.append_child(&btn);
             bit += 1;
         }
+        let label = rsx! { div { class: "pimble-toolbar__label", {group.label} } };
+        element.append_child(&row);
+        element.append_child(&label);
+        toolbar.append_child(&element);
     }
 
     toolbar

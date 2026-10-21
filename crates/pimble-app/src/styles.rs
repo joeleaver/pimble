@@ -19,6 +19,43 @@ pub(crate) const APP_CSS: &str = "
     align-items: center;
 }
 
+/* ── Editor toolbar (toolbar.rs) ──────────────────────────────── */
+
+.pimble-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 4px 0;
+    padding: 4px 8px 2px 8px;
+}
+
+/* A labeled run of buttons; a hairline separates it from the one before. */
+.pimble-toolbar__group {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 0 8px;
+    border-left: 1px solid var(--rinch-color-border);
+}
+
+.pimble-toolbar__group:first-child {
+    border-left: none;
+}
+
+.pimble-toolbar__buttons {
+    display: flex;
+    gap: 2px;
+}
+
+.pimble-toolbar__label {
+    font-size: 9px;
+    line-height: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--rinch-color-dimmed);
+    user-select: none;
+}
+
 /* ── Modals ─────────────────────────────────────────────────── */
 
 /* A Select's list is absolutely positioned inside the modal, whose
