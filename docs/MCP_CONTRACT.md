@@ -75,11 +75,17 @@ server and reopens its saved list. This handoff already works in the app (`recon
 is part of the walk-through below because nothing has exercised it with two kinds of
 client.
 
+Hosted stores are not an agent's: `list_hosted_stores` and `add_hosted_store` were removed
+on 2026-10-21. They call `Service`-only RPCs (an agent never gets the store lifecycle or
+cloud ones, docs/AGENTS_CONTRACT.md), so for an agent they only ever answered "cloudStatus
+is only available to this server's own operator". A person adds a hosted store from
+Account > Add Hosted Store..., and the agent sees it once its grants reach it.
+
 ### The open-store list
 
 `state.json`'s `open_stores` remains the one list of what is open on this computer.
 `pimble-mcp` reads it when it starts a server, and adds a store's path to it when a tool
-opens or adds one (`add_hosted_store`), so the explorer shows it next time the app
+opens one, so the explorer shows it next time the app
 connects (the app's `StoresListed` already registers a store it did not know). The app
 and `pimble-mcp` update the file by read-modify-write of that one key, as the app does
 today. Two writers losing an update to each other is accepted (writes are rare and the
@@ -210,7 +216,6 @@ Read:
 | `search` | keyword or semantic (`search`, `semantic` flag), with snippets |
 | `resolve_link` | where a `pimble:` URL points now (follows `became`) |
 | `list_deleted` | a store's recently deleted nodes |
-| `list_hosted_stores` | the signed-in account's hosted stores, and which are open here |
 
 Write:
 
@@ -221,7 +226,6 @@ Write:
 | `rename`, `set_tags` | the node's title and tags |
 | `move_node` | within a store, or between stores (`transplantNode`) |
 | `delete_node`, `undelete_node` | tombstone, put back |
-| `add_hosted_store` | open a hosted store here as a replica (`cloudAddHostedStore`) and add it to the open-store list |
 
 Sheets (docs/SHEETS_CONTRACT.md section 10, wave 1; built 2026-10-19 on branch `sheets`).
 `pimble-mcp` links `pimble-sheet` and computes what it reads exactly as the app does, over
