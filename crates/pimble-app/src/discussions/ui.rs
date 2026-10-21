@@ -38,15 +38,15 @@ fn box_class(which: Composer) -> &'static str {
     }
 }
 
-/// Put the keyboard in one of pane `pane`'s message boxes once it shows, and
-/// let it hear Enter.
+/// Put the keyboard in one of a slot's message boxes once it shows.
 pub(crate) fn focus_composer(slot: Slot, which: Composer) {
     let Some(store) = APP.with(Cell::get) else { return };
     begin_composing(store, slot, which);
     PRESS_IN_BOX.with(|p| p.set(false));
     // The edit box is built when its message is drawn again, a turn or two
     // after the click that asked for it: ask once it is there.
-    // Armed by no component, for the same reason as the interceptor.
+    // Armed by no component: a click on Edit rebuilds the message it is in,
+    // and a timer owned by that button would go with it.
     let delay = if which == Composer::Edit { 30 } else { 0 };
     rinch::core::reactive::unowned(|| {
         set_timeout(delay, move || {
@@ -109,6 +109,7 @@ fn discussion_view(__scope: &mut RenderScope, store: AppStore, slot: Slot, ui: D
             placeholder: "Topic",
             value: move || ui.topic.get(),
             oninput: move |v: String| ui.topic.set(v),
+            onkeydown: move |k: &rinch::core::KeyEventData| crate::discussions::composer_key(store, slot, Composer::Topic, &k.key, k.shift),
             onmousedown: move || {
                 crate::pane_view::press_in_view();
                 begin_composing(store, slot, Composer::Topic)
@@ -124,6 +125,7 @@ fn discussion_view(__scope: &mut RenderScope, store: AppStore, slot: Slot, ui: D
             rows: "3",
             value: move || ui.draft.get(),
             oninput: move |v: String| ui.draft.set(v),
+            onkeydown: move |k: &rinch::core::KeyEventData| crate::discussions::composer_key(store, slot, Composer::New, &k.key, k.shift),
             onmousedown: move || {
                 crate::pane_view::press_in_view();
                 begin_composing(store, slot, Composer::New)
@@ -362,6 +364,7 @@ fn message_node(__scope: &mut RenderScope, store: AppStore, slot: Slot, ui: Disc
                 rows: "3",
                 value: move || ui.edit_text.get(),
                 oninput: move |v: String| ui.edit_text.set(v),
+                onkeydown: move |k: &rinch::core::KeyEventData| crate::discussions::composer_key(store, slot, Composer::Edit, &k.key, k.shift),
                 onmousedown: move || {
                     crate::pane_view::press_in_view();
                     begin_composing(store, slot, Composer::Edit)

@@ -636,3 +636,10 @@ rinch's painter skips the children of a 0x0 box, which the overlay layer is
 (joeleaver/rinch#1696, being fixed in rinch). **Not built:** the popover (a marker opens
 its discussion in a pane, as pins do), a context-menu item in the text (the editor has no
 context menu of Pimble's yet), a "displaced" look for an anchor whose text was deleted.
+
+**The message boxes' own keys (2026-10-21, rinch `main` 0b3c7b09, joeleaver/rinch#1686).** The
+message box, the edit box and the topic line each hear their keys through `onkeydown`
+(`discussions::composer_key`): Enter sends, saves or sets the topic, Shift+Enter is a new
+line, Escape cancels; the keyboard interceptor is gone. Checked in the desktop app and the
+browser. Safari's IME-confirm Enter (keyCode 229, not marked composing) still reaches the
+handler; nothing guards it yet.

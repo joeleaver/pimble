@@ -754,51 +754,47 @@ thread_local! {
     static PRESS_IN_BOX: Cell<bool> = const { Cell::new(false) };
 }
 
-/// A press in one of pane `pane`'s message boxes: Enter sends (or saves),
-/// Shift+Enter starts a new line, Escape cancels. Plain inputs hear Enter
-/// only through the keyboard interceptor (rinch has no keydown on them yet,
-/// joeleaver/rinch#1678), so the box takes it until a press lands elsewhere.
-pub(crate) fn begin_composing(store: AppStore, slot: Slot, which: Composer) {
+/// A press in one of a slot's message boxes: it is the one being typed in
+/// (the topic line keeps what is typed while it is).
+pub(crate) fn begin_composing(_store: AppStore, slot: Slot, which: Composer) {
     PRESS_IN_BOX.with(|p| p.set(true));
     COMPOSING.with(|c| c.set(Some((slot, which))));
-    // Owned by no component: a click on Edit rebuilds the message it is in,
-    // and an interceptor owned by that button would go with it.
-    rinch::core::reactive::unowned(|| rinch::core::set_keyboard_interceptor(move |data| {
-        if data.key != "Enter" && data.key != "Escape" {
-            return false;
-        }
-        let Some((p, which)) = COMPOSING.with(Cell::get) else { return false };
-        if data.key == "Enter" && data.shift {
-            return false;
-        }
-        if data.kind != rinch::core::KeyEventKind::Down {
-            return true;
-        }
-        let escape = data.key == "Escape";
-        let _ = set_timeout(0, move || match (which, escape) {
-            (Composer::New, false) => post(store, p),
-            (Composer::New, true) => {
-                if let Some(ui) = ui_of(store, p) {
-                    ui.replying_to.set(None);
-                    ui.emoji.set(None);
-                }
+}
+
+/// A key in one of slot `p`'s message boxes (its own `onkeydown`): Enter
+/// sends (or saves), Shift+Enter starts a new line, Escape cancels. Answers
+/// whether the box keeps the key from its default.
+pub(crate) fn composer_key(store: AppStore, p: Slot, which: Composer, key: &str, shift: bool) -> bool {
+    COMPOSING.with(|c| c.set(Some((p, which))));
+    let escape = match key {
+        "Enter" if !shift => false,
+        "Escape" => true,
+        _ => return false,
+    };
+    // A turn later: what it does rebuilds the box that heard the key.
+    let _ = set_timeout(0, move || match (which, escape) {
+        (Composer::New, false) => post(store, p),
+        (Composer::New, true) => {
+            if let Some(ui) = ui_of(store, p) {
+                ui.replying_to.set(None);
+                ui.emoji.set(None);
             }
-            (Composer::Edit, false) => save_edit(store, p),
-            (Composer::Edit, true) => cancel_edit(store, p),
-            (Composer::Topic, false) => {
-                let text = ui_of(store, p).map(|ui| untracked(|| ui.topic.get())).unwrap_or_default();
-                set_topic(store, p, &text);
-                end_composing();
+        }
+        (Composer::Edit, false) => save_edit(store, p),
+        (Composer::Edit, true) => cancel_edit(store, p),
+        (Composer::Topic, false) => {
+            let text = ui_of(store, p).map(|ui| untracked(|| ui.topic.get())).unwrap_or_default();
+            set_topic(store, p, &text);
+            end_composing();
+        }
+        (Composer::Topic, true) => {
+            if let Some(ui) = ui_of(store, p) {
+                ui.topic.set(untracked(|| topic_of(store, p)));
             }
-            (Composer::Topic, true) => {
-                if let Some(ui) = ui_of(store, p) {
-                    ui.topic.set(untracked(|| topic_of(store, p)));
-                }
-                end_composing();
-            }
-        });
-        true
-    }));
+            end_composing();
+        }
+    });
+    true
 }
 
 /// A press anywhere in a pane: one outside the message boxes ends typing in
@@ -811,9 +807,7 @@ pub(crate) fn pane_pressed() {
 }
 
 fn end_composing() {
-    if COMPOSING.with(|c| c.take()).is_some() {
-        rinch::core::clear_keyboard_interceptor();
-    }
+    COMPOSING.with(|c| c.take());
 }
 
 // ── Making one ──────────────────────────────────────────────────────────

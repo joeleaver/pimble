@@ -9,9 +9,8 @@ Next, in order (Joe: "do them here sequentially"):
 
 1. Margin markers are built (contract, "Built: margin markers"); on the desktop they wait
    for joeleaver/rinch#1696 (overlay-slot children not painted). When it merges, move the
-   pin in both locks and check the desktop on a scratch store. Also switch the message box
-   to `onkeydown` once #1686 lands; #1687 and #1689 (emoji) are merged (rinch `main`
-   4dbabf84) and come with the next pin move.
+   pin in both locks and check the desktop on a scratch store. The message boxes are on
+   `onkeydown` (rinch `main` 0b3c7b09, which also brought the emoji fixes #1687/#1689).
 2. Deploying needs the accounts service's new `PersonalDoc` schema type with it, and the
    hosted server and every device on this version together (the `commenter` role and the
    discussion set in `scopes.json`).
