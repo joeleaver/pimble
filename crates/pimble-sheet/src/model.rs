@@ -122,6 +122,8 @@ pub struct ColumnSnap {
     pub name: String,
     pub order: String,
     pub ty: ColumnType,
+    /// Its width in pixels, when someone set one (contract "Layout").
+    pub width: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -244,6 +246,8 @@ pub struct TableSnap {
     pub summary_rows: Vec<SummaryRowSnap>,
     /// The column its rows are grouped by, when they are.
     pub group_by: Option<String>,
+    /// A summary's result columns' widths in pixels, by key.
+    pub result_widths: BTreeMap<ResultKey, f64>,
 }
 
 impl TableSnap {

@@ -9,7 +9,9 @@
 //!     target: String? (row_link: the table id),
 //!     under: Any? (node_link: [store uuid, node uuid], absent = anywhere),
 //!     formula: String? (stored form), format: String?,
+//!     width: Number? (the column's width in pixels; absent = as wide as its contents),
 //!   }>,
+//!   "width:<result key>": Number? (a summary's result column's width),
 //!   rows: Map<row id, Map { order: String, cells: Map<column id, cell> }>,
 //! }
 //! ```
@@ -81,6 +83,9 @@ pub(crate) mod keys {
     pub const FORMULA: &str = "formula";
     pub const FORMAT: &str = "format";
     pub const GROUP_BY: &str = "group_by";
+    pub const WIDTH: &str = "width";
+    /// The prefix of a summary's result column's width in its table's map.
+    pub const WIDTH_PREFIX: &str = "width:";
     /// The prefix of a summary row's key in its table's map (contract 4b).
     pub const SUMMARY_ROW_PREFIX: &str = "sum:";
     // Cell shapes.
@@ -430,6 +435,12 @@ impl<'a, 'doc> SheetsTxn<'a, 'doc> {
             c.insert(self.txn, NAME, column.name.clone());
             c.insert(self.txn, ORDER, column.order.clone());
             write_type(self.txn, &c, &column.ty);
+            if let Some(w) = column.width {
+                c.insert(self.txn, WIDTH, w);
+            }
+        }
+        for (key, w) in &table.result_widths {
+            t.insert(self.txn, format!("{WIDTH_PREFIX}{}", key.to_stored()), *w);
         }
         for s in &table.summary_rows {
             let m: MapRef = t.insert(self.txn, format!("{SUMMARY_ROW_PREFIX}{}", s.id), MapPrelim::default());
@@ -548,6 +559,40 @@ impl<'a, 'doc> SheetsTxn<'a, 'doc> {
         let t = self.table_map(table)?;
         let c = self.column_map(&t, column)?;
         write_type(self.txn, &c, &ty);
+        Ok(())
+    }
+
+    /// Set (or with `None`, clear) a column's width in pixels: one value on
+    /// the column's map, last writer wins (contract "Layout"). The width is
+    /// rounded to a whole pixel and kept to [`MIN_COLUMN_WIDTH`]..=[`MAX_COLUMN_WIDTH`].
+    pub fn set_column_width(&mut self, table: &str, column: &str, width: Option<f64>) -> Result<()> {
+        let t = self.table_map(table)?;
+        let c = self.column_map(&t, column)?;
+        match width.map(clamp_width) {
+            Some(w) => {
+                c.insert(self.txn, WIDTH, w);
+            }
+            None => {
+                c.remove(self.txn, WIDTH);
+            }
+        }
+        Ok(())
+    }
+
+    /// A summary's result column's width, by its key (see [`ResultKey`]): a
+    /// result column has no map of its own, so its width is a value
+    /// `width:<key>` on the table's map.
+    pub fn set_result_width(&mut self, table: &str, key: &ResultKey, width: Option<f64>) -> Result<()> {
+        let t = self.table_map(table)?;
+        let k = format!("{WIDTH_PREFIX}{}", key.to_stored());
+        match width.map(clamp_width) {
+            Some(w) => {
+                t.insert(self.txn, k, w);
+            }
+            None => {
+                t.remove(self.txn, &k);
+            }
+        }
         Ok(())
     }
 
@@ -1024,6 +1069,29 @@ fn child_map<T: ReadTxn>(txn: &T, parent: &MapRef, key: &str) -> Option<MapRef> 
     }
 }
 
+/// The narrowest and widest a column may be set, in pixels.
+pub const MIN_COLUMN_WIDTH: f64 = 40.0;
+pub const MAX_COLUMN_WIDTH: f64 = 2000.0;
+
+fn clamp_width(w: f64) -> f64 {
+    if w.is_finite() { w.round().clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH) } else { MIN_COLUMN_WIDTH }
+}
+
+/// A stored width, as written by [`SheetsTxn::set_column_width`]: anything
+/// that is not a positive number reads as no width.
+fn get_width<T: ReadTxn>(txn: &T, map: &MapRef, key: &str) -> Option<f64> {
+    width_of(&map.get(txn, key)?)
+}
+
+fn width_of(v: &Out) -> Option<f64> {
+    let w = match v {
+        Out::Any(Any::Number(n)) => *n,
+        Out::Any(Any::BigInt(n)) => *n as f64,
+        _ => return None,
+    };
+    (w.is_finite() && w > 0.0).then(|| clamp_width(w))
+}
+
 fn get_string<T: ReadTxn>(txn: &T, map: &MapRef, key: &str) -> Option<String> {
     match map.get(txn, key) {
         Some(Out::Any(Any::String(s))) => Some(s.to_string()),
@@ -1047,6 +1115,7 @@ fn read_table<T: ReadTxn>(txn: &T, id: &str, t: &MapRef) -> TableSnap {
                         name: get_string(txn, &c, NAME).unwrap_or_default(),
                         order: get_string(txn, &c, ORDER).unwrap_or_default(),
                         ty: read_type(txn, &c),
+                        width: get_width(txn, &c, WIDTH),
                     }),
                     _ => None,
                 })
@@ -1130,6 +1199,10 @@ fn read_table<T: ReadTxn>(txn: &T, id: &str, t: &MapRef) -> TableSnap {
         source: get_string(txn, t, SOURCE),
         headers,
         group_by: get_string(txn, t, GROUP_BY).filter(|g| known.contains(g.as_str())),
+        result_widths: t
+            .iter(txn)
+            .filter_map(|(k, v)| Some((ResultKey::from_stored(k.strip_prefix(WIDTH_PREFIX)?)?, width_of(&v)?)))
+            .collect(),
         columns,
         rows,
         summary_rows,

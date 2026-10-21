@@ -178,8 +178,19 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
                 if c.computed { " pimble-sheet__head--computed" } else { "" }
             );
             let tip = if c.result { format!("{} · click to rename", c.tip) } else { format!("{} · click to change", c.tip) };
+            let press = {
+                let (tid, col) = (tid.clone(), c.clone());
+                move || start_resize(store, pane, &tid, &col)
+            };
+            // The header is the cell under the column's settings; its right
+            // edge is a grip beside it, so a drag there opens nothing.
             rsx! {
-                div { class: class, title: tip, onclick: open, {c.name.clone()} {mark} }
+                div {
+                    class: "pimble-sheet__head-wrap",
+                    onmousedown: press,
+                    div { class: class, title: tip, onclick: open, {c.name.clone()} {mark} }
+                    div { class: "pimble-sheet__grip", title: "Drag to change this column's width" }
+                }
             }
         })
         .collect();
@@ -218,12 +229,13 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
             let (gt, gk) = (tid.clone(), g.key.clone());
             let open = collapsed_fn(store, pane, &tid, Some(g.key.clone()));
             let count = format!("{} {}", g.rows.len(), if g.rows.len() == 1 { "row" } else { "rows" });
+            let (label, label_tip) = (g.label.clone(), g.label.clone());
             body.push(rsx! {
                 div {
                     class: "pimble-sheet__group",
                     onclick: move || toggle_group(store, pane, &gt, &gk),
                     span { class: "pimble-sheet__group-chevron", {move || if open.get() { "▸" } else { "▾" }} }
-                    span { class: "pimble-sheet__group-label", {g.label.clone()} }
+                    span { class: "pimble-sheet__group-label", title: label_tip, {label} }
                     span { class: "pimble-sheet__group-count", {count} }
                 }
             });
@@ -255,7 +267,7 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
     let empty = (summary && t.rows.is_empty() && t.error.is_none())
         .then(|| rsx! { div { class: "pimble-sheet__empty", "Nothing matches yet." } });
 
-    let grid_style = format!("grid-template-columns: repeat({}, minmax(90px, max-content)) 30px;", columns.len().max(1));
+    let (grid_tid, grid_cols) = (tid.clone(), columns.clone());
     let form_tid = tid.clone();
     let bar_tid = tid.clone();
     let note_tid = tid.clone();
@@ -290,7 +302,7 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
                     }
                 }
                 if let Some(note) = ui.selected.get().filter(|k| k.table == note_tid).and_then(|_| ui.formula_note.get()) {
-                    span { class: "pimble-sheet__note", {note} }
+                    span { class: "pimble-sheet__note", title: move || ui.formula_note.get().unwrap_or_default(), {note} }
                 }
                 span { class: "pimble-sheet__count", {rows_label} }
                 if !summary {
@@ -352,7 +364,7 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
                 },
                 div {
                     class: "pimble-sheet__grid",
-                    style: grid_style,
+                    style: {move || grid_columns(&grid_cols, ui.resizing.get().filter(|(t, ..)| *t == grid_tid).map(|(_, k, w)| (k, w)))},
                     div {
                         class: "pimble-sheet__row",
                         {heads}
@@ -373,6 +385,55 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
     }
 }
 
+/// The grid's columns: each column's stored width, or as wide as its
+/// contents (at least 90px) when it has none; `resizing` is a column being
+/// dragged and its width so far. Then the rows' tail.
+fn grid_columns(columns: &[ColView], resizing: Option<(String, f32)>) -> String {
+    let tracks: Vec<String> = columns
+        .iter()
+        .map(|c| match (&resizing, c.width) {
+            (Some((key, w)), _) if *key == c.key => format!("{w:.0}px"),
+            (_, Some(w)) => format!("{w:.0}px"),
+            _ => "minmax(90px, max-content)".to_string(),
+        })
+        .collect();
+    let tracks = if tracks.is_empty() { "minmax(90px, max-content)".to_string() } else { tracks.join(" ") };
+    format!("grid-template-columns: {tracks} 30px;")
+}
+
+/// How near a header's right edge (in pixels) a press grabs it.
+const GRIP: f32 = 7.0;
+
+/// A press on a column's header: on its right edge, a drag that sets the
+/// column's width (shown as it moves, written to the document when it ends;
+/// docs/SHEETS_CONTRACT.md "Layout"). The press's element is the header's
+/// cell on both backends, so its bounds are the column's width now.
+fn start_resize(store: AppStore, pane: PaneId, table: &str, col: &ColView) {
+    let ctx = rinch::core::get_click_context();
+    if ctx.element_width <= 0.0 || ctx.mouse_x < ctx.element_x + ctx.element_width - GRIP {
+        return;
+    }
+    let ui = store.pane(pane).sheet_ui;
+    let (from, start) = (ctx.mouse_x, ctx.element_width);
+    let width = move |px: f32| (start + px - from).max(doc::MIN_COLUMN_WIDTH as f32).min(doc::MAX_COLUMN_WIDTH as f32);
+    let (t_move, k_move) = (table.to_string(), col.key.clone());
+    let (t_end, c_end) = (table.to_string(), col.clone());
+    ui.resizing.set(Some((table.to_string(), col.key.clone(), start)));
+    rinch::core::Drag::absolute()
+        .on_move(move |px, _| ui.resizing.set(Some((t_move.clone(), k_move.clone(), width(px)))))
+        .on_end(move |px, _| {
+            // The last move is where it was let go; a press without a move
+            // leaves the width as it was.
+            let w = untracked(|| ui.resizing.get()).map(|(.., w)| w).unwrap_or_else(|| width(px));
+            ui.resizing.set(None);
+            if (w - start).abs() >= 1.0 {
+                set_column_width(store, pane, &t_end, &c_end, Some(w as f64));
+            }
+        })
+        .on_cancel(move |_, _| ui.resizing.set(None))
+        .start();
+}
+
 fn cell_node(__scope: &mut RenderScope, store: AppStore, pane: PaneId, key: CellKey, col: &ColView, cell: Option<CellView>) -> NodeHandle {
     let ui = store.pane(pane).sheet_ui;
     let cell = cell.unwrap_or(CellView { text: String::new(), error: None, chip: None });
@@ -390,11 +451,13 @@ fn cell_node(__scope: &mut RenderScope, store: AppStore, pane: PaneId, key: Cell
     if placeholder {
         class.push_str(" pimble-sheet__cell--placeholder");
     }
+    // The text stays inside its cell, cut short with an ellipsis; the
+    // tooltip has all of it.
     let shown = match cell.chip {
-        Some(_) if !cell.text.is_empty() => rsx! { span { class: "pimble-sheet__chip", {cell.text.clone()} } },
-        _ => rsx! { span { {cell.text.clone()} } },
+        Some(_) if !cell.text.is_empty() => rsx! { div { class: "pimble-sheet__text", span { class: "pimble-sheet__chip", {cell.text.clone()} } } },
+        _ => rsx! { div { class: "pimble-sheet__text", {cell.text.clone()} } },
     };
-    let tip = cell.error.clone().unwrap_or_default();
+    let tip = cell.error.clone().unwrap_or_else(|| if placeholder { String::new() } else { cell.text.clone() });
     let press_key = key.clone();
     let editing_key = key.clone();
     let editing_key2 = key.clone();
@@ -597,14 +660,16 @@ fn summary_row_node(__scope: &mut RenderScope, store: AppStore, pane: PaneId, ta
             }
             let (t, r, k) = (table.to_string(), s.id.clone(), c.key.clone());
             let name = (i == 0).then(|| rsx! { span { class: "pimble-sheet__summary-name", {s.name.clone()} } });
-            let tip = cell.error.clone().unwrap_or_else(|| format!("{} · click to change what it shows", s.name));
+            let tip = cell.error.clone().unwrap_or_else(|| {
+                if cell.text.is_empty() { format!("{} · click to change what it shows", s.name) } else { format!("{}: {} · click to change what it shows", s.name, cell.text) }
+            });
             rsx! {
                 div {
                     class: class,
                     title: tip,
                     onclick: move || open_summary(store, pane, &t, &r, Some(&k)),
                     {name}
-                    span { {cell.text.clone()} }
+                    div { class: "pimble-sheet__text", {cell.text.clone()} }
                 }
             }
         })

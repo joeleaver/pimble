@@ -552,6 +552,7 @@ fn tables_read_names_this_notes_tables_only() {
         name: "other".into(),
         order: "z".into(),
         ty: ColumnType::Formula { formula: format!("=SUM({}!{{t:cats}}[{{c:cats.spent}}])+SUM({{t:lone}}[{{c:lone.x}}])", note_token(&node(BUDGET))), format: Format::Auto },
+        width: None,
     });
     assert!(lone.tables_read().is_empty(), "another note's table, and itself: {:?}", lone.tables_read());
 }

@@ -1106,15 +1106,25 @@ pub(crate) const APP_CSS: &str = "
     border: 1px solid var(--rinch-color-border);
     border-radius: var(--rinch-radius-sm);
     background: var(--rinch-color-body);
+    min-width: 0;
 }
 
+/* The title row is one line whatever it holds (docs/SHEETS_CONTRACT.md
+   Layout): the name, kind, count and buttons keep their size, and the
+   formula bar takes what is left and scrolls inside itself. */
 .pimble-sheet__title {
     display: flex;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     align-items: center;
     gap: 8px;
     padding: 6px 10px;
     border-bottom: 1px solid var(--rinch-color-border);
+    overflow: hidden;
+    min-width: 0;
+}
+
+.pimble-sheet__title > * {
+    flex: none;
 }
 
 .pimble-sheet__name {
@@ -1125,6 +1135,8 @@ pub(crate) const APP_CSS: &str = "
     color: var(--rinch-color-text);
     padding: 2px 4px;
     max-width: 24em;
+    min-width: 0;
+    flex: 0 1 auto;
 }
 
 .pimble-sheet__kind {
@@ -1137,10 +1149,17 @@ pub(crate) const APP_CSS: &str = "
     padding: 0 5px;
 }
 
+.pimble-sheet__title > .pimble-sheet__source,
+.pimble-sheet__title > .pimble-sheet__formula {
+    flex: 1 1 0;
+    width: 0;
+    min-width: 60px;
+    overflow: hidden;
+    white-space: nowrap;
+}
+
 .pimble-sheet__source,
 .pimble-sheet__formula {
-    flex: 1 1 260px;
-    min-width: 0;
     font-family: monospace;
     font-size: 13px;
     padding: 3px 6px;
@@ -1155,6 +1174,16 @@ pub(crate) const APP_CSS: &str = "
 .pimble-sheet__form-error {
     color: var(--rinch-color-red-6);
     font-size: 12px;
+}
+
+/* The formula bar's sentence: one line, cut short, all of it in its tooltip. */
+.pimble-sheet__title > .pimble-sheet__note {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 40%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .pimble-sheet__error {
@@ -1197,14 +1226,38 @@ pub(crate) const APP_CSS: &str = "
     display: contents;
 }
 
+/* A header's grid cell: the header, and the grip on its right edge that
+   changes the column's width. */
+.pimble-sheet__head-wrap {
+    position: relative;
+    min-width: 0;
+    border-bottom: 1px solid var(--rinch-color-border);
+    border-right: 1px solid var(--rinch-color-border);
+}
+
 .pimble-sheet__head {
     text-align: left;
     font-weight: 500;
     white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
     padding: 5px 8px;
-    border-bottom: 1px solid var(--rinch-color-border);
-    border-right: 1px solid var(--rinch-color-border);
     cursor: pointer;
+}
+
+.pimble-sheet__grip {
+    position: absolute;
+    top: 0;
+    right: -1px;
+    bottom: 0;
+    width: 7px;
+    cursor: col-resize;
+    user-select: none;
+}
+
+.pimble-sheet__grip:hover {
+    background: var(--rinch-primary-color-6);
+    opacity: 0.5;
 }
 
 .pimble-sheet__head:hover {
@@ -1229,11 +1282,20 @@ pub(crate) const APP_CSS: &str = "
 .pimble-sheet__cell {
     position: relative;
     padding: 5px 8px;
-    min-width: 80px;
+    min-width: 0;
     border-bottom: 1px solid var(--rinch-color-border);
     border-right: 1px solid var(--rinch-color-border);
     white-space: nowrap;
     cursor: text;
+}
+
+/* A cell's text stays in its column, cut short with an ellipsis; the cell
+   itself does not clip, so a link cell's choices can hang below it. */
+.pimble-sheet__text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .pimble-sheet__num {
@@ -1283,8 +1345,17 @@ pub(crate) const APP_CSS: &str = "
 }
 
 .pimble-sheet__summary-name {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     font-weight: 500;
     color: var(--rinch-color-dimmed);
+}
+
+.pimble-sheet__summary-cell--named .pimble-sheet__text {
+    flex: 0 1 auto;
 }
 
 .pimble-sheet__group {
@@ -1297,6 +1368,15 @@ pub(crate) const APP_CSS: &str = "
     font-weight: 600;
     cursor: pointer;
     user-select: none;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.pimble-sheet__group-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .pimble-sheet__group-chevron {

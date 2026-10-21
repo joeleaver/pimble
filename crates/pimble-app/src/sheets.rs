@@ -82,6 +82,11 @@ pub struct ColView {
     pub computed: bool,
     /// A summary's result column (renamed, not edited).
     pub result: bool,
+    /// Its width in pixels when someone set one; otherwise it is as wide as
+    /// its contents (contract "Layout").
+    pub width: Option<f64>,
+    /// A result column's key, which its width is stored by.
+    pub result_key: Option<ResultKey>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -192,6 +197,9 @@ pub struct SheetUi {
     /// The groups this pane shows collapsed, by table and group key: the
     /// viewer's own, never in the document (contract section 4b).
     pub collapsed: Signal<std::collections::HashSet<(String, String)>>,
+    /// A column being resized: (table, column key, width in pixels), shown
+    /// while the drag lasts and written to the document when it ends.
+    pub resizing: Signal<Option<(String, String, f32)>>,
 }
 
 impl SheetUi {
@@ -210,6 +218,7 @@ impl SheetUi {
             embedded: Signal::new(Vec::new()),
             summary_form: Signal::new(None),
             collapsed: Signal::new(std::collections::HashSet::new()),
+            resizing: Signal::new(None),
         }
     }
 }
@@ -1030,10 +1039,14 @@ fn table_view(engine: &Engine<'_>, book: &AppBook, snap: &SheetsSnap, computed: 
                         numeric: is_numeric(c.format),
                         computed: c.computed,
                         result: false,
+                        width: col.width,
+                        result_key: None,
                     }
                 }
                 None => {
                     let key = format!("r:{result_index}");
+                    let result_key = c.result_key.clone().map(ResultKey::Key).unwrap_or(ResultKey::Pos(result_index));
+                    let width = table.and_then(|t| t.result_widths.get(&result_key).copied());
                     result_index += 1;
                     ColView {
                         key,
@@ -1043,6 +1056,8 @@ fn table_view(engine: &Engine<'_>, book: &AppBook, snap: &SheetsSnap, computed: 
                         numeric: is_numeric(c.format),
                         computed: true,
                         result: true,
+                        width,
+                        result_key: Some(result_key),
                     }
                 }
             }
@@ -2163,6 +2178,19 @@ pub(crate) fn group_by(store: AppStore, pane: PaneId, table: &str, col: Option<&
     if local_edit(store, pane, |t| t.set_group_by(table, col)).is_some() {
         store.pane(pane).sheet_ui.column_form.set(None);
     }
+}
+
+/// The end of a drag on a column header's edge: the column's width, set in
+/// the document for everyone (`None` clears it).
+pub(crate) fn set_column_width(store: AppStore, pane: PaneId, table: &str, col: &ColView, width: Option<f64>) {
+    aim(pane, Some(table));
+    if width == col.width {
+        return;
+    }
+    local_edit(store, pane, |t| match &col.result_key {
+        Some(key) => t.set_result_width(table, key, width),
+        None => t.set_column_width(table, &col.key, width),
+    });
 }
 
 /// Collapse or open one group (this pane's view only).
