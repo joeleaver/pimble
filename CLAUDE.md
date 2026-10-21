@@ -27,6 +27,10 @@ Pimble is an **offline-first personal information manager**:
   (`cloudHostStore`) uploads a store, and it uploads that store. No feature may put data on
   Pimble Cloud as a side effect: sharing an unhosted store goes through the relay (Pimble
   Cloud stores nothing) or is refused with a sentence that says so (Joe, 2026-09-18).
+  The one exception is a person's own state (discussions' read state, their place in each
+  node: the personal document), which is account data encrypted for their own devices. Signing in counts as asking for it to be synced, and a switch
+  turns that off. No store content is ever uploaded because someone signed in (Joe,
+  2026-10-21, docs/DISCUSSIONS_CONTRACT.md section 8).
 - **Everything is co-editable.** Every piece of a person's data (a node's text, its place in
   the tree, its title and metadata, a plugin's JSON) lives in a CRDT document that everyone
   with edit rights edits directly, and edits merge on their own. No projections, mirrors,
