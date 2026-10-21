@@ -327,6 +327,22 @@ async fn main() -> Result<()> {
             }
             cloud_sign_in(&args[2], &args[3]).await?;
         }
+        "agents" => list_agents().await?,
+        "create-agent" => {
+            if args.len() < 4 {
+                eprintln!("Usage: pimble-cli create-agent <name> <store-id>[/<node-id>]=<reader|editor>...");
+                std::process::exit(1);
+            }
+            create_agent(&args[2], &args[3..]).await?;
+        }
+        "remove-agent" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pimble-cli remove-agent <agent-id>");
+                std::process::exit(1);
+            }
+            connect().await?.remove_agent(&args[2]).await?;
+            println!("Removed");
+        }
         "cloud-status" => cloud_status().await?,
         "cloud-sign-out" => cloud_sign_out().await?,
         "cloud-host-store" => {
@@ -452,6 +468,9 @@ COMMANDS:
     set-scope           Publish a share's scope: the documents under its root
     remove-scope        Remove a share's scope
     cloud-sign-in       Sign in to a Pimble Cloud account
+    agents              List this device's AI agents (docs/AGENTS_CONTRACT.md)
+    create-agent        Make an AI agent with grants; prints its key once
+    remove-agent        Remove an AI agent; its key stops working
     cloud-status        Show whether a Pimble Cloud account is signed in
     cloud-sign-out      Forget the signed-in Pimble Cloud account
     cloud-host-store    Host a local store's encrypted twin on Pimble Cloud
@@ -907,6 +926,46 @@ async fn cloud_sign_in(url: &str, email: &str) -> Result<()> {
     let client = connect().await?;
     client.cloud_sign_in(url, email, password).await?;
     println!("Signed in to {} as {}", url, email);
+    Ok(())
+}
+
+async fn list_agents() -> Result<()> {
+    let client = connect().await?;
+    for agent in client.list_agents().await? {
+        println!("{}  {}  (last used {})", agent.id, agent.name, agent.last_used_at.as_deref().unwrap_or("never"));
+        for g in agent.grants {
+            let role = match g.role {
+                pimble_rpc::AgentRole::Reader => "reader",
+                pimble_rpc::AgentRole::Editor => "editor",
+            };
+            match g.node {
+                Some(node) => println!("    {}/{}  {role}", g.store, node),
+                None => println!("    {}  {role} (the whole store)", g.store),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `create-agent <name> <store>[/<node>]=<reader|editor>...`
+async fn create_agent(name: &str, grants: &[String]) -> Result<()> {
+    let mut parsed = Vec::new();
+    for g in grants {
+        let (target, role) = g.split_once('=').ok_or_else(|| anyhow::anyhow!("{g}: write <store-id>[/<node-id>]=<reader|editor>"))?;
+        let role = match role {
+            "reader" => pimble_rpc::AgentRole::Reader,
+            "editor" => pimble_rpc::AgentRole::Editor,
+            other => anyhow::bail!("{other}: a role is reader or editor"),
+        };
+        let (store, node) = match target.split_once('/') {
+            Some((s, n)) => (parse_store_id(s)?, Some(parse_node_id(n)?)),
+            None => (parse_store_id(target)?, None),
+        };
+        parsed.push(pimble_rpc::AgentGrant { store, node, role });
+    }
+    let made = connect().await?.create_agent(name, parsed).await?;
+    println!("Agent {} ({})", made.agent.name, made.agent.id);
+    println!("Key (shown this once): {}", made.key);
     Ok(())
 }
 

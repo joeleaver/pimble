@@ -190,3 +190,22 @@ snippet instead. Removing an agent removes its entry the same way.
   refused with a sentence. `last_used_at` is written at most once a minute.
 - Tests: `tests/agents.rs` (reach through reads, writes, children, search, lifecycle;
   narrowing and removal on an open connection; grant checks), unit tests in the module.
+
+## Built in wave 2 (pimble-mcp), 2026-10-20
+
+- `PIMBLE_AGENT_KEY` in the client's environment (the `--agent` flag the proposal named
+  is not needed: the key names its agent). Without one every tool answers
+  `connection::NOT_AN_AGENT`, and no server is started.
+- With one, `pimble-mcp` joins or starts the local server as before (its `Service`
+  connection only opens the saved store list when it starts the server), then makes
+  every tool call over a second connection that presents the key. A removed agent gets
+  "This agent was removed in Pimble, or its key is wrong: set it up again in Account >
+  AI Agents...". Edits carry `agent:<id>`.
+- Paths: a store shown with one root as its own (an agent of one subtree) is walked from
+  that root, as listings and search name its nodes (`nodes::resolve_path`).
+- `pimble-cli agents`, `create-agent <name> <store>[/<node>]=<reader|editor>...`,
+  `remove-agent <id>`; `docs/DEPLOY.md`'s client section now sets up an agent.
+- Walked through over stdio (`scripts/mcp/drive.py`) on a scratch copy of the family
+  store: no key, the sentence; an agent reading MEDICAL lists and reads only MEDICAL,
+  finds nothing in TAXES ("Turbo Tax"), is refused TAXES by link ("no grant for this
+  document") and a write under MEDICAL ("You can read this, not change it.").

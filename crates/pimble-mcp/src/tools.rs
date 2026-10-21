@@ -96,7 +96,11 @@ impl Pimble {
     pub fn new(conn: Arc<Connection>) -> Self {
         Self {
             conn,
-            client_id: format!("mcp:{}", uuid::Uuid::new_v4()),
+            // An agent's edits are attributed to it (docs/AGENTS_CONTRACT.md).
+            client_id: match crate::connection::agent_id() {
+                Some(id) => format!("agent:{id}"),
+                None => format!("mcp:{}", uuid::Uuid::new_v4()),
+            },
             tool_router: Self::tool_router() + Self::sheet_router(),
         }
     }

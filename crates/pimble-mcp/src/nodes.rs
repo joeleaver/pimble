@@ -116,8 +116,11 @@ async fn resolve_path(client: &PimbleClient, stores: &[Store], path: &str) -> Re
     let mut here: Vec<Addr> = tops.clone();
     let mut walked = store.name.clone();
     // A whole store's path steps start under its root; a partial replica's first
-    // step names one of its shared roots.
-    let mut first = tops.len() == 1 && store.roots.is_empty();
+    // step names one of its shared roots. A store shown with one root as its own
+    // (an agent granted one subtree, docs/AGENTS_CONTRACT.md) is walked like a
+    // whole one, as `path_of` names its nodes.
+    let single_root = store.roots.len() == 1 && store.roots[0] == store.root_node_id;
+    let mut first = tops.len() == 1 && (store.roots.is_empty() || single_root);
     for step in steps {
         let mut matches = Vec::new();
         if first {

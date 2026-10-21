@@ -50,12 +50,9 @@ impl Connection {
         let connected = tokio::time::timeout(RECONNECT_WAIT, connect(&mut inner.owned)).await;
         let client = match connected {
             Ok(Ok(client)) => Arc::new(client),
-            Ok(Err(e)) => return Err(format!("Pimble's server could not be reached or started: {e}")),
+            Ok(Err(e)) => return Err(e),
             Err(_) => return Err("Pimble's server did not come back within 10 seconds; try again.".into()),
         };
-        if inner.owned.is_some() {
-            open_saved_stores(&client).await;
-        }
         inner.client = Some(client.clone());
         Ok(client)
     }
@@ -68,17 +65,51 @@ impl Connection {
     }
 }
 
+/// What every tool answers when this process was started without an agent's
+/// key (docs/AGENTS_CONTRACT.md: setups made by hand stop until scoped).
+pub const NOT_AN_AGENT: &str =
+    "Pimble needs this app set up as an agent: in Pimble, Account > AI Agents... > New Agent.";
+
+/// The agent key this process was started with (`PIMBLE_AGENT_KEY`, which
+/// the agent's client config passes in its environment, never its command line).
+fn agent_key() -> Option<String> {
+    std::env::var("PIMBLE_AGENT_KEY").ok().map(|k| k.trim().to_string()).filter(|k| !k.is_empty())
+}
+
+/// The agent this process acts for, from its key (`pmbl_agent_<id>_…`): what
+/// its edits are attributed to.
+pub fn agent_id() -> Option<String> {
+    let key = agent_key()?;
+    let (id, _) = key.strip_prefix("pmbl_agent_")?.split_once('_')?;
+    Some(id.to_string())
+}
+
+/// A connection that acts as this process's agent. The server judges every
+/// call by the agent's grants; the person's own (`Service`) connection is
+/// used only to start or join the server and to open the saved store list
+/// when this process starts it, as the app does.
 async fn connect(owned: &mut Option<PimbleServer>) -> Result<PimbleClient, String> {
     if let Ok(url) = std::env::var("PIMBLE_SERVER") {
-        // Some other server, named: never started here.
-        let token = std::env::var("PIMBLE_TOKEN").ok().filter(|t| !t.is_empty());
-        let client = match token {
-            Some(token) => PimbleClient::connect_with_auth(&url, &AuthMethod::Bearer { token }).await,
-            None => PimbleClient::connect(&url).await,
-        };
-        return client.map_err(|e| e.to_string());
+        // Some other server, named: never started here. A server token
+        // (`PIMBLE_TOKEN`) is a deliberate credential for that server, kept
+        // for development; an agent key is presented the same way.
+        let token = agent_key().or_else(|| std::env::var("PIMBLE_TOKEN").ok().filter(|t| !t.is_empty()));
+        let Some(token) = token else { return Err(NOT_AN_AGENT.into()) };
+        return PimbleClient::connect_with_auth(&url, &AuthMethod::Bearer { token }).await.map_err(|e| e.to_string());
     }
-    local::reconnect(owned).await
+    let Some(key) = agent_key() else { return Err(NOT_AN_AGENT.into()) };
+    let service = local::reconnect(owned).await.map_err(|e| format!("Pimble's server could not be reached or started: {e}"))?;
+    if owned.is_some() {
+        open_saved_stores(&service).await;
+    }
+    PimbleClient::connect_with_auth(local::server_url(), &AuthMethod::Bearer { token: key }).await.map_err(|e| {
+        let e = e.to_string();
+        if e.contains("401") {
+            "This agent was removed in Pimble, or its key is wrong: set it up again in Account > AI Agents...".to_string()
+        } else {
+            format!("Pimble's server refused this agent: {e}")
+        }
+    })
 }
 
 async fn open_saved_stores(client: &PimbleClient) {
