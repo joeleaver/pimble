@@ -1790,6 +1790,42 @@ pub(crate) const APP_CSS: &str = "
     border-radius: 0;
 }
 
+/* A gutter right of the text for the discussions' margin markers
+   (docs/DISCUSSIONS_CONTRACT.md section 6), inside the editor's padding box
+   so its own scroller never clips them. */
+.pimble-editor__content-wrap > [data-pm-editor] {
+    padding-right: 34px;
+}
+
+.pimble-margin-marker {
+    position: absolute;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 4px;
+    box-sizing: border-box;
+    border-radius: 9px 9px 9px 2px;
+    background: var(--rinch-primary-color);
+    color: white;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 18px;
+    text-align: center;
+    cursor: pointer;
+    user-select: none;
+}
+
+.pimble-margin-marker--unread::after {
+    content: '';
+    position: absolute;
+    top: -2px;
+    right: -2px;
+    width: 7px;
+    height: 7px;
+    border-radius: 4px;
+    background: var(--rinch-color-red-6, #e03131);
+    border: 1px solid var(--rinch-color-body);
+}
+
 /* A picture is never wider than the pane it is read in
    (docs/IMAGES_CONTRACT.md): a phone's photograph is thousands of pixels
    across, and a narrow split pane is a few hundred. */

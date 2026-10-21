@@ -143,6 +143,8 @@ fn edit_entries(store: AppStore) -> Vec<MenuEntry> {
         // docs/SHEETS_CONTRACT.md section 8: a named value on the node.
         MenuEntry::item("Add Field", "", move || crate::fields::add_field(store)),
         // docs/DISCUSSIONS_CONTRACT.md: a discussion on the focused pane's node.
+        // A discussion at the caret, drawn in the margin (commenters too).
+        MenuEntry::item("Start a Discussion Here", "", move || crate::discussions::start_here(store)),
         MenuEntry::item("Start a Discussion", "", move || crate::discussions::start_on_focused(store)),
         MenuEntry::Separator,
         MenuEntry::item("Delete", "", move || {

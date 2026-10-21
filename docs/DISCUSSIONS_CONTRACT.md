@@ -615,3 +615,24 @@ is locked with the commenter's sentence, he starts a discussion and posts, and t
 message is on alice's machine (her search finds it) and nowhere in clear on the hosted
 disk. **Not checked on screen:** a commenter on the desktop app (the same replica code the
 test drives, and the same UI). **Not built:** a commenter role for agents.
+
+## Built: margin markers (2026-10-21, branch `discussions`, rinch `main` 7c964285)
+
+`discussions/margin.rs`: each pane gives its editor the discussions on its note that are
+anchored in the text and not shown inline in that pane (rinch `set_margin_anchors`,
+`MarginAnchor::sticky` with the discussion's own sticky index, keyed by node id, set only
+when the set changes) and hears their line boxes (`on_margin_layout`,
+`margin_text_right`). The markers are the `Editor`'s overlay slot children, in a 34px
+gutter right of the text (`.pimble-margin-marker`): one per line, the count of live
+messages, an unread dot, the topic as its title; a press opens the first unread (or the
+first) discussion beside the note (`open_beside`). "Start a Discussion Here" (Edit menu;
+the toolbar's Discuss group, which stays usable for a commenter while the rest is dimmed)
+anchors a new attached discussion at the caret and opens it beside. Refusals use
+`StoreAccess::refusal`. Checked in the browser on the local stack (an encrypted store):
+the marker beside the line, its count after a post, following its line when a line is
+added above and the gutter when the pane widens, a press opening the discussion, an
+inline discussion drawing none. **Desktop:** the markers are laid out but not painted:
+rinch's painter skips the children of a 0x0 box, which the overlay layer is
+(joeleaver/rinch#1696, being fixed in rinch). **Not built:** the popover (a marker opens
+its discussion in a pane, as pins do), a context-menu item in the text (the editor has no
+context menu of Pimble's yet), a "displaced" look for an anchor whose text was deleted.

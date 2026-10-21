@@ -203,8 +203,28 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
     // other panes on the same note, and remote deltas arrive via
     // `BackendEvent::RemoteChanges`. There is no manual autosave — the collab
     // session persists edits live (the server applies and relays each delta).
+    // Its children are the editor's overlay slot: the margin markers of the
+    // discussions anchored in the text (docs/DISCUSSIONS_CONTRACT.md section
+    // 6), placed where the editor says their lines are.
+    let markers = crate::discussions::margin::watch(store, pane);
     let editor_view = rsx! {
-        Editor { editor: crate::editor::editor(pane) }
+        Editor {
+            editor: crate::editor::editor(pane),
+            for marker in markers() {
+                div {
+                    key: format!("{:.1} {:?} {} {:?}", marker.top, marker.ids, marker.count, marker.unread),
+                    class: marker.class,
+                    title: marker.title.clone(),
+                    style: marker.style.clone(),
+                    onmousedown: move || press_in_view(),
+                    onclick: {
+                        let (s, n) = (marker.store_id, marker.opens);
+                        move || crate::discussions::open_beside(store, pane, s, n)
+                    },
+                    {marker.label.clone()}
+                }
+            }
+        }
     };
 
     // The editor's own switch follows the read-only judgement
@@ -480,7 +500,11 @@ pub(crate) fn render_panes(__scope: &mut RenderScope, store: AppStore, hints: &[
         let pane = store.focused_pane.get();
         store.pane(pane).show_editor.get() && !editor_read_only(store, pane)
     };
-    let toolbar = crate::toolbar::render_pimble_toolbar(__scope, store, usable);
+    let commentable = move || {
+        let pane = store.focused_pane.get();
+        store.pane(pane).show_editor.get() && pane_access(store, pane).allows_comment()
+    };
+    let toolbar = crate::toolbar::render_pimble_toolbar(__scope, store, usable, commentable);
     // The board tools take the toolbar's place while the focused pane shows a
     // board (docs/IMAGE_MARKUP_CONTRACT.md section 1).
     let board_toolbar = crate::boards::render_board_toolbar(__scope, store);

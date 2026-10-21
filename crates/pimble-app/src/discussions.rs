@@ -15,6 +15,7 @@
 //! `AppStore::attachments`, which `ListAttachments` fills; the row shows how
 //! many there are.
 
+pub(crate) mod margin;
 mod ui;
 
 use std::cell::{Cell, RefCell};
@@ -211,6 +212,11 @@ pub(crate) fn inline_holds(store_id: StoreId, node_id: NodeId) -> bool {
     slots_holding(store_id, node_id).iter().any(|s| matches!(s, Slot::Inline(..)))
 }
 
+/// Whether pane `pane`'s text shows discussion `(store_id, node_id)` inline.
+pub(crate) fn inline_in(pane: PaneId, store_id: StoreId, node_id: NodeId) -> bool {
+    INLINE_UI.with(|u| u.borrow().contains_key(&Slot::Inline(pane, store_id, node_id)))
+}
+
 fn origin(slot: Slot) -> String {
     match slot {
         Slot::Pane(p) => format!("pimble-discussion-pane-{}", p.index()),
@@ -261,6 +267,7 @@ fn close_session(store: AppStore, slot: Slot) {
 /// once the node is there) and its view state.
 pub(crate) fn inline_opened(store: AppStore, slot: Slot, ui: DiscussionUi) {
     INLINE_UI.with(|u| u.borrow_mut().insert(slot, ui));
+    margin::inline_changed();
     if let Slot::Inline(_, store_id, node_id) = slot {
         if held_by(slot).is_some() {
             return;
@@ -289,6 +296,7 @@ pub(crate) fn node_loaded(store: AppStore, store_id: StoreId, node_id: NodeId, c
 /// its pane showed).
 pub(crate) fn inline_closed(store: AppStore, slot: Slot) {
     INLINE_UI.with(|u| u.borrow_mut().remove(&slot));
+    margin::inline_changed();
     close_session(store, slot);
 }
 
@@ -844,7 +852,7 @@ pub(crate) fn start_on(store: AppStore, from: PaneId, store_id: StoreId, host_id
     // A commenter starts one on what they read (docs/DISCUSSIONS_CONTRACT.md
     // section 7); it writes only the new discussion.
     if !store.node_access(store_id, host_id).allows_comment() {
-        store.notice.set(pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
+        store.notice.set(store.node_access(store_id, host_id).refusal().to_string());
         return;
     }
     let request = next_request();
@@ -863,6 +871,31 @@ pub(crate) fn start_on_focused(store: AppStore) {
         Some(edit) => start_on(store, pane, edit.store_id, edit.node_id),
         None => store.notice.set("Open a note to start a discussion on it.".to_string()),
     }
+}
+
+/// "Start a Discussion Here" (the Edit menu, the toolbar): a discussion on
+/// the focused pane's note anchored at the caret, a marker in the margin
+/// there, opened beside the note once it is made. A commenter's too: it
+/// writes only the new discussion (docs/DISCUSSIONS_CONTRACT.md section 6).
+pub(crate) fn start_here(store: AppStore) {
+    let pane = store.focused();
+    let Some(active) = untracked(|| store.pane(pane).active_edit.get()) else {
+        crate::events::show_notice(store, "Open a note to start a discussion in it.".to_string());
+        return;
+    };
+    let access = store.node_access(active.store_id, active.node_id);
+    if !access.allows_comment() {
+        crate::events::show_notice(store, access.refusal().to_string());
+        return;
+    }
+    let handle = crate::editor::editor(pane);
+    let at = handle.selection().from();
+    let anchor = handle.collab_sticky_index_with(at, rinch_editor_collab::StickyAssoc::After).map(|sticky| pimble_discussion::Anchor::Text { sticky });
+    let request = next_request();
+    OPEN_AFTER.with(|o| o.borrow_mut().insert(request, pane));
+    let mut init = init(request);
+    init.content = pimble_discussion::new_content(anchor.as_ref());
+    store.send(BackendCommand::CreateAttachment { store_id: active.store_id, host_id: active.node_id, title: String::new(), init });
 }
 
 /// Edit > "Insert Discussion": a discussion on the focused pane's note,
