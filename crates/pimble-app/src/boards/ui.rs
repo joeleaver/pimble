@@ -909,52 +909,81 @@ pub(crate) fn render_board_toolbar(__scope: &mut RenderScope, store: AppStore) -
         item(__scope, TablerIcon::Stack2, "Flatten into New Image", Box::new(export::flatten)),
     ];
 
+    // Labeled groups, as the text's toolbar has (Joe, 2026-10-20: group them
+    // in a way that makes sense, with category labels, on every toolbar).
     rsx! {
         div {
-            class: "pimble-board-toolbar",
+            class: "pimble-toolbar",
             div {
-                class: "pimble-board-toolbar__group",
+                class: "pimble-toolbar__group",
                 style: {move || if writable() { "" } else { "opacity: 0.4; pointer-events: none;" }},
-                {tools}
-                div { class: "pimble-board-toolbar__divider" }
-                {undo_btn}
-                {redo_btn}
-                {delete_btn}
-                DropdownMenu {
-                    opened_fn: move || arrange_open.get(),
-                    on_close: move || arrange_open.set(false),
-                    DropdownMenuTarget {
-                        div {
-                            title: "Arrange",
-                            class: "pimble-board-tool",
-                            onclick: move || arrange_open.update(|v| *v = !*v),
-                            IconGlyph { name: TablerIcon::ArrowsMove.name().to_string() }
+                div { class: "pimble-toolbar__buttons", {tools} }
+                div { class: "pimble-toolbar__label", "Tools" }
+            }
+            div {
+                class: "pimble-toolbar__group",
+                style: {move || if writable() { "" } else { "opacity: 0.4; pointer-events: none;" }},
+                div {
+                    class: "pimble-toolbar__buttons",
+                    {undo_btn}
+                    {redo_btn}
+                    {delete_btn}
+                    DropdownMenu {
+                        opened_fn: move || arrange_open.get(),
+                        on_close: move || arrange_open.set(false),
+                        DropdownMenuTarget {
+                            div {
+                                title: "Arrange",
+                                class: "pimble-board-tool",
+                                onclick: move || arrange_open.update(|v| *v = !*v),
+                                IconGlyph { name: TablerIcon::ArrowsMove.name().to_string() }
+                            }
                         }
-                    }
-                    DropdownMenuDropdown { {arrange_items} }
-                }
-            }
-            DropdownMenu {
-                opened_fn: move || export_open.get(),
-                on_close: move || export_open.set(false),
-                DropdownMenuTarget {
-                    div {
-                        title: "Copy and save the board as a picture",
-                        class: "pimble-board-tool",
-                        onclick: move || export_open.update(|v| *v = !*v),
-                        IconGlyph { name: TablerIcon::Download.name().to_string() }
+                        DropdownMenuDropdown { {arrange_items} }
                     }
                 }
-                DropdownMenuDropdown { {export_items} }
+                div { class: "pimble-toolbar__label", "Edit" }
             }
-            div { class: "pimble-board-toolbar__divider" }
-            {grid_btn}
-            {snap_btn}
-            {author_btn}
-            div { class: "pimble-board-toolbar__divider" }
-            {fit_btn}
-            {one_btn}
-            {panel_btn}
+            div {
+                class: "pimble-toolbar__group",
+                div {
+                    class: "pimble-toolbar__buttons",
+                    {grid_btn}
+                    {snap_btn}
+                    {author_btn}
+                    {panel_btn}
+                }
+                div { class: "pimble-toolbar__label", "Show" }
+            }
+            div {
+                class: "pimble-toolbar__group",
+                div {
+                    class: "pimble-toolbar__buttons",
+                    {fit_btn}
+                    {one_btn}
+                }
+                div { class: "pimble-toolbar__label", "Zoom" }
+            }
+            div {
+                class: "pimble-toolbar__group",
+                div {
+                    class: "pimble-toolbar__buttons",
+                    DropdownMenu {
+                        opened_fn: move || export_open.get(),
+                        on_close: move || export_open.set(false),
+                        DropdownMenuTarget {
+                            div {
+                                title: "Copy and save the board as a picture",
+                                class: "pimble-board-tool",
+                                onclick: move || export_open.update(|v| *v = !*v),
+                                IconGlyph { name: TablerIcon::Download.name().to_string() }
+                            }
+                        }
+                        DropdownMenuDropdown { {export_items} }
+                    }
+                }
+                div { class: "pimble-toolbar__label", "Export" }
+            }
         }
     }
 }

@@ -2631,12 +2631,16 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 span { class: "pimble-search-bar__icon", {search_icon} }
                 {search_input}
                 if !store.search_query.get().is_empty() {
-                    ActionIcon {
-                        icon: TablerIcon::X,
-                        variant: "subtle",
-                        size: "xs",
-                        class: "pimble-search-bar__clear",
-                        onclick: move || clear_search(store),
+                    div {
+                        title: "Clear the search",
+                        style: "display: inline-flex;",
+                        ActionIcon {
+                            icon: TablerIcon::X,
+                            variant: "subtle",
+                            size: "xs",
+                            class: "pimble-search-bar__clear",
+                            onclick: move || clear_search(store),
+                        }
                     }
                 }
             }
@@ -4052,14 +4056,18 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                                 // Pimble is signed in as; there
                                                 // is no share without them.
                                                 if member.role != pimble_rpc::MemberRole::Owner {
-                                                    ActionIcon {
-                                                        icon: TablerIcon::X,
-                                                        variant: "subtle",
-                                                        size: "xs",
-                                                        onclick: {
-                                                            let email = member.email.clone();
-                                                            move || remove_member(email.clone())
-                                                        },
+                                                    div {
+                                                        title: "Remove from this share",
+                                                        style: "display: inline-flex;",
+                                                        ActionIcon {
+                                                            icon: TablerIcon::X,
+                                                            variant: "subtle",
+                                                            size: "xs",
+                                                            onclick: {
+                                                                let email = member.email.clone();
+                                                                move || remove_member(email.clone())
+                                                            },
+                                                        }
                                                     }
                                                 }
                                             }
@@ -4273,19 +4281,27 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 // the way back to the account pages, which the
                                 // desktop reaches through its menu bar instead.
                                 if has_account_action() {
-                                    ActionIcon {
-                                        icon: TablerIcon::User,
-                                        variant: "subtle",
-                                        size: "xs",
-                                        onclick: move || run_account_action(),
+                                    div {
+                                        title: "Account",
+                                        style: "display: inline-flex;",
+                                        ActionIcon {
+                                            icon: TablerIcon::User,
+                                            variant: "subtle",
+                                            size: "xs",
+                                            onclick: move || run_account_action(),
+                                        }
                                     }
                                 }
 
-                                ActionIcon {
-                                    icon: TablerIcon::Plus,
-                                    variant: "subtle",
-                                    size: "xs",
-                                    onclick: on_new_node,
+                                div {
+                                    title: "New Node",
+                                    style: "display: inline-flex;",
+                                    ActionIcon {
+                                        icon: TablerIcon::Plus,
+                                        variant: "subtle",
+                                        size: "xs",
+                                        onclick: on_new_node,
+                                    }
                                 }
                             }
 

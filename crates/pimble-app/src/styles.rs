@@ -1209,27 +1209,6 @@ pub(crate) const APP_CSS: &str = "
     font-size: 11px;
 }
 
-.pimble-board-toolbar {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    align-items: center;
-    padding: 6px 12px;
-}
-
-.pimble-board-toolbar__group {
-    display: flex;
-    gap: 6px;
-    align-items: center;
-}
-
-.pimble-board-toolbar__divider {
-    width: 1px;
-    height: 20px;
-    background: var(--rinch-color-border);
-    margin: 0 2px;
-}
-
 .pimble-board-tool {
     display: inline-flex;
     align-items: center;
