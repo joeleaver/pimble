@@ -13,13 +13,13 @@
 
 #[cfg(feature = "native")]
 pub use rinch::prelude::{
-    create_editor, Editor, EditorHandle, EditorKey, LinkClick, LinkHover, NodeViewCtx, NodeViewRegistration, NodeViewSpec, ScrollAlign,
+    create_editor, Editor, EditorHandle, EditorKey, LinkClick, LinkHover, MarginAnchor, MarginLine, NodeViewCtx, NodeViewRegistration, NodeViewSpec, ScrollAlign,
 };
 #[cfg(feature = "native")]
 pub use rinch::editor::{set_image_source, ImageHover, ImageInputSource, SelectionAnchor};
 
 #[cfg(not(feature = "native"))]
 pub use rinch_web::{
-    create_editor, set_image_source, Editor, EditorHandle, EditorKey, ImageHover, ImageInputSource, LinkClick, LinkHover, NodeViewCtx,
+    create_editor, set_image_source, Editor, EditorHandle, EditorKey, ImageHover, ImageInputSource, LinkClick, LinkHover, MarginAnchor, MarginLine, NodeViewCtx,
     NodeViewRegistration, NodeViewSpec, ScrollAlign, SelectionAnchor,
 };

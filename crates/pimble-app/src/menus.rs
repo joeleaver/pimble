@@ -138,8 +138,14 @@ fn edit_entries(store: AppStore) -> Vec<MenuEntry> {
         MenuEntry::item("Insert Sheet", "", move || crate::sheets::in_text::insert_sheet(store)),
         // A sheet node of its own, shown live in the text.
         MenuEntry::item("Insert Sheet from a Node...", "", move || crate::sheets::in_text::insert_sheet_node(store)),
+        // docs/DISCUSSIONS_CONTRACT.md section 6: a discussion at the caret, shown there.
+        MenuEntry::item("Insert Discussion", "", move || crate::discussions::insert_inline(store)),
         // docs/SHEETS_CONTRACT.md section 8: a named value on the node.
         MenuEntry::item("Add Field", "", move || crate::fields::add_field(store)),
+        // docs/DISCUSSIONS_CONTRACT.md: a discussion on the focused pane's node.
+        // A discussion at the caret, drawn in the margin (commenters too).
+        MenuEntry::item("Start a Discussion Here", "", move || crate::discussions::start_here(store)),
+        MenuEntry::item("Start a Discussion", "", move || crate::discussions::start_on_focused(store)),
         MenuEntry::Separator,
         MenuEntry::item("Delete", "", move || {
         // A native menu item cannot be greyed out reactively, so the check a
@@ -188,6 +194,8 @@ fn view_entries(store: AppStore) -> Vec<MenuEntry> {
         MenuEntry::item("Recently Deleted...", "", move || {
             crate::app::open_deleted_modal_for_selection(store)
         }),
+        // docs/DISCUSSIONS_CONTRACT.md section 8: what is unread, everywhere.
+        MenuEntry::item("Discussions...", "", move || crate::discussions::open_unread(store)),
     ]
 }
 

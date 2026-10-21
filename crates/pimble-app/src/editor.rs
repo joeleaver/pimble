@@ -196,6 +196,7 @@ pub(crate) fn start_editing(
         if store.focused() == pane {
             crate::link_picker::caret_moved(store, &editor(pane));
         }
+        crate::places::moved(store, pane);
     });
 
     // Every local edit's delta is base64-broadcast to the server, which persists it
@@ -284,6 +285,7 @@ pub(crate) fn start_editing(
     crate::text_boards::host_opened(store, pane, store_id, node_id, content_bytes);
     // And its sheets in text (docs/SHEETS_CONTRACT.md section 1).
     crate::sheets::in_text::register(store, pane);
+    crate::discussions::register(store, pane);
     crate::sheets::text_opened(store, pane, store_id, node_id, content_bytes);
     // A followed deep link into this note: its spot, now that the session
     // holds the content.
@@ -291,6 +293,10 @@ pub(crate) fn start_editing(
     if let Some((_, _, anchor)) = arrived {
         state.pending_anchor.set(None);
         crate::links::place_anchor(&handle, &anchor);
+    } else {
+        // Where this person was in it last, on any of their devices
+        // (docs/DISCUSSIONS_CONTRACT.md section 8b).
+        crate::places::restore(pane, store_id, node_id);
     }
     // See edits from other clients: once per node, however many panes hold
     // it.
@@ -312,9 +318,12 @@ pub(crate) fn start_editing(
 pub(crate) fn stop_editing(store: AppStore, pane: PaneId) {
     // A pane holds a document or a board, never both: whatever it held goes.
     crate::boards::stop(store, pane);
+    crate::discussions::stop(store, pane);
     let state = store.pane(pane);
     let Some(active) = untracked(|| state.active_edit.get()) else { return };
     let handle = editor(pane);
+    // Where this person leaves it, for next time.
+    crate::places::remember(store, pane, active.store_id, active.node_id);
     // The node cache holds the content bytes from the last fetch; the
     // session's edits never touched them. Write the session's final state
     // back so labels and anything else reading the cache see what was

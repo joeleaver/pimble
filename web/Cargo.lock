@@ -1781,11 +1781,13 @@ dependencies = [
  "pimble-client",
  "pimble-core",
  "pimble-crdt",
+ "pimble-discussion",
  "pimble-image",
  "pimble-import",
  "pimble-rpc",
  "pimble-sheet",
  "rinch",
+ "rinch-editor-collab",
  "rinch-editor-core",
  "rinch-tabler-icons",
  "rinch-web",
@@ -1880,6 +1882,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pimble-discussion"
+version = "0.11.0"
+dependencies = [
+ "pimble-core",
+ "pimble-crdt",
+ "thiserror 2.0.20",
+ "uuid",
+ "yrs",
+]
+
+[[package]]
 name = "pimble-image"
 version = "0.11.0"
 dependencies = [
@@ -1943,6 +1956,7 @@ dependencies = [
  "pimble-core",
  "pimble-crdt",
  "pimble-crypto",
+ "pimble-discussion",
  "pimble-rpc",
  "pimble-sheet",
  "rinch",
@@ -2189,7 +2203,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rinch"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#1378e13826b867e95b71e1d7efb89488022e8c26"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#42e2d2df4be075d4e4e7bc79b5bf0a9cca45d672"
 dependencies = [
  "js-sys",
  "rinch-components",
@@ -2206,7 +2220,7 @@ dependencies = [
 [[package]]
 name = "rinch-android"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#1378e13826b867e95b71e1d7efb89488022e8c26"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#42e2d2df4be075d4e4e7bc79b5bf0a9cca45d672"
 dependencies = [
  "android-activity",
  "base64 0.22.1",
@@ -2219,7 +2233,7 @@ dependencies = [
 [[package]]
 name = "rinch-clipboard"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#1378e13826b867e95b71e1d7efb89488022e8c26"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#42e2d2df4be075d4e4e7bc79b5bf0a9cca45d672"
 dependencies = [
  "arboard",
  "js-sys",
@@ -2232,7 +2246,7 @@ dependencies = [
 [[package]]
 name = "rinch-components"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#1378e13826b867e95b71e1d7efb89488022e8c26"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#42e2d2df4be075d4e4e7bc79b5bf0a9cca45d672"
 dependencies = [
  "rinch-core",
  "rinch-macros",
@@ -2244,7 +2258,7 @@ dependencies = [
 [[package]]
 name = "rinch-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#1378e13826b867e95b71e1d7efb89488022e8c26"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#42e2d2df4be075d4e4e7bc79b5bf0a9cca45d672"
 dependencies = [
  "thiserror 1.0.69",
  "tracing",
@@ -2254,7 +2268,7 @@ dependencies = [
 [[package]]
 name = "rinch-editable"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#1378e13826b867e95b71e1d7efb89488022e8c26"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#42e2d2df4be075d4e4e7bc79b5bf0a9cca45d672"
 dependencies = [
  "rinch-words",
 ]
@@ -2262,7 +2276,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-collab"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#1378e13826b867e95b71e1d7efb89488022e8c26"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#42e2d2df4be075d4e4e7bc79b5bf0a9cca45d672"
 dependencies = [
  "rinch-editor-core",
  "thiserror 1.0.69",
@@ -2272,7 +2286,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#1378e13826b867e95b71e1d7efb89488022e8c26"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#42e2d2df4be075d4e4e7bc79b5bf0a9cca45d672"
 dependencies = [
  "pulldown-cmark",
  "regex",
@@ -2283,7 +2297,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-view"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#1378e13826b867e95b71e1d7efb89488022e8c26"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#42e2d2df4be075d4e4e7bc79b5bf0a9cca45d672"
 dependencies = [
  "rinch-core",
  "rinch-editor-collab",
@@ -2294,7 +2308,7 @@ dependencies = [
 [[package]]
 name = "rinch-macros"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#1378e13826b867e95b71e1d7efb89488022e8c26"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#42e2d2df4be075d4e4e7bc79b5bf0a9cca45d672"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2304,7 +2318,7 @@ dependencies = [
 [[package]]
 name = "rinch-platform"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#1378e13826b867e95b71e1d7efb89488022e8c26"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#42e2d2df4be075d4e4e7bc79b5bf0a9cca45d672"
 dependencies = [
  "web-time",
 ]
@@ -2312,7 +2326,7 @@ dependencies = [
 [[package]]
 name = "rinch-tabler-icons"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#1378e13826b867e95b71e1d7efb89488022e8c26"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#42e2d2df4be075d4e4e7bc79b5bf0a9cca45d672"
 dependencies = [
  "heck",
  "rinch-core",
@@ -2324,12 +2338,12 @@ dependencies = [
 [[package]]
 name = "rinch-theme"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#1378e13826b867e95b71e1d7efb89488022e8c26"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#42e2d2df4be075d4e4e7bc79b5bf0a9cca45d672"
 
 [[package]]
 name = "rinch-web"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#1378e13826b867e95b71e1d7efb89488022e8c26"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#42e2d2df4be075d4e4e7bc79b5bf0a9cca45d672"
 dependencies = [
  "js-sys",
  "rinch",
@@ -2345,9 +2359,10 @@ dependencies = [
 [[package]]
 name = "rinch-words"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#1378e13826b867e95b71e1d7efb89488022e8c26"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#42e2d2df4be075d4e4e7bc79b5bf0a9cca45d672"
 dependencies = [
  "regex",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -3085,6 +3100,12 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "universal-hash"

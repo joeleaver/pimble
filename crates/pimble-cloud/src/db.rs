@@ -836,6 +836,41 @@ impl RhypeDb {
         Ok(deleted)
     }
 
+    // ── Personal documents ────────────────────────────────────────────
+
+    /// An account's personal document: `(rid, version, blob)`.
+    pub async fn get_personal(&self, user_uuid: &str) -> CloudResult<Option<(u64, u64, String)>> {
+        let q = format!("PersonalDoc.filter(.user_uuid == {})", ql_str(user_uuid));
+        match self.one(&q).await? {
+            Some(o) => Ok(Some((o.id, get_u64(&o, "version")?, get_string(&o, "blob")?.to_string()))),
+            None => Ok(None),
+        }
+    }
+
+    /// Write it as `version` (the caller has checked the one it replaces).
+    pub async fn put_personal(&self, user_uuid: &str, existing: Option<u64>, version: u64, blob: &str) -> CloudResult<()> {
+        let q = match existing {
+            Some(rid) => format!(
+                "PersonalDoc.get({rid}).update({{ blob: {blob}, version: {version}, updated_at: {now} }})",
+                blob = ql_str(blob),
+                now = now_literal(),
+            ),
+            None => format!(
+                "PersonalDoc.create({{ user_uuid: {user}, blob: {blob}, version: {version}, updated_at: {now} }})",
+                user = ql_str(user_uuid),
+                blob = ql_str(blob),
+                now = now_literal(),
+            ),
+        };
+        self.objects(&q).await?;
+        Ok(())
+    }
+
+    pub async fn delete_personal(&self, rid: u64) -> CloudResult<()> {
+        self.objects(&format!("PersonalDoc.get({rid}).delete()")).await?;
+        Ok(())
+    }
+
     // ── Sessions ───────────────────────────────────────────────────────
 
     pub async fn sessions_for_user(&self, user_rid: u64) -> CloudResult<Vec<SessionRow>> {

@@ -476,7 +476,7 @@ pub async fn stub_put_member(
     let role = req["role"].as_str().unwrap_or_default().to_string();
     let root = req["root"].as_str().map(String::from);
     let name = req["name"].as_str().unwrap_or_default().to_string();
-    // A share's members are editors or readers, and a share has a name.
+    // A share's members are editors, commenters or readers, and a share has a name.
     if root.is_some() && (role == "owner" || name.trim().is_empty()) {
         return Err(StatusCode::BAD_REQUEST);
     }

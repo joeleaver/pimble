@@ -439,6 +439,15 @@ fn press(store: AppStore, pane: PaneId, tool: Tool, px: f32, py: f32) {
                 begin_text_existing(store, pane, &id);
             }
         }
+        Tool::Pin => {
+            // A discussion here; the tool goes back to Select (a pin is one
+            // click, not a gesture).
+            let held = with_session(pane, |s| (s.store_id, s.node_id));
+            if let Some((store_id, node_id)) = held {
+                crate::discussions::start_pin(store, pane, store_id, node_id, p.x, p.y);
+            }
+            store.board_tool.set(Tool::Select);
+        }
         Tool::Eraser => {
             if !writable_or_say(store, pane) {
                 return;

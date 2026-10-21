@@ -13,6 +13,7 @@ pimble-store = { workspace = true }
 pimble-search = { workspace = true }
 pimble-plugins = { workspace = true }
 pimble-sheet = { workspace = true }
+pimble-discussion = { workspace = true }
 pimble-rpc = { workspace = true }
 pimble-client = { workspace = true }
 # No workspace entry yet (docs/CRYPTO_CONTRACT.md phase 2a is still landing);

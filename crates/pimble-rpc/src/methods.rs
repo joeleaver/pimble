@@ -64,6 +64,29 @@ pub trait PimbleApi {
     #[method(name = "createNode", with_extensions)]
     async fn create_node(&self, request: CreateNodeRequest) -> Result<CreateNodeResponse, ErrorObjectOwned>;
 
+    /// Create an attachment of a node (a discussion on it,
+    /// docs/DISCUSSIONS_CONTRACT.md section 1). Write, judged on the host.
+    #[method(name = "createAttachment", with_extensions)]
+    async fn create_attachment(&self, request: CreateAttachmentRequest) -> Result<CreateNodeResponse, ErrorObjectOwned>;
+
+    /// Every discussion in a store the caller may read (View >
+    /// "Discussions..."). Read.
+    #[method(name = "listDiscussions", with_extensions)]
+    async fn list_discussions(&self, request: ListDiscussionsRequest) -> Result<ListDiscussionsResponse, ErrorObjectOwned>;
+
+    /// Merge this device's personal document with the account's hosted one,
+    /// sealed (docs/DISCUSSIONS_CONTRACT.md section 8). `Service`-only.
+    #[method(name = "cloudPersonalSync", with_extensions)]
+    async fn cloud_personal_sync(&self, request: CloudPersonalSyncRequest) -> Result<CloudPersonalSyncResponse, ErrorObjectOwned>;
+
+    /// Who the caller is (an agent's id and name). Any principal.
+    #[method(name = "whoAmI", with_extensions)]
+    async fn who_am_i(&self) -> Result<WhoAmIResponse, ErrorObjectOwned>;
+
+    /// A node's live attachments. Read, judged on the host.
+    #[method(name = "listAttachments", with_extensions)]
+    async fn list_attachments(&self, request: ListAttachmentsRequest) -> Result<ListAttachmentsResponse, ErrorObjectOwned>;
+
     /// Update a node's metadata. Write.
     #[method(name = "updateNodeMetadata", with_extensions)]
     async fn update_node_metadata(&self, request: UpdateNodeMetadataRequest) -> Result<EmptyResponse, ErrorObjectOwned>;

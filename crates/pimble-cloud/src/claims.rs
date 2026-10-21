@@ -26,7 +26,7 @@ enum StoreClaim {
 /// wrote must not be able to invent a permission, and a Pimble server reading
 /// a name it cannot interpret is not something to rely on either way.
 fn is_known_role(role: &str) -> bool {
-    matches!(role, "owner" | "editor" | "reader")
+    matches!(role, "owner" | "editor" | "commenter" | "reader")
 }
 
 /// `{ "<store-uuid>": "<role>", ... }` for every non-deleted store `user` has

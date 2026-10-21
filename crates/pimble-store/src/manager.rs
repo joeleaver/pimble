@@ -382,6 +382,17 @@ impl StoreManager {
         }
     }
 
+    /// Whether a vault store's document is a discussion (its discussion set).
+    pub fn vault_is_discussion(&self, store_id: StoreId, doc_id: NodeId) -> bool {
+        self.vault_stores.get(&store_id).is_some_and(|s| s.is_discussion(doc_id))
+    }
+
+    /// Record discussions of a vault store (see [`VaultStore::add_discussions`]).
+    pub async fn vault_add_discussions(&mut self, store_id: StoreId, discussions: Vec<(NodeId, NodeId)>) -> Result<bool> {
+        let store = self.vault_stores.get_mut(&store_id).ok_or(StoreError::NotOpen(store_id))?;
+        store.add_discussions(discussions).await
+    }
+
     /// A scoped member created `doc_id` under `parent_id` (see
     /// [`VaultStore::extend_scopes`]).
     pub async fn vault_extend_scopes(&mut self, store_id: StoreId, roots: &[NodeId], parent_id: NodeId, doc_id: NodeId) -> Result<bool> {
@@ -419,6 +430,20 @@ impl StoreManager {
     /// because of how this device holds it (see [`LocalStore::write_refused`]).
     pub fn write_refused(&self, store_id: StoreId, ids: &[NodeId]) -> bool {
         self.local_stores.get(&store_id).is_some_and(|s| s.write_refused(ids))
+    }
+
+    /// [`LocalStore::comment_refused`].
+    pub fn comment_refused(&self, store_id: StoreId, ids: &[NodeId]) -> bool {
+        self.local_stores.get(&store_id).is_some_and(|s| s.comment_refused(ids))
+    }
+
+    /// Whether `id` is a discussion: from the tree of a plain store, from the
+    /// discussion set of a vault store (docs/DISCUSSIONS_CONTRACT.md section 7).
+    pub fn is_discussion(&self, store_id: StoreId, id: NodeId) -> bool {
+        match self.local_stores.get(&store_id) {
+            Some(s) => s.is_discussion(id),
+            None => self.vault_is_discussion(store_id, id),
+        }
     }
 
     /// A partial replica's scope roots (empty for a whole store, or a store
@@ -522,6 +547,17 @@ impl StoreManager {
         }
 
         store.create_node(node, parent_id)
+    }
+
+    /// Create an attachment of `host` in a store ([`LocalStore::create_attachment`]).
+    /// A mount holds nothing of its own, so it takes none.
+    pub fn create_attachment(&mut self, store_id: StoreId, node: Node, host: NodeId) -> Result<(NodeId, TreeEdit)> {
+        let store = self.local_mut(store_id)?;
+        let info = store.tree().get_node_info(host).map_err(|_| StoreError::NodeNotFound(host))?;
+        if info.node_type == pimble_core::node_types::MOUNT {
+            return Err(StoreError::MountHasNoChildren { node_id: host });
+        }
+        store.create_attachment(node, host)
     }
 
     /// Move a node to a new parent in a store, deciding a plain move or a

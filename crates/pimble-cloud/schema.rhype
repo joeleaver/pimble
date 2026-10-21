@@ -196,3 +196,16 @@ type KeyGrant {
     store_rid: u64 @indexed
     store_uuid: String
 }
+
+// The personal document of an account (docs/DISCUSSIONS_CONTRACT.md section
+// 8): what its person has read in discussions and where they were in each
+// node, as one blob sealed with a key only their own devices derive. This
+// service stores the ciphertext and a version a write must name, nothing
+// else. Written once the person signs in (signing in is the asking), deleted
+// when they turn it off.
+type PersonalDoc {
+    user_uuid: String @unique
+    blob: String
+    version: u64
+    updated_at: DateTime
+}

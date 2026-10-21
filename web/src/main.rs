@@ -25,6 +25,7 @@ mod endpoints;
 mod http;
 mod keys;
 mod menu;
+mod personal_sync;
 mod pages;
 mod route;
 mod session;

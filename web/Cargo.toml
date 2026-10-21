@@ -44,6 +44,7 @@ pimble-sheet = { path = "../crates/pimble-sheet" }
 # Every byte that leaves this page is encrypted here. Pure Rust, no I/O, so
 # the browser runs exactly what the desktop runs.
 pimble-crypto = { path = "../crates/pimble-crypto" }
+pimble-discussion = { path = "../crates/pimble-discussion" }
 
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "wasmbind"] }

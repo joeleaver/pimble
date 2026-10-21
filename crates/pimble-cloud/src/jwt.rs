@@ -353,7 +353,7 @@ impl VerifiedToken {
     /// this only answers "has this account any business with this store".
     pub fn names_store(&self, store_id: &str) -> bool {
         fn is_role(value: &Value) -> bool {
-            matches!(value.as_str(), Some("owner" | "editor" | "reader"))
+            matches!(value.as_str(), Some("owner" | "editor" | "commenter" | "reader"))
         }
         match self.stores.get(store_id) {
             Some(whole @ Value::String(_)) => is_role(whole),

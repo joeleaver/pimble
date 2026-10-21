@@ -122,6 +122,7 @@ enum Insert {
     Sheet,
     SheetNode,
     Field,
+    Discussion,
 }
 
 #[derive(Clone, Copy)]
@@ -146,6 +147,8 @@ struct Group {
     /// Shown only while the caret is in a table: the row and column buttons
     /// do nothing anywhere else.
     in_table_only: bool,
+    /// Usable by a commenter too, who writes discussions and nothing else.
+    for_commenters: bool,
 }
 
 fn button_groups() -> Vec<Group> {
@@ -162,6 +165,7 @@ fn button_groups() -> Vec<Group> {
                 b(TablerIcon::ClearFormatting, "Clear Formatting", Cmd::ClearFormatting, ActiveCheck::None),
             ],
             in_table_only: false,
+            for_commenters: false,
         },
         // Everything here is inside rinch's collaboration scope (CLAUDE.md
         // "Collaboration shape"). Task lists are not, so they have no button.
@@ -177,6 +181,7 @@ fn button_groups() -> Vec<Group> {
                 b(TablerIcon::SourceCode, "Code Block", Cmd::SetBlock("pre"), ActiveCheck::Block("pre")),
             ],
             in_table_only: false,
+            for_commenters: false,
         },
         // The Edit menu's inserts, at the caret, plus the text's own table and rule.
         Group {
@@ -191,6 +196,7 @@ fn button_groups() -> Vec<Group> {
                 b(TablerIcon::Forms, "Add Field", Cmd::Insert(Insert::Field), ActiveCheck::None),
             ],
             in_table_only: false,
+            for_commenters: false,
         },
         Group {
             label: "Table",
@@ -202,6 +208,15 @@ fn button_groups() -> Vec<Group> {
                 b(TablerIcon::TableMinus, "Delete Table", Cmd::Run("deleteTable"), ActiveCheck::None),
             ],
             in_table_only: true,
+            for_commenters: false,
+        },
+        // docs/DISCUSSIONS_CONTRACT.md section 6: a discussion at the caret,
+        // in the margin.
+        Group {
+            label: "Discuss",
+            buttons: vec![b(TablerIcon::MessagePlus, "Start a Discussion Here", Cmd::Insert(Insert::Discussion), ActiveCheck::None)],
+            in_table_only: false,
+            for_commenters: true,
         },
         Group {
             label: "History",
@@ -210,6 +225,7 @@ fn button_groups() -> Vec<Group> {
                 b(TablerIcon::ArrowForwardUp, "Redo (Ctrl+Shift+Z)", Cmd::Redo, ActiveCheck::None),
             ],
             in_table_only: false,
+            for_commenters: false,
         },
     ]
 }
@@ -290,6 +306,7 @@ fn execute_cmd(store: AppStore, pane: PaneId, cmd: &Cmd) {
                 Insert::Sheet => crate::sheets::in_text::insert_sheet(store),
                 Insert::SheetNode => crate::sheets::in_text::insert_sheet_node(store),
                 Insert::Field => crate::fields::add_field(store),
+                Insert::Discussion => crate::discussions::start_here(store),
             }
             return;
         }
@@ -373,11 +390,13 @@ fn btn_style(active: bool) -> String {
 
 /// The toolbar, rendered once. `usable` says whether the focused pane holds a
 /// document this device may write; while it does not, the buttons are dimmed
-/// and do nothing.
+/// and do nothing, but for a commenter's (`commentable`: a note this device
+/// may comment on).
 pub(crate) fn render_pimble_toolbar(
     __scope: &mut RenderScope,
     store: AppStore,
     usable: impl Fn() -> bool + Copy + 'static,
+    commentable: impl Fn() -> bool + Copy + 'static,
 ) -> NodeHandle {
     let groups = button_groups();
     let count = groups.iter().map(|g| g.buttons.len()).sum();
@@ -396,7 +415,6 @@ pub(crate) fn render_pimble_toolbar(
     let toolbar = rsx! {
         div {
             class: "editor-toolbar pimble-toolbar",
-            style: {move || if usable() { "" } else { "opacity: 0.4; pointer-events: none;" }},
         }
     };
 
@@ -404,11 +422,17 @@ pub(crate) fn render_pimble_toolbar(
     // flattens the groups.
     let mut bit = 0u32;
     for group in groups {
-        let in_table_only = group.in_table_only;
+        let (in_table_only, for_commenters) = (group.in_table_only, group.for_commenters);
         let element = rsx! {
             div {
                 class: "pimble-toolbar__group",
-                style: {move || if in_table_only && !in_table.get() { "display: none;" } else { "" }},
+                style: {move || if in_table_only && !in_table.get() {
+                    "display: none;"
+                } else if usable() || (for_commenters && commentable()) {
+                    ""
+                } else {
+                    "opacity: 0.4; pointer-events: none;"
+                }},
             }
         };
         let row = rsx! { div { class: "pimble-toolbar__buttons" } };

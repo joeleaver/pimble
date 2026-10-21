@@ -100,6 +100,48 @@ fn endpoint(base_url: &str, path: &str) -> String {
     format!("{}{}", base_url.trim_end_matches('/'), path)
 }
 
+// ── /me/personal (docs/DISCUSSIONS_CONTRACT.md section 8) ─────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PersonalBody {
+    pub version: u64,
+    pub blob: String,
+}
+
+/// The account's sealed personal document, `None` when it has none.
+pub async fn get_personal(base_url: &str, session: &str) -> Result<Option<PersonalBody>> {
+    match get(&endpoint(base_url, "/api/v1/me/personal"), Some(session)).await {
+        Ok(body) => Ok(Some(body)),
+        Err(e) if e.status() == Some(404) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Replace it, naming the version replaced; `Ok(None)` when another device
+/// wrote first (409): fetch, merge, write again.
+pub async fn put_personal(base_url: &str, session: &str, version: u64, blob: &str) -> Result<Option<u64>> {
+    let body = PersonalBody { version, blob: blob.to_string() };
+    match put::<_, PersonalBody>(&endpoint(base_url, "/api/v1/me/personal"), session, &body).await {
+        Ok(answer) => Ok(Some(answer.version)),
+        Err(e) if e.status() == Some(409) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+pub async fn delete_personal(base_url: &str, session: &str) -> Result<()> {
+    let resp = client()
+        .delete(endpoint(base_url, "/api/v1/me/personal"))
+        .bearer_auth(session)
+        .send()
+        .await
+        .map_err(|e| CloudError::Request { url: base_url.to_string(), source: e })?;
+    if resp.status().is_success() || resp.status().as_u16() == 404 {
+        Ok(())
+    } else {
+        Err(CloudError::Status { url: base_url.to_string(), status: resp.status().as_u16(), body: resp.text().await.unwrap_or_default() })
+    }
+}
+
 // ── GET /kdf ──────────────────────────────────────────────────────────────
 
 pub async fn kdf(base_url: &str, email: &str) -> Result<KdfParams> {
@@ -264,12 +306,13 @@ impl StoreView {
     }
 
     /// What a device with this grant may change (`Store::access`): a reader
-    /// reads, everyone else edits what they reach.
+    /// reads, a commenter writes discussions, everyone else edits what they
+    /// reach.
     pub fn access(&self) -> pimble_core::StoreAccess {
-        if self.role == "reader" {
-            pimble_core::StoreAccess::Read
-        } else {
-            pimble_core::StoreAccess::Full
+        match self.role.as_str() {
+            "reader" => pimble_core::StoreAccess::Read,
+            "commenter" => pimble_core::StoreAccess::Comment,
+            _ => pimble_core::StoreAccess::Full,
         }
     }
 }
@@ -287,8 +330,11 @@ pub struct HeldAs {
     /// The shared nodes; empty for the whole store. A whole-store grant
     /// wins over any share of the same store, as it does in the token.
     pub roots: Vec<pimble_core::NodeId>,
-    /// The roots among them held as a reader, when others are edited.
+    /// The roots among them held as a reader or a commenter, when others are
+    /// edited (or, all of them, when some are held as a commenter).
     pub read_only_roots: Vec<pimble_core::NodeId>,
+    /// Among `read_only_roots`, the ones held as a commenter.
+    pub comment_roots: Vec<pimble_core::NodeId>,
     /// `Read` when nothing the account holds of the store may be written.
     pub access: pimble_core::StoreAccess,
     pub shared_by: Option<String>,
@@ -297,7 +343,7 @@ pub struct HeldAs {
 impl HeldAs {
     /// One's own store, just hosted.
     pub fn owner() -> Self {
-        Self { name: None, roots: Vec::new(), read_only_roots: Vec::new(), access: pimble_core::StoreAccess::Full, shared_by: None }
+        Self { name: None, roots: Vec::new(), read_only_roots: Vec::new(), comment_roots: Vec::new(), access: pimble_core::StoreAccess::Full, shared_by: None }
     }
 
     /// `None` when no row names the store (nothing is known of how it is
@@ -310,14 +356,18 @@ impl HeldAs {
                 name: Some(whole.name.clone()),
                 roots: Vec::new(),
                 read_only_roots: Vec::new(),
+                comment_roots: Vec::new(),
                 access: whole.access(),
                 shared_by: whole.shared_by.clone(),
             });
         }
         let shares: Vec<(pimble_core::NodeId, &StoreView)> = rows.iter().filter_map(|row| Some((row.scope_root()?, *row))).collect();
         let (_, first) = shares.first()?;
-        let reads = |row: &StoreView| row.access() == pimble_core::StoreAccess::Read;
+        let reads = |row: &StoreView| row.access() != pimble_core::StoreAccess::Full;
+        let comments = |row: &StoreView| row.access() == pimble_core::StoreAccess::Comment;
         let all_read = shares.iter().all(|(_, row)| reads(row));
+        let any_comment = shares.iter().any(|(_, row)| comments(row));
+        let read_only: Vec<pimble_core::NodeId> = shares.iter().filter(|(_, row)| reads(row)).map(|(root, _)| *root).collect();
         // One share is called what its owner called it. Several shares of one
         // store have several names and the replica has one row: it says whose
         // they are, and each shared folder shows its own title beneath.
@@ -329,8 +379,15 @@ impl HeldAs {
         Some(Self {
             name: Some(name),
             roots: shares.iter().map(|(root, _)| *root).collect(),
-            read_only_roots: if all_read { Vec::new() } else { shares.iter().filter(|(_, row)| reads(row)).map(|(root, _)| *root).collect() },
-            access: if all_read { pimble_core::StoreAccess::Read } else { pimble_core::StoreAccess::Full },
+            // Every root only read: the store's access says it, unless some
+            // are a commenter's, when the roots say which.
+            read_only_roots: if all_read && !any_comment { Vec::new() } else { read_only },
+            comment_roots: shares.iter().filter(|(_, row)| comments(row)).map(|(root, _)| *root).collect(),
+            access: match (all_read, any_comment) {
+                (false, _) => pimble_core::StoreAccess::Full,
+                (true, true) => pimble_core::StoreAccess::Comment,
+                (true, false) => pimble_core::StoreAccess::Read,
+            },
             shared_by: first.shared_by.clone(),
         })
     }

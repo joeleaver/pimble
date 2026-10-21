@@ -147,6 +147,7 @@ pub fn access_words(access: pimble_core::StoreAccess) -> &'static str {
     match access {
         pimble_core::StoreAccess::Full => "",
         pimble_core::StoreAccess::Read => "read only",
+        pimble_core::StoreAccess::Comment => "can comment",
     }
 }
 
@@ -272,6 +273,7 @@ pub fn access_note(access: pimble_core::StoreAccess) -> &'static str {
     match access {
         pimble_core::StoreAccess::Full => "",
         pimble_core::StoreAccess::Read => pimble_core::StoreAccess::READ_ONLY_REFUSAL,
+        pimble_core::StoreAccess::Comment => pimble_core::StoreAccess::COMMENT_ONLY_REFUSAL,
     }
 }
 
@@ -603,6 +605,11 @@ pub fn display_label_from_node(node: &Node) -> String {
         .unwrap_or(false);
     if has_explicit_title && !node.metadata.title.is_empty() {
         return node.metadata.title.clone();
+    }
+    // A discussion's title is its topic; it has no text to take one from
+    // (docs/DISCUSSIONS_CONTRACT.md section 2).
+    if node.node_type == pimble_core::node_types::DISCUSSION {
+        return if node.metadata.title.trim().is_empty() { "Discussion".to_string() } else { node.metadata.title.clone() };
     }
     let content = get_node_content_text(&node.content);
     label_from_title_and_content(has_explicit_title, &node.metadata.title, &content)
@@ -984,6 +991,20 @@ pub struct AppStore {
     /// A `BackendEvent::Error` while this modal is open lands here rather
     /// than the connection status bar.
     pub deleted_modal_error: Signal<String>,
+
+    /// The discussions on each node whose list this window asked for
+    /// (`ListAttachments`, docs/DISCUSSIONS_CONTRACT.md section 1), oldest
+    /// first; each discussion's node is in the node cache.
+    pub attachments: Signal<HashMap<(StoreId, NodeId), Vec<NodeId>>>,
+    /// Bumped whenever the personal document changes (`crate::personal`):
+    /// what shows read state reads it, to follow.
+    pub read_version: Signal<u64>,
+    /// The Account window's "Keep what I've read in step across my devices".
+    pub personal_sync: Signal<bool>,
+    /// View > "Discussions..." (docs/DISCUSSIONS_CONTRACT.md section 8): open,
+    /// and the discussions the open stores hold (`ListDiscussions`).
+    pub discussions_modal: Signal<bool>,
+    pub all_discussions: Signal<Vec<(StoreId, NodeId)>>,
 }
 
 /// What changed in the roots a store's row shows (`AppStore::set_store_roots`).
@@ -1070,6 +1091,13 @@ pub struct PaneState {
     /// What the sheet view shows: the computed tables, the cell being typed
     /// into, the column settings, the formula bar.
     pub sheet_ui: crate::sheets::SheetUi,
+    /// Whether the pane shows a discussion (docs/DISCUSSIONS_CONTRACT.md)
+    /// instead of its editor, which stays mounted, hidden.
+    pub show_discussion: Signal<bool>,
+    /// The discussion node the pane holds, like `sheet` for a sheet node.
+    pub discussion: Signal<Option<ActiveEdit>>,
+    /// What the discussion view shows: the thread, the message being typed.
+    pub discussion_ui: crate::discussions::DiscussionUi,
 }
 
 impl PaneState {
@@ -1091,6 +1119,9 @@ impl PaneState {
             adding_field: Signal::new(false),
             sheet: Signal::new(None),
             sheet_ui: crate::sheets::SheetUi::new(),
+            show_discussion: Signal::new(false),
+            discussion: Signal::new(None),
+            discussion_ui: crate::discussions::DiscussionUi::new(),
         }
     }
 }
@@ -1214,6 +1245,11 @@ impl AppStore {
             deleted_modal_nodes: Signal::new(Vec::new()),
             deleted_modal_pending: Signal::new(false),
             deleted_modal_error: Signal::new(String::new()),
+            attachments: Signal::new(HashMap::new()),
+            read_version: Signal::new(0),
+            personal_sync: Signal::new(crate::persistence::load_personal_sync()),
+            discussions_modal: Signal::new(false),
+            all_discussions: Signal::new(Vec::new()),
         }
     }
 
@@ -1252,11 +1288,13 @@ impl AppStore {
     pub fn node_access_tracked(&self, store_id: StoreId, node_id: NodeId) -> pimble_core::StoreAccess {
         let store_sig = self.store_data.with(|map| map.get(&store_id).copied());
         let store_access = store_sig.map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|s| s.access));
-        if !store_access.allows_write() {
+        if store_access == pimble_core::StoreAccess::Read {
             return store_access;
         }
+        // Held as a commenter: what the server judged of the node (a
+        // discussion is written, anything else commented on).
         let node_sig = self.node_data.with(|map| map.get(&(store_id, node_id)).copied());
-        node_sig.map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|n| n.access))
+        node_sig.map_or(store_access, |sig| sig.with(|n| n.access))
     }
 
     /// The access the held copy of a node carries (untracked), whatever its
@@ -1276,11 +1314,11 @@ impl AppStore {
         let store_access = self
             .store_data
             .with(|map| map.get(&store_id).map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|s| s.access)));
-        if !store_access.allows_write() {
+        if store_access == pimble_core::StoreAccess::Read {
             return store_access;
         }
         self.node_data
-            .with(|map| map.get(&(store_id, node_id)).map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|n| n.access)))
+            .with(|map| map.get(&(store_id, node_id)).map_or(store_access, |sig| sig.with(|n| n.access)))
     }
 
     /// Record what this device may change in a store as the server has it
@@ -1686,12 +1724,22 @@ impl AppStore {
         untracked(|| PaneId::ALL.into_iter().filter(|pane| self.pane(*pane).sheet.get() == edit).collect())
     }
 
-    /// Whether any pane holds this node, in its editor, as a board or as a
-    /// sheet, untracked: what a node's subscription is counted by.
+    /// The panes holding this discussion node, untracked.
+    pub fn panes_discussing(&self, store_id: StoreId, node_id: NodeId) -> Vec<PaneId> {
+        let edit = Some(ActiveEdit { store_id, node_id });
+        untracked(|| PaneId::ALL.into_iter().filter(|pane| self.pane(*pane).discussion.get() == edit).collect())
+    }
+
+    /// Whether any pane holds this node, in its editor, as a board, as a
+    /// sheet or as a discussion, untracked: what a node's subscription is
+    /// counted by.
     pub fn is_editing(&self, store_id: StoreId, node_id: NodeId) -> bool {
         !self.panes_editing(store_id, node_id).is_empty()
             || !self.panes_boarding(store_id, node_id).is_empty()
             || !self.panes_sheeting(store_id, node_id).is_empty()
+            || !self.panes_discussing(store_id, node_id).is_empty()
+            // And a discussion shown inline in a note's text.
+            || crate::discussions::inline_holds(store_id, node_id)
             // A board embedded in a note's text holds its subscription too
             // (docs/IMAGE_MARKUP_CONTRACT.md section 2, "Showing").
             || crate::text_boards::embed_holds(store_id, node_id)
@@ -1707,7 +1755,10 @@ impl AppStore {
     pub fn edited_nodes(&self) -> Vec<ActiveEdit> {
         let mut nodes: Vec<ActiveEdit> = Vec::new();
         for pane in PaneId::ALL {
-            let held = untracked(|| self.pane(pane).active_edit.get().or_else(|| self.pane(pane).board.get()).or_else(|| self.pane(pane).sheet.get()));
+            let held = untracked(|| {
+                let p = self.pane(pane);
+                p.active_edit.get().or_else(|| p.board.get()).or_else(|| p.sheet.get()).or_else(|| p.discussion.get())
+            });
             if let Some(edit) = held {
                 if !nodes.contains(&edit) {
                     nodes.push(edit);
@@ -1748,6 +1799,7 @@ impl AppStore {
         self.pane(pane).show_editor.set(false);
         self.pane(pane).show_board.set(false);
         self.pane(pane).show_sheet.set(false);
+        self.pane(pane).show_discussion.set(false);
         self.pane(pane).restore.set(None);
         if pane == self.focused() {
             self.node_title.set(String::new());
@@ -1769,6 +1821,8 @@ impl AppStore {
                 .active_edit
                 .get()
                 .or_else(|| state.board.get())
+                .or_else(|| state.sheet.get())
+                .or_else(|| state.discussion.get())
                 .map(|edit| (edit.store_id, edit.node_id))
                 .or_else(|| state.restore.get());
             if let Some((store_id, node_id)) = held {

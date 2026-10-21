@@ -202,6 +202,7 @@ async fn persist_last_sync(handler: &RpcHandler, store_id: StoreId, last_sync: O
         access: existing.access,
         shared_by: existing.shared_by,
         read_only_roots: existing.read_only_roots,
+        comment_roots: existing.comment_roots,
     };
     if let Err(e) = manager.write_sync_config(store_id, &updated).await {
         warn!("Could not record last_sync for store {}: {}", store_id, e);
@@ -376,6 +377,7 @@ fn document_of(kind: &StoreChangeKind) -> Option<NodeId> {
         | StoreChangeKind::NodeDeleted { node_id, .. }
         | StoreChangeKind::NodeMoved { node_id, .. }
         | StoreChangeKind::MetadataUpdated { node_id }
+        | StoreChangeKind::AttachmentChanged { node_id, .. }
         | StoreChangeKind::ContentUpdated { node_id } => Some(*node_id),
         StoreChangeKind::TreeStructure { node_ids } => node_ids.first().copied(),
         StoreChangeKind::SyncStateChanged { .. }

@@ -1,6 +1,6 @@
 # Discussions contract: threaded conversations anywhere
 
-Status: **draft, nothing built; every question asked so far is answered.** Written on 2026-10-21 from a conversation with Joe: "a
+Status: **waves 1 to 5 built** (branch `discussions`, not merged; the "Built in ..." sections at the end say what exists, how it was checked and what is missing; margin markers wait for rinch #1683, the commenter role is wave 6); every question asked so far is answered. Written on 2026-10-21 from a conversation with Joe: "a
 new node/embed type, discussions. A little like comments, but a way to put a threaded,
 replyable discussion anywhere." His answers that day are listed under "Decisions" at the
 end. The questions still open are his and are listed under "Open decisions".
@@ -45,23 +45,27 @@ There are three reasons:
   name it.
 
 **Attached, and the host is never edited to attach it** (Joe, 2026-10-21: commenters
-can start discussions). A discussion on a node names its host and its place there in
-its own document (`data.discussion.on`, section 2). The host's document doesn't change:
+can start discussions). A discussion on a node names its host in its own `node` root
+(`attached_to`, written in the transaction that initialises the document) and its
+place there in `data.discussion.anchor` (section 2). The host's document doesn't change:
 no `children` entry, no atom and no board element is needed. So anyone who may write
 the discussion may start one, and a commenter never writes the host.
 
 - **Not in the tree.** An attached discussion is in no children list and has no
   `parent_id`. `pimble_crdt::Tree` calls it an **attachment**: a document whose
-  `data.discussion.on` names a host. `Tree::repair`, `validate_tree` and `listDeleted`'s
+  `node` root names a host (`attached_to`). The key is general: nothing in the tree
+  knows it is a discussion. `Tree::repair`, `validate_tree` and `listDeleted`'s
   "nodes no list names" skip attachments, and `Tree` keeps a reverse index from host to
   attachments that every reader of a host's discussions uses. The explorer shows a count
   badge on the host's row. A standalone discussion node ("New Discussion" in a row's
   menu) has no `on` and is an ordinary tree node.
 - **It goes where its host goes.** Moving the host within its store changes nothing,
   because the discussion names the host's id. A move that is a transplant (out of a
-  share, or between stores, docs/MOVE_CONTRACT.md) gives the host a new id, so
-  `Tree::take_cutting` carries the attachments of every node it cuts and rewrites their
-  `on` to the new ids. The editor making the move writes this. A deleted host hides its
+  share, or between stores, docs/MOVE_CONTRACT.md) makes the host again under a new
+  id, so `Tree::take_cutting` takes the attachments of every node it cuts, and
+  `Tree::plant` makes them again as attachments of the new nodes, with fresh
+  documents, like the rest of the subtree. The originals stay with the tombstoned
+  host, so Put Back brings them back with it. A deleted host hides its
   discussions, and Put Back brings them back with it.
 - **Its scope is its host's.** A discussion is reachable by exactly the scopes that
   reach its host (section 7).
@@ -74,19 +78,17 @@ first use. The node is created with every container it needs.
 ```
 data.discussion: Map                       created with the node
   v:          1
-  on:         Map | absent                  absent on a standalone discussion node
-    node:     String                        the host's node id
-    anchor:   Map | absent                  absent: the node as a whole
-      kind:   "text" | "board"
-      text:   Bytes                         rinch's sticky bytes for the host's `content` (opaque)
-      board:  String                        "board" or "board:<id>" (a picture in text)
-      x, y:   Number                        board coordinates
+  anchor:     Map | absent                  absent: the node as a whole (or a standalone one)
+    kind:     "text" | "board"
+    text:     Bytes                         rinch's sticky bytes for the host's `content` (opaque)
+    board:    String                        "board" or "board:<id>" (a picture in text)
+    x, y:     Number                        board coordinates
   resolved:   { at, by: Author? } | absent  the whole discussion (section 4)
   messages:   Map<message id, Map>          created with the node, never replaced
     <id>: Map
       reply_to:   String | absent           a message id; absent at top level
-      created:    String                    RFC 3339 UTC, the shape boards use
-      author:     { id, name } | absent     section 3
+      created:    String                    RFC 3339 UTC with milliseconds, the shape boards use
+      author_id, author_name: String | absent   section 3
       body:       Text                      formatted (section 5)
       edited:     String | absent           last edit's time
       deleted_at: String | absent           a tombstone (section 4)
@@ -365,13 +367,17 @@ Agreed with the Rinch session (2026-10-21), and in progress there:
   table cells report their line, anchors in node views may be omitted, and the text
   column's right edge is reported if cheap. (Pimble's own `overflow` is what makes the
   editor scroll today; rinch's stylesheet doesn't.)
-- Sticky positions are built as joeleaver/rinch#1679 (branch `fix-sticky`, in review):
+- Sticky positions are merged (joeleaver/rinch#1679, rinch `main` 2a42fa7a; the pin moves there with wave 2):
   `StickyAssoc { After, Before }`, `CollabDoc::sticky_index_with`, `locate_sticky`,
   headless `locate_sticky_in(schema, bytes)` answering `StickyLocation { pos, path,
   displaced }`, and the same on `CollabSession` and `EditorHandle`. The bytes are a yrs
   `StickyIndex` plus a versioned trailer: Pimble stores them as opaque and never decodes
   them. A deleted block resolves nearby with `displaced: true`, which the margin marker
   can show ("the text this was on was deleted").
+  Also: `locate_sticky_many` (one pass for many anchors, for the margin), `None`
+  means "not locatable right now" and can change, and an anchor is displaced for
+  good after an undone deletion or a list toggle (the block is a new CRDT item), or
+  when the document is re-projected from the model (never done while collaborating).
 - Issues and PRs: joeleaver/rinch#1676 (sticky positions), #1677 (margin anchors and
   the overlay slot), #1678 (raw input keydown/keyup with modifiers and a flag to prevent
   the default, a selection read in UTF-16 units, `NodeHandle::caret_rect()`). Color emoji
@@ -450,3 +456,191 @@ None right now.
 - A topic line, which is the discussion node's title.
 - The same sticky positions remember your place in every node, in the personal
   document, following you across devices (section 8b).
+
+## Built in wave 1 (2026-10-21, branch `discussions`, rinch `main` 1378e13)
+
+What exists:
+
+- **`pimble-discussion`** (`doc.rs`, `body.rs`, `thread.rs`): the document under
+  `data.discussion` with its containers made by `new_content` at creation; `post`,
+  `edit_message` (common prefix and suffix kept, then every span formatted again),
+  `delete_message`/`restore_message`, `resolve`/`reopen`, `set_anchor`; bodies as a yrs
+  Text with `bold`/`italic`/`link` attributes and the Markdown they are typed as (a bare
+  `http(s)://` or `pimble:` URL is a link; `_` inside a word is text); the thread in
+  `(created, id)` order with replies waiting for a parent not here yet, cycles cut at the
+  smallest id, and a deleted message shown only while a reply is; index units and the
+  Markdown MCP reads. 19 tests, three replicas converging among them.
+- **Attachments in `pimble_crdt::Tree`**: `node.attached_to` (`NodeDoc::init_attached`),
+  `Tree::add_attachment`, `attachments_of`, `attachment_counts`, `is_attachment`; repair
+  and validation skip them; an attachment's delete and undelete touch no list; a deleted
+  host hides its attachments; `take_cutting`/`plant` make a transplanted node's
+  attachments again under the new node. 7 tests; 600 convergence seeds pass.
+- **Server**: `createAttachment`, `listAttachments`, `whoAmI` (an agent's id and name),
+  `Node.attachments` (a count reported with `getNode`/`getChildren`, never stored),
+  `StoreChangeKind::AttachmentChanged { node_id, host_id, live }` from `derive_kinds`,
+  plain scopes and vault keys reaching an attachment through its host, `listDeleted`
+  not calling a live attachment lost, and a `DiscussionPlugin` indexing messages.
+- **App (desktop and web)**: `discussions.rs` and `discussions/ui.rs`: a pane holding a
+  discussion (session, reconcile, peers' updates), the topic line (the title), the thread
+  indented five levels, Reply / Edit / Delete (your own and unauthored only), "N deleted
+  messages" with Put Back, Resolve / Reopen with the collapse and "Show all N
+  messages", the message box (Enter sends, Shift+Enter, Escape, emoji picker), the
+  "Discussions (N)" list under a note (in its text) or under a board or sheet, the row's
+  count, "New Discussion" and "Start a Discussion" in row menus and Edit > "Start a
+  Discussion", opening beside the note (an empty or discussion pane first, else a split),
+  and the layout remembering discussion (and, newly, sheet) panes. The web's vault client
+  creates, lists and counts attachments, derives `AttachmentChanged`, and wraps a new
+  discussion under its host's share keys.
+- **MCP**: `list_discussions`, `read_discussion`, `start_discussion` (`on` or `parent`),
+  `reply`, `edit_message`, `delete_message` (the agent's own messages only: an
+  unauthored message is the person's), `resolve_discussion`; messages stamped with the
+  agent's id and name.
+
+How it was checked:
+
+- `cargo test --workspace --release`: 1055 passed.
+- The release desktop app on a scratch store on its own port (driven over rinch's debug
+  port): start a discussion on a note, post with Enter, bold and emoji (drawn in color by
+  the GPU renderer), reply, set the topic, edit by keyboard, delete and put back, resolve
+  and the collapse, restart (everything and the layout back), a standalone discussion
+  from the store row, Shift+Enter. An agent through `pimble-mcp` (scratch agent key):
+  `list_discussions`, `read_discussion`, `reply` and `start_discussion`, each shown live
+  in the open app with the agent's name and mark.
+- The browser on the local stack, in an encrypted store (made-up `alice@example.com`):
+  start a discussion, post, reload and unlock (it comes back), two tabs replying live to
+  each other with the note's list following, and no typed word on the hosted disk.
+
+Found and fixed while checking: rinch cancels a timer, and drops a keyboard interceptor,
+that a component armed when it unmounts, and Edit rebuilds the message its button is in
+(the box's keys and focus are now armed with `unowned`); the node cache a note's list
+reads was not refreshed by a pane's own or received edits; an agent could edit an
+unauthored message; the saved layout dropped sheet panes.
+
+Not done or not seen:
+
+- `[[` links and `:name:` emoji completion in the message box (links are typed as
+  `[text](pimble:...)` or pasted); the box hears Enter through the keyboard interceptor
+  until joeleaver/rinch#1678, and a press in the tree does not release it.
+- Two devices on different servers at once (only two tabs on one hosted server, and the
+  app with an agent on one local server); a share member's reply reaching the owner.
+- Readers see no message box; commenters do not exist yet (wave 6).
+- Color emoji with `--cpu` (rinch #804: the software renderer draws no bitmap color font).
+
+## Built in waves 2 to 5 (2026-10-21, branch `discussions`, rinch `main` 4c5b5fb)
+
+**Wave 2, discussions in text (all but the margin markers).** The app's discussion module
+holds a discussion per *slot*: a pane, or an inline atom in a pane's text
+(`discussions::Slot`), so any number show at once and stay in step. An `embed` atom with
+`data-kind="discussion"` and `data-node` is drawn by a rinch node view as the pane's view
+in a box (topic, thread scrolling inside, message box, "Open" beside the text). Edit >
+"Insert Discussion" anchors a new attached discussion at the caret (rinch's
+`collab_sticky_index_with`, `StickyAssoc::After`) and inserts its atom where that anchor
+resolves when the discussion is made. MCP: `start_discussion` takes `after_text` (a quote:
+`NodeDoc::sticky_at_quote` makes a plain yrs sticky index, which rinch resolves too) and
+`inline` (writes the atom after the quoted block; the strict Markdown reader takes it only
+with attributes in rinch's own order); `get_node` names each inline discussion, a node's
+count and a discussion's thread. Checked in the release app: insert, post inline, Open
+beside and replies both ways, an agent's inline discussion arriving live in an open note.
+**Not built:** margin markers and "Start a Discussion Here" (waiting for
+joeleaver/rinch#1683, margin anchors and the overlay slot), and the message box's own keys
+(joeleaver/rinch#1686; it uses the keyboard interceptor until then).
+
+**Wave 3, pins.** Board `Tool::Pin` (`q`) makes a discussion attached to the board node
+with an `Anchor::Board` at the point pressed and opens it beside; the board view draws a
+numbered pin per discussion anchored to its own board (`discussions::board_pins`,
+`boards::PinView`), following the camera, with an unread dot; a press opens its discussion.
+**Not built:** the popover (a pin opens its discussion in a pane), dragging a pin, pins on
+pictures in text.
+
+**Wave 4, read state and places on this device.** `pimble_discussion::Personal` (the
+personal document: `read` with a watermark and seen ids, compacted; `places` bounded at
+2,000), saved by the app a second after a change (`<data dir>/pimble/personal.yrs`, the
+browser's `localStorage` `pimble.personal`). A slot's unread messages are marked new (one
+"N new" line) and stay marked while it shows them; they count as read once it has been on
+screen a second. Unread counts on a note's list, a dot on its tree row and on pins, View >
+"Discussions..." (`listDiscussions`, every store open) listing what is unread, newest
+first. One's own messages, and every unauthored one, are never unread. Places: the
+selection as two sticky indexes, written when a pane leaves a note and five seconds after
+the caret rests, put back when it opens with nothing else naming a place. Checked: counts,
+dots, the list, opening from it, marking read, read state surviving a restart, a place
+written. **Not seen:** a place put back (the debug port cannot read the editor's selection);
+`top` (the first visible line) is not kept.
+
+**Wave 5, the personal document across devices.** Sealed with `pimble_crypto::personal_key`
+(HKDF of the account's encryption secret) and `personal_aad(user)`; the accounts service
+holds it as one `PersonalDoc` row (blob, version) under `GET`/`PUT`/`DELETE
+/api/v1/me/personal`, a `PUT` naming the version it replaces (409 makes the writer fetch,
+merge and write again). The desktop's local server does that for the app
+(`cloudPersonalSync`, `Service`-only); the browser does it itself (`web/src/personal_sync.rs`).
+Signing in syncs at once; changes go five seconds later; every device asks every minute.
+**Off is the account's**: the switch (the Account window, the browser's account page)
+empties the hosted copy, every device that meets the empty copy turns its own switch off,
+and a device that is turned on writes over it, which turns the others on again. Checked on
+the local stack with the desktop app and the browser as one account: the desktop's read
+state reaching the browser, off from the browser reaching the desktop within a minute, and
+on again. **Deploy note:** the accounts service's schema has a new type (`PersonalDoc`).
+
+## Built in wave 6 (2026-10-21, branch `discussions`, rinch `main` 4c5b5fb)
+
+**The commenter role.** `commenter` is a role in the accounts service (`ROLES`, token
+claims), `MemberRole::Commenter` in the Share dialog, the CLI's `cloud-share-invite` and
+the stub accounts service. On a server, `Role::Commenter` reads like a reader and
+writes as `Access::Comment`: `Reach` has a `commentable` set; `require_doc_write` takes a
+commenter's write of a discussion they reach (`judge_access` answers `Full` for a
+discussion document, `Comment` for every other one); a new discussion is a
+`createAttachment` (plain stores) or a `vaultAppend` with `discussion: true` naming the
+host (vault stores, which keep a discussion set in `scopes.json`, only grown, which the
+owner's upkeep publishes with `setScope`'s `discussions`). Refusals: "You can comment here,
+not change it." (`StoreAccess::COMMENT_ONLY_REFUSAL`; `StoreAccess::refusal` picks the
+sentence), and a replica answers it for any write it refuses where commenting is allowed
+(`write_refusal`).
+
+A member's replica: `sync.json` carries `comment_roots` beside `read_only_roots`
+(`HeldAs::from_rows`; access is `Comment` when no root is edited and some are commented),
+`LocalStore::comment_refused` judges discussions, `scope_roots_above` follows
+`attached_to`, and the vault link pushes a commenter's discussions and holds everything
+else back, marked (before this, a commenter's discussion stayed on their device). The
+browser's vault client judges the same way (`AccountStore::access`/`node_access`,
+`VaultStore::access_of`, `refuse_write` letting through a new discussion and a
+discussion's edits). The app: a note a commenter reaches is locked and says the
+commenter's sentence; the row menu offers "Start a Discussion" and nothing else that
+writes; "Insert Discussion" (in the text) is an editor's.
+
+Tests: `share.rs` `a_commenter_starts_a_discussion_and_changes_nothing_else` (refusals, a
+discussion and a message from the commenter reaching the owner, the owner's answer
+reaching the commenter), the browser client's
+`a_commenter_writes_discussions_and_nothing_else`, the vault discussion set. Checked on
+the local stack: alice shares a folder with bob as a commenter; in the browser bob's note
+is locked with the commenter's sentence, he starts a discussion and posts, and the
+message is on alice's machine (her search finds it) and nowhere in clear on the hosted
+disk. **Not checked on screen:** a commenter on the desktop app (the same replica code the
+test drives, and the same UI). **Not built:** a commenter role for agents.
+
+## Built: margin markers (2026-10-21, branch `discussions`, rinch `main` 7c964285)
+
+`discussions/margin.rs`: each pane gives its editor the discussions on its note that are
+anchored in the text and not shown inline in that pane (rinch `set_margin_anchors`,
+`MarginAnchor::sticky` with the discussion's own sticky index, keyed by node id, set only
+when the set changes) and hears their line boxes (`on_margin_layout`,
+`margin_text_right`). The markers are the `Editor`'s overlay slot children, in a 34px
+gutter right of the text (`.pimble-margin-marker`): one per line, the count of live
+messages, an unread dot, the topic as its title; a press opens the first unread (or the
+first) discussion beside the note (`open_beside`). "Start a Discussion Here" (Edit menu;
+the toolbar's Discuss group, which stays usable for a commenter while the rest is dimmed)
+anchors a new attached discussion at the caret and opens it beside. Refusals use
+`StoreAccess::refusal`. Checked in the browser on the local stack (an encrypted store):
+the marker beside the line, its count after a post, following its line when a line is
+added above and the gutter when the pane widens, a press opening the discussion, an
+inline discussion drawing none. **Desktop:** painted since rinch `main` 42e2d2df (joeleaver/rinch#1696,
+#1699: the painter skipped the children of a 0x0 box, which the overlay layer is);
+checked in the release app on the GPU and with `--cpu`: the marker and its count, following
+its line and the pane's width, a press opening the discussion. **Not built:** the popover (a marker opens
+its discussion in a pane, as pins do), a context-menu item in the text (the editor has no
+context menu of Pimble's yet), a "displaced" look for an anchor whose text was deleted.
+
+**The message boxes' own keys (2026-10-21, rinch `main` 0b3c7b09, joeleaver/rinch#1686).** The
+message box, the edit box and the topic line each hear their keys through `onkeydown`
+(`discussions::composer_key`): Enter sends, saves or sets the topic, Shift+Enter is a new
+line, Escape cancels; the keyboard interceptor is gone. Checked in the desktop app and the
+browser. Safari's IME-confirm Enter (keyCode 229, not marked composing) still reaches the
+handler; nothing guards it yet.

@@ -425,6 +425,59 @@ impl PimbleClient {
         Ok(response.node_id)
     }
 
+    /// Create an attachment of `host_id` (a discussion on it) that starts
+    /// with `content` and `custom`, in the one edit that creates it.
+    pub async fn create_attachment(
+        &self,
+        store_id: StoreId,
+        host_id: NodeId,
+        node_type: impl Into<String>,
+        title: impl Into<String>,
+        content: Option<Vec<u8>>,
+        custom: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<NodeId> {
+        use base64::Engine;
+        let request = pimble_rpc::types::CreateAttachmentRequest {
+            store_id,
+            host_id,
+            node_type: node_type.into(),
+            title: title.into(),
+            content: content.map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+            custom,
+        };
+        self.client.create_attachment(request).await.map(|r| r.node_id).map_err(rpc_error)
+    }
+
+    /// Who this connection is, as the server judges it: `(sub, name)`, the
+    /// sub absent for the server's own operator.
+    pub async fn who_am_i(&self) -> Result<(Option<String>, String)> {
+        self.client.who_am_i().await.map(|r| (r.sub, r.name)).map_err(rpc_error)
+    }
+
+    /// Merge `state` (this device's personal document) with the signed-in
+    /// account's hosted one; answers the merged state.
+    /// `(merged, off)`: `off` when another device turned it off.
+    pub async fn cloud_personal_sync(&self, state: &[u8], enabled: bool, turn_on: bool) -> Result<(Vec<u8>, bool)> {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let request = pimble_rpc::types::CloudPersonalSyncRequest { state: b64.encode(state), enabled, turn_on };
+        let answer = self.client.cloud_personal_sync(request).await.map_err(rpc_error)?;
+        let merged = b64.decode(answer.state).map_err(|e| crate::ClientError::Rpc(e.to_string()))?;
+        Ok((merged, answer.off))
+    }
+
+    /// Every discussion in a store this connection may read, with content.
+    pub async fn list_discussions(&self, store_id: StoreId) -> Result<Vec<Node>> {
+        let request = pimble_rpc::types::ListDiscussionsRequest { store_id };
+        self.client.list_discussions(request).await.map(|r| r.nodes).map_err(rpc_error)
+    }
+
+    /// A node's live attachments, oldest first, with their content.
+    pub async fn list_attachments(&self, store_id: StoreId, node_id: NodeId) -> Result<Vec<Node>> {
+        let request = pimble_rpc::types::ListAttachmentsRequest { store_id, node_id };
+        self.client.list_attachments(request).await.map(|r| r.nodes).map_err(rpc_error)
+    }
+
     /// Update a node's metadata
     pub async fn update_node_metadata(
         &self,
@@ -1172,7 +1225,27 @@ impl PimbleClient {
     ) -> Result<u64> {
         let response = self
             .client
-            .vault_append(VaultAppendRequest { store_id, doc_id, blob, client_id, parent_id, keys })
+            .vault_append(VaultAppendRequest { store_id, doc_id, blob, client_id, parent_id, keys, discussion: false })
+            .await
+            .map_err(rpc_error)?;
+        Ok(response.seq)
+    }
+
+    /// A new discussion's first append (docs/DISCUSSIONS_CONTRACT.md section
+    /// 7): [`PimbleClient::vault_append_with_keys`] naming the node it is on,
+    /// which is what lets a commenter create it.
+    pub async fn vault_append_new_discussion(
+        &self,
+        store_id: StoreId,
+        doc_id: VaultDocId,
+        blob: String,
+        client_id: Option<String>,
+        host: NodeId,
+        keys: Option<VaultDocKeys>,
+    ) -> Result<u64> {
+        let response = self
+            .client
+            .vault_append(VaultAppendRequest { store_id, doc_id, blob, client_id, parent_id: Some(host), keys, discussion: true })
             .await
             .map_err(rpc_error)?;
         Ok(response.seq)
@@ -1188,7 +1261,13 @@ impl PimbleClient {
 
     /// Publish (or remove) a share's scope on the hosted server.
     pub async fn set_scope(&self, store_id: StoreId, scope: Scope, remove: bool) -> Result<()> {
-        self.client.set_scope(SetScopeRequest { store_id, scope, remove }).await.map_err(rpc_error)?;
+        self.set_scope_with_discussions(store_id, scope, remove, Vec::new()).await
+    }
+
+    /// [`PimbleClient::set_scope`] with the scope's discussions and the nodes
+    /// they are on (docs/DISCUSSIONS_CONTRACT.md section 7).
+    pub async fn set_scope_with_discussions(&self, store_id: StoreId, scope: Scope, remove: bool, discussions: Vec<(NodeId, NodeId)>) -> Result<()> {
+        self.client.set_scope(SetScopeRequest { store_id, scope, remove, discussions }).await.map_err(rpc_error)?;
         Ok(())
     }
 

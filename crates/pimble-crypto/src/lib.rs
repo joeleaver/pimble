@@ -47,6 +47,8 @@ const HKDF_INFO_AUTH_KEY: &[u8] = b"auth_key";
 const HKDF_INFO_KEK: &[u8] = b"kek";
 const HKDF_INFO_KEY_ENVELOPE: &[u8] = b"pimble-key-envelope";
 const AAD_ACCOUNT_KEYS: &[u8] = b"pimble-account-keys";
+const HKDF_SALT_PERSONAL: &[u8] = b"pimble-personal-v1";
+const HKDF_INFO_PERSONAL: &[u8] = b"pimble personal";
 
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
@@ -512,6 +514,22 @@ impl BlobHeader {
     }
 }
 
+/// The key of an account's personal document (docs/DISCUSSIONS_CONTRACT.md
+/// section 8): HKDF of the account's encryption secret, so every device that
+/// holds the account keys derives it and nothing else can. Never stored.
+pub fn personal_key(keys: &AccountKeys) -> SymmetricKey {
+    let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT_PERSONAL), &keys.encryption_secret);
+    let mut out = [0u8; 32];
+    hk.expand(HKDF_INFO_PERSONAL, &mut out).expect("32 bytes is a valid HKDF length");
+    SymmetricKey(out)
+}
+
+/// The associated data the personal document's blob is sealed with: the
+/// account it belongs to, so one account's blob never opens as another's.
+pub fn personal_aad(user_id: &str) -> Vec<u8> {
+    format!("pimble-personal/{user_id}").into_bytes()
+}
+
 /// The associated data for a document's blobs.
 pub fn blob_aad(store_id: &str, doc_id: &str) -> Vec<u8> {
     format!("{store_id}/{doc_id}").into_bytes()
@@ -683,6 +701,19 @@ fn normalize_recovery_code(code: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_personal_key_is_the_accounts_and_seals_to_it() {
+        let keys = super::AccountKeys::generate();
+        let again = super::AccountKeys { encryption_secret: keys.encryption_secret, signing_secret: keys.signing_secret };
+        assert_eq!(super::personal_key(&keys).0, super::personal_key(&again).0);
+        let other = super::AccountKeys::generate();
+        assert_ne!(super::personal_key(&keys).0, super::personal_key(&other).0);
+        let aad = super::personal_aad("sub-1");
+        let blob = super::Blob::encrypt(&super::personal_key(&keys), uuid::Uuid::nil(), &aad, b"read state");
+        assert_eq!(super::Blob::decrypt(&super::personal_key(&keys), &aad, &blob).unwrap(), b"read state");
+        assert!(super::Blob::decrypt(&super::personal_key(&keys), &super::personal_aad("sub-2"), &blob).is_err());
+    }
+
     use super::*;
 
     #[test]

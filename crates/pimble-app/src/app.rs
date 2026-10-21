@@ -346,6 +346,7 @@ fn show_in_pane(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
     let parsed = parse_tree_value(&value);
     let mut is_board = false;
     let mut is_sheet = false;
+    let mut is_discussion = false;
     let (title_opt, content_bytes_opt, is_document, sel_ids) = if let Some((s_id, node_id_opt)) = parsed {
         if let Some(n_id) = node_id_opt {
             let result = store.get_node_signal(s_id, n_id).map(|sig| {
@@ -358,13 +359,15 @@ fn show_in_pane(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
                     let is_doc = node.node_type == pimble_core::node_types::DOCUMENT;
                     let board = node.node_type == pimble_core::node_types::BOARD;
                     let sheet = node.node_type == pimble_core::node_types::SHEET;
-                    (label, node.content.clone(), is_doc, board, sheet)
+                    let discussion = node.node_type == pimble_core::node_types::DISCUSSION;
+                    (label, node.content.clone(), is_doc, board, sheet, discussion)
                 })
             });
             match result {
-                Some((label, content, is_doc, board, sheet)) => {
+                Some((label, content, is_doc, board, sheet, discussion)) => {
                     is_board = board;
                     is_sheet = sheet;
+                    is_discussion = discussion;
                     (Some(label), Some(content), is_doc, Some((s_id, n_id)))
                 }
                 None => {
@@ -387,6 +390,7 @@ fn show_in_pane(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
     state.show_editor.set(is_document);
     state.show_board.set(is_board);
     state.show_sheet.set(is_sheet);
+    state.show_discussion.set(is_discussion);
 
     if let Some(title) = title_opt.filter(|_| focused) {
         store.node_title.set(title);
@@ -410,6 +414,13 @@ fn show_in_pane(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
         let content_bytes = content_bytes_opt.unwrap_or_default();
         if let Some((s_id, n_id)) = sel_ids {
             crate::sheets::start(store, pane, s_id, n_id, &content_bytes);
+        }
+    } else if is_discussion {
+        // A discussion (docs/DISCUSSIONS_CONTRACT.md): the pane shows its
+        // thread, the editor stays mounted and hidden.
+        let content_bytes = content_bytes_opt.unwrap_or_default();
+        if let Some((s_id, n_id)) = sel_ids {
+            crate::discussions::start(store, pane, s_id, n_id, &content_bytes);
         }
     } else {
         stop_editing(store, pane);
@@ -782,6 +793,7 @@ fn member_role_text(role: pimble_rpc::MemberRole) -> &'static str {
     match role {
         pimble_rpc::MemberRole::Owner => "owner",
         pimble_rpc::MemberRole::Editor => "can edit",
+        pimble_rpc::MemberRole::Commenter => "can comment",
         pimble_rpc::MemberRole::Reader => "can read",
     }
 }
@@ -1563,6 +1575,24 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     }
                 }
             };
+            // Discussions (docs/DISCUSSIONS_CONTRACT.md): a discussion node of
+            // its own under this row, or one on this row's node.
+            let on_new_discussion = {
+                let nv = nv_ctx.clone();
+                move || {
+                    if let Some((s_id, parent)) = crate::boards::parent_for_row(store, &nv) {
+                        crate::discussions::new_discussion(store, s_id, parent);
+                    }
+                }
+            };
+            let on_start_discussion = {
+                let nv = nv_ctx.clone();
+                move || {
+                    if let Some((s_id, Some(n_id))) = parse_tree_value(&nv) {
+                        crate::discussions::start_on(store, store.focused(), s_id, n_id);
+                    }
+                }
+            };
             let on_new_sheet = {
                 let nv = nv_ctx.clone();
                 move || {
@@ -2003,6 +2033,25 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     {share_badge}
                     {shared_by_note}
 
+                    // How many discussions are on the node
+                    // (docs/DISCUSSIONS_CONTRACT.md section 1): read from
+                    // its signal, so it follows without a tree rebuild.
+                    span {
+                        class: "pimble-tree-discussions",
+                        title: "Discussions on this node",
+                        style: {move || if node_sig.map_or(0, |s| s.with(|n| n.attachments)) > 0 { "" } else { "display: none;" }},
+                        span { class: "pimble-tree-discussions__icon", IconGlyph { name: "messages".to_string() } }
+                        {move || node_sig.map_or(String::new(), |s| s.with(|n| n.attachments.to_string()))}
+                        // Something unread in them (docs/DISCUSSIONS_CONTRACT.md section 8).
+                        span {
+                            class: "pimble-tree-discussions__unread",
+                            style: {move || match parsed {
+                                Some((s_id, Some(n_id))) if crate::discussions::host_unread(store, s_id, n_id) > 0 => "",
+                                _ => "display: none;",
+                            }},
+                        }
+                    }
+
                     // Sync status badge (store roots only, linked stores
                     // only) — reactive per store, no tree rebuild
                     // (docs/SYNC_CONTRACT.md "B: app side"). A store whose
@@ -2120,6 +2169,12 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 disabled: store_menu.new_node,
                                 onclick: on_new_sheet.clone(),
                                 "New Sheet"
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::Messages,
+                                disabled: store_menu.new_node,
+                                onclick: on_new_discussion.clone(),
+                                "New Discussion"
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Photo,
@@ -2352,6 +2407,19 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 disabled: store_menu.new_node,
                                 onclick: on_new_sheet.clone(),
                                 "New Sheet"
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::Messages,
+                                disabled: store_menu.new_node,
+                                onclick: on_new_discussion.clone(),
+                                "New Discussion"
+                            }
+                            DropdownMenuItem {
+                                left_section: TablerIcon::MessagePlus,
+                                // A commenter's too (docs/DISCUSSIONS_CONTRACT.md section 7).
+                                disabled: !access_now.allows_comment(),
+                                onclick: on_start_discussion.clone(),
+                                "Start a Discussion"
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Photo,
@@ -3348,6 +3416,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             store.deleted_modal_pending.set(true);
             store.send(BackendCommand::ListDeleted { store_id });
         };
+        let discussions_modal = crate::discussions::render_unread_modal(__scope, store);
         let deleted_modal = rsx! {
             Modal {
                 opened_fn: move || store.deleted_modal_store.get().is_some(),
@@ -3519,6 +3588,18 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             div {
                                 style: "font-size: 12px; color: var(--rinch-color-dimmed);",
                                 {|| store.cloud_url.get()}
+                            }
+
+                            // docs/DISCUSSIONS_CONTRACT.md section 8: signing in
+                            // is the asking; this turns it off.
+                            Checkbox {
+                                label: "Keep what I've read in step",
+                                checked_fn: move || store.personal_sync.get(),
+                                onchange: move || crate::personal::set_sync_enabled(store, !untracked(|| store.personal_sync.get())),
+                            }
+                            div {
+                                style: "font-size: 12px; color: var(--rinch-color-dimmed);",
+                                "What you have read in discussions, and where you were in each note, sealed so only your devices can open it."
                             }
 
                             Button {
@@ -3846,6 +3927,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             }
             let role = match untracked(|| store.share_modal_invite_role.get()).as_str() {
                 "reader" => pimble_rpc::MemberRole::Reader,
+                "commenter" => pimble_rpc::MemberRole::Commenter,
                 _ => pimble_rpc::MemberRole::Editor,
             };
             store.share_modal_error.set(String::new());
@@ -4102,6 +4184,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                             onchange: move |val: String| store.share_modal_invite_role.set(val),
                                             data: {|| vec![
                                                 SelectOption::new("editor", "Editor"),
+                                                // docs/DISCUSSIONS_CONTRACT.md section 7.
+                                                SelectOption::new("commenter", "Commenter"),
                                                 SelectOption::new("reader", "Reader"),
                                             ]},
                                         }
@@ -4482,6 +4566,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {link_modal}
                 {remove_replica_modal}
                 {deleted_modal}
+                {discussions_modal}
                 {new_store_modal}
                 {import_modal}
                 {mount_picker_modal}
@@ -4512,6 +4597,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {link_modal}
                 {remove_replica_modal}
                 {deleted_modal}
+                {discussions_modal}
                 {new_store_modal}
                 {import_modal}
                 {mount_picker_modal}

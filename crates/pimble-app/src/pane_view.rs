@@ -106,7 +106,7 @@ pub(crate) fn close_focused(store: AppStore) {
 /// The node pane `pane` shows as a document, tracked: its canonical pair.
 fn pane_document(store: AppStore, pane: PaneId) -> Option<(pimble_core::StoreId, pimble_core::NodeId)> {
     let state = store.pane(pane);
-    if !state.show_editor.get() && !state.show_board.get() && !state.show_sheet.get() {
+    if !state.show_editor.get() && !state.show_board.get() && !state.show_sheet.get() && !state.show_discussion.get() {
         return None;
     }
     match parse_tree_value(&state.selected.get()?) {
@@ -138,7 +138,9 @@ fn pane_icon(store: AppStore, pane: PaneId) -> Vec<(String, String)> {
         .map(|sig| sig.with(|n| (n.metadata.icon().map(str::to_string), n.metadata.color().map(str::to_string))))
         .unwrap_or_default();
     let dark = store.dark_mode.get();
-    let fallback = if store.pane(pane).show_sheet.get() {
+    let fallback = if store.pane(pane).show_discussion.get() {
+        TablerIcon::Messages
+    } else if store.pane(pane).show_sheet.get() {
         TablerIcon::Table
     } else if store.pane(pane).show_board.get() && !store.pane(pane).markup.get() {
         TablerIcon::Chalkboard
@@ -169,14 +171,25 @@ fn pane_icon(store: AppStore, pane: PaneId) -> Vec<(String, String)> {
 /// one signal inside another's `with` panics. (`AppStore`'s own helpers nest
 /// freely because they are `untracked`.)
 fn editor_read_only(store: AppStore, pane: PaneId) -> bool {
+    !pane_access(store, pane).allows_write()
+}
+
+/// What this device may change of the pane's document: its store's access,
+/// narrowed by the node's own.
+fn pane_access(store: AppStore, pane: PaneId) -> pimble_core::StoreAccess {
     let state = store.pane(pane);
-    let Some(active) = state.active_edit.get().or_else(|| state.board.get()).or_else(|| state.sheet.get()) else { return false };
+    let Some(active) = state.active_edit.get().or_else(|| state.board.get()).or_else(|| state.sheet.get()).or_else(|| state.discussion.get()) else {
+        return pimble_core::StoreAccess::Full;
+    };
     let sig = store.store_data.with(|map| map.get(&active.store_id).copied());
-    if sig.map_or(false, |sig| sig.with(|s| !s.access.allows_write())) {
-        return true;
-    }
     let node_sig = store.node_data.with(|map| map.get(&(active.store_id, active.node_id)).copied());
-    node_sig.map_or(false, |sig| sig.with(|n| !n.access.allows_write()))
+    let node = node_sig.map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|n| n.access));
+    // A discussion node answers for itself: the store's `Comment` lets its
+    // commenter write it.
+    if !node.allows_write() || node_sig.is_some_and(|sig| sig.with(|n| n.node_type == pimble_core::node_types::DISCUSSION)) {
+        return node;
+    }
+    sig.map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|s| s.access))
 }
 
 /// One pane slot: its title strip, the read-only sentence when it applies,
@@ -190,8 +203,28 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
     // other panes on the same note, and remote deltas arrive via
     // `BackendEvent::RemoteChanges`. There is no manual autosave — the collab
     // session persists edits live (the server applies and relays each delta).
+    // Its children are the editor's overlay slot: the margin markers of the
+    // discussions anchored in the text (docs/DISCUSSIONS_CONTRACT.md section
+    // 6), placed where the editor says their lines are.
+    let markers = crate::discussions::margin::watch(store, pane);
     let editor_view = rsx! {
-        Editor { editor: crate::editor::editor(pane) }
+        Editor {
+            editor: crate::editor::editor(pane),
+            for marker in markers() {
+                div {
+                    key: format!("{:.1} {:?} {} {:?}", marker.top, marker.ids, marker.count, marker.unread),
+                    class: marker.class,
+                    title: marker.title.clone(),
+                    style: marker.style.clone(),
+                    onmousedown: move || press_in_view(),
+                    onclick: {
+                        let (s, n) = (marker.store_id, marker.opens);
+                        move || crate::discussions::open_beside(store, pane, s, n)
+                    },
+                    {marker.label.clone()}
+                }
+            }
+        }
     };
 
     // The editor's own switch follows the read-only judgement
@@ -205,6 +238,12 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
     let board_view = crate::boards::render_board(__scope, store, pane);
     // A sheet node's tables (docs/SHEETS_CONTRACT.md section 1), likewise.
     let sheet_view = crate::sheets::render_sheet(__scope, store, pane);
+    // A discussion node's thread (docs/DISCUSSIONS_CONTRACT.md), likewise.
+    let discussion_view = crate::discussions::render_discussion(__scope, store, pane);
+    // The discussions on the pane's node, under its content: in the text's
+    // scroll for a note, under the view for a board or a sheet.
+    let discussions_in_text = crate::discussions::render_host_panel(__scope, store, pane, true);
+    let discussions_panel = crate::discussions::render_host_panel(__scope, store, pane, false);
     // The floating controls over the picture under the pointer in the text
     // (docs/IMAGE_MARKUP_CONTRACT.md section 5).
     let picture_controls = crate::text_boards::render_controls(__scope, store, pane);
@@ -226,6 +265,7 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
             },
             {editor_view}
             {lost_tables}
+            {discussions_in_text}
         }
     };
     // Where the text is on screen: the controls over a picture stay inside
@@ -265,6 +305,8 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
             // title strip after the keyboard went to the tree).
             onmousedown: move || {
                 PRESS_HEARD.with(|heard| heard.set(true));
+                // A press outside a discussion's message boxes ends typing there.
+                crate::discussions::pane_pressed();
                 focus_pane(store, pane);
                 if !PRESS_IN_VIEW.with(|p| p.replace(false)) {
                     crate::editor::give_keyboard_to(store, pane);
@@ -334,16 +376,19 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
             // reader meets one wording everywhere.
             div {
                 class: "pimble-editor__read-only",
-                style: {move || if (state.show_editor.get() || state.show_board.get() || state.show_sheet.get()) && editor_read_only(store, pane) { "" } else { "display: none;" }},
-                {pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string()}
+                // A discussion says it in its own place, where its message box would be.
+                style: {move || if (state.show_editor.get() || state.show_board.get() || state.show_sheet.get()) && !state.show_discussion.get() && editor_read_only(store, pane) { "" } else { "display: none;" }},
+                {move || pane_access(store, pane).refusal().to_string()}
             }
             {content_wrap}
             {board_view}
             {sheet_view}
+            {discussion_view}
+            {discussions_panel}
             {picture_controls}
             div {
                 class: "pimble-empty-state",
-                style: {move || if state.show_editor.get() || state.show_board.get() || state.show_sheet.get() { "display: none;" } else { "" }},
+                style: {move || if state.show_editor.get() || state.show_board.get() || state.show_sheet.get() || state.show_discussion.get() { "display: none;" } else { "" }},
                 div {
                     class: "pimble-empty-state__icon",
                     {empty_icon}
@@ -455,7 +500,11 @@ pub(crate) fn render_panes(__scope: &mut RenderScope, store: AppStore, hints: &[
         let pane = store.focused_pane.get();
         store.pane(pane).show_editor.get() && !editor_read_only(store, pane)
     };
-    let toolbar = crate::toolbar::render_pimble_toolbar(__scope, store, usable);
+    let commentable = move || {
+        let pane = store.focused_pane.get();
+        store.pane(pane).show_editor.get() && pane_access(store, pane).allows_comment()
+    };
+    let toolbar = crate::toolbar::render_pimble_toolbar(__scope, store, usable, commentable);
     // The board tools take the toolbar's place while the focused pane shows a
     // board (docs/IMAGE_MARKUP_CONTRACT.md section 1).
     let board_toolbar = crate::boards::render_board_toolbar(__scope, store);

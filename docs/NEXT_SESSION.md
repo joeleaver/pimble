@@ -1,5 +1,20 @@
 # Next session: start here
 
+**2026-10-21: discussions waves 1 to 6 built** on branch `discussions` (from `master`
+e7295d5, nothing pushed; rinch at `main` 4c5b5fb in both locks). docs/DISCUSSIONS_CONTRACT.md
+is the reference: "Decisions" are Joe's from today; "Built in wave 1", "Built in waves 2
+to 5" and "Built in wave 6" say what exists, how each was checked and what is missing.
+
+Next, in order (Joe: "do them here sequentially"):
+
+1. Discussions are built through margin markers, on rinch `main` 42e2d2df; nothing from
+   the Rinch session is outstanding. Left: the marker popover, a text context-menu item,
+   a "displaced" marker look, Safari's IME Enter guard, agents as commenters (contract,
+   "Not built" lines). Merging `discussions` into `master` and releasing are Joe's call.
+2. Deploying needs the accounts service's new `PersonalDoc` schema type with it, and the
+   hosted server and every device on this version together (the `commenter` role and the
+   discussion set in `scopes.json`).
+
 **2026-10-20, end of session: sheets waves 1 to 3 built, plus sheet nodes embedded in
 text.** Branch `sheets` (on `master`, 25 commits, nothing pushed); rinch at `main` fc14187
 in both locks. docs/SHEETS_CONTRACT.md is the reference: "Built in wave 2", "Built in

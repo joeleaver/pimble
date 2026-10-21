@@ -292,13 +292,16 @@ impl RelaySide {
 }
 
 /// What this device may change in a store (docs/NODE_DOCUMENT_CONTRACT.md
-/// section 5): an editor edits everything in scope, a reader reads.
+/// section 5): an editor edits everything in scope, a reader reads, a
+/// commenter reads and writes discussions only (docs/DISCUSSIONS_CONTRACT.md
+/// section 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StoreAccess {
     #[default]
     Full,
     Read,
+    Comment,
 }
 
 impl StoreAccess {
@@ -310,11 +313,29 @@ impl StoreAccess {
     /// Whether `message` is the refusal (with or without a `Forbidden: ` in front).
     pub fn refusal_in(message: &str) -> Option<&'static str> {
         let sentence = message.strip_prefix("Forbidden: ").unwrap_or(message);
-        (sentence == Self::READ_ONLY_REFUSAL).then_some(Self::READ_ONLY_REFUSAL)
+        [Self::READ_ONLY_REFUSAL, Self::COMMENT_ONLY_REFUSAL].into_iter().find(|r| *r == sentence)
     }
+
+    /// What a commenter's refused write answers with.
+    pub const COMMENT_ONLY_REFUSAL: &'static str = "You can comment here, not change it.";
 
     pub fn allows_write(self) -> bool {
         matches!(self, StoreAccess::Full)
+    }
+
+    /// The sentence a write refused under this access answers with: a
+    /// commenter's, or a reader's.
+    pub fn refusal(self) -> &'static str {
+        match self {
+            StoreAccess::Comment => Self::COMMENT_ONLY_REFUSAL,
+            _ => Self::READ_ONLY_REFUSAL,
+        }
+    }
+
+    /// Whether discussions may be started and written (a commenter's or an
+    /// editor's).
+    pub fn allows_comment(self) -> bool {
+        matches!(self, StoreAccess::Full | StoreAccess::Comment)
     }
 
     /// Whether this is `Full`, the value an answer leaves out

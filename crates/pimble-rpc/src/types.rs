@@ -93,6 +93,11 @@ pub struct VaultAppendRequest {
     /// only through `vaultSetDocKeys`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keys: Option<VaultDocKeys>,
+    /// For a document the store does not have yet: it is a discussion on
+    /// `parent_id` (an attachment, docs/DISCUSSIONS_CONTRACT.md section 7).
+    /// What lets a commenter create it; it joins the store's discussion set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub discussion: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,6 +260,87 @@ pub struct CreateNodeRequest {
     /// title), written in the same edit.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub custom: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Request to create an attachment of a node (docs/DISCUSSIONS_CONTRACT.md
+/// section 1): a document that names `host_id` instead of a parent. No list
+/// changes, so the host's document is not edited.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateAttachmentRequest {
+    pub store_id: StoreId,
+    pub host_id: NodeId,
+    pub node_type: String,
+    pub title: String,
+    /// A yrs update (base64) merged into the new document in the edit that
+    /// creates it (a discussion's containers, made once).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub custom: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Keep the personal document in step with the signed-in account's other
+/// devices (docs/DISCUSSIONS_CONTRACT.md section 8). `Service`-only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudPersonalSyncRequest {
+    /// This device's copy (base64 of the yrs state).
+    pub state: String,
+    /// `false`: the person turned it off; the hosted copy is emptied, which
+    /// turns it off on their other devices too.
+    pub enabled: bool,
+    /// The person turned it on here: write even over a copy another device
+    /// emptied.
+    #[serde(default)]
+    pub turn_on: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudPersonalSyncResponse {
+    /// The merged copy (base64), to merge into this device's.
+    pub state: String,
+    /// Another device turned it off: this one stops too.
+    #[serde(default)]
+    pub off: bool,
+}
+
+/// Request for every discussion in a store the caller may read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListDiscussionsRequest {
+    pub store_id: StoreId,
+}
+
+/// A store's live discussions (standalone ones and those on a live node),
+/// each with its content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListDiscussionsResponse {
+    pub nodes: Vec<Node>,
+}
+
+/// Who the caller is, as the server judges it: what a client stamps its
+/// writes with when it has no account of its own to read (an agent's
+/// discussion messages, docs/DISCUSSIONS_CONTRACT.md section 3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhoAmIResponse {
+    /// `agent:<id>` for an agent, the account's `sub` for a user; absent for
+    /// the server's own operator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub: Option<String>,
+    /// An agent's name, a user's email; empty for the operator.
+    #[serde(default)]
+    pub name: String,
+}
+
+/// Request for a node's live attachments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListAttachmentsRequest {
+    pub store_id: StoreId,
+    pub node_id: NodeId,
+}
+
+/// A node's live attachments, oldest first, each with its content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListAttachmentsResponse {
+    pub nodes: Vec<Node>,
 }
 
 /// Response after creating a node
@@ -869,6 +955,10 @@ pub enum StoreChangeKind {
     /// again. A client stops showing the ones named; nothing is deleted
     /// before the replica is removed. Derived state: links never forward it.
     SharesEnded { node_ids: Vec<NodeId> },
+    /// An attachment of `host_id` was created, deleted or put back
+    /// (docs/DISCUSSIONS_CONTRACT.md section 1); `live` says which it is now.
+    /// A subscriber refetches the host's attachments.
+    AttachmentChanged { node_id: NodeId, host_id: NodeId, live: bool },
 }
 
 /// Notification that a node's content has changed.
@@ -1070,6 +1160,11 @@ pub struct SetScopeRequest {
     pub scope: Scope,
     #[serde(default)]
     pub remove: bool,
+    /// The discussions in the scope, each with the node it is on
+    /// (docs/DISCUSSIONS_CONTRACT.md section 7): added to the store's
+    /// discussion set, which only grows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discussions: Vec<(NodeId, NodeId)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1088,6 +1183,8 @@ pub struct GetScopesResponse {
 pub enum MemberRole {
     Owner,
     Editor,
+    /// Reads, and writes discussions (docs/DISCUSSIONS_CONTRACT.md section 7).
+    Commenter,
     Reader,
 }
 
@@ -1096,6 +1193,7 @@ impl MemberRole {
         match self {
             MemberRole::Owner => "owner",
             MemberRole::Editor => "editor",
+            MemberRole::Commenter => "commenter",
             MemberRole::Reader => "reader",
         }
     }
@@ -1103,6 +1201,7 @@ impl MemberRole {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "owner" => Some(MemberRole::Owner),
+            "commenter" => Some(MemberRole::Commenter),
             "editor" => Some(MemberRole::Editor),
             "reader" => Some(MemberRole::Reader),
             _ => None,

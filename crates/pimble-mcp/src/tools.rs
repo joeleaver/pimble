@@ -25,6 +25,7 @@ use crate::connection::Connection;
 use crate::nodes::{self, label, Addr};
 use crate::sheets::guide;
 
+mod discussion_tools;
 mod sheet_tools;
 
 const INSTRUCTIONS: &str = "\
@@ -64,7 +65,14 @@ link to a node; get_fields and set_fields read and write a node's own fields (re
 'Note'!field and [@link].field); evaluate \
 runs a formula without saving it. Values go in as a person types them (\"$12.50\", \"yesterday\", \
 a linked row's first-column value); rows are named by id or by their first column's value. \
-Before writing a formula, read sheet_formula_guide (also the resource \"Sheet formulas\").";
+Before writing a formula, read sheet_formula_guide (also the resource \"Sheet formulas\").
+
+Discussions are threaded conversations, on a node (they belong to it and go where it goes) \
+or as discussion nodes of their own. list_discussions lists a node's, read_discussion reads \
+one as a nested list with message ids, start_discussion starts one with its first message, \
+reply answers a message (or posts at the top level), edit_message and delete_message change \
+only your own messages, resolve_discussion closes or reopens one. Messages are Markdown with \
+bold, italic and links; your messages are signed with your agent's name.";
 
 pub struct Pimble {
     conn: Arc<Connection>,
@@ -101,7 +109,7 @@ impl Pimble {
                 Some(id) => format!("agent:{id}"),
                 None => format!("mcp:{}", uuid::Uuid::new_v4()),
             },
-            tool_router: Self::tool_router() + Self::sheet_router(),
+            tool_router: Self::tool_router() + Self::sheet_router() + Self::discussion_router(),
         }
     }
 
@@ -462,6 +470,9 @@ impl Pimble {
             out.push_str(&format!("fields: {}\n", fields.join("; ")));
         }
         out.push_str(&format!("children: {}\n", node.children.len()));
+        if node.attachments > 0 {
+            out.push_str(&format!("discussions: {} (list_discussions lists them)\n", node.attachments));
+        }
         out.push_str(&format!("modified: {}\n", node.metadata.modified_at.to_rfc3339()));
         if node.access == StoreAccess::Read {
             out.push_str("access: read-only\n");
@@ -470,11 +481,16 @@ impl Pimble {
             out.push_str("(a mount: its children are another store's; list_children shows them)\n");
         }
         out.push_str("---\n");
-        let tables = if node.node_type == pimble_core::node_types::SHEET {
+        let tables = if node.node_type == pimble_core::node_types::DISCUSSION {
+            out.push_str("(a discussion: its content is its messages)\n");
+            out.push_str(&Self::discussion_body(&node));
+            None
+        } else if node.node_type == pimble_core::node_types::SHEET {
             out.push_str("(a sheet node: its content is its tables)\n");
             self.tables_of_node(&client, addr, &node).await.map(|t| ("Tables", t))
         } else {
             // A text node's tables are shown where they are in its text.
+            let content = self.inline_discussions(&client, &content).await;
             let (content, lost) = self.tables_in_text(&client, addr, &node, &content).await;
             out.push_str(if content.is_empty() { "(no content)" } else { &content });
             lost.map(|t| ("Tables no longer in the text", t))

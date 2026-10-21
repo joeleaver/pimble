@@ -10,6 +10,7 @@ description = "WASM plugin host and built-in plugins for Pimble"
 pimble-core = { workspace = true }
 pimble-crdt = { workspace = true }
 pimble-sheet = { workspace = true }
+pimble-discussion = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 wasmtime = { workspace = true }

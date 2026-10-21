@@ -119,6 +119,50 @@ pub async fn process_command(
             }
         }
 
+        BackendCommand::CreateAttachment { store_id, host_id, title, init } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            let request = init.request;
+            match c.create_attachment(store_id, host_id, init.node_type, &title, Some(init.content), init.custom.into_iter().collect()).await {
+                Ok(node_id) => Some(BackendEvent::AttachmentCreated { store_id, host_id, node_id, request }),
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::ListAttachments { store_id, node_id } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            match c.list_attachments(store_id, node_id).await {
+                Ok(nodes) => Some(BackendEvent::AttachmentsListed { store_id, node_id, nodes }),
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::SyncPersonal { state, enabled, turn_on } => {
+            let c = client.as_ref()?;
+            match c.cloud_personal_sync(&state, enabled, turn_on).await {
+                Ok((state, off)) => Some(BackendEvent::PersonalSynced { state, off }),
+                Err(e) => {
+                    // Nobody signed in, or the service unreachable: this
+                    // device keeps its copy and tries again later.
+                    tracing::debug!("personal document not synced: {e}");
+                    None
+                }
+            }
+        }
+
+        BackendCommand::ListDiscussions { store_id } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            match c.list_discussions(store_id).await {
+                Ok(nodes) => Some(BackendEvent::DiscussionsListed { store_id, nodes }),
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
         BackendCommand::GetNode { store_id, node_id } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });

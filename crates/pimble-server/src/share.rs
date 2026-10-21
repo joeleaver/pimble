@@ -520,6 +520,7 @@ impl Upkeep {
             | StoreChangeKind::NodeDeleted { .. }
             | StoreChangeKind::NodeMoved { .. }
             | StoreChangeKind::MetadataUpdated { .. }
+            | StoreChangeKind::AttachmentChanged { .. }
             | StoreChangeKind::TreeStructure { .. } => {}
             StoreChangeKind::ContentUpdated { .. }
             | StoreChangeKind::SyncStateChanged { .. }
@@ -648,8 +649,24 @@ impl Upkeep {
                 let grown = grown_scope(&remote, &share.docs);
                 let mut doc_ids: Vec<NodeId> = grown.iter().copied().collect();
                 doc_ids.sort_by_key(|id| id.to_string());
+                // Which of them are discussions, and on what: what a
+                // commenter may write (docs/DISCUSSIONS_CONTRACT.md section 7).
+                let discussions: Vec<(NodeId, NodeId)> = {
+                    let manager = link.handler().store_manager_handle();
+                    let manager = manager.read().await;
+                    match manager.tree(store_id) {
+                        Ok(tree) => doc_ids
+                            .iter()
+                            .filter_map(|id| {
+                                let fields = tree.live_fields(*id).ok()?;
+                                (fields.node_type == pimble_core::node_types::DISCUSSION).then_some((*id, fields.attached_to?))
+                            })
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    }
+                };
                 let scope = Scope { root: share.root, doc_ids };
-                match link.client().set_scope(store_id, scope, false).await {
+                match link.client().set_scope_with_discussions(store_id, scope, false, discussions).await {
                     Ok(()) => {
                         debug!("Share {} of store {}: published a scope of {} document(s)", share.root, store_id, grown.len());
                         self.published.insert(share.root, grown);
@@ -1062,7 +1079,7 @@ impl RpcHandler {
     pub(crate) async fn share_invite(&self, request: CloudShareInviteRequest) -> Result<CloudShareInfoResponse, ErrorObjectOwned> {
         let (store_id, node_id) = (request.store_id, request.node_id);
         if request.role == MemberRole::Owner {
-            return Err(to_rpc_error("A share's members are editors or readers; owner is a role on the whole store."));
+            return Err(to_rpc_error("A share's members are editors, commenters or readers; owner is a role on the whole store."));
         }
         self.require_owners_device(store_id).await?;
         let account = self.signed_in().await?;
