@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use pimble_sheet::doc::{self, Placement, Sheets, SheetsTxn};
 use pimble_sheet::formula::{self, ComputedTable, Engine, ErrorCode, Evaluated, NameError, NameErrorKind, RowRef, Value};
 use pimble_sheet::input;
-use pimble_sheet::{Book, ColumnSnap, ColumnType, Format, NodeRef, SheetsSnap, Stored, TableSnap};
+use pimble_sheet::{Book, ColumnSnap, ColumnType, Format, NodeRef, ResultKey, SheetsSnap, Stored, TableSnap};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -627,7 +627,8 @@ pub fn render_table(work: &Work, table: &str, filter: &Filter) -> Result<String,
         match c.id.as_ref().and_then(|id| t.column(id)) {
             Some(col) => out.push_str(&format!("- {}: {}\n", col.name, type_text(book, work.snap(), Some(&t.id), &col.ty))),
             None => {
-                let renamed = if t.headers.contains_key(&result_index) { ", renamed" } else { "" };
+                let by_key = c.result_key.as_ref().is_some_and(|k| t.headers.contains_key(&ResultKey::Key(k.clone())));
+                let renamed = if by_key || t.headers.contains_key(&ResultKey::Pos(result_index)) { ", renamed" } else { "" };
                 out.push_str(&format!("- {}: from the summary's formula (result column {}{renamed})\n", c.name, result_index + 1));
                 result_index += 1;
             }
@@ -918,12 +919,19 @@ pub fn set_summary(work: &mut Work, table: &str, shown: &str, columns: Option<&[
         Err(e) => return Err(e),
     };
     let stored = formula::to_stored(&*work.book, Some(&id), shown.trim()).map_err(|e| name_error(&e))?;
-    work.write(|t| t.set_source(&id, Some(&stored)))?;
-    let (width, error) = {
+    // What still names a result column by position is moved to its key
+    // against the formula as it is, so the new formula cannot move it.
+    let rekey = formula::rekey_note(&*work.book);
+    work.write(|t| {
+        rekey.apply(t)?;
+        t.set_source(&id, Some(&stored))
+    })?;
+    let (keys, error) = {
         let engine = Engine::new(&*work.book);
         let ct = compute(&engine, work.home(), &id)?;
-        (ct.columns.iter().filter(|c| c.id.is_none()).count(), ct.error.clone())
+        (ct.columns.iter().filter(|c| c.id.is_none()).map(|c| c.result_key.clone()).collect::<Vec<_>>(), ct.error.clone())
     };
+    let width = keys.len();
     if let Some(e) = &error {
         if matches!(e.code, ErrorCode::Name | ErrorCode::Circ | ErrorCode::Error | ErrorCode::Ref | ErrorCode::Spill) {
             return Err(format!("Nothing was saved: the summary's formula gives {} {}{}", e.code.code(), sentence(&e.message), hint(e.code)));
@@ -938,7 +946,15 @@ pub fn set_summary(work: &mut Work, table: &str, shown: &str, columns: Option<&[
         }
         for (i, name) in names.iter().enumerate() {
             let name = doc::column_name_from(name);
-            work.write(|t| t.set_header(&id, i, if name.is_empty() { None } else { Some(&name) }))?;
+            let key = match &keys[i] {
+                Some(k) => ResultKey::Key(k.clone()),
+                None => ResultKey::Pos(i),
+            };
+            work.write(|t| {
+                // A rename by position from before keys gives way to this one.
+                t.set_header(&id, &ResultKey::Pos(i), None)?;
+                t.set_header(&id, &key, if name.is_empty() { None } else { Some(&name) })
+            })?;
         }
     }
     let name = work.table(&id)?.name;

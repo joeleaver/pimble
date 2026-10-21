@@ -30,6 +30,9 @@ base64 = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 default = ["onnx-download"]
 # The same search the app has, whichever process owns the server.

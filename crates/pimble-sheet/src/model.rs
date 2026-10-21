@@ -132,6 +132,39 @@ pub struct RowSnap {
     pub cells: BTreeMap<String, Stored>,
 }
 
+/// Which of a summary's result columns something means (contract section 4).
+///
+/// A result column has no id of its own: it is whatever the summary's formula
+/// gives. Its key is the name the formula gives it before any rename (`at` for
+/// `Expenses[at]`; `at 2` for a second `at`; `#3` for an unnamed fourth), so a
+/// reshape that keeps a column (`GROUPBY(at, …)` becoming
+/// `GROUPBY(HSTACK(date, at), …)`) keeps everything that reads or renames it.
+/// `Pos` is how formulas and headers written before keys name one, by
+/// position; it still works, and an edit of the summary's formula rewrites the
+/// note's own uses to keys first.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ResultKey {
+    Pos(usize),
+    Key(String),
+}
+
+impl ResultKey {
+    /// The key of a `headers` entry as stored: `k:<key>`, or a position.
+    pub fn from_stored(s: &str) -> Option<ResultKey> {
+        match s.strip_prefix("k:") {
+            Some(k) => Some(ResultKey::Key(k.to_string())),
+            None => s.parse::<usize>().ok().map(ResultKey::Pos),
+        }
+    }
+
+    pub fn to_stored(&self) -> String {
+        match self {
+            ResultKey::Pos(i) => i.to_string(),
+            ResultKey::Key(k) => format!("k:{k}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableSnap {
     pub id: String,
@@ -139,8 +172,9 @@ pub struct TableSnap {
     pub order: String,
     /// A summary's formula, stored form; `None` for a plain table.
     pub source: Option<String>,
-    /// A summary's renamed result columns, by position.
-    pub headers: BTreeMap<usize, String>,
+    /// A summary's renamed result columns, by key (or, written before keys,
+    /// by position).
+    pub headers: BTreeMap<ResultKey, String>,
     /// In column order (then id).
     pub columns: Vec<ColumnSnap>,
     /// In row order (then id). A summary has none.

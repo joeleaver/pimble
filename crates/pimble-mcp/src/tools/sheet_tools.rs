@@ -520,7 +520,9 @@ impl Pimble {
             if snap.tables.is_empty() {
                 continue;
             }
-            let book = McpBook::new(node_ref(*addr), snap.clone(), McpBook::local_today());
+            // The same book get_table computes with: the notes and fields its
+            // formulas read, not this node's tables alone.
+            let book = load_book(&client, *addr, node, &[]).await;
             out.push_str(&format!("{} {path} ({}):\n", place_of(node), addr.link()));
             for t in &snap.tables {
                 out.push_str(&format!("- {}\n", ops::table_summary(&book, &snap, t)));
@@ -998,3 +1000,146 @@ fn write_formulas(t: &mut pimble_sheet::doc::SheetsTxn<'_, '_>, before: &pimble_
 
 /// The embed attribute naming a table in a text node's text.
 const SHEET_ATTR: &str = "data-sheet";
+
+/// The tools against a real server on a scratch store, called as an LLM
+/// calls them.
+#[cfg(test)]
+mod server_tests {
+    use std::sync::Arc;
+
+    use pimble_client::PimbleClient;
+    use pimble_server::{PimbleServer, ServerConfig};
+    use rmcp::handler::server::wrapper::Parameters;
+    use serde::de::DeserializeOwned;
+    use serde_json::json;
+
+    use super::super::Pimble;
+    use crate::connection::Connection;
+
+    fn p<T: DeserializeOwned>(v: serde_json::Value) -> Parameters<T> {
+        Parameters(serde_json::from_value(v).expect("params"))
+    }
+
+    async fn start() -> (PimbleServer, Pimble, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = PimbleServer::with_config(ServerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            replicas_dir: Some(dir.path().join("replicas")),
+            ..Default::default()
+        });
+        server.start().await.expect("server starts");
+        let client = PimbleClient::connect(format!("http://{}", server.addr())).await.expect("client connects");
+        client.create_store(dir.path().join("trips.pimble"), "Trips").await.expect("store");
+        let pimble = Pimble::new(Arc::new(Connection::with_client(client)));
+        (server, pimble, dir)
+    }
+
+    /// The Spreadsheet session's repro: a summary whose grouping reads a
+    /// formula column that reads, through a link, a date computed from the
+    /// note's own field. get_table computed it; list_tables said "its formula
+    /// fails" because it computed with this node's tables alone.
+    #[tokio::test]
+    async fn list_tables_computes_as_get_table_does() {
+        let (mut server, pimble, _dir) = start().await;
+        pimble.create_node(p(json!({ "parent": "Trips", "title": "Trip" }))).await.unwrap();
+        pimble.set_fields(p(json!({ "node": "Trips/Trip", "fields": { "trip_start": "2026-10-01" } }))).await.unwrap();
+        pimble
+            .create_table(p(json!({
+                "node": "Trips/Trip", "name": "Itinerary",
+                "columns": [
+                    { "name": "stop", "type": "text" },
+                    { "name": "day", "type": "number" },
+                    { "name": "date", "formula": "='Trip'!trip_start+[@day]-1" },
+                ],
+                "rows": [ { "stop": "Moab", "day": 1 }, { "stop": "Zion", "day": 2 } ],
+            })))
+            .await
+            .unwrap();
+        pimble
+            .create_table(p(json!({
+                "node": "Trips/Trip", "name": "Expenses",
+                "columns": [
+                    { "name": "at", "type": "link", "target": "Itinerary" },
+                    { "name": "amount", "type": "money" },
+                    { "name": "date", "formula": "=[@at].date" },
+                ],
+                "rows": [ { "at": "Moab", "amount": 10 }, { "at": "Zion", "amount": 20 }, { "at": "Moab", "amount": 5 } ],
+            })))
+            .await
+            .unwrap();
+        pimble
+            .set_summary(p(json!({
+                "node": "Trips/Trip", "table": "Spend_by_Stop",
+                "formula": "=GROUPBY(HSTACK(Expenses[date],Expenses[at]),Expenses[amount],SUM)",
+            })))
+            .await
+            .unwrap();
+
+        let table = pimble.get_table(p(json!({ "node": "Trips/Trip", "table": "Spend_by_Stop" }))).await.unwrap();
+        assert!(!table.contains("fails"), "{table}");
+        assert!(table.contains("Moab") && table.contains("15"), "{table}");
+        let listed = pimble.list_tables(p(json!({ "node": "Trips/Trip" }))).await.unwrap();
+        assert!(!listed.contains("fails"), "{listed}");
+        assert!(listed.contains("Spend_by_Stop"), "{listed}");
+        let by_store = pimble.list_tables(p(json!({ "store": "Trips" }))).await.unwrap();
+        assert!(!by_store.contains("fails"), "{by_store}");
+        let _ = server.stop().await;
+    }
+
+    /// The other repro: reshaping a summary keeps its own columns on the
+    /// result columns they read (contract section 4, result column keys).
+    #[tokio::test]
+    async fn set_summary_reshape_keeps_own_columns() {
+        let (mut server, pimble, _dir) = start().await;
+        pimble.create_node(p(json!({ "parent": "Trips", "title": "Trip" }))).await.unwrap();
+        pimble
+            .create_table(p(json!({
+                "node": "Trips/Trip", "name": "Itinerary",
+                "columns": [ { "name": "stop", "type": "text" }, { "name": "day total", "type": "number" } ],
+                "rows": [ { "stop": "Moab", "day total": 100 }, { "stop": "Zion", "day total": 200 } ],
+            })))
+            .await
+            .unwrap();
+        pimble
+            .create_table(p(json!({
+                "node": "Trips/Trip", "name": "Expenses",
+                "columns": [
+                    { "name": "at", "type": "link", "target": "Itinerary" },
+                    { "name": "date", "type": "date" },
+                    { "name": "amount", "type": "money" },
+                ],
+                "rows": [
+                    { "at": "Moab", "date": "2026-10-01", "amount": 10 },
+                    { "at": "Zion", "date": "2026-10-02", "amount": 20 },
+                ],
+            })))
+            .await
+            .unwrap();
+        pimble
+            .set_summary(p(json!({
+                "node": "Trips/Trip", "table": "Spend",
+                "formula": "=GROUPBY(Expenses[at],Expenses[amount],SUM)",
+                "column_names": ["stop", "extras"],
+            })))
+            .await
+            .unwrap();
+        pimble
+            .add_column(p(json!({ "node": "Trips/Trip", "table": "Spend", "name": "budget", "formula": "=[@stop].[day total]" })))
+            .await
+            .unwrap();
+        let reshaped = pimble
+            .set_summary(p(json!({
+                "node": "Trips/Trip", "table": "Spend",
+                "formula": "=GROUPBY(HSTACK(Expenses[date],Expenses[at]),Expenses[amount],SUM)",
+                "column_names": ["date", "stop", "extras"],
+            })))
+            .await
+            .unwrap();
+        assert!(!reshaped.contains("#VALUE!"), "{reshaped}");
+        let table = pimble.get_table(p(json!({ "node": "Trips/Trip", "table": "Spend" }))).await.unwrap();
+        assert!(table.contains("=[@stop].[day total]"), "{table}");
+        assert!(!table.contains("#VALUE!") && !table.contains("#REF!"), "{table}");
+        assert!(table.contains("200"), "{table}");
+        let _ = server.stop().await;
+    }
+}

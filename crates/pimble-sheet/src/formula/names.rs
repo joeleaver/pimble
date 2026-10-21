@@ -6,8 +6,9 @@
 //! a row link whose table is known. A reference to this note's own tables
 //! carries no note token, so tables copied together keep pointing at each
 //! other. A summary's result columns have no ids, so they are stored by
-//! position in the result, `{r:<index>}`, before `headers` renames them. A
-//! node's fields and links whose table cannot be known before computing
+//! key, `{rk:<key>}` (the name the formula gives the column before `headers`
+//! renames it, [`crate::ResultKey`]); formulas from before keys name one by
+//! position, `{r:<index>}`, and still read. A node's fields and links whose table cannot be known before computing
 //! keep their names.
 //!
 //! Both directions rewrite only the spans of names, so the rest of the
@@ -304,7 +305,7 @@ impl<'e, 'b> Walk<'e, 'b> {
                 let n = norm(n);
                 t.columns.iter().find(|c| norm(&c.name) == n)
             }
-            NameRef::Pos(_) => None,
+            NameRef::Pos(_) | NameRef::Key(_) => None,
             NameRef::Dead => return None,
         };
         if let Some(c) = own {
@@ -489,9 +490,9 @@ impl<'e, 'b> Walk<'e, 'b> {
                             let Ok(cols) = self.en.table_cols(&tt.node, t) else {
                                 return Ok(());
                             };
-                            return match self.en.find_col(&cols, &m.name).map(|i| cols[i].src) {
-                                Some(ColSrc::Result(j)) => {
-                                    self.edit(m.span.clone(), format!("{{r:{j}}}"));
+                            return match self.en.find_col(&cols, &m.name).map(|i| (cols[i].src, cols[i].key.clone())) {
+                                Some((ColSrc::Result(j), key)) => {
+                                    self.edit(m.span.clone(), result_token(j, key.as_deref()));
                                     Ok(())
                                 }
                                 _ => {
@@ -638,7 +639,7 @@ impl<'e, 'b> Walk<'e, 'b> {
                 }
             },
             Some(part) => match &part.name {
-                NameRef::Dead | NameRef::Pos(_) => return Ok(()),
+                NameRef::Dead | NameRef::Pos(_) | NameRef::Key(_) => return Ok(()),
                 NameRef::Id(id) => match snap.table(id) {
                     Some(t) => t,
                     None => {
@@ -779,7 +780,7 @@ impl<'e, 'b> Walk<'e, 'b> {
                                         } else {
                                             p.span.clone()
                                         };
-                                        self.edit(span, format!("{{r:{j}}}"));
+                                        self.edit(span, result_token(j, cols[i].key.as_deref()));
                                     }
                                 }
                                 continue;
@@ -855,7 +856,7 @@ impl<'e, 'b> Walk<'e, 'b> {
                         }
                     }
                 }
-                if let NameRef::Pos(i) = &m.name {
+                if matches!(&m.name, NameRef::Pos(_) | NameRef::Key(_)) {
                     // Only a summary row's result columns; when the summary
                     // can't be worked out the token stays as it is.
                     let tt = self.target(o, &self.node.clone(), self.table, &mut env.clone(), 0);
@@ -865,7 +866,7 @@ impl<'e, 'b> Walk<'e, 'b> {
                         let cols = self.en.table_cols(&tt.node, t).ok()?;
                         Some(
                             self.en
-                                .find_col(&cols, &NameRef::Pos(*i))
+                                .find_col(&cols, &m.name)
                                 .map(|k| cols[k].meta.name.clone()),
                         )
                     });
@@ -938,7 +939,7 @@ impl<'e, 'b> Walk<'e, 'b> {
                 }
             },
             Some(part) => match &part.name {
-                NameRef::Dead | NameRef::Pos(_) => {
+                NameRef::Dead | NameRef::Pos(_) | NameRef::Key(_) => {
                     self.edits.extend(local);
                     return;
                 }
@@ -963,12 +964,12 @@ impl<'e, 'b> Walk<'e, 'b> {
         };
         if let Some(spec) = &r.spec {
             for p in pieces(spec) {
-                if let NameRef::Pos(i) = &p.name {
+                if matches!(&p.name, NameRef::Pos(_) | NameRef::Key(_)) {
                     // When the summary fails its result is unknown: keep the token.
                     let Ok(cols) = self.en.table_cols(&node, table) else {
                         continue;
                     };
-                    match self.en.find_col(&cols, &NameRef::Pos(*i)) {
+                    match self.en.find_col(&cols, &p.name) {
                         Some(k) => {
                             let text = col_text(&cols[k].meta.name, spec, p);
                             local.push((p.span.clone(), text));
@@ -1002,5 +1003,14 @@ fn pieces(spec: &Spec) -> Vec<&ColPiece> {
         Cols::All => vec![],
         Cols::One(p) => vec![p],
         Cols::Range(a, b) => vec![a, b],
+    }
+}
+
+/// How a stored formula names a summary's result column: by its key, or by
+/// position when it has none to give.
+fn result_token(position: usize, key: Option<&str>) -> String {
+    match key {
+        Some(k) => super::parser::key_token(k),
+        None => format!("{{r:{position}}}"),
     }
 }

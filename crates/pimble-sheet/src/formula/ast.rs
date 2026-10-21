@@ -74,8 +74,12 @@ pub enum NameRef {
     Name(String),
     Id(String),
     /// A summary's result column by its 0-based position in the result
-    /// (`{r:<index>}`), before `headers` renames it.
+    /// (`{r:<index>}`), before `headers` renames it: how formulas written
+    /// before result columns had keys name one.
     Pos(usize),
+    /// A summary's result column by its key (`{rk:<key>}`,
+    /// [`crate::ResultKey`]).
+    Key(String),
     Dead,
 }
 

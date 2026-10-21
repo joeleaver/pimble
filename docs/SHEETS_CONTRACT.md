@@ -79,7 +79,7 @@ data["sheet:<table id>"]: Map           one key of the node's `data` root per ta
   name:    String           unique within the note when set (section 5)
   order:   String           fractional; a sheet node's stacking order
   source:  String | absent  a summary's formula (section 4); absent for a plain table
-  headers: Map<int, String> a summary's renamed result columns
+  headers: Map<"k:<key>" | "<index>", String>  a summary's renamed result columns, by key (section 4)
   columns: Map<column id, Map>
     name, type, order (fractional),
     target  (link to a row: the table id),
@@ -151,6 +151,29 @@ ByMonth = GROUPBY(HSTACK(TEXT(Transactions[date],"yyyy-mm"), Transactions[catego
           columns month, category, spent; own columns budget = [@category].[monthly budget], left = [@budget]-[@spent]
 ```
 
+**A result column's key** (Joe, 2026-10-20). A result column has no id: it is whatever
+the formula gives. So it is known by its **key**, the name the formula gives it before any
+rename: `category` for `Transactions[category]`, `amount` for a `GROUPBY`'s values, `name 2`
+for a second column of one name, `#<position>` for one with no name. Stored formulas name
+a result column by key (`{rk:<key>}`, section 6) and `headers` rename it by key
+(`k:<key>`). Reshaping the formula keeps every column it still gives:
+`GROUPBY(Expenses[at], …)` becoming `GROUPBY(HSTACK(Expenses[date], Expenses[at]), …)`
+leaves an own column `=[@stop].[day total]` (with `stop` the rename of `at`) reading the
+stop. A reference to a column the new formula no longer gives is `#REF!` ("This formula
+reads the result column that came from "amount", and ByMonth's formula no longer gives
+one"), and it comes back if the formula gives the column again.
+
+- **Before keys** (wave 1) result columns were stored by position (`{r:<index>}`,
+  `headers` keyed `"<index>"`), and a reshape silently pointed them at whatever column
+  took that place. Those still read by position. Before any change to a summary's formula
+  (the app's formula box, the MCP's `set_summary`) the note's own formulas and headers
+  that still use positions are re-stored by key against the formula as it is
+  (`formula::rekey_note`), in the same edit. Another note's position references are moved
+  only when that note's own summary formula changes or the formula is edited; until then
+  they read by position.
+- An app from before keys reads `{rk:…}` as an unknown token: every device moves to this
+  version together.
+
 ## 5. Names, and what is unique
 
 - **A table name** is unique within its note when it is set: a second "Expenses" in the
@@ -180,7 +203,7 @@ formulas, or at least google-sheet level"), as it works in an Excel Table:
   - lookups: `XLOOKUP`, `VLOOKUP`, `INDEX`, `MATCH`, `XMATCH`
   - dynamic arrays: `FILTER`, `SORT`, `UNIQUE`, `HSTACK`, `GROUPBY`
   - text: `TEXT` with Excel format codes, `TEXTJOIN`, `CONCAT`, `LEFT`, `RIGHT`, `MID`,
-    `LEN`, `UPPER`, `LOWER`, `TRIM`, `VALUE`
+    `LEN`, `UPPER`, `LOWER`, `TRIM`, `VALUE`, `REPT` (2026-10-20: text bars, `REPT("▇", n)`)
   - dates: `TODAY`, `DATE`, `YEAR`, `MONTH`, `DAY`, `WEEKDAY`, `EOMONTH`, `EDATE`, `DAYS`
   - numbers: `ROUND`, `ROUNDUP`, `ROUNDDOWN`, `ABS`, `INT`, `MOD`, `SQRT`, `POWER`
 - **Dates are Excel serial numbers**, so `TODAY()-7`, `">"&EOMONTH(TODAY(),-1)` and
@@ -210,7 +233,10 @@ formula opens the links picker, and choosing a note inserts its `'Title'!`.
 name replaced by an id token: the note's `(store, node)`, the table's id and the column's
 id. A same-note reference is stored as "this note", so tables copied together keep
 pointing at each other. The formula editor turns ids into the current names to show, and
-names into ids on commit. The exact token encoding is wave 1's to settle. As a result:
+names into ids on commit. Tokens: `{n:<store>/<node>}!` a note, `{t:<id>}` a table,
+`{c:<id>}` a column, `{rk:<key>}` a summary's result column by key (section 4; characters
+that could end the token are written `%XX`), and `{r:<index>}` one by position, from
+before keys. As a result:
 
 - Renaming or moving a note, table or column never edits any formula; everyone just sees
   the new name. A tombstoned note is followed through `became`, as links are.

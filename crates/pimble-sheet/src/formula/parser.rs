@@ -108,6 +108,8 @@ enum Tok {
     ColId(String),
     /// `{r:<index>}` outside brackets: a summary's result column after a dot.
     ColPos(usize),
+    /// `{rk:<key>}` outside brackets: the same, by key.
+    ColKey(String),
     Op(Op),
     End,
 }
@@ -426,6 +428,10 @@ impl<'s> Lexer<'s> {
                 self.pos = end;
                 self.push(Tok::ColPos(i), start);
             }
+            "rk" => {
+                self.pos = end;
+                self.push(Tok::ColKey(decode_key(id)), start);
+            }
             _ => {
                 return Err(ParseError::new(
                     "Lists written in braces, like {1,2,3}, aren't supported yet",
@@ -566,6 +572,11 @@ fn piece(src: &str, start: usize, end: usize, outer: Span, bracketed: bool) -> C
         .and_then(|s| s.trim().parse::<usize>().ok())
     {
         NameRef::Pos(i)
+    } else if let Some(k) = trimmed
+        .strip_prefix("{rk:")
+        .and_then(|s| s.strip_suffix('}'))
+    {
+        NameRef::Key(decode_key(k))
     } else {
         NameRef::Name(text)
     };
@@ -882,6 +893,7 @@ impl<'s> Parser<'s> {
                     Tok::Bool(b) => NameRef::Name(if *b { "TRUE" } else { "FALSE" }.to_string()),
                     Tok::ColId(id) => NameRef::Id(id.clone()),
                     Tok::ColPos(i) => NameRef::Pos(*i),
+                    Tok::ColKey(k) => NameRef::Key(k.clone()),
                     Tok::Bracket(spec) if spec.single && !spec.this_row => match &spec.cols {
                         Cols::One(p) => p.name.clone(),
                         _ => unreachable_member(&t.span)?,
@@ -1104,5 +1116,73 @@ mod tests {
         assert!(parse(&deep).is_err());
         let long = vec!["1"; 5000].join("+");
         assert!(parse(&long).is_err());
+    }
+}
+
+/// A result column's key as it sits in a stored formula, `{rk:<key>}`: every
+/// character that could end the token or the brackets around it (and `%`) is
+/// written `%XX`, so any column name round-trips.
+pub(crate) fn key_token(key: &str) -> String {
+    let mut out = String::from("{rk:");
+    for c in key.chars() {
+        if c.is_alphanumeric() || c == ' ' || c == '_' || c == '-' || c == '.' {
+            out.push(c);
+        } else {
+            let mut buf = [0u8; 4];
+            for b in c.encode_utf8(&mut buf).bytes() {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+    }
+    out.push('}');
+    out
+}
+
+/// The key a `{rk:…}` token's body names.
+fn decode_key(body: &str) -> String {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let bytes = body.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(hi * 16 + lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod key_token_tests {
+    use super::*;
+
+    fn key_of(formula: &str) -> NameRef {
+        let e = parse(formula).unwrap();
+        let ExprKind::Ref(r) = &e.kind else { panic!("{e:?}") };
+        let spec = r.spec.as_ref().unwrap();
+        let Cols::One(p) = &spec.cols else { panic!() };
+        p.name.clone()
+    }
+
+    #[test]
+    fn any_name_round_trips_through_a_key_token() {
+        for k in ["at", "day total", "a]b", "x}y", "50%", "it's", "café ☕", "{rk:x}", "#3", "a,b:c"] {
+            let token = key_token(k);
+            assert!(!token[4..token.len() - 1].contains(['}', '{', ']', '[', '\'']), "{token}");
+            assert_eq!(key_of(&format!("=[@{token}]")), NameRef::Key(k.to_string()), "{k}");
+        }
+    }
+
+    #[test]
+    fn a_key_token_after_a_dot_is_a_key() {
+        let e = parse(&format!("=[@{{c:x}}].{}", key_token("day total"))).unwrap();
+        let ExprKind::Member(_, m) = &e.kind else { panic!("{e:?}") };
+        assert_eq!(m.name, NameRef::Key("day total".into()));
     }
 }

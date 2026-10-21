@@ -32,6 +32,7 @@ mod functions;
 mod names;
 mod parser;
 pub mod rehome;
+mod rekey;
 mod value;
 
 pub use coerce::general as general_number;
@@ -40,6 +41,7 @@ pub use format::{format_number, hours, money, round_half_away, short_date, text_
 pub use functions::CATEGORIES as FUNCTIONS;
 pub use names::{note_text, note_token, to_shown, to_stored, Candidate, NameError, NameErrorKind};
 pub use parser::{parse, ParseError};
+pub use rekey::{rekey_note, Rekey};
 pub use value::{
     ColMeta, ErrorCode, Evaluated, FormulaError, ResultTable, RowRef, TableAddr, Value,
 };
