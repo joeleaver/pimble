@@ -117,8 +117,10 @@ only remote ones and says why):
      "A remote client (ChatGPT, claude.ai)". This only decides the setup step; the list
      of apps Pimble configures itself grows as their config formats are confirmed.
    - **What it can reach**: the explorer's own tree with a three-way control per row:
-     none, read, edit. A row's choice covers its subtree unless a row inside says
-     otherwise (a project readable, its Drafts folder editable). Stores are rows too.
+     none, read, edit. A row's choice covers its subtree, and a row inside can only
+     widen it (a project readable, its Drafts folder editable): an agent reaches the
+     union of its grants, judged as a share's member is, so "edit the project except
+     Drafts" is made by granting the parts, not by subtracting one. Stores are rows too.
      Nothing is checked to start with.
    - **Setup**: for an app Pimble knows, "Add to Claude Desktop" writes its config
      entry (section 6) and says to restart that app; for any other client, the JSON to
@@ -166,3 +168,68 @@ snippet instead. Removing an agent removes its entry the same way.
 5. Not asked, the proposal stands until Joe says otherwise: Pimble writes the config of
    the apps it knows (Claude Desktop, Claude Code, Cursor) with a backup, and offers the
    snippet for everything else.
+
+## Built in wave 1 (server), 2026-10-20
+
+- `crates/pimble-server/src/agents.rs`: `AgentRegistry` (`agents.json`, 0600, keys
+  kept as SHA-256 only, `pmbl_agent_<id>_<secret>`), `normalize` (one grant per root,
+  the higher role winning; a whole-store reader widened by roots inside becomes its
+  root node), and `AgentConnection`.
+- An agent is a `Principal::User` with `sub = agent:<id>` and its grants, so `Reach`,
+  `authorize`, search filtering and the `Service`-only lifecycle RPCs judge it as they
+  judge a share's member; `present_store_to` keeps the store's real name for an agent.
+- The HTTP edge checks a credential shaped like an agent key before anything else (the
+  tokenless embedded server would otherwise make it `Service`); an unknown key is 401.
+- **Re-judged on every call**: the connection carries the agent's id, and
+  `principal_of` rebuilds its principal from the registry, so removing or narrowing an
+  agent holds an open connection to it on its next call.
+- Agents load on a loopback server with no JWT verifier (the app's own) or where
+  `ServerConfig::agents_path` says; never on a relay face or a hosted server.
+- RPCs `listAgents`, `createAgent` (answers the key once), `updateAgent`, `removeAgent`,
+  all `Service`-only; grants naming a store not open here or a node not in it are
+  refused with a sentence. `last_used_at` is written at most once a minute.
+- Tests: `tests/agents.rs` (reach through reads, writes, children, search, lifecycle;
+  narrowing and removal on an open connection; grant checks), unit tests in the module.
+
+## Built in wave 2 (pimble-mcp), 2026-10-20
+
+- `PIMBLE_AGENT_KEY` in the client's environment (the `--agent` flag the proposal named
+  is not needed: the key names its agent). Without one every tool answers
+  `connection::NOT_AN_AGENT`, and no server is started.
+- With one, `pimble-mcp` joins or starts the local server as before (its `Service`
+  connection only opens the saved store list when it starts the server), then makes
+  every tool call over a second connection that presents the key. A removed agent gets
+  "This agent was removed in Pimble, or its key is wrong: set it up again in Account >
+  AI Agents...". Edits carry `agent:<id>`.
+- Paths: a store shown with one root as its own (an agent of one subtree) is walked from
+  that root, as listings and search name its nodes (`nodes::resolve_path`).
+- `pimble-cli agents`, `create-agent <name> <store>[/<node>]=<reader|editor>...`,
+  `remove-agent <id>`; `docs/DEPLOY.md`'s client section now sets up an agent.
+- Walked through over stdio (`scripts/mcp/drive.py`) on a scratch copy of the family
+  store: no key, the sentence; an agent reading MEDICAL lists and reads only MEDICAL,
+  finds nothing in TAXES ("Turbo Tax"), is refused TAXES by link ("no grant for this
+  document") and a write under MEDICAL ("You can read this, not change it.").
+
+## Built in wave 3 (the app), 2026-10-20
+
+- Account > "AI Agents..." (`crates/pimble-app/src/agents.rs`, desktop only): the list
+  (name, reach in a line, last used, Edit, Remove), New Agent (name, which app, the
+  picker), and a made agent's page (its key once, "Add to <app>", the snippet, Copy
+  Setup). Commands `ListAgents`/`CreateAgent`/`UpdateAgent`/`RemoveAgent`, events
+  `AgentsListed`/`AgentCreated`/`AgentsError` (shared `commands.rs`).
+- The picker is the open stores' tree, loaded as rows open, with None / Read / Edit per
+  row; a row nothing is chosen on says what it inherits ("reads, from above"). A store's
+  root node stands for the whole store.
+- "Add to Claude Desktop / Claude Code / Cursor" merges one `mcpServers.pimble-<name>`
+  entry (`command` the `pimble-mcp` beside the app, `env.PIMBLE_AGENT_KEY`; Claude Code's
+  with `type: stdio`), keeps the old file as `.pimble-backup`, writes by rename, and
+  leaves a file it cannot parse alone (`write_entry`, tested).
+- Walked through on an isolated app (port 7491, scratch config, fake `HOME`): an agent
+  made with MEDICAL read and one folder inside it edited; the scratch Claude Desktop
+  config got the entry; Edit loads the grants back; Remove takes it off the server.
+
+**Not built yet, or known gaps:**
+- View > "Show Agent Access" markers in the explorer.
+- Removing an agent does not take its entry out of the app's config (the key stops
+  working at once; the stale entry answers with the removed-agent sentence).
+- The browser shows no Agents window; it gets one with remote agents (wave 4).

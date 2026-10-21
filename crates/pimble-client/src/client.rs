@@ -14,6 +14,7 @@ use jsonrpsee::ws_client::{HeaderMap, HeaderValue, WsClientBuilder};
 use pimble_core::{AuthMethod, BlobId, BlobUrl, Node, NodeId, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState, Workspace};
 use pimble_core::MountRef;
 use pimble_rpc::{
+    AgentGrant, AgentInfo, CreateAgentRequest, CreateAgentResponse, RemoveAgentRequest, UpdateAgentRequest,
     AddRemoteStoreRequest, ApplyEditRequest, CloseStoreRequest, CloudAddHostedStoreRequest,
     CloudHostStoreRequest, CloudHostedStoreInfo, CloudListHostedStoresResponse, CloudRelayStoreRequest, CloudShareInfoResponse, CloudShareInviteRequest, CloudShareNodeRequest, CloudShareRef,
     CloudShareRemoveMemberRequest, CloudSignInRequest, CloudStatusResponse, CloudStopRelayingRequest, DeleteVaultStoreRequest, GetScopesRequest, MemberRole, Scope,
@@ -1296,6 +1297,27 @@ impl PimbleClient {
     /// Forget the signed-in account.
     pub async fn cloud_sign_out(&self) -> Result<()> {
         self.client.cloud_sign_out().await.map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// This device's AI agents (docs/AGENTS_CONTRACT.md), never their keys.
+    pub async fn list_agents(&self) -> Result<Vec<AgentInfo>> {
+        Ok(self.client.list_agents().await.map_err(rpc_error)?.agents)
+    }
+
+    /// A new agent; the answer carries its key, shown this once.
+    pub async fn create_agent(&self, name: &str, grants: Vec<AgentGrant>) -> Result<CreateAgentResponse> {
+        self.client.create_agent(CreateAgentRequest { name: name.to_string(), grants }).await.map_err(rpc_error)
+    }
+
+    /// Rename an agent or replace its grants.
+    pub async fn update_agent(&self, id: &str, name: Option<String>, grants: Option<Vec<AgentGrant>>) -> Result<AgentInfo> {
+        self.client.update_agent(UpdateAgentRequest { id: id.to_string(), name, grants }).await.map_err(rpc_error)
+    }
+
+    /// Remove an agent: its key stops working.
+    pub async fn remove_agent(&self, id: &str) -> Result<()> {
+        self.client.remove_agent(RemoveAgentRequest { id: id.to_string() }).await.map_err(rpc_error)?;
         Ok(())
     }
 

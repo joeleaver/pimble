@@ -602,6 +602,30 @@ pub async fn process_command(
         // Pimble Cloud account (docs/DESKTOP_ACCOUNT_CONTRACT.md). Every
         // failure is a `CloudError` naming its operation, never the generic
         // `Error`, so the modal that asked gets it (decision 3).
+        BackendCommand::ListAgents | BackendCommand::CreateAgent { .. } | BackendCommand::UpdateAgent { .. } | BackendCommand::RemoveAgent { .. } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::AgentsError { message: "Not connected to Pimble's server.".into() });
+            };
+            let done = match cmd {
+                BackendCommand::CreateAgent { name, grants } => {
+                    return Some(match c.create_agent(&name, grants).await {
+                        Ok(made) => BackendEvent::AgentCreated { agent: made.agent, key: made.key },
+                        Err(e) => BackendEvent::AgentsError { message: agent_error(e) },
+                    });
+                }
+                BackendCommand::UpdateAgent { id, name, grants } => c.update_agent(&id, Some(name), Some(grants)).await.map(|_| ()),
+                BackendCommand::RemoveAgent { id } => c.remove_agent(&id).await,
+                _ => Ok(()),
+            };
+            if let Err(e) = done {
+                return Some(BackendEvent::AgentsError { message: agent_error(e) });
+            }
+            match c.list_agents().await {
+                Ok(agents) => Some(BackendEvent::AgentsListed { agents }),
+                Err(e) => Some(BackendEvent::AgentsError { message: agent_error(e) }),
+            }
+        }
+
         BackendCommand::CloudStatus => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::Status, message: "Not connected".into() });
@@ -876,5 +900,15 @@ fn share_answer(
     match answer {
         Ok(response) => BackendEvent::CloudShareUpdated { store_id, node_id, share: response.share, members: response.members },
         Err(e) => BackendEvent::CloudError { op, message: e.to_string() },
+    }
+}
+
+/// An agent command's failure as the person reads it: the server's sentence,
+/// without the error code around it.
+fn agent_error(e: impl std::fmt::Display) -> String {
+    let message = e.to_string();
+    match message.split_once(": ") {
+        Some((head, rest)) if head.contains("RPC") || head.contains("error") => rest.to_string(),
+        _ => message,
     }
 }

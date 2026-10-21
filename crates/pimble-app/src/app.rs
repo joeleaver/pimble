@@ -4453,6 +4453,9 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         #[cfg(feature = "native")]
         let brand: rinch::components::SectionRenderer =
             Rc::new(move |__scope| crate::brand::titlebar_lockup(__scope, store));
+        // Account > "AI Agents..." (docs/AGENTS_CONTRACT.md), the desktop only.
+        #[cfg(feature = "native")]
+        let agents_modal = crate::agents::render_modal(__scope, store);
         #[cfg(feature = "native")]
         let root = rsx! {
             BorderlessWindow {
@@ -4487,6 +4490,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {host_modal}
                 {stop_relay_modal}
                 {hosted_modal}
+                {agents_modal}
                 {share_modal}
                 {body}
             }

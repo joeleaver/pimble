@@ -56,6 +56,77 @@ pub(crate) const APP_CSS: &str = "
     user-select: none;
 }
 
+/* ── AI Agents (agents.rs) ─────────────────────────────────────── */
+
+.pimble-agents__intro, .pimble-agents__hint {
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-agents__row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+}
+
+.pimble-agents__name {
+    font-weight: 600;
+}
+
+.pimble-agents__reach {
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-agents__label {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.pimble-agents__picker {
+    display: flex;
+    flex-direction: column;
+    max-height: 320px;
+    overflow-y: auto;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+    padding: 4px;
+}
+
+.pimble-agents__pick {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 26px;
+    font-size: 13px;
+}
+
+.pimble-agents__chevron {
+    width: 14px;
+    cursor: pointer;
+    color: var(--rinch-color-dimmed);
+    user-select: none;
+}
+
+.pimble-agents__from {
+    font-size: 11px;
+    color: var(--rinch-color-dimmed);
+    margin-right: 4px;
+}
+
+.pimble-agents__snippet {
+    font-size: 11px;
+    padding: 8px;
+    margin: 0;
+    border-radius: var(--rinch-radius-sm);
+    background: var(--rinch-color-default);
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
 /* ── Modals ─────────────────────────────────────────────────── */
 
 /* A Select's list is absolutely positioned inside the modal, whose

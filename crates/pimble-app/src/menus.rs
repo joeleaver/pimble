@@ -62,6 +62,9 @@ fn account_entries(store: AppStore) -> Vec<MenuEntry> {
     vec![
         MenuEntry::item("Account...", "", move || crate::app::open_account_modal(store, "")),
         MenuEntry::item("Add Hosted Store...", "", move || crate::app::open_hosted_modal(store)),
+        MenuEntry::Separator,
+        // docs/AGENTS_CONTRACT.md: the AI apps connected here, and what each reaches.
+        MenuEntry::item("AI Agents...", "", move || crate::agents::open(store)),
     ]
 }
 
