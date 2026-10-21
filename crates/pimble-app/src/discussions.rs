@@ -841,7 +841,9 @@ pub(crate) fn new_discussion(store: AppStore, store_id: StoreId, parent_id: Node
 /// "Start a Discussion" on node `host_id`: an attachment of it, opened beside
 /// `from` (split to the right when there is room) once it is made.
 pub(crate) fn start_on(store: AppStore, from: PaneId, store_id: StoreId, host_id: NodeId) {
-    if !store.node_access(store_id, host_id).allows_write() {
+    // A commenter starts one on what they read (docs/DISCUSSIONS_CONTRACT.md
+    // section 7); it writes only the new discussion.
+    if !store.node_access(store_id, host_id).allows_comment() {
         store.notice.set(pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
         return;
     }
@@ -871,9 +873,18 @@ pub(crate) fn insert_inline(store: AppStore) {
         crate::events::show_notice(store, "Open a note to put a discussion in it.".to_string());
         return;
     };
-    if !store.node_access(active.store_id, active.node_id).allows_write() {
-        crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
-        return;
+    // Inline is an edit of the text: an editor's (a commenter starts one on
+    // the note instead, Edit > "Start a Discussion").
+    match store.node_access(active.store_id, active.node_id) {
+        pimble_core::StoreAccess::Full => {}
+        pimble_core::StoreAccess::Comment => {
+            crate::events::show_notice(store, "Only editors can put a discussion in the text; Start a Discussion puts one on the note.".to_string());
+            return;
+        }
+        pimble_core::StoreAccess::Read => {
+            crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
+            return;
+        }
     }
     let handle = crate::editor::editor(pane);
     let at = handle.selection().from();
@@ -1035,7 +1046,7 @@ pub(crate) fn board_pins(store: AppStore, store_id: StoreId, host: NodeId) -> Ve
 /// The Pin tool pressed at board point `(x, y)` of board node `host`: a
 /// discussion pinned there, opened beside the board once it is made.
 pub(crate) fn start_pin(store: AppStore, from: PaneId, store_id: StoreId, host: NodeId, x: f32, y: f32) {
-    if !store.node_access(store_id, host).allows_write() {
+    if !store.node_access(store_id, host).allows_comment() {
         store.notice.set(pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
         return;
     }

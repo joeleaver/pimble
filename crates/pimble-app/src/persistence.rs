@@ -147,7 +147,11 @@ mod imp {
     /// outright in a private window or with site data blocked, so every read
     /// falls back to the same default the desktop uses when it has never been
     /// told, and every write is allowed to fail silently.
+    /// Off wasm (the web crate's own tests) there is no browser at all.
     fn storage() -> Option<web_sys::Storage> {
+        if !cfg!(target_arch = "wasm32") {
+            return None;
+        }
         web_sys::window()?.local_storage().ok().flatten()
     }
 

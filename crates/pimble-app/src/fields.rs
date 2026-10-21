@@ -34,7 +34,7 @@ fn fields_of(store: AppStore, node: Option<(StoreId, NodeId)>) -> Vec<(String, S
 /// it): refused with the sentence on a node this device may only read.
 pub(crate) fn write(store: AppStore, store_id: StoreId, node_id: NodeId, name: &str, value: Option<&str>) {
     if !store.node_access(store_id, node_id).allows_write() {
-        crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
+        crate::events::show_notice(store, store.node_access(store_id, node_id).refusal().to_string());
         return;
     }
     let name = name.trim();
@@ -125,7 +125,7 @@ pub fn add_field(store: AppStore) {
         return;
     };
     if !store.node_access(s, n).allows_write() {
-        crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
+        crate::events::show_notice(store, store.node_access(s, n).refusal().to_string());
         return;
     }
     store.pane(pane).adding_field.set(true);

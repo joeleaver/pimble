@@ -57,7 +57,7 @@ fn rfc3339(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms).unwrap_or_default().to_rfc3339()
 }
 
-const ROLES: [&str; 3] = ["owner", "editor", "reader"];
+const ROLES: [&str; 4] = ["owner", "editor", "commenter", "reader"];
 
 /// The scope that is the whole store rather than one shared subtree.
 const WHOLE_STORE: &str = "";
@@ -665,7 +665,7 @@ pub async fn put_member(
         // Owner is a role on a store — it can delete the thing and every
         // other owner's access to it. A share is a subtree of somebody
         // else's store; there is nothing there to own.
-        return Err(CloudError::BadRequest("a share's members are editors or readers; owner is a role on the whole store".to_string()));
+        return Err(CloudError::BadRequest("a share's members are editors, commenters or readers; owner is a role on the whole store".to_string()));
     }
     // A share is named by its owner and by nothing else: without a name there
     // is nothing to call it in the recipient's store list, and the store's
@@ -786,7 +786,7 @@ async fn invite_member(
         // handing that to an address nobody has proven belongs to a real
         // account is not something to do by typo. (A scoped `owner` is
         // refused earlier still, for everyone.)
-        return Err(CloudError::BadRequest("an owner must already have a verified Pimble account; invite them as an editor or reader".to_string()));
+        return Err(CloudError::BadRequest("an owner must already have a verified Pimble account; invite them as an editor, commenter or reader".to_string()));
     }
     match state.db.find_invitation(store.rid, email, root).await? {
         Some(existing) => {

@@ -71,6 +71,7 @@ fn held_as(access: StoreAccess, read_only_roots: Vec<NodeId>) -> SyncConfig {
         access,
         shared_by: Some("ann@example.com".into()),
         read_only_roots,
+        comment_roots: Vec::new(),
     }
 }
 

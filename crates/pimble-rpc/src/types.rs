@@ -93,6 +93,11 @@ pub struct VaultAppendRequest {
     /// only through `vaultSetDocKeys`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keys: Option<VaultDocKeys>,
+    /// For a document the store does not have yet: it is a discussion on
+    /// `parent_id` (an attachment, docs/DISCUSSIONS_CONTRACT.md section 7).
+    /// What lets a commenter create it; it joins the store's discussion set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub discussion: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1155,6 +1160,11 @@ pub struct SetScopeRequest {
     pub scope: Scope,
     #[serde(default)]
     pub remove: bool,
+    /// The discussions in the scope, each with the node it is on
+    /// (docs/DISCUSSIONS_CONTRACT.md section 7): added to the store's
+    /// discussion set, which only grows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discussions: Vec<(NodeId, NodeId)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1173,6 +1183,8 @@ pub struct GetScopesResponse {
 pub enum MemberRole {
     Owner,
     Editor,
+    /// Reads, and writes discussions (docs/DISCUSSIONS_CONTRACT.md section 7).
+    Commenter,
     Reader,
 }
 
@@ -1181,6 +1193,7 @@ impl MemberRole {
         match self {
             MemberRole::Owner => "owner",
             MemberRole::Editor => "editor",
+            MemberRole::Commenter => "commenter",
             MemberRole::Reader => "reader",
         }
     }
@@ -1188,6 +1201,7 @@ impl MemberRole {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "owner" => Some(MemberRole::Owner),
+            "commenter" => Some(MemberRole::Commenter),
             "editor" => Some(MemberRole::Editor),
             "reader" => Some(MemberRole::Reader),
             _ => None,

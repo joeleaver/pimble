@@ -41,6 +41,12 @@ pub fn read_only_error() -> ErrorObjectOwned {
     ErrorObjectOwned::owned(pimble_rpc::RpcError::Forbidden(String::new()).code(), StoreAccess::READ_ONLY_REFUSAL, None::<()>)
 }
 
+/// A commenter's write of anything but a discussion
+/// (docs/DISCUSSIONS_CONTRACT.md section 7).
+pub fn comment_only_error() -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(pimble_rpc::RpcError::Forbidden(String::new()).code(), StoreAccess::COMMENT_ONLY_REFUSAL, None::<()>)
+}
+
 /// What a scoped principal gets for a document outside its scope, whether
 /// or not the document exists: a member of one share must not learn what
 /// else the store holds, so the answer is the same for a document that is
@@ -137,6 +143,9 @@ impl Grant {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Reader,
+    /// Reads, and writes discussions only (docs/DISCUSSIONS_CONTRACT.md
+    /// section 7).
+    Commenter,
     Editor,
     Owner,
 }
@@ -152,6 +161,7 @@ impl Role {
             "owner" => Some(Role::Owner),
             "editor" => Some(Role::Editor),
             "reader" => Some(Role::Reader),
+            "commenter" => Some(Role::Commenter),
             _ => None,
         }
     }
@@ -162,6 +172,7 @@ impl Role {
     pub fn allows(self, needed: Access) -> bool {
         match needed {
             Access::Read => true,
+            Access::Comment => matches!(self, Role::Commenter | Role::Editor | Role::Owner),
             Access::Write => matches!(self, Role::Editor | Role::Owner),
         }
     }
@@ -171,6 +182,8 @@ impl Role {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
     Read,
+    /// Writing discussions: what a commenter may do besides reading.
+    Comment,
     Write,
 }
 
@@ -218,8 +231,9 @@ pub fn authorize(principal: &Principal, store_id: StoreId, needed: Access) -> Re
         Principal::Service => Ok(()),
         Principal::User { grants, .. } => match grants.get(&store_id) {
             Some(grant) if grant.allows(needed) => Ok(()),
-            // Only a reader fails `allows`, and a reader's write is refused
-            // with the one sentence every reader refusal carries.
+            // A commenter's write of anything but a discussion is refused
+            // with the commenter's sentence; a reader's with the reader's.
+            Some(grant) if grant.allows(Access::Comment) => Err(comment_only_error()),
             Some(_) => Err(read_only_error()),
             None => Err(forbidden_error(format!("no grant for store {}", store_id))),
         },

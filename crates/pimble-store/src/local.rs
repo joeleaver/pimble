@@ -102,6 +102,11 @@ pub struct SyncConfig {
     /// would. Empty when one answer covers the store (`access`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_only_roots: Vec<NodeId>,
+    /// Among `read_only_roots`, the ones held as a commenter
+    /// (docs/DISCUSSIONS_CONTRACT.md section 7): their discussions may be
+    /// written here, nothing else.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comment_roots: Vec<NodeId>,
 }
 
 /// What a deletion tombstoned (docs/NODE_DOCUMENT_CONTRACT.md section 2).
@@ -216,11 +221,17 @@ struct LinkAccess {
     access: StoreAccess,
     shared_by: Option<String>,
     read_only_roots: Vec<NodeId>,
+    comment_roots: Vec<NodeId>,
 }
 
 impl LinkAccess {
     fn of(config: &SyncConfig) -> Self {
-        Self { access: config.access, shared_by: config.shared_by.clone(), read_only_roots: config.read_only_roots.clone() }
+        Self {
+            access: config.access,
+            shared_by: config.shared_by.clone(),
+            read_only_roots: config.read_only_roots.clone(),
+            comment_roots: config.comment_roots.clone(),
+        }
     }
 }
 
@@ -432,6 +443,34 @@ impl LocalStore {
         self.link_access.read().unwrap().read_only_roots.clone()
     }
 
+    /// The commenter's roots among the read-only ones (`sync.json`'s
+    /// `comment_roots`).
+    pub fn comment_roots(&self) -> Vec<NodeId> {
+        self.link_access.read().unwrap().comment_roots.clone()
+    }
+
+    /// Whether a write of discussions `ids` (or a new discussion on them) is
+    /// refused here (docs/DISCUSSIONS_CONTRACT.md section 7): on a replica
+    /// held as a reader; on one with a role per root, a document whose every
+    /// scope is a reader's (a commenter's root is not) or has ended.
+    pub fn comment_refused(&self, ids: &[NodeId]) -> bool {
+        let link = self.link_access.read().unwrap();
+        if !link.access.allows_comment() {
+            return true;
+        }
+        let ended = &self.manifest.ended_roots;
+        ids.iter().any(|id| {
+            let reached = self.scope_roots_above(*id);
+            !reached.is_empty()
+                && reached.iter().all(|root| (link.read_only_roots.contains(root) && !link.comment_roots.contains(root)) || ended.contains(root))
+        })
+    }
+
+    /// Whether `id` is a live discussion here.
+    pub fn is_discussion(&self, id: NodeId) -> bool {
+        self.tree.live_fields(id).is_ok_and(|f| f.node_type == pimble_core::node_types::DISCUSSION)
+    }
+
     /// Whether a write touching `ids` is refused here: everything on a
     /// replica held as a reader, and on one held with a role per shared
     /// root, a document whose every scope is a reader's or has ended
@@ -466,7 +505,8 @@ impl LocalStore {
             if self.manifest.scope_roots.contains(&cur) {
                 reached.push(cur);
             }
-            match self.tree.doc(cur).and_then(|d| d.fields().ok()).and_then(|f| f.parent_id) {
+            // An attachment is where its host is.
+            match self.tree.doc(cur).and_then(|d| d.fields().ok()).and_then(|f| f.parent_id.or(f.attached_to)) {
                 Some(parent) if self.tree.doc(parent).is_some() => cur = parent,
                 _ => break,
             }
@@ -2274,6 +2314,7 @@ mod tests {
             access,
             shared_by: Some("ann@example.com".into()),
             read_only_roots,
+            comment_roots: Vec::new(),
         };
         partial.write_sync_config(&config(StoreAccess::Full, vec![read, read_inside_edited])).await.unwrap();
         assert!(partial.write_refused(&[under_read]));

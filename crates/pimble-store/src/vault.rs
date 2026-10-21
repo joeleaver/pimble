@@ -120,6 +120,12 @@ struct ScopesFile {
     scopes: HashMap<NodeId, HashSet<NodeId>>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     unconfirmed: HashMap<NodeId, HashSet<NodeId>>,
+    /// The discussions among the store's documents, each with the node it
+    /// is on (docs/DISCUSSIONS_CONTRACT.md section 7): which documents a
+    /// commenter may write. Published by the owner's devices and added to by
+    /// the server when a member starts one; it only grows.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    discussions: HashMap<NodeId, NodeId>,
 }
 
 impl ScopesFile {
@@ -399,6 +405,28 @@ impl VaultStore {
             let scope = self.scope_union(&[*root]);
             if scope.contains(&parent_id) && !scope.contains(&doc_id) {
                 self.scopes.unconfirmed.entry(*root).or_default().insert(doc_id);
+                changed = true;
+            }
+        }
+        if changed {
+            self.write_scopes().await?;
+        }
+        Ok(changed)
+    }
+
+    /// Whether `doc_id` is a discussion (see [`ScopesFile::discussions`]).
+    pub fn is_discussion(&self, doc_id: NodeId) -> bool {
+        self.scopes.discussions.contains_key(&doc_id)
+    }
+
+    /// Record discussions and the nodes they are on (the owner's publish, or
+    /// a member's new one), and persist when that adds anything. A
+    /// discussion's host never changes here: it only grows.
+    pub async fn add_discussions(&mut self, discussions: impl IntoIterator<Item = (NodeId, NodeId)>) -> Result<bool> {
+        let mut changed = false;
+        for (doc, host) in discussions {
+            if !self.scopes.discussions.contains_key(&doc) {
+                self.scopes.discussions.insert(doc, host);
                 changed = true;
             }
         }
@@ -705,6 +733,24 @@ mod tests {
         let store = VaultStore::create(dir.path().join("v.pimble"), "V", Some(id)).await.unwrap();
         assert_eq!(store.id, id);
         assert_eq!(store.manifest().id, id);
+    }
+
+    /// The discussion set (docs/DISCUSSIONS_CONTRACT.md section 7) only grows
+    /// and survives a reopen.
+    #[tokio::test]
+    async fn the_discussion_set_grows_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.pimble");
+        let (d, host, other_host) = (NodeId::new(), NodeId::new(), NodeId::new());
+        {
+            let mut store = VaultStore::create(&path, "D", None).await.unwrap();
+            assert!(!store.is_discussion(d));
+            assert!(store.add_discussions([(d, host)]).await.unwrap());
+            assert!(!store.add_discussions([(d, other_host)]).await.unwrap(), "a host never changes");
+            assert!(store.is_discussion(d));
+        }
+        let store = VaultStore::open(&path).await.unwrap();
+        assert!(store.is_discussion(d));
     }
 
     /// Scope sets (docs/NODE_DOCUMENT_CONTRACT.md section 5) survive a reopen,

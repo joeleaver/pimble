@@ -1225,7 +1225,27 @@ impl PimbleClient {
     ) -> Result<u64> {
         let response = self
             .client
-            .vault_append(VaultAppendRequest { store_id, doc_id, blob, client_id, parent_id, keys })
+            .vault_append(VaultAppendRequest { store_id, doc_id, blob, client_id, parent_id, keys, discussion: false })
+            .await
+            .map_err(rpc_error)?;
+        Ok(response.seq)
+    }
+
+    /// A new discussion's first append (docs/DISCUSSIONS_CONTRACT.md section
+    /// 7): [`PimbleClient::vault_append_with_keys`] naming the node it is on,
+    /// which is what lets a commenter create it.
+    pub async fn vault_append_new_discussion(
+        &self,
+        store_id: StoreId,
+        doc_id: VaultDocId,
+        blob: String,
+        client_id: Option<String>,
+        host: NodeId,
+        keys: Option<VaultDocKeys>,
+    ) -> Result<u64> {
+        let response = self
+            .client
+            .vault_append(VaultAppendRequest { store_id, doc_id, blob, client_id, parent_id: Some(host), keys, discussion: true })
             .await
             .map_err(rpc_error)?;
         Ok(response.seq)
@@ -1241,7 +1261,13 @@ impl PimbleClient {
 
     /// Publish (or remove) a share's scope on the hosted server.
     pub async fn set_scope(&self, store_id: StoreId, scope: Scope, remove: bool) -> Result<()> {
-        self.client.set_scope(SetScopeRequest { store_id, scope, remove }).await.map_err(rpc_error)?;
+        self.set_scope_with_discussions(store_id, scope, remove, Vec::new()).await
+    }
+
+    /// [`PimbleClient::set_scope`] with the scope's discussions and the nodes
+    /// they are on (docs/DISCUSSIONS_CONTRACT.md section 7).
+    pub async fn set_scope_with_discussions(&self, store_id: StoreId, scope: Scope, remove: bool, discussions: Vec<(NodeId, NodeId)>) -> Result<()> {
+        self.client.set_scope(SetScopeRequest { store_id, scope, remove, discussions }).await.map_err(rpc_error)?;
         Ok(())
     }
 

@@ -169,7 +169,7 @@ pub fn insert_sheet_node(store: AppStore) {
         return;
     };
     if !store.node_access(active.store_id, active.node_id).allows_write() {
-        crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
+        crate::events::show_notice(store, store.node_access(active.store_id, active.node_id).refusal().to_string());
         return;
     }
     let handle = crate::editor::editor(pane);
@@ -306,7 +306,7 @@ pub fn insert_sheet(store: AppStore) {
         return;
     };
     if !store.node_access(active.store_id, active.node_id).allows_write() {
-        crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
+        crate::events::show_notice(store, store.node_access(active.store_id, active.node_id).refusal().to_string());
         return;
     }
     if !holds_text(pane) {
@@ -459,7 +459,7 @@ pub(crate) fn convert_to_sheet_node(store: AppStore, pane: PaneId, table: &str) 
     aim(pane, None);
     let Some((store_id, node_id)) = with_session(pane, |s| (s.store_id, s.node_id)) else { return };
     if !store.node_access(store_id, node_id).allows_write() {
-        say(store, pane, pimble_core::StoreAccess::READ_ONLY_REFUSAL);
+        say(store, pane, store.node_access(store_id, node_id).refusal());
         return;
     }
     let Some(snap) = snapshot(pane) else { return };

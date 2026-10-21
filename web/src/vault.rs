@@ -202,15 +202,22 @@ pub struct AccountStore {
 
 impl AccountStore {
     /// What this account may do in the store: `Read` only when every grant it
-    /// holds is a reader's. A reader of one folder and an editor of another
-    /// gets `Full`, and the server refuses the writes under the read-only root
-    /// one at a time — a store-wide `Read` would take away the editing they do
-    /// have (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Token").
+    /// holds is a reader's, `Comment` when none is an editor's and some are a
+    /// commenter's. A reader of one folder and an editor of another gets
+    /// `Full`, and the server refuses the writes under the read-only root one
+    /// at a time — a store-wide `Read` would take away the editing they do
+    /// have (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Token"). The same rule
+    /// as the desktop's `HeldAs::from_rows`.
     pub fn access(&self) -> StoreAccess {
-        if !self.grants.is_empty() && self.grants.iter().all(|g| g.role == "reader") {
-            StoreAccess::Read
-        } else {
+        if let Some(whole) = self.grants.iter().find(|g| g.root.is_none()) {
+            return role_access(&whole.role);
+        }
+        if self.grants.is_empty() || self.grants.iter().any(|g| role_access(&g.role).allows_write()) {
             StoreAccess::Full
+        } else if self.grants.iter().any(|g| g.role == "commenter") {
+            StoreAccess::Comment
+        } else {
+            StoreAccess::Read
         }
     }
 
@@ -223,15 +230,17 @@ impl AccountStore {
         self.grants.iter().filter_map(|g| g.root).collect()
     }
 
-    /// The shared roots this account only reads while it edits others, as a
-    /// desktop replica's `sync.json` names its own (`Store::read_only_roots`);
-    /// empty when [`AccountStore::access`] answers for the whole store.
+    /// The shared roots this account does not edit while it edits others, or
+    /// comments on some, as a desktop replica's `sync.json` names its own
+    /// (`Store::read_only_roots`); empty when [`AccountStore::access`]
+    /// answers for the whole store.
     pub fn read_only_roots(&self) -> Vec<NodeId> {
-        if !self.access().allows_write() || self.grants.iter().any(|g| g.root.is_none()) {
+        if self.access() == StoreAccess::Read || self.grants.iter().any(|g| g.root.is_none()) {
             return Vec::new();
         }
-        self.grants.iter().filter(|g| g.role == "reader").filter_map(|g| g.root).collect()
+        self.grants.iter().filter(|g| !role_access(&g.role).allows_write()).filter_map(|g| g.root).collect()
     }
+
 
     /// What this account may change of one node, by the rule the hosted
     /// server judges a write with (docs/NODE_DOCUMENT_CONTRACT.md section 5,
@@ -241,19 +250,23 @@ impl AccountStore {
     /// included) decide, and a node under a reader's root nested in an
     /// editor's takes the wider role. A node that reaches no root this
     /// account holds is not this rule's to judge and reads as the store does.
+    ///
+    /// The answer is for the node's own document: a commenter's `Comment`
+    /// still writes a discussion, which [`VaultStore::access_of`] judges.
     pub fn node_access(&self, reached: &[NodeId]) -> StoreAccess {
-        let reads = |role: &str| role == "reader";
         if let Some(whole) = self.grants.iter().find(|g| g.root.is_none()) {
-            return if reads(&whole.role) { StoreAccess::Read } else { StoreAccess::Full };
+            return role_access(&whole.role);
         }
-        let mut roles = self.grants.iter().filter(|g| g.root.is_some_and(|root| reached.contains(&root))).map(|g| g.role.as_str()).peekable();
-        if roles.peek().is_none() {
+        let roles: Vec<StoreAccess> = self.grants.iter().filter(|g| g.root.is_some_and(|root| reached.contains(&root))).map(|g| role_access(&g.role)).collect();
+        if roles.is_empty() {
             return self.access();
         }
-        if roles.all(reads) {
-            StoreAccess::Read
-        } else {
+        if roles.iter().any(|a| a.allows_write()) {
             StoreAccess::Full
+        } else if roles.contains(&StoreAccess::Comment) {
+            StoreAccess::Comment
+        } else {
+            StoreAccess::Read
         }
     }
 
@@ -274,6 +287,16 @@ impl AccountStore {
             });
         }
         self.grants.iter().find(|g| !g.name.is_empty()).map(|g| g.name.clone())
+    }
+}
+
+/// What one grant's role may do: a reader reads, a commenter writes
+/// discussions, an editor or owner edits (`pimble_server::cloud::StoreView::access`).
+fn role_access(role: &str) -> StoreAccess {
+    match role {
+        "reader" => StoreAccess::Read,
+        "commenter" => StoreAccess::Comment,
+        _ => StoreAccess::Full,
     }
 }
 
@@ -1381,8 +1404,23 @@ impl VaultClient {
             return None;
         }
         let row_access = self.rows.get(&store_id).map(AccountStore::access).unwrap_or(StoreAccess::Full);
-        if !row_access.allows_write() {
-            return Some(BackendEvent::Error { message: StoreAccess::READ_ONLY_REFUSAL.to_string() });
+        match row_access {
+            StoreAccess::Read => return Some(BackendEvent::Error { message: StoreAccess::READ_ONLY_REFUSAL.to_string() }),
+            // A commenter writes discussions only: a new one on a node, and
+            // the edits of one. In a plain store the server judges which
+            // document an edit is of.
+            StoreAccess::Comment => {
+                let on_discussion = |node_id: NodeId| self.stores.get(&store_id).is_none_or(|store| store.is_discussion(node_id));
+                let allowed = match cmd {
+                    BackendCommand::CreateAttachment { init, .. } => init.node_type == node_types::DISCUSSION,
+                    BackendCommand::BroadcastChanges { node_id, .. } | BackendCommand::SetNodeContent { node_id, .. } => on_discussion(*node_id),
+                    _ => false,
+                };
+                if !allowed {
+                    return Some(BackendEvent::Error { message: StoreAccess::COMMENT_ONLY_REFUSAL.to_string() });
+                }
+            }
+            _ => {}
         }
         if self.owner_offline.contains(&store_id) && !(self.owns(store_id) && is_content_edit(cmd)) {
             return Some(notice(OWNER_OFFLINE_REFUSAL.to_string()));
@@ -2110,17 +2148,23 @@ impl VaultClient {
         };
         let parent_id = outgoing.created.as_ref().and_then(|(_, parent)| *parent);
         let keys = outgoing.created.as_ref().map(|(keys, _)| keys.clone());
-        let appended = client
-            .vault_append_with_keys(
-                store_id,
-                outgoing.doc_id.clone(),
-                outgoing.blob.clone(),
-                Some(self.client_id.clone()),
-                parent_id,
-                keys,
-            )
-            .await
-            .map_err(|e| e.to_string());
+        // A new discussion says so, which is what lets a commenter create it
+        // and puts it in the store's discussion set (docs/DISCUSSIONS_CONTRACT.md
+        // section 7).
+        let new_discussion = parent_id.filter(|_| self.stores.get(&store_id).is_some_and(|store| store.is_discussion(node_id)));
+        let appended = match new_discussion {
+            Some(host) => {
+                client
+                    .vault_append_new_discussion(store_id, outgoing.doc_id.clone(), outgoing.blob.clone(), Some(self.client_id.clone()), host, keys)
+                    .await
+            }
+            None => {
+                client
+                    .vault_append_with_keys(store_id, outgoing.doc_id.clone(), outgoing.blob.clone(), Some(self.client_id.clone()), parent_id, keys)
+                    .await
+            }
+        }
+        .map_err(|e| e.to_string());
 
         // A refusal is the server saying no — a reader's root inside a store
         // this account edits elsewhere, or a document in nobody's scope. There
@@ -2716,12 +2760,28 @@ impl VaultStore {
         self.look.asked.clear();
     }
 
-    /// Whether this account may write `node_id`, by the rule
+    /// Whether this account may write `node_id`'s document, by the rule
     /// [`VaultStore::node_for`] puts on every node it hands the UI.
     fn may_write(&self, node_id: NodeId, row: Option<&AccountStore>) -> bool {
-        let Some(row) = row else { return true };
+        self.access_of(node_id, row).allows_write()
+    }
+
+    /// What this account may change of `node_id`'s document: the roles of
+    /// the roots above it, and a discussion is a commenter's to write
+    /// (docs/DISCUSSIONS_CONTRACT.md section 7), as the server's
+    /// `judge_access` answers.
+    fn access_of(&self, node_id: NodeId, row: Option<&AccountStore>) -> StoreAccess {
+        let Some(row) = row else { return StoreAccess::Full };
         let grant_roots: Vec<NodeId> = row.grants.iter().filter_map(|g| g.root).collect();
-        row.node_access(&roots_above(&self.tree, &grant_roots, node_id)).allows_write()
+        match row.node_access(&roots_above(&self.tree, &grant_roots, node_id)) {
+            StoreAccess::Comment if self.is_discussion(node_id) => StoreAccess::Full,
+            access => access,
+        }
+    }
+
+    /// Whether `node_id` is a discussion node.
+    fn is_discussion(&self, node_id: NodeId) -> bool {
+        self.tree.doc(node_id).and_then(|doc| doc.fields().ok()).is_some_and(|f| f.node_type == node_types::DISCUSSION)
     }
 
     /// How far `node_id`'s log has been read without a gap.
@@ -2919,8 +2979,9 @@ impl VaultStore {
     /// known about, which is no reason to disable anything.
     fn node_for(&self, node_id: NodeId, row: Option<&AccountStore>) -> Result<Node, String> {
         let mut node = self.node_of(node_id)?;
-        if !self.may_write(node_id, row) {
-            node.access = StoreAccess::Read;
+        let access = self.access_of(node_id, row);
+        if !access.allows_write() {
+            node.access = access;
         }
         Ok(node)
     }
@@ -5534,6 +5595,64 @@ mod tests {
         let mut described = scoped;
         client.describe(&mut described);
         assert_eq!((described.access, described.read_only_roots), (Full, vec![recipes]));
+    }
+
+    /// A commenter (docs/DISCUSSIONS_CONTRACT.md section 7) reads the notes
+    /// and writes discussions: a node under a commenter's root says
+    /// `Comment`, a discussion on it is the commenter's to write, the store
+    /// is `Comment` when nothing in it is edited, and the write gate lets a
+    /// new discussion and a discussion's edits through and nothing else.
+    #[test]
+    fn a_commenter_writes_discussions_and_nothing_else() {
+        use StoreAccess::{Comment, Full, Read};
+        let (mut peer, root) = origin();
+        let (recipes, bread, plans) = (NodeId::new(), NodeId::new(), NodeId::new());
+        peer.add_node(recipes, Some(root), None, "folder", "Recipes", T0).unwrap();
+        peer.add_node(bread, Some(recipes), None, "document", "Bread", T0).unwrap();
+        peer.add_node(plans, Some(root), None, "folder", "Plans", T0).unwrap();
+        let talk = NodeId::new();
+        peer.add_attachment(talk, bread, node_types::DISCUSSION, "Crust?", None, T0).unwrap();
+
+        let store_id = StoreId::new();
+        let mut scoped = listed(recipes);
+        scoped.id = store_id;
+        scoped.roots = vec![recipes];
+        let held = [recipes, bread, talk];
+        let store = VaultStore::assemble(scoped.clone(), StoreKeys::new(keyring_for(Some(recipes))), vec![recipes], pull_subset(&peer, &held));
+        let commenting = row(vec![grant(Some(recipes), "commenter", "Recipes")], Some("ann@example.com"));
+        assert_eq!(commenting.access(), Comment);
+        assert_eq!(commenting.read_only_roots(), vec![recipes], "the roots say which are a commenter's");
+        let access = |id: NodeId, row: &AccountStore| store.node_for(id, Some(row)).unwrap().access;
+        assert_eq!(access(recipes, &commenting), Comment);
+        assert_eq!(access(bread, &commenting), Comment);
+        assert_eq!(access(talk, &commenting), Full, "a discussion is the commenter's to write");
+        let reading = row(vec![grant(Some(recipes), "reader", "Recipes")], None);
+        assert_eq!(access(talk, &reading), Read, "a reader writes no discussion");
+        let mixed = row(vec![grant(Some(recipes), "commenter", "Recipes"), grant(Some(plans), "editor", "Plans")], None);
+        assert_eq!(mixed.access(), Full);
+        assert_eq!(access(bread, &mixed), Comment);
+        let whole = row(vec![grant(None, "commenter", "Family")], None);
+        assert_eq!(whole.access(), Comment);
+        assert!(whole.read_only_roots().is_empty());
+
+        let mut client = VaultClient::new("me".to_string());
+        client.stores.insert(store_id, store);
+        client.rows.insert(store_id, commenting);
+        let refused = |cmd: BackendCommand| match client.refuse_write(store_id, &cmd) {
+            Some(BackendEvent::Error { message }) => Some(message),
+            Some(other) => panic!("{other:?}"),
+            None => None,
+        };
+        let init = |node_type: &str| pimble_app::protocol::NodeInit { node_type: node_type.to_string(), content: Vec::new(), custom: Vec::new(), request: None };
+        assert_eq!(refused(BackendCommand::CreateAttachment { store_id, host_id: bread, title: "Why?".into(), init: init(node_types::DISCUSSION) }), None);
+        assert_eq!(refused(BackendCommand::SetNodeContent { store_id, node_id: talk, content: Vec::new() }), None);
+        let comment_only = Some(StoreAccess::COMMENT_ONLY_REFUSAL.to_string());
+        assert_eq!(refused(BackendCommand::SetNodeContent { store_id, node_id: bread, content: Vec::new() }), comment_only);
+        assert_eq!(refused(BackendCommand::RenameNode { store_id, node_id: bread, title: "No".into() }), comment_only);
+        assert_eq!(refused(BackendCommand::CreateNode { store_id, parent_id: Some(recipes), title: "No".into(), init: None }), comment_only);
+        let mut described = scoped;
+        client.describe(&mut described);
+        assert_eq!((described.access, described.read_only_roots), (Comment, vec![recipes]));
     }
 
     // ── A share that ended (Joe, 2026-09-21) ────────────────────────────────

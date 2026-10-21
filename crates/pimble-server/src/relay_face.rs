@@ -407,6 +407,7 @@ impl RpcHandler {
                     access: StoreAccess::Full,
                     shared_by: None,
                     read_only_roots: Vec::new(),
+                    comment_roots: Vec::new(),
                 },
             )
             .await;

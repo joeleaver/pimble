@@ -793,6 +793,7 @@ fn member_role_text(role: pimble_rpc::MemberRole) -> &'static str {
     match role {
         pimble_rpc::MemberRole::Owner => "owner",
         pimble_rpc::MemberRole::Editor => "can edit",
+        pimble_rpc::MemberRole::Commenter => "can comment",
         pimble_rpc::MemberRole::Reader => "can read",
     }
 }
@@ -2415,7 +2416,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::MessagePlus,
-                                disabled: !can_write_tree,
+                                // A commenter's too (docs/DISCUSSIONS_CONTRACT.md section 7).
+                                disabled: !access_now.allows_comment(),
                                 onclick: on_start_discussion.clone(),
                                 "Start a Discussion"
                             }
@@ -3925,6 +3927,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             }
             let role = match untracked(|| store.share_modal_invite_role.get()).as_str() {
                 "reader" => pimble_rpc::MemberRole::Reader,
+                "commenter" => pimble_rpc::MemberRole::Commenter,
                 _ => pimble_rpc::MemberRole::Editor,
             };
             store.share_modal_error.set(String::new());
@@ -4181,6 +4184,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                             onchange: move |val: String| store.share_modal_invite_role.set(val),
                                             data: {|| vec![
                                                 SelectOption::new("editor", "Editor"),
+                                                // docs/DISCUSSIONS_CONTRACT.md section 7.
+                                                SelectOption::new("commenter", "Commenter"),
                                                 SelectOption::new("reader", "Reader"),
                                             ]},
                                         }

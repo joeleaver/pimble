@@ -788,11 +788,13 @@ async fn refresh_grant(handler: &RpcHandler, store_id: StoreId) -> Option<bool> 
         let manager = manager.read().await;
         if let Ok(Some(mut config)) = manager.read_sync_config(store_id).await {
             let read_only_roots = if local_roots.is_empty() { Vec::new() } else { held_as.read_only_roots.clone() };
-            if config.access != held_as.access || config.shared_by != held_as.shared_by || config.read_only_roots != read_only_roots {
+            let comment_roots = if local_roots.is_empty() { Vec::new() } else { held_as.comment_roots.clone() };
+            if config.access != held_as.access || config.shared_by != held_as.shared_by || config.read_only_roots != read_only_roots || config.comment_roots != comment_roots {
                 info!("Vault link for store {}: held as {:?} now (shared by {:?})", store_id, held_as.access, held_as.shared_by);
                 config.access = held_as.access;
                 config.shared_by = held_as.shared_by.clone();
                 config.read_only_roots = read_only_roots;
+                config.comment_roots = comment_roots;
                 if let Err(e) = manager.write_sync_config(store_id, &config).await {
                     warn!("Vault link for store {}: could not record how the store is held: {}", store_id, e);
                 }
@@ -1384,16 +1386,15 @@ async fn full_reconcile(
 
     // Held as a reader: nothing is pushed, and nothing marked is forgotten
     // (a repair this replica made for itself goes out if the role changes).
-    let (doc_ids, access, partial): (Vec<VaultDocId>, StoreAccess, bool) = {
+    // Held as a commenter: the discussions only, the same way.
+    let (doc_ids, access, partial, discussions): (Vec<VaultDocId>, StoreAccess, bool, HashSet<NodeId>) = {
         let manager = handler.store_manager_handle();
         let manager = manager.read().await;
-        (
-            manager.doc_ids(store_id).map(|ids| ids.into_iter().map(VaultDocId::Node).collect()).unwrap_or_default(),
-            manager.store_access(store_id),
-            !manager.scope_roots(store_id).is_empty(),
-        )
+        let ids = manager.doc_ids(store_id).unwrap_or_default();
+        let discussions = ids.iter().copied().filter(|id| manager.is_discussion(store_id, *id)).collect();
+        (ids.into_iter().map(VaultDocId::Node).collect(), manager.store_access(store_id), !manager.scope_roots(store_id).is_empty(), discussions)
     };
-    if !access.allows_write() {
+    if !access.allows_comment() {
         if progress.file.cursor_version != CURSOR_VERSION {
             progress.file.cursor_version = CURSOR_VERSION;
             progress.unsaved = true;
@@ -1403,6 +1404,13 @@ async fn full_reconcile(
     }
     let mut refused = false;
     for doc_id in doc_ids {
+        if !access.allows_write() && !matches!(&doc_id, VaultDocId::Node(id) if discussions.contains(id)) {
+            if progress.is_dirty(&doc_id) {
+                progress.mark_dirty(&doc_id);
+                refused = true;
+            }
+            continue;
+        }
         let unseen = remote_heads.get(&doc_id).copied().unwrap_or(0) == 0;
         // To a share's recipient "not listed" is also what a document its
         // owner moved out of the share looks like: held here, no longer
@@ -1679,8 +1687,15 @@ async fn forward_local_change(
     };
     // Held as a reader: the local server refuses a person's write, so what
     // arrives here is this replica's own upkeep (a repair). It stays here,
-    // marked, and goes out if the role ever changes.
-    if !handler.store_manager_handle().read().await.store_access(store_id).allows_write() {
+    // marked, and goes out if the role ever changes. A commenter's
+    // discussions go out (docs/DISCUSSIONS_CONTRACT.md section 7).
+    let pushes = {
+        let manager = handler.store_manager_handle();
+        let manager = manager.read().await;
+        let access = manager.store_access(store_id);
+        access.allows_write() || (access.allows_comment() && matches!(&doc_id, VaultDocId::Node(id) if manager.is_discussion(store_id, *id)))
+    };
+    if !pushes {
         progress.mark_dirty(&doc_id);
         return Ok(());
     }
@@ -1715,7 +1730,7 @@ enum Seal {
     /// The remote has never seen the document: this device creates it, with
     /// a data key of its own making wrapped under every scope key it holds
     /// that covers the node.
-    Create { dek_id: Uuid, dek: SymmetricKey, keys: VaultDocKeys, parent_id: Option<NodeId> },
+    Create { dek_id: Uuid, dek: SymmetricKey, keys: VaultDocKeys, parent_id: Option<NodeId>, discussion: bool },
     /// The document has a data key and no wrap this device can open.
     Unreadable,
 }
@@ -1756,7 +1771,7 @@ async fn seal_plan(handler: &RpcHandler, client: &PimbleClient, store_id: StoreI
     // whole replica (this device holds it: it is the owner's, or a member's
     // of the whole store), and the key of every share the node is under
     // that this device holds, which the share's root names in its marker.
-    let (partial, parent_id, marker_keys) = {
+    let (partial, parent_id, marker_keys, discussion) = {
         let manager = handler.store_manager_handle();
         let manager = manager.read().await;
         let partial = !manager.scope_roots(store_id).is_empty();
@@ -1764,6 +1779,12 @@ async fn seal_plan(handler: &RpcHandler, client: &PimbleClient, store_id: StoreI
         // An attachment's place is its host (docs/DISCUSSIONS_CONTRACT.md
         // section 1): it joins the scopes, and takes the keys, its host has.
         let parent_id = tree.doc(*node_id).and_then(|doc| doc.fields().ok()).and_then(|fields| fields.parent_id.or(fields.attached_to));
+        // A discussion on a node says so: what lets a commenter create it
+        // (docs/DISCUSSIONS_CONTRACT.md section 7).
+        let discussion = tree
+            .doc(*node_id)
+            .and_then(|doc| doc.fields().ok())
+            .is_some_and(|fields| fields.node_type == pimble_core::node_types::DISCUSSION && fields.attached_to.is_some());
         let mut marker_keys = Vec::new();
         let mut cur = Some(*node_id);
         for _ in 0..=tree.ids().len() {
@@ -1773,7 +1794,7 @@ async fn seal_plan(handler: &RpcHandler, client: &PimbleClient, store_id: StoreI
             }
             cur = fields.parent_id.or(fields.attached_to);
         }
-        (partial, parent_id, marker_keys)
+        (partial, parent_id, marker_keys, discussion)
     };
     let mut scope_key_ids: Vec<Uuid> = if partial { Vec::new() } else { vec![link_key_id] };
     scope_key_ids.extend(marker_keys);
@@ -1799,7 +1820,7 @@ async fn seal_plan(handler: &RpcHandler, client: &PimbleClient, store_id: StoreI
     if wraps.is_empty() {
         return Err(anyhow::anyhow!("no scope key held for store {}; cannot encrypt a new document", store_id));
     }
-    Ok(Seal::Create { dek_id, dek, keys: VaultDocKeys { dek_id, wraps }, parent_id })
+    Ok(Seal::Create { dek_id, dek, keys: VaultDocKeys { dek_id, wraps }, parent_id, discussion })
 }
 
 /// Encrypt `plaintext` and append it to `doc_id`'s vault log, recording the
@@ -1822,7 +1843,7 @@ async fn append_blob(
     let plan = seal_plan(handler, client, store_id, &doc_id, key_id, progress).await?;
     let (blob, created) = match &plan {
         Seal::With { key_id, key } => (Blob::encrypt(key, *key_id, &aad, plaintext), None),
-        Seal::Create { dek_id, dek, keys, parent_id } => (Blob::encrypt(dek, *dek_id, &aad, plaintext), Some((keys, *parent_id))),
+        Seal::Create { dek_id, dek, keys, parent_id, discussion } => (Blob::encrypt(dek, *dek_id, &aad, plaintext), Some((keys, *parent_id, *discussion))),
         Seal::Unreadable => {
             warn!("Vault link for store {} doc {:?}: no wrap of its data key opens here; leaving the update for later", store_id, doc_id);
             return Ok(Appended::Refused);
@@ -1839,11 +1860,15 @@ async fn append_blob(
     // guard for anything that reaches the server without a `client_id`. A
     // new document names its parent, which is what admits a scoped member's
     // create (and is ignored for anyone else's).
-    let (keys, parent_id) = match &created {
-        Some((keys, parent_id)) => (Some((*keys).clone()), *parent_id),
-        None => (None, None),
+    let (keys, parent_id, discussion) = match &created {
+        Some((keys, parent_id, discussion)) => (Some((*keys).clone()), *parent_id, *discussion),
+        None => (None, None, false),
     };
-    let seq = match client.vault_append_with_keys(store_id, doc_id.clone(), blob_b64, Some(link_id.to_string()), parent_id, keys).await {
+    let appended = match (discussion, parent_id) {
+        (true, Some(host)) => client.vault_append_new_discussion(store_id, doc_id.clone(), blob_b64, Some(link_id.to_string()), host, keys).await,
+        _ => client.vault_append_with_keys(store_id, doc_id.clone(), blob_b64, Some(link_id.to_string()), parent_id, keys).await,
+    };
+    let seq = match appended {
         Ok(seq) => seq,
         Err(e) if is_refusal(&e) => {
             debug!("Vault link for store {} doc {:?}: append refused ({}); leaving the document for later", store_id, doc_id, e);

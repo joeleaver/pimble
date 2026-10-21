@@ -481,7 +481,7 @@ COMMANDS:
     cloud-add-hosted    Add an already-hosted store as a local replica
     cloud-share         Share a node of a hosted store (--name <name>; the node's title otherwise)
     cloud-share-info    Show a shared node's share, its state here and its members
-    cloud-share-invite  Invite an address to a share as editor or reader, or change its role
+    cloud-share-invite  Invite an address to a share as editor, commenter or reader, or change its role
     cloud-share-remove  Remove a member or a pending invitation from a share
     cloud-stop-sharing  Stop sharing a node (its documents stay hosted where they are)
 
@@ -1091,8 +1091,8 @@ async fn cloud_share_info(store_id: &str, node_id: &str) -> Result<()> {
 
 async fn cloud_share_invite(store_id: &str, node_id: &str, email: &str, role: &str) -> Result<()> {
     let role = match pimble_rpc::MemberRole::parse(role) {
-        Some(role @ (pimble_rpc::MemberRole::Editor | pimble_rpc::MemberRole::Reader)) => role,
-        _ => anyhow::bail!("unknown role '{}': expected 'editor' or 'reader'", role),
+        Some(role @ (pimble_rpc::MemberRole::Editor | pimble_rpc::MemberRole::Commenter | pimble_rpc::MemberRole::Reader)) => role,
+        _ => anyhow::bail!("unknown role '{}': expected 'editor', 'commenter' or 'reader'", role),
     };
     let client = connect().await?;
     let answer = client.cloud_share_invite(parse_store_id(store_id)?, parse_node_id(node_id)?, email, role).await?;

@@ -171,14 +171,25 @@ fn pane_icon(store: AppStore, pane: PaneId) -> Vec<(String, String)> {
 /// one signal inside another's `with` panics. (`AppStore`'s own helpers nest
 /// freely because they are `untracked`.)
 fn editor_read_only(store: AppStore, pane: PaneId) -> bool {
+    !pane_access(store, pane).allows_write()
+}
+
+/// What this device may change of the pane's document: its store's access,
+/// narrowed by the node's own.
+fn pane_access(store: AppStore, pane: PaneId) -> pimble_core::StoreAccess {
     let state = store.pane(pane);
-    let Some(active) = state.active_edit.get().or_else(|| state.board.get()).or_else(|| state.sheet.get()).or_else(|| state.discussion.get()) else { return false };
+    let Some(active) = state.active_edit.get().or_else(|| state.board.get()).or_else(|| state.sheet.get()).or_else(|| state.discussion.get()) else {
+        return pimble_core::StoreAccess::Full;
+    };
     let sig = store.store_data.with(|map| map.get(&active.store_id).copied());
-    if sig.map_or(false, |sig| sig.with(|s| !s.access.allows_write())) {
-        return true;
-    }
     let node_sig = store.node_data.with(|map| map.get(&(active.store_id, active.node_id)).copied());
-    node_sig.map_or(false, |sig| sig.with(|n| !n.access.allows_write()))
+    let node = node_sig.map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|n| n.access));
+    // A discussion node answers for itself: the store's `Comment` lets its
+    // commenter write it.
+    if !node.allows_write() || node_sig.is_some_and(|sig| sig.with(|n| n.node_type == pimble_core::node_types::DISCUSSION)) {
+        return node;
+    }
+    sig.map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|s| s.access))
 }
 
 /// One pane slot: its title strip, the read-only sentence when it applies,
@@ -347,7 +358,7 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                 class: "pimble-editor__read-only",
                 // A discussion says it in its own place, where its message box would be.
                 style: {move || if (state.show_editor.get() || state.show_board.get() || state.show_sheet.get()) && !state.show_discussion.get() && editor_read_only(store, pane) { "" } else { "display: none;" }},
-                {pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string()}
+                {move || pane_access(store, pane).refusal().to_string()}
             }
             {content_wrap}
             {board_view}

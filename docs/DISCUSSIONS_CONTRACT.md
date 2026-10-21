@@ -580,4 +580,38 @@ the local stack with the desktop app and the browser as one account: the desktop
 state reaching the browser, off from the browser reaching the desktop within a minute, and
 on again. **Deploy note:** the accounts service's schema has a new type (`PersonalDoc`).
 
-Wave 6 (the commenter role) is not started.
+## Built in wave 6 (2026-10-21, branch `discussions`, rinch `main` 4c5b5fb)
+
+**The commenter role.** `commenter` is a role in the accounts service (`ROLES`, token
+claims), `MemberRole::Commenter` in the Share dialog, the CLI's `cloud-share-invite` and
+the stub accounts service. On a server, `Role::Commenter` reads like a reader and
+writes as `Access::Comment`: `Reach` has a `commentable` set; `require_doc_write` takes a
+commenter's write of a discussion they reach (`judge_access` answers `Full` for a
+discussion document, `Comment` for every other one); a new discussion is a
+`createAttachment` (plain stores) or a `vaultAppend` with `discussion: true` naming the
+host (vault stores, which keep a discussion set in `scopes.json`, only grown, which the
+owner's upkeep publishes with `setScope`'s `discussions`). Refusals: "You can comment here,
+not change it." (`StoreAccess::COMMENT_ONLY_REFUSAL`; `StoreAccess::refusal` picks the
+sentence), and a replica answers it for any write it refuses where commenting is allowed
+(`write_refusal`).
+
+A member's replica: `sync.json` carries `comment_roots` beside `read_only_roots`
+(`HeldAs::from_rows`; access is `Comment` when no root is edited and some are commented),
+`LocalStore::comment_refused` judges discussions, `scope_roots_above` follows
+`attached_to`, and the vault link pushes a commenter's discussions and holds everything
+else back, marked (before this, a commenter's discussion stayed on their device). The
+browser's vault client judges the same way (`AccountStore::access`/`node_access`,
+`VaultStore::access_of`, `refuse_write` letting through a new discussion and a
+discussion's edits). The app: a note a commenter reaches is locked and says the
+commenter's sentence; the row menu offers "Start a Discussion" and nothing else that
+writes; "Insert Discussion" (in the text) is an editor's.
+
+Tests: `share.rs` `a_commenter_starts_a_discussion_and_changes_nothing_else` (refusals, a
+discussion and a message from the commenter reaching the owner, the owner's answer
+reaching the commenter), the browser client's
+`a_commenter_writes_discussions_and_nothing_else`, the vault discussion set. Checked on
+the local stack: alice shares a folder with bob as a commenter; in the browser bob's note
+is locked with the commenter's sentence, he starts a discussion and posts, and the
+message is on alice's machine (her search finds it) and nowhere in clear on the hosted
+disk. **Not checked on screen:** a commenter on the desktop app (the same replica code the
+test drives, and the same UI). **Not built:** a commenter role for agents.

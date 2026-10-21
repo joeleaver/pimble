@@ -147,6 +147,7 @@ pub fn access_words(access: pimble_core::StoreAccess) -> &'static str {
     match access {
         pimble_core::StoreAccess::Full => "",
         pimble_core::StoreAccess::Read => "read only",
+        pimble_core::StoreAccess::Comment => "can comment",
     }
 }
 
@@ -272,6 +273,7 @@ pub fn access_note(access: pimble_core::StoreAccess) -> &'static str {
     match access {
         pimble_core::StoreAccess::Full => "",
         pimble_core::StoreAccess::Read => pimble_core::StoreAccess::READ_ONLY_REFUSAL,
+        pimble_core::StoreAccess::Comment => pimble_core::StoreAccess::COMMENT_ONLY_REFUSAL,
     }
 }
 
@@ -1286,11 +1288,13 @@ impl AppStore {
     pub fn node_access_tracked(&self, store_id: StoreId, node_id: NodeId) -> pimble_core::StoreAccess {
         let store_sig = self.store_data.with(|map| map.get(&store_id).copied());
         let store_access = store_sig.map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|s| s.access));
-        if !store_access.allows_write() {
+        if store_access == pimble_core::StoreAccess::Read {
             return store_access;
         }
+        // Held as a commenter: what the server judged of the node (a
+        // discussion is written, anything else commented on).
         let node_sig = self.node_data.with(|map| map.get(&(store_id, node_id)).copied());
-        node_sig.map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|n| n.access))
+        node_sig.map_or(store_access, |sig| sig.with(|n| n.access))
     }
 
     /// The access the held copy of a node carries (untracked), whatever its
@@ -1310,11 +1314,11 @@ impl AppStore {
         let store_access = self
             .store_data
             .with(|map| map.get(&store_id).map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|s| s.access)));
-        if !store_access.allows_write() {
+        if store_access == pimble_core::StoreAccess::Read {
             return store_access;
         }
         self.node_data
-            .with(|map| map.get(&(store_id, node_id)).map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|n| n.access)))
+            .with(|map| map.get(&(store_id, node_id)).map_or(store_access, |sig| sig.with(|n| n.access)))
     }
 
     /// Record what this device may change in a store as the server has it

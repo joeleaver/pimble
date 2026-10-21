@@ -105,7 +105,7 @@ pub(crate) fn add_picture(store: AppStore, pane: PaneId, bytes: Vec<u8>, alt: St
         return;
     };
     if !store.node_access(active.store_id, active.node_id).allows_write() {
-        crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
+        crate::events::show_notice(store, store.node_access(active.store_id, active.node_id).refusal().to_string());
         return;
     }
     let request_id = NEXT_REQUEST.with(|next| next.replace(next.get() + 1));
@@ -170,7 +170,7 @@ pub fn insert_image(store: AppStore) {
         return;
     };
     if !store.node_access(active.store_id, active.node_id).allows_write() {
-        crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
+        crate::events::show_notice(store, store.node_access(active.store_id, active.node_id).refusal().to_string());
         return;
     }
     // Taken before the dialog opens: the caret is the person's choice of

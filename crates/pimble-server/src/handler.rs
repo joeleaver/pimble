@@ -89,7 +89,7 @@ use uuid::Uuid;
 
 use crate::keystore::Keystore;
 use crate::principal::{
-    authorize, authorize_owner, authorize_service_only, no_grant_for_document_error, principal_of, read_only_error, readable, scope_roots_of, service_extensions, Access,
+    authorize, authorize_owner, authorize_service_only, comment_only_error, no_grant_for_document_error, principal_of, read_only_error, readable, scope_roots_of, service_extensions, Access,
     Principal,
 };
 use crate::sync_link::{SyncLink, SyncLinkHandle};
@@ -198,22 +198,30 @@ pub(crate) fn plain_scope(tree: &Tree, roots: &[NodeId]) -> HashSet<NodeId> {
 struct Reach {
     readable: HashSet<NodeId>,
     writable: HashSet<NodeId>,
+    /// Where discussions may be written (docs/DISCUSSIONS_CONTRACT.md
+    /// section 7): the scopes of the roots held as a commenter or more.
+    commentable: HashSet<NodeId>,
 }
 
 impl Reach {
     fn of(manager: &StoreManager, principal: &Principal, store_id: StoreId) -> Option<Self> {
         let read_roots = scope_roots_of(principal, store_id, Access::Read)?;
         let write_roots = scope_roots_of(principal, store_id, Access::Write).unwrap_or_default();
+        let comment_roots = scope_roots_of(principal, store_id, Access::Comment).unwrap_or_default();
         let readable = scope_set(manager, store_id, &read_roots);
         // The common case, one role for every root, computes one set.
-        let writable = if write_roots.len() == read_roots.len() {
-            readable.clone()
-        } else if write_roots.is_empty() {
-            HashSet::new()
-        } else {
-            scope_set(manager, store_id, &write_roots)
+        let set_of = |roots: &[NodeId]| {
+            if roots.len() == read_roots.len() {
+                readable.clone()
+            } else if roots.is_empty() {
+                HashSet::new()
+            } else {
+                scope_set(manager, store_id, roots)
+            }
         };
-        Some(Self { readable, writable })
+        let writable = set_of(&write_roots);
+        let commentable = set_of(&comment_roots);
+        Some(Self { readable, writable, commentable })
     }
 
     /// A document outside every scope is refused without saying whether it
@@ -245,6 +253,38 @@ fn require_in_scope(reach: &Option<Reach>, id: NodeId, needed: Access) -> Result
     }
 }
 
+/// Whether `principal` may write discussions at `id` (a discussion, or the
+/// node one is started on): a commenter's role or more, in a scope held so.
+fn may_comment(principal: &Principal, reach: &Option<Reach>, store_id: StoreId, id: NodeId) -> bool {
+    authorize(principal, store_id, Access::Comment).is_ok() && reach.as_ref().is_none_or(|r| r.commentable.contains(&id))
+}
+
+/// What a replica answers a write it refuses: a commenter's sentence where
+/// the person may comment on what they tried to change, the reader's
+/// otherwise (docs/DISCUSSIONS_CONTRACT.md section 7).
+fn write_refusal(manager: &StoreManager, store_id: StoreId, ids: &[NodeId]) -> ErrorObjectOwned {
+    if manager.comment_refused(store_id, ids) {
+        read_only_error()
+    } else {
+        comment_only_error()
+    }
+}
+
+/// The one judgement of a write of document `id` (docs/DISCUSSIONS_CONTRACT.md
+/// section 7): an editor's in their scope, or a commenter's of a discussion
+/// they reach. The refusal names which: a commenter's sentence for a
+/// commenter, a reader's for a reader, "no grant" outside every scope.
+fn require_doc_write(manager: &StoreManager, principal: &Principal, reach: &Option<Reach>, store_id: StoreId, id: NodeId) -> Result<(), ErrorObjectOwned> {
+    if authorize(principal, store_id, Access::Write).is_ok() && require_in_scope(reach, id, Access::Write).is_ok() {
+        return Ok(());
+    }
+    if may_comment(principal, reach, store_id, id) {
+        return if manager.is_discussion(store_id, id) { Ok(()) } else { Err(comment_only_error()) };
+    }
+    authorize(principal, store_id, Access::Write)?;
+    require_in_scope(reach, id, Access::Write)
+}
+
 /// What `principal` may change of node `id` in plain store `store_id`: the
 /// judgement every `Node` an RPC returns carries as [`Node::access`]
 /// (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"), so a client knows
@@ -261,6 +301,11 @@ fn judge_access(manager: &StoreManager, principal: &Principal, reach: &Option<Re
     let role_allows = authorize(principal, store_id, Access::Write).is_ok() && require_in_scope(reach, id, Access::Write).is_ok();
     if role_allows && !manager.write_refused(store_id, &[id]) {
         StoreAccess::Full
+    } else if may_comment(principal, reach, store_id, id) && !manager.comment_refused(store_id, &[id]) {
+        // A commenter writes a discussion as an editor does, and starts
+        // one on anything else they reach (docs/DISCUSSIONS_CONTRACT.md
+        // section 7).
+        if manager.is_discussion(store_id, id) { StoreAccess::Full } else { StoreAccess::Comment }
     } else {
         StoreAccess::Read
     }
@@ -660,7 +705,7 @@ fn judge_move_source(manager: &StoreManager, reach: &Option<Reach>, store_id: St
     let mut judged_ids = vec![node_id];
     judged_ids.extend(listing.iter().copied());
     if manager.write_refused(store_id, &judged_ids) {
-        return Err(read_only_error());
+        return Err(write_refusal(&manager, store_id, &judged_ids));
     }
     Ok(listing.first().copied().unwrap_or(stored_parent_id))
 }
@@ -1393,7 +1438,7 @@ impl RpcHandler {
                 continue;
             }
             if manager.write_refused(store_id, &[node_id]) {
-                return Err(read_only_error());
+                return Err(write_refusal(&manager, store_id, &[node_id]));
             }
             return Ok((store_id, manager.blobs(store_id).map_err(to_rpc_error)?));
         }
@@ -1429,8 +1474,9 @@ impl RpcHandler {
     /// (`apply_node_update_from`), so a reader's replica still receives
     /// everything.
     async fn reject_if_read_only(&self, store_id: StoreId, ids: &[NodeId]) -> Result<(), ErrorObjectOwned> {
-        if self.store_manager.read().await.write_refused(store_id, ids) {
-            return Err(read_only_error());
+        let manager = self.store_manager.read().await;
+        if manager.write_refused(store_id, ids) {
+            return Err(write_refusal(&manager, store_id, ids));
         }
         Ok(())
     }
@@ -1447,7 +1493,7 @@ impl RpcHandler {
             }
         }
         if manager.write_refused(store_id, &[node_id]) {
-            return Err(read_only_error());
+            return Err(write_refusal(&manager, store_id, &[node_id]));
         }
         Ok(())
     }
@@ -1854,6 +1900,7 @@ impl RpcHandler {
                     access: held_as.access,
                     shared_by: held_as.shared_by.clone(),
                     read_only_roots: held_as.read_only_roots.clone(),
+                    comment_roots: held_as.comment_roots.clone(),
                 },
             )
             .await
@@ -2190,7 +2237,7 @@ impl RpcHandler {
             .await
             .map_err(to_rpc_error)?;
         manager
-            .write_sync_config(created_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None, mode: pimble_store::SyncMode::Sync, via_relay: false, last_seq: Default::default(), vault_key_id: None, access: StoreAccess::Full, shared_by: None, read_only_roots: Vec::new() })
+            .write_sync_config(created_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None, mode: pimble_store::SyncMode::Sync, via_relay: false, last_seq: Default::default(), vault_key_id: None, access: StoreAccess::Full, shared_by: None, read_only_roots: Vec::new(), comment_roots: Vec::new() })
             .await
             .map_err(to_rpc_error)?;
         let mut store = manager.get_store_info(created_id).map_err(to_rpc_error)?;
@@ -2767,7 +2814,8 @@ impl PimbleApiServer for RpcHandler {
 
     async fn vault_append(&self, ext: &Extensions, request: VaultAppendRequest) -> Result<VaultAppendResponse, ErrorObjectOwned> {
         let principal = principal_of(ext);
-        authorize(&principal, request.store_id, Access::Write)?;
+        // A commenter's append to a discussion is judged per document below.
+        authorize(&principal, request.store_id, Access::Comment)?;
         debug!("Vault append to store {} doc {:?}", request.store_id, request.doc_id);
 
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -2787,23 +2835,49 @@ impl PimbleApiServer for RpcHandler {
         // store whose request names no parent, or a parent outside the
         // scope, is refused like any other.
         let mut joins_scopes: Option<(Vec<NodeId>, NodeId, NodeId)> = None;
-        if let Some(reach) = Reach::of(&manager, &principal, request.store_id) {
-            let VaultDocId::Node(node_id) = &request.doc_id else {
-                return Err(no_grant_for_document_error());
-            };
-            if reach.readable.contains(node_id) {
-                reach.require(*node_id, Access::Write)?;
-            } else {
-                let held = manager.vault_has_doc(request.store_id, &request.doc_id.as_str()).map_err(to_rpc_error)?;
-                match request.parent_id {
-                    Some(parent_id) if !held => {
-                        reach.require(parent_id, Access::Write)?;
-                        let roots = scope_roots_of(&principal, request.store_id, Access::Read).unwrap_or_default();
-                        joins_scopes = Some((roots, parent_id, *node_id));
+        // A new discussion, and the node it is on: joins the discussion set.
+        let mut new_discussion: Option<(NodeId, NodeId)> = None;
+        let scoped = Reach::of(&manager, &principal, request.store_id);
+        let held = manager.vault_has_doc(request.store_id, &request.doc_id.as_str()).map_err(to_rpc_error)?;
+        match (&scoped, &request.doc_id) {
+            (Some(reach), VaultDocId::Node(node_id)) if reach.readable.contains(node_id) => {
+                require_doc_write(&manager, &principal, &scoped, request.store_id, *node_id)?;
+            }
+            (Some(reach), VaultDocId::Node(node_id)) => match request.parent_id {
+                Some(parent_id) if !held => {
+                    // An editor's new document, or a commenter's new
+                    // discussion, under a node of their scope.
+                    let edits = authorize(&principal, request.store_id, Access::Write).is_ok() && reach.require(parent_id, Access::Write).is_ok();
+                    if !edits {
+                        if !(request.discussion && reach.commentable.contains(&parent_id)) {
+                            reach.require(parent_id, Access::Write)?;
+                            return Err(comment_only_error());
+                        }
                     }
-                    _ => return Err(no_grant_for_document_error()),
+                    let roots = scope_roots_of(&principal, request.store_id, Access::Read).unwrap_or_default();
+                    joins_scopes = Some((roots, parent_id, *node_id));
+                    if request.discussion {
+                        new_discussion = Some((*node_id, parent_id));
+                    }
+                }
+                _ => return Err(no_grant_for_document_error()),
+            },
+            (Some(_), _) => return Err(no_grant_for_document_error()),
+            // The whole store: an editor writes anything; a commenter a
+            // discussion, held or new.
+            (None, VaultDocId::Node(node_id)) => {
+                if held {
+                    require_doc_write(&manager, &principal, &None, request.store_id, *node_id)?;
+                } else if authorize(&principal, request.store_id, Access::Write).is_err() && !request.discussion {
+                    return Err(comment_only_error());
+                }
+                if !held && request.discussion {
+                    if let Some(parent_id) = request.parent_id {
+                        new_discussion = Some((*node_id, parent_id));
+                    }
                 }
             }
+            (None, _) => authorize(&principal, request.store_id, Access::Write)?,
         }
 
         // A document's first append carries its wrapped data key, stored
@@ -2845,6 +2919,9 @@ impl PimbleApiServer for RpcHandler {
             })?;
         if let Some((roots, parent_id, node_id)) = joins_scopes {
             manager.vault_extend_scopes(request.store_id, &roots, parent_id, node_id).await.map_err(to_rpc_error)?;
+        }
+        if let Some(discussion) = new_discussion {
+            manager.vault_add_discussions(request.store_id, vec![discussion]).await.map_err(to_rpc_error)?;
         }
         drop(manager);
 
@@ -3336,6 +3413,11 @@ impl PimbleApiServer for RpcHandler {
         }
         let docs = (!request.remove).then_some(request.scope.doc_ids);
         manager.vault_set_scope(request.store_id, request.scope.root, docs).await.map_err(to_rpc_error)?;
+        // Which of them are discussions (docs/DISCUSSIONS_CONTRACT.md
+        // section 7): what a commenter may write.
+        if !request.discussions.is_empty() {
+            manager.vault_add_discussions(request.store_id, request.discussions).await.map_err(to_rpc_error)?;
+        }
 
         Ok(EmptyResponse {})
     }
@@ -3664,7 +3746,7 @@ impl PimbleApiServer for RpcHandler {
         // it, so in every scope the parent is in.
         require_in_scope(&Reach::of(&manager, &principal, request.store_id), parent_id, Access::Write)?;
         if manager.write_refused(request.store_id, &[parent_id]) {
-            return Err(read_only_error());
+            return Err(write_refusal(&manager, request.store_id, &[parent_id]));
         }
         let (node_id, edit) = manager
             .create_node(request.store_id, node, Some(parent_id))
@@ -3690,7 +3772,7 @@ impl PimbleApiServer for RpcHandler {
         request: CreateAttachmentRequest,
     ) -> Result<CreateNodeResponse, ErrorObjectOwned> {
         let principal = principal_of(ext);
-        authorize(&principal, request.store_id, Access::Write)?;
+        authorize(&principal, request.store_id, Access::Comment)?;
         self.reject_if_vault(request.store_id).await?;
         info!("Creating {} attachment '{}' of node {} in store {}", request.node_type, request.title, request.host_id, request.store_id);
 
@@ -3707,9 +3789,20 @@ impl PimbleApiServer for RpcHandler {
         let host_id = request.host_id;
         let mut manager = self.store_manager.write().await;
         // The attachment is in every scope its host is in, and only the new
-        // document is written: judged as a write there.
-        require_in_scope(&Reach::of(&manager, &principal, request.store_id), host_id, Access::Write)?;
-        if manager.write_refused(request.store_id, &[host_id]) {
+        // document is written: an editor's write there, or a commenter's
+        // start of a discussion on what they reach
+        // (docs/DISCUSSIONS_CONTRACT.md section 7).
+        let reach = Reach::of(&manager, &principal, request.store_id);
+        require_in_scope(&reach, host_id, Access::Read)?;
+        let edits = authorize(&principal, request.store_id, Access::Write).is_ok() && require_in_scope(&reach, host_id, Access::Write).is_ok();
+        let discussion = request.node_type == pimble_core::node_types::DISCUSSION;
+        if !edits {
+            if !(discussion && may_comment(&principal, &reach, request.store_id, host_id)) {
+                return Err(if may_comment(&principal, &reach, request.store_id, host_id) { comment_only_error() } else { read_only_error() });
+            }
+        }
+        let refused = if discussion { manager.comment_refused(request.store_id, &[host_id]) } else { manager.write_refused(request.store_id, &[host_id]) };
+        if refused {
             return Err(read_only_error());
         }
         let (node_id, edit) = manager.create_attachment(request.store_id, node, host_id).map_err(to_rpc_error)?;
@@ -3840,7 +3933,7 @@ impl PimbleApiServer for RpcHandler {
         let mut manager = self.store_manager.write().await;
         require_in_scope(&Reach::of(&manager, &principal, request.store_id), request.node_id, Access::Write)?;
         if manager.write_refused(request.store_id, &[request.node_id]) {
-            return Err(read_only_error());
+            return Err(write_refusal(&manager, request.store_id, &[request.node_id]));
         }
         let edit = manager
             .update_node_metadata(request.store_id, request.node_id, request.metadata)
@@ -3985,7 +4078,7 @@ impl PimbleApiServer for RpcHandler {
                 }
             }
             if manager.write_refused(store_id, &[node_id]) {
-                return Err(read_only_error());
+                return Err(write_refusal(&manager, store_id, &[node_id]));
             }
             let edit = manager.undelete_node(store_id, node_id).map_err(to_rpc_error)?;
             let node = manager.get_node(store_id, node_id).map_err(to_rpc_error)?;
@@ -4028,7 +4121,7 @@ impl PimbleApiServer for RpcHandler {
         let old_parent_id = judge_move_source(&manager, &reach, request.store_id, request.node_id)?;
         require_in_scope(&reach, request.new_parent_id, Access::Write)?;
         if manager.write_refused(request.store_id, &[request.new_parent_id]) {
-            return Err(read_only_error());
+            return Err(write_refusal(&manager, request.store_id, &[request.new_parent_id]));
         }
 
         // What a transplant would tombstone, read before the edit: the id
@@ -4150,7 +4243,7 @@ impl PimbleApiServer for RpcHandler {
         let target_reach = Reach::of(&manager, &principal, request.to_store_id);
         require_in_scope(&target_reach, request.new_parent_id, Access::Write)?;
         if manager.write_refused(request.to_store_id, &[request.new_parent_id]) {
-            return Err(read_only_error());
+            return Err(write_refusal(&manager, request.to_store_id, &[request.new_parent_id]));
         }
 
         let outcome = manager
@@ -4435,7 +4528,7 @@ impl PimbleApiServer for RpcHandler {
         require_in_scope(&Reach::of(&manager, &principal, request.store_id), request.parent_id, Access::Write)?;
         require_in_scope(&Reach::of(&manager, &principal, request.source_store_id), request.source_node_id, Access::Read)?;
         if manager.write_refused(request.store_id, &[request.parent_id]) {
-            return Err(read_only_error());
+            return Err(write_refusal(&manager, request.store_id, &[request.parent_id]));
         }
 
         // Validate that this mount won't create a cycle. This also rejects
@@ -4580,7 +4673,7 @@ impl PimbleApiServer for RpcHandler {
 
                 let manager = self.store_manager.read().await;
                 manager
-                    .write_sync_config(request.store_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None, mode: pimble_store::SyncMode::Sync, via_relay: false, last_seq: Default::default(), vault_key_id: None, access: StoreAccess::Full, shared_by: None, read_only_roots: Vec::new() })
+                    .write_sync_config(request.store_id, &SyncConfig { remote: Self::without_auth(&remote), last_sync: None, mode: pimble_store::SyncMode::Sync, via_relay: false, last_seq: Default::default(), vault_key_id: None, access: StoreAccess::Full, shared_by: None, read_only_roots: Vec::new(), comment_roots: Vec::new() })
                     .await
                     .map_err(to_rpc_error)?;
                 drop(manager);
@@ -4891,7 +4984,8 @@ impl PimbleApiServer for RpcHandler {
         request: ApplyEditRequest,
     ) -> Result<ApplyEditResponse, ErrorObjectOwned> {
         let principal = principal_of(ext);
-        authorize(&principal, request.store_id, Access::Write)?;
+        // A commenter's edit of a discussion is judged per document below.
+        authorize(&principal, request.store_id, Access::Comment)?;
         self.reject_if_vault(request.store_id).await?;
 
         let EditOperation::IncrementalChanges { ref changes } = request.operation;
@@ -4907,16 +5001,33 @@ impl PimbleApiServer for RpcHandler {
             // create is the node's document and the parent's list, and a
             // member may make one under a parent they may write).
             let judged_by = if held { Some(request.node_id) } else { parent_named_by(&bytes) };
-            if let Some(reach) = Reach::of(&manager, &principal, request.store_id) {
-                match judged_by {
-                    Some(id) => reach.require(id, Access::Write)?,
-                    None => return Err(no_grant_for_document_error()),
+            let reach = Reach::of(&manager, &principal, request.store_id);
+            if held {
+                // An editor's write, or a commenter's of a discussion
+                // (docs/DISCUSSIONS_CONTRACT.md section 7).
+                require_doc_write(&manager, &principal, &reach, request.store_id, request.node_id)?;
+            } else {
+                // A new document: an editor's, under a parent they may write
+                // (a commenter starts a discussion with `createAttachment`).
+                authorize(&principal, request.store_id, Access::Write)?;
+                if let Some(reach) = &reach {
+                    match judged_by {
+                        Some(id) => reach.require(id, Access::Write)?,
+                        None => return Err(no_grant_for_document_error()),
+                    }
                 }
             }
             // A relayed edit is not this device's write: a reader's replica
-            // receives everything (`is_link_client`).
-            if !is_link_client(&request.client_id) && judged_by.is_some_and(|id| manager.write_refused(request.store_id, &[id])) {
-                return Err(read_only_error());
+            // receives everything (`is_link_client`). A discussion is judged
+            // as one: a commenter's replica writes it.
+            if !is_link_client(&request.client_id) {
+                if let Some(id) = judged_by {
+                    let discussion = held && manager.is_discussion(request.store_id, id);
+                    let refused = if discussion { manager.comment_refused(request.store_id, &[id]) } else { manager.write_refused(request.store_id, &[id]) };
+                    if refused {
+                        return Err(if discussion || manager.comment_refused(request.store_id, &[id]) { read_only_error() } else { comment_only_error() });
+                    }
+                }
             }
         }
 

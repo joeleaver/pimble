@@ -93,7 +93,7 @@ async fn sharing_a_folder_gives_a_member_its_subtree_and_both_sides_edit_the_tre
     );
     assert!(env.has_share_key(store_id, shared, BOB.0));
     let refused = alice.cloud_share_invite(store_id, shared, CAROL.0, MemberRole::Owner).await.expect_err("owner is no role of a share");
-    assert!(refused.to_string().contains("editors or readers"), "{refused}");
+    assert!(refused.to_string().contains("editors, commenters or readers"), "{refused}");
     assert_eq!(env.scoped_rows(store_id, shared), 1, "and it changed nothing");
 
     // Bob's replica: the folder's subtree and nothing else.
@@ -186,6 +186,23 @@ async fn sharing_a_folder_gives_a_member_its_subtree_and_both_sides_edit_the_tre
 
     a.stop().await.unwrap();
     b.stop().await.unwrap();
+}
+
+/// Post `text` in discussion `node` as `client` sees it, through `applyEdit`.
+async fn post(client: &PimbleClient, store_id: pimble_core::StoreId, node: NodeId, text: &str, who: &str) -> Result<(), pimble_client::ClientError> {
+    use pimble_discussion::{Body, Discussion, Stamp};
+    let doc = NodeDoc::load(&client.get_node(store_id, node).await.unwrap().content).unwrap();
+    let (_, update) = Discussion::of_node(&doc).edit(|t| t.post(Stamp::new(None, "2026-10-21T00:00:00Z"), None, &Body::plain(text))).into_result().unwrap();
+    let changes = base64::engine::general_purpose::STANDARD.encode(update.expect("a post changes the document"));
+    client.apply_edit(store_id, node, who, EditOperation::IncrementalChanges { changes }).await
+}
+
+/// The texts of discussion `node`'s messages as `client` holds them.
+async fn messages(client: &PimbleClient, store_id: pimble_core::StoreId, node: NodeId) -> Vec<String> {
+    match client.get_node(store_id, node).await {
+        Ok(node) => pimble_discussion::Discussion::of_node(&NodeDoc::load(&node.content).unwrap()).read().messages.iter().map(|m| m.body.text()).collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 fn sorted_uuids(mut ids: Vec<Uuid>) -> Vec<Uuid> {
@@ -347,7 +364,6 @@ async fn a_node_moved_into_a_share_reaches_its_member_and_one_moved_out_stops_ar
     rename(&alice, store_id, new_inside, "Private packing").await;
     let pushed = wait_until(Duration::from_secs(10), || async { env.head_on_h(store_id, new_inside).await >= 1 }).await;
     assert!(pushed, "the owner's later edits to the new, private node are hosted as ever");
-    tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(!contains_bytes_recursive(b_dir.path(), b"AFTER-MOVING-OUT"), "and never reach the member");
     assert!(bob.get_node(store_id, new_inside).await.is_err(), "the new private node was never in any share bob holds");
     assert_eq!(child_ids(&bob, store_id, shared).await, vec![fx.deeper, budget]);
@@ -551,6 +567,52 @@ async fn a_reader_reads_the_share_and_cannot_write() {
     c.stop().await.unwrap();
 }
 
+/// A commenter (docs/DISCUSSIONS_CONTRACT.md section 7) reads the share,
+/// starts a discussion on a note in it and posts in it, and changes nothing
+/// else; the owner sees the discussion and answers in it.
+#[tokio::test]
+async fn a_commenter_starts_a_discussion_and_changes_nothing_else() {
+    use pimble_discussion::new_content;
+    let env = spawn_env().await;
+    let (mut a, alice, a_dir) = start_local_server().await;
+    let fx = hosted_fixture(&env, &alice, a_dir.path()).await;
+    let (store_id, shared) = (fx.store_id, fx.shared);
+    alice.cloud_share_node(store_id, shared, "Holiday Plans").await.unwrap();
+    let answer = alice.cloud_share_invite(store_id, shared, CAROL.0, MemberRole::Commenter).await.unwrap();
+    assert_eq!(answer.members.last().map(|m| (m.email.as_str(), m.role, m.status)), Some((CAROL.0, MemberRole::Commenter, ShareMemberStatus::Active)));
+
+    let (mut c, carol, _c_dir) = member_device(&env, CAROL, &fx).await;
+    assert_eq!(carol.list_stores().await.unwrap().iter().find(|s| s.id == store_id).unwrap().access, StoreAccess::Comment);
+    assert_eq!(carol.get_node(store_id, fx.inside).await.unwrap().access, StoreAccess::Comment);
+
+    let refused = |result: Result<(), pimble_client::ClientError>| assert_eq!(result.expect_err("a commenter's replica refuses the note").to_string(), StoreAccess::COMMENT_ONLY_REFUSAL);
+    refused(carol.create_node(store_id, Some(shared), "document", "no").await.map(|_| ()));
+    refused(carol.delete_node(store_id, fx.inside).await);
+    let changes = base64::engine::general_purpose::STANDARD.encode(NodeDoc::from_plain_text("no").unwrap().save());
+    refused(carol.apply_edit(store_id, fx.inside, "carol", EditOperation::IncrementalChanges { changes }).await);
+
+    // A discussion on the note, and a message in it.
+    let talk = carol
+        .create_attachment(store_id, fx.inside, pimble_core::node_types::DISCUSSION, "Enough socks?", Some(new_content(None)), HashMap::new())
+        .await
+        .expect("a commenter starts a discussion");
+    post(&carol, store_id, talk, "Three pairs?", "carol").await.expect("a commenter posts in a discussion");
+
+    // The owner sees it on the note, and answers.
+    let arrived = wait_until(Duration::from_secs(10), || async {
+        alice.list_attachments(store_id, fx.inside).await.unwrap_or_default().iter().any(|n| n.id == talk) && messages(&alice, store_id, talk).await == ["Three pairs?"]
+    })
+    .await;
+    assert!(arrived, "the owner sees the discussion and carol's message");
+    post(&alice, store_id, talk, "Four.", "alice").await.unwrap();
+    let answered = wait_until(Duration::from_secs(10), || async { messages(&carol, store_id, talk).await.len() == 2 }).await;
+    assert!(answered, "and the commenter receives the answer");
+    assert_eq!(node_text(&alice, store_id, fx.inside).await, node_text(&carol, store_id, fx.inside).await, "the note itself is as alice left it");
+
+    a.stop().await.unwrap();
+    c.stop().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_member_can_neither_share_from_a_share_nor_change_it() {
     let env = spawn_env().await;
@@ -716,7 +778,6 @@ async fn stopping_a_share_leaves_the_documents_hosted_and_removes_scope_marker_a
 
     // The member's replica keeps what it had and receives nothing more.
     seed_content(&alice, store_id, fx.inside, "alice", "AFTER-THE-SHARE-STOPPED").await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(!contains_bytes_recursive(b_dir.path(), b"AFTER-THE-SHARE-STOPPED"));
     assert!(node_text(&bob, store_id, fx.inside).await.contains("socks and a map"));
 
