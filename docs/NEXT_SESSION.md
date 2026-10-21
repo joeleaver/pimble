@@ -1,19 +1,18 @@
 # Next session: start here
 
-**2026-10-21: discussions waves 1 to 6 built** on branch `discussions` (from `master`
-e7295d5, nothing pushed; rinch at `main` 4c5b5fb in both locks). docs/DISCUSSIONS_CONTRACT.md
-is the reference: "Decisions" are Joe's from today; "Built in wave 1", "Built in waves 2
-to 5" and "Built in wave 6" say what exists, how each was checked and what is missing.
-
-Next, in order (Joe: "do them here sequentially"):
-
-1. Discussions are built through margin markers, on rinch `main` 42e2d2df; nothing from
-   the Rinch session is outstanding. Left: the marker popover, a text context-menu item,
-   a "displaced" marker look, Safari's IME Enter guard, agents as commenters (contract,
-   "Not built" lines). Merging `discussions` into `master` and releasing are Joe's call.
-2. Deploying needs the accounts service's new `PersonalDoc` schema type with it, and the
-   hosted server and every device on this version together (the `commenter` role and the
-   discussion set in `scopes.json`).
+**2026-10-21, evening: v0.12.0 released and deployed, with discussions** (Joe: "merge,
+build, release and install please"). Branch `discussions` merged into `master`; release
+commit afb4cfc, tag `v0.12.0`, rinch `main` 42e2d2df in both locks. Before it: 1061 tests
+green, the Windows check of `pimble-app` and `pimble-mcp` (`llvm-lib` from
+`/usr/lib/llvm-21/bin` on PATH), a backup of the production accounts database
+(`bkp_1792608093274_32c993b10d7e6e96`; the release adds the `PersonalDoc` schema type).
+After it: the Release run built Linux and Windows packages, CI passed, jkbase deployment
+v27 is active (the site, `/app/`, health, JWKS and releases answer 200; `/rpc` and
+`/api/v1/me/personal` 401; the hosted server opened its three stores), and v0.12.0 is
+installed here with `tools/install-release.sh`. docs/DISCUSSIONS_CONTRACT.md is the
+reference for what discussions are; its "Not built" lines are what is left: the marker
+popover, a text context-menu item, a "displaced" marker, Safari's IME Enter guard, agents
+as commenters.
 
 **2026-10-20, end of session: sheets waves 1 to 3 built, plus sheet nodes embedded in
 text.** Branch `sheets` (on `master`, 25 commits, nothing pushed); rinch at `main` fc14187
