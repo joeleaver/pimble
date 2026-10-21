@@ -208,6 +208,16 @@ formulas, or at least google-sheet level"), as it works in an Excel Table:
   - numbers: `ROUND`, `ROUNDUP`, `ROUNDDOWN`, `ABS`, `INT`, `MOD`, `SQRT`, `POWER`
 - **Dates are Excel serial numbers**, so `TODAY()-7`, `">"&EOMONTH(TODAY(),-1)` and
   `DATE(2026,13,1)` behave as in Excel.
+- **An automatic formula column takes its format from its formula** (2026-10-20), as
+  Excel gives a new formula the format of what it refers to (`formula/infer.rs`): a
+  column shows its own format, a field the one its text was typed in (an ISO date,
+  `$120`, `15%`), and a row link's `.column` that column's. A date plus or minus a number
+  stays a date (`'Trip'!trip_start + [@day] - 1`, `[@start] + 7`); a date minus a date is
+  the days between, a plain number. `*` and `/` keep money, and a side's format when the
+  other is a plain number or a percent. The date functions answer dates, and `SUM`,
+  `MIN`, `MAX`, `ROUND`, `IF`, `IFERROR`, `XLOOKUP`, `INDEX`, the `…IFS` family and
+  their kin pass on the format of the values they return. Anything else, and a column
+  that reads itself, shows a plain number. A column with a format chosen keeps it.
 - **Errors are Excel's**: `#N/A`, `#VALUE!`, `#REF!`, `#NAME?`, `#DIV/0!`, `#SPILL!`
   (a list where one value goes), `#CALC!`, `#CIRC!` (a column that depends on itself).
   Each carries a sentence for the formula bar.

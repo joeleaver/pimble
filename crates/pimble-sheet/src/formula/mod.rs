@@ -29,6 +29,7 @@ pub mod dates;
 mod engine;
 mod format;
 mod functions;
+mod infer;
 mod names;
 mod parser;
 pub mod rehome;

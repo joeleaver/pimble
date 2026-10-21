@@ -602,3 +602,72 @@ fn deep_and_long_formulas_are_refused_not_crashed() {
         let _ = en.evaluate(&node(LAB), None, None, junk);
     }
 }
+
+/// An automatic formula column shows its values in the format its formula
+/// implies, as Excel gives a new formula the format of what it refers to:
+/// a date field plus days is a date (found 2026-10-20 as `46,296`).
+#[test]
+fn automatic_format_follows_the_formula() {
+    let mut b = TestBook::new(LAB);
+    b.add(LAB, "Plans", None);
+    b.add(78, "Rome trip", None).fields = vec![
+        ("trip_start".into(), "2026-11-03".into()),
+        ("budget".into(), "$1,200".into()),
+        ("guests".into(), "2".into()),
+    ];
+    let hotels = TB::new("ho", "Hotels")
+        .text("name")
+        .money("rate")
+        .row("h1", vec![("name", s("Locarno")), ("rate", n(180.0))])
+        .build();
+    let it = TB::new("it", "Itinerary")
+        // Reads a column to its right, which is inferred from a field.
+        .formula("eve", "=[@date] - 1", Format::Auto)
+        .number("day")
+        .link("hotel", "ho")
+        .date("booked")
+        .money("price")
+        .hours("hours")
+        .formula("date", "='Rome trip'!trip_start + [@day] - 1", Format::Auto)
+        .formula("next", "=[@date] + 1", Format::Auto)
+        .formula("lead", "=[@date] - [@booked]", Format::Auto)
+        .formula("plus", "=[@booked] + 7", Format::Auto)
+        .formula("cost", "=[@hours] * [@price]", Format::Auto)
+        .formula("share", "='Rome trip'!budget / 'Rome trip'!guests", Format::Auto)
+        .formula("last", "=MAX([date])", Format::Auto)
+        .formula("pick", "=IF([@day] > 1, [@date], TODAY())", Format::Auto)
+        .formula("count", "='Rome trip'!guests * [@day]", Format::Auto)
+        .formula("night", "=[@hotel].rate", Format::Auto)
+        .formula("as number", "='Rome trip'!trip_start + [@day]", Format::Number)
+        .row("r1", vec![("day", n(1.0)), ("booked", d("2026-10-01")), ("price", n(20.0)), ("hours", n(2.0)), ("hotel", r("h1"))])
+        .row("r2", vec![("day", n(2.0)), ("booked", d("2026-10-01")), ("price", n(20.0)), ("hours", n(2.0))])
+        .build();
+    b.note(LAB).sheets.tables.extend([hotels, it]);
+    let en = Engine::new(&b);
+    let tables = en.compute_node(&node(LAB)).unwrap();
+    let t = table(&tables, "Itinerary");
+    let format = |name: &str| t.columns[t.column_index(name).unwrap()].format;
+    for (name, want) in [
+        ("date", Format::Date),
+        ("next", Format::Date),
+        ("lead", Format::Auto),
+        ("plus", Format::Date),
+        ("cost", Format::Money),
+        ("share", Format::Money),
+        ("last", Format::Date),
+        ("pick", Format::Date),
+        ("count", Format::Auto),
+        ("as number", Format::Number),
+        ("eve", Format::Date),
+        ("night", Format::Money),
+    ] {
+        assert_eq!(format(name), want, "{name}");
+    }
+    let shows = |row: &str, name: &str| shown(&en, cell(t, row, name), format(name));
+    assert_eq!(shows("r1", "date"), "Tue, Nov 3");
+    assert_eq!(shows("r2", "date"), "Wed, Nov 4");
+    assert_eq!(shows("r2", "lead"), "34");
+    assert_eq!(shows("r1", "cost"), "$40.00");
+    assert_eq!(shows("r1", "eve"), "Mon, Nov 2");
+    assert_eq!(shows("r1", "night"), "$180.00");
+}
