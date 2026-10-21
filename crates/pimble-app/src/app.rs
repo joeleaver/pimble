@@ -1451,9 +1451,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             };
 
             let base_label_style = if is_store_root {
-                "cursor: default; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.03em;"
+                "cursor: default; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.03em; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"
             } else {
-                "cursor: default;"
+                // A long title ends in an ellipsis at the row's end, rather
+                // than running on under the scrollbar and past the explorer.
+                "cursor: default; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"
             };
 
             // Drag-and-drop callbacks
@@ -1951,11 +1953,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             let wrapper = rsx! {
                 span {
                     class: "rinch-tree__label",
-                    style: "flex: 1; display: inline-flex; align-items: center;",
+                    style: "flex: 1; min-width: 0; display: inline-flex; align-items: center;",
 
-                    // The row colour: a band across the whole row, the
+                    // The row color: a band across the whole row, the
                     // indent and chevron included, behind the icon and title
-                    // (the row is `position: relative`, `APP_CSS`).
+                    // (the row is its stacking context, `APP_CSS`).
                     span {
                         class: "pimble-row-band",
                         style: {
@@ -2513,7 +2515,9 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     style: {
                         let nv = nv_effect.clone();
                         move || {
-                            let base = "flex: 1; display: flex; align-items: center; border-radius: 2px; transition: background 0.1s, opacity 0.1s;";
+                            // `min-width: 0`: a flex item never narrower than its content
+                            // pushed a long title out past the row (and the scrollbar).
+                            let base = "flex: 1; min-width: 0; display: flex; align-items: center; border-radius: 2px; transition: background 0.1s, opacity 0.1s;";
                             let is_being_dragged = drag_ctx.get().as_deref() == Some(&nv);
                             let is_target = store.drop_target.get().as_deref() == Some(&nv)
                                 && drag_ctx.is_active();

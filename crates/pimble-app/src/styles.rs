@@ -193,11 +193,16 @@ pub(crate) const APP_CSS: &str = "
     flex-direction: column;
 }
 
+/* Its own stacking context, so a positioned row is drawn inside it and under
+   its scrollbar; and room on the right for that scrollbar (rinch's is an
+   overlay, 6px wide and 2px in from the edge), so no row runs under it. */
 .pimble-sidebar__tree {
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    padding: 0 4px 8px 8px;
+    padding: 0 10px 8px 8px;
+    position: relative;
+    z-index: 0;
 }
 
 /* ── Tree refinements ───────────────────────────────────────── */
@@ -240,13 +245,16 @@ pub(crate) const APP_CSS: &str = "
 }
 /* A node's row color (`custom_keys::BACKGROUND`): a band the label draws
    across the whole row, indent included, under the chevron, icon and title.
-   Held back on the selected row so the selection still shows through it. */
+   Held back on the selected row so the selection still shows through it.
+   Each row is one stacking context and the band sits at its bottom
+   (`z-index: -1`), above the row's own hover and selection background and
+   under everything in it. Before 2026-10-21 the chevron, the spacer and the
+   title were each lifted over the band with their own `z-index`, three or
+   four layers a row: about 430 stacking-order builds a frame on the family
+   store with a few folders open, on every hover and scroll. */
 .rinch-tree__node-content {
     position: relative;
-}
-.rinch-tree__chevron, .rinch-tree__spacer, .rinch-tree__label > span {
-    position: relative;
-    z-index: 1;
+    z-index: 0;
 }
 .rinch-tree__label > .pimble-row-band {
     position: absolute;
@@ -254,7 +262,7 @@ pub(crate) const APP_CSS: &str = "
     top: 0;
     right: 0;
     bottom: 0;
-    z-index: 0;
+    z-index: -1;
     border-radius: var(--rinch-radius-sm);
     pointer-events: none;
 }
