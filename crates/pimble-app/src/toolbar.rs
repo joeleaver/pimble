@@ -105,6 +105,18 @@ enum Cmd {
     Undo,
     Redo,
     ClearFormatting,
+    /// One of the Edit menu's inserts, into the focused pane's note.
+    Insert(Insert),
+}
+
+/// The Edit menu's inserts, the same functions its items call (`menus.rs`).
+#[derive(Clone, Copy)]
+enum Insert {
+    Image,
+    Board,
+    Sheet,
+    SheetNode,
+    Field,
 }
 
 #[derive(Clone, Copy)]
@@ -154,6 +166,14 @@ fn button_groups() -> Vec<Vec<BtnDef>> {
             BtnDef { icon: TablerIcon::RowRemove, tooltip: "Delete Row", cmd: Cmd::Run("deleteRow"), active_check: ActiveCheck::None },
             BtnDef { icon: TablerIcon::ColumnRemove, tooltip: "Delete Column", cmd: Cmd::Run("deleteColumn"), active_check: ActiveCheck::None },
             BtnDef { icon: TablerIcon::TableMinus, tooltip: "Delete Table", cmd: Cmd::Run("deleteTable"), active_check: ActiveCheck::None },
+        ],
+        // Things that go in a note: the Edit menu's inserts, at the caret.
+        vec![
+            BtnDef { icon: TablerIcon::Photo, tooltip: "Insert Image...", cmd: Cmd::Insert(Insert::Image), active_check: ActiveCheck::None },
+            BtnDef { icon: TablerIcon::Chalkboard, tooltip: "Insert Board...", cmd: Cmd::Insert(Insert::Board), active_check: ActiveCheck::None },
+            BtnDef { icon: TablerIcon::Table, tooltip: "Insert Sheet", cmd: Cmd::Insert(Insert::Sheet), active_check: ActiveCheck::None },
+            BtnDef { icon: TablerIcon::TableShare, tooltip: "Insert Sheet from a Node...", cmd: Cmd::Insert(Insert::SheetNode), active_check: ActiveCheck::None },
+            BtnDef { icon: TablerIcon::Forms, tooltip: "Add Field", cmd: Cmd::Insert(Insert::Field), active_check: ActiveCheck::None },
         ],
         // Insert & utility
         vec![
@@ -234,9 +254,20 @@ fn check_active_with(h: &EditorHandle, check: &ActiveCheck) -> bool {
     }
 }
 
-fn execute_cmd(pane: PaneId, cmd: &Cmd) {
+fn execute_cmd(store: AppStore, pane: PaneId, cmd: &Cmd) {
     let h = editor(pane);
     match cmd {
+        // These act on the focused pane, which is the one the toolbar follows.
+        Cmd::Insert(what) => {
+            match what {
+                Insert::Image => crate::pictures::insert_image(store),
+                Insert::Board => crate::text_boards::insert_board(store),
+                Insert::Sheet => crate::sheets::in_text::insert_sheet(store),
+                Insert::SheetNode => crate::sheets::in_text::insert_sheet_node(store),
+                Insert::Field => crate::fields::add_field(store),
+            }
+            return;
+        }
         Cmd::ToggleWrap(tag) => {
             let name = match *tag {
                 "strong" => "toggleBold",
@@ -360,7 +391,7 @@ pub(crate) fn render_pimble_toolbar(
         }
 
         for btn_def in group {
-            let btn = render_btn(__scope, bit, btn_def);
+            let btn = render_btn(__scope, store, bit, btn_def);
             toolbar.append_child(&btn);
             bit += 1;
         }
@@ -371,6 +402,7 @@ pub(crate) fn render_pimble_toolbar(
 
 fn render_btn(
     __scope: &mut RenderScope,
+    store: AppStore,
     bit: u32,
     def: BtnDef,
 ) -> NodeHandle {
@@ -391,7 +423,7 @@ fn render_btn(
             },
             onclick: {
                 let cmd = cmd.clone();
-                move || execute_cmd(TARGET.with(Cell::get), &cmd)
+                move || execute_cmd(store, TARGET.with(Cell::get), &cmd)
             },
             span {
                 style: "width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center;",
