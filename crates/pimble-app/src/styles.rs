@@ -579,6 +579,323 @@ pub(crate) const APP_CSS: &str = "
     border-bottom: 1px solid var(--rinch-color-border);
 }
 
+/* ── Discussions (docs/DISCUSSIONS_CONTRACT.md) ───────────────── */
+
+/* A discussion pane: the topic, the thread scrolling, the message box at
+   the foot. Replies are indented with a thread line, at most five levels. */
+.pimble-discussion {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+.pimble-discussion__head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 20px 8px;
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+
+.pimble-discussion__topic {
+    flex: 1;
+    font-size: 17px;
+    font-weight: 600;
+    border: none;
+    background: transparent;
+    color: var(--rinch-color-text);
+    padding: 4px 0;
+}
+
+.pimble-discussion__head-button,
+.pimble-discussion__send {
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+    background: var(--rinch-color-default);
+    color: var(--rinch-color-text);
+    padding: 3px 10px;
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.pimble-discussion__send {
+    background: var(--rinch-primary-color);
+    border-color: var(--rinch-primary-color);
+    color: white;
+}
+
+.pimble-discussion__resolved,
+.pimble-discussion__message,
+.pimble-discussion__read-only {
+    padding: 6px 20px;
+    font-size: 13px;
+    color: var(--rinch-color-dimmed);
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+
+.pimble-discussion__thread {
+    flex: 1;
+    overflow: auto;
+    padding: 12px 20px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-height: 0;
+}
+
+.pimble-discussion__empty {
+    color: var(--rinch-color-dimmed);
+    font-size: 14px;
+    padding: 12px 0;
+}
+
+.pimble-discussion__msg {
+    padding: 2px 0 2px 0;
+}
+
+.pimble-discussion__msg--reply {
+    border-left: 2px solid var(--rinch-color-border);
+    padding-left: 10px;
+}
+
+.pimble-discussion__meta {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-discussion__author {
+    font-weight: 600;
+    color: var(--rinch-color-text);
+    font-size: 13px;
+}
+
+.pimble-discussion__agent {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+    padding: 0 4px;
+}
+
+.pimble-discussion__body {
+    font-size: 14px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    color: var(--rinch-color-text);
+    padding: 2px 0;
+}
+
+.pimble-discussion__body--deleted {
+    font-style: italic;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-discussion__a {
+    color: var(--rinch-primary-color);
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+.pimble-discussion__actions {
+    display: flex;
+    gap: 10px;
+}
+
+.pimble-discussion__link-button {
+    border: none;
+    background: transparent;
+    color: var(--rinch-color-dimmed);
+    cursor: pointer;
+    font-size: 12px;
+    padding: 0;
+}
+
+.pimble-discussion__link-button:hover {
+    color: var(--rinch-color-text);
+}
+
+.pimble-discussion__deleted {
+    padding: 4px 20px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.pimble-discussion__deleted-row {
+    display: flex;
+    gap: 10px;
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-discussion__deleted-text {
+    flex: 1;
+}
+
+.pimble-discussion__composer {
+    border-top: 1px solid var(--rinch-color-border);
+    padding: 8px 20px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    position: relative;
+}
+
+.pimble-discussion__replying {
+    display: flex;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-discussion__input,
+.pimble-discussion__edit-input {
+    width: 100%;
+    min-height: 60px;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+    background: var(--rinch-color-body);
+    color: var(--rinch-color-text);
+    padding: 6px 8px;
+    font-size: 14px;
+    resize: vertical;
+}
+
+.pimble-discussion__composer-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.pimble-discussion__hint {
+    flex: 1;
+    font-size: 11px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-discussion__emoji-button {
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    font-size: 16px;
+    padding: 0 2px;
+}
+
+.pimble-discussion__emoji-picker {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px;
+    max-width: 330px;
+    padding: 6px;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+    background: var(--rinch-color-surface);
+}
+
+.pimble-discussion__emoji {
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    font-size: 18px;
+    width: 30px;
+    height: 30px;
+    border-radius: var(--rinch-radius-sm);
+}
+
+.pimble-discussion__emoji:hover {
+    background: var(--rinch-color-option-hover);
+}
+
+.pimble-discussion__editing {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 4px 0;
+}
+
+/* The discussions on a node, under its content. */
+.pimble-discussions {
+    margin: 12px 16px 24px;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-default);
+    overflow: hidden;
+    flex-shrink: 0;
+}
+
+.pimble-discussions__head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--rinch-color-default);
+    font-size: 13px;
+}
+
+.pimble-discussions__icon {
+    display: inline-flex;
+    width: 16px;
+    height: 16px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-discussions__title {
+    flex: 1;
+    font-weight: 600;
+}
+
+.pimble-discussions__row {
+    padding: 8px 12px;
+    border-top: 1px solid var(--rinch-color-border);
+    cursor: pointer;
+}
+
+.pimble-discussions__row:hover {
+    background: var(--rinch-color-option-hover);
+}
+
+.pimble-discussions__topic {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    font-size: 14px;
+    font-weight: 500;
+}
+
+.pimble-discussions__count,
+.pimble-discussions__resolved {
+    font-size: 11px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-discussions__latest {
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* A row's count of discussions on its node. */
+.pimble-tree-discussions {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    margin-left: 6px;
+    font-size: 10px;
+    opacity: 0.6;
+}
+
+.pimble-tree-discussions__icon {
+    display: inline-flex;
+    width: 11px;
+    height: 11px;
+}
+
 /* ── Sheets (docs/SHEETS_CONTRACT.md) ─────────────────────────── */
 
 /* A sheet pane: its tables stacked, scrolling as one. Typed cells are plain,

@@ -119,6 +119,27 @@ pub async fn process_command(
             }
         }
 
+        BackendCommand::CreateAttachment { store_id, host_id, title, init } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            let request = init.request;
+            match c.create_attachment(store_id, host_id, init.node_type, &title, Some(init.content), init.custom.into_iter().collect()).await {
+                Ok(node_id) => Some(BackendEvent::AttachmentCreated { store_id, host_id, node_id, request }),
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
+        BackendCommand::ListAttachments { store_id, node_id } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::Error { message: "Not connected".into() });
+            };
+            match c.list_attachments(store_id, node_id).await {
+                Ok(nodes) => Some(BackendEvent::AttachmentsListed { store_id, node_id, nodes }),
+                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            }
+        }
+
         BackendCommand::GetNode { store_id, node_id } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });

@@ -69,6 +69,10 @@ pub trait PimbleApi {
     #[method(name = "createAttachment", with_extensions)]
     async fn create_attachment(&self, request: CreateAttachmentRequest) -> Result<CreateNodeResponse, ErrorObjectOwned>;
 
+    /// Who the caller is (an agent's id and name). Any principal.
+    #[method(name = "whoAmI", with_extensions)]
+    async fn who_am_i(&self) -> Result<WhoAmIResponse, ErrorObjectOwned>;
+
     /// A node's live attachments. Read, judged on the host.
     #[method(name = "listAttachments", with_extensions)]
     async fn list_attachments(&self, request: ListAttachmentsRequest) -> Result<ListAttachmentsResponse, ErrorObjectOwned>;

@@ -106,7 +106,7 @@ pub(crate) fn close_focused(store: AppStore) {
 /// The node pane `pane` shows as a document, tracked: its canonical pair.
 fn pane_document(store: AppStore, pane: PaneId) -> Option<(pimble_core::StoreId, pimble_core::NodeId)> {
     let state = store.pane(pane);
-    if !state.show_editor.get() && !state.show_board.get() && !state.show_sheet.get() {
+    if !state.show_editor.get() && !state.show_board.get() && !state.show_sheet.get() && !state.show_discussion.get() {
         return None;
     }
     match parse_tree_value(&state.selected.get()?) {
@@ -138,7 +138,9 @@ fn pane_icon(store: AppStore, pane: PaneId) -> Vec<(String, String)> {
         .map(|sig| sig.with(|n| (n.metadata.icon().map(str::to_string), n.metadata.color().map(str::to_string))))
         .unwrap_or_default();
     let dark = store.dark_mode.get();
-    let fallback = if store.pane(pane).show_sheet.get() {
+    let fallback = if store.pane(pane).show_discussion.get() {
+        TablerIcon::Messages
+    } else if store.pane(pane).show_sheet.get() {
         TablerIcon::Table
     } else if store.pane(pane).show_board.get() && !store.pane(pane).markup.get() {
         TablerIcon::Chalkboard
@@ -170,7 +172,7 @@ fn pane_icon(store: AppStore, pane: PaneId) -> Vec<(String, String)> {
 /// freely because they are `untracked`.)
 fn editor_read_only(store: AppStore, pane: PaneId) -> bool {
     let state = store.pane(pane);
-    let Some(active) = state.active_edit.get().or_else(|| state.board.get()).or_else(|| state.sheet.get()) else { return false };
+    let Some(active) = state.active_edit.get().or_else(|| state.board.get()).or_else(|| state.sheet.get()).or_else(|| state.discussion.get()) else { return false };
     let sig = store.store_data.with(|map| map.get(&active.store_id).copied());
     if sig.map_or(false, |sig| sig.with(|s| !s.access.allows_write())) {
         return true;
@@ -205,6 +207,12 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
     let board_view = crate::boards::render_board(__scope, store, pane);
     // A sheet node's tables (docs/SHEETS_CONTRACT.md section 1), likewise.
     let sheet_view = crate::sheets::render_sheet(__scope, store, pane);
+    // A discussion node's thread (docs/DISCUSSIONS_CONTRACT.md), likewise.
+    let discussion_view = crate::discussions::render_discussion(__scope, store, pane);
+    // The discussions on the pane's node, under its content: in the text's
+    // scroll for a note, under the view for a board or a sheet.
+    let discussions_in_text = crate::discussions::render_host_panel(__scope, store, pane, true);
+    let discussions_panel = crate::discussions::render_host_panel(__scope, store, pane, false);
     // The floating controls over the picture under the pointer in the text
     // (docs/IMAGE_MARKUP_CONTRACT.md section 5).
     let picture_controls = crate::text_boards::render_controls(__scope, store, pane);
@@ -226,6 +234,7 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
             },
             {editor_view}
             {lost_tables}
+            {discussions_in_text}
         }
     };
     // Where the text is on screen: the controls over a picture stay inside
@@ -265,6 +274,8 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
             // title strip after the keyboard went to the tree).
             onmousedown: move || {
                 PRESS_HEARD.with(|heard| heard.set(true));
+                // A press outside a discussion's message boxes ends typing there.
+                crate::discussions::pane_pressed();
                 focus_pane(store, pane);
                 if !PRESS_IN_VIEW.with(|p| p.replace(false)) {
                     crate::editor::give_keyboard_to(store, pane);
@@ -334,16 +345,19 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
             // reader meets one wording everywhere.
             div {
                 class: "pimble-editor__read-only",
-                style: {move || if (state.show_editor.get() || state.show_board.get() || state.show_sheet.get()) && editor_read_only(store, pane) { "" } else { "display: none;" }},
+                // A discussion says it in its own place, where its message box would be.
+                style: {move || if (state.show_editor.get() || state.show_board.get() || state.show_sheet.get()) && !state.show_discussion.get() && editor_read_only(store, pane) { "" } else { "display: none;" }},
                 {pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string()}
             }
             {content_wrap}
             {board_view}
             {sheet_view}
+            {discussion_view}
+            {discussions_panel}
             {picture_controls}
             div {
                 class: "pimble-empty-state",
-                style: {move || if state.show_editor.get() || state.show_board.get() || state.show_sheet.get() { "display: none;" } else { "" }},
+                style: {move || if state.show_editor.get() || state.show_board.get() || state.show_sheet.get() || state.show_discussion.get() { "display: none;" } else { "" }},
                 div {
                     class: "pimble-empty-state__icon",
                     {empty_icon}

@@ -448,6 +448,12 @@ impl PimbleClient {
         self.client.create_attachment(request).await.map(|r| r.node_id).map_err(rpc_error)
     }
 
+    /// Who this connection is, as the server judges it: `(sub, name)`, the
+    /// sub absent for the server's own operator.
+    pub async fn who_am_i(&self) -> Result<(Option<String>, String)> {
+        self.client.who_am_i().await.map(|r| (r.sub, r.name)).map_err(rpc_error)
+    }
+
     /// A node's live attachments, oldest first, with their content.
     pub async fn list_attachments(&self, store_id: StoreId, node_id: NodeId) -> Result<Vec<Node>> {
         let request = pimble_rpc::types::ListAttachmentsRequest { store_id, node_id };

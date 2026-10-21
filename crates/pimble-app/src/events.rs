@@ -547,6 +547,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     }
                     crate::boards::request_reconcile_all(store, active.store_id, active.node_id);
                     crate::sheets::request_reconcile_all(store, active.store_id, active.node_id);
+                    crate::discussions::request_reconcile_all(store, active.store_id, active.node_id);
                 }
                 // The boards embedded in text hold their nodes again.
                 crate::text_boards::reconnected(store);
@@ -848,6 +849,16 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         .is_some_and(|b| b.store_id == *store_id && b.node_id == node_id);
                     let already_sheeting = untracked(|| state.sheet.get())
                         .is_some_and(|b| b.store_id == *store_id && b.node_id == node_id);
+                    let already_discussing = untracked(|| state.discussion.get())
+                        .is_some_and(|b| b.store_id == *store_id && b.node_id == node_id);
+                    if node.node_type == pimble_core::node_types::DISCUSSION && !already_discussing {
+                        // A discussion (docs/DISCUSSIONS_CONTRACT.md).
+                        state.show_editor.set(false);
+                        state.show_board.set(false);
+                        state.show_sheet.set(false);
+                        state.show_discussion.set(true);
+                        crate::discussions::start(store, pane, *store_id, node_id, &content_bytes);
+                    }
                     if node.node_type == pimble_core::node_types::SHEET && !already_sheeting {
                         // A sheet node (docs/SHEETS_CONTRACT.md section 1).
                         state.show_editor.set(false);
@@ -933,6 +944,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     crate::text_boards::node_created(store, *request, *store_id, *node_id);
                     crate::sheets::in_text::node_created(store, *request, *store_id, *node_id);
                     crate::sheets::node_created(store, *request, *store_id, *node_id);
+                    crate::discussions::created(store, *request, *store_id, *node_id, None);
                 }
                 tracing::info!("Node created: {:?}/{:?} under {:?}", store_id, node_id, parent_id);
                 let parent = parent_id.unwrap_or_else(|| {
@@ -940,6 +952,18 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 });
                 // Re-fetch parent's children so the new node appears (triggers ChildrenLoaded → bump)
                 store.send(BackendCommand::GetChildren { store_id: *store_id, node_id: parent });
+            }
+
+            BackendEvent::AttachmentCreated { store_id, host_id, node_id, request } => {
+                tracing::info!("Attachment created: {:?}/{:?} on {:?}", store_id, node_id, host_id);
+                match request {
+                    Some(request) => crate::discussions::created(store, *request, *store_id, *node_id, Some(*host_id)),
+                    None => store.send(BackendCommand::ListAttachments { store_id: *store_id, node_id: *host_id }),
+                }
+            }
+
+            BackendEvent::AttachmentsListed { store_id, node_id, nodes } => {
+                crate::discussions::attachments_listed(store, *store_id, *node_id, nodes.clone());
             }
 
             BackendEvent::NodeContentUpdated { store_id, node_id } => {
@@ -1170,6 +1194,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         refetch_parent_children(store, *store_id, *old_parent_id);
                         refetch_parent_children(store, *store_id, *new_parent_id);
                     }
+                    StoreChangeKind::AttachmentChanged { node_id, host_id, live } => {
+                        crate::discussions::attachment_changed(store, *store_id, *host_id, *node_id, *live);
+                    }
                     StoreChangeKind::MetadataUpdated { node_id } => {
                         store.send(BackendCommand::GetNode {
                             store_id: *store_id,
@@ -1284,6 +1311,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 crate::editor::apply_reconcile(store, *store_id, *node_id, diff, server_state_vector);
                 crate::boards::apply_reconcile(store, *store_id, *node_id, diff, server_state_vector);
                 crate::sheets::apply_reconcile(store, *store_id, *node_id, diff, server_state_vector);
+                crate::discussions::apply_reconcile(store, *store_id, *node_id, diff, server_state_vector);
                 crate::text_boards::apply_reconcile(*store_id, *node_id, diff);
             }
 
@@ -1296,6 +1324,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     apply_remote(store, *store_id, *node_id, &bytes);
                     crate::boards::apply_remote(store, *store_id, *node_id, &bytes);
                     crate::sheets::apply_remote(store, *store_id, *node_id, &bytes);
+                    crate::discussions::apply_remote(store, *store_id, *node_id, &bytes);
                     crate::text_boards::apply_remote(*store_id, *node_id, &bytes);
                 }
             }

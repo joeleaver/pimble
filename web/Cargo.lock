@@ -1781,6 +1781,7 @@ dependencies = [
  "pimble-client",
  "pimble-core",
  "pimble-crdt",
+ "pimble-discussion",
  "pimble-image",
  "pimble-import",
  "pimble-rpc",
@@ -1877,6 +1878,17 @@ dependencies = [
  "uuid",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "pimble-discussion"
+version = "0.11.0"
+dependencies = [
+ "pimble-core",
+ "pimble-crdt",
+ "thiserror 2.0.20",
+ "uuid",
+ "yrs",
 ]
 
 [[package]]

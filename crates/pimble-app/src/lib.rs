@@ -43,6 +43,7 @@ pub mod rinch_editor;
 pub mod state;
 pub mod styles;
 pub mod sheets;
+pub mod discussions;
 pub mod text_boards;
 pub mod toolbar;
 #[cfg(feature = "native")]

@@ -271,6 +271,56 @@ impl NodePlugin for SheetPlugin {
     }
 }
 
+/// Built-in discussion plugin (docs/DISCUSSIONS_CONTRACT.md section 9): a
+/// discussion is only its messages, so what search finds in it is each
+/// message that is not deleted, with its author's name.
+pub struct DiscussionPlugin;
+
+impl NodePlugin for DiscussionPlugin {
+    fn info(&self) -> PluginInfo {
+        PluginInfo {
+            id: "builtin.discussion".to_string(),
+            name: "Discussion".to_string(),
+            version: "0.1.0".to_string(),
+            node_type: pimble_core::node_types::DISCUSSION.to_string(),
+            description: "A threaded discussion, on a node or on its own".to_string(),
+        }
+    }
+
+    fn node_type(&self) -> &str {
+        pimble_core::node_types::DISCUSSION
+    }
+
+    fn schema(&self) -> NodeSchema {
+        NodeSchema { version: 1, fields: vec![] }
+    }
+
+    fn render(&self, _content: &[u8]) -> Result<RenderOutput> {
+        Ok(RenderOutput { widgets: serde_json::json!({ "type": "discussion_view" }), actions: vec![] })
+    }
+
+    fn extract_text(&self, content: &[u8]) -> Result<String> {
+        let units = self.index_units(content)?;
+        Ok(units.into_iter().map(|u| u.text).collect::<Vec<_>>().join("\n"))
+    }
+
+    fn index_units(&self, content: &[u8]) -> Result<Vec<pimble_core::IndexUnit>> {
+        Ok(pimble_crdt::NodeDoc::load(content)
+            .map(|doc| pimble_discussion::Discussion::of_node(&doc).read().index_units())
+            .unwrap_or_default())
+    }
+
+    fn validate(&self, _content: &[u8]) -> Result<ValidationResult> {
+        Ok(ValidationResult::ok())
+    }
+
+    fn init_content(&self) -> Result<Vec<u8>> {
+        let mut doc = pimble_crdt::NodeDoc::new();
+        doc.apply_update(&pimble_discussion::new_content(None)).map_err(|e| crate::PluginError::ExecutionError(e.to_string()))?;
+        Ok(doc.save())
+    }
+}
+
 /// A node's own fields as index units (`name: value`), so "Acme" finds the
 /// project whose client field is Acme.
 fn field_units(doc: &pimble_crdt::NodeDoc) -> Vec<pimble_core::IndexUnit> {
@@ -288,6 +338,7 @@ pub fn create_default_host() -> PluginHost {
     host.register(FolderPlugin);
     host.register(BoardPlugin);
     host.register(SheetPlugin);
+    host.register(DiscussionPlugin);
     host
 }
 

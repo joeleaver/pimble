@@ -60,7 +60,7 @@ use pimble_rpc::{
     CloudHostStoreResponse, CloudHostedStoreInfo, CloudListHostedStoresResponse, CloudRelayStoreRequest, CloudRelayStoreResponse, CloudSignInRequest,
     CloudStatusResponse, CloudStopRelayingRequest,
     CreateMountRequest, CreateMountResponse,
-    CreateAttachmentRequest, CreateNodeRequest, CreateNodeResponse, CreateStoreRequest, CreateStoreResponse, ListAttachmentsRequest, ListAttachmentsResponse,
+    CreateAttachmentRequest, CreateNodeRequest, CreateNodeResponse, CreateStoreRequest, CreateStoreResponse, ListAttachmentsRequest, ListAttachmentsResponse, WhoAmIResponse,
     CreateWorkspaceRequest, DeleteNodeRequest, EditOperation, EmptyResponse, GetChildrenRequest,
     GetChildrenResponse, GetMountStateRequest, GetMountStateResponse, GetNodeRequest, GetStoreSyncRequest, GetStoreSyncResponse, SetStoreSyncRequest,
     GetNodeResponse, GetNodesRequest, GetNodesResponse, ListRemoteStoresRequest, ListStoresResponse, LoadWorkspaceRequest,
@@ -3718,6 +3718,13 @@ impl PimbleApiServer for RpcHandler {
         self.broadcast_tree_edit(request.store_id, &edit, &[(node_id, StoreChangeKind::AttachmentChanged { node_id, host_id, live: true })], None).await;
         self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
         Ok(CreateNodeResponse { node_id })
+    }
+
+    async fn who_am_i(&self, ext: &Extensions) -> Result<WhoAmIResponse, ErrorObjectOwned> {
+        Ok(match principal_of(ext) {
+            Principal::Service => WhoAmIResponse { sub: None, name: String::new() },
+            Principal::User { sub, email, .. } => WhoAmIResponse { sub: Some(sub), name: email },
+        })
     }
 
     async fn list_attachments(

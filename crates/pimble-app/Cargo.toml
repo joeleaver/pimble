@@ -28,6 +28,7 @@ pimble-image = { workspace = true }
 # the raster cache a board pane paints from; yrs for its per-person undo.
 pimble-board = { workspace = true }
 pimble-sheet = { workspace = true }
+pimble-discussion = { workspace = true }
 yrs = { workspace = true }
 # A stored picture's pixel size (an image node places it at one unit per
 # pixel), and a pasted clipboard bitmap as PNG. The same build pimble-board's is.

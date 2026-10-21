@@ -25,6 +25,7 @@ use crate::connection::Connection;
 use crate::nodes::{self, label, Addr};
 use crate::sheets::guide;
 
+mod discussion_tools;
 mod sheet_tools;
 
 const INSTRUCTIONS: &str = "\
@@ -64,7 +65,14 @@ link to a node; get_fields and set_fields read and write a node's own fields (re
 'Note'!field and [@link].field); evaluate \
 runs a formula without saving it. Values go in as a person types them (\"$12.50\", \"yesterday\", \
 a linked row's first-column value); rows are named by id or by their first column's value. \
-Before writing a formula, read sheet_formula_guide (also the resource \"Sheet formulas\").";
+Before writing a formula, read sheet_formula_guide (also the resource \"Sheet formulas\").
+
+Discussions are threaded conversations, on a node (they belong to it and go where it goes) \
+or as discussion nodes of their own. list_discussions lists a node's, read_discussion reads \
+one as a nested list with message ids, start_discussion starts one with its first message, \
+reply answers a message (or posts at the top level), edit_message and delete_message change \
+only your own messages, resolve_discussion closes or reopens one. Messages are Markdown with \
+bold, italic and links; your messages are signed with your agent's name.";
 
 pub struct Pimble {
     conn: Arc<Connection>,
@@ -101,7 +109,7 @@ impl Pimble {
                 Some(id) => format!("agent:{id}"),
                 None => format!("mcp:{}", uuid::Uuid::new_v4()),
             },
-            tool_router: Self::tool_router() + Self::sheet_router(),
+            tool_router: Self::tool_router() + Self::sheet_router() + Self::discussion_router(),
         }
     }
 

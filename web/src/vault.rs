@@ -1238,6 +1238,12 @@ impl VaultClient {
                 Some(self.create_node(client, store_id, parent_id, title, init).await)
             }
 
+            BackendCommand::CreateAttachment { store_id, host_id, title, init } => {
+                Some(self.create_attachment(client, store_id, host_id, title, init).await)
+            }
+
+            BackendCommand::ListAttachments { store_id, node_id } => Some(self.list_attachments(store_id, node_id)),
+
             BackendCommand::RenameNode { store_id, node_id, title } => {
                 Some(self.rename_node(client, store_id, node_id, title).await)
             }
@@ -1641,6 +1647,59 @@ impl VaultClient {
             Ok(()) => BackendEvent::NodeCreated { store_id, parent_id: Some(parent), node_id, request },
             Err(message) => BackendEvent::Error { message },
         }
+    }
+
+    /// An attachment of `host_id` (a discussion on it,
+    /// docs/DISCUSSIONS_CONTRACT.md section 1), as the server's
+    /// `createAttachment` makes one: only the new document is written.
+    async fn create_attachment(
+        &mut self,
+        client: &Arc<PimbleClient>,
+        store_id: StoreId,
+        host_id: NodeId,
+        title: String,
+        init: pimble_app::protocol::NodeInit,
+    ) -> BackendEvent {
+        let node_id = NodeId::new();
+        let request = init.request;
+        let now = now_rfc3339();
+        let edit = {
+            let Some(store) = self.stores.get_mut(&store_id) else {
+                return BackendEvent::Error { message: "no such encrypted store".into() };
+            };
+            let mut edit = store.seed_root(&now);
+            let content = (!init.content.is_empty()).then_some(init.content.as_slice());
+            match store.tree.add_attachment(node_id, host_id, &init.node_type, &title, content, &now) {
+                Ok(more) => edit.touched.extend(more.touched),
+                Err(e) => return BackendEvent::Error { message: e.to_string() },
+            }
+            for (key, value) in &init.custom {
+                match store.tree.set_custom(node_id, key, value, &now) {
+                    Ok(more) => edit.touched.extend(more.touched),
+                    Err(e) => return BackendEvent::Error { message: e.to_string() },
+                }
+            }
+            edit
+        };
+        match self.append_edit(client, store_id, &edit).await {
+            Ok(()) => BackendEvent::AttachmentCreated { store_id, host_id, node_id, request },
+            Err(message) => BackendEvent::Error { message },
+        }
+    }
+
+    fn list_attachments(&self, store_id: StoreId, node_id: NodeId) -> BackendEvent {
+        let Some(store) = self.stores.get(&store_id) else {
+            return BackendEvent::Error { message: "no such encrypted store".into() };
+        };
+        let row = self.rows.get(&store_id);
+        let nodes = store
+            .tree
+            .attachments_of(node_id)
+            .into_iter()
+            .filter_map(|id| store.node_for(id, row).ok())
+            .map(|node| self.judged(store_id, node))
+            .collect();
+        BackendEvent::AttachmentsListed { store_id, node_id, nodes }
     }
 
     async fn rename_node(
@@ -2882,6 +2941,7 @@ impl VaultStore {
         let mut node = fields.into_node(node_id);
         node.content = content;
         node.children = children;
+        node.attachments = self.tree.attachments_of(node_id).len() as u32;
         Ok(node)
     }
 
@@ -2934,7 +2994,7 @@ impl VaultStore {
             if !self.may_write(id, row) {
                 node.access = StoreAccess::Read;
             }
-            let parent_title = fields.parent_id.and_then(|parent| self.title_of(parent));
+            let parent_title = fields.parent_id.or(fields.attached_to).and_then(|parent| self.title_of(parent));
             out.push(DeletedNode { node, parent_title, deleted_at: fields.deleted_at, put_back_under: None });
         }
 
@@ -2952,7 +3012,8 @@ impl VaultStore {
             .tree
             .list_node_ids()
             .into_iter()
-            .filter(|id| !listed.contains(id) && !roots.contains(id))
+            // A live attachment is in no list by design.
+            .filter(|id| !listed.contains(id) && !roots.contains(id) && !self.tree.is_attachment(*id))
             .collect();
         unlisted.sort_by_key(|id| id.to_string());
 
@@ -3002,7 +3063,8 @@ impl VaultStore {
                 .tree
                 .doc(node_id)
                 .and_then(|doc| doc.fields().ok())
-                .and_then(|fields| fields.parent_id);
+                // An attachment joins the scopes its host is in.
+                .and_then(|fields| fields.parent_id.or(fields.attached_to));
             let scope_key_ids = self.scope_key_ids_for(node_id);
             self.keys
                 .create_document_key(store_id, node_id, &scope_key_ids)
@@ -3043,7 +3105,7 @@ impl VaultStore {
             if let Some(marker) = share_marker_of(&fields) {
                 ids.push(marker.key_id);
             }
-            cur = fields.parent_id;
+            cur = fields.parent_id.or(fields.attached_to);
         }
         if ids.is_empty() {
             ids.extend(self.keys.scope.scopes.iter().map(|(_, id)| *id));
@@ -3554,6 +3616,24 @@ fn derive_kinds(
     if effect.structure {
         let before_fields = before.and_then(|s| s.fields.as_ref());
         let after_fields = after.and_then(|s| s.fields.as_ref());
+        // An attachment is in no list: what changed is news for its host, as
+        // the server's `derive_kinds` says it.
+        if let Some(host_id) = after_fields.and_then(|a| a.attached_to) {
+            let was_live = before_fields.is_some_and(|b| b.deleted_at.is_none());
+            let live = after_fields.is_some_and(|a| a.deleted_at.is_none());
+            if was_live != live {
+                kinds.push(StoreChangeKind::AttachmentChanged { node_id, host_id, live });
+            } else if before_fields != after_fields {
+                kinds.push(StoreChangeKind::MetadataUpdated { node_id });
+            }
+            if effect.content || effect.data {
+                kinds.push(StoreChangeKind::ContentUpdated { node_id });
+            }
+            if kinds.is_empty() {
+                kinds.push(StoreChangeKind::MetadataUpdated { node_id });
+            }
+            return kinds;
+        }
         let node_kind = match (before_fields, after_fields) {
             (None, Some(a)) => Some(match (a.deleted_at.is_some(), a.parent_id) {
                 (true, parent) => StoreChangeKind::NodeDeleted { node_id, parent_id: parent.unwrap_or(root) },
@@ -3610,6 +3690,8 @@ pub fn store_id_of(cmd: &BackendCommand) -> Option<StoreId> {
     Some(match cmd {
         CloseStore { store_id }
         | CreateNode { store_id, .. }
+        | CreateAttachment { store_id, .. }
+        | ListAttachments { store_id, .. }
         | GetNode { store_id, .. }
         | GetChildren { store_id, .. }
         | SetNodeContent { store_id, .. }
@@ -3650,6 +3732,7 @@ pub fn writes(cmd: &BackendCommand) -> bool {
     matches!(
         cmd,
         CreateNode { .. }
+            | CreateAttachment { .. }
             | RenameNode { .. }
             | SetNodeAppearance { .. }
             | DeleteNode { .. }

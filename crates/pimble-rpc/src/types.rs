@@ -274,6 +274,20 @@ pub struct CreateAttachmentRequest {
     pub custom: std::collections::HashMap<String, serde_json::Value>,
 }
 
+/// Who the caller is, as the server judges it: what a client stamps its
+/// writes with when it has no account of its own to read (an agent's
+/// discussion messages, docs/DISCUSSIONS_CONTRACT.md section 3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhoAmIResponse {
+    /// `agent:<id>` for an agent, the account's `sub` for a user; absent for
+    /// the server's own operator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub: Option<String>,
+    /// An agent's name, a user's email; empty for the operator.
+    #[serde(default)]
+    pub name: String,
+}
+
 /// Request for a node's live attachments.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListAttachmentsRequest {

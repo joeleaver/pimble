@@ -39,6 +39,12 @@ pub enum BackendCommand {
     /// `init` is what the node starts with, written in the edit that creates
     /// it; `None` makes an ordinary empty document.
     CreateNode { store_id: StoreId, parent_id: Option<NodeId>, title: String, init: Option<NodeInit> },
+    /// Create an attachment of `host_id` (a discussion on it,
+    /// docs/DISCUSSIONS_CONTRACT.md section 1): the host is not edited.
+    /// Answers with `AttachmentCreated`.
+    CreateAttachment { store_id: StoreId, host_id: NodeId, title: String, init: NodeInit },
+    /// The live attachments of a node. Answers with `AttachmentsListed`.
+    ListAttachments { store_id: StoreId, node_id: NodeId },
     GetNode { store_id: StoreId, node_id: NodeId },
     GetChildren { store_id: StoreId, node_id: NodeId },
     SetNodeContent { store_id: StoreId, node_id: NodeId, content: Vec<u8> },
@@ -310,6 +316,10 @@ pub enum BackendEvent {
     // Node events
     /// `request` is the `NodeInit::request` the node was made with.
     NodeCreated { store_id: StoreId, parent_id: Option<NodeId>, node_id: NodeId, request: Option<u64> },
+    /// An attachment was made (`CreateAttachment`); `request` is its init's.
+    AttachmentCreated { store_id: StoreId, host_id: NodeId, node_id: NodeId, request: Option<u64> },
+    /// A node's live attachments, oldest first, each with its content.
+    AttachmentsListed { store_id: StoreId, node_id: NodeId, nodes: Vec<Node> },
     NodeLoaded { store_id: StoreId, node: Node },
     /// `children` live in `children_store_id`: the same as `store_id` for an
     /// ordinary parent, the mount's source store when `parent_id` is a mount point.

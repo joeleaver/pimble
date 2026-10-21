@@ -984,6 +984,11 @@ pub struct AppStore {
     /// A `BackendEvent::Error` while this modal is open lands here rather
     /// than the connection status bar.
     pub deleted_modal_error: Signal<String>,
+
+    /// The discussions on each node whose list this window asked for
+    /// (`ListAttachments`, docs/DISCUSSIONS_CONTRACT.md section 1), oldest
+    /// first; each discussion's node is in the node cache.
+    pub attachments: Signal<HashMap<(StoreId, NodeId), Vec<NodeId>>>,
 }
 
 /// What changed in the roots a store's row shows (`AppStore::set_store_roots`).
@@ -1070,6 +1075,13 @@ pub struct PaneState {
     /// What the sheet view shows: the computed tables, the cell being typed
     /// into, the column settings, the formula bar.
     pub sheet_ui: crate::sheets::SheetUi,
+    /// Whether the pane shows a discussion (docs/DISCUSSIONS_CONTRACT.md)
+    /// instead of its editor, which stays mounted, hidden.
+    pub show_discussion: Signal<bool>,
+    /// The discussion node the pane holds, like `sheet` for a sheet node.
+    pub discussion: Signal<Option<ActiveEdit>>,
+    /// What the discussion view shows: the thread, the message being typed.
+    pub discussion_ui: crate::discussions::DiscussionUi,
 }
 
 impl PaneState {
@@ -1091,6 +1103,9 @@ impl PaneState {
             adding_field: Signal::new(false),
             sheet: Signal::new(None),
             sheet_ui: crate::sheets::SheetUi::new(),
+            show_discussion: Signal::new(false),
+            discussion: Signal::new(None),
+            discussion_ui: crate::discussions::DiscussionUi::new(),
         }
     }
 }
@@ -1214,6 +1229,7 @@ impl AppStore {
             deleted_modal_nodes: Signal::new(Vec::new()),
             deleted_modal_pending: Signal::new(false),
             deleted_modal_error: Signal::new(String::new()),
+            attachments: Signal::new(HashMap::new()),
         }
     }
 
@@ -1686,12 +1702,20 @@ impl AppStore {
         untracked(|| PaneId::ALL.into_iter().filter(|pane| self.pane(*pane).sheet.get() == edit).collect())
     }
 
-    /// Whether any pane holds this node, in its editor, as a board or as a
-    /// sheet, untracked: what a node's subscription is counted by.
+    /// The panes holding this discussion node, untracked.
+    pub fn panes_discussing(&self, store_id: StoreId, node_id: NodeId) -> Vec<PaneId> {
+        let edit = Some(ActiveEdit { store_id, node_id });
+        untracked(|| PaneId::ALL.into_iter().filter(|pane| self.pane(*pane).discussion.get() == edit).collect())
+    }
+
+    /// Whether any pane holds this node, in its editor, as a board, as a
+    /// sheet or as a discussion, untracked: what a node's subscription is
+    /// counted by.
     pub fn is_editing(&self, store_id: StoreId, node_id: NodeId) -> bool {
         !self.panes_editing(store_id, node_id).is_empty()
             || !self.panes_boarding(store_id, node_id).is_empty()
             || !self.panes_sheeting(store_id, node_id).is_empty()
+            || !self.panes_discussing(store_id, node_id).is_empty()
             // A board embedded in a note's text holds its subscription too
             // (docs/IMAGE_MARKUP_CONTRACT.md section 2, "Showing").
             || crate::text_boards::embed_holds(store_id, node_id)
@@ -1707,7 +1731,10 @@ impl AppStore {
     pub fn edited_nodes(&self) -> Vec<ActiveEdit> {
         let mut nodes: Vec<ActiveEdit> = Vec::new();
         for pane in PaneId::ALL {
-            let held = untracked(|| self.pane(pane).active_edit.get().or_else(|| self.pane(pane).board.get()).or_else(|| self.pane(pane).sheet.get()));
+            let held = untracked(|| {
+                let p = self.pane(pane);
+                p.active_edit.get().or_else(|| p.board.get()).or_else(|| p.sheet.get()).or_else(|| p.discussion.get())
+            });
             if let Some(edit) = held {
                 if !nodes.contains(&edit) {
                     nodes.push(edit);
@@ -1748,6 +1775,7 @@ impl AppStore {
         self.pane(pane).show_editor.set(false);
         self.pane(pane).show_board.set(false);
         self.pane(pane).show_sheet.set(false);
+        self.pane(pane).show_discussion.set(false);
         self.pane(pane).restore.set(None);
         if pane == self.focused() {
             self.node_title.set(String::new());
