@@ -7,10 +7,10 @@ to 5" and "Built in wave 6" say what exists, how each was checked and what is mi
 
 Next, in order (Joe: "do them here sequentially"):
 
-1. Margin markers are built (contract, "Built: margin markers"); on the desktop they wait
-   for joeleaver/rinch#1696 (overlay-slot children not painted). When it merges, move the
-   pin in both locks and check the desktop on a scratch store. The message boxes are on
-   `onkeydown` (rinch `main` 0b3c7b09, which also brought the emoji fixes #1687/#1689).
+1. Discussions are built through margin markers, on rinch `main` 42e2d2df; nothing from
+   the Rinch session is outstanding. Left: the marker popover, a text context-menu item,
+   a "displaced" marker look, Safari's IME Enter guard, agents as commenters (contract,
+   "Not built" lines). Merging `discussions` into `master` and releasing are Joe's call.
 2. Deploying needs the accounts service's new `PersonalDoc` schema type with it, and the
    hosted server and every device on this version together (the `commenter` role and the
    discussion set in `scopes.json`).

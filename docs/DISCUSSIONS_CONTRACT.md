@@ -631,9 +631,10 @@ anchors a new attached discussion at the caret and opens it beside. Refusals use
 `StoreAccess::refusal`. Checked in the browser on the local stack (an encrypted store):
 the marker beside the line, its count after a post, following its line when a line is
 added above and the gutter when the pane widens, a press opening the discussion, an
-inline discussion drawing none. **Desktop:** the markers are laid out but not painted:
-rinch's painter skips the children of a 0x0 box, which the overlay layer is
-(joeleaver/rinch#1696, being fixed in rinch). **Not built:** the popover (a marker opens
+inline discussion drawing none. **Desktop:** painted since rinch `main` 42e2d2df (joeleaver/rinch#1696,
+#1699: the painter skipped the children of a 0x0 box, which the overlay layer is);
+checked in the release app on the GPU and with `--cpu`: the marker and its count, following
+its line and the pane's width, a press opening the discussion. **Not built:** the popover (a marker opens
 its discussion in a pane, as pins do), a context-menu item in the text (the editor has no
 context menu of Pimble's yet), a "displaced" look for an anchor whose text was deleted.
 
