@@ -95,6 +95,10 @@ pub struct DiscussionUi {
     pub emoji: Signal<Option<Composer>>,
     /// The topic as typed, before Enter commits it.
     pub topic: Signal<String>,
+    /// A resolved discussion shows its first message only, until this
+    /// (contract section 4): how many it holds, and whether all are shown.
+    pub hidden: Signal<usize>,
+    pub show_all: Signal<bool>,
 }
 
 impl DiscussionUi {
@@ -111,6 +115,8 @@ impl DiscussionUi {
             message: Signal::new(None),
             emoji: Signal::new(None),
             topic: Signal::new(String::new()),
+            hidden: Signal::new(0),
+            show_all: Signal::new(false),
         }
     }
 }
@@ -193,6 +199,7 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
     ui.message.set(None);
     ui.emoji.set(None);
     ui.show_deleted.set(false);
+    ui.show_all.set(false);
     state.discussion.set(Some(ActiveEdit { store_id, node_id }));
     if first {
         store.send(BackendCommand::SubscribeNodeChanges { store_id, node_id });
@@ -296,8 +303,10 @@ fn send_update(store: AppStore, from: PaneId, store_id: StoreId, node_id: NodeId
     };
     #[cfg(test)]
     deliver();
+    // Armed by no component: the button that made the edit may be rebuilt
+    // by the edit itself (Delete), which would cancel it.
     #[cfg(not(test))]
-    let _ = set_timeout(0, deliver);
+    rinch::core::reactive::unowned(|| set_timeout(0, deliver));
 }
 
 fn say(store: AppStore, pane: PaneId, sentence: impl Into<String>) {
@@ -405,7 +414,13 @@ pub(crate) fn recompute(store: AppStore, pane: PaneId) {
     let now = crate::boards::now_ms();
     let me = author();
     let ui = store.pane(pane).discussion_ui;
-    ui.messages.set(views_of(&snap, me.as_ref(), now));
+    let mut views = views_of(&snap, me.as_ref(), now);
+    let collapsed = snap.resolved.is_some() && !untracked(|| ui.show_all.get()) && views.len() > 1;
+    ui.hidden.set(if collapsed { views.len() - 1 } else { 0 });
+    if collapsed {
+        views.truncate(1);
+    }
+    ui.messages.set(views);
     ui.resolved.set(snap.resolved.as_ref().map(|r| {
         let by = r.by.as_ref().map(|a| format!(" by {}", a.name)).unwrap_or_default();
         format!("Resolved{by}, {}", ago(&r.at, now))
@@ -490,7 +505,14 @@ pub(crate) fn restore_message(store: AppStore, pane: PaneId, id: &str) {
     local_edit(store, pane, |t| t.restore_message(&id));
 }
 
+/// Show every message of a resolved discussion.
+pub(crate) fn show_all(store: AppStore, pane: PaneId) {
+    store.pane(pane).discussion_ui.show_all.set(true);
+    recompute(store, pane);
+}
+
 pub(crate) fn resolve(store: AppStore, pane: PaneId, reopen: bool) {
+    store.pane(pane).discussion_ui.show_all.set(false);
     let me = author();
     let now = crate::boards::now_stamp();
     local_edit(store, pane, |t| if reopen { t.reopen() } else { t.resolve(Stamp::new(me.as_ref(), &now)) });
@@ -525,7 +547,9 @@ thread_local! {
 pub(crate) fn begin_composing(store: AppStore, pane: PaneId, which: Composer) {
     PRESS_IN_BOX.with(|p| p.set(true));
     COMPOSING.with(|c| c.set(Some((pane, which))));
-    rinch::core::set_keyboard_interceptor(move |data| {
+    // Owned by no component: a click on Edit rebuilds the message it is in,
+    // and an interceptor owned by that button would go with it.
+    rinch::core::reactive::unowned(|| rinch::core::set_keyboard_interceptor(move |data| {
         if data.key != "Enter" && data.key != "Escape" {
             return false;
         }
@@ -557,7 +581,7 @@ pub(crate) fn begin_composing(store: AppStore, pane: PaneId, which: Composer) {
             }
         });
         true
-    });
+    }));
 }
 
 /// A press anywhere in a pane: one outside the message boxes ends typing in
@@ -641,7 +665,18 @@ pub(crate) fn open_beside(store: AppStore, from: PaneId, store_id: StoreId, node
         crate::pane_view::focus_pane(store, pane);
         return;
     }
-    let target = crate::pane_view::split_pane(store, from, crate::panes::Direction::Right).unwrap_or(from);
+    // Another pane shown that holds nothing, or another discussion, takes it;
+    // otherwise `from` is split, and with no room left `from` shows it.
+    let reuse = untracked(|| {
+        PaneId::ALL.into_iter().find(|p| {
+            let state = store.pane(*p);
+            *p != from
+                && store.tiling.with(|t| t.rect_of(*p).is_some())
+                && (state.discussion.get().is_some()
+                    || (!state.show_editor.get() && !state.show_board.get() && !state.show_sheet.get() && !state.show_discussion.get()))
+        })
+    });
+    let target = reuse.or_else(|| crate::pane_view::split_pane(store, from, crate::panes::Direction::Right)).unwrap_or(from);
     store.link_open.set(Some(LinkOpen { value: format!("node_{store_id}_{node_id}"), store_id, node_id, anchor: None, pane: Some(target) }));
 }
 

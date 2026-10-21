@@ -43,16 +43,22 @@ pub(crate) fn focus_composer(pane: PaneId, which: Composer) {
     let Some(store) = APP.with(Cell::get) else { return };
     begin_composing(store, pane, which);
     PRESS_IN_BOX.with(|p| p.set(false));
-    let _ = set_timeout(0, move || {
-        if let Some((doc_key, node)) = BOXES.with(|b| b.borrow()[pane.index()][box_index(which)]) {
-            rinch::core::request_focus(doc_key, node);
-        }
+    // The edit box is built when its message is drawn again, a turn or two
+    // after the click that asked for it: ask once it is there.
+    // Armed by no component, for the same reason as the interceptor.
+    let delay = if which == Composer::Edit { 30 } else { 0 };
+    rinch::core::reactive::unowned(|| {
+        set_timeout(delay, move || {
+            if let Some((doc_key, node)) = BOXES.with(|b| b.borrow()[pane.index()][box_index(which)]) {
+                rinch::core::request_focus(doc_key, node);
+            }
+        })
     });
     #[cfg(not(feature = "native"))]
     {
         use wasm_bindgen::JsCast;
         let selector = box_class(which);
-        let _ = set_timeout(40, move || {
+        rinch::core::reactive::unowned(|| set_timeout(delay + 40, move || {
             let Some(document) = web_sys::window().and_then(|w| w.document()) else { return };
             let Ok(list) = document.query_selector_all(selector) else { return };
             for i in 0..list.length() {
@@ -62,7 +68,7 @@ pub(crate) fn focus_composer(pane: PaneId, which: Composer) {
                     return;
                 }
             }
-        });
+        }));
     }
     #[cfg(feature = "native")]
     let _ = box_class(which);
@@ -141,6 +147,16 @@ pub(crate) fn render_discussion(__scope: &mut RenderScope, store: AppStore, pane
                     }
                 }
             }
+            if ui.hidden.get() > 0 {
+                div {
+                    class: "pimble-discussion__deleted",
+                    button {
+                        class: "pimble-discussion__link-button",
+                        onclick: move || show_all(store, pane),
+                        {move || format!("Show all {} messages", ui.hidden.get() + 1)}
+                    }
+                }
+            }
             if !ui.deleted.get().is_empty() {
                 div {
                     class: "pimble-discussion__deleted",
@@ -188,7 +204,7 @@ pub(crate) fn render_discussion(__scope: &mut RenderScope, store: AppStore, pane
                         onclick: move || ui.emoji.update(|e| *e = if *e == Some(Composer::New) { None } else { Some(Composer::New) }),
                         "🙂"
                     }
-                    span { class: "pimble-discussion__hint", "Enter sends · Shift+Enter starts a new line · **bold** *italic* [text](link)" }
+                    span { class: "pimble-discussion__hint", "Enter sends · Shift+Enter: new line" }
                     button { class: "pimble-discussion__send", onclick: move || post(store, pane), "Send" }
                 }
                 {picker}

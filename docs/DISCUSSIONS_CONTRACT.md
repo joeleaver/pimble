@@ -45,23 +45,27 @@ There are three reasons:
   name it.
 
 **Attached, and the host is never edited to attach it** (Joe, 2026-10-21: commenters
-can start discussions). A discussion on a node names its host and its place there in
-its own document (`data.discussion.on`, section 2). The host's document doesn't change:
+can start discussions). A discussion on a node names its host in its own `node` root
+(`attached_to`, written in the transaction that initialises the document) and its
+place there in `data.discussion.anchor` (section 2). The host's document doesn't change:
 no `children` entry, no atom and no board element is needed. So anyone who may write
 the discussion may start one, and a commenter never writes the host.
 
 - **Not in the tree.** An attached discussion is in no children list and has no
   `parent_id`. `pimble_crdt::Tree` calls it an **attachment**: a document whose
-  `data.discussion.on` names a host. `Tree::repair`, `validate_tree` and `listDeleted`'s
+  `node` root names a host (`attached_to`). The key is general: nothing in the tree
+  knows it is a discussion. `Tree::repair`, `validate_tree` and `listDeleted`'s
   "nodes no list names" skip attachments, and `Tree` keeps a reverse index from host to
   attachments that every reader of a host's discussions uses. The explorer shows a count
   badge on the host's row. A standalone discussion node ("New Discussion" in a row's
   menu) has no `on` and is an ordinary tree node.
 - **It goes where its host goes.** Moving the host within its store changes nothing,
   because the discussion names the host's id. A move that is a transplant (out of a
-  share, or between stores, docs/MOVE_CONTRACT.md) gives the host a new id, so
-  `Tree::take_cutting` carries the attachments of every node it cuts and rewrites their
-  `on` to the new ids. The editor making the move writes this. A deleted host hides its
+  share, or between stores, docs/MOVE_CONTRACT.md) makes the host again under a new
+  id, so `Tree::take_cutting` takes the attachments of every node it cuts, and
+  `Tree::plant` makes them again as attachments of the new nodes, with fresh
+  documents, like the rest of the subtree. The originals stay with the tombstoned
+  host, so Put Back brings them back with it. A deleted host hides its
   discussions, and Put Back brings them back with it.
 - **Its scope is its host's.** A discussion is reachable by exactly the scopes that
   reach its host (section 7).
@@ -74,19 +78,17 @@ first use. The node is created with every container it needs.
 ```
 data.discussion: Map                       created with the node
   v:          1
-  on:         Map | absent                  absent on a standalone discussion node
-    node:     String                        the host's node id
-    anchor:   Map | absent                  absent: the node as a whole
-      kind:   "text" | "board"
-      text:   Bytes                         rinch's sticky bytes for the host's `content` (opaque)
-      board:  String                        "board" or "board:<id>" (a picture in text)
-      x, y:   Number                        board coordinates
+  anchor:     Map | absent                  absent: the node as a whole (or a standalone one)
+    kind:     "text" | "board"
+    text:     Bytes                         rinch's sticky bytes for the host's `content` (opaque)
+    board:    String                        "board" or "board:<id>" (a picture in text)
+    x, y:     Number                        board coordinates
   resolved:   { at, by: Author? } | absent  the whole discussion (section 4)
   messages:   Map<message id, Map>          created with the node, never replaced
     <id>: Map
       reply_to:   String | absent           a message id; absent at top level
-      created:    String                    RFC 3339 UTC, the shape boards use
-      author:     { id, name } | absent     section 3
+      created:    String                    RFC 3339 UTC with milliseconds, the shape boards use
+      author_id, author_name: String | absent   section 3
       body:       Text                      formatted (section 5)
       edited:     String | absent           last edit's time
       deleted_at: String | absent           a tombstone (section 4)
@@ -365,13 +367,17 @@ Agreed with the Rinch session (2026-10-21), and in progress there:
   table cells report their line, anchors in node views may be omitted, and the text
   column's right edge is reported if cheap. (Pimble's own `overflow` is what makes the
   editor scroll today; rinch's stylesheet doesn't.)
-- Sticky positions are built as joeleaver/rinch#1679 (branch `fix-sticky`, in review):
+- Sticky positions are merged (joeleaver/rinch#1679, rinch `main` 2a42fa7a; the pin moves there with wave 2):
   `StickyAssoc { After, Before }`, `CollabDoc::sticky_index_with`, `locate_sticky`,
   headless `locate_sticky_in(schema, bytes)` answering `StickyLocation { pos, path,
   displaced }`, and the same on `CollabSession` and `EditorHandle`. The bytes are a yrs
   `StickyIndex` plus a versioned trailer: Pimble stores them as opaque and never decodes
   them. A deleted block resolves nearby with `displaced: true`, which the margin marker
   can show ("the text this was on was deleted").
+  Also: `locate_sticky_many` (one pass for many anchors, for the margin), `None`
+  means "not locatable right now" and can change, and an anchor is displaced for
+  good after an undone deletion or a list toggle (the block is a new CRDT item), or
+  when the document is re-projected from the model (never done while collaborating).
 - Issues and PRs: joeleaver/rinch#1676 (sticky positions), #1677 (margin anchors and
   the overlay slot), #1678 (raw input keydown/keyup with modifiers and a flag to prevent
   the default, a selection read in UTF-16 units, `NodeHandle::caret_rect()`). Color emoji

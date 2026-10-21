@@ -604,6 +604,11 @@ pub fn display_label_from_node(node: &Node) -> String {
     if has_explicit_title && !node.metadata.title.is_empty() {
         return node.metadata.title.clone();
     }
+    // A discussion's title is its topic; it has no text to take one from
+    // (docs/DISCUSSIONS_CONTRACT.md section 2).
+    if node.node_type == pimble_core::node_types::DISCUSSION {
+        return if node.metadata.title.trim().is_empty() { "Discussion".to_string() } else { node.metadata.title.clone() };
+    }
     let content = get_node_content_text(&node.content);
     label_from_title_and_content(has_explicit_title, &node.metadata.title, &content)
 }
@@ -1797,6 +1802,8 @@ impl AppStore {
                 .active_edit
                 .get()
                 .or_else(|| state.board.get())
+                .or_else(|| state.sheet.get())
+                .or_else(|| state.discussion.get())
                 .map(|edit| (edit.store_id, edit.node_id))
                 .or_else(|| state.restore.get());
             if let Some((store_id, node_id)) = held {

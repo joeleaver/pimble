@@ -169,9 +169,11 @@ impl Pimble {
     /// Refused unless message `id` of the discussion is this agent's own.
     fn require_own(snap: &DiscussionSnapshot, id: &str, me: Option<&Author>) -> Result<(), String> {
         let message = snap.message(id).ok_or("There is no such message here; read_discussion lists the ids.")?;
+        // A message with no author is the person's (written signed out),
+        // never an agent's: an agent always signs.
         match (&message.author, me) {
-            (None, _) => Ok(()),
             (Some(author), Some(me)) if author.id == me.id => Ok(()),
+            (None, None) => Ok(()),
             _ => Err("That message is someone else's; you can change only your own.".into()),
         }
     }

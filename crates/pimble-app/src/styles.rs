@@ -600,6 +600,7 @@ pub(crate) const APP_CSS: &str = "
 
 .pimble-discussion__topic {
     flex: 1;
+    min-width: 0;
     font-size: 17px;
     font-weight: 600;
     border: none;
@@ -610,6 +611,8 @@ pub(crate) const APP_CSS: &str = "
 
 .pimble-discussion__head-button,
 .pimble-discussion__send {
+    flex-shrink: 0;
+    white-space: nowrap;
     border: 1px solid var(--rinch-color-border);
     border-radius: var(--rinch-radius-sm);
     background: var(--rinch-color-default);
@@ -707,6 +710,7 @@ pub(crate) const APP_CSS: &str = "
 }
 
 .pimble-discussion__link-button {
+    white-space: nowrap;
     border: none;
     background: transparent;
     color: var(--rinch-color-dimmed);
