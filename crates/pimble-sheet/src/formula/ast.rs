@@ -143,6 +143,18 @@ pub struct Spec {
     pub single: bool,
     /// The brackets and everything between them.
     pub span: Span,
+    /// A summary row named in it (contract section 4b): `[#Average]`, stored
+    /// `[#{s:<id>}]`. With `area` `Totals` and no name, the first one
+    /// (`[#Totals]`, Excel's Total Row).
+    pub summary: Option<SummaryPiece>,
+}
+
+/// The summary row a reference names after its `#`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SummaryPiece {
+    pub name: NameRef,
+    /// The name's own text, after the `#`.
+    pub span: Span,
 }
 
 /// A column named inside brackets.

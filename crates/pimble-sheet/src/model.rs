@@ -165,6 +165,67 @@ impl ResultKey {
     }
 }
 
+/// What one column of a summary row shows (contract section 4b): one of the
+/// menu's aggregates, or a formula in its stored form.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SummaryCell {
+    Sum,
+    Average,
+    Count,
+    Min,
+    Max,
+    /// The stored formula, without its `=`.
+    Formula(String),
+}
+
+impl SummaryCell {
+    /// The value stored in the summary row's `cells` map.
+    pub fn to_stored(&self) -> String {
+        match self {
+            SummaryCell::Sum => "sum".into(),
+            SummaryCell::Average => "average".into(),
+            SummaryCell::Count => "count".into(),
+            SummaryCell::Min => "min".into(),
+            SummaryCell::Max => "max".into(),
+            SummaryCell::Formula(f) => format!("={f}"),
+        }
+    }
+
+    /// A stored value read back; anything unknown is nothing.
+    pub fn from_stored(s: &str) -> Option<SummaryCell> {
+        Some(match s {
+            "sum" => SummaryCell::Sum,
+            "average" => SummaryCell::Average,
+            "count" => SummaryCell::Count,
+            "min" => SummaryCell::Min,
+            "max" => SummaryCell::Max,
+            _ => SummaryCell::Formula(s.strip_prefix('=')?.to_string()),
+        })
+    }
+
+    /// The menu's word for it, as the app shows it.
+    pub fn label(&self) -> &'static str {
+        match self {
+            SummaryCell::Sum => "Sum",
+            SummaryCell::Average => "Average",
+            SummaryCell::Count => "Count",
+            SummaryCell::Min => "Min",
+            SummaryCell::Max => "Max",
+            SummaryCell::Formula(_) => "Formula",
+        }
+    }
+}
+
+/// A summary row of a plain table (contract section 4b).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SummaryRowSnap {
+    pub id: String,
+    pub name: String,
+    pub order: String,
+    /// By column id. A column with no entry shows nothing.
+    pub cells: BTreeMap<String, SummaryCell>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableSnap {
     pub id: String,
@@ -179,6 +240,10 @@ pub struct TableSnap {
     pub columns: Vec<ColumnSnap>,
     /// In row order (then id). A summary has none.
     pub rows: Vec<RowSnap>,
+    /// Its summary rows, top to bottom (contract section 4b).
+    pub summary_rows: Vec<SummaryRowSnap>,
+    /// The column its rows are grouped by, when they are.
+    pub group_by: Option<String>,
 }
 
 impl TableSnap {
@@ -203,6 +268,13 @@ impl TableSnap {
         let mut out = BTreeSet::new();
         if let Some(source) = &self.source {
             scan(source, &mut out);
+        }
+        for s in &self.summary_rows {
+            for cell in s.cells.values() {
+                if let SummaryCell::Formula(f) = cell {
+                    scan(f, &mut out);
+                }
+            }
         }
         for column in &self.columns {
             match &column.ty {
@@ -238,7 +310,18 @@ impl TableSnap {
                 *formula = f(formula);
             }
         }
+        for s in &mut t.summary_rows {
+            for cell in s.cells.values_mut() {
+                if let SummaryCell::Formula(formula) = cell {
+                    *formula = f(formula);
+                }
+            }
+        }
         t
+    }
+
+    pub fn summary_row(&self, id: &str) -> Option<&SummaryRowSnap> {
+        self.summary_rows.iter().find(|s| s.id == id)
     }
 
     pub fn column(&self, id: &str) -> Option<&ColumnSnap> {

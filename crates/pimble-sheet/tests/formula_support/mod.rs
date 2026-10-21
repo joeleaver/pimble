@@ -128,10 +128,24 @@ impl TestBook {
                         _ => None,
                     })
                     .collect();
-                out.push((t.id.clone(), source, cols));
+                let sums: Vec<(String, String, String)> = t
+                    .summary_rows
+                    .iter()
+                    .flat_map(|sr| {
+                        sr.cells.iter().filter_map(|(c, cell)| match cell {
+                            pimble_sheet::SummaryCell::Formula(f) => Some((
+                                sr.id.clone(),
+                                c.clone(),
+                                formula::to_stored(&view, Some(&t.id), f).unwrap_or_else(|e| panic!("{f}: {e:?}")),
+                            )),
+                            _ => None,
+                        })
+                    })
+                    .collect();
+                out.push((t.id.clone(), source, cols, sums));
             }
             let note = self.notes.iter_mut().find(|x| x.node == n).unwrap();
-            for (tid, source, cols) in out {
+            for (tid, source, cols, sums) in out {
                 let t = note.sheets.tables.iter_mut().find(|t| t.id == tid).unwrap();
                 if source.is_some() {
                     t.source = source;
@@ -140,6 +154,10 @@ impl TestBook {
                     if let (ColumnType::Formula { formula, .. }, Some(f)) = (&mut c.ty, f) {
                         *formula = f;
                     }
+                }
+                for (sr, c, f) in sums {
+                    let row = t.summary_rows.iter_mut().find(|x| x.id == sr).unwrap();
+                    row.cells.insert(c, pimble_sheet::SummaryCell::Formula(f));
                 }
             }
         }
@@ -270,6 +288,8 @@ impl TB {
                 headers: BTreeMap::new(),
                 columns: Vec::new(),
                 rows: Vec::new(),
+                summary_rows: Vec::new(),
+                group_by: None,
             },
         }
     }
@@ -341,6 +361,28 @@ impl TB {
             order,
             cells: map,
         });
+        self
+    }
+
+    /// A summary row (contract section 4b): `cells` are `(column id,
+    /// stored value)`, as `"sum"` or `"=SUM({c:x})"`.
+    pub fn summary_row(mut self, id: &str, name: &str, cells: &[(&str, &str)]) -> TB {
+        let order = format!("{:04}", self.t.summary_rows.len());
+        self.t.summary_rows.push(pimble_sheet::SummaryRowSnap {
+            id: id.to_string(),
+            name: name.to_string(),
+            order,
+            cells: cells
+                .iter()
+                .map(|(c, v)| (c.to_string(), pimble_sheet::SummaryCell::from_stored(v).expect("a summary cell")))
+                .collect(),
+        });
+        self
+    }
+
+    /// Group the rows by column `id`.
+    pub fn group_by(mut self, id: &str) -> TB {
+        self.t.group_by = Some(id.to_string());
         self
     }
 

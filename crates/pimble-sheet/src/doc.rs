@@ -80,6 +80,9 @@ pub(crate) mod keys {
     pub const UNDER: &str = "under";
     pub const FORMULA: &str = "formula";
     pub const FORMAT: &str = "format";
+    pub const GROUP_BY: &str = "group_by";
+    /// The prefix of a summary row's key in its table's map (contract 4b).
+    pub const SUMMARY_ROW_PREFIX: &str = "sum:";
     // Cell shapes.
     pub const DATE: &str = "date";
     pub const ROW: &str = "row";
@@ -108,6 +111,14 @@ pub enum SheetError {
     DuplicateTable(String),
     #[error("{table} already has a column called \"{name}\".")]
     DuplicateColumn { table: String, name: String },
+    #[error("The table has no summary row {0}.")]
+    NoSummaryRow(String),
+    #[error("A summary row needs a name.")]
+    EmptySummaryRowName,
+    #[error("{table} already has a summary row called \"{name}\".")]
+    DuplicateSummaryRow { table: String, name: String },
+    #[error("\"{0}\" is one of Excel's names for a part of a table; call the summary row something else.")]
+    ReservedSummaryRowName(String),
     #[error("{0}")]
     Invalid(String),
 }
@@ -420,6 +431,18 @@ impl<'a, 'doc> SheetsTxn<'a, 'doc> {
             c.insert(self.txn, ORDER, column.order.clone());
             write_type(self.txn, &c, &column.ty);
         }
+        for s in &table.summary_rows {
+            let m: MapRef = t.insert(self.txn, format!("{SUMMARY_ROW_PREFIX}{}", s.id), MapPrelim::default());
+            m.insert(self.txn, NAME, s.name.clone());
+            m.insert(self.txn, ORDER, s.order.clone());
+            let cells: MapRef = m.insert(self.txn, CELLS, MapPrelim::default());
+            for (column, cell) in &s.cells {
+                cells.insert(self.txn, column.clone(), cell.to_stored());
+            }
+        }
+        if let Some(g) = &table.group_by {
+            t.insert(self.txn, GROUP_BY, g.clone());
+        }
         let rows: MapRef = t.insert(self.txn, ROWS, MapPrelim::default());
         for row in &table.rows {
             let r: MapRef = rows.insert(self.txn, row.id.clone(), MapPrelim::default());
@@ -557,6 +580,17 @@ impl<'a, 'doc> SheetsTxn<'a, 'doc> {
                 }
             }
         }
+        // Its summary cells and its grouping go with it.
+        for (_, id) in self.summary_row_siblings(&t) {
+            if let Ok(m) = self.summary_row_map(&t, &id) {
+                if let Some(cells) = child_map(self.txn, &m, CELLS) {
+                    cells.remove(self.txn, column);
+                }
+            }
+        }
+        if get_string(self.txn, &t, GROUP_BY).as_deref() == Some(column) {
+            t.remove(self.txn, GROUP_BY);
+        }
         Ok(())
     }
 
@@ -628,6 +662,146 @@ impl<'a, 'doc> SheetsTxn<'a, 'doc> {
             rows.remove(self.txn, row);
         }
         Ok(())
+    }
+
+    // ── Summary rows and groups (contract section 4b) ────────────────────
+
+    /// A new summary row. `name` `None` picks "Total", then "Total 2", and so
+    /// on; `cells` is what each column shows (by column id).
+    pub fn add_summary_row(&mut self, table: &str, name: Option<&str>, cells: &[(String, SummaryCell)], placement: Placement) -> Result<String> {
+        let t = self.table_map(table)?;
+        for (column, _) in cells {
+            self.column_map(&t, column)?;
+        }
+        let name = match name {
+            Some(n) => self.check_summary_row_name(&t, n, None)?,
+            None => {
+                let taken = self.summary_row_names(&t, None);
+                let mut n = 1;
+                loop {
+                    let candidate = if n == 1 { "Total".to_string() } else { format!("Total {n}") };
+                    if !taken.iter().any(|t| same_name(t, &candidate)) {
+                        break candidate;
+                    }
+                    n += 1;
+                }
+            }
+        };
+        let keys = self.summary_row_order_keys(&t, None, &placement)?;
+        let id = new_id();
+        let m: MapRef = t.insert(self.txn, format!("{SUMMARY_ROW_PREFIX}{id}"), MapPrelim::default());
+        m.insert(self.txn, NAME, name);
+        m.insert(self.txn, ORDER, keys);
+        let cell_map: MapRef = m.insert(self.txn, CELLS, MapPrelim::default());
+        for (column, cell) in cells {
+            cell_map.insert(self.txn, column.clone(), cell.to_stored());
+        }
+        Ok(id)
+    }
+
+    pub fn rename_summary_row(&mut self, table: &str, summary_row: &str, name: &str) -> Result<()> {
+        let t = self.table_map(table)?;
+        let m = self.summary_row_map(&t, summary_row)?;
+        let name = self.check_summary_row_name(&t, name, Some(summary_row))?;
+        m.insert(self.txn, NAME, name);
+        Ok(())
+    }
+
+    /// What one column of a summary row shows; `None` shows nothing.
+    pub fn set_summary_cell(&mut self, table: &str, summary_row: &str, column: &str, cell: Option<&SummaryCell>) -> Result<()> {
+        let t = self.table_map(table)?;
+        self.column_map(&t, column)?;
+        let m = self.summary_row_map(&t, summary_row)?;
+        let cells = self.sub_map(&m, CELLS);
+        match cell {
+            Some(c) => {
+                cells.insert(self.txn, column.to_string(), c.to_stored());
+            }
+            None => {
+                cells.remove(self.txn, column);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn move_summary_row(&mut self, table: &str, summary_row: &str, placement: Placement) -> Result<()> {
+        let t = self.table_map(table)?;
+        let m = self.summary_row_map(&t, summary_row)?;
+        let key = self.summary_row_order_keys(&t, Some(summary_row), &placement)?;
+        m.insert(self.txn, ORDER, key);
+        Ok(())
+    }
+
+    pub fn delete_summary_row(&mut self, table: &str, summary_row: &str) -> Result<()> {
+        let t = self.table_map(table)?;
+        self.summary_row_map(&t, summary_row)?;
+        t.remove(self.txn, &format!("{SUMMARY_ROW_PREFIX}{summary_row}"));
+        Ok(())
+    }
+
+    /// Group the table's rows by `column`, or with `None` ungroup them.
+    pub fn set_group_by(&mut self, table: &str, column: Option<&str>) -> Result<()> {
+        let t = self.table_map(table)?;
+        match column {
+            Some(c) => {
+                self.column_map(&t, c)?;
+                t.insert(self.txn, GROUP_BY, c.to_string());
+            }
+            None => {
+                t.remove(self.txn, GROUP_BY);
+            }
+        }
+        Ok(())
+    }
+
+    fn summary_row_map(&self, table: &MapRef, id: &str) -> Result<MapRef> {
+        match table.get(self.txn, &format!("{SUMMARY_ROW_PREFIX}{id}")) {
+            Some(Out::YMap(m)) => Ok(m),
+            _ => Err(SheetError::NoSummaryRow(id.to_string())),
+        }
+    }
+
+    /// `(order, id)` of the table's summary rows, sorted.
+    fn summary_row_siblings(&self, table: &MapRef) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = table
+            .iter(self.txn)
+            .filter_map(|(k, v)| match (k.strip_prefix(SUMMARY_ROW_PREFIX), v) {
+                (Some(id), Out::YMap(m)) => Some((get_string(self.txn, &m, ORDER).unwrap_or_default(), id.to_string())),
+                _ => None,
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn summary_row_order_keys(&self, table: &MapRef, except: Option<&str>, placement: &Placement) -> Result<String> {
+        let siblings = self.summary_row_siblings(table);
+        Ok(place(siblings, except, placement, 1, |id| SheetError::NoSummaryRow(id.to_string()))?.remove(0))
+    }
+
+    fn summary_row_names(&self, table: &MapRef, except: Option<&str>) -> Vec<String> {
+        table
+            .iter(self.txn)
+            .filter_map(|(k, v)| match (k.strip_prefix(SUMMARY_ROW_PREFIX), v) {
+                (Some(id), Out::YMap(m)) if Some(id) != except => get_string(self.txn, &m, NAME),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn check_summary_row_name(&self, table: &MapRef, name: &str, except: Option<&str>) -> Result<String> {
+        let name = column_name_from(name);
+        if name.is_empty() {
+            return Err(SheetError::EmptySummaryRowName);
+        }
+        if ["all", "data", "headers", "this row"].contains(&name.to_lowercase().as_str()) {
+            return Err(SheetError::ReservedSummaryRowName(name));
+        }
+        if self.summary_row_names(table, except).iter().any(|n| same_name(n, &name)) {
+            let table_name = get_string(self.txn, table, NAME).unwrap_or_default();
+            return Err(SheetError::DuplicateSummaryRow { table: table_name, name });
+        }
+        Ok(name)
     }
 
     // ── Lookups ──────────────────────────────────────────────────────────
@@ -922,14 +1096,43 @@ fn read_table<T: ReadTxn>(txn: &T, id: &str, t: &MapRef) -> TableSnap {
         })
         .unwrap_or_default();
 
+    let mut summary_rows: Vec<SummaryRowSnap> = t
+        .iter(txn)
+        .filter_map(|(k, v)| match (k.strip_prefix(SUMMARY_ROW_PREFIX), v) {
+            (Some(sid), Out::YMap(m)) => {
+                let cells = child_map(txn, &m, CELLS)
+                    .map(|cm| {
+                        cm.iter(txn)
+                            .filter(|(cid, _)| known.contains(cid))
+                            .filter_map(|(cid, cv)| match cv {
+                                Out::Any(Any::String(s)) => SummaryCell::from_stored(&s).map(|c| (cid.to_string(), c)),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(SummaryRowSnap {
+                    id: sid.to_string(),
+                    name: get_string(txn, &m, NAME).unwrap_or_default(),
+                    order: get_string(txn, &m, ORDER).unwrap_or_default(),
+                    cells,
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    summary_rows.sort_by(|a, b| (&a.order, &a.id).cmp(&(&b.order, &b.id)));
+
     TableSnap {
         id: id.to_string(),
         name: get_string(txn, t, NAME).unwrap_or_default(),
         order: get_string(txn, t, ORDER).unwrap_or_default(),
         source: get_string(txn, t, SOURCE),
         headers,
+        group_by: get_string(txn, t, GROUP_BY).filter(|g| known.contains(g.as_str())),
         columns,
         rows,
+        summary_rows,
     }
 }
 

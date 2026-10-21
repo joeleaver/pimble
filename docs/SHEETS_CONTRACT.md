@@ -174,6 +174,72 @@ one"), and it comes back if the formula gives the column again.
 - An app from before keys reads `{rk:…}` as an unknown token: every device moves to this
   version together.
 
+## 4b. Summary rows and groups (Joe, 2026-10-21)
+
+A plain table can sum itself up: **summary rows** under its rows, and **groups** with a
+subtotal under each. Joe, 2026-10-21: "regular sheets could have summary rows, instead of
+needing a summary sheet"; several rows, not only Excel's one Total Row; a menu or a formula
+per cell; other formulas read them Excel's way; subtotals by group too. And "if we have
+this, I'm not sure we need summary tables": summaries (section 4) stay for now, since they
+exist in stores and the MCP uses them, and are retired later if grouping covers what they
+are used for, each converted to a grouped table where it can be.
+
+**In the document**, each summary row is a key of its table's map (never a container made
+on first use, section 2, so two devices adding a table's first summary row apart keep
+both):
+
+```
+data["sheet:<table id>"]
+  sum:<id>:  Map             one key per summary row
+    name:    String          unique within the table, shown at its left ("Total")
+    order:   String          fractional, top to bottom
+    cells:   Map<column id, String>   what each column shows; absent is nothing
+  group_by:  String | absent  the column id rows are grouped by
+```
+
+A summary cell is one of `sum`, `average`, `count`, `min`, `max`, or `=` and a stored
+formula (section 6). The words are the menu; the formula is anything else. Each is one value
+in a Map, so last writer wins per cell, as cells do.
+
+- **What a summary row sums** is the rows above it: the whole table for a row at the
+  bottom, one group for a subtotal. `count` counts the cells that are not blank; the others
+  take the column's numbers and skip the rest, as Excel's `SUBTOTAL` does. A result keeps
+  the column's format (`sum` of money is money; `count` is a plain number).
+- **In a summary cell's formula**, `[amount]` is the column's values in that scope (the
+  whole table, or the group), so `=SUM([amount])/COUNT([nights])` works at the bottom and
+  in every subtotal. There is no `[@…]`: a summary row has no row of its own ("A summary row
+  sums up rows; it has no row of its own to read"). Other tables and notes are read as
+  anywhere else.
+- **Adding a summary row** names it "Total" (then "Total 2", and so on), with `sum` in every
+  number, money and hours column and in formula columns that show numbers. Rename it,
+  reorder it, change any cell from the menu, or remove it.
+- **Grouping**: a column's menu has "Group by This Column". Rows then show under a header
+  per value of that column (the value as shown: a link's label, a date as a date), groups in
+  ascending order with blanks last as "(blank)", and the rows of a group in their own order.
+  Under each group come the summary rows, computed over that group (the subtotals); under
+  the last group come the same rows over every row (the grand totals). A table with no
+  summary rows shows the group headers alone. Any column can group, formula columns
+  included: a column `=TEXT([@date],"yyyy-mm")` groups by month. "Ungroup" takes it off.
+  The grouping is the table's, so everyone sees it; a new row's line stays at the bottom,
+  and a row typed there goes to its group.
+- **Collapsing** a group (its header's chevron) shows only its header and subtotals;
+  "Collapse All" turns the table into its summary. What is collapsed is the viewer's own,
+  kept on this device like the explorer's open folders, never in the document.
+- **Reading them from formulas**, Excel's way: `Trips[[#Totals],[cost]]` is the cost cell of
+  the table's first summary row (Excel's Total Row), and `Trips[[#Average],[cost]]` reads the
+  summary row named Average (a `#` part that is not one of Excel's: `#All`, `#Data`,
+  `#Headers`, `#This Row`, `#Totals`). Stored by id, `{s:<id>}`, so renaming the row edits no
+  formula. Only the bottom rows are read this way; a subtotal is the `SUMIFS` it stands for.
+  A summary row may read another summary row; one that reads itself is `#CIRC!`.
+- **Summary rows are not data rows**: `COUNTA(Trips[name])`, `FILTER`, a link column's
+  picker and the MCP's rows never see them. Copy (section 11) copies data rows only.
+- **Old apps** ignore keys they do not know: they show the table ungrouped and without its
+  summary rows. A formula that reads a summary row (`{s:<id>}`) is an unknown token there,
+  so every device moves to the version that has them together.
+- **MCP** (section 10): `add_summary_row`, `update_summary_row` (name, order, cells),
+  `remove_summary_row`, `group_table` (a column, or none); `list_tables` and `read_table`
+  give the summary rows and, for a grouped table, each group's subtotals.
+
 ## 5. Names, and what is unique
 
 - **A table name** is unique within its note when it is set: a second "Expenses" in the

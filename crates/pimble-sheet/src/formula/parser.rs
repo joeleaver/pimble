@@ -611,6 +611,28 @@ fn special(text: &str) -> Option<Special> {
     })
 }
 
+/// `#Average` (or, stored, `#{s:<id>}`) in `src[hash..end]`: the summary row
+/// of that name (contract section 4b). One to a reference.
+fn summary_part(src: &str, hash: usize, end: usize, spec: &mut Spec) -> Result<(), ParseError> {
+    let raw = &src[hash + 1..end];
+    let lead = raw.len() - raw.trim_start().len();
+    let text = raw.trim();
+    let span = hash + 1 + lead..hash + 1 + lead + text.len();
+    if text.is_empty() {
+        return Err(ParseError::new("A \"#\" names a part of a table, like [#Totals], or a summary row, like [#Average]", hash..end));
+    }
+    if spec.summary.is_some() || spec.area != Area::Data {
+        return Err(ParseError::new("A reference reads one part of a table", hash..end));
+    }
+    let name = match text.strip_prefix("{s:").and_then(|t| t.strip_suffix('}')) {
+        Some(id) => NameRef::Id(id.to_string()),
+        None => NameRef::Name(text.to_string()),
+    };
+    spec.area = Area::Totals;
+    spec.summary = Some(SummaryPiece { name, span });
+    Ok(())
+}
+
 fn parse_spec(src: &str, open: usize, close: usize) -> Result<Spec, ParseError> {
     let span = open..close + 1;
     let mut spec = Spec {
@@ -619,6 +641,7 @@ fn parse_spec(src: &str, open: usize, close: usize) -> Result<Spec, ParseError> 
         cols: Cols::All,
         single: false,
         span: span.clone(),
+        summary: None,
     };
     let mut i = skip_ws(src, open + 1, close);
     if src[i..].starts_with('@') {
@@ -639,10 +662,8 @@ fn parse_spec(src: &str, open: usize, close: usize) -> Result<Spec, ParseError> 
             Some(Special::Headers) => spec.area = Area::Headers,
             Some(Special::Totals) => spec.area = Area::Totals,
             None => {
-                return Err(ParseError::new(
-                    format!("\"{}\" isn't a part of a table; the parts are #All, #Data, #Headers and #This Row", inner.trim()),
-                    i..close,
-                ))
+                let hash = i + inner.find('#').unwrap_or(0);
+                summary_part(src, hash, close, &mut spec)?;
             }
         }
         return Ok(spec);
@@ -684,10 +705,8 @@ fn parse_list(src: &str, mut i: usize, close: usize, mut spec: Spec) -> Result<S
                 Some(Special::Headers) => spec.area = Area::Headers,
                 Some(Special::Totals) => spec.area = Area::Totals,
                 None => {
-                    return Err(ParseError::new(
-                        format!("\"{}\" isn't a part of a table; the parts are #All, #Data, #Headers and #This Row", text.trim()),
-                        i..end + 1,
-                    ))
+                    let hash = i + 1 + text.find('#').unwrap_or(0);
+                    summary_part(src, hash, end, &mut spec)?;
                 }
             }
         } else {
