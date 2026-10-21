@@ -1,5 +1,16 @@
 # Next session: start here
 
+**2026-10-21, night: v0.12.1 released, deployed (jkbase v28) and installed here**
+(release commit 15261f9; backup `bkp_1792617824741_399f9909320523ac`). It fixes the
+explorer: rows clear the overlay scrollbar, long titles end in an ellipsis, and each row
+is one stacking context (paint per hover repaint on the family store 8.0 -> 5.1 ms at
+1200x800). The rest of the tree's cost is rinch's, filed by the Rinch session: #1719
+(paint visits rows scrolled out of view; PR #1720 in review), #1718 (the GPU re-encodes
+the whole scene on every hover), #1717 (positioned content over a scroller's bar). Take
+each into a release when it merges. To measure the tree: a copy of the family store in a
+scratch environment, `state.json` reset to only `open_stores` before every run (a
+restored tree state changes what is measured), `RINCH_PERF=1`, the same folders opened.
+
 **2026-10-21, evening: v0.12.0 released and deployed, with discussions** (Joe: "merge,
 build, release and install please"). Branch `discussions` merged into `master`; release
 commit afb4cfc, tag `v0.12.0`, rinch `main` 42e2d2df in both locks. Before it: 1061 tests
