@@ -266,6 +266,7 @@ pub(crate) fn apply_reconcile(store: AppStore, store_id: StoreId, node_id: NodeI
         if let Some(ours) = ours {
             store.send(BackendCommand::BroadcastChanges { store_id, node_id, changes: encode(&ours) });
         }
+        refresh_cache(store, pane);
         recompute(store, pane);
     }
 }
@@ -284,7 +285,18 @@ fn apply_to(store: AppStore, pane: PaneId, bytes: &[u8]) {
         }
     });
     if applied.is_some() {
+        refresh_cache(store, pane);
         recompute(store, pane);
+    }
+}
+
+/// The node cache takes pane `pane`'s copy of its discussion: what this
+/// window shows of it elsewhere (its host's list) reads the cache, and no
+/// refetch comes for a node a pane holds.
+fn refresh_cache(store: AppStore, pane: PaneId) {
+    let Some((store_id, node_id, bytes)) = with_session(pane, |s| (s.store_id, s.node_id, s.doc.save())) else { return };
+    if let Some(sig) = store.get_node_signal(store_id, node_id) {
+        sig.update(|node| node.content = bytes);
     }
 }
 
@@ -334,6 +346,8 @@ fn local_edit(store: AppStore, pane: PaneId, f: impl FnOnce(&mut pimble_discussi
     };
     if let Some(update) = edited.update {
         send_update(store, pane, store_id, node_id, update);
+        // No echo of our own edit refreshes the cache either.
+        refresh_cache(store, pane);
     }
     recompute(store, pane);
     ok

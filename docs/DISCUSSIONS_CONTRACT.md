@@ -1,6 +1,6 @@
 # Discussions contract: threaded conversations anywhere
 
-Status: **draft, nothing built; every question asked so far is answered.** Written on 2026-10-21 from a conversation with Joe: "a
+Status: **wave 1 built** (branch `discussions`, not merged; "Built in wave 1" at the end says what exists and how it was checked); every question asked so far is answered. Written on 2026-10-21 from a conversation with Joe: "a
 new node/embed type, discussions. A little like comments, but a way to put a threaded,
 replyable discussion anywhere." His answers that day are listed under "Decisions" at the
 end. The questions still open are his and are listed under "Open decisions".
@@ -456,3 +456,72 @@ None right now.
 - A topic line, which is the discussion node's title.
 - The same sticky positions remember your place in every node, in the personal
   document, following you across devices (section 8b).
+
+## Built in wave 1 (2026-10-21, branch `discussions`, rinch `main` 1378e13)
+
+What exists:
+
+- **`pimble-discussion`** (`doc.rs`, `body.rs`, `thread.rs`): the document under
+  `data.discussion` with its containers made by `new_content` at creation; `post`,
+  `edit_message` (common prefix and suffix kept, then every span formatted again),
+  `delete_message`/`restore_message`, `resolve`/`reopen`, `set_anchor`; bodies as a yrs
+  Text with `bold`/`italic`/`link` attributes and the Markdown they are typed as (a bare
+  `http(s)://` or `pimble:` URL is a link; `_` inside a word is text); the thread in
+  `(created, id)` order with replies waiting for a parent not here yet, cycles cut at the
+  smallest id, and a deleted message shown only while a reply is; index units and the
+  Markdown MCP reads. 19 tests, three replicas converging among them.
+- **Attachments in `pimble_crdt::Tree`**: `node.attached_to` (`NodeDoc::init_attached`),
+  `Tree::add_attachment`, `attachments_of`, `attachment_counts`, `is_attachment`; repair
+  and validation skip them; an attachment's delete and undelete touch no list; a deleted
+  host hides its attachments; `take_cutting`/`plant` make a transplanted node's
+  attachments again under the new node. 7 tests; 600 convergence seeds pass.
+- **Server**: `createAttachment`, `listAttachments`, `whoAmI` (an agent's id and name),
+  `Node.attachments` (a count reported with `getNode`/`getChildren`, never stored),
+  `StoreChangeKind::AttachmentChanged { node_id, host_id, live }` from `derive_kinds`,
+  plain scopes and vault keys reaching an attachment through its host, `listDeleted`
+  not calling a live attachment lost, and a `DiscussionPlugin` indexing messages.
+- **App (desktop and web)**: `discussions.rs` and `discussions/ui.rs`: a pane holding a
+  discussion (session, reconcile, peers' updates), the topic line (the title), the thread
+  indented five levels, Reply / Edit / Delete (your own and unauthored only), "N deleted
+  messages" with Put Back, Resolve / Reopen with the collapse and "Show all N
+  messages", the message box (Enter sends, Shift+Enter, Escape, emoji picker), the
+  "Discussions (N)" list under a note (in its text) or under a board or sheet, the row's
+  count, "New Discussion" and "Start a Discussion" in row menus and Edit > "Start a
+  Discussion", opening beside the note (an empty or discussion pane first, else a split),
+  and the layout remembering discussion (and, newly, sheet) panes. The web's vault client
+  creates, lists and counts attachments, derives `AttachmentChanged`, and wraps a new
+  discussion under its host's share keys.
+- **MCP**: `list_discussions`, `read_discussion`, `start_discussion` (`on` or `parent`),
+  `reply`, `edit_message`, `delete_message` (the agent's own messages only: an
+  unauthored message is the person's), `resolve_discussion`; messages stamped with the
+  agent's id and name.
+
+How it was checked:
+
+- `cargo test --workspace --release`: 1055 passed.
+- The release desktop app on a scratch store on its own port (driven over rinch's debug
+  port): start a discussion on a note, post with Enter, bold and emoji (drawn in color by
+  the GPU renderer), reply, set the topic, edit by keyboard, delete and put back, resolve
+  and the collapse, restart (everything and the layout back), a standalone discussion
+  from the store row, Shift+Enter. An agent through `pimble-mcp` (scratch agent key):
+  `list_discussions`, `read_discussion`, `reply` and `start_discussion`, each shown live
+  in the open app with the agent's name and mark.
+- The browser on the local stack, in an encrypted store (made-up `alice@example.com`):
+  start a discussion, post, reload and unlock (it comes back), two tabs replying live to
+  each other with the note's list following, and no typed word on the hosted disk.
+
+Found and fixed while checking: rinch cancels a timer, and drops a keyboard interceptor,
+that a component armed when it unmounts, and Edit rebuilds the message its button is in
+(the box's keys and focus are now armed with `unowned`); the node cache a note's list
+reads was not refreshed by a pane's own or received edits; an agent could edit an
+unauthored message; the saved layout dropped sheet panes.
+
+Not done or not seen:
+
+- `[[` links and `:name:` emoji completion in the message box (links are typed as
+  `[text](pimble:...)` or pasted); the box hears Enter through the keyboard interceptor
+  until joeleaver/rinch#1678, and a press in the tree does not release it.
+- Two devices on different servers at once (only two tabs on one hosted server, and the
+  app with an agent on one local server); a share member's reply reaching the owner.
+- Readers see no message box; commenters do not exist yet (wave 6).
+- Color emoji with `--cpu` (rinch #804: the software renderer draws no bitmap color font).

@@ -1,5 +1,18 @@
 # Next session: start here
 
+**2026-10-21: discussions wave 1 built** on branch `discussions` (from `master` e7295d5,
+nothing pushed; rinch still at `main` 1378e13). docs/DISCUSSIONS_CONTRACT.md is the
+reference: its "Decisions" are Joe's from today, and "Built in wave 1" says what exists,
+how it was checked (release desktop app on a scratch store, an agent through
+`pimble-mcp`, two browser tabs on the local stack in an encrypted store) and the gaps.
+
+Next, in order (Joe: "do them here sequentially"): wave 2, discussions in text (margin
+markers, the inline embed, Insert > "Discussion"). It needs rinch: sticky positions are
+merged (joeleaver/rinch#1679, `main` 2a42fa7a; move the pin in both locks), margin
+anchors and the overlay slot are joeleaver/rinch#1683 (in review), the message box's keys
+are #1678 (being built). The Rinch session reports PR numbers to this one. Then waves 3
+(pins on boards), 4 and 5 (unread and the personal document), 6 (the commenter role).
+
 **2026-10-20, end of session: sheets waves 1 to 3 built, plus sheet nodes embedded in
 text.** Branch `sheets` (on `master`, 25 commits, nothing pushed); rinch at `main` fc14187
 in both locks. docs/SHEETS_CONTRACT.md is the reference: "Built in wave 2", "Built in
