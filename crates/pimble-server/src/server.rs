@@ -79,6 +79,9 @@ pub struct ServerConfig {
     /// no JWT verifier (the app's own), and no agents anywhere else; tests
     /// set a temp path.
     pub agents_path: Option<PathBuf>,
+    /// The version `serverInfo` reports. `None` is this build's; tests set an
+    /// older one to see a newer client take the port over.
+    pub reported_version: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -96,6 +99,7 @@ impl Default for ServerConfig {
             grant_check_interval: None,
             relay_dir: None,
             agents_path: None,
+            reported_version: None,
         }
     }
 }
@@ -254,11 +258,19 @@ impl PimbleServer {
             handler = handler.with_grant_check_interval(every);
         }
         handler = handler.with_agents(agents);
+        // The app's own server (loopback, tokenless, no JWT) hands over to a
+        // newer one (docs/MCP_CONTRACT.md "Which server it talks to").
+        let local_own = !self.face && self.config.addr.ip().is_loopback() && self.config.auth_token.is_none() && !jwt_configured;
+        handler = handler.with_hand_over(local_own);
+        if let Some(version) = self.config.reported_version.clone() {
+            handler = handler.with_reported_version(version);
+        }
         self.handler = Some(handler.clone());
-        let methods = handler.into_rpc();
+        let methods = handler.clone().into_rpc();
 
         info!("Starting Pimble server on {}", local_addr);
         let handle = server.start(methods);
+        handler.set_server_handle(handle.clone());
         self.handle = Some(handle);
 
         Ok(())

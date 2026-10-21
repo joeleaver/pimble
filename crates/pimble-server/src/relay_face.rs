@@ -189,6 +189,8 @@ impl RelayHost {
             grant_check_interval: None,
             // A face admits no agents of its own (`PimbleServer::start`).
             agents_path: None,
+            // Reports this build's version, and hands over to nobody.
+            reported_version: None,
         };
         let mut server = PimbleServer::relay_face(config);
         server.start().await.map_err(|e| anyhow::anyhow!("the relay face did not start: {}", e))?;

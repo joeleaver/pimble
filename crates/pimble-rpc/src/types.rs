@@ -984,6 +984,17 @@ pub struct NodeContentChangedNotification {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmptyResponse {}
 
+/// What a server says about itself (`serverInfo`): the Pimble version it was
+/// built as. A local client that finds an older one asks it to hand over
+/// (docs/MCP_CONTRACT.md "Which server it talks to").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerInfoResponse {
+    pub version: String,
+    /// Whether this server stops when a newer local client asks it to
+    /// (`handOver`): the app's own loopback server, never a hosted one.
+    pub hands_over: bool,
+}
+
 /// Generic error response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {

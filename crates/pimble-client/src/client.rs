@@ -1400,6 +1400,16 @@ impl PimbleClient {
         Ok(())
     }
 
+    /// The server's version, and whether it hands over to a newer one.
+    pub async fn server_info(&self) -> Result<pimble_rpc::types::ServerInfoResponse> {
+        self.client.server_info().await.map_err(rpc_error)
+    }
+
+    /// Ask the server to write everything and stop, for a newer one.
+    pub async fn hand_over(&self) -> Result<()> {
+        self.client.hand_over().await.map(|_| ()).map_err(rpc_error)
+    }
+
     /// Whether an account is signed in, and as whom.
     pub async fn cloud_status(&self) -> Result<CloudStatusResponse> {
         self.client.cloud_status().await.map_err(rpc_error)

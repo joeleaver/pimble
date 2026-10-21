@@ -322,6 +322,17 @@ pub trait PimbleApi {
     #[method(name = "removeAgent", with_extensions)]
     async fn remove_agent(&self, request: RemoveAgentRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
 
+    /// The server's version, and whether it hands over to a newer one.
+    #[method(name = "serverInfo")]
+    async fn server_info(&self) -> Result<ServerInfoResponse, ErrorObjectOwned>;
+
+    /// Write every document and stop, so a newer Pimble on this computer can
+    /// start its own server on the port (docs/MCP_CONTRACT.md "Which server
+    /// it talks to"). `Service`-only, and only on a server that says
+    /// `hands_over`. Answers before it stops.
+    #[method(name = "handOver", with_extensions)]
+    async fn hand_over(&self) -> Result<EmptyResponse, ErrorObjectOwned>;
+
     /// Whether an account is currently signed in, and as whom. `Service`-only.
     #[method(name = "cloudStatus", with_extensions)]
     async fn cloud_status(&self) -> Result<CloudStatusResponse, ErrorObjectOwned>;

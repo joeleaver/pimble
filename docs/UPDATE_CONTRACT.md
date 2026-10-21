@@ -72,6 +72,13 @@ this process, and closes the window. The new process waits up to 20 seconds for
 the old one to exit before it starts its embedded server, so the two never
 contend for the port.
 
+That restarts the app's server only when the app runs it. The server belongs to
+whichever local client started it first, and a `pimble-mcp` (an AI tool's) may
+have, from an older install or a dev build that updates never touch. So a client
+checks the version of a server it finds and takes the port over from an older
+one, or names the process to quit when it is too old to ask (docs/MCP_CONTRACT.md
+"Which server it talks to").
+
 ## Signing
 
 CI's release job signs every package with `openssl pkeyutl -sign -rawin` (pure

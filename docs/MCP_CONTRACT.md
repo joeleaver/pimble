@@ -49,7 +49,17 @@ depends on pimble-client), and both binaries call them:
 
 1. The address is `PIMBLE_APP_ADDR`, else `127.0.0.1:7462`. A `PIMBLE_SERVER` URL (with
    `PIMBLE_TOKEN`) names some other server instead, and then nothing is started.
-2. A Pimble server already answering there is used (the probe: `listStores` within 2 s).
+2. A Pimble server already answering there is used (the probe: `listStores` within 2 s),
+   when it is this build's version or newer (`serverInfo`, from 0.12.2). One that is older
+   and says `hands_over` (the app's own loopback server, never a hosted one) is asked to
+   (`handOver`: it answers, writes every document, stops its links and frees the port), and
+   the asker starts a current server in its place; the process whose server handed over
+   reconnects by joining it and starts none of its own on that reconnect. One that is older
+   and cannot be asked (any server from before 0.12.2) is refused with a sentence that names
+   the process holding the port ("An older Pimble server (from before 0.12.2) is running on
+   127.0.0.1:7462. Quit pimble-mcp (process 2065674), then start Pimble again."). Added
+   2026-10-21 after a `pimble-mcp` left running for a day from an older dev build served the
+   0.12.1 app, whose Discuss button then answered "method not found".
 3. Otherwise `pimble-mcp` starts the embedded server itself and opens the stores in the
    app's saved list (`<config dir>/pimble/state.json`, `open_stores`), so the LLM sees
    what the person sees in the explorer.

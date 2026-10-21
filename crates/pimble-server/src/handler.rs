@@ -1183,6 +1183,13 @@ pub struct RpcHandler {
     /// server; `None` elsewhere, where the agent RPCs answer that there are
     /// none here.
     agents: Option<Arc<crate::agents::AgentRegistry>>,
+    /// The running server's own handle, and whether it hands over to a newer
+    /// local one (`handOver`): set by `PimbleServer::start` for the app's
+    /// loopback server only.
+    hand_over: Arc<std::sync::Mutex<Option<jsonrpsee::server::ServerHandle>>>,
+    hands_over: bool,
+    /// What `serverInfo` says this server is: this build's version.
+    version: Arc<str>,
 }
 
 /// What a share's member is told a store is called by this server, which
@@ -1265,7 +1272,27 @@ impl RpcHandler {
             relay: Arc::new(crate::relay_face::RelayHost::new(relay_dir_beside(&replicas_dir))),
             replicas_dir: Arc::new(replicas_dir),
             agents: None,
+            hand_over: Arc::new(std::sync::Mutex::new(None)),
+            hands_over: false,
+            version: Arc::from(env!("CARGO_PKG_VERSION")),
         }
+    }
+
+    /// This server stops when a newer local client asks (`handOver`).
+    pub fn with_hand_over(mut self, hands_over: bool) -> Self {
+        self.hands_over = hands_over;
+        self
+    }
+
+    /// Report `version` from `serverInfo` instead of this build's (tests).
+    pub fn with_reported_version(mut self, version: String) -> Self {
+        self.version = Arc::from(version);
+        self
+    }
+
+    /// The running server's handle, for `handOver` to stop it with.
+    pub fn set_server_handle(&self, handle: jsonrpsee::server::ServerHandle) {
+        *self.hand_over.lock().unwrap() = Some(handle);
     }
 
     /// The agents this server admits and manages (`ServerConfig::agents_path`).
@@ -3105,6 +3132,36 @@ impl PimbleApiServer for RpcHandler {
         if !self.agents()?.remove(&request.id).map_err(to_rpc_error)? {
             return Err(invalid_params("There is no such agent."));
         }
+        Ok(EmptyResponse {})
+    }
+
+    async fn server_info(&self) -> Result<pimble_rpc::types::ServerInfoResponse, ErrorObjectOwned> {
+        Ok(pimble_rpc::types::ServerInfoResponse { version: self.version.to_string(), hands_over: self.hands_over })
+    }
+
+    async fn hand_over(&self, ext: &Extensions) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "handOver")?;
+        if !self.hands_over {
+            return Err(pimble_rpc::forbidden_error("This server does not hand over; it is not this computer's own Pimble server."));
+        }
+        let Some(handle) = self.hand_over.lock().unwrap().take() else {
+            return Ok(EmptyResponse {});
+        };
+        info!("A newer Pimble on this computer asked for the port: handing over");
+        crate::local::handed_over();
+        let handler = self.clone();
+        // After the answer: everything written, links and the relay stopped,
+        // as `PimbleServer::stop` does, then the port freed.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            handler.stop_links().await;
+            handler.relay().stop().await;
+            if let Err(e) = handler.store_manager.write().await.flush_all().await {
+                tracing::warn!("Handing over: a document could not be written: {}", e);
+            }
+            let _ = handle.stop();
+            info!("Pimble server stopped for a newer one");
+        });
         Ok(EmptyResponse {})
     }
 
