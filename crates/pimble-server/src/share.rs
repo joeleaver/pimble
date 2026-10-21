@@ -520,6 +520,7 @@ impl Upkeep {
             | StoreChangeKind::NodeDeleted { .. }
             | StoreChangeKind::NodeMoved { .. }
             | StoreChangeKind::MetadataUpdated { .. }
+            | StoreChangeKind::AttachmentChanged { .. }
             | StoreChangeKind::TreeStructure { .. } => {}
             StoreChangeKind::ContentUpdated { .. }
             | StoreChangeKind::SyncStateChanged { .. }

@@ -376,6 +376,7 @@ fn document_of(kind: &StoreChangeKind) -> Option<NodeId> {
         | StoreChangeKind::NodeDeleted { node_id, .. }
         | StoreChangeKind::NodeMoved { node_id, .. }
         | StoreChangeKind::MetadataUpdated { node_id }
+        | StoreChangeKind::AttachmentChanged { node_id, .. }
         | StoreChangeKind::ContentUpdated { node_id } => Some(*node_id),
         StoreChangeKind::TreeStructure { node_ids } => node_ids.first().copied(),
         StoreChangeKind::SyncStateChanged { .. }

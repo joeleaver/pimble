@@ -5144,6 +5144,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pimble-discussion"
+version = "0.11.0"
+dependencies = [
+ "pimble-core",
+ "pimble-crdt",
+ "thiserror 2.0.17",
+ "uuid",
+ "yrs",
+]
+
+[[package]]
 name = "pimble-image"
 version = "0.11.0"
 dependencies = [

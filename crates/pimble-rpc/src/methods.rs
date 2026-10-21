@@ -64,6 +64,15 @@ pub trait PimbleApi {
     #[method(name = "createNode", with_extensions)]
     async fn create_node(&self, request: CreateNodeRequest) -> Result<CreateNodeResponse, ErrorObjectOwned>;
 
+    /// Create an attachment of a node (a discussion on it,
+    /// docs/DISCUSSIONS_CONTRACT.md section 1). Write, judged on the host.
+    #[method(name = "createAttachment", with_extensions)]
+    async fn create_attachment(&self, request: CreateAttachmentRequest) -> Result<CreateNodeResponse, ErrorObjectOwned>;
+
+    /// A node's live attachments. Read, judged on the host.
+    #[method(name = "listAttachments", with_extensions)]
+    async fn list_attachments(&self, request: ListAttachmentsRequest) -> Result<ListAttachmentsResponse, ErrorObjectOwned>;
+
     /// Update a node's metadata. Write.
     #[method(name = "updateNodeMetadata", with_extensions)]
     async fn update_node_metadata(&self, request: UpdateNodeMetadataRequest) -> Result<EmptyResponse, ErrorObjectOwned>;

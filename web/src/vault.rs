@@ -2868,6 +2868,8 @@ impl VaultStore {
                 content: Vec::new(),
                 children: Vec::new(),
                 became: None,
+                attached_to: None,
+                attachments: 0,
                 access: StoreAccess::Full,
             });
         }
@@ -3720,6 +3722,8 @@ fn empty_folder(node_id: NodeId, title: &str) -> Node {
         content: Vec::new(),
         children: Vec::new(),
         became: None,
+        attached_to: None,
+        attachments: 0,
         access: StoreAccess::Read,
     }
 }

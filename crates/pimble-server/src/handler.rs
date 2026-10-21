@@ -60,7 +60,7 @@ use pimble_rpc::{
     CloudHostStoreResponse, CloudHostedStoreInfo, CloudListHostedStoresResponse, CloudRelayStoreRequest, CloudRelayStoreResponse, CloudSignInRequest,
     CloudStatusResponse, CloudStopRelayingRequest,
     CreateMountRequest, CreateMountResponse,
-    CreateNodeRequest, CreateNodeResponse, CreateStoreRequest, CreateStoreResponse,
+    CreateAttachmentRequest, CreateNodeRequest, CreateNodeResponse, CreateStoreRequest, CreateStoreResponse, ListAttachmentsRequest, ListAttachmentsResponse,
     CreateWorkspaceRequest, DeleteNodeRequest, EditOperation, EmptyResponse, GetChildrenRequest,
     GetChildrenResponse, GetMountStateRequest, GetMountStateResponse, GetNodeRequest, GetStoreSyncRequest, GetStoreSyncResponse, SetStoreSyncRequest,
     GetNodeResponse, GetNodesRequest, GetNodesResponse, ListRemoteStoresRequest, ListStoresResponse, LoadWorkspaceRequest,
@@ -165,7 +165,12 @@ pub(crate) fn plain_scope(tree: &Tree, roots: &[NodeId]) -> HashSet<NodeId> {
         .ids()
         .into_iter()
         .filter(|id| !scope.contains(id))
-        .filter_map(|id| Some((id, tree.doc(id)?.fields().ok()?.parent_id?)))
+        // An attachment is in the scopes its host is in
+        // (docs/DISCUSSIONS_CONTRACT.md section 1).
+        .filter_map(|id| {
+            let fields = tree.doc(id)?.fields().ok()?;
+            Some((id, fields.parent_id.or(fields.attached_to)?))
+        })
         .collect();
     // A deleted folder's deleted children point at the folder, so admit
     // until a pass admits none.
@@ -677,6 +682,24 @@ fn derive_kinds(node_id: NodeId, root: NodeId, before: Option<&DocShape>, after:
     if effect.structure {
         let before_fields = before.and_then(|s| s.fields.as_ref());
         let after_fields = after.and_then(|s| s.fields.as_ref());
+        // An attachment (docs/DISCUSSIONS_CONTRACT.md section 1) is in no
+        // list: its arrival, deletion and return are news for its host.
+        if let Some(host_id) = after_fields.and_then(|a| a.attached_to) {
+            let was_live = before_fields.is_some_and(|b| b.deleted_at.is_none());
+            let live = after_fields.is_some_and(|a| a.deleted_at.is_none());
+            if was_live != live {
+                kinds.push(StoreChangeKind::AttachmentChanged { node_id, host_id, live });
+            } else if before_fields != after_fields {
+                kinds.push(StoreChangeKind::MetadataUpdated { node_id });
+            }
+            if effect.content || effect.data {
+                kinds.push(StoreChangeKind::ContentUpdated { node_id });
+            }
+            if kinds.is_empty() {
+                kinds.push(StoreChangeKind::MetadataUpdated { node_id });
+            }
+            return kinds;
+        }
         let node_kind = match (before_fields, after_fields) {
             (None, Some(a)) => Some(match (a.deleted_at.is_some(), a.parent_id) {
                 (true, parent) => StoreChangeKind::NodeDeleted { node_id, parent_id: parent.unwrap_or(root) },
@@ -730,6 +753,8 @@ fn index_events_for(kind: &StoreChangeKind) -> Vec<IndexEvent> {
         | StoreChangeKind::NodeMoved { node_id, .. }
         | StoreChangeKind::MetadataUpdated { node_id } => vec![IndexEvent::Upsert(*node_id)],
         StoreChangeKind::NodeDeleted { node_id, .. } => vec![IndexEvent::Remove(*node_id)],
+        StoreChangeKind::AttachmentChanged { node_id, live: true, .. } => vec![IndexEvent::Upsert(*node_id)],
+        StoreChangeKind::AttachmentChanged { node_id, live: false, .. } => vec![IndexEvent::Remove(*node_id)],
         StoreChangeKind::ContentUpdated { node_id } => vec![IndexEvent::ContentChanged(*node_id)],
         StoreChangeKind::TreeStructure { node_ids } => node_ids.iter().map(|id| IndexEvent::Upsert(*id)).collect(),
         StoreChangeKind::SyncStateChanged { .. }
@@ -1024,6 +1049,7 @@ fn named_by(kind: &StoreChangeKind) -> Named {
         StoreChangeKind::MetadataUpdated { node_id } | StoreChangeKind::ContentUpdated { node_id } => {
             Named::Document { id: *node_id, others: Vec::new() }
         }
+        StoreChangeKind::AttachmentChanged { node_id, host_id, .. } => Named::Document { id: *node_id, others: vec![*host_id] },
         // One document per notification wherever this server builds one; a
         // longer list is about its first, like the bytes it carries.
         StoreChangeKind::TreeStructure { node_ids } => match node_ids.split_first() {
@@ -3557,6 +3583,10 @@ impl PimbleApiServer for RpcHandler {
             .get_node(request.store_id, request.node_id)
             .map_err(to_rpc_error)?;
         node.access = judge_access(&manager, &principal, &reach, request.store_id, node.id);
+        node.attachments = manager
+            .tree(request.store_id)
+            .map(|tree| tree.attachments_of(node.id).len() as u32)
+            .unwrap_or(0);
 
         Ok(GetNodeResponse { node })
     }
@@ -3652,6 +3682,64 @@ impl PimbleApiServer for RpcHandler {
         self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
 
         Ok(CreateNodeResponse { node_id })
+    }
+
+    async fn create_attachment(
+        &self,
+        ext: &Extensions,
+        request: CreateAttachmentRequest,
+    ) -> Result<CreateNodeResponse, ErrorObjectOwned> {
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Write)?;
+        self.reject_if_vault(request.store_id).await?;
+        info!("Creating {} attachment '{}' of node {} in store {}", request.node_type, request.title, request.host_id, request.store_id);
+
+        let mut node = Node::new(&request.node_type);
+        node.metadata.title = request.title;
+        if let Some(content) = &request.content {
+            use base64::Engine;
+            node.content = base64::engine::general_purpose::STANDARD
+                .decode(content)
+                .map_err(|e| to_rpc_error(format!("the new attachment's content is not base64: {e}")))?;
+        }
+        node.metadata.custom = request.custom;
+
+        let host_id = request.host_id;
+        let mut manager = self.store_manager.write().await;
+        // The attachment is in every scope its host is in, and only the new
+        // document is written: judged as a write there.
+        require_in_scope(&Reach::of(&manager, &principal, request.store_id), host_id, Access::Write)?;
+        if manager.write_refused(request.store_id, &[host_id]) {
+            return Err(read_only_error());
+        }
+        let (node_id, edit) = manager.create_attachment(request.store_id, node, host_id).map_err(to_rpc_error)?;
+        manager.flush(request.store_id).await.map_err(to_rpc_error)?;
+        drop(manager);
+        self.broadcast_tree_edit(request.store_id, &edit, &[(node_id, StoreChangeKind::AttachmentChanged { node_id, host_id, live: true })], None).await;
+        self.enqueue_index_event(request.store_id, IndexEvent::Upsert(node_id)).await;
+        Ok(CreateNodeResponse { node_id })
+    }
+
+    async fn list_attachments(
+        &self,
+        ext: &Extensions,
+        request: ListAttachmentsRequest,
+    ) -> Result<ListAttachmentsResponse, ErrorObjectOwned> {
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Read)?;
+        self.reject_if_vault(request.store_id).await?;
+        let manager = self.store_manager.read().await;
+        let reach = Reach::of(&manager, &principal, request.store_id);
+        require_in_scope(&reach, request.node_id, Access::Read)?;
+        let ids = manager.tree(request.store_id).map_err(to_rpc_error)?.attachments_of(request.node_id);
+        let mut nodes = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Ok(mut node) = manager.get_node(request.store_id, id) {
+                node.access = judge_access(&manager, &principal, &reach, request.store_id, id);
+                nodes.push(node);
+            }
+        }
+        Ok(ListAttachmentsResponse { nodes })
     }
 
     async fn update_node_metadata(
@@ -4078,7 +4166,9 @@ impl PimbleApiServer for RpcHandler {
             let Ok(fields) = doc.fields() else { continue };
             if fields.deleted_at.is_some() {
                 tombstones.push(id);
-            } else {
+            } else if fields.attached_to.is_none() {
+                // A live attachment is in no list by design
+                // (docs/DISCUSSIONS_CONTRACT.md section 1): never "lost".
                 node_ids.push(id);
             }
         }
@@ -4123,9 +4213,10 @@ impl PimbleApiServer for RpcHandler {
         top_tombstones.sort_by(|a, b| b.1.cmp(&a.1));
         for (id, deleted_at) in top_tombstones {
             let fields = tree.doc(id).and_then(|d| d.fields().ok());
+            // An attachment's place is its host.
             let parent_title = fields
                 .as_ref()
-                .and_then(|f| f.parent_id)
+                .and_then(|f| f.parent_id.or(f.attached_to))
                 .and_then(|p| tree.doc(p))
                 .and_then(|d| d.fields().ok())
                 .map(|f| f.title);
@@ -4221,8 +4312,10 @@ impl PimbleApiServer for RpcHandler {
         }
         // Each child is judged in the store it lives in: through a mount
         // that is the source store, which is where a write of it would go.
+        let counts = manager.tree(store_id).map(|tree| tree.attachment_counts()).unwrap_or_default();
         for child in &mut children {
             child.access = judge_access(&manager, &principal, &reach, store_id, child.id);
+            child.attachments = counts.get(&child.id).copied().unwrap_or(0) as u32;
         }
         let newly_opened = manager.opened_since();
         drop(manager);

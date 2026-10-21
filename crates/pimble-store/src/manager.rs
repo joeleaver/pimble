@@ -524,6 +524,17 @@ impl StoreManager {
         store.create_node(node, parent_id)
     }
 
+    /// Create an attachment of `host` in a store ([`LocalStore::create_attachment`]).
+    /// A mount holds nothing of its own, so it takes none.
+    pub fn create_attachment(&mut self, store_id: StoreId, node: Node, host: NodeId) -> Result<(NodeId, TreeEdit)> {
+        let store = self.local_mut(store_id)?;
+        let info = store.tree().get_node_info(host).map_err(|_| StoreError::NodeNotFound(host))?;
+        if info.node_type == pimble_core::node_types::MOUNT {
+            return Err(StoreError::MountHasNoChildren { node_id: host });
+        }
+        store.create_attachment(node, host)
+    }
+
     /// Move a node to a new parent in a store, deciding a plain move or a
     /// transplant as `LocalStore::move_node` does (docs/MOVE_CONTRACT.md
     /// "The rule"). Answers the id the node has now, the shares it left,

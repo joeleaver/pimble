@@ -425,6 +425,35 @@ impl PimbleClient {
         Ok(response.node_id)
     }
 
+    /// Create an attachment of `host_id` (a discussion on it) that starts
+    /// with `content` and `custom`, in the one edit that creates it.
+    pub async fn create_attachment(
+        &self,
+        store_id: StoreId,
+        host_id: NodeId,
+        node_type: impl Into<String>,
+        title: impl Into<String>,
+        content: Option<Vec<u8>>,
+        custom: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<NodeId> {
+        use base64::Engine;
+        let request = pimble_rpc::types::CreateAttachmentRequest {
+            store_id,
+            host_id,
+            node_type: node_type.into(),
+            title: title.into(),
+            content: content.map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+            custom,
+        };
+        self.client.create_attachment(request).await.map(|r| r.node_id).map_err(rpc_error)
+    }
+
+    /// A node's live attachments, oldest first, with their content.
+    pub async fn list_attachments(&self, store_id: StoreId, node_id: NodeId) -> Result<Vec<Node>> {
+        let request = pimble_rpc::types::ListAttachmentsRequest { store_id, node_id };
+        self.client.list_attachments(request).await.map(|r| r.nodes).map_err(rpc_error)
+    }
+
     /// Update a node's metadata
     pub async fn update_node_metadata(
         &self,

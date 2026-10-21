@@ -980,6 +980,28 @@ impl LocalStore {
         Ok((node_id, edit))
     }
 
+    /// Create an attachment of `host` (docs/DISCUSSIONS_CONTRACT.md section
+    /// 1): `node`'s type, title, content and custom, in a document that names
+    /// the host and is in no list. Only the new document is edited.
+    pub fn create_attachment(&mut self, node: Node, host: NodeId) -> Result<(NodeId, TreeEdit)> {
+        let node_id = node.id;
+        if !self.tree.has_node(host) {
+            return Err(StoreError::NodeNotFound(host));
+        }
+        let now = now();
+        let content = (!node.content.is_empty()).then_some(node.content.as_slice());
+        let mut edit = self
+            .tree
+            .add_attachment(node_id, host, &node.node_type, &node.metadata.title, content, &now)
+            .map_err(StoreError::from)?;
+        for (key, value) in &node.metadata.custom {
+            extend(&mut edit, self.tree.set_custom(node_id, key, value, &now).map_err(StoreError::from)?);
+        }
+        self.mark_edit_dirty(&edit);
+        debug!("Created attachment {} of {} in store {}", node_id, host, self.id);
+        Ok((node_id, edit))
+    }
+
     /// Delete a node and its subtree: every member becomes a tombstone (its
     /// document stays, in memory and on disk) and the node leaves its
     /// parent's list. The root cannot be deleted. The subtree is what the

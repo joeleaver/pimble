@@ -257,6 +257,36 @@ pub struct CreateNodeRequest {
     pub custom: std::collections::HashMap<String, serde_json::Value>,
 }
 
+/// Request to create an attachment of a node (docs/DISCUSSIONS_CONTRACT.md
+/// section 1): a document that names `host_id` instead of a parent. No list
+/// changes, so the host's document is not edited.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateAttachmentRequest {
+    pub store_id: StoreId,
+    pub host_id: NodeId,
+    pub node_type: String,
+    pub title: String,
+    /// A yrs update (base64) merged into the new document in the edit that
+    /// creates it (a discussion's containers, made once).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub custom: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Request for a node's live attachments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListAttachmentsRequest {
+    pub store_id: StoreId,
+    pub node_id: NodeId,
+}
+
+/// A node's live attachments, oldest first, each with its content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListAttachmentsResponse {
+    pub nodes: Vec<Node>,
+}
+
 /// Response after creating a node
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateNodeResponse {
@@ -869,6 +899,10 @@ pub enum StoreChangeKind {
     /// again. A client stops showing the ones named; nothing is deleted
     /// before the replica is removed. Derived state: links never forward it.
     SharesEnded { node_ids: Vec<NodeId> },
+    /// An attachment of `host_id` was created, deleted or put back
+    /// (docs/DISCUSSIONS_CONTRACT.md section 1); `live` says which it is now.
+    /// A subscriber refetches the host's attachments.
+    AttachmentChanged { node_id: NodeId, host_id: NodeId, live: bool },
 }
 
 /// Notification that a node's content has changed.

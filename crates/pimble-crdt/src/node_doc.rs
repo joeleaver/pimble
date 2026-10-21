@@ -17,6 +17,7 @@
 //!                    created_at: String (rfc3339), modified_at: String (rfc3339),
 //!                    deleted_at: String (rfc3339) | absent (the tombstone),
 //!                    became: String (a pimble: link) | absent,
+//!                    attached_to: String (node id) | absent (an attachment),
 //!                    tags: Array<String>, custom: Map<String, String (json)> }
 //! root array "children": [String (node id), ...]
 //! root map "data": arbitrary JSON as nested Maps, Arrays and Texts
@@ -81,6 +82,11 @@ const DELETED_AT: &str = "deleted_at";
 /// became (docs/LINKS_CONTRACT.md "`became`"). Never cleared: a live node's
 /// is not followed.
 const BECAME: &str = "became";
+/// On an attachment (docs/DISCUSSIONS_CONTRACT.md section 1): the node it
+/// belongs to. Written in the transaction that initialises the document,
+/// rewritten only by a transplant of its host. An attachment has no
+/// `parent_id` and is in no list; the tree's repair never places it.
+const ATTACHED_TO: &str = "attached_to";
 const TAGS: &str = "tags";
 const CUSTOM: &str = "custom";
 /// A node field is the `node` root's key `field:<name>` (docs/SHEETS_CONTRACT.md
@@ -107,6 +113,8 @@ pub struct NodeFields {
     pub deleted_at: Option<String>,
     /// On a transplanted original: the node it became (see `BECAME`).
     pub became: Option<PimbleUrl>,
+    /// On an attachment: the node it belongs to (see `ATTACHED_TO`).
+    pub attached_to: Option<NodeId>,
     pub tags: Vec<String>,
     pub custom: HashMap<String, serde_json::Value>,
     /// The node's fields, name and value as typed, ordered by name.
@@ -137,6 +145,8 @@ impl NodeFields {
             content: Vec::new(),
             children: Vec::new(),
             became: self.became,
+            attached_to: self.attached_to,
+            attachments: 0,
             access: StoreAccess::Full,
         }
     }
@@ -858,6 +868,33 @@ impl NodeDoc {
         string_value(self.node.get(&txn, PLACED_UNDER)).and_then(|s| NodeId::parse(&s).ok())
     }
 
+    /// The node this document is an attachment of (see `ATTACHED_TO`), read
+    /// on its own; `None` for a tree node and for a document whose `node`
+    /// root has not arrived.
+    pub fn attached_to(&self) -> Option<NodeId> {
+        let txn = self.doc.transact();
+        string_value(self.node.get(&txn, ATTACHED_TO)).and_then(|s| NodeId::parse(&s).ok())
+    }
+
+    /// Write the `node` root for an attachment of `host`: no `parent_id`, no
+    /// `placed_under`, `attached_to` in the same transaction. An error when
+    /// already initialised.
+    pub fn init_attached(&mut self, node_type: &str, title: &str, host: NodeId, now: &str) -> Result<()> {
+        self.edit(|d, txn| d.write_init_attached(txn, node_type, title, host, now)).map(|_| ())
+    }
+
+    pub(crate) fn write_init_attached(&self, txn: &mut TransactionMut, node_type: &str, title: &str, host: NodeId, now: &str) -> Result<()> {
+        self.write_init(txn, node_type, title, None, now)?;
+        self.node.insert(txn, ATTACHED_TO, host.to_string());
+        Ok(())
+    }
+
+    /// `attached_to` alone, for a document whose `node` root was just written
+    /// in this transaction (a planted attachment).
+    pub(crate) fn write_init_attached_key(&self, txn: &mut TransactionMut, host: NodeId) {
+        self.node.insert(txn, ATTACHED_TO, host.to_string());
+    }
+
     /// What walking up the tree needs of a held document, tombstoned or not:
     /// whether `custom` holds `key` (as [`NodeDoc::fields`] reports it: a
     /// value that parses) and the stored `parent_id`. `None` when the `node`
@@ -1112,6 +1149,7 @@ impl NodeDoc {
             modified_at: get(MODIFIED_AT).unwrap_or_default(),
             deleted_at: get(DELETED_AT),
             became: get(BECAME).and_then(|s| PimbleUrl::parse(&s)),
+            attached_to: get(ATTACHED_TO).and_then(|s| NodeId::parse(&s).ok()),
             tags,
             custom,
             fields,
@@ -1427,6 +1465,7 @@ mod tests {
             modified_at: "2020-01-02T00:00:00Z".into(),
             deleted_at: Some(T2.into()),
             became: None,
+            attached_to: None,
             tags: vec!["a".into(), "b".into()],
             custom: HashMap::from([
                 ("icon".to_string(), json!("star")),

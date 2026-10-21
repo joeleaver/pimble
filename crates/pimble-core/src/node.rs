@@ -86,6 +86,18 @@ pub struct Node {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub became: Option<crate::PimbleUrl>,
 
+    /// On an attachment (a discussion on a node, docs/DISCUSSIONS_CONTRACT.md
+    /// section 1): the node it belongs to. An attachment is in no children
+    /// list and has no `parent_id`; it goes where its host goes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attached_to: Option<NodeId>,
+
+    /// How many live attachments (discussions) the node has, as the server
+    /// that answered counts them: reported with the answer like `access`,
+    /// never stored. 0 is not serialized.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub attachments: u32,
+
     /// What the device that asked may change of this node, as the server
     /// that answered judges it (docs/NODE_DOCUMENT_CONTRACT.md section 5,
     /// "Roles"): `Read` under a root the account holds as a reader, or for a
@@ -117,6 +129,8 @@ impl Node {
             content: Vec::new(),
             children: Vec::new(),
             became: None,
+            attached_to: None,
+            attachments: 0,
             access: StoreAccess::Full,
         }
     }
@@ -434,6 +448,16 @@ pub mod node_types {
     /// Its document's `data` root holds its tables, one `sheet:<id>` key
     /// each; its `content` is unused.
     pub const SHEET: &str = "sheet";
+
+    /// Discussion node - a threaded conversation (docs/DISCUSSIONS_CONTRACT.md).
+    /// Its document's `data.discussion` holds the messages; its title is the
+    /// topic; its `content` is unused. A standalone one is a tree node; one
+    /// on a node is an attachment of it (`attached_to`).
+    pub const DISCUSSION: &str = "discussion";
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// Helper module for base64 encoding of bytes in serde

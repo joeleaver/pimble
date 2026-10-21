@@ -1260,6 +1260,7 @@ fn document_of(kind: &StoreChangeKind) -> Option<NodeId> {
         | StoreChangeKind::NodeDeleted { node_id, .. }
         | StoreChangeKind::NodeMoved { node_id, .. }
         | StoreChangeKind::MetadataUpdated { node_id }
+        | StoreChangeKind::AttachmentChanged { node_id, .. }
         | StoreChangeKind::ContentUpdated { node_id } => Some(*node_id),
         StoreChangeKind::TreeStructure { node_ids } => node_ids.first().copied(),
         StoreChangeKind::VaultAppended { .. }
@@ -1760,7 +1761,9 @@ async fn seal_plan(handler: &RpcHandler, client: &PimbleClient, store_id: StoreI
         let manager = manager.read().await;
         let partial = !manager.scope_roots(store_id).is_empty();
         let tree = manager.tree(store_id).map_err(|e| anyhow::anyhow!("store unavailable: {}", e))?;
-        let parent_id = tree.doc(*node_id).and_then(|doc| doc.fields().ok()).and_then(|fields| fields.parent_id);
+        // An attachment's place is its host (docs/DISCUSSIONS_CONTRACT.md
+        // section 1): it joins the scopes, and takes the keys, its host has.
+        let parent_id = tree.doc(*node_id).and_then(|doc| doc.fields().ok()).and_then(|fields| fields.parent_id.or(fields.attached_to));
         let mut marker_keys = Vec::new();
         let mut cur = Some(*node_id);
         for _ in 0..=tree.ids().len() {
@@ -1768,7 +1771,7 @@ async fn seal_plan(handler: &RpcHandler, client: &PimbleClient, store_id: StoreI
             if let Some(marker) = fields.custom.get(pimble_core::custom_keys::SHARE).and_then(|v| serde_json::from_value::<pimble_core::ShareMarker>(v.clone()).ok()) {
                 marker_keys.push(marker.key_id);
             }
-            cur = fields.parent_id;
+            cur = fields.parent_id.or(fields.attached_to);
         }
         (partial, parent_id, marker_keys)
     };

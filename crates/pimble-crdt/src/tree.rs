@@ -22,6 +22,13 @@
 //! take the node out of one: new documents where it lands, a tombstone where
 //! it was), and repair does not complete a move the operations would not have
 //! made (`analyze`, "the list wins").
+//!
+//! An *attachment* (docs/DISCUSSIONS_CONTRACT.md section 1: a discussion on a
+//! node) is a live document whose `node` root names a host (`attached_to`)
+//! instead of a parent. It is in no list, repair never places it, and it is
+//! shown only while its host is a node ([`Tree::attachments_of`]). A delete of
+//! its host hides it and an undelete brings it back; a transplant of its host
+//! makes it again under the new host, like the rest of the subtree.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -73,8 +80,11 @@ pub struct CuttingNode {
     /// The id the node had where it was read. The planted node gets a new one.
     pub source_id: NodeId,
     /// Its parent's index in [`Cutting::nodes`]; `None` for the first, the
-    /// subtree's root.
+    /// subtree's root. For an attachment, its host's index.
     pub parent: Option<usize>,
+    /// An attachment of the node at `parent`, not a child of it: planted as
+    /// one. Attachments come after every node of the subtree.
+    pub attached: bool,
     pub node_type: String,
     pub title: String,
     pub tags: Vec<String>,
@@ -364,6 +374,69 @@ impl Tree {
         Ok(edit)
     }
 
+    /// Create `id` as an attachment of `host` (docs/DISCUSSIONS_CONTRACT.md
+    /// section 1): its `node` root names the host, and no list changes, so
+    /// the host's document is not touched. `content`, when given, is merged
+    /// into the new document in the same transaction as its `node` root (a
+    /// discussion's containers, made once). An id already held and
+    /// initialised is an error.
+    pub fn add_attachment(&mut self, id: NodeId, host: NodeId, node_type: &str, title: &str, content: Option<&[u8]>, now: &str) -> Result<TreeEdit> {
+        self.require_node(host)?;
+        if self.docs.get(&host).is_some_and(|doc| doc.attached_to().is_some()) {
+            return Err(CrdtError::Serialization(format!("node {host} is an attachment and cannot hold one")));
+        }
+        if self.docs.get(&id).is_some_and(NodeDoc::is_initialised) {
+            return Err(CrdtError::Serialization(format!("node {id} already exists")));
+        }
+        let mut edit = TreeEdit::default();
+        let doc = self.docs.entry(id).or_default();
+        if let Some(bytes) = content {
+            doc.apply_update(bytes)?;
+        }
+        let (_, update) = doc.edit(|d, txn| d.write_init_attached(txn, node_type, title, host, now))?;
+        match content {
+            // Nothing else holds any of it: the whole document is the update.
+            Some(_) => edit.push(id, Some(doc.save())),
+            None => edit.push(id, update),
+        }
+        Ok(edit)
+    }
+
+    /// Whether `id` is a held attachment (live or tombstoned).
+    pub fn is_attachment(&self, id: NodeId) -> bool {
+        self.docs.get(&id).is_some_and(|doc| doc.attached_to().is_some())
+    }
+
+    /// The live attachments of `host`, oldest first (then by id): empty when
+    /// `host` is not a node, since a deleted host hides its attachments.
+    pub fn attachments_of(&self, host: NodeId) -> Vec<NodeId> {
+        if !self.has_node(host) {
+            return Vec::new();
+        }
+        let mut out: Vec<(String, NodeId)> = self
+            .docs
+            .iter()
+            .filter(|(_, doc)| doc.attached_to() == Some(host) && doc.is_live())
+            .map(|(&id, doc)| (doc.fields().map(|f| f.created_at).unwrap_or_default(), id))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.to_string().cmp(&b.1.to_string())));
+        out.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// How many live attachments each live host has (hosts with none are
+    /// not named).
+    pub fn attachment_counts(&self) -> HashMap<NodeId, usize> {
+        let mut counts: HashMap<NodeId, usize> = HashMap::new();
+        for doc in self.docs.values() {
+            if let Some(host) = doc.attached_to() {
+                if doc.is_live() && self.has_node(host) {
+                    *counts.entry(host).or_default() += 1;
+                }
+            }
+        }
+        counts
+    }
+
     /// Move `id` under `new_parent` at `position` (the end when `None`).
     /// The root cannot move; a move under a node's own descendant is refused.
     pub fn move_node(&mut self, id: NodeId, new_parent: NodeId, position: Option<usize>, now: &str) -> Result<TreeEdit> {
@@ -460,6 +533,17 @@ impl Tree {
         let Some(stamp) = fields.deleted_at.clone() else {
             return Err(CrdtError::Serialization(format!("node {id} is not deleted")));
         };
+        // An attachment has no place in a list: only its tombstone goes.
+        if fields.attached_to.is_some() {
+            let (_, update) = self.docs[&id].edit(|d, txn| {
+                d.write_deleted(txn, None);
+                d.stamp_modified(txn, now);
+                Ok(())
+            })?;
+            let mut edit = TreeEdit::default();
+            edit.push(id, update);
+            return Ok(edit);
+        }
         let parent = fields.parent_id.filter(|&p| self.has_node(p)).unwrap_or(self.root);
 
         let mut edit = TreeEdit::default();
@@ -662,6 +746,7 @@ impl Tree {
             nodes.push(CuttingNode {
                 source_id: member,
                 parent,
+                attached: false,
                 node_type: fields.node_type,
                 title: fields.title,
                 tags: fields.tags,
@@ -671,6 +756,28 @@ impl Tree {
                 data_copy: doc.fresh_data(),
                 content: doc.fresh_content()?,
             });
+        }
+        // The attachments of every member travel with it, after the subtree.
+        for (index, &member) in members.iter().enumerate() {
+            for attachment in self.attachments_of(member) {
+                let doc = &self.docs[&attachment];
+                let fields = doc.fields()?;
+                let mut custom = fields.custom;
+                custom.remove(SHARE);
+                nodes.push(CuttingNode {
+                    source_id: attachment,
+                    parent: Some(index),
+                    attached: true,
+                    node_type: fields.node_type,
+                    title: fields.title,
+                    tags: fields.tags,
+                    custom,
+                    created_at: fields.created_at,
+                    data: doc.data_json(),
+                    data_copy: doc.fresh_data(),
+                    content: doc.fresh_content()?,
+                });
+            }
         }
         Ok(Cutting { nodes })
     }
@@ -706,7 +813,7 @@ impl Tree {
         }
         let mut children: Vec<Vec<NodeId>> = vec![Vec::new(); ids.len()];
         for (index, node) in cutting.nodes.iter().enumerate() {
-            if let Some(parent) = node.parent {
+            if let Some(parent) = node.parent.filter(|_| !node.attached) {
                 children[parent].push(ids[index]);
             }
         }
@@ -721,7 +828,12 @@ impl Tree {
             let parent = node.parent.map(|parent| ids[parent]).unwrap_or(new_parent);
             let created_at = if node.created_at.is_empty() { now } else { node.created_at.as_str() };
             doc.edit(|d, txn| {
-                d.write_init_as(txn, &node.node_type, &node.title, Some(parent), created_at, now, &node.tags)?;
+                if node.attached {
+                    d.write_init_as(txn, &node.node_type, &node.title, None, created_at, now, &node.tags)?;
+                    d.write_init_attached_key(txn, parent);
+                } else {
+                    d.write_init_as(txn, &node.node_type, &node.title, Some(parent), created_at, now, &node.tags)?;
+                }
                 for (key, value) in node.custom.iter().filter(|(key, _)| key.as_str() != SHARE) {
                     d.put_custom(txn, key, value)?;
                 }
@@ -833,6 +945,8 @@ impl Tree {
         let mut nodes: Vec<(NodeId, Option<NodeId>)> = self
             .docs
             .iter()
+            // Attachments are in no list and have no parent: never placed.
+            .filter(|(_, doc)| doc.attached_to().is_none())
             .filter_map(|(&id, doc)| doc.placement().map(|parent| (id, parent)))
             .collect();
         nodes.sort_by_key(|(id, _)| id.to_string());
@@ -3371,5 +3485,130 @@ mod tests {
             "the move contract was hardly exercised: {transplants} transplants, {list_wins} lists that won"
         );
         eprintln!("randomized convergence over {} seed(s): {:?}", seeds.len(), started.elapsed());
+    }
+
+    // ── Attachments (docs/DISCUSSIONS_CONTRACT.md section 1) ────────────
+
+    fn attach(tree: &mut Tree, host: NodeId, title: &str) -> (NodeId, TreeEdit) {
+        let new = id();
+        let edit = tree.add_attachment(new, host, "discussion", title, None, T1).unwrap();
+        (new, edit)
+    }
+
+    #[test]
+    fn an_attachment_edits_only_its_own_document_and_is_in_no_list() {
+        let (mut tree, root) = tree();
+        let host = note(&mut tree, root, "Host");
+        let before = tree.doc(host).unwrap().save();
+        let (d, edit) = attach(&mut tree, host, "Topic");
+        assert_eq!(edit.node_ids(), vec![d], "only the new document is written");
+        assert_eq!(tree.doc(host).unwrap().save(), before, "the host is untouched");
+        assert_eq!(tree.get_children(host).unwrap(), Vec::<NodeId>::new());
+        assert_eq!(tree.get_children(root).unwrap(), vec![host]);
+        assert_eq!(tree.attachments_of(host), vec![d]);
+        assert!(tree.is_attachment(d) && !tree.is_attachment(host));
+        let fields = tree.live_fields(d).unwrap();
+        assert_eq!((fields.parent_id, fields.attached_to), (None, Some(host)));
+        assert!(tree.validate_tree().is_empty(), "an attachment is not detached: {:?}", tree.validate_tree());
+        assert!(tree.repair(T2).unwrap().is_none(), "repair never places an attachment");
+        assert_eq!(tree.attachment_counts(), HashMap::from([(host, 1)]));
+    }
+
+    #[test]
+    fn an_attachment_keeps_the_content_it_was_made_with() {
+        let (mut tree, root) = tree();
+        let host = note(&mut tree, root, "Host");
+        let mut seed = NodeDoc::new();
+        seed.set_data("discussion", &serde_json::json!({ "v": 1 })).unwrap();
+        let d = id();
+        let edit = tree.add_attachment(d, host, "discussion", "", Some(&seed.save()), T1).unwrap();
+        assert_eq!(tree.doc(d).unwrap().data_json()["discussion"]["v"], serde_json::json!(1));
+        // The whole document travels as the one update.
+        let mut replica = Tree::from_docs(root, HashMap::new());
+        apply_edit(&mut replica, &edit);
+        assert_eq!(replica.doc(d).unwrap().data_json(), tree.doc(d).unwrap().data_json());
+        assert_eq!(replica.doc(d).unwrap().attached_to(), Some(host));
+    }
+
+    #[test]
+    fn a_deleted_host_hides_its_attachments_and_an_undelete_brings_them_back() {
+        let (mut tree, root) = tree();
+        let folder_id = folder(&mut tree, root, "F");
+        let host = note(&mut tree, folder_id, "Host");
+        let (d, _) = attach(&mut tree, host, "Topic");
+        tree.remove_node(folder_id, T2).unwrap();
+        assert!(tree.attachments_of(host).is_empty());
+        assert!(tree.attachment_counts().is_empty());
+        assert!(tree.has_node(d), "the attachment itself is not tombstoned");
+        assert!(tree.repair(T3).unwrap().is_none(), "nor is it adopted by the root");
+        tree.undelete_node(folder_id, T3).unwrap();
+        assert_eq!(tree.attachments_of(host), vec![d]);
+    }
+
+    #[test]
+    fn an_attachment_is_deleted_and_put_back_without_a_list() {
+        let (mut tree, root) = tree();
+        let host = note(&mut tree, root, "Host");
+        let (d, _) = attach(&mut tree, host, "Topic");
+        let root_before = tree.doc(root).unwrap().save();
+        let edit = tree.remove_node(d, T2).unwrap();
+        assert_eq!(edit.node_ids(), vec![d]);
+        assert!(tree.attachments_of(host).is_empty());
+        let edit = tree.undelete_node(d, T3).unwrap();
+        assert_eq!(edit.node_ids(), vec![d], "no list takes it back");
+        assert_eq!(tree.attachments_of(host), vec![d]);
+        assert_eq!(tree.doc(root).unwrap().save(), root_before);
+        assert_eq!(tree.live_fields(d).unwrap().parent_id, None);
+    }
+
+    #[test]
+    fn an_attachment_cannot_hold_one_and_needs_a_live_host() {
+        let (mut tree, root) = tree();
+        let host = note(&mut tree, root, "Host");
+        let (d, _) = attach(&mut tree, host, "Topic");
+        assert!(tree.add_attachment(id(), d, "discussion", "", None, T1).is_err());
+        tree.remove_node(host, T2).unwrap();
+        assert!(tree.add_attachment(id(), host, "discussion", "", None, T2).is_err());
+        assert!(tree.add_attachment(id(), id(), "discussion", "", None, T2).is_err());
+    }
+
+    #[test]
+    fn attachments_merge_and_converge_on_two_replicas() {
+        let (mut a, root) = tree();
+        let host = note(&mut a, root, "Host");
+        let mut b = replica_of(&a);
+        let (da, _) = attach(&mut a, host, "From a");
+        let db = id();
+        b.add_attachment(db, host, "discussion", "From b", None, T2).unwrap();
+        sync_and_repair_round(&mut a, &mut b);
+        assert_converged(&mut a, &mut b);
+        let mut both = vec![da, db];
+        both.sort_by_key(|id| id.to_string());
+        let mut on_a = a.attachments_of(host);
+        on_a.sort_by_key(|id| id.to_string());
+        assert_eq!(on_a, both);
+        assert_eq!(a.attachments_of(host), b.attachments_of(host), "the same order on both");
+    }
+
+    #[test]
+    fn a_transplant_makes_the_attachments_again_under_the_new_nodes() {
+        let mut s = shared();
+        let (d, _) = attach(&mut s.tree, s.x, "On X");
+        s.tree.doc_mut(d).unwrap().set_data("discussion", &serde_json::json!({ "v": 1 })).unwrap();
+        let mut made = Vec::new();
+        let (new_a, _) = s.tree.transplant(HERE, s.a, s.private, None, T3, &mut fresh_ids(&mut made)).unwrap();
+        let new_x = s.tree.get_children(new_a).unwrap().into_iter().find(|&c| s.tree.live_fields(c).unwrap().title == "X").unwrap();
+        let moved = s.tree.attachments_of(new_x);
+        assert_eq!(moved.len(), 1, "the discussion came along");
+        assert_ne!(moved[0], d, "as a new document");
+        assert_eq!(s.tree.live_fields(moved[0]).unwrap().title, "On X");
+        assert_eq!(s.tree.doc(moved[0]).unwrap().data_json()["discussion"]["v"], serde_json::json!(1));
+        assert!(made.contains(&moved[0]));
+        assert!(s.tree.get_children(new_x).unwrap().is_empty(), "and is in no list");
+        // The original is hidden with its tombstoned host, and comes back with it.
+        assert!(s.tree.attachments_of(s.x).is_empty());
+        s.tree.undelete_node(s.a, T3).unwrap();
+        assert_eq!(s.tree.attachments_of(s.x), vec![d]);
+        assert!(s.tree.validate_tree().is_empty(), "{:?}", s.tree.validate_tree());
     }
 }
