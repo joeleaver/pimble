@@ -1096,3 +1096,73 @@ rinch has no copy hook, so the board travels by id within a window, not on the c
   (images wave 2): the copied board names the source store's blob URL.
 - Firefox was not run; an encrypted store in the browser takes no pictures yet (images wave
   3), so marked-up pictures there were not driven.
+
+## Built in "pictures onto a board" (2026-10-20)
+
+Section 1's "Pictures go on any board, as many as wanted: paste, drop files, or the
+picture tool" had not been built (Joe, 2026-10-20: "There doesn't seem to be a way to add
+an image to a whiteboard."). Built on rinch `main` at 08b8a6f, shared `pimble-app` code
+for the desktop and the browser (`boards.rs`, `boards/{tools,ui}.rs`).
+
+**What exists:**
+- **Three ways in**, on a whiteboard or an image node alike: Ctrl+V on a board that has
+  the keyboard (desktop: `rinch::clipboard::paste_image`, claimed by the surface's key
+  handler; browser: the page's `paste` event while a board's surface is focused and no
+  text is being typed on it, `keyboard_board`), image files dropped on the board, and the
+  toolbar's picture button ("Insert pictures", after the tools; several files; the
+  desktop's file dialog, `PIMBLE_DEBUG_IMAGES` when driven over the debug port, the
+  browser's hidden file input). A drop of a tree row still makes a node card.
+- **One path for every picture added anywhere**: `boards::Dest` says where (`Under` a
+  node: image nodes, as before; `Board(pane, point)`), and `add_image_files`,
+  `paste_image`, `pick_images` and the browser's `read_files` all take one. Pictures are
+  stored through the image-node queue (one `PutBlob` at a time, as a write of the board's
+  node, scaled to fit, refusals as sentences); nothing but the `pimble-blob:` URL enters
+  the document.
+- **Placement**: the pictures of one paste, drop or pick are a batch, placed once the
+  last is stored, in **one** `local_edit` (one `applyEdit`, one undo step): side by side
+  in order, 16 units apart, each at one unit per pixel, centered on the drop point or the
+  middle of the view, and all scaled down together when the row is wider or taller than
+  90% of the view. They go in the layer new elements go to (the picked layer, else the
+  top unlocked one), not a locked picture layer, so they can be moved, resized and
+  deleted like anything else; an image node's own picture stays alone in its locked
+  layer. They are selected and the select tool is chosen. A board closed or showing
+  another node before its pictures were stored gets none of them, with a sentence.
+- **Refusals**: a board this device may only read refuses all three with
+  `READ_ONLY_REFUSAL` before anything is stored (`writable_or_say`); a board whose layers
+  are all locked says so (`target_layer`).
+- An image opens on the arrow tool when a picture sits in a locked layer (an image
+  node's), so a whiteboard with pictures put on it still opens on select.
+
+**Verified (2026-10-20):**
+- Tests (`pimble-app`, 165): two pictures stored as writes of the board's node and placed side
+  by side, centered, at their pixel size, in an unlocked layer, selected, in one
+  broadcast, and taken back by one undo; a drop centered on its point beside an image
+  node's own picture; a picture larger than the view scaled to 90% of it, its proportions
+  kept; a read-only board storing nothing and saying the sentence; a board closed before
+  its pictures arrived getting none. wasm check of `pimble-app --features web`.
+- Desktop, isolated release app (port 7492, own config and data, a scratch store), over
+  rinch's debug port: the picture button placing two files side by side, centered and
+  selected; Ctrl+Z taking both back and Ctrl+Shift+Z bringing both; a placed picture
+  dragged; Ctrl+V with a PNG on the Wayland clipboard (`wl-copy`) placing it centered on a
+  whiteboard and on an image node, above its locked picture; all of it there after a
+  restart.
+- Chromium (Playwright) on the local stack, a plain hosted store, the stack's made-up
+  account: two PNG files dropped (a synthetic `drop` on the board's canvas) landing side
+  by side centered on the drop point; a synthetic `paste` with the board focused placing
+  its picture in the middle of the view; the picture button's file chooser taking two
+  files. A real Ctrl+V there reached the board too, but that test Chromium hands over the
+  desktop's clipboard picture as an empty `image.png`, which is refused as not a picture.
+
+**Not built, or known gaps:**
+- **A desktop drop lands in the middle of the view, not at the drop point**: rinch hands
+  an `onfiledrop` handler the paths alone (its `FileDropped` event has the position and
+  drops it). The app takes a point already (`Dest::Board(pane, Some(point))`, as the
+  browser's drop does); a rinch mechanism that gives a file drop its position (or a
+  surface its own file-drop event) is the fix. A real OS drop was not driven on the
+  desktop (the debug port cannot make one); the drop handler is the same
+  `add_image_files` the picture button runs.
+- Pictures still do not replicate (images waves 2 and 3): a board with pictures put on it
+  arrives on another device as placeholders.
+- No picture "tool" in the sense of a mode that places where clicked: the toolbar's
+  button opens the file dialog and places in the middle of the view.
+

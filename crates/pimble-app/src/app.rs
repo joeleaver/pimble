@@ -1575,7 +1575,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 let nv = nv_ctx.clone();
                 move || {
                     if let Some((s_id, parent)) = crate::boards::parent_for_row(store, &nv) {
-                        crate::boards::pick_images(store, s_id, parent);
+                        crate::boards::pick_images(store, crate::boards::Dest::Under(s_id, parent));
                     }
                 }
             };
@@ -1584,7 +1584,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 let nv = nv_ctx.clone();
                 move || {
                     if let Some((s_id, parent)) = crate::boards::parent_for_row(store, &nv) {
-                        crate::boards::paste_image(store, s_id, parent);
+                        crate::boards::paste_image(store, crate::boards::Dest::Under(s_id, parent));
                     }
                 }
             };
@@ -2478,7 +2478,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 let nv = node_value.clone();
                 let handler = __scope.register_file_drop_handler(move |paths: Vec<std::path::PathBuf>| {
                     if let Some((s_id, parent)) = crate::boards::parent_for_row(store, &nv) {
-                        crate::boards::add_image_files(store, s_id, parent, paths);
+                        crate::boards::add_image_files(store, crate::boards::Dest::Under(s_id, parent), paths);
                     }
                 });
                 hit_area.set_attribute("data-onfiledrop", &handler.0.to_string());

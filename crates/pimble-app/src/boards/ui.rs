@@ -297,6 +297,19 @@ pub(crate) fn render_board(__scope: &mut RenderScope, store: AppStore, pane: Pan
     };
     // The desktop's pixel scale reads the box the surface fills.
     BOUNDS.with(|b| b.borrow_mut()[pane.index()] = Some(canvas.bounds_signal()));
+    // Files dropped from the system are pictures for the board (contract
+    // section 1). The browser finds the board by this attribute
+    // (`install_browser_handlers`, which knows where the drop was); rinch
+    // hands the desktop's handler the paths alone, so there they land in the
+    // middle of the view.
+    canvas.set_attribute("data-pimble-board", &pane.index().to_string());
+    #[cfg(feature = "native")]
+    {
+        let handler = __scope.register_file_drop_handler(move |paths: Vec<std::path::PathBuf>| {
+            add_image_files(store, Dest::Board(pane, None), paths);
+        });
+        canvas.set_attribute("data-onfiledrop", &handler.0.to_string());
+    }
     let view = rsx! {
         div {
             class: "pimble-board",
@@ -844,6 +857,10 @@ pub(crate) fn render_board_toolbar(__scope: &mut RenderScope, store: AppStore) -
     let undo_btn = action(__scope, TablerIcon::ArrowBackUp, "Undo (Ctrl+Z)", |store, pane| tools::undo(store, pane, false));
     let redo_btn = action(__scope, TablerIcon::ArrowForwardUp, "Redo (Ctrl+Shift+Z)", |store, pane| tools::undo(store, pane, true));
     let delete_btn = action(__scope, TablerIcon::Trash, "Delete the selection (Delete)", delete_selected);
+    let picture_btn = action(__scope, TablerIcon::PhotoPlus, "Insert pictures (or paste or drop them on the board)", |store, pane| {
+        tools::end_text(store, pane);
+        pick_images(store, Dest::Board(pane, None));
+    });
     let fit_btn = action(__scope, TablerIcon::FocusCentered, "Fit", fit);
     let one_btn = action(__scope, TablerIcon::ZoomReset, "Actual size", actual_size);
     let grid_btn = icon_button(__scope, TablerIcon::LayoutGrid, "Show the grid (only here)".to_string(), move || st.grid.get(), move || {
@@ -917,7 +934,7 @@ pub(crate) fn render_board_toolbar(__scope: &mut RenderScope, store: AppStore) -
             div {
                 class: "pimble-toolbar__group",
                 style: {move || if writable() { "" } else { "opacity: 0.4; pointer-events: none;" }},
-                div { class: "pimble-toolbar__buttons", {tools} }
+                div { class: "pimble-toolbar__buttons", {tools} {picture_btn} }
                 div { class: "pimble-toolbar__label", "Tools" }
             }
             div {
