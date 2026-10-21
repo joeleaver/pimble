@@ -855,6 +855,27 @@ pub(crate) const APP_CSS: &str = "
     min-height: 36px;
 }
 
+/* A discussion pinned to a board: a numbered marker, its point at the
+   marker's lower left. */
+.pimble-board__pin {
+    position: absolute;
+    width: 24px;
+    height: 24px;
+    margin-left: -2px;
+    margin-top: -26px;
+    border-radius: 12px 12px 12px 2px;
+    background: var(--rinch-primary-color);
+    color: white;
+    font-size: 12px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+    z-index: 3;
+}
+
 /* The discussions on a node, under its content. */
 .pimble-discussions {
     margin: 12px 16px 24px;

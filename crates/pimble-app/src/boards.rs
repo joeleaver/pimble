@@ -82,11 +82,14 @@ pub enum Tool {
     Connector,
     Frame,
     Eraser,
+    /// A discussion at a point (docs/DISCUSSIONS_CONTRACT.md section 6): a
+    /// pin, which is not a board element.
+    Pin,
 }
 
 impl Tool {
     /// In toolbar order.
-    pub const ALL: [Tool; 15] = [
+    pub const ALL: [Tool; 16] = [
         Tool::Select,
         Tool::Hand,
         Tool::Pen,
@@ -102,6 +105,7 @@ impl Tool {
         Tool::Connector,
         Tool::Frame,
         Tool::Eraser,
+        Tool::Pin,
     ];
 
     /// The tool's letter on the keyboard (contract section 4: Spectacle's
@@ -124,6 +128,7 @@ impl Tool {
             Tool::Connector => 'c',
             Tool::Frame => 'f',
             Tool::Eraser => 'e',
+            Tool::Pin => 'q',
         }
     }
 
@@ -154,6 +159,7 @@ impl Tool {
             Tool::Connector => "Connector",
             Tool::Frame => "Frame",
             Tool::Eraser => "Eraser",
+            Tool::Pin => "Discussion pin",
         }
     }
 
@@ -174,6 +180,7 @@ impl Tool {
             Tool::Connector => TablerIcon::Route,
             Tool::Frame => TablerIcon::Frame,
             Tool::Eraser => TablerIcon::Eraser,
+            Tool::Pin => TablerIcon::MessagePlus,
         }
     }
 
@@ -192,7 +199,7 @@ impl Tool {
             Tool::Sticky => Kind::Sticky,
             Tool::Connector => Kind::Connector,
             Tool::Frame => Kind::Frame,
-            Tool::Select | Tool::Hand | Tool::Eraser => return None,
+            Tool::Select | Tool::Hand | Tool::Eraser | Tool::Pin => return None,
         })
     }
 }
@@ -332,12 +339,16 @@ pub struct PaneUi {
     pub cards: Signal<Vec<(StoreId, NodeId, String)>>,
     /// The board has a picture selected (Save Original As...).
     pub picture_selected: Signal<bool>,
+    /// The discussions pinned to the board, where they are on screen
+    /// (logical pixels), numbered in the order they were made.
+    pub pins: Signal<Vec<PinView>>,
 }
 
 impl PaneUi {
     pub fn new() -> Self {
         Self {
             outlines: Signal::new(Vec::new()),
+            pins: Signal::new(Vec::new()),
             handles: Signal::new(None),
             selected: Signal::new(0),
             marquee: Signal::new(None),
@@ -644,6 +655,28 @@ impl Session {
     }
 }
 
+/// A discussion pinned to a board, as the board view draws it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PinView {
+    pub store_id: StoreId,
+    pub node_id: NodeId,
+    pub x: f32,
+    pub y: f32,
+    pub number: usize,
+    pub title: String,
+    pub count: usize,
+}
+
+/// The discussions pinned to some board changed: every board pane draws its
+/// pins again.
+pub(crate) fn pins_changed(store: AppStore) {
+    for pane in PaneId::ALL {
+        if with_session(pane, |_| ()).is_some() {
+            after_change(store, pane);
+        }
+    }
+}
+
 thread_local! {
     static SESSIONS: RefCell<[Option<Session>; MAX_PANES]> = const { RefCell::new([None, None, None, None]) };
     /// Each pane slot's surface, made once (the slot is mounted once).
@@ -734,6 +767,8 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
         }
     };
     let board = Board::of_node(&doc).with_origin(format!("pimble-board-pane-{}", pane.index()));
+    // Its pins are the discussions on it (docs/DISCUSSIONS_CONTRACT.md section 6).
+    store.send(BackendCommand::ListAttachments { store_id, node_id });
     let dark = untracked(|| store.dark_mode.get());
     let ui = store.pane(pane).board_ui;
     let mut view = BoardView::new(1, 1, background(dark));
@@ -1149,6 +1184,21 @@ fn after_change(store: AppStore, pane: PaneId) {
             }
             _ => None,
         };
+        // Pins (a board node's own board only; markup on a picture in text
+        // has none yet).
+        let pins: Vec<PinView> = if untracked(|| state.markup.get()) {
+            Vec::new()
+        } else {
+            crate::discussions::board_pins(store, s.store_id, s.node_id)
+                .into_iter()
+                .enumerate()
+                .map(|(i, pin)| {
+                    let (x, y) = s.view.board_to_screen(Point::new(pin.x, pin.y));
+                    PinView { store_id: s.store_id, node_id: pin.node_id, x: x / scale, y: y / scale, number: i + 1, title: pin.title, count: pin.count }
+                })
+                .collect()
+        };
+        ui.pins.set(pins);
         (marks, outlines, handles, layers, frames, picture, authors, marquee, s.selected.len())
     });
     // An image opens on the arrow, a whiteboard on select (contract section

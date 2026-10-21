@@ -1787,6 +1787,7 @@ dependencies = [
  "pimble-rpc",
  "pimble-sheet",
  "rinch",
+ "rinch-editor-collab",
  "rinch-editor-core",
  "rinch-tabler-icons",
  "rinch-web",

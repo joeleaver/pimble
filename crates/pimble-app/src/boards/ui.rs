@@ -215,6 +215,22 @@ pub(crate) fn render_board(__scope: &mut RenderScope, store: AppStore, pane: Pan
         // drop; the desktop's arrives as the surface's own `Drop`).
         ondrop: move || tools::drop_tree_row(store, pane),
         RenderSurface { surface: Some(surface) }
+        // The discussions pinned here (docs/DISCUSSIONS_CONTRACT.md section 6):
+        // a numbered marker each; a press opens its discussion beside the board.
+        for pin in ui.pins.get() {
+            div {
+                key: format!("{} {:.1} {:.1} {} {}", pin.node_id, pin.x, pin.y, pin.number, pin.count),
+                class: "pimble-board__pin",
+                title: format!("{} ({} message{})", pin.title, pin.count, if pin.count == 1 { "" } else { "s" }),
+                style: format!("left: {:.1}px; top: {:.1}px;", pin.x, pin.y),
+                onmousedown: move || crate::pane_view::press_in_view(),
+                onclick: {
+                    let (s, n) = (pin.store_id, pin.node_id);
+                    move || crate::discussions::open_beside(store, pane, s, n)
+                },
+                {pin.number.to_string()}
+            }
+        }
         for (x, y, w, h) in ui.outlines.get() {
             div {
                 key: format!("{x:.1} {y:.1} {w:.1} {h:.1}"),

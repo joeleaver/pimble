@@ -393,6 +393,8 @@ fn refresh_cache(store: AppStore, slot: Slot) {
     if let Some(sig) = store.get_node_signal(store_id, node_id) {
         sig.update(|node| node.content = bytes);
     }
+    // A pin's count follows.
+    crate::boards::pins_changed(store);
 }
 
 /// Send an update this pane made: to the server through `applyEdit`, and to
@@ -877,6 +879,7 @@ pub(crate) fn attachments_listed(store: AppStore, store_id: StoreId, host: NodeI
     store.attachments.update(|map| {
         map.insert((store_id, host), ids);
     });
+    crate::boards::pins_changed(store);
 }
 
 /// An attachment of `host` came, went or came back: its list is asked for
@@ -908,6 +911,55 @@ pub(crate) fn host_discussions(store: AppStore, store_id: StoreId, host: NodeId)
             })
             .collect(),
     )
+}
+
+/// A discussion pinned to a board: where (board coordinates) and what it is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoardPin {
+    pub node_id: NodeId,
+    pub x: f32,
+    pub y: f32,
+    pub title: String,
+    pub count: usize,
+}
+
+/// The discussions pinned to board node `(store_id, host)`'s own board, in
+/// the order they were made, from what this window knows of its discussions.
+pub(crate) fn board_pins(store: AppStore, store_id: StoreId, host: NodeId) -> Vec<BoardPin> {
+    let ids = untracked(|| store.attachments.with(|map| map.get(&(store_id, host)).cloned())).unwrap_or_default();
+    ids.into_iter()
+        .filter_map(|id| {
+            let node = store.get_node_signal(store_id, id).map(|sig| untracked(|| sig.get()))?;
+            let doc = NodeDoc::load(&node.content).ok()?;
+            let snap = Discussion::of_node(&doc).read();
+            let count = snap.live_count();
+            match snap.anchor {
+                Some(pimble_discussion::Anchor::Board { board, x, y }) if board == pimble_board::BOARD_KEY => Some(BoardPin {
+                    node_id: id,
+                    x: x as f32,
+                    y: y as f32,
+                    title: row_of(store_id, id, Some(&node), 0.0).topic,
+                    count,
+                }),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// The Pin tool pressed at board point `(x, y)` of board node `host`: a
+/// discussion pinned there, opened beside the board once it is made.
+pub(crate) fn start_pin(store: AppStore, from: PaneId, store_id: StoreId, host: NodeId, x: f32, y: f32) {
+    if !store.node_access(store_id, host).allows_write() {
+        store.notice.set(pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
+        return;
+    }
+    let request = next_request();
+    OPEN_AFTER.with(|o| o.borrow_mut().insert(request, from));
+    let mut init = init(request);
+    let anchor = pimble_discussion::Anchor::Board { board: pimble_board::BOARD_KEY.to_string(), x: x as f64, y: y as f64 };
+    init.content = pimble_discussion::new_content(Some(&anchor));
+    store.send(BackendCommand::CreateAttachment { store_id, host_id: host, title: String::new(), init });
 }
 
 /// One line about a discussion for its host's list.
