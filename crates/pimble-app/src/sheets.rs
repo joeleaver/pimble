@@ -32,7 +32,7 @@ use pimble_core::{node_types, NodeId, StoreId};
 use pimble_crdt::NodeDoc;
 use pimble_sheet::doc::{self, Placement, Sheets};
 use pimble_sheet::formula::{self, ComputedTable, Engine, ErrorCode, Value};
-use pimble_sheet::{input, Book, ColumnType, Format, NodeInfo, NodeRef, Reach, ResultKey, SheetsSnap, Stored};
+use pimble_sheet::{input, Book, ColumnType, Format, NodeInfo, NodeRef, Reach, ResultKey, SheetsSnap, Stored, SummaryCell};
 use rinch::prelude::*;
 
 use crate::panes::{PaneId, MAX_PANES};
@@ -90,6 +90,27 @@ pub struct RowView {
     pub cells: Vec<CellView>,
 }
 
+/// A summary row as it shows (contract section 4b).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SummaryRowView {
+    pub id: String,
+    pub name: String,
+    /// One per column; empty text where the row shows nothing.
+    pub cells: Vec<CellView>,
+}
+
+/// One group of a grouped table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupView {
+    /// As shown; "(blank)" for the rows with nothing in the grouping column.
+    pub label: String,
+    /// What collapsing it is remembered by.
+    pub key: String,
+    /// Its rows, as indices into the table's `rows`.
+    pub rows: Vec<usize>,
+    pub subtotals: Vec<SummaryRowView>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableView {
     pub id: String,
@@ -104,6 +125,14 @@ pub struct TableView {
     pub error: Option<String>,
     pub columns: Vec<ColView>,
     pub rows: Vec<RowView>,
+    /// Its summary rows over every row, top to bottom.
+    pub summary_rows: Vec<SummaryRowView>,
+    /// Its groups, when it is grouped.
+    pub groups: Vec<GroupView>,
+    /// The key of the column it is grouped by.
+    pub group_by: Option<String>,
+    /// Drawn with its fields down the left (contract section 4c).
+    pub rotated: bool,
     /// Changes whenever anything above does: the view keys a table by id and
     /// version, so a table that did not change keeps its DOM.
     pub version: u64,
@@ -127,6 +156,20 @@ pub struct ColumnForm {
     pub error: Option<String>,
 }
 
+/// A summary row's settings, being changed: its name, and what one of its
+/// cells shows (`col`), from the menu or as a formula.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SummaryForm {
+    pub table: String,
+    pub row: String,
+    pub col: Option<String>,
+    pub name: String,
+    /// `none`, `sum`, `average`, `count`, `min`, `max` or `formula`.
+    pub choice: String,
+    pub formula: String,
+    pub error: Option<String>,
+}
+
 /// One pane's sheet view state. Signals only, so it is `Copy`.
 #[derive(Clone, Copy)]
 pub struct SheetUi {
@@ -147,6 +190,10 @@ pub struct SheetUi {
     pub message: Signal<Option<String>>,
     /// The tables a note's text shows (its `embed` atoms), in order.
     pub embedded: Signal<Vec<String>>,
+    pub summary_form: Signal<Option<SummaryForm>>,
+    /// The groups this pane shows collapsed, by table and group key: the
+    /// viewer's own, never in the document (contract section 4b).
+    pub collapsed: Signal<std::collections::HashSet<(String, String)>>,
 }
 
 impl SheetUi {
@@ -163,6 +210,8 @@ impl SheetUi {
             column_form: Signal::new(None),
             message: Signal::new(None),
             embedded: Signal::new(Vec::new()),
+            summary_form: Signal::new(None),
+            collapsed: Signal::new(std::collections::HashSet::new()),
         }
     }
 }
@@ -1013,6 +1062,24 @@ fn table_view(engine: &Engine<'_>, book: &AppBook, snap: &SheetsSnap, computed: 
         .and_then(|t| t.source.as_deref())
         .map(|s| formula::to_shown(book, Some(&computed.id), s))
         .unwrap_or_default();
+    let summary_view = |s: &pimble_sheet::formula::ComputedSummaryRow| SummaryRowView {
+        id: s.id.clone(),
+        name: s.name.clone(),
+        cells: s.values.iter().zip(&s.formats).map(|(v, f)| cell_view(engine, v, *f)).collect(),
+    };
+    let summary_rows = computed.summary_rows.iter().map(summary_view).collect();
+    let row_index: HashMap<&str, usize> = computed.rows.iter().enumerate().map(|(i, r)| (r.id.as_str(), i)).collect();
+    let groups = computed
+        .groups
+        .iter()
+        .map(|g| GroupView {
+            label: if g.label.is_empty() { "(blank)".to_string() } else { g.label.clone() },
+            key: g.label.to_lowercase(),
+            rows: g.rows.iter().filter_map(|id| row_index.get(id.as_str()).copied()).collect(),
+            subtotals: g.subtotals.iter().map(summary_view).collect(),
+        })
+        .collect();
+    let group_by = computed.group_by.and_then(|i| columns.get(i)).map(|c| c.key.clone());
     let mut view = TableView {
         id: computed.id.clone(),
         node: (book.home.store, book.home.node),
@@ -1022,6 +1089,10 @@ fn table_view(engine: &Engine<'_>, book: &AppBook, snap: &SheetsSnap, computed: 
         error: computed.error.as_ref().map(|e| format!("{} {}", e.code.code(), e.message)),
         columns,
         rows,
+        summary_rows,
+        groups,
+        group_by,
+        rotated: table.is_some_and(|t| t.rotated),
         version: 0,
     };
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1644,6 +1715,15 @@ fn move_typing(store: AppStore, pane: PaneId, key: &CellKey, row: Option<String>
     }
     let Some(snap) = snapshot(pane) else { return };
     let Some(table) = snap.table(&key.table) else { return };
+    // Rotated, the screen's down is the record's next field and its right the
+    // next record (contract section 4c).
+    let mv = match (table.rotated, mv) {
+        (false, mv) => mv,
+        (true, Move::Down) => return move_rotated(store, pane, table, key, row, true),
+        (true, Move::Up) => return move_rotated(store, pane, table, key, row, false),
+        (true, Move::Right) => Move::Down,
+        (true, Move::Stay) => Move::Stay,
+    };
     let typed: Vec<&str> = table
         .columns
         .iter()
@@ -1681,6 +1761,16 @@ fn move_typing(store: AppStore, pane: PaneId, key: &CellKey, row: Option<String>
     };
     if !next.col.is_empty() {
         begin_typing(store, pane, next);
+    }
+}
+
+/// In a rotated table, the record's next (or previous) typed field.
+fn move_rotated(store: AppStore, pane: PaneId, table: &pimble_sheet::TableSnap, key: &CellKey, row: Option<String>, down: bool) {
+    let typed: Vec<&str> = table.columns.iter().filter(|c| !matches!(c.ty, ColumnType::Formula { .. })).map(|c| c.id.as_str()).collect();
+    let Some(i) = typed.iter().position(|c| *c == key.col) else { return };
+    let next = if down { typed.get(i + 1) } else { i.checked_sub(1).and_then(|j| typed.get(j)) };
+    if let Some(col) = next {
+        begin_typing(store, pane, CellKey { table: key.table.clone(), row, col: col.to_string() });
     }
 }
 
@@ -1961,4 +2051,171 @@ pub(crate) fn plain_tables(pane: PaneId) -> Vec<(String, String)> {
     snapshot(pane)
         .map(|s| s.tables.iter().filter(|t| !t.is_summary()).map(|t| (t.id.clone(), t.name.clone())).collect())
         .unwrap_or_default()
+}
+
+// ── Summary rows and groups (contract section 4b) ───────────────────────
+
+/// "+ Summary Row": a row named Total (or the next free name) summing every
+/// column that shows numbers, its settings open.
+pub(crate) fn add_summary_row(store: AppStore, pane: PaneId, table: &str) {
+    aim(pane, Some(table));
+    let numeric: Vec<(String, SummaryCell)> = untracked(|| store.pane(pane).sheet_ui.tables.get())
+        .iter()
+        .find(|t| t.id == table)
+        .map(|t| t.columns.iter().filter(|c| c.numeric && !c.result).map(|c| (c.key.clone(), SummaryCell::Sum)).collect())
+        .unwrap_or_default();
+    if let Some(id) = local_edit(store, pane, |t| t.add_summary_row(table, None, &numeric, Placement::Last)) {
+        open_summary(store, pane, table, &id, None);
+    }
+}
+
+/// Open a summary row's settings, about column `col` when one was clicked.
+pub(crate) fn open_summary(store: AppStore, pane: PaneId, table: &str, row: &str, col: Option<&str>) {
+    let ui = store.pane(pane).sheet_ui;
+    commit(store, pane, Move::Stay);
+    ui.column_form.set(None);
+    aim(pane, Some(table));
+    let Some(snap) = snapshot(pane) else { return };
+    let Some(t) = snap.table(table) else { return };
+    let Some(sr) = t.summary_row(row) else { return };
+    let cell = col.and_then(|c| sr.cells.get(c));
+    let (choice, formula) = match cell {
+        None => ("none".to_string(), "=".to_string()),
+        Some(SummaryCell::Formula(f)) => {
+            let shown = book_for(store, pane).map(|b| formula::to_shown(&b, Some(table), f)).unwrap_or_else(|| f.clone());
+            ("formula".to_string(), format!("={}", shown.trim_start_matches('=')))
+        }
+        Some(other) => (other.to_stored(), "=".to_string()),
+    };
+    ui.summary_form.set(Some(SummaryForm {
+        table: table.to_string(),
+        row: row.to_string(),
+        col: col.map(str::to_string),
+        name: sr.name.clone(),
+        choice,
+        formula,
+        error: None,
+    }));
+}
+
+pub(crate) fn close_summary(store: AppStore, pane: PaneId) {
+    store.pane(pane).sheet_ui.summary_form.set(None);
+}
+
+fn summary_error(store: AppStore, pane: PaneId, sentence: impl Into<String>) {
+    let s = sentence.into();
+    store.pane(pane).sheet_ui.summary_form.update(|f| {
+        if let Some(f) = f {
+            f.error = Some(s);
+        }
+    });
+}
+
+/// "Done" in a summary row's settings.
+pub(crate) fn apply_summary(store: AppStore, pane: PaneId) {
+    let ui = store.pane(pane).sheet_ui;
+    let Some(form) = untracked(|| ui.summary_form.get()) else { return };
+    aim(pane, Some(&form.table));
+    let Some(snap) = snapshot(pane) else { return };
+    let Some(sr) = snap.table(&form.table).and_then(|t| t.summary_row(&form.row)).cloned() else { return };
+    let name = doc::column_name_from(&form.name);
+    if name.is_empty() {
+        return summary_error(store, pane, "Give the summary row a name.");
+    }
+    let cell = match form.choice.as_str() {
+        "none" => None,
+        "formula" => {
+            let shown = form.formula.trim();
+            if shown.trim_start_matches('=').trim().is_empty() {
+                return summary_error(store, pane, "Write the formula, starting with =, like =SUM([amount])/COUNT([nights]).");
+            }
+            let Some(book) = book_for(store, pane) else { return };
+            match formula::to_stored(&book, Some(&form.table), shown) {
+                Ok(stored) => Some(SummaryCell::Formula(stored.trim_start().trim_start_matches('=').to_string())),
+                Err(e) => return summary_error(store, pane, e.message),
+            }
+        }
+        other => SummaryCell::from_stored(other),
+    };
+    let done = local_edit(store, pane, |t| {
+        if sr.name != name {
+            t.rename_summary_row(&form.table, &form.row, &name)?;
+        }
+        if let Some(col) = &form.col {
+            if sr.cells.get(col) != cell.as_ref() {
+                t.set_summary_cell(&form.table, &form.row, col, cell.as_ref())?;
+            }
+        }
+        Ok(())
+    });
+    if done.is_some() {
+        ui.summary_form.set(None);
+    }
+}
+
+pub(crate) fn delete_summary_row(store: AppStore, pane: PaneId) {
+    let ui = store.pane(pane).sheet_ui;
+    let Some(form) = untracked(|| ui.summary_form.get()) else { return };
+    aim(pane, Some(&form.table));
+    if local_edit(store, pane, |t| t.delete_summary_row(&form.table, &form.row)).is_some() {
+        ui.summary_form.set(None);
+    }
+}
+
+/// Move the open summary row one place up (`up`) or down.
+pub(crate) fn move_summary_row(store: AppStore, pane: PaneId, up: bool) {
+    let Some(form) = untracked(|| store.pane(pane).sheet_ui.summary_form.get()) else { return };
+    aim(pane, Some(&form.table));
+    let Some(snap) = snapshot(pane) else { return };
+    let Some(t) = snap.table(&form.table) else { return };
+    let ids: Vec<&str> = t.summary_rows.iter().map(|s| s.id.as_str()).collect();
+    let Some(i) = ids.iter().position(|id| *id == form.row) else { return };
+    let placement = match (up, i) {
+        (true, 0) => return,
+        (true, i) => Placement::Before(ids[i - 1].to_string()),
+        (false, i) if i + 1 >= ids.len() => return,
+        (false, i) => Placement::After(ids[i + 1].to_string()),
+    };
+    local_edit(store, pane, |t| t.move_summary_row(&form.table, &form.row, placement));
+}
+
+/// Draw a table rotated, or a record per row again (contract section 4c).
+pub(crate) fn rotate_table(store: AppStore, pane: PaneId, table: &str, rotated: bool) {
+    aim(pane, Some(table));
+    local_edit(store, pane, |t| t.set_rotated(table, rotated));
+}
+
+/// Group a table's rows by a column, or (with `None`) ungroup them.
+pub(crate) fn group_by(store: AppStore, pane: PaneId, table: &str, col: Option<&str>) {
+    aim(pane, Some(table));
+    if local_edit(store, pane, |t| t.set_group_by(table, col)).is_some() {
+        store.pane(pane).sheet_ui.column_form.set(None);
+    }
+}
+
+/// Collapse or open one group (this pane's view only).
+pub(crate) fn toggle_group(store: AppStore, pane: PaneId, table: &str, key: &str) {
+    let k = (table.to_string(), key.to_string());
+    store.pane(pane).sheet_ui.collapsed.update(|c| {
+        if !c.remove(&k) {
+            c.insert(k);
+        }
+    });
+}
+
+/// Collapse every group of a table, or open them all when they all are.
+pub(crate) fn toggle_all_groups(store: AppStore, pane: PaneId, table: &str) {
+    let ui = store.pane(pane).sheet_ui;
+    let keys: Vec<String> = untracked(|| ui.tables.get()).iter().find(|t| t.id == table).map(|t| t.groups.iter().map(|g| g.key.clone()).collect()).unwrap_or_default();
+    ui.collapsed.update(|c| {
+        let all = keys.iter().all(|k| c.contains(&(table.to_string(), k.clone())));
+        for k in keys {
+            let k = (table.to_string(), k);
+            if all {
+                c.remove(&k);
+            } else {
+                c.insert(k);
+            }
+        }
+    });
 }

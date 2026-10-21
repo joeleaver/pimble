@@ -751,6 +751,27 @@ impl<'e, 'b> Walk<'e, 'b> {
                 }
             }
         }
+        // A summary row by name, stored by id (contract section 4b).
+        if let Some(SummaryPiece { name: NameRef::Name(n), span }) = &spec.summary {
+            let hits: Vec<_> = table.summary_rows.iter().filter(|s| norm(&s.name) == norm(n)).collect();
+            match hits.as_slice() {
+                [one] => self.edit(span.clone(), format!("{{s:{}}}", one.id)),
+                [] => {
+                    let list: Vec<&str> = table.summary_rows.iter().map(|s| s.name.as_str()).collect();
+                    return Err(NameError::unknown(
+                        if list.is_empty() {
+                            format!("{} has no summary rows; \"#{n}\" names one", table.name)
+                        } else {
+                            format!("{} has no summary row \"{n}\"; its summary rows are {}", table.name, list.join(", "))
+                        },
+                        span.clone(),
+                    ));
+                }
+                _ => {
+                    return Err(NameError::unknown(format!("{} has two summary rows called {n}; rename one", table.name), span.clone()));
+                }
+            }
+        }
         for p in pieces(spec) {
             let NameRef::Name(s) = &p.name else { continue };
             let hits: Vec<_> = table
@@ -963,6 +984,15 @@ impl<'e, 'b> Walk<'e, 'b> {
             },
         };
         if let Some(spec) = &r.spec {
+            if let Some(SummaryPiece { name: NameRef::Id(id), span: piece }) = &spec.summary {
+                match table.summary_row(id) {
+                    Some(s) => local.push((piece.clone(), escape_col(&s.name))),
+                    None => {
+                        self.edit(span, "#REF!");
+                        return;
+                    }
+                }
+            }
             for p in pieces(spec) {
                 if matches!(&p.name, NameRef::Pos(_) | NameRef::Key(_)) {
                     // When the summary fails its result is unknown: keep the token.

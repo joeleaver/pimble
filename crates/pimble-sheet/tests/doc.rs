@@ -903,3 +903,121 @@ fn a_copied_table_keeps_its_ids_and_contents() {
     // Twice is refused: the id (and the name) are taken.
     assert!(dest.edit(|t| t.copy_table(&source)).result.is_err());
 }
+
+// ── Summary rows and groups (contract section 4b) ───────────────────────
+
+#[test]
+fn summary_rows_are_named_and_kept_apart_from_rows() {
+    let mut f = fixture();
+    let s = Sheets::of_node(&f.a);
+    let ((first, second), update) = s
+        .edit(|t| {
+            let first = t.add_summary_row(&f.table, None, &[(f.price.clone(), SummaryCell::Sum)], Placement::Last)?;
+            let second = t.add_summary_row(&f.table, None, &[], Placement::Last)?;
+            Ok((first, second))
+        })
+        .into_result()
+        .unwrap();
+    send(update, &mut f.b);
+    let snap = Sheets::of_node(&f.b).table(&f.table).unwrap();
+    let names: Vec<&str> = snap.summary_rows.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["Total", "Total 2"], "the next free Total");
+    assert_eq!(snap.summary_rows[0].cells.get(&f.price), Some(&SummaryCell::Sum));
+    assert!(snap.rows.is_empty(), "a summary row is not a row");
+
+    let s = Sheets::of_node(&f.a);
+    let refused = s.edit(|t| t.rename_summary_row(&f.table, &second, "total")).result.unwrap_err();
+    assert!(matches!(refused, SheetError::DuplicateSummaryRow { .. }), "{refused}");
+    let refused = s.edit(|t| t.rename_summary_row(&f.table, &second, "This Row")).result.unwrap_err();
+    assert!(matches!(refused, SheetError::ReservedSummaryRowName(_)), "{refused}");
+    let (_, update) = s
+        .edit(|t| {
+            t.rename_summary_row(&f.table, &second, "Average")?;
+            t.set_summary_cell(&f.table, &second, &f.price, Some(&SummaryCell::Formula("SUM({c:x})".into())))?;
+            t.move_summary_row(&f.table, &second, Placement::First)?;
+            t.set_summary_cell(&f.table, &first, &f.price, None)
+        })
+        .into_result()
+        .unwrap();
+    send(update, &mut f.b);
+    let snap = Sheets::of_node(&f.b).table(&f.table).unwrap();
+    assert_eq!(snap.summary_rows[0].name, "Average", "moved first");
+    assert_eq!(snap.summary_rows[0].cells.get(&f.price), Some(&SummaryCell::Formula("SUM({c:x})".into())));
+    assert!(snap.summary_rows[1].cells.is_empty(), "a cell taken back shows nothing");
+
+    let (_, update) = s.edit(|t| t.delete_summary_row(&f.table, &first)).into_result().unwrap();
+    send(update, &mut f.b);
+    assert_eq!(Sheets::of_node(&f.b).table(&f.table).unwrap().summary_rows.len(), 1);
+}
+
+#[test]
+fn grouping_and_a_deleted_column() {
+    let mut f = fixture();
+    let s = Sheets::of_node(&f.a);
+    let (_, update) = s
+        .edit(|t| {
+            t.set_group_by(&f.table, Some(&f.name))?;
+            t.add_summary_row(&f.table, None, &[(f.name.clone(), SummaryCell::Count), (f.price.clone(), SummaryCell::Sum)], Placement::Last)
+        })
+        .into_result()
+        .unwrap();
+    send(update, &mut f.b);
+    assert_eq!(Sheets::of_node(&f.b).table(&f.table).unwrap().group_by.as_deref(), Some(f.name.as_str()));
+    // The grouping column goes, and its grouping and summary cells with it.
+    let (_, update) = s.edit(|t| t.delete_column(&f.table, &f.name)).into_result().unwrap();
+    send(update, &mut f.b);
+    let snap = Sheets::of_node(&f.b).table(&f.table).unwrap();
+    assert_eq!(snap.group_by, None);
+    assert_eq!(snap.summary_rows[0].cells.keys().collect::<Vec<_>>(), [&f.price]);
+    let (_, update) = s.edit(|t| t.set_group_by(&f.table, None)).into_result().unwrap();
+    assert!(update.is_none() || Sheets::of_node(&f.a).table(&f.table).unwrap().group_by.is_none());
+}
+
+#[test]
+fn two_devices_adding_a_tables_first_summary_rows_apart_keep_both() {
+    let mut f = fixture();
+    let (_, ua) = Sheets::of_node(&f.a).edit(|t| t.add_summary_row(&f.table, Some("Total"), &[(f.price.clone(), SummaryCell::Sum)], Placement::Last)).into_result().unwrap();
+    let (_, ub) = Sheets::of_node(&f.b).edit(|t| t.add_summary_row(&f.table, Some("Average"), &[(f.price.clone(), SummaryCell::Average)], Placement::Last)).into_result().unwrap();
+    send(ua, &mut f.b);
+    send(ub, &mut f.a);
+    for doc in [&f.a, &f.b] {
+        let snap = Sheets::of_node(doc).table(&f.table).unwrap();
+        let mut names: Vec<&str> = snap.summary_rows.iter().map(|s| s.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["Average", "Total"]);
+    }
+}
+
+#[test]
+fn a_copied_table_keeps_its_summary_rows_and_grouping() {
+    let f = fixture();
+    let s = Sheets::of_node(&f.a);
+    s.edit(|t| {
+        t.set_group_by(&f.table, Some(&f.name))?;
+        t.add_summary_row(&f.table, None, &[(f.price.clone(), SummaryCell::Sum)], Placement::Last)
+    })
+    .into_result()
+    .unwrap();
+    let original = s.table(&f.table).unwrap();
+    let other = node();
+    Sheets::of_node(&other).edit(|t| t.copy_table(&original)).into_result().unwrap();
+    let copy = Sheets::of_node(&other).table(&f.table).unwrap();
+    assert_eq!(copy.summary_rows, original.summary_rows);
+    assert_eq!(copy.group_by, original.group_by);
+}
+
+#[test]
+fn a_table_is_rotated_and_turned_back() {
+    let mut f = fixture();
+    assert!(!Sheets::of_node(&f.b).table(&f.table).unwrap().rotated);
+    let (_, update) = Sheets::of_node(&f.a).edit(|t| t.set_rotated(&f.table, true)).into_result().unwrap();
+    send(update, &mut f.b);
+    let rotated = Sheets::of_node(&f.b).table(&f.table).unwrap();
+    assert!(rotated.rotated, "everyone sees it rotated");
+    let other = node();
+    Sheets::of_node(&other).edit(|t| t.copy_table(&rotated)).into_result().unwrap();
+    assert!(Sheets::of_node(&other).table(&f.table).unwrap().rotated, "and a copy is too");
+    let (_, update) = Sheets::of_node(&f.a).edit(|t| t.set_rotated(&f.table, false)).into_result().unwrap();
+    send(update, &mut f.b);
+    assert!(!Sheets::of_node(&f.b).table(&f.table).unwrap().rotated);
+}

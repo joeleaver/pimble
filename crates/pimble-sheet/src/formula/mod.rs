@@ -37,7 +37,7 @@ mod rekey;
 mod value;
 
 pub use coerce::general as general_number;
-pub use engine::{ComputedColumn, ComputedRow, ComputedTable, Engine};
+pub use engine::{ComputedColumn, ComputedGroup, ComputedRow, ComputedSummaryRow, ComputedTable, Engine};
 pub use format::{format_number, hours, money, round_half_away, short_date, text_number};
 pub use functions::CATEGORIES as FUNCTIONS;
 pub use names::{note_text, note_token, to_shown, to_stored, Candidate, NameError, NameErrorKind};

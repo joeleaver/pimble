@@ -207,12 +207,6 @@ pub struct StoreParam {
 }
 
 #[derive(Deserialize, JsonSchema)]
-pub struct HostedStoreParam {
-    /// The hosted store's id, from list_hosted_stores.
-    pub store_id: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
 pub struct CreateNodeParams {
     /// Where the new node goes: the parent node (or a store's name, for its top level).
     pub parent: String,
@@ -569,48 +563,6 @@ impl Pimble {
                 )
             })
             .collect())
-    }
-
-    /// The signed-in Pimble Cloud account's hosted stores, and which are open here.
-    #[tool(name = "list_hosted_stores")]
-    async fn list_hosted_stores(&self) -> Result<String, String> {
-        let client = self.client().await?;
-        let status = client.cloud_status().await.map_err(rpc)?;
-        if !status.signed_in {
-            return Err("Sign in from Pimble's Account menu first.".into());
-        }
-        let open: HashSet<String> =
-            client.list_stores().await.map_err(rpc)?.iter().map(|s| s.id.to_string()).collect();
-        let hosted = client.cloud_list_hosted_stores().await.map_err(rpc)?;
-        if hosted.is_empty() {
-            return Ok("The account has no hosted stores.".into());
-        }
-        Ok(hosted
-            .iter()
-            .map(|h| {
-                let here = if open.contains(&h.store_id) { "open here" } else { "not open here" };
-                format!("- {} (id {}, {}, {here})\n", h.name, h.store_id, h.role)
-            })
-            .collect())
-    }
-
-    /// Open one of the account's hosted stores on this computer (it stays in step
-    /// with Pimble Cloud, encrypted), and add it to the person's open stores.
-    #[tool(name = "add_hosted_store")]
-    async fn add_hosted_store(&self, Parameters(p): Parameters<HostedStoreParam>) -> Result<String, String> {
-        let client = self.client().await?;
-        let status = client.cloud_status().await.map_err(rpc)?;
-        if !status.signed_in {
-            return Err("Sign in from Pimble's Account menu first.".into());
-        }
-        let id = pimble_core::StoreId::parse(p.store_id.trim()).map_err(|_| format!("\"{}\" is not a store id.", p.store_id))?;
-        let store = client.cloud_add_hosted_store(id).await.map_err(rpc)?;
-        if let Some(path) = store.local_path() {
-            if let Err(e) = pimble_server::local::add_open_store(&path.to_string_lossy()) {
-                tracing::warn!("could not add {} to the saved store list: {e}", path.display());
-            }
-        }
-        Ok(format!("Opened {} (id {}); it is syncing from Pimble Cloud.", store.name, store.id))
     }
 
     /// Create a node under `parent`, with a title and optionally its first content.

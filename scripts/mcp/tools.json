@@ -19,6 +19,5 @@
  ["move_node", {"node": "Family Management/MEDICAL/LLM note (renamed)", "new_parent": "Family Management/TAXES"}],
  ["delete_node", {"node": "Family Management/TAXES/LLM note (renamed)"}],
  ["list_deleted", {"store": "Family Management"}],
- ["get_node", {"node": "Nowhere/at all"}],
- ["list_hosted_stores", {}]
+ ["get_node", {"node": "Nowhere/at all"}]
 ]

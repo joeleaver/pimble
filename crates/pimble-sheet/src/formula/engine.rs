@@ -23,7 +23,7 @@ use std::rc::Rc;
 
 use crate::book::{Book, Reach};
 use crate::model::{
-    ColumnSnap, ColumnType, Format, NodeRef, ResultKey, RowSnap, SheetsSnap, Stored, TableSnap,
+    ColumnSnap, ColumnType, Format, NodeRef, ResultKey, RowSnap, SheetsSnap, Stored, SummaryCell, SummaryRowSnap, TableSnap,
 };
 
 use super::ast::*;
@@ -120,6 +120,9 @@ pub(crate) struct Ctx<'b> {
     pub table: Option<&'b TableSnap>,
     pub row: Option<RowRef>,
     pub env: Option<Rc<Env>>,
+    /// In a summary cell's formula (contract section 4b): the rows of
+    /// `table` it sums up, by index, which a bare `[column]` reads.
+    pub scope: Option<Rc<Vec<usize>>>,
 }
 
 impl<'b> Ctx<'b> {
@@ -164,6 +167,30 @@ pub struct ComputedColumn {
     pub result_key: Option<String>,
 }
 
+/// A summary row as it shows (contract section 4b): one value per
+/// displayed column, Blank where the row shows nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComputedSummaryRow {
+    pub id: String,
+    pub name: String,
+    pub values: Vec<Value>,
+    /// The format each value shows in: its column's, a plain number for a
+    /// count.
+    pub formats: Vec<Format>,
+}
+
+/// One group of a grouped table: the value its rows share, as shown, and
+/// its subtotals.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComputedGroup {
+    /// The value as shown; empty for blanks ("(blank)" in the app).
+    pub label: String,
+    pub value: Value,
+    /// The group's rows, by id, in their order.
+    pub rows: Vec<String>,
+    pub subtotals: Vec<ComputedSummaryRow>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComputedRow {
     pub id: String,
@@ -181,6 +208,12 @@ pub struct ComputedTable {
     pub rows: Vec<ComputedRow>,
     /// A summary whose formula fails: the reason, shown over the table.
     pub error: Option<FormulaError>,
+    /// Its summary rows over every row, top to bottom (contract section 4b).
+    pub summary_rows: Vec<ComputedSummaryRow>,
+    /// Its groups in order, when it is grouped; empty otherwise.
+    pub groups: Vec<ComputedGroup>,
+    /// The displayed column a grouped table is grouped by.
+    pub group_by: Option<usize>,
 }
 
 impl ComputedTable {
@@ -282,6 +315,9 @@ impl<'b> Engine<'b> {
             columns: Vec::new(),
             rows: Vec::new(),
             error: None,
+            summary_rows: Vec::new(),
+            groups: Vec::new(),
+            group_by: None,
         };
         if !t.is_summary() {
             out.columns = t.columns.iter().map(own).collect();
@@ -301,6 +337,7 @@ impl<'b> Engine<'b> {
                     values,
                 });
             }
+            self.summarize(node, t, &mut out);
             return out;
         }
         let summary = self.summary(node, t);
@@ -344,6 +381,118 @@ impl<'b> Engine<'b> {
         out
     }
 
+    /// A plain table's summary rows and groups (contract section 4b), from
+    /// its rows already computed into `out`.
+    fn summarize(&self, node: &NodeRef, t: &'b TableSnap, out: &mut ComputedTable) {
+        let all: Rc<Vec<usize>> = Rc::new((0..t.rows.len()).collect());
+        out.summary_rows = t.summary_rows.iter().map(|s| self.summary_row_values(node, t, s, "", &all, &out.columns)).collect();
+        let Some(g) = t.group_by.as_deref() else { return };
+        let Some(gi) = t.columns.iter().position(|c| c.id == g) else { return };
+        out.group_by = Some(gi);
+        let format = out.columns[gi].format;
+        // Rows by the value they show in the grouping column.
+        let mut groups: Vec<(String, Value, Vec<usize>)> = Vec::new();
+        for (i, row) in out.rows.iter().enumerate() {
+            let v = row.values[gi].clone();
+            let label = self.format_value(&v, format);
+            match groups.iter_mut().find(|(l, _, _)| norm(l) == norm(&label)) {
+                Some((_, _, rows)) => rows.push(i),
+                None => groups.push((label, v, vec![i])),
+            }
+        }
+        groups.sort_by(|(la, va, _), (lb, vb, _)| group_order(la, va).cmp(&group_order(lb, vb)));
+        out.groups = groups
+            .into_iter()
+            .enumerate()
+            .map(|(k, (label, value, rows))| {
+                let scope = Rc::new(rows.clone());
+                ComputedGroup {
+                    subtotals: t
+                        .summary_rows
+                        .iter()
+                        .map(|s| self.summary_row_values(node, t, s, &format!("g{k}"), &scope, &out.columns))
+                        .collect(),
+                    rows: rows.iter().map(|&i| out.rows[i].id.clone()).collect(),
+                    label,
+                    value,
+                }
+            })
+            .collect();
+    }
+
+    fn summary_row_values(
+        &self,
+        node: &NodeRef,
+        t: &'b TableSnap,
+        s: &'b SummaryRowSnap,
+        scope_key: &str,
+        scope: &Rc<Vec<usize>>,
+        columns: &[ComputedColumn],
+    ) -> ComputedSummaryRow {
+        let (values, formats) = t
+            .columns
+            .iter()
+            .zip(columns)
+            .map(|(c, shown)| {
+                let format = match s.cells.get(&c.id) {
+                    Some(SummaryCell::Count) => Format::Number,
+                    _ => shown.format,
+                };
+                (self.summary_cell(node, t, s, c, scope_key, scope), format)
+            })
+            .unzip();
+        ComputedSummaryRow { id: s.id.clone(), name: s.name.clone(), values, formats }
+    }
+
+    /// One summary cell over the table rows `scope` (by index), cached under
+    /// `scope_key` ("" for the whole table, one per group otherwise).
+    pub(crate) fn summary_cell(
+        &self,
+        node: &NodeRef,
+        t: &'b TableSnap,
+        s: &'b SummaryRowSnap,
+        c: &'b ColumnSnap,
+        scope_key: &str,
+        scope: &Rc<Vec<usize>>,
+    ) -> Value {
+        let Some(cell) = s.cells.get(&c.id) else { return Value::Blank };
+        let key = Key::Cell(*node, t.id.clone(), format!("sum:{}:{scope_key}", s.id), c.id.clone());
+        if let Some(v) = self.cells.borrow().get(&key) {
+            return v.clone();
+        }
+        let circ = || Value::err(FormulaError::new(ErrorCode::Circ, format!("{}'s {} depends on itself", s.name, c.name)));
+        match self.enter(&key) {
+            Enter::Cycle => return circ(),
+            Enter::TooDeep => return Value::err(FormulaError::calc("This reads through too many formulas to compute")),
+            Enter::Ok => {}
+        }
+        let v = match cell {
+            SummaryCell::Formula(f) => match &*self.parse_cached(f) {
+                Err(e) => Value::err(e.to_error()),
+                Ok(expr) => {
+                    let ctx = Ctx { node: *node, table: Some(t), row: None, env: None, scope: Some(scope.clone()) };
+                    single(self.eval(expr, &ctx))
+                }
+            },
+            agg => {
+                let agg = match agg {
+                    SummaryCell::Sum => Agg::Sum,
+                    SummaryCell::Average => Agg::Average,
+                    SummaryCell::Count => Agg::CountA,
+                    SummaryCell::Min => Agg::Min,
+                    _ => Agg::Max,
+                };
+                let col = TabCol { meta: ColMeta::named(c.name.clone()), src: ColSrc::Own(c), key: None };
+                let all = self.column_values(node, t, &col);
+                let picked: Vec<Value> = scope.iter().filter_map(|&i| all.get(i).cloned()).collect();
+                functions::aggregate_list(agg, &picked)
+            }
+        };
+        let v = if self.leave(&key) { circ() } else { v };
+        self.cells.borrow_mut().insert(key, v.clone());
+        v
+    }
+
     /// Runs a formula (shown or stored form) in a table's context, one row's
     /// or none, without storing it. Names that do not resolve are refused
     /// the way committing the formula would refuse them.
@@ -379,6 +528,7 @@ impl<'b> Engine<'b> {
             table,
             row,
             env: None,
+            scope: None,
         };
         Ok(match self.eval(&expr, &ctx) {
             Val::One(v) => Evaluated::Value(v),
@@ -913,6 +1063,7 @@ impl<'b> Engine<'b> {
                     table: Some(t),
                     row: Some(row.clone()),
                     env: None,
+                    scope: None,
                 };
                 single(self.eval(expr, &ctx))
             }
@@ -962,6 +1113,7 @@ impl<'b> Engine<'b> {
             table: Some(t),
             row: None,
             env: None,
+            scope: None,
         };
         let a = match self.eval(expr, &ctx) {
             Val::Arr(a) => a,
@@ -1207,9 +1359,6 @@ impl<'b> Engine<'b> {
         let Some(spec) = &r.spec else {
             return Ok(Val::arr(self.table_array(&node, table, &cols)));
         };
-        if spec.area == Area::Totals {
-            return Err(FormulaError::reference("Tables here have no totals row"));
-        }
         let pick = |p: &ColPiece| -> Result<usize, FormulaError> {
             self.find_col(&cols, &p.name)
                 .ok_or_else(|| self.no_column(table, &cols, &p.name))
@@ -1222,6 +1371,9 @@ impl<'b> Engine<'b> {
                 (a.min(b)..=a.max(b)).collect()
             }
         };
+        if spec.area == Area::Totals {
+            return self.summary_ref(&node, table, spec, &cols, &idx);
+        }
         if spec.area == Area::Headers {
             return Ok(Val::arr(Array::one_row(
                 idx.iter()
@@ -1267,7 +1419,50 @@ impl<'b> Engine<'b> {
             )));
         }
         let picked: Vec<TabCol<'b>> = idx.iter().map(|&i| cols[i].clone()).collect();
-        Ok(Val::arr(self.table_array(&node, table, &picked)))
+        let array = self.table_array(&node, table, &picked);
+        // In a summary cell, a bare `[column]` is the rows it sums up.
+        if let (None, Some(scope), Some(home)) = (&r.table, &ctx.scope, ctx.table) {
+            if home.id == table.id && node == ctx.node {
+                return Ok(Val::arr(array.pick_rows(scope)));
+            }
+        }
+        Ok(Val::arr(array))
+    }
+
+    /// `Trips[[#Totals],[cost]]` and `Trips[[#Average],[cost]]`: a summary
+    /// row's cells over every row (contract section 4b).
+    fn summary_ref(
+        &self,
+        node: &NodeRef,
+        table: &'b TableSnap,
+        spec: &Spec,
+        cols: &[TabCol<'b>],
+        idx: &[usize],
+    ) -> Result<Val, FormulaError> {
+        let s = match &spec.summary {
+            None => table.summary_rows.first(),
+            Some(p) => match &p.name {
+                NameRef::Id(id) => table.summary_row(id),
+                NameRef::Name(n) => table.summary_rows.iter().find(|s| norm(&s.name) == norm(n)),
+                _ => None,
+            },
+        };
+        let Some(s) = s else {
+            return Err(FormulaError::reference(match (&spec.summary, table.summary_rows.is_empty()) {
+                (_, true) => format!("{} has no summary rows", table.name),
+                (Some(SummaryPiece { name: NameRef::Name(n), .. }), false) => format!("{} has no summary row \"{n}\"", table.name),
+                _ => "That summary row was deleted".to_string(),
+            }));
+        };
+        let all: Rc<Vec<usize>> = Rc::new((0..table.rows.len()).collect());
+        let value = |i: usize| match cols[i].src {
+            ColSrc::Own(c) => self.summary_cell(node, table, s, c, "", &all),
+            ColSrc::Result(_) => Value::Blank,
+        };
+        if idx.len() == 1 {
+            return Ok(Val::One(value(idx[0])));
+        }
+        Ok(Val::arr(Array::one_row(idx.iter().map(|&i| (cols[i].meta.clone(), value(i))).collect())))
     }
 
     /// A node's field, as a value: numbers and booleans read as such.
@@ -1456,4 +1651,34 @@ pub(crate) fn result_keys<'a>(names: impl Iterator<Item = &'a str>) -> Vec<Strin
             key
         })
         .collect()
+}
+
+/// Where a group goes among the others: numbers and dates ascending, then
+/// text by its shown value, blanks last (contract section 4b).
+fn group_order(label: &str, v: &Value) -> (u8, OrderedF64, String) {
+    match v {
+        Value::Number(x) => (0, OrderedF64(*x), String::new()),
+        Value::Blank => (3, OrderedF64(0.0), String::new()),
+        Value::Error(_) => (2, OrderedF64(0.0), label.to_lowercase()),
+        _ if label.is_empty() => (3, OrderedF64(0.0), String::new()),
+        _ => (1, OrderedF64(0.0), label.to_lowercase()),
+    }
+}
+
+/// An `f64` that orders (NaN last), for sorting groups.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OrderedF64(f64);
+
+impl Eq for OrderedF64 {}
+
+impl PartialOrd for OrderedF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedF64 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.partial_cmp(&other.0).unwrap_or(std::cmp::Ordering::Equal)
+    }
 }
