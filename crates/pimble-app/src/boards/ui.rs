@@ -298,15 +298,21 @@ pub(crate) fn render_board(__scope: &mut RenderScope, store: AppStore, pane: Pan
     // The desktop's pixel scale reads the box the surface fills.
     BOUNDS.with(|b| b.borrow_mut()[pane.index()] = Some(canvas.bounds_signal()));
     // Files dropped from the system are pictures for the board (contract
-    // section 1). The browser finds the board by this attribute
-    // (`install_browser_handlers`, which knows where the drop was); rinch
-    // hands the desktop's handler the paths alone, so there they land in the
-    // middle of the view.
+    // section 1), where they were let go. The browser finds the board by this
+    // attribute (`install_browser_handlers`, which knows where the drop was);
+    // on the desktop rinch puts the drop point and this element's box in the
+    // click context before the handler runs (joeleaver/rinch#1654), and the
+    // board takes a point in the surface's physical pixels.
     canvas.set_attribute("data-pimble-board", &pane.index().to_string());
     #[cfg(feature = "native")]
     {
         let handler = __scope.register_file_drop_handler(move |paths: Vec<std::path::PathBuf>| {
-            add_image_files(store, Dest::Board(pane, None), paths);
+            let ctx = rinch::core::get_click_context();
+            let at = (ctx.element_width > 0.0 && ctx.element_height > 0.0).then(|| {
+                let scale = super::scale_of(pane);
+                ((ctx.mouse_x - ctx.element_x) * scale, (ctx.mouse_y - ctx.element_y) * scale)
+            });
+            add_image_files(store, Dest::Board(pane, at), paths);
         });
         canvas.set_attribute("data-onfiledrop", &handler.0.to_string());
     }
