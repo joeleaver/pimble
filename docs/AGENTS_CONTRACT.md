@@ -209,3 +209,27 @@ snippet instead. Removing an agent removes its entry the same way.
   store: no key, the sentence; an agent reading MEDICAL lists and reads only MEDICAL,
   finds nothing in TAXES ("Turbo Tax"), is refused TAXES by link ("no grant for this
   document") and a write under MEDICAL ("You can read this, not change it.").
+
+## Built in wave 3 (the app), 2026-10-20
+
+- Account > "AI Agents..." (`crates/pimble-app/src/agents.rs`, desktop only): the list
+  (name, reach in a line, last used, Edit, Remove), New Agent (name, which app, the
+  picker), and a made agent's page (its key once, "Add to <app>", the snippet, Copy
+  Setup). Commands `ListAgents`/`CreateAgent`/`UpdateAgent`/`RemoveAgent`, events
+  `AgentsListed`/`AgentCreated`/`AgentsError` (shared `commands.rs`).
+- The picker is the open stores' tree, loaded as rows open, with None / Read / Edit per
+  row; a row nothing is chosen on says what it inherits ("reads, from above"). A store's
+  root node stands for the whole store.
+- "Add to Claude Desktop / Claude Code / Cursor" merges one `mcpServers.pimble-<name>`
+  entry (`command` the `pimble-mcp` beside the app, `env.PIMBLE_AGENT_KEY`; Claude Code's
+  with `type: stdio`), keeps the old file as `.pimble-backup`, writes by rename, and
+  leaves a file it cannot parse alone (`write_entry`, tested).
+- Walked through on an isolated app (port 7491, scratch config, fake `HOME`): an agent
+  made with MEDICAL read and one folder inside it edited; the scratch Claude Desktop
+  config got the entry; Edit loads the grants back; Remove takes it off the server.
+
+**Not built yet, or known gaps:**
+- View > "Show Agent Access" markers in the explorer.
+- Removing an agent does not take its entry out of the app's config (the key stops
+  working at once; the stale entry answers with the removed-agent sentence).
+- The browser shows no Agents window; it gets one with remote agents (wave 4).

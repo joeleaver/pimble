@@ -959,6 +959,8 @@ pub struct AppStore {
     /// history ([`crate::nav`]), from the menu or its shortcut; the explorer,
     /// which opens things, takes it.
     pub nav_step: Signal<Option<bool>>,
+    /// Account > "AI Agents..." ([`crate::agents`]).
+    pub agents_ui: crate::agents::AgentsUi,
     /// The tooltip over a hovered link, once the pointer has rested on it
     /// (docs/LINKS_CONTRACT.md "What a link looks like").
     pub link_hover: Signal<Option<LinkTooltip>>,
@@ -1205,6 +1207,7 @@ impl AppStore {
             update_ready: Signal::new(None),
             link_open: Signal::new(None),
             nav_step: Signal::new(None),
+            agents_ui: crate::agents::AgentsUi::new(),
             link_hover: Signal::new(None),
             link_picker: Signal::new(None),
             deleted_modal_store: Signal::new(None),

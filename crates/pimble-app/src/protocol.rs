@@ -198,6 +198,18 @@ pub enum BackendCommand {
     // `Service`-only RPCs on the server this client talks to; the desktop's
     // embedded server is that principal. Each answers with a `Cloud*` event
     // that names the operation, so an outcome never has to be guessed at.
+    // AI agents (docs/AGENTS_CONTRACT.md): `Service`-only RPCs on this
+    // device's own server. Each answers `AgentsListed`, `AgentCreated` or
+    // `AgentsError`.
+    /// This device's agents.
+    ListAgents,
+    /// A new agent with these grants; `AgentCreated` carries its key, once.
+    CreateAgent { name: String, grants: Vec<pimble_rpc::AgentGrant> },
+    /// Rename an agent and replace its grants (`AgentsListed`).
+    UpdateAgent { id: String, name: String, grants: Vec<pimble_rpc::AgentGrant> },
+    /// Remove an agent: its key stops working (`AgentsListed`).
+    RemoveAgent { id: String },
+
     /// Whether an account is signed in, and as whom (`CloudStatusChanged`).
     CloudStatus,
     /// Sign in to the accounts service at `url` (`CloudStatusChanged` with
@@ -436,6 +448,14 @@ pub enum BackendEvent {
     /// An `Import` stopped, with a sentence that says why (and how much of it
     /// was written before it did).
     ImportFailed { message: String },
+
+    // AI agents (docs/AGENTS_CONTRACT.md).
+    /// This device's agents, after any agent command but a create.
+    AgentsListed { agents: Vec<pimble_rpc::AgentInfo> },
+    /// A new agent and its key, shown this once.
+    AgentCreated { agent: pimble_rpc::AgentInfo, key: String },
+    /// An agent command failed, in a sentence.
+    AgentsError { message: String },
 
     // Pimble Cloud account (docs/DESKTOP_ACCOUNT_CONTRACT.md).
     /// The answer to `CloudStatus`, `CloudSignIn` (`signed_in: true`) and
