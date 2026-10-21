@@ -199,6 +199,28 @@ pub(crate) fn anchor_at(doc: &Doc, content: &ArrayRef, spot: Spot) -> Option<Anc
     Some(Anchor::new(sticky, &after))
 }
 
+/// The spot where `quote` starts, when exactly one textblock reads it, once.
+/// The refusal says why not, in a sentence.
+pub(crate) fn quote_spot(doc: &Doc, content: &ArrayRef, quote: &str) -> std::result::Result<Spot, String> {
+    let quote = quote.trim();
+    if quote.is_empty() {
+        return Err("Quote a few words of the text to say where.".into());
+    }
+    let txn = doc.transact();
+    let mut found = Vec::new();
+    for (index, text) in textblocks(&txn, content).into_iter().enumerate() {
+        let string = text.get_string(&txn);
+        for (byte, _) in string.match_indices(quote) {
+            found.push(Spot { textblock: index, offset: string[..byte].chars().count() });
+        }
+    }
+    match found.len() {
+        1 => Ok(found[0]),
+        0 => Err(format!("The text does not read \"{quote}\" anywhere.")),
+        n => Err(format!("\"{quote}\" is in the text {n} times; quote more of it.")),
+    }
+}
+
 /// Where `anchor` is in `doc`'s content now.
 ///
 /// The sticky index when the quote still reads there (or there is no quote).

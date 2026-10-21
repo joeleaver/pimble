@@ -470,6 +470,9 @@ impl Pimble {
             out.push_str(&format!("fields: {}\n", fields.join("; ")));
         }
         out.push_str(&format!("children: {}\n", node.children.len()));
+        if node.attachments > 0 {
+            out.push_str(&format!("discussions: {} (list_discussions lists them)\n", node.attachments));
+        }
         out.push_str(&format!("modified: {}\n", node.metadata.modified_at.to_rfc3339()));
         if node.access == StoreAccess::Read {
             out.push_str("access: read-only\n");
@@ -478,11 +481,16 @@ impl Pimble {
             out.push_str("(a mount: its children are another store's; list_children shows them)\n");
         }
         out.push_str("---\n");
-        let tables = if node.node_type == pimble_core::node_types::SHEET {
+        let tables = if node.node_type == pimble_core::node_types::DISCUSSION {
+            out.push_str("(a discussion: its content is its messages)\n");
+            out.push_str(&Self::discussion_body(&node));
+            None
+        } else if node.node_type == pimble_core::node_types::SHEET {
             out.push_str("(a sheet node: its content is its tables)\n");
             self.tables_of_node(&client, addr, &node).await.map(|t| ("Tables", t))
         } else {
             // A text node's tables are shown where they are in its text.
+            let content = self.inline_discussions(&client, &content).await;
             let (content, lost) = self.tables_in_text(&client, addr, &node, &content).await;
             out.push_str(if content.is_empty() { "(no content)" } else { &content });
             lost.map(|t| ("Tables no longer in the text", t))

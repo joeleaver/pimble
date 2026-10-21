@@ -55,6 +55,16 @@ pub struct StartDiscussionParams {
     /// The first message, in Markdown: **bold**, *italic*, [text](url), and
     /// pimble: links to nodes.
     pub message: String,
+    /// With `on` (a text node): a few words of its text (read once, as
+    /// replace_text quotes) where the discussion is anchored. Left out, it is
+    /// on the node as a whole.
+    #[serde(default)]
+    pub after_text: Option<String>,
+    /// With `on`: also show the discussion in the node's text, after the
+    /// block `after_text` names (at the end when left out). This edits the
+    /// node's text.
+    #[serde(default)]
+    pub inline: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -127,7 +137,45 @@ fn summary(addr: Addr, node: &Node) -> String {
     line
 }
 
+/// The discussion a Markdown line's embed atom shows, if the line is one.
+fn inline_discussion(line: &str) -> Option<pimble_core::PimbleUrl> {
+    let line = line.trim();
+    if !line.starts_with("<div") || !line.contains("data-pm-type=\"embed\"") || !line.contains("data-kind=\"discussion\"") {
+        return None;
+    }
+    let (_, rest) = line.split_once("data-node=\"")?;
+    let (url, _) = rest.split_once('"')?;
+    pimble_core::PimbleUrl::parse(url)
+}
+
 impl Pimble {
+    /// `markdown` with each discussion shown inline replaced by a line
+    /// naming it (get_node; read_discussion reads it).
+    pub(super) async fn inline_discussions(&self, client: &PimbleClient, markdown: &str) -> String {
+        let mut out = String::new();
+        for line in markdown.split_inclusive('\n') {
+            let Some(url) = inline_discussion(line) else {
+                out.push_str(line);
+                continue;
+            };
+            let at = Addr { store: url.store, node: url.node };
+            match client.get_node(at.store, at.node).await {
+                Ok(n) => out.push_str(&format!("(the discussion {} is shown here: {})\n", topic_of(&n), summary(at, &n).trim_start_matches("- "))),
+                Err(_) => out.push_str(&format!("(a discussion shown here could not be read: {})\n", at.link())),
+            }
+        }
+        out
+    }
+
+    /// A discussion node's thread, for get_node.
+    pub(super) fn discussion_body(node: &Node) -> String {
+        match snapshot_of(node) {
+            Ok(snap) if !snap.thread().is_empty() => snap.to_markdown(),
+            Ok(_) => "No messages yet.\n".to_string(),
+            Err(e) => e,
+        }
+    }
+
     /// What this agent's messages are stamped with: its id and name, as the
     /// server knows them.
     async fn author(&self, client: &PimbleClient) -> Option<Author> {
@@ -241,12 +289,30 @@ impl Pimble {
             return Err("A message needs some text.".into());
         }
         let author = self.author(&client).await;
+        // Where on its host it is: a place in the host's text, named by a quote.
+        let anchor = match (&p.on, &p.after_text) {
+            (Some(on), Some(quote)) => {
+                let host = nodes::resolve(&client, on).await?;
+                let node = client.get_node(host.store, host.node).await.map_err(rpc)?;
+                let doc = NodeDoc::load(&node.content).map_err(|e| format!("The node's document could not be read: {e}"))?;
+                let sticky = doc.sticky_at_quote(quote).map_err(|e| match e {
+                    pimble_crdt::CrdtError::Refused(sentence) => sentence,
+                    other => other.to_string(),
+                })?;
+                Some(pimble_discussion::Anchor::Text { sticky })
+            }
+            (None, Some(_)) => return Err("after_text names a place in the text of the node given as `on`.".into()),
+            _ => None,
+        };
+        if p.inline && p.on.is_none() {
+            return Err("inline shows the discussion in the text of the node given as `on`.".into());
+        }
         // The containers and the first message, written in the create.
         let seed = Discussion::standalone();
         {
             use yrs::updates::decoder::Decode;
             use yrs::Transact;
-            let update = yrs::Update::decode_v1(&pimble_discussion::new_content(None)).map_err(|e| e.to_string())?;
+            let update = yrs::Update::decode_v1(&pimble_discussion::new_content(anchor.as_ref())).map_err(|e| e.to_string())?;
             seed.doc().transact_mut().apply_update(update).map_err(|e| e.to_string())?;
         }
         let now = now();
@@ -262,11 +328,34 @@ impl Pimble {
             (Some(on), None) => {
                 let host = nodes::resolve(&client, on).await?;
                 let node_id = client
-                    .create_attachment(host.store, host.node, node_types::DISCUSSION, topic, Some(content), custom)
+                    .create_attachment(host.store, host.node, node_types::DISCUSSION, topic.clone(), Some(content), custom)
                     .await
                     .map_err(rpc)?;
                 let addr = Addr { store: host.store, node: node_id };
-                Ok(format!("Started the discussion {} on {}.", addr.link(), self.describe(&client, &stores, host).await))
+                let mut answer = format!("Started the discussion {} on {}", addr.link(), self.describe(&client, &stores, host).await);
+                if p.inline {
+                    let title = topic.replace('"', "&quot;");
+                    // Exactly as rinch writes an embed (its attributes in order),
+                    // which is all the strict Markdown reader takes as one.
+                    let atom = format!("<div data-pm-type=\"embed\" data-kind=\"discussion\" data-node=\"{}\" data-title=\"{title}\"></div>\n", addr.link());
+                    let quote = p.after_text.clone();
+                    let shown = self
+                        .edit(&client, host, move |doc| {
+                            match &quote {
+                                Some(quote) => doc.insert_markdown_after(quote, false, &atom),
+                                None => doc.append_markdown(&atom),
+                            }
+                            .map(|_| ())
+                            .map_err(super::crdt)
+                        })
+                        .await;
+                    match shown {
+                        Ok(()) => answer.push_str(", shown in its text"),
+                        Err(e) => answer.push_str(&format!("; it could not be shown in the text ({e}), and is listed with the node's discussions")),
+                    }
+                }
+                answer.push('.');
+                Ok(answer)
             }
             (None, Some(parent)) => {
                 let parent = nodes::resolve(&client, parent).await?;

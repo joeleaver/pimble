@@ -528,6 +528,16 @@ impl NodeDoc {
         links::anchor_at(&self.doc, &self.content(), spot)
     }
 
+    /// A sticky index at the start of `quote` in the text (one place, read
+    /// once): what a discussion anchored there stores (docs/DISCUSSIONS_CONTRACT.md
+    /// section 6). Plain yrs bytes, which rinch's editor resolves too.
+    pub fn sticky_at_quote(&self, quote: &str) -> Result<Vec<u8>> {
+        let spot = links::quote_spot(&self.doc, &self.content(), quote).map_err(CrdtError::Refused)?;
+        self.anchor_at(spot)
+            .and_then(|a| a.sticky)
+            .ok_or_else(|| CrdtError::Refused("That place in the text cannot be named.".into()))
+    }
+
     /// Where `anchor` is in the content now: by its sticky index, else by its
     /// quote, else `None` (docs/LINKS_CONTRACT.md "Following a link").
     pub fn resolve_anchor(&self, anchor: &Anchor) -> Option<Resolved> {
