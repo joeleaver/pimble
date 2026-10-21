@@ -91,7 +91,11 @@ unhosted store (`docs/RELAY_CONTRACT.md`):
   contract's "Later" item), judged by the same agent principal.
 - The accounts service gives the agent a public address, `https://pimble.app/mcp/<agent
   id>`, and pipes its connections through the existing relay tunnel to this computer.
-  It stores nothing and can read nothing (the tunnel carries TLS to the relay face).
+  **Correction (2026-10-21): it could read what passes.** A share's traffic through the
+  relay is end-to-end encrypted, because members decrypt on their own devices; a remote
+  agent cannot decrypt, so this computer answers it in plain text, and the agent's HTTPS
+  ends at pimble.app's edge. Pimble Cloud would see note content in transit (in memory,
+  not stored). Joe chose to investigate keeping it blind first (section 9).
 - The remote client authenticates with OAuth to Pimble Cloud (the usual way remote MCP
   connectors sign in; each client's exact requirements are checked when this is built); the consent screen names the agent and its grants. The accounts
   service mints a short-lived token naming that agent alone, as it does for a relayed
@@ -233,3 +237,31 @@ snippet instead. Removing an agent removes its entry the same way.
 - Removing an agent does not take its entry out of the app's config (the key stops
   working at once; the stale entry answers with the removed-agent sentence).
 - The browser shows no Agents window; it gets one with remote agents (wave 4).
+
+## 9. Remote agents and Pimble Cloud's blindness (investigated 2026-10-21)
+
+**jkbase cannot pass TLS through today.** Its edge terminates TLS for every request:
+`docs/managed-rhypedb-design.md` ("the edge is HTTP-only (hyper `http1::serve_connection`),
+no L4/SNI passthrough"), and the TCP-ingress design that followed
+(`docs/managed-rhypedb-tcp-ingress-design.md` section 4) also terminates TLS at the edge
+and demuxes by ALPN before relaying plaintext inward. The L4 work is UDP
+(`docs/managed-l4-udp-ingress-design.md`). Wildcard certificates exist
+(`docs/wildcard-domains.md`), but they are the edge's, not a tenant machine's. So any
+remote agent reaching pimble.app is decrypted by jkbase's edge and then by Pimble Cloud.
+
+Ways to keep Pimble Cloud (and jkbase) blind, none built:
+
+1. **SNI passthrough in jkbase** (Joe's platform; a feature request, never an edit from
+   Pimble's side): connections to `<agent>.agents.pimble.app` are spliced, still
+   encrypted, through the existing tunnel to the owner's computer, which holds that
+   name's certificate (issued by ACME DNS-01 through Pimble Cloud, which never holds the
+   private key). The edge would route on the ClientHello's SNI without terminating.
+2. **A passthrough relay outside jkbase**: a small SNI router on a separate host doing
+   the same. New infrastructure to run and secure.
+3. **The person's own tunnel**: Tailscale Funnel or Cloudflare Tunnel in TLS-passthrough
+   mode, TLS ending on their computer; Pimble would only configure it. Needs an account
+   with that service, and is not "it just works".
+4. **Accept transit plaintext**, said plainly when a remote agent is turned on (the AI
+   service reads the same content anyway); never stored or logged.
+
+Until Joe chooses, remote agents (wave 4) are not built; local agents are complete.
