@@ -980,6 +980,25 @@ pub(crate) const APP_CSS: &str = "
     pointer-events: none;
 }
 
+/* A picture's corner: drag to resize it (text_boards.rs `render_controls`). */
+.pimble-picture-overlay__resize {
+    position: absolute;
+    right: -6px;
+    bottom: -6px;
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+    background: var(--rinch-primary-color);
+    border: 2px solid var(--rinch-color-body);
+    cursor: nwse-resize;
+    pointer-events: auto;
+}
+
+.pimble-picture-overlay--resizing {
+    outline: 2px dashed var(--rinch-primary-color);
+    outline-offset: -1px;
+}
+
 .pimble-picture-controls {
     position: absolute;
     top: 6px;

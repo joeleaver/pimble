@@ -150,9 +150,15 @@ A board node shown inside another node's text, as a picture, live (Joe, 2026-10-
   the text shows a whiteboard as people draw on it. Size: the board's natural size (one
   CSS pixel per board unit) capped at the pane's width, or a width the atom's `width`
   attribute sets (resizing pictures, from the images contract's "Later", applies to both).
-- **Clicking** an embedded board opens it in the focused pane; Ctrl+click opens it in
-  split view, as links do. "Mark Up..." on an embed opens the board node itself, so there
-  is never a second copy of its marks.
+- **Clicking** an embedded board selects it, like any picture (Joe, 2026-10-20: a click
+  should not navigate). Ctrl/Cmd+click opens it in the pane, as a link is followed, and so
+  does a double-click; "Open Board" on its menu too. "Mark Up..." on an embed opens the
+  board node itself, so there is never a second copy of its marks.
+- **Resizing** (Joe, 2026-10-20, for embeds and pictures alike): the corner handle on the
+  controls over a picture or embed drags its width, keeping its proportions, with a
+  dashed outline of the new size; the release writes the atom's `width` (CSS pixels,
+  at least 32, at most the text's width) as one edit of the text, so every device shows
+  the same size. A read-only text has no handle.
 - **It is a link**: it follows the board's `became` when the board moves out of a share
   or between stores, counts in the board's backlinks, and is offered when "Recently
   Deleted" lists the board. A board that is deleted, not here yet, or that this person

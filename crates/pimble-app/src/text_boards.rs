@@ -894,6 +894,22 @@ pub(crate) fn write_board_attr(pane: PaneId, src: &str, hint: usize, board: &str
     })
 }
 
+/// Set the width the picture `src` (with markup board `board`) shows at in
+/// pane `pane`'s text: the atom's `width`, through the editor, so it is one
+/// more co-edited edit of the text and every device shows the same size.
+fn write_width(pane: PaneId, src: &str, board: Option<&str>, hint: usize, width: i64) -> bool {
+    let (src, board) = (src.to_string(), board.map(str::to_string));
+    crate::editor::editor(pane).update(move |state| {
+        let pos = find_image(&state.doc, &src, board.as_deref(), hint)?;
+        let mut tr = state.tr();
+        tr.step(Box::new(SetNodeAttrStep::new(pos, "width", AttrValue::Int(width)))).ok()?;
+        Some(tr)
+    })
+}
+
+/// The narrowest a picture can be made by dragging its corner.
+const MIN_PICTURE_PX: f32 = 32.0;
+
 /// An image atom showing board node `url`, titled `title`.
 pub(crate) fn embed_node(schema: &rinch_editor_core::Schema, url: &BoardUrl, title: &str) -> Option<EditorNode> {
     let attrs = Attrs::new().with("src", AttrValue::from(url.to_string())).with("alt", AttrValue::from(title));
@@ -1164,8 +1180,10 @@ fn now_ms() -> f64 {
     }
 }
 
-/// A release in pane `pane`: on an embed it opens the board (Ctrl/Cmd: in
-/// split view), the second of a double-click on a picture marks it up.
+/// A release in pane `pane`: Ctrl/Cmd on an embed opens its board, as a link
+/// is followed; a plain click leaves the embed selected, like any picture
+/// (Joe, 2026-10-20: clicking an embedded board should not navigate). The
+/// second of a double-click opens an embed's board, or marks a picture up.
 /// Releases over the controls are theirs.
 pub(crate) fn pane_mouseup(store: AppStore, pane: PaneId) {
     if OVER.with(|o| o.borrow()[pane.index()]) {
@@ -1185,8 +1203,8 @@ pub(crate) fn pane_mouseup(store: AppStore, pane: PaneId) {
     if selection.from() != selection.to() && (selection.from().0, selection.to().0) != (hover.pos, hover.pos + 1) {
         return;
     }
-    if let Some(url) = &hover.embed {
-        open_embed(store, pane, url, ctx.modifiers.ctrl || ctx.modifiers.meta);
+    if let (Some(url), true) = (&hover.embed, ctx.modifiers.ctrl || ctx.modifiers.meta) {
+        open_embed(store, pane, url, false);
         return;
     }
     let now = now_ms();
@@ -1197,8 +1215,12 @@ pub(crate) fn pane_mouseup(store: AppStore, pane: PaneId) {
         l[pane.index()] = if double { (0.0, usize::MAX) } else { (now, hover.pos) };
         double
     });
-    if double && hover.is_picture() {
-        mark_up(store, pane, &hover);
+    if double {
+        match &hover.embed {
+            Some(url) => open_embed(store, pane, url, false),
+            None if hover.is_picture() => mark_up(store, pane, &hover),
+            None => {}
+        }
     }
 }
 
@@ -1347,6 +1369,8 @@ pub(crate) fn render_controls(__scope: &mut RenderScope, store: AppStore, pane: 
     APP.with(|a| a.set(Some(store)));
     let state = store.pane(pane);
     let menu_open = Signal::new(false);
+    // The width a corner drag would give the picture, while one is under way.
+    let resizing: Signal<Option<f32>> = Signal::new(None);
     let read_only = move || {
         state
             .active_edit
@@ -1366,8 +1390,14 @@ pub(crate) fn render_controls(__scope: &mut RenderScope, store: AppStore, pane: 
     };
     rsx! {
         div {
-            class: "pimble-picture-overlay",
+            class: {move || if resizing.get().is_some() { "pimble-picture-overlay pimble-picture-overlay--resizing" } else { "pimble-picture-overlay" }},
             style: {move || match state.picture.get() {
+                // A corner drag shows the size the picture will take,
+                // keeping its proportions; it takes it on release.
+                Some(PictureHover { rect: (x, y, w, h), .. }) if resizing.get().is_some() && w > 0.0 => {
+                    let nw = resizing.get().unwrap_or(w);
+                    format!("left: {x:.1}px; top: {y:.1}px; width: {nw:.1}px; height: {:.1}px;", h * nw / w)
+                }
                 Some(PictureHover { rect: (x, y, w, h), .. }) if !state.markup.get() => {
                     // Inside the text's box: a tall picture scrolled half
                     // out of view keeps its controls in sight.
@@ -1383,6 +1413,55 @@ pub(crate) fn render_controls(__scope: &mut RenderScope, store: AppStore, pane: 
                 }
                 _ => "display: none;".to_string(),
             }},
+            div {
+                class: "pimble-picture-overlay__resize",
+                title: "Drag to resize",
+                style: {move || if read_only() { "display: none;" } else { "" }},
+                onmouseenter: move || {
+                    OVER.with(|o| o.borrow_mut()[pane.index()] = true);
+                    cancel_hide(pane);
+                },
+                onmouseleave: move || {
+                    if untracked(|| resizing.get()).is_none() {
+                        OVER.with(|o| o.borrow_mut()[pane.index()] = false);
+                        hide_later(store, pane);
+                    }
+                },
+                onmousedown: move || {
+                    let Some(hover) = untracked(|| state.picture.get()) else { return };
+                    if untracked(read_only) || hover.rect.2 <= 0.0 {
+                        return;
+                    }
+                    let from = rinch::core::get_click_context().mouse_x;
+                    let width = hover.rect.2;
+                    let widest = text_bounds(pane)
+                        .map(|b| untracked(|| b.get().width))
+                        .filter(|w| *w > 0.0)
+                        .map_or(MAX_TEXT_PX, |w| (w - 64.0).max(MIN_PICTURE_PX))
+                        .max(width);
+                    // The controls stay up through the drag, which leaves the
+                    // picture as soon as it narrows it.
+                    OVER.with(|o| o.borrow_mut()[pane.index()] = true);
+                    cancel_hide(pane);
+                    resizing.set(Some(width));
+                    let done = move || {
+                        resizing.set(None);
+                        OVER.with(|o| o.borrow_mut()[pane.index()] = false);
+                        hide_later(store, pane);
+                    };
+                    let hover_end = hover.clone();
+                    rinch::core::Drag::absolute()
+                        .on_move(move |px, _| resizing.set(Some((width + px - from).clamp(MIN_PICTURE_PX, widest))))
+                        .on_end(move |_, _| {
+                            if let Some(to) = untracked(|| resizing.get()).filter(|to| (to - width).abs() >= 1.0) {
+                                write_width(pane, &hover_end.src, hover_end.board.as_deref(), hover_end.pos, to.round() as i64);
+                            }
+                            done();
+                        })
+                        .on_cancel(move |_, _| done())
+                        .start();
+                },
+            }
             div {
                 class: "pimble-picture-controls",
                 onmouseenter: move || {
