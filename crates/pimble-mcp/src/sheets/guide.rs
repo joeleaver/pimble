@@ -30,8 +30,8 @@ needs no *24.
 - `Entries[[hours]:[billable]]`: a range of columns.
 - `Vehicles`: a whole table.
 - A bare table name means this note only; there are no global table names.
-- `Trips[[#Totals],[cost]]`: the cost cell of the table's first summary row (Excel's Total
-  Row); `Trips[[#Average],[cost]]`: the summary row named Average.
+- `Trips[[#Total],[cost]]`: the cost cell of the summary row named Total;
+  `Trips[[#Average],[cost]]` the one named Average. Excel's `[#Totals]` reads the row named Total.
 
 ## Pimble's extension: a dot follows a link
 

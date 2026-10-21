@@ -133,6 +133,9 @@ pub struct TableView {
     pub group_by: Option<String>,
     /// Drawn with its fields down the left (contract section 4c).
     pub rotated: bool,
+    /// Two summary rows of one name (a merge of two devices' edits): the
+    /// sentence that says so.
+    pub note: Option<String>,
     /// Changes whenever anything above does: the view keys a table by id and
     /// version, so a table that did not change keeps its DOM.
     pub version: u64,
@@ -1093,12 +1096,27 @@ fn table_view(engine: &Engine<'_>, book: &AppBook, snap: &SheetsSnap, computed: 
         groups,
         group_by,
         rotated: table.is_some_and(|t| t.rotated),
+        note: table.and_then(duplicate_summary_rows),
         version: 0,
     };
     let mut h = std::collections::hash_map::DefaultHasher::new();
     format!("{view:?}").hash(&mut h);
     view.version = h.finish();
     view
+}
+
+/// "Two summary rows here are called Total; rename one." when a merge left
+/// two of one name (contract section 5).
+fn duplicate_summary_rows(t: &pimble_sheet::TableSnap) -> Option<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for s in &t.summary_rows {
+        let n = s.name.to_lowercase();
+        if seen.contains(&n) {
+            return Some(format!("Two summary rows here are called {}; rename one.", s.name));
+        }
+        seen.push(n);
+    }
+    None
 }
 
 /// Recompute pane `pane`'s tables and hand them to the view.

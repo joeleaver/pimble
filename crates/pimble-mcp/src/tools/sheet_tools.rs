@@ -828,8 +828,8 @@ impl Pimble {
     /// Add a summary row under a plain table's rows: totals, averages, counts
     /// or a formula per column (docs: summary rows). The bottom rows sum
     /// every row; a grouped table (group_table) also shows them under each
-    /// group as subtotals. Other formulas read the first summary row as
-    /// Table[[#Totals],[column]] and any by name as Table[[#Average],[column]].
+    /// group as subtotals. Other formulas read a summary row by name:
+    /// Table[[#Total],[column]], Table[[#Average],[column]].
     #[tool(name = "add_summary_row")]
     async fn add_summary_row(&self, Parameters(p): Parameters<AddSummaryRowParams>) -> Result<String, String> {
         let client = self.client().await?;

@@ -1439,8 +1439,14 @@ impl<'b> Engine<'b> {
         cols: &[TabCol<'b>],
         idx: &[usize],
     ) -> Result<Val, FormulaError> {
+        // `[#Totals]` is Excel's Total Row: here, the summary row named
+        // Total (Joe, 2026-10-21), whatever order the rows are in. Two of
+        // that name (a merge of two devices' edits) is said, never guessed.
+        if spec.summary.is_none() && table.summary_rows.iter().filter(|s| norm(&s.name) == "total").count() > 1 {
+            return Err(FormulaError::reference(format!("Two summary rows of {} are called Total, so [#Totals] can't tell which it means; rename one", table.name)));
+        }
         let s = match &spec.summary {
-            None => table.summary_rows.first(),
+            None => table.summary_rows.iter().find(|s| norm(&s.name) == "total"),
             Some(p) => match &p.name {
                 NameRef::Id(id) => table.summary_row(id),
                 NameRef::Name(n) => table.summary_rows.iter().find(|s| norm(&s.name) == norm(n)),
@@ -1448,8 +1454,10 @@ impl<'b> Engine<'b> {
             },
         };
         let Some(s) = s else {
+            let names: Vec<&str> = table.summary_rows.iter().map(|s| s.name.as_str()).collect();
             return Err(FormulaError::reference(match (&spec.summary, table.summary_rows.is_empty()) {
                 (_, true) => format!("{} has no summary rows", table.name),
+                (None, false) => format!("[#Totals] reads the summary row called Total, and {} has none; its summary rows are {}", table.name, names.join(", ")),
                 (Some(SummaryPiece { name: NameRef::Name(n), .. }), false) => format!("{} has no summary row \"{n}\"", table.name),
                 _ => "That summary row was deleted".to_string(),
             }));

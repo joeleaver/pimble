@@ -173,3 +173,44 @@ fn a_summary_row_that_reads_itself_is_circ() {
     // The rest still computes.
     assert_eq!(summary(&t, "Total").values[col(&t, "amount")], Value::Number(600.0));
 }
+
+#[test]
+fn totals_reads_the_row_called_total_whatever_the_order() {
+    let mut b = spending(true);
+    b.table_mut(NOTE, "ex").summary_rows.reverse();
+    let en = Engine::new(&b);
+    let t = en.compute_table(&here(), "ex").unwrap();
+    assert_eq!(t.rows[0].values[col(&t, "share")], Value::Number(0.5), "still the Total row, now last");
+    let mut renamed = spending(true);
+    renamed.table_mut(NOTE, "ex").summary_rows[0].name = "Sum".into();
+    let en = Engine::new(&renamed);
+    let t = en.compute_table(&here(), "ex").unwrap();
+    match &t.rows[0].values[col(&t, "share")] {
+        Value::Error(e) => assert!(e.message.contains("[#Totals] reads the summary row called Total"), "{}", e.message),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn two_rows_called_total_are_said_not_guessed() {
+    // Two devices each named a row Total while apart.
+    let mut b = spending(true);
+    b.table_mut(NOTE, "ex").summary_rows[1].name = "total".into();
+    let en = Engine::new(&b);
+    let t = en.compute_table(&here(), "ex").unwrap();
+    match &t.rows[0].values[col(&t, "share")] {
+        Value::Error(e) => assert!(e.message.contains("Two summary rows of Expenses are called Total"), "{}", e.message),
+        other => panic!("{other:?}"),
+    }
+    // A reference stored by id still reads its own row: Per night is $200.
+    let stored = formula::to_stored(&b, None, "Expenses[[#Per night],[amount]]").unwrap();
+    assert!(stored.contains("#{s:pn}"), "{stored}");
+    assert_eq!(per_night(&b, &stored), Value::Number(200.0));
+}
+
+fn per_night(b: &TestBook, stored: &str) -> Value {
+    match Engine::new(b).evaluate(&here(), None, None, &formula::to_shown(b, None, stored)) {
+        Ok(formula::Evaluated::Value(v)) => v,
+        other => panic!("{other:?}"),
+    }
+}

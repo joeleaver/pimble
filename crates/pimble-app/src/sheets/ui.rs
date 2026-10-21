@@ -164,7 +164,7 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
             }
         }
     });
-    let error = t.error.clone().map(|e| rsx! { div { class: "pimble-sheet__error", {e} } });
+    let error = t.error.clone().or_else(|| t.note.clone()).map(|e| rsx! { div { class: "pimble-sheet__error", {e} } });
 
     let heads: Vec<NodeHandle> = columns
         .iter()

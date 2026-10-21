@@ -225,10 +225,12 @@ in a Map, so last writer wins per cell, as cells do.
 - **Collapsing** a group (its header's chevron) shows only its header and subtotals;
   "Collapse All" turns the table into its summary. What is collapsed is the viewer's own,
   per pane and for as long as the pane shows the table, never in the document.
-- **Reading them from formulas**, Excel's way: `Trips[[#Totals],[cost]]` is the cost cell of
-  the table's first summary row (Excel's Total Row), and `Trips[[#Average],[cost]]` reads the
-  summary row named Average (a `#` part that is not one of Excel's: `#All`, `#Data`,
-  `#Headers`, `#This Row`, `#Totals`). Stored by id, `{s:<id>}`, so renaming the row edits no
+- **Reading them from formulas**, by name: `Trips[[#Total],[cost]]` is the cost cell of the
+  summary row named Total, `Trips[[#Average],[cost]]` the one named Average (a `#` part that is
+  not one of Excel's: `#All`, `#Data`, `#Headers`, `#This Row`). Excel's own `[#Totals]` (its
+  one Total Row) reads the summary row named Total, so a formula pasted from Excel works;
+  where there is none it says so. Never "the first summary row": reordering the rows changes
+  no formula (Joe, 2026-10-21, "I don't know if #Totals makes any sense at all"). Stored by id, `{s:<id>}`, so renaming the row edits no
   formula. Only the bottom rows are read this way; a subtotal is the `SUMIFS` it stands for.
   A summary row may read another summary row; one that reads itself is `#CIRC!`.
 - **Summary rows are not data rows**: `COUNTA(Trips[name])`, `FILTER`, a link column's
@@ -248,8 +250,7 @@ settings from a press on any of its cells, "Group by This Column"/"Ungroup" in a
 settings, group headers that collapse, "Collapse All"), and the four MCP tools with the
 formula guide's section. Checked in the release desktop app on a scratch store and in the
 browser on the local stack (an encrypted store): totals, count, a formula over each scope,
-grouping with subtotals, collapsing. **Open (Joe's):** `#Totals` is the first summary row,
-so reordering the rows changes what it reads.
+grouping with subtotals, collapsing.
 
 ## 4c. Rotation (Joe, 2026-10-21)
 
@@ -297,6 +298,11 @@ and in the browser on the local stack (rotated, a summary column). Copy waits fo
   one offline). Nothing breaks, because formulas point at ids. The note says "Two tables
   here are called Expenses" until one is renamed.
 - **A column name** is unique within its table, by the same rule.
+- **A summary row's name** is unique within its table, by the same rule (section 4b), and
+  none is one of Excel's names for a part of a table. A merge can leave two of one name; a
+  formula that names a row points at its id, so it keeps reading its row, and the table
+  says "Two summary rows here are called Total; rename one". `[#Totals]`, which names the
+  row called Total, answers that sentence while there are two, rather than guess.
 - **Node titles are never required to be unique** (Joe, 2026-10-19). A personal tree is
   full of "Notes" and "Budget".
 - **A name never decides what a stored formula points at.** Names exist for typing and

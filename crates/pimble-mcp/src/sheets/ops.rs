@@ -766,7 +766,15 @@ fn render_summary_rows(engine: &Engine<'_>, book: &McpBook, t: &TableSnap, ct: &
         format!("{}: {}", s.name, if parts.is_empty() { "nothing yet".to_string() } else { parts.join(", ") })
     };
     if !ct.summary_rows.is_empty() {
-        out.push_str("summary rows (read with Table[[#Totals],[column]] for the first, Table[[#Name],[column]] by name):\n");
+        out.push_str("summary rows (read one by name: Table[[#Total],[column]], Table[[#Average],[column]]):\n");
+        let mut seen: Vec<String> = Vec::new();
+        for s in &ct.summary_rows {
+            if seen.contains(&norm(&s.name)) {
+                out.push_str(&format!("(two summary rows are called {}; rename one with update_summary_row)\n", s.name));
+                break;
+            }
+            seen.push(norm(&s.name));
+        }
         for s in &ct.summary_rows {
             out.push_str(&format!("- {}\n", line(s)));
         }
