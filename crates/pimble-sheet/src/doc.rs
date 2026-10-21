@@ -81,6 +81,7 @@ pub(crate) mod keys {
     pub const FORMULA: &str = "formula";
     pub const FORMAT: &str = "format";
     pub const GROUP_BY: &str = "group_by";
+    pub const ROTATED: &str = "rotated";
     /// The prefix of a summary row's key in its table's map (contract 4b).
     pub const SUMMARY_ROW_PREFIX: &str = "sum:";
     // Cell shapes.
@@ -443,6 +444,9 @@ impl<'a, 'doc> SheetsTxn<'a, 'doc> {
         if let Some(g) = &table.group_by {
             t.insert(self.txn, GROUP_BY, g.clone());
         }
+        if table.rotated {
+            t.insert(self.txn, ROTATED, true);
+        }
         let rows: MapRef = t.insert(self.txn, ROWS, MapPrelim::default());
         for row in &table.rows {
             let r: MapRef = rows.insert(self.txn, row.id.clone(), MapPrelim::default());
@@ -750,6 +754,18 @@ impl<'a, 'doc> SheetsTxn<'a, 'doc> {
             None => {
                 t.remove(self.txn, GROUP_BY);
             }
+        }
+        Ok(())
+    }
+
+    /// Draw the table rotated (its fields down the left), or not (contract
+    /// section 4c).
+    pub fn set_rotated(&mut self, table: &str, rotated: bool) -> Result<()> {
+        let t = self.table_map(table)?;
+        if rotated {
+            t.insert(self.txn, ROTATED, true);
+        } else {
+            t.remove(self.txn, ROTATED);
         }
         Ok(())
     }
@@ -1130,6 +1146,7 @@ fn read_table<T: ReadTxn>(txn: &T, id: &str, t: &MapRef) -> TableSnap {
         source: get_string(txn, t, SOURCE),
         headers,
         group_by: get_string(txn, t, GROUP_BY).filter(|g| known.contains(g.as_str())),
+        rotated: matches!(t.get(txn, ROTATED), Some(Out::Any(Any::Bool(true)))),
         columns,
         rows,
         summary_rows,

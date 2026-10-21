@@ -244,6 +244,9 @@ pub struct TableSnap {
     pub summary_rows: Vec<SummaryRowSnap>,
     /// The column its rows are grouped by, when they are.
     pub group_by: Option<String>,
+    /// Drawn with its fields down the left and each record as a column
+    /// (contract section 4c); only the drawing turns.
+    pub rotated: bool,
 }
 
 impl TableSnap {

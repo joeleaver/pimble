@@ -267,6 +267,17 @@ pub struct SummaryRowParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct RotateTableParams {
+    /// The node holding the table.
+    pub node: String,
+    /// The table's name.
+    pub table: String,
+    /// true draws it rotated (fields down the left, each record a column),
+    /// false a record per row.
+    pub rotated: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct GroupTableParams {
     /// The node holding the table.
     pub node: String,
@@ -856,6 +867,18 @@ impl Pimble {
         let client = self.client().await?;
         let addr = nodes::resolve(&client, &p.node).await?;
         self.sheet_edit(&client, addr, &[], |w| ops::group_table(w, &p.table, p.column.as_deref())).await
+    }
+
+    /// Draw a table rotated, its fields down the left and each record a
+    /// column (for few records with many fields: comparing two trips, one
+    /// person's details), or back to a record per row. Only the drawing
+    /// turns: formulas, rows and get_table are unchanged. Use it rather than
+    /// building a comparison out of SWITCH/INDEX formulas.
+    #[tool(name = "rotate_table")]
+    async fn rotate_table(&self, Parameters(p): Parameters<RotateTableParams>) -> Result<String, String> {
+        let client = self.client().await?;
+        let addr = nodes::resolve(&client, &p.node).await?;
+        self.sheet_edit(&client, addr, &[], |w| ops::rotate_table(w, &p.table, p.rotated)).await
     }
 
     /// Rename a table; formulas that read it show the new name.

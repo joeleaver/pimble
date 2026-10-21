@@ -131,6 +131,8 @@ pub struct TableView {
     pub groups: Vec<GroupView>,
     /// The key of the column it is grouped by.
     pub group_by: Option<String>,
+    /// Drawn with its fields down the left (contract section 4c).
+    pub rotated: bool,
     /// Changes whenever anything above does: the view keys a table by id and
     /// version, so a table that did not change keeps its DOM.
     pub version: u64,
@@ -1090,6 +1092,7 @@ fn table_view(engine: &Engine<'_>, book: &AppBook, snap: &SheetsSnap, computed: 
         summary_rows,
         groups,
         group_by,
+        rotated: table.is_some_and(|t| t.rotated),
         version: 0,
     };
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1712,6 +1715,15 @@ fn move_typing(store: AppStore, pane: PaneId, key: &CellKey, row: Option<String>
     }
     let Some(snap) = snapshot(pane) else { return };
     let Some(table) = snap.table(&key.table) else { return };
+    // Rotated, the screen's down is the record's next field and its right the
+    // next record (contract section 4c).
+    let mv = match (table.rotated, mv) {
+        (false, mv) => mv,
+        (true, Move::Down) => return move_rotated(store, pane, table, key, row, true),
+        (true, Move::Up) => return move_rotated(store, pane, table, key, row, false),
+        (true, Move::Right) => Move::Down,
+        (true, Move::Stay) => Move::Stay,
+    };
     let typed: Vec<&str> = table
         .columns
         .iter()
@@ -1749,6 +1761,16 @@ fn move_typing(store: AppStore, pane: PaneId, key: &CellKey, row: Option<String>
     };
     if !next.col.is_empty() {
         begin_typing(store, pane, next);
+    }
+}
+
+/// In a rotated table, the record's next (or previous) typed field.
+fn move_rotated(store: AppStore, pane: PaneId, table: &pimble_sheet::TableSnap, key: &CellKey, row: Option<String>, down: bool) {
+    let typed: Vec<&str> = table.columns.iter().filter(|c| !matches!(c.ty, ColumnType::Formula { .. })).map(|c| c.id.as_str()).collect();
+    let Some(i) = typed.iter().position(|c| *c == key.col) else { return };
+    let next = if down { typed.get(i + 1) } else { i.checked_sub(1).and_then(|j| typed.get(j)) };
+    if let Some(col) = next {
+        begin_typing(store, pane, CellKey { table: key.table.clone(), row, col: col.to_string() });
     }
 }
 
@@ -2155,6 +2177,12 @@ pub(crate) fn move_summary_row(store: AppStore, pane: PaneId, up: bool) {
         (false, i) => Placement::After(ids[i + 1].to_string()),
     };
     local_edit(store, pane, |t| t.move_summary_row(&form.table, &form.row, placement));
+}
+
+/// Draw a table rotated, or a record per row again (contract section 4c).
+pub(crate) fn rotate_table(store: AppStore, pane: PaneId, table: &str, rotated: bool) {
+    aim(pane, Some(table));
+    local_edit(store, pane, |t| t.set_rotated(table, rotated));
 }
 
 /// Group a table's rows by a column, or (with `None`) ungroup them.

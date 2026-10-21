@@ -615,6 +615,9 @@ pub fn render_table(work: &Work, table: &str, filter: &Filter) -> Result<String,
     let ct = compute(&engine, home, table)?;
     let mut out = format!("### {}\n", t.name);
     out.push_str(&format!("table id: {}\n", t.id));
+    if t.rotated {
+        out.push_str("drawn rotated: its fields down the left and a record per column (the rows below are its records)\n");
+    }
     if let Some(source) = &t.source {
         out.push_str(&format!("summary of: {}\n", formula::to_shown(book, Some(&t.id), source)));
         if let Some(e) = &ct.error {
@@ -884,6 +887,16 @@ pub fn remove_summary_row(work: &mut Work, table: &str, row: &str) -> Result<Str
         out.push_str(&format!(" These formulas read it and now show #REF!: {}.", reading.join(", ")));
     }
     Ok(out)
+}
+
+pub fn rotate_table(work: &mut Work, table: &str, rotated: bool) -> Result<String, String> {
+    let t = find_table(work.snap(), table)?.clone();
+    work.write(|txn| txn.set_rotated(&t.id, rotated))?;
+    Ok(if rotated {
+        format!("{} is drawn rotated now: its fields down the left, each record a column. Formulas and rows are unchanged.", t.name)
+    } else {
+        format!("{} is drawn with a record per row again.", t.name)
+    })
 }
 
 pub fn group_table(work: &mut Work, table: &str, column: Option<&str>) -> Result<String, String> {

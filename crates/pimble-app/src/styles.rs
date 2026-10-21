@@ -1304,6 +1304,36 @@ pub(crate) const APP_CSS: &str = "
     color: var(--rinch-color-dimmed);
 }
 
+/* A rotated table (docs/SHEETS_CONTRACT.md section 4c): field names down
+   the left, the first field's row as the records' headers. */
+.pimble-sheet__rot-name {
+    border-right: 1px solid var(--rinch-color-border);
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+
+.pimble-sheet__rot-head {
+    font-weight: 600;
+}
+
+.pimble-sheet__rot-corner {
+    border-bottom: 1px solid var(--rinch-color-border);
+}
+
+.pimble-sheet__rot-stub {
+    min-width: 24px;
+    background: var(--rinch-color-surface);
+}
+
+.pimble-sheet__group--band {
+    grid-column: auto;
+    border-right: 1px solid var(--rinch-color-border);
+}
+
+.pimble-sheet__summary-cell--sub {
+    font-weight: 500;
+    background: transparent;
+}
+
 .pimble-sheet__group-count {
     font-weight: 400;
     font-size: 12px;

@@ -251,6 +251,45 @@ browser on the local stack (an encrypted store): totals, count, a formula over e
 grouping with subtotals, collapsing. **Open (Joe's):** `#Totals` is the first summary row,
 so reordering the rows changes what it reads.
 
+## 4c. Rotation (Joe, 2026-10-21)
+
+Some data reads better with its headings along the rows: few records with many fields (two
+trips compared, one person's details, a budget's months). A table can be **rotated**: drawn
+with its fields down the left and each record as a column. Joe's agent had built one by
+hand, a "criterion" column with a `SWITCH`/`INDEX` formula per cell, which is what this
+replaces.
+
+- **Only the drawing turns.** Underneath, a table keeps its fields and records: `[@miles]`
+  is still this record's miles, `Trips[miles]` all of them, and links, search, sync and the
+  MCP's rows are unchanged.
+- **The table's setting** (Joe): `rotated: true` on the table's map, absent otherwise, one
+  value with the last writer winning, so everyone sees it rotated, as with grouping. "Rotate
+  Table" on the table's title row turns it on and off. Old apps ignore the key and draw the
+  table unrotated.
+- **Along the top**, each record's first field (Joe): its first field's row is the header
+  row, the same label a link to the record shows, edited in place. Down the left, the field
+  names, a press on one opening that field's settings as a header does now.
+- **Adding**: a record is the "+" column at the right (its first cell "Add a record…"); a
+  field is the "+" at the bottom of the names.
+- **Formula fields** are shaded rows; **summary rows** are summary columns at the right,
+  their name in the header row; **groups** are bands of columns under a header that spans
+  them, each followed by its subtotal columns, collapsing the same way.
+- **Keys**: Enter (and ↓) goes to the record's next field, Tab (and →) to the next record's
+  same field, as the screen reads.
+- **Copy** (section 11) copies what is seen: a rotated selection pastes rotated.
+- **MCP**: `rotate_table` (on or off); `get_table` says a table is drawn rotated, and still
+  lists records as rows.
+
+**Built (2026-10-21, branch `summary-rows`).** `TableSnap::rotated`,
+`SheetsTxn::set_rotated`; "Rotate Table"/"Unrotate" on a table's title row; the rotated grid
+(`sheets/ui.rs` `rotated_grid`: a fixed first column for the field names and implicit columns
+after it, every cell pinned to its field's grid row, so a collapsed group's hidden record
+columns leave no gaps); keys swapped as the screen reads; `rotate_table` in the MCP and the
+guide. Checked in the release desktop app (records as columns, summary columns, a new
+record typed in with Enter going to its next field, grouped and collapsed, unrotated again)
+and in the browser on the local stack (rotated, a summary column). Copy waits for copy itself
+(section 11, wave 4).
+
 ## 5. Names, and what is unique
 
 - **A table name** is unique within its note when it is set: a second "Expenses" in the

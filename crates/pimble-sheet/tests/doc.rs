@@ -1005,3 +1005,19 @@ fn a_copied_table_keeps_its_summary_rows_and_grouping() {
     assert_eq!(copy.summary_rows, original.summary_rows);
     assert_eq!(copy.group_by, original.group_by);
 }
+
+#[test]
+fn a_table_is_rotated_and_turned_back() {
+    let mut f = fixture();
+    assert!(!Sheets::of_node(&f.b).table(&f.table).unwrap().rotated);
+    let (_, update) = Sheets::of_node(&f.a).edit(|t| t.set_rotated(&f.table, true)).into_result().unwrap();
+    send(update, &mut f.b);
+    let rotated = Sheets::of_node(&f.b).table(&f.table).unwrap();
+    assert!(rotated.rotated, "everyone sees it rotated");
+    let other = node();
+    Sheets::of_node(&other).edit(|t| t.copy_table(&rotated)).into_result().unwrap();
+    assert!(Sheets::of_node(&other).table(&f.table).unwrap().rotated, "and a copy is too");
+    let (_, update) = Sheets::of_node(&f.a).edit(|t| t.set_rotated(&f.table, false)).into_result().unwrap();
+    send(update, &mut f.b);
+    assert!(!Sheets::of_node(&f.b).table(&f.table).unwrap().rotated);
+}

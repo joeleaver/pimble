@@ -58,6 +58,10 @@ group_table groups the rows by a column (a formula column too, like
 `=TEXT([@date],"yyyy-mm")` for months), and the summary rows then also show under each
 group as subtotals. Prefer these to a summary table for totals and per-group totals.
 
+A table with few records and many fields (two trips compared, one person's details) can be
+drawn rotated with rotate_table: fields down the left, each record a column. Do that rather
+than building the comparison out of SWITCH/INDEX formulas.
+
 ## Summaries
 
 A summary is a table whose rows come from one dynamic-array formula (set_summary): GROUPBY,

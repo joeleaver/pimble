@@ -290,6 +290,7 @@ impl TB {
                 rows: Vec::new(),
                 summary_rows: Vec::new(),
                 group_by: None,
+                rotated: false,
             },
         }
     }
