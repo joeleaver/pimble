@@ -1,6 +1,6 @@
 # Discussions contract: threaded conversations anywhere
 
-Status: **wave 1 built** (branch `discussions`, not merged; "Built in wave 1" at the end says what exists and how it was checked); every question asked so far is answered. Written on 2026-10-21 from a conversation with Joe: "a
+Status: **waves 1 to 5 built** (branch `discussions`, not merged; the "Built in ..." sections at the end say what exists, how it was checked and what is missing; margin markers wait for rinch #1683, the commenter role is wave 6); every question asked so far is answered. Written on 2026-10-21 from a conversation with Joe: "a
 new node/embed type, discussions. A little like comments, but a way to put a threaded,
 replyable discussion anywhere." His answers that day are listed under "Decisions" at the
 end. The questions still open are his and are listed under "Open decisions".
@@ -525,3 +525,59 @@ Not done or not seen:
   app with an agent on one local server); a share member's reply reaching the owner.
 - Readers see no message box; commenters do not exist yet (wave 6).
 - Color emoji with `--cpu` (rinch #804: the software renderer draws no bitmap color font).
+
+## Built in waves 2 to 5 (2026-10-21, branch `discussions`, rinch `main` 4c5b5fb)
+
+**Wave 2, discussions in text (all but the margin markers).** The app's discussion module
+holds a discussion per *slot*: a pane, or an inline atom in a pane's text
+(`discussions::Slot`), so any number show at once and stay in step. An `embed` atom with
+`data-kind="discussion"` and `data-node` is drawn by a rinch node view as the pane's view
+in a box (topic, thread scrolling inside, message box, "Open" beside the text). Edit >
+"Insert Discussion" anchors a new attached discussion at the caret (rinch's
+`collab_sticky_index_with`, `StickyAssoc::After`) and inserts its atom where that anchor
+resolves when the discussion is made. MCP: `start_discussion` takes `after_text` (a quote:
+`NodeDoc::sticky_at_quote` makes a plain yrs sticky index, which rinch resolves too) and
+`inline` (writes the atom after the quoted block; the strict Markdown reader takes it only
+with attributes in rinch's own order); `get_node` names each inline discussion, a node's
+count and a discussion's thread. Checked in the release app: insert, post inline, Open
+beside and replies both ways, an agent's inline discussion arriving live in an open note.
+**Not built:** margin markers and "Start a Discussion Here" (waiting for
+joeleaver/rinch#1683, margin anchors and the overlay slot), and the message box's own keys
+(joeleaver/rinch#1686; it uses the keyboard interceptor until then).
+
+**Wave 3, pins.** Board `Tool::Pin` (`q`) makes a discussion attached to the board node
+with an `Anchor::Board` at the point pressed and opens it beside; the board view draws a
+numbered pin per discussion anchored to its own board (`discussions::board_pins`,
+`boards::PinView`), following the camera, with an unread dot; a press opens its discussion.
+**Not built:** the popover (a pin opens its discussion in a pane), dragging a pin, pins on
+pictures in text.
+
+**Wave 4, read state and places on this device.** `pimble_discussion::Personal` (the
+personal document: `read` with a watermark and seen ids, compacted; `places` bounded at
+2,000), saved by the app a second after a change (`<data dir>/pimble/personal.yrs`, the
+browser's `localStorage` `pimble.personal`). A slot's unread messages are marked new (one
+"N new" line) and stay marked while it shows them; they count as read once it has been on
+screen a second. Unread counts on a note's list, a dot on its tree row and on pins, View >
+"Discussions..." (`listDiscussions`, every store open) listing what is unread, newest
+first. One's own messages, and every unauthored one, are never unread. Places: the
+selection as two sticky indexes, written when a pane leaves a note and five seconds after
+the caret rests, put back when it opens with nothing else naming a place. Checked: counts,
+dots, the list, opening from it, marking read, read state surviving a restart, a place
+written. **Not seen:** a place put back (the debug port cannot read the editor's selection);
+`top` (the first visible line) is not kept.
+
+**Wave 5, the personal document across devices.** Sealed with `pimble_crypto::personal_key`
+(HKDF of the account's encryption secret) and `personal_aad(user)`; the accounts service
+holds it as one `PersonalDoc` row (blob, version) under `GET`/`PUT`/`DELETE
+/api/v1/me/personal`, a `PUT` naming the version it replaces (409 makes the writer fetch,
+merge and write again). The desktop's local server does that for the app
+(`cloudPersonalSync`, `Service`-only); the browser does it itself (`web/src/personal_sync.rs`).
+Signing in syncs at once; changes go five seconds later; every device asks every minute.
+**Off is the account's**: the switch (the Account window, the browser's account page)
+empties the hosted copy, every device that meets the empty copy turns its own switch off,
+and a device that is turned on writes over it, which turns the others on again. Checked on
+the local stack with the desktop app and the browser as one account: the desktop's read
+state reaching the browser, off from the browser reaching the desktop within a minute, and
+on again. **Deploy note:** the accounts service's schema has a new type (`PersonalDoc`).
+
+Wave 6 (the commenter role) is not started.
