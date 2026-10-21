@@ -140,6 +140,7 @@ Pimble adds one `mcpServers.pimble-<agent name>` entry and touches nothing else:
 | --- | --- |
 | Claude Desktop | Linux `~/.config/Claude/claude_desktop_config.json`, Windows `%APPDATA%\Claude\claude_desktop_config.json`, macOS `~/Library/Application Support/Claude/claude_desktop_config.json` |
 | Claude Code | `claude mcp add` if `claude` is on the PATH, else `~/.claude.json` user scope |
+| ChatGPT desktop, Codex CLI and IDE extension | `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`): a `[mcp_servers.pimble-<name>]` table with `command` and an `env` table, merged with `toml_edit` so the file's comments and layout stay |
 | Cursor | `~/.cursor/mcp.json` |
 
 The entry names the installed `pimble-mcp` by absolute path (the self-updating install's
@@ -157,9 +158,8 @@ snippet instead. Removing an agent removes its entry the same way.
 2. **pimble-mcp**: `--agent` / `PIMBLE_AGENT_KEY`; no key refuses with the sentence.
 3. **App**: the Agents window, the tree picker, config writing for Claude Desktop,
    Claude Code and Cursor, the copy-paste fallback; desktop and web.
-4. **Remote** (in this same piece of work, Joe 2026-10-20): Streamable HTTP on the relay
-   face, `/mcp/<id>` and OAuth in the accounts service, the offline sentence. Last of
-   the waves, since it touches the hosted service, and deployed only with Joe's go.
+4. **Remote**: deferred (section 9). Every major desktop client reaches Pimble locally;
+   a public endpoint would expose plaintext to jkbase's edge and Pimble Cloud.
 
 ## 8. Decisions (Joe, 2026-10-20)
 
@@ -264,4 +264,24 @@ Ways to keep Pimble Cloud (and jkbase) blind, none built:
 4. **Accept transit plaintext**, said plainly when a remote agent is turned on (the AI
    service reads the same content anyway); never stored or logged.
 
-Until Joe chooses, remote agents (wave 4) are not built; local agents are complete.
+### Decided: remote agents are deferred (Joe, 2026-10-21)
+
+Every major desktop client now reaches Pimble locally, with nothing leaving the
+computer: Claude Desktop, Claude Code, Cursor, and the ChatGPT desktop app with Codex,
+which run local stdio MCP servers from `~/.codex/config.toml`
+(learn.chatgpt.com/docs/extend/mcp, checked 2026-10-21). Only the web versions
+(chatgpt.com, claude.ai) would need a public endpoint, and that is not built.
+
+An HTTPS web API instead of MCP would not change this: whatever a cloud-hosted agent
+calls must be public, so either Pimble Cloud answers it (and must hold readable notes:
+the keys, or a plaintext copy) or it forwards to this computer (the relay, decrypting at
+jkbase's edge without passthrough). The question is where plaintext lives, not the
+protocol. If remote agents are ever wanted, the choices are the four above, or a store
+the person deliberately hosts readable by their remote agents (a product decision of its
+own, outside end-to-end encryption).
+
+## Built 2026-10-21
+
+- ChatGPT / Codex in the Agents window: "Add to ChatGPT / Codex" writes
+  `~/.codex/config.toml` (`write_toml_entry`, tested: comments and other servers kept,
+  backup written, a file that does not parse left alone); the snippet is TOML.
