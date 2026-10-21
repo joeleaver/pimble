@@ -382,11 +382,18 @@ impl Relay {
             };
             let Some(earlier) = registry.tunnels.get_mut(&earlier_id) else { continue };
             earlier.stores.remove(store_id);
-            let closed = earlier.tunnel.close_conns(Close::STORE_WITHDRAWN, |conn| &conn.store_id == store_id);
-            tracing::info!(store_id = %store_id, members_closed = closed, "relay: a later tunnel took over the store");
-            if earlier.stores.is_empty() {
+            // A tunnel left serving nothing is closed, and its members go with
+            // it: there is no owner end to tell about them then. The tunnel's
+            // signal is set first, so its writer sends the close frame and
+            // nothing a member's task might queue for it in the meantime.
+            let members_close = if earlier.stores.is_empty() {
                 signal_close(&earlier.tunnel.close, Close::new(CLOSE_REPLACED, "replaced by a later tunnel"));
-            }
+                Close::OWNER_OFFLINE
+            } else {
+                Close::STORE_WITHDRAWN
+            };
+            let closed = earlier.tunnel.close_conns(members_close, |conn| &conn.store_id == store_id);
+            tracing::info!(store_id = %store_id, members_closed = closed, "relay: a later tunnel took over the store");
         }
         if let Some(entry) = registry.tunnels.get_mut(&tunnel.id) {
             entry.stores = stores;
