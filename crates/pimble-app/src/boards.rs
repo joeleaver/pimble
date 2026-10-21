@@ -1158,7 +1158,10 @@ fn after_change(store: AppStore, pane: PaneId) {
             return None;
         }
         s.tool_chosen = true;
-        Some(s.snapshot().elements.iter().any(|e| e.raw.kind.is_picture()))
+        // An image's picture is in a locked layer of its own; pictures put on
+        // a whiteboard are not.
+        let snapshot = s.snapshot();
+        Some(snapshot.elements.iter().any(|e| e.raw.kind.is_picture() && snapshot.layer(&e.layer).is_some_and(|l| l.locked)))
     })
     .flatten();
     if let Some(picture) = opening {
@@ -1535,21 +1538,52 @@ pub(crate) fn new_whiteboard(store: AppStore, store_id: StoreId, parent_id: Node
     }
 }
 
-/// A picture on its way to becoming an image node.
+/// Where pictures that are being added go.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Dest {
+    /// An image node per picture under a node: dropped on a tree row, "New
+    /// Image...", a paste with a row selected.
+    Under(StoreId, NodeId),
+    /// On pane `pane`'s board (contract section 1: "Pictures go on any
+    /// board"): at a point over its surface (physical pixels), or in the
+    /// middle of the view.
+    Board(PaneId, Option<(f32, f32)>),
+}
+
+/// A picture on its way to becoming an image node, or onto a board.
 struct QueuedImage {
     store_id: StoreId,
-    parent_id: NodeId,
+    /// The node the picture is stored as a write of: the image node's parent,
+    /// or the board's own node.
+    node_id: NodeId,
     title: String,
     bytes: Vec<u8>,
+    /// The board batch it belongs to, for a picture going onto a board.
+    batch: Option<u64>,
+}
+
+/// Pictures going onto one board together (one paste, drop or pick): placed
+/// in one edit once the last of them is stored, side by side in order.
+struct BoardBatch {
+    pane: PaneId,
+    /// The board's node when the pictures were added; a pane that holds
+    /// another by then gets none of them.
+    held: (StoreId, NodeId),
+    at: Option<(f32, f32)>,
+    /// What came back so far, in order.
+    stored: Vec<(BlobUrl, u32, u32)>,
+    remaining: usize,
 }
 
 thread_local! {
-    /// Image nodes to make, in order: one picture stored at a time, so the
-    /// nodes appear in the order the files came.
+    /// Pictures to store, in order: one at a time, so image nodes appear and
+    /// pictures line up in the order the files came.
     static IMAGE_QUEUE: RefCell<VecDeque<QueuedImage>> = const { RefCell::new(VecDeque::new()) };
     /// The picture being stored now: its request id, where it goes, its title.
-    static IN_FLIGHT: RefCell<Option<(u64, StoreId, NodeId, String)>> = const { RefCell::new(None) };
+    static IN_FLIGHT: RefCell<Option<(u64, StoreId, NodeId, String, Option<u64>)>> = const { RefCell::new(None) };
     static NEXT_REQUEST: Cell<u64> = const { Cell::new(REQUEST_BASE) };
+    static BATCHES: RefCell<HashMap<u64, BoardBatch>> = RefCell::new(HashMap::new());
+    static NEXT_BATCH: Cell<u64> = const { Cell::new(0) };
 }
 
 /// The title an image node takes: its file's name without the extension, or
@@ -1567,10 +1601,19 @@ fn image_title(name: Option<&str>) -> String {
     }
 }
 
-/// Make an image node per picture under `parent_id`, in order: dropped
-/// files, "New Image...", a paste on a tree row. Each picture is fitted and
+/// Add pictures, in order, where `dest` says. Each picture is fitted and
 /// stored as text pictures are (`PutBlob`: scaled to fit, refused with a
-/// sentence), then becomes a `picture` element at one unit per pixel.
+/// sentence), then becomes a `picture` element at one unit per pixel: of a
+/// new image node's board, or of the board in a pane.
+pub(crate) fn add_pictures(store: AppStore, dest: Dest, pictures: Vec<(Option<String>, Vec<u8>)>) {
+    match dest {
+        Dest::Under(store_id, parent_id) => add_image_nodes(store, store_id, parent_id, pictures),
+        Dest::Board(pane, at) => add_to_board(store, pane, at, pictures),
+    }
+}
+
+/// Make an image node per picture under `parent_id`, in order: dropped
+/// files, "New Image...", a paste on a tree row.
 pub(crate) fn add_image_nodes(store: AppStore, store_id: StoreId, parent_id: NodeId, pictures: Vec<(Option<String>, Vec<u8>)>) {
     if !store.node_access(store_id, parent_id).allows_write() {
         crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
@@ -1579,7 +1622,26 @@ pub(crate) fn add_image_nodes(store: AppStore, store_id: StoreId, parent_id: Nod
     IMAGE_QUEUE.with(|q| {
         let mut q = q.borrow_mut();
         for (name, bytes) in pictures {
-            q.push_back(QueuedImage { store_id, parent_id, title: image_title(name.as_deref()), bytes });
+            q.push_back(QueuedImage { store_id, node_id: parent_id, title: image_title(name.as_deref()), bytes, batch: None });
+        }
+    });
+    pump(store);
+}
+
+/// Put pictures on pane `pane`'s board (a paste, files dropped on it, the
+/// toolbar's picture button): refused on a board this device may only read
+/// and when every layer is locked, before anything is stored.
+pub(crate) fn add_to_board(store: AppStore, pane: PaneId, at: Option<(f32, f32)>, pictures: Vec<(Option<String>, Vec<u8>)>) {
+    let Some(held) = with_session(pane, |s| (s.store_id, s.node_id)) else { return };
+    if pictures.is_empty() || !writable_or_say(store, pane) || tools::target_layer(store, pane).is_none() {
+        return;
+    }
+    let batch = NEXT_BATCH.with(|n| n.replace(n.get() + 1));
+    BATCHES.with(|b| b.borrow_mut().insert(batch, BoardBatch { pane, held, at, stored: Vec::new(), remaining: pictures.len() }));
+    IMAGE_QUEUE.with(|q| {
+        let mut q = q.borrow_mut();
+        for (name, bytes) in pictures {
+            q.push_back(QueuedImage { store_id: held.0, node_id: held.1, title: image_title(name.as_deref()), bytes, batch: Some(batch) });
         }
     });
     pump(store);
@@ -1591,37 +1653,137 @@ fn pump(store: AppStore) {
     }
     let Some(next) = IMAGE_QUEUE.with(|q| q.borrow_mut().pop_front()) else { return };
     let request_id = NEXT_REQUEST.with(|n| n.replace(n.get() + 1));
-    IN_FLIGHT.with(|f| *f.borrow_mut() = Some((request_id, next.store_id, next.parent_id, next.title)));
-    // The picture is stored as a write of the node it goes under, which is
-    // what making a child there is.
-    store.send(BackendCommand::PutBlob { store_id: next.store_id, node_id: next.parent_id, bytes: next.bytes, request_id });
+    IN_FLIGHT.with(|f| *f.borrow_mut() = Some((request_id, next.store_id, next.node_id, next.title, next.batch)));
+    // The picture is stored as a write of the node it goes under (which is
+    // what making a child there is), or of the board it goes on.
+    store.send(BackendCommand::PutBlob { store_id: next.store_id, node_id: next.node_id, bytes: next.bytes, request_id });
 }
 
-/// The answer to an image node's `PutBlob`; answers whether it was one.
+/// The answer to an image node's or a board picture's `PutBlob`; answers
+/// whether it was one.
 pub(crate) fn stored(store: AppStore, request_id: u64, result: &Result<StoredBlob, String>) -> bool {
-    let Some((_, store_id, parent_id, title)) = IN_FLIGHT.with(|f| f.borrow_mut().take_if(|(id, ..)| *id == request_id)) else {
+    let Some((_, store_id, parent_id, title, batch)) = IN_FLIGHT.with(|f| f.borrow_mut().take_if(|(id, ..)| *id == request_id)) else {
         return false;
     };
-    match result {
+    let size = match result {
         Ok(blob) => match blob.size {
             Some((w, h)) if w > 0 && h > 0 => {
-                if let Some(board) = new_board(Some((&blob.url, w, h))) {
-                    create_board_node(store, store_id, parent_id, &title, PHOTO_ICON, board, None);
-                }
                 if let Some(notice) = &blob.notice {
                     crate::events::show_notice(store, notice.clone());
                 }
+                Some((blob.url, w, h))
             }
-            _ => crate::events::show_notice(store, NOT_A_PICTURE.to_string()),
+            _ => {
+                crate::events::show_notice(store, NOT_A_PICTURE.to_string());
+                None
+            }
         },
-        Err(sentence) => crate::events::show_notice(store, sentence.clone()),
+        Err(sentence) => {
+            crate::events::show_notice(store, sentence.clone());
+            None
+        }
+    };
+    match batch {
+        None => {
+            if let Some((url, w, h)) = size {
+                if let Some(board) = new_board(Some((&url, w, h))) {
+                    create_board_node(store, store_id, parent_id, &title, PHOTO_ICON, board, None);
+                }
+            }
+        }
+        Some(batch) => {
+            let done = BATCHES.with(|b| {
+                let mut b = b.borrow_mut();
+                let entry = b.get_mut(&batch)?;
+                entry.stored.extend(size);
+                entry.remaining = entry.remaining.saturating_sub(1);
+                if entry.remaining == 0 { b.remove(&batch) } else { None }
+            });
+            if let Some(done) = done {
+                place_batch(store, done);
+            }
+        }
     }
     pump(store);
     true
 }
 
-/// A row's "New Image...": pick pictures and make an image node of each.
-pub(crate) fn pick_images(store: AppStore, store_id: StoreId, parent_id: NodeId) {
+/// Lay pictures out side by side, in order, `GAP` apart, centered on a
+/// board point, each at one unit per pixel, all scaled down together until
+/// they fit inside `view` (a board rectangle). Answers each picture's rectangle.
+fn lay_out(sizes: &[(u32, u32)], center: Point, view: Rect) -> Vec<Rect> {
+    const GAP: f32 = 16.0;
+    /// How much of the view placed pictures may take at most.
+    const FILL: f32 = 0.9;
+    let total_w = sizes.iter().map(|s| s.0 as f32).sum::<f32>() + GAP * sizes.len().saturating_sub(1) as f32;
+    let max_h = sizes.iter().map(|s| s.1 as f32).fold(0.0, f32::max);
+    let mut factor = 1.0_f32;
+    if total_w > 0.0 && view.w > 0.0 {
+        factor = factor.min(view.w * FILL / total_w);
+    }
+    if max_h > 0.0 && view.h > 0.0 {
+        factor = factor.min(view.h * FILL / max_h);
+    }
+    let mut x = center.x - total_w * factor / 2.0;
+    sizes
+        .iter()
+        .map(|&(w, h)| {
+            let (w, h) = (w as f32 * factor, h as f32 * factor);
+            let rect = Rect::new(x, center.y - h / 2.0, w, h);
+            x += w + GAP * factor;
+            rect
+        })
+        .collect()
+}
+
+/// A board batch is all stored: its pictures go on the board in one edit (one
+/// undo step), in the layer new elements go to, and are selected.
+fn place_batch(store: AppStore, batch: BoardBatch) {
+    if batch.stored.is_empty() {
+        return;
+    }
+    let pane = batch.pane;
+    if with_session(pane, |s| (s.store_id, s.node_id)) != Some(batch.held) {
+        crate::events::show_notice(store, "The board was closed before its pictures were ready, so they were not added.".to_string());
+        return;
+    }
+    let Some(layer) = tools::target_layer(store, pane) else { return };
+    let Some((center, view)) = with_session(pane, |s| {
+        let (w, h) = s.view.size();
+        let center = match batch.at {
+            Some((x, y)) => s.view.screen_to_board(x, y),
+            None => s.view.center(),
+        };
+        let a = s.view.screen_to_board(0.0, 0.0);
+        let b = s.view.screen_to_board(w as f32, h as f32);
+        (center, Rect::new(a.x.min(b.x), a.y.min(b.y), (b.x - a.x).abs(), (b.y - a.y).abs()))
+    }) else {
+        return;
+    };
+    let sizes: Vec<(u32, u32)> = batch.stored.iter().map(|&(_, w, h)| (w, h)).collect();
+    let rects = lay_out(&sizes, center, view);
+    new_undo_step(pane);
+    let ids = local_edit(store, pane, |t| {
+        let mut ids = Vec::new();
+        for ((url, w, h), rect) in batch.stored.iter().zip(rects) {
+            let geom = PictureGeom { rect, src: url.to_string(), px_w: *w, px_h: *h, crop: None };
+            ids.push(t.add_element(NewElement::new(Kind::Picture, Geom::Picture(geom)).in_layer(layer.clone()))?);
+        }
+        Ok(ids)
+    });
+    if let Some(ids) = ids {
+        // Placed pictures are moved and sized next, so the select tool.
+        if untracked(|| store.focused_pane.get()) == pane {
+            store.board_tool.set(Tool::Select);
+        }
+        tools::select(store, pane, ids);
+        request_wanted_pictures();
+    }
+}
+
+/// A row's "New Image..." (an image node of each picture picked), or the
+/// board toolbar's picture button (each picture onto the board).
+pub(crate) fn pick_images(store: AppStore, dest: Dest) {
     #[cfg(feature = "native")]
     {
         // Driving the app over rinch's debug port cannot work a file dialog:
@@ -1630,21 +1792,22 @@ pub(crate) fn pick_images(store: AppStore, store_id: StoreId, parent_id: NodeId)
         let paths: Vec<std::path::PathBuf> = match std::env::var("PIMBLE_DEBUG_IMAGES") {
             Ok(list) => std::env::split_paths(&list).collect(),
             Err(_) => rinch::dialogs::open_file()
-                .set_title("New Image")
+                .set_title(if matches!(dest, Dest::Board(..)) { "Insert Pictures" } else { "New Image" })
                 .add_filter("Pictures", &["png", "jpg", "jpeg", "gif", "webp"])
                 .pick_files()
                 .unwrap_or_default(),
         };
-        add_image_files(store, store_id, parent_id, paths);
+        add_image_files(store, dest, paths);
     }
     #[cfg(not(feature = "native"))]
-    pick_in_browser(store, store_id, parent_id);
+    pick_in_browser(store, dest);
 }
 
-/// Files dropped on a tree row, or picked: an image node per picture, in
-/// order. Files that are not pictures are left out with a sentence.
+/// Files dropped on a tree row or a board, or picked: each picture where
+/// `dest` says, in order. Files that are not pictures are left out with a
+/// sentence.
 #[cfg(feature = "native")]
-pub(crate) fn add_image_files(store: AppStore, store_id: StoreId, parent_id: NodeId, paths: Vec<std::path::PathBuf>) {
+pub(crate) fn add_image_files(store: AppStore, dest: Dest, paths: Vec<std::path::PathBuf>) {
     let mut pictures = Vec::new();
     let mut skipped = 0;
     for path in paths {
@@ -1660,14 +1823,14 @@ pub(crate) fn add_image_files(store: AppStore, store_id: StoreId, parent_id: Nod
         crate::events::show_notice(store, NOT_A_PICTURE.to_string());
     }
     if !pictures.is_empty() {
-        add_image_nodes(store, store_id, parent_id, pictures);
+        add_pictures(store, dest, pictures);
     }
 }
 
-/// A row's "Paste Image" on the desktop: the picture on the clipboard
-/// becomes an image node under the row.
+/// A row's "Paste Image" on the desktop (the picture on the clipboard becomes
+/// an image node under the row), or Ctrl+V on a board (it goes on the board).
 #[cfg(feature = "native")]
-pub(crate) fn paste_image(store: AppStore, store_id: StoreId, parent_id: NodeId) {
+pub(crate) fn paste_image(store: AppStore, dest: Dest) {
     let image = match rinch::clipboard::paste_image() {
         Ok(image) => image,
         Err(_) => {
@@ -1688,13 +1851,13 @@ pub(crate) fn paste_image(store: AppStore, store_id: StoreId, parent_id: NodeId)
         crate::events::show_notice(store, NOT_A_PICTURE.to_string());
         return;
     }
-    add_image_nodes(store, store_id, parent_id, vec![(None, png)]);
+    add_pictures(store, dest, vec![(None, png)]);
 }
 
-/// The browser's picker for "New Image...": a hidden file input taking
-/// several pictures, read in order.
+/// The browser's picker for "New Image..." and the board's picture button: a
+/// hidden file input taking several pictures, read in order.
 #[cfg(not(feature = "native"))]
-fn pick_in_browser(store: AppStore, store_id: StoreId, parent_id: NodeId) {
+fn pick_in_browser(store: AppStore, dest: Dest) {
     use wasm_bindgen::JsCast;
 
     const INPUT_ID: &str = "pimble-image-node-input";
@@ -1725,7 +1888,7 @@ fn pick_in_browser(store: AppStore, store_id: StoreId, parent_id: NodeId) {
         let files = picked.files();
         picked.remove();
         if let Some(files) = files {
-            read_files(store, store_id, parent_id, files, false);
+            read_files(store, dest, files, false);
         }
     });
     if input.add_event_listener_with_callback("change", on_change.as_ref().unchecked_ref()).is_err() {
@@ -1735,11 +1898,11 @@ fn pick_in_browser(store: AppStore, store_id: StoreId, parent_id: NodeId) {
     input.click();
 }
 
-/// Read a browser `FileList` in order and make an image node of each picture.
-/// `pasted`: a clipboard bitmap, which the browser names `image.png`; the
-/// node is called "Picture" instead.
+/// Read a browser `FileList` in order and put each picture where `dest`
+/// says. `pasted`: a clipboard bitmap, which the browser names `image.png`;
+/// an image node is called "Picture" instead.
 #[cfg(not(feature = "native"))]
-fn read_files(store: AppStore, store_id: StoreId, parent_id: NodeId, files: web_sys::FileList, pasted: bool) {
+fn read_files(store: AppStore, dest: Dest, files: web_sys::FileList, pasted: bool) {
     let files: Vec<web_sys::File> = (0..files.length()).filter_map(|i| files.get(i)).collect();
     if files.is_empty() {
         return;
@@ -1761,15 +1924,17 @@ fn read_files(store: AppStore, store_id: StoreId, parent_id: NodeId, files: web_
             }
         }
         if !pictures.is_empty() {
-            add_image_nodes(store, store_id, parent_id, pictures);
+            add_pictures(store, dest, pictures);
         }
     });
 }
 
-/// The browser's way in for a drop of image files on a tree row and a paste
-/// with a tree row focused: page-level listeners, installed once, that find
-/// the row by its `data-pimble-row` attribute (dropped) or the tree's
-/// selected row (pasted while no editor or field has the keyboard).
+/// The browser's way in for a drop of image files on a tree row or a board,
+/// and a paste with a tree row or a board focused: page-level listeners,
+/// installed once, that find the row by its `data-pimble-row` attribute
+/// (dropped) or the tree's selected row (pasted while no editor or field has
+/// the keyboard), and the board by its canvas's `data-pimble-board` (dropped)
+/// or its surface having the keyboard (pasted).
 #[cfg(not(feature = "native"))]
 pub(crate) fn install_browser_handlers(store: AppStore) {
     use wasm_bindgen::JsCast;
@@ -1786,12 +1951,24 @@ pub(crate) fn install_browser_handlers(store: AppStore) {
         let element = target?.dyn_into::<web_sys::Element>().ok()?;
         element.closest("[data-pimble-row]").ok()??.get_attribute("data-pimble-row")
     }
+    /// The board pane a drop is over and where, physical pixels over its
+    /// surface.
+    fn board_of(event: &web_sys::DragEvent) -> Option<(PaneId, (f32, f32))> {
+        let element = event.target()?.dyn_into::<web_sys::Element>().ok()?;
+        let canvas = element.closest("[data-pimble-board]").ok()??;
+        let pane = PaneId::from_index(canvas.get_attribute("data-pimble-board")?.parse().ok()?)?;
+        let rect = canvas.get_bounding_client_rect();
+        let scale = scale_of(pane);
+        let x = (event.client_x() as f64 - rect.left()) as f32 * scale;
+        let y = (event.client_y() as f64 - rect.top()) as f32 * scale;
+        Some((pane, (x, y)))
+    }
     fn carries_files(event: &web_sys::DragEvent) -> bool {
         event.data_transfer().is_some_and(|dt| dt.types().iter().any(|t| t.as_string().as_deref() == Some("Files")))
     }
 
     let over = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::DragEvent)>::new(move |event: web_sys::DragEvent| {
-        if carries_files(&event) && row_of(event.target()).is_some() {
+        if carries_files(&event) && (row_of(event.target()).is_some() || board_of(&event).is_some()) {
             event.prevent_default();
         }
     });
@@ -1802,12 +1979,16 @@ pub(crate) fn install_browser_handlers(store: AppStore) {
         if !carries_files(&event) {
             return;
         }
-        let Some(row) = row_of(event.target()) else { return };
+        let dest = if let Some((pane, at)) = board_of(&event) {
+            Dest::Board(pane, Some(at))
+        } else {
+            let Some(row) = row_of(event.target()) else { return };
+            let Some((store_id, parent_id)) = parent_for_row(store, &row) else { return };
+            Dest::Under(store_id, parent_id)
+        };
         event.prevent_default();
         let Some(files) = event.data_transfer().and_then(|dt| dt.files()) else { return };
-        if let Some((store_id, parent_id)) = parent_for_row(store, &row) {
-            read_files(store, store_id, parent_id, files, false);
-        }
+        read_files(store, dest, files, false);
     });
     let _ = document.add_event_listener_with_callback("drop", drop.as_ref().unchecked_ref());
     drop.forget();
@@ -1816,7 +1997,18 @@ pub(crate) fn install_browser_handlers(store: AppStore) {
         if event.default_prevented() {
             return;
         }
-        // Only when nothing that takes text has the keyboard.
+        // A board with the keyboard (and no text being typed on it) takes
+        // the picture.
+        if let Some(pane) = keyboard_board() {
+            let Some(files) = event.clipboard_data().and_then(|dt| dt.files()) else { return };
+            if files.length() == 0 {
+                return;
+            }
+            event.prevent_default();
+            read_files(store, Dest::Board(pane, None), files, true);
+            return;
+        }
+        // Otherwise only when nothing that takes text has the keyboard.
         let focused = web_sys::window().and_then(|w| w.document()).and_then(|d| d.active_element());
         if focused.is_some_and(|el| {
             let tag = el.tag_name().to_ascii_lowercase();
@@ -1834,10 +2026,20 @@ pub(crate) fn install_browser_handlers(store: AppStore) {
         let Some(row) = untracked(|| store.selected_id.get()) else { return };
         let Some((store_id, parent_id)) = parent_for_row(store, &row) else { return };
         event.prevent_default();
-        read_files(store, store_id, parent_id, files, true);
+        read_files(store, Dest::Under(store_id, parent_id), files, true);
     });
     let _ = document.add_event_listener_with_callback("paste", paste.as_ref().unchecked_ref());
     paste.forget();
+}
+
+/// The board pane whose surface has the keyboard, unless text is being typed
+/// on it.
+#[cfg(not(feature = "native"))]
+fn keyboard_board() -> Option<PaneId> {
+    let focused = rinch::render_surface::focused_surface_id()?;
+    PaneId::ALL.into_iter().find(|&pane| {
+        surface_of(pane).is_some_and(|s| s.id() == focused) && with_session(pane, |s| s.text.is_none()).unwrap_or(false)
+    })
 }
 
 /// Where a new node made "on" a tree row goes: the row's node, a store row's
@@ -1942,6 +2144,140 @@ mod tests {
         assert_eq!(picture.bounds, Rect::new(0.0, 0.0, 640.0, 480.0));
         assert!(!snapshot.top_layer().unwrap().locked, "new marks go above, into a layer that takes them");
         assert_eq!(snapshot.markup_count(), 0);
+    }
+
+    /// The next `PutBlob` sent, answered as stored at `size`.
+    fn answer_put(store: AppStore, commands: &crossbeam_channel::Receiver<BackendCommand>, held: (StoreId, NodeId), n: u8, size: (u32, u32)) {
+        let request_id = commands
+            .try_iter()
+            .find_map(|c| match c {
+                BackendCommand::PutBlob { store_id, node_id, request_id, .. } => {
+                    assert_eq!((store_id, node_id), held, "stored as a write of the board's node");
+                    Some(request_id)
+                }
+                _ => None,
+            })
+            .expect("a picture is stored");
+        let url = BlobUrl::parse(&format!("pimble-blob:00000000-0000-0000-0000-000000000001/{}", char::from(b'a' + n).to_string().repeat(25) + "a")).unwrap();
+        assert!(stored(store, request_id, &Ok(StoredBlob { url, size: Some(size), notice: None })));
+    }
+
+    fn pictures_on(pane: PaneId) -> Vec<(Rect, String)> {
+        with_session(pane, |s| {
+            let snapshot = s.snapshot();
+            snapshot.elements.iter().filter(|e| e.raw.kind.is_picture()).map(|e| (e.bounds, e.layer.clone())).collect()
+        })
+        .unwrap()
+    }
+
+    /// Pictures put on a board (contract section 1): stored one at a time as
+    /// writes of the board's node, then placed together in one edit and one
+    /// undo step, side by side in order, at one unit per pixel, centered in
+    /// the view, in a layer that takes them, and selected.
+    #[test]
+    fn pictures_go_on_a_board_side_by_side_in_one_step() {
+        let (store, commands) = store_with_commands();
+        let held = (StoreId::new(), NodeId::new());
+        start(store, P[0], held.0, held.1, &whiteboard_bytes());
+        with_session(P[0], |s| s.view.resize(1600, 1200));
+        let center = with_session(P[0], |s| s.view.center()).unwrap();
+        let _ = commands.try_iter().count();
+
+        add_to_board(store, P[0], None, vec![(Some("a.png".into()), b"a".to_vec()), (None, b"b".to_vec())]);
+        answer_put(store, &commands, held, 1, (400, 300));
+        assert!(pictures_on(P[0]).is_empty(), "nothing is placed until the last is stored");
+        answer_put(store, &commands, held, 2, (200, 100));
+        let placed = pictures_on(P[0]);
+        assert_eq!(placed.len(), 2);
+        let (a, b) = (placed[0].0, placed[1].0);
+        assert_eq!((a.w, a.h, b.w, b.h), (400.0, 300.0, 200.0, 100.0), "one unit per pixel");
+        assert_eq!(b.x - a.right(), 16.0, "side by side, in order");
+        assert!(((a.x + b.right()) / 2.0 - center.x).abs() < 0.01, "centered in the view");
+        assert!((a.y + a.h / 2.0 - center.y).abs() < 0.01 && (b.y + b.h / 2.0 - center.y).abs() < 0.01);
+        let unlocked = with_session(P[0], |s| !s.snapshot().layer(&placed[0].1).unwrap().locked).unwrap();
+        assert!(unlocked, "in a layer that takes them, so they can be moved");
+        assert_eq!(with_session(P[0], |s| s.selected.len()).unwrap(), 2);
+        assert_eq!(broadcasts(&commands), 1, "one applyEdit");
+        assert_eq!(untracked(|| store.board_tool.get()), Tool::Select);
+
+        tools::undo(store, P[0], false);
+        assert!(pictures_on(P[0]).is_empty(), "one undo step");
+        stop(store, P[0]);
+    }
+
+    /// A picture dropped at a point is centered there; one larger than the
+    /// view is scaled down to fit it; an image node's board takes pictures
+    /// beside its own, above its locked picture layer.
+    #[test]
+    fn a_dropped_picture_lands_where_it_was_dropped_and_fits_the_view() {
+        let (store, commands) = store_with_commands();
+        let held = (StoreId::new(), NodeId::new());
+        let url = BlobUrl::parse("pimble-blob:00000000-0000-0000-0000-000000000001/aaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let mut doc = NodeDoc::new();
+        doc.init(node_types::BOARD, "Shot", None, "2026-10-09T10:00:00.000Z").unwrap();
+        doc.apply_update(&new_board(Some((&url, 640, 480))).unwrap()).unwrap();
+        start(store, P[0], held.0, held.1, &doc.save());
+        with_session(P[0], |s| s.view.resize(800, 600));
+        let _ = commands.try_iter().count();
+
+        let at = with_session(P[0], |s| s.view.screen_to_board(100.0, 200.0)).unwrap();
+        add_to_board(store, P[0], Some((100.0, 200.0)), vec![(None, b"a".to_vec())]);
+        answer_put(store, &commands, held, 1, (40, 20));
+        let placed = pictures_on(P[0]);
+        assert_eq!(placed.len(), 2, "beside the image's own picture");
+        let new = placed.iter().find(|(r, _)| r.w == 40.0).expect("at its own size").0;
+        assert!((new.x + 20.0 - at.x).abs() < 0.01 && (new.y + 10.0 - at.y).abs() < 0.01, "centered on the drop");
+
+        add_to_board(store, P[0], None, vec![(None, b"big".to_vec())]);
+        answer_put(store, &commands, held, 2, (8000, 1000));
+        let view_w = with_session(P[0], |s| {
+            let a = s.view.screen_to_board(0.0, 0.0);
+            let b = s.view.screen_to_board(800.0, 600.0);
+            b.x - a.x
+        })
+        .unwrap();
+        let big = pictures_on(P[0]).into_iter().map(|(r, _)| r).find(|r| r.w > 40.0 && r.w != 640.0).unwrap();
+        assert!((big.w - view_w * 0.9).abs() < 0.5, "scaled down to fit the view: {} of {view_w}", big.w);
+        assert!((big.w / big.h - 8.0).abs() < 0.01, "its proportions kept");
+        stop(store, P[0]);
+    }
+
+    /// A board this device may only read takes no pictures, and stores none.
+    #[test]
+    fn a_read_only_board_takes_no_pictures() {
+        let (store, commands) = store_with_commands();
+        let held = (StoreId::new(), NodeId::new());
+        start(store, P[0], held.0, held.1, &whiteboard_bytes());
+        let mut node = pimble_core::Node::new(node_types::BOARD);
+        node.id = held.1;
+        node.access = pimble_core::StoreAccess::Read;
+        store.node_data.update(|map| {
+            map.insert(held, rinch::prelude::Signal::new(node));
+        });
+        let _ = commands.try_iter().count();
+        add_to_board(store, P[0], None, vec![(None, b"a".to_vec())]);
+        assert!(commands.try_iter().all(|c| !matches!(c, BackendCommand::PutBlob { .. })));
+        assert_eq!(store.notice.get(), pimble_core::StoreAccess::READ_ONLY_REFUSAL);
+        assert!(pictures_on(P[0]).is_empty());
+        stop(store, P[0]);
+    }
+
+    /// A board closed (or showing another node) before its pictures were
+    /// stored gets none of them, with a sentence.
+    #[test]
+    fn pictures_for_a_board_that_closed_are_not_placed() {
+        let (store, commands) = store_with_commands();
+        let held = (StoreId::new(), NodeId::new());
+        start(store, P[0], held.0, held.1, &whiteboard_bytes());
+        let _ = commands.try_iter().count();
+        add_to_board(store, P[0], None, vec![(None, b"a".to_vec())]);
+        stop(store, P[0]);
+        let other = (StoreId::new(), NodeId::new());
+        start(store, P[0], other.0, other.1, &whiteboard_bytes());
+        answer_put(store, &commands, held, 1, (40, 20));
+        assert!(pictures_on(P[0]).is_empty());
+        assert!(store.notice.get().contains("closed"));
+        stop(store, P[0]);
     }
 
     #[test]

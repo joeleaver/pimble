@@ -51,6 +51,10 @@ pub(super) fn claims_key(pane: PaneId, key: &SurfaceKeyData) -> bool {
         "Delete" | "Backspace" => selected,
         "Escape" => active,
         "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" => selected,
+        // Ctrl+V is the board's on the desktop; in the browser it is left to
+        // the page, whose `paste` brings the clipboard's files
+        // (`install_browser_handlers`).
+        _ if primary && cfg!(feature = "native") && key.key.eq_ignore_ascii_case("v") => true,
         _ if primary => matches!(
             key.key.to_ascii_lowercase().as_str(),
             "z" | "y" | "d" | "g" | "a" | "c" | "]" | "[" | "l"
@@ -1739,7 +1743,7 @@ fn erase_at(store: AppStore, pane: PaneId, p: Point) {
 /// The layer new elements go into: the one picked in the layers panel, else
 /// the topmost that is not locked. `None` (with a sentence) when that layer
 /// is locked.
-fn target_layer(store: AppStore, pane: PaneId) -> Option<String> {
+pub(super) fn target_layer(store: AppStore, pane: PaneId) -> Option<String> {
     let chosen = untracked(|| store.pane(pane).board_ui.layer.get());
     let found = with_session(pane, |s| {
         let snapshot = s.snapshot();
@@ -2243,6 +2247,8 @@ fn key_down(store: AppStore, pane: PaneId, key: &SurfaceKeyData) {
             "g" => group(store, pane),
             "a" => select_all(store, pane),
             "c" => export::copy_picture(store, pane),
+            #[cfg(feature = "native")]
+            "v" => crate::boards::paste_image(store, Dest::Board(pane, None)),
             "l" => toggle_lock(store, pane),
             "]" => reorder(store, pane, if key.shift { Order::Front } else { Order::Forward }),
             "[" => reorder(store, pane, if key.shift { Order::Back } else { Order::Backward }),
