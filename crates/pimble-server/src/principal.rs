@@ -182,6 +182,12 @@ pub enum Access {
 /// principal or, with no verifier configured, `Principal::Service`, before
 /// any request reaches jsonrpsee's dispatch.
 pub fn principal_of(ext: &Extensions) -> Principal {
+    // An agent's connection is judged by what the agent may do now, not by
+    // what it might when it connected: a removed agent, or one whose grants
+    // were narrowed, is held to that on its next call (docs/AGENTS_CONTRACT.md).
+    if let Some(agent) = ext.get::<crate::agents::AgentConnection>() {
+        return agent.principal();
+    }
     ext.get::<Principal>().cloned().unwrap_or_else(|| Principal::User {
         sub: String::new(),
         email: String::new(),

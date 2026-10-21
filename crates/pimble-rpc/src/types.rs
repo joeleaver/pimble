@@ -1207,3 +1207,68 @@ mod tests {
         assert_eq!(back.ended_roots, vec![root]);
     }
 }
+
+// ── AI agents (docs/AGENTS_CONTRACT.md) ─────────────────────────────────
+
+/// What an agent may do with what a grant reaches: read it, or read and
+/// change it, as a share's member may.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentRole {
+    Reader,
+    Editor,
+}
+
+/// One grant of an agent: a store, or one node's subtree in it, at a role.
+/// An agent reaches the union of its grants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentGrant {
+    pub store: StoreId,
+    /// The root of the subtree; `None` for the whole store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<NodeId>,
+    pub role: AgentRole,
+}
+
+/// An agent as the app sees it: never its key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentInfo {
+    pub id: String,
+    pub name: String,
+    pub grants: Vec<AgentGrant>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListAgentsResponse {
+    pub agents: Vec<AgentInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateAgentRequest {
+    pub name: String,
+    pub grants: Vec<AgentGrant>,
+}
+
+/// A new agent, and its key: shown this once, never stored in the clear.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateAgentResponse {
+    pub agent: AgentInfo,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateAgentRequest {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants: Option<Vec<AgentGrant>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveAgentRequest {
+    pub id: String,
+}

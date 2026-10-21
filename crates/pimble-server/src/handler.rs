@@ -74,7 +74,13 @@ use pimble_rpc::{
     VaultAppendRequest, VaultAppendResponse, VaultDocId, VaultDocInfo, VaultEntry, VaultFetchRequest,
     VaultFetchResponse, VaultListDocsRequest, VaultListDocsResponse, VaultSnapshotRequest,
     MAX_SYNC_NODE_CONTENTS,
+    AgentGrant, AgentInfo, CreateAgentRequest, CreateAgentResponse, ListAgentsResponse, RemoveAgentRequest, UpdateAgentRequest,
 };
+
+/// A request the person can fix, in a sentence.
+fn invalid_params(message: impl Into<String>) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(jsonrpsee::types::error::INVALID_PARAMS_CODE, message.into(), None::<()>)
+}
 use pimble_search::{IndexNode, SearchError, SearchIndex, SearchQuery};
 use pimble_store::{BlobStore, StoreEndpoint, StoreError, StoreManager, SyncConfig, SyncMode};
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -1102,6 +1108,10 @@ pub struct RpcHandler {
     /// its store has changed (`crate::vault_link::GRANT_CHECK_EVERY` unless
     /// `ServerConfig::grant_check_interval` says otherwise).
     grant_check_every: Duration,
+    /// This device's AI agents (docs/AGENTS_CONTRACT.md), on the app's own
+    /// server; `None` elsewhere, where the agent RPCs answer that there are
+    /// none here.
+    agents: Option<Arc<crate::agents::AgentRegistry>>,
 }
 
 /// What a share's member is told a store is called by this server, which
@@ -1183,7 +1193,36 @@ impl RpcHandler {
             grant_check_every: crate::vault_link::GRANT_CHECK_EVERY,
             relay: Arc::new(crate::relay_face::RelayHost::new(relay_dir_beside(&replicas_dir))),
             replicas_dir: Arc::new(replicas_dir),
+            agents: None,
         }
+    }
+
+    /// The agents this server admits and manages (`ServerConfig::agents_path`).
+    /// Call before the handler is cloned or serves anything.
+    pub fn with_agents(mut self, agents: Option<Arc<crate::agents::AgentRegistry>>) -> Self {
+        self.agents = agents;
+        self
+    }
+
+    fn agents(&self) -> Result<&crate::agents::AgentRegistry, ErrorObjectOwned> {
+        self.agents.as_deref().ok_or_else(|| pimble_rpc::forbidden_error("This server keeps no AI agents; they live on the Pimble app's own server."))
+    }
+
+    /// Grants as saved (`crate::agents::normalize`), refused when one names
+    /// a store that is not open here or a node that is not in it.
+    async fn checked_grants(&self, grants: Vec<AgentGrant>) -> Result<Vec<AgentGrant>, ErrorObjectOwned> {
+        let manager = self.store_manager.read().await;
+        for g in &grants {
+            if manager.get_store_info(g.store).is_err() {
+                return Err(invalid_params(format!("No store {} is open here.", g.store)));
+            }
+            if let Some(node) = g.node {
+                if manager.get_node(g.store, node).is_err() {
+                    return Err(invalid_params(format!("No node {node} is in store {}.", g.store)));
+                }
+            }
+        }
+        Ok(crate::agents::normalize(grants, |s| manager.root_node_id(s).ok()))
     }
 
     /// Where the twins of the stores shared from this computer live
@@ -1418,7 +1457,10 @@ impl RpcHandler {
             // (docs/NODE_DOCUMENT_CONTRACT.md "A share has a name of its own"):
             // this server does not know the share's name, the accounts
             // service does, and a client puts it here from its own row.
-            store.name = SHARE_PLACEHOLDER_NAME.to_string();
+            // An agent is this person's own; it sees the store's name.
+            if !crate::agents::is_agent(principal) {
+                store.name = SHARE_PLACEHOLDER_NAME.to_string();
+            }
         }
     }
 
@@ -2920,6 +2962,46 @@ impl PimbleApiServer for RpcHandler {
         self.keystore.sign_out().await.map_err(to_rpc_error)?;
         // Nothing is served to anyone on a session that was given up.
         self.relay.account_changed(self).await;
+        Ok(EmptyResponse {})
+    }
+
+    async fn list_agents(&self, ext: &Extensions) -> Result<ListAgentsResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "listAgents")?;
+        Ok(ListAgentsResponse { agents: self.agents()?.list() })
+    }
+
+    async fn create_agent(&self, ext: &Extensions, request: CreateAgentRequest) -> Result<CreateAgentResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "createAgent")?;
+        let name = request.name.trim();
+        if name.is_empty() {
+            return Err(invalid_params("Name the agent: the app it is for, or what it does."));
+        }
+        let grants = self.checked_grants(request.grants).await?;
+        let (agent, key) = self.agents()?.create(name, grants).map_err(to_rpc_error)?;
+        Ok(CreateAgentResponse { agent, key })
+    }
+
+    async fn update_agent(&self, ext: &Extensions, request: UpdateAgentRequest) -> Result<AgentInfo, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "updateAgent")?;
+        let name = request.name.as_deref().map(str::trim);
+        if name.is_some_and(str::is_empty) {
+            return Err(invalid_params("Name the agent: the app it is for, or what it does."));
+        }
+        let grants = match request.grants {
+            Some(grants) => Some(self.checked_grants(grants).await?),
+            None => None,
+        };
+        self.agents()?
+            .update(&request.id, name, grants)
+            .map_err(to_rpc_error)?
+            .ok_or_else(|| invalid_params("There is no such agent."))
+    }
+
+    async fn remove_agent(&self, ext: &Extensions, request: RemoveAgentRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "removeAgent")?;
+        if !self.agents()?.remove(&request.id).map_err(to_rpc_error)? {
+            return Err(invalid_params("There is no such agent."));
+        }
         Ok(EmptyResponse {})
     }
 

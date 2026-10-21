@@ -117,8 +117,10 @@ only remote ones and says why):
      "A remote client (ChatGPT, claude.ai)". This only decides the setup step; the list
      of apps Pimble configures itself grows as their config formats are confirmed.
    - **What it can reach**: the explorer's own tree with a three-way control per row:
-     none, read, edit. A row's choice covers its subtree unless a row inside says
-     otherwise (a project readable, its Drafts folder editable). Stores are rows too.
+     none, read, edit. A row's choice covers its subtree, and a row inside can only
+     widen it (a project readable, its Drafts folder editable): an agent reaches the
+     union of its grants, judged as a share's member is, so "edit the project except
+     Drafts" is made by granting the parts, not by subtracting one. Stores are rows too.
      Nothing is checked to start with.
    - **Setup**: for an app Pimble knows, "Add to Claude Desktop" writes its config
      entry (section 6) and says to restart that app; for any other client, the JSON to
@@ -166,3 +168,25 @@ snippet instead. Removing an agent removes its entry the same way.
 5. Not asked, the proposal stands until Joe says otherwise: Pimble writes the config of
    the apps it knows (Claude Desktop, Claude Code, Cursor) with a backup, and offers the
    snippet for everything else.
+
+## Built in wave 1 (server), 2026-10-20
+
+- `crates/pimble-server/src/agents.rs`: `AgentRegistry` (`agents.json`, 0600, keys
+  kept as SHA-256 only, `pmbl_agent_<id>_<secret>`), `normalize` (one grant per root,
+  the higher role winning; a whole-store reader widened by roots inside becomes its
+  root node), and `AgentConnection`.
+- An agent is a `Principal::User` with `sub = agent:<id>` and its grants, so `Reach`,
+  `authorize`, search filtering and the `Service`-only lifecycle RPCs judge it as they
+  judge a share's member; `present_store_to` keeps the store's real name for an agent.
+- The HTTP edge checks a credential shaped like an agent key before anything else (the
+  tokenless embedded server would otherwise make it `Service`); an unknown key is 401.
+- **Re-judged on every call**: the connection carries the agent's id, and
+  `principal_of` rebuilds its principal from the registry, so removing or narrowing an
+  agent holds an open connection to it on its next call.
+- Agents load on a loopback server with no JWT verifier (the app's own) or where
+  `ServerConfig::agents_path` says; never on a relay face or a hosted server.
+- RPCs `listAgents`, `createAgent` (answers the key once), `updateAgent`, `removeAgent`,
+  all `Service`-only; grants naming a store not open here or a node not in it are
+  refused with a sentence. `last_used_at` is written at most once a minute.
+- Tests: `tests/agents.rs` (reach through reads, writes, children, search, lifecycle;
+  narrowing and removal on an open connection; grant checks), unit tests in the module.

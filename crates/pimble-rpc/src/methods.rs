@@ -282,6 +282,23 @@ pub trait PimbleApi {
     #[method(name = "cloudSignOut", with_extensions)]
     async fn cloud_sign_out(&self) -> Result<EmptyResponse, ErrorObjectOwned>;
 
+    /// This device's AI agents (docs/AGENTS_CONTRACT.md), never their keys.
+    /// `Service`-only, as are the three below.
+    #[method(name = "listAgents", with_extensions)]
+    async fn list_agents(&self) -> Result<ListAgentsResponse, ErrorObjectOwned>;
+
+    /// A new agent with these grants; answers its key, shown this once.
+    #[method(name = "createAgent", with_extensions)]
+    async fn create_agent(&self, request: CreateAgentRequest) -> Result<CreateAgentResponse, ErrorObjectOwned>;
+
+    /// Rename an agent or replace its grants.
+    #[method(name = "updateAgent", with_extensions)]
+    async fn update_agent(&self, request: UpdateAgentRequest) -> Result<AgentInfo, ErrorObjectOwned>;
+
+    /// Remove an agent: its key stops working on its next call.
+    #[method(name = "removeAgent", with_extensions)]
+    async fn remove_agent(&self, request: RemoveAgentRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
     /// Whether an account is currently signed in, and as whom. `Service`-only.
     #[method(name = "cloudStatus", with_extensions)]
     async fn cloud_status(&self) -> Result<CloudStatusResponse, ErrorObjectOwned>;

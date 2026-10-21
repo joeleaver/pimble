@@ -74,6 +74,11 @@ pub struct ServerConfig {
     /// by default, and inside a test's temp directory whenever
     /// `replicas_dir` is.
     pub relay_dir: Option<PathBuf>,
+    /// Where this device's AI agents live (docs/AGENTS_CONTRACT.md). `None`
+    /// uses [`crate::agents::default_agents_path`] on a loopback server with
+    /// no JWT verifier (the app's own), and no agents anywhere else; tests
+    /// set a temp path.
+    pub agents_path: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -90,6 +95,7 @@ impl Default for ServerConfig {
             share_sweep_interval: None,
             grant_check_interval: None,
             relay_dir: None,
+            agents_path: None,
         }
     }
 }
@@ -204,11 +210,20 @@ impl PimbleServer {
         // The HTTP-edge auth layer (docs/CLOUD_CONTRACT.md "B: pimble-server"
         // items 1-3), run on every request before it reaches the JSON-RPC
         // dispatch — including the WebSocket upgrade handshake.
-        let http_middleware = tower::ServiceBuilder::new().layer(crate::auth::AuthLayer::new(
-            self.config.auth_token.clone(),
-            jwt,
-            self.config.allowed_origins.clone(),
-        ));
+        // This device's agents: the app's own loopback server only, never a
+        // relay face or a server verifying Pimble Cloud's tokens.
+        let agents = match &self.config.agents_path {
+            _ if self.face => None,
+            Some(path) => Some(Arc::new(crate::agents::AgentRegistry::load(path.clone()))),
+            None if self.config.addr.ip().is_loopback() && !jwt_configured => {
+                Some(Arc::new(crate::agents::AgentRegistry::load(crate::agents::default_agents_path())))
+            }
+            None => None,
+        };
+        let http_middleware = tower::ServiceBuilder::new().layer(
+            crate::auth::AuthLayer::new(self.config.auth_token.clone(), jwt, self.config.allowed_origins.clone())
+                .with_agents(agents.clone()),
+        );
 
         let server = Server::builder()
             .set_http_middleware(http_middleware)
@@ -238,6 +253,7 @@ impl PimbleServer {
         if let Some(every) = self.config.grant_check_interval {
             handler = handler.with_grant_check_interval(every);
         }
+        handler = handler.with_agents(agents);
         self.handler = Some(handler.clone());
         let methods = handler.into_rpc();
 

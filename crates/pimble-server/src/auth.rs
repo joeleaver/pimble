@@ -45,6 +45,7 @@ use jsonrpsee::server::{HttpBody, HttpRequest, HttpResponse};
 use subtle::ConstantTimeEq;
 use tower::{Layer, Service};
 
+use crate::agents::AgentRegistry;
 use crate::jwt::JwtVerifier;
 use crate::principal::Principal;
 
@@ -60,11 +61,18 @@ pub struct AuthLayer {
     token: Option<Arc<str>>,
     jwt: Option<Arc<JwtVerifier>>,
     allowed_origins: Arc<HashSet<String>>,
+    agents: Option<Arc<AgentRegistry>>,
 }
 
 impl AuthLayer {
     pub fn new(token: Option<String>, jwt: Option<Arc<JwtVerifier>>, allowed_origins: Vec<String>) -> Self {
-        Self { token: token.map(Arc::from), jwt, allowed_origins: Arc::new(allowed_origins.into_iter().collect()) }
+        Self { token: token.map(Arc::from), jwt, allowed_origins: Arc::new(allowed_origins.into_iter().collect()), agents: None }
+    }
+
+    /// Admit this device's AI agents by their keys (docs/AGENTS_CONTRACT.md).
+    pub fn with_agents(mut self, agents: Option<Arc<AgentRegistry>>) -> Self {
+        self.agents = agents;
+        self
     }
 }
 
@@ -77,6 +85,7 @@ impl<S> Layer<S> for AuthLayer {
             token: self.token.clone(),
             jwt: self.jwt.clone(),
             allowed_origins: Arc::clone(&self.allowed_origins),
+            agents: self.agents.clone(),
         }
     }
 }
@@ -90,6 +99,7 @@ pub struct AuthMiddleware<S> {
     token: Option<Arc<str>>,
     jwt: Option<Arc<JwtVerifier>>,
     allowed_origins: Arc<HashSet<String>>,
+    agents: Option<Arc<AgentRegistry>>,
 }
 
 impl<S, B> Service<HttpRequest<B>> for AuthMiddleware<S>
@@ -118,6 +128,7 @@ where
         let credential = extract_credential(&request);
         let token = self.token.clone();
         let jwt = self.jwt.clone();
+        let agents = self.agents.clone();
         // Cloning `inner` rather than calling it here lets the credential
         // check (which may need to await a JWKS refresh) run first and
         // decide whether `inner` is reached at all; jsonrpsee's own bound on
@@ -127,6 +138,25 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
+            // An agent's key is judged first: on the tokenless embedded
+            // server everything else is `Service`, and an agent must never
+            // be (docs/AGENTS_CONTRACT.md). A credential shaped like an
+            // agent key that matches no agent is refused, never let through
+            // as `Service`.
+            if let (Some(agents), Some(credential)) = (agents.as_ref(), credential.as_deref()) {
+                if credential.starts_with(crate::agents::KEY_PREFIX) {
+                    return match agents.connect(credential) {
+                        Some(connection) => {
+                            let principal = connection.principal();
+                            agents.touch(&principal);
+                            request.extensions_mut().insert(principal);
+                            request.extensions_mut().insert(connection);
+                            inner.call(request).await.map_err(Into::into)
+                        }
+                        None => Ok(text_response(http::StatusCode::UNAUTHORIZED, "This agent was removed or its key is wrong\n")),
+                    };
+                }
+            }
             match resolve_principal(credential.as_deref(), token.as_deref(), jwt.as_deref()).await {
                 Some(principal) => {
                     request.extensions_mut().insert(principal);
