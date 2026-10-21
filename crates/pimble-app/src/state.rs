@@ -955,6 +955,10 @@ pub struct AppStore {
     /// anchor the editor puts the caret at once the session is up
     /// (docs/LINKS_CONTRACT.md "Following a link").
     pub link_open: Signal<Option<LinkOpen>>,
+    /// A step back (`true`) or forward (`false`) asked of the focused pane's
+    /// history ([`crate::nav`]), from the menu or its shortcut; the explorer,
+    /// which opens things, takes it.
+    pub nav_step: Signal<Option<bool>>,
     /// The tooltip over a hovered link, once the pointer has rested on it
     /// (docs/LINKS_CONTRACT.md "What a link looks like").
     pub link_hover: Signal<Option<LinkTooltip>>,
@@ -1032,6 +1036,9 @@ pub struct PaneState {
     /// store is open and the node is known (docs/SPLIT_VIEW_CONTRACT.md
     /// "Persistence").
     pub restore: Signal<Option<(StoreId, NodeId)>>,
+    /// What the pane has shown, for the explorer's back and forward arrows:
+    /// this device's memory only, never stored or sent ([`crate::nav`]).
+    pub history: Signal<crate::nav::History>,
     /// Whether the pane shows a board (docs/IMAGE_MARKUP_CONTRACT.md section
     /// 1, "Showing one") instead of its editor, which stays mounted, hidden.
     pub show_board: Signal<bool>,
@@ -1071,6 +1078,7 @@ impl PaneState {
             active_edit: Signal::new(None),
             pending_anchor: Signal::new(None),
             restore: Signal::new(None),
+            history: Signal::new(crate::nav::History::default()),
             show_board: Signal::new(false),
             board: Signal::new(None),
             board_marks: Signal::new((0, true)),
@@ -1196,6 +1204,7 @@ impl AppStore {
             notice: Signal::new(String::new()),
             update_ready: Signal::new(None),
             link_open: Signal::new(None),
+            nav_step: Signal::new(None),
             link_hover: Signal::new(None),
             link_picker: Signal::new(None),
             deleted_modal_store: Signal::new(None),

@@ -115,7 +115,10 @@ fn restore_resolved(store: AppStore, url: &PimbleUrl, resolution: &LinkResolutio
     for &pane in &waiting {
         store.pane(pane).restore.set(None);
         if live {
-            store.select_in_pane(pane, Some(format!("node_{}_{}", url.store, url.node)));
+            let value = format!("node_{}_{}", url.store, url.node);
+            // Where the pane's history (crate::nav) starts this session.
+            store.pane(pane).history.update(|h| h.visit(&value));
+            store.select_in_pane(pane, Some(value));
         }
     }
     if live {

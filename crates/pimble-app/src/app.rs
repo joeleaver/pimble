@@ -301,8 +301,33 @@ fn open_node(store: AppStore, tree_state: UseTreeReturn, value: String) {
 }
 
 /// Open a tree value in pane `pane`. The tree's selected row follows when
-/// the pane has the focus.
+/// the pane has the focus, and the pane's history ([`crate::nav`]) records it.
 fn open_node_in(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value: String) {
+    store.pane(pane).history.update(|h| h.visit(&value));
+    show_in_pane(store, tree_state, pane, value);
+}
+
+/// The explorer's back (or forward) arrow: the focused pane steps through
+/// what it has shown, skipping anything in a store that is no longer open.
+fn step_history(store: AppStore, tree_state: UseTreeReturn, back: bool) {
+    let pane = store.focused();
+    let history = store.pane(pane).history;
+    loop {
+        let mut to = None;
+        history.update(|h| to = if back { h.back() } else { h.forward() });
+        let Some(value) = to else { return };
+        let opens = parse_tree_value(&value).is_some_and(|(s_id, _)| store.get_store_signal(s_id).is_some());
+        if opens {
+            show_in_pane(store, tree_state, pane, value);
+            return;
+        }
+        history.update(|h| h.forget(&value));
+    }
+}
+
+/// Open a tree value in pane `pane` without touching its history: what both
+/// an ordinary open and a step back or forward end in.
+fn show_in_pane(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value: String) {
     let focused = pane == store.focused();
     let state = store.pane(pane);
     store.select_in_pane(pane, Some(value.clone()));
@@ -1031,6 +1056,17 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             open_node_in(store, tree_state, pane, open.value);
             // Where it is in the tree, which may not have been opened that far.
             store.send(BackendCommand::GetAncestors { store_id: open.store_id, node_id: open.node_id });
+        });
+    });
+
+    // View > Back / Forward (and their shortcuts): a step through the
+    // focused pane's history, taken here where opening lives, deferred out of
+    // the effect as a followed link is.
+    let _ = rinch::Effect::new(move || {
+        let Some(back) = store.nav_step.get() else { return };
+        let _ = set_timeout(0, move || {
+            store.nav_step.set(None);
+            step_history(store, tree_state, back);
         });
     });
 
@@ -4200,6 +4236,37 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 span {
                                     class: "pimble-sidebar__heading",
                                     "EXPLORER"
+                                }
+
+                                // Back and forward through what the focused
+                                // pane has shown (this device only, crate::nav).
+                                div {
+                                    title: "Back (Alt+Left)",
+                                    style: {move || if store.pane(store.focused_pane.get()).history.with(|h| h.can_go_back()) {
+                                        ""
+                                    } else {
+                                        "opacity: 0.35; pointer-events: none;"
+                                    }},
+                                    ActionIcon {
+                                        icon: TablerIcon::ArrowLeft,
+                                        variant: "subtle",
+                                        size: "xs",
+                                        onclick: move || step_history(store, tree_state, true),
+                                    }
+                                }
+                                div {
+                                    title: "Forward (Alt+Right)",
+                                    style: {move || if store.pane(store.focused_pane.get()).history.with(|h| h.can_go_forward()) {
+                                        ""
+                                    } else {
+                                        "opacity: 0.35; pointer-events: none;"
+                                    }},
+                                    ActionIcon {
+                                        icon: TablerIcon::ArrowRight,
+                                        variant: "subtle",
+                                        size: "xs",
+                                        onclick: move || step_history(store, tree_state, false),
+                                    }
                                 }
 
                                 // Only the browser build registers this: it is

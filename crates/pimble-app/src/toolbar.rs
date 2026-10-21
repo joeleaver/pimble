@@ -509,7 +509,7 @@ mod tests {
         assert!(h.load_html("<p><strong>bold</strong> plain</p>"));
         h.set_selection(Selection::cursor(Pos(8)));
 
-        let count: usize = button_groups().iter().map(Vec::len).sum();
+        let count: usize = button_groups().iter().map(|g| g.buttons.len()).sum();
         let signals: Vec<Signal<bool>> = (0..count).map(|_| Signal::new(false)).collect();
         BUTTON_ACTIVE.with(|b| *b.borrow_mut() = signals.clone());
         let runs: Vec<Rc<Cell<u32>>> = (0..count).map(|_| Rc::new(Cell::new(0))).collect();

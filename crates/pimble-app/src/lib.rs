@@ -32,6 +32,7 @@ pub mod import;
 pub mod link_picker;
 pub mod links;
 pub mod menus;
+pub mod nav;
 pub mod pane_view;
 pub mod panes;
 pub mod persistence;
