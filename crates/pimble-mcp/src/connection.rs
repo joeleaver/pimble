@@ -30,6 +30,12 @@ impl Connection {
         Self { inner: Mutex::new(Inner { client: None, owned: None }) }
     }
 
+    /// A connection that is already made, to a server a test started.
+    #[cfg(test)]
+    pub fn with_client(client: PimbleClient) -> Self {
+        Self { inner: Mutex::new(Inner { client: Some(Arc::new(client)), owned: None }) }
+    }
+
     /// A live client: the one held, or a new connection when there is none or it
     /// closed. A server this process starts opens the saved store list, so the
     /// LLM sees what the person sees in the explorer.

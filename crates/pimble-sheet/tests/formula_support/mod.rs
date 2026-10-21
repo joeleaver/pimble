@@ -9,7 +9,7 @@ use pimble_core::{NodeId, StoreId};
 use pimble_sheet::formula::{self, Engine, Value};
 use pimble_sheet::{
     Book, ColumnSnap, ColumnType, Format, NodeInfo, NodeRef, Reach, RowSnap, SheetsSnap, Stored,
-    TableSnap,
+    ResultKey, TableSnap,
 };
 use uuid::Uuid;
 
@@ -324,7 +324,7 @@ impl TB {
     pub fn summary(mut self, source: &str, headers: &[&str]) -> TB {
         self.t.source = Some(source.to_string());
         for (i, h) in headers.iter().enumerate() {
-            self.t.headers.insert(i, h.to_string());
+            self.t.headers.insert(ResultKey::Pos(i), h.to_string());
         }
         self
     }

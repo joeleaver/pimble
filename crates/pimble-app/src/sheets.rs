@@ -32,7 +32,7 @@ use pimble_core::{node_types, NodeId, StoreId};
 use pimble_crdt::NodeDoc;
 use pimble_sheet::doc::{self, Placement, Sheets};
 use pimble_sheet::formula::{self, ComputedTable, Engine, ErrorCode, Value};
-use pimble_sheet::{input, Book, ColumnType, Format, NodeInfo, NodeRef, Reach, SheetsSnap, Stored};
+use pimble_sheet::{input, Book, ColumnType, Format, NodeInfo, NodeRef, Reach, ResultKey, SheetsSnap, Stored};
 use rinch::prelude::*;
 
 use crate::panes::{PaneId, MAX_PANES};
@@ -1233,7 +1233,13 @@ pub(crate) fn set_source(store: AppStore, pane: PaneId, table: &str, shown: &str
     let Some(book) = book_for(store, pane) else { return };
     match formula::to_stored(&book, Some(table), shown) {
         Ok(stored) => {
-            local_edit(store, pane, |t| t.set_source(table, Some(&stored)));
+            // What still names a result column by position moves to its key
+            // first, so the new formula cannot move it (contract section 4).
+            let rekey = formula::rekey_note(&book);
+            local_edit(store, pane, |t| {
+                rekey.apply(t)?;
+                t.set_source(table, Some(&stored))
+            });
         }
         Err(e) => say(store, pane, e.message),
     }
@@ -1812,7 +1818,21 @@ pub(crate) fn apply_column(store: AppStore, pane: PaneId) {
         return form_error(store, pane, "Give the column a name.");
     }
     if let Some(index) = form.result {
-        if local_edit(store, pane, |t| t.set_header(&form.table, index, Some(&name))).is_some() {
+        // Renamed by the column's key, so the rename stays with the column
+        // when the summary's formula changes (contract section 4).
+        let key = book_for(store, pane)
+            .and_then(|book| {
+                let engine = Engine::new(&book);
+                let ct = engine.compute_table(&book.home, &form.table).ok()?;
+                ct.columns.iter().filter(|c| c.id.is_none()).nth(index).and_then(|c| c.result_key.clone())
+            })
+            .map(ResultKey::Key)
+            .unwrap_or(ResultKey::Pos(index));
+        let edited = local_edit(store, pane, |t| {
+            t.set_header(&form.table, &ResultKey::Pos(index), None)?;
+            t.set_header(&form.table, &key, Some(&name))
+        });
+        if edited.is_some() {
             ui.column_form.set(None);
         }
         return;

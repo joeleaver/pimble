@@ -179,19 +179,19 @@ fn source_and_headers() {
     let s = Sheets::of_node(&f.a);
     s.edit(|t| {
         t.set_source(&f.table, Some("=SORT(x)"))?;
-        t.set_header(&f.table, 0, Some("Month"))?;
-        t.set_header(&f.table, 2, Some("Spent"))
+        t.set_header(&f.table, &ResultKey::Pos(0), Some("Month"))?;
+        t.set_header(&f.table, &ResultKey::Pos(2), Some("Spent"))
     })
     .into_result()
     .unwrap();
     let t = s.table(&f.table).unwrap();
     assert!(t.is_summary());
     assert_eq!(t.source.as_deref(), Some("=SORT(x)"));
-    assert_eq!(t.headers.get(&0).map(String::as_str), Some("Month"));
-    assert_eq!(t.headers.get(&2).map(String::as_str), Some("Spent"));
+    assert_eq!(t.headers.get(&ResultKey::Pos(0)).map(String::as_str), Some("Month"));
+    assert_eq!(t.headers.get(&ResultKey::Pos(2)).map(String::as_str), Some("Spent"));
     s.edit(|t| {
         t.set_source(&f.table, None)?;
-        t.set_header(&f.table, 0, None)
+        t.set_header(&f.table, &ResultKey::Pos(0), None)
     })
     .into_result()
     .unwrap();
@@ -727,7 +727,7 @@ fn watch_names_the_tables_that_changed() {
     s.edit(|t| t.delete_table(&t2)).into_result().unwrap();
     assert!(w.take().tables.contains(&t2));
     // A remote change is reported too.
-    let (_, u) = Sheets::of_node(&f.b).edit(|t| t.set_header(&f.table, 0, Some("h"))).into_result().unwrap();
+    let (_, u) = Sheets::of_node(&f.b).edit(|t| t.set_header(&f.table, &ResultKey::Pos(0), Some("h"))).into_result().unwrap();
     let mut a = f.a;
     send(u, &mut a);
     assert_eq!(w.take().tables, [f.table.clone()].into_iter().collect());

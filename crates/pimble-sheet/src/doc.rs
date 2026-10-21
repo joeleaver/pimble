@@ -3,7 +3,7 @@
 //! ```text
 //! data root (shared with boards and plugins), one key per table:
 //! "sheet:<table id>": Map {
-//!   v: 1, name: String, order: String, source: String?, headers: Map<"<index">, String>,
+//!   v: 1, name: String, order: String, source: String?, headers: Map<"k:<key>" | "<index>", String>,
 //!   columns: Map<column id, Map {
 //!     name, order, type: "text" | "number" | "money" | "date" | "hours" | "row_link" | "node_link" | "formula",
 //!     target: String? (row_link: the table id),
@@ -409,8 +409,8 @@ impl<'a, 'doc> SheetsTxn<'a, 'doc> {
         }
         if !table.headers.is_empty() {
             let headers: MapRef = t.insert(self.txn, HEADERS, MapPrelim::default());
-            for (index, header) in &table.headers {
-                headers.insert(self.txn, index.to_string(), header.clone());
+            for (key, header) in &table.headers {
+                headers.insert(self.txn, key.to_stored(), header.clone());
             }
         }
         let columns: MapRef = t.insert(self.txn, COLUMNS, MapPrelim::default());
@@ -477,16 +477,17 @@ impl<'a, 'doc> SheetsTxn<'a, 'doc> {
         Ok(())
     }
 
-    /// Rename (or with `None`, un-rename) a summary's result column by position.
-    pub fn set_header(&mut self, table: &str, index: usize, header: Option<&str>) -> Result<()> {
+    /// Rename (or with `None`, un-rename) a summary's result column by its
+    /// key (see [`ResultKey`]); a rename by position is only ever taken back.
+    pub fn set_header(&mut self, table: &str, key: &ResultKey, header: Option<&str>) -> Result<()> {
         let t = self.table_map(table)?;
         let headers = self.sub_map(&t, HEADERS);
         match header {
             Some(h) => {
-                headers.insert(self.txn, index.to_string(), h.to_string());
+                headers.insert(self.txn, key.to_stored(), h.to_string());
             }
             None => {
-                headers.remove(self.txn, &index.to_string());
+                headers.remove(self.txn, &key.to_stored());
             }
         }
         Ok(())
@@ -913,8 +914,8 @@ fn read_table<T: ReadTxn>(txn: &T, id: &str, t: &MapRef) -> TableSnap {
     let headers = child_map(txn, t, HEADERS)
         .map(|m| {
             m.iter(txn)
-                .filter_map(|(k, v)| match (k.parse::<usize>(), v) {
-                    (Ok(i), Out::Any(Any::String(s))) => Some((i, s.to_string())),
+                .filter_map(|(k, v)| match (ResultKey::from_stored(k), v) {
+                    (Some(key), Out::Any(Any::String(s))) => Some((key, s.to_string())),
                     _ => None,
                 })
                 .collect()

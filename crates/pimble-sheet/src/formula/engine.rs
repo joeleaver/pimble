@@ -23,7 +23,7 @@ use std::rc::Rc;
 
 use crate::book::{Book, Reach};
 use crate::model::{
-    ColumnSnap, ColumnType, Format, NodeRef, RowSnap, SheetsSnap, Stored, TableSnap,
+    ColumnSnap, ColumnType, Format, NodeRef, ResultKey, RowSnap, SheetsSnap, Stored, TableSnap,
 };
 
 use super::ast::*;
@@ -67,6 +67,8 @@ enum Enter {
 #[derive(Debug, Clone)]
 pub(crate) struct Summary {
     pub cols: Vec<ColMeta>,
+    /// Each result column's key ([`ResultKey`]), in the same order.
+    pub keys: Vec<String>,
     pub rows: Vec<SRow>,
     pub index: HashMap<String, usize>,
 }
@@ -93,6 +95,8 @@ pub(crate) enum ColSrc<'b> {
 pub(crate) struct TabCol<'b> {
     pub meta: ColMeta,
     pub src: ColSrc<'b>,
+    /// A result column's key; `None` for an own column.
+    pub key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -155,6 +159,9 @@ pub struct ComputedColumn {
     pub link: Option<TableAddr>,
     /// Computed (a formula column, or a summary's result) rather than typed.
     pub computed: bool,
+    /// A summary's result column's key ([`ResultKey`]); `None` for a column
+    /// of the table's own.
+    pub result_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -259,6 +266,7 @@ impl<'b> Engine<'b> {
                 _ => None,
             },
             computed: matches!(c.ty, ColumnType::Formula { .. }),
+            result_key: None,
         };
         let mut out = ComputedTable {
             id: t.id.clone(),
@@ -298,12 +306,14 @@ impl<'b> Engine<'b> {
                 out.columns = s
                     .cols
                     .iter()
-                    .map(|m| ComputedColumn {
+                    .zip(&s.keys)
+                    .map(|(m, k)| ComputedColumn {
                         id: None,
                         name: m.name.clone(),
                         format: m.format,
                         link: m.link.clone(),
                         computed: true,
+                        result_key: Some(k.clone()),
                     })
                     .chain(t.columns.iter().map(own))
                     .collect();
@@ -479,7 +489,7 @@ impl<'b> Engine<'b> {
     ) -> Result<Option<&'b TableSnap>, FormulaError> {
         match name {
             NameRef::Id(id) => Ok(snap.table(id)),
-            NameRef::Dead | NameRef::Pos(_) => Err(FormulaError::reference(
+            NameRef::Dead | NameRef::Pos(_) | NameRef::Key(_) => Err(FormulaError::reference(
                 "This formula points at a table that was deleted",
             )),
             NameRef::Name(n) => {
@@ -552,6 +562,7 @@ impl<'b> Engine<'b> {
                 },
             },
             src: ColSrc::Own(c),
+            key: None,
         });
         if !t.is_summary() {
             return Ok(own.collect());
@@ -566,6 +577,7 @@ impl<'b> Engine<'b> {
                 .map(|(i, m)| TabCol {
                     meta: m.clone(),
                     src: ColSrc::Result(i),
+                    key: s.keys.get(i).cloned(),
                 })
                 .chain(own)
                 .collect()),
@@ -585,6 +597,11 @@ impl<'b> Engine<'b> {
             NameRef::Pos(i) => cols
                 .iter()
                 .position(|c| matches!(c.src, ColSrc::Result(j) if j == *i)),
+            NameRef::Key(k) => {
+                let k = norm(k);
+                cols.iter()
+                    .position(|c| c.key.as_deref().is_some_and(|ck| norm(ck) == k))
+            }
             NameRef::Dead => None,
         }
     }
@@ -610,6 +627,10 @@ impl<'b> Engine<'b> {
                     t.name
                 ))
             }
+            NameRef::Key(k) => FormulaError::reference(format!(
+                "This formula reads the result column that came from \"{k}\", and {}'s formula no longer gives one",
+                t.name
+            )),
             _ => FormulaError::reference(format!(
                 "This formula points at a column of {} that was deleted",
                 t.name
@@ -944,17 +965,21 @@ impl<'b> Engine<'b> {
                 ))
             }
         };
+        let keys = result_keys(a.cols.iter().map(|c| c.meta.name.as_str()));
         let mut seen = HashSet::new();
         let cols: Vec<ColMeta> = a
             .cols
             .iter()
             .enumerate()
             .map(|(j, c)| {
-                let base = t
-                    .headers
-                    .get(&j)
-                    .map(|h| h.trim())
-                    .filter(|h| !h.is_empty())
+                let header = |k: &ResultKey| {
+                    t.headers
+                        .get(k)
+                        .map(|h| h.trim())
+                        .filter(|h| !h.is_empty())
+                };
+                let base = header(&ResultKey::Key(keys[j].clone()))
+                    .or_else(|| header(&ResultKey::Pos(j)))
                     .unwrap_or(&c.meta.name)
                     .to_string();
                 let mut name = base.clone();
@@ -987,7 +1012,7 @@ impl<'b> Engine<'b> {
                 base,
             });
         }
-        Ok(Summary { cols, rows, index })
+        Ok(Summary { cols, keys, rows, index })
     }
 
     // ── Evaluation ──────────────────────────────────────────────────────
@@ -1401,4 +1426,27 @@ impl Labels for Engine<'_> {
             None => self.book.display_name(node),
         }
     }
+}
+
+/// The keys of a summary's result columns, from the names its formula gives
+/// them ([`ResultKey`]): the name, `name 2` for its second use, `#<position>`
+/// for a column with none.
+pub(crate) fn result_keys<'a>(names: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    names
+        .enumerate()
+        .map(|(j, n)| {
+            let n = n.trim();
+            if n.is_empty() {
+                return format!("#{j}");
+            }
+            let mut key = n.to_string();
+            let mut k = 2;
+            while !seen.insert(norm(&key)) {
+                key = format!("{n} {k}");
+                k += 1;
+            }
+            key
+        })
+        .collect()
 }

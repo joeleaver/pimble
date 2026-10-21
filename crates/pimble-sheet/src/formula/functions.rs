@@ -68,6 +68,7 @@ pub const CATEGORIES: &[(&str, &[&str])] = &[
             "CONCAT",
             "CONCATENATE",
             "LEFT",
+            "REPT",
             "RIGHT",
             "MID",
             "LEN",
@@ -135,7 +136,6 @@ const NOT_YET: &[(&str, &[&str])] = &[
             "FIND",
             "SEARCH",
             "REPLACE",
-            "REPT",
             "EXACT",
             "TEXTBEFORE",
             "TEXTAFTER",
@@ -1572,6 +1572,7 @@ fn elementwise(en: &Engine, name: &str, a: &Args) -> Val {
         "ROUND" | "ROUNDUP" | "ROUNDDOWN" | "MOD" | "POWER" | "EOMONTH" | "EDATE" | "DAYS"
         | "TEXT" => (2, 2),
         "LEFT" | "RIGHT" | "WEEKDAY" => (1, 2),
+        "REPT" => (2, 2),
         "MID" | "DATE" => (3, 3),
         "SWITCH" => (3, 255),
         "CONCATENATE" => (1, 255),
@@ -1714,6 +1715,22 @@ fn scalar_fn(en: &Engine, name: &str, xs: &[Option<&Value>]) -> Result<Value, Fo
             } else {
                 chars[chars.len() - k..].iter().collect()
             }))
+        }
+        "REPT" => {
+            // Excel: the count is truncated; a negative one, or a result over
+            // 32,767 characters, is #VALUE!.
+            let s = t(0)?;
+            let k = n(1)?;
+            if k < 0.0 {
+                return Err(FormulaError::value("REPT() can't repeat fewer than 0 times"));
+            }
+            let k = trunc(k) as usize;
+            if s.chars().count().saturating_mul(k) > 32_767 {
+                return Err(FormulaError::value(
+                    "REPT() would make more than 32,767 characters",
+                ));
+            }
+            Ok(Value::Text(s.repeat(k)))
         }
         "MID" => {
             let s = t(0)?;
