@@ -395,3 +395,26 @@ fn a_new_sheet_is_made_in_one_update() {
     let e = new_sheet_content("T", &[formula_col("x", "=[@nope]", "auto")], &[], false, r(77), today()).unwrap_err();
     assert!(e.contains("nope"), "{e}");
 }
+
+#[test]
+fn a_date_field_plus_days_shows_a_date() {
+    let mut n = Note::new();
+    n.book.add_node(r(20), "Rome trip", None);
+    n.book.set_fields(r(20), vec![("trip_start".into(), "2026-11-03".into())]);
+    n.book.add_sheets(r(20), SheetsSnap::default());
+    n.work(|w| {
+        create_table(
+            w,
+            "Itinerary",
+            &[col("day", "number"), formula_col("date", "='Rome trip'!trip_start + [@day] - 1", "auto")],
+            &[row(&[("day", "1")]), row(&[("day", "2")])],
+            false,
+            None,
+        )
+        .unwrap();
+    });
+    let out = n.render("Itinerary");
+    assert!(out.contains("| 1 | Tue, Nov 3 |"), "{out}");
+    assert!(out.contains("| 2 | Wed, Nov 4 |"), "{out}");
+    assert!(!out.contains("46,"), "{out}");
+}

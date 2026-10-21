@@ -202,6 +202,8 @@ pub struct Engine<'b> {
     rows: RefCell<HashMap<TableKey, Rc<Vec<RowRef>>>>,
     summaries: RefCell<HashMap<TableKey, SummarySlot>>,
     parsed: RefCell<HashMap<String, Rc<Result<Expr, ParseError>>>>,
+    /// Automatic formula columns' inferred formats ([`super::infer`]).
+    formats: RefCell<HashMap<(NodeRef, String, String), Format>>,
     stack: RefCell<Vec<Key>>,
     cyclic: RefCell<HashSet<Key>>,
     depth: Cell<usize>,
@@ -216,6 +218,7 @@ impl<'b> Engine<'b> {
             rows: RefCell::default(),
             summaries: RefCell::default(),
             parsed: RefCell::default(),
+            formats: RefCell::default(),
             stack: RefCell::default(),
             cyclic: RefCell::default(),
             depth: Cell::new(0),
@@ -224,6 +227,10 @@ impl<'b> Engine<'b> {
 
     pub fn book(&self) -> &'b dyn Book {
         self.book
+    }
+
+    pub(super) fn formats(&self) -> &RefCell<HashMap<(NodeRef, String, String), Format>> {
+        &self.formats
     }
 
     /// Today, as a serial.
@@ -254,10 +261,10 @@ impl<'b> Engine<'b> {
     }
 
     fn compute(&self, node: &NodeRef, t: &'b TableSnap) -> ComputedTable {
-        let own = |c: &ColumnSnap| ComputedColumn {
+        let own = |c: &'b ColumnSnap| ComputedColumn {
             id: Some(c.id.clone()),
             name: c.name.clone(),
-            format: c.ty.format(),
+            format: self.column_format(node, t, c),
             link: match &c.ty {
                 ColumnType::RowLink { table } => Some(TableAddr {
                     node: *node,
@@ -552,7 +559,7 @@ impl<'b> Engine<'b> {
         let own = t.columns.iter().map(|c| TabCol {
             meta: ColMeta {
                 name: c.name.clone(),
-                format: c.ty.format(),
+                format: self.column_format(node, t, c),
                 link: match &c.ty {
                     ColumnType::RowLink { table } => Some(TableAddr {
                         node: *node,
