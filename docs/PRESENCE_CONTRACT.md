@@ -301,6 +301,9 @@ Each wave is checked in the desktop app and in the browser on the local stack
    the accounts service in the clear. A new Account > "Shares..." dialog holds a
    default name and one row per share, owned or joined, with Open / Add Here. There is no
    "Leave" button.
+6. Invitation and "shared with you" mails keep naming the inviter by email.
+7. The accounts service change (names, members not seeing each other's emails,
+   `shared_by` as a name) ships with the next deploy, together with desktop and web.
 
 ## To confirm
 
@@ -384,8 +387,6 @@ Each wave is checked in the desktop app and in the browser on the local stack
 - The browser learns other people's new names only when it asks again (a store
   registered, its own name set). There is no `PeopleChanged` there.
 - The discussions list row ("Alice: the latest message") shows the stamped name.
-- The invitation and "shared with you" mails still name the inviter by email; that is
-  for Joe to decide.
 - Stamps written before this wave keep the email's local part in the document. Only
   the display is corrected, for people who are still members.
 - The owner is never asked the one-line question; their default name applies until

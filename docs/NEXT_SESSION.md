@@ -18,11 +18,9 @@ contract.
 - `viewport_top` waits for wave 4 (follow): finding the first position in view needs a
   point hit-test the editor does not offer.
 
-1111 workspace tests pass. Before merging, ask Joe two things:
-1. Should the invitation mails stop naming the inviter by email?
-2. Should the accounts service change (member lists without emails for members,
-   `shared_by` as a name) ship with the next release and deploy? Older desktops show
-   blank member emails then.
+1111 workspace tests pass. Joe answered the open questions (contract "Decisions" 6
+and 7): invitation mails keep naming the inviter by email, and the accounts service
+change ships with the next deploy, together with desktop and web.
 
 Next is wave 3: pointers and selections on boards.
 
