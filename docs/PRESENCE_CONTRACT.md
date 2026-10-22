@@ -2,7 +2,7 @@
 
 Status: **proposed, 2026-10-22, not built.** Written from Joe's answers that day (listed
 under "Decisions" at the end). The points under "To confirm" are design choices made here
-that Joe has not seen yet.
+that Joe has not seen yet. Section 3 (names per share) was added later the same day.
 
 Builds on docs/IMAGE_MARKUP_CONTRACT.md sections 6 and 7 (identity is the signed-in
 account; presence is designed once, for text and boards together, and is never document
@@ -90,20 +90,23 @@ subscription.
   has a handful of people. An interest filter, where carets go only to those holding the
   document, is a later step if measurement asks for one.
 
-## 3. Who
+## 3. Who, and the name you go by in each share
 
-- **`who` is stamped by the server that first authenticates the sender.** It is
-  `Who { sub, name }`.
-  - The hosted server and the relay face stamp it from the JWT: `sub`, plus the local part
-    of the email as `name`, the same as the board author stamp (`set_author`).
-  - An agent's frames are stamped from its principal (`agent:<id>` and the agent's name).
+### Who a frame is from
+
+- **`who` is the account `sub`, stamped by the server that first authenticates the
+  sender.** It is `Who { sub, agent: Option<String> }` and never carries a name: names
+  are resolved by whoever shows the frame (below).
+  - The hosted server and the relay face stamp `sub` from the JWT.
   - The app's own embedded server sees `Principal::Service`, so it stamps from its
     keystore's signed-in account. Signed out, it leaves `who` empty.
+  - An agent's frames carry the `sub` of the account whose server it runs on, plus the
+    agent's name in `agent`. It shows as "Claude (Sam's agent)" with Sam's name in that
+    share.
   - A frame forwarded on a link keeps the `who` it has. A server receiving through a link
     authenticated as user U accepts a frame whose `who` is empty or names U. Any other
     frame is accepted only from a `Service` link (one operator's devices). So a member
     cannot appear as another member on the hosted server.
-  - Like attribution, it is a label and not proof.
 - **Colors** come from `pimble_board::author_color(sub)`, so a person has the same color on
   board elements, discussions and presence. A session with no `who` shows as its `device`
   in gray.
@@ -111,8 +114,70 @@ subscription.
   initials and the device label ("you, on Web"). Your own panes in this window show
   nothing: the app drops frames whose `client_uuid` is its own.
 - **Device label.** It is the hostname on the desktop and "Web" in the browser, sealed
-  inside the body. Nicknames and a people directory stay later (2026-09-21). `name`
-  changes nothing stored.
+  inside the body.
+
+### The name you go by (Joe, 2026-10-22)
+
+Everyone chooses, per share they take part in, the name they appear as there. Inside a
+share, that name is all the other members see of them. **Members never see each other's
+emails.** Only the owner does, because the owner manages the share and invites by email.
+
+- **Where names live.** They live in the accounts service, in the clear, like the share's
+  own name. It has two parts:
+  - `User.display_name` is the **default name**, used in every share that has no name of
+    its own, and on your own devices.
+  - A new type, `ShareName { user, store, root, name }`, is one row per (account, share).
+    It is a separate row and not a field on `Grant`, because the owner holds the store
+    through a whole-store grant but has a name per share too.
+  - **Until you choose anything**, you show as the local part of your email. The first time
+    you open a share you take part in, a one-line prompt asks "How should the people in
+    <share> see you?", pre-filled with your default name.
+- **Who sees what.** `GET /stores/{id}/members?root=` answers each member's name for that
+  share. It answers the email only to the owner, and owners see both. Today every member
+  gets every email, so that changes.
+  - "Shared by <owner>", the name of a member's replica, uses the owner's name in that
+    share and stops using the owner's email (`cloud.rs`, `share.rs`).
+- **How a name reaches a screen.** Frames, discussion messages and board elements name
+  people by `sub`. A device turns a `sub` into a name through the member list of the share
+  it reaches that document through:
+  - It fetches the list at connect and again whenever the grant shape changes (the
+    two-minute `grant_shape` poll).
+  - It caches the list beside the replica's manifest, as derived data that is rebuilt
+    freely, so names still show offline.
+  - A document in two nested shares shows each viewer the name used in *their* share.
+  - The JWT changes nothing, so the roles model and token claims stay as they are. The
+    accounts service is the authority for names. Nobody can claim another member's name,
+    because a name is looked up by the `sub` a server stamped.
+- **Everything in the share uses it.** That covers presence, discussion message authors,
+  board author stamps ("Arrow, by Sam") and the member list.
+  - Stamps written into documents (`Author { id, name }`) keep their `id`. The `name`
+    written from now on is the name in effect for that document's innermost share when you
+    write it, and never anything derived from an email.
+  - The display already prefers the current name for a known `id` over the stamp
+    (IMAGE_MARKUP_CONTRACT section 6), so renaming yourself relabels everything you made
+    in that share.
+  - Stamps written before this, which hold the email's local part, keep showing whatever
+    they say only where the `id` is not a member any more.
+- **Your own store, no share.** Your own devices show you as "you". An agent shows by its
+  name.
+
+### The Shares dialog
+
+There is a new item, Account > "Shares...", on the desktop and in the browser.
+
+- At the top is **Your name**, the default name field. It applies on Enter or when the
+  field loses focus, as the appearance picker's tags do.
+- Below it, one row per share you take part in, **shares you own included**:
+  - the share's name, its owner's name, and your role;
+  - an **Appear as** field, empty to use the default name;
+  - **Open**, which selects the share's root in the explorer, or **Add Here** when the
+    share is not on this device. Add Here is the command "Add Hosted Store..." already
+    runs (`AddHostedStore`). "Add Hosted Store..." stays, for whole stores.
+- It reads from a new `GET /api/v1/me/shares`, which lists owned and joined shares with
+  your name in each, and writes through `PUT /api/v1/me` (`display_name`) and
+  `PUT /api/v1/me/shares/{store}/{root}` (`name`). Both are account calls and go through
+  the embedded server's Service-only `cloud*` RPCs on the desktop.
+- Leaving a share is not part of it.
 
 ## 4. Text
 
@@ -201,6 +266,10 @@ subscription.
 
 ## 10. Waves
 
+0. **Names**: `display_name`, `ShareName`, the member list answering names and not
+   emails to members, `GET /me/shares`, the Shares dialog, the first-open prompt, names
+   resolved by `sub` everywhere a person is named (discussions, board stamps, "Shared
+   by"). This wave comes first, so presence never shows an email.
 1. **Transport and who is here.** `publishPresence`, `getPresence`, the `Presence`
    notification, the in-memory table with `seq` and expiry, stamping, forwarding in all
    three links, sealing. The app (desktop and web) gets the pane initials and the tree
@@ -227,11 +296,19 @@ Each wave is checked in the desktop app and in the browser on the local stack
    and through the relay.
 3. Agents show as present while they edit.
 4. No opt-out: presence is always on.
+5. Per share, everyone chooses the name they appear as. Members never see each other's
+   emails (the owner does). The name applies to everything in the share. It is kept in
+   the accounts service in the clear. A new Account > "Shares..." dialog holds a
+   default name and one row per share, owned or joined, with Open / Add Here. There is no
+   "Leave" button.
 
 ## To confirm
 
-- Display name is the email's local part until nicknames exist (the board stamp does the
-  same). Device label is the hostname.
+- Until someone chooses a name, they show as their email's local part, and a one-line
+  prompt asks for a name the first time they open a share. The device label is the
+  hostname.
+- Names reach screens through the member list (looked up by `sub`), not through the JWT,
+  so token claims do not change.
 - Your own sessions on other devices show as "you, on <device>".
 - Agents cannot be followed in the first version.
 - Everything goes on the store channel in the first version, with no interest filter.
