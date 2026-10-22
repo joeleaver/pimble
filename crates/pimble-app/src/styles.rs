@@ -1428,14 +1428,29 @@ pub(crate) const APP_CSS: &str = "
     font-size: 12px;
 }
 
+/* What a cell shows, kept under its edit box so the cell keeps its size. */
+.pimble-sheet__under {
+    visibility: hidden;
+}
+
+/* The edit box covers its cell and takes no room of its own, its text
+   where the cell's was: typing in a cell looks like the cell itself taking
+   a caret, with only a faint tint to say which one. */
 .pimble-sheet__edit {
+    position: absolute;
+    left: 0;
+    top: 0;
     width: 100%;
+    height: 100%;
     box-sizing: border-box;
     font: inherit;
-    border: 2px solid var(--rinch-primary-color-6);
-    padding: 2px 4px;
-    margin: -4px -6px;
-    background: var(--rinch-color-body);
+    text-align: inherit;
+    border: none;
+    outline: none;
+    border-radius: 0;
+    padding: 5px 8px;
+    margin: 0;
+    background: var(--rinch-color-option-hover);
     color: var(--rinch-color-text);
 }
 
@@ -1677,19 +1692,26 @@ pub(crate) const APP_CSS: &str = "
     pointer-events: none;
 }
 
-/* A picture's corner: drag to resize it (text_boards.rs `render_controls`). */
+/* A picture's corners and sides: drag one to resize it, keeping its
+   proportions (text_boards.rs `resize_grip`). */
 .pimble-picture-overlay__resize {
     position: absolute;
-    right: -6px;
-    bottom: -6px;
     width: 12px;
     height: 12px;
     border-radius: 3px;
     background: var(--rinch-primary-color);
     border: 2px solid var(--rinch-color-body);
-    cursor: nwse-resize;
     pointer-events: auto;
 }
+
+.pimble-picture-overlay__resize--nw { left: -6px; top: -6px; cursor: nwse-resize; }
+.pimble-picture-overlay__resize--n { left: 50%; margin-left: -6px; top: -6px; cursor: ns-resize; }
+.pimble-picture-overlay__resize--ne { right: -6px; top: -6px; cursor: nesw-resize; }
+.pimble-picture-overlay__resize--e { right: -6px; top: 50%; margin-top: -6px; cursor: ew-resize; }
+.pimble-picture-overlay__resize--se { right: -6px; bottom: -6px; cursor: nwse-resize; }
+.pimble-picture-overlay__resize--s { left: 50%; margin-left: -6px; bottom: -6px; cursor: ns-resize; }
+.pimble-picture-overlay__resize--sw { left: -6px; bottom: -6px; cursor: nesw-resize; }
+.pimble-picture-overlay__resize--w { left: -6px; top: 50%; margin-top: -6px; cursor: ew-resize; }
 
 .pimble-picture-overlay--resizing {
     outline: 2px dashed var(--rinch-primary-color);

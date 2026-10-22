@@ -494,7 +494,10 @@ fn cell_node(__scope: &mut RenderScope, store: AppStore, pane: PaneId, key: Cell
             class: class,
             title: tip,
             onclick: move || cell_pressed(store, pane, press_key.clone()),
+            // The edit box lies over the cell and the text stays under it,
+            // hidden, so opening a cell never resizes its row or columns.
             if ui.editing.get().as_ref() == Some(&editing_key) {
+                div { class: "pimble-sheet__under", {shown.clone()} }
                 {edit_input(__scope, store, pane)}
             } else {
                 {shown.clone()}

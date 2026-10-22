@@ -127,6 +127,10 @@ The UI calls this the column's **type** (Joe, 2026-10-19). From the mockup:
 
 - **Headers are one line**: the name, then the faint mark. The full type, or the
   formula, is in the tooltip.
+- **Typing happens in the cell** (Joe, 2026-10-21: no box that jumps out and resizes
+  things): a click puts the caret in the cell's own text, which stays where it was; the
+  cell takes a faint tint, and nothing changes size, so the rows and columns stay put.
+  The edit box lies over the cell with the cell's text hidden under it.
 - **A link cell opens a picker** listing every choice, with a ✓ on the current one.
   Typing filters it, the arrow keys move through it, Enter picks, and Escape closes it.
   The browser's own autocomplete is wrong for this: it lists only what already matches

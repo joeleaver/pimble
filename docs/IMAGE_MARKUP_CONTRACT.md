@@ -154,11 +154,13 @@ A board node shown inside another node's text, as a picture, live (Joe, 2026-10-
   should not navigate). Ctrl/Cmd+click opens it in the pane, as a link is followed, and so
   does a double-click; "Open Board" on its menu too. "Mark Up..." on an embed opens the
   board node itself, so there is never a second copy of its marks.
-- **Resizing** (Joe, 2026-10-20, for embeds and pictures alike): the corner handle on the
-  controls over a picture or embed drags its width, keeping its proportions, with a
-  dashed outline of the new size; the release writes the atom's `width` (CSS pixels,
+- **Resizing** (Joe, 2026-10-20, for embeds and pictures alike; all eight grips, Joe,
+  2026-10-21): a grip at each corner and in the middle of each side of the controls over
+  a picture or embed drags its width, keeping its proportions (a side's grip by its own
+  axis, a corner's by the axis the pointer moved further along), with a dashed outline of
+  the new size that keeps the side across from the grip in place; the release writes the atom's `width` (CSS pixels,
   at least 32, at most the text's width) as one edit of the text, so every device shows
-  the same size. A read-only text has no handle.
+  the same size. A read-only text has no grips.
 - **It is a link**: it follows the board's `became` when the board moves out of a share
   or between stores, counts in the board's backlinks, and is offered when "Recently
   Deleted" lists the board. A board that is deleted, not here yet, or that this person

@@ -907,7 +907,7 @@ fn write_width(pane: PaneId, src: &str, board: Option<&str>, hint: usize, width:
     })
 }
 
-/// The narrowest a picture can be made by dragging its corner.
+/// The narrowest a picture can be made by dragging a grip.
 const MIN_PICTURE_PX: f32 = 32.0;
 
 /// An image atom showing board node `url`, titled `title`.
@@ -1363,14 +1363,134 @@ pub(crate) fn node_created(store: AppStore, request: u64, store_id: StoreId, nod
 
 // ── The controls' view ──────────────────────────────────────────────────────
 
+/// One of a picture's eight resize grips: its corners and the middles of its
+/// sides. Every one keeps the picture's proportions (a picture keeps only a
+/// width), so a side's grip sizes it as a corner's does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Grip {
+    NW,
+    N,
+    NE,
+    E,
+    SE,
+    S,
+    SW,
+    W,
+}
+
+impl Grip {
+    fn north(self) -> bool {
+        matches!(self, Grip::NW | Grip::N | Grip::NE)
+    }
+
+    fn west(self) -> bool {
+        matches!(self, Grip::NW | Grip::W | Grip::SW)
+    }
+
+    fn class(self) -> &'static str {
+        match self {
+            Grip::NW => "pimble-picture-overlay__resize pimble-picture-overlay__resize--nw",
+            Grip::N => "pimble-picture-overlay__resize pimble-picture-overlay__resize--n",
+            Grip::NE => "pimble-picture-overlay__resize pimble-picture-overlay__resize--ne",
+            Grip::E => "pimble-picture-overlay__resize pimble-picture-overlay__resize--e",
+            Grip::SE => "pimble-picture-overlay__resize pimble-picture-overlay__resize--se",
+            Grip::S => "pimble-picture-overlay__resize pimble-picture-overlay__resize--s",
+            Grip::SW => "pimble-picture-overlay__resize pimble-picture-overlay__resize--sw",
+            Grip::W => "pimble-picture-overlay__resize pimble-picture-overlay__resize--w",
+        }
+    }
+
+    /// The width a drag from `(fx, fy)` to `(px, py)` gives a picture `w` by
+    /// `h`: a side's grip by its own axis, a corner's by whichever axis the
+    /// pointer moved further along (the height's move scaled to a width).
+    fn width(self, (w, h): (f32, f32), (fx, fy): (f32, f32), (px, py): (f32, f32)) -> f32 {
+        let dx = if self.west() { fx - px } else { px - fx };
+        let dy = if self.north() { fy - py } else { py - fy };
+        let dy_as_w = if h > 0.0 { dy * w / h } else { 0.0 };
+        let dw = match self {
+            Grip::E | Grip::W => dx,
+            Grip::N | Grip::S => dy_as_w,
+            _ if dx.abs() >= dy_as_w.abs() => dx,
+            _ => dy_as_w,
+        };
+        w + dw
+    }
+}
+
+/// One resize grip of pane `pane`'s picture controls.
+fn resize_grip(
+    __scope: &mut RenderScope,
+    store: AppStore,
+    pane: PaneId,
+    resizing: Signal<Option<(f32, Grip)>>,
+    read_only: impl Fn() -> bool + Copy + 'static,
+    grip: Grip,
+) -> NodeHandle {
+    let state = store.pane(pane);
+    rsx! {
+        div {
+            class: grip.class(),
+            title: "Drag to resize",
+            style: {move || if read_only() { "display: none;" } else { "" }},
+            onmouseenter: move || {
+                OVER.with(|o| o.borrow_mut()[pane.index()] = true);
+                cancel_hide(pane);
+            },
+            onmouseleave: move || {
+                if untracked(|| resizing.get()).is_none() {
+                    OVER.with(|o| o.borrow_mut()[pane.index()] = false);
+                    hide_later(store, pane);
+                }
+            },
+            onmousedown: move || {
+                let Some(hover) = untracked(|| state.picture.get()) else { return };
+                if untracked(read_only) || hover.rect.2 <= 0.0 {
+                    return;
+                }
+                let click = rinch::core::get_click_context();
+                let from = (click.mouse_x, click.mouse_y);
+                let size = (hover.rect.2, hover.rect.3);
+                let width = size.0;
+                let widest = text_bounds(pane)
+                    .map(|b| untracked(|| b.get().width))
+                    .filter(|w| *w > 0.0)
+                    .map_or(MAX_TEXT_PX, |w| (w - 64.0).max(MIN_PICTURE_PX))
+                    .max(width);
+                // The controls stay up through the drag, which leaves the
+                // picture as soon as it narrows it.
+                OVER.with(|o| o.borrow_mut()[pane.index()] = true);
+                cancel_hide(pane);
+                resizing.set(Some((width, grip)));
+                let done = move || {
+                    resizing.set(None);
+                    OVER.with(|o| o.borrow_mut()[pane.index()] = false);
+                    hide_later(store, pane);
+                };
+                let hover_end = hover.clone();
+                rinch::core::Drag::absolute()
+                    .on_move(move |px, py| resizing.set(Some((grip.width(size, from, (px, py)).clamp(MIN_PICTURE_PX, widest), grip))))
+                    .on_end(move |_, _| {
+                        if let Some((to, _)) = untracked(|| resizing.get()).filter(|(to, _)| (to - width).abs() >= 1.0) {
+                            write_width(pane, &hover_end.src, hover_end.board.as_deref(), hover_end.pos, to.round() as i64);
+                        }
+                        done();
+                    })
+                    .on_cancel(move |_, _| done())
+                    .start();
+            },
+        }
+    }
+}
+
 /// Pane `pane`'s floating controls over the picture under the pointer:
 /// rendered once per pane slot, positioned over the picture.
 pub(crate) fn render_controls(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> NodeHandle {
     APP.with(|a| a.set(Some(store)));
     let state = store.pane(pane);
     let menu_open = Signal::new(false);
-    // The width a corner drag would give the picture, while one is under way.
-    let resizing: Signal<Option<f32>> = Signal::new(None);
+    // The width a grip's drag would give the picture, and the grip, while
+    // one is under way.
+    let resizing: Signal<Option<(f32, Grip)>> = Signal::new(None);
     let read_only = move || {
         state
             .active_edit
@@ -1392,11 +1512,15 @@ pub(crate) fn render_controls(__scope: &mut RenderScope, store: AppStore, pane: 
         div {
             class: {move || if resizing.get().is_some() { "pimble-picture-overlay pimble-picture-overlay--resizing" } else { "pimble-picture-overlay" }},
             style: {move || match state.picture.get() {
-                // A corner drag shows the size the picture will take,
-                // keeping its proportions; it takes it on release.
+                // A grip's drag shows the size the picture will take,
+                // keeping its proportions and the side across from the grip
+                // in place; it takes it on release.
                 Some(PictureHover { rect: (x, y, w, h), .. }) if resizing.get().is_some() && w > 0.0 => {
-                    let nw = resizing.get().unwrap_or(w);
-                    format!("left: {x:.1}px; top: {y:.1}px; width: {nw:.1}px; height: {:.1}px;", h * nw / w)
+                    let (nw, grip) = resizing.get().unwrap_or((w, Grip::SE));
+                    let nh = h * nw / w;
+                    let left = if grip.west() { x + w - nw } else { x };
+                    let top = if grip.north() { y + h - nh } else { y };
+                    format!("left: {left:.1}px; top: {top:.1}px; width: {nw:.1}px; height: {nh:.1}px;")
                 }
                 Some(PictureHover { rect: (x, y, w, h), .. }) if !state.markup.get() => {
                     // Inside the text's box: a tall picture scrolled half
@@ -1413,55 +1537,14 @@ pub(crate) fn render_controls(__scope: &mut RenderScope, store: AppStore, pane: 
                 }
                 _ => "display: none;".to_string(),
             }},
-            div {
-                class: "pimble-picture-overlay__resize",
-                title: "Drag to resize",
-                style: {move || if read_only() { "display: none;" } else { "" }},
-                onmouseenter: move || {
-                    OVER.with(|o| o.borrow_mut()[pane.index()] = true);
-                    cancel_hide(pane);
-                },
-                onmouseleave: move || {
-                    if untracked(|| resizing.get()).is_none() {
-                        OVER.with(|o| o.borrow_mut()[pane.index()] = false);
-                        hide_later(store, pane);
-                    }
-                },
-                onmousedown: move || {
-                    let Some(hover) = untracked(|| state.picture.get()) else { return };
-                    if untracked(read_only) || hover.rect.2 <= 0.0 {
-                        return;
-                    }
-                    let from = rinch::core::get_click_context().mouse_x;
-                    let width = hover.rect.2;
-                    let widest = text_bounds(pane)
-                        .map(|b| untracked(|| b.get().width))
-                        .filter(|w| *w > 0.0)
-                        .map_or(MAX_TEXT_PX, |w| (w - 64.0).max(MIN_PICTURE_PX))
-                        .max(width);
-                    // The controls stay up through the drag, which leaves the
-                    // picture as soon as it narrows it.
-                    OVER.with(|o| o.borrow_mut()[pane.index()] = true);
-                    cancel_hide(pane);
-                    resizing.set(Some(width));
-                    let done = move || {
-                        resizing.set(None);
-                        OVER.with(|o| o.borrow_mut()[pane.index()] = false);
-                        hide_later(store, pane);
-                    };
-                    let hover_end = hover.clone();
-                    rinch::core::Drag::absolute()
-                        .on_move(move |px, _| resizing.set(Some((width + px - from).clamp(MIN_PICTURE_PX, widest))))
-                        .on_end(move |_, _| {
-                            if let Some(to) = untracked(|| resizing.get()).filter(|to| (to - width).abs() >= 1.0) {
-                                write_width(pane, &hover_end.src, hover_end.board.as_deref(), hover_end.pos, to.round() as i64);
-                            }
-                            done();
-                        })
-                        .on_cancel(move |_, _| done())
-                        .start();
-                },
-            }
+            {resize_grip(__scope, store, pane, resizing, read_only, Grip::NW)}
+            {resize_grip(__scope, store, pane, resizing, read_only, Grip::N)}
+            {resize_grip(__scope, store, pane, resizing, read_only, Grip::NE)}
+            {resize_grip(__scope, store, pane, resizing, read_only, Grip::E)}
+            {resize_grip(__scope, store, pane, resizing, read_only, Grip::SE)}
+            {resize_grip(__scope, store, pane, resizing, read_only, Grip::S)}
+            {resize_grip(__scope, store, pane, resizing, read_only, Grip::SW)}
+            {resize_grip(__scope, store, pane, resizing, read_only, Grip::W)}
             div {
                 class: "pimble-picture-controls",
                 onmouseenter: move || {
@@ -1800,5 +1883,29 @@ mod tests {
         assert_eq!(parse_source(&embed.to_string()), Some(Source::Embed(embed)));
         assert_eq!(parse_source(&blob.to_string()), None, "a plain picture is the blob loader's");
         assert_eq!(parse_source(&format!("{blob}#board=<x>")), None);
+    }
+}
+
+#[cfg(test)]
+mod grip_tests {
+    use super::Grip;
+
+    #[test]
+    fn every_grip_grows_the_picture_away_from_the_side_across_from_it() {
+        let size = (200.0, 100.0);
+        let from = (0.0, 0.0);
+        // Outward is right for the east grips, left for the west ones, down
+        // for the south ones and up for the north ones.
+        assert_eq!(Grip::E.width(size, from, (30.0, 0.0)), 230.0);
+        assert_eq!(Grip::W.width(size, from, (-30.0, 0.0)), 230.0);
+        assert_eq!(Grip::W.width(size, from, (30.0, 0.0)), 170.0, "inward narrows it");
+        // A side's height move is scaled to a width: 10px of a 100px-high
+        // picture is a tenth, 20px of its 200px width.
+        assert_eq!(Grip::S.width(size, from, (500.0, 10.0)), 220.0, "the side's own axis only");
+        assert_eq!(Grip::N.width(size, from, (0.0, -10.0)), 220.0);
+        // A corner follows whichever axis moved further.
+        assert_eq!(Grip::SE.width(size, from, (5.0, 10.0)), 220.0);
+        assert_eq!(Grip::NW.width(size, from, (-40.0, -10.0)), 240.0);
+        assert_eq!(Grip::SW.width(size, from, (-5.0, 10.0)), 220.0);
     }
 }
