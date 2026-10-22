@@ -1035,6 +1035,9 @@ pub struct AppStore {
     /// Account > "Shares...", who is who in each store's shares, and the
     /// first-open question (docs/PRESENCE_CONTRACT.md section 3).
     pub shares_ui: crate::shares::SharesUi,
+    /// Who else is in which document, as their presence frames say
+    /// (docs/PRESENCE_CONTRACT.md; `crate::presence`). Never stored.
+    pub presence: Signal<HashMap<(StoreId, NodeId), Vec<crate::presence::Present>>>,
     /// The tooltip over a hovered link, once the pointer has rested on it
     /// (docs/LINKS_CONTRACT.md "What a link looks like").
     pub link_hover: Signal<Option<LinkTooltip>>,
@@ -1309,6 +1312,7 @@ impl AppStore {
             nav_step: Signal::new(None),
             agents_ui: crate::agents::AgentsUi::new(),
             shares_ui: crate::shares::SharesUi::new(),
+            presence: Signal::new(HashMap::new()),
             link_hover: Signal::new(None),
             link_picker: Signal::new(None),
             deleted_modal_store: Signal::new(None),

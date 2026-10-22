@@ -535,11 +535,16 @@ pub struct VaultClient {
     pending: Vec<BackendEvent>,
     notices_tx: Sender<StoreChangedNotification>,
     notices_rx: Receiver<StoreChangedNotification>,
+    /// Presence frames as the subscriptions deliver them, still sealed
+    /// (docs/PRESENCE_CONTRACT.md section 9), opened by [`pump`].
+    presence_tx: Sender<pimble_rpc::PresenceFrame>,
+    presence_rx: Receiver<pimble_rpc::PresenceFrame>,
 }
 
 impl VaultClient {
     pub fn new(client_id: String) -> Self {
         let (notices_tx, notices_rx) = unbounded();
+        let (presence_tx, presence_rx) = unbounded();
         Self {
             client_id,
             stores: HashMap::new(),
@@ -554,6 +559,8 @@ impl VaultClient {
             pending: Vec::new(),
             notices_tx,
             notices_rx,
+            presence_tx,
+            presence_rx,
         }
     }
 
@@ -1136,6 +1143,7 @@ impl VaultClient {
     /// task (it only forwards raw notifications down a channel).
     pub fn pump(&mut self) -> Vec<BackendEvent> {
         let mut events = std::mem::take(&mut self.pending);
+        events.extend(self.open_presence());
         while let Ok(notification) = self.notices_rx.try_recv() {
             let StoreChangeKind::VaultAppended { doc_id, seq } = &notification.change_kind else {
                 // A vault store emits nothing else, but forward anything that
@@ -1330,6 +1338,14 @@ impl VaultClient {
 
             BackendCommand::SubscribeStoreChanges { store_id } => {
                 self.subscribe(client, store_id, signal_ui).await
+            }
+
+            // Presence rides the store's own subscription (`subscribe`), made
+            // again on every new socket; a pane's frame goes out sealed.
+            BackendCommand::SubscribePresence { .. } => None,
+            BackendCommand::PublishPresence { store_id, node_id, pane, focused, left } => {
+                self.publish_presence(client, store_id, node_id, pane, focused, left).await;
+                None
             }
 
             // This is how the vault client learns which nodes a decrypted
@@ -1587,6 +1603,8 @@ impl VaultClient {
                 None
             }
             BackendCommand::SubscribeStoreChanges { .. } => None,
+            // Nobody is there to hear it, and nobody to say so.
+            BackendCommand::PublishPresence { .. } | BackendCommand::SubscribePresence { .. } => None,
             BackendCommand::GetStoreSync { store_id } => Some(self.sync_event(store_id)),
             BackendCommand::RebuildIndex { store_id } => Some(BackendEvent::IndexRebuilt { store_id, indexed: 0 }),
             BackendCommand::ListDeleted { store_id } if held => Some(self.list_deleted(store_id)),
@@ -2355,6 +2373,7 @@ impl VaultClient {
                         signal();
                     }
                 });
+                self.subscribe_presence(client, store_id, signal_ui).await;
                 None
             }
             Err(e) => {
@@ -2363,6 +2382,74 @@ impl VaultClient {
                 Some(BackendEvent::Error { message: format!("Subscribe failed: {e}") })
             }
         }
+    }
+
+    /// Hear who else is in the store's documents (docs/PRESENCE_CONTRACT.md):
+    /// the frames already there, then each one as it comes, sealed, down the
+    /// channel [`pump`] opens them from. A server without presence answers
+    /// nothing, and that is no error.
+    async fn subscribe_presence(&mut self, client: &Arc<PimbleClient>, store_id: StoreId, signal_ui: &Arc<dyn Fn() + Send + Sync>) {
+        let mut sub = match client.subscribe_presence(store_id, &self.client_id).await {
+            Ok(sub) => sub,
+            Err(e) => {
+                tracing::debug!("No presence for {}: {}", store_id, e);
+                return;
+            }
+        };
+        for frame in client.get_presence(store_id).await.unwrap_or_default() {
+            let _ = self.presence_tx.send(frame);
+        }
+        let tx = self.presence_tx.clone();
+        let signal = signal_ui.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            while let Some(Ok(frame)) = sub.next().await {
+                if tx.send(frame).is_err() {
+                    break;
+                }
+                signal();
+            }
+        });
+        signal_ui();
+    }
+
+    /// Say where pane `pane` is, its body sealed under the document's data
+    /// key: the server holds which document and who, never what it says.
+    async fn publish_presence(&mut self, client: &Arc<PimbleClient>, store_id: StoreId, node_id: NodeId, pane: usize, focused: bool, left: bool) {
+        let mut frame = pimble_app::presence::frame_for(&self.client_id, store_id, node_id, pane, focused, left);
+        if !left {
+            let Some(store) = self.stores.get_mut(&store_id) else { return };
+            let Some((key_id, key)) = store.keys.encrypt_key(store_id, node_id) else { return };
+            let Ok(plain) = URL_SAFE_NO_PAD.decode(&frame.body) else { return };
+            let aad = pimble_crypto::presence_aad(&store_id.to_string(), &node_id.to_string());
+            frame.body = URL_SAFE_NO_PAD.encode(Blob::encrypt(&key, key_id, &aad, &plain));
+            frame.sealed = true;
+        }
+        if let Err(e) = client.publish_presence(frame, &self.client_id).await {
+            tracing::debug!("Presence in {} not taken: {}", store_id, e);
+        }
+    }
+
+    /// The presence frames delivered since the last pass, opened: anyone's
+    /// but this page's own, and nothing that does not open.
+    fn open_presence(&mut self) -> Vec<BackendEvent> {
+        let mut events = Vec::new();
+        while let Ok(mut frame) = self.presence_rx.try_recv() {
+            if frame.client() == self.client_id {
+                continue;
+            }
+            if frame.sealed {
+                let Some(store) = self.stores.get_mut(&frame.store_id) else { continue };
+                let Ok(blob) = URL_SAFE_NO_PAD.decode(&frame.body) else { continue };
+                let Ok(key_id) = Blob::key_id(&blob) else { continue };
+                let Some(key) = store.keys.blob_key(frame.store_id, frame.doc_id, key_id) else { continue };
+                let aad = pimble_crypto::presence_aad(&frame.store_id.to_string(), &frame.doc_id.to_string());
+                let Ok(plain) = Blob::decrypt(&key, &aad, &blob) else { continue };
+                frame.body = URL_SAFE_NO_PAD.encode(plain);
+                frame.sealed = false;
+            }
+            events.push(BackendEvent::PresenceFrame { frame });
+        }
+        events
     }
 
     /// Forget which of the stores an endpoint serves are subscribed, because
@@ -3845,7 +3932,9 @@ pub fn store_id_of(cmd: &BackendCommand) -> Option<StoreId> {
         | SetStoreSync { store_id, .. }
         | GetStoreSync { store_id }
         | PutBlob { store_id, .. }
-        | RemoveReplica { store_id, .. } => *store_id,
+        | RemoveReplica { store_id, .. }
+        | PublishPresence { store_id, .. }
+        | SubscribePresence { store_id } => *store_id,
         GetBlob { url } => url.store,
         MountRemoteStore { target_store_id, .. } => *target_store_id,
         ResolveLink { url, .. } => url.store,

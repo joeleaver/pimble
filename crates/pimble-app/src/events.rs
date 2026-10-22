@@ -249,6 +249,8 @@ fn register_opened_store(store: AppStore, tree_state: UseTreeReturn, opened_stor
 
     // Subscribe to store changes for real-time updates
     store.send(BackendCommand::SubscribeStoreChanges { store_id });
+    // And to who else is in its documents (docs/PRESENCE_CONTRACT.md).
+    store.send(BackendCommand::SubscribePresence { store_id });
     // Who is who in its shares: the names its people go by there
     // (docs/PRESENCE_CONTRACT.md section 3). Only an encrypted store reaches
     // Pimble Cloud; any other has nobody to name.
@@ -1113,6 +1115,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
 
                 // Structural: remove store and all its signals
                 store.remove_store(*store_id);
+                crate::presence::forget_store(store, *store_id);
 
                 // Persist open store paths
                 save_app_state_file(&store.all_store_local_paths());
@@ -1639,6 +1642,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 }
             }
 
+            BackendEvent::PresenceFrame { frame } => crate::presence::received(store, frame),
             BackendEvent::CloudSharesListed { shares } => crate::shares::listed(store, shares),
             BackendEvent::PeopleLoaded { store_id, people } => crate::shares::people_loaded(store, *store_id, people),
             BackendEvent::CloudHostedStoresListed { stores, relayed } => {

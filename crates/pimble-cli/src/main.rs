@@ -304,6 +304,14 @@ async fn main() -> Result<()> {
             }
             sync_state(&args[2]).await?;
         }
+        "presence" => {
+            let (rest, watch) = extract_switch(&args[2..], "--watch");
+            if rest.is_empty() {
+                eprintln!("Usage: pimble-cli presence <store-id> [--watch]");
+                return Ok(());
+            }
+            presence(&rest[0], watch).await?;
+        }
         "remote-stores" => {
             let (rest, token) = extract_flag_value(&args[2..], "--token");
             if rest.is_empty() {
@@ -457,6 +465,7 @@ COMMANDS:
     link-store          Link an existing local store to its twin on a remote
     unlink-store        Unlink a store from its remote (stops the sync link)
     sync-state          Show a store's replica sync link and its state
+    presence            Who is in which document of a store now (--watch to follow)
     remote-stores       List the stores a remote Pimble server has open
     remove-replica      Stop a replica's sync link, close it, and delete it
     vault-list          List a vault store's documents with their heads
@@ -852,6 +861,46 @@ async fn unlink_store(store_id: &str) -> Result<()> {
         None => println!("Store {} was already unlinked", store_id),
     }
     println!("Sync state: {:?}", state);
+    Ok(())
+}
+
+/// One presence frame in a line (docs/PRESENCE_CONTRACT.md).
+fn presence_line(frame: &pimble_rpc::PresenceFrame) -> String {
+    let who = match &frame.who {
+        Some(w) => match &w.agent {
+            Some(agent) => format!("{agent} (agent of {})", w.sub),
+            None => w.sub.clone(),
+        },
+        None => "(signed out)".to_string(),
+    };
+    if frame.left {
+        return format!("{}  {}  {}  left", frame.doc_id, frame.session, who);
+    }
+    let body = if frame.sealed {
+        "(sealed)".to_string()
+    } else {
+        pimble_rpc::PresenceBody::decode(&frame.body).map(|b| format!("on {}{}", b.device, if b.focused { ", focused" } else { "" })).unwrap_or_default()
+    };
+    format!("{}  {}  {}  {}", frame.doc_id, frame.session, who, body)
+}
+
+async fn presence(store_id: &str, watch: bool) -> Result<()> {
+    let store_id = parse_store_id(store_id)?;
+    let client = connect().await?;
+    let client_id = format!("cli:{}", uuid::Uuid::new_v4());
+    let mut sub = if watch { Some(client.subscribe_presence(store_id, &client_id).await?) } else { None };
+    let frames = client.get_presence(store_id).await?;
+    if frames.is_empty() {
+        println!("Nobody is here.");
+    }
+    for frame in &frames {
+        println!("{}", presence_line(frame));
+    }
+    if let Some(sub) = sub.as_mut() {
+        while let Some(Ok(frame)) = sub.next().await {
+            println!("{}", presence_line(&frame));
+        }
+    }
     Ok(())
 }
 

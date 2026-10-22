@@ -48,6 +48,7 @@ pub mod shares;
 pub mod discussions;
 pub mod personal;
 pub mod places;
+pub mod presence;
 pub mod text_boards;
 pub mod toolbar;
 #[cfg(feature = "native")]

@@ -548,7 +548,7 @@ async fn connect_and_sync(
     // Who is who in the store's shares, beside the connection rather than
     // in its way (docs/PRESENCE_CONTRACT.md section 3).
     spawn_people_refresh(handler, store_id);
-    let client = connect(handler, store_id, endpoint, reached, owner_was_offline, set_state(handler, link, SyncState::Syncing)).await?;
+    let client = Arc::new(connect(handler, store_id, endpoint, reached, owner_was_offline, set_state(handler, link, SyncState::Syncing)).await?);
     // What the last connection learned of the remote's documents and their
     // wraps is asked again; data keys already unwrapped stay.
     progress.keyring.forget_remote();
@@ -587,6 +587,10 @@ async fn connect_and_sync(
     set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
     *reached_synced = true;
     info!("Vault link for store {} connected to {}", store_id, endpoint);
+    // Presence rides beside the edits, sealed under each document's data key
+    // (docs/PRESENCE_CONTRACT.md sections 2 and 9), for as long as this
+    // connection lives.
+    let _presence = crate::presence_link::spawn(handler, Arc::clone(&client), store_id, link_id, true);
 
     // The shares' upkeep at connect: a pass as soon as the loop below turns
     // (reconciled first, so the pass judges the converged tree), and the

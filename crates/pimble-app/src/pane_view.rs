@@ -104,7 +104,7 @@ pub(crate) fn close_focused(store: AppStore) {
 }
 
 /// The node pane `pane` shows as a document, tracked: its canonical pair.
-fn pane_document(store: AppStore, pane: PaneId) -> Option<(pimble_core::StoreId, pimble_core::NodeId)> {
+pub(crate) fn pane_document(store: AppStore, pane: PaneId) -> Option<(pimble_core::StoreId, pimble_core::NodeId)> {
     let state = store.pane(pane);
     if !state.show_editor.get() && !state.show_board.get() && !state.show_sheet.get() && !state.show_discussion.get() {
         return None;
@@ -113,6 +113,16 @@ fn pane_document(store: AppStore, pane: PaneId) -> Option<(pimble_core::StoreId,
         Some((store_id, Some(node_id))) => Some((store_id, node_id)),
         _ => None,
     }
+}
+
+/// Who else is in pane `pane`'s document, tracked: the first four, and how
+/// many more there are.
+fn pane_people(store: AppStore, pane: PaneId) -> (Vec<crate::presence::Person>, usize) {
+    let Some((store_id, node_id)) = pane_document(store, pane) else { return (Vec::new(), 0) };
+    let mut people = crate::presence::people_in(store, store_id, node_id);
+    let more = people.len().saturating_sub(4);
+    people.truncate(4);
+    (people, more)
 }
 
 /// The title in pane `pane`'s strip, tracked: the label its tree row shows,
@@ -338,6 +348,25 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                 span {
                     class: "pimble-pane__name",
                     {move || pane_title(store, pane)}
+                }
+                // Who else has this note open (docs/PRESENCE_CONTRACT.md
+                // section 6): up to four, then how many more.
+                span {
+                    class: "pimble-pane__people",
+                    for person in pane_people(store, pane).0 {
+                        span {
+                            key: person.key.clone(),
+                            class: "pimble-pane__person",
+                            title: person.title.clone(),
+                            style: format!("background: {};", person.color),
+                            {person.initials.clone()}
+                        }
+                    }
+                    span {
+                        class: "pimble-pane__more",
+                        style: {move || if pane_people(store, pane).1 > 0 { "" } else { "display: none;" }},
+                        {move || format!("+{}", pane_people(store, pane).1)}
+                    }
                 }
                 span {
                     title: "Split Right",

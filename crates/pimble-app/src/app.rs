@@ -1958,6 +1958,24 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     {share_badge}
                     {shared_by_note}
 
+                    // Who else has the note open (docs/PRESENCE_CONTRACT.md
+                    // section 6): a dot each, up to three, from the
+                    // presence signal, so it follows without a tree rebuild.
+                    span {
+                        class: "pimble-tree-people",
+                        for person in (match parsed {
+                            Some((s_id, Some(n_id))) => crate::presence::people_in(store, s_id, n_id).into_iter().take(3).collect::<Vec<_>>(),
+                            _ => Vec::new(),
+                        }) {
+                            span {
+                                key: person.key.clone(),
+                                class: "pimble-tree-people__dot",
+                                title: person.title.clone(),
+                                style: format!("background: {};", person.color),
+                            }
+                        }
+                    }
+
                     // How many discussions are on the node
                     // (docs/DISCUSSIONS_CONTRACT.md section 1): read from
                     // its signal, so it follows without a tree rebuild.
@@ -4506,6 +4524,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         // "Shares..." and the first-open question (docs/PRESENCE_CONTRACT.md
         // section 3), both targets.
         let shares_modal = crate::shares::render_modal(__scope, store);
+        // This window's panes, said to everyone else (docs/PRESENCE_CONTRACT.md).
+        crate::presence::start(store);
         let share_name_question = crate::shares::render_question(__scope, store);
         #[cfg(feature = "native")]
         let root = rsx! {

@@ -58,7 +58,7 @@ use pimble_rpc::{
     GetBlobRequest, GetBlobResponse, HaveBlobsRequest, HaveBlobsResponse, PutBlobRequest, PutBlobResponse, BLOBS_IN_SHARES_REFUSAL, BLOB_CHUNK_BYTES, BLOB_NOT_HERE,
     AddRemoteStoreRequest, CloseStoreRequest, CloudAddHostedStoreRequest, CloudHostStoreRequest,
     CloudHostStoreResponse, CloudHostedStoreInfo, CloudListHostedStoresResponse, CloudRelayStoreRequest, CloudRelayStoreResponse, CloudSignInRequest,
-    CloudStatusResponse, CloudStopRelayingRequest, CloudListSharesResponse, CloudSetDisplayNameRequest, CloudSetShareNameRequest, CloudPeopleRequest, StorePeople,
+    CloudStatusResponse, CloudStopRelayingRequest, PresenceFrame, PresenceWho, PublishPresenceRequest, GetPresenceResponse, CloudListSharesResponse, CloudSetDisplayNameRequest, CloudSetShareNameRequest, CloudPeopleRequest, StorePeople,
     CreateMountRequest, CreateMountResponse,
     CreateAttachmentRequest, CreateNodeRequest, CreateNodeResponse, CreateStoreRequest, CreateStoreResponse, ListAttachmentsRequest, ListAttachmentsResponse, ListDiscussionsRequest, ListDiscussionsResponse, WhoAmIResponse, CloudPersonalSyncRequest, CloudPersonalSyncResponse,
     CreateWorkspaceRequest, DeleteNodeRequest, EditOperation, EmptyResponse, GetChildrenRequest,
@@ -135,6 +135,11 @@ fn is_link_client(client_id: &str) -> bool {
 /// what is under each root, and each root is in its own scope); a plain
 /// store's own tree under each root, computed and stored nowhere. A store
 /// that is not open reaches nothing, and the RPC fails on that afterwards.
+/// [`scope_set`], for `crate::presence`.
+pub(crate) fn scope_set_of(manager: &StoreManager, store_id: StoreId, roots: &[NodeId]) -> HashSet<NodeId> {
+    scope_set(manager, store_id, roots)
+}
+
 fn scope_set(manager: &StoreManager, store_id: StoreId, roots: &[NodeId]) -> HashSet<NodeId> {
     match manager.store_kind(store_id) {
         Some(StoreKind::Vault) => manager.vault_scope_union(store_id, roots).unwrap_or_default(),
@@ -1192,6 +1197,19 @@ pub struct RpcHandler {
     hands_over: bool,
     /// What `serverInfo` says this server is: this build's version.
     version: Arc<str>,
+    /// Who is in which document, in memory only (docs/PRESENCE_CONTRACT.md;
+    /// `crate::presence`).
+    presence: Arc<crate::presence::PresenceHub>,
+}
+
+/// Where a client's frames come from, as the presence hub keys them: a
+/// user's client ids are their own, so one account cannot end another's
+/// sessions by naming its client.
+fn presence_origin(principal: &Principal, client_id: &str) -> String {
+    match principal {
+        Principal::Service => client_id.to_string(),
+        Principal::User { sub, .. } => format!("{sub}/{client_id}"),
+    }
 }
 
 /// What a share's member is told a store is called by this server, which
@@ -1277,6 +1295,7 @@ impl RpcHandler {
             hand_over: Arc::new(std::sync::Mutex::new(None)),
             hands_over: false,
             version: Arc::from(env!("CARGO_PKG_VERSION")),
+            presence: Arc::new(crate::presence::PresenceHub::new()),
         }
     }
 
@@ -2377,6 +2396,66 @@ impl RpcHandler {
 
     /// Notify store subscribers about a change that is not about a document
     /// (a link's or a mount's state); it carries no bytes.
+    // ── Presence (docs/PRESENCE_CONTRACT.md) ─────────────────────────
+
+    /// Take a frame in from `origin` (a client, or a link of this server's)
+    /// and pass it on: to the subscribers who may read its document, and to
+    /// this server's other links. Not news (an older or repeated frame) goes
+    /// nowhere.
+    pub(crate) async fn publish_presence_from(&self, frame: PresenceFrame, origin: &str) {
+        if self.presence.start_sweeping() {
+            crate::presence::spawn_sweep(Arc::downgrade(&self.presence), Arc::downgrade(&self.store_manager));
+        }
+        if !self.presence.accept(&frame, origin) {
+            return;
+        }
+        crate::presence::deliver(&self.presence, &self.store_manager, &frame, origin).await;
+        self.presence.relay_locally(&frame, origin);
+    }
+
+    /// End every session `origin` brought in `store_id`, telling everyone
+    /// (a link that went down, a client whose subscription closed).
+    pub(crate) async fn end_presence_of(&self, store_id: StoreId, origin: &str) {
+        for ended in self.presence.end_sessions_of(Some(store_id), origin) {
+            crate::presence::deliver(&self.presence, &self.store_manager, &ended.frame, &ended.origin).await;
+            self.presence.relay_locally(&ended.frame, &ended.origin);
+        }
+    }
+
+    /// The live frames of `store_id` and where each came from, for a link to
+    /// send on connect.
+    pub(crate) fn presence_of(&self, store_id: StoreId) -> Vec<crate::presence::Relayed> {
+        self.presence.held_in(store_id)
+    }
+
+    /// Frames as they pass through this server, for a link to forward.
+    pub(crate) fn subscribe_local_presence(&self) -> broadcast::Receiver<crate::presence::Relayed> {
+        self.presence.subscribe_local()
+    }
+
+    /// Who a frame is from (docs/PRESENCE_CONTRACT.md section 3): stamped
+    /// here for a sender this server authenticated, kept as it is from this
+    /// server's own operator. A user may only speak for themself.
+    async fn stamp_presence(&self, principal: &Principal, mut frame: PresenceFrame) -> Result<PresenceFrame, ErrorObjectOwned> {
+        match principal {
+            Principal::Service => {
+                if frame.who.is_none() {
+                    frame.who = self.keystore.account().await.map(|a| PresenceWho { sub: a.user_id, agent: None });
+                }
+            }
+            Principal::User { sub, email, .. } if sub.starts_with(crate::agents::AGENT_SUB_PREFIX) => {
+                let account = self.keystore.account().await.map(|a| a.user_id).unwrap_or_default();
+                frame.who = Some(PresenceWho { sub: account, agent: Some(email.clone()) });
+            }
+            Principal::User { sub, .. } => match &frame.who {
+                None => frame.who = Some(PresenceWho { sub: sub.clone(), agent: None }),
+                Some(who) if who.sub == *sub => {}
+                Some(_) => return Err(to_rpc_error("A presence frame is sent as its own account.")),
+            },
+        }
+        Ok(frame)
+    }
+
     /// Who is who in `store_id`'s shares changed here (`crate::people`).
     pub(crate) async fn notify_people_changed(&self, store_id: StoreId) {
         self.notify_store_change(store_id, StoreChangeKind::PeopleChanged, None).await;
@@ -5313,6 +5392,62 @@ impl PimbleApiServer for RpcHandler {
         let principal = principal_of(ext);
         let blobs = self.blobs_for_read(&principal, request.store_id).await?;
         Ok(HaveBlobsResponse { missing: blobs.missing(&request.ids).await })
+    }
+
+    async fn publish_presence(&self, ext: &Extensions, request: PublishPresenceRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        let principal = principal_of(ext);
+        let (store_id, doc_id) = (request.frame.store_id, request.frame.doc_id);
+        authorize(&principal, store_id, Access::Read)?;
+        if let Some(reach) = self.reach_of(&principal, store_id).await {
+            reach.require(doc_id, Access::Read)?;
+        }
+        let frame = self.stamp_presence(&principal, request.frame).await?;
+        self.publish_presence_from(frame, &presence_origin(&principal, &request.client_id)).await;
+        Ok(EmptyResponse {})
+    }
+
+    async fn get_presence(&self, ext: &Extensions, store_id: StoreId) -> Result<GetPresenceResponse, ErrorObjectOwned> {
+        let principal = principal_of(ext);
+        authorize(&principal, store_id, Access::Read)?;
+        let reach = self.reach_of(&principal, store_id).await;
+        let frames = self
+            .presence
+            .frames_of(store_id)
+            .into_iter()
+            .filter(|frame| reach.as_ref().is_none_or(|reach| reach.require(frame.doc_id, Access::Read).is_ok()))
+            .collect();
+        Ok(GetPresenceResponse { frames })
+    }
+
+    async fn subscribe_presence(&self, pending: PendingSubscriptionSink, ext: &Extensions, store_id: StoreId, client_id: String) -> SubscriptionResult {
+        let principal = principal_of(ext);
+        if let Err(e) = authorize(&principal, store_id, Access::Read) {
+            pending.reject(e).await;
+            return Ok(());
+        }
+        let roots = scope_roots_of(&principal, store_id, Access::Read);
+        let origin = presence_origin(&principal, &client_id);
+        let sink = pending.accept().await?;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        self.presence.add_sub(store_id, crate::presence::PresenceSub { tx, roots, client_id: origin.clone() }).await;
+        // This task alone holds the sink. When the subscriber goes (its
+        // connection dropped, or it unsubscribed), its sessions in the store
+        // end now, not at their timeout.
+        let handler = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    msg = rx.recv() => match msg {
+                        Some(msg) => if sink.send(msg).await.is_err() { break },
+                        None => break,
+                    },
+                    _ = sink.closed() => break,
+                }
+            }
+            drop(rx);
+            handler.end_presence_of(store_id, &origin).await;
+        });
+        Ok(())
     }
 
     async fn subscribe_store_changes(

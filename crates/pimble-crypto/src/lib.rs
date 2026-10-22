@@ -535,6 +535,13 @@ pub fn blob_aad(store_id: &str, doc_id: &str) -> Vec<u8> {
     format!("{store_id}/{doc_id}").into_bytes()
 }
 
+/// The associated data a presence frame's body is sealed with
+/// (docs/PRESENCE_CONTRACT.md section 9): never the same as a document's
+/// blobs', so neither can stand in for the other.
+pub fn presence_aad(store_id: &str, doc_id: &str) -> Vec<u8> {
+    format!("{store_id}/{doc_id}/presence").into_bytes()
+}
+
 /// A document's data key (DEK) wrapped under one scope key: the store key, or
 /// the key of a share the document is under (docs/NODE_DOCUMENT_CONTRACT.md
 /// section 5, "Keys"). A document carries one wrap per scope key that may read

@@ -778,6 +778,48 @@ pub async fn process_command(
             }
         }
 
+        // Presence (docs/PRESENCE_CONTRACT.md). A frame that is not taken
+        // (an older server, a store not readable) is no one's business.
+        BackendCommand::PublishPresence { store_id, node_id, pane, focused, left } => {
+            let c = client.as_ref()?;
+            let frame = crate::presence::frame_for(client_id, store_id, node_id, pane, focused, left);
+            if let Err(e) = c.publish_presence(frame, client_id).await {
+                tracing::debug!("presence in {store_id} not taken: {e}");
+            }
+            None
+        }
+        BackendCommand::SubscribePresence { store_id } => {
+            let c = client.as_ref()?;
+            let sub = match c.subscribe_presence(store_id, client_id).await {
+                Ok(sub) => sub,
+                Err(e) => {
+                    tracing::debug!("no presence for store {store_id}: {e}");
+                    return None;
+                }
+            };
+            let mine = client_id.to_string();
+            let theirs = move |frame: &pimble_rpc::PresenceFrame| frame.client() != mine;
+            for frame in c.get_presence(store_id).await.unwrap_or_default().into_iter().filter(|f| theirs(f)) {
+                let _ = event_tx.try_send(BackendEvent::PresenceFrame { frame });
+            }
+            signal_ui();
+            let tx = event_tx.clone();
+            let signal = signal_ui.clone();
+            let mut sub = sub;
+            spawn_task(async move {
+                while let Some(Ok(frame)) = sub.next().await {
+                    if !theirs(&frame) {
+                        continue;
+                    }
+                    if let Err(e) = tx.try_send(BackendEvent::PresenceFrame { frame }) {
+                        tracing::debug!("a presence frame was dropped: {e}");
+                    }
+                    signal();
+                }
+            });
+            None
+        }
+
         // Names (docs/PRESENCE_CONTRACT.md section 3).
         BackendCommand::CloudListShares => {
             let Some(c) = client.as_ref() else {
@@ -1047,3 +1089,4 @@ async fn shares_listed(c: &PimbleClient) -> BackendEvent {
         Err(e) => BackendEvent::CloudError { op: CloudOp::Shares, message: e.to_string() },
     }
 }
+

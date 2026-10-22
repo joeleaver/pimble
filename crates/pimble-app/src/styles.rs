@@ -56,6 +56,47 @@ pub(crate) const APP_CSS: &str = "
     user-select: none;
 }
 
+/* ── Presence (presence.rs) ──────────────────────────────────────── */
+
+.pimble-pane__people {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    margin-left: 6px;
+}
+
+.pimble-pane__person {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    border-radius: 9px;
+    font-size: 9px;
+    font-weight: 600;
+    color: var(--rinch-color-white, #ffffff);
+    cursor: default;
+}
+
+.pimble-pane__more {
+    font-size: 11px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-tree-people {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    margin-left: 4px;
+}
+
+.pimble-tree-people__dot {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 3px;
+}
+
 /* ── Shares (shares.rs) ────────────────────────────────────────── */
 
 .pimble-shares {

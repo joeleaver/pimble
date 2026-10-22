@@ -253,6 +253,12 @@ pub enum BackendCommand {
     CloudSetShareName { store_id: StoreId, root: Option<NodeId>, name: String },
     /// Who is who in a store's shares (`PeopleLoaded`).
     GetPeople { store_id: StoreId },
+    /// Say where pane `pane` is (docs/PRESENCE_CONTRACT.md): it holds
+    /// `node_id`, or, `left`, lets it go. The backend makes the frame.
+    PublishPresence { store_id: StoreId, node_id: NodeId, pane: usize, focused: bool, left: bool },
+    /// Hear who else is in the store's documents (`PresenceFrame`s, the ones
+    /// already there first).
+    SubscribePresence { store_id: StoreId },
     /// Share a local store from this computer (docs/RELAY_CONTRACT.md):
     /// nothing of it is uploaded, and the people it is shared with reach it
     /// through Pimble Cloud's relay while this computer is on and online
@@ -519,6 +525,8 @@ pub enum BackendEvent {
     CloudSharesListed { shares: pimble_rpc::CloudListSharesResponse },
     /// The answer to `GetPeople`.
     PeopleLoaded { store_id: StoreId, people: pimble_rpc::StorePeople },
+    /// Someone else's presence in a document (never this client's own).
+    PresenceFrame { frame: pimble_rpc::PresenceFrame },
     /// The answer to `CloudHostStore`: the store is hosted and linked in
     /// vault mode.
     CloudStoreHosted { store_id: StoreId },

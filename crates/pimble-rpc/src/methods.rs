@@ -277,6 +277,26 @@ pub trait PimbleApi {
     async fn subscribe_node_changes(&self, store_id: StoreId, node_id: NodeId) -> SubscriptionResult;
 
     // ========================================================================
+    // Presence, docs/PRESENCE_CONTRACT.md
+    // ========================================================================
+
+    /// Say where a session is in a document: held in memory, never stored,
+    /// and sent to everyone else subscribed who may read the document. Read.
+    #[method(name = "publishPresence", with_extensions)]
+    async fn publish_presence(&self, request: PublishPresenceRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// Every live session in the documents of `store_id` the caller may
+    /// read: what someone arriving late sees at once. Read.
+    #[method(name = "getPresence", with_extensions)]
+    async fn get_presence(&self, store_id: StoreId) -> Result<GetPresenceResponse, ErrorObjectOwned>;
+
+    /// Hear other sessions' frames in `store_id`. `client_id` names the
+    /// subscriber's own: its frames are not sent back to it, and its
+    /// sessions end when this subscription closes. Read.
+    #[subscription(name = "subscribePresence" => "presenceChanged", unsubscribe = "unsubscribePresence", item = PresenceFrame, with_extensions)]
+    async fn subscribe_presence(&self, store_id: StoreId, client_id: String) -> SubscriptionResult;
+
+    // ========================================================================
     // Search Operations
     // ========================================================================
 

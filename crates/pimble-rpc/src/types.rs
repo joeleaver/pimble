@@ -1157,6 +1157,97 @@ pub struct CloudAddHostedStoreRequest {
 }
 
 // ============================================================================
+// Presence, docs/PRESENCE_CONTRACT.md
+// ============================================================================
+
+/// One session's whole presence in one document (docs/PRESENCE_CONTRACT.md
+/// section 1): sent when it changes and every [`PRESENCE_HEARTBEAT_MS`],
+/// never stored, gone when its session leaves or goes quiet. A session is
+/// one pane holding one document (`{client_id}:{pane}`), or an agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresenceFrame {
+    pub store_id: StoreId,
+    pub doc_id: NodeId,
+    pub session: String,
+    /// Increases per session; a frame not newer than the one held is dropped
+    /// (what stops a frame going round a chain of links).
+    pub seq: u64,
+    /// Who it is from, stamped by the first server that authenticated the
+    /// sender (section 3); `None` from someone signed out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub who: Option<PresenceWho>,
+    /// A goodbye: drop the session now.
+    #[serde(default)]
+    pub left: bool,
+    /// [`PresenceBody`] as base64url JSON, or, on an encrypted store, sealed
+    /// under the document's data key (`sealed`).
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub sealed: bool,
+    /// How long the frame holds without another.
+    pub ttl_ms: u64,
+}
+
+/// How often a session says it is still there.
+pub const PRESENCE_HEARTBEAT_MS: u64 = 10_000;
+/// How long a frame holds: three heartbeats.
+pub const PRESENCE_TTL_MS: u64 = 30_000;
+
+impl PresenceFrame {
+    /// The client a session belongs to: everything before its last `:`.
+    pub fn client(&self) -> &str {
+        self.session.rsplit_once(':').map(|(client, _)| client).unwrap_or(&self.session)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresenceWho {
+    /// The account's id.
+    pub sub: String,
+    /// An agent's name, for an agent working for that account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+}
+
+/// What a frame says, sealed on an encrypted store (section 9).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PresenceBody {
+    /// The device's label: its hostname, or "Web".
+    #[serde(default)]
+    pub device: String,
+    /// The pane has the focus in its window.
+    #[serde(default)]
+    pub focused: bool,
+}
+
+impl PresenceBody {
+    pub fn encode(&self) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(self).unwrap_or_default())
+    }
+
+    pub fn decode(body: &str) -> Option<Self> {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(body).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishPresenceRequest {
+    pub frame: PresenceFrame,
+    /// The publishing client (the app's per-connection id, a link's id):
+    /// its sessions end when its presence subscription closes.
+    pub client_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetPresenceResponse {
+    pub frames: Vec<PresenceFrame>,
+}
+
+// ============================================================================
 // Names, docs/PRESENCE_CONTRACT.md section 3
 // ============================================================================
 

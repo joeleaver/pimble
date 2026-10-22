@@ -250,9 +250,11 @@ async fn connect_and_sync(
     // saved for this origin, if any, the same way `addRemoteStore`/
     // `setStoreSync`/`listRemoteStores` do.
     let auth = handler.credentials().resolve(&remote.url, &remote.auth).await;
-    let client = PimbleClient::connect_with_auth(remote.url.as_str(), &auth)
-        .await
-        .map_err(|e| anyhow::anyhow!("{}", pimble_client::describe_connect_error(&remote.url, &e)))?;
+    let client = Arc::new(
+        PimbleClient::connect_with_auth(remote.url.as_str(), &auth)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", pimble_client::describe_connect_error(&remote.url, &e)))?,
+    );
 
     // Both channels are open before the reconcile, not after it: what
     // happens during it (the remote repairing its tree after this side's
@@ -272,6 +274,9 @@ async fn connect_and_sync(
 
     set_state(handler, link, SyncState::Synced { last_sync: Utc::now() }).await;
     info!("Sync link for store {} connected to {}", store_id, remote.url);
+    // Presence rides beside the edits, for as long as this connection lives
+    // (docs/PRESENCE_CONTRACT.md section 2).
+    let _presence = crate::presence_link::spawn(handler, Arc::clone(&client), store_id, link_id, false);
 
     loop {
         tokio::select! {

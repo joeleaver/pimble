@@ -5227,6 +5227,7 @@ dependencies = [
 name = "pimble-rpc"
 version = "0.12.6"
 dependencies = [
+ "base64 0.22.1",
  "jsonrpsee",
  "pimble-core",
  "pimble-crypto",

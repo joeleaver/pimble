@@ -1108,6 +1108,37 @@ impl PimbleClient {
         Ok(sub)
     }
 
+    /// Hear other sessions' presence frames in `store_id`
+    /// (docs/PRESENCE_CONTRACT.md); `client_id` is this client's own, whose
+    /// frames are not sent back and whose sessions end when this closes.
+    pub async fn subscribe_presence(&self, store_id: StoreId, client_id: &str) -> Result<jsonrpsee::core::client::Subscription<pimble_rpc::PresenceFrame>> {
+        use jsonrpsee::core::params::ArrayParams;
+
+        let mut params = ArrayParams::new();
+        params.insert(store_id)?;
+        params.insert(client_id)?;
+        let sub = self
+            .client
+            .subscribe::<pimble_rpc::PresenceFrame, _>("pimble_subscribePresence", params, "pimble_unsubscribePresence")
+            .await
+            .map_err(rpc_error)?;
+        Ok(sub)
+    }
+
+    /// Say where one of this client's sessions is.
+    pub async fn publish_presence(&self, frame: pimble_rpc::PresenceFrame, client_id: &str) -> Result<()> {
+        self.client
+            .publish_presence(pimble_rpc::PublishPresenceRequest { frame, client_id: client_id.to_string() })
+            .await
+            .map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// Every live session in the documents of `store_id` this client may read.
+    pub async fn get_presence(&self, store_id: StoreId) -> Result<Vec<pimble_rpc::PresenceFrame>> {
+        Ok(self.client.get_presence(store_id).await.map_err(rpc_error)?.frames)
+    }
+
     /// Subscribe to node content changes.
     /// Returns a subscription stream that yields `NodeContentChangedNotification`.
     pub async fn subscribe_node_changes(
