@@ -8,14 +8,15 @@ docs/PRESENCE_CONTRACT.md has Joe's answers:
 - no opt-out;
 - a name per share, and members never see each other's emails.
 
-Wave 0 (names) is built and checked on the local stack; see "Built in wave 0" at the end
-of the contract. 1099 workspace tests pass. Before merging, ask Joe two things:
+Waves 0 (names) and 1 (transport, who is here: pane initials, tree dots, through every
+link, sealed on encrypted ones) are built and checked on the local stack; see "Built in
+wave 0/1" at the end of the contract. 1106 workspace tests pass. Before merging, ask Joe two things:
 1. Should the invitation mails stop naming the inviter by email?
 2. Should the accounts service change (member lists without emails for members,
    `shared_by` as a name) ship with the next release and deploy? Older desktops show
    blank member emails then.
 
-Next is wave 1: transport and who is here.
+Next is wave 2: carets and selections in text.
 
 **2026-10-22, end of session: v0.12.6 released, deployed (jkbase v33) and installed
 here** (release commit 4f96e4d, tag `v0.12.6`, rinch `main` 5fbdfb98 in both locks;
