@@ -1,6 +1,6 @@
 # Presence contract: who is here, and where
 
-Status: **wave 0 (names) built on branch `presence`, 2026-10-22; waves 1 to 5 not built.** Written from Joe's answers that day (listed
+Status: **waves 0 (names) and 1 (transport, who is here) built on branch `presence`, 2026-10-22; waves 2 to 5 not built.** Written from Joe's answers that day (listed
 under "Decisions" at the end). The points under "To confirm" are design choices made here
 that Joe has not seen yet. Section 3 (names per share) was added later the same day.
 
@@ -404,3 +404,81 @@ Each wave is checked in the desktop app and in the browser on the local stack
 - The question now names the share by its own name (`ScopePeople.share_name`), no longer
   by its root note's label.
 - Not tried by hand: discussion authors and the board hover under the new names.
+
+## Built in wave 1 (transport, who is here), 2026-10-22, branch `presence`
+
+**RPC** (`pimble-rpc`):
+- `PresenceFrame` (`store_id`, `doc_id`, `session`, `seq`, `who`, `left`, `body`,
+  `sealed`, `ttl_ms`) and `PresenceBody { device, focused }`, base64url JSON.
+- `PresenceWho { sub, agent }`.
+- `publishPresence { frame, client_id }`, `getPresence(store)`, and a subscription of
+  its own, `subscribePresence(store, client_id)` => `presenceChanged`. It is separate
+  from `storeChanged`, so older clients never see a kind they cannot parse.
+- `PRESENCE_HEARTBEAT_MS` is 10 s and `PRESENCE_TTL_MS` is 30 s.
+
+**Server** (`crate::presence`):
+- The hub holds each session's latest frame in memory. It drops a frame not newer
+  than the one held (`seq`), which is what stops loops through links. A `ttl_ms` is
+  capped at 60 s, and a sweep every 5 s ends quiet sessions with a goodbye in their
+  name.
+- Delivery goes to each subscriber whose grant reaches the document (`scope_set`),
+  never back to the client it came from.
+- A subscriber's sink is owned by one task, fed by a channel: jsonrpsee deregisters
+  a subscription when any clone of its sink drops. When the subscription closes,
+  every session its client brought into that store ends at once.
+- Origins are keyed `sub/client` for users, so one account cannot end another's
+  sessions.
+- Stamping: `Service` keeps `who`, or stamps the keystore's account. An agent is
+  stamped as the account plus its name. A user is stamped as themself, and a frame
+  naming someone else is refused.
+- `crate::presence_link` runs beside each connected sync link (plain) and vault link
+  (sealed). It sends what is held here and fetches what is there on connect, then
+  carries frames both ways.
+  - On a vault link it seals bodies under the document's data key (asked of the
+    remote with `vaultFetch` after `u64::MAX`, cached per connection) with
+    `pimble_crypto::presence_aad`, and opens them on the way in.
+  - Dropping it with the connection ends the sessions it brought.
+- Tested by `tests/presence.rs`, which runs a member against the hosted server
+  through sealed vault links:
+  - presence crosses, stamped and opened;
+  - a note outside the share never arrives;
+  - nothing is written on the hosted disk;
+  - a dropped client sends a goodbye;
+  - an older frame goes nowhere.
+  The hub has unit tests too.
+
+**App** (`crates/pimble-app/src/presence.rs`, both targets):
+- Each pane holding a document is a session `{client}:{pane}`. An effect over the
+  panes and the focus sends a frame on change and a goodbye on letting go, and a
+  heartbeat every 10 s resends and prunes. `frame_for` builds the frame, with `seq`
+  from the clock.
+- `AppStore::presence` holds others' sessions, never this client's own (the backend
+  filters by client).
+- `people_in` merges sessions by account. Names come from section 3: "You" on
+  another device, an agent by name, someone signed out by device. The color is
+  `author_color(sub)`.
+- The pane strip shows up to four initials with "+n"; each has a hover with the name
+  and devices. The tree row shows up to three dots.
+- The browser's vault client subscribes to presence with each store (so it is renewed
+  with every new socket), seals with `encrypt_key` and opens in `pump`. A store whose
+  owner is offline takes presence silently.
+- CLI: `presence <store> [--watch]`.
+
+**Checked on the local stack**: Alice's desktop app and Bob's browser in a shared note.
+- Alice's pane was published from her machine as `on joe-laptop, focused`; the hosted
+  server held it `(sealed)`.
+- Bob's tree showed a dot on the note, and his pane showed "A" with the hover "alice,
+  on joe-laptop".
+- After Bob answered the question with "Bobby", Alice's pane and tree row showed "B".
+- Closing Bob's tab removed him from Alice's view within a second.
+
+**Gaps:**
+- No hollow dot on a collapsed row with someone below it.
+- The browser's plain (non-encrypted) stores do not renew their presence subscription
+  when the page's socket is replaced.
+- A document from before data keys carries no presence over an encrypted link.
+- The plain sync link and the relay path are not tried by hand. The relay face is an
+  ordinary server, and the plain link shares the vault link's code path except for
+  sealing.
+- The pane's initials sit at the right end of the strip, beside the split buttons,
+  because the name takes the free width.
