@@ -1571,8 +1571,11 @@ fn free_port() -> u16 {
 /// is spliced byte-for-byte in both directions — this never parses HTTP
 /// beyond that first line, so it works for both a WebSocket upgrade and an
 /// ordinary request/response.
-async fn run_edge_proxy(listen_port: u16, cloud_port: u16, h_port: u16) {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", listen_port)).await.expect("proxy binds");
+async fn run_edge_proxy(listener: std::net::TcpListener, cloud_port: u16, h_port: u16) {
+    // Bound by the caller before anything else could take the port (picking
+    // a free port and binding it again later lost it to a parallel test).
+    listener.set_nonblocking(true).expect("proxy listener is non-blocking");
+    let listener = tokio::net::TcpListener::from_std(listener).expect("proxy binds");
     loop {
         let Ok((mut inbound, _)) = listener.accept().await else { continue };
         tokio::spawn(async move {
@@ -1712,7 +1715,8 @@ async fn interop_with_the_real_accounts_service() {
     // serves no such route at all — exactly the gap the README calls out.
     let cloud_internal_port = free_port();
     let cloud_internal_url = format!("http://127.0.0.1:{cloud_internal_port}");
-    let proxy_port = free_port();
+    let proxy_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_port = proxy_listener.local_addr().unwrap().port();
     let public_url = format!("http://127.0.0.1:{proxy_port}");
     let issuer = format!("{public_url}/api/v1");
     let jwks_url = format!("{issuer}/.well-known/jwks.json");
@@ -1759,7 +1763,7 @@ async fn interop_with_the_real_accounts_service() {
     .await;
     assert!(cloud_ready, "pimble-cloud must come up within 15s (see {:?})", cloud_log_path);
 
-    tokio::spawn(run_edge_proxy(proxy_port, cloud_internal_port, h_addr.port()));
+    tokio::spawn(run_edge_proxy(proxy_listener, cloud_internal_port, h_addr.port()));
     let cloud_url = public_url;
     let proxy_ready = wait_until(Duration::from_secs(5), || async {
         reqwest::get(format!("{cloud_url}/api/v1/health")).await.map(|r| r.status().is_success()).unwrap_or(false)

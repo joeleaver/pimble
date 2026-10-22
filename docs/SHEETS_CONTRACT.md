@@ -127,6 +127,27 @@ The UI calls this the column's **type** (Joe, 2026-10-19). From the mockup:
 
 - **Headers are one line**: the name, then the faint mark. The full type, or the
   formula, is in the tooltip.
+- **A sheet node has its own toolbar** (Joe, 2026-10-22: not the text's), in the text
+  toolbar's place while the focused pane shows one, as a board's does
+  (`sheets/toolbar.rs`). Sheet: Add Table, Add Summary Table. Row: Add Row (the caret in
+  the new-row line), Move Row Up, Move Row Down, Delete Row. Column: Add Column, Column
+  Settings, Group by This Column, Move Column Left, Move Column Right, Delete Column. Table: Add Summary Row, Rotate, Collapse or Expand All Groups,
+  Delete Table. History: Undo, Redo. The row, column and table buttons act on the cell
+  last pressed, or on the sheet's only plain table before any is; a button with nothing
+  to act on is dimmed. A text node's tables keep the text toolbar.
+- **Rows and columns move by dragging** (Joe, 2026-10-22, the Google Sheets way, with a
+  grip on both): a row's grip shows in a narrow gutter before the first column while
+  the pointer is over the row, a column's at the top of its header while the pointer is
+  over the header; a plain table's row then follows the pointer, lifted in the ghost's color, and the rows
+  it passes slide aside to make room (every row is 31px, so where it lands is reckoned
+  from the pointer, `moving::RowDrag`); a column (and a rotated table's record or field)
+  shows in the ghost's color with a line where it will land. The drop writes its
+  `order` (`move_row`, `move_column`). No grip shows while a drag is under way. A rotated
+  table's record grip is beside its delete button, a field's before its name. A row
+  moves only among the rows of its own group (a drag never changes a cell), one row or
+  column at a time. The toolbar's Move Row Up/Down and Move Column Left/Right step the
+  last pressed cell's row or column one place (`sheets/moving.rs`). Clicking a cell
+  still types in it and clicking a header still opens its settings.
 - **Typing happens in the cell** (Joe, 2026-10-21: no box that jumps out and resizes
   things): a click puts the caret in the cell's own text, which stays where it was; the
   cell takes a faint tint, and nothing changes size, so the rows and columns stay put.

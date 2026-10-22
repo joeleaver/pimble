@@ -22,6 +22,8 @@
 
 pub(crate) mod in_text;
 pub(crate) mod reads;
+pub(crate) mod moving;
+pub(crate) mod toolbar;
 mod ui;
 
 use std::cell::{Cell, RefCell};
@@ -205,6 +207,20 @@ pub struct SheetUi {
     /// A column being resized: (table, column key, width in pixels), shown
     /// while the drag lasts and written to the document when it ends.
     pub resizing: Signal<Option<(String, String, f32)>>,
+    /// The cell last pressed, which the sheet toolbar's row, column and
+    /// table buttons act on once the typing in it is over.
+    pub last: Signal<Option<CellKey>>,
+    /// The row (table, row id) the pointer is over, whose grip shows.
+    pub hover_row: Signal<Option<(String, String)>>,
+    /// The header (table, column key) the pointer is over, whose grip shows.
+    pub hover_col: Signal<Option<(String, String)>>,
+    /// The row or column being dragged by its grip, and where it would land.
+    pub moving: Signal<Option<moving::Moving>>,
+    pub drop_at: Signal<Option<moving::DropAt>>,
+    /// A plain table's row following the pointer (`moving::press_row`).
+    pub row_drag: Signal<Option<moving::RowDrag>>,
+    /// Whether one is under way: the grips read this, not every move.
+    pub row_dragging: Signal<bool>,
 }
 
 impl SheetUi {
@@ -224,6 +240,13 @@ impl SheetUi {
             summary_form: Signal::new(None),
             collapsed: Signal::new(std::collections::HashSet::new()),
             resizing: Signal::new(None),
+            last: Signal::new(None),
+            hover_row: Signal::new(None),
+            hover_col: Signal::new(None),
+            moving: Signal::new(None),
+            drop_at: Signal::new(None),
+            row_drag: Signal::new(None),
+            row_dragging: Signal::new(false),
         }
     }
 }
@@ -1413,6 +1436,7 @@ pub(crate) fn cell_pressed(store: AppStore, pane: PaneId, key: CellKey) {
     }
     commit(store, pane, Move::Stay);
     aim(pane, Some(&key.table));
+    ui.last.set(Some(key.clone()));
     let typed = column_of(pane, &key).is_some_and(|(t, c)| !t.is_summary() && !matches!(c.ty, ColumnType::Formula { .. }));
     if typed {
         ui.selected.set(None);
@@ -2074,6 +2098,18 @@ pub(crate) fn delete_column(store: AppStore, pane: PaneId) {
     aim(pane, Some(&form.table));
     if let Some(col) = &form.col {
         if local_edit(store, pane, |t| t.delete_column(&form.table, col)).is_some() {
+            ui.column_form.set(None);
+        }
+    }
+}
+
+/// Delete column `col` of `table` (the sheet toolbar's "Delete Column").
+pub(crate) fn delete_column_of(store: AppStore, pane: PaneId, table: &str, col: &str) {
+    commit(store, pane, Move::Stay);
+    aim(pane, Some(table));
+    if local_edit(store, pane, |t| t.delete_column(table, col)).is_some() {
+        let ui = store.pane(pane).sheet_ui;
+        if untracked(|| ui.column_form.get()).is_some_and(|f| f.table == table && f.col.as_deref() == Some(col)) {
             ui.column_form.set(None);
         }
     }

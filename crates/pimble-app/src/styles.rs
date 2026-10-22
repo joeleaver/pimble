@@ -1226,6 +1226,67 @@ pub(crate) const APP_CSS: &str = "
     display: contents;
 }
 
+/* Moving rows and columns (sheets/moving.rs): a grip shows while the pointer
+   is over its row or its column's header, and is dragged. A plain table's
+   rows keep theirs in a gutter before the first column. */
+.pimble-sheet__gutter {
+    position: relative;
+    border-bottom: 1px solid transparent;
+}
+
+.pimble-sheet__move {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 100%;
+    color: var(--rinch-color-dimmed);
+    cursor: grab;
+    opacity: 0;
+    user-select: none;
+}
+
+.pimble-sheet__move--on {
+    opacity: 1;
+}
+
+.pimble-sheet__move:hover {
+    color: var(--rinch-primary-color-6);
+}
+
+/* A column's: at the top of its header, in the middle. */
+.pimble-sheet__move--col {
+    position: absolute;
+    top: -2px;
+    left: 50%;
+    margin-left: -8px;
+    height: 12px;
+}
+
+/* A rotated table's field: at the left of its name. */
+.pimble-sheet__move--field {
+    position: absolute;
+    top: 0;
+    left: -2px;
+    bottom: 0;
+    height: auto;
+}
+
+/* A rotated table's record: beside its delete button, under it. */
+.pimble-sheet__move--inline {
+    height: 20px;
+}
+
+/* Room for a rotated table's field grip before its name. */
+.pimble-sheet__rot-name .pimble-sheet__head {
+    padding-left: 16px;
+}
+
+.pimble-sheet__rot-tail {
+    display: flex;
+    align-items: center;
+}
+
 /* A header's grid cell: the header, and the grip on its right edge that
    changes the column's width. */
 .pimble-sheet__head-wrap {
@@ -1282,6 +1343,9 @@ pub(crate) const APP_CSS: &str = "
 .pimble-sheet__cell {
     position: relative;
     padding: 5px 8px;
+    /* A whole number of pixels, so every row is too and its 1px lines land on
+       the pixel grid (fractional rows drew some of them faint or not at all). */
+    line-height: 20px;
     min-width: 0;
     border-bottom: 1px solid var(--rinch-color-border);
     border-right: 1px solid var(--rinch-color-border);
@@ -1420,7 +1484,12 @@ pub(crate) const APP_CSS: &str = "
     color: var(--rinch-color-dimmed);
 }
 
+/* An inline-block, not a plain inline span: rinch draws a plain inline span's
+   padding without moving its text, so the pill's left end hung outside its cell
+   and was cut off wherever the cell clipped it. */
 .pimble-sheet__chip {
+    display: inline-block;
+    line-height: 18px;
     padding: 0 7px;
     border-radius: 999px;
     background: var(--rinch-primary-color);
@@ -2428,6 +2497,7 @@ pub(crate) const DARK_THEME_VARS: &str = "
     --pimble-toolbar-active-bg: var(--rinch-color-dark-4);
     --pimble-toolbar-active-fg: var(--rinch-primary-color-4);
     --pimble-toolbar-active-border: var(--rinch-primary-color-4);
+    --pimble-sheet-ghost: #1d3a5f;
 }
 ";
 
@@ -2476,5 +2546,6 @@ pub(crate) const LIGHT_THEME_VARS: &str = "
     --pimble-toolbar-active-bg: #e1e8f0;
     --pimble-toolbar-active-fg: #2a4665;
     --pimble-toolbar-active-border: #bccbdf;
+    --pimble-sheet-ghost: #dbe7f5;
 }
 ";

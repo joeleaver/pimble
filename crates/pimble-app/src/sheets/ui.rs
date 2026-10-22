@@ -5,6 +5,8 @@
 //! again.
 
 use super::*;
+use crate::appearance::IconGlyph;
+use rinch_tabler_icons::TablerIcon;
 
 thread_local! {
     /// Each pane's cell input: (document key, node id), for focusing it.
@@ -184,13 +186,23 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
                 let (tid, col) = (tid.clone(), c.clone());
                 move || start_resize(store, pane, &tid, &col)
             };
+            let grip = (!summary && !c.result).then(|| col_grip(__scope, store, pane, &tid, &c.key, false));
+            let hover = (tid.clone(), c.key.clone());
+            let key = CellKey { table: tid.clone(), row: None, col: c.key.clone() };
+            let (over_key, drop_key, mark_key) = (key.clone(), key.clone(), key);
             // The header is the cell under the column's settings; its right
             // edge is a grip beside it, so a drag there opens nothing.
             rsx! {
                 div {
                     class: "pimble-sheet__head-wrap",
+                    style: move || mark_style(moving::marks(&ui.moving.get(), &ui.drop_at.get(), &mark_key, false)),
                     onmousedown: press,
+                    onmouseenter: move || ui.hover_col.set_if_changed(Some(hover.clone())),
+                    onmouseleave: move || ui.hover_col.set_if_changed(None),
+                    ondragenter: move || moving::over(store, pane, &over_key),
+                    ondrop: move || moving::dropped(store, pane, &drop_key),
                     div { class: class, title: tip, onclick: open, {c.name.clone()} {mark} }
+                    {grip}
                     div { class: "pimble-sheet__grip", title: "Drag to change this column's width" }
                 }
             }
@@ -203,7 +215,7 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
         let cells: Vec<NodeHandle> = columns
             .iter()
             .zip(&r.cells)
-            .map(|(c, cell)| cell_node(__scope, store, pane, CellKey { table: tid.clone(), row: Some(r.id.clone()), col: c.key.clone() }, c, Some(cell.clone())))
+            .map(|(c, cell)| cell_node(__scope, store, pane, CellKey { table: tid.clone(), row: Some(r.id.clone()), col: c.key.clone() }, c, Some(cell.clone()), false))
             .collect();
         let tail = (!summary).then(|| {
             let (tid, rid) = (tid.clone(), r.id.clone());
@@ -212,12 +224,25 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
             }
         });
         let hidden = collapsed_fn(store, pane, &tid, group);
+        let grip = (!summary).then(|| row_grip(__scope, store, pane, &tid, &r.id, ""));
+        let hover = (tid.clone(), r.id.clone());
+        let (gutter_at, tail_at) = ((tid.clone(), r.id.clone()), (tid.clone(), r.id.clone()));
         rsx! {
             div {
                 class: "pimble-sheet__row",
                 style: move || if hidden.get() { "display: none;" } else { "" },
+                div {
+                    class: "pimble-sheet__gutter",
+                    style: move || ghost_style(&ui.row_drag.get(), &gutter_at.0, Some(&gutter_at.1)),
+                    onmouseenter: move || ui.hover_row.set_if_changed(Some(hover.clone())),
+                    {grip}
+                }
                 {cells}
-                div { class: "pimble-sheet__tail", {tail} }
+                div {
+                    class: "pimble-sheet__tail",
+                    style: move || ghost_style(&ui.row_drag.get(), &tail_at.0, Some(&tail_at.1)),
+                    {tail}
+                }
             }
         }
     };
@@ -261,10 +286,11 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
                 let key = CellKey { table: tid.clone(), row: None, col: c.key.clone() };
                 let placeholder = (!c.computed && std::mem::replace(&mut first, false)).then(|| "Add a row…".to_string());
                 let cell = placeholder.map(|p| CellView { text: p, error: None, chip: None });
-                cell_node(__scope, store, pane, key, c, cell)
+                cell_node(__scope, store, pane, key, c, cell, false)
             })
             .collect();
-        rsx! { div { class: "pimble-sheet__row pimble-sheet__new-row", {cells} div { class: "pimble-sheet__tail" } } }
+        let gap = gutter(__scope);
+        rsx! { div { class: "pimble-sheet__row pimble-sheet__new-row", {gap} {cells} div { class: "pimble-sheet__tail" } } }
     });
     let empty = (summary && t.rows.is_empty() && t.error.is_none())
         .then(|| rsx! { div { class: "pimble-sheet__empty", "Nothing matches yet." } });
@@ -275,9 +301,11 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
         rotated_grid(__scope, store, pane, &t)
     } else {
         let id_add = id_add.clone();
+        let head_gap = gutter(__scope);
         let head_row = rsx! {
             div {
                 class: "pimble-sheet__row",
+                {head_gap}
                 {heads}
                 div {
                     class: "pimble-sheet__add-col",
@@ -400,6 +428,7 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
                 },
                 div {
                     class: "pimble-sheet__grid",
+                    onmouseleave: move || ui.hover_row.set_if_changed(None),
                     style: {move || if rotated_layout {
                         rot_style.clone()
                     } else {
@@ -426,7 +455,8 @@ fn grid_columns(columns: &[ColView], resizing: Option<(String, f32)>) -> String 
         })
         .collect();
     let tracks = if tracks.is_empty() { "minmax(90px, max-content)".to_string() } else { tracks.join(" ") };
-    format!("grid-template-columns: {tracks} 30px;")
+    // First the gutter that holds each row's grip.
+    format!("grid-template-columns: 18px {tracks} 30px;")
 }
 
 /// How near a header's right edge (in pixels) a press grabs it.
@@ -462,7 +492,106 @@ fn start_resize(store: AppStore, pane: PaneId, table: &str, col: &ColView) {
         .start();
 }
 
-fn cell_node(__scope: &mut RenderScope, store: AppStore, pane: PaneId, key: CellKey, col: &ColView, cell: Option<CellView>) -> NodeHandle {
+/// How a cell shows a drag under way (`moving::marks`): the moved row or
+/// column in the ghost's color, a line where it would land.
+fn mark_style(mark: &str) -> &'static str {
+    match mark {
+        " pimble-sheet__cell--moving" => "background: var(--pimble-sheet-ghost);",
+        " pimble-sheet__cell--drop-above" => "box-shadow: inset 0 2px 0 var(--rinch-primary-color-6);",
+        " pimble-sheet__cell--drop-below" => "box-shadow: inset 0 -2px 0 var(--rinch-primary-color-6);",
+        " pimble-sheet__cell--drop-left" => "box-shadow: inset 2px 0 0 var(--rinch-primary-color-6);",
+        " pimble-sheet__cell--drop-right" => "box-shadow: inset -2px 0 0 var(--rinch-primary-color-6);",
+        _ => "",
+    }
+}
+
+/// How part of row `row` of `table` shows while a row follows the pointer
+/// (`moving::RowDrag`): the dragged one lifted in the ghost's color, the rows
+/// it passed a row over.
+fn ghost_style(drag: &Option<moving::RowDrag>, table: &str, row: Option<&str>) -> String {
+    let Some((dy, lifted)) = drag.as_ref().zip(row).and_then(|(d, row)| d.offset(table, row)) else { return String::new() };
+    if lifted {
+        format!("position: relative; z-index: 3; transform: translateY({dy:.1}px); background: var(--pimble-sheet-ghost);")
+    } else {
+        format!("position: relative; transform: translateY({dy:.1}px);")
+    }
+}
+
+/// A row's grip: shown while the pointer is over the row and nothing is
+/// being dragged, dragged to move the row (`moving.rs`).
+fn row_grip(__scope: &mut RenderScope, store: AppStore, pane: PaneId, table: &str, row: &str, extra_class: &'static str) -> NodeHandle {
+    let ui = store.pane(pane).sheet_ui;
+    let what = moving::Moving::Row { table: table.to_string(), row: row.to_string() };
+    let start_what = what;
+    let mine = (table.to_string(), row.to_string());
+    // No grip shows during a drag: what moves is the row itself.
+    let class = move |mine: &(String, String)| {
+        let on = ui.moving.get().is_none() && !ui.row_dragging.get() && ui.hover_row.get().as_ref() == Some(mine);
+        match (on, extra_class.is_empty()) {
+            (true, true) => "pimble-sheet__move pimble-sheet__move--on",
+            (true, false) => "pimble-sheet__move pimble-sheet__move--on pimble-sheet__move--inline",
+            (false, true) => "pimble-sheet__move",
+            (false, false) => "pimble-sheet__move pimble-sheet__move--inline",
+        }
+    };
+    if extra_class.is_empty() {
+        // A plain table's row follows the pointer (`moving::press_row`).
+        let (table, row) = (table.to_string(), row.to_string());
+        rsx! {
+            div {
+                class: {move || class(&mine)},
+                title: "Drag to move this row",
+                onmousedown: move || moving::press_row(store, pane, &table, &row),
+                IconGlyph { name: TablerIcon::GripVertical.name().to_string() }
+            }
+        }
+    } else {
+        // A rotated table's record is a column on screen: it is dropped on
+        // the record it should take the place of.
+        rsx! {
+            div {
+                class: {move || class(&mine)},
+                title: "Drag to move this record",
+                draggable: "true",
+                ondragstart: move || moving::start(store, pane, start_what.clone()),
+                ondragend: move || moving::end(store, pane),
+                IconGlyph { name: TablerIcon::GripVertical.name().to_string() }
+            }
+        }
+    }
+}
+
+/// A column's grip, in its header: shown while the pointer is over the
+/// header and nothing is being dragged.
+fn col_grip(__scope: &mut RenderScope, store: AppStore, pane: PaneId, table: &str, col: &str, rotated: bool) -> NodeHandle {
+    let ui = store.pane(pane).sheet_ui;
+    let what = moving::Moving::Col { table: table.to_string(), col: col.to_string() };
+    let start_what = what;
+    let mine = (table.to_string(), col.to_string());
+    let (on, off) = if rotated {
+        ("pimble-sheet__move pimble-sheet__move--field pimble-sheet__move--on", "pimble-sheet__move pimble-sheet__move--field")
+    } else {
+        ("pimble-sheet__move pimble-sheet__move--col pimble-sheet__move--on", "pimble-sheet__move pimble-sheet__move--col")
+    };
+    rsx! {
+        div {
+            class: {move || if ui.moving.get().is_none() && !ui.row_dragging.get() && ui.hover_col.get().as_ref() == Some(&mine) { on } else { off }},
+            title: if rotated { "Drag to move this field" } else { "Drag to move this column" },
+            draggable: "true",
+            ondragstart: move || moving::start(store, pane, start_what.clone()),
+            ondragend: move || moving::end(store, pane),
+            IconGlyph { name: if rotated { TablerIcon::GripVertical.name().to_string() } else { TablerIcon::GripHorizontal.name().to_string() } }
+        }
+    }
+}
+
+/// The empty first cell of a row with no grip (the header, summary rows, the
+/// new-row line).
+fn gutter(__scope: &mut RenderScope) -> NodeHandle {
+    rsx! { div { class: "pimble-sheet__gutter" } }
+}
+
+fn cell_node(__scope: &mut RenderScope, store: AppStore, pane: PaneId, key: CellKey, col: &ColView, cell: Option<CellView>, rotated: bool) -> NodeHandle {
     let ui = store.pane(pane).sheet_ui;
     let cell = cell.unwrap_or(CellView { text: String::new(), error: None, chip: None });
     let placeholder = key.row.is_none();
@@ -489,10 +618,19 @@ fn cell_node(__scope: &mut RenderScope, store: AppStore, pane: PaneId, key: Cell
     let press_key = key.clone();
     let editing_key = key.clone();
     let editing_key2 = key.clone();
+    let (over_key, drop_key, mark_key) = (key.clone(), key.clone(), key.clone());
+    let hover = key.row.clone().map(|row| (key.table.clone(), row));
     rsx! {
         div {
             class: class,
             title: tip,
+            style: move || {
+                let mark = mark_style(moving::marks(&ui.moving.get(), &ui.drop_at.get(), &mark_key, rotated));
+                format!("{mark}{}", ghost_style(&ui.row_drag.get(), &mark_key.table, mark_key.row.as_deref()))
+            },
+            onmouseenter: move || ui.hover_row.set_if_changed(hover.clone()),
+            ondragenter: move || moving::over(store, pane, &over_key),
+            ondrop: move || moving::dropped(store, pane, &drop_key),
             onclick: move || cell_pressed(store, pane, press_key.clone()),
             // The edit box lies over the cell and the text stays under it,
             // hidden, so opening a cell never resizes its row or columns.
@@ -681,7 +819,8 @@ fn summary_row_node(__scope: &mut RenderScope, store: AppStore, pane: PaneId, ta
         .map(|(i, (c, cell))| summary_cell(__scope, store, pane, table, s, c, cell, i == 0, false))
         .collect();
     let class = if subtotal { "pimble-sheet__row pimble-sheet__summary-row pimble-sheet__summary-row--sub" } else { "pimble-sheet__row pimble-sheet__summary-row" };
-    rsx! { div { class: class, {cells} div { class: "pimble-sheet__tail" } } }
+    let gap = gutter(__scope);
+    rsx! { div { class: class, {gap} {cells} div { class: "pimble-sheet__tail" } } }
 }
 
 /// A summary row's settings: its name, and what the clicked column shows.
@@ -875,13 +1014,32 @@ fn rotated_grid(__scope: &mut RenderScope, store: AppStore, pane: PaneId, t: &Ta
         let mark = (!c.mark.is_empty()).then(|| rsx! { span { class: "pimble-sheet__mark", {format!("\u{00a0}{}", c.mark)} } });
         let class = format!("pimble-sheet__head pimble-sheet__rot-name{}", if c.computed { " pimble-sheet__head--computed" } else { "" });
         let tip = format!("{} · click to change", c.tip);
-        out.push(pinned(rsx! { div { class: class, title: tip, onclick: open, {c.name.clone()} {mark} } }, row));
+        let grip = col_grip(__scope, store, pane, &tid, &c.key, true);
+        let ui = store.pane(pane).sheet_ui;
+        let hover = (tid.clone(), c.key.clone());
+        let key = CellKey { table: tid.clone(), row: None, col: c.key.clone() };
+        let (over_key, drop_key, mark_key) = (key.clone(), key.clone(), key);
+        out.push(pinned(
+            rsx! {
+                div {
+                    class: "pimble-sheet__head-wrap pimble-sheet__rot-name",
+                    style: move || mark_style(moving::marks(&ui.moving.get(), &ui.drop_at.get(), &mark_key, true)),
+                    onmouseenter: move || ui.hover_col.set_if_changed(Some(hover.clone())),
+                    onmouseleave: move || ui.hover_col.set_if_changed(None),
+                    ondragenter: move || moving::over(store, pane, &over_key),
+                    ondrop: move || moving::dropped(store, pane, &drop_key),
+                    div { class: class, title: tip, onclick: open, {c.name.clone()} {mark} }
+                    {grip}
+                }
+            },
+            row,
+        ));
         for (col, h) in cols.iter().zip(&hides) {
             let node = match col {
                 RotCol::Record(i, _) => {
                     let r = &t.rows[*i];
                     let key = CellKey { table: tid.clone(), row: Some(r.id.clone()), col: c.key.clone() };
-                    rot_head(cell_node(__scope, store, pane, key, c, r.cells.get(fi).cloned()), head)
+                    rot_head(cell_node(__scope, store, pane, key, c, r.cells.get(fi).cloned(), true), head)
                 }
                 RotCol::Subtotal(k, j) => {
                     let s = &t.groups[*k].subtotals[*j];
@@ -895,7 +1053,7 @@ fn rotated_grid(__scope: &mut RenderScope, store: AppStore, pane: PaneId, t: &Ta
                 RotCol::New => {
                     let key = CellKey { table: tid.clone(), row: None, col: c.key.clone() };
                     let cell = (Some(fi) == first_typed).then(|| CellView { text: "Add a record…".to_string(), error: None, chip: None });
-                    rot_head(cell_node(__scope, store, pane, key, c, cell), head)
+                    rot_head(cell_node(__scope, store, pane, key, c, cell, true), head)
                 }
             };
             out.push(rot_slot(__scope, pinned(node, row), h));
@@ -920,9 +1078,14 @@ fn rotated_grid(__scope: &mut RenderScope, store: AppStore, pane: PaneId, t: &Ta
         let node = match col {
             RotCol::Record(i, _) => {
                 let (tid, rid) = (tid.clone(), t.rows[*i].id.clone());
+                let grip = row_grip(__scope, store, pane, &tid, &rid, "inline");
+                let ui = store.pane(pane).sheet_ui;
+                let hover = (tid.clone(), rid.clone());
                 rsx! {
                     div {
-                        class: "pimble-sheet__tail",
+                        class: "pimble-sheet__tail pimble-sheet__rot-tail",
+                        onmouseenter: move || ui.hover_row.set_if_changed(Some(hover.clone())),
+                        {grip}
                         button { class: "pimble-sheet__delete-row", title: "Delete this record", onclick: move || delete_row(store, pane, &tid, &rid), "×" }
                     }
                 }

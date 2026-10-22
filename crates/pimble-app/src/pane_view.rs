@@ -509,6 +509,12 @@ pub(crate) fn render_panes(__scope: &mut RenderScope, store: AppStore, hints: &[
     // board (docs/IMAGE_MARKUP_CONTRACT.md section 1).
     let board_toolbar = crate::boards::render_board_toolbar(__scope, store);
     let board_focused = move || store.pane(store.focused_pane.get()).show_board.get();
+    // And the sheet's own while it shows a sheet node (Joe, 2026-10-22).
+    let sheet_toolbar = crate::sheets::toolbar::render_sheet_toolbar(__scope, store);
+    let sheet_focused = move || {
+        let pane = store.pane(store.focused_pane.get());
+        pane.show_sheet.get() && !pane.show_board.get() && !pane.show_discussion.get()
+    };
     // The keyboard follows the pane focus, however it moved (a press in the
     // pane, a split, a close, the View menu): the focused pane's editor when
     // it holds a document, no editor when it holds none. Only a change of the
@@ -526,12 +532,16 @@ pub(crate) fn render_panes(__scope: &mut RenderScope, store: AppStore, hints: &[
             div {
                 class: "pimble-editor__toolbar-wrap",
                 div {
-                    style: {move || if board_focused() { "display: none;" } else { "" }},
+                    style: {move || if board_focused() || sheet_focused() { "display: none;" } else { "" }},
                     {toolbar}
                 }
                 div {
                     style: {move || if board_focused() { "" } else { "display: none;" }},
                     {board_toolbar}
+                }
+                div {
+                    style: {move || if sheet_focused() && !board_focused() { "" } else { "display: none;" }},
+                    {sheet_toolbar}
                 }
             }
             div {
