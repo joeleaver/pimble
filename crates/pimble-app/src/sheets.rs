@@ -216,7 +216,7 @@ pub struct SheetUi {
     pub hover_col: Signal<Option<(String, String)>>,
     /// The row or column being dragged by its grip, and where it would land.
     pub moving: Signal<Option<moving::Moving>>,
-    pub drop_at: Signal<Option<moving::DropAt>>,
+    pub slide: Signal<Option<moving::Slide>>,
     /// A plain table's row following the pointer (`moving::press_row`).
     pub row_drag: Signal<Option<moving::RowDrag>>,
     /// Whether one is under way: the grips read this, not every move.
@@ -244,7 +244,7 @@ impl SheetUi {
             hover_row: Signal::new(None),
             hover_col: Signal::new(None),
             moving: Signal::new(None),
-            drop_at: Signal::new(None),
+            slide: Signal::new(None),
             row_drag: Signal::new(None),
             row_dragging: Signal::new(false),
         }

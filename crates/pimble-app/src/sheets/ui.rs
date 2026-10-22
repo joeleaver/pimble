@@ -189,18 +189,18 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
             let grip = (!summary && !c.result).then(|| col_grip(__scope, store, pane, &tid, &c.key, false));
             let hover = (tid.clone(), c.key.clone());
             let key = CellKey { table: tid.clone(), row: None, col: c.key.clone() };
-            let (over_key, drop_key, mark_key) = (key.clone(), key.clone(), key);
+            let (over_key, mark_key) = (key.clone(), key);
             // The header is the cell under the column's settings; its right
             // edge is a grip beside it, so a drag there opens nothing.
             rsx! {
                 div {
                     class: "pimble-sheet__head-wrap",
-                    style: move || mark_style(moving::marks(&ui.moving.get(), &ui.drop_at.get(), &mark_key, false)),
+                    style: move || moving::style_of(&ui.slide.get(), &mark_key),
                     onmousedown: press,
                     onmouseenter: move || ui.hover_col.set_if_changed(Some(hover.clone())),
                     onmouseleave: move || ui.hover_col.set_if_changed(None),
-                    ondragenter: move || moving::over(store, pane, &over_key),
-                    ondrop: move || moving::dropped(store, pane, &drop_key),
+                    ondragover: move || moving::over(store, pane, &over_key),
+                    ondrop: move || moving::dropped(store, pane),
                     div { class: class, title: tip, onclick: open, {c.name.clone()} {mark} }
                     {grip}
                     div { class: "pimble-sheet__grip", title: "Drag to change this column's width" }
@@ -215,7 +215,7 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
         let cells: Vec<NodeHandle> = columns
             .iter()
             .zip(&r.cells)
-            .map(|(c, cell)| cell_node(__scope, store, pane, CellKey { table: tid.clone(), row: Some(r.id.clone()), col: c.key.clone() }, c, Some(cell.clone()), false))
+            .map(|(c, cell)| cell_node(__scope, store, pane, CellKey { table: tid.clone(), row: Some(r.id.clone()), col: c.key.clone() }, c, Some(cell.clone())))
             .collect();
         let tail = (!summary).then(|| {
             let (tid, rid) = (tid.clone(), r.id.clone());
@@ -286,7 +286,7 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
                 let key = CellKey { table: tid.clone(), row: None, col: c.key.clone() };
                 let placeholder = (!c.computed && std::mem::replace(&mut first, false)).then(|| "Add a row…".to_string());
                 let cell = placeholder.map(|p| CellView { text: p, error: None, chip: None });
-                cell_node(__scope, store, pane, key, c, cell, false)
+                cell_node(__scope, store, pane, key, c, cell)
             })
             .collect();
         let gap = gutter(__scope);
@@ -429,6 +429,10 @@ pub(super) fn table_node(__scope: &mut RenderScope, store: AppStore, pane: PaneI
                 div {
                     class: "pimble-sheet__grid",
                     onmouseleave: move || ui.hover_row.set_if_changed(None),
+                    // The slot a column will land in is empty while it slides
+                    // there: the grid takes a drop let go over it.
+                    ondragover: move || moving::dragged(store, pane),
+                    ondrop: move || moving::dropped(store, pane),
                     style: {move || if rotated_layout {
                         rot_style.clone()
                     } else {
@@ -467,6 +471,9 @@ const GRIP: f32 = 7.0;
 /// docs/SHEETS_CONTRACT.md "Layout"). The press's element is the header's
 /// cell on both backends, so its bounds are the column's width now.
 fn start_resize(store: AppStore, pane: PaneId, table: &str, col: &ColView) {
+    // A press on the column's move grip lands here too: its drag measures
+    // from this header (`moving::pressed`).
+    moving::pressed();
     let ctx = rinch::core::get_click_context();
     if ctx.element_width <= 0.0 || ctx.mouse_x < ctx.element_x + ctx.element_width - GRIP {
         return;
@@ -490,19 +497,6 @@ fn start_resize(store: AppStore, pane: PaneId, table: &str, col: &ColView) {
         })
         .on_cancel(move |_, _| ui.resizing.set(None))
         .start();
-}
-
-/// How a cell shows a drag under way (`moving::marks`): the moved row or
-/// column in the ghost's color, a line where it would land.
-fn mark_style(mark: &str) -> &'static str {
-    match mark {
-        " pimble-sheet__cell--moving" => "background: var(--pimble-sheet-ghost);",
-        " pimble-sheet__cell--drop-above" => "box-shadow: inset 0 2px 0 var(--rinch-primary-color-6);",
-        " pimble-sheet__cell--drop-below" => "box-shadow: inset 0 -2px 0 var(--rinch-primary-color-6);",
-        " pimble-sheet__cell--drop-left" => "box-shadow: inset 2px 0 0 var(--rinch-primary-color-6);",
-        " pimble-sheet__cell--drop-right" => "box-shadow: inset -2px 0 0 var(--rinch-primary-color-6);",
-        _ => "",
-    }
 }
 
 /// How part of row `row` of `table` shows while a row follows the pointer
@@ -554,6 +548,7 @@ fn row_grip(__scope: &mut RenderScope, store: AppStore, pane: PaneId, table: &st
                 title: "Drag to move this record",
                 draggable: "true",
                 ondragstart: move || moving::start(store, pane, start_what.clone()),
+                ondragmove: move || moving::dragged(store, pane),
                 ondragend: move || moving::end(store, pane),
                 IconGlyph { name: TablerIcon::GripVertical.name().to_string() }
             }
@@ -579,6 +574,7 @@ fn col_grip(__scope: &mut RenderScope, store: AppStore, pane: PaneId, table: &st
             title: if rotated { "Drag to move this field" } else { "Drag to move this column" },
             draggable: "true",
             ondragstart: move || moving::start(store, pane, start_what.clone()),
+            ondragmove: move || moving::dragged(store, pane),
             ondragend: move || moving::end(store, pane),
             IconGlyph { name: if rotated { TablerIcon::GripVertical.name().to_string() } else { TablerIcon::GripHorizontal.name().to_string() } }
         }
@@ -591,7 +587,7 @@ fn gutter(__scope: &mut RenderScope) -> NodeHandle {
     rsx! { div { class: "pimble-sheet__gutter" } }
 }
 
-fn cell_node(__scope: &mut RenderScope, store: AppStore, pane: PaneId, key: CellKey, col: &ColView, cell: Option<CellView>, rotated: bool) -> NodeHandle {
+fn cell_node(__scope: &mut RenderScope, store: AppStore, pane: PaneId, key: CellKey, col: &ColView, cell: Option<CellView>) -> NodeHandle {
     let ui = store.pane(pane).sheet_ui;
     let cell = cell.unwrap_or(CellView { text: String::new(), error: None, chip: None });
     let placeholder = key.row.is_none();
@@ -618,19 +614,19 @@ fn cell_node(__scope: &mut RenderScope, store: AppStore, pane: PaneId, key: Cell
     let press_key = key.clone();
     let editing_key = key.clone();
     let editing_key2 = key.clone();
-    let (over_key, drop_key, mark_key) = (key.clone(), key.clone(), key.clone());
+    let (over_key, mark_key) = (key.clone(), key.clone());
     let hover = key.row.clone().map(|row| (key.table.clone(), row));
     rsx! {
         div {
             class: class,
             title: tip,
             style: move || {
-                let mark = mark_style(moving::marks(&ui.moving.get(), &ui.drop_at.get(), &mark_key, rotated));
+                let mark = moving::style_of(&ui.slide.get(), &mark_key);
                 format!("{mark}{}", ghost_style(&ui.row_drag.get(), &mark_key.table, mark_key.row.as_deref()))
             },
             onmouseenter: move || ui.hover_row.set_if_changed(hover.clone()),
-            ondragenter: move || moving::over(store, pane, &over_key),
-            ondrop: move || moving::dropped(store, pane, &drop_key),
+            ondragover: move || moving::over(store, pane, &over_key),
+            ondrop: move || moving::dropped(store, pane),
             onclick: move || cell_pressed(store, pane, press_key.clone()),
             // The edit box lies over the cell and the text stays under it,
             // hidden, so opening a cell never resizes its row or columns.
@@ -916,10 +912,19 @@ fn summary_cell(__scope: &mut RenderScope, store: AppStore, pane: PaneId, table:
     let tip = cell.error.clone().unwrap_or_else(|| {
         if cell.text.is_empty() { format!("{} · click to change what it shows", s.name) } else { format!("{}: {} · click to change what it shows", s.name, cell.text) }
     });
+    // A column being dragged takes its summary cells along.
+    let ui = store.pane(pane).sheet_ui;
+    let mark_key = CellKey { table: table.to_string(), row: None, col: c.key.clone() };
+    let over_key = mark_key.clone();
     rsx! {
         div {
             class: class,
             title: tip,
+            style: move || {
+                moving::style_of(&ui.slide.get(), &mark_key)
+            },
+            ondragover: move || moving::over(store, pane, &over_key),
+            ondrop: move || moving::dropped(store, pane),
             onclick: move || open_summary(store, pane, &t, &r, Some(&k)),
             {name}
             div { class: "pimble-sheet__text", {cell.text.clone()} }
@@ -1018,16 +1023,17 @@ fn rotated_grid(__scope: &mut RenderScope, store: AppStore, pane: PaneId, t: &Ta
         let ui = store.pane(pane).sheet_ui;
         let hover = (tid.clone(), c.key.clone());
         let key = CellKey { table: tid.clone(), row: None, col: c.key.clone() };
-        let (over_key, drop_key, mark_key) = (key.clone(), key.clone(), key);
+        let (over_key, mark_key) = (key.clone(), key);
         out.push(pinned(
             rsx! {
                 div {
                     class: "pimble-sheet__head-wrap pimble-sheet__rot-name",
-                    style: move || mark_style(moving::marks(&ui.moving.get(), &ui.drop_at.get(), &mark_key, true)),
+                    onmousedown: moving::pressed,
+                    style: move || moving::style_of(&ui.slide.get(), &mark_key),
                     onmouseenter: move || ui.hover_col.set_if_changed(Some(hover.clone())),
                     onmouseleave: move || ui.hover_col.set_if_changed(None),
-                    ondragenter: move || moving::over(store, pane, &over_key),
-                    ondrop: move || moving::dropped(store, pane, &drop_key),
+                    ondragover: move || moving::over(store, pane, &over_key),
+                    ondrop: move || moving::dropped(store, pane),
                     div { class: class, title: tip, onclick: open, {c.name.clone()} {mark} }
                     {grip}
                 }
@@ -1039,7 +1045,7 @@ fn rotated_grid(__scope: &mut RenderScope, store: AppStore, pane: PaneId, t: &Ta
                 RotCol::Record(i, _) => {
                     let r = &t.rows[*i];
                     let key = CellKey { table: tid.clone(), row: Some(r.id.clone()), col: c.key.clone() };
-                    rot_head(cell_node(__scope, store, pane, key, c, r.cells.get(fi).cloned(), true), head)
+                    rot_head(cell_node(__scope, store, pane, key, c, r.cells.get(fi).cloned()), head)
                 }
                 RotCol::Subtotal(k, j) => {
                     let s = &t.groups[*k].subtotals[*j];
@@ -1053,7 +1059,7 @@ fn rotated_grid(__scope: &mut RenderScope, store: AppStore, pane: PaneId, t: &Ta
                 RotCol::New => {
                     let key = CellKey { table: tid.clone(), row: None, col: c.key.clone() };
                     let cell = (Some(fi) == first_typed).then(|| CellView { text: "Add a record…".to_string(), error: None, chip: None });
-                    rot_head(cell_node(__scope, store, pane, key, c, cell, true), head)
+                    rot_head(cell_node(__scope, store, pane, key, c, cell), head)
                 }
             };
             out.push(rot_slot(__scope, pinned(node, row), h));
@@ -1084,6 +1090,7 @@ fn rotated_grid(__scope: &mut RenderScope, store: AppStore, pane: PaneId, t: &Ta
                 rsx! {
                     div {
                         class: "pimble-sheet__tail pimble-sheet__rot-tail",
+                        onmousedown: moving::pressed,
                         onmouseenter: move || ui.hover_row.set_if_changed(Some(hover.clone())),
                         {grip}
                         button { class: "pimble-sheet__delete-row", title: "Delete this record", onclick: move || delete_row(store, pane, &tid, &rid), "×" }

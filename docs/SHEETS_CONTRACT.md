@@ -138,11 +138,14 @@ The UI calls this the column's **type** (Joe, 2026-10-19). From the mockup:
 - **Rows and columns move by dragging** (Joe, 2026-10-22, the Google Sheets way, with a
   grip on both): a row's grip shows in a narrow gutter before the first column while
   the pointer is over the row, a column's at the top of its header while the pointer is
-  over the header; a plain table's row then follows the pointer, lifted in the ghost's color, and the rows
-  it passes slide aside to make room (every row is 31px, so where it lands is reckoned
-  from the pointer, `moving::RowDrag`); a column (and a rotated table's record or field)
-  shows in the ghost's color with a line where it will land. The drop writes its
-  `order` (`move_row`, `move_column`). No grip shows while a drag is under way. A rotated
+  over the header; what moves then follows the pointer, lifted in the ghost's color, and the rows or
+  columns it passes slide aside to make room (Joe: columns drag like rows). A plain
+  table's row reckons from its height (every row is 31px, `moving::RowDrag`); a column,
+  and a rotated table's record or field, learns each neighbor's box as the drag passes
+  over it and passes it once the pointer crosses its middle (`moving::Slide`; the
+  browser backend reports no element's bounds otherwise). The drop writes its `order`
+  (`move_row`, `move_column`), also when it is let go over the empty slot it will land
+  in (the grid takes the drop). No grip shows while a drag is under way. A rotated
   table's record grip is beside its delete button, a field's before its name. A row
   moves only among the rows of its own group (a drag never changes a cell), one row or
   column at a time. The toolbar's Move Row Up/Down and Move Column Left/Right step the

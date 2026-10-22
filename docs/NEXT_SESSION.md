@@ -1,5 +1,65 @@
 # Next session: start here
 
+**2026-10-22, end of session: v0.12.6 released, deployed (jkbase v33) and installed
+here** (release commit 4f96e4d, tag `v0.12.6`, rinch `main` 5fbdfb98 in both locks;
+backup `bkp_1792690516114_11787680e5879add`). Since v0.12.3 the releases brought:
+Help > About (versions, update status, Check Now, Restart to Update; 0.12.4), sheet
+cells typed in place with nothing resizing (0.12.5), eight resize grips on pictures and
+boards in text (0.12.5), a sheet node's own toolbar (`sheets/toolbar.rs`), link pills
+as inline-blocks and whole-pixel rows (rinch #1426/#1762 are the real bugs), and rows
+and columns moved by dragging a grip (0.12.6). docs/SHEETS_CONTRACT.md section 3 has
+every one of them.
+
+**Uncommitted on `master`, ready for the next release (Joe: "Not yet"):** columns drag
+like rows. `sheets/moving.rs` `Slide`: what moves follows the pointer in the ghost's
+color and the columns (or a rotated table's records and fields) it passes slide aside,
+each neighbor's box learned from `ondragover` as the drag reaches it (rinch-web fills
+no `bounds_signal`); the grid itself takes a drop let go over the empty landing slot.
+Checked on the desktop over the debug port (a plain table's column, a rotated table's
+record and field); tests `cargo test -p pimble-app --release --lib moving` pass; the
+web build checks but was not tried in a browser. With the next release also move rinch
+to `main` 7b58166d or later: #1761 (a ContextMenu shifted back inside the window, PR
+#1765; Joe's menus were cut off at the bottom) is merged. Pimble's only menu CSS targets
+`.rinch-context-menu__dropdown`, which still exists; check a right-click near the top of
+a short window. Still open in rinch: #1764 (DropdownMenu/Popover edges), #1426/#1762
+(inline padding; the pill workaround stays), #1731 (paint does not follow damage).
+
+**Start here next: presence indicators** (Joe, 2026-10-22: before the next release).
+Nothing exists yet, in Pimble or in rinch's editor (no remote carets or selections).
+What is already decided, all of it in the contracts:
+
+- Presence is designed once, for the whole app, text and boards together
+  (docs/IMAGE_MARKUP_CONTRACT.md section 7, Joe 2026-10-09). It is **never document
+  data**: cursors, selections, viewports are ephemeral, never stored, gone when the
+  person leaves. Boards will need positions in board units and selections as element
+  ids, both already the document's terms.
+- Identity is the signed-in account (docs/IMAGE_MARKUP_CONTRACT.md section 6, the
+  author stamp: no account, no author). Who people are to each other in a share
+  (nicknames and presence) was left as "a session of its own" on 2026-09-21.
+- @mentions in discussions wait for presence (docs/DISCUSSIONS_CONTRACT.md "Not built").
+
+Questions to put to Joe before designing (do not guess these; roles and what crosses the
+network are his calls):
+
+1. What shows: who has a note open (avatars on the pane, dots on tree rows), their caret
+   and selection in text, their pointer and selection on a board, a "follow" mode?
+2. Which tiers: local panes and windows of one person, other devices of the same person,
+   members of a share through the hosted server and through the relay. Presence through
+   an encrypted (vault) store must be encrypted too: the hosted server sees ciphertext
+   only, so presence frames would ride like `VaultAppended` blobs but never be stored.
+3. Agents (the MCP's agents): do they show as present while they edit?
+4. Opt-out: may a person hide their presence?
+
+Technical starting points: text positions must survive concurrent edits, so a caret is a
+CRDT-relative position (yrs sticky index) inside the node's `content`, resolved to a
+screen rect with rinch's `EditorHandle::caret_rect` and drawn in the editor's overlay
+slot (how discussion margin markers are drawn, `discussions/margin.rs`). Remote carets
+and selection highlights inside rinch's editor are probably a general rinch mechanism
+(decorations for ranges the app names) — ask the Rinch session, never put a Pimble
+concept into rinch. The transport is ephemeral relay of small frames beside
+`subscribeNodeChanges` (`pimble-rpc` `methods.rs`), through `relay_face.rs`/the vault
+link for shares; nothing persisted, nothing in `applyEdit`.
+
 **2026-10-21, night: v0.12.1 released, deployed (jkbase v28) and installed here**
 (release commit 15261f9; backup `bkp_1792617824741_399f9909320523ac`). It fixes the
 explorer: rows clear the overlay scrollbar, long titles end in an ellipsis, and each row

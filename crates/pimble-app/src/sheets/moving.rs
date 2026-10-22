@@ -2,11 +2,18 @@
 //! does, by a grip that shows while the pointer is over the row or the
 //! column's header; docs/SHEETS_CONTRACT.md "Moving rows and columns").
 //!
-//! A grip is `draggable`; every cell hears the drag pass over it and the drop,
-//! so a move works the same on a table drawn either way round (a rotated
-//! table's records are its columns on screen). A row moves only among the rows
-//! of its own group: the group comes from a cell's value, and a drag that
-//! changed a cell would surprise. The toolbar's Move buttons step one place.
+//! Whatever moves follows the pointer in the ghost's color and the rows or
+//! columns it passes slide aside to make room (Joe: "columns dragged like
+//! rows"). A plain table's row is dragged with `Drag::absolute`, every row
+//! being `ROW_PITCH` tall. A column, and a rotated table's record or field,
+//! is `draggable`: the cells it passes hear the drag over them with their
+//! painted box, which is how their sizes are learned (they differ, and the
+//! browser backend reports no element's bounds otherwise). A row moves only
+//! among the rows of its own group: the group comes from a cell's value, and
+//! a drag that changed a cell would surprise. The toolbar's Move buttons
+//! step one place.
+
+use std::collections::HashMap;
 
 use rinch::prelude::*;
 
@@ -20,15 +27,6 @@ use pimble_sheet::doc::Placement;
 pub enum Moving {
     Row { table: String, row: String },
     Col { table: String, col: String },
-}
-
-/// Where the dragged row or column would land: beside `target` (a row id or
-/// a column key), `after` it or before.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DropAt {
-    pub table: String,
-    pub target: String,
-    pub after: bool,
 }
 
 /// The rows a row of `t` moves among: its group's, or every row.
@@ -46,18 +44,6 @@ fn siblings<'a>(t: &'a TableView, row: &str) -> Vec<&'a str> {
 
 fn columns(t: &TableView) -> Vec<&str> {
     t.columns.iter().filter(|c| !c.result).map(|c| c.key.as_str()).collect()
-}
-
-/// Dropped on `target`, `moved` takes its place, `target` giving way toward
-/// where `moved` was: before it when `moved` came from after it.
-pub(crate) fn landing(order: &[&str], moved: &str, target: &str) -> Option<DropSide> {
-    let from = order.iter().position(|id| *id == moved)?;
-    let to = order.iter().position(|id| *id == target)?;
-    match from.cmp(&to) {
-        std::cmp::Ordering::Equal => None,
-        std::cmp::Ordering::Greater => Some(DropSide::Before),
-        std::cmp::Ordering::Less => Some(DropSide::After),
-    }
 }
 
 /// One step of `moved` along `order` (`by` is -1 or 1): beside the neighbor
@@ -89,64 +75,182 @@ fn table_of(store: AppStore, pane: PaneId, table: &str) -> Option<TableView> {
     untracked(|| store.pane(pane).sheet_ui.tables.get()).into_iter().find(|t| t.id == table)
 }
 
-/// Where the drag now under way would land on the cell `key`, if it may.
-fn landing_on(store: AppStore, pane: PaneId, moving: &Moving, key: &CellKey) -> Option<DropAt> {
-    match moving {
-        Moving::Row { table, row } if *table == key.table => {
-            let target = key.row.as_deref()?;
-            let t = table_of(store, pane, table)?;
-            let side = landing(&siblings(&t, row), row, target)?;
-            Some(DropAt { table: table.clone(), target: target.to_string(), after: side == DropSide::After })
+// ── Sliding: what moves follows the pointer, the rest make room ──────────
+
+/// A row or column on the move, along one axis of the screen: `ids` the
+/// order it moves in, `from` where it was, `to` where it would land, `offset`
+/// how far the pointer has taken it, `size` how much room it takes. `seen`
+/// holds where each one it has passed over lies (start and size, as drawn
+/// before anything slid), learned as the pointer reached it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Slide {
+    pub table: String,
+    /// A column moves (its cells are named by column key), or a row (by row id).
+    pub cols: bool,
+    /// Down the screen (a plain table's row, a rotated table's field), or across.
+    pub vertical: bool,
+    pub ids: Vec<String>,
+    pub from: usize,
+    pub to: usize,
+    pub offset: f32,
+    pub size: f32,
+    /// Where the pointer was pressed, along the axis.
+    pub start: f32,
+    pub seen: HashMap<String, (f32, f32)>,
+}
+
+impl Slide {
+    /// The id a cell's key names along this slide's axis.
+    fn id_of<'a>(&self, key: &'a CellKey) -> Option<&'a str> {
+        if key.table != self.table {
+            return None;
         }
-        Moving::Col { table, col } if *table == key.table => {
-            let t = table_of(store, pane, table)?;
-            let side = landing(&columns(&t), col, &key.col)?;
-            Some(DropAt { table: table.clone(), target: key.col.clone(), after: side == DropSide::After })
+        if self.cols { Some(key.col.as_str()) } else { key.row.as_deref() }
+    }
+
+    /// The pointer is at `p` along the axis: what moves is under it, and it
+    /// lands past every neighbor whose middle the pointer has crossed.
+    pub(crate) fn pointer_at(&mut self, p: f32) {
+        self.offset = p - self.start;
+        let crossed = |i: usize, forward: bool| {
+            self.seen.get(&self.ids[i]).is_some_and(|&(s, w)| if forward { p > s + w / 2.0 } else { p < s + w / 2.0 })
+        };
+        let mut to = self.from;
+        while to + 1 < self.ids.len() && crossed(to + 1, true) {
+            to += 1;
         }
-        _ => None,
+        if to == self.from {
+            while to > 0 && crossed(to - 1, false) {
+                to -= 1;
+            }
+        }
+        self.to = to;
+    }
+
+    /// A cell of `id` was reached, drawn at `start` and `size` along the
+    /// axis; kept the first time, while nothing has slid it.
+    pub(crate) fn saw(&mut self, id: &str, start: f32, size: f32) {
+        if id != self.ids[self.from] && size > 0.0 && self.shift(id).is_none() {
+            self.seen.entry(id.to_string()).or_insert((start, size));
+        }
+    }
+
+    /// How far `id` is drawn from its place, and whether it is what moves.
+    pub(crate) fn shift(&self, id: &str) -> Option<(f32, bool)> {
+        let i = self.ids.iter().position(|x| x == id)?;
+        if i == self.from {
+            return Some((self.offset, true));
+        }
+        let (from, to) = (self.from, self.to);
+        let by = if from < to && i > from && i <= to {
+            -self.size
+        } else if to < from && i >= to && i < from {
+            self.size
+        } else {
+            return None;
+        };
+        Some((by, false))
+    }
+
+    /// How cell `key` draws: lifted under the pointer, or slid aside.
+    pub(crate) fn style_of(&self, key: &CellKey) -> String {
+        let Some((by, lifted)) = self.id_of(key).and_then(|id| self.shift(id)) else { return String::new() };
+        let axis = if self.vertical { "Y" } else { "X" };
+        if lifted {
+            // It lets the pointer through to the cells it passes, which say
+            // where they are.
+            format!("position: relative; z-index: 3; pointer-events: none; background: var(--pimble-sheet-ghost); transform: translate{axis}({by:.1}px);")
+        } else {
+            format!("position: relative; transform: translate{axis}({by:.1}px);")
+        }
     }
 }
 
-/// A grip's drag starts.
+thread_local! {
+    /// The box of the cell a grip sits in, and the press, from the last
+    /// press on one: the moved one's size, and where its offset counts from.
+    static PRESSED: std::cell::Cell<(f32, f32, f32, f32)> = const { std::cell::Cell::new((0.0, 0.0, 0.0, 0.0)) };
+}
+
+/// A press in the cell holding a grip that drags by drop (a column's header,
+/// a rotated table's field name or record foot).
+pub(crate) fn pressed() {
+    let ctx = rinch::core::get_click_context();
+    PRESSED.with(|p| p.set((ctx.mouse_x, ctx.mouse_y, ctx.element_width, ctx.element_height)));
+}
+
+/// A grip's drag starts: what moves follows the pointer, drawn by the app
+/// (rinch's own copy of the grip is hidden).
 pub(crate) fn start(store: AppStore, pane: PaneId, what: Moving) {
     let ui = store.pane(pane).sheet_ui;
+    let (table, id, cols) = match &what {
+        Moving::Row { table, row } => (table.clone(), row.clone(), false),
+        Moving::Col { table, col } => (table.clone(), col.clone(), true),
+    };
+    let Some(t) = table_of(store, pane, &table) else { return };
+    let ids: Vec<String> = if cols { columns(&t) } else { siblings(&t, &id) }.into_iter().map(str::to_string).collect();
+    let Some(from) = ids.iter().position(|x| *x == id) else { return };
+    rinch::core::suppress_drag_ghost();
     commit(store, pane, Move::Stay);
-    ui.drop_at.set(None);
+    // A rotated table's field runs across the screen and moves down it; its
+    // records are columns on screen and move across.
+    let vertical = cols && t.rotated;
+    let (x, y, w, h) = PRESSED.with(|p| p.get());
+    let (start, size) = if vertical { (y, h) } else { (x, w) };
+    ui.slide.set(Some(Slide { table, cols, vertical, ids, from, to: from, offset: 0.0, size, start, seen: HashMap::new() }));
     ui.moving.set(Some(what));
+}
+
+/// The pointer moved during the drag.
+pub(crate) fn dragged(store: AppStore, pane: PaneId) {
+    let ui = store.pane(pane).sheet_ui;
+    let ctx = rinch::core::get_click_context();
+    let Some(mut s) = untracked(|| ui.slide.get()) else { return };
+    s.pointer_at(if s.vertical { ctx.mouse_y } else { ctx.mouse_x });
+    ui.slide.set(Some(s));
+}
+
+/// The drag passes over cell `key`, drawn in the box the click context holds.
+pub(crate) fn over(store: AppStore, pane: PaneId, key: &CellKey) {
+    let ui = store.pane(pane).sheet_ui;
+    let ctx = rinch::core::get_click_context();
+    let Some(mut s) = untracked(|| ui.slide.get()) else { return };
+    let Some(id) = s.id_of(key).map(str::to_string) else { return };
+    let (start, size) = if s.vertical { (ctx.element_y, ctx.element_height) } else { (ctx.element_x, ctx.element_width) };
+    s.saw(&id, start, size);
+    s.pointer_at(if s.vertical { ctx.mouse_y } else { ctx.mouse_x });
+    ui.slide.set_if_changed(Some(s));
 }
 
 /// The drag ends, dropped or not.
 pub(crate) fn end(store: AppStore, pane: PaneId) {
     let ui = store.pane(pane).sheet_ui;
     ui.moving.set(None);
-    ui.drop_at.set(None);
+    ui.slide.set(None);
 }
 
-/// The drag passes over cell `key`.
-pub(crate) fn over(store: AppStore, pane: PaneId, key: &CellKey) {
+/// The drag is let go over a cell: what moved lands where it is shown.
+pub(crate) fn dropped(store: AppStore, pane: PaneId) {
     let ui = store.pane(pane).sheet_ui;
-    let Some(moving) = untracked(|| ui.moving.get()) else { return };
-    ui.drop_at.set_if_changed(landing_on(store, pane, &moving, key));
-}
-
-/// The drag is let go over cell `key`.
-pub(crate) fn dropped(store: AppStore, pane: PaneId, key: &CellKey) {
-    let ui = store.pane(pane).sheet_ui;
-    let Some(moving) = untracked(|| ui.moving.get()) else { return };
-    let at = landing_on(store, pane, &moving, key);
+    let done = untracked(|| ui.slide.get());
     end(store, pane);
-    let Some(at) = at else { return };
-    let side = if at.after { DropSide::After } else { DropSide::Before };
-    aim(pane, Some(&at.table));
-    match moving {
-        Moving::Row { table, row } => {
-            local_edit(store, pane, |t| t.move_row(&table, &row, placement(&at.target, side)));
-        }
-        Moving::Col { table, col } => {
-            local_edit(store, pane, |t| t.move_column(&table, &col, placement(&at.target, side)));
-        }
+    let Some(s) = done.filter(|s| s.to != s.from) else { return };
+    let (moved, target) = (s.ids[s.from].clone(), s.ids[s.to].clone());
+    let side = if s.to > s.from { DropSide::After } else { DropSide::Before };
+    aim(pane, Some(&s.table));
+    if s.cols {
+        local_edit(store, pane, |t| t.move_column(&s.table, &moved, placement(&target, side)));
+    } else {
+        local_edit(store, pane, |t| t.move_row(&s.table, &moved, placement(&target, side)));
     }
 }
+
+/// How cell `key` draws while something slides.
+pub(crate) fn style_of(slide: &Option<Slide>, key: &CellKey) -> String {
+    slide.as_ref().map(|s| s.style_of(key)).unwrap_or_default()
+}
+
+// ── A plain table's row ──────────────────────────────────────────────────
 
 /// A row's height, which every row has (`.pimble-sheet__cell`'s line
 /// height, its padding and its bottom line): a live row drag reckons from it.
@@ -230,6 +334,8 @@ pub(crate) fn press_row(store: AppStore, pane: PaneId, table: &str, row: &str) {
         .start();
 }
 
+// ── The toolbar's steps ──────────────────────────────────────────────────
+
 /// The toolbar's Move Up and Move Down: row `row` of `table` one place
 /// along its group (`by` -1 or 1).
 pub(crate) fn step_row(store: AppStore, pane: PaneId, table: &str, row: &str, by: i32) {
@@ -258,47 +364,9 @@ pub(crate) fn col_can_step(t: &TableView, col: &str, by: i32) -> bool {
     step(&columns(t), col, by).is_some()
 }
 
-/// The marks cell `key` shows while a drag is under way: faint when it is
-/// what moves, a line on the side the moved one would land. `rotated`: the
-/// table is drawn with its records as columns.
-pub(crate) fn marks(moving: &Option<Moving>, drop_at: &Option<DropAt>, key: &CellKey, rotated: bool) -> &'static str {
-    let Some(moving) = moving else { return "" };
-    let (is_moved, along_rows) = match moving {
-        Moving::Row { table, row } => (*table == key.table && key.row.as_deref() == Some(row.as_str()), true),
-        Moving::Col { table, col } => (*table == key.table && key.col == *col, false),
-    };
-    if is_moved {
-        return " pimble-sheet__cell--moving";
-    }
-    let Some(at) = drop_at.as_ref().filter(|a| a.table == key.table) else { return "" };
-    let hit = if along_rows { key.row.as_deref() == Some(at.target.as_str()) } else { key.col == at.target };
-    if !hit {
-        return "";
-    }
-    // A row is a line across the screen in a plain table and down it in a
-    // rotated one; a column the other way round.
-    match (along_rows != rotated, at.after) {
-        (true, false) => " pimble-sheet__cell--drop-above",
-        (true, true) => " pimble-sheet__cell--drop-below",
-        (false, false) => " pimble-sheet__cell--drop-left",
-        (false, true) => " pimble-sheet__cell--drop-right",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_dropped_row_takes_the_place_of_the_one_it_lands_on() {
-        let order = ["a", "b", "c", "d"];
-        // Down the list: after the target, which moves up toward where it was.
-        assert_eq!(landing(&order, "a", "c"), Some(DropSide::After));
-        // Up the list: before it.
-        assert_eq!(landing(&order, "d", "b"), Some(DropSide::Before));
-        assert_eq!(landing(&order, "b", "b"), None, "on itself: nothing moves");
-        assert_eq!(landing(&order, "a", "z"), None, "a target that is not a sibling (another group) takes nothing");
-    }
 
     #[test]
     fn a_step_passes_one_neighbor_and_stops_at_the_ends() {
@@ -328,20 +396,71 @@ mod tests {
         assert_eq!(d.offset("u", "a"), None, "another table's rows stay put");
     }
 
+    /// Columns a (0-100), b (100-160), c (160-300), d (300-340); b is dragged
+    /// from its middle, x = 130.
+    fn sliding_b() -> Slide {
+        Slide {
+            table: "t".into(),
+            cols: true,
+            vertical: false,
+            ids: ["a", "b", "c", "d"].map(String::from).to_vec(),
+            from: 1,
+            to: 1,
+            offset: 0.0,
+            size: 60.0,
+            start: 130.0,
+            seen: HashMap::new(),
+        }
+    }
+
     #[test]
-    fn the_landing_line_follows_the_table_round() {
-        let row = |r: &str| CellKey { table: "t".into(), row: Some(r.into()), col: "c1".into() };
-        let moving = Some(Moving::Row { table: "t".into(), row: "a".into() });
-        let at = Some(DropAt { table: "t".into(), target: "b".into(), after: true });
-        assert_eq!(marks(&moving, &at, &row("a"), false), " pimble-sheet__cell--moving");
-        assert_eq!(marks(&moving, &at, &row("b"), false), " pimble-sheet__cell--drop-below");
-        assert_eq!(marks(&moving, &at, &row("b"), true), " pimble-sheet__cell--drop-right", "a record is a column when rotated");
-        assert_eq!(marks(&moving, &at, &row("c"), false), "");
-        let col = Some(Moving::Col { table: "t".into(), col: "c1".into() });
-        let at = Some(DropAt { table: "t".into(), target: "c2".into(), after: false });
-        let cell = CellKey { table: "t".into(), row: Some("a".into()), col: "c2".into() };
-        assert_eq!(marks(&col, &at, &cell, false), " pimble-sheet__cell--drop-left");
-        assert_eq!(marks(&col, &at, &cell, true), " pimble-sheet__cell--drop-above", "a field is a row when rotated");
-        assert_eq!(marks(&None, &at, &cell, false), "", "nothing while no drag is under way");
+    fn a_dragged_column_passes_a_neighbor_once_the_pointer_crosses_its_middle() {
+        let mut s = sliding_b();
+        // Into c: learned there, but its middle (230) is not crossed yet.
+        s.saw("c", 160.0, 140.0);
+        s.pointer_at(200.0);
+        assert_eq!((s.to, s.offset), (1, 70.0), "it follows the pointer; c stays");
+        s.pointer_at(240.0);
+        assert_eq!(s.to, 2, "past c's middle: it would land after c");
+        assert_eq!(s.shift("c"), Some((-60.0, false)), "c slides left by b's width");
+        assert_eq!(s.shift("b"), Some((110.0, true)));
+        // c, slid, is reached again: what was learned before it slid stands.
+        s.saw("c", 100.0, 140.0);
+        assert_eq!(s.seen["c"], (160.0, 140.0));
+        // d is not learned yet, so even far right it lands after c.
+        s.pointer_at(330.0);
+        assert_eq!(s.to, 2);
+        s.saw("d", 300.0, 40.0);
+        s.pointer_at(330.0);
+        assert_eq!(s.to, 3, "past d's middle too");
+        // Back to where it started: everything back in place.
+        s.pointer_at(130.0);
+        assert_eq!((s.to, s.shift("c"), s.shift("d")), (1, None, None));
+        // Left past a's middle.
+        s.saw("a", 0.0, 100.0);
+        s.pointer_at(40.0);
+        assert_eq!(s.to, 0);
+        assert_eq!(s.shift("a"), Some((60.0, false)), "a slides right to make room");
+    }
+
+    #[test]
+    fn a_cell_draws_by_the_slide() {
+        let mut s = sliding_b();
+        s.saw("c", 160.0, 140.0);
+        s.pointer_at(240.0);
+        let cell = |col: &str| CellKey { table: "t".into(), row: Some("r".into()), col: col.into() };
+        assert!(s.style_of(&cell("b")).contains("translateX(110.0px)"), "{}", s.style_of(&cell("b")));
+        assert!(s.style_of(&cell("b")).contains("pointer-events: none"));
+        assert!(s.style_of(&cell("c")).contains("translateX(-60.0px)"));
+        assert_eq!(s.style_of(&cell("d")), "");
+        let elsewhere = CellKey { table: "u".into(), row: None, col: "b".into() };
+        assert_eq!(s.style_of(&elsewhere), "", "another table's cells stay put");
+        // A rotated table's field moves down the screen.
+        let field = Slide { vertical: true, ..s.clone() };
+        assert!(field.style_of(&cell("b")).contains("translateY("));
+        // A record (a row) is named by its row id.
+        let record = Slide { cols: false, ids: ["r1", "r2"].map(String::from).to_vec(), from: 0, to: 0, offset: 12.0, ..sliding_b() };
+        let r1 = CellKey { table: "t".into(), row: Some("r1".into()), col: "whatever".into() };
+        assert!(record.style_of(&r1).contains("translateX(12.0px)"));
     }
 }
