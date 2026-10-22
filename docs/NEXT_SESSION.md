@@ -1,5 +1,22 @@
 # Next session: start here
 
+**2026-10-22, later: presence started, branch `presence` (not merged, nothing pushed).**
+docs/PRESENCE_CONTRACT.md has Joe's answers:
+- everything shows: open notes, carets, board pointers, follow;
+- every remote tier;
+- agents present;
+- no opt-out;
+- a name per share, and members never see each other's emails.
+
+Wave 0 (names) is built and checked on the local stack; see "Built in wave 0" at the end
+of the contract. 1099 workspace tests pass. Before merging, ask Joe two things:
+1. Should the invitation mails stop naming the inviter by email?
+2. Should the accounts service change (member lists without emails for members,
+   `shared_by` as a name) ship with the next release and deploy? Older desktops show
+   blank member emails then.
+
+Next is wave 1: transport and who is here.
+
 **2026-10-22, end of session: v0.12.6 released, deployed (jkbase v33) and installed
 here** (release commit 4f96e4d, tag `v0.12.6`, rinch `main` 5fbdfb98 in both locks;
 backup `bkp_1792690516114_11787680e5879add`). Since v0.12.3 the releases brought:
