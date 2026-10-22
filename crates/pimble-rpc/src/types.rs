@@ -988,6 +988,11 @@ pub enum StoreChangeKind {
     /// (docs/DISCUSSIONS_CONTRACT.md section 1); `live` says which it is now.
     /// A subscriber refetches the host's attachments.
     AttachmentChanged { node_id: NodeId, host_id: NodeId, live: bool },
+    /// Who is who in this store's shares changed on this device: a name
+    /// chosen, someone joining or leaving (`cloudPeople` answers the new
+    /// list; docs/PRESENCE_CONTRACT.md section 3). Derived state: links
+    /// never forward it.
+    PeopleChanged,
 }
 
 /// Notification that a node's content has changed.
@@ -1152,6 +1157,115 @@ pub struct CloudAddHostedStoreRequest {
 }
 
 // ============================================================================
+// Names, docs/PRESENCE_CONTRACT.md section 3
+// ============================================================================
+
+/// The shares the signed-in account takes part in and the names it goes by
+/// in each (`cloudListShares`): what the Shares dialog shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudListSharesResponse {
+    /// The default name chosen, `""` for none.
+    pub display_name: String,
+    /// What the account is called where nothing more particular applies: the
+    /// default name, else the local part of the email.
+    pub default_name: String,
+    pub shares: Vec<CloudShareRow>,
+}
+
+/// One share the account takes part in, owned or joined.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudShareRow {
+    pub store_id: StoreId,
+    /// The shared node; `None` for a whole store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<NodeId>,
+    pub name: String,
+    pub role: String,
+    /// Whether the account owns the store this share is of.
+    pub owned: bool,
+    /// Whose share it is, by the name they go by in it; `None` for one's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_name: Option<String>,
+    /// Shared from its owner's computer (docs/RELAY_CONTRACT.md).
+    #[serde(default)]
+    pub relayed: bool,
+    /// The name chosen for this share, `""` for none.
+    pub my_name: String,
+    /// What the others in it see.
+    pub appears_as: String,
+    /// Whether the share is on this device: its store is open here, and (for
+    /// a share of somebody else's store) the replica holds its root.
+    pub here: bool,
+}
+
+/// Set the default name (`cloudSetDisplayName`); empty clears it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudSetDisplayNameRequest {
+    pub name: String,
+}
+
+/// Set the name the account goes by in one share (`cloudSetShareName`);
+/// empty means the default name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudSetShareNameRequest {
+    pub store_id: StoreId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<NodeId>,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudPeopleRequest {
+    pub store_id: StoreId,
+}
+
+/// Who is who in a store's shares (`cloudPeople`): per scope this device
+/// reaches the store through, everyone in it and the name they go by there.
+/// How a device turns the account id on a presence frame, a discussion
+/// message or a board element into a name. Kept beside the store as derived
+/// data (`people.json`), so it answers offline too.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorePeople {
+    pub scopes: Vec<ScopePeople>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopePeople {
+    /// The share's node; `None` for the whole store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<NodeId>,
+    pub people: Vec<Person>,
+    /// What this account goes by in the scope.
+    #[serde(default)]
+    pub my_name: String,
+    /// Whether this account has chosen a name for this scope (the Shares
+    /// dialog's "Appear as"); the first open of a share asks when it has not.
+    #[serde(default)]
+    pub my_name_chosen: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Person {
+    pub user_id: String,
+    pub name: String,
+}
+
+impl StorePeople {
+    /// The name `user_id` goes by in the scope rooted at `root` (`None` for
+    /// the whole store), else in any scope of the store that names them.
+    pub fn name_of(&self, user_id: &str, root: Option<NodeId>) -> Option<&str> {
+        fn find<'a>(scope: &'a ScopePeople, user_id: &str) -> Option<&'a str> {
+            scope.people.iter().find(|p| p.user_id == user_id).map(|p| p.name.as_str())
+        }
+        self.scopes
+            .iter()
+            .find(|scope| scope.root == root)
+            .and_then(|scope| find(scope, user_id))
+            .or_else(|| self.scopes.iter().find_map(|scope| find(scope, user_id)))
+    }
+}
+
+// ============================================================================
 // Sharing, docs/NODE_DOCUMENT_CONTRACT.md section 5
 // ============================================================================
 
@@ -1263,9 +1377,15 @@ pub enum ShareMemberStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareMember {
+    /// `""` unless this device's account owns the store: members of a share
+    /// never see each other's emails (docs/PRESENCE_CONTRACT.md section 3).
     pub email: String,
     pub role: MemberRole,
     pub status: ShareMemberStatus,
+    /// What they go by in this share; `""` for an invitation, and from a
+    /// server from before names.
+    #[serde(default)]
+    pub name: String,
 }
 
 /// One share: the scope `(store, node)` and what this device knows of it.

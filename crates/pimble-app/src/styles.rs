@@ -56,6 +56,45 @@ pub(crate) const APP_CSS: &str = "
     user-select: none;
 }
 
+/* ── Shares (shares.rs) ────────────────────────────────────────── */
+
+.pimble-shares {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.pimble-shares__intro, .pimble-shares__hint, .pimble-shares__role {
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-shares__row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--rinch-color-border);
+    border-radius: var(--rinch-radius-sm);
+}
+
+.pimble-shares__name {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.pimble-shares__label {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.pimble-shares__error {
+    font-size: 12px;
+    color: var(--rinch-color-red-6);
+}
+
 /* ── AI Agents (agents.rs) ─────────────────────────────────────── */
 
 .pimble-agents__intro, .pimble-agents__hint {

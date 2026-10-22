@@ -1049,7 +1049,7 @@ fn copy_boards(store: AppStore, pane: PaneId, jobs: Vec<(String, String)>) {
         let Some(update) = HOSTS.with(|hosts| {
             let hosts = hosts.borrow();
             let host = hosts.get(&(active.store_id, active.node_id))?;
-            let author = crate::boards::current_author();
+            let author = crate::shares::author_in(store, active.store_id, active.node_id);
             let now = crate::boards::now_stamp();
             Board::in_text(&host.doc, &new).edit(Stamp::new(author.as_ref(), &now), |t| t.copy_from(&raw)).update
         }) else {
@@ -1258,7 +1258,7 @@ fn toggle(store: AppStore, pane: PaneId) {
             crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
             return;
         }
-        let author = crate::boards::current_author();
+        let author = crate::shares::author_in(store, store_id, node_id);
         let now = crate::boards::now_stamp();
         if let Some(update) = board.edit(Stamp::new(author.as_ref(), &now), |t| t.set_markup_visible(!visible)).update {
             crate::boards::send_node_update(store, store_id, node_id, update);
@@ -1274,7 +1274,7 @@ fn toggle(store: AppStore, pane: PaneId) {
     let update = HOSTS.with(|hosts| {
         let hosts = hosts.borrow();
         let host = hosts.get(&(active.store_id, active.node_id))?;
-        let author = crate::boards::current_author();
+        let author = crate::shares::author_in(store, active.store_id, active.node_id);
         let now = crate::boards::now_stamp();
         Board::in_text(&host.doc, board_id).edit(Stamp::new(author.as_ref(), &now), |t| t.set_markup_visible(!visible)).update
     });
@@ -1310,7 +1310,7 @@ fn convert(store: AppStore, pane: PaneId, hover: &PictureHover) {
     });
     let board = match raw {
         Some(raw) => {
-            let author = crate::boards::current_author();
+            let author = crate::shares::author_in(store, active.store_id, active.node_id);
             let now = crate::boards::now_stamp();
             Board::standalone().edit(Stamp::new(author.as_ref(), &now), |t| t.copy_from(&raw)).update
         }

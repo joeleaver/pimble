@@ -84,6 +84,13 @@ struct LoginRequest<'a> {
 pub struct UserView {
     pub id: String,
     pub email: String,
+    /// The default name chosen, `""` for none (docs/PRESENCE_CONTRACT.md
+    /// section 3). Absent from a service from before names.
+    #[serde(default)]
+    pub display_name: String,
+    /// What the account is called where nothing more particular applies.
+    #[serde(default)]
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -363,6 +370,50 @@ pub struct MembersView {
     pub members: Vec<MemberView>,
     #[serde(default)]
     pub share_name: Option<String>,
+    /// Everyone who reaches the scope and the name they go by in it
+    /// (docs/PRESENCE_CONTRACT.md section 3). Never an email.
+    #[serde(default)]
+    pub people: Vec<PersonView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PersonView {
+    pub user_id: String,
+    pub name: String,
+}
+
+// ── Names (docs/PRESENCE_CONTRACT.md section 3) ─────────────────────────────
+
+pub async fn put_display_name(display_name: &str) -> ApiResult<()> {
+    http::put::<_, Value>("/api/v1/me", &serde_json::json!({ "display_name": display_name })).await.map(|_| ())
+}
+
+/// One row of `GET /api/v1/me/shares`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShareView {
+    pub store_id: String,
+    #[serde(default)]
+    pub root: Option<String>,
+    pub name: String,
+    pub role: String,
+    pub owned: bool,
+    #[serde(default)]
+    pub owner_name: Option<String>,
+    #[serde(default = "default_tier")]
+    pub tier: String,
+    #[serde(default)]
+    pub my_name: String,
+    pub appears_as: String,
+}
+
+pub async fn list_shares() -> ApiResult<Vec<ShareView>> {
+    http::get("/api/v1/me/shares").await
+}
+
+pub async fn put_share_name(store_id: &str, root: Option<&str>, name: &str) -> ApiResult<()> {
+    http::put::<_, Value>(&format!("/api/v1/me/shares/{store_id}"), &serde_json::json!({ "root": root, "name": name }))
+        .await
+        .map(|_| ())
 }
 
 /// `GET /api/v1/stores/{id}/members[?root=]`.
@@ -381,6 +432,7 @@ pub async fn list_members(store_id: &str, root: Option<&str>) -> ApiResult<Membe
             members: serde_json::from_value(raw)
                 .map_err(|e| ApiError::local(format!("the member list the server sent did not parse: {e}")))?,
             share_name: None,
+            people: Vec::new(),
         }),
         other => serde_json::from_value(other)
             .map_err(|e| ApiError::local(format!("the member list the server sent did not parse: {e}"))),

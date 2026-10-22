@@ -63,6 +63,9 @@ fn account_entries(store: AppStore) -> Vec<MenuEntry> {
     vec![
         MenuEntry::item("Account...", "", move || crate::app::open_account_modal(store, "")),
         MenuEntry::item("Add Hosted Store...", "", move || crate::app::open_hosted_modal(store)),
+        // docs/PRESENCE_CONTRACT.md section 3: the shares you are in, and
+        // the name you go by in each.
+        MenuEntry::item("Shares...", "", move || crate::shares::open(store)),
         MenuEntry::Separator,
         // docs/AGENTS_CONTRACT.md: the AI apps connected here, and what each reaches.
         MenuEntry::item("AI Agents...", "", move || crate::agents::open(store)),
@@ -122,6 +125,7 @@ fn file_entries(store: AppStore) -> Vec<MenuEntry> {
     {
         entries.push(MenuEntry::Separator);
         entries.push(MenuEntry::item("Account", "", crate::app::run_account_action));
+        entries.push(MenuEntry::item("Shares...", "", move || crate::shares::open(store)));
         entries.push(MenuEntry::item("Sign Out", "", crate::app::run_sign_out_action));
     }
 

@@ -243,6 +243,16 @@ pub enum BackendCommand {
     /// Add an already-hosted store as a local replica; the store arrives as
     /// `StoreOpened`, exactly as `AddRemoteStore`'s does.
     CloudAddHostedStore { store_id: StoreId },
+    /// The shares the account takes part in and the names it goes by in
+    /// each (docs/PRESENCE_CONTRACT.md section 3; `CloudSharesListed`).
+    CloudListShares,
+    /// The account's default name, then the list again (`CloudSharesListed`).
+    CloudSetDisplayName { name: String },
+    /// The name the account goes by in one share, then the list again
+    /// (`CloudSharesListed`). Empty means the default name.
+    CloudSetShareName { store_id: StoreId, root: Option<NodeId>, name: String },
+    /// Who is who in a store's shares (`PeopleLoaded`).
+    GetPeople { store_id: StoreId },
     /// Share a local store from this computer (docs/RELAY_CONTRACT.md):
     /// nothing of it is uploaded, and the people it is shared with reach it
     /// through Pimble Cloud's relay while this computer is on and online
@@ -285,6 +295,8 @@ pub enum CloudOp {
     ShareInvite,
     ShareRemoveMember,
     StopSharing,
+    /// The Shares dialog: listing shares, setting a name.
+    Shares,
 }
 
 /// What a new node starts with (`BackendCommand::CreateNode`'s `init`): its
@@ -502,6 +514,11 @@ pub enum BackendEvent {
     /// their owner's computer through Pimble Cloud's relay
     /// (`CloudListHostedStoresResponse::relayed`).
     CloudHostedStoresListed { stores: Vec<pimble_rpc::CloudHostedStoreInfo>, relayed: Vec<String> },
+    /// The answer to `CloudListShares`, `CloudSetDisplayName` and
+    /// `CloudSetShareName`.
+    CloudSharesListed { shares: pimble_rpc::CloudListSharesResponse },
+    /// The answer to `GetPeople`.
+    PeopleLoaded { store_id: StoreId, people: pimble_rpc::StorePeople },
     /// The answer to `CloudHostStore`: the store is hosted and linked in
     /// vault mode.
     CloudStoreHosted { store_id: StoreId },

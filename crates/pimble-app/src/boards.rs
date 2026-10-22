@@ -422,6 +422,21 @@ pub fn set_author(user_id: Option<String>, email: Option<String>) {
     AUTHOR.with(|a| *a.borrow_mut() = author);
 }
 
+/// The name the account goes by where no share names it otherwise (its
+/// default name, docs/PRESENCE_CONTRACT.md section 3), once the accounts
+/// service has said it: stamps stop carrying the email's local part.
+pub fn set_author_name(name: &str) {
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    AUTHOR.with(|a| {
+        if let Some(author) = a.borrow_mut().as_mut() {
+            author.name = name.to_string();
+        }
+    });
+}
+
 fn author() -> Option<Author> {
     AUTHOR.with(|a| a.borrow().clone())
 }
@@ -1118,7 +1133,7 @@ fn local_edit<R>(store: AppStore, pane: PaneId, f: impl FnOnce(&mut BoardTxn<'_,
         return None;
     }
     first_mark(store, pane, held);
-    let author = author();
+    let author = crate::shares::author_in(store, held.0, held.1);
     let now = now_stamp();
     let (result, update) = with_session(pane, |s| {
         let edited = s.board.edit(Stamp::new(author.as_ref(), &now), f);

@@ -60,6 +60,9 @@ pub fn start() {
         // follows it (docs/DISCUSSIONS_CONTRACT.md section 8).
         store.cloud_signed_in.set(true);
         pimble_app::personal::sync_now(store);
+        // The name it goes by (docs/PRESENCE_CONTRACT.md section 3), which
+        // stamps carry instead of the email's local part.
+        store.send(pimble_app::protocol::BackendCommand::CloudListShares);
         route::mount_app(store, view);
     });
 }

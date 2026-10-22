@@ -646,6 +646,13 @@ async fn dispatch(
         return;
     }
 
+    // Names are the account's (docs/PRESENCE_CONTRACT.md section 3): the
+    // accounts service answers them, no Pimble server.
+    if let Some(event) = names_command(&cmd).await {
+        emit(event_tx, signal_ui, event);
+        return;
+    }
+
     // The personal document is the account's, not a store's: this page
     // seals and syncs it itself (docs/DISCUSSIONS_CONTRACT.md section 8).
     if let BackendCommand::SyncPersonal { state, enabled, turn_on } = cmd {
@@ -897,6 +904,79 @@ fn described(vault: &VaultClient, event: BackendEvent) -> BackendEvent {
 ///
 /// The new grant is only in a token minted after it, so this asks for a fresh
 /// one and a reconnect; the store appears when `listStores` next answers.
+/// The Shares dialog's commands and `GetPeople`, answered from the accounts
+/// service under the events the desktop's server answers them with. `None`
+/// for any other command.
+async fn names_command(cmd: &BackendCommand) -> Option<BackendEvent> {
+    use pimble_app::protocol::CloudOp;
+    let failed = |message: String| BackendEvent::CloudError { op: CloudOp::Shares, message };
+    match cmd {
+        BackendCommand::CloudListShares => Some(shares_listed().await.unwrap_or_else(failed)),
+        BackendCommand::CloudSetDisplayName { name } => Some(match crate::accounts::put_display_name(name.trim()).await {
+            Ok(()) => shares_listed().await.unwrap_or_else(failed),
+            Err(e) => failed(e.message),
+        }),
+        BackendCommand::CloudSetShareName { store_id, root, name } => {
+            let root = root.map(|r| r.to_string());
+            Some(match crate::accounts::put_share_name(&store_id.to_string(), root.as_deref(), name.trim()).await {
+                Ok(()) => shares_listed().await.unwrap_or_else(failed),
+                Err(e) => failed(e.message),
+            })
+        }
+        BackendCommand::GetPeople { store_id } => match people_of(*store_id).await {
+            Ok(people) => Some(BackendEvent::PeopleLoaded { store_id: *store_id, people }),
+            Err(message) => {
+                tracing::debug!("people of store {store_id} not loaded: {message}");
+                None
+            }
+        },
+        _ => None,
+    }
+}
+
+/// `CloudSharesListed`. Every store this page's account holds is in its
+/// explorer, so every share is "here".
+async fn shares_listed() -> Result<BackendEvent, String> {
+    let me = crate::accounts::me().await.map_err(|e| e.message)?;
+    let shares = crate::accounts::list_shares().await.map_err(|e| e.message)?;
+    let default_name = if me.name.is_empty() { me.email.split('@').next().unwrap_or_default().to_string() } else { me.name };
+    let shares = shares
+        .into_iter()
+        .filter_map(|row| {
+            Some(pimble_rpc::CloudShareRow {
+                store_id: StoreId::parse(&row.store_id).ok()?,
+                root: row.root.as_deref().and_then(|r| pimble_core::NodeId::parse(r).ok()),
+                relayed: row.tier == "relay",
+                name: row.name,
+                role: row.role,
+                owned: row.owned,
+                owner_name: row.owner_name,
+                my_name: row.my_name,
+                appears_as: row.appears_as,
+                here: true,
+            })
+        })
+        .collect();
+    Ok(BackendEvent::CloudSharesListed { shares: pimble_rpc::CloudListSharesResponse { display_name: me.display_name, default_name, shares } })
+}
+
+/// Who is who in one store's shares, asked of the accounts service now.
+async fn people_of(store_id: StoreId) -> Result<pimble_rpc::StorePeople, String> {
+    let id = store_id.to_string();
+    let shares = crate::accounts::list_shares().await.map_err(|e| e.message)?;
+    let mut scopes = Vec::new();
+    for share in shares.into_iter().filter(|share| share.store_id == id) {
+        let listing = crate::accounts::list_members(&id, share.root.as_deref()).await.map_err(|e| e.message)?;
+        scopes.push(pimble_rpc::ScopePeople {
+            root: share.root.as_deref().and_then(|r| pimble_core::NodeId::parse(r).ok()),
+            people: listing.people.into_iter().map(|p| pimble_rpc::Person { user_id: p.user_id, name: p.name }).collect(),
+            my_name: share.appears_as,
+            my_name_chosen: !share.my_name.trim().is_empty(),
+        });
+    }
+    Ok(pimble_rpc::StorePeople { scopes })
+}
+
 async fn create_hosted_store(name: &str, kind: &str) -> BackendEvent {
     if kind == "vault" && !crate::session::is_unlocked() {
         return BackendEvent::Error {

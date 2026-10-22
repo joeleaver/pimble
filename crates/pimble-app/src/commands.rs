@@ -778,6 +778,42 @@ pub async fn process_command(
             }
         }
 
+        // Names (docs/PRESENCE_CONTRACT.md section 3).
+        BackendCommand::CloudListShares => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::Shares, message: "Not connected".into() });
+            };
+            Some(shares_listed(c).await)
+        }
+        BackendCommand::CloudSetDisplayName { name } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::Shares, message: "Not connected".into() });
+            };
+            match c.cloud_set_display_name(&name).await {
+                Ok(()) => Some(shares_listed(c).await),
+                Err(e) => Some(BackendEvent::CloudError { op: CloudOp::Shares, message: e.to_string() }),
+            }
+        }
+        BackendCommand::CloudSetShareName { store_id, root, name } => {
+            let Some(c) = client.as_ref() else {
+                return Some(BackendEvent::CloudError { op: CloudOp::Shares, message: "Not connected".into() });
+            };
+            match c.cloud_set_share_name(store_id, root, &name).await {
+                Ok(()) => Some(shares_listed(c).await),
+                Err(e) => Some(BackendEvent::CloudError { op: CloudOp::Shares, message: e.to_string() }),
+            }
+        }
+        BackendCommand::GetPeople { store_id } => {
+            let c = client.as_ref()?;
+            match c.cloud_people(store_id).await {
+                Ok(people) => Some(BackendEvent::PeopleLoaded { store_id, people }),
+                Err(e) => {
+                    tracing::debug!("people of store {store_id} not loaded: {e}");
+                    None
+                }
+            }
+        }
+
         // Sharing from this computer (docs/RELAY_CONTRACT.md). The link's
         // state arrives afterwards as ordinary `SyncStateChanged`
         // notifications; a refusal is the server's own sentence.
@@ -1001,5 +1037,13 @@ fn agent_error(e: impl std::fmt::Display) -> String {
     match message.split_once(": ") {
         Some((head, rest)) if head.contains("RPC") || head.contains("error") => rest.to_string(),
         _ => message,
+    }
+}
+
+/// `CloudSharesListed`, or the error that kept it from being listed.
+async fn shares_listed(c: &PimbleClient) -> BackendEvent {
+    match c.cloud_list_shares().await {
+        Ok(shares) => BackendEvent::CloudSharesListed { shares },
+        Err(e) => BackendEvent::CloudError { op: CloudOp::Shares, message: e.to_string() },
     }
 }

@@ -2176,15 +2176,21 @@ fn ago(stamp: &str) -> String {
 
 /// "Arrow, by Sam, 2 hours ago (changed by Joe, 5 minutes ago)".
 pub(super) fn attribution(e: &pimble_board::Element) -> String {
+    attribution_named(e, |_, stamped| stamped.to_string())
+}
+
+/// [`attribution`], each person named by `named(id, stamped name)`: the
+/// name they go by in the board's share now.
+fn attribution_named(e: &pimble_board::Element, named: impl Fn(&str, &str) -> String) -> String {
     let by = match &e.raw.author {
-        Some(a) => format!("by {}", a.name),
+        Some(a) => format!("by {}", named(&a.id, &a.name)),
         None => "before sign-in".to_string(),
     };
     let mut out = format!("{}, {by}, {}", kind_label(e), ago(&e.raw.created_at));
     if let (Some(who), Some(when)) = (&e.raw.edited_by, &e.raw.edited_at) {
         let same = e.raw.author.as_ref().is_some_and(|a| a.id == who.id);
         if *when != e.raw.created_at && !(same && ago(when) == ago(&e.raw.created_at)) {
-            out.push_str(&format!(" (changed by {}, {})", who.name, ago(when)));
+            out.push_str(&format!(" (changed by {}, {})", named(&who.id, &who.name), ago(when)));
         }
     }
     out
@@ -2196,13 +2202,18 @@ pub(super) fn attribution(e: &pimble_board::Element) -> String {
 fn hover_attribution(store: AppStore, pane: PaneId, px: f32, py: f32) {
     let scale = scale_of(pane);
     let ui = store.pane(pane).board_ui;
+    let names = with_session(pane, |s| crate::shares::Names::of(store, s.store_id, s.node_id));
     let tip = with_session(pane, |s| {
         if s.snapshot().authors().len() < 2 || s.text.is_some() {
             return None;
         }
         let p = s.view.screen_to_board(px, py);
         let e = hit_at(s, p)?;
-        Some((px / scale + 14.0, py / scale + 16.0, attribution(e)))
+        let text = match &names {
+            Some(names) => attribution_named(e, |id, stamped| names.named(id, stamped)),
+            None => attribution(e),
+        };
+        Some((px / scale + 14.0, py / scale + 16.0, text))
     })
     .flatten();
     ui.tip.set_if_changed(tip);

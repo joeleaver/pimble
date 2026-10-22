@@ -545,6 +545,9 @@ async fn connect_and_sync(
 
     let owner = refresh_grant(handler, store_id).await;
     let connected_as = grant_shape(handler, store_id).await;
+    // Who is who in the store's shares, beside the connection rather than
+    // in its way (docs/PRESENCE_CONTRACT.md section 3).
+    spawn_people_refresh(handler, store_id);
     let client = connect(handler, store_id, endpoint, reached, owner_was_offline, set_state(handler, link, SyncState::Syncing)).await?;
     // What the last connection learned of the remote's documents and their
     // wraps is asked again; data keys already unwrapped stay.
@@ -655,6 +658,7 @@ async fn connect_and_sync(
             // it was made with, so the answer is to connect again, which
             // reads the grant and mints a token from it.
             _ = grant_tick.tick() => {
+                spawn_people_refresh(handler, store_id);
                 let now = grant_shape(handler, store_id).await;
                 if now.is_some() && now != connected_as {
                     info!("Vault link for store {}: the account's grant on it has changed; connecting again", store_id);
@@ -689,6 +693,16 @@ async fn connect_and_sync(
             }
         }
     }
+}
+
+/// Ask the accounts service again who is who in the store's shares
+/// (`crate::people`); a name someone chose reaches this device within one
+/// [`GRANT_CHECK_EVERY`].
+fn spawn_people_refresh(handler: &RpcHandler, store_id: StoreId) {
+    let handler = handler.clone();
+    tokio::spawn(async move {
+        crate::people::refresh(&handler, store_id).await;
+    });
 }
 
 /// How the account holds the store, as far as the accounts service's rows
@@ -1269,7 +1283,8 @@ fn document_of(kind: &StoreChangeKind) -> Option<NodeId> {
         | StoreChangeKind::SyncStateChanged { .. }
         | StoreChangeKind::MountStateChanged { .. }
         | StoreChangeKind::ShareStateChanged { .. }
-        | StoreChangeKind::SharesEnded { .. } => None,
+        | StoreChangeKind::SharesEnded { .. }
+        | StoreChangeKind::PeopleChanged => None,
     }
 }
 

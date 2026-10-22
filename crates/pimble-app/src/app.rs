@@ -4071,7 +4071,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                                 class: "pimble-share__member",
                                                 span {
                                                     class: "pimble-share__member-email",
-                                                    {member.email.clone()}
+                                                    {crate::state::member_label(&member, true)}
                                                 }
                                                 span {
                                                     class: "pimble-share__member-status",
@@ -4202,11 +4202,11 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 },
                                 for member in store.share_modal_members.get() {
                                     div {
-                                        key: member.email.clone(),
+                                        key: format!("{}|{}", member.name, member.email),
                                         class: "pimble-share__member",
                                         span {
                                             class: "pimble-share__member-email",
-                                            {member.email.clone()}
+                                            {crate::state::member_label(&member, false)}
                                         }
                                         span {
                                             class: "pimble-share__member-status",
@@ -4503,6 +4503,10 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         // Account > "AI Agents..." (docs/AGENTS_CONTRACT.md), the desktop only.
         #[cfg(feature = "native")]
         let agents_modal = crate::agents::render_modal(__scope, store);
+        // "Shares..." and the first-open question (docs/PRESENCE_CONTRACT.md
+        // section 3), both targets.
+        let shares_modal = crate::shares::render_modal(__scope, store);
+        let share_name_question = crate::shares::render_question(__scope, store);
         #[cfg(feature = "native")]
         let root = rsx! {
             BorderlessWindow {
@@ -4541,6 +4545,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {hosted_modal}
                 {agents_modal}
                 {share_modal}
+                {shares_modal}
+                {share_name_question}
                 {body}
             }
         };
@@ -4572,6 +4578,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {stop_relay_modal}
                 {hosted_modal}
                 {share_modal}
+                {shares_modal}
+                {share_name_question}
                 {body}
             }
         };

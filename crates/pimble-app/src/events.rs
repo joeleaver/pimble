@@ -249,6 +249,12 @@ fn register_opened_store(store: AppStore, tree_state: UseTreeReturn, opened_stor
 
     // Subscribe to store changes for real-time updates
     store.send(BackendCommand::SubscribeStoreChanges { store_id });
+    // Who is who in its shares: the names its people go by there
+    // (docs/PRESENCE_CONTRACT.md section 3). Only an encrypted store reaches
+    // Pimble Cloud; any other has nobody to name.
+    if opened_store.sync_mode == pimble_core::StoreKind::Vault || opened_store.shared_by.is_some() || opened_store.relay != pimble_core::RelaySide::None {
+        store.send(BackendCommand::GetPeople { store_id });
+    }
 
     // A store made for an import is open: the import goes into it.
     crate::import::store_opened(store, store_id, roots.first().copied());
@@ -617,6 +623,10 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 let root_id = opened_store.root_node_id;
 
                 register_opened_store(store, tree_state, opened_store);
+                // "Add Here" in the Shares dialog: the row becomes "Open".
+                if untracked(|| store.shares_ui.open.get()) {
+                    store.send(BackendCommand::CloudListShares);
+                }
 
                 // An `AddRemoteStore` request just answered successfully —
                 // close the connect modal (contract: "the modal closes on
@@ -1304,6 +1314,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                             store.send(BackendCommand::GetStoreSync { store_id: *store_id });
                         }
                     }
+                    StoreChangeKind::PeopleChanged => {
+                        store.send(BackendCommand::GetPeople { store_id: *store_id });
+                    }
                     StoreChangeKind::VaultAppended { .. } => {
                         // Encrypted-store blobs are handled by the vault client
                         // (docs/CRYPTO_CONTRACT.md); the tree does not change here.
@@ -1522,6 +1535,10 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     // Signing in is the asking (docs/DISCUSSIONS_CONTRACT.md
                     // section 8): the personal document follows the account.
                     crate::personal::sync_now(store);
+                    // The name the account goes by, which stamps replace the
+                    // email's local part with (docs/PRESENCE_CONTRACT.md
+                    // section 3).
+                    store.send(BackendCommand::CloudListShares);
                 } else {
                     crate::boards::set_author(None, None);
                 }
@@ -1564,6 +1581,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                             store.account_modal_error.set(message.clone());
                         }
                     }
+                    CloudOp::Shares => crate::shares::failed(store, message),
                     CloudOp::HostStore => {
                         store.host_modal_busy.set(false);
                         store.host_modal_error.set(message.clone());
@@ -1621,6 +1639,8 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 }
             }
 
+            BackendEvent::CloudSharesListed { shares } => crate::shares::listed(store, shares),
+            BackendEvent::PeopleLoaded { store_id, people } => crate::shares::people_loaded(store, *store_id, people),
             BackendEvent::CloudHostedStoresListed { stores, relayed } => {
                 // Only an encrypted store not already open here can be added
                 // as a replica (the server refuses an open one anyway), so
@@ -1807,8 +1827,8 @@ mod tests {
                 node_id,
                 share: share_info(store_id, node_id, "Recipes"),
                 members: vec![
-                    ShareMember { email: "me@example.com".into(), role: MemberRole::Owner, status: ShareMemberStatus::Active },
-                    ShareMember { email: "ann@example.com".into(), role: MemberRole::Editor, status: ShareMemberStatus::Invited },
+                    ShareMember { email: "me@example.com".into(), role: MemberRole::Owner, status: ShareMemberStatus::Active, name: String::new() },
+                    ShareMember { email: "ann@example.com".into(), role: MemberRole::Editor, status: ShareMemberStatus::Invited, name: String::new() },
                 ],
             })
             .unwrap();

@@ -306,6 +306,30 @@ fn author() -> Option<Author> {
     crate::boards::current_author().map(|a| Author::new(a.id, a.name))
 }
 
+/// [`author`] as stamped on a message in `slot`'s discussion: by the name the
+/// account goes by in that discussion's share (docs/PRESENCE_CONTRACT.md
+/// section 3), never one made from its email.
+fn author_of(store: AppStore, slot: Slot) -> Option<Author> {
+    match with_session(slot, |s| (s.store_id, s.node_id)) {
+        Some((store_id, node_id)) => crate::shares::author_in(store, store_id, node_id).map(|a| Author::new(a.id, a.name)),
+        None => author(),
+    }
+}
+
+/// Every author in `snap` by the name they go by in the share now, where
+/// this device knows it; the stamp otherwise.
+fn relabel(mut snap: DiscussionSnapshot, names: &crate::shares::Names) -> DiscussionSnapshot {
+    for m in &mut snap.messages {
+        if let Some(a) = &mut m.author {
+            a.name = names.named(&a.id, &a.name);
+        }
+    }
+    if let Some(by) = snap.resolved.as_mut().and_then(|r| r.by.as_mut()) {
+        by.name = names.named(&by.id, &by.name);
+    }
+    snap
+}
+
 /// Show discussion node `node_id` in pane `pane`.
 pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: NodeId, content: &[u8]) {
     crate::editor::stop_editing(store, pane);
@@ -551,6 +575,7 @@ pub(crate) fn recompute_all(store: AppStore) {
 /// Read `slot`'s discussion again into its view.
 pub(crate) fn recompute(store: AppStore, slot: Slot) {
     let Some((snap, store_id, node_id)) = with_session(slot, |s| (s.discussion.read(), s.store_id, s.node_id)) else { return };
+    let snap = relabel(snap, &crate::shares::Names::of(store, store_id, node_id));
     let Some(ui) = ui_of(store, slot) else { return };
     let now = crate::boards::now_ms();
     let me = author();
@@ -646,7 +671,7 @@ pub(crate) fn post(store: AppStore, slot: Slot) {
         return;
     }
     let reply_to = untracked(|| ui.replying_to.get()).map(|(id, _)| id);
-    let me = author();
+    let me = author_of(store, slot);
     let now = crate::boards::now_stamp();
     let posted = local_edit(store, slot, |t| t.post(Stamp::new(me.as_ref(), &now), reply_to.as_deref(), &body).map(|_| ()));
     if posted {
@@ -685,7 +710,7 @@ pub(crate) fn save_edit(store: AppStore, slot: Slot) {
     let Some(ui) = ui_of(store, slot) else { return };
     let Some(id) = untracked(|| ui.editing.get()) else { return };
     let body = Body::from_markdown(&untracked(|| ui.edit_text.get()));
-    let me = author();
+    let me = author_of(store, slot);
     let now = crate::boards::now_stamp();
     if local_edit(store, slot, |t| t.edit_message(Stamp::new(me.as_ref(), &now), &id, &body)) {
         ui.editing.set(None);
@@ -700,7 +725,7 @@ pub(crate) fn cancel_edit(store: AppStore, slot: Slot) {
 }
 
 pub(crate) fn delete_message(store: AppStore, slot: Slot, id: &str) {
-    let me = author();
+    let me = author_of(store, slot);
     let now = crate::boards::now_stamp();
     let id = id.to_string();
     local_edit(store, slot, |t| t.delete_message(Stamp::new(me.as_ref(), &now), &id));
@@ -723,7 +748,7 @@ pub(crate) fn resolve(store: AppStore, slot: Slot, reopen: bool) {
     if let Some(ui) = ui_of(store, slot) {
         ui.show_all.set(false);
     }
-    let me = author();
+    let me = author_of(store, slot);
     let now = crate::boards::now_stamp();
     local_edit(store, slot, |t| if reopen { t.reopen() } else { t.resolve(Stamp::new(me.as_ref(), &now)) });
 }

@@ -192,6 +192,8 @@ pub struct StubAccount {
     pub session: String,
     pub account_key_blob: AccountKeyBlob,
     pub account_public_keys: pimble_crypto::AccountPublicKeys,
+    /// The default name chosen (docs/PRESENCE_CONTRACT.md section 3).
+    pub display_name: String,
 }
 
 pub struct StubInner {
@@ -208,6 +210,9 @@ pub struct StubInner {
     pub h_stores_dir: PathBuf,
     /// Every call the sharing endpoints took, for a test to assert none was made.
     pub sharing_calls: usize,
+    /// The names chosen per (user, store, root) (docs/PRESENCE_CONTRACT.md
+    /// section 3).
+    pub share_names: HashMap<(String, String, Option<String>), String>,
 }
 
 pub struct Stub {
@@ -223,6 +228,9 @@ pub fn stub_router(state: StubState) -> Router {
         .route("/api/v1/kdf", get(stub_kdf))
         .route("/api/v1/login", post(stub_login))
         .route("/api/v1/me/keys", get(stub_me_keys))
+        .route("/api/v1/me", get(stub_me).put(stub_put_me))
+        .route("/api/v1/me/shares", get(stub_list_shares))
+        .route("/api/v1/me/shares/{store_id}", axum::routing::put(stub_put_share_name))
         .route("/api/v1/token", post(stub_mint_token))
         .route("/api/v1/stores", get(stub_list_stores).post(stub_create_store))
         .route("/api/v1/stores/{store_id}/keys", get(stub_get_keys).put(stub_put_keys))
@@ -242,6 +250,20 @@ impl StubInner {
 
     pub fn account_by_email(&self, email: Option<&str>) -> &StubAccount {
         self.accounts.iter().find(|a| Some(a.email.as_str()) == email).unwrap_or(&self.accounts[0])
+    }
+
+    /// What `user_id` goes by in the scope `root` of `store_id`, as the
+    /// accounts service answers it.
+    pub fn name_in(&self, user_id: &str, store_id: &str, root: &Option<String>) -> String {
+        if let Some(name) = self.share_names.get(&(user_id.to_string(), store_id.to_string(), root.clone())) {
+            return name.clone();
+        }
+        let account = self.accounts.iter().find(|a| a.user_id == user_id);
+        match account {
+            Some(a) if !a.display_name.is_empty() => a.display_name.clone(),
+            Some(a) => a.email.split('@').next().unwrap_or_default().to_string(),
+            None => "someone".to_string(),
+        }
     }
 
     pub fn is_owner(&self, user_id: &str, store_id: &str) -> bool {
@@ -323,7 +345,13 @@ pub async fn stub_list_stores(State(state): State<StubState>, headers: HeaderMap
         .iter()
         .filter(|st| st.user_id == account.user_id)
         .map(|st| {
-            json!({ "store_id": st.store_id, "name": st.name, "role": st.role, "kind": st.kind, "created_at": st.created_at, "root": st.root, "shared_by": st.shared_by })
+            // The owner by the name they go by in the share, never their
+            // email (docs/PRESENCE_CONTRACT.md section 3).
+            let shared_by = st.shared_by.as_deref().map(|email| {
+                let owner = s.account_by_email(Some(email)).user_id.clone();
+                s.name_in(&owner, &st.store_id, &st.root)
+            });
+            json!({ "store_id": st.store_id, "name": st.name, "role": st.role, "kind": st.kind, "created_at": st.created_at, "root": st.root, "shared_by": shared_by })
         })
         .collect();
     Json(json!(arr))
@@ -438,7 +466,8 @@ pub async fn stub_list_members(
         }
         members.push(json!({
             "user_id": account.user_id,
-            "email": account.email,
+            "name": s.name_in(&account.user_id, &store_id, &root),
+            "email": if caller_is_owner { account.email.clone() } else { String::new() },
             "role": row.role,
             "root": root,
             "status": "active",
@@ -453,7 +482,75 @@ pub async fn stub_list_members(
         }
     }
     let share_name = root.as_ref().map(|_| share_name.unwrap_or_else(|| "Shared folder".into()));
-    Ok(Json(json!({ "members": members, "share_name": share_name })))
+    // Everyone reaching the scope: the whole-store holders, then its members.
+    let mut people: Vec<serde_json::Value> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for row in s.stores.iter().filter(|row| row.store_id == store_id && (row.root.is_none() || (root.is_some() && row.root == root))) {
+        if seen.insert(row.user_id.clone()) {
+            people.push(json!({ "user_id": row.user_id, "name": s.name_in(&row.user_id, &store_id, &root), "role": row.role }));
+        }
+    }
+    Ok(Json(json!({ "members": members, "share_name": share_name, "people": people })))
+}
+
+pub async fn stub_me(State(state): State<StubState>, headers: HeaderMap) -> Json<serde_json::Value> {
+    let s = state.inner.lock().unwrap();
+    let a = s.account_of(&headers);
+    let name = if a.display_name.is_empty() { a.email.split('@').next().unwrap_or_default().to_string() } else { a.display_name.clone() };
+    Json(json!({ "id": a.user_id, "email": a.email, "display_name": a.display_name, "name": name }))
+}
+
+pub async fn stub_put_me(State(state): State<StubState>, headers: HeaderMap, Json(req): Json<serde_json::Value>) -> Json<serde_json::Value> {
+    let mut s = state.inner.lock().unwrap();
+    let user_id = s.account_of(&headers).user_id.clone();
+    let name = req["display_name"].as_str().unwrap_or_default().trim().to_string();
+    if let Some(a) = s.accounts.iter_mut().find(|a| a.user_id == user_id) {
+        a.display_name = name.clone();
+    }
+    Json(json!({ "display_name": name }))
+}
+
+pub async fn stub_list_shares(State(state): State<StubState>, headers: HeaderMap) -> Json<serde_json::Value> {
+    let s = state.inner.lock().unwrap();
+    let me = s.account_of(&headers).user_id.clone();
+    let mut out = Vec::new();
+    for row in s.stores.iter().filter(|row| row.user_id == me) {
+        if row.role == "owner" && row.root.is_none() {
+            let mut roots: Vec<(Option<String>, String)> = Vec::new();
+            for other in s.stores.iter().filter(|o| o.store_id == row.store_id && o.user_id != me && !(o.role == "owner" && o.root.is_none())) {
+                if !roots.iter().any(|(r, _)| *r == other.root) {
+                    roots.push((other.root.clone(), other.name.clone()));
+                }
+            }
+            for (root, name) in roots {
+                let chosen = s.share_names.get(&(me.clone(), row.store_id.clone(), root.clone())).cloned().unwrap_or_default();
+                out.push(json!({ "store_id": row.store_id, "root": root, "name": name, "role": "owner", "owned": true, "owner_name": null, "kind": row.kind, "tier": "hosted", "my_name": chosen, "appears_as": s.name_in(&me, &row.store_id, &root) }));
+            }
+        } else {
+            let owner = s.stores.iter().find(|o| o.store_id == row.store_id && o.role == "owner" && o.root.is_none()).map(|o| s.name_in(&o.user_id, &row.store_id, &row.root));
+            let chosen = s.share_names.get(&(me.clone(), row.store_id.clone(), row.root.clone())).cloned().unwrap_or_default();
+            out.push(json!({ "store_id": row.store_id, "root": row.root, "name": row.name, "role": row.role, "owned": false, "owner_name": owner, "kind": row.kind, "tier": "hosted", "my_name": chosen, "appears_as": s.name_in(&me, &row.store_id, &row.root) }));
+        }
+    }
+    Json(json!(out))
+}
+
+pub async fn stub_put_share_name(
+    State(state): State<StubState>,
+    AxPath(store_id): AxPath<String>,
+    headers: HeaderMap,
+    Json(req): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let mut s = state.inner.lock().unwrap();
+    let me = s.account_of(&headers).user_id.clone();
+    let root = req["root"].as_str().map(str::to_string);
+    let name = req["name"].as_str().unwrap_or_default().trim().to_string();
+    if name.is_empty() {
+        s.share_names.remove(&(me, store_id, root));
+    } else {
+        s.share_names.insert((me, store_id, root), name);
+    }
+    Json(json!({}))
 }
 
 pub async fn stub_put_member(
@@ -577,6 +674,7 @@ pub fn stub_account(email: &str, password: &str) -> StubAccount {
         session: format!("sess-{}", Uuid::new_v4()),
         account_key_blob,
         account_public_keys: account_keys.public_keys(),
+        display_name: String::new(),
     }
 }
 
@@ -666,6 +764,11 @@ impl Env {
     }
 
     /// Whether `email`'s account holds an envelope for the share rooted at `root`.
+    /// The account id of `email`.
+    pub fn user_id(&self, email: &str) -> String {
+        self.stub.inner.lock().unwrap().account_by_email(Some(email)).user_id.clone()
+    }
+
     pub fn has_share_key(&self, store_id: StoreId, root: NodeId, email: &str) -> bool {
         let s = self.stub.inner.lock().unwrap();
         let Some(user_id) = s.accounts.iter().find(|a| a.email == email).map(|a| a.user_id.clone()) else { return false };
@@ -739,6 +842,7 @@ pub async fn spawn_env() -> Env {
             h_rpc_url: String::new(),
             h_stores_dir: h_stores_dir.clone(),
             sharing_calls: 0,
+            share_names: HashMap::new(),
         }),
         members_down: AtomicBool::new(false),
     });

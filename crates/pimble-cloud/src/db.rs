@@ -185,9 +185,23 @@ pub struct UserRow {
     /// recovery token is consumed or superseded.
     pub recovery_token_hash: String,
     pub recovery_token_expires_at_ms: i64,
+    /// The name this person goes by where a share has none of their own for
+    /// them (docs/PRESENCE_CONTRACT.md section 3). `""` until they choose
+    /// one, and on every row from before the field.
+    pub display_name: String,
 }
 
 impl UserRow {
+    /// What this person is called where nothing more particular applies:
+    /// their chosen name, else the local part of their email.
+    pub fn default_name(&self) -> String {
+        let chosen = self.display_name.trim();
+        if !chosen.is_empty() {
+            return chosen.to_string();
+        }
+        self.email.split('@').next().filter(|n| !n.is_empty()).unwrap_or("someone").to_string()
+    }
+
     /// Whether this row has real Phase 2a key material — `false` for a
     /// pre-Phase-2a row (checked via `kdf_salt`, the field the startup
     /// migration keys its cleanup on too; every field here is written
@@ -364,6 +378,18 @@ pub struct KeyGrantRow {
     pub envelope: String,
 }
 
+/// The name one person goes by in one share (docs/PRESENCE_CONTRACT.md
+/// section 3).
+#[derive(Debug, Clone)]
+pub struct ShareNameRow {
+    pub rid: u64,
+    pub user_rid: u64,
+    pub store_rid: u64,
+    /// `""` for a whole-store grant, a node id for a share.
+    pub root: String,
+    pub name: String,
+}
+
 fn user_from_object(o: &Object) -> CloudResult<UserRow> {
     Ok(UserRow {
         rid: o.id,
@@ -398,6 +424,7 @@ fn user_from_object(o: &Object) -> CloudResult<UserRow> {
         recovery_key_blob: get_string_opt(o, "recovery_key_blob")?.map(str::to_string),
         recovery_token_hash: get_string_opt(o, "recovery_token_hash")?.map(str::to_string).unwrap_or_default(),
         recovery_token_expires_at_ms: get_datetime_ms_opt(o, "recovery_token_expires_at")?.unwrap_or(0),
+        display_name: get_string_opt(o, "display_name")?.map(str::to_string).unwrap_or_default(),
     })
 }
 
@@ -463,6 +490,16 @@ fn grant_from_object(o: &Object) -> CloudResult<GrantRow> {
         role: get_string(o, "role")?.to_string(),
         root: get_string_opt(o, "root")?.unwrap_or(WHOLE_STORE).to_string(),
         share_name: get_string_opt(o, "share_name")?.unwrap_or(NO_SHARE_NAME).to_string(),
+    })
+}
+
+fn share_name_from_object(o: &Object) -> CloudResult<ShareNameRow> {
+    Ok(ShareNameRow {
+        rid: o.id,
+        user_rid: get_u64(o, "user_rid")?,
+        store_rid: get_u64(o, "store_rid")?,
+        root: get_string(o, "root")?.to_string(),
+        name: get_string(o, "name")?.to_string(),
     })
 }
 
@@ -834,6 +871,79 @@ impl RhypeDb {
             deleted += 1;
         }
         Ok(deleted)
+    }
+
+    pub async fn set_display_name(&self, user_rid: u64, display_name: &str) -> CloudResult<()> {
+        self.objects(&format!("User.get({user_rid}).update({{ display_name: {} }})", ql_str(display_name))).await?;
+        Ok(())
+    }
+
+    // ── Names in shares (docs/PRESENCE_CONTRACT.md section 3) ─────────
+
+    /// Every name one person has chosen, in any share of any store.
+    pub async fn share_names_for_user(&self, user_rid: u64) -> CloudResult<Vec<ShareNameRow>> {
+        let q = format!("ShareName.filter(.user_rid == {user_rid})");
+        self.objects(&q).await?.iter().map(share_name_from_object).collect()
+    }
+
+    /// Every name chosen by anyone in any share of one store.
+    pub async fn share_names_for_store(&self, store_rid: u64) -> CloudResult<Vec<ShareNameRow>> {
+        let q = format!("ShareName.filter(.store_rid == {store_rid})");
+        self.objects(&q).await?.iter().map(share_name_from_object).collect()
+    }
+
+    /// Set (or, with an empty `name`, clear) what `user_rid` goes by in the
+    /// share of `store_rid` rooted at `root`. One row per (user, store,
+    /// root): an existing one is rewritten.
+    pub async fn put_share_name(&self, user_rid: u64, store_rid: u64, store_uuid: &str, root: &str, name: &str) -> CloudResult<()> {
+        let existing = self
+            .share_names_for_user(user_rid)
+            .await?
+            .into_iter()
+            .find(|row| row.store_rid == store_rid && row.root == root);
+        match (existing, name.is_empty()) {
+            (Some(row), true) => {
+                self.objects(&format!("ShareName.get({}).delete()", row.rid)).await?;
+            }
+            (Some(row), false) => {
+                self.objects(&format!("ShareName.get({}).update({{ name: {} }})", row.rid, ql_str(name))).await?;
+            }
+            (None, true) => {}
+            (None, false) => {
+                let q = format!(
+                    "ShareName.create({{ user_rid: {user_rid}, store_rid: {store_rid}, store_uuid: {suuid}, root: {root}, name: {name} }})",
+                    suuid = ql_str(store_uuid),
+                    root = ql_str(root),
+                    name = ql_str(name),
+                );
+                let obj = self
+                    .objects(&q)
+                    .await?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| CloudError::Internal("ShareName.create returned nothing".into()))?;
+                let row = share_name_from_object(&obj)?;
+                self.link("ShareName", row.rid, "User", user_rid).await?;
+                self.link("ShareName", row.rid, "HostedStore", store_rid).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every name an account chose, deleted with the account.
+    pub async fn delete_share_names_for_user(&self, user_rid: u64) -> CloudResult<()> {
+        for row in self.share_names_for_user(user_rid).await? {
+            self.objects(&format!("ShareName.get({}).delete()", row.rid)).await?;
+        }
+        Ok(())
+    }
+
+    /// Every chosen name on a store, deleted with it.
+    pub async fn delete_share_names_for_store(&self, store_rid: u64) -> CloudResult<()> {
+        for row in self.share_names_for_store(store_rid).await? {
+            self.objects(&format!("ShareName.get({}).delete()", row.rid)).await?;
+        }
+        Ok(())
     }
 
     // ── Personal documents ────────────────────────────────────────────

@@ -116,6 +116,18 @@ pub struct LoginRequest {
 pub struct UserView {
     id: String,
     email: String,
+    /// The default name this person chose (docs/PRESENCE_CONTRACT.md section
+    /// 3), `""` when they have chosen none.
+    display_name: String,
+    /// What they are called where nothing more particular applies: the
+    /// chosen name, else the local part of the email.
+    name: String,
+}
+
+impl From<&UserRow> for UserView {
+    fn from(user: &UserRow) -> Self {
+        Self { id: user.user_uuid.clone(), email: user.email.clone(), display_name: user.display_name.clone(), name: user.default_name() }
+    }
 }
 
 #[derive(Serialize)]
@@ -138,7 +150,7 @@ async fn issue_session(state: &AppState, user: &UserRow) -> CloudResult<Response
     let minted = state.signer.mint(&user.user_uuid, claims).await?;
 
     let body = AuthResponse {
-        user: UserView { id: user.user_uuid.clone(), email: user.email.clone() },
+        user: UserView::from(user),
         session: session_token.clone(),
         token: minted.token,
         exp: minted.exp,
@@ -338,7 +350,7 @@ pub async fn logout(State(state): State<AppState>, authed: AuthedUser) -> CloudR
 }
 
 pub async fn me(authed: AuthedUser) -> Json<UserView> {
-    Json(UserView { id: authed.user.user_uuid, email: authed.user.email })
+    Json(UserView::from(&authed.user))
 }
 
 // ── Keys ──────────────────────────────────────────────────────────────
@@ -557,7 +569,7 @@ pub async fn recover_complete(
         state.db.delete_session(session.rid).await?;
     }
 
-    Ok(Json(RecoverCompleteResponse { user: UserView { id: user.user_uuid, email: user.email } }))
+    Ok(Json(RecoverCompleteResponse { user: UserView::from(&user) }))
 }
 
 /// `POST /api/v1/recover/{token}/delete-account` — for people without the
@@ -590,6 +602,7 @@ pub async fn recover_delete_account(State(state): State<AppState>, Path(token): 
     for session in state.db.sessions_for_user(user.rid).await? {
         state.db.delete_session(session.rid).await?;
     }
+    state.db.delete_share_names_for_user(user.rid).await?;
     state.db.delete_user(user.rid).await?;
 
     Ok(Json(json!({})))

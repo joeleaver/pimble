@@ -60,7 +60,7 @@ fn rfc3339(ms: i64) -> String {
 const ROLES: [&str; 4] = ["owner", "editor", "commenter", "reader"];
 
 /// The scope that is the whole store rather than one shared subtree.
-const WHOLE_STORE: &str = "";
+pub(super) const WHOLE_STORE: &str = "";
 
 /// The share name a whole-store grant or invitation carries: none. A store is
 /// named by its own `name`.
@@ -70,7 +70,7 @@ const NO_SHARE_NAME: &str = "";
 /// shares had names (or by anything that somehow skipped `PUT members`) still
 /// must not be shown to a recipient as the store it lives in: the owner's
 /// store name is not theirs to see (Joe, 2026-09-21).
-const UNNAMED_SHARE: &str = "Shared folder";
+pub(super) const UNNAMED_SHARE: &str = "Shared folder";
 
 /// A `?root=<node id>` on an endpoint that has no body to carry one. Absent
 /// (or empty) is the whole store.
@@ -85,7 +85,7 @@ pub struct ScopeQuery {
 /// re-rendered rather than trusted as typed — otherwise the same node in two
 /// spellings (uppercase hex, braces) would be two different shares that never
 /// find each other's grants, envelopes or invitations.
-fn normalize_root(raw: &str) -> CloudResult<String> {
+pub(super) fn normalize_root(raw: &str) -> CloudResult<String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Ok(WHOLE_STORE.to_string());
@@ -97,7 +97,7 @@ fn normalize_root(raw: &str) -> CloudResult<String> {
 /// `root` as an API value: `null` for the whole store, the node id for a
 /// share. Every response says the scope this way, so a client never has to
 /// tell "the whole store" from "a share of a node called empty string".
-fn root_view(root: &str) -> Option<String> {
+pub(super) fn root_view(root: &str) -> Option<String> {
     if root.is_empty() {
         None
     } else {
@@ -136,24 +136,27 @@ pub struct StoreView {
     /// The node this row is rooted at, for a share; `null` for a whole-store
     /// grant (docs/NODE_DOCUMENT_CONTRACT.md section 5).
     root: Option<String>,
-    /// An owner's email, when the caller is not an owner — what the recipient
-    /// of a share is shown ("shared by <email>"). `null` for one's own store.
+    /// An owner's name in this share, when the caller is not an owner — what
+    /// the recipient of a share is shown ("shared by <name>"). Never an email
+    /// (docs/PRESENCE_CONTRACT.md section 3). `null` for one's own store.
     shared_by: Option<String>,
 }
 
-/// The `shared_by` of a row as its holder sees it: an owner's email unless
+/// The `shared_by` of a row as its holder sees it: an owner's name in the
+/// row's scope unless
 /// this grant is their own whole-store ownership, `None` when it is. Costs a
 /// query per store the caller doesn't own outright, which is what `GET
 /// /stores` pays; a store with several owners shows the first one the grant
 /// listing yields (any one of them answers "who shared this with me").
-async fn shared_by(state: &AppState, store: &HostedStoreRow, grant: &GrantRow) -> CloudResult<Option<String>> {
+pub(crate) async fn shared_by(state: &AppState, store: &HostedStoreRow, grant: &GrantRow) -> CloudResult<Option<String>> {
     if grant.role == "owner" && grant.is_whole_store() {
         return Ok(None);
     }
     for owner in state.db.grants_for_store(store.rid).await? {
         if owner.role == "owner" && owner.is_whole_store() {
             if let Some(owner) = state.db.get_user(owner.user_rid).await? {
-                return Ok(Some(owner.email));
+                let names = Names::of_store(state, store.rid).await?;
+                return Ok(Some(names.name_of(&owner, &grant.root)));
             }
         }
     }
@@ -164,7 +167,7 @@ async fn shared_by(state: &AppState, store: &HostedStoreRow, grant: &GrantRow) -
 /// whole store, the share's own name when it is of one node, and
 /// [`UNNAMED_SHARE`] when a scoped grant somehow carries none — a recipient
 /// is never shown the name of the store their share sits in.
-fn row_name(store: &HostedStoreRow, grant: &GrantRow) -> String {
+pub(super) fn row_name(store: &HostedStoreRow, grant: &GrantRow) -> String {
     if grant.is_whole_store() {
         store.name.clone()
     } else if grant.share_name.is_empty() {
@@ -190,7 +193,7 @@ fn store_view(store: &HostedStoreRow, grant: &GrantRow, shared_by: Option<String
 /// Look a store up by its external id, refusing (as 404) one that doesn't
 /// exist or has been soft-deleted — a deleted store is gone as far as every
 /// endpoint in this file is concerned.
-async fn require_live_store(state: &AppState, store_id: &str) -> CloudResult<HostedStoreRow> {
+pub(super) async fn require_live_store(state: &AppState, store_id: &str) -> CloudResult<HostedStoreRow> {
     let store = state
         .db
         .find_hosted_store(store_id)
@@ -208,7 +211,7 @@ async fn require_live_store(state: &AppState, store_id: &str) -> CloudResult<Hos
 /// (`root` empty) takes a whole-store grant: a member of one share must not
 /// learn about the rest of the store through an endpoint that answers for all
 /// of it.
-async fn require_role_for_scope(state: &AppState, store: &HostedStoreRow, user_rid: u64, root: &str) -> CloudResult<String> {
+pub(super) async fn require_role_for_scope(state: &AppState, store: &HostedStoreRow, user_rid: u64, root: &str) -> CloudResult<String> {
     let grants = state.db.grants_for_user_and_store(user_rid, store.rid).await?;
     if let Some(whole) = grants.iter().find(|g| g.is_whole_store()) {
         return Ok(whole.role.clone());
@@ -223,7 +226,7 @@ async fn require_role_for_scope(state: &AppState, store: &HostedStoreRow, user_r
 /// Whether the caller owns the whole store — the only kind of owner there is
 /// (`put_member` refuses `owner` for a scope), and what every "only an owner
 /// can do this" check below means.
-async fn is_store_owner(state: &AppState, store: &HostedStoreRow, user_rid: u64) -> CloudResult<bool> {
+pub(super) async fn is_store_owner(state: &AppState, store: &HostedStoreRow, user_rid: u64) -> CloudResult<bool> {
     Ok(state.db.find_grant(user_rid, store.rid, WHOLE_STORE).await?.is_some_and(|g| g.role == "owner"))
 }
 
@@ -338,7 +341,7 @@ fn stored_name(raw: &str, what: &str) -> CloudResult<String> {
 /// it (docs/RELAY_CONTRACT.md: "nothing on Pimble Cloud needs the owner's
 /// name for it"), and that is stored as it came; a name that is sent is still
 /// kept to one line and bounded, for the same reasons as any other.
-fn stored_name_or_empty(raw: &str, what: &str) -> CloudResult<String> {
+pub(super) fn stored_name_or_empty(raw: &str, what: &str) -> CloudResult<String> {
     let name = crate::mail::one_line(raw);
     if name.chars().count() > MAX_STORE_NAME_CHARS {
         return Err(CloudError::BadRequest(format!("{what} must be at most {MAX_STORE_NAME_CHARS} characters")));
@@ -411,6 +414,7 @@ pub async fn create_store(State(state): State<AppState>, authed: AuthedUser, Jso
             state.db.delete_grants_for_store(deleted_row.rid).await?;
             state.db.delete_key_grants_for_store(deleted_row.rid).await?;
             state.db.delete_invitations_for_store(deleted_row.rid).await?;
+            state.db.delete_share_names_for_store(deleted_row.rid).await?;
             state.db.revive_hosted_store(deleted_row.rid, &name, &dir_name, kind_str, req.tier.as_str()).await?
         }
         None => state.db.create_hosted_store(&store_id_str, &name, &dir_name, kind_str, req.tier.as_str()).await?,
@@ -430,6 +434,7 @@ pub async fn delete_store(State(state): State<AppState>, authed: AuthedUser, Pat
     state.db.delete_grants_for_store(store.rid).await?;
     state.db.delete_key_grants_for_store(store.rid).await?;
     state.db.delete_invitations_for_store(store.rid).await?;
+    state.db.delete_share_names_for_store(store.rid).await?;
     state.db.mark_store_deleted(store.rid).await?;
 
     // A relayed store was never on the hosted server, so there is nothing
@@ -468,7 +473,12 @@ pub async fn delete_store(State(state): State<AppState>, authed: AuthedUser, Pat
 pub struct MemberView {
     /// `null` for an invitation: there is no account to name yet.
     user_id: Option<String>,
+    /// Answered to an owner only, `""` to everyone else: members of a share
+    /// never see each other's emails (docs/PRESENCE_CONTRACT.md section 3,
+    /// Joe 2026-10-22). An invitation is listed to owners alone anyway.
     email: String,
+    /// What this member goes by in this scope; `null` for an invitation.
+    name: Option<String>,
     role: String,
     /// The scope this membership is of: the shared node, or `null` for the
     /// whole store. Always the `root` the request asked about.
@@ -499,6 +509,68 @@ pub struct MembersResponse {
     /// and `null` for a whole-store listing (a store is named by `GET
     /// /stores`, and never named here to somebody who only holds a share).
     share_name: Option<String>,
+    /// Everyone who reaches this scope, with the name they go by in it: the
+    /// members of the scope and everyone holding the whole store (its
+    /// owners above all). What a device turns the `sub` on a presence frame,
+    /// a discussion message or a board element into a name with
+    /// (docs/PRESENCE_CONTRACT.md section 3). No emails.
+    people: Vec<PersonView>,
+}
+
+/// One account that reaches a scope, as anyone in it may see them.
+#[derive(Serialize)]
+pub struct PersonView {
+    user_id: String,
+    name: String,
+    role: String,
+}
+
+/// Everyone reaching `root`: the whole-store holders, then its own members
+/// (one row per account; a whole-store grant wins).
+async fn people_of_scope(state: &AppState, names: &Names, grants: &[GrantRow], root: &str) -> CloudResult<Vec<PersonView>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let reaching = grants.iter().filter(|g| g.is_whole_store()).chain(grants.iter().filter(|g| !root.is_empty() && g.root == root));
+    for grant in reaching {
+        if !seen.insert(grant.user_rid) {
+            continue;
+        }
+        if let Some(user) = state.db.get_user(grant.user_rid).await? {
+            out.push(PersonView { name: names.name_of(&user, root), user_id: user.user_uuid, role: grant.role.clone() });
+        }
+    }
+    Ok(out)
+}
+
+/// The names chosen in one store's shares (docs/PRESENCE_CONTRACT.md section
+/// 3), read once per request.
+pub(crate) struct Names {
+    chosen: std::collections::HashMap<(u64, String), String>,
+}
+
+impl Names {
+    pub(crate) async fn of_store(state: &AppState, store_rid: u64) -> CloudResult<Self> {
+        let chosen = state
+            .db
+            .share_names_for_store(store_rid)
+            .await?
+            .into_iter()
+            .filter(|row| !row.name.trim().is_empty())
+            .map(|row| ((row.user_rid, row.root), row.name))
+            .collect();
+        Ok(Self { chosen })
+    }
+
+    /// What `user` goes by in the scope `root`: the name they chose there,
+    /// else their default name.
+    pub(crate) fn name_of(&self, user: &UserRow, root: &str) -> String {
+        self.chosen.get(&(user.rid, root.to_string())).cloned().unwrap_or_else(|| user.default_name())
+    }
+
+    /// The name `user` chose in `root` itself, `""` for none.
+    pub(crate) fn chosen(&self, user_rid: u64, root: &str) -> String {
+        self.chosen.get(&(user_rid, root.to_string())).cloned().unwrap_or_default()
+    }
 }
 
 const STATUS_ACTIVE: &str = "active";
@@ -525,11 +597,13 @@ pub async fn list_members(
     let root = normalize_root(&scope.root)?;
     require_role_for_scope(&state, &store, authed.user.rid, &root).await?;
     let caller_is_owner = is_store_owner(&state, &store, authed.user.rid).await?;
+    let names = Names::of_store(&state, store.rid).await?;
 
     // Every grant and invitation of one scope carries the same name (see
     // [`rename_share`]), so the first one that has a name is the share's.
     let mut share_name = String::new();
     let grants = state.db.grants_for_store(store.rid).await?;
+    let people = people_of_scope(&state, &names, &grants, &root).await?;
     let mut out = Vec::with_capacity(grants.len());
     for grant in grants.into_iter().filter(|g| g.root == root) {
         if share_name.is_empty() {
@@ -538,8 +612,9 @@ pub async fn list_members(
         if let Some(user) = state.db.get_user(grant.user_rid).await? {
             let public_keys = if caller_is_owner { user.public_keys() } else { None };
             out.push(MemberView {
+                name: Some(names.name_of(&user, &root)),
                 user_id: Some(user.user_uuid),
-                email: user.email,
+                email: if caller_is_owner { user.email } else { String::new() },
                 role: grant.role,
                 root: root_view(&root),
                 status: STATUS_ACTIVE,
@@ -557,6 +632,7 @@ pub async fn list_members(
                 share_name = invitation.share_name.clone();
             }
             out.push(MemberView {
+                name: None,
                 user_id: None,
                 email: invitation.email,
                 role: invitation.role,
@@ -576,7 +652,7 @@ pub async fn list_members(
     } else {
         Some(share_name)
     };
-    Ok(Json(MembersResponse { members: out, share_name }))
+    Ok(Json(MembersResponse { members: out, share_name, people }))
 }
 
 #[derive(Deserialize)]
@@ -756,7 +832,9 @@ async fn grant_member(
 
     send_share_mail(state, store, share_name, &caller.email, &target.email, false).await;
     let has_key = has_key(state, target.rid, store.rid, root).await?;
+    let name = Names::of_store(state, store.rid).await?.name_of(&target, root);
     Ok(Json(MemberView {
+        name: Some(name),
         user_id: Some(target.user_uuid.clone()),
         // The caller is an owner (`put_member` required it), and these are
         // exactly what they need to wrap the scope's key to the new member
@@ -809,6 +887,7 @@ async fn invite_member(
 
     send_share_mail(state, store, share_name, &caller.email, email, true).await;
     Ok(Json(MemberView {
+        name: None,
         user_id: None,
         email: email.to_string(),
         role: role.to_string(),

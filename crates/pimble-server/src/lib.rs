@@ -15,6 +15,7 @@ pub mod handler;
 pub mod jwt;
 pub mod keystore;
 pub mod local;
+mod people;
 pub mod principal;
 pub mod relay_face;
 mod relay_tunnel;

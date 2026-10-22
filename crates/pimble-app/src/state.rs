@@ -387,6 +387,21 @@ pub fn manages_share(shared_by: Option<&str>, members: &[pimble_rpc::ShareMember
     }
 }
 
+/// How a row of the Share modal names a member (docs/PRESENCE_CONTRACT.md
+/// section 3): the name they go by in the share, with the email beside it
+/// for the owner, who manages the share by email. Members never see an
+/// email: the server sends none. An invitation has only its address.
+pub fn member_label(member: &pimble_rpc::ShareMember, with_email: bool) -> String {
+    let name = member.name.trim();
+    let email = member.email.trim();
+    match (name.is_empty(), email.is_empty() || !with_email) {
+        (false, false) => format!("{name} ({email})"),
+        (false, true) => name.to_string(),
+        (true, _) if !email.is_empty() => email.to_string(),
+        (true, _) => "someone".to_string(),
+    }
+}
+
 /// The member's face of the Share modal in one sentence: whose share this
 /// is, and that the list under it is not theirs to change. The owner is who
 /// the store says shared it, or the member list's owner row when the store
@@ -394,7 +409,7 @@ pub fn manages_share(shared_by: Option<&str>, members: &[pimble_rpc::ShareMember
 pub fn shared_by_sentence(shared_by: Option<&str>, members: &[pimble_rpc::ShareMember]) -> String {
     let owner = shared_by
         .map(str::to_string)
-        .or_else(|| members.iter().find(|member| member.role == pimble_rpc::MemberRole::Owner).map(|member| member.email.clone()));
+        .or_else(|| members.iter().find(|member| member.role == pimble_rpc::MemberRole::Owner).map(|member| member_label(member, false)));
     match owner {
         Some(owner) => format!("Shared by {owner}. Only an owner changes who it is shared with."),
         None => "Only an owner changes who it is shared with.".to_string(),
@@ -1017,6 +1032,9 @@ pub struct AppStore {
     pub nav_step: Signal<Option<bool>>,
     /// Account > "AI Agents..." ([`crate::agents`]).
     pub agents_ui: crate::agents::AgentsUi,
+    /// Account > "Shares...", who is who in each store's shares, and the
+    /// first-open question (docs/PRESENCE_CONTRACT.md section 3).
+    pub shares_ui: crate::shares::SharesUi,
     /// The tooltip over a hovered link, once the pointer has rested on it
     /// (docs/LINKS_CONTRACT.md "What a link looks like").
     pub link_hover: Signal<Option<LinkTooltip>>,
@@ -1290,6 +1308,7 @@ impl AppStore {
             link_open: Signal::new(None),
             nav_step: Signal::new(None),
             agents_ui: crate::agents::AgentsUi::new(),
+            shares_ui: crate::shares::SharesUi::new(),
             link_hover: Signal::new(None),
             link_picker: Signal::new(None),
             deleted_modal_store: Signal::new(None),
@@ -2885,7 +2904,7 @@ mod tests {
     }
 
     fn member(email: &str, role: pimble_rpc::MemberRole) -> pimble_rpc::ShareMember {
-        pimble_rpc::ShareMember { email: email.to_string(), role, status: pimble_rpc::ShareMemberStatus::Active }
+        pimble_rpc::ShareMember { email: email.to_string(), role, status: pimble_rpc::ShareMemberStatus::Active, name: String::new() }
     }
 
     fn marker(name: &str) -> pimble_core::ShareMarker {
@@ -2895,6 +2914,21 @@ mod tests {
             url: "https://pimble.app".to_string(),
             name: name.to_string(),
         }
+    }
+
+    /// A member row names the person by the name they go by in the share,
+    /// with the email beside it for the owner only (docs/PRESENCE_CONTRACT.md
+    /// section 3); an invitation is its address.
+    #[test]
+    fn a_member_row_says_the_name_and_the_email_only_to_the_owner() {
+        use pimble_rpc::MemberRole::{Editor, Owner};
+        let named = |email: &str, name: &str, role| pimble_rpc::ShareMember { name: name.to_string(), ..member(email, role) };
+        assert_eq!(member_label(&named("ann@example.com", "Chef Ann", Editor), true), "Chef Ann (ann@example.com)");
+        assert_eq!(member_label(&named("", "Chef Ann", Editor), false), "Chef Ann");
+        assert_eq!(member_label(&named("ann@example.com", "Chef Ann", Editor), false), "Chef Ann");
+        assert_eq!(member_label(&member("new@example.com", Editor), true), "new@example.com");
+        assert_eq!(member_label(&member("", Owner), false), "someone");
+        assert_eq!(shared_by_sentence(None, &[named("", "Mom", Owner)]), "Shared by Mom. Only an owner changes who it is shared with.");
     }
 
     /// Who manages a share: the account's own row in the member list where

@@ -2119,7 +2119,7 @@ async fn inviting_an_unknown_address_and_claiming_it_at_verification() {
     let row = stores.iter().find(|s| s["store_id"] == store_id.as_str()).expect("the claimed share should be listed");
     assert_eq!(row["role"], "editor");
     assert!(row["root"].is_null(), "a whole-store grant's row names no node: {row}");
-    assert_eq!(row["shared_by"], "share-owner@example.com");
+    assert_eq!(row["shared_by"], "share-owner", "the owner by name, never by email");
 
     // ...and the invitation is gone, replaced by a real grant.
     let hosted = stack.app_state.db.find_hosted_store(&store_id).await.unwrap().unwrap();
@@ -2477,7 +2477,7 @@ async fn list_stores_reports_shared_by() {
     let member_row = list_stores(&stack, &member_cookie).await.into_iter().find(|s| s["store_id"] == store_id.as_str()).unwrap();
     assert!(member_row["root"].is_null());
     assert_eq!(member_row["role"], "editor");
-    assert_eq!(member_row["shared_by"], owner_email);
+    assert_eq!(member_row["shared_by"], owner_email.split('@').next().unwrap(), "the owner by name, never by email");
 }
 
 /// One sharing mail per (store, address) per minute: a second `PUT members`
@@ -2817,7 +2817,7 @@ async fn a_scoped_invitation_is_claimed_with_its_root() {
     let row = list_stores(&stack, &invitee_cookie).await.into_iter().find(|s| s["store_id"] == store_id.as_str()).expect("the share lists");
     assert_eq!(row["root"], root);
     assert_eq!(row["role"], "editor");
-    assert_eq!(row["shared_by"], owner_email);
+    assert_eq!(row["shared_by"], owner_email.split('@').next().unwrap(), "the owner by name, never by email");
     assert_eq!(row["name"], "Holiday Plans", "a recipient's row is named by the share, never the store: {row}");
 }
 
@@ -2846,7 +2846,7 @@ async fn list_stores_rows_carry_root_and_shared_by_for_a_share() {
     let rows: Vec<Value> = list_stores(&stack, &member_cookie).await.into_iter().filter(|s| s["store_id"] == store_id.as_str()).collect();
     assert_eq!(rows.len(), 2, "one row per grant: {rows:?}");
     for row in &rows {
-        assert_eq!(row["shared_by"], owner_email);
+        assert_eq!(row["shared_by"], owner_email.split('@').next().unwrap(), "the owner by name, never by email");
         assert_ne!(row["name"], "Two Shares", "a recipient is never told what the store around their share is called: {row}");
     }
     let by_root: std::collections::HashMap<String, (String, String)> = rows
@@ -2909,10 +2909,13 @@ async fn members_are_listed_per_scope_and_a_share_sees_only_its_own() {
     assert_eq!(find_member(&owners_view, member_email)["root"], shared);
     assert!(find_member(&owners_view, member_email)["public_keys"]["signing"].is_string());
 
-    // The share's own member: the same members, no invitations, no keys.
+    // The share's own member: the same members, no invitations, no keys,
+    // and no emails: they go by names (docs/PRESENCE_CONTRACT.md section 3).
     let members_view = list_members_at(&stack, &member_cookie, &store_id, Some(&shared)).await;
     assert_eq!(members_view.len(), 2, "an invitation is the owner's business: {members_view:?}");
-    assert!(find_member(&members_view, other_email)["public_keys"].is_null());
+    assert!(members_view.iter().all(|m| m["email"] == "" && m["public_keys"].is_null()), "{members_view:?}");
+    let other_name = other_email.split('@').next().unwrap();
+    assert!(members_view.iter().any(|m| m["name"] == other_name), "{members_view:?}");
 
     // ...and nothing else about the store.
     assert_eq!(members_response(&stack, &member_cookie, &store_id, None).await.status(), 403, "a share is not a way into the whole store");
@@ -4178,4 +4181,84 @@ async fn deleting_a_relayed_store_closes_its_members() {
     assert_eq!(next_close(&mut again).await.0, 4404);
     assert_eq!(announce(&mut tunnel, &[cast.store_id.as_str()]).await, Vec::<String>::new(), "a deleted store cannot be served");
     assert_eq!(stack.app_state.relay.counts(), pimble_cloud::relay::RelayCounts { tunnels: 1, stores: 0, connections: 0 });
+}
+
+/// docs/PRESENCE_CONTRACT.md section 3: everyone goes by a name of their own
+/// choosing in each share, the members of a share see those names and never
+/// each other's emails, and the owner still sees emails to manage it.
+#[tokio::test(flavor = "multi_thread")]
+async fn names_per_share_and_no_emails_between_members() {
+    let stack = skip_without_rhypedb!();
+    let (_o, owner_cookie) = signup_verify_login(&stack, "olga.owner@example.com", "names owner password!!").await;
+    let (_a, ann_cookie) = signup_verify_login(&stack, "ann.member@example.com", "names ann password!!").await;
+    let (_b, ben_cookie) = signup_verify_login(&stack, "ben.member@example.com", "names ben password!!").await;
+    let store = create_store_with_body(&stack, &owner_cookie, json!({ "name": "Family", "kind": "vault" })).await;
+    let store_id = store["store_id"].as_str().unwrap().to_string();
+    let root = node_id();
+    for email in ["ann.member@example.com", "ben.member@example.com"] {
+        let resp = put_member_with(&stack, &owner_cookie, &store_id, json!({ "email": email, "role": "editor", "root": root, "name": "Recipes" })).await;
+        assert_eq!(resp.status(), 200);
+    }
+    let me = |cookie: &str| {
+        let req = stack.http.get(format!("{}/me", stack.base_url)).header("Cookie", cookie);
+        async move { req.send().await.unwrap().json::<Value>().await.unwrap() }
+    };
+    // Nothing chosen: the email's local part.
+    assert_eq!(me(&ann_cookie).await["name"], "ann.member");
+
+    // A default name, and one for this share.
+    let put = |cookie: &str, url: String, body: Value| stack.http.put(url).header("Cookie", cookie).json(&body).send();
+    assert_eq!(put(&owner_cookie, format!("{}/me", stack.base_url), json!({ "display_name": "Mom" })).await.unwrap().status(), 200);
+    assert_eq!(put(&ann_cookie, format!("{}/me", stack.base_url), json!({ "display_name": "Ann" })).await.unwrap().status(), 200);
+    let resp = put(&ann_cookie, format!("{}/me/shares/{store_id}", stack.base_url), json!({ "root": root, "name": "Chef Ann" })).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(me(&ann_cookie).await["name"], "Ann");
+
+    // Ben, a member, sees names and no emails, the owner among the people.
+    let listing: Value = members_response(&stack, &ben_cookie, &store_id, Some(&root)).await.json().await.unwrap();
+    let text = listing.to_string();
+    assert!(!text.contains("@example.com"), "a member saw an email: {text}");
+    let people = listing["people"].as_array().unwrap();
+    let names: Vec<&str> = people.iter().map(|p| p["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"Chef Ann") && names.contains(&"Mom") && names.contains(&"ben.member"), "{names:?}");
+    assert!(listing["members"].as_array().unwrap().iter().any(|m| m["name"] == "Chef Ann"));
+
+    // The owner still sees emails.
+    let listing: Value = members_response(&stack, &owner_cookie, &store_id, Some(&root)).await.json().await.unwrap();
+    assert!(listing["members"].as_array().unwrap().iter().any(|m| m["email"] == "ann.member@example.com" && m["name"] == "Chef Ann"));
+
+    // "Shared by" is the owner's name, never their email.
+    let rows: Value = stack.http.get(format!("{}/stores", stack.base_url)).header("Cookie", &ben_cookie).send().await.unwrap().json().await.unwrap();
+    assert_eq!(rows[0]["shared_by"], "Mom");
+
+    // The owner goes by another name in this one share.
+    let resp = put(&owner_cookie, format!("{}/me/shares/{store_id}", stack.base_url), json!({ "root": root, "name": "Grandma" })).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let rows: Value = stack.http.get(format!("{}/stores", stack.base_url)).header("Cookie", &ben_cookie).send().await.unwrap().json().await.unwrap();
+    assert_eq!(rows[0]["shared_by"], "Grandma");
+
+    // Each one's Shares list.
+    let shares: Value = stack.http.get(format!("{}/me/shares", stack.base_url)).header("Cookie", &ann_cookie).send().await.unwrap().json().await.unwrap();
+    let shares = shares.as_array().unwrap();
+    assert_eq!(shares.len(), 1);
+    assert_eq!(shares[0]["name"], "Recipes");
+    assert_eq!(shares[0]["owned"], false);
+    assert_eq!(shares[0]["owner_name"], "Grandma");
+    assert_eq!(shares[0]["my_name"], "Chef Ann");
+    let shares: Value = stack.http.get(format!("{}/me/shares", stack.base_url)).header("Cookie", &owner_cookie).send().await.unwrap().json().await.unwrap();
+    let shares = shares.as_array().unwrap();
+    assert_eq!(shares.len(), 1, "{shares:?}");
+    assert_eq!(shares[0]["owned"], true);
+    assert_eq!(shares[0]["appears_as"], "Grandma");
+
+    // Clearing a share's name falls back to the default.
+    let resp = put(&ann_cookie, format!("{}/me/shares/{store_id}", stack.base_url), json!({ "root": root, "name": "" })).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let listing: Value = members_response(&stack, &ben_cookie, &store_id, Some(&root)).await.json().await.unwrap();
+    assert!(listing["people"].as_array().unwrap().iter().any(|p| p["name"] == "Ann"));
+
+    // Someone outside the share cannot name themselves in it.
+    let (_c, cy_cookie) = signup_verify_login(&stack, "cy.outsider@example.com", "names cy password!!").await;
+    let resp = put(&cy_cookie, format!("{}/me/shares/{store_id}", stack.base_url), json!({ "root": root, "name": "Mallory" })).await.unwrap();
+    assert_eq!(resp.status(), 403);
 }

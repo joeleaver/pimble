@@ -1,5 +1,6 @@
 mod accounts;
 mod misc;
+mod people;
 mod stores;
 
 use axum::routing::{delete, get, post};
@@ -19,7 +20,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/resend-verification", post(accounts::resend_verification))
         .route("/api/v1/login", post(accounts::login))
         .route("/api/v1/logout", post(accounts::logout))
-        .route("/api/v1/me", get(accounts::me))
+        .route("/api/v1/me", get(accounts::me).put(people::put_me))
+        .route("/api/v1/me/shares", get(people::list_shares))
+        .route("/api/v1/me/shares/:store_id", axum::routing::put(people::put_share_name))
         .route("/api/v1/me/keys", get(accounts::me_keys))
         .route("/api/v1/me/personal", get(accounts::get_personal).put(accounts::put_personal).delete(accounts::delete_personal))
         .route("/api/v1/me/password", post(accounts::change_password))

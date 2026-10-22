@@ -58,7 +58,7 @@ use pimble_rpc::{
     GetBlobRequest, GetBlobResponse, HaveBlobsRequest, HaveBlobsResponse, PutBlobRequest, PutBlobResponse, BLOBS_IN_SHARES_REFUSAL, BLOB_CHUNK_BYTES, BLOB_NOT_HERE,
     AddRemoteStoreRequest, CloseStoreRequest, CloudAddHostedStoreRequest, CloudHostStoreRequest,
     CloudHostStoreResponse, CloudHostedStoreInfo, CloudListHostedStoresResponse, CloudRelayStoreRequest, CloudRelayStoreResponse, CloudSignInRequest,
-    CloudStatusResponse, CloudStopRelayingRequest,
+    CloudStatusResponse, CloudStopRelayingRequest, CloudListSharesResponse, CloudSetDisplayNameRequest, CloudSetShareNameRequest, CloudPeopleRequest, StorePeople,
     CreateMountRequest, CreateMountResponse,
     CreateAttachmentRequest, CreateNodeRequest, CreateNodeResponse, CreateStoreRequest, CreateStoreResponse, ListAttachmentsRequest, ListAttachmentsResponse, ListDiscussionsRequest, ListDiscussionsResponse, WhoAmIResponse, CloudPersonalSyncRequest, CloudPersonalSyncResponse,
     CreateWorkspaceRequest, DeleteNodeRequest, EditOperation, EmptyResponse, GetChildrenRequest,
@@ -806,6 +806,7 @@ fn index_events_for(kind: &StoreChangeKind) -> Vec<IndexEvent> {
         | StoreChangeKind::MountStateChanged { .. }
         | StoreChangeKind::ShareStateChanged { .. }
         | StoreChangeKind::SharesEnded { .. }
+        | StoreChangeKind::PeopleChanged
         | StoreChangeKind::VaultAppended { .. } => Vec::new(),
     }
 }
@@ -1109,7 +1110,8 @@ fn named_by(kind: &StoreChangeKind) -> Named {
         StoreChangeKind::SyncStateChanged { .. }
         | StoreChangeKind::MountStateChanged { .. }
         | StoreChangeKind::ShareStateChanged { .. }
-        | StoreChangeKind::SharesEnded { .. } => Named::Nothing,
+        | StoreChangeKind::SharesEnded { .. }
+        | StoreChangeKind::PeopleChanged => Named::Nothing,
     }
 }
 
@@ -2375,6 +2377,11 @@ impl RpcHandler {
 
     /// Notify store subscribers about a change that is not about a document
     /// (a link's or a mount's state); it carries no bytes.
+    /// Who is who in `store_id`'s shares changed here (`crate::people`).
+    pub(crate) async fn notify_people_changed(&self, store_id: StoreId) {
+        self.notify_store_change(store_id, StoreChangeKind::PeopleChanged, None).await;
+    }
+
     async fn notify_store_change(&self, store_id: StoreId, kind: StoreChangeKind, source: Option<&str>) {
         let delivery = self.delivery_for(store_id, &kind).await;
         let notification = StoreChangedNotification {
@@ -3257,6 +3264,75 @@ impl PimbleApiServer for RpcHandler {
                 })
                 .collect(),
         })
+    }
+
+    async fn cloud_list_shares(&self, ext: &Extensions) -> Result<CloudListSharesResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudListShares")?;
+        let account = self.keystore.account().await.ok_or_else(|| to_rpc_error("no Pimble Cloud account is signed in"))?;
+        let me = crate::cloud::me(&account.url, &account.session).await.map_err(to_rpc_error)?;
+        let shares = crate::cloud::list_shares(&account.url, &account.session).await.map_err(to_rpc_error)?;
+        let manager = self.store_manager.read().await;
+        let rows = shares
+            .into_iter()
+            .filter_map(|share| {
+                let store_id = StoreId::parse(&share.store_id).ok()?;
+                let root = share.scope_root();
+                // Here: the store is open, and a replica of somebody else's
+                // shares holds this one's root (a whole replica holds all).
+                let here = manager.is_open(store_id) && {
+                    let roots = manager.scope_roots(store_id);
+                    share.owned || roots.is_empty() || root.is_some_and(|root| roots.contains(&root) && !manager.ended_roots(store_id).contains(&root))
+                };
+                Some(pimble_rpc::CloudShareRow {
+                    store_id,
+                    root,
+                    relayed: share.tier == crate::cloud::TIER_RELAY,
+                    name: share.name,
+                    role: share.role,
+                    owned: share.owned,
+                    owner_name: share.owner_name,
+                    my_name: share.my_name,
+                    appears_as: share.appears_as,
+                    here,
+                })
+            })
+            .collect();
+        let default_name = if me.name.is_empty() { me.email.split('@').next().unwrap_or_default().to_string() } else { me.name };
+        Ok(CloudListSharesResponse { display_name: me.display_name, default_name, shares: rows })
+    }
+
+    async fn cloud_set_display_name(&self, ext: &Extensions, request: CloudSetDisplayNameRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudSetDisplayName")?;
+        let account = self.keystore.account().await.ok_or_else(|| to_rpc_error("no Pimble Cloud account is signed in"))?;
+        crate::cloud::put_display_name(&account.url, &account.session, request.name.trim()).await.map_err(to_rpc_error)?;
+        // Every store this name may show in.
+        let open: Vec<StoreId> = self.store_manager.read().await.list_stores();
+        for store_id in open {
+            // Only an encrypted link reaches Pimble Cloud.
+            if self.link_kind_of(store_id).await.0 == StoreKind::Vault {
+                crate::people::refresh(self, store_id).await;
+            }
+        }
+        Ok(EmptyResponse {})
+    }
+
+    async fn cloud_set_share_name(&self, ext: &Extensions, request: CloudSetShareNameRequest) -> Result<EmptyResponse, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudSetShareName")?;
+        let account = self.keystore.account().await.ok_or_else(|| to_rpc_error("no Pimble Cloud account is signed in"))?;
+        crate::cloud::put_share_name(&account.url, &account.session, &request.store_id.to_string(), request.root.as_ref(), request.name.trim())
+            .await
+            .map_err(to_rpc_error)?;
+        if self.store_manager.read().await.is_open(request.store_id) {
+            crate::people::refresh(self, request.store_id).await;
+        }
+        Ok(EmptyResponse {})
+    }
+
+    async fn cloud_people(&self, ext: &Extensions, request: CloudPeopleRequest) -> Result<StorePeople, ErrorObjectOwned> {
+        authorize_service_only(&principal_of(ext), "cloudPeople")?;
+        // Asked again now where it can be (a refresh that changes it tells
+        // the subscribers too), what was kept where it cannot.
+        Ok(crate::people::refresh(self, request.store_id).await)
     }
 
     async fn cloud_add_hosted_store(&self, ext: &Extensions, request: CloudAddHostedStoreRequest) -> Result<OpenStoreResponse, ErrorObjectOwned> {

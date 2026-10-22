@@ -1,6 +1,6 @@
 # Presence contract: who is here, and where
 
-Status: **proposed, 2026-10-22, not built.** Written from Joe's answers that day (listed
+Status: **wave 0 (names) built on branch `presence`, 2026-10-22; waves 1 to 5 not built.** Written from Joe's answers that day (listed
 under "Decisions" at the end). The points under "To confirm" are design choices made here
 that Joe has not seen yet. Section 3 (names per share) was added later the same day.
 
@@ -314,3 +314,80 @@ Each wave is checked in the desktop app and in the browser on the local stack
 - Everything goes on the store channel in the first version, with no interest filter.
 - The server keeps live frames in memory to answer late arrivals. They are never written
   anywhere.
+
+## Built in wave 0 (names), 2026-10-22, branch `presence`
+
+**Accounts service** (`crates/pimble-cloud`):
+- `User.display_name` is optional, and `UserRow::default_name` falls back to the
+  email's local part.
+- `ShareName { user, store, root, name }` is keyed per (user, store, root), where `root`
+  is `""` for a whole store. Rows are deleted with the store and with the account.
+  `routes/people.rs` serves:
+  - `PUT /me` (`display_name`)
+  - `GET /me/shares`, which lists owned and joined shares with `my_name` and
+    `appears_as`
+  - `PUT /me/shares/{store}` (`root`, `name`; empty clears)
+- `GET /me` answers `display_name` and `name`.
+- `GET /stores/{id}/members` answers:
+  - `name` on each member, and `email` only to an owner (`""` otherwise, so older
+    clients still parse);
+  - `people`, everyone reaching the scope, owners included, as id, name and role.
+- `GET /stores`' `shared_by` is the owner's name in that share.
+- Names are at most 80 characters, on one line.
+- Tested by `names_per_share_and_no_emails_between_members`, against a real
+  rhypedb.
+
+**The desktop's server** (`pimble-server`):
+- `crate::people` keeps `<store>/people.json`: per scope the store is held through,
+  each person's id and name, plus `my_name` and `my_name_chosen`. It is derived data,
+  never synced.
+- `people.json` is refreshed:
+  - at every vault-link connect and on its two-minute grant check (spawned, so it does
+    not hold the link up);
+  - on `cloudPeople`, which answers the cache when the service cannot be reached;
+  - after a name is set.
+- A refresh that changes anything sends `StoreChangeKind::PeopleChanged`, which links
+  never forward.
+- New Service-only RPCs:
+  - `cloudListShares`, whose rows carry `here`;
+  - `cloudSetDisplayName`;
+  - `cloudSetShareName`;
+  - `cloudPeople`.
+- `ShareMember` carries `name`. The Share dialog's owner row is found by user id, no
+  longer by email.
+- Tested by `members_go_by_the_names_they_choose_and_see_no_emails` and the updated
+  `a_member_can_neither_share_from_a_share_nor_change_it`, against the stub accounts
+  service. `sharing_against_the_real_accounts_service` passes too.
+
+**The app** (both targets, `crates/pimble-app/src/shares.rs`):
+- The Shares dialog is Account > "Shares..." on the desktop and File > "Shares..." in
+  the browser. It has "Your name" (applied when the field commits), one row per share
+  with "Appear as", and Open (follows a `pimble:` link to the share's root) or Add Here
+  (`CloudAddHostedStore`).
+- The one-line question opens when a share somebody else made arrives with
+  `my_name_chosen` false, once per share per run. Done saves the name as typed
+  (pre-filled with the default), so the question is not asked again on another device.
+- Who is who is kept in `SharesUi::people`. `Names::of(store, node)` resolves an id
+  through the share the node is in (`scope_root_of` walks up to a scope root).
+  Discussion threads (`relabel`) and the board hover ("by Sam") show current names.
+- Stamps:
+  - `author_in(store, node)` stamps board elements, pictures in text and discussion
+    messages with the name used in that share.
+  - Outside shares the stamp is the default name (`set_author_name`, from the first
+    `CloudSharesListed` after sign-in). The email's local part is only used until that
+    first list arrives.
+- Share dialog rows read "Name (email)" for an owner and "Name" for a member.
+- The browser answers the four commands from the accounts service itself
+  (`web/src/backend.rs` `names_command`) under the same events.
+
+**Gaps:**
+- The browser learns other people's new names only when it asks again (a store
+  registered, its own name set). There is no `PeopleChanged` there.
+- The discussions list row ("Alice: the latest message") shows the stamped name.
+- The invitation and "shared with you" mails still name the inviter by email; that is
+  for Joe to decide.
+- Stamps written before this wave keep the email's local part in the document. Only
+  the display is corrected, for people who are still members.
+- The owner is never asked the one-line question; their default name applies until
+  they set one in Shares.
+- Not yet tried in the desktop app or the browser on the local stack.

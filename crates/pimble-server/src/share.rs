@@ -527,6 +527,7 @@ impl Upkeep {
             | StoreChangeKind::MountStateChanged { .. }
             | StoreChangeKind::ShareStateChanged { .. }
             | StoreChangeKind::SharesEnded { .. }
+        | StoreChangeKind::PeopleChanged
             | StoreChangeKind::VaultAppended { .. } => return,
         }
         self.retry_wait = UPKEEP_RETRY;
@@ -936,7 +937,7 @@ fn member_row(member: &MemberView) -> Option<ShareMember> {
         ShareMemberStatus::Active
     };
     // A role this build does not know is not shown as one it does.
-    Some(ShareMember { email: member.email.clone(), role: MemberRole::parse(&member.role)?, status })
+    Some(ShareMember { email: member.email.clone(), role: MemberRole::parse(&member.role)?, status, name: member.name.clone().unwrap_or_default() })
 }
 
 impl RpcHandler {
@@ -976,9 +977,40 @@ impl RpcHandler {
     async fn share_answer(&self, account: &SignedInAccount, store_id: StoreId, node_id: NodeId, marker: &ShareMarker) -> Result<CloudShareInfoResponse, ErrorObjectOwned> {
         let listing = crate::cloud::list_members(&account.url, &account.session, &store_id.to_string(), Some(&node_id)).await.map_err(to_rpc_error)?;
         let shared_by = self.store_manager_handle().read().await.get_store_info(store_id).ok().and_then(|store| store.shared_by);
-        let owner = shared_by.unwrap_or_else(|| account.email.clone());
-        let mut members = vec![ShareMember { email: owner.clone(), role: MemberRole::Owner, status: ShareMemberStatus::Active }];
-        members.extend(listing.members.iter().filter(|member| !member.email.eq_ignore_ascii_case(&owner)).filter_map(member_row));
+        // The owner: this account when the store is not someone else's
+        // share, with its email (an owner sees emails); whoever shared it
+        // otherwise, by the name they go by here and nothing more.
+        let owner_person = match &shared_by {
+            None => listing.people.iter().find(|person| person.user_id == account.user_id),
+            Some(_) => listing.people.iter().find(|person| person.role == "owner"),
+        };
+        let owner_id = owner_person.map(|person| person.user_id.clone());
+        let owner = match &shared_by {
+            None => ShareMember {
+                email: account.email.clone(),
+                role: MemberRole::Owner,
+                status: ShareMemberStatus::Active,
+                name: owner_person.map(|person| person.name.clone()).unwrap_or_default(),
+            },
+            Some(shared_by) => ShareMember {
+                email: String::new(),
+                role: MemberRole::Owner,
+                status: ShareMemberStatus::Active,
+                name: owner_person.map(|person| person.name.clone()).unwrap_or_else(|| shared_by.clone()),
+            },
+        };
+        let owner_email = owner.email.clone();
+        let mut members = vec![owner];
+        members.extend(
+            listing
+                .members
+                .iter()
+                .filter(|member| match (&owner_id, &member.user_id) {
+                    (Some(owner), Some(id)) => owner != id,
+                    _ => owner_email.is_empty() || !member.email.eq_ignore_ascii_case(&owner_email),
+                })
+                .filter_map(member_row),
+        );
         // Someone looking at a member who waits for the key should not have
         // to wait for the sweep's next tick as well.
         if members.iter().any(|member| member.status == ShareMemberStatus::WaitingForKey) {
@@ -1064,7 +1096,7 @@ impl RpcHandler {
                 let state = self.shares().state_of(self, store_id, node_id).await;
                 Ok(CloudShareInfoResponse {
                     share: ShareInfo { store_id, node_id, name: marker.name.clone(), state },
-                    members: vec![ShareMember { email: account.email.clone(), role: MemberRole::Owner, status: ShareMemberStatus::Active }],
+                    members: vec![ShareMember { email: account.email.clone(), role: MemberRole::Owner, status: ShareMemberStatus::Active, name: String::new() }],
                 })
             }
         }
@@ -1224,7 +1256,7 @@ mod tests {
     use pimble_rpc::StoreChangedNotification;
 
     fn member(status: &str, has_key: bool, role: &str) -> MemberView {
-        MemberView { user_id: None, email: "m@example.com".into(), role: role.into(), status: status.into(), has_key, public_keys: None }
+        MemberView { user_id: None, email: "m@example.com".into(), name: None, role: role.into(), status: status.into(), has_key, public_keys: None }
     }
 
     #[test]

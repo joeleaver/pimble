@@ -1465,6 +1465,32 @@ impl PimbleClient {
         self.client.cloud_list_hosted_stores().await.map_err(rpc_error)
     }
 
+    /// The shares the signed-in account takes part in and the names it
+    /// goes by in each (docs/PRESENCE_CONTRACT.md section 3).
+    pub async fn cloud_list_shares(&self) -> Result<pimble_rpc::CloudListSharesResponse> {
+        self.client.cloud_list_shares().await.map_err(rpc_error)
+    }
+
+    /// The account's default name; empty clears it.
+    pub async fn cloud_set_display_name(&self, name: &str) -> Result<()> {
+        self.client.cloud_set_display_name(pimble_rpc::CloudSetDisplayNameRequest { name: name.to_string() }).await.map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// The name the account goes by in one share; empty means the default.
+    pub async fn cloud_set_share_name(&self, store_id: StoreId, root: Option<NodeId>, name: &str) -> Result<()> {
+        self.client
+            .cloud_set_share_name(pimble_rpc::CloudSetShareNameRequest { store_id, root, name: name.to_string() })
+            .await
+            .map_err(rpc_error)?;
+        Ok(())
+    }
+
+    /// Who is who in a store's shares, as the server last learned it.
+    pub async fn cloud_people(&self, store_id: StoreId) -> Result<pimble_rpc::StorePeople> {
+        self.client.cloud_people(pimble_rpc::CloudPeopleRequest { store_id }).await.map_err(rpc_error)
+    }
+
     /// Add an already-hosted store as a local replica.
     pub async fn cloud_add_hosted_store(&self, store_id: StoreId) -> Result<Store> {
         let response = self.client.cloud_add_hosted_store(CloudAddHostedStoreRequest { store_id }).await.map_err(rpc_error)?;

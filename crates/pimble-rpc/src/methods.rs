@@ -360,6 +360,25 @@ pub trait PimbleApi {
     #[method(name = "cloudListHostedStores", with_extensions)]
     async fn cloud_list_hosted_stores(&self) -> Result<CloudListHostedStoresResponse, ErrorObjectOwned>;
 
+    /// The shares the signed-in account takes part in, owned or joined, and
+    /// the name it goes by in each (docs/PRESENCE_CONTRACT.md section 3).
+    /// `Service`-only.
+    #[method(name = "cloudListShares", with_extensions)]
+    async fn cloud_list_shares(&self) -> Result<CloudListSharesResponse, ErrorObjectOwned>;
+
+    /// The account's default name. `Service`-only.
+    #[method(name = "cloudSetDisplayName", with_extensions)]
+    async fn cloud_set_display_name(&self, request: CloudSetDisplayNameRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// The name the account goes by in one share. `Service`-only.
+    #[method(name = "cloudSetShareName", with_extensions)]
+    async fn cloud_set_share_name(&self, request: CloudSetShareNameRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
+
+    /// Who is who in a store's shares: asked of the accounts service again,
+    /// or as this device last learned it when it cannot be. `Service`-only.
+    #[method(name = "cloudPeople", with_extensions)]
+    async fn cloud_people(&self, request: CloudPeopleRequest) -> Result<StorePeople, ErrorObjectOwned>;
+
     /// Add an already-hosted store as a local replica. `Service`-only.
     #[method(name = "cloudAddHostedStore", with_extensions)]
     async fn cloud_add_hosted_store(&self, request: CloudAddHostedStoreRequest) -> Result<OpenStoreResponse, ErrorObjectOwned>;

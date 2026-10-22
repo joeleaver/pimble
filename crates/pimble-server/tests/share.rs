@@ -101,7 +101,7 @@ async fn sharing_a_folder_gives_a_member_its_subtree_and_both_sides_edit_the_tre
     env.sign_in(&bob, BOB).await;
     let rows = bob.cloud_list_hosted_stores().await.unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!((rows[0].root, rows[0].shared_by.as_deref(), rows[0].name.as_str(), rows[0].role.as_str()), (Some(shared), Some(ALICE.0), "Holiday Plans", "editor"));
+    assert_eq!((rows[0].root, rows[0].shared_by.as_deref(), rows[0].name.as_str(), rows[0].role.as_str()), (Some(shared), Some("alice"), "Holiday Plans", "editor"));
     let store = bob.cloud_add_hosted_store(store_id).await.expect("a share is added like any hosted store");
     assert_eq!((store.roots.clone(), store.access, store.name.as_str()), (vec![shared], StoreAccess::Full, "Holiday Plans"));
     let pulled = wait_until(Duration::from_secs(15), || async { node_text(&bob, store_id, fx.inside).await.contains("socks and a map") }).await;
@@ -208,6 +208,53 @@ async fn messages(client: &PimbleClient, store_id: pimble_core::StoreId, node: N
 fn sorted_uuids(mut ids: Vec<Uuid>) -> Vec<Uuid> {
     ids.sort();
     ids
+}
+
+/// docs/PRESENCE_CONTRACT.md section 3: each person goes by a name of their
+/// own choosing in each share, the others see that name and never an
+/// email, and each device keeps who is who beside the store.
+#[tokio::test]
+async fn members_go_by_the_names_they_choose_and_see_no_emails() {
+    let env = spawn_env().await;
+    let (_a, alice, a_dir) = start_local_server().await;
+    let fx = hosted_fixture(&env, &alice, a_dir.path()).await;
+    let (store_id, shared) = (fx.store_id, fx.shared);
+    alice.cloud_share_node(store_id, shared, "Holiday Plans").await.expect("sharing a folder");
+    alice.cloud_share_invite(store_id, shared, BOB.0, MemberRole::Editor).await.expect("inviting Bob");
+
+    let (_b, bob, b_dir) = start_local_server().await;
+    env.sign_in(&bob, BOB).await;
+    bob.cloud_add_hosted_store(store_id).await.expect("Bob adds the share");
+
+    // Bob's Shares list: the share, here, and whose it is by name.
+    let listed = bob.cloud_list_shares().await.expect("listing shares");
+    assert_eq!(listed.default_name, "bob");
+    assert_eq!(listed.shares.len(), 1, "{listed:?}");
+    let row = &listed.shares[0];
+    assert_eq!((row.store_id, row.root, row.owned, row.here), (store_id, Some(shared), false, true));
+    assert_eq!((row.owner_name.as_deref(), row.appears_as.as_str(), row.my_name.as_str()), (Some("alice"), "bob", ""));
+
+    // Bob names himself in the share; Alice chooses a default name.
+    bob.cloud_set_share_name(store_id, Some(shared), "Bobby").await.expect("Bob names himself");
+    alice.cloud_set_display_name("Alice A.").await.expect("Alice names herself");
+
+    // Each device's people say so, and Bob's is kept beside the store.
+    let people = bob.cloud_people(store_id).await.unwrap();
+    assert_eq!(people.name_of(&env.user_id(ALICE.0), Some(shared)), Some("Alice A."), "{people:?}");
+    let scope = people.scopes.iter().find(|s| s.root == Some(shared)).expect("the share's people");
+    assert_eq!((scope.my_name.as_str(), scope.my_name_chosen), ("Bobby", true));
+    assert_eq!(people.name_of(&env.user_id(BOB.0), Some(shared)), Some("Bobby"));
+    let alice_people = alice.cloud_people(store_id).await.unwrap();
+    assert_eq!(alice_people.name_of(&env.user_id(BOB.0), Some(shared)), Some("Bobby"), "{alice_people:?}");
+    assert!(!contains_bytes_recursive(b_dir.path(), b"alice@example.com"), "no owner email on the member's disk");
+
+    // The Share dialog on Bob's side names Alice and shows no email; Alice's
+    // own shows Bob's name with his email, for her to manage the share.
+    let info = bob.cloud_share_info(store_id, shared).await.expect("a member's view of the share");
+    assert!(info.members.iter().all(|m| m.email.is_empty()), "{:?}", info.members);
+    assert!(info.members.iter().any(|m| m.role == MemberRole::Owner && m.name == "Alice A."), "{:?}", info.members);
+    let info = alice.cloud_share_info(store_id, shared).await.expect("the owner's view");
+    assert!(info.members.iter().any(|m| m.email == BOB.0 && m.name == "Bobby"), "{:?}", info.members);
 }
 
 #[tokio::test]
@@ -636,9 +683,11 @@ async fn a_member_can_neither_share_from_a_share_nor_change_it() {
     assert_eq!(env.scoped_rows(fx.store_id, fx.shared), 1);
     assert!(env.scope_on_h(fx.store_id, fx.shared).await.is_some() && bob.get_node(fx.store_id, fx.shared).await.unwrap().metadata.share().is_some());
     let seen = bob.cloud_share_info(fx.store_id, fx.shared).await.expect("a member may look at the share they are in");
+    // By name: a member sees nobody's email (docs/PRESENCE_CONTRACT.md
+    // section 3).
     assert_eq!(
-        seen.members.iter().map(|m| (m.email.as_str(), m.role)).collect::<Vec<_>>(),
-        vec![(ALICE.0, MemberRole::Owner), (BOB.0, MemberRole::Editor)]
+        seen.members.iter().map(|m| (m.email.as_str(), m.name.as_str(), m.role)).collect::<Vec<_>>(),
+        vec![("", "alice", MemberRole::Owner), ("", "bob", MemberRole::Editor)]
     );
     assert_eq!(alice.cloud_share_invite(fx.store_id, fx.shared, ALICE.0, MemberRole::Editor).await.expect_err("one's own store").to_string(), "This is your own store; there is nothing to invite yourself to.");
 
@@ -1351,7 +1400,7 @@ async fn sharing_against_the_real_accounts_service() {
     let (mut b, bob, b_dir) = start_local_server().await;
     bob.cloud_sign_in(&cloud_url, &bob_email, password).await.expect("the member signs in");
     let rows = bob.cloud_list_hosted_stores().await.unwrap();
-    assert_eq!(rows.iter().map(|r| (r.root, r.name.as_str(), r.role.as_str(), r.shared_by.as_deref())).collect::<Vec<_>>(), vec![(Some(shared), "Holiday Plans", "editor", Some(alice_email.as_str()))]);
+    assert_eq!(rows.iter().map(|r| (r.root, r.name.as_str(), r.role.as_str(), r.shared_by.as_deref())).collect::<Vec<_>>(), vec![(Some(shared), "Holiday Plans", "editor", alice_email.split('@').next())]);
     let store = bob.cloud_add_hosted_store(store_id).await.expect("the share is added as a partial replica");
     assert_eq!((store.roots.clone(), store.name.as_str()), (vec![shared], "Holiday Plans"));
     assert!(wait_until(Duration::from_secs(15), || async { node_text(&bob, store_id, inside).await.contains("socks and a map") }).await, "read with the share's key");

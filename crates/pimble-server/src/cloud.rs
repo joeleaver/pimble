@@ -286,7 +286,8 @@ pub struct StoreView {
     /// grant. Defaulted so a service from before scopes still parses.
     #[serde(default)]
     pub root: Option<String>,
-    /// An owner's email when the account is not an owner of the store.
+    /// An owner's name in this share when the account is not an owner of
+    /// the store (an email from a service from before names).
     #[serde(default)]
     pub shared_by: Option<String>,
     /// [`TIER_HOSTED`] or [`TIER_RELAY`] (docs/RELAY_CONTRACT.md). Defaulted
@@ -558,7 +559,13 @@ pub struct MemberView {
     /// `None` for an invitation: there is no account to name yet.
     #[serde(default)]
     pub user_id: Option<String>,
+    /// `""` unless the caller is an owner of the store: members of a share
+    /// never see each other's emails (docs/PRESENCE_CONTRACT.md section 3).
     pub email: String,
+    /// What the member goes by in this scope; `None` for an invitation, and
+    /// from a service from before names.
+    #[serde(default)]
+    pub name: Option<String>,
     pub role: String,
     /// `"active"` (a grant) or `"invited"` (an invitation).
     pub status: String,
@@ -583,6 +590,81 @@ pub struct MembersResponse {
     /// The share's name; `None` for a whole-store listing.
     #[serde(default)]
     pub share_name: Option<String>,
+    /// Everyone who reaches the scope and the name they go by in it
+    /// (docs/PRESENCE_CONTRACT.md section 3). Empty from a service from
+    /// before names.
+    #[serde(default)]
+    pub people: Vec<PersonView>,
+}
+
+/// One account that reaches a scope, as any member of it sees them: an id
+/// and a name, never an email.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonView {
+    pub user_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub role: String,
+}
+
+// ── Names (docs/PRESENCE_CONTRACT.md section 3) ───────────────────────────
+
+/// `GET /api/v1/me`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MeView {
+    pub id: String,
+    pub email: String,
+    /// The default name chosen, `""` for none.
+    #[serde(default)]
+    pub display_name: String,
+    /// What the account is called where nothing more particular applies.
+    #[serde(default)]
+    pub name: String,
+}
+
+pub async fn me(base_url: &str, session: &str) -> Result<MeView> {
+    get(&endpoint(base_url, "/api/v1/me"), Some(session)).await
+}
+
+pub async fn put_display_name(base_url: &str, session: &str, display_name: &str) -> Result<()> {
+    let _: serde_json::Value = put(&endpoint(base_url, "/api/v1/me"), session, &serde_json::json!({ "display_name": display_name })).await?;
+    Ok(())
+}
+
+/// One row of `GET /api/v1/me/shares`: a share the account takes part in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareView {
+    pub store_id: String,
+    #[serde(default)]
+    pub root: Option<String>,
+    pub name: String,
+    pub role: String,
+    pub owned: bool,
+    #[serde(default)]
+    pub owner_name: Option<String>,
+    pub kind: String,
+    #[serde(default = "default_tier")]
+    pub tier: String,
+    /// The name chosen for this share, `""` for none.
+    #[serde(default)]
+    pub my_name: String,
+    pub appears_as: String,
+}
+
+impl ShareView {
+    pub fn scope_root(&self) -> Option<pimble_core::NodeId> {
+        self.root.as_deref().and_then(|r| pimble_core::NodeId::parse(r).ok())
+    }
+}
+
+pub async fn list_shares(base_url: &str, session: &str) -> Result<Vec<ShareView>> {
+    get(&endpoint(base_url, "/api/v1/me/shares"), Some(session)).await
+}
+
+pub async fn put_share_name(base_url: &str, session: &str, store_id: &str, root: Option<&pimble_core::NodeId>, name: &str) -> Result<()> {
+    let body = serde_json::json!({ "root": root.map(|r| r.to_string()), "name": name });
+    let _: serde_json::Value = put(&endpoint(base_url, &format!("/api/v1/me/shares/{store_id}")), session, &body).await?;
+    Ok(())
 }
 
 pub async fn list_members(base_url: &str, session: &str, store_id: &str, root: Option<&pimble_core::NodeId>) -> Result<MembersResponse> {

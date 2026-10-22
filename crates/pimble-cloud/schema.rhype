@@ -68,6 +68,12 @@ type User {
     // the field.
     recovery_token_hash: String
     recovery_token_expires_at: DateTime
+    // docs/PRESENCE_CONTRACT.md section 3: the name this person goes by
+    // wherever a share has no name of their own for them (`ShareName`), and
+    // on their own devices. Empty or absent until they choose one (absent on
+    // every row from before the field; read optional), when the local part
+    // of their email stands in.
+    display_name: String
 }
 
 type Session {
@@ -171,6 +177,23 @@ type Grant {
     user_rid: u64 @indexed
     store_rid: u64 @indexed
     store_uuid: String
+}
+
+// The name one person goes by in one share (docs/PRESENCE_CONTRACT.md
+// section 3, Joe 2026-10-22): what every other member of that share is shown
+// for them instead of their email. One row per (user, store, root), enforced
+// in the service like `Grant`'s; `root` is a node id for a share, the empty
+// string for a whole-store grant. Its own type rather than a `Grant` field
+// because an owner holds the store through one whole-store grant and still
+// has a name per share. No row (or an empty name) means `User.display_name`.
+type ShareName {
+    user: User
+    store: HostedStore
+    user_rid: u64 @indexed
+    store_rid: u64 @indexed
+    store_uuid: String
+    root: String
+    name: String
 }
 
 // Phase 2a (docs/CRYPTO_CONTRACT.md "Data model additions"): one row per
