@@ -10,19 +10,35 @@ as inline-blocks and whole-pixel rows (rinch #1426/#1762 are the real bugs), and
 and columns moved by dragging a grip (0.12.6). docs/SHEETS_CONTRACT.md section 3 has
 every one of them.
 
-**Uncommitted on `master`, ready for the next release (Joe: "Not yet"):** columns drag
-like rows. `sheets/moving.rs` `Slide`: what moves follows the pointer in the ghost's
-color and the columns (or a rotated table's records and fields) it passes slide aside,
-each neighbor's box learned from `ondragover` as the drag reaches it (rinch-web fills
-no `bounds_signal`); the grid itself takes a drop let go over the empty landing slot.
-Checked on the desktop over the debug port (a plain table's column, a rotated table's
-record and field); tests `cargo test -p pimble-app --release --lib moving` pass; the
-web build checks but was not tried in a browser. With the next release also move rinch
-to `main` 7b58166d or later: #1761 (a ContextMenu shifted back inside the window, PR
-#1765; Joe's menus were cut off at the bottom) is merged. Pimble's only menu CSS targets
-`.rinch-context-menu__dropdown`, which still exists; check a right-click near the top of
-a short window. Still open in rinch: #1764 (DropdownMenu/Popover edges), #1426/#1762
-(inline padding; the pill workaround stays), #1731 (paint does not follow damage).
+**On `master`, not released yet (Joe: "Not yet"; nothing pushed since v0.12.6):**
+
+- 67185d5, columns drag like rows. `sheets/moving.rs` `Slide`: what moves follows the
+  pointer in the ghost's color and the columns (or a rotated table's records and fields)
+  it passes slide aside, each neighbor's box learned from `ondragover` as the drag
+  reaches it (rinch-web fills no `bounds_signal`); the grid itself takes a drop let go
+  over the empty landing slot. Checked on the desktop over the debug port; the web build
+  checks but was not tried in a browser.
+- 4348c31, the explorer rework merged (branch `tree`, waves 1-3 of
+  docs/TREE_CONTRACT.md: drops before, into or after a row, the keyboard cursor,
+  multi-select with `moveNodes`). Node creation and transplants take a `Place` now.
+  1096 tests pass; a drop between rows and a Shift range checked in the desktop app.
+  The explorer's own wave 4 (undo) is still to come.
+
+With the next release also move rinch to `main` 7b58166d or later: #1761 (a ContextMenu
+shifted back inside the window, PR #1765; Joe's menus were cut off at the bottom) is
+merged. Pimble's only menu CSS targets `.rinch-context-menu__dropdown`, which still
+exists; check a right-click near the top of a short window. Still open in rinch: #1764
+(DropdownMenu/Popover edges), #1426/#1762 (inline padding; the pill workaround stays),
+#1731 (paint does not follow damage).
+
+**Not merged, on purpose:** branch `claude/relaxed-bassi-bdfa13` (2 commits, 2026-10-20):
+a picture file dropped on a desktop board's surface, and a preview while files are
+dragged over it. It needs rinch `RenderSurface::set_file_drops` and
+`SurfaceEvent::FileDragEnter/Over/Leave/FilesDropped`, from a rinch branch
+(`pimble/surface-file-drop`) that was never pushed; rinch main has none of it. Master
+already lands a dropped picture where it was let go (af431ff, rinch #1654), so only the
+drag preview is missing. To finish it: ask the Rinch session for surface file-drag
+events (a general mechanism), then rebase the second commit onto master.
 
 **Start here next: presence indicators** (Joe, 2026-10-22: before the next release).
 Nothing exists yet, in Pimble or in rinch's editor (no remote carets or selections).
