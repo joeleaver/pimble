@@ -85,7 +85,9 @@ data["sheet:<table id>"]: Map           one key of the node's `data` root per ta
     target  (link to a row: the table id),
     under   (link to a node: the parent node's (store, node), or absent for anywhere),
     formula (formula column: the stored formula, section 6),
-    format  (formula column: automatic | number | money | date | hours | percent)
+    format  (formula column: automatic | number | money | date | hours | percent),
+    width   (Number | absent: the column's width in pixels, section 4d)
+  "width:<result key>": Number | absent   a summary's result column's width (section 4d)
   rows:    Map<row id, Map>
     order: String (fractional)
     cells: Map<column id, value>
@@ -290,6 +292,35 @@ guide. Checked in the release desktop app (records as columns, summary columns, 
 record typed in with Enter going to its next field, grouped and collapsed, unrotated again)
 and in the browser on the local stack (rotated, a summary column). Copy waits for copy itself
 (section 11, wave 4).
+
+## 4d. Layout (2026-10-21)
+
+- **A column's width is the table's**, so everyone sees the same table: a plain number of
+  pixels, `width`, on the column's map (no container made on first use; last writer wins
+  per column, so two people resizing one column apart end with one of their widths, and
+  resizing different columns keeps both). A summary's result columns have no map of their
+  own: theirs is `width:<result key>` on the table's map (`k:<key>`, or a position for a
+  column written before keys), the same key a rename uses. Whole pixels, 40 to 2000. A
+  column with no width is as wide as its contents, at least 90px (what every table did
+  before widths). `SheetsTxn::set_column_width` / `set_result_width`; `None` clears it.
+- **Resizing**: drag a header's right edge (a 7px grip; a press on the rest of the
+  header still opens the column's settings). The column follows the pointer while the
+  drag lasts, in this pane only (`SheetUi::resizing`), and the width is written once,
+  when the drag ends, as one undoable edit. rinch's absolute `Drag` on both backends; the
+  starting width is the header cell's bounds in the press's click context.
+- **A cell's text stays in its cell**: a cell, a header, a summary row's name and value
+  and a group's label are one line, cut short with an ellipsis, never drawn over the next
+  column; the cell's tooltip holds the whole text (or its error). The cell itself does
+  not clip, so a link cell's choices still hang below it.
+- **The title row is one line.** The name, the kind, the row count and the buttons keep
+  their size and place; the formula bar (and a summary's formula) takes the width that is
+  left and scrolls inside itself, so a long formula never wraps the row, pushes the grid
+  or draws over it. The formula bar's sentence is cut short too, all of it in its tooltip.
+  The grid scrolls sideways inside the table when its columns are wider than the pane.
+
+- **A rotated table** (section 4c) is drawn as wide as its contents for now: a field's width
+  is a column's, and rotated the record columns have none of their own yet, so resizing
+  waits for a width that belongs to the rotated drawing.
 
 ## 5. Names, and what is unique
 

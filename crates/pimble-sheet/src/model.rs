@@ -122,6 +122,8 @@ pub struct ColumnSnap {
     pub name: String,
     pub order: String,
     pub ty: ColumnType,
+    /// Its width in pixels, when someone set one (contract "Layout").
+    pub width: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -247,6 +249,8 @@ pub struct TableSnap {
     /// Drawn with its fields down the left and each record as a column
     /// (contract section 4c); only the drawing turns.
     pub rotated: bool,
+    /// A summary's result columns' widths in pixels, by key.
+    pub result_widths: BTreeMap<ResultKey, f64>,
 }
 
 impl TableSnap {

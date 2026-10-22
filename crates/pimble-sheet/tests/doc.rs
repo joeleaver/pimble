@@ -1021,3 +1021,52 @@ fn a_table_is_rotated_and_turned_back() {
     send(update, &mut f.b);
     assert!(!Sheets::of_node(&f.b).table(&f.table).unwrap().rotated);
 }
+
+#[test]
+fn column_widths_are_plain_values_last_writer_wins() {
+    let mut f = fixture();
+    let (a, b) = (Sheets::of_node(&f.a), Sheets::of_node(&f.b));
+    assert_eq!(a.table(&f.table).unwrap().columns[0].width, None, "no width until someone sets one");
+
+    // A width is one value on the column's map: whole pixels, kept in bounds.
+    let (_, u) = a.edit(|t| t.set_column_width(&f.table, &f.name, Some(151.6))).into_result().unwrap();
+    send(u, &mut f.b);
+    assert_eq!(b.table(&f.table).unwrap().columns[0].width, Some(152.0), "everyone sees the table's width");
+    a.edit(|t| t.set_column_width(&f.table, &f.price, Some(3.0))).into_result().unwrap();
+    assert_eq!(a.table(&f.table).unwrap().columns[1].width, Some(MIN_COLUMN_WIDTH));
+
+    // Two devices resizing one column apart: one width wins on both; resizing
+    // different columns keeps both.
+    sync(&mut f.a, &mut f.b);
+    a.edit(|t| t.set_column_width(&f.table, &f.name, Some(200.0))).into_result().unwrap();
+    b.edit(|t| t.set_column_width(&f.table, &f.name, Some(300.0))).into_result().unwrap();
+    b.edit(|t| t.set_column_width(&f.table, &f.price, Some(90.0))).into_result().unwrap();
+    sync(&mut f.a, &mut f.b);
+    let (ta, tb) = (a.table(&f.table).unwrap(), b.table(&f.table).unwrap());
+    assert_eq!(ta, tb);
+    assert!(matches!(ta.columns[0].width, Some(w) if w == 200.0 || w == 300.0));
+    assert_eq!(ta.columns[1].width, Some(90.0));
+
+    // Clearing it goes back to as wide as the contents.
+    a.edit(|t| t.set_column_width(&f.table, &f.name, None)).into_result().unwrap();
+    assert_eq!(a.table(&f.table).unwrap().columns[0].width, None);
+
+    // A summary's result columns have no map: their widths sit on the
+    // table's map by key, and a copy of the table keeps every width.
+    let key = ResultKey::Key("name".into());
+    a.edit(|t| {
+        t.set_source(&f.table, Some("=SORT(x)"))?;
+        t.set_result_width(&f.table, &key, Some(120.0))
+    })
+    .into_result()
+    .unwrap();
+    let snap = a.table(&f.table).unwrap();
+    assert_eq!(snap.result_widths.get(&key), Some(&120.0));
+    let other = node();
+    let mut copy = snap.clone();
+    copy.id = "copy".into();
+    Sheets::of_node(&other).edit(|t| t.copy_table(&copy)).into_result().unwrap();
+    let copied = Sheets::of_node(&other).table("copy").unwrap();
+    assert_eq!(copied.result_widths, snap.result_widths);
+    assert_eq!(copied.columns[1].width, Some(90.0));
+}

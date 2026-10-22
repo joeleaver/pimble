@@ -291,6 +291,7 @@ impl TB {
                 summary_rows: Vec::new(),
                 group_by: None,
                 rotated: false,
+                result_widths: BTreeMap::new(),
             },
         }
     }
@@ -302,6 +303,7 @@ impl TB {
             name: name.to_string(),
             order,
             ty,
+            width: None,
         });
         self
     }
