@@ -1502,6 +1502,12 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             BackendEvent::AgentsListed { agents } => crate::agents::listed(store, agents),
             BackendEvent::AgentCreated { agent, key } => crate::agents::created(store, agent, key),
             BackendEvent::AgentsError { message } => crate::agents::failed(store, message),
+            BackendEvent::ServerInfo { version } => {
+                store.server_version.set(Some(match version {
+                    Some(v) => crate::state::ServerVersion::Known(v.clone()),
+                    None => crate::state::ServerVersion::Unknown,
+                }));
+            }
             BackendEvent::CloudStatusChanged { signed_in, email, user_id, url } => {
                 // Who board edits are stamped as (docs/IMAGE_MARKUP_CONTRACT.md
                 // section 6): the account, or nobody when signed out.

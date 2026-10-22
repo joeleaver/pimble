@@ -14,7 +14,7 @@ use std::time::Duration;
 use rinch::prelude::*;
 use serde::Deserialize;
 
-use crate::state::AppStore;
+use crate::state::{AppStore, UpdateStatus};
 
 /// The release feed: the accounts service's view of the latest GitHub release.
 const FEED: &str = "https://pimble.app/api/v1/releases";
@@ -303,29 +303,76 @@ thread_local! {
 }
 /// A version the checker staged, handed to the main thread.
 static STAGED: Mutex<Option<String>> = Mutex::new(None);
+/// Where checking stands, handed to the main thread for Help > About.
+static STATUS: Mutex<Option<UpdateStatus>> = Mutex::new(None);
+/// Wakes the checker for "Check Now".
+static WAKE: Mutex<Option<std::sync::mpsc::Sender<()>>> = Mutex::new(None);
+
+fn report(status: UpdateStatus) {
+    *STATUS.lock().unwrap() = Some(status);
+    run_on_main_thread(|| {
+        let Some(status) = STATUS.lock().unwrap().take() else { return };
+        if let Some(store) = STORE.with(Cell::get) {
+            store.update_status.set(status);
+        }
+    });
+}
+
+fn now_text() -> String {
+    chrono::Local::now().format("%-d %b %Y, %H:%M").to_string()
+}
+
+/// Help > About's "Check Now": run a check at once (in a managed install).
+pub fn check_now() {
+    if let Some(wake) = WAKE.lock().unwrap().as_ref() {
+        let _ = wake.send(());
+    }
+}
 
 /// Offer a staged update at once, and check in the background from now on.
 /// Does nothing outside a managed install.
 pub fn start(store: AppStore) {
-    let Some(dir) = managed_dir() else { return };
+    let Some(dir) = managed_dir() else {
+        store.update_status.set(UpdateStatus::NotInstalled);
+        return;
+    };
     STORE.with(|s| s.set(Some(store)));
+    store.update_status.set(UpdateStatus::Waiting);
     if let Some(version) = staged_version(&dir).filter(|v| newer_than_current(v)) {
-        store.update_ready.set(Some(version));
+        store.update_ready.set(Some(version.clone()));
+        store.update_status.set(UpdateStatus::Ready { version });
     }
+    let (wake, woken) = std::sync::mpsc::channel::<()>();
+    *WAKE.lock().unwrap() = Some(wake);
     std::thread::Builder::new()
         .name("pimble-update".into())
         .spawn(move || {
-            std::thread::sleep(FIRST_CHECK);
+            // The first check half a minute after start, then daily, or at
+            // once when asked.
+            let _ = woken.recv_timeout(FIRST_CHECK);
             loop {
+                report(UpdateStatus::Checking);
                 match check_and_stage(&dir) {
                     Ok(Some(version)) => {
-                        *STAGED.lock().unwrap() = Some(version);
+                        *STAGED.lock().unwrap() = Some(version.clone());
                         run_on_main_thread(deliver);
+                        report(UpdateStatus::Ready { version });
                     }
-                    Ok(None) => tracing::info!("update check: {CURRENT} is the latest"),
-                    Err(e) => tracing::warn!("update check: {e}"),
+                    // Nothing new to fetch, but one may already be waiting
+                    // for a restart: that stays what About offers.
+                    Ok(None) => match staged_version(&dir).filter(|v| newer_than_current(v)) {
+                        Some(version) => report(UpdateStatus::Ready { version }),
+                        None => {
+                            tracing::info!("update check: {CURRENT} is the latest");
+                            report(UpdateStatus::UpToDate { at: now_text() });
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("update check: {e}");
+                        report(UpdateStatus::Failed { reason: e, at: now_text() });
+                    }
                 }
-                std::thread::sleep(CHECK_EVERY);
+                let _ = woken.recv_timeout(CHECK_EVERY);
             }
         })
         .ok();

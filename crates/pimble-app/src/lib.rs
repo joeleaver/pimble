@@ -19,6 +19,7 @@
 //! as yrs bytes through `BroadcastChanges` and `RemoteChanges`, and never a
 //! document model in the sync path.
 
+pub mod about;
 pub mod agents;
 pub mod app;
 #[cfg(feature = "native")]

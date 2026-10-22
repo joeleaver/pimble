@@ -79,6 +79,28 @@ checks the version of a server it finds and takes the port over from an older
 one, or names the process to quit when it is too old to ask (docs/MCP_CONTRACT.md
 "Which server it talks to").
 
+## Help > About (2026-10-21)
+
+Help > About (`crates/pimble-app/src/about.rs`, both apps) says this app's version, the
+version of the server it talks to (an older one says so: the server belongs to whichever
+local client started it, docs/MCP_CONTRACT.md "Which server it talks to"), and where
+keeping it current stands (`AppStore::update_status`, reported by the checker):
+
+- not the installed app (a development build, or run from where it was unpacked): it does
+  not update itself;
+- waiting for the first check, half a minute after start; checking;
+- up to date, with when it last checked (it checks daily);
+- a newer version downloaded and checked: "Restart to Update" installs it and restarts, the
+  same as the status bar's "Restart to update to <version>"; a staged update stays offered
+  after later checks find nothing newer to fetch;
+- the last check failed, with the reason and when.
+
+"Check Now" runs a check at once (it wakes the daily wait). The browser's About says it is
+the web app, which loads the version pimble.app serves on every visit. Checked in the
+release build as a scratch managed copy (up to date after Check Now; a staged 0.12.9
+offered after the first check, and Restart to Update moving it into place and restarting)
+and in the browser on the local stack.
+
 ## Signing
 
 CI's release job signs every package with `openssl pkeyutl -sign -rawin` (pure

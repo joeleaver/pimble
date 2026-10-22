@@ -670,6 +670,11 @@ pub async fn process_command(
             }
         }
 
+        BackendCommand::ServerInfo => {
+            let c = client.as_ref()?;
+            Some(BackendEvent::ServerInfo { version: c.server_info().await.ok().map(|i| i.version) })
+        }
+
         BackendCommand::CloudStatus => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::Status, message: "Not connected".into() });

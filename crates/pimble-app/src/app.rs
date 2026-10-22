@@ -3521,6 +3521,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             store.account_modal_busy.set(true);
             store.send(BackendCommand::CloudSignIn { url, email, password });
         };
+        let about_modal = crate::about::render_about(__scope, store);
         let account_modal = rsx! {
             Modal {
                 opened_fn: move || store.account_modal_open.get(),
@@ -4576,6 +4577,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {mount_picker_modal}
                 {appearance_modal}
                 {account_modal}
+                {about_modal}
                 {host_modal}
                 {stop_relay_modal}
                 {hosted_modal}
@@ -4607,6 +4609,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {mount_picker_modal}
                 {appearance_modal}
                 {account_modal}
+                {about_modal}
                 {host_modal}
                 {stop_relay_modal}
                 {hosted_modal}

@@ -224,6 +224,8 @@ pub enum BackendCommand {
     RemoveAgent { id: String },
 
     /// Whether an account is signed in, and as whom (`CloudStatusChanged`).
+    /// The server's version, for Help > About. Answers with `ServerInfo`.
+    ServerInfo,
     CloudStatus,
     /// Sign in to the accounts service at `url` (`CloudStatusChanged` with
     /// `signed_in: true`, or `CloudError { op: SignIn }`).
@@ -483,6 +485,9 @@ pub enum BackendEvent {
     /// The answer to `CloudStatus`, `CloudSignIn` (`signed_in: true`) and
     /// `CloudSignOut` (`signed_in: false`).
     /// `user_id` is the account's `sub`, what board edits are stamped with.
+    /// What `ServerInfo` asked: the server's version, `None` for a server
+    /// from before 0.12.2, which has no `serverInfo`.
+    ServerInfo { version: Option<String> },
     CloudStatusChanged { signed_in: bool, email: Option<String>, user_id: Option<String>, url: Option<String> },
     /// A cloud request failed; `op` says which, so the error lands in the
     /// modal that sent it.

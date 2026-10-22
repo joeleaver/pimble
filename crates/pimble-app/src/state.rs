@@ -956,6 +956,11 @@ pub struct AppStore {
     /// A verified update staged beside a managed install, waiting for "Restart
     /// to update" (docs/UPDATE_CONTRACT.md); `None` everywhere else.
     pub update_ready: Signal<Option<String>>,
+    /// Help > About (`about.rs`): whether it is open, where updating stands,
+    /// and the version of the server this window talks to.
+    pub about_open: Signal<bool>,
+    pub update_status: Signal<UpdateStatus>,
+    pub server_version: Signal<Option<ServerVersion>>,
 
     /// A followed link's target, for `app.rs` to open with `open_node` (the
     /// one way to open a node): its tree value and, for a deep link, the
@@ -1236,6 +1241,9 @@ impl AppStore {
             owner_offline: Signal::new(HashSet::new()),
             notice: Signal::new(String::new()),
             update_ready: Signal::new(None),
+            about_open: Signal::new(false),
+            update_status: Signal::new(UpdateStatus::NotInstalled),
+            server_version: Signal::new(None),
             link_open: Signal::new(None),
             nav_step: Signal::new(None),
             agents_ui: crate::agents::AgentsUi::new(),
@@ -3213,4 +3221,30 @@ mod tests {
         assert_eq!(app.shown_roots(store_id), vec![app.root_node_id(store_id).unwrap()]);
         assert_eq!(app.store_row_node(store_id), app.root_node_id(store_id));
     }
+}
+
+/// Where keeping this copy current stands (docs/UPDATE_CONTRACT.md), as
+/// Help > About shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpdateStatus {
+    /// Not the installed app (a development build, a copy run from where it
+    /// was unpacked, the browser): nothing updates it.
+    NotInstalled,
+    /// The first check runs half a minute after start.
+    Waiting,
+    Checking,
+    /// The last check found nothing newer; when it ran, as shown.
+    UpToDate { at: String },
+    /// A newer version is downloaded, checked and waiting for a restart.
+    Ready { version: String },
+    /// The last check failed; the reason and when.
+    Failed { reason: String, at: String },
+}
+
+/// What the server this window talks to says it is.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ServerVersion {
+    Known(String),
+    /// A server from before 0.12.2, which does not say.
+    Unknown,
 }
