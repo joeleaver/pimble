@@ -43,7 +43,7 @@ pub use doc::{
 };
 pub use model::*;
 pub use paint::pressure_width;
-pub use options::{author_color, CardLabel, ViewOptions, UNAUTHORED_COLOR};
+pub use options::{author_color, author_color_index, CardLabel, ViewOptions, UNAUTHORED_COLOR};
 pub use render::{
     draw_region, render, render_area, render_extent, selection_bounds, NoPictures, Picture, PictureSource, Rendered,
     RgbaImage, View, MAX_EXTENT_PX,

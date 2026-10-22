@@ -7,12 +7,17 @@
 //! changes, one every heartbeat while it holds it, and a goodbye when it lets
 //! go. What others send arrives as `PresenceFrame` events and is held until
 //! its session says goodbye or goes quiet. Nothing here is stored.
+//!
+//! Where people are in a note's text, their carets and selections, is
+//! [`text`].
+
+pub mod text;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 
 use pimble_core::{NodeId, StoreId};
-use pimble_rpc::{PresenceBody, PresenceFrame, PresenceWho, PRESENCE_HEARTBEAT_MS};
+use pimble_rpc::{PresenceBody, PresenceFrame, PresenceWho, TextPresence, PRESENCE_HEARTBEAT_MS};
 use rinch::prelude::*;
 
 use crate::panes::PaneId;
@@ -26,6 +31,11 @@ pub struct Present {
     pub who: Option<PresenceWho>,
     pub device: String,
     pub focused: bool,
+    /// Where it is in the note's text.
+    pub text: Option<TextPresence>,
+    /// When its caret last moved (milliseconds since the epoch): its flag
+    /// names it for a while after.
+    pub moved_ms: f64,
     /// When it lapses without another frame (milliseconds since the epoch).
     pub expires_ms: f64,
 }
@@ -42,6 +52,18 @@ pub struct Person {
     pub color: String,
     /// Name and devices, for the hover.
     pub title: String,
+}
+
+/// Who one session is, as a caret's flag shows them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Identity {
+    /// What sessions of one person share (see [`Person::key`]).
+    pub key: String,
+    pub name: String,
+    /// `#rrggbb`.
+    pub color: String,
+    /// Which of the ten author colors it is.
+    pub color_index: usize,
 }
 
 thread_local! {
@@ -73,16 +95,25 @@ fn say(store: AppStore, now: HashMap<PaneId, (StoreId, NodeId, bool)>) {
     let before = SAID.with(|said| said.borrow().clone());
     for (pane, (store_id, node_id, _)) in &before {
         if now.get(pane).is_none_or(|(s, n, _)| (s, n) != (store_id, node_id)) {
-            store.send(BackendCommand::PublishPresence { store_id: *store_id, node_id: *node_id, pane: pane.index(), focused: false, left: true });
+            store.send(BackendCommand::PublishPresence { store_id: *store_id, node_id: *node_id, pane: pane.index(), focused: false, left: true, text: None });
+            text::forget_sent(*pane);
         }
     }
+    SAID.with(|said| *said.borrow_mut() = now.clone());
     for (pane, held) in &now {
         if before.get(pane) != Some(held) {
             let (store_id, node_id, focused) = *held;
-            store.send(BackendCommand::PublishPresence { store_id, node_id, pane: pane.index(), focused, left: false });
+            let text = text::take_mine(store, *pane);
+            store.send(BackendCommand::PublishPresence { store_id, node_id, pane: pane.index(), focused, left: false, text });
         }
     }
-    SAID.with(|said| *said.borrow_mut() = now);
+}
+
+/// Say again where pane `pane` is, its text part being `text` (its caret
+/// moved): nothing when the pane holds no document.
+pub(crate) fn publish_text(store: AppStore, pane: PaneId, text: Option<TextPresence>) {
+    let Some((store_id, node_id, focused)) = SAID.with(|said| said.borrow().get(&pane).copied()) else { return };
+    store.send(BackendCommand::PublishPresence { store_id, node_id, pane: pane.index(), focused, left: false, text });
 }
 
 /// Every heartbeat: say it all again, and let go of whoever went quiet.
@@ -90,7 +121,8 @@ fn heartbeat(store: AppStore) {
     let _ = set_timeout(PRESENCE_HEARTBEAT_MS as u32, move || {
         let held = SAID.with(|said| said.borrow().clone());
         for (pane, (store_id, node_id, focused)) in held {
-            store.send(BackendCommand::PublishPresence { store_id, node_id, pane: pane.index(), focused, left: false });
+            let text = text::take_mine(store, pane);
+            store.send(BackendCommand::PublishPresence { store_id, node_id, pane: pane.index(), focused, left: false, text });
         }
         prune(store);
         heartbeat(store);
@@ -104,21 +136,35 @@ pub(crate) fn received(store: AppStore, frame: &PresenceFrame) {
     let now = crate::boards::now_ms();
     store.presence.update(|all| {
         // A session holds one document: wherever it was, it is not now.
-        for sessions in all.values_mut() {
-            sessions.retain(|p| p.session != frame.session);
+        let mut before: Option<Present> = None;
+        for ((s, d), sessions) in all.iter_mut() {
+            if let Some(i) = sessions.iter().position(|p| p.session == frame.session) {
+                let held = sessions.remove(i);
+                if (*s, *d) == (frame.store_id, frame.doc_id) {
+                    before = Some(held);
+                }
+            }
         }
         if !frame.left {
             let body = PresenceBody::decode(&frame.body).unwrap_or_default();
+            let caret = |text: &Option<TextPresence>| text.as_ref().map(|t| (t.caret.clone(), t.anchor.clone()));
+            let moved_ms = match &before {
+                Some(held) if caret(&held.text) == caret(&body.text) => held.moved_ms,
+                _ => now,
+            };
             all.entry((frame.store_id, frame.doc_id)).or_default().push(Present {
                 session: frame.session.clone(),
                 who: frame.who.clone(),
                 device: body.device,
                 focused: body.focused,
+                text: body.text,
+                moved_ms,
                 expires_ms: now + frame.ttl_ms as f64,
             });
         }
         all.retain(|_, sessions| !sessions.is_empty());
     });
+    text::frames_changed(store);
 }
 
 /// Drop the sessions that went quiet, and everything of a store that closed.
@@ -132,12 +178,14 @@ pub(crate) fn prune(store: AppStore) {
             }
             all.retain(|_, sessions| !sessions.is_empty());
         });
+        text::frames_changed(store);
     }
 }
 
 /// Forget a store's presence (it closed here).
 pub(crate) fn forget_store(store: AppStore, store_id: StoreId) {
     store.presence.update(|all| all.retain(|(s, _), _| *s != store_id));
+    text::frames_changed(store);
 }
 
 /// The people in `(store_id, node_id)`, tracked: one per account (an agent
@@ -150,25 +198,15 @@ pub fn people_in(store: AppStore, store_id: StoreId, node_id: NodeId) -> Vec<Per
     let me = crate::boards::current_author().map(|a| a.id);
     let mut people: Vec<(Person, Vec<String>)> = Vec::new();
     for p in sessions {
-        let key = match &p.who {
-            Some(PresenceWho { sub, agent: Some(agent) }) => format!("{sub}/agent/{agent}"),
-            Some(PresenceWho { sub, agent: None }) if !sub.is_empty() => sub.clone(),
-            _ => p.session.clone(),
-        };
+        let key = person_key(&p);
         if let Some((_, devices)) = people.iter_mut().find(|(person, _)| person.key == key) {
             if !devices.contains(&p.device) {
                 devices.push(p.device.clone());
             }
             continue;
         }
-        let name = name_of(store, store_id, node_id, &p, me.as_deref());
-        let color_key = match &p.who {
-            Some(w) if w.agent.is_some() => key.clone(),
-            Some(w) if !w.sub.is_empty() => w.sub.clone(),
-            _ => key.clone(),
-        };
-        let c = pimble_board::author_color(&color_key);
-        let person = Person { initials: initials(&name), color: format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b), title: String::new(), name, key };
+        let who = identity(store, store_id, node_id, &p, me.as_deref());
+        let person = Person { initials: initials(&who.name), color: who.color, title: String::new(), name: who.name, key };
         people.push((person, vec![p.device.clone()]));
     }
     let mut out: Vec<Person> = people
@@ -181,6 +219,29 @@ pub fn people_in(store: AppStore, store_id: StoreId, node_id: NodeId) -> Vec<Per
         .collect();
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.key.cmp(&b.key)));
     out
+}
+
+/// What sessions of one person share: their account, an agent apart from
+/// its account, the session itself for someone signed out.
+fn person_key(p: &Present) -> String {
+    match &p.who {
+        Some(PresenceWho { sub, agent: Some(agent) }) => format!("{sub}/agent/{agent}"),
+        Some(PresenceWho { sub, agent: None }) if !sub.is_empty() => sub.clone(),
+        _ => p.session.clone(),
+    }
+}
+
+/// Who session `p` in `(store_id, node_id)` is: their name there and their
+/// color (`author_color` of the account, so the same on every device).
+pub fn identity(store: AppStore, store_id: StoreId, node_id: NodeId, p: &Present, me: Option<&str>) -> Identity {
+    let key = person_key(p);
+    let name = name_of(store, store_id, node_id, p, me);
+    let color_key = match &p.who {
+        Some(w) if w.agent.is_none() && !w.sub.is_empty() => w.sub.clone(),
+        _ => key.clone(),
+    };
+    let c = pimble_board::author_color(&color_key);
+    Identity { key, name, color: format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b), color_index: pimble_board::author_color_index(&color_key) }
 }
 
 /// What someone is called here (docs/PRESENCE_CONTRACT.md section 3): the
@@ -217,8 +278,8 @@ pub fn initials(name: &str) -> String {
 
 /// The frame pane `pane` of client `client_id` says, in plain words (an
 /// encrypted store's is sealed by whoever sends it on).
-pub fn frame_for(client_id: &str, store_id: StoreId, node_id: NodeId, pane: usize, focused: bool, left: bool) -> PresenceFrame {
-    let body = if left { String::new() } else { PresenceBody { device: device_label(), focused }.encode() };
+pub fn frame_for(client_id: &str, store_id: StoreId, node_id: NodeId, pane: usize, focused: bool, left: bool, text: Option<TextPresence>) -> PresenceFrame {
+    let body = if left { String::new() } else { PresenceBody { device: device_label(), focused, text }.encode() };
     PresenceFrame {
         store_id,
         doc_id: node_id,

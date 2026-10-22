@@ -1,6 +1,6 @@
 # Presence contract: who is here, and where
 
-Status: **waves 0 (names) and 1 (transport, who is here) built on branch `presence`, 2026-10-22; waves 2 to 5 not built.** Written from Joe's answers that day (listed
+Status: **waves 0 (names), 1 (transport, who is here) and 2 (carets and selections in text) built on branch `presence`, 2026-10-22; waves 3 to 5 not built.** Written from Joe's answers that day (listed
 under "Decisions" at the end). The points under "To confirm" are design choices made here
 that Joe has not seen yet. Section 3 (names per share) was added later the same day.
 
@@ -482,3 +482,94 @@ Each wave is checked in the desktop app and in the browser on the local stack
   sealing.
 - The pane's initials sit at the right end of the strip, beside the split buttons,
   because the name takes the free width.
+
+## Built in wave 2 (carets and selections in text), 2026-10-22, branch `presence`
+
+**Wire** (`pimble-rpc`):
+- `PresenceBody.text: Option<TextPresence>` (serde default, skipped when `None`, so wave 1
+  bodies parse and wave 1 readers ignore it).
+- `TextPresence { caret, anchor, viewport_top }`, each a base64url sticky index from
+  rinch `collab_sticky_index_with(_, After)` into the node's `content`. `anchor` is only
+  there when something is selected (`TextPresence::new` drops one equal to the caret).
+- The app's `BackendCommand::PublishPresence` carries `text`, and `presence::frame_for`
+  puts it in the body, so desktop and web build frames on one path. The browser seals
+  the whole body as before.
+- The CLI's `presence` says "a caret in the text" or "a selection in the text".
+
+**Saying where this window is** (`crates/pimble-app/src/presence/text.rs`):
+- `mine(pane)` is the pane's selection as sticky indexes. It is `None` for a pane
+  that holds no note, is not collaborating, or may only read it and has nothing
+  selected.
+- `moved` is called from the editor's `on_selection_change`, and once a note opens.
+  It sends a frame only when the text changed, at most one per 50 ms: a move inside
+  the gap waits for its end, and the frame then says where the caret is by then.
+- `presence::say` and the heartbeat carry the current text too.
+
+**Showing everyone else**:
+- `redraw(pane)` resolves the carets and anchors of every session in the pane's note
+  with one `collab_locate_sticky_many`.
+- `place` turns those answers into positions:
+  - a caret whose block is gone is at rinch's nearest place, dimmed;
+  - a caret that does not resolve at all (an edit not merged yet) is drawn at the
+    last place it resolved in this pane, clamped and dimmed;
+  - a caret never seen is not drawn;
+  - a selection needs both ends.
+- A caret is a 2 px bar in `author_color(sub)`, placed with `position: fixed` at
+  `caret_rect` in the window frame, as the picture controls are. Carets scrolled out
+  of the text's box are not drawn.
+  - The flag above it shows the name for 3 s after the caret moves
+    (`Present.moved_ms`, set when a frame brings a different caret or anchor), then
+    the initials. Hovering it gives the name and device.
+- A selection is an `Inline` decoration with `pimble-presence-selection
+  pimble-presence--c{n}`, where `n` is `pimble_board::author_color_index`.
+  - It comes from `PresencePlugin`, added to every pane's editor beside the links
+    and pictures plugins.
+  - Ranges are handed over in a meta-only transaction (`EditorHandle::update`, which
+    a read-only editor accepts because it changes nothing). They are mapped through
+    every later transaction until the next arrive, and clamped to the document.
+- The carets are read again a turn after each of these (`redraw_later`, once however
+  many ask):
+  - a frame arrives or lapses;
+  - a peer's edit to the note is applied (`editor::apply_remote`);
+  - the pane's own caret moves (`on_caret_moved`: typing shifts carets along its
+    line);
+  - the text scrolls;
+  - the margin reports.
+- The carets are margin anchors (key `presence`, combined with the discussions' in
+  `discussions/margin.rs` `give`), so a reflow that moves their lines (a peer's
+  edit above, a resize) is reported like a discussion marker's line. The markers
+  skip that key.
+- No rinch change was needed: `caret_rect`, the margin report, decorations and
+  `update` covered it.
+
+**Tests**:
+- `presence_body_round_trips_with_text` (`pimble-rpc`): the round trip, a wave 1 body,
+  and a selection of nothing.
+- `presence::text` tests: `place` for resolved, gone, unseen and half-resolved
+  positions.
+- `a_peers_caret_and_selection_resolve_and_follow_edits`: a sticky index made by one
+  editor is found by a collaborating peer's, follows typing on both sides through a
+  body round trip, and the plugin draws the selection given and carries it through an
+  edit.
+
+**Checked on the local stack** (2026-10-22): Alice's desktop app (17491) and Bob's
+browser in the shared "Holiday Plans" note.
+- Bob's page showed Alice's caret with an "A" flag at the start of the line. When she
+  selected "Sunday" on the desktop, his page drew `pimble-presence--c7` over "Sunday"
+  and her caret at its start; the flag's hover read "alice, on joe-laptop".
+- Bob's selection drew in Alice's pane as a brown tint with his caret and a "B" flag.
+- Alice typed "Note: " at the start of the line, and Bob's caret moved along with the
+  words.
+- Bob typed, and Alice's flag read "bob", then "B" about 3 s later.
+- When Alice's caret moved after her typing, Bob's page followed it, and her selection
+  was gone.
+- Not tried by hand: a read-only member's pane, a caret dimmed by a deleted paragraph
+  (unit-tested), and two windows of the desktop app.
+
+**Gaps:**
+- `viewport_top` is never filled. Finding the first position in view needs a point
+  hit-test the editor does not offer. Follow (wave 4) needs it, so it waits for that
+  wave.
+- Clicking a caret's flag does nothing yet; following is wave 4.
+- In the browser the text's box is found by `data-pimble-text` and
+  `getBoundingClientRect`, since rinch-web fills no bounds.

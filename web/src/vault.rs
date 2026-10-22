@@ -1343,8 +1343,8 @@ impl VaultClient {
             // Presence rides the store's own subscription (`subscribe`), made
             // again on every new socket; a pane's frame goes out sealed.
             BackendCommand::SubscribePresence { .. } => None,
-            BackendCommand::PublishPresence { store_id, node_id, pane, focused, left } => {
-                self.publish_presence(client, store_id, node_id, pane, focused, left).await;
+            BackendCommand::PublishPresence { store_id, node_id, pane, focused, left, text } => {
+                self.publish_presence(client, store_id, node_id, pane, focused, left, text).await;
                 None
             }
 
@@ -2414,8 +2414,9 @@ impl VaultClient {
 
     /// Say where pane `pane` is, its body sealed under the document's data
     /// key: the server holds which document and who, never what it says.
-    async fn publish_presence(&mut self, client: &Arc<PimbleClient>, store_id: StoreId, node_id: NodeId, pane: usize, focused: bool, left: bool) {
-        let mut frame = pimble_app::presence::frame_for(&self.client_id, store_id, node_id, pane, focused, left);
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_presence(&mut self, client: &Arc<PimbleClient>, store_id: StoreId, node_id: NodeId, pane: usize, focused: bool, left: bool, text: Option<pimble_rpc::TextPresence>) {
+        let mut frame = pimble_app::presence::frame_for(&self.client_id, store_id, node_id, pane, focused, left, text);
         if !left {
             let Some(store) = self.stores.get_mut(&store_id) else { return };
             let Some((key_id, key)) = store.keys.encrypt_key(store_id, node_id) else { return };

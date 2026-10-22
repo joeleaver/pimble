@@ -267,7 +267,10 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
             class: "pimble-editor__content-wrap",
             // Hidden under a picture's board view while it is marked up.
             style: {move || if state.show_editor.get() && !state.show_board.get() && !state.show_sheet.get() { "" } else { "display: none;" }},
-            onscroll: move |_| crate::text_boards::scrolled(store, pane),
+            onscroll: move |_| {
+                crate::text_boards::scrolled(store, pane);
+                crate::presence::text::redraw_later(store, pane);
+            },
             // A board node's row dropped on the text goes in as a picture
             // of it (docs/IMAGE_MARKUP_CONTRACT.md section 2).
             ondrop: move || {
@@ -281,6 +284,31 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
     // Where the text is on screen: the controls over a picture stay inside
     // it, and a board in text is drawn no wider than it.
     crate::text_boards::set_text_bounds(pane, content_wrap.bounds_signal());
+    // The browser finds the text's box by this (rinch-web fills no bounds).
+    content_wrap.set_attribute("data-pimble-text", &pane.index().to_string());
+
+    // Other people's carets in the text (docs/PRESENCE_CONTRACT.md section
+    // 4), in the window frame the editor answers `caret_rect` in.
+    let carets = crate::presence::text::watch(pane);
+    let presence_carets = rsx! {
+        div {
+            class: "pimble-presence-carets",
+            for caret in carets.get() {
+                div {
+                    // A keyed row is drawn once: everything it shows is in its key.
+                    key: format!("{} {} {} {} {}", caret.session, caret.class, caret.style, caret.label, caret.title),
+                    class: caret.class,
+                    style: caret.style.clone(),
+                    span {
+                        class: "pimble-presence-caret__flag",
+                        style: caret.flag_style.clone(),
+                        title: caret.title.clone(),
+                        {caret.label.clone()}
+                    }
+                }
+            }
+        }
+    };
 
     let empty_icon = render_tabler_icon(__scope, TablerIcon::FileText, TablerIconStyle::Outline);
     let hint_lines: Vec<NodeHandle> = hints
@@ -415,6 +443,7 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
             {discussion_view}
             {discussions_panel}
             {picture_controls}
+            {presence_carets}
             div {
                 class: "pimble-empty-state",
                 style: {move || if state.show_editor.get() || state.show_board.get() || state.show_sheet.get() || state.show_discussion.get() { "display: none;" } else { "" }},

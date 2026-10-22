@@ -254,8 +254,9 @@ pub enum BackendCommand {
     /// Who is who in a store's shares (`PeopleLoaded`).
     GetPeople { store_id: StoreId },
     /// Say where pane `pane` is (docs/PRESENCE_CONTRACT.md): it holds
-    /// `node_id`, or, `left`, lets it go. The backend makes the frame.
-    PublishPresence { store_id: StoreId, node_id: NodeId, pane: usize, focused: bool, left: bool },
+    /// `node_id`, or, `left`, lets it go; `text` is where it is in a note's
+    /// text. The backend makes the frame.
+    PublishPresence { store_id: StoreId, node_id: NodeId, pane: usize, focused: bool, left: bool, text: Option<pimble_rpc::TextPresence> },
     /// Hear who else is in the store's documents (`PresenceFrame`s, the ones
     /// already there first).
     SubscribePresence { store_id: StoreId },

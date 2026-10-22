@@ -49,6 +49,9 @@ thread_local! {
     static INLINE_SHOWN: Cell<Option<Signal<u64>>> = const { Cell::new(None) };
     /// The anchors each pane's editor was last given.
     static GIVEN: RefCell<[Vec<(NodeId, Vec<u8>)>; crate::panes::MAX_PANES]> = RefCell::new(Default::default());
+    /// Other people's carets in each pane's note: anchors too, so the editor
+    /// says when their lines move (docs/PRESENCE_CONTRACT.md section 4).
+    static PRESENCE: RefCell<[Vec<Vec<u8>>; crate::panes::MAX_PANES]> = RefCell::new(Default::default());
 }
 
 fn inline_shown() -> Signal<u64> {
@@ -102,7 +105,14 @@ pub(crate) fn watch(store: AppStore, pane: PaneId) -> impl Fn() -> Vec<Marker> +
     let held: Signal<Option<StoreId>> = Signal::new(None);
     let editor = crate::editor::editor(pane);
     editor.on_margin_layout(move |reported: &[MarginLine]| {
-        lines.set(reported.to_vec());
+        let key = crate::presence::text::MARGIN_KEY;
+        if reported.iter().any(|line| line.key == key) || PRESENCE.with(|p| !p.borrow()[pane.index()].is_empty()) {
+            crate::presence::text::redraw_later(store, pane);
+        }
+        let reported: Vec<MarginLine> = reported.iter().filter(|line| line.key != key).cloned().collect();
+        if untracked(|| lines.get()) != reported {
+            lines.set(reported);
+        }
         right.set(crate::editor::editor(pane).margin_text_right().unwrap_or(0.0));
     });
     let _ = rinch::Effect::new(move || {
@@ -123,11 +133,33 @@ pub(crate) fn watch(store: AppStore, pane: PaneId) -> impl Fn() -> Vec<Marker> +
             if list.is_empty() {
                 lines.set(Vec::new());
             }
-            let anchors = list.into_iter().map(|(id, sticky)| MarginAnchor::sticky(id.to_string(), sticky)).collect();
-            untracked(|| crate::editor::editor(pane).set_margin_anchors(anchors));
+            untracked(|| give(pane));
         }
     });
     move || markers(store, held.get(), &lines.get(), right.get())
+}
+
+/// Pane `pane`'s editor's anchors: its discussions' and the carets of
+/// whoever else is in its note.
+fn give(pane: PaneId) {
+    let mut anchors: Vec<MarginAnchor> = GIVEN.with(|given| given.borrow()[pane.index()].iter().map(|(id, sticky)| MarginAnchor::sticky(id.to_string(), sticky.clone())).collect());
+    PRESENCE.with(|p| anchors.extend(p.borrow()[pane.index()].iter().map(|sticky| MarginAnchor::sticky(crate::presence::text::MARGIN_KEY, sticky.clone()))));
+    crate::editor::editor(pane).set_margin_anchors(anchors);
+}
+
+/// The carets of others in pane `pane`'s note changed.
+pub(crate) fn set_presence_anchors(pane: PaneId, stickies: Vec<Vec<u8>>) {
+    let changed = PRESENCE.with(|p| {
+        let slot = &mut p.borrow_mut()[pane.index()];
+        if *slot == stickies {
+            return false;
+        }
+        *slot = stickies;
+        true
+    });
+    if changed {
+        give(pane);
+    }
 }
 
 /// One marker per line the reported anchors are on, top to bottom.

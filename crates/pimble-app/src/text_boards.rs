@@ -285,7 +285,7 @@ pub(crate) fn set_text_bounds(pane: PaneId, bounds: Signal<rinch::core::ElementB
     TEXT_BOUNDS.with(|b| b.borrow_mut()[pane.index()] = Some(bounds));
 }
 
-fn text_bounds(pane: PaneId) -> Option<Signal<rinch::core::ElementBounds>> {
+pub(crate) fn text_bounds(pane: PaneId) -> Option<Signal<rinch::core::ElementBounds>> {
     TEXT_BOUNDS.with(|b| b.borrow()[pane.index()])
 }
 

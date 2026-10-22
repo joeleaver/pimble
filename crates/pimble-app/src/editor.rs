@@ -52,6 +52,8 @@ pub(crate) fn editor(pane: PaneId) -> EditorHandle {
                 handle.add_plugin(std::rc::Rc::new(crate::links::LinksPlugin { pane }));
                 // After the links plugin: a pasted link is claimed there.
                 handle.add_plugin(std::rc::Rc::new(crate::pictures::PicturesPlugin { pane }));
+                // Other people's selections (docs/PRESENCE_CONTRACT.md section 4).
+                handle.add_plugin(std::rc::Rc::new(crate::presence::text::PresencePlugin));
                 // Typing, commands and remote deltas all land here; the
                 // toolbar's active states follow immediately (cursor-only
                 // moves are covered by the toolbar's own watcher).
@@ -191,12 +193,17 @@ pub(crate) fn start_editing(
         if store.focused() == pane {
             crate::link_picker::selection_changed(store, &editor(pane));
         }
+        // Where this pane is, said to everyone else in the note.
+        crate::presence::text::moved(store, pane);
     });
     handle.on_caret_moved(move || {
         if store.focused() == pane {
             crate::link_picker::caret_moved(store, &editor(pane));
         }
         crate::places::moved(store, pane);
+        // Typing shifts other people's carets along its line, which no
+        // margin report says.
+        crate::presence::text::redraw_later(store, pane);
     });
 
     // Every local edit's delta is base64-broadcast to the server, which persists it
@@ -311,6 +318,10 @@ pub(crate) fn start_editing(
 
     // A different document is under the toolbar now.
     crate::toolbar::bump_toolbar(pane);
+    // Where this pane is in it, and where everyone else is
+    // (docs/PRESENCE_CONTRACT.md section 4).
+    crate::presence::text::moved(store, pane);
+    crate::presence::text::redraw_later(store, pane);
 }
 
 /// Stop editing pane `pane`'s node (detach the collab session). Nothing to do
@@ -493,6 +504,7 @@ fn doc_text(handle: &EditorHandle) -> String {
 pub(crate) fn apply_remote(store: AppStore, store_id: StoreId, node_id: NodeId, bytes: &[u8]) {
     for pane in store.panes_editing(store_id, node_id) {
         editor(pane).collab_receive(bytes);
+        crate::presence::text::redraw_later(store, pane);
     }
 }
 

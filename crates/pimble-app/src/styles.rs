@@ -1866,6 +1866,56 @@ pub(crate) const APP_CSS: &str = "
 /* Over a picture in text (docs/IMAGE_MARKUP_CONTRACT.md section 5): a box
    the size of the picture that lets the pointer through to the editor, with
    the controls in its top-right corner. */
+/* Other people's carets in the text (presence/text.rs): a 2 px bar in
+   their color at the editor's caret_rect, with a flag naming them for a
+   while after it moves, then their initials. Dimmed while its place is
+   gone. Selections are an inline decoration, one class per author color
+   (pimble_board's palette, in order). */
+.pimble-presence-carets {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 0;
+    height: 0;
+    z-index: 35;
+    pointer-events: none;
+}
+
+.pimble-presence-caret {
+    position: fixed;
+    width: 2px;
+    pointer-events: none;
+}
+
+.pimble-presence-caret--dim {
+    opacity: 0.4;
+}
+
+.pimble-presence-caret__flag {
+    position: absolute;
+    left: 0;
+    bottom: 100%;
+    padding: 0 4px;
+    border-radius: 3px 3px 3px 0;
+    color: #ffffff;
+    font-size: 10px;
+    line-height: 14px;
+    font-weight: 600;
+    white-space: nowrap;
+    pointer-events: auto;
+}
+
+.pimble-presence--c0 { background-color: rgba(229, 57, 53, 0.22); }
+.pimble-presence--c1 { background-color: rgba(30, 136, 229, 0.22); }
+.pimble-presence--c2 { background-color: rgba(67, 160, 71, 0.22); }
+.pimble-presence--c3 { background-color: rgba(142, 36, 170, 0.22); }
+.pimble-presence--c4 { background-color: rgba(244, 81, 30, 0.22); }
+.pimble-presence--c5 { background-color: rgba(0, 137, 123, 0.22); }
+.pimble-presence--c6 { background-color: rgba(216, 27, 96, 0.22); }
+.pimble-presence--c7 { background-color: rgba(57, 73, 171, 0.22); }
+.pimble-presence--c8 { background-color: rgba(109, 76, 65, 0.22); }
+.pimble-presence--c9 { background-color: rgba(0, 172, 193, 0.22); }
+
 .pimble-picture-overlay {
     position: fixed;
     z-index: 40;

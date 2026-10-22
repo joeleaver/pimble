@@ -53,11 +53,17 @@ const AUTHOR_PALETTE: [Color; 10] = [
 /// An author's color: a pick from a palette of ten by a hash of their id,
 /// the same on every device and every run.
 pub fn author_color(id: &str) -> Color {
+    AUTHOR_PALETTE[author_color_index(id)]
+}
+
+/// Which of the ten [`author_color`] picks for `id`: for styles named per
+/// color (a CSS class per palette entry).
+pub fn author_color_index(id: &str) -> usize {
     // FNV-1a: stable across platforms and Rust versions.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in id.as_bytes() {
         h ^= *b as u64;
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
-    AUTHOR_PALETTE[(h % AUTHOR_PALETTE.len() as u64) as usize]
+    (h % AUTHOR_PALETTE.len() as u64) as usize
 }

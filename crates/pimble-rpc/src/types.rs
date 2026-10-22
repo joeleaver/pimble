@@ -1219,6 +1219,44 @@ pub struct PresenceBody {
     /// The pane has the focus in its window.
     #[serde(default)]
     pub focused: bool,
+    /// Where the session is in a note's text (section 4); none from a board,
+    /// a sheet, or a read-only pane with nothing selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<TextPresence>,
+}
+
+/// Where someone is in a note's text: yrs sticky indexes into its `content`
+/// (rinch `collab_sticky_index_with`, its v1 bytes and checked trailer), each
+/// base64url, so a position survives edits that cross it in flight.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextPresence {
+    /// The caret: the selection's head.
+    pub caret: String,
+    /// The selection's other end, when something is selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
+    /// The first position in view, for following (section 7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewport_top: Option<String>,
+}
+
+impl TextPresence {
+    /// A caret at `caret`, with a selection when `anchor` is given and differs.
+    pub fn new(caret: &[u8], anchor: Option<&[u8]>) -> Self {
+        use base64::Engine;
+        let enc = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        TextPresence { caret: enc(caret), anchor: anchor.filter(|a| *a != caret).map(enc), viewport_top: None }
+    }
+
+    pub fn caret_bytes(&self) -> Option<Vec<u8>> {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&self.caret).ok()
+    }
+
+    pub fn anchor_bytes(&self) -> Option<Vec<u8>> {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(self.anchor.as_ref()?).ok()
+    }
 }
 
 impl PresenceBody {
@@ -1541,6 +1579,30 @@ pub struct CloudShareInfoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A body with a caret and a selection comes back as it went, a body from
+    /// before text (wave 1) still parses, and a selection of nothing is a caret.
+    #[test]
+    fn presence_body_round_trips_with_text() {
+        let body = PresenceBody { device: "laptop".into(), focused: true, text: Some(TextPresence::new(&[1, 2, 3, 0xff], Some(&[9, 8]))) };
+        let back = PresenceBody::decode(&body.encode()).unwrap();
+        assert_eq!(back, body);
+        let text = back.text.unwrap();
+        assert_eq!(text.caret_bytes().unwrap(), vec![1, 2, 3, 0xff]);
+        assert_eq!(text.anchor_bytes().unwrap(), vec![9, 8]);
+
+        let older = PresenceBody { device: "web".into(), focused: false, text: None };
+        let wire = older.encode();
+        use base64::Engine;
+        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&wire).unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&json).unwrap(), serde_json::json!({ "device": "web", "focused": false }));
+        let from_wave_1 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"device":"web","focused":true}"#);
+        assert_eq!(PresenceBody::decode(&from_wave_1).unwrap().text, None);
+
+        let caret_only = TextPresence::new(&[4, 5], Some(&[4, 5]));
+        assert_eq!(caret_only.anchor, None);
+        assert_eq!(caret_only.anchor_bytes(), None);
+    }
 
     /// `SharesEnded` on the wire, and `getStoreSync`'s answer from a server
     /// from before ended roots: none.

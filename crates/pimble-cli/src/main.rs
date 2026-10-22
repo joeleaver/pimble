@@ -879,7 +879,16 @@ fn presence_line(frame: &pimble_rpc::PresenceFrame) -> String {
     let body = if frame.sealed {
         "(sealed)".to_string()
     } else {
-        pimble_rpc::PresenceBody::decode(&frame.body).map(|b| format!("on {}{}", b.device, if b.focused { ", focused" } else { "" })).unwrap_or_default()
+        pimble_rpc::PresenceBody::decode(&frame.body)
+            .map(|b| {
+                let text = match &b.text {
+                    Some(t) if t.anchor.is_some() => ", a selection in the text",
+                    Some(_) => ", a caret in the text",
+                    None => "",
+                };
+                format!("on {}{}{}", b.device, if b.focused { ", focused" } else { "" }, text)
+            })
+            .unwrap_or_default()
     };
     format!("{}  {}  {}  {}", frame.doc_id, frame.session, who, body)
 }
