@@ -90,6 +90,7 @@ async fn search_finds_the_document_containing_the_query_term() {
             title: "Alpha".into(),
             content: None,
             custom: Default::default(),
+            place: Default::default(),
         })
         .await
         .unwrap()
@@ -102,6 +103,7 @@ async fn search_finds_the_document_containing_the_query_term() {
             title: "Beta".into(),
             content: None,
             custom: Default::default(),
+            place: Default::default(),
         })
         .await
         .unwrap()
@@ -148,6 +150,7 @@ async fn search_no_longer_finds_a_deleted_node() {
             title: "Gone Soon".into(),
             content: None,
             custom: Default::default(),
+            place: Default::default(),
         })
         .await
         .unwrap()
@@ -191,6 +194,7 @@ async fn rebuild_index_reindexes_every_node_from_scratch() {
             title: "Rebuilt".into(),
             content: None,
             custom: Default::default(),
+            place: Default::default(),
         })
         .await
         .unwrap()
@@ -235,6 +239,7 @@ async fn empty_stores_list_searches_all_open_stores() {
             title: "In A".into(),
             content: None,
             custom: Default::default(),
+            place: Default::default(),
         })
         .await
         .unwrap()
@@ -249,6 +254,7 @@ async fn empty_stores_list_searches_all_open_stores() {
             title: "In B".into(),
             content: None,
             custom: Default::default(),
+            place: Default::default(),
         })
         .await
         .unwrap()
@@ -288,6 +294,7 @@ async fn reopening_a_store_preserves_its_search_index() {
             title: "Survives Restart".into(),
             content: None,
             custom: Default::default(),
+            place: Default::default(),
         })
         .await
         .unwrap()
@@ -339,6 +346,7 @@ async fn a_board_node_starts_with_its_board_and_its_words_are_found() {
             title: "Whiteboard".into(),
             content: Some(base64::engine::general_purpose::STANDARD.encode(update.unwrap())),
             custom,
+            place: Default::default(),
         })
         .await
         .unwrap()

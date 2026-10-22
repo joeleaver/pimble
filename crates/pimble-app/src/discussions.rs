@@ -837,7 +837,7 @@ fn init(request: u64) -> NodeInit {
 pub(crate) fn new_discussion(store: AppStore, store_id: StoreId, parent_id: NodeId) {
     let request = next_request();
     OPEN_AFTER.with(|o| o.borrow_mut().insert(request, store.focused()));
-    store.send(BackendCommand::CreateNode { store_id, parent_id: Some(parent_id), title: String::new(), init: Some(init(request)) });
+    store.send(BackendCommand::CreateNode { store_id, parent_id: Some(parent_id), title: String::new(), init: Some(init(request)), place: pimble_core::Place::Last });
 }
 
 /// "Start a Discussion" on node `host_id`: an attachment of it, opened beside

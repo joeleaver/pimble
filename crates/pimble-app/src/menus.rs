@@ -185,6 +185,7 @@ fn view_entries(store: AppStore) -> Vec<MenuEntry> {
         MenuEntry::item("Back", "Alt+Left", move || store.nav_step.set(Some(true))),
         MenuEntry::item("Forward", "Alt+Right", move || store.nav_step.set(Some(false))),
         MenuEntry::Separator,
+        MenuEntry::item("Focus Explorer", "Ctrl+Shift+E", crate::app::focus_explorer),
         MenuEntry::item("Focus Search", "Ctrl+K", crate::app::focus_search),
         MenuEntry::item("Rebuild Search Index", "", move || {
             crate::app::rebuild_search_indexes(store)

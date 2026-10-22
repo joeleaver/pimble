@@ -15,6 +15,20 @@ use crate::{StoreAccess, StoreId};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub Uuid);
 
+/// Where among a parent's children a node goes (docs/TREE_CONTRACT.md "Places
+/// on the wire"): an anchor, never an index, so a place chosen against one
+/// copy of a list means the same in a copy that changed meanwhile. Resolved
+/// where the edit is made; `After` a node the list no longer names is `Last`.
+/// On the wire: `"first"`, `"last"`, `{ "after": "<node id>" }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Place {
+    First,
+    #[default]
+    Last,
+    After(NodeId),
+}
+
 impl NodeId {
     /// Create a new random NodeId
     pub fn new() -> Self {

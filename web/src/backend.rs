@@ -629,7 +629,7 @@ async fn dispatch(
     // A transplant between stores names two, so it is judged and routed here
     // rather than by the single-`store_id` path every other command takes
     // below (docs/MOVE_CONTRACT.md "Between stores").
-    if let BackendCommand::TransplantNode { from_store_id, node_id, to_store_id, new_parent_id, position } = cmd {
+    if let BackendCommand::TransplantNode { from_store_id, node_id, to_store_id, new_parent_id, place } = cmd {
         dispatch_transplant(
             endpoints,
             vault,
@@ -637,7 +637,7 @@ async fn dispatch(
             node_id,
             to_store_id,
             new_parent_id,
-            position,
+            place,
             event_tx,
             signal_ui,
             client_id,
@@ -724,6 +724,12 @@ async fn route(
     // that is no error (docs/RELAY_CONTRACT.md, "The apps").
     let cmd = match vault.handle_unreachable(cmd) {
         Handled::Yes(event) => return event,
+        Handled::Several(events) => {
+            for event in events {
+                emit(event_tx, signal_ui, event);
+            }
+            return None;
+        }
         Handled::No(cmd) => cmd,
     };
 
@@ -753,6 +759,12 @@ async fn route(
     let cmd = match client.as_ref() {
         Some(connected) => match vault.handle(connected, cmd, signal_ui).await {
             Handled::Yes(event) => return event,
+            Handled::Several(events) => {
+                for event in events {
+                    emit(event_tx, signal_ui, event);
+                }
+                return None;
+            }
             Handled::No(cmd) => cmd,
         },
         None => cmd,
@@ -782,12 +794,12 @@ async fn dispatch_transplant(
     node_id: pimble_core::NodeId,
     to_store_id: StoreId,
     new_parent_id: pimble_core::NodeId,
-    position: Option<usize>,
+    place: pimble_core::Place,
     event_tx: &Sender<BackendEvent>,
     signal_ui: &Arc<dyn Fn() + Send + Sync>,
     client_id: &str,
 ) {
-    let cmd = BackendCommand::TransplantNode { from_store_id, node_id, to_store_id, new_parent_id, position };
+    let cmd = BackendCommand::TransplantNode { from_store_id, node_id, to_store_id, new_parent_id, place };
 
     // A relayed store's socket may have died since the supervisor last
     // looked, exactly as the single-`store_id` path checks before its own
@@ -832,7 +844,7 @@ async fn dispatch_transplant(
             }
         };
         let event = vault
-            .transplant_node(&from_client, &to_client, from_store_id, node_id, to_store_id, new_parent_id, position)
+            .transplant_node(&from_client, &to_client, from_store_id, node_id, to_store_id, new_parent_id, place)
             .await;
         emit(event_tx, signal_ui, event);
         return;

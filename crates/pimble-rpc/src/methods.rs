@@ -114,6 +114,11 @@ pub trait PimbleApi {
 
     /// Move a node into another store (docs/MOVE_CONTRACT.md "Between
     /// stores"): always a transplant. Write in both stores.
+    #[method(name = "moveNodes", with_extensions)]
+    async fn move_nodes(&self, request: MoveNodesRequest) -> Result<MoveNodesResponse, ErrorObjectOwned>;
+
+    /// Move a node into another store (docs/MOVE_CONTRACT.md "Between
+    /// stores"): always a transplant. Write in both stores.
     #[method(name = "transplantNode", with_extensions)]
     async fn transplant_node(&self, request: TransplantNodeRequest) -> Result<TransplantNodeResponse, ErrorObjectOwned>;
 

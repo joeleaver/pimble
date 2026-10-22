@@ -497,6 +497,7 @@ pub(crate) fn convert_to_sheet_node(store: AppStore, pane: PaneId, table: &str) 
             ],
             request: Some(request),
         }),
+        place: pimble_core::Place::Last,
     });
 }
 

@@ -8,7 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use rinch::prelude::*;
-use rinch::core::{request_focus, set_keyboard_interceptor, clear_keyboard_interceptor};
+use rinch::core::{set_keyboard_interceptor, clear_keyboard_interceptor};
 use rinch_tabler_icons::{TablerIcon, TablerIconStyle, render_tabler_icon};
 
 use crate::protocol::{BackendCommand, CloudOp};
@@ -31,6 +31,9 @@ use crate::styles::{APP_CSS, EDITOR_CSS};
 /// How long after a click a second one on the same row still counts as a
 /// double-click, and so starts an inline rename.
 const DOUBLE_CLICK_MS: f64 = 500.0;
+/// The explorer's indent per level, in pixels: wide enough that the depths a drag
+/// offers at the end of a group are easy to aim at (docs/TREE_CONTRACT.md).
+const TREE_INDENT: f32 = 12.0;
 
 /// Whether this build may administer the stores on its server: open one from a
 /// path, add a remote as a replica, link, unlink, remove a replica, close one,
@@ -162,6 +165,13 @@ thread_local! {
     /// before the box exists — can reach it later. Same reach-across-closures
     /// need as `EVENT_PROCESSOR`/`CLOSE_HANDLER` below.
     static SEARCH_INPUT: RefCell<Option<NodeHandle>> = const { RefCell::new(None) };
+    /// The explorer tree's state, for the View menu's "Focus Explorer",
+    /// built before the tree is.
+    static TREE_STATE: Cell<Option<UseTreeReturn>> = const { Cell::new(None) };
+    /// Each tree row's rename box, by tree value, for `start_rename` to give
+    /// the keyboard to. A handle and not an id: `request_focus` is the
+    /// desktop runtime's alone, and a browser needs the element's own focus.
+    static RENAME_INPUTS: RefCell<std::collections::HashMap<String, NodeHandle>> = RefCell::new(std::collections::HashMap::new());
     /// The debounced `Search` command pending from the last keystroke, if any.
     static SEARCH_DEBOUNCE: RefCell<Option<TimeoutHandle>> = const { RefCell::new(None) };
 }
@@ -249,6 +259,14 @@ pub fn focus_search() {
     });
 }
 
+/// Give the explorer the keyboard (View > "Focus Explorer"): its cursor row,
+/// or its first (docs/TREE_CONTRACT.md "The keyboard").
+pub fn focus_explorer() {
+    if let Some(tree_state) = TREE_STATE.with(Cell::get) {
+        tree_state.controller.focus();
+    }
+}
+
 /// Rebuild the search index of every open store that has one.
 ///
 /// An encrypted store has no server-side index and cannot have one — the
@@ -296,13 +314,13 @@ pub fn open_new_store_modal(store: AppStore) {
 ///
 /// It opens in the focused pane (docs/SPLIT_VIEW_CONTRACT.md "What the
 /// person sees"); [`open_node_in`] names another.
-fn open_node(store: AppStore, tree_state: UseTreeReturn, value: String) {
+pub(crate) fn open_node(store: AppStore, tree_state: UseTreeReturn, value: String) {
     open_node_in(store, tree_state, store.focused(), value);
 }
 
 /// Open a tree value in pane `pane`. The tree's selected row follows when
 /// the pane has the focus, and the pane's history ([`crate::nav`]) records it.
-fn open_node_in(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value: String) {
+pub(crate) fn open_node_in(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value: String) {
     store.pane(pane).history.update(|h| h.visit(&value));
     show_in_pane(store, tree_state, pane, value);
 }
@@ -334,7 +352,9 @@ fn show_in_pane(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
     // Whatever the saved layout meant this pane for, the person chose this.
     state.restore.set(None);
     if focused {
-        tree_state.controller.select(&value);
+        tree_state.controller.set_selection([value.clone()]);
+        // The open row is where the next Shift run starts.
+        tree_state.controller.set_anchor(Some(&value));
     }
 
     // Offline-first: a document opens from the cached content at once and
@@ -428,58 +448,6 @@ fn show_in_pane(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
     store.editor_dirty.set(false);
 }
 
-/// What a drop should do, or why it must not (`decide_drop`'s answer).
-/// `BackendCommand` carries no `PartialEq`, so this doesn't either — a test
-/// matches on it with `matches!`.
-#[derive(Debug)]
-pub(crate) enum DropDecision {
-    /// Send this command: `MoveNode` within one store, `TransplantNode`
-    /// between two (docs/MOVE_CONTRACT.md "The operation: transplant").
-    Send(BackendCommand),
-    /// Send nothing; show this sentence the way every other refusal is shown.
-    Refused(&'static str),
-}
-
-/// What a drop of `dragged` onto the resolved target parent `target` should
-/// do, judged by what this account may write at each of the three places a
-/// move touches (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"): the
-/// node itself, the list it leaves, and the list it joins. Pure and
-/// window-free, so the decision is tested on its own — the caller resolves
-/// `dragged`/`target` from the drop (through a mount: the source store, as
-/// everywhere) and the three access judgements from `AppStore` first.
-///
-/// Same store or not is the only question left once every access is fine
-/// (docs/MOVE_CONTRACT.md "A move between stores is always this, because two
-/// stores hold different documents"): a move within one, a transplant
-/// between two.
-pub(crate) fn decide_drop(
-    dragged: (pimble_core::StoreId, pimble_core::NodeId),
-    target: (pimble_core::StoreId, pimble_core::NodeId),
-    node_access: pimble_core::StoreAccess,
-    leaves_access: pimble_core::StoreAccess,
-    target_access: pimble_core::StoreAccess,
-) -> DropDecision {
-    if !node_access.allows_write() || !leaves_access.allows_write() || !target_access.allows_write() {
-        return DropDecision::Refused(pimble_core::StoreAccess::READ_ONLY_REFUSAL);
-    }
-    if dragged.0 == target.0 {
-        DropDecision::Send(BackendCommand::MoveNode {
-            store_id: dragged.0,
-            node_id: dragged.1,
-            new_parent_id: target.1,
-            position: None,
-        })
-    } else {
-        DropDecision::Send(BackendCommand::TransplantNode {
-            from_store_id: dragged.0,
-            node_id: dragged.1,
-            to_store_id: target.0,
-            new_parent_id: target.1,
-            position: None,
-        })
-    }
-}
-
 /// "Copy as Mount Source": record the canonical pair and display title of the
 /// node or store root identified by `value` into `store.mount_source`, for a
 /// subsequent "Paste Mount Here" elsewhere in the tree.
@@ -502,10 +470,117 @@ fn copy_as_mount_source(store: AppStore, value: &str) {
     bump_tree_after_menu_closes(store);
 }
 
+/// Start renaming the row of tree value `value` in place: a double-click, F2,
+/// or a node the keyboard just made. Enter commits and Escape cancels, and
+/// either gives the keyboard back to the tree. `false` when the row cannot
+/// be renamed here (a mount, or a node this device may only read).
+pub(crate) fn start_rename(store: AppStore, tree_state: UseTreeReturn, value: &str) -> bool {
+    // Don't allow rename on mount nodes
+    let is_mount_node = if let Some((sid, Some(nid))) = parse_tree_value(value) {
+        store.is_mount(sid, nid)
+    } else {
+        false
+    };
+    if is_mount_node {
+        return false;
+    }
+
+    // A node this device may only read changes in no way
+    // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"):
+    // the context menu's "Rename" is disabled there, so the
+    // double-click shortcut is not a way around it. An editor
+    // renames like anyone else. Judged per node: a reader's
+    // root may sit beside an editor's in the same store.
+    let renameable = match parse_tree_value(value) {
+        Some((s_id, Some(n_id))) => store.node_access(s_id, n_id).allows_write(),
+        Some((s_id, None)) => store.store_access(s_id).allows_write(),
+        None => true,
+    };
+    if !renameable {
+        return false;
+    }
+
+    let edit_text = if let Some((store_id, Some(node_id))) = parse_tree_value(value) {
+        store.get_node_signal(store_id, node_id)
+            .map(|sig| sig.with(|n| n.metadata.title.clone()))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    store.rename_text.set(edit_text);
+    store.renaming_node.set(Some(value.to_string()));
+    let nv_interceptor = value.to_string();
+    set_keyboard_interceptor(move |data| {
+        if data.key == "Escape" {
+            run_on_main_thread(move || {
+                store.renaming_node.set(None);
+                clear_keyboard_interceptor();
+                tree_state.controller.focus();
+            });
+            return true;
+        }
+        if data.key == "Enter" {
+            let nv = nv_interceptor.clone();
+            run_on_main_thread(move || {
+                let new_title = untracked(|| store.rename_text.get());
+                store.renaming_node.set(None);
+                clear_keyboard_interceptor();
+                tree_state.controller.focus();
+                if let Some((s_id, Some(n_id))) = parse_tree_value(&nv) {
+                    store.send(BackendCommand::RenameNode {
+                        store_id: s_id, node_id: n_id, title: new_title,
+                    });
+                }
+            });
+            return true;
+        }
+        false
+    });
+    // A moment later: the box is shown by an effect of `renaming_node`, and
+    // a browser will not focus it while it is still `display: none`.
+    if let Some(input) = RENAME_INPUTS.with(|inputs| inputs.borrow().get(value).cloned()) {
+        let _ = set_timeout(0, move || input.focus());
+    }
+    true
+}
+
+/// What a row's menu acts on: the selection when the row is one of several
+/// selected rows, the row alone otherwise (docs/TREE_CONTRACT.md
+/// "Multi-select"). A right-click does not change the selection.
+fn rows_for_menu(tree_state: UseTreeReturn, value: &str) -> Vec<String> {
+    let selected = untracked(|| tree_state.selected.get());
+    if selected.len() > 1 && selected.contains(value) {
+        let mut rows: Vec<String> = selected.into_iter().collect();
+        rows.sort();
+        rows
+    } else {
+        vec![value.to_string()]
+    }
+}
+
+/// "Copy Link" over several rows: one link per line.
+fn copy_links(store: AppStore, values: &[String]) {
+    if let [one] = values {
+        return copy_link(store, one);
+    }
+    let links: Vec<String> = values
+        .iter()
+        .filter_map(|v| {
+            let (s_id, node_id_opt) = parse_tree_value(v)?;
+            let node_id = node_id_opt.or_else(|| store.root_node_id(s_id))?;
+            Some(pimble_core::PimbleUrl::node(s_id, node_id).to_string())
+        })
+        .collect();
+    match crate::links::copy_text(&links.join("\n")) {
+        Ok(()) => crate::events::show_notice(store, format!("{} links copied.", links.len())),
+        Err(e) => crate::events::show_notice(store, format!("The links could not be copied: {e}")),
+    }
+}
+
 /// "Copy Link" (docs/LINKS_CONTRACT.md "Making a link"): the row's node, or a
 /// store row's root, as a `pimble:` link on the system clipboard. Through a
 /// mount the value names the source store's node, as every address does.
-fn copy_link(store: AppStore, value: &str) {
+pub(crate) fn copy_link(store: AppStore, value: &str) {
     let Some((s_id, node_id_opt)) = parse_tree_value(value) else { return };
     let Some(node_id) = node_id_opt.or_else(|| store.root_node_id(s_id)) else { return };
     let url = pimble_core::PimbleUrl::node(s_id, node_id).to_string();
@@ -1046,7 +1121,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
     let last_click: Rc<Cell<(f64, String)>> = Rc::new(Cell::new((now_ms(), String::new())));
 
     // Persistent tree state — created once, preserves expanded/selected across data changes
-    let tree_state = UseTreeReturn::new(UseTreeOptions::default());
+    let tree_state = UseTreeReturn::new(UseTreeOptions { multiple: true, ..Default::default() });
+    TREE_STATE.with(|cell| cell.set(Some(tree_state)));
 
     // A followed link's target opens the way a search hit does, with
     // `open_node` (docs/LINKS_CONTRACT.md "Following a link"), deferred out
@@ -1082,7 +1158,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         });
     });
 
-    // Drag-and-drop state for tree node rearrangement
+    // The tree row being dragged, for drop targets outside the tree
     let drag_ctx: DragContext<String> = DragContext::new();
     // A row dropped on a board becomes a node card there
     // (docs/IMAGE_MARKUP_CONTRACT.md section 4).
@@ -1134,68 +1210,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 let is_double_click = prev_value == value && now - prev_time < DOUBLE_CLICK_MS;
 
                 if is_double_click && value.starts_with("node_") {
-                    // Don't allow rename on mount nodes
-                    let is_mount_node = if let Some((sid, Some(nid))) = parse_tree_value(&value) {
-                        store.is_mount(sid, nid)
-                    } else {
-                        false
-                    };
-                    if is_mount_node {
-                        return;
-                    }
-
-                    // A node this device may only read changes in no way
-                    // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"):
-                    // the context menu's "Rename" is disabled there, so the
-                    // double-click shortcut is not a way around it. An editor
-                    // renames like anyone else. Judged per node: a reader's
-                    // root may sit beside an editor's in the same store.
-                    let renameable = match parse_tree_value(&value) {
-                        Some((s_id, Some(n_id))) => store.node_access(s_id, n_id).allows_write(),
-                        Some((s_id, None)) => store.store_access(s_id).allows_write(),
-                        None => true,
-                    };
-                    if !renameable {
-                        return;
-                    }
-
-                    let edit_text = if let Some((store_id, Some(node_id))) = parse_tree_value(&value) {
-                        store.get_node_signal(store_id, node_id)
-                            .map(|sig| sig.with(|n| n.metadata.title.clone()))
-                            .unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
-                    store.rename_text.set(edit_text);
-                    store.renaming_node.set(Some(value.clone()));
-                    let nv_interceptor = value.clone();
-                    set_keyboard_interceptor(move |data| {
-                        if data.key == "Escape" {
-                            run_on_main_thread(move || {
-                                store.renaming_node.set(None);
-                                clear_keyboard_interceptor();
-                            });
-                            return true;
-                        }
-                        if data.key == "Enter" {
-                            let nv = nv_interceptor.clone();
-                            run_on_main_thread(move || {
-                                let new_title = untracked(|| store.rename_text.get());
-                                store.renaming_node.set(None);
-                                clear_keyboard_interceptor();
-                                if let Some((s_id, Some(n_id))) = parse_tree_value(&nv) {
-                                    store.send(BackendCommand::RenameNode {
-                                        store_id: s_id, node_id: n_id, title: new_title,
-                                    });
-                                }
-                            });
-                            return true;
-                        }
-                        false
-                    });
-                    if let Some((doc_key, input_node_id)) = store.rename_input_ids.with(|ids| ids.get(&value).copied()) {
-                        request_focus(doc_key, input_node_id);
-                    }
+                    start_rename(store, tree_state, &value);
                     return;
                 }
 
@@ -1458,100 +1473,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 "cursor: default; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"
             };
 
-            // Drag-and-drop callbacks
-            let nv_dragstart = node_value.clone();
-            let nv_drop = node_value.clone();
-            let nv_enter = node_value.clone();
-            let nv_leave = node_value.clone();
-
-            let on_dragstart = move || {
-                tracing::info!("DragStart: {}", nv_dragstart);
-                drag_ctx.set(nv_dragstart.clone());
-            };
-            let on_dragend = move || {
-                tracing::info!("DragEnd");
-                drag_ctx.clear();
-                store.drop_target.set(None);
-            };
-            let on_drop = {
-                let nv = nv_drop.clone();
-                move || {
-                    // Always clear drag state first, even if the drop is invalid
-                    let dragged_value = drag_ctx.take();
-                    store.drop_target.set(None);
-
-                    let Some(dragged_value) = dragged_value else { return; };
-                    if dragged_value == nv { return; }
-                    let Some((drag_store_id, Some(drag_node_id))) = parse_tree_value(&dragged_value) else { return; };
-                    let Some((target_store_id, target_node_id_opt)) = parse_tree_value(&nv) else { return; };
-
-                    // A drop on a store row lands in the root that row
-                    // stands for. A drop onto a mount node stays refused: the
-                    // node it stands for lives in another store, and that is
-                    // where it moves (docs/MOVE_CONTRACT.md).
-                    let new_parent_id = match target_node_id_opt {
-                        Some(nid) => {
-                            if store.is_mount(target_store_id, nid) {
-                                tracing::warn!("Ignoring drop onto mount node {:?}/{:?}", target_store_id, nid);
-                                return;
-                            }
-                            nid
-                        }
-                        None => match store.root_node_id(target_store_id) {
-                            Some(id) => id,
-                            None => return,
-                        },
-                    };
-
-                    // A move edits three documents, and the server judges
-                    // all three: the node, the list it leaves and the list it
-                    // joins (docs/NODE_DOCUMENT_CONTRACT.md section 5,
-                    // "Roles"). `decide_drop` turns those three judgements
-                    // into a move within one store, a transplant between two
-                    // (docs/MOVE_CONTRACT.md "The operation: transplant"), or
-                    // a refusal — before anything is sent, by the server's
-                    // own word on each.
-                    let target_access = store.node_access(target_store_id, new_parent_id);
-                    let leaves_access = store
-                        .cached_parent_id(drag_store_id, drag_node_id)
-                        .map_or(pimble_core::StoreAccess::Full, |old_parent| store.node_access(drag_store_id, old_parent));
-                    let node_access = store.node_access(drag_store_id, drag_node_id);
-
-                    match decide_drop(
-                        (drag_store_id, drag_node_id),
-                        (target_store_id, new_parent_id),
-                        node_access,
-                        leaves_access,
-                        target_access,
-                    ) {
-                        DropDecision::Send(cmd) => {
-                            tracing::info!("Drop: {:?}", cmd);
-                            // Record the exact (possibly mount-path-qualified)
-                            // tree value dropped onto, so a same-store move's
-                            // `NodeMoved` event can auto-expand precisely this
-                            // place (decision 7). A transplant lands in
-                            // another store's own tree and has nothing here
-                            // to expand.
-                            crate::state::set_last_drop_target_value(nv.clone());
-                            store.send(cmd);
-                        }
-                        DropDecision::Refused(sentence) => {
-                            tracing::info!("Drop of {:?} into {} refused: {}", drag_node_id, nv, sentence);
-                            crate::events::show_notice(store, sentence.to_string());
-                        }
-                    }
-                }
-            };
-            let on_dragenter = move || { store.drop_target.set(Some(nv_enter.clone())); };
-            let on_dragleave = {
-                let nv = nv_leave.clone();
-                move || {
-                    if store.drop_target.get().as_deref() == Some(&nv) {
-                        store.drop_target.set(None);
-                    }
-                }
-            };
-
             // Context menu actions
             let nv_ctx = node_value.clone();
             let on_new_child = {
@@ -1562,6 +1483,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         if let Some(pid) = parent_id {
                             store.send(BackendCommand::CreateNode {
                                 store_id: s_id, parent_id: Some(pid), title: String::new(), init: None,
+                                place: Default::default(),
                             });
                         }
                     }
@@ -1761,10 +1683,12 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             let on_delete = {
                 let nv = nv_ctx.clone();
                 move || {
-                    if let Some((s_id, Some(n_id))) = parse_tree_value(&nv) {
-                        store.send(BackendCommand::DeleteNode {
-                            store_id: s_id, node_id: n_id,
-                        });
+                    for value in rows_for_menu(tree_state, &nv) {
+                        if let Some((s_id, Some(n_id))) = parse_tree_value(&value) {
+                            store.send(BackendCommand::DeleteNode {
+                                store_id: s_id, node_id: n_id,
+                            });
+                        }
                     }
                 }
             };
@@ -1796,6 +1720,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 parent_id: Some(mount_ref.source_node),
                                 title: String::new(),
                                 init: None,
+                                place: Default::default(),
                             });
                         }
                         None => tracing::warn!("Mount node has no mount_ref yet; cannot create a child under it"),
@@ -1812,7 +1737,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             };
             let on_copy_link = {
                 let nv = nv_ctx.clone();
-                move || copy_link(store, &nv)
+                move || copy_links(store, &rows_for_menu(tree_state, &nv))
             };
             // "Paste Mount Here" is always rendered, disabled while nothing is
             // copied, because a `DropdownMenuItem`'s `disabled` is a value
@@ -1838,11 +1763,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 let nv = nv_ctx.clone();
                 move || paste_mount_here(store, &nv)
             };
-
-            // Build the wrapper span with drag-and-drop via rsx. A node this
-            // device may not change does not drag out of its place, as the
-            // drop handler refuses drops into one.
-            let draggable = if is_store_root || !can_write_tree { "false" } else { "true" };
 
             let icon_el = render_tabler_icon(__scope, icon, TablerIconStyle::Outline);
 
@@ -1891,7 +1811,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             };
 
             let nv_submit = node_value.clone();
-            let nv_effect = node_value.clone();
             let nv_for_context_menu = node_value.clone();
 
             // This row's own locally-computed label (see `AppStore::live_label`):
@@ -1924,7 +1843,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             }
                         }
                     },
-                    value: move || store.rename_text.get(),
+                    value: {move || store.rename_text.get()},
                     oninput: move |value: String| {
                         store.rename_text.set(value);
                     },
@@ -1941,13 +1860,17 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 }
             };
 
-            // Register this input's DOM node ID so the double-click handler can focus it
-            store.rename_input_ids.update(|ids| {
-                ids.insert(node_value.clone(), (rename_input.doc_key(), rename_input.node_id().0));
-            });
+            // Register this row's rename box so `start_rename` can focus it
+            RENAME_INPUTS.with(|inputs| inputs.borrow_mut().insert(node_value.clone(), rename_input.clone()));
+            // A node the keyboard just made is named as soon as its row is
+            // drawn (docs/TREE_CONTRACT.md "The keyboard").
+            if crate::state::take_pending_rename(&node_value) {
+                let value = node_value.clone();
+                run_on_main_thread(move || {
+                    start_rename(store, tree_state, &value);
+                });
+            }
 
-            // Clone before wrapper rsx moves rename_input
-            let rename_input_for_focus = rename_input.clone();
             let row_value = node_value.clone();
 
             let wrapper = rsx! {
@@ -2335,44 +2258,19 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 // Regular nodes: new child, mount store, rename
                 let nv_rename_ctx = nv_for_context_menu.clone();
                 let on_rename = move || {
-                    if let Some((s_id, Some(n_id))) = parse_tree_value(&nv_rename_ctx) {
-                        let edit_text = store.get_node_signal(s_id, n_id)
-                            .map(|sig| sig.with(|n| n.metadata.title.clone()))
-                            .unwrap_or_default();
-                        store.rename_text.set(edit_text);
-                        store.renaming_node.set(Some(nv_rename_ctx.clone()));
-                        let nv_interceptor = nv_rename_ctx.clone();
-                        set_keyboard_interceptor(move |data| {
-                            if data.key == "Escape" {
-                                run_on_main_thread(move || {
-                                    store.renaming_node.set(None);
-                                    clear_keyboard_interceptor();
-                                });
-                                return true;
-                            }
-                            if data.key == "Enter" {
-                                let nv = nv_interceptor.clone();
-                                run_on_main_thread(move || {
-                                    let new_title = untracked(|| store.rename_text.get());
-                                    store.renaming_node.set(None);
-                                    clear_keyboard_interceptor();
-                                    if let Some((s_id, Some(n_id))) = parse_tree_value(&nv) {
-                                        store.send(BackendCommand::RenameNode {
-                                            store_id: s_id, node_id: n_id, title: new_title,
-                                        });
-                                    }
-                                });
-                                return true;
-                            }
-                            false
-                        });
-                        rename_input_for_focus.focus();
-                    }
+                    start_rename(store, tree_state, &nv_rename_ctx);
                 };
 
                 // "Open in Split View" (docs/SPLIT_VIEW_CONTRACT.md decision
                 // 2): the focused pane is split to the right and this
                 // document opens in the new half. Off with four panes open.
+                // With several rows selected and this one among them, the
+                // menu acts on all of them where that makes sense (Delete,
+                // Copy Link) and turns off what is for one row alone
+                // (docs/TREE_CONTRACT.md "Multi-select").
+                let nv_count = nv_for_context_menu.clone();
+                let acts_on = Memo::new(move || tree_state.selected.with(|s| if s.contains(&nv_count) { s.len().max(1) } else { 1 }));
+                let several = move || acts_on.get() > 1;
                 let nv_split = nv_for_context_menu.clone();
                 let on_open_in_split = move || {
                     let focused = store.focused();
@@ -2388,7 +2286,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             {menu_note}
                             DropdownMenuItem {
                                 left_section: TablerIcon::LayoutColumns,
-                                disabled: {move || !store.tiling.with(|tiling| tiling.can_split())},
+                                disabled: {move || several() || !store.tiling.with(|tiling| tiling.can_split())},
                                 onclick: on_open_in_split.clone(),
                                 "Open in Split View"
                             }
@@ -2473,14 +2371,14 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Edit,
-                                disabled: !can_write_tree,
-                                onclick: on_rename,
+                                disabled: {move || !can_write_tree || several()},
+                                onclick: on_rename.clone(),
                                 "Rename"
                             }
                             if CAN_ADMINISTER_STORES {
                                 DropdownMenuItem {
                                     left_section: TablerIcon::Share,
-                                    disabled: share_disabled,
+                                    disabled: {move || share_disabled || several()},
                                     onclick: on_share.clone(),
                                     "Share..."
                                 }
@@ -2495,7 +2393,10 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 left_section: TablerIcon::Trash,
                                 disabled: !can_write_tree,
                                 onclick: on_delete,
-                                "Delete"
+                                {move || match acts_on.get() {
+                                    1 => "Delete".to_string(),
+                                    n => format!("Delete {n} Nodes"),
+                                }}
                             }
                         }
                     }
@@ -2505,37 +2406,15 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             // The ContextMenu sets data-oncontextmenu on its ContextMenuTarget,
             // but both rinch-context-menu and rinch-context-menu__target have
             // display:contents — they're invisible to hit testing. Wrap in a
-            // visible div that carries:
-            //  - context menu handler (hoisted from ContextMenuTarget)
-            //  - drag-and-drop attributes (draggable, ondragstart, etc.)
-            //  - visual feedback for drag state (opacity, highlight)
-            // This ensures right-click, drag, and drop all work on the full row.
+            // visible div that carries the context menu handler (hoisted from
+            // ContextMenuTarget), so right-click works on the full row. The
+            // Tree's own row box is the drag source and drop target
+            // (docs/TREE_CONTRACT.md "The drop model"; `tree_drop.rs`).
             let hit_area = rsx! {
                 div {
-                    style: {
-                        let nv = nv_effect.clone();
-                        move || {
-                            // `min-width: 0`: a flex item never narrower than its content
-                            // pushed a long title out past the row (and the scrollbar).
-                            let base = "flex: 1; min-width: 0; display: flex; align-items: center; border-radius: 2px; transition: background 0.1s, opacity 0.1s;";
-                            let is_being_dragged = drag_ctx.get().as_deref() == Some(&nv);
-                            let is_target = store.drop_target.get().as_deref() == Some(&nv)
-                                && drag_ctx.is_active();
-                            if is_being_dragged {
-                                format!("{} opacity: 0.3;", base)
-                            } else if is_target {
-                                format!("{} background: var(--rinch-color-blue-1); outline: 1px solid var(--rinch-color-blue-4);", base)
-                            } else {
-                                base.to_string()
-                            }
-                        }
-                    },
-                    draggable: draggable,
-                    ondragstart: on_dragstart,
-                    ondragend: on_dragend,
-                    ondrop: on_drop,
-                    ondragenter: on_dragenter,
-                    ondragleave: on_dragleave,
+                    // `min-width: 0`: a flex item never narrower than its content
+                    // pushed a long title out past the row (and the scrollbar).
+                    style: "flex: 1; min-width: 0; display: flex; align-items: center; border-radius: 2px;",
                     {context_menu}
                 }
             };
@@ -2558,6 +2437,49 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             hit_area
         });
 
+        // Drops (docs/TREE_CONTRACT.md "The drop model"): `tree_drop` judges
+        // each one the Tree offers, the strip at the foot of the explorer
+        // says where it lands, and a release sends what was planned.
+        let tree_drag_values: rinch::prelude::DragValues = Rc::new(crate::tree_drop::drag_values);
+        let tree_judge_drop: rinch::prelude::JudgeDrop =
+            Rc::new(move |drop: &TreeDrop| crate::tree_drop::plan_drop(store, drop).verdict());
+        let on_tree_drop_change = ValueCallback::new(move |offer: Option<(TreeDrop, DropVerdict)>| {
+            store.drop_hint.set(offer.map(|(drop, _)| crate::tree_drop::plan_drop(store, &drop).hint().clone()));
+        });
+        let on_tree_drop = ValueCallback::new(move |drop: TreeDrop| {
+            crate::tree_drop::send_plan(store, crate::tree_drop::plan_drop(store, &drop));
+        });
+        // A row dragged out of the tree onto a board becomes a node card
+        // there (docs/IMAGE_MARKUP_CONTRACT.md section 4).
+        let on_tree_drag_start = ValueCallback::new(move |values: Vec<String>| {
+            if let Some(value) = values.into_iter().next() {
+                drag_ctx.set(value);
+            }
+        });
+        let on_tree_drag_end = ValueCallback::new(move |()| {
+            drag_ctx.clear();
+            store.drop_hint.set(None);
+        });
+
+        // The keyboard (docs/TREE_CONTRACT.md "The keyboard"): the Tree moves
+        // the cursor; `tree_keys` binds Pimble's keys; the document follows
+        // the cursor once it rests (Joe, 2026-10-19).
+        let tree_onkey: rinch::prelude::TreeKeyHandler =
+            Rc::new(move |key: &rinch::prelude::TreeKey| crate::tree_keys::on_key(store, tree_state, key));
+        let on_tree_cursor = ValueCallback::new(move |value: String| {
+            // A cursor that rests on one of several selected rows (the end
+            // of a Shift run) opens nothing: opening selects the row alone.
+            // Off the selection it opens the row, as a click would.
+            let selected = untracked(|| tree_state.selected.get());
+            if selected.len() > 1 && selected.contains(&value) {
+                return;
+            }
+            if untracked(|| store.selected_id.get()).as_deref() != Some(value.as_str()) {
+                open_node(store, tree_state, value);
+            }
+        });
+        let tree_label_of: rinch::prelude::LabelOf = Rc::new(move |value: &str| crate::tree_keys::label_of(store, value));
+
         let tree_scroll = rsx! {
             div {
                 class: "pimble-sidebar__tree",
@@ -2565,13 +2487,25 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     data: untracked(|| store.build_tree_data_structural()),
                     tree: tree_state,
                     data_source: data_source,
-                    level_offset: "xs",
+                    indent: TREE_INDENT,
+                    guides: true,
                     select_on_click: true,
                     expand_on_click: false,
                     onselect: on_tree_select,
                     onexpand: on_tree_expand,
                     oncollapse: on_tree_collapse,
                     render_node: render_node_fn,
+                    draggable: true,
+                    drag_values: tree_drag_values,
+                    judge_drop: tree_judge_drop,
+                    ondropchange: on_tree_drop_change,
+                    ondrop: on_tree_drop,
+                    ondragstart: on_tree_drag_start,
+                    ondragend: on_tree_drag_end,
+                    keyboard: true,
+                    handle_key: tree_onkey,
+                    oncursor: on_tree_cursor,
+                    label_of: tree_label_of,
                 }
             }
         };
@@ -2601,6 +2535,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     parent_id: Some(root_id),
                     title: String::new(),
                     init: None,
+                    place: Default::default(),
                 }),
                 // Nothing to create a node under. On the desktop "New
                 // Store..." is a menu item away; a browser has no menu bar, so
@@ -2630,7 +2565,10 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         let _ = rinch::Effect::new(move || {
             let selected = store.selected_id.get();
             untracked(|| match &selected {
-                Some(value) => tree_state.controller.select(value),
+                Some(value) => {
+                    tree_state.controller.set_selection([value.clone()]);
+                    tree_state.controller.set_anchor(Some(value));
+                }
                 None => tree_state.controller.clear_selected(),
             });
         });
@@ -3413,7 +3351,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             } else if let Some(new_parent_id) = put_back_under {
                 // A live node no list names: put it back under the scope's root.
                 store.deleted_modal_pending.set(true);
-                store.send(BackendCommand::MoveNode { store_id, node_id, new_parent_id, position: None });
+                store.send(BackendCommand::MoveNode { store_id, node_id, new_parent_id, place: pimble_core::Place::Last });
             } else {
                 return;
             }
@@ -4404,6 +4342,26 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 style: {|| if store.search_query.get().is_empty() { "display: none;" } else { "" }},
                                 {search_panel}
                             }
+
+                            // Where a dragged row lands, in words, for the
+                            // whole drag (docs/TREE_CONTRACT.md "Feedback").
+                            div {
+                                class: {move || if store.drop_hint.with(|h| h.as_ref().is_some_and(|h| h.refused)) {
+                                    "pimble-drop-hint pimble-drop-hint--refused"
+                                } else {
+                                    "pimble-drop-hint"
+                                }},
+                                style: {move || if store.drop_hint.with(|h| h.is_some()) { "" } else { "display: none;" }},
+                                div {
+                                    class: "pimble-drop-hint__line",
+                                    {move || store.drop_hint.with(|h| h.as_ref().map(|h| h.line.clone()).unwrap_or_default())}
+                                }
+                                div {
+                                    class: "pimble-drop-hint__warning",
+                                    style: {move || if store.drop_hint.with(|h| h.as_ref().is_some_and(|h| h.warning.is_some())) { "" } else { "display: none;" }},
+                                    {move || store.drop_hint.with(|h| h.as_ref().and_then(|h| h.warning.clone()).unwrap_or_default())}
+                                }
+                            }
                         }
 
                         // The explorer's right edge, dragged to resize it.
@@ -5024,67 +4982,5 @@ mod tests {
         assert_eq!(sync_badge_text(&synced, StoreKind::Vault, RelaySide::Member, false), "encrypted · synced");
         assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Vault, RelaySide::Member, false), "encrypted · offline");
         assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Vault, RelaySide::Member, true), "owner offline");
-    }
-
-    // ── The drop handler's decision (docs/MOVE_CONTRACT.md) ──────────────
-    use super::{decide_drop, DropDecision};
-    use pimble_core::StoreAccess::{Full, Read};
-
-    /// A drop within one store is a move — the id-preserving path, since
-    /// nothing about it can take a node out of a share (`Tree::repair`'s
-    /// concern, not the drop handler's).
-    #[test]
-    fn a_drop_within_one_store_is_a_move() {
-        let store_id = StoreId::new();
-        let (dragged, parent) = (NodeId::new(), NodeId::new());
-
-        let decision = decide_drop((store_id, dragged), (store_id, parent), Full, Full, Full);
-        match decision {
-            DropDecision::Send(BackendCommand::MoveNode { store_id: s, node_id: n, new_parent_id: p, position: None }) => {
-                assert_eq!((s, n, p), (store_id, dragged, parent));
-            }
-            other => panic!("expected a MoveNode, got {other:?}"),
-        }
-    }
-
-    /// A drop between two stores is always a transplant
-    /// (docs/MOVE_CONTRACT.md "A move between stores is always this,
-    /// because two stores hold different documents"): what gives the drag
-    /// between stores its meaning.
-    #[test]
-    fn a_drop_between_stores_is_a_transplant() {
-        let (from_store, to_store) = (StoreId::new(), StoreId::new());
-        let (dragged, parent) = (NodeId::new(), NodeId::new());
-
-        let decision = decide_drop((from_store, dragged), (to_store, parent), Full, Full, Full);
-        match decision {
-            DropDecision::Send(BackendCommand::TransplantNode {
-                from_store_id, node_id, to_store_id, new_parent_id, position: None,
-            }) => {
-                assert_eq!((from_store_id, node_id, to_store_id, new_parent_id), (from_store, dragged, to_store, parent));
-            }
-            other => panic!("expected a TransplantNode, got {other:?}"),
-        }
-    }
-
-    /// Any of the three documents a move touches being read only refuses the
-    /// drop and sends nothing, same store or not: the node itself, the list
-    /// it leaves, and the list it joins (docs/NODE_DOCUMENT_CONTRACT.md
-    /// section 5, "Roles").
-    #[test]
-    fn a_read_only_place_refuses_the_drop_and_sends_nothing() {
-        let (store_id, other_store) = (StoreId::new(), StoreId::new());
-        let (dragged, parent) = (NodeId::new(), NodeId::new());
-        let cases = [(Read, Full, Full), (Full, Read, Full), (Full, Full, Read)];
-
-        for (node_access, leaves_access, target_access) in cases {
-            for target_store in [store_id, other_store] {
-                let decision = decide_drop((store_id, dragged), (target_store, parent), node_access, leaves_access, target_access);
-                match decision {
-                    DropDecision::Refused(reason) => assert_eq!(reason, pimble_core::StoreAccess::READ_ONLY_REFUSAL),
-                    other => panic!("expected a refusal for {node_access:?}/{leaves_access:?}/{target_access:?} into store {target_store:?}, got {other:?}"),
-                }
-            }
-        }
     }
 }

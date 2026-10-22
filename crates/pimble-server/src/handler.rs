@@ -50,7 +50,7 @@ use jsonrpsee::core::{async_trait, SubscriptionResult};
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{Extensions, PendingSubscriptionSink, SubscriptionMessage};
 use pimble_client::{describe_connect_error, PimbleClient};
-use pimble_core::{AuthMethod, BlobUrl, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState, Workspace};
+use pimble_core::{AuthMethod, BlobUrl, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, Place, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState, Workspace};
 use pimble_crdt::{NodeDoc, NodeFields, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_plugins::PluginHost;
 use pimble_rpc::{
@@ -64,7 +64,7 @@ use pimble_rpc::{
     CreateWorkspaceRequest, DeleteNodeRequest, EditOperation, EmptyResponse, GetChildrenRequest,
     GetChildrenResponse, GetMountStateRequest, GetMountStateResponse, GetNodeRequest, GetStoreSyncRequest, GetStoreSyncResponse, SetStoreSyncRequest,
     GetNodeResponse, GetNodesRequest, GetNodesResponse, ListRemoteStoresRequest, ListStoresResponse, LoadWorkspaceRequest,
-    LoadWorkspaceResponse, MoveNodeRequest, MoveNodeResponse, ListDeletedRequest, ListDeletedResponse, TransplantNodeRequest, TransplantNodeResponse, NodeContentChangedNotification, NodeContentDiff, OpenStoreRequest,
+    LoadWorkspaceResponse, MoveNodeRequest, MoveNodeResponse, MoveNodesRequest, MoveNodesResponse, ListDeletedRequest, ListDeletedResponse, TransplantNodeRequest, TransplantNodeResponse, NodeContentChangedNotification, NodeContentDiff, OpenStoreRequest,
     OpenStoreResponse, PimbleApiServer, RebuildIndexRequest, RebuildIndexResponse, RemoveReplicaRequest,
     SaveWorkspaceRequest, SearchRequest, SearchResponse, SearchResultItem, StoreChangeKind,
     CloudShareInfoResponse, CloudShareInviteRequest, CloudShareNodeRequest, CloudShareRef, CloudShareRemoveMemberRequest, DeleteVaultStoreRequest,
@@ -3806,7 +3806,7 @@ impl PimbleApiServer for RpcHandler {
             return Err(write_refusal(&manager, request.store_id, &[parent_id]));
         }
         let (node_id, edit) = manager
-            .create_node(request.store_id, node, Some(parent_id))
+            .create_node_at(request.store_id, node, Some(parent_id), request.place)
             .map_err(to_rpc_error)?;
 
         // A node that is created and never edited again has no other flush
@@ -4191,7 +4191,7 @@ impl PimbleApiServer for RpcHandler {
             .unwrap_or_else(|_| vec![request.node_id]);
 
         let (new_node_id, left_shares, edit) = manager
-            .move_node(request.store_id, request.node_id, request.new_parent_id, request.position)
+            .move_node(request.store_id, request.node_id, request.new_parent_id, request.place)
             .map_err(to_rpc_error)?;
 
         manager
@@ -4250,6 +4250,62 @@ impl PimbleApiServer for RpcHandler {
         Ok(MoveNodeResponse { node_id: new_node_id, left_shares })
     }
 
+    async fn move_nodes(
+        &self,
+        ext: &Extensions,
+        request: MoveNodesRequest,
+    ) -> Result<MoveNodesResponse, ErrorObjectOwned> {
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Write)?;
+        self.reject_if_vault(request.store_id).await?;
+        let mut node_ids: Vec<NodeId> = Vec::with_capacity(request.node_ids.len());
+        for id in &request.node_ids {
+            if !node_ids.contains(id) {
+                node_ids.push(*id);
+            }
+        }
+
+        // Every node is judged before any is moved: one refusal refuses
+        // them all (docs/TREE_CONTRACT.md, Joe 2026-10-19).
+        {
+            let manager = self.store_manager.write().await;
+            let reach = Reach::of(&manager, &principal, request.store_id);
+            require_in_scope(&reach, request.new_parent_id, Access::Write)?;
+            if manager.write_refused(request.store_id, &[request.new_parent_id]) {
+                return Err(read_only_error());
+            }
+            let tree = manager.tree(request.store_id).map_err(to_rpc_error)?;
+            for &id in &node_ids {
+                judge_move_source(&manager, &reach, request.store_id, id)?;
+                let under = tree.subtree_ids(id).unwrap_or_else(|_| vec![id]);
+                if under.contains(&request.new_parent_id) {
+                    return Err(to_rpc_error(pimble_store::StoreError::InvalidOperation(
+                        "Cannot move a node into one of its own descendants".into(),
+                    )));
+                }
+            }
+        }
+
+        // Then each through `moveNode`. To keep their order without
+        // waiting on the ids transplants give them, every node goes to the
+        // same place, the last first; at the end they simply go in order.
+        let mut answers: HashMap<NodeId, MoveNodeResponse> = HashMap::new();
+        let order: Vec<NodeId> = match request.place {
+            Place::Last => node_ids.clone(),
+            _ => node_ids.iter().rev().copied().collect(),
+        };
+        for id in order {
+            let answer = self
+                .move_node(
+                    ext,
+                    MoveNodeRequest { store_id: request.store_id, node_id: id, new_parent_id: request.new_parent_id, place: request.place },
+                )
+                .await?;
+            answers.insert(id, answer);
+        }
+        Ok(MoveNodesResponse { moved: node_ids.iter().filter_map(|id| answers.remove(id)).collect() })
+    }
+
     async fn transplant_node(
         &self,
         ext: &Extensions,
@@ -4279,7 +4335,7 @@ impl PimbleApiServer for RpcHandler {
                         store_id: request.from_store_id,
                         node_id: request.node_id,
                         new_parent_id: request.new_parent_id,
-                        position: request.position,
+                        place: request.place,
                     },
                 )
                 .await?;
@@ -4304,7 +4360,7 @@ impl PimbleApiServer for RpcHandler {
         }
 
         let outcome = manager
-            .transplant_node(request.from_store_id, request.node_id, request.to_store_id, request.new_parent_id, request.position)
+            .transplant_node(request.from_store_id, request.node_id, request.to_store_id, request.new_parent_id, request.place)
             .map_err(to_rpc_error)?;
 
         manager.flush(request.from_store_id).await.map_err(to_rpc_error)?;
@@ -5369,6 +5425,7 @@ impl PimbleApiServer for RpcHandler {
 mod tests {
     use super::*;
     use pimble_crdt::Tree;
+    use pimble_core::Place;
 
     const T0: &str = "2026-09-18T10:00:00Z";
     const T1: &str = "2026-09-18T10:00:01Z";
@@ -5426,7 +5483,7 @@ mod tests {
         let mut merged = replica_of(&tree);
 
         let x = NodeId::new();
-        let mut edit = tree.add_node(x, Some(root), None, "document", "X", T0).unwrap();
+        let mut edit = tree.add_node(x, Some(root), Place::Last, "document", "X", T0).unwrap();
         edit.touched.extend(tree.set_tags(x, &["a".into(), "b".into()], T1).unwrap().touched);
         edit.touched.extend(tree.set_custom(x, "icon", &serde_json::json!("star"), T1).unwrap().touched);
         edit.touched.extend(tree.set_title(x, "Renamed", T1).unwrap().touched);
@@ -5468,13 +5525,13 @@ mod tests {
         let root = NodeId::new();
         let mut tree = Tree::new(root, "Store", T0).unwrap();
         let (p, q) = (NodeId::new(), NodeId::new());
-        tree.add_node(p, Some(root), None, "folder", "P", T0).unwrap();
-        tree.add_node(q, Some(root), None, "folder", "Q", T0).unwrap();
+        tree.add_node(p, Some(root), Place::Last, "folder", "P", T0).unwrap();
+        tree.add_node(q, Some(root), Place::Last, "folder", "Q", T0).unwrap();
         let x = NodeId::new();
 
         // Created: the node is new, the parent's list changed.
         let before = replica_of(&tree);
-        tree.add_node(x, Some(p), None, "document", "X", T0).unwrap();
+        tree.add_node(x, Some(p), Place::Last, "document", "X", T0).unwrap();
         let (b, a) = shapes(&before, &tree, x);
         assert!(matches!(derive_kinds(x, root, b.as_ref(), a.as_ref(), structural())[..], [StoreChangeKind::NodeCreated { node_id, parent_id }] if node_id == x && parent_id == p));
         let (b, a) = shapes(&before, &tree, p);
@@ -5482,7 +5539,7 @@ mod tests {
 
         // Moved.
         let before = replica_of(&tree);
-        tree.move_node(x, q, None, T1).unwrap();
+        tree.move_node(x, q, Place::Last, T1).unwrap();
         let (b, a) = shapes(&before, &tree, x);
         assert!(matches!(
             derive_kinds(x, root, b.as_ref(), a.as_ref(), structural())[..],

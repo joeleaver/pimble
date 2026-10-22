@@ -80,7 +80,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use pimble_app::protocol::{BackendCommand, BackendEvent};
 use pimble_client::PimbleClient;
 use pimble_core::{
-    custom_keys, node_types, DeletedNode, LeftShare, LinkResolution, Node, NodeId, PimbleUrl, MAX_LINK_HOPS, NodeMetadata, RelaySide, Store, StoreAccess, StoreId, StoreKind,
+    custom_keys, node_types, DeletedNode, LeftShare, LinkResolution, Node, NodeId, PimbleUrl, MAX_LINK_HOPS, NodeMetadata, Place, RelaySide, Store, StoreAccess, StoreId, StoreKind,
 };
 use pimble_crdt::{NodeDoc, NodeFields, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_crypto::{blob_aad, dek_aad, unwrap_dek, wrap_dek, Blob, KeyId, SymmetricKey, WrappedDek};
@@ -142,6 +142,9 @@ pub enum Handled {
     No(BackendCommand),
     /// Answered here. The event, if there is one, is the command's reply.
     Yes(Option<BackendEvent>),
+    /// Answered here with several events, in order (a `MoveNodes`: one per
+    /// node).
+    Several(Vec<BackendEvent>),
 }
 
 /// What this page knows about one node document's log. The document itself
@@ -1257,8 +1260,8 @@ impl VaultClient {
 
             BackendCommand::GetNode { store_id, node_id } => Some(self.get_node(store_id, node_id)),
 
-            BackendCommand::CreateNode { store_id, parent_id, title, init } => {
-                Some(self.create_node(client, store_id, parent_id, title, init).await)
+            BackendCommand::CreateNode { store_id, parent_id, title, init, place } => {
+                Some(self.create_node(client, store_id, parent_id, title, init, place).await)
             }
 
             BackendCommand::CreateAttachment { store_id, host_id, title, init } => {
@@ -1281,8 +1284,12 @@ impl VaultClient {
                 Some(self.delete_node(client, store_id, node_id).await)
             }
 
-            BackendCommand::MoveNode { store_id, node_id, new_parent_id, position } => {
-                Some(self.move_node(client, store_id, node_id, new_parent_id, position).await)
+            BackendCommand::MoveNodes { store_id, node_ids, new_parent_id, place } => {
+                return Handled::Several(self.move_nodes(client, store_id, node_ids, new_parent_id, place).await);
+            }
+
+            BackendCommand::MoveNode { store_id, node_id, new_parent_id, place } => {
+                Some(self.move_node(client, store_id, node_id, new_parent_id, place).await)
             }
 
             BackendCommand::UndeleteNode { store_id, node_id } => {
@@ -1650,6 +1657,7 @@ impl VaultClient {
         parent_id: Option<NodeId>,
         title: String,
         init: Option<pimble_app::protocol::NodeInit>,
+        place: Place,
     ) -> BackendEvent {
         let node_id = NodeId::new();
         let request = init.as_ref().and_then(|init| init.request);
@@ -1661,7 +1669,7 @@ impl VaultClient {
             let parent = parent_id.unwrap_or(store.tree.root());
             let mut edit = store.seed_root(&now);
             let node_type = init.as_ref().map_or(node_types::DOCUMENT, |init| init.node_type.as_str());
-            match store.tree.add_node(node_id, Some(parent), None, node_type, &title, &now) {
+            match store.tree.add_node(node_id, Some(parent), place, node_type, &title, &now) {
                 Ok(more) => edit.touched.extend(more.touched),
                 Err(e) => return BackendEvent::Error { message: e.to_string() },
             }
@@ -1850,13 +1858,52 @@ impl VaultClient {
     /// documents new-first, tombstones-last, and one `append_edit` call sends
     /// them in that order; a document an append fails on is marked unsent and
     /// resent by the existing mechanism, whichever half of the move it was.
+    /// Several nodes under one parent, in order, all or none: what `moveNodes`
+    /// is for a plain store (docs/TREE_CONTRACT.md). Every node is judged
+    /// first; then each goes to the same place, the last first (in order when
+    /// the place is the end), so they keep their order without waiting on the
+    /// ids transplants give them.
+    async fn move_nodes(
+        &mut self,
+        client: &Arc<PimbleClient>,
+        store_id: StoreId,
+        node_ids: Vec<NodeId>,
+        new_parent_id: NodeId,
+        place: Place,
+    ) -> Vec<BackendEvent> {
+        {
+            let Some(store) = self.stores.get(&store_id) else {
+                return vec![BackendEvent::Error { message: "no such encrypted store".into() }];
+            };
+            for &id in &node_ids {
+                let inside = store.tree.subtree_ids(id).map(|ids| ids.contains(&new_parent_id));
+                match inside {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        return vec![BackendEvent::Error { message: "Cannot move a node into one of its own descendants".into() }];
+                    }
+                    Err(e) => return vec![BackendEvent::Error { message: e.to_string() }],
+                }
+            }
+        }
+        let order: Vec<NodeId> = match place {
+            Place::Last => node_ids,
+            _ => node_ids.into_iter().rev().collect(),
+        };
+        let mut events = Vec::with_capacity(order.len());
+        for id in order {
+            events.push(self.move_node(client, store_id, id, new_parent_id, place).await);
+        }
+        events
+    }
+
     async fn move_node(
         &mut self,
         client: &Arc<PimbleClient>,
         store_id: StoreId,
         node_id: NodeId,
         new_parent_id: NodeId,
-        position: Option<usize>,
+        place: Place,
     ) -> BackendEvent {
         let now = now_rfc3339();
         let (old_parent_id, title, left_shares, new_node_id, edit) = {
@@ -1873,7 +1920,7 @@ impl VaultClient {
             // nothing about the shares it used to be in.
             let left_shares = as_left_shares(&store.tree, store.tree.shares_left(node_id, new_parent_id));
             let mut edit = store.seed_root(&now);
-            let (new_node_id, more) = match store.tree.move_or_transplant(store_id, node_id, new_parent_id, position, &now, &mut NodeId::new) {
+            let (new_node_id, more) = match store.tree.move_or_transplant(store_id, node_id, new_parent_id, place, &now, &mut NodeId::new) {
                 Ok(v) => v,
                 Err(e) => return BackendEvent::Error { message: e.to_string() },
             };
@@ -1991,7 +2038,7 @@ impl VaultClient {
         node_id: NodeId,
         to_store_id: StoreId,
         new_parent_id: NodeId,
-        position: Option<usize>,
+        place: Place,
     ) -> BackendEvent {
         let now = now_rfc3339();
 
@@ -2019,7 +2066,7 @@ impl VaultClient {
                 return BackendEvent::Error { message: "no such encrypted store".into() };
             };
             let mut edit = to_store.seed_root(&now);
-            match to_store.tree.plant(cutting, new_parent_id, position, &now, &mut NodeId::new) {
+            match to_store.tree.plant(cutting, new_parent_id, place, &now, &mut NodeId::new) {
                 Ok((planted, more)) => {
                     edit.touched.extend(more.touched);
                     (planted, edit)
@@ -3783,6 +3830,7 @@ pub fn store_id_of(cmd: &BackendCommand) -> Option<StoreId> {
         | SetNodeAppearance { store_id, .. }
         | DeleteNode { store_id, .. }
         | MoveNode { store_id, .. }
+        | MoveNodes { store_id, .. }
         | UndeleteNode { store_id, .. }
         | ListDeleted { store_id }
         | GetAncestors { store_id, .. }
@@ -3822,6 +3870,7 @@ pub fn writes(cmd: &BackendCommand) -> bool {
             | DeleteNode { .. }
             | UndeleteNode { .. }
             | MoveNode { .. }
+            | MoveNodes { .. }
             | TransplantNode { .. }
             | SetNodeContent { .. }
             | BroadcastChanges { .. }
@@ -4180,9 +4229,9 @@ mod tests {
     fn the_tree_is_built_from_the_documents_and_follows_their_updates() {
         let (mut peer, root) = origin();
         let (folder, x, y) = (NodeId::new(), NodeId::new(), NodeId::new());
-        peer.add_node(folder, Some(root), None, "folder", "F", T0).unwrap();
-        peer.add_node(x, Some(root), None, "document", "x", T0).unwrap();
-        peer.add_node(y, Some(folder), None, "document", "y", T0).unwrap();
+        peer.add_node(folder, Some(root), Place::Last, "folder", "F", T0).unwrap();
+        peer.add_node(x, Some(root), Place::Last, "document", "x", T0).unwrap();
+        peer.add_node(y, Some(folder), Place::Last, "document", "y", T0).unwrap();
 
         let store_id = StoreId::new();
         let mut store = opened(&peer);
@@ -4198,13 +4247,13 @@ mod tests {
         let mut seq = 10;
         // A create arriving as two document updates.
         let z = NodeId::new();
-        let edit = peer.add_node(z, Some(folder), Some(0), "document", "z", T1).unwrap();
+        let edit = peer.add_node(z, Some(folder), Place::First, "document", "z", T1).unwrap();
         arrive(&mut store, store_id, &edit, &mut seq, None);
         assert_eq!(store.children_of(folder).unwrap(), vec![z, y]);
         assert_eq!(store.node_of(z).unwrap().metadata.title, "z");
 
         // A move: three documents' updates.
-        let edit = peer.move_node(y, root, None, T1).unwrap();
+        let edit = peer.move_node(y, root, Place::Last, T1).unwrap();
         arrive(&mut store, store_id, &edit, &mut seq, None);
         assert_eq!(store.children_of(folder).unwrap(), vec![z]);
         assert_eq!(store.children_of(root).unwrap(), vec![folder, x, y]);
@@ -4225,7 +4274,7 @@ mod tests {
     fn the_root_is_the_manifest_s_unless_the_documents_name_another() {
         let (mut peer, real_root) = origin();
         let x = NodeId::new();
-        peer.add_node(x, Some(real_root), None, "document", "x", T0).unwrap();
+        peer.add_node(x, Some(real_root), Place::Last, "document", "x", T0).unwrap();
 
         // A store hosted from a desktop: the manifest carries a placeholder
         // the desktop's documents never mention.
@@ -4249,7 +4298,7 @@ mod tests {
         assert!(empty.tree.has_node(placeholder));
         assert!(empty.seed_root(T1).is_empty());
         let y = NodeId::new();
-        empty.tree.add_node(y, Some(placeholder), None, "document", "y", T1).unwrap();
+        empty.tree.add_node(y, Some(placeholder), Place::Last, "document", "y", T1).unwrap();
         assert_eq!(empty.children_of(placeholder).unwrap(), vec![y]);
     }
 
@@ -4263,7 +4312,7 @@ mod tests {
 
         let (mut peer, real_root) = origin();
         let x = NodeId::new();
-        let edit = peer.add_node(x, Some(real_root), None, "document", "x", T0).unwrap();
+        let edit = peer.add_node(x, Some(real_root), Place::Last, "document", "x", T0).unwrap();
         let mut seq = 0;
         // The child's document lands first: no root to adopt yet.
         arrive(&mut store, store_id, &TreeEdit { touched: vec![edit.touched[0].clone()] }, &mut seq, None);
@@ -4287,7 +4336,7 @@ mod tests {
         let store_id = StoreId::new();
         let mut store = opened(&peer);
         let x = NodeId::new();
-        let edit = store.tree.add_node(x, Some(root), None, "document", "x", T1).unwrap();
+        let edit = store.tree.add_node(x, Some(root), Place::Last, "document", "x", T1).unwrap();
         assert_eq!(edit.node_ids(), vec![x, root], "the new document before its parent's list");
 
         let mut seq = 0;
@@ -4379,8 +4428,8 @@ mod tests {
     fn merged_structural_updates_earn_the_kinds_the_server_derives() {
         let (mut peer, root) = origin();
         let (p, q) = (NodeId::new(), NodeId::new());
-        peer.add_node(p, Some(root), None, "folder", "P", T0).unwrap();
-        peer.add_node(q, Some(root), None, "folder", "Q", T0).unwrap();
+        peer.add_node(p, Some(root), Place::Last, "folder", "P", T0).unwrap();
+        peer.add_node(q, Some(root), Place::Last, "folder", "Q", T0).unwrap();
         let store_id = StoreId::new();
         let mut store = opened(&peer);
         let mut seq = 0;
@@ -4388,7 +4437,7 @@ mod tests {
         // Create: the node's own document is `NodeCreated`, the parent's
         // list `TreeStructure`.
         let x = NodeId::new();
-        let edit = peer.add_node(x, Some(p), None, "document", "x", T1).unwrap();
+        let edit = peer.add_node(x, Some(p), Place::Last, "document", "x", T1).unwrap();
         let (events, structure) = arrive(&mut store, store_id, &edit, &mut seq, None);
         assert!(structure);
         assert!(matches!(kinds_of(&events)[..], [StoreChangeKind::NodeCreated { node_id, parent_id }, StoreChangeKind::TreeStructure { ref node_ids }] if node_id == x && parent_id == p && node_ids == &vec![p]), "{events:?}");
@@ -4399,7 +4448,7 @@ mod tests {
         assert!(matches!(kinds_of(&events)[..], [StoreChangeKind::MetadataUpdated { node_id }] if node_id == x), "{events:?}");
 
         // Move: `NodeMoved` for the node, `TreeStructure` for both lists.
-        let edit = peer.move_node(x, q, None, T1).unwrap();
+        let edit = peer.move_node(x, q, Place::Last, T1).unwrap();
         let (events, _) = arrive(&mut store, store_id, &edit, &mut seq, None);
         let kinds = kinds_of(&events);
         assert!(kinds.iter().any(|k| matches!(k, StoreChangeKind::NodeMoved { node_id, old_parent_id, new_parent_id } if *node_id == x && *old_parent_id == p && *new_parent_id == q)), "{kinds:?}");
@@ -4420,7 +4469,7 @@ mod tests {
     fn a_content_update_reaches_the_editor_only_for_the_node_it_has_open() {
         let (mut peer, root) = origin();
         let x = NodeId::new();
-        peer.add_node(x, Some(root), None, "document", "x", T0).unwrap();
+        peer.add_node(x, Some(root), Place::Last, "document", "x", T0).unwrap();
         let store_id = StoreId::new();
         let mut store = opened(&peer);
 
@@ -4449,12 +4498,12 @@ mod tests {
     fn a_pull_is_repaired_once_after_the_whole_of_it() {
         let (mut peer, root) = origin();
         let (p, q, x) = (NodeId::new(), NodeId::new(), NodeId::new());
-        peer.add_node(p, Some(root), None, "folder", "P", T0).unwrap();
-        peer.add_node(q, Some(root), None, "folder", "Q", T0).unwrap();
-        peer.add_node(x, Some(p), None, "document", "x", T0).unwrap();
+        peer.add_node(p, Some(root), Place::Last, "folder", "P", T0).unwrap();
+        peer.add_node(q, Some(root), Place::Last, "folder", "Q", T0).unwrap();
+        peer.add_node(x, Some(p), Place::Last, "document", "x", T0).unwrap();
         let before = pull_of(&peer);
         let before_the_move = opened(&peer);
-        let edit = peer.move_node(x, q, None, T1).unwrap();
+        let edit = peer.move_node(x, q, Place::Last, T1).unwrap();
         assert_eq!(edit.touched.len(), 3);
 
         // The pull holds the snapshots and, after them, the move's three
@@ -4497,7 +4546,7 @@ mod tests {
     fn a_repair_writes_what_the_tree_needs_and_names_it() {
         let (mut peer, root) = origin();
         let x = NodeId::new();
-        peer.add_node(x, Some(root), None, "document", "x", T0).unwrap();
+        peer.add_node(x, Some(root), Place::Last, "document", "x", T0).unwrap();
         let mut store = opened(&peer);
         // A duplicate a concurrent append left in the root's list.
         store.tree.doc_mut(root).unwrap().insert_child(99, x).unwrap();
@@ -4712,6 +4761,7 @@ mod tests {
         client.endpoint_down(&[store_id]);
         let answered = |handled: Handled| match handled {
             Handled::Yes(event) => event,
+            Handled::Several(events) => panic!("answered with several: {events:?}"),
             Handled::No(cmd) => panic!("handed back: {cmd:?}"),
         };
 
@@ -4736,7 +4786,7 @@ mod tests {
         // A write is refused with the sentence that says why, before anything
         // is asked of anyone; a read is not.
         let refused = client
-            .refuse_write(store_id, &BackendCommand::CreateNode { store_id, parent_id: None, title: "New".into(), init: None })
+            .refuse_write(store_id, &BackendCommand::CreateNode { store_id, parent_id: None, title: "New".into(), init: None, place: Default::default() })
             .expect("nothing can be created in a store that cannot be reached");
         assert!(
             matches!(&refused, BackendEvent::Error { message } if message == &format!("Forbidden: {OWNER_OFFLINE_REFUSAL}")),
@@ -4762,7 +4812,7 @@ mod tests {
         // share's documents, pulled and held. (The relay face lists it to a
         // member as "Shared with you".)
         let (mut peer, root) = origin();
-        peer.add_node(NodeId::new(), Some(root), None, "document", "Pasta", T0).unwrap();
+        peer.add_node(NodeId::new(), Some(root), Place::Last, "document", "Pasta", T0).unwrap();
         client.rows.insert(store_id, relayed_row(vec![grant(Some(root), "editor", "Recipes")], Some("ann@example.com")));
         let mut listed = Store::new_local("Shared with you", PathBuf::new());
         listed.id = store_id;
@@ -4781,7 +4831,7 @@ mod tests {
 
         // And it answers like any open store from here on.
         assert!(matches!(client.handle_unreachable(BackendCommand::GetChildren { store_id, node_id: root }), Handled::No(_)));
-        assert!(client.refuse_write(store_id, &BackendCommand::CreateNode { store_id, parent_id: Some(root), title: "New".into(), init: None }).is_none());
+        assert!(client.refuse_write(store_id, &BackendCommand::CreateNode { store_id, parent_id: Some(root), title: "New".into(), init: None, place: Default::default() }).is_none());
         let BackendEvent::ChildrenLoaded { children, .. } = client.get_children(store_id, root) else { panic!("no list") };
         assert!(!children.is_empty());
         assert!(children.iter().all(|node| node.access == StoreAccess::Full));
@@ -4798,7 +4848,7 @@ mod tests {
     fn a_held_store_whose_owner_goes_offline_is_read_and_not_changed() {
         let (mut client, store_id, _) = page_with_a_relayed_share();
         let (mut peer, root) = origin();
-        peer.add_node(NodeId::new(), Some(root), None, "document", "Pasta", T0).unwrap();
+        peer.add_node(NodeId::new(), Some(root), Place::Last, "document", "Pasta", T0).unwrap();
         client.rows.insert(store_id, relayed_row(vec![grant(None, "editor", "")], None));
         client.stores.insert(store_id, opened(&peer));
 
@@ -4889,7 +4939,7 @@ mod tests {
     #[test]
     fn a_new_epoch_makes_the_page_forget_what_it_read() {
         let (mut peer, root) = origin();
-        peer.add_node(NodeId::new(), Some(root), None, "document", "Pasta", T0).unwrap();
+        peer.add_node(NodeId::new(), Some(root), Place::Last, "document", "Pasta", T0).unwrap();
         let store_id = StoreId::new();
         let mut store = opened(&peer);
         let child = peer.get_children(root).unwrap()[0];
@@ -5080,9 +5130,9 @@ mod tests {
     fn a_document_a_scoped_member_creates_is_wrapped_under_the_share_key() {
         let (mut peer, root) = origin();
         let folder = NodeId::new();
-        peer.add_node(folder, Some(root), None, "folder", "Recipes", T0).unwrap();
+        peer.add_node(folder, Some(root), Place::Last, "folder", "Recipes", T0).unwrap();
         let child = NodeId::new();
-        peer.add_node(child, Some(folder), None, "document", "Bread", T0).unwrap();
+        peer.add_node(child, Some(folder), Place::Last, "document", "Bread", T0).unwrap();
 
         // The recipient's page: the share's key, the share's documents, and
         // the shared node as its root.
@@ -5098,7 +5148,7 @@ mod tests {
 
         // A node they make in the shared folder.
         let mine = NodeId::new();
-        let edit = store.tree.add_node(mine, Some(folder), None, "document", "Soup", T1).unwrap();
+        let edit = store.tree.add_node(mine, Some(folder), Place::Last, "document", "Soup", T1).unwrap();
         let outgoing = store.prepare(store_id, mine, &edit.touched[0].1).unwrap();
         let (keys, parent_id) = outgoing.created.as_ref().expect("the server has never seen this document");
         assert_eq!(*parent_id, Some(folder), "the append names the parent, so the new document joins the scope");
@@ -5137,7 +5187,7 @@ mod tests {
     fn an_owner_s_new_document_is_wrapped_under_the_store_key_and_every_share_above_it() {
         let (mut peer, root) = origin();
         let folder = NodeId::new();
-        peer.add_node(folder, Some(root), None, "folder", "Recipes", T0).unwrap();
+        peer.add_node(folder, Some(root), Place::Last, "folder", "Recipes", T0).unwrap();
 
         // The owner's page: the store key, and the key of the share sitting on
         // that folder, which its marker names.
@@ -5153,7 +5203,7 @@ mod tests {
 
         // Inside the share: both keys.
         let inside = NodeId::new();
-        let edit = store.tree.add_node(inside, Some(folder), None, "document", "Bread", T1).unwrap();
+        let edit = store.tree.add_node(inside, Some(folder), Place::Last, "document", "Bread", T1).unwrap();
         let outgoing = store.prepare(store_id, inside, &edit.touched[0].1).unwrap();
         let (keys, parent_id) = outgoing.created.as_ref().expect("new to the server");
         assert_eq!(*parent_id, Some(folder));
@@ -5165,7 +5215,7 @@ mod tests {
 
         // Outside it: the store key alone.
         let outside = NodeId::new();
-        let edit = store.tree.add_node(outside, Some(root), None, "document", "Notes", T1).unwrap();
+        let edit = store.tree.add_node(outside, Some(root), Place::Last, "document", "Notes", T1).unwrap();
         let outgoing = store.prepare(store_id, outside, &edit.touched[0].1).unwrap();
         let (keys, _) = outgoing.created.as_ref().expect("new to the server");
         assert_eq!(keys.wraps.iter().map(|w| w.scope_key_id).collect::<Vec<_>>(), vec![store_key_id]);
@@ -5250,13 +5300,13 @@ mod tests {
     fn an_owner_s_page_reads_what_a_member_made_once_it_holds_the_share_s_key() {
         let (mut peer, root) = origin();
         let (folder, bread, soup) = (NodeId::new(), NodeId::new(), NodeId::new());
-        peer.add_node(folder, Some(root), None, "folder", "Recipes", T0).unwrap();
-        peer.add_node(bread, Some(folder), None, "document", "Bread", T0).unwrap();
+        peer.add_node(folder, Some(root), Place::Last, "folder", "Recipes", T0).unwrap();
+        peer.add_node(bread, Some(folder), Place::Last, "document", "Bread", T0).unwrap();
         let (share_key_id, share_key) = scope_key();
         mark_shared(&mut peer, folder, share_key_id, "Recipes");
         // A member's note, made while every desktop of the owner's was off:
         // its data key is wrapped under the share's key and nothing else.
-        peer.add_node(soup, Some(folder), None, "document", "Soup", T1).unwrap();
+        peer.add_node(soup, Some(folder), Place::Last, "document", "Soup", T1).unwrap();
 
         let store_id = StoreId::new();
         let (mut store, shut, _, store_key_id) = owners_page(store_id, &peer, &[soup], (share_key_id, &share_key));
@@ -5308,7 +5358,7 @@ mod tests {
     fn a_marker_arriving_in_an_update_schedules_one_look_for_its_key() {
         let (mut peer, root) = origin();
         let folder = NodeId::new();
-        peer.add_node(folder, Some(root), None, "folder", "Recipes", T0).unwrap();
+        peer.add_node(folder, Some(root), Place::Last, "folder", "Recipes", T0).unwrap();
         let (share_key_id, share_key) = scope_key();
         let store_id = StoreId::new();
         let (mut store, shut, deks, _) = owners_page(store_id, &peer, &[], (share_key_id, &share_key));
@@ -5366,7 +5416,7 @@ mod tests {
     fn a_blob_that_will_not_open_is_read_again_for_its_wraps_once() {
         let (mut peer, root) = origin();
         let folder = NodeId::new();
-        peer.add_node(folder, Some(root), None, "folder", "Recipes", T0).unwrap();
+        peer.add_node(folder, Some(root), Place::Last, "folder", "Recipes", T0).unwrap();
         let (share_key_id, share_key) = scope_key();
         mark_shared(&mut peer, folder, share_key_id, "Recipes");
         let store_id = StoreId::new();
@@ -5377,7 +5427,7 @@ mod tests {
         // carries the blob and never the wraps, so the key it names is one
         // this page has not heard of.
         let soup = NodeId::new();
-        let edit = peer.add_node(soup, Some(folder), None, "document", "Soup", T1).unwrap();
+        let edit = peer.add_node(soup, Some(folder), Place::Last, "document", "Soup", T1).unwrap();
         assert_eq!(edit.node_ids(), vec![soup, folder]);
         let (fetched, (soup_dek_id, soup_dek)) = fetched_under(store_id, soup, &[edit.touched[0].1.clone()], &[(share_key_id, &share_key)]);
         let first = &fetched.updates[0].blob;
@@ -5434,14 +5484,14 @@ mod tests {
     fn an_owner_creating_under_a_shared_root_wraps_under_the_share_s_key_once_it_holds_it() {
         let (mut peer, root) = origin();
         let folder = NodeId::new();
-        peer.add_node(folder, Some(root), None, "folder", "Recipes", T0).unwrap();
+        peer.add_node(folder, Some(root), Place::Last, "folder", "Recipes", T0).unwrap();
         let (share_key_id, share_key) = scope_key();
         mark_shared(&mut peer, folder, share_key_id, "Recipes");
         let store_id = StoreId::new();
         let (mut store, _, _, store_key_id) = owners_page(store_id, &peer, &[], (share_key_id, &share_key));
         let wraps_of = |store: &mut VaultStore, title: &str| {
             let id = NodeId::new();
-            let edit = store.tree.add_node(id, Some(folder), None, "document", title, T1).unwrap();
+            let edit = store.tree.add_node(id, Some(folder), Place::Last, "document", title, T1).unwrap();
             let outgoing = store.prepare(store_id, id, &edit.touched[0].1).unwrap();
             let (keys, _) = outgoing.created.expect("new to the server");
             let mut under: Vec<KeyId> = keys.wraps.iter().map(|w| w.scope_key_id).collect();
@@ -5462,7 +5512,7 @@ mod tests {
 
         // Outside the share: the store key alone, as before.
         let outside = NodeId::new();
-        let edit = store.tree.add_node(outside, Some(root), None, "document", "Notes", T1).unwrap();
+        let edit = store.tree.add_node(outside, Some(root), Place::Last, "document", "Notes", T1).unwrap();
         let outgoing = store.prepare(store_id, outside, &edit.touched[0].1).unwrap();
         let (keys, _) = outgoing.created.expect("new to the server");
         assert_eq!(keys.wraps.iter().map(|w| w.scope_key_id).collect::<Vec<_>>(), vec![store_key_id]);
@@ -5474,13 +5524,13 @@ mod tests {
     fn repair_leaves_a_scope_root_whose_parent_is_not_held_where_it_is() {
         let (mut peer, root) = origin();
         let (recipes, plans, elsewhere) = (NodeId::new(), NodeId::new(), NodeId::new());
-        peer.add_node(recipes, Some(root), None, "folder", "Recipes", T0).unwrap();
-        peer.add_node(plans, Some(root), None, "folder", "Plans", T0).unwrap();
-        peer.add_node(elsewhere, Some(root), None, "folder", "Elsewhere", T0).unwrap();
+        peer.add_node(recipes, Some(root), Place::Last, "folder", "Recipes", T0).unwrap();
+        peer.add_node(plans, Some(root), Place::Last, "folder", "Plans", T0).unwrap();
+        peer.add_node(elsewhere, Some(root), Place::Last, "folder", "Elsewhere", T0).unwrap();
         let (bread, monday, stray) = (NodeId::new(), NodeId::new(), NodeId::new());
-        peer.add_node(bread, Some(recipes), None, "document", "Bread", T0).unwrap();
-        peer.add_node(monday, Some(plans), None, "document", "Monday", T0).unwrap();
-        peer.add_node(stray, Some(elsewhere), None, "document", "Stray", T0).unwrap();
+        peer.add_node(bread, Some(recipes), Place::Last, "document", "Bread", T0).unwrap();
+        peer.add_node(monday, Some(plans), Place::Last, "document", "Monday", T0).unwrap();
+        peer.add_node(stray, Some(elsewhere), Place::Last, "document", "Stray", T0).unwrap();
 
         // Two shares of one store, and — as can happen while an owner's move
         // and their scope publish are in flight — one document that leads to
@@ -5535,14 +5585,14 @@ mod tests {
         use StoreAccess::{Full, Read};
         let (mut peer, root) = origin();
         let (recipes, plans, inner) = (NodeId::new(), NodeId::new(), NodeId::new());
-        peer.add_node(recipes, Some(root), None, "folder", "Recipes", T0).unwrap();
-        peer.add_node(plans, Some(root), None, "folder", "Plans", T0).unwrap();
+        peer.add_node(recipes, Some(root), Place::Last, "folder", "Recipes", T0).unwrap();
+        peer.add_node(plans, Some(root), Place::Last, "folder", "Plans", T0).unwrap();
         // A folder the account edits inside the one it reads.
-        peer.add_node(inner, Some(recipes), None, "folder", "Ours", T0).unwrap();
+        peer.add_node(inner, Some(recipes), Place::Last, "folder", "Ours", T0).unwrap();
         let (bread, monday, shared_list) = (NodeId::new(), NodeId::new(), NodeId::new());
-        peer.add_node(bread, Some(recipes), None, "document", "Bread", T0).unwrap();
-        peer.add_node(monday, Some(plans), None, "document", "Monday", T0).unwrap();
-        peer.add_node(shared_list, Some(inner), None, "document", "Shopping", T0).unwrap();
+        peer.add_node(bread, Some(recipes), Place::Last, "document", "Bread", T0).unwrap();
+        peer.add_node(monday, Some(plans), Place::Last, "document", "Monday", T0).unwrap();
+        peer.add_node(shared_list, Some(inner), Place::Last, "document", "Shopping", T0).unwrap();
 
         let store_id = StoreId::new();
         let mut scoped = listed(recipes);
@@ -5689,11 +5739,11 @@ mod tests {
     fn a_share_that_ended_is_said_and_dropped_and_the_last_one_closes_the_store() {
         let (mut peer, root) = origin();
         let (recipes, plans) = (NodeId::new(), NodeId::new());
-        peer.add_node(recipes, Some(root), None, "folder", "Recipes", T0).unwrap();
-        peer.add_node(plans, Some(root), None, "folder", "Plans", T0).unwrap();
+        peer.add_node(recipes, Some(root), Place::Last, "folder", "Recipes", T0).unwrap();
+        peer.add_node(plans, Some(root), Place::Last, "folder", "Plans", T0).unwrap();
         let (bread, monday) = (NodeId::new(), NodeId::new());
-        peer.add_node(bread, Some(recipes), None, "document", "Bread", T0).unwrap();
-        peer.add_node(monday, Some(plans), None, "document", "Monday", T0).unwrap();
+        peer.add_node(bread, Some(recipes), Place::Last, "document", "Bread", T0).unwrap();
+        peer.add_node(monday, Some(plans), Place::Last, "document", "Monday", T0).unwrap();
 
         let store_id = StoreId::new();
         let mut scoped = listed(recipes);
@@ -5748,9 +5798,9 @@ mod tests {
     fn what_is_also_under_a_share_that_is_left_is_kept() {
         let (mut peer, root) = origin();
         let (outer, inner, leaf) = (NodeId::new(), NodeId::new(), NodeId::new());
-        peer.add_node(outer, Some(root), None, "folder", "Outer", T0).unwrap();
-        peer.add_node(inner, Some(outer), None, "folder", "Inner", T0).unwrap();
-        peer.add_node(leaf, Some(inner), None, "document", "Leaf", T0).unwrap();
+        peer.add_node(outer, Some(root), Place::Last, "folder", "Outer", T0).unwrap();
+        peer.add_node(inner, Some(outer), Place::Last, "folder", "Inner", T0).unwrap();
+        peer.add_node(leaf, Some(inner), Place::Last, "document", "Leaf", T0).unwrap();
         let mut scoped = listed(inner);
         scoped.roots = vec![inner, outer];
         let mut store = VaultStore::assemble(scoped, StoreKeys::new(keyring_for(Some(outer))), vec![inner, outer], pull_subset(&peer, &[outer, inner, leaf]));
@@ -5767,12 +5817,12 @@ mod tests {
     fn a_scope_that_lists_a_document_not_held_yet_is_not_judged_yet() {
         let (mut peer, root) = origin();
         let recipes = NodeId::new();
-        peer.add_node(recipes, Some(root), None, "folder", "Recipes", T0).unwrap();
+        peer.add_node(recipes, Some(root), Place::Last, "folder", "Recipes", T0).unwrap();
         let (bread, coming) = (NodeId::new(), NodeId::new());
-        peer.add_node(bread, Some(recipes), None, "document", "Bread", T0).unwrap();
+        peer.add_node(bread, Some(recipes), Place::Last, "document", "Bread", T0).unwrap();
         // A document somebody else created a moment ago: the folder's list
         // names it and its own document has not arrived.
-        peer.add_node(coming, Some(recipes), None, "document", "Soup", T1).unwrap();
+        peer.add_node(coming, Some(recipes), Place::Last, "document", "Soup", T1).unwrap();
 
         let mut scoped = listed(recipes);
         scoped.roots = vec![recipes];
@@ -5828,7 +5878,7 @@ mod tests {
     fn a_refused_append_leaves_nothing_pending_and_nothing_local() {
         let (mut peer, root) = origin();
         let x = NodeId::new();
-        peer.add_node(x, Some(root), None, "document", "x", T0).unwrap();
+        peer.add_node(x, Some(root), Place::Last, "document", "x", T0).unwrap();
         let store_id = StoreId::new();
         let mut store = opened(&peer);
 
@@ -5852,8 +5902,8 @@ mod tests {
     fn only_the_commands_that_change_something_are_writes() {
         let store_id = StoreId::new();
         let node_id = NodeId::new();
-        assert!(writes(&BackendCommand::CreateNode { store_id, parent_id: None, title: String::new(), init: None }));
-        assert!(writes(&BackendCommand::MoveNode { store_id, node_id, new_parent_id: node_id, position: None }));
+        assert!(writes(&BackendCommand::CreateNode { store_id, parent_id: None, title: String::new(), init: None, place: Default::default() }));
+        assert!(writes(&BackendCommand::MoveNode { store_id, node_id, new_parent_id: node_id, place: Place::Last }));
         assert!(writes(&BackendCommand::BroadcastChanges { store_id, node_id, changes: String::new() }));
         assert!(!writes(&BackendCommand::GetChildren { store_id, node_id }));
         assert!(!writes(&BackendCommand::SubscribeStoreChanges { store_id }));
@@ -5866,9 +5916,9 @@ mod tests {
     fn a_move_that_leaves_a_share_appends_new_documents_with_their_own_keys_and_tombstones_the_original() {
         let (mut peer, root) = origin();
         let (share_a, share_b, note) = (NodeId::new(), NodeId::new(), NodeId::new());
-        peer.add_node(share_a, Some(root), None, "folder", "Alpha", T0).unwrap();
-        peer.add_node(share_b, Some(root), None, "folder", "Beta", T0).unwrap();
-        peer.add_node(note, Some(share_a), None, "document", "Note", T0).unwrap();
+        peer.add_node(share_a, Some(root), Place::Last, "folder", "Alpha", T0).unwrap();
+        peer.add_node(share_b, Some(root), Place::Last, "folder", "Beta", T0).unwrap();
+        peer.add_node(note, Some(share_a), Place::Last, "document", "Note", T0).unwrap();
 
         // The owner's page: the store key, and the key of each share.
         let mut scope = keyring_for(None);
@@ -5892,7 +5942,7 @@ mod tests {
         assert_eq!(left_shares[0].root, share_a);
         assert_eq!(left_shares[0].name, "Alpha", "the first share it leaves, named from its marker");
 
-        let (new_id, edit) = store.tree.move_or_transplant(store_id, note, share_b, None, T1, &mut NodeId::new).unwrap();
+        let (new_id, edit) = store.tree.move_or_transplant(store_id, note, share_b, Place::Last, T1, &mut NodeId::new).unwrap();
         assert_ne!(new_id, note, "moving into a different share is a transplant, not a move");
         assert!(store.tree.doc(note).unwrap().fields().unwrap().deleted_at.is_some(), "the original is tombstoned");
 
@@ -5917,7 +5967,7 @@ mod tests {
     fn a_transplant_between_two_vault_stores_lands_with_the_text_intact_and_the_source_tombstoned() {
         let (mut peer_from, root_from) = origin();
         let note = NodeId::new();
-        peer_from.add_node(note, Some(root_from), None, "document", "Note", T0).unwrap();
+        peer_from.add_node(note, Some(root_from), Place::Last, "document", "Note", T0).unwrap();
         peer_from.doc_mut(note).unwrap().replace_plain_text("Hello, world").unwrap();
 
         let (peer_to, root_to) = origin();
@@ -5931,7 +5981,7 @@ mod tests {
         // target with a fresh id, and appended there — as
         // `VaultClient::transplant_node` does, minus the network.
         let cutting = from_store.tree.take_cutting(note).unwrap();
-        let (planted, edit_to) = to_store.tree.plant(cutting, root_to, None, T1, &mut NodeId::new).unwrap();
+        let (planted, edit_to) = to_store.tree.plant(cutting, root_to, Place::Last, T1, &mut NodeId::new).unwrap();
         let new_id = planted.root;
         assert_ne!(new_id, note);
         assert_eq!(to_store.tree.doc(new_id).unwrap().text(), "Hello, world", "the text survives a transplant");
@@ -5966,15 +6016,15 @@ mod tests {
         let (mut peer_from, root_from) = origin();
         let note = NodeId::new();
         let gone = NodeId::new();
-        peer_from.add_node(note, Some(root_from), None, "document", "Note", T0).unwrap();
-        peer_from.add_node(gone, Some(root_from), None, "document", "Gone", T0).unwrap();
+        peer_from.add_node(note, Some(root_from), Place::Last, "document", "Note", T0).unwrap();
+        peer_from.add_node(gone, Some(root_from), Place::Last, "document", "Gone", T0).unwrap();
         let (peer_to, root_to) = origin();
         let (from_id, to_id) = (StoreId::new(), StoreId::new());
         let mut from_store = opened(&peer_from);
         let mut to_store = opened(&peer_to);
 
         let cutting = from_store.tree.take_cutting(note).unwrap();
-        let (planted, _) = to_store.tree.plant(cutting, root_to, None, T1, &mut NodeId::new).unwrap();
+        let (planted, _) = to_store.tree.plant(cutting, root_to, Place::Last, T1, &mut NodeId::new).unwrap();
         from_store.tree.remove_transplanted(note, to_id, &planted, T1).unwrap();
         from_store.tree.remove_node(gone, T1).unwrap();
         let mut stores = HashMap::from([(from_id, from_store), (to_id, to_store)]);
@@ -6024,13 +6074,13 @@ mod tests {
     fn list_deleted_names_a_tombstone_s_parent_and_an_unlisted_node_s_place_to_go_back_to() {
         let (mut peer, root) = origin();
         let folder = NodeId::new();
-        peer.add_node(folder, Some(root), None, "folder", "Notes", T0).unwrap();
+        peer.add_node(folder, Some(root), Place::Last, "folder", "Notes", T0).unwrap();
         let gone = NodeId::new();
-        peer.add_node(gone, Some(folder), None, "document", "Gone", T0).unwrap();
+        peer.add_node(gone, Some(folder), Place::Last, "document", "Gone", T0).unwrap();
         peer.remove_node(gone, T1).unwrap();
 
         let stray = NodeId::new();
-        peer.add_node(stray, Some(root), None, "document", "Stray", T0).unwrap();
+        peer.add_node(stray, Some(root), Place::Last, "document", "Stray", T0).unwrap();
         // A tampered or half-applied edit: still under `root` by `parent_id`,
         // but `root`'s own list no longer names it.
         peer.doc_mut(root).unwrap().remove_child(stray).unwrap();
@@ -6056,9 +6106,9 @@ mod tests {
     fn undeleting_a_node_puts_it_back_under_the_parent_it_was_deleted_from() {
         let (mut peer, root) = origin();
         let folder = NodeId::new();
-        peer.add_node(folder, Some(root), None, "folder", "Notes", T0).unwrap();
+        peer.add_node(folder, Some(root), Place::Last, "folder", "Notes", T0).unwrap();
         let note = NodeId::new();
-        peer.add_node(note, Some(folder), None, "document", "Note", T0).unwrap();
+        peer.add_node(note, Some(folder), Place::Last, "document", "Note", T0).unwrap();
         peer.remove_node(note, T1).unwrap();
         assert!(peer.get_node_info(note).is_err(), "a tombstone answers nothing to get_node_info");
 
@@ -6083,7 +6133,7 @@ mod tests {
             node_id: NodeId::new(),
             to_store_id: other_id,
             new_parent_id: NodeId::new(),
-            position: None,
+            place: Place::Last,
         };
         let refused = client.refuse_write(store_id, &transplant).expect("a reader may not transplant out of their root");
         assert!(matches!(&refused, BackendEvent::Error { message } if message == StoreAccess::READ_ONLY_REFUSAL));

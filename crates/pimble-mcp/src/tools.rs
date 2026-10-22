@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use base64::Engine;
 use pimble_client::PimbleClient;
-use pimble_core::{custom_keys, LinkResolution, PimbleUrl, Store, StoreAccess, StoreKind, SyncState};
+use pimble_core::{custom_keys, LinkResolution, PimbleUrl, Place, Store, StoreAccess, StoreKind, SyncState};
 use pimble_crdt::{CrdtError, NodeDoc};
 use pimble_rpc::EditOperation;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -311,9 +311,13 @@ pub struct MoveNodeParams {
     pub node: String,
     /// Its new parent (or a store's name, for its top level).
     pub new_parent: String,
-    /// Where among the new parent's children (0 first); the end when left out.
+    /// A child of the new parent to put it right after (a link or a name, as
+    /// `node` takes). Leave out `after` and `first` for the end.
     #[serde(default)]
-    pub position: Option<usize>,
+    pub after: Option<String>,
+    /// Put it first among the new parent's children.
+    #[serde(default)]
+    pub first: bool,
 }
 
 // ── Tools ────────────────────────────────────────────────────────────────
@@ -706,12 +710,24 @@ impl Pimble {
         let client = self.client().await?;
         let addr = nodes::resolve(&client, &p.node).await?;
         let parent = nodes::resolve(&client, &p.new_parent).await?;
+        let place = match (&p.after, p.first) {
+            (Some(_), true) => return Err("Give `after` or `first`, not both.".into()),
+            (None, true) => Place::First,
+            (None, false) => Place::Last,
+            (Some(after), false) => {
+                let after = nodes::resolve(&client, after).await?;
+                if after.store != parent.store {
+                    return Err("`after` must be a child of `new_parent`.".into());
+                }
+                Place::After(after.node)
+            }
+        };
         let (node_id, left) = if parent.store == addr.store {
-            let r = client.move_node(addr.store, addr.node, parent.node, p.position).await.map_err(rpc)?;
+            let r = client.move_node(addr.store, addr.node, parent.node, place).await.map_err(rpc)?;
             (r.node_id, r.left_shares.len())
         } else {
             let r = client
-                .transplant_node(addr.store, addr.node, parent.store, parent.node, p.position)
+                .transplant_node(addr.store, addr.node, parent.store, parent.node, place)
                 .await
                 .map_err(rpc)?;
             (r.node_id, r.left_shares.len())

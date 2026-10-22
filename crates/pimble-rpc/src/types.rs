@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use pimble_core::{BlobId, BlobUrl, DeletedNode, LeftShare, MountRef, MountState, Node, NodeId, NodeMetadata, RelaySide, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState, Workspace};
+use pimble_core::{BlobId, BlobUrl, DeletedNode, LeftShare, MountRef, MountState, Node, NodeId, NodeMetadata, Place, RelaySide, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState, Workspace};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -260,6 +260,10 @@ pub struct CreateNodeRequest {
     /// title), written in the same edit.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub custom: std::collections::HashMap<String, serde_json::Value>,
+    /// Where among the parent's children (docs/TREE_CONTRACT.md "Places on
+    /// the wire"); the end when left out.
+    #[serde(default)]
+    pub place: Place,
 }
 
 /// Request to create an attachment of a node (docs/DISCUSSIONS_CONTRACT.md
@@ -395,8 +399,10 @@ pub struct MoveNodeRequest {
     pub store_id: StoreId,
     pub node_id: NodeId,
     pub new_parent_id: NodeId,
-    /// Position within the new parent's children (None = append)
-    pub position: Option<usize>,
+    /// Where among the new parent's children (docs/TREE_CONTRACT.md "Places
+    /// on the wire"); the end when left out.
+    #[serde(default)]
+    pub place: Place,
 }
 
 /// Answer to `moveNode` (docs/MOVE_CONTRACT.md): the id the node has now.
@@ -411,6 +417,27 @@ pub struct MoveNodeResponse {
     pub left_shares: Vec<LeftShare>,
 }
 
+/// Request to move several nodes of one store under one new parent, kept in
+/// the order given (docs/TREE_CONTRACT.md "Places on the wire",
+/// `moveNodes`): the first lands at `place` and each next one right after
+/// the one before. Every node is judged before any is moved: one refusal
+/// refuses them all.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveNodesRequest {
+    pub store_id: StoreId,
+    pub node_ids: Vec<NodeId>,
+    pub new_parent_id: NodeId,
+    #[serde(default)]
+    pub place: Place,
+}
+
+/// Answer to `moveNodes`: one `MoveNodeResponse` per node, in the order of
+/// the request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveNodesResponse {
+    pub moved: Vec<MoveNodeResponse>,
+}
+
 /// Request to move a node into another store (docs/MOVE_CONTRACT.md "Between
 /// stores"): always a transplant, since two stores hold different documents.
 /// Write on `node_id` and the list it leaves in `from_store_id`, Write on
@@ -422,8 +449,10 @@ pub struct TransplantNodeRequest {
     pub node_id: NodeId,
     pub to_store_id: StoreId,
     pub new_parent_id: NodeId,
-    /// Position within the new parent's children (None = append)
-    pub position: Option<usize>,
+    /// Where among the new parent's children (docs/TREE_CONTRACT.md "Places
+    /// on the wire"); the end when left out.
+    #[serde(default)]
+    pub place: Place,
 }
 
 /// Answer to `transplantNode`: the new root's id in `to_store_id`, and the

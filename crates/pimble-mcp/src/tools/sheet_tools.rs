@@ -673,7 +673,7 @@ impl Pimble {
             (custom_keys::EXPLICIT_TITLE.to_string(), serde_json::json!(true)),
         ]);
         let node_id = client
-            .create_node_with(store, Some(parent_id), node_types::SHEET, title, Some(content), custom)
+            .create_node_with(store, Some(parent_id), node_types::SHEET, title, Some(content), custom, pimble_core::Place::Last)
             .await
             .map_err(rpc)?;
         let addr = Addr { store, node: node_id };

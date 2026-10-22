@@ -45,6 +45,7 @@ async fn new_handler_with_store() -> (RpcHandler, pimble_core::StoreId, pimble_c
             title: "Doc".into(),
             content: None,
             custom: Default::default(),
+            place: Default::default(),
         })
         .await
         .unwrap();

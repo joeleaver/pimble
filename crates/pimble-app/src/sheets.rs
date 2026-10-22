@@ -768,6 +768,7 @@ pub(crate) fn new_sheet(store: AppStore, store_id: StoreId, parent_id: NodeId) {
             ],
             request: None,
         }),
+        place: pimble_core::Place::Last,
     });
 }
 
@@ -1718,6 +1719,7 @@ pub(crate) fn commit(store: AppStore, pane: PaneId, mv: Move) {
                 custom: vec![(pimble_core::custom_keys::EXPLICIT_TITLE.to_string(), serde_json::json!(true))],
                 request: Some(request),
             }),
+            place: pimble_core::Place::Last,
         });
         return;
     }

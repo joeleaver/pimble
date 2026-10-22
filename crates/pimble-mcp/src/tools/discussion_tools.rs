@@ -362,7 +362,7 @@ impl Pimble {
                 let mut custom = custom;
                 custom.insert(custom_keys::ICON.to_string(), serde_json::json!(DISCUSSION_ICON));
                 let node_id = client
-                    .create_node_with(parent.store, Some(parent.node), node_types::DISCUSSION, topic, Some(content), custom)
+                    .create_node_with(parent.store, Some(parent.node), node_types::DISCUSSION, topic, Some(content), custom, pimble_core::Place::Last)
                     .await
                     .map_err(rpc)?;
                 let addr = Addr { store: parent.store, node: node_id };

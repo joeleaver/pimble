@@ -33,7 +33,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use pimble_core::custom_keys::SHARE;
-use pimble_core::{NodeId, PimbleUrl, StoreId};
+use pimble_core::{NodeId, PimbleUrl, Place, StoreId};
 
 use crate::error::{CrdtError, Result};
 use crate::node_doc::{NodeDoc, NodeFields, NodeUpdateEffect};
@@ -321,15 +321,15 @@ impl Tree {
 
     // ── Editing ──────────────────────────────────────────────────────────
 
-    /// Create `id` under `parent` (the root when `None`) at `position`
-    /// (the end when `None`). An id already held and initialised is an error;
+    /// Create `id` under `parent` (the root when `None`) at `place`
+    /// (docs/TREE_CONTRACT.md "Places on the wire"). An id already held and initialised is an error;
     /// one held but not initialised (its content arrived first) is
     /// initialised in place. The update for `id` is its `init` transaction.
     pub fn add_node(
         &mut self,
         id: NodeId,
         parent: Option<NodeId>,
-        position: Option<usize>,
+        place: Place,
         node_type: &str,
         title: &str,
         now: &str,
@@ -343,7 +343,7 @@ impl Tree {
         let doc = self.docs.entry(id).or_default();
         let (_, update) = doc.edit(|d, txn| d.write_init(txn, node_type, title, Some(parent), now))?;
         edit.push(id, update);
-        edit.push(parent, self.list_edit(parent, |d, txn| d.list_insert(txn, position, id))?);
+        edit.push(parent, self.list_edit(parent, |d, txn| d.list_place(txn, place, id))?);
         Ok(edit)
     }
 
@@ -356,7 +356,7 @@ impl Tree {
         id: NodeId,
         mut doc: NodeDoc,
         parent: Option<NodeId>,
-        position: Option<usize>,
+        place: Place,
         node_type: &str,
         title: &str,
         now: &str,
@@ -370,7 +370,7 @@ impl Tree {
         let mut edit = TreeEdit::default();
         edit.push(id, Some(doc.save()));
         self.docs.insert(id, doc);
-        edit.push(parent, self.list_edit(parent, |d, txn| d.list_insert(txn, position, id))?);
+        edit.push(parent, self.list_edit(parent, |d, txn| d.list_place(txn, place, id))?);
         Ok(edit)
     }
 
@@ -437,9 +437,9 @@ impl Tree {
         counts
     }
 
-    /// Move `id` under `new_parent` at `position` (the end when `None`).
+    /// Move `id` under `new_parent` at `place` (docs/TREE_CONTRACT.md).
     /// The root cannot move; a move under a node's own descendant is refused.
-    pub fn move_node(&mut self, id: NodeId, new_parent: NodeId, position: Option<usize>, now: &str) -> Result<TreeEdit> {
+    pub fn move_node(&mut self, id: NodeId, new_parent: NodeId, place: Place, now: &str) -> Result<TreeEdit> {
         if id == self.root {
             return Err(CrdtError::Serialization("cannot move the root node".into()));
         }
@@ -454,9 +454,22 @@ impl Tree {
         // has no list here. A stale entry anywhere else is repair's to remove.
         let old_parent = fields.parent_id.filter(|p| self.docs.contains_key(p));
         if old_parent == Some(new_parent) {
+            // After itself is where it is: after whatever comes before it,
+            // since the anchor is looked for once the node has left the list.
+            let place = match place {
+                Place::After(anchor) if anchor == id => {
+                    let list = self.docs[&new_parent].children();
+                    match list.iter().position(|&n| n == id) {
+                        Some(0) => Place::First,
+                        Some(at) => Place::After(list[at - 1]),
+                        None => Place::Last,
+                    }
+                }
+                place => place,
+            };
             edit.push(new_parent, self.list_edit(new_parent, |d, txn| {
                 d.list_remove_all(txn, id);
-                d.list_insert(txn, position, id);
+                d.list_place(txn, place, id);
             })?);
         } else {
             if let Some(old_parent) = old_parent {
@@ -466,7 +479,7 @@ impl Tree {
             }
             edit.push(new_parent, self.list_edit(new_parent, |d, txn| {
                 d.list_remove_all(txn, id);
-                d.list_insert(txn, position, id);
+                d.list_place(txn, place, id);
             })?);
         }
         let (_, update) = self.docs[&id].edit(|d, txn| {
@@ -639,7 +652,7 @@ impl Tree {
         !self.shares_left(id, new_parent).is_empty()
     }
 
-    /// Move `id` under `new_parent` at `position`, as every caller moves a
+    /// Move `id` under `new_parent` at `place`, as every caller moves a
     /// node: a plain [`Tree::move_node`] when the move leaves no share, a
     /// [`Tree::transplant`] when it does. Answers the id the node has now:
     /// `id` after a plain move, the new root's after a transplant. `new_id`
@@ -650,14 +663,14 @@ impl Tree {
         store: StoreId,
         id: NodeId,
         new_parent: NodeId,
-        position: Option<usize>,
+        place: Place,
         now: &str,
         new_id: &mut dyn FnMut() -> NodeId,
     ) -> Result<(NodeId, TreeEdit)> {
         if self.leaves_a_share(id, new_parent) {
-            self.transplant(store, id, new_parent, position, now, new_id)
+            self.transplant(store, id, new_parent, place, now, new_id)
         } else {
-            self.move_node(id, new_parent, position, now).map(|edit| (id, edit))
+            self.move_node(id, new_parent, place, now).map(|edit| (id, edit))
         }
     }
 
@@ -686,7 +699,7 @@ impl Tree {
         store: StoreId,
         id: NodeId,
         new_parent: NodeId,
-        position: Option<usize>,
+        place: Place,
         now: &str,
         new_id: &mut dyn FnMut() -> NodeId,
     ) -> Result<(NodeId, TreeEdit)> {
@@ -695,7 +708,7 @@ impl Tree {
             return Err(CrdtError::Serialization(format!("cannot transplant node {id} under its own descendant {new_parent}")));
         }
         let cutting = self.take_cutting(id)?;
-        let (planted, mut edit) = self.plant(cutting, new_parent, position, now, new_id)?;
+        let (planted, mut edit) = self.plant(cutting, new_parent, place, now, new_id)?;
         edit.touched.extend(self.remove_transplanted(id, store, &planted, now)?.touched);
         Ok((planted.root, edit))
     }
@@ -783,7 +796,7 @@ impl Tree {
     }
 
     /// The second half of a transplant: make the nodes of `cutting` under
-    /// `new_parent` at `position` (the end when `None`), in this tree, which
+    /// `new_parent` at `place`, in this tree, which
     /// need not be the one the cutting was taken from. A new document per
     /// node with an id from `new_id` (called once per node, in the cutting's
     /// preorder), `created_at` kept, `modified_at` = `now`, no share marker.
@@ -796,7 +809,7 @@ impl Tree {
         &mut self,
         cutting: Cutting,
         new_parent: NodeId,
-        position: Option<usize>,
+        place: Place,
         now: &str,
         new_id: &mut dyn FnMut() -> NodeId,
     ) -> Result<(Planted, TreeEdit)> {
@@ -860,7 +873,7 @@ impl Tree {
             edit.push(id, Some(doc.save()));
             self.docs.insert(id, doc);
         }
-        edit.push(new_parent, self.list_edit(new_parent, |d, txn| d.list_insert(txn, position, ids[0]))?);
+        edit.push(new_parent, self.list_edit(new_parent, |d, txn| d.list_place(txn, place, ids[0]))?);
         Ok((Planted { root: ids[0], ids: pairs }, edit))
     }
 
@@ -1459,7 +1472,7 @@ mod tests {
         let (mut a, root) = tree();
         let mut b = replica_of(&a);
         let child = id();
-        let edit = a.add_node(child, None, None, "document", "Doc", T1).unwrap();
+        let edit = a.add_node(child, None, Place::Last, "document", "Doc", T1).unwrap();
         assert_eq!(ids_of(&edit), HashSet::from([child, root]));
 
         assert!(a.has_node(child));
@@ -1476,14 +1489,14 @@ mod tests {
     }
 
     #[test]
-    fn add_node_at_a_position_under_a_folder() {
+    fn add_node_at_a_place_under_a_folder() {
         let (mut a, root) = tree();
         let folder = id();
-        a.add_node(folder, Some(root), None, "folder", "F", T1).unwrap();
+        a.add_node(folder, Some(root), Place::Last, "folder", "F", T1).unwrap();
         let (x, y, z) = (id(), id(), id());
-        a.add_node(x, Some(folder), None, "document", "x", T1).unwrap();
-        a.add_node(z, Some(folder), Some(99), "document", "z", T1).unwrap();
-        a.add_node(y, Some(folder), Some(1), "document", "y", T1).unwrap();
+        a.add_node(x, Some(folder), Place::Last, "document", "x", T1).unwrap();
+        a.add_node(z, Some(folder), Place::Last, "document", "z", T1).unwrap();
+        a.add_node(y, Some(folder), Place::After(x), "document", "y", T1).unwrap();
         assert_eq!(a.get_children(folder).unwrap(), vec![x, y, z]);
         assert_eq!(a.subtree_ids(root).unwrap(), vec![root, folder, x, y, z]);
     }
@@ -1492,10 +1505,10 @@ mod tests {
     fn add_node_refuses_an_existing_id_and_a_missing_parent() {
         let (mut a, root) = tree();
         let child = id();
-        a.add_node(child, None, None, "document", "Doc", T1).unwrap();
-        assert!(a.add_node(child, None, None, "document", "Again", T1).is_err());
-        assert!(a.add_node(id(), Some(id()), None, "document", "Orphan", T1).is_err());
-        assert!(a.add_node(root, None, None, "document", "Root again", T1).is_err());
+        a.add_node(child, None, Place::Last, "document", "Doc", T1).unwrap();
+        assert!(a.add_node(child, None, Place::Last, "document", "Again", T1).is_err());
+        assert!(a.add_node(id(), Some(id()), Place::Last, "document", "Orphan", T1).is_err());
+        assert!(a.add_node(root, None, Place::Last, "document", "Root again", T1).is_err());
         assert_eq!(a.list_node_ids().len(), 2);
     }
 
@@ -1511,7 +1524,7 @@ mod tests {
         assert!(!a.has_node(child));
         assert!(!a.list_node_ids().contains(&child));
 
-        let edit = a.add_node(child, None, None, "document", "Doc", T1).unwrap();
+        let edit = a.add_node(child, None, Place::Last, "document", "Doc", T1).unwrap();
         assert_eq!(ids_of(&edit), HashSet::from([child, root]));
         assert!(a.has_node(child));
         assert_eq!(a.doc(child).unwrap().text(), "arrived first");
@@ -1524,7 +1537,7 @@ mod tests {
         let mut b = replica_of(&a);
         let child = id();
         let doc = NodeDoc::from_plain_text("imported").unwrap();
-        let edit = a.add_node_with_doc(child, doc, None, None, "document", "Imported", T1).unwrap();
+        let edit = a.add_node_with_doc(child, doc, None, Place::Last, "document", "Imported", T1).unwrap();
         assert_eq!(ids_of(&edit), HashSet::from([child, root]));
         assert_eq!(a.doc(child).unwrap().text(), "imported");
         assert_eq!(a.get_node_info(child).unwrap().title, "Imported");
@@ -1534,7 +1547,7 @@ mod tests {
         assert_eq!(b.doc(child).unwrap().text(), "imported");
 
         let again = NodeDoc::from_plain_text("twice").unwrap();
-        assert!(a.add_node_with_doc(child, again, None, None, "document", "Twice", T1).is_err());
+        assert!(a.add_node_with_doc(child, again, None, Place::Last, "document", "Twice", T1).is_err());
     }
 
     #[test]
@@ -1542,12 +1555,12 @@ mod tests {
         let (mut a, root) = tree();
         let mut b = replica_of(&a);
         let (p, q, x) = (id(), id(), id());
-        a.add_node(p, Some(root), None, "folder", "P", T1).unwrap();
-        a.add_node(q, Some(root), None, "folder", "Q", T1).unwrap();
-        a.add_node(x, Some(p), None, "document", "X", T1).unwrap();
+        a.add_node(p, Some(root), Place::Last, "folder", "P", T1).unwrap();
+        a.add_node(q, Some(root), Place::Last, "folder", "Q", T1).unwrap();
+        a.add_node(x, Some(p), Place::Last, "document", "X", T1).unwrap();
         sync(&mut a, &mut b);
 
-        let edit = a.move_node(x, q, None, T2).unwrap();
+        let edit = a.move_node(x, q, Place::Last, T2).unwrap();
         assert_eq!(ids_of(&edit), HashSet::from([p, q, x]));
         assert!(a.get_children(p).unwrap().is_empty());
         assert_eq!(a.get_children(q).unwrap(), vec![x]);
@@ -1564,28 +1577,71 @@ mod tests {
     fn move_node_within_a_parent_to_a_position() {
         let (mut a, root) = tree();
         let (x, y, z) = (id(), id(), id());
-        a.add_node(x, Some(root), None, "document", "x", T1).unwrap();
-        a.add_node(y, Some(root), None, "document", "y", T1).unwrap();
-        a.add_node(z, Some(root), None, "document", "z", T1).unwrap();
-        let edit = a.move_node(z, root, Some(0), T2).unwrap();
+        a.add_node(x, Some(root), Place::Last, "document", "x", T1).unwrap();
+        a.add_node(y, Some(root), Place::Last, "document", "y", T1).unwrap();
+        a.add_node(z, Some(root), Place::Last, "document", "z", T1).unwrap();
+        let edit = a.move_node(z, root, Place::First, T2).unwrap();
         // One list touched once, plus the node's own `modified_at`.
         assert_eq!(ids_of(&edit), HashSet::from([root, z]));
         assert_eq!(a.get_children(root).unwrap(), vec![z, x, y]);
-        a.move_node(z, root, None, T2).unwrap();
+        a.move_node(z, root, Place::Last, T2).unwrap();
         assert_eq!(a.get_children(root).unwrap(), vec![x, y, z]);
         assert!(a.validate_tree().is_empty());
+    }
+
+    /// docs/TREE_CONTRACT.md "Places on the wire": `After` is found once the
+    /// node has left the list, so moving down past one sibling is no
+    /// off-by-one, and an anchor the list no longer names means the end.
+    #[test]
+    fn move_node_after_a_sibling() {
+        let (mut a, root) = tree();
+        let mut b = replica_of(&a);
+        let (w, x, y, z, f) = (id(), id(), id(), id(), id());
+        for (n, t) in [(w, "w"), (x, "x"), (y, "y"), (z, "z")] {
+            a.add_node(n, Some(root), Place::Last, "document", t, T1).unwrap();
+        }
+        a.add_node(f, Some(root), Place::Last, "folder", "f", T1).unwrap();
+        // Down one, within the parent.
+        a.move_node(w, root, Place::After(x), T2).unwrap();
+        assert_eq!(a.get_children(root).unwrap(), vec![x, w, y, z, f]);
+        // Up, within the parent.
+        a.move_node(z, root, Place::After(x), T2).unwrap();
+        assert_eq!(a.get_children(root).unwrap(), vec![x, z, w, y, f]);
+        // After itself: where it is.
+        a.move_node(w, root, Place::After(w), T2).unwrap();
+        assert_eq!(a.get_children(root).unwrap(), vec![x, z, w, y, f]);
+        // Into another parent, after a child of it; then after a node the
+        // list does not name, which is the end.
+        a.move_node(x, f, Place::Last, T2).unwrap();
+        a.move_node(y, f, Place::First, T2).unwrap();
+        a.move_node(z, f, Place::After(y), T2).unwrap();
+        assert_eq!(a.get_children(f).unwrap(), vec![y, z, x]);
+        a.move_node(w, f, Place::After(root), T2).unwrap();
+        assert_eq!(a.get_children(f).unwrap(), vec![y, z, x, w]);
+        assert!(a.validate_tree().is_empty());
+        sync(&mut a, &mut b);
+        assert_same(&a, &b);
+    }
+
+    #[test]
+    fn place_on_the_wire() {
+        let n = id();
+        assert_eq!(serde_json::to_value(Place::First).unwrap(), serde_json::json!("first"));
+        assert_eq!(serde_json::to_value(Place::Last).unwrap(), serde_json::json!("last"));
+        assert_eq!(serde_json::to_value(Place::After(n)).unwrap(), serde_json::json!({ "after": n.to_string() }));
+        assert_eq!(serde_json::from_value::<Place>(serde_json::json!({ "after": n.to_string() })).unwrap(), Place::After(n));
     }
 
     #[test]
     fn move_node_refuses_the_root_and_a_cycle_by_request() {
         let (mut a, root) = tree();
         let (p, x) = (id(), id());
-        a.add_node(p, Some(root), None, "folder", "P", T1).unwrap();
-        a.add_node(x, Some(p), None, "document", "X", T1).unwrap();
-        assert!(a.move_node(root, p, None, T2).is_err());
-        assert!(a.move_node(p, x, None, T2).is_err(), "under its own descendant");
-        assert!(a.move_node(p, p, None, T2).is_err(), "under itself");
-        assert!(a.move_node(x, id(), None, T2).is_err(), "under nothing");
+        a.add_node(p, Some(root), Place::Last, "folder", "P", T1).unwrap();
+        a.add_node(x, Some(p), Place::Last, "document", "X", T1).unwrap();
+        assert!(a.move_node(root, p, Place::Last, T2).is_err());
+        assert!(a.move_node(p, x, Place::Last, T2).is_err(), "under its own descendant");
+        assert!(a.move_node(p, p, Place::Last, T2).is_err(), "under itself");
+        assert!(a.move_node(x, id(), Place::Last, T2).is_err(), "under nothing");
         assert_eq!(a.get_node_info(p).unwrap().parent_id, Some(root));
         assert_eq!(a.get_node_info(x).unwrap().parent_id, Some(p));
     }
@@ -1595,10 +1651,10 @@ mod tests {
         let (mut a, root) = tree();
         let mut b = replica_of(&a);
         let (f, x, y, other) = (id(), id(), id(), id());
-        a.add_node(f, Some(root), None, "folder", "F", T1).unwrap();
-        a.add_node(x, Some(f), None, "document", "x", T1).unwrap();
-        a.add_node(y, Some(x), None, "document", "y", T1).unwrap();
-        a.add_node(other, Some(root), None, "document", "other", T1).unwrap();
+        a.add_node(f, Some(root), Place::Last, "folder", "F", T1).unwrap();
+        a.add_node(x, Some(f), Place::Last, "document", "x", T1).unwrap();
+        a.add_node(y, Some(x), Place::Last, "document", "y", T1).unwrap();
+        a.add_node(other, Some(root), Place::Last, "document", "other", T1).unwrap();
         sync(&mut a, &mut b);
 
         let edit = a.remove_node(f, T2).unwrap();
@@ -1628,10 +1684,10 @@ mod tests {
         let (mut a, root) = tree();
         let mut b = replica_of(&a);
         let (f, x, y, other) = (id(), id(), id(), id());
-        a.add_node(f, Some(root), None, "folder", "F", T1).unwrap();
-        a.add_node(x, Some(f), None, "document", "x", T1).unwrap();
-        a.add_node(y, Some(x), None, "document", "y", T1).unwrap();
-        a.add_node(other, Some(root), None, "document", "other", T1).unwrap();
+        a.add_node(f, Some(root), Place::Last, "folder", "F", T1).unwrap();
+        a.add_node(x, Some(f), Place::Last, "document", "x", T1).unwrap();
+        a.add_node(y, Some(x), Place::Last, "document", "y", T1).unwrap();
+        a.add_node(other, Some(root), Place::Last, "document", "other", T1).unwrap();
         a.remove_node(f, T2).unwrap();
         sync(&mut a, &mut b);
 
@@ -1655,8 +1711,8 @@ mod tests {
     fn undelete_goes_under_the_root_when_the_parent_is_gone() {
         let (mut a, root) = tree();
         let (f, x) = (id(), id());
-        a.add_node(f, Some(root), None, "folder", "F", T1).unwrap();
-        a.add_node(x, Some(f), None, "document", "x", T1).unwrap();
+        a.add_node(f, Some(root), Place::Last, "folder", "F", T1).unwrap();
+        a.add_node(x, Some(f), Place::Last, "document", "x", T1).unwrap();
         a.remove_node(f, T2).unwrap();
 
         // Undeleting the child alone: its parent is still a tombstone, so it
@@ -1682,9 +1738,9 @@ mod tests {
     fn undelete_leaves_a_child_deleted_earlier_deleted() {
         let (mut a, root) = tree();
         let (f, x, y) = (id(), id(), id());
-        a.add_node(f, Some(root), None, "folder", "F", T1).unwrap();
-        a.add_node(x, Some(f), None, "document", "x", T1).unwrap();
-        a.add_node(y, Some(f), None, "document", "y", T1).unwrap();
+        a.add_node(f, Some(root), Place::Last, "folder", "F", T1).unwrap();
+        a.add_node(x, Some(f), Place::Last, "document", "x", T1).unwrap();
+        a.add_node(y, Some(f), Place::Last, "document", "y", T1).unwrap();
         a.remove_node(x, T1).unwrap();
         a.remove_node(f, T2).unwrap();
 
@@ -1701,7 +1757,7 @@ mod tests {
         let (mut a, root) = tree();
         let mut b = replica_of(&a);
         let x = id();
-        a.add_node(x, Some(root), None, "document", "x", T1).unwrap();
+        a.add_node(x, Some(root), Place::Last, "document", "x", T1).unwrap();
         sync(&mut a, &mut b);
 
         let edits = [
@@ -1736,8 +1792,8 @@ mod tests {
     fn get_children_filters_and_dedups_the_stored_list() {
         let (mut a, root) = tree();
         let (x, y) = (id(), id());
-        a.add_node(x, Some(root), None, "document", "x", T1).unwrap();
-        a.add_node(y, Some(root), None, "document", "y", T1).unwrap();
+        a.add_node(x, Some(root), Place::Last, "document", "x", T1).unwrap();
+        a.add_node(y, Some(root), Place::Last, "document", "y", T1).unwrap();
         // What concurrency can leave in a list: a duplicate, an unknown id, a
         // content-only document, a tombstone, the owner itself.
         let unknown = id();
@@ -1766,9 +1822,9 @@ mod tests {
     fn subtree_ids_counts_a_child_only_where_list_and_parent_agree() {
         let (mut a, root) = tree();
         let (p, q, x) = (id(), id(), id());
-        a.add_node(p, Some(root), None, "folder", "P", T1).unwrap();
-        a.add_node(q, Some(root), None, "folder", "Q", T1).unwrap();
-        a.add_node(x, Some(p), None, "document", "x", T1).unwrap();
+        a.add_node(p, Some(root), Place::Last, "folder", "P", T1).unwrap();
+        a.add_node(q, Some(root), Place::Last, "folder", "Q", T1).unwrap();
+        a.add_node(x, Some(p), Place::Last, "document", "x", T1).unwrap();
         // Half a move: Q lists x, but x still says P.
         a.doc_mut(q).unwrap().insert_child(0, x).unwrap();
         assert_eq!(a.subtree_ids(q).unwrap(), vec![q]);
@@ -1786,7 +1842,7 @@ mod tests {
         let (mut a, root) = tree();
         let (mut b, _) = tree();
         let x = id();
-        let edit = a.add_node(x, Some(root), None, "document", "x", T1).unwrap();
+        let edit = a.add_node(x, Some(root), Place::Last, "document", "x", T1).unwrap();
         // b knows neither the root nor x; it holds both afterwards.
         let effects: Vec<_> = edit.touched.iter().map(|(id, u)| b.apply_update(*id, u).unwrap()).collect();
         assert!(effects.iter().all(|e| e.changed && e.structure && !e.content));
@@ -1800,7 +1856,7 @@ mod tests {
     fn repair_fixes_a_self_referential_parent() {
         let (mut a, root) = tree();
         let child = id();
-        a.add_node(child, Some(root), None, "document", "Doc", T1).unwrap();
+        a.add_node(child, Some(root), Place::Last, "document", "Doc", T1).unwrap();
         a.doc_mut(child).unwrap().set_parent_id(Some(child), T1).unwrap();
 
         let issues = a.validate_tree();
@@ -1826,7 +1882,7 @@ mod tests {
     fn a_node_under_a_document_not_held_is_left_where_it_says_it_is() {
         let (mut a, root) = tree();
         let (child, folder) = (id(), id());
-        a.add_node(child, Some(root), None, "document", "Doc", T1).unwrap();
+        a.add_node(child, Some(root), Place::Last, "document", "Doc", T1).unwrap();
         // Someone moved it into a folder whose document is not here (yet).
         a.doc_mut(child).unwrap().set_parent_id(Some(folder), T1).unwrap();
         assert!(a.validate_tree().is_empty(), "{:?}", a.validate_tree());
@@ -1852,9 +1908,9 @@ mod tests {
     fn a_listed_child_whose_document_is_not_held_stays_listed() {
         let (mut holds_all, root) = tree();
         let (folder, note) = (id(), id());
-        holds_all.add_node(folder, Some(root), None, "folder", "Shared", T1).unwrap();
+        holds_all.add_node(folder, Some(root), Place::Last, "folder", "Shared", T1).unwrap();
         let mut lacks_note = replica_of(&holds_all);
-        let made = holds_all.add_node(note, Some(folder), None, "document", "A member's note", T2).unwrap();
+        let made = holds_all.add_node(note, Some(folder), Place::Last, "document", "A member's note", T2).unwrap();
 
         // The other device is sent the folder's new list, and not the note.
         for (doc_id, update) in &made.touched {
@@ -1896,7 +1952,7 @@ mod tests {
     fn repair_fixes_a_duplicate_within_one_list() {
         let (mut a, root) = tree();
         let child = id();
-        a.add_node(child, Some(root), None, "document", "Doc", T1).unwrap();
+        a.add_node(child, Some(root), Place::Last, "document", "Doc", T1).unwrap();
         a.doc_mut(root).unwrap().insert_child(99, child).unwrap();
         assert!(a.validate_tree().iter().any(|i| matches!(i, TreeIssue::DuplicateInList { .. })));
         let repair = a.repair(T2).unwrap().expect("a duplicate entry needs a repair");
@@ -1909,9 +1965,9 @@ mod tests {
     fn repair_fixes_a_child_in_the_wrong_list() {
         let (mut a, root) = tree();
         let (fa, fb, child) = (id(), id(), id());
-        a.add_node(fa, Some(root), None, "folder", "A", T1).unwrap();
-        a.add_node(fb, Some(root), None, "folder", "B", T1).unwrap();
-        a.add_node(child, Some(fa), None, "document", "Doc", T1).unwrap();
+        a.add_node(fa, Some(root), Place::Last, "folder", "A", T1).unwrap();
+        a.add_node(fb, Some(root), Place::Last, "folder", "B", T1).unwrap();
+        a.add_node(child, Some(fa), Place::Last, "document", "Doc", T1).unwrap();
         a.doc_mut(fb).unwrap().insert_child(0, child).unwrap();
         assert!(a.validate_tree().iter().any(|i| matches!(i, TreeIssue::WrongList { .. })));
         let repair = a.repair(T2).unwrap().expect("a wrong-list entry needs a repair");
@@ -1925,7 +1981,7 @@ mod tests {
     fn repair_fixes_the_root_appearing_in_a_list() {
         let (mut a, root) = tree();
         let folder = id();
-        a.add_node(folder, Some(root), None, "folder", "Folder", T1).unwrap();
+        a.add_node(folder, Some(root), Place::Last, "folder", "Folder", T1).unwrap();
         a.doc_mut(folder).unwrap().insert_child(0, root).unwrap();
         assert!(a.validate_tree().iter().any(|i| matches!(i, TreeIssue::RootInList { .. })));
         a.repair(T2).unwrap().expect("root-in-list needs a repair");
@@ -1937,8 +1993,8 @@ mod tests {
     fn repair_fixes_a_two_node_cycle() {
         let (mut a, root) = tree();
         let (fa, fb) = (id(), id());
-        a.add_node(fa, Some(root), None, "folder", "A", T1).unwrap();
-        a.add_node(fb, Some(root), None, "folder", "B", T1).unwrap();
+        a.add_node(fa, Some(root), Place::Last, "folder", "A", T1).unwrap();
+        a.add_node(fb, Some(root), Place::Last, "folder", "B", T1).unwrap();
         a.doc_mut(fa).unwrap().set_parent_id(Some(fb), T1).unwrap();
         a.doc_mut(fb).unwrap().set_parent_id(Some(fa), T1).unwrap();
         let issues = a.validate_tree();
@@ -1964,15 +2020,15 @@ mod tests {
     fn repair_removes_entries_naming_tombstones_and_leaves_documents_that_are_not_nodes_yet() {
         let (mut a, root) = tree();
         let (folder, dead, content_only) = (id(), id(), id());
-        a.add_node(folder, Some(root), None, "folder", "F", T1).unwrap();
-        a.add_node(dead, Some(folder), None, "document", "dead", T1).unwrap();
+        a.add_node(folder, Some(root), Place::Last, "folder", "F", T1).unwrap();
+        a.add_node(dead, Some(folder), Place::Last, "document", "dead", T1).unwrap();
         a.doc_mut(dead).unwrap().set_deleted(Some(T2)).unwrap(); // a tombstone still listed by its parent
         a.apply_update(content_only, &NodeDoc::from_plain_text("c").unwrap().save()).unwrap();
         a.doc_mut(folder).unwrap().insert_child(99, content_only).unwrap();
         // A tombstone whose list names a live node: the list is left alone, the
         // node is an orphan (its parent is not a node) and goes under the root.
         let orphan = id();
-        a.add_node(orphan, Some(folder), None, "document", "orphan", T1).unwrap();
+        a.add_node(orphan, Some(folder), Place::Last, "document", "orphan", T1).unwrap();
         a.doc_mut(orphan).unwrap().set_parent_id(Some(dead), T1).unwrap();
         a.doc_mut(dead).unwrap().insert_child(0, orphan).unwrap();
 
@@ -1996,7 +2052,7 @@ mod tests {
     #[test]
     fn repair_is_a_no_op_on_a_well_formed_tree_and_on_a_tree_without_a_root_yet() {
         let (mut a, root) = tree();
-        a.add_node(id(), Some(root), None, "document", "Doc", T1).unwrap();
+        a.add_node(id(), Some(root), Place::Last, "document", "Doc", T1).unwrap();
         assert!(a.repair(T2).unwrap().is_none());
 
         let mut fresh = Tree::from_docs(root, HashMap::new());
@@ -2013,13 +2069,13 @@ mod tests {
     fn concurrent_moves_of_one_node_to_two_parents_converge() {
         let (mut a, root) = tree();
         let (fa, fb, child) = (id(), id(), id());
-        a.add_node(fa, Some(root), None, "folder", "A", T1).unwrap();
-        a.add_node(fb, Some(root), None, "folder", "B", T1).unwrap();
-        a.add_node(child, Some(fa), None, "document", "Doc", T1).unwrap();
+        a.add_node(fa, Some(root), Place::Last, "folder", "A", T1).unwrap();
+        a.add_node(fb, Some(root), Place::Last, "folder", "B", T1).unwrap();
+        a.add_node(child, Some(fa), Place::Last, "document", "Doc", T1).unwrap();
         let mut b = replica_of(&a);
 
-        a.move_node(child, fb, None, T2).unwrap();
-        b.move_node(child, root, None, T2).unwrap();
+        a.move_node(child, fb, Place::Last, T2).unwrap();
+        b.move_node(child, root, Place::Last, T2).unwrap();
 
         sync_and_repair_round(&mut a, &mut b);
         sync_and_repair_round(&mut a, &mut b);
@@ -2037,12 +2093,12 @@ mod tests {
     fn concurrent_moves_of_a_under_b_and_b_under_a_converge() {
         let (mut a, root) = tree();
         let (fa, fb) = (id(), id());
-        a.add_node(fa, Some(root), None, "folder", "A", T1).unwrap();
-        a.add_node(fb, Some(root), None, "folder", "B", T1).unwrap();
+        a.add_node(fa, Some(root), Place::Last, "folder", "A", T1).unwrap();
+        a.add_node(fb, Some(root), Place::Last, "folder", "B", T1).unwrap();
         let mut b = replica_of(&a);
 
-        a.move_node(fb, fa, None, T2).unwrap();
-        b.move_node(fa, fb, None, T2).unwrap();
+        a.move_node(fb, fa, Place::Last, T2).unwrap();
+        b.move_node(fa, fb, Place::Last, T2).unwrap();
 
         sync_and_repair_round(&mut a, &mut b);
         sync_and_repair_round(&mut a, &mut b);
@@ -2057,12 +2113,12 @@ mod tests {
     fn deleting_a_folder_while_the_other_side_adds_a_child_to_it_converges() {
         let (mut a, root) = tree();
         let folder = id();
-        a.add_node(folder, Some(root), None, "folder", "Folder", T1).unwrap();
+        a.add_node(folder, Some(root), Place::Last, "folder", "Folder", T1).unwrap();
         let mut b = replica_of(&a);
 
         a.remove_node(folder, T2).unwrap();
         let new_child = id();
-        b.add_node(new_child, Some(folder), None, "document", "New", T2).unwrap();
+        b.add_node(new_child, Some(folder), Place::Last, "document", "New", T2).unwrap();
 
         sync_and_repair_round(&mut a, &mut b);
         sync_and_repair_round(&mut a, &mut b);
@@ -2080,13 +2136,13 @@ mod tests {
     fn deleting_a_node_while_the_other_side_moves_it_converges() {
         let (mut a, root) = tree();
         let (fa, fb, child) = (id(), id(), id());
-        a.add_node(fa, Some(root), None, "folder", "A", T1).unwrap();
-        a.add_node(fb, Some(root), None, "folder", "B", T1).unwrap();
-        a.add_node(child, Some(fa), None, "document", "Doc", T1).unwrap();
+        a.add_node(fa, Some(root), Place::Last, "folder", "A", T1).unwrap();
+        a.add_node(fb, Some(root), Place::Last, "folder", "B", T1).unwrap();
+        a.add_node(child, Some(fa), Place::Last, "document", "Doc", T1).unwrap();
         let mut b = replica_of(&a);
 
         a.remove_node(child, T2).unwrap();
-        b.move_node(child, fb, None, T2).unwrap();
+        b.move_node(child, fb, Place::Last, T2).unwrap();
 
         sync_and_repair_round(&mut a, &mut b);
         sync_and_repair_round(&mut a, &mut b);
@@ -2104,15 +2160,15 @@ mod tests {
     fn both_sides_repairing_the_same_merged_state_concurrently_converge() {
         let (mut a, root) = tree();
         let (fa, fb, child) = (id(), id(), id());
-        a.add_node(fa, Some(root), None, "folder", "A", T1).unwrap();
-        a.add_node(fb, Some(root), None, "folder", "B", T1).unwrap();
-        a.add_node(child, Some(fa), None, "document", "Doc", T1).unwrap();
+        a.add_node(fa, Some(root), Place::Last, "folder", "A", T1).unwrap();
+        a.add_node(fb, Some(root), Place::Last, "folder", "B", T1).unwrap();
+        a.add_node(child, Some(fa), Place::Last, "document", "Doc", T1).unwrap();
         let mut b = replica_of(&a);
 
         // Every kind of damage at once, then both repair the same held state
         // before either sees the other's repair.
-        a.move_node(child, fb, None, T2).unwrap();
-        b.move_node(child, root, None, T2).unwrap();
+        a.move_node(child, fb, Place::Last, T2).unwrap();
+        b.move_node(child, root, Place::Last, T2).unwrap();
         a.doc_mut(fa).unwrap().set_parent_id(Some(fb), T2).unwrap();
         b.doc_mut(fb).unwrap().set_parent_id(Some(fa), T2).unwrap();
         sync(&mut a, &mut b);
@@ -2133,7 +2189,7 @@ mod tests {
     fn a_rename_concurrent_with_a_delete_lands_in_the_tombstoned_document() {
         let (mut a, root) = tree();
         let x = id();
-        a.add_node(x, Some(root), None, "document", "Old", T1).unwrap();
+        a.add_node(x, Some(root), Place::Last, "document", "Old", T1).unwrap();
         let mut b = replica_of(&a);
 
         a.remove_node(x, T2).unwrap();
@@ -2151,13 +2207,13 @@ mod tests {
     fn undelete_after_a_concurrent_move_puts_the_node_where_it_was_moved() {
         let (mut a, root) = tree();
         let (p, q, x) = (id(), id(), id());
-        a.add_node(p, Some(root), None, "folder", "P", T1).unwrap();
-        a.add_node(q, Some(root), None, "folder", "Q", T1).unwrap();
-        a.add_node(x, Some(p), None, "document", "x", T1).unwrap();
+        a.add_node(p, Some(root), Place::Last, "folder", "P", T1).unwrap();
+        a.add_node(q, Some(root), Place::Last, "folder", "Q", T1).unwrap();
+        a.add_node(x, Some(p), Place::Last, "document", "x", T1).unwrap();
         let mut b = replica_of(&a);
 
         a.remove_node(x, T2).unwrap();
-        b.move_node(x, q, None, T2).unwrap();
+        b.move_node(x, q, Place::Last, T2).unwrap();
         sync_and_repair_round(&mut a, &mut b);
         sync_and_repair_round(&mut a, &mut b);
         assert_converged(&mut a, &mut b);
@@ -2185,13 +2241,13 @@ mod tests {
 
     fn folder(tree: &mut Tree, parent: NodeId, title: &str) -> NodeId {
         let new = id();
-        tree.add_node(new, Some(parent), None, "folder", title, T1).unwrap();
+        tree.add_node(new, Some(parent), Place::Last, "folder", title, T1).unwrap();
         new
     }
 
     fn note(tree: &mut Tree, parent: NodeId, title: &str) -> NodeId {
         let new = id();
-        tree.add_node(new, Some(parent), None, "document", title, T1).unwrap();
+        tree.add_node(new, Some(parent), Place::Last, "document", title, T1).unwrap();
         new
     }
 
@@ -2379,17 +2435,17 @@ mod tests {
     #[test]
     fn move_or_transplant_moves_inside_a_share_and_transplants_out_of_it() {
         let mut s = shared();
-        let (now_id, edit) = s.tree.move_or_transplant(HERE, s.x, s.b, None, T2, &mut never_asked).unwrap();
+        let (now_id, edit) = s.tree.move_or_transplant(HERE, s.x, s.b, Place::Last, T2, &mut never_asked).unwrap();
         assert_eq!(now_id, s.x, "a plain move keeps the id");
         assert_eq!(ids_of(&edit), HashSet::from([s.a, s.b, s.x]));
         assert_eq!(s.tree.get_children(s.b).unwrap(), vec![s.x]);
 
-        let (now_id, _) = s.tree.move_or_transplant(HERE, s.own, s.b, Some(0), T2, &mut never_asked).unwrap();
+        let (now_id, _) = s.tree.move_or_transplant(HERE, s.own, s.b, Place::First, T2, &mut never_asked).unwrap();
         assert_eq!(now_id, s.own, "entering a share is a plain move");
         assert_eq!(s.tree.get_children(s.b).unwrap(), vec![s.own, s.x]);
 
         let mut made = Vec::new();
-        let (now_id, edit) = s.tree.move_or_transplant(HERE, s.x, s.private, None, T3, &mut fresh_ids(&mut made)).unwrap();
+        let (now_id, edit) = s.tree.move_or_transplant(HERE, s.x, s.private, Place::Last, T3, &mut fresh_ids(&mut made)).unwrap();
         assert_eq!(made, vec![now_id], "one node, one new id");
         assert_ne!(now_id, s.x);
         assert_eq!(edit.node_ids(), vec![now_id, s.private, s.x, s.b], "made, listed, tombstoned, unlisted");
@@ -2400,9 +2456,9 @@ mod tests {
         assert!(s.tree.validate_tree().is_empty());
 
         // What `move_node` refuses, this refuses, whichever way it would go.
-        assert!(s.tree.move_or_transplant(HERE, s.root, s.b, None, T3, &mut never_asked).is_err());
-        assert!(s.tree.move_or_transplant(HERE, s.a, s.r2, None, T3, &mut never_asked).is_err());
-        assert!(s.tree.move_or_transplant(HERE, s.y, id(), None, T3, &mut never_asked).is_err());
+        assert!(s.tree.move_or_transplant(HERE, s.root, s.b, Place::Last, T3, &mut never_asked).is_err());
+        assert!(s.tree.move_or_transplant(HERE, s.a, s.r2, Place::Last, T3, &mut never_asked).is_err());
+        assert!(s.tree.move_or_transplant(HERE, s.y, id(), Place::Last, T3, &mut never_asked).is_err());
         assert!(s.tree.has_node(s.y), "a refused transplant deletes nothing");
     }
 
@@ -2415,7 +2471,7 @@ mod tests {
         let dead = note(&mut s.tree, s.a, "Deleted earlier");
         s.tree.remove_node(dead, T1).unwrap();
         let mount = id();
-        s.tree.add_node(mount, Some(s.a), None, pimble_core::node_types::MOUNT, "Elsewhere", T1).unwrap();
+        s.tree.add_node(mount, Some(s.a), Place::Last, pimble_core::node_types::MOUNT, "Elsewhere", T1).unwrap();
         let mount_ref = serde_json::json!({ "source_store": "6a7e6f52-0000-4000-8000-000000000001", "source_node": null, "source_path": "/stores/other.pimble" });
         s.tree.set_custom(mount, "mount", &mount_ref, T1).unwrap();
         s.tree.set_tags(s.x, &["one".into(), "two".into()], T1).unwrap();
@@ -2429,7 +2485,7 @@ mod tests {
         let before = s.tree.subtree_ids(s.a).unwrap();
         assert_eq!(before, vec![s.a, s.x, s.r2, s.y, mount], "preorder, the tombstone not among them");
         let mut made = Vec::new();
-        let (new_a, edit) = s.tree.transplant(HERE, s.a, s.private, Some(0), T3, &mut fresh_ids(&mut made)).unwrap();
+        let (new_a, edit) = s.tree.transplant(HERE, s.a, s.private, Place::First, T3, &mut fresh_ids(&mut made)).unwrap();
 
         // New ids, all of them, one per live node in the subtree's preorder.
         assert_eq!(made.len(), before.len());
@@ -2502,7 +2558,7 @@ mod tests {
         let mut s = shared();
         s.tree.doc_mut(s.y).unwrap().replace_plain_text("kept").unwrap();
         let mut made = Vec::new();
-        let (new_a, _) = s.tree.transplant(HERE, s.a, s.private, None, T2, &mut fresh_ids(&mut made)).unwrap();
+        let (new_a, _) = s.tree.transplant(HERE, s.a, s.private, Place::Last, T2, &mut fresh_ids(&mut made)).unwrap();
 
         let edit = s.tree.undelete_node(s.a, T3).unwrap();
         assert_eq!(ids_of(&edit), HashSet::from([s.a, s.x, s.r2, s.y, s.r0]));
@@ -2538,7 +2594,7 @@ mod tests {
             board.insert(&mut txn, "text", TextPrelim::new("note"));
         }
         let mut made = Vec::new();
-        let (new_a, _) = s.tree.transplant(HERE, s.a, s.private, None, T3, &mut fresh_ids(&mut made)).unwrap();
+        let (new_a, _) = s.tree.transplant(HERE, s.a, s.private, Place::Last, T3, &mut fresh_ids(&mut made)).unwrap();
         let new_x = s.tree.subtree_ids(new_a).unwrap()[1];
         let doc = s.tree.doc(new_x).unwrap();
         let txn = doc.ydoc().transact();
@@ -2554,24 +2610,24 @@ mod tests {
         let mut s = shared();
         let before = snapshot(&s.tree);
         let mut no_ids = || -> NodeId { panic!("nothing should be made") };
-        assert!(s.tree.transplant(HERE, s.root, s.private, None, T2, &mut no_ids).is_err(), "the root");
-        assert!(s.tree.transplant(HERE, s.a, s.r2, None, T2, &mut no_ids).is_err(), "under its own descendant");
-        assert!(s.tree.transplant(HERE, s.a, s.a, None, T2, &mut no_ids).is_err(), "under itself");
-        assert!(s.tree.transplant(HERE, s.a, id(), None, T2, &mut no_ids).is_err(), "under nothing");
-        assert!(s.tree.transplant(HERE, id(), s.private, None, T2, &mut no_ids).is_err(), "nothing");
+        assert!(s.tree.transplant(HERE, s.root, s.private, Place::Last, T2, &mut no_ids).is_err(), "the root");
+        assert!(s.tree.transplant(HERE, s.a, s.r2, Place::Last, T2, &mut no_ids).is_err(), "under its own descendant");
+        assert!(s.tree.transplant(HERE, s.a, s.a, Place::Last, T2, &mut no_ids).is_err(), "under itself");
+        assert!(s.tree.transplant(HERE, s.a, id(), Place::Last, T2, &mut no_ids).is_err(), "under nothing");
+        assert!(s.tree.transplant(HERE, id(), s.private, Place::Last, T2, &mut no_ids).is_err(), "nothing");
         assert!(s.tree.take_cutting(s.root).is_err());
         // An id already held, and the same id twice.
         let mut held = || s.own;
-        assert!(s.tree.transplant(HERE, s.a, s.private, None, T2, &mut held).is_err());
+        assert!(s.tree.transplant(HERE, s.a, s.private, Place::Last, T2, &mut held).is_err());
         let twice = id();
         let mut same = || twice;
-        assert!(s.tree.transplant(HERE, s.a, s.private, None, T2, &mut same).is_err());
+        assert!(s.tree.transplant(HERE, s.a, s.private, Place::Last, T2, &mut same).is_err());
         assert_eq!(snapshot(&s.tree), before, "refused means untouched");
         assert!(s.tree.doc(twice).is_none());
 
         // Deleted already: not a node.
         s.tree.remove_node(s.x, T2).unwrap();
-        assert!(s.tree.transplant(HERE, s.x, s.private, None, T3, &mut no_ids).is_err());
+        assert!(s.tree.transplant(HERE, s.x, s.private, Place::Last, T3, &mut no_ids).is_err());
     }
 
     /// Content rinch's projection refuses (it fails loudly by design on what
@@ -2594,7 +2650,7 @@ mod tests {
 
         let before = snapshot(&s.tree);
         let mut made = Vec::new();
-        let err = s.tree.transplant(HERE, s.a, s.private, None, T2, &mut fresh_ids(&mut made)).unwrap_err();
+        let err = s.tree.transplant(HERE, s.a, s.private, Place::Last, T2, &mut fresh_ids(&mut made)).unwrap_err();
         assert!(matches!(err, CrdtError::Collab(_)), "{err}");
         assert_eq!(snapshot(&s.tree), before);
         assert!(s.tree.has_node(s.a) && s.tree.has_node(s.y));
@@ -2622,7 +2678,7 @@ mod tests {
         assert!(s.tree.has_node(s.a), "reading changes nothing");
 
         let mut made = Vec::new();
-        let (made_by, planted) = other.plant(cutting, landing, None, T2, &mut fresh_ids(&mut made)).unwrap();
+        let (made_by, planted) = other.plant(cutting, landing, Place::Last, T2, &mut fresh_ids(&mut made)).unwrap();
         let new_a = made_by.root;
         assert_eq!(made_by.ids, sources.iter().copied().zip(made.iter().copied()).collect::<Vec<_>>());
         let mut expected = made.clone();
@@ -2651,7 +2707,7 @@ mod tests {
 
         // The second half refuses what `add_node` refuses.
         let again = s.tree.take_cutting(s.b).unwrap();
-        assert!(other.plant(again, id(), None, T2, &mut NodeId::new).is_err(), "under nothing");
+        assert!(other.plant(again, id(), Place::Last, T2, &mut NodeId::new).is_err(), "under nothing");
     }
 
     fn contains(haystack: &[u8], needle: &str) -> bool {
@@ -2684,7 +2740,7 @@ mod tests {
         assert!(contains(&s.tree.doc(s.r2).unwrap().save(), &key_id), "the original carries its marker");
 
         let mut made = Vec::new();
-        let (new_r2, _) = s.tree.transplant(HERE, s.r2, s.private, None, T2, &mut fresh_ids(&mut made)).unwrap();
+        let (new_r2, _) = s.tree.transplant(HERE, s.r2, s.private, Place::Last, T2, &mut fresh_ids(&mut made)).unwrap();
         let new_doc = s.tree.doc(new_r2).unwrap();
         assert_eq!(new_doc.text(), "keep this");
         assert_eq!(new_doc.data_json(), serde_json::json!({ "k": "data now" }));
@@ -2713,7 +2769,7 @@ mod tests {
     fn a_node_with_no_content_yet_is_transplanted_with_none() {
         let mut s = shared();
         assert_eq!(s.tree.doc(s.x).unwrap().text(), "");
-        let (new_x, _) = s.tree.transplant(HERE, s.x, s.private, None, T2, &mut NodeId::new).unwrap();
+        let (new_x, _) = s.tree.transplant(HERE, s.x, s.private, Place::Last, T2, &mut NodeId::new).unwrap();
         // No projection was made up for it: its first edit seeds it, as for
         // any node whose content was never written.
         let mut peer = NodeDoc::load(&s.tree.doc(new_x).unwrap().save()).unwrap();
@@ -2834,7 +2890,7 @@ mod tests {
         // other one document at a time, a repair after each.
         let mut s = shared();
         let mut other = replica_of(&s.tree);
-        let moved = s.tree.move_node(s.x, s.b, None, T2).unwrap();
+        let moved = s.tree.move_node(s.x, s.b, Place::Last, T2).unwrap();
         for (doc_id, update) in moved.touched.iter().rev() {
             other.apply_update(*doc_id, update).unwrap();
             if let Some(repair) = other.repair(T3).unwrap() {
@@ -2862,7 +2918,7 @@ mod tests {
         assert_eq!(s.tree.get_children(s.private).unwrap(), vec![s.own, s.x]);
         assert!(s.tree.validate_tree().is_empty());
         // Putting it back is a plain move: it enters the share.
-        let (back, _) = s.tree.move_or_transplant(HERE, s.x, s.a, None, T3, &mut never_asked).unwrap();
+        let (back, _) = s.tree.move_or_transplant(HERE, s.x, s.a, Place::Last, T3, &mut never_asked).unwrap();
         assert_eq!(back, s.x);
     }
 
@@ -2876,9 +2932,9 @@ mod tests {
             // Someone made a folder and a folder in it, and the node says it
             // is in the inner one. Here: the inner folder, and not the outer.
             let outer = id();
-            let made_outer = holds_all.add_node(outer, Some(if lands_inside { s.b } else { s.private }), None, "folder", "Outer", T2).unwrap();
+            let made_outer = holds_all.add_node(outer, Some(if lands_inside { s.b } else { s.private }), Place::Last, "folder", "Outer", T2).unwrap();
             let inner = id();
-            let made_inner = holds_all.add_node(inner, Some(outer), None, "folder", "Inner", T2).unwrap();
+            let made_inner = holds_all.add_node(inner, Some(outer), Place::Last, "folder", "Inner", T2).unwrap();
             let moved = tamper_parent(&mut holds_all, s.x, Some(inner));
             for (doc_id, update) in made_inner.touched.iter().chain(&moved.touched) {
                 if *doc_id != outer {
@@ -3260,8 +3316,12 @@ mod tests {
             let result = if roll < 24 {
                 let id = rng.node_id();
                 let parent = rng.pick(&nodes).unwrap();
-                let position = if rng.below(2) == 0 { None } else { Some(rng.below(4)) };
-                let edit = tree.add_node(id, Some(parent), position, "document", &format!("n{step}"), &now);
+                let place = match rng.below(3) {
+                    0 => Place::Last,
+                    1 => Place::First,
+                    _ => tree.get_children(parent).ok().and_then(|kids| rng.pick(&kids)).map_or(Place::Last, Place::After),
+                };
+                let edit = tree.add_node(id, Some(parent), place, "document", &format!("n{step}"), &now);
                 if edit.is_ok() {
                     created.push(id);
                     stats.adds += 1;
@@ -3272,9 +3332,17 @@ mod tests {
                 // transplant when it would leave a share.
                 match (rng.pick(&non_root), rng.pick(&nodes)) {
                     (Some(id), Some(parent)) => {
-                        let position = if rng.below(2) == 0 { None } else { Some(rng.below(4)) };
+                        // Every kind of place, `After` a child of the
+                        // destination or a node anywhere (an anchor the
+                        // list does not name means the end).
+                        let place = match rng.below(4) {
+                            0 => Place::Last,
+                            1 => Place::First,
+                            2 => tree.get_children(parent).ok().and_then(|kids| rng.pick(&kids)).map_or(Place::Last, Place::After),
+                            _ => rng.pick(&nodes).map_or(Place::Last, Place::After),
+                        };
                         let mut made = Vec::new();
-                        let moved = tree.move_or_transplant(HERE, id, parent, position, &now, &mut || {
+                        let moved = tree.move_or_transplant(HERE, id, parent, place, &now, &mut || {
                             made.push(rng.node_id());
                             *made.last().unwrap()
                         });
@@ -3321,7 +3389,7 @@ mod tests {
                 // A client from before the contract: a plain move, wherever
                 // to, and no `placed_under` written (it did not know the key).
                 match (rng.pick(&non_root), rng.pick(&nodes)) {
-                    (Some(id), Some(parent)) => match tree.move_node(id, parent, None, &now) {
+                    (Some(id), Some(parent)) => match tree.move_node(id, parent, Place::Last, &now) {
                         Ok(mut edit) => {
                             stats.old_client_moves += 1;
                             let (_, update) = tree.docs[&id]
@@ -3596,7 +3664,7 @@ mod tests {
         let (d, _) = attach(&mut s.tree, s.x, "On X");
         s.tree.doc_mut(d).unwrap().set_data("discussion", &serde_json::json!({ "v": 1 })).unwrap();
         let mut made = Vec::new();
-        let (new_a, _) = s.tree.transplant(HERE, s.a, s.private, None, T3, &mut fresh_ids(&mut made)).unwrap();
+        let (new_a, _) = s.tree.transplant(HERE, s.a, s.private, Place::Last, T3, &mut fresh_ids(&mut made)).unwrap();
         let new_x = s.tree.get_children(new_a).unwrap().into_iter().find(|&c| s.tree.live_fields(c).unwrap().title == "X").unwrap();
         let moved = s.tree.attachments_of(new_x);
         assert_eq!(moved.len(), 1, "the discussion came along");

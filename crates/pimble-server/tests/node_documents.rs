@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
-use pimble_core::{NodeId, StoreId};
+use pimble_core::{NodeId, Place, StoreId};
 use pimble_crdt::{NodeDoc, Tree, TreeEdit};
 use pimble_rpc::{
     ApplyEditRequest, CreateNodeRequest, CreateStoreRequest, DeleteNodeRequest, EditOperation, GetChildrenRequest,
@@ -64,6 +64,7 @@ async fn create(handler: &RpcHandler, store_id: StoreId, parent_id: NodeId, node
             title: title.into(),
             content: None,
             custom: Default::default(),
+            place: Default::default(),
         })
         .await
         .unwrap()
@@ -144,7 +145,7 @@ async fn a_peers_structure_edits_earn_the_derived_kinds() {
 
     // Create.
     let x = NodeId::new();
-    let edit = peer.add_node(x, Some(root_id), None, "document", "X", T0).unwrap();
+    let edit = peer.add_node(x, Some(root_id), Place::Last, "document", "X", T0).unwrap();
     send_edit(&handler, store_id, "peer", &edit).await;
     let notifs = drain(&mut sub, Duration::from_millis(300)).await;
     let kinds: Vec<&StoreChangeKind> = notifs.iter().map(|n| &n.change_kind).collect();
@@ -154,7 +155,7 @@ async fn a_peers_structure_edits_earn_the_derived_kinds() {
     assert_eq!(children_of(&handler, store_id, root_id).await, vec![folder, x]);
 
     // Move.
-    let edit = peer.move_node(x, folder, None, T1).unwrap();
+    let edit = peer.move_node(x, folder, Place::Last, T1).unwrap();
     send_edit(&handler, store_id, "peer", &edit).await;
     let notifs = drain(&mut sub, Duration::from_millis(300)).await;
     let kinds: Vec<&StoreChangeKind> = notifs.iter().map(|n| &n.change_kind).collect();
@@ -318,4 +319,50 @@ async fn an_empty_replica_adopts_its_root_from_the_documents_that_arrive() {
     assert_eq!(tree.get_children(root_id).unwrap(), vec![folder]);
     assert_eq!(tree.get_children(folder).unwrap(), vec![inner]);
     assert_eq!(tree.get_node_info(inner).unwrap().parent_id, Some(folder), "not re-parented while its parent had not arrived");
+}
+
+/// `moveNodes` (docs/TREE_CONTRACT.md "Places on the wire"): several nodes
+/// land together in the order asked for, at every kind of place, and one
+/// that may not move refuses the lot before anything moves.
+#[tokio::test]
+async fn move_nodes_keeps_their_order_and_refuses_all_or_nothing() {
+    use pimble_rpc::MoveNodesRequest;
+    let (handler, store_id, root_id, _dir) = new_handler_with_store().await;
+    let ext = pimble_server::service_extensions();
+    let folder = create(&handler, store_id, root_id, "folder", "F").await;
+    let keep = create(&handler, store_id, folder, "document", "keep").await;
+    let a = create(&handler, store_id, root_id, "document", "a").await;
+    let b = create(&handler, store_id, root_id, "document", "b").await;
+    let c = create(&handler, store_id, root_id, "document", "c").await;
+
+    // After a node: in the order given, not the order they were in.
+    let moved = handler
+        .move_nodes(&ext, MoveNodesRequest { store_id, node_ids: vec![c, a, b], new_parent_id: folder, place: Place::After(keep) })
+        .await
+        .unwrap();
+    assert_eq!(moved.moved.iter().map(|m| m.node_id).collect::<Vec<_>>(), vec![c, a, b]);
+    assert_eq!(children_of(&handler, store_id, folder).await, vec![keep, c, a, b]);
+
+    // First, and last.
+    handler
+        .move_nodes(&ext, MoveNodesRequest { store_id, node_ids: vec![a, b], new_parent_id: folder, place: Place::First })
+        .await
+        .unwrap();
+    assert_eq!(children_of(&handler, store_id, folder).await, vec![a, b, keep, c]);
+    handler
+        .move_nodes(&ext, MoveNodesRequest { store_id, node_ids: vec![keep, a], new_parent_id: root_id, place: Place::Last })
+        .await
+        .unwrap();
+    assert_eq!(children_of(&handler, store_id, folder).await, vec![b, c]);
+    let top = children_of(&handler, store_id, root_id).await;
+    assert_eq!(&top[top.len() - 2..], &[keep, a]);
+
+    // One node that cannot go (the folder into its own child) refuses them
+    // all, before anything moves.
+    let refused = handler
+        .move_nodes(&ext, MoveNodesRequest { store_id, node_ids: vec![keep, folder], new_parent_id: c, place: Place::Last })
+        .await;
+    assert!(refused.is_err());
+    assert_eq!(children_of(&handler, store_id, c).await, Vec::<NodeId>::new(), "nothing moved");
+    assert_eq!(children_of(&handler, store_id, root_id).await, top);
 }

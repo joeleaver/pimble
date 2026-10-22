@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use pimble_client::PimbleClient;
-use pimble_core::{AuthMethod, MountRef, MountState, NodeId, RemoteEndpoint, StoreId, StoreKind};
+use pimble_core::{AuthMethod, MountRef, MountState, NodeId, Place, RemoteEndpoint, StoreId, StoreKind};
 use base64::Engine;
 use pimble_crdt::NodeDoc;
 use pimble_rpc::{EditOperation, VaultDocId};
@@ -139,10 +139,10 @@ async fn main() -> Result<()> {
         }
         "move-node" => {
             if args.len() < 5 {
-                eprintln!("Usage: pimble-cli move-node <store-id> <node-id> <new-parent-id>");
+                eprintln!("Usage: pimble-cli move-node <store-id> <node-id> <new-parent-id> [--first | --after <node-id>]");
                 return Ok(());
             }
-            move_node(&args[2], &args[3], &args[4]).await?;
+            move_node(&args[2], &args[3], &args[4], &args[5..]).await?;
         }
         "delete-node" => {
             if args.len() < 4 {
@@ -435,7 +435,7 @@ COMMANDS:
     list-stores         List all open stores
     import-scrivener    Import a Scrivener .scriv project into a Pimble store
     create-node         Create a node in a store
-    move-node           Move a node under a new parent (appended last)
+    move-node           Move a node under a new parent (last, first, or after a sibling)
     delete-node         Delete a node and its whole subtree (a tombstone)
     undelete-node       Bring a deleted node and its subtree back
     transplant-node     Move a node into another store (always a transplant)
@@ -529,7 +529,7 @@ EXAMPLES:
     pimble-cli list-stores
     pimble-cli import-scrivener ./project.scriv ./project.pimble
     pimble-cli create-node <store-id> <parent-id> document "My Note"
-    pimble-cli move-node <store-id> <node-id> <new-parent-id>
+    pimble-cli move-node <store-id> <node-id> <new-parent-id> [--first | --after <node-id>]
     pimble-cli delete-node <store-id> <node-id>
     pimble-cli undelete-node <store-id> <node-id>
     pimble-cli transplant-node <from-store-id> <node-id> <to-store-id> <new-parent-id>
@@ -1294,13 +1294,21 @@ async fn create_node(store_id: &str, parent_id: &str, node_type: &str, title: &s
     Ok(())
 }
 
-async fn move_node(store_id: &str, node_id: &str, new_parent_id: &str) -> Result<()> {
+async fn move_node(store_id: &str, node_id: &str, new_parent_id: &str, rest: &[String]) -> Result<()> {
     let store_id = parse_store_id(store_id)?;
     let node_id = parse_node_id(node_id)?;
     let new_parent_id = parse_node_id(new_parent_id)?;
+    // Where among the new parent's children (docs/TREE_CONTRACT.md "Places
+    // on the wire"): the end unless told otherwise.
+    let place = match rest {
+        [] => Place::Last,
+        [flag] if flag == "--first" => Place::First,
+        [flag, anchor] if flag == "--after" => Place::After(parse_node_id(anchor)?),
+        _ => anyhow::bail!("Usage: pimble-cli move-node <store-id> <node-id> <new-parent-id> [--first | --after <node-id>]"),
+    };
 
     let client = connect().await?;
-    let answer = client.move_node(store_id, node_id, new_parent_id, None).await?;
+    let answer = client.move_node(store_id, node_id, new_parent_id, place).await?;
     if answer.node_id == node_id {
         println!("Moved node {} under {}", node_id, new_parent_id);
     } else {
@@ -1347,7 +1355,7 @@ async fn transplant_node(from_store_id: &str, node_id: &str, to_store_id: &str, 
     let new_parent_id = parse_node_id(new_parent_id)?;
 
     let client = connect().await?;
-    let answer = client.transplant_node(from_store_id, node_id, to_store_id, new_parent_id, None).await?;
+    let answer = client.transplant_node(from_store_id, node_id, to_store_id, new_parent_id, Place::Last).await?;
     let out_of = if answer.left_shares.is_empty() {
         String::new()
     } else {

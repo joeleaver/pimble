@@ -11,7 +11,7 @@ use jsonrpsee::core::client::Client as RpcClient;
 use jsonrpsee::wasm_client::WasmClientBuilder;
 #[cfg(not(target_arch = "wasm32"))]
 use jsonrpsee::ws_client::{HeaderMap, HeaderValue, WsClientBuilder};
-use pimble_core::{AuthMethod, BlobId, BlobUrl, Node, NodeId, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState, Workspace};
+use pimble_core::{AuthMethod, BlobId, BlobUrl, Node, NodeId, Place, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState, Workspace};
 use pimble_core::MountRef;
 use pimble_rpc::{
     AgentGrant, AgentInfo, CreateAgentRequest, CreateAgentResponse, RemoveAgentRequest, UpdateAgentRequest,
@@ -21,7 +21,7 @@ use pimble_rpc::{
     SetScopeRequest, VaultDocKeys, VaultSetDocKeysRequest,
     CreateMountRequest, CreateNodeRequest, CreateStoreRequest, CreateWorkspaceRequest, DeleteNodeRequest,
     EditOperation, GetChildrenRequest, GetMountStateRequest, GetNodeRequest, GetNodesRequest, GetStoreSyncRequest, GetStoreSyncResponse, SetStoreSyncRequest,
-    ListDeletedRequest, ResolveLinkRequest, ListRemoteStoresRequest, LoadWorkspaceRequest, MoveNodeRequest, MoveNodeResponse, NodeContentChangedNotification, NodeStateVector,
+    ListDeletedRequest, ResolveLinkRequest, ListRemoteStoresRequest, LoadWorkspaceRequest, MoveNodeRequest, MoveNodeResponse, MoveNodesRequest, MoveNodesResponse, NodeContentChangedNotification, NodeStateVector,
     TransplantNodeRequest, TransplantNodeResponse,
     OpenStoreRequest, PimbleApiClient, RebuildIndexRequest, RemoveReplicaRequest, SaveWorkspaceRequest,
     SearchRequest, SearchResultItem, StoreChangedNotification, SyncNodesRequest, UndeleteNodeRequest,
@@ -392,11 +392,11 @@ impl PimbleClient {
         node_type: impl Into<String>,
         title: impl Into<String>,
     ) -> Result<NodeId> {
-        self.create_node_with(store_id, parent_id, node_type, title, None, Default::default()).await
+        self.create_node_with(store_id, parent_id, node_type, title, None, Default::default(), Place::Last).await
     }
 
     /// Create a new node that starts with `content` (a yrs update merged into
-    /// its document) and `custom` metadata, in the one edit that creates it.
+    /// its document) and `custom` metadata, in the one edit that creates it, at `place` among the parent's children.
     pub async fn create_node_with(
         &self,
         store_id: StoreId,
@@ -405,6 +405,7 @@ impl PimbleClient {
         title: impl Into<String>,
         content: Option<Vec<u8>>,
         custom: std::collections::HashMap<String, serde_json::Value>,
+        place: Place,
     ) -> Result<NodeId> {
         use base64::Engine;
         let request = CreateNodeRequest {
@@ -414,6 +415,7 @@ impl PimbleClient {
             title: title.into(),
             content: content.map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
             custom,
+            place,
         };
 
         let response = self
@@ -559,17 +561,32 @@ impl PimbleClient {
         store_id: StoreId,
         node_id: NodeId,
         new_parent_id: NodeId,
-        position: Option<usize>,
+        place: Place,
     ) -> Result<MoveNodeResponse> {
         let request = MoveNodeRequest {
             store_id,
             node_id,
             new_parent_id,
-            position,
+            place,
         };
 
         self.client
             .move_node(request)
+            .await
+            .map_err(rpc_error)
+    }
+
+    /// Move several nodes of one store under one parent, in order, all or
+    /// none (`moveNodes`).
+    pub async fn move_nodes(
+        &self,
+        store_id: StoreId,
+        node_ids: Vec<NodeId>,
+        new_parent_id: NodeId,
+        place: Place,
+    ) -> Result<MoveNodesResponse> {
+        self.client
+            .move_nodes(MoveNodesRequest { store_id, node_ids, new_parent_id, place })
             .await
             .map_err(rpc_error)
     }
@@ -583,9 +600,9 @@ impl PimbleClient {
         node_id: NodeId,
         to_store_id: StoreId,
         new_parent_id: NodeId,
-        position: Option<usize>,
+        place: Place,
     ) -> Result<TransplantNodeResponse> {
-        let request = TransplantNodeRequest { from_store_id, node_id, to_store_id, new_parent_id, position };
+        let request = TransplantNodeRequest { from_store_id, node_id, to_store_id, new_parent_id, place };
 
         self.client
             .transplant_node(request)
