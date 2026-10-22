@@ -1242,6 +1242,10 @@ pub struct ScopePeople {
     /// dialog's "Appear as"); the first open of a share asks when it has not.
     #[serde(default)]
     pub my_name_chosen: bool,
+    /// What the share is called (its owner's name for it), or the store's
+    /// name for a whole store.
+    #[serde(default)]
+    pub share_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

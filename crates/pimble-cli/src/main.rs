@@ -1064,7 +1064,14 @@ fn print_share(answer: &pimble_rpc::CloudShareInfoResponse) {
             pimble_rpc::ShareMemberStatus::WaitingForKey => "waiting for the key",
             pimble_rpc::ShareMemberStatus::Active => "active",
         };
-        println!("  {}  {}  {}", member.email, member.role.as_str(), status);
+        // By name; the email beside it only where the server sent one (to
+        // an owner: docs/PRESENCE_CONTRACT.md section 3).
+        let who = match (member.name.is_empty(), member.email.is_empty()) {
+            (false, false) => format!("{} <{}>", member.name, member.email),
+            (false, true) => member.name.clone(),
+            (true, _) => member.email.clone(),
+        };
+        println!("  {}  {}  {}", who, member.role.as_str(), status);
     }
 }
 

@@ -972,6 +972,7 @@ async fn people_of(store_id: StoreId) -> Result<pimble_rpc::StorePeople, String>
             people: listing.people.into_iter().map(|p| pimble_rpc::Person { user_id: p.user_id, name: p.name }).collect(),
             my_name: share.appears_as,
             my_name_chosen: !share.my_name.trim().is_empty(),
+            share_name: share.name.clone(),
         });
     }
     Ok(pimble_rpc::StorePeople { scopes })

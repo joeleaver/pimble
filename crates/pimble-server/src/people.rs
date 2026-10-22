@@ -60,6 +60,7 @@ pub(crate) async fn fetch(account: &SignedInAccount, store_id: StoreId) -> Optio
             people: listing.people.into_iter().map(|person| Person { user_id: person.user_id, name: person.name }).collect(),
             my_name: share.appears_as.clone(),
             my_name_chosen: !share.my_name.trim().is_empty(),
+            share_name: share.name.clone(),
         });
     }
     Some(StorePeople { scopes })

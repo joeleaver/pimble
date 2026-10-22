@@ -390,4 +390,17 @@ Each wave is checked in the desktop app and in the browser on the local stack
   the display is corrected, for people who are still members.
 - The owner is never asked the one-line question; their default name applies until
   they set one in Shares.
-- Not yet tried in the desktop app or the browser on the local stack.
+
+**Checked on the local stack** (2026-10-22): Alice hosted `Family`, shared `Holiday` as
+"Holiday Plans" and invited Bob.
+- `people.json` on Bob's disk names "alice" and "bob" and holds no email.
+- Bob's desktop app (over the debug port) asked the question on the first open; "Bobby"
+  was saved.
+- Account > "Shares..." listed "Holiday Plans · shared by alice", Editor, "Bobby". A
+  default name ("Robert") applied on Enter, and Open opened the share.
+- In the browser as Bob, File > "Shares..." showed the same values and asked no question.
+  "Bob B." typed there reached Alice's `cloud-share-info` as `Bob B. <bob@example.com>`.
+  She sees the email because she is the owner.
+- The question now names the share by its own name (`ScopePeople.share_name`), no longer
+  by its root note's label.
+- Not tried by hand: discussion authors and the board hover under the new names.

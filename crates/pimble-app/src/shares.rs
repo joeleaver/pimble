@@ -124,7 +124,8 @@ pub(crate) fn people_loaded(store: AppStore, store_id: StoreId, people: &StorePe
             asked.insert(key);
         });
         ui.ask_draft.set(scope.my_name.clone());
-        ui.asking.set(Some((key, share_name(scope.root))));
+        let name = if scope.share_name.trim().is_empty() { share_name(scope.root) } else { scope.share_name.clone() };
+        ui.asking.set(Some((key, name)));
         return;
     }
 }
