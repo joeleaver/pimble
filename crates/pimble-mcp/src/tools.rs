@@ -485,7 +485,7 @@ impl Pimble {
             label(&node),
             addr.link(),
             nodes::path_of(&client, &stores, addr).await,
-            node.node_type
+            nodes::type_name(&node)
         );
         if !node.metadata.tags.is_empty() {
             out.push_str(&format!("tags: {}\n", node.metadata.tags.join(", ")));

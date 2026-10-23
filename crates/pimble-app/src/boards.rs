@@ -397,7 +397,7 @@ const DRAG_WRITE_EVERY_MS: f64 = 80.0;
 /// `pictures.rs` numbers for pictures in text.
 const REQUEST_BASE: u64 = 1 << 40;
 
-/// "New Image..." on a store that refuses pictures, or with nothing picked.
+/// "New Canvas from Picture..." on a store that refuses pictures, or with nothing picked.
 const NOT_A_PICTURE: &str = "That file is not a picture Pimble can show.";
 /// A tool refused on a locked layer or element (a guard against accidents,
 /// contract section 5, not a permission).
@@ -1686,18 +1686,18 @@ pub(crate) fn create_board_node(store: AppStore, store_id: StoreId, parent_id: N
     });
 }
 
-/// A row's "New Whiteboard": an empty board under `parent_id`.
+/// A row's "New Canvas": an empty board under `parent_id`.
 pub(crate) fn new_whiteboard(store: AppStore, store_id: StoreId, parent_id: NodeId) {
     if let Some(board) = new_board(None) {
-        create_board_node(store, store_id, parent_id, "Whiteboard", WHITEBOARD_ICON, board, None);
+        create_board_node(store, store_id, parent_id, "Canvas", WHITEBOARD_ICON, board, None);
     }
 }
 
 /// Where pictures that are being added go.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Dest {
-    /// An image node per picture under a node: dropped on a tree row, "New
-    /// Image...", a paste with a row selected.
+    /// A canvas node per picture under a node: dropped on a tree row, "New
+    /// Canvas from Picture...", a paste with a row selected.
     Under(StoreId, NodeId),
     /// On pane `pane`'s board (contract section 1: "Pictures go on any
     /// board"): at a point over its surface (physical pixels), or in the
@@ -1768,7 +1768,7 @@ pub(crate) fn add_pictures(store: AppStore, dest: Dest, pictures: Vec<(Option<St
 }
 
 /// Make an image node per picture under `parent_id`, in order: dropped
-/// files, "New Image...", a paste on a tree row.
+/// files, "New Canvas from Picture...", a paste on a tree row.
 pub(crate) fn add_image_nodes(store: AppStore, store_id: StoreId, parent_id: NodeId, pictures: Vec<(Option<String>, Vec<u8>)>) {
     if !store.node_access(store_id, parent_id).allows_write() {
         crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
@@ -1899,7 +1899,7 @@ fn place_batch(store: AppStore, batch: BoardBatch) {
     }
     let pane = batch.pane;
     if with_session(pane, |s| (s.store_id, s.node_id)) != Some(batch.held) {
-        crate::events::show_notice(store, "The board was closed before its pictures were ready, so they were not added.".to_string());
+        crate::events::show_notice(store, "The canvas was closed before its pictures were ready, so they were not added.".to_string());
         return;
     }
     let Some(layer) = tools::target_layer(store, pane) else { return };
@@ -1936,7 +1936,7 @@ fn place_batch(store: AppStore, batch: BoardBatch) {
     }
 }
 
-/// A row's "New Image..." (an image node of each picture picked), or the
+/// A row's "New Canvas from Picture..." (an image node of each picture picked), or the
 /// board toolbar's picture button (each picture onto the board).
 pub(crate) fn pick_images(store: AppStore, dest: Dest) {
     #[cfg(feature = "native")]
@@ -1947,7 +1947,7 @@ pub(crate) fn pick_images(store: AppStore, dest: Dest) {
         let paths: Vec<std::path::PathBuf> = match std::env::var("PIMBLE_DEBUG_IMAGES") {
             Ok(list) => std::env::split_paths(&list).collect(),
             Err(_) => rinch::dialogs::open_file()
-                .set_title(if matches!(dest, Dest::Board(..)) { "Insert Pictures" } else { "New Image" })
+                .set_title(if matches!(dest, Dest::Board(..)) { "Insert Pictures" } else { "New Canvas from Picture" })
                 .add_filter("Pictures", &["png", "jpg", "jpeg", "gif", "webp"])
                 .pick_files()
                 .unwrap_or_default(),
@@ -1982,7 +1982,7 @@ pub(crate) fn add_image_files(store: AppStore, dest: Dest, paths: Vec<std::path:
     }
 }
 
-/// A row's "Paste Image" on the desktop (the picture on the clipboard becomes
+/// A row's "Paste Picture" on the desktop (the picture on the clipboard becomes
 /// an image node under the row), or Ctrl+V on a board (it goes on the board).
 #[cfg(feature = "native")]
 pub(crate) fn paste_image(store: AppStore, dest: Dest) {
@@ -2009,7 +2009,7 @@ pub(crate) fn paste_image(store: AppStore, dest: Dest) {
     add_pictures(store, dest, vec![(None, png)]);
 }
 
-/// The browser's picker for "New Image..." and the board's picture button: a
+/// The browser's picker for "New Canvas from Picture..." and the board's picture button: a
 /// hidden file input taking several pictures, read in order.
 #[cfg(not(feature = "native"))]
 fn pick_in_browser(store: AppStore, dest: Dest) {

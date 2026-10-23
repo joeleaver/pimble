@@ -27,8 +27,8 @@
 //!
 //! The rest is the person's side: the floating controls over the picture
 //! under the pointer (the markup toggle, and a menu with "Mark Up...",
-//! "Convert to Image Node", "Open"), a click that opens an embed, a
-//! double-click that marks up a picture, Insert > "Board...", a board
+//! "Make Canvas Node", "Open"), a click that opens an embed, a
+//! double-click that marks up a picture, Insert > "Canvas...", a board
 //! node's link pasted, a tree row dropped on the text, and the board a
 //! pasted marked-up picture brings with it.
 
@@ -83,16 +83,16 @@ const MAX_TEXT_PX: f32 = 4096.0;
 
 /// The placeholders an embed shows instead of someone else's pixels (contract
 /// section 2, "It is a link").
-const DELETED: &str = "This board was deleted.";
-const NOT_ARRIVED: &str = "This board has not arrived yet.";
-const NO_ACCESS: &str = "You cannot see this board.";
-const EMPTY: &str = "This board is empty.";
+const DELETED: &str = "This canvas was deleted.";
+const NOT_ARRIVED: &str = "This canvas has not arrived yet.";
+const NO_ACCESS: &str = "You cannot see this canvas.";
+const EMPTY: &str = "This canvas is empty.";
 
-/// "Convert to Image Node" refused.
-const CONVERT_FAILED: &str = "The picture could not be made into an image node.";
+/// "Make Canvas Node" refused.
+const CONVERT_FAILED: &str = "The picture could not be made into a canvas node.";
 
-/// Insert > "Board..." with no note to put it in.
-const NO_NOTE: &str = "Open a note to put a board in it.";
+/// Insert > "Canvas..." with no note to put it in.
+const NO_NOTE: &str = "Open a note to put a canvas in it.";
 
 // ── Sources ─────────────────────────────────────────────────────────────────
 
@@ -174,7 +174,7 @@ fn rendered<T>(f: impl FnOnce(&mut Rendered) -> T) -> T {
 /// UI thread. Never blocks.
 pub(crate) fn load(src: &str) -> ImageLoadResult {
     let Some(source) = parse_source(src) else {
-        return ImageLoadResult::Failed(format!("{src} is not a board's address"));
+        return ImageLoadResult::Failed(format!("{src} is not a canvas's address"));
     };
     let (answer, first) = rendered(|r| match r.images.get(src) {
         Some(bytes) => (Some(bytes.to_vec()), false),
@@ -266,7 +266,7 @@ thread_local! {
     static SWEEP_TIMER: RefCell<Option<TimeoutHandle>> = const { RefCell::new(None) };
     /// Placeholder pictures, by sentence.
     static PLACEHOLDERS: RefCell<HashMap<&'static str, Arc<Vec<u8>>>> = RefCell::new(HashMap::new());
-    /// "Convert to Image Node"s waiting for their node.
+    /// "Make Canvas Node"s waiting for their node.
     static CONVERTS: RefCell<HashMap<u64, Convert>> = RefCell::new(HashMap::new());
     static NEXT_REQUEST: Cell<u64> = const { Cell::new(1 << 48) };
     /// The app, for callbacks rinch calls with nothing in hand.
@@ -945,7 +945,7 @@ fn board_title(store: AppStore, store_id: StoreId, node_id: NodeId) -> String {
         .get_node_signal(store_id, node_id)
         .map(|sig| untracked(|| sig.with(|n| n.metadata.title.clone())))
         .filter(|t| !t.trim().is_empty())
-        .unwrap_or_else(|| "Board".to_string())
+        .unwrap_or_else(|| "Canvas".to_string())
 }
 
 /// Whether node `node_id` is a board node, as this window knows it.
@@ -965,7 +965,7 @@ pub(crate) fn drop_tree_row(store: AppStore, pane: PaneId, value: &str) -> bool 
     insert_embed(store, pane, BoardUrl::new(store_id, node_id), None)
 }
 
-/// Insert > "Board...": the link picker, limited to board nodes, and the
+/// Insert > "Canvas...": the link picker, limited to board nodes, and the
 /// pick goes in as an embed at the caret.
 pub fn insert_board(store: AppStore) {
     let pane = store.focused();
@@ -1283,7 +1283,7 @@ fn toggle(store: AppStore, pane: PaneId) {
     }
 }
 
-// ── Convert to Image Node ───────────────────────────────────────────────────
+// ── Make Canvas Node ───────────────────────────────────────────────────
 
 /// A conversion waiting for its node.
 struct Convert {
@@ -1295,7 +1295,7 @@ struct Convert {
     title: String,
 }
 
-/// "Convert to Image Node" (contract section 1): an image node under the
+/// "Make Canvas Node" (contract section 1): an image node under the
 /// note with the same blob and a copy of the picture's markup, and the
 /// picture in the text replaced by an embed of it, in one edit of the text.
 fn convert(store: AppStore, pane: PaneId, hover: &PictureHover) {
@@ -1344,7 +1344,7 @@ pub(crate) fn node_created(store: AppStore, request: u64, store_id: StoreId, nod
     let Some(job) = CONVERTS.with(|c| c.borrow_mut().remove(&request)) else { return };
     let holds = untracked(|| store.pane(job.pane).active_edit.get()).is_some_and(|e| (e.store_id, e.node_id) == job.host);
     if !holds {
-        crate::events::show_notice(store, "The note was closed before the image node was made; the picture was left as it was.".to_string());
+        crate::events::show_notice(store, "The note was closed before the canvas node was made; the picture was left as it was.".to_string());
         return;
     }
     let url = BoardUrl::new(store_id, node_id);
@@ -1619,7 +1619,7 @@ pub(crate) fn render_controls(__scope: &mut RenderScope, store: AppStore, pane: 
                             left_section: TablerIcon::Photo,
                             disabled: {move || !is_picture() || read_only()},
                             onclick: with_hover(convert),
-                            "Convert to Image Node"
+                            "Make Canvas Node"
                         }
                         DropdownMenuItem {
                             left_section: TablerIcon::ExternalLink,
@@ -1629,7 +1629,7 @@ pub(crate) fn render_controls(__scope: &mut RenderScope, store: AppStore, pane: 
                                     open_embed(store, pane, url, false);
                                 }
                             }),
-                            "Open Board"
+                            "Open Canvas"
                         }
                         DropdownMenuItem {
                             left_section: TablerIcon::LayoutColumns,
@@ -1639,7 +1639,7 @@ pub(crate) fn render_controls(__scope: &mut RenderScope, store: AppStore, pane: 
                                     open_embed(store, pane, url, true);
                                 }
                             }),
-                            "Open Board in Split View"
+                            "Open Canvas in Split View"
                         }
                     }
                 }
@@ -1765,7 +1765,7 @@ mod tests {
         crate::editor::stop_editing(store, P[1]);
     }
 
-    /// "Convert to Image Node": an image node under the note with the
+    /// "Make Canvas Node": an image node under the note with the
     /// picture's markup, and the picture replaced by an embed of it.
     #[test]
     fn converting_a_picture_makes_an_image_node_and_embeds_it() {

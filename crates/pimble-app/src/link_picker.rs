@@ -82,7 +82,7 @@ pub enum PickerKind {
     /// and a pick links those words as they are. `editing` when they are a
     /// link already (then "Remove Link" is offered too).
     Selection { from: usize, to: usize, editing: bool },
-    /// Insert > "Board..." (docs/IMAGE_MARKUP_CONTRACT.md section 2): the
+    /// Insert > "Canvas..." (docs/IMAGE_MARKUP_CONTRACT.md section 2): the
     /// query is typed in the popup, only board nodes are offered, and a pick
     /// goes in at `at` as a picture of the board.
     Board { at: usize },
@@ -283,7 +283,7 @@ pub fn lines(view: &PickerView) -> Vec<PickerLine> {
 /// What the popup says with no rows.
 pub fn empty_line(view: &PickerView) -> &'static str {
     if let PickerKind::Board { .. } = view.kind {
-        return if view.query.trim().is_empty() { "Type to find a board" } else { "No boards match" };
+        return if view.query.trim().is_empty() { "Type to find a canvas" } else { "No canvases match" };
     }
     if let PickerKind::Sheet { .. } = view.kind {
         return if view.query.trim().is_empty() { "Type to find a sheet" } else { "No sheets match" };

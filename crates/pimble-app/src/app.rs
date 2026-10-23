@@ -950,7 +950,7 @@ fn picker_is_field(store: AppStore) -> bool {
 /// The Ctrl+L picker's query line.
 fn picker_query_text(store: AppStore) -> String {
     store.link_picker.with(|view| match view {
-        Some(view) if view.query.is_empty() && matches!(view.kind, crate::link_picker::PickerKind::Board { .. }) => "Board…".to_string(),
+        Some(view) if view.query.is_empty() && matches!(view.kind, crate::link_picker::PickerKind::Board { .. }) => "Canvas…".to_string(),
         Some(view) if view.query.is_empty() && matches!(view.kind, crate::link_picker::PickerKind::Sheet { .. }) => "Sheet…".to_string(),
         Some(view) if view.query.is_empty() => "Link to…".to_string(),
         Some(view) => view.query.clone(),
@@ -1547,7 +1547,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             // clipboard from a menu without asking.
             #[cfg(not(feature = "native"))]
             let on_paste_image = move || {
-                crate::events::show_notice(store, "Select the row and press Ctrl+V to paste a picture as an image node.".to_string());
+                crate::events::show_notice(store, "Select the row and press Ctrl+V to paste a picture as a canvas.".to_string());
             };
             let on_close_store = {
                 let nv = nv_ctx.clone();
@@ -2111,7 +2111,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 left_section: TablerIcon::Chalkboard,
                                 disabled: store_menu.new_node,
                                 onclick: on_new_whiteboard.clone(),
-                                "New Whiteboard"
+                                "New Canvas"
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Table,
@@ -2129,13 +2129,13 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 left_section: TablerIcon::Photo,
                                 disabled: store_menu.new_node,
                                 onclick: on_new_image.clone(),
-                                "New Image..."
+                                "New Canvas from Picture..."
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::ClipboardCopy,
                                 disabled: store_menu.new_node,
                                 onclick: on_paste_image.clone(),
-                                "Paste Image"
+                                "Paste Picture"
                             }
                             if mounts_apply {
                                 DropdownMenuItem {
@@ -2324,7 +2324,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 left_section: TablerIcon::Chalkboard,
                                 disabled: !can_write_tree,
                                 onclick: on_new_whiteboard.clone(),
-                                "New Whiteboard"
+                                "New Canvas"
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Table,
@@ -2349,13 +2349,13 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 left_section: TablerIcon::Photo,
                                 disabled: !can_write_tree,
                                 onclick: on_new_image.clone(),
-                                "New Image..."
+                                "New Canvas from Picture..."
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::ClipboardCopy,
                                 disabled: !can_write_tree,
                                 onclick: on_paste_image.clone(),
-                                "Paste Image"
+                                "Paste Picture"
                             }
                             if mounts_apply {
                                 DropdownMenuItem {

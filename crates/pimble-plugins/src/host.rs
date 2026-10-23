@@ -183,10 +183,10 @@ impl NodePlugin for BoardPlugin {
     fn info(&self) -> PluginInfo {
         PluginInfo {
             id: "builtin.board".to_string(),
-            name: "Board".to_string(),
+            name: "Canvas".to_string(),
             version: "0.1.0".to_string(),
             node_type: pimble_core::node_types::BOARD.to_string(),
-            description: "An image node or a whiteboard: a co-edited canvas".to_string(),
+            description: "A canvas: pictures, drawing and markup, co-edited".to_string(),
         }
     }
 

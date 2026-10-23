@@ -894,7 +894,7 @@ fn presence_line(frame: &pimble_rpc::PresenceFrame) -> String {
                             0 => String::new(),
                             n => format!(", {n} selected"),
                         };
-                        format!(", on the board{pointer}{selected}")
+                        format!(", on the canvas{pointer}{selected}")
                     }
                     None => String::new(),
                 };

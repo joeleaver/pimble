@@ -29,6 +29,16 @@ pub fn label(node: &Node) -> String {
     }
 }
 
+/// A node's type as the person knows it: a `board` node is a canvas in the
+/// interface (docs/CANVAS_CONTRACT.md, "Glossary"); every other type is its own name.
+pub fn type_name(node: &Node) -> &str {
+    if node.node_type == pimble_core::node_types::BOARD {
+        "canvas"
+    } else {
+        &node.node_type
+    }
+}
+
 /// Find a store by name or id among the open ones.
 pub fn find_store<'a>(stores: &'a [Store], name: &str) -> Result<&'a Store, String> {
     if let Ok(id) = StoreId::parse(name.trim()) {

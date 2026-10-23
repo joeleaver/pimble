@@ -729,7 +729,7 @@ fn render_layers(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> No
     let delete_layer = text_button(__scope, "Delete", "Delete Layer (with its elements)", || false, move || {
         let Some(id) = untracked(|| picked()) else { return };
         if untracked(|| ui.layers.get().len()) <= 1 {
-            crate::events::show_notice(store, "A board keeps at least one layer.".to_string());
+            crate::events::show_notice(store, "A canvas keeps at least one layer.".to_string());
             return;
         }
         new_undo_step(pane);
@@ -911,7 +911,7 @@ pub(crate) fn render_board_toolbar(__scope: &mut RenderScope, store: AppStore) -
     let undo_btn = action(__scope, TablerIcon::ArrowBackUp, "Undo (Ctrl+Z)", |store, pane| tools::undo(store, pane, false));
     let redo_btn = action(__scope, TablerIcon::ArrowForwardUp, "Redo (Ctrl+Shift+Z)", |store, pane| tools::undo(store, pane, true));
     let delete_btn = action(__scope, TablerIcon::Trash, "Delete the selection (Delete)", delete_selected);
-    let picture_btn = action(__scope, TablerIcon::PhotoPlus, "Insert pictures (or paste or drop them on the board)", |store, pane| {
+    let picture_btn = action(__scope, TablerIcon::PhotoPlus, "Insert pictures (or paste or drop them on the canvas)", |store, pane| {
         tools::end_text(store, pane);
         pick_images(store, Dest::Board(pane, None));
     });
@@ -977,7 +977,7 @@ pub(crate) fn render_board_toolbar(__scope: &mut RenderScope, store: AppStore) -
         item(__scope, TablerIcon::FileExport, "Save as SVG...", Box::new(|s, p| export::save_picture(s, p, Format::Svg, false))),
         item(__scope, TablerIcon::Eye, "Save with All Markup (PNG)...", Box::new(|s, p| export::save_picture(s, p, Format::Png, true))),
         item(__scope, TablerIcon::PhotoDown, "Save Original As...", Box::new(export::save_original)),
-        item(__scope, TablerIcon::Stack2, "Flatten into New Image", Box::new(export::flatten)),
+        item(__scope, TablerIcon::Stack2, "Flatten into New Canvas", Box::new(export::flatten)),
     ];
 
     // Labeled groups, as the text's toolbar has (Joe, 2026-10-20: group them
@@ -1044,7 +1044,7 @@ pub(crate) fn render_board_toolbar(__scope: &mut RenderScope, store: AppStore) -
                         on_close: move || export_open.set(false),
                         DropdownMenuTarget {
                             div {
-                                title: "Copy and save the board as a picture",
+                                title: "Copy and save the canvas as a picture",
                                 class: "pimble-board-tool",
                                 onclick: move || export_open.update(|v| *v = !*v),
                                 IconGlyph { name: TablerIcon::Download.name().to_string() }

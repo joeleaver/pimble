@@ -94,13 +94,13 @@ use keys::*;
 /// Why a board write was refused. A refused single write changed nothing.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum BoardError {
-    #[error("this node has no board")]
+    #[error("this node has no canvas")]
     NoBoard,
-    #[error("the board has no element {0}")]
+    #[error("the canvas has no element {0}")]
     NoElement(String),
-    #[error("the board has no layer {0}")]
+    #[error("the canvas has no layer {0}")]
     NoLayer(String),
-    #[error("a board keeps at least one layer")]
+    #[error("a canvas keeps at least one layer")]
     LastLayer,
     #[error("element {0} is not a pen or highlighter stroke")]
     NotAStroke(String),
@@ -440,12 +440,12 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
     /// [`Board::read`]): its layers and elements with their ids, orders,
     /// styles, text, authors and timestamps, its page and its markup switch.
     /// The marks of a picture in text copied to another node, or to a new
-    /// image node ("Convert to Image Node"), keep saying who made them
+    /// image node ("Make Canvas Node"), keep saying who made them
     /// (contract section 6: the name is stamped, not looked up). Refused
     /// when this board exists already: a copy is a new board.
     pub fn copy_from(&mut self, raw: &RawBoard) -> Result<()> {
         if self.board.is_some() {
-            return Err(BoardError::Invalid("a board is copied only into a new one".into()));
+            return Err(BoardError::Invalid("a canvas is copied only into a new one".into()));
         }
         let mut map = self.location.root.clone();
         let path = self.location.path.clone();

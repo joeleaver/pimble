@@ -1,5 +1,10 @@
 # Boards contract: image nodes, whiteboards, and markup on any picture
 
+> **2026-10-23: boards are "canvases" in the interface, and there is no "image node"**
+> (a picture added anywhere is a canvas with the picture locked in its own layer).
+> Stored keys and code keep "board". See docs/CANVAS_CONTRACT.md, which wins where the
+> two disagree. The menu names quoted below are the ones of the time.
+
 Status: **decided, not built**. Written by the PM on 2026-10-09 from Joe's requests of
 that day: "image nodes, and image markup: any image, anywhere, embedded in a text
 document or as an image node, can be marked up, like Spectacle's annotation, but with

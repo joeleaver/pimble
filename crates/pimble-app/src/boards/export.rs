@@ -91,13 +91,13 @@ fn title(store: AppStore, pane: PaneId) -> String {
         .unwrap_or_default();
     let clean: String = title.chars().map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '-' } else { c }).collect();
     if clean.trim().is_empty() {
-        "Board".to_string()
+        "Canvas".to_string()
     } else {
         clean.trim().to_string()
     }
 }
 
-const NOTHING_SHOWS: &str = "There is nothing on this board to make a picture of.";
+const NOTHING_SHOWS: &str = "There is nothing on this canvas to make a picture of.";
 
 /// Copy Picture (Ctrl+C on a board): a flattened PNG on the clipboard.
 pub(crate) fn copy_picture(store: AppStore, pane: PaneId) {

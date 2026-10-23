@@ -705,7 +705,7 @@ impl Pimble {
                 .await;
         }
         if node.node_type == node_types::MOUNT || node.node_type == node_types::BOARD {
-            return Err(format!("A table goes in a text node or a sheet node; this is a {} node.", node.node_type));
+            return Err(format!("A table goes in a text node or a sheet node; this is a {} node.", crate::nodes::type_name(&node)));
         }
         // A text node: the table, and its embed atom in the text, in one edit
         // (contract section 10).
@@ -1026,7 +1026,7 @@ impl Pimble {
         let to_node = if to == from { from_node.clone() } else { client.get_node(to.store, to.node).await.map_err(rpc)? };
         let to_text = to_node.node_type != node_types::SHEET;
         if to_node.node_type == node_types::MOUNT || to_node.node_type == node_types::BOARD {
-            return Err(format!("A table goes in a text node or a sheet node; that is a {} node.", to_node.node_type));
+            return Err(format!("A table goes in a text node or a sheet node; that is a {} node.", crate::nodes::type_name(&to_node)));
         }
         if p.after_text.is_some() && !to_text {
             return Err("after_text places a table in a text node's text; a sheet node has no text (use after).".into());

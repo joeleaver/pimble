@@ -289,6 +289,13 @@ element bounds on both backends: rinch-web feeds no `bounds_signal`. rinch gives
 
 ### Boards (built 2026-10-09/10, branch `boards`, not merged)
 
+**Glossary: a canvas in the interface is a board in the code and in storage** (Joe,
+2026-10-23, `docs/CANVAS_CONTRACT.md`). Every word a person or the MCP reads says
+"canvas"; the `board` node type, `data.board`, `data["board:<id>"]`, `data-board`,
+`pimble-board:`, the `pimble-board` crate and Rust identifiers keep "board". There is no
+"image node": a picture added in the explorer is a canvas whose first element is the
+picture, locked in its own layer.
+
 Contract: `docs/IMAGE_MARKUP_CONTRACT.md` (decisions at the end; "Built in ..." sections
 per wave). Image nodes, whiteboards and markup on pictures in text are one model, a
 **board**: a yrs map in a node document's `data` (`data.board` for a board node,

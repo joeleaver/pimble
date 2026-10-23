@@ -453,7 +453,7 @@ pub mod node_types {
     /// Mount node - reference to a subtree in another store
     pub const MOUNT: &str = "mount";
 
-    /// Board node - a co-edited canvas: an image node or a whiteboard
+    /// Board node - a co-edited canvas (a "canvas" in the interface)
     /// (docs/IMAGE_MARKUP_CONTRACT.md section 1). Its document's
     /// `data.board` is the board; its `content` is unused.
     pub const BOARD: &str = "board";

@@ -523,8 +523,8 @@ pub(crate) fn node_created(store: AppStore, request: u64, store_id: StoreId, nod
         if at.is_empty() {
             return None;
         }
-        // In its place, the sheet node it now is, shown live (as "Convert to
-        // Image Node" leaves an embed of the image node).
+        // In its place, the sheet node it now is, shown live (as "Make Canvas
+        // Node" leaves an embed of the canvas node).
         let embed = state.schema().create_node("embed", embed_attrs, rinch_editor_core::Fragment::empty()).ok()?;
         let mut tr = state.tr();
         for (pos, size) in at.into_iter().rev() {
