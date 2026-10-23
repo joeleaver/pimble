@@ -23,9 +23,12 @@ use serde::Deserialize;
 
 use crate::connection::Connection;
 use crate::nodes::{self, label, Addr};
+use crate::presence::Presence;
 use crate::sheets::guide;
 
 mod discussion_tools;
+#[cfg(test)]
+mod presence_tests;
 mod sheet_tools;
 
 const INSTRUCTIONS: &str = "\
@@ -78,6 +81,9 @@ pub struct Pimble {
     conn: Arc<Connection>,
     /// The client id every edit carries, so notifications say where it came from.
     client_id: String,
+    /// Where this agent is working, said to everyone (docs/PRESENCE_CONTRACT.md
+    /// section 8).
+    presence: Presence,
     tool_router: ToolRouter<Self>,
 }
 
@@ -102,13 +108,19 @@ fn now() -> String {
 
 impl Pimble {
     pub fn new(conn: Arc<Connection>) -> Self {
+        // An agent's edits are attributed to it (docs/AGENTS_CONTRACT.md).
+        let client_id = match crate::connection::agent_id() {
+            Some(id) => format!("agent:{id}"),
+            None => format!("mcp:{}", uuid::Uuid::new_v4()),
+        };
+        Self::with_presence(conn, client_id.clone(), Presence::new(client_id))
+    }
+
+    pub fn with_presence(conn: Arc<Connection>, client_id: String, presence: Presence) -> Self {
         Self {
             conn,
-            // An agent's edits are attributed to it (docs/AGENTS_CONTRACT.md).
-            client_id: match crate::connection::agent_id() {
-                Some(id) => format!("agent:{id}"),
-                None => format!("mcp:{}", uuid::Uuid::new_v4()),
-            },
+            client_id,
+            presence,
             tool_router: Self::tool_router() + Self::sheet_router() + Self::discussion_router(),
         }
     }
@@ -117,8 +129,15 @@ impl Pimble {
         self.conn.client().await
     }
 
+    /// Say this agent is in `addr` (a tool read it), keeping its caret there.
+    async fn present(&self, client: &PimbleClient, addr: Addr) {
+        self.presence.say(client, addr, None).await;
+    }
+
     /// Fetch the node's document, let `edit` change it, and send what changed as
-    /// one `applyEdit`: the one way content and fields are written here.
+    /// one `applyEdit`: the one way content and fields are written here. Then
+    /// the agent is present there, its caret at the end of what it wrote, and
+    /// in the node a discussion is on.
     async fn edit(
         &self,
         client: &PimbleClient,
@@ -132,7 +151,9 @@ impl Pimble {
         let unreadable = |e: CrdtError| format!("The node's document could not be read: {e}");
         let mut doc = NodeDoc::load(&node.content).map_err(unreadable)?;
         let before = doc.state_vector();
+        let text_before = doc.textblock_texts();
         edit(&mut doc)?;
+        let caret = doc.sticky_after_change(&text_before);
         let delta = doc.diff_since(&before).map_err(|e| e.to_string())?;
         // Whether the edit changed anything is what merging it into the document as it
         // was says, never the state vector: a deletion alone does not move it.
@@ -144,7 +165,12 @@ impl Pimble {
         client
             .apply_edit(addr.store, addr.node, &self.client_id, EditOperation::IncrementalChanges { changes })
             .await
-            .map_err(rpc)
+            .map_err(rpc)?;
+        self.presence.say(client, addr, caret).await;
+        if let Some(host) = node.attached_to {
+            self.present(client, Addr { store: addr.store, node: host }).await;
+        }
+        Ok(())
     }
 
     async fn describe(&self, client: &PimbleClient, stores: &[Store], addr: Addr) -> String {
@@ -448,6 +474,7 @@ impl Pimble {
         let addr = nodes::resolve(&client, &p.node).await?;
         let stores = client.list_stores().await.map_err(rpc)?;
         let node = client.get_node(addr.store, addr.node).await.map_err(rpc)?;
+        self.present(&client, addr).await;
         let doc = NodeDoc::load(&node.content).map_err(|e| e.to_string())?;
         let content = match doc.markdown() {
             Ok(md) => md,
@@ -806,6 +833,15 @@ fn outline<'a>(
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Pimble {
+    /// The client app said who it is: its name is the device the agent's
+    /// presence names.
+    async fn on_initialized(&self, context: rmcp::service::NotificationContext<RoleServer>) {
+        if let Some(info) = context.peer.peer_info() {
+            let app = &info.client_info;
+            self.presence.set_device(app.title.as_deref().unwrap_or(&app.name));
+        }
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_resources().build())
             .with_server_info(Implementation::new("pimble", env!("CARGO_PKG_VERSION")))

@@ -538,6 +538,22 @@ impl NodeDoc {
             .ok_or_else(|| CrdtError::Refused("That place in the text cannot be named.".into()))
     }
 
+    /// Every textblock's text, in document order: what to hand
+    /// [`NodeDoc::sticky_after_change`] once the document was edited.
+    pub fn textblock_texts(&self) -> Vec<String> {
+        links::texts(&self.doc, &self.content())
+    }
+
+    /// A sticky index at the end of what an edit wrote, from the textblocks
+    /// as they read before it ([`NodeDoc::textblock_texts`]): past the last
+    /// character inserted, or where text was removed. Where an agent's caret
+    /// is drawn (docs/PRESENCE_CONTRACT.md section 8). `None` when the text
+    /// did not change.
+    pub fn sticky_after_change(&self, before: &[String]) -> Option<Vec<u8>> {
+        let spot = links::end_of_change(before, &self.textblock_texts())?;
+        self.anchor_at(spot)?.sticky
+    }
+
     /// Where `anchor` is in the content now: by its sticky index, else by its
     /// quote, else `None` (docs/LINKS_CONTRACT.md "Following a link").
     pub fn resolve_anchor(&self, anchor: &Anchor) -> Option<Resolved> {
@@ -1763,5 +1779,40 @@ mod tests {
         assert_eq!(links[0].target, target);
         assert_eq!(links[0].path, "f:board/c1");
         assert_eq!(links[0].text, "Target");
+    }
+
+    /// An agent's caret (docs/PRESENCE_CONTRACT.md section 8) is at the end of
+    /// what it wrote: after an appended paragraph, after replaced words, and
+    /// where words were removed; and it stays there through a later edit
+    /// before it.
+    #[test]
+    fn the_caret_after_an_edit_is_at_the_end_of_what_it_wrote() {
+        let at = |doc: &NodeDoc, sticky: Vec<u8>| match doc.resolve_anchor(&Anchor::new(Some(sticky), "")) {
+            Some(Resolved::Sticky(spot)) => (spot.textblock, spot.offset),
+            other => panic!("{other:?}"),
+        };
+        let mut doc = NodeDoc::from_plain_text("one\ntwo").unwrap();
+        let before = doc.textblock_texts();
+        doc.append_markdown("three more").unwrap();
+        let appended = doc.sticky_after_change(&before).unwrap();
+        assert_eq!(at(&doc, appended.clone()), (2, 10));
+
+        let before = doc.textblock_texts();
+        doc.replace_text("two", "a second line").unwrap();
+        assert_eq!(at(&doc, doc.sticky_after_change(&before).unwrap()), (1, 13));
+
+        let before = doc.textblock_texts();
+        doc.replace_text("second ", "").unwrap();
+        assert_eq!(at(&doc, doc.sticky_after_change(&before).unwrap()), (1, 2));
+
+        // Nothing changed in the text: no caret.
+        doc.init("document", "Note", None, "2026-10-22T00:00:00Z").unwrap();
+        let before = doc.textblock_texts();
+        doc.set_title("Renamed", "2026-10-22T00:00:00Z").unwrap();
+        assert_eq!(doc.sticky_after_change(&before), None);
+
+        // Typing before the appended words leaves the caret after them.
+        doc.replace_text("three", "now three").unwrap();
+        assert_eq!(at(&doc, appended), (2, 14));
     }
 }

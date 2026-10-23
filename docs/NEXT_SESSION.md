@@ -1,5 +1,15 @@
 # Next session: start here
 
+**2026-10-22, latest: presence is complete, all six waves built on branch `presence`.**
+Wave 5 (agents) is built and checked: `pimble-mcp` publishes a frame after every tool call
+that reads or writes a node (one session per node, `agent:{id}:{node}`, 15 s, no
+heartbeat), with its caret at the end of what it wrote (`NodeDoc::sticky_after_change`);
+the app shows an agent with a robot on the pane pill, the caret flag and the tree row,
+names it "Claude, an AI agent in <client app>", and never offers to follow it. See "Built
+in wave 5" in docs/PRESENCE_CONTRACT.md. 1128 workspace tests pass; the web build checks.
+**Next: merge `presence` and cut a release** (with the deploy, per Decisions 7: the
+accounts service change ships with it).
+
 **2026-10-22, later: presence started, branch `presence` (not merged, nothing pushed).**
 docs/PRESENCE_CONTRACT.md has Joe's answers:
 - everything shows: open notes, carets, board pointers, follow;

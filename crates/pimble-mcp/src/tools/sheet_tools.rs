@@ -378,6 +378,7 @@ impl Pimble {
     /// formulas (and `shown`, formulas about to be checked) read.
     async fn sheet_read(&self, client: &PimbleClient, addr: Addr, shown: &[&str], op: impl FnOnce(&Work) -> Result<String, String>) -> Result<String, String> {
         let node = client.get_node(addr.store, addr.node).await.map_err(rpc)?;
+        self.present(client, addr).await;
         let mut book = load_book(client, addr, &node, shown).await;
         let doc = NodeDoc::load(&node.content).map_err(|e| format!("The node's document could not be read: {e}"))?;
         let work = Work::new(Sheets::of_node(&doc), &mut book);
@@ -578,6 +579,7 @@ impl Pimble {
             (Some(name), _) => {
                 let addr = nodes::resolve(&client, name).await?;
                 let node = client.get_node(addr.store, addr.node).await.map_err(rpc)?;
+                self.present(&client, addr).await;
                 let path = nodes::path_of(&client, &stores, addr).await;
                 found.push((addr, node, path));
             }
@@ -897,6 +899,7 @@ impl Pimble {
         let client = self.client().await?;
         let addr = nodes::resolve(&client, &p.node).await?;
         let node = client.get_node(addr.store, addr.node).await.map_err(rpc)?;
+        self.present(&client, addr).await;
         if node.metadata.fields.is_empty() {
             return Ok(format!("{} has no fields.", label(&node)));
         }

@@ -1,6 +1,6 @@
 # Presence contract: who is here, and where
 
-Status: **waves 0 (names), 1 (transport, who is here), 2 (carets and selections in text), 3 (pointers and selections on boards) and 4 (follow) built on branch `presence`, 2026-10-22; wave 5 not built.** Written from Joe's answers that day (listed
+Status: **all waves built on branch `presence`, 2026-10-22: 0 (names), 1 (transport, who is here), 2 (carets and selections in text), 3 (pointers and selections on boards), 4 (follow) and 5 (agents).** Written from Joe's answers that day (listed
 under "Decisions" at the end). The points under "To confirm" are design choices made here
 that Joe has not seen yet. Section 3 (names per share) was added later the same day.
 
@@ -751,4 +751,84 @@ browser in the shared "Holiday plans", with two 60-paragraph notes and a whitebo
   view of the picture.
 - The browser's `type` from the automation tool inserts text without key events, which
   is how the outbound stop was found. Real key presses reach `on_key` there too.
+
+## Built in wave 5 (agents), 2026-10-22, branch `presence`
+
+**`pimble-mcp`** (`crates/pimble-mcp/src/presence.rs`):
+- After each tool call that reads or writes a node, the agent publishes a frame through
+  the local server: every write (they all go through `Pimble::edit`, so content, title,
+  tags, fields, sheets and discussion messages alike), `get_node`, `get_fields`,
+  `list_tables` and `get_table` on a node, `list_discussions` and `read_discussion`.
+  A write in a discussion that is on a node also says the agent is in that node.
+- One session per node, `agent:{agent id}:{node}`; the publishing client is
+  `agent:{agent id}`, as its edits say. `ttl_ms` is 15 000, with no heartbeat and no
+  goodbye: the hub's sweep (every 5 s) ends the session 15 to 20 s after the last call.
+- The caret: `NodeDoc::sticky_after_change(before)` (`pimble-crdt`), from the
+  textblocks as they read before the edit (`textblock_texts`). The changed span is
+  what lies between the common start and the common end of the text before and after;
+  the caret goes past its last character, or where text was removed. It is a sticky
+  index into the content made in the agent's copy of the document, so it resolves once
+  the edit has merged (the app draws a caret it has never resolved only from then on).
+  An edit that leaves the text alone (a rename, tags, fields) carries no new caret.
+- A read keeps the caret where the agent last wrote in that node (held per node in
+  memory); a node it never wrote in has no caret, so it shows only on the strip and the
+  tree.
+- `focused` is true. The body's `device` is the MCP client app's name (its title, else
+  its name) from the `initialize` handshake (`ServerHandler::on_initialized`), empty
+  when it said none.
+- A frame that cannot be sent never fails the tool call (logged at debug).
+- The server needed nothing new: `stamp_presence` already stamps an agent's principal as
+  the account plus the agent's name, and links forward the frame as any other (a vault
+  link seals it).
+
+**App** (`crates/pimble-app/src/presence.rs`, both targets):
+- `Identity` and `Person` carry `agent`, and `Identity.initials` (an agent's from its
+  own name, so "Claude (Sam's agent)" is "C", not "CS").
+- `presence::hover` names an agent as "Claude (Sam's agent), an AI agent in Claude
+  Code" (no device: "..., an AI agent"); `follow_hint` adds "(click to follow)" only for
+  people.
+- A small Tabler `robot` (`pimble-presence-robot`) sits before an agent's initials on
+  the pane strip (a pill, `pimble-pane__person--agent`) and before the name or initials
+  on its caret's flag; on a tree row the agent's dot is a robot in its color. None of
+  them follows on a click, and the cursor says so; `follow::start` still refuses an
+  agent's key if anything asks.
+- The name in a share is `name_of`'s, as before: "Claude (alice's agent)" with the
+  owner's name in that share; on one's own devices, just "Claude".
+
+**Tests**:
+- `the_caret_after_an_edit_is_at_the_end_of_what_it_wrote` (`pimble-crdt`): after an
+  appended paragraph, replaced words and removed words; no caret for a rename; the caret
+  stays after its words through a later edit before them.
+- `an_agents_edit_says_where_it_wrote_and_fades` (`pimble-mcp`, a real server and a real
+  agent key, the TTL cut to 300 ms): `append` produces a frame stamped with the agent's
+  name, its session and the client app's name, whose caret resolves in the server's copy
+  to the end of the inserted text; a `get_node` after it keeps the caret; then the
+  server says goodbye in its name and holds nothing.
+- `an_agent_on_the_owners_computer_shows_to_a_member` (`pimble-server`
+  `tests/presence.rs`): an agent on Alice's device publishes in a shared note; Bob's
+  server hears it through the hosted server stamped as Alice's account and "Claude",
+  the body opened, the TTL kept, and nothing of it in the hosted store.
+- `an_agent_is_named_as_one_and_not_offered_to_follow` (`pimble-app`).
+
+**Checked by hand** (2026-10-22): an isolated desktop app (`PIMBLE_APP_ADDR=127.0.0.1:7495`,
+its own config and data directories, a copy of the family store) and `pimble-mcp` driven
+by `scripts/mcp/drive.py` with an agent "Claude" made by `pimble-cli create-agent`.
+- `create_node` made "Agent at work": its tree row showed a red robot at once.
+- With the note open, two `append` calls: the strip showed a red pill with a robot and
+  "C", and a caret stood after "ending here" with a flag "(robot) Claude", then "(robot) C".
+- `replace_text` of "a second one" by "another paragraph": the caret moved to the end of
+  "another paragraph", mid-line.
+- The pill's hover read "Claude, an AI agent in drive" (drive.py's client name), with no
+  "(click to follow)"; a click on it started nothing (no strip text, no colored edge).
+- About 15 to 20 s after the last call the pill, the caret and the tree robot were gone.
+
+**Gaps:**
+- Not tried by hand on the local stack (a member seeing "Claude (alice's agent)"):
+  `an_agent_on_the_owners_computer_shows_to_a_member` covers the crossing, stamp and
+  sealing, and the name is `name_of`'s from wave 1, unchanged.
+- Signed out, the embedded server stamps an agent with an empty `sub`, so it shows by
+  its name alone and takes its color from the agent's name.
+- An agent never says where it is on a board (no tool draws on boards), and a read of a
+  node it never wrote in shows no caret.
+- A client app that sends no name leaves the hover at "Claude, an AI agent".
 

@@ -199,6 +199,36 @@ pub(crate) fn anchor_at(doc: &Doc, content: &ArrayRef, spot: Spot) -> Option<Anc
     Some(Anchor::new(sticky, &after))
 }
 
+/// Every textblock's text, in document order.
+pub(crate) fn texts(doc: &Doc, content: &ArrayRef) -> Vec<String> {
+    let txn = doc.transact();
+    textblocks(&txn, content).iter().map(|text| text.get_string(&txn)).collect()
+}
+
+/// The spot at the end of what changed from textblocks reading `before` to
+/// ones reading `after`: past the last character inserted, or where text was
+/// removed. The common start and end of the two are what stayed; `None` when
+/// nothing changed or there is no textblock.
+pub(crate) fn end_of_change(before: &[String], after: &[String]) -> Option<Spot> {
+    if before == after || after.is_empty() {
+        return None;
+    }
+    let old: Vec<char> = before.join("\n").chars().collect();
+    let new: Vec<char> = after.join("\n").chars().collect();
+    let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let room = old.len().min(new.len()) - prefix;
+    let suffix = old.iter().rev().zip(new.iter().rev()).take(room).take_while(|(a, b)| a == b).count();
+    let mut end = new.len() - suffix;
+    for (textblock, text) in after.iter().enumerate() {
+        let len = text.chars().count();
+        if end <= len {
+            return Some(Spot { textblock, offset: end });
+        }
+        end -= len + 1;
+    }
+    None
+}
+
 /// The spot where `quote` starts, when exactly one textblock reads it, once.
 /// The refusal says why not, in a sentence.
 pub(crate) fn quote_spot(doc: &Doc, content: &ArrayRef, quote: &str) -> std::result::Result<Spot, String> {

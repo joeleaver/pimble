@@ -98,3 +98,61 @@ async fn an_older_frame_is_dropped_and_a_goodbye_ends_the_session() {
     assert!(got.left && got.seq == 3, "the stale frame went nowhere, the goodbye did: {got:?}");
     assert!(client.get_presence(store_id).await.unwrap().is_empty());
 }
+
+/// An agent working on Alice's computer is present to the members of a share
+/// it works in (docs/PRESENCE_CONTRACT.md section 8): its frame crosses the
+/// hosted server sealed, stamped as Alice's account and the agent's name,
+/// with the caret it said.
+#[tokio::test]
+async fn an_agent_on_the_owners_computer_shows_to_a_member() {
+    let env = spawn_env().await;
+    let a_dir = tempfile::tempdir().unwrap();
+    let mut a = pimble_server::PimbleServer::with_config(pimble_server::ServerConfig {
+        agents_path: Some(a_dir.path().join("agents.json")),
+        ..device_config(a_dir.path())
+    });
+    a.start().await.expect("Alice's server starts");
+    let url = format!("http://{}", a.addr());
+    let alice = pimble_client::PimbleClient::connect(&url).await.expect("Alice's app connects");
+    let fx = hosted_fixture(&env, &alice, a_dir.path()).await;
+    let store_id = fx.store_id;
+    alice.cloud_share_node(store_id, fx.shared, "Holiday Plans").await.expect("sharing a folder");
+    alice.cloud_share_invite(store_id, fx.shared, BOB.0, MemberRole::Editor).await.expect("inviting Bob");
+
+    let (_b, bob, _b_dir) = start_local_server().await;
+    env.sign_in(&bob, BOB).await;
+    bob.cloud_add_hosted_store(store_id).await.expect("Bob adds the share");
+    let pulled = wait_until(Duration::from_secs(15), || async { node_text(&bob, store_id, fx.inside).await.contains("socks and a map") }).await;
+    assert!(pulled, "Bob's replica is synced");
+    let mut bob_hears = bob.subscribe_presence(store_id, "bob-app").await.expect("Bob's app listens");
+
+    let made = alice
+        .create_agent("Claude", vec![pimble_rpc::AgentGrant { store: store_id, node: None, role: pimble_rpc::AgentRole::Editor }])
+        .await
+        .expect("Alice makes an agent");
+    let agent = pimble_client::PimbleClient::connect_with_auth(&url, &pimble_core::AuthMethod::Bearer { token: made.key.clone() })
+        .await
+        .expect("the agent connects");
+    let client_id = format!("agent:{}", made.agent.id);
+    let mut said = frame(store_id, fx.inside, &format!("{client_id}:{}", fx.inside), 1, "Claude Code");
+    said.body = PresenceBody {
+        device: "Claude Code".into(),
+        focused: true,
+        text: Some(pimble_rpc::TextPresence::new(&[1, 2, 3], None)),
+        board: None,
+    }
+    .encode();
+    said.ttl_ms = 15_000;
+    agent.publish_presence(said, &client_id).await.expect("the agent says where it is");
+
+    let got = next_frame(&mut bob_hears).await.expect("the agent's presence reaches Bob");
+    assert_eq!((got.doc_id, got.left), (fx.inside, false));
+    let who = got.who.expect("stamped");
+    assert_eq!((who.sub, who.agent.as_deref()), (env.user_id(ALICE.0), Some("Claude")), "Alice's account, the agent's name");
+    let body = PresenceBody::decode(&got.body).expect("opened on Bob's side");
+    assert_eq!(body.device, "Claude Code");
+    assert_eq!(body.text.and_then(|t| t.caret_bytes()), Some(vec![1, 2, 3]));
+    assert_eq!(got.ttl_ms, 15_000);
+    assert!(!contains_bytes_recursive(&env.h_stores_dir, b"Claude Code"));
+    let _ = a.stop().await;
+}

@@ -51,6 +51,8 @@ pub struct Caret {
     pub label: String,
     /// Name and device, for the hover.
     pub title: String,
+    /// An AI agent: a robot glyph on the flag, and no following.
+    pub agent: bool,
 }
 
 /// Selections handed to a pane's [`PresencePlugin`]: `(from, to, color)`.
@@ -348,15 +350,16 @@ fn redraw(store: AppStore, pane: PaneId) {
             let until = p.moved_ms + NAME_SHOWN_MS;
             name_until = Some(name_until.map_or(until, |u: f64| u.min(until)));
         }
-        let title = if p.device.is_empty() { who.name.clone() } else { format!("{}, on {}", who.name, p.device) };
+        let title = super::hover(&who.name, who.agent, std::slice::from_ref(&p.device));
         drawn.push(Caret {
             session: p.session.clone(),
             key: who.key.clone(),
             class: if placed.dim { "pimble-presence-caret pimble-presence-caret--dim" } else { "pimble-presence-caret" },
             style: format!("left: {:.1}px; top: {:.1}px; height: {:.1}px; background: {};", rect.x - 1.0, rect.y, rect.height.max(1.0), who.color),
             flag_style: format!("background: {};", who.color),
-            label: if fresh { who.name.clone() } else { super::initials(&who.name) },
+            label: if fresh { who.name.clone() } else { who.initials.clone() },
             title,
+            agent: who.agent,
         });
     }
     if let Some(until) = name_until {

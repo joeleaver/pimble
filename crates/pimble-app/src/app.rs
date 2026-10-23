@@ -1969,9 +1969,15 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         }) {
                             span {
                                 key: person.key.clone(),
-                                class: "pimble-tree-people__dot",
+                                // An agent's dot is a robot in its color.
+                                class: if person.agent { "pimble-tree-people__dot pimble-tree-people__dot--agent" } else { "pimble-tree-people__dot" },
                                 title: person.title.clone(),
-                                style: format!("background: {};", person.color),
+                                style: if person.agent { format!("color: {};", person.color) } else { format!("background: {};", person.color) },
+                                span {
+                                    class: "pimble-presence-robot",
+                                    style: if person.agent { "" } else { "display: none;" },
+                                    IconGlyph { name: "robot".to_string() }
+                                }
                             }
                         }
                     }

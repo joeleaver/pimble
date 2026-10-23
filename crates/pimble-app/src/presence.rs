@@ -57,6 +57,8 @@ pub struct Person {
     pub color: String,
     /// Name and devices, for the hover.
     pub title: String,
+    /// An AI agent: a robot glyph beside its initials, and never followed.
+    pub agent: bool,
 }
 
 /// Who one session is, as a caret's flag shows them.
@@ -69,6 +71,10 @@ pub struct Identity {
     pub color: String,
     /// Which of the ten author colors it is.
     pub color_index: usize,
+    /// One or two letters: an agent's from its own name, not its owner's.
+    pub initials: String,
+    /// An AI agent (docs/PRESENCE_CONTRACT.md section 8).
+    pub agent: bool,
 }
 
 /// Where a pane is in the document it holds, as its frame says it.
@@ -265,14 +271,13 @@ pub fn people_in(store: AppStore, store_id: StoreId, node_id: NodeId) -> Vec<Per
             continue;
         }
         let who = identity(store, store_id, node_id, &p, me.as_deref());
-        let person = Person { initials: initials(&who.name), color: who.color, title: String::new(), name: who.name, key };
+        let person = Person { initials: who.initials, color: who.color, title: String::new(), name: who.name, key, agent: who.agent };
         people.push((person, vec![p.device.clone()]));
     }
     let mut out: Vec<Person> = people
         .into_iter()
         .map(|(mut person, devices)| {
-            let devices: Vec<String> = devices.into_iter().filter(|d| !d.is_empty()).collect();
-            person.title = if devices.is_empty() { person.name.clone() } else { format!("{}, on {}", person.name, devices.join(", ")) };
+            person.title = hover(&person.name, person.agent, &devices);
             person
         })
         .collect();
@@ -300,7 +305,37 @@ pub fn identity(store: AppStore, store_id: StoreId, node_id: NodeId, p: &Present
         _ => key.clone(),
     };
     let c = pimble_board::author_color(&color_key);
-    Identity { key, name, color: format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b), color_index: pimble_board::author_color_index(&color_key) }
+    let agent = p.who.as_ref().and_then(|w| w.agent.as_deref());
+    Identity {
+        key,
+        initials: initials(agent.unwrap_or(&name)),
+        name,
+        color: format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b),
+        color_index: pimble_board::author_color_index(&color_key),
+        agent: agent.is_some(),
+    }
+}
+
+/// What hovering someone says: their name and the devices they are on, or
+/// for an agent, that it is one and the app it works through.
+pub fn hover(name: &str, agent: bool, devices: &[String]) -> String {
+    let devices: Vec<&str> = devices.iter().map(String::as_str).filter(|d| !d.is_empty()).collect();
+    match (agent, devices.is_empty()) {
+        (true, true) => format!("{name}, an AI agent"),
+        (true, false) => format!("{name}, an AI agent in {}", devices.join(", ")),
+        (false, true) => name.to_string(),
+        (false, false) => format!("{name}, on {}", devices.join(", ")),
+    }
+}
+
+/// What a hover adds about following: nothing for an agent, which cannot be
+/// followed (docs/PRESENCE_CONTRACT.md section 8).
+pub fn follow_hint(agent: bool) -> &'static str {
+    if agent {
+        ""
+    } else {
+        " (click to follow)"
+    }
 }
 
 /// What someone is called here (docs/PRESENCE_CONTRACT.md section 3): the
@@ -376,6 +411,15 @@ pub fn device_label() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_is_named_as_one_and_not_offered_to_follow() {
+        assert_eq!(hover("Claude (Sam's agent)", true, &["Claude Code".to_string()]), "Claude (Sam's agent), an AI agent in Claude Code");
+        assert_eq!(hover("Claude", true, &[String::new()]), "Claude, an AI agent");
+        assert_eq!(hover("Sam", false, &["laptop".to_string(), "Web".to_string()]), "Sam, on laptop, Web");
+        assert_eq!(follow_hint(true), "");
+        assert_eq!(follow_hint(false), " (click to follow)");
+    }
 
     #[test]
     fn initials_take_the_first_letter_of_two_words() {

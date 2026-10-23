@@ -9,6 +9,7 @@
 
 mod connection;
 mod nodes;
+mod presence;
 mod sheets;
 mod tools;
 

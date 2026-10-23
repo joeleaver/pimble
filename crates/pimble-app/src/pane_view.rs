@@ -305,13 +305,21 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                     class: caret.class,
                     style: caret.style.clone(),
                     span {
-                        class: "pimble-presence-caret__flag",
+                        class: if caret.agent { "pimble-presence-caret__flag pimble-presence-caret__flag--agent" } else { "pimble-presence-caret__flag" },
                         style: caret.flag_style.clone(),
-                        title: format!("{} (click to follow)", caret.title),
+                        title: format!("{}{}", caret.title, crate::presence::follow_hint(caret.agent)),
                         onclick: {
                             let key = caret.key.clone();
-                            move || crate::presence::follow::start(store, pane, &key)
+                            let agent = caret.agent;
+                            // An agent is never followed, so its flag offers nothing.
+                            move || if !agent { crate::presence::follow::start(store, pane, &key) }
                         },
+                        // An agent's flag carries a robot (docs/PRESENCE_CONTRACT.md section 8).
+                        span {
+                            class: "pimble-presence-robot",
+                            style: if caret.agent { "" } else { "display: none;" },
+                            IconGlyph { name: "robot".to_string() }
+                        }
                         {caret.label.clone()}
                     }
                 }
@@ -401,13 +409,20 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                     for person in pane_people(store, pane).0 {
                         span {
                             key: person.key.clone(),
-                            class: "pimble-pane__person",
-                            title: format!("{} (click to follow)", person.title),
+                            class: if person.agent { "pimble-pane__person pimble-pane__person--agent" } else { "pimble-pane__person" },
+                            title: format!("{}{}", person.title, crate::presence::follow_hint(person.agent)),
                             style: format!("background: {};", person.color),
                             onclick: {
                                 let key = person.key.clone();
-                                move || crate::presence::follow::start(store, pane, &key)
+                                let agent = person.agent;
+                                move || if !agent { crate::presence::follow::start(store, pane, &key) }
                             },
+                            // An agent's initials carry a robot.
+                            span {
+                                class: "pimble-presence-robot",
+                                style: if person.agent { "" } else { "display: none;" },
+                                IconGlyph { name: "robot".to_string() }
+                            }
                             {person.initials.clone()}
                         }
                     }

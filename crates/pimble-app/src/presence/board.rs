@@ -102,7 +102,7 @@ pub(crate) fn sessions_on(store: AppStore, store_id: StoreId, node_id: NodeId, m
         .filter_map(|p| {
             let board = p.board.clone().filter(|b| b.markup.as_deref() == markup)?;
             let who = super::identity(store, store_id, node_id, &p, me.as_deref());
-            let title = if p.device.is_empty() { who.name.clone() } else { format!("{}, on {}", who.name, p.device) };
+            let title = super::hover(&who.name, who.agent, std::slice::from_ref(&p.device));
             Some((p.session, board, who, title))
         })
         .collect()

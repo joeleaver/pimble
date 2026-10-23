@@ -5188,6 +5188,7 @@ version = "0.12.6"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "jsonrpsee",
  "pimble-client",
  "pimble-core",
  "pimble-crdt",

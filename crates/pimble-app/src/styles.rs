@@ -109,6 +109,41 @@ pub(crate) const APP_CSS: &str = "
     border-radius: 3px;
 }
 
+/* An AI agent (docs/PRESENCE_CONTRACT.md section 8): a small robot beside
+   its initials on the pane and its caret's flag, and in place of its dot. */
+.pimble-presence-robot {
+    display: inline-flex;
+    width: 10px;
+    height: 10px;
+    flex-shrink: 0;
+}
+
+.pimble-pane__person--agent {
+    width: auto;
+    padding: 0 5px 0 4px;
+    gap: 2px;
+    cursor: default;
+}
+
+.pimble-tree-people__dot--agent {
+    display: inline-flex;
+    width: 11px;
+    height: 11px;
+    border-radius: 0;
+}
+
+.pimble-tree-people__dot--agent .pimble-presence-robot {
+    width: 11px;
+    height: 11px;
+}
+
+.pimble-presence-caret__flag--agent {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    cursor: default;
+}
+
 /* ── Shares (shares.rs) ────────────────────────────────────────── */
 
 .pimble-shares {

@@ -236,6 +236,7 @@ impl Pimble {
         let client = self.client().await?;
         let addr = nodes::resolve(&client, &p.node).await?;
         let node = client.get_node(addr.store, addr.node).await.map_err(rpc)?;
+        self.present(&client, addr).await;
         if node.node_type == node_types::DISCUSSION {
             return Ok(format!("{} is itself a discussion:\n{}", label(&node), summary(addr, &node)));
         }
@@ -259,10 +260,12 @@ impl Pimble {
     async fn read_discussion(&self, Parameters(p): Parameters<DiscussionParam>) -> Result<String, String> {
         let client = self.client().await?;
         let (addr, node) = self.discussion(&client, &p.discussion).await?;
+        self.present(&client, addr).await;
         let snap = snapshot_of(&node)?;
         let mut out = format!("Discussion: {} ({})\n", topic_of(&node), addr.link());
         if let Some(host) = node.attached_to {
             let host_addr = Addr { store: addr.store, node: host };
+            self.present(&client, host_addr).await;
             let host_title = client.get_node(addr.store, host).await.map(|n| label(&n)).unwrap_or_else(|_| "a node".into());
             out.push_str(&format!("On: {host_title} ({})\n", host_addr.link()));
         }
