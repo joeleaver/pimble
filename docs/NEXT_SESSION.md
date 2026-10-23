@@ -13,17 +13,16 @@ answer 200; `/rpc`, `/api/v1/me` and `/api/v1/me/shares` answer 401; the hosted 
 opened its three stores and a relay tunnel reconnected. Branch `presence` is merged.
 What is left of presence is the "Gaps" lists in the contract's "Built in wave N" sections.
 
-With the next release, move rinch to `main` a269119d or later: #1764 (PR #1812) makes
-DropdownMenu and Popover dropdowns flip above their trigger when there is more room there,
-shift back inside the viewport (8 px margin), and scroll only when neither side fits; it
-keeps inline max-height/width. Check Pimble's dropdowns near window edges then. #1426
-(inline padding) is on rinch `main` too (batch 9, PR #1838): an inline element's padding,
-border and margin take room on its line and the caret sits where typed text lands, so the
-sheet link pills' inline-block workaround (`styles.rs` `.pimble-sheet__chip`,
-rinch #1426/#1762) can go back to plain inline after the bump. #1762 (an overflow:hidden
-cell clips its pill) and #1815/#1817 (no stale pixels from shifted text and pills) landed
-with it. Still open in rinch: #1835 (RTL caret at a padded edge), #1833 (a code mark split
-by another mark draws as two pills).
+**Branch `rinch-bump` (not merged; merging it changes what ships, so it goes with the next
+release):** rinch `main` 5fa0eefb in both locks (the Rinch session's pin): #1764 (dropdowns
+flip and shift inside the window), #1426 (inline padding takes room on its line), #1762 and
+#1815/#1817. 1128 tests pass, the web build checks. Checked in an isolated app: link pills in
+sheet cells render correctly as plain inline when they fit, and the board's Export dropdown
+opens whole. The flip at a window edge was not exercised (Wayland: no scripted resize).
+`.pimble-sheet__chip` stays `inline-block`: with a plain inline span, a cell's ellipsis drops
+the pill's background and padding (rinch #1100, in progress; the Rinch session will say when
+it is on main, then retry). Still open in rinch: #1835 (RTL caret at a padded edge), #1833
+(a code mark split by another mark draws as two pills; no fix soon).
 
 **2026-10-22, latest: presence is complete, all six waves built on branch `presence`.**
 Wave 5 (agents) is built and checked: `pimble-mcp` publishes a frame after every tool call
