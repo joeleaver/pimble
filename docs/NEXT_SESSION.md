@@ -1,5 +1,18 @@
 # Next session: start here
 
+**2026-10-23: v0.13.0 released, deployed (jkbase v34) and installed here** (release
+commit be02abd, tag `v0.13.0`, rinch `main` 2dbec067 in both locks; backup
+`bkp_1792718932955_7f80163a2c514082` before the deploy, which added `ShareName` and
+`User.display_name` to the accounts schema). It brings presence (docs/PRESENCE_CONTRACT.md,
+waves 0-5: names per share with no emails between members, who is here, carets and
+selections in text, pointers on boards, follow, agents), the explorer rework (tree waves
+1-3) and columns that drag like rows. 1128 tests passed; Windows checked with `cargo xwin`
+for `pimble-app` and `pimble-mcp`; a right-click near the bottom of the window opened
+whole with the new rinch. After the deploy: the site, `/app/`, health, JWKS and releases
+answer 200; `/rpc`, `/api/v1/me` and `/api/v1/me/shares` answer 401; the hosted server
+opened its three stores and a relay tunnel reconnected. Branch `presence` is merged.
+What is left of presence is the "Gaps" lists in the contract's "Built in wave N" sections.
+
 **2026-10-22, latest: presence is complete, all six waves built on branch `presence`.**
 Wave 5 (agents) is built and checked: `pimble-mcp` publishes a frame after every tool call
 that reads or writes a node (one session per node, `agent:{id}:{node}`, 15 s, no
