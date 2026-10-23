@@ -5,7 +5,7 @@
 //! `pimble-blob:` URL; its bytes live once, beside the store, and reach this
 //! app through the server and nothing else. So there are two halves here:
 //!
-//! * **Adding.** A paste, a drop and Edit > "Insert Picture..." all end in
+//! * **Adding.** A paste, a drop and Edit > "Insert Image..." all end in
 //!   [`add_picture`]: the bytes go to the backend (`PutBlob`: fitted under
 //!   the size limit, then stored), and when the URL comes back
 //!   ([`stored`]) the image is inserted where the picture was aimed, as an
@@ -45,7 +45,7 @@ pub(crate) const NOT_CONNECTED: &str = "Pimble is not connected to its server, s
 /// then nothing is written.
 pub const ENCRYPTED_IN_BROWSER: &str = "Pictures in encrypted stores are not available in the browser yet.";
 
-/// "Insert Picture..." with no note in the focused pane.
+/// "Insert Image..." with no note in the focused pane.
 const NO_NOTE: &str = "Open a note to add a picture to it.";
 
 /// The picture was stored but its note had been closed meanwhile.
@@ -55,9 +55,9 @@ const NOTE_CLOSED: &str = "The note was closed before the picture was ready, so 
 const NO_PLACE: &str = "A picture cannot go where the caret is.";
 
 /// What pasted HTML lost to [`PicturesPlugin`].
-const PASTE_STRIPPED: &str = "Pictures from other places were left out of what you pasted. Save a picture and add it with Edit > Insert Picture.";
+const PASTE_STRIPPED: &str = "Pictures from other places were left out of what you pasted. Save a picture and add it with Edit > Insert Image.";
 
-/// The file types "Insert Picture..." offers, as extensions and as the
+/// The file types "Insert Image..." offers, as extensions and as the
 /// browser's `accept` list. The bytes decide in the end, not the name.
 #[cfg(feature = "native")]
 const EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "avif"];
@@ -134,13 +134,23 @@ pub(crate) fn stored(store: AppStore, request_id: u64, result: &Result<StoredBlo
         crate::events::show_notice(store, NOTE_CLOSED.to_string());
         return;
     }
-    let handle = crate::editor::editor(pending.pane);
-    let src = blob.url.to_string();
     // The anchor names the place the picture was aimed at however much was
     // typed meanwhile. It is lost when a peer's change re-projected the
     // document while the picture was on its way; the caret is then the best
     // place there is.
-    let inserted = handle.insert_image_at(&pending.anchor, &src, &pending.alt) || handle.insert_image(&src, &pending.alt);
+    let at = pending.anchor.selection();
+    let inserted = match blob.size {
+        // A canvas from the start, the picture locked in its own layer
+        // (docs/CANVAS_CONTRACT.md section 3).
+        Some((w, h)) => crate::text_boards::insert_canvas(store, pending.pane, pending.store_id, pending.node_id, Some((&blob.url, w, h)), &pending.alt, at),
+        // A picture whose size could not be read: a bare picture, which
+        // becomes a canvas at its first mark, as one from before canvases.
+        None => {
+            let handle = crate::editor::editor(pending.pane);
+            let src = blob.url.to_string();
+            handle.insert_image_at(&pending.anchor, &src, &pending.alt) || handle.insert_image(&src, &pending.alt)
+        }
+    };
     if !inserted {
         crate::events::show_notice(store, NO_PLACE.to_string());
     } else if let Some(notice) = &blob.notice {
@@ -160,7 +170,7 @@ pub(crate) fn take_image_input(store: AppStore, pane: PaneId) {
     });
 }
 
-/// Edit > "Insert Picture...": pick a picture and add it at the focused pane's
+/// Edit > "Insert Image...": pick a picture and add it at the focused pane's
 /// caret. A native menu item cannot be greyed out reactively, so a pane with
 /// no note, or a note this device may only read, answers with a sentence.
 pub fn insert_image(store: AppStore) {
@@ -206,7 +216,7 @@ fn pick(store: AppStore, pane: PaneId, anchor: SelectionAnchor) {
         }
         return;
     }
-    let Some(path) = rinch::dialogs::open_file().set_title("Insert Picture").add_filter("Pictures", &EXTENSIONS).pick_file() else {
+    let Some(path) = rinch::dialogs::open_file().set_title("Insert Image").add_filter("Pictures", &EXTENSIONS).pick_file() else {
         return;
     };
     let name = path.file_name().map(|n| n.to_string_lossy().to_string());
@@ -445,6 +455,7 @@ impl Plugin for PicturesPlugin {
             // A board node embedded in text is a picture of the board
             // wherever it is kept (a store not here shows a placeholder).
             pimble_core::BoardUrl::parse(src).is_some()
+                || src == crate::text_boards::IN_TEXT_SRC
                 || BlobUrl::parse(src).is_some_and(|url| crate::links::with_app_store(|store| store.get_store_signal(url.store).is_some()).unwrap_or(false))
         });
         let removed = stripped.is_some();

@@ -156,7 +156,10 @@ and then that parse.
   `Table` for the importer.
 - **Images** follow `docs/IMAGES_CONTRACT.md`: `![alt](pimble-blob:...)` both ways once
   blobs exist, and `attach_image` (a local file in, a blob and an inserted image out).
-  Until then an image is refused.
+  Until then an image is refused. Going out, a picture in text is a canvas
+  (docs/CANVAS_CONTRACT.md) and its canvas's id follows the URL:
+  `![alt](pimble-blob:<store>/<hash>#canvas=<id>)`, or `pimble-board:in-text#canvas=<id>`
+  for a canvas that began empty; a picture from before canvases has no fragment.
 - Whatever the editor cannot co-edit (raw HTML other than the tags above, footnotes, task
   lists) is **refused**, not degraded: the tool fails with a sentence naming the
   construct and its line ("Line 12 is a task list; Pimble documents cannot hold task

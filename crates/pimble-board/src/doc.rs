@@ -440,7 +440,7 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
     /// [`Board::read`]): its layers and elements with their ids, orders,
     /// styles, text, authors and timestamps, its page and its markup switch.
     /// The marks of a picture in text copied to another node, or to a new
-    /// image node ("Make Canvas Node"), keep saying who made them
+    /// canvas node ("Convert to Node"), keep saying who made them
     /// (contract section 6: the name is stamped, not looked up). Refused
     /// when this board exists already: a copy is a new board.
     pub fn copy_from(&mut self, raw: &RawBoard) -> Result<()> {

@@ -324,7 +324,7 @@ pub struct NodeInit {
     pub content: Vec<u8>,
     pub custom: Vec<(String, serde_json::Value)>,
     /// Handed back on `NodeCreated`, for a caller that must know which node
-    /// it made ("Make Canvas Node" writes the new node into the text).
+    /// it made ("Convert to Node" writes the new node into the text).
     pub request: Option<u64>,
 }
 

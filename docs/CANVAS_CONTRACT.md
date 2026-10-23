@@ -1,7 +1,8 @@
 # Canvas contract: boards are canvases, and every picture is one
 
-Status: **parts 1 and 2 built (branch `canvas`); part 3 waits on Joe's answers** in
-"Decisions" at the end. Written 2026-10-23 from Joe's decisions of that day:
+Status: **built, all three parts (branch `canvas`)**. Written 2026-10-23 from Joe's
+decisions of that day; Joe answered the six decisions the same day ("Decisions" at the
+end), and part 3 was built to them ("Built", after them).
 
 - Boards are called **canvases** in the interface. Stored keys and code keep "board".
 - There is **no image node** any more, not even as a word in the app. Adding a picture
@@ -27,7 +28,8 @@ would need a one-way migration on every device and on the hosted server, and the
 nothing there. Only words a person (or an assistant, through the MCP) reads change.
 
 "Picture" stays the word for an image file or a picture element, as it is today ("Insert
-pictures", "Copy Picture"). "Image" and "image node" go.
+pictures", "Copy Picture"). "Image node" goes; "Image" stays only in Edit > "Insert
+Image..." (Joe's name for it, decision 4).
 
 ## 1. The interface rename (built)
 
@@ -38,12 +40,12 @@ MCP, the CLI, the site and the docs a person reads:
 | --- | --- |
 | Row menu "New Whiteboard" | "New Canvas" (title "Canvas", the chalkboard icon) |
 | Row menu "New Image..." (dialog "New Image") | "New Canvas from Picture..." (dialog "New Canvas from Picture") |
-| Edit / toolbar "Insert Board..." | "Insert Canvas..." |
-| Edit / toolbar "Insert Image..." | "Insert Picture..." (it inserts a picture into text; see decision 4) |
-| Picture menu "Convert to Image Node" | "Make Canvas Node" (decision 3) |
+| Edit / toolbar "Insert Board..." (embedded an existing board node) | "Insert Canvas": an empty canvas in the text (decision 4) |
+| Edit / toolbar "Insert Image..." | "Insert Image...", unchanged: a canvas holding the picture (decision 4) |
+| Picture menu "Convert to Image Node" | "Convert to Node" (decision 3) |
 | Picture menu "Open Board", "Open Board in Split View" | "Open Canvas", "Open Canvas in Split View" |
 | Canvas menu "Flatten into New Image" | "Flatten into New Canvas" |
-| Picker "Board…", "Type to find a board", "No boards match" | "Canvas…", "Type to find a canvas", "No canvases match" |
+| Picker "Board…", "Type to find a board", "No boards match" | gone: Insert Canvas no longer picks a node |
 | Embed placeholders "This board was deleted." etc. | "This canvas was deleted.", "This canvas has not arrived yet.", "You cannot see this canvas.", "This canvas is empty." |
 | Notices and refusals naming a board or an image node | the same sentences with "canvas" |
 | `pimble-board` error messages (they reach notices) | "canvas" |
@@ -70,7 +72,7 @@ Adding pictures in the explorer makes a canvas whose first contents are the pict
 A canvas that began from a picture still opens on the arrow tool (a picture in a locked
 layer), and one that began empty on select. Nothing else tells them apart, as before.
 
-## 3. Pictures in text are canvases from the start (not built: decisions first)
+## 3. Pictures in text are canvases from the start (built)
 
 Today a picture in text is a bare `image` atom; it gets a board, in the host note's
 `data["board:<id>"]`, only when its first mark is drawn (three updates: the board, the
@@ -83,17 +85,21 @@ name, or empty for a pasted bitmap), `width` (when resized) and `data-board` (th
 id in the host note's `data`). What changes is that `data-board` is **always present** on a
 picture that Pimble put into text, from the first moment.
 
+A canvas that began empty (Insert Canvas) is the same atom with `src`
+`pimble-board:in-text` (`text_boards::IN_TEXT_SRC`): there is no picture, and `data-board`
+names the canvas. It is not a `pimble-board:<store>/<node>` embed and is not a link.
+
 ### Putting a picture in
 
-Insert Picture..., paste and drop in text all end in `pictures::add_picture`, and when
+Insert Image..., paste and drop in text all end in `pictures::add_picture`, and when
 `BlobStored` brings the URL, `pictures::stored` now:
 
 1. mints the canvas id and builds the canvas in the pane's copy of the note: the picture at
    one unit per pixel in a locked layer "Picture", "Layer 1" above it (the same shape the
    markup path makes today, `boards::start_markup`, and the same as a canvas node from a
    picture), and sends it with `applyEdit`;
-2. inserts the atom with `data-board` already set (`EditorHandle::insert_image_at` taking
-   attributes, or an insert followed by `SetNodeAttrStep` in the same editor transaction).
+2. inserts the atom with `data-board` already set, in one editor transaction over the place
+   the picture was aimed at (`text_boards::insert_canvas`, which Insert Canvas uses too).
 
 These are two updates, in that order, for the reason the first mark is three today: the
 atom lives in the editor's collaboration document, the canvas in the note's `data`, and no
@@ -116,19 +122,19 @@ Today a picture with a board is rendered by `text_boards::load` (the board's vis
 one unit per CSS pixel, no wider than the widest pane's text), and one without is shown from
 the blob's bytes. With every picture a canvas, every picture would go through the renderer:
 slower to first paint, re-encoded, and no longer the original bytes at the screen's scale.
-**The proposal**: a canvas whose only visible element is its first picture, untouched
-(not moved, cropped or resized), is shown from the blob as a plain picture is today; the
-renderer takes over at the first mark. (Decision 2.)
+**Decided**: a canvas whose only element is its first picture, untouched (not moved,
+cropped or resized, no page), is shown from the blob as a plain picture is today; the
+renderer takes over at the first mark (`text_boards::shows_only_its_picture`). (Decision 2.)
 
 The floating controls are unchanged: the eye shows only once there are marks, and the "⋯"
 menu is always there.
 
 ### Pictures already in text with no `data-board`
 
-Every note written before this change has bare pictures. **The proposal**: they stay as
-they are, and become canvases lazily, exactly as today, at their first mark (or "Make
-Canvas Node"). To the person nothing differs: every picture has "Mark Up...", the same menu
-and the same controls. Nothing is written when a note is opened.
+Every note written before this change has bare pictures. **Decided**: they stay as they
+are, and become canvases lazily, exactly as before, at their first mark (or "Convert to
+Node"). To the person nothing differs: every picture has "Mark Up...", the same menu and the
+same controls. Nothing is written when a note is opened.
 
 Why not convert them when a note opens: a note open on two devices would mint two canvases
 for one picture, and the atom's `data-board` would be last-writer-wins between them, leaving
@@ -143,53 +149,91 @@ through the MCP (`get_node`, every tool answer that shows content) sees the pict
 person first put it in, never the marks; Markdown going in refuses every image, so no tool
 can add or replace a picture and edits that touch only named blocks leave pictures alone.
 
-**The proposal**, the smallest that tells an assistant the truth without a new rinch hook:
-- Markdown keeps `![alt](pimble-blob:...)` for every picture. The canvas id is not written:
-  nothing outside Pimble can use it, and Markdown going in still refuses images.
-- `get_node` adds one line after the content when the text has pictures with marks:
-  `canvases in the text: 2 pictures with marks (alt "sunset": 3 marks; alt "": 1 mark)`.
-  Reading the marks themselves and seeing the rendered picture are the boards contract's
-  wave 5 (`render_board` and the element list), still not built.
-- `replace_content` on a note with pictures keeps refusing Markdown that contains them; a
-  rewrite that leaves them out removes them (as today). This is unchanged and noted only so
-  it is not mistaken for something this work broke.
+**Decided** (decision 5): the canvas's id goes into the URL. `markdown::render`
+(`pimble-crdt`) writes `![alt](pimble-blob:<store>/<hash>#canvas=<id>)` for a canvas in
+text, and `![alt](pimble-board:in-text#canvas=<id>)` for one that began empty, so the id
+round-trips once Markdown going in accepts images. A picture with no `data-board` (from
+before) is written as before, with no fragment. The MCP shows content through this, so
+`get_node` shows the same. Reading the marks themselves and seeing the rendered picture
+are the boards contract's wave 5 (`render_board` and the element list), still not built.
 
-(Decision 5.)
+The loader's own sources use the same fragment (`<src>#canvas=<id>`, what
+`set_image_source` asks for); `#board=`, the fragment before 2026-10-23, is still read,
+and the stored attribute stays `data-board`.
 
-### "Make Canvas Node"
+`replace_content` on a note with pictures keeps refusing Markdown that contains them; a
+rewrite that leaves them out removes them (as before). Unchanged, and noted only so it is
+not mistaken for something this work broke.
+
+### "Convert to Node"
 
 Unchanged in behavior ("Convert to Image Node" until now): a canvas node under the note
-whose canvas is a copy of the picture's, naming the same blob, and the picture in the text
-becomes an embed of it. With every picture a canvas, there is always a canvas to copy.
+whose canvas is a copy of the one in the text, naming the same blob, and the canvas in the
+text becomes an embed of it. A canvas that began empty converts the same way (titled
+"Canvas", the chalkboard icon). An existing canvas node goes into text by dragging its row
+onto the text, or by pasting its link; Insert Canvas no longer embeds one.
 
-### Tests to add with part 3
+## Decisions (Joe, 2026-10-23)
 
-- an inserted, pasted and dropped picture each carries `data-board`, and its canvas is in
-  the note's `data` with the picture locked in "Picture" and "Layer 1" above, sent before
-  the atom;
-- the first mark on such a picture is one update;
-- a pasted bare `pimble-blob:` picture gets a canvas; a pasted picture with one gets a copy;
-- a canvas with no marks is shown from the blob; the first mark switches it to the renderer;
-- an old bare picture is not written when its note opens, and is marked up as today;
-- undo of an insertion leaves the canvas in `data`.
+1. **Old pictures in text** without `data-board` stay lazy: nothing is written on open;
+   they become canvases at their first mark.
+2. **A canvas with no marks shows the original picture** from the blob; the renderer takes
+   over at the first mark.
+3. The picture menu's item is **"Convert to Node"**.
+4. **Two items with different workflows**: "Insert Image..." opens a file dialog and puts
+   in a canvas holding that picture (locked picture layer, draw layer above); "Insert
+   Canvas" puts in an empty canvas and no longer embeds an existing canvas node. Dragging a
+   canvas row onto text stays the way to embed one. Both in the desktop and the browser.
+5. **The canvas id goes into the URL** in Markdown export and the MCP
+   (`pimble-blob:...#canvas=<id>`), so it round-trips once Markdown accepts images; readers
+   of the old `#board=` fragment keep working.
+6. **Two edits, canvas first**, is the correct way to put a canvas into text.
 
-## Decisions (for Joe)
+## Built (2026-10-23, branch `canvas`)
 
-1. **Old pictures in text** (section 3): keep the lazy path for pictures without
-   `data-board` (nothing written on open; they become canvases at their first mark), rather
-   than converting them when a note opens? Recommended: yes, lazy.
-2. **A canvas with no marks shows the original picture** (from the blob, sharp at the
-   screen's scale), and the renderer takes over at the first mark? Recommended: yes.
-3. **The name of "Convert to Image Node"**: "Make Canvas Node" (built that way for now),
-   or another wording ("Move to Its Own Node", "Open as Separate Canvas")?
-4. **"Insert Image..." in text** became "Insert Picture...", keeping "Insert Canvas..." for
-   embedding an existing canvas node. Or should "Insert Canvas..." do both (a picture from a
-   file, or an existing canvas), leaving one item?
-5. **Markdown and the MCP** (section 3): Markdown unchanged (`![alt](pimble-blob:...)`, no
-   canvas id), plus a one-line count of marked-up pictures in `get_node`? Or write the
-   canvas id into the URL (`pimble-blob:...#canvas=<id>`), which would round-trip once
-   Markdown accepts images?
-6. **The two-update insertion** (section 3): accept the canvas and the atom as two updates
-   (canvas first), as the first mark is today? A single update would need rinch to let an
-   editor transaction carry a change to another root of the same yrs document, which is a
-   general mechanism worth asking for only if the gap ever shows.
+Shared `pimble-app` code, so the desktop and the browser alike.
+
+- `text_boards::insert_canvas` is the one way a new canvas goes into text: it builds the
+  canvas in the host note's `data` (`boards::build_board`, the same shape every canvas
+  starts with), sends it, then inserts the atom naming it over the aimed-at place, keeping
+  the person's selection. Insert Image..., paste and drop of picture files (all through
+  `pictures::stored`) and Insert Canvas use it. A stored picture whose size could not be
+  read goes in bare, as one from before, and becomes a canvas at its first mark.
+- Pasted pictures (`rebind_pasted_boards`): one naming a canvas this window holds brings a
+  copy; a store's picture with none, or naming a canvas not held here, gets a new canvas
+  when this window has its bytes (else it goes in bare); an empty canvas not held here
+  comes in as a new empty one.
+- The loader: `Source::Marked { blob: Option<BlobUrl>, board }`; an empty canvas draws a
+  480 × 200 placeholder, "An empty canvas. Double-click to draw on it.", until something
+  is drawn, then its drawing trimmed to the visible pixels.
+- Mark Up... and Convert to Node work on a canvas that began empty; marking one up opens
+  on the select tool, a picture's on the arrow.
+- The link picker's board kind is gone (nothing opens it).
+- `markdown::render` writes `#canvas=<id>` (above); docs/MCP_CONTRACT.md says so.
+
+**Verified:**
+- Tests (`pimble-app` 213, `pimble-crdt` 174): a picture put into text is a canvas from the
+  start (the canvas is the first broadcast and exists in it, then the text; "Picture"
+  locked under "Layer 1"; shown as the picture itself; the first mark is one update and
+  hands it to the renderer); Insert Canvas puts in an empty canvas, drawn as a placeholder,
+  marked up, then drawn; a pasted bare picture gets a canvas at its pixel size; sources
+  with `#canvas=` and the old `#board=` both parse; Markdown writes `#canvas=` and leaves a
+  picture from before alone. The web build (`web/`, wasm32, release) checks.
+- Desktop, an isolated release app (port 7473, its own config and data, a scratch store),
+  over rinch's debug port: Edit > Insert Image... put in the picture with its canvas (the
+  note's document holds `board:<id>`, `data-board` and "Layer 1"); the controls showed only
+  the "⋯" menu (Mark Up..., Convert to Node); Mark Up... and an arrow drawn from outside
+  the picture, Done: the text showed the arrow beside the picture; Edit > Insert Canvas put
+  in the empty-canvas placeholder; a double-click opened it, a rectangle drawn, Done: the
+  text showed the rectangle; Convert to Node made a child "Canvas" with the chalkboard icon
+  and the text became its embed.
+
+**Not built, or known gaps:**
+- A pasted picture's canvas follows the paste's text update a turn later (the paste is
+  mid-dispatch), so for that moment a peer sees a picture naming a canvas it has not got;
+  it is drawn as the plain picture meanwhile.
+- Insert Canvas puts the canvas in and stops; it does not open it for drawing.
+- An empty canvas's eye hides every mark, which leaves nothing to show; it then shows the
+  placeholder sentence.
+- Insert Image... in the browser was not driven here (the web build checks; the path is
+  the shared `pictures::stored`).

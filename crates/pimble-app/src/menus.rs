@@ -137,8 +137,8 @@ fn edit_entries(store: AppStore) -> Vec<MenuEntry> {
         // docs/IMAGES_CONTRACT.md "Showing and inserting images": into the
         // focused pane's note, at its caret. With no note there, or one this
         // device may only read, it says so.
-        MenuEntry::item("Insert Picture...", "", move || crate::pictures::insert_image(store)),
-        MenuEntry::item("Insert Canvas...", "", move || crate::text_boards::insert_board(store)),
+        MenuEntry::item("Insert Image...", "", move || crate::pictures::insert_image(store)),
+        MenuEntry::item("Insert Canvas", "", move || crate::text_boards::insert_board(store)),
         // docs/SHEETS_CONTRACT.md section 1: a new table at the caret.
         MenuEntry::item("Insert Sheet", "", move || crate::sheets::in_text::insert_sheet(store)),
         // A sheet node of its own, shown live in the text.

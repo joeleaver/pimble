@@ -6,10 +6,12 @@
 //! `image` atom; what its `<img>` asks the loader for is chosen from its
 //! attributes ([`install_image_source`]):
 //!
-//! * a picture whose atom carries a `data-board` id asks for
-//!   `pimble-blob:<store>/<blob>#board=<id>`, and the loader answers with the
-//!   board in the host node's `data["board:<id>"]` rendered (its visible extent,
-//!   trimmed);
+//! * a canvas in text (a picture, or one that began empty with `src`
+//!   [`IN_TEXT_SRC`]) whose atom carries a `data-board` id asks for
+//!   `<src>#canvas=<id>` (`#board=` before 2026-10-23, still read), and the
+//!   loader answers with the board in the host node's `data["board:<id>"]`
+//!   rendered (its visible extent, trimmed), or with the picture itself while
+//!   nothing is drawn on it (docs/CANVAS_CONTRACT.md);
 //! * a board node embedded in text has `src` `pimble-board:<store>/<node>`
 //!   (`#frame=<id>` for one frame), and the loader answers with that board
 //!   node rendered, live: while it is shown this window holds the board's
@@ -27,8 +29,8 @@
 //!
 //! The rest is the person's side: the floating controls over the picture
 //! under the pointer (the markup toggle, and a menu with "Mark Up...",
-//! "Make Canvas Node", "Open"), a click that opens an embed, a
-//! double-click that marks up a picture, Insert > "Canvas...", a board
+//! "Convert to Node", "Open"), a click that opens an embed, a
+//! double-click that marks up a picture, Insert > "Canvas", a board
 //! node's link pasted, a tree row dropped on the text, and the board a
 //! pasted marked-up picture brings with it.
 
@@ -58,8 +60,17 @@ use crate::state::AppStore;
 /// The scheme of an embedded board's `src`, without the colon.
 pub(crate) const BOARD_SCHEME: &str = "pimble-board";
 
-/// What a marked-up picture's source carries after its blob URL.
+/// What the source of a picture in text carries after its blob URL: the id
+/// of its canvas in the host note's `data` (docs/CANVAS_CONTRACT.md,
+/// decision 5; the same form Markdown export writes).
+pub(crate) const CANVAS_FRAGMENT: &str = "#canvas=";
+
+/// The fragment sources carried before canvases (2026-10-23); still read.
 const BOARD_FRAGMENT: &str = "#board=";
+
+/// The `src` of a canvas in text that began empty (Insert > "Canvas"):
+/// there is no picture, and the atom's `data-board` names its canvas.
+pub(crate) const IN_TEXT_SRC: &str = "pimble-board:in-text";
 
 /// How long after the last change of a board its picture in text is drawn
 /// again (contract section 2: a stroke being drawn appears as it is drawn,
@@ -87,11 +98,13 @@ const DELETED: &str = "This canvas was deleted.";
 const NOT_ARRIVED: &str = "This canvas has not arrived yet.";
 const NO_ACCESS: &str = "You cannot see this canvas.";
 const EMPTY: &str = "This canvas is empty.";
+/// An empty canvas in text, before anything is drawn on it.
+const EMPTY_IN_TEXT: &str = "An empty canvas. Double-click to draw on it.";
 
-/// "Make Canvas Node" refused.
-const CONVERT_FAILED: &str = "The picture could not be made into a canvas node.";
+/// "Convert to Node" refused.
+const CONVERT_FAILED: &str = "The canvas could not be made into a node.";
 
-/// Insert > "Canvas..." with no note to put it in.
+/// Insert > "Canvas" with no note to put it in.
 const NO_NOTE: &str = "Open a note to put a canvas in it.";
 
 // ── Sources ─────────────────────────────────────────────────────────────────
@@ -99,8 +112,9 @@ const NO_NOTE: &str = "Open a note to put a canvas in it.";
 /// What a picture source shown by this module names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Source {
-    /// A picture in text with the board of its markup.
-    Marked { blob: BlobUrl, board: String },
+    /// A canvas in text: its picture (none for one that began empty) and its
+    /// board in the host note's `data`.
+    Marked { blob: Option<BlobUrl>, board: String },
     /// A board node embedded in text.
     Embed(BoardUrl),
 }
@@ -109,8 +123,8 @@ fn parse_source(src: &str) -> Option<Source> {
     if let Some(url) = BoardUrl::parse(src) {
         return Some(Source::Embed(url));
     }
-    let (blob, board) = src.split_once(BOARD_FRAGMENT)?;
-    let blob = BlobUrl::parse(blob)?;
+    let (blob, board) = src.split_once(CANVAS_FRAGMENT).or_else(|| src.split_once(BOARD_FRAGMENT))?;
+    let blob = if blob == IN_TEXT_SRC { None } else { Some(BlobUrl::parse(blob)?) };
     let board = board.trim();
     if board.is_empty() || !board.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         return None;
@@ -118,14 +132,19 @@ fn parse_source(src: &str) -> Option<Source> {
     Some(Source::Marked { blob, board: board.to_string() })
 }
 
-/// The source a marked-up picture's `<img>` asks for.
+/// The source a canvas in text's `<img>` asks for.
 pub(crate) fn marked_src(blob_src: &str, board: &str) -> String {
-    format!("{blob_src}{BOARD_FRAGMENT}{board}")
+    format!("{blob_src}{CANVAS_FRAGMENT}{board}")
 }
 
 /// Whether the loader for `pimble-blob:` should hand `src` here.
 pub(crate) fn is_marked_src(src: &str) -> bool {
-    src.contains(BOARD_FRAGMENT)
+    src.contains(CANVAS_FRAGMENT) || src.contains(BOARD_FRAGMENT)
+}
+
+/// Whether `src` is a canvas in text: a store's picture, or one that began empty.
+pub(crate) fn is_canvas_src(src: &str) -> bool {
+    src == IN_TEXT_SRC || BlobUrl::parse(src).is_some()
 }
 
 /// Choose each picture's source from its attributes, once per process: a
@@ -143,8 +162,7 @@ pub(crate) fn install_image_source() {
         crate::rinch_editor::set_image_source(|attrs: &Attrs| {
             let board = attrs.get_str(BOARD_ATTR).filter(|b| !b.is_empty())?;
             let src = attrs.get_str("src")?;
-            BlobUrl::parse(src)?;
-            Some(marked_src(src, board))
+            is_canvas_src(src).then(|| marked_src(src, board))
         })
     });
     static REGISTERED: std::sync::Once = std::sync::Once::new();
@@ -190,10 +208,11 @@ pub(crate) fn load(src: &str) -> ImageLoadResult {
         Some(bytes) => ImageLoadResult::Loaded(bytes),
         None => match source {
             // The picture as it came in, while its board is drawn over it.
-            Source::Marked { blob, .. } => match crate::pictures::held_bytes(&blob) {
+            Source::Marked { blob: Some(blob), .. } => match crate::pictures::held_bytes(&blob) {
                 Some(bytes) => ImageLoadResult::Loaded(bytes.to_vec()),
                 None => ImageLoadResult::Loaded(nothing_yet()),
             },
+            Source::Marked { blob: None, .. } => ImageLoadResult::Loaded(nothing_yet()),
             // Not "failed": an `<img>` whose load failed is laid out as
             // nothing, and the line it is in is not wrapped again when the
             // picture comes (seen on the desktop); one pixel that shows
@@ -266,7 +285,7 @@ thread_local! {
     static SWEEP_TIMER: RefCell<Option<TimeoutHandle>> = const { RefCell::new(None) };
     /// Placeholder pictures, by sentence.
     static PLACEHOLDERS: RefCell<HashMap<&'static str, Arc<Vec<u8>>>> = RefCell::new(HashMap::new());
-    /// "Make Canvas Node"s waiting for their node.
+    /// "Convert to Node"s waiting for their node.
     static CONVERTS: RefCell<HashMap<u64, Convert>> = RefCell::new(HashMap::new());
     static NEXT_REQUEST: Cell<u64> = const { Cell::new(1 << 48) };
     /// The app, for callbacks rinch calls with nothing in hand.
@@ -521,10 +540,26 @@ fn prepare(src: &str) -> Option<Job> {
                     b.exists().then(|| b.snapshot())
                 })
             });
+            let Some(blob) = blob else {
+                // A canvas that began empty.
+                return match snapshot {
+                    None => Some(Job::Ready(placeholder(NOT_ARRIVED))),
+                    Some(snapshot) if snapshot.render_rect().is_none() => Some(Job::Ready(placeholder(EMPTY_IN_TEXT))),
+                    Some(snapshot) => {
+                        let (pictures, _) = crate::boards::pictures_of(&snapshot);
+                        Some(Job::Draw { snapshot, pictures, area: None })
+                    }
+                };
+            };
             let Some(snapshot) = snapshot else {
                 // No board here (yet): the picture as it came in.
                 return held_picture(&blob).map(Job::Ready);
             };
+            if shows_only_its_picture(&snapshot, &blob) {
+                // Nothing drawn on it: the original picture, sharp at the
+                // screen's scale (docs/CANVAS_CONTRACT.md, decision 2).
+                return held_picture(&blob).map(Job::Ready);
+            }
             let (pictures, all) = crate::boards::pictures_of(&snapshot);
             if !all {
                 // Its picture is on its way: the plain picture meanwhile.
@@ -568,6 +603,19 @@ fn prepare(src: &str) -> Option<Job> {
             Some(Job::Draw { snapshot, pictures, area })
         }
     }
+}
+
+/// Whether a canvas in text shows nothing but the picture it began with, as
+/// it began: no marks, no page, and the picture alone, at one unit per pixel
+/// where it was put, uncropped.
+fn shows_only_its_picture(snapshot: &BoardSnapshot, blob: &BlobUrl) -> bool {
+    let [only] = snapshot.elements.as_slice() else { return false };
+    let Geom::Picture(p) = &only.raw.geom else { return false };
+    snapshot.page.is_none()
+        && p.src == blob.to_string()
+        && p.crop.is_none()
+        && p.rect == Rect::new(0.0, 0.0, p.px_w as f32, p.px_h as f32)
+        && only.raw.transform == pimble_board::Transform::IDENTITY
 }
 
 /// A picture's own bytes, when this window has them (asked for when not).
@@ -641,6 +689,8 @@ fn placeholder(sentence: &'static str) -> Arc<Vec<u8>> {
     }
     let board = Board::standalone();
     let width = (sentence.chars().count() as f32 * 8.5 + 48.0).max(240.0);
+    // An empty canvas in text is a space to draw in, not a notice.
+    let (width, height) = if sentence == EMPTY_IN_TEXT { (width.max(480.0), 200.0) } else { (width, 52.0) };
     let style = Style {
         stroke: Some(Color::rgb(0x9e, 0x9e, 0x9e)),
         fill: Some(Color::rgb(0xf1, 0xf3, 0xf5)),
@@ -651,7 +701,7 @@ fn placeholder(sentence: &'static str) -> Arc<Vec<u8>> {
     };
     let _ = board.edit(Stamp::new(None, "1970-01-01T00:00:00.000Z"), |t| {
         t.create()?;
-        t.add_element(NewElement::new(Kind::Rect, Geom::Rect(Rect::new(0.0, 0.0, width, 52.0))).with_style(style).with_text(sentence))
+        t.add_element(NewElement::new(Kind::Rect, Geom::Rect(Rect::new(0.0, 0.0, width, height))).with_style(style).with_text(sentence))
     });
     let bytes = render_extent(&board.snapshot(), &pimble_board::NoPictures, 1.0)
         .and_then(|r| r.image.encode_png().ok())
@@ -965,8 +1015,9 @@ pub(crate) fn drop_tree_row(store: AppStore, pane: PaneId, value: &str) -> bool 
     insert_embed(store, pane, BoardUrl::new(store_id, node_id), None)
 }
 
-/// Insert > "Canvas...": the link picker, limited to board nodes, and the
-/// pick goes in as an embed at the caret.
+/// Insert > "Canvas": an empty canvas at the caret (docs/CANVAS_CONTRACT.md,
+/// decision 4). An existing canvas node goes into text by dragging its row
+/// onto the text, or by pasting its link.
 pub fn insert_board(store: AppStore) {
     let pane = store.focused();
     let Some(active) = untracked(|| store.pane(pane).active_edit.get()) else {
@@ -977,30 +1028,110 @@ pub fn insert_board(store: AppStore) {
         crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
         return;
     }
-    let handle = crate::editor::editor(pane);
-    let at = handle.selection().from().0;
-    let (x, y) = handle.caret_rect(handle.selection().head()).map(|r| (r.x, r.y + r.height + 4.0)).unwrap_or((40.0, 80.0));
-    crate::link_picker::open(store, crate::link_picker::PickerKind::Board { at }, x, y);
-    handle.focus();
+    if !insert_canvas(store, pane, active.store_id, active.node_id, None, "", None) {
+        crate::events::show_notice(store, "A canvas cannot go where the caret is.".to_string());
+    }
+    crate::editor::editor(pane).focus();
 }
 
-// ── Pasting a marked-up picture ─────────────────────────────────────────────
+/// Put a new canvas into pane `pane`'s text, the note `(store_id, node_id)`:
+/// empty, or starting from `picture` (its URL and pixel size) with `alt`. It
+/// goes over `at` (the caret when `None`), and the person's own selection is
+/// kept where it is in the text.
+///
+/// Two updates, the canvas first (docs/CANVAS_CONTRACT.md, decision 6): the
+/// canvas in the note's `data`, then the atom naming it as one edit of the
+/// text, so a peer never sees a picture naming a canvas it has not got.
+/// `false` when the text took nothing; the canvas then stays in `data`
+/// unreferenced, as a deleted picture's does.
+pub(crate) fn insert_canvas(
+    store: AppStore,
+    pane: PaneId,
+    store_id: StoreId,
+    node_id: NodeId,
+    picture: Option<(&BlobUrl, u32, u32)>,
+    alt: &str,
+    at: Option<rinch_editor_core::Selection>,
+) -> bool {
+    let board_id = pimble_board::doc::new_id();
+    let author = crate::shares::author_in(store, store_id, node_id);
+    let update = HOSTS.with(|hosts| {
+        let hosts = hosts.borrow();
+        let host = hosts.get(&(store_id, node_id))?;
+        crate::boards::build_board(&Board::in_text(&host.doc, &board_id), author.as_ref(), picture)
+    });
+    let Some(update) = update else { return false };
+    crate::boards::send_node_update(store, store_id, node_id, update);
+    let src = picture.map(|(url, _, _)| url.to_string()).unwrap_or_else(|| IN_TEXT_SRC.to_string());
+    let alt = alt.to_string();
+    crate::editor::editor(pane).update(move |state| {
+        let attrs = Attrs::new()
+            .with("src", AttrValue::from(src.as_str()))
+            .with("alt", AttrValue::from(alt.as_str()))
+            .with(BOARD_ATTR, AttrValue::from(board_id.as_str()));
+        let node = state.schema().create_node("image", attrs, Fragment::empty()).ok()?;
+        let mut tr = state.tr();
+        let moved = at.as_ref().is_some_and(|at| *at != state.selection);
+        if let Some(at) = at.clone() {
+            tr.set_selection(at);
+        }
+        tr.replace_selection_with(node).ok()?;
+        if moved {
+            let live = state.selection.map(tr.doc(), tr.mapping());
+            tr.set_selection(live);
+        }
+        Some(tr)
+    })
+}
 
-/// The pasted pictures' boards (contract section 2, "Copy and paste"): every
-/// image in `slice` with a `data-board` gets a fresh id, and the board it names
-/// is copied under that id into pane `pane`'s note a turn later. A board
-/// this window does not hold (copied in another window) cannot come along:
-/// the picture is pasted as it came in. Answers the slice to paste, or
-/// `None` when no pasted picture has a board.
+// ── Pasting pictures ─────────────────────────────────────────────────────────
+
+/// What a pasted picture's canvas is made from.
+enum PastedCanvas {
+    /// A copy of the canvas (by its old id) the picture named.
+    Copy(String),
+    /// A new canvas from the picture alone (its URL and pixel size): a
+    /// picture copied from text written before every picture was a canvas.
+    Fresh(BlobUrl, u32, u32),
+    /// A new empty canvas: one that began empty, from a canvas this window
+    /// does not hold.
+    Empty,
+}
+
+/// The pasted pictures' canvases (docs/IMAGE_MARKUP_CONTRACT.md section 2, "Copy
+/// and paste", and docs/CANVAS_CONTRACT.md section 3): every image in `slice`
+/// with a `data-board` gets a fresh id, and the canvas it names is copied under
+/// that id into pane `pane`'s note a turn later; a store's picture with none
+/// gets a new canvas of its own. A canvas this window does not hold (copied in
+/// another window) cannot come along, nor can a picture whose bytes it has
+/// not got be measured: the picture is pasted as it came in, and becomes a
+/// canvas at its first mark. Answers the slice to paste, or `None` when no
+/// pasted picture changed.
 pub(crate) fn rebind_pasted_boards(schema: &rinch_editor_core::Schema, slice: &rinch_editor_core::Slice, pane: PaneId) -> Option<rinch_editor_core::Slice> {
-    fn walk(node: &EditorNode, schema: &rinch_editor_core::Schema, jobs: &mut Vec<(String, String)>) -> EditorNode {
+    fn canvas_for(attrs: &Attrs) -> Option<PastedCanvas> {
+        if let Some(old) = attrs.get_str(BOARD_ATTR).filter(|b| !b.is_empty() && find_board(b).is_some()) {
+            return Some(PastedCanvas::Copy(old.to_string()));
+        }
+        let src = attrs.get_str("src")?;
+        if src == IN_TEXT_SRC {
+            return Some(PastedCanvas::Empty);
+        }
+        let blob = BlobUrl::parse(src)?;
+        let picture = crate::pictures::held_bytes(&blob).and_then(|bytes| Picture::decode(&bytes).ok())?;
+        Some(PastedCanvas::Fresh(blob, picture.width(), picture.height()))
+    }
+    fn concerns(node: &EditorNode) -> bool {
+        node.type_name() == "image" && (node.attrs().get_str(BOARD_ATTR).is_some_and(|b| !b.is_empty()) || node.attrs().get_str("src").is_some_and(is_canvas_src))
+    }
+    fn walk(node: &EditorNode, schema: &rinch_editor_core::Schema, jobs: &mut Vec<(PastedCanvas, String)>) -> EditorNode {
         if node.type_name() == "image" {
-            let Some(old) = node.attrs().get_str(BOARD_ATTR).filter(|b| !b.is_empty()) else { return node.clone() };
-            let held = find_board(old).is_some();
+            if !concerns(node) {
+                return node.clone();
+            }
             let mut attrs = node.attrs().without(BOARD_ATTR);
-            if held {
+            if let Some(canvas) = canvas_for(node.attrs()) {
                 let fresh = pimble_board::doc::new_id();
-                jobs.push((old.to_string(), fresh.clone()));
+                jobs.push((canvas, fresh.clone()));
                 attrs = attrs.with(BOARD_ATTR, AttrValue::from(fresh.as_str()));
             }
             return schema
@@ -1017,10 +1148,10 @@ pub(crate) fn rebind_pasted_boards(schema: &rinch_editor_core::Schema, slice: &r
     let mut any = false;
     slice.content.iter().for_each(|n| {
         n.nodes_between(0, n.content_size(), &mut |c, _, _| {
-            any |= c.type_name() == "image" && c.attrs().get_str(BOARD_ATTR).is_some_and(|b| !b.is_empty());
+            any |= concerns(c);
             true
         });
-        any |= n.type_name() == "image" && n.attrs().get_str(BOARD_ATTR).is_some_and(|b| !b.is_empty());
+        any |= concerns(n);
     });
     if !any {
         return None;
@@ -1028,9 +1159,11 @@ pub(crate) fn rebind_pasted_boards(schema: &rinch_editor_core::Schema, slice: &r
     let mut jobs = Vec::new();
     let top: Vec<EditorNode> = slice.content.iter().map(|n| walk(n, schema, &mut jobs)).collect();
     if !jobs.is_empty() {
-        // The paste is mid-dispatch: the boards are copied a turn later
+        // The paste is mid-dispatch: the canvases are made a turn later
         // (they touch nothing of the editor; under `cargo test` no timer
-        // runs, so at once).
+        // runs, so at once). The text's update follows the paste, so a peer
+        // can see a picture a moment before its canvas, which is drawn as the
+        // plain picture meanwhile.
         #[cfg(not(test))]
         crate::links::later(move |store| copy_boards(store, pane, jobs));
         #[cfg(test)]
@@ -1041,17 +1174,31 @@ pub(crate) fn rebind_pasted_boards(schema: &rinch_editor_core::Schema, slice: &r
     Some(rinch_editor_core::Slice::new(Fragment::from_children(top), slice.open_start, slice.open_end))
 }
 
-/// Copy each `(old, new)` board into pane `pane`'s note under its new id.
-fn copy_boards(store: AppStore, pane: PaneId, jobs: Vec<(String, String)>) {
+/// Make each pasted picture's canvas in pane `pane`'s note under its new id.
+fn copy_boards(store: AppStore, pane: PaneId, jobs: Vec<(PastedCanvas, String)>) {
     let Some(active) = untracked(|| store.pane(pane).active_edit.get()) else { return };
-    for (old, new) in jobs {
-        let Some((_, raw)) = find_board(&old) else { continue };
+    let author = crate::shares::author_in(store, active.store_id, active.node_id);
+    for (canvas, new) in jobs {
+        let raw = match &canvas {
+            PastedCanvas::Copy(old) => match find_board(old) {
+                Some((_, raw)) => Some(raw),
+                None => continue,
+            },
+            PastedCanvas::Fresh(..) | PastedCanvas::Empty => None,
+        };
         let Some(update) = HOSTS.with(|hosts| {
             let hosts = hosts.borrow();
             let host = hosts.get(&(active.store_id, active.node_id))?;
-            let author = crate::shares::author_in(store, active.store_id, active.node_id);
-            let now = crate::boards::now_stamp();
-            Board::in_text(&host.doc, &new).edit(Stamp::new(author.as_ref(), &now), |t| t.copy_from(&raw)).update
+            let board = Board::in_text(&host.doc, &new);
+            match (&canvas, raw) {
+                (_, Some(raw)) => {
+                    let now = crate::boards::now_stamp();
+                    board.edit(Stamp::new(author.as_ref(), &now), |t| t.copy_from(&raw)).update
+                }
+                (PastedCanvas::Fresh(blob, w, h), None) => crate::boards::build_board(&board, author.as_ref(), Some((blob, *w, *h))),
+                (PastedCanvas::Empty, None) => crate::boards::build_board(&board, author.as_ref(), None),
+                (PastedCanvas::Copy(_), None) => None,
+            }
         }) else {
             continue;
         };
@@ -1081,10 +1228,10 @@ pub struct PictureHover {
 }
 
 impl PictureHover {
-    /// Whether it is a picture of a store's blobs (not an embed, not a web
-    /// picture).
+    /// Whether it is a canvas in text (a store's picture, or a canvas that
+    /// began empty), not an embed and not a web picture.
     pub fn is_picture(&self) -> bool {
-        self.embed.is_none() && BlobUrl::parse(&self.src).is_some()
+        self.embed.is_none() && (BlobUrl::parse(&self.src).is_some() || (self.src == IN_TEXT_SRC && self.board.is_some()))
     }
 }
 
@@ -1114,7 +1261,7 @@ pub(crate) fn hovered(store: AppStore, pane: PaneId, hover: Option<&crate::rinch
     };
     let src = h.attrs.get_str("src").unwrap_or_default().to_string();
     let embed = BoardUrl::parse(&src);
-    if embed.is_none() && BlobUrl::parse(&src).is_none() {
+    if embed.is_none() && !is_canvas_src(&src) {
         hide_later(store, pane);
         return;
     }
@@ -1283,7 +1430,7 @@ fn toggle(store: AppStore, pane: PaneId) {
     }
 }
 
-// ── Make Canvas Node ───────────────────────────────────────────────────
+// ── Convert to Node ────────────────────────────────────────────────────
 
 /// A conversion waiting for its node.
 struct Convert {
@@ -1295,16 +1442,19 @@ struct Convert {
     title: String,
 }
 
-/// "Make Canvas Node" (contract section 1): an image node under the
-/// note with the same blob and a copy of the picture's markup, and the
-/// picture in the text replaced by an embed of it, in one edit of the text.
+/// "Convert to Node" (docs/CANVAS_CONTRACT.md): a canvas node under the note
+/// with a copy of the canvas in the text (naming the same blob), and the
+/// canvas in the text replaced by an embed of it, in one edit of the text.
 fn convert(store: AppStore, pane: PaneId, hover: &PictureHover) {
     let Some(active) = untracked(|| store.pane(pane).active_edit.get()) else { return };
     if !store.node_access(active.store_id, active.node_id).allows_write() {
         crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
         return;
     }
-    let Some(blob) = BlobUrl::parse(&hover.src) else { return };
+    let blob = BlobUrl::parse(&hover.src);
+    if blob.is_none() && !hover.is_picture() {
+        return;
+    }
     let raw = hover.board.as_deref().and_then(|b| {
         HOSTS.with(|hosts| hosts.borrow().get(&(active.store_id, active.node_id)).and_then(|h| Board::in_text(&h.doc, b).read()))
     });
@@ -1314,19 +1464,24 @@ fn convert(store: AppStore, pane: PaneId, hover: &PictureHover) {
             let now = crate::boards::now_stamp();
             Board::standalone().edit(Stamp::new(author.as_ref(), &now), |t| t.copy_from(&raw)).update
         }
-        None => {
-            let size = crate::pictures::held_bytes(&blob)
-                .and_then(|bytes| Picture::decode(&bytes).ok())
-                .map(|p| (p.width(), p.height()))
-                .unwrap_or((hover.rect.2.max(1.0) as u32, hover.rect.3.max(1.0) as u32));
-            crate::boards::new_board(Some((&blob, size.0, size.1)))
-        }
+        None => match &blob {
+            Some(blob) => {
+                let size = crate::pictures::held_bytes(blob)
+                    .and_then(|bytes| Picture::decode(&bytes).ok())
+                    .map(|p| (p.width(), p.height()))
+                    .unwrap_or((hover.rect.2.max(1.0) as u32, hover.rect.3.max(1.0) as u32));
+                crate::boards::new_board(Some((blob, size.0, size.1)))
+            }
+            None => None,
+        },
     };
     let Some(board) = board else {
         crate::events::show_notice(store, CONVERT_FAILED.to_string());
         return;
     };
-    let title = if hover.alt.trim().is_empty() { "Picture".to_string() } else { hover.alt.clone() };
+    let fallback = if blob.is_some() { "Picture" } else { "Canvas" };
+    let title = if hover.alt.trim().is_empty() { fallback.to_string() } else { hover.alt.clone() };
+    let icon = if blob.is_some() { crate::boards::PHOTO_ICON } else { crate::boards::WHITEBOARD_ICON };
     let request = NEXT_REQUEST.with(|n| n.replace(n.get() + 1));
     CONVERTS.with(|c| {
         c.borrow_mut().insert(
@@ -1335,7 +1490,7 @@ fn convert(store: AppStore, pane: PaneId, hover: &PictureHover) {
         )
     });
     store.pane(pane).picture.set(None);
-    crate::boards::create_board_node(store, active.store_id, active.node_id, &title, crate::boards::PHOTO_ICON, board, Some(request));
+    crate::boards::create_board_node(store, active.store_id, active.node_id, &title, icon, board, Some(request));
 }
 
 /// A node made for a request of this module: the picture it was made from
@@ -1619,7 +1774,7 @@ pub(crate) fn render_controls(__scope: &mut RenderScope, store: AppStore, pane: 
                             left_section: TablerIcon::Photo,
                             disabled: {move || !is_picture() || read_only()},
                             onclick: with_hover(convert),
-                            "Make Canvas Node"
+                            "Convert to Node"
                         }
                         DropdownMenuItem {
                             left_section: TablerIcon::ExternalLink,
@@ -1726,6 +1881,123 @@ mod tests {
         assert!(!store.pane(P[0]).markup.get());
     }
 
+    /// The first broadcast of node `node` in `sent`, applied to an empty
+    /// document: what a peer gets first.
+    fn first_broadcast(sent: &[BackendCommand], node: NodeId) -> NodeDoc {
+        use base64::Engine;
+        let changes = sent
+            .iter()
+            .find_map(|c| match c {
+                BackendCommand::BroadcastChanges { node_id, changes, .. } if *node_id == node => Some(changes.clone()),
+                _ => None,
+            })
+            .expect("a broadcast");
+        let mut doc = NodeDoc::new();
+        doc.apply_update(&base64::engine::general_purpose::STANDARD.decode(changes).unwrap()).unwrap();
+        doc
+    }
+
+    /// A picture put into text is a canvas from the start
+    /// (docs/CANVAS_CONTRACT.md section 3): the canvas goes out first, with
+    /// the picture locked in a layer of its own and "Layer 1" above it; then
+    /// the atom, naming it. Nothing is drawn on it, so the text shows the
+    /// picture itself, and the first mark is only the mark.
+    #[test]
+    fn a_picture_put_into_text_is_a_canvas_from_the_start() {
+        let (store, commands) = store_with_commands();
+        let (store_id, node_id) = (StoreId::new(), NodeId::new());
+        crate::editor::start_editing(store, P[2], store_id, node_id, &[]);
+        let blob = BlobUrl::new(store_id, pimble_core::BlobId::new());
+        let _ = commands.try_iter().count();
+
+        assert!(insert_canvas(store, P[2], store_id, node_id, Some((&blob, 320, 200)), "sunset", None));
+        let sent: Vec<BackendCommand> = commands.try_iter().collect();
+        assert_eq!(broadcasts(&sent, node_id), 2, "the canvas, then the text");
+        let (pos, attrs) = atoms(P[2]).remove(0);
+        let board = attrs.get_str(BOARD_ATTR).expect("the picture names its canvas").to_string();
+        assert_eq!(attrs.get_str("src"), Some(blob.to_string().as_str()));
+        assert_eq!(attrs.get_str("alt"), Some("sunset"));
+        assert!(Board::in_text(&first_broadcast(&sent, node_id), &board).exists(), "the canvas travels before the text names it");
+
+        let snapshot = board_snapshot(store_id, node_id, &board).expect("the note's canvas here");
+        let names: Vec<&str> = snapshot.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["Picture", "Layer 1"]);
+        assert!(snapshot.layers[0].locked && !snapshot.layers[1].locked);
+        assert_eq!(snapshot.markup_count(), 0);
+        assert!(shows_only_its_picture(&snapshot, &blob), "shown as the picture itself");
+
+        crate::boards::start_markup(store, P[2], store_id, node_id, &blob.to_string(), pos, Some(board.clone()));
+        crate::boards::mark_for_test(store, P[2]);
+        let sent: Vec<BackendCommand> = commands.try_iter().collect();
+        assert_eq!(broadcasts(&sent, node_id), 1, "the first mark is only the mark");
+        let snapshot = board_snapshot(store_id, node_id, &board).unwrap();
+        assert!(!shows_only_its_picture(&snapshot, &blob), "drawn on: the renderer takes over");
+        crate::boards::end_markup(store, P[2]);
+        crate::editor::stop_editing(store, P[2]);
+    }
+
+    /// Insert > "Canvas" (docs/CANVAS_CONTRACT.md, decision 4): an empty
+    /// canvas in the text, drawn as a space to draw in, marked up like any
+    /// picture.
+    #[test]
+    fn insert_canvas_puts_an_empty_canvas_in_the_text() {
+        let (store, commands) = store_with_commands();
+        let (store_id, node_id) = (StoreId::new(), NodeId::new());
+        crate::editor::start_editing(store, P[3], store_id, node_id, &[]);
+        store.focus_pane(P[3]);
+        let _ = commands.try_iter().count();
+
+        insert_board(store);
+        let sent: Vec<BackendCommand> = commands.try_iter().collect();
+        assert_eq!(broadcasts(&sent, node_id), 2);
+        let (pos, attrs) = atoms(P[3]).remove(0);
+        assert_eq!(attrs.get_str("src"), Some(IN_TEXT_SRC));
+        let board = attrs.get_str(BOARD_ATTR).expect("it names its canvas").to_string();
+        let snapshot = board_snapshot(store_id, node_id, &board).expect("an empty canvas here");
+        assert_eq!(snapshot.layers.len(), 1);
+        assert!(snapshot.elements.is_empty());
+        assert!(matches!(prepare(&marked_src(IN_TEXT_SRC, &board)), Some(Job::Ready(_))), "a placeholder until something is drawn");
+
+        crate::boards::start_markup(store, P[3], store_id, node_id, IN_TEXT_SRC, pos, Some(board.clone()));
+        assert!(store.pane(P[3]).markup.get());
+        crate::boards::mark_for_test(store, P[3]);
+        assert_eq!(board_snapshot(store_id, node_id, &board).unwrap().markup_count(), 1);
+        assert!(matches!(prepare(&marked_src(IN_TEXT_SRC, &board)), Some(Job::Draw { .. })));
+        crate::boards::end_markup(store, P[3]);
+        crate::editor::stop_editing(store, P[3]);
+    }
+
+    /// A store's picture pasted with no canvas (copied from text written
+    /// before every picture was a canvas) gets a canvas of its own.
+    #[test]
+    fn a_pasted_bare_picture_gets_a_canvas() {
+        let (store, commands) = store_with_commands();
+        let (store_id, node_id) = (StoreId::new(), NodeId::new());
+        crate::editor::start_editing(store, P[0], store_id, node_id, &[]);
+        let mut open = pimble_core::Store::new_local("Notes", std::path::PathBuf::from("/nowhere/notes.pimble"));
+        open.id = store_id;
+        store.store_data.update(|map| {
+            map.insert(store_id, Signal::new(open));
+        });
+        let blob = BlobUrl::new(store_id, pimble_core::BlobId::new());
+        let png = pimble_board::RgbaImage { width: 4, height: 3, data: vec![255; 48] }.encode_png().unwrap();
+        crate::pictures::loaded(blob, &Ok(Arc::new(png)));
+        let _ = commands.try_iter().count();
+
+        let html = format!("<p><img src=\"{blob}\" alt=\"old\"></p>");
+        assert!(crate::editor::editor(P[0]).paste(&rinch_editor_core::PasteContent::new(None, Some(html))));
+        let (_, attrs) = atoms(P[0]).remove(0);
+        let board = attrs.get_str(BOARD_ATTR).expect("a canvas of its own").to_string();
+        let snapshot = board_snapshot(store_id, node_id, &board).expect("made here");
+        assert!(shows_only_its_picture(&snapshot, &blob));
+        let picture = snapshot.elements.iter().find_map(|e| match &e.raw.geom {
+            Geom::Picture(p) => Some((p.px_w, p.px_h)),
+            _ => None,
+        });
+        assert_eq!(picture, Some((4, 3)));
+        crate::editor::stop_editing(store, P[0]);
+    }
+
     /// A marked-up picture pasted (contract section 2, "Copy and paste"):
     /// it gets a board of its own, a copy, even in the same note.
     #[test]
@@ -1765,7 +2037,7 @@ mod tests {
         crate::editor::stop_editing(store, P[1]);
     }
 
-    /// "Make Canvas Node": an image node under the note with the
+    /// "Convert to Node": an image node under the note with the
     /// picture's markup, and the picture replaced by an embed of it.
     #[test]
     fn converting_a_picture_makes_an_image_node_and_embeds_it() {
@@ -1877,8 +2149,15 @@ mod tests {
     fn sources_are_told_apart() {
         let blob = BlobUrl::new(StoreId::new(), pimble_core::BlobId::new());
         let marked = marked_src(&blob.to_string(), "a1b2");
-        assert_eq!(parse_source(&marked), Some(Source::Marked { blob, board: "a1b2".into() }));
+        assert!(marked.ends_with("#canvas=a1b2"));
+        assert_eq!(parse_source(&marked), Some(Source::Marked { blob: Some(blob), board: "a1b2".into() }));
         assert!(is_marked_src(&marked));
+        let before = format!("{blob}#board=a1b2");
+        assert_eq!(parse_source(&before), Some(Source::Marked { blob: Some(blob), board: "a1b2".into() }), "the fragment of before canvases is still read");
+        assert!(is_marked_src(&before));
+        let empty = marked_src(IN_TEXT_SRC, "c3");
+        assert_eq!(parse_source(&empty), Some(Source::Marked { blob: None, board: "c3".into() }));
+        assert_eq!(parse_source(IN_TEXT_SRC), None);
         let embed = BoardUrl::new(StoreId::new(), NodeId::new());
         assert_eq!(parse_source(&embed.to_string()), Some(Source::Embed(embed)));
         assert_eq!(parse_source(&blob.to_string()), None, "a plain picture is the blob loader's");

@@ -187,8 +187,8 @@ fn button_groups() -> Vec<Group> {
         Group {
             label: "Insert",
             buttons: vec![
-                b(TablerIcon::Photo, "Insert Picture...", Cmd::Insert(Insert::Image), ActiveCheck::None),
-                b(TablerIcon::Chalkboard, "Insert Canvas...", Cmd::Insert(Insert::Board), ActiveCheck::None),
+                b(TablerIcon::Photo, "Insert Image...", Cmd::Insert(Insert::Image), ActiveCheck::None),
+                b(TablerIcon::Chalkboard, "Insert Canvas", Cmd::Insert(Insert::Board), ActiveCheck::None),
                 b(TablerIcon::Table, "Insert Sheet", Cmd::Insert(Insert::Sheet), ActiveCheck::None),
                 b(TablerIcon::TableShare, "Insert Sheet from a Node...", Cmd::Insert(Insert::SheetNode), ActiveCheck::None),
                 b(TablerIcon::TablePlus, "Insert Table", Cmd::Run("insertTable"), ActiveCheck::None),

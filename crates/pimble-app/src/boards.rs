@@ -998,10 +998,15 @@ fn first_mark(store: AppStore, pane: PaneId, held: (StoreId, NodeId)) {
 
 /// "Mark Up..." on a picture in pane `pane`'s text (contract section 2):
 /// the board view over the pane, on the picture's board in the note's
-/// `data["board:<id>"]`. A picture with no board yet gets one in this pane's copy
-/// of the note, shown at once and written with the first mark.
+/// `data["board:<id>"]`. A picture with no board yet (one put in before every
+/// picture was a canvas, docs/CANVAS_CONTRACT.md) gets one in this pane's copy
+/// of the note, shown at once and written with the first mark. An empty canvas
+/// in text (`src` [`crate::text_boards::IN_TEXT_SRC`]) always has its board.
 pub(crate) fn start_markup(store: AppStore, pane: PaneId, store_id: StoreId, node_id: NodeId, src: &str, pos: usize, board: Option<String>) {
-    let Some(blob) = BlobUrl::parse(src) else { return };
+    let blob = BlobUrl::parse(src);
+    if blob.is_none() && (src != crate::text_boards::IN_TEXT_SRC || board.is_none()) {
+        return;
+    }
     if !store.node_access(store_id, node_id).allows_write() {
         crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
         return;
@@ -1015,26 +1020,19 @@ pub(crate) fn start_markup(store: AppStore, pane: PaneId, store_id: StoreId, nod
     let attr_needed = board.is_none();
     let board_id = board.unwrap_or_else(pimble_board::doc::new_id);
     let board = Board::in_text(&doc, &board_id).with_origin(format!("pimble-board-pane-{}", pane.index()));
-    let pending = if board.exists() {
-        None
-    } else {
-        // The picture at one unit per pixel in a locked layer of its own,
-        // and a layer above it to draw in, as an image node starts.
-        let size = crate::pictures::held_bytes(&blob)
-            .and_then(|bytes| Picture::decode(&bytes).ok())
-            .map(|p| (p.width(), p.height()))
-            .unwrap_or((640, 480));
-        let author = author();
-        let now = now_stamp();
-        let made = Board::in_text(&doc, &board_id).edit(Stamp::new(author.as_ref(), &now), |t| {
-            t.create()?;
-            let layer = t.add_layer("Picture", Placement::Bottom)?;
-            let geom = PictureGeom { rect: Rect::new(0.0, 0.0, size.0 as f32, size.1 as f32), src: blob.to_string(), px_w: size.0, px_h: size.1, crop: None };
-            t.add_element(NewElement::new(Kind::Picture, Geom::Picture(geom)).in_layer(layer.clone()))?;
-            t.set_layer_locked(&layer, true)?;
-            Ok(())
-        });
-        made.update
+    if blob.is_none() && !board.exists() {
+        crate::events::show_notice(store, "This canvas has not arrived yet.".to_string());
+        return;
+    }
+    let pending = match &blob {
+        Some(blob) if !board.exists() => {
+            let size = crate::pictures::held_bytes(blob)
+                .and_then(|bytes| Picture::decode(&bytes).ok())
+                .map(|p| (p.width(), p.height()))
+                .unwrap_or((640, 480));
+            build_board(&Board::in_text(&doc, &board_id), author().as_ref(), Some((blob, size.0, size.1)))
+        }
+        _ => None,
     };
     let dark = untracked(|| store.dark_mode.get());
     let ui = store.pane(pane).board_ui;
@@ -1644,10 +1642,16 @@ pub(crate) fn surface(store: AppStore, pane: PaneId) -> RenderSurfaceHandle {
 /// node, the picture at one unit per pixel in a locked layer of its own below
 /// it (contract sections 1 and 3).
 pub(crate) fn new_board(picture: Option<(&BlobUrl, u32, u32)>) -> Option<Vec<u8>> {
-    let board = Board::standalone();
-    let author = author();
+    build_board(&Board::standalone(), author().as_ref(), picture)
+}
+
+/// Make `board`, empty or starting from a picture: the picture at one unit per
+/// pixel in a locked layer "Picture" of its own and "Layer 1" above it to draw
+/// in. Every canvas starts this way, as a node or in text
+/// (docs/CANVAS_CONTRACT.md). Answers the update that made it.
+pub(crate) fn build_board(board: &Board, author: Option<&Author>, picture: Option<(&BlobUrl, u32, u32)>) -> Option<Vec<u8>> {
     let now = now_stamp();
-    let edited = board.edit(Stamp::new(author.as_ref(), &now), |t| {
+    let edited = board.edit(Stamp::new(author, &now), |t| {
         t.create()?;
         if let Some((url, w, h)) = picture {
             let layer = t.add_layer("Picture", Placement::Bottom)?;

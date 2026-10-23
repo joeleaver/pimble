@@ -145,8 +145,49 @@ pub fn parse(schema: &Schema, md: &str) -> Result<Node> {
 /// An editor `doc` as Markdown: CommonMark with `~~strike~~` and pipe tables, and the
 /// HTML tags rinch writes for what Markdown has no syntax for (underline, highlight,
 /// text colour, sub/superscript, a table with merged cells or blocks in a cell).
+/// A canvas in text is its picture with the canvas's id after the URL,
+/// `![alt](pimble-blob:<store>/<hash>#canvas=<id>)` (docs/CANVAS_CONTRACT.md,
+/// decision 5).
 pub fn render(doc: &Node) -> String {
-    doc_to_markdown(doc)
+    match with_canvas_urls(doc) {
+        Some(doc) => doc_to_markdown(&doc),
+        None => doc_to_markdown(doc),
+    }
+}
+
+/// The attribute of a picture in text naming its canvas (a board, in storage).
+const CANVAS_ATTR: &str = "data-board";
+
+/// What follows a canvas's picture URL in Markdown.
+pub const CANVAS_FRAGMENT: &str = "#canvas=";
+
+/// `doc` with each canvas's id written into its picture's URL; `None` when it
+/// has no canvas in its text.
+fn with_canvas_urls(doc: &Node) -> Option<Node> {
+    fn names_canvas(node: &Node) -> Option<(&str, &str)> {
+        if node.type_name() != "image" {
+            return None;
+        }
+        let id = node.attrs().get_str(CANVAS_ATTR).filter(|id| !id.is_empty())?;
+        let src = node.attrs().get_str("src").filter(|src| !src.contains('#'))?;
+        Some((src, id))
+    }
+    fn walk(node: &Node, schema: &Schema) -> Node {
+        if let Some((src, id)) = names_canvas(node) {
+            let attrs = node.attrs().with("src", rinch_editor_core::AttrValue::from(format!("{src}{CANVAS_FRAGMENT}{id}").as_str()));
+            return schema.create_node("image", attrs, Fragment::empty()).map(|n| n.with_marks(node.marks().to_vec())).unwrap_or_else(|_| node.clone());
+        }
+        if node.is_text() || node.child_count() == 0 {
+            return node.clone();
+        }
+        node.copy_with_content(Fragment::from_children(node.content().iter().map(|child| walk(child, schema)).collect()))
+    }
+    let mut any = false;
+    doc.nodes_between(0, doc.content_size(), &mut |node, _, _| {
+        any |= names_canvas(node).is_some();
+        !any
+    });
+    any.then(|| walk(doc, &Schema::starter_kit()))
 }
 
 // ── Naming a block ───────────────────────────────────────────────────────
@@ -515,6 +556,31 @@ mod tests {
         assert!(check("[x](javascript:alert(1))").unwrap_err().to_string().contains("unsafe"));
         check("# H\n\n**b** *i* ~~s~~ `c` [l](pimble:a/b)\n\n- one\n  - two\n\n1. x\n\n```rust\nfn x() {}\n```\n\n---\n")
             .unwrap();
+    }
+
+    #[test]
+    fn a_canvas_in_text_writes_its_id_after_the_picture_url() {
+        use rinch_editor_core::Attrs;
+        let s = schema();
+        let image = |src: &str, alt: &str, canvas: Option<&str>| {
+            let attrs = Attrs::new().with("src", src).with("alt", alt);
+            let attrs = match canvas {
+                Some(id) => attrs.with("data-board", id),
+                None => attrs,
+            };
+            s.create_node("image", attrs, Fragment::empty()).unwrap()
+        };
+        let p = s
+            .create_node(
+                "paragraph",
+                Attrs::new(),
+                Fragment::from_children(vec![image("pimble-blob:a/b", "shot", Some("c1")), image("pimble-blob:a/d", "", None)]),
+            )
+            .unwrap();
+        let doc = s.create_node("doc", Attrs::new(), Fragment::from_children(vec![p])).unwrap();
+        let md = render(&doc);
+        assert!(md.contains("![shot](pimble-blob:a/b#canvas=c1)"), "{md}");
+        assert!(md.contains("![](pimble-blob:a/d)"), "a picture from before canvases is as it was: {md}");
     }
 
     #[test]
