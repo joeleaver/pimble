@@ -101,6 +101,11 @@ pub(super) fn on_event(store: AppStore, pane: PaneId, event: SurfaceEvent) {
     }
     let scale = scale_of(pane);
     let ui = store.pane(pane).board_ui;
+    // A press, a scroll, a pinch or a key on the board is the person here
+    // taking it back from whoever it follows.
+    if matches!(event, SurfaceEvent::PointerDown { .. } | SurfaceEvent::MouseWheel { .. } | SurfaceEvent::Pinch { .. } | SurfaceEvent::KeyDown(_)) {
+        crate::presence::follow::stop(pane);
+    }
     match event {
         SurfaceEvent::PointerDown { x, y, button, pointer } => pointer_down(store, pane, x * scale, y * scale, button, pointer),
         SurfaceEvent::PointerMove { x, y, pointer } => {

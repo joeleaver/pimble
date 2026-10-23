@@ -1293,6 +1293,24 @@ impl TextPresence {
         use base64::Engine;
         base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(self.anchor.as_ref()?).ok()
     }
+
+    /// The same, saying `top` is the first position in view.
+    pub fn with_viewport_top(mut self, top: Option<&[u8]>) -> Self {
+        use base64::Engine;
+        self.viewport_top = top.map(|b| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b));
+        self
+    }
+
+    pub fn viewport_top_bytes(&self) -> Option<Vec<u8>> {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(self.viewport_top.as_ref()?).ok()
+    }
+
+    /// Whether it says where a caret is: a pane that may only read and has
+    /// nothing selected says only what it shows (`caret` empty).
+    pub fn has_caret(&self) -> bool {
+        !self.caret.is_empty()
+    }
 }
 
 impl PresenceBody {
@@ -1638,6 +1656,16 @@ mod tests {
         let caret_only = TextPresence::new(&[4, 5], Some(&[4, 5]));
         assert_eq!(caret_only.anchor, None);
         assert_eq!(caret_only.anchor_bytes(), None);
+
+        // The first position in view travels too, and a reader with nothing
+        // selected says only that.
+        let top = TextPresence::new(&[1], None).with_viewport_top(Some(&[7, 7]));
+        let back = PresenceBody::decode(&PresenceBody { device: "d".into(), focused: true, text: Some(top), board: None }.encode()).unwrap().text.unwrap();
+        assert_eq!(back.viewport_top_bytes(), Some(vec![7, 7]));
+        assert!(back.has_caret());
+        let reader = TextPresence::new(&[], None).with_viewport_top(Some(&[3]));
+        assert!(!reader.has_caret());
+        assert_eq!(reader.viewport_top_bytes(), Some(vec![3]));
     }
 
     /// A body with a board part comes back as it went; a pointer off the

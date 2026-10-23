@@ -182,6 +182,8 @@ pub(crate) fn start_editing(
     // pane (a peer's edit above its caret) is not the picker's business.
     handle.on_key(move |key| {
         editor_took_focus(store, pane);
+        // Typing (Escape included) takes the pane back from whoever it follows.
+        crate::presence::follow::stop(pane);
         // Typing moves pictures from under their floating controls.
         if untracked(|| store.pane(pane).picture.with(Option::is_some)) {
             crate::links::later(move |store| crate::text_boards::scrolled(store, pane));
@@ -227,6 +229,9 @@ pub(crate) fn start_editing(
             tracing::warn!("an edit to read-only node {node_id} reached the outbound path and was dropped");
             return;
         }
+        // Typing, however it arrives (a key, a paste, an input method), takes
+        // the pane back from whoever it follows.
+        crate::presence::follow::stop(pane);
         let changes = base64::engine::general_purpose::STANDARD.encode(&delta);
         // The note's sheets in this window hold its document too.
         crate::sheets::text_delta(store, store_id, node_id, &delta);

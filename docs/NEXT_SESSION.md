@@ -9,9 +9,16 @@ docs/PRESENCE_CONTRACT.md has Joe's answers:
 - a name per share, and members never see each other's emails.
 
 Waves 0 (names), 1 (transport, who is here: pane initials, tree dots, through every
-link, sealed on encrypted ones), 2 (other people's carets and selections in text) and 3
-(other people's pointers and selections on boards) are built and checked on the local
-stack. See "Built in wave 0/1/2/3" at the end of the contract.
+link, sealed on encrypted ones), 2 (other people's carets and selections in text), 3
+(other people's pointers and selections on boards) and 4 (follow) are built and checked
+on the local stack. See "Built in wave 0..4" at the end of the contract.
+- Wave 4 needed no rinch change. `viewport_top` is found by searching caret rectangles
+  (`presence/text.rs` `first_in_view`: over the textblocks, then inside the one at the
+  top), since rinch has no point hit-test. Following lives in `presence/follow.rs`:
+  `step` judges where the leader is, a following pane opens their document through
+  `link_open` and scrolls with `scroll_into_view_aligned(.., Fraction(0.0))` or takes
+  their board viewport, and a press, key, local edit, hand scroll, Stop or another
+  document in the pane stops it.
 - Wave 3 needed no rinch change. `BoardPresence` (pointer, selection, viewport, and the
   picture's board id for markup in text) rides in the same body, coalesced with the text
   part (`presence::moved`). Arrows and outlines are drawn over the surface like the
@@ -19,15 +26,12 @@ stack. See "Built in wave 0/1/2/3" at the end of the contract.
 - Wave 2 needed no rinch change. A caret is drawn at `caret_rect` in a fixed layer and
   read again on frames, margin reports, caret moves, peers' edits and scrolls.
   Selections are a decoration plugin (`presence/text.rs`).
-- `viewport_top` waits for wave 4 (follow): finding the first position in view needs a
-  point hit-test the editor does not offer.
 
-1115 workspace tests pass (wave 3). Joe answered the open questions (contract "Decisions" 6
+1124 workspace tests pass (wave 4). Joe answered the open questions (contract "Decisions" 6
 and 7): invitation mails keep naming the inviter by email, and the accounts service
 change ships with the next deploy, together with desktop and web.
 
-Next is wave 4 (follow: it reads wave 3's `viewport` and needs wave 2's
-`viewport_top`), then wave 5 (agents), then a release.
+Next is wave 5 (agents: `pimble-mcp` publishes), then a release.
 
 **2026-10-22, end of session: v0.12.6 released, deployed (jkbase v33) and installed
 here** (release commit 4f96e4d, tag `v0.12.6`, rinch `main` 5fbdfb98 in both locks;

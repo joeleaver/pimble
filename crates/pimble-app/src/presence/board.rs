@@ -30,6 +30,8 @@ pub(crate) const MAX_SELECTION: usize = 50;
 #[derive(Debug, Clone, PartialEq)]
 pub struct PointerView {
     pub session: String,
+    /// Who it is ([`super::Person::key`]): a click on the tag follows them.
+    pub key: String,
     /// Its place and color.
     pub style: String,
     /// The name tag's color.

@@ -262,6 +262,10 @@ pub(crate) fn render_board(__scope: &mut RenderScope, store: AppStore, pane: Pan
                 span {
                     class: "pimble-presence-pointer__name",
                     style: p.tag_style.clone(),
+                    onclick: {
+                        let key = p.key.clone();
+                        move || crate::presence::follow::start(store, pane, &key)
+                    },
                     {p.name.clone()}
                 }
             }

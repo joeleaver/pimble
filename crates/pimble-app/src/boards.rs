@@ -1313,6 +1313,7 @@ pub(crate) fn draw_others(store: AppStore, pane: PaneId) {
             if let Some((x, y)) = board.pointer.and_then(|p| on_screen(&view, size, scale, p)) {
                 others.pointers.push(PointerView {
                     session,
+                    key: who.key.clone(),
                     style: format!("left: {x:.1}px; top: {y:.1}px; color: {};", who.color),
                     tag_style: format!("background: {};", who.color),
                     name: who.name,
@@ -1532,6 +1533,30 @@ pub(crate) fn show_rect(store: AppStore, pane: PaneId, rect: Rect) {
         s.view.settle(&picture_source());
     });
     after_change(store, pane);
+}
+
+/// Show what board rectangle `viewport` covers in pane `pane`, as nearly as
+/// its own shape allows (following someone, docs/PRESENCE_CONTRACT.md
+/// section 7). Answers false when the pane has no board session yet.
+pub(crate) fn take_viewport(store: AppStore, pane: PaneId, viewport: &pimble_rpc::BoardRect) -> bool {
+    if viewport.w <= 0.0 || viewport.h <= 0.0 {
+        return true;
+    }
+    let rect = Rect::new(viewport.x, viewport.y, viewport.w, viewport.h);
+    let taken = with_session(pane, |s| {
+        if s.view.size().0 == 0 {
+            return false;
+        }
+        s.fitted = true;
+        s.view.fit(&rect, 0.0);
+        s.view.settle(&picture_source());
+        true
+    });
+    if taken != Some(true) {
+        return false;
+    }
+    after_change(store, pane);
+    true
 }
 
 /// The floating markup control (contract section 5): show or hide every

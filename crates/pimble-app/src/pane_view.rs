@@ -78,6 +78,7 @@ pub(crate) fn split_pane(store: AppStore, pane: PaneId, direction: Direction) ->
 /// Close pane `pane`: its document's session ends and the sibling it was
 /// split from takes its space. The last pane is emptied instead.
 pub(crate) fn close_pane(store: AppStore, pane: PaneId) {
+    crate::presence::follow::stop(pane);
     stop_editing(store, pane);
     store.clear_pane(pane);
     let mut tiling = untracked(|| store.tiling.get());
@@ -270,6 +271,10 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
             onscroll: move |_| {
                 crate::text_boards::scrolled(store, pane);
                 crate::presence::text::redraw_later(store, pane);
+                // What this pane shows is said to whoever follows it, and a
+                // scroll by hand stops it following anyone.
+                crate::presence::moved(store, pane);
+                crate::presence::follow::scrolled(pane);
             },
             // A board node's row dropped on the text goes in as a picture
             // of it (docs/IMAGE_MARKUP_CONTRACT.md section 2).
@@ -302,7 +307,11 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                     span {
                         class: "pimble-presence-caret__flag",
                         style: caret.flag_style.clone(),
-                        title: caret.title.clone(),
+                        title: format!("{} (click to follow)", caret.title),
+                        onclick: {
+                            let key = caret.key.clone();
+                            move || crate::presence::follow::start(store, pane, &key)
+                        },
                         {caret.label.clone()}
                     }
                 }
@@ -337,12 +346,19 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                     if rect.y > 0.0 { " border-top: 1px solid var(--rinch-color-border);" } else { "" },
                 ),
                 None => "display: none;".to_string(),
+            } + &match crate::presence::follow::border_color(pane) {
+                // Following someone: the pane's edge in their color.
+                Some(color) => format!(" box-shadow: inset 0 0 0 2px {color};"),
+                None => String::new(),
             }},
             // A press anywhere in the pane focuses it, and gives it the
             // keyboard even when it already had the focus (a press on its
             // title strip after the keyboard went to the tree).
             onmousedown: move || {
                 PRESS_HEARD.with(|heard| heard.set(true));
+                // A click in the pane takes it back from whoever it follows
+                // (a click on someone's initials then follows them).
+                crate::presence::follow::stop(pane);
                 // A press outside a discussion's message boxes ends typing there.
                 crate::discussions::pane_pressed();
                 focus_pane(store, pane);
@@ -353,6 +369,7 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
             onmouseup: move || {
                 let heard = PRESS_HEARD.with(|heard| heard.replace(false));
                 if EDITOR_KEEPS_ITS_PRESSES && !heard {
+                    crate::presence::follow::stop(pane);
                     focus_pane(store, pane);
                 }
                 // A click on a board embedded in the text opens it; a
@@ -385,8 +402,12 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                         span {
                             key: person.key.clone(),
                             class: "pimble-pane__person",
-                            title: person.title.clone(),
+                            title: format!("{} (click to follow)", person.title),
                             style: format!("background: {};", person.color),
+                            onclick: {
+                                let key = person.key.clone();
+                                move || crate::presence::follow::start(store, pane, &key)
+                            },
                             {person.initials.clone()}
                         }
                     }
@@ -394,6 +415,19 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                         class: "pimble-pane__more",
                         style: {move || if pane_people(store, pane).1 > 0 { "" } else { "display: none;" }},
                         {move || format!("+{}", pane_people(store, pane).1)}
+                    }
+                }
+                // Following someone (docs/PRESENCE_CONTRACT.md section 7):
+                // "Following Sam · Stop", or "Sam left" for a moment.
+                span {
+                    class: "pimble-pane__follow",
+                    style: {move || if crate::presence::follow::strip_text(pane).is_some() { "" } else { "display: none;" }},
+                    span { {move || crate::presence::follow::strip_text(pane).unwrap_or_default()} }
+                    span {
+                        class: "pimble-pane__follow-stop",
+                        style: {move || if crate::presence::follow::border_color(pane).is_some() { "" } else { "display: none;" }},
+                        onclick: move || crate::presence::follow::stop(pane),
+                        " · Stop"
                     }
                 }
                 span {

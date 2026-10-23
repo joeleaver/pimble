@@ -10,9 +10,10 @@
 //!
 //! Where people are in a note's text, their carets and selections, is
 //! [`text`]; where they are on a board, their pointers and selections, is
-//! [`board`].
+//! [`board`]. A pane that follows someone goes where they go ([`follow`]).
 
 pub mod board;
+pub mod follow;
 pub mod text;
 
 use std::cell::{Cell, RefCell};
@@ -107,6 +108,7 @@ pub fn start(store: AppStore) {
         untracked(|| say(store, now));
     });
     heartbeat(store);
+    follow::start_watching(store);
 }
 
 /// Tell everyone what changed since the last time: a goodbye for each pane
@@ -217,6 +219,7 @@ pub(crate) fn received(store: AppStore, frame: &PresenceFrame) {
     });
     text::frames_changed(store);
     board::frames_changed(store);
+    follow::frames_changed(store);
 }
 
 /// Drop the sessions that went quiet, and everything of a store that closed.
@@ -232,6 +235,7 @@ pub(crate) fn prune(store: AppStore) {
         });
         text::frames_changed(store);
         board::frames_changed(store);
+        follow::frames_changed(store);
     }
 }
 
@@ -240,6 +244,7 @@ pub(crate) fn forget_store(store: AppStore, store_id: StoreId) {
     store.presence.update(|all| all.retain(|(s, _), _| *s != store_id));
     text::frames_changed(store);
     board::frames_changed(store);
+    follow::frames_changed(store);
 }
 
 /// The people in `(store_id, node_id)`, tracked: one per account (an agent
@@ -277,7 +282,7 @@ pub fn people_in(store: AppStore, store_id: StoreId, node_id: NodeId) -> Vec<Per
 
 /// What sessions of one person share: their account, an agent apart from
 /// its account, the session itself for someone signed out.
-fn person_key(p: &Present) -> String {
+pub(crate) fn person_key(p: &Present) -> String {
     match &p.who {
         Some(PresenceWho { sub, agent: Some(agent) }) => format!("{sub}/agent/{agent}"),
         Some(PresenceWho { sub, agent: None }) if !sub.is_empty() => sub.clone(),

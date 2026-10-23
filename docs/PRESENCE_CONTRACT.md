@@ -1,6 +1,6 @@
 # Presence contract: who is here, and where
 
-Status: **waves 0 (names), 1 (transport, who is here), 2 (carets and selections in text) and 3 (pointers and selections on boards) built on branch `presence`, 2026-10-22; waves 4 and 5 not built.** Written from Joe's answers that day (listed
+Status: **waves 0 (names), 1 (transport, who is here), 2 (carets and selections in text), 3 (pointers and selections on boards) and 4 (follow) built on branch `presence`, 2026-10-22; wave 5 not built.** Written from Joe's answers that day (listed
 under "Decisions" at the end). The points under "To confirm" are design choices made here
 that Joe has not seen yet. Section 3 (names per share) was added later the same day.
 
@@ -649,3 +649,106 @@ it in the browser.
   text caret's flag.
 - Markup on pictures in text was not tried by hand, and neither were two windows of the
   desktop app or a touch screen.
+
+## Built in wave 4 (follow), 2026-10-22, branch `presence`
+
+**Wire** (`pimble-rpc`):
+- `TextPresence.viewport_top` is filled now: `with_viewport_top`, `viewport_top_bytes`.
+- A pane that may only read its note and has nothing selected says what it shows: a
+  `TextPresence` with an empty `caret` (`has_caret()` false) and only `viewport_top`.
+  Carets are drawn only for frames that have one; the CLI says "reading the text".
+
+**The first position in view** (`presence/text.rs` `viewport_top`, `first_in_view`):
+- rinch has no point hit-test, and none was asked for: `caret_rect` answers enough.
+  The textblocks' content ranges come from `nodes_between`. A binary search over them
+  finds the last one that starts at or above the top of the text's box, then a second
+  search inside it finds the first position whose line reaches below that top.
+  Blocks with no geometry (not laid out) are passed over.
+- It goes out as a sticky index with every frame, and a scroll in the text asks for a
+  frame (`presence::moved`, coalesced as before).
+
+**Following** (`crates/pimble-app/src/presence/follow.rs`, both targets):
+- Per pane, `Follow::{Off, On(Leader), Left(name)}`. A `Leader` is a person key
+  (`person_key`: their account), their name and color, the session followed now and the
+  document the pane was last steered to.
+- `step` is the one judgement of where a leader is:
+  - the session already followed, while it keeps the focus;
+  - else their focused session that spoke last (a person with two devices is followed to
+    the one they use);
+  - `Stay` when none of their sessions has the focus;
+  - `Gone` when they have no session at all.
+- Starting: a click on a person's initials on the strip, on a caret's flag, or on a
+  board pointer's name tag (`follow::start`). An agent's key is refused with "An agent
+  cannot be followed." in the status bar. One's own panes here never reach
+  `AppStore::presence`, so only you-on-another-device can be followed as "you".
+- Going: on every frame that arrives or lapses (`follow::frames_changed`), a following
+  pane opens the leader's document through `link_open` in that pane, as a followed link
+  opens. It then takes their place:
+  - text: `scroll_into_view_aligned(pos, pos, Fraction(0.0))` at `viewport_top` (their
+    caret when a frame has none);
+  - board: their `viewport`, fitted with no margin (`boards::take_viewport`); markup on a
+    picture is not followed, only the note.
+  - A heartbeat that says the same moves nothing (`TAKEN`).
+  - A document not ready yet (no session, the place not merged here) is looked at again
+    every 150 ms, up to 40 times.
+- Stopping:
+  - a press in the pane (`onmousedown`; in the browser also a release no pane heard);
+  - a key in its editor (Escape included) and any local edit (the outbound path: typing
+    through `insertText`, a paste or an input method reaches no `on_key`);
+  - a scroll of its text;
+  - a press, wheel, pinch or key on its board;
+  - Stop;
+  - something else opened in the pane (an effect over `pane_document`), or the pane
+    closed.
+  - Where the following moved the pane itself is "steered" for 800 ms, and a scroll then
+    stops nothing.
+  - A leader with no session for 1.5 s left: the strip says "Sam left" for 3 s. The
+    wait covers a pane moving to another note, which says goodbye in one and hello in the
+    next.
+- Showing: the pane's edge is an inset 2 px `box-shadow` in the leader's color, and the
+  strip says "Following Sam · Stop" ("· Stop" is the link). Initials, flags and tags say
+  "(click to follow)" on hover.
+
+**Tests**:
+- `presence::follow`: the focused session is where they are; of two focused devices the
+  one followed is kept, then the latest; no focused session stays, no session is gone; a
+  session that moved takes the pane there; agents cannot be followed; the text target
+  is `viewport_top`, else the caret.
+- `following_opens_their_document_and_stops_when_told` runs on an `AppStore`:
+  - following opens their note in the pane (`link_open` names it and the pane);
+  - their next note opens too;
+  - a steered scroll stops nothing, and one after the window does;
+  - `stop` ends it, and nothing opens after;
+  - an agent is not followed.
+- `presence::text`: the first position in view, with lines and blocks; and blocks with no
+  geometry, above and below, passed over.
+- `presence_body_round_trips_with_text`: `viewport_top` and a reader's caret-less body.
+
+**Checked on the local stack** (2026-10-22): Alice's desktop app (17491) and Bob's
+browser in the shared "Holiday plans", with two 60-paragraph notes and a whiteboard.
+- Bob clicked Alice's "A" on his strip. It read "Following alice · Stop" with an orange
+  edge.
+- Alice scrolled to paragraph 43 of Itinerary, and Bob's page showed 43 at the top.
+- She opened Hotel and scrolled. Bob's page opened Hotel at 43, then followed her back
+  up to 24.
+- She opened the whiteboard and scrolled it, and Bob's page showed the same region.
+- Bob followed her by her caret's flag in Itinerary. A typed letter stopped it, and her
+  next note did not move his pane.
+- Bob followed her in Hotel and she closed her pane: "alice left", then nothing.
+- The other way round, Alice's desktop followed Bob:
+  - his scroll in Hotel (paragraph 28 on both, a blue edge);
+  - his whiteboard, where the desktop took his viewport.
+- On the desktop, each of these stopped it: a scroll by hand, Escape, Stop, and a click
+  on the board's surface.
+
+**Gaps:**
+- A follower lands with the leader's first line 16 px below its top (rinch's `Fraction`
+  margin), and on a window of another width the lines wrap differently, so "the same
+  place" is the same first line, not the same pixels.
+- Escape while the keyboard is in the explorer does not stop a pane following: only
+  keys in the pane do.
+- Following someone marking up a picture in a note follows the note, not their
+  view of the picture.
+- The browser's `type` from the automation tool inserts text without key events, which
+  is how the outbound stop was found. Real key presses reach `on_key` there too.
+

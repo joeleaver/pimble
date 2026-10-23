@@ -41,6 +41,8 @@ pub(crate) const MARGIN_KEY: &str = "presence";
 #[derive(Debug, Clone, PartialEq)]
 pub struct Caret {
     pub session: String,
+    /// Who it is ([`super::Person::key`]): a click on the flag follows them.
+    pub key: String,
     pub class: &'static str,
     /// Its place and color, in the window frame.
     pub style: String,
@@ -75,8 +77,10 @@ thread_local! {
 // ── This window's panes ──────────────────────────────────────────────────
 
 /// Where pane `pane`'s editor is, as a frame says it: its caret and
-/// selection in the note it holds, `None` when it holds none, is not
-/// collaborating, or may only read it and has nothing selected.
+/// selection in the note it holds, and the first position in view (what a
+/// follower scrolls to); `None` when it holds none or is not collaborating.
+/// A pane that may only read the note and has nothing selected says only
+/// what it shows.
 pub(crate) fn mine(store: AppStore, pane: PaneId) -> Option<TextPresence> {
     let state = store.pane(pane);
     let active = untracked(|| state.active_edit.get())?;
@@ -89,12 +93,74 @@ pub(crate) fn mine(store: AppStore, pane: PaneId) -> Option<TextPresence> {
     }
     let selection = handle.selection();
     let (head, anchor) = (selection.head(), selection.anchor());
+    let top = viewport_top(pane, &handle).and_then(|pos| handle.collab_sticky_index_with(Pos(pos), StickyAssoc::After));
     if head == anchor && !store.node_access(active.store_id, active.node_id).allows_write() {
-        return None;
+        return top.map(|top| TextPresence::new(&[], None).with_viewport_top(Some(&top)));
     }
     let caret = handle.collab_sticky_index_with(head, StickyAssoc::After)?;
     let anchor = if anchor == head { None } else { handle.collab_sticky_index_with(anchor, StickyAssoc::After) };
-    Some(TextPresence::new(&caret, anchor.as_deref()))
+    Some(TextPresence::new(&caret, anchor.as_deref()).with_viewport_top(top.as_deref()))
+}
+
+/// The first position of pane `pane`'s note in view: on the first line whose
+/// bottom is below the top of the text's box.
+fn viewport_top(pane: PaneId, handle: &crate::rinch_editor::EditorHandle) -> Option<usize> {
+    let (_, top, _, _) = text_rect(pane)?;
+    let doc = handle.doc();
+    let mut blocks = Vec::new();
+    doc.nodes_between(0, doc.content_size(), &mut |node, pos, _| {
+        if node.is_textblock() {
+            blocks.push((pos + 1, pos + 1 + node.content_size()));
+            return false;
+        }
+        true
+    });
+    first_in_view(&blocks, top, |pos| handle.caret_rect(Pos(pos)).map(|r| (r.y, r.height)))
+}
+
+/// The first position on a line reaching below `top`, of the textblocks
+/// `blocks` (each its content's `(start, end)`, in document order), where
+/// `rect` says the top and height of the line a position is drawn on, or
+/// `None` for one with no geometry (a block not laid out). The editor offers
+/// no hit-test for a point, so this searches by caret rectangles: over the
+/// blocks for the last one starting at or above `top`, then inside it for
+/// the first of its lines in view. `None` when nothing has geometry.
+pub(crate) fn first_in_view(blocks: &[(usize, usize)], top: f32, rect: impl Fn(usize) -> Option<(f32, f32)>) -> Option<usize> {
+    // Whether block `i`, or the first block after it with geometry, starts
+    // below `top`: false up to some block and true from it on.
+    let starts_below = |i: usize| -> bool {
+        blocks[i..].iter().find_map(|&(start, _)| rect(start)).is_none_or(|(y, _)| y > top)
+    };
+    let (mut lo, mut hi) = (0, blocks.len());
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if starts_below(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    // `lo` is the first block that starts below; the one that holds `top`
+    // is the last before it with geometry.
+    let first_below = blocks[lo..].iter().find(|&&(start, _)| rect(start).is_some()).map(|&(start, _)| start);
+    let Some(&(start, end)) = blocks[..lo].iter().rev().find(|&&(start, _)| rect(start).is_some()) else {
+        return first_below;
+    };
+    let reaches = |pos: usize| rect(pos).is_some_and(|(y, h)| y + h > top);
+    if !reaches(end) {
+        // All of it is above: the next block, or (scrolled past the end) its end.
+        return first_below.or(Some(end));
+    }
+    let (mut lo, mut hi) = (start, end);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if reaches(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Some(lo)
 }
 
 // ── Everyone else ────────────────────────────────────────────────────────
@@ -229,7 +295,7 @@ fn redraw(store: AppStore, pane: PaneId) {
     };
     let sessions: Vec<super::Present> = untracked(|| store.presence.with(|all| all.get(&(active.store_id, active.node_id)).cloned().unwrap_or_default()))
         .into_iter()
-        .filter(|p| p.text.is_some())
+        .filter(|p| p.text.as_ref().is_some_and(TextPresence::has_caret))
         .collect();
     let mut bytes: Vec<Vec<u8>> = Vec::new();
     let mut texts: Vec<(String, bool)> = Vec::new();
@@ -285,6 +351,7 @@ fn redraw(store: AppStore, pane: PaneId) {
         let title = if p.device.is_empty() { who.name.clone() } else { format!("{}, on {}", who.name, p.device) };
         drawn.push(Caret {
             session: p.session.clone(),
+            key: who.key.clone(),
             class: if placed.dim { "pimble-presence-caret pimble-presence-caret--dim" } else { "pimble-presence-caret" },
             style: format!("left: {:.1}px; top: {:.1}px; height: {:.1}px; background: {};", rect.x - 1.0, rect.y, rect.height.max(1.0), who.color),
             flag_style: format!("background: {};", who.color),
@@ -372,6 +439,50 @@ mod tests {
         assert_eq!(placed[0], Some(Placed { caret: 5, dim: true, selection: Some((3, 5)) }));
         assert_eq!(placed[1], Some(Placed { caret: 12, dim: true, selection: None }));
         assert_eq!(placed[2], None);
+    }
+
+    /// Lines 20 px tall from y = 100, a block per paragraph: positions 1..=10
+    /// on two lines (1..=5 and 6..=10), 12..=14 on one, 16..=20 on one.
+    fn lines(pos: usize) -> Option<(f32, f32)> {
+        let line = match pos {
+            1..=5 => 0,
+            6..=10 => 1,
+            12..=14 => 2,
+            16..=20 => 3,
+            _ => return None,
+        };
+        Some((100.0 + 20.0 * line as f32, 20.0))
+    }
+    const BLOCKS: [(usize, usize); 3] = [(1, 10), (12, 14), (16, 20)];
+
+    #[test]
+    fn the_first_position_in_view_is_on_the_first_line_reaching_below_the_top() {
+        // Not scrolled: the start.
+        assert_eq!(first_in_view(&BLOCKS, 90.0, lines), Some(1));
+        // The top halfway down the first line: still that line.
+        assert_eq!(first_in_view(&BLOCKS, 110.0, lines), Some(1));
+        // Past the first paragraph's first line: its second line.
+        assert_eq!(first_in_view(&BLOCKS, 125.0, lines), Some(6));
+        // Exactly at the bottom of its second line: the next paragraph.
+        assert_eq!(first_in_view(&BLOCKS, 140.0, lines), Some(12));
+        assert_eq!(first_in_view(&BLOCKS, 165.0, lines), Some(16));
+        // Scrolled past the end: the end.
+        assert_eq!(first_in_view(&BLOCKS, 500.0, lines), Some(20));
+        // Nothing laid out.
+        assert_eq!(first_in_view(&BLOCKS, 0.0, |_| None), None);
+    }
+
+    #[test]
+    fn blocks_with_no_geometry_are_passed_over() {
+        // The first paragraph is not laid out (virtualized above the view).
+        let rect = |pos: usize| if pos <= 10 { None } else { lines(pos) };
+        assert_eq!(first_in_view(&BLOCKS, 130.0, rect), Some(12));
+        assert_eq!(first_in_view(&BLOCKS, 150.0, rect), Some(12));
+        assert_eq!(first_in_view(&BLOCKS, 170.0, rect), Some(16));
+        // The last one is not laid out either.
+        let rect = |pos: usize| if pos >= 16 { None } else { lines(pos) };
+        assert_eq!(first_in_view(&BLOCKS, 125.0, rect), Some(6));
+        assert_eq!(first_in_view(&BLOCKS, 165.0, rect), Some(14));
     }
 
     #[test]

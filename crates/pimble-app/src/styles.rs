@@ -75,7 +75,19 @@ pub(crate) const APP_CSS: &str = "
     font-size: 9px;
     font-weight: 600;
     color: var(--rinch-color-white, #ffffff);
-    cursor: default;
+    cursor: pointer;
+}
+
+/* Following someone, on a pane strip (presence/follow.rs). */
+.pimble-pane__follow {
+    flex-shrink: 0;
+    white-space: nowrap;
+    color: var(--rinch-color-text);
+}
+
+.pimble-pane__follow-stop {
+    cursor: pointer;
+    color: var(--rinch-primary-color);
 }
 
 .pimble-pane__more {
@@ -1802,6 +1814,8 @@ pub(crate) const APP_CSS: &str = "
 
 .pimble-presence-pointer__name {
     position: absolute;
+    pointer-events: auto;
+    cursor: pointer;
     left: 12px;
     top: 14px;
     padding: 0 5px;
@@ -1947,6 +1961,7 @@ pub(crate) const APP_CSS: &str = "
     font-weight: 600;
     white-space: nowrap;
     pointer-events: auto;
+    cursor: pointer;
 }
 
 .pimble-presence--c0 { background-color: rgba(229, 57, 53, 0.22); }

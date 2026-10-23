@@ -883,7 +883,8 @@ fn presence_line(frame: &pimble_rpc::PresenceFrame) -> String {
             .map(|b| {
                 let text = match &b.text {
                     Some(t) if t.anchor.is_some() => ", a selection in the text",
-                    Some(_) => ", a caret in the text",
+                    Some(t) if t.has_caret() => ", a caret in the text",
+                    Some(_) => ", reading the text",
                     None => "",
                 };
                 let board = match &b.board {
