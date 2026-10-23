@@ -1642,9 +1642,11 @@ pub(crate) const APP_CSS: &str = "
     color: var(--rinch-color-dimmed);
 }
 
-/* An inline-block, not a plain inline span: rinch draws a plain inline span's
-   padding without moving its text, so the pill's left end hung outside its cell
-   and was cut off wherever the cell clipped it. */
+/* An inline-block, not a plain inline span. rinch #1426 makes inline padding
+   take room on its line, but a cell's ellipsis still drops a plain span's
+   background and padding when the text does not fit (reported to rinch
+   2026-10-23), so a narrow cell would show no pill at all. An inline-block is
+   clipped by its cell instead. */
 .pimble-sheet__chip {
     display: inline-block;
     line-height: 18px;
