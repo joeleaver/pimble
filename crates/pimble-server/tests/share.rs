@@ -239,8 +239,15 @@ async fn members_go_by_the_names_they_choose_and_see_no_emails() {
     alice.cloud_set_display_name("Alice A.").await.expect("Alice names herself");
 
     // Each device's people say so, and Bob's is kept beside the store.
+    // `cloudPeople` answers what was kept at once and asks again beside the
+    // answer, so Alice's new name arrives on the next ask.
+    let alice_id = env.user_id(ALICE.0);
+    let learned = wait_until(Duration::from_secs(10), || async {
+        bob.cloud_people(store_id).await.unwrap().name_of(&alice_id, Some(shared)) == Some("Alice A.")
+    })
+    .await;
+    assert!(learned, "Bob's device learns Alice's new name");
     let people = bob.cloud_people(store_id).await.unwrap();
-    assert_eq!(people.name_of(&env.user_id(ALICE.0), Some(shared)), Some("Alice A."), "{people:?}");
     let scope = people.scopes.iter().find(|s| s.root == Some(shared)).expect("the share's people");
     assert_eq!((scope.my_name.as_str(), scope.my_name_chosen), ("Bobby", true));
     assert_eq!(people.name_of(&env.user_id(BOB.0), Some(shared)), Some("Bobby"));

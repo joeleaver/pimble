@@ -820,40 +820,54 @@ pub async fn process_command(
             None
         }
 
-        // Names (docs/PRESENCE_CONTRACT.md section 3).
+        // Names (docs/PRESENCE_CONTRACT.md section 3). Each of these asks
+        // the accounts service over the network, so each runs beside the
+        // command loop and answers when it can: commands are taken one at a
+        // time, and a store opening at start was waiting seconds behind
+        // them.
         BackendCommand::CloudListShares => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = client.clone() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::Shares, message: "Not connected".into() });
             };
-            Some(shares_listed(c).await)
+            answer_later(event_tx, signal_ui, async move { Some(shares_listed(&c).await) });
+            None
         }
         BackendCommand::CloudSetDisplayName { name } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = client.clone() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::Shares, message: "Not connected".into() });
             };
-            match c.cloud_set_display_name(&name).await {
-                Ok(()) => Some(shares_listed(c).await),
-                Err(e) => Some(BackendEvent::CloudError { op: CloudOp::Shares, message: e.to_string() }),
-            }
+            answer_later(event_tx, signal_ui, async move {
+                Some(match c.cloud_set_display_name(&name).await {
+                    Ok(()) => shares_listed(&c).await,
+                    Err(e) => BackendEvent::CloudError { op: CloudOp::Shares, message: e.to_string() },
+                })
+            });
+            None
         }
         BackendCommand::CloudSetShareName { store_id, root, name } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = client.clone() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::Shares, message: "Not connected".into() });
             };
-            match c.cloud_set_share_name(store_id, root, &name).await {
-                Ok(()) => Some(shares_listed(c).await),
-                Err(e) => Some(BackendEvent::CloudError { op: CloudOp::Shares, message: e.to_string() }),
-            }
+            answer_later(event_tx, signal_ui, async move {
+                Some(match c.cloud_set_share_name(store_id, root, &name).await {
+                    Ok(()) => shares_listed(&c).await,
+                    Err(e) => BackendEvent::CloudError { op: CloudOp::Shares, message: e.to_string() },
+                })
+            });
+            None
         }
         BackendCommand::GetPeople { store_id } => {
-            let c = client.as_ref()?;
-            match c.cloud_people(store_id).await {
-                Ok(people) => Some(BackendEvent::PeopleLoaded { store_id, people }),
-                Err(e) => {
-                    tracing::debug!("people of store {store_id} not loaded: {e}");
-                    None
+            let c = client.clone()?;
+            answer_later(event_tx, signal_ui, async move {
+                match c.cloud_people(store_id).await {
+                    Ok(people) => Some(BackendEvent::PeopleLoaded { store_id, people }),
+                    Err(e) => {
+                        tracing::debug!("people of store {store_id} not loaded: {e}");
+                        None
+                    }
                 }
-            }
+            });
+            None
         }
 
         // Sharing from this computer (docs/RELAY_CONTRACT.md). The link's
@@ -1090,3 +1104,53 @@ async fn shares_listed(c: &PimbleClient) -> BackendEvent {
     }
 }
 
+
+/// Run `answer` beside the command loop and send what it answers, for a
+/// command that waits on the network and that nothing after it waits for.
+#[cfg(feature = "native")]
+fn answer_later<F>(event_tx: &Sender<BackendEvent>, signal_ui: &std::sync::Arc<dyn Fn() + Send + Sync>, answer: F)
+where
+    F: Future<Output = Option<BackendEvent>> + Send + 'static,
+{
+    send_later(event_tx, signal_ui, answer)
+}
+
+#[cfg(not(feature = "native"))]
+fn answer_later<F>(event_tx: &Sender<BackendEvent>, signal_ui: &std::sync::Arc<dyn Fn() + Send + Sync>, answer: F)
+where
+    F: Future<Output = Option<BackendEvent>> + 'static,
+{
+    send_later(event_tx, signal_ui, answer)
+}
+
+#[cfg(feature = "native")]
+fn send_later<F>(event_tx: &Sender<BackendEvent>, signal_ui: &std::sync::Arc<dyn Fn() + Send + Sync>, answer: F)
+where
+    F: Future<Output = Option<BackendEvent>> + Send + 'static,
+{
+    let tx = event_tx.clone();
+    let signal = signal_ui.clone();
+    spawn_task(async move {
+        if let Some(event) = answer.await {
+            if tx.try_send(event).is_ok() {
+                signal();
+            }
+        }
+    });
+}
+
+#[cfg(not(feature = "native"))]
+fn send_later<F>(event_tx: &Sender<BackendEvent>, signal_ui: &std::sync::Arc<dyn Fn() + Send + Sync>, answer: F)
+where
+    F: Future<Output = Option<BackendEvent>> + 'static,
+{
+    let tx = event_tx.clone();
+    let signal = signal_ui.clone();
+    spawn_task(async move {
+        if let Some(event) = answer.await {
+            if tx.try_send(event).is_ok() {
+                signal();
+            }
+        }
+    });
+}

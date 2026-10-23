@@ -40,11 +40,20 @@ impl CloudError {
 
 pub type Result<T> = std::result::Result<T, CloudError>;
 
+/// One client per runtime for every call to the accounts service, so its
+/// connections are kept and reused: a new client per call paid a TLS
+/// handshake each time. Per runtime, because a client's pooled connections
+/// belong to the runtime that opened them (tests run one runtime each).
 fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .expect("a reqwest client with only a timeout set always builds")
+    static CLIENTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<tokio::runtime::Id, reqwest::Client>>> = std::sync::OnceLock::new();
+    let build = || {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .expect("a reqwest client with only a timeout set always builds")
+    };
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else { return build() };
+    CLIENTS.get_or_init(Default::default).lock().unwrap().entry(runtime.id()).or_insert_with(build).clone()
 }
 
 async fn finish<T: for<'de> Deserialize<'de>>(url: &str, resp: reqwest::Response) -> Result<T> {

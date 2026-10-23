@@ -3409,9 +3409,17 @@ impl PimbleApiServer for RpcHandler {
 
     async fn cloud_people(&self, ext: &Extensions, request: CloudPeopleRequest) -> Result<StorePeople, ErrorObjectOwned> {
         authorize_service_only(&principal_of(ext), "cloudPeople")?;
-        // Asked again now where it can be (a refresh that changes it tells
-        // the subscribers too), what was kept where it cannot.
-        Ok(crate::people::refresh(self, request.store_id).await)
+        // What was kept, at once; then asked again beside the answer, and a
+        // refresh that changes anything tells the subscribers
+        // (`PeopleChanged`), who ask here again. Waiting on the accounts
+        // service here held up a store's opening by seconds.
+        let kept = crate::people::cached(self, request.store_id).await;
+        let handler = self.clone();
+        let store_id = request.store_id;
+        tokio::spawn(async move {
+            crate::people::refresh(&handler, store_id).await;
+        });
+        Ok(kept)
     }
 
     async fn cloud_add_hosted_store(&self, ext: &Extensions, request: CloudAddHostedStoreRequest) -> Result<OpenStoreResponse, ErrorObjectOwned> {
