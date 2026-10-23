@@ -13,6 +13,13 @@ answer 200; `/rpc`, `/api/v1/me` and `/api/v1/me/shares` answer 401; the hosted 
 opened its three stores and a relay tunnel reconnected. Branch `presence` is merged.
 What is left of presence is the "Gaps" lists in the contract's "Built in wave N" sections.
 
+With the next release, move rinch to `main` a269119d or later: #1764 (PR #1812) makes
+DropdownMenu and Popover dropdowns flip above their trigger when there is more room there,
+shift back inside the viewport (8 px margin), and scroll only when neither side fits; it
+keeps inline max-height/width. Check Pimble's dropdowns near window edges then. #1426
+(inline padding, the link-pill workaround) is being built by the Rinch session, which says
+it will report when it lands.
+
 **2026-10-22, latest: presence is complete, all six waves built on branch `presence`.**
 Wave 5 (agents) is built and checked: `pimble-mcp` publishes a frame after every tool call
 that reads or writes a node (one session per node, `agent:{id}:{node}`, 15 s, no
