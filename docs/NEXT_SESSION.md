@@ -14,15 +14,16 @@ opened its three stores and a relay tunnel reconnected. Branch `presence` is mer
 What is left of presence is the "Gaps" lists in the contract's "Built in wave N" sections.
 
 **Branch `rinch-bump` (not merged; merging it changes what ships, so it goes with the next
-release):** rinch `main` 5fa0eefb in both locks (the Rinch session's pin): #1764 (dropdowns
-flip and shift inside the window), #1426 (inline padding takes room on its line), #1762 and
-#1815/#1817. 1128 tests pass, the web build checks. Checked in an isolated app: link pills in
-sheet cells render correctly as plain inline when they fit, and the board's Export dropdown
-opens whole. The flip at a window edge was not exercised (Wayland: no scripted resize).
-`.pimble-sheet__chip` stays `inline-block`: with a plain inline span, a cell's ellipsis drops
-the pill's background and padding (rinch #1100, in progress; the Rinch session will say when
-it is on main, then retry). Still open in rinch: #1835 (RTL caret at a padded edge), #1833
-(a code mark split by another mark draws as two pills; no fix soon).
+release):** rinch `main` cbf6655b in both locks: #1764 (dropdowns flip and shift inside the
+window), #1426 (inline padding takes room on its line), #1100 (an ellipsis is cut at paint
+time, so inline styling survives), #1833 (inline code split by another mark is one pill),
+#1762, #1815/#1817. `.pimble-sheet__chip` is a plain inline span again: checked in an
+isolated app, a link pill that fits its sheet cell is unchanged and one too long for it is
+clipped at the cell's edge with the "…" inside, as in Chrome. The board's Export dropdown
+opens whole; the flip at a window edge was not exercised (Wayland: no scripted resize).
+1128 tests pass, the web build checks. Known in rinch: a pill sits about 3 px higher than in
+Chrome (no line strut, #1463 family); a click past an ellipsis can still hit a hidden chip
+(#1864); RTL caret at a padded edge (#1835).
 
 **2026-10-22, latest: presence is complete, all six waves built on branch `presence`.**
 Wave 5 (agents) is built and checked: `pimble-mcp` publishes a frame after every tool call
