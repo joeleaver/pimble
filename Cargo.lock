@@ -6328,7 +6328,7 @@ dependencies = [
 [[package]]
 name = "rinch"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5fa0eefbac365803cd0fe9b2cd6c6eec1050d0ce"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#cbf6655b858cb00fe23c1ea822eeeda639b2a723"
 dependencies = [
  "anyrender",
  "anyrender_vello",
@@ -6376,7 +6376,7 @@ dependencies = [
 [[package]]
 name = "rinch-android"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5fa0eefbac365803cd0fe9b2cd6c6eec1050d0ce"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#cbf6655b858cb00fe23c1ea822eeeda639b2a723"
 dependencies = [
  "android-activity",
  "base64 0.22.1",
@@ -6389,7 +6389,7 @@ dependencies = [
 [[package]]
 name = "rinch-clipboard"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5fa0eefbac365803cd0fe9b2cd6c6eec1050d0ce"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#cbf6655b858cb00fe23c1ea822eeeda639b2a723"
 dependencies = [
  "arboard",
  "js-sys",
@@ -6402,7 +6402,7 @@ dependencies = [
 [[package]]
 name = "rinch-components"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5fa0eefbac365803cd0fe9b2cd6c6eec1050d0ce"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#cbf6655b858cb00fe23c1ea822eeeda639b2a723"
 dependencies = [
  "rinch-core",
  "rinch-macros",
@@ -6414,7 +6414,7 @@ dependencies = [
 [[package]]
 name = "rinch-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5fa0eefbac365803cd0fe9b2cd6c6eec1050d0ce"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#cbf6655b858cb00fe23c1ea822eeeda639b2a723"
 dependencies = [
  "thiserror 1.0.69",
  "tracing",
@@ -6424,7 +6424,7 @@ dependencies = [
 [[package]]
 name = "rinch-debug"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5fa0eefbac365803cd0fe9b2cd6c6eec1050d0ce"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#cbf6655b858cb00fe23c1ea822eeeda639b2a723"
 dependencies = [
  "serde",
  "serde_json",
@@ -6434,7 +6434,7 @@ dependencies = [
 [[package]]
 name = "rinch-dom"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5fa0eefbac365803cd0fe9b2cd6c6eec1050d0ce"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#cbf6655b858cb00fe23c1ea822eeeda639b2a723"
 dependencies = [
  "app_units",
  "atomic_refcell",
@@ -6475,7 +6475,7 @@ dependencies = [
 [[package]]
 name = "rinch-editable"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5fa0eefbac365803cd0fe9b2cd6c6eec1050d0ce"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#cbf6655b858cb00fe23c1ea822eeeda639b2a723"
 dependencies = [
  "rinch-words",
 ]
@@ -6483,7 +6483,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-collab"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5fa0eefbac365803cd0fe9b2cd6c6eec1050d0ce"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#cbf6655b858cb00fe23c1ea822eeeda639b2a723"
 dependencies = [
  "rinch-editor-core",
  "thiserror 1.0.69",
@@ -6493,7 +6493,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-core"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5fa0eefbac365803cd0fe9b2cd6c6eec1050d0ce"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#cbf6655b858cb00fe23c1ea822eeeda639b2a723"
 dependencies = [
  "pulldown-cmark",
  "regex",
@@ -6504,7 +6504,7 @@ dependencies = [
 [[package]]
 name = "rinch-editor-view"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5fa0eefbac365803cd0fe9b2cd6c6eec1050d0ce"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#cbf6655b858cb00fe23c1ea822eeeda639b2a723"
 dependencies = [
  "rinch-core",
  "rinch-editor-collab",
@@ -6515,7 +6515,7 @@ dependencies = [
 [[package]]
 name = "rinch-macros"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5fa0eefbac365803cd0fe9b2cd6c6eec1050d0ce"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#cbf6655b858cb00fe23c1ea822eeeda639b2a723"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6525,7 +6525,7 @@ dependencies = [
 [[package]]
 name = "rinch-platform"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5fa0eefbac365803cd0fe9b2cd6c6eec1050d0ce"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#cbf6655b858cb00fe23c1ea822eeeda639b2a723"
 dependencies = [
  "peniko",
  "vello",
@@ -6535,7 +6535,7 @@ dependencies = [
 [[package]]
 name = "rinch-renderer"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5fa0eefbac365803cd0fe9b2cd6c6eec1050d0ce"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#cbf6655b858cb00fe23c1ea822eeeda639b2a723"
 dependencies = [
  "rinch-core",
  "thiserror 1.0.69",
@@ -6547,7 +6547,7 @@ dependencies = [
 [[package]]
 name = "rinch-tabler-icons"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5fa0eefbac365803cd0fe9b2cd6c6eec1050d0ce"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#cbf6655b858cb00fe23c1ea822eeeda639b2a723"
 dependencies = [
  "heck 0.5.0",
  "rinch-core",
@@ -6559,12 +6559,12 @@ dependencies = [
 [[package]]
 name = "rinch-theme"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5fa0eefbac365803cd0fe9b2cd6c6eec1050d0ce"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#cbf6655b858cb00fe23c1ea822eeeda639b2a723"
 
 [[package]]
 name = "rinch-web"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5fa0eefbac365803cd0fe9b2cd6c6eec1050d0ce"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#cbf6655b858cb00fe23c1ea822eeeda639b2a723"
 dependencies = [
  "js-sys",
  "rinch",
@@ -6580,7 +6580,7 @@ dependencies = [
 [[package]]
 name = "rinch-words"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/rinch.git?branch=main#5fa0eefbac365803cd0fe9b2cd6c6eec1050d0ce"
+source = "git+https://github.com/joeleaver/rinch.git?branch=main#cbf6655b858cb00fe23c1ea822eeeda639b2a723"
 dependencies = [
  "icu_segmenter",
  "regex",
