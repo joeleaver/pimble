@@ -1768,6 +1768,50 @@ pub(crate) const APP_CSS: &str = "
     pointer-events: none;
 }
 
+/* Someone else's selection: their color, a little apart from one's own. */
+.pimble-board__outline--other {
+    border-width: 2px;
+    margin: -2px 0 0 -2px;
+    padding: 1px;
+}
+
+/* Someone else's pointer on a board: an arrow in their color, its tip at
+   the point, and their name beside it. */
+.pimble-presence-pointer {
+    position: absolute;
+    z-index: 4;
+    pointer-events: none;
+}
+
+.pimble-presence-pointer__arrow {
+    position: absolute;
+    left: -3px;
+    top: -3px;
+    width: 18px;
+    height: 18px;
+    display: block;
+}
+
+.pimble-presence-pointer__arrow svg {
+    width: 18px;
+    height: 18px;
+    fill: currentColor;
+    stroke: #ffffff;
+    stroke-width: 1px;
+}
+
+.pimble-presence-pointer__name {
+    position: absolute;
+    left: 12px;
+    top: 14px;
+    padding: 0 5px;
+    border-radius: 3px;
+    color: #ffffff;
+    font-size: 11px;
+    line-height: 16px;
+    white-space: nowrap;
+}
+
 .pimble-board__selection {
     position: absolute;
     border: 1px dashed var(--rinch-primary-color-5);

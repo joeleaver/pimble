@@ -780,9 +780,9 @@ pub async fn process_command(
 
         // Presence (docs/PRESENCE_CONTRACT.md). A frame that is not taken
         // (an older server, a store not readable) is no one's business.
-        BackendCommand::PublishPresence { store_id, node_id, pane, focused, left, text } => {
+        BackendCommand::PublishPresence { store_id, node_id, pane, focused, left, text, board } => {
             let c = client.as_ref()?;
-            let frame = crate::presence::frame_for(client_id, store_id, node_id, pane, focused, left, text);
+            let frame = crate::presence::frame_for(client_id, store_id, node_id, pane, focused, left, crate::presence::Whereabouts { text, board });
             if let Err(e) = c.publish_presence(frame, client_id).await {
                 tracing::debug!("presence in {store_id} not taken: {e}");
             }

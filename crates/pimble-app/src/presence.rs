@@ -9,18 +9,20 @@
 //! its session says goodbye or goes quiet. Nothing here is stored.
 //!
 //! Where people are in a note's text, their carets and selections, is
-//! [`text`].
+//! [`text`]; where they are on a board, their pointers and selections, is
+//! [`board`].
 
+pub mod board;
 pub mod text;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use pimble_core::{NodeId, StoreId};
-use pimble_rpc::{PresenceBody, PresenceFrame, PresenceWho, TextPresence, PRESENCE_HEARTBEAT_MS};
+use pimble_rpc::{BoardPresence, PresenceBody, PresenceFrame, PresenceWho, TextPresence, PRESENCE_HEARTBEAT_MS};
 use rinch::prelude::*;
 
-use crate::panes::PaneId;
+use crate::panes::{PaneId, MAX_PANES};
 use crate::protocol::BackendCommand;
 use crate::state::AppStore;
 
@@ -33,6 +35,8 @@ pub struct Present {
     pub focused: bool,
     /// Where it is in the note's text.
     pub text: Option<TextPresence>,
+    /// Where it is on the board.
+    pub board: Option<BoardPresence>,
     /// When its caret last moved (milliseconds since the epoch): its flag
     /// names it for a while after.
     pub moved_ms: f64,
@@ -66,9 +70,26 @@ pub struct Identity {
     pub color_index: usize,
 }
 
+/// Where a pane is in the document it holds, as its frame says it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Whereabouts {
+    pub text: Option<TextPresence>,
+    pub board: Option<BoardPresence>,
+}
+
+/// The least time between two frames of one pane that moved (a caret, a
+/// pointer, a pan).
+const COALESCE_MS: f64 = 50.0;
+
 thread_local! {
     /// What each pane last said it holds: `(store, node, focused)`.
     static SAID: RefCell<HashMap<PaneId, (StoreId, NodeId, bool)>> = RefCell::new(HashMap::new());
+    /// Where each pane last said it is.
+    static SENT: RefCell<[Whereabouts; MAX_PANES]> = RefCell::new(Default::default());
+    /// When each pane last said it.
+    static SENT_MS: [Cell<f64>; MAX_PANES] = const { [Cell::new(0.0), Cell::new(0.0), Cell::new(0.0), Cell::new(0.0)] };
+    /// A pane moved and its frame waits for the coalescing gap.
+    static OWED: [Cell<bool>; MAX_PANES] = const { [Cell::new(false), Cell::new(false), Cell::new(false), Cell::new(false)] };
 }
 
 // ── This window's panes ──────────────────────────────────────────────────
@@ -95,25 +116,54 @@ fn say(store: AppStore, now: HashMap<PaneId, (StoreId, NodeId, bool)>) {
     let before = SAID.with(|said| said.borrow().clone());
     for (pane, (store_id, node_id, _)) in &before {
         if now.get(pane).is_none_or(|(s, n, _)| (s, n) != (store_id, node_id)) {
-            store.send(BackendCommand::PublishPresence { store_id: *store_id, node_id: *node_id, pane: pane.index(), focused: false, left: true, text: None });
-            text::forget_sent(*pane);
+            store.send(BackendCommand::PublishPresence { store_id: *store_id, node_id: *node_id, pane: pane.index(), focused: false, left: true, text: None, board: None });
+            SENT.with(|s| s.borrow_mut()[pane.index()] = Whereabouts::default());
         }
     }
     SAID.with(|said| *said.borrow_mut() = now.clone());
     for (pane, held) in &now {
         if before.get(pane) != Some(held) {
             let (store_id, node_id, focused) = *held;
-            let text = text::take_mine(store, *pane);
-            store.send(BackendCommand::PublishPresence { store_id, node_id, pane: pane.index(), focused, left: false, text });
+            let at = take_mine(store, *pane);
+            store.send(BackendCommand::PublishPresence { store_id, node_id, pane: pane.index(), focused, left: false, text: at.text, board: at.board });
         }
     }
 }
 
-/// Say again where pane `pane` is, its text part being `text` (its caret
-/// moved): nothing when the pane holds no document.
-pub(crate) fn publish_text(store: AppStore, pane: PaneId, text: Option<TextPresence>) {
-    let Some((store_id, node_id, focused)) = SAID.with(|said| said.borrow().get(&pane).copied()) else { return };
-    store.send(BackendCommand::PublishPresence { store_id, node_id, pane: pane.index(), focused, left: false, text });
+/// Where pane `pane` is: in its note's text, or on its board.
+fn mine(store: AppStore, pane: PaneId) -> Whereabouts {
+    Whereabouts { text: text::mine(store, pane), board: crate::boards::presence_mine(store, pane) }
+}
+
+/// Pane `pane`'s whereabouts as its next frame carries them, remembered as
+/// said.
+fn take_mine(store: AppStore, pane: PaneId) -> Whereabouts {
+    let at = mine(store, pane);
+    SENT.with(|s| s.borrow_mut()[pane.index()] = at.clone());
+    SENT_MS.with(|s| s[pane.index()].set(crate::boards::now_ms()));
+    at
+}
+
+/// Pane `pane` moved in its document (a caret or selection, a pointer, a
+/// pan, or a note opened): a frame, coalesced, when what it says changed.
+/// Read a turn later, never from inside the callback that tells.
+pub(crate) fn moved(store: AppStore, pane: PaneId) {
+    if OWED.with(|o| o[pane.index()].replace(true)) {
+        return;
+    }
+    let since = crate::boards::now_ms() - SENT_MS.with(|s| s[pane.index()].get());
+    let wait = (COALESCE_MS - since).max(0.0) as u32;
+    rinch::core::reactive::unowned(|| {
+        set_timeout(wait, move || {
+            OWED.with(|o| o[pane.index()].set(false));
+            if SENT.with(|s| s.borrow()[pane.index()] == mine(store, pane)) {
+                return;
+            }
+            let Some((store_id, node_id, focused)) = SAID.with(|said| said.borrow().get(&pane).copied()) else { return };
+            let at = take_mine(store, pane);
+            store.send(BackendCommand::PublishPresence { store_id, node_id, pane: pane.index(), focused, left: false, text: at.text, board: at.board });
+        })
+    });
 }
 
 /// Every heartbeat: say it all again, and let go of whoever went quiet.
@@ -121,8 +171,8 @@ fn heartbeat(store: AppStore) {
     let _ = set_timeout(PRESENCE_HEARTBEAT_MS as u32, move || {
         let held = SAID.with(|said| said.borrow().clone());
         for (pane, (store_id, node_id, focused)) in held {
-            let text = text::take_mine(store, pane);
-            store.send(BackendCommand::PublishPresence { store_id, node_id, pane: pane.index(), focused, left: false, text });
+            let at = take_mine(store, pane);
+            store.send(BackendCommand::PublishPresence { store_id, node_id, pane: pane.index(), focused, left: false, text: at.text, board: at.board });
         }
         prune(store);
         heartbeat(store);
@@ -158,6 +208,7 @@ pub(crate) fn received(store: AppStore, frame: &PresenceFrame) {
                 device: body.device,
                 focused: body.focused,
                 text: body.text,
+                board: body.board,
                 moved_ms,
                 expires_ms: now + frame.ttl_ms as f64,
             });
@@ -165,6 +216,7 @@ pub(crate) fn received(store: AppStore, frame: &PresenceFrame) {
         all.retain(|_, sessions| !sessions.is_empty());
     });
     text::frames_changed(store);
+    board::frames_changed(store);
 }
 
 /// Drop the sessions that went quiet, and everything of a store that closed.
@@ -179,6 +231,7 @@ pub(crate) fn prune(store: AppStore) {
             all.retain(|_, sessions| !sessions.is_empty());
         });
         text::frames_changed(store);
+        board::frames_changed(store);
     }
 }
 
@@ -186,6 +239,7 @@ pub(crate) fn prune(store: AppStore) {
 pub(crate) fn forget_store(store: AppStore, store_id: StoreId) {
     store.presence.update(|all| all.retain(|(s, _), _| *s != store_id));
     text::frames_changed(store);
+    board::frames_changed(store);
 }
 
 /// The people in `(store_id, node_id)`, tracked: one per account (an agent
@@ -278,8 +332,8 @@ pub fn initials(name: &str) -> String {
 
 /// The frame pane `pane` of client `client_id` says, in plain words (an
 /// encrypted store's is sealed by whoever sends it on).
-pub fn frame_for(client_id: &str, store_id: StoreId, node_id: NodeId, pane: usize, focused: bool, left: bool, text: Option<TextPresence>) -> PresenceFrame {
-    let body = if left { String::new() } else { PresenceBody { device: device_label(), focused, text }.encode() };
+pub fn frame_for(client_id: &str, store_id: StoreId, node_id: NodeId, pane: usize, focused: bool, left: bool, at: Whereabouts) -> PresenceFrame {
+    let body = if left { String::new() } else { PresenceBody { device: device_label(), focused, text: at.text, board: at.board }.encode() };
     PresenceFrame {
         store_id,
         doc_id: node_id,

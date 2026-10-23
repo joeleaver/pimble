@@ -697,3 +697,28 @@ fn merge(mut rects: Vec<Rect>) -> Vec<Rect> {
     }
     rects
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What the frame shows is where its corners map, at any camera, and a
+    /// board point goes to the screen and back to itself.
+    #[test]
+    fn the_visible_rect_is_what_the_corners_show() {
+        let mut view = BoardView::new(800, 600, Color::rgb(0, 0, 0));
+        view.set_camera(Point::new(100.0, -50.0), 2.0);
+        let (w, h) = view.size();
+        let r = view.view().board_rect(w, h);
+        let (tl, br) = (view.screen_to_board(0.0, 0.0), view.screen_to_board(800.0, 600.0));
+        assert!((r.x - tl.x).abs() < 1e-3 && (r.y - tl.y).abs() < 1e-3);
+        assert!((r.right() - br.x).abs() < 1e-3 && (r.bottom() - br.y).abs() < 1e-3);
+        assert!((r.w - 400.0).abs() < 1e-3 && (r.h - 300.0).abs() < 1e-3);
+
+        view.pan_by(37.0, -12.0);
+        let p = Point::new(123.25, 7.5);
+        let (sx, sy) = view.board_to_screen(p);
+        let back = view.screen_to_board(sx, sy);
+        assert!((back.x - p.x).abs() < 1e-3 && (back.y - p.y).abs() < 1e-3);
+    }
+}

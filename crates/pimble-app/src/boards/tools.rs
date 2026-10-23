@@ -105,9 +105,22 @@ pub(super) fn on_event(store: AppStore, pane: PaneId, event: SurfaceEvent) {
         SurfaceEvent::PointerDown { x, y, button, pointer } => pointer_down(store, pane, x * scale, y * scale, button, pointer),
         SurfaceEvent::PointerMove { x, y, pointer } => {
             ui.hover.set_if_changed(true);
+            with_session(pane, |s| {
+                s.over = true;
+                s.pointer = (x * scale, y * scale);
+            });
             pointer_move(store, pane, x * scale, y * scale, pointer);
+            crate::presence::moved(store, pane);
         }
-        SurfaceEvent::PointerUp { x, y, button, pointer } => pointer_up(store, pane, x * scale, y * scale, button, pointer),
+        SurfaceEvent::PointerUp { x, y, button, pointer } => {
+            let touch = pointer.kind == SurfacePointerKind::Touch;
+            pointer_up(store, pane, x * scale, y * scale, button, pointer);
+            // A finger lifted is no longer anywhere.
+            if touch {
+                with_session(pane, |s| s.over = false);
+                crate::presence::moved(store, pane);
+            }
+        }
         SurfaceEvent::PointerCancel { pointer } => pointer_cancel(store, pane, pointer),
         SurfaceEvent::Pinch { x, y, scale: factor } => zoom_about(store, pane, x * scale, y * scale, factor),
         SurfaceEvent::MouseWheel { delta_x, delta_y, .. } => {
@@ -129,7 +142,11 @@ pub(super) fn on_event(store: AppStore, pane: PaneId, event: SurfaceEvent) {
         }
         SurfaceEvent::MouseEnter { .. } => ui.hover.set_if_changed(true),
         SurfaceEvent::MouseLeave => {
-            with_session(pane, |s| s.space = false);
+            with_session(pane, |s| {
+                s.space = false;
+                s.over = false;
+            });
+            crate::presence::moved(store, pane);
             ui.tip.set_if_changed(None);
             // A moment's grace, so the pointer can reach the markup control.
             let _ = set_timeout(600, move || ui.hover.set_if_changed(false));

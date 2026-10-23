@@ -1,6 +1,6 @@
 # Presence contract: who is here, and where
 
-Status: **waves 0 (names), 1 (transport, who is here) and 2 (carets and selections in text) built on branch `presence`, 2026-10-22; waves 3 to 5 not built.** Written from Joe's answers that day (listed
+Status: **waves 0 (names), 1 (transport, who is here), 2 (carets and selections in text) and 3 (pointers and selections on boards) built on branch `presence`, 2026-10-22; waves 4 and 5 not built.** Written from Joe's answers that day (listed
 under "Decisions" at the end). The points under "To confirm" are design choices made here
 that Joe has not seen yet. Section 3 (names per share) was added later the same day.
 
@@ -574,3 +574,78 @@ browser in the shared "Holiday Plans" note.
 - Clicking a caret's flag does nothing yet; following is wave 4.
 - In the browser the text's box is found by `data-pimble-text` and
   `getBoundingClientRect`, since rinch-web fills no bounds.
+
+## Built in wave 3 (pointers and selections on boards), 2026-10-22, branch `presence`
+
+**Wire** (`pimble-rpc`):
+- `PresenceBody.board: Option<BoardPresence>` (serde default, skipped when `None`, so
+  wave 2 bodies parse and wave 2 readers ignore it).
+- `BoardPresence { pointer: Option<BoardPoint>, selection: Vec<String>, viewport:
+  BoardRect, markup: Option<String> }`, all in board units. `pointer` and an empty
+  `selection` are left out on the wire.
+  - `markup` names the picture's board (`data["board:<id>"]`) when the board is markup on
+    a picture in a note's text. It is not in section 5: it keeps two people marking up
+    different pictures of one note from seeing each other's pointers on the wrong
+    picture.
+  - A frame carries at most 50 selected ids (`presence::board::MAX_SELECTION`): a
+    select-all on a big board would otherwise make every pointer frame kilobytes long.
+- `BackendCommand::PublishPresence` carries `board` beside `text`, and
+  `presence::frame_for` takes both as `Whereabouts`.
+- The CLI's `presence` says "on the board, the pointer at (x, y), n selected".
+
+**Saying where this window is**:
+- The coalescing moved from `presence/text.rs` to `presence.rs` (`moved`, `take_mine`):
+  one frame per pane per 50 ms, carrying its text and its board part together.
+- `boards::presence_mine` reads the board part: the pointer (`Session.over`, set on a
+  pointer move and cleared when the mouse leaves or a finger lifts), the selection, and
+  `view().board_rect` of the surface.
+- `presence::moved` is asked on every pointer move over the surface, on leaving it, and at
+  the end of every `after_change`. That covers selection changes, pans, zooms and edits.
+  A frame goes out only when what the pane says changed.
+
+**Showing everyone else** (`crate::presence::board`, `boards::draw_others`):
+- Each board pane places the sessions on its board (`sessions_on`, matched on `markup`)
+  with its own camera: `View::to_pixels` divided by the pixel scale, as the discussion
+  pins are. A pointer off the surface is not drawn.
+  - A pointer is Tabler's filled `pointer` icon in `author_color(sub)`, its tip at the
+    point, with the person's name on a tag in that color beside it. Hovering gives the
+    name and device.
+  - A selected element is outlined in the person's color
+    (`pimble-board__outline--other`) in the same layer as one's own outlines.
+- `draw_others` runs at the end of `after_change` (every camera move and board change)
+  and from `presence::board::frames_changed` when a frame arrives or lapses.
+- Pictures in text: markup on a picture shows pointers and selections between people
+  marking up the same picture. Checked only by reading the code, not by hand.
+- No rinch change was needed.
+
+**Tests**:
+- `presence_body_round_trips_with_a_board` (`pimble-rpc`): the round trip, what is left
+  out on the wire, and a wave 2 body.
+- `presence::board` tests: a pointer said from one camera lands on the same board point at
+  another camera, zoom and pixel scale; an element's bounds map the same way; a point
+  panned off the surface is not drawn; a pointer off the surface says none; a big
+  selection is cut to 50.
+- `the_visible_rect_is_what_the_corners_show` (`pimble-board`, `view.rs`): the viewport a
+  frame says is what the corners of the surface show, and board to screen and back
+  round-trips after a pan.
+
+**Checked on the local stack** (2026-10-22): Alice's desktop app (17491) made a
+whiteboard in the shared "Holiday" folder and drew a rectangle and an ellipse. Bob opened
+it in the browser.
+- Bob's page drew Alice's arrow with an "alice" tag at the corner where she let go, and
+  her selected ellipse outlined in her color, at his own fitted camera.
+- She selected the rectangle and moved her pointer. His page followed both.
+- Bob selected the ellipse and hovered below it. Alice's pane drew a "bob" arrow at the
+  same place relative to the shapes, and his selection outlined in his color.
+- Alice scrolled her board, and Bob's arrow moved with it.
+- Alice's pointer left the surface. Her frame then had no pointer (`own presence`), and
+  Bob's page stopped drawing it.
+- The hosted server held both sessions `(sealed)`.
+
+**Gaps:**
+- `viewport` is sent but nothing reads it yet. Follow (wave 4) will.
+- An outline is the element's bounds box, not its rotated shape.
+- A person's pointer shows their name always; there is no shrink to initials as on a
+  text caret's flag.
+- Markup on pictures in text was not tried by hand, and neither were two windows of the
+  desktop app or a touch screen.

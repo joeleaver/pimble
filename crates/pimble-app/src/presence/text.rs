@@ -3,7 +3,7 @@
 //!
 //! Saying where this window's panes are: a pane's caret and selection go out
 //! as yrs sticky indexes into the note's content, on every move, at most one
-//! frame per [`COALESCE_MS`], and with every frame the pane sends anyway
+//! frame per 50 ms (`presence::moved`), and with every frame the pane sends anyway
 //! (`presence::say`, the heartbeat). A read-only pane says where it is only
 //! while it has a selection.
 //!
@@ -31,8 +31,6 @@ use rinch_editor_core::{Attrs, Decoration, DecorationSet, Node as EditorNode, Pl
 use crate::panes::{PaneId, MAX_PANES};
 use crate::state::AppStore;
 
-/// The least time between two frames of one pane's caret.
-const COALESCE_MS: f64 = 50.0;
 /// How long a caret's flag names the person after it moves; then initials.
 const NAME_SHOWN_MS: f64 = 3000.0;
 /// The margin anchors' key for carets (never a node id: the discussion
@@ -61,12 +59,6 @@ const PLUGIN_KEY: PluginKey = PluginKey("pimble.presence");
 const META: &str = "pimble.presence";
 
 thread_local! {
-    /// The text each pane last said.
-    static SENT: RefCell<[Option<TextPresence>; MAX_PANES]> = const { RefCell::new([None, None, None, None]) };
-    /// When each pane last said it.
-    static SENT_MS: [Cell<f64>; MAX_PANES] = const { [Cell::new(0.0), Cell::new(0.0), Cell::new(0.0), Cell::new(0.0)] };
-    /// A pane's caret moved and its frame waits for the coalescing gap.
-    static OWED: [Cell<bool>; MAX_PANES] = const { [Cell::new(false), Cell::new(false), Cell::new(false), Cell::new(false)] };
     /// A pane's carets are owed a look.
     static REDRAW_OWED: [Cell<bool>; MAX_PANES] = const { [Cell::new(false), Cell::new(false), Cell::new(false), Cell::new(false)] };
     /// A pane is waiting to turn a flag's name into initials.
@@ -103,41 +95,6 @@ pub(crate) fn mine(store: AppStore, pane: PaneId) -> Option<TextPresence> {
     let caret = handle.collab_sticky_index_with(head, StickyAssoc::After)?;
     let anchor = if anchor == head { None } else { handle.collab_sticky_index_with(anchor, StickyAssoc::After) };
     Some(TextPresence::new(&caret, anchor.as_deref()))
-}
-
-/// Pane `pane`'s text as its next frame carries it, remembered as said.
-pub(crate) fn take_mine(store: AppStore, pane: PaneId) -> Option<TextPresence> {
-    let text = mine(store, pane);
-    SENT.with(|s| s.borrow_mut()[pane.index()] = text.clone());
-    SENT_MS.with(|s| s[pane.index()].set(crate::boards::now_ms()));
-    text
-}
-
-/// Pane `pane` let its document go: what it said is forgotten.
-pub(crate) fn forget_sent(pane: PaneId) {
-    SENT.with(|s| s.borrow_mut()[pane.index()] = None);
-}
-
-/// Pane `pane`'s caret or selection moved (or its note opened): a frame,
-/// coalesced, when what it says changed. Read a turn later, never from
-/// inside the editor's own callback.
-pub(crate) fn moved(store: AppStore, pane: PaneId) {
-    if OWED.with(|o| o[pane.index()].replace(true)) {
-        return;
-    }
-    let since = crate::boards::now_ms() - SENT_MS.with(|s| s[pane.index()].get());
-    let wait = (COALESCE_MS - since).max(0.0) as u32;
-    rinch::core::reactive::unowned(|| {
-        set_timeout(wait, move || {
-            OWED.with(|o| o[pane.index()].set(false));
-            let text = mine(store, pane);
-            if SENT.with(|s| s.borrow()[pane.index()] == text) {
-                return;
-            }
-            let text = take_mine(store, pane);
-            super::publish_text(store, pane, text);
-        })
-    });
 }
 
 // ── Everyone else ────────────────────────────────────────────────────────
@@ -454,7 +411,7 @@ mod tests {
         // They select "world" (7..12), the caret at its end.
         let caret = theirs.collab_sticky_index_with(Pos(12), StickyAssoc::After).unwrap();
         let anchor = theirs.collab_sticky_index_with(Pos(7), StickyAssoc::After).unwrap();
-        let body = pimble_rpc::PresenceBody { device: "d".into(), focused: true, text: Some(TextPresence::new(&caret, Some(&anchor))) };
+        let body = pimble_rpc::PresenceBody { device: "d".into(), focused: true, text: Some(TextPresence::new(&caret, Some(&anchor))), board: None };
         let text = pimble_rpc::PresenceBody::decode(&body.encode()).unwrap().text.unwrap();
         let (caret, anchor) = (text.caret_bytes().unwrap(), text.anchor_bytes().unwrap());
         let found = |handle: &crate::rinch_editor::EditorHandle| -> Vec<Option<(usize, bool)>> {

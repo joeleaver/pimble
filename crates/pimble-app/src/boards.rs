@@ -342,6 +342,9 @@ pub struct PaneUi {
     /// The discussions pinned to the board, where they are on screen
     /// (logical pixels), numbered in the order they were made.
     pub pins: Signal<Vec<PinView>>,
+    /// Everyone else's pointers and selections on the board
+    /// (docs/PRESENCE_CONTRACT.md section 5).
+    pub others: Signal<crate::presence::board::Others>,
 }
 
 impl PaneUi {
@@ -349,6 +352,7 @@ impl PaneUi {
         Self {
             outlines: Signal::new(Vec::new()),
             pins: Signal::new(Vec::new()),
+            others: Signal::new(Default::default()),
             handles: Signal::new(None),
             selected: Signal::new(0),
             marquee: Signal::new(None),
@@ -583,6 +587,8 @@ struct Session {
     last_press: (f64, f32, f32),
     /// The pointer's last position over the surface, physical pixels.
     pointer: (f32, f32),
+    /// The pointer is over the surface (its frames say where).
+    over: bool,
     /// The pointer and button whose press the gesture is (one at a time:
     /// another pointer's or button's presses meanwhile start nothing).
     driver: Option<(u64, SurfaceMouseButton)>,
@@ -807,6 +813,7 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
         settle_generation: 0,
         last_press: (0.0, 0.0, 0.0),
         pointer: (0.0, 0.0),
+        over: false,
         driver: None,
         touches: Vec::new(),
         pressure: 0.5,
@@ -856,6 +863,7 @@ pub(crate) fn stop(store: AppStore, pane: PaneId) {
     ui.tip.set(None);
     ui.layers.set(Vec::new());
     ui.frames.set(Vec::new());
+    ui.others.set_if_changed(Default::default());
     if !store.is_editing(session.store_id, session.node_id) {
         store.send(BackendCommand::UnsubscribeNodeChanges { store_id: session.store_id, node_id: session.node_id });
     }
@@ -1050,6 +1058,7 @@ pub(crate) fn start_markup(store: AppStore, pane: PaneId, store_id: StoreId, nod
         settle_generation: 0,
         last_press: (0.0, 0.0, 0.0),
         pointer: (0.0, 0.0),
+        over: false,
         driver: None,
         touches: Vec::new(),
         pressure: 0.5,
@@ -1261,6 +1270,60 @@ fn after_change(store: AppStore, pane: PaneId) {
     }
     present(pane);
     nav::changed(store, pane);
+    draw_others(store, pane);
+    crate::presence::moved(store, pane);
+}
+
+/// Where pane `pane` is on its board, as its presence frame says it: `None`
+/// when it shows no board.
+pub(crate) fn presence_mine(store: AppStore, pane: PaneId) -> Option<pimble_rpc::BoardPresence> {
+    if !untracked(|| store.pane(pane).show_board.get()) {
+        return None;
+    }
+    with_session(pane, |s| {
+        let pointer = s.over.then_some(s.pointer);
+        let markup = s.markup.as_ref().map(|m| m.board_id.as_str());
+        crate::presence::board::whereabouts(&s.view.view(), s.view.size(), pointer, &s.selected, markup)
+    })
+}
+
+/// Draw everyone else's pointers and selections over pane `pane`'s board
+/// with its camera as it is now.
+pub(crate) fn draw_others(store: AppStore, pane: PaneId) {
+    use crate::presence::board::{on_screen, rect_on_screen, sessions_on, OutlineView, Others, PointerView};
+    let scale = scale_of(pane);
+    let ui = store.pane(pane).board_ui;
+    let shown = untracked(|| store.pane(pane).show_board.get());
+    let held = with_session(pane, |s| (s.store_id, s.node_id, s.markup.as_ref().map(|m| m.board_id.clone()))).filter(|_| shown);
+    let Some((store_id, node_id, markup)) = held else {
+        ui.others.set_if_changed(Others::default());
+        return;
+    };
+    let sessions = sessions_on(store, store_id, node_id, markup.as_deref());
+    let others = with_session(pane, |s| {
+        let (view, size) = (s.view.view(), s.view.size());
+        let snapshot = s.snapshot();
+        let mut others = Others::default();
+        for (session, board, who, title) in sessions {
+            for id in &board.selection {
+                let Some(e) = snapshot.get(id) else { continue };
+                let (x, y, w, h) = rect_on_screen(&view, scale, &e.bounds);
+                others.outlines.push(OutlineView { x, y, w, h, color: who.color.clone() });
+            }
+            if let Some((x, y)) = board.pointer.and_then(|p| on_screen(&view, size, scale, p)) {
+                others.pointers.push(PointerView {
+                    session,
+                    style: format!("left: {x:.1}px; top: {y:.1}px; color: {};", who.color),
+                    tag_style: format!("background: {};", who.color),
+                    name: who.name,
+                    title,
+                });
+            }
+        }
+        others
+    })
+    .unwrap_or_default();
+    ui.others.set_if_changed(others);
 }
 
 /// Hand pane `pane`'s surface its next frame, if anything changed: the

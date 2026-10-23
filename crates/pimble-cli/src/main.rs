@@ -886,7 +886,18 @@ fn presence_line(frame: &pimble_rpc::PresenceFrame) -> String {
                     Some(_) => ", a caret in the text",
                     None => "",
                 };
-                format!("on {}{}{}", b.device, if b.focused { ", focused" } else { "" }, text)
+                let board = match &b.board {
+                    Some(board) => {
+                        let pointer = board.pointer.map(|p| format!(", the pointer at ({:.0}, {:.0})", p.x, p.y)).unwrap_or_default();
+                        let selected = match board.selection.len() {
+                            0 => String::new(),
+                            n => format!(", {n} selected"),
+                        };
+                        format!(", on the board{pointer}{selected}")
+                    }
+                    None => String::new(),
+                };
+                format!("on {}{}{}{}", b.device, if b.focused { ", focused" } else { "" }, text, board)
             })
             .unwrap_or_default()
     };

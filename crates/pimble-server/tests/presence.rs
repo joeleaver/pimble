@@ -19,7 +19,7 @@ fn frame(store_id: pimble_core::StoreId, doc_id: pimble_core::NodeId, session: &
         seq,
         who: None,
         left: false,
-        body: PresenceBody { device: device.to_string(), focused: true, text: None }.encode(),
+        body: PresenceBody { device: device.to_string(), focused: true, text: None, board: None }.encode(),
         sealed: false,
         ttl_ms: PRESENCE_TTL_MS,
     }

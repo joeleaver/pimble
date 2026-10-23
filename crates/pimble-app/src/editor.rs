@@ -194,7 +194,7 @@ pub(crate) fn start_editing(
             crate::link_picker::selection_changed(store, &editor(pane));
         }
         // Where this pane is, said to everyone else in the note.
-        crate::presence::text::moved(store, pane);
+        crate::presence::moved(store, pane);
     });
     handle.on_caret_moved(move || {
         if store.focused() == pane {
@@ -320,7 +320,7 @@ pub(crate) fn start_editing(
     crate::toolbar::bump_toolbar(pane);
     // Where this pane is in it, and where everyone else is
     // (docs/PRESENCE_CONTRACT.md section 4).
-    crate::presence::text::moved(store, pane);
+    crate::presence::moved(store, pane);
     crate::presence::text::redraw_later(store, pane);
 }
 

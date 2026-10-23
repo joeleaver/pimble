@@ -1223,6 +1223,42 @@ pub struct PresenceBody {
     /// a sheet, or a read-only pane with nothing selected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<TextPresence>,
+    /// Where the session is on a board (section 5); none from a note's text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<BoardPresence>,
+}
+
+/// Where someone is on a board, in board units (the document's own terms,
+/// so it means the same at every zoom and window size).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BoardPresence {
+    /// The pointer; none when it is not over the board.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pointer: Option<BoardPoint>,
+    /// The ids of the elements selected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selection: Vec<String>,
+    /// What the pane shows of the board, for following (section 7).
+    #[serde(default)]
+    pub viewport: BoardRect,
+    /// The board is a picture's markup in the note's text: its board id
+    /// (`data["board:<id>"]`); none for a board node's own board.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markup: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct BoardPoint {
+    pub x: f32,
+    pub y: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct BoardRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
 }
 
 /// Where someone is in a note's text: yrs sticky indexes into its `content`
@@ -1584,14 +1620,14 @@ mod tests {
     /// before text (wave 1) still parses, and a selection of nothing is a caret.
     #[test]
     fn presence_body_round_trips_with_text() {
-        let body = PresenceBody { device: "laptop".into(), focused: true, text: Some(TextPresence::new(&[1, 2, 3, 0xff], Some(&[9, 8]))) };
+        let body = PresenceBody { device: "laptop".into(), focused: true, text: Some(TextPresence::new(&[1, 2, 3, 0xff], Some(&[9, 8]))), board: None };
         let back = PresenceBody::decode(&body.encode()).unwrap();
         assert_eq!(back, body);
         let text = back.text.unwrap();
         assert_eq!(text.caret_bytes().unwrap(), vec![1, 2, 3, 0xff]);
         assert_eq!(text.anchor_bytes().unwrap(), vec![9, 8]);
 
-        let older = PresenceBody { device: "web".into(), focused: false, text: None };
+        let older = PresenceBody { device: "web".into(), focused: false, text: None, board: None };
         let wire = older.encode();
         use base64::Engine;
         let json = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&wire).unwrap();
@@ -1602,6 +1638,31 @@ mod tests {
         let caret_only = TextPresence::new(&[4, 5], Some(&[4, 5]));
         assert_eq!(caret_only.anchor, None);
         assert_eq!(caret_only.anchor_bytes(), None);
+    }
+
+    /// A body with a board part comes back as it went; a pointer off the
+    /// board and an empty selection are left out on the wire; a body from
+    /// before boards (wave 2) still parses.
+    #[test]
+    fn presence_body_round_trips_with_a_board() {
+        let board = BoardPresence {
+            pointer: Some(BoardPoint { x: 12.5, y: -3.25 }),
+            selection: vec!["e1".into(), "e2".into()],
+            viewport: BoardRect { x: -100.0, y: 0.0, w: 640.0, h: 480.0 },
+            markup: Some("b1".into()),
+        };
+        let body = PresenceBody { device: "laptop".into(), focused: true, text: None, board: Some(board) };
+        assert_eq!(PresenceBody::decode(&body.encode()).unwrap(), body);
+
+        let away = PresenceBody { board: Some(BoardPresence { pointer: None, selection: Vec::new(), viewport: BoardRect { x: 1.0, y: 2.0, w: 3.0, h: 4.0 }, markup: None }), ..body.clone() };
+        use base64::Engine;
+        let json: serde_json::Value = serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(away.encode()).unwrap()).unwrap();
+        assert_eq!(json["board"], serde_json::json!({ "viewport": { "x": 1.0, "y": 2.0, "w": 3.0, "h": 4.0 } }));
+        assert_eq!(PresenceBody::decode(&away.encode()).unwrap(), away);
+
+        let from_wave_2 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"device":"web","focused":true,"text":{"caret":"AQ"}}"#);
+        let older = PresenceBody::decode(&from_wave_2).unwrap();
+        assert_eq!((older.text.is_some(), older.board), (true, None));
     }
 
     /// `SharesEnded` on the wire, and `getStoreSync`'s answer from a server

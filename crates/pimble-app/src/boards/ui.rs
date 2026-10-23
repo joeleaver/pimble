@@ -9,6 +9,7 @@ use super::export::Format;
 use super::tools::{Align2, Order};
 use super::*;
 use crate::appearance::IconGlyph;
+use rinch_tabler_icons::{render_tabler_icon, TablerIconStyle};
 
 thread_local! {
     /// Each pane's text input: (document key, node id), for focusing it.
@@ -236,6 +237,33 @@ pub(crate) fn render_board(__scope: &mut RenderScope, store: AppStore, pane: Pan
                 key: format!("{x:.1} {y:.1} {w:.1} {h:.1}"),
                 class: "pimble-board__outline",
                 style: format!("left: {x:.1}px; top: {y:.1}px; width: {w:.1}px; height: {h:.1}px;"),
+            }
+        }
+        // Everyone else's selections and pointers (docs/PRESENCE_CONTRACT.md
+        // section 5), in their colors.
+        for o in ui.others.get().outlines {
+            div {
+                key: format!("{:.1} {:.1} {:.1} {:.1} {}", o.x, o.y, o.w, o.h, o.color),
+                class: "pimble-board__outline pimble-board__outline--other",
+                style: format!("left: {:.1}px; top: {:.1}px; width: {:.1}px; height: {:.1}px; border-color: {};", o.x, o.y, o.w, o.h, o.color.clone()),
+            }
+        }
+        for p in ui.others.get().pointers {
+            div {
+                // A keyed row is drawn once: everything it shows is in its key.
+                key: format!("{} {} {} {}", p.session, p.style, p.name, p.title),
+                class: "pimble-presence-pointer",
+                style: p.style.clone(),
+                title: p.title.clone(),
+                span {
+                    class: "pimble-presence-pointer__arrow",
+                    {render_tabler_icon(__scope, TablerIcon::Pointer, TablerIconStyle::Filled)}
+                }
+                span {
+                    class: "pimble-presence-pointer__name",
+                    style: p.tag_style.clone(),
+                    {p.name.clone()}
+                }
             }
         }
         div {
