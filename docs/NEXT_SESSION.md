@@ -19,7 +19,7 @@ shift back inside the viewport (8 px margin), and scroll only when neither side 
 keeps inline max-height/width. Check Pimble's dropdowns near window edges then. #1426
 (inline padding) is on rinch `main` too (batch 9, PR #1838): an inline element's padding,
 border and margin take room on its line and the caret sits where typed text lands, so the
-link pills' inline-block workaround (`styles.rs`, `.pimble-link` and `.pimble-link--*`,
+sheet link pills' inline-block workaround (`styles.rs` `.pimble-sheet__chip`,
 rinch #1426/#1762) can go back to plain inline after the bump. #1762 (an overflow:hidden
 cell clips its pill) and #1815/#1817 (no stale pixels from shifted text and pills) landed
 with it. Still open in rinch: #1835 (RTL caret at a padded edge), #1833 (a code mark split
