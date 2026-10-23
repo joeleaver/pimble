@@ -13,17 +13,16 @@ answer 200; `/rpc`, `/api/v1/me` and `/api/v1/me/shares` answer 401; the hosted 
 opened its three stores and a relay tunnel reconnected. Branch `presence` is merged.
 What is left of presence is the "Gaps" lists in the contract's "Built in wave N" sections.
 
-**Branch `rinch-bump` (not merged; merging it changes what ships, so it goes with the next
-release):** rinch `main` cbf6655b in both locks: #1764 (dropdowns flip and shift inside the
-window), #1426 (inline padding takes room on its line), #1100 (an ellipsis is cut at paint
-time, so inline styling survives), #1833 (inline code split by another mark is one pill),
-#1762, #1815/#1817. `.pimble-sheet__chip` is a plain inline span again: checked in an
-isolated app, a link pill that fits its sheet cell is unchanged and one too long for it is
-clipped at the cell's edge with the "…" inside, as in Chrome. The board's Export dropdown
-opens whole; the flip at a window edge was not exercised (Wayland: no scripted resize).
-1128 tests pass, the web build checks. Known in rinch: a pill sits about 3 px higher than in
-Chrome (no line strut, #1463 family); a click past an ellipsis can still hit a hidden chip
-(#1864); RTL caret at a padded edge (#1835).
+**2026-10-23: v0.13.1 released, deployed (jkbase v35) and installed here** (release commit
+1b306db; backup `bkp_1792775703839_e1bbc9f406d1df0c`). It is the rinch move to `main`
+cbf6655b, coordinated with the Rinch session: dropdowns stay inside the window (#1764),
+inline padding takes room on its line (#1426), an ellipsis keeps inline styling (#1100),
+inline code split by another mark is one pill (#1833). Sheet link pills (`.pimble-sheet__chip`)
+are plain inline spans again: a pill too long for its cell is clipped with the "…" inside.
+The flip of a dropdown at a window edge was not exercised (Wayland: no scripted resize).
+Known in rinch: pills sit about 3 px higher than in Chrome (no line strut, #1463 family); a
+click past an ellipsis can still hit a hidden chip (#1864); RTL caret at a padded edge
+(#1835).
 
 **2026-10-22, latest: presence is complete, all six waves built on branch `presence`.**
 Wave 5 (agents) is built and checked: `pimble-mcp` publishes a frame after every tool call
