@@ -45,6 +45,27 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Renderer, String
     Ok(renderer)
 }
 
+/// What the log file keeps: Pimble's own messages and anything that goes
+/// wrong, without the debug port's and the GPU stack's chatter.
+const LOG_FILE_FILTER: &str = "info,rinch_debug=warn,wgpu_hal=warn,wgpu_core=warn,naga=warn";
+
+/// `<data dir>/pimble/logs/pimble.log`.
+fn log_path() -> Option<std::path::PathBuf> {
+    Some(dirs::data_dir()?.join("pimble").join("logs").join("pimble.log"))
+}
+
+/// This run's log file, the last run's kept beside it as `pimble.log.1`.
+/// `None` when it cannot be made: logging to the terminal goes on.
+fn log_file() -> Option<(std::fs::File, std::path::PathBuf)> {
+    let path = log_path()?;
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    if path.exists() {
+        let _ = std::fs::rename(&path, path.with_extension("log.1"));
+    }
+    let file = std::fs::File::create(&path).ok()?;
+    Some((file, path))
+}
+
 fn main() {
     // `pimble --install` (docs/UPDATE_CONTRACT.md): copy this program into the
     // home-folder install, which keeps itself current, and stop.
@@ -72,15 +93,24 @@ fn main() {
         }
     };
 
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .init();
+    // Logging: to the terminal as before, and to a file every run, so a slow
+    // start (or anything else) can be read afterwards: when the server was
+    // found or started, any handover, when each store opened.
+    use tracing_subscriber::prelude::*;
+    let terminal = tracing_subscriber::fmt::layer()
+        .with_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()));
+    let file = log_file().map(|(file, _)| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .with_filter(tracing_subscriber::EnvFilter::new(LOG_FILE_FILTER))
+    });
+    tracing_subscriber::registry().with(terminal).with(file).init();
 
-    tracing::info!("Starting Pimble with Rinch...");
+    tracing::info!("Starting Pimble {}", env!("CARGO_PKG_VERSION"));
+    if let Some(path) = log_path() {
+        tracing::info!("This run is logged to {}", path.display());
+    }
 
     // Run the application
     pimble_app::app::run(renderer);
