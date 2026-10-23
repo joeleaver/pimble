@@ -17,8 +17,13 @@ With the next release, move rinch to `main` a269119d or later: #1764 (PR #1812) 
 DropdownMenu and Popover dropdowns flip above their trigger when there is more room there,
 shift back inside the viewport (8 px margin), and scroll only when neither side fits; it
 keeps inline max-height/width. Check Pimble's dropdowns near window edges then. #1426
-(inline padding, the link-pill workaround) is being built by the Rinch session, which says
-it will report when it lands.
+(inline padding) is on rinch `main` too (batch 9, PR #1838): an inline element's padding,
+border and margin take room on its line and the caret sits where typed text lands, so the
+link pills' inline-block workaround (`styles.rs`, `.pimble-link` and `.pimble-link--*`,
+rinch #1426/#1762) can go back to plain inline after the bump. #1762 (an overflow:hidden
+cell clips its pill) and #1815/#1817 (no stale pixels from shifted text and pills) landed
+with it. Still open in rinch: #1835 (RTL caret at a padded edge), #1833 (a code mark split
+by another mark draws as two pills).
 
 **2026-10-22, latest: presence is complete, all six waves built on branch `presence`.**
 Wave 5 (agents) is built and checked: `pimble-mcp` publishes a frame after every tool call
