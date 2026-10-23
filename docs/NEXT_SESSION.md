@@ -1,5 +1,37 @@
 # Next session: start here
 
+**2026-10-23, latest: Joe's slow desktop start, branch `faster-start` (pushed, not merged;
+Joe: no release for it yet).** Joe sees his stores take "many seconds" to load at times,
+with only "Personal" shown at first; he suspects it happens when the server was also shut
+down and the app has to open everything. Not reproduced: on his real stores (`Personal`,
+relayed, 34 nodes; `Family Management`, plain, 635 nodes, both in Dropbox) three cold
+starts with no server running took about 1.6 s (0.13.1), 1.0 s (`faster-start`) and
+0.45 s to open both stores with the app, the model and the stores evicted from the page
+cache. The method: `timeline` (screenshots every 0.5 s over the debug port,
+`scripts/perf/rd.py ... close_app` to quit cleanly) and `posix_fadvise(DONTNEED)` to
+evict files; never touch Joe's running app without asking.
+
+What `faster-start` has:
+- 17a3839: `GetPeople`, `CloudListShares` and the Shares dialog's writes run beside the
+  app's one-at-a-time command loop (`commands.rs` `answer_later`); `cloudPeople` answers
+  `people.json` at once and refreshes behind it (`PeopleChanged` follows a change); the
+  accounts-service HTTP client is reused per tokio runtime (`cloud.rs` `client()`).
+  Before, opening a relayed or encrypted store made the loop wait on several round trips
+  to pimble.app (about 0.3 s each, a TLS handshake each).
+- 2ff7ecc: every run logs to `<data dir>/pimble/logs/pimble.log` (the run before kept as
+  `pimble.log.1`): server found, started or handed over, each store opening, rows loading.
+  The next time Joe sees a slow start, read that file first.
+
+The leading suspect, not caught: 19 `pimble-mcp` processes were running (one per Claude
+session that loaded the Pimble tools), every one on a binary replaced by later updates,
+so older versions. With the app closed, the first AI tool call starts an older server on
+7462 that opens Joe's stores; the next app launch asks it to hand over and waits
+(`crates/pimble-server/src/local.rs` `probe`/`connect_or_start`). Possible follow-ups:
+an old `pimble-mcp` noticing its binary was replaced and exiting, or never starting a
+server older than the installed app.
+Still waiting on the network at start, unchanged: `SyncPersonal` (the personal
+document); left serial because two syncs at once could race.
+
 **2026-10-23: v0.13.0 released, deployed (jkbase v34) and installed here** (release
 commit be02abd, tag `v0.13.0`, rinch `main` 2dbec067 in both locks; backup
 `bkp_1792718932955_7f80163a2c514082` before the deploy, which added `ShareName` and
