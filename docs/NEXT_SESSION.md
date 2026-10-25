@@ -1,5 +1,39 @@
 # Next session: start here
 
+**2026-10-25: v0.14.0 released, deployed (jkbase v36) and installed here (tag `v0.14.0`, release commit 79520e3; backup
+`bkp_1792941339823_f4d20995a78a9314` before the deploy).** It brings:
+- **Each client remembers how things looked** (branch `remember-views`, merged; Joe,
+  2026-10-23: per device, everything): the explorer's expanded rows, the place in every text
+  node (selection and first line in view) and every canvas's camera, in
+  `<data dir>/pimble/views.json` (`localStorage` `pimble.views` in the browser;
+  `crates/pimble-app/src/views.rs`). Text places left the personal document, which empties
+  what earlier versions wrote there (`Personal::drop_places`). docs/DISCUSSIONS_CONTRACT.md
+  section 8b.
+- **The window** opens at its saved size and place, maximized if it was (`state.json`
+  `window`); on Wayland only the size and maximized state (no position exists there).
+- **Canvases** (branch `canvas`, merged): boards are "canvas" in the interface only (the
+  code and storage keep `board`); there is no image node; pictures in text are canvases
+  from the start; Insert Image... and Insert Canvas...; Markdown writes `#canvas=<id>`.
+  docs/CANVAS_CONTRACT.md.
+
+**rinch is pinned to the branch `window-restore`** (joeleaver/rinch#1884: `WindowProps::maximized`,
+`current_window_restore`, positions kept only where the title strip is on a connected
+monitor), in both locks at 158f0dc8. The PR was open at release time. **Do not delete
+that branch before the pin moves**: a fresh checkout of `v0.14.0` resolves it. Once it
+merges, point `Cargo.toml`, `crates/pimble-app/Cargo.toml` and `web/Cargo.toml` back at
+`main` and `cargo update` both locks.
+
+A push named `git push jkbase master` (instead of plain `git push jkbase`, whose refspec is
+`HEAD:refs/heads/main`) created a `master` branch on the jkbase remote on 2026-10-25. It
+deploys nothing, and jkbase refuses to delete it (the bare repository's HEAD names it).
+Deploy with plain `git push jkbase`.
+
+Not kept per device yet (rinch has no way to set an element's scroll from the app): a
+sheet's selected cell and scroll, a discussion node's scroll, the explorer's own scroll.
+Next big feature under discussion: diagrams as canvas features (shape library, routed
+connectors, snapping, one-shot auto-layout); charts and timelines as views of data in
+sheets or node fields, never canvas geometry.
+
 **2026-10-23, latest: Joe's slow desktop start, branch `faster-start` (pushed, not merged;
 Joe: no release for it yet).** Joe sees his stores take "many seconds" to load at times,
 with only "Personal" shown at first; he suspects it happens when the server was also shut
