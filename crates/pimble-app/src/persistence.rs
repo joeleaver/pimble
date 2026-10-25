@@ -78,6 +78,18 @@ mod imp {
         write_state(&state);
     }
 
+    /// The window's size and place when it last closed.
+    pub(crate) fn load_window() -> Option<super::WindowGeometry> {
+        serde_json::from_value(read_state()["window"].clone()).ok()
+    }
+
+    /// Save the window's size and place, keeping every other saved preference.
+    pub(crate) fn save_window(window: &super::WindowGeometry) {
+        let mut state = read_state();
+        state["window"] = serde_json::json!(window);
+        write_state(&state);
+    }
+
     /// The split view's layout as it was last saved, as JSON
     /// (docs/SPLIT_VIEW_CONTRACT.md "Persistence").
     pub(super) fn load_panes_json() -> Option<serde_json::Value> {
@@ -128,6 +140,31 @@ mod imp {
 
     #[cfg(test)]
     pub(crate) fn save_personal(_bytes: &[u8]) {}
+
+    /// What this device remembers of how things looked (`views.rs`):
+    /// `<data dir>/pimble/views.json`.
+    fn views_path() -> PathBuf {
+        dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("pimble").join("views.json")
+    }
+
+    pub(crate) fn load_views_json() -> Option<String> {
+        std::fs::read_to_string(views_path()).ok()
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn save_views_json(json: &str) {
+        let path = views_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn save_views_json(_json: &str) {}
 }
 
 #[cfg(not(feature = "native"))]
@@ -224,6 +261,61 @@ mod imp {
             let _ = storage.set_item(PERSONAL_KEY, &base64::engine::general_purpose::STANDARD.encode(bytes));
         }
     }
+
+    /// What this browser remembers of how things looked (`views.rs`).
+    const VIEWS_KEY: &str = "pimble.views";
+
+    pub(crate) fn load_views_json() -> Option<String> {
+        storage()?.get_item(VIEWS_KEY).ok().flatten()
+    }
+
+    pub(crate) fn save_views_json(json: &str) {
+        if let Some(storage) = storage() {
+            let _ = storage.set_item(VIEWS_KEY, json);
+        }
+    }
+}
+
+/// The desktop window's size (logical pixels, the content area) and outer
+/// top-left on the desktop, when the platform says where it is (Wayland
+/// never does), as it is when not maximized; and whether it was maximized.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WindowGeometry {
+    pub width: f64,
+    pub height: f64,
+    #[serde(default)]
+    pub x: Option<f64>,
+    #[serde(default)]
+    pub y: Option<f64>,
+    #[serde(default)]
+    pub maximized: bool,
+}
+
+impl WindowGeometry {
+    /// The smallest and largest size a window opens at, whatever was saved.
+    const MIN: (f64, f64) = (480.0, 320.0);
+    const MAX: f64 = 16384.0;
+    /// Further than this from the desktop's origin is no place a screen is.
+    const FAR: f64 = 65536.0;
+
+    /// What a window may open at: the size within bounds, and a place only
+    /// when both coordinates are ordinary numbers. Whether the place is on a
+    /// screen connected now is rinch's to judge when it makes the window
+    /// (it lets the system place one whose title bar would be out of reach).
+    pub fn sane(self) -> Option<(u32, u32, Option<(i32, i32)>)> {
+        if !self.width.is_finite() || !self.height.is_finite() {
+            return None;
+        }
+        let width = self.width.clamp(Self::MIN.0, Self::MAX).round() as u32;
+        let height = self.height.clamp(Self::MIN.1, Self::MAX).round() as u32;
+        let place = match (self.x, self.y) {
+            (Some(x), Some(y)) if x.is_finite() && y.is_finite() && x.abs() < Self::FAR && y.abs() < Self::FAR => {
+                Some((x.round() as i32, y.round() as i32))
+            }
+            _ => None,
+        };
+        Some((width, height, place))
+    }
 }
 
 /// The split view's layout as it was last saved, safe to restore; `None`
@@ -245,3 +337,21 @@ pub(crate) use imp::{
     load_app_state_file, load_dark_mode, load_personal, load_personal_sync, load_sidebar_width, save_app_state_file, save_dark_mode,
     save_personal, save_personal_sync, save_sidebar_width,
 };
+pub(crate) use imp::{load_views_json, save_views_json};
+#[cfg(feature = "native")]
+pub(crate) use imp::{load_window, save_window};
+
+#[cfg(test)]
+mod tests {
+    use super::WindowGeometry;
+
+    #[test]
+    fn a_saved_window_opens_within_bounds() {
+        let g = |width, height, x, y| WindowGeometry { width, height, x, y, maximized: false };
+        assert_eq!(g(1300.0, 900.4, Some(-10.0), Some(20.0)).sane(), Some((1300, 900, Some((-10, 20)))));
+        assert_eq!(g(10.0, 99999.0, None, None).sane(), Some((480, 16384, None)));
+        assert_eq!(g(800.0, 600.0, Some(1e9), Some(0.0)).sane(), Some((800, 600, None)));
+        assert_eq!(g(800.0, 600.0, Some(5.0), None).sane(), Some((800, 600, None)));
+        assert_eq!(g(f64::NAN, 600.0, None, None).sane(), None);
+    }
+}

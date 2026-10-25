@@ -124,8 +124,9 @@ fn restore_resolved(store: AppStore, url: &PimbleUrl, resolution: &LinkResolutio
     if live {
         store.send(BackendCommand::GetNode { store_id: url.store, node_id: url.node });
         // Where the focused pane's document is in the tree, which has not
-        // been opened that far.
-        if waiting.contains(&store.focused()) {
+        // been opened that far, unless this device remembers how the
+        // store's rows were left (`views.rs`).
+        if waiting.contains(&store.focused()) && !crate::views::rows_remembered(url.store) {
             store.send(BackendCommand::GetAncestors { store_id: url.store, node_id: url.node });
         }
     }
@@ -273,10 +274,14 @@ fn register_opened_store(store: AppStore, tree_state: UseTreeReturn, opened_stor
     // Auto-expand the store node in the tree — and, for a partial replica,
     // each shared root under it, so the store row does not open onto a list of
     // folder names with nothing in them.
-    tree_state.controller.expand(&format!("store_{}", store_id));
-    if !opened_store.roots.is_empty() {
-        for &root_id in &roots {
-            tree_state.controller.expand(&format!("node_{}_{}", store_id, root_id));
+    // A store this device has shown before opens as it was left
+    // (`views.rs`).
+    if !crate::views::seen_store(store_id) {
+        tree_state.controller.expand(&format!("store_{}", store_id));
+        if !opened_store.roots.is_empty() {
+            for &root_id in &roots {
+                tree_state.controller.expand(&format!("node_{}_{}", store_id, root_id));
+            }
         }
     }
 
@@ -780,6 +785,14 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     }
                 }
                 refetch_below_changed_access(store, *children_store_id, &access_changed);
+
+                // A row left expanded on this device opens again: its
+                // children are fetched as soon as it is here.
+                for child in children {
+                    if store.is_expanded(*children_store_id, child.id) && !store.has_children_loaded(*children_store_id, child.id) {
+                        store.send(BackendCommand::GetChildren { store_id: *children_store_id, node_id: child.id });
+                    }
+                }
 
                 // Request mount state for any mount nodes (addressed in
                 // their own store).

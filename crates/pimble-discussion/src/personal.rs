@@ -1,19 +1,18 @@
 //! The personal document (docs/DISCUSSIONS_CONTRACT.md sections 8 and 8b):
 //! one yrs document per person, edited only by their own devices, never
-//! shared. It holds what they have read in discussions and where they were
-//! in each node.
+//! shared. It holds what they have read in discussions.
 //!
 //! ```text
 //! root map "read":   Map<"<store id>/<discussion id>", Map {
 //!                       watermark: String?   every message created at or before it is read
 //!                       seen: Map<message id, true>   read messages newer than the watermark
 //!                    }>
-//! root map "places": Map<"<store id>/<node id>", Map {
-//!                       anchor: Buffer, head: Buffer, top: Buffer?, at: String
-//!                    }>
+//! root map "places": no longer written: where someone was in each node is
+//!                    kept per device (Joe, 2026-10-23), and what earlier
+//!                    versions wrote is emptied (`drop_places`)
 //! ```
 //!
-//! Both are root maps, so no container is made on first use at the top; each
+//! They are root maps, so no container is made on first use at the top; each
 //! entry is one device's own map, and two devices making the same entry while
 //! apart keep one of them whole, which for read state costs at most a few
 //! messages shown unread again, never one shown read that was not.
@@ -29,23 +28,6 @@ const READ: &str = "read";
 const PLACES: &str = "places";
 const WATERMARK: &str = "watermark";
 const SEEN: &str = "seen";
-const ANCHOR: &str = "anchor";
-const HEAD: &str = "head";
-const TOP: &str = "top";
-const AT: &str = "at";
-
-/// How many places are kept; older ones are dropped (contract section 8b).
-pub const MAX_PLACES: usize = 2000;
-
-/// Where someone was in a node: their selection and the first visible line,
-/// as rinch's sticky bytes (opaque here).
-#[derive(Debug, Clone, PartialEq)]
-pub struct Place {
-    pub anchor: Vec<u8>,
-    pub head: Vec<u8>,
-    pub top: Option<Vec<u8>>,
-    pub at: String,
-}
 
 fn key(store: &str, node: &str) -> String {
     format!("{store}/{node}")
@@ -54,13 +36,6 @@ fn key(store: &str, node: &str) -> String {
 fn string_of(out: Option<Out>) -> Option<String> {
     match out {
         Some(Out::Any(Any::String(s))) => Some(s.to_string()),
-        _ => None,
-    }
-}
-
-fn bytes_of(out: Option<Out>) -> Option<Vec<u8>> {
-    match out {
-        Some(Out::Any(Any::Buffer(b))) => Some(b.to_vec()),
         _ => None,
     }
 }
@@ -213,50 +188,14 @@ impl Personal {
 
     // ── Places ──────────────────────────────────────────────────────────
 
-    pub fn place(&self, store: &str, node: &str) -> Option<Place> {
-        let txn = self.doc.transact();
-        let Some(Out::YMap(m)) = self.places.get(&txn, &key(store, node)) else { return None };
-        Some(Place {
-            anchor: bytes_of(m.get(&txn, ANCHOR))?,
-            head: bytes_of(m.get(&txn, HEAD))?,
-            top: bytes_of(m.get(&txn, TOP)),
-            at: string_of(m.get(&txn, AT)).unwrap_or_default(),
-        })
-    }
-
-    /// Remember `place` for the node, replacing what was there, and keep only
-    /// the [`MAX_PLACES`] most recent (by `at`, then key: the same rule on
-    /// every device). `true` when something changed.
-    pub fn set_place(&self, store: &str, node: &str, place: &Place) -> bool {
-        if self.place(store, node).as_ref().is_some_and(|p| p.anchor == place.anchor && p.head == place.head && p.top == place.top) {
+    /// Empty the places earlier versions kept here; they are per device now
+    /// (docs/DISCUSSIONS_CONTRACT.md section 8b). `true` when there were any.
+    pub fn drop_places(&self) -> bool {
+        let mut txn = self.doc.transact_mut();
+        if self.places.len(&txn) == 0 {
             return false;
         }
-        let mut txn = self.doc.transact_mut();
-        let m: MapRef = self.places.insert(&mut txn, key(store, node).as_str(), MapPrelim::default());
-        m.insert(&mut txn, ANCHOR, Any::Buffer(place.anchor.clone().into()));
-        m.insert(&mut txn, HEAD, Any::Buffer(place.head.clone().into()));
-        if let Some(top) = &place.top {
-            m.insert(&mut txn, TOP, Any::Buffer(top.clone().into()));
-        }
-        m.insert(&mut txn, AT, place.at.clone());
-        let len = self.places.len(&txn) as usize;
-        if len > MAX_PLACES {
-            let mut all: Vec<(String, String)> = self
-                .places
-                .iter(&txn)
-                .map(|(k, v)| {
-                    let at = match v {
-                        Out::YMap(m) => string_of(m.get(&txn, AT)).unwrap_or_default(),
-                        _ => String::new(),
-                    };
-                    (at, k.to_string())
-                })
-                .collect();
-            all.sort();
-            for (_, k) in all.into_iter().take(len - MAX_PLACES) {
-                self.places.remove(&mut txn, &k);
-            }
-        }
+        self.places.clear(&mut txn);
         true
     }
 }
@@ -323,18 +262,17 @@ mod tests {
     }
 
     #[test]
-    fn places_are_kept_and_bounded() {
+    fn places_from_earlier_versions_are_emptied() {
         let p = Personal::new();
-        let place = |at: &str| Place { anchor: vec![1], head: vec![2], top: Some(vec![3]), at: at.into() };
-        assert!(p.set_place("s", "n", &place("1")));
-        assert!(!p.set_place("s", "n", &place("2")), "the same place is no change");
-        assert_eq!(p.place("s", "n"), Some(place("1")));
-        let reloaded = Personal::load(&p.save());
-        assert_eq!(reloaded.place("s", "n"), Some(place("1")));
-        for i in 0..(MAX_PLACES + 5) {
-            p.set_place("s", &format!("n{i:05}"), &Place { anchor: vec![i as u8], head: vec![], top: None, at: format!("{i:05}") });
+        assert!(!p.drop_places());
+        {
+            let mut txn = p.doc.transact_mut();
+            let m: MapRef = p.places.insert(&mut txn, "s/n", MapPrelim::default());
+            m.insert(&mut txn, "anchor", Any::Buffer(vec![1].into()));
         }
-        let txn = p.doc.transact();
-        assert_eq!(p.places.len(&txn) as usize, MAX_PLACES);
+        let other = Personal::load(&p.save());
+        assert!(other.drop_places());
+        p.merge(&other.save());
+        assert_eq!(p.places.len(&p.doc.transact()), 0, "the emptying reaches the other devices");
     }
 }

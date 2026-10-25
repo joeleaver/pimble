@@ -1,6 +1,5 @@
-//! The personal document in the app (docs/DISCUSSIONS_CONTRACT.md sections
-//! 8 and 8b): what this person has read in discussions and where they were
-//! in each node, kept on this device (`persistence::load_personal`), saved a
+//! The personal document in the app (docs/DISCUSSIONS_CONTRACT.md section
+//! 8): what this person has read in discussions, kept on this device (`persistence::load_personal`), saved a
 //! moment after it changes. Never shared, never in a store.
 
 use std::cell::{Cell, RefCell};
@@ -26,7 +25,13 @@ const SYNC_EVERY_MS: u32 = 60_000;
 pub(crate) fn with<R>(f: impl FnOnce(&Personal) -> R) -> R {
     DOC.with(|d| {
         let mut d = d.borrow_mut();
-        let doc = d.get_or_insert_with(|| Personal::load(&crate::persistence::load_personal()));
+        let doc = d.get_or_insert_with(|| {
+            let doc = Personal::load(&crate::persistence::load_personal());
+            // Places are kept per device now (`views.rs`); the emptying
+            // goes to the account's other copies with the next sync.
+            doc.drop_places();
+            doc
+        });
         f(doc)
     })
 }

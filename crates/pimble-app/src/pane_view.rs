@@ -275,6 +275,8 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                 // scroll by hand stops it following anyone.
                 crate::presence::moved(store, pane);
                 crate::presence::follow::scrolled(pane);
+                // Where it rests is where it opens next time.
+                crate::places::moved(store, pane);
             },
             // A board node's row dropped on the text goes in as a picture
             // of it (docs/IMAGE_MARKUP_CONTRACT.md section 2).

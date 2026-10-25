@@ -20,5 +20,5 @@ pub mod thread;
 
 pub use body::{Body, Span};
 pub use doc::{new_content, Anchor, Author, Discussion, DiscussionError, DiscussionTxn, Edited, Stamp, ROOT_KEY};
-pub use personal::{Personal, Place};
+pub use personal::Personal;
 pub use thread::{DiscussionSnapshot, MessageSnap, Resolved, ThreadItem};

@@ -116,7 +116,7 @@ fn file_entries(store: AppStore) -> Vec<MenuEntry> {
         }));
         entries.push(MenuEntry::Separator);
         entries.push(MenuEntry::item("Exit", "Alt+F4", || {
-            rinch::prelude::close_current_window()
+            crate::app::close_window()
         }));
     }
 

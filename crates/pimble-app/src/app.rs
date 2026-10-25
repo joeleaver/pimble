@@ -1120,9 +1120,26 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
     // Double-click detection for rename: (last_click_time, last_click_value)
     let last_click: Rc<Cell<(f64, String)>> = Rc::new(Cell::new((now_ms(), String::new())));
 
-    // Persistent tree state — created once, preserves expanded/selected across data changes
-    let tree_state = UseTreeReturn::new(UseTreeOptions { multiple: true, ..Default::default() });
+    // Persistent tree state — created once, preserves expanded/selected across data changes.
+    // The rows open as this device left them (`views.rs`): rinch's set
+    // holds their tree values, `AppStore::expanded` the nodes, whose children
+    // are fetched as each row arrives (`ChildrenLoaded`).
+    let remembered = crate::views::expanded();
+    store.expanded.update(|e| {
+        e.extend(remembered.iter().filter_map(|value| match parse_tree_value(value) {
+            Some((store_id, Some(node_id))) => Some((store_id, node_id)),
+            _ => None,
+        }));
+    });
+    let tree_state = UseTreeReturn::new(UseTreeOptions {
+        multiple: true,
+        initial_expanded: remembered.into_iter().collect(),
+        ..Default::default()
+    });
     TREE_STATE.with(|cell| cell.set(Some(tree_state)));
+    let _ = rinch::Effect::new(move || {
+        tree_state.expanded.with(crate::views::expanded_now);
+    });
 
     // A followed link's target opens the way a search hit does, with
     // `open_node` (docs/LINKS_CONTRACT.md "Following a link"), deferred out
@@ -4550,7 +4567,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 // own doc comment says to wire.
                 on_minimize: || minimize_current_window(),
                 on_maximize: || toggle_maximize_current_window(),
-                on_close: || close_current_window(),
+                on_close: || close_window(),
 
                 style { {APP_CSS} }
                 style { {EDITOR_CSS} }
@@ -4635,7 +4652,8 @@ pub fn run(renderer: Renderer) {
     // Theme
     let theme = theme_props(untracked(|| store.dark_mode.get()));
 
-    // Save-on-close: register a thread-local that the close callback invokes.
+    // Save-on-close (an OS close; the app's own close button and File >
+    // Exit go through `close_window`): register a thread-local that the close callback invokes.
     // WindowProps requires Send+Sync but our state is Rc-based (main thread only),
     // so we use the same thread-local pattern as EVENT_PROCESSOR.
     thread_local! {
@@ -4643,8 +4661,10 @@ pub fn run(renderer: Renderer) {
     }
     CLOSE_HANDLER.with(|cell| {
         *cell.borrow_mut() = Some(Box::new(move || {
-            // Edits persist live through the collab relay; nothing to flush on close.
-            let _ = store;
+            // Edits persist live through the collab relay. What this device
+            // remembers of how things looked is written now, with every
+            // pane's place and board camera as they are.
+            remember_views(Some(store));
         }));
     });
     let on_close: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(|| {
@@ -4656,10 +4676,16 @@ pub fn run(renderer: Renderer) {
         true // proceed with close
     });
 
+    // The size and place it closed at on this device.
+    let saved_window = crate::persistence::load_window();
+    let (width, height, place) = saved_window.and_then(|w| w.sane()).unwrap_or((1200, 800, None));
     let props = WindowProps {
         title: "Pimble".into(),
-        width: 1200,
-        height: 800,
+        width,
+        height,
+        x: place.map(|p| p.0),
+        y: place.map(|p| p.1),
+        maximized: saved_window.is_some_and(|w| w.maximized),
         borderless: true,
         transparent: true,
         resizable: true,
@@ -5017,4 +5043,36 @@ mod tests {
         assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Vault, RelaySide::Member, false), "encrypted · offline");
         assert_eq!(sync_badge_text(&SyncState::Offline, StoreKind::Vault, RelaySide::Member, true), "owner offline");
     }
+}
+
+/// What this device remembers of how things looked (`views.rs`), written now
+/// with every pane's place and board camera as they are: the window is
+/// closing.
+#[cfg(feature = "native")]
+fn remember_views(store: Option<AppStore>) {
+    if let Some(store) = store.or_else(|| crate::links::with_app_store(|store| store)) {
+        crate::places::remember_all(store);
+    }
+    crate::boards::remember_all();
+    crate::views::save_now();
+    // The window's own size and place (as it is when not maximized, where
+    // the platform says), and whether it is maximized.
+    if let Some(window) = rinch::prelude::current_window_restore() {
+        crate::persistence::save_window(&crate::persistence::WindowGeometry {
+            width: window.size.0,
+            height: window.size.1,
+            x: window.position.map(|p| p.0),
+            y: window.position.map(|p| p.1),
+            maximized: window.maximized,
+        });
+    }
+}
+
+/// Close the window (its close button, File > Exit), writing first what
+/// this device remembers of how things looked. Rinch's own close control
+/// exits without asking `on_close_requested`.
+#[cfg(feature = "native")]
+pub(crate) fn close_window() {
+    remember_views(None);
+    close_current_window();
 }
