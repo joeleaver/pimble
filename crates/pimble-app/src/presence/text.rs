@@ -106,7 +106,7 @@ pub(crate) fn mine(store: AppStore, pane: PaneId) -> Option<TextPresence> {
 
 /// The first position of pane `pane`'s note in view: on the first line whose
 /// bottom is below the top of the text's box.
-fn viewport_top(pane: PaneId, handle: &crate::rinch_editor::EditorHandle) -> Option<usize> {
+pub(crate) fn viewport_top(pane: PaneId, handle: &crate::rinch_editor::EditorHandle) -> Option<usize> {
     let (_, top, _, _) = text_rect(pane)?;
     let doc = handle.doc();
     let mut blocks = Vec::new();

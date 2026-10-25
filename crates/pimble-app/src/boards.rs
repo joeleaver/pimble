@@ -574,6 +574,9 @@ struct Session {
     view: BoardView,
     /// Fitted to the visible extent once, the first time it showed a board.
     fitted: bool,
+    /// The camera this device left the board at (`views.rs`), taken instead
+    /// of fitting the first time it shows.
+    restore: Option<crate::views::Camera>,
     gesture: Gesture,
     /// The selection, in the order it was made.
     selected: Vec<String>,
@@ -806,6 +809,7 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
         undo: None,
         view,
         fitted: false,
+        restore: crate::views::camera(store_id, node_id),
         gesture: Gesture::Idle,
         selected: Vec::new(),
         space: false,
@@ -841,6 +845,7 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
 /// go of its subscription.
 pub(crate) fn stop(store: AppStore, pane: PaneId) {
     tools::end_text(store, pane);
+    remember_camera(pane, scale_of(pane));
     let Some(session) = SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()].take()) else { return };
     let state = store.pane(pane);
     if session.markup.is_some() {
@@ -1049,6 +1054,7 @@ pub(crate) fn start_markup(store: AppStore, pane: PaneId, store_id: StoreId, nod
         undo: None,
         view,
         fitted: false,
+        restore: None,
         gesture: Gesture::Idle,
         selected: Vec::new(),
         space: false,
@@ -1174,6 +1180,7 @@ fn new_undo_step(pane: PaneId) {
 /// side panel follow, then the surface is handed a frame if one is due.
 fn after_change(store: AppStore, pane: PaneId) {
     let scale = scale_of(pane);
+    remember_camera(pane, scale);
     let state = store.pane(pane);
     let ui = state.board_ui;
     let published = with_session(pane, |s| {
@@ -1325,6 +1332,29 @@ pub(crate) fn draw_others(store: AppStore, pane: PaneId) {
     ui.others.set_if_changed(others);
 }
 
+/// Remember where pane `pane`'s board node is looked at, on this device
+/// (`views.rs`), once it shows at a camera of its own. A picture's markup
+/// is not a node of its own and is not remembered.
+fn remember_camera(pane: PaneId, scale: f32) {
+    let Some((store_id, node_id, camera)) = with_session(pane, |s| {
+        (s.fitted && s.markup.is_none() && s.view.size().0 > 0).then(|| {
+            let center = s.view.center();
+            (s.store_id, s.node_id, crate::views::Camera::new(center.x, center.y, s.view.zoom() / scale))
+        })
+    })
+    .flatten() else {
+        return;
+    };
+    crate::views::set_camera(store_id, node_id, camera);
+}
+
+/// Remember the camera of every pane's board (the window is closing).
+pub(crate) fn remember_all() {
+    for pane in PaneId::ALL {
+        remember_camera(pane, scale_of(pane));
+    }
+}
+
 /// Hand pane `pane`'s surface its next frame, if anything changed: the
 /// view at the surface's own physical size, fitted to the board the first
 /// time there is one to fit.
@@ -1338,6 +1368,12 @@ fn present(pane: PaneId) {
     let writer = surface.writer();
     with_session(pane, |s| {
         s.view.resize(width, height);
+        if let Some(camera) = s.restore.take().filter(|_| !s.fitted) {
+            // Where this device left it.
+            s.view.set_camera(Point::new(camera.x, camera.y), camera.zoom * scale);
+            s.fitted = true;
+            s.view.settle(&picture_source());
+        }
         if !s.fitted && s.view.snapshot().exists {
             match s.view.snapshot().visible_extent() {
                 Some(extent) => {
@@ -1508,7 +1544,10 @@ fn installed(src: String, picture: Result<Arc<Picture>, String>) {
 
 /// Fit pane `pane`'s board to what it shows.
 pub(crate) fn fit(store: AppStore, pane: PaneId) {
-    with_session(pane, |s| s.fitted = false);
+    with_session(pane, |s| {
+        s.fitted = false;
+        s.restore = None;
+    });
     after_change(store, pane);
 }
 

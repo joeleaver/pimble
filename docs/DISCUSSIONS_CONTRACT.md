@@ -250,8 +250,8 @@ document, because a glance must not be an edit that everyone syncs.
 Decision (Joe, 2026-10-21): **read state follows you across your devices.**
 
 - **What it is.** One yrs document per account, the **personal document**, edited only
-  by that person's devices. It holds read state (below) and your place in every node
-  (section 8b):
+  by that person's devices. It holds read state (below); your place in every node is
+  kept per device (section 8b):
   ```
   read: Map<"<store id>/<discussion id>", Map>
     watermark: String           RFC 3339; every message created at or before it is read
@@ -289,33 +289,53 @@ Decision (Joe, 2026-10-21): **read state follows you across your devices.**
 ## 8b. Your place in every node
 
 Joe, 2026-10-21: the sticky positions discussions use also remember where you were in
-every node. This isn't a discussion feature, but it lives in the same personal document
-and is built with wave 4.
+every node. **Joe, 2026-10-23: every client keeps its own** — each desktop install and
+each browser remembers its own places, beside the explorer's expanded rows and every
+board's camera. Window sizes and screens differ between devices, so a view from one rarely
+fits another. Built on branch `remember-views` (`crates/pimble-app/src/views.rs`), which
+replaced the first cut (places in the personal document, following the account).
 
-- **What is kept, per node you've had open:** your selection as two sticky positions
-  (anchor and head, the same opaque rinch bytes as section 2) and the first visible line
-  as a third, so coming back shows the same view even when the caret was off screen.
+- **What is kept, on this device only** (`<data dir>/pimble/views.json` on the desktop,
+  `localStorage` `pimble.views` in the browser; never in a store, never in the personal
+  document, never sent anywhere):
   ```
-  places: Map<"<store id>/<node id>", Map>
-    anchor, head: Bytes          the selection (equal for a plain caret)
-    top:          Bytes          the first visible line
-    at:           String         when it was last written
+  expanded:    [tree value]                     the explorer's expanded rows, mount paths
+                                                included, in the order they opened (5,000 kept)
+  stores_seen: [store id]                       a store seen before opens as it was left; a
+                                                new one opens expanded
+  places:      { "<store id>/<node id>": { anchor, head, top?, at } }
+                                                the selection and the first line in view,
+                                                rinch's sticky bytes in base64
+  boards:      { "<store id>/<node id>": { x, y, zoom, at } }
+                                                the board point at the middle of the view and
+                                                board units per CSS pixel
+  clock:       the last `at` handed out
   ```
-- **Restored** when a node opens in a pane and its collaboration session is up, from
-  `top` and then the selection, unless the opening already names a place (a link to a
-  heading, a search hit, a discussion, a back/forward step that carries its own). Because
-  the positions are sticky, the place survives other people's edits while you were away,
-  and it lands nearby (`displaced`) when its text was deleted. Being on a different
-  device doesn't matter: the personal document follows you.
-- **Written sparingly**, never per keystroke or caret move: when a pane leaves the
-  node, when the window loses focus or closes, and after about five seconds of quiet.
-  Each write replaces that node's entry.
-- **Bounded**: only the 2,000 most recently written entries are kept (by `at`); older
-  ones are dropped by whichever device notices first, which is a deterministic rule
-  every device applies the same way.
-- **Boards and sheets later**: a board's viewport (pan and zoom) and a sheet's selected
-  cell would be entries of the same shape under the same key.
+- **Restored** when a node opens in a pane and its collaboration session is up: the
+  selection, then `top` at the top of the view (the caret a third of the way down when
+  there is no `top`), unless the opening already names a place (a link to a heading, a
+  search hit, a discussion, a back/forward step that carries its own). Because the
+  positions are sticky, the place survives other people's edits while you were away. A
+  board opens at its camera instead of fitting its contents; "Fit" fits. The explorer's
+  rows open as they were left, each row's children fetched as it arrives.
+- **Written sparingly**: a text place when a pane leaves the node, when the window closes,
+  and after about five seconds without a caret move or a scroll; a board's camera as it
+  changes and when the pane leaves it; rows as they open and close. The file is written a
+  second after a change, once for a burst, and at once when the window closes.
+- **Bounded**: the 2,000 most recently written places and cameras each.
+- The places earlier versions wrote into the personal document are emptied there
+  (`Personal::drop_places`), and the emptying reaches the account's other copies with the
+  next sync.
+- Not kept yet: a sheet's selected cell and scroll, a discussion node's scroll, and the
+  explorer's own scroll. rinch has no way to set an element's scroll from the app.
 - Read-only nodes remember a place too: nothing in the node's document changes.
+
+**The window** (Joe, 2026-10-23): the desktop window opens at the size and place it closed
+at, and maximized if it was (`state.json` `window`). The size is kept within 480x320 and
+16384 pixels. A place is used only where the window's title strip lands on a screen
+connected now; otherwise the system places the window (rinch: `WindowProps::maximized`,
+`current_window_restore`, and the reachability check). Wayland gives no place, so there
+only the size and maximized state come back.
 
 ## 9. Search, MCP, sharing, sync
 

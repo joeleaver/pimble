@@ -306,7 +306,7 @@ pub(crate) fn start_editing(
         state.pending_anchor.set(None);
         crate::links::place_anchor(&handle, &anchor);
     } else {
-        // Where this person was in it last, on any of their devices
+        // Where this person was in it last on this device
         // (docs/DISCUSSIONS_CONTRACT.md section 8b).
         crate::places::restore(pane, store_id, node_id);
     }
