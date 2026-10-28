@@ -21,8 +21,9 @@
 30 + Vello 0.11 and a pinned winit fork (#1960, #1965). The window state now keeps
 `monitor` (`WindowRestore::monitor`, passed back as `WindowProps::monitor` with a place),
 which tells monitors of different scales apart; `None` on Wayland. rinch's
-`window-restore` branch stays (620bc231) and is never rewritten, so `v0.14.0` still
-builds. Checked: 1137 tests, the web and Windows builds, and the isolated desktop app on the
+`window-restore` branch was then deleted (Joe accepted it): `v0.14.0` no longer rebuilds
+from source as tagged. To rebuild it, point its rinch dependencies at `rev = "620bc231"`
+(the branch's last head, all of it on rinch main) instead of the branch. Checked: 1137 tests, the web and Windows builds, and the isolated desktop app on the
 GPU (Vulkan) with views and the window restored. Not released yet.
 
 A push named `git push jkbase master` (instead of plain `git push jkbase`, whose refspec is
