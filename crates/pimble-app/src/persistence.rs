@@ -278,8 +278,10 @@ mod imp {
 
 /// The desktop window's size (logical pixels, the content area) and outer
 /// top-left on the desktop, when the platform says where it is (Wayland
-/// never does), as it is when not maximized; and whether it was maximized.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+/// never does), as it is when not maximized; whether it was maximized; and
+/// the platform's name for the monitor the place is on, which tells two
+/// monitors of different scales apart.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WindowGeometry {
     pub width: f64,
     pub height: f64,
@@ -289,6 +291,8 @@ pub struct WindowGeometry {
     pub y: Option<f64>,
     #[serde(default)]
     pub maximized: bool,
+    #[serde(default)]
+    pub monitor: Option<String>,
 }
 
 impl WindowGeometry {
@@ -302,7 +306,7 @@ impl WindowGeometry {
     /// when both coordinates are ordinary numbers. Whether the place is on a
     /// screen connected now is rinch's to judge when it makes the window
     /// (it lets the system place one whose title bar would be out of reach).
-    pub fn sane(self) -> Option<(u32, u32, Option<(i32, i32)>)> {
+    pub fn sane(&self) -> Option<(u32, u32, Option<(i32, i32)>)> {
         if !self.width.is_finite() || !self.height.is_finite() {
             return None;
         }
@@ -347,7 +351,7 @@ mod tests {
 
     #[test]
     fn a_saved_window_opens_within_bounds() {
-        let g = |width, height, x, y| WindowGeometry { width, height, x, y, maximized: false };
+        let g = |width, height, x, y| WindowGeometry { width, height, x, y, maximized: false, monitor: None };
         assert_eq!(g(1300.0, 900.4, Some(-10.0), Some(20.0)).sane(), Some((1300, 900, Some((-10, 20)))));
         assert_eq!(g(10.0, 99999.0, None, None).sane(), Some((480, 16384, None)));
         assert_eq!(g(800.0, 600.0, Some(1e9), Some(0.0)).sane(), Some((800, 600, None)));

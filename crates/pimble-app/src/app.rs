@@ -4677,14 +4677,16 @@ pub fn run(renderer: Renderer) {
 
     // The size and place it closed at on this device.
     let saved_window = crate::persistence::load_window();
-    let (width, height, place) = saved_window.and_then(|w| w.sane()).unwrap_or((1200, 800, None));
+    let (width, height, place) = saved_window.as_ref().and_then(|w| w.sane()).unwrap_or((1200, 800, None));
     let props = WindowProps {
         title: "Pimble".into(),
         width,
         height,
         x: place.map(|p| p.0),
         y: place.map(|p| p.1),
-        maximized: saved_window.is_some_and(|w| w.maximized),
+        maximized: saved_window.as_ref().is_some_and(|w| w.maximized),
+        // The monitor the place is on, only with a place to put there.
+        monitor: saved_window.and_then(|w| w.monitor).filter(|_| place.is_some()),
         borderless: true,
         transparent: true,
         resizable: true,
@@ -5063,6 +5065,7 @@ fn remember_views(store: Option<AppStore>) {
             x: window.position.map(|p| p.0),
             y: window.position.map(|p| p.1),
             maximized: window.maximized,
+            monitor: window.monitor,
         });
     }
 }
