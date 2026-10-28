@@ -24,7 +24,9 @@ which tells monitors of different scales apart; `None` on Wayland. rinch's
 `window-restore` branch was then deleted (Joe accepted it): `v0.14.0` no longer rebuilds
 from source as tagged. To rebuild it, point its rinch dependencies at `rev = "620bc231"`
 (the branch's last head, all of it on rinch main) instead of the branch. Checked: 1137 tests, the web and Windows builds, and the isolated desktop app on the
-GPU (Vulkan) with views and the window restored. Not released yet.
+GPU (Vulkan) with views and the window restored. **Released as v0.14.1** (release commit
+79e18fa), deployed (jkbase v37; backup `bkp_1793214273715_e44c1b2d874d82eb`) and installed
+here.
 
 A push named `git push jkbase master` (instead of plain `git push jkbase`, whose refspec is
 `HEAD:refs/heads/main`) created a `master` branch on the jkbase remote on 2026-10-25. It
