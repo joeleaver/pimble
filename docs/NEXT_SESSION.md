@@ -22,6 +22,14 @@ monitor), in both locks at 158f0dc8. The PR was open at release time. **Do not d
 that branch before the pin moves**: a fresh checkout of `v0.14.0` resolves it. Once it
 merges, point `Cargo.toml`, `crates/pimble-app/Cargo.toml` and `web/Cargo.toml` back at
 `main` and `cargo update` both locks.
+When that happens (the Rinch session will say; rinch `main` 57bc511d+ needs no
+`[patch.crates-io]` at all after wgpu 30 + Vello 0.11, #1960, and winit 0.31.0-beta.4 as a
+direct dependency, #1965): delete every rinch-related `[patch.crates-io]` line from the
+root `Cargo.toml` (wgpu-fork, winit-fork, dpi) and `web/` if any; take wgpu or vello types
+through `rinch::wgpu` / `rinch::vello`, never own dependencies; OS file-drag paths may
+arrive just after the drag enters rather than at enter. #1884 will also add a `monitor`
+field to `WindowRestore`/`WindowProps`: persist it in `state.json` `window`
+(`persistence::WindowGeometry`) and pass it back.
 
 A push named `git push jkbase master` (instead of plain `git push jkbase`, whose refspec is
 `HEAD:refs/heads/main`) created a `master` branch on the jkbase remote on 2026-10-25. It
