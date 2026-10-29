@@ -289,6 +289,13 @@ what it touched and that selected (`Presence::say_on_board`).
 | `add_layer`, `update_layer`, `delete_layer` | name, visibility, lock, opacity, order; delete with its elements or `merge_down` |
 | `set_canvas` | a page (or one fitted to what shows, or none) and the markup switch |
 
+Added the same day, from sketching a floor plan and a game level with contour lines
+through the tools: strokes take `smooth` (a Catmull-Rom curve through the given points,
+eight steps a segment, stored as ordinary points) and `closed`; a pen with a `fill` is a
+filled freehand shape (rendered, exported and hit as one, `pimble-board`; the app's style
+panel does not offer it yet); a text label takes `center` (x, y its center); `get_canvas`
+gives text and grown sticky notes the size their text takes.
+
 What the app's tools refuse a person these refuse an agent: an element that is locked takes
 only a change that unlocks it (in the same change), an element on a locked layer takes none,
 nothing is added to a locked layer, and with every layer locked a new element has nowhere to

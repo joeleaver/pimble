@@ -402,7 +402,11 @@ carry an author of their own ("Claude, via <person>").
 `get_node` on a canvas node), `render_canvas`, and writing (`create_canvas`,
 `insert_canvas`, `add_elements`, `update_elements`, `delete_elements`, the layer tools,
 `set_canvas`); an agent's elements carry its own author, the agent's id and name.
-docs/MCP_CONTRACT.md "Canvases".
+docs/MCP_CONTRACT.md "Canvases". Renderer fixes found by sketching through them: a
+callout's pointer is wound like its box, so the two fill as one (the pointer's outline
+showed through the box before); a text's descenders count in its bounds (a render cut to
+what shows clipped them); and a pen with a `fill` style is filled as a closed shape (no
+pen had one before, so no drawing changes; the app's style panel does not set it yet).
 
 ## 10. Where this sits against images waves 2 to 5
 

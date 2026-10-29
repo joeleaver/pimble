@@ -25,6 +25,8 @@ struct Font {
     face: Face<'static>,
     units_per_em: f32,
     ascender: f32,
+    /// Below the baseline, positive.
+    descender: f32,
     glyphs: Mutex<HashMap<u16, Option<Arc<Path>>>>,
 }
 
@@ -35,6 +37,7 @@ fn font() -> &'static Font {
         Font {
             units_per_em: face.units_per_em() as f32,
             ascender: face.ascender() as f32,
+            descender: -(face.descender() as f32),
             face,
             glyphs: Mutex::new(HashMap::new()),
         }
@@ -68,6 +71,17 @@ pub struct TextLayout {
 impl TextLayout {
     pub fn line_height(&self) -> f32 {
         self.font_size * LINE_HEIGHT
+    }
+
+    /// How far ink reaches below the last line's box: descenders (g, y, p)
+    /// hang past it, since the baseline sits the ascender below the line's
+    /// top. What paints must be counted, or a render cut to an element's
+    /// bounds clips them.
+    pub fn ink_below(&self) -> f32 {
+        let f = font();
+        let scale = self.font_size / f.units_per_em;
+        let baseline0 = (self.line_height() - self.font_size) / 2.0 + f.ascender * scale;
+        (baseline0 + f.descender * scale - self.line_height()).max(0.0)
     }
 
     pub fn is_empty(&self) -> bool {

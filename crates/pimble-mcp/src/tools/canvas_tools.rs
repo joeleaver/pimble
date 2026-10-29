@@ -102,7 +102,8 @@ pub struct StyleSpec {
     /// Line, outline and text color.
     #[serde(default)]
     pub stroke: Option<String>,
-    /// Fill color ("none" for no fill).
+    /// Fill color ("none" for no fill). On a pen stroke it fills the shape
+    /// the stroke outlines.
     #[serde(default)]
     pub fill: Option<String>,
     /// Line width in canvas units.
@@ -155,6 +156,18 @@ pub struct ElementSpec {
     /// stroke's points in order, [[x,y],...].
     #[serde(default)]
     pub points: Option<Vec<Vec<f32>>>,
+    /// pen and highlighter: draw a smooth curve through the points (a few
+    /// points are enough for a hill's contour or a river) instead of straight
+    /// segments between them.
+    #[serde(default)]
+    pub smooth: Option<bool>,
+    /// pen: join the last point back to the first (a closed outline; give it
+    /// a fill to shade it).
+    #[serde(default)]
+    pub closed: Option<bool>,
+    /// text: x and y are the label's center instead of its top-left corner.
+    #[serde(default)]
+    pub center: Option<bool>,
     /// callout: the point its pointer touches, [x,y].
     #[serde(default)]
     pub tip: Option<Vec<f32>>,
@@ -240,6 +253,11 @@ pub struct ElementChange {
     /// New points: two for a line or arrow, the whole stroke for pen and highlighter.
     #[serde(default)]
     pub points: Option<Vec<Vec<f32>>>,
+    /// With new points for a stroke: a smooth curve through them, and closed.
+    #[serde(default)]
+    pub smooth: Option<bool>,
+    #[serde(default)]
+    pub closed: Option<bool>,
     /// A callout's new pointer tip, [x,y].
     #[serde(default)]
     pub tip: Option<Vec<f32>>,
@@ -672,6 +690,14 @@ fn geom_of(spec: &ElementSpec, index: usize, scene: &Scene) -> Result<(Kind, Geo
     let geom = match &kind {
         Kind::Rect | Kind::Ellipse | Kind::Diamond | Kind::Frame | Kind::Spotlight => Geom::Rect(rect(kind.as_str(), None)?),
         Kind::Sticky => Geom::Rect(rect("sticky note", Some((STICKY_SIZE, STICKY_SIZE)))?),
+        Kind::Text if spec.center == Some(true) => {
+            let (cx, cy) = xy("text label")?;
+            let font = spec.style.as_ref().and_then(|s| s.font_size).unwrap_or_else(|| Style::default().resolved(&Kind::Text).font_size);
+            let wrap = spec.w.filter(|w| *w > 0.0);
+            let l = pimble_board::text::layout(spec.text.as_deref().unwrap_or(""), font, wrap);
+            let w = wrap.unwrap_or(l.width);
+            Geom::Rect(Rect::new(cx - w / 2.0, cy - l.height / 2.0, wrap.unwrap_or(0.0), 0.0))
+        }
         Kind::Text => Geom::Rect(rect("text box", Some((0.0, 0.0)))?),
         Kind::Line | Kind::Arrow => match points(kind.as_str())?.as_slice() {
             [a, b] => Geom::Segment { a: *a, b: *b },
@@ -682,7 +708,7 @@ fn geom_of(spec: &ElementSpec, index: usize, scene: &Scene) -> Result<(Kind, Geo
             if pts.len() < 2 {
                 return Err(bad(format!("a {kind} stroke takes at least two points")));
             }
-            return Ok((kind, Geom::Stroke, pts.iter().map(|p| [p.x, p.y, 0.5]).collect()));
+            return Ok((kind, Geom::Stroke, stroke_points(&pts, spec.smooth == Some(true), spec.closed == Some(true))));
         }
         Kind::Step => {
             let (x, y) = xy("step")?;
@@ -721,6 +747,43 @@ fn geom_of(spec: &ElementSpec, index: usize, scene: &Scene) -> Result<(Kind, Geo
         }
     };
     Ok((kind, geom, Vec::new()))
+}
+
+/// A stroke's stored points: as given, or a Catmull-Rom curve through them
+/// (eight steps a segment, so it reads as a curve at any zoom the app shows
+/// it at), closed back to the first point when asked. Pressure 0.5: the
+/// stroke's own width all along.
+fn stroke_points(pts: &[Point], smooth: bool, closed: bool) -> Vec<[f32; 3]> {
+    let mut out: Vec<Point> = Vec::new();
+    if smooth && pts.len() >= 3 {
+        let n = pts.len();
+        let at = |i: isize| -> Point {
+            if closed {
+                pts[i.rem_euclid(n as isize) as usize]
+            } else {
+                pts[i.clamp(0, n as isize - 1) as usize]
+            }
+        };
+        let segments = if closed { n } else { n - 1 };
+        for i in 0..segments as isize {
+            let (p0, p1, p2, p3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
+            for k in 0..8 {
+                let t = k as f32 / 8.0;
+                let (t2, t3) = (t * t, t * t * t);
+                let c = |a: f32, b: f32, c: f32, d: f32| {
+                    0.5 * (2.0 * b + (-a + c) * t + (2.0 * a - 5.0 * b + 4.0 * c - d) * t2 + (-a + 3.0 * b - 3.0 * c + d) * t3)
+                };
+                out.push(Point::new(c(p0.x, p1.x, p2.x, p3.x), c(p0.y, p1.y, p2.y, p3.y)));
+            }
+        }
+        out.push(if closed { pts[0] } else { pts[n - 1] });
+    } else {
+        out.extend_from_slice(pts);
+        if closed && pts.first() != pts.last() {
+            out.push(pts[0]);
+        }
+    }
+    out.iter().map(|p| [p.x, p.y, 0.5]).collect()
 }
 
 /// The rectangle a new element takes, for connectors made in the same call.
@@ -883,7 +946,7 @@ fn change_element(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, snapshot: &BoardS
                 if points.len() < 2 {
                     return Err(bad("a stroke takes at least two points"));
                 }
-                t.replace_points(&id, &points.iter().map(|p| [p.x, p.y, 0.5]).collect::<Vec<_>>())?;
+                t.replace_points(&id, &stroke_points(&points, change.smooth == Some(true), change.closed == Some(true)))?;
             }
             None
         }
@@ -1047,6 +1110,14 @@ fn describe(snapshot: &BoardSnapshot, cards: &HashMap<String, String>) -> String
                 line.push_str(&format!(" \"{}{more}\"", shown.replace('\n', "\\n")));
             }
             let geom = match &raw.geom {
+                // Text and sticky notes take the room their text needs.
+                Geom::Rect(r) if raw.kind == Kind::Text => match e.text_box {
+                    Some(tb) => format!("{} (its text)", rect_text(&tb)),
+                    None => rect_text(r),
+                },
+                Geom::Rect(r) if raw.kind == Kind::Sticky && e.grown.is_some_and(|g| g.h > r.h) => {
+                    format!("{}, grown to {}x{} by its text", rect_text(r), n(r.w), n(e.grown.map_or(r.h, |g| g.h)))
+                }
                 Geom::Rect(r) => rect_text(r),
                 Geom::Picture(p) => format!(
                     "{}, picture {} ({}x{} px){}",
@@ -1889,6 +1960,29 @@ mod tests {
         assert_eq!(snap.get(&ids[0]).unwrap().raw.points.len(), 3);
         assert_eq!(snap.get(&ids[0]).unwrap().parent.as_deref(), Some(ids[2].as_str()));
         assert_eq!(snap.get(&ids[1]).unwrap().parent.as_deref(), Some(ids[2].as_str()));
+    }
+
+    #[test]
+    fn smooth_strokes_pass_through_their_points_and_close() {
+        let pts = [Point::new(0.0, 0.0), Point::new(100.0, 0.0), Point::new(100.0, 100.0), Point::new(0.0, 100.0)];
+        let open = stroke_points(&pts, true, false);
+        assert_eq!(open.len(), 3 * 8 + 1);
+        for p in &pts {
+            assert!(open.iter().any(|q| (q[0] - p.x).abs() < 1e-3 && (q[1] - p.y).abs() < 1e-3), "passes through {p:?}");
+        }
+        let closed = stroke_points(&pts, true, true);
+        assert_eq!(closed.len(), 4 * 8 + 1);
+        assert_eq!((closed[0][0], closed[0][1]), (closed[32][0], closed[32][1]), "ends where it began");
+        assert_eq!(stroke_points(&pts, false, true).len(), 5, "straight, closed");
+    }
+
+    #[test]
+    fn a_centered_label_sits_on_its_point() {
+        let board = fresh();
+        let ids = add(&board, &[ElementSpec { x: Some(100.0), y: Some(50.0), center: Some(true), text: Some("Kitchen".into()), ..spec("text") }]).unwrap();
+        let snap = board.snapshot();
+        let tb = snap.get(&ids[0]).unwrap().text_box.unwrap();
+        assert!((tb.center().x - 100.0).abs() < 0.5 && (tb.center().y - 50.0).abs() < 0.5, "{tb:?}");
     }
 
     #[test]

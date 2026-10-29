@@ -359,3 +359,50 @@ fn an_svg_holds_every_element_as_paths_and_pictures_as_data_uris() {
     assert!(!svg.contains("<image") && svg.matches("<path ").count() == 2, "{svg}");
     assert!(balanced(&svg));
 }
+
+/// A text's descenders hang below its line box; a render cut to what the
+/// canvas shows keeps them (found sketching through the MCP, 2026-10-29: "the
+/// logo" lost the bottom of its g).
+#[test]
+fn a_render_keeps_descenders_below_a_text_box() {
+    let b = board();
+    let id = add(&b, NewElement::new(Kind::Text, Geom::Rect(Rect::new(0.0, 0.0, 0.0, 0.0))).with_text("gyp"));
+    let snap = b.snapshot();
+    let e = snap.get(&id).unwrap();
+    let tb = e.text_box.unwrap();
+    assert!(e.bounds.bottom() > tb.bottom() + 1.0, "bounds {:?} box {:?}", e.bounds, tb);
+    let rendered = render_extent(&snap, &NoPictures, 2.0).unwrap();
+    assert!(rendered.rect.bottom() > tb.bottom() + 1.0, "the render reaches below the box: {:?}", rendered.rect);
+}
+
+/// A callout's pointer and box fill as one, whichever way the pointer points
+/// (before 2026-10-29 the two were wound apart and the pointer's outline
+/// showed through the box), and a pen with a fill is a filled shape.
+#[test]
+fn a_callout_box_covers_its_pointer_and_a_filled_pen_is_filled() {
+    for tip in [Point::new(150.0, -100.0), Point::new(-100.0, 300.0)] {
+        let b = board();
+        let style = Style { fill: Some(Color::WHITE), stroke: Some(Color::BLACK), width: Some(3.0), ..Style::default() };
+        add(&b, NewElement::new(Kind::Callout, Geom::Callout { rect: Rect::new(0.0, 0.0, 300.0, 100.0), tip }).with_style(style));
+        let snap = b.snapshot();
+        let r = render_area(&snap, &NoPictures, Rect::new(-120.0, -120.0, 540.0, 440.0), 1.0, Some(Color::WHITE), None, false).unwrap();
+        // Inside the box, away from its edge, everything is the box's white.
+        let px = |x: f32, y: f32| {
+            let (ix, iy) = ((x + 120.0) as u32, (y + 120.0) as u32);
+            let i = ((iy * r.image.width + ix) * 4) as usize;
+            [r.image.data[i], r.image.data[i + 1], r.image.data[i + 2]]
+        };
+        for (x, y) in [(150.0, 50.0), (140.0, 40.0), (160.0, 60.0), (120.0, 50.0), (180.0, 50.0)] {
+            assert_eq!(px(x, y), [255, 255, 255], "inside the box at {x},{y} for tip {tip:?}");
+        }
+    }
+    let b = board();
+    let pts = vec![[0.0, 0.0, 0.5], [100.0, 0.0, 0.5], [100.0, 100.0, 0.5], [0.0, 100.0, 0.5], [0.0, 0.0, 0.5]];
+    let style = Style { fill: Some(Color::rgb(0, 200, 0)), ..Style::default() };
+    let id = add(&b, NewElement::stroke(Kind::Pen, pts).with_style(style));
+    let snap = b.snapshot();
+    let r = render_area(&snap, &NoPictures, Rect::new(0.0, 0.0, 100.0, 100.0), 1.0, Some(Color::WHITE), None, false).unwrap();
+    let i = ((50 * r.image.width + 50) * 4) as usize;
+    assert_eq!(&r.image.data[i..i + 3], &[0, 200, 0], "the middle is filled");
+    assert!(snap.get(&id).unwrap().hits(Point::new(50.0, 50.0), 0.0), "and hit inside");
+}

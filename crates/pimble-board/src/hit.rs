@@ -114,6 +114,11 @@ impl Element {
                     .filter(|v| v[0].is_finite() && v[1].is_finite())
                     .map(|v| (Point::new(v[0], v[1]), width_at(&self.raw.kind, s.width, s.dash, v[2]) / 2.0))
                     .collect();
+                // A filled pen is a shape: inside it hits.
+                let filled = matches!(self.raw.kind, Kind::Pen) && s.fill.is_some_and(|f| f.a > 0) && pts.len() >= 3;
+                if filled && inside_polygon(q, &pts.iter().map(|(p, _)| *p).collect::<Vec<_>>()) {
+                    return true;
+                }
                 match pts.as_slice() {
                     [] => false,
                     [(only, half)] => dist(q, *only) <= half + tol,

@@ -510,7 +510,8 @@ impl Resolver {
         }
         for &i in &order_post {
             let e = &self.raws[i];
-            let extent = own_extent(e, &styles[i], text_boxes[i], grown[i]).or_else(|| {
+            let ink_below = layouts[i].as_ref().map_or(0.0, |l| l.ink_below());
+            let extent = own_extent(e, &styles[i], text_boxes[i], grown[i], ink_below).or_else(|| {
                 if !matches!(e.kind, Kind::Group) {
                     return None;
                 }
@@ -701,7 +702,7 @@ fn lay_out(
 /// An element's own extent in element space: (the pivot rectangle, what it
 /// paints). `None` for a group (its extent is its members') or a kind with
 /// nothing to show.
-fn own_extent(e: &RawElement, s: &ResolvedStyle, text_box: Option<Rect>, grown: Option<Rect>) -> Option<(Rect, Rect)> {
+fn own_extent(e: &RawElement, s: &ResolvedStyle, text_box: Option<Rect>, grown: Option<Rect>, ink_below: f32) -> Option<(Rect, Rect)> {
     let half = s.width / 2.0;
     let shadow = |r: Rect| if s.shadow { r.union(&Rect::new(r.x + SHADOW_OFFSET, r.y + SHADOW_OFFSET, r.w, r.h)) } else { r };
     Some(match (&e.kind, &e.geom) {
@@ -732,7 +733,8 @@ fn own_extent(e: &RawElement, s: &ResolvedStyle, text_box: Option<Rect>, grown: 
         }
         (Kind::Text, Geom::Rect(_)) => {
             let tb = text_box?;
-            (tb, tb)
+            // Descenders hang below the last line's box.
+            (tb, Rect::new(tb.x, tb.y, tb.w, tb.h + ink_below))
         }
         (Kind::Sticky, Geom::Rect(r)) => {
             let g = grown.unwrap_or(*r).normalized();
@@ -740,7 +742,7 @@ fn own_extent(e: &RawElement, s: &ResolvedStyle, text_box: Option<Rect>, grown: 
         }
         (Kind::Frame, Geom::Rect(r)) => {
             let r = r.normalized();
-            let painted = text_box.map_or(r, |tb| r.union(&tb));
+            let painted = text_box.map_or(r, |tb| r.union(&Rect::new(tb.x, tb.y, tb.w, tb.h + ink_below)));
             (r, painted.inflate(half))
         }
         (Kind::Spotlight, Geom::Rect(r)) => {

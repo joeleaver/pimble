@@ -202,7 +202,14 @@ pub(crate) fn callout_pointer(r: &Rect, tip: Point) -> [Point; 3] {
 fn callout_path(r: &Rect, tip: Point) -> Option<Path> {
     let mut pb = PathBuilder::new();
     pb.push_rect(tiny_skia::Rect::from_xywh(r.x, r.y, r.w.max(0.01), r.h.max(0.01))?);
-    let [p0, p1, p2] = callout_pointer(r, tip);
+    let [mut p0, p1, mut p2] = callout_pointer(r, tip);
+    // Wound like the box (clockwise on screen), so where the pointer overlaps
+    // the box the two fill as one under the nonzero rule; wound the other way
+    // the overlap cancelled out and the pointer's outline showed through the
+    // box and its text.
+    if (p1.x - p0.x) * (p2.y - p0.y) - (p1.y - p0.y) * (p2.x - p0.x) < 0.0 {
+        std::mem::swap(&mut p0, &mut p2);
+    }
     pb.move_to(p0.x, p0.y);
     pb.line_to(p1.x, p1.y);
     pb.line_to(p2.x, p2.y);
@@ -233,6 +240,21 @@ pub(crate) fn stroke_path(points: &[[f32; 3]]) -> Option<Path> {
         // A dot: a zero-length segment, which a round cap draws as a disc.
         pb.line_to(first[0] + 0.01, first[1]);
     }
+    pb.finish()
+}
+
+/// A pen stroke's points closed, for its fill; `None` under three points.
+pub(crate) fn filled_stroke_path(points: &[[f32; 3]]) -> Option<Path> {
+    let pts: Vec<&[f32; 3]> = points.iter().filter(|p| p[0].is_finite() && p[1].is_finite()).collect();
+    if pts.len() < 3 {
+        return None;
+    }
+    let mut pb = PathBuilder::new();
+    pb.move_to(pts[0][0], pts[0][1]);
+    for p in &pts[1..] {
+        pb.line_to(p[0], p[1]);
+    }
+    pb.close();
     pb.finish()
 }
 
@@ -420,6 +442,21 @@ pub(crate) fn element_ops<'a>(e: &'a Element, region: &Rect, px_per_unit: Option
     match (&e.raw.kind, &e.raw.geom) {
         (Kind::Pen | Kind::Highlighter, _) => {
             let multiply = matches!(e.raw.kind, Kind::Highlighter);
+            // A pen with a fill is a freehand shape: its points closed and
+            // filled under the line (contour bands, a room, a blob).
+            if let (Kind::Pen, Some(fill)) = (&e.raw.kind, s.fill.filter(|f| f.a > 0)) {
+                if let Some(path) = filled_stroke_path(&e.raw.points) {
+                    out.push(Op::Fill {
+                        path: PathRef::Owned(path),
+                        color: fill,
+                        opacity: e.opacity,
+                        rule: FillRule::Winding,
+                        space: el,
+                        shadow: false,
+                        multiply: false,
+                    });
+                }
+            }
             match stroke_shape(&e.raw.kind, &e.raw.points, s.width, s.dash) {
                 Some(StrokeShape::Line(path, stroke)) => out.push(Op::Stroke {
                     path: PathRef::Owned(path),
