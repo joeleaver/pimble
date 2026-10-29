@@ -1,6 +1,8 @@
 # Next session: start here
 
-**2026-10-29: canvas tools for the MCP, branch `mcp-canvas` (not merged, not released).**
+**2026-10-29: v0.15.0 released (release commit e93a32b), deployed (jkbase v38; backup
+`bkp_1793312298113_d1c1a2c37eed3dfa`) and installed here: canvas tools for the MCP and canvas meaning.**
+1151 tests, the web and Windows builds checked before tagging.
 Joe: "We need MCP tools for everything." Eleven tools (`get_canvas`, `render_canvas`,
 `create_canvas`, `insert_canvas`, `add_elements`, `update_elements`, `delete_elements`,
 `add_layer`, `update_layer`, `delete_layer`, `set_canvas`) in
