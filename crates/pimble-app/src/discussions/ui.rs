@@ -19,7 +19,7 @@ const EMOJI: [&str; 40] = [
 
 thread_local! {
     /// Each slot's message boxes: (document key, node id), for focusing them.
-    static BOXES: RefCell<HashMap<(Slot, usize), (u64, usize)>> = RefCell::new(HashMap::new());
+    static BOXES: RefCell<HashMap<(Slot, usize), (u64, u64)>> = RefCell::new(HashMap::new());
 }
 
 fn box_index(which: Composer) -> usize {

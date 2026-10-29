@@ -10,7 +10,7 @@ use rinch_tabler_icons::TablerIcon;
 
 thread_local! {
     /// Each pane's cell input: (document key, node id), for focusing it.
-    static EDIT_INPUTS: RefCell<[Option<(u64, usize)>; MAX_PANES]> = const { RefCell::new([None, None, None, None]) };
+    static EDIT_INPUTS: RefCell<[Option<(u64, u64)>; MAX_PANES]> = const { RefCell::new([None, None, None, None]) };
 }
 
 /// Put the keyboard in pane `pane`'s cell input once it shows.

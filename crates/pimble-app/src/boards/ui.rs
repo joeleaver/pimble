@@ -13,9 +13,9 @@ use rinch_tabler_icons::{render_tabler_icon, TablerIconStyle};
 
 thread_local! {
     /// Each pane's text input: (document key, node id), for focusing it.
-    static TEXT_INPUTS: RefCell<[Option<(u64, usize)>; MAX_PANES]> = const { RefCell::new([None, None, None, None]) };
+    static TEXT_INPUTS: RefCell<[Option<(u64, u64)>; MAX_PANES]> = const { RefCell::new([None, None, None, None]) };
     /// Each pane's layer rename input.
-    static RENAME_INPUTS: RefCell<[Option<(u64, usize)>; MAX_PANES]> = const { RefCell::new([None, None, None, None]) };
+    static RENAME_INPUTS: RefCell<[Option<(u64, u64)>; MAX_PANES]> = const { RefCell::new([None, None, None, None]) };
     /// Nodes a card asked about once already (`GetNode`).
     static CARD_ASKED: RefCell<HashSet<(StoreId, NodeId)>> = RefCell::new(HashSet::new());
 }
