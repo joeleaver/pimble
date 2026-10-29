@@ -2159,7 +2159,7 @@ pub(super) fn drop_tree_row(store: AppStore, pane: PaneId) {
 // ── Attribution ─────────────────────────────────────────────────────────────
 
 /// What an element is called in its attribution (contract section 6).
-fn kind_label(e: &pimble_board::Element) -> String {
+pub(super) fn kind_label(e: &pimble_board::Element) -> String {
     match &e.raw.kind {
         Kind::Picture => "Picture".to_string(),
         Kind::Pen => "Drawing".to_string(),

@@ -1310,21 +1310,59 @@ fn text_boards<T: ReadTxn>(txn: &T, data: &MapRef) -> Vec<(String, MapRef)> {
 
 /// One unit per element of `board` with text, in element id order.
 fn board_texts<T: ReadTxn>(txn: &T, board: &MapRef, prefix: &str, units: &mut Vec<IndexUnit>) {
+    // What an element or layer means (its note and named fields,
+    // `pimble_board` "Meaning") is searched beside the text it shows.
+    fn meaning<T: ReadTxn>(txn: &T, map: &MapRef) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(Out::YText(note)) = map.get(txn, "note") {
+            out.push(note.get_string(txn));
+        }
+        let mut fields: Vec<String> = map
+            .iter(txn)
+            .filter_map(|(k, v)| Some(format!("{}: {}", k.strip_prefix("field:")?, string_value(Some(v))?)))
+            .collect();
+        fields.sort();
+        out.extend(fields);
+        out.retain(|s| !s.trim().is_empty());
+        out
+    }
     let Some(Out::YMap(elements)) = board.get(txn, "elements") else { return };
     let mut found: Vec<(String, String, String)> = Vec::new();
     for (id, out) in elements.iter(txn) {
         let Out::YMap(element) = out else { continue };
-        let Some(Out::YText(text)) = element.get(txn, "text") else { continue };
-        let text = text.get_string(txn);
-        if text.trim().is_empty() {
+        let mut parts = Vec::new();
+        if let Some(Out::YText(text)) = element.get(txn, "text") {
+            parts.push(text.get_string(txn));
+        }
+        parts.extend(meaning(txn, &element));
+        parts.retain(|s| !s.trim().is_empty());
+        if parts.is_empty() {
             continue;
         }
         let kind = string_value(element.get(txn, "kind")).unwrap_or_default();
-        found.push((id.to_string(), kind, text));
+        found.push((id.to_string(), kind, parts.join("\n")));
     }
     found.sort_by(|a, b| a.0.cmp(&b.0));
     for (id, kind, text) in found {
         units.push(IndexUnit::new(pimble_core::UnitKind::Field(format!("board.{kind}")), format!("{prefix}/{id}"), text));
+    }
+    let Some(Out::YMap(layers)) = board.get(txn, "layers") else { return };
+    let mut layer_units: Vec<(String, String)> = Vec::new();
+    for (id, out) in layers.iter(txn) {
+        let Out::YMap(layer) = out else { continue };
+        let parts = meaning(txn, &layer);
+        if parts.is_empty() {
+            continue;
+        }
+        let name = match layer.get(txn, "name") {
+            Some(Out::YText(t)) => t.get_string(txn),
+            _ => String::new(),
+        };
+        layer_units.push((id.to_string(), std::iter::once(name).chain(parts).collect::<Vec<_>>().join("\n")));
+    }
+    layer_units.sort();
+    for (id, text) in layer_units {
+        units.push(IndexUnit::new(pimble_core::UnitKind::Field("board.layer".to_string()), format!("{prefix}/layers/{id}"), text));
     }
 }
 

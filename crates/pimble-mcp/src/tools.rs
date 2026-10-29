@@ -89,7 +89,11 @@ draws sticky notes, text, shapes, frames, lines, arrows, connectors that follow 
 pen strokes, numbered steps, callouts, node cards, pictures and groups in one edit; update_elements and \
 delete_elements change them; add_layer, update_layer and delete_layer manage layers; set_canvas sets a \
 page and shows or hides the markup. Coordinates are canvas units, x right and y down; a picture at 100% \
-is one unit per pixel. Locked layers and elements take no edits until unlocked. Your elements are \
+is one unit per pixel; strokes take smooth and closed, and a pen with a fill is a filled shape. Say what \
+things mean: every element and layer takes a note and named fields (role=door, elevation=60 m), which \
+get_canvas shows (with_field lists only the elements with one) and search finds; read them before \
+guessing what a shape is, and write them when you draw something whose meaning a picture alone does not \
+say. Locked layers and elements take no edits until unlocked, except to their notes and fields. Your elements are \
 signed with your agent's name.";
 
 pub struct Pimble {

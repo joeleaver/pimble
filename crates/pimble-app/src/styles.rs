@@ -2200,6 +2200,62 @@ pub(crate) const APP_CSS: &str = "
     white-space: nowrap;
 }
 
+.pimble-board__meaning-heading {
+    font-size: 12px;
+    margin-bottom: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.pimble-board__note {
+    width: 100%;
+    min-height: 54px;
+    font-size: 12px;
+    resize: vertical;
+    box-sizing: border-box;
+}
+
+.pimble-board__fields {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin-top: 4px;
+}
+
+.pimble-board__field {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+}
+
+.pimble-board__field--new {
+    margin-top: 4px;
+}
+
+.pimble-board__field-name {
+    flex: 0 0 38%;
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-board__field-name-input {
+    flex: 0 0 38%;
+    min-width: 0;
+    font-size: 12px;
+    height: 18px;
+}
+
+.pimble-board__field-value {
+    flex: 1;
+    min-width: 0;
+    font-size: 12px;
+    height: 18px;
+}
+
 .pimble-board__layer-name-input {
     flex: 1;
     width: 100%;

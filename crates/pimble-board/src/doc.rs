@@ -6,7 +6,8 @@
 //!   page: Any { x, y, w, h, fill? }?,       // absent = infinite
 //!   markup_visible: bool,
 //!   edited_by: Any { id, name }?, edited_at: String?,   // board-level writes
-//!   layers: Map<layer id, Map { name: Text, order: String, visible, locked, opacity }>,
+//!   layers: Map<layer id, Map { name: Text, order: String, visible, locked, opacity,
+//!                               note: Text?, "field:<name>": String... }>,
 //!   elements: Map<element id, Map {
 //!     layer, order, parent?, kind,
 //!     geom: Any {..} (per kind, written whole) | Array<Buffer> (pen, highlighter),
@@ -14,6 +15,7 @@
 //!                               shadow, arrow_heads, dash },
 //!     transform: Any { tx, ty, rot, sx, sy }?, locked,
 //!     author: Any { id, name }?, created_at, edited_by?, edited_at?,
+//!     note: Text?, "field:<name>": String...,   // what it means (below)
 //!   }>,
 //! }
 //! ```
@@ -25,6 +27,14 @@
 //! text merges character by character, and a stroke's points are an array of
 //! appended chunks, each chunk a run of little-endian `f32` triples (x, y,
 //! pressure), so others see a stroke as it is drawn.
+//!
+//! **Meaning** (Joe, 2026-10-29): every element and every layer can say
+//! what it is, for the people and the assistants reading the canvas: a free
+//! `note`, co-edited text, and named fields, each its own key `field:<name>`
+//! on the element's or layer's map (one last-writer-wins value per field, so
+//! two people setting different fields keep both; never a container made on
+//! first use, the rule node fields follow). Nothing reads them to draw; no
+//! legend is made from them.
 //!
 //! A [`Board`] is a handle on where a board lives in a yrs document; it holds
 //! no state of its own. Every write runs in one transaction and answers the
@@ -88,7 +98,11 @@ pub(crate) mod keys {
     pub const CREATED_AT: &str = "created_at";
     pub const EDITED_BY: &str = "edited_by";
     pub const EDITED_AT: &str = "edited_at";
+    pub const NOTE: &str = "note";
 }
+
+/// The prefix of an element's or layer's named fields (see the module doc).
+pub const FIELD_PREFIX: &str = "field:";
 use keys::*;
 
 /// Why a board write was refused. A refused single write changed nothing.
@@ -473,6 +487,7 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
                 map.insert(self.txn, VISIBLE, layer.visible);
                 map.insert(self.txn, LOCKED, layer.locked);
                 map.insert(self.txn, OPACITY, layer.opacity as f64);
+                copy_meaning(self.txn, &map, layer.note.as_deref(), &layer.fields);
             }
         }
         for e in &raw.elements {
@@ -513,6 +528,7 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
             if let Some(at) = &e.edited_at {
                 map.insert(self.txn, EDITED_AT, at.clone());
             }
+            copy_meaning(self.txn, &map, e.note.as_deref(), &e.fields);
         }
         if let (Some(by), Some(at)) = (&raw.edited_by, &raw.edited_at) {
             if let Some(board) = self.board.clone() {
@@ -976,6 +992,42 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         Ok(())
     }
 
+    // ── Meaning ──────────────────────────────────────────────────────────
+
+    /// An element's note, edited as the smallest change (someone typing in
+    /// it keeps their typing).
+    pub fn set_note(&mut self, id: &str, note: &str) -> Result<()> {
+        let map = self.element(id)?;
+        write_note(self.txn, &map, note);
+        self.stamp_element(&map);
+        Ok(())
+    }
+
+    /// An element's field `name` (matched without regard to case, keeping
+    /// the name it was first given); `None` removes it.
+    pub fn set_field(&mut self, id: &str, name: &str, value: Option<&str>) -> Result<()> {
+        let map = self.element(id)?;
+        write_field(self.txn, &map, name, value)?;
+        self.stamp_element(&map);
+        Ok(())
+    }
+
+    /// A layer's note.
+    pub fn set_layer_note(&mut self, id: &str, note: &str) -> Result<()> {
+        let map = self.layer_map(id)?;
+        write_note(self.txn, &map, note);
+        self.stamp_board();
+        Ok(())
+    }
+
+    /// A layer's field `name`; `None` removes it.
+    pub fn set_layer_field(&mut self, id: &str, name: &str, value: Option<&str>) -> Result<()> {
+        let map = self.layer_map(id)?;
+        write_field(self.txn, &map, name, value)?;
+        self.stamp_board();
+        Ok(())
+    }
+
     /// Remove an element (its key goes; a concurrent edit of it is lost,
     /// which the contract accepts). Members of a deleted frame or group read
     /// as having no parent.
@@ -999,6 +1051,10 @@ pub struct RawLayer {
     pub visible: bool,
     pub locked: bool,
     pub opacity: f32,
+    /// What it is for (see the module doc, "Meaning").
+    pub note: Option<String>,
+    /// Its named fields, by name.
+    pub fields: Vec<(String, String)>,
 }
 
 /// An element as stored.
@@ -1020,6 +1076,10 @@ pub struct RawElement {
     pub edited_at: Option<String>,
     /// A stroke's points, chunks concatenated.
     pub points: Vec<[f32; 3]>,
+    /// What it means (see the module doc, "Meaning").
+    pub note: Option<String>,
+    /// Its named fields, by name.
+    pub fields: Vec<(String, String)>,
 }
 
 /// The board as stored, before anything is derived.
@@ -1062,6 +1122,8 @@ pub(crate) fn read_board<T: ReadTxn>(txn: &T, board: &MapRef, with_elements: boo
                 visible: bool_of(layer.get(txn, VISIBLE)).unwrap_or(true),
                 locked: bool_of(layer.get(txn, LOCKED)).unwrap_or(false),
                 opacity: number_of(layer.get(txn, OPACITY)).unwrap_or(1.0).clamp(0.0, 1.0),
+                note: read_note(txn, &layer),
+                fields: read_fields(txn, &layer),
             });
         }
     }
@@ -1140,6 +1202,74 @@ fn read_element<T: ReadTxn>(txn: &T, id: &str, el: &MapRef) -> RawElement {
         edited_by: author_of(el.get(txn, EDITED_BY)),
         edited_at: string_of(el.get(txn, EDITED_AT)),
         points,
+        note: read_note(txn, el),
+        fields: read_fields(txn, el),
+    }
+}
+
+fn read_note<T: ReadTxn>(txn: &T, map: &MapRef) -> Option<String> {
+    match map.get(txn, NOTE) {
+        Some(Out::YText(t)) => Some(t.get_string(txn)),
+        other => string_of(other),
+    }
+    .filter(|n| !n.trim().is_empty())
+}
+
+fn read_fields<T: ReadTxn>(txn: &T, map: &MapRef) -> Vec<(String, String)> {
+    let mut fields: Vec<(String, String)> = map
+        .iter(txn)
+        .filter_map(|(key, value)| {
+            let name = key.strip_prefix(FIELD_PREFIX)?;
+            let value = match value {
+                Out::Any(Any::String(s)) => s.to_string(),
+                Out::Any(Any::Number(n)) => n.to_string(),
+                Out::Any(Any::BigInt(n)) => n.to_string(),
+                Out::Any(Any::Bool(b)) => b.to_string(),
+                _ => return None,
+            };
+            Some((name.to_string(), value))
+        })
+        .collect();
+    fields.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()).then(a.0.cmp(&b.0)));
+    fields
+}
+
+fn write_note(txn: &mut TransactionMut, map: &MapRef, note: &str) {
+    let text = match map.get(txn, NOTE) {
+        Some(Out::YText(t)) => t,
+        _ => map.insert(txn, NOTE, TextPrelim::new("")),
+    };
+    edit_text(txn, &text, note);
+}
+
+fn write_field(txn: &mut TransactionMut, map: &MapRef, name: &str, value: Option<&str>) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(BoardError::Invalid("a field needs a name".into()));
+    }
+    // The name it already has, in whatever case it was first given.
+    let existing = map
+        .keys(txn)
+        .filter_map(|k| k.strip_prefix(FIELD_PREFIX).map(str::to_string))
+        .find(|n| n.eq_ignore_ascii_case(name));
+    let key = format!("{FIELD_PREFIX}{}", existing.as_deref().unwrap_or(name));
+    match value {
+        Some(v) => {
+            map.insert(txn, key.as_str(), v.to_string());
+        }
+        None => {
+            map.remove(txn, &key);
+        }
+    }
+    Ok(())
+}
+
+fn copy_meaning(txn: &mut TransactionMut, map: &MapRef, note: Option<&str>, fields: &[(String, String)]) {
+    if let Some(note) = note {
+        map.insert(txn, NOTE, TextPrelim::new(note.to_string()));
+    }
+    for (name, value) in fields {
+        map.insert(txn, format!("{FIELD_PREFIX}{name}"), value.clone());
     }
 }
 

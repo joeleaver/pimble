@@ -296,6 +296,14 @@ filled freehand shape (rendered, exported and hit as one, `pimble-board`; the ap
 panel does not offer it yet); a text label takes `center` (x, y its center); `get_canvas`
 gives text and grown sticky notes the size their text takes.
 
+**Meaning** (Joe, 2026-10-29; docs/IMAGE_MARKUP_CONTRACT.md "Meaning"): `add_elements` and
+`update_elements` take `note` and `fields` (in an update, a field given as null is removed),
+`add_layer` and `update_layer` the same for layers; `get_canvas` prints each under its
+element or layer and takes `with_field` ("role" or "role=door") to list only the elements
+that have it. A change of only note and fields is allowed on a locked element. The server's
+instructions tell an assistant to read meaning before guessing and to write it when what it
+draws does not say what it is.
+
 What the app's tools refuse a person these refuse an agent: an element that is locked takes
 only a change that unlocks it (in the same change), an element on a locked layer takes none,
 nothing is added to a locked layer, and with every layer locked a new element has nowhere to

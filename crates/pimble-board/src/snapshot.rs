@@ -35,6 +35,9 @@ pub struct Layer {
     pub opacity: f32,
     /// How many elements it holds.
     pub count: usize,
+    /// What it is for (`doc` module, "Meaning").
+    pub note: Option<String>,
+    pub fields: Vec<(String, String)>,
 }
 
 /// One element, as stored and as resolved for drawing.
@@ -347,7 +350,17 @@ impl Resolver {
         raw_layers.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.id.cmp(&b.id)));
         let layers: Vec<Layer> = raw_layers
             .into_iter()
-            .map(|l| Layer { id: l.id, name: l.name, order: l.order, visible: l.visible, locked: l.locked, opacity: l.opacity, count: 0 })
+            .map(|l| Layer {
+                id: l.id,
+                name: l.name,
+                order: l.order,
+                visible: l.visible,
+                locked: l.locked,
+                opacity: l.opacity,
+                count: 0,
+                note: l.note,
+                fields: l.fields,
+            })
             .collect();
         let layer_rank: HashMap<String, usize> = layers.iter().enumerate().map(|(i, l)| (l.id.clone(), i)).collect();
         let top = layers.len().saturating_sub(1);

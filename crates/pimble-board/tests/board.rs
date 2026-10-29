@@ -693,3 +693,44 @@ fn first_boards_in_text_made_apart_both_survive_the_merge() {
         assert_eq!(Board::in_text(doc, "theirs").snapshot().elements.len(), 1);
     }
 }
+
+/// Meaning (Joe, 2026-10-29): a note and named fields on elements and
+/// layers, merged per field between two people, kept by a copy.
+#[test]
+fn notes_and_fields_merge_per_field_and_survive_a_copy() {
+    let a = Board::standalone();
+    let layer = a.create(Stamp::new(None, "2026-10-29T00:00:00.000Z")).unwrap().0;
+    let (id, _) = a.add_element(Stamp::new(None, "2026-10-29T00:00:00.000Z"), NewElement::new(Kind::Rect, Geom::Rect(Rect::new(0.0, 0.0, 10.0, 10.0)))).unwrap();
+    let b = Board::standalone();
+    {
+        use yrs::{ReadTxn, StateVector, Transact, updates::decoder::Decode};
+        let full = a.doc().transact().encode_state_as_update_v1(&StateVector::default());
+        b.doc().transact_mut().apply_update(yrs::Update::decode_v1(&full).unwrap()).unwrap();
+    }
+    let st = Stamp::new(None, "2026-10-29T00:00:01.000Z");
+    let ua = a.edit(st, |t| { t.set_field(&id, "role", Some("door"))?; t.set_layer_note(&layer, "Walls and doors") }).update.unwrap();
+    let ub = b.edit(st, |t| { t.set_field(&id, "Width", Some("90 cm"))?; t.set_note(&id, "Front door") }).update.unwrap();
+    for (board, update) in [(&a, &ub), (&b, &ua)] {
+        use yrs::{Transact, updates::decoder::Decode};
+        board.doc().transact_mut().apply_update(yrs::Update::decode_v1(update).unwrap()).unwrap();
+    }
+    for board in [&a, &b] {
+        let raw = board.read().unwrap();
+        let e = raw.elements.iter().find(|e| e.id == id).unwrap();
+        assert_eq!(e.fields, vec![("role".to_string(), "door".to_string()), ("Width".to_string(), "90 cm".to_string())], "both fields kept");
+        assert_eq!(e.note.as_deref(), Some("Front door"));
+        assert_eq!(raw.layers[0].note.as_deref(), Some("Walls and doors"));
+    }
+    // The same field in another case is the same field.
+    a.edit(st, |t| t.set_field(&id, "width", Some("80 cm"))).result.unwrap();
+    assert_eq!(a.read().unwrap().elements[0].fields[1], ("Width".to_string(), "80 cm".to_string()));
+    // A copy (Convert to Node) keeps them.
+    let raw = a.read().unwrap();
+    let c = Board::standalone();
+    c.edit(st, |t| t.copy_from(&raw)).result.unwrap();
+    let copied = c.read().unwrap();
+    assert_eq!(copied.elements[0].note.as_deref(), Some("Front door"));
+    assert_eq!(copied.elements[0].fields.len(), 2);
+    assert_eq!(copied.layers[0].note.as_deref(), Some("Walls and doors"));
+    assert!(c.snapshot().layers[0].note.is_some());
+}

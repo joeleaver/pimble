@@ -283,6 +283,25 @@ pub struct LayerRow {
     pub count: usize,
 }
 
+/// What the "Meaning" section is about: the one selected element, or else
+/// the picked layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeaningTarget {
+    Element(String),
+    Layer(String),
+}
+
+/// The "Meaning" section's view of its target: what it is called, its note
+/// and its named fields (docs/IMAGE_MARKUP_CONTRACT.md, "Meaning").
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeaningView {
+    pub target: MeaningTarget,
+    /// "Sticky note: Buy milk", "Layer: Walls".
+    pub heading: String,
+    pub note: String,
+    pub fields: Vec<(String, String)>,
+}
+
 /// The box a text being typed sits in over the board, logical pixels.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextBox {
@@ -345,6 +364,17 @@ pub struct PaneUi {
     /// Everyone else's pointers and selections on the board
     /// (docs/PRESENCE_CONTRACT.md section 5).
     pub others: Signal<crate::presence::board::Others>,
+    /// The "Meaning" section: the selected element's or the picked layer's
+    /// note and fields.
+    pub meaning: Signal<Option<MeaningView>>,
+    /// What the note box is given to hold: only when its target changes or
+    /// someone else's edit of the note arrives, never echoed per keystroke
+    /// (as `text_value`), with a count so the same text given twice is.
+    pub note_value: Signal<(u64, String)>,
+    /// The field being edited in place: its name and what is typed.
+    pub field_edit: Signal<(String, String)>,
+    /// The new field being typed: its name and value.
+    pub new_field: Signal<(String, String)>,
 }
 
 impl PaneUi {
@@ -370,6 +400,10 @@ impl PaneUi {
             authors: Signal::new(0),
             cards: Signal::new(Vec::new()),
             picture_selected: Signal::new(false),
+            meaning: Signal::new(None),
+            note_value: Signal::new((0, String::new())),
+            field_edit: Signal::new((String::new(), String::new())),
+            new_field: Signal::new((String::new(), String::new())),
         }
     }
 }
@@ -1166,6 +1200,100 @@ fn local_edit<R>(store: AppStore, pane: PaneId, f: impl FnOnce(&mut BoardTxn<'_,
     }
 }
 
+thread_local! {
+    /// Per pane: the note last typed in the "Meaning" section, and for what,
+    /// so the box is not given back what it just sent.
+    static NOTE_TYPED: RefCell<[Option<(MeaningTarget, String)>; MAX_PANES]> = const { RefCell::new([None, None, None, None]) };
+}
+
+/// Publish what the "Meaning" section shows for pane `pane`: the one
+/// selected element, or else the picked layer (the top unlocked one when none
+/// is picked, as the layers panel picks).
+pub(crate) fn publish_meaning(pane: PaneId, ui: PaneUi) {
+    let picked = untracked(|| ui.layer.get());
+    let view = with_session(pane, |s| {
+        let snapshot = s.snapshot();
+        if !snapshot.exists {
+            return None;
+        }
+        if let [id] = s.selected.as_slice() {
+            let e = snapshot.get(id)?;
+            let label = tools::kind_label(e);
+            let heading = match e.raw.text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                Some(text) => {
+                    let short: String = text.chars().take(32).collect();
+                    let more = if text.chars().count() > 32 { "…" } else { "" };
+                    format!("{label}: {}{more}", short.replace('\n', " "))
+                }
+                None => label,
+            };
+            return Some(MeaningView {
+                target: MeaningTarget::Element(id.clone()),
+                heading,
+                note: e.raw.note.clone().unwrap_or_default(),
+                fields: e.raw.fields.clone(),
+            });
+        }
+        let layer = match &picked {
+            Some(id) => snapshot.layer(id),
+            None => snapshot.layers.iter().rev().find(|l| !l.locked),
+        }?;
+        Some(MeaningView {
+            target: MeaningTarget::Layer(layer.id.clone()),
+            heading: format!("Layer: {}", layer.name),
+            note: layer.note.clone().unwrap_or_default(),
+            fields: layer.fields.clone(),
+        })
+    })
+    .flatten();
+    let before = untracked(|| ui.meaning.get());
+    if let Some(v) = &view {
+        let typed = NOTE_TYPED.with(|t| t.borrow()[pane.index()].clone());
+        let same_target = before.as_ref().is_some_and(|b| b.target == v.target);
+        let echo = typed.as_ref().is_some_and(|(target, text)| *target == v.target && *text == v.note);
+        // A new target, or someone else's edit of this note: the box takes it.
+        if !same_target || (!echo && before.as_ref().is_some_and(|b| b.note != v.note)) {
+            let count = untracked(|| ui.note_value.get().0) + 1;
+            ui.note_value.set((count, v.note.clone()));
+            if !same_target {
+                NOTE_TYPED.with(|t| t.borrow_mut()[pane.index()] = None);
+                ui.field_edit.set((String::new(), String::new()));
+            }
+        }
+    }
+    ui.meaning.set_if_changed(view);
+}
+
+/// The note box was typed in: write it to its target.
+pub(crate) fn write_note(store: AppStore, pane: PaneId, note: String) {
+    let ui = store.pane(pane).board_ui;
+    let Some(target) = untracked(|| ui.meaning.get()).map(|m| m.target) else { return };
+    // One undo step per stretch of typing in one note.
+    let first = NOTE_TYPED.with(|t| t.borrow()[pane.index()].as_ref().map(|(tg, _)| tg != &target).unwrap_or(true));
+    if first {
+        new_undo_step(pane);
+    }
+    NOTE_TYPED.with(|t| t.borrow_mut()[pane.index()] = Some((target.clone(), note.clone())));
+    local_edit(store, pane, |t| match &target {
+        MeaningTarget::Element(id) => t.set_note(id, &note),
+        MeaningTarget::Layer(id) => t.set_layer_note(id, &note),
+    });
+}
+
+/// Set (or with `None` remove) a field of the "Meaning" section's target.
+pub(crate) fn write_field(store: AppStore, pane: PaneId, name: &str, value: Option<&str>) {
+    let ui = store.pane(pane).board_ui;
+    let Some(target) = untracked(|| ui.meaning.get()).map(|m| m.target) else { return };
+    if name.trim().is_empty() {
+        return;
+    }
+    new_undo_step(pane);
+    local_edit(store, pane, |t| match &target {
+        MeaningTarget::Element(id) => t.set_field(id, name, value),
+        MeaningTarget::Layer(id) => t.set_layer_field(id, name, value),
+    });
+}
+
 /// Start a new undo step: the next edit is taken back on its own, however
 /// soon after the last.
 fn new_undo_step(pane: PaneId) {
@@ -1261,6 +1389,7 @@ fn after_change(store: AppStore, pane: PaneId) {
                 ui.layer.set(None);
             }
             ui.layers.set_if_changed(layers);
+            publish_meaning(pane, ui);
             ui.frames.set_if_changed(frames);
             ui.picture_selected.set_if_changed(picture);
             ui.authors.set_if_changed(authors);

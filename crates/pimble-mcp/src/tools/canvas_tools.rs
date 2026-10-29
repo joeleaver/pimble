@@ -11,7 +11,7 @@
 //! What the app's tools refuse a person these refuse an agent: a locked layer
 //! or element takes no edits until it is unlocked.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use base64::Engine;
@@ -55,15 +55,17 @@ type Prepared = (HashMap<usize, (String, u32, u32)>, HashMap<usize, (String, Str
 // ── Parameters ───────────────────────────────────────────────────────────
 
 #[derive(Deserialize, JsonSchema)]
-pub struct CanvasParam {
+pub struct GetCanvasParams {
     /// A canvas node, or a note whose text holds the canvas: a pimble: link
     /// (or the pimble-board: address of an embedded canvas), a node id, or a path.
     pub node: String,
-    /// For a picture's canvas in a note's text: its id, the part after
-    /// `#canvas=` in the picture's URL as get_node shows it (the whole URL works
-    /// too). Leave it out for a canvas node.
+    /// A picture's canvas in a note's text: its id after `#canvas=`.
     #[serde(default)]
     pub canvas: Option<String>,
+    /// List only the elements with this field ("role"), or with this value of
+    /// it ("role=door"); names and values match without regard to case.
+    #[serde(default)]
+    pub with_field: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -220,6 +222,14 @@ pub struct ElementSpec {
     /// Locked elements take no edits until unlocked.
     #[serde(default)]
     pub locked: Option<bool>,
+    /// What it means, for the people and assistants who read the canvas: a
+    /// free note ("Load-bearing wall; do not move").
+    #[serde(default)]
+    pub note: Option<String>,
+    /// And named fields ({"role": "door", "swing": "in"}): get_canvas can list
+    /// just the elements with a field (`with_field`), and search finds them.
+    #[serde(default)]
+    pub fields: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -306,6 +316,12 @@ pub struct ElementChange {
     /// Lock or unlock it. Unlocking is the one change a locked element takes.
     #[serde(default)]
     pub locked: Option<bool>,
+    /// A new note ("" empties it).
+    #[serde(default)]
+    pub note: Option<String>,
+    /// Fields to set; a field given as null is removed. Fields not named stay.
+    #[serde(default)]
+    pub fields: Option<BTreeMap<String, Option<String>>>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -335,6 +351,12 @@ pub struct AddLayerParams {
     /// "below:<layer>" (a layer's name or id).
     #[serde(default)]
     pub order: Option<String>,
+    /// What the layer holds, in words ("Contour lines, one every 20 m").
+    #[serde(default)]
+    pub note: Option<String>,
+    /// Named fields ({"interval": "20 m"}).
+    #[serde(default)]
+    pub fields: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -358,6 +380,12 @@ pub struct UpdateLayerParams {
     /// "top", "bottom", "above:<layer>" or "below:<layer>".
     #[serde(default)]
     pub order: Option<String>,
+    /// A new note ("" empties it).
+    #[serde(default)]
+    pub note: Option<String>,
+    /// Fields to set; a field given as null is removed. Fields not named stay.
+    #[serde(default)]
+    pub fields: Option<BTreeMap<String, Option<String>>>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -865,6 +893,14 @@ fn add_specs(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, specs: &[ElementSpec],
         }
     }
     for (spec, id) in specs.iter().zip(&ids) {
+        if let Some(note) = spec.note.as_deref().filter(|n| !n.trim().is_empty()) {
+            t.set_note(id, note)?;
+        }
+        for (name, value) in spec.fields.iter().flatten() {
+            t.set_field(id, name, Some(value))?;
+        }
+    }
+    for (spec, id) in specs.iter().zip(&ids) {
         if spec.locked == Some(true) {
             t.set_locked(id, true)?;
         }
@@ -885,11 +921,40 @@ fn placement(order: &str, resolve: &dyn Fn(&str) -> Result<String, BoardError>) 
     })
 }
 
+/// Whether a change writes only a note and fields.
+fn change_is_only_meaning(c: &ElementChange) -> bool {
+    (c.note.is_some() || c.fields.is_some())
+        && [c.x, c.y, c.w, c.h, c.rotation].iter().all(Option::is_none)
+        && c.points.is_none()
+        && c.tip.is_none()
+        && [&c.from, &c.from_side, &c.to, &c.to_side, &c.node, &c.text, &c.layer, &c.parent, &c.order].iter().all(|v| v.is_none())
+        && c.from_point.is_none()
+        && c.to_point.is_none()
+        && c.style.is_none()
+        && c.clear_style.is_empty()
+        && c.move_by.is_none()
+        && c.locked.is_none()
+        && c.smooth.is_none()
+        && c.closed.is_none()
+}
+
 /// Apply one change to an element (refused, before anything is written,
 /// when the element or its layer is locked and the change is not unlocking it).
 fn change_element(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, snapshot: &BoardSnapshot, change: &ElementChange, index: usize) -> Result<(), BoardError> {
     let id = change.id.trim().to_string();
     let element = snapshot.get(&id).ok_or_else(|| bad(format!("there is no element \"{id}\" on this canvas (get_canvas lists the ids)")))?;
+    // What an element means is not what the lock guards: a locked picture
+    // can still be described.
+    if change_is_only_meaning(change) {
+        if let Some(note) = &change.note {
+            t.set_note(&id, note)?;
+        }
+        for (name, value) in change.fields.iter().flatten() {
+            t.set_field(&id, name, value.as_deref())?;
+        }
+        scene.touched.push(id);
+        return Ok(());
+    }
     let layer_locked = snapshot.layer(&element.layer).is_some_and(|l| l.locked);
     if layer_locked {
         let name = snapshot.layer(&element.layer).map(|l| l.name.clone()).unwrap_or_default();
@@ -993,6 +1058,12 @@ fn change_element(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, snapshot: &BoardS
         let at = placement(order, &|other| scene.id(other))?;
         t.move_element(&id, at)?;
     }
+    if let Some(note) = &change.note {
+        t.set_note(&id, note)?;
+    }
+    for (name, value) in change.fields.iter().flatten() {
+        t.set_field(&id, name, value.as_deref())?;
+    }
     if change.locked == Some(true) {
         t.set_locked(&id, true)?;
     }
@@ -1058,7 +1129,36 @@ fn style_text(style: &Style) -> Vec<String> {
 
 /// One line per element, grouped by layer, bottom to top: everything an
 /// assistant needs to name, place and change it.
+/// Its note and fields, indented under the line that names it.
+fn meaning_text(note: Option<&str>, fields: &[(String, String)]) -> String {
+    let mut out = String::new();
+    if let Some(note) = note.filter(|n| !n.trim().is_empty()) {
+        out.push_str(&format!("  note: {}\n", note.trim().replace('\n', "\n        ")));
+    }
+    if !fields.is_empty() {
+        let fields: Vec<String> = fields.iter().map(|(n, v)| format!("{n} = {v}")).collect();
+        out.push_str(&format!("  fields: {}\n", fields.join("; ")));
+    }
+    out
+}
+
+/// Whether `fields` has the field `wanted` names ("role", or "role=door").
+fn has_field(fields: &[(String, String)], wanted: &str) -> bool {
+    let (name, value) = match wanted.split_once('=') {
+        Some((n, v)) => (n.trim(), Some(v.trim())),
+        None => (wanted.trim(), None),
+    };
+    fields
+        .iter()
+        .any(|(n, v)| n.trim().eq_ignore_ascii_case(name) && value.is_none_or(|want| v.trim().eq_ignore_ascii_case(want)))
+}
+
+#[cfg(test)]
 fn describe(snapshot: &BoardSnapshot, cards: &HashMap<String, String>) -> String {
+    describe_where(snapshot, cards, None)
+}
+
+fn describe_where(snapshot: &BoardSnapshot, cards: &HashMap<String, String>, with_field: Option<&str>) -> String {
     let mut out = String::new();
     match &snapshot.page {
         Some(page) => out.push_str(&format!(
@@ -1096,7 +1196,8 @@ fn describe(snapshot: &BoardSnapshot, cards: &HashMap<String, String>) -> String
             layer.count,
             if layer.count == 1 { "" } else { "s" }
         ));
-        for e in snapshot.elements.iter().rev().filter(|e| e.layer == layer.id) {
+        out.push_str(&meaning_text(layer.note.as_deref(), &layer.fields));
+        for e in snapshot.elements.iter().rev().filter(|e| e.layer == layer.id && with_field.is_none_or(|w| has_field(&e.raw.fields, w))) {
             if listed == LIST_LIMIT {
                 out.push_str(&format!("... and more; render_canvas shows the whole canvas, and these {LIST_LIMIT} are the topmost.\n"));
                 return out;
@@ -1171,6 +1272,7 @@ fn describe(snapshot: &BoardSnapshot, cards: &HashMap<String, String>) -> String
             }
             out.push_str(&line);
             out.push('\n');
+            out.push_str(&meaning_text(raw.note.as_deref(), &raw.fields));
         }
     }
     out
@@ -1357,6 +1459,10 @@ impl Pimble {
 
     /// The canvas description get_node and get_canvas show.
     pub(super) async fn canvas_body(&self, client: &PimbleClient, node: &Node, text_canvas: Option<&str>) -> String {
+        self.canvas_body_where(client, node, text_canvas, None).await
+    }
+
+    async fn canvas_body_where(&self, client: &PimbleClient, node: &Node, text_canvas: Option<&str>, with_field: Option<&str>) -> String {
         let doc = match doc_of(node) {
             Ok(doc) => doc,
             Err(e) => return e,
@@ -1370,7 +1476,7 @@ impl Pimble {
         }
         let snapshot = board.snapshot();
         let cards = self.card_titles(client, &snapshot).await;
-        describe(&snapshot, &cards)
+        describe_where(&snapshot, &cards, with_field)
     }
 }
 
@@ -1425,15 +1531,18 @@ fn build_canvas(
 impl Pimble {
     /// Read a canvas (a whiteboard, or the marks on a picture) as a list: its
     /// page, its layers, and every element with its id, kind, position and
-    /// size, text, style, frame or group, lock and author. Name a canvas node,
+    /// size, text, style, frame or group, lock and author, and what layers and
+    /// elements mean (their notes and fields). `with_field` lists only the
+    /// elements with a field ("role=door"). Name a canvas node,
     /// or a note plus the id of a canvas in its text (`#canvas=<id>` in its
     /// picture's URL). render_canvas shows it as a picture.
     #[tool(name = "get_canvas")]
-    async fn get_canvas(&self, Parameters(p): Parameters<CanvasParam>) -> Result<String, String> {
+    async fn get_canvas(&self, Parameters(p): Parameters<GetCanvasParams>) -> Result<String, String> {
         let client = self.client().await?;
         let target = self.canvas(&client, &p.node, p.canvas.as_deref()).await?;
         self.on_canvas(&client, &target, Vec::new()).await;
-        let body = self.canvas_body(&client, &target.node, target.text_canvas.as_deref()).await;
+        let with_field = p.with_field.as_deref().map(str::trim).filter(|w| !w.is_empty());
+        let body = self.canvas_body_where(&client, &target.node, target.text_canvas.as_deref(), with_field).await;
         Ok(format!("{}\nCoordinates are canvas units; x grows right, y grows down.\n{body}", target.what()))
     }
 
@@ -1741,22 +1850,32 @@ impl Pimble {
             return Err("A layer needs a name.".into());
         }
         let order = p.order.clone().unwrap_or_default();
+        let (note, fields) = (p.note.clone(), p.fields.clone());
         let id = self
             .canvas_edit(&client, &target, Default::default(), move |t, scene, _| {
                 let at = placement(&order, &|l| scene.layer(l).map(|l| l.id.clone()))?;
-                t.add_layer(&name, at)
+                let id = t.add_layer(&name, at)?;
+                if let Some(note) = note.as_deref().filter(|n| !n.trim().is_empty()) {
+                    t.set_layer_note(&id, note)?;
+                }
+                for (field, value) in fields.iter().flatten() {
+                    t.set_layer_field(&id, field, Some(value))?;
+                }
+                Ok(id)
             })
             .await?;
         Ok(format!("Added layer \"{}\" ({id}) to {}.", p.name.trim(), target.what()))
     }
 
-    /// Rename, show or hide, lock or unlock, fade, or reorder a layer of a canvas.
+    /// Rename, show or hide, lock or unlock, fade, or reorder a layer of a
+    /// canvas, or say what it holds (its note and fields).
     /// What a layer shows is the same for everyone who opens the canvas.
     #[tool(name = "update_layer")]
     async fn update_layer(&self, Parameters(p): Parameters<UpdateLayerParams>) -> Result<String, String> {
         let client = self.client().await?;
         let target = self.canvas(&client, &p.node, p.canvas.as_deref()).await?;
         let (layer, name, visible, locked, opacity, order) = (p.layer.clone(), p.name.clone(), p.visible, p.locked, p.opacity, p.order.clone());
+        let (note, fields) = (p.note.clone(), p.fields.clone());
         self.canvas_edit(&client, &target, Default::default(), move |t, scene, _| {
             let id = scene.layer(&layer)?.id.clone();
             if let Some(name) = name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
@@ -1774,6 +1893,12 @@ impl Pimble {
             if let Some(order) = order.as_deref() {
                 let at = placement(order, &|l| scene.layer(l).map(|l| l.id.clone()))?;
                 t.move_layer(&id, at)?;
+            }
+            if let Some(note) = &note {
+                t.set_layer_note(&id, note)?;
+            }
+            for (field, value) in fields.iter().flatten() {
+                t.set_layer_field(&id, field, value.as_deref())?;
             }
             Ok(())
         })
@@ -1983,6 +2108,38 @@ mod tests {
         let snap = board.snapshot();
         let tb = snap.get(&ids[0]).unwrap().text_box.unwrap();
         assert!((tb.center().x - 100.0).abs() < 0.5 && (tb.center().y - 50.0).abs() < 0.5, "{tb:?}");
+    }
+
+    #[test]
+    fn meaning_goes_in_reads_back_and_filters() {
+        let board = fresh();
+        let mut fields = BTreeMap::new();
+        fields.insert("role".to_string(), "door".to_string());
+        fields.insert("swing".to_string(), "in".to_string());
+        let ids = add(
+            &board,
+            &[
+                ElementSpec { x: Some(0.0), y: Some(0.0), w: Some(90.0), h: Some(10.0), note: Some("Front door".into()), fields: Some(fields), locked: Some(true), ..spec("rect") },
+                ElementSpec { x: Some(200.0), y: Some(0.0), w: Some(10.0), h: Some(10.0), ..spec("rect") },
+            ],
+        )
+        .unwrap();
+        let snap = board.snapshot();
+        let text = describe_where(&snap, &HashMap::new(), Some("ROLE=Door"));
+        assert!(text.contains(&ids[0]) && !text.contains(&ids[1]), "{text}");
+        assert!(text.contains("note: Front door") && text.contains("fields: role = door; swing = in"), "{text}");
+        // A locked element can still be described, and a field removed.
+        let mut scene = Scene::of(&snap);
+        let mut change_fields = BTreeMap::new();
+        change_fields.insert("Swing".to_string(), None);
+        change_fields.insert("width".to_string(), Some("90 cm".to_string()));
+        let change = ElementChange { id: ids[0].clone(), note: Some("Front door, oak".into()), fields: Some(change_fields), ..Default::default() };
+        board.edit(Stamp::new(None, "t"), |t| change_element(t, &mut scene, &snap, &change, 0)).result.unwrap();
+        let e = board.snapshot();
+        let e = e.get(&ids[0]).unwrap();
+        assert_eq!(e.raw.note.as_deref(), Some("Front door, oak"));
+        assert_eq!(e.raw.fields, vec![("role".to_string(), "door".to_string()), ("width".to_string(), "90 cm".to_string())]);
+        assert!(e.raw.locked, "still locked");
     }
 
     #[test]

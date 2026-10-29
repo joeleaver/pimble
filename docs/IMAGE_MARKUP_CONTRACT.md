@@ -241,6 +241,29 @@ board: Map {
   3 and 4 instead of two 3s.
 - **Eraser** removes whole elements. There is no pixel erasing: there are no pixels.
 
+### Meaning: notes and fields on elements and layers (Joe, 2026-10-29)
+
+A canvas read as pixels says little to the next person or to an assistant: whether a brown
+ring is the 60 m contour, whether a rectangle is a door that swings in. **Every element and
+every layer can say what it means**: a free **note** (a yrs `Text`, co-edited) and named
+**fields** (`role = door`, `elevation = 60 m`). Joe: both on both, and nothing goes on a
+legend by itself ("assuming it goes on the legend automatically might not be prudent").
+
+- Stored as `note` (Text) and one key `field:<name>` per field (a string, last writer wins
+  per field) on the element's or layer's own map, never in a container made on first use
+  (the rule node fields follow: two devices adding a first field apart would each make the
+  container and one side's fields would be lost). A field's name matches without regard
+  to case and keeps the case it was first given. A note made on first use has the residual
+  the element `text` has: two devices writing an old element's first note at once keep one.
+- Nothing draws from them. Older versions ignore the keys and keep them.
+- `copy_from` (Convert to Node) copies them; search indexes them beside the element's text
+  (`NodeDoc::board_units`; a layer's are a unit of their own); the MCP reads, writes and
+  filters by them (docs/MCP_CONTRACT.md "Canvases").
+- The app's side panel has a **Meaning** section under Layers: the one selected element,
+  or else the picked layer, its note box and fields (Enter keeps a new value, × removes,
+  "Add" adds). A lock guards geometry, not meaning: a locked picture can still be
+  described, in the app and through the MCP.
+
 ## 4. Tools
 
 One toolbar, every tool on every board; the defaults differ (an image opens on the arrow,

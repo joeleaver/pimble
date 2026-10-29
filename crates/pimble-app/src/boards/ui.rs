@@ -404,6 +404,7 @@ fn render_panel(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> Nod
     };
     let style_section = render_style(__scope, store, pane);
     let layers_section = render_layers(__scope, store, pane);
+    let meaning_section = render_meaning(__scope, store, pane);
     rsx! {
         div {
             class: "pimble-board__panel",
@@ -451,6 +452,7 @@ fn render_panel(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> Nod
                 style: {move || if writable() { "" } else { "opacity: 0.45; pointer-events: none;" }},
                 {style_section}
                 {layers_section}
+                {meaning_section}
             }
         }
     }
@@ -860,6 +862,113 @@ fn render_layers(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> No
                 },
             }
             div { class: "pimble-board__row pimble-board__row--wrap", {new_layer} {delete_layer} {merge_down} {move_here} }
+        }
+    }
+}
+
+/// "Meaning" (docs/IMAGE_MARKUP_CONTRACT.md, "Meaning"): what the selected
+/// element, or else the picked layer, means: a free note and named fields,
+/// for the people and the assistants who read the canvas. Nothing here is
+/// drawn or put on a legend.
+fn render_meaning(__scope: &mut RenderScope, store: AppStore, pane: PaneId) -> NodeHandle {
+    let ui = store.pane(pane).board_ui;
+    // Picking another layer changes what the section is about.
+    let _ = rinch::Effect::new(move || {
+        let _ = ui.layer.get();
+        let _ = ui.selected.get();
+        untracked(|| super::publish_meaning(pane, ui));
+    });
+    let add = text_button(__scope, "Add", "Add this field", || false, move || {
+        let (name, value) = untracked(|| ui.new_field.get());
+        if name.trim().is_empty() {
+            crate::events::show_notice(store, "A field needs a name.".to_string());
+            return;
+        }
+        super::write_field(store, pane, name.trim(), Some(value.trim()));
+        ui.new_field.set((String::new(), String::new()));
+    });
+    rsx! {
+        div {
+            class: "pimble-board__section",
+            style: {move || if ui.meaning.get().is_some() { "" } else { "display: none;" }},
+            div { class: "pimble-board__panel-title", "Meaning" }
+            div { class: "pimble-board__meaning-heading", {move || ui.meaning.get().map(|m| m.heading).unwrap_or_default()} }
+            textarea {
+                class: "pimble-board__note",
+                placeholder: "What this means, for people and assistants reading the canvas",
+                value: move || ui.note_value.get().1,
+                oninput: move |value: String| super::write_note(store, pane, value),
+            }
+            div {
+                class: "pimble-board__fields",
+                for (name, value, label, tip) in ui
+                    .meaning
+                    .get()
+                    .map(|m| m.fields)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(n, v)| (n.clone(), v, n.clone(), n))
+                {
+                    div {
+                        key: format!("{name}={value}"),
+                        class: "pimble-board__field",
+                        span { class: "pimble-board__field-name", title: tip, {label} }
+                        input {
+                            r#type: "text",
+                            class: "pimble-board__field-value",
+                            title: "Enter keeps a new value",
+                            value: {value.clone()},
+                            oninput: {
+                                let name = name.clone();
+                                move |v: String| ui.field_edit.set((name.clone(), v))
+                            },
+                            onsubmit: {
+                                let name = name.clone();
+                                move || {
+                                    let (editing, typed) = untracked(|| ui.field_edit.get());
+                                    if editing == name {
+                                        super::write_field(store, pane, &name, Some(typed.trim()));
+                                    }
+                                }
+                            },
+                        }
+                        div {
+                            class: "pimble-board__layer-icon",
+                            title: "Remove this field",
+                            onclick: {
+                                let name = name.clone();
+                                move || super::write_field(store, pane, &name, None)
+                            },
+                            IconGlyph { name: TablerIcon::X.name().to_string() }
+                        }
+                    }
+                }
+            }
+            div {
+                class: "pimble-board__field pimble-board__field--new",
+                input {
+                    r#type: "text",
+                    class: "pimble-board__field-name-input",
+                    placeholder: "field",
+                    value: move || ui.new_field.get().0,
+                    oninput: move |v: String| ui.new_field.update(|f| f.0 = v),
+                }
+                input {
+                    r#type: "text",
+                    class: "pimble-board__field-value",
+                    placeholder: "value",
+                    value: move || ui.new_field.get().1,
+                    oninput: move |v: String| ui.new_field.update(|f| f.1 = v),
+                    onsubmit: move || {
+                        let (name, value) = untracked(|| ui.new_field.get());
+                        if !name.trim().is_empty() {
+                            super::write_field(store, pane, name.trim(), Some(value.trim()));
+                            ui.new_field.set((String::new(), String::new()));
+                        }
+                    },
+                }
+                {add}
+            }
         }
     }
 }
