@@ -7,8 +7,17 @@ Joe: "We need MCP tools for everything." Eleven tools (`get_canvas`, `render_can
 `crates/pimble-mcp/src/tools/canvas_tools.rs`, and Markdown going in now accepts Pimble's
 own pictures (`#canvas=<id>`), so rewriting a note no longer drops or refuses its pictures.
 docs/MCP_CONTRACT.md "Canvases". Checked: tests, and every tool driven over stdio on a
-store copy (port 7474, scratch agent), renders looked at. Not checked: the app opening a
-canvas the MCP made (the rinch debug MCP was not connected).
+store copy (port 7474, scratch agent), renders looked at. Then, from sketching a floor
+plan and a game level through it: renderer fixes (callout pointer winding, text
+descenders clipped, a pen with a fill is a filled shape), smooth/closed strokes and
+centered labels in the MCP, and **meaning** (Joe: a free note and named fields on both
+elements and layers, never put on a legend by itself; docs/IMAGE_MARKUP_CONTRACT.md
+"Meaning"), with a Meaning section in the app's canvas panel. Checked in an isolated app
+over the debug port (`scripts/perf/rd.py`): the agent's canvas opens, the section shows an
+element's or layer's meaning, typing a note and adding a field reach the document.
+Open, found while sketching: a canvas's colors do not follow the theme (near-black walls
+vanish on the dark canvas); no arc, dimension or line-cap tools; labels have no halo; the
+style panel cannot yet set a pen's fill or smooth a stroke.
 
 **2026-10-25: v0.14.0 released, deployed (jkbase v36) and installed here (tag `v0.14.0`, release commit 79520e3; backup
 `bkp_1792941339823_f4d20995a78a9314` before the deploy).** It brings:
