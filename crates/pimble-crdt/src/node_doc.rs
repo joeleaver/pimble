@@ -391,7 +391,14 @@ impl NodeDoc {
     /// [`markdown::replace_content`]). The node keeps its id and its link.
     pub fn replace_content_markdown(&mut self, md: &str) -> Result<Vec<u8>> {
         let seed = !self.has_projection();
-        let delta = model_edit_steps(&self.save(), seed, |schema, doc| markdown::replace_content(schema, doc, md))?;
+        let held = self.held_canvases();
+        let delta = model_edit_steps(&self.save(), seed, |schema, doc| {
+            let steps = markdown::replace_content(schema, doc, md)?;
+            if let Some(last) = steps.last() {
+                markdown::check_canvases(doc, last, &held)?;
+            }
+            Ok(steps)
+        })?;
         self.apply_markdown_delta(delta)
     }
 
@@ -428,8 +435,23 @@ impl NodeDoc {
         edit: impl FnOnce(&std::rc::Rc<rinch_editor_core::Schema>, &rinch_editor_core::Node) -> Result<rinch_editor_core::Node>,
     ) -> Result<Vec<u8>> {
         let seed = !self.has_projection();
-        let delta = model_edit_delta(&self.save(), seed, edit)?;
+        let held = self.held_canvases();
+        let delta = model_edit_delta(&self.save(), seed, |schema, doc| {
+            let after = edit(schema, doc)?;
+            markdown::check_canvases(doc, &after, &held)?;
+            Ok(after)
+        })?;
         self.apply_markdown_delta(delta)
+    }
+
+    /// The ids of the canvases of pictures in this node's text: the keys
+    /// `board:<id>` of its `data` (docs/CANVAS_CONTRACT.md).
+    pub fn held_canvases(&self) -> std::collections::HashSet<String> {
+        let txn = self.doc.transact();
+        self.data
+            .keys(&txn)
+            .filter_map(|k| k.strip_prefix("board:").map(str::to_string))
+            .collect()
     }
 
     fn apply_markdown_delta(&mut self, delta: Vec<u8>) -> Result<Vec<u8>> {
@@ -1402,6 +1424,28 @@ mod tests {
     use super::*;
     use crate::ContentDoc;
     use serde_json::json;
+
+    /// A note with a canvas in its text is rewritten through Markdown with the
+    /// picture kept (docs/MCP_CONTRACT.md: pictures go back in by their
+    /// `#canvas=` URL), and a picture naming a canvas the note lacks is refused.
+    #[test]
+    fn markdown_rewrites_keep_canvas_pictures() {
+        let mut doc = NodeDoc::new();
+        doc.init("document", "Note", None, T0).unwrap();
+        {
+            let mut txn = doc.ydoc().transact_mut();
+            doc.data_root().insert(&mut txn, "board:c1", yrs::MapPrelim::default());
+        }
+        doc.write_markdown("Intro\n\n![shot](pimble-blob:a/b#canvas=c1)\n\nEnd").unwrap();
+        let md = doc.markdown().unwrap();
+        assert!(md.contains("![shot](pimble-blob:a/b#canvas=c1)"), "{md}");
+        doc.replace_content_markdown("Intro, longer\n\n![shot](pimble-blob:a/b#canvas=c1)\n\nEnd").unwrap();
+        assert!(doc.markdown().unwrap().contains("#canvas=c1"));
+        let err = doc.append_markdown("![](pimble-blob:a/b#canvas=nope)").unwrap_err();
+        assert!(err.to_string().contains("no canvas nope"), "{err}");
+        let err = doc.append_markdown("![](pimble-blob:a/b#canvas=c1)").unwrap_err();
+        assert!(err.to_string().contains("shown twice"), "{err}");
+    }
 
     /// Node fields (docs/SHEETS_CONTRACT.md section 8): one `node` root key
     /// each, set case-insensitively, read in name order, merged per field,

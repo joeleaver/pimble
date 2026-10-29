@@ -1,5 +1,15 @@
 # Next session: start here
 
+**2026-10-29: canvas tools for the MCP, branch `mcp-canvas` (not merged, not released).**
+Joe: "We need MCP tools for everything." Eleven tools (`get_canvas`, `render_canvas`,
+`create_canvas`, `insert_canvas`, `add_elements`, `update_elements`, `delete_elements`,
+`add_layer`, `update_layer`, `delete_layer`, `set_canvas`) in
+`crates/pimble-mcp/src/tools/canvas_tools.rs`, and Markdown going in now accepts Pimble's
+own pictures (`#canvas=<id>`), so rewriting a note no longer drops or refuses its pictures.
+docs/MCP_CONTRACT.md "Canvases". Checked: tests, and every tool driven over stdio on a
+store copy (port 7474, scratch agent), renders looked at. Not checked: the app opening a
+canvas the MCP made (the rinch debug MCP was not connected).
+
 **2026-10-25: v0.14.0 released, deployed (jkbase v36) and installed here (tag `v0.14.0`, release commit 79520e3; backup
 `bkp_1792941339823_f4d20995a78a9314` before the deploy).** It brings:
 - **Each client remembers how things looked** (branch `remember-views`, merged; Joe,

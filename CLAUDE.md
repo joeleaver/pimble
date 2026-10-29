@@ -62,7 +62,7 @@ the hosted server to this version together.
 | `pimble-plugins` | `NodePlugin` trait, built-ins | Skeleton |
 | `pimble-app` | UI library (desktop and web) plus the `pimble` desktop binary | Works: two-window live editing, persistence, local and remote mounts, replica sync UI |
 | `pimble-cli` | server, stores, nodes, mounts, replica sync, search | Complete |
-| `pimble-mcp` | MCP server over stdio: an LLM reads, searches and writes the open stores through the local server (`docs/MCP_CONTRACT.md`) | Built, Linux walk-through passed |
+| `pimble-mcp` | MCP server over stdio: an LLM reads, searches and writes the open stores through the local server, canvases included (`docs/MCP_CONTRACT.md`) | Built, Linux walk-through passed |
 | `pimble-import` | Scrivener + RTF import | Complete |
 | `pimble-cloud` | Pimble Cloud accounts service: users, sessions, verification mail, hosted stores, grants, keys, JWTs | Complete (phases 1 and 2a) |
 | `pimble-crypto` | client-side cryptography: password-derived keys, account keys, envelopes, blobs | Complete |

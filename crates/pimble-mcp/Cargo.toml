@@ -16,6 +16,10 @@ pimble-crdt = { workspace = true }
 # exactly as the app does.
 pimble-sheet = { workspace = true }
 pimble-discussion = { workspace = true }
+# Canvases (docs/CANVAS_CONTRACT.md, docs/MCP_CONTRACT.md "Canvases"): read,
+# written and rendered as the app does.
+pimble-board = { workspace = true }
+pimble-image = { workspace = true }
 yrs = { workspace = true }
 pimble-rpc = { workspace = true }
 pimble-client = { workspace = true }

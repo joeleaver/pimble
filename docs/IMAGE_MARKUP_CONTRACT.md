@@ -398,6 +398,12 @@ assistant can see what was drawn. Writing to boards from the MCP (an assistant l
 notes as stickies, circling something on a screenshot) comes later; its elements would
 carry an author of their own ("Claude, via <person>").
 
+**Built 2026-10-29** (Joe: "We need MCP tools for everything"): reading (`get_canvas`, and
+`get_node` on a canvas node), `render_canvas`, and writing (`create_canvas`,
+`insert_canvas`, `add_elements`, `update_elements`, `delete_elements`, the layer tools,
+`set_canvas`); an agent's elements carry its own author, the agent's id and name.
+docs/MCP_CONTRACT.md "Canvases".
+
 ## 10. Where this sits against images waves 2 to 5
 
 Today pictures do not replicate (images contract waves 2 and 3). A marked-up picture or a

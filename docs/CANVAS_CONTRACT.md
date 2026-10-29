@@ -165,6 +165,11 @@ and the stored attribute stays `data-board`.
 rewrite that leaves them out removes them (as before). Unchanged, and noted only so it is
 not mistaken for something this work broke.
 
+**Since 2026-10-29** Markdown going in accepts the addresses it writes out, so pictures
+survive a rewrite: `#canvas=<id>` goes back into `data-board`, and a picture may name only
+a canvas its note holds, once (docs/MCP_CONTRACT.md, "Pictures are canvases"). The MCP's
+canvas tools read and write the canvases themselves (docs/MCP_CONTRACT.md "Canvases").
+
 ### "Convert to Node"
 
 Unchanged in behavior ("Convert to Image Node" until now): a canvas node under the note

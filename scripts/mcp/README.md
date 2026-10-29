@@ -20,6 +20,12 @@ PIMBLE_APP_ADDR=127.0.0.1:7474 XDG_CONFIG_HOME=$M/env/config XDG_DATA_HOME=$M/en
   python3 scripts/mcp/drive.py target/release/pimble-mcp scripts/mcp/tools.json
 ```
 
+Since agents (docs/AGENTS_CONTRACT.md) `pimble-mcp` needs `PIMBLE_AGENT_KEY`: start a
+`pimble-cli server --addr 127.0.0.1:7474 --open $M/env/family.pimble` with the same
+environment, make a scratch agent with `PIMBLE_SERVER=ws://127.0.0.1:7474 pimble-cli
+create-agent "Walk Agent" <store id>=editor`, and pass its key in the environment. Images a
+tool answers (`render_canvas`) are saved beside the steps file as `<steps>.image-<n>.png`.
+
 `tools.json` walks every tool on the family store copy (stderr lands in
 `tools.json.stderr`). The handoff walk-through (2026-10-01, passed): start `pimble-mcp`
 with a `_wait_file` step so it owns the server, start the app with the same environment

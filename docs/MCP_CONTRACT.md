@@ -154,12 +154,18 @@ and then that parse.
   paragraph per cell; any other table is written as HTML `<table>` (`colspan`/`rowspan`,
   blocks in cells) and read back from it. `pimble_crdt::Block` has `Blockquote` and
   `Table` for the importer.
-- **Images** follow `docs/IMAGES_CONTRACT.md`: `![alt](pimble-blob:...)` both ways once
-  blobs exist, and `attach_image` (a local file in, a blob and an inserted image out).
-  Until then an image is refused. Going out, a picture in text is a canvas
-  (docs/CANVAS_CONTRACT.md) and its canvas's id follows the URL:
-  `![alt](pimble-blob:<store>/<hash>#canvas=<id>)`, or `pimble-board:in-text#canvas=<id>`
-  for a canvas that began empty; a picture from before canvases has no fragment.
+- **Pictures are canvases** (docs/CANVAS_CONTRACT.md). Going out, a picture in text is
+  written with its canvas's id after the URL: `![alt](pimble-blob:<store>/<hash>#canvas=<id>)`,
+  or `pimble-board:in-text#canvas=<id>` for a canvas that began empty; a picture from before
+  canvases has no fragment, and an embedded canvas node is `pimble-board:<store>/<node>`.
+  **Going in (2026-10-29)**, those same addresses are accepted, so an assistant that rewrites
+  a note keeps its pictures: the fragment goes back into the atom's `data-board`
+  (`markdown::with_canvas_attrs`), and every block edit is judged by
+  `markdown::check_canvases` against the canvases the note's `data` holds
+  (`NodeDoc::held_canvases`): a picture may name only a canvas the note holds, and only
+  once; pictures that were already there are judged as they were. Any other image
+  (`https:`, a file, `data:`) is refused with its line; a new picture goes in with
+  `insert_canvas`.
 - Whatever the editor cannot co-edit (raw HTML other than the tags above, footnotes, task
   lists) is **refused**, not degraded: the tool fails with a sentence naming the
   construct and its line ("Line 12 is a task list; Pimble documents cannot hold task
@@ -257,6 +263,40 @@ id or its first column's value); an ambiguous name is refused with the candidate
 content is its tables). Not yet: link-to-a-node columns, tables in text and `move_table`
 (waves 2-3), and the later waves' `get_fields`, `set_fields`, `rows_pointing_here` and
 `paste_table`.
+
+### Canvases (built 2026-10-29, branch `mcp-canvas`)
+
+Joe, 2026-10-29: "We need MCP tools for everything." A canvas (a board in the code,
+docs/IMAGE_MARKUP_CONTRACT.md section 3) is read and written through `pimble-board`, the
+crate the app draws with, in `crates/pimble-mcp/src/tools/canvas_tools.rs`. A canvas is
+named by `node` (a canvas node, or the `pimble-board:` address of an embedded one) and, for
+a picture's canvas in a note's text, `canvas` (the id after `#canvas=`, or the whole URL).
+Every write is one `BoardTxn` over the canvas as it is in the document fetched for the
+write, sent with `applyEdit` (`Pimble::edit_doc`); a refusal anywhere in a call writes
+nothing. Elements are stamped with the agent's id and name (`whoAmI`), as a person's are
+with theirs, and after each call the agent is present on the canvas with its pointer on
+what it touched and that selected (`Presence::say_on_board`).
+
+| Tool | What it does |
+| --- | --- |
+| `get_canvas` | page, what shows, layers top first, and every element: id, kind, text, geometry in canvas units, transform, set style keys, frame or group, lock, author (at most 400 lines). `get_node` on a canvas node shows the same |
+| `render_canvas` | the canvas as a PNG (all of it, an `area`, or `elements` with their members), flattened onto white, longest side `max_size` (1024, at most 2048), with a sentence mapping pixels back to canvas units; pictures fetched through `getBlob`, card titles live; `show_all` shows hidden layers and markup |
+| `create_canvas` | a canvas node under a parent, empty ("Canvas", chalkboard icon) or from a picture file (its name, photo icon, the picture locked in a layer "Picture" under "Layer 1"), with first elements, written in the `createNode` that makes it, as the app does |
+| `insert_canvas` | a canvas into a note's text after a quoted block (or at the end): a picture file, a `pimble-blob:` picture, or empty; the canvas and the picture naming it in one edit (the app needs two, since its picture lives in the editor) |
+| `add_elements` | any kind (sticky, text, rect, ellipse, diamond, frame, line, arrow, connector, pen, highlighter, step, callout, card, picture, spotlight, group) with text, style, rotation, layer, frame or group membership and lock; `ref` names an element within the call, so connectors, parents and a group's `members` can point at elements made in the same call; connectors are added after the rest whatever their place in the list; picture `file`s are stored as blobs first (`pimble_image::fit`, as the app) |
+| `update_elements` | per element, only what is given: geometry merged into what it has, points, text (smallest edit), style keys set or cleared, `move_by` and `rotation` (its transform, so a frame's members move with it), layer, parent, stacking order, lock |
+| `delete_elements` | by id |
+| `add_layer`, `update_layer`, `delete_layer` | name, visibility, lock, opacity, order; delete with its elements or `merge_down` |
+| `set_canvas` | a page (or one fitted to what shows, or none) and the markup switch |
+
+What the app's tools refuse a person these refuse an agent: an element that is locked takes
+only a change that unlocks it (in the same change), an element on a locked layer takes none,
+nothing is added to a locked layer, and with every layer locked a new element has nowhere to
+go. Search already indexes canvas text, so `search` finds sticky notes and labels.
+
+Not built: cropping a picture and its spotlight/crop tools beyond what `add_elements` writes
+(`crop` is not settable), "Convert to Node" and "Flatten into New Canvas", SVG export
+through the MCP, and moving a picture's canvas between notes.
 
 Not exposed, on purpose: hosting a store (`cloudHostStore`), sharing, relaying, linking to
 a remote, closing or removing stores, signing in or out. Nothing is hosted unless the

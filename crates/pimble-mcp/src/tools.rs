@@ -26,6 +26,7 @@ use crate::nodes::{self, label, Addr};
 use crate::presence::Presence;
 use crate::sheets::guide;
 
+mod canvas_tools;
 mod discussion_tools;
 #[cfg(test)]
 mod presence_tests;
@@ -46,8 +47,11 @@ Content is Markdown: headings, paragraphs, bold, italic, strikethrough, inline c
 fenced code, bullet and numbered lists (nested), block quotes, pipe tables, horizontal \
 rules. Underline, highlight, text colour, subscript and superscript are the HTML tags <u>, \
 <mark>, <span style=\"color:#rrggbb\">, <sub> and <sup>; a table with merged cells or blocks \
-in a cell is an HTML <table>. Images, task lists, footnotes and any other HTML are refused \
-with a sentence naming the line; nothing is written then. Link to another node with its pimble: link as the href.
+in a cell is an HTML <table>. Pictures are canvases: \
+a picture already in Pimble is written as get_node shows it (![alt](pimble-blob:...#canvas=<id>)), so \
+keep those lines when rewriting; insert_canvas puts a new picture or an empty canvas into a note. Other \
+images, task lists, footnotes and any other HTML are refused with a sentence naming the line; nothing is \
+written then. Link to another node with its pimble: link as the href.
 
 Edits touch only what they name: append, insert_after (after a block, or after a heading's \
 section), replace_section (the blocks under a heading), replace_text (an exact quote inside \
@@ -75,7 +79,18 @@ or as discussion nodes of their own. list_discussions lists a node's, read_discu
 one as a nested list with message ids, start_discussion starts one with its first message, \
 reply answers a message (or posts at the top level), edit_message and delete_message change \
 only your own messages, resolve_discussion closes or reopens one. Messages are Markdown with \
-bold, italic and links; your messages are signed with your agent's name.";
+bold, italic and links; your messages are signed with your agent's name.
+
+Canvases are infinite whiteboards (a canvas node) and the marks on pictures in a note's text (a \
+picture's canvas, named by the note and the id after #canvas= in its URL). get_canvas lists a canvas's \
+layers and elements with ids, positions and text; render_canvas shows it as an image; create_canvas makes \
+a canvas node (empty or from a picture file); insert_canvas puts one into a note's text; add_elements \
+draws sticky notes, text, shapes, frames, lines, arrows, connectors that follow the elements they join, \
+pen strokes, numbered steps, callouts, node cards, pictures and groups in one edit; update_elements and \
+delete_elements change them; add_layer, update_layer and delete_layer manage layers; set_canvas sets a \
+page and shows or hides the markup. Coordinates are canvas units, x right and y down; a picture at 100% \
+is one unit per pixel. Locked layers and elements take no edits until unlocked. Your elements are \
+signed with your agent's name.";
 
 pub struct Pimble {
     conn: Arc<Connection>,
@@ -121,7 +136,7 @@ impl Pimble {
             conn,
             client_id,
             presence,
-            tool_router: Self::tool_router() + Self::sheet_router() + Self::discussion_router(),
+            tool_router: Self::tool_router() + Self::sheet_router() + Self::discussion_router() + Self::canvas_router(),
         }
     }
 
@@ -144,6 +159,22 @@ impl Pimble {
         addr: Addr,
         edit: impl FnOnce(&mut NodeDoc) -> Result<(), String>,
     ) -> Result<(), String> {
+        let (caret, host) = self.edit_doc(client, addr, edit).await?;
+        self.presence.say(client, addr, caret).await;
+        if let Some(host) = host {
+            self.present(client, Addr { store: addr.store, node: host }).await;
+        }
+        Ok(())
+    }
+
+    /// The write itself, saying nothing: the caret after it (a sticky index
+    /// into the content) and the node a discussion is on.
+    async fn edit_doc(
+        &self,
+        client: &PimbleClient,
+        addr: Addr,
+        edit: impl FnOnce(&mut NodeDoc) -> Result<(), String>,
+    ) -> Result<(Option<Vec<u8>>, Option<pimble_core::NodeId>), String> {
         let node = client.get_node(addr.store, addr.node).await.map_err(rpc)?;
         if node.access == StoreAccess::Read {
             return Err(StoreAccess::READ_ONLY_REFUSAL.to_string());
@@ -166,11 +197,7 @@ impl Pimble {
             .apply_edit(addr.store, addr.node, &self.client_id, EditOperation::IncrementalChanges { changes })
             .await
             .map_err(rpc)?;
-        self.presence.say(client, addr, caret).await;
-        if let Some(host) = node.attached_to {
-            self.present(client, Addr { store: addr.store, node: host }).await;
-        }
-        Ok(())
+        Ok((caret, node.attached_to))
     }
 
     async fn describe(&self, client: &PimbleClient, stores: &[Store], addr: Addr) -> String {
@@ -510,6 +537,10 @@ impl Pimble {
             out.push_str("(a discussion: its content is its messages)\n");
             out.push_str(&Self::discussion_body(&node));
             None
+        } else if node.node_type == pimble_core::node_types::BOARD {
+            out.push_str("(a canvas: its content is what is drawn on it; render_canvas shows it as a picture)\n");
+            out.push_str(&self.canvas_body(&client, &node, None).await);
+            None
         } else if node.node_type == pimble_core::node_types::SHEET {
             out.push_str("(a sheet node: its content is its tables)\n");
             self.tables_of_node(&client, addr, &node).await.map(|t| ("Tables", t))
@@ -518,6 +549,13 @@ impl Pimble {
             let content = self.inline_discussions(&client, &content).await;
             let (content, lost) = self.tables_in_text(&client, addr, &node, &content).await;
             out.push_str(if content.is_empty() { "(no content)" } else { &content });
+            if content.contains(pimble_crdt::markdown::CANVAS_FRAGMENT) {
+                out.push_str(
+                    "\n\n(Each picture whose URL ends in #canvas=<id> is a canvas: get_canvas and render_canvas \
+                     read it, add_elements marks it up, with this node and canvas <id>. Keep the picture's line \
+                     as it is when rewriting the text.)",
+                );
+            }
             lost.map(|t| ("Tables no longer in the text", t))
         };
         if let Some((heading, tables)) = tables {

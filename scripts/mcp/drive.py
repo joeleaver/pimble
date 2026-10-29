@@ -5,6 +5,7 @@
 steps.json is a list of [tool, {args}] pairs. Every stdout line must be a JSON
 message (anything else fails the run: stdout carries the protocol only).
 """
+import base64
 import json
 import subprocess
 import sys
@@ -12,6 +13,7 @@ import threading
 import time
 
 binary, steps_file = sys.argv[1], sys.argv[2]
+steps_path = steps_file
 steps = json.load(open(steps_file))
 
 proc = subprocess.Popen([binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(steps_file + ".stderr", "w"), text=True, bufsize=1)
@@ -58,7 +60,16 @@ for tool, args in steps:
     t = time.time()
     reply = request("tools/call", {"name": tool, "arguments": args})
     result = reply.get("result", {})
-    text = "\n".join(c.get("text", "") for c in result.get("content", []))
+    text = "\n".join(c.get("text", "") for c in result.get("content", []) if c.get("type") == "text")
+    # Images (render_canvas) are saved beside the steps file, and their paths printed.
+    for c in result.get("content", []):
+        if c.get("type") == "image":
+            images = globals().setdefault("_images", [0])
+            images[0] += 1
+            path = f"{steps_path}.image-{images[0]}.png"
+            with open(path, "wb") as f:
+                f.write(base64.b64decode(c["data"]))
+            text += f"\n[image saved: {path}]"
     flag = "ERROR " if result.get("isError") or "error" in reply else ""
     if "error" in reply:
         text = json.dumps(reply["error"])

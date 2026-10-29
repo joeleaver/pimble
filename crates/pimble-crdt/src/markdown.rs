@@ -82,7 +82,14 @@ fn check_scope(md: &str) -> Result<()> {
                     open.last().unwrap()
                 )));
             }
-            Event::Start(Tag::Image { .. }) => return Err(cannot_hold(line(range.start), "an image")),
+            Event::Start(Tag::Image { dest_url, .. }) if !is_pimble_picture(dest_url) => {
+                return Err(refused(format!(
+                    "Line {} is a picture from outside Pimble; only pictures already in Pimble \
+                     (the pimble-blob: and pimble-board: addresses get_node shows) can be written \
+                     in Markdown, so nothing was written. A new picture goes in with insert_canvas.",
+                    line(range.start)
+                )));
+            }
             Event::TaskListMarker(_) => return Err(cannot_hold(line(range.start), "a task list item")),
             _ => {}
         }
@@ -93,7 +100,7 @@ fn check_scope(md: &str) -> Result<()> {
 /// The same two, where Markdown's own syntax did not show them: inside an HTML table.
 fn check_scope_of(node: &Node) -> Result<()> {
     let what = match node.type_name() {
-        "image" => Some("an image"),
+        "image" if !node.attrs().get_str("src").is_some_and(is_pimble_picture) => Some("a picture from outside Pimble"),
         "task_list" => Some("a task list"),
         _ => None,
     };
@@ -129,7 +136,7 @@ fn strict(schema: &Schema, md: &str) -> Result<Node> {
         MarkdownError::Invalid(e) => collab(e),
     })?;
     check_scope_of(&doc)?;
-    Ok(doc)
+    with_canvas_attrs(&doc)
 }
 
 /// `md` as an editor `doc`, after [`check`]. Markdown with no blocks at all is
@@ -188,6 +195,108 @@ fn with_canvas_urls(doc: &Node) -> Option<Node> {
         !any
     });
     any.then(|| walk(doc, &Schema::starter_kit()))
+}
+
+/// A picture Pimble holds: a blob of a store, or a canvas (docs/CANVAS_CONTRACT.md).
+/// Nothing else can be written, since its bytes are not in any store.
+fn is_pimble_picture(src: &str) -> bool {
+    let src = src.trim();
+    src.starts_with("pimble-blob:") || src.starts_with("pimble-board:")
+}
+
+/// The canvas a picture's Markdown URL names after [`CANVAS_FRAGMENT`] (or the
+/// fragment before 2026-10-23, `#board=`), and the URL without it.
+fn split_canvas_url(src: &str) -> (&str, Option<&str>) {
+    for fragment in [CANVAS_FRAGMENT, "#board="] {
+        if let Some(at) = src.find(fragment) {
+            let id = &src[at + fragment.len()..];
+            return (&src[..at], (!id.is_empty()).then_some(id));
+        }
+    }
+    (src, None)
+}
+
+/// The inverse of [`with_canvas_urls`]: each picture whose URL names a canvas takes
+/// the id back into `data-board`, its URL as stored. A canvas that began empty
+/// (`pimble-board:in-text`) is only a canvas, so one naming none is refused.
+fn with_canvas_attrs(doc: &Node) -> Result<Node> {
+    fn walk(node: &Node, schema: &Schema) -> Result<Node> {
+        if node.type_name() == "image" {
+            let src = node.attrs().get_str("src").unwrap_or_default();
+            let (bare, canvas) = split_canvas_url(src);
+            if bare == IN_TEXT_SRC && canvas.is_none() {
+                return Err(refused(format!(
+                    "A {IN_TEXT_SRC} picture is an empty canvas and names it after {CANVAS_FRAGMENT}; \
+                     this one names none, so nothing was written."
+                )));
+            }
+            let Some(canvas) = canvas else { return Ok(node.clone()) };
+            let attrs = node
+                .attrs()
+                .with("src", rinch_editor_core::AttrValue::from(bare))
+                .with(CANVAS_ATTR, rinch_editor_core::AttrValue::from(canvas));
+            return schema.create_node("image", attrs, Fragment::empty()).map(|n| n.with_marks(node.marks().to_vec())).map_err(collab);
+        }
+        if node.is_text() || node.child_count() == 0 {
+            return Ok(node.clone());
+        }
+        let children = node.content().iter().map(|child| walk(child, schema)).collect::<Result<Vec<_>>>()?;
+        Ok(node.copy_with_content(Fragment::from_children(children)))
+    }
+    walk(doc, &Schema::starter_kit())
+}
+
+/// The `src` of a canvas that began empty, with no picture under it.
+pub const IN_TEXT_SRC: &str = "pimble-board:in-text";
+
+/// The canvases the pictures in `doc` name, once per picture.
+pub fn canvases_named(doc: &Node) -> Vec<String> {
+    let mut out = Vec::new();
+    doc.nodes_between(0, doc.content_size(), &mut |node, _, _| {
+        if node.type_name() == "image" {
+            if let Some(id) = node.attrs().get_str(CANVAS_ATTR).filter(|id| !id.is_empty()) {
+                out.push(id.to_string());
+            }
+        }
+        true
+    });
+    out
+}
+
+/// Refuse an edit whose pictures name a canvas that is not in the node (`held`: the
+/// ids of the canvases in its `data`), or name one more often than before: a
+/// picture's canvas lives in the note that holds the picture, one picture each, and
+/// a picture naming a canvas the note has not got would show nothing on every device.
+/// Pictures that were there before are judged as they were (a canvas that has not
+/// arrived yet is not the edit's doing).
+pub(crate) fn check_canvases(before: &Node, after: &Node, held: &std::collections::HashSet<String>) -> Result<()> {
+    let tally = |doc: &Node| {
+        let mut count: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for id in canvases_named(doc) {
+            *count.entry(id).or_default() += 1;
+        }
+        count
+    };
+    let (was, now) = (tally(before), tally(after));
+    for (id, n) in &now {
+        let had = was.get(id).copied().unwrap_or(0);
+        if *n <= had {
+            continue;
+        }
+        if *n > 1 {
+            return Err(refused(format!(
+                "Canvas {id} would be shown twice; a canvas belongs to one picture, so nothing was \
+                 written. insert_canvas puts in another one."
+            )));
+        }
+        if !held.contains(id) {
+            return Err(refused(format!(
+                "There is no canvas {id} in this note (a picture's canvas lives in the note that holds it), \
+                 so nothing was written. insert_canvas puts a new one in."
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ── Naming a block ───────────────────────────────────────────────────────
@@ -541,18 +650,15 @@ mod tests {
     #[test]
     fn check_names_the_construct_and_its_line() {
         let err = check("# Title\n\nsome text\n\n![cat](cat.png)\n").unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "Line 5 is an image; Pimble documents cannot hold that yet, so nothing was written."
-        );
+        assert!(err.to_string().starts_with("Line 5 is a picture from outside Pimble"), "{err}");
         assert!(check("a\n\n- [ ] task").unwrap_err().to_string().starts_with("Line 3 is a task list item"));
         assert!(check("a\n\nsee <kbd>this</kbd>").unwrap_err().to_string().starts_with("Line 3 is HTML other than"));
         assert!(check("<div>x</div>").unwrap_err().to_string().starts_with("Line 1 is HTML other than"));
         assert!(check("a <u>b").unwrap_err().to_string().contains("without its partner"));
         assert!(check("a[^1]\n\n[^1]: note").unwrap_err().to_string().contains("a footnote"));
         let in_table = "<table><tr><td><img src=\"https://x.y/c.png\"></td></tr></table>";
-        assert!(check(in_table).unwrap_err().to_string().contains("an image inside an HTML table"));
-        assert!(check("![cat](cat.png)").unwrap_err().to_string().contains("an image"));
+        assert!(check(in_table).unwrap_err().to_string().contains("a picture from outside Pimble inside an HTML table"));
+        assert!(check("![cat](https://x.y/cat.png)").unwrap_err().to_string().contains("from outside Pimble"));
         assert!(check("[x](javascript:alert(1))").unwrap_err().to_string().contains("unsafe"));
         check("# H\n\n**b** *i* ~~s~~ `c` [l](pimble:a/b)\n\n- one\n  - two\n\n1. x\n\n```rust\nfn x() {}\n```\n\n---\n")
             .unwrap();
@@ -581,6 +687,40 @@ mod tests {
         let md = render(&doc);
         assert!(md.contains("![shot](pimble-blob:a/b#canvas=c1)"), "{md}");
         assert!(md.contains("![](pimble-blob:a/d)"), "a picture from before canvases is as it was: {md}");
+    }
+
+    #[test]
+    fn pimble_pictures_go_in_and_take_their_canvas_back() {
+        let md = "Before\n\n![shot](pimble-blob:a/b#canvas=c1) and ![](pimble-board:in-text#canvas=c2)\n\n![old](pimble-blob:a/d)";
+        let doc = parse(&schema(), md).unwrap();
+        assert_eq!(canvases_named(&doc), vec!["c1".to_string(), "c2".to_string()]);
+        let mut srcs = Vec::new();
+        doc.nodes_between(0, doc.content_size(), &mut |n, _, _| {
+            if n.type_name() == "image" {
+                srcs.push(n.attrs().get_str("src").unwrap_or_default().to_string());
+            }
+            true
+        });
+        assert_eq!(srcs, vec!["pimble-blob:a/b", IN_TEXT_SRC, "pimble-blob:a/d"]);
+        assert_eq!(render(&doc), md, "it reads back as it went in");
+        // The fragment from before canvases is still read.
+        assert_eq!(canvases_named(&parse(&schema(), "![x](pimble-blob:a/b#board=c9)").unwrap()), vec!["c9".to_string()]);
+        assert!(check("![](pimble-board:in-text)").unwrap_err().to_string().contains("names none"));
+    }
+
+    #[test]
+    fn a_picture_names_only_a_canvas_the_note_holds_once() {
+        let s = schema();
+        let before = parse(&s, "text").unwrap();
+        let held: std::collections::HashSet<String> = ["c1".to_string()].into();
+        let one = parse(&s, "![](pimble-blob:a/b#canvas=c1)").unwrap();
+        check_canvases(&before, &one, &held).unwrap();
+        let missing = parse(&s, "![](pimble-blob:a/b#canvas=zz)").unwrap();
+        assert!(check_canvases(&before, &missing, &held).unwrap_err().to_string().contains("no canvas zz"));
+        let twice = parse(&s, "![](pimble-blob:a/b#canvas=c1)\n\n![](pimble-blob:a/b#canvas=c1)").unwrap();
+        assert!(check_canvases(&one, &twice, &held).unwrap_err().to_string().contains("shown twice"));
+        // A picture already there whose canvas has not arrived is not the edit's doing.
+        check_canvases(&missing, &missing, &held).unwrap();
     }
 
     #[test]
