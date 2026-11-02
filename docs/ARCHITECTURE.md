@@ -571,7 +571,7 @@ pub struct AppState {
 ┌─────────────────────────────────────────────────────────────┐
 │                   Embedded Server                            │
 │  ┌─────────────┐  ┌──────────────┐  ┌─────────────┐        │
-│  │ StoreManager│  │MountResolver │  │ PluginHost  │        │
+│  │ StoreManager│  │MountResolver │  │ IndexUnits  │        │
 │  └──────┬──────┘  └──────┬───────┘  └──────┬──────┘        │
 │         │                │                  │               │
 │         ▼                ▼                  ▼               │
