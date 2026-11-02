@@ -4,7 +4,7 @@ Status: drafted by the PM on 2026-11-02 from the design conversation with Joe th
 (memory `project_views_and_plugins_2026_11_02`) and the API refactor before it
 (`docs/API_CONTRACT.md`, waves 0-5 on branch `api`). Revised the same day on Joe's model:
 a view node says **what** nodes it shows (a source: a query with filters) and **which
-viewer** shows them; grouping is the viewer's, not core's. Nothing is built. Open decisions
+viewer** shows them; grouping and sorting are the viewer's, not core's. Nothing is built. Open decisions
 at the end.
 
 **Three things, kept apart (Joe, 2026-11-02):**
@@ -23,11 +23,13 @@ A view node is two things:
    - this node's children, or its subtree to a depth;
    - nodes with a tag; a search; the nodes linking to a note (backlinks);
    - nodes with a field set, or a field matching a condition;
-   - filters on top (not done, modified this week, of a type), and an order (the tree's own
-     order, or a field).
+   - filters on top (not done, modified this week, of a type), and a limit that picks
+     ("the 20 most recently modified": selection needs an order to choose by, so a limit
+     names one; the viewer still shows what was picked however it likes).
 2. **A viewer: how they are shown.** Which viewer (a plugin's), and that viewer's own
-   settings (a calendar's date field, a kanban's card size), stored on the node under the
-   viewer's id.
+   settings (a calendar's date field, a table's sort column, a kanban's card size), stored
+   on the node under the viewer's id. Grouping and sorting are the viewer's (Joe,
+   2026-11-02: neither belongs with the source).
 
 It stores **how to show** nodes, never the nodes: every gesture made through a view
 becomes an ordinary edit of real nodes or is refused with a sentence.
@@ -35,7 +37,10 @@ becomes an ordinary edit of real nodes or is refused with a sentence.
 ### 1.1 A source answers a forest
 
 A source's result keeps the tree relations among what it found: each node with its
-parent, its children that are also in the result, and their order. A kanban reads "this
+parent and its children that are also in the result, **in the tree's own order**. That
+order is data, not a setting: a parent's list is co-edited, and a card's place in its
+column is its priority, so no source chooses it and no viewer can lose it. A viewer that
+sorts (a calendar by date, a table by a column) sorts for display only. A kanban reads "this
 node's children, two levels deep" as columns and cards; a calendar or a table flattens the
 same answer. Without the forest, a tree-shaped viewer would have to rebuild what the source
 already knew.
@@ -103,7 +108,7 @@ see an ordinary node.
    viewer and the viewer acts through `Pimble`, filled by plugins
    (`docs/PLUGINS_CONTRACT.md`); viewers' declared source shapes and the menu that offers
    only fitting ones.
-3. **Query sources:** tags, search, backlinks, field conditions, filters, field order.
+3. **Query sources:** tags, search, backlinks, field conditions, filters, limits.
 
 ## 5. Open decisions for Joe
 
