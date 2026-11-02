@@ -183,6 +183,7 @@ fn empty_folder(node_id: NodeId, title: &str) -> Node {
             tags: Vec::new(),
             custom: HashMap::new(),
             fields: Vec::new(),
+            metanode: None,
         },
         content: Vec::new(),
         children: Vec::new(),

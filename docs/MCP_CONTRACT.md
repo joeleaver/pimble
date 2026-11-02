@@ -232,6 +232,7 @@ Read:
 | `search` | keyword or semantic (`search`, `semantic` flag), with snippets |
 | `resolve_link` | where a `pimble:` URL points now (follows `became`) |
 | `list_deleted` | a store's recently deleted nodes |
+| `get_metanode` | what a metanode shows (docs/METANODES_CONTRACT.md): its source's forest as an indented outline in the tree's order, each line with its link, under a sentence saying what it is; a node with no viewer is read as its children |
 
 Write:
 
@@ -242,6 +243,10 @@ Write:
 | `rename`, `set_tags` | the node's title and tags |
 | `move_node` | within a store, or between stores (`transplantNode`); planned first with `pimble_core::plan::plan_move` through `pimble-api`, so it refuses what the explorer refuses with the same sentences (into itself, read only, a mount whose store is not open, beside a store) before sending, says the cross-store and share-leaving warnings in its answer, and takes several nodes with `nodes` (one `moveNodes`, all or none) |
 | `delete_node`, `undelete_node` | tombstone, put back |
+| `set_metanode` | make a node a metanode shown with `viewer` and, with `depth`, a source of its subtree to that depth (1 its children); no viewer makes it an ordinary node again, its source kept. One `applyEdit` of the `metanode:*` keys |
+
+`get_node` describes a metanode in one line ("a metanode: the children of Work, two levels,
+shown with the kanban viewer") and says when a newer Pimble wrote part of its source.
 
 Sheets (docs/SHEETS_CONTRACT.md section 10, wave 1; built 2026-10-19 on branch `sheets`).
 `pimble-mcp` links `pimble-sheet` and computes what it reads exactly as the app does, over

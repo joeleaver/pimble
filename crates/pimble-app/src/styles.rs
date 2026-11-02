@@ -2411,6 +2411,64 @@ pub(crate) const APP_CSS: &str = "
     height: 18px;
 }
 
+/* ── A metanode's outline (metanodes.rs) ────────────────────── */
+
+.pimble-metanode {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 12px 0;
+}
+
+.pimble-metanode__line {
+    margin: 0 12px 8px 12px;
+    padding: 6px 10px;
+    font-size: 12px;
+    color: var(--rinch-color-dimmed);
+    background: var(--rinch-color-default-hover);
+    border-radius: 4px;
+}
+
+.pimble-metanode__empty {
+    padding: 8px 12px;
+    font-size: 13px;
+    color: var(--rinch-color-dimmed);
+}
+
+.pimble-metanode__row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 26px;
+    padding-right: 12px;
+    font-size: 13px;
+    color: var(--rinch-color-text);
+    cursor: pointer;
+    user-select: none;
+}
+
+.pimble-metanode__row:hover {
+    background: var(--rinch-color-default-hover);
+}
+
+.pimble-metanode__icon {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+}
+
+.pimble-metanode__icon svg {
+    width: 15px;
+    height: 15px;
+}
+
+.pimble-metanode__label {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
 /* ── Empty state ────────────────────────────────────────────── */
 
 .pimble-empty-state {

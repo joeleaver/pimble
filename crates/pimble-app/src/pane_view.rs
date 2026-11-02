@@ -107,7 +107,7 @@ pub(crate) fn close_focused(store: AppStore) {
 /// The node pane `pane` shows as a document, tracked: its canonical pair.
 pub(crate) fn pane_document(store: AppStore, pane: PaneId) -> Option<(pimble_core::StoreId, pimble_core::NodeId)> {
     let state = store.pane(pane);
-    if !state.show_editor.get() && !state.show_board.get() && !state.show_sheet.get() && !state.show_discussion.get() {
+    if !state.show_editor.get() && !state.show_board.get() && !state.show_sheet.get() && !state.show_discussion.get() && !state.show_metanode.get() {
         return None;
     }
     match parse_tree_value(&state.selected.get()?) {
@@ -251,6 +251,8 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
     let sheet_view = crate::sheets::render_sheet(__scope, store, pane);
     // A discussion node's thread (docs/DISCUSSIONS_CONTRACT.md), likewise.
     let discussion_view = crate::discussions::render_discussion(__scope, store, pane);
+    // A metanode's outline (docs/METANODES_CONTRACT.md section 1.4), likewise.
+    let metanode_view = crate::metanodes::render_metanode(__scope, store, pane);
     // The discussions on the pane's node, under its content: in the text's
     // scroll for a note, under the view for a board or a sheet.
     let discussions_in_text = crate::discussions::render_host_panel(__scope, store, pane, true);
@@ -492,12 +494,13 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
             {board_view}
             {sheet_view}
             {discussion_view}
+            {metanode_view}
             {discussions_panel}
             {picture_controls}
             {presence_carets}
             div {
                 class: "pimble-empty-state",
-                style: {move || if state.show_editor.get() || state.show_board.get() || state.show_sheet.get() || state.show_discussion.get() { "display: none;" } else { "" }},
+                style: {move || if state.show_editor.get() || state.show_board.get() || state.show_sheet.get() || state.show_discussion.get() || state.show_metanode.get() { "display: none;" } else { "" }},
                 div {
                     class: "pimble-empty-state__icon",
                     {empty_icon}

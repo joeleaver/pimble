@@ -27,6 +27,7 @@ pub fn write_of(cmd: &BackendCommand) -> Option<Write> {
         | CreateAttachment { .. }
         | RenameNode { .. }
         | SetNodeAppearance { .. }
+        | SetMetanode { .. }
         | DeleteNode { .. }
         | UndeleteNode { .. }
         | MoveNode { .. }

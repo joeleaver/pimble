@@ -367,6 +367,7 @@ fn show_in_pane(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
     let mut is_board = false;
     let mut is_sheet = false;
     let mut is_discussion = false;
+    let mut is_metanode = false;
     let (title_opt, content_bytes_opt, is_document, sel_ids) = if let Some((s_id, node_id_opt)) = parsed {
         if let Some(n_id) = node_id_opt {
             let result = store.get_node_signal(s_id, n_id).map(|sig| {
@@ -380,11 +381,18 @@ fn show_in_pane(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
                     let board = node.node_type == pimble_core::node_types::BOARD;
                     let sheet = node.node_type == pimble_core::node_types::SHEET;
                     let discussion = node.node_type == pimble_core::node_types::DISCUSSION;
-                    (label, node.content.clone(), is_doc, board, sheet, discussion)
+                    let metanode = crate::metanodes::is_metanode(node);
+                    (label, node.content.clone(), is_doc, board, sheet, discussion, metanode)
                 })
             });
             match result {
-                Some((label, content, is_doc, board, sheet, discussion)) => {
+                // A metanode shows its outline whatever its type
+                // (docs/METANODES_CONTRACT.md section 1.4).
+                Some((label, _, _, _, _, _, true)) => {
+                    is_metanode = true;
+                    (Some(label), None, false, Some((s_id, n_id)))
+                }
+                Some((label, content, is_doc, board, sheet, discussion, false)) => {
                     is_board = board;
                     is_sheet = sheet;
                     is_discussion = discussion;
@@ -415,6 +423,16 @@ fn show_in_pane(store: AppStore, tree_state: UseTreeReturn, pane: PaneId, value:
     if let Some(title) = title_opt.filter(|_| focused) {
         store.node_title.set(title);
     }
+
+    if is_metanode {
+        if let Some((s_id, n_id)) = sel_ids {
+            crate::metanodes::start(store, pane, s_id, n_id);
+        }
+        store.editor_dirty.set(false);
+        return;
+    }
+    // Whatever metanode the pane showed, it shows this instead.
+    crate::metanodes::stop(store, pane);
 
     if is_document {
         let content_bytes = content_bytes_opt.unwrap_or_default();
@@ -1653,6 +1671,18 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             };
             // "Appearance...": open the icon, colour and tags picker for this
             // node (a store row edits its root node).
+            // "Show as Outline": a metanode back to an ordinary node
+            // (docs/METANODES_CONTRACT.md), its source kept for next time.
+            // Snapshotted like the icon: the row's label carries the viewer.
+            let is_metanode_row = node_sig.is_some_and(|sig| untracked(|| sig.with(crate::metanodes::is_metanode)));
+            let on_show_as_outline = {
+                let nv = nv_ctx.clone();
+                move || {
+                    if let Some((s_id, Some(n_id))) = parse_tree_value(&nv) {
+                        crate::metanodes::set_metanode(store, s_id, n_id, None, None);
+                    }
+                }
+            };
             let on_appearance = {
                 let nv = nv_ctx.clone();
                 move || {
@@ -2343,6 +2373,14 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 disabled: !can_write_tree,
                                 onclick: on_appearance,
                                 "Appearance..."
+                            }
+                            if is_metanode_row {
+                                DropdownMenuItem {
+                                    left_section: TablerIcon::ListTree,
+                                    disabled: {move || !can_write_tree || several()},
+                                    onclick: on_show_as_outline.clone(),
+                                    "Show as Outline"
+                                }
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Trash,

@@ -135,3 +135,58 @@ async fn moves_and_deletes_are_judged_before_they_are_sent() {
     assert_eq!(refused, pimble_core::StoreAccess::READ_ONLY_REFUSAL);
     let _ = server.stop().await;
 }
+
+/// Metanodes (docs/METANODES_CONTRACT.md wave 1): `set_metanode` sets and
+/// clears the viewer and source, `get_node` describes one, `get_metanode`
+/// lists what it shows as an outline in the tree's order.
+#[tokio::test]
+async fn metanodes_are_set_described_and_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = PimbleServer::with_config(ServerConfig {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        replicas_dir: Some(dir.path().join("replicas")),
+        ..Default::default()
+    });
+    server.start().await.expect("server starts");
+    let url = format!("http://{}", server.addr());
+    let service = PimbleClient::connect(&url).await.unwrap();
+    service.create_store(dir.path().join("work.pimble"), "Work").await.unwrap();
+    let pimble = Pimble::new(Arc::new(Connection::with_client(PimbleClient::connect(&url).await.unwrap())));
+    pimble.create_node(p(json!({ "parent": "Work", "title": "Board" }))).await.unwrap();
+    for column in ["To do", "Doing"] {
+        pimble.create_node(p(json!({ "parent": "Work/Board", "title": column }))).await.unwrap();
+    }
+    pimble.create_node(p(json!({ "parent": "Work/Board/To do", "title": "Write" }))).await.unwrap();
+    pimble.create_node(p(json!({ "parent": "Work/Board/To do", "title": "Ship" }))).await.unwrap();
+    pimble.create_node(p(json!({ "parent": "Work/Board/To do/Write", "title": "Too deep" }))).await.unwrap();
+
+    // Not a metanode yet: read as its children.
+    let plain = pimble.get_metanode(p(json!({ "node": "Work/Board" }))).await.unwrap();
+    assert!(plain.contains("is not a metanode") && !plain.contains("Write"), "{plain}");
+
+    let set = pimble.set_metanode(p(json!({ "node": "Work/Board", "viewer": "kanban", "depth": 2 }))).await.unwrap();
+    assert!(set.contains("a metanode: the children of Board, two levels, shown with the kanban viewer"), "{set}");
+    let read = pimble.get_node(p(json!({ "node": "Work/Board" }))).await.unwrap();
+    assert!(read.contains("(a metanode: the children of Board, two levels, shown with the kanban viewer; get_metanode"), "{read}");
+
+    let shown = pimble.get_metanode(p(json!({ "node": "Work/Board" }))).await.unwrap();
+    let lines: Vec<&str> = shown.lines().skip(1).collect();
+    assert_eq!(lines.len(), 4, "{shown}");
+    assert!(lines[0].starts_with("- To do (pimble:") && lines[1].starts_with("  - Write (pimble:"), "{shown}");
+    assert!(lines[2].starts_with("  - Ship (") && lines[3].starts_with("- Doing ("), "{shown}");
+    assert!(!shown.contains("Too deep"), "{shown}");
+
+    // Setting what it is already changes nothing and says so.
+    let same = pimble.set_metanode(p(json!({ "node": "Work/Board", "viewer": "kanban" }))).await.unwrap_err();
+    assert!(same.contains("change nothing"), "{same}");
+    assert!(pimble.set_metanode(p(json!({ "node": "Work/Board", "viewer": "kanban", "depth": 0 }))).await.is_err());
+
+    // Cleared: an ordinary node again, its source kept for next time.
+    let cleared = pimble.set_metanode(p(json!({ "node": "Work/Board" }))).await.unwrap();
+    assert!(cleared.contains("an ordinary node again"), "{cleared}");
+    let read = pimble.get_node(p(json!({ "node": "Work/Board" }))).await.unwrap();
+    assert!(!read.contains("a metanode"), "{read}");
+    let again = pimble.set_metanode(p(json!({ "node": "Work/Board", "viewer": "calendar" }))).await.unwrap();
+    assert!(again.contains("two levels, shown with the calendar viewer"), "{again}");
+    let _ = server.stop().await;
+}

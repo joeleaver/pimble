@@ -314,6 +314,7 @@ fn rejudge(store: AppStore, store_id: StoreId) {
 fn row_data_changed(store: AppStore, store_id: StoreId, node: &Node) -> bool {
     let shared = node.metadata.share().is_some();
     let has_row_data = node.metadata.icon().is_some()
+        || node.metadata.metanode.is_some()
         || node.metadata.color().is_some()
         || node.metadata.background().is_some()
         || shared
@@ -326,6 +327,7 @@ fn row_data_changed(store: AppStore, store_id: StoreId, node: &Node) -> bool {
                         || cached.metadata.color() != node.metadata.color()
                         || cached.metadata.background() != node.metadata.background()
                         || cached.metadata.share().is_some() != shared
+                        || cached.metadata.metanode.as_ref().map(|m| &m.viewer) != node.metadata.metanode.as_ref().map(|m| &m.viewer)
                         || cached.access != node.access
                         || cached.children.is_empty() != node.children.is_empty()
                 })
@@ -459,6 +461,19 @@ fn take_node(store: AppStore, store_id: StoreId, node: &Node) -> bool {
             .is_some_and(|b| b.store_id == store_id && b.node_id == node_id);
         let already_discussing = untracked(|| state.discussion.get())
             .is_some_and(|b| b.store_id == store_id && b.node_id == node_id);
+        // A metanode shows its outline (docs/METANODES_CONTRACT.md); one that
+        // stopped being one shows as its type again, below.
+        let already_metanode = untracked(|| state.metanode.get())
+            .is_some_and(|m| m.store_id == store_id && m.node_id == node_id);
+        if crate::metanodes::is_metanode(node) {
+            if !already_metanode {
+                crate::metanodes::start(store, pane, store_id, node_id);
+            }
+            continue;
+        }
+        if already_metanode {
+            crate::metanodes::stop(store, pane);
+        }
         if node.node_type == pimble_core::node_types::DISCUSSION && !already_discussing {
             // A discussion (docs/DISCUSSIONS_CONTRACT.md).
             state.show_editor.set(false);
@@ -856,6 +871,12 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             BackendEvent::Shown { view } => {
                 tracing::debug!("Shown in {:?}: {} rows, {} lists, {} gone", view.store, view.nodes.len(), view.lists.len(), view.gone.len());
                 apply_view(store, view);
+                // The metanodes the panes show that it may have touched.
+                crate::metanodes::view_shown(store, view);
+            }
+
+            BackendEvent::MetanodeRead { store_id, node_id, forest } => {
+                crate::metanodes::forest_read(store, *store_id, *node_id, forest.clone());
             }
 
             BackendEvent::NodeMoved { store_id, node_id, old_parent_id, new_parent_id } => {

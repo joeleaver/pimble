@@ -24,6 +24,7 @@ pub mod presence;
 pub mod recipes;
 pub mod router;
 pub mod rpc;
+pub mod metanode;
 pub mod view;
 #[cfg(feature = "conformance")]
 pub mod conformance;
@@ -35,6 +36,7 @@ pub use backend::StoreCapabilities;
 pub use error::ApiError;
 pub use router::Router;
 pub use view::{Affected, Listed, View};
+pub use metanode::{Forest, ForestEntry, Judged, MetanodeEdit};
 pub use identity::Me;
 pub use names::label;
 pub use pimble_core::plan;

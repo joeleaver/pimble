@@ -33,6 +33,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use pimble_core::{Anchor, IndexUnit, Node, NodeId, NodeMetadata, PimbleUrl, Place, StoreAccess};
+use pimble_core::metanode::{Metanode, Source, SOURCE_KEY, VIEWER_KEY};
 use yrs::updates::encoder::Encode;
 use yrs::{
     Any, Array, ArrayPrelim, ArrayRef, BranchID, Doc, GetString, In, Map, MapPrelim, MapRef, Out,
@@ -119,6 +120,10 @@ pub struct NodeFields {
     pub custom: HashMap<String, serde_json::Value>,
     /// The node's fields, name and value as typed, ordered by name.
     pub fields: Vec<(String, String)>,
+    /// The viewer a metanode is shown with (`pimble_core::metanode::VIEWER_KEY`).
+    pub metanode_viewer: Option<String>,
+    /// A metanode's source as stored (`pimble_core::metanode::SOURCE_KEY`).
+    pub metanode_source: Option<String>,
 }
 
 impl NodeFields {
@@ -141,6 +146,7 @@ impl NodeFields {
                 tags: self.tags,
                 custom: self.custom,
                 fields: self.fields,
+                metanode: Metanode::from_stored(self.metanode_viewer.as_deref(), self.metanode_source.as_deref()),
             },
             content: Vec::new(),
             children: Vec::new(),
@@ -697,6 +703,63 @@ impl NodeDoc {
         .map(|_| ())
     }
 
+    /// Make the node a metanode shown with `viewer`
+    /// (docs/METANODES_CONTRACT.md), or
+    /// with `None` an ordinary node again. The source is left as it is, so a
+    /// node shown as an outline and then with a viewer again keeps it.
+    pub fn set_metanode_viewer(&mut self, viewer: Option<&str>, now: &str) -> Result<()> {
+        let viewer = viewer.map(str::trim).filter(|v| !v.is_empty());
+        // Setting what is there writes nothing, not even the time.
+        if self.stored_string(VIEWER_KEY).as_deref() == viewer {
+            return Ok(());
+        }
+        self.edit_node(|d, txn| {
+            match viewer {
+                Some(v) => {
+                    d.node.insert(txn, VIEWER_KEY, v.to_string());
+                }
+                None => {
+                    d.node.remove(txn, VIEWER_KEY);
+                }
+            }
+            d.stamp_modified(txn, now);
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    /// Set which nodes the metanode shows, or with `None` go back to its
+    /// children (the key removed).
+    pub fn set_metanode_source(&mut self, source: Option<&Source>, now: &str) -> Result<()> {
+        if self.stored_string(SOURCE_KEY) == source.map(Source::to_stored) {
+            return Ok(());
+        }
+        self.edit_node(|d, txn| {
+            match source {
+                Some(source) => {
+                    d.node.insert(txn, SOURCE_KEY, source.to_stored());
+                }
+                None => {
+                    d.node.remove(txn, SOURCE_KEY);
+                }
+            }
+            d.stamp_modified(txn, now);
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    /// The metanode the node is, when it is one.
+    pub fn metanode(&self) -> Option<Metanode> {
+        Metanode::from_stored(self.stored_string(VIEWER_KEY).as_deref(), self.stored_string(SOURCE_KEY).as_deref())
+    }
+
+    /// A string key of the `node` root as stored.
+    fn stored_string(&self, key: &str) -> Option<String> {
+        let txn = self.doc.transact();
+        string_value(self.node.get(&txn, key))
+    }
+
     /// The node's own fields (`field:<name>` keys), ordered by name.
     pub fn node_fields(&self) -> Vec<(String, String)> {
         let txn = self.doc.transact();
@@ -1201,6 +1264,8 @@ impl NodeDoc {
             tags,
             custom,
             fields,
+            metanode_viewer: get(VIEWER_KEY),
+            metanode_source: get(SOURCE_KEY),
         })
     }
 
@@ -1565,6 +1630,52 @@ mod tests {
     }
 
     #[test]
+    fn a_metanode_is_two_keys_of_the_node_root_read_into_the_node() {
+        use pimble_core::metanode::{Query, Source};
+        let mut doc = NodeDoc::new();
+        doc.init("document", "Work", None, T0).unwrap();
+        assert!(doc.metanode().is_none());
+        assert!(doc.fields().unwrap().into_node(id()).metadata.metanode.is_none());
+
+        // A viewer alone shows the children.
+        doc.set_metanode_viewer(Some("kanban"), T1).unwrap();
+        let spec = doc.fields().unwrap().into_node(id()).metadata.metanode.unwrap();
+        assert_eq!((spec.viewer.as_str(), &spec.source), ("kanban", &Source::children()));
+
+        doc.set_metanode_source(Some(&Source::subtree(2)), T1).unwrap();
+        let loaded = NodeDoc::load(&doc.save()).unwrap();
+        assert_eq!(loaded.metanode().unwrap().source.query, Query::Subtree { depth: 2 });
+        // Neither key is a field, and neither is a container: each is a string.
+        assert!(loaded.node_fields().is_empty());
+        assert_eq!(loaded.fields().unwrap().metanode_source.as_deref(), Some(r#"{"query":{"kind":"subtree","depth":2}}"#));
+
+        // Clearing the viewer keeps the source for the next time.
+        doc.set_metanode_viewer(None, T2).unwrap();
+        assert!(doc.metanode().is_none());
+        assert!(doc.fields().unwrap().metanode_source.is_some());
+        doc.set_metanode_viewer(Some("kanban"), T2).unwrap();
+        assert_eq!(doc.metanode().unwrap().source, Source::subtree(2));
+        doc.set_metanode_source(None, T2).unwrap();
+        assert_eq!(doc.metanode().unwrap().source, Source::children());
+    }
+
+    #[test]
+    fn a_metanode_set_on_another_device_merges_as_a_metadata_change() {
+        use pimble_core::metanode::Query;
+        let mut here = NodeDoc::new();
+        here.init("document", "Work", None, T0).unwrap();
+        let mut there = NodeDoc::load(&here.save()).unwrap();
+        there.set_metanode_viewer(Some("calendar"), T1).unwrap();
+        // A source a newer Pimble wrote is kept and read as the children.
+        there.set_metanode_source(Some(&pimble_core::metanode::Source::parse(r#"{"query":{"kind":"tag","tag":"x"}}"#)), T1).unwrap();
+        here.apply_update(&there.diff_since(&here.state_vector()).unwrap()).unwrap();
+        let spec = here.metanode().unwrap();
+        assert_eq!(spec.viewer, "calendar");
+        assert_eq!(spec.source.query, Query::Later);
+        assert!(spec.source.not_understood().is_some());
+    }
+
+    #[test]
     fn every_field_round_trips_through_save_and_load() {
         let parent = id();
         let mut doc = NodeDoc::from_plain_text("body").unwrap();
@@ -1599,6 +1710,8 @@ mod tests {
                 ("nested".to_string(), json!({"x": [1, 2, {"y": null}]})),
             ]),
             fields: Vec::new(),
+            metanode_viewer: None,
+            metanode_source: None,
         };
         assert_eq!(doc.fields().unwrap(), expected);
 

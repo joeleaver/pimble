@@ -82,6 +82,12 @@ reply answers a message (or posts at the top level), edit_message and delete_mes
 only your own messages, resolve_discussion closes or reopens one. Messages are Markdown with \
 bold, italic and links; your messages are signed with your agent's name.
 
+A metanode is a node shown a particular way: it names which nodes it shows (its source, such as \
+its children two levels deep) and the viewer that shows them (such as a kanban, whose columns are \
+the first level and cards the second, in the tree's order). get_node says when a node is one, \
+get_metanode lists what it shows, set_metanode sets or clears its viewer and source. Moving, \
+creating and editing the nodes it shows is done with the ordinary tools.
+
 Canvases are infinite whiteboards (a canvas node) and the marks on pictures in a note's text (a \
 picture's canvas, named by the note and the id after #canvas= in its URL). get_canvas lists a canvas's \
 layers and elements with ids, positions and text; render_canvas shows it as an image; create_canvas makes \
@@ -323,6 +329,22 @@ pub struct SetTagsParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct SetMetanodeParams {
+    /// The node.
+    pub node: String,
+    /// The viewer to show it with (a plugin's id, such as "kanban"). Leave it
+    /// out, or give "", to show it as an ordinary node again (its outline):
+    /// its source is kept for next time.
+    #[serde(default)]
+    pub viewer: Option<String>,
+    /// How many levels below the node it shows: 1 its children (the
+    /// default), 2 its children and theirs (a kanban's columns and cards).
+    /// Leave it out to keep the source it has.
+    #[serde(default)]
+    pub depth: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct MoveNodeParams {
     /// The node to move.
     #[serde(default)]
@@ -483,6 +505,13 @@ impl Pimble {
             StoreAccess::Read => out.push_str("access: read-only\n"),
             StoreAccess::Comment => out.push_str("access: comment-only (start_discussion and reply work here)\n"),
             StoreAccess::Full => {}
+        }
+        if let Some(metanode) = &node.metadata.metanode {
+            // docs/METANODES_CONTRACT.md section 3: what it shows, and how.
+            out.push_str(&format!("({}; get_metanode lists what it shows)\n", metanode.describe(&label(&node))));
+            if let Some(why) = metanode.source.not_understood() {
+                out.push_str(&format!("({why})\n"));
+            }
         }
         if node.metadata.custom.contains_key("mount") || node.node_type == "mount" {
             out.push_str("(a mount: its children are another store's; list_children shows them)\n");
@@ -659,6 +688,63 @@ impl Pimble {
         let addr = self.api.resolve(&p.node).await?;
         self.edit(addr, |doc| doc.replace_content_markdown(&p.markdown).map(drop).map_err(crdt)).await?;
         Ok(format!("Replaced the content of {}.", addr.link()))
+    }
+
+    /// What a metanode shows (docs/METANODES_CONTRACT.md): its source's nodes as an
+    /// indented outline in the tree's own order, each line with its link. A node
+    /// with no viewer is read as its children.
+    #[tool(name = "get_metanode")]
+    async fn get_metanode(&self, Parameters(p): Parameters<NodeParam>) -> Result<String, String> {
+        let addr = self.api.resolve(&p.node).await?;
+        let forest = self.api.metanode_source(addr).await?;
+        self.present(addr).await;
+        let name = label(&forest.node);
+        let mut out = match &forest.spec {
+            Some(metanode) => format!("{} ({}) is {}.\n", self.api.path(addr).await, addr.link(), metanode.describe(&name)),
+            None => format!(
+                "{} ({}) is not a metanode (set_metanode makes it one); {}:\n",
+                self.api.path(addr).await,
+                addr.link(),
+                forest.source.describe(&name)
+            ),
+        };
+        if let Some(why) = forest.not_understood() {
+            out.push_str(&format!("{why}\n"));
+        }
+        if forest.entries.is_empty() {
+            out.push_str("(it shows nothing: no children)\n");
+        }
+        for entry in &forest.entries {
+            let indent = "  ".repeat(entry.depth.saturating_sub(1) as usize);
+            out.push_str(&format!("{indent}- {} ({})\n", label(&entry.node), entry.addr.link()));
+        }
+        Ok(out)
+    }
+
+    /// Make a node a metanode shown with a viewer and a source, or an ordinary node
+    /// again. Every gesture in a viewer is an ordinary edit of real nodes, which the
+    /// other tools already make (move_node, create_node, set_fields, set_tags).
+    #[tool(name = "set_metanode")]
+    async fn set_metanode(&self, Parameters(p): Parameters<SetMetanodeParams>) -> Result<String, String> {
+        use pimble_core::metanode::{Source, MAX_SUBTREE_DEPTH};
+        let addr = self.api.resolve(&p.node).await?;
+        let viewer = p.viewer.as_deref().map(str::trim).filter(|v| !v.is_empty());
+        let source = match p.depth {
+            Some(0) => return Err("`depth` is at least 1 (the node's children).".into()),
+            Some(d) if d > MAX_SUBTREE_DEPTH => return Err(format!("`depth` is at most {MAX_SUBTREE_DEPTH}.")),
+            Some(1) => Some(Source::children()),
+            Some(d) => Some(Source::subtree(d)),
+            None => None,
+        };
+        let edited = self.api.set_metanode(addr, viewer, source.as_ref()).await?;
+        if !edited.changed {
+            return Err("That would change nothing, so nothing was written.".into());
+        }
+        let node = self.api.node(addr).await?;
+        Ok(match &node.metadata.metanode {
+            Some(metanode) => format!("{} is now {}.", addr.link(), metanode.describe(&label(&node))),
+            None => format!("{} is an ordinary node again, shown as its outline.", addr.link()),
+        })
     }
 
     /// Rename a node.

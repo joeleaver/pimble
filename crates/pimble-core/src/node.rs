@@ -139,6 +139,7 @@ impl Node {
                 tags: Vec::new(),
                 custom: HashMap::new(),
                 fields: Vec::new(),
+                metanode: None,
             },
             content: Vec::new(),
             children: Vec::new(),
@@ -317,6 +318,12 @@ pub struct NodeMetadata {
     /// and value as typed, ordered by name. Pimble's own keys are `custom`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<(String, String)>,
+
+    /// What the node shows when it is a metanode
+    /// (docs/METANODES_CONTRACT.md): its viewer and source, read from the
+    /// `metanode:*` keys of its `node` root. `None` for any node without a viewer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metanode: Option<crate::metanode::Metanode>,
 }
 
 impl NodeMetadata {

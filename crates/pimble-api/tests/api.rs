@@ -559,3 +559,143 @@ async fn another_devices_changes_are_shown_from_held_documents() {
     assert_eq!(counts.fetches(), fetches, "nothing was fetched to show any of it");
     let _ = { s }.server.stop().await;
 }
+
+/// A metanode's source (docs/METANODES_CONTRACT.md wave 1): a forest in the
+/// tree's own order, read from held documents, told apart from changes that
+/// cannot touch it, and judged edits that say when a node leaves the view.
+#[tokio::test]
+async fn a_metanode_source_answers_a_forest_in_the_trees_order() {
+    use pimble_api::MetanodeEdit;
+    use pimble_core::metanode::{leaves_metanode_warning, Source};
+    use pimble_rpc::StoreChangeKind as K;
+    let s = stack().await;
+    let (store, root) = s.service.create_store(s.dir.path().join("work.pimble"), "Work").await.unwrap();
+    let board = s.service.create_node(store, Some(root), "folder", "Board").await.unwrap();
+    let todo = s.service.create_node(store, Some(board), "folder", "To do").await.unwrap();
+    let doing = s.service.create_node(store, Some(board), "folder", "Doing").await.unwrap();
+    let done = s.service.create_node(store, Some(board), "folder", "Done").await.unwrap();
+    let a = s.service.create_node(store, Some(todo), "document", "A").await.unwrap();
+    let b = s.service.create_node(store, Some(todo), "document", "B").await.unwrap();
+    let c = s.service.create_node(store, Some(doing), "document", "C").await.unwrap();
+    let deep = s.service.create_node(store, Some(a), "document", "Below A").await.unwrap();
+    let elsewhere = s.service.create_node(store, Some(root), "folder", "Elsewhere").await.unwrap();
+    let (api, counts) = api(&s).await;
+    let at = |n| Addr::new(store, n);
+
+    // A node with no viewer is read as its children.
+    let plain = api.metanode_source(at(board)).await.unwrap();
+    assert!(plain.spec.is_none());
+    assert_eq!(plain.entries.iter().map(|e| e.addr.node).collect::<Vec<_>>(), vec![todo, doing, done]);
+
+    // Set as a view two levels deep: columns and cards, in order, nothing deeper.
+    let edited = api.set_metanode(at(board), Some("kanban"), Some(&Source::subtree(2))).await.unwrap();
+    assert!(edited.changed);
+    let forest = api.metanode_source(at(board)).await.unwrap();
+    assert_eq!(forest.spec.as_ref().map(|v| v.viewer.as_str()), Some("kanban"));
+    let order: Vec<(NodeId, u32)> = forest.entries.iter().map(|e| (e.addr.node, e.depth)).collect();
+    assert_eq!(order, vec![(todo, 1), (a, 2), (b, 2), (doing, 1), (c, 2), (done, 1)]);
+    assert_eq!(forest.tops().map(|e| e.addr.node).collect::<Vec<_>>(), vec![todo, doing, done]);
+    assert_eq!(forest.get(at(todo)).unwrap().children, vec![at(a), at(b)]);
+    assert_eq!(forest.get(at(a)).unwrap().parent, Some(at(todo)));
+    assert!(!forest.contains(at(deep)), "a third level is not in a two-level source");
+    assert!(forest.lists_children_of(at(done)) && !forest.lists_children_of(at(a)));
+    assert_eq!(forest.not_understood(), None);
+    // The node reads as a view for every client.
+    let read = s.service.get_node(store, board).await.unwrap();
+    assert_eq!(read.metadata.metanode.map(|v| v.source), Some(Source::subtree(2)));
+
+    // Read again: the documents are held, nothing is fetched.
+    let fetches = counts.fetches();
+    api.metanode_source(at(board)).await.unwrap();
+    assert_eq!(counts.fetches(), fetches, "a held forest is read without asking the server");
+
+    // Live: a reorder elsewhere is a change the forest hears, and the
+    // forest read again keeps the tree's new order.
+    api.listen();
+    s.service.move_node(store, b, todo, Place::First).await.unwrap();
+    let touched = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match api.next_change().await {
+                Some(change @ Change::Store(_)) => {
+                    if forest.touched_by(&change) {
+                        return true;
+                    }
+                }
+                Some(_) => continue,
+                None => panic!("nothing is subscribed"),
+            }
+        }
+    })
+    .await
+    .expect("the move is heard");
+    assert!(touched);
+    let again = api.metanode_source(at(board)).await.unwrap();
+    assert_eq!(again.get(at(todo)).unwrap().children, vec![at(b), at(a)]);
+
+    // A change outside the view's lists and nodes does not touch it.
+    let forest = again;
+    let made = s.service.create_node(store, Some(elsewhere), "document", "Unrelated").await.unwrap();
+    // (What is still arriving of the reorder is skipped: only the
+    // creation's own change is judged.)
+    let affected = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match api.next_change().await {
+                Some(Change::Store(c)) if matches!(&c.kind, K::NodeCreated { node_id, .. } if *node_id == made) => {
+                    return pimble_api::Affected::of(&c.kind);
+                }
+                Some(_) => continue,
+                None => panic!("nothing is subscribed"),
+            }
+        }
+    })
+    .await
+    .expect("the creation is heard");
+    assert!(!forest.touched(store, &affected), "{affected:?}");
+    // And one in a list it read does.
+    assert!(forest.touched(store, &pimble_api::Affected::rows(vec![done])));
+
+    // Judged: within the view no warning, out of it the leaves-the-view
+    // warning, on top of plan's own refusals.
+    let judged = api.judge_in_metanode(at(board), MetanodeEdit::Move { nodes: vec![at(c)], target: at(done), place: Place::Last }).await.unwrap();
+    assert!(judged.plan.is_some() && judged.warnings.is_empty(), "{:?}", judged.warnings);
+    let judged = api.judge_in_metanode(at(board), MetanodeEdit::Move { nodes: vec![at(c)], target: at(elsewhere), place: Place::Last }).await.unwrap();
+    assert_eq!(judged.warnings, vec![leaves_metanode_warning(1)]);
+    assert_eq!(judged.warnings[0], "This won't be in this view any more.");
+    // Under a card: three levels down, out of a two-level view.
+    let judged = api.judge_in_metanode(at(board), MetanodeEdit::Move { nodes: vec![at(c)], target: at(a), place: Place::Last }).await.unwrap();
+    assert_eq!(judged.warnings, vec![leaves_metanode_warning(1)]);
+    let refused = api.judge_in_metanode(at(board), MetanodeEdit::Move { nodes: vec![at(todo)], target: at(a), place: Place::Last }).await.unwrap_err();
+    assert_eq!(refused.sentence(), pimble_api::plan::INTO_ITSELF);
+    let judged = api.judge_in_metanode(at(board), MetanodeEdit::Delete { nodes: vec![at(a), at(b)] }).await.unwrap();
+    assert_eq!(judged.warnings, vec!["These won't be in this view any more.".to_string()]);
+    // Nothing was sent by judging.
+    assert_eq!(s.service.get_children(store, doing).await.unwrap().1.len(), 1);
+
+    // Back to an outline: the viewer goes, the source stays for next time.
+    api.set_metanode(at(board), None, None).await.unwrap();
+    let read = api.node(at(board)).await.unwrap();
+    assert!(read.metadata.metanode.is_none());
+    api.set_metanode(at(board), Some("kanban"), None).await.unwrap();
+    assert_eq!(api.metanode_source(at(board)).await.unwrap().source, Source::subtree(2));
+    let _ = { s }.server.stop().await;
+}
+
+/// A metanode's source reaches through a mount to its source store's nodes.
+#[tokio::test]
+async fn a_metanode_source_reads_through_mounts() {
+    let s = stack().await;
+    let (home, home_root) = s.service.create_store(s.dir.path().join("home.pimble"), "Home").await.unwrap();
+    let (lib, lib_root) = s.service.create_store(s.dir.path().join("lib.pimble"), "Library").await.unwrap();
+    let book = s.service.create_node(lib, Some(lib_root), "document", "Book").await.unwrap();
+    let shelf = s.service.create_node(home, Some(home_root), "folder", "Shelf").await.unwrap();
+    let (mount, _) = s.service.create_mount(home, shelf, lib, lib_root, Some("Library here".into())).await.unwrap();
+    let (api, _) = api(&s).await;
+    api.set_metanode(Addr::new(home, shelf), Some("kanban"), Some(&pimble_core::metanode::Source::subtree(2))).await.unwrap();
+    let forest = api.metanode_source(Addr::new(home, shelf)).await.unwrap();
+    let order: Vec<Addr> = forest.entries.iter().map(|e| e.addr).collect();
+    assert_eq!(order, vec![Addr::new(home, mount), Addr::new(lib, book)]);
+    assert_eq!(forest.get(Addr::new(lib, book)).unwrap().parent, Some(Addr::new(home, mount)));
+    // A node put in the mount's source lands in the view.
+    assert!(forest.lists_children_of(Addr::new(lib, lib_root)));
+    let _ = { s }.server.stop().await;
+}

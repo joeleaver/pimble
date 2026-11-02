@@ -104,8 +104,62 @@ see an ordinary node.
 
 1. **The concept in core:** the `metanode:*` keys; `Source` with the first values (children,
    subtree to a depth) and its forest, live; the judgement with the leaves-the-source
-   warning; the outline fallback in the app; the MCP's description, `get_view`, `set_view`.
+   warning; the outline fallback in the app; the MCP's description, `get_metanode`, `set_metanode`.
    This is what the kanban viewer needs.
+
+   Built 2026-11-02 on branch `api`, on the recommended answers to the open decisions
+   (any node with `metanode:viewer` is a metanode; a query metanode may have children).
+   **Keys and types:** `pimble_core::metanode` (`VIEWER_KEY` `metanode:viewer`,
+   `SOURCE_KEY` `metanode:source`, `Metanode { viewer, source }`, `Source { query,
+   later }`, `Query::{Children, Subtree { depth }, Later}`). The source is stored as JSON
+   text, `{"query":{"kind":"subtree","depth":2}}`; an unknown query kind reads as
+   `Query::Later` and unknown keys beside `query` (filters, a limit) are kept in `later`, so
+   an older app shows the children with the sentence `NEWER_SOURCE` instead of failing, and
+   rewriting the source loses nothing. Depth is clamped to 1..=16. `NodeFields` reads both
+   keys and `NodeFields::into_node` puts the `Metanode` on `NodeMetadata::metanode`, so
+   every client (server answers, held documents, the vault) sees it; a change of either
+   key is a `MetadataUpdated`. `NodeDoc::set_metanode_viewer`/`set_metanode_source` write
+   one string key each (no container; setting what is there writes nothing).
+   **The forest:** `Pimble::metanode_source(addr) -> Forest` (`crates/pimble-api/src/
+   metanode.rs`): depth first in the tree's order, each `ForestEntry` with its address,
+   node, parent, children in the forest and depth, through mounts, read with
+   `Pimble::children` (held documents; a held forest is read again with no fetch).
+   `Forest::touched(store, &Affected)`, `touched_by(&Change)` and `touched_by_view(&View)`
+   say whether a change may have changed it: its ids against the metanode, the nodes found
+   and the lists read. `Pimble::set_metanode(addr, viewer, source)` is the one write.
+   **Judgement:** `Pimble::judge_in_metanode(metanode, MetanodeEdit::{Move, Delete})`
+   answers `Judged { plan, warnings }`: `plan`'s refusals as errors, its warning first, then
+   `leaves_metanode_warning` ("This won't be in this view any more." / "These won't ...")
+   when a node of the forest lands in a list the source does not read, or is deleted.
+   **App (desktop and web, shared code):** a pane opening a metanode shows
+   `crate::metanodes`'s outline (icons, colors, labels, indented by depth; a click opens the
+   node in the pane) under the line "Shown as an outline: the <viewer> viewer isn't
+   installed." (`outline_line`), plus `NEWER_SOURCE` when it applies; the forest comes from
+   `BackendCommand::GetMetanode` (`BackendEvent::MetanodeRead`) and is asked again when a
+   `Shown` touches it, so another device's, the CLI's or the MCP's moves show live. A node
+   that becomes a metanode, or stops being one, while a pane shows it switches in place.
+   The explorer row is an ordinary row; its menu has "Show as Outline" on a metanode
+   (`BackendCommand::SetMetanode` with no viewer, through `Pimble::edit`; the source is
+   kept). `metanodes::set_metanode` is the code path a viewer menu will take.
+   **MCP:** `get_node` says "(a metanode: the children of X, two levels, shown with the
+   kanban viewer; ...)"; `get_metanode` answers the forest as an outline with links;
+   `set_metanode { node, viewer?, depth? }` sets or clears.
+   **Tests:** pimble-core 4 (`metanode::tests`: stored shape, a newer query, newer parts
+   kept, depth), pimble-crdt 2 (the keys read into the node, a merge from another device),
+   pimble-api 2 (`a_metanode_source_answers_a_forest_in_the_trees_order`: children and
+   two levels, order kept after a reorder elsewhere, the live signal for a touching and an
+   unrelated change, no fetch for a held forest, the leaves-the-view warning for a move out,
+   a move three levels down and a delete, `plan`'s refusal kept, the source kept when
+   cleared; `a_metanode_source_reads_through_mounts`), pimble-mcp 1 (the three tools).
+   Checked in the release desktop app on a copy of the family store (port 7491): a folder
+   set as a kanban metanode two levels deep through the MCP opened as the outline with the
+   line; a move from the CLI showed in it live; "Show as Outline" turned it back (the
+   folder's empty state); setting it again from the MCP switched the open pane back to the
+   outline with its two-level source kept; a row opened its note in the pane. Not checked:
+   the browser (it compiles for wasm and runs the same `pimble-app` code), an encrypted
+   store's forest.
+   Not built: a viewer's icon on the explorer row (no viewers yet), "Source ..." on the
+   menu, an app test of the outline (a `Forest` is made only by the API).
 2. **Hosting viewers:** the seam where a pane hands a metanode's forest and settings to a
    viewer and the viewer acts through `Pimble`, filled by plugins
    (`docs/PLUGINS_CONTRACT.md`); viewers' declared source shapes and the menu that offers

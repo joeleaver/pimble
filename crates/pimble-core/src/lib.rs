@@ -13,6 +13,7 @@ pub mod store;
 pub mod workspace;
 pub mod error;
 pub mod plan;
+pub mod metanode;
 
 pub use blob::*;
 pub use index_unit::*;

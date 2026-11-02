@@ -892,6 +892,13 @@ pub struct PaneState {
     pub discussion: Signal<Option<ActiveEdit>>,
     /// What the discussion view shows: the thread, the message being typed.
     pub discussion_ui: crate::discussions::DiscussionUi,
+    /// Whether the pane shows a metanode (docs/METANODES_CONTRACT.md)
+    /// instead of its editor, which stays mounted, hidden.
+    pub show_metanode: Signal<bool>,
+    /// The metanode the pane holds, like `sheet` for a sheet node.
+    pub metanode: Signal<Option<ActiveEdit>>,
+    /// What the metanode's outline shows (`crate::metanodes`).
+    pub metanode_ui: crate::metanodes::MetanodeUi,
 }
 
 impl PaneState {
@@ -916,6 +923,9 @@ impl PaneState {
             show_discussion: Signal::new(false),
             discussion: Signal::new(None),
             discussion_ui: crate::discussions::DiscussionUi::new(),
+            show_metanode: Signal::new(false),
+            metanode: Signal::new(None),
+            metanode_ui: crate::metanodes::MetanodeUi::new(),
         }
     }
 }
@@ -1555,6 +1565,7 @@ impl AppStore {
         self.pane(pane).show_board.set(false);
         self.pane(pane).show_sheet.set(false);
         self.pane(pane).show_discussion.set(false);
+        crate::metanodes::stop(*self, pane);
         self.pane(pane).restore.set(None);
         if pane == self.focused() {
             self.node_title.set(String::new());
@@ -1578,6 +1589,7 @@ impl AppStore {
                 .or_else(|| state.board.get())
                 .or_else(|| state.sheet.get())
                 .or_else(|| state.discussion.get())
+                .or_else(|| state.metanode.get())
                 .map(|edit| (edit.store_id, edit.node_id))
                 .or_else(|| state.restore.get());
             if let Some((store_id, node_id)) = held {
@@ -1933,11 +1945,13 @@ impl AppStore {
                 .map(|sig| {
                     sig.with(|n| {
                         format!(
-                            "{}|{}|{}|{}",
+                            "{}|{}|{}|{}|{}",
                             n.metadata.icon().unwrap_or(""),
                             n.metadata.color().unwrap_or(""),
                             n.metadata.background().unwrap_or(""),
                             if n.metadata.share().is_some() { "shared" } else { "" },
+                            // The row's menu offers "Show as Outline" on a metanode.
+                            n.metadata.metanode.as_ref().map_or("", |m| m.viewer.as_str()),
                         )
                     })
                 })

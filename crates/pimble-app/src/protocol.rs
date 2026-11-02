@@ -69,6 +69,13 @@ pub enum BackendCommand {
     /// empty document). `BroadcastChanges` is the same write, unanswered.
     ApplyUpdate { store_id: StoreId, node_id: NodeId, update: Vec<u8> },
     RenameNode { store_id: StoreId, node_id: NodeId, title: String },
+    /// The forest a metanode's source finds (docs/METANODES_CONTRACT.md),
+    /// answered as `MetanodeRead`.
+    GetMetanode { store_id: StoreId, node_id: NodeId },
+    /// Make a node a metanode shown with `viewer`, or with `None` an
+    /// ordinary node again; `source` `None` keeps the source it has.
+    /// Answers with `Shown`, as an appearance change does.
+    SetMetanode { store_id: StoreId, node_id: NodeId, viewer: Option<String>, source: Option<pimble_core::metanode::Source> },
     /// Set or clear a node's custom icon (a Tabler icon name) and/or colour
     /// (`#rrggbb`) in its metadata. `None` for a field leaves it as it is;
     /// `Some(None)` clears it. Answers with `Shown`: the node as the edit
@@ -446,6 +453,9 @@ pub enum BackendEvent {
     /// calls; an encrypted store's in the browser from what its vault
     /// decrypts.
     Shown { view: pimble_api::View },
+    /// A metanode's forest as its source found it, or why it could not be
+    /// read.
+    MetanodeRead { store_id: StoreId, node_id: NodeId, forest: Result<pimble_api::Forest, String> },
     NodeDeleted { store_id: StoreId, node_id: NodeId, parent_id: NodeId },
     NodeMoved { store_id: StoreId, node_id: NodeId, old_parent_id: NodeId, new_parent_id: NodeId },
     /// A move that crossed a share's or a store's boundary

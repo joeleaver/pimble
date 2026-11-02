@@ -305,6 +305,16 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
             renamed(ctx, store_id, node_id, edited).await
         }
 
+        C::GetMetanode { store_id, node_id } => {
+            let forest = api.metanode_source(Addr::new(store_id, node_id)).await.map_err(|e| error_message(&e));
+            Some(BackendEvent::MetanodeRead { store_id, node_id, forest })
+        }
+
+        C::SetMetanode { store_id, node_id, viewer, source } => {
+            let edited = api.set_metanode(Addr::new(store_id, node_id), viewer.as_deref(), source.as_ref()).await;
+            renamed(ctx, store_id, node_id, edited).await
+        }
+
         C::DeleteNode { store_id, node_id } => {
             let addr = Addr::new(store_id, node_id);
             let parent_id = match api.node(addr).await {

@@ -2793,6 +2793,7 @@ impl VaultStore {
                     tags: Vec::new(),
                     custom: HashMap::new(),
                     fields: Vec::new(),
+                    metanode: None,
                 },
                 content: Vec::new(),
                 children: Vec::new(),
@@ -3149,6 +3150,8 @@ pub fn store_id_of(cmd: &BackendCommand) -> Option<StoreId> {
         | ApplyUpdate { store_id, .. }
         | RenameNode { store_id, .. }
         | SetNodeAppearance { store_id, .. }
+        | GetMetanode { store_id, .. }
+        | SetMetanode { store_id, .. }
         | DeleteNode { store_id, .. }
         | MoveNode { store_id, .. }
         | MoveNodes { store_id, .. }
