@@ -171,6 +171,10 @@ refused with the outline fallback.
 
 ## 6. Open decisions for Joe
 
+Taken by Joe on 2026-11-02 ("Sounds OK for now"): 1, a core module with a byte codec on
+`wasm32-wasip1`; 3, a per-device plugins folder installed by hand. The rest are open.
+
+
 1. **ABI:** a core module with a byte codec on `wasm32-wasip1` (recommended), or the
    component model/WIT (cleaner interfaces, but no native browser support).
 2. **Permissions:** a plugin asks at install for stores (all or chosen), read or write,
