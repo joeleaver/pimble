@@ -368,3 +368,125 @@ async fn a_reader_is_refused_before_anything_is_sent() {
     assert_eq!(me.name, "Reader");
     let _ = { s }.server.stop().await;
 }
+
+/// What `pimble_core::plan` reads, answered from held documents: a node's
+/// parent and children, its label, a mount and its source, a share marker,
+/// and the stores' facts.
+#[tokio::test]
+async fn the_tree_view_reads_held_documents() {
+    use pimble_api::plan;
+    let s = stack().await;
+    let (home, home_root) = s.service.create_store(s.dir.path().join("home.pimble"), "Home").await.unwrap();
+    let (lib, lib_root) = s.service.create_store(s.dir.path().join("lib.pimble"), "Library").await.unwrap();
+    let shelf = s.service.create_node(lib, Some(lib_root), "folder", "Shelf").await.unwrap();
+    let (mount, _) = s.service.create_mount(home, home_root, lib, shelf, Some("Shelf here".into())).await.unwrap();
+    let (api, _) = api(&s).await;
+    let first = recipes::document("", Some("A first line that is longer than the label")).unwrap();
+    let first = api.create(Addr::new(home, home_root), Place::Last, first).await.unwrap();
+    let titled = api.create(Addr::new(home, home_root), Place::Last, recipes::document("Plans", Some("Not the label")).unwrap()).await.unwrap();
+
+    // Nothing is held yet: not known, never a guess.
+    assert_eq!(api.view(|v| v.parent(home, titled.node)), None);
+    assert_eq!(api.view(|v| v.label(home, titled.node)), plan::UNTITLED);
+
+    api.hold_store(home).await.unwrap();
+    api.stores().await.unwrap();
+    api.view(|v| {
+        assert_eq!(v.parent(home, titled.node), Some(home_root));
+        assert_eq!(v.children(home, home_root), Some(vec![mount, first.node, titled.node]));
+        assert_eq!(v.label(home, titled.node), "Plans");
+        assert_eq!(v.label(home, first.node), "A first line that is long…");
+        assert!(v.is_mount(home, mount) && !v.is_mount(home, titled.node));
+        assert_eq!(v.mount_source(home, mount), Some((lib, shelf)));
+        let facts = v.store(home).expect("an open store");
+        assert_eq!((facts.name.as_str(), facts.root, facts.linked), ("Home", home_root, false));
+        assert_eq!(plan::access(v, home, titled.node), pimble_core::StoreAccess::Full);
+        assert_eq!(plan::ancestors(v, home, titled.node), vec![titled.node, home_root]);
+    });
+
+    // A share marker on a node is read from its document.
+    let marker = pimble_core::ShareMarker { v: 1, key_id: uuid::Uuid::new_v4(), url: "https://pimble.app".into(), name: "Family".into() };
+    api.edit(titled, |doc, at| doc.set_custom(pimble_core::custom_keys::SHARE, &serde_json::to_value(&marker).unwrap(), at)).await.unwrap();
+    assert!(api.view(|v| v.is_shared(home, titled.node)));
+    let _ = { s }.server.stop().await;
+}
+
+/// `plan_move` holds what it judges and answers the app's refusals and
+/// sentences; `move_nodes` sends what it planned.
+#[tokio::test]
+async fn moves_are_planned_over_held_documents_and_sent_as_planned() {
+    use pimble_api::plan::{self, MoveStep};
+    let s = stack().await;
+    let (home, home_root) = s.service.create_store(s.dir.path().join("home.pimble"), "Home").await.unwrap();
+    let (lib, lib_root) = s.service.create_store(s.dir.path().join("lib.pimble"), "Library").await.unwrap();
+    let trips = s.service.create_node(home, Some(home_root), "folder", "Trips").await.unwrap();
+    let moab = s.service.create_node(home, Some(trips), "document", "Moab").await.unwrap();
+    let zion = s.service.create_node(home, Some(trips), "document", "Zion").await.unwrap();
+    let inbox = s.service.create_node(home, Some(home_root), "folder", "Inbox").await.unwrap();
+    let (api, _) = api(&s).await;
+    let a = |n| Addr::new(home, n);
+
+    // Into itself, or beside a store, or a store's root: refused before
+    // anything is sent, with the explorer's sentences.
+    let refused = api.plan_move(&[a(trips)], a(moab), Place::Last).await.unwrap_err();
+    assert_eq!(refused.sentence(), plan::INTO_ITSELF);
+    let refused = api.plan_move(&[a(moab)], a(trips), Place::After(home_root)).await.unwrap_err();
+    assert_eq!(refused.sentence(), plan::BESIDE_A_STORE);
+    let refused = api.plan_move(&[a(home_root)], a(trips), Place::Last).await.unwrap_err();
+    assert_eq!(refused.sentence(), plan::NOT_A_NODE);
+
+    // Where it already is: nothing to send.
+    let stays = api.plan_move(&[a(zion)], a(trips), Place::Last).await.unwrap();
+    assert!(stays.stays() && stays.line == plan::WHERE_IT_IS, "{stays:?}");
+
+    // Two nodes of one store: one `moveNodes`, said as the strip says it.
+    let plan = api.plan_move(&[a(moab), a(zion)], a(inbox), Place::First).await.unwrap();
+    assert_eq!(plan.line, "2 items into Inbox, first");
+    assert!(matches!(plan.steps.as_slice(), [MoveStep::MoveMany { nodes, .. }] if nodes == &vec![moab, zion]));
+    assert_eq!(plan.warning, None);
+    let moved = api.move_nodes(&plan).await.unwrap();
+    assert_eq!(moved.iter().map(|m| m.addr).collect::<Vec<_>>(), vec![a(moab), a(zion)]);
+    let listed: Vec<Addr> = s.service.get_children(home, inbox).await.unwrap().1.into_iter().map(|n| a(n.id)).collect();
+    assert_eq!(listed, vec![a(moab), a(zion)]);
+
+    // Into another store: a transplant, and the warning that says so.
+    let plan = api.plan_move(&[a(moab)], Addr::new(lib, lib_root), Place::Last).await.unwrap();
+    assert_eq!(plan.line, "Into Library");
+    assert!(plan.warning.as_deref().is_some_and(|w| w.starts_with("A new node in Library")), "{:?}", plan.warning);
+    assert!(matches!(plan.steps.as_slice(), [MoveStep::Transplant { .. }]));
+    let moved = api.move_nodes(&plan).await.unwrap();
+    assert!(moved[0].new_link && moved[0].addr.store == lib);
+
+    // Out of a share: said before it happens.
+    let marker = pimble_core::ShareMarker { v: 1, key_id: uuid::Uuid::new_v4(), url: "https://pimble.app".into(), name: "Family".into() };
+    api.edit(a(inbox), |doc, at| doc.set_custom(pimble_core::custom_keys::SHARE, &serde_json::to_value(&marker).unwrap(), at)).await.unwrap();
+    let plan = api.plan_move(&[a(zion)], a(trips), Place::Last).await.unwrap();
+    assert_eq!(plan.warning.as_deref(), Some(plan::leaves_share_warning(1, "Inbox").as_str()));
+
+    // A mount whose store is not open here has nowhere to put anything.
+    let (mount, _) = s.service.create_mount(home, home_root, lib, lib_root, Some("Library here".into())).await.unwrap();
+    // Closed since the stores were listed.
+    s.service.close_store(lib).await.unwrap();
+    let refused = api.plan_move(&[a(trips)], a(mount), Place::Last).await.unwrap_err();
+    assert_eq!(refused.sentence(), plan::MOUNT_NOT_HERE);
+    assert_eq!(api.create_parent(a(mount)).await.unwrap_err().sentence(), plan::MOUNT_NOT_HERE);
+    let _ = { s }.server.stop().await;
+}
+
+/// A reader is refused a move and a delete before anything is sent.
+#[tokio::test]
+async fn a_reader_cannot_plan_a_move_or_a_delete() {
+    let s = stack().await;
+    let (store, root) = s.service.create_store(s.dir.path().join("work.pimble"), "Work").await.unwrap();
+    let folder = s.service.create_node(store, Some(root), "folder", "Projects").await.unwrap();
+    let note = s.service.create_node(store, Some(root), "document", "Plans").await.unwrap();
+    let created = s.service.create_agent("Reader", vec![AgentGrant { store, node: None, role: AgentRole::Reader }]).await.unwrap();
+    let agent = PimbleClient::connect_with_auth(&s.url, &AuthMethod::Bearer { token: created.key.clone() }).await.unwrap();
+    let api = Pimble::new(RpcBackend::over(agent), "agent:reader");
+    let (note, folder) = (Addr::new(store, note), Addr::new(store, folder));
+    assert_eq!(api.plan_move(&[note], folder, Place::Last).await.unwrap_err(), ApiError::ReadOnly);
+    assert_eq!(api.move_node(note, folder, Place::Last).await.unwrap_err(), ApiError::ReadOnly);
+    assert_eq!(api.can_delete(&[note]).await.unwrap_err(), ApiError::ReadOnly);
+    assert_eq!(api.create_parent(folder).await.unwrap_err(), ApiError::ReadOnly);
+    let _ = { s }.server.stop().await;
+}

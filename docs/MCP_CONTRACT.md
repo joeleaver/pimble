@@ -240,7 +240,7 @@ Write:
 | `create_node` | a child of a node, with a title and optional Markdown content |
 | `append`, `insert_after`, `replace_section`, `replace_text`, `replace_block`, `remove_section`, `replace_content` | as above |
 | `rename`, `set_tags` | the node's title and tags |
-| `move_node` | within a store, or between stores (`transplantNode`) |
+| `move_node` | within a store, or between stores (`transplantNode`); planned first with `pimble_core::plan::plan_move` through `pimble-api`, so it refuses what the explorer refuses with the same sentences (into itself, read only, a mount whose store is not open, beside a store) before sending, says the cross-store and share-leaving warnings in its answer, and takes several nodes with `nodes` (one `moveNodes`, all or none) |
 | `delete_node`, `undelete_node` | tombstone, put back |
 
 Sheets (docs/SHEETS_CONTRACT.md section 10, wave 1; built 2026-10-19 on branch `sheets`).

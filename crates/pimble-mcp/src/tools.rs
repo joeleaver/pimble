@@ -325,7 +325,12 @@ pub struct SetTagsParams {
 #[derive(Deserialize, JsonSchema)]
 pub struct MoveNodeParams {
     /// The node to move.
-    pub node: String,
+    #[serde(default)]
+    pub node: Option<String>,
+    /// Several nodes to move together, in the order they land (instead of, or
+    /// after, `node`). One that may not move refuses them all.
+    #[serde(default)]
+    pub nodes: Vec<String>,
     /// Its new parent (or a store's name, for its top level).
     pub new_parent: String,
     /// A child of the new parent to put it right after (a link or a name, as
@@ -682,33 +687,52 @@ impl Pimble {
         Ok(format!("Tagged {}: {}.", addr.link(), if tags.is_empty() { "(none)".into() } else { tags.join(", ") }))
     }
 
-    /// Move a node under a new parent, in its store or into another one. A move
-    /// out of a share or between stores gives the node a new link, which the answer
-    /// names.
+    /// Move a node (or several, with `nodes`) under a new parent, in its store or
+    /// into another one. Judged first, as Pimble's explorer judges a drop: a node
+    /// cannot go inside itself, nor where you may only read. A move out of a share
+    /// or between stores gives the node a new link, which the answer names.
     #[tool(name = "move_node")]
     async fn move_node(&self, Parameters(p): Parameters<MoveNodeParams>) -> Result<String, String> {
-        let addr = self.api.resolve(&p.node).await?;
-        // Under a mount is under its source, as everything made there is.
-        let parent = self.api.create_parent(self.api.resolve(&p.new_parent).await?).await?;
+        let mut nodes = Vec::new();
+        for name in p.node.iter().chain(&p.nodes) {
+            nodes.push(self.api.resolve(name).await?);
+        }
+        if nodes.is_empty() {
+            return Err("Name the node to move (`node`, or `nodes` for several).".into());
+        }
+        let target = self.api.resolve(&p.new_parent).await?;
         let place = match (&p.after, p.first) {
             (Some(_), true) => return Err("Give `after` or `first`, not both.".into()),
             (None, true) => Place::First,
             (None, false) => Place::Last,
-            (Some(after), false) => {
-                let after = self.api.resolve(after).await?;
-                if after.store != parent.store {
-                    return Err("`after` must be a child of `new_parent`.".into());
-                }
-                Place::After(after.node)
-            }
+            (Some(after), false) => Place::After(self.api.resolve(after).await?.node),
         };
-        let moved = self.api.move_node(addr, parent, place).await?;
-        let mut out = format!("Moved to {}", self.describe(moved.addr).await);
-        if moved.new_link {
-            out.push_str(&format!(". It has a new link; the old one ({}) now leads here.", addr.link()));
+        // Under a mount is under its source, as everything made there is.
+        let plan = self.api.plan_move(&nodes, target, place).await?;
+        if let Place::After(after) = place {
+            let parent = Addr { store: plan.parent.0, node: plan.parent.1 };
+            if !self.api.children(parent).await?.iter().any(|(a, _)| a.node == after) {
+                return Err("`after` must be a child of `new_parent`.".into());
+            }
         }
-        if moved.left_shares > 0 {
-            out.push_str(&format!(" It left {} share(s): members there see it as deleted.", moved.left_shares));
+        if plan.stays() {
+            return Ok(format!("{}: nothing moved.", pimble_api::plan::WHERE_IT_IS));
+        }
+        let moved = self.api.move_nodes(&plan).await?;
+        let mut out = format!("{}.", plan.line);
+        if let Some(warning) = &plan.warning {
+            out.push_str(&format!(" {warning}"));
+        }
+        for (i, to) in moved.iter().enumerate() {
+            // The answers come in the order the requests went.
+            let was = moved_from(&plan, i).unwrap_or(to.addr);
+            out.push_str(&format!("\nMoved to {}", self.describe(to.addr).await));
+            if to.new_link {
+                out.push_str(&format!(". It has a new link; the old one ({}) now leads here.", was.link()));
+            }
+            if to.left_shares > 0 {
+                out.push_str(&format!(" It left {} share(s): members there see it as deleted.", to.left_shares));
+            }
         }
         Ok(out)
     }
@@ -718,6 +742,7 @@ impl Pimble {
     #[tool(name = "delete_node")]
     async fn delete_node(&self, Parameters(p): Parameters<NodeParam>) -> Result<String, String> {
         let addr = self.api.resolve(&p.node).await?;
+        self.api.can_delete(&[addr]).await?;
         self.api.delete(addr).await?;
         Ok(format!("Deleted {} (undelete_node puts it back).", addr.link()))
     }
@@ -733,6 +758,21 @@ impl Pimble {
         self.api.undelete(addr).await?;
         Ok(format!("Put back {}", self.describe(addr).await))
     }
+}
+
+/// The node the `i`th answer of a plan's requests is about (each step
+/// answers its nodes in order).
+fn moved_from(plan: &pimble_api::plan::MovePlan, i: usize) -> Option<Addr> {
+    use pimble_api::plan::MoveStep;
+    let mut from = Vec::new();
+    for step in &plan.steps {
+        match step {
+            MoveStep::Move { store, node, .. } => from.push(Addr { store: *store, node: *node }),
+            MoveStep::MoveMany { store, nodes, .. } => from.extend(nodes.iter().map(|n| Addr { store: *store, node: *n })),
+            MoveStep::Transplant { from: store, node, .. } => from.push(Addr { store: *store, node: *node }),
+        }
+    }
+    from.get(i).copied()
 }
 
 /// Whether listing `top` is listing a store's single root (so no header line).

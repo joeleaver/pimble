@@ -28,10 +28,12 @@ mod menu;
 mod personal_sync;
 mod pages;
 mod route;
+mod routed;
 mod session;
 mod shortcuts;
 mod util;
 mod vault;
+mod vault_backend;
 
 use wasm_bindgen::prelude::*;
 

@@ -4813,6 +4813,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures",
+ "pimble-api",
  "pimble-board",
  "pimble-client",
  "pimble-core",

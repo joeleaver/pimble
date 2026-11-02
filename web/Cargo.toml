@@ -45,6 +45,11 @@ pimble-sheet = { path = "../crates/pimble-sheet" }
 # the browser runs exactly what the desktop runs.
 pimble-crypto = { path = "../crates/pimble-crypto" }
 pimble-discussion = { path = "../crates/pimble-discussion" }
+# The one API (docs/API_CONTRACT.md): the vault is a `Backend` of it, and a
+# `Router` picks the vault or the server per store.
+pimble-api = { path = "../crates/pimble-api" }
+async-trait = "0.1"
+futures = "0.3"
 
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "wasmbind"] }
@@ -78,6 +83,10 @@ log = "0.4"
 # `tracing` calls inside pimble-app reach the browser console through this.
 tracing = "0.1"
 tracing-wasm = "0.2"
+
+[dev-dependencies]
+# The conformance suite the vault runs, as the RPC backend does.
+pimble-api = { path = "../crates/pimble-api", features = ["conformance"] }
 
 [profile.dev]
 opt-level = 1

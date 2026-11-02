@@ -78,9 +78,10 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use pimble_app::protocol::{BackendCommand, BackendEvent};
-use pimble_client::PimbleClient;
+use pimble_api::ApiError;
+use pimble_client::{ClientError, PimbleClient};
 use pimble_core::{
-    custom_keys, node_types, DeletedNode, LeftShare, LinkResolution, Node, NodeId, PimbleUrl, NodeMetadata, Place, RelaySide, Store, StoreAccess, StoreId, StoreKind,
+    custom_keys, node_types, DeletedNode, LeftShare, LinkResolution, Node, NodeId, NodeMetadata, Place, RelaySide, Store, StoreAccess, StoreId, StoreKind,
 };
 use pimble_crdt::{derive_changes, move_order, DocShape, LinkWalk, NodeDoc, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_crypto::{Blob, KeyId, SymmetricKey};
@@ -126,12 +127,90 @@ const SHARE_KEY_FLOOR_MS: f64 = 10_000.0;
 /// row is listed, because the grant is real, and says why it will not open.
 const WAITING_SUFFIX: &str = " (waiting for the key)";
 
-/// What a write is answered with while the computer a store is served from is
-/// off (docs/RELAY_CONTRACT.md): nothing of such a store is on Pimble Cloud, a
-/// browser keeps no copy of its own for an edit to wait in, and a change made
-/// on this page would be gone with the tab.
-pub const OWNER_OFFLINE_REFUSAL: &str =
-    "This is shared from its owner's computer, which is offline. It can be changed again once that computer is back.";
+/// What the vault's writes go through: a Pimble server's vault RPCs, on the
+/// endpoint that serves the store. A trait so a test can keep a server's
+/// logs in memory and run the writes end to end (the conformance suite,
+/// `crate::vault_backend`); the page's own is [`PimbleClient`].
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+pub trait VaultWire: pimble_api::MaybeSend + pimble_api::MaybeSync {
+    /// `vaultAppend`: the blob numbered, for a new document with its parent
+    /// or the node a new discussion is on, and its wrapped data key.
+    #[allow(clippy::too_many_arguments)]
+    async fn append(
+        &self,
+        store_id: StoreId,
+        doc_id: VaultDocId,
+        blob: String,
+        client_id: Option<String>,
+        parent_id: Option<NodeId>,
+        discussion_host: Option<NodeId>,
+        keys: Option<VaultDocKeys>,
+    ) -> Result<u64, ClientError>;
+
+    async fn snapshot(&self, store_id: StoreId, doc_id: VaultDocId, upto_seq: u64, blob: String) -> Result<(), ClientError>;
+
+    async fn fetch(&self, store_id: StoreId, doc_id: VaultDocId, after_seq: u64) -> Result<VaultFetchResponse, ClientError>;
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl VaultWire for PimbleClient {
+    async fn append(
+        &self,
+        store_id: StoreId,
+        doc_id: VaultDocId,
+        blob: String,
+        client_id: Option<String>,
+        parent_id: Option<NodeId>,
+        discussion_host: Option<NodeId>,
+        keys: Option<VaultDocKeys>,
+    ) -> Result<u64, ClientError> {
+        match discussion_host {
+            Some(host) => self.vault_append_new_discussion(store_id, doc_id, blob, client_id, host, keys).await,
+            None => self.vault_append_with_keys(store_id, doc_id, blob, client_id, parent_id, keys).await,
+        }
+    }
+
+    async fn snapshot(&self, store_id: StoreId, doc_id: VaultDocId, upto_seq: u64, blob: String) -> Result<(), ClientError> {
+        self.vault_snapshot(store_id, doc_id, upto_seq, blob).await
+    }
+
+    async fn fetch(&self, store_id: StoreId, doc_id: VaultDocId, after_seq: u64) -> Result<VaultFetchResponse, ClientError> {
+        self.vault_fetch(store_id, doc_id, after_seq).await
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl<T: VaultWire + ?Sized> VaultWire for Arc<T> {
+    async fn append(
+        &self,
+        store_id: StoreId,
+        doc_id: VaultDocId,
+        blob: String,
+        client_id: Option<String>,
+        parent_id: Option<NodeId>,
+        discussion_host: Option<NodeId>,
+        keys: Option<VaultDocKeys>,
+    ) -> Result<u64, ClientError> {
+        (**self).append(store_id, doc_id, blob, client_id, parent_id, discussion_host, keys).await
+    }
+
+    async fn snapshot(&self, store_id: StoreId, doc_id: VaultDocId, upto_seq: u64, blob: String) -> Result<(), ClientError> {
+        (**self).snapshot(store_id, doc_id, upto_seq, blob).await
+    }
+
+    async fn fetch(&self, store_id: StoreId, doc_id: VaultDocId, after_seq: u64) -> Result<VaultFetchResponse, ClientError> {
+        (**self).fetch(store_id, doc_id, after_seq).await
+    }
+}
+
+/// What a command names a store this page has not opened (yet): its key may
+/// still be on its way, or its owner's computer off.
+fn not_open() -> ApiError {
+    ApiError::not_found("That encrypted store is not open in this page.")
+}
 
 /// What [`VaultClient::handle`] decided about a command.
 pub enum Handled {
@@ -139,9 +218,6 @@ pub enum Handled {
     No(BackendCommand),
     /// Answered here. The event, if there is one, is the command's reply.
     Yes(Option<BackendEvent>),
-    /// Answered here with several events, in order (a `MoveNodes`: one per
-    /// node).
-    Several(Vec<BackendEvent>),
 }
 
 /// What this page knows about one node document's log. The document itself
@@ -508,6 +584,9 @@ pub struct VaultClient {
     ended: HashSet<StoreId>,
     /// The stores subscribed to on the current socket (see `subscribe`).
     subscribed: HashSet<StoreId>,
+    /// The stores closed in this page ([`VaultClient::close`]): not opened
+    /// again, nor listed, until the page is loaded again.
+    closed: HashSet<StoreId>,
     /// Events raised somewhere with no reply of its own to carry them — a
     /// document pulled again after a refused append — drained by [`pump`].
     pending: Vec<BackendEvent>,
@@ -534,6 +613,7 @@ impl VaultClient {
             relayed: HashSet::new(),
             ended: HashSet::new(),
             subscribed: HashSet::new(),
+            closed: HashSet::new(),
             pending: Vec::new(),
             notices_tx,
             notices_rx,
@@ -1221,44 +1301,27 @@ impl VaultClient {
     // ── Commands ────────────────────────────────────────────────────────────
 
     /// Answer `cmd` if it names a vault store; otherwise hand it back.
+    ///
+    /// What `pimble_api::Backend` covers (nodes, children, the tree writes,
+    /// edits, links, the deleted list, attachments, search, pictures) never
+    /// reaches here: the backend loop sends it through the router to
+    /// `crate::vault_backend::VaultBackend` (`crate::routed`). This answers
+    /// the rest, which wave 5 moves onto the API with the app.
     pub async fn handle(
         &mut self,
         client: &Arc<PimbleClient>,
         cmd: BackendCommand,
         signal_ui: &Arc<dyn Fn() + Send + Sync>,
     ) -> Handled {
-        // A search spans every store, so it is decided before the store id is.
-        if let BackendCommand::Search { query, stores, limit, purpose } = &cmd {
-            if stores.iter().any(|id| self.owns(*id)) {
-                let event = self.search(client, query, stores, *limit, *purpose).await;
-                return Handled::Yes(Some(event));
-            }
-            return Handled::No(cmd);
-        }
-
         let Some(store_id) = store_id_of(&cmd) else { return Handled::No(cmd) };
         if !self.owns(store_id) {
             return Handled::No(cmd);
         }
 
-        // A reader's write never reaches here: the backend loop asks
-        // [`VaultClient::refuse_write`] before it hands a command anywhere, so
-        // that one gate covers an encrypted store and a plain one alike.
+        // A reader's write never reaches here: the backend loop asks the
+        // router's gate before it hands a command anywhere, so that one gate
+        // covers an encrypted store and a plain one alike.
         Handled::Yes(match cmd {
-            BackendCommand::GetChildren { store_id, node_id } => Some(self.get_children(store_id, node_id)),
-
-            BackendCommand::GetNode { store_id, node_id } => Some(self.get_node(store_id, node_id)),
-
-            BackendCommand::CreateNode { store_id, parent_id, title, init, place } => {
-                Some(self.create_node(client, store_id, parent_id, title, init, place).await)
-            }
-
-            BackendCommand::CreateAttachment { store_id, host_id, title, init } => {
-                Some(self.create_attachment(client, store_id, host_id, title, init).await)
-            }
-
-            BackendCommand::ListAttachments { store_id, node_id } => Some(self.list_attachments(store_id, node_id)),
-
             BackendCommand::ListDiscussions { store_id } => Some(self.list_discussions(store_id)),
 
             BackendCommand::RenameNode { store_id, node_id, title } => {
@@ -1269,49 +1332,7 @@ impl VaultClient {
                 Some(self.set_appearance(client, store_id, node_id, icon, color, background, tags).await)
             }
 
-            BackendCommand::DeleteNode { store_id, node_id } => {
-                Some(self.delete_node(client, store_id, node_id).await)
-            }
-
-            BackendCommand::MoveNodes { store_id, node_ids, new_parent_id, place } => {
-                return Handled::Several(self.move_nodes(client, store_id, node_ids, new_parent_id, place).await);
-            }
-
-            BackendCommand::MoveNode { store_id, node_id, new_parent_id, place } => {
-                Some(self.move_node(client, store_id, node_id, new_parent_id, place).await)
-            }
-
-            BackendCommand::UndeleteNode { store_id, node_id } => {
-                Some(self.undelete_node(client, store_id, node_id).await)
-            }
-
-            BackendCommand::ListDeleted { store_id } => Some(self.list_deleted(store_id)),
-
-            BackendCommand::ResolveLink { url, hops } => Some(self.resolve_link(url, hops)),
-
             BackendCommand::GetAncestors { store_id, node_id } => Some(self.ancestors(store_id, node_id)),
-
-            BackendCommand::BroadcastChanges { store_id, node_id, changes } => {
-                match self.broadcast(client, store_id, node_id, &changes).await {
-                    Ok(()) => None,
-                    // A refusal is the server saying no, and no later attempt
-                    // will change its mind, so the person is told. Any other
-                    // failure is recorded against the document and resent on
-                    // the next connection, which needs no announcement.
-                    Err(message) if is_refusal(&message) => Some(BackendEvent::Error { message }),
-                    Err(message) => {
-                        tracing::warn!("Appending an encrypted edit failed: {}", message);
-                        None
-                    }
-                }
-            }
-
-            BackendCommand::ApplyUpdate { store_id, node_id, update: content } => {
-                match self.append_update(client, store_id, node_id, &content).await {
-                    Ok(()) => Some(BackendEvent::NodeContentUpdated { store_id, node_id }),
-                    Err(message) => Some(BackendEvent::Error { message }),
-                }
-            }
 
             BackendCommand::ReconcileNodeContent { store_id, node_id, state_vector } => {
                 Some(self.reconcile(store_id, node_id, &state_vector))
@@ -1342,15 +1363,14 @@ impl VaultClient {
                 None
             }
 
-            // A vault store has no sync link and no server-side index. Both are
-            // answered here rather than refused, so the app's ordinary
-            // registration path does not light up the status bar with errors.
-            // What the account may change is what the store was described
-            // with (`describe`), from the same rows.
+            // Not a sync link (a vault store in the browser has none, and
+            // its capabilities say so): the store's status, which the app
+            // reads its access, its relay side and whether its owner is
+            // away from. What the account may change is what the store was
+            // described with (`describe`), from the same rows.
             BackendCommand::GetStoreSync { store_id } => Some(self.sync_event(store_id)),
-            BackendCommand::RebuildIndex { store_id } => {
-                Some(BackendEvent::IndexRebuilt { store_id, indexed: 0 })
-            }
+
+            BackendCommand::CloseStore { store_id } => Some(self.close(store_id)),
 
             other => Some(BackendEvent::Error {
                 message: format!("{} is not available on an encrypted store", name_of(&other)),
@@ -1358,79 +1378,29 @@ impl VaultClient {
         })
     }
 
-    /// What a picture command is answered with when no server is to be asked
-    /// (docs/IMAGES_CONTRACT.md): the answer to `PutBlob` or `GetBlob`, under
-    /// the event the app is waiting for, or `None` when the command should go
-    /// on to the plain store's server.
-    ///
-    /// Pictures in ciphertext are a later wave. Until then an encrypted
-    /// store, open here or only known from the account's list, takes no
-    /// picture from the browser and shows none, and nothing is written. A
-    /// reader's picture is refused like any other write of theirs.
-    pub fn answer_picture(&self, cmd: &BackendCommand) -> Option<BackendEvent> {
-        match cmd {
-            BackendCommand::PutBlob { store_id, request_id, .. } => {
-                let row_access = self.rows.get(store_id).map(AccountStore::access).unwrap_or(StoreAccess::Full);
-                let refusal = if !row_access.allows_write() {
-                    StoreAccess::READ_ONLY_REFUSAL
-                } else if self.is_encrypted(*store_id) {
-                    pimble_app::pictures::ENCRYPTED_IN_BROWSER
-                } else {
-                    return None;
-                };
-                Some(BackendEvent::BlobStored { request_id: *request_id, result: Err(refusal.to_string()) })
-            }
-            BackendCommand::GetBlob { url } if self.is_encrypted(url.store) => Some(BackendEvent::BlobLoaded {
-                url: *url,
-                result: Err(pimble_app::pictures::ENCRYPTED_IN_BROWSER.to_string()),
-            }),
-            _ => None,
-        }
+    /// What the account says this page may change of a store: the gate the
+    /// router keeps (`pimble_api::Router::set_access`). `None` for a store
+    /// the account's list does not name, which is no reason to refuse
+    /// anything.
+    pub fn row_access(&self, store_id: StoreId) -> Option<StoreAccess> {
+        self.rows.get(&store_id).map(AccountStore::access)
     }
 
-    /// The refusal a writing command earns on a store this account may only
-    /// read, or `None` when there is nothing to refuse.
-    ///
-    /// The backend loop's one gate, asked before a command is handed anywhere,
-    /// so an encrypted store and a plain one are refused the same way and for
-    /// the same reason. It answers from the account's grants, so it does not
-    /// depend on the store being one this client holds.
-    ///
-    /// A store whose owner's computer is off takes no change either, and says
-    /// that instead ([`OWNER_OFFLINE_REFUSAL`]). With one exception: what the
-    /// editor has already put on screen. The app stops sending those the
-    /// moment it hears the store is to be read, but a keystroke can be on its
-    /// way before that, and refusing it would leave the editor holding text
-    /// its document here lacks, with every later edit built on it. Those are
-    /// kept ([`VaultClient::handle_unreachable`]) and go up when the owner's
-    /// computer is back.
-    pub fn refuse_write(&self, store_id: StoreId, cmd: &BackendCommand) -> Option<BackendEvent> {
-        if !writes(cmd) {
+    /// Whether the store's owner's computer is off, as the backend loop last
+    /// said ([`VaultClient::endpoint_down`]), and the row it is listed as
+    /// meanwhile (`pimble_api::Router::set_away`).
+    pub fn away_row(&self, store_id: StoreId) -> Option<Store> {
+        if !self.owner_offline.contains(&store_id) {
             return None;
         }
-        let row_access = self.rows.get(&store_id).map(AccountStore::access).unwrap_or(StoreAccess::Full);
-        match row_access {
-            StoreAccess::Read => return Some(BackendEvent::Error { message: StoreAccess::READ_ONLY_REFUSAL.to_string() }),
-            // A commenter writes discussions only: a new one on a node, and
-            // the edits of one. In a plain store the server judges which
-            // document an edit is of.
-            StoreAccess::Comment => {
-                let on_discussion = |node_id: NodeId| self.stores.get(&store_id).is_none_or(|store| store.is_discussion(node_id));
-                let allowed = match cmd {
-                    BackendCommand::CreateAttachment { init, .. } => init.node_type == node_types::DISCUSSION,
-                    BackendCommand::BroadcastChanges { node_id, .. } | BackendCommand::ApplyUpdate { node_id, .. } => on_discussion(*node_id),
-                    _ => false,
-                };
-                if !allowed {
-                    return Some(BackendEvent::Error { message: StoreAccess::COMMENT_ONLY_REFUSAL.to_string() });
-                }
+        Some(match self.stores.get(&store_id) {
+            Some(store) => {
+                let mut row = store.view();
+                self.describe(&mut row);
+                row
             }
-            _ => {}
-        }
-        if self.owner_offline.contains(&store_id) && !(self.owns(store_id) && is_content_edit(cmd)) {
-            return Some(notice(OWNER_OFFLINE_REFUSAL.to_string()));
-        }
-        None
+            None => self.offline_row(store_id),
+        })
     }
 
     // ── A store whose owner's computer is off ───────────────────────────────
@@ -1535,46 +1505,20 @@ impl VaultClient {
     /// computer is, with no connection to answer through; any other command
     /// comes back untouched.
     ///
-    /// A store this page holds is read from what it holds. One it never
-    /// opened (or whose key has not arrived) opens empty: its row, an empty
-    /// folder under it, nothing else, and no error, because nothing has gone
-    /// wrong. Subscriptions wait for the endpoint (the backend loop makes
-    /// them again when it connects). An edit the editor had already made is
-    /// merged and kept as unsent, which the next connection delivers; every
-    /// other write was refused before it got here
-    /// ([`VaultClient::refuse_write`]).
+    /// What the router covers (reads, writes, edits; `crate::routed`) is
+    /// answered there, from what this page holds and with the router's
+    /// refusals. What is left here is answered the same way: from what this
+    /// page holds, with no error, because nothing has gone wrong.
+    /// Subscriptions wait for the endpoint (the backend loop makes them
+    /// again when it connects).
     pub fn handle_unreachable(&mut self, cmd: BackendCommand) -> Handled {
         let Some(store_id) = store_id_of(&cmd).filter(|id| self.owner_offline.contains(id)) else {
             return Handled::No(cmd);
         };
         let held = self.owns(store_id);
         Handled::Yes(match cmd {
-            BackendCommand::GetChildren { store_id, node_id } if held => Some(self.get_children(store_id, node_id)),
-            BackendCommand::GetChildren { store_id, node_id } => {
-                Some(BackendEvent::ChildrenLoaded { store_id, parent_id: node_id, children_store_id: store_id, children: Vec::new() })
-            }
-            BackendCommand::GetNode { store_id, node_id } if held => Some(self.get_node(store_id, node_id)),
-            BackendCommand::GetNode { store_id, node_id } => {
-                let title = self.offline_row(store_id).name;
-                Some(BackendEvent::NodeLoaded { store_id, node: empty_folder(node_id, &title) })
-            }
             BackendCommand::ReconcileNodeContent { store_id, node_id, state_vector } if held => {
                 Some(self.reconcile(store_id, node_id, &state_vector))
-            }
-            BackendCommand::BroadcastChanges { store_id, node_id, changes } if held => {
-                match STANDARD.decode(&changes).map_err(|e| e.to_string()).and_then(|update| self.keep_unsent(store_id, node_id, &update)) {
-                    Ok(()) => None,
-                    Err(message) => {
-                        tracing::warn!("Keeping an edit of {} for later failed: {}", node_id, message);
-                        None
-                    }
-                }
-            }
-            BackendCommand::ApplyUpdate { store_id, node_id, update: content } if held => {
-                match self.keep_unsent(store_id, node_id, &content) {
-                    Ok(()) => Some(BackendEvent::NodeContentUpdated { store_id, node_id }),
-                    Err(message) => Some(BackendEvent::Error { message }),
-                }
             }
             BackendCommand::SubscribeNodeChanges { store_id, node_id } => {
                 self.active.insert((store_id, node_id));
@@ -1588,13 +1532,9 @@ impl VaultClient {
             // Nobody is there to hear it, and nobody to say so.
             BackendCommand::PublishPresence { .. } | BackendCommand::SubscribePresence { .. } => None,
             BackendCommand::GetStoreSync { store_id } => Some(self.sync_event(store_id)),
-            BackendCommand::RebuildIndex { store_id } => Some(BackendEvent::IndexRebuilt { store_id, indexed: 0 }),
-            BackendCommand::ListDeleted { store_id } if held => Some(self.list_deleted(store_id)),
-            BackendCommand::ListDeleted { store_id } => Some(BackendEvent::DeletedListed { store_id, nodes: Vec::new() }),
-            // Reading, and answered from what this page holds, owner or not.
-            BackendCommand::ResolveLink { url, hops } => Some(self.resolve_link(url, hops)),
             BackendCommand::GetAncestors { store_id, node_id } => Some(self.ancestors(store_id, node_id)),
-            _ => Some(notice(OWNER_OFFLINE_REFUSAL.to_string())),
+            BackendCommand::CloseStore { store_id } => Some(self.close(store_id)),
+            _ => Some(notice(pimble_api::router::OWNER_OFFLINE_REFUSAL.to_string())),
         })
     }
 
@@ -1611,36 +1551,81 @@ impl VaultClient {
     }
 
     // ── Reads ───────────────────────────────────────────────────────────────
+    //
+    // What `crate::vault_backend::VaultBackend` answers `pimble_api::Backend`
+    // with, from the documents held: the same nodes, in the same shape, as a
+    // server's `getNode` and `getChildren`, each judged with what this
+    // account may change of it. Whether the store's owner is away is the
+    // router's to say (`pimble_api::Router::set_away`).
 
-    /// Answered from the documents held: every child arrives with its
-    /// document's bytes, because the app derives a document's tree label from
-    /// its first line and opens it from the bytes it is handed here, with no
-    /// second fetch in between.
-    fn get_children(&self, store_id: StoreId, node_id: NodeId) -> BackendEvent {
-        let Some(store) = self.stores.get(&store_id) else {
-            return BackendEvent::Error { message: "no such encrypted store".into() };
-        };
-        let row = self.rows.get(&store_id);
-        let children = match store.children_of(node_id) {
-            Ok(ids) => ids.iter().filter_map(|id| store.node_for(*id, row).ok()).map(|node| self.judged(store_id, node)).collect(),
-            Err(message) => return BackendEvent::Error { message },
-        };
-        BackendEvent::ChildrenLoaded { store_id, parent_id: node_id, children_store_id: store_id, children }
+    /// The store's root, which a node made with no parent goes under.
+    pub fn root_of(&self, store_id: StoreId) -> Option<NodeId> {
+        self.stores.get(&store_id).map(|store| store.tree.root())
     }
 
-    fn get_node(&self, store_id: StoreId, node_id: NodeId) -> BackendEvent {
-        let Some(store) = self.stores.get(&store_id) else {
-            return BackendEvent::Error { message: "no such encrypted store".into() };
+    /// Every child arrives with its document's bytes, because the app
+    /// derives a document's tree label from its first line and opens it
+    /// from the bytes it is handed, with no second fetch in between.
+    pub fn children(&self, store_id: StoreId, node_id: NodeId) -> Result<Vec<Node>, ApiError> {
+        let store = self.stores.get(&store_id).ok_or_else(not_open)?;
+        let row = self.rows.get(&store_id);
+        let ids = store.children_of(node_id).map_err(|_| ApiError::node_not_found(node_id))?;
+        Ok(ids.iter().filter_map(|id| store.node_for(*id, row).ok()).collect())
+    }
+
+    pub fn node(&self, store_id: StoreId, node_id: NodeId) -> Result<Node, ApiError> {
+        let store = self.stores.get(&store_id).ok_or_else(not_open)?;
+        store.node_for(node_id, self.rows.get(&store_id)).map_err(|_| ApiError::node_not_found(node_id))
+    }
+
+    /// The live nodes of `node_ids` this page holds; the rest left out, as
+    /// a server's `getNodes` leaves out what is not there.
+    pub fn nodes(&self, store_id: StoreId, node_ids: &[NodeId]) -> Result<Vec<Node>, ApiError> {
+        let store = self.stores.get(&store_id).ok_or_else(not_open)?;
+        let row = self.rows.get(&store_id);
+        Ok(node_ids.iter().filter_map(|id| store.node_for(*id, row).ok()).collect())
+    }
+
+    /// The stateless reconcile (`syncNodes`), answered from the documents
+    /// held: for each document named, what the asker lacks and this page's
+    /// state vector; with `list_unknown`, every document held that was not
+    /// named.
+    pub fn sync_docs(&self, store_id: StoreId, have: &[(NodeId, Vec<u8>)], list_unknown: bool) -> Result<(Vec<pimble_api::backend::SyncedDoc>, Vec<NodeId>), ApiError> {
+        let store = self.stores.get(&store_id).ok_or_else(not_open)?;
+        let mut docs = Vec::new();
+        for (node_id, state_vector) in have {
+            let Some(doc) = store.tree.doc(*node_id) else { continue };
+            docs.push(pimble_api::backend::SyncedDoc { node: *node_id, diff: doc.diff_since(state_vector)?, state_vector: doc.state_vector() });
+        }
+        let unknown = if list_unknown {
+            store.tree.ids().into_iter().filter(|id| !have.iter().any(|(named, _)| named == id)).collect()
+        } else {
+            Vec::new()
         };
-        match store.node_for(node_id, self.rows.get(&store_id)) {
-            Ok(node) => BackendEvent::NodeLoaded { store_id, node: self.judged(store_id, node) },
-            Err(message) => BackendEvent::Error { message },
+        Ok((docs, unknown))
+    }
+
+    /// The same stateless reconcile for one document, as the editor asks
+    /// it of a pane's node when the pane joins.
+    fn reconcile(&self, store_id: StoreId, node_id: NodeId, state_vector: &[u8]) -> BackendEvent {
+        let Some(doc) = self.stores.get(&store_id).and_then(|s| s.tree.doc(node_id)) else {
+            return BackendEvent::Error { message: "that node's document is not held here".into() };
+        };
+        match doc.diff_since(state_vector) {
+            Ok(diff) => BackendEvent::NodeContentReconciled {
+                store_id,
+                node_id,
+                diff,
+                server_state_vector: doc.state_vector(),
+            },
+            Err(e) => BackendEvent::Error { message: e.to_string() },
         }
     }
 
     /// A node as the UI is handed it while its store's owner's computer is
     /// off: to be read, whatever the account's grants say, because nothing
-    /// written to it here would reach anyone ([`OWNER_OFFLINE_REFUSAL`]).
+    /// written to it here would reach anyone (`pimble_api::router`). For the
+    /// commands not routed through the router yet.
     fn judged(&self, store_id: StoreId, mut node: Node) -> Node {
         if self.owner_offline.contains(&store_id) {
             node.access = StoreAccess::Read;
@@ -1648,96 +1633,10 @@ impl VaultClient {
         node
     }
 
-    // ── Tree writes ─────────────────────────────────────────────────────────
-
-    async fn create_node(
-        &mut self,
-        client: &Arc<PimbleClient>,
-        store_id: StoreId,
-        parent_id: Option<NodeId>,
-        title: String,
-        init: Option<pimble_app::protocol::NodeInit>,
-        place: Place,
-    ) -> BackendEvent {
-        let node_id = NodeId::new();
-        let request = init.as_ref().and_then(|init| init.request);
-        let now = now_rfc3339();
-        let (parent, edit) = {
-            let Some(store) = self.stores.get_mut(&store_id) else {
-                return BackendEvent::Error { message: "no such encrypted store".into() };
-            };
-            let parent = parent_id.unwrap_or(store.tree.root());
-            let mut edit = store.seed_root(&now);
-            let node_type = init.as_ref().map_or(node_types::DOCUMENT, |init| init.node_type.as_str());
-            match store.tree.add_node(node_id, Some(parent), place, node_type, &title, &now) {
-                Ok(more) => edit.touched.extend(more.touched),
-                Err(e) => return BackendEvent::Error { message: e.to_string() },
-            }
-            // What the node starts with goes in with the create, as the
-            // server's `createNode` does it (a board node's board).
-            if let Some(init) = &init {
-                if !init.content.is_empty() {
-                    match store.tree.apply_update(node_id, &init.content) {
-                        Ok(_) => edit.touched.push((node_id, init.content.clone())),
-                        Err(e) => return BackendEvent::Error { message: e.to_string() },
-                    }
-                }
-                for (key, value) in &init.custom {
-                    match store.tree.set_custom(node_id, key, value, &now) {
-                        Ok(more) => edit.touched.extend(more.touched),
-                        Err(e) => return BackendEvent::Error { message: e.to_string() },
-                    }
-                }
-            }
-            (parent, edit)
-        };
-        match self.append_edit(client, store_id, &edit).await {
-            Ok(()) => BackendEvent::NodeCreated { store_id, parent_id: Some(parent), node_id, request },
-            Err(message) => BackendEvent::Error { message },
-        }
-    }
-
-    /// An attachment of `host_id` (a discussion on it,
-    /// docs/DISCUSSIONS_CONTRACT.md section 1), as the server's
-    /// `createAttachment` makes one: only the new document is written.
-    async fn create_attachment(
-        &mut self,
-        client: &Arc<PimbleClient>,
-        store_id: StoreId,
-        host_id: NodeId,
-        title: String,
-        init: pimble_app::protocol::NodeInit,
-    ) -> BackendEvent {
-        let node_id = NodeId::new();
-        let request = init.request;
-        let now = now_rfc3339();
-        let edit = {
-            let Some(store) = self.stores.get_mut(&store_id) else {
-                return BackendEvent::Error { message: "no such encrypted store".into() };
-            };
-            let mut edit = store.seed_root(&now);
-            let content = (!init.content.is_empty()).then_some(init.content.as_slice());
-            match store.tree.add_attachment(node_id, host_id, &init.node_type, &title, content, &now) {
-                Ok(more) => edit.touched.extend(more.touched),
-                Err(e) => return BackendEvent::Error { message: e.to_string() },
-            }
-            for (key, value) in &init.custom {
-                match store.tree.set_custom(node_id, key, value, &now) {
-                    Ok(more) => edit.touched.extend(more.touched),
-                    Err(e) => return BackendEvent::Error { message: e.to_string() },
-                }
-            }
-            edit
-        };
-        match self.append_edit(client, store_id, &edit).await {
-            Ok(()) => BackendEvent::AttachmentCreated { store_id, host_id, node_id, request },
-            Err(message) => BackendEvent::Error { message },
-        }
-    }
-
+    /// The discussions of the store whose host is held (or that have none).
     fn list_discussions(&self, store_id: StoreId) -> BackendEvent {
         let Some(store) = self.stores.get(&store_id) else {
-            return BackendEvent::Error { message: "no such encrypted store".into() };
+            return BackendEvent::Error { message: not_open().sentence() };
         };
         let row = self.rows.get(&store_id);
         let nodes = store
@@ -1755,224 +1654,21 @@ impl VaultClient {
         BackendEvent::DiscussionsListed { store_id, nodes }
     }
 
-    fn list_attachments(&self, store_id: StoreId, node_id: NodeId) -> BackendEvent {
-        let Some(store) = self.stores.get(&store_id) else {
-            return BackendEvent::Error { message: "no such encrypted store".into() };
-        };
+    pub fn list_attachments(&self, store_id: StoreId, node_id: NodeId) -> Result<Vec<Node>, ApiError> {
+        let store = self.stores.get(&store_id).ok_or_else(not_open)?;
         let row = self.rows.get(&store_id);
-        let nodes = store
-            .tree
-            .attachments_of(node_id)
-            .into_iter()
-            .filter_map(|id| store.node_for(id, row).ok())
-            .map(|node| self.judged(store_id, node))
-            .collect();
-        BackendEvent::AttachmentsListed { store_id, node_id, nodes }
+        Ok(store.tree.attachments_of(node_id).into_iter().filter_map(|id| store.node_for(id, row).ok()).collect())
     }
 
-    async fn rename_node(
-        &mut self,
-        client: &Arc<PimbleClient>,
-        store_id: StoreId,
-        node_id: NodeId,
-        title: String,
-    ) -> BackendEvent {
-        let now = now_rfc3339();
-        let edit = {
-            let Some(store) = self.stores.get_mut(&store_id) else {
-                return BackendEvent::Error { message: "no such encrypted store".into() };
-            };
-            let mut edit = store.seed_root(&now);
-            match rename_edit(&mut store.tree, node_id, &title, &now) {
-                Ok(more) => edit.touched.extend(more.touched),
-                Err(e) => return BackendEvent::Error { message: e.to_string() },
-            }
-            edit
-        };
-        match self.append_edit(client, store_id, &edit).await {
-            Ok(()) => BackendEvent::NodeRenamed { store_id, node_id },
-            Err(message) => BackendEvent::Error { message },
-        }
+    /// "Recently Deleted..." (docs/MOVE_CONTRACT.md "Seeing and undoing what
+    /// was removed"), answered from the tree this page holds: a scoped
+    /// member's page holds only its scope's documents to begin with, so
+    /// nothing further is judged here.
+    pub fn list_deleted(&self, store_id: StoreId) -> Result<Vec<DeletedNode>, ApiError> {
+        let store = self.stores.get(&store_id).ok_or_else(not_open)?;
+        Ok(store.list_deleted(self.rows.get(&store_id)))
     }
 
-    async fn set_appearance(
-        &mut self,
-        client: &Arc<PimbleClient>,
-        store_id: StoreId,
-        node_id: NodeId,
-        icon: Option<Option<String>>,
-        color: Option<Option<String>>,
-        background: Option<Option<String>>,
-        tags: Option<Vec<String>>,
-    ) -> BackendEvent {
-        let now = now_rfc3339();
-        let edit = {
-            let Some(store) = self.stores.get_mut(&store_id) else {
-                return BackendEvent::Error { message: "no such encrypted store".into() };
-            };
-            let mut edit = store.seed_root(&now);
-            match appearance_edit(&mut store.tree, node_id, icon, color, background, tags, &now) {
-                Ok(more) => edit.touched.extend(more.touched),
-                Err(e) => return BackendEvent::Error { message: e.to_string() },
-            }
-            edit
-        };
-        match self.append_edit(client, store_id, &edit).await {
-            Ok(()) => BackendEvent::NodeRenamed { store_id, node_id },
-            Err(message) => BackendEvent::Error { message },
-        }
-    }
-
-    /// The whole subtree becomes tombstones, as it does server-side; the
-    /// documents stay, so an undelete elsewhere finds them.
-    async fn delete_node(&mut self, client: &Arc<PimbleClient>, store_id: StoreId, node_id: NodeId) -> BackendEvent {
-        let now = now_rfc3339();
-        let (parent_id, edit) = {
-            let Some(store) = self.stores.get_mut(&store_id) else {
-                return BackendEvent::Error { message: "no such encrypted store".into() };
-            };
-            let parent_id = match store.tree.get_node_info(node_id) {
-                Ok(info) => info.parent_id,
-                Err(e) => return BackendEvent::Error { message: e.to_string() },
-            };
-            let Some(parent_id) = parent_id else {
-                return BackendEvent::Error { message: "the root node cannot be deleted".into() };
-            };
-            match store.tree.remove_node(node_id, &now) {
-                Ok(edit) => (parent_id, edit),
-                Err(e) => return BackendEvent::Error { message: e.to_string() },
-            }
-        };
-        match self.append_edit(client, store_id, &edit).await {
-            Ok(()) => BackendEvent::NodeDeleted { store_id, node_id, parent_id },
-            Err(message) => BackendEvent::Error { message },
-        }
-    }
-
-    /// `Tree::move_or_transplant` decides, as every caller of a move does
-    /// (docs/MOVE_CONTRACT.md): a plain move inside a share or outside all of
-    /// them, or a transplant when it would take the node out of one, with a
-    /// fresh document (its key riding its first append, exactly as
-    /// [`VaultClient::create_node`] makes one) for every node of the subtree
-    /// and the original tombstoned. `Tree::transplant` orders the touched
-    /// documents new-first, tombstones-last, and one `append_edit` call sends
-    /// them in that order; a document an append fails on is marked unsent and
-    /// resent by the existing mechanism, whichever half of the move it was.
-    /// Several nodes under one parent, in order, all or none: what `moveNodes`
-    /// is for a plain store (docs/TREE_CONTRACT.md). Every node is judged
-    /// first; then each goes to the same place, the last first (in order when
-    /// the place is the end), so they keep their order without waiting on the
-    /// ids transplants give them.
-    async fn move_nodes(
-        &mut self,
-        client: &Arc<PimbleClient>,
-        store_id: StoreId,
-        node_ids: Vec<NodeId>,
-        new_parent_id: NodeId,
-        place: Place,
-    ) -> Vec<BackendEvent> {
-        // Each node once (a repeat was moved twice until 2026-11-02, the
-        // server's `moveNodes` never did), in the order `move_order` gives.
-        let (_, order) = move_order(&node_ids, place);
-        {
-            let Some(store) = self.stores.get(&store_id) else {
-                return vec![BackendEvent::Error { message: "no such encrypted store".into() }];
-            };
-            for &id in &order {
-                if let Err(refused) = store.tree.check_move(id, new_parent_id) {
-                    return vec![BackendEvent::Error { message: refused.to_string() }];
-                }
-            }
-        }
-        let mut events = Vec::with_capacity(order.len());
-        for id in order {
-            events.push(self.move_node(client, store_id, id, new_parent_id, place).await);
-        }
-        events
-    }
-
-    async fn move_node(
-        &mut self,
-        client: &Arc<PimbleClient>,
-        store_id: StoreId,
-        node_id: NodeId,
-        new_parent_id: NodeId,
-        place: Place,
-    ) -> BackendEvent {
-        let now = now_rfc3339();
-        let (old_parent_id, title, left_shares, new_node_id, edit) = {
-            let Some(store) = self.stores.get_mut(&store_id) else {
-                return BackendEvent::Error { message: "no such encrypted store".into() };
-            };
-            // The checks the server's `moveNode` makes, in its sentences.
-            if let Err(refused) = store.tree.check_move(node_id, new_parent_id) {
-                return BackendEvent::Error { message: refused.to_string() };
-            }
-            let info = match store.tree.get_node_info(node_id) {
-                Ok(info) => info,
-                Err(e) => return BackendEvent::Error { message: e.to_string() },
-            };
-            let old_parent_id = info.parent_id.unwrap_or(new_parent_id);
-            // What the move would leave, read before it happens: a
-            // transplant's original is a tombstone afterwards and answers
-            // nothing about the shares it used to be in.
-            let left_shares = as_left_shares(&store.tree, store.tree.shares_left(node_id, new_parent_id));
-            let mut edit = store.seed_root(&now);
-            let (new_node_id, more) = match store.tree.move_or_transplant(store_id, node_id, new_parent_id, place, &now, &mut NodeId::new) {
-                Ok(v) => v,
-                Err(e) => return BackendEvent::Error { message: e.to_string() },
-            };
-            edit.touched.extend(more.touched);
-            (old_parent_id, info.title, left_shares, new_node_id, edit)
-        };
-        match self.append_edit(client, store_id, &edit).await {
-            Ok(()) if new_node_id == node_id => {
-                BackendEvent::NodeMoved { store_id, node_id, old_parent_id, new_parent_id }
-            }
-            Ok(()) => BackendEvent::NodeTransplanted {
-                from_store_id: store_id,
-                old_node_id: node_id,
-                old_parent_id,
-                to_store_id: store_id,
-                node_id: new_node_id,
-                new_parent_id,
-                title,
-                left_shares,
-            },
-            Err(message) => BackendEvent::Error { message },
-        }
-    }
-
-    /// "Put Back": clear the tombstone `undelete_node` finds and everything
-    /// the same deletion took with it, and answer where it landed, exactly as
-    /// the desktop reads the same answer off `undeleteNode` plus a `getNode`
-    /// (`crates/pimble-app/src/commands.rs`).
-    async fn undelete_node(&mut self, client: &Arc<PimbleClient>, store_id: StoreId, node_id: NodeId) -> BackendEvent {
-        let now = now_rfc3339();
-        let edit = {
-            let Some(store) = self.stores.get_mut(&store_id) else {
-                return BackendEvent::Error { message: "no such encrypted store".into() };
-            };
-            match store.tree.undelete_node(node_id, &now) {
-                Ok(edit) => edit,
-                Err(e) => return BackendEvent::Error { message: e.to_string() },
-            }
-        };
-        if let Err(message) = self.append_edit(client, store_id, &edit).await {
-            return BackendEvent::Error { message };
-        }
-        let Some(store) = self.stores.get(&store_id) else {
-            return BackendEvent::Error { message: "no such encrypted store".into() };
-        };
-        match store.tree.get_node_info(node_id) {
-            Ok(info) => BackendEvent::NodeCreated { store_id, parent_id: info.parent_id, node_id, request: None },
-            Err(e) => BackendEvent::Error { message: e.to_string() },
-        }
-    }
-
-    /// What "Recently Deleted..." shows, answered from the tree this page
-    /// holds — a scoped member's page holds only its scope's documents to
-    /// begin with, so nothing further is judged here.
     /// `GetAncestors` for an encrypted store: `parent_id` by `parent_id` in
     /// the documents this page holds, the root first.
     fn ancestors(&self, store_id: StoreId, node_id: NodeId) -> BackendEvent {
@@ -1993,25 +1689,218 @@ impl VaultClient {
         BackendEvent::AncestorsLoaded { store_id, node_id, ancestors }
     }
 
-    /// `ResolveLink` for an encrypted store (docs/LINKS_CONTRACT.md
-    /// "Following a link"): the server's `resolveLink`, answered from the
-    /// documents this page holds, hop by hop through the tombstones'
-    /// `became`. A hop into a store this page does not hold answers
-    /// `StoreNotHere` there, and the app asks whoever holds that one.
-    fn resolve_link(&self, url: PimbleUrl, hops: usize) -> BackendEvent {
-        let resolution = resolve_in(&self.stores, url.store, url.node);
-        BackendEvent::LinkResolved { url, hops, resolution }
+    /// `resolveLink` for an encrypted store (docs/LINKS_CONTRACT.md
+    /// "Following a link"): the server's, answered from the documents this
+    /// page holds, hop by hop through the tombstones' `became`. A hop into a
+    /// store this page does not hold answers `StoreNotHere` there, and the
+    /// app asks whoever holds that one.
+    pub fn resolve_link(&self, store_id: StoreId, node_id: NodeId) -> LinkResolution {
+        resolve_in(&self.stores, store_id, node_id)
     }
 
-    fn list_deleted(&self, store_id: StoreId) -> BackendEvent {
-        let Some(store) = self.stores.get(&store_id) else {
-            return BackendEvent::Error { message: "no such encrypted store".into() };
+    // ── Tree writes ─────────────────────────────────────────────────────────
+
+    /// `createNode`, as the server makes one: the node and what it starts
+    /// with (a board node's board, its icon) in the one edit that makes it.
+    pub async fn create_node<W: VaultWire + ?Sized>(
+        &mut self,
+        client: &W,
+        store_id: StoreId,
+        parent: NodeId,
+        init: pimble_api::NodeInit,
+        place: Place,
+    ) -> Result<NodeId, ApiError> {
+        let node_id = NodeId::new();
+        let now = now_rfc3339();
+        let edit = {
+            let store = self.stores.get_mut(&store_id).ok_or_else(not_open)?;
+            let mut edit = store.seed_root(&now);
+            edit.touched.extend(store.tree.add_node(node_id, Some(parent), place, &init.node_type, &init.title, &now)?.touched);
+            if let Some(content) = init.content.as_ref().filter(|content| !content.is_empty()) {
+                store.tree.apply_update(node_id, content)?;
+                edit.touched.push((node_id, content.clone()));
+            }
+            for (key, value) in &init.custom {
+                edit.touched.extend(store.tree.set_custom(node_id, key, value, &now)?.touched);
+            }
+            edit
         };
-        let nodes = store.list_deleted(self.rows.get(&store_id));
-        BackendEvent::DeletedListed { store_id, nodes }
+        self.append_edit(client, store_id, &edit).await?;
+        Ok(node_id)
     }
 
-    /// `TransplantNode` between two vault stores this page holds
+    /// An attachment of `host_id` (a discussion on it,
+    /// docs/DISCUSSIONS_CONTRACT.md section 1), as the server's
+    /// `createAttachment` makes one: only the new document is written.
+    pub async fn create_attachment<W: VaultWire + ?Sized>(
+        &mut self,
+        client: &W,
+        store_id: StoreId,
+        host_id: NodeId,
+        init: pimble_api::NodeInit,
+    ) -> Result<NodeId, ApiError> {
+        let node_id = NodeId::new();
+        let now = now_rfc3339();
+        let edit = {
+            let store = self.stores.get_mut(&store_id).ok_or_else(not_open)?;
+            let mut edit = store.seed_root(&now);
+            let content = init.content.as_deref().filter(|content| !content.is_empty());
+            edit.touched.extend(store.tree.add_attachment(node_id, host_id, &init.node_type, &init.title, content, &now)?.touched);
+            for (key, value) in &init.custom {
+                edit.touched.extend(store.tree.set_custom(node_id, key, value, &now)?.touched);
+            }
+            edit
+        };
+        self.append_edit(client, store_id, &edit).await?;
+        Ok(node_id)
+    }
+
+    async fn rename_node(
+        &mut self,
+        client: &Arc<PimbleClient>,
+        store_id: StoreId,
+        node_id: NodeId,
+        title: String,
+    ) -> BackendEvent {
+        let now = now_rfc3339();
+        let edit = {
+            let Some(store) = self.stores.get_mut(&store_id) else {
+                return BackendEvent::Error { message: not_open().sentence() };
+            };
+            let mut edit = store.seed_root(&now);
+            match rename_edit(&mut store.tree, node_id, &title, &now) {
+                Ok(more) => edit.touched.extend(more.touched),
+                Err(e) => return BackendEvent::Error { message: e.to_string() },
+            }
+            edit
+        };
+        match self.append_edit(client, store_id, &edit).await {
+            Ok(()) => BackendEvent::NodeRenamed { store_id, node_id },
+            Err(e) => BackendEvent::Error { message: e.sentence() },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn set_appearance(
+        &mut self,
+        client: &Arc<PimbleClient>,
+        store_id: StoreId,
+        node_id: NodeId,
+        icon: Option<Option<String>>,
+        color: Option<Option<String>>,
+        background: Option<Option<String>>,
+        tags: Option<Vec<String>>,
+    ) -> BackendEvent {
+        let now = now_rfc3339();
+        let edit = {
+            let Some(store) = self.stores.get_mut(&store_id) else {
+                return BackendEvent::Error { message: not_open().sentence() };
+            };
+            let mut edit = store.seed_root(&now);
+            match appearance_edit(&mut store.tree, node_id, icon, color, background, tags, &now) {
+                Ok(more) => edit.touched.extend(more.touched),
+                Err(e) => return BackendEvent::Error { message: e.to_string() },
+            }
+            edit
+        };
+        match self.append_edit(client, store_id, &edit).await {
+            Ok(()) => BackendEvent::NodeRenamed { store_id, node_id },
+            Err(e) => BackendEvent::Error { message: e.sentence() },
+        }
+    }
+
+    /// The whole subtree becomes tombstones, as it does server-side; the
+    /// documents stay, so an undelete elsewhere finds them. The root is
+    /// refused in the server's words.
+    pub async fn delete_node<W: VaultWire + ?Sized>(&mut self, client: &W, store_id: StoreId, node_id: NodeId) -> Result<(), ApiError> {
+        let now = now_rfc3339();
+        let edit = {
+            let store = self.stores.get_mut(&store_id).ok_or_else(not_open)?;
+            let info = store.tree.get_node_info(node_id).map_err(|_| ApiError::node_not_found(node_id))?;
+            if info.parent_id.is_none() {
+                return Err(ApiError::invalid_operation("Cannot delete the root node"));
+            }
+            store.tree.remove_node(node_id, &now)?
+        };
+        self.append_edit(client, store_id, &edit).await
+    }
+
+    /// Several nodes under one parent, in order, all or none: what
+    /// `moveNodes` is for a plain store (docs/TREE_CONTRACT.md). Each node
+    /// once (a repeat was moved twice until 2026-11-02, the server's
+    /// `moveNodes` never did), every one judged first in the order named;
+    /// then each goes to the same place in the order `move_order` gives, so
+    /// they keep their order without waiting on the ids transplants give
+    /// them. Answered in the order named, as the server answers.
+    pub async fn move_nodes<W: VaultWire + ?Sized>(
+        &mut self,
+        client: &W,
+        store_id: StoreId,
+        node_ids: &[NodeId],
+        new_parent_id: NodeId,
+        place: Place,
+    ) -> Result<Vec<pimble_api::Moved>, ApiError> {
+        let (once, order) = move_order(node_ids, place);
+        {
+            let store = self.stores.get(&store_id).ok_or_else(not_open)?;
+            for &id in &once {
+                store.tree.check_move(id, new_parent_id).map_err(ApiError::of_move)?;
+            }
+        }
+        let mut answers = HashMap::new();
+        for id in order {
+            answers.insert(id, self.move_node(client, store_id, id, new_parent_id, place).await?);
+        }
+        Ok(once.iter().filter_map(|id| answers.remove(id)).collect())
+    }
+
+    /// `Tree::move_or_transplant` decides, as every caller of a move does
+    /// (docs/MOVE_CONTRACT.md): a plain move inside a share or outside all of
+    /// them, or a transplant when it would take the node out of one, with a
+    /// fresh document (its key riding its first append, exactly as
+    /// [`VaultClient::create_node`] makes one) for every node of the subtree
+    /// and the original tombstoned. `Tree::transplant` orders the touched
+    /// documents new-first, tombstones-last, and one `append_edit` call sends
+    /// them in that order; a document an append fails on is marked unsent and
+    /// resent by the existing mechanism, whichever half of the move it was.
+    pub async fn move_node<W: VaultWire + ?Sized>(
+        &mut self,
+        client: &W,
+        store_id: StoreId,
+        node_id: NodeId,
+        new_parent_id: NodeId,
+        place: Place,
+    ) -> Result<pimble_api::Moved, ApiError> {
+        let now = now_rfc3339();
+        let (left_shares, new_node_id, edit) = {
+            let store = self.stores.get_mut(&store_id).ok_or_else(not_open)?;
+            // The checks the server's `moveNode` makes, in its words.
+            store.tree.check_move(node_id, new_parent_id).map_err(ApiError::of_move)?;
+            // What the move would leave, read before it happens: a
+            // transplant's original is a tombstone afterwards and answers
+            // nothing about the shares it used to be in.
+            let left_shares = as_left_shares(&store.tree, store.tree.shares_left(node_id, new_parent_id));
+            let mut edit = store.seed_root(&now);
+            let (new_node_id, more) = store.tree.move_or_transplant(store_id, node_id, new_parent_id, place, &now, &mut NodeId::new)?;
+            edit.touched.extend(more.touched);
+            (left_shares, new_node_id, edit)
+        };
+        self.append_edit(client, store_id, &edit).await?;
+        Ok(pimble_api::Moved { node: new_node_id, left_shares })
+    }
+
+    /// "Put Back": clear the tombstone and everything the same deletion took
+    /// with it, back under the parent it was deleted from.
+    pub async fn undelete_node<W: VaultWire + ?Sized>(&mut self, client: &W, store_id: StoreId, node_id: NodeId) -> Result<(), ApiError> {
+        let now = now_rfc3339();
+        let edit = {
+            let store = self.stores.get_mut(&store_id).ok_or_else(not_open)?;
+            store.tree.undelete_node(node_id, &now)?
+        };
+        self.append_edit(client, store_id, &edit).await
+    }
+
+    /// A transplant between two vault stores this page holds
     /// (docs/MOVE_CONTRACT.md "Between stores"): the subtree read out of the
     /// source as data ([`pimble_crdt::Tree::take_cutting`]), planted under
     /// `new_parent_id` in the destination with a fresh id and a fresh key per
@@ -2021,92 +1910,61 @@ impl VaultClient {
     /// between the two leaves the original exactly where it was.
     ///
     /// `left_shares` is every share the node was in: leaving the store leaves
-    /// all of them, since two stores never share an ancestor.
-    ///
-    /// The caller (`web/src/backend.rs`) is the one place this is reached
-    /// from: it is not routed through [`VaultClient::handle`], which answers
-    /// only a single store's commands, because a transplant needs the
-    /// destination's endpoint too.
+    /// all of them, since two stores never share an ancestor. Which two
+    /// stores may be transplanted between at all is the router's to judge
+    /// (`pimble_api::Router`'s `transplant`).
     #[allow(clippy::too_many_arguments)]
-    pub async fn transplant_node(
+    pub async fn transplant_node<W: VaultWire + ?Sized>(
         &mut self,
-        from_client: &Arc<PimbleClient>,
-        to_client: &Arc<PimbleClient>,
+        from_client: &W,
+        to_client: &W,
         from_store_id: StoreId,
         node_id: NodeId,
         to_store_id: StoreId,
         new_parent_id: NodeId,
         place: Place,
-    ) -> BackendEvent {
+    ) -> Result<pimble_api::Moved, ApiError> {
+        if from_store_id == to_store_id {
+            return self.move_node(from_client, from_store_id, node_id, new_parent_id, place).await;
+        }
         let now = now_rfc3339();
 
-        let (old_parent_id, title, left_shares, cutting) = {
-            let Some(from_store) = self.stores.get(&from_store_id) else {
-                return BackendEvent::Error { message: "no such encrypted store".into() };
-            };
-            let info = match from_store.tree.get_node_info(node_id) {
-                Ok(info) => info,
-                Err(e) => return BackendEvent::Error { message: e.to_string() },
-            };
-            let Some(old_parent_id) = info.parent_id else {
-                return BackendEvent::Error { message: "the root node cannot be moved into another store".into() };
-            };
+        let (left_shares, cutting) = {
+            let from_store = self.stores.get(&from_store_id).ok_or_else(not_open)?;
+            let info = from_store.tree.get_node_info(node_id).map_err(|_| ApiError::node_not_found(node_id))?;
+            if info.parent_id.is_none() {
+                return Err(ApiError::invalid_operation("Cannot move the root node into another store"));
+            }
             let left_shares = as_left_shares(&from_store.tree, from_store.tree.shares(node_id));
-            let cutting = match from_store.tree.take_cutting(node_id) {
-                Ok(cutting) => cutting,
-                Err(e) => return BackendEvent::Error { message: e.to_string() },
-            };
-            (old_parent_id, info.title, left_shares, cutting)
+            (left_shares, from_store.tree.take_cutting(node_id)?)
         };
 
         let (planted, edit_to) = {
-            let Some(to_store) = self.stores.get_mut(&to_store_id) else {
-                return BackendEvent::Error { message: "no such encrypted store".into() };
-            };
+            let to_store = self.stores.get_mut(&to_store_id).ok_or_else(not_open)?;
             let mut edit = to_store.seed_root(&now);
-            match to_store.tree.plant(cutting, new_parent_id, place, &now, &mut NodeId::new) {
-                Ok((planted, more)) => {
-                    edit.touched.extend(more.touched);
-                    (planted, edit)
-                }
-                Err(e) => return BackendEvent::Error { message: e.to_string() },
-            }
+            let (planted, more) = to_store.tree.plant(cutting, new_parent_id, place, &now, &mut NodeId::new)?;
+            edit.touched.extend(more.touched);
+            (planted, edit)
         };
 
         // Created first: a failure appending the new documents leaves the
         // original untouched, never tombstoned with nothing to show for it.
-        if let Err(message) = self.append_edit(to_client, to_store_id, &edit_to).await {
-            return BackendEvent::Error { message };
-        }
+        self.append_edit(to_client, to_store_id, &edit_to).await?;
 
         // Deleted second, only now that the new home is on the server.
         let tombstone_edit = {
-            let Some(from_store) = self.stores.get_mut(&from_store_id) else {
-                return BackendEvent::Error { message: "no such encrypted store".into() };
-            };
-            match from_store.tree.remove_transplanted(node_id, to_store_id, &planted, &now) {
-                Ok(edit) => edit,
-                Err(e) => return BackendEvent::Error { message: e.to_string() },
-            }
+            let from_store = self.stores.get_mut(&from_store_id).ok_or_else(not_open)?;
+            from_store.tree.remove_transplanted(node_id, to_store_id, &planted, &now)?
         };
-        if let Err(message) = self.append_edit(from_client, from_store_id, &tombstone_edit).await {
+        if let Err(e) = self.append_edit(from_client, from_store_id, &tombstone_edit).await {
             // The new node is already live and answered below; a failed
             // tombstone is unsent like any other failed append and resent by
             // the same mechanism, not a reason to tell the person their move
             // did not happen.
-            tracing::warn!("Appending the tombstone of {} after a transplant failed: {}", node_id, message);
+            tracing::warn!("Appending the tombstone of {} after a transplant failed: {}", node_id, e);
         }
 
-        BackendEvent::NodeTransplanted {
-            from_store_id,
-            old_node_id: node_id,
-            old_parent_id,
-            to_store_id,
-            node_id: planted.root,
-            new_parent_id,
-            title,
-            left_shares,
-        }
+        Ok(pimble_api::Moved { node: planted.root, left_shares })
     }
 
     /// Append what a tree operation wrote: one `vaultAppend` per touched
@@ -2116,12 +1974,12 @@ impl VaultClient {
     /// Every document is attempted even after one fails, so each failure is
     /// recorded against its own document and resent from there; stopping at
     /// the first would leave the rest holding work nothing knows is unsent.
-    async fn append_edit(&mut self, client: &Arc<PimbleClient>, store_id: StoreId, edit: &TreeEdit) -> Result<(), String> {
+    async fn append_edit<W: VaultWire + ?Sized>(&mut self, client: &W, store_id: StoreId, edit: &TreeEdit) -> Result<(), ApiError> {
         let mut first_error = None;
         for (node_id, update) in &edit.touched {
-            if let Err(message) = self.append_prepared(client, store_id, *node_id, update).await {
-                tracing::warn!("Appending to the document {} failed: {}", node_id, message);
-                first_error.get_or_insert(message);
+            if let Err(e) = self.append_prepared(client, store_id, *node_id, update).await {
+                tracing::warn!("Appending to the document {} failed: {}", node_id, e);
+                first_error.get_or_insert(e);
             }
         }
         first_error.map_or(Ok(()), Err)
@@ -2129,43 +1987,43 @@ impl VaultClient {
 
     // ── Content ─────────────────────────────────────────────────────────────
 
-    /// A local edit from the editor: merge it, encrypt it, append it.
-    async fn broadcast(
-        &mut self,
-        client: &Arc<PimbleClient>,
-        store_id: StoreId,
-        node_id: NodeId,
-        changes: &str,
-    ) -> Result<(), String> {
-        // The editor's outbound closure encodes with the standard alphabet,
-        // exactly as the plain path's `applyEdit` carries it.
-        let update = STANDARD
-            .decode(changes)
-            .map_err(|e| format!("the editor's delta would not decode: {e}"))?;
-        self.append_update(client, store_id, node_id, &update).await
+    /// The one write (`applyEdit`'s part, `pimble_api::Backend::apply`): an
+    /// update of one document, merged here and appended. Judged per document
+    /// first, as the server judges an `applyEdit` (a commenter writes
+    /// discussions and nothing else). With no connection to send it through
+    /// (`client` `None`: the store's owner's computer is off), what the
+    /// editor has already put on screen is merged and kept as unsent, which
+    /// the next connection's catch-up delivers; a store this page never
+    /// opened takes nothing.
+    pub async fn apply<W: VaultWire + ?Sized>(&mut self, client: Option<&W>, store_id: StoreId, node_id: NodeId, update: &[u8]) -> Result<(), ApiError> {
+        let Some(store) = self.stores.get(&store_id) else {
+            if self.owner_offline.contains(&store_id) {
+                return Err(ApiError::OwnerOffline { sentence: pimble_api::router::OWNER_OFFLINE_REFUSAL.to_string() });
+            }
+            return Err(not_open());
+        };
+        if let Some(refusal) = ApiError::of_access(store.access_of(node_id, self.rows.get(&store_id))) {
+            return Err(refusal);
+        }
+        match client {
+            Some(client) => self.append_update(client, store_id, node_id, update).await,
+            None => self.keep_unsent(store_id, node_id, update).map_err(|sentence| ApiError::Failed { sentence }),
+        }
     }
 
     /// Merge `update` into the node's document (the editor's delta, or a whole
     /// document from a session that started from nothing), then append it.
-    async fn append_update(
-        &mut self,
-        client: &Arc<PimbleClient>,
-        store_id: StoreId,
-        node_id: NodeId,
-        update: &[u8],
-    ) -> Result<(), String> {
+    async fn append_update<W: VaultWire + ?Sized>(&mut self, client: &W, store_id: StoreId, node_id: NodeId, update: &[u8]) -> Result<(), ApiError> {
         {
-            let Some(store) = self.stores.get_mut(&store_id) else {
-                return Err("no such encrypted store".to_string());
-            };
-            store.tree.apply_update(node_id, update).map_err(|e| e.to_string())?;
+            let store = self.stores.get_mut(&store_id).ok_or_else(not_open)?;
+            store.tree.apply_update(node_id, update)?;
         }
         self.append_prepared(client, store_id, node_id, update).await
     }
 
     /// Send everything `node_id`'s document holds that the server does not,
     /// for a document an earlier append failed to deliver.
-    async fn resend(&mut self, client: &Arc<PimbleClient>, store_id: StoreId, node_id: NodeId) -> Result<(), String> {
+    async fn resend<W: VaultWire + ?Sized>(&mut self, client: &W, store_id: StoreId, node_id: NodeId) -> Result<(), ApiError> {
         // An empty update: `prepare` sends the diff since `known_sv` for an
         // unsent document whatever it is handed.
         self.append_prepared(client, store_id, node_id, &[]).await
@@ -2178,54 +2036,40 @@ impl VaultClient {
     /// parent (which is how a scoped member's new document joins their scope)
     /// and carries its wrapped data key, which the server stores together
     /// with the blob, so nothing is ever there under a key it has no wrap of.
-    async fn append_prepared(
-        &mut self,
-        client: &Arc<PimbleClient>,
-        store_id: StoreId,
-        node_id: NodeId,
-        update: &[u8],
-    ) -> Result<(), String> {
+    async fn append_prepared<W: VaultWire + ?Sized>(&mut self, client: &W, store_id: StoreId, node_id: NodeId, update: &[u8]) -> Result<(), ApiError> {
         let outgoing = {
-            let Some(store) = self.stores.get_mut(&store_id) else {
-                return Err("no such encrypted store".to_string());
-            };
-            store.prepare(store_id, node_id, update)?
+            let store = self.stores.get_mut(&store_id).ok_or_else(not_open)?;
+            store.prepare(store_id, node_id, update).map_err(|sentence| ApiError::Failed { sentence })?
         };
         let new = outgoing.created.as_ref().map(|(_, new)| *new).unwrap_or_default();
         let keys = outgoing.created.as_ref().map(|(keys, _)| keys.clone());
         // A new discussion on a node says so, which is what lets a commenter
         // create it and puts it in the store's discussion set
         // (docs/DISCUSSIONS_CONTRACT.md section 7).
-        let appended = match new.discussion_host {
-            Some(host) => {
-                client
-                    .vault_append_new_discussion(store_id, outgoing.doc_id.clone(), outgoing.blob.clone(), Some(self.client_id.clone()), host, keys)
-                    .await
-            }
-            None => {
-                client
-                    .vault_append_with_keys(store_id, outgoing.doc_id.clone(), outgoing.blob.clone(), Some(self.client_id.clone()), new.parent_id, keys)
-                    .await
-            }
-        }
-        .map_err(|e| e.to_string());
+        let appended = client
+            .append(store_id, outgoing.doc_id.clone(), outgoing.blob.clone(), Some(self.client_id.clone()), new.parent_id, new.discussion_host, keys)
+            .await
+            .map_err(ApiError::from);
 
         // A refusal is the server saying no — a reader's root inside a store
         // this account edits elsewhere, or a document in nobody's scope. There
         // is nothing to resend, so the document is not left `unsent` (which
         // would push the same refused bytes on every reconnect); instead it is
         // pulled again, so what is on screen is what the server holds.
-        if let Err(message) = &appended {
-            if is_refusal(message) {
-                tracing::warn!("Store {} refused an append to {}: {}", store_id, node_id, message);
+        if let Err(e) = &appended {
+            if e.is_refusal() {
+                tracing::warn!("Store {} refused an append to {}: {}", store_id, node_id, e);
                 let events = self.repull(client, store_id, node_id).await;
                 self.pending.extend(events);
-                return Err(message.clone());
+                return Err(e.clone());
             }
         }
 
         let Some(store) = self.stores.get_mut(&store_id) else { return Ok(()) };
-        let snapshot = store.record(node_id, &outgoing, appended)?;
+        let snapshot = match store.record(node_id, &outgoing, appended.clone().map_err(|e| e.sentence())) {
+            Ok(snapshot) => snapshot,
+            Err(sentence) => return Err(appended.err().unwrap_or(ApiError::Failed { sentence })),
+        };
 
         // The document is on the server now, and its wraps with it.
         if let Some((keys, _)) = &outgoing.created {
@@ -2234,8 +2078,8 @@ impl VaultClient {
 
         if let Some(upto_seq) = snapshot {
             let Some(store) = self.stores.get_mut(&store_id) else { return Ok(()) };
-            let blob = store.snapshot_blob(store_id, node_id)?;
-            match client.vault_snapshot(store_id, outgoing.doc_id, upto_seq, blob).await {
+            let blob = store.snapshot_blob(store_id, node_id).map_err(|sentence| ApiError::Failed { sentence })?;
+            match client.snapshot(store_id, outgoing.doc_id, upto_seq, blob).await {
                 Ok(()) => {
                     if let Some(doc) = self.stores.get_mut(&store_id).and_then(|s| s.docs.get_mut(&node_id)) {
                         doc.snapshot_seq = doc.snapshot_seq.max(upto_seq);
@@ -2255,7 +2099,7 @@ impl VaultClient {
     /// exists nowhere else and never will; the honest answer is the server's
     /// copy. A document the server refuses to serve either is simply dropped:
     /// it is not this account's to see.
-    async fn repull(&mut self, client: &Arc<PimbleClient>, store_id: StoreId, node_id: NodeId) -> Vec<BackendEvent> {
+    async fn repull<W: VaultWire + ?Sized>(&mut self, client: &W, store_id: StoreId, node_id: NodeId) -> Vec<BackendEvent> {
         // The parent before the document goes: what the UI has drawn of that
         // list is what changes, whether the document comes back or not.
         let touched = {
@@ -2271,7 +2115,7 @@ impl VaultClient {
             store.refused(node_id);
             touched
         };
-        let fetched = client.vault_fetch(store_id, VaultDocId::Node(node_id), 0).await;
+        let fetched = client.fetch(store_id, VaultDocId::Node(node_id), 0).await;
         let active = self.active.contains(&(store_id, node_id));
         let Some(store) = self.stores.get_mut(&store_id) else { return Vec::new() };
         let fetched = match fetched {
@@ -2300,21 +2144,35 @@ impl VaultClient {
         events
     }
 
-    /// The same stateless reconcile the plain path does, answered from the
-    /// node document this page holds.
-    fn reconcile(&self, store_id: StoreId, node_id: NodeId, state_vector: &[u8]) -> BackendEvent {
-        let Some(doc) = self.stores.get(&store_id).and_then(|s| s.tree.doc(node_id)) else {
-            return BackendEvent::Error { message: "that node's document is not held here".into() };
-        };
-        match doc.diff_since(state_vector) {
-            Ok(diff) => BackendEvent::NodeContentReconciled {
-                store_id,
-                node_id,
-                diff,
-                server_state_vector: doc.state_vector(),
-            },
-            Err(e) => BackendEvent::Error { message: e.to_string() },
-        }
+    /// Close a store in this page: what it holds of it is let go, its
+    /// subscription is no longer restored, and it stays out of the list
+    /// until the page is loaded again (a browser opens what the account
+    /// grants; there is no store to open by path). Until 2026-11-02 an
+    /// encrypted store answered "Closing a store is not available".
+    pub fn close(&mut self, store_id: StoreId) -> BackendEvent {
+        self.stores.remove(&store_id);
+        self.waiting.remove(&store_id);
+        self.subscribed.remove(&store_id);
+        self.active.retain(|(store, _)| *store != store_id);
+        self.closed.insert(store_id);
+        BackendEvent::StoreClosed { store_id }
+    }
+
+    /// Whether this page closed the store ([`VaultClient::close`]).
+    pub fn is_closed(&self, store_id: StoreId) -> bool {
+        self.closed.contains(&store_id)
+    }
+
+    /// The encrypted stores open in this page, as the UI is told them.
+    pub fn held_stores(&self) -> Vec<Store> {
+        self.stores
+            .values()
+            .map(|store| {
+                let mut row = store.view();
+                self.describe(&mut row);
+                row
+            })
+            .collect()
     }
 
     // ── Subscription ────────────────────────────────────────────────────────
@@ -2446,19 +2304,14 @@ impl VaultClient {
     /// and the text of every document held, which is every node's.
     ///
     /// There is no server index for a vault store and there cannot be one — the
-    /// server has never seen a word of it. Plain stores in the same query still
-    /// go to the server, and the two sets of hits are merged.
-    async fn search(
-        &self,
-        client: &Arc<PimbleClient>,
-        query: &str,
-        stores: &[StoreId],
-        limit: usize,
-        purpose: pimble_app::protocol::SearchPurpose,
-    ) -> BackendEvent {
+    /// server has never seen a word of it. Plain stores in the same query are
+    /// the router's to send to their own server (`pimble_api::Router`'s
+    /// `search`); an encrypted store not open here (its key or its owner's
+    /// computer is still to come) has nothing anywhere to search.
+    pub fn search(&self, query: &str, stores: &[StoreId], limit: usize) -> Vec<SearchResultItem> {
         let needle = query.trim().to_lowercase();
         if needle.is_empty() {
-            return BackendEvent::SearchResults { purpose, results: Ok(Vec::new()) };
+            return Vec::new();
         }
 
         let mut results = Vec::new();
@@ -2508,20 +2361,49 @@ impl VaultClient {
             }
         }
 
-        // Plain stores in the same query keep their server-side index. An
-        // encrypted store not open here (its key or its owner's computer is
-        // still to come) has nothing anywhere to search.
-        let plain: Vec<StoreId> = stores.iter().copied().filter(|id| !self.is_encrypted(*id)).collect();
-        if !plain.is_empty() {
-            match client.search(query.to_string(), plain, true, limit).await {
-                Ok(mut items) => results.append(&mut items),
-                Err(e) => tracing::warn!("Searching the plain stores failed: {}", e),
-            }
-        }
-
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(limit);
-        BackendEvent::SearchResults { purpose, results: Ok(results) }
+        results
+    }
+}
+
+/// What the tests of the vault's backend (`crate::vault_backend`) stand a
+/// page up with: an encrypted store that has just been made, held whole,
+/// under a store key of its own, and the account's word about it.
+#[cfg(test)]
+impl VaultClient {
+    pub(crate) fn hold_new_store(&mut self, store_id: StoreId, name: &str) -> NodeId {
+        let root = NodeId::new();
+        let key_id = KeyId::new_v4();
+        let keyring = Keyring { keys: HashMap::from([(key_id, SymmetricKey::generate())]), current: Some(key_id), scopes: vec![(None, key_id)] };
+        let mut listed = Store::new_local(name, std::path::PathBuf::new());
+        listed.id = store_id;
+        listed.root_node_id = root;
+        listed.kind = StoreKind::Vault;
+        self.stores.insert(store_id, VaultStore::assemble(listed, StoreKeys::new(keyring), Vec::new(), Vec::new()));
+        root
+    }
+
+    /// The account's row of a store, with one grant of `role` on it whole.
+    pub(crate) fn grant_whole(&mut self, store_id: StoreId, role: &str) {
+        self.rows.insert(
+            store_id,
+            AccountStore {
+                kind: "vault".into(),
+                grants: vec![AccountGrant { root: None, role: role.into(), name: String::new() }],
+                ..Default::default()
+            },
+        );
+    }
+
+    /// The backend loop found the store's endpoint down.
+    pub(crate) fn owner_away(&mut self, store_id: StoreId) {
+        self.owner_offline.insert(store_id);
+    }
+
+    /// Whether the store holds an edit no connection has delivered yet.
+    pub(crate) fn has_unsent(&self, store_id: StoreId, node_id: NodeId) -> bool {
+        self.stores.get(&store_id).and_then(|s| s.docs.get(&node_id)).is_some_and(|d| d.unsent)
     }
 }
 
@@ -3475,42 +3357,6 @@ pub fn store_id_of(cmd: &BackendCommand) -> Option<StoreId> {
     })
 }
 
-/// Whether a command changes anything. A reader's is refused before it is
-/// sent; everything else a `Read` store answers as it always did.
-///
-/// Listed by hand rather than by exclusion: a command added later should have
-/// to be thought about once rather than quietly become a write a reader may
-/// make.
-pub fn writes(cmd: &BackendCommand) -> bool {
-    use BackendCommand::*;
-    matches!(
-        cmd,
-        CreateNode { .. }
-            | CreateAttachment { .. }
-            | RenameNode { .. }
-            | SetNodeAppearance { .. }
-            | DeleteNode { .. }
-            | UndeleteNode { .. }
-            | MoveNode { .. }
-            | MoveNodes { .. }
-            | TransplantNode { .. }
-            | ApplyUpdate { .. }
-            | BroadcastChanges { .. }
-            | PutBlob { .. }
-            | CreateMount { .. }
-            | MountRemoteStore { .. }
-            | SetStoreSync { .. }
-            | RemoveReplica { .. }
-    )
-}
-
-/// Whether a command carries what the editor has already put on screen: the
-/// two writes a store whose owner's computer is off still takes in
-/// ([`VaultClient::refuse_write`]).
-fn is_content_edit(cmd: &BackendCommand) -> bool {
-    matches!(cmd, BackendCommand::BroadcastChanges { .. } | BackendCommand::ApplyUpdate { .. })
-}
-
 /// The placeholder root of a store listed from the account's row alone
 /// ([`VaultClient::offline_row`]): the store's own id, so it is the same every
 /// time and names no node of anybody's.
@@ -3518,8 +3364,6 @@ fn offline_root(store_id: StoreId) -> NodeId {
     NodeId(store_id.0)
 }
 
-/// An empty folder to be read: what the placeholder root of a store that
-/// cannot be reached answers as.
 /// Where a link to `node_id` in `store_id` leads, among the encrypted
 /// stores this page holds: the same answers, by the same rules, as the
 /// server's `resolveLink` (a document a scoped page does not hold is outside
@@ -3535,60 +3379,6 @@ fn resolve_in(stores: &HashMap<StoreId, VaultStore>, store_id: StoreId, node_id:
         }
     }
     walk.nowhere()
-}
-
-fn empty_folder(node_id: NodeId, title: &str) -> Node {
-    let now = chrono::Utc::now();
-    Node {
-        id: node_id,
-        parent_id: None,
-        node_type: node_types::FOLDER.to_string(),
-        metadata: NodeMetadata { title: title.to_string(), created_at: now, modified_at: now, tags: Vec::new(), custom: HashMap::new(), fields: Vec::new() },
-        content: Vec::new(),
-        children: Vec::new(),
-        became: None,
-        attached_to: None,
-        attachments: 0,
-        access: StoreAccess::Read,
-    }
-}
-
-/// Whether a failed request was the server refusing rather than failing: a
-/// reader's write, or a document in none of this account's scopes. Nothing
-/// later changes such an answer, so it is never retried and never left
-/// pending — it is shown.
-pub fn is_refusal(message: &str) -> bool {
-    StoreAccess::refusal_in(message).is_some() || message.starts_with("Forbidden: ")
-}
-
-/// What a `TransplantNode` earns when one of its stores is encrypted and the
-/// other is plain (docs/MOVE_CONTRACT.md "Between stores"): the vault client
-/// does a transplant between two stores it holds, and a plain store's is the
-/// hosted server's to do; the two are not one operation yet.
-pub const MIXED_TRANSPLANT_REFUSAL: &str = "Moving a node between an encrypted store and a plain one is not supported yet.";
-
-/// Whether a `TransplantNode` needs refusing because its two stores are not
-/// the same kind. `None` when both are encrypted (the vault client's to do,
-/// [`VaultClient::transplant_node`]) or both are plain (`process_command`'s,
-/// through whichever endpoint serves the source, as any other plain-store
-/// write).
-pub fn refuse_mixed_transplant(from_vault: bool, to_vault: bool) -> Option<BackendEvent> {
-    (from_vault != to_vault).then(|| BackendEvent::Error { message: MIXED_TRANSPLANT_REFUSAL.to_string() })
-}
-
-/// What a `TransplantNode` between two plain stores earns when different
-/// endpoints serve them (docs/MOVE_CONTRACT.md "Between stores"): the server
-/// holding the source does the transplant, and it can only plant into a
-/// store it holds too. Today every plain store a page sees is the hosted
-/// server's (a store served from its owner's computer is always encrypted),
-/// so this is the fence for the day that changes, not a path anyone reaches.
-pub const SPLIT_TRANSPLANT_REFUSAL: &str = "Moving a node between stores on different servers is not supported yet.";
-
-/// Whether a plain-to-plain `TransplantNode` needs refusing because its two
-/// stores are served by different endpoints. `None` when one server holds
-/// both, which is when `process_command` can hand it to that server.
-pub fn refuse_split_transplant(from_url: &str, to_url: &str) -> Option<BackendEvent> {
-    (from_url != to_url).then(|| BackendEvent::Error { message: SPLIT_TRANSPLANT_REFUSAL.to_string() })
 }
 
 /// A sentence written for the person rather than an error: the app shows it in
@@ -3616,13 +3406,27 @@ fn name_of(cmd: &BackendCommand) -> &'static str {
 /// The timestamp this page's edits carry (`created_at`, `modified_at`,
 /// `deleted_at`), rfc3339 like the server's. The crdt crate never reads a
 /// clock; what two replicas write is decided by their callers alone.
+#[cfg(target_arch = "wasm32")]
 fn now_rfc3339() -> String {
     js_sys::Date::new_0().to_iso_string().as_string().unwrap_or_default()
 }
 
+/// The same off the browser: the tests run natively, where there is no
+/// JavaScript clock to ask.
+#[cfg(not(target_arch = "wasm32"))]
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
 /// The page's clock, in milliseconds.
+#[cfg(target_arch = "wasm32")]
 fn now_ms() -> f64 {
     js_sys::Date::now()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn now_ms() -> f64 {
+    chrono::Utc::now().timestamp_millis() as f64
 }
 
 /// About 120 characters around the match, or the start of the text.
@@ -3695,6 +3499,7 @@ fn advance(known_sv: &mut Vec<u8>, update: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pimble_core::PimbleUrl;
     use pimble_crypto::{blob_aad, dek_aad, unwrap_dek, wrap_dek};
     use pimble_rpc::vault::{decode_blob, SNAPSHOT_EVERY};
     use pimble_crypto::SymmetricKey;
@@ -3779,6 +3584,69 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    // ── The backend loop's router, for these tests ──────────────────────────
+
+    /// A plain stores' backend with no server behind it: these tests route
+    /// encrypted stores only.
+    struct Nowhere;
+
+    #[async_trait::async_trait]
+    impl pimble_api::rpc::Connector for Nowhere {
+        async fn client(&self) -> Result<Arc<PimbleClient>, ApiError> {
+            Err(ApiError::Offline { sentence: "no server in these tests".into() })
+        }
+    }
+
+    /// No endpoint is up: what a page has while its owner's computer is off.
+    struct NoWires;
+
+    impl crate::vault_backend::WireTable for NoWires {
+        fn wire(&self, _store: StoreId) -> Option<Arc<dyn VaultWire>> {
+            None
+        }
+    }
+
+    /// What the backend loop tells the router about a store
+    /// (`crate::backend::Routes::learn`).
+    fn learn(router: &pimble_api::Router, vault_id: Option<pimble_api::router::BackendId>, client: &VaultClient, store_id: StoreId) {
+        if let Some(id) = vault_id.filter(|_| client.is_encrypted(store_id)) {
+            router.serve(store_id, id);
+        }
+        router.set_access(store_id, client.row_access(store_id));
+        router.set_away(store_id, client.away_row(store_id));
+    }
+
+    /// The backend loop's one gate, as it asks it of a command.
+    fn refuse_write(client: &VaultClient, store_id: StoreId, cmd: &BackendCommand) -> Option<BackendEvent> {
+        let router = pimble_api::Router::new(pimble_api::rpc::RpcBackend::new(Nowhere));
+        learn(&router, None, client, store_id);
+        crate::routed::gate(&router, store_id, cmd)
+    }
+
+    /// A command as the backend loop answers it through the router, with no
+    /// connection up: the gate, then the router over this page's vault.
+    /// `None` when the router hands it back. The page comes back to `client`.
+    fn route_through(client: &mut VaultClient, cmd: BackendCommand) -> Option<Vec<BackendEvent>> {
+        let store_id = store_id_of(&cmd).expect("a store's command");
+        if let Some(refused) = refuse_write(client, store_id, &cmd) {
+            return Some(vec![refused]);
+        }
+        let root = client.root_of(store_id);
+        let taken = std::mem::replace(client, VaultClient::new(String::new()));
+        let backend = crate::vault_backend::VaultBackend::new(taken, Arc::new(NoWires));
+        let shared = backend.shared();
+        let mut router = pimble_api::Router::new(pimble_api::rpc::RpcBackend::new(Nowhere));
+        let vault_id = router.add(backend);
+        learn(&router, Some(vault_id), &futures::executor::block_on(shared.lock()), store_id);
+        let answer = futures::executor::block_on(crate::routed::answer(&router, vault_id, cmd, |_| root));
+        drop(router);
+        *client = Arc::try_unwrap(shared).ok().expect("the page has one owner again").into_inner();
+        match answer {
+            crate::routed::Routed::Answered(events) => Some(events),
+            crate::routed::Routed::Not(_) => None,
+        }
     }
 
     // ── The tree from documents ─────────────────────────────────────────────
@@ -4319,17 +4187,18 @@ mod tests {
         client.endpoint_down(&[store_id]);
         let answered = |handled: Handled| match handled {
             Handled::Yes(event) => event,
-            Handled::Several(events) => panic!("answered with several: {events:?}"),
             Handled::No(cmd) => panic!("handed back: {cmd:?}"),
         };
 
-        let children = answered(client.handle_unreachable(BackendCommand::GetChildren { store_id, node_id: placeholder }));
+        // Reads go through the router, which answers a store it cannot
+        // reach and does not hold with its placeholder (`pimble_api::router`).
+        let children = route_through(&mut client, BackendCommand::GetChildren { store_id, node_id: placeholder }).expect("routed");
         assert!(
-            matches!(&children, Some(BackendEvent::ChildrenLoaded { children, parent_id, .. }) if children.is_empty() && *parent_id == placeholder),
+            matches!(children.as_slice(), [BackendEvent::ChildrenLoaded { children, parent_id, .. }] if children.is_empty() && *parent_id == placeholder),
             "{children:?}"
         );
-        let node = answered(client.handle_unreachable(BackendCommand::GetNode { store_id, node_id: placeholder }));
-        let Some(BackendEvent::NodeLoaded { node, .. }) = node else { panic!("no node: {node:?}") };
+        let node = route_through(&mut client, BackendCommand::GetNode { store_id, node_id: placeholder }).expect("routed");
+        let [BackendEvent::NodeLoaded { node, .. }] = node.as_slice() else { panic!("no node: {node:?}") };
         assert_eq!(node.metadata.title, "Recipes");
         assert_eq!(node.node_type, node_types::FOLDER);
         assert_eq!(node.access, StoreAccess::Read);
@@ -4343,14 +4212,13 @@ mod tests {
 
         // A write is refused with the sentence that says why, before anything
         // is asked of anyone; a read is not.
-        let refused = client
-            .refuse_write(store_id, &BackendCommand::CreateNode { store_id, parent_id: None, title: "New".into(), init: None, place: Default::default() })
+        let refused = refuse_write(&client, store_id, &BackendCommand::CreateNode { store_id, parent_id: None, title: "New".into(), init: None, place: Default::default() })
             .expect("nothing can be created in a store that cannot be reached");
         assert!(
-            matches!(&refused, BackendEvent::Error { message } if message == &format!("Forbidden: {OWNER_OFFLINE_REFUSAL}")),
+            matches!(&refused, BackendEvent::Error { message } if *message == format!("Forbidden: {}", pimble_api::router::OWNER_OFFLINE_REFUSAL)),
             "{refused:?}"
         );
-        assert!(client.refuse_write(store_id, &BackendCommand::GetNode { store_id, node_id: placeholder }).is_none());
+        assert!(refuse_write(&client, store_id, &BackendCommand::GetNode { store_id, node_id: placeholder }).is_none());
 
         // Another store's commands are none of this.
         let other = StoreId::new();
@@ -4389,8 +4257,8 @@ mod tests {
 
         // And it answers like any open store from here on.
         assert!(matches!(client.handle_unreachable(BackendCommand::GetChildren { store_id, node_id: root }), Handled::No(_)));
-        assert!(client.refuse_write(store_id, &BackendCommand::CreateNode { store_id, parent_id: Some(root), title: "New".into(), init: None, place: Default::default() }).is_none());
-        let BackendEvent::ChildrenLoaded { children, .. } = client.get_children(store_id, root) else { panic!("no list") };
+        assert!(refuse_write(&client, store_id, &BackendCommand::CreateNode { store_id, parent_id: Some(root), title: "New".into(), init: None, place: Default::default() }).is_none());
+        let children = client.children(store_id, root).expect("a list");
         assert!(!children.is_empty());
         assert!(children.iter().all(|node| node.access == StoreAccess::Full));
 
@@ -4414,10 +4282,9 @@ mod tests {
         assert_eq!(events.len(), 1, "a store the UI already has is not listed again: {events:?}");
         assert_eq!(sync_of(&events[0]), (StoreAccess::Read, RelaySide::Member, true));
 
-        let Handled::Yes(Some(BackendEvent::ChildrenLoaded { children, .. })) =
-            client.handle_unreachable(BackendCommand::GetChildren { store_id, node_id: root })
-        else {
-            panic!("the held list was not served")
+        let routed = route_through(&mut client, BackendCommand::GetChildren { store_id, node_id: root });
+        let Some([BackendEvent::ChildrenLoaded { children, .. }]) = routed.as_deref() else {
+            panic!("the held list was not served: {routed:?}")
         };
         assert!(!children.is_empty(), "what is held is still read");
         assert!(children.iter().all(|node| node.access == StoreAccess::Read));
@@ -4427,7 +4294,7 @@ mod tests {
         assert_eq!(described.access, StoreAccess::Read);
 
         let rename = BackendCommand::RenameNode { store_id, node_id: root, title: "No".into() };
-        assert!(client.refuse_write(store_id, &rename).is_some());
+        assert!(refuse_write(&client, store_id, &rename).is_some());
 
         // A keystroke already on its way: merged and kept, not refused.
         let mut editor = NodeDoc::load(&peer.doc(root).unwrap().save()).unwrap();
@@ -4440,8 +4307,8 @@ mod tests {
         editor.apply_update(&typed).unwrap();
         assert_ne!(editor.state_vector(), before);
         let keystroke = BackendCommand::BroadcastChanges { store_id, node_id: root, changes: STANDARD.encode(&typed) };
-        assert!(client.refuse_write(store_id, &keystroke).is_none());
-        assert!(matches!(client.handle_unreachable(keystroke), Handled::Yes(None)));
+        assert!(refuse_write(&client, store_id, &keystroke).is_none());
+        assert_eq!(route_through(&mut client, keystroke).map(|events| events.len()), Some(0), "taken, with nothing to say");
         let held = &client.stores[&store_id];
         assert!(held.docs[&root].unsent, "the next connection has nothing to resend");
         assert_eq!(held.tree.doc(root).unwrap().fields().unwrap().title, "Typed while it went");
@@ -5194,11 +5061,11 @@ mod tests {
         let mut client = VaultClient::new("me".to_string());
         client.stores.insert(store_id, store);
         client.rows.insert(store_id, mixed);
-        let BackendEvent::ChildrenLoaded { children, .. } = client.get_children(store_id, recipes) else { panic!("children of a held root") };
+        let children = client.children(store_id, recipes).expect("children of a held root");
         let mut listed_access: Vec<(NodeId, StoreAccess)> = children.iter().map(|n| (n.id, n.access)).collect();
         listed_access.sort_by_key(|(id, _)| *id != bread);
         assert_eq!(listed_access, vec![(bread, Read), (inner, Full)]);
-        let BackendEvent::NodeLoaded { node, .. } = client.get_node(store_id, bread) else { panic!("a held node") };
+        let node = client.node(store_id, bread).expect("a held node");
         assert_eq!(node.access, Read);
         let mut described = scoped;
         client.describe(&mut described);
@@ -5243,19 +5110,25 @@ mod tests {
         assert_eq!(whole.access(), Comment);
         assert!(whole.read_only_roots().is_empty());
 
+        let talk_state = store.tree.doc(talk).unwrap().save();
+        let bread_state = store.tree.doc(bread).unwrap().save();
         let mut client = VaultClient::new("me".to_string());
         client.stores.insert(store_id, store);
         client.rows.insert(store_id, commenting);
-        let refused = |cmd: BackendCommand| match client.refuse_write(store_id, &cmd) {
-            Some(BackendEvent::Error { message }) => Some(message),
-            Some(other) => panic!("{other:?}"),
-            None => None,
-        };
+        // A new discussion passes the gate (it is then made through the
+        // endpoint, which these tests do not have).
         let init = |node_type: &str| pimble_app::protocol::NodeInit { node_type: node_type.to_string(), content: Vec::new(), custom: Vec::new(), request: None };
-        assert_eq!(refused(BackendCommand::CreateAttachment { store_id, host_id: bread, title: "Why?".into(), init: init(node_types::DISCUSSION) }), None);
-        assert_eq!(refused(BackendCommand::ApplyUpdate { store_id, node_id: talk, update: Vec::new() }), None);
+        let discussion = BackendCommand::CreateAttachment { store_id, host_id: bread, title: "Why?".into(), init: init(node_types::DISCUSSION) };
+        assert!(refuse_write(&client, store_id, &discussion).is_none());
+        // The router's gate, then the vault judging the document an edit is
+        // of, as the backend loop asks them.
+        let mut refused = |cmd: BackendCommand| match route_through(&mut client, cmd).unwrap_or_default().into_iter().next() {
+            Some(BackendEvent::Error { message }) => Some(message),
+            _ => None,
+        };
+        assert_eq!(refused(BackendCommand::ApplyUpdate { store_id, node_id: talk, update: talk_state }), None);
         let comment_only = Some(StoreAccess::COMMENT_ONLY_REFUSAL.to_string());
-        assert_eq!(refused(BackendCommand::ApplyUpdate { store_id, node_id: bread, update: Vec::new() }), comment_only);
+        assert_eq!(refused(BackendCommand::ApplyUpdate { store_id, node_id: bread, update: bread_state }), comment_only);
         assert_eq!(refused(BackendCommand::RenameNode { store_id, node_id: bread, title: "No".into() }), comment_only);
         assert_eq!(refused(BackendCommand::CreateNode { store_id, parent_id: Some(recipes), title: "No".into(), init: None, place: Place::Last }), comment_only);
         let mut described = scoped;
@@ -5334,8 +5207,8 @@ mod tests {
         let mut described = scoped.clone();
         client.describe(&mut described);
         assert_eq!((described.roots.clone(), described.root_node_id), (vec![plans], plans));
-        assert!(matches!(client.get_node(store_id, bread), BackendEvent::Error { .. }), "nothing of it is answered for");
-        assert!(matches!(client.get_node(store_id, monday), BackendEvent::NodeLoaded { .. }));
+        assert!(client.node(store_id, bread).is_err(), "nothing of it is answered for");
+        assert!(client.node(store_id, monday).is_ok());
 
         // Removed from the last one: said, and the store closed.
         let events = client.take_rows(HashMap::new());
@@ -5411,8 +5284,7 @@ mod tests {
         let mut client = VaultClient::new("me".to_string());
         client.rows.insert(store_id, row(vec![grant(Some(NodeId::new()), "reader", "Recipes")], Some("ann@example.com")));
 
-        let refused = client
-            .refuse_write(store_id, &BackendCommand::RenameNode { store_id, node_id, title: "No".into() })
+        let refused = refuse_write(&client, store_id, &BackendCommand::RenameNode { store_id, node_id, title: "No".into() })
             .expect("a reader may not rename");
         assert!(
             matches!(&refused, BackendEvent::Error { message } if message == StoreAccess::READ_ONLY_REFUSAL),
@@ -5420,16 +5292,8 @@ mod tests {
         );
         // Reads are not refused, and neither is anything on a store this
         // account edits.
-        assert!(client.refuse_write(store_id, &BackendCommand::GetNode { store_id, node_id }).is_none());
-        assert!(client.refuse_write(StoreId::new(), &BackendCommand::DeleteNode { store_id, node_id }).is_none());
-    }
-
-    #[test]
-    fn a_refusal_is_told_apart_from_a_failure() {
-        assert!(is_refusal(StoreAccess::READ_ONLY_REFUSAL));
-        assert!(is_refusal("Forbidden: no grant for this document"));
-        assert!(!is_refusal("Connection error: the socket closed"));
-        assert!(!is_refusal("listing the vault's documents failed"));
+        assert!(refuse_write(&client, store_id, &BackendCommand::GetNode { store_id, node_id }).is_none());
+        assert!(refuse_write(&client, StoreId::new(), &BackendCommand::DeleteNode { store_id, node_id }).is_none());
     }
 
     #[test]
@@ -5454,18 +5318,6 @@ mod tests {
         assert!(!store.docs.contains_key(&x), "with its cursor and its unsent flag");
         assert!(!store.heads.contains_key(&x), "so the next fetch asks from 0");
         assert!(store.keys.docs.wraps(x).is_none());
-    }
-
-    #[test]
-    fn only_the_commands_that_change_something_are_writes() {
-        let store_id = StoreId::new();
-        let node_id = NodeId::new();
-        assert!(writes(&BackendCommand::CreateNode { store_id, parent_id: None, title: String::new(), init: None, place: Default::default() }));
-        assert!(writes(&BackendCommand::MoveNode { store_id, node_id, new_parent_id: node_id, place: Place::Last }));
-        assert!(writes(&BackendCommand::BroadcastChanges { store_id, node_id, changes: String::new() }));
-        assert!(!writes(&BackendCommand::GetChildren { store_id, node_id }));
-        assert!(!writes(&BackendCommand::SubscribeStoreChanges { store_id }));
-        assert!(!writes(&BackendCommand::ListStores));
     }
 
     // ── Moving a node (docs/MOVE_CONTRACT.md) ────────────────────────────────
@@ -5606,29 +5458,6 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_store_on_either_side_of_a_transplant_is_refused_with_the_sentence() {
-        assert!(refuse_mixed_transplant(true, true).is_none(), "both encrypted: the vault client's to do");
-        assert!(refuse_mixed_transplant(false, false).is_none(), "both plain: the server's to do");
-        for (from_vault, to_vault) in [(true, false), (false, true)] {
-            let refused = refuse_mixed_transplant(from_vault, to_vault).expect("one of each store kind is refused");
-            assert!(
-                matches!(&refused, BackendEvent::Error { message } if message == MIXED_TRANSPLANT_REFUSAL),
-                "the sentence alone: {refused:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_plain_transplant_across_two_servers_is_refused_with_the_sentence() {
-        assert!(refuse_split_transplant("wss://a.example/rpc", "wss://a.example/rpc").is_none(), "one server holds both: its to do");
-        let refused = refuse_split_transplant("wss://a.example/rpc", "wss://b.example/rpc").expect("two servers are refused");
-        assert!(
-            matches!(&refused, BackendEvent::Error { message } if message == SPLIT_TRANSPLANT_REFUSAL),
-            "the sentence alone: {refused:?}"
-        );
-    }
-
-    #[test]
     fn list_deleted_names_a_tombstone_s_parent_and_an_unlisted_node_s_place_to_go_back_to() {
         let (mut peer, root) = origin();
         let folder = NodeId::new();
@@ -5693,11 +5522,11 @@ mod tests {
             new_parent_id: NodeId::new(),
             place: Place::Last,
         };
-        let refused = client.refuse_write(store_id, &transplant).expect("a reader may not transplant out of their root");
+        let refused = refuse_write(&client, store_id, &transplant).expect("a reader may not transplant out of their root");
         assert!(matches!(&refused, BackendEvent::Error { message } if message == StoreAccess::READ_ONLY_REFUSAL));
 
         let undelete = BackendCommand::UndeleteNode { store_id, node_id: NodeId::new() };
-        let refused = client.refuse_write(store_id, &undelete).expect("a reader may not undelete either");
+        let refused = refuse_write(&client, store_id, &undelete).expect("a reader may not undelete either");
         assert!(matches!(&refused, BackendEvent::Error { message } if message == StoreAccess::READ_ONLY_REFUSAL));
     }
 }

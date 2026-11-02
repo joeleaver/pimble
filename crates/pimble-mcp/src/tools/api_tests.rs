@@ -69,3 +69,69 @@ async fn links_paths_discussions_and_mounts_as_the_app_has_them() {
     assert!(made.contains("Archive/Plans"), "{made}");
     let _ = server.stop().await;
 }
+
+/// `move_node` is judged as the explorer judges a drop before anything is
+/// sent, says what else a move does, and takes several nodes; `delete_node`
+/// asks `can_delete` first.
+#[tokio::test]
+async fn moves_and_deletes_are_judged_before_they_are_sent() {
+    use pimble_api::plan;
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = PimbleServer::with_config(ServerConfig {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        replicas_dir: Some(dir.path().join("replicas")),
+        agents_path: Some(dir.path().join("agents.json")),
+        ..Default::default()
+    });
+    server.start().await.expect("server starts");
+    let url = format!("http://{}", server.addr());
+    let service = PimbleClient::connect(&url).await.unwrap();
+    let (notes, notes_root) = service.create_store(dir.path().join("notes.pimble"), "Notes").await.unwrap();
+    let (archive, archive_root) = service.create_store(dir.path().join("archive.pimble"), "Archive").await.unwrap();
+    let pimble = Pimble::new(Arc::new(Connection::with_client(PimbleClient::connect(&url).await.unwrap())));
+
+    pimble.create_node(p(json!({ "parent": "Notes", "title": "Trips" }))).await.unwrap();
+    pimble.create_node(p(json!({ "parent": "Notes/Trips", "title": "Moab" }))).await.unwrap();
+    pimble.create_node(p(json!({ "parent": "Notes/Trips", "title": "Zion" }))).await.unwrap();
+    pimble.create_node(p(json!({ "parent": "Notes", "title": "Inbox" }))).await.unwrap();
+
+    // Into itself, and beside a store.
+    let refused = pimble.move_node(p(json!({ "node": "Notes/Trips", "new_parent": "Notes/Trips/Moab" }))).await.unwrap_err();
+    assert_eq!(refused, plan::INTO_ITSELF);
+    let refused = pimble.move_node(p(json!({ "node": "Notes/Trips/Moab", "new_parent": "Notes", "after": "Archive" }))).await.unwrap_err();
+    assert_eq!(refused, plan::BESIDE_A_STORE);
+    // `after` names a child of the new parent.
+    let refused = pimble.move_node(p(json!({ "node": "Notes/Inbox", "new_parent": "Notes", "after": "Notes/Trips/Zion" }))).await.unwrap_err();
+    assert!(refused.contains("must be a child"), "{refused}");
+
+    // Several at once, in their order; where it already is, nothing.
+    let moved = pimble.move_node(p(json!({ "nodes": ["Notes/Trips/Moab", "Notes/Trips/Zion"], "new_parent": "Notes/Inbox" }))).await.unwrap();
+    assert!(moved.starts_with("2 items into Inbox."), "{moved}");
+    let listed = pimble.list_children(p(json!({ "node": "Notes/Inbox" }))).await.unwrap();
+    assert!(listed.find("Moab").unwrap() < listed.find("Zion").unwrap(), "{listed}");
+    let stays = pimble.move_node(p(json!({ "node": "Notes/Inbox/Zion", "new_parent": "Notes/Inbox" }))).await.unwrap();
+    assert!(stays.starts_with(plan::WHERE_IT_IS), "{stays}");
+
+    // Into another store: the answer says what else it does.
+    let moved = pimble.move_node(p(json!({ "node": "Notes/Inbox/Zion", "new_parent": "Archive" }))).await.unwrap();
+    assert!(moved.contains("A new node in Archive; it is deleted from Notes") && moved.contains("It has a new link"), "{moved}");
+
+    // A mount whose store is not open here.
+    service.create_mount(notes, notes_root, archive, archive_root, Some("Old".into())).await.unwrap();
+    service.close_store(archive).await.unwrap();
+    let refused = pimble.move_node(p(json!({ "node": "Notes/Trips", "new_parent": "Notes/Old" }))).await.unwrap_err();
+    assert_eq!(refused, plan::MOUNT_NOT_HERE);
+
+    // A reader may move and delete nothing, and is told so before anything is sent.
+    let created = service
+        .create_agent("Reader", vec![pimble_rpc::AgentGrant { store: notes, node: None, role: pimble_rpc::AgentRole::Reader }])
+        .await
+        .unwrap();
+    let reader = PimbleClient::connect_with_auth(&url, &pimble_core::AuthMethod::Bearer { token: created.key.clone() }).await.unwrap();
+    let reader = Pimble::new(Arc::new(Connection::with_client(reader)));
+    let refused = reader.move_node(p(json!({ "node": "Notes/Inbox/Moab", "new_parent": "Notes/Trips" }))).await.unwrap_err();
+    assert_eq!(refused, pimble_core::StoreAccess::READ_ONLY_REFUSAL);
+    let refused = reader.delete_node(p(json!({ "node": "Notes/Inbox/Moab" }))).await.unwrap_err();
+    assert_eq!(refused, pimble_core::StoreAccess::READ_ONLY_REFUSAL);
+    let _ = server.stop().await;
+}

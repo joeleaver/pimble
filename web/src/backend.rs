@@ -27,8 +27,8 @@
 //! browser between passes.
 
 use std::cell::Cell;
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use pimble_app::commands::process_command;
@@ -40,7 +40,17 @@ use wasm_bindgen_futures::spawn_local;
 use crate::api::{self, Session, TokenError};
 use crate::endpoints::{Endpoints, RECONNECT_MAX_MS, RECONNECT_MIN_MS};
 use crate::util::sleep_ms;
-use crate::vault::{Handled, VaultClient};
+use crate::routed::{self, Routed};
+use crate::vault::{Handled, VaultClient, VaultWire};
+use crate::vault_backend::{VaultBackend, WireTable};
+use pimble_api::router::BackendId;
+use pimble_api::rpc::{Connector, RpcBackend};
+use pimble_api::{ApiError, Router};
+
+/// The vault, shared between the loop (connecting, pulling, keys, repairs)
+/// and its backend (`crate::vault_backend`), which answers the calls the
+/// router sends it. Locked per step, never across a call into the router.
+type SharedVault = Arc<futures::lock::Mutex<VaultClient>>;
 
 /// How long the loop sleeps when there is nothing to do. One frame: a command
 /// posted by a keystroke is on the wire within about that long, and an idle tab
@@ -100,6 +110,71 @@ impl Subscriptions {
     }
 }
 
+/// The connections the router's backends answer through, as the loop last
+/// saw its endpoints (refreshed before every routed command): the
+/// session's, which serves every hosted store, and one per store served
+/// from its owner's computer, absent while that is down. A relayed store
+/// never falls back to the session's endpoint, which does not hold it.
+#[derive(Clone, Default)]
+pub struct Wires(Arc<Mutex<WireState>>);
+
+#[derive(Default)]
+struct WireState {
+    session: Option<Arc<PimbleClient>>,
+    relayed: HashSet<StoreId>,
+    stores: HashMap<StoreId, Arc<PimbleClient>>,
+}
+
+impl Wires {
+    fn refresh(&self, endpoints: &Endpoints) {
+        let connected = |c: &Arc<PimbleClient>| c.is_connected();
+        let relayed = relayed_stores(endpoints);
+        let mut state = self.0.lock().unwrap();
+        state.session = endpoints.client_at(&endpoints.session_url()).filter(connected);
+        state.stores = relayed.iter().filter_map(|id| Some((*id, endpoints.client_for(*id).filter(connected)?))).collect();
+        state.relayed = relayed.into_iter().collect();
+    }
+}
+
+impl WireTable for Wires {
+    fn wire(&self, store: StoreId) -> Option<Arc<dyn VaultWire>> {
+        let state = self.0.lock().unwrap();
+        let client = if state.relayed.contains(&store) { state.stores.get(&store) } else { state.session.as_ref() };
+        client.map(|c| c.clone() as Arc<dyn VaultWire>)
+    }
+}
+
+/// The plain stores' backend asks for the session's connection; the loop
+/// keeps it up, so a call never connects on its own.
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl Connector for Wires {
+    async fn client(&self) -> Result<Arc<PimbleClient>, ApiError> {
+        self.0.lock().unwrap().session.clone().ok_or_else(|| ApiError::Offline { sentence: "Pimble's server is not connected; try again in a moment.".into() })
+    }
+}
+
+/// The router over the page's two backends: the session's server for plain
+/// stores (the default), the vault for encrypted ones.
+struct Routes {
+    router: Router,
+    vault_id: BackendId,
+    wires: Wires,
+}
+
+impl Routes {
+    /// Keep the router's word about `store` current from what the account
+    /// and the loop say of it: which backend serves it, what the account may
+    /// change of it, whether its owner is away.
+    fn learn(&self, vault: &VaultClient, store: StoreId) {
+        if vault.is_encrypted(store) {
+            self.router.serve(store, self.vault_id);
+        }
+        self.router.set_access(store, vault.row_access(store));
+        self.router.set_away(store, vault.away_row(store));
+    }
+}
+
 /// Ask the backend to mint a fresh token and connect again.
 ///
 /// A token carries the grants the account had when it was minted, and
@@ -141,9 +216,15 @@ async fn run(
     let client_id = uuid::Uuid::new_v4().to_string();
     tracing::info!("Backend client ID: {}", client_id);
 
-    let mut vault = VaultClient::new(client_id.clone());
+    let wires = Wires::default();
+    let vault_backend = VaultBackend::new(VaultClient::new(client_id.clone()), Arc::new(wires.clone()));
+    let shared: SharedVault = vault_backend.shared();
+    let mut router = Router::new(RpcBackend::new(wires.clone()));
+    let vault_id = router.add(vault_backend);
+    let routes = Routes { router, vault_id, wires };
+
     let mut endpoints = Endpoints::from_session(&session);
-    vault.set_relayed(relayed_stores(&endpoints));
+    shared.lock().await.set_relayed(relayed_stores(&endpoints));
     let mut subscriptions = Subscriptions::default();
 
     loop {
@@ -168,7 +249,7 @@ async fn run(
                     // accepted since is a new endpoint to keep up, one given
                     // up is an endpoint let go.
                     endpoints.adopt(&session);
-                    vault.set_relayed(relayed_stores(&endpoints));
+                    shared.lock().await.set_relayed(relayed_stores(&endpoints));
                 }
                 Err(TokenError::Unauthorized) => {
                     tracing::warn!("The session is gone; going back to the login page");
@@ -182,72 +263,74 @@ async fn run(
             }
         }
 
-        // 2. Keep the session's endpoint up. It is the one the hosted stores
-        //    come from and the one everything else waits for.
-        let session_url = endpoints.session_url();
-        if !supervise(
-            &mut endpoints,
-            &session_url,
-            &mut vault,
-            &mut subscriptions,
-            &event_tx,
-            &signal_ui,
-            &client_id,
-        )
-        .await
-        {
-            continue;
-        }
+        // Steps 2 to 3c work on the vault directly; the lock is let go
+        // before any command is routed (step 4), whose backend takes it.
+        let mut ran_anything = {
+            let mut vault = shared.lock().await;
+            let vault = &mut *vault;
 
-        // 2b. Keep each relayed store's endpoint up too, without ever waiting
-        //     on one: a store served from its owner's computer is listed from
-        //     its own endpoint, at the start and after every token refresh,
-        //     and from the account's row of it while that endpoint is down.
-        let mut ran_anything =
-            supervise_relayed(&mut endpoints, &mut vault, &mut subscriptions, &event_tx, &signal_ui, &client_id).await;
-
-        // 3. Apply whatever the vault subscriptions delivered since the last
-        //    pass. The subscription task only forwards raw notifications;
-        //    decrypting and merging them needs the vault client itself, which
-        //    lives here.
-        for event in vault.pump() {
-            ran_anything = true;
-            emit(&event_tx, &signal_ui, described(&vault, event));
-        }
-
-        // 3b. Settle any tree whose merged updates have stopped arriving: the
-        //     repair is debounced behind them (`REPAIR_DEBOUNCE_MS` in
-        //     `crate::vault`), and what it writes is appended like an edit,
-        //     through the endpoint that serves the store.
-        for store_id in vault.repairs_due() {
-            let Some(client) = endpoints.client_for(store_id).filter(|c| c.is_connected()) else {
+            // 2. Keep the session's endpoint up. It is the one the hosted
+            //    stores come from and the one everything else waits for.
+            let session_url = endpoints.session_url();
+            if !supervise(&mut endpoints, &session_url, vault, &mut subscriptions, &event_tx, &signal_ui, &client_id).await {
                 continue;
-            };
-            for event in vault.repair(&client, store_id).await {
-                ran_anything = true;
-                emit(&event_tx, &signal_ui, described(&vault, event));
             }
-        }
 
-        // 3c. Ask again for the key of a share whose owner had not handed it
-        //     over yet. Every connection asks too (`open_listed` runs on each
-        //     one); this is what makes a tab left open notice on its own. The
-        //     same retry serves an open store that is owed something: the key
-        //     of a share in a whole store, or the wraps of a document whose
-        //     blob would not open (`KeyLook` in `crate::vault`).
-        for store_id in vault.key_retries_due() {
-            let Some(client) = endpoints.client_for(store_id).filter(|c| c.is_connected()) else {
-                continue;
-            };
-            for event in vault.retry_key(&client, store_id, &signal_ui).await {
+            // 2b. Keep each relayed store's endpoint up too, without ever
+            //     waiting on one: a store served from its owner's computer
+            //     is listed from its own endpoint, at the start and after
+            //     every token refresh, and from the account's row of it
+            //     while that endpoint is down.
+            let mut ran_anything =
+                supervise_relayed(&mut endpoints, vault, &mut subscriptions, &event_tx, &signal_ui, &client_id).await;
+
+            // 3. Apply whatever the vault subscriptions delivered since the
+            //    last pass. The subscription task only forwards raw
+            //    notifications; decrypting and merging them needs the vault
+            //    client itself, which lives here.
+            for event in vault.pump() {
                 ran_anything = true;
-                emit(&event_tx, &signal_ui, described(&vault, event));
+                emit(&event_tx, &signal_ui, described(vault, event));
             }
-        }
+
+            // 3b. Settle any tree whose merged updates have stopped
+            //     arriving: the repair is debounced behind them
+            //     (`REPAIR_DEBOUNCE_MS` in `crate::vault`), and what it
+            //     writes is appended like an edit, through the endpoint that
+            //     serves the store.
+            for store_id in vault.repairs_due() {
+                let Some(client) = endpoints.client_for(store_id).filter(|c| c.is_connected()) else {
+                    continue;
+                };
+                for event in vault.repair(&client, store_id).await {
+                    ran_anything = true;
+                    emit(&event_tx, &signal_ui, described(vault, event));
+                }
+            }
+
+            // 3c. Ask again for the key of a share whose owner had not
+            //     handed it over yet. Every connection asks too
+            //     (`open_listed` runs on each one); this is what makes a tab
+            //     left open notice on its own. The same retry serves an open
+            //     store that is owed something: the key of a share in a
+            //     whole store, or the wraps of a document whose blob would
+            //     not open (`KeyLook` in `crate::vault`).
+            for store_id in vault.key_retries_due() {
+                let Some(client) = endpoints.client_for(store_id).filter(|c| c.is_connected()) else {
+                    continue;
+                };
+                for event in vault.retry_key(&client, store_id, &signal_ui).await {
+                    ran_anything = true;
+                    emit(&event_tx, &signal_ui, described(vault, event));
+                }
+            }
+            ran_anything
+        };
 
         // 4. Run whatever the UI has posted. Drain the queue rather than
         //    taking one per pass, so a burst of edits does not spread over as
         //    many frames as it has commands.
+        let session_url = endpoints.session_url();
         while let Ok(cmd) = cmd_rx.try_recv() {
             ran_anything = true;
             // The desktop watchdog posts this; nothing does here, because the
@@ -255,16 +338,8 @@ async fn run(
             if matches!(cmd, BackendCommand::ConnectionLost { .. }) {
                 continue;
             }
-            dispatch(
-                &mut endpoints,
-                &mut vault,
-                &mut subscriptions,
-                cmd,
-                &event_tx,
-                &signal_ui,
-                &client_id,
-            )
-            .await;
+            let mut ctx = Web { endpoints: &mut endpoints, shared: &shared, routes: &routes, event_tx: &event_tx, signal_ui: &signal_ui, client_id: &client_id };
+            dispatch(&mut ctx, &mut subscriptions, cmd).await;
             if !endpoints.get(&session_url).is_some_and(|e| e.is_connected()) {
                 // Reconnect at the top of the next pass rather than running
                 // the rest of the queue into a dead socket.
@@ -345,6 +420,9 @@ async fn supervise(
 
     match proven {
         Ok((candidate, mut stores)) => {
+            // A store closed in this page stays closed until it is loaded
+            // again (`VaultClient::close`).
+            stores.retain(|store| !vault.is_closed(store.id));
             // Every encrypted store is opened — keys fetched, every document
             // fetched and decrypted — *before* the UI sees the list, so the
             // tree's first `getChildren` has documents to read rather than a
@@ -534,7 +612,7 @@ async fn supervise_relayed(
             Ok((candidate, mut stores)) => {
                 // Only the stores the session named at this endpoint: what
                 // else it may list is not this page's to take from it.
-                stores.retain(|store| served.contains(&store.id));
+                stores.retain(|store| served.contains(&store.id) && !vault.is_closed(store.id));
                 if let Some(c) = candidate.as_ref() {
                     // A share accepted since the session's endpoint last
                     // connected is in the account's list and not yet here
@@ -592,17 +670,25 @@ async fn supervise_relayed(
     ran_anything
 }
 
-/// One command: the vault client first, then the shared implementation, both
-/// against the endpoint that serves the store the command names.
-async fn dispatch(
-    endpoints: &mut Endpoints,
-    vault: &mut VaultClient,
-    subscriptions: &mut Subscriptions,
-    cmd: BackendCommand,
-    event_tx: &Sender<BackendEvent>,
-    signal_ui: &Arc<dyn Fn() + Send + Sync>,
-    client_id: &str,
-) {
+/// What a command is routed with: the endpoints, the vault, the router over
+/// the page's backends, and where events go.
+struct Web<'a> {
+    endpoints: &'a mut Endpoints,
+    shared: &'a SharedVault,
+    routes: &'a Routes,
+    event_tx: &'a Sender<BackendEvent>,
+    signal_ui: &'a Arc<dyn Fn() + Send + Sync>,
+    client_id: &'a str,
+}
+
+impl Web<'_> {
+    fn emit(&self, event: BackendEvent) {
+        emit(self.event_tx, self.signal_ui, event);
+    }
+}
+
+/// One command: the account's and the page's own first, then [`route`].
+async fn dispatch(ctx: &mut Web<'_>, subscriptions: &mut Subscriptions, cmd: BackendCommand) {
     // What the UI asks to watch, it asks once. The socket it was asked on is
     // replaced on every token refresh, so the ask is remembered and made again
     // on each new connection.
@@ -614,42 +700,14 @@ async fn dispatch(
     // Pimble server's, so it never reaches one.
     if let BackendCommand::CreateHostedStore { name, kind } = &cmd {
         let event = create_hosted_store(name, kind).await;
-        emit(event_tx, signal_ui, event);
-        return;
-    }
-
-    // Pictures in an encrypted store are a later wave: answered here, under
-    // the event the app waits for, before any server is asked. A plain
-    // store's go on to its server like every other command.
-    if let Some(event) = vault.answer_picture(&cmd) {
-        emit(event_tx, signal_ui, event);
-        return;
-    }
-
-    // A transplant between stores names two, so it is judged and routed here
-    // rather than by the single-`store_id` path every other command takes
-    // below (docs/MOVE_CONTRACT.md "Between stores").
-    if let BackendCommand::TransplantNode { from_store_id, node_id, to_store_id, new_parent_id, place } = cmd {
-        dispatch_transplant(
-            endpoints,
-            vault,
-            from_store_id,
-            node_id,
-            to_store_id,
-            new_parent_id,
-            place,
-            event_tx,
-            signal_ui,
-            client_id,
-        )
-        .await;
+        ctx.emit(event);
         return;
     }
 
     // Names are the account's (docs/PRESENCE_CONTRACT.md section 3): the
     // accounts service answers them, no Pimble server.
     if let Some(event) = names_command(&cmd).await {
-        emit(event_tx, signal_ui, event);
+        ctx.emit(event);
         return;
     }
 
@@ -657,7 +715,7 @@ async fn dispatch(
     // seals and syncs it itself (docs/DISCUSSIONS_CONTRACT.md section 8).
     if let BackendCommand::SyncPersonal { state, enabled, turn_on } = cmd {
         match crate::personal_sync::sync(&state, enabled, turn_on).await {
-            Ok((state, off)) => emit(event_tx, signal_ui, BackendEvent::PersonalSynced { state, off }),
+            Ok((state, off)) => ctx.emit(BackendEvent::PersonalSynced { state, off }),
             Err(e) => tracing::debug!("personal document not synced: {e}"),
         }
         return;
@@ -666,95 +724,121 @@ async fn dispatch(
     // An import is many commands, each routed exactly as the UI's own would
     // be (docs/IMPORT_CONTRACT.md).
     if let BackendCommand::Import { store_id, parent_id, format, name, files } = cmd {
-        let mut runner = Web { endpoints, vault, event_tx, signal_ui, client_id };
-        let event = pimble_app::import::import(&mut runner, store_id, parent_id, format, &name, &files).await;
-        emit(event_tx, signal_ui, event);
+        let event = pimble_app::import::import(ctx, store_id, parent_id, format, &name, &files).await;
+        ctx.emit(event);
         return;
     }
 
-    if let Some(event) = route(endpoints, vault, cmd, event_tx, signal_ui, client_id).await {
-        emit(event_tx, signal_ui, described(vault, event));
+    if let Some(event) = route(ctx, cmd).await {
+        let event = described(&*ctx.shared.lock().await, event);
+        ctx.emit(event);
     }
-}
-
-/// `route`, as `pimble_app::import` asks it.
-struct Web<'a> {
-    endpoints: &'a mut Endpoints,
-    vault: &'a mut VaultClient,
-    event_tx: &'a Sender<BackendEvent>,
-    signal_ui: &'a Arc<dyn Fn() + Send + Sync>,
-    client_id: &'a str,
 }
 
 impl pimble_app::import::Runner for Web<'_> {
     async fn run(&mut self, cmd: BackendCommand) -> Option<BackendEvent> {
-        route(self.endpoints, self.vault, cmd, self.event_tx, self.signal_ui, self.client_id).await
+        route(self, cmd).await
     }
 }
 
-/// Answer a command that names at most one store: from the vault client for
-/// an encrypted store, from the store's server for a plain one. What happens
-/// on the way (an endpoint found down) is emitted; the answer is returned.
-async fn route(
-    endpoints: &mut Endpoints,
-    vault: &mut VaultClient,
-    cmd: BackendCommand,
-    event_tx: &Sender<BackendEvent>,
-    signal_ui: &Arc<dyn Fn() + Send + Sync>,
-    client_id: &str,
-) -> Option<BackendEvent> {
+/// The stores a command names: a transplant's two, a search's, or the one
+/// every other command that names a store names.
+fn stores_of(cmd: &BackendCommand) -> Vec<StoreId> {
+    match cmd {
+        BackendCommand::TransplantNode { from_store_id, to_store_id, .. } => vec![*from_store_id, *to_store_id],
+        BackendCommand::Search { stores, .. } => stores.clone(),
+        other => crate::vault::store_id_of(other).into_iter().collect(),
+    }
+}
+
+/// Answer a command: through the router (`crate::routed`) where the API
+/// covers it, otherwise from the vault client for an encrypted store and
+/// from the store's server for a plain one. What happens on the way (an
+/// endpoint found down) is emitted; the answer is returned.
+async fn route(ctx: &mut Web<'_>, cmd: BackendCommand) -> Option<BackendEvent> {
     // Which server answers this command is decided by the store it names, not
     // by which connection happens to be open.
     let store_id = crate::vault::store_id_of(&cmd);
+    let stores = stores_of(&cmd);
 
-    // A store served from its owner's computer whose socket has died since
-    // the supervisor last looked: down, as of now. The supervisor tries it
-    // again on its next pass and says so if it is back.
-    if let Some(store_id) = store_id.filter(|id| endpoints.is_relayed(*id)) {
-        if !endpoints.client_for(store_id).is_some_and(|c| c.is_connected()) {
-            for event in vault.endpoint_down(&[store_id]) {
-                emit(event_tx, signal_ui, event);
+    let root = {
+        let mut vault = ctx.shared.lock().await;
+        // A store served from its owner's computer whose socket has died
+        // since the supervisor last looked: down, as of now. The supervisor
+        // tries it again on its next pass and says so if it is back.
+        for &id in &stores {
+            if ctx.endpoints.is_relayed(id) && !ctx.endpoints.client_for(id).is_some_and(|c| c.is_connected()) {
+                for event in vault.endpoint_down(&[id]) {
+                    ctx.emit(event);
+                }
             }
         }
-    }
+        // The router's word about each store, from the account's grants and
+        // the loop's view of its endpoint.
+        for &id in &stores {
+            ctx.routes.learn(&vault, id);
+        }
+        store_id.and_then(|id| vault.root_of(id))
+    };
 
     // A reader's write is refused here, before anything is asked of any
     // server: the answer would be this same sentence, and it is the same one
     // whether the store is encrypted or plain
-    // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles").
-    if let Some(event) = store_id.and_then(|id| vault.refuse_write(id, &cmd)) {
-        return Some(event);
+    // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"). A transplant's two
+    // stores are gated by the router itself.
+    if !matches!(cmd, BackendCommand::TransplantNode { .. }) {
+        if let Some(event) = store_id.and_then(|id| routed::gate(&ctx.routes.router, id, &cmd)) {
+            return Some(event);
+        }
     }
+
+    // The endpoints the command's stores are served by, connected (a
+    // relayed store's is the supervisor's to connect, on its backoff: never
+    // once per command), and the router's backends told which are up.
+    for &id in &stores {
+        if ctx.endpoints.is_relayed(id) {
+            continue;
+        }
+        let url = ctx.endpoints.url_for(id);
+        if !ctx.endpoints.client_at(&url).is_some_and(|c| c.is_connected()) {
+            if let Err(message) = ctx.endpoints.ensure_connected(&url).await {
+                tracing::warn!("Could not reach {}: {}", url, message);
+            }
+        }
+    }
+    ctx.routes.wires.refresh(ctx.endpoints);
+
+    let cmd = match routed::answer(&ctx.routes.router, ctx.routes.vault_id, cmd, |_| root).await {
+        Routed::Answered(mut events) => {
+            let last = events.pop();
+            for event in events {
+                ctx.emit(event);
+            }
+            return last;
+        }
+        Routed::Not(cmd) => cmd,
+    };
 
     // A store whose owner's computer is off is answered from what this page
     // holds of it, which may be nothing: there is no connection to ask, and
     // that is no error (docs/RELAY_CONTRACT.md, "The apps").
-    let cmd = match vault.handle_unreachable(cmd) {
+    let cmd = match ctx.shared.lock().await.handle_unreachable(cmd) {
         Handled::Yes(event) => return event,
-        Handled::Several(events) => {
-            for event in events {
-                emit(event_tx, signal_ui, event);
-            }
-            return None;
-        }
         Handled::No(cmd) => cmd,
     };
 
     let url = match store_id {
-        Some(store_id) => endpoints.url_for(store_id),
-        None => endpoints.session_url(),
+        Some(store_id) => ctx.endpoints.url_for(store_id),
+        None => ctx.endpoints.session_url(),
     };
-
     let live = match store_id {
-        Some(store_id) => endpoints.client_for(store_id),
-        None => endpoints.client_at(&url),
+        Some(store_id) => ctx.endpoints.client_for(store_id),
+        None => ctx.endpoints.client_at(&url),
     };
     let client = match live.filter(|c| c.is_connected()) {
         Some(client) => Some(client),
-        // A relayed store's endpoint is `supervise_relayed`'s to connect, on
-        // its backoff: never once per command.
-        None if store_id.is_some_and(|id| endpoints.is_relayed(id)) => None,
-        None => match endpoints.ensure_connected(&url).await {
+        None if store_id.is_some_and(|id| ctx.endpoints.is_relayed(id)) => None,
+        None => match ctx.endpoints.ensure_connected(&url).await {
             Ok(client) => Some(client),
             Err(message) => {
                 tracing::warn!("Could not reach {}: {}", url, message);
@@ -764,117 +848,15 @@ async fn route(
     };
 
     let cmd = match client.as_ref() {
-        Some(connected) => match vault.handle(connected, cmd, signal_ui).await {
+        Some(connected) => match ctx.shared.lock().await.handle(connected, cmd, ctx.signal_ui).await {
             Handled::Yes(event) => return event,
-            Handled::Several(events) => {
-                for event in events {
-                    emit(event_tx, signal_ui, event);
-                }
-                return None;
-            }
             Handled::No(cmd) => cmd,
         },
         None => cmd,
     };
 
     let mut client = client;
-    process_command(&mut client, cmd, event_tx, signal_ui, client_id).await
-}
-
-/// `TransplantNode` names two stores, which may be served by two different
-/// endpoints, so it never goes through [`dispatch`]'s single-`store_id`
-/// routing (docs/MOVE_CONTRACT.md "Between stores"). Refused first, the same
-/// way and with the same sentences as any other write
-/// (`VaultClient::refuse_write`, which judges a store from the account's
-/// grants alone and does not need it held here); then routed by what kind of
-/// store each side is: both encrypted is the vault client's, in the page,
-/// between the two endpoints that serve them; one of each is refused with a
-/// sentence, since the two are not one operation yet; both plain is the
-/// hosted server's, exactly as every other plain-store write reaches it,
-/// and refused with a sentence when two servers serve the two stores (a
-/// server plants only into a store it holds).
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_transplant(
-    endpoints: &mut Endpoints,
-    vault: &mut VaultClient,
-    from_store_id: StoreId,
-    node_id: pimble_core::NodeId,
-    to_store_id: StoreId,
-    new_parent_id: pimble_core::NodeId,
-    place: pimble_core::Place,
-    event_tx: &Sender<BackendEvent>,
-    signal_ui: &Arc<dyn Fn() + Send + Sync>,
-    client_id: &str,
-) {
-    let cmd = BackendCommand::TransplantNode { from_store_id, node_id, to_store_id, new_parent_id, place };
-
-    // A relayed store's socket may have died since the supervisor last
-    // looked, exactly as the single-`store_id` path checks before its own
-    // `refuse_write` in `dispatch`, above: freshen `owner_offline` for both
-    // sides so the refusal below is not stale.
-    for id in [from_store_id, to_store_id] {
-        if endpoints.is_relayed(id) && !endpoints.client_for(id).is_some_and(|c| c.is_connected()) {
-            for event in vault.endpoint_down(&[id]) {
-                emit(event_tx, signal_ui, event);
-            }
-        }
-    }
-
-    if let Some(event) = vault.refuse_write(from_store_id, &cmd).or_else(|| vault.refuse_write(to_store_id, &cmd)) {
-        emit(event_tx, signal_ui, event);
-        return;
-    }
-
-    let from_vault = vault.is_encrypted(from_store_id);
-    let to_vault = vault.is_encrypted(to_store_id);
-
-    if let Some(event) = crate::vault::refuse_mixed_transplant(from_vault, to_vault) {
-        emit(event_tx, signal_ui, event);
-        return;
-    }
-
-    if from_vault && to_vault {
-        let from_url = endpoints.url_for(from_store_id);
-        let to_url = endpoints.url_for(to_store_id);
-        let from_client = match endpoints.ensure_connected(&from_url).await {
-            Ok(c) => c,
-            Err(message) => {
-                emit(event_tx, signal_ui, BackendEvent::Error { message: format!("Could not reach {from_url}: {message}") });
-                return;
-            }
-        };
-        let to_client = match endpoints.ensure_connected(&to_url).await {
-            Ok(c) => c,
-            Err(message) => {
-                emit(event_tx, signal_ui, BackendEvent::Error { message: format!("Could not reach {to_url}: {message}") });
-                return;
-            }
-        };
-        let event = vault
-            .transplant_node(&from_client, &to_client, from_store_id, node_id, to_store_id, new_parent_id, place)
-            .await;
-        emit(event_tx, signal_ui, event);
-        return;
-    }
-
-    // Both plain: the server does it, through whichever endpoint serves the
-    // node's own store, as every other write on it does. It plants only into
-    // a store it holds, so two endpoints are refused before anything is sent.
-    let url = endpoints.url_for(from_store_id);
-    if let Some(event) = crate::vault::refuse_split_transplant(&url, &endpoints.url_for(to_store_id)) {
-        emit(event_tx, signal_ui, event);
-        return;
-    }
-    let mut client = match endpoints.ensure_connected(&url).await {
-        Ok(c) => Some(c),
-        Err(message) => {
-            emit(event_tx, signal_ui, BackendEvent::Error { message: format!("Could not reach {url}: {message}") });
-            return;
-        }
-    };
-    if let Some(event) = process_command(&mut client, cmd, event_tx, signal_ui, client_id).await {
-        emit(event_tx, signal_ui, described(vault, event));
-    }
+    process_command(&mut client, cmd, ctx.event_tx, ctx.signal_ui, ctx.client_id).await
 }
 
 /// Every `Store` the UI is handed names, for an encrypted store this page

@@ -38,6 +38,10 @@ pub enum ApiError {
     NotAvailable { sentence: String },
     /// No connection to the server, or it went away during the call.
     Offline { sentence: String },
+    /// The store is served from its owner's computer, which is off
+    /// (docs/RELAY_CONTRACT.md): it is read from what this client holds and
+    /// takes no change until that computer is back.
+    OwnerOffline { sentence: String },
     /// Any other error the server answered with, by its code.
     Server { code: i32, message: String },
     /// Something that should not happen did (a document that does not load).
@@ -59,6 +63,7 @@ impl ApiError {
             | ApiError::EncryptedStore { sentence }
             | ApiError::NotAvailable { sentence }
             | ApiError::Offline { sentence }
+            | ApiError::OwnerOffline { sentence }
             | ApiError::Failed { sentence } => sentence.clone(),
             ApiError::Server { message, .. } => message.clone(),
         }
@@ -85,6 +90,40 @@ impl ApiError {
 
     pub fn not_found(sentence: impl Into<String>) -> Self {
         ApiError::NotFound { sentence: sentence.into() }
+    }
+
+    pub fn not_available(sentence: impl Into<String>) -> Self {
+        ApiError::NotAvailable { sentence: sentence.into() }
+    }
+
+    /// What a Pimble server answers when a store operation fails or is
+    /// refused (`pimble_rpc::to_rpc_error` over a `pimble_store::StoreError`:
+    /// code `-32000` and the error's words). A backend that answers the same
+    /// operations itself (the browser's vault) answers with exactly this, so
+    /// a caller sees one error whichever backend served the store; the day
+    /// the server gives these codes of their own (decision 9) this is the
+    /// one place that changes with it.
+    pub fn store_error(message: impl Into<String>) -> Self {
+        ApiError::Server { code: -32000, message: message.into() }
+    }
+
+    /// `StoreError::InvalidOperation`, as the server answers it.
+    pub fn invalid_operation(what: impl std::fmt::Display) -> Self {
+        Self::store_error(format!("Invalid operation: {what}"))
+    }
+
+    /// `StoreError::NodeNotFound`, as the server answers it.
+    pub fn node_not_found(node: pimble_core::NodeId) -> Self {
+        Self::store_error(format!("Node not found: {node}"))
+    }
+
+    /// A move `Tree::check_move` refused, as the server's `moveNode` and
+    /// `moveNodes` answer it (through `StoreError::from(MoveRefused)`).
+    pub fn of_move(refused: pimble_crdt::MoveRefused) -> Self {
+        match refused {
+            pimble_crdt::MoveRefused::NotFound(id) => Self::node_not_found(id),
+            other => Self::invalid_operation(other),
+        }
     }
 
     pub(crate) fn failed(sentence: impl Into<String>) -> Self {

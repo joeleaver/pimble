@@ -256,12 +256,60 @@ rows and a `Place`. Decision 5's answer for mounts is in: every creation on a ro
 through `create_parent` (the toolbar's "+" too, on the selected store's row), so "New
 Node" on a mount row and "Paste Mount Here" on one now go to the mount's source, and
 "Paste Mount Here" checks access.
-Deleting from a row's menu is all or none, like Delete in the tree. Not wired yet:
-the MCP's `move_node` (after wave 2 lands).
+Deleting from a row's menu is all or none, like Delete in the tree. `pimble-api`
+implements `TreeView` over its held documents (`tree_view.rs`: it holds the nodes, the
+target, a mount's source and their ancestors, then judges), and `Pimble::create_parent`,
+`plan_move`, `move_nodes`, `move_node` and `can_delete` go through it, so the MCP's
+`move_node` (several nodes with `nodes`) and `delete_node` refuse what the explorer
+refuses, with its sentences, before anything is sent.
 
 **Wave 4, the vault behind the trait.** `web/src/vault.rs` becomes the `Pimble` vault
 implementation; the `Router` composes it with RPC; `dispatch_transplant`,
 `refuse_write`, `handle_unreachable` move into the router.
+
+Built 2026-11-02. `Backend::capabilities(store) -> StoreCapabilities` (encrypted,
+mounts, pictures, sync links, semantic search, index rebuild; a provided method whose
+answer is `StoreCapabilities::SERVER`), `ApiError::OwnerOffline`, and
+`ApiError::store_error`/`invalid_operation`/`node_not_found`/`of_move`, the words a
+server answers a store operation with (code `-32000` until the server gives them codes
+of their own), so a backend that answers the same operations itself answers the same
+errors. `pimble_api::Router` (`router.rs`) is a `Backend` over several: `serve(store,
+backend)`, the write gate (`set_access`, `gate(store, Write::{Structure, Discussion,
+Content})`: a reader's writes, a commenter's that are not a discussion's, anything but
+an on-screen edit while the owner is away), a store whose owner's computer is off
+(`set_away(store, row)`: every write but content refused with `OWNER_OFFLINE_REFUSAL`,
+nodes handed out to be read, a store held nowhere answered as an empty folder), the
+transplant (both sides gated; an encrypted and a plain store, or two backends, refused
+with `MIXED_`/`SPLIT_TRANSPLANT_REFUSAL`), and search (each store to its own backend,
+merged by score: a plain store is no longer searched through an encrypted store's
+endpoint). The browser's vault is `web/src/vault_backend.rs` `VaultBackend` (the vault
+behind an async lock the backend loop shares, a `WireTable` naming each store's
+connection; the vault's I/O is the `VaultWire` trait, `PimbleClient` in the page, logs
+in memory in the tests); its capabilities are all "no" but `encrypted`, and pictures are
+`NotAvailable` rather than faked. The web routes through the router (`web/src/routed.rs`,
+the `BackendCommand` adapter): for an encrypted store `GetChildren`, `GetNode`,
+`CreateNode`, `CreateAttachment`, `ListAttachments`, `DeleteNode`, `MoveNode`,
+`MoveNodes`, `UndeleteNode`, `ListDeleted`, `ResolveLink`, `BroadcastChanges`,
+`ApplyUpdate`, `PutBlob`, `GetBlob`, `RebuildIndex`; every `TransplantNode`; and a
+`Search` naming an encrypted store. Every store's writes pass the router's gate first,
+plain ones included. Still the vault's commands (wave 5, with the app): rename and
+appearance (to become `Pimble::edit`), discussions listed, ancestors, reconcile,
+subscriptions and presence, `GetStoreSync` (the store's status: access, relay side,
+owner away; its `sync_links` capability says no link), `CloseStore`; a plain store's
+other commands still go through `process_command`. `VaultBackend` answers
+`subscribe`, `who_am_i` and `publish_presence` with `NotAvailable` until then (the vault
+pumps its changes as `BackendEvent`s). Behavior changes: `CloseStore` on an encrypted
+store closes it in the page (it answered "not available"); `RebuildIndex` on one answers
+a sentence instead of "rebuilt, 0" (the app never sends it); errors read as `ApiError`
+sentences; a commenter's picture is refused with the comment-only sentence; an edit made
+while the hosted server's connection is down is kept and sent on reconnect; a delete of
+the root and a move refused in an encrypted store use the server's words. The
+conformance suite is `pimble_api::conformance` (feature `conformance`): create at each
+place, fetch, the one write, sync, move, `moveNodes` order and dedupe, move refusals,
+delete, the deleted list, undelete, the root refused, links, capabilities stated; it
+passes against `RpcBackend` over a real server and behind a `Router`
+(`crates/pimble-api/tests/conformance.rs`) and against `VaultBackend` alone and behind a
+`Router` (`web/src/vault_backend/tests.rs`).
 
 **Wave 5, the app onto the API.** `AppStore`'s server mirror becomes a reactive view of the
 API's held documents and change stream; `DocSession` replaces the five session copies;

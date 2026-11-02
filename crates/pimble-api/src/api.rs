@@ -18,7 +18,7 @@ use pimble_core::{node_types, BlobId, BlobUrl, DeletedNode, Node, NodeId, Place,
 use pimble_crdt::NodeDoc;
 use pimble_rpc::{BoardPresence, SearchResultItem};
 
-use crate::backend::{Backend, MaybeSend, Moved, NodeInit, StoreChange};
+use crate::backend::{Backend, MaybeSend, NodeInit, StoreChange};
 use crate::held::Held;
 use crate::identity::Me;
 use crate::presence::{PresenceFrames, Whereabouts, AGENT_TTL_MS};
@@ -552,17 +552,6 @@ impl Pimble {
 
     // ── Structure ────────────────────────────────────────────────────────
 
-    /// Where something made or moved "under" `addr` goes: a mount's source
-    /// (open decision 5: every creation path, discussions and moves too),
-    /// anything else itself.
-    pub async fn create_parent(&self, addr: Addr) -> Result<Addr, ApiError> {
-        let node = self.held_node(addr).await?;
-        Ok(match node.mount_ref() {
-            Some(mount) => Addr { store: mount.source_store, node: mount.source_node },
-            None => addr,
-        })
-    }
-
     /// Make a node from `init` (a [`crate::recipes`] recipe) under `parent`,
     /// at `place`, in the one `createNode` that makes it.
     pub async fn create(&self, parent: Addr, place: Place, init: NodeInit) -> Result<Addr, ApiError> {
@@ -573,7 +562,7 @@ impl Pimble {
 
     /// Make an attachment of `host` (a discussion on it) from `init`.
     pub async fn create_attached(&self, host: Addr, init: NodeInit) -> Result<Addr, ApiError> {
-        let host = self.create_parent(host).await?;
+        let host = self.attachment_host(host).await?;
         let node = self.backend.create_attachment(host.store, host.node, init).await?;
         Ok(Addr { store: host.store, node })
     }
@@ -581,16 +570,12 @@ impl Pimble {
     /// Move a node under `parent` (a mount's source for a mount) at
     /// `place`: within its store a move, into another a transplant. A move
     /// out of a share or a store gives the node a new id
-    /// (docs/MOVE_CONTRACT.md).
+    /// (docs/MOVE_CONTRACT.md). Planned first ([`Pimble::plan_move`]), so it
+    /// is refused as the app refuses it; a node already there stays.
     pub async fn move_node(&self, node: Addr, parent: Addr, place: Place) -> Result<MovedTo, ApiError> {
-        let parent = self.create_parent(parent).await?;
-        let Moved { node: id, left_shares } = if parent.store == node.store {
-            self.backend.move_node(node.store, node.node, parent.node, place).await?
-        } else {
-            self.backend.transplant(node.store, node.node, parent.store, parent.node, place).await?
-        };
-        let addr = Addr { store: parent.store, node: id };
-        Ok(MovedTo { addr, new_link: addr != node, left_shares: left_shares.len() })
+        let plan = self.plan_move(&[node], parent, place).await?;
+        let moved = self.move_nodes(&plan).await?;
+        Ok(moved.into_iter().next().unwrap_or(MovedTo { addr: node, new_link: false, left_shares: 0 }))
     }
 
     /// Delete a node and its subtree (a tombstone; [`Pimble::undelete`]).

@@ -22,13 +22,20 @@ pub mod identity;
 pub mod names;
 pub mod presence;
 pub mod recipes;
+pub mod router;
 pub mod rpc;
+#[cfg(feature = "conformance")]
+pub mod conformance;
+mod tree_view;
 
 pub use api::{now, Change, Edited, MovedTo, Pimble, Walked};
 pub use backend::{Backend, MaybeSend, MaybeSync, Moved, NodeInit, StoreChange};
+pub use backend::StoreCapabilities;
 pub use error::ApiError;
+pub use router::Router;
 pub use identity::Me;
 pub use names::label;
+pub use pimble_core::plan;
 
 use pimble_core::{NodeId, PimbleUrl, StoreId};
 

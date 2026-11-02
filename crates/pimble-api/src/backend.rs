@@ -80,9 +80,52 @@ pub struct NodeInit {
     pub custom: Vec<(String, serde_json::Value)>,
 }
 
+/// What a store can do where a backend reaches it (docs/API_CONTRACT.md
+/// decision 10). Said rather than faked: a caller offers what works and
+/// explains what does not, instead of reading an answer made up to look
+/// like success (the browser's vault once answered "index rebuilt, 0
+/// nodes" for an index that does not exist).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreCapabilities {
+    /// The store's content is ciphertext wherever it is not decrypted by
+    /// this client; nothing moves between it and a plain store.
+    pub encrypted: bool,
+    /// A mount can be made in it.
+    pub mounts: bool,
+    /// Pictures can be stored in it and shown from it (blobs).
+    pub pictures: bool,
+    /// It can be linked to a store on another server and kept in step.
+    pub sync_links: bool,
+    /// Search may be asked to find by meaning as well as by words.
+    pub semantic_search: bool,
+    /// It has a search index that can be rebuilt.
+    pub index_rebuild: bool,
+}
+
+impl StoreCapabilities {
+    /// A store a Pimble server holds: everything is there to ask for, and
+    /// the server answers for itself (a search without its model falls
+    /// back to words; a sync link is for a principal allowed to make one).
+    pub const SERVER: StoreCapabilities = StoreCapabilities {
+        encrypted: false,
+        mounts: true,
+        pictures: true,
+        sync_links: true,
+        semantic_search: true,
+        index_rebuild: true,
+    };
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait Backend: MaybeSend + MaybeSync {
+    /// What `store` can do through this backend. A Pimble server's stores
+    /// can do everything it offers, which is the answer unless a backend
+    /// says otherwise.
+    fn capabilities(&self, _store: StoreId) -> StoreCapabilities {
+        StoreCapabilities::SERVER
+    }
+
     /// The stores this principal may read.
     async fn list_stores(&self) -> Result<Vec<Store>, ApiError>;
 

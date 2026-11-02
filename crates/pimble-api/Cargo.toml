@@ -22,7 +22,14 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 
+[features]
+# The conformance suite (docs/API_CONTRACT.md section 4), for the tests of
+# every backend: this crate's own and the browser's vault.
+conformance = []
+
 [dev-dependencies]
+# The suite, for this crate's own tests.
+pimble-api = { path = ".", features = ["conformance"] }
 uuid = { workspace = true }
 pimble-server = { workspace = true }
 tokio = { workspace = true }
