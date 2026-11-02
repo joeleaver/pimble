@@ -4,7 +4,7 @@
 //! (store open/close, children loaded, node moved) bump `tree_structure_version`.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use pimble_core::Node;
 
 use pimble_core::{LinkResolution, NodeId, PimbleUrl, Store, StoreId, MAX_LINK_HOPS};
 use rinch::prelude::*;
@@ -237,7 +237,7 @@ fn register_opened_store(store: AppStore, tree_state: UseTreeReturn, opened_stor
     store.upsert_store(opened_store.clone());
     apply_roots_change(store, tree_state, store_id, roots_change);
     if access_changed {
-        refetch_held_nodes(store, store_id);
+        rejudge(store, store_id);
     }
 
     for &root_id in &roots {
@@ -292,80 +292,204 @@ fn register_opened_store(store: AppStore, tree_state: UseTreeReturn, opened_stor
     store.bump_tree_structure();
 }
 
-/// Exact refetch (docs/history/HARDENING_CONTRACT.md "B: app"): refetch
-/// `(changed_store, parent_id)`'s children list if it is loaded, plus every
-/// mount (in any store) whose `mount_ref` source is exactly that pair and
-/// whose own children are loaded (decision 6 of SYNC_CONTRACT: no new
-/// server-side fan-out for mounts — the client does this itself). Each
-/// answer arrives as `ChildrenLoaded`. Used for every structural
-/// notification kind, since each one now names every parent it touched.
-fn refetch_parent_children(store: AppStore, changed_store: StoreId, parent_id: NodeId) {
-    if store.has_children_loaded(changed_store, parent_id) {
-        store.send(BackendCommand::GetChildren { store_id: changed_store, node_id: parent_id });
-    } else if store.get_node_signal(changed_store, parent_id).is_some() {
-        // A row that was never opened still says whether it can be: its
-        // node's own `children`. When the first child of such a folder turns
-        // up after the folder's own change did (a document made elsewhere,
-        // readable here only once its key wraps had been fetched), nothing
-        // else refreshes the row, and it stays without a chevron, its child
-        // out of reach (found in the browser, 2026-09-21).
-        store.send(BackendCommand::GetNode { store_id: changed_store, node_id: parent_id });
-    }
-    for (mount_store, mount_node) in store.mounts_sourced_from_node(changed_store, parent_id) {
-        if store.has_children_loaded(mount_store, mount_node) {
-            store.send(BackendCommand::GetChildren { store_id: mount_store, node_id: mount_node });
-        }
+/// What this device may do in `store_id` changed (a role, a read-only root,
+/// as the store's row or its sync answer says now), and each node carries
+/// the server's judgement of itself (`Node::access`), which no document
+/// says: the API asks it again for every node the window shows of the
+/// store, in one call, and the answer is `Shown` like any other.
+fn rejudge(store: AppStore, store_id: StoreId) {
+    let node_ids = store.shown_node_ids(store_id);
+    if !node_ids.is_empty() {
+        store.send(BackendCommand::Rejudge { store_id, node_ids });
     }
 }
 
-/// Fetch again everything the app holds of `store_id`, because what this
-/// device may change there has changed and each node carries the server's
-/// judgement of itself (`Node::access`): every loaded children list with
-/// nodes of the store in it (its own, and a mount's that shows them from
-/// another store), each root the store row shows (a share's root is in no
-/// list this device holds), and the document in each pane's editor, which may
-/// have been opened from a search hit and be in no loaded list at all. The
-/// answers arrive as `ChildrenLoaded` and `NodeLoaded` like any other; a
-/// `NodeLoaded` for the document being edited updates the node and leaves
-/// the session alone.
-fn refetch_held_nodes(store: AppStore, store_id: StoreId) {
-    for (list_store, parent_id) in store.loaded_lists_holding(store_id) {
-        store.send(BackendCommand::GetChildren { store_id: list_store, node_id: parent_id });
+/// Whether `node`'s row would draw differently from the cached copy: the
+/// row snapshots its icon, colours, share marker and access at render time
+/// (the access as its menu's disabled items), and takes its chevron from
+/// whether the node lists children, so (unlike a title or content change)
+/// a change to any of them needs the tree rebuilt to show. A node never
+/// cached before counts as changed when it carries any of them: a store's
+/// root node arrives after its row was first built.
+fn row_data_changed(store: AppStore, store_id: StoreId, node: &Node) -> bool {
+    let shared = node.metadata.share().is_some();
+    let has_row_data = node.metadata.icon().is_some()
+        || node.metadata.color().is_some()
+        || node.metadata.background().is_some()
+        || shared
+        || !node.access.allows_write();
+    untracked(|| {
+        store.node_data.with(|map| {
+            map.get(&(store_id, node.id)).map_or(has_row_data, |sig| {
+                sig.with(|cached| {
+                    cached.metadata.icon() != node.metadata.icon()
+                        || cached.metadata.color() != node.metadata.color()
+                        || cached.metadata.background() != node.metadata.background()
+                        || cached.metadata.share().is_some() != shared
+                        || cached.access != node.access
+                        || cached.children.is_empty() != node.children.is_empty()
+                })
+            })
+        })
+    })
+}
+
+/// Take one parent's children as the API holds them: `(list_store,
+/// parent_id)`'s list (a mount's own address for a mount's children) is
+/// set to them, each child cached under its own store, `children_store_id`.
+/// What the rows need next is asked for: a store not known yet (the server
+/// opened it to resolve a mount), the state of a mount not heard of yet,
+/// and the children of a row left expanded on this device. Answers whether
+/// the tree has to be rebuilt to show it (the list or a row's snapshot
+/// changed).
+fn take_children(store: AppStore, list_store: StoreId, parent_id: NodeId, children_store_id: StoreId, children: &[Node]) -> bool {
+    let child_pairs: Vec<(StoreId, NodeId)> = children.iter().map(|n| (children_store_id, n.id)).collect();
+    let mut changed = untracked(|| store.get_children_signal(list_store, parent_id).map_or(true, |sig| sig.with(|held| *held != child_pairs)));
+    if changed {
+        store.set_children(list_store, parent_id, child_pairs);
     }
-    let mut singles = store.shown_roots(store_id);
-    for active in store.edited_nodes().into_iter().filter(|active| active.store_id == store_id) {
-        if !singles.contains(&active.node_id) {
-            singles.push(active.node_id);
+
+    let children_store_known = untracked(|| store.store_ids.with(|ids| ids.contains(&children_store_id)));
+    if !children_store_known {
+        tracing::info!("Unknown store {:?} in a children list; requesting store list", children_store_id);
+        store.send(BackendCommand::ListStores);
+    }
+
+    for child in children {
+        changed |= row_data_changed(store, children_store_id, child);
+        store.track_mount_info(children_store_id, child);
+        store.upsert_node(children_store_id, child.clone());
+        // A row left expanded on this device opens again: its children are
+        // fetched as soon as it is here.
+        if store.is_expanded(children_store_id, child.id) && !store.has_children_loaded(children_store_id, child.id) {
+            store.send(BackendCommand::GetChildren { store_id: children_store_id, node_id: child.id });
+        }
+        // A mount's state is the server's (derived from its source's link),
+        // asked once; its changes arrive as `MountStateChanged`.
+        if child.is_mount() && store.get_mount_signal(children_store_id, child.id).is_none_or(|m| untracked(|| m.with(|m| m.mount_state.is_none()))) {
+            store.send(BackendCommand::GetMountState { store_id: children_store_id, node_id: child.id });
         }
     }
-    for node_id in singles {
-        store.send(BackendCommand::GetNode { store_id, node_id });
+    // A link-to-a-node cell being typed into offers these.
+    crate::sheets::children_loaded(store, children_store_id, parent_id);
+    changed
+}
+
+/// What a change did to the rows and lists of a store's tree, as the API
+/// holds them now (`BackendEvent::Shown`, docs/API_CONTRACT.md wave 5): the
+/// one place the tree takes another device's change, this window's own, or
+/// an encrypted store's from its vault. Exactly what the change touched is
+/// updated: the rows of nodes this window shows (or a pane is waiting for),
+/// the lists this window has loaded (a store's shown roots always are: they
+/// are its row's children) and every loaded mount of one, and the subtrees
+/// that left. Nothing is fetched again.
+fn apply_view(store: AppStore, view: &pimble_api::View) {
+    let store_id = view.store;
+    let mut structural = false;
+    let roots = store.shown_roots(store_id);
+    for listed in &view.lists {
+        let mut lists = Vec::new();
+        if store.has_children_loaded(store_id, listed.parent) || roots.contains(&listed.parent) {
+            lists.push((store_id, listed.parent));
+        }
+        for (mount_store, mount_node) in store.mounts_sourced_from_node(store_id, listed.parent) {
+            if store.has_children_loaded(mount_store, mount_node) {
+                lists.push((mount_store, mount_node));
+            }
+        }
+        for (list_store, parent_id) in lists {
+            structural |= take_children(store, list_store, parent_id, listed.children_store, &listed.children);
+        }
+    }
+    for node in &view.nodes {
+        let shown = store.get_node_signal(store_id, node.id).is_some() || !store.panes_showing(store_id, node.id).is_empty();
+        if shown {
+            structural |= take_node(store, store_id, node);
+        }
+    }
+    for &gone in &view.gone {
+        // Out of every loaded list it was in, whether or not that list was
+        // read again (its parent may be one this window does not hold, or a
+        // mount elsewhere shows it), and everything cached under it, a pane
+        // showing any of it included.
+        let holding: Vec<Signal<Vec<(StoreId, NodeId)>>> =
+            untracked(|| store.children_of.with(|map| map.values().filter(|sig| sig.with(|c| c.contains(&(store_id, gone)))).copied().collect()));
+        for sig in holding {
+            sig.update(|children| children.retain(|&pair| pair != (store_id, gone)));
+        }
+        store.remove_subtree(store_id, gone);
+        structural = true;
+    }
+    if structural {
+        store.bump_tree_structure();
     }
 }
 
-/// Nodes of `store_id` the app already held came back with another access
-/// than the one held (`changed`). What made it so reaches what is under them
-/// too: a folder the owner moved from a root this account edits into one it
-/// reads changes what may be done with every document in it, and the
-/// notification for the move names only the two lists the folder moved
-/// between. So each changed node's loaded children list is fetched again
-/// (and those answers cascade the same way, stopping where nothing changed),
-/// and so is the open document when it is of this store, since it may be in
-/// no loaded list at all.
-fn refetch_below_changed_access(store: AppStore, store_id: StoreId, changed: &[NodeId]) {
-    if changed.is_empty() {
-        return;
-    }
-    for &node_id in changed {
-        if store.has_children_loaded(store_id, node_id) {
-            store.send(BackendCommand::GetChildren { store_id, node_id });
+/// Take one node as the API holds it: its row's signal, the formulas and
+/// discussions waiting on it, and every pane opened on it (the first time
+/// a pane's document arrives, its session starts here: the one path a
+/// document is opened through). Answers whether its row's snapshot changed,
+/// which needs the tree rebuilt to show.
+fn take_node(store: AppStore, store_id: StoreId, node: &Node) -> bool {
+    let node_id = node.id;
+    let content_bytes = &node.content;
+    store.track_mount_info(store_id, node);
+    let row_changed = row_data_changed(store, store_id, node);
+
+    // Data-only: updates the per-node signal, no tree rebuild.
+    store.upsert_node(store_id, node.clone());
+    // A formula in a sheet may name this node (its tables, its title).
+    crate::sheets::node_loaded(store);
+    // An inline discussion may be waiting for it.
+    crate::discussions::node_loaded(store, store_id, node_id, content_bytes);
+
+    // Every pane opened on this node.
+    for pane in store.panes_showing(store_id, node_id) {
+        if pane == store.focused() {
+            store.node_title.set(store.display_label(store_id, node_id));
+        }
+        // First load of the pane's document — start the editing/collab
+        // session. Guard against restarting an already-active session.
+        let state = store.pane(pane);
+        let already_editing = untracked(|| state.active_edit.get())
+            .map_or(false, |e| e.store_id == store_id && e.node_id == node_id);
+        let already_boarding = untracked(|| state.board.get())
+            .is_some_and(|b| b.store_id == store_id && b.node_id == node_id);
+        let already_sheeting = untracked(|| state.sheet.get())
+            .is_some_and(|b| b.store_id == store_id && b.node_id == node_id);
+        let already_discussing = untracked(|| state.discussion.get())
+            .is_some_and(|b| b.store_id == store_id && b.node_id == node_id);
+        if node.node_type == pimble_core::node_types::DISCUSSION && !already_discussing {
+            // A discussion (docs/DISCUSSIONS_CONTRACT.md).
+            state.show_editor.set(false);
+            state.show_board.set(false);
+            state.show_sheet.set(false);
+            state.show_discussion.set(true);
+            crate::discussions::start(store, pane, store_id, node_id, content_bytes);
+        }
+        if node.node_type == pimble_core::node_types::SHEET && !already_sheeting {
+            // A sheet node (docs/SHEETS_CONTRACT.md section 1).
+            state.show_editor.set(false);
+            state.show_board.set(false);
+            state.show_sheet.set(true);
+            crate::sheets::start(store, pane, store_id, node_id, content_bytes);
+        }
+        if node.node_type == pimble_core::node_types::BOARD && !already_boarding {
+            // A board node (docs/IMAGE_MARKUP_CONTRACT.md): the pane shows
+            // its board, its editor hidden.
+            state.show_editor.set(false);
+            state.show_board.set(true);
+            crate::boards::start(store, pane, store_id, node_id, content_bytes);
+        }
+        if node.node_type == pimble_core::node_types::DOCUMENT && !already_editing {
+            // `open_node` could not tell this was a document (a search hit
+            // the tree had not loaded), so the pane is still hidden: show
+            // it with the session.
+            state.show_editor.set(true);
+            start_editing(store, pane, store_id, node_id, content_bytes);
         }
     }
-    for active in store.edited_nodes() {
-        if active.store_id == store_id && !changed.contains(&active.node_id) {
-            store.send(BackendCommand::GetNode { store_id, node_id: active.node_id });
-        }
-    }
+    row_changed
 }
 
 /// What the explorer does about a change in the roots a share's replica
@@ -439,24 +563,6 @@ fn apply_roots_change(store: AppStore, tree_state: UseTreeReturn, store_id: Stor
     // The rows under the store row changed, and its own menu and badge
     // snapshot whether every share has ended.
     store.bump_tree_structure();
-}
-
-/// After a transition to `Synced`, refetch the children of every root the
-/// store shows if none are loaded yet — a freshly added remote store's
-/// documents arrive empty and only gain their children once the first
-/// reconcile lands (docs/SYNC_CONTRACT.md "B: app side"). A partial replica
-/// has one root per share, and each fills in the same way.
-fn refetch_root_if_empty(store: AppStore, store_id: StoreId) {
-    for root_id in store.shown_roots(store_id) {
-        let children_missing = untracked(|| {
-            store.get_children_signal(store_id, root_id)
-                .map(|sig| sig.with(|c| c.is_empty()))
-                .unwrap_or(true)
-        });
-        if children_missing {
-            store.send(BackendCommand::GetChildren { store_id, node_id: root_id });
-        }
-    }
 }
 
 /// What a `Live`/`Cached` mount state means for the tree, shared by the
@@ -724,7 +830,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         // `StoreSyncChanged` does, fetch what is held of it
                         // again, for each node's own `access`.
                         tracing::info!("Access to store {:?} changed: {:?}", s.id, s.access);
-                        refetch_held_nodes(store, s.id);
+                        rejudge(store, s.id);
                         store.bump_tree_structure();
                     }
                 }
@@ -732,217 +838,34 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
 
             BackendEvent::ChildrenLoaded { store_id, parent_id, children_store_id, children } => {
                 tracing::info!("Children loaded for {:?}: {} nodes (in store {:?})", parent_id, children.len(), children_store_id);
-                // A link-to-a-node cell being typed into offers these.
-                let sheet_choices = (*children_store_id, *parent_id);
-
-                // Each child's own canonical store is `children_store_id`
-                // (the mount's source store when `parent_id` is a mount
-                // point, `store_id` otherwise — decision 1).
-                let child_pairs: Vec<(StoreId, NodeId)> = children.iter().map(|n| (*children_store_id, n.id)).collect();
-
-                // Structural: children list changed
-                store.set_children(*store_id, *parent_id, child_pairs);
-
-                // The children's store might not be one we know about yet —
-                // the server may have opened it implicitly to resolve a mount
-                // (decision 4). Discover it via `listStores`.
-                let children_store_known = untracked(|| store.store_ids.with(|ids| ids.contains(children_store_id)));
-                if !children_store_known {
-                    tracing::info!("Unknown store {:?} in ChildrenLoaded; requesting store list", children_store_id);
-                    store.send(BackendCommand::ListStores);
-                }
-
-                // Collect mount node IDs so we can request their state
-                let mount_node_ids: Vec<NodeId> = children.iter()
-                    .filter(|child| child.is_mount())
-                    .map(|child| child.id)
-                    .collect();
-
-                // Upsert each child node (per-entity signal), keyed by its
-                // OWN canonical store.
-                let mut access_changed: Vec<NodeId> = Vec::new();
-                for child in children {
-                    let key = (*children_store_id, child.id);
-                    if store.get_node_signal(key.0, key.1).is_some() && store.node_held_access(key.0, key.1) != child.access {
-                        access_changed.push(child.id);
-                    }
-                    let should_update = untracked(|| {
-                        store.node_data.with(|map| {
-                            map.get(&key)
-                                .map_or(true, |sig| sig.with(|cached| child.metadata.modified_at >= cached.metadata.modified_at))
-                        })
-                    });
-                    if should_update {
-                        store.track_mount_info(*children_store_id, child);
-                        store.upsert_node(*children_store_id, child.clone());
-                    } else if let Some(sig) = store.get_node_signal(*children_store_id, child.id) {
-                        // The cached copy is the newer node, but what this
-                        // device may change of it is the server's judgement
-                        // at the moment it answered, and this answer is the
-                        // latest one (`Node::access`).
-                        if untracked(|| sig.with(|cached| cached.access != child.access)) {
-                            sig.update(|cached| cached.access = child.access);
-                        }
-                    }
-                }
-                refetch_below_changed_access(store, *children_store_id, &access_changed);
-
-                // A row left expanded on this device opens again: its
-                // children are fetched as soon as it is here.
-                for child in children {
-                    if store.is_expanded(*children_store_id, child.id) && !store.has_children_loaded(*children_store_id, child.id) {
-                        store.send(BackendCommand::GetChildren { store_id: *children_store_id, node_id: child.id });
-                    }
-                }
-
-                // Request mount state for any mount nodes (addressed in
-                // their own store).
-                for mount_node_id in mount_node_ids {
-                    store.send(BackendCommand::GetMountState {
-                        store_id: *children_store_id,
-                        node_id: mount_node_id,
-                    });
-                }
-
-                // Structural change
+                // Read from the documents the API holds, so it is current:
+                // each child is taken as it is, keyed by its own canonical
+                // store (the mount's source store when `parent_id` is a
+                // mount point, `store_id` otherwise, decision 1).
+                take_children(store, *store_id, *parent_id, *children_store_id, children);
                 store.bump_tree_structure();
-                crate::sheets::children_loaded(store, sheet_choices.0, sheet_choices.1);
             }
 
             BackendEvent::NodeLoaded { store_id, node } => {
                 tracing::info!("Node loaded: {:?} - {}", node.id, node.metadata.title);
-                let node_id = node.id;
-                let content_bytes = node.content.clone();
-                store.track_mount_info(*store_id, node);
-
-                // Whether the node's icon, colour, share marker or access
-                // changed against the cache: the row snapshots all four at
-                // render time (the access as its menu's disabled items), so
-                // that (unlike a title or content change) needs the tree
-                // rebuilt to show. A node never cached before counts as changed
-                // when it carries any of them — a store's root node arrives
-                // after its row was first built.
-                let shared = node.metadata.share().is_some();
-                let has_row_data = node.metadata.icon().is_some()
-                    || node.metadata.color().is_some()
-                    || node.metadata.background().is_some()
-                    || shared
-                    || !node.access.allows_write();
-                let row_data_changed = untracked(|| {
-                    store.node_data.with(|map| {
-                        map.get(&(*store_id, node_id)).map_or(has_row_data, |sig| {
-                            sig.with(|cached| {
-                                cached.metadata.icon() != node.metadata.icon()
-                                    || cached.metadata.color() != node.metadata.color()
-                                    || cached.metadata.background() != node.metadata.background()
-                                    || cached.metadata.share().is_some() != shared
-                                    || cached.access != node.access
-                                    // A row not opened yet takes its chevron
-                                    // from whether the node lists children.
-                                    || cached.children.is_empty() != node.children.is_empty()
-                            })
-                        })
-                    })
-                });
-
-                let access_changed = store.get_node_signal(*store_id, node_id).is_some()
-                    && store.node_held_access(*store_id, node_id) != node.access;
-
-                // Data-only: updates per-node signal, NO tree rebuild (except for
-                // a change to what the row snapshots, below).
-                store.upsert_node(*store_id, node.clone());
-                // A formula in a sheet may name this node (its tables, its title).
-                crate::sheets::node_loaded(store);
-                // An inline discussion may be waiting for it.
-                crate::discussions::node_loaded(store, *store_id, node_id, &content_bytes);
-                if access_changed {
-                    refetch_below_changed_access(store, *store_id, &[node_id]);
-                }
-                if row_data_changed {
+                if take_node(store, *store_id, node) {
                     store.bump_tree_structure();
                 }
+            }
 
-                // Every pane opened on this node.
-                for pane in store.panes_showing(*store_id, node_id) {
-                    if pane == store.focused() {
-                        store.node_title.set(store.display_label(*store_id, node_id));
-                    }
-                    // First load of the pane's document (its content just
-                    // arrived from GetNode) — start the editing/collab session.
-                    // Guard against restarting an already-active session.
-                    let state = store.pane(pane);
-                    let already_editing = untracked(|| state.active_edit.get())
-                        .map_or(false, |e| e.store_id == *store_id && e.node_id == node_id);
-                    let already_boarding = untracked(|| state.board.get())
-                        .is_some_and(|b| b.store_id == *store_id && b.node_id == node_id);
-                    let already_sheeting = untracked(|| state.sheet.get())
-                        .is_some_and(|b| b.store_id == *store_id && b.node_id == node_id);
-                    let already_discussing = untracked(|| state.discussion.get())
-                        .is_some_and(|b| b.store_id == *store_id && b.node_id == node_id);
-                    if node.node_type == pimble_core::node_types::DISCUSSION && !already_discussing {
-                        // A discussion (docs/DISCUSSIONS_CONTRACT.md).
-                        state.show_editor.set(false);
-                        state.show_board.set(false);
-                        state.show_sheet.set(false);
-                        state.show_discussion.set(true);
-                        crate::discussions::start(store, pane, *store_id, node_id, &content_bytes);
-                    }
-                    if node.node_type == pimble_core::node_types::SHEET && !already_sheeting {
-                        // A sheet node (docs/SHEETS_CONTRACT.md section 1).
-                        state.show_editor.set(false);
-                        state.show_board.set(false);
-                        state.show_sheet.set(true);
-                        crate::sheets::start(store, pane, *store_id, node_id, &content_bytes);
-                    }
-                    if node.node_type == pimble_core::node_types::BOARD && !already_boarding {
-                        // A board node (docs/IMAGE_MARKUP_CONTRACT.md): the
-                        // pane shows its board, its editor hidden.
-                        state.show_editor.set(false);
-                        state.show_board.set(true);
-                        crate::boards::start(store, pane, *store_id, node_id, &content_bytes);
-                    }
-                    if node.node_type == pimble_core::node_types::DOCUMENT && !already_editing {
-                        // `open_node` could not tell this was a document
-                        // (a search hit the tree had not loaded), so the
-                        // pane is still hidden: show it with the session.
-                        state.show_editor.set(true);
-                        start_editing(store, pane, *store_id, node_id, &content_bytes);
-                    }
-                }
+            BackendEvent::Shown { view } => {
+                tracing::debug!("Shown in {:?}: {} rows, {} lists, {} gone", view.store, view.nodes.len(), view.lists.len(), view.gone.len());
+                apply_view(store, view);
             }
 
             BackendEvent::NodeMoved { store_id, node_id, old_parent_id, new_parent_id } => {
                 tracing::info!("Node moved: {:?} from {:?} to {:?}", node_id, old_parent_id, new_parent_id);
-
-                // Update children_of for old parent
-                if let Some(old_sig) = store.get_children_signal(*store_id, *old_parent_id) {
-                    old_sig.update(|children| {
-                        children.retain(|&pair| pair != (*store_id, *node_id));
-                    });
-                }
-
-                // Update children_of for new parent (avoid nested borrow)
-                let new_key = (*store_id, *new_parent_id);
-                let new_parent_sig = store.get_children_signal(*store_id, *new_parent_id);
-                let new_pair = (*store_id, *node_id);
-                if let Some(sig) = new_parent_sig {
-                    sig.update(|children| {
-                        if !children.contains(&new_pair) {
-                            children.push(new_pair);
-                        }
-                    });
-                } else {
-                    let new_sig = Signal::new(vec![new_pair]);
-                    store.children_of.update(|map| {
-                        map.insert(new_key, new_sig);
-                    });
-                }
-
-                // Auto-expand the new parent so the moved node is visible.
-                // `MoveNode` is only ever sent from a drag-and-drop, whose
-                // `on_drop` records the exact (possibly mount-path-qualified)
-                // tree value it dropped onto — use that instead of
-                // reconstructing an unqualified value that would not match a
+                // The lists it moved between were shown just before this
+                // answer (`Shown`). What is left is to open the new parent so
+                // the moved node is visible. `MoveNode` is only ever sent from
+                // a drag-and-drop or the keyboard, whose drop records the
+                // exact (possibly mount-path-qualified) tree value it dropped
+                // onto: that, not an unqualified value that would not match a
                 // target reached only through a mount (decision 7).
                 store.expanded.update(|e| { e.insert((*store_id, *new_parent_id)); });
                 let is_root = store.root_node_id(*store_id)
@@ -954,16 +877,10 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         .unwrap_or_else(|| format!("node_{}_{}", store_id, new_parent_id));
                     tree_state.controller.expand(&expand_value);
                 }
-
-                // Re-fetch from server for authoritative data
-                store.backend.with(|b| {
-                    if let Some(backend) = b {
-                        backend.send(BackendCommand::GetChildren { store_id: *store_id, node_id: *old_parent_id });
-                        backend.send(BackendCommand::GetChildren { store_id: *store_id, node_id: *new_parent_id });
-                    }
-                });
-
-                // Structural change
+                if !store.has_children_loaded(*store_id, *new_parent_id) {
+                    // Opened for the first time: its list is loaded once.
+                    store.send(BackendCommand::GetChildren { store_id: *store_id, node_id: *new_parent_id });
+                }
                 store.bump_tree_structure();
             }
 
@@ -984,8 +901,12 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     tree_state.controller.set_cursor(&value);
                     tree_state.controller.set_selection([value.clone()]);
                 }
-                // Re-fetch parent's children so the new node appears (triggers ChildrenLoaded → bump)
-                store.send(BackendCommand::GetChildren { store_id: *store_id, node_id: parent });
+                // The list it went into was shown just before this answer
+                // (`Shown`) when it is loaded; one never loaded is loaded
+                // now, so the new row is there to move the cursor to.
+                if !store.has_children_loaded(*store_id, parent) && !store.shown_roots(*store_id).contains(&parent) {
+                    store.send(BackendCommand::GetChildren { store_id: *store_id, node_id: parent });
+                }
             }
 
             BackendEvent::AttachmentCreated { store_id, host_id, node_id, request } => {
@@ -1009,44 +930,27 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             }
 
             BackendEvent::NodeContentUpdated { store_id, node_id } => {
-                tracing::info!("Node content updated: {:?}/{:?}", store_id, node_id);
-                // Only re-fetch if this isn't a node some pane is opened on.
-                let is_selected = !store.panes_showing(*store_id, *node_id).is_empty();
-                if !is_selected {
-                    // Data-only: NodeLoaded will upsert_node without tree rebuild
-                    store.send(BackendCommand::GetNode { store_id: *store_id, node_id: *node_id });
-                }
-            }
-
-            BackendEvent::NodeRenamed { store_id, node_id } => {
-                tracing::info!("Node renamed: {:?}/{:?}", store_id, node_id);
-                // Data-only: NodeLoaded will upsert_node without tree rebuild.
-                // The per-node signal update triggers only that node's label Effect.
-                store.send(BackendCommand::GetNode { store_id: *store_id, node_id: *node_id });
+                // An answered write (`ApplyUpdate`), or an encrypted store's
+                // vault saying a document changed: what it did to the node's
+                // row arrives as `Shown`.
+                tracing::debug!("Node content updated: {:?}/{:?}", store_id, node_id);
             }
 
             BackendEvent::NodeTransplanted {
-                from_store_id, old_node_id, old_parent_id, to_store_id, node_id, new_parent_id, title, left_shares,
+                from_store_id, old_node_id, old_parent_id: _, to_store_id, node_id, new_parent_id, title, left_shares,
             } => {
                 tracing::info!(
                     "Node {:?}/{:?} transplanted to {:?}/{:?} under {:?}",
                     from_store_id, old_node_id, to_store_id, node_id, new_parent_id
                 );
 
-                // The store it left: exactly what `NodeDeleted` does — the
-                // old id is a tombstone now, gone from its old parent's list
-                // and everything cached under it.
-                if let Some(parent_sig) = store.get_children_signal(*from_store_id, *old_parent_id) {
-                    parent_sig.update(|children| {
-                        children.retain(|&pair| pair != (*from_store_id, *old_node_id));
-                    });
+                // Both stores' lists were shown just before this answer
+                // (`Shown`): the old id gone with everything under it, the
+                // new one where it landed. A list there never loaded is
+                // loaded now, so the person sees where it landed.
+                if !store.has_children_loaded(*to_store_id, *new_parent_id) && !store.shown_roots(*to_store_id).contains(new_parent_id) {
+                    store.send(BackendCommand::GetChildren { store_id: *to_store_id, node_id: *new_parent_id });
                 }
-                store.remove_subtree(*from_store_id, *old_node_id);
-
-                // The store it landed in: exactly what `NodeCreated` does —
-                // ask for the new parent's children again, whether or not
-                // they were ever loaded, so the person sees where it landed.
-                store.send(BackendCommand::GetChildren { store_id: *to_store_id, node_id: *new_parent_id });
 
                 // Each pane's editor follows the node it had open to its new
                 // id: a fresh collab session on the new document, the old one
@@ -1106,22 +1010,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 }
             }
             BackendEvent::NodeDeleted { store_id, node_id, parent_id } => {
-                tracing::info!("Node deleted: {:?}/{:?}", store_id, node_id);
-
-                // Remove from parent's children signal
-                if let Some(parent_sig) = store.get_children_signal(*store_id, *parent_id) {
-                    parent_sig.update(|children| {
-                        children.retain(|&pair| pair != (*store_id, *node_id));
-                    });
-                }
-
-                // The server deletes the whole subtree (item 10) — drop every
-                // cached descendant too, and clear the selection if it was
-                // anywhere inside.
-                store.remove_subtree(*store_id, *node_id);
-
-                // Structural change
-                store.bump_tree_structure();
+                // The list it left and the subtree that went with it were
+                // shown just before this answer (`Shown`).
+                tracing::info!("Node deleted: {:?}/{:?} from {:?}", store_id, node_id, parent_id);
             }
 
             BackendEvent::StoreClosed { store_id } => {
@@ -1156,16 +1047,14 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                         map.insert((*store_id, *node_id), new_sig);
                     });
                 }
-                // Re-fetch node and mount state
-                store.send(BackendCommand::GetNode { store_id: *store_id, node_id: *node_id });
+                // Its row and its parent's list were shown just before this
+                // answer (`Shown`); its state is the server's to say.
                 store.send(BackendCommand::GetMountState { store_id: *store_id, node_id: *node_id });
-
-                // Load the parent's children so the new mount shows up under
-                // it. Unconditional, like the `NodeCreated` answer: the
-                // `NodeCreated` notification's own refetch skips a parent
-                // whose children were never loaded, which is exactly the case
-                // when a mount is created under a collapsed folder.
-                store.send(BackendCommand::GetChildren { store_id: *store_id, node_id: *parent_id });
+                if !store.has_children_loaded(*store_id, *parent_id) && !store.shown_roots(*store_id).contains(parent_id) {
+                    // Made under a folder never opened: its list is loaded
+                    // once, so the mount is there when it opens.
+                    store.send(BackendCommand::GetChildren { store_id: *store_id, node_id: *parent_id });
+                }
 
                 // The "Mount Store..." picker's request just succeeded.
                 if untracked(|| store.mount_picker_target.get()).is_some() {
@@ -1216,75 +1105,22 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 tracing::info!("Remote store change: {:?} - {:?}", store_id, change_kind);
                 use pimble_rpc::StoreChangeKind;
                 match change_kind {
-                    StoreChangeKind::NodeCreated { parent_id, .. } => {
-                        refetch_parent_children(store, *store_id, *parent_id);
-                    }
-                    StoreChangeKind::NodeDeleted { node_id, parent_id } => {
-                        // Instant feedback ahead of the refetch below: drop
-                        // the node from its parent's loaded list right away.
-                        if let Some(parent_sig) = store.get_children_signal(*store_id, *parent_id) {
-                            parent_sig.update(|children| {
-                                children.retain(|&pair| pair != (*store_id, *node_id));
-                            });
-                        }
-                        // The server deletes the whole subtree (item 10); a
-                        // notification names only its root.
-                        store.remove_subtree(*store_id, *node_id);
-                        refetch_parent_children(store, *store_id, *parent_id);
-                        store.bump_tree_structure();
-                    }
-                    StoreChangeKind::NodeMoved { old_parent_id, new_parent_id, .. } => {
-                        refetch_parent_children(store, *store_id, *old_parent_id);
-                        refetch_parent_children(store, *store_id, *new_parent_id);
-                    }
+                    // What these did to the tree arrives as `Shown`, read
+                    // from the documents the API merged them into.
+                    StoreChangeKind::NodeCreated { .. }
+                    | StoreChangeKind::NodeDeleted { .. }
+                    | StoreChangeKind::NodeMoved { .. }
+                    | StoreChangeKind::MetadataUpdated { .. }
+                    | StoreChangeKind::ContentUpdated { .. }
+                    | StoreChangeKind::TreeStructure { .. } => {}
                     StoreChangeKind::AttachmentChanged { node_id, host_id, live } => {
                         crate::discussions::attachment_changed(store, *store_id, *host_id, *node_id, *live);
-                    }
-                    StoreChangeKind::MetadataUpdated { node_id } => {
-                        store.send(BackendCommand::GetNode {
-                            store_id: *store_id,
-                            node_id: *node_id,
-                        });
-                    }
-                    StoreChangeKind::ContentUpdated { node_id } => {
-                        // CRDT-edited nodes are synced by the subscription task directly.
-                        let is_active_crdt = store.is_editing(*store_id, *node_id);
-
-                        if !is_active_crdt {
-                            store.send(BackendCommand::GetNode {
-                                store_id: *store_id,
-                                node_id: *node_id,
-                            });
-                        }
-                    }
-                    StoreChangeKind::TreeStructure { node_ids } => {
-                        // Every listed id's own loaded children (it may be a
-                        // parent whose list changed) and its cached parent's
-                        // loaded children (it may have moved in or out of a
-                        // list) — `refetch_parent_children` covers mounts
-                        // sourced from each pair too. Collect the distinct
-                        // parent ids first: a full reconcile can list many
-                        // children of the same folder, and each parent must
-                        // be refetched once, not once per listed child.
-                        let mut parents: HashSet<NodeId> = HashSet::new();
-                        for &id in node_ids {
-                            parents.insert(id);
-                            if let Some(parent_id) = store.cached_parent_id(*store_id, id) {
-                                parents.insert(parent_id);
-                            }
-                        }
-                        for parent_id in parents {
-                            refetch_parent_children(store, *store_id, parent_id);
-                        }
                     }
                     StoreChangeKind::SyncStateChanged { state } => {
                         tracing::info!("Sync state of {:?}: {:?}", store_id, state);
                         // Carries only the state — keep whatever remote endpoint
                         // is already known (decision 6, docs/SYNC_CONTRACT.md).
                         store.update_sync_state(*store_id, state.clone());
-                        if matches!(state, pimble_core::SyncState::Synced { .. }) {
-                            refetch_root_if_empty(store, *store_id);
-                        }
                         // A link reads how the account holds the store each
                         // time it connects, and connects again when the grant
                         // changes (a role the owner changed, a share stopped):
@@ -1365,11 +1201,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             }
 
             BackendEvent::Resynced { store_id } => {
-                // Nothing of the store was heard for a while: what is shown
-                // of it is read again (from the API's held documents, which
-                // were just brought up to date), and every view of one of
-                // its nodes reconciles.
-                refetch_held_nodes(store, *store_id);
+                // Nothing of the store was heard for a while: every view of
+                // one of its nodes reconciles. What the catch-up changed in
+                // the tree follows as `Shown`.
                 crate::doc_session::resynced(store, *store_id);
             }
 
@@ -1451,7 +1285,7 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 apply_roots_change(store, tree_state, *store_id, roots_change);
                 if store.set_store_access(*store_id, *access, read_only_roots) {
                     tracing::info!("Access to store {:?} changed: {:?}, read-only roots {:?}", store_id, access, read_only_roots);
-                    refetch_held_nodes(store, *store_id);
+                    rejudge(store, *store_id);
                     // The store row's menu and every node row's snapshot it.
                     store.bump_tree_structure();
                 }
@@ -1471,10 +1305,6 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     store.link_modal_pending.set(false);
                     store.link_modal_store.set(None);
                     store.link_modal_error.set(String::new());
-                }
-
-                if matches!(state, pimble_core::SyncState::Synced { .. }) {
-                    refetch_root_if_empty(store, *store_id);
                 }
             }
 
@@ -1507,7 +1337,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     } else {
                         tree_state.controller.expand(&format!("node_{store_id}_{parent}"));
                     }
-                    store.send(BackendCommand::GetChildren { store_id: *store_id, node_id: parent });
+                    if !store.has_children_loaded(*store_id, parent) {
+                        store.send(BackendCommand::GetChildren { store_id: *store_id, node_id: parent });
+                    }
                 }
             }
 
@@ -1773,8 +1605,8 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     store.share_modal_pending.set(None);
                     store.share_modal_error.set(String::new());
                 }
-                // The marker the server wrote is what the tree's badge reads.
-                store.send(BackendCommand::GetNode { store_id: *store_id, node_id: *node_id });
+                // The marker the server wrote, which the tree's badge reads,
+                // arrives as `Shown` with the node's change.
             }
 
             BackendEvent::CloudSharingStopped { store_id, node_id } => {
@@ -1787,8 +1619,8 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     store.share_modal_pending.set(None);
                     store.share_modal_error.set(String::new());
                 }
-                // The marker is gone, so the badge goes with it.
-                store.send(BackendCommand::GetNode { store_id: *store_id, node_id: *node_id });
+                // The marker is gone, so the badge goes with it, when the
+                // node's change arrives as `Shown`.
             }
         }
     }
@@ -1856,9 +1688,9 @@ mod tests {
         assert_eq!(store.share_modal_members.with(|m| m.len()), 2);
         assert_eq!(store.share_modal_pending.get(), None);
         assert!(store.share_modal_error.get().is_empty());
-        assert!(commands
-            .try_iter()
-            .any(|cmd| matches!(cmd, BackendCommand::GetNode { node_id: n, .. } if n == node_id)));
+        // The marker the server wrote arrives with the node's own change, as
+        // `Shown`: nothing is fetched for it.
+        assert!(!commands.try_iter().any(|cmd| matches!(cmd, BackendCommand::GetNode { .. })));
     }
 
     /// An update for another node leaves a modal open on this one alone.
@@ -1923,9 +1755,7 @@ mod tests {
         assert!(!store.share_modal_shared.get());
         assert!(!store.share_modal_confirm_stop.get());
         assert_eq!(store.share_modal_pending.get(), None);
-        assert!(commands
-            .try_iter()
-            .any(|cmd| matches!(cmd, BackendCommand::GetNode { node_id: n, .. } if n == node_id)));
+        assert!(!commands.try_iter().any(|cmd| matches!(cmd, BackendCommand::GetNode { .. })));
     }
 
     /// A local store that is neither hosted nor shared from anywhere, with a
@@ -2391,24 +2221,31 @@ mod tests {
         }
     }
 
+    /// A view of `store_id` as the API would show it.
+    fn shown(store_id: StoreId, nodes: Vec<Node>, lists: Vec<(NodeId, Vec<Node>)>, gone: Vec<NodeId>) -> BackendEvent {
+        let lists = lists.into_iter().map(|(parent, children)| pimble_api::Listed { parent, children_store: store_id, children }).collect();
+        BackendEvent::Shown { view: pimble_api::View { store: store_id, nodes, lists, gone } }
+    }
+
     /// A role the owner changes while the app runs reaches it with the next
     /// `GetStoreSync` answer: the store's `access` and `read_only_roots` are
     /// written, and because each node carries the server's judgement of
-    /// itself, everything held of the store is asked for again: the loaded
-    /// lists, the roots, the open document. An answer that changes nothing
-    /// asks for nothing.
+    /// itself, the API is asked once to judge again every node the window
+    /// shows of the store (the open document's included), and its answer is
+    /// shown like any other. An answer that changes nothing asks for nothing.
     #[test]
-    fn a_changed_access_is_kept_and_refetches_what_is_held() {
+    fn a_changed_access_is_kept_and_has_the_shown_nodes_judged_again() {
         use pimble_core::StoreAccess::{Full, Read};
         let (store, events, commands) = store_with_events();
         let (store_id, [recipes, trips], [pasta, rome]) = a_replica_with_two_roots(store);
-        store.panes[0].active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id: rome }));
+        let opened = NodeId::new();
+        store.panes[0].active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id: opened }));
 
         events.send(sync_changed(store_id, Full, Vec::new())).unwrap();
         pump(store);
         assert!(
-            !commands.try_iter().any(|c| matches!(c, BackendCommand::GetChildren { .. } | BackendCommand::GetNode { .. })),
-            "nothing changed, so nothing is fetched"
+            !commands.try_iter().any(|c| matches!(c, BackendCommand::Rejudge { .. } | BackendCommand::GetChildren { .. } | BackendCommand::GetNode { .. })),
+            "nothing changed, so nothing is asked"
         );
 
         // The owner made this account a reader of Trips.
@@ -2418,19 +2255,19 @@ mod tests {
         let held = store.get_store_signal(store_id).unwrap();
         assert_eq!(held.with(|s| (s.access, s.read_only_roots.clone())), (Full, vec![trips]));
         let asked: Vec<BackendCommand> = commands.try_iter().collect();
-        for parent in [recipes, trips] {
-            assert!(asked.iter().any(|c| matches!(c, BackendCommand::GetChildren { node_id, .. } if *node_id == parent)), "the list under {parent} was not fetched again");
-            assert!(asked.iter().any(|c| matches!(c, BackendCommand::GetNode { node_id, .. } if *node_id == parent)), "the root {parent} was not fetched again");
+        let [BackendCommand::Rejudge { store_id: s, node_ids }] = asked.as_slice() else { panic!("one question, not {asked:?}") };
+        assert_eq!(*s, store_id);
+        for id in [recipes, trips, pasta, rome, opened] {
+            assert!(node_ids.contains(&id), "{id} is not judged again");
         }
-        assert!(asked.iter().any(|c| matches!(c, BackendCommand::GetNode { node_id, .. } if *node_id == rome)), "nor the open document");
         assert!(store.tree_structure_version.get() > before);
 
-        // The answers carry the judgement, and the app believes it: the
+        // The answer carries the judgement, and the app believes it: the
         // document under Trips takes no edits now, its neighbour still does.
         let mut rome_now = store.get_node_signal(store_id, rome).unwrap().with(|n| n.clone());
         rome_now.access = Read;
         let before = store.tree_structure_version.get();
-        events.send(BackendEvent::NodeLoaded { store_id, node: rome_now }).unwrap();
+        events.send(shown(store_id, vec![rome_now], Vec::new(), Vec::new())).unwrap();
         pump(store);
         assert_eq!(store.node_access(store_id, rome), Read);
         assert_eq!(store.node_access(store_id, pasta), Full);
@@ -2441,24 +2278,20 @@ mod tests {
         pump(store);
         assert_eq!(held.with(|s| (s.access, s.read_only_roots.clone())), (Read, Vec::new()));
         assert_eq!(store.node_access(store_id, pasta), Read);
-        assert!(commands.try_iter().any(|c| matches!(c, BackendCommand::GetChildren { .. })));
+        assert!(commands.try_iter().any(|c| matches!(c, BackendCommand::Rejudge { .. })));
     }
 
-    /// A children list brings each child's access even when the cached copy
-    /// of the child is the newer node and is kept.
+    /// A children list is read from the documents the API holds, so it is
+    /// taken as it is, with the latest judgement of each child: there is no
+    /// older copy to keep.
     #[test]
-    fn a_children_list_brings_access_to_a_newer_cached_node() {
+    fn a_children_list_is_taken_as_it_is() {
         use pimble_core::StoreAccess::{Full, Read};
         let (store, events, _commands) = store_with_events();
         let (store_id, [_, trips], [_, rome]) = a_replica_with_two_roots(store);
 
-        // The list's copy of the node is a minute older than the held one.
-        let held_now = store.get_node_signal(store_id, rome).unwrap().with(|n| n.clone());
-        let mut listed = held_now.clone();
-        let mut newer = held_now;
-        newer.metadata.modified_at += std::time::Duration::from_secs(60);
-        store.upsert_node(store_id, newer);
-        listed.metadata.title = "An older title".to_string();
+        let mut listed = store.get_node_signal(store_id, rome).unwrap().with(|n| n.clone());
+        listed.metadata.title = "Rome in May".to_string();
         listed.access = Read;
         events
             .send(BackendEvent::ChildrenLoaded { store_id, parent_id: trips, children_store_id: store_id, children: vec![listed] })
@@ -2466,43 +2299,67 @@ mod tests {
         pump(store);
 
         let held = store.get_node_signal(store_id, rome).unwrap();
-        assert_eq!(held.with(|n| n.metadata.title.clone()), "Rome", "the newer node is kept");
-        assert_eq!(store.node_access(store_id, rome), Read, "with the latest judgement of it");
+        assert_eq!(held.with(|n| n.metadata.title.clone()), "Rome in May");
+        assert_eq!(store.node_access(store_id, rome), Read);
         assert_eq!(store.node_access(store_id, trips), Full);
     }
 
-    /// The owner moves a folder from a root this account edits into one it
-    /// reads: the move's notifications name the two lists it moved between,
-    /// and the folder comes back in one of them with another access. What is
-    /// under it changed with it, so its own loaded list is fetched again, and
-    /// the open document; the same answer a second time asks for nothing.
+    /// What another device did, shown (docs/API_CONTRACT.md wave 5): the
+    /// rows it touched update, a loaded list and every loaded mount of it
+    /// take the new order, a list never loaded is not made up, a node that
+    /// left goes with what is under it, and nothing is fetched again.
     #[test]
-    fn a_node_whose_access_changed_refetches_what_is_under_it() {
-        use pimble_core::StoreAccess::Read;
+    fn a_shown_change_updates_exactly_what_it_touched() {
         let (store, events, commands) = store_with_events();
-        let (store_id, [recipes, trips], [pasta, _]) = a_replica_with_two_roots(store);
-        store.panes[0].active_edit.set(Some(crate::state::ActiveEdit { store_id, node_id: pasta }));
+        let (store_id, [recipes, trips], [pasta, rome]) = a_replica_with_two_roots(store);
+        // A mount elsewhere showing Recipes.
+        let (other_store, mount) = (StoreId::new(), NodeId::new());
+        store.mount_data.update(|map| {
+            map.insert(
+                (other_store, mount),
+                Signal::new(MountInfo {
+                    is_mount: true,
+                    mount_state: None,
+                    mount_ref: Some(pimble_core::MountRef { source_store: store_id, source_node: recipes, source_path: None, source_remote: None }),
+                }),
+            );
+        });
+        store.set_children(other_store, mount, vec![(store_id, pasta)]);
 
-        let mut moved = store.get_node_signal(store_id, trips).unwrap().with(|n| n.clone());
-        moved.access = Read;
-        let listing = BackendEvent::ChildrenLoaded { store_id, parent_id: recipes, children_store_id: store_id, children: vec![moved] };
-        events.send(listing.clone()).unwrap();
+        let soup = pimble_core::Node::document("Soup");
+        let mut renamed = store.get_node_signal(store_id, pasta).unwrap().with(|n| n.clone());
+        renamed.metadata.title = "Pasta, fresh".to_string();
+        let before = store.tree_structure_version.get();
+        events.send(shown(store_id, vec![renamed.clone()], vec![(recipes, vec![soup.clone(), renamed])], Vec::new())).unwrap();
         pump(store);
-        let asked: Vec<BackendCommand> = commands.try_iter().collect();
-        assert!(asked.iter().any(|c| matches!(c, BackendCommand::GetChildren { node_id, .. } if *node_id == trips)), "what is under the folder keeps its old access");
-        assert!(asked.iter().any(|c| matches!(c, BackendCommand::GetNode { node_id, .. } if *node_id == pasta)), "and so may the open document");
 
-        events.send(listing).unwrap();
+        let order = |s: StoreId, p: NodeId| store.get_children_signal(s, p).unwrap().with(|c| c.clone());
+        assert_eq!(order(store_id, recipes), vec![(store_id, soup.id), (store_id, pasta)]);
+        assert_eq!(order(other_store, mount), vec![(store_id, soup.id), (store_id, pasta)], "the mount shows the same list");
+        assert_eq!(store.display_label(store_id, pasta), "Pasta, fresh");
+        assert!(store.tree_structure_version.get() > before);
+
+        // A list this window never loaded (Soup's) is not made up.
+        events.send(shown(store_id, Vec::new(), vec![(soup.id, vec![pimble_core::Node::document("Stock")])], Vec::new())).unwrap();
         pump(store);
-        assert!(!commands.try_iter().any(|c| matches!(c, BackendCommand::GetChildren { .. } | BackendCommand::GetNode { .. })), "nothing changed the second time");
+        assert!(!store.has_children_loaded(store_id, soup.id));
+
+        // Trips is deleted: its row and what is under it go.
+        let mut trips_node = store.get_node_signal(store_id, trips).unwrap().with(|n| n.clone());
+        trips_node.children = vec![rome];
+        store.upsert_node(store_id, trips_node);
+        events.send(shown(store_id, Vec::new(), Vec::new(), vec![trips])).unwrap();
+        pump(store);
+        assert!(store.get_node_signal(store_id, rome).is_none(), "what was under it went with it");
+
+        assert!(!commands.try_iter().any(|c| matches!(c, BackendCommand::GetChildren { .. } | BackendCommand::GetNode { .. })), "nothing is fetched again");
     }
 
     /// A folder that was never opened shows a chevron from its node's own
-    /// `children`. When its first child turns up after the folder's own change
-    /// was heard (a document made on another device, readable here only once
-    /// its key wraps had been fetched), the child's arrival has to refresh
-    /// the folder's node, and a node that starts listing children has to
-    /// rebuild its row, or the child stays out of reach.
+    /// `children`. When its first child turns up (a document made on another
+    /// device), the folder's row is shown again with it, and a node that
+    /// starts listing children rebuilds its row, or the child stays out of
+    /// reach; its list, never loaded, is not loaded now.
     #[test]
     fn a_child_arriving_late_gives_its_unopened_folder_a_chevron() {
         let (store, events, commands) = store_with_events();
@@ -2513,25 +2370,15 @@ mod tests {
         store.upsert_node(store_id, walks.clone());
         assert!(!store.has_children_loaded(store_id, walks_id));
 
-        let storr = NodeId::new();
-        events
-            .send(BackendEvent::RemoteStoreChange {
-                store_id,
-                change_kind: pimble_rpc::StoreChangeKind::NodeCreated { node_id: storr, parent_id: walks_id },
-                source_client_id: None,
-            })
-            .unwrap();
-        pump(store);
-        let asked: Vec<BackendCommand> = commands.try_iter().collect();
-        assert!(asked.iter().any(|c| matches!(c, BackendCommand::GetNode { node_id, .. } if *node_id == walks_id)), "the folder's node is asked for again: {asked:?}");
-        assert!(!asked.iter().any(|c| matches!(c, BackendCommand::GetChildren { node_id, .. } if *node_id == walks_id)), "its list was never loaded and is not loaded now");
-
-        let before = untracked(|| store.tree_structure_version.get());
+        let storr = pimble_core::Node::document("The Storr");
         let mut listing = walks;
-        listing.children = vec![storr];
-        events.send(BackendEvent::NodeLoaded { store_id, node: listing }).unwrap();
+        listing.children = vec![storr.id];
+        let before = untracked(|| store.tree_structure_version.get());
+        events.send(shown(store_id, vec![storr.clone(), listing], vec![(walks_id, vec![storr])], Vec::new())).unwrap();
         pump(store);
         assert_ne!(untracked(|| store.tree_structure_version.get()), before, "a node that starts listing children rebuilds its row");
+        assert!(!store.has_children_loaded(store_id, walks_id), "its list was never loaded and is not loaded now");
+        assert!(!commands.try_iter().any(|c| matches!(c, BackendCommand::GetChildren { .. } | BackendCommand::GetNode { .. })));
     }
 
     /// A link reads how the account holds the store each time it connects,
@@ -2867,17 +2714,19 @@ mod tests {
 
     /// A move between two shares of one store, the way a member holding both
     /// drags a note from one into the other (docs/MOVE_CONTRACT.md
-    /// "Verification (the bar)"): the old row leaves the list it came from,
-    /// the new parent's list is asked for so the person sees where it
-    /// landed, and the notice names the nearest share left.
+    /// "Verification (the bar)"): what it did to both lists is shown before
+    /// the answer, the new parent's list (never loaded) is loaded so the
+    /// person sees where it landed, and the notice names the nearest share
+    /// left.
     #[test]
-    fn a_transplant_leaving_a_share_drops_the_old_row_refetches_both_lists_and_shows_the_notice() {
+    fn a_transplant_leaving_a_share_drops_the_old_row_loads_where_it_landed_and_shows_the_notice() {
         let (store, events, commands) = store_with_events();
         let store_id = StoreId::new();
         let (old_parent, new_parent) = (NodeId::new(), NodeId::new());
         let (old_id, new_id) = (NodeId::new(), NodeId::new());
         store.set_children(store_id, old_parent, vec![(store_id, old_id)]);
 
+        events.send(shown(store_id, Vec::new(), vec![(old_parent, Vec::new())], vec![old_id])).unwrap();
         events
             .send(transplanted(
                 store_id, old_id, old_parent, store_id, new_id, new_parent,
@@ -2902,8 +2751,8 @@ mod tests {
         );
     }
 
-    /// A plain move between stores, with no share left, is quiet: both lists
-    /// still refetch, but there is nothing to tell anyone.
+    /// A plain move between stores, with no share left, is quiet: the lists
+    /// are shown as they are now, but there is nothing to tell anyone.
     #[test]
     fn a_transplant_between_stores_with_no_share_left_shows_no_notice() {
         let (store, events, commands) = store_with_events();
@@ -2912,6 +2761,7 @@ mod tests {
         let (old_id, new_id) = (NodeId::new(), NodeId::new());
         store.set_children(from_store, old_parent, vec![(from_store, old_id)]);
 
+        events.send(shown(from_store, Vec::new(), Vec::new(), vec![old_id])).unwrap();
         events
             .send(transplanted(from_store, old_id, old_parent, to_store, new_id, new_parent, "Notes", Vec::new()))
             .unwrap();
@@ -2998,13 +2848,8 @@ mod tests {
         let (store, events, _commands) = store_with_events();
         let (store_id, parent, shared, other) = two_panes_on_one_document(store);
 
-        events
-            .send(BackendEvent::RemoteStoreChange {
-                store_id,
-                change_kind: pimble_rpc::StoreChangeKind::NodeDeleted { node_id: shared, parent_id: parent },
-                source_client_id: None,
-            })
-            .unwrap();
+        let other_node = store.get_node_signal(store_id, other).map(|n| n.with(|n| n.clone()));
+        events.send(shown(store_id, Vec::new(), vec![(parent, other_node.into_iter().collect())], vec![shared])).unwrap();
         pump(store);
 
         for pane in [0, 1] {

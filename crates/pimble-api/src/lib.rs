@@ -24,6 +24,7 @@ pub mod presence;
 pub mod recipes;
 pub mod router;
 pub mod rpc;
+pub mod view;
 #[cfg(feature = "conformance")]
 pub mod conformance;
 mod tree_view;
@@ -33,6 +34,7 @@ pub use backend::{Backend, MaybeSend, MaybeSync, Moved, NodeInit, StoreChange};
 pub use backend::StoreCapabilities;
 pub use error::ApiError;
 pub use router::Router;
+pub use view::{Affected, Listed, View};
 pub use identity::Me;
 pub use names::label;
 pub use pimble_core::plan;

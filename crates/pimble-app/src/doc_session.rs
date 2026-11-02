@@ -25,7 +25,11 @@
 //! to the other views of this window that hold the node is still each
 //! kind's own (`editor::hand_across`, `boards::send_update`,
 //! `sheets::text_delta`, `text_boards::local_update`, ...): which views of
-//! which kinds take a delta differs by kind, and is what wave 5 left.
+//! which kinds take a delta differs by kind. One copy per window is not made:
+//! rinch's editor owns its document inside its collaboration adapter, so a
+//! copy every view shared would be a document-model layer between the editor
+//! and that adapter, which the collaboration rules forbid
+//! (docs/API_CONTRACT.md wave 5, "Not done, and why").
 
 use pimble_core::{NodeId, StoreId};
 

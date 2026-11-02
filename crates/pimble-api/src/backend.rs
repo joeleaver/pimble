@@ -7,8 +7,8 @@ use std::pin::Pin;
 
 use async_trait::async_trait;
 use futures::Stream;
-use pimble_core::{BlobId, BlobUrl, DeletedNode, LeftShare, LinkResolution, Node, NodeId, Place, Store, StoreId};
-use pimble_rpc::{PresenceFrame, SearchResultItem, StoreChangeKind};
+use pimble_core::{BlobId, BlobUrl, DeletedNode, LeftShare, LinkResolution, MountRef, MountState, Node, NodeId, Place, Store, StoreId};
+use pimble_rpc::{PresenceFrame, SearchResultItem, StoreChangeKind, StorePeople};
 
 use crate::ApiError;
 
@@ -51,6 +51,13 @@ pub struct StoreChange {
 pub type ChangeStream = Pin<Box<dyn Stream<Item = StoreChange> + Send>>;
 #[cfg(target_arch = "wasm32")]
 pub type ChangeStream = Pin<Box<dyn Stream<Item = StoreChange>>>;
+
+/// The presence frames of a store's other sessions, for as long as the
+/// subscription lives.
+#[cfg(not(target_arch = "wasm32"))]
+pub type PresenceStream = Pin<Box<dyn Stream<Item = PresenceFrame> + Send>>;
+#[cfg(target_arch = "wasm32")]
+pub type PresenceStream = Pin<Box<dyn Stream<Item = PresenceFrame>>>;
 
 /// What a move answers: the id the node has now (a new one when it left a
 /// share or its store, docs/MOVE_CONTRACT.md) and the shares it left.
@@ -188,6 +195,39 @@ pub trait Backend: MaybeSend + MaybeSync {
 
     /// A store's changes from now on.
     async fn subscribe(&self, store: StoreId) -> Result<ChangeStream, ApiError>;
+
+    /// Who is in a store's documents now (docs/PRESENCE_CONTRACT.md), every
+    /// session but `client_id`'s, and every frame from now on: the frames
+    /// held now first, then the subscription's.
+    async fn presence(&self, _store: StoreId, _client_id: &str) -> Result<(Vec<PresenceFrame>, PresenceStream), ApiError> {
+        Err(ApiError::not_available("Presence is not available here."))
+    }
+
+    /// The people of a store's shares and the names they go by there
+    /// (docs/PRESENCE_CONTRACT.md section 3).
+    async fn people(&self, _store: StoreId) -> Result<StorePeople, ApiError> {
+        Err(ApiError::not_available("Who is in a store's shares is not known here."))
+    }
+
+    /// Make a mount of `source_store`'s `source_node` under `parent`
+    /// (docs/history/MOUNTS_CONTRACT.md): the server resolves and merges
+    /// it, like any structural call.
+    async fn create_mount(
+        &self,
+        _store: StoreId,
+        _parent: NodeId,
+        _source_store: StoreId,
+        _source_node: NodeId,
+        _title: Option<String>,
+    ) -> Result<(NodeId, MountRef), ApiError> {
+        Err(ApiError::not_available("Mounts are not available here."))
+    }
+
+    /// Where a mount's source stands (docs/history/REMOTE_MOUNTS_CONTRACT.md),
+    /// derived by the server from the source's link.
+    async fn mount_state(&self, _store: StoreId, _node: NodeId) -> Result<(MountState, MountRef), ApiError> {
+        Err(ApiError::not_available("Mounts are not available here."))
+    }
 }
 
 /// A backend shared with whoever else needs it (the browser's loop keeps
@@ -290,6 +330,22 @@ impl<B: Backend + ?Sized> Backend for std::sync::Arc<B> {
 
     async fn subscribe(&self, store: StoreId) -> Result<ChangeStream, ApiError> {
         (**self).subscribe(store).await
+    }
+
+    async fn presence(&self, store: StoreId, client_id: &str) -> Result<(Vec<PresenceFrame>, PresenceStream), ApiError> {
+        (**self).presence(store, client_id).await
+    }
+
+    async fn people(&self, store: StoreId) -> Result<StorePeople, ApiError> {
+        (**self).people(store).await
+    }
+
+    async fn create_mount(&self, store: StoreId, parent: NodeId, source_store: StoreId, source_node: NodeId, title: Option<String>) -> Result<(NodeId, MountRef), ApiError> {
+        (**self).create_mount(store, parent, source_store, source_node, title).await
+    }
+
+    async fn mount_state(&self, store: StoreId, node: NodeId) -> Result<(MountState, MountRef), ApiError> {
+        (**self).mount_state(store, node).await
     }
 }
 

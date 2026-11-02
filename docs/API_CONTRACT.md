@@ -381,15 +381,71 @@ the browser re-reads a plain store's shown lists after its subscription is made 
 reconcile of a node the vault does not hold says "Node not found" in the server's words;
 `Search` always goes through the router (the same answer); an error from a modal's request
 no longer depends on that modal being the one waiting.
-**Left for a continuation:** `AppStore`'s mirror as a reactive view of `Pimble`'s held
-documents (the refetch policy in `events.rs` stays; its `GetNode`/`GetChildren` are now
-answered from held documents, so they cost no round trip for a live store); each view's
-own copy and hand-across into one `DocSession` that holds the document once per window;
-`VaultBackend::subscribe`/`who_am_i`/`publish_presence` (kept out by the holder decision
-above); author names through `pimble_api::identity` (the app's `shares::author_in` names
-the person per share, which `Me` does not); the presence subscription and `GetPeople` on
-the API; mounts (`createMount`, `getMountState`) on `Backend`; the browser's own
-reconnect loop (`supervise`) into a `Connector`.
+**Part 2, built 2026-11-02.** **The tree is a view of held documents.** A change names
+what it touched; `pimble_api::view` (`Affected::of(kind)`: rows, lists, parents of,
+gone) says which rows and lists that is, and `Pimble::shown(store, &affected) -> View`
+reads them from what is held after the merge (a list only for a parent held and not a
+mount; a child not held is fetched with the list, the one time anything is asked).
+`Held::apply` now holds a node from the update that announces it when that update is its
+whole document (fields readable, nothing pending), so a node made elsewhere or a store's
+root reaching a new replica needs no fetch, and derives access again from the new parent
+for a moved or new node and its held subtree (a share's root keeps its own judgement),
+answering the nodes whose access changed as `Change::Rejudged`; `Change::Resynced` names
+the documents the catch-up changed. The app's listener turns every change into
+`BackendEvent::Shown { view }` (`commands::change_events`, `commands::shown`); every
+structural command the window makes shows what it did before its answer
+(`Pimble::shown_after`: the touched documents reconciled first, since the change that says
+it may not have been heard yet); rename, appearance and `ApplyUpdate` show the edited node.
+The browser's vault, the one holder of an encrypted store, feeds the same view: what it
+pumps (`RemoteStoreChange`, `NodeContentUpdated`) is noted (`web/src/backend.rs` `owe`)
+and shown through the API, which reads the vault, once the vault is not locked
+(`show_owed`). `events::apply_view` is the one update: rows the window shows (or a pane
+waits for), each loaded list and every loaded mount of it (a store's shown roots count as
+loaded: they are its row's children), subtrees that left; the tree is rebuilt only when a
+list or a row's snapshot (`row_data_changed`: icon, colors, share marker, access,
+chevron) changed. **Deleted:** `refetch_parent_children`, `refetch_held_nodes`,
+`refetch_below_changed_access`, `refetch_root_if_empty`, the structural arms of
+`RemoteStoreChange`, `ChildrenLoaded`'s keep-newer-by-`modified_at`, the list surgery and
+refetches in the `NodeMoved`/`NodeDeleted`/`NodeTransplanted`/`MountCreated` answers, the
+`GetNode`s after a share update, `BackendEvent::NodeRenamed`, `AppStore::node_held_access`
+and `loaded_lists_holding`. What stays asked is what no document says: a store whose
+access changed sends one `BackendCommand::Rejudge { node_ids }` (`Pimble::rejudge`, one
+`getNodes` for every node the window shows), and first loads (a folder opened, a list
+never loaded that a node was created or moved into, a mount's state, a mount's children
+when its source becomes live).
+**Mounts, presence and people on `Backend`:** `create_mount`, `mount_state`,
+`presence(store, client_id) -> (frames now, PresenceStream)` and `people(store)` (defaults
+`NotAvailable`; `RpcBackend` and `Router` implement them, the router gating a mount as a
+structural write); `CreateMount`, `GetMountState`, `SubscribePresence` and `GetPeople` are
+`api_command`s now, and "Mount Remote Store Here..." makes its mount through the API.
+**Behavior changes:** another device's (or the CLI's, the MCP's) create, rename, move and
+delete show in the explorer with no `getChildren`/`getNode` round trip; a list arrives as
+it is held, never replaced by an older copy; a moved folder's subtree takes its new
+parent's access without a refetch; a list never loaded is not loaded by someone else's
+change (as before) but a store's root list always is (it replaces the `Synced`
+refetch); a row's node is shown again on a content change even while a pane holds it
+(cheap: it comes from held documents); a role change asks once for all shown nodes instead
+of every list and root; a failed "Mount Remote Store Here..." mount reads as that modal's
+error, unchanged. Verified in the release desktop app on a store copy (port 7491): folders
+expanded; a node made, moved into a never-opened folder (the chevron appeared), given text
+and deleted from the CLI, a node renamed and reordered from the MCP, each shown with no
+`ChildrenLoaded` in the log; two panes typing into one note; a sheet and a canvas made by
+the MCP appeared, and rows and elements the MCP added showed live in their panes.
+**Not done, and why.** *One `DocSession` per window* would put the editor's document
+somewhere the four rinch editors and the board, sheet and in-text views all read: rinch's
+editor owns its document inside its collaboration adapter, so a shared session would be a
+document-model layer between the editor and that adapter, which CLAUDE.md forbids. The
+views keep their own copies and hand-across (`doc_session.rs` stays the one plumbing).
+*Author names through `pimble_api::identity`:* the desktop's API connection is the local
+server's operator (no account, `Me` is `None`), and the name is per share (the person's
+name in the share the node is in, `shares::author_in`), which needs the cloud account's
+people and the node's scope root; `Me` says neither, so the app keeps it.
+*The browser's reconnect loop as a `Connector`:* `supervise` does far more than connect
+(proving the socket, the vault's rows, subscriptions, catch-up and opening, the store
+list), all of it the vault's, and the plain stores already reach their connection through
+`Wires`, a `Connector`; moving the loop is a rewrite of the vault's life cycle with no
+browser walk-through to check it, left for when the vault becomes a `Backend` that
+subscribes (`VaultBackend::subscribe` stays `NotAvailable` by the holder decision above).
 
 **After this contract:** views (source, grouping, order over `TreeView`, the kanban as a
 built-in written in plain rinch against `Pimble`) and the WASM plugin host, which hands a

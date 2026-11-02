@@ -3144,6 +3144,7 @@ pub fn store_id_of(cmd: &BackendCommand) -> Option<StoreId> {
         | ListAttachments { store_id, .. }
         | ListDiscussions { store_id }
         | GetNode { store_id, .. }
+        | Rejudge { store_id, .. }
         | GetChildren { store_id, .. }
         | ApplyUpdate { store_id, .. }
         | RenameNode { store_id, .. }

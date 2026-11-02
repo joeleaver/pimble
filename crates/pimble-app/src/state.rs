@@ -1090,17 +1090,6 @@ impl AppStore {
         pimble_core::plan::node_access(store_access, node_sig.map(|sig| sig.with(|n| n.access)))
     }
 
-    /// The access the held copy of a node carries (untracked), whatever its
-    /// store says: what an answer's `Node::access` is compared with to tell
-    /// that the server's judgement of the node changed. `Full` for a node
-    /// not held.
-    pub fn node_held_access(&self, store_id: StoreId, node_id: NodeId) -> pimble_core::StoreAccess {
-        untracked(|| {
-            self.node_data
-                .with(|map| map.get(&(store_id, node_id)).map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|n| n.access)))
-        })
-    }
-
     /// Record what this device may change in a store as the server has it
     /// now (`GetStoreSync`'s answer). Answers whether either value differs
     /// from what was held, which is when every `Node::access` held of the
@@ -1120,22 +1109,19 @@ impl AppStore {
         differs
     }
 
-    /// Every loaded children list that holds nodes of `store_id` (untracked):
-    /// the lists of its own parents, and the list of any mount, in whatever
-    /// store, whose children are this store's. What is refetched when the
-    /// store's access changes, since each node carries the server's
-    /// judgement of itself and no notification names the nodes it changed for.
-    pub fn loaded_lists_holding(&self, store_id: StoreId) -> Vec<(StoreId, NodeId)> {
-        untracked(|| {
-            self.children_of.with(|map| {
-                map.iter()
-                    .filter(|((list_store, _), sig)| {
-                        *list_store == store_id || sig.with(|children| children.iter().any(|(child_store, _)| *child_store == store_id))
-                    })
-                    .map(|(&key, _)| key)
-                    .collect()
-            })
-        })
+    /// Every node of `store_id` the window holds a row's copy of, and the
+    /// node of every pane opened on one (untracked): what is judged again
+    /// when what this device may do in the store changes, since each node
+    /// carries the server's judgement of itself and no document says which
+    /// changed.
+    pub fn shown_node_ids(&self, store_id: StoreId) -> Vec<NodeId> {
+        let mut ids: Vec<NodeId> = untracked(|| self.node_data.with(|map| map.keys().filter(|(s, _)| *s == store_id).map(|(_, n)| *n).collect()));
+        for active in self.edited_nodes().into_iter().filter(|a| a.store_id == store_id) {
+            if !ids.contains(&active.node_id) {
+                ids.push(active.node_id);
+            }
+        }
+        ids
     }
 
     /// The email of whoever shared a store with this account, when it is

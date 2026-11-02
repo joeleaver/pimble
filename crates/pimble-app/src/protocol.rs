@@ -57,6 +57,11 @@ pub enum BackendCommand {
     /// when nobody is signed in.
     SyncPersonal { state: Vec<u8>, enabled: bool, turn_on: bool },
     GetNode { store_id: StoreId, node_id: NodeId },
+    /// What this device may do in a store changed (a role, a read-only
+    /// root), which no document says: the server's judgement of these nodes
+    /// (the ones the window shows) is asked again, once, and answered as
+    /// `Shown`.
+    Rejudge { store_id: StoreId, node_ids: Vec<NodeId> },
     GetChildren { store_id: StoreId, node_id: NodeId },
     /// Merge `update` (a yrs update of the node's document) through
     /// `applyEdit` and answer `NodeContentUpdated` or `Error`: for a caller
@@ -66,8 +71,8 @@ pub enum BackendCommand {
     RenameNode { store_id: StoreId, node_id: NodeId, title: String },
     /// Set or clear a node's custom icon (a Tabler icon name) and/or colour
     /// (`#rrggbb`) in its metadata. `None` for a field leaves it as it is;
-    /// `Some(None)` clears it. Answers with `NodeRenamed`, whose refetch
-    /// carries the new metadata to the tree.
+    /// `Some(None)` clears it. Answers with `Shown`: the node as the edit
+    /// left it, for its row.
     SetNodeAppearance {
         store_id: StoreId,
         node_id: NodeId,
@@ -433,7 +438,14 @@ pub enum BackendEvent {
     /// ordinary parent, the mount's source store when `parent_id` is a mount point.
     ChildrenLoaded { store_id: StoreId, parent_id: NodeId, children_store_id: StoreId, children: Vec<Node> },
     NodeContentUpdated { store_id: StoreId, node_id: NodeId },
-    NodeRenamed { store_id: StoreId, node_id: NodeId },
+    /// What a change did to the rows and lists of a store's tree, read from
+    /// the documents held after it was merged (`pimble_api::View`): the
+    /// tree updates exactly those, whoever made the change, with nothing
+    /// fetched again (docs/API_CONTRACT.md wave 5). A plain store's come
+    /// from the API's change stream and from this window's own structural
+    /// calls; an encrypted store's in the browser from what its vault
+    /// decrypts.
+    Shown { view: pimble_api::View },
     NodeDeleted { store_id: StoreId, node_id: NodeId, parent_id: NodeId },
     NodeMoved { store_id: StoreId, node_id: NodeId, old_parent_id: NodeId, new_parent_id: NodeId },
     /// A move that crossed a share's or a store's boundary
@@ -466,10 +478,8 @@ pub enum BackendEvent {
     // Mount events
     MountCreated {
         store_id: StoreId,
-        /// The node the mount was created under, so the tree can load that
-        /// parent's children and show the new mount even when the parent had
-        /// never been expanded (`RemoteStoreChange`'s `NodeCreated` refetch
-        /// deliberately skips a parent whose children are not loaded).
+        /// The node the mount was created under (the `Shown` before this
+        /// answer carries its list with the new mount in it).
         parent_id: NodeId,
         node_id: NodeId,
         mount_ref: MountRef,
@@ -498,8 +508,9 @@ pub enum BackendEvent {
     RemoteChanges { store_id: StoreId, node_id: NodeId, update: Vec<u8> },
     /// A store's changes were not heard for a while (its subscription was
     /// made again after the connection came back) and what the API holds
-    /// of it was brought up to date: what is shown of it is read again, and
-    /// every view holding one of its nodes reconciles.
+    /// of it was brought up to date: every view holding one of its nodes
+    /// reconciles (what the catch-up changed in the tree follows as
+    /// `Shown`).
     Resynced { store_id: StoreId },
 
     // Pictures

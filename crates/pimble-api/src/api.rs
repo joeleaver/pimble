@@ -42,9 +42,14 @@ pub enum Change {
     /// A store's change as its subscription said it.
     Store(StoreChange),
     /// A store's subscription was made again (the connection came back); what
-    /// is held there was brought up to date, and anything shown of it should
-    /// be read again.
-    Resynced { store: StoreId },
+    /// is held there was brought up to date. `changed` names the held
+    /// documents the catch-up changed, which is what anything shown of the
+    /// store has to read again.
+    Resynced { store: StoreId, changed: Vec<NodeId> },
+    /// What this principal may do with these held nodes was derived again
+    /// from where a change put them (`Held::apply`), and differs from what
+    /// it was: nothing in their own documents changed to say so.
+    Rejudged { store: StoreId, nodes: Vec<NodeId> },
 }
 
 /// What one write did. `changed` is whether merging it into the document
@@ -168,8 +173,12 @@ impl Pimble {
     fn process(&self, event: Event) {
         match event {
             Event::Change(change) => {
-                self.held.lock().unwrap().apply(&change);
+                let store = change.store;
+                let rejudged = self.held.lock().unwrap().apply(&change);
                 self.keep(Change::Store(change));
+                if !rejudged.is_empty() {
+                    self.keep(Change::Rejudged { store, nodes: rejudged });
+                }
             }
             Event::Ended(store) => self.held.lock().unwrap().lost(store),
         }
@@ -224,7 +233,12 @@ impl Pimble {
             };
             match event {
                 Event::Change(change) => {
-                    self.held.lock().unwrap().apply(&change);
+                    let store = change.store;
+                    let rejudged = self.held.lock().unwrap().apply(&change);
+                    if !rejudged.is_empty() {
+                        // After the change that caused it.
+                        self.queue.lock().unwrap().push_back(Change::Rejudged { store, nodes: rejudged });
+                    }
                     return Some(Change::Store(change));
                 }
                 Event::Ended(store) => {
@@ -324,11 +338,14 @@ impl Pimble {
             let (docs, _) = self.backend.sync(store, have, false).await?;
             let mut held = self.held.lock().unwrap();
             let h = held.store_mut(store);
+            let mut changed = Vec::new();
             for d in docs {
-                h.merge(d.node, &d.diff, false);
+                if h.merge_changed(d.node, &d.diff) {
+                    changed.push(d.node);
+                }
             }
             drop(held);
-            self.keep(Change::Resynced { store });
+            self.keep(Change::Resynced { store, changed });
         }
         Ok(())
     }

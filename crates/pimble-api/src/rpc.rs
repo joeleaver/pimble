@@ -12,10 +12,10 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use futures::StreamExt;
 use pimble_client::PimbleClient;
-use pimble_core::{BlobId, BlobUrl, DeletedNode, LinkResolution, Node, NodeId, Place, Store, StoreId};
-use pimble_rpc::{EditOperation, PresenceFrame, SearchResultItem};
+use pimble_core::{BlobId, BlobUrl, DeletedNode, LinkResolution, MountRef, MountState, Node, NodeId, Place, Store, StoreId};
+use pimble_rpc::{EditOperation, PresenceFrame, SearchResultItem, StorePeople};
 
-use crate::backend::{Backend, ChangeStream, MaybeSend, MaybeSync, Moved, NodeInit, StoreChange, SyncedDoc};
+use crate::backend::{Backend, ChangeStream, MaybeSend, MaybeSync, Moved, NodeInit, PresenceStream, StoreChange, SyncedDoc};
 use crate::ApiError;
 
 /// How the RPC backend gets a live client.
@@ -212,5 +212,40 @@ impl Backend for RpcBackend {
             futures::future::ready(change)
         });
         Ok(Box::pin(stream))
+    }
+
+    async fn presence(&self, store: StoreId, client_id: &str) -> Result<(Vec<PresenceFrame>, PresenceStream), ApiError> {
+        let c = self.client().await?;
+        let sub = c.subscribe_presence(store, client_id).await.map_err(|e| err(&c, e))?;
+        // Subscribed first, so a frame sent between the two is heard by one
+        // of them; the frames held now leave out this client's own.
+        let mine = client_id.to_string();
+        let now: Vec<PresenceFrame> = c.get_presence(store).await.unwrap_or_default().into_iter().filter(|f| f.client() != mine).collect();
+        let stream = sub.filter_map(move |item| {
+            futures::future::ready(match item {
+                Ok(frame) if frame.client() != mine => Some(frame),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::debug!("a presence frame did not parse: {e}");
+                    None
+                }
+            })
+        });
+        Ok((now, Box::pin(stream)))
+    }
+
+    async fn people(&self, store: StoreId) -> Result<StorePeople, ApiError> {
+        let c = self.client().await?;
+        c.cloud_people(store).await.map_err(|e| err(&c, e))
+    }
+
+    async fn create_mount(&self, store: StoreId, parent: NodeId, source_store: StoreId, source_node: NodeId, title: Option<String>) -> Result<(NodeId, MountRef), ApiError> {
+        let c = self.client().await?;
+        c.create_mount(store, parent, source_store, source_node, title).await.map_err(|e| err(&c, e))
+    }
+
+    async fn mount_state(&self, store: StoreId, node: NodeId) -> Result<(MountState, MountRef), ApiError> {
+        let c = self.client().await?;
+        c.get_mount_state(store, node).await.map_err(|e| err(&c, e))
     }
 }

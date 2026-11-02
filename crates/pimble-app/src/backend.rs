@@ -182,7 +182,7 @@ async fn backend_loop(cmd_rx: Receiver<BackendCommand>, event_tx: Sender<Backend
         tokio::spawn(async move {
             let mut last = None;
             while let Some(change) = api.next_change().await {
-                for event in change_events(change, &client_id, &mut last) {
+                for event in change_events(&api, change, &client_id, &mut last).await {
                     if let Err(e) = event_tx.try_send(event) {
                         tracing::warn!("A change was dropped, the event channel is full: {e}");
                     }

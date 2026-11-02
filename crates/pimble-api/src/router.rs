@@ -28,11 +28,11 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use pimble_core::{
-    node_types, BlobId, BlobUrl, DeletedNode, LinkResolution, Node, NodeId, NodeMetadata, Place, Store, StoreAccess, StoreId,
+    node_types, BlobId, BlobUrl, DeletedNode, LinkResolution, MountRef, MountState, Node, NodeId, NodeMetadata, Place, Store, StoreAccess, StoreId,
 };
-use pimble_rpc::{PresenceFrame, SearchResultItem};
+use pimble_rpc::{PresenceFrame, SearchResultItem, StorePeople};
 
-use crate::backend::{Backend, ChangeStream, Moved, NodeInit, StoreCapabilities, SyncedDoc};
+use crate::backend::{Backend, ChangeStream, Moved, NodeInit, PresenceStream, StoreCapabilities, SyncedDoc};
 use crate::ApiError;
 
 /// Which of a router's backends: the order they were added in, the first
@@ -393,6 +393,25 @@ impl Backend for Router {
 
     async fn subscribe(&self, store: StoreId) -> Result<ChangeStream, ApiError> {
         self.of(store).subscribe(store).await
+    }
+
+    async fn presence(&self, store: StoreId, client_id: &str) -> Result<(Vec<PresenceFrame>, PresenceStream), ApiError> {
+        self.of(store).presence(store, client_id).await
+    }
+
+    async fn people(&self, store: StoreId) -> Result<StorePeople, ApiError> {
+        self.of(store).people(store).await
+    }
+
+    /// Gated like any structural write; the store's backend says whether it
+    /// can mount at all.
+    async fn create_mount(&self, store: StoreId, parent: NodeId, source_store: StoreId, source_node: NodeId, title: Option<String>) -> Result<(NodeId, MountRef), ApiError> {
+        self.gate(store, Write::Structure)?;
+        self.of(store).create_mount(store, parent, source_store, source_node, title).await
+    }
+
+    async fn mount_state(&self, store: StoreId, node: NodeId) -> Result<(MountState, MountRef), ApiError> {
+        self.of(store).mount_state(store, node).await
     }
 }
 

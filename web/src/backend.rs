@@ -30,7 +30,7 @@
 //! Nothing blocks on it: the loop drains with `try_recv` and yields to the
 //! browser between passes.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -49,7 +49,7 @@ use crate::vault::{Handled, VaultClient, VaultWire};
 use crate::vault_backend::{VaultBackend, WireTable};
 use pimble_api::router::BackendId;
 use pimble_api::rpc::{Connector, RpcBackend};
-use pimble_api::{ApiError, Pimble, Router};
+use pimble_api::{Affected, ApiError, Pimble, Router};
 
 /// The vault, shared between the loop (connecting, pulling, keys, repairs)
 /// and its backend (`crate::vault_backend`), which answers the calls the
@@ -78,6 +78,10 @@ const SETTLE_MS: f64 = 2_000.0;
 thread_local! {
     /// Set by [`request_refresh`], read once per turn of the loop.
     static REFRESH_WANTED: Cell<bool> = const { Cell::new(false) };
+
+    /// What the vault said changed in encrypted stores' trees and is not
+    /// shown yet, per store ([`owe`], [`show_owed`]).
+    static OWED: RefCell<Vec<(StoreId, Affected)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The store subscriptions this page has asked for.
@@ -239,7 +243,7 @@ async fn run(
         spawn_local(async move {
             let mut last = None;
             while let Some(change) = api.next_change().await {
-                for event in change_events(change, &client_id, &mut last) {
+                for event in change_events(&api, change, &client_id, &mut last).await {
                     if let Err(e) = event_tx.try_send(event) {
                         tracing::warn!("Event channel full, dropped: {}", e);
                     }
@@ -352,6 +356,9 @@ async fn run(
             }
             ran_anything
         };
+        // 3d. What the vault said changed in a tree, shown now that it is
+        //     not locked.
+        ran_anything |= show_owed(&shared, &routes, &event_tx, &signal_ui).await;
 
         // 4. Run whatever the UI has posted. Drain the queue rather than
         //    taking one per pass, so a burst of edits does not spread over as
@@ -367,6 +374,8 @@ async fn run(
                 break;
             }
         }
+        // And what the commands' answers had the vault say.
+        ran_anything |= show_owed(&shared, &routes, &event_tx, &signal_ui).await;
 
         // 5. Give the browser the thread back.
         if !ran_anything {
@@ -1014,10 +1023,58 @@ async fn create_hosted_store(name: &str, kind: &str) -> BackendEvent {
 }
 
 fn emit(event_tx: &Sender<BackendEvent>, signal_ui: &Arc<dyn Fn() + Send + Sync>, event: BackendEvent) {
+    owe(&event);
     if let Err(e) = event_tx.try_send(event) {
         tracing::warn!("Event channel full, dropped: {}", e);
     }
     signal_ui();
+}
+
+/// Note what an event from the vault says changed in an encrypted store's
+/// tree (the kinds the server would derive, a document's content), to be
+/// shown once the vault is not locked: the view reads it through the API,
+/// whose backend for that store is the vault itself ([`show_owed`]).
+fn owe(event: &BackendEvent) {
+    let (store, affected) = match event {
+        BackendEvent::RemoteStoreChange { store_id, change_kind, .. } => (*store_id, Affected::of(change_kind)),
+        BackendEvent::NodeContentUpdated { store_id, node_id } => (*store_id, Affected::rows(vec![*node_id])),
+        _ => return,
+    };
+    if affected.is_empty() {
+        return;
+    }
+    OWED.with(|owed| {
+        let mut owed = owed.borrow_mut();
+        match owed.iter_mut().find(|(s, _)| *s == store) {
+            Some((_, all)) => *all = std::mem::take(all).and(affected),
+            None => owed.push((store, affected)),
+        }
+    });
+}
+
+/// Show what the vault said changed since the last time (see [`owe`]): an
+/// encrypted store's tree is updated from the same `Shown` a plain store's
+/// is, read from the one holder of its documents. Answers whether there was
+/// anything to show.
+async fn show_owed(shared: &SharedVault, routes: &Routes, event_tx: &Sender<BackendEvent>, signal_ui: &Arc<dyn Fn() + Send + Sync>) -> bool {
+    let owed = OWED.with(|owed| std::mem::take(&mut *owed.borrow_mut()));
+    if owed.is_empty() {
+        return false;
+    }
+    {
+        // The router reads an encrypted store from the vault only once it
+        // knows the store is one.
+        let vault = shared.lock().await;
+        for (store, _) in &owed {
+            routes.learn(&vault, *store);
+        }
+    }
+    for (store, affected) in owed {
+        if let Some(event) = pimble_app::commands::shown(&routes.api, store, &affected).await {
+            emit(event_tx, signal_ui, event);
+        }
+    }
+    true
 }
 
 /// Whether `session`'s token is inside the refresh window (or already past it).

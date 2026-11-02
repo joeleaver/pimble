@@ -299,7 +299,7 @@ async fn a_subscription_that_ends_is_made_again_and_catches_up() {
     let resynced = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match api.next_change().await {
-                Some(Change::Resynced { store: st }) => return st,
+                Some(Change::Resynced { store: st, .. }) => return st,
                 Some(_) => continue,
                 None => panic!("nothing is subscribed"),
             }
@@ -385,9 +385,12 @@ async fn the_tree_view_reads_held_documents() {
     let first = api.create(Addr::new(home, home_root), Place::Last, first).await.unwrap();
     let titled = api.create(Addr::new(home, home_root), Place::Last, recipes::document("Plans", Some("Not the label")).unwrap()).await.unwrap();
 
-    // Nothing is held yet: not known, never a guess.
-    assert_eq!(api.view(|v| v.parent(home, titled.node)), None);
-    assert_eq!(api.view(|v| v.label(home, titled.node)), plan::UNTITLED);
+    // A node not held is not known, never a guess. (The two just made may
+    // be held already: a node made is held from the change that announces
+    // it, once that is heard.)
+    let never = NodeId::new();
+    assert_eq!(api.view(|v| v.parent(home, never)), None);
+    assert_eq!(api.view(|v| v.label(home, never)), plan::UNTITLED);
 
     api.hold_store(home).await.unwrap();
     api.stores().await.unwrap();
@@ -488,5 +491,71 @@ async fn a_reader_cannot_plan_a_move_or_a_delete() {
     assert_eq!(api.move_node(note, folder, Place::Last).await.unwrap_err(), ApiError::ReadOnly);
     assert_eq!(api.can_delete(&[note]).await.unwrap_err(), ApiError::ReadOnly);
     assert_eq!(api.create_parent(folder).await.unwrap_err(), ApiError::ReadOnly);
+    let _ = { s }.server.stop().await;
+}
+
+/// Wait until `api` has heard a change of every kind `wanted` names, and
+/// answer the rows and lists they touched, as a client shows them.
+async fn heard_all(api: &Pimble, store: StoreId, mut wanted: Vec<fn(&pimble_rpc::StoreChangeKind) -> bool>) -> pimble_api::Affected {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut affected = pimble_api::Affected::default();
+        while !wanted.is_empty() {
+            match api.next_change().await {
+                Some(Change::Store(c)) if c.store == store => {
+                    affected = affected.and(pimble_api::Affected::of(&c.kind));
+                    wanted.retain(|w| !w(&c.kind));
+                }
+                Some(_) => continue,
+                None => panic!("nothing is subscribed"),
+            }
+        }
+        affected
+    })
+    .await
+    .expect("the changes arrive")
+}
+
+/// What another device does to a store's tree is shown from the documents
+/// the API holds once their changes are merged (docs/API_CONTRACT.md wave
+/// 5): a node made there is held from its announcement, a rename and a move
+/// read as they are now, and nothing is fetched to show any of it.
+#[tokio::test]
+async fn another_devices_changes_are_shown_from_held_documents() {
+    use pimble_rpc::StoreChangeKind as K;
+    let s = stack().await;
+    let (store, root) = s.service.create_store(s.dir.path().join("work.pimble"), "Work").await.unwrap();
+    let folder = s.service.create_node(store, Some(root), "folder", "Folder").await.unwrap();
+    let (api, counts) = api(&s).await;
+    api.listing(Addr::new(store, root)).await.unwrap();
+    api.listing(Addr::new(store, folder)).await.unwrap();
+    api.listen();
+    let fetches = counts.fetches();
+
+    // Made elsewhere.
+    let made = s.service.create_node(store, Some(root), "document", "Made elsewhere").await.unwrap();
+    let affected = heard_all(&api, store, vec![|k| matches!(k, K::NodeCreated { .. }), |k| matches!(k, K::TreeStructure { .. })]).await;
+    let view = api.shown(store, &affected).await;
+    let list = view.lists.iter().find(|l| l.parent == root).expect("the root's list is shown");
+    assert_eq!(list.children.iter().map(|n| n.id).collect::<Vec<_>>(), vec![folder, made]);
+    assert!(view.nodes.iter().any(|n| n.id == made && n.metadata.title == "Made elsewhere"));
+
+    // Renamed elsewhere.
+    s.service.edit_node(store, made, "elsewhere", |doc, at| doc.set_title("Renamed", at)).await.unwrap();
+    let affected = heard_all(&api, store, vec![|k| matches!(k, K::MetadataUpdated { .. })]).await;
+    let view = api.shown(store, &affected).await;
+    assert_eq!(view.nodes.iter().find(|n| n.id == made).map(|n| n.metadata.title.as_str()), Some("Renamed"));
+
+    // Moved elsewhere: both lists, as they are now.
+    s.service.move_node(store, made, folder, Place::Last).await.unwrap();
+    let affected = heard_all(&api, store, vec![|k| matches!(k, K::NodeMoved { .. })]).await;
+    // The lists' own documents may still be on their way; what they say is
+    // the same once they are merged.
+    let _ = tokio::time::timeout(Duration::from_millis(300), heard_all(&api, store, vec![|k| matches!(k, K::TreeStructure { .. }), |k| matches!(k, K::TreeStructure { .. })])).await;
+    let view = api.shown(store, &affected).await;
+    let ids = |parent: NodeId| view.lists.iter().find(|l| l.parent == parent).map(|l| l.children.iter().map(|n| n.id).collect::<Vec<_>>());
+    assert_eq!(ids(root), Some(vec![folder]));
+    assert_eq!(ids(folder), Some(vec![made]));
+
+    assert_eq!(counts.fetches(), fetches, "nothing was fetched to show any of it");
     let _ = { s }.server.stop().await;
 }

@@ -74,16 +74,22 @@ fn failed(e: ApiError) -> Option<BackendEvent> {
 
 /// What one change the API heard is for the UI, in order: the update for the
 /// views holding the node (unless this window's own views made it, which
-/// hand it to each other themselves), then the change for the tree. `last`
-/// is the update handed over last: the server announces one update once per
-/// kind of change it made (a content edit that also renamed), and a view
-/// takes it once.
-pub fn change_events(change: Change, client_id: &str, last: &mut Option<(StoreId, NodeId, Vec<u8>)>) -> Vec<BackendEvent> {
+/// hand it to each other themselves), the change itself (what is not a
+/// document's: a link's state, a share that ended, an attachment), and what
+/// it did to the rows and lists of the tree, read from the documents the API
+/// holds now that it merged the change (`BackendEvent::Shown`; nothing is
+/// fetched again). `last` is the update handed over last: the server
+/// announces one update once per kind of change it made (a content edit that
+/// also renamed), and a view takes it once.
+pub async fn change_events(api: &Pimble, change: Change, client_id: &str, last: &mut Option<(StoreId, NodeId, Vec<u8>)>) -> Vec<BackendEvent> {
     match change {
-        Change::Resynced { store } => {
+        Change::Resynced { store, changed } => {
             *last = None;
-            vec![BackendEvent::Resynced { store_id: store }]
+            let mut events = vec![BackendEvent::Resynced { store_id: store }];
+            events.extend(shown(api, store, &pimble_api::Affected::documents(changed)).await);
+            events
         }
+        Change::Rejudged { store, nodes } => shown(api, store, &pimble_api::Affected::rows(nodes)).await.into_iter().collect(),
         Change::Store(c) => {
             let mut events = Vec::new();
             let mine = c.source.as_deref() == Some(client_id);
@@ -94,9 +100,45 @@ pub fn change_events(change: Change, client_id: &str, last: &mut Option<(StoreId
                     *last = Some(key);
                 }
             }
+            let affected = pimble_api::Affected::of(&c.kind);
             events.push(BackendEvent::RemoteStoreChange { store_id: c.store, change_kind: c.kind, source_client_id: c.source });
+            events.extend(shown(api, c.store, &affected).await);
             events
         }
+    }
+}
+
+/// What `affected` is in `store` as the API holds it now, as the event the
+/// tree takes it as; nothing when it touches nothing held.
+pub async fn shown(api: &Pimble, store: StoreId, affected: &pimble_api::Affected) -> Option<BackendEvent> {
+    if affected.is_empty() {
+        return None;
+    }
+    let view = api.shown(store, affected).await;
+    (!view.is_empty()).then_some(BackendEvent::Shown { view })
+}
+
+/// [`shown`] after a structural call this window made, emitted before its
+/// answer: the documents it touched are brought up to date first, so the
+/// tree shows what the call did without waiting for the store's
+/// subscription to say it (which then says the same again).
+async fn show_after(ctx: &Context<'_>, store: StoreId, affected: pimble_api::Affected) {
+    let view = ctx.api.shown_after(store, &affected).await;
+    if !view.is_empty() {
+        ctx.emit(BackendEvent::Shown { view });
+    }
+}
+
+/// What a move did to the tree: a move inside the store, or, when the node
+/// has a new id (it left a share), a deletion where it was and a creation
+/// where it landed.
+fn moved_affected(node_id: NodeId, old_parent_id: NodeId, new_parent_id: NodeId, moved: &pimble_api::Moved) -> pimble_api::Affected {
+    use pimble_rpc::StoreChangeKind as K;
+    if moved.node == node_id {
+        pimble_api::Affected::of(&K::NodeMoved { node_id, old_parent_id, new_parent_id })
+    } else {
+        pimble_api::Affected::of(&K::NodeDeleted { node_id, parent_id: old_parent_id })
+            .and(pimble_api::Affected::of(&K::NodeCreated { node_id: moved.node, parent_id: new_parent_id }))
     }
 }
 
@@ -177,7 +219,10 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
                 },
             };
             match api.backend().create_node(store_id, parent, node_init(title, init), place).await {
-                Ok(node_id) => Some(BackendEvent::NodeCreated { store_id, parent_id: Some(parent), node_id, request }),
+                Ok(node_id) => {
+                    show_after(ctx, store_id, created(node_id, parent)).await;
+                    Some(BackendEvent::NodeCreated { store_id, parent_id: Some(parent), node_id, request })
+                }
                 Err(e) => failed(e),
             }
         }
@@ -201,7 +246,12 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
         },
 
         C::ApplyUpdate { store_id, node_id, update } => match api.apply(Addr::new(store_id, node_id), update).await {
-            Ok(()) => Some(BackendEvent::NodeContentUpdated { store_id, node_id }),
+            Ok(()) => {
+                if let Some(event) = shown(api, store_id, &pimble_api::Affected::rows(vec![node_id])).await {
+                    ctx.emit(event);
+                }
+                Some(BackendEvent::NodeContentUpdated { store_id, node_id })
+            }
             Err(e) => failed(e),
         },
 
@@ -229,7 +279,7 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
                     Ok(())
                 })
                 .await;
-            renamed(ctx, store_id, node_id, edited)
+            renamed(ctx, store_id, node_id, edited).await
         }
 
         C::SetNodeAppearance { store_id, node_id, icon, color, background, tags } => {
@@ -252,7 +302,7 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
                     Ok(())
                 })
                 .await;
-            renamed(ctx, store_id, node_id, edited)
+            renamed(ctx, store_id, node_id, edited).await
         }
 
         C::DeleteNode { store_id, node_id } => {
@@ -262,7 +312,10 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
                 Err(e) => return Ok(failed(e)),
             };
             match api.delete(addr).await {
-                Ok(()) => Some(BackendEvent::NodeDeleted { store_id, node_id, parent_id }),
+                Ok(()) => {
+                    show_after(ctx, store_id, pimble_api::Affected::of(&pimble_rpc::StoreChangeKind::NodeDeleted { node_id, parent_id })).await;
+                    Some(BackendEvent::NodeDeleted { store_id, node_id, parent_id })
+                }
                 Err(e) => failed(e),
             }
         }
@@ -275,7 +328,10 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
                 Err(e) => return Ok(failed(e)),
             };
             match api.backend().move_node(store_id, node_id, new_parent_id, place).await {
-                Ok(moved) => Some(moved_event(store_id, node_id, old_parent_id, title, new_parent_id, moved)),
+                Ok(moved) => {
+                    show_after(ctx, store_id, moved_affected(node_id, old_parent_id, new_parent_id, &moved)).await;
+                    Some(moved_event(store_id, node_id, old_parent_id, title, new_parent_id, moved))
+                }
                 Err(e) => failed(e),
             }
         }
@@ -292,6 +348,11 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
             }
             match api.backend().move_nodes(store_id, node_ids, new_parent_id, place).await {
                 Ok(answer) => {
+                    let affected = before
+                        .iter()
+                        .zip(&answer)
+                        .fold(pimble_api::Affected::default(), |all, ((node_id, old_parent_id, _), moved)| all.and(moved_affected(*node_id, *old_parent_id, new_parent_id, moved)));
+                    show_after(ctx, store_id, affected).await;
                     let mut events: Vec<BackendEvent> = before
                         .into_iter()
                         .zip(answer)
@@ -313,7 +374,11 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
                 Err(e) => return Ok(failed(e)),
             };
             match api.backend().transplant(from_store_id, node_id, to_store_id, new_parent_id, place).await {
-                Ok(moved) => Some(BackendEvent::NodeTransplanted {
+                Ok(moved) => {
+                    use pimble_rpc::StoreChangeKind as K;
+                    show_after(ctx, from_store_id, pimble_api::Affected::of(&K::NodeDeleted { node_id, parent_id: old_parent_id })).await;
+                    show_after(ctx, to_store_id, created(moved.node, new_parent_id)).await;
+                    Some(BackendEvent::NodeTransplanted {
                     from_store_id,
                     old_node_id: node_id,
                     old_parent_id,
@@ -322,7 +387,8 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
                     new_parent_id,
                     title,
                     left_shares: moved.left_shares,
-                }),
+                    })
+                }
                 Err(e) => failed(e),
             }
         }
@@ -332,10 +398,15 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
             if let Err(e) = api.undelete(addr).await {
                 return Ok(failed(e));
             }
-            // Back under its parent: the list it went back into is what the
-            // tree refetches on `NodeCreated`.
+            // Back under its parent: the list it went back into is shown
+            // again, read from the documents as they are now.
             match api.node(addr).await {
-                Ok(node) => Some(BackendEvent::NodeCreated { store_id, parent_id: node.parent_id, node_id, request: None }),
+                Ok(node) => {
+                    if let Some(parent) = node.parent_id {
+                        show_after(ctx, store_id, created(node_id, parent)).await;
+                    }
+                    Some(BackendEvent::NodeCreated { store_id, parent_id: node.parent_id, node_id, request: None })
+                }
                 Err(e) => failed(e),
             }
         }
@@ -427,8 +498,75 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
             None
         }
 
+        // What this device may do in the store changed (a role, a
+        // read-only root): the server's judgement of each node the window
+        // shows is asked again, once, and shown.
+        C::Rejudge { store_id, node_ids } => {
+            let nodes = api.rejudge(store_id, node_ids).await;
+            (!nodes.is_empty()).then_some(BackendEvent::Shown { view: pimble_api::View { store: store_id, nodes, lists: Vec::new(), gone: Vec::new() } })
+        }
+
+        C::CreateMount { store_id, parent_id, source_store_id, source_node_id, title } => {
+            match api.backend().create_mount(store_id, parent_id, source_store_id, source_node_id, title).await {
+                Ok((node_id, mount_ref)) => {
+                    show_after(ctx, store_id, created(node_id, parent_id)).await;
+                    Some(BackendEvent::MountCreated { store_id, parent_id, node_id, mount_ref })
+                }
+                Err(e) => failed(e),
+            }
+        }
+
+        C::GetMountState { store_id, node_id } => match api.backend().mount_state(store_id, node_id).await {
+            Ok((state, mount_ref)) => Some(BackendEvent::MountStateChanged { store_id, node_id, state, mount_ref }),
+            Err(e) => failed(e),
+        },
+
+        // Who else is in the store's documents (docs/PRESENCE_CONTRACT.md):
+        // the frames held now, then each as it comes, for as long as the
+        // subscription lives. A store that has none (an older server, a
+        // store not readable) is no one's business.
+        C::SubscribePresence { store_id } => {
+            let (now, mut frames) = match api.backend().presence(store_id, ctx.client_id).await {
+                Ok(subscribed) => subscribed,
+                Err(e) => {
+                    tracing::debug!("no presence for store {store_id}: {e}");
+                    return Ok(None);
+                }
+            };
+            for frame in now {
+                let _ = ctx.event_tx.try_send(BackendEvent::PresenceFrame { frame });
+            }
+            (ctx.signal_ui)();
+            let (tx, signal) = (ctx.event_tx.clone(), ctx.signal_ui.clone());
+            spawn_task(async move {
+                use futures::StreamExt;
+                while let Some(frame) = frames.next().await {
+                    if let Err(e) = tx.try_send(BackendEvent::PresenceFrame { frame }) {
+                        tracing::debug!("a presence frame was dropped: {e}");
+                    }
+                    signal();
+                }
+            });
+            None
+        }
+
+        // Names (docs/PRESENCE_CONTRACT.md section 3).
+        C::GetPeople { store_id } => match api.backend().people(store_id).await {
+            Ok(people) => Some(BackendEvent::PeopleLoaded { store_id, people }),
+            Err(e) => {
+                tracing::debug!("people of store {store_id} not loaded: {e}");
+                None
+            }
+        },
+
         other => return Err(other),
     })
+}
+
+/// What a new node does to the tree: a row under `parent`, whose list
+/// changed.
+fn created(node_id: NodeId, parent_id: NodeId) -> pimble_api::Affected {
+    pimble_api::Affected::of(&pimble_rpc::StoreChangeKind::NodeCreated { node_id, parent_id })
 }
 
 /// The frame pane `pane` says where it is with: what it holds and where it
@@ -448,16 +586,17 @@ pub fn presence_frame(
     api.frames().frame(store_id, node_id, &pane.to_string(), body)
 }
 
-/// What a rename or an appearance change answers: the tree reads the node
-/// again (`NodeRenamed`), and the views of this window holding it take the
-/// update first.
-fn renamed(ctx: &Context<'_>, store_id: StoreId, node_id: NodeId, edited: Result<pimble_api::Edited<()>, ApiError>) -> Option<BackendEvent> {
+/// What a rename or an appearance change answers: the views of this window
+/// holding the node take the update first, then the tree shows the node as
+/// the edit left it (`Shown`, read from the document the edit was merged
+/// into).
+async fn renamed(ctx: &Context<'_>, store_id: StoreId, node_id: NodeId, edited: Result<pimble_api::Edited<()>, ApiError>) -> Option<BackendEvent> {
     match edited {
         Ok(edited) => {
             if let Some(update) = edited.delta {
                 ctx.emit(BackendEvent::RemoteChanges { store_id, node_id, update });
             }
-            Some(BackendEvent::NodeRenamed { store_id, node_id })
+            shown(ctx.api, store_id, &pimble_api::Affected::rows(vec![node_id])).await
         }
         Err(e) => failed(e),
     }
@@ -528,26 +667,6 @@ pub async fn host_command(ctx: &Context<'_>, cmd: BackendCommand) -> Option<Back
                     tracing::debug!("personal document not synced: {e}");
                     None
                 }
-            }
-        }
-
-        BackendCommand::CreateMount { store_id, parent_id, source_store_id, source_node_id, title } => {
-            let Some(c) = ctx.host.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            match c.create_mount(store_id, parent_id, source_store_id, source_node_id, title).await {
-                Ok((node_id, mount_ref)) => Some(BackendEvent::MountCreated { store_id, parent_id, node_id, mount_ref }),
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
-        BackendCommand::GetMountState { store_id, node_id } => {
-            let Some(c) = ctx.host.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            match c.get_mount_state(store_id, node_id).await {
-                Ok((state, mount_ref)) => Some(BackendEvent::MountStateChanged { store_id, node_id, state, mount_ref }),
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
         }
 
@@ -634,24 +753,15 @@ pub async fn host_command(ctx: &Context<'_>, cmd: BackendCommand) -> Option<Back
             };
 
             // Step 2: mount the source store's root under the target.
-            match c
-                .create_mount(
-                    target_store_id,
-                    target_parent_id,
-                    source.id,
-                    source.root_node_id,
-                    Some(source.name.clone()),
-                )
-                .await
-            {
-                Ok((node_id, mount_ref)) => Some(BackendEvent::MountCreated {
-                    store_id: target_store_id,
-                    parent_id: target_parent_id,
-                    node_id,
-                    mount_ref,
-                }),
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
+            let mount = BackendCommand::CreateMount {
+                store_id: target_store_id,
+                parent_id: target_parent_id,
+                source_store_id: source.id,
+                source_node_id: source.root_node_id,
+                title: Some(source.name.clone()),
+            };
+            // The API's mount, its failure answered as this request's.
+            api_command(ctx, mount).await.unwrap_or(None)
         }
 
         BackendCommand::SetStoreSync { store_id, remote } => {
@@ -767,38 +877,6 @@ pub async fn host_command(ctx: &Context<'_>, cmd: BackendCommand) -> Option<Back
             }
         }
 
-        BackendCommand::SubscribePresence { store_id } => {
-            let c = ctx.host.as_ref()?;
-            let sub = match c.subscribe_presence(store_id, ctx.client_id).await {
-                Ok(sub) => sub,
-                Err(e) => {
-                    tracing::debug!("no presence for store {store_id}: {e}");
-                    return None;
-                }
-            };
-            let mine = ctx.client_id.to_string();
-            let theirs = move |frame: &pimble_rpc::PresenceFrame| frame.client() != mine;
-            for frame in c.get_presence(store_id).await.unwrap_or_default().into_iter().filter(|f| theirs(f)) {
-                let _ = ctx.event_tx.try_send(BackendEvent::PresenceFrame { frame });
-            }
-            (ctx.signal_ui)();
-            let tx = ctx.event_tx.clone();
-            let signal = ctx.signal_ui.clone();
-            let mut sub = sub;
-            spawn_task(async move {
-                while let Some(Ok(frame)) = sub.next().await {
-                    if !theirs(&frame) {
-                        continue;
-                    }
-                    if let Err(e) = tx.try_send(BackendEvent::PresenceFrame { frame }) {
-                        tracing::debug!("a presence frame was dropped: {e}");
-                    }
-                    signal();
-                }
-            });
-            None
-        }
-
         // Names (docs/PRESENCE_CONTRACT.md section 3).
         BackendCommand::CloudListShares => {
             let Some(c) = ctx.host.as_ref() else {
@@ -824,17 +902,6 @@ pub async fn host_command(ctx: &Context<'_>, cmd: BackendCommand) -> Option<Back
                 Err(e) => Some(BackendEvent::CloudError { op: CloudOp::Shares, message: e.to_string() }),
             }
         }
-        BackendCommand::GetPeople { store_id } => {
-            let c = ctx.host.as_ref()?;
-            match c.cloud_people(store_id).await {
-                Ok(people) => Some(BackendEvent::PeopleLoaded { store_id, people }),
-                Err(e) => {
-                    tracing::debug!("people of store {store_id} not loaded: {e}");
-                    None
-                }
-            }
-        }
-
         // Sharing from this computer (docs/RELAY_CONTRACT.md). The link's
         // state arrives afterwards as ordinary `SyncStateChanged`
         // notifications; a refusal is the server's own sentence.

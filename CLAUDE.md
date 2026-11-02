@@ -206,8 +206,17 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
   broadcast per document with `source_client_id: None`. `validate_tree` reports exactly
   what repair fixes.
 - **Notifications name parents** (`NodeCreated`/`NodeDeleted { parent_id }`, `NodeMoved {
-  old_parent_id, new_parent_id }`, `TreeStructure { node_ids }`); the app refetches only
-  those lists. Deleting a node deletes its subtree; the root cannot be deleted.
+  old_parent_id, new_parent_id }`, `TreeStructure { node_ids }`). The app fetches nothing
+  again for them (docs/API_CONTRACT.md wave 5): `pimble_api::Affected::of` says which rows
+  and lists a change touched, `Pimble::shown` reads them from the documents the API holds
+  after merging it (a node made elsewhere is held from the update that announces it; a
+  moved subtree's access is derived again from its new parent, `Change::Rejudged`), and
+  `BackendEvent::Shown` reaches `events::apply_view`, the one place the tree takes a
+  change: rows it shows, lists it loaded (a store's shown roots always), every loaded mount
+  of them, subtrees gone. This window's own structural calls show theirs before their
+  answer (`Pimble::shown_after`); the browser's vault feeds the same view from what it
+  pumps (`web/src/backend.rs` `owe`/`show_owed`). Only what no document says is asked
+  again: a store's changed access sends one `Rejudge` for the nodes shown. Deleting a node deletes its subtree; the root cannot be deleted.
 - **`closeStore` releases the search index** before answering (the old flaky reopen test).
 - rinch's Tree re-renders a row only when its `TreeNodeData` changes: anything a row
   snapshots at render time (context-menu `disabled` states) must be reflected in that data
@@ -413,7 +422,7 @@ target takes about 12 minutes to build.
   `protocol.rs` (`BackendCommand`/`BackendEvent`), `commands.rs` (the adapter onto
   `pimble_api::Pimble`, shared by both backends: `api_command` for every read and write of
   a store, `host_command` for the server operator's RPCs, `change_events` for what the API
-  hears; docs/API_CONTRACT.md wave 5), `rinch_editor.rs` (the editor types from whichever rinch backend is
+  hears (the update for the views, the change, and `Shown` for the tree); docs/API_CONTRACT.md wave 5), `rinch_editor.rs` (the editor types from whichever rinch backend is
   in play). The embedded server, tokio thread and persistence are behind the default
   `native` feature; the `web` feature takes `rinch-web`'s collaboration adapter. rinch is
   declared in `crates/pimble-app/Cargo.toml` with default features off, not in the root

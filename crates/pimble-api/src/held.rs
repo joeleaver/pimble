@@ -91,6 +91,70 @@ impl HeldStore {
         self.tree.apply_update(id, update).is_ok()
     }
 
+    /// Hold `id` from `update` when the update is its whole document: a node
+    /// made elsewhere is announced with the update that brought it into
+    /// being, and a store's root reaches a new replica the same way. Only a
+    /// document that reads whole (its fields there, nothing waiting on state
+    /// this side never had) is taken; an update that continues a document
+    /// not held is left, and the node is fetched when it is asked for.
+    fn adopt_whole(&mut self, id: NodeId, update: &[u8]) {
+        if self.tree.doc(id).is_some() {
+            return;
+        }
+        let Ok(doc) = NodeDoc::load(update) else { return };
+        let whole = {
+            use yrs::{ReadTxn, Transact};
+            !doc.ydoc().transact().has_missing_updates()
+        };
+        if whole && doc.is_initialised() && doc.fields().is_ok() {
+            self.tree.insert_doc(id, doc);
+        }
+    }
+
+    /// Derive again what this principal may do with `id` and the held nodes
+    /// under it from where `id` now is: a node takes its parent's access,
+    /// which is how every holder judges it (a share's role reaches what is
+    /// under its root; a replica's read-only roots make what is under them
+    /// read-only). A share's root keeps its own judgement, an attachment is
+    /// not in the tree, and nothing is derived from a parent not judged.
+    /// Answers the nodes whose access changed.
+    fn inherit(&mut self, id: NodeId) -> Vec<NodeId> {
+        let mut changed = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stack = vec![id];
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n) {
+                continue;
+            }
+            let Some(fields) = self.tree.doc(n).and_then(|d| d.fields().ok()) else { continue };
+            if fields.attached_to.is_some() {
+                continue;
+            }
+            stack.extend(self.listed(n));
+            if fields.custom.contains_key(pimble_core::custom_keys::SHARE) && self.judged.contains_key(&n) {
+                continue;
+            }
+            let Some(parent) = fields.parent_id.and_then(|p| self.judged.get(&p)).map(|j| j.access) else { continue };
+            let held = self.judged.entry(n).or_insert(Judged { access: self.store_access, attachments: 0, stale: false });
+            if held.access != parent {
+                held.access = parent;
+                changed.push(n);
+            }
+        }
+        changed
+    }
+
+    /// Merge an update into a held document, answering whether it changed
+    /// anything there (a catch-up's diff is never empty, even when it brings
+    /// nothing new).
+    pub fn merge_changed(&mut self, id: NodeId, update: &[u8]) -> bool {
+        if self.tree.doc(id).is_none() {
+            return false;
+        }
+        self.absent.remove(&id);
+        self.tree.apply_update(id, update).is_ok_and(|effect| effect.changed)
+    }
+
     /// The live node `id` as an answer carries it: its fields, its whole
     /// document as the content, its children, and the server's judgement.
     /// Children not held yet are named from the stored list, so a count is
@@ -155,8 +219,11 @@ impl Held {
 
     /// What a store's change does to what is held: the update merged into
     /// the document it is about, judgements it may have changed marked to be
-    /// asked again, the store row's link state followed.
-    pub fn apply(&mut self, change: &StoreChange) {
+    /// asked again or derived again, the store row's link state followed.
+    /// Answers the held nodes whose judgement was derived again with another
+    /// access than they had (a folder moved under a root this principal only
+    /// reads), which nothing in their own documents says.
+    pub fn apply(&mut self, change: &StoreChange) -> Vec<NodeId> {
         if let StoreChangeKind::SyncStateChanged { state } = &change.kind {
             if let Some(row) = self.stores.iter_mut().find(|s| s.id == change.store) {
                 row.sync_state = state.clone();
@@ -166,20 +233,25 @@ impl Held {
             // The roots a store shows changed: the rows are listed again.
             self.listed = false;
         }
-        let Some(held) = self.held.get_mut(&change.store) else { return };
+        let Some(held) = self.held.get_mut(&change.store) else { return Vec::new() };
         if let StoreChangeKind::AttachmentChanged { host_id, .. } = &change.kind {
             if let Some(j) = held.judged.get_mut(host_id) {
                 j.stale = true;
             }
         }
-        if let Some(id) = document_of(&change.kind) {
-            // Asked for before and not there; it may be now (put back, or
-            // newly in scope).
-            held.absent.remove(&id);
-            if let Some(update) = change.update.as_deref() {
-                let complete = held.complete;
-                held.merge(id, update, complete);
+        let Some(id) = document_of(&change.kind) else { return Vec::new() };
+        // Asked for before and not there; it may be now (put back, or newly
+        // in scope).
+        held.absent.remove(&id);
+        if let Some(update) = change.update.as_deref() {
+            let complete = held.complete;
+            if !held.merge(id, update, complete) {
+                held.adopt_whole(id, update);
             }
+        }
+        match &change.kind {
+            StoreChangeKind::NodeCreated { node_id, .. } | StoreChangeKind::NodeMoved { node_id, .. } => held.inherit(*node_id),
+            _ => Vec::new(),
         }
     }
 
@@ -189,5 +261,108 @@ impl Held {
         if let Some(held) = self.held.get_mut(&store) {
             held.live = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pimble_core::Place;
+
+    const T: &str = "2026-11-02T00:00:00.000Z";
+
+    /// A store as a server holds it: the root, a folder this principal only
+    /// reads (`Reading`), one it edits (`Mine`), and `Mine/Note/Child`.
+    struct Fixture {
+        server: Tree,
+        held: Held,
+        store: StoreId,
+        reading: NodeId,
+        mine: NodeId,
+        note: NodeId,
+        child: NodeId,
+    }
+
+    fn fixture() -> Fixture {
+        let root = NodeId::new();
+        let mut server = Tree::new(root, "Work", T).unwrap();
+        let [reading, mine, note, child] = [NodeId::new(), NodeId::new(), NodeId::new(), NodeId::new()];
+        server.add_node(reading, Some(root), Place::Last, "folder", "Reading", T).unwrap();
+        server.add_node(mine, Some(root), Place::Last, "folder", "Mine", T).unwrap();
+        server.add_node(note, Some(mine), Place::Last, "document", "Note", T).unwrap();
+        server.add_node(child, Some(note), Place::Last, "document", "Child", T).unwrap();
+        let store = StoreId::new();
+        let mut held = Held::default();
+        let h = held.store_mut(store);
+        for (id, access) in [(root, StoreAccess::Full), (reading, StoreAccess::Read), (mine, StoreAccess::Full), (note, StoreAccess::Full), (child, StoreAccess::Full)] {
+            let mut node = server.node(id).unwrap();
+            node.access = access;
+            h.take(&node);
+        }
+        h.complete = false;
+        Fixture { server, held, store, reading, mine, note, child }
+    }
+
+    fn change(store: StoreId, kind: StoreChangeKind, update: Vec<u8>) -> StoreChange {
+        StoreChange { store, kind, source: Some("elsewhere".into()), update: Some(update) }
+    }
+
+    /// A node moved under a root this principal only reads is read-only
+    /// here at once, and so is everything held under it: their documents
+    /// say nothing of it, so the judgement is derived from where they are.
+    #[test]
+    fn a_move_derives_access_again_for_the_held_subtree() {
+        let mut f = fixture();
+        let edit = f.server.move_node(f.note, f.reading, Place::Last, T).unwrap();
+        let mut rejudged = Vec::new();
+        for (id, update) in edit.touched {
+            let kind = if id == f.note {
+                StoreChangeKind::NodeMoved { node_id: id, old_parent_id: f.mine, new_parent_id: f.reading }
+            } else {
+                StoreChangeKind::TreeStructure { node_ids: vec![id] }
+            };
+            rejudged.extend(f.held.apply(&change(f.store, kind, update)));
+        }
+        let rejudged: HashSet<NodeId> = rejudged.into_iter().collect();
+        assert_eq!(rejudged, HashSet::from([f.note, f.child]));
+        let h = f.held.store(f.store).unwrap();
+        assert_eq!(h.node(f.note).unwrap().access, StoreAccess::Read);
+        assert_eq!(h.node(f.child).unwrap().access, StoreAccess::Read);
+        assert_eq!(h.node(f.mine).unwrap().access, StoreAccess::Full);
+        assert_eq!(h.listed(f.reading), vec![f.note]);
+    }
+
+    /// A node made elsewhere is announced with the update that brought it
+    /// into being: it is held from that, judged as its parent is, and its
+    /// parent lists it, with nothing fetched. An update that continues a
+    /// document not held is not mistaken for one.
+    #[test]
+    fn a_node_made_elsewhere_is_held_from_its_announcement() {
+        let mut f = fixture();
+        let new = NodeId::new();
+        let edit = f.server.add_node(new, Some(f.reading), Place::Last, "document", "New", T).unwrap();
+        for (id, update) in edit.touched {
+            let kind = if id == new {
+                StoreChangeKind::NodeCreated { node_id: id, parent_id: f.reading }
+            } else {
+                StoreChangeKind::TreeStructure { node_ids: vec![id] }
+            };
+            f.held.apply(&change(f.store, kind, update));
+        }
+        let h = f.held.store(f.store).unwrap();
+        let node = h.node(new).expect("held from its announcement");
+        assert_eq!(node.metadata.title, "New");
+        assert_eq!(node.access, StoreAccess::Read, "judged as its parent is");
+        assert_eq!(h.listed(f.reading), vec![new]);
+
+        // A rename of a node never held: only the rename's bytes, which do
+        // not make a document.
+        let elsewhere = NodeId::new();
+        f.server.add_node(elsewhere, Some(f.mine), Place::Last, "document", "Old", T).unwrap();
+        let before = f.server.doc(elsewhere).unwrap().state_vector();
+        f.server.set_title(elsewhere, "Renamed", T).unwrap();
+        let delta = f.server.doc(elsewhere).unwrap().diff_since(&before).unwrap();
+        f.held.apply(&change(f.store, StoreChangeKind::MetadataUpdated { node_id: elsewhere }, delta));
+        assert!(f.held.store(f.store).unwrap().tree.doc(elsewhere).is_none());
     }
 }
