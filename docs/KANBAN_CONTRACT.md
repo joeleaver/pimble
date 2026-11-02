@@ -1,9 +1,10 @@
-# Kanban contract: the first plugin, a layout for view nodes
+# Kanban contract: the first viewer for view nodes, built as a plugin
 
 Status: drafted by the PM on 2026-11-02 from Joe's design (memory
-`project_views_and_plugins_2026_11_02`). Nothing is built. Kanban is **a plugin** built with
-the plugin system (`docs/PLUGINS_CONTRACT.md`) on **view nodes** (`docs/VIEWS_CONTRACT.md`);
-it is the first consumer of both and waits on them. Open decisions at the end.
+`project_views_and_plugins_2026_11_02`). Nothing is built. Kanban is **a viewer, built as a
+plugin** with the plugin system (`docs/PLUGINS_CONTRACT.md`), for **view nodes**
+(`docs/VIEWS_CONTRACT.md`); it is the first consumer of both and waits on them. It declares
+the source shape it needs: a tree two levels deep. Open decisions at the end.
 
 **Naming:** "board" already means a canvas in the code; this is a **kanban** in code and in
 the interface.
@@ -11,29 +12,32 @@ the interface.
 ## 1. What Joe decided
 
 - Cards are ordinary nodes (notes or one-liners).
-- A kanban is a view node with layout `kanban`, its source the node's children, grouped by
-  parent: **columns are the node's children, cards the columns' children.**
+- A kanban is a view node whose viewer is `kanban` and whose source is the node's children,
+  two levels deep (a forest, `docs/VIEWS_CONTRACT.md` section 1.1). The kanban viewer reads
+  that forest its own way: **columns are the first level, cards the second.** Grouping is
+  the viewer's, not core's.
 - **Position in a column is priority**: the top of "To do" is what you pull next.
 - **Swimlanes are a tree of kanban trees**: a kanban whose children are kanbans shows them
   as lanes, columns lined up by name; a lane can be a mount.
 
-## 2. The layout
+## 2. The viewer
 
-- Columns in order; each header is the column node's label, renamed in place (intent
-  "rename group").
+- Columns in order; each header is the column node's label, renamed in place (a rename
+  through `Pimble`).
 - Cards in order, top first; a card shows its label, icon and colors and a subtask count
-  (open decision 1). Opening a card opens it in a pane (intent "open item").
-- Drag a card within or across columns (intent "put item in group after ..."), drag a
-  column (a move of the column node), "+ Add card" at a column's foot, "+ Add column",
-  Delete. Refusals are the explorer's sentences, because core judges the intents through
-  `plan` (`docs/VIEWS_CONTRACT.md` section 1).
-- Read-only nodes show the board with no gestures. Live through the view model.
-- "New Kanban" creates a view node with layout `kanban` and columns To do, Doing, Done
-  (open decision 4), through a recipe the plugin registers.
+  (open decision 1). Opening a card opens it in a pane (a host call).
+- Drag a card within or across columns (a move under the column, after the card above),
+  drag a column (a move of the column node), "+ Add card" at a column's foot (a create
+  under the column, last), "+ Add column", Delete. Refusals are the explorer's sentences,
+  because core judges every edit through `plan` (`docs/VIEWS_CONTRACT.md` section 1.3).
+- Read-only nodes show the board with no gestures. Live: the source's forest follows `Pimble`'s changes.
+- "New Kanban" creates a view node with viewer `kanban`, source its children two levels
+  deep, and columns To do, Doing, Done (open decision 4), through a recipe the plugin
+  registers.
 
 ## 3. Lanes (wave 2)
 
-- Kanban children of a kanban are lanes, top to bottom; their children are their columns.
+- With lanes the source is three levels deep. Kanban children of a kanban are lanes, top to bottom; their children are their columns.
 - Columns line up by name (case- and space-insensitive) when every lane agrees; otherwise
   each lane draws its own headers.
 - A drag into another lane goes to its same-named column; a lane from another store makes

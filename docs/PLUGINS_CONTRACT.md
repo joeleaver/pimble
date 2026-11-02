@@ -4,7 +4,7 @@ Status: drafted by the PM on 2026-11-02 from Joe's direction (memory
 `project_views_and_plugins_2026_11_02`) and a read-only study of rinch at the pinned
 revision (`2d1f11a0`, cargo checkout) and of `crates/pimble-plugins`. Nothing is built.
 Open decisions at the end. View nodes (`docs/VIEWS_CONTRACT.md`) are a separate, generic
-concept that plugins can provide layouts for; the kanban (`docs/KANBAN_CONTRACT.md`) is the
+concept whose viewers plugins provide; the kanban (`docs/KANBAN_CONTRACT.md`) is the
 first plugin.
 
 ## 1. What Joe decided (2026-11-02)
@@ -90,9 +90,10 @@ first plugin.
 
 ### 3.3 Mount points
 
-1. **A view node's layout** (`docs/VIEWS_CONTRACT.md`): a pane opening a node with
-   `view:layout = <name>` mounts the plugin that provides `<name>`, with the view model as
-   props; the plugin answers with intents or `Pimble` calls.
+1. **A view node's viewer** (`docs/VIEWS_CONTRACT.md`): a pane opening a node with
+   `view:viewer = <id>` mounts the plugin that provides that viewer, with the source's
+   forest and the viewer's settings as props; the plugin acts through `Pimble`, and core
+   judges its edits. A viewer declares the source shapes it can show.
 2. **A node type** (later): a pane opening a node whose type a plugin provides.
 3. **Embedded in text** (later): a node view matched on `data-plugin=<id>`; the attribute
    verbs (`set_attrs`, `delete`, `select`) become host calls.
@@ -112,7 +113,7 @@ first plugin.
 ### 3.5 Packaging
 
 - A plugin is a `.wasm` file with a manifest it returns from `describe`: id, name, version,
-  ABI version, rinch revision it was built against, what it provides (view layouts, node
+  ABI version, rinch revision it was built against, what it provides (viewers and the source shapes they take, node
   types, embeds, recipes such as "New Kanban"), and what it asks for.
 - **ABI and rinch versions are checked at load**: a plugin built against another ABI or an
   incompatible rinch is refused with a sentence, and the view falls back to an outline.
@@ -139,7 +140,7 @@ first plugin.
 0. **wasmtime behind a feature** (hosted builds stop paying for it) and `NodePlugin`
    retired to the `index_units` registry.
 1. **The guest SDK and the desktop host with a toy plugin**: `RemoteDocument`, the op log,
-   events, runtime hooks, epoch interruption, ABI/version checks; a "hello" view layout
+   events, runtime hooks, epoch interruption, ABI/version checks; a "hello" viewer
    that renders rinch components and handles clicks and keys. The rinch gating PR.
 2. **The API bridge**: `GuestBackend`, call/resolve, the change stream, attribution,
    install-time permissions.
