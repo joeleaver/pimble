@@ -1,5 +1,5 @@
 //! Editor integration: the rinch `Editor {}` component + `EditorHandle`, with
-//! M9 collaboration wired onto pimble's existing per-node change relay.
+//! rinch's collaboration wired onto the API through `crate::doc_session`.
 //!
 //! Pimble has four pane slots (docs/SPLIT_VIEW_CONTRACT.md), each with its own
 //! editor, mounted once, into which the pane's document is swapped. So there
@@ -7,11 +7,12 @@
 //! pane that holds a document has its own collaboration session.
 //! Collaboration maps cleanly onto pimble's transport:
 //!
-//! * a local edit's delta → `outbound` → [`BackendCommand::BroadcastChanges`] → the
-//!   server applies it (`apply_edit` → `ContentDoc::apply_update`) and relays it to
-//!   peers; the same delta goes straight to every other pane in this window that
-//!   holds the node, because the server relays to other clients and not back;
-//! * a peer's delta arrives as `BackendEvent::RemoteChanges` →
+//! * a local edit's delta → `outbound` → `doc_session::send` → the API's
+//!   `applyEdit`, which the server merges and relays to peers; the same delta
+//!   goes straight to every other pane in this window that holds the node,
+//!   because the server relays to other clients and not back;
+//! * a peer's delta arrives on the node's store subscription as
+//!   `BackendEvent::RemoteChanges` → `doc_session::received` →
 //!   [`apply_remote`] → [`EditorHandle::collab_receive`] of every pane holding
 //!   the node.
 //!
@@ -213,7 +214,6 @@ pub(crate) fn start_editing(
     // and relays it to the other clients. The closure captures only `Copy` values
     // (AppStore/StoreId/NodeId), so it is itself `Copy` and can be reused below.
     let outbound = move |delta: Vec<u8>| {
-        use base64::Engine;
         // A document shared read-only takes remote changes but sends none
         // back. The editor refuses the edit before it gets here
         // ([`set_read_only`], which the pane switches as the access changes),
@@ -233,14 +233,9 @@ pub(crate) fn start_editing(
         // Typing, however it arrives (a key, a paste, an input method), takes
         // the pane back from whoever it follows.
         crate::presence::follow::stop(pane);
-        let changes = base64::engine::general_purpose::STANDARD.encode(&delta);
         // The note's sheets in this window hold its document too.
         crate::sheets::text_delta(store, store_id, node_id, &delta);
-        store.send(BackendCommand::BroadcastChanges {
-            store_id,
-            node_id,
-            changes,
-        });
+        crate::doc_session::send(store, store_id, node_id, delta.clone());
         // The same note open in another pane of this window: the server
         // relays to other clients, not back to the one that sent, so the
         // window hands the delta across itself. Never to this pane.
@@ -311,11 +306,8 @@ pub(crate) fn start_editing(
         // (docs/DISCUSSIONS_CONTRACT.md section 8b).
         crate::places::restore(pane, store_id, node_id);
     }
-    // See edits from other clients: once per node, however many panes hold
-    // it.
-    if already_open.is_empty() {
-        store.send(BackendCommand::SubscribeNodeChanges { store_id, node_id });
-    }
+    // Edits from other clients arrive on the store's subscription
+    // (`doc_session::received`), however many panes hold the node.
     // Offline-first open: the session started from the cached bytes above
     // (instant, no flash); now reconcile with the server's copy, which may
     // hold edits this cache never saw (this window's own earlier session,
@@ -359,10 +351,9 @@ pub(crate) fn stop_editing(store: AppStore, pane: PaneId) {
         crate::link_picker::close(store);
     }
     state.active_edit.set(None);
-    // The last pane holding the node lets go of its subscription and of the
-    // label refresh it may be owed.
+    // The last pane holding the node lets go of the label refresh it may
+    // be owed.
     if !store.is_editing(active.store_id, active.node_id) {
-        store.send(BackendCommand::UnsubscribeNodeChanges { store_id: active.store_id, node_id: active.node_id });
         cancel_pending_label_refresh(active.store_id, active.node_id);
     }
     crate::toolbar::bump_toolbar(pane);
@@ -385,7 +376,7 @@ pub(crate) fn set_read_only(pane: PaneId, read_only: bool) {
 /// connection comes back after a failover.
 pub(crate) fn request_reconcile(store: AppStore, pane: PaneId, store_id: StoreId, node_id: NodeId) {
     if let Some(state_vector) = editor(pane).collab_state_vector() {
-        store.send(BackendCommand::ReconcileNodeContent { store_id, node_id, state_vector });
+        crate::doc_session::ask(store, store_id, node_id, state_vector);
     }
 }
 
@@ -414,16 +405,10 @@ pub(crate) fn apply_reconcile(
         // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"). Without this the
         // reconcile that follows every open pushes the freshly hosted empty
         // document, and the server refuses it out loud.
-        if !store.node_access(store_id, node_id).allows_write() {
+        if !crate::doc_session::writable(store, store_id, node_id) {
             continue;
         }
-        if let Some(ours) = handle.collab_sync_diff(server_state_vector) {
-            if !ours.is_empty() {
-                use base64::Engine;
-                let changes = base64::engine::general_purpose::STANDARD.encode(&ours);
-                store.send(BackendCommand::BroadcastChanges { store_id, node_id, changes });
-            }
-        }
+        crate::doc_session::send_back(store, store_id, node_id, handle.collab_sync_diff(server_state_vector));
     }
 }
 
@@ -538,18 +523,14 @@ mod tests {
         assert!(handle.insert_text(text));
     }
 
-    fn subscribes(commands: &[BackendCommand], node_id: NodeId) -> usize {
-        commands.iter().filter(|c| matches!(c, BackendCommand::SubscribeNodeChanges { node_id: n, .. } if *n == node_id)).count()
-    }
-
-    fn unsubscribes(commands: &[BackendCommand], node_id: NodeId) -> usize {
-        commands.iter().filter(|c| matches!(c, BackendCommand::UnsubscribeNodeChanges { node_id: n, .. } if *n == node_id)).count()
+    fn reconciles(commands: &[BackendCommand], node_id: NodeId) -> usize {
+        commands.iter().filter(|c| matches!(c, BackendCommand::ReconcileNodeContent { node_id: n, .. } if *n == node_id)).count()
     }
 
     /// The same note in two panes (docs/SPLIT_VIEW_CONTRACT.md "Editors and
     /// collaboration"): what is typed in one appears in the other and goes
-    /// to the server once; a peer's delta reaches both and no other pane;
-    /// the node is subscribed once and let go of when the last pane does.
+    /// to the server once; a peer's delta reaches both and no other pane.
+    /// No pane subscribes to its node: the store's subscription carries it.
     #[test]
     fn the_same_note_in_two_panes_is_one_document() {
         let (store, commands) = store_with_commands();
@@ -562,8 +543,11 @@ mod tests {
         start_editing(store, P[2], store_id, other_id, &[]);
         assert_eq!(store.panes_editing(store_id, node_id), vec![P[0], P[1]]);
         let sent: Vec<BackendCommand> = commands.try_iter().collect();
-        assert_eq!(subscribes(&sent, node_id), 1, "once per node, however many panes hold it");
-        assert_eq!(subscribes(&sent, other_id), 1);
+        // Each pane asks for what its copy lacks (the note's other views,
+        // its sheets and canvases in text, may ask too).
+        assert!(reconciles(&sent, node_id) >= 2);
+        assert!(reconciles(&sent, other_id) >= 1);
+        assert!(!sent.iter().any(|c| matches!(c, BackendCommand::SubscribeStoreChanges { .. })), "nothing is subscribed per node");
 
         type_at_end(P[0], "typed in the first");
         assert_eq!(doc_text(&editor(P[1])), "typed in the first", "the window hands the delta across");
@@ -593,15 +577,13 @@ mod tests {
         assert_eq!(doc_text(&editor(P[2])), "", "and not the pane on another note");
         let _ = commands.try_iter().count();
 
-        // Letting go: the subscription lasts as long as one pane holds it.
+        // Letting go: the node is held as long as one pane holds it.
         stop_editing(store, P[0]);
-        let sent: Vec<BackendCommand> = commands.try_iter().collect();
-        assert_eq!(unsubscribes(&sent, node_id), 0, "the second pane still holds it");
+        assert!(store.is_editing(store_id, node_id), "the second pane still holds it");
         type_at_end(P[1], "!");
         assert!(doc_text(&editor(P[1])).ends_with("second!"), "the pane left keeps working");
         stop_editing(store, P[1]);
-        let sent: Vec<BackendCommand> = commands.try_iter().collect();
-        assert_eq!(unsubscribes(&sent, node_id), 1, "the last pane lets go of it");
+        assert!(!store.is_editing(store_id, node_id), "the last pane lets go of it");
         assert!(store.edited_nodes() == vec![ActiveEdit { store_id, node_id: other_id }]);
         stop_editing(store, P[2]);
     }

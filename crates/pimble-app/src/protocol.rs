@@ -1,10 +1,14 @@
 //! The seam between the UI and whatever is behind it.
 //!
 //! The UI sends a [`BackendCommand`] and consumes a [`BackendEvent`], and knows
-//! nothing else about how either travels. Two implementations fill that in:
-//! the desktop's `backend` module (a background thread with a tokio runtime and
-//! an embedded `PimbleServer`, behind the `native` feature) and the web app's
-//! command loop on `wasm_bindgen_futures::spawn_local` against a hosted server.
+//! nothing else about how either travels. Behind it, every command that reads
+//! or writes a store is a call on `pimble_api::Pimble` (`crate::commands`,
+//! docs/API_CONTRACT.md wave 5), and every change to a store the API hears
+//! comes back as events. Two implementations own the API and the channels:
+//! the desktop's `backend` module (a background thread with a tokio runtime
+//! and an embedded `PimbleServer`, behind the `native` feature) and the web
+//! app's command loop on `wasm_bindgen_futures::spawn_local` against hosted
+//! servers and the browser's vault.
 //!
 //! [`BackendHandle`] is the pair of channels itself, so both implementations
 //! hand the UI the same thing. Only `BackendHandle::spawn` is native; `send`
@@ -128,12 +132,13 @@ pub enum BackendCommand {
         node_id: NodeId,
     },
 
-    // Collaborative editing — broadcast incremental changes to server
+    /// A view of this window changed a node's document (typing, a stroke
+    /// on a canvas, a sheet's cell): `update` is the yrs update it made,
+    /// sent through `applyEdit`, unanswered (`crate::doc_session::send`).
     BroadcastChanges {
         store_id: StoreId,
         node_id: NodeId,
-        /// Base64-encoded incremental yrs change bytes
-        changes: String,
+        update: Vec<u8>,
     },
 
     /// Reconcile the editor's collaboration session with the server's copy
@@ -153,18 +158,12 @@ pub enum BackendCommand {
     /// `BlobLoaded`.
     GetBlob { url: BlobUrl },
 
-    // Subscription operations
+    /// Hear a store's changes (`Pimble::watch`): every document's update
+    /// arrives as `RemoteChanges` for the views holding it and as
+    /// `RemoteStoreChange` for the tree, for as long as the store is open,
+    /// across lost connections. There is no subscription per node: a view
+    /// holding a node hears it through its store's.
     SubscribeStoreChanges { store_id: StoreId },
-    /// Sent once per node however many panes hold it, when the first pane
-    /// opens it (docs/SPLIT_VIEW_CONTRACT.md "Editors and collaboration").
-    SubscribeNodeChanges { store_id: StoreId, node_id: NodeId },
-    /// The last pane holding the node let go of it.
-    UnsubscribeNodeChanges { store_id: StoreId, node_id: NodeId },
-
-    /// Internal: the connection watchdog saw the WebSocket close. Carries the
-    /// connection generation it watched so a stale watchdog (from before a
-    /// reconnect) is ignored.
-    ConnectionLost { generation: u64 },
 
     // Search
     /// `purpose` says whose results these are, and comes back on
@@ -296,6 +295,53 @@ pub enum BackendCommand {
     CloudStopSharing { store_id: StoreId, node_id: NodeId },
 }
 
+/// Which request a failure answers, for the commands a modal waits on
+/// (docs/API_CONTRACT.md wave 5, "answers instead of guesses"): the error
+/// reaches the modal that asked because the adapter says which command it
+/// answers (`BackendEvent::Failed`), not because the modal happens to be
+/// waiting when some error arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asked {
+    /// "Add Remote Store..." and "Mount Remote Store Here...".
+    AddRemoteStore,
+    /// The link modal's `SetStoreSync`.
+    SetStoreSync,
+    RemoveReplica,
+    /// "New Store...": a store file on the desktop, a hosted store in the
+    /// browser.
+    CreateStore,
+    /// The mount picker's `CreateMount`.
+    CreateMount,
+    /// "Recently Deleted...": its list, and putting a tombstone back.
+    ListDeleted,
+    UndeleteNode,
+}
+
+impl Asked {
+    /// The request `cmd` is, when a failure of it has a modal to go to.
+    pub fn of(cmd: &BackendCommand) -> Option<Asked> {
+        Some(match cmd {
+            BackendCommand::AddRemoteStore { .. } | BackendCommand::MountRemoteStore { .. } => Asked::AddRemoteStore,
+            BackendCommand::SetStoreSync { .. } => Asked::SetStoreSync,
+            BackendCommand::RemoveReplica { .. } => Asked::RemoveReplica,
+            BackendCommand::CreateStore { .. } | BackendCommand::CreateHostedStore { .. } => Asked::CreateStore,
+            BackendCommand::CreateMount { .. } => Asked::CreateMount,
+            BackendCommand::ListDeleted { .. } => Asked::ListDeleted,
+            BackendCommand::UndeleteNode { .. } => Asked::UndeleteNode,
+            _ => return None,
+        })
+    }
+
+    /// `answer` as the event the UI takes it as: an `Error` answering a
+    /// request a modal waits on becomes `Failed`, naming the request.
+    pub fn answer(asked: Option<Asked>, answer: Option<BackendEvent>) -> Option<BackendEvent> {
+        match (asked, answer) {
+            (Some(asked), Some(BackendEvent::Error { message })) => Some(BackendEvent::Failed { asked, message }),
+            (_, answer) => answer,
+        }
+    }
+}
+
 /// Which cloud request an outcome belongs to (docs/DESKTOP_ACCOUNT_CONTRACT.md
 /// decision 3): every cloud event names its operation, so the event handler
 /// routes an error to the modal that asked without a pending flag.
@@ -332,6 +378,16 @@ pub struct NodeInit {
     pub request: Option<u64>,
 }
 
+impl NodeInit {
+    /// A recipe's node (`pimble_api::recipes`, the one place a new node of
+    /// each kind is described) as the command carries it: its title goes on
+    /// the command, `request` comes back on `NodeCreated`.
+    pub fn of(recipe: pimble_api::NodeInit, request: Option<u64>) -> (String, NodeInit) {
+        let init = NodeInit { node_type: recipe.node_type, content: recipe.content.unwrap_or_default(), custom: recipe.custom, request };
+        (recipe.title, init)
+    }
+}
+
 /// A picture that was stored (`BackendEvent::BlobStored`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredBlob {
@@ -349,6 +405,9 @@ pub enum BackendEvent {
     Connected { server_addr: String, client_id: String },
     Disconnected,
     Error { message: String },
+    /// A request a modal waits on failed (`Asked::answer`): the sentence
+    /// goes to that modal.
+    Failed { asked: Asked, message: String },
 
     // Store events
     StoreCreated { store_id: StoreId, root_node_id: NodeId },
@@ -431,10 +490,17 @@ pub enum BackendEvent {
     RemoteStoreChange { store_id: StoreId, change_kind: pimble_rpc::StoreChangeKind, source_client_id: Option<String> },
 
     // Collaborative editing
-    /// Remote incremental changes of one node arrived: apply them to the
-    /// collab session of every pane that holds it. The node is named because
-    /// several panes hold different documents at once.
-    RemoteChanges { store_id: StoreId, node_id: NodeId, changes: String },
+    /// An update of one node's document that this window's views did not
+    /// make (another device's, an agent's, a write the API made for this
+    /// window such as a rename): every view holding the node merges it
+    /// (`crate::doc_session::received`). The node is named because several
+    /// views hold different documents at once.
+    RemoteChanges { store_id: StoreId, node_id: NodeId, update: Vec<u8> },
+    /// A store's changes were not heard for a while (its subscription was
+    /// made again after the connection came back) and what the API holds
+    /// of it was brought up to date: what is shown of it is read again, and
+    /// every view holding one of its nodes reconciles.
+    Resynced { store_id: StoreId },
 
     // Pictures
     /// Answer to `PutBlob`: the URL the document should carry and, when the

@@ -778,25 +778,24 @@ pub(crate) fn link_resolved(store: AppStore, url: &PimbleUrl, hops: usize, resol
     let Some(srcs) = srcs else {
         return true;
     };
+    let _ = held;
     if let Some((store_id, node_id)) = live {
-        if !held {
-            store.send(BackendCommand::SubscribeNodeChanges { store_id, node_id });
-        }
-        store.send(BackendCommand::ReconcileNodeContent { store_id, node_id, state_vector: NodeDoc::new().state_vector() });
+        crate::doc_session::ask(store, store_id, node_id, NodeDoc::new().state_vector());
     }
     schedule(srcs, true);
     true
 }
 
-/// Whether an embed in this window holds the node's subscription.
+/// Whether an embed in this window holds the node.
 pub(crate) fn embed_holds(store_id: StoreId, node_id: NodeId) -> bool {
     EMBEDS.with(|embeds| {
         embeds.borrow().values().any(|e| matches!(&e.state, EmbedState::Live { store_id: s, node_id: n, .. } if (*s, *n) == (store_id, node_id)))
     })
 }
 
-/// The connection came back: every embed's subscription died with it.
-pub(crate) fn reconnected(store: AppStore) {
+/// The connection came back (or `only` was heard again after a gap): every
+/// embed (of that store) reconciles.
+pub(crate) fn reconnected(store: AppStore, only: Option<StoreId>) {
     let live: Vec<(StoreId, NodeId, Vec<u8>)> = EMBEDS.with(|embeds| {
         embeds
             .borrow()
@@ -809,16 +808,12 @@ pub(crate) fn reconnected(store: AppStore) {
             })
             .collect()
     });
-    let edited = store.edited_nodes();
     let mut done = HashSet::new();
     for (store_id, node_id, state_vector) in live {
-        if !done.insert((store_id, node_id)) {
+        if only.is_some_and(|o| o != store_id) || !done.insert((store_id, node_id)) {
             continue;
         }
-        if !edited.iter().any(|e| (e.store_id, e.node_id) == (store_id, node_id)) {
-            store.send(BackendCommand::SubscribeNodeChanges { store_id, node_id });
-        }
-        store.send(BackendCommand::ReconcileNodeContent { store_id, node_id, state_vector });
+        crate::doc_session::ask(store, store_id, node_id, state_vector);
     }
 }
 
@@ -890,11 +885,7 @@ fn sweep(store: AppStore) {
                 r.asked.remove(src);
             }
         });
-        if let Some((store_id, node_id)) = live {
-            if !store.is_editing(store_id, node_id) {
-                store.send(BackendCommand::UnsubscribeNodeChanges { store_id, node_id });
-            }
-        }
+        let _ = live;
     }
     for src in shown {
         if let Some(Source::Embed(url)) = parse_source(&src) {
@@ -1481,7 +1472,6 @@ fn convert(store: AppStore, pane: PaneId, hover: &PictureHover) {
     };
     let fallback = if blob.is_some() { "Picture" } else { "Canvas" };
     let title = if hover.alt.trim().is_empty() { fallback.to_string() } else { hover.alt.clone() };
-    let icon = pimble_board::recipe::canvas_icon(blob.is_some());
     let request = NEXT_REQUEST.with(|n| n.replace(n.get() + 1));
     CONVERTS.with(|c| {
         c.borrow_mut().insert(
@@ -1490,7 +1480,7 @@ fn convert(store: AppStore, pane: PaneId, hover: &PictureHover) {
         )
     });
     store.pane(pane).picture.set(None);
-    crate::boards::create_board_node(store, active.store_id, active.node_id, &title, icon, board, Some(request));
+    crate::boards::create_board_node(store, active.store_id, active.node_id, &title, blob.is_some(), board, Some(request));
 }
 
 /// A node made for a request of this module: the picture it was made from
@@ -1884,16 +1874,15 @@ mod tests {
     /// The first broadcast of node `node` in `sent`, applied to an empty
     /// document: what a peer gets first.
     fn first_broadcast(sent: &[BackendCommand], node: NodeId) -> NodeDoc {
-        use base64::Engine;
-        let changes = sent
+        let update = sent
             .iter()
             .find_map(|c| match c {
-                BackendCommand::BroadcastChanges { node_id, changes, .. } if *node_id == node => Some(changes.clone()),
+                BackendCommand::BroadcastChanges { node_id, update, .. } if *node_id == node => Some(update.clone()),
                 _ => None,
             })
             .expect("a broadcast");
         let mut doc = NodeDoc::new();
-        doc.apply_update(&base64::engine::general_purpose::STANDARD.decode(changes).unwrap()).unwrap();
+        doc.apply_update(&update).unwrap();
         doc
     }
 
@@ -2111,7 +2100,6 @@ mod tests {
         assert!(link_resolved(store, &url.link(), 0, &LinkResolution::Live { store_id, node_id: board_node }));
         assert!(embed_holds(store_id, board_node) && store.is_editing(store_id, board_node));
         let sent: Vec<BackendCommand> = commands.try_iter().collect();
-        assert!(sent.iter().any(|c| matches!(c, BackendCommand::SubscribeNodeChanges { node_id, .. } if *node_id == board_node)));
         assert!(sent.iter().any(|c| matches!(c, BackendCommand::ReconcileNodeContent { node_id, .. } if *node_id == board_node)));
 
         // Its document arrives: drawn.
@@ -2140,8 +2128,7 @@ mod tests {
         }));
         sweep(store);
         assert!(!embed_holds(store_id, board_node));
-        let sent: Vec<BackendCommand> = commands.try_iter().collect();
-        assert!(sent.iter().any(|c| matches!(c, BackendCommand::UnsubscribeNodeChanges { node_id, .. } if *node_id == board_node)));
+        assert!(!store.is_editing(store_id, board_node));
         crate::editor::stop_editing(store, P[3]);
     }
 

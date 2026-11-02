@@ -133,22 +133,15 @@ pub(super) fn sync(store: AppStore) {
         // again (it may have been deleted or put back meanwhile).
         r.retain(|n, read| wanted.contains(n) || read.resolution.is_none());
     });
+    // Its store's subscription brings its changes from now on; what the
+    // cache has may be as old as its last fetch.
     for t in subscribe {
-        store.send(BackendCommand::SubscribeNodeChanges { store_id: t.store, node_id: t.node });
-        // What the cache has may be as old as its last fetch.
         store.send(BackendCommand::GetNode { store_id: t.store, node_id: t.node });
-    }
-    for (_, old, _) in changes {
-        if let Some(t) = old {
-            if !store.is_editing(t.store, t.node) {
-                store.send(BackendCommand::UnsubscribeNodeChanges { store_id: t.store, node_id: t.node });
-            }
-        }
     }
 }
 
-/// Whether a sheet of this window reads node `node_id` and holds its
-/// subscription (counted with the panes holding nodes, `AppStore::is_editing`).
+/// Whether a sheet of this window reads node `node_id` (counted with the
+/// panes holding nodes, `AppStore::is_editing`).
 pub(crate) fn holds(store_id: StoreId, node_id: NodeId) -> bool {
     let t = node_ref(store_id, node_id);
     READS.with(|r| r.borrow().values().any(|read| read.subscribed == Some(t)))
@@ -165,11 +158,11 @@ pub(crate) fn remote(store: AppStore, store_id: StoreId, node_id: NodeId, bytes:
     }
 }
 
-/// The connection came back: every read note is subscribed and fetched again.
-pub(crate) fn reconnected(store: AppStore) {
+/// The connection came back (or `only` was heard again after a gap): every
+/// read note (of that store) is fetched again.
+pub(crate) fn reconnected(store: AppStore, only: Option<StoreId>) {
     let held: Vec<NodeRef> = READS.with(|r| r.borrow().values().filter_map(|read| read.subscribed).collect::<HashSet<_>>().into_iter().collect());
-    for t in held {
-        store.send(BackendCommand::SubscribeNodeChanges { store_id: t.store, node_id: t.node });
+    for t in held.into_iter().filter(|t| only.is_none_or(|o| o == t.store)) {
         store.send(BackendCommand::GetNode { store_id: t.store, node_id: t.node });
     }
 }

@@ -4834,14 +4834,17 @@ dependencies = [
 name = "pimble-app"
 version = "0.15.1"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "chrono",
  "crossbeam-channel",
  "dirs",
  "ed25519-dalek",
+ "futures",
  "image",
  "js-sys",
  "open",
+ "pimble-api",
  "pimble-board",
  "pimble-client",
  "pimble-core",

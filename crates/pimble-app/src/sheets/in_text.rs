@@ -773,10 +773,10 @@ mod tests {
         // It got its siblings' field names, empty.
         let sent: Vec<BackendCommand> = commands.try_iter().collect();
         let field_write = sent.iter().find_map(|c| match c {
-            BackendCommand::BroadcastChanges { node_id: n, changes, .. } if *n == made => Some(changes.clone()),
+            BackendCommand::BroadcastChanges { node_id: n, update, .. } if *n == made => Some(update.clone()),
             _ => None,
         });
-        let bytes = { use base64::Engine; base64::engine::general_purpose::STANDARD.decode(field_write.expect("a field write")).unwrap() };
+        let bytes = field_write.expect("a field write");
         let mut probe = NodeDoc::new();
         probe.apply_update(&bytes).unwrap();
         assert_eq!(probe.node_fields(), vec![("rate".to_string(), String::new())]);
@@ -836,7 +836,7 @@ mod tests {
 
         assert!(reads::link_resolved(store, &url, &pimble_core::LinkResolution::Live { store_id, node_id: b }));
         let sent: Vec<BackendCommand> = commands.try_iter().collect();
-        assert!(sent.iter().any(|c| matches!(c, BackendCommand::SubscribeNodeChanges { node_id: n, .. } if *n == b)), "held while read");
+        assert!(sent.iter().any(|c| matches!(c, BackendCommand::GetNode { node_id: n, .. } if *n == b)), "read afresh while read");
         assert!(store.is_editing(store_id, b));
 
         // A peer adds a row to Budget: the total follows.
@@ -848,8 +848,6 @@ mod tests {
 
         // No longer read: let go.
         local_edit(store, P[0], |t| t.delete_column(&table, &col));
-        let sent: Vec<BackendCommand> = commands.try_iter().collect();
-        assert!(sent.iter().any(|c| matches!(c, BackendCommand::UnsubscribeNodeChanges { node_id: n, .. } if *n == b)));
         assert!(!store.is_editing(store_id, b));
 
         // A deleted note: #REF!, and why.

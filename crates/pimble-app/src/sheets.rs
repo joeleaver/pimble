@@ -403,9 +403,6 @@ pub(crate) fn sync_embeds(store: AppStore) {
             let bytes = x.session.doc.save();
             sig.update(|node| node.content = merged(&node.content, &bytes));
         }
-        if !store.is_editing(key.0, key.1) {
-            store.send(BackendCommand::UnsubscribeNodeChanges { store_id: key.0, node_id: key.1 });
-        }
     }
     for (key, panes) in wanted {
         let held = EMBEDS.with(|e| {
@@ -435,15 +432,11 @@ pub(crate) fn sync_embeds(store: AppStore) {
         };
         EMBED_ASKED.with(|a| a.borrow_mut().remove(&key));
         let Ok(doc) = NodeDoc::load(&bytes) else { continue };
-        let subscribe = !store.is_editing(key.0, key.1);
         let sheets = Sheets::of_node(&doc).with_origin(format!("pimble-sheet-embed-{}", key.1));
         let undo = sheets.undo_manager(undo_options());
         let session = Session { store_id: key.0, node_id: key.1, doc, sheets, undo, in_text: false, reads: Vec::new() };
         touched.extend(panes.iter().copied());
         EMBEDS.with(|e| e.borrow_mut().insert(key, Embedded { session, panes }));
-        if subscribe {
-            store.send(BackendCommand::SubscribeNodeChanges { store_id: key.0, node_id: key.1 });
-        }
         request_reconcile_slot(store, Slot::Embed(key.0, key.1));
     }
     for pane in touched {
@@ -451,12 +444,11 @@ pub(crate) fn sync_embeds(store: AppStore) {
     }
 }
 
-/// The connection came back: every embedded sheet node is subscribed and
-/// reconciled again.
-pub(crate) fn embeds_reconnected(store: AppStore) {
+/// The connection came back (or `only` was heard again after a gap):
+/// every embedded sheet node (of that store) reconciles.
+pub(crate) fn embeds_reconnected(store: AppStore, only: Option<StoreId>) {
     let keys: Vec<(StoreId, NodeId)> = EMBEDS.with(|e| e.borrow().keys().copied().collect());
-    for (s, n) in keys {
-        store.send(BackendCommand::SubscribeNodeChanges { store_id: s, node_id: n });
+    for (s, n) in keys.into_iter().filter(|(s, _)| only.is_none_or(|o| o == *s)) {
         request_reconcile_slot(store, Slot::Embed(s, n));
     }
 }
@@ -539,10 +531,8 @@ fn open(store: AppStore, pane: PaneId, store_id: StoreId, node_id: NodeId, conte
     ui.message.set(None);
     if !in_text {
         state.sheet.set(Some(ActiveEdit { store_id, node_id }));
-        if first {
-            store.send(BackendCommand::SubscribeNodeChanges { store_id, node_id });
-        }
     }
+    let _ = first;
     request_reconcile(store, pane);
     recompute(store, pane);
     if in_text {
@@ -551,8 +541,7 @@ fn open(store: AppStore, pane: PaneId, store_id: StoreId, node_id: NodeId, conte
 }
 
 /// Stop showing pane `pane`'s sheet, if it shows one: the node cache gets the
-/// document as this pane last had it, and the last pane holding the node lets
-/// go of its subscription.
+/// document as this pane last had it.
 pub(crate) fn stop(store: AppStore, pane: PaneId) {
     let Some(session) = SESSIONS.with(|sessions| sessions.borrow_mut()[pane.index()].take()) else { return };
     end_typing();
@@ -578,9 +567,6 @@ pub(crate) fn stop(store: AppStore, pane: PaneId) {
         return;
     }
     state.sheet.set(None);
-    if !store.is_editing(session.store_id, session.node_id) {
-        store.send(BackendCommand::UnsubscribeNodeChanges { store_id: session.store_id, node_id: session.node_id });
-    }
 }
 
 /// `ours` merged into the document `cached` (either may be empty).
@@ -616,7 +602,7 @@ pub(crate) fn request_reconcile(store: AppStore, pane: PaneId) {
 
 fn request_reconcile_slot(store: AppStore, slot: Slot) {
     if let Some((store_id, node_id, state_vector)) = with_slot(slot, |s| (s.store_id, s.node_id, s.doc.state_vector())) {
-        store.send(BackendCommand::ReconcileNodeContent { store_id, node_id, state_vector });
+        crate::doc_session::ask(store, store_id, node_id, state_vector);
     }
 }
 
@@ -630,7 +616,7 @@ pub(crate) fn request_reconcile_all(store: AppStore, store_id: StoreId, node_id:
 /// The server's answer to a reconcile: merged into every sheet pane holding
 /// the node, then what the server lacks goes back.
 pub(crate) fn apply_reconcile(store: AppStore, store_id: StoreId, node_id: NodeId, diff: &[u8], server_state_vector: &[u8]) {
-    let writable = store.node_access(store_id, node_id).allows_write();
+    let writable = crate::doc_session::writable(store, store_id, node_id);
     for slot in holders(store_id, node_id) {
         let ours = with_slot(slot, |s| {
             if !diff.is_empty() {
@@ -645,9 +631,7 @@ pub(crate) fn apply_reconcile(store: AppStore, store_id: StoreId, node_id: NodeI
             }
         })
         .flatten();
-        if let Some(ours) = ours {
-            store.send(BackendCommand::BroadcastChanges { store_id, node_id, changes: encode(&ours) });
-        }
+        crate::doc_session::send_back(store, store_id, node_id, ours);
         for pane in slot_panes(slot) {
             recompute(store, pane);
         }
@@ -705,15 +689,10 @@ fn recompute_others(store: AppStore, store_id: StoreId, node_id: NodeId) {
     }
 }
 
-fn encode(bytes: &[u8]) -> String {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
 /// Send an update this pane made: to the server through `applyEdit`, and to
 /// every other pane of this window holding the sheet, a turn later.
 fn send_update(store: AppStore, from: Slot, store_id: StoreId, node_id: NodeId, bytes: Vec<u8>) {
-    store.send(BackendCommand::BroadcastChanges { store_id, node_id, changes: encode(&bytes) });
+    crate::doc_session::send(store, store_id, node_id, bytes.clone());
     let others: Vec<Slot> = holders(store_id, node_id).into_iter().filter(|p| *p != from).collect();
     let deliver = move || {
         for other in others {
@@ -733,36 +712,17 @@ fn send_update(store: AppStore, from: Slot, store_id: StoreId, node_id: NodeId, 
 
 // ── Making one ───────────────────────────────────────────────────────────
 
-/// A new sheet's first table, written in the edit that makes the node
-/// (`pimble_sheet::ops::new_sheet_content`).
-pub(crate) fn new_sheet_content() -> Option<Vec<u8>> {
-    match pimble_sheet::ops::new_sheet_content() {
-        Ok(content) => Some(content),
-        Err(e) => {
-            tracing::warn!("a new sheet could not be made: {e}");
-            None
-        }
-    }
-}
-
 /// A row's "New Sheet": a sheet node under `parent_id`.
 pub(crate) fn new_sheet(store: AppStore, store_id: StoreId, parent_id: NodeId) {
-    let Some(content) = new_sheet_content() else { return };
-    store.send(BackendCommand::CreateNode {
-        store_id,
-        parent_id: Some(parent_id),
-        title: "Sheet".to_string(),
-        init: Some(NodeInit {
-            node_type: node_types::SHEET.to_string(),
-            content,
-            custom: vec![
-                (pimble_core::custom_keys::ICON.to_string(), serde_json::json!(SHEET_ICON)),
-                (pimble_core::custom_keys::EXPLICIT_TITLE.to_string(), serde_json::json!(true)),
-            ],
-            request: None,
-        }),
-        place: pimble_core::Place::Last,
-    });
+    let recipe = match pimble_api::recipes::sheet("Sheet", None) {
+        Ok(recipe) => recipe,
+        Err(e) => {
+            tracing::warn!("a new sheet could not be made: {e}");
+            return;
+        }
+    };
+    let (title, init) = NodeInit::of(recipe, None);
+    store.send(BackendCommand::CreateNode { store_id, parent_id: Some(parent_id), title, init: Some(init), place: pimble_core::Place::Last });
 }
 
 // ── What formulas see ────────────────────────────────────────────────────

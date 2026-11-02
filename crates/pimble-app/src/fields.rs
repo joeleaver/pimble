@@ -15,7 +15,6 @@ use pimble_crdt::NodeDoc;
 use rinch::prelude::*;
 
 use crate::panes::PaneId;
-use crate::protocol::BackendCommand;
 use crate::state::AppStore;
 
 /// The node pane `pane` holds (a note in its editor, or a sheet node).
@@ -62,8 +61,7 @@ pub(crate) fn write(store: AppStore, store_id: StoreId, node_id: NodeId, name: &
         // A node this window has no copy of: a new field is all it can be.
         None => NodeDoc::field_update(&name, value),
     };
-    use base64::Engine;
-    store.send(BackendCommand::BroadcastChanges { store_id, node_id, changes: base64::engine::general_purpose::STANDARD.encode(&bytes) });
+    crate::doc_session::send(store, store_id, node_id, bytes.clone());
     // This window's copies: the cache (what the band and formulas read),
     // the editors and the sheets holding the node.
     if let Some(sig) = store.get_node_signal(store_id, node_id) {
@@ -241,7 +239,7 @@ mod tests {
     #[test]
     fn a_field_write_replaces_the_value_it_read() {
         let store = AppStore::new();
-        let (cmd_tx, commands) = bounded::<BackendCommand>(64);
+        let (cmd_tx, commands) = bounded::<crate::protocol::BackendCommand>(64);
         let (_event_tx, event_rx) = bounded::<BackendEvent>(1);
         store.backend.set(Some(BackendHandle { cmd_tx, event_rx }));
         let store_id = StoreId::new();
@@ -257,10 +255,9 @@ mod tests {
         for value in ["30", "35"] {
             write(store, store_id, node_id, "rate", Some(value));
             for c in commands.try_iter() {
-                if let BackendCommand::BroadcastChanges { node_id: n, changes, .. } = c {
+                if let crate::protocol::BackendCommand::BroadcastChanges { node_id: n, update, .. } = c {
                     assert_eq!(n, node_id);
-                    use base64::Engine;
-                    server.apply_update(&base64::engine::general_purpose::STANDARD.decode(changes).unwrap()).unwrap();
+                    server.apply_update(&update).unwrap();
                 }
             }
             assert_eq!(server.node_fields(), vec![("rate".to_string(), value.to_string())], "the server has {value}");

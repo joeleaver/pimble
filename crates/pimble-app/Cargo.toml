@@ -19,6 +19,11 @@ required-features = ["native"]
 
 [dependencies]
 pimble-core = { workspace = true }
+# The one API (docs/API_CONTRACT.md): every command that reads or writes a
+# store goes through `pimble_api::Pimble` (`commands.rs`).
+pimble-api = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
 pimble-client = { workspace = true }
 pimble-rpc = { workspace = true }
 pimble-crdt = { workspace = true }

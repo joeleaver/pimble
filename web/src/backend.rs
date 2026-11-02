@@ -1,10 +1,13 @@
 //! The browser's implementation of the UI's backend seam.
 //!
-//! The desktop runs `pimble_app::commands::process_command` on a tokio thread
-//! that owns an embedded server; this runs the *same* function on the page's
-//! own task queue against hosted ones. Everything specific to the browser is
-//! here: getting credentials from the accounts service, keeping them fresh, and
-//! noticing when a socket dies.
+//! The desktop answers the UI's commands on a tokio thread that owns an
+//! embedded server; this answers them on the page's own task queue against
+//! hosted ones, with the *same* adapter (`pimble_app::commands`): every
+//! command that reads or writes a store is a call on the page's
+//! `pimble_api::Pimble`, over a `Router` that sends a plain store to its
+//! server and an encrypted one to the vault (docs/API_CONTRACT.md wave 5).
+//! Everything specific to the browser is here: getting credentials from the
+//! accounts service, keeping them fresh, and noticing when a socket dies.
 //!
 //! **There is no "the" server.** Every command is answered through the endpoint
 //! that serves the store it names (`crate::endpoints`): the session's own for
@@ -16,10 +19,11 @@
 //! is listed from the account's own row of it meanwhile (`owner offline`), and
 //! what it serves fills in when it connects ([`supervise_relayed`]).
 //!
-//! One thing sits in front of `process_command`: the vault client
-//! (`crate::vault`). A command for an encrypted store is answered from the
-//! documents this page holds and never reaches the plain RPCs — which the
-//! server refuses for such a store anyway. Everything else is unchanged.
+//! The vault client (`crate::vault`) is the one holder of an encrypted
+//! store's documents in this page: the API reads through it
+//! (`crate::vault_backend`), and what it decrypts from the store's
+//! subscription it pumps to the UI itself. Its subscription, presence,
+//! status and closing are answered by it before the API is asked.
 //!
 //! The command channel is crossbeam's, as on the desktop, because
 //! [`pimble_app::BackendHandle`] is the one thing both backends hand the UI.
@@ -31,7 +35,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
-use pimble_app::commands::process_command;
+use pimble_app::commands::{api_command, change_events, host_command, Context};
 use pimble_app::protocol::{BackendCommand, BackendEvent, BackendHandle};
 use pimble_client::PimbleClient;
 use pimble_core::StoreId;
@@ -40,12 +44,12 @@ use wasm_bindgen_futures::spawn_local;
 use crate::api::{self, Session, TokenError};
 use crate::endpoints::{Endpoints, RECONNECT_MAX_MS, RECONNECT_MIN_MS};
 use crate::util::sleep_ms;
-use crate::routed::{self, Routed};
+use crate::routed;
 use crate::vault::{Handled, VaultClient, VaultWire};
 use crate::vault_backend::{VaultBackend, WireTable};
 use pimble_api::router::BackendId;
 use pimble_api::rpc::{Connector, RpcBackend};
-use pimble_api::{ApiError, Router};
+use pimble_api::{ApiError, Pimble, Router};
 
 /// The vault, shared between the loop (connecting, pulling, keys, repairs)
 /// and its backend (`crate::vault_backend`), which answers the calls the
@@ -157,9 +161,12 @@ impl Connector for Wires {
 /// The router over the page's two backends: the session's server for plain
 /// stores (the default), the vault for encrypted ones.
 struct Routes {
-    router: Router,
+    router: Arc<Router>,
     vault_id: BackendId,
     wires: Wires,
+    /// The API over the router: what every command that reads or writes a
+    /// store is answered by.
+    api: Arc<Pimble>,
 }
 
 impl Routes {
@@ -221,7 +228,26 @@ async fn run(
     let shared: SharedVault = vault_backend.shared();
     let mut router = Router::new(RpcBackend::new(wires.clone()));
     let vault_id = router.add(vault_backend);
-    let routes = Routes { router, vault_id, wires };
+    let router = Arc::new(router);
+    let api = Arc::new(Pimble::with_presence_ttl(router.clone(), client_id.clone(), pimble_rpc::PRESENCE_TTL_MS));
+    let routes = Routes { router, vault_id, wires, api };
+
+    // Every change the API hears of a plain store, after it merged it into
+    // what it holds. (An encrypted store's are the vault's to pump.)
+    {
+        let (api, event_tx, signal_ui, client_id) = (routes.api.clone(), event_tx.clone(), signal_ui.clone(), client_id.clone());
+        spawn_local(async move {
+            let mut last = None;
+            while let Some(change) = api.next_change().await {
+                for event in change_events(change, &client_id, &mut last) {
+                    if let Err(e) = event_tx.try_send(event) {
+                        tracing::warn!("Event channel full, dropped: {}", e);
+                    }
+                }
+                signal_ui();
+            }
+        });
+    }
 
     let mut endpoints = Endpoints::from_session(&session);
     shared.lock().await.set_relayed(relayed_stores(&endpoints));
@@ -272,7 +298,7 @@ async fn run(
             // 2. Keep the session's endpoint up. It is the one the hosted
             //    stores come from and the one everything else waits for.
             let session_url = endpoints.session_url();
-            if !supervise(&mut endpoints, &session_url, vault, &mut subscriptions, &event_tx, &signal_ui, &client_id).await {
+            if !supervise(&mut endpoints, &session_url, vault, &mut subscriptions, &routes, &event_tx, &signal_ui).await {
                 continue;
             }
 
@@ -282,7 +308,7 @@ async fn run(
             //     every token refresh, and from the account's row of it
             //     while that endpoint is down.
             let mut ran_anything =
-                supervise_relayed(&mut endpoints, vault, &mut subscriptions, &event_tx, &signal_ui, &client_id).await;
+                supervise_relayed(&mut endpoints, vault, &mut subscriptions, &event_tx, &signal_ui).await;
 
             // 3. Apply whatever the vault subscriptions delivered since the
             //    last pass. The subscription task only forwards raw
@@ -333,11 +359,6 @@ async fn run(
         let session_url = endpoints.session_url();
         while let Ok(cmd) = cmd_rx.try_recv() {
             ran_anything = true;
-            // The desktop watchdog posts this; nothing does here, because the
-            // loop checks the sockets itself at the top of every pass.
-            if matches!(cmd, BackendCommand::ConnectionLost { .. }) {
-                continue;
-            }
             let mut ctx = Web { endpoints: &mut endpoints, shared: &shared, routes: &routes, event_tx: &event_tx, signal_ui: &signal_ui, client_id: &client_id };
             dispatch(&mut ctx, &mut subscriptions, cmd).await;
             if !endpoints.get(&session_url).is_some_and(|e| e.is_connected()) {
@@ -367,9 +388,9 @@ async fn supervise(
     url: &str,
     vault: &mut VaultClient,
     subscriptions: &mut Subscriptions,
+    routes: &Routes,
     event_tx: &Sender<BackendEvent>,
     signal_ui: &Arc<dyn Fn() + Send + Sync>,
-    client_id: &str,
 ) -> bool {
     // A connection that has held up for a while is a good one; only then is it
     // safe to forget how long the last outage lasted.
@@ -397,24 +418,10 @@ async fn supervise(
     let attempt = PimbleClient::connect_with_auth(url, &auth).await;
 
     let proven = match attempt {
-        Ok(c) => {
-            let mut candidate = Some(Arc::new(c));
-            let answer = process_command(
-                &mut candidate,
-                BackendCommand::ListStores,
-                event_tx,
-                signal_ui,
-                client_id,
-            )
-            .await;
-            match answer {
-                Some(BackendEvent::StoresListed { stores }) => Ok((candidate, stores)),
-                other => Err(match other {
-                    Some(BackendEvent::Error { message }) => message,
-                    _ => "the server did not answer listStores".to_string(),
-                }),
-            }
-        }
+        Ok(c) => match c.list_stores().await {
+            Ok(stores) => Ok((Some(Arc::new(c)), stores)),
+            Err(e) => Err(e.to_string()),
+        },
         Err(e) => Err(e.to_string()),
     };
 
@@ -458,21 +465,14 @@ async fn supervise(
                 let served_here = |store_id: StoreId| !relayed.contains(&store_id);
                 vault.forget_subscriptions(served_here);
                 let listed_ids: Vec<StoreId> = stores.iter().map(|store| store.id).collect();
+                // A plain store's subscription is the API's
+                // (`Pimble::rewatch`, below, once the connection is the
+                // one its backend asks for).
                 for store_id in subscriptions.restore(&listed_ids, served_here) {
-                    let event = if vault.is_encrypted(store_id) {
-                        vault.subscribe(c, store_id, signal_ui).await
-                    } else {
-                        let mut client = Some(c.clone());
-                        process_command(
-                            &mut client,
-                            BackendCommand::SubscribeStoreChanges { store_id },
-                            event_tx,
-                            signal_ui,
-                            client_id,
-                        )
-                        .await
-                    };
-                    if let Some(BackendEvent::Error { message }) = event {
+                    if !vault.is_encrypted(store_id) {
+                        continue;
+                    }
+                    if let Some(BackendEvent::Error { message }) = vault.subscribe(c, store_id, signal_ui).await {
                         tracing::warn!("Subscribing to {} again failed: {}", store_id, message);
                     }
                 }
@@ -499,12 +499,15 @@ async fn supervise(
                 endpoint.connected_at = Some(now_ms());
                 endpoint.reported_failure = false;
             }
+            // Every plain store the page hears again, on this connection.
+            routes.wires.refresh(endpoints);
+            routes.api.rewatch().await;
             emit(
                 event_tx,
                 signal_ui,
                 BackendEvent::Connected {
                     server_addr: url.to_string(),
-                    client_id: client_id.to_string(),
+                    client_id: routes.api.client_id().to_string(),
                 },
             );
             emit(event_tx, signal_ui, BackendEvent::StoresListed { stores });
@@ -564,7 +567,6 @@ async fn supervise_relayed(
     subscriptions: &mut Subscriptions,
     event_tx: &Sender<BackendEvent>,
     signal_ui: &Arc<dyn Fn() + Send + Sync>,
-    client_id: &str,
 ) -> bool {
     let mut ran_anything = false;
     for url in endpoints.relay_urls() {
@@ -597,14 +599,10 @@ async fn supervise_relayed(
         ran_anything = true;
         let auth = endpoint.auth();
         let proven = match PimbleClient::connect_with_auth(&url, &auth).await {
-            Ok(c) => {
-                let mut candidate = Some(Arc::new(c));
-                match process_command(&mut candidate, BackendCommand::ListStores, event_tx, signal_ui, client_id).await {
-                    Some(BackendEvent::StoresListed { stores }) => Ok((candidate, stores)),
-                    Some(BackendEvent::Error { message }) => Err(message),
-                    _ => Err("the server did not answer listStores".to_string()),
-                }
-            }
+            Ok(c) => match c.list_stores().await {
+                Ok(stores) => Ok((Some(Arc::new(c)), stores)),
+                Err(e) => Err(e.to_string()),
+            },
             Err(e) => Err(e.to_string()),
         };
 
@@ -700,7 +698,9 @@ async fn dispatch(ctx: &mut Web<'_>, subscriptions: &mut Subscriptions, cmd: Bac
     // Pimble server's, so it never reaches one.
     if let BackendCommand::CreateHostedStore { name, kind } = &cmd {
         let event = create_hosted_store(name, kind).await;
-        ctx.emit(event);
+        if let Some(event) = pimble_app::protocol::Asked::answer(Some(pimble_app::protocol::Asked::CreateStore), Some(event)) {
+            ctx.emit(event);
+        }
         return;
     }
 
@@ -756,6 +756,13 @@ fn stores_of(cmd: &BackendCommand) -> Vec<StoreId> {
 /// from the store's server for a plain one. What happens on the way (an
 /// endpoint found down) is emitted; the answer is returned.
 async fn route(ctx: &mut Web<'_>, cmd: BackendCommand) -> Option<BackendEvent> {
+    // A failure of a request a modal waits on names it.
+    let asked = pimble_app::protocol::Asked::of(&cmd);
+    let answer = route_one(ctx, cmd).await;
+    pimble_app::protocol::Asked::answer(asked, answer)
+}
+
+async fn route_one(ctx: &mut Web<'_>, cmd: BackendCommand) -> Option<BackendEvent> {
     // Which server answers this command is decided by the store it names, not
     // by which connection happens to be open.
     let store_id = crate::vault::store_id_of(&cmd);
@@ -808,17 +815,6 @@ async fn route(ctx: &mut Web<'_>, cmd: BackendCommand) -> Option<BackendEvent> {
     }
     ctx.routes.wires.refresh(ctx.endpoints);
 
-    let cmd = match routed::answer(&ctx.routes.router, ctx.routes.vault_id, cmd, |_| root).await {
-        Routed::Answered(mut events) => {
-            let last = events.pop();
-            for event in events {
-                ctx.emit(event);
-            }
-            return last;
-        }
-        Routed::Not(cmd) => cmd,
-    };
-
     // A store whose owner's computer is off is answered from what this page
     // holds of it, which may be nothing: there is no connection to ask, and
     // that is no error (docs/RELAY_CONTRACT.md, "The apps").
@@ -847,16 +843,49 @@ async fn route(ctx: &mut Web<'_>, cmd: BackendCommand) -> Option<BackendEvent> {
         },
     };
 
-    let cmd = match client.as_ref() {
-        Some(connected) => match ctx.shared.lock().await.handle(connected, cmd, ctx.signal_ui).await {
+    // What an encrypted store answers itself: its subscription, presence
+    // (sealed under the document's key), its status, closing it.
+    let owned = store_id.is_some_and(|id| ctx.routes.router.served_by(id) == ctx.routes.vault_id);
+    let cmd = match (cmd, client.as_ref()) {
+        (BackendCommand::PublishPresence { store_id, node_id, pane, focused, left, text, board }, Some(c)) if owned => {
+            let frame = pimble_app::commands::presence_frame(&ctx.routes.api, store_id, node_id, pane, focused, left, text, board);
+            ctx.shared.lock().await.publish_presence(c, frame).await;
+            return None;
+        }
+        (cmd, Some(c)) => match ctx.shared.lock().await.handle(c, cmd, ctx.signal_ui).await {
             Handled::Yes(event) => return event,
             Handled::No(cmd) => cmd,
         },
-        None => cmd,
+        (cmd, None) => cmd,
     };
 
-    let mut client = client;
-    process_command(&mut client, cmd, ctx.event_tx, ctx.signal_ui, ctx.client_id).await
+    // A node made with no parent goes under the root this page's own
+    // documents name (an encrypted store's listing may carry a placeholder).
+    let cmd = match cmd {
+        BackendCommand::CreateNode { store_id, parent_id: None, title, init, place } if root.is_some() => {
+            BackendCommand::CreateNode { store_id, parent_id: root, title, init, place }
+        }
+        cmd => cmd,
+    };
+
+    // Every read and write of a store: the API, through the router.
+    let context = Context { api: &ctx.routes.api, host: client, event_tx: ctx.event_tx, signal_ui: ctx.signal_ui, client_id: ctx.client_id };
+    let cmd = match api_command(&context, cmd).await {
+        Ok(event) => return event,
+        Err(cmd) => cmd,
+    };
+
+    // What is left is the server's operator's, which an encrypted store and
+    // a store whose owner is away cannot be asked.
+    let cmd = match ctx.shared.lock().await.refuse_unreachable(cmd) {
+        Handled::Yes(event) => return event,
+        Handled::No(cmd) => cmd,
+    };
+    let cmd = match ctx.shared.lock().await.refuse(cmd) {
+        Handled::Yes(event) => return event,
+        Handled::No(cmd) => cmd,
+    };
+    host_command(&context, cmd).await
 }
 
 /// Every `Store` the UI is handed names, for an encrypted store this page

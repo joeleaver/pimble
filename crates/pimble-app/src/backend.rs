@@ -1,19 +1,31 @@
-//! Background thread for RPC communication
+//! The desktop's backend: a background thread with a tokio runtime that
+//! owns the API (`pimble_api::Pimble` over the RPC backend) and the
+//! connection to this computer's Pimble server.
 //!
-//! Rinch has its own event loop and doesn't use tokio directly. We:
-//! 1. Spawn a background thread with a tokio runtime
-//! 2. Use channels to communicate between Rinch UI and async code
-//! 3. Signal Rinch to process events when data arrives
+//! Rinch has its own event loop and doesn't use tokio directly. So:
+//! 1. a background thread runs a tokio runtime;
+//! 2. channels carry `BackendCommand`s in and `BackendEvent`s out;
+//! 3. Rinch is signalled to process events when they arrive.
+//!
+//! The connection is the implementation's (docs/API_CONTRACT.md decision
+//! 11): [`Local`] joins or starts the embedded server
+//! (`pimble_server::local`), notices it going away and connects again, and
+//! says so to the UI; the API asks it for a live client on every call and
+//! makes every store subscription again once the stores are open there. The
+//! command loop knows nothing of connections.
 
+use std::sync::{Arc, Weak};
 use std::thread;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
+use pimble_api::rpc::{Connector, RpcBackend};
+use pimble_api::{ApiError, Pimble};
 use pimble_client::PimbleClient;
 use pimble_server::local::{ensure_connected, reconnect, server_addr, shut_down};
 use pimble_server::PimbleServer;
 use tokio::runtime::Runtime;
 
-use crate::commands::process_command;
+use crate::commands::{change_events, process_command, Context};
 use crate::protocol::{BackendCommand, BackendEvent, BackendHandle};
 
 impl BackendHandle {
@@ -27,184 +39,194 @@ impl BackendHandle {
         let (cmd_tx, cmd_rx) = bounded::<BackendCommand>(100);
         let (event_tx, event_rx) = bounded::<BackendEvent>(1000);
 
-        let watchdog_tx = cmd_tx.clone();
         thread::spawn(move || {
             let rt = Runtime::new().expect("Failed to create tokio runtime");
-            rt.block_on(backend_loop(cmd_rx, watchdog_tx, event_tx, signal_ui));
+            rt.block_on(backend_loop(cmd_rx, event_tx, signal_ui));
         });
 
         Self { cmd_tx, event_rx }
     }
 }
 
-/// Returns true if an error looks like a connection/transport failure
-/// (as opposed to a logical RPC error like "store not found").
-fn is_connection_error(msg: &str) -> bool {
-    let lower = msg.to_lowercase();
-    lower.contains("connection refused")
-        || lower.contains("connection reset")
-        || lower.contains("broken pipe")
-        || lower.contains("transport")
-        || lower.contains("hyper")
-        || lower.contains("tcp")
-        || lower.contains("eof")
-        || lower.contains("not connected")
-        || lower.contains("connection closed")
-}
-
-/// Watch `client` and post `ConnectionLost` to the command loop the moment
-/// its WebSocket closes. This is what lets an app that borrowed another
-/// instance's embedded server notice that instance quitting, instead of
-/// finding out from the next failed call.
-fn spawn_connection_watchdog(client: std::sync::Arc<PimbleClient>, generation: u64, cmd_tx: Sender<BackendCommand>) {
-    tokio::spawn(async move {
-        client.on_disconnect().await;
-        tracing::warn!("Connection to the server closed (generation {})", generation);
-        let _ = cmd_tx.try_send(BackendCommand::ConnectionLost { generation });
-    });
-}
-
-async fn backend_loop(
-    cmd_rx: Receiver<BackendCommand>,
-    cmd_tx: Sender<BackendCommand>,
+/// The connection to this computer's Pimble server: joined when one runs,
+/// started (and owned) when none does, and made again the moment it closes,
+/// by the same rule (an app that borrowed another instance's server notices
+/// that instance quitting without waiting for its next call). Every
+/// connection made is said to the UI as `Connected`, every one lost as
+/// `Disconnected`.
+pub(crate) struct Local {
+    inner: tokio::sync::Mutex<Inner>,
     event_tx: Sender<BackendEvent>,
-    signal_ui: impl Fn() + Send + Sync + 'static,
-) {
-    let signal_arc: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(signal_ui);
-    let signal_ui = signal_arc.clone();
+    signal_ui: Arc<dyn Fn() + Send + Sync>,
+    client_id: String,
+    /// Set when the app quits: a connection that closes then is not made
+    /// again (that would start a server for an app that is leaving).
+    closing: std::sync::atomic::AtomicBool,
+    me: Weak<Local>,
+}
+
+struct Inner {
+    client: Option<Arc<PimbleClient>>,
+    /// The server this process started, when it did.
+    owned: Option<PimbleServer>,
+    /// Whether a connection was ever made: the first one may start a server
+    /// with the saved store list, later ones join or start as `reconnect`
+    /// does.
+    ever: bool,
+}
+
+impl Local {
+    fn new(event_tx: Sender<BackendEvent>, signal_ui: Arc<dyn Fn() + Send + Sync>, client_id: String) -> Arc<Self> {
+        Arc::new_cyclic(|me| Local {
+            inner: tokio::sync::Mutex::new(Inner { client: None, owned: None, ever: false }),
+            event_tx,
+            signal_ui,
+            client_id,
+            closing: std::sync::atomic::AtomicBool::new(false),
+            me: me.clone(),
+        })
+    }
+
+    fn emit(&self, event: BackendEvent) {
+        let _ = self.event_tx.try_send(event);
+        (self.signal_ui)();
+    }
+
+    /// A live client: the one held, or a new connection when there is none or
+    /// it closed.
+    pub(crate) async fn client(&self) -> Result<Arc<PimbleClient>, String> {
+        let mut inner = self.inner.lock().await;
+        if let Some(client) = &inner.client {
+            if client.is_connected() {
+                return Ok(client.clone());
+            }
+            tracing::warn!("The connection to the server closed; connecting again");
+            inner.client = None;
+            self.emit(BackendEvent::Disconnected);
+        }
+        if self.closing.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("Pimble is quitting.".into());
+        }
+        let made = if inner.ever {
+            reconnect(&mut inner.owned).await
+        } else {
+            ensure_connected().await.map(|(client, server)| {
+                inner.owned = server;
+                client
+            })
+        };
+        let client = match made {
+            Ok(client) => Arc::new(client),
+            Err(e) => {
+                tracing::error!("Connecting to the server failed: {e}");
+                let message = if inner.ever { format!("Reconnection failed: {e}") } else { format!("Failed to connect: {e}") };
+                self.emit(BackendEvent::Error { message });
+                return Err(e);
+            }
+        };
+        inner.ever = true;
+        inner.client = Some(client.clone());
+        self.watch(client.clone());
+        self.emit(BackendEvent::Connected { server_addr: server_addr(), client_id: self.client_id.clone() });
+        Ok(client)
+    }
+
+    /// Connect again the moment `client`'s WebSocket closes.
+    fn watch(&self, client: Arc<PimbleClient>) {
+        let me = self.me.clone();
+        tokio::spawn(async move {
+            client.on_disconnect().await;
+            let Some(me) = me.upgrade() else { return };
+            if !me.closing.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = me.client().await;
+            }
+        });
+    }
+
+    /// The app is quitting: stop the server this process owns, writing every
+    /// document it holds.
+    async fn shut_down(&self) {
+        self.closing.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut inner = self.inner.lock().await;
+        inner.client = None;
+        shut_down(&mut inner.owned).await;
+    }
+}
+
+/// The API's way to a live client: [`Local`], which connects again when the
+/// last connection closed.
+struct LocalConnector(Arc<Local>);
+
+#[async_trait::async_trait]
+impl Connector for LocalConnector {
+    async fn client(&self) -> Result<Arc<PimbleClient>, ApiError> {
+        self.0.client().await.map_err(|e| ApiError::Offline { sentence: format!("Pimble's server could not be reached: {e}") })
+    }
+}
+
+async fn backend_loop(cmd_rx: Receiver<BackendCommand>, event_tx: Sender<BackendEvent>, signal_ui: impl Fn() + Send + Sync + 'static) {
+    let signal_ui: Arc<dyn Fn() + Send + Sync> = Arc::new(signal_ui);
 
     let client_id = uuid::Uuid::new_v4().to_string();
     tracing::info!("Backend client ID: {}", client_id);
 
-    let mut client: Option<std::sync::Arc<PimbleClient>> = None;
-    let mut owned_server: Option<PimbleServer> = None;
-    // Bumped on every (re)connection; watchdogs report the generation they
-    // watched so one left over from a previous connection cannot trigger a
-    // second reconnect.
-    let mut generation: u64 = 0;
+    let local = Local::new(event_tx.clone(), signal_ui.clone(), client_id.clone());
+    let api = Arc::new(Pimble::with_presence_ttl(RpcBackend::new(LocalConnector(local.clone())), client_id.clone(), pimble_rpc::PRESENCE_TTL_MS));
 
-    // Initial connection
-    match ensure_connected().await {
-        Ok((c, server)) => {
-            let c = std::sync::Arc::new(c);
-            spawn_connection_watchdog(std::sync::Arc::clone(&c), generation, cmd_tx.clone());
-            client = Some(c);
-            owned_server = server;
-            let _ = event_tx.try_send(BackendEvent::Connected {
-                server_addr: server_addr(),
-                client_id: client_id.clone(),
-            });
-            signal_ui();
-        }
-        Err(e) => {
-            tracing::error!("Initial connection failed: {}", e);
-            let _ = event_tx.try_send(BackendEvent::Error {
-                message: format!("Failed to connect: {}", e),
-            });
-            signal_ui();
-        }
+    // The first connection, said to the UI either way.
+    let _ = local.client().await;
+
+    // Every change the API hears, after it merged it into what it holds.
+    {
+        let (api, event_tx, signal_ui, client_id) = (api.clone(), event_tx.clone(), signal_ui.clone(), client_id.clone());
+        tokio::spawn(async move {
+            let mut last = None;
+            while let Some(change) = api.next_change().await {
+                for event in change_events(change, &client_id, &mut last) {
+                    if let Err(e) = event_tx.try_send(event) {
+                        tracing::warn!("A change was dropped, the event channel is full: {e}");
+                    }
+                }
+                signal_ui();
+            }
+        });
     }
 
-    loop {
-        // Block waiting for commands
-        let cmd = match cmd_rx.recv() {
-            Ok(cmd) => cmd,
-            Err(_) => break, // Channel closed, exit
-        };
-
-        // A dead connection is handled before the command runs against it:
-        // the watchdog's `ConnectionLost` for the current generation, or a
-        // client that reports itself closed. Either way, reconnect (starting
-        // our own embedded server if the one we borrowed is gone), tell the
-        // UI, and then run the command against the new connection. A stale
-        // `ConnectionLost` is dropped.
-        let lost = match &cmd {
-            BackendCommand::ConnectionLost { generation: g } => {
-                if *g != generation {
-                    continue;
-                }
-                true
-            }
-            _ => client.as_ref().map_or(false, |c| !c.is_connected()),
-        };
-        if lost {
-            tracing::warn!("Connection lost, attempting reconnect");
-            let _ = event_tx.try_send(BackendEvent::Disconnected);
-            signal_ui();
-            match reconnect(&mut owned_server).await {
-                Ok(c) => {
-                    generation += 1;
-                    let c = std::sync::Arc::new(c);
-                    spawn_connection_watchdog(std::sync::Arc::clone(&c), generation, cmd_tx.clone());
-                    client = Some(c);
-                    let _ = event_tx.try_send(BackendEvent::Connected {
-                        server_addr: server_addr(),
-                        client_id: client_id.clone(),
-                    });
-                    signal_ui();
-                }
-                Err(e) => {
-                    tracing::error!("Reconnection failed: {}", e);
-                    let _ = event_tx.try_send(BackendEvent::Error {
-                        message: format!("Reconnection failed: {}", e),
-                    });
-                    signal_ui();
-                    continue;
-                }
-            }
-            if matches!(cmd, BackendCommand::ConnectionLost { .. }) {
-                continue;
-            }
-        }
-
+    // Blocking on the channel is fine here: this runs on the thread that
+    // owns the runtime, and every task (the listener, the watchdog, a
+    // picture being stored) runs on the runtime's workers.
+    while let Ok(cmd) = cmd_rx.recv() {
+        // What only the server's operator does goes over the connection
+        // itself; asking for it here connects again first if it closed.
+        let host = local.client().await.ok();
+        let ctx = Context { api: &api, host, event_tx: &event_tx, signal_ui: &signal_ui, client_id: &client_id };
         // An import is many commands, each answered as the UI's own would be
         // (docs/IMPORT_CONTRACT.md).
         let event = match cmd {
             BackendCommand::Import { store_id, parent_id, format, name, files } => {
-                let mut runner = Desktop { client: &mut client, event_tx: &event_tx, signal_ui: &signal_arc, client_id: &client_id };
+                let mut runner = Desktop { ctx: &ctx };
                 Some(crate::import::import(&mut runner, store_id, parent_id, format, &name, &files).await)
             }
-            cmd => process_command(&mut client, cmd, &event_tx, &signal_arc, &client_id).await,
+            cmd => process_command(&ctx, cmd).await,
         };
-
-        if let Some(ref event) = event {
-            // A call that failed because the connection died under it: the
-            // watchdog will post `ConnectionLost` and the next command
-            // reconnects; report it as a disconnect rather than a generic error.
-            if let BackendEvent::Error { message } = event {
-                if is_connection_error(message) {
-                    tracing::warn!("Connection error on a call: {}", message);
-                    let _ = event_tx.try_send(BackendEvent::Disconnected);
-                    signal_ui();
-                    // Wake the loop so the reconnect happens even if the UI
-                    // sends nothing else for a while.
-                    let _ = cmd_tx.try_send(BackendCommand::ConnectionLost { generation });
-                    continue;
-                }
-            }
-        }
-
         if let Some(event) = event {
             let _ = event_tx.try_send(event);
             signal_ui();
         }
     }
 
-    // Cleanup: only stop the server if we own it
-    shut_down(&mut owned_server).await;
+    // The window closed: only a server this process started is stopped.
+    local.shut_down().await;
 }
 
 /// `process_command`, as `crate::import` asks it.
-struct Desktop<'a> {
-    client: &'a mut Option<std::sync::Arc<pimble_client::PimbleClient>>,
-    event_tx: &'a crossbeam_channel::Sender<BackendEvent>,
-    signal_ui: &'a std::sync::Arc<dyn Fn() + Send + Sync>,
-    client_id: &'a str,
+struct Desktop<'a, 'b> {
+    ctx: &'a Context<'b>,
 }
 
-impl crate::import::Runner for Desktop<'_> {
+impl crate::import::Runner for Desktop<'_, '_> {
     async fn run(&mut self, cmd: BackendCommand) -> Option<BackendEvent> {
-        process_command(self.client, cmd, self.event_tx, self.signal_ui, self.client_id).await
+        process_command(self.ctx, cmd).await
     }
 }
 
@@ -234,8 +256,9 @@ mod import_tests {
 
         let (event_tx, _event_rx) = crossbeam_channel::unbounded();
         let signal: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(|| {});
-        let mut client = Some(c.clone());
-        let mut runner = Desktop { client: &mut client, event_tx: &event_tx, signal_ui: &signal, client_id: "test" };
+        let api = Arc::new(Pimble::new(RpcBackend::over(PimbleClient::connect(format!("http://{}", server.addr())).await.unwrap()), "test"));
+        let ctx = Context { api: &api, host: Some(c.clone()), event_tx: &event_tx, signal_ui: &signal, client_id: "test" };
+        let mut runner = Desktop { ctx: &ctx };
 
         let rtf = Files::from([("Letter.rtf".to_string(), br"{\rtf1\ansi Dear {\b Sam},\par}".to_vec())]);
         let event = crate::import::import(&mut runner, store_id, Some(parent), Format::Rtf, "Letter.rtf", &rtf).await;

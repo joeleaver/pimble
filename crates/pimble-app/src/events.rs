@@ -10,7 +10,7 @@ use pimble_core::{LinkResolution, NodeId, PimbleUrl, Store, StoreId, MAX_LINK_HO
 use rinch::prelude::*;
 
 use crate::protocol::{BackendCommand, BackendEvent, CloudOp};
-use crate::editor::{apply_remote, start_editing};
+use crate::editor::start_editing;
 use crate::panes::PaneId;
 use crate::persistence::{load_app_state_file, save_app_state_file};
 use crate::state::{
@@ -543,30 +543,15 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     }
                 });
 
-                // Documents were being edited across the reconnect: each one's
-                // subscription died with the old connection and any delta
-                // sent during the gap was lost. Commands run in order, so
-                // the store is open again by the time these execute:
-                // subscribe again and reconcile (state vector in, diff out,
-                // then our diff back), so nothing typed offline is lost and
-                // nothing the new server holds is missed.
-                for active in store.edited_nodes() {
-                    store.send(BackendCommand::SubscribeNodeChanges {
-                        store_id: active.store_id,
-                        node_id: active.node_id,
-                    });
-                    for pane in store.panes_editing(active.store_id, active.node_id) {
-                        crate::editor::request_reconcile(store, pane, active.store_id, active.node_id);
-                    }
-                    crate::boards::request_reconcile_all(store, active.store_id, active.node_id);
-                    crate::sheets::request_reconcile_all(store, active.store_id, active.node_id);
-                    crate::discussions::request_reconcile_all(store, active.store_id, active.node_id);
-                }
-                // The boards embedded in text hold their nodes again.
-                crate::text_boards::reconnected(store);
-                // And the notes sheets read.
-                crate::sheets::reads::reconnected(store);
-                crate::sheets::embeds_reconnected(store);
+                // Documents were being edited across the reconnect, and any
+                // delta sent during the gap was lost. Commands run in order,
+                // so the stores are open again by the time these execute:
+                // every view reconciles (state vector in, diff out, then its
+                // diff back), so nothing typed offline is lost and nothing
+                // the new server holds is missed. The stores' subscriptions
+                // are the API's to make again (`Pimble::watch`, when each
+                // store's `StoreOpened` subscribes it).
+                crate::doc_session::reconnected(store);
 
                 // Whether the server's keystore holds a signed-in account
                 // (a sign-in survives an app restart), for the status bar
@@ -581,35 +566,51 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 store.connection_status.set("Disconnected".to_string());
             }
 
+            BackendEvent::Failed { asked, message } => {
+                // The adapter says which request failed, so its modal gets
+                // the sentence (docs/API_CONTRACT.md wave 5).
+                tracing::warn!("{asked:?} failed: {message}");
+                use crate::protocol::Asked;
+                match asked {
+                    Asked::AddRemoteStore => {
+                        store.connect_modal_pending_add.set(false);
+                        store.connect_modal_busy.set(false);
+                        store.connect_modal_error.set(message.clone());
+                    }
+                    Asked::SetStoreSync => {
+                        store.link_modal_pending.set(false);
+                        store.link_modal_error.set(message.clone());
+                    }
+                    Asked::RemoveReplica => {
+                        store.remove_replica_modal_pending.set(false);
+                        store.remove_replica_modal_error.set(message.clone());
+                    }
+                    Asked::CreateStore if crate::import::store_failed() => {
+                        // The store an import was waiting for was not made.
+                        show_notice(store, format!("The store for the import could not be made: {message}"));
+                    }
+                    Asked::CreateStore => {
+                        store.new_store_modal_pending.set(false);
+                        store.new_store_modal_error.set(message.clone());
+                    }
+                    Asked::CreateMount => {
+                        store.mount_picker_pending.set(false);
+                        store.mount_picker_error.set(message.clone());
+                    }
+                    Asked::ListDeleted | Asked::UndeleteNode => {
+                        store.deleted_modal_pending.set(false);
+                        store.deleted_modal_error.set(message.clone());
+                    }
+                }
+            }
+
             BackendEvent::Error { message } => {
                 tracing::error!("Backend error: {}", message);
-                // A pending sync-modal request claims this error for its own
-                // error line instead of the global status bar — the wire
-                // protocol has no per-request tag, but only one such request
-                // is ever in flight at a time from these modals.
-                if untracked(|| store.connect_modal_pending_add.get()) {
-                    store.connect_modal_pending_add.set(false);
-                    store.connect_modal_busy.set(false);
-                    store.connect_modal_error.set(message.clone());
-                } else if untracked(|| store.link_modal_pending.get()) {
-                    store.link_modal_pending.set(false);
-                    store.link_modal_error.set(message.clone());
-                } else if untracked(|| store.remove_replica_modal_pending.get()) {
-                    store.remove_replica_modal_pending.set(false);
-                    store.remove_replica_modal_error.set(message.clone());
-                } else if untracked(|| store.new_store_modal_pending.get()) {
-                    store.new_store_modal_pending.set(false);
-                    store.new_store_modal_error.set(message.clone());
-                } else if untracked(|| store.mount_picker_pending.get()) {
-                    store.mount_picker_pending.set(false);
-                    store.mount_picker_error.set(message.clone());
-                } else if untracked(|| store.deleted_modal_pending.get()) {
-                    // Only an error answering this modal's own `ListDeleted`,
-                    // `UndeleteNode` or "Put Back" `MoveNode` lands here — a
-                    // refusal or failure from anything else in flight while
-                    // the modal happens to be open (a sync link, a mount
-                    // fetch) takes the path below instead, same as before
-                    // this modal existed.
+                if untracked(|| store.deleted_modal_pending.get()) {
+                    // "Put Back" on a node no list names is an ordinary
+                    // `MoveNode`, so its failure is not told apart by the
+                    // request it answers: the open modal waiting on it still
+                    // claims it (the one guess left).
                     store.deleted_modal_pending.set(false);
                     store.deleted_modal_error.set(message.clone());
                 } else if crate::import::store_failed() {
@@ -1353,25 +1354,23 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             }
 
             BackendEvent::NodeContentReconciled { store_id, node_id, diff, server_state_vector } => {
-                crate::editor::apply_reconcile(store, *store_id, *node_id, diff, server_state_vector);
-                crate::boards::apply_reconcile(store, *store_id, *node_id, diff, server_state_vector);
-                crate::sheets::apply_reconcile(store, *store_id, *node_id, diff, server_state_vector);
-                crate::discussions::apply_reconcile(store, *store_id, *node_id, diff, server_state_vector);
-                crate::text_boards::apply_reconcile(*store_id, *node_id, diff);
+                crate::doc_session::reconciled(store, *store_id, *node_id, diff, server_state_vector);
             }
 
-            BackendEvent::RemoteChanges { store_id, node_id, changes } => {
-                use base64::Engine;
-                // A peer's delta: integrate it into the collab session of every
-                // pane holding the node (which re-projects the view and does
-                // NOT re-broadcast).
-                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(changes) {
-                    apply_remote(store, *store_id, *node_id, &bytes);
-                    crate::boards::apply_remote(store, *store_id, *node_id, &bytes);
-                    crate::sheets::apply_remote(store, *store_id, *node_id, &bytes);
-                    crate::discussions::apply_remote(store, *store_id, *node_id, &bytes);
-                    crate::text_boards::apply_remote(*store_id, *node_id, &bytes);
-                }
+            BackendEvent::RemoteChanges { store_id, node_id, update } => {
+                // An update this window's views did not make: every view
+                // holding the node merges it (re-projecting, never sending
+                // it on).
+                crate::doc_session::received(store, *store_id, *node_id, update);
+            }
+
+            BackendEvent::Resynced { store_id } => {
+                // Nothing of the store was heard for a while: what is shown
+                // of it is read again (from the API's held documents, which
+                // were just brought up to date), and every view of one of
+                // its nodes reconciles.
+                refetch_held_nodes(store, *store_id);
+                crate::doc_session::resynced(store, *store_id);
             }
 
             BackendEvent::BlobStored { request_id, result } => {

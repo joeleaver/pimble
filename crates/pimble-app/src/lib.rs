@@ -16,8 +16,10 @@
 //!
 //! The collaboration invariants in `CLAUDE.md` hold on both: four pane slots,
 //! each with its own `EditorHandle` in one thread-local table, edits travelling
-//! as yrs bytes through `BroadcastChanges` and `RemoteChanges`, and never a
-//! document model in the sync path.
+//! as yrs bytes through `BroadcastChanges` and `RemoteChanges` (one plumbing
+//! for every view that holds a document, [`doc_session`]), and never a
+//! document model in the sync path. Behind the seam, every command that reads
+//! or writes a store is a call on `pimble_api::Pimble` ([`commands`]).
 
 pub mod about;
 pub mod agents;
@@ -46,6 +48,7 @@ pub mod styles;
 pub mod sheets;
 pub mod shares;
 pub mod discussions;
+pub mod doc_session;
 pub mod personal;
 pub mod places;
 pub mod views;

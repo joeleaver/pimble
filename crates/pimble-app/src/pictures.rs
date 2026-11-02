@@ -37,8 +37,6 @@ use crate::state::AppStore;
 /// The scheme of a picture's `src`, without the colon, as rinch registers it.
 const SCHEME: &str = "pimble-blob";
 
-/// What a picture command answers with no server to ask.
-pub(crate) const NOT_CONNECTED: &str = "Pimble is not connected to its server, so the picture could not be reached.";
 
 /// What the browser answers for a picture in an encrypted store: pictures in
 /// ciphertext are a later wave (docs/IMAGES_CONTRACT.md, wave 3), and until

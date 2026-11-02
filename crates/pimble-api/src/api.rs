@@ -7,11 +7,12 @@
 //! the browser and in tokio alike); a caller that wants every change as it
 //! comes awaits [`Pimble::next_change`].
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use futures::channel::mpsc;
 use futures::stream::SelectAll;
 use futures::{FutureExt, Stream, StreamExt};
 use pimble_core::{node_types, BlobId, BlobUrl, DeletedNode, Node, NodeId, Place, Store, StoreId};
@@ -56,6 +57,10 @@ pub struct Edited<T> {
     pub caret: Option<Vec<u8>>,
     /// The node the edited document is attached to (a discussion's host).
     pub host: Option<NodeId>,
+    /// What was sent, when anything was: the views this client holds of
+    /// the node take the same bytes (the server relays a write to everyone
+    /// but its sender).
+    pub delta: Option<Vec<u8>>,
 }
 
 /// Where a move left the node.
@@ -92,6 +97,13 @@ pub struct Pimble {
     /// Subscriptions made while someone awaited the others; joined to them
     /// at the next drain.
     new_subs: Mutex<Vec<Events>>,
+    /// Rung when a subscription is added, so a listener waiting with none
+    /// (or only quiet ones) takes it in.
+    wake: mpsc::UnboundedSender<()>,
+    woken: futures::lock::Mutex<mpsc::UnboundedReceiver<()>>,
+    /// The stores a caller asked to hear ([`Pimble::watch`]): subscribed
+    /// again whenever their subscription ends, for as long as they are.
+    watched: Mutex<HashSet<StoreId>>,
     /// Stores whose subscription is being made, so two reads make one.
     subscribing: Mutex<std::collections::HashSet<StoreId>>,
     /// Changes kept for [`Pimble::next_change`] once someone listens.
@@ -112,6 +124,7 @@ impl Pimble {
     /// As [`Pimble::new`], with presence frames that hold `ttl_ms`.
     pub fn with_presence_ttl(backend: impl Backend + 'static, client_id: impl Into<String>, ttl_ms: u64) -> Self {
         let client_id = client_id.into();
+        let (wake, woken) = mpsc::unbounded();
         Self {
             backend: Box::new(backend),
             frames: PresenceFrames::new(client_id.clone(), ttl_ms),
@@ -119,6 +132,9 @@ impl Pimble {
             held: Mutex::new(Held::default()),
             subs: futures::lock::Mutex::new(SelectAll::new()),
             new_subs: Mutex::new(Vec::new()),
+            wake,
+            woken: futures::lock::Mutex::new(woken),
+            watched: Mutex::new(HashSet::new()),
             subscribing: Mutex::new(Default::default()),
             queue: Mutex::new(VecDeque::new()),
             listening: AtomicBool::new(false),
@@ -173,9 +189,13 @@ impl Pimble {
     }
 
     /// The next change to a held store, merged into what is held before it
-    /// is answered (and listening from the first call, [`Pimble::listen`]). `None` when no store is held (nothing to listen to). A
-    /// subscription that ends is made again, and its store brought up to
-    /// date, before the next change is answered (`Change::Resynced`).
+    /// is answered (and listening from the first call, [`Pimble::listen`]).
+    /// With nothing subscribed it waits for a subscription to be made. A
+    /// subscription that ends is made again when its store is watched
+    /// ([`Pimble::watch`]) or held, and its store brought up to date, before
+    /// the next change is answered (`Change::Resynced`); one that cannot be
+    /// made now (the connection is down, the store not open there yet) is
+    /// made at the next [`Pimble::watch`] or [`Pimble::rewatch`].
     pub async fn next_change(&self) -> Option<Change> {
         self.listen();
         loop {
@@ -184,10 +204,23 @@ impl Pimble {
             }
             let event = {
                 let mut subs = self.subs.lock().await;
-                for s in self.new_subs.lock().unwrap().drain(..) {
-                    subs.push(s);
+                let mut woken = self.woken.lock().await;
+                loop {
+                    for s in self.new_subs.lock().unwrap().drain(..) {
+                        subs.push(s);
+                    }
+                    if subs.is_empty() {
+                        woken.next().await?;
+                        continue;
+                    }
+                    match futures::future::select(subs.next(), woken.next()).await {
+                        futures::future::Either::Left((Some(event), _)) => break event,
+                        // Every subscription ended at once; wait for the next.
+                        futures::future::Either::Left((None, _)) => continue,
+                        futures::future::Either::Right((Some(()), _)) => continue,
+                        futures::future::Either::Right((None, _)) => return None,
+                    }
                 }
-                subs.next().await?
             };
             match event {
                 Event::Change(change) => {
@@ -196,10 +229,46 @@ impl Pimble {
                 }
                 Event::Ended(store) => {
                     self.held.lock().unwrap().lost(store);
-                    let _ = self.ensure_live(store).await;
+                    if self.watched.lock().unwrap().contains(&store) {
+                        let _ = self.ensure_live(store).await;
+                    }
                 }
             }
         }
+    }
+
+    /// Hear `store`'s changes from now on, through [`Pimble::next_change`],
+    /// and keep hearing them across a lost connection: a subscription that
+    /// ends is made again. Answers why it could not be made now, if it
+    /// could not (it is made again at the next [`Pimble::rewatch`]). A store
+    /// whose backend holds its documents itself is not subscribed to here:
+    /// its backend says what changed in it.
+    pub async fn watch(&self, store: StoreId) -> Result<(), ApiError> {
+        self.watched.lock().unwrap().insert(store);
+        self.subscribe_now(store).await
+    }
+
+    /// Stop hearing `store` (it was closed): what is held of it goes too.
+    pub fn forget(&self, store: StoreId) {
+        self.watched.lock().unwrap().remove(&store);
+        self.held.lock().unwrap().held.remove(&store);
+    }
+
+    /// Make again every watched store's subscription that is not live (a new
+    /// connection: the old one's subscriptions went with it).
+    pub async fn rewatch(&self) {
+        let watched: Vec<StoreId> = self.watched.lock().unwrap().iter().copied().collect();
+        for store in watched {
+            if let Err(e) = self.subscribe_now(store).await {
+                tracing::debug!("store {store} could not be heard again yet: {e}");
+            }
+        }
+    }
+
+    /// Whether `store`'s backend holds its documents itself, so nothing of
+    /// it is held here ([`crate::StoreCapabilities::local_documents`]).
+    fn passes_through(&self, store: StoreId) -> bool {
+        self.backend.capabilities(store).local_documents
     }
 
     /// Subscribe to `store` if what is held there is not kept current (the
@@ -207,6 +276,18 @@ impl Pimble {
     /// up to date. A store that cannot be subscribed to is read afresh
     /// every time instead.
     pub(crate) async fn ensure_live(&self, store: StoreId) -> Result<(), ApiError> {
+        if let Err(e) = self.subscribe_now(store).await {
+            tracing::debug!("store {store} could not be subscribed to; reading it afresh: {e}");
+        }
+        Ok(())
+    }
+
+    /// [`Pimble::ensure_live`], answering why a subscription could not be
+    /// made.
+    async fn subscribe_now(&self, store: StoreId) -> Result<(), ApiError> {
+        if self.passes_through(store) {
+            return Ok(());
+        }
         self.drain();
         let had = {
             let mut held = self.held.lock().unwrap();
@@ -221,15 +302,10 @@ impl Pimble {
         }
         let subscribed = self.backend.subscribe(store).await;
         self.subscribing.lock().unwrap().remove(&store);
-        let stream = match subscribed {
-            Ok(stream) => stream,
-            Err(e) => {
-                tracing::debug!("store {store} could not be subscribed to; reading it afresh: {e}");
-                return Ok(());
-            }
-        };
+        let stream = subscribed?;
         let tagged: Events = Box::pin(stream.map(Event::Change).chain(futures::stream::once(async move { Event::Ended(store) })));
         self.new_subs.lock().unwrap().push(tagged);
+        let _ = self.wake.unbounded_send(());
         let have = {
             let mut held = self.held.lock().unwrap();
             let h = held.store_mut(store);
@@ -315,6 +391,9 @@ impl Pimble {
 
     /// [`Pimble::node`], and whether it was fetched just now.
     async fn node_fetched(&self, addr: Addr) -> Result<(Node, bool), ApiError> {
+        if self.passes_through(addr.store) {
+            return Ok((self.backend.fetch_one(addr.store, addr.node).await?, true));
+        }
         self.ensure_live(addr.store).await?;
         {
             let held = self.held.lock().unwrap();
@@ -336,6 +415,9 @@ impl Pimble {
     /// A node held (fetched when it is not), without asking the server for
     /// a fresh judgement: what walks and lists read.
     pub(crate) async fn held_node(&self, addr: Addr) -> Result<Node, ApiError> {
+        if self.passes_through(addr.store) {
+            return self.backend.fetch_one(addr.store, addr.node).await;
+        }
         self.ensure_live(addr.store).await?;
         {
             let held = self.held.lock().unwrap();
@@ -350,6 +432,10 @@ impl Pimble {
 
     /// A copy of a node's document as held, to read from.
     pub async fn doc(&self, addr: Addr) -> Result<NodeDoc, ApiError> {
+        if self.passes_through(addr.store) {
+            let node = self.backend.fetch_one(addr.store, addr.node).await?;
+            return NodeDoc::load(&node.content).map_err(ApiError::unreadable);
+        }
         self.held_node(addr).await?;
         let held = self.held.lock().unwrap();
         let doc = held.store(addr.store).and_then(|h| h.tree.doc(addr.node)).ok_or_else(|| ApiError::not_found("That node is not here."))?;
@@ -359,6 +445,17 @@ impl Pimble {
     /// A node's children, through a mount to its source's: each with the
     /// address it lives at (a mount's children live in the source store).
     pub async fn children(&self, addr: Addr) -> Result<Vec<(Addr, Node)>, ApiError> {
+        let (store, nodes) = self.listing(addr).await?;
+        Ok(nodes.into_iter().map(|n| (Addr { store, node: n.id }, n)).collect())
+    }
+
+    /// [`Pimble::children`] as a list answers it: the store the children
+    /// live in (a mount's source store, for a mount, even when it has none
+    /// yet), and them, in order.
+    pub async fn listing(&self, addr: Addr) -> Result<(StoreId, Vec<Node>), ApiError> {
+        if self.passes_through(addr.store) {
+            return self.backend.children(addr.store, addr.node).await;
+        }
         let parent = self.held_node(addr).await?;
         if parent.node_type == node_types::MOUNT && parent.mount_ref().is_some() {
             // The server resolves a mount (opening or replicating its
@@ -370,11 +467,11 @@ impl Pimble {
             for n in &nodes {
                 h.take(n);
             }
-            return Ok(nodes.into_iter().map(|n| (Addr { store, node: n.id }, n)).collect());
+            return Ok((store, nodes));
         }
         let missing = {
             let held = self.held.lock().unwrap();
-            let Some(h) = held.store(addr.store) else { return Ok(Vec::new()) };
+            let Some(h) = held.store(addr.store) else { return Ok((addr.store, Vec::new())) };
             h.listed(addr.node).into_iter().filter(|c| (!h.live || h.tree.doc(*c).is_none()) && !h.absent.contains(c)).collect::<Vec<_>>()
         };
         if !missing.is_empty() {
@@ -391,9 +488,9 @@ impl Pimble {
             }
         }
         let held = self.held.lock().unwrap();
-        let Some(h) = held.store(addr.store) else { return Ok(Vec::new()) };
+        let Some(h) = held.store(addr.store) else { return Ok((addr.store, Vec::new())) };
         let ids = h.tree.get_children(addr.node).unwrap_or_default();
-        Ok(ids.into_iter().filter_map(|id| Some((Addr { store: addr.store, node: id }, h.node(id)?))).collect())
+        Ok((addr.store, ids.into_iter().filter_map(|id| h.node(id)).collect()))
     }
 
     /// Hold every document of `store` this principal may read: two
@@ -501,6 +598,7 @@ impl Pimble {
         E: Into<ApiError>,
         T: MaybeSend,
     {
+        let pass_through = self.passes_through(addr.store);
         let (node, fetched) = self.node_fetched(addr).await?;
         if let Some(refusal) = ApiError::of_access(node.access) {
             return Err(refusal);
@@ -508,7 +606,10 @@ impl Pimble {
         if !fetched {
             self.refresh(addr).await?;
         }
-        let before_bytes = {
+        let before_bytes = if pass_through {
+            // The backend's own copy, as it handed it over just now.
+            node.content.clone()
+        } else {
             let held = self.held.lock().unwrap();
             let doc = held.store(addr.store).and_then(|h| h.tree.doc(addr.node)).ok_or_else(|| ApiError::not_found("That node is not here."))?;
             doc.save()
@@ -527,9 +628,11 @@ impl Pimble {
         };
         if changed {
             self.backend.apply(addr.store, addr.node, delta.clone(), &self.client_id).await?;
-            self.held.lock().unwrap().store_mut(addr.store).merge(addr.node, &delta, false);
+            if !pass_through {
+                self.held.lock().unwrap().store_mut(addr.store).merge(addr.node, &delta, false);
+            }
         }
-        Ok(Edited { value, changed, caret: caret.filter(|_| changed), host: node.attached_to })
+        Ok(Edited { value, changed, caret: caret.filter(|_| changed), host: node.attached_to, delta: changed.then_some(delta) })
     }
 
     /// Bring one held document up to date with the server's.
@@ -600,12 +703,54 @@ impl Pimble {
     /// A node's attachments (its discussions).
     pub async fn attachments(&self, host: Addr) -> Result<Vec<Node>, ApiError> {
         let nodes = self.backend.list_attachments(host.store, host.node).await?;
+        if self.passes_through(host.store) {
+            return Ok(nodes);
+        }
         let mut held = self.held.lock().unwrap();
         let h = held.store_mut(host.store);
         for n in &nodes {
             h.take(n);
         }
         Ok(nodes)
+    }
+
+    /// Every discussion of `store` (a host's list is [`Pimble::attachments`]).
+    pub async fn discussions(&self, store: StoreId) -> Result<Vec<Node>, ApiError> {
+        self.backend.list_discussions(store).await
+    }
+
+    /// The stateless reconcile of one document a view holds (an editor's
+    /// session, a board's): everything the backend has beyond
+    /// `state_vector`, and the backend's own state vector, so the view can
+    /// send back what the backend lacks. What it brings is merged into
+    /// what is held too.
+    pub async fn reconcile(&self, addr: Addr, state_vector: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>), ApiError> {
+        let (docs, _) = self.backend.sync(addr.store, vec![(addr.node, state_vector)], false).await?;
+        let Some(d) = docs.into_iter().find(|d| d.node == addr.node) else {
+            return Err(ApiError::node_not_found(addr.node));
+        };
+        if !self.passes_through(addr.store) {
+            let mut held = self.held.lock().unwrap();
+            if let Some(h) = held.held.get_mut(&addr.store) {
+                h.merge(addr.node, &d.diff, false);
+            }
+        }
+        Ok((d.diff, d.state_vector))
+    }
+
+    /// Merge `update` into a node's document, as a view of this client made
+    /// it (typing, a stroke on a canvas): the view already holds it, so this
+    /// only sends it and keeps what is held in step. The access judgement
+    /// is the view's (a locked editor makes no update) and the backend's.
+    pub async fn apply(&self, addr: Addr, update: Vec<u8>) -> Result<(), ApiError> {
+        self.backend.apply(addr.store, addr.node, update.clone(), &self.client_id).await?;
+        if !self.passes_through(addr.store) {
+            let mut held = self.held.lock().unwrap();
+            if let Some(h) = held.held.get_mut(&addr.store) {
+                h.merge(addr.node, &update, false);
+            }
+        }
+        Ok(())
     }
 
     /// Store a picture as a blob of `addr`'s store, as a write of `addr`.

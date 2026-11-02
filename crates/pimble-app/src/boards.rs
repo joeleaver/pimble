@@ -48,7 +48,9 @@ use pimble_board::{
     smooth_stroke, Align, ArrowHeads, Author, Board, BoardSnapshot, BoardTxn, BoardView, BoardWatch, CardLabel, Color, Dash,
     Geom, Kind, NewElement, Picture, PictureGeom, Placement, Point, Rect, Stamp, StartingPicture, Style, Transform, ViewOptions,
 };
-use pimble_core::{node_types, BlobUrl, NodeId, StoreId};
+use pimble_core::{BlobUrl, NodeId, StoreId};
+#[cfg(test)]
+use pimble_core::node_types;
 use pimble_crdt::NodeDoc;
 use rinch::prelude::*;
 use rinch_tabler_icons::TablerIcon;
@@ -858,17 +860,14 @@ pub(crate) fn start(store: AppStore, pane: PaneId, store_id: StoreId, node_id: N
     let state = store.pane(pane);
     state.board.set(Some(ActiveEdit { store_id, node_id }));
     ui.layer.set(None);
-    if first {
-        store.send(BackendCommand::SubscribeNodeChanges { store_id, node_id });
-    }
+    let _ = first;
     request_reconcile(store, pane);
     after_change(store, pane);
     crate::pictures::retry_missing();
 }
 
 /// Stop showing pane `pane`'s board, if it shows one: the node cache gets the
-/// document as this pane last had it, and the last pane holding the node lets
-/// go of its subscription.
+/// document as this pane last had it.
 pub(crate) fn stop(store: AppStore, pane: PaneId) {
     tools::end_text(store, pane);
     remember_camera(pane, scale_of(pane));
@@ -895,15 +894,12 @@ pub(crate) fn stop(store: AppStore, pane: PaneId) {
     ui.layers.set(Vec::new());
     ui.frames.set(Vec::new());
     ui.others.set_if_changed(Default::default());
-    if !store.is_editing(session.store_id, session.node_id) {
-        store.send(BackendCommand::UnsubscribeNodeChanges { store_id: session.store_id, node_id: session.node_id });
-    }
 }
 
 /// Ask the server for what it has beyond pane `pane`'s copy of its board.
 pub(crate) fn request_reconcile(store: AppStore, pane: PaneId) {
     if let Some((store_id, node_id, state_vector)) = with_session(pane, |s| (s.store_id, s.node_id, s.doc.state_vector())) {
-        store.send(BackendCommand::ReconcileNodeContent { store_id, node_id, state_vector });
+        crate::doc_session::ask(store, store_id, node_id, state_vector);
     }
 }
 
@@ -917,7 +913,7 @@ pub(crate) fn request_reconcile_all(store: AppStore, store_id: StoreId, node_id:
 /// The server's answer to a reconcile: merge it into every board pane
 /// holding the node, then send back what the server lacks.
 pub(crate) fn apply_reconcile(store: AppStore, store_id: StoreId, node_id: NodeId, diff: &[u8], server_state_vector: &[u8]) {
-    let writable = store.node_access(store_id, node_id).allows_write();
+    let writable = crate::doc_session::writable(store, store_id, node_id);
     for pane in store.panes_boarding(store_id, node_id) {
         let ours = with_session(pane, |s| {
             if !diff.is_empty() {
@@ -933,11 +929,7 @@ pub(crate) fn apply_reconcile(store: AppStore, store_id: StoreId, node_id: NodeI
             }
         })
         .flatten();
-        if let Some(ours) = ours {
-            use base64::Engine;
-            let changes = base64::engine::general_purpose::STANDARD.encode(&ours);
-            store.send(BackendCommand::BroadcastChanges { store_id, node_id, changes });
-        }
+        crate::doc_session::send_back(store, store_id, node_id, ours);
         after_change(store, pane);
     }
 }
@@ -970,9 +962,7 @@ fn apply_to(store: AppStore, pane: PaneId, store_id: StoreId, node_id: NodeId, b
 /// every other pane of this window holding the board, a turn later (the
 /// server relays to other clients, not back to this one).
 fn send_update(store: AppStore, from: PaneId, store_id: StoreId, node_id: NodeId, bytes: Vec<u8>) {
-    use base64::Engine;
-    let changes = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    store.send(BackendCommand::BroadcastChanges { store_id, node_id, changes });
+    crate::doc_session::send(store, store_id, node_id, bytes.clone());
     // A board shown in text (a picture's markup, an embed) follows.
     crate::text_boards::local_update(store_id, node_id, &bytes);
     let others: Vec<PaneId> = store.panes_boarding(store_id, node_id).into_iter().filter(|p| *p != from).collect();
@@ -995,9 +985,7 @@ fn send_update(store: AppStore, from: PaneId, store_id: StoreId, node_id: NodeId
 /// paste): to the server, to every board pane holding the node, and to what
 /// shows it in text.
 pub(crate) fn send_node_update(store: AppStore, store_id: StoreId, node_id: NodeId, bytes: Vec<u8>) {
-    use base64::Engine;
-    let changes = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    store.send(BackendCommand::BroadcastChanges { store_id, node_id, changes });
+    crate::doc_session::send(store, store_id, node_id, bytes.clone());
     crate::text_boards::local_update(store_id, node_id, &bytes);
     for pane in store.panes_boarding(store_id, node_id) {
         apply_to(store, pane, store_id, node_id, &bytes);
@@ -1830,28 +1818,16 @@ pub(crate) fn build_board(board: &Board, author: Option<&Author>, picture: Optio
 
 /// Make a board node under `parent_id`, its board written in the edit that
 /// creates it (two devices creating one board would keep only one).
-pub(crate) fn create_board_node(store: AppStore, store_id: StoreId, parent_id: NodeId, title: &str, icon: &str, board: Vec<u8>, request: Option<u64>) {
-    store.send(BackendCommand::CreateNode {
-        store_id,
-        parent_id: Some(parent_id),
-        title: title.to_string(),
-        init: Some(NodeInit {
-            node_type: node_types::BOARD.to_string(),
-            content: board,
-            custom: vec![
-                (pimble_core::custom_keys::ICON.to_string(), serde_json::json!(icon)),
-                (pimble_core::custom_keys::EXPLICIT_TITLE.to_string(), serde_json::json!(true)),
-            ],
-            request,
-        }),
-        place: Default::default(),
-    });
+/// The node is `pimble_api::recipes::canvas`; `from_picture` picks its icon.
+pub(crate) fn create_board_node(store: AppStore, store_id: StoreId, parent_id: NodeId, title: &str, from_picture: bool, board: Vec<u8>, request: Option<u64>) {
+    let (title, init) = NodeInit::of(pimble_api::recipes::canvas(title, board, from_picture), request);
+    store.send(BackendCommand::CreateNode { store_id, parent_id: Some(parent_id), title, init: Some(init), place: Default::default() });
 }
 
 /// A row's "New Canvas": an empty board under `parent_id`.
 pub(crate) fn new_whiteboard(store: AppStore, store_id: StoreId, parent_id: NodeId) {
     if let Some(board) = new_board(None) {
-        create_board_node(store, store_id, parent_id, "Canvas", pimble_board::recipe::CANVAS_ICON, board, None);
+        create_board_node(store, store_id, parent_id, "Canvas", false, board, None);
     }
 }
 
@@ -2004,7 +1980,7 @@ pub(crate) fn stored(store: AppStore, request_id: u64, result: &Result<StoredBlo
         None => {
             if let Some((url, w, h)) = size {
                 if let Some(board) = new_board(Some((&url, w, h))) {
-                    create_board_node(store, store_id, parent_id, &title, pimble_board::recipe::PICTURE_CANVAS_ICON, board, None);
+                    create_board_node(store, store_id, parent_id, &title, true, board, None);
                 }
             }
         }
@@ -2397,9 +2373,10 @@ mod tests {
         let bytes = whiteboard_bytes();
         start(store, P[0], store_id, node_id, &bytes);
         start(store, P[1], store_id, node_id, &bytes);
+        // Both panes reconcile; the node's changes come on its store's
+        // subscription, never one of its own.
         let sent: Vec<BackendCommand> = commands.try_iter().collect();
-        let subscribes = sent.iter().filter(|c| matches!(c, BackendCommand::SubscribeNodeChanges { .. })).count();
-        assert_eq!(subscribes, 1, "once per node");
+        assert_eq!(sent.iter().filter(|c| matches!(c, BackendCommand::ReconcileNodeContent { .. })).count(), 2);
 
         let id = local_edit(store, P[0], |t| t.add_element(NewElement::stroke(Kind::Pen, vec![[0.0, 0.0, 0.5], [10.0, 10.0, 0.5]])));
         assert!(id.is_some());
@@ -2427,11 +2404,9 @@ mod tests {
         assert_eq!(texts(P[1]), 1);
 
         stop(store, P[0]);
-        let sent: Vec<BackendCommand> = commands.try_iter().collect();
-        assert!(!sent.iter().any(|c| matches!(c, BackendCommand::UnsubscribeNodeChanges { .. })));
+        assert_eq!(store.panes_boarding(store_id, node_id), vec![P[1]]);
         stop(store, P[1]);
-        let sent: Vec<BackendCommand> = commands.try_iter().collect();
-        assert!(sent.iter().any(|c| matches!(c, BackendCommand::UnsubscribeNodeChanges { .. })));
+        assert!(!store.is_editing(store_id, node_id));
     }
 
     /// An image node's board: the picture at one unit per pixel in a locked

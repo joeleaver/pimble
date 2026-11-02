@@ -1,17 +1,24 @@
-//! Every `BackendCommand`, turned into RPC calls on a connected
-//! [`PimbleClient`] and answered with `BackendEvent`s.
+//! Every `BackendCommand`, answered with `BackendEvent`s: the app's thin
+//! adapter onto the one API (docs/API_CONTRACT.md wave 5).
 //!
-//! This is the whole of what the two backends have in common, and the one place
-//! a command's meaning is written down. The desktop's `backend` module wraps it
-//! in a tokio thread that owns an embedded server and reconnects to it; the web
-//! app wraps it in a `spawn_local` loop against a hosted server. Adding a
-//! command means adding an arm here and nowhere else.
+//! A command that reads or writes a store is a call on [`Pimble`]
+//! ([`api_command`]): its documents are held there, kept current by the
+//! store's subscription, and every write goes through it. What only a
+//! Pimble server's operator does (open, close and create stores, replicas
+//! and sync links, the cloud account, sharing, agents) is the server's own
+//! RPCs on the connection to this client's own server ([`host_command`]),
+//! the `Host` side of decision 2. The desktop's `backend` module and the web
+//! app's loop own the API and that connection, and both call
+//! [`process_command`]; a store's changes reach the UI through
+//! [`change_events`], from whoever listens to the API.
 
 use std::future::Future;
+use std::sync::Arc;
 
 use crossbeam_channel::Sender;
+use pimble_api::{Addr, ApiError, Change, Pimble};
 use pimble_client::PimbleClient;
-use pimble_core::{custom_keys, AuthMethod, NodeId, RemoteEndpoint};
+use pimble_core::{custom_keys, node_types, AuthMethod, NodeId, RemoteEndpoint, StoreId};
 
 use crate::protocol::{BackendCommand, BackendEvent, CloudOp};
 
@@ -30,31 +37,438 @@ fn spawn_task(fut: impl Future<Output = ()> + 'static) {
     wasm_bindgen_futures::spawn_local(fut);
 }
 
-/// The node subscriptions this process holds, each with the number of the
-/// task that feeds it. `UnsubscribeNodeChanges` takes a node out and a second
-/// `SubscribeNodeChanges` (after a reconnect) renumbers it; a task whose
-/// number is no longer the node's forwards nothing more and ends, dropping
-/// its subscription, at the next notification it is handed. So a node no
-/// pane holds reaches no editor, and one a pane holds is fed exactly once.
-static NODE_SUBSCRIPTIONS: std::sync::Mutex<Option<std::collections::HashMap<(pimble_core::StoreId, NodeId), u64>>> =
-    std::sync::Mutex::new(None);
-static NEXT_NODE_SUBSCRIPTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-fn node_subscriptions<T>(f: impl FnOnce(&mut std::collections::HashMap<(pimble_core::StoreId, NodeId), u64>) -> T) -> T {
-    let mut held = NODE_SUBSCRIPTIONS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    f(held.get_or_insert_with(Default::default))
+/// What a command runs against.
+pub struct Context<'a> {
+    /// The API: every command that reads or writes a store.
+    pub api: &'a Arc<Pimble>,
+    /// The connection to this client's own server, for what only its
+    /// operator does; `None` while there is none.
+    pub host: Option<Arc<PimbleClient>>,
+    pub event_tx: &'a Sender<BackendEvent>,
+    pub signal_ui: &'a Arc<dyn Fn() + Send + Sync>,
+    /// This window's id, what its views' writes are sent as.
+    pub client_id: &'a str,
 }
 
-pub async fn process_command(
-    client: &mut Option<std::sync::Arc<PimbleClient>>,
-    cmd: BackendCommand,
-    event_tx: &Sender<BackendEvent>,
-    signal_ui: &std::sync::Arc<dyn Fn() + Send + Sync>,
-    client_id: &str,
-) -> Option<BackendEvent> {
+impl Context<'_> {
+    fn emit(&self, event: BackendEvent) {
+        let _ = self.event_tx.try_send(event);
+        (self.signal_ui)();
+    }
+}
+
+/// An API error as the app shows it: the sentence, and a store whose owner
+/// is away says so as a notice, the way the app recognises a sentence meant
+/// to be read as it is (`events::show_notice`, reached by `Forbidden: `; the
+/// server's own refusals already read that way).
+pub fn error_message(e: &ApiError) -> String {
+    match e {
+        ApiError::OwnerOffline { sentence } => format!("Forbidden: {sentence}"),
+        other => other.sentence(),
+    }
+}
+
+fn failed(e: ApiError) -> Option<BackendEvent> {
+    Some(BackendEvent::Error { message: error_message(&e) })
+}
+
+/// What one change the API heard is for the UI, in order: the update for the
+/// views holding the node (unless this window's own views made it, which
+/// hand it to each other themselves), then the change for the tree. `last`
+/// is the update handed over last: the server announces one update once per
+/// kind of change it made (a content edit that also renamed), and a view
+/// takes it once.
+pub fn change_events(change: Change, client_id: &str, last: &mut Option<(StoreId, NodeId, Vec<u8>)>) -> Vec<BackendEvent> {
+    match change {
+        Change::Resynced { store } => {
+            *last = None;
+            vec![BackendEvent::Resynced { store_id: store }]
+        }
+        Change::Store(c) => {
+            let mut events = Vec::new();
+            let mine = c.source.as_deref() == Some(client_id);
+            if let (Some(node), Some(update), false) = (pimble_api::backend::document_of(&c.kind), c.update, mine) {
+                let key = (c.store, node, update);
+                if last.as_ref() != Some(&key) {
+                    events.push(BackendEvent::RemoteChanges { store_id: c.store, node_id: node, update: key.2.clone() });
+                    *last = Some(key);
+                }
+            }
+            events.push(BackendEvent::RemoteStoreChange { store_id: c.store, change_kind: c.kind, source_client_id: c.source });
+            events
+        }
+    }
+}
+
+/// Answer `cmd`: through the API when it reads or writes a store, otherwise
+/// on the host connection.
+/// A failure of a request a modal waits on is answered as `Failed`, naming
+/// it (`crate::protocol::Asked`).
+pub async fn process_command(ctx: &Context<'_>, cmd: BackendCommand) -> Option<BackendEvent> {
+    let asked = crate::protocol::Asked::of(&cmd);
+    let answer = match api_command(ctx, cmd).await {
+        Ok(event) => event,
+        Err(cmd) => host_command(ctx, cmd).await,
+    };
+    crate::protocol::Asked::answer(asked, answer)
+}
+
+/// Where the node and its title were before a move: after a transplant the
+/// node is a tombstone under its old id.
+async fn before_move(api: &Pimble, addr: Addr) -> Result<(NodeId, String), ApiError> {
+    let node = api.node(addr).await?;
+    Ok((node.parent_id.unwrap_or(NodeId(uuid::Uuid::nil())), node.metadata.title))
+}
+
+fn moved_event(store_id: StoreId, node_id: NodeId, old_parent_id: NodeId, title: String, new_parent_id: NodeId, moved: pimble_api::Moved) -> BackendEvent {
+    if moved.node == node_id {
+        BackendEvent::NodeMoved { store_id, node_id, old_parent_id, new_parent_id }
+    } else {
+        BackendEvent::NodeTransplanted {
+            from_store_id: store_id,
+            old_node_id: node_id,
+            old_parent_id,
+            to_store_id: store_id,
+            node_id: moved.node,
+            new_parent_id,
+            title,
+            left_shares: moved.left_shares,
+        }
+    }
+}
+
+/// A new node's first state as the API takes it.
+fn node_init(title: String, init: Option<crate::protocol::NodeInit>) -> pimble_api::NodeInit {
+    match init {
+        Some(init) => pimble_api::NodeInit {
+            node_type: init.node_type,
+            title,
+            content: (!init.content.is_empty()).then_some(init.content),
+            custom: init.custom,
+        },
+        None => pimble_api::NodeInit { node_type: node_types::DOCUMENT.to_string(), title, content: None, custom: Vec::new() },
+    }
+}
+
+/// Answer `cmd` through the API when it reads or writes a store; any other
+/// command comes back untouched.
+pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Option<BackendEvent>, BackendCommand> {
+    let api = ctx.api;
+    use BackendCommand as C;
+    Ok(match cmd {
+        C::GetNode { store_id, node_id } => match api.node(Addr::new(store_id, node_id)).await {
+            Ok(node) => Some(BackendEvent::NodeLoaded { store_id, node }),
+            Err(e) => failed(e),
+        },
+
+        C::GetChildren { store_id, node_id } => match api.listing(Addr::new(store_id, node_id)).await {
+            Ok((children_store_id, children)) => Some(BackendEvent::ChildrenLoaded { store_id, parent_id: node_id, children_store_id, children }),
+            Err(e) => failed(e),
+        },
+
+        C::CreateNode { store_id, parent_id, title, init, place } => {
+            let request = init.as_ref().and_then(|init| init.request);
+            // No parent is the store's root, as the server takes it.
+            let parent = match parent_id {
+                Some(parent) => parent,
+                None => match api.store_row(store_id).await {
+                    Some(row) => row.root_node_id,
+                    None => return Ok(failed(ApiError::not_found("That store is not open here."))),
+                },
+            };
+            match api.backend().create_node(store_id, parent, node_init(title, init), place).await {
+                Ok(node_id) => Some(BackendEvent::NodeCreated { store_id, parent_id: Some(parent), node_id, request }),
+                Err(e) => failed(e),
+            }
+        }
+
+        C::CreateAttachment { store_id, host_id, title, init } => {
+            let request = init.request;
+            match api.backend().create_attachment(store_id, host_id, node_init(title, Some(init))).await {
+                Ok(node_id) => Some(BackendEvent::AttachmentCreated { store_id, host_id, node_id, request }),
+                Err(e) => failed(e),
+            }
+        }
+
+        C::ListAttachments { store_id, node_id } => match api.attachments(Addr::new(store_id, node_id)).await {
+            Ok(nodes) => Some(BackendEvent::AttachmentsListed { store_id, node_id, nodes }),
+            Err(e) => failed(e),
+        },
+
+        C::ListDiscussions { store_id } => match api.discussions(store_id).await {
+            Ok(nodes) => Some(BackendEvent::DiscussionsListed { store_id, nodes }),
+            Err(e) => failed(e),
+        },
+
+        C::ApplyUpdate { store_id, node_id, update } => match api.apply(Addr::new(store_id, node_id), update).await {
+            Ok(()) => Some(BackendEvent::NodeContentUpdated { store_id, node_id }),
+            Err(e) => failed(e),
+        },
+
+        C::BroadcastChanges { store_id, node_id, update } => match api.apply(Addr::new(store_id, node_id), update).await {
+            Ok(()) => None,
+            // A refusal is the server (or the account) saying no, and no
+            // later attempt will change its mind, so the person is told.
+            // Anything else is the connection's, which the API remakes and
+            // the views reconcile across.
+            Err(e) if e.is_refusal() || matches!(e, ApiError::OwnerOffline { .. }) => failed(e),
+            Err(e) => {
+                tracing::warn!("an edit of {node_id} was not sent: {e}");
+                None
+            }
+        },
+
+        // Rename and appearance are targeted edits of the node's document
+        // through the one write; the views of this window holding the node
+        // take the same update (the server relays it to everyone else).
+        C::RenameNode { store_id, node_id, title } => {
+            let edited = api
+                .edit(Addr::new(store_id, node_id), move |doc, now| -> Result<(), ApiError> {
+                    doc.set_title(&title, now)?;
+                    doc.set_custom(custom_keys::EXPLICIT_TITLE, &serde_json::Value::Bool(true), now)?;
+                    Ok(())
+                })
+                .await;
+            renamed(ctx, store_id, node_id, edited)
+        }
+
+        C::SetNodeAppearance { store_id, node_id, icon, color, background, tags } => {
+            let edited = api
+                .edit(Addr::new(store_id, node_id), move |doc, now| -> Result<(), ApiError> {
+                    // `None` leaves a key alone; `Some(None)`, or an empty
+                    // string, removes it, as `NodeMetadata::set_icon` does.
+                    for (key, value) in [(custom_keys::ICON, icon), (custom_keys::COLOR, color), (custom_keys::BACKGROUND, background)] {
+                        let Some(value) = value else { continue };
+                        match value.filter(|s| !s.is_empty()) {
+                            Some(value) => doc.set_custom(key, &serde_json::Value::String(value), now)?,
+                            None => {
+                                doc.remove_custom(key, now)?;
+                            }
+                        }
+                    }
+                    if let Some(tags) = tags {
+                        doc.set_tags(&tags, now)?;
+                    }
+                    Ok(())
+                })
+                .await;
+            renamed(ctx, store_id, node_id, edited)
+        }
+
+        C::DeleteNode { store_id, node_id } => {
+            let addr = Addr::new(store_id, node_id);
+            let parent_id = match api.node(addr).await {
+                Ok(node) => node.parent_id.unwrap_or(NodeId(uuid::Uuid::nil())),
+                Err(e) => return Ok(failed(e)),
+            };
+            match api.delete(addr).await {
+                Ok(()) => Some(BackendEvent::NodeDeleted { store_id, node_id, parent_id }),
+                Err(e) => failed(e),
+            }
+        }
+
+        // Moves were planned by the explorer (`pimble_core::plan` over the
+        // app's view); the backend judges them again and is authoritative.
+        C::MoveNode { store_id, node_id, new_parent_id, place } => {
+            let (old_parent_id, title) = match before_move(api, Addr::new(store_id, node_id)).await {
+                Ok(v) => v,
+                Err(e) => return Ok(failed(e)),
+            };
+            match api.backend().move_node(store_id, node_id, new_parent_id, place).await {
+                Ok(moved) => Some(moved_event(store_id, node_id, old_parent_id, title, new_parent_id, moved)),
+                Err(e) => failed(e),
+            }
+        }
+
+        C::MoveNodes { store_id, node_ids, new_parent_id, place } => {
+            // Each node once, as the answer names them.
+            let (once, _) = pimble_crdt::move_order(&node_ids, place);
+            let mut before = Vec::with_capacity(once.len());
+            for &node_id in &once {
+                match before_move(api, Addr::new(store_id, node_id)).await {
+                    Ok((old_parent_id, title)) => before.push((node_id, old_parent_id, title)),
+                    Err(e) => return Ok(failed(e)),
+                }
+            }
+            match api.backend().move_nodes(store_id, node_ids, new_parent_id, place).await {
+                Ok(answer) => {
+                    let mut events: Vec<BackendEvent> = before
+                        .into_iter()
+                        .zip(answer)
+                        .map(|((node_id, old_parent_id, title), moved)| moved_event(store_id, node_id, old_parent_id, title, new_parent_id, moved))
+                        .collect();
+                    let last = events.pop();
+                    for event in events {
+                        ctx.emit(event);
+                    }
+                    last
+                }
+                Err(e) => failed(e),
+            }
+        }
+
+        C::TransplantNode { from_store_id, node_id, to_store_id, new_parent_id, place } => {
+            let (old_parent_id, title) = match before_move(api, Addr::new(from_store_id, node_id)).await {
+                Ok(v) => v,
+                Err(e) => return Ok(failed(e)),
+            };
+            match api.backend().transplant(from_store_id, node_id, to_store_id, new_parent_id, place).await {
+                Ok(moved) => Some(BackendEvent::NodeTransplanted {
+                    from_store_id,
+                    old_node_id: node_id,
+                    old_parent_id,
+                    to_store_id,
+                    node_id: moved.node,
+                    new_parent_id,
+                    title,
+                    left_shares: moved.left_shares,
+                }),
+                Err(e) => failed(e),
+            }
+        }
+
+        C::UndeleteNode { store_id, node_id } => {
+            let addr = Addr::new(store_id, node_id);
+            if let Err(e) = api.undelete(addr).await {
+                return Ok(failed(e));
+            }
+            // Back under its parent: the list it went back into is what the
+            // tree refetches on `NodeCreated`.
+            match api.node(addr).await {
+                Ok(node) => Some(BackendEvent::NodeCreated { store_id, parent_id: node.parent_id, node_id, request: None }),
+                Err(e) => failed(e),
+            }
+        }
+
+        C::ListDeleted { store_id } => match api.list_deleted(store_id).await {
+            Ok(nodes) => Some(BackendEvent::DeletedListed { store_id, nodes }),
+            Err(e) => failed(e),
+        },
+
+        C::GetAncestors { store_id, node_id } => {
+            // Parent by parent, as far as this device may read: a member's
+            // replica stops at the share's root, whose parent it does not
+            // hold, and a parent it cannot read is no row to open. A chain
+            // longer than any real tree is broken.
+            let mut ancestors = Vec::new();
+            let mut at = api.node(Addr::new(store_id, node_id)).await.ok();
+            while let Some(node) = at.take() {
+                let Some(parent) = node.parent_id else { break };
+                if ancestors.contains(&parent) || ancestors.len() >= 256 {
+                    break;
+                }
+                if let Ok(parent_node) = api.node(Addr::new(store_id, parent)).await {
+                    ancestors.push(parent);
+                    at = Some(parent_node);
+                }
+            }
+            ancestors.reverse();
+            Some(BackendEvent::AncestorsLoaded { store_id, node_id, ancestors })
+        }
+
+        C::ResolveLink { url, hops } => match api.backend().resolve_link(url.store, url.node).await {
+            Ok(resolution) => Some(BackendEvent::LinkResolved { url, hops, resolution }),
+            Err(e) => failed(e),
+        },
+
+        C::ReconcileNodeContent { store_id, node_id, state_vector } => match api.reconcile(Addr::new(store_id, node_id), state_vector).await {
+            Ok((diff, server_state_vector)) => Some(BackendEvent::NodeContentReconciled { store_id, node_id, diff, server_state_vector }),
+            Err(e) => Some(BackendEvent::Error { message: format!("Reconcile failed: {}", error_message(&e)) }),
+        },
+
+        C::SubscribeStoreChanges { store_id } => match api.watch(store_id).await {
+            Ok(()) => None,
+            Err(e) => Some(BackendEvent::Error { message: format!("Subscribe failed: {}", error_message(&e)) }),
+        },
+
+        C::Search { query, stores, limit, purpose } => {
+            // Hybrid (keyword + semantic) where a store's backend can; a
+            // server built without an ONNX link mode, or an encrypted store
+            // searched in the page, answers by words.
+            let results = api.search(&query, stores, true, limit).await.map_err(|e| error_message(&e));
+            Some(BackendEvent::SearchResults { purpose, results })
+        }
+
+        // Presence (docs/PRESENCE_CONTRACT.md): the frame is the API's
+        // (`pimble_api::presence`), its session named after the pane. A
+        // frame that is not taken (an older server, a store not readable)
+        // is no one's business.
+        C::PublishPresence { store_id, node_id, pane, focused, left, text, board } => {
+            let frame = presence_frame(api, store_id, node_id, pane, focused, left, text, board);
+            if let Err(e) = api.backend().publish_presence(frame, ctx.client_id).await {
+                tracing::debug!("presence in {store_id} not taken: {e}");
+            }
+            None
+        }
+
+        // Both picture commands run beside the command loop, not in it: a
+        // 20 MiB picture takes a moment to send and a huge one seconds to
+        // scale down, and typing must not wait behind either.
+        C::PutBlob { store_id, node_id, bytes, request_id } => {
+            let (api, event_tx, signal_ui) = (api.clone(), ctx.event_tx.clone(), ctx.signal_ui.clone());
+            spawn_task(async move {
+                let result = store_picture(&api, Addr::new(store_id, node_id), bytes).await;
+                let _ = event_tx.try_send(BackendEvent::BlobStored { request_id, result });
+                signal_ui();
+            });
+            None
+        }
+
+        C::GetBlob { url } => {
+            let (api, event_tx, signal_ui) = (api.clone(), ctx.event_tx.clone(), ctx.signal_ui.clone());
+            spawn_task(async move {
+                let result = match api.get_blob(url.store, url.blob).await {
+                    Ok((_mime, bytes)) => Ok(Arc::new(bytes)),
+                    Err(e) => Err(e.sentence()),
+                };
+                let _ = event_tx.try_send(BackendEvent::BlobLoaded { url, result });
+                signal_ui();
+            });
+            None
+        }
+
+        other => return Err(other),
+    })
+}
+
+/// The frame pane `pane` says where it is with: what it holds and where it
+/// is in it, or, `left`, that it let go.
+#[allow(clippy::too_many_arguments)]
+pub fn presence_frame(
+    api: &Pimble,
+    store_id: StoreId,
+    node_id: NodeId,
+    pane: usize,
+    focused: bool,
+    left: bool,
+    text: Option<pimble_rpc::TextPresence>,
+    board: Option<pimble_rpc::BoardPresence>,
+) -> pimble_rpc::PresenceFrame {
+    let body = (!left).then(|| pimble_rpc::PresenceBody { device: crate::presence::device_label(), focused, text, board });
+    api.frames().frame(store_id, node_id, &pane.to_string(), body)
+}
+
+/// What a rename or an appearance change answers: the tree reads the node
+/// again (`NodeRenamed`), and the views of this window holding it take the
+/// update first.
+fn renamed(ctx: &Context<'_>, store_id: StoreId, node_id: NodeId, edited: Result<pimble_api::Edited<()>, ApiError>) -> Option<BackendEvent> {
+    match edited {
+        Ok(edited) => {
+            if let Some(update) = edited.delta {
+                ctx.emit(BackendEvent::RemoteChanges { store_id, node_id, update });
+            }
+            Some(BackendEvent::NodeRenamed { store_id, node_id })
+        }
+        Err(e) => failed(e),
+    }
+}
+
+/// Answer what only a Pimble server's operator does, on the host
+/// connection.
+pub async fn host_command(ctx: &Context<'_>, cmd: BackendCommand) -> Option<BackendEvent> {
     match cmd {
         BackendCommand::CreateStore { path, name } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
             match c.create_store(&path, &name).await {
@@ -72,7 +486,7 @@ pub async fn process_command(
         }),
 
         BackendCommand::OpenStore { path } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
             match c.open_store(&path).await {
@@ -82,17 +496,20 @@ pub async fn process_command(
         }
 
         BackendCommand::CloseStore { store_id } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
             match c.close_store(store_id).await {
-                Ok(()) => Some(BackendEvent::StoreClosed { store_id }),
+                Ok(()) => {
+                    ctx.api.forget(store_id);
+                    Some(BackendEvent::StoreClosed { store_id })
+                }
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
         }
 
         BackendCommand::ListStores => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
             match c.list_stores().await {
@@ -101,50 +518,8 @@ pub async fn process_command(
             }
         }
 
-        BackendCommand::CreateNode { store_id, parent_id, title, init, place } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            let request = init.as_ref().and_then(|init| init.request);
-            let created = match init {
-                None => {
-                    c.create_node_with(store_id, parent_id, pimble_core::node_types::DOCUMENT, &title, None, Default::default(), place)
-                        .await
-                }
-                Some(init) => {
-                    c.create_node_with(store_id, parent_id, init.node_type, &title, Some(init.content), init.custom.into_iter().collect(), place)
-                        .await
-                }
-            };
-            match created {
-                Ok(node_id) => Some(BackendEvent::NodeCreated { store_id, parent_id, node_id, request }),
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
-        BackendCommand::CreateAttachment { store_id, host_id, title, init } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            let request = init.request;
-            match c.create_attachment(store_id, host_id, init.node_type, &title, Some(init.content), init.custom.into_iter().collect()).await {
-                Ok(node_id) => Some(BackendEvent::AttachmentCreated { store_id, host_id, node_id, request }),
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
-        BackendCommand::ListAttachments { store_id, node_id } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            match c.list_attachments(store_id, node_id).await {
-                Ok(nodes) => Some(BackendEvent::AttachmentsListed { store_id, node_id, nodes }),
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
         BackendCommand::SyncPersonal { state, enabled, turn_on } => {
-            let c = client.as_ref()?;
+            let c = ctx.host.as_ref()?;
             match c.cloud_personal_sync(&state, enabled, turn_on).await {
                 Ok((state, off)) => Some(BackendEvent::PersonalSynced { state, off }),
                 Err(e) => {
@@ -156,273 +531,8 @@ pub async fn process_command(
             }
         }
 
-        BackendCommand::ListDiscussions { store_id } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            match c.list_discussions(store_id).await {
-                Ok(nodes) => Some(BackendEvent::DiscussionsListed { store_id, nodes }),
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
-        BackendCommand::GetNode { store_id, node_id } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            match c.get_node(store_id, node_id).await {
-                Ok(node) => Some(BackendEvent::NodeLoaded { store_id, node }),
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
-        BackendCommand::GetChildren { store_id, node_id } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            match c.get_children(store_id, node_id).await {
-                Ok((children_store_id, children)) => Some(BackendEvent::ChildrenLoaded {
-                    store_id,
-                    parent_id: node_id,
-                    children_store_id,
-                    children
-                }),
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
-        BackendCommand::ApplyUpdate { store_id, node_id, update } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            use base64::Engine as _;
-            let changes = base64::engine::general_purpose::STANDARD.encode(update);
-            match c.apply_edit(store_id, node_id, client_id, pimble_rpc::EditOperation::IncrementalChanges { changes }).await {
-                Ok(()) => Some(BackendEvent::NodeContentUpdated { store_id, node_id }),
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
-        BackendCommand::BroadcastChanges { store_id, node_id, changes } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            use pimble_rpc::EditOperation;
-            if let Err(e) = c.apply_edit(store_id, node_id, client_id, EditOperation::IncrementalChanges { changes }).await {
-                tracing::warn!("BroadcastChanges failed: {}", e);
-            }
-            None
-        }
-
-        BackendCommand::SetNodeAppearance { store_id, node_id, icon, color, background, tags } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            let edited = edit_node_document(c, store_id, node_id, client_id, |doc, now| {
-                // `None` leaves a key alone; `Some(None)`, or an empty string,
-                // removes it, as `NodeMetadata::set_icon` does.
-                for (key, value) in [(custom_keys::ICON, icon), (custom_keys::COLOR, color), (custom_keys::BACKGROUND, background)] {
-                    let Some(value) = value else { continue };
-                    match value.filter(|s| !s.is_empty()) {
-                        Some(value) => doc.set_custom(key, &serde_json::Value::String(value), now)?,
-                        None => {
-                            doc.remove_custom(key, now)?;
-                        }
-                    }
-                }
-                if let Some(tags) = tags {
-                    doc.set_tags(&tags, now)?;
-                }
-                Ok(())
-            })
-            .await;
-            match edited {
-                Ok(()) => Some(BackendEvent::NodeRenamed { store_id, node_id }),
-                Err(message) => Some(BackendEvent::Error { message }),
-            }
-        }
-
-        BackendCommand::RenameNode { store_id, node_id, title } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            let edited = edit_node_document(c, store_id, node_id, client_id, |doc, now| {
-                doc.set_title(&title, now)?;
-                doc.set_custom(custom_keys::EXPLICIT_TITLE, &serde_json::Value::Bool(true), now)
-            })
-            .await;
-            match edited {
-                Ok(()) => Some(BackendEvent::NodeRenamed { store_id, node_id }),
-                Err(message) => Some(BackendEvent::Error { message }),
-            }
-        }
-
-        BackendCommand::DeleteNode { store_id, node_id } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            // Get parent before deleting
-            let parent_id = match c.get_node(store_id, node_id).await {
-                Ok(node) => node.parent_id.unwrap_or(NodeId(uuid::Uuid::nil())),
-                Err(e) => return Some(BackendEvent::Error { message: e.to_string() }),
-            };
-            match c.delete_node(store_id, node_id).await {
-                Ok(()) => Some(BackendEvent::NodeDeleted { store_id, node_id, parent_id }),
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
-        BackendCommand::MoveNode { store_id, node_id, new_parent_id, place } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            // The old parent and the title are read before the move: after a
-            // transplant the node is a tombstone under its old id.
-            let (old_parent_id, title) = match c.get_node(store_id, node_id).await {
-                Ok(node) => (node.parent_id.unwrap_or(NodeId(uuid::Uuid::nil())), node.metadata.title),
-                Err(e) => return Some(BackendEvent::Error { message: e.to_string() }),
-            };
-            match c.move_node(store_id, node_id, new_parent_id, place).await {
-                Ok(answer) if answer.node_id == node_id => {
-                    Some(BackendEvent::NodeMoved { store_id, node_id, old_parent_id, new_parent_id })
-                }
-                Ok(answer) => Some(BackendEvent::NodeTransplanted {
-                    from_store_id: store_id,
-                    old_node_id: node_id,
-                    old_parent_id,
-                    to_store_id: store_id,
-                    node_id: answer.node_id,
-                    new_parent_id,
-                    title,
-                    left_shares: answer.left_shares,
-                }),
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
-        BackendCommand::MoveNodes { store_id, node_ids, new_parent_id, place } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            // Each node's old parent and title, read before the move (as
-            // `MoveNode` does): after a transplant the node is a tombstone.
-            let mut before = Vec::with_capacity(node_ids.len());
-            for &node_id in &node_ids {
-                match c.get_node(store_id, node_id).await {
-                    Ok(node) => before.push((node_id, node.parent_id.unwrap_or(NodeId(uuid::Uuid::nil())), node.metadata.title)),
-                    Err(e) => return Some(BackendEvent::Error { message: e.to_string() }),
-                }
-            }
-            match c.move_nodes(store_id, node_ids, new_parent_id, place).await {
-                Ok(answer) => {
-                    for ((node_id, old_parent_id, title), moved) in before.into_iter().zip(answer.moved) {
-                        let event = if moved.node_id == node_id {
-                            BackendEvent::NodeMoved { store_id, node_id, old_parent_id, new_parent_id }
-                        } else {
-                            BackendEvent::NodeTransplanted {
-                                from_store_id: store_id,
-                                old_node_id: node_id,
-                                old_parent_id,
-                                to_store_id: store_id,
-                                node_id: moved.node_id,
-                                new_parent_id,
-                                title,
-                                left_shares: moved.left_shares,
-                            }
-                        };
-                        let _ = event_tx.try_send(event);
-                    }
-                    signal_ui();
-                    None
-                }
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
-        BackendCommand::TransplantNode { from_store_id, node_id, to_store_id, new_parent_id, place } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            let (old_parent_id, title) = match c.get_node(from_store_id, node_id).await {
-                Ok(node) => (node.parent_id.unwrap_or(NodeId(uuid::Uuid::nil())), node.metadata.title),
-                Err(e) => return Some(BackendEvent::Error { message: e.to_string() }),
-            };
-            match c.transplant_node(from_store_id, node_id, to_store_id, new_parent_id, place).await {
-                Ok(answer) => Some(BackendEvent::NodeTransplanted {
-                    from_store_id,
-                    old_node_id: node_id,
-                    old_parent_id,
-                    to_store_id,
-                    node_id: answer.node_id,
-                    new_parent_id,
-                    title,
-                    left_shares: answer.left_shares,
-                }),
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
-        BackendCommand::UndeleteNode { store_id, node_id } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            if let Err(e) = c.undelete_node(store_id, node_id).await {
-                return Some(BackendEvent::Error { message: e.to_string() });
-            }
-            // Back under its parent: the list it went back into is what the
-            // tree refetches on `NodeCreated`.
-            match c.get_node(store_id, node_id).await {
-                Ok(node) => Some(BackendEvent::NodeCreated { store_id, parent_id: node.parent_id, node_id, request: None }),
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
-        BackendCommand::ListDeleted { store_id } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            match c.list_deleted(store_id).await {
-                Ok(nodes) => Some(BackendEvent::DeletedListed { store_id, nodes }),
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
-        BackendCommand::GetAncestors { store_id, node_id } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            // Parent by parent, as far as this device may read: a member's
-            // replica stops at the share's root, whose parent it does not
-            // hold, and a parent it cannot fetch is no row to open. A chain
-            // longer than any real tree is broken.
-            let mut ancestors = Vec::new();
-            let mut at = c.get_node(store_id, node_id).await.ok();
-            while let Some(node) = at.take() {
-                let Some(parent) = node.parent_id else { break };
-                if ancestors.contains(&parent) || ancestors.len() >= 256 {
-                    break;
-                }
-                if let Ok(parent_node) = c.get_node(store_id, parent).await {
-                    ancestors.push(parent);
-                    at = Some(parent_node);
-                }
-            }
-            ancestors.reverse();
-            Some(BackendEvent::AncestorsLoaded { store_id, node_id, ancestors })
-        }
-
-        BackendCommand::ResolveLink { url, hops } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            match c.resolve_link(url.store, url.node).await {
-                Ok(resolution) => Some(BackendEvent::LinkResolved { url, hops, resolution }),
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-            }
-        }
-
         BackendCommand::CreateMount { store_id, parent_id, source_store_id, source_node_id, title } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
             match c.create_mount(store_id, parent_id, source_store_id, source_node_id, title).await {
@@ -432,7 +542,7 @@ pub async fn process_command(
         }
 
         BackendCommand::GetMountState { store_id, node_id } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
             match c.get_mount_state(store_id, node_id).await {
@@ -441,127 +551,8 @@ pub async fn process_command(
             }
         }
 
-        BackendCommand::ReconcileNodeContent { store_id, node_id, state_vector } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            match c.sync_node_content(store_id, node_id, &state_vector).await {
-                Ok((diff, server_state_vector)) => Some(BackendEvent::NodeContentReconciled {
-                    store_id,
-                    node_id,
-                    diff,
-                    server_state_vector,
-                }),
-                Err(e) => Some(BackendEvent::Error { message: format!("Reconcile failed: {}", e) }),
-            }
-        }
-
-        BackendCommand::SubscribeStoreChanges { store_id } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            match c.subscribe_store_changes(store_id).await {
-                Ok(mut sub) => {
-                    let tx = event_tx.clone();
-                    let signal = signal_ui.clone();
-                    spawn_task(async move {
-                        while let Some(Ok(notification)) = sub.next().await {
-                            let event = BackendEvent::RemoteStoreChange {
-                                store_id: notification.store_id,
-                                change_kind: notification.change_kind,
-                                source_client_id: notification.source_client_id,
-                            };
-                            if let Err(e) = tx.try_send(event) {
-                                tracing::warn!("RemoteStoreChange channel full, dropped: {}", e);
-                            }
-                            signal();
-                        }
-                    });
-                    None // No immediate event
-                }
-                Err(e) => Some(BackendEvent::Error { message: format!("Subscribe failed: {}", e) }),
-            }
-        }
-
-        BackendCommand::SubscribeNodeChanges { store_id, node_id } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::Error { message: "Not connected".into() });
-            };
-            match c.subscribe_node_changes(store_id, node_id).await {
-                Ok(mut sub) => {
-                    let tx = event_tx.clone();
-                    let signal = signal_ui.clone();
-                    let my_client_id = client_id.to_string();
-                    let number = NEXT_NODE_SUBSCRIPTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    node_subscriptions(|held| held.insert((store_id, node_id), number));
-                    spawn_task(async move {
-                        loop {
-                            let notification = match sub.next().await {
-                                Some(Ok(n)) => n,
-                                Some(Err(e)) => {
-                                    tracing::warn!("Node subscription error: {}", e);
-                                    continue;
-                                }
-                                None => break,
-                            };
-                            // Let go of, or taken over by a later
-                            // subscription: this one is done.
-                            if node_subscriptions(|held| held.get(&(store_id, node_id)).copied()) != Some(number) {
-                                break;
-                            }
-
-                            tracing::info!("Node sub: received notification, source={:?}, has_op={}", notification.source_client_id, notification.operation.is_some());
-
-                            // Skip our own echoes
-                            if let Some(ref source) = notification.source_client_id {
-                                if source == &my_client_id {
-                                    continue;
-                                }
-                            }
-
-                            // Forward incremental changes if present
-                            if let Some(ref op) = notification.operation {
-                                use pimble_rpc::EditOperation;
-                                let EditOperation::IncrementalChanges { changes } = op;
-                                if let Err(e) = tx.try_send(BackendEvent::RemoteChanges {
-                                    store_id,
-                                    node_id,
-                                    changes: changes.clone(),
-                                }) {
-                                    tracing::warn!("RemoteChanges channel full, dropped: {}", e);
-                                }
-                            }
-                            signal();
-                        }
-                    });
-                    None
-                }
-                Err(e) => Some(BackendEvent::Error { message: format!("Subscribe failed: {}", e) }),
-            }
-        }
-
-        BackendCommand::UnsubscribeNodeChanges { store_id, node_id } => {
-            node_subscriptions(|held| held.remove(&(store_id, node_id)));
-            None
-        }
-
-        // Handled in `backend_loop` before dispatch; never reaches here.
-        BackendCommand::ConnectionLost { .. } => None,
-
-        BackendCommand::Search { query, stores, limit, purpose } => {
-            let Some(c) = client.as_ref() else {
-                return Some(BackendEvent::SearchResults { purpose, results: Err("Not connected".into()) });
-            };
-            // Ask for hybrid (keyword + semantic); a server built without an ONNX
-            // link mode answers keyword-only.
-            match c.search(query, stores, true, limit).await {
-                Ok(results) => Some(BackendEvent::SearchResults { purpose, results: Ok(results) }),
-                Err(e) => Some(BackendEvent::SearchResults { purpose, results: Err(e.to_string()) }),
-            }
-        }
-
         BackendCommand::RebuildIndex { store_id } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
             match c.rebuild_index(store_id).await {
@@ -574,7 +565,7 @@ pub async fn process_command(
             // Through this server's own `listRemoteStores` (decision 5): the
             // app never connects to a remote itself. `c` here is our
             // connection to the local embedded/shared server.
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::RemoteStoresListed { url, result: Err("Not connected".into()) });
             };
             let remote = match remote_endpoint(&url, &token) {
@@ -588,7 +579,7 @@ pub async fn process_command(
         }
 
         BackendCommand::AddRemoteStore { url, remote_store_id, token } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
             let remote = match remote_endpoint(&url, &token) {
@@ -609,7 +600,7 @@ pub async fn process_command(
             target_store_id,
             target_parent_id,
         } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
 
@@ -636,8 +627,8 @@ pub async fn process_command(
                     };
                     // Report the new store before the mount, so the tree has
                     // it registered by the time `MountCreated` lands.
-                    let _ = event_tx.try_send(BackendEvent::StoreOpened { store: added.clone() });
-                    signal_ui();
+                    let _ = ctx.event_tx.try_send(BackendEvent::StoreOpened { store: added.clone() });
+                    (ctx.signal_ui)();
                     added
                 }
             };
@@ -664,7 +655,7 @@ pub async fn process_command(
         }
 
         BackendCommand::SetStoreSync { store_id, remote } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
             match c.set_store_sync_response(store_id, remote).await {
@@ -674,7 +665,7 @@ pub async fn process_command(
         }
 
         BackendCommand::GetStoreSync { store_id } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
             match c.get_store_sync_response(store_id).await {
@@ -687,7 +678,7 @@ pub async fn process_command(
         // failure is a `CloudError` naming its operation, never the generic
         // `Error`, so the modal that asked gets it (decision 3).
         BackendCommand::ListAgents | BackendCommand::CreateAgent { .. } | BackendCommand::UpdateAgent { .. } | BackendCommand::RemoveAgent { .. } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::AgentsError { message: "Not connected to Pimble's server.".into() });
             };
             let done = match cmd {
@@ -711,12 +702,12 @@ pub async fn process_command(
         }
 
         BackendCommand::ServerInfo => {
-            let c = client.as_ref()?;
+            let c = ctx.host.as_ref()?;
             Some(BackendEvent::ServerInfo { version: c.server_info().await.ok().map(|i| i.version) })
         }
 
         BackendCommand::CloudStatus => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::Status, message: "Not connected".into() });
             };
             match c.cloud_status().await {
@@ -726,7 +717,7 @@ pub async fn process_command(
         }
 
         BackendCommand::CloudSignIn { url, email, password } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::SignIn, message: "Not connected".into() });
             };
             if let Err(e) = c.cloud_sign_in(url.clone(), email.clone(), password).await {
@@ -746,7 +737,7 @@ pub async fn process_command(
         }
 
         BackendCommand::CloudSignOut => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::SignOut, message: "Not connected".into() });
             };
             match c.cloud_sign_out().await {
@@ -756,7 +747,7 @@ pub async fn process_command(
         }
 
         BackendCommand::CloudHostStore { store_id } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::HostStore, message: "Not connected".into() });
             };
             match c.cloud_host_store(store_id).await {
@@ -766,7 +757,7 @@ pub async fn process_command(
         }
 
         BackendCommand::CloudListHostedStores => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::ListHostedStores, message: "Not connected".into() });
             };
             // The whole answer: which rows are relay-tier rides beside them.
@@ -776,33 +767,23 @@ pub async fn process_command(
             }
         }
 
-        // Presence (docs/PRESENCE_CONTRACT.md). A frame that is not taken
-        // (an older server, a store not readable) is no one's business.
-        BackendCommand::PublishPresence { store_id, node_id, pane, focused, left, text, board } => {
-            let c = client.as_ref()?;
-            let frame = crate::presence::frame_for(client_id, store_id, node_id, pane, focused, left, crate::presence::Whereabouts { text, board });
-            if let Err(e) = c.publish_presence(frame, client_id).await {
-                tracing::debug!("presence in {store_id} not taken: {e}");
-            }
-            None
-        }
         BackendCommand::SubscribePresence { store_id } => {
-            let c = client.as_ref()?;
-            let sub = match c.subscribe_presence(store_id, client_id).await {
+            let c = ctx.host.as_ref()?;
+            let sub = match c.subscribe_presence(store_id, ctx.client_id).await {
                 Ok(sub) => sub,
                 Err(e) => {
                     tracing::debug!("no presence for store {store_id}: {e}");
                     return None;
                 }
             };
-            let mine = client_id.to_string();
+            let mine = ctx.client_id.to_string();
             let theirs = move |frame: &pimble_rpc::PresenceFrame| frame.client() != mine;
             for frame in c.get_presence(store_id).await.unwrap_or_default().into_iter().filter(|f| theirs(f)) {
-                let _ = event_tx.try_send(BackendEvent::PresenceFrame { frame });
+                let _ = ctx.event_tx.try_send(BackendEvent::PresenceFrame { frame });
             }
-            signal_ui();
-            let tx = event_tx.clone();
-            let signal = signal_ui.clone();
+            (ctx.signal_ui)();
+            let tx = ctx.event_tx.clone();
+            let signal = ctx.signal_ui.clone();
             let mut sub = sub;
             spawn_task(async move {
                 while let Some(Ok(frame)) = sub.next().await {
@@ -820,13 +801,13 @@ pub async fn process_command(
 
         // Names (docs/PRESENCE_CONTRACT.md section 3).
         BackendCommand::CloudListShares => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::Shares, message: "Not connected".into() });
             };
             Some(shares_listed(c).await)
         }
         BackendCommand::CloudSetDisplayName { name } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::Shares, message: "Not connected".into() });
             };
             match c.cloud_set_display_name(&name).await {
@@ -835,7 +816,7 @@ pub async fn process_command(
             }
         }
         BackendCommand::CloudSetShareName { store_id, root, name } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::Shares, message: "Not connected".into() });
             };
             match c.cloud_set_share_name(store_id, root, &name).await {
@@ -844,7 +825,7 @@ pub async fn process_command(
             }
         }
         BackendCommand::GetPeople { store_id } => {
-            let c = client.as_ref()?;
+            let c = ctx.host.as_ref()?;
             match c.cloud_people(store_id).await {
                 Ok(people) => Some(BackendEvent::PeopleLoaded { store_id, people }),
                 Err(e) => {
@@ -858,7 +839,7 @@ pub async fn process_command(
         // state arrives afterwards as ordinary `SyncStateChanged`
         // notifications; a refusal is the server's own sentence.
         BackendCommand::CloudRelayStore { store_id } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::RelayStore, message: "Not connected".into() });
             };
             match c.cloud_relay_store(store_id).await {
@@ -868,7 +849,7 @@ pub async fn process_command(
         }
 
         BackendCommand::CloudStopRelaying { store_id } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::StopRelaying, message: "Not connected".into() });
             };
             match c.cloud_stop_relaying(store_id).await {
@@ -878,7 +859,7 @@ pub async fn process_command(
         }
 
         BackendCommand::CloudAddHostedStore { store_id } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::AddHostedStore, message: "Not connected".into() });
             };
             // The replica arrives the way `AddRemoteStore`'s does.
@@ -889,35 +870,35 @@ pub async fn process_command(
         }
 
         BackendCommand::CloudShareNode { store_id, node_id, name } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::Share, message: "Not connected".into() });
             };
             Some(share_answer(CloudOp::Share, store_id, node_id, c.cloud_share_node(store_id, node_id, &name).await))
         }
 
         BackendCommand::CloudShareInfo { store_id, node_id } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::ShareInfo, message: "Not connected".into() });
             };
             Some(share_answer(CloudOp::ShareInfo, store_id, node_id, c.cloud_share_info(store_id, node_id).await))
         }
 
         BackendCommand::CloudShareInvite { store_id, node_id, email, role } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::ShareInvite, message: "Not connected".into() });
             };
             Some(share_answer(CloudOp::ShareInvite, store_id, node_id, c.cloud_share_invite(store_id, node_id, &email, role).await))
         }
 
         BackendCommand::CloudShareRemoveMember { store_id, node_id, email } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::ShareRemoveMember, message: "Not connected".into() });
             };
             Some(share_answer(CloudOp::ShareRemoveMember, store_id, node_id, c.cloud_share_remove_member(store_id, node_id, &email).await))
         }
 
         BackendCommand::CloudStopSharing { store_id, node_id } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::CloudError { op: CloudOp::StopSharing, message: "Not connected".into() });
             };
             match c.cloud_stop_sharing(store_id, node_id).await {
@@ -934,46 +915,22 @@ pub async fn process_command(
             message: "This build cannot create a hosted store".into(),
         }),
 
-        // Both picture commands run beside the command loop, not in it: a
-        // 20 MiB picture takes a moment to send and a huge one seconds to
-        // scale down, and typing must not wait behind either.
-        BackendCommand::PutBlob { store_id, node_id, bytes, request_id } => {
-            let Some(c) = client.clone() else {
-                return Some(BackendEvent::BlobStored { request_id, result: Err(crate::pictures::NOT_CONNECTED.to_string()) });
-            };
-            let (event_tx, signal_ui) = (event_tx.clone(), signal_ui.clone());
-            spawn_task(async move {
-                let result = store_picture(&c, store_id, node_id, bytes).await;
-                let _ = event_tx.try_send(BackendEvent::BlobStored { request_id, result });
-                signal_ui();
-            });
-            None
-        }
-
-        BackendCommand::GetBlob { url } => {
-            let Some(c) = client.clone() else {
-                return Some(BackendEvent::BlobLoaded { url, result: Err(crate::pictures::NOT_CONNECTED.to_string()) });
-            };
-            let (event_tx, signal_ui) = (event_tx.clone(), signal_ui.clone());
-            spawn_task(async move {
-                let result = match c.get_blob(url.store, url.blob).await {
-                    Ok((_mime, bytes)) => Ok(std::sync::Arc::new(bytes)),
-                    Err(e) => Err(e.to_string()),
-                };
-                let _ = event_tx.try_send(BackendEvent::BlobLoaded { url, result });
-                signal_ui();
-            });
-            None
-        }
-
         BackendCommand::RemoveReplica { store_id, force } => {
-            let Some(c) = client.as_ref() else {
+            let Some(c) = ctx.host.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
             match c.remove_replica(store_id, force).await {
-                Ok(()) => Some(BackendEvent::ReplicaRemoved { store_id }),
+                Ok(()) => {
+                    ctx.api.forget(store_id);
+                    Some(BackendEvent::ReplicaRemoved { store_id })
+                }
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
+        }
+
+        other => {
+            tracing::warn!("a command reached the host that is the API's: {other:?}");
+            None
         }
     }
 }
@@ -981,20 +938,12 @@ pub async fn process_command(
 /// Fit a picture under the size limit and store it: the one way a picture
 /// the person adds reaches a store (docs/IMAGES_CONTRACT.md "Too large").
 /// Every error is a sentence for the person.
-async fn store_picture(
-    client: &PimbleClient,
-    store_id: pimble_core::StoreId,
-    node_id: NodeId,
-    bytes: Vec<u8>,
-) -> Result<crate::protocol::StoredBlob, String> {
+async fn store_picture(api: &Pimble, addr: Addr, bytes: Vec<u8>) -> Result<crate::protocol::StoredBlob, String> {
     let fitted = fit_picture(bytes).await?;
-    let url = client
-        .put_blob(store_id, node_id, fitted.mime.as_str(), &fitted.bytes)
-        .await
-        .map_err(|e| {
-            let message = e.to_string();
-            message.strip_prefix("Forbidden: ").map(str::to_string).unwrap_or(message)
-        })?;
+    let url = api.put_blob(addr, fitted.mime.as_str(), &fitted.bytes).await.map_err(|e| {
+        let message = e.sentence();
+        message.strip_prefix("Forbidden: ").map(str::to_string).unwrap_or(message)
+    })?;
     let size = ::image::ImageReader::new(std::io::Cursor::new(&fitted.bytes))
         .with_guessed_format()
         .ok()
@@ -1086,18 +1035,4 @@ async fn shares_listed(c: &PimbleClient) -> BackendEvent {
         Ok(shares) => BackendEvent::CloudSharesListed { shares },
         Err(e) => BackendEvent::CloudError { op: CloudOp::Shares, message: e.to_string() },
     }
-}
-
-/// Change a node's document through [`PimbleClient::edit_node`], under a
-/// client id of its own so this app's own node subscription hears the edit
-/// and its open sessions of the node take it in (the server relays to
-/// everyone but the sender).
-async fn edit_node_document(
-    c: &PimbleClient,
-    store_id: pimble_core::StoreId,
-    node_id: NodeId,
-    client_id: &str,
-    edit: impl FnOnce(&mut pimble_crdt::NodeDoc, &str) -> pimble_crdt::Result<()>,
-) -> Result<(), String> {
-    c.edit_node(store_id, node_id, &format!("{client_id}:metadata"), edit).await.map_err(|e| e.to_string())
 }

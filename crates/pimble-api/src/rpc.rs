@@ -160,6 +160,11 @@ impl Backend for RpcBackend {
         c.list_attachments(store, host).await.map_err(|e| err(&c, e))
     }
 
+    async fn list_discussions(&self, store: StoreId) -> Result<Vec<Node>, ApiError> {
+        let c = self.client().await?;
+        c.list_discussions(store).await.map_err(|e| err(&c, e))
+    }
+
     async fn search(&self, query: &str, stores: Vec<StoreId>, semantic: bool, limit: usize) -> Result<Vec<SearchResultItem>, ApiError> {
         let c = self.client().await?;
         c.search(query, stores, semantic, limit).await.map_err(|e| err(&c, e))

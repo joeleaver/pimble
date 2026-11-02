@@ -100,6 +100,12 @@ pub struct StoreCapabilities {
     pub semantic_search: bool,
     /// It has a search index that can be rebuilt.
     pub index_rebuild: bool,
+    /// The backend holds the store's documents itself, in this process,
+    /// and answers every read from them (the browser's vault holds the
+    /// decrypted documents of an encrypted store). [`crate::Pimble`] then
+    /// holds no second copy: it asks the backend each time, so there is one
+    /// holder and nothing to disagree with it (docs/API_CONTRACT.md wave 5).
+    pub local_documents: bool,
 }
 
 impl StoreCapabilities {
@@ -113,6 +119,7 @@ impl StoreCapabilities {
         sync_links: true,
         semantic_search: true,
         index_rebuild: true,
+        local_documents: false,
     };
 }
 
@@ -163,6 +170,13 @@ pub trait Backend: MaybeSend + MaybeSync {
     async fn resolve_link(&self, store: StoreId, node: NodeId) -> Result<LinkResolution, ApiError>;
     async fn list_deleted(&self, store: StoreId) -> Result<Vec<DeletedNode>, ApiError>;
     async fn list_attachments(&self, store: StoreId, host: NodeId) -> Result<Vec<Node>, ApiError>;
+
+    /// Every live discussion of a store whose host is live (or that has
+    /// none), each whole. Said not to be there by a backend that cannot list
+    /// them.
+    async fn list_discussions(&self, _store: StoreId) -> Result<Vec<Node>, ApiError> {
+        Err(ApiError::not_available("Listing a store's discussions is not available here."))
+    }
     async fn search(&self, query: &str, stores: Vec<StoreId>, semantic: bool, limit: usize) -> Result<Vec<SearchResultItem>, ApiError>;
     async fn put_blob(&self, store: StoreId, node: NodeId, mime: &str, bytes: &[u8]) -> Result<BlobUrl, ApiError>;
     async fn get_blob(&self, store: StoreId, blob: BlobId) -> Result<(String, Vec<u8>), ApiError>;
@@ -174,6 +188,109 @@ pub trait Backend: MaybeSend + MaybeSync {
 
     /// A store's changes from now on.
     async fn subscribe(&self, store: StoreId) -> Result<ChangeStream, ApiError>;
+}
+
+/// A backend shared with whoever else needs it (the browser's loop keeps
+/// the [`crate::Router`] it routes through, to tell it which backend serves
+/// a store and what the account may change there).
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl<B: Backend + ?Sized> Backend for std::sync::Arc<B> {
+    fn capabilities(&self, store: StoreId) -> StoreCapabilities {
+        (**self).capabilities(store)
+    }
+
+    async fn list_stores(&self) -> Result<Vec<Store>, ApiError> {
+        (**self).list_stores().await
+    }
+
+    async fn fetch_one(&self, store: StoreId, node: NodeId) -> Result<Node, ApiError> {
+        (**self).fetch_one(store, node).await
+    }
+
+    async fn fetch(&self, store: StoreId, nodes: Vec<NodeId>) -> Result<Vec<Node>, ApiError> {
+        (**self).fetch(store, nodes).await
+    }
+
+    async fn children(&self, store: StoreId, node: NodeId) -> Result<(StoreId, Vec<Node>), ApiError> {
+        (**self).children(store, node).await
+    }
+
+    async fn sync(&self, store: StoreId, have: Vec<(NodeId, Vec<u8>)>, list_unknown: bool) -> Result<(Vec<SyncedDoc>, Vec<NodeId>), ApiError> {
+        (**self).sync(store, have, list_unknown).await
+    }
+
+    async fn apply(&self, store: StoreId, node: NodeId, update: Vec<u8>, client_id: &str) -> Result<(), ApiError> {
+        (**self).apply(store, node, update, client_id).await
+    }
+
+    async fn create_node(&self, store: StoreId, parent: NodeId, init: NodeInit, place: Place) -> Result<NodeId, ApiError> {
+        (**self).create_node(store, parent, init, place).await
+    }
+
+    async fn create_attachment(&self, store: StoreId, host: NodeId, init: NodeInit) -> Result<NodeId, ApiError> {
+        (**self).create_attachment(store, host, init).await
+    }
+
+    async fn move_node(&self, store: StoreId, node: NodeId, parent: NodeId, place: Place) -> Result<Moved, ApiError> {
+        (**self).move_node(store, node, parent, place).await
+    }
+
+    async fn move_nodes(&self, store: StoreId, nodes: Vec<NodeId>, parent: NodeId, place: Place) -> Result<Vec<Moved>, ApiError> {
+        (**self).move_nodes(store, nodes, parent, place).await
+    }
+
+    async fn transplant(&self, from: StoreId, node: NodeId, to: StoreId, parent: NodeId, place: Place) -> Result<Moved, ApiError> {
+        (**self).transplant(from, node, to, parent, place).await
+    }
+
+    async fn delete(&self, store: StoreId, node: NodeId) -> Result<(), ApiError> {
+        (**self).delete(store, node).await
+    }
+
+    async fn undelete(&self, store: StoreId, node: NodeId) -> Result<(), ApiError> {
+        (**self).undelete(store, node).await
+    }
+
+    async fn resolve_link(&self, store: StoreId, node: NodeId) -> Result<LinkResolution, ApiError> {
+        (**self).resolve_link(store, node).await
+    }
+
+    async fn list_deleted(&self, store: StoreId) -> Result<Vec<DeletedNode>, ApiError> {
+        (**self).list_deleted(store).await
+    }
+
+    async fn list_attachments(&self, store: StoreId, host: NodeId) -> Result<Vec<Node>, ApiError> {
+        (**self).list_attachments(store, host).await
+    }
+
+    async fn list_discussions(&self, store: StoreId) -> Result<Vec<Node>, ApiError> {
+        (**self).list_discussions(store).await
+    }
+
+    async fn search(&self, query: &str, stores: Vec<StoreId>, semantic: bool, limit: usize) -> Result<Vec<SearchResultItem>, ApiError> {
+        (**self).search(query, stores, semantic, limit).await
+    }
+
+    async fn put_blob(&self, store: StoreId, node: NodeId, mime: &str, bytes: &[u8]) -> Result<BlobUrl, ApiError> {
+        (**self).put_blob(store, node, mime, bytes).await
+    }
+
+    async fn get_blob(&self, store: StoreId, blob: BlobId) -> Result<(String, Vec<u8>), ApiError> {
+        (**self).get_blob(store, blob).await
+    }
+
+    async fn publish_presence(&self, frame: PresenceFrame, client_id: &str) -> Result<(), ApiError> {
+        (**self).publish_presence(frame, client_id).await
+    }
+
+    async fn who_am_i(&self) -> Result<(Option<String>, String), ApiError> {
+        (**self).who_am_i().await
+    }
+
+    async fn subscribe(&self, store: StoreId) -> Result<ChangeStream, ApiError> {
+        (**self).subscribe(store).await
+    }
 }
 
 /// The node document a change is about, when it is about one: the kinds a

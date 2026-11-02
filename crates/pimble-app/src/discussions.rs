@@ -21,7 +21,7 @@ mod ui;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
-use pimble_core::{custom_keys, node_types, Node, NodeId, StoreId};
+use pimble_core::{node_types, Node, NodeId, StoreId};
 use pimble_crdt::NodeDoc;
 use pimble_discussion::{Author, Body, Discussion, DiscussionSnapshot, Span, Stamp};
 use rinch::prelude::*;
@@ -32,8 +32,6 @@ use crate::state::{ActiveEdit, AppStore, LinkOpen};
 
 pub(crate) use ui::{register, render_discussion, render_host_panel, render_unread_modal};
 
-/// A new discussion node's icon (a Tabler icon name).
-pub const DISCUSSION_ICON: &str = "messages";
 /// How deep replies are indented before they are shown flat, with whom
 /// they reply to (Joe, 2026-10-21).
 pub const MAX_INDENT: usize = 5;
@@ -240,15 +238,13 @@ fn open_session(store: AppStore, slot: Slot, store_id: StoreId, node_id: NodeId,
     };
     let discussion = Discussion::of_node(&doc).with_origin(origin(slot));
     SESSIONS.with(|sessions| sessions.borrow_mut().insert(slot, Session { store_id, node_id, doc, discussion, fresh: HashSet::new(), marking: false }));
-    if first {
-        store.send(BackendCommand::SubscribeNodeChanges { store_id, node_id });
-    }
+    let _ = first;
     request_reconcile(store, slot);
     recompute(store, slot);
 }
 
 /// Let go of `slot`'s document: the node cache gets it as the slot last had
-/// it, and the last slot holding the node lets go of its subscription.
+/// it.
 fn close_session(store: AppStore, slot: Slot) {
     let Some(session) = SESSIONS.with(|sessions| sessions.borrow_mut().remove(&slot)) else { return };
     if COMPOSING.with(Cell::get).is_some_and(|(s, _)| s == slot) {
@@ -257,9 +253,6 @@ fn close_session(store: AppStore, slot: Slot) {
     if let Some(sig) = store.get_node_signal(session.store_id, session.node_id) {
         let bytes = session.doc.save();
         sig.update(|node| node.content = bytes);
-    }
-    if !store.is_editing(session.store_id, session.node_id) {
-        store.send(BackendCommand::UnsubscribeNodeChanges { store_id: session.store_id, node_id: session.node_id });
     }
 }
 
@@ -360,15 +353,10 @@ pub(crate) fn stop(store: AppStore, pane: PaneId) {
     close_session(store, Slot::Pane(pane));
 }
 
-fn encode(bytes: &[u8]) -> String {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
 /// Ask the server for what it has beyond `slot`'s copy.
 fn request_reconcile(store: AppStore, slot: Slot) {
     if let Some((store_id, node_id, state_vector)) = with_session(slot, |s| (s.store_id, s.node_id, s.doc.state_vector())) {
-        store.send(BackendCommand::ReconcileNodeContent { store_id, node_id, state_vector });
+        crate::doc_session::ask(store, store_id, node_id, state_vector);
     }
 }
 
@@ -382,7 +370,7 @@ pub(crate) fn request_reconcile_all(store: AppStore, store_id: StoreId, node_id:
 /// The server's answer to a reconcile: merged into every pane holding the
 /// node, then what the server lacks goes back.
 pub(crate) fn apply_reconcile(store: AppStore, store_id: StoreId, node_id: NodeId, diff: &[u8], server_state_vector: &[u8]) {
-    let writable = store.node_access(store_id, node_id).allows_write();
+    let writable = crate::doc_session::writable(store, store_id, node_id);
     for slot in slots_holding(store_id, node_id) {
         let ours = with_session(slot, |s| {
             if !diff.is_empty() {
@@ -397,9 +385,7 @@ pub(crate) fn apply_reconcile(store: AppStore, store_id: StoreId, node_id: NodeI
             }
         })
         .flatten();
-        if let Some(ours) = ours {
-            store.send(BackendCommand::BroadcastChanges { store_id, node_id, changes: encode(&ours) });
-        }
+        crate::doc_session::send_back(store, store_id, node_id, ours);
         refresh_cache(store, slot);
         recompute(store, slot);
     }
@@ -439,7 +425,7 @@ fn refresh_cache(store: AppStore, slot: Slot) {
 /// Send an update this pane made: to the server through `applyEdit`, and to
 /// every other pane of this window holding the discussion, a turn later.
 fn send_update(store: AppStore, from: Slot, store_id: StoreId, node_id: NodeId, bytes: Vec<u8>) {
-    store.send(BackendCommand::BroadcastChanges { store_id, node_id, changes: encode(&bytes) });
+    crate::doc_session::send(store, store_id, node_id, bytes.clone());
     let others: Vec<Slot> = slots_holding(store_id, node_id).into_iter().filter(|p| *p != from).collect();
     if others.is_empty() {
         return;
@@ -845,16 +831,11 @@ fn next_request() -> u64 {
     })
 }
 
+/// A new discussion as `pimble_api::recipes::discussion` makes one (its
+/// title and first message are written by the caller).
 fn init(request: u64) -> NodeInit {
-    NodeInit {
-        node_type: node_types::DISCUSSION.to_string(),
-        content: pimble_discussion::new_content(None),
-        custom: vec![
-            (custom_keys::ICON.to_string(), serde_json::json!(DISCUSSION_ICON)),
-            (custom_keys::EXPLICIT_TITLE.to_string(), serde_json::json!(true)),
-        ],
-        request: Some(request),
-    }
+    let recipe = pimble_api::recipes::discussion("", None, None).expect("an empty discussion is always made");
+    NodeInit::of(recipe, Some(request)).1
 }
 
 /// A row's "New Discussion": a discussion node of its own under `parent_id`,

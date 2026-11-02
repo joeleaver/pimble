@@ -219,17 +219,23 @@ Contract: `docs/history/HARDENING_CONTRACT.md`.
   keyed by `PaneId` (`pimble-app/src/editor.rs`: `editor(pane)`, `focused_editor`), and its
   own collaboration session while it holds a document. rinch's `Editor {}` is mounted
   exactly four times in the app's life and never re-parented (see "Split view").
-- Local edits: a pane's outbound closure -> `BackendCommand::BroadcastChanges` -> server
-  persists and relays -> peers receive `BackendEvent::RemoteChanges { store_id, node_id, .. }`
-  -> `collab_receive` of every pane holding that node. The same delta also goes to every
+- Local edits: a pane's outbound closure -> `doc_session::send` ->
+  `BackendCommand::BroadcastChanges { update }` -> `Pimble::apply` (`applyEdit`) -> server
+  persists and relays on the store's subscription -> peers' listeners hand it over as
+  `BackendEvent::RemoteChanges { store_id, node_id, update }` -> `doc_session::received` ->
+  `collab_receive` of every pane holding that node (and the board, sheet, discussion and
+  in-text views holding it). `crates/pimble-app/src/doc_session.rs` is the one plumbing
+  for every view of a document: send, ask (reconcile), the answer, remote updates, and
+  reconciling after a reconnect or a `Resynced` store. The same delta also goes to every
   other pane of the window holding the node (the server does not relay back to the
   sender), a turn later (`editor::hand_across`: handed over from inside the edit, rinch's
   editor handle panicked on a `RefCell` in the browser); a pane never receives its own
   delta.
-- A node is subscribed once however many panes hold it (`SubscribeNodeChanges` when the
-  first pane opens it, `UnsubscribeNodeChanges` when the last lets go). A pane opening a
-  note another pane holds joins from that pane's `collab_snapshot`, never from the cache:
-  two panes each hosting an empty document would merge into two paragraphs.
+- There is no subscription per node (removed 2026-11-02, docs/API_CONTRACT.md wave 5):
+  a store's subscription (`Pimble::watch`) carries every document's update, and the
+  listener skips the ones this window's views made (`commands::change_events`). A pane
+  opening a note another pane holds joins from that pane's `collab_snapshot`, never from
+  the cache: two panes each hosting an empty document would merge into two paragraphs.
 - Never wrap the editor in a document-model layer in the sync path. Never call
   `load_html`/`load_doc` on a collaborating editor.
 - A document this device may only read is locked with rinch's `EditorHandle::set_read_only`
@@ -343,7 +349,7 @@ judged first, one refusal refuses all).
 A node's custom icon and colour live in `metadata.custom` under
 `pimble_core::custom_keys::{ICON, COLOR}` (`NodeMetadata::icon/color/set_icon/set_color`):
 a Tabler icon name and a `#rrggbb`, replicated with the store like any metadata and
-written through `updateNodeMetadata` (`BackendCommand::SetNodeAppearance`). The app's
+written through `Pimble::edit` as an `applyEdit` of the keys it names (`BackendCommand::SetNodeAppearance`). The app's
 `appearance.rs` holds the picker's curated icon table and palette; `icon_by_name` resolves
 any Tabler icon (`ALL_ICONS`), and the picker's search box (`icons_matching`) offers all
 of them, rendered through the `IconGlyph` component so a reactive `for` can draw icons.
@@ -404,8 +410,10 @@ target takes about 12 minutes to build.
   against a real `rhypedb-server` process (`~/dev/rhypedb/target/debug/rhypedb-server`) and
   skip when it is absent.
 - **App split.** `pimble-app` is a library: UI, state, events, editor wiring,
-  `protocol.rs` (`BackendCommand`/`BackendEvent`), `commands.rs` (`process_command`, shared
-  by both backends), `rinch_editor.rs` (the editor types from whichever rinch backend is
+  `protocol.rs` (`BackendCommand`/`BackendEvent`), `commands.rs` (the adapter onto
+  `pimble_api::Pimble`, shared by both backends: `api_command` for every read and write of
+  a store, `host_command` for the server operator's RPCs, `change_events` for what the API
+  hears; docs/API_CONTRACT.md wave 5), `rinch_editor.rs` (the editor types from whichever rinch backend is
   in play). The embedded server, tokio thread and persistence are behind the default
   `native` feature; the `web` feature takes `rinch-web`'s collaboration adapter. rinch is
   declared in `crates/pimble-app/Cargo.toml` with default features off, not in the root
@@ -466,9 +474,12 @@ store-name question). Pimble Cloud holds ciphertext only.
   `cloud-*` commands. The desktop sign-in UI is not built yet.
 - **Web app**: keys in memory only (a reload asks for the password to unlock); one
   `PimbleClient` per endpoint with per-store `rpc_url` and token ready for relayed shares;
-  the vault client holds a decrypted `Tree` of `NodeDoc`s in the
-  browser, answers tree and editor commands from them, encrypts outbound edits and
-  searches client-side; it outlives its socket (replaced on every token refresh), so on
+  the page's commands go through a `pimble_api::Pimble` over a `Router` (plain stores to
+  their server, encrypted ones to `VaultBackend`); the vault client is the one holder of a
+  decrypted `Tree` of `NodeDoc`s in the browser (`StoreCapabilities::local_documents`:
+  the API reads through it and keeps no copy), answers the API's reads and writes from
+  them, encrypts outbound edits, pumps what it decrypts as the app's events, seals
+  presence and searches client-side; it outlives its socket (replaced on every token refresh), so on
   every connect `catch_up` fetches what each held document missed and resends what a
   failed append left unsent (`known_sv`/`unsent` per document); the explorer's `+` creates an encrypted store through the accounts
   service and re-mints the token; menus are data in `crates/pimble-app/src/menus.rs` and the
@@ -617,8 +628,8 @@ vault-link start), so a reopened replica no longer reports a placeholder root.
 - `crates/pimble-app/src/app.rs` - UI tree, menus, rename, drag-and-drop
 - `crates/pimble-app/src/editor.rs` - the editor of each pane + collaboration wiring
 - `docs/SPLIT_VIEW_CONTRACT.md`, `crates/pimble-app/src/panes.rs`, `pane_view.rs` - the split view: the tiling model, and the pane and divider slots
-- `crates/pimble-app/src/protocol.rs` - `BackendCommand`/`BackendEvent`; `commands.rs` - `process_command`, shared by desktop and web
-- `crates/pimble-app/src/backend.rs` - desktop background thread and embedded server (`native` only)
+- `crates/pimble-app/src/protocol.rs` - `BackendCommand`/`BackendEvent`; `commands.rs` - the adapter onto `pimble_api::Pimble`, shared by desktop and web; `doc_session.rs` - the one plumbing for views of a document
+- `crates/pimble-app/src/backend.rs` - desktop background thread, the API over RPC, and `Local` (the connection: join or start the embedded server, reconnect) (`native` only)
 - `crates/pimble-server/src/auth.rs`, `jwt.rs`, `principal.rs` - HTTP-edge auth, JWT verification, `Principal` and `authorize`
 - `crates/pimble-cloud/src/routes/` - the accounts API; `schema.rhype` - its RhypeDB schema
 - `web/src/backend.rs` - the browser backend (token, connection, reconnect)

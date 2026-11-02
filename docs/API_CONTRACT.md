@@ -316,6 +316,81 @@ API's held documents and change stream; `DocSession` replaces the five session c
 `BackendCommand` shrinks to what is genuinely UI plumbing; every command that forwards is
 deleted. Error routing uses answers, not modal flags.
 
+Built 2026-11-02 (part; what is left is listed at the end). **The backend loop is over
+`Pimble`.** `crates/pimble-app/src/commands.rs` is the adapter: `api_command` answers every
+command that reads or writes a store with `Pimble` calls (`node`, the new `listing`,
+`attachments`, the new `discussions`, `apply`, `edit`, `delete`, `undelete`,
+`list_deleted`, the new `reconcile`, `watch`, `search`, `put_blob`/`get_blob`, and
+`backend()` for create, attach, move, transplant and links, which the explorer has already
+planned), and `host_command` keeps the server operator's RPCs (stores, replicas, sync
+links, the cloud account, sharing, agents, mounts, presence subscription) on the host
+connection. The desktop (`backend.rs`) owns a `Pimble` over `RpcBackend` whose
+`Connector` is `Local`: it joins or starts the embedded server (`pimble_server::local`),
+watches the socket, connects again the moment it closes and says `Connected`/`Disconnected`
+itself, so the watchdog, `ConnectionLost` and the connection generations are gone; a
+listener task turns `Pimble::next_change` into events (`commands::change_events`). The
+browser (`web/src/backend.rs`) owns a `Pimble` over `Arc<Router>` (a blanket
+`Backend for Arc<B>`), with the same listener, and calls `Pimble::rewatch` on every new
+connection; `routed.rs` keeps only the write gate (its `answer` is gone: the API through
+the router answers what it answered).
+**API additions:** `StoreCapabilities::local_documents`, `Backend::list_discussions`
+(default `NotAvailable`; RPC, router and vault implement it), `Pimble::listing`,
+`watch`/`rewatch`/`forget` (a watched store's subscription is made again when it ends, and
+`next_change` waits instead of answering `None` while nothing is subscribed),
+`reconcile`, `apply`, `discussions`, `Edited::delta`.
+**The vault holder decision:** the browser's vault is the one holder of an encrypted
+store's documents. `VaultBackend` says `local_documents: true`, and `Pimble` then holds
+nothing of that store: every read, `edit`, `reconcile` and listing goes through to the
+vault (in memory). The alternative, feeding `Held` from the vault's decrypted updates,
+keeps two copies that disagree between an update and its delivery (a tombstone the vault
+holds and `Held` does not yet was found to leak back into a children list). So
+`VaultBackend::subscribe` stays `NotAvailable` on purpose: the vault pumps what it
+decrypts as the app's events itself, and its subscription, sealed presence, status and
+closing are answered by it before the API (`VaultClient::handle`); what an encrypted store
+cannot do is refused by `VaultClient::refuse`. Rename, appearance, discussions listed,
+ancestors and reconcile moved off the vault onto `Pimble` (`rename_node`, `set_appearance`,
+`reconcile`, `ancestors`, `rename_edit`, `appearance_edit` and the vault's `active` set are
+deleted). Planning over an encrypted store stays the app's (`AppView`): `Pimble`'s
+`TreeView` holds no documents of a pass-through store.
+**Subscriptions:** there is no subscription per node. `SubscribeNodeChanges`,
+`UnsubscribeNodeChanges`, `ConnectionLost` and the app's `NODE_SUBSCRIPTIONS` are deleted;
+a store's subscription carries every document's update, the listener hands each one that
+this window's views did not make to them as `RemoteChanges { update }` (bytes, no base64;
+`BroadcastChanges { update }` likewise), once per update even when the server announces it
+under several kinds, and `Resynced { store }` after a gap (the tree reads the store again
+from the held documents, and every view of it reconciles). The vault hands over every live
+update the same way.
+**One plumbing for open documents:** `crates/pimble-app/src/doc_session.rs` (`send`,
+`ask`, `writable`, `send_back`, `received`, `reconciled`, `reconnected`, `resynced`); the
+five views (`editor`, `boards`, `sheets`, `discussions`, `text_boards`) send, ask and send
+back through it, and `events.rs` fans out through it once. Each view still keeps its own
+copy and its own hand-across to same-kind views (the invariants in CLAUDE.md
+"Collaboration shape" are unchanged and their tests pass).
+**Answers:** `BackendEvent::Failed { asked: Asked, message }` (`protocol::Asked::of`,
+`Asked::answer`) names the request a modal waits on (add or mount a remote store, link,
+remove a replica, a new store, a mount, the deleted list, undelete); `events.rs` routes it
+by that, and the pending-flag guess is left only for "Put Back" as a `MoveNode`.
+**Presence and recipes:** frames from `Pimble::frames()` (`commands::presence_frame`; the
+browser's vault seals the frame it is handed); the app's `presence::frame_for` is deleted.
+New sheets, canvases and discussions are `pimble_api::recipes` (`protocol::NodeInit::of`).
+**Behavior changes:** rename and appearance in an encrypted store go through `applyEdit`'s
+vault path (one append of one update instead of the tree's two); a view now also receives a
+peer's structural and metadata updates of its node (harmless merges); a vault store's
+`ContentUpdated` still answers `NodeContentUpdated`, plus `RemoteChanges` for live updates;
+the browser re-reads a plain store's shown lists after its subscription is made again; a
+reconcile of a node the vault does not hold says "Node not found" in the server's words;
+`Search` always goes through the router (the same answer); an error from a modal's request
+no longer depends on that modal being the one waiting.
+**Left for a continuation:** `AppStore`'s mirror as a reactive view of `Pimble`'s held
+documents (the refetch policy in `events.rs` stays; its `GetNode`/`GetChildren` are now
+answered from held documents, so they cost no round trip for a live store); each view's
+own copy and hand-across into one `DocSession` that holds the document once per window;
+`VaultBackend::subscribe`/`who_am_i`/`publish_presence` (kept out by the holder decision
+above); author names through `pimble_api::identity` (the app's `shares::author_in` names
+the person per share, which `Me` does not); the presence subscription and `GetPeople` on
+the API; mounts (`createMount`, `getMountState`) on `Backend`; the browser's own
+reconnect loop (`supervise`) into a `Connector`.
+
 **After this contract:** views (source, grouping, order over `TreeView`, the kanban as a
 built-in written in plain rinch against `Pimble`) and the WASM plugin host, which hands a
 plugin the same `Pimble` trait.

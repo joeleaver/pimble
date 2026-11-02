@@ -38,6 +38,10 @@ pub const CAPABILITIES: StoreCapabilities = StoreCapabilities {
     sync_links: false,
     semantic_search: false,
     index_rebuild: false,
+    // The vault holds the store's decrypted documents and is the one holder
+    // of them in this page: the API asks it every time and keeps no copy
+    // that could disagree (docs/API_CONTRACT.md wave 5).
+    local_documents: true,
 };
 
 /// Which connection serves a store, as the backend loop last saw them.
@@ -159,6 +163,10 @@ impl Backend for VaultBackend {
         self.vault.lock().await.list_attachments(store, host)
     }
 
+    async fn list_discussions(&self, store: StoreId) -> Result<Vec<Node>, ApiError> {
+        self.vault.lock().await.list_discussions(store)
+    }
+
     /// Words, in the page: there is no index anywhere for an encrypted
     /// store, so `semantic` changes nothing (its capabilities say so).
     async fn search(&self, query: &str, stores: Vec<StoreId>, _semantic: bool, limit: usize) -> Result<Vec<SearchResultItem>, ApiError> {
@@ -173,10 +181,14 @@ impl Backend for VaultBackend {
         Err(ApiError::not_available(pimble_app::pictures::ENCRYPTED_IN_BROWSER))
     }
 
-    // What follows is still the app's commands' (presence frames sealed per
-    // pane, the change stream the vault pumps as `BackendEvent`s, who is
-    // signed in from the accounts service), and moves onto the API with the
-    // app in wave 5.
+    // What follows is not this backend's to answer through the trait. The
+    // vault is the one holder of an encrypted store's documents in this page
+    // (`CAPABILITIES.local_documents`), so the API keeps no copy to keep
+    // current and needs no change stream from it: the backend loop pumps
+    // what the vault decrypts as the app's events itself
+    // (`VaultClient::pump`). A presence frame is sealed under a document's
+    // key by the backend loop (`VaultClient::publish_presence`), and who is
+    // signed in is the accounts service's (`crate::accounts::me`).
 
     async fn publish_presence(&self, _frame: PresenceFrame, _client_id: &str) -> Result<(), ApiError> {
         Err(not_here("Presence through the API"))

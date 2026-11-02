@@ -328,6 +328,11 @@ impl Backend for Router {
         Ok(nodes.into_iter().map(|n| self.while_away(store, n)).collect())
     }
 
+    async fn list_discussions(&self, store: StoreId) -> Result<Vec<Node>, ApiError> {
+        let nodes = self.of(store).list_discussions(store).await?;
+        Ok(nodes.into_iter().map(|n| self.while_away(store, n)).collect())
+    }
+
     /// Each store to the backend that serves it (so a plain store is never
     /// searched through an encrypted store's endpoint), the hits merged by
     /// score. A backend that fails leaves its stores out; every one failing
@@ -518,6 +523,7 @@ mod tests {
         sync_links: false,
         semantic_search: false,
         index_rebuild: false,
+        local_documents: true,
     };
 
     /// A plain backend (the default) and an encrypted one, with two stores

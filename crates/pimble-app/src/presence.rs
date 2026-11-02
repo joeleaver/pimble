@@ -370,30 +370,6 @@ pub fn initials(name: &str) -> String {
     }
 }
 
-/// The frame pane `pane` of client `client_id` says, in plain words (an
-/// encrypted store's is sealed by whoever sends it on).
-pub fn frame_for(client_id: &str, store_id: StoreId, node_id: NodeId, pane: usize, focused: bool, left: bool, at: Whereabouts) -> PresenceFrame {
-    let body = if left { String::new() } else { PresenceBody { device: device_label(), focused, text: at.text, board: at.board }.encode() };
-    PresenceFrame {
-        store_id,
-        doc_id: node_id,
-        session: format!("{client_id}:{pane}"),
-        seq: next_seq(),
-        who: None,
-        left,
-        body,
-        sealed: false,
-        ttl_ms: pimble_rpc::PRESENCE_TTL_MS,
-    }
-}
-
-/// A frame's sequence number: rising for the life of this process, and from
-/// the clock, so a client that comes back starts above where it was.
-fn next_seq() -> u64 {
-    static SEQ: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
-    SEQ.get_or_init(|| std::sync::atomic::AtomicU64::new(crate::boards::now_ms() as u64)).fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
 /// The device label a frame carries: the computer's name, or "Web".
 pub fn device_label() -> String {
     #[cfg(feature = "native")]
