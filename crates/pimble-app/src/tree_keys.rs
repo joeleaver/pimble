@@ -10,7 +10,8 @@ use rinch::prelude::{untracked, DropZone, TreeDrop, TreeKey, TreeMove, TreeSlot,
 
 use crate::protocol::BackendCommand;
 use crate::state::{parse_tree_value, AppStore};
-use crate::tree_drop::{plan_drop, send_plan, DropHint, DropPlan, BESIDE_A_STORE};
+use crate::tree_drop::{plan_drop, send_plan, DropHint, DropPlan};
+use pimble_core::plan::BESIDE_A_STORE;
 
 /// What a key does, before anything is done: pure, so the map is tested on
 /// its own.
@@ -137,17 +138,7 @@ pub(crate) fn on_key(store: AppStore, tree_state: UseTreeReturn, key: &TreeKey) 
         }
         Action::Delete => {
             // The selection, or the cursor row; nodes only, all or none.
-            let nodes: Vec<_> = key.carried().iter().filter_map(|v| match parse_tree_value(v) {
-                Some((s, Some(n))) => Some((s, n)),
-                _ => None,
-            }).collect();
-            if nodes.is_empty() {
-                return true;
-            }
-            if nodes.iter().any(|&(s, n)| !store.node_access(s, n).allows_write()) {
-                crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
-                return true;
-            }
+            let Some(nodes) = crate::tree_view::deletable(store, key.carried()) else { return true };
             // The cursor goes on to the row below what is deleted (or
             // above) before it is gone, so the keyboard stays in the tree.
             if let Some(next) = key.below.clone().or_else(|| key.above.clone()) {
@@ -219,20 +210,7 @@ fn new_node(store: AppStore, key: &TreeKey, child: bool) {
     let Some(parent_value) = target else { return };
     // Under a store row: its root. Under a mount: the node it mounts, as a
     // drop into one does.
-    let Some((s, parent)) = (match parse_tree_value(&parent_value) {
-        Some((s, None)) => store.root_node_id(s).map(|root| (s, root)),
-        Some((s, Some(n))) if store.is_mount(s, n) => store
-            .get_mount_signal(s, n)
-            .and_then(|sig| untracked(|| sig.with(|m| m.mount_ref.as_ref().map(|r| (r.source_store, r.source_node))))),
-        Some((s, Some(n))) => Some((s, n)),
-        None => None,
-    }) else {
-        return;
-    };
-    if !store.node_access(s, parent).allows_write() {
-        crate::events::show_notice(store, pimble_core::StoreAccess::READ_ONLY_REFUSAL.to_string());
-        return;
-    }
+    let Some((s, parent)) = crate::tree_view::create_parent_of_row(store, &parent_value) else { return };
     let place = if child {
         Place::Last
     } else {

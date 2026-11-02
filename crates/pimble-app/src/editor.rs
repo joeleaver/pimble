@@ -29,7 +29,8 @@ use rinch_editor_core::Node as EditorNode;
 use crate::panes::{PaneId, MAX_PANES};
 use crate::protocol::BackendCommand;
 use crate::rinch_editor::{create_editor, EditorHandle};
-use crate::state::{label_from_title_and_content, ActiveEdit, AppStore};
+use crate::state::{ActiveEdit, AppStore};
+use pimble_core::plan::label_from_title_and_content;
 
 thread_local! {
     /// Each pane slot's editor handle, created lazily on first use.

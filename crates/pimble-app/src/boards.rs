@@ -2300,7 +2300,7 @@ pub(crate) fn install_browser_handlers(store: AppStore) {
             Dest::Board(pane, Some(at))
         } else {
             let Some(row) = row_of(event.target()) else { return };
-            let Some((store_id, parent_id)) = parent_for_row(store, &row) else { return };
+            let Some((store_id, parent_id)) = crate::tree_view::create_parent_of_row(store, &row) else { return };
             Dest::Under(store_id, parent_id)
         };
         event.prevent_default();
@@ -2341,7 +2341,7 @@ pub(crate) fn install_browser_handlers(store: AppStore) {
             return;
         }
         let Some(row) = untracked(|| store.selected_id.get()) else { return };
-        let Some((store_id, parent_id)) = parent_for_row(store, &row) else { return };
+        let Some((store_id, parent_id)) = crate::tree_view::create_parent_of_row(store, &row) else { return };
         event.prevent_default();
         read_files(store, Dest::Under(store_id, parent_id), files, true);
     });
@@ -2357,18 +2357,6 @@ fn keyboard_board() -> Option<PaneId> {
     PaneId::ALL.into_iter().find(|&pane| {
         surface_of(pane).is_some_and(|s| s.id() == focused) && with_session(pane, |s| s.text.is_none()).unwrap_or(false)
     })
-}
-
-/// Where a new node made "on" a tree row goes: the row's node, a store row's
-/// root, or a mount's source node (a mount node takes no children).
-pub(crate) fn parent_for_row(store: AppStore, row: &str) -> Option<(StoreId, NodeId)> {
-    let (store_id, node_id) = crate::state::parse_tree_value(row)?;
-    let node_id = node_id.or_else(|| store.root_node_id(store_id))?;
-    if store.is_mount(store_id, node_id) {
-        let mount_ref = store.get_node_signal(store_id, node_id).and_then(|sig| untracked(|| sig.with(|n| n.mount_ref())))?;
-        return Some((mount_ref.source_store, mount_ref.source_node));
-    }
-    Some((store_id, node_id))
 }
 
 #[cfg(all(test, feature = "native"))]

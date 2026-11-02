@@ -164,15 +164,7 @@ pub fn scope_root_of(store: AppStore, store_id: StoreId, node_id: NodeId) -> Opt
     if roots.is_empty() {
         return None;
     }
-    let mut at = Some(node_id);
-    for _ in 0..256 {
-        let node = at?;
-        if roots.contains(&node) {
-            return Some(node);
-        }
-        at = store.get_node_signal(store_id, node).and_then(|s| untracked(|| s.with(|n| n.parent_id)));
-    }
-    None
+    pimble_core::plan::nearest(&store.view(), store_id, node_id, |at| roots.contains(&at))
 }
 
 /// Who an edit of `node_id` is stamped as: the signed-in account, by the

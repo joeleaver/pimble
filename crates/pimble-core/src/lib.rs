@@ -12,6 +12,7 @@ pub mod node;
 pub mod store;
 pub mod workspace;
 pub mod error;
+pub mod plan;
 
 pub use blob::*;
 pub use index_unit::*;

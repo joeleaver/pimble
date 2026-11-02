@@ -2718,17 +2718,7 @@ mod tests {
 
         let held = store.get_store_signal(store_id).unwrap();
         assert_eq!(held.with(crate::state::shared_by_words), "no longer shared");
-        let menu = crate::state::store_row_menu(crate::state::StoreRowFacts {
-            access: store.store_access(store_id),
-            linked: true,
-            replica: held.with(|s| s.is_replica),
-            vault: false,
-            relay: pimble_core::RelaySide::None,
-            held_as_share: true,
-            shared_root: false,
-            mount_source_copied: false,
-            every_share_ended: store.every_share_ended(store_id),
-        });
+        let menu = pimble_core::plan::capabilities(&store.view(), store_id, None).store_row_menu(false);
         assert!(!menu.remove_replica);
         assert!(menu.new_node && menu.unlink && menu.link_to_remote && menu.share && menu.appearance && menu.copy_as_mount_source);
     }

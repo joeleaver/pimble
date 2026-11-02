@@ -12,6 +12,9 @@ use pimble_core::{MountRef, MountState, Node, NodeId, RemoteEndpoint, Store, Sto
 use rinch::components::TreeNodeData;
 use rinch::prelude::*;
 
+use pimble_core::plan::{share_face, share_ways_note};
+pub use pimble_core::plan::{ShareFace, ONLY_AN_OWNER_SHARES_NOTE};
+
 use crate::panes::{PaneId, Tiling, MAX_PANES};
 use crate::protocol::BackendHandle;
 
@@ -121,42 +124,6 @@ pub struct MountInfo {
 /// node's title.
 pub fn get_node_content_text(content: &[u8]) -> String {
     pimble_crdt::NodeDoc::text_of(content)
-}
-
-/// Compute a display label from an explicit-title flag/title plus a plain-text
-/// content projection: an explicit title wins; otherwise the first non-empty
-/// line of `content_text` (truncated to 25 chars with an ellipsis); otherwise
-/// `title`; otherwise `"Untitled"`.
-///
-/// Shared by [`display_label_from_node`] (which projects `content_text` from
-/// stored node bytes) and the editor's debounced live-label refresh
-/// (`editor::schedule_label_refresh`), which supplies `content_text` straight
-/// from the in-memory document instead of decoding a CRDT snapshot.
-pub fn label_from_title_and_content(has_explicit_title: bool, title: &str, content_text: &str) -> String {
-    if has_explicit_title && !title.is_empty() {
-        return title.to_string();
-    }
-
-    let first_line = content_text
-        .lines()
-        .map(|l| l.trim())
-        .find(|l| !l.is_empty())
-        .unwrap_or("");
-    if !first_line.is_empty() {
-        let char_count = first_line.chars().count();
-        if char_count > 25 {
-            let truncated: String = first_line.chars().take(25).collect();
-            return format!("{truncated}…");
-        } else {
-            return first_line.to_string();
-        }
-    }
-
-    if !title.is_empty() {
-        return title.to_string();
-    }
-
-    "Untitled".to_string()
 }
 
 /// The suffix a mount node's tree label carries for its current state
@@ -271,11 +238,9 @@ pub fn deleted_row_meta(row: &DeletedRow) -> String {
     parts.join(" · ")
 }
 
-/// Whether "Put Back" is off for this row: the store or the node itself is
-/// read only for this account (docs/NODE_DOCUMENT_CONTRACT.md section 5,
-/// "Roles").
+/// Whether "Put Back" is off for this row (`pimble_core::plan::can_put_back`).
 pub fn deleted_row_read_only(store_access: pimble_core::StoreAccess, row: &DeletedRow) -> bool {
-    !store_access.allows_write() || !row.access.allows_write()
+    !pimble_core::plan::can_put_back(store_access, row.access)
 }
 
 /// What the row of a share's replica says once every share it held has
@@ -323,42 +288,6 @@ pub fn access_note(access: pimble_core::StoreAccess) -> &'static str {
     }
 }
 
-/// Why "Share..." is disabled on a node of a store that reached this device
-/// as someone else's share: sharing is an owner's to do, and the server
-/// refuses it from anyone else with a sentence that opens with this one
-/// (docs/NODE_DOCUMENT_CONTRACT.md section 5). An item that can only be
-/// refused is not offered; this says why.
-pub const ONLY_AN_OWNER_SHARES_NOTE: &str = "Only an owner of this store can share from it.";
-
-/// Whether a row's "Share..." is disabled. `held_as_share` is whether the
-/// node's store reached this device as someone else's share
-/// (`Store::shared_by`), `is_shared_root` whether the node carries a share
-/// marker.
-///
-/// In one's own store the item shares a node or opens the share it already
-/// has, and only a store held to read disables it, as ever. In someone else's
-/// store nothing can be shared from here, so the item opens only on a shared
-/// root, where it shows the share's read-only face: who shared it and who is
-/// on it. That changes nothing, so a reader gets it as an editor does.
-pub fn share_item_disabled(access: pimble_core::StoreAccess, held_as_share: bool, is_shared_root: bool) -> bool {
-    if held_as_share {
-        !is_shared_root
-    } else {
-        !access.allows_write()
-    }
-}
-
-/// The sentence that says why "Share..." is disabled for a reason of its own,
-/// or empty: a node of someone else's store that is not a shared root. (A
-/// store of one's own held to read is covered by [`access_note`].)
-pub fn share_item_note(held_as_share: bool, is_shared_root: bool) -> &'static str {
-    if held_as_share && !is_shared_root {
-        ONLY_AN_OWNER_SHARES_NOTE
-    } else {
-        ""
-    }
-}
-
 /// The one dimmed line at the top of a row's menu: every reason something
 /// below it is disabled, each said once, in the order given. Empty when
 /// nothing is.
@@ -366,25 +295,12 @@ pub fn menu_note_text(notes: &[&str]) -> String {
     notes.iter().copied().filter(|note| !note.is_empty()).collect::<Vec<_>>().join(" ")
 }
 
-/// Whether the person at this device manages a share: invites to it, removes
-/// from it, stops it. Decided from what the app already holds, never asked of
-/// anyone (the server judges every request whatever the dialog offers).
-///
-/// The account's own row in the share's member list says it where there is
-/// one, since that is the accounts service answering now: `owner` manages,
-/// anything else does not. Without that row (the list has not arrived, could
-/// not be loaded, or nobody is signed in) the store says it: one that reached
-/// this device as someone else's share (`Store::shared_by`) is not this
-/// account's to manage, and any other store is.
+/// Whether the person at this device manages a share
+/// (`pimble_core::plan::manages_share`, the rule), from the share's member
+/// list as the accounts service sends it.
 pub fn manages_share(shared_by: Option<&str>, members: &[pimble_rpc::ShareMember], account_email: &str) -> bool {
-    let account_email = account_email.trim();
-    let own_row = members
-        .iter()
-        .find(|member| !account_email.is_empty() && member.email.trim().eq_ignore_ascii_case(account_email));
-    match own_row {
-        Some(row) => row.role == pimble_rpc::MemberRole::Owner,
-        None => shared_by.is_none(),
-    }
+    let rows = members.iter().map(|member| (member.email.as_str(), member.role == pimble_rpc::MemberRole::Owner));
+    pimble_core::plan::manages_share(shared_by, rows, account_email)
 }
 
 /// How a row of the Share modal names a member (docs/PRESENCE_CONTRACT.md
@@ -418,38 +334,6 @@ pub fn shared_by_sentence(shared_by: Option<&str>, members: &[pimble_rpc::ShareM
 
 // ── Sharing from an unhosted store (docs/RELAY_CONTRACT.md, "The apps") ──
 
-/// Which face the Share modal shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShareFace {
-    /// The node's store is neither hosted on Pimble Cloud nor shared from
-    /// this computer, so there is nowhere for a share to live yet: the two
-    /// ways to give it one, each with its sentence. Nothing is chosen for
-    /// the person, and neither button is a default.
-    Ways,
-    /// The node is not shared yet: a name and "Share".
-    Name,
-    /// The node is shared and this person manages the share.
-    Owner,
-    /// The node is shared and the share is someone else's.
-    Member,
-}
-
-/// The Share modal's face. `shared` is whether the node carries a share (its
-/// marker, then the server's answers), `manages` is [`manages_share`], and
-/// `link` is what the store's link is (`Store::sync_mode`): `Vault` for a
-/// store hosted on Pimble Cloud and for one shared from this computer alike,
-/// which is the very thing the server asks before it lets a node be shared
-/// (`pimble_server::share`, `NOT_HOSTED_REFUSAL`). A node that is shared
-/// already shows its share whatever the link says.
-pub fn share_face(shared: bool, manages: bool, link: pimble_core::StoreKind) -> ShareFace {
-    match (shared, manages) {
-        (true, true) => ShareFace::Owner,
-        (true, false) => ShareFace::Member,
-        (false, _) if link != pimble_core::StoreKind::Vault => ShareFace::Ways,
-        (false, _) => ShareFace::Name,
-    }
-}
-
 /// What Pimble Cloud holds of a share, said under the member list. It is a
 /// promise, so it has to be the true one for the store's tier: a hosted
 /// store's notes are kept there as ciphertext, a store shared from this
@@ -475,149 +359,6 @@ pub const SHARE_FROM_HERE_SENTENCE: &str =
 /// The second way, and its sentence.
 pub const HOST_ON_CLOUD_LABEL: &str = "Host on Pimble Cloud...";
 pub const HOST_ON_CLOUD_SENTENCE: &str = "An encrypted copy is kept there, so it works while this computer is off.";
-
-/// Whether "Host on Pimble Cloud..." is off for a store: one that has a link
-/// already (to another Pimble server, to its hosted twin, or to its twin on
-/// this computer), a copy of a store that lives somewhere else, or encrypted
-/// storage, which is nobody's store to host. One rule for the store row's
-/// menu and for the Share modal's two ways, because the server would not
-/// refuse all of these: hosting a store linked elsewhere would replace its
-/// link.
-pub fn host_item_disabled(linked: bool, replica: bool, vault: bool) -> bool {
-    linked || replica || vault
-}
-
-/// Why neither way of sharing is offered for a store the Share modal's
-/// [`ShareFace::Ways`] opened on, or empty when both are. The server refuses
-/// `cloudRelayStore` for the same stores, and says the same.
-pub fn share_ways_note(linked: bool, replica: bool, vault: bool) -> &'static str {
-    if replica {
-        "This is a copy of a store that lives somewhere else, and can only be shared from there."
-    } else if vault {
-        "This is encrypted storage, not a store of its own."
-    } else if linked {
-        "This store is linked to another Pimble server. Unlink it first."
-    } else {
-        ""
-    }
-}
-
-/// Why "Host on Pimble Cloud...", "Link to Remote..." and "Unlink from
-/// Remote" are all off on the row of a store shared from this computer: it
-/// is one or the other, and the person says which
-/// (`pimble_server::relay_face::RELAYED_LINK_REFUSAL` is what the server
-/// would answer any of them with).
-pub const RELAYED_STORE_NOTE: &str =
-    "This store is shared from this computer. To host it or link it elsewhere, stop sharing it from this computer first.";
-
-/// The sentence that says why a store row's hosting and linking items are
-/// disabled for a reason of their own, or empty: a store shared from this
-/// computer.
-pub fn relayed_store_note(relay: pimble_core::RelaySide) -> &'static str {
-    match relay {
-        pimble_core::RelaySide::Owner => RELAYED_STORE_NOTE,
-        pimble_core::RelaySide::None | pimble_core::RelaySide::Member => "",
-    }
-}
-
-/// Whether "Stop Sharing from This Computer..." is off: on every store but
-/// one shared from this computer.
-pub fn stop_relaying_item_disabled(relay: pimble_core::RelaySide) -> bool {
-    relay != pimble_core::RelaySide::Owner
-}
-
-/// Whether "Unlink from Remote" is off: a store with no link, and a store
-/// shared from this computer, whose link is to its own twin on this machine
-/// and is ended by "Stop Sharing from This Computer..." (the server refuses
-/// an unlink of one).
-pub fn unlink_item_disabled(linked: bool, relay: pimble_core::RelaySide) -> bool {
-    !linked || relay == pimble_core::RelaySide::Owner
-}
-
-/// What a store row's menu snapshots when the row renders: everything its
-/// items' `disabled` values are decided from (rinch #714: a menu item is
-/// static, so each of these is also in the row's `TreeNodeData`).
-#[derive(Debug, Clone, Copy)]
-pub struct StoreRowFacts {
-    /// What this device may change in the store.
-    pub access: pimble_core::StoreAccess,
-    pub linked: bool,
-    pub replica: bool,
-    pub vault: bool,
-    pub relay: pimble_core::RelaySide,
-    /// The store reached this device as someone else's share.
-    pub held_as_share: bool,
-    /// The row's node (a whole store's root) carries a share marker.
-    pub shared_root: bool,
-    /// Something is copied for "Paste Mount Here".
-    pub mount_source_copied: bool,
-    /// A share's replica whose every share has ended.
-    pub every_share_ended: bool,
-}
-
-/// Which items of a store row's menu are off (`true` is disabled). "Close
-/// Store" is never off and is not here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StoreRowMenu {
-    pub new_node: bool,
-    pub mount_store: bool,
-    pub mount_remote_store: bool,
-    pub copy_as_mount_source: bool,
-    pub paste_mount: bool,
-    pub link_to_remote: bool,
-    pub host: bool,
-    pub share: bool,
-    pub stop_relaying: bool,
-    pub unlink: bool,
-    pub remove_replica: bool,
-    pub appearance: bool,
-    /// "Recently Deleted...": off only once every share has ended, when
-    /// there is no scope left to list (docs/MOVE_CONTRACT.md "Seeing and
-    /// undoing what was removed"). A reader sees it like an editor does;
-    /// only "Put Back" on a row is gated by what this account may write.
-    pub recently_deleted: bool,
-}
-
-/// The `disabled` value of every item of a store row's menu. A replica whose
-/// every share has ended (Joe, 2026-09-21) keeps its row because it keeps its
-/// files: everything that would change it, its link or another store from it
-/// is off, and "Remove Replica..." is where the files go.
-pub fn store_row_menu(facts: StoreRowFacts) -> StoreRowMenu {
-    let remove_replica = !facts.replica;
-    if facts.every_share_ended {
-        return StoreRowMenu {
-            new_node: true,
-            mount_store: true,
-            mount_remote_store: true,
-            copy_as_mount_source: true,
-            paste_mount: true,
-            link_to_remote: true,
-            host: true,
-            share: true,
-            stop_relaying: true,
-            unlink: true,
-            remove_replica,
-            appearance: true,
-            recently_deleted: true,
-        };
-    }
-    let read_only = !facts.access.allows_write();
-    StoreRowMenu {
-        new_node: read_only,
-        mount_store: read_only,
-        mount_remote_store: read_only,
-        copy_as_mount_source: false,
-        paste_mount: !facts.mount_source_copied || read_only,
-        link_to_remote: facts.linked,
-        host: host_item_disabled(facts.linked, facts.replica, facts.vault),
-        share: share_item_disabled(facts.access, facts.held_as_share, facts.shared_root),
-        stop_relaying: stop_relaying_item_disabled(facts.relay),
-        unlink: unlink_item_disabled(facts.linked, facts.relay),
-        remove_replica,
-        appearance: read_only,
-        recently_deleted: false,
-    }
-}
 
 /// What a store not yet named here is called in a list: the accounts service
 /// holds no name for a store shared from a computer (nothing on Pimble Cloud
@@ -653,27 +394,10 @@ pub fn mount_state_kind(state: &MountState) -> MountStateKind {
     }
 }
 
-/// Compute display label from a Node reference (no signal dependency).
-///
-/// An explicitly titled node's label is its title, so its content is not
-/// decoded at all: that decode walks the whole document, and it ran on every
-/// label refresh of every row (about a tenth of a keystroke's time in a
-/// 9,500-word document, before 2026-09-22).
+/// What a node is called (`pimble_core::plan::display_label`, the one rule),
+/// with the content decode the rule asks for, which `pimble-core` cannot do.
 pub fn display_label_from_node(node: &Node) -> String {
-    let has_explicit_title = node.metadata.custom
-        .get("explicit_title")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if has_explicit_title && !node.metadata.title.is_empty() {
-        return node.metadata.title.clone();
-    }
-    // A discussion's title is its topic; it has no text to take one from
-    // (docs/DISCUSSIONS_CONTRACT.md section 2).
-    if node.node_type == pimble_core::node_types::DISCUSSION {
-        return if node.metadata.title.trim().is_empty() { "Discussion".to_string() } else { node.metadata.title.clone() };
-    }
-    let content = get_node_content_text(&node.content);
-    label_from_title_and_content(has_explicit_title, &node.metadata.title, &content)
+    pimble_core::plan::display_label(node, get_node_content_text)
 }
 
 /// What the link tooltip shows and where: under the hovered link, `x`/`y`
@@ -1333,12 +1057,7 @@ impl AppStore {
     /// and `Read` for a reader. A store the app has not registered yet reads
     /// as `Full`: nothing is disabled on a guess.
     pub fn store_access(&self, store_id: StoreId) -> pimble_core::StoreAccess {
-        untracked(|| {
-            self.store_data.with(|map| {
-                map.get(&store_id)
-                    .map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|s| s.access))
-            })
-        })
+        pimble_core::plan::store_access(&self.view(), store_id)
     }
 
     /// What this device may change of ONE node (untracked): the judgement
@@ -1353,22 +1072,22 @@ impl AppStore {
     /// node's CANONICAL pair: the editor, a row's menu, rename, delete, drag
     /// and drop. A store row's own items ask [`AppStore::store_access`].
     pub fn node_access(&self, store_id: StoreId, node_id: NodeId) -> pimble_core::StoreAccess {
-        untracked(|| self.node_access_in(store_id, node_id))
+        pimble_core::plan::access(&self.view(), store_id, node_id)
     }
 
     /// [`AppStore::node_access`], tracked, for a reactive closure: one signal
     /// read at a time (a tracked read inside another signal's `with` panics,
     /// see `pane_view::editor_read_only`).
     pub fn node_access_tracked(&self, store_id: StoreId, node_id: NodeId) -> pimble_core::StoreAccess {
+        // The rule is `pimble_core::plan::node_access`; this only reads what
+        // it judges from, tracked.
         let store_sig = self.store_data.with(|map| map.get(&store_id).copied());
-        let store_access = store_sig.map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|s| s.access));
-        if store_access == pimble_core::StoreAccess::Read {
-            return store_access;
+        let store_access = store_sig.map(|sig| sig.with(|s| s.access));
+        if store_access == Some(pimble_core::StoreAccess::Read) {
+            return pimble_core::StoreAccess::Read;
         }
-        // Held as a commenter: what the server judged of the node (a
-        // discussion is written, anything else commented on).
         let node_sig = self.node_data.with(|map| map.get(&(store_id, node_id)).copied());
-        node_sig.map_or(store_access, |sig| sig.with(|n| n.access))
+        pimble_core::plan::node_access(store_access, node_sig.map(|sig| sig.with(|n| n.access)))
     }
 
     /// The access the held copy of a node carries (untracked), whatever its
@@ -1380,19 +1099,6 @@ impl AppStore {
             self.node_data
                 .with(|map| map.get(&(store_id, node_id)).map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|n| n.access)))
         })
-    }
-
-    /// [`AppStore::node_access`] for a caller already inside `untracked`
-    /// (`build_tree_data_structural`).
-    fn node_access_in(&self, store_id: StoreId, node_id: NodeId) -> pimble_core::StoreAccess {
-        let store_access = self
-            .store_data
-            .with(|map| map.get(&store_id).map_or(pimble_core::StoreAccess::Full, |sig| sig.with(|s| s.access)));
-        if store_access == pimble_core::StoreAccess::Read {
-            return store_access;
-        }
-        self.node_data
-            .with(|map| map.get(&(store_id, node_id)).map_or(store_access, |sig| sig.with(|n| n.access)))
     }
 
     /// Record what this device may change in a store as the server has it
@@ -1581,18 +1287,7 @@ impl AppStore {
     /// chain says (untracked). A chain that breaks before it reaches `root`
     /// (an ancestor the app never loaded) answers no.
     pub fn is_at_or_under(&self, store_id: StoreId, node_id: NodeId, root: NodeId) -> bool {
-        let mut seen = HashSet::new();
-        let mut current = node_id;
-        while seen.insert(current) {
-            if current == root {
-                return true;
-            }
-            match self.cached_parent_id(store_id, current) {
-                Some(parent) => current = parent,
-                None => return false,
-            }
-        }
-        false
+        pimble_core::plan::is_at_or_under(&self.view(), store_id, node_id, root)
     }
 
     /// Whether a store is a partial replica — this device holds some shared
@@ -2411,14 +2106,14 @@ impl AppStore {
         // which the access does not say: an editor of a share and an owner
         // both read as `Full`.
         let appearance = self.row_snapshot(child_store, child_id);
-        let access = format!("{:?}", self.node_access_in(child_store, child_id));
+        let access = format!("{:?}", self.node_access(child_store, child_id));
         let held_as_share = self
             .store_data
             .with(|map| map.get(&child_store).map_or(false, |sig| sig.with(|s| s.shared_by.is_some())));
         let source_access = self
             .mount_data
             .with(|map| map.get(&(child_store, child_id)).and_then(|sig| sig.with(|m| m.mount_ref.as_ref().map(|r| (r.source_store, r.source_node)))))
-            .map(|(source_store, source_node)| format!("{:?}", self.node_access_in(source_store, source_node)))
+            .map(|(source_store, source_node)| format!("{:?}", self.node_access(source_store, source_node)))
             .unwrap_or_default();
         let tree_node = TreeNodeData::new(
             format!("node_{}_{}{}", child_store, child_id, suffix),
@@ -2699,62 +2394,11 @@ mod tests {
         assert_eq!(before[0].label, stopped[0].label);
     }
 
-    /// What a store row's menu offers a store shared from this computer, one
-    /// that is not, and a member's replica of one (docs/RELAY_CONTRACT.md,
-    /// "The apps").
+    /// The two ways of sharing a store that is not hosted, and their
+    /// sentences, as docs/RELAY_CONTRACT.md "The apps" has them (which way
+    /// is offered is `pimble_core::plan::share_face`'s).
     #[test]
-    fn menu_states_for_a_store_shared_from_this_computer() {
-        use pimble_core::RelaySide::{Member, None as NotRelayed, Owner};
-
-        // "Stop Sharing from This Computer...": only where it is shared from.
-        assert!(stop_relaying_item_disabled(NotRelayed));
-        assert!(stop_relaying_item_disabled(Member));
-        assert!(!stop_relaying_item_disabled(Owner));
-
-        // "Host on Pimble Cloud...": a store with no link that is nobody's
-        // copy. A store shared from here has a link (to its own twin), so it
-        // is off, and the menu says why.
-        assert!(!host_item_disabled(false, false, false));
-        assert!(host_item_disabled(true, false, false));
-        assert!(host_item_disabled(false, true, false));
-        assert!(host_item_disabled(false, false, true));
-        assert_eq!(
-            relayed_store_note(Owner),
-            "This store is shared from this computer. To host it or link it elsewhere, stop sharing it from this computer first."
-        );
-        assert_eq!(relayed_store_note(NotRelayed), "");
-        assert_eq!(relayed_store_note(Member), "");
-        assert_eq!(
-            menu_note_text(&["", "", relayed_store_note(Owner)]),
-            "This store is shared from this computer. To host it or link it elsewhere, stop sharing it from this computer first."
-        );
-
-        // "Unlink from Remote": any linked store but one shared from here,
-        // whose link "Stop Sharing from This Computer..." ends.
-        assert!(unlink_item_disabled(false, NotRelayed));
-        assert!(!unlink_item_disabled(true, NotRelayed));
-        assert!(!unlink_item_disabled(true, Member));
-        assert!(unlink_item_disabled(true, Owner));
-    }
-
-    /// The Share dialog's four faces (docs/RELAY_CONTRACT.md, "The apps"): a
-    /// node that is shared shows its share, to whoever manages it or not; one
-    /// that is not shows the name form only where a share has somewhere to
-    /// live, and the two ways everywhere else.
-    #[test]
-    fn the_share_dialog_has_four_faces() {
-        use pimble_core::StoreKind::{Plain, Vault};
-
-        assert_eq!(share_face(false, true, Plain), ShareFace::Ways);
-        assert_eq!(share_face(false, true, Vault), ShareFace::Name);
-        assert_eq!(share_face(true, true, Vault), ShareFace::Owner);
-        assert_eq!(share_face(true, false, Vault), ShareFace::Member);
-        // A marker left on a node of a store that is no longer hosted still
-        // opens on the share it names, never on a form over it.
-        assert_eq!(share_face(true, true, Plain), ShareFace::Owner);
-        assert_eq!(share_face(true, false, Plain), ShareFace::Member);
-
-        // The two ways and their sentences, as the contract has them.
+    fn the_two_ways_say_what_they_do() {
         assert_eq!(SHARE_FROM_HERE_LABEL, "Share from this computer");
         assert_eq!(
             SHARE_FROM_HERE_SENTENCE,
@@ -2762,12 +2406,6 @@ mod tests {
         );
         assert_eq!(HOST_ON_CLOUD_LABEL, "Host on Pimble Cloud...");
         assert_eq!(HOST_ON_CLOUD_SENTENCE, "An encrypted copy is kept there, so it works while this computer is off.");
-
-        // Both ways are open to an ordinary local store and to nothing else.
-        assert_eq!(share_ways_note(false, false, false), "");
-        assert!(!share_ways_note(true, false, false).is_empty());
-        assert!(!share_ways_note(false, true, false).is_empty());
-        assert!(!share_ways_note(false, false, true).is_empty());
     }
 
     /// A backend that knows a store's owner's computer to be off says so, and
@@ -3018,28 +2656,12 @@ mod tests {
     /// one's own store it is what it always was.
     #[test]
     fn share_is_offered_only_where_it_can_do_something() {
-        // One's own store: any node one may write, shared or not.
-        assert!(!share_item_disabled(StoreAccess::Full, false, false));
-        assert!(!share_item_disabled(StoreAccess::Full, false, true));
-        assert!(share_item_disabled(StoreAccess::Read, false, false));
-        assert_eq!(share_item_note(false, false), "");
-        assert_eq!(share_item_note(false, true), "");
-
-        // Someone else's: a shared root opens, for a reader as for an editor,
-        // since that face changes nothing; any other node is off with the note.
-        assert!(!share_item_disabled(StoreAccess::Full, true, true));
-        assert!(!share_item_disabled(StoreAccess::Read, true, true));
-        assert!(share_item_disabled(StoreAccess::Full, true, false));
-        assert!(share_item_disabled(StoreAccess::Read, true, false));
-        assert_eq!(share_item_note(true, true), "");
-        assert_eq!(share_item_note(true, false), "Only an owner of this store can share from it.");
-        assert_eq!(share_item_note(true, false), ONLY_AN_OWNER_SHARES_NOTE);
-
-        // The same judgement from the store and the node the app holds.
+        // The rule is `pimble_core::plan`'s; this is the app's view of the
+        // store and the node feeding it.
         let (app, store_id, child_id) = store_with_a_child();
         let item = |app: &AppStore| {
-            let (theirs, shared) = (app.shared_by(store_id).is_some(), app.is_shared(store_id, child_id));
-            (share_item_disabled(app.node_access(store_id, child_id), theirs, shared), share_item_note(theirs, shared))
+            let caps = pimble_core::plan::capabilities(&app.view(), store_id, Some(child_id));
+            (!caps.can_share(), caps.share_note())
         };
         assert_eq!(item(&app), (false, ""));
         if let Some(sig) = app.get_store_signal(store_id) {
@@ -3233,49 +2855,6 @@ mod tests {
         store.ended_roots = vec![trips, recipes];
         assert_eq!(shared_by_words(&store), "no longer shared");
         assert_eq!(shared_by_words(&store), NO_LONGER_SHARED_WORDS);
-    }
-
-    /// The menu of that row: everything that changes anything is off, and
-    /// "Remove Replica..." is still there, because that is where the files go.
-    #[test]
-    fn the_menu_of_an_ended_replica_offers_removal_and_nothing_that_changes_anything() {
-        let facts = StoreRowFacts {
-            access: StoreAccess::Read,
-            linked: true,
-            replica: true,
-            vault: false,
-            relay: pimble_core::RelaySide::None,
-            held_as_share: true,
-            shared_root: false,
-            mount_source_copied: true,
-            every_share_ended: true,
-        };
-        let menu = store_row_menu(facts);
-        assert!(!menu.remove_replica, "\"Remove Replica...\" is available");
-        let off = [
-            menu.new_node,
-            menu.mount_store,
-            menu.mount_remote_store,
-            menu.copy_as_mount_source,
-            menu.paste_mount,
-            menu.link_to_remote,
-            menu.host,
-            menu.share,
-            menu.stop_relaying,
-            menu.unlink,
-            menu.appearance,
-        ];
-        assert!(off.iter().all(|disabled| *disabled), "{menu:?}");
-
-        // The same replica while a share of it is held, as an editor: what
-        // it always offered ("Unlink from Remote" included).
-        let held = store_row_menu(StoreRowFacts { access: StoreAccess::Full, every_share_ended: false, ..facts });
-        assert!(!held.new_node && !held.paste_mount && !held.unlink && !held.remove_replica && !held.appearance && !held.copy_as_mount_source);
-        assert!(held.link_to_remote && held.host && held.share && held.stop_relaying);
-        // And one's own unlinked store.
-        let own = store_row_menu(StoreRowFacts { access: StoreAccess::Full, linked: false, replica: false, held_as_share: false, mount_source_copied: false, every_share_ended: false, ..facts });
-        assert!(!own.new_node && !own.link_to_remote && !own.host && !own.share && !own.appearance);
-        assert!(own.paste_mount && own.unlink && own.remove_replica && own.stop_relaying);
     }
 
     /// Whether a node is under a root is read off the cached parent chain.

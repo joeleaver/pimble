@@ -620,8 +620,9 @@ fn bump_tree_after_menu_closes(store: AppStore) {
 fn paste_mount_here(store: AppStore, target_value: &str) {
     let Some(source) = untracked(|| store.mount_source.get()) else { return };
     let (source_store, source_node, title) = source;
-    let Some((target_store, target_node_opt)) = parse_tree_value(target_value) else { return };
-    let Some(parent_id) = target_node_opt.or_else(|| store.root_node_id(target_store)) else { return };
+    // Under a mount it goes into the mount's source, like anything made on
+    // a row, and only where this device may write.
+    let Some((target_store, parent_id)) = crate::tree_view::create_parent_of_row(store, target_value) else { return };
     store.send(BackendCommand::CreateMount {
         store_id: target_store,
         parent_id,
@@ -1326,107 +1327,55 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             // Sync status (store roots only, docs/SYNC_CONTRACT.md "B: app
             // side"): looked up once (an entry always exists by the time a
             // registered store's row renders — see `ensure_sync_entry`) and
-            // read reactively below for the badge; `is_linked_now` is a
-            // static (untracked) snapshot for the context menu's `disabled`
-            // values, rebuilt only when the tree structurally re-renders this
-            // row (rinch #714 — see the `no_mount_source` note further down).
+            // read reactively below for the badge.
             let sync_sig = if is_store_root {
                 parsed.and_then(|(s_id, _)| store.get_sync_signal(s_id))
             } else {
                 None
             };
-            let is_linked_now = sync_sig
-                .map(|sig| untracked(|| sig.with(|(remote, _)| remote.is_some())))
-                .unwrap_or(false);
 
-            // Same static-snapshot-rebuilt-on-structural-rebuild pattern as
-            // `is_linked_now` (rinch #714 — see the `no_mount_source` note
-            // further down): whether this store row is a replica, for
-            // "Remove Replica..."'s `disabled` value.
-            let is_replica_now = store_sig
-                .map(|sig| untracked(|| sig.with(|s| s.is_replica)))
-                .unwrap_or(false);
-            // And whether it is itself an encrypted store, for "Host on
-            // Pimble Cloud..."'s `disabled` value (decision 5): the server
-            // holds only blobs for one, so there is nothing here to host.
-            let is_vault_now = parsed
-                .map(|(s_id, _)| store.is_vault(s_id))
-                .unwrap_or(false);
-            // And which end of Pimble Cloud's relay this device is for the
-            // store (docs/RELAY_CONTRACT.md): a store shared from this
-            // computer offers "Stop Sharing from This Computer..." and turns
-            // off hosting and unlinking, with a line saying why. Snapshotted
-            // like the others; the store row's data carries it.
-            let relay_now = parsed
-                .map(|(s_id, _)| store.store_relay(s_id))
-                .unwrap_or_default();
-            // And whether this is a share's replica whose every share has
-            // ended (Joe, 2026-09-21): the row stays because the files do,
-            // everything that changes anything is off, and "Remove
-            // Replica..." is where the files go. Snapshotted like the
-            // others; the store row's data carries the ended roots.
-            let ended_now = is_store_root && parsed.map_or(false, |(s_id, _)| store.every_share_ended(s_id));
-            // A browser build has none of those items to explain.
-            let relayed_note_text = if CAN_ADMINISTER_STORES && is_store_root {
-                crate::state::relayed_store_note(relay_now)
-            } else {
-                ""
-            };
-
-            // What this device may change of this row's node
-            // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"): the
-            // server's own judgement of the node (`AppStore::node_access`),
-            // because one store can hold a root this account reads beside a
-            // root it edits, and only the rows under the first have anything
-            // greyed out. A store row asks about the store. `Full` is one's
-            // own store and an editor's scope alike, so an editor of a share
-            // has nothing greyed out; only a reader does.
+            // What may be done with this row (`pimble_core::plan::capabilities`,
+            // one rule for every menu): what this device may change of the
+            // row's node (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"),
+            // the server's own judgement of the node, because one store can
+            // hold a root this account reads beside a root it edits, and only
+            // the rows under the first have anything greyed out; a store row
+            // asks about the store. `Full` is one's own store and an editor's
+            // scope alike, so an editor of a share has nothing greyed out;
+            // only a reader does. Whether the store is linked, a replica,
+            // encrypted, shared from this computer, someone else's share, or
+            // a share's replica whose every share has ended (Joe,
+            // 2026-09-21: the row stays because the files do, everything that
+            // changes anything is off, and "Remove Replica..." is where the
+            // files go); whether the row's node carries a share marker (a
+            // store row takes its root's, like its icon and colour).
             // `parse_tree_value` returns the CANONICAL pair, so a node
             // reached through a mount is judged as the node it is in its
-            // source store, which is where the RPC would go. Snapshotted like
-            // `is_linked_now` (rinch #714); the row's data carries it, so a
-            // node whose access changes re-renders its row with fresh items.
-            let access_now = match parsed {
-                Some((s_id, Some(n_id))) => store.node_access(s_id, n_id),
-                Some((s_id, None)) => store.store_access(s_id),
-                None => Default::default(),
-            };
-            let can_write_tree = access_now.allows_write();
+            // source store, which is where the RPC would go. A snapshot, like
+            // `no_mount_source` below (rinch #714): the row's data carries
+            // all of it, so a change of any re-renders the row with fresh
+            // items.
+            let caps = parsed
+                .map(|(s_id, n_id)| pimble_core::plan::capabilities(&store.view(), s_id, n_id))
+                .unwrap_or_default();
+            let ended_now = is_store_root && caps.every_share_ended;
+            // A browser build has none of those items to explain.
+            let relayed_note_text = if CAN_ADMINISTER_STORES && is_store_root { caps.relayed_note() } else { "" };
+            let access_now = caps.access;
+            let can_write_tree = caps.writable();
             // A mount's "New Node" creates under the mount's SOURCE node, so
             // that node's access is what governs that one item.
             let can_write_mount_source = mount_sig
                 .and_then(|sig| untracked(|| sig.with(|m| m.mount_ref.as_ref().map(|r| (r.source_store, r.source_node)))))
                 .map_or(can_write_tree, |(source_store, source_node)| store.node_access(source_store, source_node).allows_write());
-            // Whether this row's node carries a share marker (a store row
-            // takes its root node's, like its icon and colour, and a partial
-            // replica's row has no root of its own): the badge.
-            let is_shared_now = if is_store_root {
-                parsed
-                    .and_then(|(s_id, _)| store.store_row_node(s_id).map(|root| store.is_shared(s_id, root)))
-                    .unwrap_or(false)
-            } else {
-                parsed
-                    .and_then(|(s_id, n_id)| n_id.map(|n_id| store.is_shared(s_id, n_id)))
-                    .unwrap_or(false)
-            };
+            let is_shared_now = caps.shared_root;
             // "Share...": in a store that reached this device as someone
             // else's share nothing can be shared from here, so the item opens
             // only on a shared root (the member's read-only face of the
-            // modal) and every other row says why it is off. `parsed` is the
-            // canonical pair, so a node reached through a mount is judged by
-            // the store it lives in. Snapshotted like `is_linked_now` (rinch
-            // #714): the row's data carries the store's `shared_by`, the
-            // marker and the access, so a change of any re-renders the row.
-            let held_as_share_now = parsed
-                .map(|(s_id, _)| store.shared_by(s_id).is_some())
-                .unwrap_or(false);
-            let share_disabled = crate::state::share_item_disabled(access_now, held_as_share_now, is_shared_now);
+            // modal) and every other row says why it is off.
+            let share_disabled = !caps.can_share();
             // A browser build has no "Share..." item to explain.
-            let share_note_text = if CAN_ADMINISTER_STORES {
-                crate::state::share_item_note(held_as_share_now, is_shared_now)
-            } else {
-                ""
-            };
+            let share_note_text = if CAN_ADMINISTER_STORES { caps.share_note() } else { "" };
 
             // Choose icon (static — changes only on structural rebuild). Folders
             // are folders even when empty; documents are documents even with
@@ -1491,17 +1440,16 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
 
             // Context menu actions
             let nv_ctx = node_value.clone();
+            // Under this row's node, a store row's root, or a mount's source
+            // (`pimble_core::plan::create_parent`, as every creation is).
             let on_new_child = {
                 let nv = nv_ctx.clone();
                 move || {
-                    if let Some((s_id, node_id_opt)) = parse_tree_value(&nv) {
-                        let parent_id = node_id_opt.or_else(|| store.root_node_id(s_id));
-                        if let Some(pid) = parent_id {
-                            store.send(BackendCommand::CreateNode {
-                                store_id: s_id, parent_id: Some(pid), title: String::new(), init: None,
-                                place: Default::default(),
-                            });
-                        }
+                    if let Some((s_id, pid)) = crate::tree_view::create_parent_of_row(store, &nv) {
+                        store.send(BackendCommand::CreateNode {
+                            store_id: s_id, parent_id: Some(pid), title: String::new(), init: None,
+                            place: Default::default(),
+                        });
                     }
                 }
             };
@@ -1510,7 +1458,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             let on_new_whiteboard = {
                 let nv = nv_ctx.clone();
                 move || {
-                    if let Some((s_id, parent)) = crate::boards::parent_for_row(store, &nv) {
+                    if let Some((s_id, parent)) = crate::tree_view::create_parent_of_row(store, &nv) {
                         crate::boards::new_whiteboard(store, s_id, parent);
                     }
                 }
@@ -1520,7 +1468,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             let on_new_discussion = {
                 let nv = nv_ctx.clone();
                 move || {
-                    if let Some((s_id, parent)) = crate::boards::parent_for_row(store, &nv) {
+                    if let Some((s_id, parent)) = crate::tree_view::create_parent_of_row(store, &nv) {
                         crate::discussions::new_discussion(store, s_id, parent);
                     }
                 }
@@ -1536,7 +1484,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             let on_new_sheet = {
                 let nv = nv_ctx.clone();
                 move || {
-                    if let Some((s_id, parent)) = crate::boards::parent_for_row(store, &nv) {
+                    if let Some((s_id, parent)) = crate::tree_view::create_parent_of_row(store, &nv) {
                         crate::sheets::new_sheet(store, s_id, parent);
                     }
                 }
@@ -1544,7 +1492,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             let on_new_image = {
                 let nv = nv_ctx.clone();
                 move || {
-                    if let Some((s_id, parent)) = crate::boards::parent_for_row(store, &nv) {
+                    if let Some((s_id, parent)) = crate::tree_view::create_parent_of_row(store, &nv) {
                         crate::boards::pick_images(store, crate::boards::Dest::Under(s_id, parent));
                     }
                 }
@@ -1553,7 +1501,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             let on_paste_image = {
                 let nv = nv_ctx.clone();
                 move || {
-                    if let Some((s_id, parent)) = crate::boards::parent_for_row(store, &nv) {
+                    if let Some((s_id, parent)) = crate::tree_view::create_parent_of_row(store, &nv) {
                         crate::boards::paste_image(store, crate::boards::Dest::Under(s_id, parent));
                     }
                 }
@@ -1686,25 +1634,20 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             let on_mount_remote_store = {
                 let nv = nv_ctx.clone();
                 move || {
-                    if let Some((s_id, node_id_opt)) = parse_tree_value(&nv) {
-                        let parent_id = node_id_opt.or_else(|| store.root_node_id(s_id));
-                        match parent_id {
-                            Some(pid) => open_connect_modal(store, Some((s_id, pid))),
-                            None => tracing::warn!("No target node for a remote mount under {:?}", s_id),
-                        }
+                    if let Some(target) = crate::tree_view::create_parent_of_row(store, &nv) {
+                        open_connect_modal(store, Some(target));
                     }
                 }
             };
 
+            // The rows the menu acts on, all or none
+            // (`pimble_core::plan::can_delete`).
             let on_delete = {
                 let nv = nv_ctx.clone();
                 move || {
-                    for value in rows_for_menu(tree_state, &nv) {
-                        if let Some((s_id, Some(n_id))) = parse_tree_value(&value) {
-                            store.send(BackendCommand::DeleteNode {
-                                store_id: s_id, node_id: n_id,
-                            });
-                        }
+                    let Some(nodes) = crate::tree_view::deletable(store, &rows_for_menu(tree_state, &nv)) else { return };
+                    for (s_id, n_id) in nodes {
+                        store.send(BackendCommand::DeleteNode { store_id: s_id, node_id: n_id });
                     }
                 }
             };
@@ -1721,28 +1664,10 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 }
             };
 
-            // Mount-node-only "New Node": creates under the mount's source
-            // (mount_ref), never under the mount node itself (decision 2 —
-            // the server rejects a mount node as a create parent).
-            let on_new_child_mount = {
-                let sig = mount_sig;
-                move || {
-                    let Some(sig) = sig else { return };
-                    let mount_ref = untracked(|| sig.with(|m| m.mount_ref.clone()));
-                    match mount_ref {
-                        Some(mount_ref) => {
-                            store.send(BackendCommand::CreateNode {
-                                store_id: mount_ref.source_store,
-                                parent_id: Some(mount_ref.source_node),
-                                title: String::new(),
-                                init: None,
-                                place: Default::default(),
-                            });
-                        }
-                        None => tracing::warn!("Mount node has no mount_ref yet; cannot create a child under it"),
-                    }
-                }
-            };
+            // Mount-node-only "New Node": creates under the mount's source,
+            // never under the mount node itself (decision 2 — the server
+            // rejects a mount node as a create parent), as `on_new_child` does.
+            let on_new_child_mount = on_new_child.clone();
 
             // "Copy as Mount Source" — store roots and ordinary nodes only
             // (not mount nodes, which are placeholders). Not reactive, so a
@@ -2089,18 +2014,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             };
 
             // Which of a store row's items are off: one rule, in one place
-            // (`state::store_row_menu`), from what the row snapshots.
-            let store_menu = crate::state::store_row_menu(crate::state::StoreRowFacts {
-                access: access_now,
-                linked: is_linked_now,
-                replica: is_replica_now,
-                vault: is_vault_now,
-                relay: relay_now,
-                held_as_share: held_as_share_now,
-                shared_root: is_shared_now,
-                mount_source_copied: !no_mount_source,
-                every_share_ended: ended_now,
-            });
+            // (`Capabilities::store_row_menu`), from what the row snapshots.
+            let store_menu = caps.store_row_menu(!no_mount_source);
 
             // Remember this row for `reveal_row`, and scroll to it now if it
             // is the one a followed link revealed.
@@ -2468,7 +2383,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             {
                 let nv = node_value.clone();
                 let handler = __scope.register_file_drop_handler(move |paths: Vec<std::path::PathBuf>| {
-                    if let Some((s_id, parent)) = crate::boards::parent_for_row(store, &nv) {
+                    if let Some((s_id, parent)) = crate::tree_view::create_parent_of_row(store, &nv) {
                         crate::boards::add_image_files(store, crate::boards::Dest::Under(s_id, parent), paths);
                     }
                 });
@@ -2555,20 +2470,15 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             // Try to use the currently selected store
             let result = store.selected_id.get()
                 .and_then(|sel| parse_tree_value(&sel))
-                .and_then(|(s_id, _)| {
-                    store.root_node_id(s_id).map(|rid| (s_id, rid))
-                })
+                .map(|(s_id, _)| s_id)
+                .filter(|s_id| store.root_node_id(*s_id).is_some())
                 // Fall back to first store
-                .or_else(|| {
-                    let first_sid = untracked(|| store.store_ids.with(|ids| ids.first().copied()));
-                    first_sid.and_then(|sid| {
-                        store.root_node_id(sid).map(|rid| (sid, rid))
-                    })
-                })
-                // Not under a node this device may only read
+                .or_else(|| untracked(|| store.store_ids.with(|ids| ids.first().copied())))
+                // Under the store's root, as its row's "New Node" makes one,
+                // and not where this device may only read
                 // (docs/NODE_DOCUMENT_CONTRACT.md section 5): the row's "New
                 // Node" is disabled there, and so is this.
-                .filter(|(s_id, root_id)| store.node_access(*s_id, *root_id).allows_write());
+                .and_then(|s_id| pimble_core::plan::create_parent(&store.view(), s_id, None).ok());
             match result {
                 Some((s_id, root_id)) => store.send(BackendCommand::CreateNode {
                     store_id: s_id,

@@ -204,6 +204,9 @@ server rules in `pimble_crdt::rules` (`derive_changes`, `Tree::repair_held`,
 `StoreAccess::of_role`/`on_document`; canvas locks, the layer rule and the new-canvas
 recipe in `pimble-board` (`locks.rs`, `recipe.rs`); sheet operations, path matching and
 moves in `pimble-sheet` (`ops.rs`, `book.rs`); embed atoms as `markdown::Embed`.
+The shared vault protocol, built 2026-11-02: `pimble_rpc::vault` beside `VaultCursor`
+(`DocKeys`, `seal`, `scope_key_ids`, `NewDocument`, `snapshot_due` with the desktop's
+log-length rule, `should_apply`, `fetched_entries`), used by `vault_link.rs` and `vault.rs`.
 
 **Wave 2, `pimble-api` with the RPC implementation, and the MCP moves onto it.** The trait,
 `ApiError`, held documents, the one write, naming and links, recipes, presence. The MCP is
@@ -214,6 +217,23 @@ become lookups. The MCP's tests are the check.
 `capabilities`, labels. The app's `tree_drop`, `tree_keys`, menus and toolbar call them
 through an adapter over `AppStore`; the MCP's `move_node` gets the app's refusals and
 `moveNodes`.
+
+Built 2026-11-02 in `pimble_core::plan` rather than `pimble-api` (decision 5 placed it
+there): the app uses it now, before it moves onto the API in wave 5, and `pimble-api`
+was being built beside it; the API implements `TreeView` over its held documents and
+re-exports the module. `TreeView` (store facts, parent, ordered children, mount and its
+source, share marker, held access, label), the one bounded walk (`ancestors`, `nearest`,
+`is_at_or_under`), `node_access` with "unknown access is `Full`" stated as policy,
+`plan_move` (answers `MovePlan { steps: MoveStep::{Move, MoveMany, Transplant}, line,
+warning }` or a `Refusal` with its sentence), `create_parent`, `can_delete`,
+`capabilities` with the menu rules, and `display_label`. The app reads them through
+`tree_view::AppView` over `AppStore`; `tree_drop` only translates rinch's drop into
+rows and a `Place`. Decision 5's answer for mounts is in: every creation on a row goes
+through `create_parent` (the toolbar's "+" too, on the selected store's row), so "New
+Node" on a mount row and "Paste Mount Here" on one now go to the mount's source, and
+"Paste Mount Here" checks access.
+Deleting from a row's menu is all or none, like Delete in the tree. Not wired yet:
+the MCP's `move_node` (after wave 2 lands).
 
 **Wave 4, the vault behind the trait.** `web/src/vault.rs` becomes the `Pimble` vault
 implementation; the `Router` composes it with RPC; `dispatch_transplant`,

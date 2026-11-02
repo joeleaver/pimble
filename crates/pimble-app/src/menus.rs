@@ -159,8 +159,8 @@ fn edit_entries(store: AppStore) -> Vec<MenuEntry> {
         // (docs/NODE_DOCUMENT_CONTRACT.md section 5, "Roles"). An editor
         // deletes like anyone else.
         if let Some((store_id, node_id)) = store.selected_store_and_node() {
-            if !store.node_access(store_id, node_id).allows_write() {
-                tracing::info!("Delete refused: {:?}/{:?} is shared with us to read", store_id, node_id);
+            if let Err(refusal) = pimble_core::plan::can_delete(&store.view(), &[(store_id, node_id)]) {
+                tracing::info!("Delete refused: {:?}/{:?}: {refusal}", store_id, node_id);
                 return;
             }
             store.send(crate::protocol::BackendCommand::DeleteNode { store_id, node_id });
