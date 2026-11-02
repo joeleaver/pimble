@@ -1,5 +1,16 @@
 # Next session: start here
 
+**2026-11-02: v0.15.1 released (release commit 490cbaa), deployed (jkbase v39; backup
+`bkp_1793634527332_f7581ddf58f5fea8`) and installed here: rinch `main` 2d1f11a0.** A
+rinch-only release: 332 rinch commits past v0.15.0's 6c2bedc0 (element ids are u64,
+a7e519c; Vello frames no longer block the main thread, #2071; nothing hidden reaches
+Vello; scroll into view moves every scrolling ancestor; Page Up/Down move the editor's
+caret; element `onwheel`; every SVG stroke property). Still not in rinch: setting an
+element's scroll from the app, file drags over a `RenderSurface`. Checked: 1151 tests, the
+web build, the Windows check of `pimble-app` and `pimble-mcp`, and the isolated app on
+Vulkan (port 7494, a store copy: search, the long note, typing, Page Down, wheel scroll,
+a clean close). Branch `rinch-main` is merged into `master`.
+
 **2026-10-29: v0.15.0 released (release commit e93a32b), deployed (jkbase v38; backup
 `bkp_1793312298113_d1c1a2c37eed3dfa`) and installed here: canvas tools for the MCP and canvas meaning.**
 1151 tests, the web and Windows builds checked before tagging.
