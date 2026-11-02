@@ -305,6 +305,14 @@ would destroy what is underneath.
   Selection to Layer". New elements go into the selected layer.
 - A locked layer or element refuses edits from the tools for everyone (a shared guard
   against accidents, not a permission: anyone with edit rights can unlock it).
+  `pimble_board::BoardTxn` judges it for every caller (docs/API_CONTRACT.md wave 1,
+  `crates/pimble-board/src/locks.rs`): a locked element, or one in a locked layer, takes
+  no edit of its geometry, text, style, place or membership and is not deleted; a locked
+  layer takes no new elements and is neither deleted nor merged away (merging or deleting
+  an unlocked layer takes its locked elements along); notes, fields, the locks themselves
+  and a layer's name, visibility, opacity and order stay open. Deleting several elements
+  skips the locked ones and says how many it kept. New elements with no layer named go to
+  the top layer that is not locked.
 - **Visibility is one thing, shared, on the node** (Joe, 2026-10-09): what a board shows
   is part of its document, the same for everyone who opens the node, in its pane, in text,
   in embeds and in exports. There is no per-person or per-device hiding.

@@ -353,7 +353,7 @@ only the size and maximized state come back.
   reach: plain stores compute a scope from the tree plus its attachments, and vault
   stores use the discussion set (section 7). Creating, changing or deleting an
   attachment is announced as `StoreChangeKind::AttachmentChanged { host_id, node_id }`
-  (from `derive_kinds`), so a host's open views refresh their markers, pins and badge.
+  (from `pimble_crdt::rules::derive_changes`), so a host's open views refresh their markers, pins and badge.
   Nothing is hosted as a side effect.
 - **Desktop and web together** in every wave (Joe, 2026-10-06), from shared `pimble-app`
   code.
@@ -497,7 +497,7 @@ What exists:
   attachments again under the new node. 7 tests; 600 convergence seeds pass.
 - **Server**: `createAttachment`, `listAttachments`, `whoAmI` (an agent's id and name),
   `Node.attachments` (a count reported with `getNode`/`getChildren`, never stored),
-  `StoreChangeKind::AttachmentChanged { node_id, host_id, live }` from `derive_kinds`,
+  `StoreChangeKind::AttachmentChanged { node_id, host_id, live }` from `pimble_crdt::rules::derive_changes`,
   plain scopes and vault keys reaching an attachment through its host, `listDeleted`
   not calling a live attachment lost, and a `DiscussionPlugin` indexing messages.
 - **App (desktop and web)**: `discussions.rs` and `discussions/ui.rs`: a pane holding a

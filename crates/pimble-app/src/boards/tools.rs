@@ -8,6 +8,7 @@
 //! [`super::local_edit`], written about every 80 ms while the pointer moves
 //! (so others watch it happen) and once more on release.
 
+use pimble_board::recipe::{CARD_SIZE, STICKY_SIZE};
 use pimble_board::{End, Side};
 use rinch::render_surface::{SurfacePointer, SurfacePointerKind};
 
@@ -27,12 +28,10 @@ const HIT_SLOP: f32 = 5.0;
 const NUDGE: f32 = 1.0;
 /// Where a duplicate lands, board units from the original.
 const DUPLICATE_OFFSET: f32 = 16.0;
-/// A new sticky note's size, and a shape's when it is clicked rather than
-/// dragged out, board units.
-const STICKY_SIZE: f32 = 200.0;
+/// A shape's size when it is clicked rather than dragged out, board units.
+/// A sticky note's and a node card's are `pimble-board`'s, which the MCP
+/// gives them too.
 const CLICKED_SHAPE: (f32, f32) = (160.0, 100.0);
-/// A node card's size, board units.
-const CARD_SIZE: (f32, f32) = (240.0, 56.0);
 
 // ── Events ──────────────────────────────────────────────────────────────────
 
@@ -499,7 +498,7 @@ fn hit_at<'a>(s: &'a Session, p: Point) -> Option<&'a pimble_board::Element> {
         .filter(|e| e.hits(p, tolerance))
         .collect();
     hits.reverse();
-    hits.into_iter().find(|e| !snapshot.layer(&e.layer).is_some_and(|l| l.locked))
+    hits.into_iter().find(|e| !snapshot.in_locked_layer(e))
 }
 
 /// The physical pixels per logical pixel the session last drew at (hit
@@ -768,7 +767,7 @@ fn pointer_moved(store: AppStore, pane: PaneId, px: f32, py: f32) {
                 let snapshot = s.view.snapshot();
                 let mut chosen = base.clone();
                 for e in snapshot.within(&rect) {
-                    if snapshot.layer(&e.layer).is_some_and(|l| l.locked) {
+                    if snapshot.in_locked_layer(e) {
                         continue;
                     }
                     let id = select_target(snapshot, e);
@@ -1351,6 +1350,8 @@ fn adopt_into_frame(store: AppStore, pane: PaneId, frame: &str) {
             .within(&rect)
             .into_iter()
             .filter(|e| e.raw.id != frame && e.parent.is_none() && e.raw.kind != Kind::Frame && e.layer == f.layer)
+            // A locked element is not taken in: its membership is an edit the lock guards.
+            .filter(|e| snapshot.editable(&e.raw.id))
             .map(|e| {
                 let t = e.raw.transform;
                 (e.raw.id.clone(), Transform { tx: t.tx - offset.0, ty: t.ty - offset.1, ..t })
@@ -1458,31 +1459,35 @@ pub(super) fn ungroup(store: AppStore, pane: PaneId) {
 
 // ── Arranging ───────────────────────────────────────────────────────────────
 
-/// Delete the selection (a group with its members); locked elements stay.
+/// Delete the selection (a group with its members). Locked elements stay,
+/// and the notice says how many (`BoardTxn::delete_elements`, docs/API_CONTRACT.md
+/// open decision 5); a locked group keeps its members too.
 pub(crate) fn delete_selected(store: AppStore, pane: PaneId) {
     let ids: Vec<String> = with_session(pane, |s| {
         let snapshot = s.snapshot();
         let mut out: Vec<String> = Vec::new();
-        for id in s.selected.iter().filter(|id| s.editable(id)) {
-            collect_with_members(snapshot, id, &mut out);
+        for id in s.selected.iter().filter(|id| snapshot.get(id).is_some()) {
+            if s.editable(id) {
+                collect_with_members(snapshot, id, &mut out);
+            } else if !out.contains(id) {
+                out.push(id.clone());
+            }
         }
         out
     })
     .unwrap_or_default();
     if ids.is_empty() {
-        if with_session(pane, |s| !s.selected.is_empty()) == Some(true) {
-            crate::events::show_notice(store, LOCKED.to_string());
-        }
+        return;
+    }
+    if with_session(pane, |s| ids.iter().all(|id| !s.editable(id))) == Some(true) {
+        crate::events::show_notice(store, LOCKED.to_string());
         return;
     }
     new_undo_step(pane);
-    local_edit(store, pane, |t| {
-        for id in &ids {
-            // A member may have gone with its group already.
-            let _ = t.delete_element(id);
-        }
-        Ok(())
-    });
+    let deleted = local_edit(store, pane, |t| t.delete_elements(&ids));
+    if let Some(sentence) = deleted.and_then(|d| d.kept_sentence()) {
+        crate::events::show_notice(store, sentence);
+    }
 }
 
 /// `id` and, for a group, everything in it.
@@ -1732,7 +1737,7 @@ fn select_all(store: AppStore, pane: PaneId) {
         let snapshot = s.snapshot();
         let mut out: Vec<String> = Vec::new();
         for e in &snapshot.elements {
-            if !e.visible || snapshot.layer(&e.layer).is_some_and(|l| l.locked) {
+            if !e.visible || snapshot.in_locked_layer(e) {
                 continue;
             }
             let id = select_target(snapshot, e);
@@ -1778,15 +1783,14 @@ pub(super) fn target_layer(store: AppStore, pane: PaneId) -> Option<String> {
     let chosen = untracked(|| store.pane(pane).board_ui.layer.get());
     let found = with_session(pane, |s| {
         let snapshot = s.snapshot();
-        match chosen.as_ref().and_then(|id| snapshot.layer(id)) {
-            Some(l) => (!l.locked).then(|| l.id.clone()).ok_or(()),
-            None => snapshot.layers.iter().rev().find(|l| !l.locked).map(|l| l.id.clone()).ok_or(()),
-        }
+        // A picked layer someone else deleted is no pick.
+        let picked = chosen.as_deref().filter(|id| snapshot.layer(id).is_some());
+        snapshot.layer_for_new(picked).map(|l| l.id.clone())
     });
     match found {
         Some(Ok(id)) => Some(id),
-        Some(Err(())) => {
-            crate::events::show_notice(store, "That layer is locked. Unlock it, or pick another layer to draw in.".to_string());
+        Some(Err(e)) => {
+            crate::events::show_notice(store, e.to_string());
             None
         }
         None => None,

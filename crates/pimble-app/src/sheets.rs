@@ -34,7 +34,8 @@ use pimble_core::{node_types, NodeId, StoreId};
 use pimble_crdt::NodeDoc;
 use pimble_sheet::doc::{self, Placement, Sheets};
 use pimble_sheet::formula::{self, ComputedTable, Engine, ErrorCode, Value};
-use pimble_sheet::{input, Book, ColumnType, Format, NodeInfo, NodeRef, Reach, ResultKey, SheetsSnap, Stored, SummaryCell};
+use pimble_sheet::book::{find_by_path, formulas_of, named_nodes, serial_of, shortest_path};
+use pimble_sheet::{input, Book, ColumnType, Format, NodeInfo, NodeRef, Reach, ResultKey, SheetsSnap, Stored, SummaryCell, Titles};
 use rinch::prelude::*;
 
 use crate::panes::{PaneId, MAX_PANES};
@@ -43,8 +44,7 @@ use crate::state::{ActiveEdit, AppStore};
 
 pub(crate) use ui::render_sheet;
 
-/// A new sheet node's icon (a Tabler icon name).
-pub const SHEET_ICON: &str = "table";
+pub use pimble_sheet::ops::SHEET_ICON;
 
 // ── What the view shows ──────────────────────────────────────────────────
 
@@ -733,18 +733,11 @@ fn send_update(store: AppStore, from: Slot, store_id: StoreId, node_id: NodeId, 
 
 // ── Making one ───────────────────────────────────────────────────────────
 
-/// A new sheet's first table, written in the edit that makes the node (two
-/// devices making one node's first table would otherwise both make one).
+/// A new sheet's first table, written in the edit that makes the node
+/// (`pimble_sheet::ops::new_sheet_content`).
 pub(crate) fn new_sheet_content() -> Option<Vec<u8>> {
-    let sheets = Sheets::standalone();
-    let edited = sheets.edit(|t| {
-        let table = t.create_table("Table1", Placement::Last)?;
-        t.add_column(&table, "name", ColumnType::Text, Placement::Last)?;
-        t.add_column(&table, "amount", ColumnType::Number, Placement::Last)?;
-        Ok(())
-    });
-    match edited.result {
-        Ok(()) => edited.update,
+    match pimble_sheet::ops::new_sheet_content() {
+        Ok(content) => Some(content),
         Err(e) => {
             tracing::warn!("a new sheet could not be made: {e}");
             None
@@ -793,36 +786,6 @@ fn node_ref(store_id: StoreId, node_id: NodeId) -> NodeRef {
     NodeRef { store: store_id, node: node_id }
 }
 
-/// The nodes a stored formula names (`{n:<store>/<node>}`).
-fn named_nodes(stored: &str, out: &mut Vec<NodeRef>) {
-    let mut rest = stored;
-    while let Some(at) = rest.find("{n:") {
-        rest = &rest[at + 3..];
-        let Some(end) = rest.find('}') else { break };
-        if let Some((s, n)) = rest[..end].split_once('/') {
-            if let (Ok(s), Ok(n)) = (uuid::Uuid::parse_str(s), uuid::Uuid::parse_str(n)) {
-                out.push(NodeRef { store: StoreId(s), node: NodeId(n) });
-            }
-        }
-        rest = &rest[end..];
-    }
-}
-
-fn formulas_of(snap: &SheetsSnap) -> Vec<&str> {
-    let mut all = Vec::new();
-    for t in &snap.tables {
-        if let Some(s) = &t.source {
-            all.push(s.as_str());
-        }
-        for c in &t.columns {
-            if let ColumnType::Formula { formula, .. } = &c.ty {
-                all.push(formula.as_str());
-            }
-        }
-    }
-    all
-}
-
 fn cached_sheets(store: AppStore, node: &NodeRef) -> Option<SheetsSnap> {
     // A pane of this window holding the note has the freshest copy; the
     // cache is as old as the last fetch.
@@ -842,7 +805,7 @@ impl AppBook {
         let mut read_notes = Vec::new();
         let mut pending: Vec<NodeRef> = Vec::new();
         for f in formulas_of(&snap) {
-            named_nodes(f, &mut pending);
+            pending.extend(named_nodes(f));
         }
         snaps.insert(home, snap);
         // Other notes' tables, and the notes their formulas name, a few
@@ -859,7 +822,7 @@ impl AppBook {
                     reads::Where::Read(at) => {
                         if let Some(s) = cached_sheets(store, &at) {
                             for f in formulas_of(&s) {
-                                named_nodes(f, &mut next);
+                                next.extend(named_nodes(f));
                             }
                             snaps.insert(node, s);
                         } else if store.get_node_signal(at.store, at.node).is_none() {
@@ -890,9 +853,7 @@ impl AppBook {
                 }
             }
         }
-        let today = chrono::Local::now().date_naive();
-        use chrono::Datelike;
-        let today = formula::dates::serial(today.year() as i64, today.month() as i64, today.day() as i64) as f64;
+        let today = serial_of(chrono::Local::now().date_naive());
         Self { store, home, snaps, absent, reads: read_notes, labels: RefCell::new(HashMap::new()), today }
     }
 
@@ -912,6 +873,16 @@ impl AppBook {
             .or_insert_with(|| untracked(|| sig.with(crate::state::display_label_from_node)))
             .clone();
         Some((label, parent))
+    }
+}
+
+impl Titles for AppBook {
+    fn candidates(&self) -> Vec<NodeRef> {
+        untracked(|| self.store.node_data.with(|m| m.keys().map(|(s, n)| node_ref(*s, *n)).collect()))
+    }
+
+    fn title_and_parent(&self, node: &NodeRef) -> Option<(String, Option<NodeRef>)> {
+        self.title(node).map(|(title, parent)| (title, parent.map(|p| node_ref(node.store, p))))
     }
 }
 
@@ -942,56 +913,11 @@ impl Book for AppBook {
     }
 
     fn find_nodes(&self, name_or_path: &str) -> Vec<NodeRef> {
-        let parts: Vec<String> = name_or_path.split('/').map(|p| p.trim().to_lowercase()).filter(|p| !p.is_empty()).collect();
-        let Some(last) = parts.last() else { return Vec::new() };
-        let all: Vec<(StoreId, NodeId)> = untracked(|| self.store.node_data.with(|m| m.keys().copied().collect()));
-        let mut found = Vec::new();
-        for (s, n) in all {
-            let r = node_ref(s, n);
-            let Some((title, mut parent)) = self.title(&r) else { continue };
-            if title.trim().to_lowercase() != *last {
-                continue;
-            }
-            // Every earlier part names the next parent up, in order: a path
-            // is a run of titles straight down the tree, never skipping a
-            // level (a same-titled note further down must not match too).
-            let mut ok = true;
-            for part in parts.iter().rev().skip(1) {
-                let Some(p) = parent else {
-                    ok = false;
-                    break;
-                };
-                let Some((t, up)) = self.title(&node_ref(s, p)) else {
-                    ok = false;
-                    break;
-                };
-                if t.trim().to_lowercase() != *part {
-                    ok = false;
-                    break;
-                }
-                parent = up;
-            }
-            if ok {
-                found.push(r);
-            }
-        }
-        found
+        find_by_path(self, name_or_path)
     }
 
     fn display_name(&self, node: &NodeRef) -> String {
-        let Some((title, mut parent)) = self.title(node) else { return "That note".to_string() };
-        let mut path = title.clone();
-        // The shortest path from an ancestor that names this node alone.
-        for _ in 0..8 {
-            if self.find_nodes(&path).len() <= 1 {
-                break;
-            }
-            let Some(p) = parent else { break };
-            let Some((t, up)) = self.title(&node_ref(node.store, p)) else { break };
-            path = format!("{t}/{path}");
-            parent = up;
-        }
-        path
+        shortest_path(self, node)
     }
 
     fn today(&self) -> f64 {
@@ -1991,75 +1917,29 @@ pub(crate) fn apply_column(store: AppStore, pane: PaneId) {
     if table.columns.iter().any(|c| Some(&c.id) != form.col.as_ref() && c.name.eq_ignore_ascii_case(&name)) {
         return form_error(store, pane, format!("{} already has a column called \"{name}\".", table.name));
     }
-    let ty = match form.kind.as_str() {
-        "number" => ColumnType::Number,
-        "money" => ColumnType::Money,
-        "date" => ColumnType::Date,
-        "hours" => ColumnType::Hours,
-        "row_link" => {
-            if form.target.is_empty() {
-                return form_error(store, pane, "Pick a table to link to.");
-            }
-            ColumnType::RowLink { table: form.target.clone() }
-        }
-        "node_link" => {
-            let under = form.under.trim().trim_matches('\'');
-            if under.is_empty() {
-                ColumnType::NodeLink { under: None }
-            } else {
-                let Some(book) = book_for(store, pane) else { return };
-                match book.find_nodes(under).as_slice() {
-                    [one] => ColumnType::NodeLink { under: Some(*one) },
-                    [] => return form_error(store, pane, format!("No node here is called {under}.")),
-                    many => {
-                        let paths: Vec<String> = many.iter().map(|n| book.display_name(n)).collect();
-                        return form_error(store, pane, format!("Several nodes are called {under}: {}. Write the one you mean as its path.", paths.join(", ")));
-                    }
-                }
-            }
-        }
-        "formula" => {
-            let shown = form.formula.trim();
-            if shown.trim_start_matches('=').trim().is_empty() {
-                return form_error(store, pane, "Write the formula, starting with =.");
-            }
-            let Some(book) = book_for(store, pane) else { return };
-            match formula::to_stored(&book, Some(&form.table), shown) {
-                Ok(stored) => ColumnType::Formula { formula: stored, format: Format::parse(&form.format) },
-                Err(e) => return form_error(store, pane, e.message),
-            }
-        }
-        _ => ColumnType::Text,
+    let Some(book) = book_for(store, pane) else { return };
+    let spec = pimble_sheet::ops::ColumnSpec {
+        kind: Some(form.kind.as_str()),
+        target: Some(form.target.as_str()),
+        under: Some(form.under.as_str()),
+        formula: Some(form.formula.as_str()),
+        format: Some(form.format.as_str()),
+    };
+    let ty = match pimble_sheet::ops::column_type(&book, &snap, Some(&form.table), &spec, None, &|e| e.message.clone()) {
+        Ok(ty) => ty,
+        Err(sentence) => return form_error(store, pane, sentence),
     };
     let done = match &form.col {
         None => local_edit(store, pane, |t| t.add_column(&form.table, &name, ty, Placement::Last).map(|_| ())),
         Some(col) => {
-            let old = table.column(col).cloned();
-            // Carry each row's value over as the text that would have been
-            // typed (formula columns: their computed values).
-            let carried: Vec<(String, Option<Stored>)> = match &old {
-                Some(old) if old.ty != ty && !matches!(ty, ColumnType::Formula { .. }) => {
-                    carry_over(store, pane, table, old, &ty)
-                }
-                _ => Vec::new(),
+            let Some(old) = table.column(col).cloned() else {
+                ui.column_form.set(None);
+                return;
             };
-            local_edit(store, pane, |t| {
-                if old.as_ref().is_some_and(|o| o.name != name) {
-                    t.rename_column(&form.table, col, &name)?;
-                }
-                if old.as_ref().is_some_and(|o| o.ty != ty) {
-                    t.set_column_type(&form.table, col, ty.clone())?;
-                    if matches!(ty, ColumnType::Formula { .. }) {
-                        for r in &table.rows {
-                            t.set_cell(&form.table, &r.id, col, None)?;
-                        }
-                    }
-                    for (row, value) in &carried {
-                        t.set_cell(&form.table, row, col, value.as_ref())?;
-                    }
-                }
-                Ok(())
-            })
+            let carried = if pimble_sheet::ops::carries_over(&old.ty, &ty) { carry_over(store, pane, table, &old, &ty) } else { Vec::new() };
+            let rename = (old.name != name).then_some(name.as_str());
+            let retyped = (old.ty != ty).then_some(&ty);
+            local_edit(store, pane, |t| pimble_sheet::ops::change_column(t, table, col, rename, retyped, &carried))
         }
     };
     if done.is_some() {
@@ -2067,31 +1947,20 @@ pub(crate) fn apply_column(store: AppStore, pane: PaneId) {
     }
 }
 
+/// Each row's value carried over to a new type (`pimble_sheet::ops::carry_over`):
+/// computed values as this pane shows them, and links by the labels its
+/// picker offers.
 fn carry_over(store: AppStore, pane: PaneId, table: &pimble_sheet::TableSnap, old: &pimble_sheet::ColumnSnap, ty: &ColumnType) -> Vec<(String, Option<Stored>)> {
     let shown = untracked(|| store.pane(pane).sheet_ui.tables.get());
     let view = shown.iter().find(|t| t.id == table.id);
     let ci = view.and_then(|v| v.columns.iter().position(|c| c.key == old.id));
-    let choices = link_choices(store, pane, ty);
-    table
-        .rows
-        .iter()
-        .map(|r| {
-            let text = match (&old.ty, r.cells.get(&old.id)) {
-                (ColumnType::Formula { .. }, _) | (ColumnType::RowLink { .. } | ColumnType::NodeLink { .. }, Some(_)) => view
-                    .and_then(|v| v.rows.iter().find(|x| x.id == r.id))
-                    .and_then(|x| ci.and_then(|i| x.cells.get(i)))
-                    .filter(|c| c.error.is_none())
-                    .map(|c| c.text.replace(['$', ','], ""))
-                    .unwrap_or_default(),
-                (_, Some(stored)) => input::edit_text(stored, &old.ty, &|_| String::new()),
-                (_, None) => String::new(),
-            };
-            let value = input::parse_input(ty, &text, today(), &|label: &str| {
-                choices.iter().find(|(l, _)| l.eq_ignore_ascii_case(label.trim())).map(|(_, v)| v.clone())
-            });
-            (r.id.clone(), value)
-        })
-        .collect()
+    let text_of = |row: &str| {
+        view.and_then(|v| v.rows.iter().find(|x| x.id == row))
+            .and_then(|x| ci.and_then(|i| x.cells.get(i)))
+            .filter(|c| c.error.is_none())
+            .map(|c| c.text.clone())
+    };
+    pimble_sheet::ops::carry_over(table, old, ty, &text_of, &link_choices(store, pane, ty), today())
 }
 
 pub(crate) fn delete_column(store: AppStore, pane: PaneId) {

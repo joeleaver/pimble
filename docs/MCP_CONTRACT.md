@@ -304,10 +304,13 @@ that have it. A change of only note and fields is allowed on a locked element. T
 instructions tell an assistant to read meaning before guessing and to write it when what it
 draws does not say what it is.
 
-What the app's tools refuse a person these refuse an agent: an element that is locked takes
-only a change that unlocks it (in the same change), an element on a locked layer takes none,
-nothing is added to a locked layer, and with every layer locked a new element has nowhere to
-go. Search already indexes canvas text, so `search` finds sticky notes and labels.
+What the app's tools refuse a person these refuse an agent, judged by `pimble_board`
+(`BoardTxn`, docs/API_CONTRACT.md wave 1): an element that is locked takes only a change of
+its note and fields or one that unlocks it (in the same change), an element on a locked layer
+takes nothing but note and fields, nothing is added to a locked layer, a locked layer is
+neither deleted nor merged down, and with every layer locked a new element has nowhere to go.
+`delete_elements` deletes what it can and keeps the locked ones, and its answer names them
+(open decision 5). Search already indexes canvas text, so `search` finds sticky notes and labels.
 
 Not built: cropping a picture and its spotlight/crop tools beyond what `add_elements` writes
 (`crop` is not settable), "Convert to Node" and "Flatten into New Canvas", SVG export

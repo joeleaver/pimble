@@ -5076,6 +5076,7 @@ dependencies = [
  "base64 0.22.1",
  "jsonrpsee",
  "pimble-core",
+ "pimble-crdt",
  "pimble-crypto",
  "serde",
  "serde_json",

@@ -601,7 +601,7 @@ pub enum Placement {
 pub struct NewElement {
     pub kind: Kind,
     pub geom: Geom,
-    /// `None`: the top layer by order.
+    /// `None`: the top layer that is not locked.
     pub layer: Option<String>,
     /// `None`: on top of its layer.
     pub placement: Option<Placement>,

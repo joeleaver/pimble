@@ -495,23 +495,11 @@ impl LocalStore {
         })
     }
 
-    /// The scope roots on `id`'s stored parent chain, itself included,
-    /// through held documents (tombstones too: a deleted document stays
-    /// with its scope). Bounded, so an unrepaired cycle cannot loop.
+    /// The scope roots on `id`'s stored parent chain, itself included
+    /// (`Tree::roots_above`: through held documents, tombstones too, and an
+    /// attachment is where its host is).
     fn scope_roots_above(&self, id: NodeId) -> Vec<NodeId> {
-        let mut reached = Vec::new();
-        let mut cur = id;
-        for _ in 0..=self.tree.ids().len() {
-            if self.manifest.scope_roots.contains(&cur) {
-                reached.push(cur);
-            }
-            // An attachment is where its host is.
-            match self.tree.doc(cur).and_then(|d| d.fields().ok()).and_then(|f| f.parent_id.or(f.attached_to)) {
-                Some(parent) if self.tree.doc(parent).is_some() => cur = parent,
-                _ => break,
-            }
-        }
-        reached
+        self.tree.roots_above(&self.manifest.scope_roots, id)
     }
 
     /// A partial replica's scope roots (empty for a whole store).
@@ -570,7 +558,7 @@ impl LocalStore {
     /// The documents a partial replica's lists name and it does not hold
     /// (yet): on their way, or not in the published scope yet. What its
     /// link asks the remote for again, and what keeps a scope from being
-    /// repaired meanwhile (see [`LocalStore::repair_scopes`]). Empty for a
+    /// repaired meanwhile (see `Tree::repair_held`). Empty for a
     /// whole store, where a list entry with no document is simply missing.
     pub fn awaited_docs(&self) -> Vec<NodeId> {
         if !self.is_partial() {
@@ -829,41 +817,21 @@ impl LocalStore {
         let manifest_json = serde_json::to_string_pretty(&self.manifest)?;
         atomic_write(&self.path.join(Self::MANIFEST_FILE), manifest_json).await?;
 
-        // `Tree` fixes its root at construction; re-rooting is rebuilding it
-        // over the same documents.
-        let ids = self.tree.ids();
-        let mut docs = HashMap::with_capacity(ids.len());
-        for id in ids {
-            if let Some(doc) = self.tree.take_doc(id) {
-                docs.insert(id, doc);
-            }
-        }
-        self.tree = Tree::from_docs(root_node_id, docs);
+        self.tree.reroot(root_node_id);
         Ok(())
     }
 
-    /// The root the documents say the store has: the manifest's root when
-    /// it is a node with no `parent_id`; otherwise the one node with no
-    /// `parent_id`, when there is exactly one; otherwise `None` (no root
-    /// has arrived yet, or several nodes claim to be it, which only a
-    /// repair from a known root settles). What `set_root_node_id`'s callers
-    /// compare the manifest against. A partial replica's root is its first
-    /// scope root, a node with a parent this replica never holds: nothing
-    /// to adopt, ever.
+    /// The root the documents say the store has (`Tree::document_root`,
+    /// from the manifest's root): what `set_root_node_id`'s callers compare
+    /// the manifest against. `None` when no root has arrived yet or several
+    /// nodes claim to be it. A partial replica's root is its first scope
+    /// root, a node with a parent this replica never holds: nothing to
+    /// adopt, ever.
     pub fn document_root(&self) -> Option<NodeId> {
         if self.is_partial() {
             return None;
         }
-        let is_root_like = |id: NodeId| self.tree.get_node_info(id).is_ok_and(|info| info.parent_id.is_none());
-        let manifest_root = self.manifest.root_node_id;
-        if is_root_like(manifest_root) {
-            return Some(manifest_root);
-        }
-        let mut candidates = self.tree.list_node_ids().into_iter().filter(|&id| is_root_like(id));
-        match (candidates.next(), candidates.next()) {
-            (Some(only), None) => Some(only),
-            _ => None,
-        }
+        self.tree.document_root(self.manifest.root_node_id)
     }
 
     // ── Documents ────────────────────────────────────────────────────────
@@ -943,46 +911,21 @@ impl LocalStore {
 
     // ── Nodes ────────────────────────────────────────────────────────────
 
-    /// Assemble a Node from the tree's view of `node_id` and its document's
-    /// bytes (`NodeFields::into_node`, the one mapping of stored fields to a
-    /// node, here and in `pimble-web`'s vault client). The content is the
-    /// whole node document (the editor joins it as it joined a content
-    /// document; Pimble's roots ride along). `access` stays `Full`: a
-    /// judgement the server that answers makes per caller, from
-    /// `write_refused` and the caller's role, never a property of the
-    /// stored node.
-    fn assemble_node(&self, node_id: NodeId) -> Result<Node> {
-        let fields = self.tree.live_fields(node_id).map_err(|_| StoreError::NodeNotFound(node_id))?;
-        let children = self.tree.get_children(node_id).map_err(|_| StoreError::NodeNotFound(node_id))?;
-        let content = self.tree.doc(node_id).map(NodeDoc::save).unwrap_or_default();
-        let mut node = fields.into_node(node_id);
-        node.content = content;
-        node.children = children;
-        Ok(node)
-    }
-
-    /// Get a node by ID. `NodeNotFound` for an id with no document, a
-    /// tombstone, or a document whose `node` root has not arrived yet.
+    /// Get a node by ID (`Tree::node`: its fields, its children and its
+    /// whole document as the content, `access` left `Full` for the server
+    /// that answers to judge per caller). `NodeNotFound` for an id with no
+    /// document, a tombstone, or a document whose `node` root has not
+    /// arrived yet.
     pub fn get_node(&self, node_id: NodeId) -> Result<Node> {
-        self.assemble_node(node_id)
+        self.tree.node(node_id).map_err(|_| StoreError::NodeNotFound(node_id))
     }
 
-    /// [`LocalStore::get_node`] without requiring the node to be live: for
-    /// "Recently Deleted..." (docs/MOVE_CONTRACT.md "Seeing and undoing what
-    /// was removed"), which needs a tombstone's fields (and a live node's,
-    /// for the ones no held list names) even though
-    /// `Tree::get_node_info`/`Tree::get_children` refuse anything not live.
-    /// `NodeNotFound` only for an id with no document at all, or whose
-    /// `node` root has not arrived. Content and children are left empty on
-    /// purpose: the list shows a name and a place to put it back, not the
-    /// note itself, the same choice `pimble-web`'s
-    /// `VaultStore::node_of_any` makes on the encrypted side. Something
-    /// that wants the note back reads it with `get_node` after
-    /// `undelete_node`, not from here.
+    /// [`LocalStore::get_node`] without requiring the node to be live, for
+    /// "Recently Deleted..." (`Tree::node_any`: fields only, content and
+    /// children empty). `NodeNotFound` only for an id with no document at
+    /// all, or whose `node` root has not arrived.
     pub fn get_node_any(&self, node_id: NodeId) -> Result<Node> {
-        let doc = self.tree.doc(node_id).ok_or(StoreError::NodeNotFound(node_id))?;
-        let fields = doc.fields().map_err(|_| StoreError::NodeNotFound(node_id))?;
-        Ok(fields.into_node(node_id))
+        self.tree.node_any(node_id).ok_or(StoreError::NodeNotFound(node_id))
     }
 
     /// Create a node under `parent_id` (the root when `None`), returning its
@@ -1105,26 +1048,11 @@ impl LocalStore {
     /// before the edit — a transplant strips every marker as it recreates
     /// the subtree, so the shares must be named from the tree as it was.
     pub fn move_node(&mut self, node_id: NodeId, new_parent_id: NodeId, place: Place) -> Result<(NodeId, Vec<LeftShare>, TreeEdit)> {
-        if node_id == self.root_node_id() {
-            return Err(StoreError::InvalidOperation("Cannot move the root node".into()));
-        }
-        if node_id == new_parent_id {
-            return Err(StoreError::InvalidOperation("Cannot move node into itself".into()));
-        }
-        if !self.tree.has_node(node_id) {
-            return Err(StoreError::NodeNotFound(node_id));
-        }
-        if !self.tree.has_node(new_parent_id) {
-            return Err(StoreError::NodeNotFound(new_parent_id));
-        }
-        // A move under one's own descendant: `Tree::move_or_transplant`
-        // refuses it too, but as a crdt error; here it is the invalid
-        // operation it is.
-        if self.tree.subtree_ids(node_id).map_err(StoreError::from)?.contains(&new_parent_id) {
-            return Err(StoreError::InvalidOperation(
-                "Cannot move a node into one of its own descendants".into(),
-            ));
-        }
+        // Not the root, not into itself, both live, not under one of its own
+        // descendants (`Tree::move_or_transplant` refuses that last one too,
+        // but as a crdt error; here it is the invalid operation it is). The
+        // same checks the browser's vault client makes.
+        self.tree.check_move(node_id, new_parent_id)?;
 
         let left_shares = self.left_shares(node_id, new_parent_id);
         let (new_id, edit) = self
@@ -1236,111 +1164,17 @@ impl LocalStore {
     /// repair usually finds nothing to fix, and that must never force a
     /// flush. `None` when nothing needed fixing.
     ///
-    /// A partial replica is repaired one scope at a time (see
-    /// [`LocalStore::repair_scopes`]): each scope is a tree of its own, whose
-    /// root's parent is by design never held. `Tree::repair` itself never
-    /// reads "not held" as "missing" (since 2026-09-21: that was false of a
-    /// whole store too, whenever a document was still on its way or its key
-    /// was), so what the scope pass adds is the rooting, not the caution.
+    /// A partial replica is repaired one scope at a time
+    /// (`Tree::repair_held`, the browser's vault client's repair too): each
+    /// scope is a tree of its own, whose root's parent is by design never
+    /// held, and a scope that lists a document not held yet is not judged
+    /// yet.
     pub fn repair_tree(&mut self) -> Result<Option<TreeEdit>> {
-        if self.is_partial() {
-            return self.repair_scopes();
-        }
-        let edit = self.tree.repair(&now()).map_err(StoreError::from)?;
+        let edit = self.tree.repair_held(&self.manifest.scope_roots, &now()).map_err(StoreError::from)?;
         if let Some(edit) = &edit {
             self.mark_edit_dirty(edit);
         }
         Ok(edit)
-    }
-
-    /// Repair a partial replica (docs/NODE_DOCUMENT_CONTRACT.md section 5).
-    /// Every repair is an edit that travels to the owner and to every other
-    /// member, so it must be one a device holding the whole store would
-    /// make too; two devices that disagree about a fix undo each other's
-    /// for ever. Three things keep it so, all in this layer, each scope
-    /// being handed to `Tree::repair` as the honest tree it is (rooted at
-    /// its scope root, holding exactly the documents that lead to it):
-    ///
-    /// - **A scope root is a root.** Its `parent_id` names a document this
-    ///   replica never holds, which is no orphan here, and as the root of
-    ///   its own tree it is never re-parented nor listed. A scope root held
-    ///   under another (overlapping shares) is an ordinary node of that
-    ///   one's tree.
-    /// - **A document that leads to no scope root is left alone**: moved
-    ///   out of the share by its owner, or not yet under it. A whole store
-    ///   knows where it belongs; adopting it here would move it back.
-    /// - **A scope whose lists name a document not held yet is not judged
-    ///   yet.** The entry is a document on its way (created by someone
-    ///   else a moment ago, or not in the published scope yet), and
-    ///   removing it would delete a child from the owner's folder. The
-    ///   scope is repaired once the document is here, or by any device
-    ///   that holds the whole store.
-    fn repair_scopes(&mut self) -> Result<Option<TreeEdit>> {
-        let scope_roots: HashSet<NodeId> = self.manifest.scope_roots.iter().copied().collect();
-        let stored_parent = |tree: &Tree, id: NodeId| tree.doc(id).and_then(|d| d.fields().ok()).and_then(|f| f.parent_id);
-
-        // Which scope's tree a document belongs to: the last scope root on
-        // its stored parent chain through held documents (tombstones
-        // included: a deleted document stays with its scope). Bounded, so
-        // an unrepaired cycle cannot loop.
-        let ids = self.tree.ids();
-        let bound = ids.len();
-        let mut groups: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
-        for &id in &ids {
-            let mut cur = id;
-            let mut top = None;
-            for _ in 0..=bound {
-                if scope_roots.contains(&cur) {
-                    top = Some(cur);
-                }
-                match stored_parent(&self.tree, cur) {
-                    Some(parent) if self.tree.doc(parent).is_some() => cur = parent,
-                    _ => break,
-                }
-            }
-            if let Some(top) = top {
-                groups.entry(top).or_default().push(id);
-            }
-        }
-
-        let now = now();
-        let mut edit = TreeEdit::default();
-        let mut tops: Vec<NodeId> = groups.keys().copied().collect();
-        tops.sort_by_key(|id| id.to_string());
-        for top in tops {
-            let group = &groups[&top];
-            // Only a node's list is repaired (a tombstone keeps its own for
-            // an undelete), so only a node's list can ask for a removal.
-            let awaited = group.iter().filter(|id| self.tree.has_node(**id)).filter_map(|id| self.tree.doc(*id)).any(|doc| {
-                doc.children().into_iter().any(|child| !self.tree.doc(child).is_some_and(|held| held.fields().is_ok()))
-            });
-            if awaited {
-                debug!("Store {}: scope {} lists a document not held yet; not repairing it now", self.id, top);
-                continue;
-            }
-
-            let mut docs = HashMap::with_capacity(group.len());
-            for id in group {
-                if let Some(doc) = self.tree.take_doc(*id) {
-                    docs.insert(*id, doc);
-                }
-            }
-            let mut scope_tree = Tree::from_docs(top, docs);
-            let repaired = scope_tree.repair(&now).map_err(StoreError::from);
-            for id in group {
-                if let Some(doc) = scope_tree.take_doc(*id) {
-                    self.tree.insert_doc(*id, doc);
-                }
-            }
-            if let Some(scope_edit) = repaired? {
-                extend(&mut edit, scope_edit);
-            }
-        }
-        if edit.is_empty() {
-            return Ok(None);
-        }
-        self.mark_edit_dirty(&edit);
-        Ok(Some(edit))
     }
 
     /// Flush all changes to disk: each dirty document's snapshot, written

@@ -1481,7 +1481,7 @@ fn convert(store: AppStore, pane: PaneId, hover: &PictureHover) {
     };
     let fallback = if blob.is_some() { "Picture" } else { "Canvas" };
     let title = if hover.alt.trim().is_empty() { fallback.to_string() } else { hover.alt.clone() };
-    let icon = if blob.is_some() { crate::boards::PHOTO_ICON } else { crate::boards::WHITEBOARD_ICON };
+    let icon = pimble_board::recipe::canvas_icon(blob.is_some());
     let request = NEXT_REQUEST.with(|n| n.replace(n.get() + 1));
     CONVERTS.with(|c| {
         c.borrow_mut().insert(

@@ -23,3 +23,14 @@ pub use rinch_web::{
     create_editor, set_image_source, Editor, EditorHandle, EditorKey, ImageHover, ImageInputSource, LinkClick, LinkHover, MarginAnchor, MarginLine, NodeViewCtx,
     NodeViewRegistration, NodeViewSpec, ScrollAlign, SelectionAnchor,
 };
+
+/// An embed atom's attributes for the editor (`pimble_crdt::markdown::Embed`
+/// says what each one carries).
+pub fn embed_attrs(embed: &pimble_crdt::markdown::Embed) -> rinch_editor_core::Attrs {
+    embed.attrs().into_iter().fold(rinch_editor_core::Attrs::new(), |a, (k, v)| a.with(k, v.as_str()))
+}
+
+/// What an embed atom in the editor shows, if it is one of Pimble's.
+pub fn embed_of(attrs: &rinch_editor_core::Attrs) -> Option<pimble_crdt::markdown::Embed> {
+    pimble_crdt::markdown::Embed::from_attrs(|name| attrs.get_str(name))
+}

@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 use pimble_board::{
     smooth_stroke, Align, ArrowHeads, Author, Board, BoardSnapshot, BoardTxn, BoardView, BoardWatch, CardLabel, Color, Dash,
-    Geom, Kind, NewElement, Picture, PictureGeom, Placement, Point, Rect, Stamp, Style, Transform, ViewOptions,
+    Geom, Kind, NewElement, Picture, PictureGeom, Placement, Point, Rect, Stamp, StartingPicture, Style, Transform, ViewOptions,
 };
 use pimble_core::{node_types, BlobUrl, NodeId, StoreId};
 use pimble_crdt::NodeDoc;
@@ -414,12 +414,6 @@ impl Default for PaneUi {
     }
 }
 
-/// The icon a board node made from a picture starts with (the node's ordinary
-/// custom icon, so the person can change it).
-pub const PHOTO_ICON: &str = "photo";
-/// The icon a new whiteboard starts with.
-pub const WHITEBOARD_ICON: &str = "chalkboard";
-
 /// How long after the last wheel step the cache is re-rendered at the new zoom.
 const SETTLE_MS: u32 = 150;
 /// How often a stroke being drawn is appended to the document (contract
@@ -434,8 +428,8 @@ const REQUEST_BASE: u64 = 1 << 40;
 /// "New Canvas from Picture..." on a store that refuses pictures, or with nothing picked.
 const NOT_A_PICTURE: &str = "That file is not a picture Pimble can show.";
 /// A tool refused on a locked layer or element (a guard against accidents,
-/// contract section 5, not a permission).
-const LOCKED: &str = "That is locked. Unlock it in the layers panel or with Arrange > Unlock.";
+/// contract section 5, not a permission): `pimble-board`'s sentence.
+const LOCKED: &str = pimble_board::locks::ELEMENT_LOCKED;
 
 // ── Who is drawing ──────────────────────────────────────────────────────────
 
@@ -705,11 +699,9 @@ impl Session {
     }
 
     /// Whether element `id` may be changed by the tools: neither it nor its
-    /// layer is locked (contract section 5).
+    /// layer is locked (contract section 5, judged by `pimble-board`).
     fn editable(&self, id: &str) -> bool {
-        let snapshot = self.snapshot();
-        let Some(e) = snapshot.get(id) else { return false };
-        !e.raw.locked && !snapshot.layer(&e.layer).is_some_and(|l| l.locked)
+        self.snapshot().editable(id)
     }
 }
 
@@ -1193,6 +1185,12 @@ fn local_edit<R>(store: AppStore, pane: PaneId, f: impl FnOnce(&mut BoardTxn<'_,
     after_change(store, pane);
     match result {
         Ok(r) => Some(r),
+        // The tools check locks before they write; a lock that arrived from
+        // someone else in between is said the way the board says it.
+        Err(e) if e.is_lock() => {
+            crate::events::show_notice(store, e.to_string());
+            None
+        }
         Err(e) => {
             tracing::info!("a board edit was refused: {e}");
             None
@@ -1236,7 +1234,7 @@ pub(crate) fn publish_meaning(pane: PaneId, ui: PaneUi) {
         }
         let layer = match &picked {
             Some(id) => snapshot.layer(id),
-            None => snapshot.layers.iter().rev().find(|l| !l.locked),
+            None => snapshot.layer_for_new(None).ok(),
         }?;
         Some(MeaningView {
             target: MeaningTarget::Layer(layer.id.clone()),
@@ -1369,7 +1367,7 @@ fn after_change(store: AppStore, pane: PaneId) {
         // An image's picture is in a locked layer of its own; pictures put on
         // a whiteboard are not.
         let snapshot = s.snapshot();
-        Some(snapshot.elements.iter().any(|e| e.raw.kind.is_picture() && snapshot.layer(&e.layer).is_some_and(|l| l.locked)))
+        Some(snapshot.elements.iter().any(|e| e.raw.kind.is_picture() && snapshot.in_locked_layer(e)))
     })
     .flatten();
     if let Some(picture) = opening {
@@ -1813,22 +1811,14 @@ pub(crate) fn new_board(picture: Option<(&BlobUrl, u32, u32)>) -> Option<Vec<u8>
     build_board(&Board::standalone(), author().as_ref(), picture)
 }
 
-/// Make `board`, empty or starting from a picture: the picture at one unit per
-/// pixel in a locked layer "Picture" of its own and "Layer 1" above it to draw
-/// in. Every canvas starts this way, as a node or in text
-/// (docs/CANVAS_CONTRACT.md). Answers the update that made it.
+/// Make `board`, empty or starting from a picture, the way every canvas
+/// starts (`BoardTxn::start_canvas`, docs/CANVAS_CONTRACT.md). Answers the
+/// update that made it.
 pub(crate) fn build_board(board: &Board, author: Option<&Author>, picture: Option<(&BlobUrl, u32, u32)>) -> Option<Vec<u8>> {
     let now = now_stamp();
-    let edited = board.edit(Stamp::new(author, &now), |t| {
-        t.create()?;
-        if let Some((url, w, h)) = picture {
-            let layer = t.add_layer("Picture", Placement::Bottom)?;
-            let geom = PictureGeom { rect: Rect::new(0.0, 0.0, w as f32, h as f32), src: url.to_string(), px_w: w, px_h: h, crop: None };
-            t.add_element(NewElement::new(Kind::Picture, Geom::Picture(geom)).in_layer(layer.clone()))?;
-            t.set_layer_locked(&layer, true)?;
-        }
-        Ok(())
-    });
+    let src = picture.map(|(url, _, _)| url.to_string());
+    let start = picture.zip(src.as_deref()).map(|((_, px_w, px_h), src)| StartingPicture { src, px_w, px_h });
+    let edited = board.edit(Stamp::new(author, &now), |t| t.start_canvas(start).map(|_| ()));
     match edited.result {
         Ok(()) => edited.update,
         Err(e) => {
@@ -1861,7 +1851,7 @@ pub(crate) fn create_board_node(store: AppStore, store_id: StoreId, parent_id: N
 /// A row's "New Canvas": an empty board under `parent_id`.
 pub(crate) fn new_whiteboard(store: AppStore, store_id: StoreId, parent_id: NodeId) {
     if let Some(board) = new_board(None) {
-        create_board_node(store, store_id, parent_id, "Canvas", WHITEBOARD_ICON, board, None);
+        create_board_node(store, store_id, parent_id, "Canvas", pimble_board::recipe::CANVAS_ICON, board, None);
     }
 }
 
@@ -2014,7 +2004,7 @@ pub(crate) fn stored(store: AppStore, request_id: u64, result: &Result<StoredBlo
         None => {
             if let Some((url, w, h)) = size {
                 if let Some(board) = new_board(Some((&url, w, h))) {
-                    create_board_node(store, store_id, parent_id, &title, PHOTO_ICON, board, None);
+                    create_board_node(store, store_id, parent_id, &title, pimble_board::recipe::PICTURE_CANVAS_ICON, board, None);
                 }
             }
         }

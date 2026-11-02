@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use pimble_client::PimbleClient;
 use pimble_core::{custom_keys, node_types, Node};
+use pimble_crdt::markdown::{embed_attrs, Embed};
 use pimble_crdt::NodeDoc;
 use pimble_discussion::{Author, Body, Discussion, DiscussionSnapshot, Stamp};
 use rmcp::handler::server::wrapper::Parameters;
@@ -137,24 +138,13 @@ fn summary(addr: Addr, node: &Node) -> String {
     line
 }
 
-/// The discussion a Markdown line's embed atom shows, if the line is one.
-fn inline_discussion(line: &str) -> Option<pimble_core::PimbleUrl> {
-    let line = line.trim();
-    if !line.starts_with("<div") || !line.contains("data-pm-type=\"embed\"") || !line.contains("data-kind=\"discussion\"") {
-        return None;
-    }
-    let (_, rest) = line.split_once("data-node=\"")?;
-    let (url, _) = rest.split_once('"')?;
-    pimble_core::PimbleUrl::parse(url)
-}
-
 impl Pimble {
     /// `markdown` with each discussion shown inline replaced by a line
     /// naming it (get_node; read_discussion reads it).
     pub(super) async fn inline_discussions(&self, client: &PimbleClient, markdown: &str) -> String {
         let mut out = String::new();
         for line in markdown.split_inclusive('\n') {
-            let Some(url) = inline_discussion(line) else {
+            let Some(url) = Embed::from_markdown_line(line).and_then(|e| e.node_of_kind(embed_attrs::KIND_DISCUSSION).cloned()) else {
                 out.push_str(line);
                 continue;
             };
@@ -337,10 +327,8 @@ impl Pimble {
                 let addr = Addr { store: host.store, node: node_id };
                 let mut answer = format!("Started the discussion {} on {}", addr.link(), self.describe(&client, &stores, host).await);
                 if p.inline {
-                    let title = topic.replace('"', "&quot;");
-                    // Exactly as rinch writes an embed (its attributes in order),
-                    // which is all the strict Markdown reader takes as one.
-                    let atom = format!("<div data-pm-type=\"embed\" data-kind=\"discussion\" data-node=\"{}\" data-title=\"{title}\"></div>\n", addr.link());
+                    let url = pimble_core::PimbleUrl::node(addr.store, addr.node);
+                    let atom = Embed::discussion(url, Some(topic.clone())).to_markdown();
                     let quote = p.after_text.clone();
                     let shown = self
                         .edit(&client, host, move |doc| {

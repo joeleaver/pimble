@@ -536,30 +536,20 @@ fn host_row(__scope: &mut RenderScope, store: AppStore, pane: PaneId, row: Discu
 
 // ── Discussions in text (contract section 6, wave 2) ────────────────────
 
-/// The embed attributes naming a discussion shown inline: the node as a
-/// `pimble:` link (any reader of the content counts it as a link to it),
-/// its kind, which says this view draws it, and its topic when it was put
-/// there (shown until the node arrives).
-pub(crate) const NODE_ATTR: &str = "data-node";
-pub(crate) const KIND_ATTR: &str = "data-kind";
-pub(crate) const KIND_DISCUSSION: &str = "discussion";
-pub(crate) const TITLE_ATTR: &str = "data-title";
-
-/// The discussion an embed's attributes name, if they name one.
+/// The discussion an embed's attributes name, if they name one (the node as
+/// a `pimble:` link, which any reader of the content counts as a link to it,
+/// and its kind, which says this view draws it).
 pub(crate) fn embedded_discussion(attrs: &rinch_editor_core::Attrs) -> Option<(StoreId, NodeId)> {
-    if attrs.get_str(KIND_ATTR) != Some(KIND_DISCUSSION) {
-        return None;
-    }
-    let url = pimble_core::PimbleUrl::parse(attrs.get_str(NODE_ATTR)?)?;
+    let embed = crate::rinch_editor::embed_of(attrs)?;
+    let url = embed.node_of_kind(pimble_crdt::markdown::embed_attrs::KIND_DISCUSSION)?;
     Some((url.store, url.node))
 }
 
-/// The attributes of an inline discussion of node `(store_id, node_id)`.
+/// The attributes of an inline discussion of node `(store_id, node_id)`, with
+/// its topic when it was put there (shown until the node arrives).
 pub(crate) fn embed_attrs(store: AppStore, store_id: StoreId, node_id: NodeId) -> rinch_editor_core::Attrs {
-    rinch_editor_core::Attrs::new()
-        .with(NODE_ATTR, pimble_core::PimbleUrl::node(store_id, node_id).to_string())
-        .with(KIND_ATTR, KIND_DISCUSSION)
-        .with(TITLE_ATTR, store.display_label(store_id, node_id))
+    let url = pimble_core::PimbleUrl::node(store_id, node_id);
+    crate::rinch_editor::embed_attrs(&pimble_crdt::markdown::Embed::discussion(url, Some(store.display_label(store_id, node_id))))
 }
 
 thread_local! {

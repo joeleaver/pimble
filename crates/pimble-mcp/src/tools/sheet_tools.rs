@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use pimble_client::PimbleClient;
 use pimble_core::{custom_keys, node_types, Node, Store};
+use pimble_crdt::markdown::{embed_attrs, Embed};
 use pimble_crdt::NodeDoc;
 use pimble_sheet::doc::Sheets;
 use pimble_sheet::{ColumnType, NodeRef};
@@ -22,9 +23,6 @@ use crate::sheets::book::{reads_table, McpBook};
 use crate::sheets::load::{load_book, node_ref, sheets_of};
 use crate::sheets::ops::{self, ColumnSpec, Filter, RowUpdate, RowValues, Work};
 use crate::sheets::{guide, ops::find_table};
-
-/// The icon a new sheet node gets, as the app's "New Sheet" gives it.
-const SHEET_ICON: &str = "table";
 
 /// How many rows get_node shows of each table.
 const NODE_ROWS: usize = 50;
@@ -428,7 +426,10 @@ impl Pimble {
         let mut shown = HashSet::new();
         let mut out = String::new();
         for line in markdown.split_inclusive('\n') {
-            match embedded_table(line) {
+            match Embed::from_markdown_line(line).and_then(|e| match e {
+                Embed::Table { id } => Some(id),
+                Embed::Node { .. } => None,
+            }) {
                 Some(id) if work.snap().table(&id).is_some() => {
                     out.push_str(&render(&id));
                     shown.insert(id);
@@ -447,7 +448,7 @@ impl Pimble {
     async fn embedded_sheet_nodes(&self, client: &PimbleClient, markdown: &str) -> String {
         let mut out = String::new();
         for line in markdown.split_inclusive('\n') {
-            let Some(url) = embedded_sheet_node(line) else {
+            let Some(url) = Embed::from_markdown_line(line).and_then(|e| e.node_of_kind(embed_attrs::KIND_SHEET).cloned()) else {
                 out.push_str(line);
                 continue;
             };
@@ -501,32 +502,9 @@ async fn walk_store(client: &PimbleClient, store: &Store) -> Vec<(Addr, Node, St
     out
 }
 
-/// The embed atom of table `id` as Markdown (rinch writes and reads it as
-/// its element).
+/// The embed atom of table `id` as Markdown.
 fn embed_markdown(id: &str) -> String {
-    format!("<div data-pm-type=\"embed\" {SHEET_ATTR}=\"{id}\"></div>\n")
-}
-
-/// The sheet node a Markdown line's embed atom shows, if the line is one.
-fn embedded_sheet_node(line: &str) -> Option<pimble_core::PimbleUrl> {
-    let line = line.trim();
-    if !line.starts_with("<div") || !line.contains("data-pm-type=\"embed\"") || !line.contains("data-kind=\"sheet\"") {
-        return None;
-    }
-    let (_, rest) = line.split_once("data-node=\"")?;
-    let (url, _) = rest.split_once('"')?;
-    pimble_core::PimbleUrl::parse(url)
-}
-
-/// The table a Markdown line's embed atom names, if the line is one.
-fn embedded_table(line: &str) -> Option<String> {
-    let line = line.trim();
-    if !line.starts_with("<div") || !line.contains("data-pm-type=\"embed\"") {
-        return None;
-    }
-    let (_, rest) = line.split_once("data-sheet=\"")?;
-    let (id, _) = rest.split_once('"')?;
-    Some(id.to_string())
+    Embed::Table { id: id.to_string() }.to_markdown()
 }
 
 fn place_of(node: &Node) -> &'static str {
@@ -671,7 +649,7 @@ impl Pimble {
         let home = NodeRef { store, node: pimble_core::NodeId::new() };
         let content = ops::new_sheet_content(&name, &p.columns, &p.rows, p.keep_as_typed, home, McpBook::local_today())?;
         let custom = HashMap::from([
-            (custom_keys::ICON.to_string(), serde_json::json!(SHEET_ICON)),
+            (custom_keys::ICON.to_string(), serde_json::json!(pimble_sheet::ops::SHEET_ICON)),
             (custom_keys::EXPLICIT_TITLE.to_string(), serde_json::json!(true)),
         ]);
         let node_id = client
@@ -998,7 +976,7 @@ impl Pimble {
                 id
             };
             // Nothing in the text names it: fine.
-            let _ = doc.remove_embeds(SHEET_ATTR, &id);
+            let _ = doc.remove_embeds(embed_attrs::SHEET, &id);
             Ok(())
         })
         .await?;
@@ -1041,7 +1019,7 @@ impl Pimble {
                     edited.result.map_err(|e| e.to_string())?;
                 }
                 if let Some(quote) = quote.as_deref() {
-                    let _ = doc.remove_embeds(SHEET_ATTR, &id);
+                    let _ = doc.remove_embeds(embed_attrs::SHEET, &id);
                     doc.insert_markdown_after(quote, false, &embed_markdown(&id)).map_err(|e| e.to_string())?;
                 }
                 Ok(())
@@ -1049,12 +1027,8 @@ impl Pimble {
             .await?;
             return Ok(format!("Moved {} within its node.", table.name));
         }
-        let tied = !table.row_links().is_empty() || snap.tables.iter().any(|o| o.id != table.id && o.row_links().contains(&table.id));
-        if tied {
-            return Err(format!(
-                "A link column ties {} to another table of its note, and a link reaches rows of its own note only, so it cannot move to another node.",
-                table.name
-            ));
+        if pimble_sheet::ops::tied(&snap, &table) {
+            return Err(pimble_sheet::ops::tied_sentence(&table.name));
         }
         let (from_ref, to_ref) = (node_ref(from), node_ref(to));
         let moved = table.map_formulas(|f| pimble_sheet::formula::rehome::moved_out(f, &table.id, &from_ref, Some(&to_ref)));
@@ -1072,7 +1046,7 @@ impl Pimble {
             let edited = sheets.edit(|t| {
                 for before in &here {
                     let after = before.map_formulas(|f| pimble_sheet::formula::rehome::arrived(f, &moved.id, &from_ref));
-                    write_formulas(t, before, &after)?;
+                    pimble_sheet::ops::write_formulas(t, before, &after)?;
                 }
                 t.copy_table(&moved)?;
                 if let Some(target) = target {
@@ -1100,12 +1074,12 @@ impl Pimble {
                     t.delete_table(&id)?;
                     for before in &rest {
                         let after = before.map_formulas(|f| pimble_sheet::formula::rehome::left_behind(f, &id, &to_ref));
-                        write_formulas(t, before, &after)?;
+                        pimble_sheet::ops::write_formulas(t, before, &after)?;
                     }
                     Ok(())
                 });
                 edited.result.map_err(|e| e.to_string())?;
-                let _ = doc.remove_embeds(SHEET_ATTR, &id);
+                let _ = doc.remove_embeds(embed_attrs::SHEET, &id);
                 Ok(())
             })
             .await;
@@ -1115,23 +1089,6 @@ impl Pimble {
         }
     }
 }
-
-/// Write the formulas and source of `after` where they differ from `before`
-/// (the same table, rewritten).
-fn write_formulas(t: &mut pimble_sheet::doc::SheetsTxn<'_, '_>, before: &pimble_sheet::TableSnap, after: &pimble_sheet::TableSnap) -> pimble_sheet::doc::Result<()> {
-    if after.source != before.source {
-        t.set_source(&after.id, after.source.as_deref())?;
-    }
-    for (old, new) in before.columns.iter().zip(&after.columns) {
-        if old.ty != new.ty {
-            t.set_column_type(&after.id, &new.id, new.ty.clone())?;
-        }
-    }
-    Ok(())
-}
-
-/// The embed attribute naming a table in a text node's text.
-const SHEET_ATTR: &str = "data-sheet";
 
 /// The tools against a real server on a scratch store, called as an LLM
 /// calls them.

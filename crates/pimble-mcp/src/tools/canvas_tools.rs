@@ -8,13 +8,15 @@
 //! theirs (contract section 6), and the agent shows on the canvas with what it
 //! just made selected (docs/PRESENCE_CONTRACT.md section 8).
 //!
-//! What the app's tools refuse a person these refuse an agent: a locked layer
-//! or element takes no edits until it is unlocked.
+//! What the app's tools refuse a person these refuse an agent: locks are
+//! `pimble_board`'s to judge (`BoardTxn` refuses what a lock guards), and
+//! [`said`] tells an agent which tool takes the lock off.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use base64::Engine;
+use pimble_board::recipe::{canvas_icon, StartingPicture, CARD_SIZE, PICTURE_LAYER_NAME, STICKY_SIZE};
 use pimble_board::{
     selection_bounds, Align, ArrowHeads, Author, Board, BoardError, BoardSnapshot, BoardTxn, CardLabel, Color, Dash, End,
     Geom, Kind, NewElement, Page, Picture, PictureGeom, Placement, Point, Rect, Side, Stamp, Style, StyleKey, Transform,
@@ -39,12 +41,6 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-/// The icons the app gives a new canvas: empty, and made from a picture.
-const CANVAS_ICON: &str = "chalkboard";
-const PHOTO_ICON: &str = "photo";
-/// The sizes the app's tools give a new sticky note and node card.
-const STICKY_SIZE: f32 = 200.0;
-const CARD_SIZE: (f32, f32) = (240.0, 56.0);
 /// How many elements get_canvas lists before it stops.
 const LIST_LIMIT: usize = 400;
 
@@ -521,6 +517,25 @@ fn bad(what: impl Into<String>) -> BoardError {
     BoardError::Invalid(what.into())
 }
 
+/// A refusal as an agent reads it. `pimble_board`'s sentences for locks
+/// point a person at the layers panel; an agent is pointed at the tool that
+/// takes the lock off.
+fn said(e: &BoardError) -> String {
+    match e {
+        BoardError::ElementLocked { id, layer: Some(layer) } => {
+            format!("element {id} is on the locked layer \"{}\"; update_layer can unlock it", layer.name)
+        }
+        BoardError::ElementLocked { id, layer: None } => {
+            format!("element {id} is locked; update_elements with \"locked\": false in the same change unlocks and edits it")
+        }
+        BoardError::LayerLocked(layer) | BoardError::LayerLockedAgainstRemoval(layer) => {
+            format!("layer \"{}\" is locked; update_layer can unlock it", layer.name)
+        }
+        BoardError::EveryLayerLocked => "every layer of this canvas is locked; update_layer can unlock one, or add_layer adds one".into(),
+        other => other.to_string(),
+    }
+}
+
 fn point(v: &[f32], what: &str) -> Result<Point, BoardError> {
     match v {
         [x, y, ..] if x.is_finite() && y.is_finite() => Ok(Point::new(*x, *y)),
@@ -600,14 +615,13 @@ fn anchor_of(rect: &Rect, side: Option<Side>) -> Point {
 struct LayerInfo {
     id: String,
     name: String,
-    locked: bool,
 }
 
 /// The canvas as it was when the write began, and the elements this write made.
 struct Scene {
     layers: Vec<LayerInfo>,
-    /// By id: its bounds, whether it is locked (itself or by its layer), its layer.
-    elements: HashMap<String, (Rect, bool, String)>,
+    /// By id: its bounds.
+    elements: HashMap<String, Rect>,
     /// Refs of this call to ids.
     refs: HashMap<String, String>,
     /// What a picture spec stood for (src, pixel size), and a card's link and title, by spec index.
@@ -622,14 +636,9 @@ impl Scene {
         let layers = snapshot
             .layers
             .iter()
-            .map(|l| LayerInfo { id: l.id.clone(), name: l.name.clone(), locked: l.locked })
+            .map(|l| LayerInfo { id: l.id.clone(), name: l.name.clone() })
             .collect::<Vec<_>>();
-        let locked_layers: HashSet<&str> = snapshot.layers.iter().filter(|l| l.locked).map(|l| l.id.as_str()).collect();
-        let elements = snapshot
-            .elements
-            .iter()
-            .map(|e| (e.raw.id.clone(), (e.bounds, e.raw.locked || locked_layers.contains(e.layer.as_str()), e.layer.clone())))
-            .collect();
+        let elements = snapshot.elements.iter().map(|e| (e.raw.id.clone(), e.bounds)).collect();
         Self { layers, elements, refs: HashMap::new(), pictures: HashMap::new(), cards: HashMap::new(), touched: Vec::new() }
     }
 
@@ -649,23 +658,13 @@ impl Scene {
         }
     }
 
-    /// The layer a new element goes in.
-    fn target_layer(&self, own: Option<&str>, call: Option<&str>) -> Result<String, BoardError> {
+    /// The layer a new element names, by id: its own, else the call's.
+    /// `None` leaves the choice to `pimble_board` (the top layer that is
+    /// not locked), which also refuses a locked one.
+    fn named_layer(&self, own: Option<&str>, call: Option<&str>) -> Result<Option<String>, BoardError> {
         match own.or(call).map(str::trim).filter(|s| !s.is_empty()) {
-            Some(name) => {
-                let layer = self.layer(name)?;
-                if layer.locked {
-                    return Err(bad(format!("layer \"{}\" is locked; update_layer can unlock it", layer.name)));
-                }
-                Ok(layer.id.clone())
-            }
-            None => self
-                .layers
-                .iter()
-                .rev()
-                .find(|l| !l.locked)
-                .map(|l| l.id.clone())
-                .ok_or_else(|| bad("every layer of this canvas is locked; update_layer can unlock one, or add_layer adds one")),
+            Some(name) => Ok(Some(self.layer(name)?.id.clone())),
+            None => Ok(None),
         }
     }
 
@@ -686,7 +685,7 @@ impl Scene {
             (Some(e), None) => {
                 let id = self.id(e)?;
                 let side = side(side_of)?;
-                let last = self.elements.get(&id).map(|(r, _, _)| anchor_of(r, side)).unwrap_or(Point::new(0.0, 0.0));
+                let last = self.elements.get(&id).map(|r| anchor_of(r, side)).unwrap_or(Point::new(0.0, 0.0));
                 Ok(End::Element { id, side, last })
             }
             (None, Some(p)) => Ok(End::Point(point(p, which)?)),
@@ -853,8 +852,8 @@ fn add_specs(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, specs: &[ElementSpec],
     for i in order {
         let spec = &specs[i];
         let (kind, geom, points) = geom_of(spec, i, scene)?;
-        let layer = scene.target_layer(spec.layer.as_deref(), call_layer)?;
-        let mut element = NewElement::new(kind.clone(), geom.clone()).in_layer(layer.clone()).with_points(points.clone());
+        let mut element = NewElement::new(kind.clone(), geom.clone()).with_points(points.clone());
+        element.layer = scene.named_layer(spec.layer.as_deref(), call_layer)?;
         if let Some(text) = &spec.text {
             if matches!(kind, Kind::Pen | Kind::Highlighter | Kind::Picture | Kind::Group | Kind::Step | Kind::Line | Kind::Arrow) {
                 return Err(bad(format!("a {kind} holds no text")));
@@ -871,7 +870,7 @@ fn add_specs(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, specs: &[ElementSpec],
             element = element.with_transform(Transform { rot, ..Transform::IDENTITY });
         }
         let id = t.add_element(element)?;
-        scene.elements.insert(id.clone(), (rect_of_geom(&geom, &points), false, layer));
+        scene.elements.insert(id.clone(), rect_of_geom(&geom, &points));
         if let Some(name) = spec.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             scene.refs.insert(name.to_string(), id.clone());
         }
@@ -886,9 +885,6 @@ fn add_specs(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, specs: &[ElementSpec],
         }
         for member in spec.members.iter().flatten() {
             let member = scene.id(member)?;
-            if scene.elements.get(&member).is_some_and(|(_, locked, _)| *locked) {
-                return Err(bad(format!("element {member} is locked; unlock it before putting it in a group or frame")));
-            }
             t.set_parent(&member, Some(id))?;
         }
     }
@@ -921,49 +917,24 @@ fn placement(order: &str, resolve: &dyn Fn(&str) -> Result<String, BoardError>) 
     })
 }
 
-/// Whether a change writes only a note and fields.
-fn change_is_only_meaning(c: &ElementChange) -> bool {
-    (c.note.is_some() || c.fields.is_some())
-        && [c.x, c.y, c.w, c.h, c.rotation].iter().all(Option::is_none)
-        && c.points.is_none()
-        && c.tip.is_none()
-        && [&c.from, &c.from_side, &c.to, &c.to_side, &c.node, &c.text, &c.layer, &c.parent, &c.order].iter().all(|v| v.is_none())
-        && c.from_point.is_none()
-        && c.to_point.is_none()
-        && c.style.is_none()
-        && c.clear_style.is_empty()
-        && c.move_by.is_none()
-        && c.locked.is_none()
-        && c.smooth.is_none()
-        && c.closed.is_none()
+/// Whether a change names anything of an element's geometry.
+fn change_names_geometry(c: &ElementChange) -> bool {
+    [c.x, c.y, c.w, c.h].iter().any(Option::is_some)
+        || c.points.is_some()
+        || c.tip.is_some()
+        || [&c.from, &c.from_side, &c.to, &c.to_side, &c.node].iter().any(|v| v.is_some())
+        || c.from_point.is_some()
+        || c.to_point.is_some()
 }
 
-/// Apply one change to an element (refused, before anything is written,
-/// when the element or its layer is locked and the change is not unlocking it).
+/// Apply one change to an element. Locks are `pimble_board`'s to judge: a
+/// locked element, or one on a locked layer, takes a change of its note and
+/// fields and nothing else, unless the change unlocks it ("locked": false,
+/// written first) and its layer is not locked.
 fn change_element(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, snapshot: &BoardSnapshot, change: &ElementChange, index: usize) -> Result<(), BoardError> {
     let id = change.id.trim().to_string();
     let element = snapshot.get(&id).ok_or_else(|| bad(format!("there is no element \"{id}\" on this canvas (get_canvas lists the ids)")))?;
-    // What an element means is not what the lock guards: a locked picture
-    // can still be described.
-    if change_is_only_meaning(change) {
-        if let Some(note) = &change.note {
-            t.set_note(&id, note)?;
-        }
-        for (name, value) in change.fields.iter().flatten() {
-            t.set_field(&id, name, value.as_deref())?;
-        }
-        scene.touched.push(id);
-        return Ok(());
-    }
-    let layer_locked = snapshot.layer(&element.layer).is_some_and(|l| l.locked);
-    if layer_locked {
-        let name = snapshot.layer(&element.layer).map(|l| l.name.clone()).unwrap_or_default();
-        return Err(bad(format!("element {id} is on the locked layer \"{name}\"; update_layer can unlock it")));
-    }
-    if element.raw.locked {
-        if change.locked != Some(false) {
-            return Err(bad(format!("element {id} is locked; set \"locked\": false in the same change to edit it")));
-        }
+    if element.raw.locked && change.locked == Some(false) {
         t.set_locked(&id, false)?;
     }
     let raw = &element.raw;
@@ -972,50 +943,54 @@ fn change_element(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, snapshot: &BoardS
     let new_points = || -> Result<Option<Vec<Point>>, BoardError> {
         change.points.as_ref().map(|ps| ps.iter().map(|p| point(p, "each point")).collect()).transpose()
     };
-    let geom = match &raw.geom {
-        Geom::Rect(rect) => Some(Geom::Rect(r(rect))),
-        Geom::Picture(p) => Some(Geom::Picture(PictureGeom { rect: r(&p.rect), ..p.clone() })),
-        Geom::Callout { rect, tip } => Some(Geom::Callout {
-            rect: r(rect),
-            tip: change.tip.as_deref().map(|p| point(p, "tip")).transpose()?.unwrap_or(*tip),
-        }),
-        Geom::Card { rect, link } => Some(Geom::Card {
-            rect: r(rect),
-            link: scene.cards.get(&index).map(|(l, _)| l.clone()).unwrap_or_else(|| link.clone()),
-        }),
-        Geom::Anchor(p) => Some(Geom::Anchor(Point::new(change.x.unwrap_or(p.x), change.y.unwrap_or(p.y)))),
-        Geom::Segment { a, b } => match new_points()?.as_deref() {
-            None => Some(Geom::Segment { a: *a, b: *b }),
-            Some([a, b]) => Some(Geom::Segment { a: *a, b: *b }),
-            Some(_) => return Err(bad("a line or arrow takes two points")),
-        },
-        Geom::Connector { from, to } => {
-            let end = |el: &Option<String>, pt: &Option<Vec<f32>>, sd: &Option<String>, old: &End, which: &str| -> Result<End, BoardError> {
-                if el.is_none() && pt.is_none() {
-                    if sd.is_some() {
-                        if let End::Element { id, last, .. } = old {
-                            return Ok(End::Element { id: id.clone(), side: side(sd)?, last: *last });
+    let geom = if !change_names_geometry(change) {
+        None
+    } else {
+        match &raw.geom {
+            Geom::Rect(rect) => Some(Geom::Rect(r(rect))),
+            Geom::Picture(p) => Some(Geom::Picture(PictureGeom { rect: r(&p.rect), ..p.clone() })),
+            Geom::Callout { rect, tip } => Some(Geom::Callout {
+                rect: r(rect),
+                tip: change.tip.as_deref().map(|p| point(p, "tip")).transpose()?.unwrap_or(*tip),
+            }),
+            Geom::Card { rect, link } => Some(Geom::Card {
+                rect: r(rect),
+                link: scene.cards.get(&index).map(|(l, _)| l.clone()).unwrap_or_else(|| link.clone()),
+            }),
+            Geom::Anchor(p) => Some(Geom::Anchor(Point::new(change.x.unwrap_or(p.x), change.y.unwrap_or(p.y)))),
+            Geom::Segment { a, b } => match new_points()?.as_deref() {
+                None => Some(Geom::Segment { a: *a, b: *b }),
+                Some([a, b]) => Some(Geom::Segment { a: *a, b: *b }),
+                Some(_) => return Err(bad("a line or arrow takes two points")),
+            },
+            Geom::Connector { from, to } => {
+                let end = |el: &Option<String>, pt: &Option<Vec<f32>>, sd: &Option<String>, old: &End, which: &str| -> Result<End, BoardError> {
+                    if el.is_none() && pt.is_none() {
+                        if sd.is_some() {
+                            if let End::Element { id, last, .. } = old {
+                                return Ok(End::Element { id: id.clone(), side: side(sd)?, last: *last });
+                            }
                         }
+                        return Ok(old.clone());
                     }
-                    return Ok(old.clone());
-                }
-                scene.end(el, pt, sd, which)
-            };
-            Some(Geom::Connector {
-                from: end(&change.from, &change.from_point, &change.from_side, from, "from")?,
-                to: end(&change.to, &change.to_point, &change.to_side, to, "to")?,
-            })
-        }
-        Geom::Stroke => {
-            if let Some(points) = new_points()? {
-                if points.len() < 2 {
-                    return Err(bad("a stroke takes at least two points"));
-                }
-                t.replace_points(&id, &stroke_points(&points, change.smooth == Some(true), change.closed == Some(true)))?;
+                    scene.end(el, pt, sd, which)
+                };
+                Some(Geom::Connector {
+                    from: end(&change.from, &change.from_point, &change.from_side, from, "from")?,
+                    to: end(&change.to, &change.to_point, &change.to_side, to, "to")?,
+                })
             }
-            None
+            Geom::Stroke => {
+                if let Some(points) = new_points()? {
+                    if points.len() < 2 {
+                        return Err(bad("a stroke takes at least two points"));
+                    }
+                    t.replace_points(&id, &stroke_points(&points, change.smooth == Some(true), change.closed == Some(true)))?;
+                }
+                None
+            }
+            Geom::None => None,
         }
-        Geom::None => None,
     };
     if let Some(geom) = geom.filter(|g| *g != raw.geom) {
         t.set_geom(&id, &geom)?;
@@ -1042,7 +1017,7 @@ fn change_element(t: &mut BoardTxn<'_, '_>, scene: &mut Scene, snapshot: &BoardS
         t.set_transform(&id, &transform)?;
     }
     if let Some(layer) = change.layer.as_deref() {
-        let layer = scene.target_layer(Some(layer), None)?;
+        let layer = scene.layer(layer)?.id.clone();
         t.move_to_layer(std::slice::from_ref(&id), &layer)?;
     }
     if let Some(parent) = change.parent.as_deref() {
@@ -1426,7 +1401,7 @@ impl Pimble {
             let mut scene = Scene::of(&snapshot);
             (scene.pictures, scene.cards) = prepared;
             let edited = board.edit(Stamp::new(author.as_ref(), &now), |t| write(t, &mut scene, &snapshot));
-            let result = edited.result.map_err(|e| format!("Nothing was written: {e}."))?;
+            let result = edited.result.map_err(|e| format!("Nothing was written: {}.", said(&e)))?;
             *answer_ref = Some((result, scene.touched));
             Ok(())
         })
@@ -1499,26 +1474,23 @@ fn made(specs: &[ElementSpec], ids: &[String]) -> String {
         .collect()
 }
 
-/// The board a new canvas starts with, as the app makes one: "Layer 1" and,
-/// for a picture, the picture at 100% locked in a layer "Picture" below it.
-/// Then `specs` on top. Answers the element ids.
+/// The board a new canvas starts with, as every canvas starts
+/// (`BoardTxn::start_canvas`), then `specs` on top. Answers the element ids.
 fn build_canvas(
     t: &mut BoardTxn<'_, '_>,
     picture: Option<&(String, u32, u32)>,
     prepared: Prepared,
     specs: &[ElementSpec],
 ) -> Result<(Vec<String>, Vec<String>), BoardError> {
-    let first = t.create()?;
+    let start = picture.map(|(src, px_w, px_h)| StartingPicture { src, px_w: *px_w, px_h: *px_h });
+    let made = t.start_canvas(start)?;
     let mut layers = Vec::new();
     let mut touched = Vec::new();
-    if let Some((src, w, h)) = picture {
-        let layer = t.add_layer("Picture", Placement::Bottom)?;
-        let geom = PictureGeom { rect: Rect::new(0.0, 0.0, *w as f32, *h as f32), src: src.clone(), px_w: *w, px_h: *h, crop: None };
-        touched.push(t.add_element(NewElement::new(Kind::Picture, Geom::Picture(geom)).in_layer(layer.clone()))?);
-        t.set_layer_locked(&layer, true)?;
-        layers.push(LayerInfo { id: layer, name: "Picture".into(), locked: true });
+    if let Some((layer, element)) = made.picture {
+        touched.push(element);
+        layers.push(LayerInfo { id: layer, name: PICTURE_LAYER_NAME.into() });
     }
-    layers.push(LayerInfo { id: first, name: pimble_board::doc::FIRST_LAYER_NAME.into(), locked: false });
+    layers.push(LayerInfo { id: made.draw_layer, name: pimble_board::doc::FIRST_LAYER_NAME.into() });
     let mut scene = Scene { layers, elements: HashMap::new(), refs: HashMap::new(), pictures: prepared.0, cards: prepared.1, touched: Vec::new() };
     let ids = add_specs(t, &mut scene, specs, None)?;
     touched.extend(ids.iter().cloned());
@@ -1668,7 +1640,7 @@ impl Pimble {
         let now = now();
         let board = Board::standalone();
         let edited = board.edit(Stamp::new(author.as_ref(), &now), |t| build_canvas(t, picture.as_ref(), prepared, &p.elements));
-        let ((ids, touched), update) = edited.into_result().map_err(|e| format!("Nothing was made: {e}."))?;
+        let ((ids, touched), update) = edited.into_result().map_err(|e| format!("Nothing was made: {}.", said(&e)))?;
         let content = update.ok_or("Nothing was made.")?;
         let title = p
             .title
@@ -1676,7 +1648,7 @@ impl Pimble {
             .filter(|t| !t.trim().is_empty())
             .or_else(|| p.picture.as_deref().map(picture_title))
             .unwrap_or_else(|| "Canvas".to_string());
-        let icon = if picture.is_some() { PHOTO_ICON } else { CANVAS_ICON };
+        let icon = canvas_icon(picture.is_some());
         let custom = HashMap::from([
             (custom_keys::ICON.to_string(), serde_json::json!(icon)),
             (custom_keys::EXPLICIT_TITLE.to_string(), serde_json::json!(true)),
@@ -1740,7 +1712,7 @@ impl Pimble {
         self.edit_doc(&client, addr, move |doc| {
             let board = Board::in_text(doc, &canvas_for_edit);
             let edited = board.edit(Stamp::new(author.as_ref(), &now), |t| build_canvas(t, picture.as_ref(), prepared, &specs));
-            *made_ref = edited.result.map_err(|e| format!("Nothing was written: {e}."))?;
+            *made_ref = edited.result.map_err(|e| format!("Nothing was written: {}.", said(&e)))?;
             match after.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
                 Some(quote) => doc.insert_markdown_after(quote, after_section, &markdown),
                 None => doc.append_markdown(&markdown),
@@ -1815,6 +1787,8 @@ impl Pimble {
 
     /// Delete elements from a canvas. A frame's or group's members stay (they
     /// no longer belong to it); a connector to a deleted element keeps its last point.
+    /// Locked elements, and elements on a locked layer, are kept; the answer
+    /// says how many.
     #[tool(name = "delete_elements")]
     async fn delete_elements(&self, Parameters(p): Parameters<DeleteElementsParams>) -> Result<String, String> {
         if p.ids.is_empty() {
@@ -1823,21 +1797,34 @@ impl Pimble {
         let client = self.client().await?;
         let target = self.canvas(&client, &p.node, p.canvas.as_deref()).await?;
         let ids: Vec<String> = p.ids.iter().map(|s| s.trim().to_string()).collect();
-        let count = ids.len();
-        self.canvas_edit(&client, &target, Default::default(), move |t, scene, _| {
-            for id in &ids {
-                let (_, locked, _) = scene.elements.get(id).ok_or_else(|| bad(format!("there is no element \"{id}\" on this canvas")))?;
-                if *locked {
-                    return Err(bad(format!("element {id} is locked, or on a locked layer; unlock it first")));
+        let done = self
+            .canvas_edit(&client, &target, Default::default(), move |t, scene, _| {
+                for id in &ids {
+                    if !scene.elements.contains_key(id) {
+                        return Err(bad(format!("there is no element \"{id}\" on this canvas")));
+                    }
                 }
-            }
-            for id in &ids {
-                t.delete_element(id)?;
-            }
-            Ok(())
-        })
-        .await?;
-        Ok(format!("Deleted {count} element{} from {}.", if count == 1 { "" } else { "s" }, target.what()))
+                let done = t.delete_elements(&ids)?;
+                if done.deleted.is_empty() {
+                    return Err(bad(
+                        "every element named is locked, or on a locked layer; update_elements with \"locked\": false, \
+                         or update_layer for a locked layer, unlocks them",
+                    ));
+                }
+                Ok(done)
+            })
+            .await?;
+        let (count, kept) = (done.deleted.len(), done.kept.len());
+        let mut out = format!("Deleted {count} element{} from {}.", if count == 1 { "" } else { "s" }, target.what());
+        if kept > 0 {
+            out.push_str(&format!(
+                " Kept {kept} locked element{} ({}): update_elements with \"locked\": false, or update_layer for a locked layer, unlocks {}.",
+                if kept == 1 { "" } else { "s" },
+                done.kept.join(", "),
+                if kept == 1 { "it" } else { "them" }
+            ));
+        }
+        Ok(out)
     }
 
     /// Add a layer to a canvas (layers organize; who made what is on each element).
@@ -1914,11 +1901,7 @@ impl Pimble {
         let target = self.canvas(&client, &p.node, p.canvas.as_deref()).await?;
         let (layer, merge) = (p.layer.clone(), p.merge_down);
         self.canvas_edit(&client, &target, Default::default(), move |t, scene, _| {
-            let found = scene.layer(&layer)?;
-            if found.locked {
-                return Err(bad(format!("layer \"{}\" is locked; update_layer can unlock it", found.name)));
-            }
-            let id = found.id.clone();
+            let id = scene.layer(&layer)?.id.clone();
             if merge {
                 t.merge_layer_down(&id)
             } else {
@@ -2055,7 +2038,8 @@ mod tests {
         let mut scene = Scene::of(&snapshot);
         let move_it = ElementChange { id: ids[0].clone(), x: Some(50.0), ..Default::default() };
         let err = board.edit(Stamp::new(None, "t"), |t| change_element(t, &mut scene, &snapshot, &move_it, 0)).result.unwrap_err();
-        assert!(err.to_string().contains("is locked"), "{err}");
+        assert!(matches!(err, BoardError::ElementLocked { layer: None, .. }), "{err:?}");
+        assert!(said(&err).contains("is locked; update_elements"), "{}", said(&err));
         let unlock_and_move = ElementChange { locked: Some(false), ..move_it };
         board.edit(Stamp::new(None, "t"), |t| change_element(t, &mut scene, &snapshot, &unlock_and_move, 0)).result.unwrap();
         let snap = board.snapshot();
@@ -2066,7 +2050,23 @@ mod tests {
         let layer = snap.layers[0].id.clone();
         board.edit(Stamp::new(None, "t"), |t| t.set_layer_locked(&layer, true)).result.unwrap();
         let err = add(&board, &[ElementSpec { x: Some(0.0), y: Some(0.0), ..spec("step") }]).unwrap_err();
-        assert!(err.to_string().contains("every layer of this canvas is locked"), "{err}");
+        assert_eq!(err, BoardError::EveryLayerLocked);
+        assert!(said(&err).contains("every layer of this canvas is locked"), "{}", said(&err));
+        // An element on the locked layer takes no lock of its own either.
+        let snapshot = board.snapshot();
+        let mut scene = Scene::of(&snapshot);
+        let lock = ElementChange { id: ids[0].clone(), locked: Some(true), ..Default::default() };
+        let err = board.edit(Stamp::new(None, "t"), |t| change_element(t, &mut scene, &snapshot, &lock, 0)).result.unwrap_err();
+        assert!(said(&err).contains("on the locked layer \"Layer 1\""), "{}", said(&err));
+    }
+
+    #[test]
+    fn a_member_that_is_locked_stays_out_of_a_group() {
+        let board = fresh();
+        let ids = add(&board, &[ElementSpec { name: Some("a".into()), x: Some(0.0), y: Some(0.0), w: Some(10.0), h: Some(10.0), locked: Some(true), ..spec("rect") }])
+            .unwrap();
+        let err = add(&board, &[ElementSpec { members: Some(vec![ids[0].clone()]), ..spec("group") }]).unwrap_err();
+        assert!(matches!(&err, BoardError::ElementLocked { id, .. } if *id == ids[0]), "{err:?}");
     }
 
     #[test]

@@ -8,10 +8,11 @@ use std::collections::HashSet;
 use pimble_client::PimbleClient;
 use pimble_core::{LinkResolution, Node};
 use pimble_crdt::NodeDoc;
+use pimble_sheet::book::{formulas_of, named_nodes};
 use pimble_sheet::doc::Sheets;
 use pimble_sheet::{NodeRef, SheetsSnap};
 
-use super::book::{formulas_of, named_nodes, Absent, McpBook};
+use super::book::{Absent, McpBook};
 use crate::nodes::{self, label, Addr};
 
 /// How many notes deep the formulas of named notes are followed.

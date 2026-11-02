@@ -8,6 +8,9 @@ description = "JSON-RPC protocol definitions for Pimble"
 
 [dependencies]
 pimble-core = { workspace = true }
+# For `NodeChange`, the node-document half of `StoreChangeKind`, derived in
+# `pimble_crdt::rules` by the server and the browser's vault client alike.
+pimble-crdt = { workspace = true }
 pimble-crypto = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

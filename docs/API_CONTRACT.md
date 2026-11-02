@@ -198,6 +198,13 @@ vault; canvas locks into `pimble-board`; sheet operations, carry-over, `write_fo
 into `pimble-sheet`; embed atoms into `markdown`; one vault protocol module shared by
 `vault_link.rs` and `vault.rs`. Each move deletes its copies in the same commit.
 
+Built 2026-11-02 except the shared vault protocol (it runs beside wave 2): tree and
+server rules in `pimble_crdt::rules` (`derive_changes`, `Tree::repair_held`,
+`document_root`, `deleted`, `link_hop`, `node`, `check_move`, `move_order`) and
+`StoreAccess::of_role`/`on_document`; canvas locks, the layer rule and the new-canvas
+recipe in `pimble-board` (`locks.rs`, `recipe.rs`); sheet operations, path matching and
+moves in `pimble-sheet` (`ops.rs`, `book.rs`); embed atoms as `markdown::Embed`.
+
 **Wave 2, `pimble-api` with the RPC implementation, and the MCP moves onto it.** The trait,
 `ApiError`, held documents, the one write, naming and links, recipes, presence. The MCP is
 the first consumer because it has no UI state: its 62 tools become thin, its tree walks
@@ -221,9 +228,59 @@ deleted. Error routing uses answers, not modal flags.
 built-in written in plain rinch against `Pimble`) and the WASM plugin host, which hands a
 plugin the same `Pimble` trait.
 
+## 3b. The crate, concretely (wave 2's design)
+
+`crates/pimble-api`, a workspace member that builds for `wasm32` (no tokio in the
+library; `futures`, `async-trait` with `?Send` on wasm, timers behind a small trait).
+
+```text
+pimble-api
+  backend.rs   trait Backend      what an implementation must do (transport only)
+  rpc.rs       RpcBackend          over PimbleClient: reconnect, resubscribe (native and wasm)
+  held.rs      Held                per store: a Tree of the node documents this client holds,
+                                   the store's Store row, what is known to be complete
+  api.rs       Pimble              the API every client uses (reads, edit, structure, ...)
+  names.rs     resolve/display     links, ids, paths; became and StoreNotHere hops
+  recipes.rs   create_*            document, sheet, canvas, discussion: one createNode{init}
+  presence.rs  PresenceFrames      one frame builder (session, sequence, TTL, body)
+  identity.rs  Author              who is writing, per share, cached (no whoAmI per write)
+  error.rs     ApiError            data with a sentence (decision 9)
+```
+
+- **`Backend`** (async, object-safe through `async-trait`): `list_stores`, `fetch(store,
+  ids)` (whole documents: `getNodes`), `children(store, node)` (`getChildren`, mount-aware,
+  answers the store the children live in), `apply(store, node, update, client_id)`
+  (`applyEdit`), the structural calls (`create_node`, `move_node(s)`, `transplant`,
+  `delete`, `undelete`, `create_mount`), `resolve_link`, `list_deleted`, `search`, blobs,
+  presence publish and subscribe, discussions' attachments, and `subscribe(store) ->
+  Stream<StoreChange>` where a change carries its kind, its source and the update bytes.
+  `RpcBackend` owns the reconnect loop and resubscribes; callers see `ApiError::Offline`
+  and, on return, a `Change::Resynced { store }` after which held documents are brought up
+  to date with `syncNodes` (state vectors in, diffs out).
+- **`Held`** is the cache: documents come in whole the first time they are read and are
+  kept current by the store subscription's update bytes (merged with
+  `NodeDoc::apply_update`); `Tree` answers children, parents, ancestors, labels, access
+  through `NodeFields::into_node` and the wave 1 rules. A store's documents are fetched as
+  they are asked for (a node, a list, a walk); `hold_store(store)` fetches all of them
+  (search-free name lookups, `rows_pointing_here`, a view that needs the tree).
+- **`Pimble`**: `stores()`, `node(addr)`, `children(addr)`, `ancestors(addr)`,
+  `label(addr)`, `doc(addr)` (a read-only clone), `edit(addr, |doc, now| ...)` (decision 4;
+  answers `Edited { changed, caret }`), `create(recipe, parent, place)`, `move_nodes(nodes,
+  parent, place)`, `delete`, `undelete`, `transplant`, `resolve(name)` and `display(addr)`,
+  `changes()` (the stream, after `Held` has merged each change), plus pass-throughs for
+  search, blobs, deleted lists, attachments, presence.
+- **What does not move in wave 2:** the app keeps `BackendCommand` (wave 5); the vault is
+  not a `Backend` yet (wave 4); planning functions arrive in wave 3. The MCP and the CLI's
+  node commands move onto `Pimble` in this wave, and `pimble_client::PimbleClient::edit_node`
+  becomes `Pimble::edit`'s RPC path.
+
 ## 4. How it is checked
 
-- Every wave: `cargo test --workspace` (under `scripts/guarded.sh`), `web` compiles, the
+- Every wave: the crates it touched are tested by whoever built it; then the workspace
+  compiles with its tests (`cargo check --workspace --tests`) and `web` compiles, and the
+  wave is committed. The whole suite (`cargo test --release --workspace`, and `web`'s
+  `cargo test`) runs after wave 3 and before the release (Joe, 2026-11-02: a full run
+  after every wave costs days). Before the release also: the
   release desktop app driven over the debug port for the paths the wave touched, the MCP
   walk-through (`scripts/mcp/`), the local stack sharing walk-through
   (`scripts/local-stack/README.md`) for waves 1 and 4.

@@ -310,11 +310,7 @@ impl StoreView {
     /// reads, a commenter writes discussions, everyone else edits what they
     /// reach.
     pub fn access(&self) -> pimble_core::StoreAccess {
-        match self.role.as_str() {
-            "reader" => pimble_core::StoreAccess::Read,
-            "commenter" => pimble_core::StoreAccess::Comment,
-            _ => pimble_core::StoreAccess::Full,
-        }
+        pimble_core::StoreAccess::of_role(&self.role)
     }
 }
 
@@ -384,11 +380,10 @@ impl HeldAs {
             // are a commenter's, when the roots say which.
             read_only_roots: if all_read && !any_comment { Vec::new() } else { read_only },
             comment_roots: shares.iter().filter(|(_, row)| comments(row)).map(|(root, _)| *root).collect(),
-            access: match (all_read, any_comment) {
-                (false, _) => pimble_core::StoreAccess::Full,
-                (true, true) => pimble_core::StoreAccess::Comment,
-                (true, false) => pimble_core::StoreAccess::Read,
-            },
+            // The widest role among the shares (`StoreAccess::widest`, the
+            // browser's rule too): any root edited makes the store editable,
+            // and the writes under a read-only root are refused one at a time.
+            access: pimble_core::StoreAccess::widest(shares.iter().map(|(_, row)| row.access())).unwrap_or_default(),
             shared_by: first.shared_by.clone(),
         })
     }

@@ -19,6 +19,11 @@
 //!   rinch's `paint` example (contract spike 1), with a per-viewer grid.
 //! - [`Element::hits`], [`BoardSnapshot::hit_precise`],
 //!   [`BoardSnapshot::within`]: hit testing against painted geometry.
+//! - [`locks`]: what a lock guards, judged by [`BoardTxn`] for every
+//!   caller, and the same rules read over a snapshot (which layer new
+//!   elements go into, what can be edited).
+//! - [`recipe`]: how a new canvas starts, its icons, and the sizes a sticky
+//!   note and a node card take when placed with a click.
 //! - [`ViewOptions`]: a viewer's choices (color by author, show everything,
 //!   card titles), carried by the snapshot.
 //! - [`render_area`], [`render_svg`]: export of a part of a board, as pixels
@@ -26,8 +31,10 @@
 
 pub mod doc;
 mod hit;
+pub mod locks;
 pub mod model;
 pub mod options;
+pub mod recipe;
 pub use pimble_crdt::order;
 mod paint;
 pub mod render;
@@ -38,9 +45,11 @@ pub mod text;
 pub mod view;
 
 pub use doc::{
-    Board, BoardError, BoardTxn, BoardWatch, ChangedElements, Changes, Edited, RawBoard, RawElement, RawLayer, text_board_key, TEXT_BOARD_PREFIX,
-    BOARD_KEY,
+    Board, BoardError, BoardTxn, BoardWatch, ChangedElements, Changes, Edited, LockedLayer, RawBoard, RawElement, RawLayer, text_board_key,
+    TEXT_BOARD_PREFIX, BOARD_KEY,
 };
+pub use locks::Deleted;
+pub use recipe::{NewCanvas, StartingPicture};
 pub use model::*;
 pub use paint::pressure_width;
 pub use options::{author_color, author_color_index, CardLabel, ViewOptions, UNAUTHORED_COLOR};

@@ -54,6 +54,7 @@ use yrs::{
     StateVector, Text, TextPrelim, Transact, TransactionMut,
 };
 
+use crate::locks::Deleted;
 use crate::model::*;
 use crate::order;
 
@@ -118,8 +119,41 @@ pub enum BoardError {
     LastLayer,
     #[error("element {0} is not a pen or highlighter stroke")]
     NotAStroke(String),
+    /// An edit of an element that is locked, itself or by the layer it is
+    /// drawn in (`layer` names that layer when it is the layer's lock).
+    #[error("{}", crate::locks::ELEMENT_LOCKED)]
+    ElementLocked { id: String, layer: Option<LockedLayer> },
+    /// Something new was to go into a locked layer: an element added or
+    /// moved there, or a layer merged down into it.
+    #[error("{}", crate::locks::LAYER_LOCKED)]
+    LayerLocked(LockedLayer),
+    /// A locked layer was to be deleted or merged away.
+    #[error("{}", crate::locks::LAYER_LOCKED_AGAINST_REMOVAL)]
+    LayerLockedAgainstRemoval(LockedLayer),
+    /// Nothing named a layer and every layer is locked.
+    #[error("{}", crate::locks::EVERY_LAYER_LOCKED)]
+    EveryLayerLocked,
     #[error("{0}")]
     Invalid(String),
+}
+
+/// The locked layer a refusal is about, by id and by the name a person sees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockedLayer {
+    pub id: String,
+    pub name: String,
+}
+
+impl BoardError {
+    /// Whether this is a lock's refusal (contract section 5: a guard
+    /// against accidents, not a permission), which a person is told about,
+    /// rather than a mistake of the caller's.
+    pub fn is_lock(&self) -> bool {
+        matches!(
+            self,
+            BoardError::ElementLocked { .. } | BoardError::LayerLocked(_) | BoardError::LayerLockedAgainstRemoval(_) | BoardError::EveryLayerLocked
+        )
+    }
 }
 
 pub type Result<T> = std::result::Result<T, BoardError>;
@@ -406,6 +440,15 @@ impl BoardWatch {
 
 /// A write transaction on a board. Every write checks what it needs before
 /// it writes, so a refused write changes nothing.
+///
+/// **Locks** (contract section 5) are judged here, for every caller: an
+/// element that is locked, or drawn in a locked layer, takes no edit of its
+/// geometry, text, style, place or membership, and is not deleted; a locked
+/// layer takes no new elements and is neither deleted nor merged away. What
+/// stays open on a locked thing: its lock (an element's own lock, while its
+/// layer is not locked), what it means (notes and fields: a locked picture
+/// can still be described), and a layer's name, visibility, opacity and
+/// place among the layers.
 pub struct BoardTxn<'a, 'doc> {
     txn: &'a mut TransactionMut<'doc>,
     location: &'a Board,
@@ -622,6 +665,49 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         self.layer_orders()?.into_iter().last().map(|(id, _)| id).ok_or(BoardError::LastLayer)
     }
 
+    /// The layer `id` when it is locked, by id and name.
+    fn locked_layer(&self, id: &str) -> Result<Option<LockedLayer>> {
+        let layer = self.layer_map(id)?;
+        if !bool_of(layer.get(self.txn, LOCKED)).unwrap_or(false) {
+            return Ok(None);
+        }
+        let name = match layer.get(self.txn, NAME) {
+            Some(Out::YText(t)) => t.get_string(self.txn),
+            other => string_of(other).unwrap_or_default(),
+        };
+        Ok(Some(LockedLayer { id: id.to_string(), name }))
+    }
+
+    /// The layer something new goes into: `layer` when given (refused when
+    /// it is locked), else the top layer that is not locked
+    /// ([`crate::BoardSnapshot::layer_for_new`] is the same rule, read).
+    fn layer_for_new(&self, layer: Option<&str>) -> Result<String> {
+        match layer {
+            Some(id) => match self.locked_layer(id)? {
+                Some(locked) => Err(BoardError::LayerLocked(locked)),
+                None => Ok(id.to_string()),
+            },
+            None => {
+                for (id, _) in self.layer_orders()?.into_iter().rev() {
+                    if self.locked_layer(&id)?.is_none() {
+                        return Ok(id);
+                    }
+                }
+                Err(BoardError::EveryLayerLocked)
+            }
+        }
+    }
+
+    /// The layer an element is drawn in: its own, or the top layer when its
+    /// own is gone (as [`crate::BoardSnapshot`] resolves it).
+    fn drawn_in(&self, element: &MapRef) -> Result<String> {
+        let own = string_of(element.get(self.txn, LAYER)).unwrap_or_default();
+        if self.layer_map(&own).is_ok() {
+            return Ok(own);
+        }
+        self.top_layer()
+    }
+
     /// A new layer at `placement`; answers its id.
     pub fn add_layer(&mut self, name: &str, placement: Placement) -> Result<String> {
         let orders = self.layer_orders()?;
@@ -674,9 +760,14 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         Ok(())
     }
 
-    /// Delete a layer with its elements. A board keeps at least one layer.
+    /// Delete a layer with its elements. A board keeps at least one layer,
+    /// and a locked layer stays. The lock judged is the layer's: deleting a
+    /// layer is a deliberate act on the layer, and takes its elements with
+    /// it whether or not they are locked one by one.
     pub fn delete_layer(&mut self, id: &str) -> Result<()> {
-        self.layer_map(id)?;
+        if let Some(locked) = self.locked_layer(id)? {
+            return Err(BoardError::LayerLockedAgainstRemoval(locked));
+        }
         if self.layer_orders()?.len() <= 1 {
             return Err(BoardError::LastLayer);
         }
@@ -698,24 +789,40 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
     }
 
     /// "Merge Down": the layer's elements go on top of the layer below, in
-    /// their order, and the layer goes.
+    /// their order, and the layer goes. Refused when either layer is locked;
+    /// elements locked one by one go along, still locked (as with
+    /// [`BoardTxn::delete_layer`], the act is on the layer).
     pub fn merge_layer_down(&mut self, id: &str) -> Result<()> {
         let orders = self.layer_orders()?;
         let at = orders.iter().position(|(l, _)| l == id).ok_or_else(|| BoardError::NoLayer(id.to_string()))?;
         if at == 0 {
             return Err(BoardError::Invalid("the bottom layer has nothing below it".into()));
         }
+        if let Some(locked) = self.locked_layer(id)? {
+            return Err(BoardError::LayerLockedAgainstRemoval(locked));
+        }
         let below = orders[at - 1].0.clone();
+        if let Some(locked) = self.locked_layer(&below)? {
+            return Err(BoardError::LayerLocked(locked));
+        }
         let ids = self.element_ids_in_layer(id)?;
-        self.move_to_layer(&ids, &below)?;
+        self.move_into_layer(&ids, &below, false)?;
         self.layers()?.remove(self.txn, id);
         self.tops.remove(id);
         Ok(())
     }
 
     /// "Move Selection to Layer": the elements go on top of `layer`, keeping
-    /// their order among themselves.
+    /// their order among themselves. Refused, before anything is written,
+    /// when `layer` or any of the elements is locked.
     pub fn move_to_layer(&mut self, ids: &[String], layer: &str) -> Result<()> {
+        if let Some(locked) = self.locked_layer(layer)? {
+            return Err(BoardError::LayerLocked(locked));
+        }
+        self.move_into_layer(ids, layer, true)
+    }
+
+    fn move_into_layer(&mut self, ids: &[String], layer: &str, judge_locks: bool) -> Result<()> {
         self.layer_map(layer)?;
         let elements = self.elements()?;
         let mut found = Vec::with_capacity(ids.len());
@@ -723,6 +830,9 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
             let Some(Out::YMap(map)) = elements.get(self.txn, id) else {
                 return Err(BoardError::NoElement(id.clone()));
             };
+            if judge_locks {
+                self.judge_element(id, &map)?;
+            }
             let key = string_of(map.get(self.txn, ORDER)).unwrap_or_default();
             let from = string_of(map.get(self.txn, LAYER)).unwrap_or_default();
             found.push((from, key, id.clone(), map));
@@ -761,6 +871,20 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         }
     }
 
+    /// Element `id` for an edit the lock guards: refused when it or the
+    /// layer it is drawn in is locked.
+    fn editable(&self, id: &str) -> Result<MapRef> {
+        let map = self.element(id)?;
+        self.judge_element(id, &map)?;
+        Ok(map)
+    }
+
+    fn judge_element(&self, id: &str, map: &MapRef) -> Result<()> {
+        let layer = self.drawn_in(map)?;
+        let element_locked = bool_of(map.get(self.txn, LOCKED)).unwrap_or(false);
+        crate::locks::judge_element(id, element_locked, self.locked_layer(&layer)?)
+    }
+
     fn stamp_element(&mut self, element: &MapRef) {
         if let Some(author) = self.stamp.author {
             element.insert(self.txn, EDITED_BY, author_any(author));
@@ -794,16 +918,11 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
     }
 
     /// Add an element; answers its new id. It goes into `element.layer` (the
-    /// top layer when `None`), at `element.placement` (on top when `None`),
-    /// stamped `author` and `created_at`.
+    /// top layer that is not locked when `None`; a locked layer takes no new
+    /// elements), at `element.placement` (on top when `None`), stamped
+    /// `author` and `created_at`.
     pub fn add_element(&mut self, element: NewElement) -> Result<String> {
-        let layer = match &element.layer {
-            Some(layer) => {
-                self.layer_map(layer)?;
-                layer.clone()
-            }
-            None => self.top_layer()?,
-        };
+        let layer = self.layer_for_new(element.layer.as_deref())?;
         if element.kind.is_stroke() != matches!(element.geom, Geom::Stroke) {
             return Err(BoardError::Invalid(format!("a {} takes {}", element.kind, if element.kind.is_stroke() { "stroke geometry" } else { "geometry of its own" })));
         }
@@ -864,7 +983,7 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
     /// ~100 ms). Appending is the drawing itself, not an edit of someone
     /// else's mark, so it does not stamp `edited_by`.
     pub fn append_points(&mut self, id: &str, points: &[[f32; 3]]) -> Result<()> {
-        let map = self.element(id)?;
+        let map = self.editable(id)?;
         let array = match map.get(self.txn, GEOM) {
             Some(Out::YArray(array)) => array,
             _ => return Err(BoardError::NotAStroke(id.to_string())),
@@ -878,7 +997,7 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
     /// Replace a stroke's points whole (smoothing once on release, contract
     /// section 3): the old chunks are removed and one chunk written.
     pub fn replace_points(&mut self, id: &str, points: &[[f32; 3]]) -> Result<()> {
-        let map = self.element(id)?;
+        let map = self.editable(id)?;
         let array = match map.get(self.txn, GEOM) {
             Some(Out::YArray(array)) => array,
             _ => return Err(BoardError::NotAStroke(id.to_string())),
@@ -898,7 +1017,7 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
     /// geometry is its points: use [`BoardTxn::replace_points`], or move it
     /// with its transform.
     pub fn set_geom(&mut self, id: &str, geom: &Geom) -> Result<()> {
-        let map = self.element(id)?;
+        let map = self.editable(id)?;
         if matches!(geom, Geom::Stroke) || matches!(map.get(self.txn, GEOM), Some(Out::YArray(_))) {
             return Err(BoardError::Invalid("a stroke's geometry is its points".into()));
         }
@@ -909,7 +1028,7 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
 
     /// Set the style keys that are `Some`; the others stay as they are.
     pub fn set_style(&mut self, id: &str, style: &Style) -> Result<()> {
-        let map = self.element(id)?;
+        let map = self.editable(id)?;
         let style_map = match map.get(self.txn, STYLE) {
             Some(Out::YMap(m)) => m,
             _ => map.insert(self.txn, STYLE, MapPrelim::default()),
@@ -921,7 +1040,7 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
 
     /// Clear one style key, back to the kind's default.
     pub fn clear_style(&mut self, id: &str, key: StyleKey) -> Result<()> {
-        let map = self.element(id)?;
+        let map = self.editable(id)?;
         if let Some(Out::YMap(style)) = map.get(self.txn, STYLE) {
             if style.remove(self.txn, key.as_str()).is_some() {
                 self.stamp_element(&map);
@@ -932,7 +1051,7 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
 
     /// The transform, written whole (identity removes it).
     pub fn set_transform(&mut self, id: &str, transform: &Transform) -> Result<()> {
-        let map = self.element(id)?;
+        let map = self.editable(id)?;
         if transform.is_identity() {
             map.remove(self.txn, TRANSFORM);
         } else {
@@ -946,7 +1065,7 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
     /// common start and end kept), so someone typing elsewhere in the same
     /// sticky note keeps their typing.
     pub fn set_text(&mut self, id: &str, text: &str) -> Result<()> {
-        let map = self.element(id)?;
+        let map = self.editable(id)?;
         let text_ref = match map.get(self.txn, TEXT) {
             Some(Out::YText(t)) => t,
             _ => map.insert(self.txn, TEXT, TextPrelim::new("")),
@@ -956,8 +1075,12 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
         Ok(())
     }
 
+    /// Lock or unlock an element. Its own lock never stands in the way of
+    /// this (it is how a locked element is unlocked); a locked layer does.
     pub fn set_locked(&mut self, id: &str, locked: bool) -> Result<()> {
         let map = self.element(id)?;
+        let layer = self.drawn_in(&map)?;
+        crate::locks::judge_element(id, false, self.locked_layer(&layer)?)?;
         map.insert(self.txn, LOCKED, locked);
         self.stamp_element(&map);
         Ok(())
@@ -965,7 +1088,7 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
 
     /// Membership in a frame or group (`None`: none).
     pub fn set_parent(&mut self, id: &str, parent: Option<&str>) -> Result<()> {
-        let map = self.element(id)?;
+        let map = self.editable(id)?;
         if let Some(p) = parent {
             if p == id {
                 return Err(BoardError::Invalid("an element cannot contain itself".into()));
@@ -982,7 +1105,7 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
     /// Bring forward or send back within the element's layer (writes
     /// `order`).
     pub fn move_element(&mut self, id: &str, placement: Placement) -> Result<()> {
-        let map = self.element(id)?;
+        let map = self.editable(id)?;
         let layer = string_of(map.get(self.txn, LAYER)).unwrap_or_default();
         let orders = self.element_orders(&layer)?;
         let key = place(&orders, Some(id), &placement)?;
@@ -993,6 +1116,10 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
     }
 
     // ── Meaning ──────────────────────────────────────────────────────────
+    //
+    // What an element or layer means is not what a lock guards
+    // (docs/API_CONTRACT.md open decision 5, taken): a locked picture can
+    // still be described, so none of these judge locks.
 
     /// An element's note, edited as the smallest change (someone typing in
     /// it keeps their typing).
@@ -1030,13 +1157,43 @@ impl<'a, 'doc> BoardTxn<'a, 'doc> {
 
     /// Remove an element (its key goes; a concurrent edit of it is lost,
     /// which the contract accepts). Members of a deleted frame or group read
-    /// as having no parent.
+    /// as having no parent. Refused when it is locked.
     pub fn delete_element(&mut self, id: &str) -> Result<()> {
-        let elements = self.elements()?;
-        if elements.remove(self.txn, id).is_none() {
-            return Err(BoardError::NoElement(id.to_string()));
-        }
+        self.editable(id)?;
+        self.elements()?.remove(self.txn, id);
         Ok(())
+    }
+
+    /// Remove several elements, skipping the locked ones (contract open
+    /// decision 5, taken: a delete of a selection that holds locked elements
+    /// deletes the rest and says how many it kept). Refused, before anything
+    /// is written, when an id names no element; an id given twice counts
+    /// once.
+    pub fn delete_elements(&mut self, ids: &[String]) -> Result<Deleted> {
+        let mut seen = HashSet::new();
+        let mut judged = Vec::with_capacity(ids.len());
+        for id in ids {
+            if seen.insert(id.as_str()) {
+                let map = self.element(id)?;
+                let free = match self.judge_element(id, &map) {
+                    Ok(()) => true,
+                    Err(e) if e.is_lock() => false,
+                    Err(e) => return Err(e),
+                };
+                judged.push((id.clone(), free));
+            }
+        }
+        let mut out = Deleted::default();
+        let elements = self.elements()?;
+        for (id, free) in judged {
+            if free {
+                elements.remove(self.txn, &id);
+                out.deleted.push(id);
+            } else {
+                out.kept.push(id);
+            }
+        }
+        Ok(out)
     }
 }
 

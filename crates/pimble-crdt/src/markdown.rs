@@ -299,6 +299,125 @@ pub(crate) fn check_canvases(before: &Node, after: &Node, held: &std::collection
     Ok(())
 }
 
+// ── Embeds ───────────────────────────────────────────────────────────────
+
+/// The `data-*` attributes Pimble's `embed` atoms carry. rinch keeps and merges them
+/// per attribute and knows nothing of what they mean; these are what they mean.
+pub mod embed_attrs {
+    /// A table of the note's own sheets shown where the atom is: its table id.
+    pub const SHEET: &str = "data-sheet";
+    /// Another node shown where the atom is, as a `pimble:` link, which any reader of
+    /// the content counts as a link to it.
+    pub const NODE: &str = "data-node";
+    /// What the shown node is ([`KIND_SHEET`], [`KIND_DISCUSSION`]), which says which
+    /// view draws it.
+    pub const KIND: &str = "data-kind";
+    /// The shown node's title when the atom was written, for a reader that cannot
+    /// fetch it.
+    pub const TITLE: &str = "data-title";
+    /// The one table of a shown sheet node, when only one is shown.
+    pub const TABLE: &str = "data-table";
+    /// [`KIND`] of a sheet node shown in the text.
+    pub const KIND_SHEET: &str = "sheet";
+    /// [`KIND`] of a discussion shown in the text.
+    pub const KIND_DISCUSSION: &str = "discussion";
+}
+
+/// What an `embed` atom in a node's text shows (docs/SHEETS_CONTRACT.md section 1,
+/// docs/DISCUSSIONS_CONTRACT.md). The app builds these as editor nodes from
+/// [`Embed::attrs`] and reads them with [`Embed::from_attrs`]; Markdown carries them as
+/// the HTML element rinch writes for an embed, which [`Embed::to_markdown`] and
+/// [`Embed::from_markdown_line`] write and read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Embed {
+    /// A table of the note's own sheets, by id.
+    Table { id: String },
+    /// Another node: a sheet node (all its tables, or `table` alone) or a discussion.
+    Node { kind: String, node: pimble_core::PimbleUrl, title: Option<String>, table: Option<String> },
+}
+
+impl Embed {
+    /// A sheet node shown in the text.
+    pub fn sheet_node(node: pimble_core::PimbleUrl, title: Option<String>) -> Embed {
+        Embed::Node { kind: embed_attrs::KIND_SHEET.to_string(), node, title, table: None }
+    }
+
+    /// A discussion shown in the text.
+    pub fn discussion(node: pimble_core::PimbleUrl, title: Option<String>) -> Embed {
+        Embed::Node { kind: embed_attrs::KIND_DISCUSSION.to_string(), node, title, table: None }
+    }
+
+    /// The shown node of a [`Embed::Node`] of kind `kind`.
+    pub fn node_of_kind(&self, kind: &str) -> Option<&pimble_core::PimbleUrl> {
+        match self {
+            Embed::Node { kind: k, node, .. } if k == kind => Some(node),
+            _ => None,
+        }
+    }
+
+    /// The atom's attributes, as an editor node carries them.
+    pub fn attrs(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Embed::Table { id } => vec![(embed_attrs::SHEET, id.clone())],
+            Embed::Node { kind, node, title, table } => {
+                let mut out = vec![(embed_attrs::NODE, node.to_string()), (embed_attrs::KIND, kind.clone())];
+                if let Some(table) = table {
+                    out.push((embed_attrs::TABLE, table.clone()));
+                }
+                if let Some(title) = title {
+                    out.push((embed_attrs::TITLE, title.clone()));
+                }
+                out
+            }
+        }
+    }
+
+    /// What an atom with these attributes shows (`get` reads one by name), if it is
+    /// one of Pimble's. An empty table id or an unreadable link is none.
+    pub fn from_attrs<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Option<Embed> {
+        if let Some(id) = get(embed_attrs::SHEET).filter(|id| !id.is_empty()) {
+            return Some(Embed::Table { id: id.to_string() });
+        }
+        let kind = get(embed_attrs::KIND).filter(|k| !k.is_empty())?;
+        let node = pimble_core::PimbleUrl::parse(get(embed_attrs::NODE)?)?;
+        Some(Embed::Node {
+            kind: kind.to_string(),
+            node,
+            title: get(embed_attrs::TITLE).map(str::to_string),
+            table: get(embed_attrs::TABLE).filter(|t| !t.is_empty()).map(str::to_string),
+        })
+    }
+
+    /// The atom as one line of Markdown, written by rinch's own writer, so its
+    /// attributes are in the order and escaping the strict reader takes as one atom
+    /// (anything else is read as HTML and refused).
+    pub fn to_markdown(&self) -> String {
+        let schema = Schema::starter_kit();
+        let attrs = self.attrs().into_iter().fold(rinch_editor_core::Attrs::new(), |a, (k, v)| a.with(k, v.as_str()));
+        let written = schema
+            .create_node("embed", attrs, Fragment::empty())
+            .and_then(|atom| schema.create_node("doc", rinch_editor_core::Attrs::new(), Fragment::from_node(atom)))
+            .map(|doc| doc_to_markdown(&doc))
+            .unwrap_or_default();
+        format!("{}\n", written.trim_end())
+    }
+
+    /// The atom a line of Markdown (as [`render`] writes a node's text) is, if it is
+    /// one of Pimble's and nothing else.
+    pub fn from_markdown_line(line: &str) -> Option<Embed> {
+        let line = line.trim();
+        if !line.starts_with("<div") || !line.contains("data-pm-type=\"embed\"") {
+            return None;
+        }
+        let doc = doc_from_markdown_strict(&Schema::starter_kit(), line).ok()?;
+        if doc.child_count() != 1 || doc.child(0).type_name() != "embed" {
+            return None;
+        }
+        let atom = doc.child(0);
+        Embed::from_attrs(|name| atom.attrs().get_str(name))
+    }
+}
+
 // ── Naming a block ───────────────────────────────────────────────────────
 
 /// The text a quote is matched against: a textblock's text, atoms as [`ATOM`].
@@ -884,6 +1003,40 @@ mod tests {
         assert_eq!(render(swapped.last().unwrap()), "four\n\none\n\ntwo\n\nthree");
         assert!(is_blank(replace_content(&s, &d, "").unwrap().last().unwrap()));
         assert!(replace_content(&s, &d, "one\n\ntwo\n\nthree\n\nfour").unwrap().is_empty());
+    }
+
+    /// The embed atoms write exactly what the MCP wrote by hand before they were
+    /// typed (rinch's attribute order), and read back as what they were.
+    #[test]
+    fn embeds_write_rinchs_element_and_read_back() {
+        let url = pimble_core::PimbleUrl::node(pimble_core::StoreId::new(), pimble_core::NodeId::new());
+        let table = Embed::Table { id: "t1".to_string() };
+        assert_eq!(table.to_markdown(), "<div data-pm-type=\"embed\" data-sheet=\"t1\"></div>\n");
+        let talk = Embed::discussion(url.clone(), Some("Say \"hi\"".to_string()));
+        assert_eq!(
+            talk.to_markdown(),
+            format!("<div data-pm-type=\"embed\" data-kind=\"discussion\" data-node=\"{url}\" data-title=\"Say &quot;hi&quot;\"></div>\n")
+        );
+        let sheet = Embed::Node { kind: embed_attrs::KIND_SHEET.to_string(), node: url.clone(), title: Some("A & <b>".into()), table: Some("t2".into()) };
+        for embed in [table, talk, sheet, Embed::sheet_node(url.clone(), None)] {
+            let line = embed.to_markdown();
+            assert_eq!(Embed::from_markdown_line(&line), Some(embed.clone()), "{line}");
+            // A node's text renders the atom as that line, and takes it back as one atom.
+            let s = schema();
+            let d = parse(&s, &format!("before\n\n{line}\nafter")).unwrap();
+            assert_eq!(d.child_count(), 3);
+            let rendered = render(&d);
+            let lines: Vec<Embed> = rendered.lines().filter_map(Embed::from_markdown_line).collect();
+            assert_eq!(lines, vec![embed.clone()], "{rendered}");
+            let attrs = embed.attrs();
+            assert_eq!(Embed::from_attrs(|name| attrs.iter().find(|(k, _)| *k == name).map(|(_, v)| v.as_str())), Some(embed));
+        }
+        assert_eq!(Embed::sheet_node(url.clone(), None).node_of_kind(embed_attrs::KIND_SHEET), Some(&url));
+        assert_eq!(Embed::discussion(url.clone(), None).node_of_kind(embed_attrs::KIND_SHEET), None);
+        // Not an atom: text, other HTML, an embed with nothing Pimble's in it.
+        assert_eq!(Embed::from_markdown_line("some text"), None);
+        assert_eq!(Embed::from_markdown_line("<div>x</div>"), None);
+        assert_eq!(Embed::from_markdown_line("<div data-pm-type=\"embed\" data-sheet=\"\"></div>"), None);
     }
 
     fn same_text(a: &Node, b: &Node) -> bool {

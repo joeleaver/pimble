@@ -7,6 +7,9 @@
 //! - The tree over node documents (`Tree`): the operations, validation and
 //!   repair, each edit reported per document (`TreeEdit`); a node never leaves
 //!   a share, so a move that would is a transplant (docs/MOVE_CONTRACT.md)
+//! - The rules every holder of a store's documents applies alike (`rules`):
+//!   notifications from a merge, scope repair, the documents' root, Recently
+//!   Deleted, link hops, node assembly, move checks
 //! - The previous layout, until wave 2 switches the workspace over: per-node
 //!   content documents (`ContentDoc`) and the store document (`StoreDocument`)
 //! - Shared error types
@@ -19,6 +22,7 @@ pub mod links;
 pub mod markdown;
 pub mod node_doc;
 pub mod order;
+pub mod rules;
 pub mod store_document;
 pub mod tree;
 mod sync_util;
@@ -30,5 +34,6 @@ pub use error::*;
 pub use node_doc::{NodeDoc, NodeFields, NodeUpdateEffect, ROOT_CHILDREN, ROOT_DATA, ROOT_NODE};
 pub use store_document::*;
 pub use links::{LinkRef, Resolved, Spot};
+pub use rules::{derive_changes, move_order, DeletedEntry, DocShape, LinkHop, LinkWalk, MoveRefused, NodeChange};
 pub use tree::{Cutting, CuttingNode, Planted, Tree, TreeEdit};
 pub use sync_util::{advance_state_vector, empty_state_vector, state_vector_exceeds};

@@ -10,6 +10,7 @@
 //! under the text, "Tables no longer in the text", with "Put Back": nothing
 //! is deleted behind the person's back.
 
+use pimble_crdt::markdown::{embed_attrs, Embed};
 use rinch_editor_core::Attrs;
 
 use super::*;
@@ -17,24 +18,14 @@ use crate::rinch_editor::{EditorKey, NodeViewCtx, NodeViewRegistration, NodeView
 
 /// The embed attribute naming its table (a `data-*` attribute, which rinch
 /// keeps and merges per attribute; rinch knows nothing of what it means).
-pub(crate) const SHEET_ATTR: &str = "data-sheet";
+pub(crate) const SHEET_ATTR: &str = embed_attrs::SHEET;
 
-/// The embed attributes naming a sheet node shown in the text (contract
-/// section 1, "a sheet node embedded"): the node as a `pimble:` link, which
-/// any reader of the content counts as a link to it; its kind, which says
-/// this view draws it; and optionally the one table shown.
-pub(crate) const NODE_ATTR: &str = "data-node";
-pub(crate) const KIND_ATTR: &str = "data-kind";
-pub(crate) const KIND_SHEET: &str = "sheet";
-pub(crate) const TABLE_ATTR: &str = "data-table";
-pub(crate) const TITLE_ATTR: &str = "data-title";
-
-/// The sheet node an embed's attributes name, if they name one.
+/// The sheet node an embed's attributes name, if they name one (contract
+/// section 1, "a sheet node embedded": the node as a `pimble:` link, its
+/// kind, which says this view draws it, and optionally the one table shown).
 fn embedded_node(attrs: &Attrs) -> Option<(StoreId, NodeId)> {
-    if attrs.get_str(KIND_ATTR) != Some(KIND_SHEET) {
-        return None;
-    }
-    let url = pimble_core::PimbleUrl::parse(attrs.get_str(NODE_ATTR)?)?;
+    let embed = crate::rinch_editor::embed_of(attrs)?;
+    let url = embed.node_of_kind(embed_attrs::KIND_SHEET)?;
     Some((url.store, url.node))
 }
 
@@ -101,13 +92,13 @@ fn render_node_embed(__scope: &mut RenderScope, store: AppStore, pane: PaneId, c
     let ui = store.pane(pane).sheet_ui;
     let attrs = ctx.attrs;
     let node = move || embedded_node(&attrs.get());
-    let only = move || attrs.get().get_str(TABLE_ATTR).filter(|t| !t.is_empty()).map(str::to_string);
+    let only = move || attrs.get().get_str(embed_attrs::TABLE).filter(|t| !t.is_empty()).map(str::to_string);
     let title = move || match node() {
         Some((s, n)) if store.get_node_signal(s, n).is_some() => store.display_label(s, n),
-        _ => attrs.get().get_str(TITLE_ATTR).unwrap_or("Sheet").to_string(),
+        _ => attrs.get().get_str(embed_attrs::TITLE).unwrap_or("Sheet").to_string(),
     };
     let open = move || {
-        if let Some(href) = untracked(|| attrs.get()).get_str(NODE_ATTR).map(str::to_string) {
+        if let Some(href) = untracked(|| attrs.get()).get_str(embed_attrs::NODE).map(str::to_string) {
             crate::links::follow_href(store, &href);
         }
     };
@@ -154,10 +145,12 @@ pub(crate) fn embedded_nodes(pane: PaneId) -> Vec<(StoreId, NodeId)> {
 
 /// The attributes of an embed of sheet node `(store_id, node_id)`.
 pub(crate) fn node_embed_attrs(store: AppStore, store_id: StoreId, node_id: NodeId) -> Attrs {
-    Attrs::new()
-        .with(NODE_ATTR, pimble_core::PimbleUrl::node(store_id, node_id).to_string())
-        .with(KIND_ATTR, KIND_SHEET)
-        .with(TITLE_ATTR, store.display_label(store_id, node_id))
+    sheet_node_attrs(store_id, node_id, store.display_label(store_id, node_id))
+}
+
+/// The attributes of an embed of sheet node `(store_id, node_id)` titled `title`.
+fn sheet_node_attrs(store_id: StoreId, node_id: NodeId, title: String) -> Attrs {
+    crate::rinch_editor::embed_attrs(&Embed::sheet_node(pimble_core::PimbleUrl::node(store_id, node_id), Some(title)))
 }
 
 /// Insert > "Sheet from a Node...": the picker, sheet nodes only; the pick
@@ -432,12 +425,6 @@ pub(crate) fn render_lost(__scope: &mut RenderScope, store: AppStore, pane: Pane
 
 // ── Convert to Sheet Node ────────────────────────────────────────────────
 
-/// "Convert to Sheet Node" refused: a row link ties the table to another of
-/// the note's tables, and a row link points within its own node only.
-fn tied_sentence(name: &str) -> String {
-    format!("A link column ties {name} to another table of this note, and a link reaches rows of its own note only, so it cannot move to a node of its own.")
-}
-
 /// A table on its way to a sheet node of its own.
 struct ConvertJob {
     pane: PaneId,
@@ -464,9 +451,8 @@ pub(crate) fn convert_to_sheet_node(store: AppStore, pane: PaneId, table: &str) 
     }
     let Some(snap) = snapshot(pane) else { return };
     let Some(t) = snap.table(table).cloned() else { return };
-    let tied = !t.row_links().is_empty() || snap.tables.iter().any(|o| o.id != t.id && o.row_links().contains(&t.id));
-    if tied {
-        say(store, pane, tied_sentence(&t.name));
+    if pimble_sheet::ops::tied(&snap, &t) {
+        say(store, pane, pimble_sheet::ops::tied_sentence(&t.name));
         return;
     }
     // Its formulas name this note's tables with the note (references across
@@ -510,7 +496,7 @@ pub(crate) fn node_created(store: AppStore, request: u64, store_id: StoreId, nod
         crate::events::show_notice(store, "The note was closed before the sheet node was made; the table is in both.".to_string());
         return;
     }
-    let embed_attrs = node_embed_attrs(store, store_id, node_id).with(TITLE_ATTR, job.title.as_str());
+    let attrs = sheet_node_attrs(store_id, node_id, job.title.clone());
     let table = job.table.clone();
     crate::editor::editor(job.pane).update(move |state| {
         let mut at = Vec::new();
@@ -525,7 +511,7 @@ pub(crate) fn node_created(store: AppStore, request: u64, store_id: StoreId, nod
         }
         // In its place, the sheet node it now is, shown live (as "Make Canvas
         // Node" leaves an embed of the canvas node).
-        let embed = state.schema().create_node("embed", embed_attrs, rinch_editor_core::Fragment::empty()).ok()?;
+        let embed = state.schema().create_node("embed", attrs, rinch_editor_core::Fragment::empty()).ok()?;
         let mut tr = state.tr();
         for (pos, size) in at.into_iter().rev() {
             tr.replace_with(pos, pos + size, rinch_editor_core::Fragment::from_node(embed.clone())).ok()?;
@@ -541,25 +527,11 @@ pub(crate) fn node_created(store: AppStore, request: u64, store_id: StoreId, nod
         t.delete_table(&job.table)?;
         for table in &rest {
             let after = table.map_formulas(|f| formula::rehome::left_behind(f, &job.table, &to));
-            write_formulas(t, table, &after)?;
+            pimble_sheet::ops::write_formulas(t, table, &after)?;
         }
         Ok(())
     });
     text_changed(job.pane);
-}
-
-/// Write the formulas and source of `after` where they differ from `before`
-/// (the same table, rewritten).
-fn write_formulas(t: &mut doc::SheetsTxn<'_, '_>, before: &pimble_sheet::TableSnap, after: &pimble_sheet::TableSnap) -> doc::Result<()> {
-    if after.source != before.source {
-        t.set_source(&after.id, after.source.as_deref())?;
-    }
-    for (old, new) in before.columns.iter().zip(&after.columns) {
-        if old.ty != new.ty {
-            t.set_column_type(&after.id, &new.id, new.ty.clone())?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -5,11 +5,11 @@
 
 use std::collections::HashMap;
 
-use chrono::{Datelike, NaiveDate};
-use pimble_core::{NodeId, StoreId};
+use chrono::NaiveDate;
+use pimble_sheet::book::{find_by_path, serial_of, shortest_path};
 use pimble_sheet::formula::ast::{Expr, ExprKind, NoteName};
-use pimble_sheet::formula::{self, dates};
-use pimble_sheet::{Book, ColumnType, NodeInfo, NodeRef, Reach, SheetsSnap};
+use pimble_sheet::formula;
+use pimble_sheet::{Book, NodeInfo, NodeRef, Reach, SheetsSnap, Titles};
 
 /// Why a node's sheets cannot be read (the states of contract section 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,8 +107,14 @@ impl McpBook {
     }
 }
 
-fn lower(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+impl Titles for McpBook {
+    fn candidates(&self) -> Vec<NodeRef> {
+        self.nodes.keys().copied().collect()
+    }
+
+    fn title_and_parent(&self, node: &NodeRef) -> Option<(String, Option<NodeRef>)> {
+        self.known(node).map(|k| (k.title.clone(), k.parent))
+    }
 }
 
 impl Book for McpBook {
@@ -134,93 +140,16 @@ impl Book for McpBook {
     }
 
     fn find_nodes(&self, name_or_path: &str) -> Vec<NodeRef> {
-        let parts: Vec<String> = name_or_path.split('/').map(lower).filter(|p| !p.is_empty()).collect();
-        let Some(last) = parts.last() else { return Vec::new() };
-        let mut found: Vec<NodeRef> = self
-            .nodes
-            .iter()
-            .filter(|(_, k)| lower(&k.title) == *last)
-            .filter(|(_, k)| {
-                // Each earlier part names the parent of the part after it: a
-                // path is a run of titles down the tree, starting anywhere.
-                // (A path that could skip levels would leave a note with a
-                // namesake below it, under one ancestor, with no unique name.)
-                let mut parent = k.parent;
-                for part in parts.iter().rev().skip(1) {
-                    let Some(p) = parent else { return false };
-                    let Some(up) = self.known(&p) else { return false };
-                    if lower(&up.title) != *part {
-                        return false;
-                    }
-                    parent = up.parent;
-                }
-                true
-            })
-            .map(|(n, _)| *n)
-            .collect();
-        found.sort_by_key(|n| (n.store.0, n.node.0));
-        found
+        find_by_path(self, name_or_path)
     }
 
     fn display_name(&self, node: &NodeRef) -> String {
-        let Some(k) = self.known(node) else { return "That note".to_string() };
-        let mut path = k.title.clone();
-        let mut parent = k.parent;
-        // The shortest path from an ancestor that names this node alone.
-        for _ in 0..12 {
-            if self.find_nodes(&path).len() <= 1 {
-                break;
-            }
-            let Some(p) = parent else { break };
-            let Some(up) = self.known(&p) else { break };
-            path = format!("{}/{path}", up.title);
-            parent = up.parent;
-        }
-        path
+        shortest_path(self, node)
     }
 
     fn today(&self) -> f64 {
         serial_of(self.today)
     }
-}
-
-/// A date as an Excel serial number.
-pub fn serial_of(d: NaiveDate) -> f64 {
-    dates::serial(d.year() as i64, d.month() as i64, d.day() as i64) as f64
-}
-
-/// The nodes a stored formula names (`{n:<store>/<node>}`).
-pub fn named_nodes(stored: &str) -> Vec<NodeRef> {
-    let mut out = Vec::new();
-    let mut rest = stored;
-    while let Some(at) = rest.find("{n:") {
-        rest = &rest[at + 3..];
-        let Some(end) = rest.find('}') else { break };
-        if let Some((s, n)) = rest[..end].split_once('/') {
-            if let (Ok(s), Ok(n)) = (uuid::Uuid::parse_str(s), uuid::Uuid::parse_str(n)) {
-                out.push(NodeRef { store: StoreId(s), node: NodeId(n) });
-            }
-        }
-        rest = &rest[end..];
-    }
-    out
-}
-
-/// Every stored formula of a node's tables: summaries' sources and formula
-/// columns'.
-pub fn formulas_of(snap: &SheetsSnap) -> Vec<&str> {
-    let mut all = Vec::new();
-    for t in &snap.tables {
-        if let Some(s) = &t.source {
-            all.push(s.as_str());
-        }
-        for c in &t.columns {
-            if let ColumnType::Formula { formula, .. } = &c.ty {
-                all.push(formula.as_str());
-            }
-        }
-    }
-    all
 }
 
 /// The note names a formula as typed uses before a `!` (`'Household
@@ -273,6 +202,8 @@ pub fn reads_table(stored: &str, formula_node: &NodeRef, target: &NodeRef, table
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pimble_core::{NodeId, StoreId};
+    use pimble_sheet::book::named_nodes;
 
     fn r(n: u128) -> NodeRef {
         NodeRef { store: StoreId(uuid::Uuid::from_u128(7)), node: NodeId(uuid::Uuid::from_u128(n)) }

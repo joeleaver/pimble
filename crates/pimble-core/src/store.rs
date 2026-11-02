@@ -343,6 +343,62 @@ impl StoreAccess {
     pub fn is_full(&self) -> bool {
         matches!(self, StoreAccess::Full)
     }
+
+    // ── The role judgement (docs/NODE_DOCUMENT_CONTRACT.md section 5,
+    // "Roles"; docs/DISCUSSIONS_CONTRACT.md section 7). One rule, read by
+    // the hosted server, a desktop's replica and the browser's vault client:
+    // a role's access, the widest of the roles that reach a document, held
+    // no wider than the device holds the store, and a commenter writing a
+    // discussion as an editor does.
+
+    /// What a grant's role lets its holder do, by the accounts service's
+    /// names: a reader reads, a commenter writes discussions, an editor or
+    /// owner edits. Any other name reads as an editor's: the server that
+    /// takes the write judges it again, from the token.
+    pub fn of_role(role: &str) -> StoreAccess {
+        match role {
+            "reader" => StoreAccess::Read,
+            "commenter" => StoreAccess::Comment,
+            _ => StoreAccess::Full,
+        }
+    }
+
+    /// How much this access allows, for comparing two.
+    fn rank(self) -> u8 {
+        match self {
+            StoreAccess::Read => 0,
+            StoreAccess::Comment => 1,
+            StoreAccess::Full => 2,
+        }
+    }
+
+    /// The widest of several roles' access (`None` for none): a document
+    /// under a reader's root nested in an editor's takes the wider role,
+    /// and a reader of one folder who edits another is `Full` in the store
+    /// as a whole, the writes under the read-only root refused one at a time.
+    pub fn widest(accesses: impl IntoIterator<Item = StoreAccess>) -> Option<StoreAccess> {
+        accesses.into_iter().max_by_key(|access| access.rank())
+    }
+
+    /// The narrower of two: what a role allows, held no wider than the
+    /// device holds the store (a replica held to read refuses an owner's
+    /// writes too).
+    pub fn narrower(self, other: StoreAccess) -> StoreAccess {
+        if other.rank() < self.rank() {
+            other
+        } else {
+            self
+        }
+    }
+
+    /// What this access allows of one document: a commenter writes a
+    /// discussion as an editor does, and only comments on anything else.
+    pub fn on_document(self, is_discussion: bool) -> StoreAccess {
+        match self {
+            StoreAccess::Comment if is_discussion => StoreAccess::Full,
+            access => access,
+        }
+    }
 }
 
 /// Authentication method for remote stores

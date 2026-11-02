@@ -15,7 +15,7 @@
 //! - `applyEdit` (a client's keystroke, a sync or vault link relaying a
 //!   peer's update) merges any update into a document through
 //!   [`RpcHandler::apply_node_update_from`], which derives the kinds from
-//!   what the merge changed (see [`derive_kinds`]) and broadcasts them with
+//!   what the merge changed (see `pimble_crdt::derive_changes`) and broadcasts them with
 //!   the same bytes. A merge that changed nothing does nothing at all
 //!   (docs/history/HARDENING_CONTRACT.md decision 8).
 //!
@@ -50,8 +50,8 @@ use jsonrpsee::core::{async_trait, SubscriptionResult};
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{Extensions, PendingSubscriptionSink, SubscriptionMessage};
 use pimble_client::{describe_connect_error, PimbleClient};
-use pimble_core::{AuthMethod, BlobUrl, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, Place, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState};
-use pimble_crdt::{NodeDoc, NodeFields, NodeUpdateEffect, Tree, TreeEdit};
+use pimble_core::{AuthMethod, BlobUrl, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState};
+use pimble_crdt::{derive_changes, move_order, LinkHop, LinkWalk, NodeDoc, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_plugins::PluginHost;
 use pimble_rpc::{
     encrypted_store_error, index_building_error, snapshot_required_error, to_rpc_error, ApplyEditRequest, ApplyEditResponse, ResolveLinkRequest, ResolveLinkResponse,
@@ -241,13 +241,6 @@ impl Reach {
     }
 }
 
-/// What one hop of `resolveLink` found: an answer, or a tombstone's
-/// `became` to follow.
-enum LinkHop {
-    Done(LinkResolution),
-    Became((StoreId, NodeId)),
-}
-
 /// `Ok` when `reach` is `None` (the principal reaches the whole store, and
 /// `authorize` has judged its role) or covers `id` for `needed`.
 fn require_in_scope(reach: &Option<Reach>, id: NodeId, needed: Access) -> Result<(), ErrorObjectOwned> {
@@ -302,17 +295,24 @@ fn require_doc_write(manager: &StoreManager, principal: &Principal, reach: &Opti
 /// that are edited). `Read` if either refuses, else `Full`. `reach` is the
 /// caller's in `store_id`, computed once for a list.
 fn judge_access(manager: &StoreManager, principal: &Principal, reach: &Option<Reach>, store_id: StoreId, id: NodeId) -> StoreAccess {
-    let role_allows = authorize(principal, store_id, Access::Write).is_ok() && require_in_scope(reach, id, Access::Write).is_ok();
-    if role_allows && !manager.write_refused(store_id, &[id]) {
+    let role = if authorize(principal, store_id, Access::Write).is_ok() && require_in_scope(reach, id, Access::Write).is_ok() {
         StoreAccess::Full
-    } else if may_comment(principal, reach, store_id, id) && !manager.comment_refused(store_id, &[id]) {
-        // A commenter writes a discussion as an editor does, and starts
-        // one on anything else they reach (docs/DISCUSSIONS_CONTRACT.md
-        // section 7).
-        if manager.is_discussion(store_id, id) { StoreAccess::Full } else { StoreAccess::Comment }
+    } else if may_comment(principal, reach, store_id, id) {
+        StoreAccess::Comment
     } else {
         StoreAccess::Read
-    }
+    };
+    let held = if !manager.write_refused(store_id, &[id]) {
+        StoreAccess::Full
+    } else if !manager.comment_refused(store_id, &[id]) {
+        StoreAccess::Comment
+    } else {
+        StoreAccess::Read
+    };
+    // A commenter writes a discussion as an editor does, and starts one on
+    // anything else they reach (docs/DISCUSSIONS_CONTRACT.md section 7): the
+    // rule the browser's vault client judges its nodes by too.
+    role.narrower(held).on_document(manager.is_discussion(store_id, id))
 }
 
 /// The parent a node document's update names, for admitting a scoped
@@ -631,41 +631,6 @@ fn build_index_node(store_id: StoreId, node: &Node, plugin_host: &PluginHost) ->
 
 // ── Deriving notifications from a merged update ────────────────────────
 
-/// What a node document says about the node before or after a merge: the
-/// `node` root as fields (`None` while the document is not initialised) and
-/// the children list as stored.
-struct DocShape {
-    fields: Option<NodeFields>,
-    children: Vec<NodeId>,
-}
-
-/// The shape of `id`'s document, `None` when the store holds none.
-fn shape_of(tree: &Tree, id: NodeId) -> Option<DocShape> {
-    tree.doc(id).map(|doc| DocShape { fields: doc.fields().ok(), children: doc.children() })
-}
-
-/// The scope root on `id`'s stored parent chain, nearest first, through
-/// held documents (tombstones included: a deleted document stays with its
-/// scope) — `listDeleted`'s `put_back_under` for a live node no list names
-/// (docs/MOVE_CONTRACT.md "Seeing and undoing what was removed"). `None`
-/// when `id` is not reached by any of `scope_roots` (a whole store, where
-/// `scope_roots` is empty, or a document outside every scope this replica
-/// holds). Bounded, so an unrepaired cycle cannot loop.
-fn scope_root_reaching(tree: &Tree, scope_roots: &HashSet<NodeId>, id: NodeId) -> Option<NodeId> {
-    let mut cur = id;
-    for _ in 0..=tree.ids().len() {
-        if scope_roots.contains(&cur) {
-            return Some(cur);
-        }
-        let fields = tree.doc(cur)?.fields().ok()?;
-        match fields.parent_id {
-            Some(parent) if tree.doc(parent).is_some() => cur = parent,
-            _ => return None,
-        }
-    }
-    None
-}
-
 /// Every held document in `store_id` whose stored list currently names
 /// `node_id` (docs/MOVE_CONTRACT.md "The list a move leaves is the list
 /// that names the node, not the node's `parent_id`"): a node's stored
@@ -712,85 +677,6 @@ fn judge_move_source(manager: &StoreManager, reach: &Option<Reach>, store_id: St
         return Err(write_refusal(&manager, store_id, &judged_ids));
     }
     Ok(listing.first().copied().unwrap_or(stored_parent_id))
-}
-
-/// The notifications a merged update earns, from what it changed in the
-/// document (docs/NODE_DOCUMENT_CONTRACT.md section 2): the `node` root
-/// newly written is `NodeCreated` (or `NodeDeleted` when it arrived as a
-/// tombstone, or `TreeStructure` for a root, which has no parent to name);
-/// a tombstone set is `NodeDeleted`, cleared is `NodeCreated` again (the
-/// node is back under its parent); a changed `parent_id` is `NodeMoved`;
-/// any other change to the `node` root is `MetadataUpdated`; a changed
-/// children list is `TreeStructure { [node] }`; a changed `content` root,
-/// or the plugin's `data` root, is `ContentUpdated`. One update can earn
-/// several; a structural change nothing above names (a rewrite of the same
-/// values) still earns `TreeStructure`, so that its bytes travel down a
-/// chain of links. `root` stands in for a parent no document names.
-fn derive_kinds(node_id: NodeId, root: NodeId, before: Option<&DocShape>, after: Option<&DocShape>, effect: NodeUpdateEffect) -> Vec<StoreChangeKind> {
-    let mut kinds = Vec::new();
-    if effect.structure {
-        let before_fields = before.and_then(|s| s.fields.as_ref());
-        let after_fields = after.and_then(|s| s.fields.as_ref());
-        // An attachment (docs/DISCUSSIONS_CONTRACT.md section 1) is in no
-        // list: its arrival, deletion and return are news for its host.
-        if let Some(host_id) = after_fields.and_then(|a| a.attached_to) {
-            let was_live = before_fields.is_some_and(|b| b.deleted_at.is_none());
-            let live = after_fields.is_some_and(|a| a.deleted_at.is_none());
-            if was_live != live {
-                kinds.push(StoreChangeKind::AttachmentChanged { node_id, host_id, live });
-            } else if before_fields != after_fields {
-                kinds.push(StoreChangeKind::MetadataUpdated { node_id });
-            }
-            if effect.content || effect.data {
-                kinds.push(StoreChangeKind::ContentUpdated { node_id });
-            }
-            if kinds.is_empty() {
-                kinds.push(StoreChangeKind::MetadataUpdated { node_id });
-            }
-            return kinds;
-        }
-        let node_kind = match (before_fields, after_fields) {
-            (None, Some(a)) => Some(match (a.deleted_at.is_some(), a.parent_id) {
-                (true, parent) => StoreChangeKind::NodeDeleted { node_id, parent_id: parent.unwrap_or(root) },
-                (false, Some(parent_id)) => StoreChangeKind::NodeCreated { node_id, parent_id },
-                (false, None) => StoreChangeKind::TreeStructure { node_ids: vec![node_id] },
-            }),
-            (Some(b), Some(a)) => {
-                if b.deleted_at.is_none() && a.deleted_at.is_some() {
-                    Some(StoreChangeKind::NodeDeleted { node_id, parent_id: b.parent_id.or(a.parent_id).unwrap_or(root) })
-                } else if b.deleted_at.is_some() && a.deleted_at.is_none() {
-                    Some(StoreChangeKind::NodeCreated { node_id, parent_id: a.parent_id.unwrap_or(root) })
-                } else if b.parent_id != a.parent_id {
-                    Some(StoreChangeKind::NodeMoved {
-                        node_id,
-                        old_parent_id: b.parent_id.unwrap_or(root),
-                        new_parent_id: a.parent_id.unwrap_or(root),
-                    })
-                } else if b != a {
-                    Some(StoreChangeKind::MetadataUpdated { node_id })
-                } else {
-                    None
-                }
-            }
-            // An initialised `node` root cannot become uninitialised, and
-            // a change that touched neither side of it is a list change.
-            (Some(_), None) | (None, None) => None,
-        };
-        let named_the_list = matches!(node_kind, Some(StoreChangeKind::TreeStructure { .. }));
-        kinds.extend(node_kind);
-        let before_children = before.map(|s| s.children.as_slice()).unwrap_or(&[]);
-        let after_children = after.map(|s| s.children.as_slice()).unwrap_or(&[]);
-        if (before_children != after_children || kinds.is_empty()) && !named_the_list {
-            kinds.push(StoreChangeKind::TreeStructure { node_ids: vec![node_id] });
-        }
-    }
-    if effect.content || effect.data {
-        kinds.push(StoreChangeKind::ContentUpdated { node_id });
-    }
-    if kinds.is_empty() {
-        kinds.push(StoreChangeKind::TreeStructure { node_ids: vec![node_id] });
-    }
-    kinds
 }
 
 /// What the index does about a derived kind. A tombstone is removed; a
@@ -1436,17 +1322,12 @@ impl RpcHandler {
         if manager.under_ended_root(store_id, node_id) {
             return LinkHop::Done(LinkResolution::NoAccess);
         }
-        let fields = manager.tree(store_id).ok().and_then(|tree| tree.doc(node_id)).map(|doc| doc.fields());
-        match fields {
-            None if manager.scope_roots(store_id).is_empty() => LinkHop::Done(LinkResolution::Missing),
-            None => LinkHop::Done(LinkResolution::NoAccess),
-            // A document whose `node` root has not arrived is not a node yet.
-            Some(Err(_)) => LinkHop::Done(LinkResolution::Missing),
-            Some(Ok(fields)) => match (fields.deleted_at, fields.became) {
-                (Some(_), Some(became)) => LinkHop::Became((became.store, became.node)),
-                (Some(_), None) => LinkHop::Done(LinkResolution::Deleted { store_id, node_id }),
-                (None, _) => LinkHop::Done(LinkResolution::Live { store_id, node_id }),
-            },
+        // The hop itself, over the documents, by the rule the browser's
+        // vault client follows too.
+        match manager.tree(store_id) {
+            Ok(tree) => tree.link_hop(store_id, node_id, !manager.scope_roots(store_id).is_empty()),
+            Err(_) if manager.scope_roots(store_id).is_empty() => LinkHop::Done(LinkResolution::Missing),
+            Err(_) => LinkHop::Done(LinkResolution::NoAccess),
         }
     }
 
@@ -2508,7 +2389,7 @@ impl RpcHandler {
 
     /// Merge `update` into `node_id`'s document (creating it when unknown),
     /// persist on the flush debounce, derive the notifications from what it
-    /// changed (see [`derive_kinds`]) and broadcast them with `update` as
+    /// changed (see `pimble_crdt::derive_changes`) and broadcast them with `update` as
     /// their bytes, feed the index, and settle the tree per `repair`. The
     /// one path a peer's update takes into a store: `applyEdit` from a
     /// client, and a sync or vault link applying what its remote sent.
@@ -2525,14 +2406,18 @@ impl RpcHandler {
     ) -> Result<NodeUpdateEffect, ErrorObjectOwned> {
         let (effect, kinds) = {
             let mut manager = self.store_manager.write().await;
-            let before = shape_of(manager.tree(store_id).map_err(to_rpc_error)?, node_id);
+            let before = manager.tree(store_id).map_err(to_rpc_error)?.shape(node_id);
             let effect = manager.apply_node_update(store_id, node_id, update).map_err(to_rpc_error)?;
             if !effect.changed {
                 return Ok(effect);
             }
             let tree = manager.tree(store_id).map_err(to_rpc_error)?;
-            let after = shape_of(tree, node_id);
-            (effect, derive_kinds(node_id, tree.root(), before.as_ref(), after.as_ref(), effect))
+            let after = tree.shape(node_id);
+            // What the merge changed, by the one derivation the browser's
+            // vault client makes too (`pimble_crdt::derive_changes`).
+            let kinds: Vec<StoreChangeKind> =
+                derive_changes(node_id, tree.root(), before.as_ref(), after.as_ref(), effect).into_iter().map(StoreChangeKind::from).collect();
+            (effect, kinds)
         };
 
         self.schedule_content_flush(store_id);
@@ -4321,12 +4206,11 @@ impl PimbleApiServer for RpcHandler {
         let principal = principal_of(ext);
         authorize(&principal, request.store_id, Access::Write)?;
         self.reject_if_vault(request.store_id).await?;
-        let mut node_ids: Vec<NodeId> = Vec::with_capacity(request.node_ids.len());
-        for id in &request.node_ids {
-            if !node_ids.contains(id) {
-                node_ids.push(*id);
-            }
-        }
+        // Each node once, and the order to move them in (`move_order`, the
+        // browser's vault client's too): every node goes to the same place,
+        // the last first, so they keep their order without waiting on the
+        // ids transplants give them; at the end they simply go in order.
+        let (node_ids, order) = move_order(&request.node_ids, request.place);
 
         // Every node is judged before any is moved: one refusal refuses
         // them all (docs/TREE_CONTRACT.md, Joe 2026-10-19).
@@ -4340,23 +4224,12 @@ impl PimbleApiServer for RpcHandler {
             let tree = manager.tree(request.store_id).map_err(to_rpc_error)?;
             for &id in &node_ids {
                 judge_move_source(&manager, &reach, request.store_id, id)?;
-                let under = tree.subtree_ids(id).unwrap_or_else(|_| vec![id]);
-                if under.contains(&request.new_parent_id) {
-                    return Err(to_rpc_error(pimble_store::StoreError::InvalidOperation(
-                        "Cannot move a node into one of its own descendants".into(),
-                    )));
-                }
+                tree.check_move(id, request.new_parent_id).map_err(|refused| to_rpc_error(pimble_store::StoreError::from(refused)))?;
             }
         }
 
-        // Then each through `moveNode`. To keep their order without
-        // waiting on the ids transplants give them, every node goes to the
-        // same place, the last first; at the end they simply go in order.
+        // Then each through `moveNode`.
         let mut answers: HashMap<NodeId, MoveNodeResponse> = HashMap::new();
-        let order: Vec<NodeId> = match request.place {
-            Place::Last => node_ids.clone(),
-            _ => node_ids.iter().rev().copied().collect(),
-        };
         for id in order {
             let answer = self
                 .move_node(
@@ -4475,19 +4348,14 @@ impl PimbleApiServer for RpcHandler {
         request: ResolveLinkRequest,
     ) -> Result<ResolveLinkResponse, ErrorObjectOwned> {
         let principal = principal_of(ext);
-        let mut at = (request.store_id, request.node_id);
-        let mut seen = HashSet::new();
-        for _ in 0..=MAX_LINK_HOPS {
-            if !seen.insert(at) {
-                break;
-            }
-            match self.link_hop(&principal, at.0, at.1).await {
-                LinkHop::Done(resolution) => return Ok(ResolveLinkResponse { resolution }),
-                LinkHop::Became(next) => at = next,
+        let mut walk = LinkWalk::new(request.store_id, request.node_id);
+        while let Some((store_id, node_id)) = walk.next() {
+            if let Some(resolution) = walk.took(self.link_hop(&principal, store_id, node_id).await) {
+                return Ok(ResolveLinkResponse { resolution });
             }
         }
         // A chain that loops or runs past the limit leads nowhere.
-        Ok(ResolveLinkResponse { resolution: LinkResolution::Missing })
+        Ok(ResolveLinkResponse { resolution: walk.nowhere() })
     }
 
     async fn list_deleted(
@@ -4503,97 +4371,20 @@ impl PimbleApiServer for RpcHandler {
         let reach = Reach::of(&manager, &principal, request.store_id);
         let tree = manager.tree(request.store_id).map_err(to_rpc_error)?;
         let root = manager.root_node_id(request.store_id).map_err(to_rpc_error)?;
-        let scope_roots: HashSet<NodeId> = manager.scope_roots(request.store_id).into_iter().collect();
+        let scope_roots = manager.scope_roots(request.store_id);
 
-        // Every held document, tombstoned or not: `listDeleted` looks past
-        // ordinary tree reachability on purpose, since exactly the entries
-        // it names are the ones normal reachability leaves out (a
-        // tombstone keeps its list for `undeleteNode`; a node no list
-        // names is unreachable by definition).
-        let mut node_ids: Vec<NodeId> = Vec::new();
-        let mut tombstones: Vec<NodeId> = Vec::new();
-        for id in tree.ids() {
-            let Some(doc) = tree.doc(id) else { continue };
-            let Ok(fields) = doc.fields() else { continue };
-            if fields.deleted_at.is_some() {
-                tombstones.push(id);
-            } else if fields.attached_to.is_none() {
-                // A live attachment is in no list by design
-                // (docs/DISCUSSIONS_CONTRACT.md section 1): never "lost".
-                node_ids.push(id);
-            }
-        }
-
-        // Which lists name which held children, once: a node is "no list
-        // names it" when it is absent from every one of these. Each
-        // owner's raw stored list, read once — `Tree::get_children`'s
-        // filtered view is always a subset of it, so reading that too
-        // would only read the same list twice — and a tombstone's own
-        // (unrepaired) list still counts: it is what `undeleteNode` restores.
-        let mut listed: HashSet<NodeId> = HashSet::new();
-        for &owner in node_ids.iter().chain(tombstones.iter()) {
-            if let Some(doc) = tree.doc(owner) {
-                listed.extend(doc.children());
-            }
-        }
-
+        // The entries by the rule the browser's vault client lists its own
+        // with (`Tree::deleted`). Read access only: a scoped member reads
+        // what `Reach` reaches, same as `getChildren`; a live node under an
+        // ended root is not the account's any more.
+        let shown = |id: NodeId| reach.as_ref().is_none_or(|reach| reach.require(id, Access::Read).is_ok());
+        let ended = |id: NodeId| manager.under_ended_root(request.store_id, id);
         let mut entries: Vec<pimble_core::DeletedNode> = Vec::new();
-
-        // The top-most tombstones: a tombstoned node whose held parent is
-        // not itself tombstoned, or whose parent is not held. Read access
-        // only: a scoped member reads what `Reach` reaches, same as
-        // `getChildren`.
-        let tombstone_set: HashSet<NodeId> = tombstones.iter().copied().collect();
-        let mut top_tombstones: Vec<(NodeId, String)> = Vec::new();
-        for &id in &tombstones {
-            if let Some(reach) = &reach {
-                if reach.require(id, Access::Read).is_err() {
-                    continue;
-                }
-            }
-            let Some(doc) = tree.doc(id) else { continue };
-            let Ok(fields) = doc.fields() else { continue };
-            let is_top = fields.parent_id.map(|p| !tombstone_set.contains(&p)).unwrap_or(true);
-            if !is_top {
-                continue;
-            }
-            let Some(deleted_at) = fields.deleted_at.clone() else { continue };
-            top_tombstones.push((id, deleted_at));
-        }
-        // Most recent first.
-        top_tombstones.sort_by(|a, b| b.1.cmp(&a.1));
-        for (id, deleted_at) in top_tombstones {
-            let fields = tree.doc(id).and_then(|d| d.fields().ok());
-            // An attachment's place is its host.
-            let parent_title = fields
-                .as_ref()
-                .and_then(|f| f.parent_id.or(f.attached_to))
-                .and_then(|p| tree.doc(p))
-                .and_then(|d| d.fields().ok())
-                .map(|f| f.title);
-            let Ok(node) = manager.get_node_any(request.store_id, id) else { continue };
-            entries.push(pimble_core::DeletedNode { node, parent_title, deleted_at: Some(deleted_at), put_back_under: None });
-        }
-
-        // The live nodes no held list names, excluding the store's root and
-        // (on a partial replica) its scope roots and anything under an
-        // ended root: what "Put Back" would move under the scope root that
-        // reaches it, or the store's root on a whole store.
-        for &id in &node_ids {
-            if id == root || scope_roots.contains(&id) || listed.contains(&id) {
-                continue;
-            }
-            if manager.under_ended_root(request.store_id, id) {
-                continue;
-            }
-            if let Some(reach) = &reach {
-                if reach.require(id, Access::Read).is_err() {
-                    continue;
-                }
-            }
-            let Ok(node) = manager.get_node(request.store_id, id) else { continue };
-            let put_back_under = scope_root_reaching(tree, &scope_roots, id).unwrap_or(root);
-            entries.push(pimble_core::DeletedNode { node, parent_title: None, deleted_at: None, put_back_under: Some(put_back_under) });
+        for entry in tree.deleted(root, &scope_roots, shown, ended) {
+            // A tombstone's fields; a live node whole, as `getNode` reads it.
+            let node = if entry.deleted_at.is_some() { manager.get_node_any(request.store_id, entry.id) } else { manager.get_node(request.store_id, entry.id) };
+            let Ok(node) = node else { continue };
+            entries.push(pimble_core::DeletedNode { node, parent_title: entry.parent_title, deleted_at: entry.deleted_at, put_back_under: entry.put_back_under });
         }
 
         Ok(ListDeletedResponse { nodes: entries })
@@ -5579,78 +5370,6 @@ mod tests {
         assert_eq!(fields.tags, vec!["a", "b"]);
         assert_eq!(fields.custom.get("icon"), Some(&serde_json::json!("star")));
         assert_eq!(merged.get_children(root).unwrap(), vec![x]);
-    }
-
-    fn shapes(before: &Tree, after: &Tree, id: NodeId) -> (Option<DocShape>, Option<DocShape>) {
-        (shape_of(before, id), shape_of(after, id))
-    }
-
-    fn structural() -> NodeUpdateEffect {
-        NodeUpdateEffect { changed: true, structure: true, content: false, data: false }
-    }
-
-    #[test]
-    fn derive_kinds_names_what_a_merge_changed() {
-        let root = NodeId::new();
-        let mut tree = Tree::new(root, "Store", T0).unwrap();
-        let (p, q) = (NodeId::new(), NodeId::new());
-        tree.add_node(p, Some(root), Place::Last, "folder", "P", T0).unwrap();
-        tree.add_node(q, Some(root), Place::Last, "folder", "Q", T0).unwrap();
-        let x = NodeId::new();
-
-        // Created: the node is new, the parent's list changed.
-        let before = replica_of(&tree);
-        tree.add_node(x, Some(p), Place::Last, "document", "X", T0).unwrap();
-        let (b, a) = shapes(&before, &tree, x);
-        assert!(matches!(derive_kinds(x, root, b.as_ref(), a.as_ref(), structural())[..], [StoreChangeKind::NodeCreated { node_id, parent_id }] if node_id == x && parent_id == p));
-        let (b, a) = shapes(&before, &tree, p);
-        assert!(matches!(derive_kinds(p, root, b.as_ref(), a.as_ref(), structural())[..], [StoreChangeKind::TreeStructure { ref node_ids }] if node_ids == &vec![p]));
-
-        // Moved.
-        let before = replica_of(&tree);
-        tree.move_node(x, q, Place::Last, T1).unwrap();
-        let (b, a) = shapes(&before, &tree, x);
-        assert!(matches!(
-            derive_kinds(x, root, b.as_ref(), a.as_ref(), structural())[..],
-            [StoreChangeKind::NodeMoved { node_id, old_parent_id, new_parent_id }] if node_id == x && old_parent_id == p && new_parent_id == q
-        ));
-
-        // Renamed.
-        let before = replica_of(&tree);
-        tree.set_title(x, "Y", T1).unwrap();
-        let (b, a) = shapes(&before, &tree, x);
-        assert!(matches!(derive_kinds(x, root, b.as_ref(), a.as_ref(), structural())[..], [StoreChangeKind::MetadataUpdated { node_id }] if node_id == x));
-
-        // Content, on top of nothing structural.
-        let content = NodeUpdateEffect { changed: true, structure: false, content: true, data: false };
-        let (b, a) = shapes(&tree, &tree, x);
-        assert!(matches!(derive_kinds(x, root, b.as_ref(), a.as_ref(), content)[..], [StoreChangeKind::ContentUpdated { node_id }] if node_id == x));
-
-        // Deleted, and back.
-        let before = replica_of(&tree);
-        tree.remove_node(x, T1).unwrap();
-        let (b, a) = shapes(&before, &tree, x);
-        assert!(matches!(derive_kinds(x, root, b.as_ref(), a.as_ref(), structural())[..], [StoreChangeKind::NodeDeleted { node_id, parent_id }] if node_id == x && parent_id == q));
-        let before = replica_of(&tree);
-        tree.undelete_node(x, T1).unwrap();
-        let (b, a) = shapes(&before, &tree, x);
-        assert!(matches!(derive_kinds(x, root, b.as_ref(), a.as_ref(), structural())[..], [StoreChangeKind::NodeCreated { node_id, parent_id }] if node_id == x && parent_id == q));
-
-        // A tombstone arriving whole on a replica that never had the node.
-        let mut fresh = Tree::from_docs(root, HashMap::new());
-        tree.remove_node(x, T1).unwrap();
-        fresh.apply_update(x, &tree.doc(x).unwrap().save()).unwrap();
-        let (b, a) = (None, shape_of(&fresh, x));
-        assert!(matches!(derive_kinds(x, root, b, a.as_ref(), structural())[..], [StoreChangeKind::NodeDeleted { node_id, parent_id }] if node_id == x && parent_id == q));
-
-        // The root arriving on an empty replica: no parent to name.
-        fresh.apply_update(root, &tree.doc(root).unwrap().save()).unwrap();
-        let a = shape_of(&fresh, root);
-        assert!(matches!(derive_kinds(root, root, None, a.as_ref(), structural())[..], [StoreChangeKind::TreeStructure { ref node_ids }] if node_ids == &vec![root]));
-
-        // A structural change that reads the same still earns bytes to forward.
-        let (b, a) = shapes(&tree, &tree, root);
-        assert!(matches!(derive_kinds(root, root, b.as_ref(), a.as_ref(), structural())[..], [StoreChangeKind::TreeStructure { .. }]));
     }
 
     #[test]

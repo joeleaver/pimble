@@ -79,7 +79,7 @@ the old store document's) fixes what concurrency can leave behind. Deleting is a
 
 `applyEdit` carries an update of any part of a node's document and is the one way anything
 is written; the server merges it (`apply_node_update_from`), derives the notifications from
-what changed (`derive_kinds`: `ContentUpdated`, `NodeRenamed`, `NodeMoved`, ...), relays the
+what changed (`pimble_crdt::rules::derive_changes`, mapped to `StoreChangeKind`: `ContentUpdated`, `NodeRenamed`, `NodeMoved`, ...), relays the
 raw bytes, runs repair 250 ms after a structural merge, and flushes dirty documents on a
 750 ms debounce and on stop. `syncNodes` is the one stateless reconcile (state vectors in,
 diffs and the server's vectors out, plus the ids the caller did not name).

@@ -74,3 +74,15 @@ pub enum StoreError {
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+impl From<pimble_crdt::MoveRefused> for StoreError {
+    /// A move refused before anything was touched (`Tree::check_move`): a
+    /// node that is not there is the `NodeNotFound` it always was, the rest
+    /// the invalid operations they are.
+    fn from(refused: pimble_crdt::MoveRefused) -> Self {
+        match refused {
+            pimble_crdt::MoveRefused::NotFound(id) => StoreError::NodeNotFound(id),
+            other => StoreError::InvalidOperation(other.to_string()),
+        }
+    }
+}

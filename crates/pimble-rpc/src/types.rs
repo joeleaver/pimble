@@ -940,6 +940,23 @@ pub enum StoreChangeKind {
     PeopleChanged,
 }
 
+impl From<pimble_crdt::NodeChange> for StoreChangeKind {
+    /// What a merged update changed, as `pimble_crdt::derive_changes` says
+    /// it (the one derivation, the server's and the vault client's).
+    fn from(change: pimble_crdt::NodeChange) -> Self {
+        use pimble_crdt::NodeChange as C;
+        match change {
+            C::NodeCreated { node_id, parent_id } => StoreChangeKind::NodeCreated { node_id, parent_id },
+            C::NodeDeleted { node_id, parent_id } => StoreChangeKind::NodeDeleted { node_id, parent_id },
+            C::NodeMoved { node_id, old_parent_id, new_parent_id } => StoreChangeKind::NodeMoved { node_id, old_parent_id, new_parent_id },
+            C::MetadataUpdated { node_id } => StoreChangeKind::MetadataUpdated { node_id },
+            C::ContentUpdated { node_id } => StoreChangeKind::ContentUpdated { node_id },
+            C::TreeStructure { node_ids } => StoreChangeKind::TreeStructure { node_ids },
+            C::AttachmentChanged { node_id, host_id, live } => StoreChangeKind::AttachmentChanged { node_id, host_id, live },
+        }
+    }
+}
+
 /// Notification that a node's content has changed.
 /// Carries the edit operation so the receiving client can apply it directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
