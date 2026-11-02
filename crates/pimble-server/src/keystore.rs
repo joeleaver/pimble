@@ -9,6 +9,7 @@
 //! signing in or out, or adding a store key. Moving the unwrapped material
 //! to the OS keychain is a follow-up, not this phase.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 
@@ -209,6 +210,17 @@ impl Keystore {
         let entry = data.store_keys.iter().find(|e| e.store_id == store_id && e.key_id == key_id)?;
         let bytes = b64_decode_32(&entry.key)?;
         Some(SymmetricKey(bytes))
+    }
+
+    /// Every key this server holds for `store_id`, by id: the scope keys a
+    /// vault blob's key is resolved against (`pimble_rpc::vault::DocKeys`).
+    pub async fn store_keys(&self, store_id: StoreId) -> HashMap<Uuid, SymmetricKey> {
+        let data = self.data.read().await;
+        data.store_keys
+            .iter()
+            .filter(|e| e.store_id == store_id)
+            .filter_map(|e| Some((e.key_id, SymmetricKey(b64_decode_32(&e.key)?))))
+            .collect()
     }
 
     async fn write_atomic(&self, data: &KeystoreData) -> io::Result<()> {

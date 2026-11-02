@@ -67,6 +67,13 @@ pub struct Keyring {
     pub scopes: Vec<(Option<NodeId>, KeyId)>,
 }
 
+/// What `pimble_rpc::vault` resolves a document's wraps and old blobs against.
+impl pimble_rpc::vault::ScopeKeys for Keyring {
+    fn scope_key(&self, key_id: &KeyId) -> Option<SymmetricKey> {
+        self.keys.get(key_id).cloned()
+    }
+}
+
 impl Keyring {
     pub fn get(&self, key_id: &KeyId) -> Option<&SymmetricKey> {
         self.keys.get(key_id)

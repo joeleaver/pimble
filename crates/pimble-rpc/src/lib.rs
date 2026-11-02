@@ -8,6 +8,7 @@
 pub mod error;
 pub mod methods;
 pub mod types;
+pub mod vault;
 pub mod vault_cursor;
 
 pub use error::*;

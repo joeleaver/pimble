@@ -35,34 +35,34 @@
 //!   `Progress`).
 //! - **Live**: subscribes to the hosted store's `storeChanged` and applies
 //!   every `VaultAppended` blob the same way, recognizing (and dropping) its
-//!   own appends echoed back through that same subscription by the
-//!   `(doc_id, seq)` pairs it remembers handing back from `vaultAppend`.
+//!   own appends echoed back through that same subscription by their
+//!   `client_id` (`pimble_rpc::vault::should_apply`) and, as a second guard,
+//!   by the `(doc_id, seq)` pairs it remembers handing back from `vaultAppend`.
 //! - **Outbound**: subscribes to this server's local-change broadcast; every
 //!   notification about a document carries that document's update bytes,
 //!   which are encrypted and appended as they are, structure and content
 //!   alike; one with no bytes (an older server's) pushes that document's
 //!   current whole state instead.
-//! - **Snapshots**: whenever an append's returned sequence number is a
-//!   multiple of 200, the link uploads that document's current full state as
-//!   a `vaultSnapshot` covering everything up to that sequence, so a fresh
+//! - **Snapshots**: whenever an append leaves a document's log
+//!   `pimble_rpc::vault::SNAPSHOT_EVERY` entries past its last snapshot and
+//!   this device has read through it (`pimble_rpc::vault::snapshot_due`),
+//!   the link uploads that document's current full state as a
+//!   `vaultSnapshot` covering everything up to that sequence, so a fresh
 //!   peer's first `vaultFetch` never replays the whole history.
 //!
-//! **Keys** (docs/NODE_DOCUMENT_CONTRACT.md section 5): a document has its
-//! own data key, stored on the hosted server wrapped under every scope key
-//! that may read it (the store key, and each share's). A blob's key is
-//! resolved by its header's key id: among the document's wraps first
-//! (unwrapped with a scope key the keystore holds, kept in memory for the
-//! life of the link and never written down), then among the scope keys the
-//! keystore holds directly, which is how a blob from before data keys, under
-//! the store key itself, still reads. A blob goes out under the document's
-//! data key when it has one and under the link's scope key when it does not
-//! (a document from before data keys, until its owner gives it one). A
-//! document the remote has never seen gets a data key from the device that
-//! creates it, wrapped under every scope key this device holds that covers
-//! the node: the store key on a whole replica, the share's key on a share's
-//! recipient (see [`Keyring`] and `seal_plan`). Those wraps ride the
-//! document's first append and the remote stores the two together, so no
-//! blob is ever on the remote under a key it has no wrap of.
+//! **Keys** (docs/NODE_DOCUMENT_CONTRACT.md section 5): the protocol is
+//! `pimble_rpc::vault`'s, shared with the browser's vault client: a blob's
+//! key is resolved by its header's key id (the document's data key, kept in
+//! memory for the life of the link and never written down; its wraps opened
+//! with a scope key the keystore holds; a scope key held directly, for a
+//! blob from before data keys), and a document the remote has never seen
+//! gets a data key from the device that creates it, wrapped under every
+//! scope key this device holds that covers the node. A blob goes out under
+//! the document's data key when it has one and under the link's scope key
+//! when it does not (a document from before data keys, until its owner
+//! gives it one). What is particular to the link (which documents the
+//! remote holds, which were pulled in this connection) is [`Keyring`]'s,
+//! and how a blob is sealed is `seal_plan`'s.
 //!
 //! **A share's recipient** links a partial replica: the hosted server lists
 //! and sends it exactly its scope, so the pull needs to know nothing about
@@ -127,12 +127,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use pimble_client::PimbleClient;
 use pimble_core::{AuthMethod, NodeId, StoreAccess, StoreId, SyncState};
-use pimble_crypto::{Blob, SymmetricKey};
+use pimble_crypto::SymmetricKey;
+use pimble_rpc::vault::{self as protocol, DocKeys, NewDocument, SealKey, Unopened};
 use pimble_rpc::{StoreChangeKind, StoreChangedNotification, VaultCursor, VaultDocId, VaultDocKeys};
 use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio::task::JoinHandle;
@@ -152,10 +153,6 @@ pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// every other share of the store from its members.
 const ANNOUNCE_WAIT: Duration = Duration::from_secs(20);
 const ANNOUNCE_CHECK_EVERY: Duration = Duration::from_millis(250);
-/// Upload a snapshot of a document once this many entries have been appended
-/// since the last one (docs/CRYPTO_CONTRACT.md), and only when this device has
-/// applied every one of them (see `pimble_rpc::VaultCursor`).
-const SNAPSHOT_EVERY: u64 = 200;
 /// `ProgressFile::cursor_version` once a replica's cursors are gap-aware. A
 /// file below it (or none) was written when `sync.json`'s `last_seq` meant "the
 /// highest number seen", which may sit beyond an entry that never arrived; one
@@ -1000,13 +997,8 @@ struct Progress {
 /// key the keystore holds, and is gone with the process.
 #[derive(Default)]
 struct Keyring {
-    /// Each document's wraps, as `vaultFetch` last gave them.
-    wraps: HashMap<String, VaultDocKeys>,
-    /// The data key id `vaultListDocs` names for a document whose wraps
-    /// have not been fetched yet.
-    listed_dek: HashMap<String, Uuid>,
-    /// Data keys unwrapped (or made) so far: document -> (key id, key).
-    deks: HashMap<String, (Uuid, SymmetricKey)>,
+    /// The documents' data keys and wraps (`pimble_rpc::vault`).
+    docs: DocKeys,
     /// The documents the remote is known to hold: listed, pulled, or
     /// appended to by anyone. One that is not here is this device's to
     /// create, data key and all.
@@ -1033,9 +1025,11 @@ struct Keyring {
 const UNREAD_RETRIES: u32 = 5;
 
 impl Keyring {
+    /// Everything about the remote's documents (the documents' data keys
+    /// included: a twin built again gives each a new one). The scope keys are
+    /// the keystore's and stay.
     fn forget_remote(&mut self) {
-        self.wraps.clear();
-        self.listed_dek.clear();
+        self.docs.forget_all();
         self.remote_docs.clear();
         self.pulled.clear();
         self.unresolved.clear();
@@ -1043,54 +1037,16 @@ impl Keyring {
     }
 
     fn note_wraps(&mut self, doc_id: &VaultDocId, keys: Option<VaultDocKeys>) {
-        let doc = doc_id.as_str();
-        match keys {
-            Some(keys) => {
-                // A rotation: the cached key is the old one's.
-                if self.deks.get(&doc).is_some_and(|(id, _)| *id != keys.dek_id) {
-                    self.deks.remove(&doc);
-                }
-                self.listed_dek.insert(doc.clone(), keys.dek_id);
-                self.wraps.insert(doc, keys);
-            }
-            None => {
-                self.wraps.remove(&doc);
-                self.listed_dek.remove(&doc);
-            }
+        if let VaultDocId::Node(node_id) = doc_id {
+            self.docs.note_wraps(*node_id, keys);
         }
     }
 
-    /// The id of the document's data key, as far as the remote has said.
-    fn dek_id(&self, doc: &str) -> Option<Uuid> {
-        self.wraps.get(doc).map(|keys| keys.dek_id).or_else(|| self.listed_dek.get(doc).copied())
-    }
-}
-
-/// The key a blob of `doc_id` with `key_id` in its header reads with: the
-/// document's data key when the id names it (cached, or unwrapped now with
-/// whichever scope key the keystore holds among the wraps), else a scope
-/// key held directly (a blob from before data keys).
-async fn blob_key(handler: &RpcHandler, keyring: &mut Keyring, store_id: StoreId, doc_id: &VaultDocId, key_id: Uuid) -> Option<SymmetricKey> {
-    let doc = doc_id.as_str();
-    if let Some((id, key)) = keyring.deks.get(&doc) {
-        if *id == key_id {
-            return Some(key.clone());
+    fn note_listed(&mut self, doc_id: &VaultDocId, dek_id: Uuid) {
+        if let VaultDocId::Node(node_id) = doc_id {
+            self.docs.note_listed(*node_id, dek_id);
         }
     }
-    if let Some(keys) = keyring.wraps.get(&doc).filter(|keys| keys.dek_id == key_id) {
-        let aad = pimble_crypto::dek_aad(&store_id.to_string(), &doc);
-        for wrap in &keys.wraps {
-            let Some(scope_key) = handler.keystore().store_key(store_id, wrap.scope_key_id).await else { continue };
-            match pimble_crypto::unwrap_dek(wrap, &scope_key, &aad) {
-                Ok(dek) => {
-                    keyring.deks.insert(doc, (key_id, dek.clone()));
-                    return Some(dek);
-                }
-                Err(e) => warn!("Vault link for store {} doc {:?}: the wrap under scope key {} did not open ({})", store_id, doc_id, wrap.scope_key_id, e),
-            }
-        }
-    }
-    handler.keystore().store_key(store_id, key_id).await
 }
 
 impl Progress {
@@ -1392,7 +1348,7 @@ async fn full_reconcile(
         progress.note_snapshot(&doc.doc_id, doc.snapshot_seq);
         progress.keyring.remote_docs.insert(doc.doc_id.as_str());
         if let Some(dek_id) = doc.dek_id {
-            progress.keyring.listed_dek.insert(doc.doc_id.as_str(), dek_id);
+            progress.keyring.note_listed(&doc.doc_id, dek_id);
         }
         remote_heads.insert(doc.doc_id, doc.head);
     }
@@ -1507,22 +1463,14 @@ async fn pull_doc(handler: &RpcHandler, client: &PimbleClient, store_id: StoreId
     progress.keyring.note_wraps(doc_id, fetch.keys.clone());
 
     let mut wants_a_key = false;
-    if let Some(entry) = &fetch.snapshot {
-        progress.note_snapshot(doc_id, entry.seq);
-        match apply_blob_locally(handler, &mut progress.keyring, store_id, doc_id, &entry.blob, link_id, Repair::Later).await? {
-            Applying::Applied(update) => {
-                progress.advance(doc_id, &update);
-                progress.cursor(doc_id).mark_through(entry.seq);
-            }
-            Applying::UnknownKey(_) => wants_a_key = true,
-            Applying::Skipped => {}
+    for (mark, blob) in protocol::fetched_entries(&fetch) {
+        if let Some(seq) = mark.snapshot() {
+            progress.note_snapshot(doc_id, seq);
         }
-    }
-    for entry in &fetch.updates {
-        match apply_blob_locally(handler, &mut progress.keyring, store_id, doc_id, &entry.blob, link_id, Repair::Later).await? {
+        match apply_blob_locally(handler, &mut progress.keyring, store_id, doc_id, blob, link_id, Repair::Later).await? {
             Applying::Applied(update) => {
                 progress.advance(doc_id, &update);
-                progress.cursor(doc_id).mark(entry.seq);
+                mark.apply(progress.cursor(doc_id));
             }
             Applying::UnknownKey(_) => wants_a_key = true,
             Applying::Skipped => {}
@@ -1559,10 +1507,10 @@ fn is_refusal(error: &pimble_client::ClientError) -> bool {
 }
 
 /// Decrypt one base64url blob and apply it locally through the handler's
-/// own `apply_node_update_from`. An unknown key id or a decryption failure
-/// is logged and skipped, never fatal to the link (docs/CRYPTO_CONTRACT.md:
-/// "a blob with an unknown key id is logged and skipped"); so is a blob of
-/// the retired tree document.
+/// own `apply_node_update_from`. A malformed blob, an unknown key id or a
+/// decryption failure is logged and skipped, never fatal to the link
+/// (docs/CRYPTO_CONTRACT.md: "a blob with an unknown key id is logged and
+/// skipped"); so is a blob of the retired tree document.
 async fn apply_blob_locally(
     handler: &RpcHandler,
     keyring: &mut Keyring,
@@ -1577,27 +1525,15 @@ async fn apply_blob_locally(
         return Ok(Applying::Skipped);
     };
 
-    let blob = URL_SAFE_NO_PAD
-        .decode(blob_b64url)
-        .map_err(|e| anyhow::anyhow!("blob for {:?} is not valid base64url: {}", doc_id, e))?;
-
-    let key_id = match Blob::key_id(&blob) {
-        Ok(id) => id,
-        Err(e) => {
-            warn!("Vault link for store {} doc {:?}: malformed blob header ({}); skipping it", store_id, doc_id, e);
-            return Ok(Applying::Skipped);
-        }
-    };
-    let Some(key) = blob_key(handler, keyring, store_id, doc_id, key_id).await else {
-        warn!("Vault link for store {} doc {:?}: no key held for key id {}; skipping this blob", store_id, doc_id, key_id);
-        return Ok(Applying::UnknownKey(key_id));
-    };
-
-    let aad = pimble_crypto::blob_aad(&store_id.to_string(), &doc_id.as_str());
-    let plaintext = match Blob::decrypt(&key, &aad, &blob) {
+    let scope = handler.keystore().store_keys(store_id).await;
+    let plaintext = match keyring.docs.open(store_id, *node_id, blob_b64url, &scope) {
         Ok(bytes) => bytes,
+        Err(Unopened::NoKey(key_id)) => {
+            warn!("Vault link for store {} doc {:?}: no key held for key id {}; skipping this blob", store_id, doc_id, key_id);
+            return Ok(Applying::UnknownKey(key_id));
+        }
         Err(e) => {
-            warn!("Vault link for store {} doc {:?}: decryption failed ({}); skipping this blob", store_id, doc_id, e);
+            warn!("Vault link for store {} doc {:?}: {}; skipping this blob", store_id, doc_id, e);
             return Ok(Applying::Skipped);
         }
     };
@@ -1636,7 +1572,7 @@ async fn handle_remote_notification(
     // by `seq >= last_seq` instead would be wrong the moment a peer is also
     // appending concurrently, since this link's own seq is then not
     // reliably the highest.
-    if notif.source_client_id.as_deref() == Some(link_id) {
+    if !protocol::should_apply(notif.source_client_id.as_deref(), link_id) {
         debug!("Vault link for store {} doc {:?}: dropping our own echoed append by id (seq {})", store_id, doc_id, seq);
         progress.cursor(doc_id).mark(*seq);
         return Ok(());
@@ -1748,8 +1684,8 @@ enum Seal {
     With { key_id: Uuid, key: SymmetricKey },
     /// The remote has never seen the document: this device creates it, with
     /// a data key of its own making wrapped under every scope key it holds
-    /// that covers the node.
-    Create { dek_id: Uuid, dek: SymmetricKey, keys: VaultDocKeys, parent_id: Option<NodeId>, discussion: bool },
+    /// that covers the node (a create tried again: the same key).
+    Create { dek_id: Uuid, dek: SymmetricKey, keys: VaultDocKeys, new: NewDocument },
     /// The document has a data key and no wrap this device can open.
     Unreadable,
 }
@@ -1760,91 +1696,52 @@ async fn seal_plan(handler: &RpcHandler, client: &PimbleClient, store_id: StoreI
     let VaultDocId::Node(node_id) = doc_id else {
         return Err(anyhow::anyhow!("the tree document is retired; nothing is written to it"));
     };
+    let node_id = *node_id;
 
     if progress.keyring.remote_docs.contains(&doc) {
         // Wraps are fetched with the document; one only listed so far, or
         // heard of through another device's append, is asked for now.
-        if progress.keyring.dek_id(&doc).is_some() && !progress.keyring.wraps.contains_key(&doc) {
+        if progress.keyring.docs.wants_wraps(node_id) {
             match client.vault_fetch(store_id, doc_id.clone(), u64::MAX).await {
                 Ok(fetch) => progress.keyring.note_wraps(doc_id, fetch.keys),
                 Err(e) if is_refusal(&e) => return Ok(Seal::Unreadable),
                 Err(e) => return Err(anyhow::anyhow!("remote vaultFetch for {:?} failed: {}", doc_id, e)),
             }
         }
-        return Ok(match progress.keyring.dek_id(&doc) {
-            Some(dek_id) => match blob_key(handler, &mut progress.keyring, store_id, doc_id, dek_id).await {
-                Some(key) => Seal::With { key_id: dek_id, key },
-                None => Seal::Unreadable,
-            },
-            // From before data keys: under the scope key, as it always was,
-            // until its owner gives it a data key. A recipient never makes
-            // keys for a document that exists.
-            None => match handler.keystore().store_key(store_id, link_key_id).await {
-                Some(key) => Seal::With { key_id: link_key_id, key },
-                None => return Err(anyhow::anyhow!("no local key held for store {} key id {}; cannot encrypt an outgoing update", store_id, link_key_id)),
-            },
-        });
+        // From before data keys: under the scope key, as it always was,
+        // until its owner gives it a data key. A recipient never makes
+        // keys for a document that exists.
+        let scope = handler.keystore().store_keys(store_id).await;
+        return match progress.keyring.docs.seal_key(store_id, node_id, Some(link_key_id), &scope) {
+            SealKey::With(key_id, key) => Ok(Seal::With { key_id, key }),
+            SealKey::Unreadable => Ok(Seal::Unreadable),
+            SealKey::NoScopeKey => Err(anyhow::anyhow!("no local key held for store {} key id {}; cannot encrypt an outgoing update", store_id, link_key_id)),
+        };
     }
 
     // A new document. The scope keys that cover it: the store key on a
     // whole replica (this device holds it: it is the owner's, or a member's
     // of the whole store), and the key of every share the node is under
-    // that this device holds, which the share's root names in its marker.
-    let (partial, parent_id, marker_keys, discussion) = {
+    // that this device holds. On a share's recipient with no marker on the
+    // way up (a share from before markers, or a root whose document has not
+    // arrived), the key this replica was added with, which is its share's.
+    let (scope_key_ids, new) = {
         let manager = handler.store_manager_handle();
         let manager = manager.read().await;
         let partial = !manager.scope_roots(store_id).is_empty();
         let tree = manager.tree(store_id).map_err(|e| anyhow::anyhow!("store unavailable: {}", e))?;
-        // An attachment's place is its host (docs/DISCUSSIONS_CONTRACT.md
-        // section 1): it joins the scopes, and takes the keys, its host has.
-        let parent_id = tree.doc(*node_id).and_then(|doc| doc.fields().ok()).and_then(|fields| fields.parent_id.or(fields.attached_to));
-        // A discussion on a node says so: what lets a commenter create it
-        // (docs/DISCUSSIONS_CONTRACT.md section 7).
-        let discussion = tree
-            .doc(*node_id)
-            .and_then(|doc| doc.fields().ok())
-            .is_some_and(|fields| fields.node_type == pimble_core::node_types::DISCUSSION && fields.attached_to.is_some());
-        let mut marker_keys = Vec::new();
-        let mut cur = Some(*node_id);
-        for _ in 0..=tree.ids().len() {
-            let Some(fields) = cur.and_then(|id| tree.doc(id)).and_then(|doc| doc.fields().ok()) else { break };
-            if let Some(marker) = fields.custom.get(pimble_core::custom_keys::SHARE).and_then(|v| serde_json::from_value::<pimble_core::ShareMarker>(v.clone()).ok()) {
-                marker_keys.push(marker.key_id);
-            }
-            cur = fields.parent_id.or(fields.attached_to);
-        }
-        (partial, parent_id, marker_keys, discussion)
+        let store_key = (!partial).then_some(link_key_id);
+        (protocol::scope_key_ids(tree, node_id, store_key, [link_key_id]), NewDocument::of(tree, node_id))
     };
-    let mut scope_key_ids: Vec<Uuid> = if partial { Vec::new() } else { vec![link_key_id] };
-    scope_key_ids.extend(marker_keys);
-    if partial && scope_key_ids.is_empty() {
-        // No marker on the way up (a share from before markers, or a root
-        // whose document has not arrived): the key this replica was added
-        // with is its share's.
-        scope_key_ids.push(link_key_id);
-    }
-
-    let dek = SymmetricKey::generate();
-    let dek_id = Uuid::new_v4();
-    let aad = pimble_crypto::dek_aad(&store_id.to_string(), &doc);
-    let mut wraps = Vec::new();
-    for scope_key_id in scope_key_ids {
-        if wraps.iter().any(|w: &pimble_crypto::WrappedDek| w.scope_key_id == scope_key_id) {
-            continue;
-        }
-        if let Some(scope_key) = handler.keystore().store_key(store_id, scope_key_id).await {
-            wraps.push(pimble_crypto::wrap_dek(&dek, &scope_key, scope_key_id, &aad));
-        }
-    }
-    if wraps.is_empty() {
+    let scope = handler.keystore().store_keys(store_id).await;
+    let Some((dek_id, dek, keys)) = progress.keyring.docs.create_key(store_id, node_id, &scope_key_ids, &scope) else {
         return Err(anyhow::anyhow!("no scope key held for store {}; cannot encrypt a new document", store_id));
-    }
-    Ok(Seal::Create { dek_id, dek, keys: VaultDocKeys { dek_id, wraps }, parent_id, discussion })
+    };
+    Ok(Seal::Create { dek_id, dek, keys, new })
 }
 
 /// Encrypt `plaintext` and append it to `doc_id`'s vault log, recording the
-/// echo and snapshotting if the returned sequence lands on a multiple of
-/// [`SNAPSHOT_EVERY`].
+/// echo and snapshotting when one is due (`pimble_rpc::vault::snapshot_due`).
 #[allow(clippy::too_many_arguments)]
 async fn append_blob(
     handler: &RpcHandler,
@@ -1858,17 +1755,17 @@ async fn append_blob(
     progress: &mut Progress,
 ) -> anyhow::Result<Appended> {
     let doc = doc_id.as_str();
-    let aad = pimble_crypto::blob_aad(&store_id.to_string(), &doc);
-    let plan = seal_plan(handler, client, store_id, &doc_id, key_id, progress).await?;
-    let (blob, created) = match &plan {
-        Seal::With { key_id, key } => (Blob::encrypt(key, *key_id, &aad, plaintext), None),
-        Seal::Create { dek_id, dek, keys, parent_id, discussion } => (Blob::encrypt(dek, *dek_id, &aad, plaintext), Some((keys, *parent_id, *discussion))),
+    let VaultDocId::Node(node_id) = doc_id else {
+        return Err(anyhow::anyhow!("the tree document is retired; nothing is written to it"));
+    };
+    let (blob_b64, created) = match seal_plan(handler, client, store_id, &doc_id, key_id, progress).await? {
+        Seal::With { key_id, key } => (protocol::seal(store_id, node_id, key_id, &key, plaintext), None),
+        Seal::Create { dek_id, dek, keys, new } => (protocol::seal(store_id, node_id, dek_id, &dek, plaintext), Some((keys, new))),
         Seal::Unreadable => {
             warn!("Vault link for store {} doc {:?}: no wrap of its data key opens here; leaving the update for later", store_id, doc_id);
             return Ok(Appended::Refused);
         }
     };
-    let blob_b64 = URL_SAFE_NO_PAD.encode(&blob);
 
     // A new document's first blob carries its wrapped data key, and the
     // remote stores the two together (`VaultAppendRequest::keys`): no blob
@@ -1879,13 +1776,11 @@ async fn append_blob(
     // guard for anything that reaches the server without a `client_id`. A
     // new document names its parent, which is what admits a scoped member's
     // create (and is ignored for anyone else's).
-    let (keys, parent_id, discussion) = match &created {
-        Some((keys, parent_id, discussion)) => (Some((*keys).clone()), *parent_id, *discussion),
-        None => (None, None, false),
-    };
-    let appended = match (discussion, parent_id) {
-        (true, Some(host)) => client.vault_append_new_discussion(store_id, doc_id.clone(), blob_b64, Some(link_id.to_string()), host, keys).await,
-        _ => client.vault_append_with_keys(store_id, doc_id.clone(), blob_b64, Some(link_id.to_string()), parent_id, keys).await,
+    let keys = created.as_ref().map(|(keys, _)| keys.clone());
+    let new = created.as_ref().map(|(_, new)| *new).unwrap_or_default();
+    let appended = match new.discussion_host {
+        Some(host) => client.vault_append_new_discussion(store_id, doc_id.clone(), blob_b64, Some(link_id.to_string()), host, keys).await,
+        None => client.vault_append_with_keys(store_id, doc_id.clone(), blob_b64, Some(link_id.to_string()), new.parent_id, keys).await,
     };
     let seq = match appended {
         Ok(seq) => seq,
@@ -1898,22 +1793,17 @@ async fn append_blob(
     echoes.remember(&doc_id, seq);
     progress.keyring.remote_docs.insert(doc.clone());
     progress.keyring.pulled.insert(doc.clone());
-    if let Seal::Create { dek_id, dek, keys, .. } = plan {
-        progress.keyring.deks.insert(doc.clone(), (dek_id, dek));
-        progress.keyring.note_wraps(&doc_id, Some(keys));
+    if let Some((keys, _)) = &created {
+        progress.keyring.docs.note_created(node_id, keys);
     }
     progress.cursor(&doc_id).mark(seq);
     let applied_through = progress.cursor(&doc_id).applied_through();
     record_last_seq(handler, store_id, &doc_id, applied_through).await;
     debug!("Vault link for store {} pushed doc {:?} update (seq {})", store_id, doc_id, seq);
 
-    // A snapshot deletes every log entry at or below its number, so it may
-    // only be stamped with a number this device has read *through*. Our own
-    // append being `seq` says nothing about another device's `seq - 1`, which
-    // may still be on its way here; until it lands `applied_through` stays
-    // below `seq` and the snapshot waits for a later append.
-    let due = seq.saturating_sub(progress.snapshot_seq(&doc_id)) >= SNAPSHOT_EVERY;
-    if due && applied_through == seq {
+    // Stamped only with a number this device has read *through*
+    // (`snapshot_due`): a snapshot deletes every log entry at or below it.
+    if protocol::snapshot_due(seq, progress.snapshot_seq(&doc_id), progress.cursor(&doc_id)) {
         upload_snapshot(handler, client, store_id, doc_id.clone(), key_id, seq, progress).await?;
         progress.note_snapshot(&doc_id, seq);
     }
@@ -2010,10 +1900,9 @@ async fn upload_snapshot(handler: &RpcHandler, client: &PimbleClient, store_id: 
     let Seal::With { key_id, key } = seal_plan(handler, client, store_id, &doc_id, key_id, progress).await? else {
         return Ok(false);
     };
+    let VaultDocId::Node(node_id) = doc_id else { return Ok(false) };
     let (_, plaintext) = full_doc_state(handler, store_id, &doc_id).await?;
-    let aad = pimble_crypto::blob_aad(&store_id.to_string(), &doc_id.as_str());
-    let blob = Blob::encrypt(&key, key_id, &aad, &plaintext);
-    let blob_b64 = URL_SAFE_NO_PAD.encode(&blob);
+    let blob_b64 = protocol::seal(store_id, node_id, key_id, &key, &plaintext);
     match client.vault_snapshot(store_id, doc_id.clone(), upto_seq, blob_b64).await {
         Ok(()) => {}
         Err(e) if is_refusal(&e) => {
@@ -2100,7 +1989,7 @@ impl LinkSession<'_> {
         if !self.progress.keyring.remote_docs.contains(&doc) {
             return Ok(RemoteKeys::Absent);
         }
-        if let Some(keys) = self.progress.keyring.wraps.get(&doc) {
+        if let Some(keys) = self.progress.keyring.docs.wraps(node) {
             return Ok(RemoteKeys::Keys(keys.clone()));
         }
         self.calls += 1;
@@ -2120,13 +2009,10 @@ impl LinkSession<'_> {
 
     /// `node`'s data key, when some scope key this device holds opens a wrap of it.
     pub(crate) async fn data_key(&mut self, node: NodeId, dek_id: Uuid) -> Option<SymmetricKey> {
-        let doc_id = VaultDocId::Node(node);
-        // Only ever the data key: `blob_key`'s fall back to a scope key held
+        // Only ever the data key: a blob's fall back to a scope key held
         // under that id is for reading old blobs, not for wrapping.
-        if !self.progress.keyring.wraps.get(&doc_id.as_str()).is_some_and(|keys| keys.dek_id == dek_id) {
-            return None;
-        }
-        blob_key(self.handler, &mut self.progress.keyring, self.store_id, &doc_id, dek_id).await
+        let scope = self.handler.keystore().store_keys(self.store_id).await;
+        self.progress.keyring.docs.data_key(self.store_id, node, dek_id, &scope)
     }
 
     /// Add wraps of `node`'s data key (the remote merges them by scope
@@ -2143,9 +2029,8 @@ impl LinkSession<'_> {
             Err(e) => return Err(anyhow::anyhow!("remote vaultSetDocKeys for {:?} failed: {}", doc_id, e)),
         }
         // The keyring's copy follows the remote's merge.
-        let doc = doc_id.as_str();
         let mut merged = keys;
-        if let Some(held) = self.progress.keyring.wraps.get(&doc).filter(|held| held.dek_id == merged.dek_id) {
+        if let Some(held) = self.progress.keyring.docs.wraps(node).filter(|held| held.dek_id == merged.dek_id) {
             for wrap in &held.wraps {
                 if !merged.wraps.iter().any(|w| w.scope_key_id == wrap.scope_key_id) {
                     merged.wraps.push(wrap.clone());
@@ -2181,24 +2066,15 @@ impl LinkSession<'_> {
             return Ok(Rekeyed::Waiting);
         }
 
-        let dek = SymmetricKey::generate();
-        let dek_id = Uuid::new_v4();
-        let aad = pimble_crypto::dek_aad(&self.store_id.to_string(), &doc);
-        let mut wraps: Vec<pimble_crypto::WrappedDek> = Vec::new();
-        for scope_key_id in scope_key_ids {
-            if wraps.iter().any(|w| w.scope_key_id == *scope_key_id) {
-                continue;
-            }
-            if let Some(scope_key) = self.handler.keystore().store_key(self.store_id, *scope_key_id).await {
-                wraps.push(pimble_crypto::wrap_dek(&dek, &scope_key, *scope_key_id, &aad));
-            }
-        }
+        let scope = self.handler.keystore().store_keys(self.store_id).await;
+        let Some((dek_id, dek, keys)) = protocol::new_data_key(self.store_id, node, scope_key_ids, &scope) else {
+            return Ok(Rekeyed::Waiting);
+        };
         // Without the store key's wrap the owner's other devices could not
         // read what comes after.
-        if !wraps.iter().any(|w| w.scope_key_id == self.link_key_id) {
+        if !keys.wraps.iter().any(|w| w.scope_key_id == self.link_key_id) {
             return Ok(Rekeyed::Waiting);
         }
-        let keys = VaultDocKeys { dek_id, wraps };
 
         self.progress.file.rekeying.insert(doc.clone());
         self.progress.unsaved = true;
@@ -2222,7 +2098,7 @@ impl LinkSession<'_> {
             .map_err(|e| anyhow::anyhow!("remote vaultFetch for {:?} failed: {}", doc_id, e))?;
         match after.keys {
             Some(held) if held.dek_id == dek_id => {
-                self.progress.keyring.deks.insert(doc.clone(), (dek_id, dek));
+                self.progress.keyring.docs.hold(node, dek_id, dek);
                 self.progress.keyring.note_wraps(&doc_id, Some(held));
             }
             other => {
@@ -2320,7 +2196,7 @@ async fn pull_pending(handler: &RpcHandler, client: &PimbleClient, store_id: Sto
             }
             progress.keyring.remote_docs.insert(doc.doc_id.as_str());
             if let Some(dek_id) = doc.dek_id {
-                progress.keyring.listed_dek.insert(doc.doc_id.as_str(), dek_id);
+                progress.keyring.note_listed(&doc.doc_id, dek_id);
             }
             progress.note_snapshot(&doc.doc_id, doc.snapshot_seq);
             pull_doc(handler, client, store_id, &doc.doc_id, link_id, progress).await?;
