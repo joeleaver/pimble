@@ -9,7 +9,7 @@ ahead and do all six waves before the next release." He did not answer the open 
 one by one, so the work goes ahead on the recommended answers (marked "taken" at the end);
 any of them can still be overruled. Branch `api`.
 
-Why now: view nodes (kanban first) and WASM plugins are next
+Why now: metanodes (kanban first) and WASM plugins are next
 (memory `project_views_and_plugins_2026_11_02`), and a plugin must be able to do what the
 app does, the way the app does it. Today there is no such "way": there are three.
 

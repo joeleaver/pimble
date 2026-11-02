@@ -3,7 +3,7 @@
 Status: drafted by the PM on 2026-11-02 from Joe's direction (memory
 `project_views_and_plugins_2026_11_02`) and a read-only study of rinch at the pinned
 revision (`2d1f11a0`, cargo checkout) and of `crates/pimble-plugins`. Nothing is built.
-Open decisions at the end. View nodes (`docs/VIEWS_CONTRACT.md`) are a separate, generic
+Open decisions at the end. Metanodes (`docs/METANODES_CONTRACT.md`) are a separate, generic
 concept whose viewers plugins provide; the kanban (`docs/KANBAN_CONTRACT.md`) is the
 first plugin.
 
@@ -90,8 +90,8 @@ first plugin.
 
 ### 3.3 Mount points
 
-1. **A view node's viewer** (`docs/VIEWS_CONTRACT.md`): a pane opening a node with
-   `view:viewer = <id>` mounts the plugin that provides that viewer, with the source's
+1. **A metanode's viewer** (`docs/METANODES_CONTRACT.md`): a pane opening a node with
+   `metanode:viewer = <id>` mounts the plugin that provides that viewer, with the source's
    forest and the viewer's settings as props; the plugin acts through `Pimble`, and core
    judges its edits. A viewer declares the source shapes it can show.
 2. **A node type** (later): a pane opening a node whose type a plugin provides.

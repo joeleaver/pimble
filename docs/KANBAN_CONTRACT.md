@@ -1,9 +1,9 @@
-# Kanban contract: the first viewer for view nodes, built as a plugin
+# Kanban contract: the first viewer for metanodes, built as a plugin
 
 Status: drafted by the PM on 2026-11-02 from Joe's design (memory
 `project_views_and_plugins_2026_11_02`). Nothing is built. Kanban is **a viewer, built as a
-plugin** with the plugin system (`docs/PLUGINS_CONTRACT.md`), for **view nodes**
-(`docs/VIEWS_CONTRACT.md`); it is the first consumer of both and waits on them. It declares
+plugin** with the plugin system (`docs/PLUGINS_CONTRACT.md`), for **metanodes**
+(`docs/METANODES_CONTRACT.md`); it is the first consumer of both and waits on them. It declares
 the source shape it needs: a tree two levels deep. Open decisions at the end.
 
 **Naming:** "board" already means a canvas in the code; this is a **kanban** in code and in
@@ -12,8 +12,8 @@ the interface.
 ## 1. What Joe decided
 
 - Cards are ordinary nodes (notes or one-liners).
-- A kanban is a view node whose viewer is `kanban` and whose source is the node's children,
-  two levels deep (a forest, `docs/VIEWS_CONTRACT.md` section 1.1). The kanban viewer reads
+- A kanban is a metanode whose viewer is `kanban` and whose source is the node's children,
+  two levels deep (a forest, `docs/METANODES_CONTRACT.md` section 1.1). The kanban viewer reads
   that forest its own way: **columns are the first level, cards the second.** Grouping is
   the viewer's, not core's.
 - **Position in a column is priority**: the top of "To do" is what you pull next.
@@ -29,9 +29,9 @@ the interface.
 - Drag a card within or across columns (a move under the column, after the card above),
   drag a column (a move of the column node), "+ Add card" at a column's foot (a create
   under the column, last), "+ Add column", Delete. Refusals are the explorer's sentences,
-  because core judges every edit through `plan` (`docs/VIEWS_CONTRACT.md` section 1.3).
+  because core judges every edit through `plan` (`docs/METANODES_CONTRACT.md` section 1.3).
 - Read-only nodes show the board with no gestures. Live: the source's forest follows `Pimble`'s changes.
-- "New Kanban" creates a view node with viewer `kanban`, source its children two levels
+- "New Kanban" creates a metanode with viewer `kanban`, source its children two levels
   deep, and columns To do, Doing, Done (open decision 4), through a recipe the plugin
   registers.
 
