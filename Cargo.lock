@@ -4806,6 +4806,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "pimble-api"
+version = "0.15.1"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "futures",
+ "pimble-board",
+ "pimble-client",
+ "pimble-core",
+ "pimble-crdt",
+ "pimble-discussion",
+ "pimble-rpc",
+ "pimble-server",
+ "pimble-sheet",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+ "yrs",
+]
+
+[[package]]
 name = "pimble-app"
 version = "0.15.1"
 dependencies = [
@@ -4870,6 +4894,7 @@ version = "0.15.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "pimble-api",
  "pimble-client",
  "pimble-core",
  "pimble-crdt",
@@ -5029,9 +5054,11 @@ dependencies = [
 name = "pimble-mcp"
 version = "0.15.1"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "chrono",
  "jsonrpsee",
+ "pimble-api",
  "pimble-board",
  "pimble-client",
  "pimble-core",
@@ -5081,6 +5108,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tracing",
  "uuid",
 ]
 

@@ -14,6 +14,8 @@ path = "src/main.rs"
 pimble-core = { workspace = true }
 pimble-crdt = { workspace = true }
 pimble-client = { workspace = true }
+# The node commands write through the one API (docs/API_CONTRACT.md wave 2).
+pimble-api = { workspace = true }
 pimble-rpc = { workspace = true }
 base64 = { workspace = true }
 pimble-server = { workspace = true }

@@ -1,0 +1,29 @@
+[package]
+name = "pimble-api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "The one Pimble API every client uses (docs/API_CONTRACT.md): held node documents, the one write, naming and links, recipes, presence. Native and wasm32."
+
+[dependencies]
+pimble-core = { workspace = true }
+pimble-crdt = { workspace = true }
+pimble-rpc = { workspace = true }
+pimble-client = { workspace = true }
+pimble-sheet = { workspace = true }
+pimble-board = { workspace = true }
+pimble-discussion = { workspace = true }
+yrs = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }
+pimble-server = { workspace = true }
+tokio = { workspace = true }
+tempfile = "3"

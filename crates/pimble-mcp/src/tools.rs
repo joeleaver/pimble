@@ -5,11 +5,11 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use base64::Engine;
-use pimble_client::PimbleClient;
-use pimble_core::{custom_keys, LinkResolution, PimbleUrl, Place, Store, StoreAccess, StoreKind, SyncState};
+use pimble_api::names::{label, stop_sentence, store_tops};
+use pimble_api::rpc::RpcBackend;
+use pimble_api::{recipes, Addr, ApiError, Edited, Pimble as Api};
+use pimble_core::{LinkResolution, Node, PimbleUrl, Place, Store, StoreAccess, StoreKind, SyncState};
 use pimble_crdt::{CrdtError, NodeDoc};
-use pimble_rpc::EditOperation;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -21,13 +21,13 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::connection::Connection;
-use crate::nodes::{self, label, Addr};
-use crate::presence::Presence;
+use crate::connection::{Connection, Shared};
 use crate::sheets::guide;
 
 mod canvas_tools;
 mod discussion_tools;
+#[cfg(test)]
+mod api_tests;
 #[cfg(test)]
 mod presence_tests;
 mod sheet_tools;
@@ -39,7 +39,8 @@ on the person's computer, as a collaborator: edits merge with whatever the perso
 
 Naming a node: every `node`/`parent` argument takes a pimble: link (what Pimble's \"Copy \
 Link\" gives the person, and what every tool answer shows), a bare node id, or a path of \
-titles from the store's name such as \"Family Management/MEDICAL\". When a name is ambiguous \
+titles from the store's name such as \"Family Management/MEDICAL\" (or from anywhere, such as \
+\"MEDICAL/Dr Smith\"); a link to a node that moved leads to where it went. When a name is ambiguous \
 the tool says so and lists the links to choose from. Use list_stores and list_children (with \
 depth for an outline) or find_node to discover where things are.
 
@@ -97,32 +98,25 @@ say. Locked layers and elements take no edits until unlocked, except to their no
 signed with your agent's name.";
 
 pub struct Pimble {
-    conn: Arc<Connection>,
-    /// The client id every edit carries, so notifications say where it came from.
-    client_id: String,
-    /// Where this agent is working, said to everyone (docs/PRESENCE_CONTRACT.md
-    /// section 8).
-    presence: Presence,
+    /// The one API (docs/API_CONTRACT.md): what the tools read and write
+    /// through, as this agent, holding the documents it has read.
+    api: Arc<Api>,
     tool_router: ToolRouter<Self>,
 }
 
-fn rpc(e: impl std::fmt::Display) -> String {
-    let message = e.to_string();
-    match StoreAccess::refusal_in(&message) {
-        Some(sentence) => sentence.to_string(),
-        None => message,
-    }
-}
-
+/// A library's or the API's refusal, as the sentence a tool answers with.
 fn crdt(e: CrdtError) -> String {
-    match e {
-        CrdtError::Refused(sentence) => sentence,
-        other => format!("The edit could not be made: {other}"),
-    }
+    ApiError::from(e).sentence()
 }
 
-fn now() -> String {
-    chrono::Utc::now().to_rfc3339()
+/// A node's type as the person knows it: a `board` node is a canvas in the
+/// interface (docs/CANVAS_CONTRACT.md, "Glossary"); every other type is its own name.
+pub fn type_name(node: &Node) -> &str {
+    if node.node_type == pimble_core::node_types::BOARD {
+        "canvas"
+    } else {
+        &node.node_type
+    }
 }
 
 impl Pimble {
@@ -132,80 +126,46 @@ impl Pimble {
             Some(id) => format!("agent:{id}"),
             None => format!("mcp:{}", uuid::Uuid::new_v4()),
         };
-        Self::with_presence(conn, client_id.clone(), Presence::new(client_id))
+        Self::with_api(Api::new(RpcBackend::new(Shared(conn)), client_id))
     }
 
-    pub fn with_presence(conn: Arc<Connection>, client_id: String, presence: Presence) -> Self {
+    pub fn with_api(api: Api) -> Self {
         Self {
-            conn,
-            client_id,
-            presence,
+            api: Arc::new(api),
             tool_router: Self::tool_router() + Self::sheet_router() + Self::discussion_router() + Self::canvas_router(),
         }
     }
 
-    async fn client(&self) -> Result<Arc<PimbleClient>, String> {
-        self.conn.client().await
-    }
-
     /// Say this agent is in `addr` (a tool read it), keeping its caret there.
-    async fn present(&self, client: &PimbleClient, addr: Addr) {
-        self.presence.say(client, addr, None).await;
+    async fn present(&self, addr: Addr) {
+        self.api.say(addr, None).await;
     }
 
-    /// Fetch the node's document, let `edit` change it, and send what changed as
-    /// one `applyEdit`: the one way content and fields are written here. Then
-    /// the agent is present there, its caret at the end of what it wrote, and
-    /// in the node a discussion is on.
-    async fn edit(
-        &self,
-        client: &PimbleClient,
-        addr: Addr,
-        edit: impl FnOnce(&mut NodeDoc) -> Result<(), String>,
-    ) -> Result<(), String> {
-        let (caret, host) = self.edit_doc(client, addr, edit).await?;
-        self.presence.say(client, addr, caret).await;
-        if let Some(host) = host {
-            self.present(client, Addr { store: addr.store, node: host }).await;
+    /// Let `edit` change the node's document and send what changed
+    /// (`pimble_api::Pimble::edit`, the one write). Then the agent is present
+    /// there, its caret at the end of what it wrote, and in the node a
+    /// discussion is on.
+    async fn edit(&self, addr: Addr, edit: impl FnOnce(&mut NodeDoc) -> Result<(), String> + Send) -> Result<(), String> {
+        let edited = self.edit_doc(addr, edit).await?;
+        self.api.say(addr, edited.caret).await;
+        if let Some(host) = edited.host {
+            self.present(Addr { store: addr.store, node: host }).await;
         }
         Ok(())
     }
 
-    /// The write itself, saying nothing: the caret after it (a sticky index
-    /// into the content) and the node a discussion is on.
-    async fn edit_doc(
-        &self,
-        client: &PimbleClient,
-        addr: Addr,
-        edit: impl FnOnce(&mut NodeDoc) -> Result<(), String>,
-    ) -> Result<(Option<Vec<u8>>, Option<pimble_core::NodeId>), String> {
-        let node = client.get_node(addr.store, addr.node).await.map_err(rpc)?;
-        if node.access == StoreAccess::Read {
-            return Err(StoreAccess::READ_ONLY_REFUSAL.to_string());
-        }
-        let unreadable = |e: CrdtError| format!("The node's document could not be read: {e}");
-        let mut doc = NodeDoc::load(&node.content).map_err(unreadable)?;
-        let before = doc.state_vector();
-        let text_before = doc.textblock_texts();
-        edit(&mut doc)?;
-        let caret = doc.sticky_after_change(&text_before);
-        let delta = doc.diff_since(&before).map_err(|e| e.to_string())?;
-        // Whether the edit changed anything is what merging it into the document as it
-        // was says, never the state vector: a deletion alone does not move it.
-        let mut untouched = NodeDoc::load(&node.content).map_err(unreadable)?;
-        if !untouched.apply_update(&delta).map_err(|e| e.to_string())?.changed {
+    /// The write itself, saying nothing; refused when it would change
+    /// nothing, so an agent hears that its edit missed.
+    async fn edit_doc(&self, addr: Addr, edit: impl FnOnce(&mut NodeDoc) -> Result<(), String> + Send) -> Result<Edited<()>, String> {
+        let edited = self.api.edit(addr, |doc, _| edit(doc)).await?;
+        if !edited.changed {
             return Err("That would change nothing, so nothing was written.".into());
         }
-        let changes = base64::engine::general_purpose::STANDARD.encode(delta);
-        client
-            .apply_edit(addr.store, addr.node, &self.client_id, EditOperation::IncrementalChanges { changes })
-            .await
-            .map_err(rpc)?;
-        Ok((caret, node.attached_to))
+        Ok(edited)
     }
 
-    async fn describe(&self, client: &PimbleClient, stores: &[Store], addr: Addr) -> String {
-        format!("{} ({})", nodes::path_of(client, stores, addr).await, addr.link())
+    async fn describe(&self, addr: Addr) -> String {
+        format!("{} ({})", self.api.path(addr).await, addr.link())
     }
 }
 
@@ -385,8 +345,7 @@ impl Pimble {
     /// you may change them.
     #[tool(name = "list_stores")]
     async fn list_stores(&self) -> Result<String, String> {
-        let client = self.client().await?;
-        let stores = client.list_stores().await.map_err(rpc)?;
+        let stores = self.api.stores().await?;
         if stores.is_empty() {
             return Ok("No stores are open in Pimble on this computer.".into());
         }
@@ -417,21 +376,20 @@ impl Pimble {
     /// line carries the node's link, to name it in the next call.
     #[tool(name = "list_children")]
     async fn list_children(&self, Parameters(p): Parameters<ListChildrenParams>) -> Result<String, String> {
-        let client = self.client().await?;
         let depth = p.depth.unwrap_or(1).clamp(1, 6);
-        let stores = client.list_stores().await.map_err(rpc)?;
         // A store with several shared roots lists them as its top level.
-        let tops = match nodes::find_store(&stores, &p.node) {
-            Ok(store) if !store.roots.is_empty() => nodes::store_tops(store),
-            _ => vec![nodes::resolve(&client, &p.node).await?],
+        let tops = match self.api.find_store(&p.node).await {
+            Ok(store) if !store.roots.is_empty() => store_tops(&store),
+            _ => vec![self.api.resolve(&p.node).await?],
         };
+        let stores = self.api.known_stores().await?;
         let mut out = String::new();
         let mut seen = HashSet::new();
         for top in tops {
             if !store_listing_is_top(&stores, top) {
-                out.push_str(&format!("{}:\n", self.describe(&client, &stores, top).await));
+                out.push_str(&format!("{}:\n", self.describe(top).await));
             }
-            outline(&client, top, depth, 0, &mut seen, &mut out).await?;
+            outline(&self.api, top, depth, 0, &mut seen, &mut out).await?;
         }
         if out.is_empty() {
             out = "(no children)".into();
@@ -443,44 +401,32 @@ impl Pimble {
     /// the MEDICAL node".
     #[tool(name = "find_node")]
     async fn find_node(&self, Parameters(p): Parameters<FindNodeParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let stores = client.list_stores().await.map_err(rpc)?;
         let wanted = p.title.trim().to_lowercase();
         if wanted.is_empty() {
             return Err("Give some of the title to look for.".into());
         }
-        let searched: Vec<&Store> = match &p.store {
-            Some(name) => vec![nodes::find_store(&stores, name)?],
-            None => stores.iter().collect(),
+        let searched: Vec<Store> = match &p.store {
+            Some(name) => vec![self.api.find_store(name).await?],
+            None => self.api.known_stores().await?,
         };
         // (rank, path, link): 0 exact, 1 prefix, 2 contains.
         let mut hits: Vec<(u8, String, String)> = Vec::new();
-        let mut seen = HashSet::new();
-        for store in searched {
-            let mut queue: Vec<(Addr, String)> =
-                nodes::store_tops(store).into_iter().map(|a| (a, store.name.clone())).collect();
-            while let Some((at, path)) = queue.pop() {
-                if !seen.insert(at) {
-                    continue;
-                }
-                let Ok(children) = nodes::children(&client, at).await else { continue };
-                for (addr, node) in children {
-                    let title = label(&node);
-                    let child_path = format!("{path}/{title}");
-                    let lower = title.to_lowercase();
-                    let rank = if lower == wanted {
-                        Some(0)
-                    } else if lower.starts_with(&wanted) {
-                        Some(1)
-                    } else if lower.contains(&wanted) {
-                        Some(2)
-                    } else {
-                        None
-                    };
-                    if let Some(rank) = rank {
-                        hits.push((rank, child_path.clone(), addr.link()));
-                    }
-                    queue.push((addr, child_path));
+        for store in &searched {
+            // The tops themselves are the store's rows, not names to find.
+            let Ok(walked) = self.api.walk(store).await else { continue };
+            for w in walked.into_iter().filter(|w| w.parent.is_some()) {
+                let lower = label(&w.node).to_lowercase();
+                let rank = if lower == wanted {
+                    Some(0)
+                } else if lower.starts_with(&wanted) {
+                    Some(1)
+                } else if lower.contains(&wanted) {
+                    Some(2)
+                } else {
+                    None
+                };
+                if let Some(rank) = rank {
+                    hits.push((rank, w.path, w.addr.link()));
                 }
             }
         }
@@ -488,9 +434,9 @@ impl Pimble {
             return Ok(format!("No node's title contains \"{}\".", p.title.trim()));
         }
         hits.sort();
+        hits.dedup();
         let total = hits.len();
-        let mut out: String =
-            hits.iter().take(30).map(|(_, path, link)| format!("- {path} ({link})\n")).collect();
+        let mut out: String = hits.iter().take(30).map(|(_, path, link)| format!("- {path} ({link})\n")).collect();
         if total > 30 {
             out.push_str(&format!("... and {} more; be more specific.\n", total - 30));
         }
@@ -501,11 +447,9 @@ impl Pimble {
     /// Markdown.
     #[tool(name = "get_node")]
     async fn get_node(&self, Parameters(p): Parameters<NodeParam>) -> Result<String, String> {
-        let client = self.client().await?;
-        let addr = nodes::resolve(&client, &p.node).await?;
-        let stores = client.list_stores().await.map_err(rpc)?;
-        let node = client.get_node(addr.store, addr.node).await.map_err(rpc)?;
-        self.present(&client, addr).await;
+        let addr = self.api.resolve(&p.node).await?;
+        let node = self.api.node(addr).await?;
+        self.present(addr).await;
         let doc = NodeDoc::load(&node.content).map_err(|e| e.to_string())?;
         let content = match doc.markdown() {
             Ok(md) => md,
@@ -515,8 +459,8 @@ impl Pimble {
             "title: {}\nlink: {}\npath: {}\ntype: {}\n",
             label(&node),
             addr.link(),
-            nodes::path_of(&client, &stores, addr).await,
-            nodes::type_name(&node)
+            self.api.path(addr).await,
+            type_name(&node)
         );
         if !node.metadata.tags.is_empty() {
             out.push_str(&format!("tags: {}\n", node.metadata.tags.join(", ")));
@@ -530,8 +474,10 @@ impl Pimble {
             out.push_str(&format!("discussions: {} (list_discussions lists them)\n", node.attachments));
         }
         out.push_str(&format!("modified: {}\n", node.metadata.modified_at.to_rfc3339()));
-        if node.access == StoreAccess::Read {
-            out.push_str("access: read-only\n");
+        match node.access {
+            StoreAccess::Read => out.push_str("access: read-only\n"),
+            StoreAccess::Comment => out.push_str("access: comment-only (start_discussion and reply work here)\n"),
+            StoreAccess::Full => {}
         }
         if node.metadata.custom.contains_key("mount") || node.node_type == "mount" {
             out.push_str("(a mount: its children are another store's; list_children shows them)\n");
@@ -543,15 +489,15 @@ impl Pimble {
             None
         } else if node.node_type == pimble_core::node_types::BOARD {
             out.push_str("(a canvas: its content is what is drawn on it; render_canvas shows it as a picture)\n");
-            out.push_str(&self.canvas_body(&client, &node, None).await);
+            out.push_str(&self.canvas_body(&node, None).await);
             None
         } else if node.node_type == pimble_core::node_types::SHEET {
             out.push_str("(a sheet node: its content is its tables)\n");
-            self.tables_of_node(&client, addr, &node).await.map(|t| ("Tables", t))
+            self.tables_of_node(addr, &node).await.map(|t| ("Tables", t))
         } else {
             // A text node's tables are shown where they are in its text.
-            let content = self.inline_discussions(&client, &content).await;
-            let (content, lost) = self.tables_in_text(&client, addr, &node, &content).await;
+            let content = self.inline_discussions(&content).await;
+            let (content, lost) = self.tables_in_text(addr, &node, &content).await;
             out.push_str(if content.is_empty() { "(no content)" } else { &content });
             if content.contains(pimble_crdt::markdown::CANVAS_FRAGMENT) {
                 out.push_str(
@@ -572,21 +518,19 @@ impl Pimble {
     /// Search the open stores, by words or (with `semantic`) by meaning.
     #[tool(name = "search")]
     async fn search(&self, Parameters(p): Parameters<SearchParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let stores = client.list_stores().await.map_err(rpc)?;
         let only = match &p.store {
-            Some(name) => vec![nodes::find_store(&stores, name)?.id],
+            Some(name) => vec![self.api.find_store(name).await?.id],
             None => Vec::new(),
         };
         let limit = p.limit.unwrap_or(20).clamp(1, 50);
-        let results = client.search(p.query.clone(), only, p.semantic, limit).await.map_err(rpc)?;
+        let results = self.api.search(&p.query, only, p.semantic, limit).await?;
         if results.is_empty() {
             return Ok(format!("Nothing matches \"{}\".", p.query));
         }
         let mut out = String::new();
         for r in results {
             let addr = Addr { store: r.store_id, node: r.node_id };
-            let path = nodes::path_of(&client, &stores, addr).await;
+            let path = self.api.path(addr).await;
             let snippet: String = r.snippet.split_whitespace().collect::<Vec<_>>().join(" ");
             out.push_str(&format!("- {path} ({})\n  {snippet}\n", addr.link()));
         }
@@ -597,29 +541,27 @@ impl Pimble {
     /// is followed to where it went).
     #[tool(name = "resolve_link")]
     async fn resolve_link(&self, Parameters(p): Parameters<LinkParam>) -> Result<String, String> {
-        let client = self.client().await?;
         let url = PimbleUrl::parse(p.link.trim()).ok_or_else(|| format!("\"{}\" is not a Pimble link.", p.link))?;
-        let stores = client.list_stores().await.map_err(rpc)?;
-        let resolution = client.resolve_link(url.store, url.node).await.map_err(rpc)?;
+        let (resolution, hops) = self.api.follow(&url).await?;
         Ok(match resolution {
             LinkResolution::Live { store_id, node_id } => {
-                let addr = Addr { store: store_id, node: node_id };
-                format!("Live: {}", self.describe(&client, &stores, addr).await)
+                format!("Live: {}", self.describe(Addr { store: store_id, node: node_id }).await)
             }
             LinkResolution::Deleted { store_id, node_id } => {
                 format!("Deleted (undelete_node can put it back): {}", Addr { store: store_id, node: node_id }.link())
             }
-            other => other.sentence().unwrap_or("The link leads nowhere.").to_string(),
+            other => {
+                let said = stop_sentence(&url, hops, &other);
+                if said.is_empty() { "The link leads nowhere." } else { said }.to_string()
+            }
         })
     }
 
     /// A store's recently deleted nodes, which undelete_node can put back.
     #[tool(name = "list_deleted")]
     async fn list_deleted(&self, Parameters(p): Parameters<StoreParam>) -> Result<String, String> {
-        let client = self.client().await?;
-        let stores = client.list_stores().await.map_err(rpc)?;
-        let store = nodes::find_store(&stores, &p.store)?;
-        let deleted = client.list_deleted(store.id).await.map_err(rpc)?;
+        let store = self.api.find_store(&p.store).await?;
+        let deleted = self.api.list_deleted(store.id).await?;
         if deleted.is_empty() {
             return Ok(format!("Nothing was deleted in {}.", store.name));
         }
@@ -641,38 +583,20 @@ impl Pimble {
     /// Create a node under `parent`, with a title and optionally its first content.
     #[tool(name = "create_node")]
     async fn create_node(&self, Parameters(p): Parameters<CreateNodeParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let parent = nodes::resolve(&client, &p.parent).await?;
-        // A node created under a mount lives in the mount's source store.
-        let parent_node = client.get_node(parent.store, parent.node).await.map_err(rpc)?;
-        let (store, parent_id) = match parent_node.mount_ref() {
-            Some(mount) => (mount.source_store, mount.source_node),
-            None => (parent.store, parent.node),
-        };
-        if let Some(md) = &p.markdown {
-            pimble_crdt::markdown::check(md).map_err(crdt)?;
-        }
-        let node_id = client.create_node(store, Some(parent_id), "document", p.title.clone()).await.map_err(rpc)?;
-        let addr = Addr { store, node: node_id };
-        let markdown = p.markdown.clone();
-        self.edit(&client, addr, move |doc| {
-            doc.set_custom(custom_keys::EXPLICIT_TITLE, &serde_json::json!(true), &now()).map_err(crdt)?;
-            if let Some(md) = markdown.as_deref().filter(|md| !md.trim().is_empty()) {
-                doc.write_markdown(md).map_err(crdt)?;
-            }
-            Ok(())
-        })
-        .await?;
-        let stores = client.list_stores().await.map_err(rpc)?;
-        Ok(format!("Created {}", self.describe(&client, &stores, addr).await))
+        let parent = self.api.resolve(&p.parent).await?;
+        // Made with its content in the one createNode (a node under a mount
+        // lives in the mount's source store).
+        let init = recipes::document(&p.title, p.markdown.as_deref())?;
+        let addr = self.api.create(parent, Place::Last, init).await?;
+        self.present(addr).await;
+        Ok(format!("Created {}", self.describe(addr).await))
     }
 
     /// Append Markdown after the node's content.
     #[tool(name = "append")]
     async fn append(&self, Parameters(p): Parameters<AppendParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let addr = nodes::resolve(&client, &p.node).await?;
-        self.edit(&client, addr, |doc| doc.append_markdown(&p.markdown).map(drop).map_err(crdt)).await?;
+        let addr = self.api.resolve(&p.node).await?;
+        self.edit(addr, |doc| doc.append_markdown(&p.markdown).map(drop).map_err(crdt)).await?;
         Ok(format!("Appended to {}.", addr.link()))
     }
 
@@ -680,12 +604,8 @@ impl Pimble {
     /// section.
     #[tool(name = "insert_after")]
     async fn insert_after(&self, Parameters(p): Parameters<InsertAfterParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let addr = nodes::resolve(&client, &p.node).await?;
-        self.edit(&client, addr, |doc| {
-            doc.insert_markdown_after(&p.after, p.after_section, &p.markdown).map(drop).map_err(crdt)
-        })
-        .await?;
+        let addr = self.api.resolve(&p.node).await?;
+        self.edit(addr, |doc| doc.insert_markdown_after(&p.after, p.after_section, &p.markdown).map(drop).map_err(crdt)).await?;
         Ok(format!("Inserted into {}.", addr.link()))
     }
 
@@ -693,19 +613,16 @@ impl Pimble {
     /// higher); the heading stays.
     #[tool(name = "replace_section")]
     async fn replace_section(&self, Parameters(p): Parameters<ReplaceSectionParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let addr = nodes::resolve(&client, &p.node).await?;
-        self.edit(&client, addr, |doc| doc.replace_section_markdown(&p.heading, &p.markdown).map(drop).map_err(crdt))
-            .await?;
+        let addr = self.api.resolve(&p.node).await?;
+        self.edit(addr, |doc| doc.replace_section_markdown(&p.heading, &p.markdown).map(drop).map_err(crdt)).await?;
         Ok(format!("Replaced the section under \"{}\" in {}.", p.heading, addr.link()))
     }
 
     /// Replace an exact quote inside one paragraph with new text.
     #[tool(name = "replace_text")]
     async fn replace_text(&self, Parameters(p): Parameters<ReplaceTextParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let addr = nodes::resolve(&client, &p.node).await?;
-        self.edit(&client, addr, |doc| doc.replace_text(&p.quote, &p.text).map(drop).map_err(crdt)).await?;
+        let addr = self.api.resolve(&p.node).await?;
+        self.edit(addr, |doc| doc.replace_text(&p.quote, &p.text).map(drop).map_err(crdt)).await?;
         Ok(format!("Replaced the text in {}.", addr.link()))
     }
 
@@ -714,10 +631,8 @@ impl Pimble {
     /// turning a paragraph into a list.
     #[tool(name = "replace_block")]
     async fn replace_block(&self, Parameters(p): Parameters<ReplaceBlockParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let addr = nodes::resolve(&client, &p.node).await?;
-        self.edit(&client, addr, |doc| doc.replace_block_markdown(&p.block, &p.markdown).map(drop).map_err(crdt))
-            .await?;
+        let addr = self.api.resolve(&p.node).await?;
+        self.edit(addr, |doc| doc.replace_block_markdown(&p.block, &p.markdown).map(drop).map_err(crdt)).await?;
         let did = if p.markdown.trim().is_empty() { "Removed" } else { "Replaced" };
         Ok(format!("{did} the block in {}.", addr.link()))
     }
@@ -726,9 +641,8 @@ impl Pimble {
     /// or higher.
     #[tool(name = "remove_section")]
     async fn remove_section(&self, Parameters(p): Parameters<RemoveSectionParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let addr = nodes::resolve(&client, &p.node).await?;
-        self.edit(&client, addr, |doc| doc.remove_section(&p.heading).map(drop).map_err(crdt)).await?;
+        let addr = self.api.resolve(&p.node).await?;
+        self.edit(addr, |doc| doc.remove_section(&p.heading).map(drop).map_err(crdt)).await?;
         Ok(format!("Removed the section \"{}\" from {}.", p.heading, addr.link()))
     }
 
@@ -737,25 +651,23 @@ impl Pimble {
     /// them), and the node keeps its link. Prefer the smaller edits for small changes.
     #[tool(name = "replace_content")]
     async fn replace_content(&self, Parameters(p): Parameters<ReplaceContentParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let addr = nodes::resolve(&client, &p.node).await?;
-        self.edit(&client, addr, |doc| doc.replace_content_markdown(&p.markdown).map(drop).map_err(crdt)).await?;
+        let addr = self.api.resolve(&p.node).await?;
+        self.edit(addr, |doc| doc.replace_content_markdown(&p.markdown).map(drop).map_err(crdt)).await?;
         Ok(format!("Replaced the content of {}.", addr.link()))
     }
 
     /// Rename a node.
     #[tool(name = "rename")]
     async fn rename(&self, Parameters(p): Parameters<RenameParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let addr = nodes::resolve(&client, &p.node).await?;
+        let addr = self.api.resolve(&p.node).await?;
         let title = p.title.trim().to_string();
         if title.is_empty() {
             return Err("A title cannot be empty.".into());
         }
-        self.edit(&client, addr, |doc| {
-            let at = now();
+        self.edit(addr, |doc| {
+            let at = pimble_api::now();
             doc.set_title(&title, &at).map_err(crdt)?;
-            doc.set_custom(custom_keys::EXPLICIT_TITLE, &serde_json::json!(true), &at).map_err(crdt)
+            doc.set_custom(pimble_core::custom_keys::EXPLICIT_TITLE, &serde_json::json!(true), &at).map_err(crdt)
         })
         .await?;
         Ok(format!("Renamed {} to \"{title}\".", addr.link()))
@@ -764,10 +676,9 @@ impl Pimble {
     /// Set a node's tags (replacing the ones it has).
     #[tool(name = "set_tags")]
     async fn set_tags(&self, Parameters(p): Parameters<SetTagsParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let addr = nodes::resolve(&client, &p.node).await?;
+        let addr = self.api.resolve(&p.node).await?;
         let tags: Vec<String> = p.tags.iter().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
-        self.edit(&client, addr, |doc| doc.set_tags(&tags, &now()).map_err(crdt)).await?;
+        self.edit(addr, |doc| doc.set_tags(&tags, &pimble_api::now()).map_err(crdt)).await?;
         Ok(format!("Tagged {}: {}.", addr.link(), if tags.is_empty() { "(none)".into() } else { tags.join(", ") }))
     }
 
@@ -776,39 +687,28 @@ impl Pimble {
     /// names.
     #[tool(name = "move_node")]
     async fn move_node(&self, Parameters(p): Parameters<MoveNodeParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let addr = nodes::resolve(&client, &p.node).await?;
-        let parent = nodes::resolve(&client, &p.new_parent).await?;
+        let addr = self.api.resolve(&p.node).await?;
+        // Under a mount is under its source, as everything made there is.
+        let parent = self.api.create_parent(self.api.resolve(&p.new_parent).await?).await?;
         let place = match (&p.after, p.first) {
             (Some(_), true) => return Err("Give `after` or `first`, not both.".into()),
             (None, true) => Place::First,
             (None, false) => Place::Last,
             (Some(after), false) => {
-                let after = nodes::resolve(&client, after).await?;
+                let after = self.api.resolve(after).await?;
                 if after.store != parent.store {
                     return Err("`after` must be a child of `new_parent`.".into());
                 }
                 Place::After(after.node)
             }
         };
-        let (node_id, left) = if parent.store == addr.store {
-            let r = client.move_node(addr.store, addr.node, parent.node, place).await.map_err(rpc)?;
-            (r.node_id, r.left_shares.len())
-        } else {
-            let r = client
-                .transplant_node(addr.store, addr.node, parent.store, parent.node, place)
-                .await
-                .map_err(rpc)?;
-            (r.node_id, r.left_shares.len())
-        };
-        let now_at = Addr { store: parent.store, node: node_id };
-        let stores = client.list_stores().await.map_err(rpc)?;
-        let mut out = format!("Moved to {}", self.describe(&client, &stores, now_at).await);
-        if now_at != addr {
+        let moved = self.api.move_node(addr, parent, place).await?;
+        let mut out = format!("Moved to {}", self.describe(moved.addr).await);
+        if moved.new_link {
             out.push_str(&format!(". It has a new link; the old one ({}) now leads here.", addr.link()));
         }
-        if left > 0 {
-            out.push_str(&format!(" It left {left} share(s): members there see it as deleted."));
+        if moved.left_shares > 0 {
+            out.push_str(&format!(" It left {} share(s): members there see it as deleted.", moved.left_shares));
         }
         Ok(out)
     }
@@ -817,24 +717,21 @@ impl Pimble {
     /// Recently Deleted.
     #[tool(name = "delete_node")]
     async fn delete_node(&self, Parameters(p): Parameters<NodeParam>) -> Result<String, String> {
-        let client = self.client().await?;
-        let addr = nodes::resolve(&client, &p.node).await?;
-        client.delete_node(addr.store, addr.node).await.map_err(rpc)?;
+        let addr = self.api.resolve(&p.node).await?;
+        self.api.delete(addr).await?;
         Ok(format!("Deleted {} (undelete_node puts it back).", addr.link()))
     }
 
     /// Put a deleted node back where it was.
     #[tool(name = "undelete_node")]
     async fn undelete_node(&self, Parameters(p): Parameters<NodeParam>) -> Result<String, String> {
-        let client = self.client().await?;
-        let url = PimbleUrl::parse(p.node.trim());
-        let addr = match url {
+        // A link to a deleted node names it as it is, not where it would lead.
+        let addr = match PimbleUrl::parse(p.node.trim()) {
             Some(url) => Addr { store: url.store, node: url.node },
-            None => nodes::resolve(&client, &p.node).await?,
+            None => self.api.resolve(&p.node).await?,
         };
-        client.undelete_node(addr.store, addr.node).await.map_err(rpc)?;
-        let stores = client.list_stores().await.map_err(rpc)?;
-        Ok(format!("Put back {}", self.describe(&client, &stores, addr).await))
+        self.api.undelete(addr).await?;
+        Ok(format!("Put back {}", self.describe(addr).await))
     }
 }
 
@@ -845,7 +742,7 @@ fn store_listing_is_top(stores: &[Store], top: Addr) -> bool {
 
 /// An indented outline of `at`'s subtree, `depth` levels deep.
 fn outline<'a>(
-    client: &'a PimbleClient,
+    api: &'a Api,
     at: Addr,
     depth: u32,
     indent: usize,
@@ -856,7 +753,7 @@ fn outline<'a>(
         if !seen.insert(at) {
             return Ok(());
         }
-        for (addr, node) in nodes::children(client, at).await? {
+        for (addr, node) in api.children(at).await? {
             let count = node.children.len();
             let mount = if node.node_type == "mount" { ", a mount" } else { "" };
             let children = match count {
@@ -866,7 +763,7 @@ fn outline<'a>(
             };
             out.push_str(&format!("{}- {} ({}{children}{mount})\n", "  ".repeat(indent), label(&node), addr.link()));
             if depth > 1 && (count > 0 || node.node_type == "mount") {
-                outline(client, addr, depth - 1, indent + 1, seen, out).await?;
+                outline(api, addr, depth - 1, indent + 1, seen, out).await?;
             }
         }
         Ok(())
@@ -880,7 +777,7 @@ impl ServerHandler for Pimble {
     async fn on_initialized(&self, context: rmcp::service::NotificationContext<RoleServer>) {
         if let Some(info) = context.peer.peer_info() {
             let app = &info.client_info;
-            self.presence.set_device(app.title.as_deref().unwrap_or(&app.name));
+            self.api.set_device(app.title.as_deref().unwrap_or(&app.name));
         }
     }
 

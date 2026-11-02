@@ -16,14 +16,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use base64::Engine;
-use pimble_board::recipe::{canvas_icon, StartingPicture, CARD_SIZE, PICTURE_LAYER_NAME, STICKY_SIZE};
+use pimble_board::recipe::{StartingPicture, CARD_SIZE, PICTURE_LAYER_NAME, STICKY_SIZE};
 use pimble_board::{
     selection_bounds, Align, ArrowHeads, Author, Board, BoardError, BoardSnapshot, BoardTxn, CardLabel, Color, Dash, End,
     Geom, Kind, NewElement, Page, Picture, PictureGeom, Placement, Point, Rect, Side, Stamp, Style, StyleKey, Transform,
     ViewOptions,
 };
-use pimble_client::PimbleClient;
-use pimble_core::{custom_keys, node_types, BlobUrl, Node, Place, PimbleUrl};
+use pimble_core::{node_types, BlobUrl, Node, Place, PimbleUrl};
 use pimble_crdt::NodeDoc;
 use pimble_rpc::{BoardPoint, BoardPresence, BoardRect};
 use rmcp::handler::server::wrapper::Parameters;
@@ -32,8 +31,9 @@ use rmcp::{tool, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use super::{rpc, Pimble};
-use crate::nodes::{self, label, Addr};
+use pimble_api::{label, recipes, Addr};
+
+use super::{type_name, Pimble};
 
 /// Board writes are stamped with RFC 3339 UTC with milliseconds: step numbers
 /// sort by it as a string, so every writer uses the app's shape.
@@ -1258,23 +1258,20 @@ fn describe_where(snapshot: &BoardSnapshot, cards: &HashMap<String, String>, wit
 impl Pimble {
     /// Who this agent's elements are stamped with: its id and name, as the
     /// server knows them (none when no account is signed in, as for a person).
-    async fn board_author(&self, client: &PimbleClient) -> Option<Author> {
-        match client.who_am_i().await {
-            Ok((Some(sub), name)) => Some(Author::new(sub, if name.is_empty() { "AI agent".to_string() } else { name })),
-            _ => None,
-        }
+    async fn board_author(&self) -> Option<Author> {
+        self.api.me().await.map(|me| me.board_author("AI agent"))
     }
 
     /// The canvas a tool was given.
-    async fn canvas(&self, client: &PimbleClient, node: &str, canvas: Option<&str>) -> Result<Target, String> {
+    async fn canvas(&self, node: &str, canvas: Option<&str>) -> Result<Target, String> {
         let node = node.trim();
         // An embedded canvas node's address, as get_node shows it in text.
         let node = match node.strip_prefix("pimble-board:") {
             Some(rest) if rest.contains('/') => format!("pimble:{}", rest.split('#').next().unwrap_or(rest)),
             _ => node.to_string(),
         };
-        let addr = nodes::resolve(client, &node).await?;
-        let found = client.get_node(addr.store, addr.node).await.map_err(rpc)?;
+        let addr = self.api.resolve(&node).await?;
+        let found = self.api.node(addr).await?;
         let canvas = canvas.map(canvas_id).filter(|c| !c.is_empty());
         if found.node_type == node_types::BOARD {
             if canvas.is_some() {
@@ -1304,7 +1301,7 @@ impl Pimble {
     }
 
     /// The titles of the nodes the canvas's cards show, by link.
-    async fn card_titles(&self, client: &PimbleClient, snapshot: &BoardSnapshot) -> HashMap<String, String> {
+    async fn card_titles(&self, snapshot: &BoardSnapshot) -> HashMap<String, String> {
         let mut out = HashMap::new();
         for e in &snapshot.elements {
             if let Geom::Card { link, .. } = &e.raw.geom {
@@ -1312,7 +1309,7 @@ impl Pimble {
                     continue;
                 }
                 if let Some(url) = PimbleUrl::parse(link) {
-                    if let Ok(node) = client.get_node(url.store, url.node).await {
+                    if let Ok(node) = self.api.node(Addr { store: url.store, node: url.node }).await {
                         out.insert(link.clone(), label(&node));
                     }
                 }
@@ -1323,20 +1320,20 @@ impl Pimble {
 
     /// Store a picture file as a blob of `addr`'s store (as a write of
     /// `addr`), fitted as the app fits one: its URL and pixel size.
-    async fn store_picture(&self, client: &PimbleClient, addr: Addr, file: &str) -> Result<(String, u32, u32), String> {
+    async fn store_picture(&self, addr: Addr, file: &str) -> Result<(String, u32, u32), String> {
         let path = std::path::Path::new(file.trim());
         let bytes = std::fs::read(path).map_err(|e| format!("The picture {} could not be read: {e}", path.display()))?;
         let fitted = pimble_image::fit(bytes).map_err(|e| e.to_string())?;
         let picture = Picture::decode(&fitted.bytes).map_err(|e| format!("{} is not a picture Pimble can show: {e}", path.display()))?;
-        let url = client.put_blob(addr.store, addr.node, fitted.mime.as_str(), &fitted.bytes).await.map_err(rpc)?;
+        let url = self.api.put_blob(addr, fitted.mime.as_str(), &fitted.bytes).await?;
         Ok((url.to_string(), picture.width(), picture.height()))
     }
 
     /// A picture already in Pimble: its URL and pixel size.
-    async fn known_picture(&self, client: &PimbleClient, src: &str) -> Result<(String, u32, u32), String> {
+    async fn known_picture(&self, src: &str) -> Result<(String, u32, u32), String> {
         let src = src.trim().split('#').next().unwrap_or_default();
         let url = BlobUrl::parse(src).ok_or_else(|| format!("\"{src}\" is not a pimble-blob: URL."))?;
-        let (_, bytes) = client.get_blob(url.store, url.blob).await.map_err(rpc)?;
+        let (_, bytes) = self.api.get_blob(url.store, url.blob).await?;
         let picture = Picture::decode(&bytes).map_err(|e| format!("{src} is not a picture Pimble can show: {e}"))?;
         Ok((url.to_string(), picture.width(), picture.height()))
     }
@@ -1345,7 +1342,6 @@ impl Pimble {
     /// stored, cards' nodes found. Picture blobs are written as writes of `owner`.
     async fn prepare(
         &self,
-        client: &PimbleClient,
         owner: Addr,
         specs: &[ElementSpec],
     ) -> Result<Prepared, String> {
@@ -1355,14 +1351,14 @@ impl Pimble {
             let kind = Kind::parse(spec.kind.trim());
             if kind == Kind::Picture {
                 let picture = match (&spec.file, &spec.src) {
-                    (Some(file), None) => self.store_picture(client, owner, file).await?,
-                    (None, Some(src)) => self.known_picture(client, src).await?,
+                    (Some(file), None) => self.store_picture(owner, file).await?,
+                    (None, Some(src)) => self.known_picture(src).await?,
                     _ => return Err(format!("Element {} (a picture) takes a file or a src, one of them.", i + 1)),
                 };
                 pictures.insert(i, picture);
             }
             if let Some(node) = &spec.node {
-                cards.insert(i, self.card_target(client, node).await?);
+                cards.insert(i, self.card_target(node).await?);
             } else if kind == Kind::Card {
                 return Err(format!("Element {} (a card) needs the node it shows (`node`).", i + 1));
             }
@@ -1370,9 +1366,9 @@ impl Pimble {
         Ok((pictures, cards))
     }
 
-    async fn card_target(&self, client: &PimbleClient, node: &str) -> Result<(String, String), String> {
-        let addr = nodes::resolve(client, node).await?;
-        let found = client.get_node(addr.store, addr.node).await.map_err(rpc)?;
+    async fn card_target(&self, node: &str) -> Result<(String, String), String> {
+        let addr = self.api.resolve(node).await?;
+        let found = self.api.node(addr).await?;
         Ok((addr.link(), label(&found)))
     }
 
@@ -1382,17 +1378,16 @@ impl Pimble {
     /// what it touched selected. Answers what `write` answered.
     async fn canvas_edit<R: Send + 'static>(
         &self,
-        client: &PimbleClient,
         target: &Target,
         prepared: Prepared,
         write: impl FnOnce(&mut BoardTxn<'_, '_>, &mut Scene, &BoardSnapshot) -> Result<R, BoardError> + Send,
     ) -> Result<R, String> {
-        let author = self.board_author(client).await;
+        let author = self.board_author().await;
         let now = now();
         let mut answer: Option<(R, Vec<String>)> = None;
         let answer_ref = &mut answer;
         let board_of = target.clone();
-        self.edit_doc(client, target.addr, move |doc| {
+        self.edit_doc(target.addr, move |doc| {
             let board = board_of.board(doc);
             if !board.exists() {
                 return Err("This canvas has not arrived on this computer yet, so nothing was written.".into());
@@ -1407,14 +1402,14 @@ impl Pimble {
         })
         .await?;
         let (result, touched) = answer.expect("the edit ran");
-        self.on_canvas(client, target, touched).await;
+        self.on_canvas(target, touched).await;
         Ok(result)
     }
 
     /// Say this agent is on the canvas, with `selection` selected and its
     /// pointer in the middle of it.
-    async fn on_canvas(&self, client: &PimbleClient, target: &Target, selection: Vec<String>) {
-        let Ok(node) = client.get_node(target.addr.store, target.addr.node).await else { return };
+    async fn on_canvas(&self, target: &Target, selection: Vec<String>) {
+        let Ok(node) = self.api.node(target.addr).await else { return };
         let Ok(doc) = doc_of(&node) else { return };
         let snapshot = target.board(&doc).snapshot();
         let area = selection_bounds(&snapshot, &selection).or_else(|| snapshot.visible_extent());
@@ -1429,15 +1424,15 @@ impl Pimble {
                 .unwrap_or_default(),
             markup: target.text_canvas.clone(),
         };
-        self.presence.say_on_board(client, target.addr, presence).await;
+        self.api.say_on_board(target.addr, presence).await;
     }
 
     /// The canvas description get_node and get_canvas show.
-    pub(super) async fn canvas_body(&self, client: &PimbleClient, node: &Node, text_canvas: Option<&str>) -> String {
-        self.canvas_body_where(client, node, text_canvas, None).await
+    pub(super) async fn canvas_body(&self, node: &Node, text_canvas: Option<&str>) -> String {
+        self.canvas_body_where(node, text_canvas, None).await
     }
 
-    async fn canvas_body_where(&self, client: &PimbleClient, node: &Node, text_canvas: Option<&str>, with_field: Option<&str>) -> String {
+    async fn canvas_body_where(&self, node: &Node, text_canvas: Option<&str>, with_field: Option<&str>) -> String {
         let doc = match doc_of(node) {
             Ok(doc) => doc,
             Err(e) => return e,
@@ -1450,7 +1445,7 @@ impl Pimble {
             return "(this canvas has not arrived on this computer yet)\n".to_string();
         }
         let snapshot = board.snapshot();
-        let cards = self.card_titles(client, &snapshot).await;
+        let cards = self.card_titles(&snapshot).await;
         describe_where(&snapshot, &cards, with_field)
     }
 }
@@ -1510,11 +1505,10 @@ impl Pimble {
     /// picture's URL). render_canvas shows it as a picture.
     #[tool(name = "get_canvas")]
     async fn get_canvas(&self, Parameters(p): Parameters<GetCanvasParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let target = self.canvas(&client, &p.node, p.canvas.as_deref()).await?;
-        self.on_canvas(&client, &target, Vec::new()).await;
+        let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
+        self.on_canvas(&target, Vec::new()).await;
         let with_field = p.with_field.as_deref().map(str::trim).filter(|w| !w.is_empty());
-        let body = self.canvas_body_where(&client, &target.node, target.text_canvas.as_deref(), with_field).await;
+        let body = self.canvas_body_where(&target.node, target.text_canvas.as_deref(), with_field).await;
         Ok(format!("{}\nCoordinates are canvas units; x grows right, y grows down.\n{body}", target.what()))
     }
 
@@ -1524,15 +1518,14 @@ impl Pimble {
     /// coordinates.
     #[tool(name = "render_canvas")]
     async fn render_canvas(&self, Parameters(p): Parameters<RenderCanvasParams>) -> Result<CallToolResult, String> {
-        let client = self.client().await?;
-        let target = self.canvas(&client, &p.node, p.canvas.as_deref()).await?;
+        let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
         let doc = doc_of(&target.node)?;
         let board = target.board(&doc);
         if !board.exists() {
             return Err("This canvas has not arrived on this computer yet.".into());
         }
         let plain = board.snapshot();
-        let cards = self.card_titles(&client, &plain).await;
+        let cards = self.card_titles(&plain).await;
         let labels = cards.iter().map(|(link, title)| (link.clone(), CardLabel { title: title.clone(), color: None })).collect();
         let options = ViewOptions { show_all: p.show_all, card_labels: Arc::new(labels), ..ViewOptions::default() };
         let snapshot = BoardSnapshot::build_with(board.read(), options);
@@ -1544,7 +1537,7 @@ impl Pimble {
                     continue;
                 }
                 if let Some(url) = BlobUrl::parse(&pg.src) {
-                    if let Ok((_, bytes)) = client.get_blob(url.store, url.blob).await {
+                    if let Ok((_, bytes)) = self.api.get_blob(url.store, url.blob).await {
                         if let Ok(picture) = Picture::decode(&bytes) {
                             pictures.insert(pg.src.clone(), Arc::new(picture));
                         }
@@ -1589,7 +1582,7 @@ impl Pimble {
         let png = image.encode_png().map_err(|e| format!("The picture could not be made: {e}"))?;
         let (w, h) = (image.width, image.height);
         let s = w as f32 / rendered.rect.w.max(1e-3);
-        self.on_canvas(&client, &target, only.into_iter().collect()).await;
+        self.on_canvas(&target, only.into_iter().collect()).await;
         let missing = snapshot
             .elements
             .iter()
@@ -1622,21 +1615,16 @@ impl Pimble {
     /// draw in), with its first elements if given (as add_elements takes them).
     #[tool(name = "create_canvas")]
     async fn create_canvas(&self, Parameters(p): Parameters<CreateCanvasParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let parent = nodes::resolve(&client, &p.parent).await?;
-        let parent_node = client.get_node(parent.store, parent.node).await.map_err(rpc)?;
-        let parent = match parent_node.mount_ref() {
-            Some(mount) => Addr { store: mount.source_store, node: mount.source_node },
-            None => parent,
-        };
+        // A node made under a mount lives in the mount's source store.
+        let parent = self.api.create_parent(self.api.resolve(&p.parent).await?).await?;
         // Pictures are stored as writes of the parent, as the app stores a
         // picture dropped on a row, since the canvas does not exist yet.
         let picture = match &p.picture {
-            Some(file) => Some(self.store_picture(&client, parent, file).await?),
+            Some(file) => Some(self.store_picture(parent, file).await?),
             None => None,
         };
-        let prepared = self.prepare(&client, parent, &p.elements).await?;
-        let author = self.board_author(&client).await;
+        let prepared = self.prepare(parent, &p.elements).await?;
+        let author = self.board_author().await;
         let now = now();
         let board = Board::standalone();
         let edited = board.edit(Stamp::new(author.as_ref(), &now), |t| build_canvas(t, picture.as_ref(), prepared, &p.elements));
@@ -1648,20 +1636,10 @@ impl Pimble {
             .filter(|t| !t.trim().is_empty())
             .or_else(|| p.picture.as_deref().map(picture_title))
             .unwrap_or_else(|| "Canvas".to_string());
-        let icon = canvas_icon(picture.is_some());
-        let custom = HashMap::from([
-            (custom_keys::ICON.to_string(), serde_json::json!(icon)),
-            (custom_keys::EXPLICIT_TITLE.to_string(), serde_json::json!(true)),
-        ]);
-        let node_id = client
-            .create_node_with(parent.store, Some(parent.node), node_types::BOARD, title.clone(), Some(content), custom, Place::Last)
-            .await
-            .map_err(rpc)?;
-        let addr = Addr { store: parent.store, node: node_id };
-        let node = client.get_node(addr.store, addr.node).await.map_err(rpc)?;
-        self.on_canvas(&client, &Target { addr, node, text_canvas: None }, touched).await;
-        let stores = client.list_stores().await.map_err(rpc)?;
-        let mut out = format!("Made the canvas {}.", self.describe(&client, &stores, addr).await);
+        let addr = self.api.create(parent, Place::Last, recipes::canvas(&title, content, picture.is_some())).await?;
+        let node = self.api.node(addr).await?;
+        self.on_canvas(&Target { addr, node, text_canvas: None }, touched).await;
+        let mut out = format!("Made the canvas {}.", self.describe(addr).await);
         if !ids.is_empty() {
             out.push_str(&format!("\nIts elements:\n{}", made(&p.elements, &ids)));
         }
@@ -1675,24 +1653,23 @@ impl Pimble {
     /// other canvas tools take as `canvas`.
     #[tool(name = "insert_canvas")]
     async fn insert_canvas(&self, Parameters(p): Parameters<InsertCanvasParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let addr = nodes::resolve(&client, &p.node).await?;
-        let node = client.get_node(addr.store, addr.node).await.map_err(rpc)?;
+        let addr = self.api.resolve(&p.node).await?;
+        let node = self.api.node(addr).await?;
         if node.node_type == node_types::BOARD || node.node_type == node_types::SHEET || node.node_type == node_types::DISCUSSION || node.node_type == node_types::MOUNT {
             return Err(format!(
                 "{} is a {} and has no text to put a canvas in; add_elements draws on a canvas node.",
                 label(&node),
-                nodes::type_name(&node)
+                type_name(&node)
             ));
         }
         let picture = match (&p.picture, &p.src) {
-            (Some(file), None) => Some(self.store_picture(&client, addr, file).await?),
-            (None, Some(src)) => Some(self.known_picture(&client, src).await?),
+            (Some(file), None) => Some(self.store_picture(addr, file).await?),
+            (None, Some(src)) => Some(self.known_picture(src).await?),
             (None, None) => None,
             _ => return Err("Give a picture file or a pimble-blob: src, not both.".into()),
         };
-        let prepared = self.prepare(&client, addr, &p.elements).await?;
-        let author = self.board_author(&client).await;
+        let prepared = self.prepare(addr, &p.elements).await?;
+        let author = self.board_author().await;
         let now = now();
         let canvas = pimble_board::doc::new_id();
         let alt = p.alt.clone().unwrap_or_default().replace(['[', ']', '\n'], " ");
@@ -1709,7 +1686,7 @@ impl Pimble {
         // One edit, canvas first then the picture naming it: in the app these
         // are two (the picture lives in the editor), here both are this
         // document's, so a peer never sees one without the other.
-        self.edit_doc(&client, addr, move |doc| {
+        self.edit_doc(addr, move |doc| {
             let board = Board::in_text(doc, &canvas_for_edit);
             let edited = board.edit(Stamp::new(author.as_ref(), &now), |t| build_canvas(t, picture.as_ref(), prepared, &specs));
             *made_ref = edited.result.map_err(|e| format!("Nothing was written: {}.", said(&e)))?;
@@ -1722,8 +1699,8 @@ impl Pimble {
         })
         .await?;
         let (ids, touched) = made_ids;
-        let fresh = client.get_node(addr.store, addr.node).await.map_err(rpc)?;
-        self.on_canvas(&client, &Target { addr, node: fresh, text_canvas: Some(canvas.clone()) }, touched).await;
+        let fresh = self.api.node(addr).await?;
+        self.on_canvas(&Target { addr, node: fresh, text_canvas: Some(canvas.clone()) }, touched).await;
         let mut out = format!(
             "Put canvas {canvas} into {} ({}). Name it to the canvas tools with node {} and canvas \"{canvas}\".",
             label(&node),
@@ -1746,13 +1723,12 @@ impl Pimble {
         if p.elements.is_empty() {
             return Err("Give at least one element.".into());
         }
-        let client = self.client().await?;
-        let target = self.canvas(&client, &p.node, p.canvas.as_deref()).await?;
-        let prepared = self.prepare(&client, target.addr, &p.elements).await?;
+        let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
+        let prepared = self.prepare(target.addr, &p.elements).await?;
         let specs = p.elements.clone();
         let layer = p.layer.clone();
         let ids = self
-            .canvas_edit(&client, &target, prepared, move |t, scene, _| add_specs(t, scene, &specs, layer.as_deref()))
+            .canvas_edit(&target, prepared, move |t, scene, _| add_specs(t, scene, &specs, layer.as_deref()))
             .await?;
         Ok(format!("Added to {}:\n{}", target.what(), made(&p.elements, &ids)))
     }
@@ -1765,17 +1741,16 @@ impl Pimble {
         if p.changes.is_empty() {
             return Err("Give at least one change.".into());
         }
-        let client = self.client().await?;
-        let target = self.canvas(&client, &p.node, p.canvas.as_deref()).await?;
+        let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
         let mut cards = HashMap::new();
         for (i, change) in p.changes.iter().enumerate() {
             if let Some(node) = &change.node {
-                cards.insert(i, self.card_target(&client, node).await?);
+                cards.insert(i, self.card_target(node).await?);
             }
         }
         let changes = p.changes.clone();
         let count = changes.len();
-        self.canvas_edit(&client, &target, (HashMap::new(), cards), move |t, scene, snapshot| {
+        self.canvas_edit(&target, (HashMap::new(), cards), move |t, scene, snapshot| {
             for (i, change) in changes.iter().enumerate() {
                 change_element(t, scene, snapshot, change, i)?;
             }
@@ -1794,11 +1769,10 @@ impl Pimble {
         if p.ids.is_empty() {
             return Err("Name at least one element.".into());
         }
-        let client = self.client().await?;
-        let target = self.canvas(&client, &p.node, p.canvas.as_deref()).await?;
+        let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
         let ids: Vec<String> = p.ids.iter().map(|s| s.trim().to_string()).collect();
         let done = self
-            .canvas_edit(&client, &target, Default::default(), move |t, scene, _| {
+            .canvas_edit(&target, Default::default(), move |t, scene, _| {
                 for id in &ids {
                     if !scene.elements.contains_key(id) {
                         return Err(bad(format!("there is no element \"{id}\" on this canvas")));
@@ -1830,8 +1804,7 @@ impl Pimble {
     /// Add a layer to a canvas (layers organize; who made what is on each element).
     #[tool(name = "add_layer")]
     async fn add_layer(&self, Parameters(p): Parameters<AddLayerParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let target = self.canvas(&client, &p.node, p.canvas.as_deref()).await?;
+        let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
         let name = p.name.trim().to_string();
         if name.is_empty() {
             return Err("A layer needs a name.".into());
@@ -1839,7 +1812,7 @@ impl Pimble {
         let order = p.order.clone().unwrap_or_default();
         let (note, fields) = (p.note.clone(), p.fields.clone());
         let id = self
-            .canvas_edit(&client, &target, Default::default(), move |t, scene, _| {
+            .canvas_edit(&target, Default::default(), move |t, scene, _| {
                 let at = placement(&order, &|l| scene.layer(l).map(|l| l.id.clone()))?;
                 let id = t.add_layer(&name, at)?;
                 if let Some(note) = note.as_deref().filter(|n| !n.trim().is_empty()) {
@@ -1859,11 +1832,10 @@ impl Pimble {
     /// What a layer shows is the same for everyone who opens the canvas.
     #[tool(name = "update_layer")]
     async fn update_layer(&self, Parameters(p): Parameters<UpdateLayerParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let target = self.canvas(&client, &p.node, p.canvas.as_deref()).await?;
+        let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
         let (layer, name, visible, locked, opacity, order) = (p.layer.clone(), p.name.clone(), p.visible, p.locked, p.opacity, p.order.clone());
         let (note, fields) = (p.note.clone(), p.fields.clone());
-        self.canvas_edit(&client, &target, Default::default(), move |t, scene, _| {
+        self.canvas_edit(&target, Default::default(), move |t, scene, _| {
             let id = scene.layer(&layer)?.id.clone();
             if let Some(name) = name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
                 t.rename_layer(&id, name)?;
@@ -1897,10 +1869,9 @@ impl Pimble {
     /// below. A canvas keeps at least one layer.
     #[tool(name = "delete_layer")]
     async fn delete_layer(&self, Parameters(p): Parameters<DeleteLayerParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let target = self.canvas(&client, &p.node, p.canvas.as_deref()).await?;
+        let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
         let (layer, merge) = (p.layer.clone(), p.merge_down);
-        self.canvas_edit(&client, &target, Default::default(), move |t, scene, _| {
+        self.canvas_edit(&target, Default::default(), move |t, scene, _| {
             let id = scene.layer(&layer)?.id.clone();
             if merge {
                 t.merge_layer_down(&id)
@@ -1929,8 +1900,7 @@ impl Pimble {
         if wants == 0 && p.markup_visible.is_none() {
             return Err("Nothing to set: give a page, page_fits_content, remove_page or markup_visible.".into());
         }
-        let client = self.client().await?;
-        let target = self.canvas(&client, &p.node, p.canvas.as_deref()).await?;
+        let target = self.canvas(&p.node, p.canvas.as_deref()).await?;
         let page = match &p.page {
             Some(spec) => Some(Page {
                 rect: Rect::new(spec.x, spec.y, spec.w, spec.h).normalized(),
@@ -1939,7 +1909,7 @@ impl Pimble {
             None => None,
         };
         let (fits, remove, markup) = (p.page_fits_content, p.remove_page, p.markup_visible);
-        self.canvas_edit(&client, &target, Default::default(), move |t, _, snapshot| {
+        self.canvas_edit(&target, Default::default(), move |t, _, snapshot| {
             if let Some(page) = &page {
                 if !(page.rect.w > 0.0 && page.rect.h > 0.0) {
                     return Err(bad("a page needs a width and a height"));

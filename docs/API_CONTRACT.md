@@ -213,6 +213,30 @@ log-length rule, `should_apply`, `fetched_entries`), used by `vault_link.rs` and
 the first consumer because it has no UI state: its 62 tools become thin, its tree walks
 become lookups. The MCP's tests are the check.
 
+Built 2026-11-02: `crates/pimble-api` (native and `wasm32-unknown-unknown`, no tokio).
+`Backend` (transport, `async-trait`, `?Send` on wasm) and `RpcBackend` over
+`PimbleClient`, which asks a `Connector` for a live client on every call (the MCP's
+connection joins or starts the local server; `Connected` holds one made elsewhere).
+`Pimble` holds a `Tree` per store with each node's server judgement (access, attachment
+count), subscribes to a store the first time it reads one, and drains the subscriptions
+before every read, so nothing is spawned; a subscription that ends is made again and
+what is held reconciled with `syncNodes` (`Change::Resynced`); `next_change` is the
+stream for a caller that listens. `hold_store` holds a store whole in two `syncNodes`,
+after which walks and names are lookups. The one write is `Pimble::edit` (the document
+brought up to date first, the access pre-check including comment-only, the "changed
+anything?" merge, `applyEdit`, the caret). Naming and links in `names.rs` (paths from a
+store's name or anywhere through `pimble_sheet::book::find_by_path`, `follow` with the
+app's `stop_sentence`, `path`, `short_name`, `ancestors`); `create_parent` is the one
+mount redirect, used by every create and by `move_node`. Recipes (`document`, `sheet`,
+`canvas`, `discussion`) build one `NodeInit`. `PresenceFrames` (session, sequence, TTL)
+and `Whereabouts` (an agent's per-node sessions and carets). `Me`, asked once.
+`ApiError` from codes and library error types. The sheet book (`SheetBook`, was the
+MCP's `McpBook`) is filled from held documents by `Pimble::sheet_book`. The MCP's tools
+and the CLI's `set-node-text` and `append-link` call it. Not in this wave: the vault as
+a `Backend` (wave 4), the app (wave 5), the conformance suite against both backends
+(needs wave 4), `move_table`'s and an inline discussion's two writes (two documents,
+which no single write can name), `Host`.
+
 **Wave 3, planning.** `TreeView`, `plan_move`, `create_parent`, `can_delete`,
 `capabilities`, labels. The app's `tree_drop`, `tree_keys`, menus and toolbar call them
 through an adapter over `AppStore`; the MCP's `move_node` gets the app's refusals and

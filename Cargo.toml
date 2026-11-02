@@ -19,6 +19,7 @@ members = [
     "crates/pimble-board",
     "crates/pimble-sheet",
     "crates/pimble-discussion",
+    "crates/pimble-api",
 ]
 
 [workspace.package]
@@ -109,3 +110,4 @@ pimble-image = { path = "crates/pimble-image" }
 pimble-board = { path = "crates/pimble-board" }
 pimble-sheet = { path = "crates/pimble-sheet" }
 pimble-discussion = { path = "crates/pimble-discussion" }
+pimble-api = { path = "crates/pimble-api" }

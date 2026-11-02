@@ -7,7 +7,7 @@ use pimble_client::PimbleClient;
 use pimble_core::{AuthMethod, MountRef, MountState, NodeId, Place, RemoteEndpoint, StoreId, StoreKind};
 use base64::Engine;
 use pimble_crdt::NodeDoc;
-use pimble_rpc::{EditOperation, VaultDocId};
+use pimble_rpc::VaultDocId;
 use pimble_server::auth;
 use tracing_subscriber::EnvFilter;
 
@@ -1477,24 +1477,20 @@ async fn set_node_text(store_id: &str, node_id: &str, text: &str) -> Result<()> 
     let store_id = parse_store_id(store_id)?;
     let node_id = parse_node_id(node_id)?;
 
-    let client = connect().await?;
-
-    // An edit of the node's existing document, sent as an `applyEdit`
-    // delta — the one way content is written. A fresh document built from
-    // `text` (`updateNodeContent`) shares no history with the node's, so on
-    // any replica it would merge in next to the old paragraphs instead of
-    // replacing them.
-    let node = client.get_node(store_id, node_id).await?;
-    let mut doc = NodeDoc::load(&node.content)
-        .map_err(|e| anyhow::anyhow!("failed to load the node's document: {e}"))?;
-    let delta = doc
-        .replace_plain_text(text)
-        .map_err(|e| anyhow::anyhow!("failed to build the replacement edit: {e}"))?;
-    let changes = base64::engine::general_purpose::STANDARD.encode(delta);
-    client
-        .apply_edit(store_id, node_id, "pimble-cli", EditOperation::IncrementalChanges { changes })
-        .await?;
-    println!("Updated content for node {}", node_id);
+    // An edit of the node's existing document through the one write
+    // (`pimble_api::Pimble::edit`). A fresh document built from `text`
+    // shares no history with the node's, so on any replica it would merge
+    // in next to the old paragraphs instead of replacing them.
+    let api = api().await?;
+    let edited = api
+        .edit(pimble_api::Addr::new(store_id, node_id), |doc, _| doc.replace_plain_text(text).map(drop))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if edited.changed {
+        println!("Updated content for node {}", node_id);
+    } else {
+        println!("Node {} already has that text", node_id);
+    }
     Ok(())
 }
 
@@ -1542,23 +1538,16 @@ async fn blob_refs(store_id: &str, node_id: &str) -> Result<()> {
 }
 
 /// Append a paragraph whose words link to `href` (docs/LINKS_CONTRACT.md), as
-/// an `applyEdit` of the node's existing document like `set-node-text`.
+/// an edit of the node's existing document like `set-node-text`.
 async fn append_link(store_id: &str, node_id: &str, href: &str, text: &str) -> Result<()> {
     use pimble_crdt::{Block, Mark, Run};
     let store_id = parse_store_id(store_id)?;
     let node_id = parse_node_id(node_id)?;
-    let client = connect().await?;
-    let node = client.get_node(store_id, node_id).await?;
-    let mut doc = NodeDoc::load(&node.content)
-        .map_err(|e| anyhow::anyhow!("failed to load the node's document: {e}"))?;
+    let api = api().await?;
     let block = Block::paragraph(vec![Run::marked(text, vec![Mark::Link { href: href.to_string() }])]);
-    let delta = doc
-        .append_blocks(&[block])
-        .map_err(|e| anyhow::anyhow!("failed to build the edit: {e}"))?;
-    let changes = base64::engine::general_purpose::STANDARD.encode(delta);
-    client
-        .apply_edit(store_id, node_id, "pimble-cli", EditOperation::IncrementalChanges { changes })
-        .await?;
+    api.edit(pimble_api::Addr::new(store_id, node_id), |doc, _| doc.append_blocks(&[block]).map(drop))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("Linked \"{}\" to {} in node {}", text, href, node_id);
     Ok(())
 }
@@ -1759,6 +1748,11 @@ fn auth_method_of(token: Option<String>) -> AuthMethod {
 }
 
 /// Connect to `PIMBLE_SERVER`, authenticating per [`resolve_cli_auth`].
+/// The one API over the server `connect` reaches, writing as `pimble-cli`.
+async fn api() -> Result<pimble_api::Pimble> {
+    Ok(pimble_api::Pimble::new(pimble_api::rpc::RpcBackend::over(connect().await?), "pimble-cli"))
+}
+
 async fn connect() -> Result<PimbleClient> {
     // With no server named, the local one, wherever `PIMBLE_APP_ADDR` puts it: a
     // test instance on its own port sets that for the app and `pimble-mcp`, and a

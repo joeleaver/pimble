@@ -1,15 +1,30 @@
-//! What the formula engine sees from the MCP (docs/SHEETS_CONTRACT.md
-//! sections 6 and 10): a [`Book`] over node documents fetched through the
-//! connection. This part is plain values, so it is tested without a server;
-//! `load.rs` fills it.
+//! What the formula engine sees beyond the node it computes
+//! (docs/SHEETS_CONTRACT.md sections 6 and 8): a [`SheetBook`] of plain
+//! values, filled from held documents by [`Pimble::sheet_book`]. The
+//! values part is tested without a server; the filling reads what the API
+//! holds (the home node, the notes its formulas name, and every store's
+//! titles when a name must be looked up), so a second computation over the
+//! same notes asks the server for nothing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::NaiveDate;
-use pimble_sheet::book::{find_by_path, serial_of, shortest_path};
-use pimble_sheet::formula::ast::{Expr, ExprKind, NoteName};
+use pimble_crdt::NodeDoc;
+use pimble_sheet::book::{find_by_path, formulas_of, named_nodes, serial_of, shortest_path};
+use pimble_sheet::doc::Sheets;
 use pimble_sheet::formula;
+use pimble_sheet::formula::ast::{Expr, ExprKind, NoteName};
 use pimble_sheet::{Book, NodeInfo, NodeRef, Reach, SheetsSnap, Titles};
+
+use crate::names::{label, store_tops};
+use crate::{Addr, ApiError, Pimble};
+
+/// How many notes deep the formulas of named notes are followed.
+const HOPS: usize = 4;
+
+/// Marks an entry of `shown` that is a column's `under` (a node name to
+/// resolve) rather than a formula, so every node is indexed by title.
+pub const UNDER_MARK: &str = "under:";
 
 /// Why a node's sheets cannot be read (the states of contract section 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +46,7 @@ pub struct Known {
 
 /// The engine's view of the stores from one node ("this note").
 #[derive(Debug, Clone)]
-pub struct McpBook {
+pub struct SheetBook {
     home: NodeRef,
     snaps: HashMap<NodeRef, SheetsSnap>,
     absent: HashMap<NodeRef, Absent>,
@@ -39,7 +54,7 @@ pub struct McpBook {
     today: NaiveDate,
 }
 
-impl McpBook {
+impl SheetBook {
     pub fn new(home: NodeRef, home_snap: SheetsSnap, today: NaiveDate) -> Self {
         let mut snaps = HashMap::new();
         snaps.insert(home, home_snap);
@@ -107,7 +122,7 @@ impl McpBook {
     }
 }
 
-impl Titles for McpBook {
+impl Titles for SheetBook {
     fn candidates(&self) -> Vec<NodeRef> {
         self.nodes.keys().copied().collect()
     }
@@ -117,7 +132,7 @@ impl Titles for McpBook {
     }
 }
 
-impl Book for McpBook {
+impl Book for SheetBook {
     fn home(&self) -> NodeRef {
         self.home
     }
@@ -199,18 +214,153 @@ pub fn reads_table(stored: &str, formula_node: &NodeRef, target: &NodeRef, table
     false
 }
 
+pub fn node_ref(addr: Addr) -> NodeRef {
+    NodeRef { store: addr.store, node: addr.node }
+}
+
+/// A node's tables, read from its document; empty when it cannot be read.
+pub fn sheets_of(node: &pimble_core::Node) -> SheetsSnap {
+    match NodeDoc::load(&node.content) {
+        Ok(doc) => Sheets::of_node(&doc).read(),
+        Err(_) => SheetsSnap::default(),
+    }
+}
+
+/// What a named note is to a formula.
+enum Reached {
+    Live(pimble_core::Node),
+    Deleted { title: String, parent: Option<pimble_core::NodeId> },
+    Absent(Absent),
+}
+
+impl Pimble {
+    /// The book for `home`: its tables, the notes its stored formulas name
+    /// (a few hops deep), and, when a formula names notes or shows them (or
+    /// a column chooses among nodes), every store's titles, so names
+    /// resolve and paths show as the app shows them. `shown` are formulas as
+    /// typed that are about to be stored, and columns' `under`s marked with
+    /// [`UNDER_MARK`]: the notes they name are looked up too.
+    pub async fn sheet_book(&self, home: Addr, shown: &[&str]) -> Result<SheetBook, ApiError> {
+        let home_node = self.held_node(home).await?;
+        let mut book = SheetBook::new(node_ref(home), sheets_of(&home_node), SheetBook::local_today());
+        book.add_node(node_ref(home), label(&home_node), home_node.parent_id.map(|p| NodeRef { store: home.store, node: p }));
+        book.set_fields(node_ref(home), home_node.metadata.fields.clone());
+        let mut pending: Vec<NodeRef> = formulas_of(book.home_snap()).into_iter().flat_map(named_nodes).collect();
+        let mut wanted: HashSet<String> = HashSet::new();
+        for f in shown {
+            for name in note_names_in(f) {
+                if let Some(last) = name.split('/').map(str::trim).filter(|p| !p.is_empty()).last() {
+                    wanted.insert(last.to_lowercase());
+                }
+            }
+        }
+        // The notes stored formulas name, and the ones their formulas name.
+        let mut seen: HashSet<NodeRef> = HashSet::from([node_ref(home)]);
+        for _ in 0..HOPS {
+            if pending.is_empty() {
+                break;
+            }
+            let mut next = Vec::new();
+            for n in std::mem::take(&mut pending) {
+                if !seen.insert(n) {
+                    continue;
+                }
+                match self.reached(Addr { store: n.store, node: n.node }).await {
+                    Reached::Live(node) => {
+                        wanted.insert(label(&node).to_lowercase());
+                        let snap = sheets_of(&node);
+                        next.extend(formulas_of(&snap).into_iter().flat_map(named_nodes));
+                        book.add_sheets(n, snap);
+                        book.add_node(n, label(&node), node.parent_id.map(|p| NodeRef { store: n.store, node: p }));
+                        book.set_fields(n, node.metadata.fields.clone());
+                    }
+                    Reached::Deleted { title, parent } => {
+                        // Its title, for "Household budget was deleted".
+                        book.add_node(n, title, parent.map(|p| NodeRef { store: n.store, node: p }));
+                        book.add_absent(n, Absent::Deleted);
+                    }
+                    Reached::Absent(why) => book.add_absent(n, why),
+                }
+            }
+            pending = next;
+        }
+        // A link-to-a-node column chooses among nodes by title: they are all
+        // known then (the tables of only the wanted ones are read).
+        let node_links = book
+            .home_snap()
+            .tables
+            .iter()
+            .any(|t| t.columns.iter().any(|c| matches!(c.ty, pimble_sheet::ColumnType::NodeLink { .. })))
+            || shown.iter().any(|s| s.starts_with(UNDER_MARK));
+        if !wanted.is_empty() || node_links {
+            self.index_titles(&mut book, &wanted).await;
+        }
+        Ok(book)
+    }
+
+    /// A named note, live, deleted (with the title it had), or why not.
+    async fn reached(&self, addr: Addr) -> Reached {
+        match self.held_node(addr).await {
+            Ok(node) => Reached::Live(node),
+            Err(e) if e.is_refusal() => Reached::Absent(Absent::NoAccess),
+            Err(ApiError::Offline { .. } | ApiError::NotAvailable { .. }) => Reached::Absent(Absent::Loading),
+            Err(_) => match self.any_fields(addr).await {
+                // A tombstone is not served as a node; its document says so.
+                Some(f) if f.deleted_at.is_some() => Reached::Deleted { title: f.title, parent: f.parent_id },
+                _ => Reached::Absent(Absent::Missing),
+            },
+        }
+    }
+
+    /// Every node of the stores by title and parent (paths are the tree as
+    /// this device sees it, mounts included), and the tables of the ones
+    /// whose title is `wanted`.
+    async fn index_titles(&self, book: &mut SheetBook, wanted: &HashSet<String>) {
+        let Ok(stores) = self.known_stores().await else { return };
+        for store in &stores {
+            for top in store_tops(store) {
+                // A whole store's root goes by the store's name, so a path
+                // can start there ('Family/Household budget'!).
+                let title = if top.node == store.root_node_id {
+                    store.name.clone()
+                } else {
+                    match self.held_node(top).await {
+                        Ok(n) => label(&n),
+                        Err(_) => continue,
+                    }
+                };
+                book.add_node(node_ref(top), title, None);
+            }
+            let Ok(walked) = self.walk(store).await else { continue };
+            for w in walked {
+                let Some(parent) = w.parent else { continue };
+                let title = label(&w.node);
+                let r = node_ref(w.addr);
+                if wanted.contains(&title.to_lowercase()) && !book.has_sheets(&r) {
+                    book.add_sheets(r, sheets_of(&w.node));
+                }
+                book.add_node(r, title, Some(node_ref(parent)));
+                book.set_fields(r, w.node.metadata.fields.clone());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pimble_core::{NodeId, StoreId};
-    use pimble_sheet::book::named_nodes;
 
     fn r(n: u128) -> NodeRef {
-        NodeRef { store: StoreId(uuid::Uuid::from_u128(7)), node: NodeId(uuid::Uuid::from_u128(n)) }
+        NodeRef { store: StoreId(uuid_of(7)), node: NodeId(uuid_of(n)) }
     }
 
-    fn book() -> McpBook {
-        let mut b = McpBook::new(r(1), SheetsSnap::default(), NaiveDate::from_ymd_opt(2026, 10, 19).unwrap());
+    fn uuid_of(n: u128) -> uuid::Uuid {
+        uuid::Uuid::from_u128(n)
+    }
+
+    fn book() -> SheetBook {
+        let mut b = SheetBook::new(r(1), SheetsSnap::default(), NaiveDate::from_ymd_opt(2026, 10, 19).unwrap());
         b.add_node(r(10), "Family", None);
         b.add_node(r(11), "Home", Some(r(10)));
         b.add_node(r(12), "Work", Some(r(10)));

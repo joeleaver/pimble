@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use pimble_api::ApiError;
 use pimble_client::PimbleClient;
 use pimble_core::AuthMethod;
 use pimble_server::{local, PimbleServer};
@@ -118,5 +119,17 @@ async fn open_saved_stores(client: &PimbleClient) {
             Ok(store) => tracing::info!("opened {} ({})", store.name, path),
             Err(e) => tracing::warn!("could not open the saved store {path}: {e}"),
         }
+    }
+}
+
+/// The connection as the API's way to a live client: every call the API
+/// makes asks for one, so a server that went away is joined or started
+/// again by the rule above, within the wait.
+pub struct Shared(pub Arc<Connection>);
+
+#[async_trait::async_trait]
+impl pimble_api::rpc::Connector for Shared {
+    async fn client(&self) -> Result<Arc<PimbleClient>, ApiError> {
+        self.0.client().await.map_err(|sentence| ApiError::Offline { sentence })
     }
 }

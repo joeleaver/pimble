@@ -9,7 +9,7 @@ use pimble_sheet::doc::Sheets;
 use pimble_sheet::{NodeRef, SheetsSnap, Stored};
 
 use super::*;
-use crate::sheets::book::McpBook;
+use pimble_api::book::SheetBook;
 
 fn r(n: u128) -> NodeRef {
     NodeRef { store: StoreId(uuid::Uuid::from_u128(5)), node: NodeId(uuid::Uuid::from_u128(n)) }
@@ -37,12 +37,12 @@ fn row(pairs: &[(&str, &str)]) -> RowValues {
 
 struct Note {
     doc: NodeDoc,
-    book: McpBook,
+    book: SheetBook,
 }
 
 impl Note {
     fn new() -> Self {
-        Note { doc: NodeDoc::new(), book: McpBook::new(r(1), SheetsSnap::default(), today()) }
+        Note { doc: NodeDoc::new(), book: SheetBook::new(r(1), SheetsSnap::default(), today()) }
     }
 
     fn work<R>(&mut self, f: impl FnOnce(&mut Work) -> R) -> R {
@@ -379,7 +379,7 @@ fn a_new_sheet_is_made_in_one_update() {
     .unwrap();
     let mut doc = NodeDoc::new();
     doc.apply_update(&content).unwrap();
-    let mut book = McpBook::new(r(2), SheetsSnap::default(), today());
+    let mut book = SheetBook::new(r(2), SheetsSnap::default(), today());
     let w = Work::new(Sheets::of_node(&doc), &mut book);
     let out = render_table(&w, &w.snap().tables[0].id.clone(), &Filter { equals: Vec::new(), limit: 10, ..Default::default() }).unwrap();
     assert!(out.contains("### Budget"), "{out}");

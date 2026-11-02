@@ -11,6 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 pimble-core = { workspace = true }
+# The one API (docs/API_CONTRACT.md wave 2): held documents, the one write,
+# naming, recipes, presence. The tools are what it answers, in words.
+pimble-api = { workspace = true }
+async-trait = { workspace = true }
 pimble-crdt = { workspace = true }
 # Sheets (docs/SHEETS_CONTRACT.md section 10): the MCP computes what it reads
 # exactly as the app does.

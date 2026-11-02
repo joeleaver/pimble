@@ -1,4 +1,4 @@
-//! What the sheet tools do, over a node's document and a [`McpBook`], with
+//! What the sheet tools do, over a node's document and a [`SheetBook`], with
 //! no connection: every tool fetches the node, runs one of these on its
 //! document, and sends the update the edit made through `applyEdit` (the
 //! caller's `edit`). A refused operation answers `Err` with the sentence, and
@@ -18,7 +18,7 @@ use pimble_sheet::{Book, ColumnSnap, ColumnType, Format, NodeRef, ResultKey, She
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use super::book::McpBook;
+use pimble_api::book::SheetBook;
 
 /// How many rows a tool's answer previews after a formula is accepted.
 const PREVIEW_ROWS: usize = 5;
@@ -82,11 +82,11 @@ pub struct RowUpdate {
 /// the book formulas are computed over, kept in step after every write.
 pub struct Work<'b> {
     sheets: Sheets,
-    pub book: &'b mut McpBook,
+    pub book: &'b mut SheetBook,
 }
 
 impl<'b> Work<'b> {
-    pub fn new(sheets: Sheets, book: &'b mut McpBook) -> Self {
+    pub fn new(sheets: Sheets, book: &'b mut SheetBook) -> Self {
         book.set_home_snap(sheets.read());
         Self { sheets, book }
     }
@@ -133,7 +133,7 @@ pub fn name_error(e: &NameError) -> String {
 // ── Column types ─────────────────────────────────────────────────────────
 
 /// What a column's type is called in answers.
-pub fn type_text(book: &McpBook, snap: &SheetsSnap, table: Option<&str>, ty: &ColumnType) -> String {
+pub fn type_text(book: &SheetBook, snap: &SheetsSnap, table: Option<&str>, ty: &ColumnType) -> String {
     match ty {
         ColumnType::Text => "text".into(),
         ColumnType::Number => "number".into(),
@@ -229,7 +229,7 @@ fn md(s: &str) -> String {
 }
 
 /// One table in one line, for listings: kind, rows, columns with types.
-pub fn table_summary(book: &McpBook, snap: &SheetsSnap, t: &TableSnap) -> String {
+pub fn table_summary(book: &SheetBook, snap: &SheetsSnap, t: &TableSnap) -> String {
     let kind = if t.is_summary() { "summary" } else { "table" };
     let mut result: Vec<String> = Vec::new();
     let count = if t.is_summary() {
@@ -297,7 +297,7 @@ fn matches(cell: &str, v: &Value, wanted: &str) -> bool {
 pub fn render_table(work: &Work, table: &str, filter: &Filter) -> Result<String, String> {
     let t = work.table(table)?;
     let home = work.home();
-    let book: &McpBook = &*work.book;
+    let book: &SheetBook = &*work.book;
     let engine = Engine::new(book);
     let ct = compute(&engine, home, table)?;
     let mut out = format!("### {}\n", t.name);
@@ -427,7 +427,7 @@ pub fn render_table(work: &Work, table: &str, filter: &Filter) -> Result<String,
 
 /// A table's summary rows and groups (contract section 4b), as get_table
 /// shows them: each row's name, what each column shows and its value.
-fn render_summary_rows(engine: &Engine<'_>, book: &McpBook, t: &TableSnap, ct: &ComputedTable) -> String {
+fn render_summary_rows(engine: &Engine<'_>, book: &SheetBook, t: &TableSnap, ct: &ComputedTable) -> String {
     let mut out = String::new();
     let line = |s: &pimble_sheet::formula::ComputedSummaryRow| -> String {
         let def = t.summary_row(&s.id);
@@ -531,7 +531,7 @@ pub fn add_summary_row(work: &mut Work, table: &str, name: Option<&str>, cells: 
 /// The summary rows and groups of a table, as get_table ends with them.
 fn summary_part(work: &Work, table: &str) -> Result<String, String> {
     let t = work.table(table)?;
-    let book: &McpBook = &*work.book;
+    let book: &SheetBook = &*work.book;
     let engine = Engine::new(book);
     let ct = compute(&engine, work.home(), table)?;
     Ok(render_summary_rows(&engine, book, &t, &ct))
@@ -1058,7 +1058,7 @@ pub fn delete_rows(work: &mut Work, table: &str, rows: &[String]) -> Result<usiz
 /// edit that creates the node, as the app's "New Sheet" does.
 pub fn new_sheet_content(name: &str, columns: &[ColumnSpec], rows: &[RowValues], keep_as_typed: bool, home: NodeRef, today: chrono::NaiveDate) -> Result<Vec<u8>, String> {
     let sheets = Sheets::standalone();
-    let mut book = McpBook::new(home, SheetsSnap::default(), today);
+    let mut book = SheetBook::new(home, SheetsSnap::default(), today);
     let mut work = Work::new(sheets.clone(), &mut book);
     let defaults: Vec<ColumnSpec> = sheet_ops::FIRST_COLUMNS
         .iter()

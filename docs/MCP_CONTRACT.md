@@ -104,12 +104,19 @@ notifications and logs say where an edit came from.
 
 ## Writing: the CRDT path, and nothing else
 
-Every write is an edit of the node's existing document, made the way `set-node-text`
-makes one (`crates/pimble-cli/src/main.rs`, `set_node_text`):
+Every write is an edit of the node's existing document through the one write,
+`pimble_api::Pimble::edit` (docs/API_CONTRACT.md decision 4; the CLI's `set-node-text`
+uses the same call):
 
-1. fetch the node's document (`getNode`, `NodeDoc::load`);
-2. compute the edit locally as a delta on that document (a `NodeDoc` method);
-3. send it with `applyEdit` (`IncrementalChanges`).
+1. the node's document is held (read once, kept current by the store's subscription)
+   and brought up to date with the server's before the edit (`syncNodes` of that one
+   document), so a quote is judged against what the server holds now;
+2. a write this agent may not make is refused before anything is sent: read-only, and
+   since 2026-11-02 comment-only too (a commenter writes discussions, not notes; the
+   server judges again);
+3. the edit is computed locally as a delta on that document (a `NodeDoc` method), and
+   sent with `applyEdit` only when merging it into the document as it was changes
+   anything ("That would change nothing, so nothing was written." otherwise).
 
 (`updateNodeContent` no longer exists.) Because the delta continues the document's own
 history, whatever the person typed between steps 1 and 3 survives the merge: the edit
@@ -330,13 +337,40 @@ Every tool that takes a node takes one string, `node`, which is any of:
   clipboard), anchor ignored;
 - a bare node id (a UUID), looked up in every open store;
 - a path of titles from a store's name, `/`-separated (`Family Management/MEDICAL/Dr
-  Smith`), matched case-insensitively, through mounts.
+  Smith`), matched case-insensitively, through mounts;
+- since 2026-11-02, a path that starts anywhere (`MEDICAL/Dr Smith`), a run of titles down
+  the tree as a sheet formula's note path is (docs/API_CONTRACT.md open decision 5). A path
+  whose first title is a store's name is walked from it first.
+
+A link is followed where its node went (`became`, after a move out of a share or between
+stores), as the app follows one; before 2026-11-02 a moved node's old link "named no
+node". A link to a deleted node says so.
 
 Ambiguity is an error, never a guess: a path or id that matches several nodes answers
 each candidate's id and path, so the LLM (or the person) picks one. Every node a tool
 returns carries its id, its `pimble:` link and its path, so anything listed can be named
 in the next call. A node's id is shown in the app too: its row's "Copy Link" gives the
 link, which is what a person pastes into the LLM's chat.
+
+## On `pimble-api` (2026-11-02, docs/API_CONTRACT.md wave 2)
+
+The tools are words over `pimble_api::Pimble`: naming (`resolve`, `path`), the one write
+(`edit`), recipes (`create_node`, `create_sheet`, `create_canvas` and `start_discussion`
+each make their node with its first content in one `createNode`), identity (who an
+agent's canvas elements and messages are signed by, asked once), presence frames, and
+the sheet book (`Pimble::sheet_book`, over held documents). `crates/pimble-mcp` lost
+`nodes.rs`, `presence.rs`, `sheets/book.rs` and `sheets/load.rs`. What changed for an
+assistant:
+
+- `create_node` writes its content in the create (before, a create and then an edit).
+- An old link is followed where its node went; a path may start anywhere (above).
+- A comment-only node refuses an edit before it is sent, with
+  `StoreAccess::COMMENT_ONLY_REFUSAL`; `get_node` says `access: comment-only`.
+- A discussion started on a node carries the `messages` icon, as the app's does.
+- Everything made under a mount goes to its source: notes, sheets, canvases, discussion
+  nodes, discussions on a mount, and `move_node` into a mount.
+- Walks (`find_node`, `list_tables` of a store, `rows_pointing_here`, a formula's
+  names) hold the store's documents once and are lookups after that.
 
 ## Waves
 

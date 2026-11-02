@@ -5,10 +5,10 @@
 //! the agent's id and name (contract section 3), and an agent edits and
 //! deletes only its own, as the app offers a person only theirs.
 
-use std::collections::HashMap;
 
-use pimble_client::PimbleClient;
-use pimble_core::{custom_keys, node_types, Node};
+use pimble_api::recipes::{self, FirstMessage};
+use pimble_api::{label, Addr};
+use pimble_core::{node_types, Node};
 use pimble_crdt::markdown::{embed_attrs, Embed};
 use pimble_crdt::NodeDoc;
 use pimble_discussion::{Author, Body, Discussion, DiscussionSnapshot, Stamp};
@@ -17,17 +17,13 @@ use rmcp::{tool, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use super::{rpc, Pimble};
-use crate::nodes::{self, label, Addr};
+use super::Pimble;
 
 /// A message's time: RFC 3339 UTC with milliseconds, the one shape every
 /// writer uses (messages sort by it as a string, as the app writes it).
 fn now() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    pimble_api::now()
 }
-
-/// A new discussion node's icon, as the app's "New Discussion" gives it.
-const DISCUSSION_ICON: &str = "messages";
 
 #[derive(Deserialize, JsonSchema)]
 pub struct ListDiscussionsParams {
@@ -141,7 +137,7 @@ fn summary(addr: Addr, node: &Node) -> String {
 impl Pimble {
     /// `markdown` with each discussion shown inline replaced by a line
     /// naming it (get_node; read_discussion reads it).
-    pub(super) async fn inline_discussions(&self, client: &PimbleClient, markdown: &str) -> String {
+    pub(super) async fn inline_discussions(&self, markdown: &str) -> String {
         let mut out = String::new();
         for line in markdown.split_inclusive('\n') {
             let Some(url) = Embed::from_markdown_line(line).and_then(|e| e.node_of_kind(embed_attrs::KIND_DISCUSSION).cloned()) else {
@@ -149,7 +145,7 @@ impl Pimble {
                 continue;
             };
             let at = Addr { store: url.store, node: url.node };
-            match client.get_node(at.store, at.node).await {
+            match self.api.node(at).await {
                 Ok(n) => out.push_str(&format!("(the discussion {} is shown here: {})\n", topic_of(&n), summary(at, &n).trim_start_matches("- "))),
                 Err(_) => out.push_str(&format!("(a discussion shown here could not be read: {})\n", at.link())),
             }
@@ -167,19 +163,16 @@ impl Pimble {
     }
 
     /// What this agent's messages are stamped with: its id and name, as the
-    /// server knows them.
-    async fn author(&self, client: &PimbleClient) -> Option<Author> {
-        match client.who_am_i().await {
-            Ok((Some(sub), name)) => Some(Author::new(sub, if name.is_empty() { "AI agent".to_string() } else { name })),
-            _ => None,
-        }
+    /// server knows them (asked once).
+    async fn author(&self) -> Option<Author> {
+        self.api.me().await.map(|me| me.discussion_author("AI agent"))
     }
 
     /// The discussion named `name`: its address and node, refused when it is
     /// not a discussion.
-    async fn discussion(&self, client: &PimbleClient, name: &str) -> Result<(Addr, Node), String> {
-        let addr = nodes::resolve(client, name).await?;
-        let node = client.get_node(addr.store, addr.node).await.map_err(rpc)?;
+    async fn discussion(&self, name: &str) -> Result<(Addr, Node), String> {
+        let addr = self.api.resolve(name).await?;
+        let node = self.api.node(addr).await?;
         if node.node_type != node_types::DISCUSSION {
             return Err(format!("{} is not a discussion; list_discussions names a node's discussions.", label(&node)));
         }
@@ -189,13 +182,12 @@ impl Pimble {
     /// One discussion write through `applyEdit`.
     async fn discussion_edit(
         &self,
-        client: &PimbleClient,
         addr: Addr,
         op: impl FnOnce(&mut pimble_discussion::DiscussionTxn<'_, '_>) -> pimble_discussion::doc::Result<String> + Send,
     ) -> Result<String, String> {
         let mut answer = String::new();
         let answer_ref = &mut answer;
-        self.edit(client, addr, move |doc| {
+        self.edit(addr, move |doc| {
             let edited = Discussion::of_node(doc).edit(op);
             *answer_ref = edited.result.map_err(|e| e.to_string())?;
             Ok(())
@@ -223,14 +215,13 @@ impl Pimble {
     /// and the latest), or say what a discussion node is.
     #[tool(name = "list_discussions")]
     async fn list_discussions(&self, Parameters(p): Parameters<ListDiscussionsParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let addr = nodes::resolve(&client, &p.node).await?;
-        let node = client.get_node(addr.store, addr.node).await.map_err(rpc)?;
-        self.present(&client, addr).await;
+        let addr = self.api.resolve(&p.node).await?;
+        let node = self.api.node(addr).await?;
+        self.present(addr).await;
         if node.node_type == node_types::DISCUSSION {
             return Ok(format!("{} is itself a discussion:\n{}", label(&node), summary(addr, &node)));
         }
-        let attached = client.list_attachments(addr.store, addr.node).await.map_err(rpc)?;
+        let attached = self.api.attachments(addr).await?;
         let discussions: Vec<&Node> = attached.iter().filter(|n| n.node_type == node_types::DISCUSSION).collect();
         if discussions.is_empty() {
             return Ok(format!("{} has no discussions. start_discussion starts one.", label(&node)));
@@ -248,15 +239,14 @@ impl Pimble {
     /// author and time.
     #[tool(name = "read_discussion")]
     async fn read_discussion(&self, Parameters(p): Parameters<DiscussionParam>) -> Result<String, String> {
-        let client = self.client().await?;
-        let (addr, node) = self.discussion(&client, &p.discussion).await?;
-        self.present(&client, addr).await;
+        let (addr, node) = self.discussion(&p.discussion).await?;
+        self.present(addr).await;
         let snap = snapshot_of(&node)?;
         let mut out = format!("Discussion: {} ({})\n", topic_of(&node), addr.link());
         if let Some(host) = node.attached_to {
             let host_addr = Addr { store: addr.store, node: host };
-            self.present(&client, host_addr).await;
-            let host_title = client.get_node(addr.store, host).await.map(|n| label(&n)).unwrap_or_else(|_| "a node".into());
+            self.present(host_addr).await;
+            let host_title = self.api.node(host_addr).await.map(|n| label(&n)).unwrap_or_else(|_| "a node".into());
             out.push_str(&format!("On: {host_title} ({})\n", host_addr.link()));
         }
         if let Some(resolved) = &snap.resolved {
@@ -275,23 +265,21 @@ impl Pimble {
     /// Start a discussion with its first message: on a node (`on`), where it
     /// belongs to the node, or as a discussion node of its own under `parent`.
     #[tool(name = "start_discussion")]
-    async fn start_discussion(&self, Parameters(p): Parameters<StartDiscussionParams>) -> Result<String, String> {
-        let client = self.client().await?;
+    pub(super) async fn start_discussion(&self, Parameters(p): Parameters<StartDiscussionParams>) -> Result<String, String> {
         let body = Body::from_markdown(&p.message);
         if body.is_blank() {
             return Err("A message needs some text.".into());
         }
-        let author = self.author(&client).await;
+        let author = self.author().await;
         // Where on its host it is: a place in the host's text, named by a quote.
-        let anchor = match (&p.on, &p.after_text) {
-            (Some(on), Some(quote)) => {
-                let host = nodes::resolve(&client, on).await?;
-                let node = client.get_node(host.store, host.node).await.map_err(rpc)?;
-                let doc = NodeDoc::load(&node.content).map_err(|e| format!("The node's document could not be read: {e}"))?;
-                let sticky = doc.sticky_at_quote(quote).map_err(|e| match e {
-                    pimble_crdt::CrdtError::Refused(sentence) => sentence,
-                    other => other.to_string(),
-                })?;
+        let host = match &p.on {
+            Some(on) => Some(self.api.resolve(on).await?),
+            None => None,
+        };
+        let anchor = match (host, &p.after_text) {
+            (Some(host), Some(quote)) => {
+                let doc = self.api.doc(host).await?;
+                let sticky = doc.sticky_at_quote(quote).map_err(super::crdt)?;
                 Some(pimble_discussion::Anchor::Text { sticky })
             }
             (None, Some(_)) => return Err("after_text names a place in the text of the node given as `on`.".into()),
@@ -300,38 +288,22 @@ impl Pimble {
         if p.inline && p.on.is_none() {
             return Err("inline shows the discussion in the text of the node given as `on`.".into());
         }
-        // The containers and the first message, written in the create.
-        let seed = Discussion::standalone();
-        {
-            use yrs::updates::decoder::Decode;
-            use yrs::Transact;
-            let update = yrs::Update::decode_v1(&pimble_discussion::new_content(anchor.as_ref())).map_err(|e| e.to_string())?;
-            seed.doc().transact_mut().apply_update(update).map_err(|e| e.to_string())?;
-        }
-        let now = now();
-        seed.edit(|t| t.post(Stamp::new(author.as_ref(), &now), None, &body)).result.map_err(|e| e.to_string())?;
-        let content = {
-            use yrs::{ReadTxn, StateVector, Transact};
-            seed.doc().transact().encode_state_as_update_v1(&StateVector::default())
-        };
+        // The discussion with its first message, made in the one create
+        // (attached or a node of its own is only where it is made).
         let topic = p.topic.trim().to_string();
-        let custom = HashMap::from([(custom_keys::EXPLICIT_TITLE.to_string(), serde_json::json!(true))]);
-        let stores = client.list_stores().await.map_err(rpc)?;
-        match (&p.on, &p.parent) {
-            (Some(on), None) => {
-                let host = nodes::resolve(&client, on).await?;
-                let node_id = client
-                    .create_attachment(host.store, host.node, node_types::DISCUSSION, topic.clone(), Some(content), custom)
-                    .await
-                    .map_err(rpc)?;
-                let addr = Addr { store: host.store, node: node_id };
-                let mut answer = format!("Started the discussion {} on {}", addr.link(), self.describe(&client, &stores, host).await);
+        let now = now();
+        let first = FirstMessage { author: author.as_ref(), at: &now, body: &body };
+        let init = recipes::discussion(&topic, anchor.as_ref(), Some(first))?;
+        match (host, &p.parent) {
+            (Some(host), None) => {
+                let addr = self.api.create_attached(host, init).await?;
+                let mut answer = format!("Started the discussion {} on {}", addr.link(), self.describe(host).await);
                 if p.inline {
                     let url = pimble_core::PimbleUrl::node(addr.store, addr.node);
                     let atom = Embed::discussion(url, Some(topic.clone())).to_markdown();
                     let quote = p.after_text.clone();
                     let shown = self
-                        .edit(&client, host, move |doc| {
+                        .edit(host, move |doc| {
                             match &quote {
                                 Some(quote) => doc.insert_markdown_after(quote, false, &atom),
                                 None => doc.append_markdown(&atom),
@@ -349,15 +321,9 @@ impl Pimble {
                 Ok(answer)
             }
             (None, Some(parent)) => {
-                let parent = nodes::resolve(&client, parent).await?;
-                let mut custom = custom;
-                custom.insert(custom_keys::ICON.to_string(), serde_json::json!(DISCUSSION_ICON));
-                let node_id = client
-                    .create_node_with(parent.store, Some(parent.node), node_types::DISCUSSION, topic, Some(content), custom, pimble_core::Place::Last)
-                    .await
-                    .map_err(rpc)?;
-                let addr = Addr { store: parent.store, node: node_id };
-                Ok(format!("Created the discussion {}.", self.describe(&client, &stores, addr).await))
+                let parent = self.api.resolve(parent).await?;
+                let addr = self.api.create(parent, pimble_core::Place::Last, init).await?;
+                Ok(format!("Created the discussion {}.", self.describe(addr).await))
             }
             _ => Err("Give `on` (the node it is about) or `parent` (where a discussion node of its own goes), not both.".into()),
         }
@@ -367,14 +333,13 @@ impl Pimble {
     /// top level.
     #[tool(name = "reply")]
     async fn reply(&self, Parameters(p): Parameters<ReplyParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let (addr, _) = self.discussion(&client, &p.discussion).await?;
-        let author = self.author(&client).await;
+        let (addr, _) = self.discussion(&p.discussion).await?;
+        let author = self.author().await;
         let body = Body::from_markdown(&p.message);
         let now = now();
         let reply_to = p.reply_to.clone();
         let id = self
-            .discussion_edit(&client, addr, move |t| t.post(Stamp::new(author.as_ref(), &now), reply_to.as_deref(), &body))
+            .discussion_edit(addr, move |t| t.post(Stamp::new(author.as_ref(), &now), reply_to.as_deref(), &body))
             .await?;
         Ok(format!("Posted message {id}."))
     }
@@ -382,14 +347,13 @@ impl Pimble {
     /// Rewrite one of your own messages.
     #[tool(name = "edit_message")]
     async fn edit_message(&self, Parameters(p): Parameters<EditMessageParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let (addr, node) = self.discussion(&client, &p.discussion).await?;
-        let author = self.author(&client).await;
+        let (addr, node) = self.discussion(&p.discussion).await?;
+        let author = self.author().await;
         Self::require_own(&snapshot_of(&node)?, &p.message_id, author.as_ref())?;
         let body = Body::from_markdown(&p.message);
         let now = now();
         let id = p.message_id.clone();
-        self.discussion_edit(&client, addr, move |t| t.edit_message(Stamp::new(author.as_ref(), &now), &id, &body).map(|_| String::new()))
+        self.discussion_edit(addr, move |t| t.edit_message(Stamp::new(author.as_ref(), &now), &id, &body).map(|_| String::new()))
             .await?;
         Ok(format!("Edited message {}.", p.message_id))
     }
@@ -397,13 +361,12 @@ impl Pimble {
     /// Delete one of your own messages (its replies stay where they are).
     #[tool(name = "delete_message")]
     async fn delete_message(&self, Parameters(p): Parameters<DeleteMessageParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let (addr, node) = self.discussion(&client, &p.discussion).await?;
-        let author = self.author(&client).await;
+        let (addr, node) = self.discussion(&p.discussion).await?;
+        let author = self.author().await;
         Self::require_own(&snapshot_of(&node)?, &p.message_id, author.as_ref())?;
         let now = now();
         let id = p.message_id.clone();
-        self.discussion_edit(&client, addr, move |t| t.delete_message(Stamp::new(author.as_ref(), &now), &id).map(|_| String::new()))
+        self.discussion_edit(addr, move |t| t.delete_message(Stamp::new(author.as_ref(), &now), &id).map(|_| String::new()))
             .await?;
         Ok(format!("Deleted message {}.", p.message_id))
     }
@@ -411,12 +374,11 @@ impl Pimble {
     /// Mark a discussion resolved, or open it again (`reopen`).
     #[tool(name = "resolve_discussion")]
     async fn resolve_discussion(&self, Parameters(p): Parameters<ResolveParams>) -> Result<String, String> {
-        let client = self.client().await?;
-        let (addr, node) = self.discussion(&client, &p.discussion).await?;
-        let author = self.author(&client).await;
+        let (addr, node) = self.discussion(&p.discussion).await?;
+        let author = self.author().await;
         let now = now();
         let reopen = p.reopen;
-        self.discussion_edit(&client, addr, move |t| {
+        self.discussion_edit(addr, move |t| {
             if reopen {
                 t.reopen()?;
             } else {

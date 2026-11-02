@@ -3,7 +3,6 @@
 //! the agent by the server, with a caret at the end of what it wrote, and the
 //! session ends once its frame lapses.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use pimble_client::PimbleClient;
@@ -16,8 +15,6 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use super::Pimble;
-use crate::connection::Connection;
-use crate::presence::Presence;
 
 fn p<T: DeserializeOwned>(v: serde_json::Value) -> Parameters<T> {
     Parameters(serde_json::from_value(v).expect("params"))
@@ -50,9 +47,9 @@ async fn an_agents_edit_says_where_it_wrote_and_fades() {
         .expect("an agent is made");
     let agent = PimbleClient::connect_with_auth(&url, &AuthMethod::Bearer { token: created.key.clone() }).await.expect("the agent connects");
     let client_id = format!("agent:{}", created.agent.id);
-    let short = Presence::with_ttl(client_id.clone(), 300);
-    short.set_device("Claude Code");
-    let pimble = Pimble::with_presence(Arc::new(Connection::with_client(agent)), client_id.clone(), short);
+    let api = pimble_api::Pimble::with_presence_ttl(pimble_api::rpc::RpcBackend::over(agent), client_id.clone(), 300);
+    api.set_device("Claude Code");
+    let pimble = Pimble::with_api(api);
 
     let mut watch = service.subscribe_presence(store, "watcher").await.expect("presence subscribes");
     pimble.append(p(json!({ "node": "Work/Plans", "markdown": "First line\n\nThe agent wrote this" }))).await.unwrap();
