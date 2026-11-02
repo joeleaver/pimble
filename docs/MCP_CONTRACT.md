@@ -93,13 +93,14 @@ loss is a store missing from the list, never data).
 
 ## Principal and write scope
 
-`pimble-mcp` connects as the local server's `Service` principal, like the app. It can do
-anything the person can do in the app, and the server's own judgements (`StoreAccess`,
+`pimble-mcp` connects to the local server with its agent key (`PIMBLE_AGENT_KEY`,
+docs/AGENTS_CONTRACT.md), as the grants that agent was given. Within them it can do what the
+person can do in the app, and the server's own judgements (`StoreAccess`,
 read-only roots, ended shares) refuse it what they refuse the person. Each refusal reaches
 the LLM as the server's sentence, unchanged ("You can read this, not change it.").
 
-Edits carry client id `mcp:<uuid>` (one per `pimble-mcp` process), so notifications and
-logs say where an edit came from.
+Edits carry client id `agent:<id>` (the agent the key names, docs/AGENTS_CONTRACT.md), so
+notifications and logs say where an edit came from.
 
 ## Writing: the CRDT path, and nothing else
 
@@ -110,13 +111,13 @@ makes one (`crates/pimble-cli/src/main.rs`, `set_node_text`):
 2. compute the edit locally as a delta on that document (a `NodeDoc` method);
 3. send it with `applyEdit` (`IncrementalChanges`).
 
-`updateNodeContent` is never used. Because the delta continues the document's own
+(`updateNodeContent` no longer exists.) Because the delta continues the document's own
 history, whatever the person typed between steps 1 and 3 survives the merge: the edit
 deletes only items it saw and inserts relative to items it saw.
 
 Titles and tags go the same way (`NodeDoc::set_title` with `custom.explicit_title = true`,
-`NodeDoc::set_tags`), as `applyEdit` of the `node` root, not through
-`updateNodeMetadata`, which replaces the whole metadata from a copy that may be stale.
+`NodeDoc::set_tags`), as `applyEdit` of the `node` root (`updateNodeMetadata`, which
+replaced the whole metadata from a copy that may be stale, was removed on 2026-11-02).
 The server derives `NodeRenamed` from the merge, as for any device.
 
 Structure goes through the RPCs that already make structural edits of node documents:
@@ -185,7 +186,6 @@ The write tools name the blocks they change:
 | `insert_after` | blocks after the block a quote names, or after a heading's section |
 | `replace_section` | the blocks under a heading, up to the next heading of its level or higher |
 | `replace_text` | an exact quote inside one block, replaced by new text; marks outside the quote untouched |
-| `write_new` | the content of a node whose content was never written (a node `create_node` just made) |
 | `replace_block` | the one top-level block a quote names, replaced by Markdown or removed when it is empty (a heading removed or re-levelled) |
 | `remove_section` | a heading and everything under it, up to the next heading of its level or higher |
 | `replace_content` | the whole content, written as the smallest set of block edits: blocks whose Markdown is the same before and after stay the same nodes, and each changed stretch is recorded as its own step (last first), so an unchanged block between two changed ones is never touched and anyone typing in it keeps their words. The node keeps its id and link |

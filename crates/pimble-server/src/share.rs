@@ -730,7 +730,7 @@ impl Upkeep {
 }
 
 fn is_forbidden(error: &pimble_client::ClientError) -> bool {
-    error.to_string().starts_with("Forbidden: ")
+    error.is_forbidden()
 }
 
 /// Bring `doc`'s wraps up to the store key's and `share_keys`'. A document

@@ -278,10 +278,10 @@ pub(crate) fn start_editing(
                 // Seeding the node's document is a content write; a node
                 // this device may only read is left exactly as it is.
                 if store.node_access(store_id, node_id).allows_write() {
-                    store.send(BackendCommand::SetNodeContent {
+                    store.send(BackendCommand::ApplyUpdate {
                         store_id,
                         node_id,
-                        content: snapshot,
+                        update: snapshot,
                     });
                 }
             }

@@ -11,7 +11,7 @@ use std::future::Future;
 
 use crossbeam_channel::Sender;
 use pimble_client::PimbleClient;
-use pimble_core::{AuthMethod, NodeId, RemoteEndpoint};
+use pimble_core::{custom_keys, AuthMethod, NodeId, RemoteEndpoint};
 
 use crate::protocol::{BackendCommand, BackendEvent, CloudOp};
 
@@ -191,11 +191,13 @@ pub async fn process_command(
             }
         }
 
-        BackendCommand::SetNodeContent { store_id, node_id, content } => {
+        BackendCommand::ApplyUpdate { store_id, node_id, update } => {
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
-            match c.set_node_content_bytes(store_id, node_id, content, Some(client_id.to_string())).await {
+            use base64::Engine as _;
+            let changes = base64::engine::general_purpose::STANDARD.encode(update);
+            match c.apply_edit(store_id, node_id, client_id, pimble_rpc::EditOperation::IncrementalChanges { changes }).await {
                 Ok(()) => Some(BackendEvent::NodeContentUpdated { store_id, node_id }),
                 Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
             }
@@ -216,26 +218,27 @@ pub async fn process_command(
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
-            match c.get_node(store_id, node_id).await {
-                Ok(mut node) => {
-                    if let Some(icon) = icon {
-                        node.metadata.set_icon(icon);
-                    }
-                    if let Some(color) = color {
-                        node.metadata.set_color(color);
-                    }
-                    if let Some(background) = background {
-                        node.metadata.set_background(background);
-                    }
-                    if let Some(tags) = tags {
-                        node.metadata.tags = tags;
-                    }
-                    match c.update_node_metadata(store_id, node_id, node.metadata).await {
-                        Ok(()) => Some(BackendEvent::NodeRenamed { store_id, node_id }),
-                        Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            let edited = edit_node_document(c, store_id, node_id, client_id, |doc, now| {
+                // `None` leaves a key alone; `Some(None)`, or an empty string,
+                // removes it, as `NodeMetadata::set_icon` does.
+                for (key, value) in [(custom_keys::ICON, icon), (custom_keys::COLOR, color), (custom_keys::BACKGROUND, background)] {
+                    let Some(value) = value else { continue };
+                    match value.filter(|s| !s.is_empty()) {
+                        Some(value) => doc.set_custom(key, &serde_json::Value::String(value), now)?,
+                        None => {
+                            doc.remove_custom(key, now)?;
+                        }
                     }
                 }
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+                if let Some(tags) = tags {
+                    doc.set_tags(&tags, now)?;
+                }
+                Ok(())
+            })
+            .await;
+            match edited {
+                Ok(()) => Some(BackendEvent::NodeRenamed { store_id, node_id }),
+                Err(message) => Some(BackendEvent::Error { message }),
             }
         }
 
@@ -243,19 +246,14 @@ pub async fn process_command(
             let Some(c) = client.as_ref() else {
                 return Some(BackendEvent::Error { message: "Not connected".into() });
             };
-            match c.get_node(store_id, node_id).await {
-                Ok(mut node) => {
-                    node.metadata.title = title;
-                    node.metadata.custom.insert(
-                        pimble_core::custom_keys::EXPLICIT_TITLE.to_string(),
-                        serde_json::Value::Bool(true),
-                    );
-                    match c.update_node_metadata(store_id, node_id, node.metadata).await {
-                        Ok(()) => Some(BackendEvent::NodeRenamed { store_id, node_id }),
-                        Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
-                    }
-                }
-                Err(e) => Some(BackendEvent::Error { message: e.to_string() }),
+            let edited = edit_node_document(c, store_id, node_id, client_id, |doc, now| {
+                doc.set_title(&title, now)?;
+                doc.set_custom(custom_keys::EXPLICIT_TITLE, &serde_json::Value::Bool(true), now)
+            })
+            .await;
+            match edited {
+                Ok(()) => Some(BackendEvent::NodeRenamed { store_id, node_id }),
+                Err(message) => Some(BackendEvent::Error { message }),
             }
         }
 
@@ -1090,3 +1088,16 @@ async fn shares_listed(c: &PimbleClient) -> BackendEvent {
     }
 }
 
+/// Change a node's document through [`PimbleClient::edit_node`], under a
+/// client id of its own so this app's own node subscription hears the edit
+/// and its open sessions of the node take it in (the server relays to
+/// everyone but the sender).
+async fn edit_node_document(
+    c: &PimbleClient,
+    store_id: pimble_core::StoreId,
+    node_id: NodeId,
+    client_id: &str,
+    edit: impl FnOnce(&mut pimble_crdt::NodeDoc, &str) -> pimble_crdt::Result<()>,
+) -> Result<(), String> {
+    c.edit_node(store_id, node_id, &format!("{client_id}:metadata"), edit).await.map_err(|e| e.to_string())
+}

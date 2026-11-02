@@ -54,7 +54,11 @@ pub enum BackendCommand {
     SyncPersonal { state: Vec<u8>, enabled: bool, turn_on: bool },
     GetNode { store_id: StoreId, node_id: NodeId },
     GetChildren { store_id: StoreId, node_id: NodeId },
-    SetNodeContent { store_id: StoreId, node_id: NodeId, content: Vec<u8> },
+    /// Merge `update` (a yrs update of the node's document) through
+    /// `applyEdit` and answer `NodeContentUpdated` or `Error`: for a caller
+    /// that must know the write landed (the importer, the editor seeding an
+    /// empty document). `BroadcastChanges` is the same write, unanswered.
+    ApplyUpdate { store_id: StoreId, node_id: NodeId, update: Vec<u8> },
     RenameNode { store_id: StoreId, node_id: NodeId, title: String },
     /// Set or clear a node's custom icon (a Tabler icon name) and/or colour
     /// (`#rrggbb`) in its metadata. `None` for a field leaves it as it is;

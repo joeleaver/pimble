@@ -87,14 +87,6 @@ pub trait PimbleApi {
     #[method(name = "listAttachments", with_extensions)]
     async fn list_attachments(&self, request: ListAttachmentsRequest) -> Result<ListAttachmentsResponse, ErrorObjectOwned>;
 
-    /// Update a node's metadata. Write.
-    #[method(name = "updateNodeMetadata", with_extensions)]
-    async fn update_node_metadata(&self, request: UpdateNodeMetadataRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
-
-    /// Update a node's content. Write.
-    #[method(name = "updateNodeContent", with_extensions)]
-    async fn update_node_content(&self, request: UpdateNodeContentRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
-
     /// Delete a node and its subtree (tombstones,
     /// docs/NODE_DOCUMENT_CONTRACT.md section 2). Write.
     #[method(name = "deleteNode", with_extensions)]
@@ -200,22 +192,6 @@ pub trait PimbleApi {
     /// List a vault store's documents with their heads (reader).
     #[method(name = "vaultListDocs", with_extensions)]
     async fn vault_list_docs(&self, request: VaultListDocsRequest) -> Result<VaultListDocsResponse, ErrorObjectOwned>;
-
-    // ========================================================================
-    // Workspace Operations
-    // ========================================================================
-
-    /// Load a workspace from file
-    #[method(name = "loadWorkspace")]
-    async fn load_workspace(&self, request: LoadWorkspaceRequest) -> Result<LoadWorkspaceResponse, ErrorObjectOwned>;
-
-    /// Save a workspace to file
-    #[method(name = "saveWorkspace")]
-    async fn save_workspace(&self, request: SaveWorkspaceRequest) -> Result<EmptyResponse, ErrorObjectOwned>;
-
-    /// Create a new workspace
-    #[method(name = "createWorkspace")]
-    async fn create_workspace(&self, request: CreateWorkspaceRequest) -> Result<LoadWorkspaceResponse, ErrorObjectOwned>;
 
     // ========================================================================
     // Edit Operations (collaborative editing)

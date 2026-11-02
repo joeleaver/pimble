@@ -8,7 +8,7 @@
 //! new store made for it ([`under_selection`], [`into_new_store`]). Last, the
 //! backend parses the files with `pimble-import` and [`write`] makes the nodes
 //! with the same commands the app writes with everywhere else (`CreateNode`,
-//! `GetNode`, `SetNodeContent`), so an import is an ordinary edit: it works
+//! `GetNode`, `ApplyUpdate`), so an import is an ordinary edit: it works
 //! in a plain store, an encrypted one, a share and a replica alike, and it
 //! reaches every other device the way typing does.
 
@@ -372,7 +372,7 @@ async fn write_one<R: Runner>(runner: &mut R, store_id: StoreId, parent_id: Opti
         other => return Err(unexpected(other)),
     };
     let delta = fill(&content, item).map_err(|e| format!("\"{}\" could not be written: {e}", item.title))?;
-    match runner.run(BackendCommand::SetNodeContent { store_id, node_id, content: delta }).await {
+    match runner.run(BackendCommand::ApplyUpdate { store_id, node_id, update: delta }).await {
         Some(BackendEvent::NodeContentUpdated { .. }) => Ok(node_id),
         other => Err(unexpected(other)),
     }

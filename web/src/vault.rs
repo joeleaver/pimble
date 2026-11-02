@@ -1325,7 +1325,7 @@ impl VaultClient {
                 }
             }
 
-            BackendCommand::SetNodeContent { store_id, node_id, content } => {
+            BackendCommand::ApplyUpdate { store_id, node_id, update: content } => {
                 match self.append_update(client, store_id, node_id, &content).await {
                     Ok(()) => Some(BackendEvent::NodeContentUpdated { store_id, node_id }),
                     Err(message) => Some(BackendEvent::Error { message }),
@@ -1437,7 +1437,7 @@ impl VaultClient {
                 let on_discussion = |node_id: NodeId| self.stores.get(&store_id).is_none_or(|store| store.is_discussion(node_id));
                 let allowed = match cmd {
                     BackendCommand::CreateAttachment { init, .. } => init.node_type == node_types::DISCUSSION,
-                    BackendCommand::BroadcastChanges { node_id, .. } | BackendCommand::SetNodeContent { node_id, .. } => on_discussion(*node_id),
+                    BackendCommand::BroadcastChanges { node_id, .. } | BackendCommand::ApplyUpdate { node_id, .. } => on_discussion(*node_id),
                     _ => false,
                 };
                 if !allowed {
@@ -1589,7 +1589,7 @@ impl VaultClient {
                     }
                 }
             }
-            BackendCommand::SetNodeContent { store_id, node_id, content } if held => {
+            BackendCommand::ApplyUpdate { store_id, node_id, update: content } if held => {
                 match self.keep_unsent(store_id, node_id, &content) {
                     Ok(()) => Some(BackendEvent::NodeContentUpdated { store_id, node_id }),
                     Err(message) => Some(BackendEvent::Error { message }),
@@ -3914,7 +3914,7 @@ pub fn store_id_of(cmd: &BackendCommand) -> Option<StoreId> {
         | ListDiscussions { store_id }
         | GetNode { store_id, .. }
         | GetChildren { store_id, .. }
-        | SetNodeContent { store_id, .. }
+        | ApplyUpdate { store_id, .. }
         | RenameNode { store_id, .. }
         | SetNodeAppearance { store_id, .. }
         | DeleteNode { store_id, .. }
@@ -3963,7 +3963,7 @@ pub fn writes(cmd: &BackendCommand) -> bool {
             | MoveNode { .. }
             | MoveNodes { .. }
             | TransplantNode { .. }
-            | SetNodeContent { .. }
+            | ApplyUpdate { .. }
             | BroadcastChanges { .. }
             | PutBlob { .. }
             | CreateMount { .. }
@@ -3977,7 +3977,7 @@ pub fn writes(cmd: &BackendCommand) -> bool {
 /// two writes a store whose owner's computer is off still takes in
 /// ([`VaultClient::refuse_write`]).
 fn is_content_edit(cmd: &BackendCommand) -> bool {
-    matches!(cmd, BackendCommand::BroadcastChanges { .. } | BackendCommand::SetNodeContent { .. })
+    matches!(cmd, BackendCommand::BroadcastChanges { .. } | BackendCommand::ApplyUpdate { .. })
 }
 
 /// The placeholder root of a store listed from the account's row alone
@@ -5786,9 +5786,9 @@ mod tests {
         };
         let init = |node_type: &str| pimble_app::protocol::NodeInit { node_type: node_type.to_string(), content: Vec::new(), custom: Vec::new(), request: None };
         assert_eq!(refused(BackendCommand::CreateAttachment { store_id, host_id: bread, title: "Why?".into(), init: init(node_types::DISCUSSION) }), None);
-        assert_eq!(refused(BackendCommand::SetNodeContent { store_id, node_id: talk, content: Vec::new() }), None);
+        assert_eq!(refused(BackendCommand::ApplyUpdate { store_id, node_id: talk, update: Vec::new() }), None);
         let comment_only = Some(StoreAccess::COMMENT_ONLY_REFUSAL.to_string());
-        assert_eq!(refused(BackendCommand::SetNodeContent { store_id, node_id: bread, content: Vec::new() }), comment_only);
+        assert_eq!(refused(BackendCommand::ApplyUpdate { store_id, node_id: bread, update: Vec::new() }), comment_only);
         assert_eq!(refused(BackendCommand::RenameNode { store_id, node_id: bread, title: "No".into() }), comment_only);
         assert_eq!(refused(BackendCommand::CreateNode { store_id, parent_id: Some(recipes), title: "No".into(), init: None }), comment_only);
         let mut described = scoped;

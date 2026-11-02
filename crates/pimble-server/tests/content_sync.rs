@@ -12,7 +12,7 @@ use base64::Engine;
 use pimble_crdt::NodeDoc;
 use pimble_rpc::{
     ApplyEditRequest, CreateNodeRequest, CreateStoreRequest, EditOperation, GetNodeRequest,
-    NodeStateVector, PimbleApiServer, SyncNodesRequest, UpdateNodeContentRequest,
+    NodeStateVector, PimbleApiServer, SyncNodesRequest,
 };
 use pimble_server::RpcHandler;
 use pimble_store::StoreManager;
@@ -63,12 +63,7 @@ async fn sync_node_content_hands_new_client_the_full_document() {
     let content_b64 = base64::engine::general_purpose::STANDARD.encode(a_doc.save());
 
     handler
-        .update_node_content(&pimble_server::service_extensions(), UpdateNodeContentRequest {
-            store_id,
-            node_id,
-            content: content_b64,
-            client_id: Some("client-a".into()),
-        })
+        .apply_edit(&pimble_server::service_extensions(), ApplyEditRequest { store_id, node_id, client_id: "client-a".into(), operation: EditOperation::IncrementalChanges { changes: content_b64 } })
         .await
         .unwrap();
 
@@ -113,12 +108,7 @@ async fn apply_edit_incremental_changes_merges_into_server_document() {
     let base = NodeDoc::from_plain_text("Hello").unwrap();
     let content_b64 = base64::engine::general_purpose::STANDARD.encode(base.save());
     handler
-        .update_node_content(&pimble_server::service_extensions(), UpdateNodeContentRequest {
-            store_id,
-            node_id,
-            content: content_b64,
-            client_id: Some("client-a".into()),
-        })
+        .apply_edit(&pimble_server::service_extensions(), ApplyEditRequest { store_id, node_id, client_id: "client-a".into(), operation: EditOperation::IncrementalChanges { changes: content_b64 } })
         .await
         .unwrap();
 
@@ -164,12 +154,7 @@ async fn apply_edit_incremental_changes_is_flushed_to_disk_after_debounce() {
     let base = NodeDoc::from_plain_text("Hello").unwrap();
     let content_b64 = base64::engine::general_purpose::STANDARD.encode(base.save());
     handler
-        .update_node_content(&pimble_server::service_extensions(), UpdateNodeContentRequest {
-            store_id,
-            node_id,
-            content: content_b64,
-            client_id: Some("client-a".into()),
-        })
+        .apply_edit(&pimble_server::service_extensions(), ApplyEditRequest { store_id, node_id, client_id: "client-a".into(), operation: EditOperation::IncrementalChanges { changes: content_b64 } })
         .await
         .unwrap();
 

@@ -11,7 +11,7 @@ use jsonrpsee::core::client::Client as RpcClient;
 use jsonrpsee::wasm_client::WasmClientBuilder;
 #[cfg(not(target_arch = "wasm32"))]
 use jsonrpsee::ws_client::{HeaderMap, HeaderValue, WsClientBuilder};
-use pimble_core::{AuthMethod, BlobId, BlobUrl, Node, NodeId, Place, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState, Workspace};
+use pimble_core::{AuthMethod, BlobId, BlobUrl, Node, NodeId, Place, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState};
 use pimble_core::MountRef;
 use pimble_rpc::{
     AgentGrant, AgentInfo, CreateAgentRequest, CreateAgentResponse, RemoveAgentRequest, UpdateAgentRequest,
@@ -19,13 +19,13 @@ use pimble_rpc::{
     CloudHostStoreRequest, CloudHostedStoreInfo, CloudListHostedStoresResponse, CloudRelayStoreRequest, CloudShareInfoResponse, CloudShareInviteRequest, CloudShareNodeRequest, CloudShareRef,
     CloudShareRemoveMemberRequest, CloudSignInRequest, CloudStatusResponse, CloudStopRelayingRequest, DeleteVaultStoreRequest, GetScopesRequest, MemberRole, Scope,
     SetScopeRequest, VaultDocKeys, VaultSetDocKeysRequest,
-    CreateMountRequest, CreateNodeRequest, CreateStoreRequest, CreateWorkspaceRequest, DeleteNodeRequest,
+    CreateMountRequest, CreateNodeRequest, CreateStoreRequest, DeleteNodeRequest,
     EditOperation, GetChildrenRequest, GetMountStateRequest, GetNodeRequest, GetNodesRequest, GetStoreSyncRequest, GetStoreSyncResponse, SetStoreSyncRequest,
-    ListDeletedRequest, ResolveLinkRequest, ListRemoteStoresRequest, LoadWorkspaceRequest, MoveNodeRequest, MoveNodeResponse, MoveNodesRequest, MoveNodesResponse, NodeContentChangedNotification, NodeStateVector,
+    ListDeletedRequest, ResolveLinkRequest, ListRemoteStoresRequest, MoveNodeRequest, MoveNodeResponse, MoveNodesRequest, MoveNodesResponse, NodeContentChangedNotification, NodeStateVector,
     TransplantNodeRequest, TransplantNodeResponse,
-    OpenStoreRequest, PimbleApiClient, RebuildIndexRequest, RemoveReplicaRequest, SaveWorkspaceRequest,
+    OpenStoreRequest, PimbleApiClient, RebuildIndexRequest, RemoveReplicaRequest,
     SearchRequest, SearchResultItem, StoreChangedNotification, SyncNodesRequest, UndeleteNodeRequest,
-    UpdateNodeContentRequest, UpdateNodeMetadataRequest, VaultAppendRequest, VaultDocId,
+    VaultAppendRequest, VaultDocId,
     VaultDocInfo, VaultFetchRequest, VaultFetchResponse, VaultListDocsRequest, VaultListDocsResponse,
     VaultSnapshotRequest, MAX_SYNC_NODE_CONTENTS,
     GetBlobRequest, HaveBlobsRequest, PutBlobRequest, BLOB_CHUNK_BYTES,
@@ -106,14 +106,15 @@ pub fn describe_connect_error(url: &Url, err: &ClientError) -> String {
     }
 }
 
-/// A failed call as `ClientError::Rpc`. For an error the server returned,
-/// that is the server's own message: jsonrpsee renders the whole
-/// `ErrorObject { code, message, data }` otherwise, and that is what a user
-/// would read in the app. Transport and protocol failures keep their text
-/// (the app recognises a dead connection by it).
+/// A failed call. An error the server returned is `ClientError::Server`
+/// with its code and its own message: jsonrpsee renders the whole
+/// `ErrorObject { code, message, data }` otherwise, and the message is what
+/// a person reads in the app. Transport and protocol failures are
+/// `ClientError::Rpc` and keep their text (the app recognises a dead
+/// connection by it).
 fn rpc_error(e: jsonrpsee::core::client::Error) -> ClientError {
     match e {
-        jsonrpsee::core::client::Error::Call(obj) => ClientError::Rpc(obj.message().to_string()),
+        jsonrpsee::core::client::Error::Call(obj) => ClientError::Server { code: obj.code(), message: obj.message().to_string() },
         other => ClientError::Rpc(other.to_string()),
     }
 }
@@ -480,55 +481,6 @@ impl PimbleClient {
         self.client.list_attachments(request).await.map(|r| r.nodes).map_err(rpc_error)
     }
 
-    /// Update a node's metadata
-    pub async fn update_node_metadata(
-        &self,
-        store_id: StoreId,
-        node_id: NodeId,
-        metadata: pimble_core::NodeMetadata,
-    ) -> Result<()> {
-        let request = UpdateNodeMetadataRequest {
-            store_id,
-            node_id,
-            metadata,
-        };
-
-        self.client
-            .update_node_metadata(request)
-            .await
-            .map_err(rpc_error)?;
-
-        Ok(())
-    }
-
-    /// Seed a node's content with a whole document snapshot (`updateNodeContent`).
-    /// A merge, not a replacement: only right for a node whose content was
-    /// never written (see `UpdateNodeContentRequest`).
-    pub async fn set_node_content_bytes(
-        &self,
-        store_id: StoreId,
-        node_id: NodeId,
-        content: Vec<u8>,
-        client_id: Option<String>,
-    ) -> Result<()> {
-        use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&content);
-
-        let request = UpdateNodeContentRequest {
-            store_id,
-            node_id,
-            content: encoded,
-            client_id,
-        };
-
-        self.client
-            .update_node_content(request)
-            .await
-            .map_err(rpc_error)?;
-
-        Ok(())
-    }
-
     /// Delete a node and its subtree (a tombstone; see `undelete_node`).
     pub async fn delete_node(&self, store_id: StoreId, node_id: NodeId) -> Result<()> {
         let request = DeleteNodeRequest { store_id, node_id };
@@ -826,62 +778,35 @@ impl PimbleClient {
     }
 
     // ========================================================================
-    // Workspace Operations
-    // ========================================================================
-
-    /// Load a workspace from file
-    pub async fn load_workspace(&self, path: impl AsRef<Path>) -> Result<Workspace> {
-        let request = LoadWorkspaceRequest {
-            path: path.as_ref().to_path_buf(),
-        };
-
-        let response = self
-            .client
-            .load_workspace(request)
-            .await
-            .map_err(rpc_error)?;
-
-        Ok(response.workspace)
-    }
-
-    /// Save a workspace to file
-    pub async fn save_workspace(&self, workspace: Workspace, path: impl AsRef<Path>) -> Result<()> {
-        let request = SaveWorkspaceRequest {
-            workspace,
-            path: path.as_ref().to_path_buf(),
-        };
-
-        self.client
-            .save_workspace(request)
-            .await
-            .map_err(rpc_error)?;
-
-        Ok(())
-    }
-
-    /// Create a new workspace
-    pub async fn create_workspace(
-        &self,
-        name: impl Into<String>,
-        path: impl AsRef<Path>,
-    ) -> Result<Workspace> {
-        let request = CreateWorkspaceRequest {
-            name: name.into(),
-            path: path.as_ref().to_path_buf(),
-        };
-
-        let response = self
-            .client
-            .create_workspace(request)
-            .await
-            .map_err(rpc_error)?;
-
-        Ok(response.workspace)
-    }
-
-    // ========================================================================
     // Edit Operations (collaborative editing)
     // ========================================================================
+
+    /// Change a node's document and send what changed as one `applyEdit`,
+    /// the one way anything in a node is written (docs/API_CONTRACT.md):
+    /// fetch the document, let `edit` change it (it gets the time to stamp,
+    /// RFC 3339 UTC with milliseconds), send the delta under `client_id`.
+    /// A rename, a tag or an icon touches only the keys it names, so a
+    /// concurrent edit of another key on another device is kept. An edit
+    /// that changes nothing still sends a no-op update, which the server
+    /// merges as one.
+    pub async fn edit_node(
+        &self,
+        store_id: StoreId,
+        node_id: NodeId,
+        client_id: &str,
+        edit: impl FnOnce(&mut pimble_crdt::NodeDoc, &str) -> pimble_crdt::Result<()>,
+    ) -> Result<()> {
+        use base64::Engine as _;
+        let node = self.get_node(store_id, node_id).await?;
+        let mut doc = pimble_crdt::NodeDoc::load(&node.content)
+            .map_err(|e| ClientError::Rpc(format!("The node's document could not be read: {e}")))?;
+        let before = doc.state_vector();
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        edit(&mut doc, &now).map_err(|e| ClientError::Rpc(e.to_string()))?;
+        let delta = doc.diff_since(&before).map_err(|e| ClientError::Rpc(e.to_string()))?;
+        let changes = base64::engine::general_purpose::STANDARD.encode(delta);
+        self.apply_edit(store_id, node_id, client_id, EditOperation::IncrementalChanges { changes }).await
+    }
 
     /// Apply an edit operation to a node and broadcast to other clients.
     pub async fn apply_edit(

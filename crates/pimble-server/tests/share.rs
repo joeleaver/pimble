@@ -591,9 +591,7 @@ async fn a_reader_reads_the_share_and_cannot_write() {
     refused(carol.create_node(store_id, Some(shared), "document", "no").await.map(|_| ()));
     refused(carol.move_node(store_id, fx.leaf, shared, Place::Last).await.map(|_| ()));
     refused(carol.delete_node(store_id, fx.inside).await);
-    let mut metadata = carol.get_node(store_id, fx.inside).await.unwrap().metadata;
-    metadata.title = "no".into();
-    refused(carol.update_node_metadata(store_id, fx.inside, metadata).await);
+    refused(carol.edit_node(store_id, fx.inside, "carol", |doc, now| doc.set_title("no", now)).await);
     let changes = base64::engine::general_purpose::STANDARD.encode(NodeDoc::from_plain_text("no").unwrap().save());
     refused(carol.apply_edit(store_id, fx.inside, "carol", EditOperation::IncrementalChanges { changes }).await);
     // Sharing on is an owner's to do, whoever asks.

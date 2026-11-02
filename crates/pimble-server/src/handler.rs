@@ -50,7 +50,7 @@ use jsonrpsee::core::{async_trait, SubscriptionResult};
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{Extensions, PendingSubscriptionSink, SubscriptionMessage};
 use pimble_client::{describe_connect_error, PimbleClient};
-use pimble_core::{AuthMethod, BlobUrl, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, Place, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState, Workspace};
+use pimble_core::{AuthMethod, BlobUrl, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, Place, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState};
 use pimble_crdt::{NodeDoc, NodeFields, NodeUpdateEffect, Tree, TreeEdit};
 use pimble_plugins::PluginHost;
 use pimble_rpc::{
@@ -61,16 +61,15 @@ use pimble_rpc::{
     CloudStatusResponse, CloudStopRelayingRequest, PresenceFrame, PresenceWho, PublishPresenceRequest, GetPresenceResponse, CloudListSharesResponse, CloudSetDisplayNameRequest, CloudSetShareNameRequest, CloudPeopleRequest, StorePeople,
     CreateMountRequest, CreateMountResponse,
     CreateAttachmentRequest, CreateNodeRequest, CreateNodeResponse, CreateStoreRequest, CreateStoreResponse, ListAttachmentsRequest, ListAttachmentsResponse, ListDiscussionsRequest, ListDiscussionsResponse, WhoAmIResponse, CloudPersonalSyncRequest, CloudPersonalSyncResponse,
-    CreateWorkspaceRequest, DeleteNodeRequest, EditOperation, EmptyResponse, GetChildrenRequest,
+    DeleteNodeRequest, EditOperation, EmptyResponse, GetChildrenRequest,
     GetChildrenResponse, GetMountStateRequest, GetMountStateResponse, GetNodeRequest, GetStoreSyncRequest, GetStoreSyncResponse, SetStoreSyncRequest,
-    GetNodeResponse, GetNodesRequest, GetNodesResponse, ListRemoteStoresRequest, ListStoresResponse, LoadWorkspaceRequest,
-    LoadWorkspaceResponse, MoveNodeRequest, MoveNodeResponse, MoveNodesRequest, MoveNodesResponse, ListDeletedRequest, ListDeletedResponse, TransplantNodeRequest, TransplantNodeResponse, NodeContentChangedNotification, NodeContentDiff, OpenStoreRequest,
+    GetNodeResponse, GetNodesRequest, GetNodesResponse, ListRemoteStoresRequest, ListStoresResponse,
+    MoveNodeRequest, MoveNodeResponse, MoveNodesRequest, MoveNodesResponse, ListDeletedRequest, ListDeletedResponse, TransplantNodeRequest, TransplantNodeResponse, NodeContentChangedNotification, NodeContentDiff, OpenStoreRequest,
     OpenStoreResponse, PimbleApiServer, RebuildIndexRequest, RebuildIndexResponse, RemoveReplicaRequest,
-    SaveWorkspaceRequest, SearchRequest, SearchResponse, SearchResultItem, StoreChangeKind,
+    SearchRequest, SearchResponse, SearchResultItem, StoreChangeKind,
     CloudShareInfoResponse, CloudShareInviteRequest, CloudShareNodeRequest, CloudShareRef, CloudShareRemoveMemberRequest, DeleteVaultStoreRequest,
     GetScopesRequest, GetScopesResponse, Scope, SetScopeRequest, StoreChangedNotification, SyncNodesRequest, SyncNodesResponse, UndeleteNodeRequest,
-    UpdateNodeContentRequest, VaultDocKeys, VaultSetDocKeysRequest,
-    UpdateNodeMetadataRequest,
+    VaultDocKeys, VaultSetDocKeysRequest,
     VaultAppendRequest, VaultAppendResponse, VaultDocId, VaultDocInfo, VaultEntry, VaultFetchRequest,
     VaultFetchResponse, VaultListDocsRequest, VaultListDocsResponse, VaultSnapshotRequest,
     MAX_SYNC_NODE_CONTENTS,
@@ -1514,21 +1513,6 @@ impl RpcHandler {
     // ── Scoped grants and read-only replicas (docs/NODE_DOCUMENT_CONTRACT.md
     // section 5) ─────────────────────────────────────────────────────────
 
-    /// The guard every write RPC on a plain store runs after `authorize`:
-    /// a replica this device holds as a share's reader (`sync.json`'s
-    /// `access: read`, or a reader's root among several) refuses a write
-    /// touching `ids` with the reader's own sentence, as the hosted server
-    /// would refuse the push. A link's applies never come this way
-    /// (`apply_node_update_from`), so a reader's replica still receives
-    /// everything.
-    async fn reject_if_read_only(&self, store_id: StoreId, ids: &[NodeId]) -> Result<(), ErrorObjectOwned> {
-        let manager = self.store_manager.read().await;
-        if manager.write_refused(store_id, ids) {
-            return Err(write_refusal(&manager, store_id, ids));
-        }
-        Ok(())
-    }
-
     /// Whether `principal` may delete `node_id`. A delete edits the node
     /// (and everything under it, which is in every scope the node is in)
     /// and its parent's list: a member cannot delete their share's own
@@ -1839,9 +1823,9 @@ impl RpcHandler {
     }
 
     /// Change `node_id`'s metadata under one lock and send the change out
-    /// exactly as `updateNodeMetadata` does (it is the same write): how a
-    /// share's marker is set and removed, so that it replicates like any
-    /// other metadata.
+    /// as a metadata edit: how a share's marker is set and removed, so that
+    /// it replicates like any other metadata. Only the keys that differ are
+    /// written, and the read and the write share the lock.
     pub(crate) async fn edit_node_metadata(
         &self,
         store_id: StoreId,
@@ -4129,82 +4113,6 @@ impl PimbleApiServer for RpcHandler {
         Ok(ListAttachmentsResponse { nodes })
     }
 
-    async fn update_node_metadata(
-        &self,
-        ext: &Extensions,
-        request: UpdateNodeMetadataRequest,
-    ) -> Result<EmptyResponse, ErrorObjectOwned> {
-        let principal = principal_of(ext);
-        authorize(&principal, request.store_id, Access::Write)?;
-        self.reject_if_vault(request.store_id).await?;
-        debug!(
-            "Updating metadata for node {} in store {}",
-            request.node_id, request.store_id
-        );
-
-        let mut manager = self.store_manager.write().await;
-        require_in_scope(&Reach::of(&manager, &principal, request.store_id), request.node_id, Access::Write)?;
-        if manager.write_refused(request.store_id, &[request.node_id]) {
-            return Err(write_refusal(&manager, request.store_id, &[request.node_id]));
-        }
-        let edit = manager
-            .update_node_metadata(request.store_id, request.node_id, request.metadata)
-            .map_err(to_rpc_error)?;
-        self.publish_metadata_edit(manager, request.store_id, request.node_id, edit).await?;
-
-        Ok(EmptyResponse {})
-    }
-
-    async fn update_node_content(
-        &self,
-        ext: &Extensions,
-        request: UpdateNodeContentRequest,
-    ) -> Result<EmptyResponse, ErrorObjectOwned> {
-        let principal = principal_of(ext);
-        authorize(&principal, request.store_id, Access::Write)?;
-        self.reject_if_vault(request.store_id).await?;
-        info!(
-            "Updating content for node {} in store {}",
-            request.node_id, request.store_id
-        );
-        require_in_scope(&self.reach_of(&principal, request.store_id).await, request.node_id, Access::Write)?;
-        self.reject_if_read_only(request.store_id, &[request.node_id]).await?;
-
-        let content = base64::engine::general_purpose::STANDARD
-            .decode(&request.content)
-            .map_err(|e| to_rpc_error(format!("Invalid base64: {}", e)))?;
-        let (store_id, node_id) = (request.store_id, request.node_id);
-
-        // A merge like any other, so the snapshot's bytes ride the
-        // notification as an update a subscriber applies; and a person's
-        // write, so the node is stamped, here and now rather than on the
-        // flush debounce, since this is one call and not a keystroke.
-        let stamp = {
-            let mut manager = self.store_manager.write().await;
-            let effect = manager.update_node_content(store_id, node_id, content).map_err(to_rpc_error)?;
-            if !effect.changed {
-                return Ok(EmptyResponse {});
-            }
-            let stamp = manager
-                .tree_mut(store_id)
-                .map_err(to_rpc_error)?
-                .touch_modified(node_id, &now())
-                .map_err(to_rpc_error)?;
-            for id in stamp.node_ids() {
-                manager.mark_dirty(store_id, id).map_err(to_rpc_error)?;
-            }
-            manager.flush(store_id).await.map_err(to_rpc_error)?;
-            stamp
-        };
-
-        self.broadcast_document_change(store_id, StoreChangeKind::ContentUpdated { node_id }, request.client_id.as_deref(), Some(request.content))
-            .await;
-        self.broadcast_tree_edit(store_id, &stamp, &[(node_id, StoreChangeKind::MetadataUpdated { node_id })], None).await;
-        self.enqueue_index_event(store_id, IndexEvent::ContentChanged(node_id)).await;
-
-        Ok(EmptyResponse {})
-    }
-
     async fn delete_node(
         &self,
         ext: &Extensions,
@@ -5194,56 +5102,6 @@ impl PimbleApiServer for RpcHandler {
         };
 
         Ok(SyncNodesResponse { nodes, unknown_ids })
-    }
-
-    async fn load_workspace(
-        &self,
-        request: LoadWorkspaceRequest,
-    ) -> Result<LoadWorkspaceResponse, ErrorObjectOwned> {
-        info!("Loading workspace from {:?}", request.path);
-
-        let content = tokio::fs::read_to_string(&request.path)
-            .await
-            .map_err(to_rpc_error)?;
-
-        let workspace: Workspace = serde_json::from_str(&content)
-            .map_err(to_rpc_error)?;
-
-        Ok(LoadWorkspaceResponse { workspace })
-    }
-
-    async fn save_workspace(
-        &self,
-        request: SaveWorkspaceRequest,
-    ) -> Result<EmptyResponse, ErrorObjectOwned> {
-        info!("Saving workspace to {:?}", request.path);
-
-        let content = serde_json::to_string_pretty(&request.workspace)
-            .map_err(to_rpc_error)?;
-
-        tokio::fs::write(&request.path, content)
-            .await
-            .map_err(to_rpc_error)?;
-
-        Ok(EmptyResponse {})
-    }
-
-    async fn create_workspace(
-        &self,
-        request: CreateWorkspaceRequest,
-    ) -> Result<LoadWorkspaceResponse, ErrorObjectOwned> {
-        info!("Creating workspace '{}' at {:?}", request.name, request.path);
-
-        let workspace = Workspace::new(&request.name);
-
-        let content = serde_json::to_string_pretty(&workspace)
-            .map_err(to_rpc_error)?;
-
-        tokio::fs::write(&request.path, content)
-            .await
-            .map_err(to_rpc_error)?;
-
-        Ok(LoadWorkspaceResponse { workspace })
     }
 
     async fn apply_edit(

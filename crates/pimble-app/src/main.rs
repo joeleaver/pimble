@@ -167,7 +167,7 @@ mod collab_sync_test {
             .expect("host projects the flat document");
 
         // The pimble server loads that snapshot into its per-node `NodeDoc`
-        // (exactly what `update_node_content` does) and will apply deltas to it
+        // (what merging it through `apply_edit` does) and will apply deltas to it
         // (exactly what `apply_edit` does).
         let mut server_doc = pimble_crdt::NodeDoc::load(&snapshot).unwrap();
 

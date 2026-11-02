@@ -10,8 +10,7 @@ use base64::Engine;
 use pimble_crdt::NodeDoc;
 use pimble_rpc::{
     CloseStoreRequest, CreateNodeRequest, CreateStoreRequest, DeleteNodeRequest,
-    OpenStoreRequest, PimbleApiServer, RebuildIndexRequest, SearchRequest,
-    UpdateNodeContentRequest,
+    ApplyEditRequest, EditOperation, OpenStoreRequest, PimbleApiServer, RebuildIndexRequest, SearchRequest,
 };
 use pimble_server::RpcHandler;
 use pimble_store::StoreManager;
@@ -53,12 +52,7 @@ async fn set_text(
     let doc = NodeDoc::from_plain_text(text).unwrap();
     let content_b64 = base64::engine::general_purpose::STANDARD.encode(doc.save());
     handler
-        .update_node_content(&pimble_server::service_extensions(), UpdateNodeContentRequest {
-            store_id,
-            node_id,
-            content: content_b64,
-            client_id: None,
-        })
+        .apply_edit(&pimble_server::service_extensions(), ApplyEditRequest { store_id, node_id, client_id: "seed".into(), operation: EditOperation::IncrementalChanges { changes: content_b64 } })
         .await
         .unwrap();
 }

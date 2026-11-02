@@ -1317,9 +1317,8 @@ async fn share_by_hand(env: &Env, owner: &PimbleClient, owner_dir: &Path, store_
         env.h_admin.vault_set_doc_keys(store_id, doc, pimble_rpc::VaultDocKeys { dek_id: keys.dek_id, wraps: vec![wrap] }).await.unwrap();
     }
 
-    let mut metadata = owner.get_node(store_id, shared).await.unwrap().metadata;
-    metadata.set_share(Some(&pimble_core::ShareMarker { v: pimble_core::ShareMarker::VERSION, key_id: share_key_id, url: env.stub_url.clone(), name: share_name.into() }));
-    owner.update_node_metadata(store_id, shared, metadata).await.unwrap();
+    let marker = serde_json::to_value(pimble_core::ShareMarker { v: pimble_core::ShareMarker::VERSION, key_id: share_key_id, url: env.stub_url.clone(), name: share_name.into() }).unwrap();
+    owner.edit_node(store_id, shared, "owner", |doc, now| doc.set_custom(pimble_core::custom_keys::SHARE, &marker, now)).await.unwrap();
 
     env.h_admin.set_scope(store_id, pimble_rpc::Scope { root: shared, doc_ids: under_it.to_vec() }, false).await.unwrap();
 
@@ -1521,8 +1520,7 @@ async fn a_readers_replica_reads_everything_and_writes_nothing() {
     refused(bob.delete_node(store_id, inside).await);
     let changes = base64::engine::general_purpose::STANDARD.encode(NodeDoc::from_plain_text("no").unwrap().save());
     refused(bob.apply_edit(store_id, inside, "bob", EditOperation::IncrementalChanges { changes }).await);
-    let metadata = bob.get_node(store_id, inside).await.unwrap().metadata;
-    refused(bob.update_node_metadata(store_id, inside, metadata).await);
+    refused(bob.edit_node(store_id, inside, "bob", |doc, now| doc.set_title("no", now)).await);
 
     // And still receives everything, a link's applies being no write of its own.
     seed_content(&alice, store_id, inside, "alice", "and potatoes").await;

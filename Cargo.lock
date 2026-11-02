@@ -4890,8 +4890,10 @@ name = "pimble-client"
 version = "0.15.1"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "jsonrpsee",
  "pimble-core",
+ "pimble-crdt",
  "pimble-rpc",
  "serde_json",
  "thiserror 2.0.21",

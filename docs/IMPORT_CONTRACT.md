@@ -56,7 +56,7 @@ first; the selected row shows its selection through it. Both apps (Joe, 2026-10-
   `store` (the CLI's `import-scrivener`) writes a tree into a new store on disk.
 - `BackendCommand::Import` carries the picked files to the backend, which parses them
   and writes the tree with `pimble_app::import::write`: per node `CreateNode`, `GetNode`,
-  then one `SetNodeContent` carrying the update that sets the node's type, explicit
+  then one `ApplyUpdate` (an answered `applyEdit`) carrying the update that sets the node's type, explicit
   title, icon, color, tags and blocks on the document the server made. These are the
   commands the app already writes with, routed as any other: through `process_command`
   on the desktop, and in the browser through the same routing as every command (the

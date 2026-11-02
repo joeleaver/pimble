@@ -551,9 +551,7 @@ async fn a_scoped_editor_reads_and_writes_exactly_its_scope() {
     // Writing: everything in scope, structure included; a create joins it.
     let created = member.create_node(store_id, Some(shared), "folder", "Made by Bob").await.expect("a create under the share");
     member.get_node(store_id, created).await.expect("the new node is in the scope at once");
-    let mut renamed = member.get_node(store_id, inside).await.unwrap().metadata;
-    renamed.title = "Renamed by Bob".into();
-    member.update_node_metadata(store_id, inside, renamed).await.expect("metadata in scope");
+    member.edit_node(store_id, inside, "bob-editor", |doc, now| doc.set_title("Renamed by Bob", now)).await.expect("metadata in scope");
     member.move_node(store_id, inside, created, Place::Last).await.expect("a move inside the scope");
     member.apply_edit(store_id, inside, "bob-editor", edit_of("typed by bob")).await.expect("an edit in scope");
     let by_edit = pimble_core::NodeId::new();
@@ -565,8 +563,7 @@ async fn a_scoped_editor_reads_and_writes_exactly_its_scope() {
     refused_as_no_grant(member.create_node(store_id, Some(root), "document", "x").await, "a create under the root");
     refused_as_no_grant(member.create_node(store_id, None, "document", "x").await, "a create with no parent is one under the root");
     refused_as_no_grant(member.create_node(store_id, Some(outside), "document", "x").await, "a create under a node outside");
-    let outside_meta = s.admin.get_node(store_id, outside).await.unwrap().metadata;
-    refused_as_no_grant(member.update_node_metadata(store_id, outside, outside_meta).await, "metadata outside");
+    refused_as_no_grant(member.edit_node(store_id, outside, "bob-editor", |doc, now| doc.set_title("x", now)).await, "metadata outside");
     refused_as_no_grant(member.move_node(store_id, inside, root, Place::Last).await, "a move out of the scope");
     refused_as_no_grant(member.move_node(store_id, outside, shared, Place::Last).await, "a move into the scope");
     refused_as_no_grant(member.delete_node(store_id, outside).await, "a delete outside");
@@ -693,10 +690,8 @@ async fn a_reader_is_refused_every_write_with_the_sentence_as_the_whole_message(
 
     for (who, reader) in [("a whole-store reader", &whole_reader), ("a share's reader", &share_reader)] {
         reader.get_node(store_id, inside).await.unwrap_or_else(|e| panic!("{who} reads: {e}"));
-        let metadata = reader.get_node(store_id, inside).await.unwrap().metadata;
         refused_as_read_only(reader.create_node(store_id, Some(shared), "document", "x").await, who);
-        refused_as_read_only(reader.update_node_metadata(store_id, inside, metadata).await, who);
-        refused_as_read_only(reader.set_node_content_bytes(store_id, inside, pimble_crdt::NodeDoc::from_plain_text("x").unwrap().save(), None).await, who);
+        refused_as_read_only(reader.edit_node(store_id, inside, "reader-editor", |doc, now| doc.set_title("x", now)).await, who);
         refused_as_read_only(reader.delete_node(store_id, inside).await, who);
         refused_as_read_only(reader.undelete_node(store_id, inside).await, who);
         refused_as_read_only(reader.move_node(store_id, inside, shared, Place::Last).await, who);

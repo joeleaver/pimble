@@ -21,7 +21,7 @@ use pimble_core::{AuthMethod, NodeId, RemoteEndpoint, StoreId, SyncState};
 use pimble_crdt::{NodeDoc, Tree};
 use pimble_rpc::{
     ApplyEditRequest, CreateNodeRequest, CreateStoreRequest, EditOperation, GetNodeRequest, NodeStateVector,
-    PimbleApiServer, StoreChangeKind, StoreChangedNotification, SyncNodesRequest, UpdateNodeContentRequest,
+    PimbleApiServer, StoreChangeKind, StoreChangedNotification, SyncNodesRequest,
 };
 use pimble_server::{PimbleServer, RpcHandler, ServerConfig};
 use pimble_store::StoreManager;
@@ -72,7 +72,7 @@ async fn resending_an_applied_content_edit_produces_no_notification_or_modified_
     let base = NodeDoc::from_plain_text("Hello").unwrap();
     let content_b64 = base64::engine::general_purpose::STANDARD.encode(base.save());
     handler
-        .update_node_content(&pimble_server::service_extensions(), UpdateNodeContentRequest { store_id, node_id, content: content_b64, client_id: None })
+        .apply_edit(&pimble_server::service_extensions(), ApplyEditRequest { store_id, node_id, client_id: "seed".into(), operation: EditOperation::IncrementalChanges { changes: content_b64 } })
         .await
         .unwrap();
 

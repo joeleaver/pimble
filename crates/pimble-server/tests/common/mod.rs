@@ -74,9 +74,7 @@ pub async fn child_ids(client: &PimbleClient, store_id: StoreId, node_id: NodeId
 }
 
 pub async fn rename(client: &PimbleClient, store_id: StoreId, node_id: NodeId, title: &str) {
-    let mut metadata = client.get_node(store_id, node_id).await.expect("the node to rename").metadata;
-    metadata.title = title.to_string();
-    client.update_node_metadata(store_id, node_id, metadata).await.expect("rename");
+    client.edit_node(store_id, node_id, "rename", |doc, now| doc.set_title(title, now)).await.expect("rename");
 }
 
 pub async fn seed_content(client: &PimbleClient, store_id: StoreId, node_id: NodeId, client_id: &str, text: &str) {

@@ -15,7 +15,7 @@ use pimble_crdt::{NodeDoc, Tree, TreeEdit};
 use pimble_rpc::{
     ApplyEditRequest, CreateNodeRequest, CreateStoreRequest, DeleteNodeRequest, EditOperation, GetChildrenRequest,
     GetNodeRequest, NodeStateVector, PimbleApiServer, StoreChangeKind, StoreChangedNotification, SyncNodesRequest,
-    UndeleteNodeRequest, UpdateNodeMetadataRequest,
+    UndeleteNodeRequest,
 };
 use pimble_server::RpcHandler;
 use pimble_store::StoreManager;
@@ -228,10 +228,13 @@ async fn a_tombstoned_node_is_gone_and_comes_back_on_undelete() {
     let folder = create(&handler, store_id, root_id, "folder", "Folder").await;
     let inner = create(&handler, store_id, folder, "document", "Inner").await;
     let other = create(&handler, store_id, root_id, "document", "Other").await;
-    let mut metadata = handler.get_node(&pimble_server::service_extensions(), GetNodeRequest { store_id, node_id: inner }).await.unwrap().node.metadata;
-    metadata.tags = vec!["kept".into()];
+    let content = handler.get_node(&pimble_server::service_extensions(), GetNodeRequest { store_id, node_id: inner }).await.unwrap().node.content;
+    let mut doc = NodeDoc::load(&content).unwrap();
+    let before = doc.state_vector();
+    doc.set_tags(&["kept".to_string()], T0).unwrap();
+    let changes = base64::engine::general_purpose::STANDARD.encode(doc.diff_since(&before).unwrap());
     handler
-        .update_node_metadata(&pimble_server::service_extensions(), UpdateNodeMetadataRequest { store_id, node_id: inner, metadata })
+        .apply_edit(&pimble_server::service_extensions(), ApplyEditRequest { store_id, node_id: inner, client_id: "tags".into(), operation: EditOperation::IncrementalChanges { changes } })
         .await
         .unwrap();
 

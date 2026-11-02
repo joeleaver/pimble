@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use pimble_core::{BlobId, BlobUrl, DeletedNode, LeftShare, MountRef, MountState, Node, NodeId, NodeMetadata, Place, RelaySide, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState, Workspace};
+use pimble_core::{BlobId, BlobUrl, DeletedNode, LeftShare, MountRef, MountState, Node, NodeId, Place, RelaySide, RemoteEndpoint, Store, StoreAccess, StoreId, StoreKind, SyncState};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -353,31 +353,6 @@ pub struct CreateNodeResponse {
     pub node_id: NodeId,
 }
 
-/// Request to update a node's metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateNodeMetadataRequest {
-    pub store_id: StoreId,
-    pub node_id: NodeId,
-    pub metadata: NodeMetadata,
-}
-
-/// Request to seed a node's content with a whole document snapshot. The
-/// snapshot is merged into the node's document like any update, so this is
-/// only right for a node whose content was never written (the importer): a
-/// snapshot that shares no history with the copies replicas hold merges in
-/// beside their paragraphs instead of replacing them. An edit of existing
-/// content is an `applyEdit`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateNodeContentRequest {
-    pub store_id: StoreId,
-    pub node_id: NodeId,
-    /// Base64-encoded yrs v1 update: a whole document snapshot
-    pub content: String,
-    /// Client ID for echo suppression in notifications
-    #[serde(default)]
-    pub client_id: Option<String>,
-}
-
 /// Request to delete a node
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteNodeRequest {
@@ -642,36 +617,6 @@ pub struct RemoveReplicaRequest {
     pub store_id: StoreId,
     #[serde(default)]
     pub force: bool,
-}
-
-// ============================================================================
-// Workspace Operations
-// ============================================================================
-
-/// Request to load a workspace
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoadWorkspaceRequest {
-    pub path: PathBuf,
-}
-
-/// Response after loading a workspace
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoadWorkspaceResponse {
-    pub workspace: Workspace,
-}
-
-/// Request to save a workspace
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SaveWorkspaceRequest {
-    pub workspace: Workspace,
-    pub path: PathBuf,
-}
-
-/// Request to create a new workspace
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateWorkspaceRequest {
-    pub name: String,
-    pub path: PathBuf,
 }
 
 // ============================================================================

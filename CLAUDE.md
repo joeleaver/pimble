@@ -177,10 +177,11 @@ Partial replication and TLS are not done. Contract:
 `add-remote-store`, `link-store`, `unlink-store`, `sync-state`, `remote-stores`,
 `remove-replica`, `mount-remote-store`, `move-node`, `delete-node`, `PIMBLE_SERVER`,
 `PIMBLE_TOKEN`. `set-node-text` is an `applyEdit` of `NodeDoc::replace_plain_text`
-(an edit of the node's existing document); `updateNodeContent` replaces the document
-wholesale and is only right for a node whose content was never written (the importer),
-since a replacement shares no history with the copies replicas hold and merges in beside
-the old paragraphs instead of replacing them.
+(an edit of the node's existing document). There is no `updateNodeContent` and no
+`updateNodeMetadata` (removed 2026-11-02, docs/API_CONTRACT.md wave 0): a rename, tags, an
+icon or a color is an `applyEdit` of the keys it names (`PimbleClient::edit_node`), and the
+importer and the editor's seed of an empty document send `ApplyUpdate`, an answered
+`applyEdit`.
 
 ### Hardening (done 2026-09-14)
 

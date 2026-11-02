@@ -322,8 +322,8 @@ pub trait PimbleApi {
 
 `EditOperation` (carried by `apply_edit` and relayed in `NodeContentChangedNotification`)
 has one active variant, `IncrementalChanges { changes: String }` — a base64-encoded yrs v1
-update (a delta or a reconciliation diff). Whole-document replacement goes through
-`updateNodeContent`, which seeds or replaces a node's content with a full snapshot.
+update (a delta or a reconciliation diff). It is the one way anything in a node is
+written; there is no whole-document replacement.
 
 **Server-side relay.** `apply_edit` merges the incoming update into the server's
 in-memory `ContentDoc` for that node, schedules a debounced flush to `nodes/{id}.yrs`

@@ -107,13 +107,9 @@ async fn start_server(token: Option<&str>) -> Server {
 /// Replace a mount node's `MountRef`, in the store that holds it, by
 /// rewriting the `mount_ref` custom metadata field the node carries.
 async fn repoint_mount(client: &PimbleClient, store_id: StoreId, mount_node: NodeId, mount_ref: &MountRef) {
-    let node = client.get_node(store_id, mount_node).await.expect("the mount node exists");
-    let mut metadata = node.metadata.clone();
-    metadata
-        .custom
-        .insert("mount_ref".to_string(), serde_json::to_value(mount_ref).unwrap());
+    let value = serde_json::to_value(mount_ref).unwrap();
     client
-        .update_node_metadata(store_id, mount_node, metadata)
+        .edit_node(store_id, mount_node, "repoint", |doc, now| doc.set_custom("mount_ref", &value, now))
         .await
         .expect("the mount node's metadata updates");
 }
