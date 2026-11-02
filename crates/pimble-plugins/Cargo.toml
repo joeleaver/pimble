@@ -4,16 +4,19 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "WASM plugin host and built-in plugins for Pimble"
+description = "Search units per node type for Pimble, and the WASM plugin host to come"
 
 [dependencies]
 pimble-core = { workspace = true }
 pimble-crdt = { workspace = true }
 pimble-sheet = { workspace = true }
 pimble-discussion = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-wasmtime = { workspace = true }
-thiserror = { workspace = true }
-anyhow = { workspace = true }
-tracing = { workspace = true }
+# The WASM host (docs/PLUGINS_CONTRACT.md wave 1) runs plugins on the desktop only.
+# Optional so the hosted server and the CLI, which run no plugins, stop compiling
+# wasmtime: it was about 12 minutes of every hosted build (docs/NEXT_SESSION.md 0a).
+wasmtime = { workspace = true, optional = true }
+
+[features]
+default = []
+# The WASM plugin host. Nothing turns it on yet; the desktop app will in plugin wave 1.
+wasm-host = ["dep:wasmtime"]

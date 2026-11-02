@@ -1346,7 +1346,9 @@ after "Copy as Mount Source" again.
    wasmtime (the plugin skeleton, `pimble-plugins`), and jkbase keeps no compile cache
    between builds, so every push costs about 12 minutes. Make wasmtime optional in
    `pimble-plugins` (the hosted server loads no plugins) and ask jkbase for a per-project
-   `target/` cache.
+   `target/` cache. The wasmtime half is done (2026-11-02, plugins wave 0): wasmtime is
+   behind `pimble-plugins`' `wasm-host` feature, off by default, and nothing links it.
+   The jkbase cache half stays.
 0b. **jkbase issues found on the first deploys** (Joe's platform, fix there): the trunk
    buildpack reads the wasm-bindgen version from the build-context root `Cargo.lock`, not
    the workspace containing `source` (both locks must agree for now); `[hosting]` is

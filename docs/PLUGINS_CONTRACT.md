@@ -139,6 +139,18 @@ first plugin.
 
 0. **wasmtime behind a feature** (hosted builds stop paying for it) and `NodePlugin`
    retired to the `index_units` registry.
+
+   **Built 2026-11-02 (branch `api`).** `pimble-plugins` is now `index_units_for(node_type,
+   content)` and `INDEXED_NODE_TYPES` (document, folder, canvas, sheet, discussion; the
+   units each gave before, unchanged), which the server's search index calls directly.
+   `NodePlugin`, `PluginHost`, `create_default_host`, `PluginInfo`, `NodeSchema`/
+   `SchemaField`/`FieldType`, `RenderOutput`, `PluginAction`, `ValidationResult`,
+   `PluginError` and the five placeholder built-ins are gone, with the crate's unused
+   serde, thiserror, anyhow and tracing dependencies; `pimble-search` no longer declares a
+   dependency on it. wasmtime is an optional dependency behind the `wasm-host` feature,
+   off by default and turned on by nothing until wave 1 (the desktop app):
+   `cargo tree -i wasmtime` finds it for none of `pimble-cli`, `pimble-server`,
+   `pimble-app`, `pimble-mcp` or the workspace as a whole.
 1. **The guest SDK and the desktop host with a toy plugin**: `RemoteDocument`, the op log,
    events, runtime hooks, epoch interruption, ABI/version checks; a "hello" viewer
    that renders rinch components and handles clicks and keys. The rinch gating PR.

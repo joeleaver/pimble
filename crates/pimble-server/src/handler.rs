@@ -52,7 +52,6 @@ use jsonrpsee::{Extensions, PendingSubscriptionSink, SubscriptionMessage};
 use pimble_client::{describe_connect_error, PimbleClient};
 use pimble_core::{AuthMethod, BlobUrl, LinkResolution, Node, MountRef, MAX_LINK_HOPS, MountState, NodeId, RelaySide, RemoteEndpoint, StoreAccess, StoreId, StoreKind, StoreLocation, SyncState};
 use pimble_crdt::{derive_changes, move_order, LinkHop, LinkWalk, NodeDoc, NodeUpdateEffect, Tree, TreeEdit};
-use pimble_plugins::PluginHost;
 use pimble_rpc::{
     encrypted_store_error, index_building_error, snapshot_required_error, to_rpc_error, ApplyEditRequest, ApplyEditResponse, ResolveLinkRequest, ResolveLinkResponse,
     GetBlobRequest, GetBlobResponse, HaveBlobsRequest, HaveBlobsResponse, PutBlobRequest, PutBlobResponse, BLOBS_IN_SHARES_REFUSAL, BLOB_CHUNK_BYTES, BLOB_NOT_HERE,
@@ -443,7 +442,6 @@ struct StoreIndexer {
     store_id: StoreId,
     index: Arc<SearchIndex>,
     store_manager: Arc<RwLock<StoreManager>>,
-    plugin_host: Arc<PluginHost>,
     /// Per-node debounce generation: `schedule_content_upsert` increments a
     /// node's counter and captures it; the sleeping task that follows only
     /// does the work if its captured value is still current when it wakes,
@@ -526,7 +524,7 @@ impl StoreIndexer {
                 Err(_) => return Ok(()),
             }
         };
-        let index_node = build_index_node(self.store_id, &node, &self.plugin_host);
+        let index_node = build_index_node(self.store_id, &node);
         self.index.upsert(&index_node)
     }
 }
@@ -580,18 +578,15 @@ fn index_title(node: &Node, content_text: &str) -> String {
 }
 
 /// Project a [`Node`] into the search index's [`IndexNode`]: its title and
-/// metadata, and its content's [`pimble_core::IndexUnit`]s from the node
-/// type's plugin (`NodeDoc::units()` for `document` nodes, via
-/// `DocumentPlugin`; `node.content` is the node document's bytes, title and
-/// text alike). A node type with no registered plugin (e.g. `mount`) indexes
-/// with no units/text. Its links are the `pimble:` link marks in its content,
+/// metadata, and its content's [`pimble_core::IndexUnit`]s for its node type
+/// ([`pimble_plugins::index_units_for`]: `NodeDoc::units()` and more for
+/// `document` nodes; `node.content` is the node document's bytes, title and
+/// text alike). A node type it does not know (e.g. `mount`) indexes with no
+/// units/text. Its links are the `pimble:` link marks in its content,
 /// whatever its type (docs/LINKS_CONTRACT.md "Where a link lives"): only those
 /// into `store_id`, since the index is per store.
-fn build_index_node(store_id: StoreId, node: &Node, plugin_host: &PluginHost) -> IndexNode {
-    let units = plugin_host
-        .get(&node.node_type)
-        .and_then(|plugin| plugin.index_units(&node.content).ok())
-        .unwrap_or_default();
+fn build_index_node(store_id: StoreId, node: &Node) -> IndexNode {
+    let units = pimble_plugins::index_units_for(&node.node_type, &node.content);
     let text = units
         .iter()
         .map(|u| u.text.as_str())
@@ -1017,9 +1012,6 @@ pub struct RpcHandler {
     flush_debouncer: Arc<FlushDebouncer>,
     /// Debounced tree repairs after merged structural updates (see [`Repair`]).
     repairs: Arc<RepairDebouncer>,
-    /// Built-in node-type plugins (document, folder), shared across every
-    /// store, used to project a node's content into `IndexUnit`s for search.
-    plugin_host: Arc<PluginHost>,
     /// One open `SearchIndex` per open store, under `<store dir>/index/rhypedb/`.
     /// Opened when a store opens, closed (removed) when it closes.
     indexes: Arc<RwLock<HashMap<StoreId, IndexHandle>>>,
@@ -1164,7 +1156,6 @@ impl RpcHandler {
             subscriptions: Arc::new(RwLock::new(SubscriptionRegistry::new())),
             flush_debouncer: Arc::new(FlushDebouncer::default()),
             repairs: Arc::new(RepairDebouncer::default()),
-            plugin_host: Arc::new(pimble_plugins::create_default_host()),
             indexes: Arc::new(RwLock::new(HashMap::new())),
             semantic_available,
             links: Arc::new(RwLock::new(HashMap::new())),
@@ -2545,7 +2536,6 @@ impl RpcHandler {
             store_id,
             index: Arc::clone(&index),
             store_manager: Arc::clone(&self.store_manager),
-            plugin_host: Arc::clone(&self.plugin_host),
             content_gen: Mutex::new(HashMap::new()),
             debounce_tasks: Arc::clone(&debounce_tasks),
         });
@@ -2598,7 +2588,7 @@ impl RpcHandler {
         let mut count = 0usize;
         while let Some(node_id) = stack.pop() {
             let node = manager.get_node(store_id, node_id)?;
-            let index_node = build_index_node(store_id, &node, &self.plugin_host);
+            let index_node = build_index_node(store_id, &node);
             index.upsert(&index_node)?;
             count += 1;
             if !node.is_mount() {
@@ -5326,9 +5316,7 @@ mod tests {
         node.id = me;
         node.content = content.save();
 
-        let mut plugins = PluginHost::new();
-        plugins.register(pimble_plugins::DocumentPlugin);
-        let indexed = build_index_node(here, &node, &plugins);
+        let indexed = build_index_node(here, &node);
         let mut want = vec![a, b];
         want.sort_by_key(|id| id.0);
         assert_eq!(indexed.links, want, "same store only, once each, never itself");

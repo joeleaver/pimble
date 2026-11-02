@@ -13,7 +13,6 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 pimble-crdt = { workspace = true }
-pimble-plugins = { workspace = true }
 rhypedb-engine = { workspace = true }
 rhypedb-schema = { workspace = true }
 rhypedb-query = { workspace = true }

@@ -59,7 +59,7 @@ the hosted server to this version together.
 | `pimble-store` | `LocalStore` (`nodes/{id}.yrs`, migration at open, partial replicas), vault stores (logs, snapshots, per-document keys, scope sets), `StoreManager` | Complete |
 | `pimble-rpc` / `pimble-server` / `pimble-client` | RPC protocol, embedded server, WebSocket client | Complete |
 | `pimble-search` | rhypedb index per store: keyword (`@fulltext`, BM25), chunked embeddings behind `semantic`, backlinks | Complete |
-| `pimble-plugins` | `NodePlugin` trait, built-ins | Skeleton |
+| `pimble-plugins` | `index_units_for`: search units per built-in node type; the WASM host (`docs/PLUGINS_CONTRACT.md`) to come behind the `wasm-host` feature, which pulls in wasmtime and is off by default | Search units done; host not started |
 | `pimble-app` | UI library (desktop and web) plus the `pimble` desktop binary | Works: two-window live editing, persistence, local and remote mounts, replica sync UI |
 | `pimble-cli` | server, stores, nodes, mounts, replica sync, search | Complete |
 | `pimble-mcp` | MCP server over stdio: an LLM reads, searches and writes the open stores through the local server, canvases included (`docs/MCP_CONTRACT.md`) | Built, Linux walk-through passed |

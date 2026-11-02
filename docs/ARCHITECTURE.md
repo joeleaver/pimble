@@ -37,7 +37,7 @@ pimble/
 │   ├── pimble-rpc/            # JSON-RPC protocol definitions
 │   ├── pimble-server/         # Local/remote server implementation
 │   ├── pimble-client/         # Client library for connecting to servers
-│   ├── pimble-plugins/        # WASM plugin host + built-in plugins
+│   ├── pimble-plugins/        # search units per node type; the WASM host to come
 │   ├── pimble-app/            # Rinch desktop application
 │   └── pimble-cli/            # CLI tool for debugging and admin
 ├── plugins/                   # Example/default WASM plugins
@@ -335,21 +335,12 @@ flush `store.yrs` immediately, and broadcast to the store's subscribers as a
 
 ### 7. Plugin System (`pimble-plugins`)
 
-WASM plugins define new node types.
-
-```rust
-pub trait NodePlugin: Send + Sync {
-    fn info(&self) -> PluginInfo;
-    fn node_type(&self) -> &str;
-    fn schema(&self) -> NodeSchema;
-    fn render(&self, content: &[u8]) -> Result<RenderOutput>;
-    fn extract_text(&self, content: &[u8]) -> Result<String>;
-    fn validate(&self, content: &[u8]) -> Result<ValidationResult>;
-    fn init_content(&self) -> Result<Vec<u8>>;
-}
-```
-
-Built-in plugins: `DocumentPlugin` (markdown), `FolderPlugin` (container).
+Today the crate is what search finds in a node: `index_units_for(node_type, content)` is
+the table of search units for the built-in node types (document, folder, canvas, sheet,
+discussion), which the server's search index reads. The WASM plugin host (guests running
+plain rinch over the Pimble API, on the desktop and in the browser) is designed in
+`docs/PLUGINS_CONTRACT.md` and built from its wave 1, behind the `wasm-host` feature, so
+only the desktop app compiles wasmtime.
 
 ---
 
@@ -737,7 +728,7 @@ via `listRemoteStores`.
 yrs = "0.27"                 # CRDT (node content and the store document)
 jsonrpsee = "0.24"           # JSON-RPC
 rinch = { git = "..." }      # UI framework
-wasmtime = "27"              # WASM runtime (Phase 8)
+wasmtime = "27"              # WASM runtime, pimble-plugins' `wasm-host` feature only
 ```
 
 ---

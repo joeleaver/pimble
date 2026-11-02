@@ -5088,15 +5088,10 @@ dependencies = [
 name = "pimble-plugins"
 version = "0.15.1"
 dependencies = [
- "anyhow",
  "pimble-core",
  "pimble-crdt",
  "pimble-discussion",
  "pimble-sheet",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tracing",
  "wasmtime",
 ]
 
@@ -5123,7 +5118,6 @@ dependencies = [
  "chrono",
  "pimble-core",
  "pimble-crdt",
- "pimble-plugins",
  "rhypedb-embed",
  "rhypedb-engine",
  "rhypedb-query",
