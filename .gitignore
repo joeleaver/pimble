@@ -49,3 +49,6 @@ scripts/local-stack/signup-helper/target/
 
 # Python bytecode (scripts/perf)
 __pycache__/
+
+# The plugins workspace (plugins/Cargo.toml) builds into its own target directory.
+/plugins/target/

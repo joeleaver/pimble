@@ -1,0 +1,13 @@
+[package]
+name = "stuck-viewer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "A test Pimble plugin whose button never returns, to check that the app stops it"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pimble-plugin-sdk = { path = "../../crates/pimble-plugin-sdk" }

@@ -1,0 +1,26 @@
+[package]
+name = "pimble-plugin-host"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Runs Pimble plugins: applies a guest's DOM op log to the app's document and routes events back"
+
+[dependencies]
+pimble-plugin-abi = { workspace = true }
+# The same rinch-core the app's rinch uses (git main, one package in the lock):
+# the host applies a guest's ops through the app's own `dyn DomDocument` and
+# registers its proxy handlers in the app's handler registries.
+rinch-core = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }
+tracing = { workspace = true }
+# The desktop engine. Off by default so that a build without it (the browser
+# app's, wave 3) compiles none of wasmtime; the desktop app turns it on.
+wasmtime = { workspace = true, optional = true }
+wasmtime-wasi = { workspace = true, optional = true }
+
+[features]
+default = []
+wasm-host = ["dep:wasmtime", "dep:wasmtime-wasi"]
+
+[dev-dependencies]
+rinch-core = { git = "https://github.com/joeleaver/rinch.git", branch = "main", features = ["test-util"] }

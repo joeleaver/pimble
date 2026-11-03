@@ -20,7 +20,12 @@ members = [
     "crates/pimble-sheet",
     "crates/pimble-discussion",
     "crates/pimble-api",
+    "crates/pimble-plugin-abi",
+    "crates/pimble-plugin-host",
 ]
+# The plugin SDK and the plugins are their own workspace (plugins/Cargo.toml): they
+# build for wasm32-wasip1 against a rinch branch until it merges.
+exclude = ["crates/pimble-plugin-sdk", "plugins"]
 
 [workspace.package]
 version = "0.15.1"
@@ -44,8 +49,10 @@ tokio = { version = "1.0", features = ["full"] }
 # JSON-RPC
 jsonrpsee = { version = "0.24", features = ["server", "client", "macros"] }
 
-# WASM runtime
-wasmtime = "27"
+# WASM runtime: the desktop app's plugin host (pimble-plugin-host's `wasm-host`).
+# wasmtime-wasi gives a plugin preview1 (clock, random, stderr) and nothing else.
+wasmtime = "47"
+wasmtime-wasi = "47"
 
 # Search and graph index engine (Joe's rhypedb). default-features off keeps the
 # ONNX/fastembed stack out; pimble-search's `semantic` feature turns it on.
@@ -111,3 +118,5 @@ pimble-board = { path = "crates/pimble-board" }
 pimble-sheet = { path = "crates/pimble-sheet" }
 pimble-discussion = { path = "crates/pimble-discussion" }
 pimble-api = { path = "crates/pimble-api" }
+pimble-plugin-abi = { path = "crates/pimble-plugin-abi" }
+pimble-plugin-host = { path = "crates/pimble-plugin-host" }

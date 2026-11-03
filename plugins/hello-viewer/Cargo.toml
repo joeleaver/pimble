@@ -1,0 +1,13 @@
+[package]
+name = "hello-viewer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "A toy Pimble plugin: the `hello` metanode viewer (docs/PLUGINS_CONTRACT.md wave 1)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pimble-plugin-sdk = { path = "../../crates/pimble-plugin-sdk" }

@@ -1,0 +1,27 @@
+[package]
+name = "pimble-plugin-sdk"
+version = "0.15.1"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Write a Pimble plugin: plain rinch in a wasm32-wasip1 guest"
+# A member of the plugins workspace (plugins/Cargo.toml), not the main one: it is
+# built against a rinch branch until that change merges (docs/PLUGINS_CONTRACT.md
+# wave 1), and two rinch packages in the main lock would make the documented
+# `cargo update rinch` ambiguous there.
+workspace = "../../plugins"
+
+[dependencies]
+pimble-plugin-abi = { path = "../pimble-plugin-abi" }
+# Components and theme only, nothing browser-specific: a wasm32-wasip1 guest runs
+# inside a host that is not a browser. The branch gates rinch's browser halves on
+# `target_os = "unknown"` (joeleaver/rinch#2088); back to `main` once it merges.
+rinch = { git = "https://github.com/joeleaver/rinch.git", branch = "wasi-guest-gating", default-features = false, features = [
+    "components",
+    "theme",
+] }
+
+[dev-dependencies]
+# rinch's headless document, to render the same component directly and through a
+# RemoteDocument and compare the trees.
+rinch-core = { git = "https://github.com/joeleaver/rinch.git", branch = "wasi-guest-gating", features = ["test-util"] }

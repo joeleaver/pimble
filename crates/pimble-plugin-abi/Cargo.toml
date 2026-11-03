@@ -1,0 +1,15 @@
+[package]
+name = "pimble-plugin-abi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "What crosses between a Pimble plugin (a wasm32-wasip1 guest) and its host, as postcard bytes"
+
+# No rinch and no wasmtime: the guest SDK and the host both depend on this crate,
+# and they are built against different rinch revisions (the SDK's points at a
+# branch until a rinch change merges, docs/PLUGINS_CONTRACT.md wave 1), so the
+# messages are plain data that each side translates to and from its own rinch.
+[dependencies]
+serde = { workspace = true }
+postcard = { version = "1", default-features = false, features = ["alloc"] }

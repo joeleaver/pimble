@@ -1,13 +1,13 @@
-//! What search finds in a node, per node type, and (later) the WASM plugin host.
+//! What search finds in a node, per node type.
 //!
 //! [`index_units_for`] is the registry of search units per built-in node type: the
 //! server's search index asks it for a node's [`IndexUnit`]s (the pieces the index
 //! chunks and embeds, see [`pimble_core::IndexUnit`]). It runs on the server, which runs
 //! no UI plugins, so it is a plain table of the built-in types rather than a plugin trait.
 //!
-//! The WASM plugin host (guests running plain rinch over the Pimble API) is designed in
-//! docs/PLUGINS_CONTRACT.md and is built from wave 1 on, behind the `wasm-host` feature
-//! so that only the desktop app compiles wasmtime.
+//! The WASM plugin host (guests running plain rinch over the Pimble API,
+//! docs/PLUGINS_CONTRACT.md) is `pimble-plugin-host`, whose wasmtime engine only the
+//! desktop app turns on.
 
 use pimble_core::{node_types, IndexUnit, UnitKind};
 use pimble_crdt::NodeDoc;
