@@ -154,6 +154,72 @@ first plugin.
 1. **The guest SDK and the desktop host with a toy plugin**: `RemoteDocument`, the op log,
    events, runtime hooks, epoch interruption, ABI/version checks; a "hello" viewer
    that renders rinch components and handles clicks and keys. The rinch gating PR.
+
+   **Built 2026-11-02 (branch `api`).** rinch: joeleaver/rinch#2088 (branch
+   `wasi-guest-gating`) gates the facade's browser halves on `target_os = "unknown"`, so a
+   `wasm32-wasip1` build with components and theme links no wasm-bindgen; only the SDK
+   points at it, the app stays on `main`. **`pimble-plugin-abi`** (main workspace, no
+   rinch): postcard messages (`Manifest`, `MountArgs`/`Props` with the metanode's address
+   and its forest, `Op`, `Event`/`EventData`, `Query`/`Answer`), `ABI_VERSION` 1, export and
+   import names all `pimble_`-prefixed (wasi-libc's `free` and libm's `log` would collide),
+   `HANDLER_ATTRIBUTES` (rinch's closed list of 25, with the handler kind each holds).
+   **`pimble-plugin-sdk`** (`crates/pimble-plugin-sdk`, a member of the new `plugins/`
+   workspace with its own lock, because it is on the rinch branch): `RemoteDocument`
+   (shadow tree answering structural reads and a small selector matcher; the op log flushed
+   at the end of every turn and before live value, layout, scroll, focus and selection
+   reads; `parse_html`/`set_inner_html` refused with a log line; `insert_child` sent as a
+   place by sibling, not an index), `Guest` (mount/dispatch/props/unmount, target
+   independent), the runtime hooks installed on first use as imports, a reactor
+   `_initialize` (without it the linker wraps every export in constructors and destructors),
+   and `plugin!(describe: .., view: ..)`. A plugin author writes a `describe()` with
+   `manifest(..).with(viewer(id, name, &[SourceShape::Any]))` and a view
+   `fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle` (props are a
+   `Signal<Props>`), and glob-imports the prelude (`rsx!` reaches rinch through it). The
+   build script records the rinch revision from the plugins lock. **`pimble-plugin-host`**
+   (main workspace; `wasm-host` turns on wasmtime 47 and wasmtime-wasi, which
+   `pimble-plugins` no longer carries): `Applier` (ops through rinch `NodeHandle`s over the
+   app's `dyn DomDocument`; the guest-to-host map is the sandbox: an unknown id, an id made
+   twice, `<style>`/`<script>`/`<link>`/... or touching its own area are refused and stop
+   the plugin; handler attributes become unowned host proxies calling the guest's
+   `dispatch`, keys and wheels answering synchronously, file drops not wired; the
+   desktop's text-field shim, which `rsx!` omits on any wasm32), `Instance` (engine
+   agnostic: imports reach it through a key, since wasmtime store data must be `Send`;
+   timers, tasks and poll drains as host `set_timeout`s; events arriving mid-call queued;
+   a failure stops it, clears what it built and calls `on_stop` with a sentence), and the
+   wasmtime engine (preview1 with inherited stderr only, one `Store` per instance, 256 MiB,
+   epoch interruption at 10 ms ticks with a 2 s turn budget, `Registry::load` of
+   `<data dir>/pimble/plugins/*.wasm` with the ABI check). **The rinch version check is
+   not what section 3.5 says:** rinch is 0.1.0 at every revision and revisions have no
+   order outside its repository, so the host checks the ABI exactly and only logs a
+   plugin built against another rinch revision; an exact match would refuse every plugin
+   at each pin move (open question for Joe). **App** (`crates/pimble-app/src/plugins.rs`,
+   desktop only): the folder loads off the UI thread at start; a pane opening a metanode
+   whose viewer a loaded plugin provides mounts it in a slot in `render_metanode` (props
+   updated in place as the forest changes); a refused plugin's viewer, or a plugin that
+   stopped, shows the outline under its sentence, and the stopped one is not restarted
+   while the pane shows that metanode. **Plugins:** `plugins/hello-viewer` (`hello`: the
+   metanode's title, the forest indented, a counting `Button`, a `TextInput` echoing what
+   is typed and the last key), `plugins/stuck-viewer` (`stuck`: a button that never
+   returns). **Tests:** abi 3; sdk 3 (`remote_vs_mock`: the same component straight into
+   `MockDomDocument` and through a `RemoteDocument` applied to another mock make the same
+   tree, and stay the same after clicks, new props and typing; a host-only read flushes
+   first; selectors); host 9 (ABI refusal sentence; applier: tree, translated handlers both
+   ways, discard releasing proxies, the sandbox refusals, a refused op stopping the plugin
+   and clearing it, unmount; wasm with hand-written WAT guests: a manifest for ABI 2
+   refused at load and in a folder, a looping guest interrupted at a 200 ms budget with
+   the notice, a guest naming node 0 stopped; and the built hello plugin over a mock
+   document taking a click, typing, a key and new props, skipped with a line when it is
+   not built). **Checked in the release desktop app** (port 7491, scratch dirs, a copy of
+   the family store, both `.wasm` files in the scratch plugins folder): MEDICAL set to
+   `hello` two levels deep through the MCP's `set_metanode` opened as the plugin's view
+   with the 62-node forest; three clicks read "Clicked 3 times"; typing "hi plug" echoed
+   with "Last key: g"; setting `stuck` from the MCP switched the open pane in place;
+   "Hang" was stopped after 2 s with "The Stuck viewer plugin was stopped: it ran too long
+   without answering." over the outline. Not checked: the browser (no host there yet; it
+   compiles), a refused plugin in the app (tested in the host), menus or modals portaled
+   to the plugin's body. Known limits: a plugin's markup is styled by the app's theme;
+   fixed-position content is not clipped to the pane; queued (non-key) events wait for the
+   running call; no `GuestBackend` yet, so a plugin cannot read or write anything.
 2. **The API bridge**: `GuestBackend`, call/resolve, the change stream, attribution,
    install-time permissions.
 3. **The browser host**: the same plugin running in the web app.

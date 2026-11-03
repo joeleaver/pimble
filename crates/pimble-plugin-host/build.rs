@@ -22,9 +22,12 @@ fn main() {
             .ancestors()
             .map(|dir| dir.join("Cargo.lock"))
             .chain(Path::new(&manifest).ancestors().map(|dir| dir.join("Cargo.lock")))
-            .find(|p| p.is_file())?;
-        println!("cargo:rerun-if-changed={}", lock.display());
-        rinch_revision(&std::fs::read_to_string(lock).ok()?)
+            // The first lock that pins rinch: a build directory can sit under
+            // some other project's lock that does not.
+            .filter(|p| p.is_file())
+            .find_map(|p| Some((rinch_revision(&std::fs::read_to_string(&p).ok()?)?, p)))?;
+        println!("cargo:rerun-if-changed={}", lock.1.display());
+        Some(lock.0)
     });
     println!("cargo:rustc-env=PIMBLE_RINCH_REVISION={}", revision.unwrap_or_else(|| "unknown".into()));
 }

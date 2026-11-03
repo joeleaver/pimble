@@ -58,6 +58,10 @@ pub mod text_boards;
 pub mod toolbar;
 #[cfg(feature = "native")]
 pub mod update;
+/// Plugins on the desktop (docs/PLUGINS_CONTRACT.md wave 1): the plugins folder
+/// and the metanode viewers they provide. The browser runs none yet (wave 3).
+#[cfg(feature = "native")]
+pub mod plugins;
 pub mod tree_drop;
 pub mod tree_keys;
 pub mod tree_view;

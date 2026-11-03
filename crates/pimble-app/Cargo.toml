@@ -75,6 +75,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 ed25519-dalek = { version = "2.2", optional = true }
 semver = { version = "1", optional = true }
 dirs = { version = "6", optional = true }
+# Runs plugins (docs/PLUGINS_CONTRACT.md): the op log applier and, with its
+# `wasm-host` feature, the wasmtime engine. Desktop only until the browser host
+# (wave 3).
+pimble-plugin-host = { workspace = true, optional = true }
 # Merging an agent into ChatGPT / Codex's config.toml with its comments kept
 # (docs/AGENTS_CONTRACT.md section 6).
 toml_edit = "0.20"
@@ -126,6 +130,8 @@ native = [
     "dep:ed25519-dalek",
     "dep:semver",
     "dep:dirs",
+    "dep:pimble-plugin-host",
+    "pimble-plugin-host/wasm-host",
     "rinch/desktop",
     # GPU rendering (vello over wgpu). The CPU renderer repaints the whole window
     # on the CPU after every layout change, about 100 ms a frame at 3840x2160.

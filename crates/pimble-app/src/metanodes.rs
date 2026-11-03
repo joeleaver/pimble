@@ -1,8 +1,10 @@
-//! A metanode in a pane (docs/METANODES_CONTRACT.md wave 1): a node set to be
-//! shown by a viewer. No viewers exist yet (they come with plugins, wave 2),
-//! so a pane opening one shows the fallback every app without the viewer
-//! shows: the source's forest as an outline, with one line naming the
-//! viewer. A row opens its node in the pane, as the explorer's does.
+//! A metanode in a pane (docs/METANODES_CONTRACT.md): a node set to be shown by
+//! a viewer. On the desktop, a viewer an installed plugin provides is mounted in
+//! the pane (`crate::plugins`, docs/PLUGINS_CONTRACT.md wave 1). Otherwise the
+//! pane shows the fallback every app without the viewer shows: the source's
+//! forest as an outline, with one line naming the viewer, or saying why its
+//! plugin is not running. A row opens its node in the pane, as the explorer's
+//! does.
 //!
 //! The forest comes from the API (`Pimble::metanode_source`, asked with
 //! `BackendCommand::GetMetanode`) and is asked again whenever a change the
@@ -47,11 +49,18 @@ pub struct MetanodeUi {
     pub lines: Signal<Vec<String>>,
     /// The forest has been read at least once since the pane opened it.
     pub loaded: Signal<bool>,
+    /// A plugin's view is in the pane, in place of the outline.
+    pub plugin: Signal<bool>,
 }
 
 impl MetanodeUi {
     pub fn new() -> Self {
-        Self { rows: Signal::new(Vec::new()), lines: Signal::new(Vec::new()), loaded: Signal::new(false) }
+        Self {
+            rows: Signal::new(Vec::new()),
+            lines: Signal::new(Vec::new()),
+            loaded: Signal::new(false),
+            plugin: Signal::new(false),
+        }
     }
 }
 
@@ -113,6 +122,9 @@ pub(crate) fn stop(store: AppStore, pane: PaneId) {
     state.show_metanode.set(false);
     state.metanode_ui.rows.set(Vec::new());
     state.metanode_ui.lines.set(Vec::new());
+    state.metanode_ui.plugin.set(false);
+    #[cfg(feature = "native")]
+    crate::plugins::hide(pane);
     let key = (held.store_id, held.node_id);
     if showing(store, key).is_empty() {
         FORESTS.with(|f| f.borrow_mut().remove(&key));
@@ -200,8 +212,13 @@ fn fill(store: AppStore, pane: PaneId, forest: Result<&Forest, &str>) {
         }
     };
     let mut lines = Vec::new();
+    let mut plugin = false;
     if let Some(spec) = &forest.spec {
-        lines.push(outline_line(&spec.viewer));
+        match viewer(store, pane, &spec.viewer, forest) {
+            Viewer::Plugin => plugin = true,
+            Viewer::Outline(sentence) => lines.push(sentence),
+            Viewer::Missing => lines.push(outline_line(&spec.viewer)),
+        }
     }
     if let Some(why) = forest.not_understood() {
         lines.push(why.to_string());
@@ -221,6 +238,58 @@ fn fill(store: AppStore, pane: PaneId, forest: Result<&Forest, &str>) {
     ui.lines.set(lines);
     ui.rows.set(rows);
     ui.loaded.set(true);
+    ui.plugin.set(plugin);
+}
+
+/// What a pane shows for a metanode's viewer.
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
+enum Viewer {
+    /// The plugin providing it, mounted in the pane.
+    Plugin,
+    /// The outline, under this sentence (its plugin was refused or stopped).
+    Outline(String),
+    /// The outline, under the line naming the missing viewer.
+    Missing,
+}
+
+#[cfg(feature = "native")]
+fn viewer(store: AppStore, pane: PaneId, viewer: &str, forest: &Forest) -> Viewer {
+    match crate::plugins::show(store, pane, viewer, forest) {
+        crate::plugins::Outcome::Shown => Viewer::Plugin,
+        crate::plugins::Outcome::Outline(sentence) => Viewer::Outline(sentence),
+        crate::plugins::Outcome::Missing => Viewer::Missing,
+    }
+}
+
+/// The browser runs no plugins yet (docs/PLUGINS_CONTRACT.md wave 3).
+#[cfg(not(feature = "native"))]
+fn viewer(_store: AppStore, _pane: PaneId, _viewer: &str, _forest: &Forest) -> Viewer {
+    Viewer::Missing
+}
+
+/// The plugin in pane `pane` stopped by itself (it ran too long, was refused or
+/// trapped): the pane shows the outline, under the sentence saying so.
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
+pub(crate) fn plugin_stopped(store: AppStore, pane: PaneId, sentence: &str) {
+    let ui = store.pane(pane).metanode_ui;
+    ui.plugin.set(false);
+    ui.lines.update(|lines| {
+        lines.retain(|l| l != sentence);
+        lines.insert(0, sentence.to_string());
+    });
+}
+
+/// The plugins folder finished loading: every pane showing a metanode looks for
+/// its viewer again.
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
+pub(crate) fn plugins_ready(store: AppStore) {
+    for pane in PaneId::ALL {
+        let Some(held) = untracked(|| store.pane(pane).metanode.get()) else { continue };
+        let forest = FORESTS.with(|f| f.borrow().get(&(held.store_id, held.node_id)).cloned());
+        if let Some(forest) = forest {
+            fill(store, pane, Ok(&forest));
+        }
+    }
 }
 
 /// The icon a row shows: the node's own, or its type's as the explorer
@@ -255,6 +324,13 @@ pub(crate) fn render_metanode(__scope: &mut RenderScope, store: AppStore, pane: 
             (row, color.clone(), color)
         }).collect::<Vec<_>>()
     };
+    // A plugin's view goes here (`crate::plugins`); the outline is hidden while it
+    // shows.
+    #[cfg(feature = "native")]
+    let plugin_slot = Some(crate::plugins::render_slot(__scope, pane, ui.plugin));
+    #[cfg(not(feature = "native"))]
+    let plugin_slot: Option<NodeHandle> = None;
+    let drawn = move || if ui.plugin.get() { Vec::new() } else { drawn() };
     rsx! {
         div {
             class: "pimble-metanode",
@@ -266,9 +342,10 @@ pub(crate) fn render_metanode(__scope: &mut RenderScope, store: AppStore, pane: 
                     {line.clone()}
                 }
             }
+            {plugin_slot}
             div {
                 class: "pimble-metanode__empty",
-                style: {move || if ui.loaded.get() && ui.rows.with(|r| r.is_empty()) { "" } else { "display: none;" }},
+                style: {move || if ui.loaded.get() && !ui.plugin.get() && ui.rows.with(|r| r.is_empty()) { "" } else { "display: none;" }},
                 "Nothing to show here yet."
             }
             for item in drawn() {

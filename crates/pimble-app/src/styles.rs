@@ -2429,6 +2429,12 @@ pub(crate) const APP_CSS: &str = "
     border-radius: 4px;
 }
 
+.pimble-metanode__plugin {
+    /* A plugin's view (plugins.rs): its menus and modals portal to this area, so
+       it is their containing box. */
+    position: relative;
+}
+
 .pimble-metanode__empty {
     padding: 8px 12px;
     font-size: 13px;
