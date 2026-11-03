@@ -393,8 +393,10 @@ struct PluginRow {
     name: String,
     /// What it provides and asks for, or why it does not run.
     line: String,
-    /// What it is allowed, when anything.
-    allowed: Option<String>,
+    /// What it is allowed here, or that it needs nothing.
+    note: String,
+    /// It was allowed something here, which "Revoke" takes back.
+    revocable: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -434,24 +436,22 @@ fn rows(store: AppStore) -> Vec<PluginRow> {
             };
             let line = format!("{} {}: the {} viewer; {asks}.", m.name, m.version, viewers.join(", "));
             let approval = approval_of(&m.id);
-            let allowed = match &approval.stores {
-                Approved::Nothing => None,
-                stores => {
-                    let what = match stores {
-                        Approved::All => "all your stores".to_string(),
-                        Approved::Only(ids) => ids.iter().map(|id| store_name(store, *id)).collect::<Vec<_>>().join(", "),
-                        Approved::Nothing => unreachable!(),
-                    };
-                    let verb = if approval.write { "read and change" } else { "read" };
-                    Some(format!("Allowed to {verb} {what} on this device."))
+            let verb = if approval.write { "read and change" } else { "read" };
+            let (note, revocable) = match &approval.stores {
+                Approved::All => (format!("Allowed to {verb} all your stores on this device."), true),
+                Approved::Only(ids) => {
+                    let names = ids.iter().map(|id| store_name(store, *id)).collect::<Vec<_>>().join(", ");
+                    (format!("Allowed to {verb} {names} on this device."), true)
                 }
+                Approved::Nothing if m.asks.asks_anything() => ("Not allowed anything yet.".to_string(), false),
+                Approved::Nothing => ("It needs nothing allowed.".to_string(), false),
             };
-            PluginRow { id: m.id.clone(), name: m.name.clone(), line, allowed }
+            PluginRow { id: m.id.clone(), name: m.name.clone(), line, note, revocable }
         })
         .collect();
     for refused in &registry.refused {
         let file = refused.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
-        rows.push(PluginRow { id: String::new(), name: file, line: refused.sentence.clone(), allowed: None });
+        rows.push(PluginRow { id: String::new(), name: file, line: refused.sentence.clone(), note: String::new(), revocable: false });
     }
     rows
 }
@@ -479,7 +479,7 @@ pub(crate) fn render_modal(__scope: &mut RenderScope, store: AppStore) -> NodeHa
                 }
                 for row in ui.rows.get() {
                     div {
-                        key: format!("{} {} {:?}", row.id, row.name, row.allowed),
+                        key: format!("{} {} {} {}", row.id, row.name, row.note, row.revocable),
                         class: "pimble-plugins__row",
                         style: "display: flex; gap: 12px; align-items: center;",
                         div {
@@ -487,10 +487,10 @@ pub(crate) fn render_modal(__scope: &mut RenderScope, store: AppStore) -> NodeHa
                             div { style: "font-size: 13px;", {row.line.clone()} }
                             div {
                                 style: "font-size: 12px; color: var(--rinch-color-dimmed);",
-                                {row.allowed.clone().unwrap_or_else(|| if row.id.is_empty() { String::new() } else { "Not allowed anything yet.".to_string() })}
+                                {row.note.clone()}
                             }
                         }
-                        if row.allowed.is_some() {
+                        if row.revocable {
                             Button {
                                 variant: "default",
                                 size: "xs",
