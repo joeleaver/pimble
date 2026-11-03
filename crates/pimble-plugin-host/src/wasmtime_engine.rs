@@ -216,6 +216,7 @@ pub struct WasmGuest {
     drain_polls: TypedFunc<(), i64>,
     resolve: TypedFunc<(u32, u32), ()>,
     host_state: TypedFunc<(u32, u32), ()>,
+    drag_ended: TypedFunc<(), ()>,
     budget_ticks: u64,
 }
 
@@ -261,6 +262,7 @@ impl WasmGuest {
             drain_polls: export(&mut store, &instance, exports::DRAIN_POLLS)?,
             resolve: export(&mut store, &instance, exports::RESOLVE)?,
             host_state: export(&mut store, &instance, exports::HOST_STATE)?,
+            drag_ended: export(&mut store, &instance, exports::DRAG_ENDED)?,
             memory,
             store,
             budget_ticks,
@@ -332,6 +334,10 @@ impl WasmGuest {
             }
             Call::HostState(bytes) => {
                 self.with_input(bytes, |g, p, l| g.host_state.call(&mut g.store, (p, l)))?;
+                Answered::Done
+            }
+            Call::DragEnded => {
+                self.drag_ended.call(&mut self.store, ())?;
                 Answered::Done
             }
         })

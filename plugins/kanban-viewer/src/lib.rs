@@ -443,6 +443,17 @@ const COLUMNS_STYLE: &str = "display: flex; gap: 12px; align-items: flex-start; 
 const COLUMN_LIST_STYLE: &str = "display: flex; flex-direction: row; gap: 12px; align-items: flex-start; flex-shrink: 0; max-height: 100%; position: relative;";
 const COLUMN_STYLE: &str = "display: flex; flex-direction: column; gap: 6px; width: 260px; flex-shrink: 0; padding: 8px; border-radius: 8px; background: var(--rinch-color-default-hover, rgba(127,127,127,0.08)); max-height: 100%; overflow-y: auto; box-sizing: border-box; position: relative;";
 const CARD_LIST_STYLE: &str = "display: flex; flex-direction: column; gap: 6px; min-height: 28px; position: relative;";
+/// The caret and the refusal box in the app's own theme colors, through the
+/// properties rinch's sortable stylesheet reads (a plugin cannot add a
+/// stylesheet; custom properties set inline here are inherited by the boxes
+/// the lists draw).
+const SORT_THEME: &str = " --rinch-sortable-caret-color: var(--rinch-primary-color); --rinch-sortable-refused-color: var(--rinch-color-red-6); --rinch-sortable-reason-bg: var(--rinch-color-red-6); --rinch-sortable-reason-color: var(--rinch-color-white, #ffffff); --rinch-sortable-reason-font-size: 12px; --rinch-sortable-reason-radius: 4px; --rinch-sortable-reason-white-space: normal; --rinch-sortable-reason-max-width: 220px; --rinch-sortable-dragging-opacity: 0.45;";
+
+/// The keys that lift a focused card or column for a keyboard move: Space
+/// only, so Enter stays "open the card", as everywhere else in Pimble.
+fn lift_keys() -> Vec<String> {
+    vec![" ".to_string()]
+}
 const HEADER_STYLE: &str = "display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 13px; padding: 2px 4px; border-radius: 4px; cursor: pointer;";
 const FIELD_STYLE: &str = "width: 100%; box-sizing: border-box; font: inherit; padding: 2px 4px;";
 const ADD_STYLE: &str = "font-size: 12px; color: var(--rinch-color-dimmed); padding: 4px; cursor: pointer; border-radius: 4px;";
@@ -564,27 +575,14 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
             div {
                 class: "kanban__columns",
                 style: COLUMNS_STYLE,
-                // The columns, dragged by their headers along the board.
-                SortableList {
-                    group: COLUMNS,
-                    id: metanode_key.clone(),
-                    axis: SortAxis::Horizontal,
-                    label: "Columns",
-                    class: "kanban__column-list",
-                    style: COLUMN_LIST_STYLE,
-                    judge: Some(judge.clone()),
-                    ondrop: move |m: SortMove| kd.drop_move(m),
-                    for column in board.get().columns {
-                        SortableItem {
-                            key: format!("{column:?}"),
-                            value: key_of(column.addr),
-                            handle: true,
-                            label: column.label.clone(),
-                            class: "kanban__column",
-                            style: COLUMN_STYLE,
-                            {render_column(__scope, &kcol, column.clone(), judge.clone())}
-                        }
-                    }
+                // The columns, dragged by their headers along the board. A
+                // list's props are read when it is drawn, so it is drawn again
+                // when the board's writability changes (the board reads as not
+                // writable until its first read).
+                if board.with(|b| b.writable) {
+                    {column_list(__scope, &kcol, &metanode_key, judge.clone(), true)}
+                } else {
+                    {column_list(__scope, &kd, &metanode_key, judge.clone(), false)}
                 }
                 if board.with(|b| b.writable) {
                     div {
@@ -599,6 +597,39 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
     }
 }
 
+/// The board's columns, a horizontal sortable list dragged by the headers;
+/// `writable` is the board's (a board the person may only read takes no
+/// drags at all).
+fn column_list(__scope: &mut RenderScope, k: &Kanban, metanode_key: &str, judge: SortJudge, writable: bool) -> NodeHandle {
+    let (board, kd, kcol) = (k.board, k.clone(), k.clone());
+    rsx! {
+        SortableList {
+            group: COLUMNS,
+            id: metanode_key.to_string(),
+            axis: SortAxis::Horizontal,
+            label: "Columns",
+            class: "kanban__column-list",
+            style: format!("{COLUMN_LIST_STYLE}{SORT_THEME}"),
+            disabled: !writable,
+            lift_keys: lift_keys(),
+            judge: Some(judge.clone()),
+            ondrop: move |m: SortMove| kd.drop_move(m),
+            for column in board.get().columns {
+                SortableItem {
+                    key: format!("{column:?}"),
+                    value: key_of(column.addr),
+                    handle: true,
+                    disabled: !(column.writable && writable),
+                    label: column.label.clone(),
+                    class: "kanban__column",
+                    style: COLUMN_STYLE,
+                    {render_column(__scope, &kcol, column.clone(), judge.clone(), writable)}
+                }
+            }
+        }
+    }
+}
+
 /// How the board's lists judge a drop ([`Kanban::judge_drop`]).
 fn drop_judge(k: &Kanban) -> SortJudge {
     let k = k.clone();
@@ -607,7 +638,7 @@ fn drop_judge(k: &Kanban) -> SortJudge {
 
 /// One column: its header (renamed in place, its people; what a column is
 /// dragged by), its cards (a sortable list of their own), "+ Add card".
-fn render_column(__scope: &mut RenderScope, k: &Kanban, column: board::Column, judge: SortJudge) -> NodeHandle {
+fn render_column(__scope: &mut RenderScope, k: &Kanban, column: board::Column, judge: SortJudge, board_writable: bool) -> NodeHandle {
     let addr = column.addr;
     let seen = k.host.seen();
     let color = column.color.clone();
@@ -669,7 +700,7 @@ fn render_column(__scope: &mut RenderScope, k: &Kanban, column: board::Column, j
         }
     };
     // A column is dragged by its header, when the person may move it.
-    let movable = untracked(|| k.board.with(|b| b.writable)) && writable;
+    let movable = board_writable && writable;
     let header = if movable { rsx! { SortableHandle { {header} } } } else { header };
     let cards: Vec<NodeHandle> = column.cards.iter().map(|card| render_card(__scope, k, &column, card.clone())).collect();
     let can_add = column.writable;
@@ -683,7 +714,12 @@ fn render_column(__scope: &mut RenderScope, k: &Kanban, column: board::Column, j
                 id: key_of(addr),
                 label: column.label.clone(),
                 class: "kanban__cards",
-                style: CARD_LIST_STYLE,
+                style: format!("{CARD_LIST_STYLE}{SORT_THEME}"),
+                // A read-only board takes no drags; a read-only column on a
+                // writable board still judges a drop into it, so the caret says
+                // why not ("You can read this, not change it.").
+                disabled: !board_writable,
+                lift_keys: lift_keys(),
                 judge: Some(judge),
                 ondrop: move |m: SortMove| kd.drop_move(m),
                 {cards}
@@ -829,11 +865,11 @@ fn render_card(__scope: &mut RenderScope, k: &Kanban, column: &board::Column, ca
         }
     };
     // The whole card drags (a press that never moves 5 px stays a click);
-    // a card the person may only read has no handle, so it does not.
+    // a card the person may only read does not.
     rsx! {
         SortableItem {
             value: key_of(addr),
-            handle: !writable,
+            disabled: !writable,
             label: item_label,
             class: "kanban__card-item",
             style: "position: relative;",

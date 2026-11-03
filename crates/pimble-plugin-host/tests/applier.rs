@@ -88,36 +88,70 @@ fn ops_build_the_tree_under_the_container_and_handlers_are_translated() {
 }
 
 #[test]
-fn a_drag_start_that_hides_the_ghost_hides_the_hosts() {
-    // A sortable list's drag start calls `suppress_drag_ghost` in the guest's
-    // own rinch, which nothing paints: the guest answers the flag and the
-    // host's proxy hides the window's ghost.
+fn a_drag_source_marked_ghostless_hides_the_hosts_ghost() {
+    // A sortable list's item is marked `data-drag-ghost="false"`: it draws its
+    // own feedback. The guest's `suppress_drag_ghost` reaches only its own
+    // rinch, so the host's proxy reads the mark and hides the window's ghost.
     let (doc, dyn_doc, container) = document();
-    let mut applier = Applier::new(
-        dyn_doc,
-        container,
-        Rc::new(|event: Event| if event.handler == 7 { pimble_plugin_abi::dispatched::HIDE_DRAG_GHOST } else { 0 }),
-        ApplierOptions::default(),
-    );
+    let mut applier = Applier::new(dyn_doc, container, Rc::new(|_| 0), ApplierOptions::default());
     applier
         .apply(vec![
             element(2, "div"),
-            Op::SetAttribute { node: 2, name: "draggable".into(), value: "true".into() },
-            Op::SetAttribute { node: 2, name: "data-ondragstart".into(), value: "7".into() },
-            Op::SetAttribute { node: 2, name: "data-ondragend".into(), value: "8".into() },
+            Op::SetAttribute { node: 2, name: "data-drag-ghost".into(), value: "false".into() },
+            element(3, "div"),
+            Op::SetAttribute { node: 3, name: "draggable".into(), value: "true".into() },
+            Op::SetAttribute { node: 3, name: "data-ondragstart".into(), value: "7".into() },
+            Op::Append { parent: 2, child: 3 },
+            element(4, "div"),
+            Op::SetAttribute { node: 4, name: "data-ondragstart".into(), value: "8".into() },
+            Op::Append { parent: GUEST_BODY, child: 2 },
+            Op::Append { parent: GUEST_BODY, child: 4 },
+        ])
+        .unwrap();
+    let handler = |guest: u64| {
+        let node = applier.host_node(guest).unwrap();
+        EventHandlerId(doc.borrow().get_attribute(node, "data-ondragstart").unwrap().parse().unwrap())
+    };
+    // `draggable` is plain data and passes through as written.
+    assert_eq!(doc.borrow().get_attribute(applier.host_node(3).unwrap(), "draggable").as_deref(), Some("true"));
+    rinch_core::events::reset_drag_ghost_visibility();
+    assert!(dispatch_event(handler(4)));
+    assert!(rinch_core::events::is_drag_ghost_visible(), "an unmarked source keeps the ghost");
+    assert!(dispatch_event(handler(3)));
+    assert!(!rinch_core::events::is_drag_ghost_visible());
+    rinch_core::events::reset_drag_ghost_visibility();
+}
+
+#[test]
+fn a_key_names_the_guest_node_it_was_sent_to() {
+    // An element handler hears keys typed in the fields inside it: the event
+    // names the focused element in the guest's ids, so a sortable item tells a
+    // Space typed in a field from one meant to lift it.
+    let (doc, dyn_doc, container) = document();
+    let seen: Rc<RefCell<Vec<Event>>> = Rc::default();
+    let sink = seen.clone();
+    let mut applier = Applier::new(dyn_doc, container, Rc::new(move |e: Event| { sink.borrow_mut().push(e); 0 }), ApplierOptions::default());
+    applier
+        .apply(vec![
+            element(2, "div"),
+            Op::SetAttribute { node: 2, name: "data-onkeydown".into(), value: "9".into() },
+            element(3, "input"),
+            Op::Append { parent: 2, child: 3 },
             Op::Append { parent: GUEST_BODY, child: 2 },
         ])
         .unwrap();
     let item = applier.host_node(2).unwrap();
-    let handler = |attr: &str| EventHandlerId(doc.borrow().get_attribute(item, attr).unwrap().parse().unwrap());
-    // `draggable` is plain data and passes through as written.
-    assert_eq!(doc.borrow().get_attribute(item, "draggable").as_deref(), Some("true"));
-    rinch_core::events::reset_drag_ghost_visibility();
-    assert!(dispatch_event(handler("data-ondragend")));
-    assert!(rinch_core::events::is_drag_ghost_visible());
-    assert!(dispatch_event(handler("data-ondragstart")));
-    assert!(!rinch_core::events::is_drag_ghost_visible());
-    rinch_core::events::reset_drag_ghost_visibility();
+    let keys = EventHandlerId(doc.borrow().get_attribute(item, "data-onkeydown").unwrap().parse().unwrap());
+    let target = |seen: &Rc<RefCell<Vec<Event>>>| match &seen.borrow().last().unwrap().data {
+        EventData::Key(k) => k.target,
+        other => panic!("{other:?}"),
+    };
+    doc.borrow_mut().focus_element(applier.host_node(3).unwrap());
+    dispatch_key_handler(keys, &KeyEventData::new(" ", "Space"));
+    assert_eq!(target(&seen), Some(3));
+    doc.borrow_mut().focus_element(item);
+    dispatch_key_handler(keys, &KeyEventData::new(" ", "Space"));
+    assert_eq!(target(&seen), Some(2));
 }
 
 #[test]

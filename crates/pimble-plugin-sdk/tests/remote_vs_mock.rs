@@ -271,7 +271,7 @@ fn a_component_renders_the_same_tree_through_a_remote_document() {
     let input: u64 = remote.borrow().get_attribute(field, "data-oninput").unwrap().parse().unwrap();
     guest.dispatch(Event { handler: input, data: EventData::Input { value: "hi".into(), node: Some(field.0) } });
     let keys: u64 = remote.borrow().get_attribute(field, "data-onkeydown").unwrap().parse().unwrap();
-    let key = |k: &str| Key { key: k.into(), code: k.into(), modifiers: Modifiers::default(), up: false };
+    let key = |k: &str| Key { key: k.into(), code: k.into(), modifiers: Modifiers::default(), up: false, target: None };
     assert!(!guest.dispatch(Event { handler: keys, data: EventData::Key(key("a")) }));
     assert!(guest.dispatch(Event { handler: keys, data: EventData::Key(key("Escape")) }));
     let shown = render(&*host.doc.borrow(), host.doc.borrow().body());

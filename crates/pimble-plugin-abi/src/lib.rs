@@ -69,6 +69,12 @@ pub mod exports {
     pub const PROPS_CHANGED: &str = "pimble_props_changed";
     /// `()`: take the view down and drop what it holds.
     pub const UNMOUNT: &str = "pimble_unmount";
+    /// `()`: an element drag in the host's window ended, dropped or cancelled
+    /// (ABI 4). The guest tells rinch's `on_element_drag_end` listeners: a
+    /// drag whose dragged element its view re-rendered away hears no
+    /// `data-ondragend` (the host sends it to the gone node), and a sortable
+    /// list keeps state for the drag until it hears this.
+    pub const DRAG_ENDED: &str = "pimble_drag_ended";
     /// `(id: u64)`: the timer the guest armed with `SET_TIMEOUT` is due.
     pub const FIRE_TIMEOUT: &str = "pimble_fire_timeout";
     /// `(id: u64)`: poll the task the guest scheduled with `SCHEDULE_TASK`.
@@ -475,8 +481,10 @@ pub const HANDLER_ATTRIBUTES: &[(&str, HandlerKind)] = &[
 // `-ondragmove`, `-ondragend`, `data-onkeydown`) and judge a drop inside the
 // guest, synchronously, with what the guest holds: no new kind was needed. What
 // they need of the host besides is the click context of each drag step, the
-// painted box of an element ([`Query::BoundingRect`]), and the drag ghost hidden
-// when a drag start asks ([`dispatched::HIDE_DRAG_GHOST`]).
+// painted box of an element ([`Query::BoundingRect`]), the element a key was sent
+// to ([`Key::target`]), the end of every drag ([`exports::DRAG_ENDED`]), and the
+// drag ghost hidden for a source marked `data-drag-ghost="false"` (plain data the
+// host reads itself).
 
 /// The kind of handler attribute `name` holds, or `None` for an ordinary attribute.
 pub fn handler_kind(name: &str) -> Option<HandlerKind> {
@@ -485,13 +493,9 @@ pub fn handler_kind(name: &str) -> Option<HandlerKind> {
 
 /// The flags `dispatch` answers (ABI 4).
 pub mod dispatched {
-    /// A key or wheel handler consumed the event.
+    /// A key or wheel handler consumed the event. The other bits are free for
+    /// what a later handler may ask of the host's window.
     pub const CONSUMED: u32 = 1;
-    /// The handler hid the window's drag ghost (rinch `suppress_drag_ghost`,
-    /// which a drag start calls when it draws its own feedback, as a sortable
-    /// list does). The flag lives in the guest's own copy of rinch, which
-    /// nothing paints, so the host hides its ghost when told.
-    pub const HIDE_DRAG_GHOST: u32 = 2;
 }
 
 /// An event for one of the guest's handlers.
@@ -548,6 +552,11 @@ pub struct Key {
     pub modifiers: Modifiers,
     /// A release, else a press.
     pub up: bool,
+    /// The guest node the key was sent to (the focused element), when it is
+    /// one of the guest's (ABI 4): an element handler hears keys typed in the
+    /// fields inside it too, and this tells them apart (rinch
+    /// `KeyEventData::target`).
+    pub target: Option<u64>,
 }
 
 /// A wheel turn over an element.
@@ -649,11 +658,10 @@ mod tests {
             Op::Append { parent: GUEST_BODY, child: 2 },
         ];
         assert_eq!(decode::<Vec<Op>>(&encode(&ops)).unwrap(), ops);
-        let event = Event { handler: 7, data: EventData::Key(Key { key: "a".into(), code: "KeyA".into(), modifiers: Modifiers::default(), up: false }) };
+        let event = Event { handler: 7, data: EventData::Key(Key { key: "a".into(), code: "KeyA".into(), modifiers: Modifiers::default(), up: false, target: Some(4) }) };
         assert_eq!(decode::<Event>(&encode(&event)).unwrap(), event);
         let query = Query::BoundingRect { node: 7 };
         assert_eq!(decode::<Query>(&encode(&query)).unwrap(), query);
-        assert_eq!(dispatched::CONSUMED & dispatched::HIDE_DRAG_GHOST, 0);
         assert!(decode::<Manifest>(&[1, 2, 3]).is_err());
     }
 

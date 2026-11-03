@@ -211,6 +211,10 @@ macro_rules! plugin {
                 $crate::wasm::host_state(ptr, len)
             }
             #[unsafe(no_mangle)]
+            pub extern "C" fn pimble_drag_ended() {
+                $crate::wasm::drag_ended()
+            }
+            #[unsafe(no_mangle)]
             pub extern "C" fn pimble_unmount() {
                 $crate::wasm::unmount()
             }

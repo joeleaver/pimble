@@ -180,6 +180,13 @@ pub fn host_state(ptr: u32, len: u32) {
     with_guest(None, |g| g.host_state(state));
 }
 
+/// An element drag in the host's window ended: rinch's drag-end listeners
+/// hear it (a sortable list ends a drag whose dragged item was re-rendered
+/// away), and the turn's writes go out.
+pub fn drag_ended() {
+    with_guest(None, |g| g.drag_ended());
+}
+
 pub fn unmount() {
     with_guest(None, |g| g.unmount());
 }

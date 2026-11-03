@@ -13,7 +13,7 @@ use pimble_plugin_abi::{dispatched, Click, Event, EventData, HostRequest, HostSt
 use rinch::core::dom::{DomDocument, NodeHandle, NodeId, RenderScope};
 use rinch::core::events::{
     dispatch_event, dispatch_input_event, dispatch_key_handler, dispatch_scroll_event, dispatch_wheel_handler,
-    is_drag_ghost_visible, restore_drag_ghost, set_click_context, set_input_context, set_modifier_state, ClickContext, EventHandlerId, InputContext,
+    notify_element_drag_ended, set_click_context, set_input_context, set_modifier_state, ClickContext, EventHandlerId, InputContext,
     KeyEventData, KeyEventKind, ModifierState, MouseButton, ScrollEvent, WheelEvent,
 };
 use rinch::core::Signal;
@@ -241,6 +241,13 @@ impl Guest {
         self.flush();
     }
 
+    /// An element drag in the host's window ended: rinch's drag-end
+    /// listeners hear it, then the turn's writes go out.
+    pub fn drag_ended(&mut self) {
+        notify_element_drag_ended();
+        self.flush();
+    }
+
     fn take_down(&mut self) {
         if let Some(Mounted { scope, node, .. }) = self.mounted.take() {
             scope.dispose();
@@ -254,10 +261,8 @@ impl Guest {
         self.dispatch_flags(event) & dispatched::CONSUMED != 0
     }
 
-    /// Hand an event to the handler it names; answers the
-    /// [`dispatched`] flags: whether a key or wheel handler consumed it, and
-    /// whether the handler hid the drag ghost (a sortable list's drag start
-    /// does), which only the host's window can do.
+    /// Hand an event to the handler it names; answers the [`dispatched`]
+    /// flags: whether a key or wheel handler consumed it.
     pub fn dispatch_flags(&mut self, event: Event) -> u32 {
         let id = EventHandlerId(event.handler as usize);
         let mut flags = 0;
@@ -265,14 +270,7 @@ impl Guest {
             EventData::Plain(click) => {
                 set_modifier_state(modifiers(click.modifiers));
                 set_click_context(click_context(&click));
-                // The guest's flag says only what this handler asked: nothing
-                // here paints a ghost or resets it when a drag ends.
-                restore_drag_ghost();
                 dispatch_event(id);
-                if !is_drag_ghost_visible() {
-                    flags |= dispatched::HIDE_DRAG_GHOST;
-                    restore_drag_ghost();
-                }
                 false
             }
             EventData::Input { value, node } => {
@@ -335,6 +333,7 @@ fn key_data(key: &Key) -> KeyEventData {
     KeyEventData::new(key.key.clone(), key.code.clone())
         .with_modifiers(m.ctrl, m.shift, m.alt, m.meta)
         .with_kind(if key.up { KeyEventKind::Up } else { KeyEventKind::Down })
+        .with_target(key.target.map(NodeId))
 }
 
 fn wheel_event(wheel: &Wheel) -> WheelEvent {

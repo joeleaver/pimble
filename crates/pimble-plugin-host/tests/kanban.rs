@@ -336,3 +336,92 @@ fn cards_and_columns_drag_through_the_host_and_a_refused_drop_says_why() {
     assert_eq!(children(&f, store, f.write), ["Bravo", "Charlie", "Alpha"]);
     r.instance.unmount();
 }
+
+fn lifted(r: &Running, card: DomId) -> bool {
+    has_class(&r.doc.borrow(), card, "rinch-sortable__item--lifted")
+}
+
+#[test]
+fn space_lifts_a_focused_card_but_not_from_a_field_and_enter_opens() {
+    if built_plugin("kanban_viewer").is_none() {
+        return;
+    }
+    let f = fixture("kanban");
+    let store = f.store;
+    let alpha = f.rt.block_on(f.service.create_node(store, Some(f.plan), "document", "Alpha")).unwrap();
+    let running = mount(&f, Approval { stores: Approved::All, write: true }, "kanban_viewer", "kanban");
+    let r = &running;
+    r.pump_until(&f, "the board", |r| r.text().contains("Alpha"));
+    let item = sortable(r, &key(store, alpha));
+    let keys = |r: &Running| EventHandlerId(r.handler(sortable(r, &key(store, alpha)), "data-onkeydown"));
+
+    // Enter on the focused card is not a lift key here: it stays the board's.
+    r.doc.borrow_mut().focus_element(item);
+    dispatch_key_handler(keys(r), &KeyEventData::new("Enter", "Enter"));
+    assert!(!lifted(r, item));
+    // Space on the card itself lifts it; Escape puts it down.
+    assert!(dispatch_key_handler(keys(r), &KeyEventData::new(" ", "Space")));
+    assert!(lifted(r, item));
+    assert!(dispatch_key_handler(keys(r), &KeyEventData::new("Escape", "Escape")));
+    assert!(!lifted(r, item));
+
+    // A Space typed in the card's name field is the field's: the host names
+    // the field as the key's target, and the card is not lifted.
+    choose(r, "kanban__card", "Alpha");
+    r.pump_until(&f, "the actions", |r| r.text().contains("Rename"));
+    r.click("button", "Rename");
+    r.pump_until(&f, "the name field", |r| r.find(&|d, n| d.tag_name(n).as_deref() == Some("input")).is_some());
+    let field = r.find(&|d, n| d.tag_name(n).as_deref() == Some("input")).unwrap();
+    r.doc.borrow_mut().focus_element(field);
+    let item = sortable(r, &key(store, alpha));
+    assert!(!dispatch_key_handler(keys(r), &KeyEventData::new(" ", "Space")));
+    assert!(!lifted(r, item));
+    r.instance.unmount();
+}
+
+#[test]
+fn a_drag_whose_card_a_remote_edit_redrew_ends_when_the_host_says() {
+    if built_plugin("kanban_viewer").is_none() {
+        return;
+    }
+    let f = fixture("kanban");
+    let store = f.store;
+    let (alpha, charlie) = f.rt.block_on(async {
+        let a = f.service.create_node(store, Some(f.plan), "document", "Alpha").await.unwrap();
+        let c = f.service.create_node(store, Some(f.write), "document", "Charlie").await.unwrap();
+        (a, c)
+    });
+    let running = mount(&f, Approval { stores: Approved::All, write: true }, "kanban_viewer", "kanban");
+    let r = &running;
+    r.pump_until(&f, "the board", |r| r.text().contains("Charlie"));
+
+    // Alpha is dragged over Charlie: the caret is after Charlie.
+    let card = sortable(r, &key(store, alpha));
+    fire(r, card, "data-ondragstart");
+    let target = sortable(r, &key(store, charlie));
+    over(150.0, 135.0, 100.0, 100.0, 240.0, 40.0);
+    fire(r, target, "data-ondragover");
+    assert!(has_class(&r.doc.borrow(), target, "rinch-sortable__item--drop-after"));
+
+    // Someone renames Alpha meanwhile: its card is drawn again as a new node,
+    // and the old one's `data-ondragend` has nowhere to go.
+    f.rt.block_on(f.service.edit_node(store, alpha, "someone", |doc, now| doc.set_title("Alpha two", now))).unwrap();
+    r.pump_until(&f, "the card drawn again", |r| r.text().contains("Alpha two"));
+    assert_ne!(sortable(r, &key(store, alpha)), card, "the card is a new node");
+
+    // The drag is cancelled (Escape): the target hears it leave, and the host
+    // tells the plugin the drag ended. The caret is gone and nothing moved.
+    fire(r, target, "data-ondragleave");
+    assert!(r.instance.drag_ended());
+    assert!(!has_class(&r.doc.borrow(), target, "rinch-sortable__item--drop-after"));
+    assert_eq!(children(&f, store, f.plan), ["Alpha two"]);
+
+    // A later drop over Charlie delivers only what that drag carries: a drag
+    // of nothing (a drop with no drag start) moves nothing.
+    over(150.0, 135.0, 100.0, 100.0, 240.0, 40.0);
+    fire(r, target, "data-ondragover");
+    fire(r, target, "data-ondrop");
+    r.pump_until(&f, "a turn", |_| true);
+    assert_eq!(children(&f, store, f.write), ["Charlie"]);
+    r.instance.unmount();
+}

@@ -35,6 +35,8 @@ pub enum Call<'a> {
     Resolve(&'a [u8]),
     /// What the host knows changed (a postcard [`HostState`]).
     HostState(&'a [u8]),
+    /// An element drag in the window ended (`exports::DRAG_ENDED`).
+    DragEnded,
 }
 
 /// What an export call answered.
@@ -117,6 +119,7 @@ enum Pending {
     Event(Event),
     Resolve(Vec<u8>),
     HostState(Vec<u8>),
+    DragEnded,
 }
 
 /// Names an instance's [`HostCalls`] to its engine.
@@ -279,6 +282,23 @@ impl Instance {
         self.0.call(Call::PropsChanged(&bytes)).is_some()
     }
 
+    /// An element drag in the host's window ended, dropped or cancelled: the
+    /// guest tells rinch's drag-end listeners, which is how a sortable list
+    /// ends a drag whose dragged item its view re-rendered away (that item's
+    /// own `data-ondragend` went to the gone node). The host calls it for
+    /// every running instance when its runtime says a drag ended. Waits for a
+    /// call the guest is in.
+    pub fn drag_ended(&self) -> bool {
+        if self.0.stopped.get() {
+            return false;
+        }
+        if self.0.engine.try_borrow_mut().is_err() {
+            self.0.queued.borrow_mut().push_back(Pending::DragEnded);
+            return true;
+        }
+        self.0.call(Call::DragEnded).is_some()
+    }
+
     /// Hand an event to the guest, as a proxy handler does; answers "consumed".
     pub fn dispatch(&self, event: Event) -> bool {
         self.0.dispatch(event) & pimble_plugin_abi::dispatched::CONSUMED != 0
@@ -400,6 +420,11 @@ impl Inner {
                 Some(Pending::Resolve(bytes)) => {
                     if !self.stopped.get() {
                         self.call(Call::Resolve(&bytes));
+                    }
+                }
+                Some(Pending::DragEnded) => {
+                    if !self.stopped.get() {
+                        self.call(Call::DragEnded);
                     }
                 }
                 Some(Pending::HostState(bytes)) => {

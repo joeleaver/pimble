@@ -73,7 +73,8 @@ pub struct Applier {
     doc: Rc<RefCell<dyn DomDocument>>,
     container: NodeId,
     map: HashMap<u64, NodeId>,
-    back: HashMap<NodeId, u64>,
+    /// Shared with the key proxies, which name the guest node a key was sent to.
+    back: Rc<RefCell<HashMap<NodeId, u64>>>,
     /// The proxy registered for each guest node's handler attribute.
     handlers: HashMap<(u64, &'static str), EventHandlerId>,
     /// Fields given the desktop's no-op `data-oninput` by the host, not the guest.
@@ -94,7 +95,7 @@ impl Applier {
             doc,
             container,
             map,
-            back,
+            back: Rc::new(RefCell::new(back)),
             handlers: HashMap::new(),
             shimmed: HashSet::new(),
             dispatch,
@@ -109,7 +110,7 @@ impl Applier {
 
     /// The guest node host node `host` stands for, if it is one.
     pub fn guest_node(&self, host: NodeId) -> Option<u64> {
-        self.back.get(&host).copied()
+        self.back.borrow().get(&host).copied()
     }
 
     /// How many host handlers stand for the guest's.
@@ -137,7 +138,7 @@ impl Applier {
 
     fn adopt(&mut self, guest: u64, host: NodeId) {
         self.map.insert(guest, host);
-        self.back.insert(host, guest);
+        self.back.borrow_mut().insert(host, guest);
     }
 
     /// Apply `ops` in order. Stops at the first refused op; the caller stops the
@@ -252,7 +253,7 @@ impl Applier {
         if attr == "data-oninput" {
             self.shimmed.remove(&node);
         }
-        let Some(proxy) = self.proxy(node, host.node_id(), kind, guest_handler) else {
+        let Some(proxy) = self.proxy(node, host.node_id(), attr, kind, guest_handler) else {
             // Files from the operating system: no install permission covers them
             // yet, so the attribute is not written and nothing is dropped on it.
             tracing::debug!("plugin: {name} is not wired for plugins");
@@ -281,8 +282,9 @@ impl Applier {
 
     /// A host handler standing for the guest's `guest_handler` on guest node
     /// `node` (host node `host`), or `None` for a kind plugins are not given.
-    fn proxy(&self, node: u64, host: NodeId, kind: HandlerKind, guest_handler: u64) -> Option<EventHandlerId> {
+    fn proxy(&self, node: u64, host: NodeId, attr: &'static str, kind: HandlerKind, guest_handler: u64) -> Option<EventHandlerId> {
         let dispatch = self.dispatch.clone();
+        let (doc, back) = (Rc::downgrade(&self.doc), self.back.clone());
         let send = move |data: EventData| dispatch(Event { handler: guest_handler, data });
         // Unowned: the proxy lives as long as the guest's attribute does, and the
         // applier unregisters it then. Registered under whatever app scope happens
@@ -290,12 +292,16 @@ impl Applier {
         // that scope re-ran.
         rinch_core::reactive::unowned(|| match kind {
             HandlerKind::Plain => Some(register_handler(Rc::new(move || {
-                let flags = send(EventData::Plain(click(&get_click_context())));
-                // A drag start that draws its own feedback hides the ghost; the
-                // guest's call reached only its own copy of rinch.
-                if flags & dispatched::HIDE_DRAG_GHOST != 0 {
+                // A drag source that draws its own feedback (a sortable list's
+                // item) says so with `data-drag-ghost="false"` on itself or an
+                // ancestor; the window's ghost is hidden before the guest hears
+                // the start. A rinch whose runtime reads the attribute itself
+                // makes this a no-op; the guest's own `suppress_drag_ghost`
+                // reaches nothing that paints.
+                if attr == "data-ondragstart" && doc.upgrade().is_some_and(|d| ghost_refused(&*d.borrow(), host)) {
                     rinch_core::events::suppress_drag_ghost();
                 }
+                send(EventData::Plain(click(&get_click_context())));
             }))),
             HandlerKind::Input => Some(register_input_handler(InputCallback::new(move |value: String| {
                 // The field the text came from, when it is this node (it is on the
@@ -313,6 +319,7 @@ impl Applier {
                     code: k.code.clone(),
                     modifiers: Modifiers { shift: k.shift, ctrl: k.ctrl, alt: k.alt, meta: k.meta },
                     up: k.kind == KeyEventKind::Up,
+                    target: key_target(&doc, &back),
                 })) & dispatched::CONSUMED
                     != 0
             }))),
@@ -336,7 +343,8 @@ impl Applier {
         for child in children {
             self.forget_subtree(child);
         }
-        if let Some(guest) = self.back.remove(&host) {
+        let gone = self.back.borrow_mut().remove(&host);
+        if let Some(guest) = gone {
             self.map.remove(&guest);
             self.shimmed.remove(&guest);
             let gone: Vec<(u64, &'static str)> = self.handlers.keys().filter(|(n, _)| *n == guest).copied().collect();
@@ -359,7 +367,7 @@ impl Applier {
             child.discard();
         }
         self.map.retain(|&guest, _| guest == GUEST_BODY);
-        self.back.retain(|_, &mut guest| guest == GUEST_BODY);
+        self.back.borrow_mut().retain(|_, &mut guest| guest == GUEST_BODY);
         self.shimmed.clear();
     }
 
@@ -397,7 +405,7 @@ impl Applier {
                 None => Answer::Nothing,
             },
             Query::ActiveElement => {
-                doc.active_element().and_then(|n| self.back.get(&n).copied()).map(Answer::Node).unwrap_or(Answer::Nothing)
+                doc.active_element().and_then(|n| self.back.borrow().get(&n).copied()).map(Answer::Node).unwrap_or(Answer::Nothing)
             }
             Query::ViewportSize => {
                 doc.viewport_size().map(|(width, height)| Answer::Size { width, height }).unwrap_or(Answer::Nothing)
@@ -425,6 +433,27 @@ impl Drop for Applier {
             unregister_handler(id);
         }
     }
+}
+
+/// The guest node a key is sent to: the document's focused element, when it is
+/// one of the guest's. (rinch's `KeyEventData::target` names it on a rinch that
+/// has it; on the desktop the two are the same element.)
+fn key_target(doc: &std::rc::Weak<RefCell<dyn DomDocument>>, back: &Rc<RefCell<HashMap<NodeId, u64>>>) -> Option<u64> {
+    let focused = doc.upgrade()?.borrow().active_element()?;
+    back.borrow().get(&focused).copied()
+}
+
+/// Whether the drag source `node`, or an element above it, is marked
+/// `data-drag-ghost="false"`.
+fn ghost_refused(doc: &dyn DomDocument, node: NodeId) -> bool {
+    let mut at = Some(node);
+    while let Some(n) = at {
+        if doc.get_attribute(n, "data-drag-ghost").as_deref() == Some("false") {
+            return true;
+        }
+        at = doc.parent_node(n);
+    }
+    false
 }
 
 /// Whether `name` is one of rinch's handler attributes.

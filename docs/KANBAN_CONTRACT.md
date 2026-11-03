@@ -150,7 +150,7 @@ below). Presence with a second app instance: see docs/PRESENCE_CONTRACT.md "Plug
 ### Drags (built 2026-11-02 against joeleaver/rinch#2093, NOT merged)
 
 **Built against an unmerged rinch PR.** The `plugins/` workspace patches every rinch
-crate to #2093's branch at `b63871e6` (`[patch]` in `plugins/Cargo.toml`, spelled with
+crate to #2093's branch at `44e6448f` (its fix round; first built on `b63871e6`) (`[patch]` in `plugins/Cargo.toml`, spelled with
 `www.github.com` because a patch must name another source); the app and the web stay
 on rinch main. When #2093 merges: delete that patch block, `cargo update -p rinch` in
 `plugins/` (and in the root and `web/` so the app carries the sortable stylesheet), and
@@ -160,9 +160,15 @@ rebuild and reinstall the plugins.
   (id: the column's key); the columns are a horizontal `SortableList` of the group
   `columns` (id: the metanode's key), each column a `SortableItem` with `handle: true`
   dragged by its header in a `SortableHandle`. A key is `<store>/<node>`
-  (`board::key_of`), so a mounted column's cards keep their own addresses. A card the
-  person may only read has no handle (it does not drag); a column the person may not move
-  has none either. The lists' layout is also written inline, so an app whose rinch has
+  (`board::key_of`), so a mounted column's cards keep their own addresses; cards and
+  columns are distinct nodes, so no key repeats across the two groups (lanes, wave 2, are
+  nodes too). A card the person may only read is `disabled` (it does not drag), and so is
+  a column the person may not move; a board the person may only read disables both lists
+  (no drag starts or lands). A read-only column on a writable board keeps its list live,
+  so a drop into it is judged and says "You can read this, not change it." at the caret.
+  Both lists lift with Space only (`lift_keys`), so Enter stays "open the card". The caret
+  and the refusal box are drawn in the app's theme colors through rinch's
+  `--rinch-sortable-*` properties, set inline on each list (`SORT_THEME`). The lists' layout is also written inline, so an app whose rinch has
   no sortable stylesheet still lays the board out (only the caret and the refusal box
   need the stylesheet).
 - **Judge** (`Kanban::judge_drop`): synchronous, for every place a drag offers, `plan`'s
@@ -183,30 +189,48 @@ rebuild and reinstall the plugins.
 - **One at a time:** the board has one choice, not a selection, so a drag carries one card
   or one column (`drag_keys` unused). Alt+Shift+arrows, the menu and plain-arrow choosing
   are unchanged.
-- **Host (ABI 4).** Nothing kanban-specific: `Query::BoundingRect` (the painted box in the
-  click context's frame; the SDK's `bounding_rect` had answered the parent-relative layout
-  box, which a drag cannot compare with the pointer), and `dispatch` answers flags
-  (`dispatched::CONSUMED`, `dispatched::HIDE_DRAG_GHOST`): a guest handler that calls
-  `suppress_drag_ghost` reaches only its own rinch, so the SDK reports it and the host's
-  proxy hides the window's ghost. No new handler kind: #2093 runs on `data-ondrag*` and
-  `data-onkeydown`, already proxied.
-- **Not yet:** #2093's keyboard lift (Space or Enter on a focused item) collides with
-  Enter = open; the board keeps the keyboard on its own element, so a card is focused
-  only by Tab. #2093 is adding configurable lift keys and a `disabled` switch (for a
-  read-only board); adopt both when they land. A lift is not cancelled by focus leaving
-  the item inside a plugin (the dismiss stack is not forwarded).
+- **Host (ABI 4).** Nothing kanban-specific, and no new handler kind (#2093 runs on
+  `data-ondrag*` and `data-onkeydown`, already proxied):
+  - `Query::BoundingRect`: the painted box in the click context's frame (the SDK's
+    `bounding_rect` had answered the parent-relative layout box, which a drag cannot
+    compare with the pointer).
+  - `Key::target`: the guest node a key was sent to (the document's focused element,
+    translated), which the SDK passes as rinch's `KeyEventData::target`, so a Space typed
+    in a card's name field does not lift the card.
+  - The drag ghost: a proxied `data-ondragstart` whose element (or an ancestor) carries
+    `data-drag-ghost="false"` hides the window's ghost before the guest hears the start
+    (the guest's own `suppress_drag_ghost` reaches nothing that paints). A rinch whose
+    runtime reads the attribute itself (#2093's) makes this a no-op.
+  - `exports::DRAG_ENDED` / `Instance::drag_ended`: the guest calls rinch's
+    `notify_element_drag_ended`, which ends a drag whose dragged card a co-edit
+    re-rendered away (its `data-ondragend` goes to the gone node). **The app does not
+    call it yet:** it needs `rinch_core::on_element_drag_end` in the app's own rinch,
+    which arrives with #2093; when the app moves to that rinch, register one listener
+    in `crates/pimble-app/src/plugins.rs` that calls `drag_ended` on every running
+    instance. Until then such a drag ends at the next drag start.
+  - `dispatch` answers flags (`dispatched::CONSUMED`; the other bits are free).
+- **Not yet:** a lift is not cancelled by focus leaving the item inside a plugin (the
+  dismiss stack is not forwarded); Escape, Tab and the arrows work.
 
-**Tests (drags):** kanban-viewer 5 (`a_drop_lands_after_the_item_it_names_or_first`);
-pimble-plugin-abi 5 (`BoundingRect` and the flags round trip); pimble-plugin-host
-applier 5 (`a_drag_start_that_hides_the_ghost_hides_the_hosts`: the flag reaches the
-host's ghost, `draggable` passes through) and kanban 3
-(`cards_and_columns_drag_through_the_host_and_a_refused_drop_says_why`: the built plugin
-over a real server, driven only through the host's proxied `data-ondrag*` handlers and
-click contexts: Alpha dragged over Charlie's lower half lands after it in the other column
-with the ghost hidden and the caret drawn after Charlie; the "Write it" column dragged by
-its header over the left half of "Plan" lands first on the board; a card dragged into a
-mounted column whose store is gone shows `plan`'s "This mount's store isn't open here."
-in the list's reason slot, and the drop sends nothing).
+**Tests (drags, at `44e6448f`):** kanban-viewer 5
+(`a_drop_lands_after_the_item_it_names_or_first`); pimble-plugin-abi 5 (`BoundingRect` and
+a key's target round trip); pimble-plugin-host applier 6
+(`a_drag_source_marked_ghostless_hides_the_hosts_ghost`: a proxied drag start under
+`data-drag-ghost="false"` hides the window's ghost, an unmarked one keeps it, `draggable`
+passes through; `a_key_names_the_guest_node_it_was_sent_to`), wasm 3 (the WAT guest
+exports `pimble_drag_ended`), and kanban 5, the built plugin over a real server driven only
+through the host's proxied `data-ondrag*` and `data-onkeydown` handlers:
+`cards_and_columns_drag_through_the_host_and_a_refused_drop_says_why` (Alpha dragged over
+Charlie's lower half lands after it in the other column, ghost hidden, caret after
+Charlie; the "Write it" column dragged by its header over the left half of "Plan" lands
+first; a card dragged into a mounted column whose store is gone shows "This mount's store
+isn't open here." in the list's reason slot and the drop sends nothing),
+`space_lifts_a_focused_card_but_not_from_a_field_and_enter_opens` (Enter on a focused card
+does not lift it; Space does and Escape puts it down; a Space typed in the card's name
+field does not), and `a_drag_whose_card_a_remote_edit_redrew_ends_when_the_host_says` (a
+rename from elsewhere redraws the dragged card mid-drag; after the leave and
+`Instance::drag_ended` the caret is gone and nothing moved; a later drop with no drag
+moves nothing).
 
 **Checked in the release desktop app** (port 7491, scratch dirs, the family-store copy,
 the plugin installed with `scripts/plugins/install.sh`, real pointer drags through rinch's
