@@ -123,6 +123,15 @@ fn loaded(registry: Registry) {
         crate::metanodes::plugins_ready(store);
         if !WATCHING.with(|w| w.replace(true)) {
             watch_host_state(store);
+            // A drag in this window ended: every running plugin hears it, so a
+            // sortable list whose dragged item a re-render removed still ends
+            // its drag (rinch #2093).
+            rinch::core::on_element_drag_end(|| {
+                let running: Vec<Instance> = SHOWN.with(|s| s.borrow().values().filter_map(|shown| shown.instance.clone()).collect());
+                for instance in running {
+                    instance.drag_ended();
+                }
+            });
         }
     }
     refresh_window();

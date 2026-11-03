@@ -463,16 +463,16 @@ first plugin.
    machinery.
 5. **The kanban plugin** (`docs/KANBAN_CONTRACT.md`). Wave 1 built 2026-11-02 (its
    contract's "Built" note), before waves 3 and 4: it needed no host slot.
-   **ABI 4** (2026-11-02, for its drags on rinch #2093, unmerged): `Query::BoundingRect`
+   **ABI 4** (2026-11-02, for its drags on rinch #2093, merged 2026-11-03): `Query::BoundingRect`
    answers `DomDocument::bounding_rect` (the painted box in the click context's frame;
    the SDK's `bounding_rect` had answered the parent-relative `Layout`); `Key::target`, the
    guest node a key was sent to (the focused element), passed as rinch's
    `KeyEventData::target`; an export `pimble_drag_ended` (`Instance::drag_ended`), which
-   the guest turns into rinch's `notify_element_drag_ended` (the app calls it once its
-   rinch has `on_element_drag_end`); the host hides the window's drag ghost for a proxied
+   the guest turns into rinch's `notify_element_drag_ended` (the app calls it from one
+   `on_element_drag_end` listener); the host hides the window's drag ghost for a proxied
    drag start marked `data-drag-ghost="false"`; and `dispatch` answers `dispatched` flags
-   (`CONSUMED`). Sortable lists added no handler attribute. Only the plugins workspace is on
-   #2093's branch (a `[patch]` in `plugins/Cargo.toml`, removed when it merges).
+   (`CONSUMED`). Sortable lists added no handler attribute. Every workspace is on rinch main at
+   `8421ff53` (the `[patch]` onto #2093's branch is gone).
 
 ## 5. How it is checked
 

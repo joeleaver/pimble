@@ -3,7 +3,7 @@
 Status: drafted by the PM on 2026-11-02 from Joe's design (memory
 `project_views_and_plugins_2026_11_02`). Wave 1 built the same day (section 7), with
 open decisions 1-5 taken as recommended; drags built the same day against rinch #2093
-(unmerged, section 7 "Drags"). Kanban is **a viewer, built as a
+(merged to rinch main 2026-11-03, section 7 "Drags"). Kanban is **a viewer, built as a
 plugin** with the plugin system (`docs/PLUGINS_CONTRACT.md`), for **metanodes**
 (`docs/METANODES_CONTRACT.md`); it is the first consumer of both and waits on them. It declares
 the source shape it needs: a tree two levels deep. Open decisions at the end.
@@ -147,14 +147,12 @@ here." (the plugin's approval covered only the family store, so to the plugin th
 is not open: the explorer's sentence, though "not allowed" would say it better; noted
 below). Presence with a second app instance: see docs/PRESENCE_CONTRACT.md "Plugins".
 
-### Drags (built 2026-11-02 against joeleaver/rinch#2093, NOT merged)
+### Drags (built 2026-11-02 against joeleaver/rinch#2093, merged 2026-11-03)
 
-**Built against an unmerged rinch PR.** The `plugins/` workspace patches every rinch
-crate to #2093's branch at `44e6448f` (its fix round; first built on `b63871e6`) (`[patch]` in `plugins/Cargo.toml`, spelled with
-`www.github.com` because a patch must name another source); the app and the web stay
-on rinch main. When #2093 merges: delete that patch block, `cargo update -p rinch` in
-`plugins/` (and in the root and `web/` so the app carries the sortable stylesheet), and
-rebuild and reinstall the plugins.
+Built against #2093's branch at `44e6448f` (its fix round; first built on `b63871e6`)
+through a `[patch]` in `plugins/Cargo.toml`. #2093 merged to rinch main on 2026-11-03
+(batch #2096); the patch is gone and the root, `web/` and `plugins/` locks all pin rinch
+main at `8421ff53`, so the app carries the sortable stylesheet too.
 
 - **Shape.** Each column's cards are a vertical `SortableList` of the group `cards`
   (id: the column's key); the columns are a horizontal `SortableList` of the group
@@ -203,11 +201,10 @@ rebuild and reinstall the plugins.
     runtime reads the attribute itself (#2093's) makes this a no-op.
   - `exports::DRAG_ENDED` / `Instance::drag_ended`: the guest calls rinch's
     `notify_element_drag_ended`, which ends a drag whose dragged card a co-edit
-    re-rendered away (its `data-ondragend` goes to the gone node). **The app does not
-    call it yet:** it needs `rinch_core::on_element_drag_end` in the app's own rinch,
-    which arrives with #2093; when the app moves to that rinch, register one listener
-    in `crates/pimble-app/src/plugins.rs` that calls `drag_ended` on every running
-    instance. Until then such a drag ends at the next drag start.
+    re-rendered away (its `data-ondragend` goes to the gone node). The app registers one
+    `rinch::core::on_element_drag_end` listener when the plugins first load
+    (`crates/pimble-app/src/plugins.rs` `loaded`) that calls `drag_ended` on every
+    running instance (2026-11-03).
   - `dispatch` answers flags (`dispatched::CONSUMED`; the other bits are free).
 - **Not yet:** a lift is not cancelled by focus leaving the item inside a plugin (the
   dismiss stack is not forwarded); Escape, Tab and the arrows work.
@@ -246,9 +243,8 @@ card dragged into Home (a red dashed outline and the red reason box, clipped whe
 Home ran past the pane's edge) whose release moved nothing. Each move moved the node
 and the explorer followed.
 
-**Not done / known limits:** until the app moves to a rinch with #2093 it has no sortable
-stylesheet, so it draws no caret (checked with the app built against #2093 in a scratch
-worktree, above); a refusal box at a column cut off by the board's scroll edge is
+**Not done / known limits:** the app on rinch main with the drag-end listener (2026-11-03)
+is built and its tests pass but was not yet driven by hand; a refusal box at a column cut off by the board's scroll edge is
 clipped; "Move anyway" is tested end to end but was not
 clicked in the app; a column from a store the plugin was not allowed reads as "not open
 here"; a card's menu is inline buttons under the chosen card, not a popup menu (portals
