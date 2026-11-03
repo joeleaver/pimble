@@ -1,16 +1,17 @@
 # Pimble plugins and the SDK they are written with (docs/PLUGINS_CONTRACT.md).
 #
 # Its own workspace, not a part of the main one: plugins build for wasm32-wasip1
-# with their own lock and target directory, and the SDK is built against a rinch
-# branch until that change merges (joeleaver/rinch#2088), while the app stays on
-# rinch main. Build every plugin with
+# with their own lock and target directory. Both workspaces track rinch main
+# (the wasip1 gating, joeleaver/rinch#2088, merged on 2026-11-02); each lock pins
+# its own revision. Build every plugin with
 #
 #   cargo build --release --target wasm32-wasip1
 #
-# and test the SDK natively with `cargo test -p pimble-plugin-sdk`.
+# and test the SDK natively with `cargo test -p pimble-plugin-sdk`. To build and
+# install them into this device's plugins folder: scripts/plugins/install.sh.
 [workspace]
 resolver = "2"
-members = ["../crates/pimble-plugin-sdk", "hello-viewer", "stuck-viewer"]
+members = ["../crates/pimble-plugin-sdk", "hello-viewer", "stuck-viewer", "kanban-viewer"]
 
 [profile.release]
 # Plugins are loaded and compiled by the app at start: small modules load faster.

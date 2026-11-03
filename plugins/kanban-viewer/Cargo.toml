@@ -1,0 +1,15 @@
+[package]
+name = "kanban-viewer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The kanban metanode viewer: columns and cards over a tree two levels deep (docs/KANBAN_CONTRACT.md)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pimble-plugin-sdk = { path = "../../crates/pimble-plugin-sdk" }
+# The value a rename's `explicit_title` flag is written as.
+serde_json = "1"
