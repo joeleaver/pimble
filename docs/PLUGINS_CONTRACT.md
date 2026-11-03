@@ -2,7 +2,7 @@
 
 Status: drafted by the PM on 2026-11-02 from Joe's direction (memory
 `project_views_and_plugins_2026_11_02`) and a read-only study of rinch at the pinned
-revision (`2d1f11a0`, cargo checkout) and of `crates/pimble-plugins`. Waves 0 to 2 are built (section 4).
+revision (`2d1f11a0`, cargo checkout) and of `crates/pimble-plugins`. Waves 0 to 3 are built (section 4).
 Open decisions at the end. Metanodes (`docs/METANODES_CONTRACT.md`) are a separate, generic
 concept whose viewers plugins provide; the kanban (`docs/KANBAN_CONTRACT.md`) is the
 first plugin.
@@ -69,8 +69,8 @@ first plugin.
   - **desktop:** wasmtime core module, `wasmtime-wasi` preview1, one `Store` per instance
     on the UI thread, **epoch interruption** so a stuck plugin is stopped with a notice;
   - **browser:** `js_sys::WebAssembly` with a tiny WASI shim (console, clock, random,
-    exit); no interruption is possible, so a plugin that runs too long is unloaded at its
-    next turn (open decision 5).
+    exit); no interruption is possible, so a turn is timed and a plugin whose turn ran
+    past its budget is stopped when it returns (decision 5, taken; wave 3).
 - **Applying the op log**: the host keeps, per instance, a map from guest node ids to host
   node ids under the instance's root and applies ops through the host's own
   `dyn DomDocument`, so the same code works on the desktop and the web documents. **The
@@ -119,7 +119,9 @@ first plugin.
   types, embeds, recipes such as "New Kanban"), and what it asks for.
 - **ABI and rinch versions are checked at load**: a plugin built against another ABI or an
   incompatible rinch is refused with a sentence, and the view falls back to an outline.
-- Where plugins live and how they reach other devices: open decision 3.
+- Where plugins live and how they reach other devices: decision 3 (a per-device
+  folder on the desktop; in the browser, which has no folder, the page's own IndexedDB,
+  filled by "Add plugin...": wave 3).
 
 ### 3.6 What happens to `pimble-plugins` today
 
@@ -357,6 +359,106 @@ first plugin.
    for wasm32-wasip1 (guarded) and copies each `.wasm` into `<data dir>/pimble/plugins/`
    (`PIMBLE_DATA_DIR` names a scratch one); the app loads the folder at start.
 3. **The browser host**: the same plugin running in the web app.
+
+   **Built 2026-11-03 (branch `api`), decision 5 as recommended.** **The engine**
+   (`pimble_plugin_host::js_engine`, feature `js-host`, which pimble-app's `web` turns
+   on): the same `wasm32-wasip1` core modules, compiled and instantiated by the page's
+   own `WebAssembly` (asynchronously: a browser may refuse either synchronously for a
+   module this size on the page's thread). The imports are an object of wasm-bindgen
+   closures that mirror the wasmtime linker's one for one, reading and writing guest
+   memory through a fresh `Uint8Array` view of its buffer each time (a view goes stale
+   when the memory grows) and reaching the instance's `HostCalls` through its key, as
+   the desktop's do; `i64`s cross as BigInts. WASI is a shim of what a plugin imports:
+   `fd_write` into the log, `clock_time_get` from the wall clock, `random_get` from
+   `crypto.getRandomValues` (a plugin's new ids come from it), empty environment and
+   arguments, `sched_yield`, `proc_exit` (stops it with "it exited with status N"), and
+   `ENOSYS` for any other preview1 function a module imports. An import that refuses
+   what the guest sent records why and throws; the throw unwinds the guest to the
+   export call, which reads the reason back, so the sentences are the desktop's.
+   **Stopping (decision 5):** nothing can interrupt running code in a page, so each turn
+   is timed against the desktop's 2 s budget and a plugin whose turn ran past it is
+   stopped when the turn returns, with the desktop's notice ("... was stopped: it ran
+   too long without answering."); one that never returns holds the page until the
+   browser offers to stop the script. Memory is not capped in the browser (the desktop
+   caps it at 256 MiB). **Ready ahead:** a pane mounts a plugin synchronously, so each
+   plugin keeps one instance ready (the one that described it, then one made behind
+   each that is taken); a pane that finds none shows the outline under "The Kanban
+   plugin is starting." and looks again once it is ready, and one that could not be
+   made says why. **Shared code:** the applier, bridge, instance and approvals are
+   unchanged; the registry moved out of the wasmtime engine (`registry.rs`, generic
+   over an engine's loaded plugin; `wasmtime_engine::load_dir` is the folder loader).
+   `crates/pimble-app/src/plugins.rs` is one module for both targets, with only a
+   `place` per target (engine, where plugins and approvals are kept, the window's
+   add and remove); `plugin_calls.rs` runs plugins' calls on either backend (tokio on
+   the desktop, `spawn_local` in the page). **Where plugins live in the browser:** there
+   is no folder, so the Plugins window (File > "Plugins...") has "Add plugin...", which
+   takes a `.wasm` file the person picks, compiles and describes it in the page, and
+   keeps one this app runs in the page's own IndexedDB (`pimble-plugins`, its bytes
+   under the plugin's id, so a new version replaces the old), per browser and never
+   uploaded (nothing is hosted unless asked); one it does not run is refused with its
+   sentence and not kept. Each row has "Remove" (the plugin and what it was allowed
+   leave this browser). Approvals are `localStorage` `pimble.plugins.approvals`, the
+   same JSON as the desktop's `approvals.json`. **The API in the browser:** a plugin's
+   calls go through a router of their own over the page's connections and vault
+   (`Routes::plugin_router`, taught each store as the app's router is), so plain stores
+   go to their server and encrypted ones to the vault, and the router's write gate
+   refuses a reader's write the same way. **Capabilities:** `ApiReply::Stores` carries
+   each listed store's capabilities as the host's backend says them (optional JSON, so
+   no ABI bump), and the SDK's `GuestBackend::capabilities` answers from the last
+   listing (a server's before one), so an encrypted store reads as one; never
+   `local_documents`, which is about holding documents in one's own process: the guest
+   is another, so its `Pimble` keeps its own copies, which `plan` and a sortable list's
+   synchronous drop judge read. **An encrypted store's change stream:** the app's own
+   `Pimble` holds nothing of an encrypted store and so never subscribed; a plugin's does,
+   so `VaultBackend::subscribe` is now `VaultClient::watch`: every update the vault
+   merges (a peer's, a catch-up) or writes (the app's commands, a plugin's, repair) is
+   heard with the document it is about (`TreeStructure`, `ContentUpdated` or
+   `MetadataUpdated` naming that document, carrying its update), handed over when an
+   API call lets go of the vault and on every pass of the backend loop. What a plugin
+   writes is attributed to it (`VaultBackend::for_plugins`; `apply` carries
+   `plugin:<id>`) and shown to the app's views as a peer's change is (the kinds through
+   `owe`/`show_owed`, a content update as `RemoteChanges`), since no command of the
+   app's own told them. "New Kanban" (`MakeFromRecipe`) is routed in the browser too.
+   **Tests:** host `tests/js.rs` 4 under wasm-bindgen-test in node (a manifest for
+   another ABI and junk refused at load; a guest's ops reach a mock document and the
+   next instance is made ready; a guest whose turn ran past a 1 ms budget is stopped
+   with the notice when it returns; a guest naming node 0 is stopped from inside the
+   import); run with `CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner
+   cargo test -p pimble-plugin-host --features js-host --target wasm32-unknown-unknown
+   --test js` and a runner of the lock's wasm-bindgen (0.2.128); web 69 (new:
+   `a_subscription_hears_every_write_and_the_app_hears_the_plugins`); host with
+   `wasm-host` unchanged (applier 6, bridge 2, kanban 5, wasm 3, unit 4); pimble-app
+   206.
+   **Checked in a real browser** (the built-in browser pane) on the local stack (a
+   scratch `PIMBLE_STACK_DIR`, alice with the stack's made-up password): File >
+   "Plugins..." said no plugins were installed; "Add plugin..." took the built
+   `kanban_viewer.wasm` (the file handed to the page's own file input, as the dialog
+   would) and listed it with what it asks for; a plain hosted store's row menu offered
+   "New Kanban", which made Kanban with To do, Doing, Done; opening it showed the
+   outline under "The Kanban plugin wants to read and change the store Plain Board."
+   with Allow and Not now; Allow mounted the board; "+ Add card" named in place;
+   Alt+Shift+Right moved a card to Doing; a pointer drag moved another into Done; the
+   explorer followed each. In an encrypted store (File > "New Store..."): "New
+   Kanban", the request again (Chosen is per store), Allow, a card added and named, a
+   key move and a drag, each shown in the explorer (the vault's writes made for the
+   plugin reaching the app's views); a rename made in the explorer showed live in the
+   board in the other split pane (the vault's change stream). After a reload the plugin
+   and both approvals were still there (IndexedDB and `localStorage`), and a second tab
+   of the same account mounted the board at once. Presence between the two tabs: the
+   card one tab held natively showed the other's chip on it in the board, and the
+   kanban and the card the board chose showed the other tab's dots and chips. "Add
+   plugin..." took the stuck plugin ("Added the Stuck viewer plugin 0.1.0."), and
+   "Remove" took it out ("Removed the Stuck viewer plugin from this browser.").
+   **Not checked:** a stuck plugin in a real page (no menu sets a viewer, and the MCP
+   reaches no browser; the engine's path is the node test's); the OS file dialog
+   itself (the file was handed to the input the button made); presence between the
+   browser and a desktop app (the desktop's "Add Hosted Store..." lists encrypted
+   stores and the browser's plain hosted store is not reachable from a desktop without
+   a replica set up by hand; the frames are the app's own, so the existing paths carry
+   them); the desktop app run by hand after the refactor (its plugin tests and
+   pimble-app's 206 pass). **Known limits:** a never-returning plugin holds the page;
+   no memory cap; "Add plugin..." is browser-only (the desktop's folder stays by hand,
+   decision 3); one ready instance per plugin is kept in memory.
 4. **Host slots** (the Editor first), overlay roots for portals, the forwarded global
    machinery.
 5. **The kanban plugin** (`docs/KANBAN_CONTRACT.md`). Wave 1 built 2026-11-02 (its
@@ -404,6 +506,7 @@ the pane shows the outline with the request and "Allow"); 6, no network in these
    indexing export the server runs.
 5. **A stuck plugin in the browser:** unloaded at its next turn with a notice
    (recommended; a browser cannot interrupt it), or plugins run in a Web Worker (safe to
-   stop, but synchronous layout queries then cost a message each).
+   stop, but synchronous layout queries then cost a message each). Taken as recommended
+   for wave 3 (2026-11-03): stopped when a turn that ran past its budget returns.
 6. **Network access:** none in the first waves (recommended), or a host-mediated `fetch`
    gated by the install permission.

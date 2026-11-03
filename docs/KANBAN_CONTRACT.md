@@ -252,6 +252,6 @@ worktree, above); a refusal box at a column cut off by the board's scroll edge i
 clipped; "Move anyway" is tested end to end but was not
 clicked in the app; a column from a store the plugin was not allowed reads as "not open
 here"; a card's menu is inline buttons under the chosen card, not a popup menu (portals
-into a plugin's body are untried, wave 4); the browser (no plugin host there yet); a
+into a plugin's body are untried, wave 4); the browser is checked under docs/PLUGINS_CONTRACT.md wave 3 (cards added, moved by key and by drag, in a plain and an encrypted store); a
 reader's board (no gestures) was not tried with a real share; plugin markup is styled
 inline (a plugin cannot add a stylesheet), so it has no hover states.

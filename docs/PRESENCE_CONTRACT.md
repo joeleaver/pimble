@@ -893,4 +893,4 @@ the family store; the second app with `HOSTNAME=second-laptop`), both signed out
 - An agent's edit of a card (`append` through `pimble-mcp`) showed its robot pill on the
   card in the kanban, and faded.
 **Not checked:** two accounts through the hosted server or the relay (the frames are the
-app's own, so the existing paths carry them); the browser (no plugin host there yet).
+app's own, so the existing paths carry them); a plugin in the browser against a desktop app (two browser tabs of one account were checked: docs/PLUGINS_CONTRACT.md wave 3).
