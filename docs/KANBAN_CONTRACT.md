@@ -1,7 +1,8 @@
 # Kanban contract: the first viewer for metanodes, built as a plugin
 
 Status: drafted by the PM on 2026-11-02 from Joe's design (memory
-`project_views_and_plugins_2026_11_02`). Nothing is built. Kanban is **a viewer, built as a
+`project_views_and_plugins_2026_11_02`). Wave 1 built the same day (section 7), with
+open decisions 1-5 taken as recommended; drags wait on rinch #2091. Kanban is **a viewer, built as a
 plugin** with the plugin system (`docs/PLUGINS_CONTRACT.md`), for **metanodes**
 (`docs/METANODES_CONTRACT.md`); it is the first consumer of both and waits on them. It declares
 the source shape it needs: a tree two levels deep. Open decisions at the end.
@@ -60,6 +61,12 @@ the interface.
 
 ## 6. Open decisions for Joe
 
+Taken as recommended on 2026-11-02 (wave 1): 1, a card shows its label, icon, colors and a
+subtask count; 2, a column's own text is hidden; 3, non-kanban children of a laned kanban
+form one unnamed top lane (lanes are wave 2); 4, "New Kanban" makes To do, Doing, Done;
+5, nothing for Done piling up yet.
+
+
 1. **What a card shows:** label, icon, colors and a subtask count (recommended), or also
    the first line of its text, its tags, a discussion badge.
 2. **A column's own text:** hidden (recommended), or shown under the header (a WIP limit,
@@ -69,3 +76,82 @@ the interface.
 4. **New Kanban's columns:** To do, Doing, Done (recommended), or none.
 5. **Done piling up:** nothing in wave 1 (recommended), later an "Archive" that moves old
    done cards under a child of Done, or a per-device filter.
+
+## 7. Built: wave 1 (2026-11-02, branch `api`)
+
+`plugins/kanban-viewer` (`kanban_viewer.wasm`, about 7 MB: the whole Tabler set rides with
+`IconGlyph`). Manifest: viewer `kanban` taking `SourceShape::Subtree { depth: 2 }`, recipe
+`new-kanban` ("New Kanban": a metanode titled Kanban, icon `layout-kanban`, its subtree
+two levels deep, children To do, Doing, Done), asks to read and change the stores chosen
+(`StoreAsk::Chosen`, write).
+
+- **The board** (`board.rs`, pure and tested natively): `board_of(forest)` makes columns
+  (the forest's first level) of cards (the second), in the tree's order; a card is its
+  label (`display_label`, the explorer's), its icon (`pimble_ui::appearance::node_icon`),
+  its text and row colors drawn with the app's `display_color`/`row_background` for the
+  theme the host says, and a subtask count (its children). A column's own text is not
+  shown. Writability is each node's `access` and the metanode's: a node the person may
+  only read shows no gestures (no add, rename, move or delete; Open stays).
+- **Moves, one function.** Every move is a `Target { parent, place }` with a tree
+  `Place`, never an index, and `Kanban::move_to` is the only thing that moves: it lists
+  the stores again, judges in the metanode (`Pimble::judge_in_metanode`), shows a refusal
+  as `plan`'s sentence with nothing sent, holds a warning (another store, leaving a share,
+  leaving the view) for "Move anyway" / "Cancel", and sends the plan
+  (`Pimble::move_nodes`), keeping the card chosen under a new id when the move gave it one.
+  The card's "Move to ▸ <column>" buttons go to the bottom of that column; the keyboard is
+  the explorer's, Alt+Shift+arrows (Alt+Left and Alt+Right alone are the app's Back and
+  Forward): up and down one within the column, left and right into the neighbor column at
+  the same height; a column chosen by its header moves along the board with
+  Alt+Shift+Left/Right. Plain arrows choose (cards, and a column's header above its first
+  card), Enter opens, F2 renames, Delete deletes, Escape lets go.
+- **Drag waits on rinch #2091** (sortable lists, being built: whole-card drags with
+  column-header handles, non-optimistic drops, First/Last/After(key) places, a
+  synchronous judge with a reason, three nesting levels, plain `data-*` handlers).
+  `board::drop_target(list, place)` is where its answer becomes a `Target`, so a drop is
+  judged and sent by `move_to` like a menu item or a key.
+- **Renaming** in place (a column by its header's "Rename" or F2, a card by its own): the
+  one write, `Pimble::edit` with the title and `explicit_title`; Enter keeps it, Escape
+  cancels; the field takes the keyboard when it is drawn.
+- **Adding:** "+ Add card" creates under the column, last; "+ Add column" under the
+  metanode, last; each with no title (`recipes::document("")`), then its name typed in
+  place. **Deleting** a card asks `can_delete` first, then deletes (a tombstone) and says
+  "Deleted “X”. View > Recently Deleted puts it back."
+- **Opening** a card: Open or Enter asks the host (`Host::open`), which opens it in the
+  plugin's pane as an outline row does.
+- **Live:** the forest is read again whenever a change touches it
+  (`next_change`, `Forest::touched_by`): another window, the CLI, the MCP.
+- **Presence** (docs/PRESENCE_CONTRACT.md "Plugins"): choosing a card or column says the
+  person is on it; each card and column header shows who else is on it with the app's
+  `PersonChip` (up to three, then "+n"), a click on one follows them; a pane following
+  someone scrolls to the card they are on and edges it in their color.
+
+**Tests:** kanban-viewer 4 (keys move by place within and across columns, the menu goes
+to the bottom, a column moves along the board, the manifest's viewer and recipe);
+pimble-plugin-host `tests/kanban.rs` 2, the built plugin over a real in-process server:
+the board in the tree's order with a subtask count, choosing tells the host, "Move to"
+and Alt+Shift+Up/Left reach the server, Open asks the host, a column renamed in place
+with its explicit title, "+ Add card" named in place, Delete, a move from elsewhere shown
+live, people drawn with the app's chips and the followed person's card edged, a chip's
+click asks to follow, a move into another store's column held for "Move anyway",
+`plan`'s "This mount's store isn't open here." with nothing sent; and a plugin allowed
+only to read refused its write with the host's sentence.
+
+**Checked in the release desktop app** (port 7491, scratch dirs, a copy of the family
+store, the plugin installed with `scripts/plugins/install.sh`): "New Kanban" on a row's
+menu made Kanban with To do, Doing, Done; opening it asked to allow the plugin, then
+showed the board; "+ Add card" with a name typed in place; Alt+Shift+Up and
+Alt+Shift+Right moved it; "Move to ▸ Done" moved it; the Doing column renamed in place to
+"In progress" (the explorer followed); a move made through `pimble-mcp` (an agent) showed
+live, and the agent's edit of a card showed its robot pill on the card; Open opened the
+card in the pane; Delete removed a card with its line; a store mounted as a column from
+the CLI appeared live, and a move into it was refused with "This mount's store isn't open
+here." (the plugin's approval covered only the family store, so to the plugin that store
+is not open: the explorer's sentence, though "not allowed" would say it better; noted
+below). Presence with a second app instance: see docs/PRESENCE_CONTRACT.md "Plugins".
+
+**Not done / known limits:** drags (#2091); "Move anyway" is tested end to end but was not
+clicked in the app; a column from a store the plugin was not allowed reads as "not open
+here"; a card's menu is inline buttons under the chosen card, not a popup menu (portals
+into a plugin's body are untried, wave 4); the browser (no plugin host there yet); a
+reader's board (no gestures) was not tried with a real share; plugin markup is styled
+inline (a plugin cannot add a stylesheet), so it has no hover states.

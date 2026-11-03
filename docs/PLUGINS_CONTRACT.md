@@ -106,8 +106,9 @@ first plugin.
   backend, so the server judges them with the person's role; nothing extra is granted.
 - **Narrowed by what the person approved** (decision 2, taken): which stores, read or
   write; no network (decision 6).
-- **Attributed**: edits carry `client_id = "plugin:<id>"`; presence shows the plugin like an
-  agent.
+- **Attributed**: edits carry `client_id = "plugin:<id>"`. Presence does not name the
+  plugin: the person is present through the pane exactly as in a native view (wave 2b;
+  docs/PRESENCE_CONTRACT.md "Plugins").
 - Changes: the guest's `Pimble` gets the same change stream (`next_change`) through the
   host, and the same `DocSession` plumbing for documents it shows.
 
@@ -312,10 +313,54 @@ first plugin.
    browser's vault stores (wave 3); the presence stream (`Backend::presence`) is not
    bridged; `Chosen` adds the store of each metanode the plugin is shown for, with no
    store picker; the browser host is wave 3.
+2b. **Presence like native, host state and requests, recipes (ABI 3)**.
+
+   **Built 2026-11-02 (branch `api`).** Joe: plugin presence looks and feels just like
+   native presence (docs/PRESENCE_CONTRACT.md "Plugins" has the design and what was
+   checked). **rinch:** joeleaver/rinch#2088 merged to `main` on 2026-11-02; the SDK and
+   the plugins point at `main` again (no branch reference anywhere) and the plugins lock
+   pins its own revision (`0740192d` now; the app's stays `2d1f11a0` until
+   `cargo update rinch` there). **ABI 3** (`ABI_VERSION`): an export
+   `pimble_host_state(ptr, len)` taking a postcard `HostState` (people per node in the
+   stores the plugin may read, resolved as the app resolves them; the key of the person its
+   pane follows; dark or light), sent after mount and whenever any of it changes; an import
+   `pimble_host(ptr, len)` taking a postcard `HostRequest` (`Open { node }`,
+   `Focus { node }`, `Follow { person }`), handed to the app a turn later (never inside the
+   guest's call) and dropped for a node of a store the plugin may not read;
+   `ApiCall::PublishPresence` removed (the person is present through the pane, never as a
+   plugin session); `Provision::Recipe(RecipeDecl { id, label, title, icon, viewer, depth,
+   children })` and `Manifest::recipes()`. **`pimble-ui`** (new crate, both workspaces):
+   the presence chips and dots, icons and colors as rinch components with no app state,
+   drawn by the app and by plugins alike. **SDK:** `Mount::host` (`Host`: `open`,
+   `focus`, `follow`, `people_in`, `following`, `dark`, `seen()` a `Copy` handle),
+   `HostLink::request`, `recipe(..)`, `display_label(node)` (the explorer's label),
+   `person(..)`, re-exports `pimble_ui`. **Host:** `Instance::on_request`,
+   `Instance::set_host_state`, `Call::HostState`, the engine links the import and needs
+   the export. **App:** `plugins.rs` pushes host state from one effect over presence, the
+   theme and every pane's following; answers `Open` with the pane's link-open, `Focus`
+   with `presence::say_within`, `Follow` with `follow::start`; lists every loaded
+   plugin's recipes in `AppStore::recipes`, offered in the explorer's row and store menus,
+   made by `BackendCommand::MakeFromRecipe` through the window's `Pimble`
+   (`pimble_api::recipes::metanode`: the metanode keys go in with the create, through
+   `NodeDoc::metanode_seed`; then the children, last each). A recipe runs no plugin code,
+   so it needs nothing allowed; the node is the person's own edit. **The handler list:**
+   rinch #2091 (sortable lists, being built) was asked for plain `data-*` handlers; any
+   attribute it adds goes in `HANDLER_ATTRIBUTES`, and a synchronous drop judge needs a
+   kind of its own answered as keys are (the note sits above `handler_kind`).
+   **Tests:** abi 5 (host state, requests and recipes round trip), sdk 3+3
+   (`a_plugin_draws_presence_with_the_apps_chips_and_asks_the_host_to_follow`), ui 5,
+   host 4 unit + applier 4 + bridge 2 + kanban 2 + wasm 3 (the harness is
+   `tests/common/mod.rs` now, shared by the bridge and kanban tests), api 18 (a recipe's
+   metanode is one from its first edit), app 206 (a pane and what its plugin view is on
+   are one person; the presence and appearance tests moved to `pimble-ui`).
+   **Install:** `scripts/plugins/install.sh [plugin ...]` builds the plugins workspace
+   for wasm32-wasip1 (guarded) and copies each `.wasm` into `<data dir>/pimble/plugins/`
+   (`PIMBLE_DATA_DIR` names a scratch one); the app loads the folder at start.
 3. **The browser host**: the same plugin running in the web app.
 4. **Host slots** (the Editor first), overlay roots for portals, the forwarded global
    machinery.
-5. **The kanban plugin** (`docs/KANBAN_CONTRACT.md`).
+5. **The kanban plugin** (`docs/KANBAN_CONTRACT.md`). Wave 1 built 2026-11-02 (its
+   contract's "Built" note), before waves 3 and 4: it needed no host slot.
 
 ## 5. How it is checked
 

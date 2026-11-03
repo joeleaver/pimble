@@ -1,6 +1,6 @@
 # Presence contract: who is here, and where
 
-Status: **all waves built on branch `presence`, 2026-10-22: 0 (names), 1 (transport, who is here), 2 (carets and selections in text), 3 (pointers and selections on boards), 4 (follow) and 5 (agents).** Written from Joe's answers that day (listed
+Status: **all waves built on branch `presence`, 2026-10-22: 0 (names), 1 (transport, who is here), 2 (carets and selections in text), 3 (pointers and selections on boards), 4 (follow) and 5 (agents).** Plugins present like native views: section "Plugins", built 2026-11-02 on branch `api`. Written from Joe's answers that day (listed
 under "Decisions" at the end). The points under "To confirm" are design choices made here
 that Joe has not seen yet. Section 3 (names per share) was added later the same day.
 
@@ -832,3 +832,65 @@ by `scripts/mcp/drive.py` with an agent "Claude" made by `pimble-cli create-agen
   node it never wrote in shows no caret.
 - A client app that sends no name leaves the hover at "Claude, an AI agent".
 
+
+## Plugins (built 2026-11-02, branch `api`)
+
+Joe, 2026-11-02: "Plugin presence should look and feel just like native presence; if we
+need more API surface to make that happen we should."
+
+**The person is the actor; the plugin is how they act.** Presence never names the plugin:
+a native canvas does not say "canvas" either, and an agent is named only because the
+agent is the one acting. Edits keep their attribution (`plugin:<id>` on the change), which
+is about what wrote, not who is here.
+
+- **Where the person is.** The pane holding a plugin's view is the person's session on the
+  metanode, exactly as for any pane (`pane_document` counts a metanode). What they are on
+  in the view (a card they chose) is a second session of the same pane:
+  `{client}:{pane}.in` (`presence::within_session`), sent through the app's own
+  `PublishPresence` under the app's own client id, `focused: false`. So:
+  - this window drops it as its own (the client is its own) and nobody sees the person
+    twice; signed out, a window's sessions are one person in one color
+    (`person_key` falls back to the client, not the session, since 2026-11-02);
+  - others see the person on that node as on any open node: its tree dot, the initials on
+    a pane holding it, its card in their own kanban;
+  - following follows the focused session, the pane, so a follower's pane opens the
+    metanode (the plugin view), not the card; the follower's view then takes the leader's
+    place (a kanban scrolls to the card they are on and edges it in their color);
+  - it is said again with every heartbeat, and a goodbye goes when the view says it is on
+    nothing, when the plugin stops or is hidden, and when the pane lets its document go;
+  - a delivery scope is the node's own, so a member outside a share never hears it.
+  A plugin says it with `Mount::host.focus(Some(addr))` (the ABI's
+  `HostRequest::Focus`); the host drops a node in a store the plugin may not read.
+  `ApiCall::PublishPresence` is gone (ABI 3): a frame of the plugin's own would show the
+  person as a second, lookalike session.
+- **Who else is where.** The host hands every mounted plugin a `HostState` (ABI export
+  `pimble_host_state`) whenever presence, the theme or its pane's following changes: for
+  each node someone is in, in the stores the plugin may read, the people as the app
+  resolves them (`presence::people_in`: names in the share, initials, `author_color`,
+  hover with devices, agents as agents), plus the key of the person its pane follows and
+  whether the theme is dark. A plugin reads `host.people_in(addr)`, `host.following()`
+  and `host.dark()` (or `host.seen()`, a `Copy` handle for reactive closures).
+- **The same components.** The chips and dots are `pimble-ui` (`crates/pimble-ui`,
+  rinch components with no app state): `PersonChip` (the pane strip's initials, an
+  agent's robot pill, the hover with "(click to follow)"), `PersonDot` (the tree's dot),
+  `more_label`, `initials`, `hover`, `follow_hint`, and their stylesheet
+  (`pimble_ui::STYLES`, in the app's document, so it styles a plugin's markup too). The
+  app's pane strip and tree rows draw with them; so does the SDK's plugin. Icons and
+  colors moved there too (`IconGlyph`, `node_icon`, `display_color`, `row_background`).
+- **Following from a plugin.** A click on a chip in a plugin asks the host to follow
+  (`HostRequest::Follow { person }`), which is `follow::start` for the plugin's pane.
+- **The server** needed nothing: the plugin's presence is the app's, stamped as the app's
+  always is.
+
+**Checked** in two release desktop apps on one server (port 7491, scratch dirs, a copy of
+the family store; the second app with `HOSTNAME=second-laptop`), both signed out:
+- A chose a card in its kanban: B's tree showed A's dot on the kanban and on the card, in
+  one color, and B's pane holding the card natively showed A's "J" on its strip.
+- B holding the card natively showed as "S" on that card in A's kanban, and on A's
+  kanban strip while B's pane showed the kanban.
+- B clicked A's "J" and followed: B's pane opened the kanban (the plugin mounted) with
+  A's card edged in A's color; A opened the card from the kanban and B followed into it.
+- An agent's edit of a card (`append` through `pimble-mcp`) showed its robot pill on the
+  card in the kanban, and faded.
+**Not checked:** two accounts through the hosted server or the relay (the frames are the
+app's own, so the existing paths carry them); the browser (no plugin host there yet).
