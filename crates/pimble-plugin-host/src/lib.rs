@@ -4,6 +4,8 @@
 //! - [`applier`]: applies a guest's op log to the app's `dyn DomDocument` under the
 //!   plugin's container, proxies its event handlers, answers the reads only the
 //!   host can. The guest-to-host node map is the sandbox.
+//! - [`bridge`]: the Pimble API across the boundary: what the person approved for
+//!   a plugin, and making its calls through the app's own backend.
 //! - [`instance`]: one running plugin over any [`GuestEngine`]: mount, props,
 //!   events, timers, and stopping it (with a sentence) when it runs too long, is
 //!   refused or traps.
@@ -15,12 +17,14 @@
 //! reuses it.
 
 pub mod applier;
+pub mod bridge;
 pub mod instance;
 #[cfg(feature = "wasm-host")]
 pub mod wasmtime_engine;
 
 pub use applier::{Applier, ApplierOptions, Refusal};
-pub use instance::{host_calls, Answered, Call, Failure, GuestEngine, HostCalls, HostKey, Instance, InstanceOptions};
+pub use bridge::{Approval, Approved};
+pub use instance::{host_calls, Answered, ApiSide, Call, Failure, GuestEngine, HostCalls, HostKey, Instance, InstanceOptions};
 pub use pimble_plugin_abi as abi;
 
 use pimble_plugin_abi::{refusal_for_abi, Manifest, ABI_VERSION};
@@ -50,6 +54,11 @@ pub fn check_manifest(manifest: &Manifest) -> Result<(), String> {
     if manifest.viewers().any(|v| v.id.is_empty()) {
         return Err(format!("The {name} plugin provides a viewer with no id."));
     }
+    // Decision 6: no plugin reaches the network in these waves, so one that
+    // needs it would not work if it ran.
+    if manifest.asks.network {
+        return Err(format!("The {name} plugin asks to use the network, which Pimble does not allow plugins yet."));
+    }
     Ok(())
 }
 
@@ -66,6 +75,7 @@ mod tests {
             abi,
             rinch: "somewhere-else".into(),
             provides: vec![Provision::Viewer(ViewerDecl { id: "hello".into(), name: "Hello".into(), takes: vec![SourceShape::Any] })],
+            asks: Default::default(),
         }
     }
 
@@ -80,5 +90,9 @@ mod tests {
         let mut nameless = manifest(ABI_VERSION);
         nameless.id.clear();
         assert!(check_manifest(&nameless).is_err());
+        // Decision 6: no network in these waves.
+        let mut online = manifest(ABI_VERSION);
+        online.asks.network = true;
+        assert_eq!(check_manifest(&online).unwrap_err(), "The Hello viewer plugin asks to use the network, which Pimble does not allow plugins yet.");
     }
 }

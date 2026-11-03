@@ -13,6 +13,13 @@ workspace = "../../plugins"
 
 [dependencies]
 pimble-plugin-abi = { path = "../pimble-plugin-abi" }
+# The API a plugin uses (docs/PLUGINS_CONTRACT.md wave 2), without its RPC
+# backend: a plugin reaches the stores through the host (`GuestBackend`).
+pimble-api = { path = "../pimble-api", default-features = false }
+pimble-core = { path = "../pimble-core" }
+pimble-rpc = { path = "../pimble-rpc" }
+futures = "0.3"
+async-trait = "0.1"
 # Components and theme only, nothing browser-specific: a wasm32-wasip1 guest runs
 # inside a host that is not a browser. The branch gates rinch's browser halves on
 # `target_os = "unknown"` (joeleaver/rinch#2088); back to `main` once it merges.

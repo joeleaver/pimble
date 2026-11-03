@@ -4,10 +4,12 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 publish = false
-description = "A toy Pimble plugin: the `hello` metanode viewer (docs/PLUGINS_CONTRACT.md wave 1)"
+description = "A toy Pimble plugin: the `hello` metanode viewer (docs/PLUGINS_CONTRACT.md waves 1 and 2)"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pimble-plugin-sdk = { path = "../../crates/pimble-plugin-sdk" }
+# The value a rename's `explicit_title` flag is written as.
+serde_json = "1"

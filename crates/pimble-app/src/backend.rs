@@ -192,10 +192,19 @@ async fn backend_loop(cmd_rx: Receiver<BackendCommand>, event_tx: Sender<Backend
         });
     }
 
+    let plugin_calls = PluginCalls::default();
+
     // Blocking on the channel is fine here: this runs on the thread that
     // owns the runtime, and every task (the listener, the watchdog, a
     // picture being stored) runs on the runtime's workers.
     while let Ok(cmd) = cmd_rx.recv() {
+        // A plugin's calls run beside the command loop, each a task of its
+        // own: a slow one (or a subscription, which lasts) must not hold up
+        // the window's commands.
+        let cmd = match plugin_calls.take(cmd, &api, &event_tx, &signal_ui) {
+            Some(cmd) => cmd,
+            None => continue,
+        };
         // What only the server's operator does goes over the connection
         // itself; asking for it here connects again first if it closed.
         let host = local.client().await.ok();
@@ -217,6 +226,79 @@ async fn backend_loop(cmd_rx: Receiver<BackendCommand>, event_tx: Sender<Backend
 
     // The window closed: only a server this process started is stopped.
     local.shut_down().await;
+}
+
+/// The plugin calls in flight (docs/PLUGINS_CONTRACT.md wave 2), by instance
+/// and call: what a cancelled call or a stopped plugin aborts.
+#[derive(Default, Clone)]
+struct PluginCalls(Arc<std::sync::Mutex<std::collections::HashMap<u64, std::collections::HashMap<u64, futures::future::AbortHandle>>>>);
+
+impl PluginCalls {
+    /// Run `cmd` when it is a plugin's, answering `None`; any other command
+    /// comes back for the loop.
+    fn take(
+        &self,
+        cmd: BackendCommand,
+        api: &Arc<Pimble>,
+        event_tx: &Sender<BackendEvent>,
+        signal_ui: &Arc<dyn Fn() + Send + Sync>,
+    ) -> Option<BackendCommand> {
+        use pimble_plugin_host::abi::api::{ApiCall, ApiReply};
+        use pimble_plugin_host::bridge;
+        match cmd {
+            BackendCommand::PluginCall { instance, plugin_id, plugin_name, approval, call_id, call } => {
+                let (api, event_tx, signal_ui, calls) = (api.clone(), event_tx.clone(), signal_ui.clone(), self.clone());
+                let reply = move |reply: ApiReply| {
+                    let _ = event_tx.try_send(BackendEvent::PluginReply { instance, call_id, reply });
+                    signal_ui();
+                };
+                let work = async move {
+                    match call {
+                        ApiCall::Subscribe { store } => match bridge::subscribe(api.backend(), &plugin_name, &approval, store).await {
+                            Ok(mut changes) => {
+                                use futures::StreamExt;
+                                reply(ApiReply::Subscribed);
+                                while let Some(change) = changes.next().await {
+                                    reply(ApiReply::Change { change: change.into() });
+                                }
+                                reply(ApiReply::Ended);
+                            }
+                            Err(e) => reply(ApiReply::error(e)),
+                        },
+                        call => reply(bridge::execute(api.backend(), &plugin_id, &plugin_name, &approval, call).await),
+                    }
+                    calls.done(instance, call_id);
+                };
+                let (work, handle) = futures::future::abortable(work);
+                self.0.lock().unwrap().entry(instance).or_default().insert(call_id, handle);
+                tokio::spawn(work);
+                None
+            }
+            BackendCommand::PluginCancel { instance, call_id } => {
+                if let Some(handle) = self.0.lock().unwrap().get_mut(&instance).and_then(|calls| calls.remove(&call_id)) {
+                    handle.abort();
+                }
+                None
+            }
+            BackendCommand::PluginForget { instance } => {
+                for (_, handle) in self.0.lock().unwrap().remove(&instance).unwrap_or_default() {
+                    handle.abort();
+                }
+                None
+            }
+            other => Some(other),
+        }
+    }
+
+    fn done(&self, instance: u64, call_id: u64) {
+        let mut all = self.0.lock().unwrap();
+        if let Some(calls) = all.get_mut(&instance) {
+            calls.remove(&call_id);
+            if calls.is_empty() {
+                all.remove(&instance);
+            }
+        }
+    }
 }
 
 /// `process_command`, as `crate::import` asks it.

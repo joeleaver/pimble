@@ -16,17 +16,24 @@
 //! [`imports::TAKE_ANSWER`], so the host never calls into the guest while the guest
 //! is calling it.
 //!
+//! The Pimble API crosses in [`api`]: a plugin's `Backend` call is an
+//! [`imports::API_CALL`] naming a call id, and its answer comes back later through
+//! [`exports::RESOLVE`] (docs/PLUGINS_CONTRACT.md wave 2). Those messages are JSON
+//! (see the module for why).
+//!
 //! Every export and import name carries a `pimble_` prefix: a wasip1 module links
 //! wasi-libc, and a plain `free` export or `log` import would collide with libc's
 //! `free` and libm's `log` at link time.
 
 use serde::{Deserialize, Serialize};
 
+pub mod api;
+
 /// The version of this ABI. A host runs only plugins built for the same version;
 /// anything else is refused at load with [`refusal_for_abi`]'s sentence. Bump it on
 /// any change a plugin built before it would misread: a message's shape, an export,
 /// an import, the meaning of a node id.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 /// The guest node id of the plugin document's `<html>` root. Nothing in the host
 /// stands for it: a plugin renders under its body.
@@ -67,6 +74,10 @@ pub mod exports {
     /// `() -> i64`: sample the guest's polled signals; answers the milliseconds
     /// until the next is due, 0 for every frame, -1 for none.
     pub const DRAIN_POLLS: &str = "pimble_drain_polls";
+    /// `(ptr: u32, len: u32)`: an [`api::Resolution`](crate::api::Resolution), the
+    /// answer to one of the guest's API calls (JSON). The host never calls it
+    /// inside the guest's own call: an answer is always a later turn.
+    pub const RESOLVE: &str = "pimble_resolve";
     /// The guest's linear memory.
     pub const MEMORY: &str = "memory";
 }
@@ -89,6 +100,14 @@ pub mod imports {
     pub const SCHEDULE_TASK: &str = "pimble_schedule_task";
     /// `()`: a polled signal was registered; call `DRAIN_POLLS` soon.
     pub const WAKE_POLLS: &str = "pimble_wake_polls";
+    /// `(call: u64, ptr: u32, len: u32)`: an [`api::ApiCall`](crate::api::ApiCall)
+    /// (JSON) under the guest's own call id. Answers nothing now: the host checks
+    /// it against the plugin's approval, forwards it, and later calls `RESOLVE`
+    /// with the call id (a refusal too).
+    pub const API_CALL: &str = "pimble_api_call";
+    /// `(call: u64)`: the guest no longer wants answers to that call (a
+    /// subscription it dropped).
+    pub const API_CANCEL: &str = "pimble_api_cancel";
     /// `(level: u32, ptr: u32, len: u32)`: a line for the app's log, UTF-8. Level 0
     /// is an error, 1 a warning, 2 information, 3 and above debugging.
     pub const LOG: &str = "pimble_log";
@@ -132,6 +151,43 @@ pub struct Manifest {
     pub rinch: String,
     /// What it provides.
     pub provides: Vec<Provision>,
+    /// What it asks to be allowed (decision 2): the person approves it once per
+    /// device, and the host refuses any call outside what was approved.
+    pub asks: Permissions,
+}
+
+/// What a plugin asks to be allowed to do through the Pimble API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Permissions {
+    /// Which stores it reads (and writes, with `write`).
+    pub stores: StoreAsk,
+    /// It changes what it reads, not only shows it.
+    pub write: bool,
+    /// It reaches the network. No host grants this yet (decision 6): a plugin
+    /// that asks for it is refused at load.
+    pub network: bool,
+}
+
+/// Which stores a plugin asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum StoreAsk {
+    /// None: it reads nothing through the API.
+    #[default]
+    None,
+    /// Every store open on the device, now and later.
+    All,
+    /// The stores the person chooses when approving it (the store of the
+    /// metanode it is first shown for, and each further one as it is shown
+    /// there).
+    Chosen,
+}
+
+impl Permissions {
+    /// Whether it asks for anything at all: a plugin asking for nothing is
+    /// shown without an approval.
+    pub fn asks_anything(&self) -> bool {
+        self.stores != StoreAsk::None || self.write || self.network
+    }
 }
 
 /// One thing a plugin provides.
@@ -186,17 +242,16 @@ pub struct MountArgs {
     pub props: Props,
 }
 
-/// What a viewer shows (wave 1: the metanode's address and its source's forest;
-/// the viewer reads and writes through the Pimble API from wave 2).
+/// What a viewer is handed: the metanode it shows and the viewer's settings on
+/// it. The viewer reads the metanode's source (`Pimble::metanode_source`) and
+/// everything else through the Pimble API, which keeps it live; the props change
+/// only when the settings do.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Props {
     /// The metanode.
     pub metanode: NodeAddr,
-    /// The metanode's own label.
-    pub title: String,
-    /// The source's forest, depth first in the tree's order.
-    pub forest: Vec<ForestRow>,
-    /// The viewer's shared settings on the node, as JSON, when it has any.
+    /// The viewer's shared settings on the node (its `data` under the viewer's
+    /// id), as JSON, when it has any.
     pub settings: Option<String>,
 }
 
@@ -207,16 +262,19 @@ pub struct NodeAddr {
     pub node: String,
 }
 
-/// One node of a source's forest.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ForestRow {
-    pub addr: NodeAddr,
-    /// Its parent in the forest, when the parent was found too.
-    pub parent: Option<NodeAddr>,
-    /// 1 for the metanode's own children.
-    pub depth: u32,
-    pub label: String,
-    pub node_type: String,
+impl NodeAddr {
+    /// The API's address, when both ids parse.
+    pub fn addr(&self) -> Option<pimble_api::Addr> {
+        let store = pimble_core::StoreId::parse(&self.store).ok()?;
+        let node = pimble_core::NodeId::parse(&self.node).ok()?;
+        Some(pimble_api::Addr::new(store, node))
+    }
+}
+
+impl From<pimble_api::Addr> for NodeAddr {
+    fn from(a: pimble_api::Addr) -> Self {
+        NodeAddr { store: a.store.to_string(), node: a.node.to_string() }
+    }
 }
 
 // ── The DOM op log ────────────────────────────────────────────────────────────
@@ -425,6 +483,7 @@ mod tests {
                 name: "Hello".into(),
                 takes: vec![SourceShape::Any, SourceShape::Subtree { depth: 2 }],
             })],
+            asks: Permissions { stores: StoreAsk::Chosen, write: true, network: false },
         };
         assert_eq!(decode::<Manifest>(&encode(&manifest)).unwrap(), manifest);
         let ops = vec![

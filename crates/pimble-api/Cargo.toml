@@ -10,7 +10,10 @@ description = "The one Pimble API every client uses (docs/API_CONTRACT.md): held
 pimble-core = { workspace = true }
 pimble-crdt = { workspace = true }
 pimble-rpc = { workspace = true }
-pimble-client = { workspace = true }
+# The RPC backend (`rpc`, on by default). A plugin's guest builds this crate
+# without it for wasm32-wasip1 (docs/PLUGINS_CONTRACT.md wave 2): it reaches
+# the stores through the host, so it needs no client and no JSON-RPC stack.
+pimble-client = { workspace = true, optional = true }
 pimble-sheet = { workspace = true }
 pimble-board = { workspace = true }
 pimble-discussion = { workspace = true }
@@ -23,6 +26,9 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 
 [features]
+default = ["rpc"]
+# `RpcBackend` over `PimbleClient`, and `ApiError`s from the client's errors.
+rpc = ["dep:pimble-client"]
 # The conformance suite (docs/API_CONTRACT.md section 4), for the tests of
 # every backend: this crate's own and the browser's vault.
 conformance = []

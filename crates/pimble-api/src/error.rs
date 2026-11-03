@@ -4,6 +4,7 @@
 //! libraries' by their own types, and nobody matches text to tell them apart.
 
 use pimble_board::BoardError;
+#[cfg(feature = "rpc")]
 use pimble_client::ClientError;
 use pimble_core::StoreAccess;
 use pimble_crdt::CrdtError;
@@ -169,6 +170,7 @@ impl From<&str> for ApiError {
 /// `-32004` names which refusal it is with `StoreAccess`'s sentences, which
 /// are the server's whole message for those two; that is reading the
 /// constant the server wrote, not guessing from text.
+#[cfg(feature = "rpc")]
 impl From<ClientError> for ApiError {
     fn from(e: ClientError) -> Self {
         match e {
@@ -230,6 +232,7 @@ impl From<pimble_discussion::DiscussionError> for ApiError {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "rpc")]
     #[test]
     fn refusals_are_told_apart_by_code() {
         let read = ClientError::Server { code: -32004, message: StoreAccess::READ_ONLY_REFUSAL.into() };

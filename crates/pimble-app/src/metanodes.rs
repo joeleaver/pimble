@@ -51,6 +51,10 @@ pub struct MetanodeUi {
     pub loaded: Signal<bool>,
     /// A plugin's view is in the pane, in place of the outline.
     pub plugin: Signal<bool>,
+    /// The viewer's plugin asks to be allowed what it needs: this sentence,
+    /// over the outline, with "Allow" and "Not now" (docs/PLUGINS_CONTRACT.md
+    /// decision 2).
+    pub asking: Signal<Option<String>>,
 }
 
 impl MetanodeUi {
@@ -60,6 +64,7 @@ impl MetanodeUi {
             lines: Signal::new(Vec::new()),
             loaded: Signal::new(false),
             plugin: Signal::new(false),
+            asking: Signal::new(None),
         }
     }
 }
@@ -123,6 +128,7 @@ pub(crate) fn stop(store: AppStore, pane: PaneId) {
     state.metanode_ui.rows.set(Vec::new());
     state.metanode_ui.lines.set(Vec::new());
     state.metanode_ui.plugin.set(false);
+    state.metanode_ui.asking.set(None);
     #[cfg(feature = "native")]
     crate::plugins::hide(pane);
     let key = (held.store_id, held.node_id);
@@ -213,10 +219,12 @@ fn fill(store: AppStore, pane: PaneId, forest: Result<&Forest, &str>) {
     };
     let mut lines = Vec::new();
     let mut plugin = false;
+    let mut asking = None;
     if let Some(spec) = &forest.spec {
         match viewer(store, pane, &spec.viewer, forest) {
             Viewer::Plugin => plugin = true,
             Viewer::Outline(sentence) => lines.push(sentence),
+            Viewer::Ask(sentence) => asking = Some(sentence),
             Viewer::Missing => lines.push(outline_line(&spec.viewer)),
         }
     }
@@ -239,6 +247,7 @@ fn fill(store: AppStore, pane: PaneId, forest: Result<&Forest, &str>) {
     ui.rows.set(rows);
     ui.loaded.set(true);
     ui.plugin.set(plugin);
+    ui.asking.set(asking);
 }
 
 /// What a pane shows for a metanode's viewer.
@@ -248,6 +257,8 @@ enum Viewer {
     Plugin,
     /// The outline, under this sentence (its plugin was refused or stopped).
     Outline(String),
+    /// The outline, under the plugin's request to be allowed what it needs.
+    Ask(String),
     /// The outline, under the line naming the missing viewer.
     Missing,
 }
@@ -257,6 +268,7 @@ fn viewer(store: AppStore, pane: PaneId, viewer: &str, forest: &Forest) -> Viewe
     match crate::plugins::show(store, pane, viewer, forest) {
         crate::plugins::Outcome::Shown => Viewer::Plugin,
         crate::plugins::Outcome::Outline(sentence) => Viewer::Outline(sentence),
+        crate::plugins::Outcome::Ask(sentence) => Viewer::Ask(sentence),
         crate::plugins::Outcome::Missing => Viewer::Missing,
     }
 }
@@ -277,6 +289,33 @@ pub(crate) fn plugin_stopped(store: AppStore, pane: PaneId, sentence: &str) {
         lines.retain(|l| l != sentence);
         lines.insert(0, sentence.to_string());
     });
+}
+
+/// Pane `pane` shows its metanode again from the forest held for it (a plugin
+/// was allowed, declined or revoked there).
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
+pub(crate) fn refill(store: AppStore, pane: PaneId) {
+    let Some(held) = untracked(|| store.pane(pane).metanode.get()) else { return };
+    let forest = FORESTS.with(|f| f.borrow().get(&(held.store_id, held.node_id)).cloned());
+    if let Some(forest) = forest {
+        fill(store, pane, Ok(&forest));
+    }
+}
+
+/// "Allow" under a plugin's request in pane `pane`.
+fn allow_plugin(store: AppStore, pane: PaneId) {
+    #[cfg(feature = "native")]
+    crate::plugins::allow(store, pane);
+    #[cfg(not(feature = "native"))]
+    let _ = (store, pane);
+}
+
+/// "Not now" under a plugin's request in pane `pane`.
+fn decline_plugin(store: AppStore, pane: PaneId) {
+    #[cfg(feature = "native")]
+    crate::plugins::decline(store, pane);
+    #[cfg(not(feature = "native"))]
+    let _ = (store, pane);
 }
 
 /// The plugins folder finished loading: every pane showing a metanode looks for
@@ -340,6 +379,18 @@ pub(crate) fn render_metanode(__scope: &mut RenderScope, store: AppStore, pane: 
                     key: line.clone(),
                     class: "pimble-metanode__line",
                     {line.clone()}
+                }
+            }
+            if ui.asking.with(|a| a.is_some()) {
+                div {
+                    class: "pimble-metanode__ask",
+                    style: "display: flex; align-items: center; gap: 8px; flex-wrap: wrap;",
+                    span {
+                        class: "pimble-metanode__line",
+                        {move || ui.asking.get().unwrap_or_default()}
+                    }
+                    Button { variant: "filled", size: "xs", onclick: move || allow_plugin(store, pane), "Allow" }
+                    Button { variant: "default", size: "xs", onclick: move || decline_plugin(store, pane), "Not now" }
                 }
             }
             {plugin_slot}

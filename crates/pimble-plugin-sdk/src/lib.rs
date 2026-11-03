@@ -11,11 +11,20 @@
 //! fn describe() -> Manifest {
 //!     manifest("hello-viewer", "Hello viewer", env!("CARGO_PKG_VERSION"))
 //!         .with(viewer("hello", "Hello", &[SourceShape::Any]))
+//!         .writes(StoreAsk::Chosen)
 //! }
 //!
 //! fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
-//!     let props = mount.props;
-//!     rsx! { h2 { {move || props.get().title} } }
+//!     let title = Signal::new(String::new());
+//!     let (api, metanode) = (mount.api.clone(), mount.metanode());
+//!     spawn_local(async move {
+//!         if let Some(addr) = metanode {
+//!             if let Ok(forest) = api.metanode_source(addr).await {
+//!                 title.set(pimble_api::label(&forest.node));
+//!             }
+//!         }
+//!     });
+//!     rsx! { h2 { {move || title.get()} } }
 //! }
 //!
 //! pimble_plugin_sdk::plugin!(describe: describe, view: view);
@@ -24,12 +33,18 @@
 //! Build it with `cargo build --release --target wasm32-wasip1` as a `cdylib`, and
 //! put the `.wasm` in the plugins folder of Pimble's data directory.
 //!
+//! A plugin reads and writes through `mount.api`, a `pimble_api::Pimble` over
+//! [`GuestBackend`]: the same API the app uses, allowed what the person approved
+//! for the plugin (the manifest's `asks`) and judged by the server with the
+//! person's role.
+//!
 //! The view renders into a [`RemoteDocument`]: a shadow of the plugin's tree that
 //! answers rinch's structural reads, and a log of DOM writes the host applies to the
 //! window under the plugin's area at the end of every turn. Events come back to the
 //! plugin's own handlers, so `onclick`, `oninput` and `onkeydown` work as anywhere
 //! else in rinch.
 
+pub mod api;
 pub mod document;
 pub mod runtime;
 mod selector;
@@ -39,7 +54,10 @@ pub mod wasm;
 
 pub use document::{HostLink, RemoteDocument};
 pub use pimble_plugin_abi as abi;
-pub use pimble_plugin_abi::{ForestRow, Manifest, NodeAddr, Props, Provision, SourceShape, ViewerDecl, ABI_VERSION};
+pub use api::{ApiLink, Bridge, GuestBackend};
+pub use pimble_api;
+pub use pimble_core;
+pub use pimble_plugin_abi::{Manifest, NodeAddr, Permissions, Props, Provision, SourceShape, StoreAsk, ViewerDecl, ABI_VERSION};
 pub use runtime::{log_line, Guest, Mount, ViewFn};
 
 /// The rinch git revision this SDK was built against (from the plugin's
@@ -54,9 +72,11 @@ pub use rinch;
 /// Glob-import it in every module that uses `rsx!`, which reaches rinch through the
 /// `rinch` it brings into scope.
 pub mod prelude {
-    pub use crate::rinch;
+    pub use crate::{pimble_api, rinch};
     pub use crate::{manifest, viewer, ManifestExt, Mount};
-    pub use pimble_plugin_abi::{ForestRow, Manifest, NodeAddr, Props, SourceShape};
+    pub use pimble_api::{plan, Addr, ApiError, Forest, ForestEntry, Pimble};
+    pub use pimble_core::Place;
+    pub use pimble_plugin_abi::{Manifest, NodeAddr, Permissions, Props, SourceShape, StoreAsk};
     pub use rinch::prelude::*;
 }
 
@@ -70,6 +90,7 @@ pub fn manifest(id: &str, name: &str, version: &str) -> Manifest {
         abi: ABI_VERSION,
         rinch: RINCH_REVISION.to_string(),
         provides: Vec::new(),
+        asks: Permissions::default(),
     }
 }
 
@@ -83,11 +104,26 @@ pub fn viewer(id: &str, name: &str, takes: &[SourceShape]) -> Provision {
 pub trait ManifestExt {
     /// The manifest, also providing `provision`.
     fn with(self, provision: Provision) -> Self;
+    /// The manifest, asking to read the stores `stores` names.
+    fn reads(self, stores: StoreAsk) -> Self;
+    /// The manifest, asking to read and change the stores `stores` names.
+    fn writes(self, stores: StoreAsk) -> Self;
 }
 
 impl ManifestExt for Manifest {
     fn with(mut self, provision: Provision) -> Self {
         self.provides.push(provision);
+        self
+    }
+
+    fn reads(mut self, stores: StoreAsk) -> Self {
+        self.asks.stores = stores;
+        self
+    }
+
+    fn writes(mut self, stores: StoreAsk) -> Self {
+        self.asks.stores = stores;
+        self.asks.write = true;
         self
     }
 }
@@ -129,7 +165,11 @@ macro_rules! plugin {
             }
             #[unsafe(no_mangle)]
             pub extern "C" fn pimble_mount(ptr: u32, len: u32) {
-                $crate::wasm::mount($view, ptr, len)
+                $crate::wasm::mount($describe, $view, ptr, len)
+            }
+            #[unsafe(no_mangle)]
+            pub extern "C" fn pimble_resolve(ptr: u32, len: u32) {
+                $crate::wasm::resolve(ptr, len)
             }
             #[unsafe(no_mangle)]
             pub extern "C" fn pimble_dispatch(ptr: u32, len: u32) -> u32 {

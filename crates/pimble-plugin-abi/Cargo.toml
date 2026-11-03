@@ -10,6 +10,17 @@ description = "What crosses between a Pimble plugin (a wasm32-wasip1 guest) and 
 # and they are built against different rinch revisions (the SDK's points at a
 # branch until a rinch change merges, docs/PLUGINS_CONTRACT.md wave 1), so the
 # messages are plain data that each side translates to and from its own rinch.
+#
+# The API messages (`api`) carry Pimble's own types, so this crate depends on
+# pimble-api without its RPC backend (which a guest cannot build), and on the
+# core and RPC types those messages are made of.
 [dependencies]
 serde = { workspace = true }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+pimble-core = { workspace = true }
+pimble-rpc = { workspace = true }
+# A path, not the workspace entry: a member cannot turn off default features the
+# workspace entry leaves on.
+pimble-api = { path = "../pimble-api", default-features = false }

@@ -6,9 +6,10 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use pimble_plugin_sdk::abi::{
-    Answer, Click, Event, EventData, ForestRow, Key, Modifiers, MountArgs, NodeAddr, Op, Props, Query, GUEST_BODY,
+    Answer, Click, Event, EventData, Key, Modifiers, MountArgs, NodeAddr, Op, Props, Query, GUEST_BODY,
     GUEST_ROOT,
 };
 use pimble_plugin_sdk::prelude::*;
@@ -97,10 +98,10 @@ fn counter(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
         div {
             class: "counter",
             style: "padding: 4px;",
-            h2 { {move || props.get().title} }
+            h2 { {move || heading(&props.get())} }
             ul {
-                for row in props.get().forest {
-                    li { key: row.addr.node.clone(), {row.label.clone()} }
+                for label in rows(&props.get()) {
+                    li { key: label.clone(), {label.clone()} }
                 }
             }
             if clicks.get() > 1 {
@@ -121,22 +122,33 @@ fn counter(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
     }
 }
 
+/// The test's props: a heading and rows, carried in the viewer's settings as
+/// `heading|row,row` (a plugin reads its nodes through the API; these tests are
+/// about the document, so the props carry something to draw).
 fn props(title: &str, labels: &[&str]) -> Props {
-    Props {
-        metanode: NodeAddr { store: "s".into(), node: "m".into() },
-        title: title.into(),
-        forest: labels
-            .iter()
-            .map(|label| ForestRow {
-                addr: NodeAddr { store: "s".into(), node: label.to_string() },
-                parent: None,
-                depth: 1,
-                label: label.to_string(),
-                node_type: "document".into(),
-            })
-            .collect(),
-        settings: None,
-    }
+    Props { metanode: NodeAddr { store: "s".into(), node: "m".into() }, settings: Some(format!("{title}|{}", labels.join(","))) }
+}
+
+fn heading(props: &Props) -> String {
+    props.settings.as_deref().unwrap_or_default().split('|').next().unwrap_or_default().to_string()
+}
+
+fn rows(props: &Props) -> Vec<String> {
+    let settings = props.settings.clone().unwrap_or_default();
+    let list = settings.split('|').nth(1).unwrap_or_default();
+    list.split(',').filter(|l| !l.is_empty()).map(str::to_string).collect()
+}
+
+/// An API that is never answered: these tests make no calls.
+struct NoHost;
+
+impl pimble_plugin_sdk::ApiLink for NoHost {
+    fn call(&self, _id: u64, _call: Vec<u8>) {}
+    fn cancel(&self, _id: u64) {}
+}
+
+fn api() -> Arc<Pimble> {
+    Arc::new(Pimble::new(pimble_plugin_sdk::GuestBackend::new(pimble_plugin_sdk::Bridge::new(NoHost)), "plugin:test"))
 }
 
 /// A handler attribute's value is an id that differs between two renders.
@@ -195,13 +207,13 @@ fn a_component_renders_the_same_tree_through_a_remote_document() {
     let mut scope = RenderScope::new(direct_dyn.clone(), body);
     let node = scope.build(|s| {
         let p = Signal::new(props("Work", &["Plan", "Do"]));
-        counter(s, Mount { viewer: "test".into(), props: p })
+        counter(s, Mount { viewer: "test".into(), props: p, api: api() })
     });
     NodeHandle::new(body, Rc::downgrade(&direct_dyn)).append_child(&node);
 
     // Through a plugin's document, applied to another mock.
     let host = ApplyToMock::new();
-    let mut guest = Guest::new(host.clone());
+    let mut guest = Guest::new(host.clone(), api());
     guest.mount(counter, MountArgs { viewer: "test".into(), props: props("Work", &["Plan", "Do"]) });
     let remote = guest.document();
     assert_eq!(remote.borrow().ops_pending(), 0, "a turn ends with the log flushed");
@@ -262,7 +274,7 @@ fn a_component_renders_the_same_tree_through_a_remote_document() {
 #[test]
 fn a_read_only_the_host_answers_sends_the_pending_writes_first() {
     let host = ApplyToMock::new();
-    let guest = Guest::new(host.clone());
+    let guest = Guest::new(host.clone(), api());
     let doc = guest.document();
     let field = doc.borrow_mut().create_element("input");
     doc.borrow_mut().set_attribute(field, "value", "draft");

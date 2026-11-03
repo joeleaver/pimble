@@ -69,6 +69,9 @@ fn account_entries(store: AppStore) -> Vec<MenuEntry> {
         MenuEntry::Separator,
         // docs/AGENTS_CONTRACT.md: the AI apps connected here, and what each reaches.
         MenuEntry::item("AI Agents...", "", move || crate::agents::open(store)),
+        // docs/PLUGINS_CONTRACT.md decision 2: the plugins installed here, and
+        // what each was allowed.
+        MenuEntry::item("Plugins...", "", move || crate::plugins::open(store)),
     ]
 }
 

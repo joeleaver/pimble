@@ -4495,6 +4495,9 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         // Account > "AI Agents..." (docs/AGENTS_CONTRACT.md), the desktop only.
         #[cfg(feature = "native")]
         let agents_modal = crate::agents::render_modal(__scope, store);
+        // Account > "Plugins..." (docs/PLUGINS_CONTRACT.md decision 2), the desktop only.
+        #[cfg(feature = "native")]
+        let plugins_modal = crate::plugins::render_modal(__scope, store);
         // "Shares..." and the first-open question (docs/PRESENCE_CONTRACT.md
         // section 3), both targets.
         let shares_modal = crate::shares::render_modal(__scope, store);
@@ -4538,6 +4541,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {stop_relay_modal}
                 {hosted_modal}
                 {agents_modal}
+                {plugins_modal}
                 {share_modal}
                 {shares_modal}
                 {share_name_question}

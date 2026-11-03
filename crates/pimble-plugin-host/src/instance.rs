@@ -12,10 +12,13 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::{Rc, Weak};
 
+use pimble_api::ApiError;
+use pimble_plugin_abi::api::{decode_json, encode_json, ApiCall, ApiReply, Resolution};
 use pimble_plugin_abi::{decode, encode, Event, EventData, MountArgs, Op, Props, Query};
 use rinch_core::dom::{DomDocument, NodeId};
 
 use crate::applier::{Applier, ApplierOptions, Dispatch, Refusal};
+use crate::bridge::Approval;
 
 /// An export call.
 #[derive(Debug, Clone, Copy)]
@@ -28,6 +31,8 @@ pub enum Call<'a> {
     FireTimeout(u64),
     PollTask(u64),
     DrainPolls,
+    /// An answer to one of its API calls (a JSON [`Resolution`]).
+    Resolve(&'a [u8]),
 }
 
 /// What an export call answered.
@@ -79,6 +84,33 @@ pub trait HostCalls {
     fn schedule_task(&self, id: u64);
     fn wake_polls(&self);
     fn log(&self, level: u32, line: &str);
+    /// An API call (a JSON [`ApiCall`]) under the guest's call id. Never answered
+    /// inside the guest's call: the answer is a later [`Call::Resolve`].
+    fn api_call(&self, call: u64, bytes: &[u8]);
+    /// The guest wants no more answers to `call`.
+    fn api_cancel(&self, call: u64);
+}
+
+/// Where an instance's API calls go once its approval allows them
+/// (`crate::bridge`): the app forwards them to its own backend and hands each
+/// answer back with [`Instance::resolve`].
+pub struct ApiSide {
+    /// The plugin's id, which its edits are attributed to.
+    pub plugin_id: String,
+    /// What the person allowed it on this device.
+    pub approval: Approval,
+    /// Make call `call` (already checked against the approval).
+    pub forward: Box<dyn Fn(u64, ApiCall)>,
+    /// Stop answering call `call` (a subscription the plugin dropped).
+    pub cancel: Box<dyn Fn(u64)>,
+    /// The instance stopped: drop everything still in flight for it.
+    pub forget: Box<dyn Fn()>,
+}
+
+/// What waits for the guest to finish its call.
+enum Pending {
+    Event(Event),
+    Resolve(Vec<u8>),
 }
 
 /// Names an instance's [`HostCalls`] to its engine.
@@ -108,8 +140,11 @@ struct Inner {
     engine: RefCell<Option<Box<dyn GuestEngine>>>,
     applier: RefCell<Applier>,
     /// Events that arrived while the guest was busy (a write it made set off a
-    /// host handler of its own): handed over once the call returns.
-    queued: RefCell<VecDeque<Event>>,
+    /// host handler of its own), and answers to its API calls made meanwhile:
+    /// handed over, in order, once the call returns.
+    queued: RefCell<VecDeque<Pending>>,
+    /// Where its API calls go; without one, every call is refused.
+    api: RefCell<Option<ApiSide>>,
     stopped: Cell<bool>,
     on_stop: RefCell<Option<Box<dyn Fn(&str)>>>,
     /// The last error the plugin logged (its panic message), for the sentence when
@@ -150,6 +185,7 @@ impl Instance {
                 engine: RefCell::new(None),
                 applier: RefCell::new(Applier::new(doc, container, dispatch, options.applier)),
                 queued: RefCell::new(VecDeque::new()),
+                api: RefCell::new(None),
                 stopped: Cell::new(false),
                 on_stop: RefCell::new(None),
                 last_error: RefCell::new(None),
@@ -166,6 +202,31 @@ impl Instance {
             }
             Err(failure) => Err(failure.sentence(name)),
         }
+    }
+
+    /// Give the instance its way to the API, allowed what `side.approval` says.
+    pub fn set_api(&self, side: ApiSide) {
+        *self.0.api.borrow_mut() = Some(side);
+    }
+
+    /// The approval its calls are checked against, changed (the person allowed
+    /// it more, or less).
+    pub fn set_approval(&self, approval: Approval) {
+        if let Some(side) = self.0.api.borrow_mut().as_mut() {
+            side.approval = approval;
+        }
+    }
+
+    /// The key its engine reaches it by; the app names the instance with it on
+    /// the way to its backend and back.
+    pub fn key(&self) -> HostKey {
+        self.0.key
+    }
+
+    /// Answer the guest's API call `call`. When the guest is in a call, the
+    /// answer waits for it to return.
+    pub fn resolve(&self, call: u64, reply: ApiReply) {
+        self.0.resolve(call, reply);
     }
 
     /// Call `f` with the sentence when the instance stops by itself (it ran too
@@ -269,7 +330,7 @@ impl Inner {
             // needs its answer now and cannot wait, so it goes unconsumed; anything
             // else waits for the call to return.
             if !matches!(event.data, EventData::Key(_) | EventData::Wheel(_)) {
-                self.queued.borrow_mut().push_back(event);
+                self.queued.borrow_mut().push_back(Pending::Event(event));
             }
             return false;
         }
@@ -277,12 +338,39 @@ impl Inner {
         matches!(self.call(Call::Dispatch(&bytes)), Some(Answered::Flag(true)))
     }
 
+    fn resolve(&self, call: u64, reply: ApiReply) {
+        if self.stopped.get() {
+            return;
+        }
+        let bytes = encode_json(&Resolution { call, reply });
+        if self.engine.try_borrow_mut().is_err() {
+            self.queued.borrow_mut().push_back(Pending::Resolve(bytes));
+            return;
+        }
+        self.call(Call::Resolve(&bytes));
+    }
+
     fn drain_queue(&self) {
         loop {
             let next = self.queued.borrow_mut().pop_front();
-            let Some(event) = next else { break };
-            self.dispatch(event);
+            match next {
+                None => break,
+                Some(Pending::Event(event)) => {
+                    self.dispatch(event);
+                }
+                Some(Pending::Resolve(bytes)) => {
+                    if !self.stopped.get() {
+                        self.call(Call::Resolve(&bytes));
+                    }
+                }
+            }
         }
+    }
+
+    /// Answer `call` with `reply` at the next turn: never inside the guest's own
+    /// call, which is where a refusal is decided.
+    fn resolve_later(&self, call: u64, reply: ApiReply) {
+        self.later(0, move |inner| inner.resolve(call, reply));
     }
 
     /// Stop by itself: everything it built comes down, and the app hears why.
@@ -295,7 +383,12 @@ impl Inner {
     }
 
     fn halt(&self) {
-        self.stopped.set(true);
+        let was_running = !self.stopped.replace(true);
+        if was_running {
+            if let Some(side) = self.api.borrow().as_ref() {
+                (side.forget)();
+            }
+        }
         let engine = self.engine.borrow_mut().take();
         drop(engine);
         self.queued.borrow_mut().clear();
@@ -360,6 +453,35 @@ impl HostCalls for Inner {
             1 => tracing::warn!("plugin {}: {line}", self.name),
             2 => tracing::info!("plugin {}: {line}", self.name),
             _ => tracing::debug!("plugin {}: {line}", self.name),
+        }
+    }
+
+    fn api_call(&self, call: u64, bytes: &[u8]) {
+        let decided: Result<ApiCall, ApiReply> = match decode_json::<ApiCall>(bytes) {
+            Err(e) => Err(ApiReply::error(ApiError::Failed { sentence: format!("The host could not read the plugin's call: {e}") })),
+            Ok(api_call) => match self.api.borrow().as_ref() {
+                None => Err(ApiReply::error(ApiError::NoGrant {
+                    sentence: format!("The {} plugin has not been allowed to use your stores.", self.name),
+                })),
+                Some(side) => match side.approval.check(&self.name, &api_call) {
+                    Ok(()) => Ok(api_call),
+                    Err(e) => Err(ApiReply::error(e)),
+                },
+            },
+        };
+        match decided {
+            Ok(api_call) => {
+                if let Some(side) = self.api.borrow().as_ref() {
+                    (side.forward)(call, api_call);
+                }
+            }
+            Err(refusal) => self.resolve_later(call, refusal),
+        }
+    }
+
+    fn api_cancel(&self, call: u64) {
+        if let Some(side) = self.api.borrow().as_ref() {
+            (side.cancel)(call);
         }
     }
 }

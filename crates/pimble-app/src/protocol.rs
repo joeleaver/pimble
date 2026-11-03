@@ -76,6 +76,28 @@ pub enum BackendCommand {
     /// ordinary node again; `source` `None` keeps the source it has.
     /// Answers with `Shown`, as an appearance change does.
     SetMetanode { store_id: StoreId, node_id: NodeId, viewer: Option<String>, source: Option<pimble_core::metanode::Source> },
+    /// A plugin's call through the Pimble API (docs/PLUGINS_CONTRACT.md wave
+    /// 2), already checked against what the person approved for it: made
+    /// through this window's own backend, so the server judges it with the
+    /// person's role, and its edits attributed to `plugin_id`. Answered as
+    /// `PluginReply` naming the instance and the call (a subscription once,
+    /// then once per change, until it ends).
+    #[cfg(feature = "native")]
+    PluginCall {
+        instance: u64,
+        plugin_id: String,
+        plugin_name: String,
+        approval: pimble_plugin_host::Approval,
+        call_id: u64,
+        call: pimble_plugin_host::abi::api::ApiCall,
+    },
+    /// A plugin instance no longer wants answers to one call (a subscription
+    /// it dropped).
+    #[cfg(feature = "native")]
+    PluginCancel { instance: u64, call_id: u64 },
+    /// A plugin instance stopped: everything still in flight for it goes.
+    #[cfg(feature = "native")]
+    PluginForget { instance: u64 },
     /// Set or clear a node's custom icon (a Tabler icon name) and/or colour
     /// (`#rrggbb`) in its metadata. `None` for a field leaves it as it is;
     /// `Some(None)` clears it. Answers with `Shown`: the node as the edit
@@ -456,6 +478,10 @@ pub enum BackendEvent {
     /// A metanode's forest as its source found it, or why it could not be
     /// read.
     MetanodeRead { store_id: StoreId, node_id: NodeId, forest: Result<pimble_api::Forest, String> },
+    /// The answer to a plugin's call (`PluginCall`), for the instance that
+    /// made it.
+    #[cfg(feature = "native")]
+    PluginReply { instance: u64, call_id: u64, reply: pimble_plugin_host::abi::api::ApiReply },
     NodeDeleted { store_id: StoreId, node_id: NodeId, parent_id: NodeId },
     NodeMoved { store_id: StoreId, node_id: NodeId, old_parent_id: NodeId, new_parent_id: NodeId },
     /// A move that crossed a share's or a store's boundary

@@ -8,6 +8,10 @@ description = "Runs Pimble plugins: applies a guest's DOM op log to the app's do
 
 [dependencies]
 pimble-plugin-abi = { workspace = true }
+# The API a plugin's calls are made through (`bridge`): the app's own backend.
+pimble-api = { workspace = true }
+pimble-core = { workspace = true }
+serde = { workspace = true }
 # The same rinch-core the app's rinch uses (git main, one package in the lock):
 # the host applies a guest's ops through the app's own `dyn DomDocument` and
 # registers its proxy handlers in the app's handler registries.
@@ -24,3 +28,11 @@ wasm-host = ["dep:wasmtime", "dep:wasmtime-wasi"]
 
 [dev-dependencies]
 rinch-core = { git = "https://github.com/joeleaver/rinch.git", branch = "main", features = ["test-util"] }
+# The API bridge end to end (tests/bridge.rs): the built hello plugin's calls made
+# through a real in-process server, as the app's backend makes them.
+pimble-server = { workspace = true }
+pimble-client = { workspace = true }
+pimble-rpc = { workspace = true }
+tokio = { workspace = true }
+tempfile = "3"
+futures = { workspace = true }

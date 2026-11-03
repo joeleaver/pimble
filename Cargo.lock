@@ -5177,16 +5177,30 @@ dependencies = [
 name = "pimble-plugin-abi"
 version = "0.15.1"
 dependencies = [
+ "base64 0.22.1",
+ "pimble-api",
+ "pimble-core",
+ "pimble-rpc",
  "postcard",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
 name = "pimble-plugin-host"
 version = "0.15.1"
 dependencies = [
+ "futures",
+ "pimble-api",
+ "pimble-client",
+ "pimble-core",
  "pimble-plugin-abi",
+ "pimble-rpc",
+ "pimble-server",
  "rinch-core",
+ "serde",
+ "tempfile",
+ "tokio",
  "tracing",
  "wasmtime",
  "wasmtime-wasi",

@@ -4,9 +4,13 @@
 use std::alloc::{alloc as raw_alloc, dealloc, Layout};
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
+use pimble_api::Pimble;
+use pimble_plugin_abi::api::{decode_json, plugin_client_id, Resolution};
 use pimble_plugin_abi::{decode, encode, pack, Answer, Event, Manifest, MountArgs, Op, Props, Query};
 
+use crate::api::{ApiLink, Bridge, GuestBackend};
 use crate::document::HostLink;
 use crate::runtime::{Guest, ViewFn};
 
@@ -19,6 +23,31 @@ unsafe extern "C" {
     fn pimble_schedule_task(id: u64);
     fn pimble_wake_polls();
     fn pimble_log(level: u32, ptr: *const u8, len: u32);
+    fn pimble_api_call(call: u64, ptr: *const u8, len: u32);
+    fn pimble_api_cancel(call: u64);
+}
+
+/// The host's side of the API, through the imports.
+struct WasmApi;
+
+impl ApiLink for WasmApi {
+    fn call(&self, id: u64, call: Vec<u8>) {
+        unsafe { pimble_api_call(id, call.as_ptr(), call.len() as u32) }
+    }
+
+    fn cancel(&self, id: u64) {
+        unsafe { pimble_api_cancel(id) }
+    }
+}
+
+thread_local! {
+    /// The guest's calls in flight: `pimble_resolve` answers them. Thread-local
+    /// because a guest has one thread, and the imports are not `Sync`.
+    static BRIDGE: Arc<Bridge> = Bridge::new(WasmApi);
+}
+
+fn bridge() -> Arc<Bridge> {
+    BRIDGE.with(Arc::clone)
 }
 
 /// The host, through the imports.
@@ -63,7 +92,11 @@ thread_local! {
 /// the host has no rinch frame loop to lend a guest, so timers, tasks and polled
 /// signals run when the host calls the matching exports, as the browser runtime
 /// runs them off `setTimeout` and microtasks.
-fn with_guest<R>(f: impl FnOnce(&mut Guest) -> R) -> R {
+///
+/// Its API is a `Pimble` over the host ([`GuestBackend`]) writing as
+/// `plugin:<id>` (the host stamps that on every edit anyway, so a plugin cannot
+/// pass for anyone else).
+fn with_guest<R>(describe: Option<fn() -> Manifest>, f: impl FnOnce(&mut Guest) -> R) -> R {
     GUEST.with(|cell| {
         let mut slot = cell.borrow_mut();
         let guest = slot.get_or_insert_with(|| {
@@ -71,7 +104,9 @@ fn with_guest<R>(f: impl FnOnce(&mut Guest) -> R) -> R {
             rinch::core::task::set_task_scheduler(schedule_task_hook);
             rinch::core::reactive::set_poll_waker(wake_polls_hook);
             std::panic::set_hook(Box::new(|info| log(0, &info.to_string())));
-            Guest::new(Rc::new(WasmHost))
+            let id = describe.map(|d| d().id).unwrap_or_else(|| "unknown".to_string());
+            let api = Arc::new(Pimble::new(GuestBackend::new(bridge()), plugin_client_id(&id)));
+            Guest::new(Rc::new(WasmHost), api)
         });
         f(guest)
     })
@@ -108,38 +143,49 @@ pub fn describe(describe: fn() -> Manifest) -> u64 {
     answer(&encode(&describe()))
 }
 
-pub fn mount(view: ViewFn, ptr: u32, len: u32) {
+pub fn mount(describe: fn() -> Manifest, view: ViewFn, ptr: u32, len: u32) {
     let args: MountArgs = decode(input(ptr, len)).expect("the host sends mount arguments");
-    with_guest(|g| g.mount(view, args));
+    with_guest(Some(describe), |g| g.mount(view, args));
+}
+
+/// The host answered one of the guest's API calls: wake whoever waited (the
+/// task that awaited it is polled at the host's next turn), and send what the
+/// turn wrote.
+pub fn resolve(ptr: u32, len: u32) {
+    match decode_json::<Resolution>(input(ptr, len)) {
+        Ok(resolution) => bridge().resolve(resolution),
+        Err(e) => log(1, &format!("an API answer the plugin could not read: {e}")),
+    }
+    with_guest(None, |g| g.flush());
 }
 
 pub fn dispatch(ptr: u32, len: u32) -> u32 {
     let event: Event = decode(input(ptr, len)).expect("the host sends an event");
-    with_guest(|g| g.dispatch(event)) as u32
+    with_guest(None, |g| g.dispatch(event)) as u32
 }
 
 pub fn props_changed(ptr: u32, len: u32) {
     let props: Props = decode(input(ptr, len)).expect("the host sends props");
-    with_guest(|g| g.props_changed(props));
+    with_guest(None, |g| g.props_changed(props));
 }
 
 pub fn unmount() {
-    with_guest(|g| g.unmount());
+    with_guest(None, |g| g.unmount());
 }
 
 pub fn fire_timeout(id: u64) {
     rinch::core::fire_timeout(id);
-    with_guest(|g| g.flush());
+    with_guest(None, |g| g.flush());
 }
 
 pub fn poll_task(id: u64) {
     rinch::core::task::poll_task(id);
-    with_guest(|g| g.flush());
+    with_guest(None, |g| g.flush());
 }
 
 pub fn drain_polls() -> i64 {
     rinch::core::batch(rinch::core::reactive::drain_polls);
-    with_guest(|g| g.flush());
+    with_guest(None, |g| g.flush());
     if rinch::core::reactive::polls_want_every_frame() {
         0
     } else {

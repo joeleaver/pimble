@@ -137,6 +137,28 @@ fn make_linker() -> Linker<StoreData> {
         })
         .expect("log links");
     linker
+        .func_wrap(imports::MODULE, imports::API_CALL, |mut caller: Caller<'_, StoreData>, call: u64, ptr: u32, len: u32| {
+            // A call is at most a blob's size and change; anything larger is
+            // not a call this host makes.
+            if len > 64 << 20 {
+                return Err(wasmtime::Error::new(Refusal("it made an API call larger than any the host takes".into())));
+            }
+            let bytes = read(&mut caller, ptr, len)?;
+            match host_calls(caller.data().key) {
+                Some(host) => host.api_call(call, &bytes),
+                None => tracing::info!("plugin (loading): an API call before it was shown was dropped"),
+            }
+            Ok(())
+        })
+        .expect("api_call links");
+    linker
+        .func_wrap(imports::MODULE, imports::API_CANCEL, |caller: Caller<'_, StoreData>, call: u64| {
+            if let Some(host) = host_calls(caller.data().key) {
+                host.api_cancel(call);
+            }
+        })
+        .expect("api_cancel links");
+    linker
 }
 
 /// What a failed call means for the plugin.
@@ -178,6 +200,7 @@ pub struct WasmGuest {
     fire_timeout: TypedFunc<u64, ()>,
     poll_task: TypedFunc<u64, ()>,
     drain_polls: TypedFunc<(), i64>,
+    resolve: TypedFunc<(u32, u32), ()>,
     budget_ticks: u64,
 }
 
@@ -221,6 +244,7 @@ impl WasmGuest {
             fire_timeout: export(&mut store, &instance, exports::FIRE_TIMEOUT)?,
             poll_task: export(&mut store, &instance, exports::POLL_TASK)?,
             drain_polls: export(&mut store, &instance, exports::DRAIN_POLLS)?,
+            resolve: export(&mut store, &instance, exports::RESOLVE)?,
             memory,
             store,
             budget_ticks,
@@ -286,6 +310,10 @@ impl WasmGuest {
                 Answered::Done
             }
             Call::DrainPolls => Answered::Number(self.drain_polls.call(&mut self.store, ())?),
+            Call::Resolve(bytes) => {
+                self.with_input(bytes, |g, p, l| g.resolve.call(&mut g.store, (p, l)))?;
+                Answered::Done
+            }
         })
     }
 }

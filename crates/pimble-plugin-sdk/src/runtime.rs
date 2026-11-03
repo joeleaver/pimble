@@ -7,6 +7,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use pimble_plugin_abi::{Click, Event, EventData, Key, Modifiers, MountArgs, Props, Wheel, GUEST_BODY};
 use rinch::core::dom::{DomDocument, NodeHandle, NodeId, RenderScope};
@@ -17,15 +18,32 @@ use rinch::core::events::{
 };
 use rinch::core::Signal;
 
+use pimble_api::{Addr, Pimble};
+
 use crate::document::{HostLink, RemoteDocument};
 
 /// What a viewer is handed when it is mounted.
 pub struct Mount {
     /// Which of the plugin's viewers the metanode names.
     pub viewer: String,
-    /// What it shows. A signal: the host sends new props when the metanode's forest
-    /// changes, and the view updates as it would for any signal.
+    /// What it shows: the metanode and the viewer's settings on it. A signal: the
+    /// host sends new props when the settings change, and the view updates as it
+    /// would for any signal.
     pub props: Signal<Props>,
+    /// The Pimble API, as the app uses it: read the metanode's source with
+    /// `api.metanode_source(addr)`, write with `api.edit`, move with
+    /// `api.move_node`, hear changes with `api.next_change()`. Its calls are
+    /// asynchronous; run them with `spawn_local`. The host allows only what the
+    /// person approved for the plugin, and the server judges every write with the
+    /// person's own role.
+    pub api: Arc<Pimble>,
+}
+
+impl Mount {
+    /// The metanode's address, when the props name one.
+    pub fn metanode(&self) -> Option<Addr> {
+        rinch::core::untracked(|| self.props.with(|p| p.metanode.addr()))
+    }
 }
 
 /// A plugin's view: a rinch component taking the [`Mount`].
@@ -41,12 +59,18 @@ struct Mounted {
 pub struct Guest {
     doc: Rc<RefCell<RemoteDocument>>,
     mounted: Option<Mounted>,
+    api: Arc<Pimble>,
 }
 
 impl Guest {
-    /// A guest whose op log goes to `link`.
-    pub fn new(link: Rc<dyn HostLink>) -> Self {
-        Guest { doc: Rc::new(RefCell::new(RemoteDocument::new(link))), mounted: None }
+    /// A guest whose op log goes to `link`, and whose views use `api`.
+    pub fn new(link: Rc<dyn HostLink>, api: Arc<Pimble>) -> Self {
+        Guest { doc: Rc::new(RefCell::new(RemoteDocument::new(link))), mounted: None, api }
+    }
+
+    /// The API its views use.
+    pub fn api(&self) -> Arc<Pimble> {
+        self.api.clone()
     }
 
     /// The document, for a test to read the shadow tree.
@@ -71,9 +95,10 @@ impl Guest {
         let MountArgs { viewer, props } = args;
         // Built through the scope, so the props signal and every handler the view
         // registers belong to it and go with it at unmount.
+        let api = self.api.clone();
         let (node, props) = scope.build(|s| {
             let props = Signal::new(props);
-            (view(s, Mount { viewer, props }), props)
+            (view(s, Mount { viewer, props, api }), props)
         });
         NodeHandle::new(NodeId(GUEST_BODY), Rc::downgrade(&doc)).append_child(&node);
         self.mounted = Some(Mounted { scope, node, props });
