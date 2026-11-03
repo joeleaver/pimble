@@ -56,27 +56,7 @@ pub(crate) const APP_CSS: &str = "
     user-select: none;
 }
 
-/* ── Presence (presence.rs) ──────────────────────────────────────── */
-
-.pimble-pane__people {
-    display: inline-flex;
-    align-items: center;
-    gap: 2px;
-    margin-left: 6px;
-}
-
-.pimble-pane__person {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 18px;
-    height: 18px;
-    border-radius: 9px;
-    font-size: 9px;
-    font-weight: 600;
-    color: var(--rinch-color-white, #ffffff);
-    cursor: pointer;
-}
+/* ── Presence (presence.rs; the chips and dots are pimble-ui's) ── */
 
 /* Following someone, on a pane strip (presence/follow.rs). */
 .pimble-pane__follow {
@@ -88,53 +68,6 @@ pub(crate) const APP_CSS: &str = "
 .pimble-pane__follow-stop {
     cursor: pointer;
     color: var(--rinch-primary-color);
-}
-
-.pimble-pane__more {
-    font-size: 11px;
-    color: var(--rinch-color-dimmed);
-}
-
-.pimble-tree-people {
-    display: inline-flex;
-    align-items: center;
-    gap: 2px;
-    margin-left: 4px;
-}
-
-.pimble-tree-people__dot {
-    display: inline-block;
-    width: 6px;
-    height: 6px;
-    border-radius: 3px;
-}
-
-/* An AI agent (docs/PRESENCE_CONTRACT.md section 8): a small robot beside
-   its initials on the pane and its caret's flag, and in place of its dot. */
-.pimble-presence-robot {
-    display: inline-flex;
-    width: 10px;
-    height: 10px;
-    flex-shrink: 0;
-}
-
-.pimble-pane__person--agent {
-    width: auto;
-    padding: 0 5px 0 4px;
-    gap: 2px;
-    cursor: default;
-}
-
-.pimble-tree-people__dot--agent {
-    display: inline-flex;
-    width: 11px;
-    height: 11px;
-    border-radius: 0;
-}
-
-.pimble-tree-people__dot--agent .pimble-presence-robot {
-    width: 11px;
-    height: 11px;
 }
 
 .pimble-presence-caret__flag--agent {

@@ -279,8 +279,11 @@ impl Backend for GuestBackend {
         expect!(self.0.ask(ApiCall::GetBlob { store, blob }).await?, ApiReply::Blob { mime, bytes } => (mime, bytes.0))
     }
 
-    async fn publish_presence(&self, frame: PresenceFrame, _client_id: &str) -> Result<(), ApiError> {
-        expect!(self.0.ask(ApiCall::PublishPresence { frame }).await?, ApiReply::Done => ())
+    async fn publish_presence(&self, _frame: PresenceFrame, _client_id: &str) -> Result<(), ApiError> {
+        // A plugin says where the person is with `Mount::host.focus` (a host
+        // request), which the app publishes as part of the pane's own
+        // session; a frame of the plugin's own would show the person twice.
+        Err(ApiError::not_available("A plugin says where the person is with Host::focus, not with presence frames."))
     }
 
     async fn who_am_i(&self) -> Result<(Option<String>, String), ApiError> {

@@ -36,3 +36,4 @@ pimble-rpc = { workspace = true }
 tokio = { workspace = true }
 tempfile = "3"
 futures = { workspace = true }
+serde_json = { workspace = true }

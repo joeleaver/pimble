@@ -856,8 +856,8 @@ async fn route_one(ctx: &mut Web<'_>, cmd: BackendCommand) -> Option<BackendEven
     // (sealed under the document's key), its status, closing it.
     let owned = store_id.is_some_and(|id| ctx.routes.router.served_by(id) == ctx.routes.vault_id);
     let cmd = match (cmd, client.as_ref()) {
-        (BackendCommand::PublishPresence { store_id, node_id, pane, focused, left, text, board }, Some(c)) if owned => {
-            let frame = pimble_app::commands::presence_frame(&ctx.routes.api, store_id, node_id, pane, focused, left, text, board);
+        (BackendCommand::PublishPresence { store_id, node_id, session, focused, left, text, board }, Some(c)) if owned => {
+            let frame = pimble_app::commands::presence_frame(&ctx.routes.api, store_id, node_id, &session, focused, left, text, board);
             ctx.shared.lock().await.publish_presence(c, frame).await;
             return None;
         }

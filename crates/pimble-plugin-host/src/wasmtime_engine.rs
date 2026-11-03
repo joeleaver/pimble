@@ -159,6 +159,20 @@ fn make_linker() -> Linker<StoreData> {
         })
         .expect("api_cancel links");
     linker
+        .func_wrap(imports::MODULE, imports::HOST, |mut caller: Caller<'_, StoreData>, ptr: u32, len: u32| {
+            // A request names a node or a person: small.
+            if len > 64 << 10 {
+                return Err(wasmtime::Error::new(Refusal("it asked the host for something larger than any request".into())));
+            }
+            let bytes = read(&mut caller, ptr, len)?;
+            match host_calls(caller.data().key) {
+                Some(host) => host.host_request(&bytes),
+                None => tracing::info!("plugin (loading): a request before it was shown was dropped"),
+            }
+            Ok(())
+        })
+        .expect("host links");
+    linker
 }
 
 /// What a failed call means for the plugin.
@@ -201,6 +215,7 @@ pub struct WasmGuest {
     poll_task: TypedFunc<u64, ()>,
     drain_polls: TypedFunc<(), i64>,
     resolve: TypedFunc<(u32, u32), ()>,
+    host_state: TypedFunc<(u32, u32), ()>,
     budget_ticks: u64,
 }
 
@@ -245,6 +260,7 @@ impl WasmGuest {
             poll_task: export(&mut store, &instance, exports::POLL_TASK)?,
             drain_polls: export(&mut store, &instance, exports::DRAIN_POLLS)?,
             resolve: export(&mut store, &instance, exports::RESOLVE)?,
+            host_state: export(&mut store, &instance, exports::HOST_STATE)?,
             memory,
             store,
             budget_ticks,
@@ -312,6 +328,10 @@ impl WasmGuest {
             Call::DrainPolls => Answered::Number(self.drain_polls.call(&mut self.store, ())?),
             Call::Resolve(bytes) => {
                 self.with_input(bytes, |g, p, l| g.resolve.call(&mut g.store, (p, l)))?;
+                Answered::Done
+            }
+            Call::HostState(bytes) => {
+                self.with_input(bytes, |g, p, l| g.host_state.call(&mut g.store, (p, l)))?;
                 Answered::Done
             }
         })

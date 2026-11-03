@@ -16,7 +16,7 @@
 
 use pimble_api::{Addr, ApiError, Moved, NodeInit, StoreChange};
 use pimble_core::{BlobId, BlobUrl, DeletedNode, LeftShare, LinkResolution, MountRef, MountState, Node, NodeId, Place, Store, StoreId};
-use pimble_rpc::{PresenceFrame, SearchResultItem, StoreChangeKind, StorePeople};
+use pimble_rpc::{SearchResultItem, StoreChangeKind, StorePeople};
 use serde::{Deserialize, Serialize};
 
 /// The prefix of the client id every edit a plugin makes carries, before the
@@ -77,7 +77,6 @@ pub enum ApiCall {
     Search { query: String, stores: Vec<StoreId>, semantic: bool, limit: usize },
     PutBlob { store: StoreId, node: NodeId, mime: String, bytes: Bytes },
     GetBlob { store: StoreId, blob: BlobId },
-    PublishPresence { frame: PresenceFrame },
     WhoAmI,
     /// The store's changes from now on, each as a [`ApiReply::Change`] to this
     /// call, until [`ApiReply::Ended`] (or the plugin cancels the call).
@@ -126,9 +125,6 @@ impl ApiCall {
             | PutBlob { store, .. } => vec![(*store, Write)],
             Transplant { from, to, .. } => vec![(*from, Write), (*to, Write)],
             CreateMount { store, source_store, .. } => vec![(*store, Write), (*source_store, Read)],
-            // A presence frame says where the plugin is: it changes nothing,
-            // but it is about a store, which must be one the plugin may read.
-            PublishPresence { frame } => vec![(frame.store_id, Read)],
         }
     }
 }

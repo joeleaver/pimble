@@ -14,7 +14,7 @@ use std::rc::{Rc, Weak};
 
 use pimble_api::ApiError;
 use pimble_plugin_abi::api::{decode_json, encode_json, ApiCall, ApiReply, Resolution};
-use pimble_plugin_abi::{decode, encode, Event, EventData, MountArgs, Op, Props, Query};
+use pimble_plugin_abi::{decode, encode, Event, EventData, HostRequest, HostState, MountArgs, Op, Props, Query};
 use rinch_core::dom::{DomDocument, NodeId};
 
 use crate::applier::{Applier, ApplierOptions, Dispatch, Refusal};
@@ -33,6 +33,8 @@ pub enum Call<'a> {
     DrainPolls,
     /// An answer to one of its API calls (a JSON [`Resolution`]).
     Resolve(&'a [u8]),
+    /// What the host knows changed (a postcard [`HostState`]).
+    HostState(&'a [u8]),
 }
 
 /// What an export call answered.
@@ -89,6 +91,9 @@ pub trait HostCalls {
     fn api_call(&self, call: u64, bytes: &[u8]);
     /// The guest wants no more answers to `call`.
     fn api_cancel(&self, call: u64);
+    /// Something only the app can do (a postcard [`HostRequest`]): handed to
+    /// the app at the next turn, never inside the guest's call.
+    fn host_request(&self, bytes: &[u8]);
 }
 
 /// Where an instance's API calls go once its approval allows them
@@ -111,6 +116,7 @@ pub struct ApiSide {
 enum Pending {
     Event(Event),
     Resolve(Vec<u8>),
+    HostState(Vec<u8>),
 }
 
 /// Names an instance's [`HostCalls`] to its engine.
@@ -147,6 +153,9 @@ struct Inner {
     api: RefCell<Option<ApiSide>>,
     stopped: Cell<bool>,
     on_stop: RefCell<Option<Box<dyn Fn(&str)>>>,
+    /// What the app does with the guest's requests; without it they are
+    /// dropped.
+    on_request: RefCell<Option<Rc<dyn Fn(HostRequest)>>>,
     /// The last error the plugin logged (its panic message), for the sentence when
     /// it traps.
     last_error: RefCell<Option<String>>,
@@ -188,6 +197,7 @@ impl Instance {
                 api: RefCell::new(None),
                 stopped: Cell::new(false),
                 on_stop: RefCell::new(None),
+                on_request: RefCell::new(None),
                 last_error: RefCell::new(None),
                 polls_armed: Cell::new(false),
                 me: me.clone(),
@@ -233,6 +243,19 @@ impl Instance {
     /// long, was refused, trapped). Not called for [`Instance::unmount`].
     pub fn on_stop(&self, f: impl Fn(&str) + 'static) {
         *self.0.on_stop.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Call `f` with each request the guest makes (open a node, say where the
+    /// person is, follow someone), a turn after it made it.
+    pub fn on_request(&self, f: impl Fn(HostRequest) + 'static) {
+        *self.0.on_request.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// Hand the guest what the host knows now (people, following, theme).
+    /// When the guest is in a call, it waits for the call to return. False
+    /// when the plugin stopped.
+    pub fn set_host_state(&self, state: &HostState) -> bool {
+        self.0.host_state(encode(state))
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -350,6 +373,17 @@ impl Inner {
         self.call(Call::Resolve(&bytes));
     }
 
+    fn host_state(&self, bytes: Vec<u8>) -> bool {
+        if self.stopped.get() {
+            return false;
+        }
+        if self.engine.try_borrow_mut().is_err() {
+            self.queued.borrow_mut().push_back(Pending::HostState(bytes));
+            return true;
+        }
+        self.call(Call::HostState(&bytes)).is_some()
+    }
+
     fn drain_queue(&self) {
         loop {
             let next = self.queued.borrow_mut().pop_front();
@@ -361,6 +395,11 @@ impl Inner {
                 Some(Pending::Resolve(bytes)) => {
                     if !self.stopped.get() {
                         self.call(Call::Resolve(&bytes));
+                    }
+                }
+                Some(Pending::HostState(bytes)) => {
+                    if !self.stopped.get() {
+                        self.call(Call::HostState(&bytes));
                     }
                 }
             }
@@ -483,6 +522,20 @@ impl HostCalls for Inner {
         if let Some(side) = self.api.borrow().as_ref() {
             (side.cancel)(call);
         }
+    }
+
+    fn host_request(&self, bytes: &[u8]) {
+        let request: HostRequest = match decode(bytes) {
+            Ok(request) => request,
+            Err(e) => {
+                tracing::warn!("plugin {}: a request the host could not read: {e}", self.name);
+                return;
+            }
+        };
+        let Some(f) = self.on_request.borrow().clone() else { return };
+        // The app acts on it at the next turn: it may hand the guest new
+        // state, which it could not do while the guest is in its call.
+        self.later(0, move |_| f(request));
     }
 }
 

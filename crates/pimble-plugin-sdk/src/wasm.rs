@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use pimble_api::Pimble;
 use pimble_plugin_abi::api::{decode_json, plugin_client_id, Resolution};
-use pimble_plugin_abi::{decode, encode, pack, Answer, Event, Manifest, MountArgs, Op, Props, Query};
+use pimble_plugin_abi::{decode, encode, pack, Answer, Event, HostRequest, HostState, Manifest, MountArgs, Op, Props, Query};
 
 use crate::api::{ApiLink, Bridge, GuestBackend};
 use crate::document::HostLink;
@@ -25,6 +25,7 @@ unsafe extern "C" {
     fn pimble_log(level: u32, ptr: *const u8, len: u32);
     fn pimble_api_call(call: u64, ptr: *const u8, len: u32);
     fn pimble_api_cancel(call: u64);
+    fn pimble_host(ptr: *const u8, len: u32);
 }
 
 /// The host's side of the API, through the imports.
@@ -65,6 +66,11 @@ impl HostLink for WasmHost {
         let mut answer = vec![0u8; len];
         unsafe { pimble_take_answer(answer.as_mut_ptr()) }
         decode(&answer).unwrap_or(Answer::Nothing)
+    }
+
+    fn request(&self, request: &HostRequest) {
+        let bytes = encode(request);
+        unsafe { pimble_host(bytes.as_ptr(), bytes.len() as u32) }
     }
 }
 
@@ -167,6 +173,11 @@ pub fn dispatch(ptr: u32, len: u32) -> u32 {
 pub fn props_changed(ptr: u32, len: u32) {
     let props: Props = decode(input(ptr, len)).expect("the host sends props");
     with_guest(None, |g| g.props_changed(props));
+}
+
+pub fn host_state(ptr: u32, len: u32) {
+    let state: HostState = decode(input(ptr, len)).expect("the host sends its state");
+    with_guest(None, |g| g.host_state(state));
 }
 
 pub fn unmount() {

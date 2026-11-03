@@ -703,6 +703,22 @@ impl NodeDoc {
         .map(|_| ())
     }
 
+    /// The first state of a new metanode shown with `viewer` over `source`
+    /// (docs/METANODES_CONTRACT.md): the two keys alone, as an update the
+    /// create merges into the new node's document, so the node is a metanode
+    /// from the edit that makes it (`pimble_api::recipes::metanode`). It is
+    /// written without the `node` root's other keys, which the create
+    /// writes; their merge is the create's own.
+    pub fn metanode_seed(viewer: &str, source: &Source) -> Vec<u8> {
+        let seed = NodeDoc::new();
+        {
+            let mut txn = seed.doc.transact_mut();
+            seed.node.insert(&mut txn, VIEWER_KEY, viewer.trim().to_string());
+            seed.node.insert(&mut txn, SOURCE_KEY, source.to_stored());
+        }
+        seed.save()
+    }
+
     /// Make the node a metanode shown with `viewer`
     /// (docs/METANODES_CONTRACT.md), or
     /// with `None` an ordinary node again. The source is left as it is, so a

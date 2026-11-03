@@ -227,6 +227,26 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
             }
         }
 
+        C::MakeFromRecipe { store_id, parent_id, recipe } => {
+            let init = pimble_api::recipes::metanode(&recipe.title, recipe.icon.as_deref(), &recipe.viewer, recipe.depth);
+            let node_id = match api.backend().create_node(store_id, parent_id, init, pimble_core::Place::Last).await {
+                Ok(node_id) => node_id,
+                Err(e) => return Ok(failed(e)),
+            };
+            show_after(ctx, store_id, created(node_id, parent_id)).await;
+            for title in &recipe.children {
+                let child = match pimble_api::recipes::document(title, None) {
+                    Ok(init) => init,
+                    Err(e) => return Ok(failed(e)),
+                };
+                match api.backend().create_node(store_id, node_id, child, pimble_core::Place::Last).await {
+                    Ok(child_id) => show_after(ctx, store_id, created(child_id, node_id)).await,
+                    Err(e) => return Ok(failed(e)),
+                }
+            }
+            Some(BackendEvent::NodeCreated { store_id, parent_id: Some(parent_id), node_id, request: None })
+        }
+
         C::CreateAttachment { store_id, host_id, title, init } => {
             let request = init.request;
             match api.backend().create_attachment(store_id, host_id, node_init(title, Some(init))).await {
@@ -474,8 +494,8 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
         // (`pimble_api::presence`), its session named after the pane. A
         // frame that is not taken (an older server, a store not readable)
         // is no one's business.
-        C::PublishPresence { store_id, node_id, pane, focused, left, text, board } => {
-            let frame = presence_frame(api, store_id, node_id, pane, focused, left, text, board);
+        C::PublishPresence { store_id, node_id, session, focused, left, text, board } => {
+            let frame = presence_frame(api, store_id, node_id, &session, focused, left, text, board);
             if let Err(e) = api.backend().publish_presence(frame, ctx.client_id).await {
                 tracing::debug!("presence in {store_id} not taken: {e}");
             }
@@ -586,14 +606,14 @@ pub fn presence_frame(
     api: &Pimble,
     store_id: StoreId,
     node_id: NodeId,
-    pane: usize,
+    session: &str,
     focused: bool,
     left: bool,
     text: Option<pimble_rpc::TextPresence>,
     board: Option<pimble_rpc::BoardPresence>,
 ) -> pimble_rpc::PresenceFrame {
     let body = (!left).then(|| pimble_rpc::PresenceBody { device: crate::presence::device_label(), focused, text, board });
-    api.frames().frame(store_id, node_id, &pane.to_string(), body)
+    api.frames().frame(store_id, node_id, session, body)
 }
 
 /// What a rename or an appearance change answers: the views of this window

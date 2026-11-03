@@ -52,6 +52,11 @@ rinch = { git = "https://github.com/joeleaver/rinch.git", branch = "main", defau
     "theme",
 ] }
 rinch-tabler-icons = { workspace = true }
+# Presence, icons and colors drawn alike by the app and by plugins.
+pimble-ui = { workspace = true }
+# A plugin's recipes ("New Kanban") as the explorer's menu offers them: plain
+# data, on both targets (the browser lists none until its host, wave 3).
+pimble-plugin-abi = { workspace = true }
 rinch-editor-core = { workspace = true }
 rinch-editor-collab = { workspace = true }
 serde = { workspace = true }

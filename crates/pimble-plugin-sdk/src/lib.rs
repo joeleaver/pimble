@@ -57,8 +57,11 @@ pub use pimble_plugin_abi as abi;
 pub use api::{ApiLink, Bridge, GuestBackend};
 pub use pimble_api;
 pub use pimble_core;
-pub use pimble_plugin_abi::{Manifest, NodeAddr, Permissions, Props, Provision, SourceShape, StoreAsk, ViewerDecl, ABI_VERSION};
-pub use runtime::{log_line, Guest, Mount, ViewFn};
+pub use pimble_plugin_abi::{HostState, Manifest, NodeAddr, Permissions, PresentPerson, Props, Provision, RecipeDecl, SourceShape, StoreAsk, ViewerDecl, ABI_VERSION};
+/// Pimble's own components (presence, icons, colors), drawn alike by the app
+/// and by plugins.
+pub use pimble_ui;
+pub use runtime::{log_line, person, Guest, Host, Mount, Seen, ViewFn};
 
 /// The rinch git revision this SDK was built against (from the plugin's
 /// `Cargo.lock`, `unknown` when there was none to read). The manifest carries it.
@@ -73,10 +76,11 @@ pub use rinch;
 /// `rinch` it brings into scope.
 pub mod prelude {
     pub use crate::{pimble_api, rinch};
-    pub use crate::{manifest, viewer, ManifestExt, Mount};
-    pub use pimble_api::{plan, Addr, ApiError, Forest, ForestEntry, Pimble};
+    pub use crate::{display_label, manifest, recipe, viewer, Host, ManifestExt, Mount, Seen};
+    pub use crate::pimble_ui;
+    pub use pimble_api::{plan, Addr, ApiError, Forest, ForestEntry, Judged, MetanodeEdit, Pimble};
     pub use pimble_core::Place;
-    pub use pimble_plugin_abi::{Manifest, NodeAddr, Permissions, Props, SourceShape, StoreAsk};
+    pub use pimble_plugin_abi::{Manifest, NodeAddr, Permissions, PresentPerson, Props, SourceShape, StoreAsk};
     pub use rinch::prelude::*;
 }
 
@@ -98,6 +102,29 @@ pub fn manifest(id: &str, name: &str, version: &str) -> Manifest {
 /// showing sources of the shapes `takes`.
 pub fn viewer(id: &str, name: &str, takes: &[SourceShape]) -> Provision {
     Provision::Viewer(ViewerDecl { id: id.to_string(), name: name.to_string(), takes: takes.to_vec() })
+}
+
+/// A recipe "New <thing>" (`label`) making a metanode titled `title`, shown
+/// with `viewer`, whose source is its own subtree `depth` levels deep, with
+/// `children` titled in order. The app makes it through its own API when
+/// the person picks it from the explorer's new-node menu.
+pub fn recipe(id: &str, label: &str, title: &str, icon: Option<&str>, viewer: &str, depth: u32, children: &[&str]) -> Provision {
+    Provision::Recipe(RecipeDecl {
+        id: id.to_string(),
+        label: label.to_string(),
+        title: title.to_string(),
+        icon: icon.map(str::to_string),
+        viewer: viewer.to_string(),
+        depth,
+        children: children.iter().map(|c| c.to_string()).collect(),
+    })
+}
+
+/// What a node is called wherever it is named, as the explorer's row names it
+/// (`pimble_core::plan::display_label`): an explicit title, else the first
+/// line of its text, else its title.
+pub fn display_label(node: &pimble_core::Node) -> String {
+    pimble_core::plan::display_label(node, pimble_crdt::NodeDoc::text_of)
 }
 
 /// Building a manifest.
@@ -178,6 +205,10 @@ macro_rules! plugin {
             #[unsafe(no_mangle)]
             pub extern "C" fn pimble_props_changed(ptr: u32, len: u32) {
                 $crate::wasm::props_changed(ptr, len)
+            }
+            #[unsafe(no_mangle)]
+            pub extern "C" fn pimble_host_state(ptr: u32, len: u32) {
+                $crate::wasm::host_state(ptr, len)
             }
             #[unsafe(no_mangle)]
             pub extern "C" fn pimble_unmount() {

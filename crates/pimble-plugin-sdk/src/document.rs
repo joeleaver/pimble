@@ -34,6 +34,9 @@ pub trait HostLink {
     fn flush(&self, ops: Vec<Op>);
     /// Answer a read only the host can.
     fn query(&self, query: &Query) -> Answer;
+    /// Ask the app to do something for the person (open a node in the pane,
+    /// say where they are, follow someone). A host that cannot drops it.
+    fn request(&self, _request: &pimble_plugin_abi::HostRequest) {}
 }
 
 #[derive(Debug, Clone, PartialEq)]

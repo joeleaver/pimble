@@ -410,6 +410,13 @@ pub struct LinkTooltip {
     pub y: f32,
 }
 
+/// A recipe an installed plugin registers, and the plugin's name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginRecipe {
+    pub plugin: String,
+    pub recipe: pimble_plugin_abi::RecipeDecl,
+}
+
 /// Where a followed link leads, as `AppStore::link_open` carries it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinkOpen {
@@ -762,6 +769,9 @@ pub struct AppStore {
     /// Who else is in which document, as their presence frames say
     /// (docs/PRESENCE_CONTRACT.md; `crate::presence`). Never stored.
     pub presence: Signal<HashMap<(StoreId, NodeId), Vec<crate::presence::Present>>>,
+    /// The recipes installed plugins register ("New Kanban"), offered in the
+    /// explorer's new-node menu (`crate::plugins`).
+    pub recipes: Signal<Vec<PluginRecipe>>,
     /// The tooltip over a hovered link, once the pointer has rested on it
     /// (docs/LINKS_CONTRACT.md "What a link looks like").
     pub link_hover: Signal<Option<LinkTooltip>>,
@@ -1047,6 +1057,7 @@ impl AppStore {
             agents_ui: crate::agents::AgentsUi::new(),
             shares_ui: crate::shares::SharesUi::new(),
             presence: Signal::new(HashMap::new()),
+            recipes: Signal::new(Vec::new()),
             link_hover: Signal::new(None),
             link_picker: Signal::new(None),
             deleted_modal_store: Signal::new(None),

@@ -12,6 +12,7 @@ use rinch::prelude::*;
 use rinch_tabler_icons::{render_tabler_icon, TablerIcon, TablerIconStyle};
 
 use crate::appearance::{display_color, IconGlyph};
+use pimble_ui::presence::PersonChip;
 use crate::editor::stop_editing;
 use crate::panes::{Direction, PaneId, MAX_PANES};
 use crate::rinch_editor::Editor;
@@ -411,29 +412,16 @@ fn render_pane(__scope: &mut RenderScope, store: AppStore, pane: PaneId, hints: 
                 span {
                     class: "pimble-pane__people",
                     for person in pane_people(store, pane).0 {
-                        span {
+                        PersonChip {
                             key: person.key.clone(),
-                            class: if person.agent { "pimble-pane__person pimble-pane__person--agent" } else { "pimble-pane__person" },
-                            title: format!("{}{}", person.title, crate::presence::follow_hint(person.agent)),
-                            style: format!("background: {};", person.color),
-                            onclick: {
-                                let key = person.key.clone();
-                                let agent = person.agent;
-                                move || if !agent { crate::presence::follow::start(store, pane, &key) }
-                            },
-                            // An agent's initials carry a robot.
-                            span {
-                                class: "pimble-presence-robot",
-                                style: if person.agent { "" } else { "display: none;" },
-                                IconGlyph { name: "robot".to_string() }
-                            }
-                            {person.initials.clone()}
+                            person: person.clone(),
+                            onfollow: move |key: String| crate::presence::follow::start(store, pane, &key),
                         }
                     }
                     span {
                         class: "pimble-pane__more",
                         style: {move || if pane_people(store, pane).1 > 0 { "" } else { "display: none;" }},
-                        {move || format!("+{}", pane_people(store, pane).1)}
+                        {move || pimble_ui::presence::more_label(pane_people(store, pane).1)}
                     }
                 }
                 // Following someone (docs/PRESENCE_CONTRACT.md section 7):

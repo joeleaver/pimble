@@ -4940,11 +4940,13 @@ dependencies = [
  "pimble-discussion",
  "pimble-image",
  "pimble-import",
+ "pimble-plugin-abi",
  "pimble-plugin-host",
  "pimble-rpc",
  "pimble-server",
  "pimble-sheet",
  "pimble-store",
+ "pimble-ui",
  "reqwest",
  "rinch",
  "rinch-editor-collab",
@@ -5199,6 +5201,7 @@ dependencies = [
  "pimble-server",
  "rinch-core",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
@@ -5330,6 +5333,15 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "pimble-ui"
+version = "0.15.1"
+dependencies = [
+ "pimble-core",
+ "rinch",
+ "rinch-tabler-icons",
 ]
 
 [[package]]

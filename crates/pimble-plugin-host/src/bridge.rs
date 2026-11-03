@@ -215,10 +215,6 @@ async fn run(backend: &dyn Backend, plugin_id: &str, plugin: &str, approval: &Ap
             let (mime, bytes) = backend.get_blob(store, blob).await?;
             ApiReply::Blob { mime, bytes: Bytes(bytes) }
         }
-        C::PublishPresence { frame } => {
-            backend.publish_presence(frame, &plugin_client_id(plugin_id)).await?;
-            ApiReply::Done
-        }
         C::WhoAmI => {
             let (sub, name) = backend.who_am_i().await?;
             ApiReply::Me { sub, name }

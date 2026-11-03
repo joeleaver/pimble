@@ -1,0 +1,22 @@
+[package]
+name = "pimble-ui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Pimble's own rinch components with no app state: who is here, icons, colors. The app and plugins draw them alike."
+
+# Shared by the app (this workspace) and the plugin SDK (the plugins workspace,
+# which builds for wasm32-wasip1), so that a plugin draws presence, icons and
+# colors with the very components the app draws them with, not lookalikes
+# (Joe, 2026-11-02: "Plugin presence should look and feel just like native
+# presence"). Nothing here reads the app's state: each component takes what it
+# shows as props.
+#
+# rinch is declared here, as in pimble-app, with default features off, so the
+# desktop backend never reaches a wasm guest; each workspace resolves it to its
+# own pinned revision of rinch main.
+[dependencies]
+pimble-core = { path = "../pimble-core" }
+rinch = { git = "https://github.com/joeleaver/rinch.git", branch = "main", default-features = false }
+rinch-tabler-icons = { git = "https://github.com/joeleaver/rinch.git", branch = "main" }

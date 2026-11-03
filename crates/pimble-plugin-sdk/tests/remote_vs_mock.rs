@@ -9,10 +9,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use pimble_plugin_sdk::abi::{
-    Answer, Click, Event, EventData, Key, Modifiers, MountArgs, NodeAddr, Op, Props, Query, GUEST_BODY,
-    GUEST_ROOT,
+    Answer, Click, Event, EventData, HostRequest, HostState, Key, Modifiers, MountArgs, NodeAddr, NodePeople, Op, Props,
+    PresentPerson, Query, GUEST_BODY, GUEST_ROOT,
 };
 use pimble_plugin_sdk::prelude::*;
+use pimble_plugin_sdk::pimble_ui::presence::PersonChip;
 use pimble_plugin_sdk::{Guest, HostLink};
 use rinch_core::dom::mock::MockDomDocument;
 use rinch_core::dom::{DomDocument, NodeId};
@@ -22,15 +23,21 @@ struct ApplyToMock {
     doc: Rc<RefCell<MockDomDocument>>,
     map: RefCell<HashMap<u64, NodeId>>,
     queries: RefCell<Vec<Query>>,
+    requests: RefCell<Vec<HostRequest>>,
 }
 
 impl ApplyToMock {
+    /// One not shared, for a view rendered straight into a mock.
+    fn new_link() -> Self {
+        Rc::try_unwrap(Self::new()).ok().expect("not shared yet")
+    }
+
     fn new() -> Rc<Self> {
         let doc = Rc::new(RefCell::new(MockDomDocument::new()));
         let mut map = HashMap::new();
         map.insert(GUEST_ROOT, doc.borrow().root());
         map.insert(GUEST_BODY, doc.borrow().body());
-        Rc::new(ApplyToMock { doc, map: RefCell::new(map), queries: RefCell::new(Vec::new()) })
+        Rc::new(ApplyToMock { doc, map: RefCell::new(map), queries: RefCell::new(Vec::new()), requests: RefCell::new(Vec::new()) })
     }
 
     fn id(&self, guest: u64) -> NodeId {
@@ -39,6 +46,10 @@ impl ApplyToMock {
 }
 
 impl HostLink for ApplyToMock {
+    fn request(&self, request: &HostRequest) {
+        self.requests.borrow_mut().push(request.clone());
+    }
+
     fn flush(&self, ops: Vec<Op>) {
         let mut doc = self.doc.borrow_mut();
         for op in ops {
@@ -207,7 +218,8 @@ fn a_component_renders_the_same_tree_through_a_remote_document() {
     let mut scope = RenderScope::new(direct_dyn.clone(), body);
     let node = scope.build(|s| {
         let p = Signal::new(props("Work", &["Plan", "Do"]));
-        counter(s, Mount { viewer: "test".into(), props: p, api: api() })
+        let host = Host::new(Rc::new(ApplyToMock::new_link()), Signal::new(HostState::default()));
+        counter(s, Mount { viewer: "test".into(), props: p, api: api(), host })
     });
     NodeHandle::new(body, Rc::downgrade(&direct_dyn)).append_child(&node);
 
@@ -291,4 +303,90 @@ fn a_read_only_the_host_answers_sends_the_pending_writes_first() {
     assert_eq!(doc.borrow().parent_node(field), Some(NodeId(GUEST_BODY)));
     assert_eq!(doc.borrow().query_selector("body > input").map(|n| n.0), Some(field.0));
     assert_eq!(host.queries.borrow().len(), 1);
+}
+
+/// A view drawing who is in the metanode with pimble-ui's chips, as a plugin
+/// draws presence; a click on one asks the host to follow them.
+fn present(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
+    let host = mount.host.clone();
+    let metanode = mount.metanode().expect("a metanode");
+    let following = mount.host.clone();
+    let focus = mount.host.clone();
+    rsx! {
+        div {
+            span {
+                class: "people",
+                for person in host.people_in(metanode) {
+                    PersonChip {
+                        key: person.key.clone(),
+                        person: person.clone(),
+                        onfollow: {
+                            let following = following.clone();
+                            move |key: String| following.follow(&key)
+                        },
+                    }
+                }
+            }
+            button { class: "focus", onclick: move || focus.focus(Some(metanode)), "Focus" }
+        }
+    }
+}
+
+#[test]
+fn a_plugin_draws_presence_with_the_apps_chips_and_asks_the_host_to_follow() {
+    let host = ApplyToMock::new();
+    let mut guest = Guest::new(host.clone(), api());
+    let metanode = NodeAddr { store: pimble_plugin_sdk::pimble_core::StoreId::new().to_string(), node: pimble_plugin_sdk::pimble_core::NodeId::new().to_string() };
+    guest.mount(present, MountArgs { viewer: "test".into(), props: Props { metanode: metanode.clone(), settings: None } });
+    let render = || {
+        let mut out = String::new();
+        dump(&*host.doc.borrow(), host.doc.borrow().body(), &names(), 0, &mut out);
+        out
+    };
+    assert!(!render().contains("pimble-pane__person"));
+
+    // The host says who is there: an agent and a person, drawn as the pane's
+    // strip draws them.
+    let sam = PresentPerson { key: "sub-sam".into(), name: "Sam".into(), initials: "S".into(), color: "#aa3300".into(), title: "Sam, on laptop".into(), agent: false };
+    let claude = PresentPerson { key: "sub-sam/agent/Claude".into(), name: "Claude".into(), initials: "C".into(), color: "#0033aa".into(), title: "Claude, an AI agent".into(), agent: true };
+    guest.host_state(HostState { dark: false, people: vec![NodePeople { node: metanode.clone(), people: vec![claude, sam] }], following: None });
+    let doc = host.doc.borrow();
+    let chips: Vec<NodeId> = all_with_class(&*doc, doc.body(), "pimble-pane__person");
+    assert_eq!(chips.len(), 2, "{}", { drop(doc); render() });
+    let classes: Vec<String> = chips.iter().map(|c| doc.get_attribute(*c, "class").unwrap()).collect();
+    assert!(classes[0].contains("pimble-pane__person--agent") && !classes[1].contains("--agent"), "{classes:?}");
+    assert_eq!(doc.get_attribute(chips[1], "title").as_deref(), Some("Sam, on laptop (click to follow)"));
+    assert_eq!(doc.get_attribute(chips[1], "style").as_deref(), Some("background: #aa3300;"));
+    drop(doc);
+
+    // A click on Sam's chip asks to follow Sam; on the agent's, nothing.
+    let remote = guest.document();
+    let guest_chips = all_with_class(&*remote.borrow(), NodeId(GUEST_BODY), "pimble-pane__person");
+    for chip in guest_chips {
+        let handler: u64 = remote.borrow().get_attribute(chip, "data-rid").unwrap().parse().unwrap();
+        guest.dispatch(Event { handler, data: EventData::Plain(Click::default()) });
+    }
+    let focus = all_with_class(&*remote.borrow(), NodeId(GUEST_BODY), "focus")[0];
+    let handler: u64 = remote.borrow().get_attribute(focus, "data-rid").unwrap().parse().unwrap();
+    guest.dispatch(Event { handler, data: EventData::Plain(Click::default()) });
+    assert_eq!(
+        host.requests.borrow().as_slice(),
+        &[HostRequest::Follow { person: "sub-sam".into() }, HostRequest::Focus { node: Some(metanode.clone()) }]
+    );
+
+    // They leave: the chips go.
+    guest.host_state(HostState::default());
+    let doc = host.doc.borrow();
+    assert!(all_with_class(&*doc, doc.body(), "pimble-pane__person").is_empty());
+}
+
+fn all_with_class(doc: &dyn DomDocument, node: NodeId, class: &str) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    if doc.get_attribute(node, "class").is_some_and(|c| c.split_whitespace().any(|w| w == class)) {
+        out.push(node);
+    }
+    for child in doc.get_children(node) {
+        out.extend(all_with_class(doc, child, class));
+    }
+    out
 }

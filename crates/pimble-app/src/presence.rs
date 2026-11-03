@@ -46,20 +46,9 @@ pub struct Present {
 }
 
 /// A person in a document, their sessions merged: what a pane's initials and
-/// a tree row's dot show.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Person {
-    /// Their account (or agent, or session when signed out).
-    pub key: String,
-    pub name: String,
-    pub initials: String,
-    /// `#rrggbb`.
-    pub color: String,
-    /// Name and devices, for the hover.
-    pub title: String,
-    /// An AI agent: a robot glyph beside its initials, and never followed.
-    pub agent: bool,
-}
+/// a tree row's dot show. The type and the components that draw it are
+/// pimble-ui's, which plugins draw with too.
+pub use pimble_ui::presence::{follow_hint, hover, initials, Person};
 
 /// Who one session is, as a caret's flag shows them.
 #[derive(Debug, Clone, PartialEq)]
@@ -124,16 +113,25 @@ fn say(store: AppStore, now: HashMap<PaneId, (StoreId, NodeId, bool)>) {
     let before = SAID.with(|said| said.borrow().clone());
     for (pane, (store_id, node_id, _)) in &before {
         if now.get(pane).is_none_or(|(s, n, _)| (s, n) != (store_id, node_id)) {
-            store.send(BackendCommand::PublishPresence { store_id: *store_id, node_id: *node_id, pane: pane.index(), focused: false, left: true, text: None, board: None });
+            store.send(BackendCommand::PublishPresence { store_id: *store_id, node_id: *node_id, session: pane_session(*pane), focused: false, left: true, text: None, board: None });
             SENT.with(|s| s.borrow_mut()[pane.index()] = Whereabouts::default());
         }
     }
     SAID.with(|said| *said.borrow_mut() = now.clone());
+    // What a plugin's view said it is on belongs to the document the pane
+    // held: a pane that let it go lets that go too.
+    let within: Vec<PaneId> = WITHIN.with(|w| w.borrow().keys().copied().collect());
+    for pane in within {
+        let held = now.get(&pane).map(|(s, n, _)| (*s, *n));
+        if held != WITHIN.with(|w| w.borrow().get(&pane).map(|w| w.view)) {
+            say_within(store, pane, None);
+        }
+    }
     for (pane, held) in &now {
         if before.get(pane) != Some(held) {
             let (store_id, node_id, focused) = *held;
             let at = take_mine(store, *pane);
-            store.send(BackendCommand::PublishPresence { store_id, node_id, pane: pane.index(), focused, left: false, text: at.text, board: at.board });
+            store.send(BackendCommand::PublishPresence { store_id, node_id, session: pane_session(*pane), focused, left: false, text: at.text, board: at.board });
         }
     }
 }
@@ -169,7 +167,7 @@ pub(crate) fn moved(store: AppStore, pane: PaneId) {
             }
             let Some((store_id, node_id, focused)) = SAID.with(|said| said.borrow().get(&pane).copied()) else { return };
             let at = take_mine(store, pane);
-            store.send(BackendCommand::PublishPresence { store_id, node_id, pane: pane.index(), focused, left: false, text: at.text, board: at.board });
+            store.send(BackendCommand::PublishPresence { store_id, node_id, session: pane_session(pane), focused, left: false, text: at.text, board: at.board });
         })
     });
 }
@@ -180,11 +178,80 @@ fn heartbeat(store: AppStore) {
         let held = SAID.with(|said| said.borrow().clone());
         for (pane, (store_id, node_id, focused)) in held {
             let at = take_mine(store, pane);
-            store.send(BackendCommand::PublishPresence { store_id, node_id, pane: pane.index(), focused, left: false, text: at.text, board: at.board });
+            store.send(BackendCommand::PublishPresence { store_id, node_id, session: pane_session(pane), focused, left: false, text: at.text, board: at.board });
+        }
+        let within = WITHIN.with(|w| w.borrow().clone());
+        for (pane, w) in within {
+            store.send(within_frame(pane, w.on, false));
         }
         prune(store);
         heartbeat(store);
     });
+}
+
+/// Pane `pane`'s own session: its index.
+fn pane_session(pane: PaneId) -> String {
+    pane.index().to_string()
+}
+
+/// The session of what a plugin's view in pane `pane` says the person is on
+/// (a card they chose): beside the pane's own, under the same client, so
+/// this window drops it as its own and everyone else sees the person, not a
+/// second visitor.
+pub(crate) fn within_session(pane: PaneId) -> String {
+    format!("{}.in", pane.index())
+}
+
+/// What a plugin's view in a pane said the person is on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Within {
+    /// The document the pane holds (the metanode).
+    view: (StoreId, NodeId),
+    /// The node the person is on in it.
+    on: (StoreId, NodeId),
+}
+
+thread_local! {
+    /// What each pane's plugin view says the person is on.
+    static WITHIN: RefCell<HashMap<PaneId, Within>> = RefCell::new(HashMap::new());
+}
+
+fn within_frame(pane: PaneId, (store_id, node_id): (StoreId, NodeId), left: bool) -> BackendCommand {
+    // Not focused: following someone follows the pane they work in (the
+    // metanode, which opens their view), not the node they are on in it.
+    BackendCommand::PublishPresence { store_id, node_id, session: within_session(pane), focused: false, left, text: None, board: None }
+}
+
+/// The plugin's view in pane `pane` says the person is on `node` in it, or on
+/// nothing (docs/PRESENCE_CONTRACT.md "Plugins"). Everyone else then sees the
+/// person on that node as they would see someone with it open: on its tree
+/// row, on a pane holding it, on its card in their own view. Said again with
+/// every heartbeat while it holds, and a goodbye when it changes, when the
+/// view goes, or when the pane lets its document go.
+pub(crate) fn say_within(store: AppStore, pane: PaneId, node: Option<(StoreId, NodeId)>) {
+    let before = WITHIN.with(|w| w.borrow().get(&pane).copied());
+    let view = SAID.with(|said| said.borrow().get(&pane).map(|(s, n, _)| (*s, *n)));
+    let now = match (node, view) {
+        (Some(on), Some(view)) => Some(Within { view, on }),
+        _ => None,
+    };
+    if before.map(|w| w.on) == now.map(|w| w.on) {
+        return;
+    }
+    if let Some(before) = before {
+        store.send(within_frame(pane, before.on, true));
+    }
+    WITHIN.with(|w| match now {
+        Some(within) => {
+            w.borrow_mut().insert(pane, within);
+        }
+        None => {
+            w.borrow_mut().remove(&pane);
+        }
+    });
+    if let Some(now) = now {
+        store.send(within_frame(pane, now.on, false));
+    }
 }
 
 // ── Everyone else ────────────────────────────────────────────────────────
@@ -286,13 +353,21 @@ pub fn people_in(store: AppStore, store_id: StoreId, node_id: NodeId) -> Vec<Per
 }
 
 /// What sessions of one person share: their account, an agent apart from
-/// its account, the session itself for someone signed out.
+/// its account, the client (one window of one device) for someone signed
+/// out, so a signed-out window's pane and what its plugin view says it is on
+/// (docs/PRESENCE_CONTRACT.md "Plugins") are one person in one color.
 pub(crate) fn person_key(p: &Present) -> String {
     match &p.who {
         Some(PresenceWho { sub, agent: Some(agent) }) => format!("{sub}/agent/{agent}"),
         Some(PresenceWho { sub, agent: None }) if !sub.is_empty() => sub.clone(),
-        _ => p.session.clone(),
+        _ => client_of(&p.session).to_string(),
     }
+}
+
+/// The client a session belongs to: everything before its last `:`
+/// (`{client}:{pane}`, `{client}:{pane}.in`).
+fn client_of(session: &str) -> &str {
+    session.rsplit_once(':').map_or(session, |(client, _)| client)
 }
 
 /// Who session `p` in `(store_id, node_id)` is: their name there and their
@@ -313,28 +388,6 @@ pub fn identity(store: AppStore, store_id: StoreId, node_id: NodeId, p: &Present
         color: format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b),
         color_index: pimble_board::author_color_index(&color_key),
         agent: agent.is_some(),
-    }
-}
-
-/// What hovering someone says: their name and the devices they are on, or
-/// for an agent, that it is one and the app it works through.
-pub fn hover(name: &str, agent: bool, devices: &[String]) -> String {
-    let devices: Vec<&str> = devices.iter().map(String::as_str).filter(|d| !d.is_empty()).collect();
-    match (agent, devices.is_empty()) {
-        (true, true) => format!("{name}, an AI agent"),
-        (true, false) => format!("{name}, an AI agent in {}", devices.join(", ")),
-        (false, true) => name.to_string(),
-        (false, false) => format!("{name}, on {}", devices.join(", ")),
-    }
-}
-
-/// What a hover adds about following: nothing for an agent, which cannot be
-/// followed (docs/PRESENCE_CONTRACT.md section 8).
-pub fn follow_hint(agent: bool) -> &'static str {
-    if agent {
-        ""
-    } else {
-        " (click to follow)"
     }
 }
 
@@ -360,16 +413,6 @@ fn name_of(store: AppStore, store_id: StoreId, node_id: NodeId, p: &Present, me:
     }
 }
 
-/// One or two letters for a name: the first of its first two words.
-pub fn initials(name: &str) -> String {
-    let letters: String = name.split_whitespace().take(2).filter_map(|w| w.chars().find(|c| c.is_alphanumeric())).flat_map(char::to_uppercase).collect();
-    if letters.is_empty() {
-        "?".to_string()
-    } else {
-        letters
-    }
-}
-
 /// The device label a frame carries: the computer's name, or "Web".
 pub fn device_label() -> String {
     #[cfg(feature = "native")]
@@ -388,21 +431,23 @@ pub fn device_label() -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn an_agent_is_named_as_one_and_not_offered_to_follow() {
-        assert_eq!(hover("Claude (Sam's agent)", true, &["Claude Code".to_string()]), "Claude (Sam's agent), an AI agent in Claude Code");
-        assert_eq!(hover("Claude", true, &[String::new()]), "Claude, an AI agent");
-        assert_eq!(hover("Sam", false, &["laptop".to_string(), "Web".to_string()]), "Sam, on laptop, Web");
-        assert_eq!(follow_hint(true), "");
-        assert_eq!(follow_hint(false), " (click to follow)");
+    fn present(session: &str, who: Option<PresenceWho>) -> Present {
+        Present { session: session.into(), who, device: "laptop".into(), focused: false, text: None, board: None, moved_ms: 0.0, expires_ms: 0.0 }
     }
 
     #[test]
-    fn initials_take_the_first_letter_of_two_words() {
-        assert_eq!(initials("Chef Ann"), "CA");
-        assert_eq!(initials("bob"), "B");
-        assert_eq!(initials("  mary   jane watson "), "MJ");
-        assert_eq!(initials("(Grandma)"), "G");
-        assert_eq!(initials(""), "?");
+    fn a_pane_and_what_its_plugin_view_is_on_are_one_person() {
+        // Signed out: the pane's session and its plugin view's are one client.
+        let pane = present("c1:0", None);
+        let within = present(&format!("c1:{}", within_session(PaneId::ALL[0])), None);
+        assert_eq!(within.session, "c1:0.in");
+        assert_eq!(person_key(&pane), person_key(&within));
+        assert_ne!(person_key(&pane), person_key(&present("c2:0", None)));
+        // Signed in: the account, whatever the session.
+        let sam = Some(PresenceWho { sub: "sam".into(), agent: None });
+        assert_eq!(person_key(&present("c1:0.in", sam.clone())), "sam");
+        // An agent apart from its account.
+        let agent = Some(PresenceWho { sub: "sam".into(), agent: Some("Claude".into()) });
+        assert_eq!(person_key(&present("agent:7:n", agent)), "sam/agent/Claude");
     }
 }

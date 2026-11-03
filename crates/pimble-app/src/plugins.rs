@@ -36,8 +36,8 @@ use std::sync::OnceLock;
 
 use pimble_api::{Addr, Forest};
 use pimble_crdt::NodeDoc;
-use pimble_plugin_host::abi::api::ApiReply;
-use pimble_plugin_host::abi::{Manifest, NodeAddr, Props, StoreAsk};
+use pimble_plugin_host::abi::api::{ApiReply, Reach};
+use pimble_plugin_host::abi::{HostRequest, HostState, Manifest, NodeAddr, NodePeople, PresentPerson, Props, RecipeDecl, StoreAsk};
 use pimble_plugin_host::bridge::asking_sentence;
 use pimble_plugin_host::wasmtime_engine::{Registry, ViewerLookup, DEFAULT_BUDGET};
 use pimble_plugin_host::{ApiSide, ApplierOptions, Approval, Approved, Instance, InstanceOptions};
@@ -117,7 +117,113 @@ pub(crate) fn load(store: AppStore) {
 
 fn loaded() {
     if let Some(store) = STORE.with(Cell::get) {
+        // What the explorer's new-node menu offers from them.
+        store.recipes.set(recipes());
         crate::metanodes::plugins_ready(store);
+        watch_host_state(store);
+    }
+}
+
+/// The recipes every loaded plugin registers ("New Kanban"), in the folder's
+/// order, each with the plugin that registered it.
+fn recipes() -> Vec<crate::state::PluginRecipe> {
+    let Some(registry) = REGISTRY.get() else { return Vec::new() };
+    registry
+        .plugins
+        .iter()
+        .flat_map(|p| p.manifest.recipes().map(|r| crate::state::PluginRecipe { plugin: p.manifest.name.clone(), recipe: r.clone() }))
+        .collect()
+}
+
+/// A row's recipe item: make what `recipe` says under `parent`, through the
+/// app's own API, as the person's own edit (no plugin code runs).
+pub(crate) fn make(store: AppStore, store_id: pimble_core::StoreId, parent_id: pimble_core::NodeId, recipe: RecipeDecl) {
+    store.send(BackendCommand::MakeFromRecipe { store_id, parent_id, recipe });
+}
+
+// ── What the host knows, for each plugin view ─────────────────────────────────
+
+/// Hand every mounted plugin what the app knows that it draws with, now and
+/// whenever it changes: who is in which node, whom its pane follows, the
+/// theme (docs/PRESENCE_CONTRACT.md "Plugins").
+fn watch_host_state(store: AppStore) {
+    let _ = rinch::Effect::new(move || {
+        // Tracked: the sessions, the theme, and each pane's following.
+        store.presence.with(|_| ());
+        store.dark_mode.get();
+        for pane in PaneId::ALL {
+            crate::presence::follow::watch(pane).with(|_| ());
+        }
+        untracked(|| {
+            for pane in PaneId::ALL {
+                push_host_state(store, pane);
+            }
+        });
+    });
+}
+
+/// What the plugin in pane `pane` is told: the people in every node of the
+/// stores it may read, as the app draws them (`presence::people_in`, so names,
+/// initials, colors and hovers are the app's own), whom the pane follows, and
+/// the theme.
+fn host_state(store: AppStore, pane: PaneId, approval: &Approval) -> HostState {
+    let docs: Vec<(pimble_core::StoreId, pimble_core::NodeId)> = store.presence.with(|all| all.keys().copied().collect());
+    let people = docs
+        .into_iter()
+        .filter(|(s, _)| approval.allows(*s, Reach::Read))
+        .map(|(s, n)| NodePeople {
+            node: NodeAddr::from(Addr::new(s, n)),
+            people: crate::presence::people_in(store, s, n)
+                .into_iter()
+                .map(|p| PresentPerson { key: p.key, name: p.name, initials: p.initials, color: p.color, title: p.title, agent: p.agent })
+                .collect(),
+        })
+        .filter(|n| !n.people.is_empty())
+        .collect();
+    let following = match crate::presence::follow::watch(pane).get() {
+        crate::presence::follow::Follow::On(leader) => Some(leader.key),
+        _ => None,
+    };
+    HostState { dark: store.dark_mode.get(), people, following }
+}
+
+fn push_host_state(store: AppStore, pane: PaneId) {
+    let Some((instance, plugin_id)) = SHOWN.with(|s| s.borrow().get(&pane).and_then(|shown| Some((shown.instance.clone()?, shown.plugin_id.clone())))) else {
+        return;
+    };
+    let state = host_state(store, pane, &approval_of(&plugin_id));
+    instance.set_host_state(&state);
+}
+
+/// What the plugin in pane `pane` asked of the app.
+fn request(store: AppStore, pane: PaneId, plugin_id: &str, request: HostRequest) {
+    // A plugin names only nodes of stores it may read; anything else it
+    // asks about is dropped, as a call outside its approval is refused.
+    let approval = approval_of(plugin_id);
+    let readable = |node: &NodeAddr| node.addr().filter(|a| approval.allows(a.store, Reach::Read));
+    match request {
+        HostRequest::Open { node } => {
+            if let Some(addr) = readable(&node) {
+                store.link_open.set(Some(crate::state::LinkOpen {
+                    value: format!("node_{}_{}", addr.store, addr.node),
+                    store_id: addr.store,
+                    node_id: addr.node,
+                    anchor: None,
+                    pane: Some(pane),
+                }));
+            }
+        }
+        HostRequest::Focus { node } => {
+            let on = match node {
+                None => None,
+                Some(node) => match readable(&node) {
+                    Some(addr) => Some((addr.store, addr.node)),
+                    None => return,
+                },
+            };
+            crate::presence::say_within(store, pane, on);
+        }
+        HostRequest::Follow { person } => crate::presence::follow::start(store, pane, &person),
     }
 }
 
@@ -244,8 +350,11 @@ pub(crate) fn show(store: AppStore, pane: PaneId, viewer: &str, forest: &Forest)
     };
     instance.set_api(api_side(store, &instance, &manifest, approval));
     instance.on_stop(move |sentence| stopped(store, pane, sentence));
+    let plugin_id = manifest.id.clone();
+    instance.on_request(move |r| request(store, pane, &plugin_id, r));
     SHOWN.with(|s| s.borrow_mut().insert(pane, shown(Some(instance.clone()), None)));
     if instance.mount(viewer, &props) {
+        push_host_state(store, pane);
         Outcome::Shown
     } else {
         stopped_sentence(pane)
@@ -343,6 +452,7 @@ fn stopped_sentence(pane: PaneId) -> Outcome {
 /// The plugin in `pane` stopped by itself: the pane falls back to the outline with
 /// the sentence, and the plugin is not started again for this metanode.
 fn stopped(store: AppStore, pane: PaneId, sentence: &str) {
+    crate::presence::say_within(store, pane, None);
     SHOWN.with(|s| {
         if let Some(shown) = s.borrow_mut().get_mut(&pane) {
             shown.instance = None;
@@ -352,11 +462,15 @@ fn stopped(store: AppStore, pane: PaneId, sentence: &str) {
     crate::metanodes::plugin_stopped(store, pane, sentence);
 }
 
-/// Take down whatever plugin pane `pane` shows.
+/// Take down whatever plugin pane `pane` shows; what it said the person was
+/// on goes with it.
 pub(crate) fn hide(pane: PaneId) {
     let shown = SHOWN.with(|s| s.borrow_mut().remove(&pane));
     if let Some(Shown { instance: Some(instance), .. }) = shown {
         instance.unmount();
+    }
+    if let Some(store) = STORE.with(Cell::get) {
+        crate::presence::say_within(store, pane, None);
     }
 }
 

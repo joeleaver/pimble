@@ -59,6 +59,7 @@ fn guest(manifest: &Manifest, mount_body: &str, ops: &[Op]) -> Vec<u8> {
   (func (export "pimble_poll_task") (param i64))
   (func (export "pimble_drain_polls") (result i64) i64.const -1)
   (func (export "pimble_resolve") (param i32 i32))
+  (func (export "pimble_host_state") (param i32 i32))
 )"#,
         described = data(&described),
         ops_data = data(&ops),

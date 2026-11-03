@@ -43,6 +43,11 @@ pub enum BackendCommand {
     /// `init` is what the node starts with, written in the edit that creates
     /// it; `None` makes an ordinary empty document.
     CreateNode { store_id: StoreId, parent_id: Option<NodeId>, title: String, init: Option<NodeInit>, place: Place },
+    /// Make what a plugin's recipe says under `parent_id`, last
+    /// (docs/KANBAN_CONTRACT.md "New Kanban"): a metanode with its viewer and
+    /// source written in its create, then its first children in order.
+    /// Answers with `NodeCreated` for the metanode.
+    MakeFromRecipe { store_id: StoreId, parent_id: NodeId, recipe: pimble_plugin_abi::RecipeDecl },
     /// Create an attachment of `host_id` (a discussion on it,
     /// docs/DISCUSSIONS_CONTRACT.md section 1): the host is not edited.
     /// Answers with `AttachmentCreated`.
@@ -296,7 +301,9 @@ pub enum BackendCommand {
     PublishPresence {
         store_id: StoreId,
         node_id: NodeId,
-        pane: usize,
+        /// The session within this client: a pane's index, or what a
+        /// plugin in that pane is on (`presence::within_session`).
+        session: String,
         focused: bool,
         left: bool,
         text: Option<pimble_rpc::TextPresence>,

@@ -67,6 +67,25 @@ pub fn canvas(title: &str, content: Vec<u8>, from_picture: bool) -> NodeInit {
     }
 }
 
+/// A metanode titled `title` shown with `viewer` over its own subtree
+/// `depth` levels deep (docs/METANODES_CONTRACT.md), with `icon` when given:
+/// a plugin's recipe ("New Kanban", docs/KANBAN_CONTRACT.md) as data. The
+/// metanode keys go in with the create, so no one ever sees it as a plain
+/// node first; its first children are creates of their own, after it.
+pub fn metanode(title: &str, icon_name: Option<&str>, viewer: &str, depth: u32) -> NodeInit {
+    let source = pimble_core::metanode::Source::subtree(depth);
+    let mut custom = vec![explicit()];
+    if let Some(name) = icon_name.filter(|n| !n.trim().is_empty()) {
+        custom.insert(0, icon(name));
+    }
+    NodeInit {
+        node_type: node_types::DOCUMENT.to_string(),
+        title: title.to_string(),
+        content: Some(NodeDoc::metanode_seed(viewer, &source)),
+        custom,
+    }
+}
+
 /// The first message of a discussion: who wrote it, when, and its body.
 pub struct FirstMessage<'a> {
     pub author: Option<&'a Author>,
@@ -114,6 +133,21 @@ mod tests {
         assert!(init.custom.iter().any(|(k, _)| k == custom_keys::EXPLICIT_TITLE));
         assert!(document("Empty", Some("  ")).unwrap().content.is_none());
         assert!(matches!(document("Tasks", Some("- [ ] a task")), Err(ApiError::Refused { .. })));
+    }
+
+    #[test]
+    fn a_metanode_is_one_from_its_first_edit() {
+        let init = metanode("Kanban", Some("layout-kanban"), "kanban", 2);
+        assert!(init.custom.contains(&icon("layout-kanban")));
+        // As the create makes it: a node document with its title, and the
+        // seed merged into it.
+        let mut doc = NodeDoc::new();
+        doc.init(node_types::DOCUMENT, "Kanban", None, "2026-11-02T00:00:00.000Z").unwrap();
+        doc.apply_update(init.content.as_deref().unwrap()).unwrap();
+        let spec = doc.metanode().expect("a metanode");
+        assert_eq!(spec.viewer, "kanban");
+        assert_eq!(spec.source.depth(), 2);
+        assert_eq!(doc.fields().unwrap().title, "Kanban");
     }
 
     #[test]

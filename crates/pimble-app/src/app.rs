@@ -27,6 +27,7 @@ use crate::state::{ShareFace, HOST_ON_CLOUD_LABEL, HOST_ON_CLOUD_SENTENCE, SHARE
 use crate::state::PendingMount;
 use crate::state::{SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH};
 use crate::styles::{APP_CSS, EDITOR_CSS};
+use pimble_ui::presence::PersonDot;
 
 /// How long after a click a second one on the same row still counts as a
 /// double-click, and so starts an inline rename.
@@ -1507,6 +1508,19 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     }
                 }
             };
+            // A plugin's recipe ("New Kanban"): made under the row, as
+            // "New Sheet" is.
+            let on_recipe = {
+                let nv = nv_ctx.clone();
+                move |recipe: pimble_plugin_abi::RecipeDecl| {
+                    if let Some((s_id, parent)) = crate::tree_view::create_parent_of_row(store, &nv) {
+                        #[cfg(feature = "native")]
+                        crate::plugins::make(store, s_id, parent, recipe);
+                        #[cfg(not(feature = "native"))]
+                        let _ = (s_id, parent, recipe);
+                    }
+                }
+            };
             let on_new_image = {
                 let nv = nv_ctx.clone();
                 move || {
@@ -1938,18 +1952,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                             Some((s_id, Some(n_id))) => crate::presence::people_in(store, s_id, n_id).into_iter().take(3).collect::<Vec<_>>(),
                             _ => Vec::new(),
                         }) {
-                            span {
-                                key: person.key.clone(),
-                                // An agent's dot is a robot in its color.
-                                class: if person.agent { "pimble-tree-people__dot pimble-tree-people__dot--agent" } else { "pimble-tree-people__dot" },
-                                title: person.title.clone(),
-                                style: if person.agent { format!("color: {};", person.color) } else { format!("background: {};", person.color) },
-                                span {
-                                    class: "pimble-presence-robot",
-                                    style: if person.agent { "" } else { "display: none;" },
-                                    IconGlyph { name: "robot".to_string() }
-                                }
-                            }
+                            PersonDot { key: person.key.clone(), person: person.clone() }
                         }
                     }
 
@@ -2085,6 +2088,18 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 disabled: store_menu.new_node,
                                 onclick: on_new_discussion.clone(),
                                 "New Discussion"
+                            }
+                            for item in store.recipes.get() {
+                                DropdownMenuItem {
+                                    key: format!("{} {}", item.plugin, item.recipe.id),
+                                    left_section: item.recipe.icon.as_deref().and_then(icon_by_name).unwrap_or(TablerIcon::LayoutKanban),
+                                    disabled: store_menu.new_node,
+                                    onclick: {
+                                        let (on_recipe, recipe) = (on_recipe.clone(), item.recipe.clone());
+                                        move || on_recipe(recipe.clone())
+                                    },
+                                    {item.recipe.label.clone()}
+                                }
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::Photo,
@@ -2298,6 +2313,18 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 disabled: store_menu.new_node,
                                 onclick: on_new_discussion.clone(),
                                 "New Discussion"
+                            }
+                            for item in store.recipes.get() {
+                                DropdownMenuItem {
+                                    key: format!("{} {}", item.plugin, item.recipe.id),
+                                    left_section: item.recipe.icon.as_deref().and_then(icon_by_name).unwrap_or(TablerIcon::LayoutKanban),
+                                    disabled: store_menu.new_node,
+                                    onclick: {
+                                        let (on_recipe, recipe) = (on_recipe.clone(), item.recipe.clone());
+                                        move || on_recipe(recipe.clone())
+                                    },
+                                    {item.recipe.label.clone()}
+                                }
                             }
                             DropdownMenuItem {
                                 left_section: TablerIcon::MessagePlus,
@@ -4524,6 +4551,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 on_close: || close_window(),
 
                 style { {APP_CSS} }
+                style { {pimble_ui::STYLES} }
                 style { {EDITOR_CSS} }
 
                 {connect_modal}
@@ -4559,6 +4587,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 style: "height: 100%; display: flex; flex-direction: column;",
 
                 style { {APP_CSS} }
+                style { {pimble_ui::STYLES} }
                 style { {EDITOR_CSS} }
 
                 {connect_modal}

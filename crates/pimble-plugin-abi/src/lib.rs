@@ -33,7 +33,7 @@ pub mod api;
 /// anything else is refused at load with [`refusal_for_abi`]'s sentence. Bump it on
 /// any change a plugin built before it would misread: a message's shape, an export,
 /// an import, the meaning of a node id.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 /// The guest node id of the plugin document's `<html>` root. Nothing in the host
 /// stands for it: a plugin renders under its body.
@@ -78,6 +78,11 @@ pub mod exports {
     /// answer to one of the guest's API calls (JSON). The host never calls it
     /// inside the guest's own call: an answer is always a later turn.
     pub const RESOLVE: &str = "pimble_resolve";
+    /// `(ptr: u32, len: u32)`: a [`HostState`](crate::HostState), what the
+    /// host knows that the plugin draws with and that changes on its own: who
+    /// is in which node, whom the pane follows, the theme. Sent after
+    /// `MOUNT` and again whenever any of it changes (ABI 3).
+    pub const HOST_STATE: &str = "pimble_host_state";
     /// The guest's linear memory.
     pub const MEMORY: &str = "memory";
 }
@@ -108,6 +113,10 @@ pub mod imports {
     /// `(call: u64)`: the guest no longer wants answers to that call (a
     /// subscription it dropped).
     pub const API_CANCEL: &str = "pimble_api_cancel";
+    /// `(ptr: u32, len: u32)`: a [`HostRequest`](crate::HostRequest), something
+    /// only the app can do for the person (open a node in the pane, say where
+    /// they are, follow someone). Answers nothing; the host may decline (ABI 3).
+    pub const HOST: &str = "pimble_host";
     /// `(level: u32, ptr: u32, len: u32)`: a line for the app's log, UTF-8. Level 0
     /// is an error, 1 a warning, 2 information, 3 and above debugging.
     pub const LOG: &str = "pimble_log";
@@ -195,6 +204,33 @@ impl Permissions {
 pub enum Provision {
     /// A metanode viewer (docs/METANODES_CONTRACT.md).
     Viewer(ViewerDecl),
+    /// A way to make a new node, offered in the explorer's new-node menu
+    /// ("New Kanban").
+    Recipe(RecipeDecl),
+}
+
+/// A recipe a plugin registers: what a new node of its kind starts as, as
+/// data the app makes through its own API when the person picks it. No
+/// plugin code runs to make it, so a recipe needs nothing allowed; the node
+/// it makes is the person's own edit, made where they chose.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecipeDecl {
+    /// Unique among the plugin's recipes: `new-kanban`.
+    pub id: String,
+    /// The menu item: "New Kanban".
+    pub label: String,
+    /// The new node's title: "Kanban".
+    pub title: String,
+    /// The new node's icon (a Tabler icon name), and the menu item's.
+    pub icon: Option<String>,
+    /// The new node is a metanode shown with this viewer (one of the
+    /// plugin's own, usually).
+    pub viewer: String,
+    /// Its source: its own subtree this many levels deep (1 is its
+    /// children).
+    pub depth: u32,
+    /// The children it starts with, titled, in order: a kanban's columns.
+    pub children: Vec<String>,
 }
 
 /// A viewer a plugin provides.
@@ -222,8 +258,17 @@ pub enum SourceShape {
 impl Manifest {
     /// The viewers this plugin provides.
     pub fn viewers(&self) -> impl Iterator<Item = &ViewerDecl> {
-        self.provides.iter().map(|p| match p {
-            Provision::Viewer(v) => v,
+        self.provides.iter().filter_map(|p| match p {
+            Provision::Viewer(v) => Some(v),
+            _ => None,
+        })
+    }
+
+    /// The recipes this plugin registers.
+    pub fn recipes(&self) -> impl Iterator<Item = &RecipeDecl> {
+        self.provides.iter().filter_map(|p| match p {
+            Provision::Recipe(r) => Some(r),
+            _ => None,
         })
     }
 }
@@ -275,6 +320,68 @@ impl From<pimble_api::Addr> for NodeAddr {
     fn from(a: pimble_api::Addr) -> Self {
         NodeAddr { store: a.store.to_string(), node: a.node.to_string() }
     }
+}
+
+// ── What the host knows, and what it does for a plugin (ABI 3) ────────────────
+
+/// What the host knows that a plugin draws with and that changes on its own,
+/// sent whole whenever any of it changes (`pimble_host_state`).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct HostState {
+    /// The app shows its dark theme: colors are drawn for it
+    /// (`pimble_ui::appearance::display_color`).
+    pub dark: bool,
+    /// Who else is in which node, for every node someone is in, in the stores
+    /// the plugin may read (docs/PRESENCE_CONTRACT.md "Plugins"): resolved
+    /// as the app resolves them, names, initials and colors included, so a
+    /// plugin draws them with `pimble_ui::presence` exactly as the app does.
+    pub people: Vec<NodePeople>,
+    /// The key of the person the plugin's pane follows, when it follows
+    /// someone: the plugin shows where they are in its view (a kanban
+    /// scrolls to the card they are on).
+    pub following: Option<String>,
+}
+
+/// The people in one node.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct NodePeople {
+    pub node: NodeAddr,
+    pub people: Vec<PresentPerson>,
+}
+
+/// A person in a node, as the app draws them (`pimble_ui::presence::Person`).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct PresentPerson {
+    pub key: String,
+    pub name: String,
+    pub initials: String,
+    pub color: String,
+    pub title: String,
+    pub agent: bool,
+}
+
+impl HostState {
+    /// The people in `node`.
+    pub fn people_in(&self, node: &NodeAddr) -> &[PresentPerson] {
+        self.people.iter().find(|p| &p.node == node).map_or(&[], |p| p.people.as_slice())
+    }
+}
+
+/// Something only the app can do for the person using a plugin
+/// (`pimble_host`). The host may decline any of them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum HostRequest {
+    /// Open `node` in the plugin's pane, as a click on a row of the outline
+    /// does.
+    Open { node: NodeAddr },
+    /// The person is on `node` in the plugin's view (a card they chose), or
+    /// on nothing in it: the app says so to everyone else as part of the
+    /// pane's presence, so they show on that node as they would in a native
+    /// view. Never document data.
+    Focus { node: Option<NodeAddr> },
+    /// Follow the person with this key in the plugin's pane, as a click on
+    /// their initials on the pane's strip does.
+    Follow { person: String },
 }
 
 // ── The DOM op log ────────────────────────────────────────────────────────────
@@ -360,6 +467,13 @@ pub const HANDLER_ATTRIBUTES: &[(&str, HandlerKind)] = &[
     ("data-onfiledragenter", HandlerKind::Plain),
     ("data-onfiledragleave", HandlerKind::Plain),
 ];
+
+// rinch #2091 (sortable lists, being built 2026-11-02) is asked for plain
+// `data-*` handlers so that its drags work through this proxy. When it lands,
+// any new attribute it writes a handler id to goes in the list above with the
+// kind of handler it holds; a drag judge that answers synchronously (a reason
+// shown during the drag) needs a kind of its own here, answered the way `Key`
+// is (the host waits for the guest's answer), and a variant in `EventData`.
 
 /// The kind of handler attribute `name` holds, or `None` for an ordinary attribute.
 pub fn handler_kind(name: &str) -> Option<HandlerKind> {
@@ -478,14 +592,36 @@ mod tests {
             version: "0.1.0".into(),
             abi: ABI_VERSION,
             rinch: "edcee04".into(),
-            provides: vec![Provision::Viewer(ViewerDecl {
-                id: "hello".into(),
-                name: "Hello".into(),
-                takes: vec![SourceShape::Any, SourceShape::Subtree { depth: 2 }],
-            })],
+            provides: vec![
+                Provision::Viewer(ViewerDecl {
+                    id: "hello".into(),
+                    name: "Hello".into(),
+                    takes: vec![SourceShape::Any, SourceShape::Subtree { depth: 2 }],
+                }),
+                Provision::Recipe(RecipeDecl {
+                    id: "new-kanban".into(),
+                    label: "New Kanban".into(),
+                    title: "Kanban".into(),
+                    icon: Some("layout-kanban".into()),
+                    viewer: "kanban".into(),
+                    depth: 2,
+                    children: vec!["To do".into(), "Doing".into(), "Done".into()],
+                }),
+            ],
             asks: Permissions { stores: StoreAsk::Chosen, write: true, network: false },
         };
         assert_eq!(decode::<Manifest>(&encode(&manifest)).unwrap(), manifest);
+        assert_eq!(manifest.viewers().count(), 1);
+        assert_eq!(manifest.recipes().next().map(|r| r.children.len()), Some(3));
+        let state = HostState {
+            dark: true,
+            people: vec![NodePeople { node: NodeAddr { store: "s".into(), node: "n".into() }, people: vec![PresentPerson { key: "k".into(), agent: true, ..Default::default() }] }],
+            following: Some("k".into()),
+        };
+        assert_eq!(decode::<HostState>(&encode(&state)).unwrap(), state);
+        assert_eq!(state.people_in(&NodeAddr { store: "s".into(), node: "n".into() }).len(), 1);
+        let request = HostRequest::Focus { node: Some(NodeAddr { store: "s".into(), node: "n".into() }) };
+        assert_eq!(decode::<HostRequest>(&encode(&request)).unwrap(), request);
         let ops = vec![
             Op::CreateElement { id: 2, tag: "div".into() },
             Op::SetAttribute { node: 2, name: "data-rid".into(), value: "7".into() },

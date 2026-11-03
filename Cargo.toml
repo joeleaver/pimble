@@ -22,9 +22,10 @@ members = [
     "crates/pimble-api",
     "crates/pimble-plugin-abi",
     "crates/pimble-plugin-host",
+    "crates/pimble-ui",
 ]
 # The plugin SDK and the plugins are their own workspace (plugins/Cargo.toml): they
-# build for wasm32-wasip1 against a rinch branch until it merges.
+# build for wasm32-wasip1 with their own lock.
 exclude = ["crates/pimble-plugin-sdk", "plugins"]
 
 [workspace.package]
@@ -120,3 +121,4 @@ pimble-discussion = { path = "crates/pimble-discussion" }
 pimble-api = { path = "crates/pimble-api" }
 pimble-plugin-abi = { path = "crates/pimble-plugin-abi" }
 pimble-plugin-host = { path = "crates/pimble-plugin-host" }
+pimble-ui = { path = "crates/pimble-ui" }

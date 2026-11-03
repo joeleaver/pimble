@@ -17,9 +17,8 @@ use std::collections::HashMap;
 
 use pimble_api::Forest;
 use pimble_core::metanode::{outline_line, Source};
-use pimble_core::{node_types, Node, NodeId, StoreId};
+use pimble_core::{Node, NodeId, StoreId};
 use rinch::prelude::*;
-use rinch_tabler_icons::TablerIcon;
 
 use crate::appearance::{display_color, IconGlyph};
 use crate::panes::PaneId;
@@ -334,18 +333,7 @@ pub(crate) fn plugins_ready(store: AppStore) {
 /// The icon a row shows: the node's own, or its type's as the explorer
 /// draws it.
 fn icon_of(node: &Node) -> String {
-    if let Some(icon) = node.metadata.icon() {
-        return icon.to_string();
-    }
-    let icon = match node.node_type.as_str() {
-        node_types::FOLDER => TablerIcon::Folder,
-        node_types::MOUNT => TablerIcon::Link,
-        node_types::BOARD => TablerIcon::Chalkboard,
-        node_types::SHEET => TablerIcon::Table,
-        node_types::DISCUSSION => TablerIcon::Messages,
-        _ => TablerIcon::File,
-    };
-    icon.name().to_string()
+    pimble_ui::appearance::node_icon(node)
 }
 
 /// The outline a pane shows for a metanode: the lines, then the rows,

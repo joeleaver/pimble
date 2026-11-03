@@ -5,10 +5,9 @@ edition = "2021"
 license = "MIT"
 publish = false
 description = "Write a Pimble plugin: plain rinch in a wasm32-wasip1 guest"
-# A member of the plugins workspace (plugins/Cargo.toml), not the main one: it is
-# built against a rinch branch until that change merges (docs/PLUGINS_CONTRACT.md
-# wave 1), and two rinch packages in the main lock would make the documented
-# `cargo update rinch` ambiguous there.
+# A member of the plugins workspace (plugins/Cargo.toml), not the main one: plugins
+# build for wasm32-wasip1 with their own lock and target directory, at a rinch
+# revision of their own (the main lock moves only with `cargo update rinch`).
 workspace = "../../plugins"
 
 [dependencies]
@@ -17,13 +16,19 @@ pimble-plugin-abi = { path = "../pimble-plugin-abi" }
 # backend: a plugin reaches the stores through the host (`GuestBackend`).
 pimble-api = { path = "../pimble-api", default-features = false }
 pimble-core = { path = "../pimble-core" }
+# A node's label as the explorer shows it reads its text (`display_label`).
+pimble-crdt = { path = "../pimble-crdt" }
 pimble-rpc = { path = "../pimble-rpc" }
+# Presence, icons and colors as the app draws them (docs/PRESENCE_CONTRACT.md
+# "Plugins"): a plugin draws with the app's own components.
+pimble-ui = { path = "../pimble-ui" }
 futures = "0.3"
 async-trait = "0.1"
 # Components and theme only, nothing browser-specific: a wasm32-wasip1 guest runs
-# inside a host that is not a browser. The branch gates rinch's browser halves on
-# `target_os = "unknown"` (joeleaver/rinch#2088); back to `main` once it merges.
-rinch = { git = "https://github.com/joeleaver/rinch.git", branch = "wasi-guest-gating", default-features = false, features = [
+# inside a host that is not a browser. rinch gates its browser halves on
+# `target_os = "unknown"` (joeleaver/rinch#2088, merged 2026-11-02), so main
+# builds for wasip1 with no panicking stubs.
+rinch = { git = "https://github.com/joeleaver/rinch.git", branch = "main", default-features = false, features = [
     "components",
     "theme",
 ] }
@@ -31,4 +36,4 @@ rinch = { git = "https://github.com/joeleaver/rinch.git", branch = "wasi-guest-g
 [dev-dependencies]
 # rinch's headless document, to render the same component directly and through a
 # RemoteDocument and compare the trees.
-rinch-core = { git = "https://github.com/joeleaver/rinch.git", branch = "wasi-guest-gating", features = ["test-util"] }
+rinch-core = { git = "https://github.com/joeleaver/rinch.git", branch = "main", features = ["test-util"] }
