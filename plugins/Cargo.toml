@@ -18,3 +18,21 @@ members = ["../crates/pimble-plugin-sdk", "hello-viewer", "stuck-viewer", "kanba
 opt-level = "s"
 lto = true
 codegen-units = 1
+
+# Kanban drags are built against joeleaver/rinch#2093 (sortable lists, #2091),
+# not merged yet: every rinch crate of this workspace comes from its branch at
+# the reviewed revision. The main workspace stays on rinch main. Remove this
+# block when #2093 merges (`cargo update -p rinch` then moves the lock to main).
+# The URL is spelled with `www.` because a patch must name another source
+# than the one it patches.
+[patch."https://github.com/joeleaver/rinch.git"]
+rinch = { git = "https://www.github.com/joeleaver/rinch.git", rev = "b63871e68e0182d76b942e6e629aa049acd8fd7b" }
+rinch-components = { git = "https://www.github.com/joeleaver/rinch.git", rev = "b63871e68e0182d76b942e6e629aa049acd8fd7b" }
+rinch-core = { git = "https://www.github.com/joeleaver/rinch.git", rev = "b63871e68e0182d76b942e6e629aa049acd8fd7b" }
+rinch-editor-collab = { git = "https://www.github.com/joeleaver/rinch.git", rev = "b63871e68e0182d76b942e6e629aa049acd8fd7b" }
+rinch-editor-core = { git = "https://www.github.com/joeleaver/rinch.git", rev = "b63871e68e0182d76b942e6e629aa049acd8fd7b" }
+rinch-macros = { git = "https://www.github.com/joeleaver/rinch.git", rev = "b63871e68e0182d76b942e6e629aa049acd8fd7b" }
+rinch-platform = { git = "https://www.github.com/joeleaver/rinch.git", rev = "b63871e68e0182d76b942e6e629aa049acd8fd7b" }
+rinch-tabler-icons = { git = "https://www.github.com/joeleaver/rinch.git", rev = "b63871e68e0182d76b942e6e629aa049acd8fd7b" }
+rinch-theme = { git = "https://www.github.com/joeleaver/rinch.git", rev = "b63871e68e0182d76b942e6e629aa049acd8fd7b" }
+rinch-words = { git = "https://www.github.com/joeleaver/rinch.git", rev = "b63871e68e0182d76b942e6e629aa049acd8fd7b" }

@@ -42,8 +42,8 @@ pub enum Call<'a> {
 pub enum Answered {
     Done,
     Bytes(Vec<u8>),
-    /// `dispatch`'s "consumed".
-    Flag(bool),
+    /// `dispatch`'s [`pimble_plugin_abi::dispatched`] flags.
+    Dispatched(u32),
     /// `drain_polls`'s milliseconds to the next poll.
     Number(i64),
 }
@@ -187,7 +187,7 @@ impl Instance {
         });
         let inner = Rc::new_cyclic(|me: &Weak<Inner>| {
             let weak = me.clone();
-            let dispatch: Dispatch = Rc::new(move |event: Event| weak.upgrade().is_some_and(|inner| inner.dispatch(event)));
+            let dispatch: Dispatch = Rc::new(move |event: Event| weak.upgrade().map_or(0, |inner| inner.dispatch(event)));
             Inner {
                 name: name.to_string(),
                 key,
@@ -281,7 +281,7 @@ impl Instance {
 
     /// Hand an event to the guest, as a proxy handler does; answers "consumed".
     pub fn dispatch(&self, event: Event) -> bool {
-        self.0.dispatch(event)
+        self.0.dispatch(event) & pimble_plugin_abi::dispatched::CONSUMED != 0
     }
 
     /// Take the view down and stop the instance: the guest unmounts, then whatever
@@ -344,9 +344,11 @@ impl Inner {
         }
     }
 
-    fn dispatch(&self, event: Event) -> bool {
+    /// Hand `event` to the guest: its [`pimble_plugin_abi::dispatched`] flags,
+    /// 0 when it is stopped or the event had to wait.
+    fn dispatch(&self, event: Event) -> u32 {
         if self.stopped.get() {
-            return false;
+            return 0;
         }
         if self.engine.try_borrow_mut().is_err() {
             // The guest is in a call: a write it made set this off. A key or a wheel
@@ -355,10 +357,13 @@ impl Inner {
             if !matches!(event.data, EventData::Key(_) | EventData::Wheel(_)) {
                 self.queued.borrow_mut().push_back(Pending::Event(event));
             }
-            return false;
+            return 0;
         }
         let bytes = encode(&event);
-        matches!(self.call(Call::Dispatch(&bytes)), Some(Answered::Flag(true)))
+        match self.call(Call::Dispatch(&bytes)) {
+            Some(Answered::Dispatched(flags)) => flags,
+            _ => 0,
+        }
     }
 
     fn resolve(&self, call: u64, reply: ApiReply) {

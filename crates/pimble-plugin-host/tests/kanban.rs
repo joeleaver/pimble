@@ -17,7 +17,7 @@ use pimble_core::{NodeId, Place, StoreId};
 use pimble_plugin_abi::{HostRequest, HostState, NodeAddr, NodePeople, PresentPerson};
 use pimble_plugin_host::{Approval, Approved};
 use rinch_core::dom::{DomDocument, NodeId as DomId};
-use rinch_core::events::{dispatch_event, dispatch_key_handler, EventHandlerId, KeyEventData};
+use rinch_core::events::{dispatch_event, dispatch_key_handler, set_click_context, ClickContext, EventHandlerId, KeyEventData};
 
 fn children(f: &Fixture, store: StoreId, node: NodeId) -> Vec<String> {
     let (_, nodes) = f.rt.block_on(f.service.get_children(store, node)).unwrap();
@@ -201,5 +201,138 @@ fn a_kanban_allowed_only_to_read_is_refused_its_writes() {
     r.click("button", "Write it");
     r.pump_until(&f, "the refusal", |r| r.text().contains("The Kanban plugin was allowed to read this store, not to change it."));
     assert_eq!(children(&f, store, f.plan), ["Alpha"]);
+    r.instance.unmount();
+}
+
+/// A node's key in the board's sortable lists (`board::key_of`).
+fn key(store: StoreId, node: NodeId) -> String {
+    format!("{store}/{node}")
+}
+
+/// The element of the sortable item keyed `key`.
+fn sortable(r: &Running, key: &str) -> DomId {
+    r.find(&|d, n| d.get_attribute(n, "data-sortable-key").as_deref() == Some(key))
+        .unwrap_or_else(|| panic!("no sortable {key} in: {}", r.text()))
+}
+
+/// The first element under `node` (or `node`) of class `class`.
+fn under(r: &Running, node: DomId, class: &str) -> Option<DomId> {
+    fn walk(d: &rinch_core::dom::mock::MockDomDocument, n: DomId, class: &str) -> Option<DomId> {
+        if has_class(d, n, class) {
+            return Some(n);
+        }
+        d.get_children(n).into_iter().find_map(|c| walk(d, c, class))
+    }
+    walk(&r.doc.borrow(), node, class)
+}
+
+/// The runtime's click context for a drag step over a box at `(x, y, w, h)`
+/// with the pointer at `(px, py)`, as the desktop sets it for `data-ondragover`.
+fn over(px: f32, py: f32, x: f32, y: f32, w: f32, h: f32) {
+    set_click_context(ClickContext {
+        mouse_x: px,
+        mouse_y: py,
+        element_x: x,
+        element_y: y,
+        element_width: w,
+        element_height: h,
+        ..ClickContext::default()
+    });
+}
+
+/// Fire the host handler `attr` of `node`, as the drag runtime does.
+fn fire(r: &Running, node: DomId, attr: &str) {
+    assert!(dispatch_event(EventHandlerId(r.handler(node, attr))), "{attr}");
+}
+
+#[test]
+fn cards_and_columns_drag_through_the_host_and_a_refused_drop_says_why() {
+    if built_plugin("kanban_viewer").is_none() {
+        return;
+    }
+    let f = fixture("kanban");
+    let store = f.store;
+    let (alpha, bravo, charlie) = f.rt.block_on(async {
+        let a = f.service.create_node(store, Some(f.plan), "document", "Alpha").await.unwrap();
+        let b = f.service.create_node(store, Some(f.plan), "document", "Bravo").await.unwrap();
+        let c = f.service.create_node(store, Some(f.write), "document", "Charlie").await.unwrap();
+        (a, b, c)
+    });
+    let running = mount(&f, Approval { stores: Approved::All, write: true }, "kanban_viewer", "kanban");
+    let r = &running;
+    r.pump_until(&f, "the board", |r| r.text().contains("Charlie"));
+
+    // Alpha dragged over the lower half of Charlie, in the other column: it
+    // lands after Charlie, one moveNode.
+    let card = sortable(r, &key(store, alpha));
+    rinch_core::events::reset_drag_ghost_visibility();
+    fire(r, card, "data-ondragstart");
+    // The guest's drag start hid the window's ghost through the host.
+    assert!(!rinch_core::events::is_drag_ghost_visible());
+    rinch_core::events::reset_drag_ghost_visibility();
+    assert!(has_class(&r.doc.borrow(), card, "rinch-sortable__item--dragging"));
+    let target = sortable(r, &key(store, charlie));
+    over(150.0, 135.0, 100.0, 100.0, 240.0, 40.0);
+    fire(r, target, "data-ondragover");
+    assert!(has_class(&r.doc.borrow(), target, "rinch-sortable__item--drop-after"), "the caret after Charlie");
+    fire(r, card, "data-ondragmove");
+    fire(r, target, "data-ondrop");
+    fire(r, card, "data-ondragend");
+    r.pump_until(&f, "the card's drop", |_| children(&f, store, f.write) == ["Charlie", "Alpha"]);
+    assert_eq!(children(&f, store, f.plan), ["Bravo"]);
+    r.pump_until(&f, "the board after the drop", |r| {
+        let t = r.text();
+        t.find("Charlie").unwrap() < t.find("Alpha").unwrap()
+    });
+
+    // The "Write it" column dragged by its header over the left half of
+    // "Plan": first on the board, a move of the column node.
+    let column = sortable(r, &key(store, f.write));
+    assert!(r.find(&|d, n| has_class(d, n, "rinch-sortable__handle") && d.get_attribute(n, "draggable").as_deref() == Some("true")).is_some());
+    fire(r, column, "data-ondragstart");
+    let plan_column = sortable(r, &key(store, f.plan));
+    over(110.0, 50.0, 100.0, 40.0, 260.0, 400.0);
+    fire(r, plan_column, "data-ondragover");
+    assert!(has_class(&r.doc.borrow(), plan_column, "rinch-sortable__item--drop-before"));
+    fire(r, plan_column, "data-ondrop");
+    fire(r, column, "data-ondragend");
+    r.pump_until(&f, "the column's drop", |_| children(&f, store, f.board) == ["Write it", "Plan"]);
+    rinch_core::events::reset_drag_ghost_visibility();
+
+    // A column mounted from another store, whose store is then gone from
+    // this computer: a card dragged into it is refused at the caret with
+    // `plan`'s sentence, and the drop sends nothing.
+    let other = f.rt.block_on(async {
+        let (other, other_root) = f.service.create_store(f.dir.path().join("home.pimble"), "Home").await.unwrap();
+        f.service.create_mount(store, f.board, other, other_root, Some("Home".into())).await.unwrap();
+        other
+    });
+    r.pump_until(&f, "the mounted column", |r| r.text().contains("Home"));
+    f.rt.block_on(f.service.close_store(other)).unwrap();
+    std::fs::remove_dir_all(f.dir.path().join("home.pimble")).unwrap();
+    // A change elsewhere reads the board, and its stores, again.
+    f.rt.block_on(f.service.move_node(store, bravo, f.write, Place::First)).unwrap();
+    r.pump_until(&f, "the board read again", |r| {
+        let t = r.text();
+        t.find("Bravo").unwrap() < t.find("Charlie").unwrap()
+    });
+    let home = r
+        .find(&|d, n| has_class(d, n, "kanban__column") && d.text_content(n).unwrap_or_default().contains("Home"))
+        .expect("the Home column");
+    let card = sortable(r, &key(store, charlie));
+    fire(r, card, "data-ondragstart");
+    let list = under(r, home, "kanban__cards").expect("the Home column's cards");
+    over(700.0, 80.0, 650.0, 60.0, 240.0, 28.0);
+    fire(r, list, "data-ondragover");
+    let reason = under(r, list, "rinch-sortable__reason").expect("the list's reason slot");
+    assert!(has_class(&r.doc.borrow(), list, "rinch-sortable--refused"));
+    assert!(has_class(&r.doc.borrow(), reason, "rinch-sortable__reason--shown"));
+    assert_eq!(r.doc.borrow().text_content(reason).as_deref(), Some(Refusal::MountNotHere.sentence()));
+    fire(r, list, "data-ondrop");
+    fire(r, card, "data-ondragend");
+    // Nothing was asked of the server: no call waits, and the lists stand.
+    assert!(r.calls.borrow().iter().all(|(_, c)| !format!("{c:?}").contains("Move")), "{:?}", r.calls.borrow());
+    r.pump_until(&f, "the caret gone", |r| r.find(&|d, n| has_class(d, n, "rinch-sortable__reason--shown")).is_none());
+    assert_eq!(children(&f, store, f.write), ["Bravo", "Charlie", "Alpha"]);
     r.instance.unmount();
 }

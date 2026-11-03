@@ -167,7 +167,7 @@ pub fn resolve(ptr: u32, len: u32) {
 
 pub fn dispatch(ptr: u32, len: u32) -> u32 {
     let event: Event = decode(input(ptr, len)).expect("the host sends an event");
-    with_guest(None, |g| g.dispatch(event)) as u32
+    with_guest(None, |g| g.dispatch_flags(event))
 }
 
 pub fn props_changed(ptr: u32, len: u32) {

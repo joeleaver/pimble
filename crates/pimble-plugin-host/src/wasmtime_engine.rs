@@ -306,8 +306,8 @@ impl WasmGuest {
                 Answered::Done
             }
             Call::Dispatch(bytes) => {
-                let consumed = self.with_input(bytes, |g, p, l| g.dispatch.call(&mut g.store, (p, l)))?;
-                Answered::Flag(consumed != 0)
+                let flags = self.with_input(bytes, |g, p, l| g.dispatch.call(&mut g.store, (p, l)))?;
+                Answered::Dispatched(flags)
             }
             Call::PropsChanged(bytes) => {
                 self.with_input(bytes, |g, p, l| g.props_changed.call(&mut g.store, (p, l)))?;

@@ -33,7 +33,7 @@ pub mod api;
 /// anything else is refused at load with [`refusal_for_abi`]'s sentence. Bump it on
 /// any change a plugin built before it would misread: a message's shape, an export,
 /// an import, the meaning of a node id.
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 /// The guest node id of the plugin document's `<html>` root. Nothing in the host
 /// stands for it: a plugin renders under its body.
@@ -60,8 +60,10 @@ pub mod exports {
     /// `(ptr: u32, len: u32)`: a [`MountArgs`](crate::MountArgs). Renders the viewer it names
     /// into the guest body.
     pub const MOUNT: &str = "pimble_mount";
-    /// `(ptr: u32, len: u32) -> u32`: an [`Event`](crate::Event); 1 when the plugin
-    /// consumed it (a key or a wheel), else 0.
+    /// `(ptr: u32, len: u32) -> u32`: an [`Event`](crate::Event); answers the
+    /// [`dispatched`](crate::dispatched) flags: whether the plugin consumed it (a
+    /// key or a wheel), and what of the window's own machinery the handler asked
+    /// for (ABI 4).
     pub const DISPATCH: &str = "pimble_dispatch";
     /// `(ptr: u32, len: u32)`: new [`Props`](crate::Props) for the mounted view.
     pub const PROPS_CHANGED: &str = "pimble_props_changed";
@@ -468,16 +470,28 @@ pub const HANDLER_ATTRIBUTES: &[(&str, HandlerKind)] = &[
     ("data-onfiledragleave", HandlerKind::Plain),
 ];
 
-// rinch #2091 (sortable lists, being built 2026-11-02) is asked for plain
-// `data-*` handlers so that its drags work through this proxy. When it lands,
-// any new attribute it writes a handler id to goes in the list above with the
-// kind of handler it holds; a drag judge that answers synchronously (a reason
-// shown during the drag) needs a kind of its own here, answered the way `Key`
-// is (the host waits for the guest's answer), and a variant in `EventData`.
+// rinch's sortable lists (joeleaver/rinch#2093) run on handlers already in this
+// list (`data-ondragstart`, `-ondragover`, `-ondragleave`, `-ondrop`,
+// `-ondragmove`, `-ondragend`, `data-onkeydown`) and judge a drop inside the
+// guest, synchronously, with what the guest holds: no new kind was needed. What
+// they need of the host besides is the click context of each drag step, the
+// painted box of an element ([`Query::BoundingRect`]), and the drag ghost hidden
+// when a drag start asks ([`dispatched::HIDE_DRAG_GHOST`]).
 
 /// The kind of handler attribute `name` holds, or `None` for an ordinary attribute.
 pub fn handler_kind(name: &str) -> Option<HandlerKind> {
     HANDLER_ATTRIBUTES.iter().find(|(attr, _)| *attr == name).map(|(_, kind)| *kind)
+}
+
+/// The flags `dispatch` answers (ABI 4).
+pub mod dispatched {
+    /// A key or wheel handler consumed the event.
+    pub const CONSUMED: u32 = 1;
+    /// The handler hid the window's drag ghost (rinch `suppress_drag_ghost`,
+    /// which a drag start calls when it draws its own feedback, as a sortable
+    /// list does). The flag lives in the guest's own copy of rinch, which
+    /// nothing paints, so the host hides its ghost when told.
+    pub const HIDE_DRAG_GHOST: u32 = 2;
 }
 
 /// An event for one of the guest's handlers.
@@ -554,7 +568,8 @@ pub struct Wheel {
 pub enum Query {
     /// The text a form control holds now (`DomDocument::live_value`).
     LiveValue { node: u64 },
-    /// The border box, `(x, y, width, height)` (`query_node_layout`).
+    /// The layout box relative to its parent, `(x, y, width, height)`
+    /// (`query_node_layout`).
     Layout { node: u64 },
     /// The scroll offsets and sizes.
     Scroll { node: u64 },
@@ -564,6 +579,12 @@ pub enum Query {
     ViewportSize,
     /// A text control's selection.
     TextSelection { node: u64 },
+    /// The box the element is painted in, in the window's logical pixels: the
+    /// frame of the click context's pointer and element box
+    /// (`DomDocument::bounding_rect`, ABI 4). A drag compares the pointer
+    /// with the boxes of items it is not over; the parent-relative `Layout`
+    /// cannot be compared with it.
+    BoundingRect { node: u64 },
 }
 
 /// The host's answer to a [`Query`].
@@ -630,6 +651,9 @@ mod tests {
         assert_eq!(decode::<Vec<Op>>(&encode(&ops)).unwrap(), ops);
         let event = Event { handler: 7, data: EventData::Key(Key { key: "a".into(), code: "KeyA".into(), modifiers: Modifiers::default(), up: false }) };
         assert_eq!(decode::<Event>(&encode(&event)).unwrap(), event);
+        let query = Query::BoundingRect { node: 7 };
+        assert_eq!(decode::<Query>(&encode(&query)).unwrap(), query);
+        assert_eq!(dispatched::CONSUMED & dispatched::HIDE_DRAG_GHOST, 0);
         assert!(decode::<Manifest>(&[1, 2, 3]).is_err());
     }
 

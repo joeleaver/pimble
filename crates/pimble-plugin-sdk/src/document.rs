@@ -574,8 +574,14 @@ impl DomDocument for RemoteDocument {
         }
     }
 
+    /// The painted box, asked of the host: the frame of the click context, so
+    /// a drag can compare the pointer with an item it is not over. (The
+    /// layout box is relative to its parent and cannot be compared.)
     fn bounding_rect(&mut self, node: NodeId) -> Option<ElementBounds> {
-        self.query_node_layout(node.0).map(|(x, y, width, height)| ElementBounds { x, y, width, height })
+        match self.ask(Query::BoundingRect { node: node.0 }) {
+            Answer::Rect { x, y, width, height } => Some(ElementBounds { x, y, width, height }),
+            _ => None,
+        }
     }
 
     fn viewport_size(&self) -> Option<(f32, f32)> {

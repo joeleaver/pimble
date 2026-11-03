@@ -24,7 +24,7 @@ use std::rc::Rc;
 use std::cell::RefCell;
 
 use pimble_plugin_abi::{
-    handler_kind, Answer, Click, Event, EventData, HandlerKind, Key, Modifiers, Op, Query, Wheel, FIRST_GUEST_NODE,
+    dispatched, handler_kind, Answer, Click, Event, EventData, HandlerKind, Key, Modifiers, Op, Query, Wheel, FIRST_GUEST_NODE,
     GUEST_BODY,
 };
 use rinch_core::dom::{DomDocument, NodeHandle, NodeId, SelectionDirection};
@@ -34,8 +34,10 @@ use rinch_core::events::{
     KeyCallback, KeyEventKind, ModifierState, MouseButton, ScrollCallback, WheelCallback,
 };
 
-/// Hands an event to the guest and answers whether it consumed it.
-pub type Dispatch = Rc<dyn Fn(Event) -> bool>;
+/// Hands an event to the guest and answers its [`pimble_plugin_abi::dispatched`]
+/// flags: whether it consumed it, and what of the window's machinery its handler
+/// asked for.
+pub type Dispatch = Rc<dyn Fn(Event) -> u32>;
 
 /// Why the host refused what a plugin sent. The plugin is stopped with this sentence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,7 +290,12 @@ impl Applier {
         // that scope re-ran.
         rinch_core::reactive::unowned(|| match kind {
             HandlerKind::Plain => Some(register_handler(Rc::new(move || {
-                send(EventData::Plain(click(&get_click_context())));
+                let flags = send(EventData::Plain(click(&get_click_context())));
+                // A drag start that draws its own feedback hides the ghost; the
+                // guest's call reached only its own copy of rinch.
+                if flags & dispatched::HIDE_DRAG_GHOST != 0 {
+                    rinch_core::events::suppress_drag_ghost();
+                }
             }))),
             HandlerKind::Input => Some(register_input_handler(InputCallback::new(move |value: String| {
                 // The field the text came from, when it is this node (it is on the
@@ -306,7 +313,8 @@ impl Applier {
                     code: k.code.clone(),
                     modifiers: Modifiers { shift: k.shift, ctrl: k.ctrl, alt: k.alt, meta: k.meta },
                     up: k.kind == KeyEventKind::Up,
-                }))
+                })) & dispatched::CONSUMED
+                    != 0
             }))),
             HandlerKind::Wheel => Some(register_wheel_handler(WheelCallback::new(move |w| {
                 send(EventData::Wheel(Wheel {
@@ -315,7 +323,8 @@ impl Applier {
                     x: w.x,
                     y: w.y,
                     modifiers: modifiers(w.modifiers),
-                }))
+                })) & dispatched::CONSUMED
+                    != 0
             }))),
             HandlerKind::Files => None,
         })
@@ -357,6 +366,15 @@ impl Applier {
     /// Answer a read the guest's shadow cannot. A node that is not the guest's
     /// answers [`Answer::Nothing`]: a read reaches nothing, so it is not refused.
     pub fn answer(&self, query: &Query) -> Answer {
+        if let Query::BoundingRect { node: guest } = *query {
+            // rinch-dom may shape a font probe to measure an inline element,
+            // so this read borrows the document mutably.
+            let Some(n) = self.map.get(&guest).copied() else { return Answer::Nothing };
+            return match self.doc.borrow_mut().bounding_rect(n) {
+                Some(b) => Answer::Rect { x: b.x, y: b.y, width: b.width, height: b.height },
+                None => Answer::Nothing,
+            };
+        }
         let doc = self.doc.borrow();
         let node = |guest: u64| self.map.get(&guest).copied();
         match *query {
@@ -396,6 +414,7 @@ impl Applier {
                     },
                 })
                 .unwrap_or(Answer::Nothing),
+            Query::BoundingRect { .. } => unreachable!("answered above"),
         }
     }
 }

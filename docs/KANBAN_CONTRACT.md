@@ -2,7 +2,8 @@
 
 Status: drafted by the PM on 2026-11-02 from Joe's design (memory
 `project_views_and_plugins_2026_11_02`). Wave 1 built the same day (section 7), with
-open decisions 1-5 taken as recommended; drags wait on rinch #2091. Kanban is **a viewer, built as a
+open decisions 1-5 taken as recommended; drags built the same day against rinch #2093
+(unmerged, section 7 "Drags"). Kanban is **a viewer, built as a
 plugin** with the plugin system (`docs/PLUGINS_CONTRACT.md`), for **metanodes**
 (`docs/METANODES_CONTRACT.md`); it is the first consumer of both and waits on them. It declares
 the source shape it needs: a tree two levels deep. Open decisions at the end.
@@ -104,11 +105,8 @@ two levels deep, children To do, Doing, Done), asks to read and change the store
   the same height; a column chosen by its header moves along the board with
   Alt+Shift+Left/Right. Plain arrows choose (cards, and a column's header above its first
   card), Enter opens, F2 renames, Delete deletes, Escape lets go.
-- **Drag waits on rinch #2091** (sortable lists, being built: whole-card drags with
-  column-header handles, non-optimistic drops, First/Last/After(key) places, a
-  synchronous judge with a reason, three nesting levels, plain `data-*` handlers).
-  `board::drop_target(list, place)` is where its answer becomes a `Target`, so a drop is
-  judged and sent by `move_to` like a menu item or a key.
+- **Drags** are rinch's sortable lists (see "Drags" below): a card drags whole, a
+  column by its header; a drop is judged and sent by `move_to` like a menu item or a key.
 - **Renaming** in place (a column by its header's "Rename" or F2, a card by its own): the
   one write, `Pimble::edit` with the title and `explicit_title`; Enter keeps it, Escape
   cancels; the field takes the keyboard when it is drawn.
@@ -149,7 +147,80 @@ here." (the plugin's approval covered only the family store, so to the plugin th
 is not open: the explorer's sentence, though "not allowed" would say it better; noted
 below). Presence with a second app instance: see docs/PRESENCE_CONTRACT.md "Plugins".
 
-**Not done / known limits:** drags (#2091); "Move anyway" is tested end to end but was not
+### Drags (built 2026-11-02 against joeleaver/rinch#2093, NOT merged)
+
+**Built against an unmerged rinch PR.** The `plugins/` workspace patches every rinch
+crate to #2093's branch at `b63871e6` (`[patch]` in `plugins/Cargo.toml`, spelled with
+`www.github.com` because a patch must name another source); the app and the web stay
+on rinch main. When #2093 merges: delete that patch block, `cargo update -p rinch` in
+`plugins/` (and in the root and `web/` so the app carries the sortable stylesheet), and
+rebuild and reinstall the plugins.
+
+- **Shape.** Each column's cards are a vertical `SortableList` of the group `cards`
+  (id: the column's key); the columns are a horizontal `SortableList` of the group
+  `columns` (id: the metanode's key), each column a `SortableItem` with `handle: true`
+  dragged by its header in a `SortableHandle`. A key is `<store>/<node>`
+  (`board::key_of`), so a mounted column's cards keep their own addresses. A card the
+  person may only read has no handle (it does not drag); a column the person may not move
+  has none either. The lists' layout is also written inline, so an app whose rinch has
+  no sortable stylesheet still lays the board out (only the caret and the refusal box
+  need the stylesheet).
+- **Judge** (`Kanban::judge_drop`): synchronous, for every place a drag offers, `plan`'s
+  `plan_move` over the documents the plugin holds (`Pimble::view`): a refusal's sentence
+  shows at the caret and the drop is not delivered. The board lists its stores again with
+  every read, so a mounted column whose store closed since is refused at the caret.
+- **Drop** (`Kanban::drop_move`): `board::drop_of` maps the `SortMove` to the same
+  `Target` the menu and the keys make (no `after` is `Place::First`, an empty column
+  included; `after(k)` is `Place::After(k)`), chooses what was dragged and calls
+  `move_to`, which judges again in full (`judge_in_metanode`, with ancestors held)
+  before sending: the place on offer may be stale by the release.
+- **A warning-only move is accepted at the caret and then held for "Move anyway"**, as a
+  menu's or a key's move is. A warning (a new node in another store, leaving a share,
+  leaving the view) is not a refusal, and the sync judge cannot see all of them (a share
+  above the metanode is not held), so the drop is accepted and `move_to`'s full
+  judgement decides; making a consequential move on a release with only a sentence the
+  person may not have read would be the one place the board moves without asking.
+- **One at a time:** the board has one choice, not a selection, so a drag carries one card
+  or one column (`drag_keys` unused). Alt+Shift+arrows, the menu and plain-arrow choosing
+  are unchanged.
+- **Host (ABI 4).** Nothing kanban-specific: `Query::BoundingRect` (the painted box in the
+  click context's frame; the SDK's `bounding_rect` had answered the parent-relative layout
+  box, which a drag cannot compare with the pointer), and `dispatch` answers flags
+  (`dispatched::CONSUMED`, `dispatched::HIDE_DRAG_GHOST`): a guest handler that calls
+  `suppress_drag_ghost` reaches only its own rinch, so the SDK reports it and the host's
+  proxy hides the window's ghost. No new handler kind: #2093 runs on `data-ondrag*` and
+  `data-onkeydown`, already proxied.
+- **Not yet:** #2093's keyboard lift (Space or Enter on a focused item) collides with
+  Enter = open; the board keeps the keyboard on its own element, so a card is focused
+  only by Tab. #2093 is adding configurable lift keys and a `disabled` switch (for a
+  read-only board); adopt both when they land. A lift is not cancelled by focus leaving
+  the item inside a plugin (the dismiss stack is not forwarded).
+
+**Tests (drags):** kanban-viewer 5 (`a_drop_lands_after_the_item_it_names_or_first`);
+pimble-plugin-abi 5 (`BoundingRect` and the flags round trip); pimble-plugin-host
+applier 5 (`a_drag_start_that_hides_the_ghost_hides_the_hosts`: the flag reaches the
+host's ghost, `draggable` passes through) and kanban 3
+(`cards_and_columns_drag_through_the_host_and_a_refused_drop_says_why`: the built plugin
+over a real server, driven only through the host's proxied `data-ondrag*` handlers and
+click contexts: Alpha dragged over Charlie's lower half lands after it in the other column
+with the ghost hidden and the caret drawn after Charlie; the "Write it" column dragged by
+its header over the left half of "Plan" lands first on the board; a card dragged into a
+mounted column whose store is gone shows `plan`'s "This mount's store isn't open here."
+in the list's reason slot, and the drop sends nothing).
+
+**Checked in the release desktop app** (port 7491, scratch dirs, the family-store copy,
+the plugin installed with `scripts/plugins/install.sh`, real pointer drags through rinch's
+debug port: `mouse_down`, stepped `mouse_move`s with a frame each, `mouse_up`): "Call the
+plumber" dragged from Done into the empty To do; "Untitled" dragged above it; the plumber
+dragged back above Untitled within the column; the Done column dragged by its header to
+the front of the board; each moved the node and the explorer followed; no drag ghost.
+A card dragged into the Home column (a store the plugin was not allowed) showed "This
+mount's store isn't open here." while over it, and the release moved nothing. No caret
+was drawn (the app's rinch has no sortable stylesheet yet, above).
+
+**Not done / known limits:** drags were checked in an app on rinch main, which has no
+sortable stylesheet, so no caret is drawn and the refusal sentence sits unstyled in the
+list (see "Drags"); "Move anyway" is tested end to end but was not
 clicked in the app; a column from a store the plugin was not allowed reads as "not open
 here"; a card's menu is inline buttons under the chosen card, not a popup menu (portals
 into a plugin's body are untried, wave 4); the browser (no plugin host there yet); a

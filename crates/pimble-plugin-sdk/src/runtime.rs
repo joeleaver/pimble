@@ -9,11 +9,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use pimble_plugin_abi::{Click, Event, EventData, HostRequest, HostState, Key, Modifiers, MountArgs, NodeAddr, Props, PresentPerson, Wheel, GUEST_BODY};
+use pimble_plugin_abi::{dispatched, Click, Event, EventData, HostRequest, HostState, Key, Modifiers, MountArgs, NodeAddr, Props, PresentPerson, Wheel, GUEST_BODY};
 use rinch::core::dom::{DomDocument, NodeHandle, NodeId, RenderScope};
 use rinch::core::events::{
     dispatch_event, dispatch_input_event, dispatch_key_handler, dispatch_scroll_event, dispatch_wheel_handler,
-    set_click_context, set_input_context, set_modifier_state, ClickContext, EventHandlerId, InputContext,
+    is_drag_ghost_visible, restore_drag_ghost, set_click_context, set_input_context, set_modifier_state, ClickContext, EventHandlerId, InputContext,
     KeyEventData, KeyEventKind, ModifierState, MouseButton, ScrollEvent, WheelEvent,
 };
 use rinch::core::Signal;
@@ -251,12 +251,28 @@ impl Guest {
     /// Hand an event to the handler it names; answers whether a key or wheel
     /// handler consumed it.
     pub fn dispatch(&mut self, event: Event) -> bool {
+        self.dispatch_flags(event) & dispatched::CONSUMED != 0
+    }
+
+    /// Hand an event to the handler it names; answers the
+    /// [`dispatched`] flags: whether a key or wheel handler consumed it, and
+    /// whether the handler hid the drag ghost (a sortable list's drag start
+    /// does), which only the host's window can do.
+    pub fn dispatch_flags(&mut self, event: Event) -> u32 {
         let id = EventHandlerId(event.handler as usize);
+        let mut flags = 0;
         let consumed = match event.data {
             EventData::Plain(click) => {
                 set_modifier_state(modifiers(click.modifiers));
                 set_click_context(click_context(&click));
+                // The guest's flag says only what this handler asked: nothing
+                // here paints a ghost or resets it when a drag ends.
+                restore_drag_ghost();
                 dispatch_event(id);
+                if !is_drag_ghost_visible() {
+                    flags |= dispatched::HIDE_DRAG_GHOST;
+                    restore_drag_ghost();
+                }
                 false
             }
             EventData::Input { value, node } => {
@@ -283,7 +299,10 @@ impl Guest {
             }
         };
         self.flush();
-        consumed
+        if consumed {
+            flags |= dispatched::CONSUMED;
+        }
+        flags
     }
 }
 

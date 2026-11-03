@@ -361,6 +361,13 @@ first plugin.
    machinery.
 5. **The kanban plugin** (`docs/KANBAN_CONTRACT.md`). Wave 1 built 2026-11-02 (its
    contract's "Built" note), before waves 3 and 4: it needed no host slot.
+   **ABI 4** (2026-11-02, for its drags on rinch #2093, unmerged): `Query::BoundingRect`
+   answers `DomDocument::bounding_rect` (the painted box in the click context's frame;
+   the SDK's `bounding_rect` had answered the parent-relative `Layout`), and `dispatch`
+   answers `dispatched` flags (`CONSUMED`; `HIDE_DRAG_GHOST`, which a guest handler sets by
+   calling `suppress_drag_ghost` in its own rinch and the host's plain proxy turns into the
+   window's). Sortable lists added no handler attribute. Only the plugins workspace is on
+   #2093's branch (a `[patch]` in `plugins/Cargo.toml`, removed when it merges).
 
 ## 5. How it is checked
 

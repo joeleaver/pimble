@@ -9,14 +9,14 @@
 //! an index: that is what `plan` judges and what the server makes.
 //!
 //! Every way of moving ends in one [`Target`]: the menu's "Move to" a column,
-//! the keyboard's steps ([`step_card`], [`step_column`]), and later a drop. rinch #2091 (sortable
-//! lists, being built) is asked to answer a drop as a list and a place
-//! (first, last, after a key); [`drop_target`] is where that answer becomes a
-//! `Target`, so a drop goes through the same judgement and the same move as
-//! the menu and the keys.
+//! the keyboard's steps ([`step_card`], [`step_column`]), and a drop. rinch's
+//! sortable lists (joeleaver/rinch#2093) answer a drop as the keys carried,
+//! the list it lands in and the key of the item it lands after;
+//! [`drop_of`] is where that answer becomes a `Target`, so a drop goes
+//! through the same judgement and the same move as the menu and the keys.
 
 use pimble_plugin_sdk::pimble_api::{Addr, Forest};
-use pimble_plugin_sdk::pimble_core::{Node, Place};
+use pimble_plugin_sdk::pimble_core::{Node, NodeId, Place, StoreId};
 
 /// A card: a node of the second level.
 #[derive(Debug, Clone, PartialEq)]
@@ -164,14 +164,34 @@ pub fn step_column(board: &Board, column: Addr, step: Step) -> Option<Target> {
     }
 }
 
-/// A drop (rinch #2091, when it lands) into list `list` (a column's cards,
-/// or the board's columns when `list` is the metanode) at `place`, as the
-/// drop names it: first, last, or after the item with that key. The same
-/// [`Target`] a menu item or a key makes, so a drop is judged and moved by
-/// the same function.
-#[allow(dead_code)] // Called once rinch #2091 lands; the tests hold its shape.
-pub fn drop_target(list: Addr, place: Place) -> Target {
-    Target { parent: list, place }
+/// A node's key in a sortable list (a card's, a column's, and a list's id):
+/// its store and its id, so a column mounted from another store keeps its
+/// cards' own addresses.
+pub fn key_of(addr: Addr) -> String {
+    format!("{}/{}", addr.store, addr.node)
+}
+
+/// The node a [`key_of`] key names.
+pub fn addr_of(key: &str) -> Option<Addr> {
+    let (store, node) = key.split_once('/')?;
+    Some(Addr::new(StoreId::parse(store).ok()?, NodeId::parse(node).ok()?))
+}
+
+/// A drop of a sortable list: the nodes it carries (`keys`, in order) and
+/// where they go, under the node whose list it lands in (`to_list`: a
+/// column's cards, or the board's columns when it is the metanode), after
+/// the item keyed `after`, or first when there is none (the top of the
+/// list, an empty list included). The same [`Target`] a menu item or a key
+/// makes, so a drop is judged and moved by the same function. `None` for a
+/// key that names no node, which nothing on this board draws.
+pub fn drop_of(keys: &[String], to_list: &str, after: Option<&str>) -> Option<(Vec<Addr>, Target)> {
+    let nodes = keys.iter().map(|k| addr_of(k)).collect::<Option<Vec<Addr>>>()?;
+    let parent = addr_of(to_list)?;
+    let place = match after {
+        Some(key) => Place::After(addr_of(key)?.node),
+        None => Place::First,
+    };
+    (!nodes.is_empty()).then_some((nodes, Target { parent, place }))
 }
 
 #[cfg(test)]
@@ -236,7 +256,27 @@ mod tests {
         assert_eq!(step_card(&b, mid.cards[1].addr, Step::Right), Some(Target { parent: right.addr, place: Place::First }));
         assert_eq!(step_card(&b, mid.cards[0].addr, Step::Left), Some(Target { parent: left.addr, place: Place::First }));
         assert_eq!(to_column(right.addr), Target { parent: right.addr, place: Place::Last });
-        assert_eq!(drop_target(mid.addr, Place::After(mid.cards[0].addr.node)).place, Place::After(mid.cards[0].addr.node));
+    }
+
+    #[test]
+    fn a_drop_lands_after_the_item_it_names_or_first() {
+        let b = board(&[2, 1, 0]);
+        let (left, mid, right) = (&b.columns[0], &b.columns[1], &b.columns[2]);
+        let card = left.cards[0].addr;
+        assert_eq!(addr_of(&key_of(card)), Some(card));
+        let keys = vec![key_of(card)];
+        // After a card of another column.
+        let after = key_of(mid.cards[0].addr);
+        assert_eq!(drop_of(&keys, &key_of(mid.addr), Some(&after)), Some((vec![card], Target { parent: mid.addr, place: Place::After(mid.cards[0].addr.node) })));
+        // The top of a column, and an empty column: first.
+        assert_eq!(drop_of(&keys, &key_of(mid.addr), None).map(|(_, t)| t.place), Some(Place::First));
+        assert_eq!(drop_of(&keys, &key_of(right.addr), None), Some((vec![card], Target { parent: right.addr, place: Place::First })));
+        // A column along the board: a move under the metanode.
+        let m = b.metanode.unwrap();
+        assert_eq!(drop_of(&[key_of(right.addr)], &key_of(m), None), Some((vec![right.addr], Target { parent: m, place: Place::First })));
+        // Nothing for a key that names no node.
+        assert_eq!(drop_of(&["nonsense".into()], &key_of(mid.addr), None), None);
+        assert_eq!(drop_of(&[], &key_of(mid.addr), None), None);
     }
 
     #[test]

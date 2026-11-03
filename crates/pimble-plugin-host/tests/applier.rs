@@ -35,7 +35,7 @@ fn ops_build_the_tree_under_the_container_and_handlers_are_translated() {
         Rc::new(move |event: Event| {
             let consumed = matches!(&event.data, EventData::Key(k) if k.key == "Escape");
             sink.borrow_mut().push(event);
-            consumed
+            consumed as u32
         }),
         ApplierOptions { text_field_shim: true },
     );
@@ -88,9 +88,42 @@ fn ops_build_the_tree_under_the_container_and_handlers_are_translated() {
 }
 
 #[test]
+fn a_drag_start_that_hides_the_ghost_hides_the_hosts() {
+    // A sortable list's drag start calls `suppress_drag_ghost` in the guest's
+    // own rinch, which nothing paints: the guest answers the flag and the
+    // host's proxy hides the window's ghost.
+    let (doc, dyn_doc, container) = document();
+    let mut applier = Applier::new(
+        dyn_doc,
+        container,
+        Rc::new(|event: Event| if event.handler == 7 { pimble_plugin_abi::dispatched::HIDE_DRAG_GHOST } else { 0 }),
+        ApplierOptions::default(),
+    );
+    applier
+        .apply(vec![
+            element(2, "div"),
+            Op::SetAttribute { node: 2, name: "draggable".into(), value: "true".into() },
+            Op::SetAttribute { node: 2, name: "data-ondragstart".into(), value: "7".into() },
+            Op::SetAttribute { node: 2, name: "data-ondragend".into(), value: "8".into() },
+            Op::Append { parent: GUEST_BODY, child: 2 },
+        ])
+        .unwrap();
+    let item = applier.host_node(2).unwrap();
+    let handler = |attr: &str| EventHandlerId(doc.borrow().get_attribute(item, attr).unwrap().parse().unwrap());
+    // `draggable` is plain data and passes through as written.
+    assert_eq!(doc.borrow().get_attribute(item, "draggable").as_deref(), Some("true"));
+    rinch_core::events::reset_drag_ghost_visibility();
+    assert!(dispatch_event(handler("data-ondragend")));
+    assert!(rinch_core::events::is_drag_ghost_visible());
+    assert!(dispatch_event(handler("data-ondragstart")));
+    assert!(!rinch_core::events::is_drag_ghost_visible());
+    rinch_core::events::reset_drag_ghost_visibility();
+}
+
+#[test]
 fn a_guest_can_name_only_its_own_nodes() {
     let (doc, dyn_doc, container) = document();
-    let mut applier = Applier::new(dyn_doc, container, Rc::new(|_| false), ApplierOptions::default());
+    let mut applier = Applier::new(dyn_doc, container, Rc::new(|_| 0), ApplierOptions::default());
     // The app's nodes have no guest ids: any number the guest tries is one it never
     // created, whatever the host's own ids are.
     let outside = doc.borrow().body();
@@ -127,7 +160,7 @@ impl GuestEngine for Scripted {
                 host.flush(&encode(&self.on_mount)).map_err(|r| Failure::Refused(r.0))?;
                 Ok(Answered::Done)
             }
-            Call::Dispatch(_) => Ok(Answered::Flag(false)),
+            Call::Dispatch(_) => Ok(Answered::Dispatched(0)),
             _ => Ok(Answered::Done),
         }
     }

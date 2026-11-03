@@ -13,11 +13,15 @@
 //! change the API hears (`next_change`, `Forest::touched_by`), from this
 //! window, another device, the CLI or an agent.
 //!
-//! Moving is by the card's "Move to" buttons and by the keyboard
+//! Moving is by dragging, by the card's "Move to" buttons and by the keyboard
 //! (Alt+Shift+arrows, as in the explorer; a column moves with
-//! Alt+Shift+Left/Right once its header is chosen). Dragging
-//! waits on rinch #2091 (sortable lists); `board::drop_target` is where a drop
-//! will become the same `Target` the menu and the keys make, and
+//! Alt+Shift+Left/Right once its header is chosen). Drags are rinch's
+//! sortable lists (joeleaver/rinch#2093): each column's cards are a vertical
+//! list of the group "cards", and the columns a horizontal list of the group
+//! "columns" dragged by their headers. While a drag is over a place, the list
+//! asks [`Kanban::judge_drop`], `plan`'s judgement over the documents held,
+//! and a refusal's sentence shows at the caret; a drop becomes the same
+//! `Target` the menu and the keys make (`board::drop_of`), and
 //! `Kanban::move_to` is the one function every kind of move ends in.
 //!
 //! Presence is the app's (docs/PRESENCE_CONTRACT.md "Plugins"): choosing a
@@ -31,13 +35,18 @@ mod board;
 
 use std::sync::Arc;
 
-use pimble_plugin_sdk::pimble_core::custom_keys;
+use pimble_plugin_sdk::pimble_core::{custom_keys, plan};
 use pimble_plugin_sdk::pimble_ui::appearance::{display_color, row_background, IconGlyph};
 use pimble_plugin_sdk::pimble_ui::presence::{more_label, PersonChip};
 use pimble_plugin_sdk::prelude::*;
 use rinch::core::dom::NodeId as DomId;
 
-use board::{board_of, step_card, step_column, to_column, Board, Step, Target};
+use board::{board_of, drop_of, key_of, step_card, step_column, to_column, Board, Step, Target};
+
+/// The sortable groups: a drag of one only ever lands in lists of its own,
+/// so a card never lands among the columns or a column among the cards.
+const CARDS: &str = "cards";
+const COLUMNS: &str = "columns";
 
 /// The viewer's id, as a metanode names it in `metanode:viewer`.
 pub const VIEWER: &str = "kanban";
@@ -119,6 +128,11 @@ fn dom_id(addr: Addr) -> String {
 impl Kanban {
     /// Read the forest into the board.
     async fn read(&self) -> Option<Forest> {
+        // The stores listed again with every read: a drag is judged
+        // synchronously over what is held (`judge_drop`), so a mounted
+        // column's store closed since is refused at the caret, not after
+        // the drop.
+        let _ = self.api.stores().await;
         match self.api.metanode_source(self.metanode).await {
             Ok(forest) => {
                 let board = board_of(&forest, display_label);
@@ -213,6 +227,37 @@ impl Kanban {
                 Err(e) => k.say(e.sentence()),
             }
         });
+    }
+
+    /// Whether a drop of a sortable list may land where it is over, asked
+    /// for every place a drag offers, synchronously, before the release:
+    /// `plan`'s judgement over the documents held now (what the board read),
+    /// so a refusal's sentence (a column the person may only read, a mount
+    /// whose store is not open here) shows at the caret and the drop is not
+    /// delivered. A warning is not a refusal: the drop is accepted, and
+    /// [`Kanban::move_to`] judges it again in full and holds it for "Move
+    /// anyway" as it does a menu's or a key's move.
+    fn judge_drop(&self, m: &SortMove) -> SortVerdict {
+        let Some((nodes, target)) = drop_of(&m.keys, &m.to_list, m.place.after.as_deref()) else {
+            return SortVerdict::Refuse(String::new());
+        };
+        let pairs: Vec<_> = nodes.iter().map(|a| (a.store, a.node)).collect();
+        let parent = (target.parent.store, Some(target.parent.node));
+        match self.api.view(|v| plan::plan_move(v, &pairs, parent, target.place)) {
+            Ok(_) => SortVerdict::Accept,
+            Err(refusal) => SortVerdict::Refuse(refusal.sentence().to_string()),
+        }
+    }
+
+    /// An accepted drop: the move, through the one function, and what was
+    /// dragged chosen, so the keyboard and the card's actions follow it.
+    fn drop_move(&self, m: SortMove) {
+        let Some((nodes, target)) = drop_of(&m.keys, &m.to_list, m.place.after.as_deref()) else { return };
+        // The board has one choice, so a drag carries one card or one column.
+        let [node] = nodes[..] else { return };
+        self.choose(Some(if m.group == COLUMNS { Chosen::Column(node) } else { Chosen::Card(node) }));
+        self.take_keyboard();
+        self.move_to(node, target, false);
     }
 
     /// Alt+Shift+arrow on what is chosen.
@@ -392,7 +437,12 @@ fn walk(board: &Board, chosen: Option<Chosen>, step: Step) -> Option<Chosen> {
 
 const BOARD_STYLE: &str = "display: flex; flex-direction: column; gap: 8px; padding: 12px 16px; height: 100%; box-sizing: border-box; outline: none;";
 const COLUMNS_STYLE: &str = "display: flex; gap: 12px; align-items: flex-start; overflow-x: auto; flex: 1; min-height: 0; padding-bottom: 12px;";
-const COLUMN_STYLE: &str = "display: flex; flex-direction: column; gap: 6px; width: 260px; flex-shrink: 0; padding: 8px; border-radius: 8px; background: var(--rinch-color-default-hover, rgba(127,127,127,0.08)); max-height: 100%; overflow-y: auto;";
+// The sortable lists' layout is written here as well as in rinch's stylesheet,
+// which is the app's: an app on a rinch from before sortable lists still lays
+// the board out (only the caret and the refusal box need its stylesheet).
+const COLUMN_LIST_STYLE: &str = "display: flex; flex-direction: row; gap: 12px; align-items: flex-start; flex-shrink: 0; max-height: 100%; position: relative;";
+const COLUMN_STYLE: &str = "display: flex; flex-direction: column; gap: 6px; width: 260px; flex-shrink: 0; padding: 8px; border-radius: 8px; background: var(--rinch-color-default-hover, rgba(127,127,127,0.08)); max-height: 100%; overflow-y: auto; box-sizing: border-box; position: relative;";
+const CARD_LIST_STYLE: &str = "display: flex; flex-direction: column; gap: 6px; min-height: 28px; position: relative;";
 const HEADER_STYLE: &str = "display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 13px; padding: 2px 4px; border-radius: 4px; cursor: pointer;";
 const FIELD_STYLE: &str = "width: 100%; box-sizing: border-box; font: inherit; padding: 2px 4px;";
 const ADD_STYLE: &str = "font-size: 12px; color: var(--rinch-color-dimmed); padding: 4px; cursor: pointer; border-radius: 4px;";
@@ -476,7 +526,9 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
         });
     }
 
-    let (kk, kw1, kw2, ka, kcol) = (k.clone(), k.clone(), k.clone(), k.clone(), k.clone());
+    let (kk, kw1, kw2, ka, kcol, kd) = (k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone());
+    let judge = drop_judge(&k);
+    let metanode_key = key_of(metanode);
     let (board, status, waiting, loaded, root) = (k.board, k.status, k.waiting, k.loaded, k.root);
     rsx! {
         div {
@@ -512,12 +564,26 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
             div {
                 class: "kanban__columns",
                 style: COLUMNS_STYLE,
-                for column in board.get().columns {
-                    div {
-                        key: format!("{column:?}"),
-                        class: "kanban__column",
-                        style: COLUMN_STYLE,
-                        {render_column(__scope, &kcol, column.clone())}
+                // The columns, dragged by their headers along the board.
+                SortableList {
+                    group: COLUMNS,
+                    id: metanode_key.clone(),
+                    axis: SortAxis::Horizontal,
+                    label: "Columns",
+                    class: "kanban__column-list",
+                    style: COLUMN_LIST_STYLE,
+                    judge: Some(judge.clone()),
+                    ondrop: move |m: SortMove| kd.drop_move(m),
+                    for column in board.get().columns {
+                        SortableItem {
+                            key: format!("{column:?}"),
+                            value: key_of(column.addr),
+                            handle: true,
+                            label: column.label.clone(),
+                            class: "kanban__column",
+                            style: COLUMN_STYLE,
+                            {render_column(__scope, &kcol, column.clone(), judge.clone())}
+                        }
                     }
                 }
                 if board.with(|b| b.writable) {
@@ -533,9 +599,15 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
     }
 }
 
-/// One column: its header (renamed in place, its people), its cards, "+ Add
-/// card".
-fn render_column(__scope: &mut RenderScope, k: &Kanban, column: board::Column) -> NodeHandle {
+/// How the board's lists judge a drop ([`Kanban::judge_drop`]).
+fn drop_judge(k: &Kanban) -> SortJudge {
+    let k = k.clone();
+    std::rc::Rc::new(move |m: &SortMove| k.judge_drop(m))
+}
+
+/// One column: its header (renamed in place, its people; what a column is
+/// dragged by), its cards (a sortable list of their own), "+ Add card".
+fn render_column(__scope: &mut RenderScope, k: &Kanban, column: board::Column, judge: SortJudge) -> NodeHandle {
     let addr = column.addr;
     let seen = k.host.seen();
     let color = column.color.clone();
@@ -596,13 +668,26 @@ fn render_column(__scope: &mut RenderScope, k: &Kanban, column: board::Column) -
             }
         }
     };
+    // A column is dragged by its header, when the person may move it.
+    let movable = untracked(|| k.board.with(|b| b.writable)) && writable;
+    let header = if movable { rsx! { SortableHandle { {header} } } } else { header };
     let cards: Vec<NodeHandle> = column.cards.iter().map(|card| render_card(__scope, k, &column, card.clone())).collect();
     let can_add = column.writable;
+    let kd = k.clone();
     rsx! {
         div {
             style: "display: contents;",
             {header}
-            {cards}
+            SortableList {
+                group: CARDS,
+                id: key_of(addr),
+                label: column.label.clone(),
+                class: "kanban__cards",
+                style: CARD_LIST_STYLE,
+                judge: Some(judge),
+                ondrop: move |m: SortMove| kd.drop_move(m),
+                {cards}
+            }
             if can_add {
                 div {
                     class: "kanban__add-card",
@@ -656,7 +741,8 @@ fn render_card(__scope: &mut RenderScope, k: &Kanban, column: &board::Column, ca
     let (board, home) = (k.board, column.addr);
 
     let km = k.clone();
-    rsx! {
+    let item_label = card.label.clone();
+    let card = rsx! {
         div {
             class: "kanban__card",
             id: dom_id(addr),
@@ -740,6 +826,18 @@ fn render_card(__scope: &mut RenderScope, k: &Kanban, column: &board::Column, ca
                     }
                 }
             }
+        }
+    };
+    // The whole card drags (a press that never moves 5 px stays a click);
+    // a card the person may only read has no handle, so it does not.
+    rsx! {
+        SortableItem {
+            value: key_of(addr),
+            handle: !writable,
+            label: item_label,
+            class: "kanban__card-item",
+            style: "position: relative;",
+            {card}
         }
     }
 }
