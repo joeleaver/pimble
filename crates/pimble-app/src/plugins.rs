@@ -644,7 +644,7 @@ pub(crate) fn render_modal(__scope: &mut RenderScope, store: AppStore) -> NodeHa
                     }
                 }
                 if !ui.status.get().is_empty() {
-                    div { style: "font-size: 12px;", {ui.status.get()} }
+                    div { style: "font-size: 12px;", {move || ui.status.get()} }
                 }
                 div {
                     style: "display: flex; justify-content: flex-end; gap: 8px;",
