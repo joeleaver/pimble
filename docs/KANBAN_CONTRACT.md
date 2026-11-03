@@ -233,18 +233,23 @@ rename from elsewhere redraws the dragged card mid-drag; after the leave and
 moves nothing).
 
 **Checked in the release desktop app** (port 7491, scratch dirs, the family-store copy,
-the plugin installed with `scripts/plugins/install.sh`, real pointer drags through rinch's
-debug port: `mouse_down`, stepped `mouse_move`s with a frame each, `mouse_up`): "Call the
-plumber" dragged from Done into the empty To do; "Untitled" dragged above it; the plumber
-dragged back above Untitled within the column; the Done column dragged by its header to
-the front of the board; each moved the node and the explorer followed; no drag ghost.
-A card dragged into the Home column (a store the plugin was not allowed) showed "This
-mount's store isn't open here." while over it, and the release moved nothing. No caret
-was drawn (the app's rinch has no sortable stylesheet yet, above).
+real pointer drags through rinch's debug port: `mouse_down`, stepped `mouse_move`s with a
+frame each, `mouse_up`). First with the app on rinch main (no sortable stylesheet, so no
+caret): a card across columns, above another, back within its column, a column to the
+front, and a drop into Home (a store the plugin was not allowed) refused. Then, at
+`44e6448f`, with the app itself built against #2093 in a scratch worktree (not
+committed; the app stays on main until it merges): a card into the empty In progress
+(the list outlined in the theme's primary color, the dragged card dimmed, no ghost);
+a card after another (a line caret under it); a reorder within the column; the In
+progress column dragged by its header to the front (a vertical caret at Done's edge); a
+card dragged into Home (a red dashed outline and the red reason box, clipped where
+Home ran past the pane's edge) whose release moved nothing. Each move moved the node
+and the explorer followed.
 
-**Not done / known limits:** drags were checked in an app on rinch main, which has no
-sortable stylesheet, so no caret is drawn and the refusal sentence sits unstyled in the
-list (see "Drags"); "Move anyway" is tested end to end but was not
+**Not done / known limits:** until the app moves to a rinch with #2093 it has no sortable
+stylesheet, so it draws no caret (checked with the app built against #2093 in a scratch
+worktree, above); a refusal box at a column cut off by the board's scroll edge is
+clipped; "Move anyway" is tested end to end but was not
 clicked in the app; a column from a store the plugin was not allowed reads as "not open
 here"; a card's menu is inline buttons under the chosen card, not a popup menu (portals
 into a plugin's body are untried, wave 4); the browser (no plugin host there yet); a
