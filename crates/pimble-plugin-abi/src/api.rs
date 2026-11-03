@@ -274,13 +274,65 @@ impl From<ErrorWire> for ApiError {
     }
 }
 
+/// What one store can do where the host reaches it
+/// (`pimble_api::StoreCapabilities`, less `local_documents`): the guest is
+/// another process, so whatever the host holds, the guest's own `Pimble` holds
+/// its own copy and keeps it current from the change stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capabilities {
+    pub store: StoreId,
+    pub encrypted: bool,
+    pub mounts: bool,
+    pub pictures: bool,
+    pub sync_links: bool,
+    pub semantic_search: bool,
+    pub index_rebuild: bool,
+}
+
+impl Capabilities {
+    /// What the host's backend says of `store`, for a guest.
+    pub fn of(store: StoreId, c: pimble_api::StoreCapabilities) -> Self {
+        Capabilities {
+            store,
+            encrypted: c.encrypted,
+            mounts: c.mounts,
+            pictures: c.pictures,
+            sync_links: c.sync_links,
+            semantic_search: c.semantic_search,
+            index_rebuild: c.index_rebuild,
+        }
+    }
+
+    /// As the guest's backend answers them: never `local_documents`, which is
+    /// about holding documents in the guest's own process.
+    pub fn for_guest(&self) -> pimble_api::StoreCapabilities {
+        pimble_api::StoreCapabilities {
+            encrypted: self.encrypted,
+            mounts: self.mounts,
+            pictures: self.pictures,
+            sync_links: self.sync_links,
+            semantic_search: self.semantic_search,
+            index_rebuild: self.index_rebuild,
+            local_documents: false,
+        }
+    }
+}
+
 /// The host's answer to an [`ApiCall`], by the shape the `Backend` method
 /// answers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub enum ApiReply {
     Done,
-    Stores { stores: Vec<Store> },
+    /// The stores, and what each can do where the host reaches it (wave 3):
+    /// a plugin's `Backend::capabilities` answers from them, so an encrypted
+    /// store in the browser reads as one. Absent from a host before wave 3,
+    /// which a guest reads as "every store a server's".
+    Stores {
+        stores: Vec<Store>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<Capabilities>,
+    },
     Node { node: Node },
     Nodes { nodes: Vec<Node> },
     Children { store: StoreId, nodes: Vec<Node> },

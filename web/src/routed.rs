@@ -28,6 +28,7 @@ pub fn write_of(cmd: &BackendCommand) -> Option<Write> {
         | RenameNode { .. }
         | SetNodeAppearance { .. }
         | SetMetanode { .. }
+        | MakeFromRecipe { .. }
         | DeleteNode { .. }
         | UndeleteNode { .. }
         | MoveNode { .. }

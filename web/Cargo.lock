@@ -1847,6 +1847,7 @@ dependencies = [
  "pimble-image",
  "pimble-import",
  "pimble-plugin-abi",
+ "pimble-plugin-host",
  "pimble-rpc",
  "pimble-sheet",
  "pimble-ui",
@@ -1991,6 +1992,21 @@ dependencies = [
  "postcard",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "pimble-plugin-host"
+version = "0.15.1"
+dependencies = [
+ "js-sys",
+ "pimble-api",
+ "pimble-core",
+ "pimble-plugin-abi",
+ "rinch-core",
+ "serde",
+ "tracing",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]

@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use futures::channel::{mpsc, oneshot};
 use futures::Stream;
 use pimble_api::backend::{ChangeStream, SyncedDoc};
-use pimble_api::{ApiError, Backend, MaybeSend, MaybeSync, Moved, NodeInit, StoreChange};
+use pimble_api::{ApiError, Backend, MaybeSend, MaybeSync, Moved, NodeInit, StoreCapabilities, StoreChange};
 use pimble_core::{BlobId, BlobUrl, DeletedNode, LinkResolution, MountRef, MountState, Node, NodeId, Place, Store, StoreId};
 use pimble_plugin_abi::api::{encode_json, ApiCall, ApiReply, Bytes, Resolution};
 use pimble_rpc::{PresenceFrame, SearchResultItem, StorePeople};
@@ -171,12 +171,16 @@ fn unexpected(reply: &ApiReply) -> ApiError {
 }
 
 /// A `pimble_api::Backend` over the host: what a plugin's `Pimble` runs on.
+///
+/// What each store can do is the host's to say, and a `Backend` answers it
+/// synchronously, so it comes with every store listing (wave 3) and is
+/// answered from the last one; a store not listed yet reads as a server's.
 #[derive(Clone)]
-pub struct GuestBackend(pub Arc<Bridge>);
+pub struct GuestBackend(pub Arc<Bridge>, Arc<Mutex<HashMap<StoreId, StoreCapabilities>>>);
 
 impl GuestBackend {
     pub fn new(bridge: Arc<Bridge>) -> Self {
-        GuestBackend(bridge)
+        GuestBackend(bridge, Arc::default())
     }
 }
 
@@ -192,8 +196,17 @@ macro_rules! expect {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl Backend for GuestBackend {
+    fn capabilities(&self, store: StoreId) -> StoreCapabilities {
+        self.1.lock().unwrap().get(&store).copied().unwrap_or(StoreCapabilities::SERVER)
+    }
+
     async fn list_stores(&self) -> Result<Vec<Store>, ApiError> {
-        expect!(self.0.ask(ApiCall::ListStores).await?, ApiReply::Stores { stores } => stores)
+        let (stores, capabilities) = expect!(self.0.ask(ApiCall::ListStores).await?, ApiReply::Stores { stores, capabilities } => (stores, capabilities))?;
+        let mut known = self.1.lock().unwrap();
+        for c in capabilities {
+            known.insert(c.store, c.for_guest());
+        }
+        Ok(stores)
     }
 
     async fn fetch_one(&self, store: StoreId, node: NodeId) -> Result<Node, ApiError> {

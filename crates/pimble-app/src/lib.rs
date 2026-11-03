@@ -58,10 +58,12 @@ pub mod text_boards;
 pub mod toolbar;
 #[cfg(feature = "native")]
 pub mod update;
-/// Plugins on the desktop (docs/PLUGINS_CONTRACT.md wave 1): the plugins folder
-/// and the metanode viewers they provide. The browser runs none yet (wave 3).
-#[cfg(feature = "native")]
+/// Plugins (docs/PLUGINS_CONTRACT.md): where they live on this device, what
+/// each was allowed, and the metanode viewers they provide, on the desktop and
+/// in the browser alike; only the engine differs.
 pub mod plugins;
+/// Plugins' calls through the Pimble API, on either backend.
+pub mod plugin_calls;
 pub mod tree_drop;
 pub mod tree_keys;
 pub mod tree_view;

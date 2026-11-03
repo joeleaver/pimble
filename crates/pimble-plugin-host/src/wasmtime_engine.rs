@@ -395,72 +395,29 @@ impl Plugin {
 }
 
 /// The plugins in a folder, and the ones refused.
-#[derive(Clone, Default)]
-pub struct Registry {
-    pub plugins: Vec<Plugin>,
-    /// Files that are not plugins this app can run, each with why, and the viewers
-    /// it said it provides when it could say.
-    pub refused: Vec<Refused>,
-}
+pub type Registry = crate::registry::Registry<Plugin>;
+pub use crate::registry::Refused;
+/// What the app has for a viewer id, among plugins this engine loaded.
+pub type ViewerLookup<'a> = crate::registry::ViewerLookup<'a, Plugin>;
 
-/// A plugin file the app does not run.
-#[derive(Debug, Clone)]
-pub struct Refused {
-    pub path: PathBuf,
-    pub viewers: Vec<String>,
-    pub sentence: String,
-}
-
-/// What the app has for a viewer id.
-pub enum ViewerLookup<'a> {
-    Ready(&'a Plugin),
-    /// A plugin provides it but was refused; the sentence says why.
-    Refused(&'a str),
-    Missing,
-}
-
-impl Registry {
-    /// Every `.wasm` file in `dir`, loaded. A folder that does not exist holds none.
-    pub fn load(dir: &Path, budget: Duration) -> Registry {
-        let mut registry = Registry::default();
-        let Ok(entries) = std::fs::read_dir(dir) else { return registry };
-        let mut paths: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "wasm"))
-            .collect();
-        paths.sort();
-        for path in paths {
-            match load_file(&path, budget) {
-                Ok(plugin) => {
-                    if plugin.manifest.rinch != crate::HOST_RINCH_REVISION {
-                        tracing::info!(
-                            "plugin {} was built against rinch {}; this app runs rinch {}",
-                            plugin.manifest.id,
-                            plugin.manifest.rinch,
-                            crate::HOST_RINCH_REVISION
-                        );
-                    }
-                    tracing::info!("plugin {} {} loaded from {}", plugin.manifest.id, plugin.manifest.version, path.display());
-                    registry.plugins.push(plugin);
-                }
-                Err((manifest, sentence)) => {
-                    tracing::warn!("{sentence}");
-                    let viewers = manifest.map(|m| m.viewers().map(|v| v.id.clone()).collect()).unwrap_or_default();
-                    registry.refused.push(Refused { path, viewers, sentence });
-                }
-            }
-        }
-        registry
+impl crate::registry::Loaded for Plugin {
+    fn manifest(&self) -> &Manifest {
+        &self.manifest
     }
+}
 
-    /// The plugin providing viewer `id`, or why there is none to run.
-    pub fn viewer(&self, id: &str) -> ViewerLookup<'_> {
-        if let Some(plugin) = self.plugins.iter().find(|p| p.manifest.viewers().any(|v| v.id == id)) {
-            return ViewerLookup::Ready(plugin);
-        }
-        match self.refused.iter().find(|r| r.viewers.iter().any(|v| v == id)) {
-            Some(refused) => ViewerLookup::Refused(&refused.sentence),
-            None => ViewerLookup::Missing,
-        }
+/// Every `.wasm` file in `dir`, loaded. A folder that does not exist holds none.
+pub fn load_dir(dir: &Path, budget: Duration) -> Registry {
+    let mut registry = Registry::default();
+    let Ok(entries) = std::fs::read_dir(dir) else { return registry };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "wasm"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let loaded = load_file(&path, budget);
+        registry.take(path, loaded);
     }
+    registry
 }

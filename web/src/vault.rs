@@ -451,6 +451,10 @@ struct VaultStore {
     /// last read (see [`VaultStore::take_epoch`]). `None` for a server that
     /// names none.
     epoch: Option<String>,
+    /// What changed in its documents since the vault last said so to whoever
+    /// listens through the API ([`VaultClient::watch`]): a plugin's `Pimble`,
+    /// which holds copies of its own (docs/PLUGINS_CONTRACT.md wave 3).
+    heard: Vec<pimble_api::StoreChange>,
 }
 
 /// What an open store is still owed from outside, and when to go and look.
@@ -589,6 +593,32 @@ pub struct VaultClient {
     /// (docs/PRESENCE_CONTRACT.md section 9), opened by [`pump`].
     presence_tx: Sender<pimble_rpc::PresenceFrame>,
     presence_rx: Receiver<pimble_rpc::PresenceFrame>,
+    /// Who listens to each store's changes through the API: a plugin's
+    /// subscription (docs/PLUGINS_CONTRACT.md wave 3). The app's own views
+    /// hear the vault through [`VaultClient::pump`]'s events instead.
+    watchers: HashMap<StoreId, Vec<futures::channel::mpsc::UnboundedSender<pimble_api::StoreChange>>>,
+    /// Who is writing, while a plugin's call holds the vault
+    /// (`crate::vault_backend::VaultBackend::for_plugins`): what its writes
+    /// are attributed to, and the sign that the app's views must be told of
+    /// them, since no command of the app's own made them.
+    pub(crate) writer: Option<String>,
+    /// The changes plugins made, for [`VaultClient::pump`] to show.
+    by_plugins: Vec<pimble_api::StoreChange>,
+}
+
+/// The kind a change of one document is heard as through the API: one that
+/// names that document first (`pimble_api::backend::document_of`), so its
+/// update is merged into the right copy, and whose reach (`Affected::of`)
+/// covers what the change can touch: the document's own row for content and
+/// fields, its row, its list and its parent's list for structure.
+fn heard_kind(node_id: NodeId, effect: NodeUpdateEffect) -> StoreChangeKind {
+    if effect.structure {
+        StoreChangeKind::TreeStructure { node_ids: vec![node_id] }
+    } else if effect.content {
+        StoreChangeKind::ContentUpdated { node_id }
+    } else {
+        StoreChangeKind::MetadataUpdated { node_id }
+    }
 }
 
 impl VaultClient {
@@ -611,7 +641,74 @@ impl VaultClient {
             notices_rx,
             presence_tx,
             presence_rx,
+            watchers: HashMap::new(),
+            writer: None,
+            by_plugins: Vec::new(),
         }
+    }
+
+    // ── Listening through the API ───────────────────────────────────────────
+
+    /// Hear `store_id`'s changes from now on, each with the update of the
+    /// document it is about: what a plugin's `Pimble` keeps its copies current
+    /// from (docs/PLUGINS_CONTRACT.md wave 3). Ends when the page lets go of
+    /// the store.
+    pub fn watch(&mut self, store_id: StoreId) -> futures::channel::mpsc::UnboundedReceiver<pimble_api::StoreChange> {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        self.watchers.entry(store_id).or_default().push(tx);
+        rx
+    }
+
+    /// Note a write this page made of one document (`update`, merged here
+    /// already): heard by the API's listeners, and by the app's views when a
+    /// plugin made it.
+    fn wrote(&mut self, store_id: StoreId, node_id: NodeId, effect: NodeUpdateEffect, update: &[u8]) {
+        let source = Some(self.writer.clone().unwrap_or_else(|| self.client_id.clone()));
+        let change = pimble_api::StoreChange { store: store_id, kind: heard_kind(node_id, effect), source, update: Some(update.to_vec()) };
+        if self.writer.is_some() {
+            self.by_plugins.push(change.clone());
+        }
+        if let Some(store) = self.stores.get_mut(&store_id) {
+            store.heard.push(change);
+        }
+    }
+
+    /// Hand every listener what its store heard since the last time. Called
+    /// when a call through the API lets go of the vault and on every pass of
+    /// the backend loop.
+    pub fn tell_watchers(&mut self) {
+        for (store_id, store) in &mut self.stores {
+            if store.heard.is_empty() {
+                continue;
+            }
+            let heard = std::mem::take(&mut store.heard);
+            let Some(watchers) = self.watchers.get_mut(store_id) else { continue };
+            watchers.retain(|tx| heard.iter().all(|change| tx.unbounded_send(change.clone()).is_ok()));
+        }
+        // A store let go of: its listeners hear the end, and subscribe again
+        // when they read it next.
+        let stores = &self.stores;
+        self.watchers.retain(|store_id, _| stores.contains_key(store_id));
+    }
+
+    /// What plugins changed, as the app's views hear a peer's change of an
+    /// encrypted store (`VaultStore::merge`): the kinds, which the backend
+    /// loop shows through the API, and a content update for the editors
+    /// holding the document.
+    fn plugin_events(&mut self) -> Vec<BackendEvent> {
+        let mut events = Vec::new();
+        for change in std::mem::take(&mut self.by_plugins) {
+            match change.kind {
+                StoreChangeKind::ContentUpdated { node_id } => {
+                    if let Some(update) = change.update {
+                        events.push(BackendEvent::RemoteChanges { store_id: change.store, node_id, update });
+                    }
+                    events.push(BackendEvent::NodeContentUpdated { store_id: change.store, node_id });
+                }
+                kind => events.push(BackendEvent::RemoteStoreChange { store_id: change.store, change_kind: kind, source_client_id: change.source }),
+            }
+        }
+        events
     }
 
     /// Whether this store is one the vault client answers for.
@@ -1191,6 +1288,7 @@ impl VaultClient {
     /// task (it only forwards raw notifications down a channel).
     pub fn pump(&mut self) -> Vec<BackendEvent> {
         let mut events = std::mem::take(&mut self.pending);
+        events.extend(self.plugin_events());
         events.extend(self.open_presence());
         while let Ok(notification) = self.notices_rx.try_recv() {
             let StoreChangeKind::VaultAppended { doc_id, seq } = &notification.change_kind else {
@@ -1219,6 +1317,7 @@ impl VaultClient {
             let source = notification.source_client_id.clone();
             events.extend(self.apply_notification(store_id, node_id, seq, &blob, source));
         }
+        self.tell_watchers();
         events
     }
 
@@ -1496,8 +1595,11 @@ impl VaultClient {
         let Some(store) = self.stores.get_mut(&store_id) else {
             return Err("no such encrypted store".to_string());
         };
-        store.tree.apply_update(node_id, update).map_err(|e| e.to_string())?;
+        let effect = store.tree.apply_update(node_id, update).map_err(|e| e.to_string())?;
         store.doc_entry(node_id).unsent = true;
+        if effect.changed {
+            self.wrote(store_id, node_id, effect, update);
+        }
         Ok(())
     }
 
@@ -1833,6 +1935,10 @@ impl VaultClient {
     /// recorded against its own document and resent from there; stopping at
     /// the first would leave the rest holding work nothing knows is unsent.
     async fn append_edit<W: VaultWire + ?Sized>(&mut self, client: &W, store_id: StoreId, edit: &TreeEdit) -> Result<(), ApiError> {
+        let structure = NodeUpdateEffect { changed: true, structure: true, ..Default::default() };
+        for (node_id, update) in &edit.touched {
+            self.wrote(store_id, *node_id, structure, update);
+        }
         let mut first_error = None;
         for (node_id, update) in &edit.touched {
             if let Err(e) = self.append_prepared(client, store_id, *node_id, update).await {
@@ -1872,9 +1978,12 @@ impl VaultClient {
     /// Merge `update` into the node's document (the editor's delta, or a whole
     /// document from a session that started from nothing), then append it.
     async fn append_update<W: VaultWire + ?Sized>(&mut self, client: &W, store_id: StoreId, node_id: NodeId, update: &[u8]) -> Result<(), ApiError> {
-        {
+        let effect = {
             let store = self.stores.get_mut(&store_id).ok_or_else(not_open)?;
-            store.tree.apply_update(node_id, update)?;
+            store.tree.apply_update(node_id, update)?
+        };
+        if effect.changed {
+            self.wrote(store_id, node_id, effect, update);
         }
         self.append_prepared(client, store_id, node_id, update).await
     }
@@ -2338,7 +2447,7 @@ impl VaultStore {
                 tree.reroot(root);
             }
         }
-        Self { listed, keys, scope_roots, tree, docs, heads, repair_due: None, look: KeyLook::default(), epoch: None }
+        Self { listed, keys, scope_roots, tree, docs, heads, repair_due: None, look: KeyLook::default(), epoch: None, heard: Vec::new() }
     }
 
     /// Whether this page holds only a scope of the store: a share's recipient.
@@ -2409,6 +2518,12 @@ impl VaultStore {
         let wants_key = !self.is_partial()
             && marker_after != marker_before
             && marker_after.is_some_and(|key_id| self.keys.scope.get(&key_id).is_none());
+        // Whoever listens through the API hears each update with the document
+        // it is about, and keeps its own copy current from it.
+        let kind = heard_kind(node_id, effect);
+        for update in &content_updates {
+            self.heard.push(pimble_api::StoreChange { store: store_id, kind: kind.clone(), source: source.clone(), update: Some(update.clone()) });
+        }
         let mut events = Vec::new();
         if live {
             for update in content_updates {
@@ -3152,6 +3267,7 @@ pub fn store_id_of(cmd: &BackendCommand) -> Option<StoreId> {
         | SetNodeAppearance { store_id, .. }
         | GetMetanode { store_id, .. }
         | SetMetanode { store_id, .. }
+        | MakeFromRecipe { store_id, .. }
         | DeleteNode { store_id, .. }
         | MoveNode { store_id, .. }
         | MoveNodes { store_id, .. }

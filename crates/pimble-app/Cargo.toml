@@ -80,10 +80,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 ed25519-dalek = { version = "2.2", optional = true }
 semver = { version = "1", optional = true }
 dirs = { version = "6", optional = true }
-# Runs plugins (docs/PLUGINS_CONTRACT.md): the op log applier and, with its
-# `wasm-host` feature, the wasmtime engine. Desktop only until the browser host
-# (wave 3).
-pimble-plugin-host = { workspace = true, optional = true }
+# Runs plugins (docs/PLUGINS_CONTRACT.md): the op log applier, the bridge and,
+# per target, an engine: wasmtime (`wasm-host`) on the desktop, the page's own
+# WebAssembly (`js-host`) in the browser.
+pimble-plugin-host = { workspace = true }
 # Merging an agent into ChatGPT / Codex's config.toml with its comments kept
 # (docs/AGENTS_CONTRACT.md section 6).
 toml_edit = "0.20"
@@ -135,7 +135,6 @@ native = [
     "dep:ed25519-dalek",
     "dep:semver",
     "dep:dirs",
-    "dep:pimble-plugin-host",
     "pimble-plugin-host/wasm-host",
     "rinch/desktop",
     # GPU rendering (vello over wgpu). The CPU renderer repaints the whole window
@@ -149,6 +148,6 @@ native = [
     # `rinch-web/collaboration` instead.
     "rinch/collaboration",
 ]
-web = ["dep:rinch-web", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys"]
+web = ["dep:rinch-web", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys", "pimble-plugin-host/js-host"]
 onnx-download = ["native", "pimble-server/onnx-download"]
 onnx-dynamic = ["native", "pimble-server/onnx-dynamic"]

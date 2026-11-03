@@ -128,7 +128,6 @@ pub(crate) fn stop(store: AppStore, pane: PaneId) {
     state.metanode_ui.lines.set(Vec::new());
     state.metanode_ui.plugin.set(false);
     state.metanode_ui.asking.set(None);
-    #[cfg(feature = "native")]
     crate::plugins::hide(pane);
     let key = (held.store_id, held.node_id);
     if showing(store, key).is_empty() {
@@ -250,7 +249,6 @@ fn fill(store: AppStore, pane: PaneId, forest: Result<&Forest, &str>) {
 }
 
 /// What a pane shows for a metanode's viewer.
-#[cfg_attr(not(feature = "native"), allow(dead_code))]
 enum Viewer {
     /// The plugin providing it, mounted in the pane.
     Plugin,
@@ -262,7 +260,6 @@ enum Viewer {
     Missing,
 }
 
-#[cfg(feature = "native")]
 fn viewer(store: AppStore, pane: PaneId, viewer: &str, forest: &Forest) -> Viewer {
     match crate::plugins::show(store, pane, viewer, forest) {
         crate::plugins::Outcome::Shown => Viewer::Plugin,
@@ -272,15 +269,8 @@ fn viewer(store: AppStore, pane: PaneId, viewer: &str, forest: &Forest) -> Viewe
     }
 }
 
-/// The browser runs no plugins yet (docs/PLUGINS_CONTRACT.md wave 3).
-#[cfg(not(feature = "native"))]
-fn viewer(_store: AppStore, _pane: PaneId, _viewer: &str, _forest: &Forest) -> Viewer {
-    Viewer::Missing
-}
-
 /// The plugin in pane `pane` stopped by itself (it ran too long, was refused or
 /// trapped): the pane shows the outline, under the sentence saying so.
-#[cfg_attr(not(feature = "native"), allow(dead_code))]
 pub(crate) fn plugin_stopped(store: AppStore, pane: PaneId, sentence: &str) {
     let ui = store.pane(pane).metanode_ui;
     ui.plugin.set(false);
@@ -292,7 +282,6 @@ pub(crate) fn plugin_stopped(store: AppStore, pane: PaneId, sentence: &str) {
 
 /// Pane `pane` shows its metanode again from the forest held for it (a plugin
 /// was allowed, declined or revoked there).
-#[cfg_attr(not(feature = "native"), allow(dead_code))]
 pub(crate) fn refill(store: AppStore, pane: PaneId) {
     let Some(held) = untracked(|| store.pane(pane).metanode.get()) else { return };
     let forest = FORESTS.with(|f| f.borrow().get(&(held.store_id, held.node_id)).cloned());
@@ -303,23 +292,16 @@ pub(crate) fn refill(store: AppStore, pane: PaneId) {
 
 /// "Allow" under a plugin's request in pane `pane`.
 fn allow_plugin(store: AppStore, pane: PaneId) {
-    #[cfg(feature = "native")]
     crate::plugins::allow(store, pane);
-    #[cfg(not(feature = "native"))]
-    let _ = (store, pane);
 }
 
 /// "Not now" under a plugin's request in pane `pane`.
 fn decline_plugin(store: AppStore, pane: PaneId) {
-    #[cfg(feature = "native")]
     crate::plugins::decline(store, pane);
-    #[cfg(not(feature = "native"))]
-    let _ = (store, pane);
 }
 
 /// The plugins folder finished loading: every pane showing a metanode looks for
 /// its viewer again.
-#[cfg_attr(not(feature = "native"), allow(dead_code))]
 pub(crate) fn plugins_ready(store: AppStore) {
     for pane in PaneId::ALL {
         let Some(held) = untracked(|| store.pane(pane).metanode.get()) else { continue };
@@ -353,10 +335,7 @@ pub(crate) fn render_metanode(__scope: &mut RenderScope, store: AppStore, pane: 
     };
     // A plugin's view goes here (`crate::plugins`); the outline is hidden while it
     // shows.
-    #[cfg(feature = "native")]
     let plugin_slot = Some(crate::plugins::render_slot(__scope, pane, ui.plugin));
-    #[cfg(not(feature = "native"))]
-    let plugin_slot: Option<NodeHandle> = None;
     let drawn = move || if ui.plugin.get() { Vec::new() } else { drawn() };
     rsx! {
         div {

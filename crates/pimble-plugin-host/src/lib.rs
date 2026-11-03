@@ -9,16 +9,25 @@
 //! - [`instance`]: one running plugin over any [`GuestEngine`]: mount, props,
 //!   events, timers, and stopping it (with a sentence) when it runs too long, is
 //!   refused or traps.
+//! - [`registry`]: the plugins loaded and the ones refused, whatever engine
+//!   compiled them.
 //! - `wasmtime_engine` (feature `wasm-host`, the desktop): loading `.wasm` files from
 //!   the plugins folder, checking what they say they are, and running them under
 //!   wasmtime with epoch interruption.
+//! - `js_engine` (feature `js-host`, the browser, wave 3): the same modules under
+//!   the browser's own `WebAssembly`, with a small preview1 shim; a turn that ran
+//!   past its budget stops the plugin when it returns, since nothing can
+//!   interrupt it.
 //!
-//! Everything but the engine is backend-agnostic, so the browser's engine (wave 3)
-//! reuses it.
+//! Everything but the engine is backend-agnostic: both engines share the
+//! applier, the bridge, the instance and the registry.
 
 pub mod applier;
 pub mod bridge;
 pub mod instance;
+#[cfg(feature = "js-host")]
+pub mod js_engine;
+pub mod registry;
 #[cfg(feature = "wasm-host")]
 pub mod wasmtime_engine;
 

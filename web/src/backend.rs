@@ -166,6 +166,11 @@ impl Connector for Wires {
 /// stores (the default), the vault for encrypted ones.
 struct Routes {
     router: Arc<Router>,
+    /// What plugins' calls are made through: the same backends, the vault's
+    /// writes attributed to the plugin (`VaultBackend::for_plugins`).
+    plugin_router: Arc<Router>,
+    /// Plugins' calls in flight.
+    plugin_calls: pimble_app::plugin_calls::PluginCalls,
     vault_id: BackendId,
     wires: Wires,
     /// The API over the router: what every command that reads or writes a
@@ -178,11 +183,13 @@ impl Routes {
     /// and the loop say of it: which backend serves it, what the account may
     /// change of it, whether its owner is away.
     fn learn(&self, vault: &VaultClient, store: StoreId) {
-        if vault.is_encrypted(store) {
-            self.router.serve(store, self.vault_id);
+        for router in [&self.router, &self.plugin_router] {
+            if vault.is_encrypted(store) {
+                router.serve(store, self.vault_id);
+            }
+            router.set_access(store, vault.row_access(store));
+            router.set_away(store, vault.away_row(store));
         }
-        self.router.set_access(store, vault.row_access(store));
-        self.router.set_away(store, vault.away_row(store));
     }
 }
 
@@ -230,11 +237,18 @@ async fn run(
     let wires = Wires::default();
     let vault_backend = VaultBackend::new(VaultClient::new(client_id.clone()), Arc::new(wires.clone()));
     let shared: SharedVault = vault_backend.shared();
+    // Plugins' calls go through a router of their own over the same
+    // connections and the same vault (docs/PLUGINS_CONTRACT.md wave 3): the
+    // vault then knows a plugin wrote, and tells the app's views, which no
+    // command of the app's own told.
+    let mut plugin_router = Router::new(RpcBackend::new(wires.clone()));
+    let plugin_vault_id = plugin_router.add(vault_backend.for_plugins());
     let mut router = Router::new(RpcBackend::new(wires.clone()));
     let vault_id = router.add(vault_backend);
+    assert_eq!(vault_id, plugin_vault_id, "the two routers number their backends alike");
     let router = Arc::new(router);
     let api = Arc::new(Pimble::with_presence_ttl(router.clone(), client_id.clone(), pimble_rpc::PRESENCE_TTL_MS));
-    let routes = Routes { router, vault_id, wires, api };
+    let routes = Routes { router, plugin_router: Arc::new(plugin_router), vault_id, wires, api, plugin_calls: Default::default() };
 
     // Every change the API hears of a plain store, after it merged it into
     // what it holds. (An encrypted store's are the vault's to pump.)
@@ -696,6 +710,20 @@ impl Web<'_> {
 
 /// One command: the account's and the page's own first, then [`route`].
 async fn dispatch(ctx: &mut Web<'_>, subscriptions: &mut Subscriptions, cmd: BackendCommand) {
+    // A plugin's call runs beside the loop, a task of its own, through the
+    // plugins' router; the router learns its stores first, as a command's
+    // route does.
+    if let BackendCommand::PluginCall { call, .. } = &cmd {
+        let stores: Vec<StoreId> = call.stores().into_iter().map(|(store, _)| store).collect();
+        let vault = ctx.shared.lock().await;
+        for store in stores {
+            ctx.routes.learn(&vault, store);
+        }
+    }
+    let Some(cmd) = ctx.routes.plugin_calls.take(cmd, &ctx.routes.plugin_router, ctx.event_tx, ctx.signal_ui) else {
+        return;
+    };
+
     // What the UI asks to watch, it asks once. The socket it was asked on is
     // replaced on every token refresh, so the ask is remembered and made again
     // on each new connection.

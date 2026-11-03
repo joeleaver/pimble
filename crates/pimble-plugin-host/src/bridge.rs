@@ -20,7 +20,7 @@
 use pimble_api::backend::ChangeStream;
 use pimble_api::{ApiError, Backend};
 use pimble_core::StoreId;
-use pimble_plugin_abi::api::{plugin_client_id, ApiCall, ApiReply, Bytes, Reach, Synced};
+use pimble_plugin_abi::api::{plugin_client_id, ApiCall, ApiReply, Bytes, Capabilities, Reach, Synced};
 use pimble_plugin_abi::{Permissions, StoreAsk};
 use serde::{Deserialize, Serialize};
 
@@ -157,8 +157,12 @@ async fn run(backend: &dyn Backend, plugin_id: &str, plugin: &str, approval: &Ap
     use ApiCall as C;
     Ok(match call {
         C::ListStores => {
-            let stores = backend.list_stores().await?;
-            ApiReply::Stores { stores: stores.into_iter().filter(|s| approval.reads(s.id)).collect() }
+            let stores: Vec<_> = backend.list_stores().await?.into_iter().filter(|s| approval.reads(s.id)).collect();
+            // What each can do where this host reaches it (an encrypted store
+            // in the browser is the vault's), for the plugin's own
+            // `capabilities`.
+            let capabilities = stores.iter().map(|s| Capabilities::of(s.id, backend.capabilities(s.id))).collect();
+            ApiReply::Stores { stores, capabilities }
         }
         C::FetchOne { store, node } => ApiReply::Node { node: backend.fetch_one(store, node).await? },
         C::Fetch { store, nodes } => ApiReply::Nodes { nodes: backend.fetch(store, nodes).await? },

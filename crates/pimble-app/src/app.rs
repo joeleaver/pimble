@@ -1514,10 +1514,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 let nv = nv_ctx.clone();
                 move |recipe: pimble_plugin_abi::RecipeDecl| {
                     if let Some((s_id, parent)) = crate::tree_view::create_parent_of_row(store, &nv) {
-                        #[cfg(feature = "native")]
                         crate::plugins::make(store, s_id, parent, recipe);
-                        #[cfg(not(feature = "native"))]
-                        let _ = (s_id, parent, recipe);
                     }
                 }
             };
@@ -4248,9 +4245,9 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         // callbacks will be processed correctly via run_on_main_thread. The web
         // build has no thread to spawn: its entry point puts a backend into the
         // store before it mounts, and this leaves that one alone.
-        // The plugins folder loads off the UI thread; a metanode opened before
-        // it is done shows its outline until then.
-        #[cfg(feature = "native")]
+        // The plugins load off the UI thread (the desktop's folder) or
+        // asynchronously (the browser's own store of them); a metanode opened
+        // before they are done shows its outline until then.
         crate::plugins::load(store);
         #[cfg(feature = "native")]
         if store.backend.with(|b| b.is_none()) {
@@ -4522,8 +4519,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         // Account > "AI Agents..." (docs/AGENTS_CONTRACT.md), the desktop only.
         #[cfg(feature = "native")]
         let agents_modal = crate::agents::render_modal(__scope, store);
-        // Account > "Plugins..." (docs/PLUGINS_CONTRACT.md decision 2), the desktop only.
-        #[cfg(feature = "native")]
+        // Account > "Plugins..." (docs/PLUGINS_CONTRACT.md decision 2) on the
+        // desktop, File > "Plugins..." in the browser.
         let plugins_modal = crate::plugins::render_modal(__scope, store);
         // "Shares..." and the first-open question (docs/PRESENCE_CONTRACT.md
         // section 3), both targets.
@@ -4604,6 +4601,7 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                 {host_modal}
                 {stop_relay_modal}
                 {hosted_modal}
+                {plugins_modal}
                 {share_modal}
                 {shares_modal}
                 {share_name_question}

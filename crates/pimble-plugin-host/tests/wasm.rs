@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use pimble_plugin_abi::{encode, Manifest, Op, Props, Provision, SourceShape, ViewerDecl, ABI_VERSION, GUEST_BODY};
-use pimble_plugin_host::wasmtime_engine::{load_bytes, Plugin, Registry, ViewerLookup};
+use pimble_plugin_host::wasmtime_engine::{load_bytes, Plugin, ViewerLookup};
 use pimble_plugin_host::{ApplierOptions, Instance, InstanceOptions};
 use rinch_core::dom::mock::MockDomDocument;
 use rinch_core::dom::{DomDocument, NodeId};
@@ -116,7 +116,7 @@ fn a_plugin_built_for_another_abi_is_refused_at_load() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("old.wasm"), &module).unwrap();
     std::fs::write(dir.join("good.wasm"), guest(&manifest(ABI_VERSION, "good"), "", &[])).unwrap();
-    let registry = Registry::load(&dir, Duration::from_secs(1));
+    let registry = pimble_plugin_host::wasmtime_engine::load_dir(&dir, Duration::from_secs(1));
     std::fs::remove_dir_all(&dir).unwrap();
     assert!(matches!(registry.viewer("good"), ViewerLookup::Ready(p) if p.manifest.id == "good-test"));
     assert!(matches!(registry.viewer("old"), ViewerLookup::Refused(s) if s.contains("plugin ABI")));

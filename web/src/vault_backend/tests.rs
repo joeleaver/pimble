@@ -255,3 +255,53 @@ fn an_encrypted_store_closes() {
     assert!(!vault.owns(page.store));
     assert!(vault.held_stores().is_empty());
 }
+
+// ── Listening through the API (docs/PLUGINS_CONTRACT.md wave 3) ─────────────
+
+/// A plugin's `Pimble` keeps copies of its own, so it subscribes: it hears
+/// every write of the store, the app's and its own, each with the update of
+/// the document it is about; the app's views hear only what a plugin wrote
+/// (their own commands show what they wrote themselves).
+#[test]
+fn a_subscription_hears_every_write_and_the_app_hears_the_plugins() {
+    use futures::{FutureExt, StreamExt};
+    let page = page();
+    let plugins = page.backend.for_plugins();
+    let mut changes = block_on(plugins.subscribe(page.store)).unwrap();
+
+    // The app's own write: heard by the plugin, not shown again to the app.
+    let mine = block_on(page.backend.create_node(page.store, page.root, document("Mine"), Place::Last)).unwrap();
+    let mut heard = Vec::new();
+    while let Some(Some(change)) = changes.next().now_or_never() {
+        heard.push(change);
+    }
+    assert!(heard.iter().any(|c| pimble_api::backend::document_of(&c.kind) == Some(mine) && c.update.is_some()), "{heard:?}");
+    assert!(heard.iter().all(|c| c.source.as_deref() == Some("page")), "{heard:?}");
+    let shown = block_on(page.backend.shared().lock()).pump();
+    assert!(shown.is_empty(), "the app's own write is its commands' to show: {shown:?}");
+
+    // The plugin's write: heard by the plugin, and shown to the app's views.
+    let theirs = block_on(plugins.create_node(page.store, page.root, document("Theirs"), Place::Last)).unwrap();
+    let mut heard = Vec::new();
+    while let Some(Some(change)) = changes.next().now_or_never() {
+        heard.push(change);
+    }
+    assert!(heard.iter().any(|c| pimble_api::backend::document_of(&c.kind) == Some(theirs) && c.source.as_deref() == Some("plugin")), "{heard:?}");
+    let shown = block_on(page.backend.shared().lock()).pump();
+    assert!(
+        shown.iter().any(|e| matches!(e, pimble_app::protocol::BackendEvent::RemoteStoreChange { change_kind: pimble_rpc::StoreChangeKind::TreeStructure { node_ids }, .. } if node_ids.contains(&theirs))),
+        "{shown:?}"
+    );
+    // A plugin's content write reaches the editors holding the document.
+    let doc = pimble_crdt::NodeDoc::load(&block_on(plugins.fetch_one(page.store, theirs)).unwrap().content).unwrap();
+    let mut edited = pimble_crdt::NodeDoc::load(&doc.save()).unwrap();
+    let update = edited.replace_plain_text("words").unwrap();
+    block_on(plugins.apply(page.store, theirs, update, "plugin:kanban-viewer")).unwrap();
+    let shown = block_on(page.backend.shared().lock()).pump();
+    assert!(shown.iter().any(|e| matches!(e, pimble_app::protocol::BackendEvent::RemoteChanges { node_id, .. } if *node_id == theirs)), "{shown:?}");
+    let mut heard = Vec::new();
+    while let Some(Some(change)) = changes.next().now_or_never() {
+        heard.push(change);
+    }
+    assert!(heard.iter().any(|c| c.source.as_deref() == Some("plugin:kanban-viewer")), "{heard:?}");
+}

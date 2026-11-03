@@ -129,6 +129,9 @@ fn file_entries(store: AppStore) -> Vec<MenuEntry> {
         entries.push(MenuEntry::Separator);
         entries.push(MenuEntry::item("Account", "", crate::app::run_account_action));
         entries.push(MenuEntry::item("Shares...", "", move || crate::shares::open(store)));
+        // docs/PLUGINS_CONTRACT.md wave 3: the plugins added in this browser,
+        // what each was allowed, and "Add plugin...".
+        entries.push(MenuEntry::item("Plugins...", "", move || crate::plugins::open(store)));
         entries.push(MenuEntry::item("Sign Out", "", crate::app::run_sign_out_action));
     }
 

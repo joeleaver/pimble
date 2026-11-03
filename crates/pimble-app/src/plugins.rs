@@ -1,11 +1,16 @@
-//! Plugins in the desktop app (docs/PLUGINS_CONTRACT.md waves 1 and 2): the
-//! plugins folder, what the person has allowed each plugin on this device, the
-//! viewer a pane mounts for a metanode, and the plugin's calls through the
-//! Pimble API.
+//! Plugins in the app (docs/PLUGINS_CONTRACT.md waves 1 to 3), on the desktop and
+//! in the browser alike: where plugins live on this device, what the person has
+//! allowed each, the viewer a pane mounts for a metanode, and the plugin's calls
+//! through the Pimble API. Only the engine and where plugins and approvals are kept
+//! differ (`place` below).
 //!
-//! Plugins are `.wasm` files in `<data dir>/pimble/plugins/`, put there by hand
-//! (decision 3). They are compiled and asked to describe themselves once, off the UI
-//! thread, when the app starts; a pane opening a metanode whose viewer one of them
+//! On the desktop, plugins are `.wasm` files in `<data dir>/pimble/plugins/`, put
+//! there by hand (decision 3), compiled under wasmtime off the UI thread when the
+//! app starts. In the browser there is no folder: the Plugins window's "Add
+//! plugin..." takes a `.wasm` file the person picks, and the page keeps it in its
+//! own IndexedDB (per browser, never uploaded), compiled by the page's own
+//! `WebAssembly` when the app starts and when it is added. A pane opening a
+//! metanode whose viewer one of them
 //! provides mounts that plugin's view in the pane, and every other metanode keeps
 //! the outline (`crate::metanodes`). A plugin refused at load (built for another
 //! ABI) leaves its viewers' metanodes on the outline with the sentence saying why;
@@ -17,30 +22,35 @@
 //! time it would be shown, the pane shows the outline under the sentence saying
 //! what it asks for and "Allow" / "Not now"; "Allow" is remembered on this device
 //! in `<data dir>/pimble/plugins/approvals.json` (beside the plugins themselves:
-//! per device, never synced), and a plugin without approval mounts nothing.
-//! Account > "Plugins..." lists the plugins and takes an approval back.
+//! per device, never synced), in the browser in `localStorage`
+//! (`pimble.plugins.approvals`, per browser), and a plugin without approval
+//! mounts nothing. "Plugins..." (the desktop's Account menu, the browser's File
+//! menu) lists the plugins and takes an approval back.
 //!
 //! **The API.** A mounted plugin's calls are checked against its approval by the
 //! host (`pimble_plugin_host::bridge`) and sent to the backend thread as
 //! `BackendCommand::PluginCall`, where they are made through the window's own
-//! `Pimble` backend (so the server judges them with the person's role, and the
-//! plugin is granted nothing more); answers come back as
+//! backend (`crate::plugin_calls`: the desktop's `Pimble`, the browser's router,
+//! whose encrypted stores are the page's vault), so the server or the vault
+//! judges them with the person's role and the plugin is granted nothing more;
+//! answers come back as
 //! `BackendEvent::PluginReply` and are handed to the instance. The UI thread has
 //! no second API instance.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::rc::Weak;
-use std::sync::OnceLock;
 
 use pimble_api::{Addr, Forest};
 use pimble_crdt::NodeDoc;
 use pimble_plugin_host::abi::api::{ApiReply, Reach};
 use pimble_plugin_host::abi::{HostRequest, HostState, Manifest, NodeAddr, NodePeople, PresentPerson, Props, RecipeDecl, StoreAsk};
 use pimble_plugin_host::bridge::asking_sentence;
-use pimble_plugin_host::wasmtime_engine::{Registry, ViewerLookup, DEFAULT_BUDGET};
-use pimble_plugin_host::{ApiSide, ApplierOptions, Approval, Approved, Instance, InstanceOptions};
+#[cfg(not(feature = "native"))]
+use pimble_plugin_host::js_engine::{Plugin, Registry, ViewerLookup};
+#[cfg(feature = "native")]
+use pimble_plugin_host::wasmtime_engine::{Plugin, Registry, ViewerLookup};
+use pimble_plugin_host::{ApiSide, ApplierOptions, Approval, Approved, GuestEngine, Failure, HostKey, Instance, InstanceOptions};
 use rinch::core::dom::{DomDocument, NodeId};
 use rinch::prelude::*;
 
@@ -48,18 +58,6 @@ use crate::panes::PaneId;
 use crate::protocol::BackendCommand;
 use crate::state::AppStore;
 
-/// Where plugins are installed on this device.
-pub fn plugins_dir() -> PathBuf {
-    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("pimble").join("plugins")
-}
-
-/// Where this device remembers what each plugin was allowed.
-fn approvals_path() -> PathBuf {
-    plugins_dir().join("approvals.json")
-}
-
-/// The plugins folder as loaded at start; unset until loading ends.
-static REGISTRY: OnceLock<Registry> = OnceLock::new();
 
 /// A pane's plugin area: the element a plugin's view is applied under.
 struct Slot {
@@ -91,48 +89,56 @@ thread_local! {
     static APPROVALS: RefCell<HashMap<String, Approval>> = RefCell::new(HashMap::new());
     /// The Plugins window.
     static UI: Cell<Option<PluginsUi>> = const { Cell::new(None) };
+    /// The plugins as loaded; `None` until loading ends.
+    static REGISTRY: RefCell<Option<Registry>> = const { RefCell::new(None) };
+    /// Host state is pushed from one effect, made once.
+    static WATCHING: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Load the plugins folder off the UI thread, and the approvals on it; panes
-/// showing a metanode look again when it is done.
+/// Read the registry, if it has loaded.
+fn with_registry<R>(f: impl FnOnce(&Registry) -> R) -> Option<R> {
+    REGISTRY.with(|r| r.borrow().as_ref().map(f))
+}
+
+/// The manifest of loaded plugin `id`.
+fn manifest_of(id: &str) -> Option<Manifest> {
+    with_registry(|r| r.plugin(id).map(|p| p.manifest.clone())).flatten()
+}
+
+/// Load the plugins (off the UI thread, or asynchronously in the browser), and
+/// the approvals; panes showing a metanode look again when it is done.
 pub(crate) fn load(store: AppStore) {
     STORE.with(|s| s.set(Some(store)));
-    APPROVALS.with(|a| *a.borrow_mut() = read_approvals());
-    let dir = plugins_dir();
-    let spawned = std::thread::Builder::new().name("pimble-plugins".into()).spawn(move || {
-        let registry = Registry::load(&dir, DEFAULT_BUDGET);
-        tracing::info!(
-            "plugins: {} loaded and {} refused from {}",
-            registry.plugins.len(),
-            registry.refused.len(),
-            dir.display()
-        );
-        let _ = REGISTRY.set(registry);
-        rinch::core::reactive::run_on_main_thread(loaded);
-    });
-    if let Err(e) = spawned {
-        tracing::warn!("plugins: could not start loading: {e}");
-    }
+    APPROVALS.with(|a| *a.borrow_mut() = place::read_approvals());
+    place::load();
 }
 
-fn loaded() {
+/// The plugins finished loading (or changed: one was added or removed in the
+/// browser).
+fn loaded(registry: Registry) {
+    REGISTRY.with(|r| *r.borrow_mut() = Some(registry));
     if let Some(store) = STORE.with(Cell::get) {
         // What the explorer's new-node menu offers from them.
         store.recipes.set(recipes());
         crate::metanodes::plugins_ready(store);
-        watch_host_state(store);
+        if !WATCHING.with(|w| w.replace(true)) {
+            watch_host_state(store);
+        }
     }
+    refresh_window();
 }
 
 /// The recipes every loaded plugin registers ("New Kanban"), in the folder's
 /// order, each with the plugin that registered it.
 fn recipes() -> Vec<crate::state::PluginRecipe> {
-    let Some(registry) = REGISTRY.get() else { return Vec::new() };
-    registry
-        .plugins
-        .iter()
-        .flat_map(|p| p.manifest.recipes().map(|r| crate::state::PluginRecipe { plugin: p.manifest.name.clone(), recipe: r.clone() }))
-        .collect()
+    with_registry(|registry| {
+        registry
+            .plugins
+            .iter()
+            .flat_map(|p| p.manifest.recipes().map(|r| crate::state::PluginRecipe { plugin: p.manifest.name.clone(), recipe: r.clone() }))
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// A row's recipe item: make what `recipe` says under `parent`, through the
@@ -227,30 +233,21 @@ fn request(store: AppStore, pane: PaneId, plugin_id: &str, request: HostRequest)
     }
 }
 
-fn read_approvals() -> HashMap<String, Approval> {
-    let path = approvals_path();
-    match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            // A file this app cannot read allows nothing: every plugin asks again.
-            tracing::warn!("plugins: {} could not be read, so every plugin will ask again: {e}", path.display());
-            HashMap::new()
-        }),
-        Err(_) => HashMap::new(),
+fn write_approvals() {
+    let json = APPROVALS.with(|a| serde_json::to_vec_pretty(&*a.borrow()));
+    match json {
+        Ok(json) => place::write_approvals(&json),
+        Err(e) => tracing::warn!("plugins: the approvals could not be saved: {e}"),
     }
 }
 
-fn write_approvals() {
-    let path = approvals_path();
-    let json = APPROVALS.with(|a| serde_json::to_vec_pretty(&*a.borrow()));
-    let written = json
-        .map_err(|e| e.to_string())
-        .and_then(|json| {
-            std::fs::create_dir_all(plugins_dir()).map_err(|e| e.to_string())?;
-            std::fs::write(&path, json).map_err(|e| e.to_string())
-        });
-    if let Err(e) = written {
-        tracing::warn!("plugins: the approvals could not be saved to {}: {e}", path.display());
-    }
+/// Approvals as remembered: a record this app cannot read allows nothing, and
+/// every plugin asks again.
+fn parse_approvals(bytes: &[u8]) -> HashMap<String, Approval> {
+    serde_json::from_slice(bytes).unwrap_or_else(|e| {
+        tracing::warn!("plugins: the approvals could not be read, so every plugin will ask again: {e}");
+        HashMap::new()
+    })
 }
 
 fn approval_of(plugin_id: &str) -> Approval {
@@ -308,18 +305,22 @@ pub(crate) fn show(store: AppStore, pane: PaneId, viewer: &str, forest: &Forest)
         }
         if declined {
             let name = SHOWN.with(|s| s.borrow().get(&pane).map(|shown| shown.plugin_id.clone())).unwrap_or_default();
-            let name = REGISTRY.get().and_then(|r| r.plugins.iter().find(|p| p.manifest.id == name)).map_or(name, |p| p.manifest.name.clone());
+            let name = manifest_of(&name).map_or(name, |m| m.name);
             return Outcome::Outline(format!("Shown as an outline: the {name} plugin was not allowed here."));
         }
         // Waiting for approval: judged again below (it may have been allowed
         // just now).
     }
     hide(pane);
-    let Some(registry) = REGISTRY.get() else { return Outcome::Missing };
-    let plugin = match registry.viewer(viewer) {
-        ViewerLookup::Ready(plugin) => plugin,
-        ViewerLookup::Refused(sentence) => return Outcome::Outline(sentence.to_string()),
-        ViewerLookup::Missing => return Outcome::Missing,
+    let found = with_registry(|registry| match registry.viewer(viewer) {
+        ViewerLookup::Ready(plugin) => Ok(plugin.clone()),
+        ViewerLookup::Refused(sentence) => Err(Outcome::Outline(sentence.to_string())),
+        ViewerLookup::Missing => Err(Outcome::Missing),
+    });
+    let plugin = match found {
+        Some(Ok(plugin)) => plugin,
+        Some(Err(outcome)) => return outcome,
+        None => return Outcome::Missing,
     };
     let manifest = plugin.manifest.clone();
     let approval = approval_of(&manifest.id);
@@ -339,8 +340,14 @@ pub(crate) fn show(store: AppStore, pane: PaneId, viewer: &str, forest: &Forest)
     let Some((doc, node)) = SLOTS.with(|s| s.borrow().get(&pane).and_then(|slot| Some((slot.doc.upgrade()?, slot.node)))) else {
         return Outcome::Missing;
     };
-    let options = InstanceOptions { applier: ApplierOptions { text_field_shim: true } };
-    let started = Instance::start(&manifest.name, doc, node, options, |key| plugin.instantiate(key, DEFAULT_BUDGET));
+    if !place::ready(&plugin, store) {
+        return Outcome::Outline(format!("The {} plugin is starting.", manifest.name));
+    }
+    // The desktop backend makes an element a text field only when it carries
+    // `data-oninput`, which a plugin's `rsx!` leaves out; the browser's must
+    // not get one (it would shadow an ancestor's in rinch-web's delegation).
+    let options = InstanceOptions { applier: ApplierOptions { text_field_shim: cfg!(feature = "native") } };
+    let started = Instance::start(&manifest.name, doc, node, options, |key| place::instantiate(&plugin, key));
     let instance = match started {
         Ok(instance) => instance,
         Err(sentence) => {
@@ -400,7 +407,7 @@ pub(crate) fn allow(store: AppStore, pane: PaneId) {
     let Some((plugin_id, metanode)) = SHOWN.with(|s| s.borrow().get(&pane).map(|shown| (shown.plugin_id.clone(), shown.metanode))) else {
         return;
     };
-    let Some(manifest) = REGISTRY.get().and_then(|r| r.plugins.iter().find(|p| p.manifest.id == plugin_id)).map(|p| p.manifest.clone()) else {
+    let Some(manifest) = manifest_of(&plugin_id) else {
         return;
     };
     let grown = approval_of(&plugin_id).grown(&manifest.asks, metanode.store);
@@ -511,17 +518,23 @@ struct PluginRow {
     note: String,
     /// It was allowed something here, which "Revoke" takes back.
     revocable: bool,
+    /// "Remove" takes it off this device (the browser's own store of
+    /// plugins; the desktop's folder is the person's to change).
+    removable: bool,
 }
 
 #[derive(Clone, Copy)]
 struct PluginsUi {
     open: Signal<bool>,
     rows: Signal<Vec<PluginRow>>,
+    /// What came of the last "Add plugin..." or "Remove".
+    status: Signal<String>,
 }
 
 /// Open Account > "Plugins...".
 pub(crate) fn open(store: AppStore) {
     if let Some(ui) = UI.with(Cell::get) {
+        ui.status.set(String::new());
         ui.rows.set(rows(store));
         ui.open.set(true);
     }
@@ -534,7 +547,10 @@ fn refresh_window() {
 }
 
 fn rows(store: AppStore) -> Vec<PluginRow> {
-    let Some(registry) = REGISTRY.get() else { return Vec::new() };
+    with_registry(|registry| rows_of(store, registry)).unwrap_or_default()
+}
+
+fn rows_of(store: AppStore, registry: &Registry) -> Vec<PluginRow> {
     let mut rows: Vec<PluginRow> = registry
         .plugins
         .iter()
@@ -560,12 +576,11 @@ fn rows(store: AppStore) -> Vec<PluginRow> {
                 Approved::Nothing if m.asks.asks_anything() => ("Not allowed anything yet.".to_string(), false),
                 Approved::Nothing => ("It needs nothing allowed.".to_string(), false),
             };
-            PluginRow { id: m.id.clone(), name: m.name.clone(), line, note, revocable }
+            PluginRow { id: m.id.clone(), name: m.name.clone(), line, note, revocable, removable: place::REMOVABLE }
         })
         .collect();
     for refused in &registry.refused {
-        let file = refused.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
-        rows.push(PluginRow { id: String::new(), name: file, line: refused.sentence.clone(), note: String::new(), revocable: false });
+        rows.push(PluginRow { id: String::new(), name: refused.file(), line: refused.sentence.clone(), note: String::new(), revocable: false, removable: false });
     }
     rows
 }
@@ -573,7 +588,7 @@ fn rows(store: AppStore) -> Vec<PluginRow> {
 /// The Plugins window: each plugin in the folder, what it asks for, what it was
 /// allowed here, and "Revoke".
 pub(crate) fn render_modal(__scope: &mut RenderScope, store: AppStore) -> NodeHandle {
-    let ui = PluginsUi { open: Signal::new(false), rows: Signal::new(Vec::new()) };
+    let ui = PluginsUi { open: Signal::new(false), rows: Signal::new(Vec::new()), status: Signal::new(String::new()) };
     UI.with(|u| u.set(Some(ui)));
     rsx! {
         Modal {
@@ -586,7 +601,7 @@ pub(crate) fn render_modal(__scope: &mut RenderScope, store: AppStore) -> NodeHa
                 style: "display: flex; flex-direction: column; gap: 12px;",
                 div {
                     style: "font-size: 12px; color: var(--rinch-color-dimmed);",
-                    {format!("Plugins are .wasm files in {}. Each asks once on this device before it reads or changes anything.", plugins_dir().display())}
+                    {place::WHERE.to_string()}
                 }
                 if ui.rows.with(|r| r.is_empty()) {
                     div { style: "font-size: 13px;", "No plugins are installed." }
@@ -604,6 +619,17 @@ pub(crate) fn render_modal(__scope: &mut RenderScope, store: AppStore) -> NodeHa
                                 {row.note.clone()}
                             }
                         }
+                        if row.removable {
+                            Button {
+                                variant: "default",
+                                size: "xs",
+                                onclick: {
+                                    let id = row.id.clone();
+                                    move || place::remove(&id)
+                                },
+                                "Remove"
+                            }
+                        }
                         if row.revocable {
                             Button {
                                 variant: "default",
@@ -617,11 +643,311 @@ pub(crate) fn render_modal(__scope: &mut RenderScope, store: AppStore) -> NodeHa
                         }
                     }
                 }
+                if !ui.status.get().is_empty() {
+                    div { style: "font-size: 12px;", {ui.status.get()} }
+                }
                 div {
-                    style: "display: flex; justify-content: flex-end;",
+                    style: "display: flex; justify-content: flex-end; gap: 8px;",
+                    if place::CAN_ADD {
+                        Button { variant: "default", size: "xs", onclick: move || place::pick(), "Add plugin..." }
+                    }
                     Button { variant: "default", size: "xs", onclick: move || ui.open.set(false), "Close" }
                 }
             }
+        }
+    }
+}
+
+/// Say what came of an add or a remove, in the Plugins window.
+#[cfg_attr(feature = "native", allow(dead_code))]
+fn say(line: String) {
+    if let Some(ui) = UI.with(Cell::get) {
+        ui.status.set(line);
+    }
+}
+
+// ── Where plugins live, per target ────────────────────────────────────────────
+
+/// The desktop: a folder of `.wasm` files put there by hand, compiled under
+/// wasmtime off the UI thread; approvals in a file beside them.
+#[cfg(feature = "native")]
+mod place {
+    use std::path::PathBuf;
+
+    use super::*;
+    use pimble_plugin_host::wasmtime_engine::{load_dir, DEFAULT_BUDGET};
+
+    /// The folder is the person's: the window lists it and does not change it.
+    pub const CAN_ADD: bool = false;
+    pub const REMOVABLE: bool = false;
+
+    pub static WHERE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        format!("Plugins are .wasm files in {}. Each asks once on this device before it reads or changes anything.", plugins_dir().display())
+    });
+
+    /// Where plugins are installed on this device.
+    pub fn plugins_dir() -> PathBuf {
+        dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("pimble").join("plugins")
+    }
+
+    fn approvals_path() -> PathBuf {
+        plugins_dir().join("approvals.json")
+    }
+
+    pub fn read_approvals() -> HashMap<String, Approval> {
+        std::fs::read(approvals_path()).map(|bytes| parse_approvals(&bytes)).unwrap_or_default()
+    }
+
+    pub fn write_approvals(json: &[u8]) {
+        let path = approvals_path();
+        let written = std::fs::create_dir_all(plugins_dir()).and_then(|_| std::fs::write(&path, json));
+        if let Err(e) = written {
+            tracing::warn!("plugins: the approvals could not be saved to {}: {e}", path.display());
+        }
+    }
+
+    pub fn load() {
+        let dir = plugins_dir();
+        let spawned = std::thread::Builder::new().name("pimble-plugins".into()).spawn(move || {
+            let registry = load_dir(&dir, DEFAULT_BUDGET);
+            tracing::info!("plugins: {} loaded and {} refused from {}", registry.plugins.len(), registry.refused.len(), dir.display());
+            rinch::core::reactive::run_on_main_thread(move || loaded(registry));
+        });
+        if let Err(e) = spawned {
+            tracing::warn!("plugins: could not start loading: {e}");
+        }
+    }
+
+    /// A wasmtime instance is made on the spot.
+    pub fn ready(_plugin: &Plugin, _store: AppStore) -> bool {
+        true
+    }
+
+    pub fn instantiate(plugin: &Plugin, key: HostKey) -> Result<Box<dyn GuestEngine>, Failure> {
+        plugin.instantiate(key, DEFAULT_BUDGET)
+    }
+
+    pub fn pick() {}
+
+    pub fn remove(_id: &str) {}
+}
+
+/// The browser: plugins the person added, kept in this page's IndexedDB (per
+/// browser, never uploaded: nothing is hosted unless asked), compiled by the
+/// page's own `WebAssembly`; approvals in `localStorage`.
+#[cfg(not(feature = "native"))]
+mod place {
+    use super::*;
+    use pimble_plugin_host::js_engine::{load_bytes, DEFAULT_BUDGET};
+    use wasm_bindgen::prelude::*;
+    use wasm_bindgen::JsCast;
+
+    pub const CAN_ADD: bool = true;
+    pub const REMOVABLE: bool = true;
+    pub const WHERE: &str = "Plugins added here are kept in this browser only, never uploaded. Each asks once in this browser before it reads or changes anything.";
+
+    const APPROVALS_KEY: &str = "pimble.plugins.approvals";
+
+    // The page's own store of plugins: one IndexedDB object store, a
+    // plugin's module bytes under its id.
+    #[wasm_bindgen(inline_js = r#"
+const DB = 'pimble-plugins', STORE = 'plugins';
+function open() {
+  return new Promise((ok, fail) => {
+    const r = indexedDB.open(DB, 1);
+    r.onupgradeneeded = () => r.result.createObjectStore(STORE);
+    r.onsuccess = () => ok(r.result);
+    r.onerror = () => fail(r.error);
+  });
+}
+function done(tx) {
+  return new Promise((ok, fail) => {
+    tx.oncomplete = () => ok();
+    tx.onerror = () => fail(tx.error);
+    tx.onabort = () => fail(tx.error);
+  });
+}
+export async function pluginsList() {
+  const db = await open();
+  const tx = db.transaction(STORE, 'readonly');
+  const out = [];
+  await new Promise((ok, fail) => {
+    const c = tx.objectStore(STORE).openCursor();
+    c.onsuccess = () => {
+      const cur = c.result;
+      if (cur) { out.push([String(cur.key), new Uint8Array(cur.value)]); cur.continue(); } else { ok(); }
+    };
+    c.onerror = () => fail(c.error);
+  });
+  db.close();
+  return out;
+}
+export async function pluginsPut(id, bytes) {
+  const db = await open();
+  const tx = db.transaction(STORE, 'readwrite');
+  tx.objectStore(STORE).put(bytes.slice().buffer, id);
+  await done(tx);
+  db.close();
+}
+export async function pluginsDelete(id) {
+  const db = await open();
+  const tx = db.transaction(STORE, 'readwrite');
+  tx.objectStore(STORE).delete(id);
+  await done(tx);
+  db.close();
+}
+"#)]
+    extern "C" {
+        #[wasm_bindgen(js_name = pluginsList, catch)]
+        async fn plugins_list() -> Result<JsValue, JsValue>;
+        #[wasm_bindgen(js_name = pluginsPut, catch)]
+        async fn plugins_put(id: &str, bytes: &[u8]) -> Result<JsValue, JsValue>;
+        #[wasm_bindgen(js_name = pluginsDelete, catch)]
+        async fn plugins_delete(id: &str) -> Result<JsValue, JsValue>;
+    }
+
+    fn storage() -> Option<web_sys::Storage> {
+        web_sys::window()?.local_storage().ok().flatten()
+    }
+
+    pub fn read_approvals() -> HashMap<String, Approval> {
+        storage().and_then(|s| s.get_item(APPROVALS_KEY).ok().flatten()).map(|json| parse_approvals(json.as_bytes())).unwrap_or_default()
+    }
+
+    pub fn write_approvals(json: &[u8]) {
+        let saved = storage().map(|s| s.set_item(APPROVALS_KEY, &String::from_utf8_lossy(json)));
+        if !matches!(saved, Some(Ok(()))) {
+            tracing::warn!("plugins: the approvals could not be saved in this browser");
+        }
+    }
+
+    /// Every plugin kept in this browser, compiled and described.
+    pub fn load() {
+        wasm_bindgen_futures::spawn_local(async {
+            let mut registry = Registry::default();
+            match plugins_list().await {
+                Ok(list) => {
+                    for entry in js_sys::Array::from(&list).iter() {
+                        let entry = js_sys::Array::from(&entry);
+                        let id = entry.get(0).as_string().unwrap_or_default();
+                        let bytes = js_sys::Uint8Array::new(&entry.get(1)).to_vec();
+                        let loaded = load_bytes(&format!("{id}.wasm"), &bytes, DEFAULT_BUDGET).await;
+                        registry.take(format!("{id}.wasm").into(), loaded);
+                    }
+                }
+                Err(e) => tracing::warn!("plugins: this browser's plugins could not be read: {e:?}"),
+            }
+            tracing::info!("plugins: {} loaded and {} refused in this browser", registry.plugins.len(), registry.refused.len());
+            loaded(registry);
+        });
+    }
+
+    /// Whether an instance is ready to mount now; if not, one is made and every
+    /// pane showing a metanode looks again once it is.
+    pub fn ready(plugin: &Plugin, store: AppStore) -> bool {
+        // One that could not be made is taken anyway, so the pane says why.
+        if plugin.is_ready() || plugin.is_broken() {
+            return true;
+        }
+        plugin.warm(move || crate::metanodes::plugins_ready(store));
+        false
+    }
+
+    pub fn instantiate(plugin: &Plugin, key: HostKey) -> Result<Box<dyn GuestEngine>, Failure> {
+        plugin.instantiate(key)
+    }
+
+    /// "Add plugin...": a `.wasm` file the person picks, compiled and described
+    /// here; one this app runs is kept in this browser, replacing an earlier
+    /// version of the same plugin, and one it does not is refused with its
+    /// sentence and not kept.
+    pub fn pick() {
+        const INPUT_ID: &str = "pimble-plugin-input";
+        let Some(document) = web_sys::window().and_then(|w| w.document()) else { return };
+        if let Some(old) = document.get_element_by_id(INPUT_ID) {
+            old.remove();
+        }
+        let Some(input) = document.create_element("input").ok().and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok()) else {
+            return;
+        };
+        input.set_id(INPUT_ID);
+        input.set_type("file");
+        input.set_accept(".wasm,application/wasm");
+        input.set_hidden(true);
+        let Some(body) = document.body() else { return };
+        if body.append_child(&input).is_err() {
+            return;
+        }
+        let picked = input.clone();
+        let on_change = wasm_bindgen::closure::Closure::once_into_js(move |_: web_sys::Event| {
+            let file = picked.files().and_then(|files| files.get(0));
+            picked.remove();
+            let Some(file) = file else { return };
+            wasm_bindgen_futures::spawn_local(async move {
+                let name = file.name();
+                say(format!("Adding {name}..."));
+                let bytes = match wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
+                    Ok(buffer) => js_sys::Uint8Array::new(&buffer).to_vec(),
+                    Err(_) => return say(format!("{name} could not be read.")),
+                };
+                add(&name, &bytes).await;
+            });
+        });
+        if input.add_event_listener_with_callback("change", on_change.unchecked_ref()).is_err() {
+            return;
+        }
+        input.click();
+    }
+
+    async fn add(name: &str, bytes: &[u8]) {
+        let plugin = match load_bytes(name, bytes, DEFAULT_BUDGET).await {
+            Ok(plugin) => plugin,
+            Err((_, sentence)) => return say(sentence),
+        };
+        let id = plugin.manifest.id.clone();
+        if let Err(e) = plugins_put(&id, bytes).await {
+            tracing::warn!("plugins: {id} could not be kept: {e:?}");
+            return say(format!("The {} plugin could not be kept in this browser.", plugin.manifest.name));
+        }
+        // An earlier version of the same plugin goes, with any pane showing it.
+        stop_everywhere(&id);
+        let mut registry = REGISTRY.with(|r| r.borrow().clone()).unwrap_or_default();
+        registry.plugins.retain(|p| p.manifest.id != id);
+        registry.refused.retain(|r| r.file() != format!("{id}.wasm"));
+        let line = format!("Added the {} plugin {}.", plugin.manifest.name, plugin.manifest.version);
+        registry.take(format!("{id}.wasm").into(), Ok(plugin));
+        loaded(registry);
+        say(line);
+    }
+
+    /// "Remove": the plugin leaves this browser, with what it was allowed.
+    pub fn remove(id: &str) {
+        let id = id.to_string();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = plugins_delete(&id).await {
+                tracing::warn!("plugins: {id} could not be removed: {e:?}");
+                return say("The plugin could not be removed from this browser.".to_string());
+            }
+            let name = manifest_of(&id).map_or(id.clone(), |m| m.name);
+            stop_everywhere(&id);
+            APPROVALS.with(|a| a.borrow_mut().remove(&id));
+            write_approvals_now();
+            let mut registry = REGISTRY.with(|r| r.borrow().clone()).unwrap_or_default();
+            registry.plugins.retain(|p| p.manifest.id != id);
+            loaded(registry);
+            say(format!("Removed the {name} plugin from this browser."));
+        });
+    }
+
+    fn write_approvals_now() {
+        super::write_approvals();
+    }
+
+    /// Take plugin `id` out of every pane showing it; they look again.
+    fn stop_everywhere(id: &str) {
+        let panes: Vec<PaneId> = SHOWN.with(|s| s.borrow().iter().filter(|(_, shown)| shown.plugin_id == id).map(|(p, _)| *p).collect());
+        for pane in panes {
+            hide(pane);
         }
     }
 }

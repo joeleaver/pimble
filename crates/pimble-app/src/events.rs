@@ -879,7 +879,6 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                 crate::metanodes::forest_read(store, *store_id, *node_id, forest.clone());
             }
 
-            #[cfg(feature = "native")]
             BackendEvent::PluginReply { instance, call_id, reply } => {
                 crate::plugins::reply(*instance, *call_id, reply.clone());
             }
