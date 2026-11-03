@@ -2,7 +2,7 @@
 
 Status: drafted by the PM on 2026-11-02 from Joe's direction (memory
 `project_views_and_plugins_2026_11_02`) and a read-only study of rinch at the pinned
-revision (`2d1f11a0`, cargo checkout) and of `crates/pimble-plugins`. Nothing is built.
+revision (`2d1f11a0`, cargo checkout) and of `crates/pimble-plugins`. Waves 0 to 2 are built (section 4).
 Open decisions at the end. Metanodes (`docs/METANODES_CONTRACT.md`) are a separate, generic
 concept whose viewers plugins provide; the kanban (`docs/KANBAN_CONTRACT.md`) is the
 first plugin.
@@ -91,9 +91,10 @@ first plugin.
 ### 3.3 Mount points
 
 1. **A metanode's viewer** (`docs/METANODES_CONTRACT.md`): a pane opening a node with
-   `metanode:viewer = <id>` mounts the plugin that provides that viewer, with the source's
-   forest and the viewer's settings as props; the plugin acts through `Pimble`, and core
-   judges its edits. A viewer declares the source shapes it can show.
+   `metanode:viewer = <id>` mounts the plugin that provides that viewer, with the metanode's
+   address and the viewer's settings as props (wave 2: it reads the forest itself with
+   `Pimble::metanode_source`); the plugin acts through `Pimble`, and core judges its
+   edits. A viewer declares the source shapes it can show.
 2. **A node type** (later): a pane opening a node whose type a plugin provides.
 3. **Embedded in text** (later): a node view matched on `data-plugin=<id>`; the attribute
    verbs (`set_attrs`, `delete`, `select`) become host calls.
@@ -103,8 +104,8 @@ first plugin.
 - `Pimble` (the data API), never `Host` (stores, replicas, accounts, sharing, agents).
 - **Authorized as the person running it**: the guest's calls go through the person's own
   backend, so the server judges them with the person's role; nothing extra is granted.
-- **Narrowed by what it was given at install** (open decision 2): which stores, read or
-  write, network.
+- **Narrowed by what the person approved** (decision 2, taken): which stores, read or
+  write; no network (decision 6).
 - **Attributed**: edits carry `client_id = "plugin:<id>"`; presence shows the plugin like an
   agent.
 - Changes: the guest's `Pimble` gets the same change stream (`next_change`) through the
@@ -222,6 +223,95 @@ first plugin.
    running call; no `GuestBackend` yet, so a plugin cannot read or write anything.
 2. **The API bridge**: `GuestBackend`, call/resolve, the change stream, attribution,
    install-time permissions.
+
+   **Built 2026-11-02 (branch `api`), on decision 2 as recommended.** **The bridge's
+   shape:** a plugin's `pimble_api::Pimble` runs over the SDK's `GuestBackend`, whose
+   every `Backend` method is one `ApiCall` sent through the import
+   `pimble_api_call(call_id, json)` and answered later through the export
+   `pimble_resolve(json)` (`Resolution { call, reply }`), which wakes the awaiting
+   future (`Bridge`, a call table; the host never answers inside the guest's own
+   call). A subscription is one call answered `Subscribed`, then `Change` per change,
+   then `Ended`; dropping the stream sends `pimble_api_cancel`. These messages
+   (`pimble_plugin_abi::api`) are JSON, not postcard: they carry the server's own
+   types (tagged enums, skipped fields, JSON values in `custom`), which postcard cannot
+   read back; bytes travel as base64. `ABI_VERSION` is 2. `pimble-api` has an `rpc`
+   feature (default) holding `RpcBackend`, so the guest builds it for `wasm32-wasip1`
+   without pimble-client; a built plugin imports only `pimble` and
+   `wasi_snapshot_preview1` (hello is 3.2 MB). **The host side**
+   (`pimble_plugin_host::bridge`, engine-agnostic): `Approval { stores: All |
+   Only(ids) | Nothing, write }`; `Approval::check` judges each call by the stores it
+   names and whether it writes (`ApiCall::stores`), on the UI thread before it leaves
+   (`Instance`'s `ApiSide`) and again where it is made (`execute`), which also narrows
+   answers: `listStores` to approved stores, children read through a mount into an
+   unapproved store refused, a search of every store to the approved ones; `apply`
+   and presence carry `client_id = "plugin:<id>"` whatever the guest said; nothing
+   else is granted, since every call goes through the person's own backend and the
+   server judges it with their role. A refusal is a sentence: "The Hello viewer plugin
+   was not allowed to use that store.", "The Hello viewer plugin was allowed to read
+   this store, not to change it." A manifest asking for the network is refused at
+   load (decision 6). **Desktop:** `BackendCommand::PluginCall { instance, plugin_id,
+   plugin_name, approval, call_id, call }` runs beside the command loop on the backend
+   thread (a task per call, so a subscription or a slow call holds nothing up) over
+   the window's own `Pimble::backend()`, answered as `BackendEvent::PluginReply`;
+   `PluginCancel` and `PluginForget` (sent when an instance stops) abort what is in
+   flight. The UI thread has no second API instance. **Changes:** the plugin's
+   `Pimble` subscribes like any client, through the bridge, to stores its approval
+   covers only, so its held documents stay live and `next_change` works as in the
+   app. **Props** are the metanode's address and the viewer's settings (its `data`
+   under the viewer's id); the forest is no longer sent: the plugin reads it with
+   `Pimble::metanode_source` and keeps it live itself. **What an author writes:** in
+   `describe`, `.writes(StoreAsk::Chosen)` (or `.reads(..)`, `StoreAsk::All`); in the
+   view, `mount.api` (an `Arc<Pimble>`) and `mount.metanode()`, with calls run in
+   `spawn_local(async move { ... })`, e.g. `api.metanode_source(addr).await`,
+   `api.edit(addr, |doc, now| doc.set_title(..))`, `api.move_node(node, parent,
+   Place::First)`, `while let Some(c) = api.next_change().await { if
+   forest.touched_by(&c) { .. } }`. **Approval flow:** a plugin whose manifest asks for
+   anything and whose approval does not cover the metanode's store mounts nothing;
+   the pane shows the outline under "The Hello viewer plugin wants to read and change
+   the store Family Management." with "Allow" and "Not now". Allow grows the approval
+   (`Approval::grown`: the store for `Chosen`, everything for `All`, write when asked),
+   writes `<data dir>/pimble/plugins/approvals.json` and mounts it; Not now shows the
+   outline under "Shown as an outline: the Hello viewer plugin was not allowed here."
+   until the pane shows something else. Account > "Plugins..." lists each plugin,
+   what it asks for and what it was allowed here, with "Revoke", which stops it in
+   every pane (they ask again). A plugin asking for nothing mounts at once.
+   **Toy:** `hello` asks `.writes(StoreAsk::Chosen)`, reads its forest through the
+   API and keeps it live, and with a chosen row renames it (`Pimble::edit`), moves it
+   to the top (`Pimble::move_node`) or tries to move it into itself, which `plan`
+   refuses in the plugin with the explorer's "A node can't go inside itself."; the
+   line under the buttons says what came of each. **Tests:** abi 5 (calls and replies
+   round trip with bytes, nodes, changes and every error); sdk 5 (a call waits for
+   its resolution and reads errors as the API's; a subscription takes changes until it
+   ends and cancels when dropped; `remote_vs_mock` unchanged in substance); host 4
+   unit (a call outside the approval refused with a sentence; a read-only approval
+   refuses writes; allowing grows the approval; the network refusal) and 2 end to end
+   in `tests/bridge.rs` (the built hello plugin over a mock document against a real
+   in-process server: the forest read, a key, typing, a rename whose change the
+   server attributes to `plugin:hello-viewer`, a move whose order the server and the
+   plugin agree on, `plan`'s refusal with nothing sent, a read-only approval refusing
+   a rename; and a plugin with no approval shown the refusal and reading nothing),
+   plus the 7 earlier ones; `pimble-api` 17+13+2 and `pimble-app` 209 unchanged.
+   **Checked in the release desktop app** (port 7491, scratch dirs, a copy of the
+   family store, both plugins in the scratch plugins folder): MEDICAL set to `hello`
+   one level deep through the MCP opened as the outline under the request with Allow
+   and Not now; Not now gave the outline with its line; reopened, Allow mounted the
+   plugin showing the five children read through the API and wrote
+   `approvals.json`; a row chosen, "Boo Kitty (vet)" typed and Rename renamed it in
+   the explorer too; Move to top moved it in both; Move into itself showed "A node
+   can't go inside itself."; a rename made through the MCP showed in the plugin
+   live; Account > Plugins... listed both plugins with what each asks and is allowed,
+   and Revoke emptied `approvals.json` and put the pane back to the request; Allow,
+   then a restart, mounted the plugin without asking; `stuck` (asks for nothing)
+   mounted without a request. **Not done:** presence does not show a plugin like an
+   agent (a presence frame's `who` is stamped by the server from the connection's
+   principal, which for a plugin is the person's own; showing the plugin needs the
+   server to read `plugin:` client ids, or the app to publish frames under a plugin
+   session, so it is left for Joe); `Backend::capabilities` is the default
+   (`StoreCapabilities::SERVER`), since a capability is a synchronous answer the bridge
+   cannot give yet, which is right for the desktop's stores and wrong for the
+   browser's vault stores (wave 3); the presence stream (`Backend::presence`) is not
+   bridged; `Chosen` adds the store of each metanode the plugin is shown for, with no
+   store picker; the browser host is wave 3.
 3. **The browser host**: the same plugin running in the web app.
 4. **Host slots** (the Editor first), overlay roots for portals, the forwarded global
    machinery.
@@ -238,7 +328,12 @@ refused with the outline fallback.
 ## 6. Open decisions for Joe
 
 Taken by Joe on 2026-11-02 ("Sounds OK for now"): 1, a core module with a byte codec on
-`wasm32-wasip1`; 3, a per-device plugins folder installed by hand. The rest are open.
+`wasm32-wasip1`; 3, a per-device plugins folder installed by hand. Taken the same day
+for wave 2: 2, as recommended (a manifest asks for stores, all or chosen at approval,
+and read or write; the person approves once per device on first use; remembered in
+`<data dir>/pimble/plugins/approvals.json`; a plugin without approval mounts nothing and
+the pane shows the outline with the request and "Allow"); 6, no network in these waves
+(a plugin asking for it is refused at load). The rest are open.
 
 
 1. **ABI:** a core module with a byte codec on `wasm32-wasip1` (recommended), or the
