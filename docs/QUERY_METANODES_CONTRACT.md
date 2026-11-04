@@ -1,8 +1,9 @@
 # Query metanodes contract: nodes that gather other nodes
 
-Status: drafted 2026-11-04 from Joe's design in conversation; nothing built. This is
-`docs/METANODES_CONTRACT.md` wave 3 ("Query sources"), shaped by what Joe decided on
-2026-11-04 (section 1). Open decisions in section 9.
+Status: drafted 2026-11-04 from Joe's design in conversation; Joe: "build it", the
+decisions of section 9 taken as recommended (Smart List; its own store; a drop makes an own
+child; found rows expand). This is `docs/METANODES_CONTRACT.md` wave 3 ("Query sources"),
+shaped by what Joe decided on 2026-11-04 (section 1).
 
 ## 1. What Joe decided (2026-11-04)
 
@@ -134,7 +135,7 @@ D. **Setup pane and New ▸**, both targets.
 E. **Checked** in the release desktop app and the browser: a plain store, an encrypted one,
    a shared one as a member.
 
-## 9. Open decisions for Joe
+## 9. Decisions (taken as recommended, 2026-11-04)
 
 1. **What New calls it**: "Smart List" (recommended: says it gathers, not a folder you put
    things in), "Smart Folder", "Query", or "Collection".
