@@ -20,8 +20,8 @@ pub fn node_icon(node: &Node) -> String {
     if let Some(icon) = node.metadata.icon() {
         return icon.to_string();
     }
-    // A query metanode, a query metanode (docs/QUERY_METANODES_CONTRACT.md
-    // section 6), whatever its type.
+    // A metanode with a query (docs/QUERY_METANODES_CONTRACT.md section 6),
+    // whatever its type.
     if node.metadata.metanode.as_ref().is_some_and(|m| m.is_query()) {
         return TablerIcon::FilterSearch.name().to_string();
     }

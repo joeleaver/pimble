@@ -146,10 +146,19 @@ fn pane_title(store: AppStore, pane: PaneId) -> String {
 fn pane_icon(store: AppStore, pane: PaneId) -> Vec<(String, String)> {
     let Some((store_id, node_id)) = pane_document(store, pane) else { return Vec::new() };
     let node = store.node_data.with(|map| map.get(&(store_id, node_id)).copied());
-    let (icon, color) = node
-        .map(|sig| sig.with(|n| (n.metadata.icon().map(str::to_string), n.metadata.color().map(str::to_string))))
-        .unwrap_or_default();
+    // The icon and color the node's explorer row shows: a metanode with a
+    // query is violet unless the person gave it a color.
     let dark = store.dark_mode.get();
+    let (icon, color) = node
+        .map(|sig| {
+            sig.with(|n| {
+                let query = n.metadata.metanode.as_ref().is_some_and(|m| m.is_query());
+                let icon = (n.metadata.icon().is_some() || query || crate::metanodes::is_metanode(n)).then(|| pimble_ui::appearance::node_icon(n));
+                let color = n.metadata.color().map(|hex| display_color(hex, dark)).or_else(|| query.then(|| pimble_ui::appearance::gathered_violet(dark).to_string()));
+                (icon, color)
+            })
+        })
+        .unwrap_or_default();
     let fallback = if store.pane(pane).show_discussion.get() {
         TablerIcon::Messages
     } else if store.pane(pane).show_sheet.get() {
@@ -161,7 +170,7 @@ fn pane_icon(store: AppStore, pane: PaneId) -> Vec<(String, String)> {
     };
     vec![(
         icon.unwrap_or_else(|| fallback.name().to_string()),
-        color.map(|hex| display_color(&hex, dark)).unwrap_or_default(),
+        color.unwrap_or_default(),
     )]
 }
 

@@ -570,11 +570,11 @@ pub(crate) fn start_rename(store: AppStore, tree_state: UseTreeReturn, value: &s
         if data.key == "Enter" {
             let nv = nv_interceptor.clone();
             run_on_main_thread(move || {
-                let new_title = untracked(|| store.rename_text.get());
+                let new_title = rename_title(&nv, untracked(|| store.rename_text.get()));
                 store.renaming_node.set(None);
                 clear_keyboard_interceptor();
                 tree_state.controller.focus();
-                if let Some((s_id, Some(n_id))) = parse_tree_value(&nv) {
+                if let (Some((s_id, Some(n_id))), Some(new_title)) = (parse_tree_value(&nv), new_title) {
                     store.send(BackendCommand::RenameNode {
                         store_id: s_id, node_id: n_id, title: new_title,
                     });
@@ -590,6 +590,19 @@ pub(crate) fn start_rename(store: AppStore, tree_state: UseTreeReturn, value: &s
         let _ = set_timeout(0, move || input.focus());
     }
     true
+}
+
+thread_local! {
+    /// The row of a node just made whose name is being typed: its box starts
+    /// empty, and an empty Enter keeps the name it was made with ("Metanode").
+    static FRESH_RENAME: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// The title a rename of `value` commits, or `None` to keep the one it has: a
+/// node just made, named nothing, keeps the name it was made with.
+fn rename_title(value: &str, text: String) -> Option<String> {
+    let fresh = FRESH_RENAME.with(|f| f.borrow_mut().take()).as_deref() == Some(value);
+    (!(fresh && text.trim().is_empty())).then_some(text)
 }
 
 /// What a row's menu acts on: the selection when the row is one of several
@@ -1201,8 +1214,8 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
         let cancel_rename = move |commit: bool| {
             if let Some(prev_value) = untracked(|| store.renaming_node.get()) {
                 if commit {
-                    let new_title = untracked(|| store.rename_text.get());
-                    if let Some((sid, Some(nid))) = parse_tree_value(&prev_value) {
+                    let new_title = rename_title(&prev_value, untracked(|| store.rename_text.get()));
+                    if let (Some((sid, Some(nid))), Some(new_title)) = (parse_tree_value(&prev_value), new_title) {
                         store.send(BackendCommand::RenameNode {
                             store_id: sid, node_id: nid, title: new_title,
                         });
@@ -1751,9 +1764,10 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                     },
                     onsubmit: move || {
                         let new_title = store.rename_text.get();
+                        let new_title = rename_title(&nv_submit, new_title);
                         store.renaming_node.set(None);
                         clear_keyboard_interceptor();
-                        if let Some((s_id, Some(n_id))) = parse_tree_value(&nv_submit) {
+                        if let (Some((s_id, Some(n_id))), Some(new_title)) = (parse_tree_value(&nv_submit), new_title) {
                             store.send(BackendCommand::RenameNode {
                                 store_id: s_id, node_id: n_id, title: new_title,
                             });
@@ -1769,7 +1783,12 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             if crate::state::take_pending_rename(&node_value) {
                 let value = node_value.clone();
                 run_on_main_thread(move || {
-                    start_rename(store, tree_state, &value);
+                    if start_rename(store, tree_state, &value) {
+                        // Typed from nothing, not after the name it was made
+                        // with.
+                        FRESH_RENAME.with(|f| *f.borrow_mut() = Some(value.clone()));
+                        store.rename_text.set(String::new());
+                    }
                 });
             }
 
