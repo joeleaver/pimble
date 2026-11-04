@@ -1611,35 +1611,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             };
             // "Appearance...": open the icon, colour and tags picker for this
             // node (a store row edits its root node).
-            // "Show as Outline": a metanode back to an ordinary node
-            // (docs/METANODES_CONTRACT.md), its source kept for next time.
-            // Snapshotted like the icon: the row's label carries the viewer.
-            let is_metanode_row = node_sig.is_some_and(|sig| untracked(|| sig.with(crate::metanodes::is_metanode)));
-            // "Show as <viewer>" (Joe, 2026-11-04: "there seems to be no way to
-            // revert 'show as outline'"): a plugin viewer the node is not shown
-            // with, over the source its recipe makes ("Show as Kanban": its
-            // subtree two levels deep). Snapshotted like the icon.
-            let row_viewer: Option<String> = node_sig.and_then(|sig| untracked(|| sig.with(|n| n.metadata.metanode.as_ref().map(|m| m.viewer.clone()))));
-            let show_as_items: Vec<(String, TablerIcon, String, u32)> = {
-                let mut seen = std::collections::HashSet::new();
-                untracked(|| store.recipes.get())
-                    .into_iter()
-                    .filter(|r| Some(&r.recipe.viewer) != row_viewer.as_ref() && seen.insert(r.recipe.viewer.clone()))
-                    .map(|r| {
-                        let name = r.recipe.label.strip_prefix("New ").unwrap_or(&r.recipe.label).to_string();
-                        let icon = r.recipe.icon.as_deref().and_then(icon_by_name).unwrap_or(TablerIcon::LayoutKanban);
-                        (format!("Show as {name}"), icon, r.recipe.viewer.clone(), r.recipe.depth)
-                    })
-                    .collect()
-            };
-            let on_show_as_outline = {
-                let nv = nv_ctx.clone();
-                move || {
-                    if let Some((s_id, Some(n_id))) = parse_tree_value(&nv) {
-                        crate::metanodes::set_metanode(store, s_id, n_id, None, None);
-                    }
-                }
-            };
             let on_appearance = {
                 let nv = nv_ctx.clone();
                 move || {
@@ -1973,7 +1944,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
             // left out; New is one list, `crate::creating`, until rinch's
             // submenus make it "New ▸").
             let nv_new = nv_ctx.clone();
-            let nv_show_as = nv_ctx.clone();
             let context_menu = if is_store_root {
                 rsx! {
                     ContextMenu {
@@ -2194,31 +2164,6 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 disabled: !can_write_tree,
                                 onclick: on_appearance,
                                 "Appearance..."
-                            }
-                            if is_metanode_row {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::ListTree,
-                                    disabled: {move || !can_write_tree || several()},
-                                    onclick: on_show_as_outline.clone(),
-                                    "Show as Outline"
-                                }
-                            }
-                            for (label, icon, viewer, depth) in show_as_items.clone() {
-                                DropdownMenuItem {
-                                    key: label.clone(),
-                                    left_section: icon,
-                                    disabled: !can_write_tree,
-                                    onclick: {
-                                        let (nv, viewer) = (nv_show_as.clone(), viewer.clone());
-                                        move || {
-                                            if let Some((s_id, Some(n_id))) = parse_tree_value(&nv) {
-                                                let source = pimble_core::metanode::Source::subtree(depth);
-                                                crate::metanodes::set_metanode(store, s_id, n_id, Some(viewer.clone()), Some(source));
-                                            }
-                                        }
-                                    },
-                                    {label.clone()}
-                                }
                             }
                             DropdownMenuDivider {}
                             DropdownMenuItem {

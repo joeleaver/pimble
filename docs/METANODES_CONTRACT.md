@@ -170,6 +170,9 @@ see an ordinary node.
 
 1. **A metanode is any node with `metanode:viewer`** (recommended: a folder can become a
    kanban and go back to an outline with nothing lost), or a node type of its own (`view`).
+   *Taken as recommended in the data; in the app (Joe, 2026-11-04) there is no menu that
+   turns a node into a metanode or back: one is made by a recipe (New Kanban), and the MCP's
+   `set_metanode` is the way to change one (docs/MENUS_CONTRACT.md section 8).*
 2. **A query metanode's own children:** allowed and shown in the explorer as any node's
    (recommended: it is still an ordinary node), or a query metanode takes no children.
 3. **Where a query's new items go** (a viewer's "add" on a query source): the viewer's

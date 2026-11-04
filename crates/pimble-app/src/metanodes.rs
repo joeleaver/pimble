@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use pimble_api::Forest;
-use pimble_core::metanode::{outline_line, Source};
+use pimble_core::metanode::outline_line;
 use pimble_core::{Node, NodeId, StoreId};
 use rinch::prelude::*;
 
@@ -193,14 +193,6 @@ pub(crate) fn view_shown(store: AppStore, view: &pimble_api::View) {
     for key in touched {
         ask(store, key);
     }
-}
-
-/// Make `(store_id, node_id)` a metanode shown with `viewer`, or with `None`
-/// an ordinary node again; `source` `None` keeps the one it has. The code
-/// path a viewer menu takes once plugins provide viewers (wave 2); today
-/// "Show as Outline" is its one caller.
-pub(crate) fn set_metanode(store: AppStore, store_id: StoreId, node_id: NodeId, viewer: Option<String>, source: Option<Source>) {
-    store.send(BackendCommand::SetMetanode { store_id, node_id, viewer, source });
 }
 
 /// Pane `pane`'s outline and lines from `forest`.

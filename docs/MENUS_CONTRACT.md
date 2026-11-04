@@ -61,7 +61,6 @@ Discuss               (a discussion on this node; was "Start a Discussion")
 ─────────
 Rename
 Appearance...
-View as ▸             Outline · Kanban ...   (a metanode; replaces "Show as Outline")
 ─────────
 Cut
 Copy
@@ -188,3 +187,13 @@ guards, the refusals); this moves and groups them. Keyboard creation in the expl
   last in Work; File > New ▸ Text made a node after the selected row and took its name in
   place. pimble-app's 206 tests pass. Not tried: the browser; a picture paste from the
   menu.
+
+## 8. No "Show as" (Joe, 2026-11-04)
+
+"Show as Outline" (and the "Show as Kanban" added beside it the same day) are gone from the
+row menu: a hidden mode switch on a node, which hid a kanban from Joe once and needed a
+menu item no one would look for to bring it back. A kanban is made with New Kanban; a
+metanode's viewer is still data (`metanode:viewer`), which an agent sets through the MCP
+(`set_metanode`); the outline shows only when a viewer's plugin is missing. "View as ▸"
+is dropped from wave 2.
+
