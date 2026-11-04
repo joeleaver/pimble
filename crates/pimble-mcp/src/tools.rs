@@ -85,8 +85,8 @@ bold, italic and links; your messages are signed with your agent's name.
 A metanode is a node shown a particular way: it names which nodes it shows (its source, such as \
 its children two levels deep) and the viewer that shows them (such as a kanban, whose columns are \
 the first level and cards the second, in the tree's order). get_node says when a node is one, \
-get_metanode lists what it shows, set_metanode sets or clears its viewer and source. A smart list \
-(set_metanode with a query) shows its own children and then the nodes its query finds, which live \
+get_metanode lists what it shows, set_metanode sets or clears its viewer and source. A metanode can also have a query \
+(set_metanode with query): it shows its own children and then the nodes its query finds, which live \
 elsewhere. Moving, creating and editing the nodes it shows is done with the ordinary tools.
 
 Canvases are infinite whiteboards (a canvas node) and the marks on pictures in a note's text (a \
@@ -175,7 +175,7 @@ impl Pimble {
         format!("{} ({})", self.api.path(addr).await, addr.link())
     }
 
-    /// A smart list's source from what an agent gave (docs/QUERY_METANODES_CONTRACT.md
+    /// A query metanode's source from what an agent gave (docs/QUERY_METANODES_CONTRACT.md
     /// section 3), with its nodes and stores named as the source names them.
     async fn match_source(&self, q: &MatchParams) -> Result<pimble_core::metanode::Source, String> {
         use pimble_core::metanode::{node_ref, Condition, FieldOp, Order, Query, Source, Within, DEFAULT_LIMIT, MAX_LIMIT};
@@ -408,14 +408,14 @@ pub struct SetMetanodeParams {
     /// Leave it out to keep the source it has.
     #[serde(default)]
     pub depth: Option<u32>,
-    /// Make it a smart list instead: it shows its own children, then the
+    /// Make it a metanode with a query instead: it shows its own children, then the
     /// nodes this finds (live, never copied). Its viewer is "list" unless
     /// `viewer` says otherwise. Not together with `depth`.
     #[serde(default)]
     pub query: Option<MatchParams>,
 }
 
-/// What a smart list finds: the nodes every condition holds for.
+/// What a metanode's query finds: the nodes every condition holds for.
 #[derive(Deserialize, JsonSchema)]
 pub struct MatchParams {
     /// Where it looks: leave it out for the node's own store; "everywhere"
@@ -816,7 +816,7 @@ impl Pimble {
 
     /// What a metanode shows (docs/METANODES_CONTRACT.md): its source's nodes as an
     /// indented outline in the tree's own order, each line with its link. A node
-    /// with no viewer is read as its children. A smart list (a query) lists its
+    /// with no viewer is read as its children. A metanode with a query lists its
     /// own children, then the nodes it finds, each marked found with where it lives.
     #[tool(name = "get_metanode")]
     async fn get_metanode(&self, Parameters(p): Parameters<NodeParam>) -> Result<String, String> {
@@ -869,7 +869,7 @@ impl Pimble {
     /// Make a node a metanode shown with a viewer and a source, or an ordinary node
     /// again. Every gesture in a viewer is an ordinary edit of real nodes, which the
     /// other tools already make (move_node, create_node, set_fields, set_tags).
-    /// With `query` it becomes a smart list: its own children, then the nodes the
+    /// With `query` it becomes a metanode with a query: its own children, then the nodes the
     /// query finds (tags, absent tags, words, field values, links, types), live.
     #[tool(name = "set_metanode")]
     async fn set_metanode(&self, Parameters(p): Parameters<SetMetanodeParams>) -> Result<String, String> {

@@ -198,7 +198,7 @@ What is built, on `master`:
   `a_query_metanode_finds_nodes_after_its_own_children` (every condition kind, the four
   orders, descending, limit, under / another store / everywhere, the exclusions, own first
   and once, a newer condition, the refusal sentence and `judge_in_metanode`, liveness);
-  `pimble-mcp` `a_smart_list_is_set_and_lists_its_finds`.
+  `pimble-mcp` `a_query_metanode_is_set_and_lists_its_finds`.
 
 Not done, or done differently from sections 3 and 8:
 

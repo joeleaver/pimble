@@ -191,11 +191,11 @@ async fn metanodes_are_set_described_and_listed() {
     let _ = server.stop().await;
 }
 
-/// Smart lists (docs/QUERY_METANODES_CONTRACT.md section 7): `set_metanode`
+/// Query metanodes (docs/QUERY_METANODES_CONTRACT.md section 7): `set_metanode`
 /// takes a query and makes the node a list, `get_metanode` lists its own
 /// children and then what it finds, each marked found with where it lives.
 #[tokio::test]
-async fn a_smart_list_is_set_and_lists_its_finds() {
+async fn a_query_metanode_is_set_and_lists_its_finds() {
     let dir = tempfile::tempdir().unwrap();
     let mut server = PimbleServer::with_config(ServerConfig {
         addr: "127.0.0.1:0".parse().unwrap(),

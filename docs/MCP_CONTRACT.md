@@ -248,7 +248,7 @@ Write:
 `get_node` describes a metanode in one line ("a metanode: the children of Work, two levels,
 shown with the kanban viewer") and says when a newer Pimble wrote part of its source.
 
-Smart lists (docs/QUERY_METANODES_CONTRACT.md section 7, built 2026-11-04): `set_metanode`
+Metanodes with a query (docs/QUERY_METANODES_CONTRACT.md section 7, built 2026-11-04): `set_metanode`
 takes `query` instead of `depth` (`within`: omitted for the node's store, "everywhere", a
 store's name, or a node for everything under it; `all`: conditions, each one of `tag`,
 `no_tag`, `text`, `field` with `is` and `value`, `links_to`, `type`; `order`: "title",
