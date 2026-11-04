@@ -43,9 +43,24 @@ pub(crate) struct HeldStore {
     /// What the store's row says this principal may do in it: a node's
     /// access until the server judges that node.
     pub store_access: StoreAccess,
+    /// Counts every change to what is held here (a merge, a document
+    /// taken, the subscription lost), so what was derived from the held
+    /// documents can be kept until it moves (`crate::references`).
+    pub generation: u64,
+}
+
+/// A generation no held store has had: a store forgotten and held again
+/// never repeats one, so nothing derived before is taken for current.
+fn next_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl HeldStore {
+    fn bump(&mut self) {
+        self.generation = next_generation();
+    }
+
     fn new(root: NodeId, store_access: StoreAccess) -> Self {
         Self {
             tree: Tree::from_docs(root, HashMap::new()),
@@ -54,6 +69,7 @@ impl HeldStore {
             complete: false,
             live: false,
             store_access,
+            generation: next_generation(),
         }
     }
 
@@ -65,9 +81,18 @@ impl HeldStore {
             return;
         }
         let merged = match self.tree.doc_mut(node.id) {
-            Some(doc) => doc.apply_update(&node.content).is_ok(),
+            Some(doc) => match doc.apply_update(&node.content) {
+                Ok(effect) => {
+                    if effect.changed {
+                        self.bump();
+                    }
+                    true
+                }
+                Err(_) => false,
+            },
             None => match NodeDoc::load(&node.content) {
                 Ok(doc) => {
+                    self.bump();
                     self.tree.insert_doc(node.id, doc);
                     true
                 }
@@ -88,7 +113,18 @@ impl HeldStore {
             return false;
         }
         self.absent.remove(&id);
-        self.tree.apply_update(id, update).is_ok()
+        match self.tree.apply_update(id, update) {
+            Ok(effect) => {
+                if effect.changed {
+                    self.bump();
+                }
+                true
+            }
+            Err(_) => {
+                self.bump();
+                false
+            }
+        }
     }
 
     /// Hold `id` from `update` when the update is its whole document: a node
@@ -107,6 +143,7 @@ impl HeldStore {
             !doc.ydoc().transact().has_missing_updates()
         };
         if whole && doc.is_initialised() && doc.fields().is_ok() {
+            self.bump();
             self.tree.insert_doc(id, doc);
         }
     }
@@ -152,7 +189,11 @@ impl HeldStore {
             return false;
         }
         self.absent.remove(&id);
-        self.tree.apply_update(id, update).is_ok_and(|effect| effect.changed)
+        let changed = self.tree.apply_update(id, update).is_ok_and(|effect| effect.changed);
+        if changed {
+            self.bump();
+        }
+        changed
     }
 
     /// The live node `id` as an answer carries it: its fields, its whole
@@ -260,6 +301,7 @@ impl Held {
     pub fn lost(&mut self, store: StoreId) {
         if let Some(held) = self.held.get_mut(&store) {
             held.live = false;
+            held.bump();
         }
     }
 }

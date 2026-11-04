@@ -860,40 +860,19 @@ impl Pimble {
     #[tool(name = "rows_pointing_here")]
     async fn rows_pointing_here(&self, Parameters(p): Parameters<RowsPointingHereParams>) -> Result<String, String> {
         let target = self.api.resolve(&p.node).await?;
-        let target_ref = node_ref(target);
-        let stores = self.api.known_stores().await?;
+        // The walk is the API's, shared with the app's Properties panel.
         let mut out = String::new();
-        for store in &stores {
-            for (at, node, path) in self.walk_store(store).await {
-                let snap = sheets_of(&node);
-                let hits: Vec<(String, HashSet<String>)> = snap
-                    .tables
-                    .iter()
-                    .filter_map(|t| {
-                        let cols: Vec<&str> = t.columns.iter().filter(|c| matches!(c.ty, ColumnType::NodeLink { .. })).map(|c| c.id.as_str()).collect();
-                        let rows: HashSet<String> = t
-                            .rows
-                            .iter()
-                            .filter(|r| cols.iter().any(|c| r.cells.get(*c) == Some(&pimble_sheet::Stored::Node(target_ref))))
-                            .map(|r| r.id.clone())
-                            .collect();
-                        (!rows.is_empty()).then(|| (t.id.clone(), rows))
-                    })
-                    .collect();
-                if hits.is_empty() {
-                    continue;
-                }
-                let Ok(mut book) = self.api.sheet_book(at, &[]).await else { continue };
-                let Ok(doc) = NodeDoc::load(&node.content) else { continue };
-                let work = Work::new(Sheets::of_node(&doc), &mut book);
-                for (table, rows) in hits {
-                    let n = rows.len();
-                    let filter = Filter { limit: NODE_ROWS, rows: Some(rows), totals: n > 1, ..Default::default() };
-                    match ops::render_table(&work, &table, &filter) {
-                        Ok(text) => out.push_str(&format!("{} {path} ({}):\n{text}\n", place_of(&node), at.link())),
-                        Err(e) => out.push_str(&format!("(a table in {path} could not be shown: {e})\n")),
-                    }
-                }
+        for here in self.api.rows_pointing_here(target).await? {
+            let (at, node, path) = (here.at, &here.node, &here.path);
+            let rows: HashSet<String> = here.rows.iter().map(|(id, _)| id.clone()).collect();
+            let Ok(mut book) = self.api.sheet_book(at, &[]).await else { continue };
+            let Ok(doc) = NodeDoc::load(&node.content) else { continue };
+            let work = Work::new(Sheets::of_node(&doc), &mut book);
+            let n = rows.len();
+            let filter = Filter { limit: NODE_ROWS, rows: Some(rows), totals: n > 1, ..Default::default() };
+            match ops::render_table(&work, &here.table, &filter) {
+                Ok(text) => out.push_str(&format!("{} {path} ({}):\n{text}\n", place_of(node), at.link())),
+                Err(e) => out.push_str(&format!("(a table in {path} could not be shown: {e})\n")),
             }
         }
         if out.is_empty() {
@@ -1062,6 +1041,53 @@ mod server_tests {
         client.create_store(dir.path().join("trips.pimble"), "Trips").await.expect("store");
         let pimble = Pimble::new(Arc::new(Connection::with_client(client)));
         (server, pimble, dir)
+    }
+
+    /// rows_pointing_here lists, per table, the rows whose node-link column
+    /// chooses the node, with totals; the walk is the API's
+    /// (`Pimble::rows_pointing_here`), which the app's Properties panel reads
+    /// too. A link cell is not a text link: "Links here" leaves it out.
+    #[tokio::test]
+    async fn rows_pointing_here_lists_the_rows_that_choose_a_node() {
+        let (mut server, pimble, _dir) = start().await;
+        for title in ["Alice", "Bob"] {
+            pimble.create_node(p(json!({ "parent": "Trips", "title": title }))).await.unwrap();
+        }
+        let alice = pimble.api.resolve("Trips/Alice").await.unwrap();
+        let bob = pimble.api.resolve("Trips/Bob").await.unwrap();
+        let (a, b) = (alice.link(), bob.link());
+        pimble
+            .create_sheet(p(json!({
+                "parent": "Trips", "title": "Ledger", "table": "Costs",
+                "columns": [ { "name": "what", "type": "text" }, { "name": "who", "type": "node_link", "under": "" }, { "name": "amount", "type": "money" } ],
+                "rows": [ { "what": "Fuel", "who": a, "amount": 10 }, { "what": "Food", "who": b, "amount": 20 }, { "what": "Tolls", "who": a, "amount": 5 } ],
+            })))
+            .await
+            .unwrap();
+        let out = pimble.rows_pointing_here(p(json!({ "node": "Trips/Alice" }))).await.unwrap();
+        println!("{out}");
+        assert!(out.starts_with("in the sheet node Trips/Ledger (pimble:"), "{out}");
+        assert!(out.contains("Fuel") && out.contains("Tolls") && !out.contains("Food"), "{out}");
+        let ledger = pimble.api.resolve("Trips/Ledger").await.unwrap();
+        let groups = pimble.api.rows_pointing_here(alice).await.unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!((groups[0].at, groups[0].table_name.as_str()), (ledger, "Costs"));
+        assert_eq!(groups[0].rows.iter().map(|(_, label)| label.as_str()).collect::<Vec<_>>(), vec!["Fuel", "Tolls"]);
+        // A text link from Bob's note shows in "Links here" once indexed; the
+        // Ledger's link cell never does.
+        pimble.append(p(json!({ "node": "Trips/Bob", "markdown": format!("Owes [Alice]({a})") }))).await.unwrap();
+        let mut linking = Vec::new();
+        for _ in 0..50 {
+            linking = pimble.api.backlinks(alice).await.unwrap().into_iter().map(|l| l.addr).collect::<Vec<_>>();
+            if !linking.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert_eq!(linking, vec![bob], "a table's link cell is not a text link");
+        let none = pimble.rows_pointing_here(p(json!({ "node": "Trips" }))).await.unwrap();
+        assert_eq!(none, "No table links to that node.");
+        let _ = server.stop().await;
     }
 
     /// The Spreadsheet session's repro: a summary whose grouping reads a

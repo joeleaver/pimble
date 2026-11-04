@@ -65,7 +65,7 @@ use pimble_rpc::{
     GetNodeResponse, GetNodesRequest, GetNodesResponse, ListRemoteStoresRequest, ListStoresResponse,
     MoveNodeRequest, MoveNodeResponse, MoveNodesRequest, MoveNodesResponse, ListDeletedRequest, ListDeletedResponse, TransplantNodeRequest, TransplantNodeResponse, NodeContentChangedNotification, NodeContentDiff, OpenStoreRequest,
     OpenStoreResponse, PimbleApiServer, RebuildIndexRequest, RebuildIndexResponse, RemoveReplicaRequest,
-    SearchRequest, SearchResponse, SearchResultItem, StoreChangeKind,
+    BacklinksRequest, BacklinksResponse, SearchRequest, SearchResponse, SearchResultItem, StoreChangeKind,
     CloudShareInfoResponse, CloudShareInviteRequest, CloudShareNodeRequest, CloudShareRef, CloudShareRemoveMemberRequest, DeleteVaultStoreRequest,
     GetScopesRequest, GetScopesResponse, Scope, SetScopeRequest, StoreChangedNotification, SyncNodesRequest, SyncNodesResponse, UndeleteNodeRequest,
     VaultDocKeys, VaultSetDocKeysRequest,
@@ -5251,6 +5251,56 @@ impl PimbleApiServer for RpcHandler {
 
         let total = results.len();
         Ok(SearchResponse { results, total })
+    }
+
+    async fn backlinks(
+        &self,
+        ext: &Extensions,
+        request: BacklinksRequest,
+    ) -> Result<BacklinksResponse, ErrorObjectOwned> {
+        let principal = principal_of(ext);
+        authorize(&principal, request.store_id, Access::Read)?;
+        self.reject_if_vault(request.store_id).await?;
+        {
+            // A node outside the principal's reach is refused as `getNode`
+            // refuses it, without saying whether it exists.
+            let manager = self.store_manager.read().await;
+            require_in_scope(&Reach::of(&manager, &principal, request.store_id), request.node_id, Access::Read)?;
+        }
+
+        // What the index says links here (it lags typing by its debounce)...
+        let indexed = {
+            let indexes = self.indexes.read().await;
+            match indexes.get(&request.store_id) {
+                Some(handle) => handle.index.backlinks(request.node_id).map_err(to_rpc_error)?,
+                None => Vec::new(),
+            }
+        };
+        // ...each judged against its document as it is now: live, readable
+        // by this principal, not under an ended share, and its text naming
+        // the node (the index also links a table's link cells, which are
+        // "rows pointing here").
+        let manager = self.store_manager.read().await;
+        let reach = Reach::of(&manager, &principal, request.store_id);
+        let tree = manager.tree(request.store_id).map_err(to_rpc_error)?;
+        let mut nodes: Vec<NodeId> = Vec::new();
+        for id in indexed {
+            if id == request.node_id || nodes.contains(&id) {
+                continue;
+            }
+            if reach.as_ref().is_some_and(|reach| reach.require(id, Access::Read).is_err()) {
+                continue;
+            }
+            if manager.under_ended_root(request.store_id, id) {
+                continue;
+            }
+            let Some(doc) = tree.doc(id) else { continue };
+            let live = doc.fields().is_ok_and(|f| f.deleted_at.is_none() && f.attached_to.is_none());
+            if live && doc.links().iter().any(|link| link.target.store == request.store_id && link.target.node == request.node_id) {
+                nodes.push(id);
+            }
+        }
+        Ok(BacklinksResponse { nodes })
     }
 
     async fn rebuild_index(

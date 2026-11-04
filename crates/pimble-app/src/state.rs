@@ -664,6 +664,9 @@ pub struct AppStore {
     pub properties_width: Signal<f32>,
     pub properties_adding_field: Signal<bool>,
     pub properties_context: Signal<Option<crate::properties::Context>>,
+    /// What points at the node the panel shows, as last answered
+    /// (`BackendEvent::ReferencesLoaded`).
+    pub properties_references: Signal<Option<(StoreId, NodeId, crate::properties::References)>>,
 
     /// The theme in use (View > "Toggle Dark Mode"), persisted in `state.json`.
     /// Read reactively wherever a colour depends on the scheme.
@@ -1076,6 +1079,7 @@ impl AppStore {
             properties_width: Signal::new(crate::properties::DEFAULT_WIDTH),
             properties_adding_field: Signal::new(false),
             properties_context: Signal::new(None),
+            properties_references: Signal::new(None),
             dark_mode: Signal::new(true),
             board_tool: Signal::new(crate::boards::Tool::default()),
             board_style: crate::boards::StyleUi::new(),

@@ -26,6 +26,7 @@ pub mod router;
 #[cfg(feature = "rpc")]
 pub mod rpc;
 pub mod metanode;
+pub mod references;
 mod matching;
 pub mod view;
 #[cfg(feature = "conformance")]
@@ -39,6 +40,7 @@ pub use error::ApiError;
 pub use router::Router;
 pub use view::{Affected, Listed, View};
 pub use metanode::{Forest, ForestEntry, Judged, MetanodeEdit};
+pub use references::{LinksHere, RowsHere, ShownIn};
 pub use identity::Me;
 pub use names::label;
 pub use pimble_core::plan;

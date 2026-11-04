@@ -70,7 +70,7 @@ pub struct Forest {
     lists: Vec<Addr>,
     /// The stores a match looked in: any node changing there may change
     /// what it finds.
-    scanned: Vec<StoreId>,
+    pub(crate) scanned: Vec<StoreId>,
     /// Whether what a match finds depends on node content (a text or links
     /// condition, or the last-changed order), so a content edit counts.
     reads_content: bool,

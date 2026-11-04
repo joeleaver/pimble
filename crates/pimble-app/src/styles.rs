@@ -840,6 +840,35 @@ pub(crate) const APP_CSS: &str = "
     text-decoration: underline;
 }
 
+.pimble-properties__heading--line {
+    display: flex;
+    gap: 6px;
+}
+
+.pimble-properties__count {
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: 0;
+}
+
+/* Flex boxes, so each link is a box a click can land on (rinch hit-tests
+   boxes, not inline text runs). */
+.pimble-properties__ref {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    padding: 2px 0;
+}
+
+.pimble-properties__ref-head {
+    display: flex;
+}
+
+.pimble-properties__rows {
+    color: var(--rinch-color-dimmed);
+    font-size: 12px;
+}
+
 .pimble-properties__through,
 .pimble-properties__times {
     margin-top: 6px;

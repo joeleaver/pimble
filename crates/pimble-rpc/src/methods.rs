@@ -283,6 +283,14 @@ pub trait PimbleApi {
     #[method(name = "search", with_extensions)]
     async fn search(&self, request: SearchRequest) -> Result<SearchResponse, ErrorObjectOwned>;
 
+    /// The live nodes of a store whose text links to one of its nodes (its
+    /// content's `pimble:` links and its canvases' node cards; a table's
+    /// link cells are "rows pointing here", not this), from the store's
+    /// search index, filtered to what the principal may read
+    /// (docs/PROPERTIES_CONTRACT.md section 5, "Links here"). Read.
+    #[method(name = "backlinks", with_extensions)]
+    async fn backlinks(&self, request: BacklinksRequest) -> Result<BacklinksResponse, ErrorObjectOwned>;
+
     /// Rebuild a store's search index from scratch: delete the on-disk
     /// index and re-index every node from the store's documents. Returns
     /// the number of nodes indexed. Write.

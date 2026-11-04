@@ -1039,6 +1039,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
                     store_tags: store_tags.clone(),
                 }));
             }
+            BackendEvent::ReferencesLoaded { store_id, node_id, references } => {
+                crate::properties::references_loaded(store, *store_id, *node_id, references.clone());
+            }
             BackendEvent::DeletedListed { store_id, nodes } => {
                 tracing::info!("Store {:?}: {} recently deleted", store_id, nodes.len());
                 // A late answer for a store the modal has moved on from (or
@@ -1134,6 +1137,9 @@ pub(crate) fn process_backend_events(store: AppStore, tree_state: UseTreeReturn)
             }
 
             BackendEvent::RemoteStoreChange { store_id, change_kind, source_client_id } => {
+                // Whoever made it, it may change what points at the node
+                // the Properties panel shows.
+                crate::properties::store_changed(store);
                 // Skip our own echoes
                 let my_id = untracked(|| store.client_id.get());
                 if let Some(source) = source_client_id {

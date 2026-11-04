@@ -117,6 +117,8 @@ pub struct Pimble {
     me: futures::lock::Mutex<Option<Option<Me>>>,
     frames: PresenceFrames,
     whereabouts: Whereabouts,
+    /// What walks for references found, per store ([`crate::references`]).
+    pub(crate) refs: Mutex<crate::references::Cache>,
 }
 
 impl Pimble {
@@ -145,6 +147,7 @@ impl Pimble {
             listening: AtomicBool::new(false),
             me: futures::lock::Mutex::new(None),
             whereabouts: Whereabouts::default(),
+            refs: Mutex::new(Default::default()),
         }
     }
 
@@ -579,7 +582,10 @@ impl Pimble {
     /// or a partial replica's shared roots) and everything under it, through
     /// mounts, each with its path of titles from the store's name.
     pub async fn walk(&self, store: &Store) -> Result<Vec<Walked>, ApiError> {
-        self.hold_store(store.id).await?;
+        // A store whose backend holds its documents is read through it.
+        if !self.passes_through(store.id) {
+            self.hold_store(store.id).await?;
+        }
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let tops = crate::names::store_tops(store);

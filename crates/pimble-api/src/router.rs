@@ -324,6 +324,15 @@ impl Backend for Router {
         }
     }
 
+    /// Asked of the backend that serves the store; nothing while its owner
+    /// is away (the relay that would answer is not there).
+    async fn backlinks(&self, store: StoreId, node: NodeId) -> Result<Vec<NodeId>, ApiError> {
+        match self.of(store).backlinks(store, node).await {
+            Err(e) if !e.is_refusal() && self.is_away(store) => Ok(Vec::new()),
+            other => other,
+        }
+    }
+
     async fn list_attachments(&self, store: StoreId, host: NodeId) -> Result<Vec<Node>, ApiError> {
         let nodes = self.of(store).list_attachments(store, host).await?;
         Ok(nodes.into_iter().map(|n| self.while_away(store, n)).collect())

@@ -385,6 +385,10 @@ assistant:
   nodes, discussions on a mount, and `move_node` into a mount.
 - Walks (`find_node`, `list_tables` of a store, `rows_pointing_here`, a formula's
   names) hold the store's documents once and are lookups after that.
+- `rows_pointing_here` finds its tables through `Pimble::rows_pointing_here` (pimble-api,
+  2026-11-04), the walk the app's Properties panel reads too, kept per store until a
+  change touches it; what the tool answers is unchanged
+  (docs/PROPERTIES_CONTRACT.md section 9).
 
 ## Waves
 

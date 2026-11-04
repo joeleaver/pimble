@@ -474,7 +474,10 @@ pimble-api
   ids)` (whole documents: `getNodes`), `children(store, node)` (`getChildren`, mount-aware,
   answers the store the children live in), `apply(store, node, update, client_id)`
   (`applyEdit`), the structural calls (`create_node`, `move_node(s)`, `transplant`,
-  `delete`, `undelete`, `create_mount`), `resolve_link`, `list_deleted`, `search`, blobs,
+  `delete`, `undelete`, `create_mount`), `resolve_link`, `list_deleted`, `search`,
+  `backlinks(store, node)` (the `backlinks` RPC, 2026-11-04, docs/PROPERTIES_CONTRACT.md
+  section 9: the store's index, judged per document; the browser's vault from the
+  documents it holds), blobs,
   presence publish and subscribe, discussions' attachments, and `subscribe(store) ->
   Stream<StoreChange>` where a change carries its kind, its source and the update bytes.
   `RpcBackend` owns the reconnect loop and resubscribes; callers see `ApiError::Offline`

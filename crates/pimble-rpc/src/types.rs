@@ -660,6 +660,19 @@ pub struct SearchResponse {
     pub total: usize,
 }
 
+/// Request for what links to `node_id` in `store_id` (`backlinks`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BacklinksRequest {
+    pub store_id: StoreId,
+    pub node_id: NodeId,
+}
+
+/// Answer to `backlinks`: the linking nodes of the same store, each once.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BacklinksResponse {
+    pub nodes: Vec<NodeId>,
+}
+
 /// Request to rebuild a store's search index from scratch: delete
 /// `index/rhypedb/` and re-index every node from the store's documents.
 #[derive(Debug, Clone, Serialize, Deserialize)]

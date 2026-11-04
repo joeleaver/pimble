@@ -140,6 +140,9 @@ impl Backend for Counting {
     async fn search(&self, query: &str, stores: Vec<StoreId>, semantic: bool, limit: usize) -> Result<Vec<SearchResultItem>, ApiError> {
         self.inner.search(query, stores, semantic, limit).await
     }
+    async fn backlinks(&self, store: StoreId, node: NodeId) -> Result<Vec<NodeId>, ApiError> {
+        self.inner.backlinks(store, node).await
+    }
     async fn put_blob(&self, store: StoreId, node: NodeId, mime: &str, bytes: &[u8]) -> Result<BlobUrl, ApiError> {
         self.inner.put_blob(store, node, mime, bytes).await
     }
@@ -882,4 +885,86 @@ async fn a_query_metanode_finds_nodes_after_its_own_children() {
     let by_text = api.metanode_source(at).await.unwrap();
     assert!(by_text.touched_by(&content(projects)));
     let _ = { s }.server.stop().await;
+}
+
+/// What points at a node (docs/PROPERTIES_CONTRACT.md section 5, wave 3):
+/// the query Metanodes that find it, in its store and from another store
+/// looking everywhere, as their evaluation does (a limit that cuts it off,
+/// a condition that does not hold, a Metanode looking in its own other
+/// store); the nodes whose text links to it, from the store's index, a
+/// table's link cell not counted and a deleted linker left out; and both
+/// following changes, the walks kept until a store changes.
+#[tokio::test]
+async fn what_points_at_a_node() {
+    use pimble_core::metanode::{Condition as C, Order, Query, Source, Within};
+    let s = stack().await;
+    let (p, root) = s.service.create_store(s.dir.path().join("personal.pimble"), "Personal").await.unwrap();
+    let (o, o_root) = s.service.create_store(s.dir.path().join("other.pimble"), "Other").await.unwrap();
+    let mk = |store, parent, title: &'static str| s.service.create_node(store, Some(parent), "document", title);
+    let target = mk(p, root, "Target").await.unwrap();
+    let first = mk(p, root, "Aardvark").await.unwrap();
+    let linker = mk(p, root, "Linker").await.unwrap();
+    let gone = mk(p, root, "Gone linker").await.unwrap();
+    let plain = mk(p, root, "Plain").await.unwrap();
+    let [waiting, done, cut] = [mk(p, root, "Waiting").await.unwrap(), mk(p, root, "Done").await.unwrap(), mk(p, root, "Cut off").await.unwrap()];
+    let [everywhere, local] = [mk(o, o_root, "Everywhere").await.unwrap(), mk(o, o_root, "Only here").await.unwrap()];
+    let link = pimble_core::PimbleUrl::node(p, target).to_string();
+    for (node, tags, text) in [(target, vec!["waiting"], String::new()), (first, vec!["waiting"], String::new()), (linker, vec![], format!("See [the target]({link})")), (gone, vec![], format!("Also [here]({link})")), (plain, vec![], "No link".to_string())] {
+        s.service
+            .edit_node(p, node, "setup", |doc, at| {
+                doc.set_tags(&tags.iter().map(|t| t.to_string()).collect::<Vec<_>>(), at)?;
+                if !text.is_empty() {
+                    doc.append_markdown(&text)?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+    s.service.delete_node(p, gone).await.unwrap();
+
+    let (api, _) = api(&s).await;
+    let source = |tag: &str, within: Option<Within>, limit: u32| Source {
+        query: Query::Match { within, all: vec![C::Tag { tag: tag.into() }], order: Order::Title, descending: false, limit },
+        later: Default::default(),
+    };
+    for (store, node, src) in [
+        (p, waiting, source("waiting", None, 50)),
+        (p, done, source("done", None, 50)),
+        // "Aardvark" comes first by title and takes the one place.
+        (p, cut, source("waiting", None, 1)),
+        (o, everywhere, source("waiting", Some(Within::Everywhere), 50)),
+        (o, local, source("waiting", None, 50)),
+    ] {
+        api.set_metanode(Addr::new(store, node), Some("list"), Some(&src)).await.unwrap();
+    }
+    let t = Addr::new(p, target);
+    let names = |found: Vec<pimble_api::ShownIn>| found.iter().map(|f| f.metanode.node).collect::<Vec<_>>();
+    assert_eq!(names(api.shown_in(t).await.unwrap()), vec![everywhere, waiting], "by name; not Done, Cut off or Only here");
+    assert_eq!(names(api.shown_in(t).await.unwrap()), vec![everywhere, waiting], "asked again, the same (from what was kept)");
+    assert!(api.shown_in(Addr::new(p, plain)).await.unwrap().is_empty());
+
+    // A change to the node: what finds it follows.
+    api.edit(t, |doc, at| doc.set_tags(&["done".to_string()], at)).await.unwrap();
+    assert_eq!(names(api.shown_in(t).await.unwrap()), vec![done]);
+    // A change to a Metanode elsewhere, made by another client.
+    s.service
+        .edit_node(o, local, "elsewhere", |doc, at| doc.set_metanode_source(Some(&source("done", Some(Within::Store(p)), 50)), at))
+        .await
+        .unwrap();
+    heard(&api, local).await;
+    assert_eq!(names(api.shown_in(t).await.unwrap()), vec![done, local]);
+
+    // Links here: from the index, which takes a moment.
+    let mut links = Vec::new();
+    for _ in 0..60 {
+        links = api.backlinks(t).await.unwrap().into_iter().map(|l| l.addr.node).collect::<Vec<_>>();
+        if !links.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(links, vec![linker], "the deleted linker is left out");
+    assert!(api.backlinks(Addr::new(p, plain)).await.unwrap().is_empty());
+    assert!(api.rows_pointing_here(t).await.unwrap().is_empty(), "no table links to it");
 }

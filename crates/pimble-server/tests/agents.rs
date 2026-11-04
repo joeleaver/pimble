@@ -176,3 +176,38 @@ async fn grants_must_name_what_is_here() {
     assert!(f.service.create_agent("  ", vec![]).await.is_err(), "an agent has a name");
     assert!(f.service.list_agents().await.unwrap().is_empty(), "nothing was made");
 }
+
+/// `backlinks` (docs/PROPERTIES_CONTRACT.md section 5, "Links here"): the
+/// nodes whose text links to a node, from the index, filtered to what the
+/// caller may read; a node the caller cannot reach is refused.
+#[tokio::test]
+async fn backlinks_answer_what_the_caller_may_read() {
+    let f = fixture().await;
+    let link = pimble_core::PimbleUrl::node(f.store, f.drafts).to_string();
+    for node in [f.project, f.journal] {
+        let text = format!("See [the drafts]({link})");
+        f.service.edit_node(f.store, node, "test", |doc, _| doc.append_markdown(&text).map(|_| ())).await.unwrap();
+    }
+    let mut linking = Vec::new();
+    for _ in 0..50 {
+        linking = f.service.backlinks(f.store, f.drafts).await.unwrap();
+        if linking.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    linking.sort_by_key(|n| n.0);
+    let mut want = vec![f.project, f.journal];
+    want.sort_by_key(|n| n.0);
+    assert_eq!(linking, want, "the person sees every linking node");
+    assert!(f.service.backlinks(f.store, f.journal).await.unwrap().is_empty());
+
+    let created = f
+        .service
+        .create_agent("Claude Desktop", vec![AgentGrant { store: f.store, node: Some(f.project), role: AgentRole::Reader }])
+        .await
+        .unwrap();
+    let agent = connect_agent(&f.server, &created.key).await;
+    assert_eq!(agent.backlinks(f.store, f.drafts).await.unwrap(), vec![f.project], "never the journal it cannot read");
+    assert!(agent.backlinks(f.store, f.journal).await.is_err(), "a node outside its grants is refused");
+}

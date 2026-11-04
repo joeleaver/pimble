@@ -3,7 +3,7 @@
 Status: drafted 2026-11-04 from Joe's request ("should we have a dedicated pane, maybe a
 side panel, for editing key/value pairs and tags?"), with his decisions (section 1).
 The decisions of section 7 taken as recommended ("looks good", 2026-11-04). Waves 1 and 2
-built 2026-11-04 (section 8); waves 3 and 4 not started.
+built 2026-11-04 (section 8), wave 3 the same day (section 9); wave 4 not started.
 
 ## 1. What Joe decided (2026-11-04)
 
@@ -164,3 +164,95 @@ the explorer's found rows, so it is missing after a restart (the restored pane h
 yet) and stays after the node stops being found until the pane opens something else.
 Ancestors renamed elsewhere show their new name only when the panel asks again. Waves 3
 (Shown in, Links here, Rows pointing here) and 4 (the full check matrix) remain.
+
+## 9. Built: wave 3 (2026-11-04)
+
+**What and where.**
+
+- **API** (`crates/pimble-api/src/references.rs`): `Pimble::shown_in(addr)` answers the
+  query Metanodes that find a node: every listed store's query Metanodes (found by a walk),
+  those whose match looks where the node lives (its own store, `within` that store, `under`
+  a node of it, or everywhere), whose conditions hold for the node (`Matcher`, cheap), and
+  whose evaluation (`Pimble::metanode_source`, so the limit, the order and the exclusions
+  count exactly as in the explorer) has it as a found entry; by name. A node that is a
+  Metanode's own child is not "shown in" it (that is where it lives). `Pimble::backlinks(addr)`
+  asks the backend (`Backend::backlinks`, below) and reads each linker as held.
+  `Pimble::rows_pointing_here(addr)` answers `RowsHere { at, node, path, table,
+  table_name, rows: (id, first column's value) }` per table, in the order the MCP's walk
+  had them (stores as listed, `Pimble::walk` through mounts, tables in their node's order).
+- **Cache**: a held store now has a `generation` (`held.rs`), a fresh value from a global
+  counter whenever what is held there changes (a merge or a document taken that changed
+  something, a document adopted, the subscription lost), so a store forgotten and held
+  again never repeats one. A walk's findings (`Scan`: Metanodes and link-column tables) are
+  kept per store, and each Metanode's forest per Metanode, with the generations of every
+  store they read; they are reused while all are the same and only when every one is held
+  whole and live, and not kept when the walk itself moved its store's generation (the first
+  walk holds the store). Nothing is kept for a store whose backend holds its documents
+  (the browser's encrypted stores). `Pimble::walk` no longer holds such a store (it read
+  it through the backend anyway).
+- **`backlinks` RPC** (`pimble-rpc` `BacklinksRequest { store_id, node_id }` /
+  `BacklinksResponse { nodes }`, `PimbleClient::backlinks`, `RpcHandler::backlinks`):
+  Read, `authorize` and `reject_if_vault` as every store read, the target refused outside a
+  scoped principal's reach (as `getNode`), then `pimble_search::Index::backlinks` judged per
+  document as it is now: in reach, not under an ended share, live, not an attachment, and
+  its text (`NodeDoc::links`: content links and canvas cards) naming the node. The index
+  also links a table's link cells, which are "Rows pointing here", so those are dropped.
+  `Backend::backlinks` has a default "not known here" answer; `RpcBackend` calls the RPC,
+  `Router` asks the backend serving the store (nothing while its owner is away), the web's
+  `VaultBackend` answers from the documents the vault holds
+  (`VaultClient::backlinks`, `pimble_api::references::backlinks_among`).
+- **MCP**: `rows_pointing_here` takes its tables from `Pimble::rows_pointing_here` and
+  renders each as before; its answer is unchanged.
+- **App**: `BackendCommand::GetReferences` answers `ReferencesLoaded { references }`
+  (`properties::References`: `shown_in`, `links_here`, `rows_here` grouped by table, and
+  `not_known`, the sentence of a part that could not be read). The panel asks when it opens
+  or shows another node, and again when changes rest: every `RemoteStoreChange` (any store,
+  anyone's, before the echo skip) calls `properties::store_changed`, which asks 800 ms after
+  the last change and once more 2.5 s after that (a server's index takes in text 2 s after
+  it rests, so a link just typed elsewhere shows). Nothing is asked while the panel is
+  closed. Three sections under "Lives in": "Shown in", "Links here" (each a link per node,
+  opening it in the focused pane) and "Rows pointing here" (per table "Costs in Ledger",
+  opening the node the table is in, with the rows by their first column's value, "Fuel,
+  Tolls, Parking", eight at most and then a count). Each is one line ("Shown in None";
+  "…" until the first answer) when empty. "Created ... · Changed ..." moved to its own
+  section at the end, as section 5 orders them. Read-only nodes show them alike. Each link
+  is a flex box (`.pimble-properties__ref`): an inline span is not hit by a click in rinch.
+  Routed in the browser by `vault::store_id_of`; a read, so not gated.
+
+**Tests**: `pimble-api` `tests/api.rs` `what_points_at_a_node` (a Metanode here, one in
+another store looking everywhere, one cut off by its limit, one whose condition does not
+hold, one looking in its own other store; the same answer asked again; the node's tags
+changed by this client and another Metanode changed by another client, both followed;
+"Links here" from the index with a deleted linker left out); `pimble-server`
+`tests/agents.rs` `backlinks_answer_what_the_caller_may_read` (the person sees both
+linkers, an agent granted one subtree sees only its own, a node outside its grant is
+refused); `pimble-mcp` `rows_pointing_here_lists_the_rows_that_choose_a_node` (the tool's
+answer, the API's groups and row labels, a table's link cell not in "Links here" while a
+text link is); `pimble-app` `properties::tests::a_group_of_rows_says_its_table_and_rows`.
+`pimble-api` all pass, `pimble-mcp` 33 pass, `pimble-app --lib` 217 pass, `pimble-server
+--test agents` 4 pass; the web build compiles (`wasm32`, only the pre-existing warnings).
+
+**Checked in the release desktop app** (scratch environment, port 7473, a scratch agent's
+`pimble-mcp` writing): with "Waiting" (tagged waiting, not tagged done) open, its own
+panel said "Shown in None", "Links here None", "Rows pointing here None". The agent
+appended a link to Bravo in Charlie and made a sheet "Ledger" whose table "Costs" chose
+Bravo in two rows; opening Bravo showed "Shown in: Waiting", "Links here: Charlie", "Rows
+pointing here: Costs in Ledger / Fuel, Tolls". With the panel left open, the agent tagged
+Bravo done, added a row "Parking" and appended a link in Delta: "Shown in" went to None and
+the rows to "Fuel, Tolls, Parking" within a second, but Delta was missing from "Links
+here" (the panel asked before the index had it; that is why the second ask 2.5 s later was
+added, and after it a link appended in Echo and the tag removed showed "Charlie, Delta,
+Echo links Bravo too." and "Waiting" again without a click). Clicking "Waiting" opened the
+Metanode, "Costs in Ledger" the sheet, "Charlie" the note. A first cut of the rows had the
+links as inline spans and a click on one did nothing; they are flex boxes now. No errors
+in the log.
+
+**Not done / not checked**: a link from another store is not in "Links here" (an index is
+per store and keeps only links into its own store; the vault's answer keeps to the same
+rule). The browser was compiled, not driven; the read-only face and a node through a mount were not
+seen (wave 4's matrix). A store reached only through a mount whose source is not held
+whole is walked again at every ask (nothing kept). Typing in a note re-asks once its
+changes rest, and the walk runs again because the store's generation moved; on a large
+store that is one walk per rest, on the backend's thread. A row's label is its first
+column's stored value (a number as typed in its plain form, a link cell or a formula
+column says nothing and the row is counted).

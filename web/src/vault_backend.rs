@@ -228,6 +228,11 @@ impl Backend for VaultBackend {
         Ok(self.lock().await.search(query, &stores, limit))
     }
 
+    /// From the documents this page holds: no index anywhere.
+    async fn backlinks(&self, store: StoreId, node: NodeId) -> Result<Vec<NodeId>, ApiError> {
+        Ok(self.lock().await.backlinks(store, node))
+    }
+
     async fn put_blob(&self, _store: StoreId, _node: NodeId, _mime: &str, _bytes: &[u8]) -> Result<BlobUrl, ApiError> {
         Err(ApiError::not_available(pimble_app::pictures::ENCRYPTED_IN_BROWSER))
     }

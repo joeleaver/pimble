@@ -170,6 +170,11 @@ impl Backend for RpcBackend {
         c.search(query, stores, semantic, limit).await.map_err(|e| err(&c, e))
     }
 
+    async fn backlinks(&self, store: StoreId, node: NodeId) -> Result<Vec<NodeId>, ApiError> {
+        let c = self.client().await?;
+        c.backlinks(store, node).await.map_err(|e| err(&c, e))
+    }
+
     async fn put_blob(&self, store: StoreId, node: NodeId, mime: &str, bytes: &[u8]) -> Result<BlobUrl, ApiError> {
         let c = self.client().await?;
         c.put_blob(store, node, mime, bytes).await.map_err(|e| err(&c, e))

@@ -24,7 +24,7 @@ use pimble_rpc::{
     ListDeletedRequest, ResolveLinkRequest, ListRemoteStoresRequest, MoveNodeRequest, MoveNodeResponse, MoveNodesRequest, MoveNodesResponse, NodeContentChangedNotification, NodeStateVector,
     TransplantNodeRequest, TransplantNodeResponse,
     OpenStoreRequest, PimbleApiClient, RebuildIndexRequest, RemoveReplicaRequest,
-    SearchRequest, SearchResultItem, StoreChangedNotification, SyncNodesRequest, UndeleteNodeRequest,
+    BacklinksRequest, SearchRequest, SearchResultItem, StoreChangedNotification, SyncNodesRequest, UndeleteNodeRequest,
     VaultAppendRequest, VaultDocId,
     VaultDocInfo, VaultFetchRequest, VaultFetchResponse, VaultListDocsRequest, VaultListDocsResponse,
     VaultSnapshotRequest, MAX_SYNC_NODE_CONTENTS,
@@ -1115,6 +1115,15 @@ impl PimbleClient {
             .map_err(rpc_error)?;
 
         Ok(response.results)
+    }
+
+    /// The nodes of `store_id` whose text links to `node_id` (`backlinks`).
+    pub async fn backlinks(&self, store_id: StoreId, node_id: NodeId) -> Result<Vec<NodeId>> {
+        self.client
+            .backlinks(BacklinksRequest { store_id, node_id })
+            .await
+            .map(|answer| answer.nodes)
+            .map_err(rpc_error)
     }
 
     /// Rebuild a store's search index from scratch: delete the on-disk

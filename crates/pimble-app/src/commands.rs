@@ -494,6 +494,35 @@ pub async fn api_command(ctx: &Context<'_>, cmd: BackendCommand) -> Result<Optio
             Some(BackendEvent::PropertiesLoaded { store_id, node_id, lives_in, store_tags })
         }
 
+        C::GetReferences { store_id, node_id } => {
+            use crate::properties::{Mention, References, RowsMention};
+            let addr = Addr::new(store_id, node_id);
+            let mut references = References::default();
+            let mention = |addr: Addr, node: &pimble_core::Node| Mention { store_id: addr.store, node_id: addr.node, label: crate::state::display_label_from_node(node) };
+            match api.shown_in(addr).await {
+                Ok(found) => references.shown_in = found.iter().map(|s| mention(s.metanode, &s.node)).collect(),
+                Err(e) => references.not_known.push(error_message(&e)),
+            }
+            match api.backlinks(addr).await {
+                Ok(links) => references.links_here = links.iter().map(|l| mention(l.addr, &l.node)).collect(),
+                Err(e) => references.not_known.push(error_message(&e)),
+            }
+            match api.rows_pointing_here(addr).await {
+                Ok(groups) => {
+                    references.rows_here = groups
+                        .iter()
+                        .map(|g| RowsMention {
+                            at: mention(g.at, &g.node),
+                            table_name: g.table_name.clone(),
+                            rows: g.rows.iter().map(|(_, label)| label.clone()).collect(),
+                        })
+                        .collect()
+                }
+                Err(e) => references.not_known.push(error_message(&e)),
+            }
+            Some(BackendEvent::ReferencesLoaded { store_id, node_id, references })
+        }
+
         C::ResolveLink { url, hops } => match api.backend().resolve_link(url.store, url.node).await {
             Ok(resolution) => Some(BackendEvent::LinkResolved { url, hops, resolution }),
             Err(e) => failed(e),

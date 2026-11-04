@@ -185,6 +185,14 @@ pub trait Backend: MaybeSend + MaybeSync {
         Err(ApiError::not_available("Listing a store's discussions is not available here."))
     }
     async fn search(&self, query: &str, stores: Vec<StoreId>, semantic: bool, limit: usize) -> Result<Vec<SearchResultItem>, ApiError>;
+
+    /// The live nodes of `store` whose text links to `node` there (its
+    /// content's `pimble:` links and its canvases' node cards, never a
+    /// table's link cells), as far as this principal may read them
+    /// (docs/PROPERTIES_CONTRACT.md section 5, "Links here").
+    async fn backlinks(&self, _store: StoreId, _node: NodeId) -> Result<Vec<NodeId>, ApiError> {
+        Err(ApiError::not_available("What links to a node is not known here."))
+    }
     async fn put_blob(&self, store: StoreId, node: NodeId, mime: &str, bytes: &[u8]) -> Result<BlobUrl, ApiError>;
     async fn get_blob(&self, store: StoreId, blob: BlobId) -> Result<(String, Vec<u8>), ApiError>;
     async fn publish_presence(&self, frame: PresenceFrame, client_id: &str) -> Result<(), ApiError>;
@@ -310,6 +318,10 @@ impl<B: Backend + ?Sized> Backend for std::sync::Arc<B> {
 
     async fn search(&self, query: &str, stores: Vec<StoreId>, semantic: bool, limit: usize) -> Result<Vec<SearchResultItem>, ApiError> {
         (**self).search(query, stores, semantic, limit).await
+    }
+
+    async fn backlinks(&self, store: StoreId, node: NodeId) -> Result<Vec<NodeId>, ApiError> {
+        (**self).backlinks(store, node).await
     }
 
     async fn put_blob(&self, store: StoreId, node: NodeId, mime: &str, bytes: &[u8]) -> Result<BlobUrl, ApiError> {

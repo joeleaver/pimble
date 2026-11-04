@@ -176,6 +176,11 @@ pub enum BackendCommand {
     /// (docs/PROPERTIES_CONTRACT.md sections 4 and 5): where it lives and the
     /// tags its store uses. Answers `PropertiesLoaded`.
     GetProperties { store_id: StoreId, node_id: NodeId },
+    /// What points at a node, for the Properties panel's last sections
+    /// (docs/PROPERTIES_CONTRACT.md section 5, wave 3): the Metanodes whose
+    /// queries find it, the nodes whose text links to it, the table rows
+    /// whose link columns choose it. Answers `ReferencesLoaded`.
+    GetReferences { store_id: StoreId, node_id: NodeId },
 
     /// Parse picked files and write what they hold under `parent_id` (the
     /// store's root when `None`) as new nodes, through the same commands the
@@ -554,6 +559,10 @@ pub enum BackendEvent {
     /// first, each with the label its row shows (empty for a store's root,
     /// or when the chain could not be read), and the tags used in the store.
     PropertiesLoaded { store_id: StoreId, node_id: NodeId, lives_in: Vec<(NodeId, String)>, store_tags: Vec<String> },
+    /// Answer to `GetReferences`. A part that could not be read is empty,
+    /// with `not_known` saying which and why ("What links to a node is not
+    /// known here.").
+    ReferencesLoaded { store_id: StoreId, node_id: NodeId, references: crate::properties::References },
 
     // Mount events
     MountCreated {

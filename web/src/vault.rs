@@ -2273,6 +2273,20 @@ impl VaultClient {
     /// the router's to send to their own server (`pimble_api::Router`'s
     /// `search`); an encrypted store not open here (its key or its owner's
     /// computer is still to come) has nothing anywhere to search.
+    /// The nodes of `store_id` whose text links to `node_id`, from the
+    /// documents this page holds (there is no index for an encrypted store
+    /// anywhere): what the Properties panel's "Links here" lists
+    /// (docs/PROPERTIES_CONTRACT.md section 5).
+    pub fn backlinks(&self, store_id: StoreId, node_id: NodeId) -> Vec<NodeId> {
+        if !self.owns(store_id) {
+            return Vec::new();
+        }
+        let Some(store) = self.stores.get(&store_id) else { return Vec::new() };
+        let ids = store.tree.list_node_ids();
+        let docs = ids.iter().filter_map(|id| store.tree.doc(*id).map(|doc| (*id, doc)));
+        pimble_api::references::backlinks_among(pimble_api::Addr::new(store_id, node_id), docs)
+    }
+
     pub fn search(&self, query: &str, stores: &[StoreId], limit: usize) -> Vec<SearchResultItem> {
         let needle = query.trim().to_lowercase();
         if needle.is_empty() {
@@ -3275,6 +3289,7 @@ pub fn store_id_of(cmd: &BackendCommand) -> Option<StoreId> {
         | ListDeleted { store_id }
         | GetAncestors { store_id, .. }
         | GetProperties { store_id, .. }
+        | GetReferences { store_id, .. }
         | CreateMount { store_id, .. }
         | GetMountState { store_id, .. }
         | BroadcastChanges { store_id, .. }
