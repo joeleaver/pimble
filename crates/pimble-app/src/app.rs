@@ -2051,16 +2051,20 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         ContextMenuTarget { {wrapper} }
                         ContextMenuDropdown {
                             {menu_note}
-                            for item in crate::creating::kinds(store) {
-                                DropdownMenuItem {
-                                    key: item.label.clone(),
-                                    left_section: item.icon,
-                                    disabled: store_menu.new_node,
-                                    onclick: {
-                                        let (nv, kind) = (nv_new.clone(), item.kind.clone());
-                                        move || crate::creating::make_in_row(store, &kind, &nv)
-                                    },
-                                    {format!("New {}", item.label)}
+                            DropdownMenuSub {
+                                label: "New",
+                                left_section: TablerIcon::Plus,
+                                disabled: store_menu.new_node,
+                                for item in crate::creating::kinds(store) {
+                                    DropdownMenuItem {
+                                        key: item.label.clone(),
+                                        left_section: item.icon,
+                                        onclick: {
+                                            let (nv, kind) = (nv_new.clone(), item.kind.clone());
+                                            move || crate::creating::make_in_row(store, &kind, &nv)
+                                        },
+                                        {item.label.clone()}
+                                    }
                                 }
                             }
                             DropdownMenuDivider {}
@@ -2085,57 +2089,70 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 }
                             }
                             // How the store reaches other places: only what
-                            // can apply to it now (principle 2).
-                            if CAN_ADMINISTER_STORES && !store_menu.link_to_remote {
-                                DropdownMenuItem {
+                            // can apply to it now (principle 2), in one
+                            // submenu, left out when nothing applies.
+                            if CAN_ADMINISTER_STORES && !(store_menu.link_to_remote && store_menu.host && store_menu.stop_relaying && store_menu.unlink && store_menu.remove_replica) {
+                                DropdownMenuSub {
+                                    label: "Sync",
                                     left_section: TablerIcon::Cloud,
-                                    onclick: on_link_to_remote.clone(),
-                                    "Link to Remote..."
+                                    if !store_menu.link_to_remote {
+                                        DropdownMenuItem {
+                                            left_section: TablerIcon::Cloud,
+                                            onclick: on_link_to_remote.clone(),
+                                            "Link to Remote..."
+                                        }
+                                    }
+                                    if !store_menu.host {
+                                        DropdownMenuItem {
+                                            left_section: TablerIcon::CloudUpload,
+                                            onclick: on_host_on_cloud.clone(),
+                                            "Host on Pimble Cloud..."
+                                        }
+                                    }
+                                    if !store_menu.stop_relaying {
+                                        DropdownMenuItem {
+                                            left_section: TablerIcon::ShareOff,
+                                            onclick: on_stop_relaying.clone(),
+                                            "Stop Sharing from This Computer..."
+                                        }
+                                    }
+                                    if !store_menu.unlink {
+                                        DropdownMenuItem {
+                                            left_section: TablerIcon::Unlink,
+                                            onclick: on_unlink_from_remote.clone(),
+                                            "Unlink from Remote"
+                                        }
+                                    }
+                                    if !store_menu.remove_replica {
+                                        DropdownMenuItem {
+                                            left_section: TablerIcon::Trash,
+                                            onclick: on_remove_replica.clone(),
+                                            "Remove Replica..."
+                                        }
+                                    }
                                 }
                             }
-                            if CAN_ADMINISTER_STORES && !store_menu.host {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::CloudUpload,
-                                    onclick: on_host_on_cloud.clone(),
-                                    "Host on Pimble Cloud..."
+                            if mounts_apply || CAN_ADMINISTER_STORES {
+                            DropdownMenuSub {
+                                label: "Mount",
+                                left_section: TablerIcon::Link,
+                                if mounts_apply {
+                                    DropdownMenuItem {
+                                        left_section: TablerIcon::Link,
+                                        disabled: store_menu.mount_store,
+                                        onclick: on_mount_store.clone(),
+                                        "Mount Store Here..."
+                                    }
+                                }
+                                if CAN_ADMINISTER_STORES {
+                                    DropdownMenuItem {
+                                        left_section: TablerIcon::CloudDownload,
+                                        disabled: store_menu.mount_remote_store,
+                                        onclick: on_mount_remote_store.clone(),
+                                        "Mount Remote Store Here..."
+                                    }
                                 }
                             }
-                            if CAN_ADMINISTER_STORES && !store_menu.stop_relaying {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::ShareOff,
-                                    onclick: on_stop_relaying.clone(),
-                                    "Stop Sharing from This Computer..."
-                                }
-                            }
-                            if CAN_ADMINISTER_STORES && !store_menu.unlink {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::Unlink,
-                                    onclick: on_unlink_from_remote.clone(),
-                                    "Unlink from Remote"
-                                }
-                            }
-                            if CAN_ADMINISTER_STORES && !store_menu.remove_replica {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::Trash,
-                                    onclick: on_remove_replica.clone(),
-                                    "Remove Replica..."
-                                }
-                            }
-                            if mounts_apply {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::Link,
-                                    disabled: store_menu.mount_store,
-                                    onclick: on_mount_store.clone(),
-                                    "Mount Store Here..."
-                                }
-                            }
-                            if CAN_ADMINISTER_STORES {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::CloudDownload,
-                                    disabled: store_menu.mount_remote_store,
-                                    onclick: on_mount_remote_store.clone(),
-                                    "Mount Remote Store Here..."
-                                }
                             }
                             DropdownMenuDivider {}
                             DropdownMenuItem {
@@ -2169,16 +2186,20 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                         ContextMenuTarget { {wrapper} }
                         ContextMenuDropdown {
                             {mount_menu_note}
-                            for item in crate::creating::kinds(store) {
-                                DropdownMenuItem {
-                                    key: item.label.clone(),
-                                    left_section: item.icon,
-                                    disabled: !can_write_mount_source,
-                                    onclick: {
-                                        let (nv, kind) = (nv_new.clone(), item.kind.clone());
-                                        move || crate::creating::make_in_row(store, &kind, &nv)
-                                    },
-                                    {format!("New {}", item.label)}
+                            DropdownMenuSub {
+                                label: "New",
+                                left_section: TablerIcon::Plus,
+                                disabled: !can_write_mount_source,
+                                for item in crate::creating::kinds(store) {
+                                    DropdownMenuItem {
+                                        key: item.label.clone(),
+                                        left_section: item.icon,
+                                        onclick: {
+                                            let (nv, kind) = (nv_new.clone(), item.kind.clone());
+                                            move || crate::creating::make_in_row(store, &kind, &nv)
+                                        },
+                                        {item.label.clone()}
+                                    }
                                 }
                             }
                             DropdownMenuDivider {}
@@ -2234,16 +2255,20 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 onclick: on_open_in_split.clone(),
                                 "Open in Split View"
                             }
-                            for item in crate::creating::kinds(store) {
-                                DropdownMenuItem {
-                                    key: item.label.clone(),
-                                    left_section: item.icon,
-                                    disabled: !can_write_tree,
-                                    onclick: {
-                                        let (nv, kind) = (nv_new.clone(), item.kind.clone());
-                                        move || crate::creating::make_in_row(store, &kind, &nv)
-                                    },
-                                    {format!("New {}", item.label)}
+                            DropdownMenuSub {
+                                label: "New",
+                                left_section: TablerIcon::Plus,
+                                disabled: !can_write_tree,
+                                for item in crate::creating::kinds(store) {
+                                    DropdownMenuItem {
+                                        key: item.label.clone(),
+                                        left_section: item.icon,
+                                        onclick: {
+                                            let (nv, kind) = (nv_new.clone(), item.kind.clone());
+                                            move || crate::creating::make_in_row(store, &kind, &nv)
+                                        },
+                                        {item.label.clone()}
+                                    }
                                 }
                             }
                             DropdownMenuItem {
@@ -2284,20 +2309,25 @@ pub fn build_view() -> (AppStore, impl FnOnce(&mut RenderScope) -> NodeHandle) {
                                 onclick: on_paste.clone(),
                                 "Paste"
                             }
-                            if mounts_apply {
-                                DropdownMenuItem {
+                            if mounts_apply || CAN_ADMINISTER_STORES {
+                                DropdownMenuSub {
+                                    label: "Mount",
                                     left_section: TablerIcon::Link,
                                     disabled: !can_write_tree || !found_allows(Fra::PasteInto),
-                                    onclick: on_mount_store.clone(),
-                                    "Mount Store Here..."
-                                }
-                            }
-                            if CAN_ADMINISTER_STORES {
-                                DropdownMenuItem {
-                                    left_section: TablerIcon::CloudDownload,
-                                    disabled: !can_write_tree || !found_allows(Fra::PasteInto),
-                                    onclick: on_mount_remote_store.clone(),
-                                    "Mount Remote Store Here..."
+                                    if mounts_apply {
+                                        DropdownMenuItem {
+                                            left_section: TablerIcon::Link,
+                                            onclick: on_mount_store.clone(),
+                                            "Mount Store Here..."
+                                        }
+                                    }
+                                    if CAN_ADMINISTER_STORES {
+                                        DropdownMenuItem {
+                                            left_section: TablerIcon::CloudDownload,
+                                            onclick: on_mount_remote_store.clone(),
+                                            "Mount Remote Store Here..."
+                                        }
+                                    }
                                 }
                             }
                             if CAN_ADMINISTER_STORES {

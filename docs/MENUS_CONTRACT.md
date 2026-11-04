@@ -205,3 +205,16 @@ New gains **Metanode** after Discussion (`creating::Kind::Metanode`; docs/QUERY_
 is named "Metanode" in place and opens its setup in the pane. On a row a query metanode
 found, the menu's top line says why it is shown there and where it lives, and Cut, Paste,
 Mount Store Here..., Mount Remote Store Here... and Delete are greyed.
+
+## 10. Built: wave 2, submenus (2026-11-04, rinch main `c69c65ec`, #2214)
+
+rinch's `DropdownMenuSub` (cascading submenus in dropdown and context menus, Chromium's
+timing) arrived; the row menus fold as section 3 shows: a node's menu is Open in Split
+View, New ▸ (every kind from `crate::creating`), Discuss, Rename, Appearance..., Cut,
+Copy, Paste, Mount ▸ (Mount Store Here..., Mount Remote Store Here...), Share..., Delete:
+12 lines. A store's is New ▸, Copy, Paste, Share..., Sync ▸ (only the items that apply;
+the submenu is left out when none do), Mount ▸, Appearance..., Recently Deleted..., Close
+Store: 10 lines. A mount row's New is New ▸. Checked in the release desktop app: both
+menus, New ▸ and Sync ▸ opening on hover. All three locks pin rinch `c69c65ec`; the
+plugins, pimble-plugin-host's tests (kanban included), pimble-app's 216 tests and the web
+check pass on it.
