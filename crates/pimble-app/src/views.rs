@@ -80,6 +80,11 @@ pub(crate) struct Views {
     places: HashMap<String, TextPlace>,
     #[serde(default)]
     boards: HashMap<String, Camera>,
+    /// What plugins' viewers keep of how they look on a metanode (a kanban's
+    /// folded lanes and columns), keyed `"<plugin>/<viewer>/<store id>/<node
+    /// id>"`, as each handed it over.
+    #[serde(default)]
+    plugins: HashMap<String, PluginView>,
     /// The last `at` handed out.
     #[serde(default)]
     clock: u64,
@@ -87,6 +92,18 @@ pub(crate) struct Views {
     /// they were left, rather than revealing what a pane shows.
     #[serde(skip)]
     seen_at_start: Vec<String>,
+}
+
+/// A plugin viewer's remembered look on one metanode: its own text.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PluginView {
+    value: String,
+    #[serde(default)]
+    at: u64,
+}
+
+fn plugin_key(plugin: &str, viewer: &str, store_id: StoreId, node_id: NodeId) -> String {
+    format!("{plugin}/{viewer}/{store_id}/{node_id}")
 }
 
 fn key(store_id: StoreId, node_id: NodeId) -> String {
@@ -131,6 +148,16 @@ impl Views {
         place.at = self.tick();
         self.places.insert(key, place);
         bound(&mut self.places, |p| p.at);
+        true
+    }
+
+    fn set_plugin_view(&mut self, key: String, value: String) -> bool {
+        if self.plugins.get(&key).is_some_and(|old| old.value == value) {
+            return false;
+        }
+        let at = self.tick();
+        self.plugins.insert(key, PluginView { value, at });
+        bound(&mut self.plugins, |p| p.at);
         true
     }
 
@@ -241,6 +268,21 @@ pub(crate) fn place(store_id: StoreId, node_id: NodeId) -> Option<TextPlace> {
 /// remembered before (the text was not on screen to say).
 pub(crate) fn set_place(store_id: StoreId, node_id: NodeId, place: TextPlace) {
     if with(|v| v.set_place(key(store_id, node_id), place)) {
+        changed();
+    }
+}
+
+// ── Plugins' viewers ────────────────────────────────────────────────────────
+
+/// What plugin `plugin`'s viewer `viewer` remembered of its look on a
+/// metanode (`pimble_plugin_abi::Props::remembered`).
+pub(crate) fn plugin_view(plugin: &str, viewer: &str, store_id: StoreId, node_id: NodeId) -> Option<String> {
+    with(|v| v.plugins.get(&plugin_key(plugin, viewer, store_id, node_id)).map(|p| p.value.clone()))
+}
+
+/// Remember `value` as that look (`HostRequest::Remember`).
+pub(crate) fn set_plugin_view(plugin: &str, viewer: &str, store_id: StoreId, node_id: NodeId, value: String) {
+    if with(|v| v.set_plugin_view(plugin_key(plugin, viewer, store_id, node_id), value)) {
         changed();
     }
 }

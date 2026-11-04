@@ -157,9 +157,12 @@ pub fn board_of(forest: &Forest, lanes: &[(Addr, Forest)], label: impl Fn(&Node)
 }
 
 /// A column's name as lanes match it: case and spaces do not count.
+pub fn column_key(name: &str) -> String {
+    name.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
 fn same_name(a: &str, b: &str) -> bool {
-    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-    norm(a) == norm(b)
+    column_key(a) == column_key(b)
 }
 
 impl Board {
@@ -195,6 +198,25 @@ impl Board {
             .iter()
             .find(|lane| lane.metanode == parent)
             .or_else(|| self.find_column(parent).map(|(l, _)| &self.lanes[l]))
+    }
+
+    /// Every lane has the same columns in the same order (by name, case and
+    /// spacing ignored): the board draws one header row for all of them.
+    pub fn aligned(&self) -> bool {
+        let keys = |lane: &Lane| lane.columns.iter().map(|c| column_key(&c.label)).collect::<Vec<_>>();
+        match self.lanes.split_first() {
+            None => true,
+            Some((first, rest)) => {
+                let first = keys(first);
+                rest.iter().all(|lane| keys(lane) == first)
+            }
+        }
+    }
+
+    /// The column at place `c` of every lane, top to bottom (an aligned
+    /// board's columns under one header).
+    pub fn across(&self, c: usize) -> Vec<&Column> {
+        self.lanes.iter().filter_map(|lane| lane.columns.get(c)).collect()
     }
 
     /// Every card, in lane, column and card order.
@@ -446,6 +468,17 @@ mod tests {
         // A column steps along its own lane, under the lane's node.
         let c0 = lane.columns[0].addr;
         assert_eq!(step_column(&b, c0, Step::Right), Some(Target { parent: lane.metanode, place: Place::After(lane.columns[1].addr.node) }));
+    }
+
+    #[test]
+    fn a_board_is_aligned_when_every_lane_has_the_same_columns() {
+        let mut b = laned(&[&[1, 0], &[0, 2]]);
+        assert!(b.aligned());
+        let (top, low) = (b.lanes[0].columns[1].addr, b.lanes[1].columns[1].addr);
+        assert_eq!(b.across(1).iter().map(|c| c.addr).collect::<Vec<_>>(), vec![top, low]);
+        b.lanes[1].columns[1].label = "Elsewhere".into();
+        assert!(!b.aligned());
+        assert!(board(&[1]).aligned());
     }
 
     #[test]

@@ -82,6 +82,15 @@ impl Host {
         self.link.request(&HostRequest::Follow { person: person.to_string() });
     }
 
+    /// Remember `value` as how the view looks on its metanode on this device
+    /// (lanes collapsed, columns folded): the next mount reads it back with
+    /// [`Mount::remembered`]. One person's view on one device, never a
+    /// store's data; at most `pimble_plugin_abi::MAX_REMEMBERED` bytes, a
+    /// longer value is not kept.
+    pub fn remember(&self, value: impl Into<String>) {
+        self.link.request(&HostRequest::Remember { value: value.into() });
+    }
+
     /// Who else is in `node`, tracked: read inside a reactive closure, the
     /// view follows as people come and go. Draw each with
     /// `pimble_ui::presence::PersonChip` (or `PersonDot`), as the app does.
@@ -134,6 +143,12 @@ impl Mount {
     /// The metanode's address, when the props name one.
     pub fn metanode(&self) -> Option<Addr> {
         rinch::core::untracked(|| self.props.with(|p| p.metanode.addr()))
+    }
+
+    /// What this device remembered of the view on its metanode when it was
+    /// mounted ([`Host::remember`]).
+    pub fn remembered(&self) -> Option<String> {
+        rinch::core::untracked(|| self.props.with(|p| p.remembered.clone()))
     }
 }
 

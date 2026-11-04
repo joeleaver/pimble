@@ -33,7 +33,7 @@ pub mod api;
 /// anything else is refused at load with [`refusal_for_abi`]'s sentence. Bump it on
 /// any change a plugin built before it would misread: a message's shape, an export,
 /// an import, the meaning of a node id.
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 
 /// The guest node id of the plugin document's `<html>` root. Nothing in the host
 /// stands for it: a plugin renders under its body.
@@ -306,7 +306,15 @@ pub struct Props {
     /// The viewer's shared settings on the node (its `data` under the viewer's
     /// id), as JSON, when it has any.
     pub settings: Option<String>,
+    /// What this device remembers of how the viewer last looked on this
+    /// metanode, as the viewer handed it to [`HostRequest::Remember`]: one
+    /// person's view on one device (lanes collapsed, columns folded), never
+    /// in a store and never synced, like the explorer's expanded rows.
+    pub remembered: Option<String>,
 }
+
+/// The most a viewer may ask the host to remember for one metanode, in bytes.
+pub const MAX_REMEMBERED: usize = 16 * 1024;
 
 /// A node by its store and its id, as text.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -390,6 +398,10 @@ pub enum HostRequest {
     /// Follow the person with this key in the plugin's pane, as a click on
     /// their initials on the pane's strip does.
     Follow { person: String },
+    /// Remember `value` (the viewer's own text, at most [`MAX_REMEMBERED`]
+    /// bytes) as how the viewer looks on its metanode on this device; the
+    /// next mount's [`Props::remembered`]. Not document data.
+    Remember { value: String },
 }
 
 // ── The DOM op log ────────────────────────────────────────────────────────────

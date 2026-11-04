@@ -473,6 +473,15 @@ first plugin.
    drag start marked `data-drag-ghost="false"`; and `dispatch` answers `dispatched` flags
    (`CONSUMED`). Sortable lists added no handler attribute. Every workspace is on rinch main at
    `8421ff53` (the `[patch]` onto #2093's branch is gone).
+   **ABI 5** (2026-11-04, for the kanban's folded lanes and columns): a viewer's look on
+   this device. `Props::remembered` hands a viewer, at mount only, what this device kept
+   for it on that metanode; `HostRequest::Remember { value }` (`Host::remember`, at most
+   `MAX_REMEMBERED`, 16 KiB) keeps it. The app stores it in `views.rs` beside the
+   explorer's expanded rows and the text places (`views.json` on the desktop,
+   `localStorage` in the browser), keyed by plugin, viewer and metanode, under Joe's
+   2026-10-23 rule that how things look is each device's own: never in a store, never
+   synced, never in the personal document. The props kept for comparing are the
+   settings alone, so remembering never sends new props.
 
 ## 5. How it is checked
 

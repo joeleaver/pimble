@@ -76,8 +76,15 @@ fn the_kanban_shows_moves_renames_adds_deletes_and_shows_who_is_there() {
     choose(r, "kanban__card", "Alpha");
     r.pump_until(&f, "the focus", |r| r.requests.borrow().contains(&HostRequest::Focus { node: Some(NodeAddr::from(Addr::new(store, alpha))) }));
 
-    // "Move to ▸ Write it": the bottom of that column.
-    r.click("button", "Write it");
+    // Alt+Shift+Right: into Write it at the same height (its top); then
+    // Alt+Shift+Down below Charlie.
+    assert!(key_on(r, "kanban", alt("ArrowRight")));
+    r.pump_until(&f, "the move across", |_| children(&f, store, f.write) == ["Alpha", "Charlie"]);
+    // The next key acts on the board as it reads: wait for Alpha in Write it.
+    r.pump_until(&f, "the board after the move across", |r| {
+        r.doc.borrow().text_content(cell(r, &key(store, f.write))).unwrap_or_default().contains("Alpha")
+    });
+    assert!(key_on(r, "kanban", alt("ArrowDown")));
     r.pump_until(&f, "the move", |_| children(&f, store, f.write) == ["Charlie", "Alpha"]);
     r.pump_until(&f, "the board after the move", |r| {
         let t = r.text();
@@ -111,7 +118,10 @@ fn the_kanban_shows_moves_renames_adds_deletes_and_shows_who_is_there() {
 
     // "+ Add card": a create under the column, last, then named in place.
     r.pump_until(&f, "the renamed header", |r| r.text().contains("Planning"));
-    let add = r.find(&|d, n| has_class(d, n, "kanban__add-card")).expect("+ Add card");
+    // It shows while the pointer is over the column's cell.
+    fire(r, cell(r, &key(store, f.plan)), "data-onenter");
+    r.pump_until(&f, "Add card on hover", |r| r.find(&|d, n| has_class(d, n, "kanban__add-card")).is_some());
+    let add = r.find(&|d, n| has_class(d, n, "kanban__add-card")).expect("Add card");
     assert!(dispatch_event(EventHandlerId(r.handler(add, "data-rid"))));
     r.pump_until(&f, "the new card", |_| children(&f, store, f.plan).len() == 3);
     r.pump_until(&f, "its name field", |r| r.find(&|d, n| d.tag_name(n).as_deref() == Some("input")).is_some());
@@ -158,23 +168,21 @@ fn the_kanban_shows_moves_renames_adds_deletes_and_shows_who_is_there() {
         (other, mount)
     });
     r.pump_until(&f, "the mounted column", |r| r.text().contains("Home"));
-    choose(r, "kanban__card", "Alpha");
-    r.pump_until(&f, "Alpha's actions", |r| r.find(&|d, n| d.tag_name(n).as_deref() == Some("button") && d.text_content(n).unwrap_or_default().trim() == "Home").is_some());
-    r.click("button", "Home");
+    // Alpha dropped into the mounted column: a move into another store, held
+    // for "Move anyway"; Cancel sends nothing. (A drop into it once its store
+    // is gone is refused at the caret: the drag test.)
+    let card = sortable(r, &key(store, alpha));
+    fire(r, card, "data-ondragstart");
+    let list = under(r, cell(r, &key(store, mount_column)), "kanban__cards").expect("the Home column's cards");
+    over(700.0, 80.0, 650.0, 60.0, 240.0, 28.0);
+    fire(r, list, "data-ondragover");
+    fire(r, list, "data-ondrop");
+    fire(r, card, "data-ondragend");
     r.pump_until(&f, "the warning", |r| r.text().contains("Move anyway"));
     r.click("button", "Cancel");
     r.pump_until(&f, "the warning gone", |r| !r.text().contains("Move anyway"));
     assert_eq!(children(&f, store, f.plan), ["Charlie", "Alpha", "Bravo"]);
-
-    // With that store gone from this computer (closed, and its folder
-    // removed, so the mount cannot open it again), the explorer's refusal,
-    // and nothing sent.
-    f.rt.block_on(f.service.close_store(other)).unwrap();
-    std::fs::remove_dir_all(f.dir.path().join("home.pimble")).unwrap();
-    r.click("button", "Home");
-    r.pump_until(&f, "the refusal", |r| r.text().contains(Refusal::MountNotHere.sentence()));
-    assert_eq!(children(&f, store, f.plan), ["Charlie", "Alpha", "Bravo"]);
-    let _ = mount_column;
+    let _ = other;
 
     r.instance.unmount();
     assert!(r.doc.borrow().get_children(r.container).is_empty());
@@ -197,8 +205,8 @@ fn a_kanban_allowed_only_to_read_is_refused_its_writes() {
     let r = &running;
     r.pump_until(&f, "the board", |r| r.text().contains("Alpha"));
     choose(r, "kanban__card", "Alpha");
-    r.pump_until(&f, "the actions", |r| r.text().contains("Write it"));
-    r.click("button", "Write it");
+    // Alt+Shift+Right: into Write it, which the host refuses.
+    assert!(key_on(r, "kanban", alt("ArrowRight")));
     r.pump_until(&f, "the refusal", |r| r.text().contains("The Kanban plugin was allowed to read this store, not to change it."));
     assert_eq!(children(&f, store, f.plan), ["Alpha"]);
     r.instance.unmount();
@@ -213,6 +221,12 @@ fn key(store: StoreId, node: NodeId) -> String {
 fn sortable(r: &Running, key: &str) -> DomId {
     r.find(&|d, n| d.get_attribute(n, "data-sortable-key").as_deref() == Some(key))
         .unwrap_or_else(|| panic!("no sortable {key} in: {}", r.text()))
+}
+
+/// The cell of the column keyed `key` (its cards, in one lane).
+fn cell(r: &Running, key: &str) -> DomId {
+    r.find(&|d, n| d.get_attribute(n, "data-kanban-column").as_deref() == Some(key))
+        .unwrap_or_else(|| panic!("no column cell {key} in: {}", r.text()))
 }
 
 /// The first element under `node` (or `node`) of class `class`.
@@ -302,10 +316,10 @@ fn cards_and_columns_drag_through_the_host_and_a_refused_drop_says_why() {
     // A column mounted from another store, whose store is then gone from
     // this computer: a card dragged into it is refused at the caret with
     // `plan`'s sentence, and the drop sends nothing.
-    let other = f.rt.block_on(async {
+    let (other, mount) = f.rt.block_on(async {
         let (other, other_root) = f.service.create_store(f.dir.path().join("home.pimble"), "Home").await.unwrap();
-        f.service.create_mount(store, f.board, other, other_root, Some("Home".into())).await.unwrap();
-        other
+        let (mount, _) = f.service.create_mount(store, f.board, other, other_root, Some("Home".into())).await.unwrap();
+        (other, mount)
     });
     r.pump_until(&f, "the mounted column", |r| r.text().contains("Home"));
     f.rt.block_on(f.service.close_store(other)).unwrap();
@@ -316,9 +330,7 @@ fn cards_and_columns_drag_through_the_host_and_a_refused_drop_says_why() {
         let t = r.text();
         t.find("Bravo").unwrap() < t.find("Charlie").unwrap()
     });
-    let home = r
-        .find(&|d, n| has_class(d, n, "kanban__column") && d.text_content(n).unwrap_or_default().contains("Home"))
-        .expect("the Home column");
+    let home = cell(r, &key(store, mount));
     let card = sortable(r, &key(store, charlie));
     fire(r, card, "data-ondragstart");
     let list = under(r, home, "kanban__cards").expect("the Home column's cards");

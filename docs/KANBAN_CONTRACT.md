@@ -298,3 +298,48 @@ buttons go ("we can drag").
   window's ghost and dims the item in place with a caret; the request went to the Rinch
   master session.
 
+## 9. Built: from kobayban (2026-11-04)
+
+Joe asked what the kanban could take from kobayban (`~/dev/kobayban`, the board he uses
+every day) and chose four (2026-11-04): one header row with lane names down the left,
+three lane sizes and folded columns, Done no taller than its row, and "Add card" on hover.
+
+- **One header row.** When every lane has the same columns (by name, case and spacing
+  ignored: `Board::aligned`), the board draws one header row above the lanes, each
+  header counting its cards in every lane, and each lane is a row: its name's cell on the
+  left (on a board with named lanes; the unnamed lane reads "Other cards"), then a cell
+  per column. A header renames its column in every lane (one rename each), and a header
+  dragged or moved with Alt+Shift+Left/Right moves that column in every lane
+  (`columns_everywhere`); "+ Add column" there adds one to every lane. On an aligned
+  board the plain arrows walk a column header first, then its cards lane after lane.
+  Lanes whose columns differ draw their own header rows, as before.
+- **Sizes and folds** are how this person has the board on this device (Joe's 2026-10-23
+  rule: how things look is each client's own), kept through the host
+  (`Host::remember`, plugin ABI 5, `docs/PLUGINS_CONTRACT.md`) in the app's `views.rs`,
+  never in the store: folding a lane for oneself folds it for no one else. A lane is
+  collapsed (one bar with its name and count; a click shows it), minimized (about three
+  cards a column, 220 px, the rest scrolled) or expanded; a board with lanes starts
+  minimized, a board without them is shown whole. The name cell has show all / show
+  about three and collapse; "Expand all" and "Reset lanes" sit above a board with lanes.
+  A column folds by its name (in every lane) to a 44 px strip with its name turned on
+  its side and its count; a click unfolds it.
+- **Done no taller than its row.** The last column's cell (where finished cards pile up,
+  open decision 5) is stretched to the row's tallest cell and its list scrolls inside it
+  (`position: absolute` in a stretched flex cell), so a long Done never makes its lane
+  taller.
+- **Add card on hover**: a small pill at the foot of a column's cell while the pointer is
+  over it (`onmouseenter`/`onmouseleave`, proxied by the host), not a line in every column.
+- A lane's row is drawn from the lane without its columns (rinch's `for` draws a row again
+  when its item changes): its cells follow the board on their own, so an edit to one card
+  redraws only its column's cell, never a card being dragged in another.
+- **Tests:** kanban-viewer 10 (`a_board_is_aligned_when_every_lane_has_the_same_columns`,
+  `the_look_is_remembered_as_json_and_read_back`); pimble-plugin-host kanban 5, updated
+  for the keyboard in place of "Move to", "Add card" on hover, and a drop into a mounted
+  column in place of its button.
+- **Checked in the release desktop app** (port 7473, scratch dirs): the shared header row
+  over "Other cards" and Work; "Add card" on hover; Doing folded to a strip in both lanes;
+  Work collapsed to a bar; both still so after the app restarted; seven cards added to Done
+  from the CLI stayed inside a cell as tall as its row and scrolled there.
+- **Not built:** the milestone party (petals every ten done; plugins cannot animate yet);
+  assignee and tag filters; a folded column takes no drops; the browser was not tried.
+

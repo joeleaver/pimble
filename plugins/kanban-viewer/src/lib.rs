@@ -42,7 +42,9 @@ use pimble_plugin_sdk::pimble_ui::presence::{more_label, PersonChip};
 use pimble_plugin_sdk::prelude::*;
 use rinch::core::dom::NodeId as DomId;
 
-use board::{board_of, drop_of, key_of, step_card, step_column, Board, Lane, Step, Target};
+use std::collections::BTreeMap;
+
+use board::{board_of, column_key, drop_of, key_of, step_card, step_column, Board, Lane, Step, Target};
 
 /// The sortable groups: a drag of one only ever lands in lists of its own,
 /// so a card never lands among the columns or a column among the cards.
@@ -112,6 +114,77 @@ struct Kanban {
     root: Signal<Option<NodeHandle>>,
     /// The name field while one is open.
     field: Signal<Option<NodeHandle>>,
+    /// How the person has the board on this device.
+    look: Signal<Look>,
+    /// The column cell the pointer is over: it offers "Add card".
+    hovered: Signal<Option<Addr>>,
+}
+
+/// How big a lane is drawn (kobayban's three): one bar with its name and
+/// count, about three cards a column with the rest scrolled, or everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Size {
+    Collapsed,
+    Minimized,
+    Expanded,
+}
+
+impl Size {
+    fn name(self) -> &'static str {
+        match self {
+            Size::Collapsed => "collapsed",
+            Size::Minimized => "minimized",
+            Size::Expanded => "expanded",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Size> {
+        match s {
+            "collapsed" => Some(Size::Collapsed),
+            "minimized" => Some(Size::Minimized),
+            "expanded" => Some(Size::Expanded),
+            _ => None,
+        }
+    }
+}
+
+/// How this person has the board on this device: the lanes they sized (by
+/// [`lane_key`]) and the columns they folded (by [`column_key`], so a folded
+/// "Done" is folded in every lane). Kept by the host
+/// (`Host::remember`), never in the store: someone else's board is
+/// not folded because this one is.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Look {
+    lanes: BTreeMap<String, Size>,
+    folded: Vec<String>,
+}
+
+impl Look {
+    fn parse(text: &str) -> Look {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else { return Look::default() };
+        let lanes = value
+            .get("lanes")
+            .and_then(|l| l.as_object())
+            .map(|l| l.iter().filter_map(|(k, v)| Some((k.clone(), Size::parse(v.as_str()?)?))).collect())
+            .unwrap_or_default();
+        let folded = value
+            .get("folded")
+            .and_then(|f| f.as_array())
+            .map(|f| f.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        Look { lanes, folded }
+    }
+
+    fn to_json(&self) -> String {
+        let lanes: serde_json::Map<String, serde_json::Value> = self.lanes.iter().map(|(k, v)| (k.clone(), serde_json::Value::from(v.name()))).collect();
+        serde_json::json!({ "lanes": lanes, "folded": self.folded }).to_string()
+    }
+}
+
+/// A lane's key in the [`Look`]: its node on the board, or "top" for the
+/// unnamed lane.
+fn lane_key(lane: &Lane) -> String {
+    lane.node.map_or_else(|| "top".to_string(), key_of)
 }
 
 fn dom_id(addr: Addr) -> String {
@@ -199,6 +272,64 @@ impl Kanban {
         self.status.set(line.into());
     }
 
+    /// How big `lane` is drawn, tracked: a board with one lane shows it
+    /// whole; with several, each is minimized until the person sizes it.
+    fn size_of(&self, lane: &Lane, lanes: usize) -> Size {
+        if lanes < 2 {
+            return Size::Expanded;
+        }
+        self.look.with(|l| l.lanes.get(&lane_key(lane)).copied()).unwrap_or(Size::Minimized)
+    }
+
+    /// Change how the board looks, and have the host remember it.
+    fn relook(&self, f: impl FnOnce(&mut Look)) {
+        let mut look = untracked(|| self.look.get());
+        f(&mut look);
+        if untracked(|| self.look.get()) != look {
+            self.host.remember(look.to_json());
+            self.look.set(look);
+        }
+    }
+
+    fn set_size(&self, lane: &Lane, size: Size) {
+        let key = lane_key(lane);
+        self.relook(|l| {
+            l.lanes.insert(key, size);
+        });
+    }
+
+    /// Fold or unfold the column named `name`, in every lane.
+    fn toggle_fold(&self, name: &str) {
+        let key = column_key(name);
+        self.relook(|l| match l.folded.iter().position(|f| *f == key) {
+            Some(i) => {
+                l.folded.remove(i);
+            }
+            None => l.folded.push(key),
+        });
+    }
+
+    /// Whether the column named `name` is folded, tracked.
+    fn folded(&self, name: &str) -> bool {
+        let key = column_key(name);
+        self.look.with(|l| l.folded.contains(&key))
+    }
+
+    /// Move the column at place `from` of every lane to place `at` (counted
+    /// without it) of its lane: an aligned board's header moved.
+    fn columns_everywhere(&self, from: usize, at: usize) {
+        let board = untracked(|| self.board.get());
+        for lane in &board.lanes {
+            let Some(column) = lane.columns.get(from) else { continue };
+            let others: Vec<Addr> = lane.columns.iter().map(|c| c.addr).filter(|a| *a != column.addr).collect();
+            let place = match at.checked_sub(1).and_then(|i| others.get(i)) {
+                None => Place::First,
+                Some(before) => Place::After(before.node),
+            };
+            self.move_to(column.addr, Target { parent: lane.metanode, place }, false);
+        }
+    }
+
     /// The one way anything moves on the board: a card to a column or a place
     /// in one, a column along the board. Judged in the metanode first, so a
     /// refusal is the explorer's sentence and nothing is sent; a warning
@@ -276,6 +407,17 @@ impl Kanban {
         let [node] = nodes[..] else { return };
         self.choose(Some(if m.group == COLUMNS { Chosen::Column(node) } else { Chosen::Card(node) }));
         self.take_keyboard();
+        // An aligned board's header moves that column in every lane.
+        let board = untracked(|| self.board.get());
+        if m.group == COLUMNS && board.aligned() && board.lanes.len() > 1 {
+            let Some((0, from)) = board.find_column(node) else { return };
+            let others: Vec<Addr> = board.lanes[0].columns.iter().map(|c| c.addr).filter(|a| *a != node).collect();
+            let at = match target.place {
+                Place::After(after) => others.iter().position(|a| a.node == after).map_or(0, |i| i + 1),
+                _ => 0,
+            };
+            return self.columns_everywhere(from, at);
+        }
         self.move_to(node, target, false);
     }
 
@@ -284,6 +426,18 @@ impl Kanban {
         let board = untracked(|| self.board.get());
         let (node, target) = match untracked(|| self.chosen.get()) {
             Some(Chosen::Card(card)) => (card, step_card(&board, card, step)),
+            Some(Chosen::Column(column)) if board.aligned() && board.lanes.len() > 1 => {
+                let Some((_, c)) = board.find_column(column) else { return };
+                let at = match step {
+                    Step::Left => c.checked_sub(1),
+                    Step::Right => (c + 1 < board.lanes[0].columns.len()).then_some(c + 1),
+                    Step::Up | Step::Down => None,
+                };
+                if let Some(at) = at {
+                    self.columns_everywhere(c, at);
+                }
+                return;
+            }
             Some(Chosen::Column(column)) => (column, step_column(&board, column, step)),
             Some(Chosen::Lane(_)) | None => return,
         };
@@ -311,18 +465,28 @@ impl Kanban {
         if title.is_empty() {
             return;
         }
+        // An aligned board's header renames that column in every lane: one
+        // rename each, as the explorer would make them.
+        let board = untracked(|| self.board.get());
+        let nodes: Vec<Addr> = match board.find_column(addr) {
+            Some((_, c)) if board.aligned() && board.lanes.len() > 1 => board.across(c).iter().map(|col| col.addr).collect(),
+            _ => vec![addr],
+        };
         let k = self.clone();
         spawn_local(async move {
-            let edited = k
-                .api
-                .edit(addr, move |doc, now| -> Result<(), ApiError> {
-                    doc.set_title(&title, now)?;
-                    doc.set_custom(custom_keys::EXPLICIT_TITLE, &serde_json::Value::Bool(true), now)?;
-                    Ok(())
-                })
-                .await;
-            if let Err(e) = edited {
-                k.say(e.sentence());
+            for node in nodes {
+                let title = title.clone();
+                let edited = k
+                    .api
+                    .edit(node, move |doc, now| -> Result<(), ApiError> {
+                        doc.set_title(&title, now)?;
+                        doc.set_custom(custom_keys::EXPLICIT_TITLE, &serde_json::Value::Bool(true), now)?;
+                        Ok(())
+                    })
+                    .await;
+                if let Err(e) = edited {
+                    k.say(e.sentence());
+                }
             }
         });
     }
@@ -348,6 +512,36 @@ impl Kanban {
                     k.start_rename(made, String::new());
                 }
                 Err(e) => k.say(e.sentence()),
+            }
+        });
+    }
+
+    /// "+ Add column" under each of `lanes` (one lane's, or every lane's on a
+    /// shared header), last, then its name typed in place: on a shared header
+    /// the rename names them all, as the lanes still line up.
+    fn add_column(&self, lanes: Vec<Addr>) {
+        let k = self.clone();
+        spawn_local(async move {
+            let mut first = None;
+            for lane in lanes {
+                let made = match pimble_api::recipes::document("", None) {
+                    Ok(init) => k.api.create(lane, Place::Last, init).await,
+                    Err(e) => Err(e),
+                };
+                match made {
+                    Ok(made) => {
+                        first.get_or_insert(made);
+                    }
+                    Err(e) => {
+                        k.say(e.sentence());
+                        break;
+                    }
+                }
+            }
+            if let Some(made) = first {
+                k.say("");
+                k.choose(Some(Chosen::Column(made)));
+                k.start_rename(made, String::new());
             }
         });
     }
@@ -458,6 +652,9 @@ impl Kanban {
 /// above its first card, and past a column's top or bottom into the lined-up
 /// column of the lane above or below.
 fn walk(board: &Board, chosen: Option<Chosen>, step: Step) -> Option<Chosen> {
+    if board.aligned() && board.lanes.len() > 1 {
+        return walk_aligned(board, chosen, step);
+    }
     let top_of = |l: usize, c: usize| {
         let col = &board.lanes[l].columns[c];
         col.cards.first().map_or(Chosen::Column(col.addr), |k| Chosen::Card(k.addr))
@@ -502,19 +699,60 @@ fn walk(board: &Board, chosen: Option<Chosen>, step: Step) -> Option<Chosen> {
     }
 }
 
+/// [`walk`] on an aligned board: a column is its header and then its cards
+/// lane after lane, so the arrows go down a column through every lane.
+fn walk_aligned(board: &Board, chosen: Option<Chosen>, step: Step) -> Option<Chosen> {
+    let header = |c: usize| board.lanes[0].columns.get(c).map(|col| Chosen::Column(col.addr));
+    let down = |c: usize| -> Vec<Chosen> {
+        header(c).into_iter().chain(board.across(c).into_iter().flat_map(|col| col.cards.iter().map(|k| Chosen::Card(k.addr)))).collect()
+    };
+    match chosen {
+        None | Some(Chosen::Lane(_)) => down(0).get(1).or(down(0).first()).copied(),
+        Some(Chosen::Column(column)) => {
+            let (_, c) = board.find_column(column)?;
+            match step {
+                Step::Down => down(c).get(1).copied(),
+                Step::Up => None,
+                Step::Left => header(c.checked_sub(1)?),
+                Step::Right => header(c + 1),
+            }
+        }
+        Some(Chosen::Card(card)) => {
+            let (l, c, i) = board.find_card(card)?;
+            let at = down(c).iter().position(|x| *x == Chosen::Card(card))?;
+            match step {
+                Step::Up => down(c).get(at - 1).copied(),
+                Step::Down => down(c).get(at + 1).copied(),
+                Step::Left | Step::Right => {
+                    let to = if step == Step::Left { c.checked_sub(1)? } else { c + 1 };
+                    let next = board.lanes[l].columns.get(to)?;
+                    Some(next.cards.get(i.min(next.cards.len().saturating_sub(1))).map_or_else(|| header(to).unwrap_or(Chosen::Column(next.addr)), |k| Chosen::Card(k.addr)))
+                }
+            }
+        }
+    }
+}
+
 const BOARD_STYLE: &str = "display: flex; flex-direction: column; gap: 8px; padding: 12px 16px; height: 100%; box-sizing: border-box; outline: none;";
-/// The lanes, top to bottom, scrolled together, so lined-up columns stay
-/// lined up.
-const COLUMNS_STYLE: &str = "display: flex; flex-direction: column; gap: 16px; overflow: auto; flex: 1; min-height: 0; padding-bottom: 12px;";
-const LANE_STYLE: &str = "display: flex; flex-direction: column; gap: 6px; flex-shrink: 0;";
-const LANE_ROW_STYLE: &str = "display: flex; gap: 12px; align-items: flex-start;";
-const LANE_HEADER_STYLE: &str = "display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 14px; padding: 2px 4px; border-radius: 4px; cursor: pointer; max-width: 600px;";
+/// The board's rows (the header row, then a row per lane), scrolled together
+/// so columns stay lined up.
+const GRID_STYLE: &str = "display: flex; flex-direction: column; gap: 10px; overflow: auto; flex: 1; min-height: 0; padding-bottom: 12px;";
+/// A column's width, a folded column's, and the lane names' column.
+const COLUMN_W: u32 = 260;
+const FOLDED_W: u32 = 44;
+const LABEL_W: u32 = 168;
+/// A minimized lane shows about three cards a column (kobayban's cap).
+const MINIMIZED_MAX: u32 = 220;
+const ROW_STYLE: &str = "display: flex; gap: 12px; align-items: stretch; flex-shrink: 0;";
+const HEADER_ROW_STYLE: &str = "display: flex; gap: 12px; align-items: flex-end; flex-shrink: 0;";
 // The sortable lists' layout is written here as well as in rinch's stylesheet,
 // which is the app's: an app on a rinch from before sortable lists still lays
 // the board out (only the caret and the refusal box need its stylesheet).
-const COLUMN_LIST_STYLE: &str = "display: flex; flex-direction: row; gap: 12px; align-items: flex-start; flex-shrink: 0; max-height: 100%; position: relative;";
-const COLUMN_STYLE: &str = "display: flex; flex-direction: column; gap: 6px; width: 260px; flex-shrink: 0; padding: 8px; border-radius: 8px; background: var(--rinch-color-default-hover, rgba(127,127,127,0.08)); max-height: 100%; overflow-y: auto; box-sizing: border-box; position: relative;";
+const COLUMN_LIST_STYLE: &str = "display: flex; flex-direction: row; gap: 12px; align-items: flex-end; flex-shrink: 0; position: relative;";
 const CARD_LIST_STYLE: &str = "display: flex; flex-direction: column; gap: 6px; min-height: 28px; position: relative;";
+const CELL_BG: &str = "background: var(--rinch-color-default-hover, rgba(127,127,127,0.08)); border: 1px solid var(--rinch-color-default-border, rgba(127,127,127,0.25)); border-radius: 8px;";
+const LANE_LABEL_STYLE: &str = "display: flex; flex-direction: column; gap: 4px; padding: 6px 4px; flex-shrink: 0; box-sizing: border-box; min-width: 0;";
+const ICON_BUTTON: &str = "display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 4px; cursor: pointer; color: var(--rinch-color-dimmed);";
 /// The caret and the refusal box in the app's own theme colors, through the
 /// properties rinch's sortable stylesheet reads (a plugin cannot add a
 /// stylesheet; custom properties set inline here are inherited by the boxes
@@ -528,7 +766,6 @@ fn lift_keys() -> Vec<String> {
 }
 const HEADER_STYLE: &str = "display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 13px; padding: 2px 4px; border-radius: 4px; cursor: pointer;";
 const FIELD_STYLE: &str = "width: 100%; box-sizing: border-box; font: inherit; padding: 2px 4px;";
-const ADD_STYLE: &str = "font-size: 12px; color: var(--rinch-color-dimmed); padding: 4px; cursor: pointer; border-radius: 4px;";
 const LINE_STYLE: &str = "font-size: 12px; color: var(--rinch-color-dimmed);";
 
 /// A card's style: chosen or not, its row color, and the color of the person
@@ -561,6 +798,8 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
         waiting: Signal::new(None),
         root: Signal::new(None),
         field: Signal::new(None),
+        look: Signal::new(mount.remembered().map(|r| Look::parse(&r)).unwrap_or_default()),
+        hovered: Signal::new(None),
     };
 
     // Read the forest, then keep it live from every change the API hears.
@@ -609,9 +848,10 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
         });
     }
 
-    let (kk, kw1, kw2, ka, kl) = (k.clone(), k.clone(), k.clone(), k.clone(), k.clone());
+    let (kk, kw1, kw2, ka, kl, kt, kx, kh) = (k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone());
     let judge = drop_judge(&k);
-    let (board, status, waiting, loaded, root) = (k.board, k.status, k.waiting, k.loaded, k.root);
+    let (judge_h, judge_l) = (judge.clone(), judge.clone());
+    let (board, status, waiting, loaded, root, look) = (k.board, k.status, k.waiting, k.loaded, k.root, k.look);
     rsx! {
         div {
             class: "kanban",
@@ -640,27 +880,61 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
                     Button { size: "xs", variant: "default", onclick: { let k = kw2.clone(); move || k.waiting.set(None) }, "Cancel" }
                 }
             }
-            if loaded.get() && board.with(|b| b.lanes.iter().all(|l| l.columns.is_empty()) && b.lanes.len() < 2) {
+            // With lanes: every lane shown whole, or each back to its own size.
+            if board.with(|b| b.lanes.len() > 1) {
+                div {
+                    class: "kanban__toolbar",
+                    style: "display: flex; gap: 4px; align-items: center;",
+                    Button {
+                        size: "xs",
+                        variant: "subtle",
+                        onclick: {
+                            let k = kt.clone();
+                            move || {
+                                let lanes = untracked(|| k.board.get()).lanes;
+                                k.relook(|l| {
+                                    for lane in &lanes {
+                                        l.lanes.insert(lane_key(lane), Size::Expanded);
+                                    }
+                                });
+                            }
+                        },
+                        "Expand all"
+                    }
+                    Button {
+                        size: "xs",
+                        variant: "subtle",
+                        onclick: { let k = kx.clone(); move || k.relook(|l| l.lanes.clear()) },
+                        "Reset lanes"
+                    }
+                }
+            }
+            if loaded.get() && board.with(|b| b.lanes.len() < 2 && b.lanes.iter().all(|l| l.columns.is_empty())) {
                 div { style: LINE_STYLE, "This kanban has no columns yet." }
             }
             div {
-                class: "kanban__lanes",
-                style: COLUMNS_STYLE,
-                // Each lane is drawn again when its name or what the person may
-                // do with it changes (a list's props are read when it is drawn);
-                // its columns follow the board on their own.
-                for lane in board.get().lanes {
+                class: "kanban__grid",
+                style: GRID_STYLE,
+                // Lanes with the same columns share one header row.
+                if board.with(|b| b.aligned() && !b.lanes.is_empty()) {
+                    {header_row(__scope, &kh, None, judge_h.clone())}
+                }
+                // A lane is drawn again when its name, its size or what the
+                // person may do with it changes (a list's props are read when
+                // it is drawn); its columns and cards follow the board on their
+                // own.
+                for shown in lanes_shown(board, look, &kl) {
                     div {
-                        key: format!("{:?} {:?} {:?} {}", lane.metanode, lane.label, lane.color, lane.writable),
+                        key: shown.key(),
                         class: "kanban__lane",
-                        style: LANE_STYLE,
-                        {render_lane(__scope, &kl, lane.clone(), judge.clone())}
+                        style: "display: flex; flex-direction: column; flex-shrink: 0;",
+                        {render_lane(__scope, &kl, shown.clone(), judge_l.clone())}
                     }
                 }
                 if board.with(|b| b.writable) {
                     div {
                         class: "kanban__add-lane",
-                        style: "font-size: 13px; color: var(--rinch-color-dimmed); cursor: pointer; padding: 4px;",
+                        style: "font-size: 13px; color: var(--rinch-color-dimmed); cursor: pointer; padding: 4px; flex-shrink: 0;",
                         onclick: { let k = ka.clone(); move || k.add_lane() },
                         "+ Add lane"
                     }
@@ -670,141 +944,156 @@ pub fn view(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
     }
 }
 
-/// A lane's columns as the board has them now, tracked.
-fn lane_columns(board: Signal<Board>, lane: Addr) -> Vec<board::Column> {
-    board.with(|b| b.lanes.iter().find(|l| l.metanode == lane).map(|l| l.columns.clone()).unwrap_or_default())
+/// A lane as the board draws it now.
+#[derive(Debug, Clone, PartialEq)]
+struct LaneShown {
+    /// The lane, without its columns.
+    lane: Lane,
+    size: Size,
+    /// The board shares one header row.
+    aligned: bool,
+    /// The board has a column of lane names (it has named lanes).
+    laned: bool,
 }
 
-/// One lane: its header (a named lane's: chosen, renamed in place, its
-/// people), its columns, a horizontal sortable list dragged by the headers,
-/// and "+ Add column". A lane the person may only read takes no drags.
-fn render_lane(__scope: &mut RenderScope, k: &Kanban, lane: Lane, judge: SortJudge) -> NodeHandle {
-    let (board, kd, kcol, ka) = (k.board, k.clone(), k.clone(), k.clone());
-    let writable = lane.writable;
-    let metanode = lane.metanode;
-    let header = match lane.node {
-        Some(node) => lane_header(__scope, k, &lane, node),
-        None => rsx! { span { style: "display: none;" } },
-    };
-    rsx! {
-        div {
-            style: "display: contents;",
-            {header}
-            div {
-                class: "kanban__lane-row",
-                style: LANE_ROW_STYLE,
-                SortableList {
-                    group: COLUMNS,
-                    id: key_of(metanode),
-                    axis: SortAxis::Horizontal,
-                    label: lane.label.clone().unwrap_or_else(|| "Columns".to_string()),
-                    class: "kanban__column-list",
-                    style: format!("{COLUMN_LIST_STYLE}{SORT_THEME}"),
-                    disabled: !writable,
-                    lift_keys: lift_keys(),
-                    judge: Some(judge.clone()),
-                    ondrop: move |m: SortMove| kd.drop_move(m),
-                    for column in lane_columns(board, metanode) {
-                        SortableItem {
-                            key: format!("{column:?}"),
-                            value: key_of(column.addr),
-                            handle: true,
-                            disabled: !(column.writable && writable),
-                            label: column.label.clone(),
-                            class: "kanban__column",
-                            style: COLUMN_STYLE,
-                            {render_column(__scope, &kcol, column.clone(), judge.clone(), writable)}
-                        }
-                    }
-                }
-                if writable {
-                    div {
-                        class: "kanban__add-column",
-                        style: "width: 200px; flex-shrink: 0; padding: 8px; font-size: 13px; color: var(--rinch-color-dimmed); cursor: pointer;",
-                        onclick: { let k = ka.clone(); move || k.add(metanode, false) },
-                        "+ Add column"
-                    }
-                }
-            }
-        }
+impl LaneShown {
+    /// What redraws the lane: never its cards, which its cells follow on
+    /// their own (a card redrawn mid-drag would lose the drag).
+    fn key(&self) -> String {
+        let l = &self.lane;
+        format!("{:?} {:?} {:?} {:?} {} {:?} {} {}", l.metanode, l.node, l.label, l.color, l.writable, self.size, self.aligned, self.laned)
     }
 }
 
-/// A named lane's header: its name (renamed in place), its people, and while
-/// chosen, Rename.
-fn lane_header(__scope: &mut RenderScope, k: &Kanban, lane: &Lane, node: Addr) -> NodeHandle {
-    let seen = k.host.seen();
-    let (kc, kr, kh, kf, kf2) = (k.clone(), k.clone(), k.clone(), k.clone(), k.clone());
-    let (chosen, renaming) = (k.chosen, k.renaming);
-    let color = lane.color.clone();
-    let (label, label2) = (lane.label.clone().unwrap_or_default(), lane.label.clone().unwrap_or_default());
-    let writable = lane.writable;
+/// How many cards lane `lane` has, tracked.
+fn lane_count(board: Signal<Board>, lane: Addr) -> usize {
+    board.with(|b| b.lanes.iter().find(|l| l.metanode == lane).map_or(0, |l| l.columns.iter().map(|c| c.cards.len()).sum()))
+}
+
+/// The lanes as the board draws them, tracked: the board and the look.
+fn lanes_shown(board: Signal<Board>, _look: Signal<Look>, k: &Kanban) -> Vec<LaneShown> {
+    board.with(|b| {
+        let (aligned, laned) = (b.aligned(), b.lanes.iter().any(|l| l.node.is_some()));
+        // Without its columns: a `for` row is drawn again when its item
+        // changes, and a lane's cells follow the board on their own.
+        b.lanes.iter().map(|lane| LaneShown { lane: Lane { columns: Vec::new(), ..lane.clone() }, size: k.size_of(lane, b.lanes.len()), aligned, laned }).collect()
+    })
+}
+
+/// A lane's columns as the board has them now, tracked, each with whether it
+/// is the last (where done things pile up) and folded.
+fn lane_columns(k: &Kanban, lane: Addr) -> Vec<(board::Column, bool, bool)> {
+    let columns = k.board.with(|b| b.lanes.iter().find(|l| l.metanode == lane).map(|l| l.columns.clone()).unwrap_or_default());
+    let n = columns.len();
+    columns.into_iter().enumerate().map(|(i, c)| {
+        let folded = k.folded(&c.label);
+        (c, n > 1 && i + 1 == n, folded)
+    }).collect()
+}
+
+/// A header's columns, tracked: a lane's own (`lane`), or on an aligned board
+/// the first lane's, each with its cards counted in every lane, and folded.
+fn header_columns(k: &Kanban, lane: Option<Addr>) -> Vec<(board::Column, usize, bool)> {
+    let columns: Vec<(board::Column, usize)> = k.board.with(|b| match lane {
+        Some(lane) => b.lanes.iter().find(|l| l.metanode == lane).map(|l| l.columns.iter().map(|c| (c.clone(), c.cards.len())).collect()).unwrap_or_default(),
+        None => b.lanes.first().map(|l| {
+            l.columns.iter().enumerate().map(|(i, c)| (c.clone(), b.across(i).iter().map(|col| col.cards.len()).sum())).collect()
+        }).unwrap_or_default(),
+    });
+    columns.into_iter().map(|(c, n)| {
+        let folded = k.folded(&c.label);
+        (c, n, folded)
+    }).collect()
+}
+
+/// A row of column headers: the board's (`lane` `None`: one for every lane,
+/// after a space the width of the lane names when there are any) or a lane's
+/// own. A horizontal sortable list dragged by the headers, then "+ Add
+/// column".
+fn header_row(__scope: &mut RenderScope, k: &Kanban, lane: Option<Lane>, judge: SortJudge) -> NodeHandle {
+    let (kd, kc, ka) = (k.clone(), k.clone(), k.clone());
+    let board = untracked(|| k.board.get());
+    let first = board.lanes.first().cloned();
+    let Some(owner) = lane.clone().or(first) else { return rsx! { span { style: "display: none;" } } };
+    let spacer = lane.is_none() && board.lanes.iter().any(|l| l.node.is_some());
+    let writable = owner.writable;
+    let (list_lane, list_label) = (owner.metanode, owner.label.clone().unwrap_or_else(|| "Columns".to_string()));
+    let shared = lane.is_none() && board.lanes.len() > 1;
     rsx! {
         div {
-            class: "kanban__lane-header",
-            id: dom_id(node),
-            style: {|| format!(
-                "{LANE_HEADER_STYLE}{}{}",
-                color.as_deref().map(|c| format!(" color: {};", display_color(c, seen.dark()))).unwrap_or_default(),
-                if chosen.get() == Some(Chosen::Lane(node)) { " box-shadow: inset 0 0 0 2px var(--rinch-primary-color);" } else { "" },
-            )},
-            onclick: move || {
-                kc.choose(Some(Chosen::Lane(node)));
-                if untracked(|| kc.renaming.get()) != Some(node) {
-                    kc.take_keyboard();
+            class: "kanban__header-row",
+            style: HEADER_ROW_STYLE,
+            if spacer {
+                div { style: format!("width: {LABEL_W}px; flex-shrink: 0;") }
+            }
+            SortableList {
+                group: COLUMNS,
+                id: key_of(list_lane),
+                axis: SortAxis::Horizontal,
+                label: list_label,
+                class: "kanban__column-list",
+                style: format!("{COLUMN_LIST_STYLE}{SORT_THEME}"),
+                disabled: !writable,
+                lift_keys: lift_keys(),
+                judge: Some(judge.clone()),
+                ondrop: move |m: SortMove| kd.drop_move(m),
+                for (column, count, folded) in header_columns(&kc, lane.as_ref().map(|l| l.metanode)) {
+                    SortableItem {
+                        key: format!("{column:?} {count} {folded}"),
+                        value: key_of(column.addr),
+                        handle: true,
+                        disabled: folded || !(column.writable && writable),
+                        label: column.label.clone(),
+                        class: "kanban__column",
+                        style: format!("width: {}px; flex-shrink: 0; position: relative;", if folded { FOLDED_W } else { COLUMN_W }),
+                        {column_header(__scope, &kc, column.clone(), count, folded, writable)}
+                    }
                 }
-            },
-            span { style: "display: inline-flex; width: 16px; height: 16px; flex-shrink: 0;", IconGlyph { name: "layout-kanban".to_string() } }
-            if renaming.get() == Some(node) {
-                input {
-                    class: "kanban__field",
-                    style: FIELD_STYLE,
-                    ref: kf.field,
-                    placeholder: "Lane name",
-                    value: {move || kf.draft.get()},
-                    oninput: move |v: String| kf2.draft.set(v),
-                    onkeydown: {
-                        let k = kr.clone();
-                        move |key: &KeyEventData| match key.key.as_str() {
-                            "Enter" => { k.commit_rename(); true }
-                            "Escape" => { k.cancel_rename(); true }
-                            _ => false,
+            }
+            if writable {
+                div {
+                    class: "kanban__add-column",
+                    style: "flex-shrink: 0; padding: 4px 8px; font-size: 13px; color: var(--rinch-color-dimmed); cursor: pointer; white-space: nowrap;",
+                    onclick: {
+                        let k = ka.clone();
+                        move || {
+                            // On a shared header, a new column goes in every lane.
+                            let lanes: Vec<Addr> = if shared { untracked(|| k.board.get()).lanes.iter().map(|l| l.metanode).collect() } else { vec![list_lane] };
+                            k.add_column(lanes);
                         }
                     },
-                }
-            } else {
-                span { style: "overflow: hidden; text-overflow: ellipsis; white-space: nowrap;", {label.clone()} }
-            }
-            {people(__scope, k, node)}
-            if writable && chosen.get() == Some(Chosen::Lane(node)) && renaming.get() != Some(node) {
-                Button {
-                    size: "xs",
-                    variant: "subtle",
-                    onclick: { let (k, label) = (kh.clone(), label2.clone()); move || k.start_rename(node, label.clone()) },
-                    "Rename"
+                    "+ Add column"
                 }
             }
         }
     }
 }
 
-/// How the board's lists judge a drop ([`Kanban::judge_drop`]).
-fn drop_judge(k: &Kanban) -> SortJudge {
-    let k = k.clone();
-    std::rc::Rc::new(move |m: &SortMove| k.judge_drop(m))
-}
-
-/// One column: its header (renamed in place, its people; what a column is
-/// dragged by), its cards (a sortable list of their own), "+ Add card".
-fn render_column(__scope: &mut RenderScope, k: &Kanban, column: board::Column, judge: SortJudge, board_writable: bool) -> NodeHandle {
+/// A column's header: its name (renamed in place; on a shared header, in
+/// every lane), its count, its people, fold; what a column is dragged by. A
+/// folded column's header is a narrow "+" that unfolds it.
+fn column_header(__scope: &mut RenderScope, k: &Kanban, column: board::Column, count: usize, folded: bool, board_writable: bool) -> NodeHandle {
     let addr = column.addr;
+    let name = column.label.clone();
+    if folded {
+        let kf = k.clone();
+        let tip = format!("Unfold {name} ({count})");
+        return rsx! {
+            div {
+                class: "kanban__header kanban__header--folded",
+                style: format!("{ICON_BUTTON} width: {FOLDED_W}px; height: 28px; {CELL_BG}"),
+                title: tip,
+                onclick: move || kf.toggle_fold(&name),
+                span { style: "display: inline-flex; width: 14px; height: 14px;", IconGlyph { name: "plus".to_string() } }
+            }
+        };
+    }
     let seen = k.host.seen();
     let color = column.color.clone();
-    let (kc, kr, kh, ka, kf, kf2) = (k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone());
+    let (kc, kr, kh, kf, kf2, kfold) = (k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone());
     let (label, label2) = (column.label.clone(), column.label.clone());
     let writable = column.writable;
-    let chosen = k.chosen;
-    let renaming = k.renaming;
+    let (chosen, renaming) = (k.chosen, k.renaming);
     let header = rsx! {
         div {
             class: "kanban__header",
@@ -837,14 +1126,11 @@ fn render_column(__scope: &mut RenderScope, k: &Kanban, column: board::Column, j
                 }
             } else {
                 span {
-                    style: "flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                    style: "overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
                     title: if writable { "Click to choose; F2 or Rename to rename" } else { "" },
                     {label.clone()}
                 }
-            }
-            span {
-                style: LINE_STYLE,
-                {column.cards.len().to_string()}
+                span { style: LINE_STYLE, {count.to_string()} }
             }
             {people(__scope, k, addr)}
             if writable && chosen.get() == Some(Chosen::Column(addr)) && renaming.get() != Some(addr) {
@@ -855,43 +1141,264 @@ fn render_column(__scope: &mut RenderScope, k: &Kanban, column: board::Column, j
                     "Rename"
                 }
             }
+            span {
+                style: ICON_BUTTON,
+                title: "Fold this column",
+                onclick: { let name = name.clone(); move || kfold.toggle_fold(&name) },
+                span { style: "display: inline-flex; width: 14px; height: 14px;", IconGlyph { name: "minus".to_string() } }
+            }
         }
     };
     // A column is dragged by its header, when the person may move it.
-    let movable = board_writable && writable;
-    let header = if movable { rsx! { SortableHandle { {header} } } } else { header };
-    let cards: Vec<NodeHandle> = column.cards.iter().map(|card| render_card(__scope, k, card.clone())).collect();
-    let can_add = column.writable;
-    let kd = k.clone();
+    if board_writable && writable { rsx! { SortableHandle { {header} } } } else { header }
+}
+
+/// One lane: a bar with its name and count when collapsed; otherwise its
+/// name's cell (on a board with named lanes), its own header row when the
+/// board's lanes differ, and a cell per column.
+fn render_lane(__scope: &mut RenderScope, k: &Kanban, shown: LaneShown, judge: SortJudge) -> NodeHandle {
+    let lane = shown.lane.clone();
+    let (board, metanode) = (k.board, lane.metanode);
+    if shown.size == Size::Collapsed {
+        let ke = k.clone();
+        let l2 = lane.clone();
+        let name = lane.label.clone().unwrap_or_else(|| "Other cards".to_string());
+        return rsx! {
+            div {
+                class: "kanban__lane-bar",
+                style: format!("display: flex; align-items: center; gap: 8px; padding: 6px 10px; cursor: pointer; font-weight: 600; font-size: 13px; {CELL_BG}"),
+                title: "Show this lane",
+                onclick: move || ke.set_size(&l2, Size::Minimized),
+                span { style: "display: inline-flex; width: 14px; height: 14px;", IconGlyph { name: "plus".to_string() } }
+                span { style: "display: inline-flex; width: 14px; height: 14px;", IconGlyph { name: "layout-kanban".to_string() } }
+                span { {name} }
+                span { style: LINE_STYLE, {move || format!("({})", lane_count(board, metanode))} }
+            }
+        };
+    }
+    let label = if shown.laned { Some(lane_label(__scope, k, &shown)) } else { None };
+    let header = if shown.aligned { None } else { Some(header_row(__scope, k, Some(lane.clone()), judge.clone())) };
+    let cells = cells_row(__scope, k, &shown, judge);
     rsx! {
         div {
-            style: "display: contents;",
-            {header}
-            SortableList {
-                group: CARDS,
-                id: key_of(addr),
-                label: column.label.clone(),
-                class: "kanban__cards",
-                style: format!("{CARD_LIST_STYLE}{SORT_THEME}"),
-                // A read-only board takes no drags; a read-only column on a
-                // writable board still judges a drop into it, so the caret says
-                // why not ("You can read this, not change it.").
-                disabled: !board_writable,
-                lift_keys: lift_keys(),
-                judge: Some(judge),
-                ondrop: move |m: SortMove| kd.drop_move(m),
-                {cards}
+            class: "kanban__lane-row",
+            style: ROW_STYLE,
+            if let Some(label) = label.clone() {
+                {label}
             }
-            if can_add {
+            div {
+                style: "display: flex; flex-direction: column; gap: 6px; min-width: 0;",
+                if let Some(header) = header.clone() {
+                    {header}
+                }
+                {cells}
+            }
+        }
+    }
+}
+
+/// A lane's name cell: its name (the unnamed lane's is "Other cards"),
+/// renamed in place, its count and people, and its size: show all or about
+/// three cards a column, collapse.
+fn lane_label(__scope: &mut RenderScope, k: &Kanban, shown: &LaneShown) -> NodeHandle {
+    let lane = shown.lane.clone();
+    let (board, metanode) = (k.board, lane.metanode);
+    let seen = k.host.seen();
+    let (kc, kr, kh, kf, kf2, ks, kz) = (k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone(), k.clone());
+    let (chosen, renaming) = (k.chosen, k.renaming);
+    let node = lane.node;
+    let color = lane.color.clone();
+    let name = lane.label.clone();
+    let name2 = name.clone().unwrap_or_default();
+    let writable = lane.writable && node.is_some();
+    let size = shown.size;
+    let (l1, l2) = (lane.clone(), lane.clone());
+    let people_here = node.map(|n| people(__scope, k, n));
+    let (toggle_icon, toggle_tip, toggle_to) = match size {
+        Size::Expanded => ("chevrons-up", "Show about three cards a column", Size::Minimized),
+        _ => ("chevrons-down", "Show every card", Size::Expanded),
+    };
+    rsx! {
+        div {
+            class: "kanban__lane-label",
+            id: node.map(dom_id).unwrap_or_default(),
+            style: {|| format!(
+                "{LANE_LABEL_STYLE} width: {LABEL_W}px;{}",
+                if node.is_some() && chosen.get() == node.map(Chosen::Lane) { " box-shadow: inset 0 0 0 2px var(--rinch-primary-color); border-radius: 6px;" } else { "" },
+            )},
+            div {
+                style: {|| format!(
+                    "display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 13px; cursor: pointer; min-width: 0;{}",
+                    color.as_deref().map(|c| format!(" color: {};", display_color(c, seen.dark()))).unwrap_or_default(),
+                )},
+                onclick: move || {
+                    if let Some(node) = node {
+                        kc.choose(Some(Chosen::Lane(node)));
+                        if untracked(|| kc.renaming.get()) != Some(node) {
+                            kc.take_keyboard();
+                        }
+                    }
+                },
+                span { style: "display: inline-flex; width: 14px; height: 14px; flex-shrink: 0;", IconGlyph { name: "layout-kanban".to_string() } }
+                if node.is_some() && renaming.get() == node {
+                    input {
+                        class: "kanban__field",
+                        style: FIELD_STYLE,
+                        ref: kf.field,
+                        placeholder: "Lane name",
+                        value: {move || kf.draft.get()},
+                        oninput: move |v: String| kf2.draft.set(v),
+                        onkeydown: {
+                            let k = kr.clone();
+                            move |key: &KeyEventData| match key.key.as_str() {
+                                "Enter" => { k.commit_rename(); true }
+                                "Escape" => { k.cancel_rename(); true }
+                                _ => false,
+                            }
+                        },
+                    }
+                } else {
+                    span {
+                        style: "overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                        {name.clone().unwrap_or_else(|| "Other cards".to_string())}
+                    }
+                }
+            }
+            div {
+                style: "display: flex; align-items: center; gap: 2px;",
+                span { style: format!("{LINE_STYLE} margin-right: 4px;"), {move || { let n = lane_count(board, metanode); format!("{n} card{}", if n == 1 { "" } else { "s" }) }} }
+                span {
+                    style: ICON_BUTTON,
+                    title: toggle_tip,
+                    onclick: move || ks.set_size(&l1, toggle_to),
+                    span { style: "display: inline-flex; width: 14px; height: 14px;", IconGlyph { name: toggle_icon.to_string() } }
+                }
+                span {
+                    style: ICON_BUTTON,
+                    title: "Collapse this lane",
+                    onclick: move || kz.set_size(&l2, Size::Collapsed),
+                    span { style: "display: inline-flex; width: 14px; height: 14px;", IconGlyph { name: "minus".to_string() } }
+                }
+            }
+            if let Some(people_here) = people_here.clone() {
+                {people_here}
+            }
+            if writable && node.is_some() && chosen.get() == node.map(Chosen::Lane) && renaming.get() != node {
                 div {
-                    class: "kanban__add-card",
-                    style: ADD_STYLE,
-                    onclick: { let k = ka.clone(); move || k.add(addr, true) },
-                    "+ Add card"
+                    Button {
+                        size: "xs",
+                        variant: "subtle",
+                        onclick: { let (k, label) = (kh.clone(), name2.clone()); move || if let Some(node) = node { k.start_rename(node, label.clone()) } },
+                        "Rename"
+                    }
                 }
             }
         }
     }
+}
+
+/// A lane's cells, one per column, stretched to the tallest so the last
+/// (Done, where finished cards pile up) is never taller than the others.
+fn cells_row(__scope: &mut RenderScope, k: &Kanban, shown: &LaneShown, judge: SortJudge) -> NodeHandle {
+    let kc = k.clone();
+    let lane = shown.lane.metanode;
+    let (size, writable) = (shown.size, shown.lane.writable);
+    rsx! {
+        div {
+            class: "kanban__cells",
+            style: ROW_STYLE,
+            for (column, last, folded) in lane_columns(&kc, lane) {
+                div {
+                    key: format!("{column:?} {last} {folded}"),
+                    style: "display: flex; flex-shrink: 0;",
+                    {cell(__scope, &kc, column.clone(), last, folded, size, writable, judge.clone())}
+                }
+            }
+        }
+    }
+}
+
+/// One column of one lane: its cards (a sortable list of their own), and on
+/// hover, "Add card". The last column's list fills the cell the row's tallest
+/// sets and scrolls inside it; a minimized lane's lists show about three
+/// cards. A folded column is a narrow strip with its name and count.
+#[allow(clippy::too_many_arguments)]
+fn cell(__scope: &mut RenderScope, k: &Kanban, column: board::Column, last: bool, folded: bool, size: Size, lane_writable: bool, judge: SortJudge) -> NodeHandle {
+    let addr = column.addr;
+    let name = column.label.clone();
+    if folded {
+        let kf = k.clone();
+        let (tip, text) = (format!("Unfold {name}"), format!("{name} ({})", column.cards.len()));
+        return rsx! {
+            div {
+                class: "kanban__cell kanban__cell--folded",
+                style: format!("width: {FOLDED_W}px; min-height: 64px; position: relative; cursor: pointer; overflow: hidden; {CELL_BG}"),
+                title: tip,
+                onclick: move || kf.toggle_fold(&name),
+                span {
+                    style: "position: absolute; top: 10px; left: 30px; transform: rotate(90deg); transform-origin: top left; white-space: nowrap; font-size: 12px; font-weight: 600; color: var(--rinch-color-dimmed);",
+                    {text}
+                }
+            }
+        };
+    }
+    let cards: Vec<NodeHandle> = column.cards.iter().map(|card| render_card(__scope, k, card.clone())).collect();
+    let can_add = column.writable;
+    let (kd, ka, kenter, kleave) = (k.clone(), k.clone(), k.clone(), k.clone());
+    let hovered = k.hovered;
+    let list_style = if last {
+        "position: absolute; top: 8px; left: 8px; right: 8px; bottom: 34px; overflow-y: auto;".to_string()
+    } else if size == Size::Minimized {
+        format!("max-height: {MINIMIZED_MAX}px; overflow-y: auto;")
+    } else {
+        String::new()
+    };
+    rsx! {
+        div {
+            class: "kanban__cell",
+            data-kanban-column: key_of(addr),
+            style: format!("width: {COLUMN_W}px; min-height: {}px; position: relative; display: flex; flex-direction: column; padding: 8px 8px 34px 8px; box-sizing: border-box; {CELL_BG}", if last { 110 } else { 72 }),
+            onmouseenter: move || kenter.hovered.set(Some(addr)),
+            onmouseleave: move || {
+                if untracked(|| kleave.hovered.get()) == Some(addr) {
+                    kleave.hovered.set(None);
+                }
+            },
+            div {
+                style: list_style,
+                SortableList {
+                    group: CARDS,
+                    id: key_of(addr),
+                    label: column.label.clone(),
+                    class: "kanban__cards",
+                    style: format!("{CARD_LIST_STYLE}{SORT_THEME}"),
+                    // A read-only board takes no drags; a read-only column on a
+                    // writable board still judges a drop into it, so the caret says
+                    // why not ("You can read this, not change it.").
+                    disabled: !lane_writable,
+                    lift_keys: lift_keys(),
+                    judge: Some(judge),
+                    ondrop: move |m: SortMove| kd.drop_move(m),
+                    {cards}
+                }
+            }
+            if can_add && hovered.get() == Some(addr) {
+                div {
+                    class: "kanban__add-card",
+                    style: "position: absolute; left: 50%; bottom: 6px; transform: translateX(-50%); display: flex; align-items: center; gap: 4px; padding: 3px 10px; font-size: 12px; border-radius: 4px; cursor: pointer; white-space: nowrap; color: var(--rinch-color-body); background: var(--rinch-color-text); box-shadow: 0 1px 3px rgba(0,0,0,0.25);",
+                    onclick: { let k = ka.clone(); move || k.add(addr, true) },
+                    span { style: "display: inline-flex; width: 12px; height: 12px;", IconGlyph { name: "plus".to_string() } }
+                    "Add card"
+                }
+            }
+        }
+    }
+}
+
+/// How the board's lists judge a drop ([`Kanban::judge_drop`]).
+fn drop_judge(k: &Kanban) -> SortJudge {
+    let k = k.clone();
+    std::rc::Rc::new(move |m: &SortMove| k.judge_drop(m))
 }
 
 /// Who else is on `addr`: the app's own chips, up to three and "+n"; a click
@@ -1034,5 +1541,17 @@ mod tests {
         assert_eq!(recipe.depth, 2);
         assert_eq!(recipe.children, vec!["To do", "Doing", "Done"]);
         assert!(m.asks.write);
+    }
+
+    #[test]
+    fn the_look_is_remembered_as_json_and_read_back() {
+        let mut look = Look::default();
+        look.lanes.insert("top".into(), Size::Collapsed);
+        look.lanes.insert("s/n".into(), Size::Expanded);
+        look.folded.push("done".into());
+        assert_eq!(Look::parse(&look.to_json()), look);
+        // Anything else reads as the board's own look.
+        assert_eq!(Look::parse("not json"), Look::default());
+        assert_eq!(Look::parse(r#"{"lanes":{"top":"sideways"}}"#), Look::default());
     }
 }

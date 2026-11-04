@@ -161,7 +161,7 @@ pub fn mount(f: &Fixture, approval: Approval, file: &str, viewer: &str) -> Runni
     let requests: Rc<RefCell<Vec<HostRequest>>> = Rc::default();
     let heard = requests.clone();
     instance.on_request(move |r| heard.borrow_mut().push(r));
-    let props = Props { metanode: NodeAddr::from(Addr::new(f.store, f.board)), settings: None };
+    let props = Props { metanode: NodeAddr::from(Addr::new(f.store, f.board)), settings: None, remembered: None };
     assert!(instance.mount(viewer, &props));
     Running {
         doc,

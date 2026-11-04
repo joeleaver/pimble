@@ -239,6 +239,16 @@ fn request(store: AppStore, pane: PaneId, plugin_id: &str, request: HostRequest)
             crate::presence::say_within(store, pane, on);
         }
         HostRequest::Follow { person } => crate::presence::follow::start(store, pane, &person),
+        HostRequest::Remember { value } => {
+            if value.len() > pimble_plugin_abi::MAX_REMEMBERED {
+                tracing::debug!("plugins: {plugin_id} asked to remember {} bytes; not kept", value.len());
+                return;
+            }
+            let shown = SHOWN.with(|s| s.borrow().get(&pane).map(|shown| (shown.viewer.clone(), shown.metanode)));
+            if let Some((viewer, metanode)) = shown {
+                crate::views::set_plugin_view(plugin_id, &viewer, metanode.store, metanode.node, value);
+            }
+        }
     }
 }
 
@@ -369,7 +379,11 @@ pub(crate) fn show(store: AppStore, pane: PaneId, viewer: &str, forest: &Forest)
     let plugin_id = manifest.id.clone();
     instance.on_request(move |r| request(store, pane, &plugin_id, r));
     SHOWN.with(|s| s.borrow_mut().insert(pane, shown(Some(instance.clone()), None)));
-    if instance.mount(viewer, &props) {
+    // What this device remembers of the view is handed at mount only: the
+    // props kept for comparing are the settings, so remembering never sends
+    // new props.
+    let remembered = crate::views::plugin_view(&manifest.id, viewer, forest.metanode.store, forest.metanode.node);
+    if instance.mount(viewer, &Props { remembered, ..props.clone() }) {
         push_host_state(store, pane);
         Outcome::Shown
     } else {
@@ -497,7 +511,7 @@ fn props(forest: &Forest, viewer: &str) -> Props {
         .ok()
         .and_then(|doc| doc.data_json().get(viewer).cloned())
         .map(|value| value.to_string());
-    Props { metanode: NodeAddr::from(forest.metanode), settings }
+    Props { metanode: NodeAddr::from(forest.metanode), settings, remembered: None }
 }
 
 /// The element a pane's plugin view is applied under: shown while a plugin view

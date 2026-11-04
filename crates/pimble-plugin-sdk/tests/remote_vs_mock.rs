@@ -137,7 +137,7 @@ fn counter(__scope: &mut RenderScope, mount: Mount) -> NodeHandle {
 /// `heading|row,row` (a plugin reads its nodes through the API; these tests are
 /// about the document, so the props carry something to draw).
 fn props(title: &str, labels: &[&str]) -> Props {
-    Props { metanode: NodeAddr { store: "s".into(), node: "m".into() }, settings: Some(format!("{title}|{}", labels.join(","))) }
+    Props { metanode: NodeAddr { store: "s".into(), node: "m".into() }, settings: Some(format!("{title}|{}", labels.join(","))), remembered: None }
 }
 
 fn heading(props: &Props) -> String {
@@ -337,7 +337,7 @@ fn a_plugin_draws_presence_with_the_apps_chips_and_asks_the_host_to_follow() {
     let host = ApplyToMock::new();
     let mut guest = Guest::new(host.clone(), api());
     let metanode = NodeAddr { store: pimble_plugin_sdk::pimble_core::StoreId::new().to_string(), node: pimble_plugin_sdk::pimble_core::NodeId::new().to_string() };
-    guest.mount(present, MountArgs { viewer: "test".into(), props: Props { metanode: metanode.clone(), settings: None } });
+    guest.mount(present, MountArgs { viewer: "test".into(), props: Props { metanode: metanode.clone(), settings: None, remembered: None } });
     let render = || {
         let mut out = String::new();
         dump(&*host.doc.borrow(), host.doc.borrow().body(), &names(), 0, &mut out);
