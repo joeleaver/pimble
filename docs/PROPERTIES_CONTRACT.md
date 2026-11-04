@@ -2,7 +2,7 @@
 
 Status: drafted 2026-11-04 from Joe's request ("should we have a dedicated pane, maybe a
 side panel, for editing key/value pairs and tags?"), with his decisions (section 1).
-Nothing built. Open decisions in section 7.
+Nothing built. The decisions of section 7 taken as recommended ("looks good", 2026-11-04).
 
 ## 1. What Joe decided (2026-11-04)
 
@@ -85,7 +85,7 @@ Read-only sections under the fields, each collapsed to one line when empty:
 4. Checked in the release desktop app and the browser: a plain store, an encrypted one, a
    read-only share, a node through a mount, a found node.
 
-## 7. Open decisions for Joe
+## 7. Decisions (taken as recommended, 2026-11-04)
 
 1. **The shortcut**: `Alt+Enter` (recommended: the "properties" key on Windows, and free in
    the editor), or none.
